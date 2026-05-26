@@ -185,6 +185,7 @@ func (s *Server) slockProvisionForUserInfo(ctx context.Context, info slockoauth.
 			_ = s.meta.UpdateTenantStatus(context.Background(), res.TenantID, meta.TenantDeleted)
 			return newProvisionTenantError(http.StatusInternalServerError, "failed to persist external binding", err)
 		}
+		s.startProvisionedTenantSchemaInit(lockCtx, res)
 		logger.Info(lockCtx, "server_event", eventFields(lockCtx, "slock_external_binding_created",
 			"tenant_id", res.TenantID, "subject_key", subjectKey)...)
 		out = &slockCallbackResponse{

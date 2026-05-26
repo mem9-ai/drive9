@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -52,11 +53,14 @@ func TestLoginURL(t *testing.T) {
 }
 
 func TestNewTrimsClientSecret(t *testing.T) {
+	reqErr := make(chan error, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		want := "Basic " + base64.StdEncoding.EncodeToString([]byte("drive9:secret"))
 		if r.Header.Get("Authorization") != want {
-			t.Fatalf("Authorization = %q, want %q", r.Header.Get("Authorization"), want)
+			reqErr <- fmt.Errorf("Authorization = %q, want %q", r.Header.Get("Authorization"), want)
+			return
 		}
+		reqErr <- nil
 		_, _ = w.Write([]byte(`{"access_token":"tok"}`))
 	}))
 	t.Cleanup(srv.Close)
@@ -74,29 +78,41 @@ func TestNewTrimsClientSecret(t *testing.T) {
 	if _, err := c.ExchangeCode(context.Background(), "abc"); err != nil {
 		t.Fatalf("ExchangeCode: %v", err)
 	}
+	if err := <-reqErr; err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestExchangeCodeSuccess(t *testing.T) {
+	reqErr := make(chan error, 1)
 	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/oauth/token" || r.Method != http.MethodPost {
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			reqErr <- fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			return
 		}
 		if !strings.HasPrefix(r.Header.Get("Authorization"), "Basic ") {
-			t.Fatalf("missing basic auth")
+			reqErr <- fmt.Errorf("missing basic auth")
+			return
 		}
 		var body map[string]string
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Fatalf("decode body: %v", err)
+			reqErr <- fmt.Errorf("decode body: %v", err)
+			return
 		}
 		if body["grant_type"] != "authorization_code" || body["code"] != "abc" {
-			t.Fatalf("unexpected body: %#v", body)
+			reqErr <- fmt.Errorf("unexpected body: %#v", body)
+			return
 		}
+		reqErr <- nil
 		_, _ = w.Write([]byte(`{"access_token":"tok","token_type":"Bearer","expires_in":3600,"scope":"identity openid profile"}`))
 	}))
 
 	tok, err := c.ExchangeCode(context.Background(), "abc")
 	if err != nil {
 		t.Fatalf("ExchangeCode: %v", err)
+	}
+	if err := <-reqErr; err != nil {
+		t.Fatal(err)
 	}
 	if tok.AccessToken != "tok" {
 		t.Fatalf("AccessToken = %q", tok.AccessToken)
@@ -132,19 +148,26 @@ func TestExchangeCodeFailures(t *testing.T) {
 }
 
 func TestUserinfoSuccess(t *testing.T) {
+	reqErr := make(chan error, 1)
 	c, _ := newTestClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/oauth/userinfo" || r.Method != http.MethodGet {
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			reqErr <- fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			return
 		}
 		if r.Header.Get("Authorization") != "Bearer tok" {
-			t.Fatalf("Authorization = %q", r.Header.Get("Authorization"))
+			reqErr <- fmt.Errorf("Authorization = %q", r.Header.Get("Authorization"))
+			return
 		}
+		reqErr <- nil
 		_, _ = w.Write([]byte(`{"sub":"sub-1","type":"agent","client_id":"drive9","server_id":"server-1","server_slug":"dev","preferred_username":"assistant","name":"Assistant"}`))
 	}))
 
 	info, err := c.Userinfo(context.Background(), "tok")
 	if err != nil {
 		t.Fatalf("Userinfo: %v", err)
+	}
+	if err := <-reqErr; err != nil {
+		t.Fatal(err)
 	}
 	if info.Sub != "sub-1" || info.ServerID != "server-1" || info.Type != "agent" {
 		t.Fatalf("unexpected info: %+v", info)

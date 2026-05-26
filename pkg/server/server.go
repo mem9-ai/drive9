@@ -2985,6 +2985,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "failed to provision tenant")
 		return
 	}
+	s.startProvisionedTenantSchemaInit(r.Context(), res)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
@@ -3008,11 +3009,12 @@ type provisionTenantOptions struct {
 }
 
 type provisionTenantResult struct {
-	TenantID string
-	APIKey   string
-	APIKeyID string
-	Status   meta.TenantStatus
-	Provider string
+	TenantID  string
+	APIKey    string
+	APIKeyID  string
+	Status    meta.TenantStatus
+	Provider  string
+	TenantDSN string
 }
 
 type provisionTenantError struct {
@@ -3128,19 +3130,25 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist api key", err)
 	}
 
-	// Initialize tenant schema asynchronously; tenant remains in provisioning state until success.
-	dsn := tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true)
-	go s.initTenantSchemaAsync(backgroundWithTrace(ctx), tenantID, dsn, provider, s.provisioner.InitSchema)
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
 	metricEvent(ctx, "tenant_provision", "provider", provider, "result", "accepted")
 
 	return &provisionTenantResult{
-		TenantID: tenantID,
-		APIKey:   apiToken,
-		APIKeyID: apiKeyID,
-		Status:   meta.TenantProvisioning,
-		Provider: provider,
+		TenantID:  tenantID,
+		APIKey:    apiToken,
+		APIKeyID:  apiKeyID,
+		Status:    meta.TenantProvisioning,
+		Provider:  provider,
+		TenantDSN: tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
 	}, nil
+}
+
+func (s *Server) startProvisionedTenantSchemaInit(ctx context.Context, res *provisionTenantResult) {
+	if res == nil || res.TenantID == "" || res.TenantDSN == "" || s.provisioner == nil {
+		return
+	}
+	// Tenant remains in provisioning state until schema initialization succeeds.
+	go s.initTenantSchemaAsync(backgroundWithTrace(ctx), res.TenantID, res.TenantDSN, res.Provider, s.provisioner.InitSchema)
 }
 
 func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string, tokenVersion int, source apiKeyIssueSource) (rawToken, apiKeyID string, err error) {

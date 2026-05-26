@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
@@ -51,8 +52,7 @@ func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -150,8 +150,7 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -270,8 +269,7 @@ func TestProvisionPersistsTenantBeforeProvisionFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -342,8 +340,7 @@ func TestStartupResumesProvisioningTenantInit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
@@ -419,8 +416,7 @@ func TestStartupMarksPendingTenantFailed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	master := make([]byte, 32)
 	if _, err := rand.Read(master); err != nil {
