@@ -94,13 +94,17 @@ func (policy *LocalPolicy) classifyWithSource(localPath string) (PathLayer, poli
 	if !policy.Enabled() {
 		return PathLayerRemotePersistent, policyMatchDisabled
 	}
+	cleaned, err := canonicalRuntimePolicyPath(localPath)
+	if err != nil {
+		return PathLayerRemotePersistent, policyMatchRemoteDefault
+	}
 	for _, pattern := range policy.remoteOnly {
-		if pattern.matches(localPath) {
+		if pattern.matchesCanonical(cleaned) {
 			return PathLayerRemotePersistent, policyMatchRemoteOverride
 		}
 	}
 	for _, pattern := range policy.localOnly {
-		if pattern.matches(localPath) {
+		if pattern.matchesCanonical(cleaned) {
 			return PathLayerLocalOnly, policyMatchLocalOnly
 		}
 	}
@@ -186,11 +190,12 @@ func (pattern localPolicyPattern) matches(localPath string) bool {
 	if err != nil {
 		return false
 	}
+	return pattern.matchesCanonical(cleaned)
+}
+
+func (pattern localPolicyPattern) matchesCanonical(cleaned string) bool {
 	if len(pattern.subpath) > 0 {
-		segments, err := splitRuntimePolicyPath(cleaned)
-		if err != nil {
-			return false
-		}
+		segments := splitCanonicalPolicyPath(cleaned)
 		return containsSubpath(segments, pattern.subpath)
 	}
 	if pattern.prefix != "" {
