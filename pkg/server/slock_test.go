@@ -182,22 +182,15 @@ func TestSlockCallbackReusesExistingBinding(t *testing.T) {
 	if second.TenantID != first.TenantID {
 		t.Fatalf("second tenant = %s, want %s", second.TenantID, first.TenantID)
 	}
-	if second.APIKey == first.APIKey {
-		t.Fatal("repeat callback should issue a fresh api key")
+	if second.APIKey != first.APIKey {
+		t.Fatalf("repeat callback should reuse the same api key; got %s, want %s", second.APIKey, first.APIKey)
 	}
-	firstResolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), token.HashToken(first.APIKey))
+	resolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), token.HashToken(first.APIKey))
 	if err != nil {
-		t.Fatalf("ResolveByAPIKeyHash(first): %v", err)
+		t.Fatalf("ResolveByAPIKeyHash: %v", err)
 	}
-	if firstResolved.APIKey.Status != meta.APIKeyRevoked {
-		t.Fatalf("first api key status = %s, want %s", firstResolved.APIKey.Status, meta.APIKeyRevoked)
-	}
-	secondResolved, err := metaStore.ResolveByAPIKeyHash(context.Background(), token.HashToken(second.APIKey))
-	if err != nil {
-		t.Fatalf("ResolveByAPIKeyHash(second): %v", err)
-	}
-	if secondResolved.APIKey.Status != meta.APIKeyActive {
-		t.Fatalf("second api key status = %s, want %s", secondResolved.APIKey.Status, meta.APIKeyActive)
+	if resolved.APIKey.Status != meta.APIKeyActive {
+		t.Fatalf("api key status = %s, want %s", resolved.APIKey.Status, meta.APIKeyActive)
 	}
 	var tenantCount int
 	if err := metaStore.DB().QueryRow("SELECT COUNT(*) FROM tenants").Scan(&tenantCount); err != nil {
@@ -363,13 +356,18 @@ func TestSlockCallbackRejectsOversizedMetadataBeforeProvision(t *testing.T) {
 	}
 }
 
-func TestSlockHTMLDoesNotRenderAPIKey(t *testing.T) {
+func TestSlockCallbackHTMLResponse(t *testing.T) {
 	info := slockoauth.UserInfo{Sub: "sub-1", Type: "agent", ClientID: "drive9", ServerID: "server-1"}
 	srv, _, _ := newSlockTestServer(t, info)
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
-	resp, err := http.Get(ts.URL + "/v1/auth/slock/callback?code=html")
+	req, err := http.NewRequest("GET", ts.URL+"/v1/auth/slock/callback?code=html", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept", "text/html")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -382,13 +380,16 @@ func TestSlockHTMLDoesNotRenderAPIKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := string(bodyBytes)
-	if strings.Contains(body, "<pre>") {
-		t.Fatal("html response should not render preformatted api key output")
+	if !strings.Contains(body, "API Key") {
+		t.Fatal("html response should show API Key section")
 	}
-	if strings.Contains(strings.ToLower(body), "api_key") {
-		t.Fatal("html response should not render api_key field")
+	if !strings.Contains(body, "copy-text") {
+		t.Fatal("html response should render api_key for easy copy")
 	}
-	if strings.Contains(body, "eyJ") {
-		t.Fatal("html response should not render token-like content")
+	if !strings.Contains(body, "Identity") {
+		t.Fatal("html response should show identity section")
+	}
+	if !strings.Contains(body, "Server URL") {
+		t.Fatal("html response should show server URL section")
 	}
 }

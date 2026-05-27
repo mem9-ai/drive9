@@ -15,6 +15,8 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/slockoauth"
 	"go.uber.org/zap"
+
+	"github.com/mem9-ai/dat9/pkg/tenant/token"
 )
 
 const slockProvider = "slock"
@@ -25,13 +27,355 @@ const (
 )
 
 var slockHTMLTemplate = template.Must(template.New("slock").Parse(`<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Drive9 Slock Login</title></head>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="https://drive9.ai/favicon.svg">
+<title>drive9 — Login</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  color-scheme: dark;
+  --bg: #0a0908;
+  --ink: #ede8e0;
+  --muted: #918c85;
+  --faint: #48443f;
+  --line: #1f1d1a;
+  --paper: #131210;
+  --warm: #1a1816;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { min-height: 100%; -webkit-font-smoothing: antialiased; }
+body {
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 17px;
+  line-height: 1.6;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.page {
+  width: min(780px, 100%);
+}
+.card {
+  position: relative;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.15), 0 12px 40px rgba(0,0,0,0.3);
+}
+.card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 0%, rgba(141,216,141,0.3) 50%, transparent 100%);
+}
+.header {
+  padding: 32px 32px 24px;
+  border-bottom: 1px solid var(--line);
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 20px;
+  padding: 4px 12px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: var(--bg);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+.badge-dot {
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: #8dd88d;
+}
+.header h1 {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--ink);
+  letter-spacing: -0.02em;
+  margin-bottom: 10px;
+}
+.header p {
+  font-size: 16px;
+  color: var(--muted);
+  line-height: 1.6;
+}
+.section {
+  padding: 24px 32px;
+  border-bottom: 1px solid var(--line);
+}
+.section:last-of-type {
+  border-bottom: none;
+}
+.section-title {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 16px;
+}
+.copy-row {
+  position: relative;
+  padding: 16px 20px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  cursor: pointer;
+  transition: border-color 0.3s, box-shadow 0.3s;
+  user-select: none;
+}
+.copy-row:hover {
+  border-color: #2a2520;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.2), 0 8px 32px rgba(0,0,0,0.4);
+}
+.copy-row::after {
+  content: 'click to copy';
+  position: absolute;
+  bottom: 8px; right: 12px;
+  font-family: 'Inter', sans-serif;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+  opacity: 0;
+  transition: opacity 0.25s;
+  background: var(--bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.copy-row:hover::after { opacity: 1; }
+.copy-row[data-copied]::after { content: 'copied'; opacity: 1; color: var(--ink); }
+.copy-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 8px;
+}
+.copy-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 15px;
+  font-weight: 400;
+  color: var(--ink);
+  word-break: break-all;
+  line-height: 1.5;
+}
+.info-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.info-item {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg);
+}
+.info-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin-bottom: 6px;
+}
+.info-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--muted);
+  word-break: break-all;
+}
+.cli-box {
+  position: relative;
+  padding: 20px 24px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  cursor: pointer;
+  transition: border-color 0.3s, box-shadow 0.3s;
+  user-select: none;
+}
+.cli-box:hover {
+  border-color: #2a2520;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.2), 0 8px 32px rgba(0,0,0,0.4);
+}
+.cli-box::after {
+  content: 'click to copy';
+  position: absolute;
+  bottom: 8px; right: 12px;
+  font-family: 'Inter', sans-serif;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--faint);
+  opacity: 0;
+  transition: opacity 0.25s;
+  background: var(--bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.cli-box:hover::after { opacity: 1; }
+.cli-box[data-copied]::after { content: 'copied'; opacity: 1; color: var(--ink); }
+.doc-box {
+  padding: 16px 20px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg);
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.doc-box a {
+  color: #8dd88d;
+  text-decoration: none;
+  transition: opacity 0.2s;
+}
+.doc-box a:hover {
+  opacity: 0.8;
+}
+.cli-box code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 15px;
+  font-weight: 500;
+  line-height: 1.7;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.cli-box .cmd { color: var(--ink); }
+.cli-box .arg { color: #8dd88d; }
+.footer {
+  padding: 20px 32px;
+  text-align: center;
+  border-top: 1px solid var(--line);
+}
+.footer a {
+  color: var(--muted);
+  text-decoration: none;
+  font-size: 12px;
+  transition: color 0.2s;
+}
+.footer a:hover { color: var(--ink); }
+</style>
+</head>
 <body>
-<h1>Drive9 tenant ready</h1>
-<p>Tenant: <code>{{.TenantID}}</code></p>
-<p>Status: <code>{{.Status}}</code></p>
-<p>API key is only returned from the JSON callback response.</p>
+<div class="page">
+  <div class="card">
+    <div class="header">
+      <div class="badge"><span class="badge-dot"></span> drive9</div>
+      <h1>Login Successful</h1>
+      <p>Your tenant is ready. Copy the credentials below to configure your CLI.</p>
+    </div>
+
+    <div class="section">
+      <div class="section-title">API Key</div>
+      <div class="copy-row" data-copy-text="{{.APIKey}}">
+        <div class="copy-value">{{.APIKey}}</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Server URL</div>
+      <div class="copy-row" data-copy-text="{{.ServerURL}}">
+        <div class="copy-value">{{.ServerURL}}</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Identity</div>
+      <div class="info-grid">
+        <div class="info-item">
+          <div class="info-label">Provider</div>
+          <div class="info-value">{{.Principal.Provider}}</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Type</div>
+          <div class="info-value">{{.Principal.Type}}</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Server ID</div>
+          <div class="info-value">{{.Principal.ServerID}}</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Subject</div>
+          <div class="info-value">{{.Principal.Sub}}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Getting Started</div>
+      <div class="doc-box">
+        Read <a href="https://drive9.ai/skill.md" target="_blank" rel="noopener noreferrer">https://drive9.ai/skill.md</a> and follow the instructions to install and configure drive9.
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">Quick Start</div>
+      <div class="cli-box" data-copy-text="drive9 ctx add --api-key {{.APIKey}} --server {{.ServerURL}}">
+        <code><span class="cmd">drive9</span> <span class="arg">ctx</span> <span class="arg">add</span> <span class="arg">--api-key</span> "{{.APIKey}}" <span class="arg">--server</span> {{.ServerURL}}</code>
+      </div>
+    </div>
+
+    <div class="footer">
+      <a href="https://drive9.ai">drive9.ai</a> — persistent filesystem for AI agents
+    </div>
+  </div>
+</div>
+<script>
+(function() {
+  function copy(el) {
+    var text = el.dataset.copyText || el.textContent.trim();
+    var done = function() {
+      el.dataset.copied = 'true';
+      setTimeout(function() { delete el.dataset.copied; }, 1500);
+    };
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(done).catch(function() {
+          fallbackCopy(text, done);
+        });
+      } else {
+        fallbackCopy(text, done);
+      }
+    } catch(_) {
+      fallbackCopy(text, done);
+    }
+  }
+  function fallbackCopy(text, done) {
+    var ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.cssText = 'position:fixed;opacity:0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch(e) {}
+    document.body.removeChild(ta);
+  }
+  document.querySelectorAll('.copy-row, .cli-box').forEach(function(el) {
+    el.addEventListener('click', function() { copy(el); });
+  });
+})();
+</script>
 </body>
 </html>`))
 
@@ -87,13 +431,13 @@ func (s *Server) handleSlockCallback(w http.ResponseWriter, r *http.Request) {
 	tok, err := s.slockOAuth.ExchangeCode(r.Context(), code)
 	if err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "slock_token_exchange_failed", "error", err)...)
-		writeSlockOAuthError(w, err)
+		writeSlockOAuthError(w, r, err)
 		return
 	}
 	info, err := s.slockOAuth.Userinfo(r.Context(), tok.AccessToken)
 	if err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "slock_userinfo_failed", "error", err)...)
-		writeSlockOAuthError(w, err)
+		writeSlockOAuthError(w, r, err)
 		return
 	}
 
@@ -101,10 +445,25 @@ func (s *Server) handleSlockCallback(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var pe *provisionTenantError
 		if errors.As(err, &pe) {
-			errJSON(w, pe.status, pe.message)
+			if wantsJSON(r) {
+				errJSON(w, pe.status, pe.message)
+				return
+			}
+			setSlockCallbackNoStoreHeaders(w)
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(pe.status)
+			_, _ = fmt.Fprintf(w, "<!doctype html><html><body style='font-family:sans-serif;padding:40px;text-align:center;background:#0a0908;color:#ede8e0'><h1>Provisioning Error</h1><p style='color:#c75050'>%s</p></body></html>", template.HTMLEscapeString(pe.message))
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, "slock tenant provision failed")
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "slock_tenant_provision_failed", "error", err)...)
+		if wantsJSON(r) {
+			errJSON(w, http.StatusInternalServerError, "slock tenant provision failed")
+			return
+		}
+		setSlockCallbackNoStoreHeaders(w)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = fmt.Fprint(w, "<!doctype html><html><body style='font-family:sans-serif;padding:40px;text-align:center;background:#0a0908;color:#ede8e0'><h1>Provisioning Error</h1><p style='color:#c75050'>slock tenant provision failed</p></body></html>")
 		return
 	}
 	if wantsJSON(r) {
@@ -113,7 +472,7 @@ func (s *Server) handleSlockCallback(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(resp)
 		return
 	}
-	writeSlockHTML(w, resp)
+	writeSlockHTML(w, resp, s.vaultIssuerURL)
 }
 
 func (s *Server) ensureSlockProvisioningEnabled() error {
@@ -216,6 +575,36 @@ func (s *Server) slockIssueForBinding(ctx context.Context, binding *meta.Externa
 	default:
 		return nil, false, newProvisionTenantError(http.StatusForbidden, "bound tenant is unavailable", fmt.Errorf("tenant status %s", t.Status))
 	}
+
+	// Reuse existing active API key for the same issuer instead of rotating.
+	existingKey, err := s.meta.GetActiveAPIKeyByIssuer(ctx, t.ID, source.Provider, source.SubjectKey)
+	if err == nil {
+		plain, decryptErr := poolDecryptToken(ctx, s.pool, existingKey.JWTCiphertext)
+		if decryptErr == nil {
+			// Verify the reused token is still valid with the current signing key.
+			_, verifyErr := token.ParseAndVerifyToken(s.tokenSecret, string(plain))
+			if verifyErr == nil {
+				logger.Info(ctx, "server_event", eventFields(ctx, "slock_external_binding_resolved",
+					"tenant_id", t.ID, "subject_key", binding.SubjectKey, "status", string(t.Status), "reuse", true)...)
+				return &slockCallbackResponse{
+					TenantID:  t.ID,
+					APIKey:    string(plain),
+					Status:    string(t.Status),
+					Principal: principal,
+				}, false, nil
+			}
+			logger.Warn(ctx, "server_event", eventFields(ctx, "slock_existing_key_verify_failed",
+				"tenant_id", t.ID, "api_key_id", existingKey.ID, "error", verifyErr)...)
+		} else {
+			logger.Warn(ctx, "server_event", eventFields(ctx, "slock_existing_key_decrypt_failed",
+				"tenant_id", t.ID, "api_key_id", existingKey.ID, "error", decryptErr)...)
+		}
+	} else if !errors.Is(err, meta.ErrNotFound) {
+		logger.Error(ctx, "server_event", eventFields(ctx, "slock_get_active_key_failed",
+			"tenant_id", t.ID, "error", err)...)
+		return nil, false, newProvisionTenantError(http.StatusInternalServerError, "failed to lookup existing api key", err)
+	}
+
 	apiKey, _, err := s.rotateIssuedOwnerAPIKey(ctx, t.ID, "slock", source)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "slock_api_key_issue_failed", "tenant_id", t.ID, "error", err)...)
@@ -273,26 +662,41 @@ func (s *Server) rotateIssuedOwnerAPIKey(ctx context.Context, tenantID, keyName 
 	return rawToken, apiKeyID, nil
 }
 
-func writeSlockOAuthError(w http.ResponseWriter, err error) {
+func writeSlockOAuthError(w http.ResponseWriter, r *http.Request, err error) {
 	var oe slockoauth.OAuthError
+	msg := "slock oauth request failed"
 	if errors.As(err, &oe) {
-		errJSON(w, http.StatusBadGateway, oe.Error())
+		msg = oe.Error()
+	}
+	if wantsJSON(r) {
+		errJSON(w, http.StatusBadGateway, msg)
 		return
 	}
-	errJSON(w, http.StatusBadGateway, "slock oauth request failed")
+	setSlockCallbackNoStoreHeaders(w)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusBadGateway)
+	_, _ = fmt.Fprintf(w, "<!doctype html><html><body style='font-family:sans-serif;padding:40px;text-align:center;background:#0a0908;color:#ede8e0'><h1>Authentication Error</h1><p style='color:#c75050'>%s</p></body></html>", template.HTMLEscapeString(msg))
 }
 
 func wantsJSON(r *http.Request) bool {
 	if strings.EqualFold(r.URL.Query().Get("format"), "json") {
 		return true
 	}
-	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "application/json")
+	return !strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html")
 }
 
-func writeSlockHTML(w http.ResponseWriter, resp *slockCallbackResponse) {
+func writeSlockHTML(w http.ResponseWriter, resp *slockCallbackResponse, serverURL string) {
 	setSlockCallbackNoStoreHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	if err := slockHTMLTemplate.Execute(w, resp); err != nil {
+	if err := slockHTMLTemplate.Execute(w, struct {
+		APIKey    string
+		Principal slockPrincipal
+		ServerURL string
+	}{
+		APIKey:    resp.APIKey,
+		Principal: resp.Principal,
+		ServerURL: serverURL,
+	}); err != nil {
 		logger.Warn(context.Background(), "slock_html_render_failed", zap.Error(err))
 	}
 }
@@ -300,4 +704,5 @@ func writeSlockHTML(w http.ResponseWriter, resp *slockCallbackResponse) {
 func setSlockCallbackNoStoreHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 }

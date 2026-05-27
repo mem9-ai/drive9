@@ -430,7 +430,8 @@ func metaInitSchemaStatements() []string {
 			created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			UNIQUE INDEX idx_api_keys_hash (jwt_hash),
-			INDEX idx_api_keys_tenant (tenant_id, status)
+			INDEX idx_api_keys_tenant (tenant_id, status),
+			INDEX idx_api_keys_issuer (tenant_id, issued_by_provider, issued_by_subject_key, status, created_at)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_external_bindings (
 			provider      VARCHAR(64) NOT NULL,
@@ -1588,6 +1589,50 @@ func (s *Store) RevokeAPIKeysByIssuer(ctx context.Context, tenantID, provider, s
 			AND (? = '' OR id <> ?)`,
 		APIKeyRevoked, now, now, tenantID, provider, subjectKey, APIKeyActive, exceptAPIKeyID, exceptAPIKeyID)
 	return err
+}
+
+func (s *Store) GetActiveAPIKeyByIssuer(ctx context.Context, tenantID, provider, subjectKey string) (out *APIKey, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_active_api_key_by_issuer", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT
+			id, tenant_id, key_name, jwt_ciphertext, jwt_hash, token_version, status, scope_kind,
+			issued_by_provider, issued_by_subject_key, issued_by_metadata_json, issued_at,
+			revoked_at, created_at, updated_at
+		FROM tenant_api_keys
+		WHERE tenant_id = ? AND issued_by_provider = ? AND issued_by_subject_key = ? AND status = ?
+		ORDER BY created_at DESC
+		LIMIT 1`, tenantID, provider, subjectKey, APIKeyActive)
+
+	var rec APIKey
+	var revokedAt sql.NullTime
+	var issuedByProvider sql.NullString
+	var issuedBySubjectKey sql.NullString
+	var issuedByMetadataJSON []byte
+	if err = row.Scan(
+		&rec.ID, &rec.TenantID, &rec.KeyName, &rec.JWTCiphertext,
+		&rec.JWTHash, &rec.TokenVersion, &rec.Status, &rec.ScopeKind,
+		&issuedByProvider, &issuedBySubjectKey, &issuedByMetadataJSON, &rec.IssuedAt,
+		&revokedAt, &rec.CreatedAt, &rec.UpdatedAt,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = ErrNotFound
+			return nil, err
+		}
+		return nil, err
+	}
+	if revokedAt.Valid {
+		t := revokedAt.Time.UTC()
+		rec.RevokedAt = &t
+	}
+	if issuedByProvider.Valid {
+		rec.IssuedByProvider = issuedByProvider.String
+	}
+	if issuedBySubjectKey.Valid {
+		rec.IssuedBySubjectKey = issuedBySubjectKey.String
+	}
+	rec.IssuedByMetadataJSON = issuedByMetadataJSON
+	out = &rec
+	return out, nil
 }
 
 func (s *Store) UpsertStorageNamespace(ctx context.Context, ns *StorageNamespace) (err error) {
