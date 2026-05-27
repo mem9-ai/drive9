@@ -584,3 +584,46 @@ func TestReconcilePendingTenantDoesNotOverwriteChangedStatus(t *testing.T) {
 		t.Fatalf("status after reconcile = %s, want %s", status, meta.TenantProvisioning)
 	}
 }
+
+func TestServerCloseCancelsSchemaInitRetryWorker(t *testing.T) {
+	origWindow, origInitBackoff, origMaxBackoff := schemaInitRetryWindow, schemaInitInitialBackoff, schemaInitMaxBackoff
+	schemaInitRetryWindow = time.Minute
+	schemaInitInitialBackoff = 5 * time.Second
+	schemaInitMaxBackoff = 5 * time.Second
+	defer func() {
+		schemaInitRetryWindow = origWindow
+		schemaInitInitialBackoff = origInitBackoff
+		schemaInitMaxBackoff = origMaxBackoff
+	}()
+
+	prov := &fakeProvisioner{
+		provider: tenant.ProviderTiDBZero,
+		cluster:  &tenant.ClusterInfo{},
+		initErr:  fmt.Errorf("boom"),
+	}
+	srv := NewWithConfig(Config{
+		Provisioner: prov,
+		TokenSecret: []byte("abc"),
+	})
+
+	srv.startProvisionedTenantSchemaInit(context.Background(), &provisionTenantResult{
+		TenantID:  "tenant-close-test",
+		TenantDSN: "user:pass@tcp(localhost:3306)/db?parseTime=true",
+		Provider:  tenant.ProviderTiDBZero,
+	})
+
+	// Let the worker enter the retry backoff path before closing the server.
+	time.Sleep(50 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		srv.Close()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Server.Close did not cancel schema init retry worker promptly")
+	}
+}

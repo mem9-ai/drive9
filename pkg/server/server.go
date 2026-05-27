@@ -3278,12 +3278,21 @@ func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) {
-	ctx = backgroundWithTrace(ctx)
+	ctx = ensureTrace(ctx)
 	logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_started", "tenant_id", tenantID, "provider", provider)...)
 	deadline := time.Now().Add(schemaInitRetryWindow)
 	backoff := schemaInitInitialBackoff
 	attempt := 1
 	for {
+		select {
+		case <-ctx.Done():
+			logger.Info(ctx, "schema_init_stopped",
+				zap.String("tenant_id", tenantID),
+				zap.String("provider", provider),
+				zap.Error(ctx.Err()))
+			return
+		default:
+		}
 		if err := schemaInit(ctx, tenantDSN); err == nil {
 			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_ok", "tenant_id", tenantID, "provider", provider, "attempt", attempt)...)
 			if s.metrics != nil {
@@ -3333,7 +3342,19 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			sleepFor = time.Until(deadline)
 		}
 		if sleepFor > 0 {
-			time.Sleep(sleepFor)
+			timer := time.NewTimer(sleepFor)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				logger.Info(ctx, "schema_init_stopped",
+					zap.String("tenant_id", tenantID),
+					zap.String("provider", provider),
+					zap.Error(ctx.Err()))
+				return
+			case <-timer.C:
+			}
 		}
 		backoff *= 2
 		attempt++
