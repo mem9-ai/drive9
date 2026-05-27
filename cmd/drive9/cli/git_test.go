@@ -1,14 +1,18 @@
 package cli
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -193,6 +197,39 @@ func TestParseGitHubRepoURL(t *testing.T) {
 	}
 }
 
+func TestArchiveGitStateDirSkipsObjectDatabases(t *testing.T) {
+	gitDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte("[core]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "objects", "aa"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "objects", "aa", "blob"), []byte("object"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "modules", "sub", "objects", "bb"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "modules", "sub", "objects", "bb", "blob"), []byte("object"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := archiveGitStateDir(gitDir)
+	if err != nil {
+		t.Fatalf("archiveGitStateDir: %v", err)
+	}
+	names := gitArchiveNames(t, state)
+	if !names["config"] {
+		t.Fatalf("config missing from objectless archive")
+	}
+	for name := range names {
+		if name == "objects" || strings.HasPrefix(name, "objects/") || strings.Contains(name, "/objects/") {
+			t.Fatalf("object database path %q included in objectless archive", name)
+		}
+	}
+}
+
 func TestResolveMountedGitTargetUsesMountMetadata(t *testing.T) {
 	mountPoint := t.TempDir()
 	localRoot := t.TempDir()
@@ -289,4 +326,25 @@ func gitOutputForTest(t *testing.T, dir string, args ...string) string {
 
 func int64Ptr(v int64) *int64 {
 	return &v
+}
+
+func gitArchiveNames(t *testing.T, content []byte) map[string]bool {
+	t.Helper()
+	gz, err := gzip.NewReader(bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v", err)
+	}
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	names := make(map[string]bool)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return names
+		}
+		if err != nil {
+			t.Fatalf("tar.Next: %v", err)
+		}
+		names[hdr.Name] = true
+	}
 }

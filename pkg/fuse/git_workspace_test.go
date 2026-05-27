@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -21,7 +22,10 @@ type gitWorkspaceFixture struct {
 	mu              sync.Mutex
 	overlay         map[string]client.GitOverlayEntry
 	state           []byte
+	stateStorage    string
 	server          *httptest.Server
+	repoURL         string
+	treeNodes       []client.GitTreeNode
 	readmeObjectSHA string
 	readmeSize      int64
 }
@@ -30,6 +34,8 @@ func newGitWorkspaceFixture(t *testing.T) *gitWorkspaceFixture {
 	t.Helper()
 	f := &gitWorkspaceFixture{
 		overlay:         make(map[string]client.GitOverlayEntry),
+		stateStorage:    "tar.gz",
+		repoURL:         "https://example.test/repo.git",
 		readmeObjectSHA: "2222222222222222222222222222222222222222",
 		readmeSize:      12,
 	}
@@ -49,7 +55,7 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"workspaces": []client.GitWorkspace{{
 			WorkspaceID: "ws1",
 			RootPath:    "/repo/",
-			RepoURL:     "https://example.test/repo.git",
+			RepoURL:     f.repoURL,
 			RemoteName:  "origin",
 			BranchName:  "main",
 			BaseCommit:  "1111111111111111111111111111111111111111",
@@ -60,24 +66,28 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 			UpdatedAt:   time.Now(),
 		}}})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/git-workspaces/ws1/tree":
-		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": []client.GitTreeNode{{
-			WorkspaceID: "ws1",
-			CommitSHA:   "1111111111111111111111111111111111111111",
-			Path:        "README.md",
-			ParentPath:  "",
-			Name:        "README.md",
-			Kind:        "file",
-			Mode:        "100644",
-			ObjectSHA:   f.readmeObjectSHA,
-			SizeBytes:   f.readmeSize,
-		}}})
+		nodes := f.treeNodes
+		if nodes == nil {
+			nodes = []client.GitTreeNode{{
+				WorkspaceID: "ws1",
+				CommitSHA:   "1111111111111111111111111111111111111111",
+				Path:        "README.md",
+				ParentPath:  "",
+				Name:        "README.md",
+				Kind:        "file",
+				Mode:        "100644",
+				ObjectSHA:   f.readmeObjectSHA,
+				SizeBytes:   f.readmeSize,
+			}}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": nodes})
 	case r.URL.Path == "/v1/git-workspaces/ws1/overlay":
 		f.handleOverlay(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/git-workspaces/ws1/git-state":
 		_ = json.NewEncoder(w).Encode(client.GitState{
 			WorkspaceID:      "ws1",
 			CheckpointCommit: "1111111111111111111111111111111111111111",
-			StorageType:      "tar.gz",
+			StorageType:      f.stateStorage,
 			SizeBytes:        int64(len(f.state)),
 			Content:          f.state,
 		})
@@ -263,6 +273,122 @@ func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	}
 	if string(got) != "[core]\n" {
 		t.Fatalf("restored config = %q, want %q", got, "[core]\n")
+	}
+}
+
+func TestArchiveLocalGitStateDirSkipsObjectDatabases(t *testing.T) {
+	gitDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte("[core]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "objects", "aa"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "objects", "aa", "blob"), []byte("object"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(gitDir, "modules", "sub", "objects", "bb"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "modules", "sub", "objects", "bb", "blob"), []byte("object"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	state, err := archiveLocalGitStateDir(gitDir)
+	if err != nil {
+		t.Fatalf("archiveLocalGitStateDir: %v", err)
+	}
+	dst := t.TempDir()
+	if err := extractGitArchive(state, dst); err != nil {
+		t.Fatalf("extractGitArchive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "config")); err != nil {
+		t.Fatalf("config missing from objectless archive: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "objects")); !os.IsNotExist(err) {
+		t.Fatalf("objects restored from objectless archive, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "modules", "sub", "objects")); !os.IsNotExist(err) {
+		t.Fatalf("module objects restored from objectless archive, err=%v", err)
+	}
+}
+
+func TestGitWorkspaceObjectlessStateRestoresObjectsFromRemote(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	fixture := newGitWorkspaceFixture(t)
+	content := []byte("hello base\n")
+	repo := createGitRepoWithReadme(t, content)
+	state, err := archiveLocalGitStateDir(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("archiveLocalGitStateDir: %v", err)
+	}
+	fixture.repoURL = repo
+	fixture.state = state
+	fixture.stateStorage = gitStateStorageTarGzNoObjects
+	fixture.readmeObjectSHA = fuseGitOutputForTest(t, repo, "hash-object", "README.md")
+	fixture.readmeSize = int64(len(content))
+
+	localRoot := t.TempDir()
+	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+
+	got, err := fs.readGitFile(context.Background(), "/repo/README.md", 0, int64(len(content)))
+	if err != nil {
+		t.Fatalf("readGitFile: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("readGitFile = %q, want %q", got, content)
+	}
+	if _, err := os.Stat(filepath.Join(localRoot, "overlay", "repo", ".git", "objects")); err != nil {
+		t.Fatalf("restored git objects missing: %v", err)
+	}
+}
+
+func TestGitWorkspaceTrackedLocalOnlyPathBypassesLocalOverlay(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.treeNodes = []client.GitTreeNode{
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   "1111111111111111111111111111111111111111",
+			Path:        "build",
+			ParentPath:  "",
+			Name:        "build",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			SizeBytes:   0,
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   "1111111111111111111111111111111111111111",
+			Path:        "build/raw-text-plugin.mjs",
+			ParentPath:  "build",
+			Name:        "raw-text-plugin.mjs",
+			Kind:        "file",
+			Mode:        "100644",
+			ObjectSHA:   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+			SizeBytes:   42,
+		},
+	}
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var buildOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "build", &buildOut); st != gofuse.OK {
+		t.Fatalf("Lookup build status = %v, want OK", st)
+	}
+	var fileOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: buildOut.NodeId}, "raw-text-plugin.mjs", &fileOut); st != gofuse.OK {
+		t.Fatalf("Lookup tracked build file status = %v, want OK", st)
+	}
+	if fileOut.Size != 42 {
+		t.Fatalf("tracked build file size = %d, want 42", fileOut.Size)
 	}
 }
 

@@ -28,9 +28,10 @@ import (
 )
 
 const (
-	gitWorkspaceAPITimeout = 2 * time.Minute
-	githubTreeAPITimeout   = 30 * time.Second
-	githubAPIBaseURL       = "https://api.github.com"
+	gitWorkspaceAPITimeout        = 2 * time.Minute
+	githubTreeAPITimeout          = 30 * time.Second
+	githubAPIBaseURL              = "https://api.github.com"
+	gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
 )
 
 // Git handles git-aware drive9 workflows.
@@ -56,7 +57,7 @@ func gitUsage() {
 
 commands:
   clone --fast <repo-url> <mounted-path>
-                       create a blobless local .git and register the HEAD tree
+                       create a full local .git and register the HEAD tree
 
 global:
   -h, --help, help     show this help
@@ -88,8 +89,8 @@ func gitClone(args []string) error {
 		return err
 	}
 
-	if err := runGitStreaming("clone", "--filter=blob:none", "--no-checkout", repoURL, target); err != nil {
-		return fmt.Errorf("git clone --filter=blob:none --no-checkout: %w", err)
+	if err := runGitStreaming("clone", "--no-checkout", repoURL, target); err != nil {
+		return fmt.Errorf("git clone --no-checkout: %w", err)
 	}
 	head, err := gitOutput(target, "rev-parse", "HEAD")
 	if err != nil {
@@ -154,7 +155,7 @@ func gitClone(args []string) error {
 			return fmt.Errorf("stat local .git checkpoint path: %w", statErr)
 		}
 	}
-	gitState, err := archiveGitDir(gitDir)
+	gitState, err := archiveGitStateDir(gitDir)
 	if err != nil {
 		return fmt.Errorf("checkpoint .git: %w", err)
 	}
@@ -162,7 +163,7 @@ func gitClone(args []string) error {
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	if _, err := c.UpsertGitState(ctx, ws.WorkspaceID, client.GitStateRequest{
 		CheckpointCommit: head,
-		StorageType:      "tar.gz",
+		StorageType:      gitStateStorageTarGzNoObjects,
 		ChecksumSHA256:   hex.EncodeToString(sum[:]),
 		SizeBytes:        int64(len(gitState)),
 		Content:          gitState,
@@ -631,7 +632,11 @@ func splitGitManifestPath(p string) (parent, name string, err error) {
 	return parent, name, nil
 }
 
-func archiveGitDir(gitDir string) ([]byte, error) {
+func archiveGitStateDir(gitDir string) ([]byte, error) {
+	return archiveGitDir(gitDir, shouldSkipGitObjectStatePath)
+}
+
+func archiveGitDir(gitDir string, skip func(string, fs.DirEntry) bool) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
@@ -642,15 +647,21 @@ func archiveGitDir(gitDir string) ([]byte, error) {
 		if p == gitDir {
 			return nil
 		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
 		rel, err := filepath.Rel(gitDir, p)
 		if err != nil {
 			return err
 		}
 		name := filepath.ToSlash(rel)
+		if skip != nil && skip(name, d) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
 		link := ""
 		if info.Mode()&os.ModeSymlink != 0 {
 			link, err = os.Readlink(p)
@@ -690,4 +701,13 @@ func archiveGitDir(gitDir string) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func shouldSkipGitObjectStatePath(rel string, _ fs.DirEntry) bool {
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if part == "objects" {
+			return true
+		}
+	}
+	return false
 }

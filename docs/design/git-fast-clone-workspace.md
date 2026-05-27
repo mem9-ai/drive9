@@ -12,7 +12,7 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 ## Goals
 
 - `drive9 git clone --fast <repo-url> <mounted-path>` registers only the HEAD tree manifest and does not check out clean file content into `file_nodes`.
-- The FUSE directory exposes the full file tree; clean file content is loaded on demand from the local blobless `.git`.
+- The local `.git` object database is a full clone, while the working tree checkout is virtual. Build-time reads are served from local Git objects instead of Drive9 file rows or GitHub lazy blob fetches.
 - Working tree changes such as edit/create/delete/chmod/symlink are persisted to the Drive9 backend overlay.
 - `.git` keeps local disk read/write performance while being checkpointed to Drive9 for cross-sandbox recovery.
 - `git add`, `git commit`, and `git push` should remain as close as possible to the native Git workflow, without introducing a separate push API.
@@ -21,6 +21,7 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 
 - Do not add a full artifact-style command suite or turn this into a general content-addressed checkout tool.
 - Do not write clean tree file content into `file_nodes` or `contents`.
+- Do not persist the full Git object database in Drive9. Cross-sandbox recovery may depend on the original Git remote, such as GitHub, to repopulate local objects.
 - Do not introduce local SQLite. Local state continues to use the existing local overlay, shadow files, and `journal.wal`; authoritative state lives in Drive9 backend Git workspace tables.
 - Do not implement complete semantics for complex Git features in the first version, such as optimized submodule/LFS handling, merge conflict assistance, or automatic remote branch synchronization.
 
@@ -38,7 +39,7 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 - Paths are relative to the workspace root and do not have a leading `/`.
 - Includes `kind`, `mode`, `object_sha`, and `size_bytes` for directories, files, symlinks, and submodules.
 - Clean tree file content is not stored in Drive9's generic file content tables.
-- `size_bytes` must be populated without triggering blob fetches. Manifest generation uses `git ls-tree -r -t -z HEAD` and must not use `git ls-tree -l`; `-l` asks Git to print blob sizes, which triggers lazy fetches in a blobless partial clone and turns fast clone into a large number of remote object queries.
+- `size_bytes` is still populated without relying on checkout file content. Manifest generation uses `git ls-tree -r -t -z HEAD` and must not use `git ls-tree -l`; `-l` asks Git to print blob sizes and is unsafe if a future mode uses a partial clone again.
 - For GitHub repositories, the CLI fills blob sizes through the GitHub Trees API. If the recursive response is truncated, it falls back to walking trees level by level. This preserves accurate `stat` and `git status` sizes while still avoiding blob downloads during clone.
 - For non-GitHub repositories, unavailable GitHub API responses, or temporarily missing sizes, `size_bytes=-1` means unknown size. FUSE reports size 0 to the kernel attr path as a fallback, but real read/write/truncate/rename-copy paths load the base blob on demand and update the local inode size from the actual content length. This avoids treating unknown-size files as empty files.
 
@@ -52,8 +53,10 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 `git_workspace_git_state`
 
 - Stores `.git` directory checkpoints.
-- The current format is `storage_type=tar.gz`, with the payload in `content_blob`.
-- When sandbox B mounts the same drive, FUSE restores local `.git` from this checkpoint.
+- The checkpoint intentionally excludes Git object databases such as `.git/objects` and `.git/modules/*/objects`.
+- The current format is `storage_type=tar.gz-no-objects`, with the lightweight payload in `content_blob`.
+- When sandbox B mounts the same drive, FUSE first recreates a full local `.git` object database from `repo_url`, then overlays the Drive9 checkpoint to restore refs, index, config, logs, and other lightweight state.
+- Local commits that were not pushed to the remote are outside this recovery model because their objects are not stored in Drive9.
 
 `file_nodes`
 
@@ -75,13 +78,13 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
    drive9 git clone --fast https://github.com/org/repo.git <mountpoint>/<path>/repo
    ```
 
-3. The CLI runs a blobless no-checkout clone under the mounted path:
+3. The CLI runs a full-object no-checkout clone under the mounted path:
 
    ```bash
-   git clone --filter=blob:none --no-checkout <repo-url> <target>
+   git clone --no-checkout <repo-url> <target>
    ```
 
-   `.git` is routed to local disk by the coding-agent local overlay and does not enter Drive9's generic file tables.
+   `.git` is routed to local disk by the coding-agent local overlay and does not enter Drive9's generic file tables. The local object database is complete, so clean file reads during build are local Git object reads.
 
 4. The CLI reads `HEAD`, branch, and `git ls-tree -r -t -z HEAD`, generates the tree manifest, and fills file sizes according to the `git_workspace_tree_nodes.size_bytes` rules.
 
@@ -97,7 +100,7 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 
    - upsert `git_workspaces`
    - replace `git_workspace_tree_nodes`
-   - archive the local overlay `.git` directory and upsert `git_workspace_git_state`
+   - archive the local overlay `.git` directory without object databases and upsert `git_workspace_git_state`
 
 7. After FUSE rediscovers the workspace, directory listings come from the synthetic view of `git_workspace_tree_nodes` plus `git_workspace_overlay`.
 
@@ -106,7 +109,7 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 Read a clean file:
 
 - FUSE looks up the workspace manifest and constructs a virtual inode.
-- On read, FUSE returns blob content on demand through the local `.git`.
+- On read, FUSE returns blob content through the local full-object `.git`.
 - File content is not written into `file_nodes`.
 
 Edit a file:
@@ -131,8 +134,7 @@ Edit a file:
 
 `git push`:
 
-- Git pushes natively.
-- For partial/blobless clones, Git may need to complete history objects if the target remote does not already have the base history. Tests use a pre-mirrored bare remote to model the real incremental push case where the remote already has the base history.
+- Git pushes natively from the local full-object `.git`.
 - Drive9 does not participate in the push protocol.
 
 ## Sandbox Replacement Flow
@@ -148,7 +150,7 @@ Edit a file:
    - `git_workspace_overlay`
    - `git_workspace_git_state`
 
-6. FUSE extracts the `.git` checkpoint into B's local overlay.
+6. FUSE runs a full no-checkout clone from `repo_url` into B's local overlay to repopulate Git objects, then extracts the lightweight `.git` checkpoint over it.
 7. B sees working tree = clean tree manifest + durable overlay; `git status`, `git log`, and file content are restored to A's last persisted state.
 
 ## Local State and SQLite
@@ -161,7 +163,7 @@ Local fast workspace state includes:
 - `<cache-dir>/<mount-id>/journal.wal`: the existing FUSE write/cache journal.
 - shadow/cache files used by the existing write-back and strict durability mechanisms.
 
-Authoritative cross-sandbox state lives in backend DB Git workspace tables. Local files are only the current sandbox's performance layer and restore target.
+Authoritative cross-sandbox working tree state lives in backend DB Git workspace tables. Local files are the current sandbox's performance layer and restore target. Git object content is recovered from the Git remote rather than from Drive9.
 
 ## Dev E2E Validation
 
@@ -186,7 +188,7 @@ Backend table checks:
 
 - `git_workspaces`: active fast workspace row exists.
 - `git_workspace_tree_nodes`: 26 rows, equal to the base commit tree count.
-- `git_workspace_git_state`: `storage_type=tar.gz`, `content_len=46078`.
+- `git_workspace_git_state`: `storage_type=tar.gz-no-objects`; payload contains lightweight `.git` state and excludes object databases.
 - `git_workspace_overlay` contains:
   - `README.txt` upsert file
   - `notes` upsert dir
@@ -198,7 +200,7 @@ Backend table checks:
 
 ## Known Limits and Follow-Ups
 
-- `.git` checkpointing still uploads a full tar.gz archive. Later versions should debounce/coalesce, checkpoint incrementally, or upload only at idle/unmount/write-transaction boundaries.
+- `.git` checkpointing is objectless. Restoring local unpushed commits would require persisting Git objects through S3/storage refs or an object/pack dedup layer.
 - After `git commit`, the overlay remains relative to the base tree. Later versions can add an explicit `drive9 git checkpoint` or an automatic manifest-advance mechanism.
 - Large overlay files need to move from inline `content_blob` to S3/storage refs.
 - Branch switching, merge, rebase, conflicts, submodules, and LFS need deeper semantic validation.

@@ -356,6 +356,9 @@ func (fs *Dat9FS) localOverlayForPath(localPath string) (*LocalOverlay, bool, go
 	if fs.observePathPolicy(localPath) != PathLayerLocalOnly {
 		return nil, false, gofuse.OK
 	}
+	if fs.gitWorkspaceOwnsPath(localPath) {
+		return nil, false, gofuse.OK
+	}
 	if fs.localOverlay == nil {
 		return nil, true, gofuse.EIO
 	}

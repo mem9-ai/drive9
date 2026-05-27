@@ -28,6 +28,7 @@ import (
 
 const gitCheckpointTimeout = 2 * time.Minute
 const gitWorkspaceRefreshInterval = time.Second
+const gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
 
 type gitWorkspaceLayer struct {
 	mu         sync.Mutex
@@ -140,6 +141,20 @@ func (fs *Dat9FS) gitWorkspaceForPath(localPath string) (*gitWorkspaceRuntime, s
 		}
 	}
 	return nil, "", false
+}
+
+func (fs *Dat9FS) gitWorkspaceOwnsPath(localPath string) bool {
+	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+	if !ok || rel == "" {
+		return false
+	}
+	if _, ok := rt.overlayEntry(rel); ok {
+		return true
+	}
+	if _, ok := rt.cleanNode(rel); ok {
+		return true
+	}
+	return rt.hasImpliedDir(rel)
 }
 
 func (rt *gitWorkspaceRuntime) overlayEntry(rel string) (client.GitOverlayEntry, bool) {
@@ -474,12 +489,58 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	if len(state.Content) == 0 {
 		return fmt.Errorf("git workspace %s has no .git checkpoint", rt.workspace.WorkspaceID)
 	}
+	if state.StorageType == gitStateStorageTarGzNoObjects {
+		if err := fs.restoreGitObjectsFromRemote(ctx, rt, gitDir); err != nil {
+			return err
+		}
+	}
 	if err := extractGitArchive(state.Content, gitDir); err != nil {
 		return err
 	}
 	fs.git.mu.Lock()
 	rt.restored = true
 	fs.git.mu.Unlock()
+	return nil
+}
+
+func (fs *Dat9FS) restoreGitObjectsFromRemote(ctx context.Context, rt *gitWorkspaceRuntime, gitDir string) error {
+	repoURL := strings.TrimSpace(rt.workspace.RepoURL)
+	if repoURL == "" {
+		return fmt.Errorf("git workspace %s has no repo URL for object restore", rt.workspace.WorkspaceID)
+	}
+	worktreeRoot := filepath.Dir(gitDir)
+	parent := filepath.Dir(worktreeRoot)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	tmpWorktree, err := os.MkdirTemp(parent, ".drive9-git-restore-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(tmpWorktree) }()
+	if err := os.RemoveAll(tmpWorktree); err != nil {
+		return err
+	}
+	cmd := exec.CommandContext(ctx, "git", "clone", "--no-checkout", repoURL, tmpWorktree)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return fmt.Errorf("restore git objects from remote: %w: %s", err, msg)
+		}
+		return fmt.Errorf("restore git objects from remote: %w", err)
+	}
+	tmpGitDir := filepath.Join(tmpWorktree, ".git")
+	if err := os.MkdirAll(worktreeRoot, 0o755); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(gitDir); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpGitDir, gitDir); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -573,14 +634,14 @@ func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath strin
 	fs.git.checkpoint.Lock()
 	defer fs.git.checkpoint.Unlock()
 
-	content, err := archiveLocalGitDir(gitDir)
+	content, err := archiveLocalGitStateDir(gitDir)
 	if err != nil {
 		return err
 	}
 	sum := sha256.Sum256(content)
 	_, err = fs.client.UpsertGitState(ctx, rt.workspace.WorkspaceID, client.GitStateRequest{
 		CheckpointCommit: rt.workspace.HeadCommit,
-		StorageType:      "tar.gz",
+		StorageType:      gitStateStorageTarGzNoObjects,
 		ChecksumSHA256:   hex.EncodeToString(sum[:]),
 		SizeBytes:        int64(len(content)),
 		Content:          content,
@@ -589,6 +650,14 @@ func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath strin
 }
 
 func archiveLocalGitDir(gitDir string) ([]byte, error) {
+	return archiveLocalGitDirFiltered(gitDir, nil)
+}
+
+func archiveLocalGitStateDir(gitDir string) ([]byte, error) {
+	return archiveLocalGitDirFiltered(gitDir, shouldSkipGitObjectStatePath)
+}
+
+func archiveLocalGitDirFiltered(gitDir string, skip func(string, fs.DirEntry) bool) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
@@ -599,11 +668,18 @@ func archiveLocalGitDir(gitDir string) ([]byte, error) {
 		if p == gitDir {
 			return nil
 		}
-		info, err := d.Info()
+		rel, err := filepath.Rel(gitDir, p)
 		if err != nil {
 			return err
 		}
-		rel, err := filepath.Rel(gitDir, p)
+		name := filepath.ToSlash(rel)
+		if skip != nil && skip(name, d) {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		info, err := d.Info()
 		if err != nil {
 			return err
 		}
@@ -618,7 +694,7 @@ func archiveLocalGitDir(gitDir string) ([]byte, error) {
 		if err != nil {
 			return err
 		}
-		hdr.Name = filepath.ToSlash(rel)
+		hdr.Name = name
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
@@ -646,6 +722,15 @@ func archiveLocalGitDir(gitDir string) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func shouldSkipGitObjectStatePath(rel string, _ fs.DirEntry) bool {
+	for _, part := range strings.Split(filepath.ToSlash(rel), "/") {
+		if part == "objects" {
+			return true
+		}
+	}
+	return false
 }
 
 func (fs *Dat9FS) putGitOverlay(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest) (*client.GitOverlayEntry, error) {
