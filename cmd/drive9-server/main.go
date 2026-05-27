@@ -27,6 +27,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 	"github.com/mem9-ai/dat9/pkg/server"
+	"github.com/mem9-ai/dat9/pkg/slockoauth"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/db9"
 	"github.com/mem9-ai/dat9/pkg/tenant/starter"
@@ -258,6 +259,16 @@ func main() {
 		}
 	}
 
+	slockOAuth, err := slockOAuthFromEnv()
+	if err != nil {
+		die(err)
+	}
+	if slockOAuth != nil {
+		logger.Info(context.Background(), "slock_oauth_enabled")
+	} else {
+		logger.Info(context.Background(), "slock_oauth_disabled")
+	}
+
 	die(server.NewWithConfig(server.Config{
 		Meta:             store,
 		Pool:             pool,
@@ -271,6 +282,7 @@ func main() {
 		Logger:           srvLogger,
 		SemanticEmbedder: semanticEmbedder,
 		SemanticWorkers:  semanticWorkerOpts,
+		SlockOAuth:       slockOAuth,
 	}).ListenAndServe(addr))
 }
 
@@ -279,6 +291,24 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func slockOAuthFromEnv() (*slockoauth.Client, error) {
+	origin := strings.TrimSpace(os.Getenv("DRIVE9_SLOCK_ORIGIN"))
+	if origin == "" {
+		return nil, nil
+	}
+	cfg := slockoauth.Config{
+		Origin:       origin,
+		APIOrigin:    strings.TrimSpace(os.Getenv("DRIVE9_SLOCK_API_ORIGIN")),
+		ClientID:     strings.TrimSpace(os.Getenv("DRIVE9_SLOCK_CLIENT_ID")),
+		ClientSecret: strings.TrimSpace(os.Getenv("DRIVE9_SLOCK_CLIENT_SECRET")),
+		PublicURL:    strings.TrimSpace(os.Getenv("DRIVE9_PUBLIC_URL")),
+	}
+	if cfg.APIOrigin == "" || cfg.ClientID == "" || cfg.ClientSecret == "" || cfg.PublicURL == "" {
+		return nil, fmt.Errorf("DRIVE9_SLOCK_ORIGIN enables Slock OAuth; DRIVE9_SLOCK_API_ORIGIN, DRIVE9_SLOCK_CLIENT_ID, DRIVE9_SLOCK_CLIENT_SECRET, and DRIVE9_PUBLIC_URL must also be set")
+	}
+	return slockoauth.New(cfg)
 }
 
 func s3ConfigFromEnv() s3Config {
@@ -359,6 +389,10 @@ environment:
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
+  DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
+  DRIVE9_SLOCK_API_ORIGIN Slock API origin (required when DRIVE9_SLOCK_ORIGIN is set)
+  DRIVE9_SLOCK_CLIENT_ID Slock connected-app client id (required when DRIVE9_SLOCK_ORIGIN is set)
+  DRIVE9_SLOCK_CLIENT_SECRET Slock connected-app client secret (required when DRIVE9_SLOCK_ORIGIN is set)
 
   S3 storage (set DRIVE9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)

@@ -229,6 +229,11 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 
 		switch resolved.Tenant.Status {
 		case meta.TenantActive:
+		case meta.TenantPending:
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_pending", "tenant_id", resolved.Tenant.ID)...)
+			metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantPending))
+			errJSON(w, http.StatusServiceUnavailable, "tenant provisioning is pending")
+			return
 		case meta.TenantProvisioning:
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_provisioning", "tenant_id", resolved.Tenant.ID)...)
 			metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantProvisioning))

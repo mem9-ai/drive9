@@ -84,6 +84,7 @@ func ResetMetaDB(t *testing.T, db *sql.DB) {
 	queries := []string{
 		"DELETE FROM tenant_api_key_fs_scopes",
 		"DELETE FROM tenant_api_keys",
+		"DELETE FROM tenant_external_bindings",
 		"DELETE FROM tenants",
 	}
 	for _, q := range queries {

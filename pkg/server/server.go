@@ -25,6 +25,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/metrics"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/dat9/pkg/slockoauth"
 	"github.com/mem9-ai/dat9/pkg/tagutil"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
@@ -52,6 +53,13 @@ type Config struct {
 	Logger           *zap.Logger
 	SemanticEmbedder embedding.Client
 	SemanticWorkers  SemanticWorkerOptions
+	SlockOAuth       SlockOAuthClient
+}
+
+type SlockOAuthClient interface {
+	LoginURL() string
+	ExchangeCode(ctx context.Context, code string) (slockoauth.Token, error)
+	Userinfo(ctx context.Context, accessToken string) (slockoauth.UserInfo, error)
 }
 
 type Server struct {
@@ -72,6 +80,7 @@ type Server struct {
 	semanticWorker      *semanticWorkerManager
 	journalCursorSecret []byte
 	objectGCWorker      *objectGCWorker
+	slockOAuth          SlockOAuthClient
 	forkWorkerCtx       context.Context
 	forkWorkerCancel    context.CancelFunc
 	forkWorkerWG        sync.WaitGroup
@@ -83,6 +92,8 @@ var (
 	schemaInitRetryWindow    = 10 * time.Minute
 	schemaInitInitialBackoff = 2 * time.Second
 	schemaInitMaxBackoff     = 30 * time.Second
+	pendingTenantStaleAfter  = 10 * time.Minute
+	pendingTenantSweepEvery  = time.Minute
 )
 
 // DefaultMaxUploadBytes is the server-wide fallback upload size limit.
@@ -159,6 +170,7 @@ func NewWithConfig(cfg Config) *Server {
 		metrics:             newServerMetrics(),
 		logger:              logger,
 		events:              newEventBuses(),
+		slockOAuth:          cfg.SlockOAuth,
 		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
@@ -208,6 +220,8 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
+	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
+	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
@@ -244,6 +258,8 @@ func NewWithConfig(cfg Config) *Server {
 
 	s.mux = mux
 	if s.meta != nil && s.pool != nil && s.provisioner != nil {
+		s.resumePendingTenants()
+		s.startPendingTenantReconciler()
 		s.resumeProvisioningTenants()
 		s.resumeDeletingForkTenants()
 	}
@@ -327,23 +343,111 @@ func (s *Server) resumeProvisioningTenants() {
 			s.startForkProvision(ctx, t.ID)
 			continue
 		}
-		go s.resumeTenantSchemaInit(t)
+		s.startTenantSchemaInitResume(ctx, t)
 	}
 }
 
-func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
+func (s *Server) resumePendingTenants() {
 	ctx := backgroundWithTrace(context.Background())
-	plain, err := s.pool.Decrypt(ctx, t.DBPasswordCipher)
+	tenants, err := s.meta.ListTenantsByStatus(ctx, meta.TenantPending, 1000)
 	if err != nil {
-		logger.Warn(ctx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
+		logger.Error(ctx, "resume_pending_list_failed", zap.Error(err))
 		return
 	}
-	dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
-	s.initTenantSchemaAsync(ctx, t.ID, dsn, t.Provider, s.provisioner.InitSchema)
+	for i := range tenants {
+		s.reconcilePendingTenant(ctx, tenants[i])
+	}
+}
+
+func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant) {
+	s.startServerWorker(ctx, func(workerCtx context.Context) {
+		plain, err := s.pool.Decrypt(workerCtx, t.DBPasswordCipher)
+		if err != nil {
+			logger.Warn(workerCtx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
+			return
+		}
+		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
+		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.provisioner.InitSchema)
+	})
+}
+
+func (s *Server) startPendingTenantReconciler() {
+	if s.forkWorkerCtx == nil || pendingTenantSweepEvery <= 0 {
+		return
+	}
+	s.forkWorkerWG.Add(1)
+	go func() {
+		defer s.forkWorkerWG.Done()
+		ticker := time.NewTicker(pendingTenantSweepEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-s.forkWorkerCtx.Done():
+				return
+			case <-ticker.C:
+				s.resumePendingTenants()
+			}
+		}
+	}()
+}
+
+func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
+	if !isStalePendingTenant(time.Now().UTC(), t) {
+		return
+	}
+	logger.Warn(ctx, "resume_pending_mark_failed",
+		zap.String("tenant_id", t.ID),
+		zap.String("kind", string(t.Kind)),
+		zap.String("provider", t.Provider),
+		zap.Time("updated_at", t.UpdatedAt))
+	updated, err := s.meta.UpdateTenantStatusIf(ctx, t.ID, meta.TenantPending, meta.TenantFailed)
+	if err != nil {
+		logger.Error(ctx, "resume_pending_mark_failed_update_error",
+			zap.String("tenant_id", t.ID),
+			zap.Error(err))
+		return
+	}
+	if !updated {
+		logger.Info(ctx, "resume_pending_mark_failed_skipped",
+			zap.String("tenant_id", t.ID),
+			zap.String("reason", "status_changed"))
+	}
+}
+
+func isStalePendingTenant(now time.Time, t meta.Tenant) bool {
+	if pendingTenantStaleAfter <= 0 {
+		return true
+	}
+	lastTouched := t.UpdatedAt
+	if lastTouched.IsZero() || t.CreatedAt.After(lastTouched) {
+		lastTouched = t.CreatedAt
+	}
+	return !lastTouched.IsZero() && now.Sub(lastTouched) >= pendingTenantStaleAfter
 }
 
 func backgroundWithTrace(ctx context.Context) context.Context {
 	return contextWithTrace(context.Background(), ctx)
+}
+
+func (s *Server) startServerWorker(ctx context.Context, fn func(context.Context)) {
+	workerCtx := backgroundWithTrace(ctx)
+	if s.forkWorkerCtx != nil {
+		workerCtx = contextWithTrace(s.forkWorkerCtx, ctx)
+	}
+
+	s.forkWorkerMu.Lock()
+	if s.forkWorkerClosed {
+		s.forkWorkerMu.Unlock()
+		logger.Warn(workerCtx, "server_worker_start_after_close")
+		return
+	}
+	s.forkWorkerWG.Add(1)
+	s.forkWorkerMu.Unlock()
+
+	go func() {
+		defer s.forkWorkerWG.Done()
+		fn(workerCtx)
+	}()
 }
 
 func ensureTrace(ctx context.Context) context.Context {
@@ -2938,46 +3042,128 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	tenantID := token.NewID()
-	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", tenantID, "provider", provider)...)
-	keyName := "default"
-
-	apiToken, err := token.IssueTokenWithJournalPermissions(s.tokenSecret, tenantID, 1, time.Time{}, ownerJournalPermissionList())
+	res, err := s.provisionTenant(r.Context(), provisionTenantOptions{
+		KeyName:      "default",
+		TokenVersion: 1,
+	})
 	if err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_issue_token_failed", "tenant_id", tenantID, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-		errJSON(w, http.StatusInternalServerError, "failed to issue token")
+		var pe *provisionTenantError
+		if errors.As(err, &pe) {
+			errJSON(w, pe.status, pe.message)
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, "failed to provision tenant")
 		return
 	}
-	hash := token.HashToken(apiToken)
-	now := time.Now().UTC()
-	cluster, err := s.provisioner.Provision(r.Context(), tenantID)
+	s.startProvisionedTenantSchemaInit(r.Context(), res)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"tenant_id": res.TenantID,
+		"api_key":   res.APIKey,
+		"status":    string(res.Status),
+	})
+}
+
+type apiKeyIssueSource struct {
+	Provider     string
+	SubjectKey   string
+	MetadataJSON []byte
+}
+
+type provisionTenantOptions struct {
+	KeyName      string
+	TokenVersion int
+	APIKeySource apiKeyIssueSource
+}
+
+type provisionTenantResult struct {
+	TenantID  string
+	APIKey    string
+	APIKeyID  string
+	Status    meta.TenantStatus
+	Provider  string
+	TenantDSN string
+}
+
+type provisionTenantError struct {
+	status  int
+	message string
+	err     error
+}
+
+func (e *provisionTenantError) Error() string {
+	if e.err != nil {
+		return e.err.Error()
+	}
+	return e.message
+}
+
+func (e *provisionTenantError) Unwrap() error { return e.err }
+
+func newProvisionTenantError(status int, message string, err error) *provisionTenantError {
+	return &provisionTenantError{status: status, message: message, err: err}
+}
+
+func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
+	rawProvider := s.provisioner.ProviderType()
+	provider, err := tenant.NormalizeProvider(rawProvider)
 	if err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "cluster_error")
-		errJSON(w, http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err))
-		return
+		logger.Warn(ctx, "server_event", eventFields(ctx, "provision_provider_invalid", "provider", rawProvider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", rawProvider, "result", "error")
+		return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
+	}
+	tenantID := token.NewID()
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
+
+	keyName := strings.TrimSpace(opts.KeyName)
+	if keyName == "" {
+		keyName = "default"
+	}
+	now := time.Now().UTC()
+	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantPending,
+		DBHost:           "",
+		DBPort:           0,
+		DBUser:           "",
+		DBPasswordCipher: []byte{},
+		DBName:           "",
+		DBTLS:            true,
+		Provider:         provider,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_tenant_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "error")
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant", err)
+	}
+	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
+
+	cluster, err := s.provisioner.Provision(ctx, tenantID)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
+		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+		}
+		return nil, newProvisionTenantError(http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err), err)
 	}
 	cluster.Provider = provider
 
-	cipherPass, err := s.pool.Encrypt(r.Context(), []byte(cluster.Password))
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-		errJSON(w, http.StatusInternalServerError, "failed to encrypt db password")
-		return
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+		}
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encrypt db password", err)
 	}
-	cipherToken, err := s.pool.Encrypt(r.Context(), []byte(apiToken))
-	if err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_encrypt_api_key_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-		errJSON(w, http.StatusInternalServerError, "failed to encrypt api key")
-		return
-	}
-
-	if err := s.meta.InsertTenant(r.Context(), &meta.Tenant{
-		ID:               tenantID,
-		Status:           meta.TenantProvisioning,
+	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
 		DBUser:           cluster.Username,
@@ -2988,52 +3174,92 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		ClusterID:        cluster.ClusterID,
 		ClaimURL:         cluster.ClaimURL,
 		ClaimExpiresAt:   cluster.ClaimExpiresAt,
-		SchemaVersion:    1,
-		CreatedAt:        now,
-		UpdatedAt:        now,
 	}); err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_insert_tenant_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-		metricEvent(r.Context(), "metadb_query", "api", "insert_tenant", "result", "error")
-		errJSON(w, http.StatusInternalServerError, "failed to persist tenant")
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_tenant_connection_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+		}
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant connection", err)
+	}
+	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_tenant_status_failed", "tenant_id", tenantID, "provider", provider, "status", meta.TenantProvisioning, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+		}
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to update tenant status", err)
+	}
+
+	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_api_key_failed", "tenant_id", tenantID, "api_key_id", apiKeyID, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "error")
+		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist api key", err)
+	}
+
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
+	metricEvent(ctx, "tenant_provision", "provider", provider, "result", "accepted")
+
+	return &provisionTenantResult{
+		TenantID:  tenantID,
+		APIKey:    apiToken,
+		APIKeyID:  apiKeyID,
+		Status:    meta.TenantProvisioning,
+		Provider:  provider,
+		TenantDSN: tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
+	}, nil
+}
+
+func (s *Server) startProvisionedTenantSchemaInit(ctx context.Context, res *provisionTenantResult) {
+	if res == nil || res.TenantID == "" || res.TenantDSN == "" || s.provisioner == nil {
 		return
 	}
-	metricEvent(r.Context(), "metadb_query", "api", "insert_tenant", "result", "ok")
-	apiKeyID := token.NewID()
-	if err := s.meta.InsertAPIKey(r.Context(), &meta.APIKey{
-		ID:            apiKeyID,
-		TenantID:      tenantID,
-		KeyName:       keyName,
-		JWTCiphertext: cipherToken,
-		JWTHash:       hash,
-		TokenVersion:  1,
-		Status:        meta.APIKeyActive,
-		IssuedAt:      now,
-		CreatedAt:     now,
-		UpdatedAt:     now,
-	}); err != nil {
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_insert_api_key_failed", "tenant_id", tenantID, "api_key_id", apiKeyID, "error", err)...)
-		metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-		metricEvent(r.Context(), "metadb_query", "api", "insert_api_key", "result", "error")
-		_ = s.meta.UpdateTenantStatus(r.Context(), tenantID, meta.TenantDeleted)
-		errJSON(w, http.StatusInternalServerError, "failed to persist api key")
-		return
-	}
-	metricEvent(r.Context(), "metadb_query", "api", "insert_api_key", "result", "ok")
-
-	// Initialize tenant schema asynchronously; tenant remains in provisioning state until success.
-	dsn := tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true)
-	go s.initTenantSchemaAsync(backgroundWithTrace(r.Context()), tenantID, dsn, provider, s.provisioner.InitSchema)
-	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
-	metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "accepted")
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(map[string]string{
-		"tenant_id": tenantID,
-		"api_key":   apiToken,
-		"status":    string(meta.TenantProvisioning),
+	// Tenant remains in provisioning state until schema initialization succeeds.
+	s.startServerWorker(ctx, func(workerCtx context.Context) {
+		s.initTenantSchemaAsync(workerCtx, res.TenantID, res.TenantDSN, res.Provider, s.provisioner.InitSchema)
 	})
+}
+
+func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string, tokenVersion int, source apiKeyIssueSource) (rawToken, apiKeyID string, err error) {
+	if tokenVersion <= 0 {
+		tokenVersion, err = newScopedTokenVersion()
+		if err != nil {
+			return "", "", err
+		}
+	}
+	rawToken, err = token.IssueTokenWithJournalPermissions(s.tokenSecret, tenantID, tokenVersion, time.Time{}, ownerJournalPermissionList())
+	if err != nil {
+		return "", "", err
+	}
+	cipherToken, err := s.pool.Encrypt(ctx, []byte(rawToken))
+	if err != nil {
+		return "", "", err
+	}
+	now := time.Now().UTC()
+	apiKeyID = token.NewID()
+	if err := s.meta.InsertAPIKey(ctx, &meta.APIKey{
+		ID:                   apiKeyID,
+		TenantID:             tenantID,
+		KeyName:              keyName,
+		JWTCiphertext:        cipherToken,
+		JWTHash:              token.HashToken(rawToken),
+		TokenVersion:         tokenVersion,
+		Status:               meta.APIKeyActive,
+		ScopeKind:            meta.APIKeyScopeKindOwner,
+		IssuedByProvider:     source.Provider,
+		IssuedBySubjectKey:   source.SubjectKey,
+		IssuedByMetadataJSON: source.MetadataJSON,
+		IssuedAt:             now,
+		CreatedAt:            now,
+		UpdatedAt:            now,
+	}); err != nil {
+		return "", "", err
+	}
+	metricEvent(ctx, "metadb_query", "api", "insert_api_key", "result", "ok")
+	return rawToken, apiKeyID, nil
 }
 
 // handleLocalTenantProvision serves drive9-server-local's single-tenant
@@ -3052,19 +3278,34 @@ func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Reque
 }
 
 func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) {
-	ctx = backgroundWithTrace(ctx)
+	ctx = ensureTrace(ctx)
 	logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_started", "tenant_id", tenantID, "provider", provider)...)
 	deadline := time.Now().Add(schemaInitRetryWindow)
 	backoff := schemaInitInitialBackoff
 	attempt := 1
 	for {
+		select {
+		case <-ctx.Done():
+			logger.Info(ctx, "schema_init_stopped",
+				zap.String("tenant_id", tenantID),
+				zap.String("provider", provider),
+				zap.Error(ctx.Err()))
+			return
+		default:
+		}
 		if err := schemaInit(ctx, tenantDSN); err == nil {
 			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_ok", "tenant_id", tenantID, "provider", provider, "attempt", attempt)...)
 			if s.metrics != nil {
 				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "ok")
 			}
-			if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantActive); err != nil {
+			updated, err := s.meta.UpdateTenantStatusIf(ctx, tenantID, meta.TenantProvisioning, meta.TenantActive)
+			if err != nil {
 				logger.Error(ctx, "schema_init_activate_failed", zap.String("tenant_id", tenantID), zap.Error(err))
+			} else if !updated {
+				logger.Warn(ctx, "schema_init_activate_skipped",
+					zap.String("tenant_id", tenantID),
+					zap.String("provider", provider),
+					zap.String("reason", "status_changed"))
 			}
 			return
 		} else {
@@ -3074,8 +3315,13 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			}
 			remaining := time.Until(deadline)
 			if remaining <= 0 {
-				if uerr := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed); uerr != nil {
+				if updated, uerr := s.meta.UpdateTenantStatusIf(ctx, tenantID, meta.TenantProvisioning, meta.TenantFailed); uerr != nil {
 					logger.Error(ctx, "schema_init_mark_failed_update_error", zap.String("tenant_id", tenantID), zap.Error(uerr))
+				} else if !updated {
+					logger.Warn(ctx, "schema_init_mark_failed_skipped",
+						zap.String("tenant_id", tenantID),
+						zap.String("provider", provider),
+						zap.String("reason", "status_changed"))
 				}
 				logger.Error(ctx, "schema_init_retry_exhausted", zap.String("tenant_id", tenantID), zap.Error(err))
 				return
@@ -3096,7 +3342,19 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			sleepFor = time.Until(deadline)
 		}
 		if sleepFor > 0 {
-			time.Sleep(sleepFor)
+			timer := time.NewTimer(sleepFor)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				logger.Info(ctx, "schema_init_stopped",
+					zap.String("tenant_id", tenantID),
+					zap.String("provider", provider),
+					zap.Error(ctx.Err()))
+				return
+			case <-timer.C:
+			}
 		}
 		backoff *= 2
 		attempt++

@@ -16,6 +16,71 @@ func TestVersionTextUsesDrive9ServerComponent(t *testing.T) {
 	}
 }
 
+func TestSlockOAuthFromEnvDisabledByDefault(t *testing.T) {
+	keys := []string{
+		"DRIVE9_SLOCK_ORIGIN",
+		"DRIVE9_SLOCK_API_ORIGIN",
+		"DRIVE9_SLOCK_CLIENT_ID",
+		"DRIVE9_SLOCK_CLIENT_SECRET",
+		"DRIVE9_PUBLIC_URL",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	c, err := slockOAuthFromEnv()
+	if err != nil {
+		t.Fatalf("slockOAuthFromEnv: %v", err)
+	}
+	if c != nil {
+		t.Fatal("expected nil Slock client when DRIVE9_SLOCK_ORIGIN is unset")
+	}
+}
+
+func TestSlockOAuthFromEnvRequiresCompanionVars(t *testing.T) {
+	keys := []string{
+		"DRIVE9_SLOCK_ORIGIN",
+		"DRIVE9_SLOCK_API_ORIGIN",
+		"DRIVE9_SLOCK_CLIENT_ID",
+		"DRIVE9_SLOCK_CLIENT_SECRET",
+		"DRIVE9_PUBLIC_URL",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+	setEnv(t, "DRIVE9_SLOCK_ORIGIN", "https://app.slock.ai")
+
+	if _, err := slockOAuthFromEnv(); err == nil {
+		t.Fatal("expected partial Slock config to fail")
+	}
+}
+
+func TestSlockOAuthFromEnvEnabled(t *testing.T) {
+	keys := []string{
+		"DRIVE9_SLOCK_ORIGIN",
+		"DRIVE9_SLOCK_API_ORIGIN",
+		"DRIVE9_SLOCK_CLIENT_ID",
+		"DRIVE9_SLOCK_CLIENT_SECRET",
+		"DRIVE9_PUBLIC_URL",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+	setEnv(t, "DRIVE9_SLOCK_ORIGIN", "https://app.slock.ai")
+	setEnv(t, "DRIVE9_SLOCK_API_ORIGIN", "https://api.slock.ai")
+	setEnv(t, "DRIVE9_SLOCK_CLIENT_ID", "drive9")
+	setEnv(t, "DRIVE9_SLOCK_CLIENT_SECRET", "secret")
+	setEnv(t, "DRIVE9_PUBLIC_URL", "https://drive9.example.com")
+
+	c, err := slockOAuthFromEnv()
+	if err != nil {
+		t.Fatalf("slockOAuthFromEnv: %v", err)
+	}
+	if c == nil || !strings.Contains(c.LoginURL(), "client_id=drive9") {
+		t.Fatalf("unexpected Slock client: %#v", c)
+	}
+}
+
 func TestBuildBackendOptionsFromEnvAudioDisabled(t *testing.T) {
 	keys := []string{
 		"DRIVE9_QUERY_EMBED_API_BASE",
