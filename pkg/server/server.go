@@ -359,17 +359,6 @@ func (s *Server) resumePendingTenants() {
 	}
 }
 
-func (s *Server) resumeTenantSchemaInit(t meta.Tenant) {
-	ctx := backgroundWithTrace(context.Background())
-	plain, err := s.pool.Decrypt(ctx, t.DBPasswordCipher)
-	if err != nil {
-		logger.Warn(ctx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
-		return
-	}
-	dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
-	s.initTenantSchemaAsync(ctx, t.ID, dsn, t.Provider, s.provisioner.InitSchema)
-}
-
 func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant) {
 	s.startServerWorker(ctx, func(workerCtx context.Context) {
 		plain, err := s.pool.Decrypt(workerCtx, t.DBPasswordCipher)
