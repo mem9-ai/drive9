@@ -7,7 +7,7 @@ from urllib.parse import urlencode, quote
 import requests
 
 from .exceptions import Drive9Error, StatusError, ConflictError
-from .models import FileInfo, StatResult, SearchResult
+from .models import FileInfo, StatMetadataResult, StatResult, SearchResult
 from .transfer import TransferMixin
 from .patch import PatchMixin
 from .stream import StreamWriter
@@ -193,6 +193,22 @@ class Client(TransferMixin, PatchMixin):
             is_dir=resp.headers.get("X-Dat9-IsDir") == "true",
             revision=revision,
             mtime=mtime,
+        )
+
+    def stat_metadata(self, path: str) -> StatMetadataResult:
+        """Return enriched metadata for a path, including semantic_text."""
+        resp = self._request("GET", self._url(path) + "?stat=1")
+        self._check_error(resp)
+        data = resp.json()
+        return StatMetadataResult(
+            size=int(data.get("size") or 0),
+            is_dir=bool(data.get("isdir")),
+            resource_id=data.get("resource_id") or "",
+            revision=int(data.get("revision") or 0),
+            mtime=data.get("mtime"),
+            content_type=data.get("content_type") or "",
+            semantic_text=data.get("semantic_text") or "",
+            tags=data.get("tags") or {},
         )
 
     def delete(self, path: str) -> None:

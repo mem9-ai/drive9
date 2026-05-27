@@ -59,6 +59,7 @@ Environment variables `DRIVE9_SERVER` and `DRIVE9_API_KEY` take priority over th
 | Read file | `client.read(path)` |
 | List directory | `client.list(path)` |
 | Stat | `client.stat(path)` |
+| Enriched stat | `client.statMetadata(path)` |
 | Delete | `client.delete(path)` |
 | Copy | `client.copy(src, dst)` |
 | Rename | `client.rename(old, new)` |
@@ -66,6 +67,10 @@ Environment variables `DRIVE9_SERVER` and `DRIVE9_API_KEY` take priority over th
 | SQL query | `client.sql(query)` |
 | Grep | `client.grep(query, prefix, limit)` |
 | Find | `client.find(prefix, params)` |
+
+`statMetadata` returns enriched file metadata - size, isDir, resourceId,
+revision, mtime, contentType, semanticText, and tags - by calling
+`GET /v1/fs/{path}?stat=1`.
 
 ### Streaming & multipart
 
