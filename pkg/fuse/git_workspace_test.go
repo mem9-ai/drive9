@@ -1,10 +1,12 @@
 package fuse
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -16,16 +18,20 @@ import (
 )
 
 type gitWorkspaceFixture struct {
-	mu      sync.Mutex
-	overlay map[string]client.GitOverlayEntry
-	state   []byte
-	server  *httptest.Server
+	mu              sync.Mutex
+	overlay         map[string]client.GitOverlayEntry
+	state           []byte
+	server          *httptest.Server
+	readmeObjectSHA string
+	readmeSize      int64
 }
 
 func newGitWorkspaceFixture(t *testing.T) *gitWorkspaceFixture {
 	t.Helper()
 	f := &gitWorkspaceFixture{
-		overlay: make(map[string]client.GitOverlayEntry),
+		overlay:         make(map[string]client.GitOverlayEntry),
+		readmeObjectSHA: "2222222222222222222222222222222222222222",
+		readmeSize:      12,
 	}
 	f.server = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.server.Close)
@@ -62,8 +68,8 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 			Name:        "README.md",
 			Kind:        "file",
 			Mode:        "100644",
-			ObjectSHA:   "2222222222222222222222222222222222222222",
-			SizeBytes:   12,
+			ObjectSHA:   f.readmeObjectSHA,
+			SizeBytes:   f.readmeSize,
 		}}})
 	case r.URL.Path == "/v1/git-workspaces/ws1/overlay":
 		f.handleOverlay(w, r)
@@ -258,4 +264,113 @@ func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	if string(got) != "[core]\n" {
 		t.Fatalf("restored config = %q, want %q", got, "[core]\n")
 	}
+}
+
+func TestSliceReadNegativeSizeReadsToEOF(t *testing.T) {
+	got := sliceRead([]byte("abcdef"), 2, -1)
+	if string(got) != "cdef" {
+		t.Fatalf("sliceRead = %q, want cdef", got)
+	}
+}
+
+func TestGitWorkspaceUnknownSizeWritableOpenPreservesBaseContent(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	fixture := newGitWorkspaceFixture(t)
+	content := []byte("hello base\n")
+	repo := createGitRepoWithReadme(t, content)
+	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("archiveLocalGitDir: %v", err)
+	}
+	fixture.state = state
+	fixture.readmeObjectSHA = fuseGitOutputForTest(t, repo, "hash-object", "README.md")
+	fixture.readmeSize = -1
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := lookupOut.Size; got != 0 {
+		t.Fatalf("Lookup size = %d, want 0 attr fallback for unknown size", got)
+	}
+
+	var openOut gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &openOut); st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	appendix := []byte("tail")
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       openOut.Fh,
+		Offset:   uint64(len(content)),
+		Size:     uint32(len(appendix)),
+	}, appendix)
+	if st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	if written != uint32(len(appendix)) {
+		t.Fatalf("Write bytes = %d, want %d", written, len(appendix))
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: openOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["README.md"]
+	fixture.mu.Unlock()
+	if !ok {
+		t.Fatalf("overlay entry missing for README.md")
+	}
+	want := append(append([]byte{}, content...), appendix...)
+	if !bytes.Equal(entry.Content, want) {
+		t.Fatalf("overlay content = %q, want %q", entry.Content, want)
+	}
+}
+
+func createGitRepoWithReadme(t *testing.T, content []byte) string {
+	t.Helper()
+	repo := t.TempDir()
+	runFuseTestGit(t, "", "init", "-b", "main", repo)
+	runFuseTestGit(t, repo, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, repo, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), content, 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", ".")
+	runFuseTestGit(t, repo, "commit", "-m", "initial")
+	return repo
+}
+
+func runFuseTestGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func fuseGitOutputForTest(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return string(bytes.TrimSpace(out))
 }

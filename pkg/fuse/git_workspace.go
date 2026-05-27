@@ -200,7 +200,7 @@ func (rt *gitWorkspaceRuntime) hasImpliedDir(rel string) bool {
 func (fs *Dat9FS) gitTreeInode(localPath string, n client.GitTreeNode, incrementLookup bool) *InodeEntry {
 	mode, hasMode, isDir := gitNodeMode(n)
 	size := n.SizeBytes
-	if size < 0 || isDir {
+	if isDir {
 		size = 0
 	}
 	return fs.gitInode(localPath, isDir, size, mode, hasMode, incrementLookup)
@@ -426,12 +426,21 @@ func (fs *Dat9FS) readGitFile(ctx context.Context, localPath string, offset, siz
 }
 
 func sliceRead(data []byte, offset, size int64) []byte {
+	if offset < 0 {
+		return nil
+	}
 	if offset >= int64(len(data)) {
 		return nil
 	}
-	end := offset + size
+	end := int64(len(data))
+	if size >= 0 {
+		end = offset + size
+	}
 	if end > int64(len(data)) {
 		end = int64(len(data))
+	}
+	if end < offset {
+		return nil
 	}
 	out := make([]byte, end-offset)
 	copy(out, data[offset:end])
@@ -880,15 +889,20 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 	}
 
 	size := fh.OrigSize
+	data, err := fs.readGitFile(ctx, fh.Path, 0, size)
+	if err != nil {
+		return gitReadErrToFuseStatus(err)
+	}
+	if size < 0 {
+		size = int64(len(data))
+		fh.OrigSize = size
+		fs.inodes.UpdateSize(fh.Ino, size)
+	}
 	bufMax := size * 2
 	if bufMax < maxPreloadSize {
 		bufMax = maxPreloadSize
 	}
 	fh.Dirty = fs.newWriteBuffer(fh.Path, bufMax, 0)
-	data, err := fs.readGitFile(ctx, fh.Path, 0, size)
-	if err != nil {
-		return gitReadErrToFuseStatus(err)
-	}
 	if len(data) > 0 {
 		if _, err := fh.Dirty.Write(0, data); err != nil {
 			return gofuse.Status(syscall.EFBIG)
@@ -993,9 +1007,14 @@ func (fs *Dat9FS) setGitAttr(ctx context.Context, input *gofuse.SetAttrIn, entry
 				fh.Unlock()
 			}
 		} else if newSize != entry.Size {
-			data, err := fs.readGitFile(ctx, entry.Path, 0, entry.Size)
+			readSize := entry.Size
+			data, err := fs.readGitFile(ctx, entry.Path, 0, readSize)
 			if err != nil {
 				return gitReadErrToFuseStatus(err)
+			}
+			if readSize < 0 {
+				entry.Size = int64(len(data))
+				fs.inodes.UpdateSize(input.NodeId, entry.Size)
 			}
 			switch {
 			case newSize < int64(len(data)):

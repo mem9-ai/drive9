@@ -80,7 +80,11 @@ Drive9 的 agent 场景里有两个高优先级目标：
 
    `.git` 被 coding-agent local overlay 路由到本地盘，不进入通用 Drive9 文件表。
 
-4. CLI 读取 `HEAD`、branch、`git ls-tree -r -t -l HEAD`，生成 tree manifest。
+4. CLI 读取 `HEAD`、branch、`git ls-tree -r -t -z HEAD`，生成 tree manifest。
+
+   这里不能使用 `git ls-tree -l`。`-l` 会要求 Git 输出 blob size，而 blobless partial clone 下很多 blob 本地不存在，Git 会触发 lazy fetch，导致 fast clone 在 manifest 阶段退化成大量远端对象查询。
+
+   对 GitHub repo，CLI 再调用 GitHub Trees API 获取 blob size 并补齐 `size_bytes`。这样 FUSE 可以给 `stat`/`git status` 暴露准确大小，但 clone 阶段仍不下载 blob 内容。非 GitHub 或 GitHub API 不可用时，`size_bytes=-1` 作为 unknown-size fallback，FUSE 会在真正读写该文件时按需读取 blob 并修正本地 inode size。
 
 5. CLI 执行：
 

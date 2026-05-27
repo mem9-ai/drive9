@@ -7,10 +7,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,7 +27,11 @@ import (
 	"github.com/mem9-ai/dat9/pkg/pathutil"
 )
 
-const gitWorkspaceAPITimeout = 2 * time.Minute
+const (
+	gitWorkspaceAPITimeout = 2 * time.Minute
+	githubTreeAPITimeout   = 30 * time.Second
+	githubAPIBaseURL       = "https://api.github.com"
+)
 
 // Git handles git-aware drive9 workflows.
 func Git(args []string) error {
@@ -96,12 +103,27 @@ func gitClone(args []string) error {
 	if err != nil {
 		return err
 	}
+	treeSHA, treeErr := gitOutput(target, "rev-parse", head+"^{tree}")
+	if treeErr != nil {
+		return fmt.Errorf("git rev-parse HEAD^{tree}: %w", treeErr)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), githubTreeAPITimeout)
+	enriched, enrichErr := enrichGitTreeSizesFromGitHub(ctx, repoURL, treeSHA, nodes)
+	cancel()
+	if enrichErr != nil {
+		fmt.Fprintf(os.Stderr, "drive9: warning: could not enrich GitHub tree sizes: %v\n", enrichErr)
+		if unknown := unknownGitTreeFileSizeCount(nodes); unknown > 0 {
+			fmt.Fprintf(os.Stderr, "drive9: warning: %d git file sizes remain unknown; git status may need to read those blobs lazily\n", unknown)
+		}
+	} else {
+		nodes = enriched
+	}
 	if err := initializeFastCloneIndex(target, head); err != nil {
 		return err
 	}
 
 	c := NewFromEnv()
-	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
+	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
 		RootPath:   resolved.RemotePath,
 		RepoURL:    repoURL,
@@ -298,7 +320,7 @@ func gitRun(repoDir string, args ...string) error {
 }
 
 func gitListTree(repoDir, commitSHA string) ([]client.GitTreeNode, error) {
-	full := []string{"-C", repoDir, "ls-tree", "-r", "-t", "-l", "-z", commitSHA}
+	full := []string{"-C", repoDir, "ls-tree", "-r", "-t", "-z", commitSHA}
 	cmd := exec.Command("git", full...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -329,10 +351,10 @@ func parseGitLsTree(out []byte) ([]client.GitTreeNode, error) {
 			return nil, fmt.Errorf("record missing path separator")
 		}
 		meta := strings.Fields(string(rec[:tab]))
-		if len(meta) < 4 {
+		if len(meta) < 3 {
 			return nil, fmt.Errorf("record metadata has %d fields", len(meta))
 		}
-		mode, gitType, objectSHA, sizeRaw := meta[0], meta[1], meta[2], meta[3]
+		mode, gitType, objectSHA := meta[0], meta[1], meta[2]
 		path := string(rec[tab+1:])
 		parent, name, err := splitGitManifestPath(path)
 		if err != nil {
@@ -343,7 +365,8 @@ func parseGitLsTree(out []byte) ([]client.GitTreeNode, error) {
 			return nil, err
 		}
 		size := int64(-1)
-		if sizeRaw != "-" {
+		if len(meta) >= 4 && meta[3] != "-" {
+			sizeRaw := meta[3]
 			size, err = strconv.ParseInt(sizeRaw, 10, 64)
 			if err != nil {
 				return nil, fmt.Errorf("invalid size %q for %q: %w", sizeRaw, path, err)
@@ -360,6 +383,213 @@ func parseGitLsTree(out []byte) ([]client.GitTreeNode, error) {
 		})
 	}
 	return nodes, nil
+}
+
+type githubRepoRef struct {
+	Owner string
+	Repo  string
+}
+
+type githubTreeResponse struct {
+	Tree      []githubTreeEntry `json:"tree"`
+	Truncated bool              `json:"truncated"`
+}
+
+type githubTreeEntry struct {
+	Path string `json:"path"`
+	Type string `json:"type"`
+	SHA  string `json:"sha"`
+	Size *int64 `json:"size"`
+}
+
+func enrichGitTreeSizesFromGitHub(ctx context.Context, repoURL, treeSHA string, nodes []client.GitTreeNode) ([]client.GitTreeNode, error) {
+	ref, ok := parseGitHubRepoURL(repoURL)
+	if !ok {
+		return nodes, nil
+	}
+	sizes, err := fetchGitHubTreeSizes(ctx, http.DefaultClient, githubAPIBaseURL, ref, treeSHA, githubTokenForRepoURL(repoURL))
+	if err != nil {
+		return nodes, err
+	}
+	return applyGitHubTreeSizes(nodes, sizes), nil
+}
+
+func applyGitHubTreeSizes(nodes []client.GitTreeNode, sizes map[string]int64) []client.GitTreeNode {
+	out := make([]client.GitTreeNode, len(nodes))
+	copy(out, nodes)
+	for i := range out {
+		if out[i].Kind == "dir" || out[i].Kind == "submodule" {
+			continue
+		}
+		if size, ok := sizes[out[i].Path]; ok {
+			out[i].SizeBytes = size
+		}
+	}
+	return out
+}
+
+func fetchGitHubTreeSizes(ctx context.Context, httpClient *http.Client, baseURL string, ref githubRepoRef, treeSHA string, token string) (map[string]int64, error) {
+	body, err := fetchGitHubTree(ctx, httpClient, baseURL, ref, treeSHA, token, true)
+	if err != nil {
+		return nil, err
+	}
+	if !body.Truncated {
+		return githubTreeSizesFromEntries("", body.Tree), nil
+	}
+	return fetchGitHubTreeSizesWalk(ctx, httpClient, baseURL, ref, treeSHA, token)
+}
+
+func fetchGitHubTree(ctx context.Context, httpClient *http.Client, baseURL string, ref githubRepoRef, treeSHA string, token string, recursive bool) (githubTreeResponse, error) {
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+	baseURL = strings.TrimRight(baseURL, "/")
+	endpoint := fmt.Sprintf("%s/repos/%s/%s/git/trees/%s",
+		baseURL,
+		url.PathEscape(ref.Owner),
+		url.PathEscape(ref.Repo),
+		url.PathEscape(treeSHA),
+	)
+	if recursive {
+		endpoint += "?recursive=1"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return githubTreeResponse{}, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	if token = strings.TrimSpace(token); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return githubTreeResponse{}, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		msg := strings.TrimSpace(string(body))
+		if msg == "" {
+			msg = resp.Status
+		}
+		return githubTreeResponse{}, fmt.Errorf("GitHub tree API %s: %s", resp.Status, msg)
+	}
+	var body githubTreeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return githubTreeResponse{}, err
+	}
+	return body, nil
+}
+
+func fetchGitHubTreeSizesWalk(ctx context.Context, httpClient *http.Client, baseURL string, ref githubRepoRef, treeSHA string, token string) (map[string]int64, error) {
+	sizes := make(map[string]int64)
+	pending := []struct {
+		sha    string
+		prefix string
+	}{{sha: treeSHA}}
+	for len(pending) > 0 {
+		item := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		body, err := fetchGitHubTree(ctx, httpClient, baseURL, ref, item.sha, token, false)
+		if err != nil {
+			return nil, err
+		}
+		if body.Truncated {
+			return nil, fmt.Errorf("GitHub tree API non-recursive response was truncated for tree %s", item.sha)
+		}
+		for _, entry := range body.Tree {
+			fullPath := entry.Path
+			if item.prefix != "" {
+				fullPath = item.prefix + "/" + entry.Path
+			}
+			switch entry.Type {
+			case "blob":
+				if fullPath != "" && entry.Size != nil {
+					sizes[fullPath] = *entry.Size
+				}
+			case "tree":
+				if entry.SHA != "" && fullPath != "" {
+					pending = append(pending, struct {
+						sha    string
+						prefix string
+					}{sha: entry.SHA, prefix: fullPath})
+				}
+			}
+		}
+	}
+	return sizes, nil
+}
+
+func githubTreeSizesFromEntries(prefix string, entries []githubTreeEntry) map[string]int64 {
+	sizes := make(map[string]int64)
+	for _, entry := range entries {
+		fullPath := entry.Path
+		if prefix != "" {
+			fullPath = prefix + "/" + entry.Path
+		}
+		if entry.Type != "blob" || fullPath == "" || entry.Size == nil {
+			continue
+		}
+		sizes[fullPath] = *entry.Size
+	}
+	return sizes
+}
+
+func parseGitHubRepoURL(raw string) (githubRepoRef, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return githubRepoRef{}, false
+	}
+	const scpPrefix = "git@github.com:"
+	if strings.HasPrefix(raw, scpPrefix) {
+		return parseGitHubRepoPath(strings.TrimPrefix(raw, scpPrefix))
+	}
+	u, err := url.Parse(raw)
+	if err != nil || !strings.EqualFold(u.Hostname(), "github.com") {
+		return githubRepoRef{}, false
+	}
+	return parseGitHubRepoPath(u.Path)
+}
+
+func parseGitHubRepoPath(rawPath string) (githubRepoRef, bool) {
+	p := strings.Trim(strings.TrimSpace(rawPath), "/")
+	p = strings.TrimSuffix(p, ".git")
+	parts := strings.Split(p, "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return githubRepoRef{}, false
+	}
+	return githubRepoRef{Owner: parts[0], Repo: parts[1]}, true
+}
+
+func githubTokenForRepoURL(repoURL string) string {
+	for _, key := range []string{"GITHUB_TOKEN", "GH_TOKEN"} {
+		if token := strings.TrimSpace(os.Getenv(key)); token != "" {
+			return token
+		}
+	}
+	u, err := url.Parse(repoURL)
+	if err != nil || !strings.EqualFold(u.Hostname(), "github.com") || u.User == nil {
+		return ""
+	}
+	if password, ok := u.User.Password(); ok && password != "" {
+		return password
+	}
+	username := u.User.Username()
+	if username != "" && username != "git" && username != "x-access-token" {
+		return username
+	}
+	return ""
+}
+
+func unknownGitTreeFileSizeCount(nodes []client.GitTreeNode) int {
+	var count int
+	for _, n := range nodes {
+		if (n.Kind == "file" || n.Kind == "symlink") && n.SizeBytes < 0 {
+			count++
+		}
+	}
+	return count
 }
 
 func gitTreeKind(mode, gitType string) (string, error) {

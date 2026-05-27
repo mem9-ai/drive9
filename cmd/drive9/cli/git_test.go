@@ -2,11 +2,16 @@ package cli
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 
+	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
@@ -42,6 +47,149 @@ func TestParseGitLsTree(t *testing.T) {
 		if got.Path != check.path || got.ParentPath != check.parent || got.Name != check.name || got.Kind != check.kind || got.SizeBytes != check.size {
 			t.Fatalf("node[%d] = %+v, want path=%q parent=%q name=%q kind=%q size=%d", check.i, got, check.path, check.parent, check.name, check.kind, check.size)
 		}
+	}
+}
+
+func TestParseGitLsTreeWithoutSizes(t *testing.T) {
+	raw := "" +
+		"040000 tree 1111111111111111111111111111111111111111\tsrc\x00" +
+		"100644 blob 2222222222222222222222222222222222222222\tsrc/main.go\x00" +
+		"120000 blob 3333333333333333333333333333333333333333\tlink\x00" +
+		"160000 commit 4444444444444444444444444444444444444444\tdeps/lib\x00"
+
+	nodes, err := parseGitLsTree([]byte(raw))
+	if err != nil {
+		t.Fatalf("parseGitLsTree: %v", err)
+	}
+	if len(nodes) != 4 {
+		t.Fatalf("len(nodes) = %d, want 4", len(nodes))
+	}
+	for i, node := range nodes {
+		if node.SizeBytes != -1 {
+			t.Fatalf("node[%d].SizeBytes = %d, want -1", i, node.SizeBytes)
+		}
+	}
+}
+
+func TestGitListTreeOmitsBlobSizes(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	root := t.TempDir()
+	runTestGit(t, "", "init", "-b", "main", root)
+	runTestGit(t, root, "config", "user.email", "drive9-test@example.invalid")
+	runTestGit(t, root, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runTestGit(t, root, "add", ".")
+	runTestGit(t, root, "commit", "-m", "initial")
+	head := gitOutputForTest(t, root, "rev-parse", "HEAD")
+
+	nodes, err := gitListTree(root, head)
+	if err != nil {
+		t.Fatalf("gitListTree: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("len(nodes) = %d, want 1", len(nodes))
+	}
+	if nodes[0].Path != "README.md" {
+		t.Fatalf("node path = %q, want README.md", nodes[0].Path)
+	}
+	if nodes[0].SizeBytes != -1 {
+		t.Fatalf("SizeBytes = %d, want -1", nodes[0].SizeBytes)
+	}
+}
+
+func TestGitHubTreeSizeEnrichment(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/mem9-ai/drive9/git/trees/tree-sha" {
+			t.Fatalf("path = %q, want /repos/mem9-ai/drive9/git/trees/tree-sha", r.URL.Path)
+		}
+		if r.URL.Query().Get("recursive") != "1" {
+			t.Fatalf("recursive = %q, want 1", r.URL.Query().Get("recursive"))
+		}
+		gotAuth = r.Header.Get("Authorization")
+		_ = json.NewEncoder(w).Encode(githubTreeResponse{Tree: []githubTreeEntry{
+			{Path: "README.md", Type: "blob", Size: int64Ptr(6)},
+			{Path: "src", Type: "tree"},
+			{Path: "src/main.go", Type: "blob", Size: int64Ptr(12)},
+		}})
+	}))
+	defer srv.Close()
+
+	sizes, err := fetchGitHubTreeSizes(context.Background(), srv.Client(), srv.URL, githubRepoRef{Owner: "mem9-ai", Repo: "drive9"}, "tree-sha", "secret")
+	if err != nil {
+		t.Fatalf("fetchGitHubTreeSizes: %v", err)
+	}
+	if gotAuth != "Bearer secret" {
+		t.Fatalf("Authorization = %q, want Bearer secret", gotAuth)
+	}
+	nodes := applyGitHubTreeSizes([]client.GitTreeNode{
+		{Path: "README.md", Kind: "file", SizeBytes: -1},
+		{Path: "src", Kind: "dir", SizeBytes: -1},
+		{Path: "src/main.go", Kind: "file", SizeBytes: -1},
+	}, sizes)
+	if nodes[0].SizeBytes != 6 {
+		t.Fatalf("README size = %d, want 6", nodes[0].SizeBytes)
+	}
+	if nodes[1].SizeBytes != -1 {
+		t.Fatalf("dir size = %d, want -1", nodes[1].SizeBytes)
+	}
+	if nodes[2].SizeBytes != 12 {
+		t.Fatalf("src/main.go size = %d, want 12", nodes[2].SizeBytes)
+	}
+}
+
+func TestGitHubTreeSizeEnrichmentWalksTruncatedTree(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/repos/mem9-ai/drive9/git/trees/root-sha" && r.URL.Query().Get("recursive") == "1":
+			_ = json.NewEncoder(w).Encode(githubTreeResponse{Truncated: true})
+		case r.URL.Path == "/repos/mem9-ai/drive9/git/trees/root-sha":
+			_ = json.NewEncoder(w).Encode(githubTreeResponse{Tree: []githubTreeEntry{
+				{Path: "README.md", Type: "blob", Size: int64Ptr(6)},
+				{Path: "src", Type: "tree", SHA: "src-sha"},
+			}})
+		case r.URL.Path == "/repos/mem9-ai/drive9/git/trees/src-sha":
+			_ = json.NewEncoder(w).Encode(githubTreeResponse{Tree: []githubTreeEntry{
+				{Path: "main.go", Type: "blob", Size: int64Ptr(12)},
+			}})
+		default:
+			t.Fatalf("unexpected request path=%q query=%q", r.URL.Path, r.URL.RawQuery)
+		}
+	}))
+	defer srv.Close()
+
+	sizes, err := fetchGitHubTreeSizes(context.Background(), srv.Client(), srv.URL, githubRepoRef{Owner: "mem9-ai", Repo: "drive9"}, "root-sha", "")
+	if err != nil {
+		t.Fatalf("fetchGitHubTreeSizes: %v", err)
+	}
+	if sizes["README.md"] != 6 {
+		t.Fatalf("README.md size = %d, want 6", sizes["README.md"])
+	}
+	if sizes["src/main.go"] != 12 {
+		t.Fatalf("src/main.go size = %d, want 12", sizes["src/main.go"])
+	}
+}
+
+func TestParseGitHubRepoURL(t *testing.T) {
+	for _, raw := range []string{
+		"https://github.com/mem9-ai/drive9.git",
+		"git@github.com:mem9-ai/drive9.git",
+		"ssh://git@github.com/mem9-ai/drive9.git",
+	} {
+		ref, ok := parseGitHubRepoURL(raw)
+		if !ok {
+			t.Fatalf("parseGitHubRepoURL(%q) ok = false, want true", raw)
+		}
+		if ref.Owner != "mem9-ai" || ref.Repo != "drive9" {
+			t.Fatalf("parseGitHubRepoURL(%q) = %+v, want mem9-ai/drive9", raw, ref)
+		}
+	}
+	if _, ok := parseGitHubRepoURL("https://example.com/mem9-ai/drive9.git"); ok {
+		t.Fatalf("non-GitHub URL parsed as GitHub")
 	}
 }
 
@@ -137,4 +285,8 @@ func gitOutputForTest(t *testing.T, dir string, args ...string) string {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 	return string(bytes.TrimSpace(out))
+}
+
+func int64Ptr(v int64) *int64 {
+	return &v
 }

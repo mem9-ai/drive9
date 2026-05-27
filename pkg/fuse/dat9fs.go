@@ -1139,9 +1139,13 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 }
 
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
+	size := entry.Size
+	if size < 0 {
+		size = 0
+	}
 	out.Ino = entry.Ino
-	out.Size = uint64(entry.Size)
-	out.Blocks = (uint64(entry.Size) + 511) / 512
+	out.Size = uint64(size)
+	out.Blocks = (uint64(size) + 511) / 512
 	out.Uid = fs.uid
 	out.Gid = fs.gid
 
