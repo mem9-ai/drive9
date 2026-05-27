@@ -276,6 +276,7 @@ func main() {
 		TokenSecret:      tokenSecret,
 		VaultMasterKey:   vaultMasterKey,
 		VaultIssuerURL:   vaultIssuerURL(addr),
+		PublicURL:        publicBaseURL(addr),
 		S3Dir:            s3cfg.Dir,
 		MaxUploadBytes:   maxUploadBytes,
 		InlineThreshold:  backendOptions.InlineThreshold,

@@ -468,15 +468,20 @@ func (s *Server) handleSlockCallback(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, "<!doctype html><html><body style='font-family:sans-serif;padding:40px;text-align:center;background:#0a0908;color:#ede8e0'><h1>Provisioning Error</h1><p style='color:#c75050'>slock tenant provision failed</p></body></html>")
 		return
 	}
-	resp.ServerURL = s.vaultIssuerURL
-	resp.Message = fmt.Sprintf("Welcome to drive9! Your tenant is ready. Visit https://drive9.ai/ for documentation. Read https://drive9.ai/skill.md and follow the instructions to install and configure drive9. Use the API key below with the CLI: drive9 ctx add --api-key %s --server %s", resp.APIKey, s.vaultIssuerURL)
+	resp.ServerURL = s.publicURL
+	resp.Message = fmt.Sprintf(
+		"Drive9 login successful. "+
+			"Documentation: https://drive9.ai/ | Skill setup: https://drive9.ai/skill.md\n"+
+			"Configure CLI: drive9 ctx add --api-key <API_KEY> --server %s",
+		s.publicURL,
+	)
 	if wantsJSON(r) {
 		setSlockCallbackNoStoreHeaders(w)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 		return
 	}
-	writeSlockHTML(w, resp, s.vaultIssuerURL)
+	writeSlockHTML(w, resp, s.publicURL)
 }
 
 func (s *Server) ensureSlockProvisioningEnabled() error {

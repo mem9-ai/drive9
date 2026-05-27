@@ -42,6 +42,7 @@ type Config struct {
 	LocalTenantAPIKey string
 	VaultMasterKey    []byte // 32-byte AES key for vault DEK wrapping; nil disables vault
 	VaultIssuerURL    string // canonical server URL placed in grant `iss` claim; empty = server hostname unknown, grants disabled
+	PublicURL         string // externally reachable base URL for client responses (e.g., slock callback server_url)
 	Backend           *backend.Dat9Backend
 	LocalS3           *s3client.LocalS3Client
 	S3Dir             string
@@ -71,6 +72,7 @@ type Server struct {
 	localTenantAPIKey   string
 	vaultMK             *vault.MasterKey
 	vaultIssuerURL      string
+	publicURL           string
 	maxUploadBytes      int64
 	inlineThreshold     int64
 	metrics             *serverMetrics
@@ -164,6 +166,7 @@ func NewWithConfig(cfg Config) *Server {
 		localTenantAPIKey:   strings.TrimSpace(cfg.LocalTenantAPIKey),
 		vaultMK:             vaultMK,
 		vaultIssuerURL:      strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:           strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
 		provisioner:         cfg.Provisioner,
 		maxUploadBytes:      maxUpload,
 		inlineThreshold:     inlineThreshold,
