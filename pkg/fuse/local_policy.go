@@ -18,6 +18,7 @@ type PathLayer string
 const (
 	PathLayerRemotePersistent PathLayer = "remote_persistent"
 	PathLayerLocalOnly        PathLayer = "local_only"
+	PathLayerGitWorkspace     PathLayer = "git_workspace"
 )
 
 type policyMatchSource string

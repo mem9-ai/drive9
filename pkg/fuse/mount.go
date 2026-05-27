@@ -338,7 +338,20 @@ func Mount(opts *MountOptions) error {
 	if err := server.WaitMount(); err != nil {
 		return fmt.Errorf("fuse wait mount: %w", err)
 	}
-	pidFile, err := mountstate.WritePID(opts.MountPoint, os.Getpid())
+	stateMountPoint := opts.MountPoint
+	if absMountPoint, absErr := filepath.Abs(stateMountPoint); absErr == nil {
+		stateMountPoint = absMountPoint
+	}
+	if resolvedMountPoint, resolveErr := filepath.EvalSymlinks(stateMountPoint); resolveErr == nil {
+		stateMountPoint = resolvedMountPoint
+	}
+	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
+		PID:        os.Getpid(),
+		MountPoint: stateMountPoint,
+		RemoteRoot: opts.RemoteRoot,
+		Profile:    opts.Profile,
+		Server:     opts.Server,
+	})
 	if err != nil {
 		sseWatcher.Stop()
 		dat9fs.FlushAll()

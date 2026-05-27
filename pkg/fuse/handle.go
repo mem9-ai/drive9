@@ -33,12 +33,17 @@ type FileHandle struct {
 	Prefetch          *Prefetcher     // nil for writable handles; sequential read prefetcher
 	ReadTarget        *client.ReadTarget
 	WritePolicy       WritePolicy // per-handle remote durability policy chosen at open/create
-	PendingMode       uint32      // mode change deferred because a dirty handle was open
-	HasPendingMode    bool        // true when PendingMode should be applied on Release
-	PendingModeGen    uint64      // generation for PendingMode, used to avoid clearing newer chmods
-	PreviousMode      uint32      // mode before PendingMode was set (for rollback on flush failure)
-	HasPreviousMode   bool        // true when previous mode state was snapshotted
-	PreviousModeKnown bool        // true when PreviousMode was authoritative
+	GitWorkspaceID    string      // set for handles served by the git workspace layer
+	GitRelPath        string
+	GitKind           string
+	GitMode           string
+	GitBaseObjectSHA  string
+	PendingMode       uint32 // mode change deferred because a dirty handle was open
+	HasPendingMode    bool   // true when PendingMode should be applied on Release
+	PendingModeGen    uint64 // generation for PendingMode, used to avoid clearing newer chmods
+	PreviousMode      uint32 // mode before PendingMode was set (for rollback on flush failure)
+	HasPreviousMode   bool   // true when previous mode state was snapshotted
+	PreviousModeKnown bool   // true when PreviousMode was authoritative
 	mu                sync.Mutex
 }
 

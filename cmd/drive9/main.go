@@ -13,6 +13,7 @@
 //	token  issue and revoke workspace-zone scoped filesystem tokens
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	journal append-only agent/workflow journal operations
+//	git     git-aware drive9 workflows
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
 //	doctor  diagnose local drive9 runtime prerequisites
@@ -45,6 +46,7 @@ var vaultHandler = cli.Secret
 var tokenHandler = cli.Token
 var doctorHandler = cli.Doctor
 var journalHandler = cli.Journal
+var gitHandler = cli.Git
 
 func main() {
 	if logger.CLIEnabled() {
@@ -156,6 +158,21 @@ func dispatch(cmd string, args []string) {
 				sub = " " + args[0]
 			}
 			fatal("journal"+sub, err)
+		}
+	case "git":
+		if cliLogger != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = args[0]
+			}
+			logger.Info(context.Background(), "cli_command", zap.String("command", "git"), zap.String("subcommand", sub))
+		}
+		if err := gitHandler(args); err != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = " " + args[0]
+			}
+			fatal("git"+sub, err)
 		}
 	case "mount":
 		if cliLogger != nil {
@@ -311,6 +328,8 @@ func usage(code int) {
 			"                         vault operations\n"+
 			"  journal <new|append|cat|find|verify>\n"+
 			"                         append-only agent/workflow journal operations\n"+
+			"  git clone --fast <repo-url> <mounted-path>\n"+
+			"                         git-aware fast clone workflow\n"+
 			"  mount [flags] [:/remote] <mountpoint>\n"+
 			"                         mount drive9 filesystem\n"+
 			"  mount vault [flags] <mountpoint>\n"+
