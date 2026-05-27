@@ -54,6 +54,7 @@ func newSlockTestServer(t *testing.T, info slockoauth.UserInfo) (*Server, *meta.
 		Pool:        dbi.Pool,
 		Provisioner: prov,
 		TokenSecret: tokenSecret,
+		PublicURL:   "http://localhost:9009",
 		SlockOAuth:  &fakeSlockOAuth{info: info},
 	})
 	t.Cleanup(srv.Close)
@@ -133,6 +134,12 @@ func TestSlockCallbackCreatesTenantBindingAndOwnerKey(t *testing.T) {
 	}
 	if _, err := token.ParseAndVerifyToken(tokenSecret, out.APIKey); err != nil {
 		t.Fatalf("ParseAndVerifyToken: %v", err)
+	}
+	if out.ServerURL == "" {
+		t.Fatal("server_url should not be empty")
+	}
+	if out.Message == "" {
+		t.Fatal("message should not be empty")
 	}
 	wantSubjectKey := slockSubjectKey(info)
 	binding, err := metaStore.GetExternalBinding(context.Background(), "slock", wantSubjectKey)
