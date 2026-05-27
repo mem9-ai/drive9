@@ -124,7 +124,15 @@ func gitClone(args []string) error {
 		return fmt.Errorf("register git tree manifest: %w", err)
 	}
 	cancel()
-	gitState, err := archiveGitDir(filepath.Join(target, ".git"))
+	gitDir := filepath.Join(target, ".git")
+	if resolved.LocalGitDir != "" {
+		if info, statErr := os.Stat(resolved.LocalGitDir); statErr == nil && info.IsDir() {
+			gitDir = resolved.LocalGitDir
+		} else if statErr != nil && !os.IsNotExist(statErr) {
+			return fmt.Errorf("stat local .git checkpoint path: %w", statErr)
+		}
+	}
+	gitState, err := archiveGitDir(gitDir)
 	if err != nil {
 		return fmt.Errorf("checkpoint .git: %w", err)
 	}
@@ -154,10 +162,11 @@ func initializeFastCloneIndex(repoDir, commitSHA string) error {
 }
 
 type mountedGitTarget struct {
-	MountPoint string
-	RemoteRoot string
-	RemotePath string
-	Profile    string
+	MountPoint  string
+	RemoteRoot  string
+	RemotePath  string
+	Profile     string
+	LocalGitDir string
 }
 
 func resolveMountedGitTarget(target string) (mountedGitTarget, error) {
@@ -194,11 +203,16 @@ func resolveMountedGitTarget(target string) (mountedGitTarget, error) {
 			if err != nil {
 				return mountedGitTarget{}, fmt.Errorf("canonicalize remote workspace path: %w", err)
 			}
+			localGitDir, err := localGitDirForMountedTarget(state.LocalRoot, rel)
+			if err != nil {
+				return mountedGitTarget{}, err
+			}
 			return mountedGitTarget{
-				MountPoint: absMount,
-				RemoteRoot: state.RemoteRoot,
-				RemotePath: remotePath,
-				Profile:    state.Profile,
+				MountPoint:  absMount,
+				RemoteRoot:  state.RemoteRoot,
+				RemotePath:  remotePath,
+				Profile:     state.Profile,
+				LocalGitDir: localGitDir,
 			}, nil
 		}
 		parent := filepath.Dir(candidate)
@@ -208,6 +222,21 @@ func resolveMountedGitTarget(target string) (mountedGitTarget, error) {
 		candidate = parent
 	}
 	return mountedGitTarget{}, fmt.Errorf("target %q is not inside a drive9 mount with readable mount metadata", target)
+}
+
+func localGitDirForMountedTarget(localRoot, rel string) (string, error) {
+	localRoot = strings.TrimSpace(localRoot)
+	if localRoot == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(localRoot) {
+		return "", fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
+	}
+	localPath := filepath.Join(localRoot, "overlay")
+	if rel != "" && rel != "." {
+		localPath = filepath.Join(localPath, rel)
+	}
+	return filepath.Join(localPath, ".git"), nil
 }
 
 func relToMountedTarget(absTarget, mountPoint string) (absMount string, rel string, ok bool, err error) {
@@ -414,9 +443,12 @@ func archiveGitDir(gitDir string) ([]byte, error) {
 		if err != nil {
 			return err
 		}
-		defer func() { _ = f.Close() }()
-		_, err = io.Copy(tw, f)
-		return err
+		_, copyErr := io.Copy(tw, f)
+		closeErr := f.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
 	})
 	if closeErr := tw.Close(); err == nil {
 		err = closeErr

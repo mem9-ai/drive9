@@ -47,11 +47,13 @@ func TestParseGitLsTree(t *testing.T) {
 
 func TestResolveMountedGitTargetUsesMountMetadata(t *testing.T) {
 	mountPoint := t.TempDir()
+	localRoot := t.TempDir()
 	pidPath, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
 		PID:        os.Getpid(),
 		MountPoint: mountPoint,
 		RemoteRoot: "/remote",
 		Profile:    "coding-agent",
+		LocalRoot:  localRoot,
 	})
 	if err != nil {
 		t.Fatalf("WriteProcessState: %v", err)
@@ -68,6 +70,10 @@ func TestResolveMountedGitTargetUsesMountMetadata(t *testing.T) {
 	}
 	if resolved.RemoteRoot != "/remote" {
 		t.Fatalf("RemoteRoot = %q, want /remote", resolved.RemoteRoot)
+	}
+	wantLocalGitDir := filepath.Join(localRoot, "overlay", "repos", "drive9", ".git")
+	if resolved.LocalGitDir != wantLocalGitDir {
+		t.Fatalf("LocalGitDir = %q, want %q", resolved.LocalGitDir, wantLocalGitDir)
 	}
 }
 

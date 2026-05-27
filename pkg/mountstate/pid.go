@@ -18,6 +18,7 @@ type ProcessState struct {
 	MountPoint   string `json:"mount_point,omitempty"`
 	RemoteRoot   string `json:"remote_root,omitempty"`
 	Profile      string `json:"profile,omitempty"`
+	LocalRoot    string `json:"local_root,omitempty"`
 	Server       string `json:"server,omitempty"`
 }
 

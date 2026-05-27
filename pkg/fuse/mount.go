@@ -351,6 +351,7 @@ func Mount(opts *MountOptions) error {
 		MountPoint: stateMountPoint,
 		RemoteRoot: opts.RemoteRoot,
 		Profile:    opts.Profile,
+		LocalRoot:  opts.LocalRoot,
 		Server:     opts.Server,
 	})
 	if err != nil {

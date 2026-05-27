@@ -382,6 +382,14 @@ func isLocalFileHandle(fh *FileHandle) bool {
 	return fh != nil && fh.Layer == PathLayerLocalOnly && fh.LocalFile != nil
 }
 
+func localFileHandleOpenedWritable(fh *FileHandle) bool {
+	if !isLocalFileHandle(fh) {
+		return false
+	}
+	accMode := fh.Flags & syscall.O_ACCMODE
+	return accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR
+}
+
 func (fs *Dat9FS) writePolicyForOpen(flags uint32) WritePolicy {
 	policy := WritePolicyWriteBack
 	if fs != nil && fs.opts != nil {
@@ -5130,11 +5138,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
-		ctx, cf := context.WithTimeout(context.Background(), gitCheckpointTimeout)
-		if err := fs.checkpointGitStateForPath(ctx, fh.Path); err != nil {
-			log.Printf("git state checkpoint after local flush failed for %s: %v", fh.Path, err)
+		if localFileHandleOpenedWritable(fh) {
+			ctx, cf := context.WithTimeout(context.Background(), gitCheckpointTimeout)
+			if err := fs.checkpointGitStateForPath(ctx, fh.Path); err != nil {
+				log.Printf("git state checkpoint after local flush failed for %s: %v", fh.Path, err)
+			}
+			cf()
 		}
-		cf()
 		return gofuse.OK
 	}
 	if fh.Layer == PathLayerGitWorkspace {
@@ -5370,11 +5380,13 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
-		ctx, cf := context.WithTimeout(context.Background(), gitCheckpointTimeout)
-		if err := fs.checkpointGitStateForPath(ctx, fh.Path); err != nil {
-			log.Printf("git state checkpoint after local fsync failed for %s: %v", fh.Path, err)
+		if localFileHandleOpenedWritable(fh) {
+			ctx, cf := context.WithTimeout(context.Background(), gitCheckpointTimeout)
+			if err := fs.checkpointGitStateForPath(ctx, fh.Path); err != nil {
+				log.Printf("git state checkpoint after local fsync failed for %s: %v", fh.Path, err)
+			}
+			cf()
 		}
-		cf()
 		return gofuse.OK
 	}
 	if fh.Layer == PathLayerGitWorkspace {
@@ -5641,7 +5653,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					flushStatus = localErrToFuseStatus(err)
 				}
 			}
-			if flushStatus == gofuse.OK {
+			if flushStatus == gofuse.OK && localFileHandleOpenedWritable(fh) {
 				ctx, cf := context.WithTimeout(context.Background(), gitCheckpointTimeout)
 				if err := fs.checkpointGitStateForPath(ctx, fh.Path); err != nil {
 					log.Printf("git state checkpoint after local release failed for %s: %v", fh.Path, err)
