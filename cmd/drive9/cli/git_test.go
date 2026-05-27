@@ -1,10 +1,13 @@
 package cli
 
 import (
+	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
+	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
@@ -67,4 +70,70 @@ func TestResolveMountedGitTargetUsesMountMetadata(t *testing.T) {
 	if resolved.RemoteRoot != "/remote" {
 		t.Fatalf("RemoteRoot = %q, want /remote", resolved.RemoteRoot)
 	}
+}
+
+func TestInitializeFastCloneIndexMakesStatusClean(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	root := t.TempDir()
+	src := filepath.Join(root, "src")
+	dst := filepath.Join(root, "dst")
+	if err := os.Mkdir(src, 0o755); err != nil {
+		t.Fatalf("mkdir src: %v", err)
+	}
+	runTestGit(t, "", "init", "-b", "main", src)
+	runTestGit(t, src, "config", "user.email", "drive9-test@example.invalid")
+	runTestGit(t, src, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(src, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "index.html"), []byte("<h1>hi</h1>\n"), 0o644); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	runTestGit(t, src, "add", ".")
+	runTestGit(t, src, "commit", "-m", "initial")
+	head := gitOutputForTest(t, src, "rev-parse", "HEAD")
+
+	runTestGit(t, "", "clone", "--no-checkout", src, dst)
+	if err := os.WriteFile(filepath.Join(dst, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write virtual README: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dst, "index.html"), []byte("<h1>hi</h1>\n"), 0o644); err != nil {
+		t.Fatalf("write virtual index: %v", err)
+	}
+
+	nodes := []client.GitTreeNode{
+		{Path: "README.md", Kind: "file"},
+		{Path: "index.html", Kind: "file"},
+	}
+	if err := initializeFastCloneIndex(dst, head, nodes); err != nil {
+		t.Fatalf("initializeFastCloneIndex: %v", err)
+	}
+	if got := gitOutputForTest(t, dst, "status", "--porcelain=v1"); got != "" {
+		t.Fatalf("status = %q, want clean", got)
+	}
+}
+
+func runTestGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func gitOutputForTest(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return string(bytes.TrimSpace(out))
 }
