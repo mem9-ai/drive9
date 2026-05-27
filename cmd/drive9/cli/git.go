@@ -102,7 +102,6 @@ func gitClone(args []string) error {
 
 	c := NewFromEnv()
 	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	defer cancel()
 	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
 		RootPath:   resolved.RemotePath,
 		RepoURL:    repoURL,
@@ -112,20 +111,25 @@ func gitClone(args []string) error {
 		HeadCommit: head,
 		Mode:       "fast",
 	})
+	cancel()
 	if err != nil {
 		return fmt.Errorf("register git workspace: %w", err)
 	}
+	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	if err := c.ReplaceGitTree(ctx, ws.WorkspaceID, client.GitTreeReplaceRequest{
 		CommitSHA: head,
 		Nodes:     nodes,
 	}); err != nil {
+		cancel()
 		return fmt.Errorf("register git tree manifest: %w", err)
 	}
+	cancel()
 	gitState, err := archiveGitDir(filepath.Join(target, ".git"))
 	if err != nil {
 		return fmt.Errorf("checkpoint .git: %w", err)
 	}
 	sum := sha256.Sum256(gitState)
+	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	if _, err := c.UpsertGitState(ctx, ws.WorkspaceID, client.GitStateRequest{
 		CheckpointCommit: head,
 		StorageType:      "tar.gz",
@@ -133,8 +137,10 @@ func gitClone(args []string) error {
 		SizeBytes:        int64(len(gitState)),
 		Content:          gitState,
 	}); err != nil {
+		cancel()
 		return fmt.Errorf("upload .git checkpoint: %w", err)
 	}
+	cancel()
 
 	fmt.Fprintf(os.Stderr, "drive9: registered git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, resolved.RemotePath, len(nodes))
 	return nil
