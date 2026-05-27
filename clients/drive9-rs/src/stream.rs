@@ -2,6 +2,7 @@ use crate::client::Client;
 use crate::error::Drive9Error;
 use crate::models::{CompletePart, UploadPlanV2};
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 
 const UPLOAD_MAX_CONCURRENCY: usize = 16;
@@ -11,8 +12,8 @@ pub struct StreamWriter {
     path: String,
     total_size: i64,
     expected_revision: i64,
-    state: std::sync::Arc<Mutex<StreamState>>,
-    sem: Semaphore,
+    state: Arc<Mutex<StreamState>>,
+    sem: Arc<Semaphore>,
 }
 
 struct StreamState {
@@ -38,7 +39,7 @@ impl StreamWriter {
             path,
             total_size,
             expected_revision,
-            state: std::sync::Arc::new(Mutex::new(StreamState {
+            state: Arc::new(Mutex::new(StreamState {
                 plan: None,
                 uploaded: HashMap::new(),
                 inflight: 0,
@@ -48,7 +49,7 @@ impl StreamWriter {
                 aborted: false,
                 closing: false,
             })),
-            sem: Semaphore::new(UPLOAD_MAX_CONCURRENCY),
+            sem: Arc::new(Semaphore::new(UPLOAD_MAX_CONCURRENCY)),
         }
     }
 
@@ -104,33 +105,32 @@ impl StreamWriter {
             return Err(Drive9Error::Other("stream writer is closing".to_string()));
         }
         if state.uploaded.contains_key(&part_num) {
-            return Err(Drive9Error::Other(
-                format!("part {} already uploaded", part_num),
-            ));
+            return Err(Drive9Error::Other(format!(
+                "part {} already uploaded",
+                part_num
+            )));
         }
         self.init_locked(&mut state).await?;
         if let Some(ref plan) = state.plan {
             if part_num > plan.total_parts {
-                return Err(Drive9Error::Other(
-                    format!(
-                        "part number {} exceeds total_parts {}",
-                        part_num, plan.total_parts
-                    ),
-                ));
+                return Err(Drive9Error::Other(format!(
+                    "part number {} exceeds total_parts {}",
+                    part_num, plan.total_parts
+                )));
             }
         }
         let plan = state.plan.clone().unwrap();
         state.inflight += 1;
         drop(state);
 
-        let permit = self.sem.acquire().await.unwrap();
+        let permit = Arc::clone(&self.sem).acquire_owned().await.unwrap();
         let client = self.client.clone();
         let data = data.clone();
         let upload_id = plan.upload_id;
 
         // Note: we spawn but do not await here; fire-and-forget like Go.
         // The caller must later call complete()/abort() which wait for inflight.
-        let this_state = std::sync::Arc::clone(&self.state);
+        let this_state = Arc::clone(&self.state);
         tokio::spawn(async move {
             let _permit = permit;
             let result = async {
