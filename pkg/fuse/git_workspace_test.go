@@ -141,7 +141,7 @@ func (f *gitWorkspaceFixture) handleOverlay(w http.ResponseWriter, r *http.Reque
 
 func TestGitWorkspaceOverlayPersistsAcrossFilesystemInstances(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
-	opts := &MountOptions{LocalRoot: t.TempDir()}
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
 
 	fs := NewDat9FS(fixture.client(), opts)
@@ -186,6 +186,49 @@ func TestGitWorkspaceOverlayPersistsAcrossFilesystemInstances(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceWriteSyncWritesOverlay(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "sync.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	content := []byte("write-sync overlay")
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(content)),
+	}, content)
+	if st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	if written != uint32(len(content)) {
+		t.Fatalf("Write bytes = %d, want %d", written, len(content))
+	}
+
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["sync.txt"]
+	fixture.mu.Unlock()
+	if !ok {
+		t.Fatalf("overlay entry missing for sync.txt")
+	}
+	if string(entry.Content) != string(content) {
+		t.Fatalf("overlay content = %q, want %q", entry.Content, content)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+}
+
 func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	srcGit := t.TempDir()
@@ -199,7 +242,7 @@ func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	fixture.state = state
 
 	localRoot := t.TempDir()
-	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent}
+	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())

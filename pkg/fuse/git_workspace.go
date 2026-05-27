@@ -115,7 +115,7 @@ func (fs *Dat9FS) ensureGitWorkspaces(ctx context.Context) error {
 }
 
 func (fs *Dat9FS) gitWorkspaceForPath(localPath string) (*gitWorkspaceRuntime, string, bool) {
-	if fs == nil || fs.git == nil {
+	if fs == nil || fs.git == nil || fs.opts == nil || !fs.opts.EnableGitWorkspaces {
 		return nil, "", false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), fuseTimeout)
@@ -712,6 +712,7 @@ func (fs *Dat9FS) flushGitHandleLocked(ctx context.Context, fh *FileHandle) gofu
 	fh.Dirty.ClearDirty()
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.DirtySeq = 0
+	fh.IsNew = false
 	if fh.HasPendingMode {
 		fs.inodes.UpdateMode(fh.Ino, fh.PendingMode&0o777)
 		fh.GitMode = req.Mode

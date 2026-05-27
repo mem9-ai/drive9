@@ -52,6 +52,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		ReadOnly:              opts.ReadOnly,
 		Debug:                 opts.Debug,
 		PerfCounters:          opts.PerfCounters,
+		EnableGitWorkspaces:   true,
 	})
 }
 

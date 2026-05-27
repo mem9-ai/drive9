@@ -64,6 +64,7 @@ type MountOptions struct {
 	ReadOnly              bool          // mount as read-only
 	Debug                 bool          // enable FUSE debug logging
 	PerfCounters          bool          // print low-overhead FUSE perf counter summary on shutdown
+	EnableGitWorkspaces   bool          // enable fast-clone git workspace overlay discovery
 }
 
 const defaultUploadConcurrency = 16
