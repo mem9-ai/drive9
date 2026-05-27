@@ -96,6 +96,9 @@ func gitClone(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := initializeFastCloneIndex(target, head); err != nil {
+		return err
+	}
 
 	c := NewFromEnv()
 	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
@@ -118,9 +121,6 @@ func gitClone(args []string) error {
 	}); err != nil {
 		return fmt.Errorf("register git tree manifest: %w", err)
 	}
-	if err := initializeFastCloneIndex(target, head, nodes); err != nil {
-		return err
-	}
 	gitState, err := archiveGitDir(filepath.Join(target, ".git"))
 	if err != nil {
 		return fmt.Errorf("checkpoint .git: %w", err)
@@ -140,44 +140,11 @@ func gitClone(args []string) error {
 	return nil
 }
 
-func initializeFastCloneIndex(repoDir, commitSHA string, nodes []client.GitTreeNode) error {
+func initializeFastCloneIndex(repoDir, commitSHA string) error {
 	if err := gitRun(repoDir, "read-tree", "--reset", commitSHA); err != nil {
 		return fmt.Errorf("initialize git index: %w", err)
 	}
-	if err := waitForFastCloneTree(repoDir, nodes, 5*time.Second); err != nil {
-		return err
-	}
-	if err := gitRun(repoDir, "update-index", "--refresh"); err != nil {
-		return fmt.Errorf("refresh git index: %w", err)
-	}
 	return nil
-}
-
-func waitForFastCloneTree(repoDir string, nodes []client.GitTreeNode, timeout time.Duration) error {
-	var probe string
-	for _, node := range nodes {
-		if node.Kind == "file" || node.Kind == "symlink" {
-			probe = node.Path
-			break
-		}
-	}
-	if probe == "" {
-		return nil
-	}
-	deadline := time.Now().Add(timeout)
-	probePath := filepath.Join(repoDir, filepath.FromSlash(probe))
-	var lastErr error
-	for {
-		if _, err := os.Lstat(probePath); err == nil {
-			return nil
-		} else {
-			lastErr = err
-		}
-		if time.Now().After(deadline) {
-			return fmt.Errorf("wait for drive9 git workspace tree %s: %w", probe, lastErr)
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
 }
 
 type mountedGitTarget struct {

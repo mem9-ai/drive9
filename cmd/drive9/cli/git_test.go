@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
@@ -96,6 +95,9 @@ func TestInitializeFastCloneIndexMakesStatusClean(t *testing.T) {
 	head := gitOutputForTest(t, src, "rev-parse", "HEAD")
 
 	runTestGit(t, "", "clone", "--no-checkout", src, dst)
+	if err := initializeFastCloneIndex(dst, head); err != nil {
+		t.Fatalf("initializeFastCloneIndex: %v", err)
+	}
 	if err := os.WriteFile(filepath.Join(dst, "README.md"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatalf("write virtual README: %v", err)
 	}
@@ -103,13 +105,6 @@ func TestInitializeFastCloneIndexMakesStatusClean(t *testing.T) {
 		t.Fatalf("write virtual index: %v", err)
 	}
 
-	nodes := []client.GitTreeNode{
-		{Path: "README.md", Kind: "file"},
-		{Path: "index.html", Kind: "file"},
-	}
-	if err := initializeFastCloneIndex(dst, head, nodes); err != nil {
-		t.Fatalf("initializeFastCloneIndex: %v", err)
-	}
 	if got := gitOutputForTest(t, dst, "status", "--porcelain=v1"); got != "" {
 		t.Fatalf("status = %q, want clean", got)
 	}
