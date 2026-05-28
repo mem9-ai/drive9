@@ -20,7 +20,7 @@ Go version: 1.25.1 (see `go.mod`)
 
 ## CI Pipeline
 
-```
+```text
 PR → code-ci.yml (lint + test + failpoint + build)
   + local-e2e.yml (TiDB playground + 4 smoke suites inc. FUSE)
 
