@@ -7,10 +7,40 @@ title: AGENTS.md - drive9 development guide for AI coding agents
 drive9 is a Go agent-native filesystem — a network drive with semantic search built on top of
 TiDB/MySQL (metadata), S3 (large files), and db9 (small files + embeddings).
 
-Module: `github.com/mem9-ai/drive9`  
+Module: `github.com/mem9-ai/dat9` (NOTE: module path uses `dat9`, not `drive9`)  
 Go version: 1.25.1 (see `go.mod`)
 
+### Structural notes
+
+- **`pkg/` is the primary code directory**, not `internal/`. Core application code (`server/`, `backend/`, `fuse/`, `datastore/`, `tenant/`, `semantic/`) lives in `pkg/` alongside truly reusable libraries (`client/`, `logger/`, `pathutil/`). The Go `internal/` visibility mechanism is not relied upon to prevent external imports.
+- **Non-Go projects at root**: `clients/` (5 multi-language SDKs), `obsidian-plugin/` (TypeScript), `site/` (static frontend). Each has its own build system — do not expect `go build` to work there.
+- **Module path is `github.com/mem9-ai/dat9`** (historical), not `drive9`. All Go source imports use the `dat9` path. Build ldflags in the Makefile also reference `dat9`.
+
 ---
+
+## CI Pipeline
+
+```
+PR → code-ci.yml (lint + test + failpoint + build)
+  + local-e2e.yml (TiDB playground + 4 smoke suites inc. FUSE)
+
+Push to main →
+  dev-cd.yml (Docker build → ECR → deploy to dev EKS)
+  drive9-archive.yml (self-archive CLI + source to drive9 FS)
+
+Prod deploy (manual workflow_dispatch) →
+  prod-cd.yml (promote image from dev → deploy to prod EKS)
+  ↳ release-cli.yml (cross-compile CLI for 6 platforms → push to drive9-fe)
+
+SDK changes (PR/push) → sdk-ci.yml (5 language SDKs in parallel)
+```
+
+**Key non-standard CI steps:**
+- **Failpoint tests** (`make test-failpoint`) rewrite Go source at CI time — never run in parallel with normal `go test`.
+- **Self-archiving/dogfooding** — `drive9-archive.yml` uploads build artifacts back into drive9 filesystem itself.
+- **TiDB playground in CI** — `local-e2e.yml` installs `tiup` and starts a real TiDB cluster for smoke tests.
+- **No `VERSION` file** — version always derived from git (short SHA in CI).
+- **No `.golangci.yml`** — golangci-lint v2.5.0 runs with default settings.
 
 ## Build commands
 
@@ -101,6 +131,7 @@ embedding. Override any var before running.
 ```
 cmd/drive9/             CLI entrypoint (cp, cat, ls, mv, rm, mount, umount, ...)
 cmd/drive9-server/      Server entrypoint
+cmd/drive9-server-local/ Single-tenant local validation server
 .github/ISSUE_TEMPLATE/ GitHub issue templates (bug report / enhancement / feature request)
 pkg/
   backend/              AGFS FileSystem implementation (Drive9Backend)
@@ -118,10 +149,15 @@ pkg/
   pathutil/             Path canonicalization and validation
   semantic/             Durable background task types
   traceid/              Trace ID helpers
+  vault/                Secret vault, grants, delegated tokens
 internal/
   testmysql/            MySQL test helpers (shared across packages)
+  schemaspec/           Schema specification helpers
+clients/                5 multi-language SDKs (Py/JS/RS/Kotlin/Swift)
+obsidian-plugin/        Obsidian TypeScript plugin
 e2e/                    Live bash smoke tests; read e2e/AGENTS.md first
 scripts/                Shell helpers for local dev and test
+deploy/                 Kubernetes deployment manifests
 docs/                   Design documents
 site/                   Frontend / release assets
 ```
