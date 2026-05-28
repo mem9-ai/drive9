@@ -4907,7 +4907,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
 		defer cf()
 		source = "write-sync"
-		st := gofuse.OK
+		var st gofuse.Status
 		if fh.Layer == PathLayerGitWorkspace {
 			source = "git-write-sync"
 			st = fs.flushGitHandleLocked(ctx, fh)

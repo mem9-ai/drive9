@@ -42,6 +42,7 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 
 - Stores the base/head commit tree manifest.
 - Paths are relative to the workspace root and do not have a leading `/`.
+- `path_hash` and `parent_path_hash` are SHA-256 hex hashes used for TiDB/MySQL indexes so long Git paths do not exceed key-length limits. The original `path` and `parent_path` remain authoritative for exact semantics and API responses.
 - Includes `kind`, `mode`, `object_sha`, and `size_bytes` for directories, files, symlinks, and submodules.
 - Clean tree file content is not stored in Drive9's generic file content tables.
 - `size_bytes` is still populated without relying on checkout file content. Manifest generation uses `git ls-tree -r -t -z HEAD` and must not use `git ls-tree -l`; `-l` asks Git to print blob sizes and is unsafe if a future mode uses a partial clone again.
@@ -52,6 +53,7 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 
 - Stores working tree changes relative to the clean tree.
 - `op=upsert` means a file or directory was created or modified; `op=whiteout` means a clean tree entry was deleted.
+- `path_hash` is the SHA-256 hex hash used as the durable key; the original `path` is still stored and checked on lookup.
 - File payloads are currently stored inline in `content_blob`; large-file support can later extend this to S3/storage refs.
 - Directory creation is stored as an overlay entry with `kind=dir`.
 

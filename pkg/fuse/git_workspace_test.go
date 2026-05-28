@@ -250,7 +250,7 @@ func TestGitWorkspaceOverlayPersistsAcrossFilesystemInstances(t *testing.T) {
 	if !handled || entry == nil {
 		t.Fatalf("gitEntry handled=%t entry=%v, want persisted overlay entry", handled, entry)
 	}
-	got, err := fs2.readGitFile(nil, "/repo/new.txt", 0, int64(len(content)))
+	got, err := fs2.readGitFile(context.Background(), "/repo/new.txt", 0, int64(len(content)))
 	if err != nil {
 		t.Fatalf("readGitFile: %v", err)
 	}

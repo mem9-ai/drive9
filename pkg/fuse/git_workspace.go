@@ -949,7 +949,7 @@ func extractGitArchive(content []byte, dst string) error {
 			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)&0o777); err != nil {
 				return err
 			}
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}

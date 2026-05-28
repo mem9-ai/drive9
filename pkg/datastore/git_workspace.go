@@ -228,9 +228,9 @@ WHERE workspace_id = ? AND commit_sha = ?`, workspaceID, commitSHA); err != nil 
 	if len(nodes) > 0 {
 		stmt, prepErr := tx.PrepareContext(ctx, `
 INSERT INTO git_workspace_tree_nodes (
-	workspace_id, commit_sha, path, parent_path, name, kind, mode,
-	object_sha, size_bytes, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3))`)
+	workspace_id, commit_sha, path, path_hash, parent_path, parent_path_hash,
+	name, kind, mode, object_sha, size_bytes, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3))`)
 		if prepErr != nil {
 			return fmt.Errorf("prepare insert git tree node: %w", prepErr)
 		}
@@ -244,8 +244,8 @@ INSERT INTO git_workspace_tree_nodes (
 				n.CommitSHA = commitSHA
 			}
 			if _, err = stmt.ExecContext(ctx,
-				n.WorkspaceID, n.CommitSHA, n.Path, n.ParentPath, n.Name, n.Kind, n.Mode,
-				n.ObjectSHA, n.SizeBytes,
+				n.WorkspaceID, n.CommitSHA, n.Path, gitPathHash(n.Path), n.ParentPath, gitPathHash(n.ParentPath),
+				n.Name, n.Kind, n.Mode, n.ObjectSHA, n.SizeBytes,
 			); err != nil {
 				return fmt.Errorf("insert git tree node %s: %w", n.Path, err)
 			}
@@ -414,10 +414,11 @@ func (s *Store) UpsertGitOverlayEntry(ctx context.Context, entry GitOverlayEntry
 	}
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO git_workspace_overlay (
-	workspace_id, path, op, kind, mode, storage_type, storage_ref, storage_ref_hash,
+	workspace_id, path, path_hash, op, kind, mode, storage_type, storage_ref, storage_ref_hash,
 	checksum_sha256, size_bytes, base_object_sha, content_blob, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
 ON DUPLICATE KEY UPDATE
+	path = VALUES(path),
 	op = VALUES(op),
 	kind = VALUES(kind),
 	mode = VALUES(mode),
@@ -429,7 +430,7 @@ ON DUPLICATE KEY UPDATE
 	base_object_sha = VALUES(base_object_sha),
 	content_blob = VALUES(content_blob),
 	updated_at = UTC_TIMESTAMP(3)`,
-		entry.WorkspaceID, entry.Path, entry.Op, entry.Kind, entry.Mode, entry.StorageType, entry.StorageRef,
+		entry.WorkspaceID, entry.Path, gitPathHash(entry.Path), entry.Op, entry.Kind, entry.Mode, entry.StorageType, entry.StorageRef,
 		entry.StorageRefHash, entry.ChecksumSHA256, entry.SizeBytes, entry.BaseObjectSHA, entry.ContentBlob)
 	if err != nil {
 		return fmt.Errorf("upsert git overlay entry %s: %w", entry.Path, err)
@@ -470,7 +471,7 @@ func (s *Store) GetGitOverlayEntry(ctx context.Context, workspaceID, relPath str
 SELECT workspace_id, path, op, kind, mode, storage_type, storage_ref, storage_ref_hash,
 	checksum_sha256, size_bytes, base_object_sha, content_blob, created_at, updated_at
 FROM git_workspace_overlay
-WHERE workspace_id = ? AND path = ?`, workspaceID, relPath)
+WHERE workspace_id = ? AND path_hash = ? AND path = ?`, workspaceID, gitPathHash(relPath), relPath)
 	var e GitOverlayEntry
 	if err := row.Scan(
 		&e.WorkspaceID, &e.Path, &e.Op, &e.Kind, &e.Mode, &e.StorageType, &e.StorageRef,
@@ -482,4 +483,8 @@ WHERE workspace_id = ? AND path = ?`, workspaceID, relPath)
 		return nil, err
 	}
 	return &e, nil
+}
+
+func gitPathHash(path string) string {
+	return StorageRefHash(path)
 }

@@ -261,7 +261,6 @@ func hydrateFromGitHubTarball(ctx context.Context, opts HydrateOptions, ref GitH
 	if err := installTree(opts, tmp); err != nil {
 		return HydrateResult{Provider: "github-codeload"}, err
 	}
-	cleanup = func() {}
 	return HydrateResult{Status: hydrateStatusSuccess, Provider: "github-codeload", Files: files, Bytes: bytes}, nil
 }
 
@@ -295,7 +294,6 @@ func hydrateFromLocalGit(ctx context.Context, opts HydrateOptions) (HydrateResul
 	if err := installTree(opts, tmp); err != nil {
 		return HydrateResult{Provider: "git-checkout-index"}, err
 	}
-	cleanup = func() {}
 	return HydrateResult{Status: hydrateStatusSuccess, Provider: "git-checkout-index", Files: files, Bytes: bytes}, nil
 }
 
@@ -370,7 +368,7 @@ func extractCodeloadTar(r io.Reader, dst string) (int64, int64, error) {
 			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)&0o777); err != nil {
 				return files, bytes, err
 			}
-		case tar.TypeReg, tar.TypeRegA:
+		case tar.TypeReg:
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return files, bytes, err
 			}

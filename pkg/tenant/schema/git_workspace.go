@@ -26,16 +26,18 @@ func GitWorkspaceTiDBSchemaStatements() []string {
 			workspace_id VARCHAR(64) NOT NULL,
 			commit_sha   VARCHAR(64) NOT NULL,
 			path         VARCHAR(1024) NOT NULL,
+			path_hash    VARCHAR(64) NOT NULL,
 			parent_path  VARCHAR(1024) NOT NULL DEFAULT '',
+			parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 			name         VARCHAR(255) NOT NULL,
 			kind         VARCHAR(16) NOT NULL,
 			mode         VARCHAR(16) NOT NULL,
 			object_sha   VARCHAR(64) NOT NULL DEFAULT '',
 			size_bytes   BIGINT NOT NULL DEFAULT -1,
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			PRIMARY KEY (workspace_id, commit_sha, path)
+			PRIMARY KEY (workspace_id, commit_sha, path_hash)
 		)`,
-		`CREATE INDEX idx_git_tree_parent ON git_workspace_tree_nodes(workspace_id, commit_sha, parent_path)`,
+		`CREATE INDEX idx_git_tree_parent ON git_workspace_tree_nodes(workspace_id, commit_sha, parent_path_hash)`,
 
 		`CREATE TABLE IF NOT EXISTS git_workspace_git_state (
 			workspace_id      VARCHAR(64) PRIMARY KEY,
@@ -65,6 +67,7 @@ func GitWorkspaceTiDBSchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS git_workspace_overlay (
 			workspace_id    VARCHAR(64) NOT NULL,
 			path            VARCHAR(1024) NOT NULL,
+			path_hash       VARCHAR(64) NOT NULL,
 			op              VARCHAR(16) NOT NULL,
 			kind            VARCHAR(16) NOT NULL DEFAULT 'file',
 			mode            VARCHAR(16) NOT NULL DEFAULT '',
@@ -77,7 +80,7 @@ func GitWorkspaceTiDBSchemaStatements() []string {
 			content_blob    LONGBLOB,
 			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-			PRIMARY KEY (workspace_id, path)
+			PRIMARY KEY (workspace_id, path_hash)
 		)`,
 		`CREATE INDEX idx_git_overlay_op ON git_workspace_overlay(workspace_id, op)`,
 	}
@@ -107,16 +110,18 @@ func GitWorkspaceDB9SchemaStatements() []string {
 			workspace_id VARCHAR(64) NOT NULL,
 			commit_sha   VARCHAR(64) NOT NULL,
 			path         VARCHAR(1024) NOT NULL,
+			path_hash    VARCHAR(64) NOT NULL,
 			parent_path  VARCHAR(1024) NOT NULL DEFAULT '',
+			parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 			name         VARCHAR(255) NOT NULL,
 			kind         VARCHAR(16) NOT NULL,
 			mode         VARCHAR(16) NOT NULL,
 			object_sha   VARCHAR(64) NOT NULL DEFAULT '',
 			size_bytes   BIGINT NOT NULL DEFAULT -1,
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (workspace_id, commit_sha, path)
+			PRIMARY KEY (workspace_id, commit_sha, path_hash)
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_git_tree_parent ON git_workspace_tree_nodes(workspace_id, commit_sha, parent_path)`,
+		`CREATE INDEX IF NOT EXISTS idx_git_tree_parent ON git_workspace_tree_nodes(workspace_id, commit_sha, parent_path_hash)`,
 
 		`CREATE TABLE IF NOT EXISTS git_workspace_git_state (
 			workspace_id      VARCHAR(64) PRIMARY KEY,
@@ -146,6 +151,7 @@ func GitWorkspaceDB9SchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS git_workspace_overlay (
 			workspace_id    VARCHAR(64) NOT NULL,
 			path            VARCHAR(1024) NOT NULL,
+			path_hash       VARCHAR(64) NOT NULL,
 			op              VARCHAR(16) NOT NULL,
 			kind            VARCHAR(16) NOT NULL DEFAULT 'file',
 			mode            VARCHAR(16) NOT NULL DEFAULT '',
@@ -158,7 +164,7 @@ func GitWorkspaceDB9SchemaStatements() []string {
 			content_blob    BYTEA,
 			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (workspace_id, path)
+			PRIMARY KEY (workspace_id, path_hash)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_git_overlay_op ON git_workspace_overlay(workspace_id, op)`,
 	}
