@@ -821,6 +821,108 @@ func TestGitWorkspaceTrackedLocalOnlyPathBypassesLocalOverlay(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceGeneratedTmpApiExtractorUsesLocalOverlay(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.treeNodes = []client.GitTreeNode{
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "packages",
+			ParentPath:  "",
+			Name:        "packages",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "packages/node-sdk",
+			ParentPath:  "packages",
+			Name:        "node-sdk",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "packages/node-sdk/src",
+			ParentPath:  "packages/node-sdk",
+			Name:        "src",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "cccccccccccccccccccccccccccccccccccccccc",
+		},
+	}
+
+	localRoot := t.TempDir()
+	opts := &MountOptions{
+		LocalRoot:           localRoot,
+		Profile:             MountProfileCodingAgent,
+		EnableGitWorkspaces: true,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	nodeSDKIno := fs.inodes.Lookup("/repo/packages/node-sdk", true, 0, time.Now())
+
+	var dirOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: nodeSDKIno},
+		Mode:     0o755,
+	}, ".tmp-api-extractor", &dirOut); st != gofuse.OK {
+		t.Fatalf("Mkdir .tmp-api-extractor status = %v, want OK", st)
+	}
+
+	var fileOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: dirOut.NodeId},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "index.d.ts", &fileOut); st != gofuse.OK {
+		t.Fatalf("Create generated dts status = %v, want OK", st)
+	}
+	content := []byte("export {};\n")
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: fileOut.NodeId},
+		Fh:       fileOut.Fh,
+		Size:     uint32(len(content)),
+	}, content)
+	if st != gofuse.OK {
+		t.Fatalf("Write generated dts status = %v, want OK", st)
+	}
+	if written != uint32(len(content)) {
+		t.Fatalf("Write generated dts bytes = %d, want %d", written, len(content))
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: fileOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush generated dts status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: fileOut.Fh})
+
+	got, err := os.ReadFile(filepath.Join(localRoot, "overlay/repo/packages/node-sdk/.tmp-api-extractor/index.d.ts"))
+	if err != nil {
+		t.Fatalf("read local generated dts: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("local generated dts = %q, want %q", got, content)
+	}
+
+	entries, err := fs.listDir(context.Background(), "/repo/packages/node-sdk")
+	if err != nil {
+		t.Fatalf("listDir node-sdk: %v", err)
+	}
+	names := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		names[entry.Name] = struct{}{}
+	}
+	if _, ok := names[".tmp-api-extractor"]; !ok {
+		t.Fatalf("listDir missing local .tmp-api-extractor entry: %#v", entries)
+	}
+	if _, ok := names["src"]; !ok {
+		t.Fatalf("listDir missing tracked src entry: %#v", entries)
+	}
+}
+
 func TestSliceReadNegativeSizeReadsToEOF(t *testing.T) {
 	got := sliceRead([]byte("abcdef"), 2, -1)
 	if string(got) != "cdef" {
