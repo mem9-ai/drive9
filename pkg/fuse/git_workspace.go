@@ -709,8 +709,14 @@ func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath strin
 }
 
 type gitCheckpointSanitization struct {
-	resetIndex    bool
+	indexRestores []gitIndexRestore
 	dropLocalRefs bool
+}
+
+type gitIndexRestore struct {
+	path      string
+	mode      string
+	objectSHA string
 }
 
 type gitObjectInfo struct {
@@ -734,29 +740,35 @@ func buildLocalGitObjectPack(ctx context.Context, gitDir string, rt *gitWorkspac
 		sanitize.dropLocalRefs = true
 	}
 
-	stagedObjects, stagedOversize, err := collectStagedLocalObjects(ctx, gitDir, rt)
+	stagedObjects, stagedAllRestores, stagedRestores, err := collectStagedLocalObjects(ctx, gitDir, rt)
 	if err != nil {
 		return nil, sanitize, err
 	}
-	if stagedOversize {
-		stagedObjects = nil
-		sanitize.resetIndex = true
-	}
+	sanitize.indexRestores = append(sanitize.indexRestores, stagedRestores...)
 
 	pack, err := packGitObjects(ctx, gitDir, mergeObjectSets(refObjects, stagedObjects))
 	if err != nil {
 		return nil, sanitize, err
 	}
 	if int64(len(pack)) > gitLocalObjectMaxPackBytes {
-		sanitize.resetIndex = true
 		pack, err = packGitObjects(ctx, gitDir, refObjects)
 		if err != nil {
 			return nil, sanitize, err
 		}
+		sanitize.indexRestores = mergeIndexRestores(sanitize.indexRestores, stagedAllRestores)
 	}
 	if int64(len(pack)) > gitLocalObjectMaxPackBytes {
 		sanitize.dropLocalRefs = true
-		pack = nil
+		pack, err = packGitObjects(ctx, gitDir, stagedObjects)
+		if err != nil {
+			return nil, sanitize, err
+		}
+		if int64(len(pack)) > gitLocalObjectMaxPackBytes {
+			pack = nil
+			sanitize.indexRestores = mergeIndexRestores(sanitize.indexRestores, stagedAllRestores)
+		} else {
+			sanitize.indexRestores = stagedRestores
+		}
 	}
 	return pack, sanitize, nil
 }
@@ -790,10 +802,10 @@ func collectLocalRefObjects(ctx context.Context, gitDir, remoteName string) (map
 	return objects, false, nil
 }
 
-func collectStagedLocalObjects(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime) (map[string]struct{}, bool, error) {
+func collectStagedLocalObjects(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime) (map[string]struct{}, []gitIndexRestore, []gitIndexRestore, error) {
 	out, err := gitCommandOutput(ctx, "--git-dir", gitDir, "ls-files", "-s", "-z")
 	if err != nil {
-		return nil, false, err
+		return nil, nil, nil, err
 	}
 	type stagedBlob struct {
 		oid  string
@@ -824,7 +836,7 @@ func collectStagedLocalObjects(ctx context.Context, gitDir string, rt *gitWorksp
 		staged = append(staged, stagedBlob{oid: oid, path: rel})
 	}
 	if len(staged) == 0 {
-		return nil, false, nil
+		return nil, nil, nil, nil
 	}
 	ids := make([]string, 0, len(staged))
 	for _, blob := range staged {
@@ -832,17 +844,49 @@ func collectStagedLocalObjects(ctx context.Context, gitDir string, rt *gitWorksp
 	}
 	info, err := gitObjectInfoBatch(ctx, gitDir, ids)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, nil, err
 	}
 	objects := make(map[string]struct{})
+	allRestores := make([]gitIndexRestore, 0, len(staged))
+	var restores []gitIndexRestore
 	for _, blob := range staged {
+		restore := gitIndexRestoreForPath(rt, blob.path)
+		allRestores = append(allRestores, restore)
 		object := info[blob.oid]
 		if object.typ == "blob" && object.size > gitLocalObjectMaxBlobBytes {
-			return nil, true, nil
+			restores = append(restores, restore)
+			continue
 		}
 		objects[blob.oid] = struct{}{}
 	}
-	return objects, false, nil
+	if len(objects) == 0 {
+		objects = nil
+	}
+	return objects, allRestores, restores, nil
+}
+
+func gitIndexRestoreForPath(rt *gitWorkspaceRuntime, rel string) gitIndexRestore {
+	restore := gitIndexRestore{path: rel}
+	if node, ok := rt.cleanNode(rel); ok {
+		restore.mode = node.Mode
+		restore.objectSHA = node.ObjectSHA
+	}
+	return restore
+}
+
+func mergeIndexRestores(restores ...[]gitIndexRestore) []gitIndexRestore {
+	byPath := make(map[string]gitIndexRestore)
+	for _, list := range restores {
+		for _, restore := range list {
+			byPath[restore.path] = restore
+		}
+	}
+	out := make([]gitIndexRestore, 0, len(byPath))
+	for _, restore := range byPath {
+		out = append(out, restore)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].path < out[j].path })
+	return out
 }
 
 func gitObjectInfoBatch(ctx context.Context, gitDir string, ids []string) (map[string]gitObjectInfo, error) {
@@ -936,7 +980,7 @@ func gitCommandOutput(ctx context.Context, args ...string) ([]byte, error) {
 }
 
 func archiveLocalGitStateForCheckpoint(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime, sanitize gitCheckpointSanitization) ([]byte, error) {
-	if !sanitize.resetIndex && !sanitize.dropLocalRefs {
+	if len(sanitize.indexRestores) == 0 && !sanitize.dropLocalRefs {
 		return archiveLocalGitStateDir(gitDir)
 	}
 	content, err := archiveLocalGitStateDir(gitDir)
@@ -951,8 +995,8 @@ func archiveLocalGitStateForCheckpoint(ctx context.Context, gitDir string, rt *g
 	if err := extractGitArchive(content, tmp); err != nil {
 		return nil, err
 	}
-	if sanitize.resetIndex {
-		if err := writeBaseGitIndex(ctx, gitDir, tmp, rt.workspace.HeadCommit); err != nil {
+	if len(sanitize.indexRestores) > 0 {
+		if err := applyGitIndexRestores(ctx, gitDir, tmp, sanitize.indexRestores); err != nil {
 			return nil, err
 		}
 	}
@@ -964,23 +1008,35 @@ func archiveLocalGitStateForCheckpoint(ctx context.Context, gitDir string, rt *g
 	return archiveLocalGitDir(tmp)
 }
 
-func writeBaseGitIndex(ctx context.Context, sourceGitDir, stateDir, commit string) error {
-	if strings.TrimSpace(commit) == "" {
-		return os.Remove(filepath.Join(stateDir, "index"))
-	}
+func applyGitIndexRestores(ctx context.Context, sourceGitDir, stateDir string, restores []gitIndexRestore) error {
 	indexPath := filepath.Join(stateDir, "index")
-	tmpIndex := filepath.Join(stateDir, "index.drive9-base")
-	cmd := exec.CommandContext(ctx, "git", "--git-dir", sourceGitDir, "read-tree", "--index-output="+tmpIndex, commit)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg != "" {
-			return fmt.Errorf("git read-tree base index: %w: %s", err, msg)
+	for _, restore := range restores {
+		if strings.TrimSpace(restore.path) == "" {
+			continue
 		}
-		return fmt.Errorf("git read-tree base index: %w", err)
+		var args []string
+		if restore.objectSHA != "" {
+			mode := restore.mode
+			if mode == "" {
+				mode = "100644"
+			}
+			args = []string{"--git-dir", sourceGitDir, "update-index", "--cacheinfo", mode, restore.objectSHA, restore.path}
+		} else {
+			args = []string{"--git-dir", sourceGitDir, "update-index", "--force-remove", "--", restore.path}
+		}
+		cmd := exec.CommandContext(ctx, "git", args...)
+		cmd.Env = append(os.Environ(), "GIT_INDEX_FILE="+indexPath)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			msg := strings.TrimSpace(stderr.String())
+			if msg != "" {
+				return fmt.Errorf("git update-index restore %s: %w: %s", restore.path, err, msg)
+			}
+			return fmt.Errorf("git update-index restore %s: %w", restore.path, err)
+		}
 	}
-	return os.Rename(tmpIndex, indexPath)
+	return nil
 }
 
 func resetLocalGitRefs(stateDir, commit string) error {

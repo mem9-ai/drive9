@@ -421,7 +421,7 @@ func TestBuildLocalGitObjectPackPreservesSmallStagedBlob(t *testing.T) {
 	if len(pack) == 0 {
 		t.Fatalf("pack is empty, want staged blob")
 	}
-	if sanitize.resetIndex || sanitize.dropLocalRefs {
+	if len(sanitize.indexRestores) != 0 || sanitize.dropLocalRefs {
 		t.Fatalf("sanitize = %+v, want no degradation", sanitize)
 	}
 	state, err := archiveLocalGitStateForCheckpoint(context.Background(), filepath.Join(work, ".git"), rt, sanitize)
@@ -462,8 +462,8 @@ func TestBuildLocalGitObjectPackDowngradesOversizedStagedBlob(t *testing.T) {
 	if len(pack) != 0 {
 		t.Fatalf("pack len = %d, want 0 for oversized staged blob", len(pack))
 	}
-	if !sanitize.resetIndex {
-		t.Fatalf("sanitize.resetIndex = false, want true")
+	if len(sanitize.indexRestores) != 1 {
+		t.Fatalf("sanitize.indexRestores len = %d, want 1", len(sanitize.indexRestores))
 	}
 	state, err := archiveLocalGitStateForCheckpoint(context.Background(), filepath.Join(work, ".git"), rt, sanitize)
 	if err != nil {
@@ -477,6 +477,51 @@ func TestBuildLocalGitObjectPackDowngradesOversizedStagedBlob(t *testing.T) {
 	}
 	if got := fuseGitOutputForTest(t, restored, "diff", "--cached", "--name-only"); got != "" {
 		t.Fatalf("cached diff = %q, want downgraded empty index", got)
+	}
+}
+
+func TestBuildLocalGitObjectPackDowngradesOnlyOversizedStagedBlob(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	src := createGitRepoWithReadme(t, []byte("hello base\n"))
+	work := filepath.Join(t.TempDir(), "work")
+	runFuseTestGit(t, "", "clone", src, work)
+	rt := gitRuntimeForRepo(t, src)
+
+	if err := os.WriteFile(filepath.Join(work, "staged-small.txt"), []byte("small staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runFuseTestGit(t, work, "add", "staged-small.txt")
+	large := bytes.Repeat([]byte("x"), int(gitLocalObjectMaxBlobBytes)+1)
+	if err := os.WriteFile(filepath.Join(work, "oversized-staged.bin"), large, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runFuseTestGit(t, work, "add", "oversized-staged.bin")
+
+	pack, sanitize, err := buildLocalGitObjectPack(context.Background(), filepath.Join(work, ".git"), rt)
+	if err != nil {
+		t.Fatalf("buildLocalGitObjectPack: %v", err)
+	}
+	if len(pack) == 0 {
+		t.Fatalf("pack is empty, want small staged blob")
+	}
+	if len(sanitize.indexRestores) != 1 || sanitize.indexRestores[0].path != "oversized-staged.bin" {
+		t.Fatalf("sanitize.indexRestores = %+v, want only oversized-staged.bin", sanitize.indexRestores)
+	}
+	state, err := archiveLocalGitStateForCheckpoint(context.Background(), filepath.Join(work, ".git"), rt, sanitize)
+	if err != nil {
+		t.Fatalf("archiveLocalGitStateForCheckpoint: %v", err)
+	}
+
+	restored := filepath.Join(t.TempDir(), "restored")
+	runFuseTestGit(t, "", "clone", "--no-checkout", src, restored)
+	unpackGitPackForTest(t, filepath.Join(restored, ".git"), pack)
+	if err := extractGitArchive(state, filepath.Join(restored, ".git")); err != nil {
+		t.Fatalf("extractGitArchive: %v", err)
+	}
+	if got := fuseGitOutputForTest(t, restored, "diff", "--cached", "--name-only"); got != "staged-small.txt" {
+		t.Fatalf("cached diff = %q, want staged-small.txt", got)
 	}
 }
 
