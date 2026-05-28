@@ -283,6 +283,9 @@ func initServerGitObjectPackTestSchema(t *testing.T, s *Server) {
 	}
 	for _, stmt := range stmts {
 		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+			if strings.Contains(err.Error(), "Duplicate key name") {
+				continue
+			}
 			t.Fatal(err)
 		}
 	}

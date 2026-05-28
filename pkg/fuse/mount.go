@@ -493,6 +493,9 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 		return fmt.Errorf("mount: unknown profile %q", opts.Profile)
 	}
 	opts.LocalRoot = strings.TrimSpace(opts.LocalRoot)
+	if opts.EnableGitWorkspaces && opts.LocalRoot == "" {
+		return fmt.Errorf("mount: EnableGitWorkspaces requires LocalRoot")
+	}
 	hasLocalPolicy := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0
 	if opts.Profile != MountProfileCodingAgent {
 		if hasLocalPolicy {

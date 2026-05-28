@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,7 +98,7 @@ func TestReadTreeFileReadsSymlinkTarget(t *testing.T) {
 	if err := os.Symlink("target.txt", filepath.Join(root, "link")); err != nil {
 		t.Fatal(err)
 	}
-	got, hit, err := ReadTreeFile(localRoot, "ws1", "commit1", "link", 0, -1)
+	got, hit, err := ReadTreeFile(context.Background(), localRoot, "ws1", "commit1", "link", 0, -1)
 	if err != nil {
 		t.Fatalf("ReadTreeFile: %v", err)
 	}

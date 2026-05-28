@@ -3,6 +3,7 @@ package datastore
 import (
 	"bytes"
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -56,6 +57,9 @@ func initGitObjectPackTestSchema(t *testing.T, s *Store) {
 	}
 	for _, stmt := range stmts {
 		if _, err := s.DB().Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "Duplicate key name") {
+				continue
+			}
 			t.Fatal(err)
 		}
 	}

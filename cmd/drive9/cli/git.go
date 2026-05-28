@@ -95,6 +95,7 @@ func gitClone(args []string) error {
 	}
 	repoURL := fs.Arg(0)
 	target := fs.Arg(1)
+	cmdCtx := context.Background()
 
 	resolved, err := resolveMountedGitTarget(target)
 	if err != nil {
@@ -102,22 +103,22 @@ func gitClone(args []string) error {
 	}
 
 	cloneArgs := gitFastCloneArgs(repoURL, target, *blobless)
-	if err := runGitStreaming(cloneArgs...); err != nil {
-		return fmt.Errorf("git %s: %w", strings.Join(cloneArgs, " "), err)
+	if err := runGitStreaming(cmdCtx, cloneArgs...); err != nil {
+		return fmt.Errorf("git clone failed: %w", err)
 	}
-	head, err := gitOutput(target, "rev-parse", "HEAD")
+	head, err := gitOutput(cmdCtx, target, "rev-parse", "HEAD")
 	if err != nil {
 		return fmt.Errorf("git rev-parse HEAD: %w", err)
 	}
-	branch, branchErr := gitOutput(target, "symbolic-ref", "--short", "-q", "HEAD")
+	branch, branchErr := gitOutput(cmdCtx, target, "symbolic-ref", "--short", "-q", "HEAD")
 	if branchErr != nil {
 		branch = ""
 	}
-	nodes, err := gitListTree(target, head)
+	nodes, err := gitListTree(cmdCtx, target, head)
 	if err != nil {
 		return err
 	}
-	treeSHA, treeErr := gitOutput(target, "rev-parse", head+"^{tree}")
+	treeSHA, treeErr := gitOutput(cmdCtx, target, "rev-parse", head+"^{tree}")
 	if treeErr != nil {
 		return fmt.Errorf("git rev-parse HEAD^{tree}: %w", treeErr)
 	}
@@ -132,7 +133,7 @@ func gitClone(args []string) error {
 	} else {
 		nodes = enriched
 	}
-	if err := initializeFastCloneIndex(target, head); err != nil {
+	if err := initializeFastCloneIndex(cmdCtx, target, head); err != nil {
 		return err
 	}
 
@@ -172,7 +173,7 @@ func gitClone(args []string) error {
 			return fmt.Errorf("stat local .git checkpoint path: %w", statErr)
 		}
 	}
-	gitState, err := archiveGitStateDir(gitDir)
+	gitState, err := archiveGitStateDir(cmdCtx, gitDir)
 	if err != nil {
 		return fmt.Errorf("checkpoint .git: %w", err)
 	}
@@ -203,7 +204,7 @@ func gitClone(args []string) error {
 			fmt.Fprintf(os.Stderr, "drive9: hydrated clean tree provider=%s files=%d bytes=%d duration=%s\n",
 				result.Provider, result.Files, result.Bytes, result.Duration.Truncate(time.Millisecond))
 		case gitHydrateModeBackground:
-			if err := startGitHydrateBackground(target, resolved, ws); err != nil {
+			if err := startGitHydrateBackground(cmdCtx, target, resolved, ws); err != nil {
 				fmt.Fprintf(os.Stderr, "drive9: warning: could not start background hydrate: %v\n", err)
 			}
 		}
@@ -295,7 +296,7 @@ func hydrateMountedGitTarget(ctx context.Context, repoURL string, resolved mount
 	})
 }
 
-func startGitHydrateBackground(target string, resolved mountedGitTarget, ws *client.GitWorkspace) error {
+func startGitHydrateBackground(ctx context.Context, target string, resolved mountedGitTarget, ws *client.GitWorkspace) error {
 	if strings.TrimSpace(resolved.LocalRoot) == "" {
 		return fmt.Errorf("mount metadata does not include local_root")
 	}
@@ -310,7 +311,7 @@ func startGitHydrateBackground(target string, resolved mountedGitTarget, ws *cli
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(os.Args[0], "git", "hydrate", "--timeout="+gitHydrateTimeout.String(), target)
+	cmd := exec.CommandContext(ctx, os.Args[0], "git", "hydrate", "--timeout="+gitHydrateTimeout.String(), target)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Env = os.Environ()
@@ -336,8 +337,8 @@ func gitFastCloneArgs(repoURL, target string, blobless bool) []string {
 	return args
 }
 
-func initializeFastCloneIndex(repoDir, commitSHA string) error {
-	if err := gitRun(repoDir, "read-tree", "--reset", commitSHA); err != nil {
+func initializeFastCloneIndex(ctx context.Context, repoDir, commitSHA string) error {
+	if err := gitRun(ctx, repoDir, "read-tree", "--reset", commitSHA); err != nil {
 		return fmt.Errorf("initialize git index: %w", err)
 	}
 	return nil
@@ -442,17 +443,17 @@ func relToMountedTarget(absTarget, mountPoint string) (absMount string, rel stri
 	return absMount, rel, true, nil
 }
 
-func runGitStreaming(args ...string) error {
-	cmd := exec.Command("git", args...)
+func runGitStreaming(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
-func gitOutput(repoDir string, args ...string) (string, error) {
+func gitOutput(ctx context.Context, repoDir string, args ...string) (string, error) {
 	full := append([]string{"-C", repoDir}, args...)
-	cmd := exec.Command("git", full...)
+	cmd := exec.CommandContext(ctx, "git", full...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -466,9 +467,9 @@ func gitOutput(repoDir string, args ...string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func gitRun(repoDir string, args ...string) error {
+func gitRun(ctx context.Context, repoDir string, args ...string) error {
 	full := append([]string{"-C", repoDir}, args...)
-	cmd := exec.Command("git", full...)
+	cmd := exec.CommandContext(ctx, "git", full...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -481,9 +482,9 @@ func gitRun(repoDir string, args ...string) error {
 	return nil
 }
 
-func gitListTree(repoDir, commitSHA string) ([]client.GitTreeNode, error) {
+func gitListTree(ctx context.Context, repoDir, commitSHA string) ([]client.GitTreeNode, error) {
 	full := []string{"-C", repoDir, "ls-tree", "-r", "-t", "-z", commitSHA}
-	cmd := exec.Command("git", full...)
+	cmd := exec.CommandContext(ctx, "git", full...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -793,15 +794,18 @@ func splitGitManifestPath(p string) (parent, name string, err error) {
 	return parent, name, nil
 }
 
-func archiveGitStateDir(gitDir string) ([]byte, error) {
-	return archiveGitDir(gitDir, shouldSkipGitObjectStatePath)
+func archiveGitStateDir(ctx context.Context, gitDir string) ([]byte, error) {
+	return archiveGitDir(ctx, gitDir, shouldSkipGitObjectStatePath)
 }
 
-func archiveGitDir(gitDir string, skip func(string, fs.DirEntry) bool) ([]byte, error) {
+func archiveGitDir(ctx context.Context, gitDir string, skip func(string, fs.DirEntry) bool) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
 	err := filepath.WalkDir(gitDir, func(p string, d fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
 		}

@@ -17,10 +17,11 @@ import (
 )
 
 const (
-	maxGitWorkspaceBodyBytes = 4 << 20
-	maxGitTreeBodyBytes      = 128 << 20
-	maxGitBlobBodyBytes      = 512 << 20
-	maxGitObjectPackBytes    = 256 << 20
+	maxGitWorkspaceBodyBytes  = 4 << 20
+	maxGitTreeBodyBytes       = 128 << 20
+	maxGitBlobBodyBytes       = 512 << 20
+	maxGitObjectPackBytes     = 256 << 20
+	maxGitObjectPackBodyBytes = maxGitObjectPackBytes + maxGitObjectPackBytes/3 + 1<<20
 )
 
 type gitWorkspaceRequest struct {
@@ -209,7 +210,7 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 		BranchName:  strings.TrimSpace(req.BranchName),
 		BaseCommit:  strings.TrimSpace(req.BaseCommit),
 		HeadCommit:  strings.TrimSpace(req.HeadCommit),
-		Mode:        strings.TrimSpace(req.Mode),
+		Mode:        datastore.GitWorkspaceMode(strings.TrimSpace(req.Mode)),
 		Status:      datastore.GitWorkspaceStatusLive,
 	}
 	if ws.RemoteName == "" {
@@ -265,6 +266,15 @@ func (s *Server) handleGitWorkspaceList(w http.ResponseWriter, r *http.Request, 
 	_ = json.NewEncoder(w).Encode(map[string]any{"workspaces": out})
 }
 
+func (s *Server) handleGitWorkspaceDelete(w http.ResponseWriter, r *http.Request, store *datastore.Store, workspaceID string) {
+	if err := store.DeleteGitWorkspace(r.Context(), workspaceID); err != nil {
+		writeGitWorkspaceStoreError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+}
+
 func (s *Server) handleGitWorkspaceObject(w http.ResponseWriter, r *http.Request, store *datastore.Store) {
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/git-workspaces/")
 	rawID, sub, hasSub := strings.Cut(rest, "/")
@@ -279,6 +289,10 @@ func (s *Server) handleGitWorkspaceObject(w http.ResponseWriter, r *http.Request
 	}
 	switch {
 	case !hasSub:
+		if r.Method == http.MethodDelete {
+			s.handleGitWorkspaceDelete(w, r, store, workspaceID)
+			return
+		}
 		if r.Method != http.MethodGet {
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
@@ -369,7 +383,7 @@ func (s *Server) handleGitWorkspaceObject(w http.ResponseWriter, r *http.Request
 func (s *Server) handleGitObjectPackUpsert(w http.ResponseWriter, r *http.Request, store *datastore.Store, workspaceID string) {
 	defer func() { _ = r.Body.Close() }()
 	var req gitObjectPackRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxGitBlobBodyBytes)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxGitObjectPackBodyBytes)).Decode(&req); err != nil {
 		errJSON(w, http.StatusBadRequest, "malformed JSON")
 		return
 	}
@@ -478,6 +492,10 @@ func (s *Server) handleGitStateUpsert(w http.ResponseWriter, r *http.Request, st
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if err := validateInlineContentMetadata(req.Content, req.SizeBytes, req.ChecksumSHA256); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := store.UpsertGitState(r.Context(), datastore.GitState{
 		WorkspaceID:      workspaceID,
 		CheckpointCommit: strings.TrimSpace(req.CheckpointCommit),
@@ -512,7 +530,7 @@ func (s *Server) handleGitOverlayUpsert(w http.ResponseWriter, r *http.Request, 
 		errJSON(w, http.StatusBadRequest, "invalid overlay path: "+err.Error())
 		return
 	}
-	op := strings.TrimSpace(req.Op)
+	op := datastore.GitOverlayOp(strings.TrimSpace(req.Op))
 	if op == "" {
 		op = datastore.GitOverlayOpUpsert
 	}
@@ -522,12 +540,12 @@ func (s *Server) handleGitOverlayUpsert(w http.ResponseWriter, r *http.Request, 
 		errJSON(w, http.StatusBadRequest, "invalid overlay op")
 		return
 	}
-	kind := strings.TrimSpace(req.Kind)
+	kind := datastore.GitOverlayKind(strings.TrimSpace(req.Kind))
 	if kind == "" {
-		kind = datastore.GitTreeNodeKindFile
+		kind = datastore.GitOverlayKindFile
 	}
 	switch kind {
-	case datastore.GitTreeNodeKindFile, datastore.GitTreeNodeKindDirectory, datastore.GitTreeNodeKindSymlink, datastore.GitTreeNodeKindSubmodule:
+	case datastore.GitOverlayKindFile, datastore.GitOverlayKindDirectory, datastore.GitOverlayKindSymlink, datastore.GitOverlayKindSubmodule:
 	default:
 		errJSON(w, http.StatusBadRequest, "invalid overlay kind")
 		return
@@ -595,7 +613,7 @@ func normalizeGitTreeNodes(workspaceID, commitSHA string, in []gitTreeNodeRespon
 		if err != nil {
 			return nil, fmt.Errorf("invalid node path %q: %w", n.Path, err)
 		}
-		kind := strings.TrimSpace(n.Kind)
+		kind := datastore.GitTreeNodeKind(strings.TrimSpace(n.Kind))
 		switch kind {
 		case datastore.GitTreeNodeKindFile, datastore.GitTreeNodeKindDirectory, datastore.GitTreeNodeKindSymlink, datastore.GitTreeNodeKindSubmodule:
 		default:
@@ -681,6 +699,27 @@ func validateGitObjectID(field, value string) error {
 	return nil
 }
 
+func validateInlineContentMetadata(content []byte, sizeBytes int64, checksumSHA256 string) error {
+	if len(content) == 0 {
+		return nil
+	}
+	if sizeBytes != 0 && sizeBytes != int64(len(content)) {
+		return fmt.Errorf("size_bytes does not match content length")
+	}
+	checksumSHA256 = strings.TrimSpace(checksumSHA256)
+	if checksumSHA256 == "" {
+		return nil
+	}
+	if len(checksumSHA256) != 64 {
+		return fmt.Errorf("checksum_sha256 must be a 64 character sha256")
+	}
+	sum := sha256.Sum256(content)
+	if !strings.EqualFold(checksumSHA256, hex.EncodeToString(sum[:])) {
+		return fmt.Errorf("checksum_sha256 does not match content")
+	}
+	return nil
+}
+
 func writeGitWorkspaceStoreError(w http.ResponseWriter, err error) {
 	if errors.Is(err, datastore.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "not found")
@@ -698,8 +737,8 @@ func toGitWorkspaceResponse(ws *datastore.GitWorkspace) gitWorkspaceResponse {
 		BranchName:  ws.BranchName,
 		BaseCommit:  ws.BaseCommit,
 		HeadCommit:  ws.HeadCommit,
-		Mode:        ws.Mode,
-		Status:      ws.Status,
+		Mode:        string(ws.Mode),
+		Status:      string(ws.Status),
 		CreatedAt:   ws.CreatedAt,
 		UpdatedAt:   ws.UpdatedAt,
 	}
@@ -712,7 +751,7 @@ func toGitTreeNodeResponse(n *datastore.GitTreeNode) gitTreeNodeResponse {
 		Path:        n.Path,
 		ParentPath:  n.ParentPath,
 		Name:        n.Name,
-		Kind:        n.Kind,
+		Kind:        string(n.Kind),
 		Mode:        n.Mode,
 		ObjectSHA:   n.ObjectSHA,
 		SizeBytes:   n.SizeBytes,
@@ -753,8 +792,8 @@ func toGitOverlayEntryResponse(entry *datastore.GitOverlayEntry) gitOverlayEntry
 	return gitOverlayEntryResponse{
 		WorkspaceID:    entry.WorkspaceID,
 		Path:           entry.Path,
-		Op:             entry.Op,
-		Kind:           entry.Kind,
+		Op:             string(entry.Op),
+		Kind:           string(entry.Kind),
 		Mode:           entry.Mode,
 		StorageType:    entry.StorageType,
 		StorageRef:     entry.StorageRef,

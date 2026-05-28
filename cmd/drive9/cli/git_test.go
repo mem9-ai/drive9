@@ -90,7 +90,7 @@ func TestGitListTreeOmitsBlobSizes(t *testing.T) {
 	runTestGit(t, root, "commit", "-m", "initial")
 	head := gitOutputForTest(t, root, "rev-parse", "HEAD")
 
-	nodes, err := gitListTree(root, head)
+	nodes, err := gitListTree(context.Background(), root, head)
 	if err != nil {
 		t.Fatalf("gitListTree: %v", err)
 	}
@@ -261,7 +261,7 @@ func TestArchiveGitStateDirSkipsObjectDatabases(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	state, err := archiveGitStateDir(gitDir)
+	state, err := archiveGitStateDir(context.Background(), gitDir)
 	if err != nil {
 		t.Fatalf("archiveGitStateDir: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestInitializeFastCloneIndexMakesStatusClean(t *testing.T) {
 	head := gitOutputForTest(t, src, "rev-parse", "HEAD")
 
 	runTestGit(t, "", "clone", "--no-checkout", src, dst)
-	if err := initializeFastCloneIndex(dst, head); err != nil {
+	if err := initializeFastCloneIndex(context.Background(), dst, head); err != nil {
 		t.Fatalf("initializeFastCloneIndex: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dst, "README.md"), []byte("hello\n"), 0o644); err != nil {

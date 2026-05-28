@@ -7,22 +7,36 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/pathutil"
 )
 
+type GitWorkspaceMode string
+type GitWorkspaceStatus string
+type GitTreeNodeKind string
+type GitOverlayOp string
+type GitOverlayKind string
+
 const (
-	GitWorkspaceModeFast         = "fast"
-	GitWorkspaceModeFastBlobless = "fast-blobless"
-	GitWorkspaceStatusLive       = "active"
+	GitWorkspaceModeFast         GitWorkspaceMode   = "fast"
+	GitWorkspaceModeFastBlobless GitWorkspaceMode   = "fast-blobless"
+	GitWorkspaceStatusLive       GitWorkspaceStatus = "active"
+	GitWorkspaceStatusDeleted    GitWorkspaceStatus = "deleted"
 
-	GitTreeNodeKindFile      = "file"
-	GitTreeNodeKindDirectory = "dir"
-	GitTreeNodeKindSymlink   = "symlink"
-	GitTreeNodeKindSubmodule = "submodule"
+	GitTreeNodeKindFile      GitTreeNodeKind = "file"
+	GitTreeNodeKindDirectory GitTreeNodeKind = "dir"
+	GitTreeNodeKindSymlink   GitTreeNodeKind = "symlink"
+	GitTreeNodeKindSubmodule GitTreeNodeKind = "submodule"
 
-	GitOverlayOpUpsert   = "upsert"
-	GitOverlayOpWhiteout = "whiteout"
-	GitOverlayOpChmod    = "chmod"
-	GitOverlayOpSymlink  = "symlink"
+	GitOverlayKindFile      GitOverlayKind = "file"
+	GitOverlayKindDirectory GitOverlayKind = "dir"
+	GitOverlayKindSymlink   GitOverlayKind = "symlink"
+	GitOverlayKindSubmodule GitOverlayKind = "submodule"
+
+	GitOverlayOpUpsert   GitOverlayOp = "upsert"
+	GitOverlayOpWhiteout GitOverlayOp = "whiteout"
+	GitOverlayOpChmod    GitOverlayOp = "chmod"
+	GitOverlayOpSymlink  GitOverlayOp = "symlink"
 )
 
 // GitWorkspace is the authoritative drive9 record for a git-backed worktree.
@@ -35,8 +49,8 @@ type GitWorkspace struct {
 	BranchName  string
 	BaseCommit  string
 	HeadCommit  string
-	Mode        string
-	Status      string
+	Mode        GitWorkspaceMode
+	Status      GitWorkspaceStatus
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
 }
@@ -49,7 +63,7 @@ type GitTreeNode struct {
 	Path        string
 	ParentPath  string
 	Name        string
-	Kind        string
+	Kind        GitTreeNodeKind
 	Mode        string
 	ObjectSHA   string
 	SizeBytes   int64
@@ -87,8 +101,8 @@ type GitObjectPack struct {
 type GitOverlayEntry struct {
 	WorkspaceID    string
 	Path           string
-	Op             string
-	Kind           string
+	Op             GitOverlayOp
+	Kind           GitOverlayKind
 	Mode           string
 	StorageType    string
 	StorageRef     string
@@ -108,6 +122,11 @@ func (s *Store) UpsertGitWorkspace(ctx context.Context, ws GitWorkspace) error {
 	if strings.TrimSpace(ws.RootPath) == "" {
 		return fmt.Errorf("git workspace root path is required")
 	}
+	root, err := pathutil.CanonicalizeDir(ws.RootPath)
+	if err != nil {
+		return fmt.Errorf("invalid git workspace root path: %w", err)
+	}
+	ws.RootPath = root
 	if strings.TrimSpace(ws.RepoURL) == "" {
 		return fmt.Errorf("git workspace repo url is required")
 	}
@@ -120,7 +139,7 @@ func (s *Store) UpsertGitWorkspace(ctx context.Context, ws GitWorkspace) error {
 	if ws.Status == "" {
 		ws.Status = GitWorkspaceStatusLive
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 INSERT INTO git_workspaces (
 	workspace_id, root_path, repo_url, remote_name, branch_name,
 	base_commit, head_commit, mode, status, created_at, updated_at
@@ -135,7 +154,7 @@ ON DUPLICATE KEY UPDATE
 	status = VALUES(status),
 	updated_at = UTC_TIMESTAMP(3)`,
 		ws.WorkspaceID, ws.RootPath, ws.RepoURL, ws.RemoteName, ws.BranchName,
-		ws.BaseCommit, ws.HeadCommit, ws.Mode, ws.Status)
+		ws.BaseCommit, ws.HeadCommit, string(ws.Mode), string(ws.Status))
 	if err != nil {
 		return fmt.Errorf("upsert git workspace %s: %w", ws.WorkspaceID, err)
 	}
@@ -152,11 +171,15 @@ WHERE workspace_id = ?`, workspaceID)
 }
 
 func (s *Store) GetGitWorkspaceByRoot(ctx context.Context, rootPath string) (*GitWorkspace, error) {
+	root, err := pathutil.CanonicalizeDir(rootPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid git workspace root path: %w", err)
+	}
 	row := s.db.QueryRowContext(ctx, `
-SELECT workspace_id, root_path, repo_url, remote_name, branch_name,
-	base_commit, head_commit, mode, status, created_at, updated_at
-FROM git_workspaces
-WHERE root_path = ?`, rootPath)
+	SELECT workspace_id, root_path, repo_url, remote_name, branch_name,
+		base_commit, head_commit, mode, status, created_at, updated_at
+	FROM git_workspaces
+	WHERE root_path = ?`, root)
 	return scanGitWorkspace(row)
 }
 
@@ -166,7 +189,7 @@ SELECT workspace_id, root_path, repo_url, remote_name, branch_name,
 	base_commit, head_commit, mode, status, created_at, updated_at
 FROM git_workspaces
 WHERE status = ?
-ORDER BY root_path`, GitWorkspaceStatusLive)
+	ORDER BY root_path`, string(GitWorkspaceStatusLive))
 	if err != nil {
 		return nil, fmt.Errorf("list git workspaces: %w", err)
 	}
@@ -185,21 +208,77 @@ ORDER BY root_path`, GitWorkspaceStatusLive)
 	return out, nil
 }
 
+func (s *Store) DeleteGitWorkspace(ctx context.Context, workspaceID string) error {
+	if strings.TrimSpace(workspaceID) == "" {
+		return fmt.Errorf("git workspace id is required")
+	}
+	res, err := s.db.ExecContext(ctx, `
+	UPDATE git_workspaces
+	SET status = ?, updated_at = UTC_TIMESTAMP(3)
+	WHERE workspace_id = ?`, string(GitWorkspaceStatusDeleted), workspaceID)
+	if err != nil {
+		return fmt.Errorf("delete git workspace %s: %w", workspaceID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err == nil && affected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func cleanGitRelativePathForStore(raw string) (path string, parent string, name string, err error) {
+	if raw == "" {
+		return "", "", "", fmt.Errorf("path is required")
+	}
+	if len(raw) > 1024 {
+		return "", "", "", fmt.Errorf("path exceeds 1024 bytes")
+	}
+	if strings.HasPrefix(raw, "/") {
+		return "", "", "", fmt.Errorf("path must be relative")
+	}
+	if strings.ContainsRune(raw, '\x00') {
+		return "", "", "", fmt.Errorf("path contains NUL")
+	}
+	if strings.ContainsRune(raw, '\\') {
+		return "", "", "", fmt.Errorf("path contains backslash")
+	}
+	if strings.HasSuffix(raw, "/") {
+		return "", "", "", fmt.Errorf("path must not end with slash")
+	}
+	parts := strings.Split(raw, "/")
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return "", "", "", fmt.Errorf("path contains invalid segment %q", part)
+		}
+		if len(part) > 255 {
+			return "", "", "", fmt.Errorf("path segment exceeds 255 bytes")
+		}
+	}
+	name = parts[len(parts)-1]
+	if len(parts) > 1 {
+		parent = strings.Join(parts[:len(parts)-1], "/")
+	}
+	return raw, parent, name, nil
+}
+
 type gitWorkspaceScanner interface {
 	Scan(dest ...any) error
 }
 
 func scanGitWorkspace(row gitWorkspaceScanner) (*GitWorkspace, error) {
 	var ws GitWorkspace
+	var mode, status string
 	if err := row.Scan(
 		&ws.WorkspaceID, &ws.RootPath, &ws.RepoURL, &ws.RemoteName, &ws.BranchName,
-		&ws.BaseCommit, &ws.HeadCommit, &ws.Mode, &ws.Status, &ws.CreatedAt, &ws.UpdatedAt,
+		&ws.BaseCommit, &ws.HeadCommit, &mode, &status, &ws.CreatedAt, &ws.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	ws.Mode = GitWorkspaceMode(mode)
+	ws.Status = GitWorkspaceStatus(status)
 	return &ws, nil
 }
 
@@ -239,13 +318,32 @@ INSERT INTO git_workspace_tree_nodes (
 			n := nodes[i]
 			if n.WorkspaceID == "" {
 				n.WorkspaceID = workspaceID
+			} else if n.WorkspaceID != workspaceID {
+				return fmt.Errorf("insert git tree node %s: workspace_id mismatch", n.Path)
 			}
 			if n.CommitSHA == "" {
 				n.CommitSHA = commitSHA
+			} else if n.CommitSHA != commitSHA {
+				return fmt.Errorf("insert git tree node %s: commit_sha mismatch", n.Path)
+			}
+			relPath, parent, name, err := cleanGitRelativePathForStore(n.Path)
+			if err != nil {
+				return fmt.Errorf("insert git tree node %s: %w", n.Path, err)
+			}
+			n.Path = relPath
+			if n.ParentPath == "" {
+				n.ParentPath = parent
+			} else if n.ParentPath != parent {
+				return fmt.Errorf("insert git tree node %s: parent_path mismatch", n.Path)
+			}
+			if n.Name == "" {
+				n.Name = name
+			} else if n.Name != name {
+				return fmt.Errorf("insert git tree node %s: name mismatch", n.Path)
 			}
 			if _, err = stmt.ExecContext(ctx,
 				n.WorkspaceID, n.CommitSHA, n.Path, gitPathHash(n.Path), n.ParentPath, gitPathHash(n.ParentPath),
-				n.Name, n.Kind, n.Mode, n.ObjectSHA, n.SizeBytes,
+				n.Name, string(n.Kind), n.Mode, n.ObjectSHA, n.SizeBytes,
 			); err != nil {
 				return fmt.Errorf("insert git tree node %s: %w", n.Path, err)
 			}
@@ -272,12 +370,14 @@ ORDER BY path`, workspaceID, commitSHA)
 	var out []GitTreeNode
 	for rows.Next() {
 		var n GitTreeNode
+		var kind string
 		if err := rows.Scan(
-			&n.WorkspaceID, &n.CommitSHA, &n.Path, &n.ParentPath, &n.Name, &n.Kind, &n.Mode,
+			&n.WorkspaceID, &n.CommitSHA, &n.Path, &n.ParentPath, &n.Name, &kind, &n.Mode,
 			&n.ObjectSHA, &n.SizeBytes, &n.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan git tree node: %w", err)
 		}
+		n.Kind = GitTreeNodeKind(kind)
 		out = append(out, n)
 	}
 	if err := rows.Err(); err != nil {
@@ -406,13 +506,18 @@ func (s *Store) UpsertGitOverlayEntry(ctx context.Context, entry GitOverlayEntry
 	if strings.TrimSpace(entry.Path) == "" {
 		return fmt.Errorf("git overlay path is required")
 	}
+	relPath, _, _, err := cleanGitRelativePathForStore(entry.Path)
+	if err != nil {
+		return fmt.Errorf("invalid git overlay path: %w", err)
+	}
+	entry.Path = relPath
 	if entry.Op == "" {
 		entry.Op = GitOverlayOpUpsert
 	}
 	if entry.Kind == "" {
-		entry.Kind = GitTreeNodeKindFile
+		entry.Kind = GitOverlayKindFile
 	}
-	_, err := s.db.ExecContext(ctx, `
+	_, err = s.db.ExecContext(ctx, `
 INSERT INTO git_workspace_overlay (
 	workspace_id, path, path_hash, op, kind, mode, storage_type, storage_ref, storage_ref_hash,
 	checksum_sha256, size_bytes, base_object_sha, content_blob, created_at, updated_at
@@ -430,7 +535,7 @@ ON DUPLICATE KEY UPDATE
 	base_object_sha = VALUES(base_object_sha),
 	content_blob = VALUES(content_blob),
 	updated_at = UTC_TIMESTAMP(3)`,
-		entry.WorkspaceID, entry.Path, gitPathHash(entry.Path), entry.Op, entry.Kind, entry.Mode, entry.StorageType, entry.StorageRef,
+		entry.WorkspaceID, entry.Path, gitPathHash(entry.Path), string(entry.Op), string(entry.Kind), entry.Mode, entry.StorageType, entry.StorageRef,
 		entry.StorageRefHash, entry.ChecksumSHA256, entry.SizeBytes, entry.BaseObjectSHA, entry.ContentBlob)
 	if err != nil {
 		return fmt.Errorf("upsert git overlay entry %s: %w", entry.Path, err)
@@ -452,12 +557,15 @@ ORDER BY path`, workspaceID)
 	var out []GitOverlayEntry
 	for rows.Next() {
 		var e GitOverlayEntry
+		var op, kind string
 		if err := rows.Scan(
-			&e.WorkspaceID, &e.Path, &e.Op, &e.Kind, &e.Mode, &e.StorageType, &e.StorageRef,
+			&e.WorkspaceID, &e.Path, &op, &kind, &e.Mode, &e.StorageType, &e.StorageRef,
 			&e.StorageRefHash, &e.ChecksumSHA256, &e.SizeBytes, &e.BaseObjectSHA, &e.ContentBlob, &e.CreatedAt, &e.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("scan git overlay entry: %w", err)
 		}
+		e.Op = GitOverlayOp(op)
+		e.Kind = GitOverlayKind(kind)
 		out = append(out, e)
 	}
 	if err := rows.Err(); err != nil {
@@ -467,14 +575,19 @@ ORDER BY path`, workspaceID)
 }
 
 func (s *Store) GetGitOverlayEntry(ctx context.Context, workspaceID, relPath string) (*GitOverlayEntry, error) {
+	relPath, _, _, err := cleanGitRelativePathForStore(relPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid git overlay path: %w", err)
+	}
 	row := s.db.QueryRowContext(ctx, `
 SELECT workspace_id, path, op, kind, mode, storage_type, storage_ref, storage_ref_hash,
 	checksum_sha256, size_bytes, base_object_sha, content_blob, created_at, updated_at
 FROM git_workspace_overlay
-WHERE workspace_id = ? AND path_hash = ? AND path = ?`, workspaceID, gitPathHash(relPath), relPath)
+	WHERE workspace_id = ? AND path_hash = ? AND path = ?`, workspaceID, gitPathHash(relPath), relPath)
 	var e GitOverlayEntry
+	var op, kind string
 	if err := row.Scan(
-		&e.WorkspaceID, &e.Path, &e.Op, &e.Kind, &e.Mode, &e.StorageType, &e.StorageRef,
+		&e.WorkspaceID, &e.Path, &op, &kind, &e.Mode, &e.StorageType, &e.StorageRef,
 		&e.StorageRefHash, &e.ChecksumSHA256, &e.SizeBytes, &e.BaseObjectSHA, &e.ContentBlob, &e.CreatedAt, &e.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -482,6 +595,8 @@ WHERE workspace_id = ? AND path_hash = ? AND path = ?`, workspaceID, gitPathHash
 		}
 		return nil, err
 	}
+	e.Op = GitOverlayOp(op)
+	e.Kind = GitOverlayKind(kind)
 	return &e, nil
 }
 

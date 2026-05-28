@@ -71,7 +71,10 @@ func HydrateLogPath(localRoot, workspaceID, commit string) string {
 
 // ReadTreeFile reads a materialized clean tree file or symlink. The boolean is
 // false when the materialized path is simply absent.
-func ReadTreeFile(localRoot, workspaceID, commit, rel string, offset, size int64) ([]byte, bool, error) {
+func ReadTreeFile(ctx context.Context, localRoot, workspaceID, commit, rel string, offset, size int64) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	p, err := treeFilePath(localRoot, workspaceID, commit, rel)
 	if err != nil {
 		return nil, false, err
@@ -87,11 +90,17 @@ func ReadTreeFile(localRoot, workspaceID, commit, rel string, offset, size int64
 		return nil, true, syscall.EISDIR
 	}
 	if info.Mode()&fs.ModeSymlink != 0 {
+		if err := ctx.Err(); err != nil {
+			return nil, true, err
+		}
 		target, err := os.Readlink(p)
 		if err != nil {
 			return nil, true, err
 		}
 		return SliceRead([]byte(target), offset, size), true, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, true, err
 	}
 	f, err := os.Open(p)
 	if err != nil {
@@ -102,7 +111,10 @@ func ReadTreeFile(localRoot, workspaceID, commit, rel string, offset, size int64
 }
 
 // ReadBlob reads a cached blob.
-func ReadBlob(localRoot, workspaceID, commit, objectSHA string, offset, size int64) ([]byte, bool, error) {
+func ReadBlob(ctx context.Context, localRoot, workspaceID, commit, objectSHA string, offset, size int64) ([]byte, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	p, err := BlobPath(localRoot, workspaceID, commit, objectSHA)
 	if err != nil {
 		return nil, false, err
@@ -114,6 +126,9 @@ func ReadBlob(localRoot, workspaceID, commit, objectSHA string, offset, size int
 		}
 		return nil, false, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, true, err
+	}
 	f, err := os.Open(p)
 	if err != nil {
 		return nil, true, err
@@ -123,7 +138,10 @@ func ReadBlob(localRoot, workspaceID, commit, objectSHA string, offset, size int
 }
 
 // WriteBlob writes a blob cache entry atomically. Existing entries are kept.
-func WriteBlob(localRoot, workspaceID, commit, objectSHA string, data []byte) error {
+func WriteBlob(ctx context.Context, localRoot, workspaceID, commit, objectSHA string, data []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	p, err := BlobPath(localRoot, workspaceID, commit, objectSHA)
 	if err != nil {
 		return err
@@ -134,6 +152,9 @@ func WriteBlob(localRoot, workspaceID, commit, objectSHA string, data []byte) er
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 	return writeFileAtomic(p, data, 0o644)

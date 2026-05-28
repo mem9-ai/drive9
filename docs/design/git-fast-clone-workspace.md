@@ -222,11 +222,11 @@ Authoritative cross-sandbox working tree state lives in backend DB Git workspace
 
 Validated in the dev environment on 2026-05-27:
 
-- endpoint: `http://k8s-dat9-dat9serv-d5e02e7d07-1645488597.ap-southeast-1.elb.amazonaws.com`
-- repo: `https://github.com/githubtraining/hellogitworld.git`
-- run_id: `fastclone-e2e-20260527222938`
-- tenant_id: `b1dc5fa2-f166-431b-9672-754887571975`
-- workspace_id: `55ab295b-e674-4b24-80da-e515d7bf2f38`
+- endpoint: `http://example-k8s-endpoint.local`
+- repo: `https://github.com/example/repo.git`
+- run_id: `fastclone-e2e-YYYYMMDDHHMMSS`
+- tenant_id: `TENANT_ID_PLACEHOLDER`
+- workspace_id: `WORKSPACE_ID_PLACEHOLDER`
 
 Covered scenario:
 

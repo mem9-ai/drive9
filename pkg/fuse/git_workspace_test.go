@@ -1,7 +1,9 @@
 package fuse
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -32,6 +34,7 @@ type gitWorkspaceFixture struct {
 	state           []byte
 	stateStorage    string
 	mode            string
+	deleted         bool
 	server          *httptest.Server
 	repoURL         string
 	treeNodes       []client.GitTreeNode
@@ -63,6 +66,13 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/git-workspaces":
+		f.mu.Lock()
+		deleted := f.deleted
+		f.mu.Unlock()
+		if deleted {
+			_ = json.NewEncoder(w).Encode(map[string]any{"workspaces": []client.GitWorkspace{}})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{"workspaces": []client.GitWorkspace{{
 			WorkspaceID: "ws1",
 			RootPath:    "/repo/",
@@ -104,6 +114,11 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 			SizeBytes:        int64(len(f.state)),
 			Content:          f.state,
 		})
+	case r.Method == http.MethodDelete && r.URL.Path == "/v1/git-workspaces/ws1":
+		f.mu.Lock()
+		f.deleted = true
+		f.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	default:
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
@@ -148,6 +163,7 @@ func (f *gitWorkspaceFixture) handleObjectPacks(w http.ResponseWriter, r *http.R
 			CreatedAt:      time.Now(),
 		}
 		f.objectPacks[packID] = pack
+		pack.Content = nil
 		_ = json.NewEncoder(w).Encode(pack)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -302,6 +318,147 @@ func TestGitWorkspaceWriteSyncWritesOverlay(t *testing.T) {
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
 }
 
+func TestGitWorkspaceChmodDirectoryPreservesKind(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.treeNodes = []client.GitTreeNode{
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "src",
+			ParentPath:  "",
+			Name:        "src",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "3333333333333333333333333333333333333333",
+			SizeBytes:   -1,
+		},
+	}
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "src", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	var attrOut gofuse.AttrOut
+	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o700,
+		},
+	}, &attrOut); st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if attrOut.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFDIR) || attrOut.Mode&0o777 != 0o700 {
+		t.Fatalf("mode = %#o, want dir 0700", attrOut.Mode)
+	}
+	if _, _, err := fs.listGitDir(context.Background(), "/repo/src"); err != nil {
+		t.Fatalf("listGitDir after chmod: %v", err)
+	}
+	fixture.mu.Lock()
+	entry := fixture.overlay["src"]
+	fixture.mu.Unlock()
+	if entry.Kind != "dir" {
+		t.Fatalf("overlay kind = %q, want dir", entry.Kind)
+	}
+}
+
+func TestGitWorkspaceMkdirPreservesDirectoryMode(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var out gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Mode:     0o700,
+	}, "private", &out); st != gofuse.OK {
+		t.Fatalf("Mkdir status = %v, want OK", st)
+	}
+	fixture.mu.Lock()
+	entry := fixture.overlay["private"]
+	fixture.mu.Unlock()
+	if entry.Kind != "dir" {
+		t.Fatalf("overlay kind = %q, want dir", entry.Kind)
+	}
+	parsed, ok := parseGitMode(entry.Mode)
+	if !ok || parsed&0o777 != 0o700 {
+		t.Fatalf("overlay mode = %q parsed=%#o ok=%t, want 0700", entry.Mode, parsed, ok)
+	}
+	fs2 := NewDat9FS(fixture.client(), opts)
+	got, handled := fs2.gitEntry("/repo/private", true)
+	if !handled || got == nil || !got.IsDir || got.Mode&0o777 != 0o700 {
+		t.Fatalf("restored entry handled=%t entry=%+v, want dir 0700", handled, got)
+	}
+}
+
+func TestGitWorkspaceReadOnlyRejectsMkdir(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, ReadOnly: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var out gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Mode:     0o755,
+	}, "blocked", &out); st != gofuse.EROFS {
+		t.Fatalf("Mkdir status = %v, want EROFS", st)
+	}
+	fixture.mu.Lock()
+	_, ok := fixture.overlay["blocked"]
+	fixture.mu.Unlock()
+	if ok {
+		t.Fatalf("read-only mkdir wrote overlay")
+	}
+}
+
+func TestGitWorkspaceRenameRejectsNonEmptyDirectoryTarget(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.treeNodes = []client.GitTreeNode{
+		{WorkspaceID: "ws1", CommitSHA: fixtureHeadCommit, Path: "a", ParentPath: "", Name: "a", Kind: "dir", Mode: "040000", ObjectSHA: "3333333333333333333333333333333333333333", SizeBytes: -1},
+		{WorkspaceID: "ws1", CommitSHA: fixtureHeadCommit, Path: "a/file.txt", ParentPath: "a", Name: "file.txt", Kind: "file", Mode: "100644", ObjectSHA: "4444444444444444444444444444444444444444", SizeBytes: 1},
+		{WorkspaceID: "ws1", CommitSHA: fixtureHeadCommit, Path: "b", ParentPath: "", Name: "b", Kind: "dir", Mode: "040000", ObjectSHA: "5555555555555555555555555555555555555555", SizeBytes: -1},
+		{WorkspaceID: "ws1", CommitSHA: fixtureHeadCommit, Path: "b/existing.txt", ParentPath: "b", Name: "existing.txt", Kind: "file", Mode: "100644", ObjectSHA: "6666666666666666666666666666666666666666", SizeBytes: 1},
+	}
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Newdir:   repoIno,
+	}, "a", "b")
+	if st != gofuse.Status(syscall.ENOTEMPTY) {
+		t.Fatalf("Rename status = %v, want ENOTEMPTY", st)
+	}
+}
+
+func TestGitWorkspaceRootRmdirDeletesWorkspace(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.treeNodes = []client.GitTreeNode{}
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+
+	if st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "repo"); st != gofuse.OK {
+		t.Fatalf("Rmdir status = %v, want OK", st)
+	}
+	fixture.mu.Lock()
+	deleted := fixture.deleted
+	fixture.mu.Unlock()
+	if !deleted {
+		t.Fatalf("workspace was not deleted")
+	}
+}
+
 func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	srcGit := t.TempDir()
@@ -367,6 +524,32 @@ func TestArchiveLocalGitStateDirSkipsObjectDatabases(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dst, "modules", "sub", "objects")); !os.IsNotExist(err) {
 		t.Fatalf("module objects restored from objectless archive, err=%v", err)
+	}
+}
+
+func TestExtractGitArchiveRejectsSymlinkTraversal(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "safe", Mode: 0o777}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "link/config", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("x"))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err := extractGitArchive(buf.Bytes(), t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "traverses symlink") {
+		t.Fatalf("extractGitArchive err = %v, want symlink traversal rejection", err)
 	}
 }
 
@@ -437,7 +620,7 @@ func TestGitWorkspaceCleanReadUsesMaterializedTreeCache(t *testing.T) {
 func TestGitWorkspaceCleanReadUsesBlobCache(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	localRoot := t.TempDir()
-	if err := gitcache.WriteBlob(localRoot, "ws1", fixtureHeadCommit, fixture.readmeObjectSHA, []byte("cached blob\n")); err != nil {
+	if err := gitcache.WriteBlob(context.Background(), localRoot, "ws1", fixtureHeadCommit, fixture.readmeObjectSHA, []byte("cached blob\n")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -495,7 +678,7 @@ func TestGitWorkspaceOverlayWinsOverCleanCache(t *testing.T) {
 func TestGitWorkspaceWritablePreloadFromCacheDoesNotWriteOverlay(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	localRoot := t.TempDir()
-	if err := gitcache.WriteBlob(localRoot, "ws1", fixtureHeadCommit, fixture.readmeObjectSHA, []byte("hello base\n")); err != nil {
+	if err := gitcache.WriteBlob(context.Background(), localRoot, "ws1", fixtureHeadCommit, fixture.readmeObjectSHA, []byte("hello base\n")); err != nil {
 		t.Fatal(err)
 	}
 

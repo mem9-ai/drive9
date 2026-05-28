@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -145,6 +146,9 @@ func (c *Client) UpsertGitWorkspace(ctx context.Context, req GitWorkspaceRequest
 }
 
 func (c *Client) GetGitWorkspaceByRoot(ctx context.Context, rootPath string) (*GitWorkspace, error) {
+	if strings.TrimSpace(rootPath) == "" {
+		return nil, fmt.Errorf("rootPath must not be empty")
+	}
 	u := c.baseURL + "/v1/git-workspaces?root_path=" + url.QueryEscape(rootPath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -163,6 +167,26 @@ func (c *Client) GetGitWorkspaceByRoot(ctx context.Context, rootPath string) (*G
 		return nil, fmt.Errorf("decode git workspace: %w", err)
 	}
 	return &out, nil
+}
+
+func (c *Client) DeleteGitWorkspace(ctx context.Context, workspaceID string) error {
+	if strings.TrimSpace(workspaceID) == "" {
+		return fmt.Errorf("workspaceID must not be empty")
+	}
+	u := c.baseURL + "/v1/git-workspaces/" + url.PathEscape(workspaceID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return readError(resp)
+	}
+	return nil
 }
 
 func (c *Client) ListGitWorkspaces(ctx context.Context) ([]GitWorkspace, error) {

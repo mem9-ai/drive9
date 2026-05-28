@@ -400,7 +400,7 @@ func isLocalFileHandle(fh *FileHandle) bool {
 }
 
 func localFileHandleOpenedWritable(fh *FileHandle) bool {
-	if !isLocalFileHandle(fh) {
+	if fh == nil {
 		return false
 	}
 	accMode := fh.Flags & syscall.O_ACCMODE
@@ -2551,6 +2551,9 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseSetAttr, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
@@ -2781,6 +2784,9 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseMkdir, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
 	childP, st := fs.childPath(input.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -2949,6 +2955,9 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseUnlink, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
@@ -3091,6 +3100,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseRmdir, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -3139,6 +3151,16 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		}
 		if len(entries) > 0 {
 			return gofuse.Status(syscall.ENOTEMPTY)
+		}
+		if rt, rel, ok := fs.gitWorkspaceForPath(childP); ok && rel == "" {
+			st := fs.removeGitWorkspaceRoot(ctx, rt, childP)
+			if st != gofuse.OK {
+				return st
+			}
+			parentPath, _ := fs.inodes.GetPath(header.NodeId)
+			fs.dirCache.Remove(parentPath, name)
+			fs.dirCache.InvalidatePrefix(childP)
+			return gofuse.OK
 		}
 		st := fs.putGitWhiteout(ctx, childP)
 		if st != gofuse.OK {
@@ -3405,6 +3427,9 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseRename, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -5189,7 +5214,8 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		if gitState && localFileHandleOpenedWritable(fh) {
 			ctx, cf := context.WithTimeout(context.Background(), gitCheckpointTimeout)
 			if err := fs.checkpointGitStateForPath(ctx, fh.Path); err != nil {
-				log.Printf("git state checkpoint after local flush failed for %s: %v", fh.Path, err)
+				cf()
+				return httpToFuseStatus(err)
 			}
 			cf()
 		}
@@ -5431,7 +5457,8 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		if localPathMayBeGitState(fh.Path) && localFileHandleOpenedWritable(fh) {
 			ctx, cf := context.WithTimeout(context.Background(), gitCheckpointTimeout)
 			if err := fs.checkpointGitStateForPath(ctx, fh.Path); err != nil {
-				log.Printf("git state checkpoint after local fsync failed for %s: %v", fh.Path, err)
+				cf()
+				return httpToFuseStatus(err)
 			}
 			cf()
 		}
@@ -5603,6 +5630,9 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				return
 			}
 			if layer == PathLayerGitWorkspace {
+				if flushStatus != gofuse.OK {
+					return
+				}
 				fh.Lock()
 				stillCurrent := pendingModeMatchesLocked(fh, pendingMode, pendingModeGen)
 				if stillCurrent {
