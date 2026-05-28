@@ -3307,6 +3307,140 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	}
 }
 
+func TestCodingAgentLocalOverlayFlushSkipsSyncForGeneratedPath(t *testing.T) {
+	var syncCalls atomic.Int32
+	previousSync := syncOpenLocalFile
+	syncOpenLocalFile = func(file *os.File) error {
+		syncCalls.Add(1)
+		return syscall.EIO
+	}
+	t.Cleanup(func() {
+		syncOpenLocalFile = previousSync
+	})
+
+	opts := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: t.TempDir(),
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var nodeModulesOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Mode:     0o755,
+	}, "node_modules", &nodeModulesOut); st != gofuse.OK {
+		t.Fatalf("Mkdir node_modules: %v", st)
+	}
+	var pkgOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: nodeModulesOut.NodeId},
+		Mode:     0o755,
+	}, "pkg", &pkgOut); st != gofuse.OK {
+		t.Fatalf("Mkdir pkg: %v", st)
+	}
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: pkgOut.NodeId},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "index.js", &createOut); st != gofuse.OK {
+		t.Fatalf("Create index.js: %v", st)
+	}
+	t.Cleanup(func() {
+		fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	})
+
+	content := []byte("module.exports = 1\n")
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(content)),
+	}, content)
+	if st != gofuse.OK {
+		t.Fatalf("Write index.js: %v", st)
+	}
+	if written != uint32(len(content)) {
+		t.Fatalf("Write bytes = %d, want %d", written, len(content))
+	}
+
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush generated local-only file status = %v, want OK", st)
+	}
+	if got := syncCalls.Load(); got != 0 {
+		t.Fatalf("Flush sync calls = %d, want 0", got)
+	}
+
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{Fh: createOut.Fh}); st != gofuse.Status(syscall.EIO) {
+		t.Fatalf("Fsync status = %v, want EIO", st)
+	}
+	if got := syncCalls.Load(); got != 1 {
+		t.Fatalf("Fsync sync calls = %d, want 1", got)
+	}
+}
+
+func TestCodingAgentLocalOverlayFlushSyncsGitState(t *testing.T) {
+	var syncCalls atomic.Int32
+	previousSync := syncOpenLocalFile
+	syncOpenLocalFile = func(file *os.File) error {
+		syncCalls.Add(1)
+		return nil
+	}
+	t.Cleanup(func() {
+		syncOpenLocalFile = previousSync
+	})
+
+	opts := &MountOptions{
+		Profile:   MountProfileCodingAgent,
+		LocalRoot: t.TempDir(),
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var gitOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Mode:     0o755,
+	}, ".git", &gitOut); st != gofuse.OK {
+		t.Fatalf("Mkdir .git: %v", st)
+	}
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: gitOut.NodeId},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "config", &createOut); st != gofuse.OK {
+		t.Fatalf("Create config: %v", st)
+	}
+	t.Cleanup(func() {
+		fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	})
+
+	content := []byte("[core]\n\trepositoryformatversion = 0\n")
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(content)),
+	}, content)
+	if st != gofuse.OK {
+		t.Fatalf("Write config: %v", st)
+	}
+	if written != uint32(len(content)) {
+		t.Fatalf("Write bytes = %d, want %d", written, len(content))
+	}
+
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush .git config status = %v, want OK", st)
+	}
+	if got := syncCalls.Load(); got != 1 {
+		t.Fatalf("Flush sync calls = %d, want 1", got)
+	}
+}
+
 func TestCodingAgentLocalOverlayCrossLayerRenameReturnsEXDEV(t *testing.T) {
 	opts := &MountOptions{
 		Profile:   MountProfileCodingAgent,

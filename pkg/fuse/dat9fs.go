@@ -407,6 +407,18 @@ func localFileHandleOpenedWritable(fh *FileHandle) bool {
 	return accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR
 }
 
+var syncOpenLocalFile = func(file *os.File) error {
+	return file.Sync()
+}
+
+func localPathMayBeGitState(localPath string) bool {
+	clean := path.Clean(localPath)
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	return clean == "/.git" || strings.HasPrefix(clean, "/.git/") || strings.Contains(clean, "/.git/")
+}
+
 func (fs *Dat9FS) writePolicyForOpen(flags uint32) WritePolicy {
 	policy := WritePolicyWriteBack
 	if fs != nil && fs.opts != nil {
@@ -5161,15 +5173,20 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	}()
 
 	if isLocalFileHandle(fh) {
-		phase = "local-sync"
-		if err := fh.LocalFile.Sync(); err != nil {
-			return localErrToFuseStatus(err)
+		gitState := localPathMayBeGitState(fh.Path)
+		if gitState {
+			phase = "local-git-sync"
+			if err := syncOpenLocalFile(fh.LocalFile); err != nil {
+				return localErrToFuseStatus(err)
+			}
+		} else {
+			phase = "local-metadata"
 		}
 		if info, err := fh.LocalFile.Stat(); err == nil {
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
-		if localFileHandleOpenedWritable(fh) {
+		if gitState && localFileHandleOpenedWritable(fh) {
 			ctx, cf := context.WithTimeout(context.Background(), gitCheckpointTimeout)
 			if err := fs.checkpointGitStateForPath(ctx, fh.Path); err != nil {
 				log.Printf("git state checkpoint after local flush failed for %s: %v", fh.Path, err)
@@ -5404,14 +5421,14 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 
 	if isLocalFileHandle(fh) {
 		phase = "local-sync"
-		if err := fh.LocalFile.Sync(); err != nil {
+		if err := syncOpenLocalFile(fh.LocalFile); err != nil {
 			return localErrToFuseStatus(err)
 		}
 		if info, err := fh.LocalFile.Stat(); err == nil {
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
-		if localFileHandleOpenedWritable(fh) {
+		if localPathMayBeGitState(fh.Path) && localFileHandleOpenedWritable(fh) {
 			ctx, cf := context.WithTimeout(context.Background(), gitCheckpointTimeout)
 			if err := fs.checkpointGitStateForPath(ctx, fh.Path); err != nil {
 				log.Printf("git state checkpoint after local fsync failed for %s: %v", fh.Path, err)
@@ -5673,21 +5690,31 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			phase = "local-close"
 			fh.Lock()
 			localFile := fh.LocalFile
+			openedWritable := localFileHandleOpenedWritable(fh)
+			gitState := localPathMayBeGitState(fh.Path)
+			localPath := fh.Path
+			ino := fh.Ino
 			fh.LocalFile = nil
 			fh.Unlock()
 			if localFile != nil {
-				if info, err := localFile.Stat(); err == nil {
-					fs.inodes.UpdateSize(fh.Ino, info.Size())
-					fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
+				if gitState && openedWritable {
+					phase = "local-git-sync-close"
+					if err := syncOpenLocalFile(localFile); err != nil {
+						flushStatus = localErrToFuseStatus(err)
+					}
 				}
-				if err := localFile.Close(); err != nil {
+				if info, err := localFile.Stat(); err == nil {
+					fs.inodes.UpdateSize(ino, info.Size())
+					fs.inodes.UpdateMtime(ino, info.ModTime())
+				}
+				if err := localFile.Close(); err != nil && flushStatus == gofuse.OK {
 					flushStatus = localErrToFuseStatus(err)
 				}
 			}
-			if flushStatus == gofuse.OK && localFileHandleOpenedWritable(fh) {
+			if flushStatus == gofuse.OK && gitState && openedWritable {
 				ctx, cf := context.WithTimeout(context.Background(), gitCheckpointTimeout)
-				if err := fs.checkpointGitStateForPath(ctx, fh.Path); err != nil {
-					log.Printf("git state checkpoint after local release failed for %s: %v", fh.Path, err)
+				if err := fs.checkpointGitStateForPath(ctx, localPath); err != nil {
+					log.Printf("git state checkpoint after local release failed for %s: %v", localPath, err)
 				}
 				cf()
 			}

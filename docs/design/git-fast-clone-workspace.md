@@ -90,6 +90,7 @@ Coding-agent local overlay policy
 - The coding-agent mount profile routes heavyweight local state and generated output to `<local-root>/overlay` instead of Drive9 backend storage.
 - Default local-only paths include VCS state (`.git`, `.hg`, `.svn`), dependency directories (`node_modules`, `.venv`, `.pnpm-store`), build outputs (`dist`, `build`, `target`, `coverage`), temporary/cache directories (`tmp`, `.tmp`, `.cache`, `.turbo`, `.next/cache`, `.vitepress/cache`), and tool-specific generated output such as `.tmp-api-extractor`.
 - These local-only paths are still merged into FUSE directory listings with tracked Git workspace entries, so generated directories under a tracked source directory remain visible to local build tools without being uploaded to Drive9.
+- Local-only dependency and generated-output files are a rebuildable performance layer. Their ordinary FUSE `Flush` path does not force `fsync`; it refreshes local inode metadata only. Explicit `Fsync` still syncs the local file, and `.git` local-only state still syncs/checkpoints so Git state can be restored in replacement sandboxes.
 
 ## Clone Flow
 
@@ -166,7 +167,7 @@ Edit a file:
 
 - Git reads the clean+overlay synthetic working tree through FUSE.
 - `.git/index`, objects, logs, and related files are written to the local overlay.
-- Writable `.git` handles checkpoint local-only object packs first, then `git_workspace_git_state`, on flush/release/rename write paths.
+- Writable `.git` handles sync local file state and checkpoint local-only object packs first, then `git_workspace_git_state`, on flush/fsync/release/rename write paths.
 - Read-only `.git` handles do not checkpoint, which prevents commands such as `git status` from repeatedly uploading the full `.git` archive.
 - If a staged blob is larger than 5 MiB, restore downgrades that staged state to unstaged. The file content remains durable through the Drive9 dirty overlay.
 
