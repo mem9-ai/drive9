@@ -35,7 +35,7 @@ HTTP server for `/v1/fs/*`, upload (V1/V2), SSE events, auth, background workers
 
 ## Handler Pattern
 
-`func (s *Server) handleXxx(w http.ResponseWriter, r *http.Request, path string)`. Call `authorizeFS(w, r, FSOpXxx, path)` at top. Extract backend via `backendFromRequest(r)`. Write errors via `errJSON(w, code, msg)`. Write JSON responses with `encoding/json` + `Content-Type: application/json`.
+`func (s *Server) handleXxx(w http.ResponseWriter, r *http.Request, path string)`. Call `authorizeFS(w, r, FSOpXxx, path)` at top for ordinary FS operations. `handleChmod` is the explicit exception: there is no chmod `FSOp`, so it must keep the scoped-token fail-closed check rather than using `authorizeFS(FSOpWrite)`. Extract backend via `backendFromRequest(r)`. Write errors via `errJSON(w, code, msg)`. Write JSON responses with `encoding/json` + `Content-Type: application/json`.
 
 ## Background Workers
 
