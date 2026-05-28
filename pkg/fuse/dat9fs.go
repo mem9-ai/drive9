@@ -353,7 +353,21 @@ func (fs *Dat9FS) remotePath(localPath string) string {
 }
 
 func (fs *Dat9FS) localOverlayForPath(localPath string) (*LocalOverlay, bool, gofuse.Status) {
-	if fs.observePathPolicy(localPath) != PathLayerLocalOnly {
+	return fs.localOverlayForPathWithHint(localPath, false)
+}
+
+func (fs *Dat9FS) localOverlayForDirPath(localPath string) (*LocalOverlay, bool, gofuse.Status) {
+	return fs.localOverlayForPathWithHint(localPath, true)
+}
+
+func (fs *Dat9FS) localOverlayForPathWithHint(localPath string, dirHint bool) (*LocalOverlay, bool, gofuse.Status) {
+	var layer PathLayer
+	if dirHint {
+		layer = fs.observeDirPathPolicy(localPath)
+	} else {
+		layer = fs.observePathPolicy(localPath)
+	}
+	if layer != PathLayerLocalOnly {
 		return nil, false, gofuse.OK
 	}
 	if fs.gitWorkspaceOwnsPath(localPath) {
@@ -2761,7 +2775,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	}
 
 	mode := input.Mode & 0o777
-	if overlay, local, st := fs.localOverlayForPath(childP); local {
+	if overlay, local, st := fs.localOverlayForDirPath(childP); local {
 		if st != gofuse.OK {
 			return st
 		}
@@ -3072,7 +3086,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	if st != gofuse.OK {
 		return st
 	}
-	if overlay, local, st := fs.localOverlayForPath(childP); local {
+	if overlay, local, st := fs.localOverlayForDirPath(childP); local {
 		if st != gofuse.OK {
 			return st
 		}
@@ -3395,6 +3409,12 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 	oldLayer := fs.observePathPolicy(oldP)
 	newLayer := fs.observePathPolicy(newP)
+	if fs.localOverlay != nil {
+		if info, err := fs.localOverlay.Lstat(oldP); err == nil && info.IsDir() {
+			oldLayer = fs.observeDirPathPolicy(oldP)
+			newLayer = fs.observeDirPathPolicy(newP)
+		}
+	}
 	if oldLayer == PathLayerLocalOnly || newLayer == PathLayerLocalOnly {
 		if oldLayer != newLayer {
 			return gofuse.Status(syscall.EXDEV)
@@ -3929,7 +3949,11 @@ func (fs *Dat9FS) localOverlayDirEntries(dirPath string, items []localOverlayEnt
 	entries := make([]DirEntry, 0, len(items))
 	for _, item := range items {
 		childP := dirEntryChildPath(dirPath, item.Name)
-		if fs.observePathPolicy(childP) != PathLayerLocalOnly {
+		layer := fs.observePathPolicy(childP)
+		if item.Info.IsDir() {
+			layer = fs.observeDirPathPolicy(childP)
+		}
+		if layer != PathLayerLocalOnly {
 			continue
 		}
 		info := item.Info

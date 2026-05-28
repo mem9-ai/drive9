@@ -120,10 +120,22 @@ func (policy *LocalPolicy) classifyWithSource(localPath string) (PathLayer, poli
 }
 
 func (fs *Dat9FS) observePathPolicy(localPath string) PathLayer {
+	return fs.observePathPolicyWithHint(localPath, false)
+}
+
+func (fs *Dat9FS) observeDirPathPolicy(localPath string) PathLayer {
+	return fs.observePathPolicyWithHint(localPath, true)
+}
+
+func (fs *Dat9FS) observePathPolicyWithHint(localPath string, dirHint bool) PathLayer {
 	if fs == nil || fs.localPolicy == nil {
 		return PathLayerRemotePersistent
 	}
 	layer, source := fs.localPolicy.classifyWithSource(localPath)
+	if layer == PathLayerRemotePersistent && source == policyMatchRemoteDefault && fs.gitIgnoredPathLocalOnly(localPath, dirHint) {
+		layer = PathLayerLocalOnly
+		source = policyMatchLocalOnly
+	}
 	if fs.perfEnabled() {
 		fs.perf.recordLocalPolicy(source)
 	}

@@ -30,6 +30,7 @@ import (
 
 const gitCheckpointTimeout = 2 * time.Minute
 const gitWorkspaceHydrateTimeout = 30 * time.Minute
+const gitCheckIgnoreTimeout = 2 * time.Second
 const gitWorkspaceRefreshInterval = time.Second
 const gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
 const gitWorkspaceModeFastBlobless = "fast-blobless"
@@ -45,6 +46,7 @@ type gitWorkspaceLayer struct {
 
 	materialize    map[string]*gitMaterializeCall
 	hydrateStarted map[string]struct{}
+	ignoreCache    map[string]bool
 }
 
 type gitWorkspaceRuntime struct {
@@ -66,6 +68,7 @@ func newGitWorkspaceLayer() *gitWorkspaceLayer {
 	return &gitWorkspaceLayer{
 		materialize:    make(map[string]*gitMaterializeCall),
 		hydrateStarted: make(map[string]struct{}),
+		ignoreCache:    make(map[string]bool),
 	}
 }
 
@@ -177,6 +180,100 @@ func (fs *Dat9FS) gitWorkspaceOwnsPath(localPath string) bool {
 		return true
 	}
 	return rt.hasImpliedDir(rel)
+}
+
+func (fs *Dat9FS) gitIgnoredPathLocalOnly(localPath string, dirHint bool) bool {
+	if fs == nil || fs.opts == nil || fs.opts.Profile != MountProfileCodingAgent || fs.git == nil || fs.localOverlay == nil {
+		return false
+	}
+	if !dirHint {
+		if info, err := fs.localOverlay.Lstat(localPath); err == nil && info.IsDir() {
+			dirHint = true
+		}
+	}
+	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+	if !ok || rt == nil || rel == "" || rel == "." {
+		return false
+	}
+	if rel == ".git" || strings.HasPrefix(rel, ".git/") {
+		return false
+	}
+	if _, ok := rt.overlayEntry(rel); ok {
+		return false
+	}
+	if _, ok := rt.cleanNode(rel); ok {
+		return false
+	}
+	if rt.hasImpliedDir(rel) {
+		return false
+	}
+
+	key := gitIgnoreCacheKey(rt, rel, dirHint)
+	fs.git.mu.Lock()
+	if ignored, ok := fs.git.ignoreCache[key]; ok {
+		fs.git.mu.Unlock()
+		return ignored
+	}
+	fs.git.mu.Unlock()
+
+	ignored, cacheable := fs.gitCheckIgnoredPath(rt, rel, dirHint)
+	if cacheable {
+		fs.git.mu.Lock()
+		if fs.git.ignoreCache == nil {
+			fs.git.ignoreCache = make(map[string]bool)
+		}
+		fs.git.ignoreCache[key] = ignored
+		fs.git.mu.Unlock()
+	}
+	return ignored
+}
+
+func gitIgnoreCacheKey(rt *gitWorkspaceRuntime, rel string, dirHint bool) string {
+	if dirHint {
+		rel += "/"
+	}
+	return rt.workspace.WorkspaceID + ":" + rt.workspace.HeadCommit + ":" + rel
+}
+
+func (fs *Dat9FS) gitCheckIgnoredPath(rt *gitWorkspaceRuntime, rel string, dirHint bool) (bool, bool) {
+	if strings.TrimSpace(fs.opts.LocalRoot) == "" {
+		return false, false
+	}
+	treeRoot := gitcache.TreeRoot(fs.opts.LocalRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit)
+	if info, err := os.Stat(treeRoot); err != nil || !info.IsDir() {
+		return false, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitCheckIgnoreTimeout)
+	defer cancel()
+	if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
+		return false, false
+	}
+	gitDir, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git"))
+	if err != nil {
+		return false, false
+	}
+	ignored, cacheable := runGitCheckIgnore(ctx, gitDir, treeRoot, rel)
+	if ignored || !cacheable || !dirHint {
+		return ignored, cacheable
+	}
+	if !strings.HasSuffix(rel, "/") {
+		return runGitCheckIgnore(ctx, gitDir, treeRoot, rel+"/")
+	}
+	return false, true
+}
+
+func runGitCheckIgnore(ctx context.Context, gitDir, workTree, rel string) (bool, bool) {
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "--work-tree", workTree, "check-ignore", "-q", "--", rel)
+	cmd.Env = append(os.Environ(), "GIT_OPTIONAL_LOCKS=0")
+	err := cmd.Run()
+	if err == nil {
+		return true, true
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return false, true
+	}
+	return false, false
 }
 
 func (rt *gitWorkspaceRuntime) overlayEntry(rel string) (client.GitOverlayEntry, bool) {

@@ -923,6 +923,180 @@ func TestGitWorkspaceGeneratedTmpApiExtractorUsesLocalOverlay(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceGitIgnoredGeneratedPathsUseLocalOverlay(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	fixture := newGitWorkspaceFixture(t)
+	fixture.treeNodes = []client.GitTreeNode{
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        ".gitignore",
+			ParentPath:  "",
+			Name:        ".gitignore",
+			Kind:        "file",
+			Mode:        "100644",
+			ObjectSHA:   "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			SizeBytes:   96,
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "src",
+			ParentPath:  "",
+			Name:        "src",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "src/kimi_cli",
+			ParentPath:  "src",
+			Name:        "kimi_cli",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "cccccccccccccccccccccccccccccccccccccccc",
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "src/kimi_cli/vis",
+			ParentPath:  "src/kimi_cli",
+			Name:        "vis",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "dddddddddddddddddddddddddddddddddddddddd",
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "src/kimi_cli/web",
+			ParentPath:  "src/kimi_cli",
+			Name:        "web",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "src/kimi_cli/web/static",
+			ParentPath:  "src/kimi_cli/web",
+			Name:        "static",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "ffffffffffffffffffffffffffffffffffffffff",
+		},
+	}
+
+	ignoreFile := strings.Join([]string{
+		"src/kimi_cli/deps/bin",
+		"src/kimi_cli/deps/tmp",
+		"src/kimi_cli/_build_info.py",
+		"src/kimi_cli/web/static/assets/",
+		"src/kimi_cli/vis/static/",
+		"",
+	}, "\n")
+	repo := t.TempDir()
+	runFuseTestGit(t, "", "init", "-b", "main", repo)
+	runFuseTestGit(t, repo, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, repo, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(repo, ".gitignore"), []byte(ignoreFile), 0o644); err != nil {
+		t.Fatalf("write .gitignore: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", ".gitignore")
+	runFuseTestGit(t, repo, "commit", "-m", "ignore generated outputs")
+	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("archiveLocalGitDir: %v", err)
+	}
+	fixture.state = state
+
+	localRoot := t.TempDir()
+	treeRoot := gitcache.TreeRoot(localRoot, "ws1", fixtureHeadCommit)
+	if err := os.MkdirAll(treeRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(treeRoot, ".gitignore"), []byte(ignoreFile), 0o644); err != nil {
+		t.Fatalf("write hydrated .gitignore: %v", err)
+	}
+
+	opts := &MountOptions{
+		LocalRoot:           localRoot,
+		Profile:             MountProfileCodingAgent,
+		EnableGitWorkspaces: true,
+		PerfCounters:        true,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+
+	if got := fs.observePathPolicy("/repo/src/kimi_cli/_build_info.py"); got != PathLayerLocalOnly {
+		t.Fatalf("_build_info.py policy = %s, want local-only", got)
+	}
+	if got := fs.observePathPolicy("/repo/src/kimi_cli/web/static/assets/app.js"); got != PathLayerLocalOnly {
+		t.Fatalf("web assets policy = %s, want local-only", got)
+	}
+	if got := fs.observePathPolicy("/repo/src/kimi_cli/web/app.py"); got != PathLayerRemotePersistent {
+		t.Fatalf("source policy = %s, want remote persistent", got)
+	}
+
+	kimiCLIIno := fs.inodes.Lookup("/repo/src/kimi_cli", true, 0, time.Now())
+	var buildInfoOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: kimiCLIIno},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "_build_info.py", &buildInfoOut); st != gofuse.OK {
+		t.Fatalf("Create _build_info.py status = %v, want OK", st)
+	}
+	content := []byte("version = 'test'\n")
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: buildInfoOut.NodeId},
+		Fh:       buildInfoOut.Fh,
+		Size:     uint32(len(content)),
+	}, content)
+	if st != gofuse.OK {
+		t.Fatalf("Write _build_info.py status = %v, want OK", st)
+	}
+	if written != uint32(len(content)) {
+		t.Fatalf("Write _build_info.py bytes = %d, want %d", written, len(content))
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: buildInfoOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush _build_info.py status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: buildInfoOut.Fh})
+
+	visIno := fs.inodes.Lookup("/repo/src/kimi_cli/vis", true, 0, time.Now())
+	var staticOut gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: visIno},
+		Mode:     0o755,
+	}, "static", &staticOut); st != gofuse.OK {
+		t.Fatalf("Mkdir vis/static status = %v, want OK", st)
+	}
+
+	if _, err := os.Stat(filepath.Join(localRoot, "overlay/repo/src/kimi_cli/vis/static")); err != nil {
+		t.Fatalf("local ignored directory missing: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(localRoot, "overlay/repo/src/kimi_cli/_build_info.py"))
+	if err != nil {
+		t.Fatalf("read local ignored file: %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("local ignored file = %q, want %q", got, content)
+	}
+	fixture.mu.Lock()
+	_, overlayFile := fixture.overlay["src/kimi_cli/_build_info.py"]
+	_, overlayDir := fixture.overlay["src/kimi_cli/vis/static"]
+	fixture.mu.Unlock()
+	if overlayFile || overlayDir {
+		t.Fatalf("ignored generated path entered git overlay: file=%t dir=%t", overlayFile, overlayDir)
+	}
+}
+
 func TestSliceReadNegativeSizeReadsToEOF(t *testing.T) {
 	got := sliceRead([]byte("abcdef"), 2, -1)
 	if string(got) != "cdef" {

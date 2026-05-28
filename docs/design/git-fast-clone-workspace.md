@@ -142,6 +142,8 @@ Coding-agent local overlay policy
 
 8. After FUSE rediscovers the workspace, directory listings come from the synthetic view of `git_workspace_tree_nodes` plus `git_workspace_overlay`. FUSE also best-effort starts hydrate for `mode=fast-blobless` workspaces so replacement sandboxes still warm their local cache.
 
+9. In the coding-agent mount profile, FUSE treats repository-ignored generated paths as local-only. The policy first applies explicit local/remote patterns; for otherwise remote-default paths inside a Git workspace, it runs cached `git check-ignore` against the hidden hydrated clean tree and the local `.git` state. Paths that Git would ignore are routed to the local overlay, while tracked clean files and durable Git overlay entries keep their normal Git workspace semantics.
+
 ## Read/Edit/Add/Commit/Push Flow
 
 Read a clean file:
@@ -156,6 +158,7 @@ Edit a file:
 
 - When a tracked clean file is written, FUSE stores the new content in a `git_workspace_overlay` `upsert` entry.
 - New files and directories also enter the overlay.
+- In the coding-agent profile, untracked paths matched by the repository's `.gitignore` are local-only. This keeps repo-specific build outputs such as generated web assets, package build directories, and temporary tool output off Drive9 without hand-maintaining per-repo mount patterns.
 - Deleting a clean file writes a `whiteout`.
 - With `write-sync`, the overlay is uploaded before write returns, so partially edited files survive an agent or sandbox stop.
 
@@ -204,6 +207,7 @@ The current implementation does not introduce SQLite.
 Local fast workspace state includes:
 
 - `<local-root>/overlay/.../.git`: local `.git`.
+- `<local-root>/overlay/.../<ignored-path>`: coding-agent local-only files for paths matched by static local-only patterns or repository `.gitignore` rules.
 - `<local-root>/git-workspaces/<workspace-id>/<head-commit>/tree`: hidden hydrated clean source tree cache.
 - `<local-root>/git-workspaces/<workspace-id>/<head-commit>/blobs`: hidden read-through clean blob cache.
 - `<cache-dir>/<mount-id>/journal.wal`: the existing FUSE write/cache journal.
