@@ -36,6 +36,7 @@ const gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
 const gitWorkspaceModeFastBlobless = "fast-blobless"
 const gitLocalObjectMaxBlobBytes int64 = 5 << 20
 const gitLocalObjectMaxPackBytes int64 = 256 << 20
+const gitDirectoryRenameOverlayLimit = 100
 
 type gitWorkspaceLayer struct {
 	mu         sync.Mutex
@@ -51,6 +52,7 @@ type gitWorkspaceLayer struct {
 
 type gitWorkspaceRuntime struct {
 	mu        sync.RWMutex
+	restoreMu sync.Mutex
 	workspace client.GitWorkspace
 	localRoot string
 	nodes     map[string]client.GitTreeNode
@@ -92,6 +94,7 @@ func (fs *Dat9FS) ensureGitWorkspaces(ctx context.Context) error {
 		return err
 	}
 	loaded := make([]*gitWorkspaceRuntime, 0, len(workspaces))
+	var loadErrs []error
 	for i := range workspaces {
 		ws := workspaces[i]
 		localRoot, ok := fs.localPath(strings.TrimSuffix(ws.RootPath, "/"))
@@ -103,10 +106,12 @@ func (fs *Dat9FS) ensureGitWorkspaces(ctx context.Context) error {
 		}
 		nodes, err := fs.client.ListGitTree(ctx, ws.WorkspaceID, ws.HeadCommit)
 		if err != nil {
+			loadErrs = append(loadErrs, fmt.Errorf("load git tree workspace=%s root=%s: %w", ws.WorkspaceID, ws.RootPath, err))
 			continue
 		}
 		overlays, err := fs.client.ListGitOverlayEntries(ctx, ws.WorkspaceID)
 		if err != nil && !client.IsNotFound(err) {
+			loadErrs = append(loadErrs, fmt.Errorf("load git overlay workspace=%s root=%s: %w", ws.WorkspaceID, ws.RootPath, err))
 			continue
 		}
 		rt := &gitWorkspaceRuntime{
@@ -125,6 +130,11 @@ func (fs *Dat9FS) ensureGitWorkspaces(ctx context.Context) error {
 		}
 		loaded = append(loaded, rt)
 	}
+	if len(loadErrs) > 0 {
+		err := errors.Join(loadErrs...)
+		log.Printf("git workspace refresh incomplete: %v", err)
+		return err
+	}
 	sort.Slice(loaded, func(i, j int) bool {
 		return len(loaded[i].localRoot) > len(loaded[j].localRoot)
 	})
@@ -141,12 +151,17 @@ func (fs *Dat9FS) ensureGitWorkspaces(ctx context.Context) error {
 	return nil
 }
 
-func (fs *Dat9FS) gitWorkspaceForPath(localPath string) (*gitWorkspaceRuntime, string, bool) {
+func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*gitWorkspaceRuntime, string, bool) {
 	if fs == nil || fs.git == nil || fs.opts == nil || !fs.opts.EnableGitWorkspaces {
 		return nil, "", false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), fuseTimeout)
-	_ = fs.ensureGitWorkspaces(ctx)
+	if ctx == nil {
+		ctx = context.TODO()
+	}
+	ctx, cancel := context.WithTimeout(ctx, fuseTimeout)
+	if err := fs.ensureGitWorkspaces(ctx); err != nil {
+		log.Printf("git workspace refresh failed for %s: %v", localPath, err)
+	}
 	cancel()
 
 	clean := path.Clean(localPath)
@@ -169,8 +184,8 @@ func (fs *Dat9FS) gitWorkspaceForPath(localPath string) (*gitWorkspaceRuntime, s
 	return nil, "", false
 }
 
-func (fs *Dat9FS) gitWorkspaceOwnsPath(localPath string) bool {
-	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+func (fs *Dat9FS) gitWorkspaceOwnsPath(ctx context.Context, localPath string) bool {
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || rel == "" {
 		return false
 	}
@@ -183,7 +198,7 @@ func (fs *Dat9FS) gitWorkspaceOwnsPath(localPath string) bool {
 	return rt.hasImpliedDir(rel)
 }
 
-func (fs *Dat9FS) gitIgnoredPathLocalOnly(localPath string, dirHint bool) bool {
+func (fs *Dat9FS) gitIgnoredPathLocalOnly(ctx context.Context, localPath string, dirHint bool) bool {
 	if fs == nil || fs.opts == nil || fs.opts.Profile != MountProfileCodingAgent || fs.git == nil || fs.localOverlay == nil {
 		return false
 	}
@@ -192,7 +207,7 @@ func (fs *Dat9FS) gitIgnoredPathLocalOnly(localPath string, dirHint bool) bool {
 			dirHint = true
 		}
 	}
-	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || rt == nil || rel == "" || rel == "." {
 		return false
 	}
@@ -217,7 +232,7 @@ func (fs *Dat9FS) gitIgnoredPathLocalOnly(localPath string, dirHint bool) bool {
 	}
 	fs.git.mu.Unlock()
 
-	ignored, cacheable := fs.gitCheckIgnoredPath(rt, rel, dirHint)
+	ignored, cacheable := fs.gitCheckIgnoredPath(ctx, rt, rel, dirHint)
 	if cacheable {
 		fs.git.mu.Lock()
 		if fs.git.ignoreCache == nil {
@@ -236,7 +251,7 @@ func gitIgnoreCacheKey(rt *gitWorkspaceRuntime, rel string, dirHint bool) string
 	return rt.workspace.WorkspaceID + ":" + rt.workspace.HeadCommit + ":" + rel
 }
 
-func (fs *Dat9FS) gitCheckIgnoredPath(rt *gitWorkspaceRuntime, rel string, dirHint bool) (bool, bool) {
+func (fs *Dat9FS) gitCheckIgnoredPath(ctx context.Context, rt *gitWorkspaceRuntime, rel string, dirHint bool) (bool, bool) {
 	if strings.TrimSpace(fs.opts.LocalRoot) == "" {
 		return false, false
 	}
@@ -244,7 +259,10 @@ func (fs *Dat9FS) gitCheckIgnoredPath(rt *gitWorkspaceRuntime, rel string, dirHi
 	if info, err := os.Stat(treeRoot); err != nil || !info.IsDir() {
 		return false, false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), gitCheckIgnoreTimeout)
+	if ctx == nil {
+		ctx = context.TODO()
+	}
+	ctx, cancel := context.WithTimeout(ctx, gitCheckIgnoreTimeout)
 	defer cancel()
 	if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
 		return false, false
@@ -345,8 +363,8 @@ func (rt *gitWorkspaceRuntime) nodeSnapshot() []gitNodeSnapshot {
 	return out
 }
 
-func (fs *Dat9FS) gitEntry(localPath string, incrementLookup bool) (*InodeEntry, bool) {
-	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+func (fs *Dat9FS) gitEntry(ctx context.Context, localPath string, incrementLookup bool) (*InodeEntry, bool) {
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok {
 		return nil, false
 	}
@@ -476,8 +494,7 @@ func parseGitMode(raw string) (uint32, bool) {
 }
 
 func (fs *Dat9FS) listGitDir(ctx context.Context, dirPath string) ([]DirEntry, bool, error) {
-	_ = ctx
-	rt, rel, ok := fs.gitWorkspaceForPath(dirPath)
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, dirPath)
 	if !ok {
 		return nil, false, nil
 	}
@@ -583,7 +600,7 @@ func (fs *Dat9FS) listGitDir(ctx context.Context, dirPath string) ([]DirEntry, b
 }
 
 func (fs *Dat9FS) readGitFile(ctx context.Context, localPath string, offset, size int64) ([]byte, error) {
-	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || rel == "" {
 		return nil, os.ErrNotExist
 	}
@@ -605,10 +622,10 @@ func (fs *Dat9FS) readGitFile(ctx context.Context, localPath string, offset, siz
 	if n.Kind == "dir" || n.Kind == "submodule" {
 		return nil, syscall.EISDIR
 	}
-	return fs.readGitCleanFile(ctx, rt, rel, n, offset, size)
+	return fs.readGitCleanFile(ctx, rt, localPath, rel, n, offset, size)
 }
 
-func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime, rel string, n client.GitTreeNode, offset, size int64) ([]byte, error) {
+func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime, localPath, rel string, n client.GitTreeNode, offset, size int64) ([]byte, error) {
 	if fs.perfEnabled() {
 		fs.perf.gitCleanReadCount.add(1)
 	}
@@ -621,6 +638,9 @@ func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime,
 			if fs.perfEnabled() {
 				fs.perf.gitCleanTreeHit.add(1)
 			}
+			if offset == 0 && size < 0 {
+				fs.updateGitKnownSize(rt, localPath, rel, n, int64(len(data)))
+			}
 			return data, nil
 		}
 		data, hit, err = gitcache.ReadBlob(ctx, localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, n.ObjectSHA, offset, size)
@@ -630,6 +650,9 @@ func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime,
 		if hit {
 			if fs.perfEnabled() {
 				fs.perf.gitCleanBlobCacheHit.add(1)
+			}
+			if offset == 0 && size < 0 {
+				fs.updateGitKnownSize(rt, localPath, rel, n, int64(len(data)))
 			}
 			return data, nil
 		}
@@ -641,7 +664,37 @@ func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime,
 	if err != nil {
 		return nil, err
 	}
+	fs.updateGitKnownSize(rt, localPath, rel, n, int64(len(data)))
 	return sliceRead(data, offset, size), nil
+}
+
+func (fs *Dat9FS) updateGitKnownSize(rt *gitWorkspaceRuntime, localPath, rel string, n client.GitTreeNode, size int64) {
+	if fs == nil || rt == nil || n.SizeBytes >= 0 || size < 0 {
+		return
+	}
+	if ino, ok := fs.inodes.GetInode(localPath); ok {
+		fs.inodes.UpdateSize(ino, size)
+	}
+	rt.updateCleanNodeSize(rel, size)
+}
+
+func (rt *gitWorkspaceRuntime) updateCleanNodeSize(rel string, size int64) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	n, ok := rt.nodes[rel]
+	if !ok || n.SizeBytes >= 0 {
+		return
+	}
+	n.SizeBytes = size
+	rt.nodes[rel] = n
+	children := rt.children[n.ParentPath]
+	for i := range children {
+		if children[i].Path == rel {
+			children[i].SizeBytes = size
+			rt.children[n.ParentPath] = children
+			return
+		}
+	}
 }
 
 func (fs *Dat9FS) materializeGitBlob(ctx context.Context, rt *gitWorkspaceRuntime, objectSHA string) ([]byte, error) {
@@ -762,20 +815,30 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	if rt == nil || fs.localOverlay == nil {
 		return nil
 	}
-	fs.git.mu.Lock()
+	rt.mu.RLock()
 	if rt.restored {
-		fs.git.mu.Unlock()
+		rt.mu.RUnlock()
 		return nil
 	}
-	fs.git.mu.Unlock()
+	rt.mu.RUnlock()
+
+	rt.restoreMu.Lock()
+	defer rt.restoreMu.Unlock()
+	rt.mu.RLock()
+	if rt.restored {
+		rt.mu.RUnlock()
+		return nil
+	}
+	rt.mu.RUnlock()
+
 	gitDir, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git"))
 	if err != nil {
 		return err
 	}
 	if _, err := os.Stat(gitDir); err == nil {
-		fs.git.mu.Lock()
+		rt.mu.Lock()
 		rt.restored = true
-		fs.git.mu.Unlock()
+		rt.mu.Unlock()
 		return nil
 	}
 	state, err := fs.client.GetGitState(ctx, rt.workspace.WorkspaceID)
@@ -796,9 +859,9 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	if err := extractGitArchive(state.Content, gitDir); err != nil {
 		return err
 	}
-	fs.git.mu.Lock()
+	rt.mu.Lock()
 	rt.restored = true
-	fs.git.mu.Unlock()
+	rt.mu.Unlock()
 	return nil
 }
 
@@ -888,7 +951,7 @@ func (fs *Dat9FS) restoreGitObjectPacks(ctx context.Context, rt *gitWorkspaceRun
 }
 
 func (fs *Dat9FS) ensureGitStateForLocalPath(ctx context.Context, localPath string) error {
-	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok {
 		return nil
 	}
@@ -1112,7 +1175,7 @@ func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath strin
 	if fs == nil || fs.git == nil || fs.client == nil || fs.localOverlay == nil {
 		return nil
 	}
-	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || (rel != ".git" && !strings.HasPrefix(rel, ".git/")) {
 		return nil
 	}
@@ -1728,7 +1791,7 @@ func gitModeForHandle(fh *FileHandle) string {
 }
 
 func (fs *Dat9FS) putGitWhiteout(ctx context.Context, localPath string) gofuse.Status {
-	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || rel == "" {
 		return gofuse.ENOENT
 	}
@@ -1771,7 +1834,7 @@ func (fs *Dat9FS) removeGitWorkspaceRoot(ctx context.Context, rt *gitWorkspaceRu
 }
 
 func (fs *Dat9FS) putGitDirectory(ctx context.Context, localPath string, mode uint32) (*InodeEntry, gofuse.Status) {
-	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || rel == "" {
 		return nil, gofuse.ENOENT
 	}
@@ -1790,7 +1853,7 @@ func (fs *Dat9FS) putGitDirectory(ctx context.Context, localPath string, mode ui
 }
 
 func (fs *Dat9FS) putGitSymlink(ctx context.Context, localPath, target string) (*InodeEntry, gofuse.Status) {
-	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || rel == "" {
 		return nil, gofuse.ENOENT
 	}
@@ -1810,12 +1873,11 @@ func (fs *Dat9FS) putGitSymlink(ctx context.Context, localPath, target string) (
 }
 
 func (fs *Dat9FS) gitCreateHandle(ctx context.Context, localPath string, flags uint32, pid uint32, mode uint32, hasMode bool) (*FileHandle, *InodeEntry, gofuse.Status) {
-	_ = ctx
-	rt, rel, ok := fs.gitWorkspaceForPath(localPath)
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || rel == "" {
 		return nil, nil, gofuse.ENOENT
 	}
-	if existing, handled := fs.gitEntry(localPath, false); handled && existing != nil && flags&uint32(syscall.O_EXCL) != 0 {
+	if existing, handled := fs.gitEntry(ctx, localPath, false); handled && existing != nil && flags&uint32(syscall.O_EXCL) != 0 {
 		return nil, nil, gofuse.Status(syscall.EEXIST)
 	}
 	ino := fs.inodes.Lookup(localPath, false, 0, time.Now())
@@ -1852,7 +1914,7 @@ func (fs *Dat9FS) gitCreateHandle(ctx context.Context, localPath string, flags u
 }
 
 func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flags uint32) gofuse.Status {
-	rt, rel, ok := fs.gitWorkspaceForPath(fh.Path)
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, fh.Path)
 	if !ok || rel == "" {
 		return gofuse.ENOENT
 	}
@@ -1947,7 +2009,7 @@ func (fs *Dat9FS) setGitAttr(ctx context.Context, input *gofuse.SetAttrIn, entry
 	if entry == nil {
 		return gofuse.ENOENT
 	}
-	rt, rel, ok := fs.gitWorkspaceForPath(entry.Path)
+	rt, rel, ok := fs.gitWorkspaceForPath(ctx, entry.Path)
 	if !ok || rel == "" {
 		return gofuse.Status(syscall.ENOTSUP)
 	}
@@ -2042,7 +2104,7 @@ func (fs *Dat9FS) setGitAttr(ctx context.Context, input *gofuse.SetAttrIn, entry
 		entry.Size = newSize
 		fs.inodes.UpdateSize(input.NodeId, newSize)
 	}
-	if refreshed, handled := fs.gitEntry(entry.Path, false); handled && refreshed != nil {
+	if refreshed, handled := fs.gitEntry(ctx, entry.Path, false); handled && refreshed != nil {
 		entry = refreshed
 	}
 	fs.fillAttr(entry, &out.Attr)
@@ -2077,8 +2139,8 @@ func gitOverlayKindForEntry(entry *InodeEntry) string {
 }
 
 func (fs *Dat9FS) renameGitPath(ctx context.Context, input *gofuse.RenameIn, oldP, newP string) (bool, gofuse.Status) {
-	oldRT, oldRel, oldOK := fs.gitWorkspaceForPath(oldP)
-	newRT, newRel, newOK := fs.gitWorkspaceForPath(newP)
+	oldRT, oldRel, oldOK := fs.gitWorkspaceForPath(ctx, oldP)
+	newRT, newRel, newOK := fs.gitWorkspaceForPath(ctx, newP)
 	if !oldOK && !newOK {
 		return false, gofuse.OK
 	}
@@ -2088,7 +2150,7 @@ func (fs *Dat9FS) renameGitPath(ctx context.Context, input *gofuse.RenameIn, old
 	if oldRel == newRel {
 		return true, gofuse.OK
 	}
-	oldEntry, handled := fs.gitEntry(oldP, false)
+	oldEntry, handled := fs.gitEntry(ctx, oldP, false)
 	if !handled || oldEntry == nil {
 		return true, gofuse.ENOENT
 	}
@@ -2124,7 +2186,7 @@ func (fs *Dat9FS) validateGitRenameTarget(ctx context.Context, oldRel, newRel st
 	if oldEntry.IsDir && strings.HasPrefix(newRel, oldRel+"/") {
 		return gofuse.Status(syscall.EINVAL)
 	}
-	newEntry, handled := fs.gitEntry(newP, false)
+	newEntry, handled := fs.gitEntry(ctx, newP, false)
 	if !handled || newEntry == nil {
 		return gofuse.OK
 	}
@@ -2147,6 +2209,11 @@ func (fs *Dat9FS) validateGitRenameTarget(ctx context.Context, oldRel, newRel st
 }
 
 func (fs *Dat9FS) renameGitDir(ctx context.Context, rt *gitWorkspaceRuntime, oldRel, newRel string) gofuse.Status {
+	if count := gitDirRenameEntryCount(rt, oldRel); count > gitDirectoryRenameOverlayLimit {
+		log.Printf("git workspace directory rename too large workspace=%s path=%s entries=%d limit=%d",
+			rt.workspace.WorkspaceID, oldRel, count, gitDirectoryRenameOverlayLimit)
+		return gofuse.Status(syscall.EXDEV)
+	}
 	if _, err := fs.putGitOverlay(ctx, rt.workspace.WorkspaceID, client.GitOverlayEntryRequest{
 		Path: newRel,
 		Op:   "upsert",
@@ -2230,6 +2297,24 @@ func (fs *Dat9FS) renameGitDir(ctx context.Context, rt *gitWorkspaceRuntime, old
 		}
 	}
 	return gofuse.OK
+}
+
+func gitDirRenameEntryCount(rt *gitWorkspaceRuntime, oldRel string) int {
+	prefix := oldRel + "/"
+	seen := map[string]struct{}{oldRel: {}}
+	for _, item := range rt.nodeSnapshot() {
+		rel := item.path
+		if rel == oldRel || strings.HasPrefix(rel, prefix) {
+			seen[rel] = struct{}{}
+		}
+	}
+	for _, item := range rt.overlaySnapshot() {
+		rel := item.path
+		if rel == oldRel || strings.HasPrefix(rel, prefix) {
+			seen[rel] = struct{}{}
+		}
+	}
+	return len(seen)
 }
 
 func gitDirOverlayMode(rt *gitWorkspaceRuntime, rel string) string {

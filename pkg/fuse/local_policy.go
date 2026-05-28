@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"strings"
@@ -120,19 +121,27 @@ func (policy *LocalPolicy) classifyWithSource(localPath string) (PathLayer, poli
 }
 
 func (fs *Dat9FS) observePathPolicy(localPath string) PathLayer {
-	return fs.observePathPolicyWithHint(localPath, false)
+	return fs.observePathPolicyWithHint(context.TODO(), localPath, false)
 }
 
 func (fs *Dat9FS) observeDirPathPolicy(localPath string) PathLayer {
-	return fs.observePathPolicyWithHint(localPath, true)
+	return fs.observePathPolicyWithHint(context.TODO(), localPath, true)
 }
 
-func (fs *Dat9FS) observePathPolicyWithHint(localPath string, dirHint bool) PathLayer {
+func (fs *Dat9FS) observePathPolicyWithContext(ctx context.Context, localPath string) PathLayer {
+	return fs.observePathPolicyWithHint(ctx, localPath, false)
+}
+
+func (fs *Dat9FS) observeDirPathPolicyWithContext(ctx context.Context, localPath string) PathLayer {
+	return fs.observePathPolicyWithHint(ctx, localPath, true)
+}
+
+func (fs *Dat9FS) observePathPolicyWithHint(ctx context.Context, localPath string, dirHint bool) PathLayer {
 	if fs == nil || fs.localPolicy == nil {
 		return PathLayerRemotePersistent
 	}
 	layer, source := fs.localPolicy.classifyWithSource(localPath)
-	if layer == PathLayerRemotePersistent && source == policyMatchRemoteDefault && fs.gitIgnoredPathLocalOnly(localPath, dirHint) {
+	if layer == PathLayerRemotePersistent && source == policyMatchRemoteDefault && fs.gitIgnoredPathLocalOnly(ctx, localPath, dirHint) {
 		layer = PathLayerLocalOnly
 		source = policyMatchLocalOnly
 	}

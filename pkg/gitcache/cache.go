@@ -380,16 +380,20 @@ func extractCodeloadTar(r io.Reader, dst string) (int64, int64, error) {
 		if !ok {
 			continue
 		}
-		target := filepath.Join(dst, filepath.FromSlash(rel))
-		if !strings.HasPrefix(target, dst+string(filepath.Separator)) && target != dst {
-			return files, bytes, fmt.Errorf("unsafe hydrate path %q", hdr.Name)
-		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
+			target, err := hydrateTarget(dst, rel, true)
+			if err != nil {
+				return files, bytes, err
+			}
 			if err := os.MkdirAll(target, os.FileMode(hdr.Mode)&0o777); err != nil {
 				return files, bytes, err
 			}
 		case tar.TypeReg:
+			target, err := hydrateTarget(dst, rel, true)
+			if err != nil {
+				return files, bytes, err
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return files, bytes, err
 			}
@@ -411,6 +415,10 @@ func extractCodeloadTar(r io.Reader, dst string) (int64, int64, error) {
 			if !safeSymlinkTarget(hdr.Linkname) {
 				continue
 			}
+			target, err := hydrateTarget(dst, rel, false)
+			if err != nil {
+				return files, bytes, err
+			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return files, bytes, err
 			}
@@ -422,6 +430,56 @@ func extractCodeloadTar(r io.Reader, dst string) (int64, int64, error) {
 			bytes += int64(len(hdr.Linkname))
 		}
 	}
+}
+
+func hydrateTarget(dst, rel string, includeTarget bool) (string, error) {
+	clean, err := CleanRelative(rel)
+	if err != nil {
+		return "", err
+	}
+	root, err := filepath.Abs(dst)
+	if err != nil {
+		return "", err
+	}
+	root = filepath.Clean(root)
+	target := filepath.Join(root, filepath.FromSlash(clean))
+	if target != root && !strings.HasPrefix(target, root+string(filepath.Separator)) {
+		return "", fmt.Errorf("unsafe hydrate path %q", rel)
+	}
+	if err := rejectHydrateSymlinkTraversal(root, target, includeTarget); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+func rejectHydrateSymlinkTraversal(root, target string, includeTarget bool) error {
+	rel, err := filepath.Rel(root, target)
+	if err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	limit := len(parts)
+	if !includeTarget && limit > 0 {
+		limit--
+	}
+	cur := root
+	for i := 0; i < limit; i++ {
+		cur = filepath.Join(cur, parts[i])
+		info, err := os.Lstat(cur)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("unsafe hydrate path %q traverses symlink %q", target, cur)
+		}
+	}
+	return nil
 }
 
 func stripCodeloadRoot(name string) (string, bool, error) {

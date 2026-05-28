@@ -3478,7 +3478,7 @@ func TestCodingAgentLocalOverlayReadDirMergesRemoteAndLocalEntries(t *testing.T)
 		{Name: ".git", Ino: 99, Mode: uint32(syscall.S_IFREG) | 0o644},
 		{Name: "README.md", Ino: 100, Mode: uint32(syscall.S_IFREG) | 0o644},
 	}
-	entries, err := fs.mergeLocalDirEntries("/repo", remote)
+	entries, err := fs.mergeLocalDirEntries(context.Background(), "/repo", remote)
 	if err != nil {
 		t.Fatalf("mergeLocalDirEntries: %v", err)
 	}

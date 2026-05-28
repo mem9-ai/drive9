@@ -258,6 +258,7 @@ Backend table checks:
 - Restoring large local-only Git objects without downgrades will require S3/storage refs or an object/pack dedup layer.
 - After `git commit`, the overlay remains relative to the base tree. Later versions can add an explicit `drive9 git checkpoint` or an automatic manifest-advance mechanism.
 - Large overlay files need to move from inline `content_blob` to S3/storage refs.
+- Directory renames inside a Git workspace are capped at 100 affected tree/overlay entries in v1 and return `EXDEV` above that limit. This avoids thousands of sequential overlay RPCs; a later batch endpoint can lift the limit.
 - Branch switching, merge, rebase, conflicts, submodules, and LFS need deeper semantic validation.
 - V1 hydrate does not optimize LFS or submodule object fetching. Non-GitHub repositories use a Git checkout-index fallback, which can be slower than GitHub codeload but still keeps the work out of FUSE read calls.
 - The fast clone E2E should be turned into a repeatable script instead of relying on manual commands.

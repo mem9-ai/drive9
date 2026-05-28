@@ -40,6 +40,8 @@ type gitWorkspaceFixture struct {
 	treeNodes       []client.GitTreeNode
 	readmeObjectSHA string
 	readmeSize      int64
+	failTree        bool
+	failOverlay     bool
 }
 
 func newGitWorkspaceFixture(t *testing.T) *gitWorkspaceFixture {
@@ -87,6 +89,14 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 			UpdatedAt:   time.Now(),
 		}}})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/git-workspaces/ws1/tree":
+		f.mu.Lock()
+		failTree := f.failTree
+		f.mu.Unlock()
+		if failTree {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "tree unavailable"})
+			return
+		}
 		nodes := f.treeNodes
 		if nodes == nil {
 			nodes = []client.GitTreeNode{{
@@ -173,6 +183,11 @@ func (f *gitWorkspaceFixture) handleObjectPacks(w http.ResponseWriter, r *http.R
 func (f *gitWorkspaceFixture) handleOverlay(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failOverlay && r.Method == http.MethodGet {
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "overlay unavailable"})
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
 		if p := r.URL.Query().Get("path"); p != "" {
@@ -262,7 +277,7 @@ func TestGitWorkspaceOverlayPersistsAcrossFilesystemInstances(t *testing.T) {
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
 
 	fs2 := NewDat9FS(fixture.client(), opts)
-	entry, handled := fs2.gitEntry("/repo/new.txt", true)
+	entry, handled := fs2.gitEntry(context.Background(), "/repo/new.txt", true)
 	if !handled || entry == nil {
 		t.Fatalf("gitEntry handled=%t entry=%v, want persisted overlay entry", handled, entry)
 	}
@@ -272,6 +287,44 @@ func TestGitWorkspaceOverlayPersistsAcrossFilesystemInstances(t *testing.T) {
 	}
 	if string(got) != string(content) {
 		t.Fatalf("readGitFile = %q, want %q", got, content)
+	}
+}
+
+func TestEnsureGitWorkspacesKeepsPreviousSnapshotOnLoadFailure(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("initial ensureGitWorkspaces: %v", err)
+	}
+	fs.git.mu.Lock()
+	initialLoaded := fs.git.loaded
+	initialCount := len(fs.git.workspaces)
+	fs.git.loadedAt = time.Now().Add(-2 * gitWorkspaceRefreshInterval)
+	fs.git.mu.Unlock()
+	if !initialLoaded || initialCount != 1 {
+		t.Fatalf("initial workspace snapshot loaded=%t count=%d, want loaded one workspace", initialLoaded, initialCount)
+	}
+
+	fixture.mu.Lock()
+	fixture.failTree = true
+	fixture.mu.Unlock()
+	if err := fs.ensureGitWorkspaces(context.Background()); err == nil {
+		t.Fatalf("ensureGitWorkspaces error = nil, want refresh failure")
+	}
+
+	fs.git.mu.Lock()
+	loaded := fs.git.loaded
+	count := len(fs.git.workspaces)
+	fs.git.mu.Unlock()
+	if !loaded || count != initialCount {
+		t.Fatalf("workspace snapshot after failed refresh loaded=%t count=%d, want loaded count %d", loaded, count, initialCount)
+	}
+	entry, handled := fs.gitEntry(context.Background(), "/repo/README.md", false)
+	if !handled || entry == nil {
+		t.Fatalf("gitEntry after failed refresh handled=%t entry=%v, want stale snapshot", handled, entry)
 	}
 }
 
@@ -391,7 +444,7 @@ func TestGitWorkspaceMkdirPreservesDirectoryMode(t *testing.T) {
 		t.Fatalf("overlay mode = %q parsed=%#o ok=%t, want 0700", entry.Mode, parsed, ok)
 	}
 	fs2 := NewDat9FS(fixture.client(), opts)
-	got, handled := fs2.gitEntry("/repo/private", true)
+	got, handled := fs2.gitEntry(context.Background(), "/repo/private", true)
 	if !handled || got == nil || !got.IsDir || got.Mode&0o777 != 0o700 {
 		t.Fatalf("restored entry handled=%t entry=%+v, want dir 0700", handled, got)
 	}
@@ -438,6 +491,51 @@ func TestGitWorkspaceRenameRejectsNonEmptyDirectoryTarget(t *testing.T) {
 	}, "a", "b")
 	if st != gofuse.Status(syscall.ENOTEMPTY) {
 		t.Fatalf("Rename status = %v, want ENOTEMPTY", st)
+	}
+}
+
+func TestGitWorkspaceRenameLargeDirectoryReturnsEXDEV(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.treeNodes = []client.GitTreeNode{{
+		WorkspaceID: "ws1",
+		CommitSHA:   fixtureHeadCommit,
+		Path:        "big",
+		ParentPath:  "",
+		Name:        "big",
+		Kind:        "dir",
+		Mode:        "040000",
+		ObjectSHA:   "3333333333333333333333333333333333333333",
+		SizeBytes:   -1,
+	}}
+	for i := 0; i < gitDirectoryRenameOverlayLimit+1; i++ {
+		fixture.treeNodes = append(fixture.treeNodes, client.GitTreeNode{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        fmt.Sprintf("big/file-%03d.txt", i),
+			ParentPath:  "big",
+			Name:        fmt.Sprintf("file-%03d.txt", i),
+			Kind:        "file",
+			Mode:        "100644",
+			ObjectSHA:   fmt.Sprintf("%040x", i+1),
+			SizeBytes:   1,
+		})
+	}
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Newdir:   repoIno,
+	}, "big", "moved")
+	if st != gofuse.Status(syscall.EXDEV) {
+		t.Fatalf("Rename status = %v, want EXDEV", st)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if len(fixture.overlay) != 0 {
+		t.Fatalf("overlay writes = %d, want none after guarded rename", len(fixture.overlay))
 	}
 }
 
@@ -1321,6 +1419,9 @@ func TestGitWorkspaceUnknownSizeWritableOpenPreservesBaseContent(t *testing.T) {
 		Flags:    uint32(syscall.O_RDWR),
 	}, &openOut); st != gofuse.OK {
 		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if entry, ok := fs.inodes.GetEntry(lookupOut.NodeId); !ok || entry.Size != int64(len(content)) {
+		t.Fatalf("inode size after clean read = entry %v ok %t, want %d", entry, ok, len(content))
 	}
 	appendix := []byte("tail")
 	written, st := fs.Write(nil, &gofuse.WriteIn{

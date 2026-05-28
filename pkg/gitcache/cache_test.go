@@ -47,6 +47,40 @@ func TestExtractCodeloadTarRejectsTraversal(t *testing.T) {
 	}
 }
 
+func TestExtractCodeloadTarRejectsSymlinkTraversal(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "repo-abc/target", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "repo-abc/link", Typeflag: tar.TypeSymlink, Linkname: "target"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "repo-abc/link/file.txt", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("hello"))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = zr.Close() }()
+
+	_, _, err = extractCodeloadTar(zr, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "traverses symlink") {
+		t.Fatalf("extractCodeloadTar err = %v, want symlink traversal error", err)
+	}
+}
+
 func TestExtractCodeloadTarSkipsRootDirectory(t *testing.T) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
