@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	GitWorkspaceModeFast   = "fast"
-	GitWorkspaceStatusLive = "active"
+	GitWorkspaceModeFast         = "fast"
+	GitWorkspaceModeFastBlobless = "fast-blobless"
+	GitWorkspaceStatusLive       = "active"
 
 	GitTreeNodeKindFile      = "file"
 	GitTreeNodeKindDirectory = "dir"
@@ -67,6 +68,17 @@ type GitState struct {
 	ContentBlob      []byte
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+}
+
+// GitObjectPack stores a local-only git pack needed to restore staged/local
+// objects that are not available from the remote promisor.
+type GitObjectPack struct {
+	WorkspaceID    string
+	PackID         string
+	ChecksumSHA256 string
+	SizeBytes      int64
+	ContentBlob    []byte
+	CreatedAt      time.Time
 }
 
 // GitOverlayEntry records a durable dirty/new/delete overlay entry on top of a
@@ -317,6 +329,74 @@ WHERE workspace_id = ?`, workspaceID)
 		return nil, err
 	}
 	return &state, nil
+}
+
+func (s *Store) UpsertGitObjectPack(ctx context.Context, pack GitObjectPack) error {
+	if strings.TrimSpace(pack.WorkspaceID) == "" {
+		return fmt.Errorf("git workspace id is required")
+	}
+	if strings.TrimSpace(pack.PackID) == "" {
+		return fmt.Errorf("git object pack id is required")
+	}
+	if pack.SizeBytes == 0 && len(pack.ContentBlob) > 0 {
+		pack.SizeBytes = int64(len(pack.ContentBlob))
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO git_workspace_object_packs (
+	workspace_id, pack_id, checksum_sha256, size_bytes, content_blob, created_at
+) VALUES (?, ?, ?, ?, ?, UTC_TIMESTAMP(3))
+ON DUPLICATE KEY UPDATE
+	checksum_sha256 = VALUES(checksum_sha256),
+	size_bytes = VALUES(size_bytes),
+	content_blob = VALUES(content_blob)`,
+		pack.WorkspaceID, pack.PackID, pack.ChecksumSHA256, pack.SizeBytes, pack.ContentBlob)
+	if err != nil {
+		return fmt.Errorf("upsert git object pack %s: %w", pack.PackID, err)
+	}
+	return nil
+}
+
+func (s *Store) ListGitObjectPacks(ctx context.Context, workspaceID string) ([]GitObjectPack, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT workspace_id, pack_id, checksum_sha256, size_bytes, created_at
+FROM git_workspace_object_packs
+WHERE workspace_id = ?
+ORDER BY created_at, pack_id`, workspaceID)
+	if err != nil {
+		return nil, fmt.Errorf("list git object packs: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []GitObjectPack
+	for rows.Next() {
+		var pack GitObjectPack
+		if err := rows.Scan(
+			&pack.WorkspaceID, &pack.PackID, &pack.ChecksumSHA256, &pack.SizeBytes, &pack.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan git object pack: %w", err)
+		}
+		out = append(out, pack)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list git object packs: %w", err)
+	}
+	return out, nil
+}
+
+func (s *Store) GetGitObjectPack(ctx context.Context, workspaceID, packID string) (*GitObjectPack, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT workspace_id, pack_id, checksum_sha256, size_bytes, content_blob, created_at
+FROM git_workspace_object_packs
+WHERE workspace_id = ? AND pack_id = ?`, workspaceID, packID)
+	var pack GitObjectPack
+	if err := row.Scan(
+		&pack.WorkspaceID, &pack.PackID, &pack.ChecksumSHA256, &pack.SizeBytes, &pack.ContentBlob, &pack.CreatedAt,
+	); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &pack, nil
 }
 
 func (s *Store) UpsertGitOverlayEntry(ctx context.Context, entry GitOverlayEntry) error {

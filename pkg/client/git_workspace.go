@@ -75,6 +75,19 @@ type GitState struct {
 	UpdatedAt        time.Time `json:"updated_at"`
 }
 
+type GitObjectPackRequest struct {
+	Content []byte `json:"content"`
+}
+
+type GitObjectPack struct {
+	WorkspaceID    string    `json:"workspace_id"`
+	PackID         string    `json:"pack_id"`
+	ChecksumSHA256 string    `json:"checksum_sha256"`
+	SizeBytes      int64     `json:"size_bytes"`
+	Content        []byte    `json:"content,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
 type GitOverlayEntryRequest struct {
 	Path           string `json:"path"`
 	Op             string `json:"op,omitempty"`
@@ -264,6 +277,76 @@ func (c *Client) GetGitState(ctx context.Context, workspaceID string) (*GitState
 	var out GitState
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode git state: %w", err)
+	}
+	return &out, nil
+}
+
+func (c *Client) PutGitObjectPack(ctx context.Context, workspaceID string, req GitObjectPackRequest) (*GitObjectPack, error) {
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	u := c.baseURL + "/v1/git-workspaces/" + url.PathEscape(workspaceID) + "/object-packs"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out GitObjectPack
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode git object pack: %w", err)
+	}
+	return &out, nil
+}
+
+func (c *Client) ListGitObjectPacks(ctx context.Context, workspaceID string) ([]GitObjectPack, error) {
+	u := c.baseURL + "/v1/git-workspaces/" + url.PathEscape(workspaceID) + "/object-packs"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out struct {
+		Packs []GitObjectPack `json:"packs"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode git object packs: %w", err)
+	}
+	return out.Packs, nil
+}
+
+func (c *Client) GetGitObjectPack(ctx context.Context, workspaceID, packID string) (*GitObjectPack, error) {
+	u := c.baseURL + "/v1/git-workspaces/" + url.PathEscape(workspaceID) + "/object-packs/" + url.PathEscape(packID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out GitObjectPack
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode git object pack: %w", err)
 	}
 	return &out, nil
 }

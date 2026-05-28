@@ -105,6 +105,17 @@ func TestGitListTreeOmitsBlobSizes(t *testing.T) {
 	}
 }
 
+func TestGitFastCloneArgs(t *testing.T) {
+	full := gitFastCloneArgs("https://example.test/repo.git", "/mnt/repo", false)
+	if got, want := strings.Join(full, " "), "clone --no-checkout https://example.test/repo.git /mnt/repo"; got != want {
+		t.Fatalf("full clone args = %q, want %q", got, want)
+	}
+	blobless := gitFastCloneArgs("https://example.test/repo.git", "/mnt/repo", true)
+	if got, want := strings.Join(blobless, " "), "clone --filter=blob:none --no-checkout https://example.test/repo.git /mnt/repo"; got != want {
+		t.Fatalf("blobless clone args = %q, want %q", got, want)
+	}
+}
+
 func TestGitHubTreeSizeEnrichment(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

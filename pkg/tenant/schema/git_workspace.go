@@ -51,6 +51,17 @@ func GitWorkspaceTiDBSchemaStatements() []string {
 		)`,
 		`CREATE INDEX idx_git_state_ref_hash ON git_workspace_git_state(storage_ref_hash)`,
 
+		`CREATE TABLE IF NOT EXISTS git_workspace_object_packs (
+			workspace_id    VARCHAR(64) NOT NULL,
+			pack_id         VARCHAR(64) NOT NULL,
+			checksum_sha256 VARCHAR(128) NOT NULL DEFAULT '',
+			size_bytes      BIGINT NOT NULL DEFAULT 0,
+			content_blob    LONGBLOB,
+			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (workspace_id, pack_id)
+		)`,
+		`CREATE INDEX idx_git_object_packs_created ON git_workspace_object_packs(workspace_id, created_at)`,
+
 		`CREATE TABLE IF NOT EXISTS git_workspace_overlay (
 			workspace_id    VARCHAR(64) NOT NULL,
 			path            VARCHAR(1024) NOT NULL,
@@ -120,6 +131,17 @@ func GitWorkspaceDB9SchemaStatements() []string {
 			updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_git_state_ref_hash ON git_workspace_git_state(storage_ref_hash)`,
+
+		`CREATE TABLE IF NOT EXISTS git_workspace_object_packs (
+			workspace_id    VARCHAR(64) NOT NULL,
+			pack_id         VARCHAR(64) NOT NULL,
+			checksum_sha256 VARCHAR(128) NOT NULL DEFAULT '',
+			size_bytes      BIGINT NOT NULL DEFAULT 0,
+			content_blob    BYTEA,
+			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (workspace_id, pack_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_git_object_packs_created ON git_workspace_object_packs(workspace_id, created_at)`,
 
 		`CREATE TABLE IF NOT EXISTS git_workspace_overlay (
 			workspace_id    VARCHAR(64) NOT NULL,

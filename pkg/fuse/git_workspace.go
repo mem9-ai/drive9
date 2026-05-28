@@ -29,6 +29,9 @@ import (
 const gitCheckpointTimeout = 2 * time.Minute
 const gitWorkspaceRefreshInterval = time.Second
 const gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
+const gitWorkspaceModeFastBlobless = "fast-blobless"
+const gitLocalObjectMaxBlobBytes int64 = 16 << 20
+const gitLocalObjectMaxPackBytes int64 = 256 << 20
 
 type gitWorkspaceLayer struct {
 	mu         sync.Mutex
@@ -493,6 +496,9 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 		if err := fs.restoreGitObjectsFromRemote(ctx, rt, gitDir); err != nil {
 			return err
 		}
+		if err := fs.restoreGitObjectPacks(ctx, rt, gitDir); err != nil {
+			return err
+		}
 	}
 	if err := extractGitArchive(state.Content, gitDir); err != nil {
 		return err
@@ -521,7 +527,12 @@ func (fs *Dat9FS) restoreGitObjectsFromRemote(ctx context.Context, rt *gitWorksp
 	if err := os.RemoveAll(tmpWorktree); err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, "git", "clone", "--no-checkout", repoURL, tmpWorktree)
+	args := []string{"clone"}
+	if rt.workspace.Mode == gitWorkspaceModeFastBlobless {
+		args = append(args, "--filter=blob:none")
+	}
+	args = append(args, "--no-checkout", repoURL, tmpWorktree)
+	cmd := exec.CommandContext(ctx, "git", args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -540,6 +551,45 @@ func (fs *Dat9FS) restoreGitObjectsFromRemote(ctx context.Context, rt *gitWorksp
 	}
 	if err := os.Rename(tmpGitDir, gitDir); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (fs *Dat9FS) restoreGitObjectPacks(ctx context.Context, rt *gitWorkspaceRuntime, gitDir string) error {
+	packs, err := fs.client.ListGitObjectPacks(ctx, rt.workspace.WorkspaceID)
+	if err != nil {
+		if client.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	for _, meta := range packs {
+		pack, err := fs.client.GetGitObjectPack(ctx, rt.workspace.WorkspaceID, meta.PackID)
+		if err != nil {
+			return err
+		}
+		if len(pack.Content) == 0 {
+			continue
+		}
+		if pack.SizeBytes != 0 && pack.SizeBytes != int64(len(pack.Content)) {
+			return fmt.Errorf("git object pack %s size mismatch", pack.PackID)
+		}
+		sum := sha256.Sum256(pack.Content)
+		checksum := hex.EncodeToString(sum[:])
+		if pack.ChecksumSHA256 != "" && !strings.EqualFold(pack.ChecksumSHA256, checksum) {
+			return fmt.Errorf("git object pack %s checksum mismatch", pack.PackID)
+		}
+		cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "unpack-objects", "-q")
+		cmd.Stdin = bytes.NewReader(pack.Content)
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Run(); err != nil {
+			msg := strings.TrimSpace(stderr.String())
+			if msg != "" {
+				return fmt.Errorf("unpack git object pack %s: %w: %s", pack.PackID, err, msg)
+			}
+			return fmt.Errorf("unpack git object pack %s: %w", pack.PackID, err)
+		}
 	}
 	return nil
 }
@@ -634,7 +684,16 @@ func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath strin
 	fs.git.checkpoint.Lock()
 	defer fs.git.checkpoint.Unlock()
 
-	content, err := archiveLocalGitStateDir(gitDir)
+	pack, sanitize, err := buildLocalGitObjectPack(ctx, gitDir, rt)
+	if err != nil {
+		return err
+	}
+	if len(pack) > 0 {
+		if _, err := fs.client.PutGitObjectPack(ctx, rt.workspace.WorkspaceID, client.GitObjectPackRequest{Content: pack}); err != nil {
+			return err
+		}
+	}
+	content, err := archiveLocalGitStateForCheckpoint(ctx, gitDir, rt, sanitize)
 	if err != nil {
 		return err
 	}
@@ -647,6 +706,333 @@ func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath strin
 		Content:          content,
 	})
 	return err
+}
+
+type gitCheckpointSanitization struct {
+	resetIndex    bool
+	dropLocalRefs bool
+}
+
+type gitObjectInfo struct {
+	typ  string
+	size int64
+}
+
+func buildLocalGitObjectPack(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime) ([]byte, gitCheckpointSanitization, error) {
+	var sanitize gitCheckpointSanitization
+	remoteName := strings.TrimSpace(rt.workspace.RemoteName)
+	if remoteName == "" {
+		remoteName = "origin"
+	}
+
+	refObjects, refOversize, err := collectLocalRefObjects(ctx, gitDir, remoteName)
+	if err != nil {
+		return nil, sanitize, err
+	}
+	if refOversize {
+		refObjects = nil
+		sanitize.dropLocalRefs = true
+	}
+
+	stagedObjects, stagedOversize, err := collectStagedLocalObjects(ctx, gitDir, rt)
+	if err != nil {
+		return nil, sanitize, err
+	}
+	if stagedOversize {
+		stagedObjects = nil
+		sanitize.resetIndex = true
+	}
+
+	pack, err := packGitObjects(ctx, gitDir, mergeObjectSets(refObjects, stagedObjects))
+	if err != nil {
+		return nil, sanitize, err
+	}
+	if int64(len(pack)) > gitLocalObjectMaxPackBytes {
+		sanitize.resetIndex = true
+		pack, err = packGitObjects(ctx, gitDir, refObjects)
+		if err != nil {
+			return nil, sanitize, err
+		}
+	}
+	if int64(len(pack)) > gitLocalObjectMaxPackBytes {
+		sanitize.dropLocalRefs = true
+		pack = nil
+	}
+	return pack, sanitize, nil
+}
+
+func collectLocalRefObjects(ctx context.Context, gitDir, remoteName string) (map[string]struct{}, bool, error) {
+	args := []string{"--git-dir", gitDir, "rev-list", "--objects", "--reflog", "--all", "--not", "--remotes=" + remoteName}
+	out, err := gitCommandOutput(ctx, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	objects := make(map[string]struct{})
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		objects[fields[0]] = struct{}{}
+	}
+	if len(objects) == 0 {
+		return nil, false, nil
+	}
+	info, err := gitObjectInfoBatch(ctx, gitDir, mapKeys(objects))
+	if err != nil {
+		return nil, false, err
+	}
+	for oid := range objects {
+		if object := info[oid]; object.typ == "blob" && object.size > gitLocalObjectMaxBlobBytes {
+			return nil, true, nil
+		}
+	}
+	return objects, false, nil
+}
+
+func collectStagedLocalObjects(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime) (map[string]struct{}, bool, error) {
+	out, err := gitCommandOutput(ctx, "--git-dir", gitDir, "ls-files", "-s", "-z")
+	if err != nil {
+		return nil, false, err
+	}
+	type stagedBlob struct {
+		oid  string
+		path string
+	}
+	var staged []stagedBlob
+	for _, rec := range bytes.Split(out, []byte{0}) {
+		if len(rec) == 0 {
+			continue
+		}
+		tab := bytes.IndexByte(rec, '\t')
+		if tab < 0 {
+			continue
+		}
+		meta := strings.Fields(string(rec[:tab]))
+		if len(meta) < 3 {
+			continue
+		}
+		stage := meta[2]
+		if stage != "0" {
+			continue
+		}
+		oid := meta[1]
+		rel := string(rec[tab+1:])
+		if n, ok := rt.cleanNode(rel); ok && strings.EqualFold(n.ObjectSHA, oid) {
+			continue
+		}
+		staged = append(staged, stagedBlob{oid: oid, path: rel})
+	}
+	if len(staged) == 0 {
+		return nil, false, nil
+	}
+	ids := make([]string, 0, len(staged))
+	for _, blob := range staged {
+		ids = append(ids, blob.oid)
+	}
+	info, err := gitObjectInfoBatch(ctx, gitDir, ids)
+	if err != nil {
+		return nil, false, err
+	}
+	objects := make(map[string]struct{})
+	for _, blob := range staged {
+		object := info[blob.oid]
+		if object.typ == "blob" && object.size > gitLocalObjectMaxBlobBytes {
+			return nil, true, nil
+		}
+		objects[blob.oid] = struct{}{}
+	}
+	return objects, false, nil
+}
+
+func gitObjectInfoBatch(ctx context.Context, gitDir string, ids []string) (map[string]gitObjectInfo, error) {
+	out := make(map[string]gitObjectInfo, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+	cmd.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("git cat-file --batch-check: %w: %s", err, msg)
+		}
+		return nil, fmt.Errorf("git cat-file --batch-check: %w", err)
+	}
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		size, err := strconv.ParseInt(fields[2], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parse git object size for %s: %w", fields[0], err)
+		}
+		out[fields[0]] = gitObjectInfo{typ: fields[1], size: size}
+	}
+	return out, nil
+}
+
+func packGitObjects(ctx context.Context, gitDir string, objects map[string]struct{}) ([]byte, error) {
+	if len(objects) == 0 {
+		return nil, nil
+	}
+	ids := mapKeys(objects)
+	sort.Strings(ids)
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "pack-objects", "--stdout")
+	cmd.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("git pack-objects: %w: %s", err, msg)
+		}
+		return nil, fmt.Errorf("git pack-objects: %w", err)
+	}
+	return stdout.Bytes(), nil
+}
+
+func mergeObjectSets(sets ...map[string]struct{}) map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, set := range sets {
+		for oid := range set {
+			out[oid] = struct{}{}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func mapKeys(m map[string]struct{}) []string {
+	keys := make([]string, 0, len(m))
+	for key := range m {
+		keys = append(keys, key)
+	}
+	return keys
+}
+
+func gitCommandOutput(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
+		}
+		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	return out, nil
+}
+
+func archiveLocalGitStateForCheckpoint(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime, sanitize gitCheckpointSanitization) ([]byte, error) {
+	if !sanitize.resetIndex && !sanitize.dropLocalRefs {
+		return archiveLocalGitStateDir(gitDir)
+	}
+	content, err := archiveLocalGitStateDir(gitDir)
+	if err != nil {
+		return nil, err
+	}
+	tmp, err := os.MkdirTemp(filepath.Dir(gitDir), ".drive9-git-state-*")
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+	if err := extractGitArchive(content, tmp); err != nil {
+		return nil, err
+	}
+	if sanitize.resetIndex {
+		if err := writeBaseGitIndex(ctx, gitDir, tmp, rt.workspace.HeadCommit); err != nil {
+			return nil, err
+		}
+	}
+	if sanitize.dropLocalRefs {
+		if err := resetLocalGitRefs(tmp, rt.workspace.HeadCommit); err != nil {
+			return nil, err
+		}
+	}
+	return archiveLocalGitDir(tmp)
+}
+
+func writeBaseGitIndex(ctx context.Context, sourceGitDir, stateDir, commit string) error {
+	if strings.TrimSpace(commit) == "" {
+		return os.Remove(filepath.Join(stateDir, "index"))
+	}
+	indexPath := filepath.Join(stateDir, "index")
+	tmpIndex := filepath.Join(stateDir, "index.drive9-base")
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", sourceGitDir, "read-tree", "--index-output="+tmpIndex, commit)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return fmt.Errorf("git read-tree base index: %w: %s", err, msg)
+		}
+		return fmt.Errorf("git read-tree base index: %w", err)
+	}
+	return os.Rename(tmpIndex, indexPath)
+}
+
+func resetLocalGitRefs(stateDir, commit string) error {
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		return nil
+	}
+	headPath := filepath.Join(stateDir, "HEAD")
+	head, err := os.ReadFile(headPath)
+	if err != nil {
+		return err
+	}
+	headText := strings.TrimSpace(string(head))
+	if strings.HasPrefix(headText, "ref: ") {
+		refName := strings.TrimSpace(strings.TrimPrefix(headText, "ref: "))
+		if strings.HasPrefix(refName, "refs/heads/") {
+			if err := os.RemoveAll(filepath.Join(stateDir, "refs", "heads")); err != nil {
+				return err
+			}
+			refPath := filepath.Join(stateDir, filepath.FromSlash(refName))
+			if err := os.MkdirAll(filepath.Dir(refPath), 0o755); err != nil {
+				return err
+			}
+			if err := os.WriteFile(refPath, []byte(commit+"\n"), 0o644); err != nil {
+				return err
+			}
+		}
+	} else if err := os.WriteFile(headPath, []byte(commit+"\n"), 0o644); err != nil {
+		return err
+	}
+	_ = os.RemoveAll(filepath.Join(stateDir, "logs"))
+	_ = os.Remove(filepath.Join(stateDir, "refs", "stash"))
+	return filterPackedRefs(stateDir)
+}
+
+func filterPackedRefs(stateDir string) error {
+	packedPath := filepath.Join(stateDir, "packed-refs")
+	content, err := os.ReadFile(packedPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var out []string
+	for _, line := range strings.Split(string(content), "\n") {
+		if strings.Contains(line, " refs/heads/") || strings.Contains(line, " refs/stash") {
+			continue
+		}
+		out = append(out, line)
+	}
+	return os.WriteFile(packedPath, []byte(strings.Join(out, "\n")), 0o644)
 }
 
 func archiveLocalGitDir(gitDir string) ([]byte, error) {

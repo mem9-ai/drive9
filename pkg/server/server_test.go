@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -15,6 +17,7 @@ import (
 
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
+	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
@@ -213,6 +216,75 @@ func TestReadInlineNoRedirect(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if string(body) != "tiny" {
 		t.Errorf("body=%q, want 'tiny'", body)
+	}
+}
+
+func TestGitObjectPackAPIRoundTrip(t *testing.T) {
+	s := newTestServer(t)
+	initServerGitObjectPackTestSchema(t, s)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	c := client.New(ts.URL, "")
+	ctx := context.Background()
+	workspaceID := "ws1"
+
+	content := []byte("small inline pack")
+	sum := sha256.Sum256(content)
+	wantPackID := hex.EncodeToString(sum[:])
+	pack, err := c.PutGitObjectPack(ctx, workspaceID, client.GitObjectPackRequest{Content: content})
+	if err != nil {
+		t.Fatalf("PutGitObjectPack: %v", err)
+	}
+	if pack.PackID != wantPackID || pack.ChecksumSHA256 != wantPackID {
+		t.Fatalf("pack ids = %q/%q, want %q", pack.PackID, pack.ChecksumSHA256, wantPackID)
+	}
+	if pack.SizeBytes != int64(len(content)) {
+		t.Fatalf("pack size = %d, want %d", pack.SizeBytes, len(content))
+	}
+	if len(pack.Content) != 0 {
+		t.Fatalf("upsert response included content, want metadata only")
+	}
+
+	packs, err := c.ListGitObjectPacks(ctx, workspaceID)
+	if err != nil {
+		t.Fatalf("ListGitObjectPacks: %v", err)
+	}
+	if len(packs) != 1 || packs[0].PackID != wantPackID {
+		t.Fatalf("packs = %+v, want one pack %s", packs, wantPackID)
+	}
+	if len(packs[0].Content) != 0 {
+		t.Fatalf("list response included content, want metadata only")
+	}
+
+	downloaded, err := c.GetGitObjectPack(ctx, workspaceID, wantPackID)
+	if err != nil {
+		t.Fatalf("GetGitObjectPack: %v", err)
+	}
+	if string(downloaded.Content) != string(content) {
+		t.Fatalf("downloaded content = %q, want %q", downloaded.Content, content)
+	}
+}
+
+func initServerGitObjectPackTestSchema(t *testing.T, s *Server) {
+	t.Helper()
+	db := s.fallback.Store().DB()
+	stmts := []string{
+		`CREATE TABLE IF NOT EXISTS git_workspace_object_packs (
+			workspace_id    VARCHAR(64) NOT NULL,
+			pack_id         VARCHAR(64) NOT NULL,
+			checksum_sha256 VARCHAR(128) NOT NULL DEFAULT '',
+			size_bytes      BIGINT NOT NULL DEFAULT 0,
+			content_blob    LONGBLOB,
+			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (workspace_id, pack_id)
+		)`,
+		`CREATE INDEX idx_git_object_packs_created ON git_workspace_object_packs(workspace_id, created_at)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

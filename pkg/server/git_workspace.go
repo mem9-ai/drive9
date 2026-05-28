@@ -1,6 +1,8 @@
 package server
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ const (
 	maxGitWorkspaceBodyBytes = 4 << 20
 	maxGitTreeBodyBytes      = 128 << 20
 	maxGitBlobBodyBytes      = 512 << 20
+	maxGitObjectPackBytes    = 256 << 20
 )
 
 type gitWorkspaceRequest struct {
@@ -83,6 +86,19 @@ type gitStateResponse struct {
 	Content          []byte    `json:"content,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
+}
+
+type gitObjectPackRequest struct {
+	Content []byte `json:"content"`
+}
+
+type gitObjectPackResponse struct {
+	WorkspaceID    string    `json:"workspace_id"`
+	PackID         string    `json:"pack_id"`
+	ChecksumSHA256 string    `json:"checksum_sha256"`
+	SizeBytes      int64     `json:"size_bytes"`
+	Content        []byte    `json:"content,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 type gitOverlayEntryRequest struct {
@@ -292,6 +308,36 @@ func (s *Server) handleGitWorkspaceObject(w http.ResponseWriter, r *http.Request
 		default:
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
+	case sub == "object-packs":
+		switch r.Method {
+		case http.MethodGet:
+			packs, err := store.ListGitObjectPacks(r.Context(), workspaceID)
+			if err != nil {
+				writeGitWorkspaceStoreError(w, err)
+				return
+			}
+			out := make([]gitObjectPackResponse, 0, len(packs))
+			for i := range packs {
+				out = append(out, toGitObjectPackResponse(&packs[i], false))
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"packs": out})
+		case http.MethodPost, http.MethodPut:
+			s.handleGitObjectPackUpsert(w, r, store, workspaceID)
+		default:
+			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+	case strings.HasPrefix(sub, "object-packs/"):
+		if r.Method != http.MethodGet {
+			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		packID, err := url.PathUnescape(strings.TrimPrefix(sub, "object-packs/"))
+		if err != nil || packID == "" {
+			errJSON(w, http.StatusBadRequest, "invalid object pack id")
+			return
+		}
+		s.handleGitObjectPackGet(w, r, store, workspaceID, packID)
 	case sub == "overlay":
 		switch r.Method {
 		case http.MethodGet:
@@ -318,6 +364,64 @@ func (s *Server) handleGitWorkspaceObject(w http.ResponseWriter, r *http.Request
 	default:
 		errJSON(w, http.StatusNotFound, "not found")
 	}
+}
+
+func (s *Server) handleGitObjectPackUpsert(w http.ResponseWriter, r *http.Request, store *datastore.Store, workspaceID string) {
+	defer func() { _ = r.Body.Close() }()
+	var req gitObjectPackRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxGitBlobBodyBytes)).Decode(&req); err != nil {
+		errJSON(w, http.StatusBadRequest, "malformed JSON")
+		return
+	}
+	if len(req.Content) == 0 {
+		errJSON(w, http.StatusBadRequest, "content is required")
+		return
+	}
+	if len(req.Content) > maxGitObjectPackBytes {
+		errJSON(w, http.StatusRequestEntityTooLarge, "git object pack exceeds inline limit")
+		return
+	}
+	sum := sha256.Sum256(req.Content)
+	packID := hex.EncodeToString(sum[:])
+	pack := datastore.GitObjectPack{
+		WorkspaceID:    workspaceID,
+		PackID:         packID,
+		ChecksumSHA256: packID,
+		SizeBytes:      int64(len(req.Content)),
+		ContentBlob:    req.Content,
+	}
+	if err := store.UpsertGitObjectPack(r.Context(), pack); err != nil {
+		writeGitWorkspaceStoreError(w, err)
+		return
+	}
+	stored, err := store.GetGitObjectPack(r.Context(), workspaceID, packID)
+	if err != nil {
+		writeGitWorkspaceStoreError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(toGitObjectPackResponse(stored, false))
+}
+
+func (s *Server) handleGitObjectPackGet(w http.ResponseWriter, r *http.Request, store *datastore.Store, workspaceID, packID string) {
+	if len(packID) != 64 {
+		errJSON(w, http.StatusBadRequest, "object pack id must be a 64 character sha256")
+		return
+	}
+	for _, ch := range packID {
+		if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F') {
+			continue
+		}
+		errJSON(w, http.StatusBadRequest, "object pack id must be hexadecimal")
+		return
+	}
+	pack, err := store.GetGitObjectPack(r.Context(), workspaceID, strings.ToLower(packID))
+	if err != nil {
+		writeGitWorkspaceStoreError(w, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(toGitObjectPackResponse(pack, true))
 }
 
 func (s *Server) handleGitTreeReplace(w http.ResponseWriter, r *http.Request, store *datastore.Store, workspaceID string) {
@@ -629,6 +733,20 @@ func toGitStateResponse(state *datastore.GitState) gitStateResponse {
 		CreatedAt:        state.CreatedAt,
 		UpdatedAt:        state.UpdatedAt,
 	}
+}
+
+func toGitObjectPackResponse(pack *datastore.GitObjectPack, includeContent bool) gitObjectPackResponse {
+	out := gitObjectPackResponse{
+		WorkspaceID:    pack.WorkspaceID,
+		PackID:         pack.PackID,
+		ChecksumSHA256: pack.ChecksumSHA256,
+		SizeBytes:      pack.SizeBytes,
+		CreatedAt:      pack.CreatedAt,
+	}
+	if includeContent {
+		out.Content = pack.ContentBlob
+	}
+	return out
 }
 
 func toGitOverlayEntryResponse(entry *datastore.GitOverlayEntry) gitOverlayEntryResponse {

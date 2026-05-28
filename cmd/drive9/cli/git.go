@@ -56,8 +56,8 @@ func gitUsage() {
 	fmt.Fprintf(os.Stderr, `usage: drive9 git <command> [arguments]
 
 commands:
-  clone --fast <repo-url> <mounted-path>
-                       create a full local .git and register the HEAD tree
+  clone --fast [--blobless] <repo-url> <mounted-path>
+                       create a local .git and register the HEAD tree
 
 global:
   -h, --help, help     show this help
@@ -67,8 +67,9 @@ global:
 func gitClone(args []string) error {
 	fs := flag.NewFlagSet("git clone", flag.ContinueOnError)
 	fast := fs.Bool("fast", false, "use drive9 git fast clone")
+	blobless := fs.Bool("blobless", false, "use a blobless partial local .git; clean blobs lazy-fetch from the remote")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 git clone --fast <repo-url> <mounted-path>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: drive9 git clone --fast [--blobless] <repo-url> <mounted-path>\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -89,8 +90,9 @@ func gitClone(args []string) error {
 		return err
 	}
 
-	if err := runGitStreaming("clone", "--no-checkout", repoURL, target); err != nil {
-		return fmt.Errorf("git clone --no-checkout: %w", err)
+	cloneArgs := gitFastCloneArgs(repoURL, target, *blobless)
+	if err := runGitStreaming(cloneArgs...); err != nil {
+		return fmt.Errorf("git %s: %w", strings.Join(cloneArgs, " "), err)
 	}
 	head, err := gitOutput(target, "rev-parse", "HEAD")
 	if err != nil {
@@ -123,6 +125,10 @@ func gitClone(args []string) error {
 		return err
 	}
 
+	mode := "fast"
+	if *blobless {
+		mode = "fast-blobless"
+	}
 	c := NewFromEnv()
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
@@ -132,7 +138,7 @@ func gitClone(args []string) error {
 		BranchName: branch,
 		BaseCommit: head,
 		HeadCommit: head,
-		Mode:       "fast",
+		Mode:       mode,
 	})
 	cancel()
 	if err != nil {
@@ -175,6 +181,15 @@ func gitClone(args []string) error {
 
 	fmt.Fprintf(os.Stderr, "drive9: registered git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, resolved.RemotePath, len(nodes))
 	return nil
+}
+
+func gitFastCloneArgs(repoURL, target string, blobless bool) []string {
+	args := []string{"clone"}
+	if blobless {
+		args = append(args, "--filter=blob:none")
+	}
+	args = append(args, "--no-checkout", repoURL, target)
+	return args
 }
 
 func initializeFastCloneIndex(repoDir, commitSHA string) error {

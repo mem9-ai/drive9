@@ -3,12 +3,15 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -21,8 +24,10 @@ import (
 type gitWorkspaceFixture struct {
 	mu              sync.Mutex
 	overlay         map[string]client.GitOverlayEntry
+	objectPacks     map[string]client.GitObjectPack
 	state           []byte
 	stateStorage    string
+	mode            string
 	server          *httptest.Server
 	repoURL         string
 	treeNodes       []client.GitTreeNode
@@ -34,7 +39,9 @@ func newGitWorkspaceFixture(t *testing.T) *gitWorkspaceFixture {
 	t.Helper()
 	f := &gitWorkspaceFixture{
 		overlay:         make(map[string]client.GitOverlayEntry),
+		objectPacks:     make(map[string]client.GitObjectPack),
 		stateStorage:    "tar.gz",
+		mode:            "fast",
 		repoURL:         "https://example.test/repo.git",
 		readmeObjectSHA: "2222222222222222222222222222222222222222",
 		readmeSize:      12,
@@ -60,7 +67,7 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 			BranchName:  "main",
 			BaseCommit:  "1111111111111111111111111111111111111111",
 			HeadCommit:  "1111111111111111111111111111111111111111",
-			Mode:        "fast",
+			Mode:        f.mode,
 			Status:      "active",
 			CreatedAt:   time.Now(),
 			UpdatedAt:   time.Now(),
@@ -83,6 +90,8 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"nodes": nodes})
 	case r.URL.Path == "/v1/git-workspaces/ws1/overlay":
 		f.handleOverlay(w, r)
+	case strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/ws1/object-packs"):
+		f.handleObjectPacks(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/git-workspaces/ws1/git-state":
 		_ = json.NewEncoder(w).Encode(client.GitState{
 			WorkspaceID:      "ws1",
@@ -94,6 +103,50 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+	}
+}
+
+func (f *gitWorkspaceFixture) handleObjectPacks(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	prefix := "/v1/git-workspaces/ws1/object-packs"
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == prefix:
+		packs := make([]client.GitObjectPack, 0, len(f.objectPacks))
+		for _, pack := range f.objectPacks {
+			pack.Content = nil
+			packs = append(packs, pack)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"packs": packs})
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, prefix+"/"):
+		packID := strings.TrimPrefix(r.URL.Path, prefix+"/")
+		pack, ok := f.objectPacks[packID]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(pack)
+	case r.Method == http.MethodPost && r.URL.Path == prefix:
+		var req client.GitObjectPackRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		sum := sha256.Sum256(req.Content)
+		packID := hex.EncodeToString(sum[:])
+		pack := client.GitObjectPack{
+			WorkspaceID:    "ws1",
+			PackID:         packID,
+			ChecksumSHA256: packID,
+			SizeBytes:      int64(len(req.Content)),
+			Content:        req.Content,
+			CreatedAt:      time.Now(),
+		}
+		f.objectPacks[packID] = pack
+		_ = json.NewEncoder(w).Encode(pack)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
@@ -347,6 +400,129 @@ func TestGitWorkspaceObjectlessStateRestoresObjectsFromRemote(t *testing.T) {
 	}
 }
 
+func TestBuildLocalGitObjectPackPreservesSmallStagedBlob(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	src := createGitRepoWithReadme(t, []byte("hello base\n"))
+	work := filepath.Join(t.TempDir(), "work")
+	runFuseTestGit(t, "", "clone", src, work)
+	rt := gitRuntimeForRepo(t, src)
+
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("hello staged\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runFuseTestGit(t, work, "add", "README.md")
+
+	pack, sanitize, err := buildLocalGitObjectPack(context.Background(), filepath.Join(work, ".git"), rt)
+	if err != nil {
+		t.Fatalf("buildLocalGitObjectPack: %v", err)
+	}
+	if len(pack) == 0 {
+		t.Fatalf("pack is empty, want staged blob")
+	}
+	if sanitize.resetIndex || sanitize.dropLocalRefs {
+		t.Fatalf("sanitize = %+v, want no degradation", sanitize)
+	}
+	state, err := archiveLocalGitStateForCheckpoint(context.Background(), filepath.Join(work, ".git"), rt, sanitize)
+	if err != nil {
+		t.Fatalf("archiveLocalGitStateForCheckpoint: %v", err)
+	}
+
+	restored := filepath.Join(t.TempDir(), "restored")
+	runFuseTestGit(t, "", "clone", "--no-checkout", src, restored)
+	unpackGitPackForTest(t, filepath.Join(restored, ".git"), pack)
+	if err := extractGitArchive(state, filepath.Join(restored, ".git")); err != nil {
+		t.Fatalf("extractGitArchive: %v", err)
+	}
+	if got := fuseGitOutputForTest(t, restored, "diff", "--cached", "--name-only"); got != "README.md" {
+		t.Fatalf("cached diff = %q, want README.md", got)
+	}
+}
+
+func TestBuildLocalGitObjectPackDowngradesOversizedStagedBlob(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	src := createGitRepoWithReadme(t, []byte("hello base\n"))
+	work := filepath.Join(t.TempDir(), "work")
+	runFuseTestGit(t, "", "clone", src, work)
+	rt := gitRuntimeForRepo(t, src)
+
+	large := bytes.Repeat([]byte("x"), int(gitLocalObjectMaxBlobBytes)+1)
+	if err := os.WriteFile(filepath.Join(work, "README.md"), large, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runFuseTestGit(t, work, "add", "README.md")
+
+	pack, sanitize, err := buildLocalGitObjectPack(context.Background(), filepath.Join(work, ".git"), rt)
+	if err != nil {
+		t.Fatalf("buildLocalGitObjectPack: %v", err)
+	}
+	if len(pack) != 0 {
+		t.Fatalf("pack len = %d, want 0 for oversized staged blob", len(pack))
+	}
+	if !sanitize.resetIndex {
+		t.Fatalf("sanitize.resetIndex = false, want true")
+	}
+	state, err := archiveLocalGitStateForCheckpoint(context.Background(), filepath.Join(work, ".git"), rt, sanitize)
+	if err != nil {
+		t.Fatalf("archiveLocalGitStateForCheckpoint: %v", err)
+	}
+
+	restored := filepath.Join(t.TempDir(), "restored")
+	runFuseTestGit(t, "", "clone", "--no-checkout", src, restored)
+	if err := extractGitArchive(state, filepath.Join(restored, ".git")); err != nil {
+		t.Fatalf("extractGitArchive: %v", err)
+	}
+	if got := fuseGitOutputForTest(t, restored, "diff", "--cached", "--name-only"); got != "" {
+		t.Fatalf("cached diff = %q, want downgraded empty index", got)
+	}
+}
+
+func TestBuildLocalGitObjectPackPreservesSmallLocalCommit(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	src := createGitRepoWithReadme(t, []byte("hello base\n"))
+	work := filepath.Join(t.TempDir(), "work")
+	runFuseTestGit(t, "", "clone", src, work)
+	runFuseTestGit(t, work, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, work, "config", "user.name", "Drive9 Test")
+	rt := gitRuntimeForRepo(t, src)
+
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("hello commit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runFuseTestGit(t, work, "add", "README.md")
+	runFuseTestGit(t, work, "commit", "-m", "local commit")
+
+	pack, sanitize, err := buildLocalGitObjectPack(context.Background(), filepath.Join(work, ".git"), rt)
+	if err != nil {
+		t.Fatalf("buildLocalGitObjectPack: %v", err)
+	}
+	if len(pack) == 0 {
+		t.Fatalf("pack is empty, want local commit objects")
+	}
+	if sanitize.dropLocalRefs {
+		t.Fatalf("sanitize.dropLocalRefs = true, want false")
+	}
+	state, err := archiveLocalGitStateForCheckpoint(context.Background(), filepath.Join(work, ".git"), rt, sanitize)
+	if err != nil {
+		t.Fatalf("archiveLocalGitStateForCheckpoint: %v", err)
+	}
+
+	restored := filepath.Join(t.TempDir(), "restored")
+	runFuseTestGit(t, "", "clone", "--no-checkout", src, restored)
+	unpackGitPackForTest(t, filepath.Join(restored, ".git"), pack)
+	if err := extractGitArchive(state, filepath.Join(restored, ".git")); err != nil {
+		t.Fatalf("extractGitArchive: %v", err)
+	}
+	if got := fuseGitOutputForTest(t, restored, "log", "-1", "--pretty=%s"); got != "local commit" {
+		t.Fatalf("restored HEAD subject = %q, want local commit", got)
+	}
+}
+
 func TestGitWorkspaceTrackedLocalOnlyPathBypassesLocalOverlay(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	fixture.treeNodes = []client.GitTreeNode{
@@ -461,6 +637,38 @@ func TestGitWorkspaceUnknownSizeWritableOpenPreservesBaseContent(t *testing.T) {
 	want := append(append([]byte{}, content...), appendix...)
 	if !bytes.Equal(entry.Content, want) {
 		t.Fatalf("overlay content = %q, want %q", entry.Content, want)
+	}
+}
+
+func gitRuntimeForRepo(t *testing.T, repo string) *gitWorkspaceRuntime {
+	t.Helper()
+	head := fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
+	readmeSHA := fuseGitOutputForTest(t, repo, "hash-object", "README.md")
+	return &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			RemoteName:  "origin",
+			HeadCommit:  head,
+		},
+		nodes: map[string]client.GitTreeNode{
+			"README.md": {
+				Path:      "README.md",
+				Kind:      "file",
+				Mode:      "100644",
+				ObjectSHA: readmeSHA,
+				SizeBytes: 11,
+			},
+		},
+	}
+}
+
+func unpackGitPackForTest(t *testing.T, gitDir string, pack []byte) {
+	t.Helper()
+	cmd := exec.Command("git", "--git-dir", gitDir, "unpack-objects", "-q")
+	cmd.Stdin = bytes.NewReader(pack)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git unpack-objects: %v\n%s", err, out)
 	}
 }
 
