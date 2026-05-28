@@ -124,10 +124,6 @@ func (fs *Dat9FS) observePathPolicy(localPath string) PathLayer {
 	return fs.observePathPolicyWithHint(context.TODO(), localPath, false)
 }
 
-func (fs *Dat9FS) observeDirPathPolicy(localPath string) PathLayer {
-	return fs.observePathPolicyWithHint(context.TODO(), localPath, true)
-}
-
 func (fs *Dat9FS) observePathPolicyWithContext(ctx context.Context, localPath string) PathLayer {
 	return fs.observePathPolicyWithHint(ctx, localPath, false)
 }
