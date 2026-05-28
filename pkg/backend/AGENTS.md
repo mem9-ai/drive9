@@ -32,7 +32,7 @@ Central type: `Dat9Backend`. ~24 non-test Go files, ~16K lines, flat `package ba
 
 - **Ctx/non-Ctx pairs**: Every FS op has `FooCtx(ctx, ...)` and `Foo(...)` (background ctx). Non-Ctx variants satisfy AGFS interface.
 - **observeBackend timer/defer**: Every exported method starts with `start := time.Now(); defer func() { observeBackend(ctx, op, err, start) }()`.
-- **Durable outbox**: Quota mutations go through `applyLoggedQuotaMutation()` -- write mutation log in same tx, then apply. Background `MutationReplayWorker` retries failures.
+- **Durable quota outbox**: Quota mutations go through `applyLoggedQuotaMutation()` -- insert the durable mutation log first, then use one transaction to apply the mutation and mark the log applied. Background `MutationReplayWorker` retries unapplied logs.
 - **Fail-open quotas**: When server DB unreachable, operations proceed silently. Convergence via replay worker + reconciliation.
 - **Interface injection via setter**: `MetaQuotaStore` set via `SetMetaQuotaStore()` after construction to avoid circular dep with `meta` package.
 - **Pluggable extractors**: `ImageTextExtractor` and `AudioTextExtractor` are interface fields. Use `NewFallbackImageTextExtractor` for primary+fallback composition.
@@ -44,7 +44,7 @@ Central type: `Dat9Backend`. ~24 non-test Go files, ~16K lines, flat `package ba
 ## Quota architecture
 
 Two sources: tenant-DB (legacy) vs server-DB (Rev 4). Switchable via `QuotaSource`.
-Per-operation: check tenant-DB first, optionally verify server-DB, apply mutation log, optionally sync to server.
+Per-operation checks dispatch by `QuotaSource`: `tenant` uses tenant-DB quota checks; `server` uses central quota/reservations and skips tenant-DB upload checks after the server-reserve-first saga. Small server-quota writes use `ensureStorageQuotaServer`; mutation logs converge central counters.
 Upload reservations use a server-first saga: reserve -> upload -> complete/abort on server.
 
 ## Key types

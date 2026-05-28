@@ -21,7 +21,7 @@ FUSE mount implementation using go-fuse/v2 RawFileSystem. Two filesystems: **Dat
 
 | Mode | Trigger | Upload path |
 |---|---|---|
-| Small file | <50KB | Direct PUT after close/debounce |
+| Small file | Below negotiated server inline threshold | Direct PUT after close/debounce |
 | Sequential append | New appending file | Streaming v2 multipart during Write() |
 | Non-sequential new | Back-write detected | Shadow spill + async upload |
 | Existing edit | Opened w/o truncate | Dirty part PATCH at flush |
@@ -30,7 +30,7 @@ FUSE mount implementation using go-fuse/v2 RawFileSystem. Two filesystems: **Dat
 
 Write() → ShadowStore (disk) → PendingIndex (in-memory) → Journal (WAL, CRC32) → CommitQueue (async upload + backoff).
 
-Recovery order on startup: Journal.Replay → PendingIndex.RecoverFromDisk → CommitQueue.RecoverPending.
+Recovery order on startup: PendingIndex.RecoverFromDisk → Journal.Replay → CommitQueue.RecoverPending.
 
 ## Read priority chain (9-step cascade)
 
