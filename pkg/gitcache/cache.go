@@ -355,8 +355,11 @@ func extractCodeloadTar(r io.Reader, dst string) (int64, int64, error) {
 			return files, bytes, err
 		}
 		rel, ok, err := stripCodeloadRoot(hdr.Name)
-		if err != nil || !ok {
+		if err != nil {
 			return files, bytes, err
+		}
+		if !ok {
+			continue
 		}
 		target := filepath.Join(dst, filepath.FromSlash(rel))
 		if !strings.HasPrefix(target, dst+string(filepath.Separator)) && target != dst {

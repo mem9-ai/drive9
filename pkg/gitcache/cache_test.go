@@ -46,6 +46,48 @@ func TestExtractCodeloadTarRejectsTraversal(t *testing.T) {
 	}
 }
 
+func TestExtractCodeloadTarSkipsRootDirectory(t *testing.T) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "repo-abc/", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: "repo-abc/README.md", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len("hello\n"))}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("hello\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	zr, err := gzip.NewReader(bytes.NewReader(buf.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = zr.Close() }()
+
+	dst := t.TempDir()
+	files, bytesWritten, err := extractCodeloadTar(zr, dst)
+	if err != nil {
+		t.Fatalf("extractCodeloadTar: %v", err)
+	}
+	if files != 1 || bytesWritten != int64(len("hello\n")) {
+		t.Fatalf("extractCodeloadTar stats = files %d bytes %d, want 1/%d", files, bytesWritten, len("hello\n"))
+	}
+	got, err := os.ReadFile(filepath.Join(dst, "README.md"))
+	if err != nil {
+		t.Fatalf("read extracted README: %v", err)
+	}
+	if string(got) != "hello\n" {
+		t.Fatalf("README content = %q, want hello", got)
+	}
+}
+
 func TestReadTreeFileReadsSymlinkTarget(t *testing.T) {
 	localRoot := t.TempDir()
 	root := TreeRoot(localRoot, "ws1", "commit1")
