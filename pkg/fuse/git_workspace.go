@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"path"
@@ -24,13 +25,15 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/gitcache"
 )
 
 const gitCheckpointTimeout = 2 * time.Minute
+const gitWorkspaceHydrateTimeout = 30 * time.Minute
 const gitWorkspaceRefreshInterval = time.Second
 const gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
 const gitWorkspaceModeFastBlobless = "fast-blobless"
-const gitLocalObjectMaxBlobBytes int64 = 16 << 20
+const gitLocalObjectMaxBlobBytes int64 = 5 << 20
 const gitLocalObjectMaxPackBytes int64 = 256 << 20
 
 type gitWorkspaceLayer struct {
@@ -39,6 +42,9 @@ type gitWorkspaceLayer struct {
 	loaded     bool
 	loadedAt   time.Time
 	workspaces []*gitWorkspaceRuntime
+
+	materialize    map[string]*gitMaterializeCall
+	hydrateStarted map[string]struct{}
 }
 
 type gitWorkspaceRuntime struct {
@@ -50,8 +56,17 @@ type gitWorkspaceRuntime struct {
 	restored  bool
 }
 
+type gitMaterializeCall struct {
+	done chan struct{}
+	data []byte
+	err  error
+}
+
 func newGitWorkspaceLayer() *gitWorkspaceLayer {
-	return &gitWorkspaceLayer{}
+	return &gitWorkspaceLayer{
+		materialize:    make(map[string]*gitMaterializeCall),
+		hydrateStarted: make(map[string]struct{}),
+	}
 }
 
 func (fs *Dat9FS) ensureGitWorkspaces(ctx context.Context) error {
@@ -115,6 +130,10 @@ func (fs *Dat9FS) ensureGitWorkspaces(ctx context.Context) error {
 	fs.git.loaded = true
 	fs.git.loadedAt = time.Now()
 	fs.git.mu.Unlock()
+
+	for _, rt := range loaded {
+		fs.maybeStartGitWorkspaceHydrate(rt)
+	}
 	return nil
 }
 
@@ -428,19 +447,135 @@ func (fs *Dat9FS) readGitFile(ctx context.Context, localPath string, offset, siz
 	if n.Kind == "dir" || n.Kind == "submodule" {
 		return nil, syscall.EISDIR
 	}
+	return fs.readGitCleanFile(ctx, rt, rel, n, offset, size)
+}
+
+func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime, rel string, n client.GitTreeNode, offset, size int64) ([]byte, error) {
+	if fs.perfEnabled() {
+		fs.perf.gitCleanReadCount.add(1)
+	}
+	if localRoot := strings.TrimSpace(fs.opts.LocalRoot); localRoot != "" {
+		data, hit, err := gitcache.ReadTreeFile(localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, rel, offset, size)
+		if err != nil {
+			return nil, err
+		}
+		if hit {
+			if fs.perfEnabled() {
+				fs.perf.gitCleanTreeHit.add(1)
+			}
+			return data, nil
+		}
+		data, hit, err = gitcache.ReadBlob(localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, n.ObjectSHA, offset, size)
+		if err != nil {
+			return nil, err
+		}
+		if hit {
+			if fs.perfEnabled() {
+				fs.perf.gitCleanBlobCacheHit.add(1)
+			}
+			return data, nil
+		}
+	}
+	if fs.perfEnabled() {
+		fs.perf.gitCleanCacheMiss.add(1)
+	}
+	data, err := fs.materializeGitBlob(ctx, rt, n.ObjectSHA)
+	if err != nil {
+		return nil, err
+	}
+	return sliceRead(data, offset, size), nil
+}
+
+func (fs *Dat9FS) materializeGitBlob(ctx context.Context, rt *gitWorkspaceRuntime, objectSHA string) ([]byte, error) {
+	if fs == nil || fs.git == nil || rt == nil {
+		return nil, os.ErrNotExist
+	}
+	key := rt.workspace.WorkspaceID + ":" + rt.workspace.HeadCommit + ":" + objectSHA
+	fs.git.mu.Lock()
+	if fs.git.materialize == nil {
+		fs.git.materialize = make(map[string]*gitMaterializeCall)
+	}
+	if call, ok := fs.git.materialize[key]; ok {
+		fs.git.mu.Unlock()
+		select {
+		case <-call.done:
+			return call.data, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &gitMaterializeCall{done: make(chan struct{})}
+	fs.git.materialize[key] = call
+	fs.git.mu.Unlock()
+
+	call.data, call.err = fs.materializeGitBlobOnce(ctx, rt, objectSHA)
+	close(call.done)
+
+	fs.git.mu.Lock()
+	delete(fs.git.materialize, key)
+	fs.git.mu.Unlock()
+	return call.data, call.err
+}
+
+func (fs *Dat9FS) materializeGitBlobOnce(ctx context.Context, rt *gitWorkspaceRuntime, objectSHA string) ([]byte, error) {
+	if localRoot := strings.TrimSpace(fs.opts.LocalRoot); localRoot != "" {
+		data, hit, err := gitcache.ReadBlob(localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, objectSHA, 0, -1)
+		if err != nil {
+			return nil, err
+		}
+		if hit {
+			if fs.perfEnabled() {
+				fs.perf.gitCleanBlobCacheHit.add(1)
+			}
+			return data, nil
+		}
+	}
+	data, err := fs.gitCatFileBlob(ctx, rt, objectSHA)
+	if err != nil {
+		return nil, err
+	}
+	if localRoot := strings.TrimSpace(fs.opts.LocalRoot); localRoot != "" {
+		if err := gitcache.WriteBlob(localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, objectSHA, data); err != nil {
+			return nil, err
+		}
+	}
+	return data, nil
+}
+
+func (fs *Dat9FS) gitCatFileBlob(ctx context.Context, rt *gitWorkspaceRuntime, objectSHA string) ([]byte, error) {
 	if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
 		return nil, err
+	}
+	if fs.localOverlay == nil {
+		return nil, syscall.EIO
 	}
 	gitDir, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git"))
 	if err != nil {
 		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "cat-file", "blob", n.ObjectSHA)
+	start := time.Now()
+	if fs.perfEnabled() {
+		fs.perf.gitCatFileCount.add(1)
+	}
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "cat-file", "blob", objectSHA)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	data, err := cmd.Output()
+	dur := time.Since(start)
+	if fs.perfEnabled() {
+		fs.perf.gitCatFileTotalNS.add(uint64(dur))
+		if dur >= 50*time.Millisecond {
+			fs.perf.gitCatFileSlowCount.add(1)
+		}
+	}
 	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("git cat-file blob %s: %w: %s", objectSHA, err, msg)
+		}
 		return nil, err
 	}
-	return sliceRead(data, offset, size), nil
+	return data, nil
 }
 
 func sliceRead(data []byte, offset, size int64) []byte {
@@ -603,6 +738,88 @@ func (fs *Dat9FS) ensureGitStateForLocalPath(ctx context.Context, localPath stri
 		return fs.ensureGitStateRestored(ctx, rt)
 	}
 	return nil
+}
+
+func (fs *Dat9FS) maybeStartGitWorkspaceHydrate(rt *gitWorkspaceRuntime) {
+	if fs == nil || fs.git == nil || rt == nil || rt.workspace.Mode != gitWorkspaceModeFastBlobless {
+		return
+	}
+	if strings.TrimSpace(fs.opts.LocalRoot) == "" {
+		return
+	}
+	key := gitWorkspaceCacheKey(rt)
+	fs.git.mu.Lock()
+	if fs.git.hydrateStarted == nil {
+		fs.git.hydrateStarted = make(map[string]struct{})
+	}
+	if _, ok := fs.git.hydrateStarted[key]; ok {
+		fs.git.mu.Unlock()
+		return
+	}
+	fs.git.hydrateStarted[key] = struct{}{}
+	fs.git.mu.Unlock()
+
+	go fs.runGitWorkspaceHydrate(rt)
+}
+
+func gitWorkspaceCacheKey(rt *gitWorkspaceRuntime) string {
+	if rt == nil {
+		return ""
+	}
+	return rt.workspace.WorkspaceID + ":" + rt.workspace.HeadCommit
+}
+
+func (fs *Dat9FS) runGitWorkspaceHydrate(rt *gitWorkspaceRuntime) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceHydrateTimeout)
+	defer cancel()
+	if fs.perfEnabled() {
+		fs.perf.gitHydrateStart.add(1)
+	}
+
+	gitDir := ""
+	if fs.localOverlay != nil {
+		if p, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git")); err == nil {
+			gitDir = p
+		}
+	}
+	if _, ok := gitcache.ParseGitHubRepoURL(rt.workspace.RepoURL); !ok {
+		if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
+			if fs.perfEnabled() {
+				fs.perf.gitHydrateFailure.add(1)
+			}
+			log.Printf("git workspace hydrate restore failed for %s: %v", rt.workspace.RootPath, err)
+			return
+		}
+	}
+	result, err := gitcache.Hydrate(ctx, gitcache.HydrateOptions{
+		LocalRoot:   fs.opts.LocalRoot,
+		WorkspaceID: rt.workspace.WorkspaceID,
+		Commit:      rt.workspace.HeadCommit,
+		RepoURL:     rt.workspace.RepoURL,
+		GitDir:      gitDir,
+		Token:       gitWorkspaceHydrateToken(rt.workspace.RepoURL),
+	})
+	if fs.perfEnabled() {
+		fs.perf.gitHydrateBytes.add(uint64(result.Bytes))
+		fs.perf.gitHydrateTotalNS.add(uint64(result.Duration))
+		if err != nil {
+			fs.perf.gitHydrateFailure.add(1)
+		} else {
+			fs.perf.gitHydrateSuccess.add(1)
+		}
+	}
+	if err != nil {
+		log.Printf("git workspace hydrate failed for %s: %v", rt.workspace.RootPath, err)
+	}
+}
+
+func gitWorkspaceHydrateToken(repoURL string) string {
+	for _, key := range []string{"GITHUB_TOKEN", "GH_TOKEN"} {
+		if token := strings.TrimSpace(os.Getenv(key)); token != "" {
+			return token
+		}
+	}
+	return ""
 }
 
 func extractGitArchive(content []byte, dst string) error {

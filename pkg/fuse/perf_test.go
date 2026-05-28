@@ -29,6 +29,17 @@ func TestFusePerfCountersSummary(t *testing.T) {
 	perf.recordLocalPolicy(policyMatchLocalOnly)
 	perf.recordLocalPolicy(policyMatchRemoteOverride)
 	perf.recordLocalPolicy(policyMatchRemoteDefault)
+	perf.gitCleanReadCount.add(3)
+	perf.gitCleanTreeHit.add(1)
+	perf.gitCleanBlobCacheHit.add(1)
+	perf.gitCleanCacheMiss.add(1)
+	perf.gitCatFileCount.add(1)
+	perf.gitCatFileSlowCount.add(1)
+	perf.gitCatFileTotalNS.add(uint64(75 * time.Millisecond))
+	perf.gitHydrateStart.add(1)
+	perf.gitHydrateSuccess.add(1)
+	perf.gitHydrateBytes.add(1024)
+	perf.gitHydrateTotalNS.add(uint64(2 * time.Second))
 
 	snap := perf.snapshot()
 	if got := snap.FuseOps["lookup"].count; got != 1 {
@@ -58,6 +69,8 @@ func TestFusePerfCountersSummary(t *testing.T) {
 		"perf uploader submit=1",
 		"perf sse change=1",
 		"perf local_policy local_only=1 remote_override=1 remote_default=1",
+		"perf git clean_read=3 tree_hit=1 blob_cache_hit=1 cache_miss=1 cat_file=1 cat_file_slow=1",
+		"hydrate_start=1 hydrate_success=1 hydrate_failure=0 hydrate_bytes=1024 hydrate_total=2s",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("summary missing %q:\n%s", want, text)

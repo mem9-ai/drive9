@@ -116,6 +116,41 @@ func TestGitFastCloneArgs(t *testing.T) {
 	}
 }
 
+func TestResolveGitHydrateMode(t *testing.T) {
+	tests := []struct {
+		name     string
+		raw      string
+		blobless bool
+		want     gitHydrateMode
+		wantErr  bool
+	}{
+		{name: "auto blobless", raw: "auto", blobless: true, want: gitHydrateModeBackground},
+		{name: "auto full", raw: "auto", blobless: false, want: gitHydrateModeOff},
+		{name: "empty blobless", raw: "", blobless: true, want: gitHydrateModeBackground},
+		{name: "off full", raw: "off", blobless: false, want: gitHydrateModeOff},
+		{name: "sync blobless", raw: "sync", blobless: true, want: gitHydrateModeSync},
+		{name: "background full", raw: "background", blobless: false, wantErr: true},
+		{name: "invalid", raw: "now", blobless: true, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := resolveGitHydrateMode(tt.raw, tt.blobless)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("resolveGitHydrateMode err = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveGitHydrateMode: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("resolveGitHydrateMode = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestGitHubTreeSizeEnrichment(t *testing.T) {
 	var gotAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

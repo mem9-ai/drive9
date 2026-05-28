@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/gitcache"
 	"github.com/mem9-ai/dat9/pkg/mountpath"
 	"github.com/mem9-ai/dat9/pkg/mountstate"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
@@ -30,6 +31,7 @@ import (
 const (
 	gitWorkspaceAPITimeout        = 2 * time.Minute
 	githubTreeAPITimeout          = 30 * time.Second
+	gitHydrateTimeout             = 30 * time.Minute
 	githubAPIBaseURL              = "https://api.github.com"
 	gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
 )
@@ -43,6 +45,8 @@ func Git(args []string) error {
 	switch args[0] {
 	case "clone":
 		return gitClone(args[1:])
+	case "hydrate":
+		return gitHydrate(args[1:])
 	case "-h", "-help", "--help", "help":
 		gitUsage()
 		return nil
@@ -56,8 +60,10 @@ func gitUsage() {
 	fmt.Fprintf(os.Stderr, `usage: drive9 git <command> [arguments]
 
 commands:
-  clone --fast [--blobless] <repo-url> <mounted-path>
+  clone --fast [--blobless] [--hydrate=background|sync|off] <repo-url> <mounted-path>
                        create a local .git and register the HEAD tree
+  hydrate <mounted-path>
+                       materialize a blobless clean tree into local cache
 
 global:
   -h, --help, help     show this help
@@ -68,8 +74,9 @@ func gitClone(args []string) error {
 	fs := flag.NewFlagSet("git clone", flag.ContinueOnError)
 	fast := fs.Bool("fast", false, "use drive9 git fast clone")
 	blobless := fs.Bool("blobless", false, "use a blobless partial local .git; clean blobs lazy-fetch from the remote")
+	hydrate := fs.String("hydrate", "auto", "blobless clean tree hydrate strategy: auto, background, sync, or off")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 git clone --fast [--blobless] <repo-url> <mounted-path>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: drive9 git clone --fast [--blobless] [--hydrate=background|sync|off] <repo-url> <mounted-path>\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -81,6 +88,10 @@ func gitClone(args []string) error {
 	if fs.NArg() != 2 {
 		fs.Usage()
 		return fmt.Errorf("drive9 git clone --fast requires <repo-url> and <mounted-path>")
+	}
+	hydrateMode, err := resolveGitHydrateMode(*hydrate, *blobless)
+	if err != nil {
+		return err
 	}
 	repoURL := fs.Arg(0)
 	target := fs.Arg(1)
@@ -180,6 +191,139 @@ func gitClone(args []string) error {
 	cancel()
 
 	fmt.Fprintf(os.Stderr, "drive9: registered git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, resolved.RemotePath, len(nodes))
+	if *blobless {
+		switch hydrateMode {
+		case gitHydrateModeSync:
+			ctx, cancel := context.WithTimeout(context.Background(), gitHydrateTimeout)
+			result, err := hydrateMountedGitTarget(ctx, repoURL, resolved, ws)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("hydrate clean tree: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "drive9: hydrated clean tree provider=%s files=%d bytes=%d duration=%s\n",
+				result.Provider, result.Files, result.Bytes, result.Duration.Truncate(time.Millisecond))
+		case gitHydrateModeBackground:
+			if err := startGitHydrateBackground(target, resolved, ws); err != nil {
+				fmt.Fprintf(os.Stderr, "drive9: warning: could not start background hydrate: %v\n", err)
+			}
+		}
+	}
+	return nil
+}
+
+type gitHydrateMode string
+
+const (
+	gitHydrateModeOff        gitHydrateMode = "off"
+	gitHydrateModeBackground gitHydrateMode = "background"
+	gitHydrateModeSync       gitHydrateMode = "sync"
+)
+
+func resolveGitHydrateMode(raw string, blobless bool) (gitHydrateMode, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "auto" {
+		if blobless {
+			return gitHydrateModeBackground, nil
+		}
+		return gitHydrateModeOff, nil
+	}
+	switch gitHydrateMode(raw) {
+	case gitHydrateModeOff:
+		return gitHydrateModeOff, nil
+	case gitHydrateModeBackground, gitHydrateModeSync:
+		if !blobless {
+			return "", fmt.Errorf("--hydrate=%s requires --blobless", raw)
+		}
+		return gitHydrateMode(raw), nil
+	default:
+		return "", fmt.Errorf("invalid --hydrate %q (valid: auto, background, sync, off)", raw)
+	}
+}
+
+func gitHydrate(args []string) error {
+	fs := flag.NewFlagSet("git hydrate", flag.ContinueOnError)
+	timeout := fs.Duration("timeout", gitHydrateTimeout, "maximum hydrate duration")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: drive9 git hydrate [--timeout=30m] <mounted-path>\n\nflags:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return fmt.Errorf("drive9 git hydrate requires <mounted-path>")
+	}
+	target := fs.Arg(0)
+	resolved, err := resolveMountedGitTarget(target)
+	if err != nil {
+		return err
+	}
+	c := NewFromEnv()
+	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
+	ws, err := c.GetGitWorkspaceByRoot(ctx, resolved.RemotePath)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("lookup git workspace :%s: %w", resolved.RemotePath, err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), *timeout)
+	result, err := hydrateMountedGitTarget(ctx, ws.RepoURL, resolved, ws)
+	cancel()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "drive9: hydrated clean tree provider=%s files=%d bytes=%d duration=%s\n",
+		result.Provider, result.Files, result.Bytes, result.Duration.Truncate(time.Millisecond))
+	return nil
+}
+
+func hydrateMountedGitTarget(ctx context.Context, repoURL string, resolved mountedGitTarget, ws *client.GitWorkspace) (gitcache.HydrateResult, error) {
+	if ws == nil {
+		return gitcache.HydrateResult{}, fmt.Errorf("workspace is required")
+	}
+	repoURL = strings.TrimSpace(repoURL)
+	if repoURL == "" {
+		repoURL = ws.RepoURL
+	}
+	return gitcache.Hydrate(ctx, gitcache.HydrateOptions{
+		LocalRoot:   resolved.LocalRoot,
+		WorkspaceID: ws.WorkspaceID,
+		Commit:      ws.HeadCommit,
+		RepoURL:     repoURL,
+		GitDir:      resolved.LocalGitDir,
+		Token:       githubTokenForRepoURL(repoURL),
+	})
+}
+
+func startGitHydrateBackground(target string, resolved mountedGitTarget, ws *client.GitWorkspace) error {
+	if strings.TrimSpace(resolved.LocalRoot) == "" {
+		return fmt.Errorf("mount metadata does not include local_root")
+	}
+	if ws == nil {
+		return fmt.Errorf("workspace is required")
+	}
+	logPath := gitcache.HydrateLogPath(resolved.LocalRoot, ws.WorkspaceID, ws.HeadCommit)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o755); err != nil {
+		return err
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(os.Args[0], "git", "hydrate", "--timeout="+gitHydrateTimeout.String(), target)
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.Env = os.Environ()
+	if err := cmd.Start(); err != nil {
+		_ = logFile.Close()
+		return err
+	}
+	if err := cmd.Process.Release(); err != nil {
+		_ = logFile.Close()
+		return err
+	}
+	_ = logFile.Close()
+	fmt.Fprintf(os.Stderr, "drive9: started background clean tree hydrate pid=%d log=%s\n", cmd.Process.Pid, logPath)
 	return nil
 }
 
@@ -204,6 +348,7 @@ type mountedGitTarget struct {
 	RemoteRoot  string
 	RemotePath  string
 	Profile     string
+	LocalRoot   string
 	LocalGitDir string
 }
 
@@ -250,6 +395,7 @@ func resolveMountedGitTarget(target string) (mountedGitTarget, error) {
 				RemoteRoot:  state.RemoteRoot,
 				RemotePath:  remotePath,
 				Profile:     state.Profile,
+				LocalRoot:   state.LocalRoot,
 				LocalGitDir: localGitDir,
 			}, nil
 		}
