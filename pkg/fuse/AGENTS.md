@@ -32,7 +32,7 @@ Write() → ShadowStore (disk) → PendingIndex (in-memory) → Journal (WAL, CR
 
 Recovery order on startup: Journal.Replay → PendingIndex.RecoverFromDisk → CommitQueue.RecoverPending.
 
-## Read priority chain (10-step cascade)
+## Read priority chain (9-step cascade)
 
 local-only → shadow → dirty-buf → shadow-store → writeback-cache → prefetcher → read-cache → small-file-http → range-read.
 

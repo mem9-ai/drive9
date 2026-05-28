@@ -27,11 +27,11 @@ HTTP server for `/v1/fs/*`, upload (V1/V2), SSE events, auth, background workers
 
 1. **Mux prefix matching** — `http.ServeMux` routes `/v1/fs/`, `/v1/uploads`, `/v2/uploads/` etc. to `handleBusiness`. Unauthenticated routes (provision, healthz, metrics) registered directly on mux.
 2. **handleBusiness switch** — dispatches on `r.URL.Path`: batch-stat, `/v1/fs/*` → handleFS, `/v1/uploads/initiate`, `/v2/uploads/*`, etc.
-3. **handleFS method+query dispatch** — `GET ?stat` → handleStat, `GET ?list` → handleList, `POST ?copy` → handleCopy. Query modifiers are presence-based (`?list` ≡ `?list=1`).
+3. **handleFS method+query dispatch** — `GET ?stat` → handleStatMetadata, `HEAD ?stat` → handleStat, `GET ?list` → handleList, `POST ?copy` → handleCopy. Query modifiers are presence-based (`?list` ≡ `?list=1`).
 
 ## Auth Middleware
 
-`tenantAuthMiddleware`: extract Bearer token → hash → resolve by hash in meta store → verify JWT (sig, tenant, version) → check tenant status → load FSScopes → pool.Acquire tenant backend → inject TenantScope into context. FS-scoped tokens additionally go through `authorizeFS(w, r, FSOpXxx, path)` per-operation. Scoped token admission gate (`isScopedBusinessRequestAllowed`) blocks non-FS endpoints.
+`tenantAuthMiddleware`: extract Bearer token → hash → resolve by hash in meta store → verify JWT (sig, tenant, version) → check tenant status → load FSScopes → pool.Acquire tenant backend → inject TenantScope into context. FS-scoped tokens additionally go through `authorizeFS(w, r, FSOpXxx, path)` per-operation. Scoped token admission gate (`isScopedBusinessRequestAllowed`) admits FS endpoints (which then go through `authorizeFS` for per-operation checks) and scoped V1/V2 upload routes specifically allowlisted for scoped tokens; all other non-FS endpoints are blocked.
 
 ## Handler Pattern
 
