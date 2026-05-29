@@ -282,6 +282,46 @@ func TestTokenRevokeLocalNameUsesAPIKeyAndForgetsContext(t *testing.T) {
 	}
 }
 
+func TestTokenRevokeTreatsEscapedDashPrefixedLocalNameAsData(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/tokens/revoke" {
+			t.Fatalf("method/path = %s %s, want POST /v1/tokens/revoke", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	cfg := &Config{Server: srv.URL, Contexts: map[string]*Context{}}
+	if _, err := ctxAdd(cfg, "owner", &Context{Type: PrincipalOwner, Server: srv.URL, APIKey: "owner-key"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ctxAdd(cfg, "--help", &Context{Type: PrincipalFSScoped, Server: srv.URL, APIKey: "dat9_scoped", Scope: []string{"/scratch:read"}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg.CurrentContext = "owner"
+	if err := saveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	if err := TokenRevoke([]string{"--", "--help"}); err != nil {
+		t.Fatalf("TokenRevoke(-- --help): %v", err)
+	}
+	if gotBody["api_key"] != "dat9_scoped" {
+		t.Fatalf("request body = %#v", gotBody)
+	}
+	if _, ok := loadConfig().Contexts["--help"]; ok {
+		t.Fatal("local scoped token context still present after revoke")
+	}
+}
+
 func TestTokenRevokeRejectsAPIKeyInArgv(t *testing.T) {
 	err := TokenRevoke([]string{"dat9_secret"})
 	if err == nil {

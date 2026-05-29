@@ -26,6 +26,33 @@ func IsHelpArgs(args []string) bool {
 	return false
 }
 
+func IsHelpArgsWithValueFlags(args []string, valueFlags ...string) bool {
+	valueFlag := map[string]struct{}{}
+	for _, flag := range valueFlags {
+		valueFlag[flag] = struct{}{}
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch arg {
+		case "--":
+			return false
+		case "-h", "-help", "--help":
+			return true
+		}
+		if _, ok := valueFlag[arg]; ok && i+1 < len(args) {
+			i++
+		}
+	}
+	return false
+}
+
+func stripLeadingDashDash(args []string) ([]string, bool) {
+	if len(args) > 0 && args[0] == "--" {
+		return args[1:], true
+	}
+	return args, false
+}
+
 // FSSubcommandUsage returns the focused usage line for a drive9 fs leaf
 // command. The bool is false when sub is not a known fs subcommand.
 func FSSubcommandUsage(sub string) (string, bool) {
