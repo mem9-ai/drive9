@@ -65,9 +65,9 @@ func TestCtxLeafHelpScansFullArgumentList(t *testing.T) {
 		firstLine string
 	}{
 		{name: "show", args: []string{"show", "--json", "--help"}, firstLine: "usage: drive9 ctx show [--json] [--reveal]"},
-		{name: "add", args: []string{"add", "--api-key", "--help"}, firstLine: "usage: drive9 ctx add --api-key <key> [--name <n>] [--server <url>]"},
-		{name: "import", args: []string{"import", "--from-file", "--help"}, firstLine: "usage: drive9 ctx import [--from-file <path|->] [--name <name>]"},
-		{name: "fork", args: []string{"fork", "--from", "--help"}, firstLine: "usage: drive9 ctx fork [<new>] [--from <ctx>] [--json]"},
+		{name: "add", args: []string{"add", "--api-key", "k", "--help"}, firstLine: "usage: drive9 ctx add --api-key <key> [--name <n>] [--server <url>]"},
+		{name: "import", args: []string{"import", "--name", "imported", "--help"}, firstLine: "usage: drive9 ctx import [--from-file <path|->] [--name <name>]"},
+		{name: "fork", args: []string{"fork", "child", "--help"}, firstLine: "usage: drive9 ctx fork [<new>] [--from <ctx>] [--json]"},
 		{name: "ls", args: []string{"ls", "--type", "--help"}, firstLine: "usage: drive9 ctx ls [-l|--json] [--type <kind>|--scoped]"},
 		{name: "use", args: []string{"use", "--help"}, firstLine: "usage: drive9 ctx use [--] <name>"},
 		{name: "rm", args: []string{"rm", "old", "--help"}, firstLine: "usage: drive9 ctx rm <name>"},

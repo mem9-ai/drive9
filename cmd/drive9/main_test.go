@@ -115,9 +115,9 @@ func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
 			firstLine: "usage: drive9 ctx rm <name>",
 		},
 		{
-			name:      "ctx import help after flag",
+			name:      "ctx import help after value",
 			cmd:       "ctx",
-			args:      []string{"import", "--from-file", "--help"},
+			args:      []string{"import", "--name", "imported", "--help"},
 			firstLine: "usage: drive9 ctx import [--from-file <path|->] [--name <name>]",
 		},
 		{

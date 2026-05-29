@@ -708,6 +708,94 @@ func TestF15_CtxUseIsExplicitVerb(t *testing.T) {
 	}
 }
 
+func TestCtxNameFlagValuesCanBeDashPrefixed(t *testing.T) {
+	t.Run("add name and use", func(t *testing.T) {
+		_ = withIsolatedHome(t)
+		if _, err := captureStdoutE(t, func() error {
+			return Ctx([]string{"add", "--api-key", "owner-key", "--name", "--help", "--server", "https://s"})
+		}); err != nil {
+			t.Fatalf("ctx add --name --help: %v", err)
+		}
+		if _, err := captureStdoutE(t, func() error {
+			return Ctx([]string{"use", "--", "--help"})
+		}); err != nil {
+			t.Fatalf("ctx use -- --help: %v", err)
+		}
+		if got := loadConfig().CurrentContext; got != "--help" {
+			t.Fatalf("current context = %q, want --help", got)
+		}
+	})
+
+	t.Run("import name", func(t *testing.T) {
+		_ = withIsolatedHome(t)
+		tok := makeJWT(t, map[string]any{
+			"iss":            "https://api.example.com",
+			"principal_type": "delegated",
+			"grant_id":       "grt_help",
+			"agent":          "alice",
+			"scope":          []string{"/n/vault/x"},
+			"perm":           "read",
+			"exp":            time.Now().Add(time.Hour).Unix(),
+		})
+		if _, err := captureStdoutE(t, func() error {
+			return Ctx([]string{"import", "--from-file", writeJWTFile(t, tok), "--name", "--help"})
+		}); err != nil {
+			t.Fatalf("ctx import --name --help: %v", err)
+		}
+		if _, ok := loadConfig().Contexts["--help"]; !ok {
+			t.Fatalf("imported context --help missing")
+		}
+	})
+
+	t.Run("fork from", func(t *testing.T) {
+		_ = withIsolatedHome(t)
+		var sawName string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost || r.URL.Path != "/v1/fork" {
+				t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			}
+			if got := r.Header.Get("Authorization"); got != "Bearer source-key" {
+				t.Fatalf("Authorization = %q", got)
+			}
+			var body struct {
+				Name string `json:"name"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			sawName = body.Name
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"tenant_id":        "fork-tenant",
+				"api_key":          "fork-key",
+				"status":           "provisioning",
+				"parent_tenant_id": "source-tenant",
+				"storage":          "shared",
+			})
+		}))
+		defer ts.Close()
+
+		cfg := loadConfig()
+		if _, err := ctxAdd(cfg, "--help", &Context{Type: PrincipalOwner, APIKey: "source-key", Server: ts.URL}); err != nil {
+			t.Fatalf("ctxAdd source: %v", err)
+		}
+		if err := saveConfig(cfg); err != nil {
+			t.Fatalf("save config: %v", err)
+		}
+		if _, err := captureStdoutE(t, func() error {
+			return Ctx([]string{"fork", "child", "--from", "--help"})
+		}); err != nil {
+			t.Fatalf("ctx fork --from --help: %v", err)
+		}
+		if sawName != "child" {
+			t.Fatalf("fork name = %q, want child", sawName)
+		}
+		if _, ok := loadConfig().Contexts["child"]; !ok {
+			t.Fatalf("forked context child missing")
+		}
+	})
+}
+
 // TestF15_CtxUseRejectsExpiredDelegated — §17 short-circuit: ctx use must not
 // activate an already-expired delegated context.
 func TestF15_CtxUseRejectsExpiredDelegated(t *testing.T) {

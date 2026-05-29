@@ -97,7 +97,8 @@ func vaultAuditUsage() string {
 // then re-set, or `drive9 vault put /n/vault/<name> --from <dir>` for the
 // atomic wholesale-replace path.
 func SecretSet(args []string) error {
-	if IsHelpArgs(args) {
+	args, escaped := stripLeadingDashDash(args)
+	if !escaped && IsHelpArgs(args) {
 		_, _ = fmt.Fprintln(os.Stdout, vaultSetUsage())
 		return nil
 	}
@@ -130,7 +131,8 @@ func SecretSet(args []string) error {
 
 // SecretGet reads a whole secret or one field.
 func SecretGet(args []string) error {
-	if IsHelpArgs(args) {
+	args, escaped := stripLeadingDashDash(args)
+	if !escaped && IsHelpArgs(args) {
 		_, _ = fmt.Fprintln(os.Stdout, vaultGetUsage())
 		return nil
 	}
@@ -444,11 +446,7 @@ func SecretLs(args []string) error {
 
 // SecretRm deletes a secret.
 func SecretRm(args []string) error {
-	escaped := false
-	if len(args) > 0 && args[0] == "--" {
-		args = args[1:]
-		escaped = true
-	}
+	args, escaped := stripLeadingDashDash(args)
 	if !escaped && IsHelpArgs(args) {
 		_, _ = fmt.Fprintln(os.Stdout, vaultRmUsage())
 		return nil
@@ -516,6 +514,9 @@ func SecretGrant(args []string) error {
 			asJSON = true
 		case "--token-only":
 			tokenOnly = true
+		case "--":
+			scope = append(scope, args[i+1:]...)
+			i = len(args)
 		default:
 			if strings.HasPrefix(arg, "--") {
 				return fmt.Errorf("unknown flag %q", arg)

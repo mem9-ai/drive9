@@ -16,39 +16,51 @@ func Find(c *client.Client, args []string) error {
 	}
 	path := "/"
 	params := url.Values{}
+	nextValue := func(i *int, flag, want string) (string, error) {
+		if *i+1 >= len(args) {
+			return "", fmt.Errorf("%s requires %s", flag, want)
+		}
+		(*i)++
+		if args[*i] == "--" {
+			if *i+1 >= len(args) {
+				return "", fmt.Errorf("%s requires %s", flag, want)
+			}
+			(*i)++
+		}
+		return args[*i], nil
+	}
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "-name":
-			if i+1 >= len(args) {
-				return fmt.Errorf("-name requires argument")
+			v, err := nextValue(&i, "-name", "argument")
+			if err != nil {
+				return err
 			}
-			i++
-			params.Set("name", args[i])
+			params.Set("name", v)
 		case "-tag":
-			if i+1 >= len(args) {
-				return fmt.Errorf("-tag requires key=value argument")
+			v, err := nextValue(&i, "-tag", "key=value argument")
+			if err != nil {
+				return err
 			}
-			i++
-			params.Set("tag", args[i])
+			params.Set("tag", v)
 		case "-newer":
-			if i+1 >= len(args) {
-				return fmt.Errorf("-newer requires date (YYYY-MM-DD)")
+			v, err := nextValue(&i, "-newer", "date (YYYY-MM-DD)")
+			if err != nil {
+				return err
 			}
-			i++
-			params.Set("newer", args[i])
+			params.Set("newer", v)
 		case "-older":
-			if i+1 >= len(args) {
-				return fmt.Errorf("-older requires date (YYYY-MM-DD)")
+			v, err := nextValue(&i, "-older", "date (YYYY-MM-DD)")
+			if err != nil {
+				return err
 			}
-			i++
-			params.Set("older", args[i])
+			params.Set("older", v)
 		case "-size":
-			if i+1 >= len(args) {
-				return fmt.Errorf("-size requires argument (+N or -N)")
+			v, err := nextValue(&i, "-size", "argument (+N or -N)")
+			if err != nil {
+				return err
 			}
-			i++
-			v := args[i]
 			if strings.HasPrefix(v, "+") {
 				params.Set("minsize", v[1:])
 			} else if strings.HasPrefix(v, "-") {

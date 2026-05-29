@@ -300,6 +300,7 @@ func TokenRevoke(args []string) error {
 		_, _ = fmt.Fprintln(os.Stdout, tokenRevokeUsage())
 		return nil
 	}
+	args, _ = stripLeadingDashDash(args)
 	var apiKeyFile string
 	pos := make([]string, 0, 1)
 	for i := 0; i < len(args); i++ {

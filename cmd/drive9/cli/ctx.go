@@ -323,7 +323,7 @@ func formatSecretForDisplay(secret string, reveal bool) string {
 // re-entry) so the invariant "exactly one place writes ~/.drive9/config" is
 // preserved.
 func ctxAddCmd(args []string) error {
-	if IsHelpArgs(args) {
+	if IsHelpArgsWithValueFlags(args, "--api-key", "--name", "--server") {
 		_, _ = fmt.Fprintln(os.Stdout, ctxAddUsage())
 		return nil
 	}
@@ -412,7 +412,7 @@ func ctxAdd(cfg *Config, name string, ctx *Context) (*Context, error) {
 }
 
 func ctxForkCmd(args []string) error {
-	if IsHelpArgs(args) {
+	if IsHelpArgsWithValueFlags(args, "--from") {
 		_, _ = fmt.Fprintln(os.Stdout, ctxForkUsage())
 		return nil
 	}
@@ -545,7 +545,7 @@ type forkCtxResult struct {
 //  3. parseable delegated but exp already past     -> command error (§17 short-circuit #1)
 //  4. parseable delegated with exp in the future   -> TOFU on iss, store
 func ctxImportCmd(args []string) error {
-	if IsHelpArgs(args) {
+	if IsHelpArgsWithValueFlags(args, "--from-file", "--name") {
 		_, _ = fmt.Fprintln(os.Stdout, ctxImportUsage())
 		return nil
 	}

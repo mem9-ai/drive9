@@ -13,6 +13,7 @@ func Grep(c *client.Client, args []string) error {
 		_, _ = fmt.Fprintln(os.Stdout, fsGrepUsage())
 		return nil
 	}
+	args, _ = stripLeadingDashDash(args)
 	if len(args) < 1 {
 		return fmt.Errorf("%s", fsGrepUsage())
 	}
