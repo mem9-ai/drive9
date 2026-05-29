@@ -883,7 +883,7 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	if err != nil {
 		return err
 	}
-	if gitDirLooksUsable(gitDir) {
+	if gitDirLooksUsable(ctx, gitDir) {
 		rt.mu.Lock()
 		rt.restored = true
 		rt.mu.Unlock()
@@ -899,7 +899,7 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	if err := fs.restoreGitStateAtomically(ctx, rt, gitDir, state); err != nil {
 		return err
 	}
-	if !gitDirLooksUsable(gitDir) {
+	if !gitDirLooksUsable(ctx, gitDir) {
 		return fmt.Errorf("git workspace %s restored unusable .git state", rt.workspace.WorkspaceID)
 	}
 	rt.mu.Lock()
@@ -908,13 +908,20 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	return nil
 }
 
-func gitDirLooksUsable(gitDir string) bool {
+func gitDirLooksUsable(ctx context.Context, gitDir string) bool {
 	info, err := os.Stat(gitDir)
 	if err != nil || !info.IsDir() {
 		return false
 	}
 	head, err := os.ReadFile(filepath.Join(gitDir, "HEAD"))
-	return err == nil && strings.TrimSpace(string(head)) != ""
+	if err != nil || strings.TrimSpace(string(head)) == "" {
+		return false
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(checkCtx, "git", "--git-dir", gitDir, "cat-file", "-e", "HEAD^{commit}")
+	cmd.Env = append(os.Environ(), "GIT_NO_LAZY_FETCH=1")
+	return cmd.Run() == nil
 }
 
 func (fs *Dat9FS) restoreGitStateAtomically(ctx context.Context, rt *gitWorkspaceRuntime, gitDir string, state *client.GitState) error {
@@ -939,8 +946,8 @@ func (fs *Dat9FS) restoreGitStateAtomically(ctx context.Context, rt *gitWorkspac
 	if err := extractGitArchive(state.Content, tmpGitDir); err != nil {
 		return err
 	}
-	if !gitDirLooksUsable(tmpGitDir) {
-		return fmt.Errorf("restored git state is missing HEAD")
+	if !gitDirLooksUsable(ctx, tmpGitDir) {
+		return fmt.Errorf("restored git state is missing a usable HEAD")
 	}
 	if err := os.RemoveAll(gitDir); err != nil {
 		return err

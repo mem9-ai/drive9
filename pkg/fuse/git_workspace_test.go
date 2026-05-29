@@ -766,15 +766,13 @@ func TestGitWorkspaceRootRmdirDeletesWorkspace(t *testing.T) {
 }
 
 func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
 	fixture := newGitWorkspaceFixture(t)
-	srcGit := t.TempDir()
-	if err := os.WriteFile(filepath.Join(srcGit, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(srcGit, "config"), []byte("[core]\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	state, err := archiveLocalGitDir(srcGit)
+	repo := createGitRepoWithReadme(t, []byte("hello base\n"))
+	fixture.headCommit = fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
+	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -794,21 +792,19 @@ func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "[core]\n" {
-		t.Fatalf("restored config = %q, want %q", got, "[core]\n")
+	if !strings.Contains(string(got), "repositoryformatversion") {
+		t.Fatalf("restored config = %q, want git config", got)
 	}
 }
 
 func TestGitWorkspaceRestoreReplacesInvalidLocalGitState(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
 	fixture := newGitWorkspaceFixture(t)
-	srcGit := t.TempDir()
-	if err := os.WriteFile(filepath.Join(srcGit, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(srcGit, "config"), []byte("[core]\n\trepositoryformatversion = 0\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	state, err := archiveLocalGitDir(srcGit)
+	repo := createGitRepoWithReadme(t, []byte("hello base\n"))
+	fixture.headCommit = fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
+	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -825,6 +821,9 @@ func TestGitWorkspaceRestoreReplacesInvalidLocalGitState(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte("[broken]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(gitDir, "HEAD"), []byte(fixture.headCommit+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
 
 	var out gofuse.EntryOut
@@ -835,8 +834,8 @@ func TestGitWorkspaceRestoreReplacesInvalidLocalGitState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != "ref: refs/heads/main\n" {
-		t.Fatalf("restored HEAD = %q, want main ref", got)
+	if strings.TrimSpace(string(got)) == "" {
+		t.Fatalf("restored HEAD = %q, want non-empty", got)
 	}
 	got, err = os.ReadFile(filepath.Join(gitDir, "config"))
 	if err != nil {
