@@ -240,6 +240,40 @@ func TestSecretGrantTreatsEscapedDashPrefixedScopeAsData(t *testing.T) {
 	}
 }
 
+func TestSecretGrantAgentFlagValueCanBeHelpLike(t *testing.T) {
+	var gotAgent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/vault/grants" {
+			http.NotFound(w, r)
+			return
+		}
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		gotAgent, _ = req["agent"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"token":"vt_abc","grant_id":"grt_123","expires_at":"2026-04-14T00:00:00Z","scope":["aws-prod"],"perm":"read"}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", srv.URL)
+	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	_ = captureStdout(t, func() {
+		if err := SecretGrant([]string{"--agent", "--help", "--ttl", "1h", "--perm", "read", "aws-prod"}); err != nil {
+			t.Fatalf("SecretGrant --agent --help: %v", err)
+		}
+	})
+	if gotAgent != "--help" {
+		t.Fatalf("agent = %q, want --help", gotAgent)
+	}
+}
+
 func TestSecretLsFallsBackToReadableScopeWithCapabilityToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/vault/read" {
@@ -355,6 +389,35 @@ func TestSecretAuditFiltersClientSide(t *testing.T) {
 	})
 	if !strings.Contains(out, `"agent_id": "deploy-agent"`) || strings.Contains(out, `"agent_id": "test-agent"`) {
 		t.Fatalf("output = %q", out)
+	}
+}
+
+func TestSecretAuditSecretFilterCanBeHelpLike(t *testing.T) {
+	var gotSecret string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/vault/audit" {
+			http.NotFound(w, r)
+			return
+		}
+		gotSecret = r.URL.Query().Get("secret")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"events":[]}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", srv.URL)
+	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	if _, err := captureStdoutE(t, func() error {
+		return SecretAudit([]string{"--secret", "--help"})
+	}); err != nil {
+		t.Fatalf("SecretAudit --secret --help: %v", err)
+	}
+	if gotSecret != "--help" {
+		t.Fatalf("secret query = %q, want --help", gotSecret)
 	}
 }
 

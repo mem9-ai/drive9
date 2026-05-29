@@ -17,7 +17,7 @@ import (
 //
 // See migration call-out #4 in the impl PR body.
 func Create(args []string) error {
-	if IsHelpArgs(args) {
+	if IsHelpArgsWithValueFlags(args, "--name", "--server") {
 		_, _ = fmt.Fprintln(os.Stdout, createUsage())
 		return nil
 	}

@@ -74,7 +74,7 @@ var stdinIsTTY = func() bool {
 //  3. ROW E owner-credential check.
 //  4. ROW B dir semantics (includes `--from` missing/empty/nonexistent/etc).
 func SecretPut(args []string) error {
-	if IsHelpArgs(args) {
+	if IsHelpArgsWithValueFlags(args, "--from") {
 		_, _ = fmt.Fprintln(os.Stdout, vaultPutUsage())
 		return nil
 	}
