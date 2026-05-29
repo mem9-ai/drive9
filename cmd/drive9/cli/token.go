@@ -296,7 +296,7 @@ func TokenForget(args []string) error {
 }
 
 func TokenRevoke(args []string) error {
-	if IsHelpArgs(args) {
+	if IsHelpArgsWithValueFlags(args, "--api-key-file") {
 		_, _ = fmt.Fprintln(os.Stdout, tokenRevokeUsage())
 		return nil
 	}
