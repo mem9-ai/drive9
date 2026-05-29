@@ -458,6 +458,9 @@ func (fs *Dat9FS) gitOverlayInode(rt *gitWorkspaceRuntime, rel string, e client.
 	if len(e.Content) > 0 {
 		size = int64(len(e.Content))
 	}
+	if info, ok := fs.gitWorkspaceDirtyMirrorStat(rt, rel); ok {
+		size = info.Size()
+	}
 	if isDir {
 		size = 0
 	}
@@ -636,9 +639,110 @@ func (fs *Dat9FS) readGitFile(ctx context.Context, localPath string, offset, siz
 	return fs.readGitCleanFile(ctx, rt, localPath, rel, n, offset, size)
 }
 
+func gitWorkspaceOpenFlags(rt *gitWorkspaceRuntime, rel string, flags uint32) uint32 {
+	accMode := flags & syscall.O_ACCMODE
+	if accMode != syscall.O_RDONLY {
+		return 0
+	}
+	if e, ok := rt.overlayEntry(rel); ok && gitOverlayHasContentChange(e) {
+		return gofuse.FOPEN_DIRECT_IO
+	}
+	return gofuse.FOPEN_KEEP_CACHE
+}
+
+func gitOverlayHasContentChange(e client.GitOverlayEntry) bool {
+	if e.Op == "whiteout" {
+		return true
+	}
+	if e.Kind == "dir" || e.Kind == "submodule" {
+		return false
+	}
+	return e.Op != "chmod"
+}
+
+func (fs *Dat9FS) gitWorkspaceCurrentSize(rt *gitWorkspaceRuntime, rel string) (int64, bool) {
+	if rt == nil || rel == "" {
+		return 0, false
+	}
+	if info, ok := fs.gitWorkspaceDirtyMirrorStat(rt, rel); ok {
+		return info.Size(), true
+	}
+	if e, ok := rt.overlayEntry(rel); ok {
+		if e.Op == "whiteout" || e.Kind == "dir" || e.Kind == "submodule" {
+			return 0, false
+		}
+		if e.Op != "chmod" || len(e.Content) > 0 {
+			if len(e.Content) > 0 {
+				return int64(len(e.Content)), true
+			}
+			return e.SizeBytes, true
+		}
+	}
+	if n, ok := rt.cleanNode(rel); ok {
+		if n.Kind == "dir" || n.Kind == "submodule" {
+			return 0, false
+		}
+		return n.SizeBytes, true
+	}
+	return 0, false
+}
+
+func (fs *Dat9FS) gitWorkspaceDirtyMirrorPath(rt *gitWorkspaceRuntime, rel string) (string, bool) {
+	if fs == nil || fs.opts == nil || rt == nil || rt.workspace.WorkspaceID == "" || rt.workspace.HeadCommit == "" {
+		return "", false
+	}
+	localRoot := strings.TrimSpace(fs.opts.LocalRoot)
+	if localRoot == "" {
+		return "", false
+	}
+	cleanRel := strings.TrimPrefix(path.Clean("/"+rel), "/")
+	if cleanRel == "" || cleanRel == "." || strings.HasPrefix(cleanRel, "../") {
+		return "", false
+	}
+	return filepath.Join(localRoot, "git-workspaces", rt.workspace.WorkspaceID, rt.workspace.HeadCommit, "dirty", filepath.FromSlash(cleanRel)), true
+}
+
+func (fs *Dat9FS) gitWorkspaceDirtyMirrorStat(rt *gitWorkspaceRuntime, rel string) (os.FileInfo, bool) {
+	mirrorPath, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel)
+	if !ok {
+		return nil, false
+	}
+	info, err := os.Stat(mirrorPath)
+	if err != nil || info.IsDir() {
+		return nil, false
+	}
+	return info, true
+}
+
+func (fs *Dat9FS) readGitDirtyMirror(rt *gitWorkspaceRuntime, rel string, offset, size int64) ([]byte, bool, error) {
+	mirrorPath, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel)
+	if !ok {
+		return nil, false, nil
+	}
+	data, err := os.ReadFile(mirrorPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, false, nil
+		}
+		return nil, true, err
+	}
+	return sliceRead(data, offset, size), true, nil
+}
+
 func (fs *Dat9FS) readGitOverlayFile(ctx context.Context, rt *gitWorkspaceRuntime, localPath, rel string, e client.GitOverlayEntry, offset, size int64) ([]byte, error) {
 	if e.Kind == "dir" || e.Kind == "submodule" {
 		return nil, syscall.EISDIR
+	}
+	if data, ok, err := fs.readGitDirtyMirror(rt, rel, 0, -1); err != nil {
+		return nil, err
+	} else if ok {
+		e.Content = data
+		e.SizeBytes = int64(len(data))
+		fs.applyGitOverlayEntry(rt.workspace.WorkspaceID, e)
+		if ino, ok := fs.inodes.GetInode(localPath); ok {
+			fs.inodes.UpdateSize(ino, int64(len(data)))
+		}
+		return sliceRead(data, offset, size), nil
 	}
 	if len(e.Content) == 0 && e.SizeBytes > 0 {
 		if fs == nil || fs.client == nil {
@@ -2392,9 +2496,53 @@ func (fs *Dat9FS) flushGitHandleLocked(ctx context.Context, fh *FileHandle) gofu
 	return fs.flushGitHandleLockedWithPolicy(ctx, fh, false)
 }
 
+func (fs *Dat9FS) flushGitLocalFileHandleLockedWithPolicy(ctx context.Context, fh *FileHandle, forceSync bool) gofuse.Status {
+	if fh == nil || fh.Layer != PathLayerGitWorkspace || fh.LocalFile == nil {
+		return gofuse.OK
+	}
+	if fh.DirtySeq == 0 && !fh.HasPendingMode {
+		return gofuse.OK
+	}
+	data, err := os.ReadFile(fh.LocalFile.Name())
+	if err != nil {
+		return localErrToFuseStatus(err)
+	}
+	req := client.GitOverlayEntryRequest{
+		Path:          fh.GitRelPath,
+		Op:            "upsert",
+		Kind:          fh.GitKind,
+		Mode:          gitModeForHandle(fh),
+		BaseObjectSHA: fh.GitBaseObjectSHA,
+		Content:       data,
+		SizeBytes:     int64(len(data)),
+	}
+	fh.Unlock()
+	_, err = fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync)
+	fh.Lock()
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+	fh.DirtySeq = 0
+	fh.IsNew = false
+	if fh.HasPendingMode {
+		fs.inodes.UpdateMode(fh.Ino, fh.PendingMode&0o777)
+		fh.GitMode = req.Mode
+		clearPendingModeLocked(fh)
+	}
+	fs.inodes.UpdateSize(fh.Ino, int64(len(data)))
+	fs.inodes.UpdateMtime(fh.Ino, time.Now())
+	fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+	fs.notifyInode(fh.Ino)
+	return gofuse.OK
+}
+
 func (fs *Dat9FS) flushGitHandleLockedWithPolicy(ctx context.Context, fh *FileHandle, forceSync bool) gofuse.Status {
 	if fh == nil || fh.Layer != PathLayerGitWorkspace {
 		return gofuse.OK
+	}
+	if fh.LocalFile != nil {
+		return fs.flushGitLocalFileHandleLockedWithPolicy(ctx, fh, forceSync)
 	}
 	if fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
 		if !fh.HasPendingMode {
@@ -2449,6 +2597,7 @@ func (fs *Dat9FS) flushGitHandleLockedWithPolicy(ctx context.Context, fh *FileHa
 	fs.inodes.UpdateSize(fh.Ino, int64(len(data)))
 	fs.inodes.UpdateMtime(fh.Ino, time.Now())
 	fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+	fs.notifyInode(fh.Ino)
 	return gofuse.OK
 }
 
@@ -2631,14 +2780,32 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 	}
 
 	size := fh.OrigSize
+	if currentSize, ok := fs.gitWorkspaceCurrentSize(rt, rel); ok {
+		size = currentSize
+		fh.OrigSize = currentSize
+		fs.inodes.UpdateSize(fh.Ino, currentSize)
+	}
 	data, err := fs.readGitFile(ctx, fh.Path, 0, size)
 	if err != nil {
 		return gitReadErrToFuseStatus(err)
 	}
-	if size < 0 {
+	if size < 0 || int64(len(data)) < size {
 		size = int64(len(data))
 		fh.OrigSize = size
 		fs.inodes.UpdateSize(fh.Ino, size)
+	}
+	if mirrorPath, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel); ok {
+		if err := os.MkdirAll(filepath.Dir(mirrorPath), 0o755); err == nil {
+			if err := os.WriteFile(mirrorPath, data, 0o644); err == nil {
+				openFlags := int(flags)
+				openFlags &^= syscall.O_ACCMODE
+				openFlags |= syscall.O_RDWR | syscall.O_CREAT
+				if file, err := os.OpenFile(mirrorPath, openFlags, 0o644); err == nil {
+					fh.LocalFile = file
+					return gofuse.OK
+				}
+			}
+		}
 	}
 	bufMax := size * 2
 	if bufMax < maxPreloadSize {

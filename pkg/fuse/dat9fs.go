@@ -417,6 +417,10 @@ func isLocalFileHandle(fh *FileHandle) bool {
 	return fh != nil && fh.Layer == PathLayerLocalOnly && fh.LocalFile != nil
 }
 
+func isGitWorkspaceLocalFileHandle(fh *FileHandle) bool {
+	return fh != nil && fh.Layer == PathLayerGitWorkspace && fh.LocalFile != nil
+}
+
 func localFileHandleOpenedWritable(fh *FileHandle) bool {
 	if fh == nil {
 		return false
@@ -4144,7 +4148,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 			return st
 		}
 		out.Fh = fs.allocateFileHandle(fh)
-		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+		out.OpenFlags = 0
 		fs.fillEntryOut(entry, &out.EntryOut)
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
@@ -4279,7 +4283,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 		return gofuse.OK
 	}
-	if _, rel, ok := fs.gitWorkspaceForPath(ctx, p); ok && rel != "" {
+	if rt, rel, ok := fs.gitWorkspaceForPath(ctx, p); ok && rel != "" {
 		if (accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR) && fs.opts.ReadOnly {
 			return gofuse.EROFS
 		}
@@ -4287,7 +4291,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			return st
 		}
 		out.Fh = fs.allocateFileHandle(fh)
-		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+		out.OpenFlags = gitWorkspaceOpenFlags(rt, rel, input.Flags)
 		return gofuse.OK
 	}
 
@@ -4477,6 +4481,25 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			return nil, localErrToFuseStatus(err)
 		}
 		source = "local-file"
+		bytesRead = n
+		return gofuse.ReadResultData(data[:n]), gofuse.OK
+	}
+	if isGitWorkspaceLocalFileHandle(fh) {
+		size := int(input.Size)
+		if size <= 0 {
+			fh.Unlock()
+			source = "git-local-empty"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		data := make([]byte, size)
+		n, err := fh.LocalFile.ReadAt(data, int64(input.Offset))
+		fh.Unlock()
+		if err != nil && !errors.Is(err, io.EOF) {
+			source = "git-local-error"
+			return nil, localErrToFuseStatus(err)
+		}
+		source = "git-local-file"
 		bytesRead = n
 		return gofuse.ReadResultData(data[:n]), gofuse.OK
 	}
@@ -4908,6 +4931,29 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		source = "local-file"
 		return written, gofuse.OK
 	}
+	if isGitWorkspaceLocalFileHandle(fh) {
+		var (
+			n   int
+			err error
+		)
+		if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+			n, err = fh.LocalFile.Write(data)
+		} else {
+			n, err = fh.LocalFile.WriteAt(data, int64(input.Offset))
+		}
+		if err != nil && n == 0 {
+			source = "git-local-error"
+			return 0, localErrToFuseStatus(err)
+		}
+		written = uint32(n)
+		if info, statErr := fh.LocalFile.Stat(); statErr == nil {
+			fh.DirtySeq = fs.markDirtySize(fh.Ino, info.Size())
+			fs.inodes.UpdateSize(fh.Ino, info.Size())
+			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
+		}
+		source = "git-local-file"
+		return written, gofuse.OK
+	}
 
 	if fh.Dirty == nil {
 		source = "new-dirty-buffer"
@@ -4916,6 +4962,11 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
 	if fh.WritePolicy == WritePolicyWriteSync {
 		writeSyncSnapshot = fh.Dirty.snapshot()
+	}
+
+	writeOffset := int64(input.Offset)
+	if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+		writeOffset = fh.Dirty.Size()
 	}
 
 	// ShadowSpill: write shadow FIRST, before Dirty. If shadow fails, return
@@ -4928,7 +4979,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			return 0, gofuse.Status(syscall.ENOSPC)
 		}
 		shadowStart := time.Now()
-		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {
+		if _, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev); err != nil {
 			log.Printf("shadow write failed for ShadowSpill %s: %v", fh.Path, err)
 			source = "shadow-spill-error"
 			return 0, gofuse.EIO
@@ -4939,7 +4990,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		source = "shadow-spill"
 	}
 
-	n, err := fh.Dirty.Write(int64(input.Offset), data)
+	n, err := fh.Dirty.Write(writeOffset, data)
 	if err != nil {
 		source = "dirty-write-error"
 		return 0, gofuse.Status(syscall.EFBIG)
@@ -4949,7 +5000,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	// Non-ShadowSpill: write-through to shadow after Dirty (best-effort).
 	if !fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
 		shadowStart := time.Now()
-		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {
+		if _, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev); err != nil {
 			log.Printf("shadow write-through failed for %s: %v", fh.Path, err)
 			fs.shadowStore.Remove(fh.Path)
 			fh.ShadowReady = false
@@ -5806,7 +5857,14 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(flushSize))
 			flushStatus = fs.flushGitHandleLocked(flushCtx, fh)
 			flushCancel()
+			localFile := fh.LocalFile
+			fh.LocalFile = nil
 			fh.Unlock()
+			if localFile != nil {
+				if err := localFile.Close(); err != nil && flushStatus == gofuse.OK {
+					flushStatus = localErrToFuseStatus(err)
+				}
+			}
 			return
 		}
 
