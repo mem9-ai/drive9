@@ -362,6 +362,42 @@ func TestTokenRevokeTreatsEscapedFlagNameAsLocalName(t *testing.T) {
 	}
 }
 
+func TestTokenRevokeAPIKeyFileValueCanBeHelpLike(t *testing.T) {
+	var gotMethod, gotPath string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+	defer srv.Close()
+
+	tmp := t.TempDir()
+	t.Chdir(tmp)
+	if err := os.WriteFile("--help", []byte("dat9_from_file\n"), 0o600); err != nil {
+		t.Fatalf("write token file: %v", err)
+	}
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv(EnvServer, srv.URL)
+	t.Setenv(EnvAPIKey, "owner-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	if err := TokenRevoke([]string{"--api-key-file", "--help"}); err != nil {
+		t.Fatalf("TokenRevoke(--api-key-file --help): %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v1/tokens/revoke" {
+		t.Fatalf("method/path = %s %s, want POST /v1/tokens/revoke", gotMethod, gotPath)
+	}
+	if gotBody["api_key"] != "dat9_from_file" {
+		t.Fatalf("request body = %#v", gotBody)
+	}
+}
+
 func TestTokenRevokeRejectsAPIKeyInArgv(t *testing.T) {
 	err := TokenRevoke([]string{"dat9_secret"})
 	if err == nil {
