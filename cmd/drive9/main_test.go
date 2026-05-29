@@ -267,6 +267,52 @@ func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
 	}
 }
 
+func TestFSSubcommandHelpSkipsCpValueFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sub  string
+		args []string
+		want bool
+	}{
+		{
+			name: "cp description value",
+			sub:  "cp",
+			args: []string{"--description", "--help", "local.txt", ":/x"},
+			want: false,
+		},
+		{
+			name: "cp tag value",
+			sub:  "cp",
+			args: []string{"--tag", "--help", "local.txt", ":/x"},
+			want: false,
+		},
+		{
+			name: "cp explicit help after value",
+			sub:  "cp",
+			args: []string{"--description", "note", "--help"},
+			want: true,
+		},
+		{
+			name: "cp escaped help",
+			sub:  "cp",
+			args: []string{"--", "--help"},
+			want: false,
+		},
+		{
+			name: "cat existing generic scan",
+			sub:  "cat",
+			args: []string{"--offset", "--help"},
+			want: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := fsSubcommandHasHelp(tc.sub, tc.args); got != tc.want {
+				t.Fatalf("fsSubcommandHasHelp(%q, %v) = %v, want %v", tc.sub, tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
 // V2b: `drive9 vault <sub>` MUST route to the vault handler with args forwarded
 // verbatim (no shell parsing, no arg mangling). This is the positive half of
 // the hard-cut contract: the new verb name is live.

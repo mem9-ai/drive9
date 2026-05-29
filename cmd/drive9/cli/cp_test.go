@@ -460,6 +460,55 @@ func TestCpUploadWithTagsSendsHeaders(t *testing.T) {
 	}
 }
 
+func TestCpDescriptionValueCanBeHelpLike(t *testing.T) {
+	localPath := filepath.Join(t.TempDir(), "upload.txt")
+	if err := os.WriteFile(localPath, []byte("hello description"), 0o644); err != nil {
+		t.Fatalf("WriteFile(local): %v", err)
+	}
+
+	var gotDescription string
+	var gotBody []byte
+	var putCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "PUT /v1/fs/described.txt":
+			putCalls++
+			gotDescription = r.Header.Get("X-Dat9-Description")
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			gotBody = append([]byte(nil), body...)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	c.SetSmallFileThresholdForTests(client.DefaultSmallFileThreshold)
+	out, err := captureStdoutE(t, func() error {
+		return Cp(c, []string{"--description", "--help", localPath, ":/described.txt"})
+	})
+	if err != nil {
+		t.Fatalf("Cp(upload with help-like description): %v", err)
+	}
+	if strings.Contains(out, "usage: drive9 fs cp") {
+		t.Fatalf("stdout = %q, want no cp usage", out)
+	}
+	if putCalls != 1 {
+		t.Fatalf("PUT calls = %d, want 1", putCalls)
+	}
+	if gotDescription != "--help" {
+		t.Fatalf("X-Dat9-Description = %q, want %q", gotDescription, "--help")
+	}
+	if got := string(gotBody); got != "hello description" {
+		t.Fatalf("uploaded body = %q, want %q", got, "hello description")
+	}
+}
+
 func TestCpTreatsHelpLikeSourcesAsData(t *testing.T) {
 	tmp := t.TempDir()
 	oldWD, err := os.Getwd()

@@ -36,7 +36,7 @@ const recursiveCopyConcurrency = 16
 //	drive9 fs cp :/remote/path -                  download to stdout
 //	drive9 fs cp --append tail.log :/remote/path  append local data to remote file
 func Cp(c *client.Client, args []string) error {
-	if IsHelpArgs(args) {
+	if IsCpHelpArgs(args) {
 		_, _ = fmt.Fprintln(os.Stdout, fsCpUsage())
 		return nil
 	}
