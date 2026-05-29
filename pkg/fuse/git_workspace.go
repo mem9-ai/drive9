@@ -1217,20 +1217,6 @@ func validateGitArchiveLinkname(linkname string) error {
 	return nil
 }
 
-func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath string) error {
-	if fs == nil || fs.git == nil || fs.client == nil || fs.localOverlay == nil {
-		return nil
-	}
-	if !localPathShouldCheckpointGitState(localPath) {
-		return nil
-	}
-	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
-	if !ok || (rel != ".git" && !strings.HasPrefix(rel, ".git/")) {
-		return nil
-	}
-	return fs.checkpointGitStateForRuntime(ctx, rt)
-}
-
 func (fs *Dat9FS) scheduleGitStateCheckpoint(localPath string) {
 	if fs == nil || fs.gitCheckpoints == nil || !localPathShouldCheckpointGitState(localPath) {
 		return
@@ -1764,7 +1750,7 @@ func shouldSkipGitObjectStatePath(rel string, _ fs.DirEntry) bool {
 	return false
 }
 
-func (fs *Dat9FS) putGitOverlay(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest) (*client.GitOverlayEntry, error) {
+func normalizeGitOverlayRequest(req client.GitOverlayEntryRequest) client.GitOverlayEntryRequest {
 	if req.Op == "" {
 		req.Op = "upsert"
 	}
@@ -1774,24 +1760,159 @@ func (fs *Dat9FS) putGitOverlay(ctx context.Context, workspaceID string, req cli
 	if req.SizeBytes == 0 && len(req.Content) > 0 {
 		req.SizeBytes = int64(len(req.Content))
 	}
-	entry, err := fs.client.PutGitOverlayEntry(ctx, workspaceID, req)
-	if err != nil {
-		return nil, err
+	if len(req.Content) > 0 {
+		req.Content = append([]byte(nil), req.Content...)
+	}
+	return req
+}
+
+func gitOverlayEntryFromRequest(workspaceID string, req client.GitOverlayEntryRequest) *client.GitOverlayEntry {
+	now := time.Now()
+	return &client.GitOverlayEntry{
+		WorkspaceID:    workspaceID,
+		Path:           req.Path,
+		Op:             req.Op,
+		Kind:           req.Kind,
+		Mode:           req.Mode,
+		StorageType:    req.StorageType,
+		StorageRef:     req.StorageRef,
+		StorageRefHash: req.StorageRefHash,
+		ChecksumSHA256: req.ChecksumSHA256,
+		SizeBytes:      req.SizeBytes,
+		BaseObjectSHA:  req.BaseObjectSHA,
+		Content:        append([]byte(nil), req.Content...),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+}
+
+func (fs *Dat9FS) applyGitOverlayEntry(workspaceID string, entry client.GitOverlayEntry) {
+	if fs == nil || fs.git == nil {
+		return
 	}
 	fs.git.mu.Lock()
 	defer fs.git.mu.Unlock()
 	for _, rt := range fs.git.workspaces {
 		if rt.workspace.WorkspaceID == workspaceID {
 			rt.mu.Lock()
-			rt.overlay[entry.Path] = *entry
+			rt.overlay[entry.Path] = entry
 			rt.mu.Unlock()
 			break
 		}
 	}
+}
+
+func (fs *Dat9FS) gitOverlayWriteBackEnabled(policy WritePolicy, forceSync bool) bool {
+	if fs == nil || forceSync {
+		return false
+	}
+	if policy == "" {
+		policy = WritePolicyWriteBack
+	}
+	if policy != WritePolicyWriteBack {
+		return false
+	}
+	return fs.syncMode == SyncInteractive
+}
+
+func (fs *Dat9FS) reserveGitOverlayCommitSlot() (<-chan struct{}, chan struct{}) {
+	done := make(chan struct{})
+	if fs == nil {
+		return nil, done
+	}
+	fs.gitOverlayMu.Lock()
+	prev := fs.gitOverlayTail
+	fs.gitOverlayTail = done
+	fs.gitOverlayMu.Unlock()
+	return prev, done
+}
+
+func (fs *Dat9FS) putGitOverlayRemote(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest) (*client.GitOverlayEntry, error) {
+	if fs == nil || fs.client == nil {
+		return nil, syscall.EIO
+	}
+	start := fs.perfStart()
+	entry, err := fs.client.PutGitOverlayEntry(ctx, workspaceID, req)
+	fs.perfRecordRemote(perfRemoteMutation, start, err, uint64(len(req.Content)))
+	if fs.perfEnabled() {
+		if err != nil {
+			fs.perf.gitOverlayFailure.add(1)
+		} else {
+			fs.perf.gitOverlaySuccess.add(1)
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
 	return entry, nil
 }
 
+func (fs *Dat9FS) putGitOverlay(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest) (*client.GitOverlayEntry, error) {
+	policy := WritePolicyWriteBack
+	if fs != nil && fs.opts != nil && fs.opts.WritePolicy != "" {
+		policy = fs.opts.WritePolicy
+	}
+	return fs.putGitOverlayWithPolicy(ctx, workspaceID, req, policy, false)
+}
+
+func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID string, req client.GitOverlayEntryRequest, policy WritePolicy, forceSync bool) (*client.GitOverlayEntry, error) {
+	req = normalizeGitOverlayRequest(req)
+	localEntry := gitOverlayEntryFromRequest(workspaceID, req)
+	if fs.gitOverlayWriteBackEnabled(policy, forceSync) {
+		fs.applyGitOverlayEntry(workspaceID, *localEntry)
+		prev, done := fs.reserveGitOverlayCommitSlot()
+		if fs.perfEnabled() {
+			fs.perf.gitOverlayEnqueue.add(1)
+		}
+		fs.gitOverlayWG.Add(1)
+		go func() {
+			defer fs.gitOverlayWG.Done()
+			if prev != nil {
+				<-prev
+			}
+			defer close(done)
+			timeout := releaseTimeout(req.SizeBytes)
+			commitCtx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+			if _, err := fs.putGitOverlayRemote(commitCtx, workspaceID, req); err != nil {
+				log.Printf("git workspace overlay async commit failed workspace=%s path=%s op=%s: %v", workspaceID, req.Path, req.Op, err)
+			}
+		}()
+		return localEntry, nil
+	}
+	if fs.perfEnabled() {
+		fs.perf.gitOverlaySync.add(1)
+	}
+	prev, done := fs.reserveGitOverlayCommitSlot()
+	if prev != nil {
+		<-prev
+	}
+	defer close(done)
+	entry, err := fs.putGitOverlayRemote(ctx, workspaceID, req)
+	if err != nil {
+		return nil, err
+	}
+	fs.applyGitOverlayEntry(workspaceID, *entry)
+	return entry, nil
+}
+
+func (fs *Dat9FS) drainGitOverlayWrites() {
+	if fs == nil {
+		return
+	}
+	start := time.Now()
+	fs.gitOverlayWG.Wait()
+	if fs.perfEnabled() {
+		fs.perf.gitOverlayDrainCount.add(1)
+		fs.perf.gitOverlayDrainTotalNS.add(uint64(time.Since(start)))
+	}
+}
+
 func (fs *Dat9FS) flushGitHandleLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
+	return fs.flushGitHandleLockedWithPolicy(ctx, fh, false)
+}
+
+func (fs *Dat9FS) flushGitHandleLockedWithPolicy(ctx context.Context, fh *FileHandle, forceSync bool) gofuse.Status {
 	if fh == nil || fh.Layer != PathLayerGitWorkspace {
 		return gofuse.OK
 	}
@@ -1808,7 +1929,7 @@ func (fs *Dat9FS) flushGitHandleLocked(ctx context.Context, fh *FileHandle) gofu
 			SizeBytes:     fh.OrigSize,
 		}
 		fh.Unlock()
-		_, err := fs.putGitOverlay(ctx, fh.GitWorkspaceID, req)
+		_, err := fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync)
 		fh.Lock()
 		if err != nil {
 			return httpToFuseStatus(err)
@@ -1831,7 +1952,7 @@ func (fs *Dat9FS) flushGitHandleLocked(ctx context.Context, fh *FileHandle) gofu
 		SizeBytes:     int64(len(data)),
 	}
 	fh.Unlock()
-	_, err := fs.putGitOverlay(ctx, fh.GitWorkspaceID, req)
+	_, err := fs.putGitOverlayWithPolicy(ctx, fh.GitWorkspaceID, req, fh.WritePolicy, forceSync)
 	fh.Lock()
 	if err != nil {
 		return httpToFuseStatus(err)

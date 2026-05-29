@@ -30,6 +30,8 @@ const fixtureHeadCommit = "1111111111111111111111111111111111111111"
 type gitWorkspaceFixture struct {
 	mu              sync.Mutex
 	overlay         map[string]client.GitOverlayEntry
+	overlayPuts     int
+	overlayPostWait chan struct{}
 	objectPacks     map[string]client.GitObjectPack
 	state           []byte
 	stateStorage    string
@@ -213,15 +215,15 @@ func (f *gitWorkspaceFixture) handleObjectPacks(w http.ResponseWriter, r *http.R
 }
 
 func (f *gitWorkspaceFixture) handleOverlay(w http.ResponseWriter, r *http.Request) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.failOverlay && r.Method == http.MethodGet {
-		w.WriteHeader(http.StatusInternalServerError)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": "overlay unavailable"})
-		return
-	}
 	switch r.Method {
 	case http.MethodGet:
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.failOverlay {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "overlay unavailable"})
+			return
+		}
 		if p := r.URL.Query().Get("path"); p != "" {
 			entry, ok := f.overlay[p]
 			if !ok {
@@ -242,6 +244,12 @@ func (f *gitWorkspaceFixture) handleOverlay(w http.ResponseWriter, r *http.Reque
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
+		}
+		f.mu.Lock()
+		wait := f.overlayPostWait
+		f.mu.Unlock()
+		if wait != nil {
+			<-wait
 		}
 		entry := client.GitOverlayEntry{
 			WorkspaceID:    "ws1",
@@ -268,6 +276,9 @@ func (f *gitWorkspaceFixture) handleOverlay(w http.ResponseWriter, r *http.Reque
 		if entry.SizeBytes == 0 && len(entry.Content) > 0 {
 			entry.SizeBytes = int64(len(entry.Content))
 		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.overlayPuts++
 		f.overlay[entry.Path] = entry
 		_ = json.NewEncoder(w).Encode(entry)
 	default:
@@ -401,6 +412,146 @@ func TestGitWorkspaceWriteSyncWritesOverlay(t *testing.T) {
 	}
 
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+}
+
+func TestGitWorkspaceWriteBackDefersOverlayRemoteAndDrains(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	wait := make(chan struct{})
+	var closeWait sync.Once
+	t.Cleanup(func() { closeWait.Do(func() { close(wait) }) })
+	fixture.mu.Lock()
+	fixture.overlayPostWait = wait
+	fixture.mu.Unlock()
+
+	opts := &MountOptions{
+		LocalRoot:           t.TempDir(),
+		SyncMode:            SyncInteractive,
+		WritePolicy:         WritePolicyWriteBack,
+		EnableGitWorkspaces: true,
+		PerfCounters:        true,
+	}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     0o644,
+	}, "async.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	content := []byte("writeback overlay")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(content)),
+	}, content); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+
+	fixture.mu.Lock()
+	putsBeforeDrain := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if putsBeforeDrain != 0 {
+		t.Fatalf("overlay puts before drain = %d, want 0", putsBeforeDrain)
+	}
+	got, err := fs.readGitFile(context.Background(), "/repo/async.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("readGitFile local overlay: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("local overlay content = %q, want %q", got, content)
+	}
+
+	closeWait.Do(func() { close(wait) })
+	fs.drainGitOverlayWrites()
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["async.txt"]
+	putsAfterDrain := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if !ok {
+		t.Fatalf("overlay entry missing after drain")
+	}
+	if putsAfterDrain != 1 {
+		t.Fatalf("overlay puts after drain = %d, want 1", putsAfterDrain)
+	}
+	if !bytes.Equal(entry.Content, content) {
+		t.Fatalf("overlay content = %q, want %q", entry.Content, content)
+	}
+}
+
+func TestGitWorkspaceMetadataWriteBackDefersOverlayRemoteAndDrains(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	wait := make(chan struct{})
+	var closeWait sync.Once
+	t.Cleanup(func() { closeWait.Do(func() { close(wait) }) })
+	fixture.mu.Lock()
+	fixture.overlayPostWait = wait
+	fixture.mu.Unlock()
+
+	opts := &MountOptions{
+		LocalRoot:           t.TempDir(),
+		SyncMode:            SyncInteractive,
+		WritePolicy:         WritePolicyWriteBack,
+		EnableGitWorkspaces: true,
+	}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var out gofuse.EntryOut
+	if st := fs.Mkdir(nil, &gofuse.MkdirIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Mode:     0o700,
+	}, "private", &out); st != gofuse.OK {
+		t.Fatalf("Mkdir status = %v, want OK", st)
+	}
+	entries, handled, err := fs.listGitDir(context.Background(), "/repo")
+	if err != nil || !handled {
+		t.Fatalf("listGitDir handled=%t err=%v, want handled nil", handled, err)
+	}
+	found := false
+	for _, entry := range entries {
+		if entry.Name == "private" && entry.IsDir {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("local overlay directory private missing from listing: %+v", entries)
+	}
+	fixture.mu.Lock()
+	putsBeforeDrain := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if putsBeforeDrain != 0 {
+		t.Fatalf("overlay puts before drain = %d, want 0", putsBeforeDrain)
+	}
+
+	closeWait.Do(func() { close(wait) })
+	fs.drainGitOverlayWrites()
+
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["private"]
+	putsAfterDrain := fixture.overlayPuts
+	fixture.mu.Unlock()
+	if !ok {
+		t.Fatalf("overlay entry missing after drain")
+	}
+	if putsAfterDrain != 1 {
+		t.Fatalf("overlay puts after drain = %d, want 1", putsAfterDrain)
+	}
+	if entry.Kind != "dir" {
+		t.Fatalf("overlay kind = %q, want dir", entry.Kind)
+	}
 }
 
 func TestGitWorkspaceChmodDirectoryPreservesKind(t *testing.T) {

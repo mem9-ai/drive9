@@ -45,6 +45,12 @@ func TestFusePerfCountersSummary(t *testing.T) {
 	perf.gitHydrateObjectSkipped.add(1)
 	perf.gitHydrateObjectMismatch.add(2)
 	perf.gitHydrateObjectFallbacks.add(1)
+	perf.gitOverlayEnqueue.add(2)
+	perf.gitOverlaySync.add(1)
+	perf.gitOverlaySuccess.add(3)
+	perf.gitOverlayFailure.add(1)
+	perf.gitOverlayDrainCount.add(1)
+	perf.gitOverlayDrainTotalNS.add(uint64(150 * time.Millisecond))
 
 	snap := perf.snapshot()
 	if got := snap.FuseOps["lookup"].count; got != 1 {
@@ -77,6 +83,7 @@ func TestFusePerfCountersSummary(t *testing.T) {
 		"perf git clean_read=3 tree_hit=1 blob_cache_hit=1 cache_miss=1 cat_file=1 cat_file_slow=1",
 		"hydrate_start=1 hydrate_success=1 hydrate_failure=0 hydrate_bytes=1024 hydrate_total=2s",
 		"hydrate_objects=4 hydrate_object_bytes=512 hydrate_object_skipped=1 hydrate_object_mismatch=2 hydrate_object_fallbacks=1",
+		"perf git_overlay enqueue=2 sync=1 success=3 failure=1 drain_count=1 drain_total=150ms",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("summary missing %q:\n%s", want, text)

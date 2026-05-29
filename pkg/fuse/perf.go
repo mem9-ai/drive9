@@ -155,6 +155,12 @@ type fusePerfCounters struct {
 	gitHydrateObjectSkipped   atomicUint64
 	gitHydrateObjectMismatch  atomicUint64
 	gitHydrateObjectFallbacks atomicUint64
+	gitOverlayEnqueue         atomicUint64
+	gitOverlaySync            atomicUint64
+	gitOverlaySuccess         atomicUint64
+	gitOverlayFailure         atomicUint64
+	gitOverlayDrainCount      atomicUint64
+	gitOverlayDrainTotalNS    atomicUint64
 }
 
 // atomicUint64 is a small wrapper around sync/atomic.Uint64. Keeping it local
@@ -316,6 +322,12 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	snap.Counters["git_hydrate_object_skipped"] = p.gitHydrateObjectSkipped.load()
 	snap.Counters["git_hydrate_object_mismatch"] = p.gitHydrateObjectMismatch.load()
 	snap.Counters["git_hydrate_object_fallbacks"] = p.gitHydrateObjectFallbacks.load()
+	snap.Counters["git_overlay_enqueue"] = p.gitOverlayEnqueue.load()
+	snap.Counters["git_overlay_sync"] = p.gitOverlaySync.load()
+	snap.Counters["git_overlay_success"] = p.gitOverlaySuccess.load()
+	snap.Counters["git_overlay_failure"] = p.gitOverlayFailure.load()
+	snap.Counters["git_overlay_drain_count"] = p.gitOverlayDrainCount.load()
+	snap.Counters["git_overlay_drain_total_ns"] = p.gitOverlayDrainTotalNS.load()
 	return snap
 }
 
@@ -371,6 +383,13 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 		snap.Counters["git_hydrate_object_skipped"],
 		snap.Counters["git_hydrate_object_mismatch"],
 		snap.Counters["git_hydrate_object_fallbacks"])
+	writePerfLine(w, "drive9: perf git_overlay enqueue=%d sync=%d success=%d failure=%d drain_count=%d drain_total=%s\n",
+		snap.Counters["git_overlay_enqueue"],
+		snap.Counters["git_overlay_sync"],
+		snap.Counters["git_overlay_success"],
+		snap.Counters["git_overlay_failure"],
+		snap.Counters["git_overlay_drain_count"],
+		time.Duration(snap.Counters["git_overlay_drain_total_ns"]).Truncate(time.Millisecond))
 }
 
 func writePerfOps(w io.Writer, group string, names []string, stats map[string]perfOpStats) {

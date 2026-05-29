@@ -56,6 +56,7 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 - `path_hash` is the SHA-256 hex hash used as the durable key; the original `path` is still stored and checked on lookup.
 - File payloads are currently stored inline in `content_blob`; large-file support can later extend this to S3/storage refs.
 - Directory creation is stored as an overlay entry with `kind=dir`.
+- Dirty overlay entries include file content and metadata changes such as chmod, directory creation, symlink creation, rename copy/whiteout, and delete whiteouts. FUSE applies them to the in-memory workspace view immediately, while the remote backend write follows the same `--durability` / write policy used by ordinary files.
 
 `git_workspace_git_state`
 
@@ -170,7 +171,10 @@ Edit a file:
 - New files and directories also enter the overlay.
 - In the coding-agent profile, untracked paths matched by the repository's `.gitignore` are local-only. This keeps repo-specific build outputs such as generated web assets, package build directories, and temporary tool output off Drive9 without hand-maintaining per-repo mount patterns.
 - Deleting a clean file writes a `whiteout`.
-- With `write-sync`, the overlay is uploaded before write returns, so partially edited files survive an agent or sandbox stop.
+- Dirty overlay file content and metadata use one durability policy:
+  - `writeback` with interactive durability updates the local runtime overlay before returning and commits the backend `git_workspace_overlay` entry on an ordered background path. `FlushAll`/unmount drains pending overlay writes.
+  - `close-sync`, `write-sync`, and strict durability wait for the backend overlay write before reporting success on the relevant FUSE operation.
+  - Background overlay writes are ordered per mount, so rename copy/whiteout sequences reach the backend in the same order they became visible locally.
 
 `git add`:
 

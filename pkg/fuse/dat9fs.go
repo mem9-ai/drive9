@@ -105,6 +105,12 @@ type Dat9FS struct {
 	// gitCheckpoints coalesces lightweight .git state checkpoints so Git
 	// porcelain close/rename/unlink paths do not synchronously run rev-list.
 	gitCheckpoints *flushDebouncer
+	// gitOverlayTail serializes background git workspace overlay commits so
+	// compound operations such as rename copy+whiteout reach the backend in
+	// the same order they became visible locally.
+	gitOverlayMu   sync.Mutex
+	gitOverlayTail chan struct{}
+	gitOverlayWG   sync.WaitGroup
 
 	// smallFileMax mirrors the server's inline_threshold (fetched lazily via
 	// the dat9 client). When 0, defaultSmallFileThreshold is used. Use the
@@ -194,6 +200,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		uid:            uint32(os.Getuid()),
 		gid:            uint32(os.Getgid()),
 		opts:           opts,
+		syncMode:       opts.SyncMode,
 		debouncer:      newFlushDebouncer(opts.FlushDebounce),
 		perf:           newFusePerfCounters(opts.PerfCounters),
 		localPolicy:    NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
@@ -4964,7 +4971,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		var st gofuse.Status
 		if fh.Layer == PathLayerGitWorkspace {
 			source = "git-write-sync"
-			st = fs.flushGitHandleLocked(writeCtx, fh)
+			st = fs.flushGitHandleLockedWithPolicy(writeCtx, fh, true)
 		} else {
 			st = fs.syncWriteHandleToRemoteLocked(writeCtx, fh)
 		}
@@ -5251,7 +5258,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		phase = "git-overlay"
 		flushCtx, flushCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
 		defer flushCancel()
-		return fs.flushGitHandleLocked(flushCtx, fh)
+		return fs.flushGitHandleLockedWithPolicy(flushCtx, fh, fs.syncMode == SyncStrict)
 	}
 
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() &&
@@ -5488,7 +5495,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		phase = "git-overlay"
 		flushCtx, flushCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
 		defer flushCancel()
-		return fs.flushGitHandleLocked(flushCtx, fh)
+		return fs.flushGitHandleLockedWithPolicy(flushCtx, fh, fs.syncMode == SyncStrict)
 	}
 
 	// Interactive mode: Fsync = local durable only. Shadow file + journal
@@ -6423,6 +6430,11 @@ func (fs *Dat9FS) FlushAll() {
 	// Drain coalesced .git checkpoints before shutdown so replacement
 	// sandboxes can restore the latest lightweight Git state.
 	fs.drainGitStateCheckpoints()
+
+	// Drain git workspace overlay commits queued by interactive writeback.
+	// These include both file payloads and metadata entries such as chmod,
+	// mkdir, symlink, and whiteout.
+	fs.drainGitOverlayWrites()
 
 	// Drain all pending write-back uploads before shutting down.
 	if fs.uploader != nil {
