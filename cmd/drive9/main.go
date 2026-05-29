@@ -227,12 +227,12 @@ func runFS(args []string) {
 	rest := args[1:]
 
 	if cli.IsHelpArg(sub) {
-		fmt.Fprint(os.Stdout, fsUsageText())
+		_, _ = fmt.Fprint(os.Stdout, fsUsageText())
 		return
 	}
 	if cli.IsHelpArgs(rest) {
 		if usage, ok := cli.FSSubcommandUsage(sub); ok {
-			fmt.Fprintln(os.Stdout, usage)
+			_, _ = fmt.Fprintln(os.Stdout, usage)
 			return
 		}
 	}
