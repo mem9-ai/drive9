@@ -22,6 +22,48 @@ func TestGitHubCodeloadURL(t *testing.T) {
 	}
 }
 
+func TestSanitizeRepoURL(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{
+			name: "https user token",
+			raw:  "https://secret@github.com/mem9-ai/drive9.git",
+			want: "https://github.com/mem9-ai/drive9.git",
+		},
+		{
+			name: "https password token and query",
+			raw:  "https://x-access-token:secret@github.com/mem9-ai/drive9.git?token=hidden&depth=1",
+			want: "https://github.com/mem9-ai/drive9.git?depth=1",
+		},
+		{
+			name: "ssh keeps git username",
+			raw:  "ssh://git@github.com/mem9-ai/drive9.git",
+			want: "ssh://git@github.com/mem9-ai/drive9.git",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SanitizeRepoURL(tt.raw); got != tt.want {
+				t.Fatalf("SanitizeRepoURL(%q) = %q, want %q", tt.raw, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSanitizeGitConfigCredentials(t *testing.T) {
+	config := "[remote \"origin\"]\n\turl = https://secret@github.com/mem9-ai/drive9.git\n"
+	got := string(SanitizeGitConfigCredentials([]byte(config)))
+	if strings.Contains(got, "secret") {
+		t.Fatalf("SanitizeGitConfigCredentials leaked secret: %q", got)
+	}
+	if !strings.Contains(got, "url = https://github.com/mem9-ai/drive9.git") {
+		t.Fatalf("SanitizeGitConfigCredentials = %q, want sanitized GitHub URL", got)
+	}
+}
+
 func TestExtractCodeloadTarRejectsTraversal(t *testing.T) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)

@@ -5253,7 +5253,12 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
 		if gitState && localFileHandleOpenedWritable(fh) {
-			fs.scheduleGitStateCheckpoint(fh.Path)
+			phase = "local-git-checkpoint"
+			checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+			defer checkpointCancel()
+			if err := fs.checkpointGitStateAfterLocalWrite(checkpointCtx, fh.Path, fs.syncMode == SyncStrict); err != nil {
+				return httpToFuseStatus(err)
+			}
 		}
 		return gofuse.OK
 	}
@@ -5490,7 +5495,12 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
 		if localPathShouldCheckpointGitState(fh.Path) && localFileHandleOpenedWritable(fh) {
-			fs.scheduleGitStateCheckpoint(fh.Path)
+			phase = "local-git-checkpoint"
+			checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+			defer checkpointCancel()
+			if err := fs.checkpointGitStateAfterLocalWrite(checkpointCtx, fh.Path, true); err != nil {
+				return httpToFuseStatus(err)
+			}
 		}
 		return gofuse.OK
 	}
@@ -5771,7 +5781,13 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				}
 			}
 			if flushStatus == gofuse.OK && gitState && openedWritable {
-				fs.scheduleGitStateCheckpoint(localPath)
+				phase = "local-git-checkpoint"
+				checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+				err := fs.checkpointGitStateAfterLocalWrite(checkpointCtx, localPath, fs.syncMode == SyncStrict)
+				checkpointCancel()
+				if err != nil {
+					flushStatus = httpToFuseStatus(err)
+				}
 			}
 			return
 		}

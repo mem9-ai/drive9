@@ -146,7 +146,7 @@ func gitClone(args []string) error {
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
 		RootPath:   resolved.RemotePath,
-		RepoURL:    repoURL,
+		RepoURL:    gitcache.SanitizeRepoURL(repoURL),
 		RemoteName: "origin",
 		BranchName: branch,
 		BaseCommit: head,
@@ -870,11 +870,24 @@ func archiveGitDir(ctx context.Context, gitDir string, skip func(string, fs.DirE
 			return err
 		}
 		hdr.Name = name
+		var data []byte
+		if info.Mode().IsRegular() && isGitConfigStatePath(name) {
+			data, err = os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			data = gitcache.SanitizeGitConfigCredentials(data)
+			hdr.Size = int64(len(data))
+		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
 		if !info.Mode().IsRegular() {
 			return nil
+		}
+		if data != nil {
+			_, err := tw.Write(data)
+			return err
 		}
 		f, err := os.Open(p)
 		if err != nil {
@@ -906,4 +919,9 @@ func shouldSkipGitObjectStatePath(rel string, _ fs.DirEntry) bool {
 		}
 	}
 	return false
+}
+
+func isGitConfigStatePath(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	return rel == "config" || strings.HasSuffix(rel, "/config")
 }

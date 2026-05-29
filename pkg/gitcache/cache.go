@@ -275,6 +275,63 @@ func ParseGitHubRepoURL(raw string) (GitHubRepoRef, bool) {
 	return parseGitHubRepoPath(u.Path)
 }
 
+// SanitizeRepoURL removes credential material from a Git remote URL before it is
+// persisted in Drive9 metadata or local hydrate manifests.
+func SanitizeRepoURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" {
+		return raw
+	}
+	if u.User != nil {
+		switch strings.ToLower(u.Scheme) {
+		case "http", "https":
+			u.User = nil
+		default:
+			if _, hasPassword := u.User.Password(); hasPassword {
+				u.User = url.User(u.User.Username())
+			}
+		}
+	}
+	if u.RawQuery != "" {
+		q := u.Query()
+		for _, key := range []string{"access_token", "auth_token", "oauth_token", "password", "private_token", "token"} {
+			q.Del(key)
+		}
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
+// SanitizeGitConfigCredentials redacts credential-bearing remote URLs from a
+// Git config file while preserving ordinary config formatting.
+func SanitizeGitConfigCredentials(data []byte) []byte {
+	lines := strings.SplitAfter(string(data), "\n")
+	changed := false
+	for i, line := range lines {
+		lineNoNewline := strings.TrimRight(line, "\r\n")
+		newline := line[len(lineNoNewline):]
+		eq := strings.Index(lineNoNewline, "=")
+		if eq < 0 || strings.TrimSpace(lineNoNewline[:eq]) != "url" {
+			continue
+		}
+		rawURL := strings.TrimSpace(lineNoNewline[eq+1:])
+		sanitized := SanitizeRepoURL(rawURL)
+		if sanitized == rawURL {
+			continue
+		}
+		lines[i] = lineNoNewline[:eq+1] + " " + sanitized + newline
+		changed = true
+	}
+	if !changed {
+		return data
+	}
+	return []byte(strings.Join(lines, ""))
+}
+
 // GitHubCodeloadURL returns the GitHub codeload tarball URL for a commit.
 func GitHubCodeloadURL(ref GitHubRepoRef, commit string) string {
 	return fmt.Sprintf("https://codeload.github.com/%s/%s/tar.gz/%s",
@@ -1044,7 +1101,7 @@ func writeHydrateMetadata(opts HydrateOptions, result HydrateResult) error {
 		Provider:        result.Provider,
 		TreeStatus:      result.TreeStatus,
 		ObjectStatus:    result.ObjectStatus,
-		RepoURL:         opts.RepoURL,
+		RepoURL:         SanitizeRepoURL(opts.RepoURL),
 		Commit:          opts.Commit,
 		WorkspaceID:     opts.WorkspaceID,
 		Files:           result.Files,

@@ -37,7 +37,6 @@ const gitStateStorageTarGzNoObjects = "tar.gz-no-objects"
 const gitWorkspaceModeFastBlobless = "fast-blobless"
 const gitLocalObjectMaxBlobBytes int64 = 5 << 20
 const gitLocalObjectMaxPackBytes int64 = 256 << 20
-const gitDirectoryRenameOverlayLimit = 100
 
 type gitWorkspaceLayer struct {
 	mu         sync.Mutex
@@ -350,11 +349,6 @@ type gitOverlaySnapshot struct {
 	entry client.GitOverlayEntry
 }
 
-type gitNodeSnapshot struct {
-	path string
-	node client.GitTreeNode
-}
-
 func (rt *gitWorkspaceRuntime) childrenFor(rel string) []client.GitTreeNode {
 	if rt == nil {
 		return nil
@@ -376,19 +370,6 @@ func (rt *gitWorkspaceRuntime) overlaySnapshot() []gitOverlaySnapshot {
 	out := make([]gitOverlaySnapshot, 0, len(rt.overlay))
 	for p, e := range rt.overlay {
 		out = append(out, gitOverlaySnapshot{path: p, entry: e})
-	}
-	return out
-}
-
-func (rt *gitWorkspaceRuntime) nodeSnapshot() []gitNodeSnapshot {
-	if rt == nil {
-		return nil
-	}
-	rt.mu.RLock()
-	defer rt.mu.RUnlock()
-	out := make([]gitNodeSnapshot, 0, len(rt.nodes))
-	for p, n := range rt.nodes {
-		out = append(out, gitNodeSnapshot{path: p, node: n})
 	}
 	return out
 }
@@ -1316,6 +1297,28 @@ func (fs *Dat9FS) scheduleGitStateCheckpoint(localPath string) {
 	})
 }
 
+func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath string) error {
+	if fs == nil || !localPathShouldCheckpointGitState(localPath) {
+		return nil
+	}
+	rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath)
+	if !ok || (rel != ".git" && !strings.HasPrefix(rel, ".git/")) {
+		return nil
+	}
+	if fs.gitCheckpoints != nil {
+		fs.gitCheckpoints.Cancel(gitWorkspaceCacheKey(rt))
+	}
+	return fs.checkpointGitStateForRuntime(ctx, rt)
+}
+
+func (fs *Dat9FS) checkpointGitStateAfterLocalWrite(ctx context.Context, localPath string, durable bool) error {
+	if durable {
+		return fs.checkpointGitStateForPath(ctx, localPath)
+	}
+	fs.scheduleGitStateCheckpoint(localPath)
+	return nil
+}
+
 func (fs *Dat9FS) drainGitStateCheckpoints() {
 	if fs == nil || fs.gitCheckpoints == nil {
 		return
@@ -2110,11 +2113,24 @@ func archiveLocalGitDirFiltered(gitDir string, skip func(string, fs.DirEntry) bo
 			return err
 		}
 		hdr.Name = name
+		var data []byte
+		if info.Mode().IsRegular() && isGitConfigStatePath(name) {
+			data, err = os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			data = gitcache.SanitizeGitConfigCredentials(data)
+			hdr.Size = int64(len(data))
+		}
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
 		if !info.Mode().IsRegular() {
 			return nil
+		}
+		if data != nil {
+			_, err := tw.Write(data)
+			return err
 		}
 		f, err := os.Open(p)
 		if err != nil {
@@ -2146,6 +2162,11 @@ func shouldSkipGitObjectStatePath(rel string, _ fs.DirEntry) bool {
 		}
 	}
 	return false
+}
+
+func isGitConfigStatePath(rel string) bool {
+	rel = filepath.ToSlash(rel)
+	return rel == "config" || strings.HasSuffix(rel, "/config")
 }
 
 func normalizeGitOverlayRequest(req client.GitOverlayEntryRequest) client.GitOverlayEntryRequest {
@@ -2863,126 +2884,9 @@ func (fs *Dat9FS) validateGitRenameTarget(ctx context.Context, oldRel, newRel st
 }
 
 func (fs *Dat9FS) renameGitDir(ctx context.Context, rt *gitWorkspaceRuntime, oldRel, newRel string) gofuse.Status {
-	if count := gitDirRenameEntryCount(rt, oldRel); count > gitDirectoryRenameOverlayLimit {
-		log.Printf("git workspace directory rename too large workspace=%s path=%s entries=%d limit=%d",
-			rt.workspace.WorkspaceID, oldRel, count, gitDirectoryRenameOverlayLimit)
-		return gofuse.Status(syscall.EXDEV)
-	}
-	if _, err := fs.putGitOverlay(ctx, rt.workspace.WorkspaceID, client.GitOverlayEntryRequest{
-		Path: newRel,
-		Op:   "upsert",
-		Kind: "dir",
-		Mode: gitDirOverlayMode(rt, oldRel),
-	}); err != nil {
-		return httpToFuseStatus(err)
-	}
-	prefix := oldRel + "/"
-	seen := map[string]struct{}{oldRel: {}}
-	for _, item := range rt.nodeSnapshot() {
-		rel, n := item.path, item.node
-		if rel == oldRel || !strings.HasPrefix(rel, prefix) {
-			continue
-		}
-		seen[rel] = struct{}{}
-		targetRel := newRel + strings.TrimPrefix(rel, oldRel)
-		if n.Kind == "dir" {
-			if _, err := fs.putGitOverlay(ctx, rt.workspace.WorkspaceID, client.GitOverlayEntryRequest{
-				Path: targetRel,
-				Op:   "upsert",
-				Kind: "dir",
-				Mode: gitDirOverlayMode(rt, rel),
-			}); err != nil {
-				return httpToFuseStatus(err)
-			}
-			continue
-		}
-		if st := fs.copyGitFileOverlay(ctx, rt, rel, targetRel); st != gofuse.OK {
-			return st
-		}
-	}
-	for _, item := range rt.overlaySnapshot() {
-		rel, e := item.path, item.entry
-		if rel == oldRel || !strings.HasPrefix(rel, prefix) {
-			continue
-		}
-		if _, ok := seen[rel]; ok {
-			continue
-		}
-		targetRel := newRel + strings.TrimPrefix(rel, oldRel)
-		req := client.GitOverlayEntryRequest{
-			Path:           targetRel,
-			Op:             e.Op,
-			Kind:           e.Kind,
-			Mode:           e.Mode,
-			StorageType:    e.StorageType,
-			StorageRef:     e.StorageRef,
-			StorageRefHash: e.StorageRefHash,
-			ChecksumSHA256: e.ChecksumSHA256,
-			SizeBytes:      e.SizeBytes,
-			BaseObjectSHA:  e.BaseObjectSHA,
-			Content:        e.Content,
-		}
-		if _, err := fs.putGitOverlay(ctx, rt.workspace.WorkspaceID, req); err != nil {
-			return httpToFuseStatus(err)
-		}
-	}
-	for rel := range seen {
-		if rel == oldRel {
-			continue
-		}
-		if _, err := fs.putGitOverlay(ctx, rt.workspace.WorkspaceID, client.GitOverlayEntryRequest{
-			Path: rel,
-			Op:   "whiteout",
-			Kind: "file",
-		}); err != nil {
-			return httpToFuseStatus(err)
-		}
-	}
-	for _, item := range rt.overlaySnapshot() {
-		rel := item.path
-		if rel == oldRel || strings.HasPrefix(rel, prefix) {
-			if _, err := fs.putGitOverlay(ctx, rt.workspace.WorkspaceID, client.GitOverlayEntryRequest{
-				Path: rel,
-				Op:   "whiteout",
-				Kind: "file",
-			}); err != nil {
-				return httpToFuseStatus(err)
-			}
-		}
-	}
-	return gofuse.OK
-}
-
-func gitDirRenameEntryCount(rt *gitWorkspaceRuntime, oldRel string) int {
-	prefix := oldRel + "/"
-	seen := map[string]struct{}{oldRel: {}}
-	for _, item := range rt.nodeSnapshot() {
-		rel := item.path
-		if rel == oldRel || strings.HasPrefix(rel, prefix) {
-			seen[rel] = struct{}{}
-		}
-	}
-	for _, item := range rt.overlaySnapshot() {
-		rel := item.path
-		if rel == oldRel || strings.HasPrefix(rel, prefix) {
-			seen[rel] = struct{}{}
-		}
-	}
-	return len(seen)
-}
-
-func gitDirOverlayMode(rt *gitWorkspaceRuntime, rel string) string {
-	if e, ok := rt.overlayEntry(rel); ok {
-		if parsed, ok := parseGitMode(e.Mode); ok {
-			return gitFileModeString(parsed, true)
-		}
-	}
-	if n, ok := rt.cleanNode(rel); ok {
-		if parsed, ok := parseGitMode(n.Mode); ok && parsed&0o777 != 0 {
-			return gitFileModeString(parsed, true)
-		}
-	}
-	return gitFileModeString(0o755, true)
+	log.Printf("git workspace directory rename requires cross-device fallback workspace=%s old=%s new=%s",
+		rt.workspace.WorkspaceID, oldRel, newRel)
+	return gofuse.Status(syscall.EXDEV)
 }
 
 func (fs *Dat9FS) copyGitFileOverlay(ctx context.Context, rt *gitWorkspaceRuntime, oldRel, newRel string) gofuse.Status {

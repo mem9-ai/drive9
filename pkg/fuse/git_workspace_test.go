@@ -702,31 +702,31 @@ func TestGitWorkspaceRenameRejectsNonEmptyDirectoryTarget(t *testing.T) {
 	}
 }
 
-func TestGitWorkspaceRenameLargeDirectoryReturnsEXDEV(t *testing.T) {
+func TestGitWorkspaceRenameDirectoryReturnsEXDEV(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
-	fixture.treeNodes = []client.GitTreeNode{{
-		WorkspaceID: "ws1",
-		CommitSHA:   fixtureHeadCommit,
-		Path:        "big",
-		ParentPath:  "",
-		Name:        "big",
-		Kind:        "dir",
-		Mode:        "040000",
-		ObjectSHA:   "3333333333333333333333333333333333333333",
-		SizeBytes:   -1,
-	}}
-	for i := 0; i < gitDirectoryRenameOverlayLimit+1; i++ {
-		fixture.treeNodes = append(fixture.treeNodes, client.GitTreeNode{
+	fixture.treeNodes = []client.GitTreeNode{
+		{
 			WorkspaceID: "ws1",
 			CommitSHA:   fixtureHeadCommit,
-			Path:        fmt.Sprintf("big/file-%03d.txt", i),
-			ParentPath:  "big",
-			Name:        fmt.Sprintf("file-%03d.txt", i),
+			Path:        "dir",
+			ParentPath:  "",
+			Name:        "dir",
+			Kind:        "dir",
+			Mode:        "040000",
+			ObjectSHA:   "3333333333333333333333333333333333333333",
+			SizeBytes:   -1,
+		},
+		{
+			WorkspaceID: "ws1",
+			CommitSHA:   fixtureHeadCommit,
+			Path:        "dir/file.txt",
+			ParentPath:  "dir",
+			Name:        "file.txt",
 			Kind:        "file",
 			Mode:        "100644",
-			ObjectSHA:   fmt.Sprintf("%040x", i+1),
+			ObjectSHA:   "4444444444444444444444444444444444444444",
 			SizeBytes:   1,
-		})
+		},
 	}
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
@@ -736,14 +736,14 @@ func TestGitWorkspaceRenameLargeDirectoryReturnsEXDEV(t *testing.T) {
 	st := fs.Rename(nil, &gofuse.RenameIn{
 		InHeader: gofuse.InHeader{NodeId: repoIno},
 		Newdir:   repoIno,
-	}, "big", "moved")
+	}, "dir", "moved")
 	if st != gofuse.Status(syscall.EXDEV) {
 		t.Fatalf("Rename status = %v, want EXDEV", st)
 	}
 	fixture.mu.Lock()
 	defer fixture.mu.Unlock()
 	if len(fixture.overlay) != 0 {
-		t.Fatalf("overlay writes = %d, want none after guarded rename", len(fixture.overlay))
+		t.Fatalf("overlay writes = %d, want none after directory rename fallback", len(fixture.overlay))
 	}
 }
 
@@ -849,7 +849,8 @@ func TestGitWorkspaceRestoreReplacesInvalidLocalGitState(t *testing.T) {
 
 func TestArchiveLocalGitStateDirSkipsObjectDatabases(t *testing.T) {
 	gitDir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte("[core]\n"), 0o644); err != nil {
+	config := "[remote \"origin\"]\n\turl = https://secret-token@github.com/mem9-ai/drive9.git\n"
+	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte(config), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(gitDir, "objects", "aa"), 0o755); err != nil {
@@ -873,8 +874,12 @@ func TestArchiveLocalGitStateDirSkipsObjectDatabases(t *testing.T) {
 	if err := extractGitArchive(state, dst); err != nil {
 		t.Fatalf("extractGitArchive: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dst, "config")); err != nil {
+	gotConfig, err := os.ReadFile(filepath.Join(dst, "config"))
+	if err != nil {
 		t.Fatalf("config missing from objectless archive: %v", err)
+	}
+	if strings.Contains(string(gotConfig), "secret-token") || !strings.Contains(string(gotConfig), "https://github.com/mem9-ai/drive9.git") {
+		t.Fatalf("config credentials were not sanitized: %q", gotConfig)
 	}
 	if _, err := os.Stat(filepath.Join(dst, "objects")); !os.IsNotExist(err) {
 		t.Fatalf("objects restored from objectless archive, err=%v", err)

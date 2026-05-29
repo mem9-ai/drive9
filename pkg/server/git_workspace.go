@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/datastore"
+	"github.com/mem9-ai/dat9/pkg/gitcache"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 )
@@ -177,7 +178,7 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 		errJSON(w, http.StatusBadRequest, "root_path cannot be / for a git workspace")
 		return
 	}
-	repoURL := strings.TrimSpace(req.RepoURL)
+	repoURL := gitcache.SanitizeRepoURL(req.RepoURL)
 	if repoURL == "" {
 		errJSON(w, http.StatusBadRequest, "repo_url is required")
 		return
