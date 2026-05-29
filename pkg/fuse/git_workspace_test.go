@@ -462,6 +462,12 @@ func TestGitWorkspaceWriteBackDefersOverlayRemoteAndDrains(t *testing.T) {
 	if putsBeforeDrain != 0 {
 		t.Fatalf("overlay puts before drain = %d, want 0", putsBeforeDrain)
 	}
+	fs.git.mu.Lock()
+	fs.git.loadedAt = time.Time{}
+	fs.git.mu.Unlock()
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces during pending overlay: %v", err)
+	}
 	got, err := fs.readGitFile(context.Background(), "/repo/async.txt", 0, -1)
 	if err != nil {
 		t.Fatalf("readGitFile local overlay: %v", err)
@@ -534,6 +540,25 @@ func TestGitWorkspaceMetadataWriteBackDefersOverlayRemoteAndDrains(t *testing.T)
 	fixture.mu.Unlock()
 	if putsBeforeDrain != 0 {
 		t.Fatalf("overlay puts before drain = %d, want 0", putsBeforeDrain)
+	}
+	fs.git.mu.Lock()
+	fs.git.loadedAt = time.Time{}
+	fs.git.mu.Unlock()
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces during pending metadata: %v", err)
+	}
+	entries, handled, err = fs.listGitDir(context.Background(), "/repo")
+	if err != nil || !handled {
+		t.Fatalf("listGitDir after refresh handled=%t err=%v, want handled nil", handled, err)
+	}
+	found = false
+	for _, entry := range entries {
+		if entry.Name == "private" && entry.IsDir {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pending metadata disappeared after refresh: %+v", entries)
 	}
 
 	closeWait.Do(func() { close(wait) })

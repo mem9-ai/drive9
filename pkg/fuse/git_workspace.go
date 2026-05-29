@@ -68,6 +68,11 @@ type gitMaterializeCall struct {
 	err  error
 }
 
+type pendingGitOverlayEntry struct {
+	seq   uint64
+	entry client.GitOverlayEntry
+}
+
 func newGitWorkspaceLayer() *gitWorkspaceLayer {
 	return &gitWorkspaceLayer{
 		materialize:    make(map[string]*gitMaterializeCall),
@@ -129,6 +134,7 @@ func (fs *Dat9FS) ensureGitWorkspaces(ctx context.Context) error {
 		for _, e := range overlays {
 			rt.overlay[e.Path] = e
 		}
+		fs.mergePendingGitOverlayEntries(ws.WorkspaceID, rt.overlay)
 		loaded = append(loaded, rt)
 	}
 	if len(loadErrs) > 0 {
@@ -1802,6 +1808,56 @@ func (fs *Dat9FS) applyGitOverlayEntry(workspaceID string, entry client.GitOverl
 	}
 }
 
+func (fs *Dat9FS) rememberPendingGitOverlayEntry(workspaceID string, entry client.GitOverlayEntry) uint64 {
+	if fs == nil {
+		return 0
+	}
+	seq := fs.gitOverlaySeq.Add(1)
+	fs.gitOverlayMu.Lock()
+	if fs.gitOverlayPending == nil {
+		fs.gitOverlayPending = make(map[string]map[string]pendingGitOverlayEntry)
+	}
+	byPath := fs.gitOverlayPending[workspaceID]
+	if byPath == nil {
+		byPath = make(map[string]pendingGitOverlayEntry)
+		fs.gitOverlayPending[workspaceID] = byPath
+	}
+	byPath[entry.Path] = pendingGitOverlayEntry{seq: seq, entry: entry}
+	fs.gitOverlayMu.Unlock()
+	return seq
+}
+
+func (fs *Dat9FS) forgetPendingGitOverlayEntry(workspaceID, relPath string, seq uint64) {
+	if fs == nil || relPath == "" {
+		return
+	}
+	fs.gitOverlayMu.Lock()
+	defer fs.gitOverlayMu.Unlock()
+	byPath := fs.gitOverlayPending[workspaceID]
+	if byPath == nil {
+		return
+	}
+	pending, ok := byPath[relPath]
+	if !ok || (seq != 0 && pending.seq != seq) {
+		return
+	}
+	delete(byPath, relPath)
+	if len(byPath) == 0 {
+		delete(fs.gitOverlayPending, workspaceID)
+	}
+}
+
+func (fs *Dat9FS) mergePendingGitOverlayEntries(workspaceID string, overlay map[string]client.GitOverlayEntry) {
+	if fs == nil || len(overlay) == 0 && fs.gitOverlayPending == nil {
+		return
+	}
+	fs.gitOverlayMu.Lock()
+	defer fs.gitOverlayMu.Unlock()
+	for rel, pending := range fs.gitOverlayPending[workspaceID] {
+		overlay[rel] = pending.entry
+	}
+}
+
 func (fs *Dat9FS) gitOverlayWriteBackEnabled(policy WritePolicy, forceSync bool) bool {
 	if fs == nil || forceSync {
 		return false
@@ -1859,6 +1915,7 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 	req = normalizeGitOverlayRequest(req)
 	localEntry := gitOverlayEntryFromRequest(workspaceID, req)
 	if fs.gitOverlayWriteBackEnabled(policy, forceSync) {
+		pendingSeq := fs.rememberPendingGitOverlayEntry(workspaceID, *localEntry)
 		fs.applyGitOverlayEntry(workspaceID, *localEntry)
 		prev, done := fs.reserveGitOverlayCommitSlot()
 		if fs.perfEnabled() {
@@ -1876,6 +1933,8 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 			defer cancel()
 			if _, err := fs.putGitOverlayRemote(commitCtx, workspaceID, req); err != nil {
 				log.Printf("git workspace overlay async commit failed workspace=%s path=%s op=%s: %v", workspaceID, req.Path, req.Op, err)
+			} else {
+				fs.forgetPendingGitOverlayEntry(workspaceID, req.Path, pendingSeq)
 			}
 		}()
 		return localEntry, nil
@@ -1892,6 +1951,7 @@ func (fs *Dat9FS) putGitOverlayWithPolicy(ctx context.Context, workspaceID strin
 	if err != nil {
 		return nil, err
 	}
+	fs.forgetPendingGitOverlayEntry(workspaceID, entry.Path, 0)
 	fs.applyGitOverlayEntry(workspaceID, *entry)
 	return entry, nil
 }

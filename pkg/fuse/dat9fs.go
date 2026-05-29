@@ -108,9 +108,11 @@ type Dat9FS struct {
 	// gitOverlayTail serializes background git workspace overlay commits so
 	// compound operations such as rename copy+whiteout reach the backend in
 	// the same order they became visible locally.
-	gitOverlayMu   sync.Mutex
-	gitOverlayTail chan struct{}
-	gitOverlayWG   sync.WaitGroup
+	gitOverlayMu      sync.Mutex
+	gitOverlayTail    chan struct{}
+	gitOverlayWG      sync.WaitGroup
+	gitOverlaySeq     atomic.Uint64
+	gitOverlayPending map[string]map[string]pendingGitOverlayEntry
 
 	// smallFileMax mirrors the server's inline_threshold (fetched lazily via
 	// the dat9 client). When 0, defaultSmallFileThreshold is used. Use the
@@ -187,26 +189,27 @@ type dirtyInodeState struct {
 // NewDat9FS creates a new FUSE filesystem backed by the given dat9 client.
 func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 	return &Dat9FS{
-		RawFileSystem:  gofuse.NewDefaultRawFileSystem(),
-		client:         c,
-		inodes:         NewInodeToPath(),
-		fileHandles:    NewHandleTable[*FileHandle](),
-		openHandles:    NewOpenHandleIndex(),
-		dirHandles:     NewHandleTable[*DirHandle](),
-		readCache:      NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
-		dirCache:       NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
-		readSlots:      make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
-		dirtyInodes:    make(map[uint64]dirtyInodeState),
-		uid:            uint32(os.Getuid()),
-		gid:            uint32(os.Getgid()),
-		opts:           opts,
-		syncMode:       opts.SyncMode,
-		debouncer:      newFlushDebouncer(opts.FlushDebounce),
-		perf:           newFusePerfCounters(opts.PerfCounters),
-		localPolicy:    NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
-		localOverlay:   NewLocalOverlay(opts.LocalRoot),
-		git:            newGitWorkspaceLayer(),
-		gitCheckpoints: newFlushDebouncer(gitCheckpointDebounce),
+		RawFileSystem:     gofuse.NewDefaultRawFileSystem(),
+		client:            c,
+		inodes:            NewInodeToPath(),
+		fileHandles:       NewHandleTable[*FileHandle](),
+		openHandles:       NewOpenHandleIndex(),
+		dirHandles:        NewHandleTable[*DirHandle](),
+		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
+		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
+		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
+		dirtyInodes:       make(map[uint64]dirtyInodeState),
+		uid:               uint32(os.Getuid()),
+		gid:               uint32(os.Getgid()),
+		opts:              opts,
+		syncMode:          opts.SyncMode,
+		debouncer:         newFlushDebouncer(opts.FlushDebounce),
+		perf:              newFusePerfCounters(opts.PerfCounters),
+		localPolicy:       NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
+		localOverlay:      NewLocalOverlay(opts.LocalRoot),
+		git:               newGitWorkspaceLayer(),
+		gitCheckpoints:    newFlushDebouncer(gitCheckpointDebounce),
+		gitOverlayPending: make(map[string]map[string]pendingGitOverlayEntry),
 	}
 }
 
