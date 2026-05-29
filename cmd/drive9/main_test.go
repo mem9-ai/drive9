@@ -304,6 +304,42 @@ func TestFSSubcommandHelpSkipsCpValueFlags(t *testing.T) {
 			args: []string{"--offset", "--help"},
 			want: true,
 		},
+		{
+			name: "find name value",
+			sub:  "find",
+			args: []string{"/docs", "-name", "--help"},
+			want: false,
+		},
+		{
+			name: "find tag value",
+			sub:  "find",
+			args: []string{"/docs", "-tag", "-h"},
+			want: false,
+		},
+		{
+			name: "find newer value",
+			sub:  "find",
+			args: []string{"/docs", "-newer", "-help"},
+			want: false,
+		},
+		{
+			name: "find older value",
+			sub:  "find",
+			args: []string{"/docs", "-older", "--help"},
+			want: false,
+		},
+		{
+			name: "find size value",
+			sub:  "find",
+			args: []string{"/docs", "-size", "-h"},
+			want: false,
+		},
+		{
+			name: "find explicit help after value",
+			sub:  "find",
+			args: []string{"/docs", "-name", "*.md", "--help"},
+			want: true,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := fsSubcommandHasHelp(tc.sub, tc.args); got != tc.want {

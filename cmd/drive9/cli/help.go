@@ -52,6 +52,35 @@ func IsCpHelpArgs(args []string) bool {
 	return IsHelpArgsWithValueFlags(args, "--tag", "--description")
 }
 
+// IsFindHelpArgs reports whether find args contain a help token, excluding
+// help-like values consumed by find filter flags.
+func IsFindHelpArgs(args []string) bool {
+	valueFlag := map[string]struct{}{
+		"-name":  {},
+		"-tag":   {},
+		"-newer": {},
+		"-older": {},
+		"-size":  {},
+	}
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if _, ok := valueFlag[arg]; ok && i+1 < len(args) {
+			i++
+			if args[i] == "--" && i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		switch arg {
+		case "--":
+			return false
+		case "-h", "-help", "--help":
+			return true
+		}
+	}
+	return false
+}
+
 func stripLeadingDashDash(args []string) ([]string, bool) {
 	if len(args) > 0 && args[0] == "--" {
 		return args[1:], true

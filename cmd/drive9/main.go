@@ -289,6 +289,8 @@ func fsSubcommandHasHelp(sub string, args []string) bool {
 	switch sub {
 	case "cp":
 		return cli.IsCpHelpArgs(args)
+	case "find":
+		return cli.IsFindHelpArgs(args)
 	default:
 		return cli.IsHelpArgs(args)
 	}

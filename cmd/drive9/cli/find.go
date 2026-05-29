@@ -10,7 +10,7 @@ import (
 )
 
 func Find(c *client.Client, args []string) error {
-	if IsHelpArgs(args) {
+	if IsFindHelpArgs(args) {
 		_, _ = fmt.Fprintln(os.Stdout, fsFindUsage())
 		return nil
 	}

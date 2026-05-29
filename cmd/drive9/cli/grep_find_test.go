@@ -43,3 +43,48 @@ func TestFindTreatsEscapedDashPrefixedFilterValueAsData(t *testing.T) {
 		t.Fatalf("name/path = %q %q, want %q %q", gotName, gotPath, "--help", "/v1/fs/docs")
 	}
 }
+
+func TestFindFilterValuesCanBeHelpLike(t *testing.T) {
+	var gotName, gotTag, gotNewer, gotOlder, gotMaxSize, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotName = r.URL.Query().Get("name")
+		gotTag = r.URL.Query().Get("tag")
+		gotNewer = r.URL.Query().Get("newer")
+		gotOlder = r.URL.Query().Get("older")
+		gotMaxSize = r.URL.Query().Get("maxsize")
+		gotPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	err := Find(client.New(srv.URL, ""), []string{
+		"/docs",
+		"-name", "--help",
+		"-tag", "-h",
+		"-newer", "-help",
+		"-older", "--help",
+		"-size", "-h",
+	})
+	if err != nil {
+		t.Fatalf("Find(help-like filter values): %v", err)
+	}
+	if gotName != "--help" {
+		t.Fatalf("name = %q, want %q", gotName, "--help")
+	}
+	if gotTag != "-h" {
+		t.Fatalf("tag = %q, want %q", gotTag, "-h")
+	}
+	if gotNewer != "-help" {
+		t.Fatalf("newer = %q, want %q", gotNewer, "-help")
+	}
+	if gotOlder != "--help" {
+		t.Fatalf("older = %q, want %q", gotOlder, "--help")
+	}
+	if gotMaxSize != "h" {
+		t.Fatalf("maxsize = %q, want %q", gotMaxSize, "h")
+	}
+	if gotPath != "/v1/fs/docs" {
+		t.Fatalf("path = %q, want %q", gotPath, "/v1/fs/docs")
+	}
+}
