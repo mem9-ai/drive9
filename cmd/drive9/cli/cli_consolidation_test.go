@@ -41,7 +41,7 @@ func TestIsHelpArgsScansBeforeDashDash(t *testing.T) {
 		want bool
 	}{
 		{name: "empty", args: nil, want: false},
-		{name: "bare help first arg", args: []string{"help"}, want: true},
+		{name: "bare help is data outside command dispatch", args: []string{"help"}, want: false},
 		{name: "long help first arg", args: []string{"--help"}, want: true},
 		{name: "dash prefixed help flag value position", args: []string{"--from-file", "--help"}, want: true},
 		{name: "short help after flag", args: []string{"--name", "-h"}, want: true},

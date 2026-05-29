@@ -46,9 +46,14 @@ func Cp(c *client.Client, args []string) error {
 	var tags map[string]string
 	var description string
 	filtered := make([]string, 0, len(args))
+	parseFlags := true
 	for i := 0; i < len(args); i++ {
 		a := args[i]
 		switch {
+		case parseFlags && a == "--":
+			parseFlags = false
+		case !parseFlags:
+			filtered = append(filtered, args[i])
 		case a == "--resume":
 			resume = true
 		case a == "--append":
