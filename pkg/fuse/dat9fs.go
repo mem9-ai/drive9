@@ -4951,6 +4951,13 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
+		if fh.WritePolicy == WritePolicyWriteSync {
+			source = "git-local-write-sync"
+			st := fs.flushGitLocalFileHandleLockedWithPolicy(ctx, fh, true)
+			if st != gofuse.OK {
+				return 0, st
+			}
+		}
 		source = "git-local-file"
 		return written, gofuse.OK
 	}

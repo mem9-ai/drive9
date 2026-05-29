@@ -26,6 +26,7 @@ GIT_WORKSPACE_CLONE_TIMEOUT_S="${GIT_WORKSPACE_CLONE_TIMEOUT_S:-600}"
 GIT_WORKSPACE_GIT_TIMEOUT_S="${GIT_WORKSPACE_GIT_TIMEOUT_S:-120}"
 GIT_WORKSPACE_HYDRATE="${GIT_WORKSPACE_HYDRATE:-sync}"
 GIT_WORKSPACE_ALLOW_OTHER="${GIT_WORKSPACE_ALLOW_OTHER:-0}"
+GIT_WORKSPACE_TRACE_GIT="${GIT_WORKSPACE_TRACE_GIT:-0}"
 GIT_WORKSPACE_LOG_AUDIT_PATTERN="${GIT_WORKSPACE_LOG_AUDIT_PATTERN:-panic|fatal error|short read|input/output error}"
 
 PASS=0
@@ -145,8 +146,10 @@ run_with_timeout() {
     kill "$cmd_pid" >/dev/null 2>&1 || true
   ) &
   local watchdog_pid=$!
+  set +e
   wait "$cmd_pid"
   local rc=$?
+  set -e
   kill "$watchdog_pid" >/dev/null 2>&1 || true
   wait "$watchdog_pid" 2>/dev/null || true
   return "$rc"
@@ -190,6 +193,32 @@ wait_mount_state() {
   done
 }
 
+wait_mount_log_ready() {
+  local log_file="$1"
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  while :; do
+    if [ -f "$log_file" ] && grep -q "drive9: mounted on " "$log_file"; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
+}
+
+force_unmount() {
+  local mount_point="$1"
+  case "$(uname -s)" in
+    Darwin)
+      umount "$mount_point" >/dev/null 2>&1 || diskutil unmount force "$mount_point" >/dev/null 2>&1 || true
+      ;;
+    Linux)
+      fusermount3 -uz "$mount_point" >/dev/null 2>&1 || fusermount -uz "$mount_point" >/dev/null 2>&1 || umount -l "$mount_point" >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
 start_mount() {
   local mount_point="$1"
   local local_root="$2"
@@ -211,6 +240,7 @@ start_mount() {
   drive9 "${args[@]}" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
   wait_mount_state mounted
+  wait_mount_log_ready "$MOUNT_LOG"
 }
 
 stop_mount() {
@@ -218,6 +248,10 @@ stop_mount() {
   if [ -n "${MOUNT_POINT:-}" ] && is_mounted "$MOUNT_POINT"; then
     drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT" >/dev/null 2>&1 || true
     wait_mount_state unmounted >/dev/null 2>&1 || true
+    if is_mounted "$MOUNT_POINT"; then
+      force_unmount "$MOUNT_POINT"
+      wait_mount_state unmounted >/dev/null 2>&1 || true
+    fi
   fi
   if [ -n "${MOUNT_PID:-}" ] && kill -0 "$MOUNT_PID" >/dev/null 2>&1; then
     kill "$MOUNT_PID" >/dev/null 2>&1 || true
@@ -253,6 +287,13 @@ drive9() {
 }
 
 git_cmd() {
+  if [ "$GIT_WORKSPACE_TRACE_GIT" = "1" ]; then
+    {
+      printf '+ git'
+      printf ' %q' "$@"
+      printf '\n'
+    } >&2
+  fi
   run_with_timeout "$GIT_WORKSPACE_GIT_TIMEOUT_S" git "$@"
 }
 
@@ -265,8 +306,8 @@ clone_fast_blobless() {
 
 configure_git_identity() {
   local repo="$1"
-  git_cmd -C "$repo" config user.email "drive9-e2e@example.test"
-  git_cmd -C "$repo" config user.name "Drive9 E2E"
+  git_cmd -C "$repo" config user.email "drive9-e2e@example.test" || return
+  git_cmd -C "$repo" config user.name "Drive9 E2E" || return
 }
 
 select_and_append_existing() {
@@ -332,35 +373,35 @@ PY
 setup_ignored_local_only_probe() {
   local repo="$1"
   local marker="$2"
-  mkdir -p "$repo/.git/info"
-  printf '\nagent-bench/local-only/\n' >> "$repo/.git/info/exclude"
-  mkdir -p "$repo/agent-bench/local-only"
-  printf 'ignored local-only %s\n' "$marker" > "$repo/agent-bench/local-only/cache.txt"
+  mkdir -p "$repo/.git/info" || return
+  printf '\nagent-bench/local-only/\n' >> "$repo/.git/info/exclude" || return
+  mkdir -p "$repo/agent-bench/local-only" || return
+  printf 'ignored local-only %s\n' "$marker" > "$repo/agent-bench/local-only/cache.txt" || return
   git_cmd -C "$repo" check-ignore -q agent-bench/local-only/cache.txt
 }
 
 assert_clean_status() {
   local repo="$1"
   local out
-  out="$(git -C "$repo" status --porcelain=v1)"
+  out="$(git -C "$repo" status --porcelain=v1)" || return
   [ -z "$out" ]
 }
 
 assert_repo_ready() {
   local repo="$1"
-  test -d "$repo/.git"
-  git_cmd -C "$repo" rev-parse --is-inside-work-tree >/dev/null
-  git_cmd -C "$repo" log --oneline -1 >/dev/null
+  test -d "$repo/.git" || return
+  git_cmd -C "$repo" rev-parse --is-inside-work-tree >/dev/null || return
+  git_cmd -C "$repo" log --oneline -1 >/dev/null || return
   git_cmd -C "$repo" status --porcelain=v1 >/dev/null
 }
 
 commit_all() {
   local repo="$1"
   local message="$2"
-  git_cmd -C "$repo" status --porcelain=v1 >/dev/null
-  git_cmd -C "$repo" diff --stat >/dev/null
-  git_cmd -C "$repo" add -A
-  git_cmd -C "$repo" commit --no-verify -m "$message" >/dev/null
+  git_cmd -C "$repo" status --porcelain=v1 >/dev/null || return
+  git_cmd -C "$repo" diff --stat >/dev/null || return
+  git_cmd -C "$repo" add -A || return
+  git_cmd -C "$repo" commit --no-verify -m "$message" >/dev/null || return
   assert_clean_status "$repo"
 }
 
@@ -372,7 +413,7 @@ run_agent_edit_add_commit() {
   local mount_point="$case_root/mount"
   local local_root="$case_root/local-root"
   local log_file="$case_root/mount.log"
-  local repo="$mount_point/$slug"
+  local repo="$mount_point/$slug-$scenario"
   local selected="$case_root/selected.txt"
   mkdir -p "$case_root"
 
@@ -399,7 +440,7 @@ run_agent_patch_apply() {
   local mount_point="$case_root/mount"
   local local_root="$case_root/local-root"
   local log_file="$case_root/mount.log"
-  local repo="$mount_point/$slug"
+  local repo="$mount_point/$slug-$scenario"
   local selected="$case_root/selected.txt"
   local patch_file="$case_root/agent.patch"
   mkdir -p "$case_root"
@@ -431,7 +472,7 @@ run_sandbox_restore() {
   local local_root_b="$case_root/local-root-b"
   local log_a="$case_root/mount-a.log"
   local log_b="$case_root/mount-b.log"
-  local repo="$mount_point/$slug"
+  local repo="$mount_point/$slug-$scenario"
   local selected="$case_root/selected.txt"
   local status_before="$case_root/status-before.txt"
   local status_after="$case_root/status-after.txt"
@@ -566,6 +607,7 @@ prepare_cli_binary
 check_cmd "drive9 binary ready" test -x "$CLI_BIN"
 
 RUN_ROOT="$(mktemp -d "$FUSE_MOUNT_ROOT/drive9-git-workspace-e2e.XXXXXX")"
+RUN_ROOT="$(cd "$RUN_ROOT" && pwd -P)"
 echo "RUN_ROOT=$RUN_ROOT"
 
 IFS=',' read -r -a repo_specs <<< "$GIT_WORKSPACE_REPOS"

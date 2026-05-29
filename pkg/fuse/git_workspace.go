@@ -644,9 +644,9 @@ func gitWorkspaceOpenFlags(rt *gitWorkspaceRuntime, rel string, flags uint32) ui
 	if accMode != syscall.O_RDONLY {
 		return 0
 	}
-	if e, ok := rt.overlayEntry(rel); ok && gitOverlayHasContentChange(e) {
-		return gofuse.FOPEN_DIRECT_IO
-	}
+	// macFUSE mmap readers can SIGBUS on read-only DIRECT_IO handles. Git uses
+	// mmap in porcelain paths such as diff/status, so keep read-only workspace
+	// handles cacheable and rely on write/overlay updates to invalidate inodes.
 	return gofuse.FOPEN_KEEP_CACHE
 }
 
@@ -712,6 +712,14 @@ func (fs *Dat9FS) gitWorkspaceDirtyMirrorStat(rt *gitWorkspaceRuntime, rel strin
 		return nil, false
 	}
 	return info, true
+}
+
+func (fs *Dat9FS) removeGitDirtyMirror(rt *gitWorkspaceRuntime, rel string) {
+	mirrorPath, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel)
+	if !ok {
+		return
+	}
+	_ = os.Remove(mirrorPath)
 }
 
 func (fs *Dat9FS) readGitDirtyMirror(rt *gitWorkspaceRuntime, rel string, offset, size int64) ([]byte, bool, error) {
@@ -2633,6 +2641,7 @@ func (fs *Dat9FS) putGitWhiteout(ctx context.Context, localPath string) gofuse.S
 	}); err != nil {
 		return httpToFuseStatus(err)
 	}
+	fs.removeGitDirtyMirror(rt, rel)
 	fs.inodes.Remove(localPath)
 	fs.invalidateReadCacheAndTargets(localPath)
 	fs.dirCache.Invalidate(parentDir(localPath))
@@ -2740,6 +2749,9 @@ func (fs *Dat9FS) gitCreateHandle(ctx context.Context, localPath string, flags u
 	if hasMode {
 		fs.setPendingModeLocked(fh, mode, 0)
 	}
+	if file, ok := fs.openGitDirtyMirrorFile(rt, rel, flags|uint32(syscall.O_TRUNC), nil); ok {
+		fh.LocalFile = file
+	}
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
 	return fh, entry, gofuse.OK
 }
@@ -2776,6 +2788,10 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 		fh.ZeroBase = true
 		fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 		fs.inodes.UpdateSize(fh.Ino, 0)
+		if file, ok := fs.openGitDirtyMirrorFile(rt, rel, flags, nil); ok {
+			fh.LocalFile = file
+			return gofuse.OK
+		}
 		return gofuse.OK
 	}
 
@@ -2794,18 +2810,9 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 		fh.OrigSize = size
 		fs.inodes.UpdateSize(fh.Ino, size)
 	}
-	if mirrorPath, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel); ok {
-		if err := os.MkdirAll(filepath.Dir(mirrorPath), 0o755); err == nil {
-			if err := os.WriteFile(mirrorPath, data, 0o644); err == nil {
-				openFlags := int(flags)
-				openFlags &^= syscall.O_ACCMODE
-				openFlags |= syscall.O_RDWR | syscall.O_CREAT
-				if file, err := os.OpenFile(mirrorPath, openFlags, 0o644); err == nil {
-					fh.LocalFile = file
-					return gofuse.OK
-				}
-			}
-		}
+	if file, ok := fs.openGitDirtyMirrorFile(rt, rel, flags, data); ok {
+		fh.LocalFile = file
+		return gofuse.OK
 	}
 	bufMax := size * 2
 	if bufMax < maxPreloadSize {
@@ -2821,6 +2828,29 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 	}
 	fh.Dirty.ClearDirty()
 	return gofuse.OK
+}
+
+func (fs *Dat9FS) openGitDirtyMirrorFile(rt *gitWorkspaceRuntime, rel string, flags uint32, initial []byte) (*os.File, bool) {
+	mirrorPath, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel)
+	if !ok {
+		return nil, false
+	}
+	if err := os.MkdirAll(filepath.Dir(mirrorPath), 0o755); err != nil {
+		return nil, false
+	}
+	if initial != nil {
+		if err := os.WriteFile(mirrorPath, initial, 0o644); err != nil {
+			return nil, false
+		}
+	}
+	openFlags := int(flags)
+	openFlags &^= syscall.O_ACCMODE
+	openFlags |= syscall.O_RDWR | syscall.O_CREAT
+	file, err := os.OpenFile(mirrorPath, openFlags, 0o644)
+	if err != nil {
+		return nil, false
+	}
+	return file, true
 }
 
 func gitFileModeString(mode uint32, isDir bool) string {

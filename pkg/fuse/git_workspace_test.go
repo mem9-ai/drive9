@@ -495,7 +495,7 @@ func TestGitWorkspaceWriteBackDefersOverlayRemoteAndDrains(t *testing.T) {
 	}
 }
 
-func TestGitWorkspaceOverlayReadonlyOpenBypassesKernelCache(t *testing.T) {
+func TestGitWorkspaceOverlayReadonlyOpenKeepsKernelCacheForMmap(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
 	opts.setDefaults()
@@ -539,11 +539,11 @@ func TestGitWorkspaceOverlayReadonlyOpenBypassesKernelCache(t *testing.T) {
 	}, &overlayOpen); st != gofuse.OK {
 		t.Fatalf("Open overlay status = %v, want OK", st)
 	}
-	if overlayOpen.OpenFlags&gofuse.FOPEN_DIRECT_IO == 0 {
-		t.Fatalf("overlay open flags = %d, want FOPEN_DIRECT_IO", overlayOpen.OpenFlags)
+	if overlayOpen.OpenFlags&gofuse.FOPEN_KEEP_CACHE == 0 {
+		t.Fatalf("overlay open flags = %d, want FOPEN_KEEP_CACHE", overlayOpen.OpenFlags)
 	}
-	if overlayOpen.OpenFlags&gofuse.FOPEN_KEEP_CACHE != 0 {
-		t.Fatalf("overlay open flags = %d, do not want FOPEN_KEEP_CACHE", overlayOpen.OpenFlags)
+	if overlayOpen.OpenFlags&gofuse.FOPEN_DIRECT_IO != 0 {
+		t.Fatalf("overlay open flags = %d, do not want FOPEN_DIRECT_IO", overlayOpen.OpenFlags)
 	}
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: overlayOpen.Fh})
 }
@@ -2064,6 +2064,178 @@ func TestGitWorkspaceAppendOpenUsesCurrentBufferEnd(t *testing.T) {
 	want := append(append([]byte{}, content...), appendix...)
 	if !bytes.Equal(entry.Content, want) {
 		t.Fatalf("overlay content = %q, want %q", entry.Content, want)
+	}
+}
+
+func TestGitWorkspaceTruncateOpenRefreshesDirtyMirror(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	fixture := newGitWorkspaceFixture(t)
+	content := []byte("hello base\n")
+	repo := createGitRepoWithReadme(t, content)
+	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("archiveLocalGitDir: %v", err)
+	}
+	fixture.state = state
+	fixture.readmeObjectSHA = fuseGitOutputForTest(t, repo, "hash-object", "README.md")
+	fixture.readmeSize = int64(len(content))
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+
+	var appendOpen gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_APPEND),
+	}, &appendOpen); st != gofuse.OK {
+		t.Fatalf("append Open status = %v, want OK", st)
+	}
+	appendix := []byte("tail\n")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       appendOpen.Fh,
+		Offset:   0,
+		Size:     uint32(len(appendix)),
+	}, appendix); st != gofuse.OK {
+		t.Fatalf("append Write status = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: appendOpen.Fh}); st != gofuse.OK {
+		t.Fatalf("append Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: appendOpen.Fh})
+	appended := append(append([]byte{}, content...), appendix...)
+	got, err := fs.readGitFile(context.Background(), "/repo/README.md", 0, -1)
+	if err != nil {
+		t.Fatalf("read appended git file: %v", err)
+	}
+	if !bytes.Equal(got, appended) {
+		t.Fatalf("appended readGitFile = %q, want %q", got, appended)
+	}
+
+	var restoreOpen gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &restoreOpen); st != gofuse.OK {
+		t.Fatalf("restore Open status = %v, want OK", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       restoreOpen.Fh,
+		Offset:   0,
+		Size:     uint32(len(content)),
+	}, content); st != gofuse.OK {
+		t.Fatalf("restore Write status = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: restoreOpen.Fh}); st != gofuse.OK {
+		t.Fatalf("restore Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: restoreOpen.Fh})
+	fs.drainGitOverlayWrites()
+
+	got, err = fs.readGitFile(context.Background(), "/repo/README.md", 0, -1)
+	if err != nil {
+		t.Fatalf("read restored git file: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("restored readGitFile = %q, want %q", got, content)
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["README.md"]
+	fixture.mu.Unlock()
+	if !ok {
+		t.Fatalf("overlay entry missing for README.md")
+	}
+	if !bytes.Equal(entry.Content, content) {
+		t.Fatalf("restored overlay content = %q, want %q", entry.Content, content)
+	}
+}
+
+func TestGitWorkspaceUnlinkCreateRefreshesDirtyMirror(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	fixture := newGitWorkspaceFixture(t)
+	content := []byte("hello base\n")
+	repo := createGitRepoWithReadme(t, content)
+	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("archiveLocalGitDir: %v", err)
+	}
+	fixture.state = state
+	fixture.readmeObjectSHA = fuseGitOutputForTest(t, repo, "hash-object", "README.md")
+	fixture.readmeSize = int64(len(content))
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	var appendOpen gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_APPEND),
+	}, &appendOpen); st != gofuse.OK {
+		t.Fatalf("append Open status = %v, want OK", st)
+	}
+	appendix := []byte("tail\n")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       appendOpen.Fh,
+		Offset:   0,
+		Size:     uint32(len(appendix)),
+	}, appendix); st != gofuse.OK {
+		t.Fatalf("append Write status = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: appendOpen.Fh}); st != gofuse.OK {
+		t.Fatalf("append Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: appendOpen.Fh})
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT | syscall.O_EXCL),
+		Mode:     0o644,
+	}, "README.md", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+		Size:     uint32(len(content)),
+	}, content); st != gofuse.OK {
+		t.Fatalf("restore Write status = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
+		t.Fatalf("restore Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	fs.drainGitOverlayWrites()
+
+	got, err := fs.readGitFile(context.Background(), "/repo/README.md", 0, -1)
+	if err != nil {
+		t.Fatalf("read recreated git file: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("recreated readGitFile = %q, want %q", got, content)
 	}
 }
 
