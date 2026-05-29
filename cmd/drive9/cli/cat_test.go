@@ -30,6 +30,22 @@ func TestCatWritesFullFile(t *testing.T) {
 	}
 }
 
+func TestCatHelpWritesToInjectedWriter(t *testing.T) {
+	var out bytes.Buffer
+	stdout, err := captureStdoutE(t, func() error {
+		return catWithWriter(client.New("http://127.0.0.1", ""), []string{"--help"}, &out)
+	})
+	if err != nil {
+		t.Fatalf("cat help: %v", err)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if got := strings.TrimSpace(out.String()); got != fsCatUsage() {
+		t.Fatalf("writer output = %q, want %q", got, fsCatUsage())
+	}
+}
+
 func TestCatRangeWritesRequestedBytes(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

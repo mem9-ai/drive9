@@ -172,13 +172,13 @@ func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
 			name:      "vault",
 			cmd:       "vault",
 			args:      []string{"--help"},
-			firstLine: "usage drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>",
+			firstLine: "usage: drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>",
 		},
 		{
 			name:      "vault put",
 			cmd:       "vault",
 			args:      []string{"put", "/n/vault/aws", "--from", "--help"},
-			firstLine: "usage drive9 vault put /n/vault/<secret> --from <dir>",
+			firstLine: "usage: drive9 vault put /n/vault/<secret> --from <dir>",
 		},
 		{
 			name:      "token issue",

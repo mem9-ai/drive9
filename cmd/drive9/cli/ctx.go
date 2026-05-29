@@ -57,7 +57,7 @@ func ctxUsage() string {
   import                                              add delegated context from stdin (default when stdin is a pipe)
   fork [<new>] [--from <ctx>] [--json]                create a copy-on-write fork context
   ls [-l|--json] [--type <kind>|--scoped]             list contexts (filter by type: owner|delegated|fs_scoped)
-  use <name>                                          activate a context
+  use [--] <name>                                     activate a context
   rm <name>                                           remove a local context name (does NOT revoke server-side credential)`
 }
 
@@ -79,7 +79,7 @@ func ctxListUsage() string {
 	return "usage: drive9 ctx ls [-l|--json] [--type <kind>|--scoped]"
 }
 
-func ctxUseUsage() string { return "usage: drive9 ctx use <name>" }
+func ctxUseUsage() string { return "usage: drive9 ctx use [--] <name>" }
 
 type ctxShowEntry struct {
 	Name      string     `json:"name"`
@@ -970,11 +970,16 @@ func formatExpiresAt(t time.Time) string {
 //
 // Per §17 short-circuit, an already-expired delegated context is refused.
 func ctxUseCmd(args []string) error {
-	if IsHelpArgs(args) {
+	escaped := false
+	if len(args) > 0 && args[0] == "--" {
+		escaped = true
+		args = args[1:]
+	}
+	if !escaped && IsHelpArgs(args) {
 		_, _ = fmt.Fprintln(os.Stdout, ctxUseUsage())
 		return nil
 	}
-	if len(args) != 1 || strings.HasPrefix(args[0], "--") {
+	if len(args) != 1 || (!escaped && strings.HasPrefix(args[0], "--")) {
 		return fmt.Errorf("%s", ctxUseUsage())
 	}
 	name := args[0]

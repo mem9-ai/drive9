@@ -62,31 +62,31 @@ func Secret(args []string) error {
 }
 
 func vaultUsage() string {
-	return "usage drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>"
+	return "usage: drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>"
 }
 
 func vaultSetUsage() string {
-	return "usage drive9 vault set <name> <field=value|field=@file|field=-> [more fields]"
+	return "usage: drive9 vault set <name> <field=value|field=@file|field=-> [more fields]"
 }
 
-func vaultGetUsage() string { return "usage drive9 vault get <name[/field]> [--json|--env]" }
+func vaultGetUsage() string { return "usage: drive9 vault get <name[/field]> [--json|--env]" }
 
 func vaultWithUsage() string {
-	return "usage drive9 vault with /n/vault/<secret> -- <command...>"
+	return "usage: drive9 vault with /n/vault/<secret> -- <command...>"
 }
 
-func vaultLsUsage() string { return "usage drive9 vault ls [--json]" }
+func vaultLsUsage() string { return "usage: drive9 vault ls [--json]" }
 
-func vaultRmUsage() string { return "usage drive9 vault rm <name>" }
+func vaultRmUsage() string { return "usage: drive9 vault rm <name>" }
 
 func vaultGrantUsage() string {
-	return "usage drive9 vault grant --agent <agent> --perm <read|write> --ttl <duration> <scope...> [--json|--token-only]"
+	return "usage: drive9 vault grant --agent <agent> --perm <read|write> --ttl <duration> <scope...> [--json|--token-only]"
 }
 
-func vaultRevokeUsage() string { return "usage drive9 vault revoke <id>" }
+func vaultRevokeUsage() string { return "usage: drive9 vault revoke <id>" }
 
 func vaultAuditUsage() string {
-	return "usage drive9 vault audit [--secret <name>] [--agent <agent>] [--since <duration>] [--limit <n>] [--json]"
+	return "usage: drive9 vault audit [--secret <name>] [--agent <agent>] [--since <duration>] [--limit <n>] [--json]"
 }
 
 // SecretSet creates a new secret. It deliberately does NOT update in place on

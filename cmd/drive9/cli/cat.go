@@ -21,7 +21,7 @@ func Cat(c *client.Client, args []string) error {
 
 func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 	if IsHelpArgs(args) {
-		_, _ = fmt.Fprintln(os.Stdout, fsCatUsage())
+		_, _ = fmt.Fprintln(out, fsCatUsage())
 		return nil
 	}
 	fs := flag.NewFlagSet("fs cat", flag.ContinueOnError)
