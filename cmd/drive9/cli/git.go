@@ -352,6 +352,8 @@ func initializeFastCloneIndex(ctx context.Context, repoDir, commitSHA string) er
 }
 
 func configureFastCloneGitOptimizations(ctx context.Context, repoDir string) {
+	_ = gitRun(ctx, repoDir, "config", "gc.auto", "0")
+	_ = gitRun(ctx, repoDir, "config", "maintenance.auto", "false")
 	if err := gitRun(ctx, repoDir, "update-index", "--test-untracked-cache"); err == nil {
 		_ = gitRun(ctx, repoDir, "config", "core.untrackedCache", "true")
 	}

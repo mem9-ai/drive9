@@ -92,7 +92,10 @@ Coding-agent local overlay policy
 - The coding-agent mount profile routes heavyweight local state and generated output to `<local-root>/overlay` instead of Drive9 backend storage.
 - Default local-only paths include VCS state (`.git`, `.hg`, `.svn`), dependency directories (`node_modules`, `.venv`, `.pnpm-store`), build outputs (`dist`, `build`, `target`, `coverage`), temporary/cache directories (`tmp`, `.tmp`, `.cache`, `.turbo`, `.next/cache`, `.vitepress/cache`), and tool-specific generated output such as `.tmp-api-extractor`.
 - These local-only paths are still merged into FUSE directory listings with tracked Git workspace entries, so generated directories under a tracked source directory remain visible to local build tools without being uploaded to Drive9.
-- Local-only dependency and generated-output files are a rebuildable performance layer. Their ordinary FUSE `Flush` path does not force `fsync`; it refreshes local inode metadata only. Explicit `Fsync` still syncs the local file. Lightweight `.git` state still syncs/checkpoints so Git state can be restored in replacement sandboxes, while `.git/objects` remains a local object database/cache and is not checkpointed directly.
+- Local-only dependency and generated-output files are a rebuildable performance layer. Their ordinary FUSE `Flush` path does not force `fsync`; it refreshes local inode metadata only. Explicit `Fsync` still syncs the local file.
+- Lightweight `.git` state is checkpointed asynchronously and coalesced per workspace. Foreground `Flush`, `Fsync`, `Release`, `Rename`, and `Unlink` on local `.git` files only perform the necessary local filesystem operation and schedule a checkpoint; `FlushAll`/unmount drains pending checkpoints.
+- Transient Git lock files such as `.git/index.lock`, `.git/packed-refs.lock`, `.git/HEAD.lock`, and `refs/**/*.lock` are never checkpointed. The durable state is captured after Git atomically renames the lock file to its final destination.
+- `.git/objects` remains a local object database/cache and is not checkpointed directly.
 
 ## Clone Flow
 
@@ -134,6 +137,7 @@ Coding-agent local overlay policy
    ```
 
    This tells Git the clean tree object IDs without checking out file content.
+   The CLI also sets repo-local performance knobs such as `gc.auto=0`, `maintenance.auto=false`, `core.untrackedCache=true` when supported, and `core.splitIndex=true` when supported. Automatic foreground GC is disabled because local `.git/objects` is a rebuildable cache and Git porcelain should not unexpectedly auto-pack while FUSE is servicing `.git/index.lock` operations.
 
 6. The CLI calls Drive9 APIs:
 
@@ -172,7 +176,8 @@ Edit a file:
 
 - Git reads the clean+overlay synthetic working tree through FUSE.
 - `.git/index`, objects, logs, and related files are written to the local overlay.
-- Writable lightweight `.git` handles sync local file state and checkpoint local-only object packs first, then `git_workspace_git_state`, on flush/fsync/release/rename write paths.
+- Writable lightweight `.git` handles schedule a coalesced checkpoint instead of blocking the close/rename/unlink hot path. The checkpoint packs local-only Git objects first, then writes `git_workspace_git_state`.
+- Git lock files are local-only and transient; closing or unlinking them must not run checkpoint work. This prevents `git status`, `git diff`, and `git add` from paying `rev-list`/object-pack cost on every `.git/index.lock` lifecycle.
 - `.git/objects/**` is not checkpointed directly and does not enter Drive9 backend storage. Clean objects are rebuilt from remote or hydrate cache; local-only objects needed by staged state or local refs are packed during the next lightweight `.git` checkpoint.
 - Read-only `.git` handles do not checkpoint, which prevents commands such as `git status` from repeatedly uploading the full `.git` archive.
 - If a staged blob is larger than 5 MiB, restore downgrades that staged state to unstaged. The file content remains durable through the Drive9 dirty overlay.

@@ -33,7 +33,9 @@ type gitWorkspaceFixture struct {
 	objectPacks     map[string]client.GitObjectPack
 	state           []byte
 	stateStorage    string
+	gitStatePuts    int
 	mode            string
+	headCommit      string
 	deleted         bool
 	server          *httptest.Server
 	repoURL         string
@@ -51,6 +53,7 @@ func newGitWorkspaceFixture(t *testing.T) *gitWorkspaceFixture {
 		objectPacks:     make(map[string]client.GitObjectPack),
 		stateStorage:    "tar.gz",
 		mode:            "fast",
+		headCommit:      fixtureHeadCommit,
 		repoURL:         "https://example.test/repo.git",
 		readmeObjectSHA: "2222222222222222222222222222222222222222",
 		readmeSize:      12,
@@ -81,8 +84,8 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 			RepoURL:     f.repoURL,
 			RemoteName:  "origin",
 			BranchName:  "main",
-			BaseCommit:  fixtureHeadCommit,
-			HeadCommit:  fixtureHeadCommit,
+			BaseCommit:  f.headCommit,
+			HeadCommit:  f.headCommit,
 			Mode:        f.mode,
 			Status:      "active",
 			CreatedAt:   time.Now(),
@@ -101,7 +104,7 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 		if nodes == nil {
 			nodes = []client.GitTreeNode{{
 				WorkspaceID: "ws1",
-				CommitSHA:   fixtureHeadCommit,
+				CommitSHA:   f.headCommit,
 				Path:        "README.md",
 				ParentPath:  "",
 				Name:        "README.md",
@@ -116,14 +119,8 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 		f.handleOverlay(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/ws1/object-packs"):
 		f.handleObjectPacks(w, r)
-	case r.Method == http.MethodGet && r.URL.Path == "/v1/git-workspaces/ws1/git-state":
-		_ = json.NewEncoder(w).Encode(client.GitState{
-			WorkspaceID:      "ws1",
-			CheckpointCommit: "1111111111111111111111111111111111111111",
-			StorageType:      f.stateStorage,
-			SizeBytes:        int64(len(f.state)),
-			Content:          f.state,
-		})
+	case r.URL.Path == "/v1/git-workspaces/ws1/git-state":
+		f.handleGitState(w, r)
 	case r.Method == http.MethodDelete && r.URL.Path == "/v1/git-workspaces/ws1":
 		f.mu.Lock()
 		f.deleted = true
@@ -132,6 +129,41 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+	}
+}
+
+func (f *gitWorkspaceFixture) handleGitState(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch r.Method {
+	case http.MethodGet:
+		_ = json.NewEncoder(w).Encode(client.GitState{
+			WorkspaceID:      "ws1",
+			CheckpointCommit: f.headCommit,
+			StorageType:      f.stateStorage,
+			SizeBytes:        int64(len(f.state)),
+			Content:          f.state,
+		})
+	case http.MethodPost:
+		var req client.GitStateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		f.gitStatePuts++
+		f.stateStorage = req.StorageType
+		f.state = append([]byte(nil), req.Content...)
+		_ = json.NewEncoder(w).Encode(client.GitState{
+			WorkspaceID:      "ws1",
+			CheckpointCommit: req.CheckpointCommit,
+			StorageType:      req.StorageType,
+			SizeBytes:        int64(len(req.Content)),
+			Content:          req.Content,
+			CreatedAt:        time.Now(),
+			UpdatedAt:        time.Now(),
+		})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
@@ -1222,6 +1254,88 @@ func TestGitWorkspaceGeneratedTmpApiExtractorUsesLocalOverlay(t *testing.T) {
 	}
 	if _, ok := names["src"]; !ok {
 		t.Fatalf("listDir missing tracked src entry: %#v", entries)
+	}
+}
+
+func TestGitStateCheckpointIsDebouncedAndDrained(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	src := createGitRepoWithReadme(t, []byte("hello base\n"))
+	fixture := newGitWorkspaceFixture(t)
+	fixture.repoURL = src
+	fixture.headCommit = fuseGitOutputForTest(t, src, "rev-parse", "HEAD")
+	fixture.readmeObjectSHA = fuseGitOutputForTest(t, src, "hash-object", "README.md")
+	fixture.readmeSize = int64(len("hello base\n"))
+
+	localRoot := t.TempDir()
+	runFuseTestGit(t, "", "clone", "--no-checkout", src, filepath.Join(localRoot, "overlay", "repo"))
+
+	opts := &MountOptions{
+		LocalRoot:           localRoot,
+		Profile:             MountProfileCodingAgent,
+		EnableGitWorkspaces: true,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+
+	fs.scheduleGitStateCheckpoint("/repo/.git/index")
+	fixture.mu.Lock()
+	immediate := fixture.gitStatePuts
+	fixture.mu.Unlock()
+	if immediate != 0 {
+		t.Fatalf("git state PUTs immediately after schedule = %d, want 0", immediate)
+	}
+
+	fs.drainGitStateCheckpoints()
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.gitStatePuts != 1 {
+		t.Fatalf("git state PUTs after drain = %d, want 1", fixture.gitStatePuts)
+	}
+	if fixture.stateStorage != gitStateStorageTarGzNoObjects {
+		t.Fatalf("git state storage = %q, want %q", fixture.stateStorage, gitStateStorageTarGzNoObjects)
+	}
+	if len(fixture.state) == 0 {
+		t.Fatal("git state checkpoint content is empty")
+	}
+}
+
+func TestGitStateCheckpointSkipsTransientLockFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	src := createGitRepoWithReadme(t, []byte("hello base\n"))
+	fixture := newGitWorkspaceFixture(t)
+	fixture.repoURL = src
+	fixture.headCommit = fuseGitOutputForTest(t, src, "rev-parse", "HEAD")
+	fixture.readmeObjectSHA = fuseGitOutputForTest(t, src, "hash-object", "README.md")
+	fixture.readmeSize = int64(len("hello base\n"))
+
+	localRoot := t.TempDir()
+	runFuseTestGit(t, "", "clone", "--no-checkout", src, filepath.Join(localRoot, "overlay", "repo"))
+
+	opts := &MountOptions{
+		LocalRoot:           localRoot,
+		Profile:             MountProfileCodingAgent,
+		EnableGitWorkspaces: true,
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+
+	fs.scheduleGitStateCheckpoint("/repo/.git/index.lock")
+	fs.scheduleGitStateCheckpoint("/repo/.git/refs/heads/main.lock")
+	fs.drainGitStateCheckpoints()
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if fixture.gitStatePuts != 0 {
+		t.Fatalf("git state PUTs for lock files = %d, want 0", fixture.gitStatePuts)
 	}
 }
 

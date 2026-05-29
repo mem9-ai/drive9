@@ -355,6 +355,12 @@ func TestConfigureFastCloneGitOptimizationsBestEffort(t *testing.T) {
 	runTestGit(t, "", "init", "-b", "main", repo)
 	supportsUntrackedCache := exec.Command("git", "-C", repo, "update-index", "--test-untracked-cache").Run() == nil
 	configureFastCloneGitOptimizations(context.Background(), repo)
+	if got := gitOutputForTest(t, repo, "config", "--get", "gc.auto"); got != "0" {
+		t.Fatalf("gc.auto = %q, want 0", got)
+	}
+	if got := gitOutputForTest(t, repo, "config", "--get", "maintenance.auto"); got != "false" {
+		t.Fatalf("maintenance.auto = %q, want false", got)
+	}
 	if supportsUntrackedCache {
 		got := gitOutputForTest(t, repo, "config", "--get", "core.untrackedCache")
 		if got != "true" {

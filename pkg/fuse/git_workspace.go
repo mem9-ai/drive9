@@ -29,6 +29,7 @@ import (
 )
 
 const gitCheckpointTimeout = 2 * time.Minute
+const gitCheckpointDebounce = 2 * time.Second
 const gitWorkspaceHydrateTimeout = 30 * time.Minute
 const gitCheckIgnoreTimeout = 2 * time.Second
 const gitWorkspaceRefreshInterval = time.Second
@@ -172,6 +173,29 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 		if root == "/" {
 			rel := strings.TrimPrefix(clean, "/")
 			return rt, rel, true
+		}
+		if clean == root {
+			return rt, "", true
+		}
+		prefix := root + "/"
+		if strings.HasPrefix(clean, prefix) {
+			return rt, strings.TrimPrefix(clean, prefix), true
+		}
+	}
+	return nil, "", false
+}
+
+func (fs *Dat9FS) loadedGitWorkspaceForPath(localPath string) (*gitWorkspaceRuntime, string, bool) {
+	if fs == nil || fs.git == nil || fs.opts == nil || !fs.opts.EnableGitWorkspaces {
+		return nil, "", false
+	}
+	clean := path.Clean(localPath)
+	fs.git.mu.Lock()
+	defer fs.git.mu.Unlock()
+	for _, rt := range fs.git.workspaces {
+		root := rt.localRoot
+		if root == "/" {
+			return rt, strings.TrimPrefix(clean, "/"), true
 		}
 		if clean == root {
 			return rt, "", true
@@ -1197,11 +1221,43 @@ func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath strin
 	if fs == nil || fs.git == nil || fs.client == nil || fs.localOverlay == nil {
 		return nil
 	}
+	if !localPathShouldCheckpointGitState(localPath) {
+		return nil
+	}
 	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || (rel != ".git" && !strings.HasPrefix(rel, ".git/")) {
 		return nil
 	}
-	if localPathIsGitObjectDatabase(localPath) {
+	return fs.checkpointGitStateForRuntime(ctx, rt)
+}
+
+func (fs *Dat9FS) scheduleGitStateCheckpoint(localPath string) {
+	if fs == nil || fs.gitCheckpoints == nil || !localPathShouldCheckpointGitState(localPath) {
+		return
+	}
+	rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath)
+	if !ok || (rel != ".git" && !strings.HasPrefix(rel, ".git/")) {
+		return
+	}
+	key := gitWorkspaceCacheKey(rt)
+	fs.gitCheckpoints.Schedule(key, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
+		defer cancel()
+		if err := fs.checkpointGitStateForRuntime(ctx, rt); err != nil {
+			log.Printf("git state checkpoint failed for workspace %s root %s: %v", rt.workspace.WorkspaceID, rt.workspace.RootPath, err)
+		}
+	})
+}
+
+func (fs *Dat9FS) drainGitStateCheckpoints() {
+	if fs == nil || fs.gitCheckpoints == nil {
+		return
+	}
+	fs.gitCheckpoints.FlushAll()
+}
+
+func (fs *Dat9FS) checkpointGitStateForRuntime(ctx context.Context, rt *gitWorkspaceRuntime) error {
+	if fs == nil || fs.git == nil || fs.client == nil || fs.localOverlay == nil || rt == nil {
 		return nil
 	}
 	gitDir, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git"))

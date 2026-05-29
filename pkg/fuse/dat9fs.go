@@ -102,6 +102,9 @@ type Dat9FS struct {
 	// localOverlay stores local-only paths under MountOptions.LocalRoot.
 	localOverlay *LocalOverlay
 	git          *gitWorkspaceLayer
+	// gitCheckpoints coalesces lightweight .git state checkpoints so Git
+	// porcelain close/rename/unlink paths do not synchronously run rev-list.
+	gitCheckpoints *flushDebouncer
 
 	// smallFileMax mirrors the server's inline_threshold (fetched lazily via
 	// the dat9 client). When 0, defaultSmallFileThreshold is used. Use the
@@ -178,24 +181,25 @@ type dirtyInodeState struct {
 // NewDat9FS creates a new FUSE filesystem backed by the given dat9 client.
 func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 	return &Dat9FS{
-		RawFileSystem: gofuse.NewDefaultRawFileSystem(),
-		client:        c,
-		inodes:        NewInodeToPath(),
-		fileHandles:   NewHandleTable[*FileHandle](),
-		openHandles:   NewOpenHandleIndex(),
-		dirHandles:    NewHandleTable[*DirHandle](),
-		readCache:     NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
-		dirCache:      NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
-		readSlots:     make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
-		dirtyInodes:   make(map[uint64]dirtyInodeState),
-		uid:           uint32(os.Getuid()),
-		gid:           uint32(os.Getgid()),
-		opts:          opts,
-		debouncer:     newFlushDebouncer(opts.FlushDebounce),
-		perf:          newFusePerfCounters(opts.PerfCounters),
-		localPolicy:   NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
-		localOverlay:  NewLocalOverlay(opts.LocalRoot),
-		git:           newGitWorkspaceLayer(),
+		RawFileSystem:  gofuse.NewDefaultRawFileSystem(),
+		client:         c,
+		inodes:         NewInodeToPath(),
+		fileHandles:    NewHandleTable[*FileHandle](),
+		openHandles:    NewOpenHandleIndex(),
+		dirHandles:     NewHandleTable[*DirHandle](),
+		readCache:      NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
+		dirCache:       NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
+		readSlots:      make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
+		dirtyInodes:    make(map[uint64]dirtyInodeState),
+		uid:            uint32(os.Getuid()),
+		gid:            uint32(os.Getgid()),
+		opts:           opts,
+		debouncer:      newFlushDebouncer(opts.FlushDebounce),
+		perf:           newFusePerfCounters(opts.PerfCounters),
+		localPolicy:    NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
+		localOverlay:   NewLocalOverlay(opts.LocalRoot),
+		git:            newGitWorkspaceLayer(),
+		gitCheckpoints: newFlushDebouncer(gitCheckpointDebounce),
 	}
 }
 
@@ -424,7 +428,9 @@ func localPathMayBeGitState(localPath string) bool {
 }
 
 func localPathShouldCheckpointGitState(localPath string) bool {
-	return localPathMayBeGitState(localPath) && !localPathIsGitObjectDatabase(localPath)
+	return localPathMayBeGitState(localPath) &&
+		!localPathIsGitObjectDatabase(localPath) &&
+		!localPathIsGitLockFile(localPath)
 }
 
 func localPathIsGitObjectDatabase(localPath string) bool {
@@ -438,6 +444,25 @@ func localPathIsGitObjectDatabase(localPath string) bool {
 	return strings.HasSuffix(clean, "/.git/objects") ||
 		strings.Contains(clean, "/.git/objects/") ||
 		(strings.Contains(clean, "/.git/modules/") && (strings.HasSuffix(clean, "/objects") || strings.Contains(clean, "/objects/")))
+}
+
+func localPathIsGitLockFile(localPath string) bool {
+	clean := path.Clean(localPath)
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	if clean == "/.git" || strings.HasSuffix(clean, "/.git") {
+		return false
+	}
+	idx := strings.LastIndex(clean, "/.git/")
+	if idx < 0 {
+		return false
+	}
+	rel := clean[idx+len("/.git/"):]
+	if rel == "" {
+		return false
+	}
+	return strings.HasSuffix(rel, ".lock")
 }
 
 func (fs *Dat9FS) writePolicyForOpen(flags uint32) WritePolicy {
@@ -2999,11 +3024,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.cacheNegativePath(childP)
-		checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
-		if err := fs.checkpointGitStateForPath(checkpointCtx, childP); err != nil {
-			log.Printf("git state checkpoint after local unlink failed for %s: %v", childP, err)
-		}
-		checkpointCancel()
+		fs.scheduleGitStateCheckpoint(childP)
 		return gofuse.OK
 	}
 	if entry, handled := fs.gitEntry(ctx, childP, false); handled {
@@ -3146,9 +3167,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.cacheNegativePath(childP)
-		if err := fs.checkpointGitStateForPath(ctx, childP); err != nil {
-			log.Printf("git state checkpoint after local rmdir failed for %s: %v", childP, err)
-		}
+		fs.scheduleGitStateCheckpoint(childP)
 		return gofuse.OK
 	}
 	if entry, handled := fs.gitEntry(ctx, childP, false); handled {
@@ -3482,9 +3501,7 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 			return localErrToFuseStatus(err)
 		}
 		fs.finishLocalRename(input, oldP, newP)
-		if err := fs.checkpointGitStateForPath(ctx, newP); err != nil {
-			log.Printf("git state checkpoint after local rename failed for %s -> %s: %v", oldP, newP, err)
-		}
+		fs.scheduleGitStateCheckpoint(newP)
 		return gofuse.OK
 	}
 	if handled, st := fs.renameGitPath(ctx, input, oldP, newP); handled {
@@ -5226,12 +5243,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
 		if gitState && localFileHandleOpenedWritable(fh) {
-			checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
-			if err := fs.checkpointGitStateForPath(checkpointCtx, fh.Path); err != nil {
-				checkpointCancel()
-				return httpToFuseStatus(err)
-			}
-			checkpointCancel()
+			fs.scheduleGitStateCheckpoint(fh.Path)
 		}
 		return gofuse.OK
 	}
@@ -5468,12 +5480,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
 		if localPathShouldCheckpointGitState(fh.Path) && localFileHandleOpenedWritable(fh) {
-			checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
-			if err := fs.checkpointGitStateForPath(checkpointCtx, fh.Path); err != nil {
-				checkpointCancel()
-				return httpToFuseStatus(err)
-			}
-			checkpointCancel()
+			fs.scheduleGitStateCheckpoint(fh.Path)
 		}
 		return gofuse.OK
 	}
@@ -5754,11 +5761,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				}
 			}
 			if flushStatus == gofuse.OK && gitState && openedWritable {
-				checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
-				if err := fs.checkpointGitStateForPath(checkpointCtx, localPath); err != nil {
-					log.Printf("git state checkpoint after local release failed for %s: %v", localPath, err)
-				}
-				checkpointCancel()
+				fs.scheduleGitStateCheckpoint(localPath)
 			}
 			return
 		}
@@ -6416,6 +6419,10 @@ func (fs *Dat9FS) FlushAll() {
 		e.fh.Unlock()
 		cf()
 	}
+
+	// Drain coalesced .git checkpoints before shutdown so replacement
+	// sandboxes can restore the latest lightweight Git state.
+	fs.drainGitStateCheckpoints()
 
 	// Drain all pending write-back uploads before shutting down.
 	if fs.uploader != nil {
