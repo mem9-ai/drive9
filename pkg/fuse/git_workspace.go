@@ -1003,14 +1003,12 @@ func (fs *Dat9FS) runGitWorkspaceHydrate(rt *gitWorkspaceRuntime) {
 			gitDir = p
 		}
 	}
-	if _, ok := gitcache.ParseGitHubRepoURL(rt.workspace.RepoURL); !ok {
-		if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
-			if fs.perfEnabled() {
-				fs.perf.gitHydrateFailure.add(1)
-			}
-			log.Printf("git workspace hydrate restore failed for %s: %v", rt.workspace.RootPath, err)
-			return
+	if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
+		if fs.perfEnabled() {
+			fs.perf.gitHydrateFailure.add(1)
 		}
+		log.Printf("git workspace hydrate restore failed for %s: %v", rt.workspace.RootPath, err)
+		return
 	}
 	result, err := gitcache.Hydrate(ctx, gitcache.HydrateOptions{
 		LocalRoot:   fs.opts.LocalRoot,
@@ -1019,10 +1017,16 @@ func (fs *Dat9FS) runGitWorkspaceHydrate(rt *gitWorkspaceRuntime) {
 		RepoURL:     rt.workspace.RepoURL,
 		GitDir:      gitDir,
 		Token:       gitWorkspaceHydrateToken(rt.workspace.RepoURL),
+		TreeEntries: gitHydrateEntriesFromRuntime(rt),
 	})
 	if fs.perfEnabled() {
 		fs.perf.gitHydrateBytes.add(uint64(result.Bytes))
 		fs.perf.gitHydrateTotalNS.add(uint64(result.Duration))
+		fs.perf.gitHydrateObjects.add(uint64(result.Objects))
+		fs.perf.gitHydrateObjectBytes.add(uint64(result.ObjectBytes))
+		fs.perf.gitHydrateObjectSkipped.add(uint64(result.ObjectSkipped))
+		fs.perf.gitHydrateObjectMismatch.add(uint64(result.ObjectMismatch))
+		fs.perf.gitHydrateObjectFallbacks.add(uint64(result.ObjectFallbacks))
 		if err != nil {
 			fs.perf.gitHydrateFailure.add(1)
 		} else {
@@ -1032,6 +1036,24 @@ func (fs *Dat9FS) runGitWorkspaceHydrate(rt *gitWorkspaceRuntime) {
 	if err != nil {
 		log.Printf("git workspace hydrate failed for %s: %v", rt.workspace.RootPath, err)
 	}
+}
+
+func gitHydrateEntriesFromRuntime(rt *gitWorkspaceRuntime) []gitcache.HydrateTreeEntry {
+	if rt == nil {
+		return nil
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	entries := make([]gitcache.HydrateTreeEntry, 0, len(rt.nodes))
+	for _, n := range rt.nodes {
+		entries = append(entries, gitcache.HydrateTreeEntry{
+			Path:      n.Path,
+			Kind:      n.Kind,
+			Mode:      n.Mode,
+			ObjectSHA: n.ObjectSHA,
+		})
+	}
+	return entries
 }
 
 func gitWorkspaceHydrateToken(repoURL string) string {
@@ -1177,6 +1199,9 @@ func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath strin
 	}
 	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || (rel != ".git" && !strings.HasPrefix(rel, ".git/")) {
+		return nil
+	}
+	if localPathIsGitObjectDatabase(localPath) {
 		return nil
 	}
 	gitDir, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git"))

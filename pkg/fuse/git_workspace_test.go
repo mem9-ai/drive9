@@ -715,6 +715,27 @@ func TestGitWorkspaceCleanReadUsesMaterializedTreeCache(t *testing.T) {
 	}
 }
 
+func TestGitObjectDatabasePathsSkipDirectCheckpoint(t *testing.T) {
+	if !localPathMayBeGitState("/repo/.git/index") {
+		t.Fatal(".git/index should be git state")
+	}
+	if !localPathShouldCheckpointGitState("/repo/.git/index") {
+		t.Fatal(".git/index should checkpoint")
+	}
+	if !localPathMayBeGitState("/repo/.git/objects/aa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") {
+		t.Fatal(".git/objects path should still be recognized as git state")
+	}
+	if localPathShouldCheckpointGitState("/repo/.git/objects/aa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") {
+		t.Fatal(".git/objects path should not checkpoint directly")
+	}
+	if localPathShouldCheckpointGitState("/repo/.git/objects") {
+		t.Fatal(".git/objects directory should not checkpoint directly")
+	}
+	if localPathShouldCheckpointGitState("/repo/.git/modules/sub/objects/aa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") {
+		t.Fatal("submodule object database path should not checkpoint directly")
+	}
+}
+
 func TestGitWorkspaceCleanReadUsesBlobCache(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	localRoot := t.TempDir()

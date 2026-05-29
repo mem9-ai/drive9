@@ -347,6 +347,25 @@ func TestInitializeFastCloneIndexMakesStatusClean(t *testing.T) {
 	}
 }
 
+func TestConfigureFastCloneGitOptimizationsBestEffort(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	repo := t.TempDir()
+	runTestGit(t, "", "init", "-b", "main", repo)
+	supportsUntrackedCache := exec.Command("git", "-C", repo, "update-index", "--test-untracked-cache").Run() == nil
+	configureFastCloneGitOptimizations(context.Background(), repo)
+	if supportsUntrackedCache {
+		got := gitOutputForTest(t, repo, "config", "--get", "core.untrackedCache")
+		if got != "true" {
+			t.Fatalf("core.untrackedCache = %q, want true", got)
+		}
+	}
+	if got := gitOutputForTest(t, repo, "config", "--get", "core.splitIndex"); got != "true" {
+		t.Fatalf("core.splitIndex = %q, want true", got)
+	}
+}
+
 func runTestGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)

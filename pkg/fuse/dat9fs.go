@@ -423,6 +423,23 @@ func localPathMayBeGitState(localPath string) bool {
 	return clean == "/.git" || strings.HasPrefix(clean, "/.git/") || strings.Contains(clean, "/.git/")
 }
 
+func localPathShouldCheckpointGitState(localPath string) bool {
+	return localPathMayBeGitState(localPath) && !localPathIsGitObjectDatabase(localPath)
+}
+
+func localPathIsGitObjectDatabase(localPath string) bool {
+	clean := path.Clean(localPath)
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	if clean == "/.git/objects" || strings.HasPrefix(clean, "/.git/objects/") {
+		return true
+	}
+	return strings.HasSuffix(clean, "/.git/objects") ||
+		strings.Contains(clean, "/.git/objects/") ||
+		(strings.Contains(clean, "/.git/modules/") && (strings.HasSuffix(clean, "/objects") || strings.Contains(clean, "/objects/")))
+}
+
 func (fs *Dat9FS) writePolicyForOpen(flags uint32) WritePolicy {
 	policy := WritePolicyWriteBack
 	if fs != nil && fs.opts != nil {
@@ -5195,7 +5212,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	}()
 
 	if isLocalFileHandle(fh) {
-		gitState := localPathMayBeGitState(fh.Path)
+		gitState := localPathShouldCheckpointGitState(fh.Path)
 		if gitState {
 			phase = "local-git-sync"
 			if err := syncOpenLocalFile(fh.LocalFile); err != nil {
@@ -5450,7 +5467,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
-		if localPathMayBeGitState(fh.Path) && localFileHandleOpenedWritable(fh) {
+		if localPathShouldCheckpointGitState(fh.Path) && localFileHandleOpenedWritable(fh) {
 			checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
 			if err := fs.checkpointGitStateForPath(checkpointCtx, fh.Path); err != nil {
 				checkpointCancel()
@@ -5716,7 +5733,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			fh.Lock()
 			localFile := fh.LocalFile
 			openedWritable := localFileHandleOpenedWritable(fh)
-			gitState := localPathMayBeGitState(fh.Path)
+			gitState := localPathShouldCheckpointGitState(fh.Path)
 			localPath := fh.Path
 			ino := fh.Ino
 			fh.LocalFile = nil

@@ -138,18 +138,23 @@ type fusePerfCounters struct {
 	localPolicyRemoteOverride atomicUint64
 	localPolicyRemoteDefault  atomicUint64
 
-	gitCleanReadCount    atomicUint64
-	gitCleanTreeHit      atomicUint64
-	gitCleanBlobCacheHit atomicUint64
-	gitCleanCacheMiss    atomicUint64
-	gitCatFileCount      atomicUint64
-	gitCatFileSlowCount  atomicUint64
-	gitCatFileTotalNS    atomicUint64
-	gitHydrateStart      atomicUint64
-	gitHydrateSuccess    atomicUint64
-	gitHydrateFailure    atomicUint64
-	gitHydrateBytes      atomicUint64
-	gitHydrateTotalNS    atomicUint64
+	gitCleanReadCount         atomicUint64
+	gitCleanTreeHit           atomicUint64
+	gitCleanBlobCacheHit      atomicUint64
+	gitCleanCacheMiss         atomicUint64
+	gitCatFileCount           atomicUint64
+	gitCatFileSlowCount       atomicUint64
+	gitCatFileTotalNS         atomicUint64
+	gitHydrateStart           atomicUint64
+	gitHydrateSuccess         atomicUint64
+	gitHydrateFailure         atomicUint64
+	gitHydrateBytes           atomicUint64
+	gitHydrateTotalNS         atomicUint64
+	gitHydrateObjects         atomicUint64
+	gitHydrateObjectBytes     atomicUint64
+	gitHydrateObjectSkipped   atomicUint64
+	gitHydrateObjectMismatch  atomicUint64
+	gitHydrateObjectFallbacks atomicUint64
 }
 
 // atomicUint64 is a small wrapper around sync/atomic.Uint64. Keeping it local
@@ -306,6 +311,11 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	snap.Counters["git_hydrate_failure"] = p.gitHydrateFailure.load()
 	snap.Counters["git_hydrate_bytes"] = p.gitHydrateBytes.load()
 	snap.Counters["git_hydrate_total_ns"] = p.gitHydrateTotalNS.load()
+	snap.Counters["git_hydrate_objects"] = p.gitHydrateObjects.load()
+	snap.Counters["git_hydrate_object_bytes"] = p.gitHydrateObjectBytes.load()
+	snap.Counters["git_hydrate_object_skipped"] = p.gitHydrateObjectSkipped.load()
+	snap.Counters["git_hydrate_object_mismatch"] = p.gitHydrateObjectMismatch.load()
+	snap.Counters["git_hydrate_object_fallbacks"] = p.gitHydrateObjectFallbacks.load()
 	return snap
 }
 
@@ -343,7 +353,7 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 		snap.Counters["local_policy_local_only"],
 		snap.Counters["local_policy_remote_override"],
 		snap.Counters["local_policy_remote_default"])
-	writePerfLine(w, "drive9: perf git clean_read=%d tree_hit=%d blob_cache_hit=%d cache_miss=%d cat_file=%d cat_file_slow=%d cat_file_avg=%s hydrate_start=%d hydrate_success=%d hydrate_failure=%d hydrate_bytes=%d hydrate_total=%s\n",
+	writePerfLine(w, "drive9: perf git clean_read=%d tree_hit=%d blob_cache_hit=%d cache_miss=%d cat_file=%d cat_file_slow=%d cat_file_avg=%s hydrate_start=%d hydrate_success=%d hydrate_failure=%d hydrate_bytes=%d hydrate_total=%s hydrate_objects=%d hydrate_object_bytes=%d hydrate_object_skipped=%d hydrate_object_mismatch=%d hydrate_object_fallbacks=%d\n",
 		snap.Counters["git_clean_read_count"],
 		snap.Counters["git_clean_tree_hit"],
 		snap.Counters["git_clean_blob_cache_hit"],
@@ -355,7 +365,12 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 		snap.Counters["git_hydrate_success"],
 		snap.Counters["git_hydrate_failure"],
 		snap.Counters["git_hydrate_bytes"],
-		time.Duration(snap.Counters["git_hydrate_total_ns"]).Truncate(time.Millisecond))
+		time.Duration(snap.Counters["git_hydrate_total_ns"]).Truncate(time.Millisecond),
+		snap.Counters["git_hydrate_objects"],
+		snap.Counters["git_hydrate_object_bytes"],
+		snap.Counters["git_hydrate_object_skipped"],
+		snap.Counters["git_hydrate_object_mismatch"],
+		snap.Counters["git_hydrate_object_fallbacks"])
 }
 
 func writePerfOps(w io.Writer, group string, names []string, stats map[string]perfOpStats) {

@@ -136,6 +136,7 @@ func gitClone(args []string) error {
 	if err := initializeFastCloneIndex(cmdCtx, target, head); err != nil {
 		return err
 	}
+	configureFastCloneGitOptimizations(cmdCtx, target)
 
 	mode := "fast"
 	if *blobless {
@@ -196,13 +197,13 @@ func gitClone(args []string) error {
 		switch hydrateMode {
 		case gitHydrateModeSync:
 			ctx, cancel := context.WithTimeout(context.Background(), gitHydrateTimeout)
-			result, err := hydrateMountedGitTarget(ctx, repoURL, resolved, ws)
+			result, err := hydrateMountedGitTarget(ctx, repoURL, resolved, ws, nodes)
 			cancel()
 			if err != nil {
 				return fmt.Errorf("hydrate clean tree: %w", err)
 			}
-			fmt.Fprintf(os.Stderr, "drive9: hydrated clean tree provider=%s files=%d bytes=%d duration=%s\n",
-				result.Provider, result.Files, result.Bytes, result.Duration.Truncate(time.Millisecond))
+			fmt.Fprintf(os.Stderr, "drive9: hydrated clean tree provider=%s files=%d bytes=%d objects=%d object_bytes=%d duration=%s\n",
+				result.Provider, result.Files, result.Bytes, result.Objects, result.ObjectBytes, result.Duration.Truncate(time.Millisecond))
 		case gitHydrateModeBackground:
 			if err := startGitHydrateBackground(cmdCtx, target, resolved, ws); err != nil {
 				fmt.Fprintf(os.Stderr, "drive9: warning: could not start background hydrate: %v\n", err)
@@ -268,17 +269,22 @@ func gitHydrate(args []string) error {
 		return fmt.Errorf("lookup git workspace :%s: %w", resolved.RemotePath, err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), *timeout)
-	result, err := hydrateMountedGitTarget(ctx, ws.RepoURL, resolved, ws)
+	nodes, nodeErr := c.ListGitTree(ctx, ws.WorkspaceID, ws.HeadCommit)
+	if nodeErr != nil {
+		cancel()
+		return fmt.Errorf("lookup git tree workspace=%s commit=%s: %w", ws.WorkspaceID, ws.HeadCommit, nodeErr)
+	}
+	result, err := hydrateMountedGitTarget(ctx, ws.RepoURL, resolved, ws, nodes)
 	cancel()
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "drive9: hydrated clean tree provider=%s files=%d bytes=%d duration=%s\n",
-		result.Provider, result.Files, result.Bytes, result.Duration.Truncate(time.Millisecond))
+	fmt.Fprintf(os.Stderr, "drive9: hydrated clean tree provider=%s files=%d bytes=%d objects=%d object_bytes=%d duration=%s\n",
+		result.Provider, result.Files, result.Bytes, result.Objects, result.ObjectBytes, result.Duration.Truncate(time.Millisecond))
 	return nil
 }
 
-func hydrateMountedGitTarget(ctx context.Context, repoURL string, resolved mountedGitTarget, ws *client.GitWorkspace) (gitcache.HydrateResult, error) {
+func hydrateMountedGitTarget(ctx context.Context, repoURL string, resolved mountedGitTarget, ws *client.GitWorkspace, nodes []client.GitTreeNode) (gitcache.HydrateResult, error) {
 	if ws == nil {
 		return gitcache.HydrateResult{}, fmt.Errorf("workspace is required")
 	}
@@ -293,6 +299,7 @@ func hydrateMountedGitTarget(ctx context.Context, repoURL string, resolved mount
 		RepoURL:     repoURL,
 		GitDir:      resolved.LocalGitDir,
 		Token:       githubTokenForRepoURL(repoURL),
+		TreeEntries: gitcacheEntriesFromClient(nodes),
 	})
 }
 
@@ -342,6 +349,28 @@ func initializeFastCloneIndex(ctx context.Context, repoDir, commitSHA string) er
 		return fmt.Errorf("initialize git index: %w", err)
 	}
 	return nil
+}
+
+func configureFastCloneGitOptimizations(ctx context.Context, repoDir string) {
+	if err := gitRun(ctx, repoDir, "update-index", "--test-untracked-cache"); err == nil {
+		_ = gitRun(ctx, repoDir, "config", "core.untrackedCache", "true")
+	}
+	if err := gitRun(ctx, repoDir, "config", "core.splitIndex", "true"); err == nil {
+		_ = gitRun(ctx, repoDir, "update-index", "--split-index")
+	}
+}
+
+func gitcacheEntriesFromClient(nodes []client.GitTreeNode) []gitcache.HydrateTreeEntry {
+	entries := make([]gitcache.HydrateTreeEntry, 0, len(nodes))
+	for _, n := range nodes {
+		entries = append(entries, gitcache.HydrateTreeEntry{
+			Path:      n.Path,
+			Kind:      n.Kind,
+			Mode:      n.Mode,
+			ObjectSHA: n.ObjectSHA,
+		})
+	}
+	return entries
 }
 
 type mountedGitTarget struct {

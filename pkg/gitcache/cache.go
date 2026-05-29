@@ -4,6 +4,7 @@ package gitcache
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -24,6 +25,8 @@ import (
 )
 
 const hydrateStatusSuccess = "success"
+const hydrateObjectLockStaleAfter = 2 * time.Hour
+const hydrateHashObjectBatchSize = 256
 
 // HydrateOptions describes one local clean tree cache hydration.
 type HydrateOptions struct {
@@ -34,16 +37,34 @@ type HydrateOptions struct {
 	GitDir      string
 	Token       string
 	HTTPClient  *http.Client
+	TreeEntries []HydrateTreeEntry
+}
+
+// HydrateTreeEntry is the manifest subset needed to hydrate clean Git objects
+// from the materialized clean tree cache.
+type HydrateTreeEntry struct {
+	Path      string
+	Kind      string
+	Mode      string
+	ObjectSHA string
 }
 
 // HydrateResult summarizes a hydrate attempt.
 type HydrateResult struct {
-	Status   string        `json:"status"`
-	Provider string        `json:"provider"`
-	Files    int64         `json:"files"`
-	Bytes    int64         `json:"bytes"`
-	Duration time.Duration `json:"duration"`
-	Error    string        `json:"error,omitempty"`
+	Status          string        `json:"status"`
+	Provider        string        `json:"provider"`
+	TreeStatus      string        `json:"tree_status,omitempty"`
+	ObjectStatus    string        `json:"object_status,omitempty"`
+	Files           int64         `json:"files"`
+	Bytes           int64         `json:"bytes"`
+	Objects         int64         `json:"objects"`
+	ObjectBytes     int64         `json:"object_bytes"`
+	ObjectSkipped   int64         `json:"object_skipped"`
+	ObjectMismatch  int64         `json:"object_mismatch"`
+	ObjectFallbacks int64         `json:"object_fallbacks"`
+	ObjectDuration  time.Duration `json:"object_duration,omitempty"`
+	Duration        time.Duration `json:"duration"`
+	Error           string        `json:"error,omitempty"`
 }
 
 // CacheRoot returns the root for one workspace/commit's local git cache.
@@ -160,7 +181,9 @@ func WriteBlob(ctx context.Context, localRoot, workspaceID, commit, objectSHA st
 	return writeFileAtomic(p, data, 0o644)
 }
 
-// Hydrate materializes a workspace clean tree into the local cache.
+// Hydrate materializes a workspace clean tree into the local cache and, when
+// GitDir and TreeEntries are provided, fills the local Git object database from
+// that tree cache.
 func Hydrate(ctx context.Context, opts HydrateOptions) (HydrateResult, error) {
 	start := time.Now()
 	result := HydrateResult{Status: "failed"}
@@ -179,6 +202,17 @@ func Hydrate(ctx context.Context, opts HydrateOptions) (HydrateResult, error) {
 	} else if ok {
 		result.Status = hydrateStatusSuccess
 		result.Provider = "cache"
+		result.TreeStatus = hydrateStatusSuccess
+		if objectResult, err := hydrateGitObjectDB(ctx, opts); err != nil {
+			mergeObjectHydrateResult(&result, objectResult)
+			result.Status = "failed"
+			result.Duration = time.Since(start)
+			result.Error = err.Error()
+			_ = writeHydrateMetadata(opts, result)
+			return result, err
+		} else {
+			mergeObjectHydrateResult(&result, objectResult)
+		}
 		result.Duration = time.Since(start)
 		_ = writeHydrateMetadata(opts, result)
 		return result, nil
@@ -203,6 +237,16 @@ func Hydrate(ctx context.Context, opts HydrateOptions) (HydrateResult, error) {
 	if err != nil {
 		result.Status = "failed"
 		result.Error = err.Error()
+	} else {
+		result.TreeStatus = hydrateStatusSuccess
+		if objectResult, objectErr := hydrateGitObjectDB(ctx, opts); objectErr != nil {
+			mergeObjectHydrateResult(&result, objectResult)
+			result.Status = "failed"
+			result.Error = objectErr.Error()
+			err = objectErr
+		} else {
+			mergeObjectHydrateResult(&result, objectResult)
+		}
 	}
 	_ = writeHydrateMetadata(opts, result)
 	return result, err
@@ -316,6 +360,401 @@ func hydrateFromLocalGit(ctx context.Context, opts HydrateOptions) (HydrateResul
 		return HydrateResult{Provider: "git-checkout-index"}, err
 	}
 	return HydrateResult{Status: hydrateStatusSuccess, Provider: "git-checkout-index", Files: files, Bytes: bytes}, nil
+}
+
+type objectHydrateResult struct {
+	status    string
+	objects   int64
+	bytes     int64
+	skipped   int64
+	mismatch  int64
+	fallbacks int64
+	duration  time.Duration
+}
+
+type objectHydrateMarker struct {
+	GitDir      string    `json:"git_dir"`
+	Commit      string    `json:"commit"`
+	WorkspaceID string    `json:"workspace_id"`
+	Entries     int       `json:"entries"`
+	UpdatedAt   time.Time `json:"updated_at"`
+}
+
+type objectHydrateFile struct {
+	abs       string
+	rel       string
+	expected  string
+	sizeBytes int64
+}
+
+func mergeObjectHydrateResult(result *HydrateResult, objectResult objectHydrateResult) {
+	if result == nil {
+		return
+	}
+	result.ObjectStatus = objectResult.status
+	result.Objects = objectResult.objects
+	result.ObjectBytes = objectResult.bytes
+	result.ObjectSkipped = objectResult.skipped
+	result.ObjectMismatch = objectResult.mismatch
+	result.ObjectFallbacks = objectResult.fallbacks
+	result.ObjectDuration = objectResult.duration
+}
+
+func hydrateGitObjectDB(ctx context.Context, opts HydrateOptions) (objectHydrateResult, error) {
+	start := time.Now()
+	result := objectHydrateResult{status: "skipped"}
+	if len(opts.TreeEntries) == 0 {
+		result.duration = time.Since(start)
+		return result, nil
+	}
+	gitDir := strings.TrimSpace(opts.GitDir)
+	if gitDir == "" {
+		result.duration = time.Since(start)
+		return result, fmt.Errorf("git directory is required for object hydrate")
+	}
+	info, err := os.Stat(gitDir)
+	if err != nil {
+		result.duration = time.Since(start)
+		return result, fmt.Errorf("stat git directory for object hydrate: %w", err)
+	}
+	if !info.IsDir() {
+		result.duration = time.Since(start)
+		return result, fmt.Errorf("git directory for object hydrate is not a directory: %s", gitDir)
+	}
+	if objectHydrateReady(opts) {
+		result.status = "cache"
+		result.duration = time.Since(start)
+		return result, nil
+	}
+	unlock, err := acquireObjectHydrateLock(ctx, opts)
+	if err != nil {
+		result.duration = time.Since(start)
+		return result, err
+	}
+	defer unlock()
+	if objectHydrateReady(opts) {
+		result.status = "cache"
+		result.duration = time.Since(start)
+		return result, nil
+	}
+	result, err = hydrateGitObjectDBLocked(ctx, opts)
+	result.duration = time.Since(start)
+	if err != nil {
+		result.status = "failed"
+		return result, err
+	}
+	result.status = hydrateStatusSuccess
+	if err := writeObjectHydrateMarker(opts); err != nil {
+		result.status = "failed"
+		return result, err
+	}
+	return result, nil
+}
+
+func hydrateGitObjectDBLocked(ctx context.Context, opts HydrateOptions) (objectHydrateResult, error) {
+	var result objectHydrateResult
+	var regular []objectHydrateFile
+	var firstErr error
+	for _, entry := range opts.TreeEntries {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		kind := strings.TrimSpace(entry.Kind)
+		switch kind {
+		case "dir", "submodule":
+			result.skipped++
+			continue
+		case "file", "symlink":
+		default:
+			result.skipped++
+			continue
+		}
+		rel, err := CleanRelative(entry.Path)
+		if err != nil {
+			return result, err
+		}
+		expected := strings.ToLower(strings.TrimSpace(entry.ObjectSHA))
+		if err := validateObjectSHA(expected); err != nil {
+			return result, err
+		}
+		treePath, err := treeFilePath(opts.LocalRoot, opts.WorkspaceID, opts.Commit, rel)
+		if err != nil {
+			return result, err
+		}
+		info, err := os.Lstat(treePath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				result.skipped++
+				continue
+			}
+			return result, err
+		}
+		switch kind {
+		case "file":
+			if !info.Mode().IsRegular() {
+				result.skipped++
+				continue
+			}
+			regular = append(regular, objectHydrateFile{
+				abs:       treePath,
+				rel:       rel,
+				expected:  expected,
+				sizeBytes: info.Size(),
+			})
+		case "symlink":
+			if info.Mode()&fs.ModeSymlink == 0 {
+				result.skipped++
+				continue
+			}
+			target, err := os.Readlink(treePath)
+			if err != nil {
+				return result, err
+			}
+			got, err := hashGitBlobBytes(ctx, opts.GitDir, []byte(target))
+			if err != nil {
+				return result, err
+			}
+			result.bytes += int64(len(target))
+			if strings.EqualFold(got, expected) {
+				result.objects++
+				continue
+			}
+			result.mismatch++
+			if err := fallbackFetchGitObject(ctx, opts.GitDir, expected); err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("hydrate symlink object %s mismatch got %s and fallback failed: %w", rel, got, err)
+				}
+			} else {
+				result.fallbacks++
+			}
+		}
+	}
+	for start := 0; start < len(regular); start += hydrateHashObjectBatchSize {
+		end := start + hydrateHashObjectBatchSize
+		if end > len(regular) {
+			end = len(regular)
+		}
+		if err := hashRegularGitObjects(ctx, opts.GitDir, regular[start:end], &result, &firstErr); err != nil {
+			return result, err
+		}
+	}
+	return result, firstErr
+}
+
+func hashRegularGitObjects(ctx context.Context, gitDir string, files []objectHydrateFile, result *objectHydrateResult, firstErr *error) error {
+	if len(files) == 0 {
+		return nil
+	}
+	var batch []objectHydrateFile
+	flush := func(items []objectHydrateFile) error {
+		if len(items) == 0 {
+			return nil
+		}
+		hashes, err := hashGitRegularObjects(ctx, gitDir, items)
+		if err != nil {
+			return err
+		}
+		for i, got := range hashes {
+			item := items[i]
+			result.bytes += item.sizeBytes
+			if strings.EqualFold(got, item.expected) {
+				result.objects++
+				continue
+			}
+			result.mismatch++
+			if err := fallbackFetchGitObject(ctx, gitDir, item.expected); err != nil {
+				if *firstErr == nil {
+					*firstErr = fmt.Errorf("hydrate file object %s mismatch got %s and fallback failed: %w", item.rel, got, err)
+				}
+			} else {
+				result.fallbacks++
+			}
+		}
+		return nil
+	}
+	for _, item := range files {
+		if strings.Contains(item.abs, "\n") || strings.Contains(item.abs, "\r") {
+			if err := flush(batch); err != nil {
+				return err
+			}
+			batch = nil
+			got, err := hashGitRegularObject(ctx, gitDir, item.abs)
+			if err != nil {
+				return err
+			}
+			result.bytes += item.sizeBytes
+			if strings.EqualFold(got, item.expected) {
+				result.objects++
+				continue
+			}
+			result.mismatch++
+			if err := fallbackFetchGitObject(ctx, gitDir, item.expected); err != nil {
+				if *firstErr == nil {
+					*firstErr = fmt.Errorf("hydrate file object %s mismatch got %s and fallback failed: %w", item.rel, got, err)
+				}
+			} else {
+				result.fallbacks++
+			}
+			continue
+		}
+		batch = append(batch, item)
+	}
+	return flush(batch)
+}
+
+func hashGitRegularObjects(ctx context.Context, gitDir string, files []objectHydrateFile) ([]string, error) {
+	var stdin strings.Builder
+	for _, item := range files {
+		stdin.WriteString(item.abs)
+		stdin.WriteByte('\n')
+	}
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "hash-object", "-w", "--no-filters", "--stdin-paths")
+	cmd.Stdin = strings.NewReader(stdin.String())
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("git hash-object --stdin-paths: %w: %s", err, msg)
+		}
+		return nil, fmt.Errorf("git hash-object --stdin-paths: %w", err)
+	}
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) == 1 && lines[0] == "" {
+		lines = nil
+	}
+	if len(lines) != len(files) {
+		return nil, fmt.Errorf("git hash-object wrote %d objects, want %d", len(lines), len(files))
+	}
+	out := make([]string, len(lines))
+	for i, line := range lines {
+		out[i] = strings.TrimSpace(line)
+	}
+	return out, nil
+}
+
+func hashGitRegularObject(ctx context.Context, gitDir, path string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "hash-object", "-w", "--no-filters", path)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return "", fmt.Errorf("git hash-object %s: %w: %s", path, err, msg)
+		}
+		return "", fmt.Errorf("git hash-object %s: %w", path, err)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+func hashGitBlobBytes(ctx context.Context, gitDir string, data []byte) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "hash-object", "-w", "--stdin")
+	cmd.Stdin = bytes.NewReader(data)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return "", fmt.Errorf("git hash-object --stdin: %w: %s", err, msg)
+		}
+		return "", fmt.Errorf("git hash-object --stdin: %w", err)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}
+
+func fallbackFetchGitObject(ctx context.Context, gitDir, objectSHA string) error {
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "cat-file", "blob", objectSHA)
+	cmd.Stdout = io.Discard
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return fmt.Errorf("git cat-file blob %s: %w: %s", objectSHA, err, msg)
+		}
+		return fmt.Errorf("git cat-file blob %s: %w", objectSHA, err)
+	}
+	return nil
+}
+
+func acquireObjectHydrateLock(ctx context.Context, opts HydrateOptions) (func(), error) {
+	root := CacheRoot(opts.LocalRoot, opts.WorkspaceID, opts.Commit)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(root, "hydrate.objects.lock")
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			_, _ = fmt.Fprintf(f, "pid=%d time=%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339Nano))
+			_ = f.Close()
+			return func() { _ = os.Remove(lockPath) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		if info, statErr := os.Stat(lockPath); statErr == nil && time.Since(info.ModTime()) > hydrateObjectLockStaleAfter {
+			_ = os.Remove(lockPath)
+			continue
+		}
+		timer := time.NewTimer(200 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func objectHydrateReady(opts HydrateOptions) bool {
+	gitDir := strings.TrimSpace(opts.GitDir)
+	if gitDir == "" || len(opts.TreeEntries) == 0 {
+		return false
+	}
+	if info, err := os.Stat(filepath.Join(gitDir, "objects")); err != nil || !info.IsDir() {
+		return false
+	}
+	data, err := os.ReadFile(filepath.Join(CacheRoot(opts.LocalRoot, opts.WorkspaceID, opts.Commit), "objects.ready.json"))
+	if err != nil {
+		return false
+	}
+	var marker objectHydrateMarker
+	if err := json.Unmarshal(data, &marker); err != nil {
+		return false
+	}
+	return marker.GitDir == gitDir &&
+		marker.Commit == opts.Commit &&
+		marker.WorkspaceID == opts.WorkspaceID &&
+		marker.Entries == len(opts.TreeEntries)
+}
+
+func writeObjectHydrateMarker(opts HydrateOptions) error {
+	root := CacheRoot(opts.LocalRoot, opts.WorkspaceID, opts.Commit)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+	payload := objectHydrateMarker{
+		GitDir:      strings.TrimSpace(opts.GitDir),
+		Commit:      opts.Commit,
+		WorkspaceID: opts.WorkspaceID,
+		Entries:     len(opts.TreeEntries),
+		UpdatedAt:   time.Now().UTC(),
+	}
+	data, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(filepath.Join(root, "objects.ready.json"), append(data, '\n'), 0o644)
 }
 
 func runGitWithIndex(ctx context.Context, gitDir, indexPath string, args ...string) error {
@@ -582,27 +1021,43 @@ func writeHydrateMetadata(opts HydrateOptions, result HydrateResult) error {
 		return err
 	}
 	payload := struct {
-		Status      string        `json:"status"`
-		Provider    string        `json:"provider"`
-		RepoURL     string        `json:"repo_url"`
-		Commit      string        `json:"commit"`
-		WorkspaceID string        `json:"workspace_id"`
-		Files       int64         `json:"files"`
-		Bytes       int64         `json:"bytes"`
-		Duration    time.Duration `json:"duration"`
-		Error       string        `json:"error,omitempty"`
-		UpdatedAt   time.Time     `json:"updated_at"`
+		Status          string        `json:"status"`
+		Provider        string        `json:"provider"`
+		TreeStatus      string        `json:"tree_status,omitempty"`
+		ObjectStatus    string        `json:"object_status,omitempty"`
+		RepoURL         string        `json:"repo_url"`
+		Commit          string        `json:"commit"`
+		WorkspaceID     string        `json:"workspace_id"`
+		Files           int64         `json:"files"`
+		Bytes           int64         `json:"bytes"`
+		Objects         int64         `json:"objects"`
+		ObjectBytes     int64         `json:"object_bytes"`
+		ObjectSkipped   int64         `json:"object_skipped"`
+		ObjectMismatch  int64         `json:"object_mismatch"`
+		ObjectFallbacks int64         `json:"object_fallbacks"`
+		ObjectDuration  time.Duration `json:"object_duration,omitempty"`
+		Duration        time.Duration `json:"duration"`
+		Error           string        `json:"error,omitempty"`
+		UpdatedAt       time.Time     `json:"updated_at"`
 	}{
-		Status:      result.Status,
-		Provider:    result.Provider,
-		RepoURL:     opts.RepoURL,
-		Commit:      opts.Commit,
-		WorkspaceID: opts.WorkspaceID,
-		Files:       result.Files,
-		Bytes:       result.Bytes,
-		Duration:    result.Duration,
-		Error:       result.Error,
-		UpdatedAt:   time.Now().UTC(),
+		Status:          result.Status,
+		Provider:        result.Provider,
+		TreeStatus:      result.TreeStatus,
+		ObjectStatus:    result.ObjectStatus,
+		RepoURL:         opts.RepoURL,
+		Commit:          opts.Commit,
+		WorkspaceID:     opts.WorkspaceID,
+		Files:           result.Files,
+		Bytes:           result.Bytes,
+		Objects:         result.Objects,
+		ObjectBytes:     result.ObjectBytes,
+		ObjectSkipped:   result.ObjectSkipped,
+		ObjectMismatch:  result.ObjectMismatch,
+		ObjectFallbacks: result.ObjectFallbacks,
+		ObjectDuration:  result.ObjectDuration,
+		Duration:        result.Duration,
+		Error:           result.Error,
+		UpdatedAt:       time.Now().UTC(),
 	}
 	data, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {

@@ -5,7 +5,10 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha1"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -142,4 +145,139 @@ func TestReadTreeFileReadsSymlinkTarget(t *testing.T) {
 	if string(got) != "target.txt" {
 		t.Fatalf("ReadTreeFile = %q, want target.txt", got)
 	}
+}
+
+func TestHydrateWritesCleanTreeObjectsToGitObjectDB(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	localRoot := t.TempDir()
+	workspaceID := "ws1"
+	commit := "abcdef"
+	treeRoot := TreeRoot(localRoot, workspaceID, commit)
+	if err := os.MkdirAll(filepath.Join(treeRoot, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	readme := []byte("hello from hydrate\n")
+	if err := os.WriteFile(filepath.Join(treeRoot, "README.md"), readme, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../README.md", filepath.Join(treeRoot, "docs", "readme-link")); err != nil {
+		t.Fatal(err)
+	}
+	gitDir := filepath.Join(t.TempDir(), "repo.git")
+	runGitCacheTest(t, "", "init", "--bare", gitDir)
+
+	result, err := Hydrate(context.Background(), HydrateOptions{
+		LocalRoot:   localRoot,
+		WorkspaceID: workspaceID,
+		Commit:      commit,
+		RepoURL:     "https://github.com/mem9-ai/drive9.git",
+		GitDir:      gitDir,
+		TreeEntries: []HydrateTreeEntry{
+			{Path: "README.md", Kind: "file", Mode: "100644", ObjectSHA: gitBlobSHA(readme)},
+			{Path: "docs/readme-link", Kind: "symlink", Mode: "120000", ObjectSHA: gitBlobSHA([]byte("../README.md"))},
+			{Path: "docs", Kind: "dir", Mode: "040000", ObjectSHA: "0000"},
+			{Path: "vendor/lib", Kind: "submodule", Mode: "160000", ObjectSHA: "1111"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Hydrate: %v", err)
+	}
+	if result.Provider != "cache" {
+		t.Fatalf("Provider = %q, want cache", result.Provider)
+	}
+	if result.ObjectStatus != hydrateStatusSuccess {
+		t.Fatalf("ObjectStatus = %q, want success", result.ObjectStatus)
+	}
+	if result.Objects != 2 {
+		t.Fatalf("Objects = %d, want 2", result.Objects)
+	}
+	if result.ObjectSkipped != 2 {
+		t.Fatalf("ObjectSkipped = %d, want 2", result.ObjectSkipped)
+	}
+
+	got := gitCacheOutput(t, gitDir, "cat-file", "blob", gitBlobSHA(readme))
+	if string(got) != string(readme) {
+		t.Fatalf("cat-file README = %q, want %q", got, readme)
+	}
+	got = gitCacheOutput(t, gitDir, "cat-file", "blob", gitBlobSHA([]byte("../README.md")))
+	if string(got) != "../README.md" {
+		t.Fatalf("cat-file symlink = %q, want target", got)
+	}
+	meta, err := os.ReadFile(filepath.Join(CacheRoot(localRoot, workspaceID, commit), "hydrate.json"))
+	if err != nil {
+		t.Fatalf("read hydrate metadata: %v", err)
+	}
+	for _, want := range []string{`"object_status": "success"`, `"objects": 2`, `"object_skipped": 2`} {
+		if !strings.Contains(string(meta), want) {
+			t.Fatalf("hydrate metadata missing %s:\n%s", want, meta)
+		}
+	}
+}
+
+func TestHydrateObjectReadySkipsRepeatedObjectWrites(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	localRoot := t.TempDir()
+	workspaceID := "ws1"
+	commit := "abcdef"
+	treeRoot := TreeRoot(localRoot, workspaceID, commit)
+	if err := os.MkdirAll(treeRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("cached\n")
+	if err := os.WriteFile(filepath.Join(treeRoot, "cached.txt"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitDir := filepath.Join(t.TempDir(), "repo.git")
+	runGitCacheTest(t, "", "init", "--bare", gitDir)
+	opts := HydrateOptions{
+		LocalRoot:   localRoot,
+		WorkspaceID: workspaceID,
+		Commit:      commit,
+		RepoURL:     "https://github.com/mem9-ai/drive9.git",
+		GitDir:      gitDir,
+		TreeEntries: []HydrateTreeEntry{{Path: "cached.txt", Kind: "file", Mode: "100644", ObjectSHA: gitBlobSHA(content)}},
+	}
+	if _, err := Hydrate(context.Background(), opts); err != nil {
+		t.Fatalf("first Hydrate: %v", err)
+	}
+	result, err := Hydrate(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("second Hydrate: %v", err)
+	}
+	if result.ObjectStatus != "cache" {
+		t.Fatalf("ObjectStatus = %q, want cache", result.ObjectStatus)
+	}
+}
+
+func gitBlobSHA(data []byte) string {
+	payload := append([]byte(fmt.Sprintf("blob %d\x00", len(data))), data...)
+	sum := sha1.Sum(payload)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+func runGitCacheTest(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+func gitCacheOutput(t *testing.T, gitDir string, args ...string) []byte {
+	t.Helper()
+	full := append([]string{"--git-dir", gitDir}, args...)
+	cmd := exec.Command("git", full...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", full, err, out)
+	}
+	return out
 }
