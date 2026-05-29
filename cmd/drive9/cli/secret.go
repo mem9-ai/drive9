@@ -444,7 +444,12 @@ func SecretLs(args []string) error {
 
 // SecretRm deletes a secret.
 func SecretRm(args []string) error {
-	if IsHelpArgs(args) {
+	escaped := false
+	if len(args) > 0 && args[0] == "--" {
+		args = args[1:]
+		escaped = true
+	}
+	if !escaped && IsHelpArgs(args) {
 		_, _ = fmt.Fprintln(os.Stdout, vaultRmUsage())
 		return nil
 	}

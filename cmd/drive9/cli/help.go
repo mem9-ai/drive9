@@ -10,21 +10,16 @@ func IsHelpArg(arg string) bool {
 	}
 }
 
-// IsHelpArgs reports whether argv contains an explicit drive9 help token.
+// IsHelpArgs reports whether argv contains an explicit dash-prefixed drive9
+// help token.
 // It stops at "--" because arguments after that separator belong to a nested
 // command or data payload rather than drive9's own parser.
 func IsHelpArgs(args []string) bool {
-	for i, arg := range args {
-		if arg == "--" {
+	for _, arg := range args {
+		switch arg {
+		case "--":
 			return false
-		}
-		if arg == "help" {
-			if i == 0 {
-				return true
-			}
-			continue
-		}
-		if IsHelpArg(arg) {
+		case "-h", "-help", "--help":
 			return true
 		}
 	}

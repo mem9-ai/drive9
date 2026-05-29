@@ -63,6 +63,36 @@ func TestSecretSetRefusesToOverwriteOnConflict(t *testing.T) {
 	}
 }
 
+func TestSecretRmTreatsHelpLikeNamesAsData(t *testing.T) {
+	var deleted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.NotFound(w, r)
+			return
+		}
+		deleted = append(deleted, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", srv.URL)
+	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	if err := SecretRm([]string{"help"}); err != nil {
+		t.Fatalf("SecretRm(help): %v", err)
+	}
+	if err := SecretRm([]string{"--", "--help"}); err != nil {
+		t.Fatalf("SecretRm(-- --help): %v", err)
+	}
+	want := []string{"/v1/vault/secrets/help", "/v1/vault/secrets/--help"}
+	if strings.Join(deleted, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("deleted paths = %v, want %v", deleted, want)
+	}
+}
+
 func TestSecretGetUsesCapabilityToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer cap-token" {
