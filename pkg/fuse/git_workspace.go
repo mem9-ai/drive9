@@ -1382,12 +1382,8 @@ type gitObjectInfo struct {
 
 func buildLocalGitObjectPack(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime) ([]byte, gitCheckpointSanitization, error) {
 	var sanitize gitCheckpointSanitization
-	remoteName := strings.TrimSpace(rt.workspace.RemoteName)
-	if remoteName == "" {
-		remoteName = "origin"
-	}
 
-	refObjects, refOversize, err := collectLocalRefObjects(ctx, gitDir, remoteName)
+	refObjects, refOversize, err := collectLocalRefObjects(ctx, gitDir, rt)
 	if err != nil {
 		return nil, sanitize, err
 	}
@@ -1429,31 +1425,32 @@ func buildLocalGitObjectPack(ctx context.Context, gitDir string, rt *gitWorkspac
 	return pack, sanitize, nil
 }
 
-func collectLocalRefObjects(ctx context.Context, gitDir, remoteName string) (map[string]struct{}, bool, error) {
-	args := []string{"--git-dir", gitDir, "rev-list", "--objects", "--reflog", "--all", "--not", "--remotes=" + remoteName}
-	out, err := gitCommandOutput(ctx, args...)
+func collectLocalRefObjects(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime) (map[string]struct{}, bool, error) {
+	tips, err := collectLocalRefTips(gitDir)
 	if err != nil {
 		return nil, false, err
 	}
+	if len(tips) == 0 {
+		return nil, false, nil
+	}
 	objects := make(map[string]struct{})
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
+	seenCommits := make(map[string]struct{})
+	seenTrees := make(map[string]struct{})
+	baseCommit := ""
+	if rt != nil {
+		baseCommit = strings.ToLower(strings.TrimSpace(rt.workspace.HeadCommit))
+	}
+	for _, tip := range tips {
+		oversize, err := collectLocalCommitObjects(ctx, gitDir, rt, tip, baseCommit, objects, seenCommits, seenTrees)
+		if err != nil {
+			return nil, false, err
 		}
-		objects[fields[0]] = struct{}{}
+		if oversize {
+			return nil, true, nil
+		}
 	}
 	if len(objects) == 0 {
 		return nil, false, nil
-	}
-	info, err := gitObjectInfoBatch(ctx, gitDir, mapKeys(objects))
-	if err != nil {
-		return nil, false, err
-	}
-	for oid := range objects {
-		if object := info[oid]; object.typ == "blob" && object.size > gitLocalObjectMaxBlobBytes {
-			return nil, true, nil
-		}
 	}
 	return objects, false, nil
 }
@@ -1486,8 +1483,10 @@ func collectStagedLocalObjects(ctx context.Context, gitDir string, rt *gitWorksp
 		}
 		oid := meta[1]
 		rel := string(rec[tab+1:])
-		if n, ok := rt.cleanNode(rel); ok && strings.EqualFold(n.ObjectSHA, oid) {
-			continue
+		if rt != nil {
+			if n, ok := rt.cleanNode(rel); ok && strings.EqualFold(n.ObjectSHA, oid) {
+				continue
+			}
 		}
 		staged = append(staged, stagedBlob{oid: oid, path: rel})
 	}
@@ -1509,7 +1508,15 @@ func collectStagedLocalObjects(ctx context.Context, gitDir string, rt *gitWorksp
 		restore := gitIndexRestoreForPath(rt, blob.path)
 		allRestores = append(allRestores, restore)
 		object := info[blob.oid]
-		if object.typ == "blob" && object.size > gitLocalObjectMaxBlobBytes {
+		if object.typ == "" || object.typ == "missing" {
+			restores = append(restores, restore)
+			continue
+		}
+		if object.typ != "blob" {
+			restores = append(restores, restore)
+			continue
+		}
+		if object.size > gitLocalObjectMaxBlobBytes {
 			restores = append(restores, restore)
 			continue
 		}
@@ -1519,6 +1526,262 @@ func collectStagedLocalObjects(ctx context.Context, gitDir string, rt *gitWorksp
 		objects = nil
 	}
 	return objects, allRestores, restores, nil
+}
+
+func collectLocalRefTips(gitDir string) ([]string, error) {
+	seen := make(map[string]struct{})
+	add := func(raw string) {
+		fields := strings.Fields(raw)
+		if len(fields) == 0 {
+			return
+		}
+		oid := strings.ToLower(strings.TrimSpace(fields[0]))
+		if !isGitObjectID(oid) {
+			return
+		}
+		seen[oid] = struct{}{}
+	}
+	if head, err := os.ReadFile(filepath.Join(gitDir, "HEAD")); err == nil {
+		text := strings.TrimSpace(string(head))
+		if !strings.HasPrefix(text, "ref: ") {
+			add(text)
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	headsDir := filepath.Join(gitDir, "refs", "heads")
+	if err := filepath.WalkDir(headsDir, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if os.IsNotExist(walkErr) {
+				return nil
+			}
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		content, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		add(string(content))
+		return nil
+	}); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	if stash, err := os.ReadFile(filepath.Join(gitDir, "refs", "stash")); err == nil {
+		add(string(stash))
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	if packed, err := os.ReadFile(filepath.Join(gitDir, "packed-refs")); err == nil {
+		for _, line := range strings.Split(string(packed), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "^") {
+				continue
+			}
+			fields := strings.Fields(line)
+			if len(fields) < 2 {
+				continue
+			}
+			ref := fields[1]
+			if strings.HasPrefix(ref, "refs/heads/") || ref == "refs/stash" {
+				add(fields[0])
+			}
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	tips := mapKeys(seen)
+	sort.Strings(tips)
+	return tips, nil
+}
+
+func collectLocalCommitObjects(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime, tip, baseCommit string, objects map[string]struct{}, seenCommits, seenTrees map[string]struct{}) (bool, error) {
+	tip = strings.ToLower(strings.TrimSpace(tip))
+	if !isGitObjectID(tip) || tip == baseCommit {
+		return false, nil
+	}
+	stack := []string{tip}
+	for len(stack) > 0 {
+		oid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if oid == "" || oid == baseCommit {
+			continue
+		}
+		if _, ok := seenCommits[oid]; ok {
+			continue
+		}
+		typ, ok, err := gitObjectTypeNoLazy(ctx, gitDir, oid)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			continue
+		}
+		switch typ {
+		case "commit":
+			seenCommits[oid] = struct{}{}
+			objects[oid] = struct{}{}
+			tree, parents, err := gitCommitTreeAndParentsNoLazy(ctx, gitDir, oid)
+			if err != nil {
+				return false, err
+			}
+			if tree != "" {
+				oversize, err := collectTreeObjectsNoLazy(ctx, gitDir, rt, tree, "", objects, seenTrees)
+				if err != nil || oversize {
+					return oversize, err
+				}
+			}
+			for _, parent := range parents {
+				parent = strings.ToLower(strings.TrimSpace(parent))
+				if parent != "" && parent != baseCommit {
+					stack = append(stack, parent)
+				}
+			}
+		case "tag":
+			target, err := gitTagTargetNoLazy(ctx, gitDir, oid)
+			if err != nil {
+				return false, err
+			}
+			if target != "" && target != baseCommit {
+				stack = append(stack, target)
+			}
+		}
+	}
+	return false, nil
+}
+
+func collectTreeObjectsNoLazy(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime, treeOID, relDir string, objects map[string]struct{}, seenTrees map[string]struct{}) (bool, error) {
+	treeOID = strings.ToLower(strings.TrimSpace(treeOID))
+	if !isGitObjectID(treeOID) {
+		return false, nil
+	}
+	relDir = strings.Trim(filepath.ToSlash(relDir), "/")
+	if relDir != "" {
+		if rt != nil {
+			if n, ok := rt.cleanNode(relDir); ok && n.Kind == "dir" && strings.EqualFold(n.ObjectSHA, treeOID) {
+				return false, nil
+			}
+		}
+	}
+	if _, ok := seenTrees[treeOID]; ok {
+		return false, nil
+	}
+	seenTrees[treeOID] = struct{}{}
+	objects[treeOID] = struct{}{}
+
+	out, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "ls-tree", "-z", treeOID)
+	if err != nil {
+		return false, err
+	}
+	for _, rec := range bytes.Split(out, []byte{0}) {
+		if len(rec) == 0 {
+			continue
+		}
+		tab := bytes.IndexByte(rec, '\t')
+		if tab < 0 {
+			continue
+		}
+		meta := strings.Fields(string(rec[:tab]))
+		if len(meta) < 3 {
+			continue
+		}
+		kind := meta[1]
+		oid := strings.ToLower(meta[2])
+		name := string(rec[tab+1:])
+		entryRel := name
+		if relDir != "" {
+			entryRel = path.Join(relDir, name)
+		}
+		switch kind {
+		case "tree":
+			if rt != nil {
+				if n, ok := rt.cleanNode(entryRel); ok && n.Kind == "dir" && strings.EqualFold(n.ObjectSHA, oid) {
+					continue
+				}
+			}
+			oversize, err := collectTreeObjectsNoLazy(ctx, gitDir, rt, oid, entryRel, objects, seenTrees)
+			if err != nil || oversize {
+				return oversize, err
+			}
+		case "blob":
+			if rt != nil {
+				if n, ok := rt.cleanNode(entryRel); ok && strings.EqualFold(n.ObjectSHA, oid) {
+					continue
+				}
+			}
+			info, err := gitObjectInfoBatch(ctx, gitDir, []string{oid})
+			if err != nil {
+				return false, err
+			}
+			object := info[oid]
+			if object.typ == "" || object.typ == "missing" {
+				continue
+			}
+			if object.typ != "blob" {
+				continue
+			}
+			if object.size > gitLocalObjectMaxBlobBytes {
+				return true, nil
+			}
+			objects[oid] = struct{}{}
+		}
+	}
+	return false, nil
+}
+
+func gitObjectTypeNoLazy(ctx context.Context, gitDir, oid string) (string, bool, error) {
+	out, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "cat-file", "-t", oid)
+	if err != nil {
+		if isMissingGitObjectError(err) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return strings.TrimSpace(string(out)), true, nil
+}
+
+func gitCommitTreeAndParentsNoLazy(ctx context.Context, gitDir, oid string) (string, []string, error) {
+	out, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "cat-file", "-p", oid)
+	if err != nil {
+		return "", nil, err
+	}
+	var tree string
+	var parents []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "tree ") {
+			tree = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "tree ")))
+		} else if strings.HasPrefix(line, "parent ") {
+			parent := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "parent ")))
+			if isGitObjectID(parent) {
+				parents = append(parents, parent)
+			}
+		} else if line == "" {
+			break
+		}
+	}
+	return tree, parents, nil
+}
+
+func gitTagTargetNoLazy(ctx context.Context, gitDir, oid string) (string, error) {
+	out, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "cat-file", "-p", oid)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "object ") {
+			target := strings.ToLower(strings.TrimSpace(strings.TrimPrefix(line, "object ")))
+			if isGitObjectID(target) {
+				return target, nil
+			}
+			return "", nil
+		}
+		if line == "" {
+			break
+		}
+	}
+	return "", nil
 }
 
 func gitIndexRestoreForPath(rt *gitWorkspaceRuntime, rel string) gitIndexRestore {
@@ -1551,6 +1814,7 @@ func gitObjectInfoBatch(ctx context.Context, gitDir string, ids []string) (map[s
 		return out, nil
 	}
 	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "cat-file", "--batch-check=%(objectname) %(objecttype) %(objectsize)")
+	setGitNoLazyEnv(cmd)
 	cmd.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -1566,6 +1830,9 @@ func gitObjectInfoBatch(ctx context.Context, gitDir string, ids []string) (map[s
 	for _, line := range strings.Split(stdout.String(), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 3 {
+			if len(fields) >= 2 && fields[1] == "missing" {
+				out[fields[0]] = gitObjectInfo{typ: "missing"}
+			}
 			continue
 		}
 		size, err := strconv.ParseInt(fields[2], 10, 64)
@@ -1584,6 +1851,7 @@ func packGitObjects(ctx context.Context, gitDir string, objects map[string]struc
 	ids := mapKeys(objects)
 	sort.Strings(ids)
 	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "pack-objects", "--stdout")
+	setGitNoLazyEnv(cmd)
 	cmd.Stdin = strings.NewReader(strings.Join(ids, "\n") + "\n")
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -1633,6 +1901,49 @@ func gitCommandOutput(ctx context.Context, args ...string) ([]byte, error) {
 		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return out, nil
+}
+
+func gitCommandOutputNoLazy(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	setGitNoLazyEnv(cmd)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, msg)
+		}
+		return nil, fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
+	}
+	return out, nil
+}
+
+func setGitNoLazyEnv(cmd *exec.Cmd) {
+	cmd.Env = append(os.Environ(), "GIT_NO_LAZY_FETCH=1", "GIT_TERMINAL_PROMPT=0")
+}
+
+func isMissingGitObjectError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "missing") ||
+		strings.Contains(msg, "Not a valid object name") ||
+		strings.Contains(msg, "could not get object info") ||
+		strings.Contains(msg, "bad object")
+}
+
+func isGitObjectID(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func archiveLocalGitStateForCheckpoint(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime, sanitize gitCheckpointSanitization) ([]byte, error) {

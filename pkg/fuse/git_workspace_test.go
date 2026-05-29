@@ -1384,6 +1384,7 @@ func TestBuildLocalGitObjectPackPreservesSmallLocalCommit(t *testing.T) {
 	runFuseTestGit(t, work, "add", "README.md")
 	runFuseTestGit(t, work, "commit", "-m", "local commit")
 
+	forbidGitSubcommandForTest(t, "rev-list")
 	pack, sanitize, err := buildLocalGitObjectPack(context.Background(), filepath.Join(work, ".git"), rt)
 	if err != nil {
 		t.Fatalf("buildLocalGitObjectPack: %v", err)
@@ -1944,6 +1945,29 @@ func runFuseTestGit(t *testing.T, dir string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
+}
+
+func forbidGitSubcommandForTest(t *testing.T, forbidden string) {
+	t.Helper()
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not found")
+	}
+	binDir := t.TempDir()
+	wrapper := filepath.Join(binDir, "git")
+	script := fmt.Sprintf(`#!/bin/sh
+for arg in "$@"; do
+	if [ "$arg" = %q ]; then
+		echo "forbidden git subcommand: $arg" >&2
+		exit 123
+	fi
+done
+exec %q "$@"
+`, forbidden, realGit)
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatalf("write git wrapper: %v", err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func fuseGitOutputForTest(t *testing.T, dir string, args ...string) string {
