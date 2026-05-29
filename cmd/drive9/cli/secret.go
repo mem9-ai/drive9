@@ -477,7 +477,7 @@ func SecretRm(args []string) error {
 //   - --json: full VaultGrantIssueResponse (adds scope and perm to the key set)
 //   - --token-only: <token>\n  (byte-identical to the pre-V2a shape)
 func SecretGrant(args []string) error {
-	if IsHelpArgs(args) {
+	if IsHelpArgsWithValueFlags(args, "--agent", "--ttl", "--perm") {
 		_, _ = fmt.Fprintln(os.Stdout, vaultGrantUsage())
 		return nil
 	}
@@ -611,7 +611,7 @@ func SecretRevoke(args []string) error {
 
 // SecretAudit queries vault audit events and applies client-side filters.
 func SecretAudit(args []string) error {
-	if IsHelpArgs(args) {
+	if IsHelpArgsWithValueFlags(args, "--secret", "--agent", "--since", "--limit") {
 		_, _ = fmt.Fprintln(os.Stdout, vaultAuditUsage())
 		return nil
 	}

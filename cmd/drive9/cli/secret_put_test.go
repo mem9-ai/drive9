@@ -93,6 +93,26 @@ func TestSecretPut_RowA_ArgvAndPathShape(t *testing.T) {
 	}
 }
 
+func TestSecretPutFromFlagValueCanBeHelpLike(t *testing.T) {
+	withTTY(t, true)
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", "http://example.invalid")
+	t.Setenv("DRIVE9_API_KEY", "owner-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	err := SecretPut([]string{"/n/vault/aws-prod", "--from", "--help"})
+	if err == nil {
+		t.Fatal("SecretPut error = nil, want directory validation error")
+	}
+	if !strings.Contains(err.Error(), `--from directory "--help"`) {
+		t.Fatalf("error = %q, want --from directory validation for --help", err)
+	}
+	if strings.Contains(err.Error(), vaultPutUsage()) {
+		t.Fatalf("error = %q, must not be usage", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Row B — `--from <dir>` dir semantics. B1..B9 rejected classes each get
 // a subtest with a double-sided assertion (named class marker + name of

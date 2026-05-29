@@ -123,7 +123,7 @@ func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
 		{
 			name:      "create",
 			cmd:       "create",
-			args:      []string{"--name", "--help"},
+			args:      []string{"--name", "example", "--help"},
 			firstLine: "usage: drive9 create [--name NAME] [--server URL]",
 		},
 		{
@@ -177,7 +177,7 @@ func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
 		{
 			name:      "vault put",
 			cmd:       "vault",
-			args:      []string{"put", "/n/vault/aws", "--from", "--help"},
+			args:      []string{"put", "/n/vault/aws", "--help"},
 			firstLine: "usage: drive9 vault put /n/vault/<secret> --from <dir>",
 		},
 		{

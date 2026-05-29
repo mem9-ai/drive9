@@ -300,19 +300,26 @@ func TokenRevoke(args []string) error {
 		_, _ = fmt.Fprintln(os.Stdout, tokenRevokeUsage())
 		return nil
 	}
-	args, _ = stripLeadingDashDash(args)
+	args, escaped := stripLeadingDashDash(args)
 	var apiKeyFile string
 	pos := make([]string, 0, 1)
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--api-key-file":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--api-key-file requires a value")
+	if escaped {
+		if len(args) != 1 {
+			return fmt.Errorf("%s", tokenRevokeUsage())
+		}
+		pos = append(pos, args[0])
+	} else {
+		for i := 0; i < len(args); i++ {
+			switch args[i] {
+			case "--api-key-file":
+				if i+1 >= len(args) {
+					return fmt.Errorf("--api-key-file requires a value")
+				}
+				i++
+				apiKeyFile = args[i]
+			default:
+				pos = append(pos, args[i])
 			}
-			i++
-			apiKeyFile = args[i]
-		default:
-			pos = append(pos, args[i])
 		}
 	}
 	if apiKeyFile != "" && len(pos) > 0 {
@@ -331,7 +338,7 @@ func TokenRevoke(args []string) error {
 	switch {
 	case apiKeyFile != "":
 		targetAPIKey, err = readTokenAPIKeyFile(apiKeyFile)
-	case pos[0] == "-":
+	case !escaped && pos[0] == "-":
 		targetAPIKey, err = readTokenAPIKeyStdin()
 	default:
 		target := strings.TrimSpace(pos[0])
