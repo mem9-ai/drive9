@@ -642,7 +642,7 @@ func (fs *Dat9FS) readGitFile(ctx context.Context, localPath string, offset, siz
 			return nil, syscall.EISDIR
 		}
 		if e.Op != "chmod" || len(e.Content) > 0 {
-			return sliceRead(e.Content, offset, size), nil
+			return fs.readGitOverlayFile(ctx, rt, localPath, rel, e, offset, size)
 		}
 	}
 	n, ok := rt.cleanNode(rel)
@@ -653,6 +653,43 @@ func (fs *Dat9FS) readGitFile(ctx context.Context, localPath string, offset, siz
 		return nil, syscall.EISDIR
 	}
 	return fs.readGitCleanFile(ctx, rt, localPath, rel, n, offset, size)
+}
+
+func (fs *Dat9FS) readGitOverlayFile(ctx context.Context, rt *gitWorkspaceRuntime, localPath, rel string, e client.GitOverlayEntry, offset, size int64) ([]byte, error) {
+	if e.Kind == "dir" || e.Kind == "submodule" {
+		return nil, syscall.EISDIR
+	}
+	if len(e.Content) == 0 && e.SizeBytes > 0 {
+		if fs == nil || fs.client == nil {
+			return nil, syscall.EIO
+		}
+		loaded, err := fs.client.GetGitOverlayEntry(ctx, rt.workspace.WorkspaceID, rel)
+		if err != nil {
+			return nil, err
+		}
+		e = *loaded
+		fs.applyGitOverlayEntry(rt.workspace.WorkspaceID, e)
+	}
+	if e.Op == "whiteout" {
+		return nil, os.ErrNotExist
+	}
+	if e.Kind == "dir" || e.Kind == "submodule" {
+		return nil, syscall.EISDIR
+	}
+	if len(e.Content) == 0 && e.SizeBytes > 0 {
+		return nil, fmt.Errorf("git overlay %s has size %d but no local content", rel, e.SizeBytes)
+	}
+	if e.SizeBytes > int64(len(e.Content)) {
+		return nil, fmt.Errorf("git overlay %s content shorter than metadata: got %d want %d", rel, len(e.Content), e.SizeBytes)
+	}
+	if e.SizeBytes != int64(len(e.Content)) {
+		e.SizeBytes = int64(len(e.Content))
+		fs.applyGitOverlayEntry(rt.workspace.WorkspaceID, e)
+	}
+	if ino, ok := fs.inodes.GetInode(localPath); ok {
+		fs.inodes.UpdateSize(ino, int64(len(e.Content)))
+	}
+	return sliceRead(e.Content, offset, size), nil
 }
 
 func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime, localPath, rel string, n client.GitTreeNode, offset, size int64) ([]byte, error) {
@@ -865,7 +902,7 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	if err != nil {
 		return err
 	}
-	if _, err := os.Stat(gitDir); err == nil {
+	if gitDirLooksUsable(gitDir) {
 		rt.mu.Lock()
 		rt.restored = true
 		rt.mu.Unlock()
@@ -878,20 +915,58 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	if len(state.Content) == 0 {
 		return fmt.Errorf("git workspace %s has no .git checkpoint", rt.workspace.WorkspaceID)
 	}
-	if state.StorageType == gitStateStorageTarGzNoObjects {
-		if err := fs.restoreGitObjectsFromRemote(ctx, rt, gitDir); err != nil {
-			return err
-		}
-		if err := fs.restoreGitObjectPacks(ctx, rt, gitDir); err != nil {
-			return err
-		}
-	}
-	if err := extractGitArchive(state.Content, gitDir); err != nil {
+	if err := fs.restoreGitStateAtomically(ctx, rt, gitDir, state); err != nil {
 		return err
+	}
+	if !gitDirLooksUsable(gitDir) {
+		return fmt.Errorf("git workspace %s restored unusable .git state", rt.workspace.WorkspaceID)
 	}
 	rt.mu.Lock()
 	rt.restored = true
 	rt.mu.Unlock()
+	return nil
+}
+
+func gitDirLooksUsable(gitDir string) bool {
+	info, err := os.Stat(gitDir)
+	if err != nil || !info.IsDir() {
+		return false
+	}
+	head, err := os.ReadFile(filepath.Join(gitDir, "HEAD"))
+	return err == nil && strings.TrimSpace(string(head)) != ""
+}
+
+func (fs *Dat9FS) restoreGitStateAtomically(ctx context.Context, rt *gitWorkspaceRuntime, gitDir string, state *client.GitState) error {
+	parent := filepath.Dir(gitDir)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	tmpRoot, err := os.MkdirTemp(parent, ".drive9-git-state-restore-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(tmpRoot) }()
+	tmpGitDir := filepath.Join(tmpRoot, ".git")
+	if state.StorageType == gitStateStorageTarGzNoObjects {
+		if err := fs.restoreGitObjectsFromRemote(ctx, rt, tmpGitDir); err != nil {
+			return err
+		}
+		if err := fs.restoreGitObjectPacks(ctx, rt, tmpGitDir); err != nil {
+			return err
+		}
+	}
+	if err := extractGitArchive(state.Content, tmpGitDir); err != nil {
+		return err
+	}
+	if !gitDirLooksUsable(tmpGitDir) {
+		return fmt.Errorf("restored git state is missing HEAD")
+	}
+	if err := os.RemoveAll(gitDir); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpGitDir, gitDir); err != nil {
+		return err
+	}
 	return nil
 }
 

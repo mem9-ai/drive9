@@ -768,6 +768,9 @@ func TestGitWorkspaceRootRmdirDeletesWorkspace(t *testing.T) {
 func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	srcGit := t.TempDir()
+	if err := os.WriteFile(filepath.Join(srcGit, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(srcGit, "config"), []byte("[core]\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -793,6 +796,54 @@ func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	}
 	if string(got) != "[core]\n" {
 		t.Fatalf("restored config = %q, want %q", got, "[core]\n")
+	}
+}
+
+func TestGitWorkspaceRestoreReplacesInvalidLocalGitState(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	srcGit := t.TempDir()
+	if err := os.WriteFile(filepath.Join(srcGit, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcGit, "config"), []byte("[core]\n\trepositoryformatversion = 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	state, err := archiveLocalGitDir(srcGit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.state = state
+
+	localRoot := t.TempDir()
+	opts := &MountOptions{LocalRoot: localRoot, Profile: MountProfileCodingAgent, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	gitDir := filepath.Join(localRoot, "overlay", "repo", ".git")
+	if err := os.MkdirAll(gitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(gitDir, "config"), []byte("[broken]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var out gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, ".git", &out); st != gofuse.OK {
+		t.Fatalf("Lookup .git status = %v, want OK", st)
+	}
+	got, err := os.ReadFile(filepath.Join(gitDir, "HEAD"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "ref: refs/heads/main\n" {
+		t.Fatalf("restored HEAD = %q, want main ref", got)
+	}
+	got, err = os.ReadFile(filepath.Join(gitDir, "config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(got), "[broken]") {
+		t.Fatalf("invalid git state was reused: %q", got)
 	}
 }
 
@@ -999,6 +1050,79 @@ func TestGitWorkspaceOverlayWinsOverCleanCache(t *testing.T) {
 	}
 	if string(got) != "overlay\n" {
 		t.Fatalf("readGitFile = %q, want overlay", got)
+	}
+}
+
+func TestGitWorkspaceOverlayReadFetchesMissingContent(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	content := []byte("overlay content\n")
+	fixture.overlay["generated.ts"] = client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "generated.ts",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   int64(len(content)),
+	}
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if entry, handled := fs.gitEntry(context.Background(), "/repo/generated.ts", true); !handled || entry == nil {
+		t.Fatalf("gitEntry handled=%t entry=%v, want overlay entry", handled, entry)
+	}
+	fs.git.mu.Lock()
+	fs.git.loadedAt = time.Now().Add(gitWorkspaceRefreshInterval)
+	fs.git.mu.Unlock()
+	fixture.mu.Lock()
+	entry := fixture.overlay["generated.ts"]
+	entry.Content = append([]byte(nil), content...)
+	fixture.overlay["generated.ts"] = entry
+	fixture.mu.Unlock()
+
+	got, err := fs.readGitFile(context.Background(), "/repo/generated.ts", 0, -1)
+	if err != nil {
+		t.Fatalf("readGitFile: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("readGitFile = %q, want %q", got, content)
+	}
+	fixture.mu.Lock()
+	fixture.overlay["generated.ts"] = client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "generated.ts",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   int64(len(content)),
+	}
+	fixture.mu.Unlock()
+	got, err = fs.readGitFile(context.Background(), "/repo/generated.ts", 0, -1)
+	if err != nil {
+		t.Fatalf("cached readGitFile: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("cached readGitFile = %q, want %q", got, content)
+	}
+}
+
+func TestGitWorkspaceOverlayReadErrorsWhenContentMissing(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.overlay["missing.ts"] = client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "missing.ts",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   8,
+	}
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	got, err := fs.readGitFile(context.Background(), "/repo/missing.ts", 0, -1)
+	if err == nil {
+		t.Fatalf("readGitFile = %q, nil error; want missing content error", got)
 	}
 }
 
