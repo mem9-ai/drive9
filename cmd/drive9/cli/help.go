@@ -14,9 +14,15 @@ func IsHelpArg(arg string) bool {
 // It stops at "--" because arguments after that separator belong to a nested
 // command or data payload rather than drive9's own parser.
 func IsHelpArgs(args []string) bool {
-	for _, arg := range args {
+	for i, arg := range args {
 		if arg == "--" {
 			return false
+		}
+		if arg == "help" {
+			if i == 0 {
+				return true
+			}
+			continue
 		}
 		if IsHelpArg(arg) {
 			return true

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -40,9 +41,13 @@ func TestIsHelpArgsScansBeforeDashDash(t *testing.T) {
 		want bool
 	}{
 		{name: "empty", args: nil, want: false},
-		{name: "first arg", args: []string{"--help"}, want: true},
-		{name: "flag value position", args: []string{"--from-file", "--help"}, want: true},
-		{name: "short help", args: []string{"--name", "-h"}, want: true},
+		{name: "bare help first arg", args: []string{"help"}, want: true},
+		{name: "long help first arg", args: []string{"--help"}, want: true},
+		{name: "dash prefixed help flag value position", args: []string{"--from-file", "--help"}, want: true},
+		{name: "short help after flag", args: []string{"--name", "-h"}, want: true},
+		{name: "bare help after first arg is data", args: []string{"pattern", "help"}, want: false},
+		{name: "bare help as flag value is data", args: []string{"--name", "help"}, want: false},
+		{name: "bare help data before dash prefixed help keeps scanning", args: []string{"pattern", "help", "--help"}, want: true},
 		{name: "after dash dash is data", args: []string{"/n/vault/aws", "--", "env", "--help"}, want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -64,7 +69,7 @@ func TestCtxLeafHelpScansFullArgumentList(t *testing.T) {
 		{name: "import", args: []string{"import", "--from-file", "--help"}, firstLine: "usage: drive9 ctx import [--from-file <path|->] [--name <name>]"},
 		{name: "fork", args: []string{"fork", "--from", "--help"}, firstLine: "usage: drive9 ctx fork [<new>] [--from <ctx>] [--json]"},
 		{name: "ls", args: []string{"ls", "--type", "--help"}, firstLine: "usage: drive9 ctx ls [-l|--json] [--type <kind>|--scoped]"},
-		{name: "use", args: []string{"use", "--help"}, firstLine: "usage: drive9 ctx use <name>"},
+		{name: "use", args: []string{"use", "--help"}, firstLine: "usage: drive9 ctx use [--] <name>"},
 		{name: "rm", args: []string{"rm", "old", "--help"}, firstLine: "usage: drive9 ctx rm <name>"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -315,6 +320,34 @@ func TestCtxRmRemovesEscapedHelpAliasContextNames(t *testing.T) {
 			}
 			if _, ok := loadConfig().Contexts[name]; ok {
 				t.Fatalf("local %q context still present after rm", name)
+			}
+		})
+	}
+}
+
+func TestCtxUseUsesEscapedHelpAliasContextNames(t *testing.T) {
+	for _, name := range []string{"help", "-h", "-help", "--help"} {
+		t.Run(name, func(t *testing.T) {
+			seedThreeContexts(t)
+			cfg := loadConfig()
+			if _, err := ctxAdd(cfg, name, &Context{Type: PrincipalFSScoped, Server: "https://s", APIKey: "dat9_scoped", ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
+				t.Fatalf("ctxAdd %q: %v", name, err)
+			}
+			if err := saveConfig(cfg); err != nil {
+				t.Fatalf("saveConfig: %v", err)
+			}
+
+			out, err := captureStdoutE(t, func() error {
+				return Ctx([]string{"use", "--", name})
+			})
+			if err != nil {
+				t.Fatalf("ctx use -- %q: %v", name, err)
+			}
+			if !strings.Contains(out, "switched to context "+strconv.Quote(name)) {
+				t.Fatalf("missing switch confirmation, got: %s", out)
+			}
+			if got := loadConfig().CurrentContext; got != name {
+				t.Fatalf("CurrentContext = %q, want %q", got, name)
 			}
 		})
 	}

@@ -207,7 +207,7 @@ func SecretPut(args []string) error {
 }
 
 func vaultPutUsage() string {
-	return "usage drive9 vault put /n/vault/<secret> --from <dir>"
+	return "usage: drive9 vault put /n/vault/<secret> --from <dir>"
 }
 
 // errPreSend marks errors that the CLI constructed locally before any byte
