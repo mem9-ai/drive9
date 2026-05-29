@@ -650,16 +650,6 @@ func gitWorkspaceOpenFlags(rt *gitWorkspaceRuntime, rel string, flags uint32) ui
 	return gofuse.FOPEN_KEEP_CACHE
 }
 
-func gitOverlayHasContentChange(e client.GitOverlayEntry) bool {
-	if e.Op == "whiteout" {
-		return true
-	}
-	if e.Kind == "dir" || e.Kind == "submodule" {
-		return false
-	}
-	return e.Op != "chmod"
-}
-
 func (fs *Dat9FS) gitWorkspaceCurrentSize(rt *gitWorkspaceRuntime, rel string) (int64, bool) {
 	if rt == nil || rel == "" {
 		return 0, false
