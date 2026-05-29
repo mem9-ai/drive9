@@ -17,6 +17,10 @@ import (
 //	drive9 fs stat -o json /path/to/file
 //	drive9 fs stat :/path/to/file
 func Stat(c *client.Client, args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, fsStatUsage())
+		return nil
+	}
 	outputFormat := "text"
 	path := ""
 	for i := 0; i < len(args); i++ {
@@ -24,7 +28,7 @@ func Stat(c *client.Client, args []string) error {
 		switch arg {
 		case "-o", "--output":
 			if i+1 >= len(args) {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+				return fmt.Errorf("%s", fsStatUsage())
 			}
 			i++
 			outputFormat = args[i]
@@ -33,16 +37,16 @@ func Stat(c *client.Client, args []string) error {
 			}
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+				return fmt.Errorf("%s", fsStatUsage())
 			}
 			if path != "" {
-				return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+				return fmt.Errorf("%s", fsStatUsage())
 			}
 			path = arg
 		}
 	}
 	if path == "" {
-		return fmt.Errorf("usage: drive9 fs stat [-o text|json] <path>")
+		return fmt.Errorf("%s", fsStatUsage())
 	}
 	var err error
 	c, path, _, _, err = fsClientForRemoteArg(c, path)

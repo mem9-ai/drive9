@@ -9,8 +9,12 @@ import (
 )
 
 func Grep(c *client.Client, args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, fsGrepUsage())
+		return nil
+	}
 	if len(args) < 1 {
-		return fmt.Errorf("usage: drive9 fs grep <pattern> [path]")
+		return fmt.Errorf("%s", fsGrepUsage())
 	}
 	query := args[0]
 	path := "/"
@@ -43,7 +47,7 @@ func Grep(c *client.Client, args []string) error {
 
 func GrepJSON(c *client.Client, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: drive9 fs grep <pattern> [path]")
+		return fmt.Errorf("%s", fsGrepUsage())
 	}
 	query := args[0]
 	path := "/"

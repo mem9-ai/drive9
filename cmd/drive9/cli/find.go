@@ -10,6 +10,10 @@ import (
 )
 
 func Find(c *client.Client, args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, fsFindUsage())
+		return nil
+	}
 	path := "/"
 	params := url.Values{}
 

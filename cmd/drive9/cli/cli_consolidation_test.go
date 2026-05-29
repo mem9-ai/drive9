@@ -33,6 +33,55 @@ func captureStderrE(t *testing.T, fn func() error) (string, error) {
 	return string(<-done), fnErr
 }
 
+func TestIsHelpArgsScansBeforeDashDash(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "empty", args: nil, want: false},
+		{name: "first arg", args: []string{"--help"}, want: true},
+		{name: "flag value position", args: []string{"--from-file", "--help"}, want: true},
+		{name: "short help", args: []string{"--name", "-h"}, want: true},
+		{name: "after dash dash is data", args: []string{"/n/vault/aws", "--", "env", "--help"}, want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsHelpArgs(tc.args); got != tc.want {
+				t.Fatalf("IsHelpArgs(%v) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCtxLeafHelpScansFullArgumentList(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		args      []string
+		firstLine string
+	}{
+		{name: "show", args: []string{"show", "--json", "--help"}, firstLine: "usage: drive9 ctx show [--json] [--reveal]"},
+		{name: "add", args: []string{"add", "--api-key", "--help"}, firstLine: "usage: drive9 ctx add --api-key <key> [--name <n>] [--server <url>]"},
+		{name: "import", args: []string{"import", "--from-file", "--help"}, firstLine: "usage: drive9 ctx import [--from-file <path|->] [--name <name>]"},
+		{name: "fork", args: []string{"fork", "--from", "--help"}, firstLine: "usage: drive9 ctx fork [<new>] [--from <ctx>] [--json]"},
+		{name: "ls", args: []string{"ls", "--type", "--help"}, firstLine: "usage: drive9 ctx ls [-l|--json] [--type <kind>|--scoped]"},
+		{name: "use", args: []string{"use", "--help"}, firstLine: "usage: drive9 ctx use <name>"},
+		{name: "rm", args: []string{"rm", "old", "--help"}, firstLine: "usage: drive9 ctx rm <name>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			out, err := captureStdoutE(t, func() error {
+				return Ctx(tc.args)
+			})
+			if err != nil {
+				t.Fatalf("Ctx(%v): %v", tc.args, err)
+			}
+			if !strings.HasPrefix(out, tc.firstLine) {
+				t.Fatalf("stdout = %q, want first line %q", out, tc.firstLine)
+			}
+		})
+	}
+}
+
 // seedThreeContexts writes one owner + one delegated + one fs_scoped
 // context to local config under an isolated $HOME for use by the
 // ctx list / ctx rm / token deprecation alias tests in this file.
@@ -243,7 +292,7 @@ func TestCtxRmRemovesDashPrefixedContextNames(t *testing.T) {
 	}
 }
 
-func TestCtxRmRemovesHelpAliasContextNames(t *testing.T) {
+func TestCtxRmRemovesEscapedHelpAliasContextNames(t *testing.T) {
 	for _, name := range []string{"help", "-h", "-help", "--help"} {
 		t.Run(name, func(t *testing.T) {
 			seedThreeContexts(t)
@@ -256,7 +305,7 @@ func TestCtxRmRemovesHelpAliasContextNames(t *testing.T) {
 			}
 
 			out, err := captureStdoutE(t, func() error {
-				return Ctx([]string{"rm", name})
+				return Ctx([]string{"rm", "--", name})
 			})
 			if err != nil {
 				t.Fatalf("ctx rm %q: %v", name, err)

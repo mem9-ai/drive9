@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -12,8 +13,12 @@ import (
 //	drive9 fs symlink /target :/link
 //	drive9 fs symlink ctx:/target ctx:/link
 func Symlink(c *client.Client, args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, fsSymlinkUsage())
+		return nil
+	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs symlink <target> <link>")
+		return fmt.Errorf("%s", fsSymlinkUsage())
 	}
 	target := args[0]
 	linkPath := args[1]

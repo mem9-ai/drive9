@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -12,6 +13,10 @@ import (
 //	drive9 fs rm -r /path/to/dir/
 //	drive9 fs rm --recursive :/path/to/dir/
 func Rm(c *client.Client, args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, fsRmUsage())
+		return nil
+	}
 	var (
 		path       string
 		parseFlags = true
@@ -33,13 +38,13 @@ func Rm(c *client.Client, args []string) error {
 			}
 		}
 		if path != "" {
-			return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] <path>")
+			return fmt.Errorf("%s", fsRmUsage())
 		}
 		path = arg
 	}
 
 	if path == "" {
-		return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] <path>")
+		return fmt.Errorf("%s", fsRmUsage())
 	}
 
 	var err error

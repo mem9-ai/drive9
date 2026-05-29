@@ -118,9 +118,17 @@ commands:
 `
 }
 
+func doctorFuseUsage() string {
+	return "usage: drive9 doctor fuse [--mountpoint path] [--cache-dir path] [--server url] [--timeout duration]"
+}
+
 func runDoctorFuse(args []string, deps doctorDeps) error {
 	if deps.stdout == nil {
 		deps.stdout = io.Discard
+	}
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(deps.stdout, doctorFuseUsage())
+		return nil
 	}
 
 	fs := flag.NewFlagSet("doctor fuse", flag.ContinueOnError)
@@ -130,10 +138,10 @@ func runDoctorFuse(args []string, deps doctorDeps) error {
 	server := fs.String("server", "", "drive9 server URL to check")
 	timeout := fs.Duration("timeout", 3*time.Second, "server connectivity timeout")
 	if err := fs.Parse(args); err != nil {
-		return fmt.Errorf("usage: drive9 doctor fuse [--mountpoint path] [--cache-dir path] [--server url] [--timeout duration]")
+		return fmt.Errorf("%s", doctorFuseUsage())
 	}
 	if fs.NArg() != 0 {
-		return fmt.Errorf("usage: drive9 doctor fuse [--mountpoint path] [--cache-dir path] [--server url] [--timeout duration]")
+		return fmt.Errorf("%s", doctorFuseUsage())
 	}
 	if *timeout <= 0 {
 		return fmt.Errorf("doctor fuse: --timeout must be > 0")

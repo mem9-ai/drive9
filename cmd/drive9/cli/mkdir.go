@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -12,8 +13,12 @@ import (
 //	drive9 fs mkdir /path/to/dir
 //	drive9 fs mkdir :/path/to/dir
 func Mkdir(c *client.Client, args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, fsMkdirUsage())
+		return nil
+	}
 	if len(args) != 1 {
-		return fmt.Errorf("usage: drive9 fs mkdir <path>")
+		return fmt.Errorf("%s", fsMkdirUsage())
 	}
 	path := args[0]
 	var err error

@@ -36,6 +36,10 @@ const recursiveCopyConcurrency = 16
 //	drive9 fs cp :/remote/path -                  download to stdout
 //	drive9 fs cp --append tail.log :/remote/path  append local data to remote file
 func Cp(c *client.Client, args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, fsCpUsage())
+		return nil
+	}
 	resume := false
 	appendMode := false
 	recursive := false
@@ -84,7 +88,7 @@ func Cp(c *client.Client, args []string) error {
 	}
 
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs cp [-r|--recursive] [--resume] [--append] [--tag key=value]... [--description <text>] <src> <dst>")
+		return fmt.Errorf("%s", fsCpUsage())
 	}
 	if resume && appendMode {
 		return fmt.Errorf("--resume and --append cannot be used together")

@@ -226,6 +226,17 @@ func runFS(args []string) {
 	sub := args[0]
 	rest := args[1:]
 
+	if cli.IsHelpArg(sub) {
+		fmt.Fprint(os.Stdout, fsUsageText())
+		return
+	}
+	if cli.IsHelpArgs(rest) {
+		if usage, ok := cli.FSSubcommandUsage(sub); ok {
+			fmt.Fprintln(os.Stdout, usage)
+			return
+		}
+	}
+
 	// Only commands that may upload pay the /v1/status warm RTT. Read-only
 	// commands (cat/ls/stat/rm/grep/find) and namespace-only writes (mv,
 	// mkdir) do not consult the upload threshold and can skip the warm —
@@ -265,8 +276,6 @@ func runFS(args []string) {
 		err = cli.Grep(c, rest)
 	case "find":
 		err = cli.Find(c, rest)
-	case "-h", "-help", "--help", "help":
-		fsUsage(0)
 	default:
 		fmt.Fprintf(os.Stderr, "drive9 fs: unknown command %q\n", sub)
 		fsUsage(2)
@@ -327,7 +336,12 @@ func usage(code int) {
 func fsUsage(code int) {
 	// Keep this usage block visually aligned. When editing wrapped help text,
 	// preserve the column layout so subcommand descriptions remain easy to scan.
-	fmt.Fprintf(os.Stderr, `usage: drive9 fs <command> [arguments]
+	fmt.Fprint(os.Stderr, fsUsageText())
+	exitWithCode(code)
+}
+
+func fsUsageText() string {
+	return `usage: drive9 fs <command> [arguments]
 
 commands:
   cp [flags] <src> <dst>
@@ -362,8 +376,7 @@ commands:
 
 global:
   -h, --help, help       show this help
-`)
-	exitWithCode(code)
+`
 }
 
 func exitWithCode(code int) {

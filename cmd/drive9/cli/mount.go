@@ -53,14 +53,20 @@ var (
 // a positional-arity error rather than by pre-reserving backend-shaped
 // words that do not exist yet.
 func MountCmd(args []string) error {
-	fmt.Fprint(os.Stderr, buildinfo.String("drive9 mount"))
 	if len(args) > 0 {
 		if args[0] == "vault" {
 			return VaultMountCmd(args[1:])
 		}
 	}
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, mountUsage())
+		return nil
+	}
+	fmt.Fprint(os.Stderr, buildinfo.String("drive9 mount"))
 	return fsMountCmd(args)
 }
+
+func mountUsage() string { return "usage: drive9 mount [flags] [:/remote] <mountpoint>" }
 
 // fsMountCmd is the pre-V2e writable fs mount entry point.
 //
@@ -83,6 +89,10 @@ func MountCmd(args []string) error {
 // MountOptions{Server, APIKey, Token}, not through the child's environment.
 // This makes the resolver's Unsetenv-after-read mitigation safe for mount.
 func fsMountCmd(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, mountUsage())
+		return nil
+	}
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
@@ -118,7 +128,7 @@ func fsMountCmd(args []string) error {
 	perfCounters := fs.Bool("perf-counters", false, "print FUSE perf counter summary on unmount")
 
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] [:/remote] <mountpoint>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "%s\n\nflags:\n", mountUsage())
 		fs.PrintDefaults()
 	}
 
@@ -448,6 +458,8 @@ func UmountCmd(args []string) error {
 	return runUmount(args, defaultUmountDeps())
 }
 
+func umountUsage() string { return "usage: drive9 umount [--timeout duration] <mountpoint>" }
+
 type umountDeps struct {
 	goos             string
 	lookPath         func(string) (string, error)
@@ -486,10 +498,14 @@ func defaultUmountDeps() umountDeps {
 }
 
 func runUmount(args []string, deps umountDeps) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, umountUsage())
+		return nil
+	}
 	fs := flag.NewFlagSet("umount", flag.ContinueOnError)
 	waitTimeout := fs.Duration("timeout", 60*time.Second, "time to wait for the drive9 mount process to exit after unmount; 0 disables waiting")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 umount [--timeout duration] <mountpoint>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "%s\n\nflags:\n", umountUsage())
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -497,7 +513,7 @@ func runUmount(args []string, deps umountDeps) error {
 	}
 	if fs.NArg() != 1 {
 		fs.Usage()
-		return fmt.Errorf("usage: drive9 umount [--timeout duration] <mountpoint>")
+		return fmt.Errorf("%s", umountUsage())
 	}
 	mountPoint := fs.Arg(0)
 	stateMountPoint := mountPoint
