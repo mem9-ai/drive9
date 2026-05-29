@@ -46,6 +46,12 @@ func IsHelpArgsWithValueFlags(args []string, valueFlags ...string) bool {
 	return false
 }
 
+// IsCpHelpArgs reports whether cp args contain a help token, excluding
+// help-like values consumed by cp value flags.
+func IsCpHelpArgs(args []string) bool {
+	return IsHelpArgsWithValueFlags(args, "--tag", "--description")
+}
+
 func stripLeadingDashDash(args []string) ([]string, bool) {
 	if len(args) > 0 && args[0] == "--" {
 		return args[1:], true

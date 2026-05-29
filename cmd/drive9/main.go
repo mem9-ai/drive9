@@ -230,7 +230,7 @@ func runFS(args []string) {
 		_, _ = fmt.Fprint(os.Stdout, fsUsageText())
 		return
 	}
-	if cli.IsHelpArgs(rest) {
+	if fsSubcommandHasHelp(sub, rest) {
 		if usage, ok := cli.FSSubcommandUsage(sub); ok {
 			_, _ = fmt.Fprintln(os.Stdout, usage)
 			return
@@ -282,6 +282,15 @@ func runFS(args []string) {
 	}
 	if err != nil {
 		fatal("fs "+sub, err)
+	}
+}
+
+func fsSubcommandHasHelp(sub string, args []string) bool {
+	switch sub {
+	case "cp":
+		return cli.IsCpHelpArgs(args)
+	default:
+		return cli.IsHelpArgs(args)
 	}
 }
 
