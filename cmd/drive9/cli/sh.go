@@ -16,7 +16,11 @@ import (
 //
 // The shell supports: cd, pwd, ls, cat, cp, mv, rm, stat, help, exit.
 // Paths are resolved relative to the current working directory.
-func Sh(c *client.Client, _ []string) error {
+func Sh(c *client.Client, args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, fsShUsage())
+		return nil
+	}
 	cwd := "/"
 	scanner := bufio.NewScanner(os.Stdin)
 

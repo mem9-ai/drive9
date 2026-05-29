@@ -74,6 +74,10 @@ var stdinIsTTY = func() bool {
 //  3. ROW E owner-credential check.
 //  4. ROW B dir semantics (includes `--from` missing/empty/nonexistent/etc).
 func SecretPut(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, vaultPutUsage())
+		return nil
+	}
 	// Row F: stdin input contract. The wholesale-replace payload is
 	// multi-key; stdin would require adopting a new framing (tar/dotenv/
 	// envdir-stream) that is out of MVP scope. We reject early — BEFORE
@@ -87,7 +91,7 @@ func SecretPut(args []string) error {
 	// Row A: argv shape. Exactly one positional (the `/n/vault/<secret>`
 	// path) and exactly the `--from <dir>` flag pair. No other flags.
 	if len(args) == 0 {
-		return fmt.Errorf("usage drive9 vault put /n/vault/<secret> --from <dir>")
+		return fmt.Errorf("%s", vaultPutUsage())
 	}
 	pathArg := args[0]
 	name, err := parseVaultPath(pathArg)
@@ -200,6 +204,10 @@ func SecretPut(args []string) error {
 		return fmt.Errorf("drive9 vault put %s: server refused: HTTP %d: %s", pathArg, resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	return nil
+}
+
+func vaultPutUsage() string {
+	return "usage drive9 vault put /n/vault/<secret> --from <dir>"
 }
 
 // errPreSend marks errors that the CLI constructed locally before any byte

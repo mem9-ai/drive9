@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"os"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -11,8 +12,12 @@ import (
 //	drive9 fs mv /old/path /new/path
 //	drive9 fs mv :/old/path :/new/path
 func Mv(c *client.Client, args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, fsMvUsage())
+		return nil
+	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs mv <old> <new>")
+		return fmt.Errorf("%s", fsMvUsage())
 	}
 	oldPath := args[0]
 	newPath := args[1]

@@ -20,6 +20,10 @@ func Cat(c *client.Client, args []string) error {
 }
 
 func catWithWriter(c *client.Client, args []string, out io.Writer) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, fsCatUsage())
+		return nil
+	}
 	fs := flag.NewFlagSet("fs cat", flag.ContinueOnError)
 	offset := fs.Int64("offset", 0, "byte offset for a positional read; requires --length")
 	length := fs.Int64("length", 0, "byte length for a positional read; requires --offset")
@@ -38,7 +42,7 @@ func catWithWriter(c *client.Client, args []string, out io.Writer) error {
 	})
 
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 fs cat [--offset N --length N] <path>")
+		return fmt.Errorf("%s", fsCatUsage())
 	}
 	if offsetSet != lengthSet {
 		return fmt.Errorf("--offset and --length must be provided together")

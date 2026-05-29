@@ -15,6 +15,10 @@ import (
 //	drive9 fs ls -l /path  long format with size
 //	drive9 fs ls :/path    list using remote path prefix
 func Ls(c *client.Client, args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, fsLsUsage())
+		return nil
+	}
 	long := false
 	path := "/"
 
