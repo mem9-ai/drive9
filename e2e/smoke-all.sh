@@ -4,6 +4,7 @@
 set -euo pipefail
 
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
 
 PASS=0
 FAIL=0
@@ -36,6 +37,13 @@ run_case "cli" "e2e/cli-smoke-test.sh"
 run_case "journal" "e2e/journal-smoke-test.sh"
 run_case "fuse" "e2e/fuse-smoke-test.sh"
 run_case "posix-permission" "e2e/posix-permission-smoke-test.sh"
+if [ "$RUN_GIT_WORKSPACE_SMOKE" = "1" ]; then
+  run_case "git-workspace" "e2e/git-workspace-smoke-test.sh"
+else
+  echo
+  echo "=== [git-workspace] e2e/git-workspace-smoke-test.sh ==="
+  echo "SKIP [git-workspace] set RUN_GIT_WORKSPACE_SMOKE=1 to run fast-clone Git workspace coverage"
+fi
 
 echo
 echo "=== smoke-all result ==="

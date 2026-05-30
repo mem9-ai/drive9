@@ -101,6 +101,18 @@ type Dat9FS struct {
 	localPolicy *LocalPolicy
 	// localOverlay stores local-only paths under MountOptions.LocalRoot.
 	localOverlay *LocalOverlay
+	git          *gitWorkspaceLayer
+	// gitCheckpoints coalesces lightweight .git state checkpoints so Git
+	// porcelain close/rename/unlink paths do not synchronously run rev-list.
+	gitCheckpoints *flushDebouncer
+	// gitOverlayTail serializes background git workspace overlay commits so
+	// compound operations such as rename copy+whiteout reach the backend in
+	// the same order they became visible locally.
+	gitOverlayMu      sync.Mutex
+	gitOverlayTail    chan struct{}
+	gitOverlayWG      sync.WaitGroup
+	gitOverlaySeq     atomic.Uint64
+	gitOverlayPending map[string]map[string]pendingGitOverlayEntry
 
 	// smallFileMax mirrors the server's inline_threshold (fetched lazily via
 	// the dat9 client). When 0, defaultSmallFileThreshold is used. Use the
@@ -177,23 +189,27 @@ type dirtyInodeState struct {
 // NewDat9FS creates a new FUSE filesystem backed by the given dat9 client.
 func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 	return &Dat9FS{
-		RawFileSystem: gofuse.NewDefaultRawFileSystem(),
-		client:        c,
-		inodes:        NewInodeToPath(),
-		fileHandles:   NewHandleTable[*FileHandle](),
-		openHandles:   NewOpenHandleIndex(),
-		dirHandles:    NewHandleTable[*DirHandle](),
-		readCache:     NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
-		dirCache:      NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
-		readSlots:     make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
-		dirtyInodes:   make(map[uint64]dirtyInodeState),
-		uid:           uint32(os.Getuid()),
-		gid:           uint32(os.Getgid()),
-		opts:          opts,
-		debouncer:     newFlushDebouncer(opts.FlushDebounce),
-		perf:          newFusePerfCounters(opts.PerfCounters),
-		localPolicy:   NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
-		localOverlay:  NewLocalOverlay(opts.LocalRoot),
+		RawFileSystem:     gofuse.NewDefaultRawFileSystem(),
+		client:            c,
+		inodes:            NewInodeToPath(),
+		fileHandles:       NewHandleTable[*FileHandle](),
+		openHandles:       NewOpenHandleIndex(),
+		dirHandles:        NewHandleTable[*DirHandle](),
+		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
+		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
+		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
+		dirtyInodes:       make(map[uint64]dirtyInodeState),
+		uid:               uint32(os.Getuid()),
+		gid:               uint32(os.Getgid()),
+		opts:              opts,
+		syncMode:          opts.SyncMode,
+		debouncer:         newFlushDebouncer(opts.FlushDebounce),
+		perf:              newFusePerfCounters(opts.PerfCounters),
+		localPolicy:       NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
+		localOverlay:      NewLocalOverlay(opts.LocalRoot),
+		git:               newGitWorkspaceLayer(),
+		gitCheckpoints:    newFlushDebouncer(gitCheckpointDebounce),
+		gitOverlayPending: make(map[string]map[string]pendingGitOverlayEntry),
 	}
 }
 
@@ -304,7 +320,11 @@ func releaseTimeout(size int64) time.Duration {
 // The context is cancelled when either the FUSE operation is interrupted or the
 // timeout expires. This ensures HTTP calls never block indefinitely.
 func fuseCtx(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
-	ctx, cf := context.WithTimeout(context.Background(), fuseTimeout)
+	return fuseCtxWithTimeout(cancel, fuseTimeout)
+}
+
+func fuseCtxWithTimeout(cancel <-chan struct{}, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cf := context.WithTimeout(context.Background(), timeout)
 	if cancel == nil {
 		return ctx, cf
 	}
@@ -350,8 +370,25 @@ func (fs *Dat9FS) remotePath(localPath string) string {
 	return mountpath.ToRemote(fs.remoteRoot(), localPath)
 }
 
-func (fs *Dat9FS) localOverlayForPath(localPath string) (*LocalOverlay, bool, gofuse.Status) {
-	if fs.observePathPolicy(localPath) != PathLayerLocalOnly {
+func (fs *Dat9FS) localOverlayForPath(ctx context.Context, localPath string) (*LocalOverlay, bool, gofuse.Status) {
+	return fs.localOverlayForPathWithHint(ctx, localPath, false)
+}
+
+func (fs *Dat9FS) localOverlayForDirPath(ctx context.Context, localPath string) (*LocalOverlay, bool, gofuse.Status) {
+	return fs.localOverlayForPathWithHint(ctx, localPath, true)
+}
+
+func (fs *Dat9FS) localOverlayForPathWithHint(ctx context.Context, localPath string, dirHint bool) (*LocalOverlay, bool, gofuse.Status) {
+	var layer PathLayer
+	if dirHint {
+		layer = fs.observeDirPathPolicyWithContext(ctx, localPath)
+	} else {
+		layer = fs.observePathPolicyWithContext(ctx, localPath)
+	}
+	if layer != PathLayerLocalOnly {
+		return nil, false, gofuse.OK
+	}
+	if fs.gitWorkspaceOwnsPath(ctx, localPath) {
 		return nil, false, gofuse.OK
 	}
 	if fs.localOverlay == nil {
@@ -378,6 +415,68 @@ func (fs *Dat9FS) localEntry(localPath string, info os.FileInfo, incrementLookup
 
 func isLocalFileHandle(fh *FileHandle) bool {
 	return fh != nil && fh.Layer == PathLayerLocalOnly && fh.LocalFile != nil
+}
+
+func isGitWorkspaceLocalFileHandle(fh *FileHandle) bool {
+	return fh != nil && fh.Layer == PathLayerGitWorkspace && fh.LocalFile != nil
+}
+
+func localFileHandleOpenedWritable(fh *FileHandle) bool {
+	if fh == nil {
+		return false
+	}
+	accMode := fh.Flags & syscall.O_ACCMODE
+	return accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR
+}
+
+var syncOpenLocalFile = func(file *os.File) error {
+	return file.Sync()
+}
+
+func localPathMayBeGitState(localPath string) bool {
+	clean := path.Clean(localPath)
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	return clean == "/.git" || strings.HasPrefix(clean, "/.git/") || strings.Contains(clean, "/.git/")
+}
+
+func localPathShouldCheckpointGitState(localPath string) bool {
+	return localPathMayBeGitState(localPath) &&
+		!localPathIsGitObjectDatabase(localPath) &&
+		!localPathIsGitLockFile(localPath)
+}
+
+func localPathIsGitObjectDatabase(localPath string) bool {
+	clean := path.Clean(localPath)
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	if clean == "/.git/objects" || strings.HasPrefix(clean, "/.git/objects/") {
+		return true
+	}
+	return strings.HasSuffix(clean, "/.git/objects") ||
+		strings.Contains(clean, "/.git/objects/") ||
+		(strings.Contains(clean, "/.git/modules/") && (strings.HasSuffix(clean, "/objects") || strings.Contains(clean, "/objects/")))
+}
+
+func localPathIsGitLockFile(localPath string) bool {
+	clean := path.Clean(localPath)
+	if !strings.HasPrefix(clean, "/") {
+		clean = "/" + clean
+	}
+	if clean == "/.git" || strings.HasSuffix(clean, "/.git") {
+		return false
+	}
+	idx := strings.LastIndex(clean, "/.git/")
+	if idx < 0 {
+		return false
+	}
+	rel := clean[idx+len("/.git/"):]
+	if rel == "" {
+		return false
+	}
+	return strings.HasSuffix(rel, ".lock")
 }
 
 func (fs *Dat9FS) writePolicyForOpen(flags uint32) WritePolicy {
@@ -1129,9 +1228,13 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 }
 
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
+	size := entry.Size
+	if size < 0 {
+		size = 0
+	}
 	out.Ino = entry.Ino
-	out.Size = uint64(entry.Size)
-	out.Blocks = (uint64(entry.Size) + 511) / 512
+	out.Size = uint64(size)
+	out.Blocks = (uint64(size) + 511) / 512
 	out.Uid = fs.uid
 	out.Gid = fs.gid
 
@@ -2148,9 +2251,15 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if st != gofuse.OK {
 		return st
 	}
-	if overlay, local, st := fs.localOverlayForPath(childP); local {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
 		if st != gofuse.OK {
 			return st
+		}
+		restoreErr := fs.ensureGitStateForLocalPath(ctx, childP)
+		if restoreErr != nil {
+			return httpToFuseStatus(restoreErr)
 		}
 		info, err := overlay.Lstat(childP)
 		if err != nil {
@@ -2164,6 +2273,17 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		entry, st := fs.localEntry(childP, info, true)
 		if st != gofuse.OK {
 			return st
+		}
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
+	if entry, handled := fs.gitEntry(ctx, childP, true); handled {
+		if entry == nil {
+			out.NodeId = 0
+			out.SetEntryTimeout(fs.negativeEntryTTL(childP))
+			return gofuse.ENOENT
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
@@ -2383,9 +2503,15 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	if !ok {
 		return gofuse.ENOENT
 	}
-	if overlay, local, st := fs.localOverlayForPath(entry.Path); local {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	if overlay, local, st := fs.localOverlayForPath(ctx, entry.Path); local {
 		if st != gofuse.OK {
 			return st
+		}
+		restoreErr := fs.ensureGitStateForLocalPath(ctx, entry.Path)
+		if restoreErr != nil {
+			return httpToFuseStatus(restoreErr)
 		}
 		info, err := overlay.Lstat(entry.Path)
 		if err != nil {
@@ -2403,6 +2529,11 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	// Prefer unflushed writable state over the remote object size.
 	if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
 		entry.Size = size
+	} else if gitEntry, handled := fs.gitEntry(ctx, entry.Path, false); handled {
+		if gitEntry == nil {
+			return gofuse.ENOENT
+		}
+		entry = gitEntry
 	} else if fs.writeBack != nil && !entry.IsDir {
 		// Check pending index first (in-memory, O(1)), then fall back
 		// to old GetMeta for backward compatibility.
@@ -2480,13 +2611,22 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseSetAttr, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
 	entry, ok := fs.inodes.GetEntry(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
 	}
-	if overlay, local, st := fs.localOverlayForPath(entry.Path); local {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	if overlay, local, st := fs.localOverlayForPath(ctx, entry.Path); local {
 		if st != gofuse.OK {
 			return st
+		}
+		restoreErr := fs.ensureGitStateForLocalPath(ctx, entry.Path)
+		if restoreErr != nil {
+			return httpToFuseStatus(restoreErr)
 		}
 		if mtime, ok := input.GetMTime(); ok {
 			if err := overlay.Chtimes(entry.Path, mtime); err != nil {
@@ -2526,6 +2666,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		fs.fillAttr(entry, &out.Attr)
 		out.SetTimeout(fs.opts.AttrTTL)
 		return gofuse.OK
+	}
+	if _, rel, ok := fs.gitWorkspaceForPath(ctx, entry.Path); ok && rel != "" {
+		ctx, cf := fuseCtx(cancel)
+		defer cf()
+		return fs.setGitAttr(ctx, input, entry, out)
 	}
 
 	// Handle mtime updates
@@ -2658,9 +2803,15 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 	if !entryIsSymlink(entry) {
 		return nil, gofuse.Status(syscall.EINVAL)
 	}
-	if overlay, local, st := fs.localOverlayForPath(entry.Path); local {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	if overlay, local, st := fs.localOverlayForPath(ctx, entry.Path); local {
 		if st != gofuse.OK {
 			return nil, st
+		}
+		restoreErr := fs.ensureGitStateForLocalPath(ctx, entry.Path)
+		if restoreErr != nil {
+			return nil, httpToFuseStatus(restoreErr)
 		}
 		target, err := overlay.Readlink(entry.Path)
 		if err != nil {
@@ -2669,8 +2820,13 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 		return []byte(target), gofuse.OK
 	}
 
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
+	if _, rel, ok := fs.gitWorkspaceForPath(ctx, entry.Path); ok && rel != "" {
+		target, err := fs.readGitFile(ctx, entry.Path, 0, entry.Size)
+		if err != nil {
+			return nil, gitReadErrToFuseStatus(err)
+		}
+		return target, gofuse.OK
+	}
 	target, err := fs.readSmallFileWithRetry(ctx, entry.Path)
 	if err != nil {
 		if errors.Is(err, errReadRetriesExhausted) {
@@ -2686,15 +2842,24 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseMkdir, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
 	childP, st := fs.childPath(input.NodeId, name)
 	if st != gofuse.OK {
 		return st
 	}
 
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
 	mode := input.Mode & 0o777
-	if overlay, local, st := fs.localOverlayForPath(childP); local {
+	if overlay, local, st := fs.localOverlayForDirPath(ctx, childP); local {
 		if st != gofuse.OK {
 			return st
+		}
+		restoreErr := fs.ensureGitStateForLocalPath(ctx, childP)
+		if restoreErr != nil {
+			return httpToFuseStatus(restoreErr)
 		}
 		if err := overlay.Mkdir(childP, mode); err != nil {
 			return localErrToFuseStatus(err)
@@ -2704,6 +2869,16 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 			return localErrToFuseStatus(err)
 		}
 		entry, st := fs.localEntry(childP, info, true)
+		if st != gofuse.OK {
+			return st
+		}
+		parentPath, _ := fs.inodes.GetPath(input.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
+	if _, rel, ok := fs.gitWorkspaceForPath(ctx, childP); ok && rel != "" {
+		entry, st := fs.putGitDirectory(ctx, childP, mode)
 		if st != gofuse.OK {
 			return st
 		}
@@ -2745,9 +2920,15 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	if st != gofuse.OK {
 		return st
 	}
-	if overlay, local, st := fs.localOverlayForPath(childP); local {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
 		if st != gofuse.OK {
 			return st
+		}
+		restoreErr := fs.ensureGitStateForLocalPath(ctx, childP)
+		if restoreErr != nil {
+			return httpToFuseStatus(restoreErr)
 		}
 		if err := overlay.Symlink(pointedTo, childP); err != nil {
 			return localErrToFuseStatus(err)
@@ -2765,9 +2946,17 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
 	}
+	if _, rel, ok := fs.gitWorkspaceForPath(ctx, childP); ok && rel != "" {
+		entry, st := fs.putGitSymlink(ctx, childP, pointedTo)
+		if st != gofuse.OK {
+			return st
+		}
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
 
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
 	mutationStart := fs.perfStart()
 	err := fs.client.SymlinkCtx(ctx, pointedTo, fs.remotePath(childP))
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
@@ -2818,13 +3007,22 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name string) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseUnlink, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
 	}
-	if overlay, local, st := fs.localOverlayForPath(childP); local {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
 		if st != gofuse.OK {
 			return st
+		}
+		restoreErr := fs.ensureGitStateForLocalPath(ctx, childP)
+		if restoreErr != nil {
+			return httpToFuseStatus(restoreErr)
 		}
 		info, err := overlay.Lstat(childP)
 		if err != nil {
@@ -2840,6 +3038,24 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.cacheNegativePath(childP)
+		fs.scheduleGitStateCheckpoint(childP)
+		return gofuse.OK
+	}
+	if entry, handled := fs.gitEntry(ctx, childP, false); handled {
+		if entry == nil {
+			return gofuse.ENOENT
+		}
+		if entry.IsDir {
+			return gofuse.Status(syscall.EISDIR)
+		}
+		ctx, cf := fuseCtx(cancel)
+		defer cf()
+		st := fs.putGitWhiteout(ctx, childP)
+		if st != gofuse.OK {
+			return st
+		}
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Remove(parentPath, name)
 		return gofuse.OK
 	}
 	start := time.Now()
@@ -2932,6 +3148,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name string) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseRmdir, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -2939,9 +3158,13 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	if st != gofuse.OK {
 		return st
 	}
-	if overlay, local, st := fs.localOverlayForPath(childP); local {
+	if overlay, local, st := fs.localOverlayForDirPath(ctx, childP); local {
 		if st != gofuse.OK {
 			return st
+		}
+		restoreErr := fs.ensureGitStateForLocalPath(ctx, childP)
+		if restoreErr != nil {
+			return httpToFuseStatus(restoreErr)
 		}
 		info, err := overlay.Lstat(childP)
 		if err != nil {
@@ -2958,6 +3181,40 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.cacheNegativePath(childP)
+		fs.scheduleGitStateCheckpoint(childP)
+		return gofuse.OK
+	}
+	if entry, handled := fs.gitEntry(ctx, childP, false); handled {
+		if entry == nil {
+			return gofuse.ENOENT
+		}
+		if !entry.IsDir {
+			return gofuse.Status(syscall.ENOTDIR)
+		}
+		entries, _, err := fs.listGitDir(ctx, childP)
+		if err != nil {
+			return listDirErrToFuseStatus(err)
+		}
+		if len(entries) > 0 {
+			return gofuse.Status(syscall.ENOTEMPTY)
+		}
+		if rt, rel, ok := fs.gitWorkspaceForPath(ctx, childP); ok && rel == "" {
+			st := fs.removeGitWorkspaceRoot(ctx, rt, childP)
+			if st != gofuse.OK {
+				return st
+			}
+			parentPath, _ := fs.inodes.GetPath(header.NodeId)
+			fs.dirCache.Remove(parentPath, name)
+			fs.dirCache.InvalidatePrefix(childP)
+			return gofuse.OK
+		}
+		st := fs.putGitWhiteout(ctx, childP)
+		if st != gofuse.OK {
+			return st
+		}
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Remove(parentPath, name)
+		fs.dirCache.InvalidatePrefix(childP)
 		return gofuse.OK
 	}
 	start := time.Now()
@@ -3216,6 +3473,9 @@ func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
 func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName string, newName string) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseRename, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 
@@ -3230,8 +3490,14 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	if oldP == newP {
 		return gofuse.OK
 	}
-	oldLayer := fs.observePathPolicy(oldP)
-	newLayer := fs.observePathPolicy(newP)
+	oldLayer := fs.observePathPolicyWithContext(ctx, oldP)
+	newLayer := fs.observePathPolicyWithContext(ctx, newP)
+	if fs.localOverlay != nil {
+		if info, err := fs.localOverlay.Lstat(oldP); err == nil && info.IsDir() {
+			oldLayer = fs.observeDirPathPolicyWithContext(ctx, oldP)
+			newLayer = fs.observeDirPathPolicyWithContext(ctx, newP)
+		}
+	}
 	if oldLayer == PathLayerLocalOnly || newLayer == PathLayerLocalOnly {
 		if oldLayer != newLayer {
 			return gofuse.Status(syscall.EXDEV)
@@ -3239,11 +3505,21 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		if fs.localOverlay == nil {
 			return gofuse.EIO
 		}
+		if err := fs.ensureGitStateForLocalPath(ctx, oldP); err != nil {
+			return httpToFuseStatus(err)
+		}
+		if err := fs.ensureGitStateForLocalPath(ctx, newP); err != nil {
+			return httpToFuseStatus(err)
+		}
 		if err := fs.localOverlay.Rename(oldP, newP); err != nil {
 			return localErrToFuseStatus(err)
 		}
 		fs.finishLocalRename(input, oldP, newP)
+		fs.scheduleGitStateCheckpoint(newP)
 		return gofuse.OK
+	}
+	if handled, st := fs.renameGitPath(ctx, input, oldP, newP); handled {
+		return st
 	}
 
 	pendingRename, err := fs.renamePendingNewCommit(ctx, input, oldP, newP)
@@ -3361,11 +3637,13 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 func (fs *Dat9FS) OpenDir(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse.OpenOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseOpenDir, perfStart, status, 0) }()
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
 	p, ok := fs.inodes.GetPath(input.NodeId)
 	if !ok {
 		return gofuse.ENOENT
 	}
-	fs.observePathPolicy(p)
+	fs.observePathPolicyWithContext(ctx, p)
 
 	dh := &DirHandle{
 		Ino:  input.NodeId,
@@ -3383,12 +3661,12 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 	if !ok {
 		return gofuse.ENOENT
 	}
-	fs.observePathPolicy(dh.Path)
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	fs.observePathPolicyWithContext(ctx, dh.Path)
 
 	// Populate entries if not already done
 	if dh.Entries == nil {
-		ctx, cf := fuseCtx(cancel)
-		defer cf()
 		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
 			log.Printf("list dir failed for %s: %v", dh.Path, err)
@@ -3418,11 +3696,11 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 	if !ok {
 		return gofuse.ENOENT
 	}
-	fs.observePathPolicy(dh.Path)
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	fs.observePathPolicyWithContext(ctx, dh.Path)
 
 	if dh.Entries == nil {
-		ctx, cf := fuseCtx(cancel)
-		defer cf()
 		entries, err := fs.listDir(ctx, dh.Path)
 		if err != nil {
 			log.Printf("list dir plus failed for %s: %v", dh.Path, err)
@@ -3542,15 +3820,24 @@ func (fs *Dat9FS) ReleaseDir(input *gofuse.ReleaseIn) {
 }
 
 func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, error) {
-	if overlay, local, st := fs.localOverlayForPath(dirPath); local {
+	if overlay, local, st := fs.localOverlayForPath(ctx, dirPath); local {
 		if st != gofuse.OK {
 			return nil, syscall.EIO
+		}
+		if err := fs.ensureGitStateForLocalPath(ctx, dirPath); err != nil {
+			return nil, err
 		}
 		items, err := overlay.ReadDir(dirPath)
 		if err != nil {
 			return nil, err
 		}
-		return fs.localOverlayDirEntries(dirPath, items), nil
+		return fs.localOverlayDirEntries(ctx, dirPath, items), nil
+	}
+	if entries, handled, err := fs.listGitDir(ctx, dirPath); handled {
+		if err != nil {
+			return nil, err
+		}
+		return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergePendingDirEntries(dirPath, entries))
 	}
 
 	// Check dir cache first
@@ -3559,7 +3846,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 			fs.perf.dirCacheHit.add(1)
 		}
 		entries := fs.cachedToDirEntries(dirPath, cached)
-		return fs.mergeLocalDirEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries))
+		return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergePendingDirEntries(dirPath, entries))
 	}
 	if fs.perf != nil {
 		fs.perf.dirCacheMiss.add(1)
@@ -3579,7 +3866,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached)
 
 	entries := fs.cachedToDirEntries(dirPath, cached)
-	return fs.mergeLocalDirEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries))
+	return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergePendingDirEntries(dirPath, entries))
 }
 
 func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []CachedFileInfo) {
@@ -3708,7 +3995,7 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 	return entries
 }
 
-func (fs *Dat9FS) mergeLocalDirEntries(dirPath string, entries []DirEntry) ([]DirEntry, error) {
+func (fs *Dat9FS) mergeLocalDirEntries(ctx context.Context, dirPath string, entries []DirEntry) ([]DirEntry, error) {
 	if fs.localOverlay == nil {
 		return entries, nil
 	}
@@ -3719,7 +4006,7 @@ func (fs *Dat9FS) mergeLocalDirEntries(dirPath string, entries []DirEntry) ([]Di
 		}
 		return nil, err
 	}
-	localEntries := fs.localOverlayDirEntries(dirPath, items)
+	localEntries := fs.localOverlayDirEntries(ctx, dirPath, items)
 	if len(localEntries) == 0 {
 		return entries, nil
 	}
@@ -3741,11 +4028,15 @@ func (fs *Dat9FS) mergeLocalDirEntries(dirPath string, entries []DirEntry) ([]Di
 	return entries, nil
 }
 
-func (fs *Dat9FS) localOverlayDirEntries(dirPath string, items []localOverlayEntry) []DirEntry {
+func (fs *Dat9FS) localOverlayDirEntries(ctx context.Context, dirPath string, items []localOverlayEntry) []DirEntry {
 	entries := make([]DirEntry, 0, len(items))
 	for _, item := range items {
 		childP := dirEntryChildPath(dirPath, item.Name)
-		if fs.observePathPolicy(childP) != PathLayerLocalOnly {
+		layer := fs.observePathPolicyWithContext(ctx, childP)
+		if item.Info.IsDir() {
+			layer = fs.observeDirPathPolicyWithContext(ctx, childP)
+		}
+		if layer != PathLayerLocalOnly {
 			continue
 		}
 		info := item.Info
@@ -3811,10 +4102,16 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		return st
 	}
 
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
 	mode, hasRemoteMode := createInputMode(input.Mode)
-	if overlay, local, st := fs.localOverlayForPath(childP); local {
+	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
 		if st != gofuse.OK {
 			return st
+		}
+		restoreErr := fs.ensureGitStateForLocalPath(ctx, childP)
+		if restoreErr != nil {
+			return httpToFuseStatus(restoreErr)
 		}
 		file, err := overlay.OpenFile(childP, input.Flags|uint32(syscall.O_CREAT), mode)
 		if err != nil {
@@ -3841,6 +4138,18 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
 		fs.fillEntryOut(entry, &out.EntryOut)
 
+		parentPath, _ := fs.inodes.GetPath(input.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		return gofuse.OK
+	}
+	if _, rel, ok := fs.gitWorkspaceForPath(ctx, childP); ok && rel != "" {
+		fh, entry, st := fs.gitCreateHandle(ctx, childP, input.Flags, input.Pid, mode, hasRemoteMode)
+		if st != gofuse.OK {
+			return st
+		}
+		out.Fh = fs.allocateFileHandle(fh)
+		out.OpenFlags = 0
+		fs.fillEntryOut(entry, &out.EntryOut)
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
 		return gofuse.OK
@@ -3922,7 +4231,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	if !ok {
 		return gofuse.ENOENT
 	}
-	fs.observePathPolicy(p)
+	fs.observePathPolicyWithContext(ctx, p)
 
 	fh := &FileHandle{
 		Ino:         input.NodeId,
@@ -3942,9 +4251,13 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 
 	// Allocate write buffer for writable opens
 	accMode := input.Flags & syscall.O_ACCMODE
-	if overlay, local, st := fs.localOverlayForPath(p); local {
+	if overlay, local, st := fs.localOverlayForPath(ctx, p); local {
 		if st != gofuse.OK {
 			return st
+		}
+		restoreErr := fs.ensureGitStateForLocalPath(ctx, p)
+		if restoreErr != nil {
+			return httpToFuseStatus(restoreErr)
 		}
 		if (accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR) && fs.opts.ReadOnly {
 			return gofuse.EROFS
@@ -3968,6 +4281,17 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		fh.OrigSize = refreshed.Size
 		out.Fh = fs.allocateFileHandle(fh)
 		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+		return gofuse.OK
+	}
+	if rt, rel, ok := fs.gitWorkspaceForPath(ctx, p); ok && rel != "" {
+		if (accMode == syscall.O_WRONLY || accMode == syscall.O_RDWR) && fs.opts.ReadOnly {
+			return gofuse.EROFS
+		}
+		if st := fs.prepareGitOpenHandle(ctx, fh, input.Flags); st != gofuse.OK {
+			return st
+		}
+		out.Fh = fs.allocateFileHandle(fh)
+		out.OpenFlags = gitWorkspaceOpenFlags(rt, rel, input.Flags)
 		return gofuse.OK
 	}
 
@@ -4131,7 +4455,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 	logPath = fh.Path
 	logIno = fh.Ino
-	fs.observePathPolicy(fh.Path)
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	fs.observePathPolicyWithContext(ctx, fh.Path)
 
 	lockStart := time.Now()
 	fh.Lock()
@@ -4155,6 +4481,25 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			return nil, localErrToFuseStatus(err)
 		}
 		source = "local-file"
+		bytesRead = n
+		return gofuse.ReadResultData(data[:n]), gofuse.OK
+	}
+	if isGitWorkspaceLocalFileHandle(fh) {
+		size := int(input.Size)
+		if size <= 0 {
+			fh.Unlock()
+			source = "git-local-empty"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		data := make([]byte, size)
+		n, err := fh.LocalFile.ReadAt(data, int64(input.Offset))
+		fh.Unlock()
+		if err != nil && !errors.Is(err, io.EOF) {
+			source = "git-local-error"
+			return nil, localErrToFuseStatus(err)
+		}
+		source = "git-local-file"
 		bytesRead = n
 		return gofuse.ReadResultData(data[:n]), gofuse.OK
 	}
@@ -4325,6 +4670,17 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		fh.Unlock()
 	}
 
+	if fh.Layer == PathLayerGitWorkspace {
+		data, err := fs.readGitFile(ctx, fh.Path, int64(input.Offset), int64(input.Size))
+		if err != nil {
+			source = "git-read-error"
+			return nil, gitReadErrToFuseStatus(err)
+		}
+		source = "git-workspace"
+		bytesRead = len(data)
+		return gofuse.ReadResultData(data), gofuse.OK
+	}
+
 	// Read path priority for pending files:
 	// 1. ShadowStore (local SSD) — for files staged by Flush
 	// 2. WriteBackCache.Get (local disk, full file) — legacy path
@@ -4393,9 +4749,6 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			return gofuse.ReadResultData(wbData[offset:end]), gofuse.OK
 		}
 	}
-
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
 
 	p := fh.Path
 
@@ -4545,7 +4898,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 	logPath = fh.Path
 	logIno = fh.Ino
-	fs.observePathPolicy(fh.Path)
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	fs.observePathPolicyWithContext(ctx, fh.Path)
 
 	lockStart := time.Now()
 	fh.Lock()
@@ -4576,6 +4931,36 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		source = "local-file"
 		return written, gofuse.OK
 	}
+	if isGitWorkspaceLocalFileHandle(fh) {
+		var (
+			n   int
+			err error
+		)
+		if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+			n, err = fh.LocalFile.Write(data)
+		} else {
+			n, err = fh.LocalFile.WriteAt(data, int64(input.Offset))
+		}
+		if err != nil && n == 0 {
+			source = "git-local-error"
+			return 0, localErrToFuseStatus(err)
+		}
+		written = uint32(n)
+		if info, statErr := fh.LocalFile.Stat(); statErr == nil {
+			fh.DirtySeq = fs.markDirtySize(fh.Ino, info.Size())
+			fs.inodes.UpdateSize(fh.Ino, info.Size())
+			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
+		}
+		if fh.WritePolicy == WritePolicyWriteSync {
+			source = "git-local-write-sync"
+			st := fs.flushGitLocalFileHandleLockedWithPolicy(ctx, fh, true)
+			if st != gofuse.OK {
+				return 0, st
+			}
+		}
+		source = "git-local-file"
+		return written, gofuse.OK
+	}
 
 	if fh.Dirty == nil {
 		source = "new-dirty-buffer"
@@ -4584,6 +4969,11 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	writeSyncSnapshot := (*writeBufferSnapshot)(nil)
 	if fh.WritePolicy == WritePolicyWriteSync {
 		writeSyncSnapshot = fh.Dirty.snapshot()
+	}
+
+	writeOffset := int64(input.Offset)
+	if fh.Flags&uint32(syscall.O_APPEND) != 0 {
+		writeOffset = fh.Dirty.Size()
 	}
 
 	// ShadowSpill: write shadow FIRST, before Dirty. If shadow fails, return
@@ -4596,7 +4986,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			return 0, gofuse.Status(syscall.ENOSPC)
 		}
 		shadowStart := time.Now()
-		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {
+		if _, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev); err != nil {
 			log.Printf("shadow write failed for ShadowSpill %s: %v", fh.Path, err)
 			source = "shadow-spill-error"
 			return 0, gofuse.EIO
@@ -4607,7 +4997,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 		source = "shadow-spill"
 	}
 
-	n, err := fh.Dirty.Write(int64(input.Offset), data)
+	n, err := fh.Dirty.Write(writeOffset, data)
 	if err != nil {
 		source = "dirty-write-error"
 		return 0, gofuse.Status(syscall.EFBIG)
@@ -4617,7 +5007,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	// Non-ShadowSpill: write-through to shadow after Dirty (best-effort).
 	if !fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
 		shadowStart := time.Now()
-		if _, err := fs.shadowStore.WriteAt(fh.Path, int64(input.Offset), data, fh.BaseRev); err != nil {
+		if _, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev); err != nil {
 			log.Printf("shadow write-through failed for %s: %v", fh.Path, err)
 			fs.shadowStore.Remove(fh.Path)
 			fh.ShadowReady = false
@@ -4636,12 +5026,20 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
 	if fh.WritePolicy == WritePolicyWriteSync {
 		size := fh.Dirty.Size()
-		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
-		defer cf()
+		writeCtx, writeCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		defer writeCancel()
 		source = "write-sync"
-		st := fs.syncWriteHandleToRemoteLocked(ctx, fh)
+		var st gofuse.Status
+		if fh.Layer == PathLayerGitWorkspace {
+			source = "git-write-sync"
+			st = fs.flushGitHandleLockedWithPolicy(writeCtx, fh, true)
+		} else {
+			st = fs.syncWriteHandleToRemoteLocked(writeCtx, fh)
+		}
 		if st != gofuse.OK {
-			fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot)
+			if fh.Layer != PathLayerGitWorkspace {
+				fs.restoreFailedWriteSyncLocked(fh, writeSyncSnapshot)
+			}
 			return 0, st
 		}
 	}
@@ -4868,7 +5266,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	if !ok {
 		return gofuse.OK
 	}
-	fs.observePathPolicy(fh.Path)
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	fs.observePathPolicyWithContext(ctx, fh.Path)
 
 	start := time.Now()
 	phase := "start"
@@ -4897,24 +5297,43 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	}()
 
 	if isLocalFileHandle(fh) {
-		phase = "local-sync"
-		if err := fh.LocalFile.Sync(); err != nil {
-			return localErrToFuseStatus(err)
+		gitState := localPathShouldCheckpointGitState(fh.Path)
+		if gitState {
+			phase = "local-git-sync"
+			if err := syncOpenLocalFile(fh.LocalFile); err != nil {
+				return localErrToFuseStatus(err)
+			}
+		} else {
+			phase = "local-metadata"
 		}
 		if info, err := fh.LocalFile.Stat(); err == nil {
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
+		if gitState && localFileHandleOpenedWritable(fh) {
+			phase = "local-git-checkpoint"
+			checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+			defer checkpointCancel()
+			if err := fs.checkpointGitStateAfterLocalWrite(checkpointCtx, fh.Path, fs.syncMode == SyncStrict); err != nil {
+				return httpToFuseStatus(err)
+			}
+		}
 		return gofuse.OK
+	}
+	if fh.Layer == PathLayerGitWorkspace {
+		phase = "git-overlay"
+		flushCtx, flushCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+		defer flushCancel()
+		return fs.flushGitHandleLockedWithPolicy(flushCtx, fh, fs.syncMode == SyncStrict)
 	}
 
 	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() &&
 		(fh.WritePolicy == WritePolicyCloseSync || fh.WritePolicy == WritePolicyWriteSync) {
 		size := fh.Dirty.Size()
-		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
-		defer cf()
+		syncCtx, syncCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		defer syncCancel()
 		phase = fh.WritePolicy.String()
-		return fs.syncHandleToRemoteLocked(ctx, fh)
+		return fs.syncHandleToRemoteLocked(syncCtx, fh)
 	}
 
 	// Write-back path: small dirty files are persisted to local disk
@@ -5014,13 +5433,13 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		// ShadowSpill strict path: synchronous streaming upload from shadow.
 		if fh.ShadowSpill {
 			size := fh.Dirty.Size()
-			ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
-			defer cf()
+			uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+			defer uploadCancel()
 			phase = "large-shadowspill-sync-upload"
 			uploadStart := time.Now()
 			fs.debugf("flush shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 			fh.Unlock()
-			err := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
+			err := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
 			fh.Lock()
 			var uploadBytes uint64
 			if size > 0 {
@@ -5076,15 +5495,12 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		// a size-aware timeout. Must NOT debounce — debounce returns OK and
 		// uploads asynchronously, which would re-introduce the same bug.
 		size := fh.Dirty.Size()
-		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
-		defer cf()
+		flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		defer flushCancel()
 		phase = "large-sync-flush"
 		fs.debugf("flush sync upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
-		return fs.flushHandle(ctx, fh)
+		return fs.flushHandle(flushCtx, fh)
 	}
-
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
 
 	phase = "debounced-or-sync-flush"
 	return fs.flushHandleDebounced(ctx, fh, false)
@@ -5097,7 +5513,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if !ok {
 		return gofuse.OK
 	}
-	fs.observePathPolicy(fh.Path)
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+	fs.observePathPolicyWithContext(ctx, fh.Path)
 
 	start := time.Now()
 	phase := "start"
@@ -5127,14 +5545,28 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 
 	if isLocalFileHandle(fh) {
 		phase = "local-sync"
-		if err := fh.LocalFile.Sync(); err != nil {
+		if err := syncOpenLocalFile(fh.LocalFile); err != nil {
 			return localErrToFuseStatus(err)
 		}
 		if info, err := fh.LocalFile.Stat(); err == nil {
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
 		}
+		if localPathShouldCheckpointGitState(fh.Path) && localFileHandleOpenedWritable(fh) {
+			phase = "local-git-checkpoint"
+			checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+			defer checkpointCancel()
+			if err := fs.checkpointGitStateAfterLocalWrite(checkpointCtx, fh.Path, true); err != nil {
+				return httpToFuseStatus(err)
+			}
+		}
 		return gofuse.OK
+	}
+	if fh.Layer == PathLayerGitWorkspace {
+		phase = "git-overlay"
+		flushCtx, flushCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+		defer flushCancel()
+		return fs.flushGitHandleLockedWithPolicy(flushCtx, fh, fs.syncMode == SyncStrict)
 	}
 
 	// Interactive mode: Fsync = local durable only. Shadow file + journal
@@ -5191,13 +5623,13 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	// ShadowSpill strict: synchronous streaming upload from shadow.
 	if fh.ShadowSpill && fs.shadowStore != nil {
 		size := fh.Dirty.Size()
-		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
-		defer cf()
+		uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+		defer uploadCancel()
 		phase = "shadowspill-sync-upload"
 		uploadStart := time.Now()
 		fs.debugf("fsync shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 		fh.Unlock()
-		err := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
+		err := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
 		fh.Lock()
 		var uploadBytes uint64
 		if size > 0 {
@@ -5222,9 +5654,6 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	}
 
 	// Strict mode: Fsync = remote durable. Upload to server before returning.
-	ctx, cf := fuseCtx(cancel)
-	defer cf()
-
 	if fs.writeBack != nil && fs.uploader != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq {
 		// Snapshot matches current dirty state — safe to upload.
 		phase = "writeback-upload-sync"
@@ -5270,7 +5699,9 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	defer func() { fs.perfRecordFuse(perfFuseRelease, perfStart, releaseStatus, 0) }()
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
-		fs.observePathPolicy(fh.Path)
+		ctx, cf := fuseCtx(cancel)
+		defer cf()
+		fs.observePathPolicyWithContext(ctx, fh.Path)
 		flushStatus := gofuse.OK
 		defer func() {
 			if fh.Prefetch != nil {
@@ -5290,17 +5721,34 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			previousModeKnown := fh.PreviousModeKnown
 			ino := fh.Ino
 			localPath := fh.Path
+			layer := fh.Layer
 			fh.Unlock()
 			if !hasPendingMode {
 				return
 			}
+			if layer == PathLayerGitWorkspace {
+				if flushStatus != gofuse.OK {
+					return
+				}
+				fh.Lock()
+				stillCurrent := pendingModeMatchesLocked(fh, pendingMode, pendingModeGen)
+				if stillCurrent {
+					clearPendingModeLocked(fh)
+				}
+				fh.Unlock()
+				if stillCurrent {
+					fs.inodes.UpdateMode(ino, pendingMode)
+					fs.clearPendingModeForInodeGeneration(ino, fh, pendingMode, pendingModeGen)
+				}
+				return
+			}
 
 			if flushStatus == gofuse.OK {
-				ctx, cf := context.WithTimeout(context.Background(), 30*time.Second)
-				err := retryPostUploadMode(ctx, func() error {
-					return fs.applyRemoteMode(ctx, localPath, pendingMode)
+				modeCtx, modeCancel := fuseCtxWithTimeout(cancel, 30*time.Second)
+				err := retryPostUploadMode(modeCtx, func() error {
+					return fs.applyRemoteMode(modeCtx, localPath, pendingMode)
 				})
-				cf()
+				modeCancel()
 				if err != nil {
 					log.Printf("release: pending chmod failed for %s: %v", localPath, err)
 					fh.Lock()
@@ -5369,14 +5817,58 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			phase = "local-close"
 			fh.Lock()
 			localFile := fh.LocalFile
+			openedWritable := localFileHandleOpenedWritable(fh)
+			gitState := localPathShouldCheckpointGitState(fh.Path)
+			localPath := fh.Path
+			ino := fh.Ino
 			fh.LocalFile = nil
 			fh.Unlock()
 			if localFile != nil {
-				if info, err := localFile.Stat(); err == nil {
-					fs.inodes.UpdateSize(fh.Ino, info.Size())
-					fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
+				if gitState && openedWritable {
+					phase = "local-git-sync-close"
+					if err := syncOpenLocalFile(localFile); err != nil {
+						flushStatus = localErrToFuseStatus(err)
+					}
 				}
-				if err := localFile.Close(); err != nil {
+				if info, err := localFile.Stat(); err == nil {
+					fs.inodes.UpdateSize(ino, info.Size())
+					fs.inodes.UpdateMtime(ino, info.ModTime())
+				}
+				if err := localFile.Close(); err != nil && flushStatus == gofuse.OK {
+					flushStatus = localErrToFuseStatus(err)
+				}
+			}
+			if flushStatus == gofuse.OK && gitState && openedWritable {
+				phase = "local-git-checkpoint"
+				checkpointCtx, checkpointCancel := fuseCtxWithTimeout(cancel, gitCheckpointTimeout)
+				err := fs.checkpointGitStateAfterLocalWrite(checkpointCtx, localPath, fs.syncMode == SyncStrict)
+				checkpointCancel()
+				if err != nil {
+					flushStatus = httpToFuseStatus(err)
+				}
+			}
+			return
+		}
+
+		if fh.Layer == PathLayerGitWorkspace {
+			phase = "git-overlay"
+			lockStart := time.Now()
+			fh.Lock()
+			if lockWait := time.Since(lockStart); fs.debugEnabled() && lockWait >= fuseDebugSlowOpThreshold {
+				fs.debugf("release lock wait path=%s fh=%d ino=%d phase=%s wait=%s", fh.Path, input.Fh, fh.Ino, phase, lockWait)
+			}
+			var flushSize int64
+			if fh.Dirty != nil {
+				flushSize = fh.Dirty.Size()
+			}
+			flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(flushSize))
+			flushStatus = fs.flushGitHandleLocked(flushCtx, fh)
+			flushCancel()
+			localFile := fh.LocalFile
+			fh.LocalFile = nil
+			fh.Unlock()
+			if localFile != nil {
+				if err := localFile.Close(); err != nil && flushStatus == gofuse.OK {
 					flushStatus = localErrToFuseStatus(err)
 				}
 			}
@@ -5399,12 +5891,12 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			}
 			if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
 				size := fh.Dirty.Size()
-				ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
+				flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 				flushStart := time.Now()
 				fs.debugf("release write policy sync start path=%s size=%d policy=%s timeout=%s", fh.Path, size, fh.WritePolicy, releaseTimeout(size))
-				flushStatus = fs.syncHandleToRemoteLocked(ctx, fh)
+				flushStatus = fs.syncHandleToRemoteLocked(flushCtx, fh)
 				fs.debugDurationf(flushStart, 0, "release write policy sync done path=%s size=%d status=%d", fh.Path, size, flushStatus)
-				cf()
+				flushCancel()
 			}
 			fh.Unlock()
 			if flushStatus != gofuse.OK {
@@ -5449,11 +5941,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				// Fallback: synchronous streaming upload from shadow.
 				// Do NOT use uploader.Submit — it reads from writeBack cache.
 				log.Printf("release: ShadowSpill commitQueue enqueue failed for %s: %v, falling back to sync upload", fh.Path, err)
-				ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(size))
+				uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 				phase = "shadowspill-sync-upload"
 				uploadStart := time.Now()
 				fs.debugf("release shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
-				uploadErr := uploadFromShadowRemote(ctx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
+				uploadErr := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
 				var uploadBytes uint64
 				if size > 0 {
 					uploadBytes = uint64(size)
@@ -5464,7 +5956,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					flushStatus = gofuse.EIO
 					log.Printf("release: ShadowSpill sync upload failed for %s: %v", fh.Path, uploadErr)
 				}
-				cf()
+				uploadCancel()
 			} else if hasMode {
 				fs.clearPendingModeForInode(fh.Ino)
 			}
@@ -5574,13 +6066,13 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		if fh.Dirty != nil {
 			flushSize = fh.Dirty.Size()
 		}
-		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(flushSize))
+		flushCtx, flushCancel := fuseCtxWithTimeout(cancel, releaseTimeout(flushSize))
 		flushStart := time.Now()
 		fs.debugf("release sync flush start path=%s size=%d timeout=%s", fh.Path, flushSize, releaseTimeout(flushSize))
-		st := fs.flushHandle(ctx, fh)
+		st := fs.flushHandle(flushCtx, fh)
 		fs.debugDurationf(flushStart, 0, "release sync flush done path=%s size=%d status=%d", fh.Path, flushSize, st)
 		flushStatus = st
-		cf()
+		flushCancel()
 		streamer := fh.Streamer
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
@@ -6010,10 +6502,23 @@ func (fs *Dat9FS) FlushAll() {
 			sz = e.fh.Dirty.Size()
 		}
 		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(sz))
-		fs.flushHandle(ctx, e.fh)
+		if e.fh.Layer == PathLayerGitWorkspace {
+			fs.flushGitHandleLocked(ctx, e.fh)
+		} else {
+			fs.flushHandle(ctx, e.fh)
+		}
 		e.fh.Unlock()
 		cf()
 	}
+
+	// Drain coalesced .git checkpoints before shutdown so replacement
+	// sandboxes can restore the latest lightweight Git state.
+	fs.drainGitStateCheckpoints()
+
+	// Drain git workspace overlay commits queued by interactive writeback.
+	// These include both file payloads and metadata entries such as chmod,
+	// mkdir, symlink, and whiteout.
+	fs.drainGitOverlayWrites()
 
 	// Drain all pending write-back uploads before shutting down.
 	if fs.uploader != nil {

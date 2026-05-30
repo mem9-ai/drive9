@@ -43,6 +43,11 @@ func dropDataPlaneTables(t *testing.T, s *Store) {
 	t.Helper()
 	stmts := []string{
 		"DROP TABLE IF EXISTS file_gc_tasks",
+		"DROP TABLE IF EXISTS git_workspace_object_packs",
+		"DROP TABLE IF EXISTS git_workspace_overlay",
+		"DROP TABLE IF EXISTS git_workspace_git_state",
+		"DROP TABLE IF EXISTS git_workspace_tree_nodes",
+		"DROP TABLE IF EXISTS git_workspaces",
 		"DROP TABLE IF EXISTS journal_entry_subjects",
 		"DROP TABLE IF EXISTS journal_entries",
 		"DROP TABLE IF EXISTS journal_append_requests",

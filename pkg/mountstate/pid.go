@@ -15,6 +15,11 @@ import (
 type ProcessState struct {
 	PID          int    `json:"pid"`
 	CreationTime uint64 `json:"creation_time,omitempty"`
+	MountPoint   string `json:"mount_point,omitempty"`
+	RemoteRoot   string `json:"remote_root,omitempty"`
+	Profile      string `json:"profile,omitempty"`
+	LocalRoot    string `json:"local_root,omitempty"`
+	Server       string `json:"server,omitempty"`
 }
 
 func PIDFilePath(mountPoint string) string {

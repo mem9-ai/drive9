@@ -46,11 +46,17 @@ bash e2e/journal-smoke-test.sh
 # FUSE smoke (mount + bidirectional filesystem checks)
 bash e2e/fuse-smoke-test.sh
 
+# Git workspace smoke (fast-blobless clone + common agent Git workloads)
+bash e2e/git-workspace-smoke-test.sh
+
 # POSIX permission smoke (API/CLI/FUSE chmod and mkdir mode)
 bash e2e/posix-permission-smoke-test.sh
 
 # Run all smoke scripts in sequence
 bash e2e/smoke-all.sh
+
+# Include Git workspace smoke in smoke-all when desired
+RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
 ```
 
 ### Local via `drive9-server-local`
@@ -101,6 +107,7 @@ bash e2e/api-smoke-test.sh
 DRIVE9_API_KEY='local-dev-key' bash e2e/api-smoke-test-existing-key.sh
 bash e2e/cli-smoke-test.sh
 bash e2e/fuse-smoke-test.sh
+bash e2e/git-workspace-smoke-test.sh
 bash e2e/smoke-all.sh
 ```
 
@@ -201,6 +208,26 @@ Notes:
 - Optional release-gate knobs add small-repo git clone/status/log checks,
   durable `drive9 umount --timeout` remount visibility checks, and mount-log audit.
 
+### `git-workspace-smoke-test.sh`
+
+Host support: Linux and macOS only. This script needs real FUSE support and
+uses a `--profile=coding-agent` mount with `--local-root`, so it is intended for
+developer machines or EC2-style validation rather than the default smoke path.
+
+1. Provision tenant unless `DRIVE9_API_KEY` is already set
+2. Prepare `drive9` CLI binary (build local or download official release)
+3. For each configured repo, run `drive9 git clone --fast --blobless --hydrate=sync`
+   inside a coding-agent FUSE mount
+4. Validate repository readiness (`.git`, `rev-parse`, `log`, `status`)
+5. Agent edit/add/commit scenario: append to tracked files, write generated
+   files, verify ignored local-only path handling, `git status`, `git diff`,
+   `git add -A`, `git commit --no-verify`, and clean status
+6. Patch scenario: generate a tracked-file patch, restore, `git apply`, then
+   `git add`/`commit`
+7. Sandbox restore scenario: stage tracked and generated edits, unmount, remount
+   with a fresh local root, and verify `.git` plus dirty status survive restore
+8. Audit mount logs for fatal FUSE/Git workspace patterns such as short reads
+
 ### `posix-permission-smoke-test.sh`
 
 1. Provision + readiness polling
@@ -273,6 +300,15 @@ Notes:
 | `FUSE_GIT_CLONE_TIMEOUT_S` | `180` | `fuse-smoke-test.sh` |
 | `RUN_FUSE_UMOUNT_DURABLE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `RUN_FUSE_LOG_AUDIT` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
+| `RUN_GIT_WORKSPACE_SMOKE` | `0` | `smoke-all.sh` |
+| `GIT_WORKSPACE_REPOS` | `drive9=...,kimi-cli=...,kimi-code=...` | `git-workspace-smoke-test.sh` |
+| `GIT_WORKSPACE_SCENARIOS` | `agent_edit_add_commit,agent_patch_apply,sandbox_restore` | `git-workspace-smoke-test.sh` |
+| `GIT_WORKSPACE_EXISTING_FILES` | `20` | `git-workspace-smoke-test.sh` |
+| `GIT_WORKSPACE_NEW_FILES` | `20` | `git-workspace-smoke-test.sh` |
+| `GIT_WORKSPACE_PATCH_FILES` | `20` | `git-workspace-smoke-test.sh` |
+| `GIT_WORKSPACE_CLONE_TIMEOUT_S` | `600` | `git-workspace-smoke-test.sh` |
+| `GIT_WORKSPACE_GIT_TIMEOUT_S` | `120` | `git-workspace-smoke-test.sh` |
+| `GIT_WORKSPACE_HYDRATE` | `sync` | `git-workspace-smoke-test.sh` |
 
 ## Conventions
 

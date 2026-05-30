@@ -3,11 +3,14 @@ package testmysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	mysql "github.com/go-sql-driver/mysql"
 	tcmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
 )
 
@@ -58,6 +61,19 @@ func Start(ctx context.Context) (*Instance, error) {
 	}, nil
 }
 
+func OpenDB(t *testing.T, dsn string) *sql.DB {
+	t.Helper()
+	if dsn == "" {
+		t.Fatal("mysql test DSN is empty")
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatalf("open mysql test db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
 func ResetDB(t *testing.T, db *sql.DB) {
 	t.Helper()
 	queries := []string{
@@ -73,6 +89,9 @@ func ResetDB(t *testing.T, db *sql.DB) {
 	}
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {
+			if isMissingTableError(err) {
+				continue
+			}
 			t.Fatalf("reset test db: %v", err)
 		}
 	}
@@ -89,6 +108,9 @@ func ResetMetaDB(t *testing.T, db *sql.DB) {
 	}
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {
+			if isMissingTableError(err) {
+				continue
+			}
 			t.Fatalf("reset meta test db: %v", err)
 		}
 	}
@@ -110,7 +132,23 @@ func ResetDBWithoutFiles(t *testing.T, db *sql.DB) {
 	}
 	for _, q := range queries {
 		if _, err := db.Exec(q); err != nil {
+			if isMissingTableError(err) {
+				continue
+			}
 			t.Fatalf("reset test db: %v", err)
 		}
 	}
+}
+
+func isMissingTableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) && mysqlErr.Number == 1146 {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error 1146") ||
+		(strings.Contains(msg, "table") && strings.Contains(msg, "doesn't exist"))
 }

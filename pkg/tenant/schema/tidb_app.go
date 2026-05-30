@@ -162,6 +162,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 		)`,
 		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
 	}
+	stmts = append(stmts, GitWorkspaceTiDBSchemaStatements()...)
 	stmts = append(stmts, JournalTiDBSchemaStatements()...)
 	stmts = append(stmts, VaultTiDBSchemaStatements()...)
 	return stmts

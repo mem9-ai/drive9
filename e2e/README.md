@@ -18,8 +18,9 @@ including local single-tenant validation via `drive9-server-local`.
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/rename/stat semantics, cross-channel consistency, read-only and error-path checks |
 | `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, and mount-log audit |
+| `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
-| `smoke-all.sh` | Runs API + CLI + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail |
+| `smoke-all.sh` | Runs API + CLI + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_GIT_WORKSPACE_SMOKE=1` to include Git workspace coverage |
 
 ## Run
 
@@ -51,6 +52,10 @@ bash e2e/cli-smoke-test.sh
 CLI_SOURCE=official bash e2e/cli-smoke-test.sh
 
 bash e2e/fuse-smoke-test.sh
+
+# Fast-blobless Git workspace smoke. This is intentionally opt-in for broad
+# smoke runs because it clones real repositories and needs FUSE support.
+bash e2e/git-workspace-smoke-test.sh
 
 # Strict FUSE release gate used by CI
 bash e2e/fuse-release-gate.sh
@@ -140,6 +145,9 @@ bash e2e/posix-permission-smoke-test.sh
 
 # Run API + CLI + FUSE + POSIX permission in sequence.
 bash e2e/smoke-all.sh
+
+# Include Git workspace fast-clone coverage in smoke-all.
+RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
 ```
 
 If you overrode `DRIVE9_LOCAL_API_KEY` before starting `drive9-server-local`,
@@ -151,6 +159,7 @@ use the same value as `DRIVE9_API_KEY` here.
 CLI_SOURCE=official bash e2e/cli-smoke-test.sh
 CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
 CLI_SOURCE=official bash e2e/fuse-release-gate.sh
+CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
 ```
 
 #### `drive9-server-local` notes
@@ -185,6 +194,11 @@ CLI_SOURCE=official bash e2e/fuse-release-gate.sh
 - CLI retry knobs for throttling are `CLI_MAX_RETRIES` and `CLI_RETRY_SLEEP_S`.
 - FUSE mount readiness knobs are `MOUNT_READY_TIMEOUT_S`, `MOUNT_READY_INTERVAL_S`, and `FUSE_MOUNT_ROOT`.
 - FUSE release-gate knobs are `FUSE_STRICT_PREREQS`, `RUN_FUSE_GIT_CLONE`, `FUSE_GIT_CLONE_URL`, `FUSE_GIT_CLONE_TIMEOUT_S`, `RUN_FUSE_UMOUNT_DURABLE`, `FUSE_UMOUNT_TIMEOUT`, and `RUN_FUSE_LOG_AUDIT`.
+- Git workspace smoke defaults to `drive9`, `kimi-cli`, and `kimi-code`. Override with `GIT_WORKSPACE_REPOS='slug=https://example/repo.git,...'`.
+- Git workspace scenarios default to `agent_edit_add_commit,agent_patch_apply,sandbox_restore`; tune with `GIT_WORKSPACE_SCENARIOS`.
+- Git workspace file-count knobs are `GIT_WORKSPACE_EXISTING_FILES`, `GIT_WORKSPACE_NEW_FILES`, and `GIT_WORKSPACE_PATCH_FILES`.
+- Git workspace timeout knobs are `GIT_WORKSPACE_CLONE_TIMEOUT_S` and `GIT_WORKSPACE_GIT_TIMEOUT_S`.
+- Git workspace clone uses `drive9 git clone --fast --blobless --hydrate=${GIT_WORKSPACE_HYDRATE:-sync}` inside a `--profile=coding-agent` FUSE mount.
 - CLI source knobs are `CLI_SOURCE` (`build` or `official`), `CLI_RELEASE_BASE_URL`, and optional `CLI_RELEASE_VERSION`.
 - API upload-limit boundary check is enabled by default via `RUN_UPLOAD_LIMIT_BOUNDARY=1`.
 - `UPLOAD_LIMIT_BYTES` controls the boundary value checked by API e2e (default `10737418240`).

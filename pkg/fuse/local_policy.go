@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"strings"
@@ -18,6 +19,7 @@ type PathLayer string
 const (
 	PathLayerRemotePersistent PathLayer = "remote_persistent"
 	PathLayerLocalOnly        PathLayer = "local_only"
+	PathLayerGitWorkspace     PathLayer = "git_workspace"
 )
 
 type policyMatchSource string
@@ -71,7 +73,14 @@ func defaultCodingAgentLocalOnlyPatterns(profile string) []string {
 		"**/target/**",
 		"**/dist/**",
 		"**/build/**",
+		"**/coverage/**",
+		"**/tmp/**",
+		"**/.tmp/**",
+		"**/.tmp-api-extractor/**",
+		"**/.cache/**",
+		"**/.turbo/**",
 		"**/.next/cache/**",
+		"**/.vitepress/cache/**",
 		"**/.gradle/**",
 		"**/.venv/**",
 		"**/__pycache__/**",
@@ -112,10 +121,26 @@ func (policy *LocalPolicy) classifyWithSource(localPath string) (PathLayer, poli
 }
 
 func (fs *Dat9FS) observePathPolicy(localPath string) PathLayer {
+	return fs.observePathPolicyWithHint(context.TODO(), localPath, false)
+}
+
+func (fs *Dat9FS) observePathPolicyWithContext(ctx context.Context, localPath string) PathLayer {
+	return fs.observePathPolicyWithHint(ctx, localPath, false)
+}
+
+func (fs *Dat9FS) observeDirPathPolicyWithContext(ctx context.Context, localPath string) PathLayer {
+	return fs.observePathPolicyWithHint(ctx, localPath, true)
+}
+
+func (fs *Dat9FS) observePathPolicyWithHint(ctx context.Context, localPath string, dirHint bool) PathLayer {
 	if fs == nil || fs.localPolicy == nil {
 		return PathLayerRemotePersistent
 	}
 	layer, source := fs.localPolicy.classifyWithSource(localPath)
+	if layer == PathLayerRemotePersistent && source == policyMatchRemoteDefault && fs.gitIgnoredPathLocalOnly(ctx, localPath, dirHint) {
+		layer = PathLayerLocalOnly
+		source = policyMatchLocalOnly
+	}
 	if fs.perfEnabled() {
 		fs.perf.recordLocalPolicy(source)
 	}

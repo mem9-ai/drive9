@@ -64,6 +64,7 @@ type MountOptions struct {
 	ReadOnly              bool          // mount as read-only
 	Debug                 bool          // enable FUSE debug logging
 	PerfCounters          bool          // print low-overhead FUSE perf counter summary on shutdown
+	EnableGitWorkspaces   bool          // enable fast-clone git workspace overlay discovery
 }
 
 const defaultUploadConcurrency = 16
@@ -338,7 +339,21 @@ func Mount(opts *MountOptions) error {
 	if err := server.WaitMount(); err != nil {
 		return fmt.Errorf("fuse wait mount: %w", err)
 	}
-	pidFile, err := mountstate.WritePID(opts.MountPoint, os.Getpid())
+	stateMountPoint := opts.MountPoint
+	if absMountPoint, absErr := filepath.Abs(stateMountPoint); absErr == nil {
+		stateMountPoint = absMountPoint
+	}
+	if resolvedMountPoint, resolveErr := filepath.EvalSymlinks(stateMountPoint); resolveErr == nil {
+		stateMountPoint = resolvedMountPoint
+	}
+	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
+		PID:        os.Getpid(),
+		MountPoint: stateMountPoint,
+		RemoteRoot: opts.RemoteRoot,
+		Profile:    opts.Profile,
+		LocalRoot:  opts.LocalRoot,
+		Server:     opts.Server,
+	})
 	if err != nil {
 		sseWatcher.Stop()
 		dat9fs.FlushAll()
@@ -478,6 +493,9 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 		return fmt.Errorf("mount: unknown profile %q", opts.Profile)
 	}
 	opts.LocalRoot = strings.TrimSpace(opts.LocalRoot)
+	if opts.EnableGitWorkspaces && opts.LocalRoot == "" {
+		return fmt.Errorf("mount: EnableGitWorkspaces requires LocalRoot")
+	}
 	hasLocalPolicy := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0
 	if opts.Profile != MountProfileCodingAgent {
 		if hasLocalPolicy {
