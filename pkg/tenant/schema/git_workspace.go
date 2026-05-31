@@ -15,12 +15,21 @@ func GitWorkspaceTiDBSchemaStatements() []string {
 			base_commit  VARCHAR(64) NOT NULL DEFAULT '',
 			head_commit  VARCHAR(64) NOT NULL DEFAULT '',
 			mode         VARCHAR(32) NOT NULL DEFAULT 'fast',
+			workspace_kind VARCHAR(16) NOT NULL DEFAULT 'main',
+			common_workspace_id VARCHAR(64) NOT NULL DEFAULT '',
+			worktree_name VARCHAR(255) NOT NULL DEFAULT '',
+			gitdir_rel VARCHAR(1024) NOT NULL DEFAULT '',
 			status       VARCHAR(32) NOT NULL DEFAULT 'active',
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
+		`ALTER TABLE git_workspaces ADD COLUMN workspace_kind VARCHAR(16) NOT NULL DEFAULT 'main'`,
+		`ALTER TABLE git_workspaces ADD COLUMN common_workspace_id VARCHAR(64) NOT NULL DEFAULT ''`,
+		`ALTER TABLE git_workspaces ADD COLUMN worktree_name VARCHAR(255) NOT NULL DEFAULT ''`,
+		`ALTER TABLE git_workspaces ADD COLUMN gitdir_rel VARCHAR(1024) NOT NULL DEFAULT ''`,
 		`CREATE UNIQUE INDEX uk_git_workspaces_root ON git_workspaces(root_path)`,
 		`CREATE INDEX idx_git_workspaces_status ON git_workspaces(status, updated_at)`,
+		`CREATE INDEX idx_git_workspaces_common ON git_workspaces(common_workspace_id, status)`,
 
 		`CREATE TABLE IF NOT EXISTS git_workspace_tree_nodes (
 			workspace_id VARCHAR(64) NOT NULL,
@@ -99,12 +108,21 @@ func GitWorkspaceDB9SchemaStatements() []string {
 			base_commit  VARCHAR(64) NOT NULL DEFAULT '',
 			head_commit  VARCHAR(64) NOT NULL DEFAULT '',
 			mode         VARCHAR(32) NOT NULL DEFAULT 'fast',
+			workspace_kind VARCHAR(16) NOT NULL DEFAULT 'main',
+			common_workspace_id VARCHAR(64) NOT NULL DEFAULT '',
+			worktree_name VARCHAR(255) NOT NULL DEFAULT '',
+			gitdir_rel VARCHAR(1024) NOT NULL DEFAULT '',
 			status       VARCHAR(32) NOT NULL DEFAULT 'active',
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
+		`ALTER TABLE git_workspaces ADD COLUMN workspace_kind VARCHAR(16) NOT NULL DEFAULT 'main'`,
+		`ALTER TABLE git_workspaces ADD COLUMN common_workspace_id VARCHAR(64) NOT NULL DEFAULT ''`,
+		`ALTER TABLE git_workspaces ADD COLUMN worktree_name VARCHAR(255) NOT NULL DEFAULT ''`,
+		`ALTER TABLE git_workspaces ADD COLUMN gitdir_rel VARCHAR(1024) NOT NULL DEFAULT ''`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS uk_git_workspaces_root ON git_workspaces(root_path)`,
 		`CREATE INDEX IF NOT EXISTS idx_git_workspaces_status ON git_workspaces(status, updated_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_git_workspaces_common ON git_workspaces(common_workspace_id, status)`,
 
 		`CREATE TABLE IF NOT EXISTS git_workspace_tree_nodes (
 			workspace_id VARCHAR(64) NOT NULL,

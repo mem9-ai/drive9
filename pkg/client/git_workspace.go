@@ -12,27 +12,35 @@ import (
 )
 
 type GitWorkspaceRequest struct {
-	RootPath   string `json:"root_path"`
-	RepoURL    string `json:"repo_url"`
-	RemoteName string `json:"remote_name,omitempty"`
-	BranchName string `json:"branch_name,omitempty"`
-	BaseCommit string `json:"base_commit,omitempty"`
-	HeadCommit string `json:"head_commit,omitempty"`
-	Mode       string `json:"mode,omitempty"`
+	RootPath          string `json:"root_path"`
+	RepoURL           string `json:"repo_url"`
+	RemoteName        string `json:"remote_name,omitempty"`
+	BranchName        string `json:"branch_name,omitempty"`
+	BaseCommit        string `json:"base_commit,omitempty"`
+	HeadCommit        string `json:"head_commit,omitempty"`
+	Mode              string `json:"mode,omitempty"`
+	WorkspaceKind     string `json:"workspace_kind,omitempty"`
+	CommonWorkspaceID string `json:"common_workspace_id,omitempty"`
+	WorktreeName      string `json:"worktree_name,omitempty"`
+	GitDirRel         string `json:"gitdir_rel,omitempty"`
 }
 
 type GitWorkspace struct {
-	WorkspaceID string    `json:"workspace_id"`
-	RootPath    string    `json:"root_path"`
-	RepoURL     string    `json:"repo_url"`
-	RemoteName  string    `json:"remote_name"`
-	BranchName  string    `json:"branch_name"`
-	BaseCommit  string    `json:"base_commit"`
-	HeadCommit  string    `json:"head_commit"`
-	Mode        string    `json:"mode"`
-	Status      string    `json:"status"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	WorkspaceID       string    `json:"workspace_id"`
+	RootPath          string    `json:"root_path"`
+	RepoURL           string    `json:"repo_url"`
+	RemoteName        string    `json:"remote_name"`
+	BranchName        string    `json:"branch_name"`
+	BaseCommit        string    `json:"base_commit"`
+	HeadCommit        string    `json:"head_commit"`
+	Mode              string    `json:"mode"`
+	WorkspaceKind     string    `json:"workspace_kind"`
+	CommonWorkspaceID string    `json:"common_workspace_id"`
+	WorktreeName      string    `json:"worktree_name"`
+	GitDirRel         string    `json:"gitdir_rel"`
+	Status            string    `json:"status"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type GitTreeReplaceRequest struct {
@@ -150,6 +158,30 @@ func (c *Client) GetGitWorkspaceByRoot(ctx context.Context, rootPath string) (*G
 		return nil, fmt.Errorf("rootPath must not be empty")
 	}
 	u := c.baseURL + "/v1/git-workspaces?root_path=" + url.QueryEscape(rootPath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out GitWorkspace
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode git workspace: %w", err)
+	}
+	return &out, nil
+}
+
+func (c *Client) GetGitWorkspace(ctx context.Context, workspaceID string) (*GitWorkspace, error) {
+	if strings.TrimSpace(workspaceID) == "" {
+		return nil, fmt.Errorf("workspaceID must not be empty")
+	}
+	u := c.baseURL + "/v1/git-workspaces/" + url.PathEscape(workspaceID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err

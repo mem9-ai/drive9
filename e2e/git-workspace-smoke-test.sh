@@ -18,7 +18,7 @@ CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
 GIT_WORKSPACE_REPOS="${GIT_WORKSPACE_REPOS:-drive9=https://github.com/mem9-ai/drive9.git,kimi-cli=https://github.com/MoonshotAI/kimi-cli.git,kimi-code=https://github.com/MoonshotAI/kimi-code.git}"
-GIT_WORKSPACE_SCENARIOS="${GIT_WORKSPACE_SCENARIOS:-agent_edit_add_commit,agent_patch_apply,sandbox_restore}"
+GIT_WORKSPACE_SCENARIOS="${GIT_WORKSPACE_SCENARIOS:-agent_edit_add_commit,agent_patch_apply,sandbox_restore,fast_worktree}"
 GIT_WORKSPACE_EXISTING_FILES="${GIT_WORKSPACE_EXISTING_FILES:-20}"
 GIT_WORKSPACE_NEW_FILES="${GIT_WORKSPACE_NEW_FILES:-20}"
 GIT_WORKSPACE_PATCH_FILES="${GIT_WORKSPACE_PATCH_FILES:-20}"
@@ -304,6 +304,15 @@ clone_fast_blobless() {
     drive9 git clone --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" "$repo_url" "$target"
 }
 
+fast_worktree_add() {
+  local base_repo="$1"
+  local worktree="$2"
+  local branch="$3"
+  local commitish="$4"
+  run_with_timeout "$GIT_WORKSPACE_CLONE_TIMEOUT_S" \
+    drive9 git worktree add --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" -b "$branch" "$base_repo" "$worktree" "$commitish"
+}
+
 configure_git_identity() {
   local repo="$1"
   git_cmd -C "$repo" config user.email "drive9-e2e@example.test" || return
@@ -389,7 +398,7 @@ assert_clean_status() {
 
 assert_repo_ready() {
   local repo="$1"
-  test -d "$repo/.git" || return
+  test -e "$repo/.git" || return
   git_cmd -C "$repo" rev-parse --is-inside-work-tree >/dev/null || return
   git_cmd -C "$repo" log --oneline -1 >/dev/null || return
   git_cmd -C "$repo" status --porcelain=v1 >/dev/null
@@ -506,12 +515,81 @@ run_sandbox_restore() {
   stop_mount
 }
 
+run_fast_worktree() {
+  local slug="$1" repo_url="$2"
+  local scenario="fast_worktree"
+  local marker="${slug}-${scenario}-$(date +%s)"
+  local case_root="$RUN_ROOT/$slug-$scenario"
+  local mount_point="$case_root/mount"
+  local local_root_a="$case_root/local-root-a"
+  local local_root_b="$case_root/local-root-b"
+  local log_a="$case_root/mount-a.log"
+  local log_b="$case_root/mount-b.log"
+  local base_repo="$mount_point/$slug-$scenario-base"
+  local worktree="$mount_point/$slug-$scenario-linked"
+  local branch="drive9-e2e-${slug}-${scenario}-$(date +%s)"
+  local selected_commit="$case_root/selected-commit.txt"
+  local selected_staged="$case_root/selected-staged.txt"
+  local status_before="$case_root/status-before.txt"
+  local status_after="$case_root/status-after.txt"
+  local cached_before="$case_root/cached-before.txt"
+  local cached_after="$case_root/cached-after.txt"
+  local commit_subject="drive9 e2e $scenario committed $marker"
+  local staged_rel
+  mkdir -p "$case_root"
+
+  echo "[repo=$slug scenario=$scenario] initial mount + fast linked worktree"
+  check_cmd "$slug $scenario first mount starts" start_mount "$mount_point" "$local_root_a" "$log_a"
+  check_cmd "$slug $scenario fast blobless clone base" clone_fast_blobless "$repo_url" "$base_repo"
+  check_cmd "$slug $scenario base repo ready" assert_repo_ready "$base_repo"
+  configure_git_identity "$base_repo"
+  check_cmd "$slug $scenario fast worktree add" fast_worktree_add "$base_repo" "$worktree" "$branch" "HEAD"
+  check_cmd "$slug $scenario linked worktree ready" assert_repo_ready "$worktree"
+  configure_git_identity "$worktree"
+  check_cmd "$slug $scenario base lists linked worktree" bash -c 'git -C "$1" worktree list --porcelain | grep -q "^worktree $2$"' _ "$base_repo" "$worktree"
+
+  check_cmd "$slug $scenario append commit files" select_and_append_existing "$worktree" "$GIT_WORKSPACE_EXISTING_FILES" "$marker-commit" "$selected_commit"
+  check_cmd "$slug $scenario write commit files" write_new_files "$worktree" "$GIT_WORKSPACE_NEW_FILES" "$marker-commit"
+  check_cmd "$slug $scenario linked worktree commit" commit_all "$worktree" "$commit_subject"
+  check_eq "$slug $scenario commit subject before remount" "$(git -C "$worktree" log -1 --pretty=%s)" "$commit_subject"
+
+  check_cmd "$slug $scenario append staged file" select_and_append_existing "$worktree" 1 "$marker-staged" "$selected_staged"
+  staged_rel="$(head -n 1 "$selected_staged")"
+  check_cmd "$slug $scenario git add staged file" git_cmd -C "$worktree" add -- "$staged_rel"
+  mkdir -p "$worktree/agent-bench/worktree"
+  printf 'unstaged linked worktree marker=%s\n' "$marker" > "$worktree/agent-bench/worktree/unstaged.txt"
+  git_cmd -C "$worktree" diff --cached --name-only > "$cached_before"
+  git_cmd -C "$worktree" status --porcelain=v1 > "$status_before"
+  check_cmd "$slug $scenario cached diff before remount" grep -Fxq "$staged_rel" "$cached_before"
+  check_cmd "$slug $scenario dirty status before remount" test -s "$status_before"
+  check_cmd "$slug $scenario first mount log audit" audit_mount_log "$log_a"
+  stop_mount
+
+  echo "[repo=$slug scenario=$scenario] remount with fresh local root"
+  check_cmd "$slug $scenario second mount starts" start_mount "$mount_point" "$local_root_b" "$log_b"
+  check_cmd "$slug $scenario linked .git restored as file" test -f "$worktree/.git"
+  check_cmd "$slug $scenario base .git restored" test -d "$base_repo/.git"
+  check_cmd "$slug $scenario base worktree list restored" bash -c 'git -C "$1" worktree list --porcelain | grep -q "^worktree $2$"' _ "$base_repo" "$worktree"
+  check_cmd "$slug $scenario linked worktree ready after remount" assert_repo_ready "$worktree"
+  check_eq "$slug $scenario commit subject after remount" "$(git -C "$worktree" log -1 --pretty=%s)" "$commit_subject"
+  git_cmd -C "$worktree" diff --cached --name-only > "$cached_after"
+  git_cmd -C "$worktree" status --porcelain=v1 > "$status_after"
+  check_cmd "$slug $scenario cached diff restored" cmp -s "$cached_before" "$cached_after"
+  check_cmd "$slug $scenario status restored" cmp -s "$status_before" "$status_after"
+  check_cmd "$slug $scenario unstaged file restored" grep -q "$marker" "$worktree/agent-bench/worktree/unstaged.txt"
+  check_cmd "$slug $scenario fast worktree remove" drive9 git worktree remove --fast "$worktree"
+  check_cmd "$slug $scenario linked worktree removed from git metadata" bash -c 'out=$(git -C "$1" worktree list --porcelain) && ! printf "%s\n" "$out" | grep -q "^worktree $2$"' _ "$base_repo" "$worktree"
+  check_cmd "$slug $scenario second mount log audit" audit_mount_log "$log_b"
+  stop_mount
+}
+
 run_repo_scenario() {
   local slug="$1" repo_url="$2" scenario="$3"
   case "$scenario" in
     agent_edit_add_commit) run_agent_edit_add_commit "$slug" "$repo_url" ;;
     agent_patch_apply) run_agent_patch_apply "$slug" "$repo_url" ;;
     sandbox_restore) run_sandbox_restore "$slug" "$repo_url" ;;
+    fast_worktree) run_fast_worktree "$slug" "$repo_url" ;;
     *)
       echo "unknown GIT_WORKSPACE_SCENARIOS entry: $scenario" >&2
       FAIL=$((FAIL + 1))

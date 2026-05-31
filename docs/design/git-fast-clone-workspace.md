@@ -18,6 +18,8 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 - Working tree changes such as edit/create/delete/chmod/symlink are persisted to the Drive9 backend overlay.
 - `.git` keeps local disk read/write performance while lightweight state and small local-only Git objects are checkpointed to Drive9 for cross-sandbox recovery.
 - `git add`, `git commit`, and `git push` should remain as close as possible to the native Git workflow, without introducing a separate push API.
+- `drive9 git worktree add --fast` should create linked worktrees without native checkout writes into FUSE.
+- `drive9 git worktree remove --fast` should remove a linked fast workspace without recursively unlinking every virtual clean file.
 
 ## Non-Goals
 
@@ -37,6 +39,10 @@ This is therefore not a pure generic filesystem optimization. It is a Git-aware 
 - Key fields: `workspace_id`, `root_path`, `repo_url`, `remote_name`, `branch_name`, `base_commit`, `head_commit`, `mode`, and `status=active`.
 - `mode=fast` is the default full-object local clone; `mode=fast-blobless` is the opt-in blobless local clone.
 - `root_path` is unique and maps to the repo root directory inside the mounted tree.
+- `workspace_kind=main` is a primary fast clone. `workspace_kind=linked` is a Git linked worktree with its own clean tree manifest and dirty overlay.
+- `common_workspace_id` points from a linked worktree to the main/common workspace that owns the shared Git common dir.
+- `worktree_name` is the stable name under the common Git dir's `worktrees/` directory.
+- `gitdir_rel` stores the linked gitdir path relative to the common `.git` directory, normally `worktrees/<worktree_name>`.
 
 `git_workspace_tree_nodes`
 
@@ -95,6 +101,7 @@ Coding-agent local overlay policy
 - These local-only paths are still merged into FUSE directory listings with tracked Git workspace entries, so generated directories under a tracked source directory remain visible to local build tools without being uploaded to Drive9.
 - Local-only dependency and generated-output files are a rebuildable performance layer. Their ordinary FUSE `Flush` path does not force `fsync`; it refreshes local inode metadata only. Explicit `Fsync` still syncs the local file.
 - Lightweight `.git` state is checkpointed asynchronously and coalesced per workspace. Foreground `Flush`, `Fsync`, `Release`, `Rename`, and `Unlink` on local `.git` files only perform the necessary local filesystem operation and schedule a checkpoint; `FlushAll`/unmount drains pending checkpoints.
+- Linked worktree `.git` is a file, not a directory. It is local-only too. On restore, Drive9 rewrites it with a relative `gitdir:` target that points through the mounted path back to the common workspace's `.git/worktrees/<name>` directory, so later Git metadata writes still pass through FUSE and can be checkpointed.
 - Transient Git lock files such as `.git/index.lock`, `.git/packed-refs.lock`, `.git/HEAD.lock`, and `refs/**/*.lock` are never checkpointed. The durable state is captured after Git atomically renames the lock file to its final destination.
 - `.git/objects` remains a local object database/cache and is not checkpointed directly.
 
@@ -154,6 +161,56 @@ Coding-agent local overlay policy
 8. After FUSE rediscovers the workspace, directory listings come from the synthetic view of `git_workspace_tree_nodes` plus `git_workspace_overlay`. FUSE also best-effort starts hydrate for `mode=fast-blobless` workspaces so replacement sandboxes still warm their local cache.
 
 9. In the coding-agent mount profile, FUSE treats repository-ignored generated paths as local-only. The policy first applies explicit local/remote patterns; for otherwise remote-default paths inside a Git workspace, it runs cached `git check-ignore` against the hidden hydrated clean tree and the local `.git` state. Paths that Git would ignore are routed to the local overlay, while tracked clean files and durable Git overlay entries keep their normal Git workspace semantics.
+
+## Fast Worktree Flow
+
+V1 uses explicit Drive9 commands and does not transparently intercept native `git worktree add/remove`:
+
+```bash
+drive9 git worktree add --fast [-b <branch>] [--detach] [--blobless] [--hydrate=auto|background|sync|off] <base-repo-path> <worktree-path> [<commit-ish>]
+drive9 git worktree remove --fast <worktree-path>
+```
+
+`drive9 git worktree add --fast`:
+
+1. Resolves both paths through Drive9 mount metadata and requires them to be in the same mount.
+2. Looks up `<base-repo-path>` as an active `workspace_kind=main` fast workspace.
+3. Runs native Git only for linked worktree metadata:
+
+   ```bash
+   git -C <base-repo-path> worktree add --no-checkout [-b <branch>|--detach] <worktree-path> <resolved-commit>
+   git -C <worktree-path> read-tree --reset <resolved-commit>
+   ```
+
+   The command intentionally avoids a checkout. It creates only the worktree root, the linked `.git` file, the common `.git/worktrees/<name>` metadata, and the Git index.
+
+4. Generates a clean tree manifest with `git ls-tree -r -t -z <commit>`, enriches sizes through the GitHub Trees API when possible, and registers a new `git_workspaces` row with `workspace_kind=linked`.
+5. Stores linked `.git` state as a separate `git_workspace_git_state` row and also checkpoints the common workspace `.git`, because Git updated common metadata such as `worktrees/<name>` and refs.
+6. Uses the same hydrate behavior as fast clone. A linked workspace inherits blobless behavior from a blobless common workspace; `--blobless` is a validation flag rather than a way to convert a full common object database into a partial one.
+
+`drive9 git worktree remove --fast`:
+
+1. Resolves `<worktree-path>` to a linked fast workspace.
+2. Removes the common `.git/worktrees/<name>` metadata from the local overlay and runs `git worktree prune` as best-effort local cleanup.
+3. Checkpoints the common workspace `.git`.
+4. Marks the linked `git_workspaces` row deleted and removes the linked local overlay root.
+5. Best-effort removes the empty mounted worktree root. It does not generate clean-tree whiteouts and does not recursively unlink virtual manifest files.
+
+Linked worktree restore:
+
+1. FUSE matches workspaces by longest `root_path`, so the main repo and each linked worktree get independent runtimes.
+2. Access to a linked worktree `.git` file, or to the common path `.git/worktrees/<name>/...`, triggers linked restore.
+3. FUSE restores the common workspace `.git` first from `repo_url`, common object packs, and the common Git state checkpoint.
+4. FUSE recreates the linked `.git` file, restores the linked gitdir under the common `.git/worktrees/<name>` directory, unpacks linked local-only object packs into the common object database, and extracts the linked lightweight Git state.
+5. Dirty working tree files restore from the linked workspace's own `git_workspace_overlay`, isolated from the common workspace and other linked worktrees.
+
+Performance coverage for issue #476:
+
+- `git worktree add --fast` avoids checkout writes for every clean source file.
+- `git worktree remove --fast` avoids recursive unlink/rmdir over virtual clean tree entries.
+- `git status` and `git add` read tracked metadata from the manifest and overlay instead of round-tripping to generic remote `file_nodes`.
+- `.git` probes, lock files, linked gitdir files, and common worktree metadata stay on local overlay hot paths with coalesced checkpoints.
+- The expected perf-counter movement is lower aggregate `remote stat`, `remote mutation`, `remote write`, and FUSE unlink time for worktree smoke workflows.
 
 ## Read/Edit/Add/Commit/Push Flow
 
@@ -218,6 +275,8 @@ Edit a file:
 7. FUSE downloads and unpacks local-only object packs, then extracts the lightweight `.git` checkpoint over the local clone.
 8. B sees working tree = clean tree manifest + durable overlay; `git status`, `git log`, and file content are restored to A's last persisted state, subject to the explicit oversized staged/local-ref downgrade rules.
 
+For linked worktrees, B restores the common workspace first, then each linked gitdir on demand. Edited files come from the linked workspace overlay, staged state comes from the linked `.git` checkpoint plus small object packs, and local commits/refs are recovered through the common and linked checkpoints together.
+
 ## Local State and SQLite
 
 The current implementation does not introduce SQLite.
@@ -278,4 +337,4 @@ Backend table checks:
 - Branch switching, merge, rebase, conflicts, submodules, and LFS need deeper semantic validation.
 - V1 hydrate does not optimize LFS or submodule object fetching. Non-GitHub repositories use a Git checkout-index fallback, which can be slower than GitHub codeload but still keeps the work out of FUSE read calls.
 - Object database hydrate is a performance layer, not authoritative storage. If a sandbox loses its local root, replacement sandboxes rebuild clean objects from the remote or hidden tree hydrate and restore local-only objects through the existing object-pack checkpoint path.
-- The fast clone E2E should be turned into a repeatable script instead of relying on manual commands.
+- The repeatable live smoke path is `e2e/git-workspace-smoke-test.sh`. It covers fast clone, agent edit/add/commit, sandbox replacement, and fast linked worktree add/edit/stage/commit/remount/remove. Release gates still need to decide when to enable this heavier FUSE workflow by default.

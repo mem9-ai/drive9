@@ -61,6 +61,10 @@ type gitWorkspaceRuntime struct {
 	restored  bool
 }
 
+func (rt *gitWorkspaceRuntime) isLinked() bool {
+	return rt != nil && rt.workspace.WorkspaceKind == "linked"
+}
+
 type gitMaterializeCall struct {
 	done chan struct{}
 	data []byte
@@ -213,6 +217,128 @@ func (fs *Dat9FS) loadedGitWorkspaceForPath(localPath string) (*gitWorkspaceRunt
 	return nil, "", false
 }
 
+func (fs *Dat9FS) loadedGitWorkspaceForGitStatePath(localPath string) (*gitWorkspaceRuntime, string, bool) {
+	rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath)
+	if !ok {
+		return nil, "", false
+	}
+	if linked, linkedRel, linkedOK := fs.linkedWorkspaceForCommonGitStatePath(rt, rel); linkedOK {
+		return linked, linkedRel, true
+	}
+	return rt, rel, true
+}
+
+func (fs *Dat9FS) linkedWorkspaceForCommonGitStatePath(commonRT *gitWorkspaceRuntime, rel string) (*gitWorkspaceRuntime, string, bool) {
+	if fs == nil || fs.git == nil || commonRT == nil || commonRT.isLinked() {
+		return nil, "", false
+	}
+	rel = strings.TrimPrefix(path.Clean("/"+rel), "/")
+	const prefix = ".git/worktrees/"
+	if !strings.HasPrefix(rel, prefix) {
+		return nil, "", false
+	}
+	tail := strings.TrimPrefix(rel, prefix)
+	name, rest, _ := strings.Cut(tail, "/")
+	if name == "" {
+		return nil, "", false
+	}
+	fs.git.mu.Lock()
+	defer fs.git.mu.Unlock()
+	for _, candidate := range fs.git.workspaces {
+		if candidate.workspace.CommonWorkspaceID == commonRT.workspace.WorkspaceID && candidate.workspace.WorktreeName == name {
+			if rest == "" {
+				return candidate, ".git", true
+			}
+			return candidate, ".git/" + rest, true
+		}
+	}
+	return nil, "", false
+}
+
+func (fs *Dat9FS) gitWorkspaceRuntimeByID(workspaceID string) (*gitWorkspaceRuntime, bool) {
+	if fs == nil || fs.git == nil || strings.TrimSpace(workspaceID) == "" {
+		return nil, false
+	}
+	fs.git.mu.Lock()
+	defer fs.git.mu.Unlock()
+	for _, rt := range fs.git.workspaces {
+		if rt.workspace.WorkspaceID == workspaceID {
+			return rt, true
+		}
+	}
+	return nil, false
+}
+
+func (fs *Dat9FS) commonRuntimeForLinked(rt *gitWorkspaceRuntime) (*gitWorkspaceRuntime, error) {
+	if rt == nil {
+		return nil, fmt.Errorf("git workspace runtime is nil")
+	}
+	commonID := strings.TrimSpace(rt.workspace.CommonWorkspaceID)
+	if commonID == "" {
+		return nil, fmt.Errorf("linked git workspace %s has no common workspace id", rt.workspace.WorkspaceID)
+	}
+	commonRT, ok := fs.gitWorkspaceRuntimeByID(commonID)
+	if !ok {
+		return nil, fmt.Errorf("linked git workspace %s common workspace %s is not loaded", rt.workspace.WorkspaceID, commonID)
+	}
+	return commonRT, nil
+}
+
+func (fs *Dat9FS) gitDirForRuntime(rt *gitWorkspaceRuntime) (string, error) {
+	if fs == nil || fs.localOverlay == nil || rt == nil {
+		return "", syscall.EIO
+	}
+	if !rt.isLinked() {
+		return fs.localOverlay.abs(path.Join(rt.localRoot, ".git"))
+	}
+	commonRT, err := fs.commonRuntimeForLinked(rt)
+	if err != nil {
+		return "", err
+	}
+	return fs.linkedGitDir(rt, commonRT)
+}
+
+func (fs *Dat9FS) linkedGitDir(rt, commonRT *gitWorkspaceRuntime) (string, error) {
+	if fs == nil || fs.localOverlay == nil || rt == nil || commonRT == nil {
+		return "", syscall.EIO
+	}
+	commonGitDir, err := fs.localOverlay.abs(path.Join(commonRT.localRoot, ".git"))
+	if err != nil {
+		return "", err
+	}
+	rel := strings.Trim(strings.TrimSpace(rt.workspace.GitDirRel), "/")
+	if rel == "" {
+		name := strings.TrimSpace(rt.workspace.WorktreeName)
+		if name == "" {
+			return "", fmt.Errorf("linked git workspace %s has no worktree name", rt.workspace.WorkspaceID)
+		}
+		rel = path.Join("worktrees", name)
+	}
+	if strings.ContainsRune(rel, '\x00') || strings.HasPrefix(rel, "../") || strings.Contains(rel, "/../") || rel == ".." {
+		return "", fmt.Errorf("linked git workspace %s has unsafe gitdir_rel %q", rt.workspace.WorkspaceID, rt.workspace.GitDirRel)
+	}
+	return filepath.Join(commonGitDir, filepath.FromSlash(rel)), nil
+}
+
+func (fs *Dat9FS) writeLinkedGitFile(rt, commonRT *gitWorkspaceRuntime, gitFile string) error {
+	if rt == nil || commonRT == nil {
+		return fmt.Errorf("linked git runtime is incomplete")
+	}
+	if err := os.MkdirAll(filepath.Dir(gitFile), 0o755); err != nil {
+		return err
+	}
+	name := strings.TrimSpace(rt.workspace.WorktreeName)
+	if name == "" {
+		return fmt.Errorf("linked git workspace %s has no worktree name", rt.workspace.WorkspaceID)
+	}
+	target := path.Join(commonRT.localRoot, ".git", "worktrees", name)
+	rel, err := filepath.Rel(filepath.FromSlash(rt.localRoot), filepath.FromSlash(target))
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(gitFile, []byte("gitdir: "+filepath.ToSlash(rel)+"\n"), 0o644)
+}
+
 func (fs *Dat9FS) gitWorkspaceOwnsPath(ctx context.Context, localPath string) bool {
 	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
 	if !ok || rel == "" {
@@ -296,7 +422,7 @@ func (fs *Dat9FS) gitCheckIgnoredPath(ctx context.Context, rt *gitWorkspaceRunti
 	if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
 		return false, false
 	}
-	gitDir, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git"))
+	gitDir, err := fs.gitDirForRuntime(rt)
 	if err != nil {
 		return false, false
 	}
@@ -907,10 +1033,7 @@ func (fs *Dat9FS) gitCatFileBlob(ctx context.Context, rt *gitWorkspaceRuntime, o
 	if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
 		return nil, err
 	}
-	if fs.localOverlay == nil {
-		return nil, syscall.EIO
-	}
-	gitDir, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git"))
+	gitDir, err := fs.gitDirForRuntime(rt)
 	if err != nil {
 		return nil, err
 	}
@@ -965,6 +1088,9 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	if rt == nil || fs.localOverlay == nil {
 		return nil
 	}
+	if rt.isLinked() {
+		return fs.ensureLinkedGitStateRestored(ctx, rt)
+	}
 	rt.mu.RLock()
 	if rt.restored {
 		rt.mu.RUnlock()
@@ -981,7 +1107,7 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	}
 	rt.mu.RUnlock()
 
-	gitDir, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git"))
+	gitDir, err := fs.gitDirForRuntime(rt)
 	if err != nil {
 		return err
 	}
@@ -1003,6 +1129,73 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	}
 	if !gitDirLooksUsable(ctx, gitDir) {
 		return fmt.Errorf("git workspace %s restored unusable .git state", rt.workspace.WorkspaceID)
+	}
+	rt.mu.Lock()
+	rt.restored = true
+	rt.mu.Unlock()
+	return nil
+}
+
+func (fs *Dat9FS) ensureLinkedGitStateRestored(ctx context.Context, rt *gitWorkspaceRuntime) error {
+	rt.mu.RLock()
+	if rt.restored {
+		rt.mu.RUnlock()
+		return nil
+	}
+	rt.mu.RUnlock()
+
+	rt.restoreMu.Lock()
+	defer rt.restoreMu.Unlock()
+	rt.mu.RLock()
+	if rt.restored {
+		rt.mu.RUnlock()
+		return nil
+	}
+	rt.mu.RUnlock()
+
+	commonRT, err := fs.commonRuntimeForLinked(rt)
+	if err != nil {
+		return err
+	}
+	if err := fs.ensureGitStateRestored(ctx, commonRT); err != nil {
+		return err
+	}
+	linkedGitDir, err := fs.linkedGitDir(rt, commonRT)
+	if err != nil {
+		return err
+	}
+	linkedGitFile, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git"))
+	if err != nil {
+		return err
+	}
+	if gitDirLooksUsable(ctx, linkedGitDir) {
+		if err := fs.writeLinkedGitFile(rt, commonRT, linkedGitFile); err != nil {
+			return err
+		}
+		rt.mu.Lock()
+		rt.restored = true
+		rt.mu.Unlock()
+		return nil
+	}
+	state, err := fs.client.GetGitState(ctx, rt.workspace.WorkspaceID)
+	if err != nil {
+		return err
+	}
+	if len(state.Content) == 0 {
+		return fmt.Errorf("git workspace %s has no .git checkpoint", rt.workspace.WorkspaceID)
+	}
+	commonGitDir, err := fs.gitDirForRuntime(commonRT)
+	if err != nil {
+		return err
+	}
+	if err := fs.restoreGitObjectPacks(ctx, rt, commonGitDir); err != nil {
+		return err
+	}
+	if err := fs.restoreLinkedGitStateAtomically(ctx, rt, commonRT, linkedGitDir, linkedGitFile, state); err != nil {
+		return err
+	}
+	if !gitDirLooksUsable(ctx, linkedGitDir) {
+		return fmt.Errorf("git workspace %s restored unusable linked .git state", rt.workspace.WorkspaceID)
 	}
 	rt.mu.Lock()
 	rt.restored = true
@@ -1058,6 +1251,38 @@ func (fs *Dat9FS) restoreGitStateAtomically(ctx context.Context, rt *gitWorkspac
 		return err
 	}
 	return nil
+}
+
+func (fs *Dat9FS) restoreLinkedGitStateAtomically(ctx context.Context, rt, commonRT *gitWorkspaceRuntime, linkedGitDir, linkedGitFile string, state *client.GitState) error {
+	parent := filepath.Dir(linkedGitDir)
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		return err
+	}
+	tmpRoot, err := os.MkdirTemp(parent, ".drive9-linked-git-state-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(tmpRoot) }()
+	tmpGitDir := filepath.Join(tmpRoot, rt.workspace.WorktreeName)
+	if err := extractGitArchive(state.Content, tmpGitDir); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(tmpGitDir, "commondir"), []byte("../..\n"), 0o644); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(linkedGitFile), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(tmpGitDir, "gitdir"), []byte(linkedGitFile+"\n"), 0o644); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(linkedGitDir); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpGitDir, linkedGitDir); err != nil {
+		return err
+	}
+	return fs.writeLinkedGitFile(rt, commonRT, linkedGitFile)
 }
 
 func (fs *Dat9FS) restoreGitObjectsFromRemote(ctx context.Context, rt *gitWorkspaceRuntime, gitDir string) error {
@@ -1146,7 +1371,18 @@ func (fs *Dat9FS) restoreGitObjectPacks(ctx context.Context, rt *gitWorkspaceRun
 }
 
 func (fs *Dat9FS) ensureGitStateForLocalPath(ctx context.Context, localPath string) error {
-	rt, rel, ok := fs.gitWorkspaceForPath(ctx, localPath)
+	if fs == nil || fs.git == nil || fs.opts == nil || !fs.opts.EnableGitWorkspaces {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.TODO()
+	}
+	refreshCtx, cancel := context.WithTimeout(ctx, fuseTimeout)
+	if err := fs.ensureGitWorkspaces(refreshCtx); err != nil {
+		log.Printf("git workspace refresh failed for %s: %v", localPath, err)
+	}
+	cancel()
+	rt, rel, ok := fs.loadedGitWorkspaceForGitStatePath(localPath)
 	if !ok {
 		return nil
 	}
@@ -1192,18 +1428,16 @@ func (fs *Dat9FS) runGitWorkspaceHydrate(rt *gitWorkspaceRuntime) {
 		fs.perf.gitHydrateStart.add(1)
 	}
 
-	gitDir := ""
-	if fs.localOverlay != nil {
-		if p, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git")); err == nil {
-			gitDir = p
-		}
-	}
 	if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
 		if fs.perfEnabled() {
 			fs.perf.gitHydrateFailure.add(1)
 		}
 		log.Printf("git workspace hydrate restore failed for %s: %v", rt.workspace.RootPath, err)
 		return
+	}
+	gitDir := ""
+	if p, err := fs.gitDirForRuntime(rt); err == nil {
+		gitDir = p
 	}
 	result, err := gitcache.Hydrate(ctx, gitcache.HydrateOptions{
 		LocalRoot:   fs.opts.LocalRoot,
@@ -1392,7 +1626,7 @@ func (fs *Dat9FS) scheduleGitStateCheckpoint(localPath string) {
 	if fs == nil || fs.gitCheckpoints == nil || !localPathShouldCheckpointGitState(localPath) {
 		return
 	}
-	rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath)
+	rt, rel, ok := fs.loadedGitWorkspaceForGitStatePath(localPath)
 	if !ok || (rel != ".git" && !strings.HasPrefix(rel, ".git/")) {
 		return
 	}
@@ -1410,7 +1644,7 @@ func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath strin
 	if fs == nil || !localPathShouldCheckpointGitState(localPath) {
 		return nil
 	}
-	rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath)
+	rt, rel, ok := fs.loadedGitWorkspaceForGitStatePath(localPath)
 	if !ok || (rel != ".git" && !strings.HasPrefix(rel, ".git/")) {
 		return nil
 	}
@@ -1439,7 +1673,7 @@ func (fs *Dat9FS) checkpointGitStateForRuntime(ctx context.Context, rt *gitWorks
 	if fs == nil || fs.git == nil || fs.client == nil || fs.localOverlay == nil || rt == nil {
 		return nil
 	}
-	gitDir, err := fs.localOverlay.abs(path.Join(rt.localRoot, ".git"))
+	gitDir, err := fs.gitDirForRuntime(rt)
 	if err != nil {
 		return err
 	}
@@ -1538,7 +1772,7 @@ func buildLocalGitObjectPack(ctx context.Context, gitDir string, rt *gitWorkspac
 }
 
 func collectLocalRefObjects(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime) (map[string]struct{}, bool, error) {
-	tips, err := collectLocalRefTips(gitDir)
+	tips, err := collectLocalRefTips(ctx, gitDir)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1640,7 +1874,7 @@ func collectStagedLocalObjects(ctx context.Context, gitDir string, rt *gitWorksp
 	return objects, allRestores, restores, nil
 }
 
-func collectLocalRefTips(gitDir string) ([]string, error) {
+func collectLocalRefTips(ctx context.Context, gitDir string) ([]string, error) {
 	seen := make(map[string]struct{})
 	add := func(raw string) {
 		fields := strings.Fields(raw)
@@ -1653,56 +1887,20 @@ func collectLocalRefTips(gitDir string) ([]string, error) {
 		}
 		seen[oid] = struct{}{}
 	}
-	if head, err := os.ReadFile(filepath.Join(gitDir, "HEAD")); err == nil {
-		text := strings.TrimSpace(string(head))
-		if !strings.HasPrefix(text, "ref: ") {
-			add(text)
-		}
-	} else if !os.IsNotExist(err) {
+	if head, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "rev-parse", "--verify", "HEAD"); err == nil {
+		add(string(head))
+	} else if !isMissingGitObjectError(err) {
 		return nil, err
 	}
-	headsDir := filepath.Join(gitDir, "refs", "heads")
-	if err := filepath.WalkDir(headsDir, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			if os.IsNotExist(walkErr) {
-				return nil
-			}
-			return walkErr
+	out, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "for-each-ref", "--format=%(objectname)", "refs/heads", "refs/stash")
+	if err != nil {
+		if !isMissingGitObjectError(err) {
+			return nil, err
 		}
-		if d.IsDir() {
-			return nil
+	} else {
+		for _, line := range strings.Split(string(out), "\n") {
+			add(line)
 		}
-		content, err := os.ReadFile(p)
-		if err != nil {
-			return err
-		}
-		add(string(content))
-		return nil
-	}); err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	if stash, err := os.ReadFile(filepath.Join(gitDir, "refs", "stash")); err == nil {
-		add(string(stash))
-	} else if err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	if packed, err := os.ReadFile(filepath.Join(gitDir, "packed-refs")); err == nil {
-		for _, line := range strings.Split(string(packed), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "^") {
-				continue
-			}
-			fields := strings.Fields(line)
-			if len(fields) < 2 {
-				continue
-			}
-			ref := fields[1]
-			if strings.HasPrefix(ref, "refs/heads/") || ref == "refs/stash" {
-				add(fields[0])
-			}
-		}
-	} else if err != nil && !os.IsNotExist(err) {
-		return nil, err
 	}
 	tips := mapKeys(seen)
 	sort.Strings(tips)

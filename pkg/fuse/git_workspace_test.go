@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -46,6 +47,137 @@ type gitWorkspaceFixture struct {
 	readmeSize      int64
 	failTree        bool
 	failOverlay     bool
+}
+
+type gitStateOnlyFixture struct {
+	mu            sync.Mutex
+	states        map[string]client.GitState
+	statePuts     map[string]int
+	objectPacks   map[string]map[string]client.GitObjectPack
+	objectPackPut map[string]int
+	server        *httptest.Server
+}
+
+func newGitStateOnlyFixture(t *testing.T) *gitStateOnlyFixture {
+	t.Helper()
+	f := &gitStateOnlyFixture{
+		states:        make(map[string]client.GitState),
+		statePuts:     make(map[string]int),
+		objectPacks:   make(map[string]map[string]client.GitObjectPack),
+		objectPackPut: make(map[string]int),
+	}
+	f.server = httptest.NewServer(http.HandlerFunc(f.handle))
+	t.Cleanup(f.server.Close)
+	return f
+}
+
+func (f *gitStateOnlyFixture) client() *client.Client {
+	return newTestClient(f.server.URL)
+}
+
+func (f *gitStateOnlyFixture) handle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 3 || parts[0] != "v1" || parts[1] != "git-workspaces" {
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+		return
+	}
+	workspaceID := parts[2]
+	switch {
+	case len(parts) == 4 && parts[3] == "git-state":
+		f.handleGitState(workspaceID, w, r)
+	case len(parts) >= 4 && parts[3] == "object-packs":
+		f.handleObjectPacks(workspaceID, parts[4:], w, r)
+	default:
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+	}
+}
+
+func (f *gitStateOnlyFixture) handleGitState(workspaceID string, w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch r.Method {
+	case http.MethodGet:
+		state, ok := f.states[workspaceID]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(state)
+	case http.MethodPost:
+		var req client.GitStateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		state := client.GitState{
+			WorkspaceID:      workspaceID,
+			CheckpointCommit: req.CheckpointCommit,
+			StorageType:      req.StorageType,
+			ChecksumSHA256:   req.ChecksumSHA256,
+			SizeBytes:        int64(len(req.Content)),
+			Content:          append([]byte(nil), req.Content...),
+			CreatedAt:        time.Now(),
+			UpdatedAt:        time.Now(),
+		}
+		f.states[workspaceID] = state
+		f.statePuts[workspaceID]++
+		_ = json.NewEncoder(w).Encode(state)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+func (f *gitStateOnlyFixture) handleObjectPacks(workspaceID string, tail []string, w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	packs := f.objectPacks[workspaceID]
+	if packs == nil {
+		packs = make(map[string]client.GitObjectPack)
+		f.objectPacks[workspaceID] = packs
+	}
+	switch {
+	case r.Method == http.MethodGet && len(tail) == 0:
+		out := make([]client.GitObjectPack, 0, len(packs))
+		for _, pack := range packs {
+			pack.Content = nil
+			out = append(out, pack)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"packs": out})
+	case r.Method == http.MethodGet && len(tail) == 1:
+		pack, ok := packs[tail[0]]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "not found"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(pack)
+	case r.Method == http.MethodPost && len(tail) == 0:
+		var req client.GitObjectPackRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		sum := sha256.Sum256(req.Content)
+		packID := hex.EncodeToString(sum[:])
+		pack := client.GitObjectPack{
+			WorkspaceID:    workspaceID,
+			PackID:         packID,
+			ChecksumSHA256: packID,
+			SizeBytes:      int64(len(req.Content)),
+			Content:        append([]byte(nil), req.Content...),
+			CreatedAt:      time.Now(),
+		}
+		packs[packID] = pack
+		f.objectPackPut[workspaceID]++
+		pack.Content = nil
+		_ = json.NewEncoder(w).Encode(pack)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 func newGitWorkspaceFixture(t *testing.T) *gitWorkspaceFixture {
@@ -901,6 +1033,215 @@ func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	}
 	if !strings.Contains(string(got), "repositoryformatversion") {
 		t.Fatalf("restored config = %q, want git config", got)
+	}
+}
+
+func TestLinkedGitStatePathMapsToLinkedRuntime(t *testing.T) {
+	fs := &Dat9FS{
+		opts: &MountOptions{EnableGitWorkspaces: true},
+		git:  newGitWorkspaceLayer(),
+	}
+	common := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{WorkspaceID: "base", WorkspaceKind: "main"},
+		localRoot: "/repo",
+	}
+	linked := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID:       "wt",
+			WorkspaceKind:     "linked",
+			CommonWorkspaceID: "base",
+			WorktreeName:      "wt",
+		},
+		localRoot: "/repo-wt",
+	}
+	fs.git.workspaces = []*gitWorkspaceRuntime{linked, common}
+
+	got, rel, ok := fs.loadedGitWorkspaceForGitStatePath("/repo/.git/worktrees/wt/index")
+	if !ok {
+		t.Fatalf("linked git state path was not resolved")
+	}
+	if got != linked {
+		t.Fatalf("runtime = %s, want linked", got.workspace.WorkspaceID)
+	}
+	if rel != ".git/index" {
+		t.Fatalf("rel = %q, want .git/index", rel)
+	}
+}
+
+func TestWriteLinkedGitFileUsesRelativeMountPath(t *testing.T) {
+	localRoot := t.TempDir()
+	overlay := NewLocalOverlay(localRoot)
+	if err := overlay.EnsureRoot(); err != nil {
+		t.Fatalf("EnsureRoot: %v", err)
+	}
+	fs := &Dat9FS{localOverlay: overlay}
+	common := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{WorkspaceID: "base", WorkspaceKind: "main"},
+		localRoot: "/repo",
+	}
+	linked := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID:       "wt",
+			WorkspaceKind:     "linked",
+			CommonWorkspaceID: "base",
+			WorktreeName:      "wt",
+		},
+		localRoot: "/repo-wt",
+	}
+	gitFile, err := overlay.abs("/repo-wt/.git")
+	if err != nil {
+		t.Fatalf("overlay abs: %v", err)
+	}
+	if err := fs.writeLinkedGitFile(linked, common, gitFile); err != nil {
+		t.Fatalf("writeLinkedGitFile: %v", err)
+	}
+	got, err := os.ReadFile(gitFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != "gitdir: ../repo/.git/worktrees/wt\n" {
+		t.Fatalf(".git file = %q", got)
+	}
+}
+
+func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	linkedRepo := createLinkedGitWorktreeForTest(t)
+	commonState, err := archiveLocalGitDir(linkedRepo.commonGitDir)
+	if err != nil {
+		t.Fatalf("archive common git state: %v", err)
+	}
+	linkedState, err := archiveLocalGitDir(linkedRepo.linkedGitDir)
+	if err != nil {
+		t.Fatalf("archive linked git state: %v", err)
+	}
+
+	localRoot := t.TempDir()
+	overlay := NewLocalOverlay(localRoot)
+	if err := overlay.EnsureRoot(); err != nil {
+		t.Fatalf("EnsureRoot: %v", err)
+	}
+	commonGitDir, err := overlay.abs("/repo/.git")
+	if err != nil {
+		t.Fatalf("common git dir: %v", err)
+	}
+	if err := extractGitArchive(commonState, commonGitDir); err != nil {
+		t.Fatalf("extract common git state: %v", err)
+	}
+	if err := os.RemoveAll(filepath.Join(commonGitDir, "worktrees", linkedRepo.worktreeName)); err != nil {
+		t.Fatalf("remove preexisting linked gitdir: %v", err)
+	}
+
+	fixture := newGitStateOnlyFixture(t)
+	fixture.states["linked"] = client.GitState{
+		WorkspaceID:      "linked",
+		CheckpointCommit: linkedRepo.headCommit,
+		StorageType:      gitStateStorageTarGzNoObjects,
+		SizeBytes:        int64(len(linkedState)),
+		Content:          linkedState,
+	}
+	fs, commonRT, linkedRT := newLinkedGitWorkspaceTestFS(localRoot, overlay, fixture.client(), linkedRepo)
+	commonRT.restored = true
+
+	if err := fs.ensureGitStateRestored(context.Background(), linkedRT); err != nil {
+		t.Fatalf("ensure linked git state restored: %v", err)
+	}
+	linkedGitFile := filepath.Join(localRoot, "overlay", "repo-wt", ".git")
+	got, err := os.ReadFile(linkedGitFile)
+	if err != nil {
+		t.Fatalf("read linked .git file: %v", err)
+	}
+	wantGitFile := "gitdir: ../repo/.git/worktrees/" + linkedRepo.worktreeName + "\n"
+	if string(got) != wantGitFile {
+		t.Fatalf("linked .git file = %q, want %q", got, wantGitFile)
+	}
+	restoredLinkedGitDir, err := fs.linkedGitDir(linkedRT, commonRT)
+	if err != nil {
+		t.Fatalf("linked gitdir: %v", err)
+	}
+	if !gitDirLooksUsable(context.Background(), restoredLinkedGitDir) {
+		t.Fatalf("restored linked gitdir is not usable: %s", restoredLinkedGitDir)
+	}
+	gotHead := fuseGitOutputForTest(t, "", "--git-dir", restoredLinkedGitDir, "rev-parse", "HEAD")
+	if gotHead != linkedRepo.headCommit {
+		t.Fatalf("linked HEAD = %s, want %s", gotHead, linkedRepo.headCommit)
+	}
+}
+
+func TestLinkedGitWorkspaceCheckpointUsesLinkedGitdir(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	linkedRepo := createLinkedGitWorktreeForTest(t)
+	commonState, err := archiveLocalGitDir(linkedRepo.commonGitDir)
+	if err != nil {
+		t.Fatalf("archive common git state: %v", err)
+	}
+	linkedState, err := archiveLocalGitDir(linkedRepo.linkedGitDir)
+	if err != nil {
+		t.Fatalf("archive linked git state: %v", err)
+	}
+
+	localRoot := t.TempDir()
+	overlay := NewLocalOverlay(localRoot)
+	if err := overlay.EnsureRoot(); err != nil {
+		t.Fatalf("EnsureRoot: %v", err)
+	}
+	commonGitDir, err := overlay.abs("/repo/.git")
+	if err != nil {
+		t.Fatalf("common git dir: %v", err)
+	}
+	if err := extractGitArchive(commonState, commonGitDir); err != nil {
+		t.Fatalf("extract common git state: %v", err)
+	}
+	linkedGitDir := filepath.Join(commonGitDir, "worktrees", linkedRepo.worktreeName)
+	if err := os.RemoveAll(linkedGitDir); err != nil {
+		t.Fatalf("clear linked gitdir: %v", err)
+	}
+	if err := extractGitArchive(linkedState, linkedGitDir); err != nil {
+		t.Fatalf("extract linked git state: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(linkedGitDir, "commondir"), []byte("../..\n"), 0o644); err != nil {
+		t.Fatalf("rewrite commondir: %v", err)
+	}
+	linkedGitFile := filepath.Join(localRoot, "overlay", "repo-wt", ".git")
+	if err := os.MkdirAll(filepath.Dir(linkedGitFile), 0o755); err != nil {
+		t.Fatalf("mkdir linked worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(linkedGitDir, "gitdir"), []byte(linkedGitFile+"\n"), 0o644); err != nil {
+		t.Fatalf("rewrite linked gitdir file: %v", err)
+	}
+
+	fixture := newGitStateOnlyFixture(t)
+	fs, commonRT, linkedRT := newLinkedGitWorkspaceTestFS(localRoot, overlay, fixture.client(), linkedRepo)
+	commonRT.restored = true
+	linkedRT.restored = true
+	if err := fs.writeLinkedGitFile(linkedRT, commonRT, linkedGitFile); err != nil {
+		t.Fatalf("write linked .git file: %v", err)
+	}
+
+	checkpointPath := "/repo/.git/worktrees/" + linkedRepo.worktreeName + "/index"
+	if err := fs.checkpointGitStateForPath(context.Background(), checkpointPath); err != nil {
+		t.Fatalf("checkpoint linked git state: %v", err)
+	}
+	fixture.mu.Lock()
+	linkedPuts := fixture.statePuts["linked"]
+	commonPuts := fixture.statePuts["base"]
+	state := fixture.states["linked"]
+	fixture.mu.Unlock()
+	if linkedPuts != 1 {
+		t.Fatalf("linked state PUTs = %d, want 1", linkedPuts)
+	}
+	if commonPuts != 0 {
+		t.Fatalf("common state PUTs = %d, want 0", commonPuts)
+	}
+	if state.StorageType != gitStateStorageTarGzNoObjects {
+		t.Fatalf("linked state storage = %q, want %q", state.StorageType, gitStateStorageTarGzNoObjects)
+	}
+	if len(state.Content) == 0 {
+		t.Fatal("linked checkpoint content is empty")
 	}
 }
 
@@ -2259,6 +2600,102 @@ func gitRuntimeForRepo(t *testing.T, repo string) *gitWorkspaceRuntime {
 			},
 		},
 	}
+}
+
+type linkedGitWorktreeForTest struct {
+	sourceRepo     string
+	baseWorktree   string
+	linkedWorktree string
+	commonGitDir   string
+	linkedGitDir   string
+	worktreeName   string
+	headCommit     string
+}
+
+func createLinkedGitWorktreeForTest(t *testing.T) linkedGitWorktreeForTest {
+	t.Helper()
+	sourceRepo := createGitRepoWithReadme(t, []byte("hello base\n"))
+	root := t.TempDir()
+	baseWorktree := filepath.Join(root, "base")
+	linkedWorktree := filepath.Join(root, "linked")
+	runFuseTestGit(t, "", "clone", "--no-checkout", sourceRepo, baseWorktree)
+	headCommit := fuseGitOutputForTest(t, baseWorktree, "rev-parse", "HEAD")
+	runFuseTestGit(t, baseWorktree, "worktree", "add", "--no-checkout", "--detach", linkedWorktree, headCommit)
+	runFuseTestGit(t, linkedWorktree, "read-tree", "--reset", headCommit)
+	linkedGitDir := parseFuseTestGitDirFile(t, filepath.Join(linkedWorktree, ".git"))
+	return linkedGitWorktreeForTest{
+		sourceRepo:     sourceRepo,
+		baseWorktree:   baseWorktree,
+		linkedWorktree: linkedWorktree,
+		commonGitDir:   filepath.Join(baseWorktree, ".git"),
+		linkedGitDir:   linkedGitDir,
+		worktreeName:   filepath.Base(linkedGitDir),
+		headCommit:     headCommit,
+	}
+}
+
+func parseFuseTestGitDirFile(t *testing.T, gitFile string) string {
+	t.Helper()
+	data, err := os.ReadFile(gitFile)
+	if err != nil {
+		t.Fatalf("read %s: %v", gitFile, err)
+	}
+	text := strings.TrimSpace(string(data))
+	const prefix = "gitdir:"
+	if !strings.HasPrefix(text, prefix) {
+		t.Fatalf("%s = %q, want gitdir file", gitFile, text)
+	}
+	target := strings.TrimSpace(strings.TrimPrefix(text, prefix))
+	if target == "" {
+		t.Fatalf("%s has empty gitdir target", gitFile)
+	}
+	if filepath.IsAbs(target) {
+		return filepath.Clean(target)
+	}
+	return filepath.Clean(filepath.Join(filepath.Dir(gitFile), filepath.FromSlash(target)))
+}
+
+func newLinkedGitWorkspaceTestFS(localRoot string, overlay *LocalOverlay, c *client.Client, repo linkedGitWorktreeForTest) (*Dat9FS, *gitWorkspaceRuntime, *gitWorkspaceRuntime) {
+	common := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID:   "base",
+			RootPath:      "/repo/",
+			RepoURL:       repo.sourceRepo,
+			RemoteName:    "origin",
+			BranchName:    "main",
+			BaseCommit:    repo.headCommit,
+			HeadCommit:    repo.headCommit,
+			Mode:          "fast-blobless",
+			WorkspaceKind: "main",
+			Status:        "active",
+		},
+		localRoot: "/repo",
+	}
+	linked := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID:       "linked",
+			RootPath:          "/repo-wt/",
+			RepoURL:           repo.sourceRepo,
+			RemoteName:        "origin",
+			BaseCommit:        repo.headCommit,
+			HeadCommit:        repo.headCommit,
+			Mode:              "fast-blobless",
+			WorkspaceKind:     "linked",
+			CommonWorkspaceID: "base",
+			WorktreeName:      repo.worktreeName,
+			GitDirRel:         path.Join("worktrees", repo.worktreeName),
+			Status:            "active",
+		},
+		localRoot: "/repo-wt",
+	}
+	fs := &Dat9FS{
+		client:       c,
+		opts:         &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true},
+		git:          newGitWorkspaceLayer(),
+		localOverlay: overlay,
+	}
+	fs.git.workspaces = []*gitWorkspaceRuntime{linked, common}
+	return fs, common, linked
 }
 
 func unpackGitPackForTest(t *testing.T, gitDir string, pack []byte) {

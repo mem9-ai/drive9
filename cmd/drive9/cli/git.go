@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -47,6 +48,8 @@ func Git(args []string) error {
 		return gitClone(args[1:])
 	case "hydrate":
 		return gitHydrate(args[1:])
+	case "worktree":
+		return gitWorktree(args[1:])
 	case "-h", "-help", "--help", "help":
 		gitUsage()
 		return nil
@@ -62,6 +65,10 @@ func gitUsage() {
 commands:
   clone --fast [--blobless] [--hydrate=background|sync|off] <repo-url> <mounted-path>
                        create a local .git and register the HEAD tree
+  worktree add --fast [-b <branch>] [--detach] [--blobless] [--hydrate=auto|background|sync|off] <base-repo-path> <worktree-path> [<commit-ish>]
+                       add a linked worktree without checking out file contents
+  worktree remove --fast <worktree-path>
+                       remove a fast linked worktree without per-file whiteouts
   hydrate <mounted-path>
                        materialize a blobless clean tree into local cache
 
@@ -166,31 +173,13 @@ func gitClone(args []string) error {
 		return fmt.Errorf("register git tree manifest: %w", err)
 	}
 	cancel()
-	gitDir := filepath.Join(target, ".git")
-	if resolved.LocalGitDir != "" {
-		if info, statErr := os.Stat(resolved.LocalGitDir); statErr == nil && info.IsDir() {
-			gitDir = resolved.LocalGitDir
-		} else if statErr != nil && !os.IsNotExist(statErr) {
-			return fmt.Errorf("stat local .git checkpoint path: %w", statErr)
-		}
-	}
-	gitState, err := archiveGitStateDir(cmdCtx, gitDir)
+	gitDir, err := mainGitStateDirForTarget(target, resolved)
 	if err != nil {
-		return fmt.Errorf("checkpoint .git: %w", err)
+		return err
 	}
-	sum := sha256.Sum256(gitState)
-	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
-	if _, err := c.UpsertGitState(ctx, ws.WorkspaceID, client.GitStateRequest{
-		CheckpointCommit: head,
-		StorageType:      gitStateStorageTarGzNoObjects,
-		ChecksumSHA256:   hex.EncodeToString(sum[:]),
-		SizeBytes:        int64(len(gitState)),
-		Content:          gitState,
-	}); err != nil {
-		cancel()
-		return fmt.Errorf("upload .git checkpoint: %w", err)
+	if err := uploadGitStateCheckpoint(cmdCtx, c, ws.WorkspaceID, head, gitDir); err != nil {
+		return err
 	}
-	cancel()
 
 	fmt.Fprintf(os.Stderr, "drive9: registered git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, resolved.RemotePath, len(nodes))
 	if *blobless {
@@ -210,6 +199,296 @@ func gitClone(args []string) error {
 			}
 		}
 	}
+	return nil
+}
+
+func gitWorktree(args []string) error {
+	if len(args) == 0 {
+		gitWorktreeUsage()
+		return fmt.Errorf("usage: drive9 git worktree <add|remove> [arguments]")
+	}
+	switch args[0] {
+	case "add":
+		return gitWorktreeAdd(args[1:])
+	case "remove":
+		return gitWorktreeRemove(args[1:])
+	case "-h", "-help", "--help", "help":
+		gitWorktreeUsage()
+		return nil
+	default:
+		gitWorktreeUsage()
+		return fmt.Errorf("drive9 git worktree: unknown command %q", args[0])
+	}
+}
+
+func gitWorktreeUsage() {
+	fmt.Fprintf(os.Stderr, `usage: drive9 git worktree <command> [arguments]
+
+commands:
+  add --fast [-b <branch>] [--detach] [--blobless] [--hydrate=auto|background|sync|off] <base-repo-path> <worktree-path> [<commit-ish>]
+  remove --fast <worktree-path>
+`)
+}
+
+func gitWorktreeAdd(args []string) error {
+	fs := flag.NewFlagSet("git worktree add", flag.ContinueOnError)
+	fast := fs.Bool("fast", false, "use drive9 git fast worktree add")
+	branch := fs.String("b", "", "create a new branch for the worktree")
+	detach := fs.Bool("detach", false, "detach HEAD in the new worktree")
+	blobless := fs.Bool("blobless", false, "require a blobless base workspace")
+	hydrate := fs.String("hydrate", "auto", "blobless clean tree hydrate strategy: auto, background, sync, or off")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: drive9 git worktree add --fast [-b <branch>] [--detach] [--blobless] [--hydrate=auto|background|sync|off] <base-repo-path> <worktree-path> [<commit-ish>]\n\nflags:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !*fast {
+		return fmt.Errorf("drive9 git worktree add currently requires --fast")
+	}
+	if *branch != "" && *detach {
+		return fmt.Errorf("-b and --detach are mutually exclusive")
+	}
+	if fs.NArg() < 2 || fs.NArg() > 3 {
+		fs.Usage()
+		return fmt.Errorf("drive9 git worktree add --fast requires <base-repo-path> <worktree-path> [<commit-ish>]")
+	}
+	basePath := fs.Arg(0)
+	worktreePath := fs.Arg(1)
+	commitish := "HEAD"
+	if fs.NArg() == 3 {
+		commitish = fs.Arg(2)
+	}
+	cmdCtx := context.Background()
+
+	baseResolved, err := resolveMountedGitTarget(basePath)
+	if err != nil {
+		return err
+	}
+	worktreeResolved, err := resolveMountedGitTarget(worktreePath)
+	if err != nil {
+		return err
+	}
+	if !sameDrive9Mount(baseResolved, worktreeResolved) {
+		return fmt.Errorf("base repo and worktree path must be inside the same drive9 mount")
+	}
+
+	c := NewFromEnv()
+	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
+	baseWS, err := c.GetGitWorkspaceByRoot(ctx, baseResolved.RemotePath)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("lookup base git workspace :%s: %w", baseResolved.RemotePath, err)
+	}
+	if baseWS.WorkspaceKind != "" && baseWS.WorkspaceKind != "main" {
+		return fmt.Errorf("base repo must be a main fast workspace, got workspace_kind=%q", baseWS.WorkspaceKind)
+	}
+	linkedBlobless := baseWS.Mode == "fast-blobless"
+	if *blobless && !linkedBlobless {
+		return fmt.Errorf("--blobless requires the base workspace to be fast-blobless")
+	}
+	hydrateMode, err := resolveGitHydrateMode(*hydrate, linkedBlobless)
+	if err != nil {
+		return err
+	}
+	resolvedCommit, err := gitOutput(cmdCtx, basePath, "rev-parse", "--verify", commitish+"^{commit}")
+	if err != nil {
+		return fmt.Errorf("resolve commit %q: %w", commitish, err)
+	}
+
+	worktreeArgs := gitFastWorktreeAddArgs(basePath, worktreePath, *branch, *detach || *branch == "", resolvedCommit)
+	if err := runGitStreaming(cmdCtx, worktreeArgs...); err != nil {
+		return fmt.Errorf("git worktree add failed: %w", err)
+	}
+	if err := initializeFastCloneIndex(cmdCtx, worktreePath, resolvedCommit); err != nil {
+		return err
+	}
+	configureFastCloneGitOptimizations(cmdCtx, worktreePath)
+
+	head, err := gitOutput(cmdCtx, worktreePath, "rev-parse", "HEAD")
+	if err != nil {
+		return fmt.Errorf("git rev-parse HEAD in worktree: %w", err)
+	}
+	branchName, branchErr := gitOutput(cmdCtx, worktreePath, "symbolic-ref", "--short", "-q", "HEAD")
+	if branchErr != nil {
+		branchName = ""
+	}
+	nodes, err := gitListTree(cmdCtx, worktreePath, head)
+	if err != nil {
+		return err
+	}
+	treeSHA, treeErr := gitOutput(cmdCtx, worktreePath, "rev-parse", head+"^{tree}")
+	if treeErr != nil {
+		return fmt.Errorf("git rev-parse HEAD^{tree}: %w", treeErr)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), githubTreeAPITimeout)
+	enriched, enrichErr := enrichGitTreeSizesFromGitHub(ctx, baseWS.RepoURL, treeSHA, nodes)
+	cancel()
+	if enrichErr != nil {
+		fmt.Fprintf(os.Stderr, "drive9: warning: could not enrich GitHub tree sizes: %v\n", enrichErr)
+		if unknown := unknownGitTreeFileSizeCount(nodes); unknown > 0 {
+			fmt.Fprintf(os.Stderr, "drive9: warning: %d git file sizes remain unknown; git status may need to read those blobs lazily\n", unknown)
+		}
+	} else {
+		nodes = enriched
+	}
+
+	linkedGitDir, worktreeName, gitDirRel, err := linkedWorktreeGitDirMetadata(worktreeResolved.LocalGitDir, baseResolved.LocalGitDir)
+	if err != nil {
+		return err
+	}
+	mode := "fast"
+	if linkedBlobless {
+		mode = "fast-blobless"
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
+	ws, err := c.UpsertGitWorkspace(ctx, client.GitWorkspaceRequest{
+		RootPath:          worktreeResolved.RemotePath,
+		RepoURL:           baseWS.RepoURL,
+		RemoteName:        baseWS.RemoteName,
+		BranchName:        branchName,
+		BaseCommit:        head,
+		HeadCommit:        head,
+		Mode:              mode,
+		WorkspaceKind:     "linked",
+		CommonWorkspaceID: baseWS.WorkspaceID,
+		WorktreeName:      worktreeName,
+		GitDirRel:         gitDirRel,
+	})
+	cancel()
+	if err != nil {
+		return fmt.Errorf("register linked git workspace: %w", err)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
+	if err := c.ReplaceGitTree(ctx, ws.WorkspaceID, client.GitTreeReplaceRequest{
+		CommitSHA: head,
+		Nodes:     nodes,
+	}); err != nil {
+		cancel()
+		return fmt.Errorf("register linked git tree manifest: %w", err)
+	}
+	cancel()
+	if err := uploadGitStateCheckpoint(cmdCtx, c, ws.WorkspaceID, head, linkedGitDir); err != nil {
+		return err
+	}
+	baseGitDir, err := mainGitStateDirForTarget(basePath, baseResolved)
+	if err != nil {
+		return err
+	}
+	if err := uploadGitStateCheckpoint(cmdCtx, c, baseWS.WorkspaceID, baseWS.HeadCommit, baseGitDir); err != nil {
+		return fmt.Errorf("checkpoint base .git after worktree add: %w", err)
+	}
+
+	fmt.Fprintf(os.Stderr, "drive9: registered linked git workspace %s at :%s (%d tree entries)\n", ws.WorkspaceID, worktreeResolved.RemotePath, len(nodes))
+	if linkedBlobless {
+		switch hydrateMode {
+		case gitHydrateModeSync:
+			ctx, cancel := context.WithTimeout(context.Background(), gitHydrateTimeout)
+			result, err := hydrateMountedGitTarget(ctx, baseWS.RepoURL, worktreeResolved, ws, nodes)
+			cancel()
+			if err != nil {
+				return fmt.Errorf("hydrate linked clean tree: %w", err)
+			}
+			fmt.Fprintf(os.Stderr, "drive9: hydrated linked clean tree provider=%s files=%d bytes=%d objects=%d object_bytes=%d duration=%s\n",
+				result.Provider, result.Files, result.Bytes, result.Objects, result.ObjectBytes, result.Duration.Truncate(time.Millisecond))
+		case gitHydrateModeBackground:
+			if err := startGitHydrateBackground(cmdCtx, worktreePath, worktreeResolved, ws); err != nil {
+				fmt.Fprintf(os.Stderr, "drive9: warning: could not start background hydrate: %v\n", err)
+			}
+		}
+	}
+	return nil
+}
+
+func gitFastWorktreeAddArgs(basePath, worktreePath, branch string, detach bool, commit string) []string {
+	args := []string{"-C", basePath, "worktree", "add", "--no-checkout"}
+	if branch != "" {
+		args = append(args, "-b", branch)
+	} else if detach {
+		args = append(args, "--detach")
+	}
+	args = append(args, worktreePath)
+	if commit != "" {
+		args = append(args, commit)
+	}
+	return args
+}
+
+func gitWorktreeRemove(args []string) error {
+	fs := flag.NewFlagSet("git worktree remove", flag.ContinueOnError)
+	fast := fs.Bool("fast", false, "use drive9 git fast worktree remove")
+	fs.Usage = func() {
+		fmt.Fprintf(os.Stderr, "usage: drive9 git worktree remove --fast <worktree-path>\n\nflags:\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !*fast {
+		return fmt.Errorf("drive9 git worktree remove currently requires --fast")
+	}
+	if fs.NArg() != 1 {
+		fs.Usage()
+		return fmt.Errorf("drive9 git worktree remove --fast requires <worktree-path>")
+	}
+	target := fs.Arg(0)
+	cmdCtx := context.Background()
+	resolved, err := resolveMountedGitTarget(target)
+	if err != nil {
+		return err
+	}
+	c := NewFromEnv()
+	ctx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
+	ws, err := c.GetGitWorkspaceByRoot(ctx, resolved.RemotePath)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("lookup linked git workspace :%s: %w", resolved.RemotePath, err)
+	}
+	if ws.WorkspaceKind != "linked" {
+		return fmt.Errorf("git workspace :%s is not a linked worktree", resolved.RemotePath)
+	}
+	if strings.TrimSpace(ws.CommonWorkspaceID) == "" {
+		return fmt.Errorf("linked git workspace %s has no common_workspace_id", ws.WorkspaceID)
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
+	commonWS, err := c.GetGitWorkspace(ctx, ws.CommonWorkspaceID)
+	cancel()
+	if err != nil {
+		return fmt.Errorf("lookup common git workspace %s: %w", ws.CommonWorkspaceID, err)
+	}
+	commonLocalPath, err := localPathForRemoteInMount(resolved, commonWS.RootPath)
+	if err != nil {
+		return err
+	}
+	commonResolved, err := resolveMountedGitTarget(commonLocalPath)
+	if err != nil {
+		return err
+	}
+	if commonResolved.LocalGitDir != "" && strings.TrimSpace(ws.WorktreeName) != "" {
+		if err := os.RemoveAll(filepath.Join(commonResolved.LocalGitDir, "worktrees", ws.WorktreeName)); err != nil {
+			return fmt.Errorf("remove common worktree gitdir: %w", err)
+		}
+		_ = gitRun(cmdCtx, commonLocalPath, "worktree", "prune")
+		if err := uploadGitStateCheckpoint(cmdCtx, c, commonWS.WorkspaceID, commonWS.HeadCommit, commonResolved.LocalGitDir); err != nil {
+			return fmt.Errorf("checkpoint common .git after worktree remove: %w", err)
+		}
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
+	if err := c.DeleteGitWorkspace(ctx, ws.WorkspaceID); err != nil {
+		cancel()
+		return fmt.Errorf("delete linked git workspace: %w", err)
+	}
+	cancel()
+	if overlayRoot, err := localOverlayRootForMountedTarget(resolved); err == nil && overlayRoot != "" {
+		if err := os.RemoveAll(overlayRoot); err != nil {
+			return fmt.Errorf("remove linked local overlay root: %w", err)
+		}
+	}
+	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "drive9: warning: could not remove empty worktree root %s: %v\n", target, err)
+	}
+	fmt.Fprintf(os.Stderr, "drive9: removed linked git workspace %s at :%s\n", ws.WorkspaceID, resolved.RemotePath)
 	return nil
 }
 
@@ -292,12 +571,16 @@ func hydrateMountedGitTarget(ctx context.Context, repoURL string, resolved mount
 	if repoURL == "" {
 		repoURL = ws.RepoURL
 	}
+	gitDir := resolved.LocalGitDir
+	if parsed, err := gitDirFromMountedGitPath(resolved.LocalGitDir); err == nil && parsed != "" {
+		gitDir = parsed
+	}
 	return gitcache.Hydrate(ctx, gitcache.HydrateOptions{
 		LocalRoot:   resolved.LocalRoot,
 		WorkspaceID: ws.WorkspaceID,
 		Commit:      ws.HeadCommit,
 		RepoURL:     repoURL,
-		GitDir:      resolved.LocalGitDir,
+		GitDir:      gitDir,
 		Token:       githubTokenForRepoURL(repoURL),
 		TreeEntries: gitcacheEntriesFromClient(nodes),
 	})
@@ -377,6 +660,7 @@ func gitcacheEntriesFromClient(nodes []client.GitTreeNode) []gitcache.HydrateTre
 
 type mountedGitTarget struct {
 	MountPoint  string
+	MountRel    string
 	RemoteRoot  string
 	RemotePath  string
 	Profile     string
@@ -424,6 +708,7 @@ func resolveMountedGitTarget(target string) (mountedGitTarget, error) {
 			}
 			return mountedGitTarget{
 				MountPoint:  absMount,
+				MountRel:    rel,
 				RemoteRoot:  state.RemoteRoot,
 				RemotePath:  remotePath,
 				Profile:     state.Profile,
@@ -453,6 +738,164 @@ func localGitDirForMountedTarget(localRoot, rel string) (string, error) {
 		localPath = filepath.Join(localPath, rel)
 	}
 	return filepath.Join(localPath, ".git"), nil
+}
+
+func localOverlayRootForMountedTarget(resolved mountedGitTarget) (string, error) {
+	localRoot := strings.TrimSpace(resolved.LocalRoot)
+	if localRoot == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(localRoot) {
+		return "", fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
+	}
+	localPath := filepath.Join(localRoot, "overlay")
+	if resolved.MountRel != "" && resolved.MountRel != "." {
+		localPath = filepath.Join(localPath, resolved.MountRel)
+	}
+	return localPath, nil
+}
+
+func sameDrive9Mount(a, b mountedGitTarget) bool {
+	return filepath.Clean(a.MountPoint) == filepath.Clean(b.MountPoint) &&
+		strings.TrimRight(a.RemoteRoot, "/") == strings.TrimRight(b.RemoteRoot, "/") &&
+		filepath.Clean(a.LocalRoot) == filepath.Clean(b.LocalRoot)
+}
+
+func localPathForRemoteInMount(anchor mountedGitTarget, remotePath string) (string, error) {
+	remote, err := pathutil.CanonicalizeDir(remotePath)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize remote path: %w", err)
+	}
+	root, err := pathutil.CanonicalizeDir(anchor.RemoteRoot)
+	if err != nil {
+		return "", fmt.Errorf("canonicalize mount remote root: %w", err)
+	}
+	cleanRemote := pathpkg.Clean(remote)
+	cleanRoot := pathpkg.Clean(root)
+	rel := ""
+	if cleanRoot == "/" {
+		rel = strings.TrimPrefix(cleanRemote, "/")
+	} else {
+		if cleanRemote != cleanRoot && !strings.HasPrefix(cleanRemote, cleanRoot+"/") {
+			return "", fmt.Errorf("remote path %s is outside mounted remote root %s", remote, root)
+		}
+		rel = strings.TrimPrefix(cleanRemote, cleanRoot)
+		rel = strings.TrimPrefix(rel, "/")
+	}
+	if rel == "" {
+		return anchor.MountPoint, nil
+	}
+	return filepath.Join(anchor.MountPoint, filepath.FromSlash(rel)), nil
+}
+
+func mainGitStateDirForTarget(target string, resolved mountedGitTarget) (string, error) {
+	gitDir := filepath.Join(target, ".git")
+	if resolved.LocalGitDir == "" {
+		return gitDir, nil
+	}
+	info, err := os.Stat(resolved.LocalGitDir)
+	if err == nil {
+		if !info.IsDir() {
+			return "", fmt.Errorf("local .git checkpoint path %s is not a directory", resolved.LocalGitDir)
+		}
+		return resolved.LocalGitDir, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", fmt.Errorf("stat local .git checkpoint path: %w", err)
+	}
+	return gitDir, nil
+}
+
+func uploadGitStateCheckpoint(ctx context.Context, c *client.Client, workspaceID, checkpointCommit, gitDir string) error {
+	gitState, err := archiveGitStateDir(ctx, gitDir)
+	if err != nil {
+		return fmt.Errorf("checkpoint .git: %w", err)
+	}
+	sum := sha256.Sum256(gitState)
+	apiCtx, cancel := context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
+	defer cancel()
+	if _, err := c.UpsertGitState(apiCtx, workspaceID, client.GitStateRequest{
+		CheckpointCommit: checkpointCommit,
+		StorageType:      gitStateStorageTarGzNoObjects,
+		ChecksumSHA256:   hex.EncodeToString(sum[:]),
+		SizeBytes:        int64(len(gitState)),
+		Content:          gitState,
+	}); err != nil {
+		return fmt.Errorf("upload .git checkpoint: %w", err)
+	}
+	return nil
+}
+
+func linkedWorktreeGitDirMetadata(gitFile, commonGitDir string) (gitDir string, worktreeName string, gitDirRel string, err error) {
+	if strings.TrimSpace(gitFile) == "" {
+		return "", "", "", fmt.Errorf("linked worktree .git file path is unavailable")
+	}
+	data, err := os.ReadFile(gitFile)
+	if err != nil {
+		return "", "", "", fmt.Errorf("read linked worktree .git file: %w", err)
+	}
+	gitDir, err = parseGitDirFile(data, filepath.Dir(gitFile))
+	if err != nil {
+		return "", "", "", err
+	}
+	info, err := os.Stat(gitDir)
+	if err != nil {
+		return "", "", "", fmt.Errorf("stat linked worktree gitdir: %w", err)
+	}
+	if !info.IsDir() {
+		return "", "", "", fmt.Errorf("linked worktree gitdir %s is not a directory", gitDir)
+	}
+	worktreeName = filepath.Base(gitDir)
+	if worktreeName == "." || worktreeName == string(filepath.Separator) || worktreeName == "" {
+		return "", "", "", fmt.Errorf("could not derive linked worktree name from gitdir %s", gitDir)
+	}
+	gitDirRel = filepath.ToSlash(filepath.Join("worktrees", worktreeName))
+	if commonGitDir != "" {
+		if rel, relErr := filepath.Rel(commonGitDir, gitDir); relErr == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
+			gitDirRel = filepath.ToSlash(rel)
+		}
+	}
+	return gitDir, worktreeName, gitDirRel, nil
+}
+
+func gitDirFromMountedGitPath(gitPath string) (string, error) {
+	if strings.TrimSpace(gitPath) == "" {
+		return "", nil
+	}
+	info, err := os.Stat(gitPath)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return gitPath, nil
+	}
+	data, err := os.ReadFile(gitPath)
+	if err != nil {
+		return "", err
+	}
+	return parseGitDirFile(data, filepath.Dir(gitPath))
+}
+
+func parseGitDirFile(data []byte, baseDir string) (string, error) {
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		gitDir, ok := strings.CutPrefix(line, "gitdir:")
+		if !ok {
+			continue
+		}
+		gitDir = strings.TrimSpace(gitDir)
+		if gitDir == "" {
+			return "", fmt.Errorf("linked worktree .git file has empty gitdir")
+		}
+		if !filepath.IsAbs(gitDir) {
+			gitDir = filepath.Join(baseDir, gitDir)
+		}
+		return filepath.Clean(gitDir), nil
+	}
+	return "", fmt.Errorf("linked worktree .git file does not contain gitdir")
 }
 
 func relToMountedTarget(absTarget, mountPoint string) (absMount string, rel string, ok bool, err error) {

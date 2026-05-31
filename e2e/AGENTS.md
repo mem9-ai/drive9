@@ -226,7 +226,12 @@ developer machines or EC2-style validation rather than the default smoke path.
    `git add`/`commit`
 7. Sandbox restore scenario: stage tracked and generated edits, unmount, remount
    with a fresh local root, and verify `.git` plus dirty status survive restore
-8. Audit mount logs for fatal FUSE/Git workspace patterns such as short reads
+8. Fast worktree scenario: clone a base workspace, run
+   `drive9 git worktree add --fast --blobless`, commit in the linked worktree,
+   leave another staged edit and unstaged file, unmount, remount with a fresh
+   local root, verify `git worktree list`/`status`/`log`, then remove the
+   linked workspace with `drive9 git worktree remove --fast`
+9. Audit mount logs for fatal FUSE/Git workspace patterns such as short reads
 
 ### `posix-permission-smoke-test.sh`
 
@@ -302,7 +307,7 @@ developer machines or EC2-style validation rather than the default smoke path.
 | `RUN_FUSE_LOG_AUDIT` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `RUN_GIT_WORKSPACE_SMOKE` | `0` | `smoke-all.sh` |
 | `GIT_WORKSPACE_REPOS` | `drive9=...,kimi-cli=...,kimi-code=...` | `git-workspace-smoke-test.sh` |
-| `GIT_WORKSPACE_SCENARIOS` | `agent_edit_add_commit,agent_patch_apply,sandbox_restore` | `git-workspace-smoke-test.sh` |
+| `GIT_WORKSPACE_SCENARIOS` | `agent_edit_add_commit,agent_patch_apply,sandbox_restore,fast_worktree` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_EXISTING_FILES` | `20` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_NEW_FILES` | `20` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_PATCH_FILES` | `20` | `git-workspace-smoke-test.sh` |

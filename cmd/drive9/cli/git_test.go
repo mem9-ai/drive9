@@ -116,6 +116,17 @@ func TestGitFastCloneArgs(t *testing.T) {
 	}
 }
 
+func TestGitFastWorktreeAddArgs(t *testing.T) {
+	args := gitFastWorktreeAddArgs("/mnt/base", "/mnt/wt", "feature", false, "abc123")
+	if got, want := strings.Join(args, " "), "-C /mnt/base worktree add --no-checkout -b feature /mnt/wt abc123"; got != want {
+		t.Fatalf("branch worktree args = %q, want %q", got, want)
+	}
+	args = gitFastWorktreeAddArgs("/mnt/base", "/mnt/wt", "", true, "abc123")
+	if got, want := strings.Join(args, " "), "-C /mnt/base worktree add --no-checkout --detach /mnt/wt abc123"; got != want {
+		t.Fatalf("detached worktree args = %q, want %q", got, want)
+	}
+}
+
 func TestResolveGitHydrateMode(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -276,6 +287,18 @@ func TestArchiveGitStateDirSkipsObjectDatabases(t *testing.T) {
 	}
 }
 
+func TestParseGitDirFileResolvesRelativeGitDir(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "worktree")
+	got, err := parseGitDirFile([]byte("gitdir: ../repo/.git/worktrees/wt\n"), base)
+	if err != nil {
+		t.Fatalf("parseGitDirFile: %v", err)
+	}
+	want := filepath.Clean(filepath.Join(base, "../repo/.git/worktrees/wt"))
+	if got != want {
+		t.Fatalf("gitdir = %q, want %q", got, want)
+	}
+}
+
 func TestResolveMountedGitTargetUsesMountMetadata(t *testing.T) {
 	mountPoint := t.TempDir()
 	localRoot := t.TempDir()
@@ -305,6 +328,25 @@ func TestResolveMountedGitTargetUsesMountMetadata(t *testing.T) {
 	wantLocalGitDir := filepath.Join(localRoot, "overlay", "repos", "drive9", ".git")
 	if resolved.LocalGitDir != wantLocalGitDir {
 		t.Fatalf("LocalGitDir = %q, want %q", resolved.LocalGitDir, wantLocalGitDir)
+	}
+}
+
+func TestLocalPathForRemoteInMount(t *testing.T) {
+	mountPoint := t.TempDir()
+	resolved := mountedGitTarget{
+		MountPoint: mountPoint,
+		RemoteRoot: "/remote/root/",
+	}
+	got, err := localPathForRemoteInMount(resolved, "/remote/root/repos/wt/")
+	if err != nil {
+		t.Fatalf("localPathForRemoteInMount: %v", err)
+	}
+	want := filepath.Join(mountPoint, "repos", "wt")
+	if got != want {
+		t.Fatalf("local path = %q, want %q", got, want)
+	}
+	if _, err := localPathForRemoteInMount(resolved, "/other/repos/wt/"); err == nil {
+		t.Fatalf("localPathForRemoteInMount outside root err = nil, want error")
 	}
 }
 

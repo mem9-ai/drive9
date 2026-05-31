@@ -26,27 +26,35 @@ const (
 )
 
 type gitWorkspaceRequest struct {
-	RootPath   string `json:"root_path"`
-	RepoURL    string `json:"repo_url"`
-	RemoteName string `json:"remote_name,omitempty"`
-	BranchName string `json:"branch_name,omitempty"`
-	BaseCommit string `json:"base_commit,omitempty"`
-	HeadCommit string `json:"head_commit,omitempty"`
-	Mode       string `json:"mode,omitempty"`
+	RootPath          string `json:"root_path"`
+	RepoURL           string `json:"repo_url"`
+	RemoteName        string `json:"remote_name,omitempty"`
+	BranchName        string `json:"branch_name,omitempty"`
+	BaseCommit        string `json:"base_commit,omitempty"`
+	HeadCommit        string `json:"head_commit,omitempty"`
+	Mode              string `json:"mode,omitempty"`
+	WorkspaceKind     string `json:"workspace_kind,omitempty"`
+	CommonWorkspaceID string `json:"common_workspace_id,omitempty"`
+	WorktreeName      string `json:"worktree_name,omitempty"`
+	GitDirRel         string `json:"gitdir_rel,omitempty"`
 }
 
 type gitWorkspaceResponse struct {
-	WorkspaceID string    `json:"workspace_id"`
-	RootPath    string    `json:"root_path"`
-	RepoURL     string    `json:"repo_url"`
-	RemoteName  string    `json:"remote_name"`
-	BranchName  string    `json:"branch_name"`
-	BaseCommit  string    `json:"base_commit"`
-	HeadCommit  string    `json:"head_commit"`
-	Mode        string    `json:"mode"`
-	Status      string    `json:"status"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	WorkspaceID       string    `json:"workspace_id"`
+	RootPath          string    `json:"root_path"`
+	RepoURL           string    `json:"repo_url"`
+	RemoteName        string    `json:"remote_name"`
+	BranchName        string    `json:"branch_name"`
+	BaseCommit        string    `json:"base_commit"`
+	HeadCommit        string    `json:"head_commit"`
+	Mode              string    `json:"mode"`
+	WorkspaceKind     string    `json:"workspace_kind"`
+	CommonWorkspaceID string    `json:"common_workspace_id"`
+	WorktreeName      string    `json:"worktree_name"`
+	GitDirRel         string    `json:"gitdir_rel"`
+	Status            string    `json:"status"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
 }
 
 type gitTreeReplaceRequest struct {
@@ -194,6 +202,56 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 	if req.BaseCommit == "" {
 		req.BaseCommit = req.HeadCommit
 	}
+	workspaceKind := datastore.GitWorkspaceKind(strings.TrimSpace(req.WorkspaceKind))
+	if workspaceKind == "" {
+		workspaceKind = datastore.GitWorkspaceKindMain
+	}
+	switch workspaceKind {
+	case datastore.GitWorkspaceKindMain, datastore.GitWorkspaceKindLinked:
+	default:
+		errJSON(w, http.StatusBadRequest, "invalid workspace_kind")
+		return
+	}
+	commonWorkspaceID := strings.TrimSpace(req.CommonWorkspaceID)
+	worktreeName := strings.TrimSpace(req.WorktreeName)
+	gitDirRel := strings.TrimSpace(req.GitDirRel)
+	if workspaceKind == datastore.GitWorkspaceKindLinked {
+		if commonWorkspaceID == "" {
+			errJSON(w, http.StatusBadRequest, "common_workspace_id is required for linked git workspaces")
+			return
+		}
+		if worktreeName == "" {
+			errJSON(w, http.StatusBadRequest, "worktree_name is required for linked git workspaces")
+			return
+		}
+		if err := validateGitWorktreeName(worktreeName); err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid worktree_name: "+err.Error())
+			return
+		}
+		if gitDirRel != "" {
+			if err := validateGitMetadataRelativePath(gitDirRel); err != nil {
+				errJSON(w, http.StatusBadRequest, "invalid gitdir_rel: "+err.Error())
+				return
+			}
+		}
+		common, err := store.GetGitWorkspace(r.Context(), commonWorkspaceID)
+		if err != nil {
+			if errors.Is(err, datastore.ErrNotFound) {
+				errJSON(w, http.StatusBadRequest, "common_workspace_id does not reference an active workspace")
+				return
+			}
+			writeGitWorkspaceStoreError(w, err)
+			return
+		}
+		if common.Status != datastore.GitWorkspaceStatusLive || common.Kind == datastore.GitWorkspaceKindLinked {
+			errJSON(w, http.StatusBadRequest, "common_workspace_id does not reference an active main workspace")
+			return
+		}
+	} else {
+		commonWorkspaceID = ""
+		worktreeName = ""
+		gitDirRel = ""
+	}
 
 	workspaceID := token.NewID()
 	existing, err := store.GetGitWorkspaceByRoot(r.Context(), root)
@@ -204,15 +262,19 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 		return
 	}
 	ws := datastore.GitWorkspace{
-		WorkspaceID: workspaceID,
-		RootPath:    root,
-		RepoURL:     repoURL,
-		RemoteName:  strings.TrimSpace(req.RemoteName),
-		BranchName:  strings.TrimSpace(req.BranchName),
-		BaseCommit:  strings.TrimSpace(req.BaseCommit),
-		HeadCommit:  strings.TrimSpace(req.HeadCommit),
-		Mode:        datastore.GitWorkspaceMode(strings.TrimSpace(req.Mode)),
-		Status:      datastore.GitWorkspaceStatusLive,
+		WorkspaceID:  workspaceID,
+		RootPath:     root,
+		RepoURL:      repoURL,
+		RemoteName:   strings.TrimSpace(req.RemoteName),
+		BranchName:   strings.TrimSpace(req.BranchName),
+		BaseCommit:   strings.TrimSpace(req.BaseCommit),
+		HeadCommit:   strings.TrimSpace(req.HeadCommit),
+		Mode:         datastore.GitWorkspaceMode(strings.TrimSpace(req.Mode)),
+		Kind:         workspaceKind,
+		CommonID:     commonWorkspaceID,
+		WorktreeName: worktreeName,
+		GitDirRel:    gitDirRel,
+		Status:       datastore.GitWorkspaceStatusLive,
 	}
 	if ws.RemoteName == "" {
 		ws.RemoteName = "origin"
@@ -721,6 +783,46 @@ func validateInlineContentMetadata(content []byte, sizeBytes int64, checksumSHA2
 	return nil
 }
 
+func validateGitWorktreeName(name string) error {
+	if name == "" {
+		return fmt.Errorf("name is required")
+	}
+	if len(name) > 255 {
+		return fmt.Errorf("name exceeds 255 bytes")
+	}
+	if strings.ContainsRune(name, '\x00') {
+		return fmt.Errorf("name contains NUL")
+	}
+	if strings.ContainsAny(name, `/\`) || name == "." || name == ".." {
+		return fmt.Errorf("name must be a single safe path segment")
+	}
+	return nil
+}
+
+func validateGitMetadataRelativePath(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	if len(raw) > 1024 {
+		return fmt.Errorf("path exceeds 1024 bytes")
+	}
+	if strings.HasPrefix(raw, "/") {
+		return fmt.Errorf("path must be relative")
+	}
+	if strings.ContainsRune(raw, '\x00') || strings.ContainsRune(raw, '\\') {
+		return fmt.Errorf("path contains invalid character")
+	}
+	for _, part := range strings.Split(raw, "/") {
+		if part == "" || part == "." || part == ".." {
+			return fmt.Errorf("path contains invalid segment %q", part)
+		}
+		if len(part) > 255 {
+			return fmt.Errorf("path segment exceeds 255 bytes")
+		}
+	}
+	return nil
+}
+
 func writeGitWorkspaceStoreError(w http.ResponseWriter, err error) {
 	if errors.Is(err, datastore.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "not found")
@@ -731,17 +833,21 @@ func writeGitWorkspaceStoreError(w http.ResponseWriter, err error) {
 
 func toGitWorkspaceResponse(ws *datastore.GitWorkspace) gitWorkspaceResponse {
 	return gitWorkspaceResponse{
-		WorkspaceID: ws.WorkspaceID,
-		RootPath:    ws.RootPath,
-		RepoURL:     ws.RepoURL,
-		RemoteName:  ws.RemoteName,
-		BranchName:  ws.BranchName,
-		BaseCommit:  ws.BaseCommit,
-		HeadCommit:  ws.HeadCommit,
-		Mode:        string(ws.Mode),
-		Status:      string(ws.Status),
-		CreatedAt:   ws.CreatedAt,
-		UpdatedAt:   ws.UpdatedAt,
+		WorkspaceID:       ws.WorkspaceID,
+		RootPath:          ws.RootPath,
+		RepoURL:           ws.RepoURL,
+		RemoteName:        ws.RemoteName,
+		BranchName:        ws.BranchName,
+		BaseCommit:        ws.BaseCommit,
+		HeadCommit:        ws.HeadCommit,
+		Mode:              string(ws.Mode),
+		WorkspaceKind:     string(ws.Kind),
+		CommonWorkspaceID: ws.CommonID,
+		WorktreeName:      ws.WorktreeName,
+		GitDirRel:         ws.GitDirRel,
+		Status:            string(ws.Status),
+		CreatedAt:         ws.CreatedAt,
+		UpdatedAt:         ws.UpdatedAt,
 	}
 }
 
