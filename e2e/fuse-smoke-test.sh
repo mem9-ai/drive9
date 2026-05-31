@@ -782,6 +782,12 @@ if is_mounted "$MOUNT_POINT"; then
   else
     check_eq "remote hardlink nlink is 2" "" "2"
   fi
+  if source_resource_id=$(stat_field "$RW_TEXT_REMOTE" "resource_id") && hardlink_resource_id=$(stat_field "$RW_HARDLINK_REMOTE" "resource_id"); then
+    check_cmd "remote source resource_id is non-empty" test -n "$source_resource_id"
+    check_eq "remote hardlink shares resource_id" "$hardlink_resource_id" "$source_resource_id"
+  else
+    check_eq "remote hardlink resource_id fields are available" "false" "true"
+  fi
   if [ -f "$RW_HARDLINK_MOUNT" ]; then
     printf "hardlink-%s" "$TS" > "$RW_HARDLINK_MOUNT"
     hardlink_source_cat=$(cat "$RW_TEXT_MOUNT")

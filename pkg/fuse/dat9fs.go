@@ -1410,6 +1410,17 @@ func isNotFoundErr(err error) bool {
 	return strings.Contains(msg, "not found") || strings.Contains(msg, "HTTP 404")
 }
 
+func isForbiddenErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se *client.StatusError
+	if errors.As(err, &se) && se.StatusCode == http.StatusForbidden {
+		return true
+	}
+	return strings.Contains(err.Error(), "HTTP 403")
+}
+
 func isTransientLookupErr(err error) bool {
 	if err == nil {
 		return false
@@ -2001,6 +2012,60 @@ func (fs *Dat9FS) remotePathStatDetached(localPath string) (*client.StatResult, 
 	return stat, err
 }
 
+func (fs *Dat9FS) remoteHardlinkCommittedDetached(srcP, dstP string) bool {
+	dstStat, err := fs.remotePathStatDetached(dstP)
+	if err != nil || dstStat == nil || dstStat.IsDir || dstStat.ResourceID == "" {
+		return false
+	}
+	srcStat, err := fs.remotePathStatDetached(srcP)
+	if err != nil || srcStat == nil || srcStat.IsDir || srcStat.ResourceID == "" {
+		return false
+	}
+	return srcStat.ResourceID == dstStat.ResourceID
+}
+
+func (fs *Dat9FS) hardlinkRemoteWithTransientRecovery(ctx context.Context, srcP, dstP string) error {
+	srcRemote := fs.remotePath(srcP)
+	dstRemote := fs.remotePath(dstP)
+	mutationStart := fs.perfStart()
+	err := fs.client.HardlinkCtx(ctx, srcRemote, dstRemote)
+	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
+	if err == nil || !isTransientLookupErr(err) {
+		return err
+	}
+	if fs.remoteHardlinkCommittedDetached(srcP, dstP) {
+		return nil
+	}
+
+	retryCount := fs.lookupStatRetryCount()
+	if retryCount <= 0 {
+		return err
+	}
+
+	lastErr := err
+	for range retryCount {
+		retryCtx, retryCancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+		mutationStart = fs.perfStart()
+		err = fs.client.HardlinkCtx(retryCtx, srcRemote, dstRemote)
+		retryCancel()
+		fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
+		if err == nil {
+			return nil
+		}
+		if isConflictErr(err) && fs.remoteHardlinkCommittedDetached(srcP, dstP) {
+			return nil
+		}
+		if !isTransientLookupErr(err) {
+			return err
+		}
+		if fs.remoteHardlinkCommittedDetached(srcP, dstP) {
+			return nil
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
 func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string, mode uint32) error {
 	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
@@ -2150,7 +2215,7 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 		if mtime.IsZero() {
 			mtime = time.Now()
 		}
-		ino := fs.inodes.Lookup(childP, item.IsDir, item.Size, mtime)
+		ino := fs.inodes.LookupWithIdentity(childP, item.ResourceID, item.Nlink, item.IsDir, item.Size, mtime)
 		if item.Revision > 0 {
 			fs.inodes.UpdateRevision(ino, item.Revision)
 		}
@@ -2463,6 +2528,51 @@ func (fs *Dat9FS) hasPendingLocalState(p string) bool {
 
 func (fs *Dat9FS) hasQueuedCommit(p string) bool {
 	return fs.commitQueue != nil && fs.commitQueue.HasPath(p)
+}
+
+func (fs *Dat9FS) syncOpenSourceForHardlink(ctx context.Context, ino uint64) gofuse.Status {
+	type candidate struct {
+		fh       *FileHandle
+		dirtySeq uint64
+	}
+
+	var candidates []candidate
+	for _, fh := range fs.openHandles.SnapshotInode(ino) {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		needsSync := fh.Dirty != nil && (fh.IsNew || fh.Dirty.HasDirtyParts())
+		dirtySeq := fh.DirtySeq
+		fh.Unlock()
+		if needsSync {
+			candidates = append(candidates, candidate{fh: fh, dirtySeq: dirtySeq})
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].dirtySeq < candidates[j].dirtySeq
+	})
+
+	for _, c := range candidates {
+		fh := c.fh
+		fh.Lock()
+		if fh.Dirty == nil || (!fh.IsNew && !fh.Dirty.HasDirtyParts()) {
+			fh.Unlock()
+			continue
+		}
+		size := fh.Dirty.Size()
+		if fs.debouncer != nil {
+			fs.debouncer.Cancel(fh.Path)
+		}
+		syncCtx, cancel := context.WithTimeout(ctx, releaseTimeout(size))
+		st := fs.syncHandleToRemoteLocked(syncCtx, fh)
+		cancel()
+		fh.Unlock()
+		if st != gofuse.OK {
+			return st
+		}
+	}
+	return gofuse.OK
 }
 
 func (fs *Dat9FS) openHandleEntry(p string) (*InodeEntry, bool) {
@@ -3103,6 +3213,12 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	if _, rel, handled := fs.gitWorkspaceForPath(ctx, dstP); handled && rel != "" {
 		return gofuse.Status(syscall.ENOTSUP)
 	}
+	if fs.openHandles.Has(0, dstP) {
+		return gofuse.Status(syscall.EEXIST)
+	}
+	if st := fs.syncOpenSourceForHardlink(ctx, input.Oldnodeid); st != gofuse.OK {
+		return st
+	}
 	if fs.hasPendingLocalState(dstP) || fs.hasQueuedCommit(dstP) {
 		return gofuse.Status(syscall.EEXIST)
 	}
@@ -3121,15 +3237,12 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 		}
 	}
 
-	mutationStart := fs.perfStart()
-	err := fs.client.HardlinkCtx(ctx, fs.remotePath(srcP), fs.remotePath(dstP))
-	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
-	if err != nil {
+	if err := fs.hardlinkRemoteWithTransientRecovery(ctx, srcP, dstP); err != nil {
 		return httpToFuseStatus(err)
 	}
 
 	stat, err := fs.client.StatCtx(ctx, fs.remotePath(dstP))
-	if err != nil {
+	if err != nil && !isForbiddenErr(err) {
 		return httpToFuseStatus(err)
 	}
 	mtime := time.Now()
@@ -3206,7 +3319,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if err := overlay.Remove(childP); err != nil {
 			return localErrToFuseStatus(err)
 		}
-		fs.inodes.Remove(childP)
+		fs.inodes.RemoveLink(childP)
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.cacheNegativePath(childP)
@@ -3306,7 +3419,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 	}
 
-	fs.inodes.Remove(childP)
+	fs.inodes.RemoveLink(childP)
 	fs.invalidateReadCacheAndTargets(childP)
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
@@ -5391,7 +5504,13 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 // Caller must hold fh.mu. The method may temporarily release fh.mu around
 // network I/O, matching flushHandle's locking contract.
 func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
-	if fh == nil || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
+	if fh == nil || fh.Dirty == nil {
+		return gofuse.OK
+	}
+	if !fh.Dirty.HasDirtyParts() {
+		if fh.IsNew && fh.Dirty.Size() == 0 {
+			return fs.createEmptyHandleRemoteLocked(ctx, fh)
+		}
 		return gofuse.OK
 	}
 
@@ -5439,6 +5558,54 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 	}
 
 	return fs.flushHandle(ctx, fh)
+}
+
+func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
+	expectedRevision := expectedRevisionForHandle(fh)
+	writeStart := time.Now()
+	fs.debugf("sync empty create start path=%s expected_rev=%d", fh.Path, expectedRevision)
+	committedRev, err := fs.client.CreateFileCtx(ctx, fs.remotePath(fh.Path))
+	if isCreateActionUnsupportedErr(err) {
+		fs.debugf("sync empty create unsupported path=%s fallback=small-write err=%v", fh.Path, err)
+		committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), nil, expectedRevision)
+	}
+	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
+	fs.debugDurationf(writeStart, 0, "sync empty create done path=%s committed_rev=%d err=%v", fh.Path, committedRev, err)
+	if err != nil {
+		log.Printf("sync empty create failed for %s: %v", fh.Path, err)
+		return httpToFuseStatus(err)
+	}
+	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+		log.Printf("sync empty create pending chmod failed for %s: %v", fh.Path, err)
+		return httpToFuseStatus(err)
+	}
+
+	if fh.DirtySeq != 0 {
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fh.DirtySeq = 0
+	}
+	clearReadTargetForLockedHandle(fh)
+	if committedRev > 0 {
+		fh.IsNew = false
+		fh.BaseRev = committedRev
+		fs.inodes.UpdateRevision(fh.Ino, committedRev)
+		fs.readCache.Put(fh.Path, nil, committedRev)
+	} else {
+		fs.finalizeHandleFlushLocked(fh, expectedRevision)
+		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+	}
+	fs.inodes.UpdateSize(fh.Ino, 0)
+	fs.cacheFileForPath(fh.Path, 0, time.Now(), committedRev)
+	if fs.shadowStore != nil {
+		fs.shadowStore.Remove(fh.Path)
+		fh.ShadowReady = false
+		fh.ShadowSpill = false
+		fh.ShadowCommitReady = false
+	}
+	if fs.pendingIndex != nil {
+		fs.pendingIndex.Remove(fh.Path)
+	}
+	return gofuse.OK
 }
 
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status gofuse.Status) {

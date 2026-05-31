@@ -52,9 +52,9 @@ func TestInodeHardlinkAliasesShareIdentity(t *testing.T) {
 		t.Fatalf("entry paths missing /b.txt: %+v", entry.Paths)
 	}
 
-	m.Remove("/a.txt")
+	m.RemoveLink("/a.txt")
 	if _, ok := m.GetInode("/a.txt"); ok {
-		t.Fatal("/a.txt mapping survived Remove")
+		t.Fatal("/a.txt mapping survived RemoveLink")
 	}
 	if got, ok := m.GetInode("/b.txt"); !ok || got != inoA {
 		t.Fatalf("/b.txt inode = %d/%v, want %d/true", got, ok, inoA)
@@ -65,6 +65,25 @@ func TestInodeHardlinkAliasesShareIdentity(t *testing.T) {
 	}
 	if entry.Nlink != 1 {
 		t.Fatalf("nlink after removing one alias = %d, want 1", entry.Nlink)
+	}
+}
+
+func TestInodeRemoveMappingDoesNotConsumeLink(t *testing.T) {
+	m := NewInodeToPath()
+	now := time.Now()
+
+	inoA := m.LookupWithIdentity("/a.txt", "file-1", 2, false, 10, now)
+	inoB := m.LookupWithIdentity("/b.txt", "file-1", 2, false, 10, now)
+	if inoA != inoB {
+		t.Fatalf("hardlink aliases got different inodes: %d != %d", inoA, inoB)
+	}
+	m.Remove("/a.txt")
+	entry, ok := m.GetEntry(inoA)
+	if !ok {
+		t.Fatal("entry removed while alias still exists")
+	}
+	if entry.Nlink != 2 {
+		t.Fatalf("nlink after mapping removal = %d, want 2", entry.Nlink)
 	}
 }
 

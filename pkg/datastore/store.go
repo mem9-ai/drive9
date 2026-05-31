@@ -524,9 +524,32 @@ func (s *Store) LinkFileNode(ctx context.Context, srcPath, dstPath, dstParentPat
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	if err := s.LinkFileNodeTx(ctx, tx, srcPath, dstPath, dstParentPath, dstName, nodeID, createdAt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// LinkFileNodeTx creates a hardlink node inside an existing transaction.
+func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath, dstParentPath, dstName, nodeID string, createdAt time.Time) error {
+	if dstParentPath != "/" {
+		var parentIsDir bool
+		err := db.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, dstParentPath).
+			Scan(&parentIsDir)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if !parentIsDir {
+			return ErrNotFound
+		}
+	}
+
 	var fileID, inodeID sql.NullString
 	var isDir bool
-	err = tx.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, srcPath).
+	err := db.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, srcPath).
 		Scan(&fileID, &inodeID, &isDir)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -540,14 +563,14 @@ func (s *Store) LinkFileNode(ctx context.Context, srcPath, dstPath, dstParentPat
 	if !fileID.Valid || fileID.String == "" {
 		return ErrNotFound
 	}
-	if err := s.lockConfirmedFileForAttachTx(tx, fileID.String); err != nil {
+	if err := s.lockConfirmedFileForAttachTx(db, fileID.String); err != nil {
 		return err
 	}
 	linkInodeID := fileID.String
 	if inodeID.Valid && inodeID.String != "" {
 		linkInodeID = inodeID.String
 	}
-	_, err = tx.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at)
+	_, err = db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at)
 		VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
 		nodeID, dstPath, dstParentPath, dstName, fileID.String, linkInodeID, createdAt.UTC())
 	if isUniqueViolation(err) {
@@ -556,7 +579,7 @@ func (s *Store) LinkFileNode(ctx context.Context, srcPath, dstPath, dstParentPat
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() string) error {

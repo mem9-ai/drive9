@@ -474,6 +474,12 @@ func TestMkdirAndReadDir(t *testing.T) {
 	if entries[0].Name != "a.txt" || entries[1].Name != "b.txt" {
 		t.Errorf("unexpected: %+v", entries)
 	}
+	if got := entries[0].Meta.Content["resource_id"]; got == "" {
+		t.Fatal("ReadDir entry resource_id is empty")
+	}
+	if got := entries[0].Meta.Content["nlink"]; got != "1" {
+		t.Fatalf("ReadDir entry nlink = %q, want 1", got)
+	}
 }
 
 func TestRemove(t *testing.T) {

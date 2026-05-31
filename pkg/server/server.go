@@ -1108,12 +1108,14 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "list_ok", "path", path, "entries", len(entries))...)
 	type entry struct {
-		Name    string `json:"name"`
-		Size    int64  `json:"size"`
-		IsDir   bool   `json:"isDir"`
-		Mtime   int64  `json:"mtime,omitempty"`
-		Mode    uint32 `json:"mode,omitempty"`
-		HasMode bool   `json:"hasMode"`
+		Name       string `json:"name"`
+		Size       int64  `json:"size"`
+		IsDir      bool   `json:"isDir"`
+		Mtime      int64  `json:"mtime,omitempty"`
+		Mode       uint32 `json:"mode,omitempty"`
+		HasMode    bool   `json:"hasMode"`
+		ResourceID string `json:"resource_id,omitempty"`
+		Nlink      uint32 `json:"nlink,omitempty"`
 	}
 	out := make([]entry, 0, len(entries))
 	for _, e := range entries {
@@ -1122,7 +1124,22 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 			mtime = e.ModTime.Unix()
 		}
 		hasMode := e.Meta.Content["hasMode"] == "true"
-		out = append(out, entry{Name: e.Name, Size: e.Size, IsDir: e.IsDir, Mtime: mtime, Mode: e.Mode, HasMode: hasMode})
+		var nlink uint32
+		if raw := e.Meta.Content["nlink"]; raw != "" {
+			if parsed, err := strconv.ParseUint(raw, 10, 32); err == nil {
+				nlink = uint32(parsed)
+			}
+		}
+		out = append(out, entry{
+			Name:       e.Name,
+			Size:       e.Size,
+			IsDir:      e.IsDir,
+			Mtime:      mtime,
+			Mode:       e.Mode,
+			HasMode:    hasMode,
+			ResourceID: e.Meta.Content["resource_id"],
+			Nlink:      nlink,
+		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})

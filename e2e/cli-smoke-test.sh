@@ -477,6 +477,10 @@ check_eq "cat hardlink returns source content" "$hardlink_body" "cli-smoke-${TS}
 
 hardlink_nlink="$(cli_stat_field "$SMALL_HARDLINK" "nlink")"
 check_cmd "hardlink stat reports nlink >= 2" bash -c 'test "${1:-0}" -ge 2' -- "$hardlink_nlink"
+hardlink_source_resource_id="$(cli_stat_field "$SMALL_RENAMED" "resource_id")"
+hardlink_resource_id="$(cli_stat_field "$SMALL_HARDLINK" "resource_id")"
+check_cmd "hardlink source resource_id is non-empty" test -n "$hardlink_source_resource_id"
+check_eq "hardlink and source share resource_id" "$hardlink_resource_id" "$hardlink_source_resource_id"
 
 printf "cli-hardlink-%s" "$TS" > "$HARDLINK_LOCAL"
 drive9_retry fs cp "$HARDLINK_LOCAL" ":$SMALL_HARDLINK" >/dev/null

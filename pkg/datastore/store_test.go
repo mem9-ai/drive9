@@ -636,6 +636,28 @@ func TestLinkFileNodeRejectsDirectorySource(t *testing.T) {
 	}
 }
 
+func TestLinkFileNodeRejectsMissingParent(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 50, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{
+		NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt",
+		FileID: "f1", InodeID: "f1", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LinkFileNode(ctx, "/a.txt", "/missing/b.txt", "/missing/", "b.txt", "n2", now); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LinkFileNode missing parent error = %v, want ErrNotFound", err)
+	}
+	if _, err := s.GetNode(ctx, "/missing/b.txt"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing-parent link created dst: %v", err)
+	}
+}
+
 func TestDeleteWithRefCount(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()

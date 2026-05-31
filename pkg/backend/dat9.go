@@ -14,6 +14,7 @@ import (
 	"math/rand"
 	"mime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -828,18 +829,44 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 		info := filesystem.FileInfo{
 			Name: e.Node.Name, IsDir: e.Node.IsDirectory, Mode: 0o644,
 		}
+		meta := make(map[string]string)
 		if e.Node.IsDirectory {
 			info.Mode = 0o755
 		}
 		if e.HasMode {
 			info.Mode = e.Mode
-			info.Meta = filesystem.MetaData{Content: map[string]string{"hasMode": "true"}}
+			meta["hasMode"] = "true"
 		}
 		if e.File != nil {
 			info.Size = e.File.SizeBytes
 			info.ModTime = fileMtime(e.File)
+			meta["resource_id"] = e.File.FileID
+			count, err := b.store.RefCount(ctx, e.File.FileID)
+			if err != nil {
+				return nil, err
+			}
+			if count <= 0 {
+				count = 1
+			}
+			if count > int64(^uint32(0)) {
+				count = int64(^uint32(0))
+			}
+			meta["nlink"] = strconv.FormatInt(count, 10)
 		} else {
 			info.ModTime = e.Node.CreatedAt
+			if e.Node.InodeID != "" {
+				meta["resource_id"] = e.Node.InodeID
+			} else if e.Node.NodeID != "" {
+				meta["resource_id"] = e.Node.NodeID
+			}
+			if e.Node.IsDirectory {
+				meta["nlink"] = "2"
+			} else {
+				meta["nlink"] = "1"
+			}
+		}
+		if len(meta) > 0 {
+			info.Meta = filesystem.MetaData{Content: meta}
 		}
 		infos = append(infos, info)
 	}
@@ -1219,10 +1246,12 @@ func (b *Dat9Backend) HardlinkFileCtx(ctx context.Context, srcPath, dstPath stri
 	if srcNode.IsDirectory {
 		return ErrInvalidHardlinkTarget
 	}
-	if err := b.store.EnsureParentDirs(ctx, dstPath, b.genID); err != nil {
-		return err
-	}
-	err = b.store.LinkFileNode(ctx, srcPath, dstPath, pathutil.ParentPath(dstPath), pathutil.BaseName(dstPath), b.genID(), time.Now())
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.store.EnsureParentDirsTx(tx, dstPath, b.genID); err != nil {
+			return err
+		}
+		return b.store.LinkFileNodeTx(ctx, tx, srcPath, dstPath, pathutil.ParentPath(dstPath), pathutil.BaseName(dstPath), b.genID(), time.Now())
+	})
 	if errors.Is(err, datastore.ErrInvalidLinkTarget) {
 		return ErrInvalidHardlinkTarget
 	}

@@ -1676,6 +1676,9 @@ func TestLinkCreatesRemoteHardlinkAndCachesAlias(t *testing.T) {
 	if !ok {
 		t.Fatal("source entry missing")
 	}
+	if entry.Path != "/dst.txt" {
+		t.Fatalf("primary path = %q, want /dst.txt", entry.Path)
+	}
 	if _, ok := entry.Paths["/src.txt"]; !ok {
 		t.Fatalf("entry paths missing src alias: %+v", entry.Paths)
 	}
@@ -1684,6 +1687,211 @@ func TestLinkCreatesRemoteHardlinkAndCachesAlias(t *testing.T) {
 	}
 	if cached := fs.dirCache.Lookup("/", "dst.txt"); cached.kind != namespaceLookupPositive || cached.item.Nlink != 2 {
 		t.Fatalf("cached dst = %+v, want positive nlink 2", cached)
+	}
+}
+
+func TestLinkRecoversCommittedHardlinkAfterTransientError(t *testing.T) {
+	var postCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			postCalls.Add(1)
+			w.WriteHeader(statusClientClosedRequest)
+		case http.MethodHead:
+			if r.URL.Path != "/v1/fs/src.txt" && r.URL.Path != "/v1/fs/dst.txt" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Length", "6")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.Header().Set("X-Dat9-Resource-ID", "file-1")
+			w.Header().Set("X-Dat9-Nlink", "2")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 1, false, 6, time.Now())
+
+	var out gofuse.EntryOut
+	st := fs.Link(nil, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: srcIno,
+	}, "dst.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Link status = %v, want OK", st)
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("POST calls = %d, want 1 recovery stat without retry", got)
+	}
+	if out.NodeId != srcIno || out.Nlink != 2 {
+		t.Fatalf("entry out = node %d nlink %d, want node %d nlink 2", out.NodeId, out.Nlink, srcIno)
+	}
+}
+
+func TestLinkKeepsDestinationPathWhenDestinationStatForbidden(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			w.WriteHeader(http.StatusForbidden)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 1, false, 6, time.Now())
+
+	var out gofuse.EntryOut
+	st := fs.Link(nil, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: srcIno,
+	}, "dst.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Link status = %v, want OK", st)
+	}
+	if out.NodeId != srcIno || out.Nlink != 2 {
+		t.Fatalf("entry out = node %d nlink %d, want node %d nlink 2", out.NodeId, out.Nlink, srcIno)
+	}
+	entry, ok := fs.inodes.GetEntry(srcIno)
+	if !ok {
+		t.Fatal("source entry missing")
+	}
+	if entry.Path != "/dst.txt" {
+		t.Fatalf("primary path = %q, want /dst.txt", entry.Path)
+	}
+	if entry.ResourceID != "file-1" {
+		t.Fatalf("resource id = %q, want file-1", entry.ResourceID)
+	}
+}
+
+func TestLinkSyncsDirtyOpenSourceAndRejectsOpenDestination(t *testing.T) {
+	var putCalls atomic.Int32
+	var postCalls atomic.Int32
+	var putBody string
+	var putMu sync.Mutex
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putCalls.Add(1)
+			body, _ := io.ReadAll(r.Body)
+			putMu.Lock()
+			putBody = string(body)
+			putMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"revision":1}`))
+		case http.MethodPost:
+			postCalls.Add(1)
+			if got := r.Header.Get("X-Dat9-Hardlink-Source"); got != "/src.txt" {
+				t.Errorf("hardlink source header = %q, want /src.txt", got)
+			}
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "5")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.Header().Set("X-Dat9-Resource-ID", "file-1")
+			w.Header().Set("X-Dat9-Nlink", "2")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcIno := fs.inodes.Lookup("/src.txt", false, 0, time.Now())
+	dirty := fs.newWriteBuffer("/src.txt", 1024, 0)
+	if _, err := dirty.Write(0, []byte("dirty")); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{Ino: srcIno, Path: "/src.txt", Dirty: dirty, IsNew: true}
+	fh.DirtySeq = fs.markDirtySize(srcIno, dirty.Size())
+	fs.openHandles.Add(fh)
+
+	var out gofuse.EntryOut
+	st := fs.Link(nil, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: srcIno,
+	}, "dst.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("dirty source Link status = %v, want OK", st)
+	}
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("PUT calls = %d, want 1 source sync before hardlink", got)
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("POST calls = %d, want 1 hardlink", got)
+	}
+	putMu.Lock()
+	gotBody := putBody
+	putMu.Unlock()
+	if gotBody != "dirty" {
+		t.Fatalf("synced body = %q, want dirty", gotBody)
+	}
+	fh.Lock()
+	if fh.IsNew || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		t.Fatalf("source handle not clean after hardlink sync: isNew=%t dirtySeq=%d dirty=%t", fh.IsNew, fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+	fh.Unlock()
+	fs.openHandles.Remove(fh)
+
+	dstIno := fs.inodes.Lookup("/dst.txt", false, 0, time.Now())
+	dstHandle := &FileHandle{Ino: dstIno, Path: "/dst.txt"}
+	fs.openHandles.Add(dstHandle)
+	st = fs.Link(nil, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: srcIno,
+	}, "dst.txt", &out)
+	if st != gofuse.Status(syscall.EEXIST) {
+		t.Fatalf("open destination Link status = %v, want EEXIST", st)
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("POST calls = %d, want no extra hardlink while destination is open", got)
+	}
+}
+
+func TestLookupFromDirCachePreservesHardlinkIdentity(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 2, false, 6, time.Now())
+	fs.dirCache.Upsert("/", CachedFileInfo{
+		Name:       "dst.txt",
+		Size:       6,
+		IsDir:      false,
+		Mtime:      time.Now(),
+		ResourceID: "file-1",
+		Nlink:      2,
+	})
+
+	var out gofuse.EntryOut
+	handled, st := fs.lookupFromDirCache("/", "/dst.txt", "dst.txt", &out)
+	if !handled || st != gofuse.OK {
+		t.Fatalf("lookupFromDirCache handled/status = %v/%v, want true/OK", handled, st)
+	}
+	if out.NodeId != srcIno {
+		t.Fatalf("cached hardlink node = %d, want source inode %d", out.NodeId, srcIno)
+	}
+	entry, ok := fs.inodes.GetEntry(srcIno)
+	if !ok {
+		t.Fatal("source entry missing")
+	}
+	if _, ok := entry.Paths["/dst.txt"]; !ok {
+		t.Fatalf("entry paths missing cached dst alias: %+v", entry.Paths)
 	}
 }
 

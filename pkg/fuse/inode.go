@@ -314,9 +314,10 @@ func (m *InodeToPath) AddAlias(ino uint64, path, resourceID string, nlink uint32
 		return false
 	}
 	if replaced, exists := m.byPath[path]; exists && replaced != ino {
-		m.removePathLocked(path)
+		m.removePathLocked(path, false)
 	}
 	m.addPathLocked(entry, path)
+	entry.Path = path
 	entry.Nlookup++
 	m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
 	return true
@@ -413,7 +414,7 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 	// Update the entry itself.
 	delete(m.byPath, oldPath)
 	if replacedIno, ok := m.byPath[newPath]; ok && replacedIno != ino {
-		m.removePathLocked(newPath)
+		m.removePathLocked(newPath, false)
 	}
 	m.byPath[newPath] = ino
 	if entry.Paths == nil {
@@ -478,7 +479,15 @@ func (m *InodeToPath) Remove(path string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.removePathLocked(path)
+	m.removePathLocked(path, false)
+}
+
+// RemoveLink removes one path mapping for a successful unlink-like operation.
+func (m *InodeToPath) RemoveLink(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.removePathLocked(path, true)
 }
 
 func inodeResourceKey(resourceID string, isDir bool) string {
@@ -540,7 +549,7 @@ func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
 	delete(m.byInode, ino)
 }
 
-func (m *InodeToPath) removePathLocked(path string) {
+func (m *InodeToPath) removePathLocked(path string, consumeLink bool) {
 	ino, ok := m.byPath[path]
 	if !ok {
 		return
@@ -552,7 +561,7 @@ func (m *InodeToPath) removePathLocked(path string) {
 	}
 	delete(m.byPath, path)
 	delete(entry.Paths, path)
-	if !entry.IsDir && entry.Nlink > 1 {
+	if consumeLink && !entry.IsDir && entry.Nlink > 1 {
 		entry.Nlink--
 	}
 	if entry.Path == path {
