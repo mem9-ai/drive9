@@ -572,6 +572,70 @@ func TestZeroCopyCp(t *testing.T) {
 	}
 }
 
+func TestLinkFileNodeSharesFileAndRefCount(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.InsertFile(ctx, &File{FileID: "f1", StorageType: StorageDB9, StorageRef: "/blobs/f1",
+		SizeBytes: 50, Revision: 1, Status: StatusConfirmed, CreatedAt: now, ConfirmedAt: &now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{
+		NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt",
+		FileID: "f1", InodeID: "f1", CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.LinkFileNode(ctx, "/a.txt", "/b.txt", "/", "b.txt", "n2", now); err != nil {
+		t.Fatalf("LinkFileNode: %v", err)
+	}
+	dst, err := s.GetNode(ctx, "/b.txt")
+	if err != nil {
+		t.Fatalf("GetNode(dst): %v", err)
+	}
+	if dst.FileID != "f1" || dst.InodeID != "f1" {
+		t.Fatalf("dst identity = file %q inode %q, want f1/f1", dst.FileID, dst.InodeID)
+	}
+	count, err := s.RefCount(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("refcount = %d, want 2", count)
+	}
+	if err := s.LinkFileNode(ctx, "/a.txt", "/b.txt", "/", "b.txt", "n3", now); !errors.Is(err, ErrPathConflict) {
+		t.Fatalf("duplicate LinkFileNode error = %v, want ErrPathConflict", err)
+	}
+
+	deleted, err := s.DeleteFileWithRefCheck(ctx, "/a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != nil {
+		t.Fatalf("first unlink deleted file record: %+v", deleted)
+	}
+	deleted, err = s.DeleteFileWithRefCheck(ctx, "/b.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted == nil || deleted.Status != StatusDeleted {
+		t.Fatalf("last unlink deleted = %+v, want DELETED file", deleted)
+	}
+}
+
+func TestLinkFileNodeRejectsDirectorySource(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "dir", Path: "/dir/", ParentPath: "/", Name: "dir", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.LinkFileNode(ctx, "/dir/", "/dir-link", "/", "dir-link", "n2", now); !errors.Is(err, ErrInvalidLinkTarget) {
+		t.Fatalf("LinkFileNode directory error = %v, want ErrInvalidLinkTarget", err)
+	}
+}
+
 func TestDeleteWithRefCount(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()

@@ -27,6 +27,7 @@ var (
 	ErrUploadNotActive         = errors.New("upload is not in UPLOADING state")
 	ErrUploadExpired           = errors.New("upload has expired")
 	ErrPathConflict            = errors.New("path already exists")
+	ErrInvalidLinkTarget       = errors.New("invalid link target")
 	ErrUploadConflict          = errors.New("active upload already exists for this path")
 	ErrIdempotencyConflict     = errors.New("duplicate idempotency key")
 	ErrJournalConflict         = errors.New("journal create conflict")
@@ -509,6 +510,53 @@ func (s *Store) RefCount(ctx context.Context, fileID string) (count int64, err e
 
 	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_nodes WHERE file_id = ?`, fileID).Scan(&count)
 	return count, err
+}
+
+// LinkFileNode atomically creates dstPath as another directory entry for the
+// same confirmed file entity referenced by srcPath.
+func (s *Store) LinkFileNode(ctx context.Context, srcPath, dstPath, dstParentPath, dstName, nodeID string, createdAt time.Time) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "link_file_node", start, &err)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var fileID, inodeID sql.NullString
+	var isDir bool
+	err = tx.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, srcPath).
+		Scan(&fileID, &inodeID, &isDir)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if isDir {
+		return ErrInvalidLinkTarget
+	}
+	if !fileID.Valid || fileID.String == "" {
+		return ErrNotFound
+	}
+	if err := s.lockConfirmedFileForAttachTx(tx, fileID.String); err != nil {
+		return err
+	}
+	linkInodeID := fileID.String
+	if inodeID.Valid && inodeID.String != "" {
+		linkInodeID = inodeID.String
+	}
+	_, err = tx.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
+		nodeID, dstPath, dstParentPath, dstName, fileID.String, linkInodeID, createdAt.UTC())
+	if isUniqueViolation(err) {
+		return ErrPathConflict
+	}
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() string) error {

@@ -13,10 +13,10 @@ including local single-tenant validation via `drive9-server-local`.
 
 | Script | What it validates |
 |--------|--------------------|
-| `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download |
+| `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download |
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
-| `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
-| `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/rename/stat semantics, cross-channel consistency, read-only and error-path checks |
+| `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
+| `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/hardlink/rename/stat semantics, cross-channel consistency, read-only and error-path checks |
 | `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, and mount-log audit |
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |

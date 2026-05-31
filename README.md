@@ -326,6 +326,7 @@ DELETE /v1/fs/{path}              delete
 DELETE /v1/fs/{path}?recursive    recursive delete
 POST   /v1/fs/{path}?append       append
 POST   /v1/fs/{path}?copy         copy (X-Dat9-Copy-Source)
+POST   /v1/fs/{path}?hardlink     hard link (X-Dat9-Hardlink-Source)
 POST   /v1/fs/{path}?rename       rename (X-Dat9-Rename-Source)
 POST   /v1/fs/{path}?mkdir        mkdir
 ```

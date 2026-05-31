@@ -664,6 +664,77 @@ func TestSymlinkCtxPreservesStatusError(t *testing.T) {
 	}
 }
 
+func TestHardlinkCtxPostsHardlinkAction(t *testing.T) {
+	var gotSource string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/fs/link" {
+			t.Errorf("path = %s, want /v1/fs/link", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("hardlink"); got != "1" {
+			t.Errorf("hardlink query = %q, want 1", got)
+		}
+		gotSource = r.Header.Get("X-Dat9-Hardlink-Source")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	if err := c.HardlinkCtx(context.Background(), "/src.txt", "/link"); err != nil {
+		t.Fatalf("HardlinkCtx error = %v", err)
+	}
+	if gotSource != "/src.txt" {
+		t.Fatalf("source header = %q, want /src.txt", gotSource)
+	}
+}
+
+func TestHardlinkCtxPreservesStatusError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "invalid hardlink target"})
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	err := c.HardlinkCtx(context.Background(), "/src", "/link")
+	if err == nil {
+		t.Fatal("HardlinkCtx error = nil, want status error")
+	}
+	var statusErr *StatusError
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("HardlinkCtx error type = %T, want *StatusError", err)
+	}
+	if statusErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", statusErr.StatusCode)
+	}
+}
+
+func TestStatCtxParsesResourceIDAndNlink(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("method = %s, want HEAD", r.Method)
+		}
+		w.Header().Set("Content-Length", "12")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "7")
+		w.Header().Set("X-Dat9-Resource-ID", "file-1")
+		w.Header().Set("X-Dat9-Nlink", "3")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	stat, err := c.StatCtx(context.Background(), "/file.txt")
+	if err != nil {
+		t.Fatalf("StatCtx error = %v", err)
+	}
+	if stat.Size != 12 || stat.Revision != 7 || stat.ResourceID != "file-1" || stat.Nlink != 3 {
+		t.Fatalf("stat = %+v, want size 12 rev 7 resource file-1 nlink 3", stat)
+	}
+}
+
 func TestWriteCtxConditionalWithTagsRejectsInvalidHeaderTags(t *testing.T) {
 	requests := 0
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

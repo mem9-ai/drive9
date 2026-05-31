@@ -263,6 +263,22 @@ drive9_retry_read() {
   done
 }
 
+cli_stat_field() {
+  local path="$1"
+  local field="$2"
+  local out
+  out="$(drive9_retry fs stat "$path")"
+  python3 - "$out" "$field" <<'PY'
+import sys
+text, field = sys.argv[1], sys.argv[2].lower()
+for line in text.splitlines():
+    if line.strip().lower().startswith(field + ":"):
+        print(line.split(":", 1)[1].strip())
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 wait_cli_grep_target() {
   local desc="$1"
   local query="$2"
@@ -297,9 +313,11 @@ SMALL_LOCAL="/tmp/drive9-cli-small-${TS}.txt"
 SMALL_REMOTE="/cli-${TS}-small.txt"
 SMALL_RENAMED="/cli-${TS}-small-renamed.txt"
 SMALL_SYMLINK="/cli-${TS}-small-link"
+SMALL_HARDLINK="/cli-${TS}-small-hardlink.txt"
 CP_DIR_REMOTE="/cli-${TS}-cpdir"
 CP_DIR_REMOTE_COPY="/cli-${TS}-cpdir-copy"
 CP_DIR_LOCAL="/tmp/drive9-cli-cpdir-${TS}"
+HARDLINK_LOCAL="/tmp/drive9-cli-hardlink-${TS}.txt"
 TAG_LOCAL="/tmp/drive9-cli-tag-${TS}.txt"
 TAG_REMOTE="/cli-${TS}-tagged.txt"
 IMAGE_LOCAL="/tmp/drive9-cli-image-${TS}.jpg"
@@ -435,6 +453,35 @@ check_eq "symlink appears in ls /" "$symlink_present" "true"
 
 symlink_target="$(drive9_retry_read fs cat "$SMALL_SYMLINK")"
 check_eq "cat symlink returns target payload" "$symlink_target" "$SMALL_RENAMED"
+
+drive9_retry fs hardlink "$SMALL_RENAMED" "$SMALL_HARDLINK" >/dev/null
+hardlink_present="false"
+for _ in $(seq 1 "$CLI_MAX_RETRIES"); do
+  hardlink_ls="$(drive9_retry fs ls /)"
+  hardlink_present=$(python3 - "$hardlink_ls" "$(basename "$SMALL_HARDLINK")" <<'PY'
+import sys
+out=sys.argv[1].splitlines()
+name=sys.argv[2]
+print("true" if any(line.strip()==name for line in out) else "false")
+PY
+)
+  if [[ "$hardlink_present" == "true" ]]; then
+    break
+  fi
+  sleep "$CLI_RETRY_SLEEP_S"
+done
+check_eq "hardlink appears in ls /" "$hardlink_present" "true"
+
+hardlink_body="$(drive9_retry_read fs cat "$SMALL_HARDLINK")"
+check_eq "cat hardlink returns source content" "$hardlink_body" "cli-smoke-${TS}"
+
+hardlink_nlink="$(cli_stat_field "$SMALL_HARDLINK" "nlink")"
+check_cmd "hardlink stat reports nlink >= 2" bash -c 'test "${1:-0}" -ge 2' -- "$hardlink_nlink"
+
+printf "cli-hardlink-%s" "$TS" > "$HARDLINK_LOCAL"
+drive9_retry fs cp "$HARDLINK_LOCAL" ":$SMALL_HARDLINK" >/dev/null
+hardlink_source_after_write="$(drive9_retry_read fs cat "$SMALL_RENAMED")"
+check_eq "writing hardlink updates source content" "$hardlink_source_after_write" "cli-hardlink-${TS}"
 
 echo "[4.1] cli tag/stat metadata checks"
 printf "cli-tag-%s" "$TS" > "$TAG_LOCAL"
@@ -587,6 +634,7 @@ check_eq "downloaded large file sha256 matches" "$sum_dst" "$sum_src"
 
 echo "[8] cleanup via cli"
 drive9_retry fs rm "$SMALL_SYMLINK" >/dev/null
+drive9_retry fs rm "$SMALL_HARDLINK" >/dev/null
 drive9_retry fs rm "$SMALL_RENAMED" >/dev/null
 drive9_retry fs rm "$TAG_REMOTE" >/dev/null
 if [ "$CLI_IMAGE_UPLOADED" = "1" ]; then
@@ -734,7 +782,7 @@ PY
   rm -f "$boundary_over_payload" "$over_file"
 fi
 
-rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
+rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$HARDLINK_LOCAL" "$IMAGE_LOCAL" "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
 rm -f "$TAG_LOCAL"
 rm -f "$FORK_LOCAL"
 rm -f "/tmp/drive9-cli-sem-target-${TS}.txt" "/tmp/drive9-cli-sem-other-${TS}.txt" "/tmp/drive9-cli-image-caption-${TS}.txt"

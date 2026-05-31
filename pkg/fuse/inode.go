@@ -8,15 +8,18 @@ import (
 
 // InodeEntry holds metadata for a single inode in the FUSE filesystem.
 type InodeEntry struct {
-	Ino      uint64
-	Path     string
-	IsDir    bool
-	Nlookup  int64 // kernel lookup reference count
-	Size     int64
-	Mtime    time.Time
-	Mode     uint32 // permission bits
-	HasMode  bool   // true when mode is explicitly known (including 0)
-	Revision int64  // server-side revision for cache validation
+	Ino        uint64
+	Path       string
+	Paths      map[string]struct{}
+	ResourceID string
+	Nlink      uint32
+	IsDir      bool
+	Nlookup    int64 // kernel lookup reference count
+	Size       int64
+	Mtime      time.Time
+	Mode       uint32 // permission bits
+	HasMode    bool   // true when mode is explicitly known (including 0)
+	Revision   int64  // server-side revision for cache validation
 }
 
 // InodeToPath provides a bidirectional mapping between inode numbers and
@@ -25,6 +28,7 @@ type InodeToPath struct {
 	mu      sync.RWMutex
 	byInode map[uint64]*InodeEntry
 	byPath  map[string]uint64
+	byID    map[string]uint64
 	nextIno uint64
 }
 
@@ -34,12 +38,15 @@ func NewInodeToPath() *InodeToPath {
 	root := &InodeEntry{
 		Ino:     1,
 		Path:    "/",
+		Paths:   map[string]struct{}{"/": {}},
 		IsDir:   true,
+		Nlink:   2,
 		Nlookup: 1,
 	}
 	return &InodeToPath{
 		byInode: map[uint64]*InodeEntry{1: root},
 		byPath:  map[string]uint64{"/": 1},
+		byID:    make(map[string]uint64),
 		nextIno: 2,
 	}
 }
@@ -48,30 +55,53 @@ func NewInodeToPath() *InodeToPath {
 // Nlookup count is incremented and its size/mtime are updated. If the path
 // does not exist, a new inode is allocated and an entry is created.
 func (m *InodeToPath) Lookup(path string, isDir bool, size int64, mtime time.Time) uint64 {
+	return m.LookupWithIdentity(path, "", 0, isDir, size, mtime)
+}
+
+// LookupWithIdentity is like Lookup, but non-directory entries with a stable
+// resourceID share one FUSE inode across all known hardlink paths.
+func (m *InodeToPath) LookupWithIdentity(path, resourceID string, nlink uint32, isDir bool, size int64, mtime time.Time) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if ino, ok := m.byPath[path]; ok {
 		entry := m.byInode[ino]
 		entry.Nlookup++
-		entry.Size = size
-		entry.Mtime = mtime
+		m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
 		return ino
+	}
+	if key := inodeResourceKey(resourceID, isDir); key != "" {
+		if ino, ok := m.byID[key]; ok {
+			entry := m.byInode[ino]
+			entry.Nlookup++
+			m.addPathLocked(entry, path)
+			m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
+			return ino
+		}
 	}
 
 	ino := m.nextIno
 	m.nextIno++
 
 	entry := &InodeEntry{
-		Ino:     ino,
-		Path:    path,
-		IsDir:   isDir,
-		Nlookup: 1,
-		Size:    size,
-		Mtime:   mtime,
+		Ino:        ino,
+		Path:       path,
+		Paths:      map[string]struct{}{path: {}},
+		ResourceID: inodeResourceKey(resourceID, isDir),
+		Nlink:      nlink,
+		IsDir:      isDir,
+		Nlookup:    1,
+		Size:       size,
+		Mtime:      mtime,
+	}
+	if entry.Nlink == 0 && !entry.IsDir {
+		entry.Nlink = 1
 	}
 	m.byInode[ino] = entry
 	m.byPath[path] = ino
+	if entry.ResourceID != "" {
+		m.byID[entry.ResourceID] = ino
+	}
 	return ino
 }
 
@@ -79,29 +109,51 @@ func (m *InodeToPath) Lookup(path string, isDir bool, size int64, mtime time.Tim
 // not exist. Unlike Lookup, it does NOT increment the Nlookup counter. Use
 // this for readdir entries where the kernel does not track a lookup reference.
 func (m *InodeToPath) EnsureInode(path string, isDir bool, size int64, mtime time.Time) uint64 {
+	return m.EnsureInodeWithIdentity(path, "", 0, isDir, size, mtime)
+}
+
+// EnsureInodeWithIdentity is like EnsureInode, but preserves hardlink identity
+// for non-directory entries when resourceID is known.
+func (m *InodeToPath) EnsureInodeWithIdentity(path, resourceID string, nlink uint32, isDir bool, size int64, mtime time.Time) uint64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	if ino, ok := m.byPath[path]; ok {
 		entry := m.byInode[ino]
-		entry.Size = size
-		entry.Mtime = mtime
+		m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
 		return ino
+	}
+	if key := inodeResourceKey(resourceID, isDir); key != "" {
+		if ino, ok := m.byID[key]; ok {
+			entry := m.byInode[ino]
+			m.addPathLocked(entry, path)
+			m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
+			return ino
+		}
 	}
 
 	ino := m.nextIno
 	m.nextIno++
 
 	entry := &InodeEntry{
-		Ino:     ino,
-		Path:    path,
-		IsDir:   isDir,
-		Nlookup: 0, // no kernel lookup reference yet
-		Size:    size,
-		Mtime:   mtime,
+		Ino:        ino,
+		Path:       path,
+		Paths:      map[string]struct{}{path: {}},
+		ResourceID: inodeResourceKey(resourceID, isDir),
+		Nlink:      nlink,
+		IsDir:      isDir,
+		Nlookup:    0, // no kernel lookup reference yet
+		Size:       size,
+		Mtime:      mtime,
+	}
+	if entry.Nlink == 0 && !entry.IsDir {
+		entry.Nlink = 1
 	}
 	m.byInode[ino] = entry
 	m.byPath[path] = ino
+	if entry.ResourceID != "" {
+		m.byID[entry.ResourceID] = ino
+	}
 	return ino
 }
 
@@ -122,7 +174,9 @@ func (m *InodeToPath) EnsureInodeNoUpdate(path string, isDir bool, size int64, m
 	entry := &InodeEntry{
 		Ino:     ino,
 		Path:    path,
+		Paths:   map[string]struct{}{path: {}},
 		IsDir:   isDir,
+		Nlink:   1,
 		Nlookup: 0,
 		Size:    size,
 		Mtime:   mtime,
@@ -181,6 +235,12 @@ func (m *InodeToPath) GetEntry(ino uint64) (*InodeEntry, bool) {
 		return nil, false
 	}
 	cp := *entry
+	if entry.Paths != nil {
+		cp.Paths = make(map[string]struct{}, len(entry.Paths))
+		for p := range entry.Paths {
+			cp.Paths[p] = struct{}{}
+		}
+	}
 	return &cp, true
 }
 
@@ -204,8 +264,7 @@ func (m *InodeToPath) Forget(ino uint64, nlookup uint64) {
 			entry.Nlookup = 0
 			return
 		}
-		delete(m.byPath, entry.Path)
-		delete(m.byInode, ino)
+		m.removeEntryLocked(ino, entry)
 	}
 }
 
@@ -240,9 +299,55 @@ func (m *InodeToPath) RemoveFileIfUnreferenced(ino uint64) bool {
 	if ino == 1 || entry.IsDir || entry.Nlookup > 0 {
 		return false
 	}
-	delete(m.byPath, entry.Path)
-	delete(m.byInode, ino)
+	m.removeEntryLocked(ino, entry)
 	return true
+}
+
+// AddAlias maps path to an existing inode and increments its lookup count for
+// the new kernel dentry returned by a successful FUSE Link call.
+func (m *InodeToPath) AddAlias(ino uint64, path, resourceID string, nlink uint32, isDir bool, size int64, mtime time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return false
+	}
+	if replaced, exists := m.byPath[path]; exists && replaced != ino {
+		m.removePathLocked(path)
+	}
+	m.addPathLocked(entry, path)
+	entry.Nlookup++
+	m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
+	return true
+}
+
+// SetIdentity records a stable resource identity for an existing inode.
+func (m *InodeToPath) SetIdentity(ino uint64, resourceID string, nlink uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return
+	}
+	m.setIdentityLocked(entry, resourceID)
+	if nlink > 0 {
+		entry.Nlink = nlink
+	}
+}
+
+// UpdateLinkCount updates the known hardlink count for an inode.
+func (m *InodeToPath) UpdateLinkCount(ino uint64, nlink uint32) {
+	if nlink == 0 {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Nlink = nlink
+	}
 }
 
 // UpdateSize updates the size of the entry identified by the given inode.
@@ -308,9 +413,14 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 	// Update the entry itself.
 	delete(m.byPath, oldPath)
 	if replacedIno, ok := m.byPath[newPath]; ok && replacedIno != ino {
-		delete(m.byInode, replacedIno)
+		m.removePathLocked(newPath)
 	}
 	m.byPath[newPath] = ino
+	if entry.Paths == nil {
+		entry.Paths = make(map[string]struct{})
+	}
+	delete(entry.Paths, oldPath)
+	entry.Paths[newPath] = struct{}{}
 	entry.Path = newPath
 
 	// If it is a directory, update all children with a matching prefix.
@@ -331,7 +441,13 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 			newChildPath := newPath + "/" + strings.TrimPrefix(c.oldChildPath, oldPrefix)
 			delete(m.byPath, c.oldChildPath)
 			m.byPath[newChildPath] = c.childIno
-			m.byInode[c.childIno].Path = newChildPath
+			childEntry := m.byInode[c.childIno]
+			if childEntry.Paths == nil {
+				childEntry.Paths = make(map[string]struct{})
+			}
+			delete(childEntry.Paths, c.oldChildPath)
+			childEntry.Paths[newChildPath] = struct{}{}
+			childEntry.Path = newChildPath
 		}
 	}
 }
@@ -345,7 +461,14 @@ func (m *InodeToPath) Snapshot() []InodeEntry {
 
 	entries := make([]InodeEntry, 0, len(m.byInode))
 	for _, e := range m.byInode {
-		entries = append(entries, *e)
+		cp := *e
+		if e.Paths != nil {
+			cp.Paths = make(map[string]struct{}, len(e.Paths))
+			for p := range e.Paths {
+				cp.Paths[p] = struct{}{}
+			}
+		}
+		entries = append(entries, cp)
 	}
 	return entries
 }
@@ -355,10 +478,91 @@ func (m *InodeToPath) Remove(path string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.removePathLocked(path)
+}
+
+func inodeResourceKey(resourceID string, isDir bool) string {
+	if isDir || resourceID == "" {
+		return ""
+	}
+	return resourceID
+}
+
+func (m *InodeToPath) addPathLocked(entry *InodeEntry, path string) {
+	if entry.Paths == nil {
+		entry.Paths = make(map[string]struct{})
+		if entry.Path != "" {
+			entry.Paths[entry.Path] = struct{}{}
+		}
+	}
+	entry.Paths[path] = struct{}{}
+	m.byPath[path] = entry.Ino
+	if entry.Path == "" {
+		entry.Path = path
+	}
+}
+
+func (m *InodeToPath) updateEntryLocked(entry *InodeEntry, path, resourceID string, nlink uint32, isDir bool, size int64, mtime time.Time) {
+	m.addPathLocked(entry, path)
+	entry.IsDir = isDir
+	entry.Size = size
+	entry.Mtime = mtime
+	m.setIdentityLocked(entry, resourceID)
+	if nlink > 0 {
+		entry.Nlink = nlink
+	} else if entry.Nlink == 0 && !isDir {
+		entry.Nlink = 1
+	}
+}
+
+func (m *InodeToPath) setIdentityLocked(entry *InodeEntry, resourceID string) {
+	key := inodeResourceKey(resourceID, entry.IsDir)
+	if key == "" || entry.ResourceID == key {
+		return
+	}
+	if entry.ResourceID != "" && m.byID[entry.ResourceID] == entry.Ino {
+		delete(m.byID, entry.ResourceID)
+	}
+	entry.ResourceID = key
+	m.byID[key] = entry.Ino
+}
+
+func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
+	for p := range entry.Paths {
+		delete(m.byPath, p)
+	}
+	if entry.Path != "" {
+		delete(m.byPath, entry.Path)
+	}
+	if entry.ResourceID != "" && m.byID[entry.ResourceID] == ino {
+		delete(m.byID, entry.ResourceID)
+	}
+	delete(m.byInode, ino)
+}
+
+func (m *InodeToPath) removePathLocked(path string) {
 	ino, ok := m.byPath[path]
 	if !ok {
 		return
 	}
+	entry, ok := m.byInode[ino]
+	if !ok {
+		delete(m.byPath, path)
+		return
+	}
 	delete(m.byPath, path)
-	delete(m.byInode, ino)
+	delete(entry.Paths, path)
+	if !entry.IsDir && entry.Nlink > 1 {
+		entry.Nlink--
+	}
+	if entry.Path == path {
+		entry.Path = ""
+		for p := range entry.Paths {
+			entry.Path = p
+			break
+		}
+	}
+	if entry.Path == "" && len(entry.Paths) == 0 {
+		m.removeEntryLocked(ino, entry)
+	}
 }

@@ -185,22 +185,26 @@ func newClient(baseURL, credential string) *Client {
 
 // FileInfo represents a file entry from a directory listing.
 type FileInfo struct {
-	Name    string `json:"name"`
-	Size    int64  `json:"size"`
-	IsDir   bool   `json:"isDir"`
-	Mtime   int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
-	Mode    uint32 `json:"mode,omitempty"`
-	HasMode bool   `json:"hasMode"`
+	Name       string `json:"name"`
+	Size       int64  `json:"size"`
+	IsDir      bool   `json:"isDir"`
+	Mtime      int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+	Mode       uint32 `json:"mode,omitempty"`
+	HasMode    bool   `json:"hasMode"`
+	ResourceID string `json:"resource_id,omitempty"`
+	Nlink      uint32 `json:"nlink,omitempty"`
 }
 
 // StatResult represents file metadata from HEAD.
 type StatResult struct {
-	Size     int64
-	IsDir    bool
-	Revision int64
-	Mtime    time.Time
-	Mode     uint32
-	HasMode  bool // true when the server returned a mode header (including 0)
+	Size       int64
+	IsDir      bool
+	Revision   int64
+	Mtime      time.Time
+	Mode       uint32
+	HasMode    bool // true when the server returned a mode header (including 0)
+	ResourceID string
+	Nlink      uint32
 }
 
 // MaxBatchStatPaths is the maximum number of paths accepted by BatchStatCtx.
@@ -214,15 +218,17 @@ const MaxBatchReadSmallPaths = 128
 // Status is the HTTP-like per-path status. A missing path returns Status 404
 // in its own result instead of failing the whole batch.
 type BatchStatResult struct {
-	Path     string `json:"path"`
-	Status   int    `json:"status"`
-	Error    string `json:"error,omitempty"`
-	Size     int64  `json:"size,omitempty"`
-	IsDir    bool   `json:"isDir"`
-	Revision int64  `json:"revision,omitempty"`
-	Mtime    int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
-	Mode     uint32 `json:"mode,omitempty"`
-	HasMode  bool   `json:"hasMode"`
+	Path       string `json:"path"`
+	Status     int    `json:"status"`
+	Error      string `json:"error,omitempty"`
+	Size       int64  `json:"size,omitempty"`
+	IsDir      bool   `json:"isDir"`
+	Revision   int64  `json:"revision,omitempty"`
+	Mtime      int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+	Mode       uint32 `json:"mode,omitempty"`
+	HasMode    bool   `json:"hasMode"`
+	ResourceID string `json:"resource_id,omitempty"`
+	Nlink      uint32 `json:"nlink,omitempty"`
 }
 
 // OK reports whether the per-path batch stat result is successful.
@@ -254,6 +260,7 @@ type StatMetadataResult struct {
 	Size         int64             `json:"size"`
 	IsDir        bool              `json:"isdir"`
 	ResourceID   string            `json:"resource_id,omitempty"`
+	Nlink        uint32            `json:"nlink,omitempty"`
 	Revision     int64             `json:"revision"`
 	Mtime        *int64            `json:"mtime,omitempty"` // Unix seconds when known
 	ContentType  string            `json:"content_type"`
@@ -533,6 +540,29 @@ func (c *Client) SymlinkCtx(ctx context.Context, target, linkPath string) error 
 	return nil
 }
 
+// Hardlink creates a hard link at dstPath pointing at srcPath's file entity.
+func (c *Client) Hardlink(srcPath, dstPath string) error {
+	return c.HardlinkCtx(context.Background(), srcPath, dstPath)
+}
+
+// HardlinkCtx creates a hard link with context support.
+func (c *Client) HardlinkCtx(ctx context.Context, srcPath, dstPath string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url(dstPath)+"?hardlink=1", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("X-Dat9-Hardlink-Source", srcPath)
+	resp, err := c.do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return readError(resp)
+	}
+	return nil
+}
+
 func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
@@ -771,6 +801,12 @@ func (c *Client) StatCtx(ctx context.Context, path string) (*StatResult, error) 
 			s.Mtime = time.Unix(sec, 0)
 		}
 	}
+	s.ResourceID = resp.Header.Get("X-Dat9-Resource-ID")
+	if nlink := resp.Header.Get("X-Dat9-Nlink"); nlink != "" {
+		if n, err := strconv.ParseUint(nlink, 10, 32); err == nil {
+			s.Nlink = uint32(n)
+		}
+	}
 	return s, nil
 }
 
@@ -840,6 +876,8 @@ func (c *Client) StatMetadataCompatCtx(ctx context.Context, path string) (*StatM
 	return &StatMetadataResult{
 		Size:         statOut.Size,
 		IsDir:        statOut.IsDir,
+		ResourceID:   statOut.ResourceID,
+		Nlink:        statOut.Nlink,
 		Revision:     statOut.Revision,
 		Mtime:        mtime,
 		ContentType:  "",

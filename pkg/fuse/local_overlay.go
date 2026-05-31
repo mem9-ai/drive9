@@ -95,6 +95,21 @@ func (o *LocalOverlay) Symlink(target, localPath string) error {
 	return os.Symlink(target, abs)
 }
 
+func (o *LocalOverlay) Link(oldPath, newPath string) error {
+	oldAbs, err := o.abs(oldPath)
+	if err != nil {
+		return err
+	}
+	newAbs, err := o.abs(newPath)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(newAbs), 0o755); err != nil {
+		return err
+	}
+	return os.Link(oldAbs, newAbs)
+}
+
 func (o *LocalOverlay) Readlink(localPath string) (string, error) {
 	abs, err := o.abs(localPath)
 	if err != nil {

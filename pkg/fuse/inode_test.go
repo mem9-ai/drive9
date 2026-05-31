@@ -29,6 +29,64 @@ func TestUpdateModeUnknownInode(t *testing.T) {
 	m.UpdateMode(999, 0o600)
 }
 
+func TestInodeHardlinkAliasesShareIdentity(t *testing.T) {
+	m := NewInodeToPath()
+	now := time.Now()
+
+	inoA := m.LookupWithIdentity("/a.txt", "file-1", 2, false, 10, now)
+	inoB := m.LookupWithIdentity("/b.txt", "file-1", 2, false, 10, now)
+	if inoA != inoB {
+		t.Fatalf("hardlink aliases got different inodes: %d != %d", inoA, inoB)
+	}
+	entry, ok := m.GetEntry(inoA)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.Nlink != 2 {
+		t.Fatalf("nlink = %d, want 2", entry.Nlink)
+	}
+	if _, ok := entry.Paths["/a.txt"]; !ok {
+		t.Fatalf("entry paths missing /a.txt: %+v", entry.Paths)
+	}
+	if _, ok := entry.Paths["/b.txt"]; !ok {
+		t.Fatalf("entry paths missing /b.txt: %+v", entry.Paths)
+	}
+
+	m.Remove("/a.txt")
+	if _, ok := m.GetInode("/a.txt"); ok {
+		t.Fatal("/a.txt mapping survived Remove")
+	}
+	if got, ok := m.GetInode("/b.txt"); !ok || got != inoA {
+		t.Fatalf("/b.txt inode = %d/%v, want %d/true", got, ok, inoA)
+	}
+	entry, ok = m.GetEntry(inoA)
+	if !ok {
+		t.Fatal("entry removed while alias still exists")
+	}
+	if entry.Nlink != 1 {
+		t.Fatalf("nlink after removing one alias = %d, want 1", entry.Nlink)
+	}
+}
+
+func TestInodeSetIdentityLetsLaterLookupJoinExistingInode(t *testing.T) {
+	m := NewInodeToPath()
+	now := time.Now()
+
+	inoA := m.Lookup("/a.txt", false, 10, now)
+	m.SetIdentity(inoA, "file-1", 1)
+	inoB := m.LookupWithIdentity("/b.txt", "file-1", 2, false, 10, now)
+	if inoA != inoB {
+		t.Fatalf("lookup with identity allocated new inode: %d != %d", inoB, inoA)
+	}
+	entry, ok := m.GetEntry(inoA)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if entry.Nlink != 2 {
+		t.Fatalf("nlink = %d, want 2", entry.Nlink)
+	}
+}
+
 func TestFillAttrFileMode(t *testing.T) {
 	fs := &Dat9FS{uid: 1000, gid: 1000}
 
@@ -52,6 +110,16 @@ func TestFillAttrFileMode(t *testing.T) {
 				t.Errorf("mode=%o, want %o", out.Mode, tt.wantMode)
 			}
 		})
+	}
+}
+
+func TestFillAttrFileNlink(t *testing.T) {
+	fs := &Dat9FS{uid: 1000, gid: 1000}
+	entry := &InodeEntry{Ino: 2, Path: "/a.txt", IsDir: false, Size: 42, Nlink: 3}
+	var out gofuse.Attr
+	fs.fillAttr(entry, &out)
+	if out.Nlink != 3 {
+		t.Fatalf("nlink = %d, want 3", out.Nlink)
 	}
 }
 

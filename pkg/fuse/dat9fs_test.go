@@ -1613,6 +1613,80 @@ func TestSymlinkCreatesRemoteLinkAndCachesEntry(t *testing.T) {
 	}
 }
 
+func TestLinkCreatesRemoteHardlinkAndCachesAlias(t *testing.T) {
+	var gotSource string
+	var postCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			postCalls.Add(1)
+			if r.URL.Path != "/v1/fs/dst.txt" {
+				t.Errorf("POST path = %s, want /v1/fs/dst.txt", r.URL.Path)
+			}
+			if got := r.URL.Query().Get("hardlink"); got != "1" {
+				t.Errorf("hardlink query = %q, want 1", got)
+			}
+			gotSource = r.Header.Get("X-Dat9-Hardlink-Source")
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case http.MethodHead:
+			if r.URL.Path != "/v1/fs/dst.txt" {
+				t.Errorf("HEAD path = %s, want /v1/fs/dst.txt", r.URL.Path)
+			}
+			w.Header().Set("Content-Length", "6")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.Header().Set("X-Dat9-Resource-ID", "file-1")
+			w.Header().Set("X-Dat9-Nlink", "2")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 1, false, 6, time.Now())
+
+	var out gofuse.EntryOut
+	st := fs.Link(nil, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: srcIno,
+	}, "dst.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Link status = %v, want OK", st)
+	}
+	if gotSource != "/src.txt" {
+		t.Fatalf("posted source = %q, want /src.txt", gotSource)
+	}
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("POST calls = %d, want 1", got)
+	}
+	if out.NodeId != srcIno {
+		t.Fatalf("linked node id = %d, want source inode %d", out.NodeId, srcIno)
+	}
+	if out.Nlink != 2 {
+		t.Fatalf("entry nlink = %d, want 2", out.Nlink)
+	}
+	if dstIno, ok := fs.inodes.GetInode("/dst.txt"); !ok || dstIno != srcIno {
+		t.Fatalf("dst inode = %d/%v, want %d/true", dstIno, ok, srcIno)
+	}
+	entry, ok := fs.inodes.GetEntry(srcIno)
+	if !ok {
+		t.Fatal("source entry missing")
+	}
+	if _, ok := entry.Paths["/src.txt"]; !ok {
+		t.Fatalf("entry paths missing src alias: %+v", entry.Paths)
+	}
+	if _, ok := entry.Paths["/dst.txt"]; !ok {
+		t.Fatalf("entry paths missing dst alias: %+v", entry.Paths)
+	}
+	if cached := fs.dirCache.Lookup("/", "dst.txt"); cached.kind != namespaceLookupPositive || cached.item.Nlink != 2 {
+		t.Fatalf("cached dst = %+v, want positive nlink 2", cached)
+	}
+}
+
 func TestSymlinkRecoversWhenInterruptedAfterRemoteCreate(t *testing.T) {
 	const target = "../target"
 	symlinkMode := uint32(syscall.S_IFLNK) | 0o777

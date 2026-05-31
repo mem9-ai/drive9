@@ -1195,6 +1195,44 @@ func (b *Dat9Backend) CopyFileCtx(ctx context.Context, srcPath, dstPath string) 
 	})
 }
 
+// HardlinkFile creates dstPath as another directory entry for srcPath's file
+// entity. The two paths share content, revision, mode, tags, and storage.
+func (b *Dat9Backend) HardlinkFile(srcPath, dstPath string) error {
+	return b.HardlinkFileCtx(backgroundWithTrace(), srcPath, dstPath)
+}
+
+func (b *Dat9Backend) HardlinkFileCtx(ctx context.Context, srcPath, dstPath string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "hardlink_file", err, start) }()
+
+	srcPath, err = pathutil.Canonicalize(srcPath)
+	if err != nil {
+		return err
+	}
+	dstPath, err = pathutil.Canonicalize(dstPath)
+	if err != nil {
+		return err
+	}
+	if srcPath == dstPath {
+		return datastore.ErrPathConflict
+	}
+	srcNode, err := b.store.GetNode(ctx, srcPath)
+	if err != nil {
+		return err
+	}
+	if srcNode.IsDirectory {
+		return ErrInvalidHardlinkTarget
+	}
+	if err := b.store.EnsureParentDirs(ctx, dstPath, b.genID); err != nil {
+		return err
+	}
+	err = b.store.LinkFileNode(ctx, srcPath, dstPath, pathutil.ParentPath(dstPath), pathutil.BaseName(dstPath), b.genID(), time.Now())
+	if errors.Is(err, datastore.ErrInvalidLinkTarget) {
+		return ErrInvalidHardlinkTarget
+	}
+	return err
+}
+
 func (b *Dat9Backend) deleteBlobCtx(ctx context.Context, ref string) {
 	if b.s3 != nil && ref != "" {
 		if err := b.s3.DeleteObject(ctx, ref); err != nil {

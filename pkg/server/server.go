@@ -713,7 +713,7 @@ func isScopedFSPostQueryAllowed(q url.Values) bool {
 	// no selector = deny (no handler matches the dispatcher's else branch
 	// for scoped tokens — that's "unknown POST action" which is a 400 for
 	// owner today, and we don't want to silently widen for scoped).
-	selectors := []string{"append", "copy", "rename", "mkdir", "chmod", "create", "symlink"}
+	selectors := []string{"append", "copy", "rename", "mkdir", "chmod", "create", "symlink", "hardlink"}
 	selectorCount := 0
 	var selectorKey string
 	for _, k := range selectors {
@@ -753,6 +753,10 @@ func isScopedFSPostQueryAllowed(q url.Values) bool {
 	case "symlink":
 		// handleSymlink reads only ?symlink; target is in the JSON body.
 		return queryKeysSubsetOf(q, []string{"symlink"})
+	case "hardlink":
+		// handleHardlink reads only ?hardlink; source path is in
+		// X-Dat9-Hardlink-Source.
+		return queryKeysSubsetOf(q, []string{"hardlink"})
 	default:
 		return false
 	}
@@ -989,6 +993,8 @@ func (s *Server) handleFS(w http.ResponseWriter, r *http.Request) {
 			s.handleCreate(w, r, path)
 		} else if r.URL.Query().Has("symlink") {
 			s.handleSymlink(w, r, path)
+		} else if r.URL.Query().Has("hardlink") {
+			s.handleHardlink(w, r, path)
 		} else {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "fs_unknown_post_action", "path", path)...)
 			errJSON(w, http.StatusBadRequest, "unknown POST action")
@@ -1142,6 +1148,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 			Size         int64             `json:"size"`
 			IsDir        bool              `json:"isdir"`
 			ResourceID   string            `json:"resource_id"`
+			Nlink        uint32            `json:"nlink,omitempty"`
 			Revision     int64             `json:"revision"`
 			Mtime        *int64            `json:"mtime,omitempty"`
 			ContentType  string            `json:"content_type"`
@@ -1149,6 +1156,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 			Tags         map[string]string `json:"tags"`
 		}{
 			IsDir: true,
+			Nlink: 2,
 			Mtime: &zero,
 			Tags:  make(map[string]string),
 		})
@@ -1174,6 +1182,12 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	var contentType string
 	var semanticText string
 	resourceID := nf.Node.NodeID
+	nlink, err := nodeLinkCount(r.Context(), b, nf)
+	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_refcount_failed", "path", path, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	if nf.File != nil {
 		resourceID = nf.File.FileID
 		size = nf.File.SizeBytes
@@ -1206,6 +1220,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 		Size         int64             `json:"size"`
 		IsDir        bool              `json:"isdir"`
 		ResourceID   string            `json:"resource_id"`
+		Nlink        uint32            `json:"nlink,omitempty"`
 		Revision     int64             `json:"revision"`
 		Mtime        *int64            `json:"mtime,omitempty"`
 		ContentType  string            `json:"content_type"`
@@ -1215,6 +1230,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 		Size:         size,
 		IsDir:        nf.Node.IsDirectory,
 		ResourceID:   resourceID,
+		Nlink:        nlink,
 		Revision:     revision,
 		Mtime:        mtime,
 		ContentType:  contentType,
@@ -1592,15 +1608,17 @@ type batchStatResponse struct {
 }
 
 type batchStatResult struct {
-	Path     string `json:"path"`
-	Status   int    `json:"status"`
-	Error    string `json:"error,omitempty"`
-	Size     int64  `json:"size,omitempty"`
-	IsDir    bool   `json:"isDir"`
-	Revision int64  `json:"revision,omitempty"`
-	Mtime    int64  `json:"mtime,omitempty"`
-	Mode     uint32 `json:"mode,omitempty"`
-	HasMode  bool   `json:"hasMode"`
+	Path       string `json:"path"`
+	Status     int    `json:"status"`
+	Error      string `json:"error,omitempty"`
+	Size       int64  `json:"size,omitempty"`
+	IsDir      bool   `json:"isDir"`
+	Revision   int64  `json:"revision,omitempty"`
+	Mtime      int64  `json:"mtime,omitempty"`
+	Mode       uint32 `json:"mode,omitempty"`
+	HasMode    bool   `json:"hasMode"`
+	ResourceID string `json:"resource_id,omitempty"`
+	Nlink      uint32 `json:"nlink,omitempty"`
 }
 
 type batchReadSmallRequest struct {
@@ -1762,6 +1780,7 @@ func (s *Server) batchStatOne(ctx context.Context, b *backend.Dat9Backend, rawPa
 	if path == "/" {
 		result.Status = http.StatusOK
 		result.IsDir = true
+		result.Nlink = 2
 		return result
 	}
 
@@ -1780,6 +1799,14 @@ func (s *Server) batchStatOne(ctx context.Context, b *backend.Dat9Backend, rawPa
 	result.IsDir = nf.Node.IsDirectory
 	result.HasMode = nf.HasMode
 	result.Mode = nf.Mode
+	result.ResourceID = nodeResourceID(nf)
+	nlink, nlinkErr := nodeLinkCount(ctx, b, nf)
+	if nlinkErr != nil {
+		result.Status = http.StatusInternalServerError
+		result.Error = nlinkErr.Error()
+		return result
+	}
+	result.Nlink = nlink
 	if nf.File != nil {
 		result.Size = nf.File.SizeBytes
 		result.Revision = nf.File.Revision
@@ -1801,6 +1828,42 @@ func validateBatchStatPath(rawPath string) error {
 	}
 	_, err := pathutil.Canonicalize(rawPath)
 	return err
+}
+
+func nodeResourceID(nf *datastore.NodeWithFile) string {
+	if nf == nil {
+		return ""
+	}
+	if nf.File != nil {
+		return nf.File.FileID
+	}
+	if nf.Node.InodeID != "" {
+		return nf.Node.InodeID
+	}
+	return nf.Node.NodeID
+}
+
+func nodeLinkCount(ctx context.Context, b *backend.Dat9Backend, nf *datastore.NodeWithFile) (uint32, error) {
+	if nf == nil {
+		return 0, nil
+	}
+	if nf.File == nil || nf.File.FileID == "" {
+		if nf.Node.IsDirectory {
+			return 2, nil
+		}
+		return 1, nil
+	}
+	count, err := b.Store().RefCount(ctx, nf.File.FileID)
+	if err != nil {
+		return 0, err
+	}
+	if count <= 0 {
+		count = 1
+	}
+	if count > int64(^uint32(0)) {
+		return ^uint32(0), nil
+	}
+	return uint32(count), nil
 }
 
 func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string) {
@@ -1826,6 +1889,7 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 		w.Header().Set("Content-Length", "0")
 		w.Header().Set("X-Dat9-IsDir", "true")
 		w.Header().Set("X-Dat9-Mtime", "0")
+		w.Header().Set("X-Dat9-Nlink", "2")
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "stat_ok", "path", path, "is_dir", true)...)
 		w.WriteHeader(http.StatusOK)
 		return
@@ -1854,6 +1918,12 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 	if nf.File != nil {
 		size = nf.File.SizeBytes
 	}
+	nlink, err := nodeLinkCount(r.Context(), b, nf)
+	if err != nil {
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_refcount_failed", "path", path, "error", err)...)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	logger.InfoBenchTiming(r.Context(), "server_stat_timing",
 		zap.String("path", path),
 		zap.Bool("is_dir", nf.Node.IsDirectory),
@@ -1862,6 +1932,12 @@ func (s *Server) handleStat(w http.ResponseWriter, r *http.Request, path string)
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 	w.Header().Set("X-Dat9-IsDir", fmt.Sprintf("%v", nf.Node.IsDirectory))
+	if resourceID := nodeResourceID(nf); resourceID != "" {
+		w.Header().Set("X-Dat9-Resource-ID", resourceID)
+	}
+	if nlink > 0 {
+		w.Header().Set("X-Dat9-Nlink", strconv.FormatUint(uint64(nlink), 10))
+	}
 	if nf.File != nil {
 		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(nf.File.Revision, 10))
 		if nf.File.ConfirmedAt != nil {
@@ -1956,6 +2032,48 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "copy_ok", "src_path", srcPath, "dst_path", dstPath)...)
 	s.publishEvent(r, dstPath, "copy")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath string) {
+	srcPath := r.Header.Get("X-Dat9-Hardlink-Source")
+	if srcPath == "" {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "hardlink_missing_source_header", "dst_path", dstPath)...)
+		errJSON(w, http.StatusBadRequest, "missing X-Dat9-Hardlink-Source header")
+		return
+	}
+	if !authorizeFSPair(w, r, FSOpRead, srcPath, FSOpWrite, dstPath) {
+		return
+	}
+	b := backendFromRequest(r)
+	if b == nil {
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "hardlink_missing_scope", "dst_path", dstPath)...)
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
+	if err := b.HardlinkFileCtx(r.Context(), srcPath, dstPath); err != nil {
+		if errors.Is(err, datastore.ErrNotFound) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "hardlink_not_found", "src_path", srcPath, "dst_path", dstPath)...)
+			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errors.Is(err, datastore.ErrPathConflict) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "hardlink_conflict", "src_path", srcPath, "dst_path", dstPath)...)
+			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errors.Is(err, backend.ErrInvalidHardlinkTarget) {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "hardlink_invalid_target", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "hardlink_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "hardlink_ok", "src_path", srcPath, "dst_path", dstPath)...)
+	s.publishEvent(r, srcPath, "hardlink")
+	s.publishEvent(r, dstPath, "hardlink")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 

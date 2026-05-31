@@ -653,6 +653,9 @@ RW_TEXT_MOUNT="$MOUNT_POINT/$RW_TEXT_REL"
 RW_SYMLINK_REL="${RW_ALPHA_REL}/text-link"
 RW_SYMLINK_REMOTE="/${RW_SYMLINK_REL}"
 RW_SYMLINK_MOUNT="$MOUNT_POINT/$RW_SYMLINK_REL"
+RW_HARDLINK_REL="${RW_ALPHA_REL}/text-hardlink.txt"
+RW_HARDLINK_REMOTE="/${RW_HARDLINK_REL}"
+RW_HARDLINK_MOUNT="$MOUNT_POINT/$RW_HARDLINK_REL"
 RW_TEXT_RENAMED_REL="${RW_ALPHA_REL}/text-renamed.txt"
 RW_TEXT_RENAMED_REMOTE="/${RW_TEXT_RENAMED_REL}"
 RW_TEXT_RENAMED_MOUNT="$MOUNT_POINT/$RW_TEXT_RENAMED_REL"
@@ -761,6 +764,38 @@ if is_mounted "$MOUNT_POINT"; then
   check_eq "readlink returns symlink target" "$link_target" "text.txt"
   check_eq "cat follows mounted symlink" "$symlink_cat" "overwrite-${TS}-append"
   check_eq "remote cat returns symlink payload" "$remote_link_target" "text.txt"
+
+  if ln "$RW_TEXT_MOUNT" "$RW_HARDLINK_MOUNT"; then
+    check_eq "hardlink via mount succeeds" "true" "true"
+  else
+    check_eq "hardlink via mount succeeds" "false" "true"
+  fi
+  check_cmd "hardlink is visible as local file" test -f "$RW_HARDLINK_MOUNT"
+  if [ -f "$RW_HARDLINK_MOUNT" ]; then
+    hardlink_cat=$(cat "$RW_HARDLINK_MOUNT")
+  else
+    hardlink_cat=""
+  fi
+  check_eq "cat hardlink returns source content" "$hardlink_cat" "overwrite-${TS}-append"
+  if hardlink_nlink=$(wait_remote_stat_field_eq "$RW_HARDLINK_REMOTE" "nlink" "2"); then
+    check_eq "remote hardlink nlink is 2" "$hardlink_nlink" "2"
+  else
+    check_eq "remote hardlink nlink is 2" "" "2"
+  fi
+  if [ -f "$RW_HARDLINK_MOUNT" ]; then
+    printf "hardlink-%s" "$TS" > "$RW_HARDLINK_MOUNT"
+    hardlink_source_cat=$(cat "$RW_TEXT_MOUNT")
+    if remote_hardlink_source=$(wait_remote_cat_eq "$RW_TEXT_REMOTE" "hardlink-${TS}"); then
+      :
+    else
+      remote_hardlink_source=""
+    fi
+  else
+    hardlink_source_cat=""
+    remote_hardlink_source=""
+  fi
+  check_eq "writing hardlink updates local source" "$hardlink_source_cat" "hardlink-${TS}"
+  check_eq "writing hardlink updates remote source" "$remote_hardlink_source" "hardlink-${TS}"
 
   if : > "$RW_TEXT_MOUNT"; then
     check_eq "truncate via mount succeeds" "true" "true"

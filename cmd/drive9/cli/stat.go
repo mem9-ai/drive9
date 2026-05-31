@@ -64,6 +64,9 @@ func Stat(c *client.Client, args []string) error {
 	if m.ResourceID != "" {
 		fmt.Printf("resource_id: %s\n", m.ResourceID)
 	}
+	if m.Nlink > 0 {
+		fmt.Printf("nlink: %d\n", m.Nlink)
+	}
 	fmt.Printf("revision: %d\n", m.Revision)
 	if m.Mtime != nil {
 		fmt.Printf("mtime: %s\n", time.Unix(*m.Mtime, 0).UTC().Format(time.RFC3339))

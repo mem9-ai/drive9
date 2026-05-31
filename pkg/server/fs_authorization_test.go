@@ -189,14 +189,14 @@ func TestIsScopedBusinessRequestAllowed(t *testing.T) {
 			path   string
 			query  string
 		}{
-			{http.MethodPost, "/v1/fs/main.txt", "chmod=1"},           // owner-only forever
-			{http.MethodGet, "/v1/fs:batch-stat", ""},                 // wrong method for this endpoint
-			{http.MethodGet, "/v1/fs:batch-read-small", ""},           // wrong method
-			{http.MethodPost, "/v1/sql", ""},                          // out of scope
-			{http.MethodPost, "/v1/fork", ""},                         // out of scope
-			{http.MethodGet, "/v1/events", ""},                        // out of scope
-			{http.MethodGet, "/v1/journals", ""},                      // out of scope
-			{http.MethodGet, "/v1/vault/secrets", ""},                 // out of scope
+			{http.MethodPost, "/v1/fs/main.txt", "chmod=1"}, // owner-only forever
+			{http.MethodGet, "/v1/fs:batch-stat", ""},       // wrong method for this endpoint
+			{http.MethodGet, "/v1/fs:batch-read-small", ""}, // wrong method
+			{http.MethodPost, "/v1/sql", ""},                // out of scope
+			{http.MethodPost, "/v1/fork", ""},               // out of scope
+			{http.MethodGet, "/v1/events", ""},              // out of scope
+			{http.MethodGet, "/v1/journals", ""},            // out of scope
+			{http.MethodGet, "/v1/vault/secrets", ""},       // out of scope
 		}
 		for _, tc := range cases {
 			r := newScopedRequest(t, tc.method, tc.path, tc.query)
@@ -534,6 +534,46 @@ func TestC2aHandleCopyAllowsBothInZone(t *testing.T) {
 	}
 }
 
+func TestC2aHandleHardlinkAuthorizesSrcViaHeader(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			Prefix: "/scratch",
+			Ops:    map[FSOp]bool{FSOpRead: true, FSOpWrite: true},
+		}},
+	}
+	r := newScopedRequest(t, http.MethodPost, "/v1/fs/scratch/exfil.env", "hardlink=1")
+	r.Header.Set("X-Dat9-Hardlink-Source", "/secrets/api-key.env")
+	r = r.WithContext(withScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	(&Server{}).handleHardlink(w, r, "/scratch/exfil.env")
+
+	if got := w.Result().StatusCode; got != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d (src in header must be authorized). body=%s",
+			got, http.StatusForbidden, w.Body.String())
+	}
+}
+
+func TestC2aHandleHardlinkAllowsBothInZone(t *testing.T) {
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{
+			{Prefix: "/source", Ops: map[FSOp]bool{FSOpRead: true}},
+			{Prefix: "/dest", Ops: map[FSOp]bool{FSOpWrite: true}},
+		},
+	}
+	r := newScopedRequest(t, http.MethodPost, "/v1/fs/dest/a.txt", "hardlink=1")
+	r.Header.Set("X-Dat9-Hardlink-Source", "/source/a.txt")
+	r = r.WithContext(withScope(r.Context(), scope))
+	w := httptest.NewRecorder()
+	(&Server{}).handleHardlink(w, r, "/dest/a.txt")
+
+	if got := w.Result().StatusCode; got != http.StatusUnauthorized {
+		t.Errorf("status = %d, want %d (authorize passed; backend missing). body=%s",
+			got, http.StatusUnauthorized, w.Body.String())
+	}
+}
+
 // TestC2aHandleRenameSrcRequiresDeleteNotWrite pins the banked rename
 // invariant: rename's src op is DELETE (the file disappears), not WRITE.
 // A token with read+write on the source zone but NO delete cannot rename
@@ -603,6 +643,7 @@ func TestC2aDispatcherWriteSideAllowed(t *testing.T) {
 			{http.MethodDelete, "recursive=1&kind=dir"},
 			{http.MethodPost, "append=1"},
 			{http.MethodPost, "copy=1"},
+			{http.MethodPost, "hardlink=1"},
 			{http.MethodPost, "rename=1"},
 			{http.MethodPost, "mkdir=1"},
 			{http.MethodPost, "mkdir=1&mode=755"},
@@ -629,6 +670,8 @@ func TestC2aDispatcherWriteSideAllowed(t *testing.T) {
 		cases := []string{
 			"append=1&copy=1",
 			"copy=1&rename=1",
+			"copy=1&hardlink=1",
+			"hardlink=1&rename=1",
 			"mkdir=1&create=1",
 			"create=1&symlink=1",
 			"copy=1&chmod=1", // chmod combined with anything → deny
@@ -668,6 +711,7 @@ func TestC2aDispatcherWriteSideAllowed(t *testing.T) {
 			why   string
 		}{
 			{"copy=1&mode=755", "mode is a mkdir-arm key, not copy-arm"},
+			{"hardlink=1&mode=755", "mode is a mkdir-arm key, not hardlink-arm"},
 			{"create=1&mode=755", "mode is a mkdir-arm key, not create-arm"},
 			{"append=1&extra=x", "append doesn't consume any filter param"},
 		}
@@ -759,18 +803,18 @@ func TestC2bUploadsAdmittedAtDispatcher(t *testing.T) {
 		method string
 		path   string
 	}{
-		{http.MethodPost, "/v1/uploads"},                          // handleUploadInitiate
-		{http.MethodPost, "/v1/uploads/initiate"},                 // handleUploadInitiate
-		{http.MethodGet, "/v1/uploads"},                           // handleUploads list
-		{http.MethodPost, "/v1/uploads/upload-1/complete"},        // handleUploadComplete
-		{http.MethodPost, "/v1/uploads/upload-1/resume"},          // handleUploadResume
-		{http.MethodGet, "/v1/uploads/upload-1/resume"},           // handleUploadResume (GET form)
-		{http.MethodDelete, "/v1/uploads/upload-1"},               // handleUploadAbort
-		{http.MethodPost, "/v2/uploads/initiate"},                 // handleV2UploadInitiate
-		{http.MethodPost, "/v2/uploads/upload-1/presign"},         // handleV2PresignPart
-		{http.MethodPost, "/v2/uploads/upload-1/presign-batch"},   // handleV2PresignBatch
-		{http.MethodPost, "/v2/uploads/upload-1/complete"},        // handleV2UploadComplete
-		{http.MethodPost, "/v2/uploads/upload-1/abort"},           // handleV2UploadAbort
+		{http.MethodPost, "/v1/uploads"},                        // handleUploadInitiate
+		{http.MethodPost, "/v1/uploads/initiate"},               // handleUploadInitiate
+		{http.MethodGet, "/v1/uploads"},                         // handleUploads list
+		{http.MethodPost, "/v1/uploads/upload-1/complete"},      // handleUploadComplete
+		{http.MethodPost, "/v1/uploads/upload-1/resume"},        // handleUploadResume
+		{http.MethodGet, "/v1/uploads/upload-1/resume"},         // handleUploadResume (GET form)
+		{http.MethodDelete, "/v1/uploads/upload-1"},             // handleUploadAbort
+		{http.MethodPost, "/v2/uploads/initiate"},               // handleV2UploadInitiate
+		{http.MethodPost, "/v2/uploads/upload-1/presign"},       // handleV2PresignPart
+		{http.MethodPost, "/v2/uploads/upload-1/presign-batch"}, // handleV2PresignBatch
+		{http.MethodPost, "/v2/uploads/upload-1/complete"},      // handleV2UploadComplete
+		{http.MethodPost, "/v2/uploads/upload-1/abort"},         // handleV2UploadAbort
 	}
 	for _, tc := range allowed {
 		r := newScopedRequest(t, tc.method, tc.path, "")
@@ -846,8 +890,8 @@ func TestHandlersRejectScopedRequestBeforeBackend(t *testing.T) {
 	}
 
 	cases := []struct {
-		name string
-		op   FSOp
+		name   string
+		op     FSOp
 		invoke func(s *Server, w http.ResponseWriter, r *http.Request)
 	}{
 		{"handleRead", FSOpRead, func(s *Server, w http.ResponseWriter, r *http.Request) {

@@ -33,6 +33,7 @@ const (
 	perfFuseSetAttr
 	perfFuseReadlink
 	perfFuseSymlink
+	perfFuseLink
 	perfFuseOpCount
 )
 
@@ -56,6 +57,7 @@ var perfFuseOpNames = [...]string{
 	perfFuseSetAttr:     "setattr",
 	perfFuseReadlink:    "readlink",
 	perfFuseSymlink:     "symlink",
+	perfFuseLink:        "link",
 }
 
 type perfRemoteOp int
