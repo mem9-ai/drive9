@@ -577,7 +577,7 @@ run_fast_worktree() {
   check_cmd "$slug $scenario cached diff restored" cmp -s "$cached_before" "$cached_after"
   check_cmd "$slug $scenario status restored" cmp -s "$status_before" "$status_after"
   check_cmd "$slug $scenario unstaged file restored" grep -q "$marker" "$worktree/agent-bench/worktree/unstaged.txt"
-  check_cmd "$slug $scenario fast worktree remove" drive9 git worktree remove --fast "$worktree"
+  check_cmd "$slug $scenario fast worktree remove" drive9 git worktree remove --fast --force "$worktree"
   check_cmd "$slug $scenario linked worktree removed from git metadata" bash -c 'out=$(git -C "$1" worktree list --porcelain) && ! printf "%s\n" "$out" | grep -q "^worktree $2$"' _ "$base_repo" "$worktree"
   check_cmd "$slug $scenario second mount log audit" audit_mount_log "$log_b"
   stop_mount

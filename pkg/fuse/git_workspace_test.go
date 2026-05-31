@@ -1104,6 +1104,43 @@ func TestWriteLinkedGitFileUsesRelativeMountPath(t *testing.T) {
 	}
 }
 
+func TestWriteLinkedGitFileUsesGitDirRel(t *testing.T) {
+	localRoot := t.TempDir()
+	overlay := NewLocalOverlay(localRoot)
+	if err := overlay.EnsureRoot(); err != nil {
+		t.Fatalf("EnsureRoot: %v", err)
+	}
+	fs := &Dat9FS{localOverlay: overlay}
+	common := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{WorkspaceID: "base", WorkspaceKind: "main"},
+		localRoot: "/repo",
+	}
+	linked := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID:       "wt",
+			WorkspaceKind:     "linked",
+			CommonWorkspaceID: "base",
+			WorktreeName:      "wt",
+			GitDirRel:         "custom/worktrees/wt",
+		},
+		localRoot: "/repo-wt",
+	}
+	gitFile, err := overlay.abs("/repo-wt/.git")
+	if err != nil {
+		t.Fatalf("overlay abs: %v", err)
+	}
+	if err := fs.writeLinkedGitFile(linked, common, gitFile); err != nil {
+		t.Fatalf("writeLinkedGitFile: %v", err)
+	}
+	got, err := os.ReadFile(gitFile)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != "gitdir: ../repo/.git/custom/worktrees/wt\n" {
+		t.Fatalf(".git file = %q", got)
+	}
+}
+
 func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found")
@@ -1144,6 +1181,7 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 	}
 	fs, commonRT, linkedRT := newLinkedGitWorkspaceTestFS(localRoot, overlay, fixture.client(), linkedRepo)
 	commonRT.restored = true
+	linkedRT.workspace.GitDirRel = "custom/worktrees/" + linkedRepo.worktreeName
 
 	if err := fs.ensureGitStateRestored(context.Background(), linkedRT); err != nil {
 		t.Fatalf("ensure linked git state restored: %v", err)
@@ -1153,7 +1191,7 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read linked .git file: %v", err)
 	}
-	wantGitFile := "gitdir: ../repo/.git/worktrees/" + linkedRepo.worktreeName + "\n"
+	wantGitFile := "gitdir: ../repo/.git/custom/worktrees/" + linkedRepo.worktreeName + "\n"
 	if string(got) != wantGitFile {
 		t.Fatalf("linked .git file = %q, want %q", got, wantGitFile)
 	}
@@ -1163,6 +1201,21 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 	}
 	if !gitDirLooksUsable(context.Background(), restoredLinkedGitDir) {
 		t.Fatalf("restored linked gitdir is not usable: %s", restoredLinkedGitDir)
+	}
+	gitDirFile, err := os.ReadFile(filepath.Join(restoredLinkedGitDir, "gitdir"))
+	if err != nil {
+		t.Fatalf("read restored linked gitdir file: %v", err)
+	}
+	wantMountedGitFile := filepath.Join(fs.opts.MountPoint, "repo-wt", ".git") + "\n"
+	if string(gitDirFile) != wantMountedGitFile {
+		t.Fatalf("restored gitdir file = %q, want %q", gitDirFile, wantMountedGitFile)
+	}
+	commonDir, err := os.ReadFile(filepath.Join(restoredLinkedGitDir, "commondir"))
+	if err != nil {
+		t.Fatalf("read restored commondir: %v", err)
+	}
+	if string(commonDir) != "../../..\n" {
+		t.Fatalf("restored commondir = %q, want ../../..", commonDir)
 	}
 	gotHead := fuseGitOutputForTest(t, "", "--git-dir", restoredLinkedGitDir, "rev-parse", "HEAD")
 	if gotHead != linkedRepo.headCommit {
@@ -1210,14 +1263,14 @@ func TestLinkedGitWorkspaceCheckpointUsesLinkedGitdir(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(linkedGitFile), 0o755); err != nil {
 		t.Fatalf("mkdir linked worktree: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(linkedGitDir, "gitdir"), []byte(linkedGitFile+"\n"), 0o644); err != nil {
-		t.Fatalf("rewrite linked gitdir file: %v", err)
-	}
 
 	fixture := newGitStateOnlyFixture(t)
 	fs, commonRT, linkedRT := newLinkedGitWorkspaceTestFS(localRoot, overlay, fixture.client(), linkedRepo)
 	commonRT.restored = true
 	linkedRT.restored = true
+	if err := os.WriteFile(filepath.Join(linkedGitDir, "gitdir"), []byte(fs.mountedGitFileForRuntime(linkedRT, linkedGitFile)+"\n"), 0o644); err != nil {
+		t.Fatalf("rewrite linked gitdir file: %v", err)
+	}
 	if err := fs.writeLinkedGitFile(linkedRT, commonRT, linkedGitFile); err != nil {
 		t.Fatalf("write linked .git file: %v", err)
 	}
@@ -2690,7 +2743,7 @@ func newLinkedGitWorkspaceTestFS(localRoot string, overlay *LocalOverlay, c *cli
 	}
 	fs := &Dat9FS{
 		client:       c,
-		opts:         &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true},
+		opts:         &MountOptions{MountPoint: filepath.Join(localRoot, "mount"), LocalRoot: localRoot, EnableGitWorkspaces: true},
 		git:          newGitWorkspaceLayer(),
 		localOverlay: overlay,
 	}

@@ -125,6 +125,55 @@ func TestGitFastWorktreeAddArgs(t *testing.T) {
 	if got, want := strings.Join(args, " "), "-C /mnt/base worktree add --no-checkout --detach /mnt/wt abc123"; got != want {
 		t.Fatalf("detached worktree args = %q, want %q", got, want)
 	}
+	args = gitFastWorktreeAddArgs("/mnt/base", "/mnt/wt", "", false, "feature")
+	if got, want := strings.Join(args, " "), "-C /mnt/base worktree add --no-checkout /mnt/wt feature"; got != want {
+		t.Fatalf("existing branch worktree args = %q, want %q", got, want)
+	}
+}
+
+func TestGitFastWorktreeAddCommitPreservesExistingBranchish(t *testing.T) {
+	if got := gitFastWorktreeAddCommit("", false, "feature", "abc123"); got != "feature" {
+		t.Fatalf("commit arg = %q, want original branchish", got)
+	}
+	if got := gitFastWorktreeAddCommit("new-feature", false, "feature", "abc123"); got != "abc123" {
+		t.Fatalf("new branch commit arg = %q, want resolved commit", got)
+	}
+	if got := gitFastWorktreeAddCommit("", true, "feature", "abc123"); got != "abc123" {
+		t.Fatalf("detached commit arg = %q, want resolved commit", got)
+	}
+}
+
+func TestGitWorktreeStatusClean(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	repo := t.TempDir()
+	runTestGit(t, "", "init", "-b", "main", repo)
+	runTestGit(t, repo, "config", "user.email", "drive9-test@example.invalid")
+	runTestGit(t, repo, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runTestGit(t, repo, "add", ".")
+	runTestGit(t, repo, "commit", "-m", "initial")
+
+	clean, status, err := gitWorktreeStatusClean(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("gitWorktreeStatusClean clean repo: %v", err)
+	}
+	if !clean || status != "" {
+		t.Fatalf("clean=%t status=%q, want clean empty status", clean, status)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clean, status, err = gitWorktreeStatusClean(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("gitWorktreeStatusClean dirty repo: %v", err)
+	}
+	if clean || !strings.Contains(status, "dirty.txt") {
+		t.Fatalf("clean=%t status=%q, want dirty status", clean, status)
+	}
 }
 
 func TestResolveGitHydrateMode(t *testing.T) {

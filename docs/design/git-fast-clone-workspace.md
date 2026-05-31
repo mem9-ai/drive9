@@ -168,7 +168,7 @@ V1 uses explicit Drive9 commands and does not transparently intercept native `gi
 
 ```bash
 drive9 git worktree add --fast [-b <branch>] [--detach] [--blobless] [--hydrate=auto|background|sync|off] <base-repo-path> <worktree-path> [<commit-ish>]
-drive9 git worktree remove --fast <worktree-path>
+drive9 git worktree remove --fast [--force] <worktree-path>
 ```
 
 `drive9 git worktree add --fast`:
@@ -191,10 +191,11 @@ drive9 git worktree remove --fast <worktree-path>
 `drive9 git worktree remove --fast`:
 
 1. Resolves `<worktree-path>` to a linked fast workspace.
-2. Removes the common `.git/worktrees/<name>` metadata from the local overlay and runs `git worktree prune` as best-effort local cleanup.
-3. Checkpoints the common workspace `.git`.
-4. Marks the linked `git_workspaces` row deleted and removes the linked local overlay root.
-5. Best-effort removes the empty mounted worktree root. It does not generate clean-tree whiteouts and does not recursively unlink virtual manifest files.
+2. Refuses removal when `git status --porcelain` reports staged, unstaged, or untracked changes, unless the caller passes `--force`.
+3. Removes the common `.git/worktrees/<name>` metadata from the local overlay and runs `git worktree prune` as best-effort local cleanup.
+4. Checkpoints the common workspace `.git`.
+5. Marks the linked `git_workspaces` row deleted and removes the linked local overlay root.
+6. Best-effort removes the empty mounted worktree root. It does not generate clean-tree whiteouts and does not recursively unlink virtual manifest files.
 
 Linked worktree restore:
 

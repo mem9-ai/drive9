@@ -306,6 +306,17 @@ func (fs *Dat9FS) linkedGitDir(rt, commonRT *gitWorkspaceRuntime) (string, error
 	if err != nil {
 		return "", err
 	}
+	rel, err := linkedGitDirRel(rt)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(commonGitDir, filepath.FromSlash(rel)), nil
+}
+
+func linkedGitDirRel(rt *gitWorkspaceRuntime) (string, error) {
+	if rt == nil {
+		return "", fmt.Errorf("git workspace runtime is nil")
+	}
 	rel := strings.Trim(strings.TrimSpace(rt.workspace.GitDirRel), "/")
 	if rel == "" {
 		name := strings.TrimSpace(rt.workspace.WorktreeName)
@@ -314,10 +325,15 @@ func (fs *Dat9FS) linkedGitDir(rt, commonRT *gitWorkspaceRuntime) (string, error
 		}
 		rel = path.Join("worktrees", name)
 	}
-	if strings.ContainsRune(rel, '\x00') || strings.HasPrefix(rel, "../") || strings.Contains(rel, "/../") || rel == ".." {
+	if strings.ContainsRune(rel, '\x00') || strings.ContainsRune(rel, '\\') {
 		return "", fmt.Errorf("linked git workspace %s has unsafe gitdir_rel %q", rt.workspace.WorkspaceID, rt.workspace.GitDirRel)
 	}
-	return filepath.Join(commonGitDir, filepath.FromSlash(rel)), nil
+	for _, part := range strings.Split(rel, "/") {
+		if part == "" || part == "." || part == ".." {
+			return "", fmt.Errorf("linked git workspace %s has unsafe gitdir_rel %q", rt.workspace.WorkspaceID, rt.workspace.GitDirRel)
+		}
+	}
+	return path.Clean(rel), nil
 }
 
 func (fs *Dat9FS) writeLinkedGitFile(rt, commonRT *gitWorkspaceRuntime, gitFile string) error {
@@ -327,16 +343,29 @@ func (fs *Dat9FS) writeLinkedGitFile(rt, commonRT *gitWorkspaceRuntime, gitFile 
 	if err := os.MkdirAll(filepath.Dir(gitFile), 0o755); err != nil {
 		return err
 	}
-	name := strings.TrimSpace(rt.workspace.WorktreeName)
-	if name == "" {
-		return fmt.Errorf("linked git workspace %s has no worktree name", rt.workspace.WorkspaceID)
+	relGitDir, err := linkedGitDirRel(rt)
+	if err != nil {
+		return err
 	}
-	target := path.Join(commonRT.localRoot, ".git", "worktrees", name)
+	target := path.Join(commonRT.localRoot, ".git", relGitDir)
 	rel, err := filepath.Rel(filepath.FromSlash(rt.localRoot), filepath.FromSlash(target))
 	if err != nil {
 		return err
 	}
 	return os.WriteFile(gitFile, []byte("gitdir: "+filepath.ToSlash(rel)+"\n"), 0o644)
+}
+
+func (fs *Dat9FS) mountedGitFileForRuntime(rt *gitWorkspaceRuntime, fallback string) string {
+	if rt == nil {
+		return fallback
+	}
+	localGitFile := path.Join(rt.localRoot, ".git")
+	if fs != nil && fs.opts != nil {
+		if mountPoint := strings.TrimSpace(fs.opts.MountPoint); mountPoint != "" {
+			return filepath.Join(mountPoint, filepath.FromSlash(strings.TrimPrefix(localGitFile, "/")))
+		}
+	}
+	return filepath.FromSlash(localGitFile)
 }
 
 func (fs *Dat9FS) gitWorkspaceOwnsPath(ctx context.Context, localPath string) bool {
@@ -1267,13 +1296,22 @@ func (fs *Dat9FS) restoreLinkedGitStateAtomically(ctx context.Context, rt, commo
 	if err := extractGitArchive(state.Content, tmpGitDir); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(tmpGitDir, "commondir"), []byte("../..\n"), 0o644); err != nil {
+	commonGitDir, err := fs.gitDirForRuntime(commonRT)
+	if err != nil {
+		return err
+	}
+	commonDirRel, err := filepath.Rel(linkedGitDir, commonGitDir)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(tmpGitDir, "commondir"), []byte(filepath.ToSlash(commonDirRel)+"\n"), 0o644); err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(linkedGitFile), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(tmpGitDir, "gitdir"), []byte(linkedGitFile+"\n"), 0o644); err != nil {
+	mountedGitFile := fs.mountedGitFileForRuntime(rt, linkedGitFile)
+	if err := os.WriteFile(filepath.Join(tmpGitDir, "gitdir"), []byte(mountedGitFile+"\n"), 0o644); err != nil {
 		return err
 	}
 	if err := os.RemoveAll(linkedGitDir); err != nil {

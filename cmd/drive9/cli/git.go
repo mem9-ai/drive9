@@ -67,7 +67,7 @@ commands:
                        create a local .git and register the HEAD tree
   worktree add --fast [-b <branch>] [--detach] [--blobless] [--hydrate=auto|background|sync|off] <base-repo-path> <worktree-path> [<commit-ish>]
                        add a linked worktree without checking out file contents
-  worktree remove --fast <worktree-path>
+  worktree remove --fast [--force] <worktree-path>
                        remove a fast linked worktree without per-file whiteouts
   hydrate <mounted-path>
                        materialize a blobless clean tree into local cache
@@ -226,7 +226,7 @@ func gitWorktreeUsage() {
 
 commands:
   add --fast [-b <branch>] [--detach] [--blobless] [--hydrate=auto|background|sync|off] <base-repo-path> <worktree-path> [<commit-ish>]
-  remove --fast <worktree-path>
+  remove --fast [--force] <worktree-path>
 `)
 }
 
@@ -297,7 +297,8 @@ func gitWorktreeAdd(args []string) error {
 		return fmt.Errorf("resolve commit %q: %w", commitish, err)
 	}
 
-	worktreeArgs := gitFastWorktreeAddArgs(basePath, worktreePath, *branch, *detach || *branch == "", resolvedCommit)
+	worktreeCommit := gitFastWorktreeAddCommit(*branch, *detach, commitish, resolvedCommit)
+	worktreeArgs := gitFastWorktreeAddArgs(basePath, worktreePath, *branch, *detach, worktreeCommit)
 	if err := runGitStreaming(cmdCtx, worktreeArgs...); err != nil {
 		return fmt.Errorf("git worktree add failed: %w", err)
 	}
@@ -415,11 +416,19 @@ func gitFastWorktreeAddArgs(basePath, worktreePath, branch string, detach bool, 
 	return args
 }
 
+func gitFastWorktreeAddCommit(branch string, detach bool, commitish, resolvedCommit string) string {
+	if branch != "" || detach {
+		return resolvedCommit
+	}
+	return commitish
+}
+
 func gitWorktreeRemove(args []string) error {
 	fs := flag.NewFlagSet("git worktree remove", flag.ContinueOnError)
 	fast := fs.Bool("fast", false, "use drive9 git fast worktree remove")
+	force := fs.Bool("force", false, "remove even when the linked worktree has local changes")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 git worktree remove --fast <worktree-path>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: drive9 git worktree remove --fast [--force] <worktree-path>\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -465,6 +474,15 @@ func gitWorktreeRemove(args []string) error {
 	if err != nil {
 		return err
 	}
+	if !*force {
+		clean, status, err := gitWorktreeStatusClean(cmdCtx, target)
+		if err != nil {
+			return fmt.Errorf("check linked worktree status before remove: %w", err)
+		}
+		if !clean {
+			return fmt.Errorf("linked worktree %s has local changes; commit/stash them or rerun with --force\n%s", target, status)
+		}
+	}
 	if commonResolved.LocalGitDir != "" && strings.TrimSpace(ws.WorktreeName) != "" {
 		if err := os.RemoveAll(filepath.Join(commonResolved.LocalGitDir, "worktrees", ws.WorktreeName)); err != nil {
 			return fmt.Errorf("remove common worktree gitdir: %w", err)
@@ -490,6 +508,15 @@ func gitWorktreeRemove(args []string) error {
 	}
 	fmt.Fprintf(os.Stderr, "drive9: removed linked git workspace %s at :%s\n", ws.WorkspaceID, resolved.RemotePath)
 	return nil
+}
+
+func gitWorktreeStatusClean(ctx context.Context, worktreePath string) (bool, string, error) {
+	status, err := gitOutput(ctx, worktreePath, "status", "--porcelain=v1", "--untracked-files=all")
+	if err != nil {
+		return false, "", err
+	}
+	status = strings.TrimSpace(status)
+	return status == "", status, nil
 }
 
 type gitHydrateMode string

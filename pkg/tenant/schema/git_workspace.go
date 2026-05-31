@@ -23,6 +23,9 @@ func GitWorkspaceTiDBSchemaStatements() []string {
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
+		// Repair existing git_workspaces tables created before linked worktree
+		// metadata existed. ExecSchemaStatementsContext tolerates duplicate
+		// column errors for fresh schemas.
 		`ALTER TABLE git_workspaces ADD COLUMN workspace_kind VARCHAR(16) NOT NULL DEFAULT 'main'`,
 		`ALTER TABLE git_workspaces ADD COLUMN common_workspace_id VARCHAR(64) NOT NULL DEFAULT ''`,
 		`ALTER TABLE git_workspaces ADD COLUMN worktree_name VARCHAR(255) NOT NULL DEFAULT ''`,
@@ -116,6 +119,9 @@ func GitWorkspaceDB9SchemaStatements() []string {
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
+		// Repair existing git_workspaces tables created before linked worktree
+		// metadata existed. ExecSchemaStatementsContext tolerates duplicate
+		// column errors for fresh schemas.
 		`ALTER TABLE git_workspaces ADD COLUMN workspace_kind VARCHAR(16) NOT NULL DEFAULT 'main'`,
 		`ALTER TABLE git_workspaces ADD COLUMN common_workspace_id VARCHAR(64) NOT NULL DEFAULT ''`,
 		`ALTER TABLE git_workspaces ADD COLUMN worktree_name VARCHAR(255) NOT NULL DEFAULT ''`,

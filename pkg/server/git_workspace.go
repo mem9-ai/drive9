@@ -256,6 +256,10 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 	workspaceID := token.NewID()
 	existing, err := store.GetGitWorkspaceByRoot(r.Context(), root)
 	if err == nil {
+		if workspaceKind == datastore.GitWorkspaceKindLinked && commonWorkspaceID == existing.WorkspaceID {
+			errJSON(w, http.StatusBadRequest, "linked git workspace cannot reference itself as common_workspace_id")
+			return
+		}
 		workspaceID = existing.WorkspaceID
 	} else if !errors.Is(err, datastore.ErrNotFound) {
 		writeGitWorkspaceStoreError(w, err)

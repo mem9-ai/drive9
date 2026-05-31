@@ -229,8 +229,8 @@ developer machines or EC2-style validation rather than the default smoke path.
 8. Fast worktree scenario: clone a base workspace, run
    `drive9 git worktree add --fast --blobless`, commit in the linked worktree,
    leave another staged edit and unstaged file, unmount, remount with a fresh
-   local root, verify `git worktree list`/`status`/`log`, then remove the
-   linked workspace with `drive9 git worktree remove --fast`
+   local root, verify `git worktree list`/`status`/`log`, then force-remove the
+   intentionally dirty linked workspace with `drive9 git worktree remove --fast --force`
 9. Audit mount logs for fatal FUSE/Git workspace patterns such as short reads
 
 ### `posix-permission-smoke-test.sh`
