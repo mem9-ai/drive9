@@ -1205,20 +1205,16 @@ func (b *Dat9Backend) HardlinkFileCtx(ctx context.Context, srcPath, dstPath stri
 	start := time.Now()
 	defer func() { observeBackend(ctx, "hardlink_file", err, start) }()
 
-	srcPath, err = pathutil.Canonicalize(srcPath)
+	dstPath, err = pathutil.Canonicalize(dstPath)
 	if err != nil {
 		return err
 	}
-	dstPath, err = pathutil.Canonicalize(dstPath)
+	srcPath, srcNode, err := b.resolveNodePath(ctx, srcPath)
 	if err != nil {
 		return err
 	}
 	if srcPath == dstPath {
 		return datastore.ErrPathConflict
-	}
-	srcNode, err := b.store.GetNode(ctx, srcPath)
-	if err != nil {
-		return err
 	}
 	if srcNode.IsDirectory {
 		return ErrInvalidHardlinkTarget
