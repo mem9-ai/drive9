@@ -127,14 +127,6 @@ type tidbPrimaryKeySpec struct {
 	columns []string
 }
 
-func (pk tidbPrimaryKeySpec) repairSQL(tableName string, needsDrop bool) string {
-	cols := strings.Join(pk.columns, ", ")
-	if needsDrop {
-		return fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY, ADD PRIMARY KEY (%s)", tableName, cols)
-	}
-	return fmt.Sprintf("ALTER TABLE %s ADD PRIMARY KEY (%s)", tableName, cols)
-}
-
 type tidbUniqueIndexRepair struct {
 	tableName string
 	indexName string
@@ -1436,28 +1428,16 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 	if len(table.primaryKey.columns) > 0 {
 		actualPrimaryKey, ok := parsePrimaryKeyColumnsFromCreateStatement(createStmt)
 		if !ok {
-			// Distinguish "unable to parse CREATE statement" from "parsed OK but no PK found".
-			// Only attempt repair when we successfully parsed the statement and confirmed the PK is missing.
-			if _, _, parseOk, parseErr := parseCreateTableStatement(createStmt); parseErr != nil || !parseOk {
-				diffs = append(diffs, tidbSchemaDiff{
-					kind:      tidbSchemaDiffTableContract,
-					tableName: table.name,
-					detail:    fmt.Sprintf("%s schema contract: unable to inspect primary key", table.name),
-				})
-			} else {
-				diffs = append(diffs, tidbSchemaDiff{
-					kind:      tidbSchemaDiffTableContract,
-					tableName: table.name,
-					detail:    fmt.Sprintf("%s schema contract: missing primary key constraint", table.name),
-					repairSQL: table.primaryKey.repairSQL(table.name, false),
-				})
-			}
+			diffs = append(diffs, tidbSchemaDiff{
+				kind:      tidbSchemaDiffTableContract,
+				tableName: table.name,
+				detail:    fmt.Sprintf("%s schema contract: missing primary key constraint", table.name),
+			})
 		} else if !equalStringSlices(actualPrimaryKey, table.primaryKey.columns) {
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:      tidbSchemaDiffTableContract,
 				tableName: table.name,
 				detail:    fmt.Sprintf("%s schema contract: primary key columns = (%s), want (%s)", table.name, strings.Join(actualPrimaryKey, ", "), strings.Join(table.primaryKey.columns, ", ")),
-				repairSQL: table.primaryKey.repairSQL(table.name, true),
 			})
 		}
 	}
@@ -1659,37 +1639,9 @@ func isSafeTiDBRepairDiff(diff tidbSchemaDiff) bool {
 		return isSafeAddColumnRepairSQL(diff.repairSQL)
 	case tidbSchemaDiffMissingIndex:
 		return isSafeAddIndexRepairSQL(diff.repairSQL)
-	case tidbSchemaDiffTableContract:
-		return diff.repairSQL != "" && isSafePrimaryKeyRepairSQL(diff.repairSQL)
 	default:
 		return false
 	}
-}
-
-func isSafePrimaryKeyRepairSQL(sqlText string) bool {
-	normalized := normalizeSQLFragment(sqlText)
-	if !strings.HasPrefix(normalized, "alter table ") {
-		return false
-	}
-	// Disallow statement chaining in safety gate.
-	if strings.Contains(normalized, ";") {
-		return false
-	}
-	// Reject statements that contain other ALTER actions besides PK changes.
-	disallowed := []string{
-		" add column ", " drop column ", " modify ", " change ", " rename ",
-		" drop index ", " add index ", " add unique ", " add constraint ",
-		" add key ", " drop key ", " add fulltext ", " add vector ",
-	}
-	for _, token := range disallowed {
-		if strings.Contains(normalized, token) {
-			return false
-		}
-	}
-	// Allow only the two exact shapes we generate.
-	hasAdd := strings.Contains(normalized, " add primary key (")
-	hasDropAdd := strings.Contains(normalized, " drop primary key, add primary key (")
-	return hasAdd || hasDropAdd
 }
 
 func isSafeAddColumnRepairSQL(sqlText string) bool {
