@@ -1435,12 +1435,22 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 	if len(table.primaryKey.columns) > 0 {
 		actualPrimaryKey, ok := parsePrimaryKeyColumnsFromCreateStatement(createStmt)
 		if !ok {
-			diffs = append(diffs, tidbSchemaDiff{
-				kind:      tidbSchemaDiffTableContract,
-				tableName: table.name,
-				detail:    fmt.Sprintf("%s schema contract: missing primary key constraint", table.name),
-				repairSQL: table.primaryKey.repairSQL(table.name, false),
-			})
+			// Distinguish "unable to parse CREATE statement" from "parsed OK but no PK found".
+			// Only attempt repair when we successfully parsed the statement and confirmed the PK is missing.
+			if _, _, parseOk, parseErr := parseCreateTableStatement(createStmt); parseErr != nil || !parseOk {
+				diffs = append(diffs, tidbSchemaDiff{
+					kind:      tidbSchemaDiffTableContract,
+					tableName: table.name,
+					detail:    fmt.Sprintf("%s schema contract: unable to inspect primary key", table.name),
+				})
+			} else {
+				diffs = append(diffs, tidbSchemaDiff{
+					kind:      tidbSchemaDiffTableContract,
+					tableName: table.name,
+					detail:    fmt.Sprintf("%s schema contract: missing primary key constraint", table.name),
+					repairSQL: table.primaryKey.repairSQL(table.name, false),
+				})
+			}
 		} else if !equalStringSlices(actualPrimaryKey, table.primaryKey.columns) {
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:      tidbSchemaDiffTableContract,
@@ -1657,7 +1667,28 @@ func isSafeTiDBRepairDiff(diff tidbSchemaDiff) bool {
 
 func isSafePrimaryKeyRepairSQL(sqlText string) bool {
 	normalized := normalizeSQLFragment(sqlText)
-	return strings.HasPrefix(normalized, "alter table ") && strings.Contains(normalized, "primary key")
+	if !strings.HasPrefix(normalized, "alter table ") {
+		return false
+	}
+	// Disallow statement chaining in safety gate.
+	if strings.Contains(normalized, ";") {
+		return false
+	}
+	// Reject statements that contain other ALTER actions besides PK changes.
+	disallowed := []string{
+		" add column ", " drop column ", " modify ", " change ", " rename ",
+		" drop index ", " add index ", " add unique ", " add constraint ",
+		" add key ", " drop key ", " add fulltext ", " add vector ",
+	}
+	for _, token := range disallowed {
+		if strings.Contains(normalized, token) {
+			return false
+		}
+	}
+	// Allow only the two exact shapes we generate.
+	hasAdd := strings.Contains(normalized, " add primary key (")
+	hasDropAdd := strings.Contains(normalized, " drop primary key, add primary key (")
+	return hasAdd || hasDropAdd
 }
 
 func isSafeAddColumnRepairSQL(sqlText string) bool {
