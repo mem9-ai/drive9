@@ -127,6 +127,14 @@ type tidbPrimaryKeySpec struct {
 	columns []string
 }
 
+func (pk tidbPrimaryKeySpec) repairSQL(tableName string, needsDrop bool) string {
+	cols := strings.Join(pk.columns, ", ")
+	if needsDrop {
+		return fmt.Sprintf("ALTER TABLE %s DROP PRIMARY KEY, ADD PRIMARY KEY (%s)", tableName, cols)
+	}
+	return fmt.Sprintf("ALTER TABLE %s ADD PRIMARY KEY (%s)", tableName, cols)
+}
+
 type tidbUniqueIndexRepair struct {
 	tableName string
 	indexName string
@@ -1431,12 +1439,14 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 				kind:      tidbSchemaDiffTableContract,
 				tableName: table.name,
 				detail:    fmt.Sprintf("%s schema contract: missing primary key constraint", table.name),
+				repairSQL: table.primaryKey.repairSQL(table.name, false),
 			})
 		} else if !equalStringSlices(actualPrimaryKey, table.primaryKey.columns) {
 			diffs = append(diffs, tidbSchemaDiff{
 				kind:      tidbSchemaDiffTableContract,
 				tableName: table.name,
 				detail:    fmt.Sprintf("%s schema contract: primary key columns = (%s), want (%s)", table.name, strings.Join(actualPrimaryKey, ", "), strings.Join(table.primaryKey.columns, ", ")),
+				repairSQL: table.primaryKey.repairSQL(table.name, true),
 			})
 		}
 	}
@@ -1638,9 +1648,16 @@ func isSafeTiDBRepairDiff(diff tidbSchemaDiff) bool {
 		return isSafeAddColumnRepairSQL(diff.repairSQL)
 	case tidbSchemaDiffMissingIndex:
 		return isSafeAddIndexRepairSQL(diff.repairSQL)
+	case tidbSchemaDiffTableContract:
+		return diff.repairSQL != "" && isSafePrimaryKeyRepairSQL(diff.repairSQL)
 	default:
 		return false
 	}
+}
+
+func isSafePrimaryKeyRepairSQL(sqlText string) bool {
+	normalized := normalizeSQLFragment(sqlText)
+	return strings.HasPrefix(normalized, "alter table ") && strings.Contains(normalized, "primary key")
 }
 
 func isSafeAddColumnRepairSQL(sqlText string) bool {
