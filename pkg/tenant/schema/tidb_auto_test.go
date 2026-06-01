@@ -612,6 +612,143 @@ func TestDiffTiDBTableMetaReportsPrimaryKeyColumnMismatch(t *testing.T) {
 	}
 }
 
+func TestDiffTiDBTableMetaMissingPrimaryKeyGeneratesRepairSQL(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "file_tags")
+	meta := tidbTableMeta{
+		tableName: "file_tags",
+		columns: map[string]tidbColumnMeta{
+			"file_id":   {columnType: "varchar(64)"},
+			"tag_key":   {columnType: "varchar(255)"},
+			"tag_value": {columnType: "varchar(255)"},
+		},
+	}
+	createStmt := `CREATE TABLE file_tags (
+		file_id VARCHAR(64) NOT NULL,
+		tag_key VARCHAR(255) NOT NULL,
+		tag_value VARCHAR(255),
+		KEY idx_kv (tag_key, tag_value)
+	)`
+
+	diffs := diffTiDBTableMeta(spec, meta, createStmt)
+	var pkDiff *tidbSchemaDiff
+	for i := range diffs {
+		if diffs[i].kind == tidbSchemaDiffTableContract && strings.Contains(diffs[i].detail, "missing primary key") {
+			pkDiff = &diffs[i]
+			break
+		}
+	}
+	if pkDiff == nil {
+		t.Fatalf("expected missing primary key diff, got %#v", diffs)
+	}
+	wantRepair := "ALTER TABLE file_tags ADD PRIMARY KEY (file_id, tag_key)"
+	if pkDiff.repairSQL != wantRepair {
+		t.Fatalf("missing PK repairSQL=%q, want %q", pkDiff.repairSQL, wantRepair)
+	}
+}
+
+func TestDiffTiDBTableMetaPrimaryKeyMismatchGeneratesRepairSQL(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "file_tags")
+	meta := tidbTableMeta{
+		tableName: "file_tags",
+		columns: map[string]tidbColumnMeta{
+			"file_id":   {columnType: "varchar(64)"},
+			"tag_key":   {columnType: "varchar(255)"},
+			"tag_value": {columnType: "varchar(255)"},
+		},
+	}
+	createStmt := `CREATE TABLE file_tags (
+		file_id VARCHAR(64) NOT NULL,
+		tag_key VARCHAR(255) NOT NULL,
+		tag_value VARCHAR(255),
+		PRIMARY KEY (tag_key, file_id),
+		KEY idx_kv (tag_key, tag_value)
+	)`
+
+	diffs := diffTiDBTableMeta(spec, meta, createStmt)
+	var pkDiff *tidbSchemaDiff
+	for i := range diffs {
+		if diffs[i].kind == tidbSchemaDiffTableContract && strings.Contains(diffs[i].detail, "primary key columns") {
+			pkDiff = &diffs[i]
+			break
+		}
+	}
+	if pkDiff == nil {
+		t.Fatalf("expected primary key mismatch diff, got %#v", diffs)
+	}
+	wantRepair := "ALTER TABLE file_tags DROP PRIMARY KEY, ADD PRIMARY KEY (file_id, tag_key)"
+	if pkDiff.repairSQL != wantRepair {
+		t.Fatalf("PK mismatch repairSQL=%q, want %q", pkDiff.repairSQL, wantRepair)
+	}
+}
+
+func TestDiffTiDBTableMetaUnparseableCreateStmtSkipsPKRepair(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "file_tags")
+	meta := tidbTableMeta{
+		tableName: "file_tags",
+		columns: map[string]tidbColumnMeta{
+			"file_id":   {columnType: "varchar(64)"},
+			"tag_key":   {columnType: "varchar(255)"},
+			"tag_value": {columnType: "varchar(255)"},
+		},
+	}
+	// Malformed CREATE statement — parsing should fail.
+	createStmt := `NOT A CREATE TABLE STATEMENT`
+
+	diffs := diffTiDBTableMeta(spec, meta, createStmt)
+	var pkDiff *tidbSchemaDiff
+	for i := range diffs {
+		if diffs[i].kind == tidbSchemaDiffTableContract && strings.Contains(diffs[i].detail, "primary key") {
+			pkDiff = &diffs[i]
+			break
+		}
+	}
+	if pkDiff == nil {
+		t.Fatalf("expected primary key inspection diff, got %#v", diffs)
+	}
+	if pkDiff.repairSQL != "" {
+		t.Fatalf("unparseable CREATE stmt should not produce repairSQL, got %q", pkDiff.repairSQL)
+	}
+}
+
+func TestIsSafePrimaryKeyRepairSQLAcceptsExactForms(t *testing.T) {
+	tests := []struct {
+		sql  string
+		want bool
+	}{
+		{"ALTER TABLE t ADD PRIMARY KEY (a)", true},
+		{"ALTER TABLE t DROP PRIMARY KEY, ADD PRIMARY KEY (a, b)", true},
+		{"ALTER TABLE t ADD PRIMARY KEY (a); DROP TABLE x", false},
+		{"ALTER TABLE t ADD COLUMN x INT, ADD PRIMARY KEY (a)", false},
+		{"ALTER TABLE t DROP PRIMARY KEY", false},
+		{"CREATE TABLE t (a INT PRIMARY KEY)", false},
+		{"SELECT 1", false},
+	}
+	for _, tt := range tests {
+		got := isSafePrimaryKeyRepairSQL(tt.sql)
+		if got != tt.want {
+			t.Fatalf("isSafePrimaryKeyRepairSQL(%q) = %v, want %v", tt.sql, got, tt.want)
+		}
+	}
+}
+
+func TestPlannedTiDBSchemaRepairsIncludesPrimaryKeyChanges(t *testing.T) {
+	diffs := []tidbSchemaDiff{
+		{kind: tidbSchemaDiffTableContract, tableName: "t", detail: "missing pk", repairSQL: "ALTER TABLE t ADD PRIMARY KEY (a)"},
+		{kind: tidbSchemaDiffTableContract, tableName: "t", detail: "pk mismatch", repairSQL: "ALTER TABLE t DROP PRIMARY KEY, ADD PRIMARY KEY (b)"},
+		{kind: tidbSchemaDiffTableContract, tableName: "t", detail: "unparseable", repairSQL: ""},
+	}
+	got := plannedTiDBSchemaRepairs(diffs)
+	if len(got) != 2 {
+		t.Fatalf("plannedTiDBSchemaRepairs() len=%d, want 2 (%#v)", len(got), got)
+	}
+	if got[0] != "ALTER TABLE t ADD PRIMARY KEY (a)" {
+		t.Fatalf("unexpected first repair: %q", got[0])
+	}
+	if got[1] != "ALTER TABLE t DROP PRIMARY KEY, ADD PRIMARY KEY (b)" {
+		t.Fatalf("unexpected second repair: %q", got[1])
+	}
+}
+
 func TestDiffTiDBTableMetaTreatsBooleanAndTinyIntAsEquivalent(t *testing.T) {
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "file_nodes")
 	meta := tidbTableMeta{
