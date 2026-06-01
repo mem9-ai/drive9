@@ -129,9 +129,16 @@ func TestGitFastWorktreeAddArgs(t *testing.T) {
 	if got, want := strings.Join(args, " "), "-C /mnt/base worktree add --no-checkout /mnt/wt feature"; got != want {
 		t.Fatalf("existing branch worktree args = %q, want %q", got, want)
 	}
+	args = gitFastWorktreeAddArgs("/mnt/base", "/mnt/wt", "", false, "")
+	if got, want := strings.Join(args, " "), "-C /mnt/base worktree add --no-checkout /mnt/wt"; got != want {
+		t.Fatalf("omitted commitish worktree args = %q, want %q", got, want)
+	}
 }
 
 func TestGitFastWorktreeAddCommitPreservesExistingBranchish(t *testing.T) {
+	if got := gitFastWorktreeAddCommit("", false, "", "abc123"); got != "" {
+		t.Fatalf("omitted commit arg = %q, want empty", got)
+	}
 	if got := gitFastWorktreeAddCommit("", false, "feature", "abc123"); got != "feature" {
 		t.Fatalf("commit arg = %q, want original branchish", got)
 	}
@@ -140,6 +147,30 @@ func TestGitFastWorktreeAddCommitPreservesExistingBranchish(t *testing.T) {
 	}
 	if got := gitFastWorktreeAddCommit("", true, "feature", "abc123"); got != "abc123" {
 		t.Fatalf("detached commit arg = %q, want resolved commit", got)
+	}
+}
+
+func TestGitWorktreeAddNoCommitishCreatesAttachedBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	root := t.TempDir()
+	base := filepath.Join(root, "base")
+	worktree := filepath.Join(root, "topic")
+	runTestGit(t, "", "init", "-b", "main", base)
+	runTestGit(t, base, "config", "user.email", "drive9-test@example.invalid")
+	runTestGit(t, base, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(base, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runTestGit(t, base, "add", ".")
+	runTestGit(t, base, "commit", "-m", "initial")
+
+	args := gitFastWorktreeAddArgs(base, worktree, "", false, gitFastWorktreeAddCommit("", false, "", ""))
+	runTestGit(t, "", args...)
+	branch := gitOutputForTest(t, worktree, "symbolic-ref", "--short", "HEAD")
+	if branch != "topic" {
+		t.Fatalf("branch = %q, want topic", branch)
 	}
 }
 

@@ -57,7 +57,10 @@ func TestGitWorkspaceUpsertRejectsSelfLinkedWorkspace(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	gotBody, _ := io.ReadAll(resp.Body)
+	gotBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response body: %v", err)
+	}
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400, body=%s", resp.StatusCode, gotBody)
 	}

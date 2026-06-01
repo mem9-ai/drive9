@@ -256,7 +256,7 @@ func gitWorktreeAdd(args []string) error {
 	}
 	basePath := fs.Arg(0)
 	worktreePath := fs.Arg(1)
-	commitish := "HEAD"
+	commitish := ""
 	if fs.NArg() == 3 {
 		commitish = fs.Arg(2)
 	}
@@ -292,9 +292,12 @@ func gitWorktreeAdd(args []string) error {
 	if err != nil {
 		return err
 	}
-	resolvedCommit, err := gitOutput(cmdCtx, basePath, "rev-parse", "--verify", commitish+"^{commit}")
-	if err != nil {
-		return fmt.Errorf("resolve commit %q: %w", commitish, err)
+	resolvedCommit := ""
+	if commitish != "" {
+		resolvedCommit, err = gitOutput(cmdCtx, basePath, "rev-parse", "--verify", commitish+"^{commit}")
+		if err != nil {
+			return fmt.Errorf("resolve commit %q: %w", commitish, err)
+		}
 	}
 
 	worktreeCommit := gitFastWorktreeAddCommit(*branch, *detach, commitish, resolvedCommit)
@@ -302,15 +305,15 @@ func gitWorktreeAdd(args []string) error {
 	if err := runGitStreaming(cmdCtx, worktreeArgs...); err != nil {
 		return fmt.Errorf("git worktree add failed: %w", err)
 	}
-	if err := initializeFastCloneIndex(cmdCtx, worktreePath, resolvedCommit); err != nil {
-		return err
-	}
-	configureFastCloneGitOptimizations(cmdCtx, worktreePath)
-
 	head, err := gitOutput(cmdCtx, worktreePath, "rev-parse", "HEAD")
 	if err != nil {
 		return fmt.Errorf("git rev-parse HEAD in worktree: %w", err)
 	}
+	if err := initializeFastCloneIndex(cmdCtx, worktreePath, head); err != nil {
+		return err
+	}
+	configureFastCloneGitOptimizations(cmdCtx, worktreePath)
+
 	branchName, branchErr := gitOutput(cmdCtx, worktreePath, "symbolic-ref", "--short", "-q", "HEAD")
 	if branchErr != nil {
 		branchName = ""
@@ -417,6 +420,9 @@ func gitFastWorktreeAddArgs(basePath, worktreePath, branch string, detach bool, 
 }
 
 func gitFastWorktreeAddCommit(branch string, detach bool, commitish, resolvedCommit string) string {
+	if commitish == "" {
+		return ""
+	}
 	if branch != "" || detach {
 		return resolvedCommit
 	}
