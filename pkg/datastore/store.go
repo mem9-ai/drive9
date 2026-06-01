@@ -512,6 +512,57 @@ func (s *Store) RefCount(ctx context.Context, fileID string) (count int64, err e
 	return count, err
 }
 
+// RefCounts returns path-reference counts for the supplied file IDs.
+func (s *Store) RefCounts(ctx context.Context, fileIDs []string) (counts map[string]int64, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "ref_counts", start, &err)
+
+	counts = make(map[string]int64)
+	seen := make(map[string]struct{}, len(fileIDs))
+	unique := make([]string, 0, len(fileIDs))
+	for _, fileID := range fileIDs {
+		if fileID == "" {
+			continue
+		}
+		if _, ok := seen[fileID]; ok {
+			continue
+		}
+		seen[fileID] = struct{}{}
+		unique = append(unique, fileID)
+	}
+	const batchSize = 500
+	for start := 0; start < len(unique); start += batchSize {
+		end := start + batchSize
+		if end > len(unique) {
+			end = len(unique)
+		}
+		batch := unique[start:end]
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT file_id, COUNT(*) FROM file_nodes WHERE file_id IN (`+questionPlaceholders(len(batch))+`) GROUP BY file_id`,
+			stringsToAny(batch)...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var fileID string
+			var count int64
+			if err := rows.Scan(&fileID, &count); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			counts[fileID] = count
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return counts, nil
+}
+
 // LinkFileNode atomically creates dstPath as another directory entry for the
 // same confirmed file entity referenced by srcPath.
 func (s *Store) LinkFileNode(ctx context.Context, srcPath, dstPath, dstParentPath, dstName, nodeID string, createdAt time.Time) (err error) {

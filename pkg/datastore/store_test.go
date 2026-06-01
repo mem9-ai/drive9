@@ -604,6 +604,16 @@ func TestLinkFileNodeSharesFileAndRefCount(t *testing.T) {
 	if count != 2 {
 		t.Fatalf("refcount = %d, want 2", count)
 	}
+	counts, err := s.RefCounts(ctx, []string{"f1", "f1", "missing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counts["f1"] != 2 {
+		t.Fatalf("batch refcount f1 = %d, want 2", counts["f1"])
+	}
+	if _, ok := counts["missing"]; ok {
+		t.Fatal("batch refcount returned missing file")
+	}
 	if err := s.LinkFileNode(ctx, "/a.txt", "/b.txt", "/", "b.txt", "n3", now); !errors.Is(err, ErrPathConflict) {
 		t.Fatalf("duplicate LinkFileNode error = %v, want ErrPathConflict", err)
 	}

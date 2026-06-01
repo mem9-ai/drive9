@@ -824,6 +824,17 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 		return nil, err
 	}
 
+	fileIDs := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.File != nil && e.File.FileID != "" {
+			fileIDs = append(fileIDs, e.File.FileID)
+		}
+	}
+	refCounts, err := b.store.RefCounts(ctx, fileIDs)
+	if err != nil {
+		return nil, err
+	}
+
 	infos = make([]filesystem.FileInfo, 0, len(entries))
 	for _, e := range entries {
 		info := filesystem.FileInfo{
@@ -841,10 +852,7 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 			info.Size = e.File.SizeBytes
 			info.ModTime = fileMtime(e.File)
 			meta["resource_id"] = e.File.FileID
-			count, err := b.store.RefCount(ctx, e.File.FileID)
-			if err != nil {
-				return nil, err
-			}
+			count := refCounts[e.File.FileID]
 			if count <= 0 {
 				count = 1
 			}

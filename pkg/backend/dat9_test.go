@@ -685,6 +685,28 @@ func TestHardlinkFileSharesContentAndRejectsDirectories(t *testing.T) {
 	if count != 2 {
 		t.Fatalf("refcount = %d, want 2", count)
 	}
+	entries, err := b.ReadDir("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) < 2 {
+		t.Fatalf("root entries = %d, want at least 2", len(entries))
+	}
+	resourceID := entries[0].Meta.Content["resource_id"]
+	if resourceID == "" {
+		t.Fatal("hardlink ReadDir resource_id is empty")
+	}
+	for _, entry := range entries {
+		if entry.Name != "a.txt" && entry.Name != "b.txt" {
+			continue
+		}
+		if got := entry.Meta.Content["resource_id"]; got != resourceID {
+			t.Fatalf("%s resource_id = %q, want %q", entry.Name, got, resourceID)
+		}
+		if got := entry.Meta.Content["nlink"]; got != "2" {
+			t.Fatalf("%s nlink = %q, want 2", entry.Name, got)
+		}
+	}
 	if err := b.HardlinkFile("/a.txt", "/b.txt"); !errors.Is(err, datastore.ErrPathConflict) {
 		t.Fatalf("duplicate HardlinkFile error = %v, want ErrPathConflict", err)
 	}
