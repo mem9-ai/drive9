@@ -1197,7 +1197,7 @@ func (fs *Dat9FS) ensureLinkedGitStateRestored(ctx context.Context, rt *gitWorks
 	if err != nil {
 		return err
 	}
-	if gitDirLooksUsable(ctx, linkedGitDir) {
+	if _, err := os.Lstat(linkedGitFile); err == nil && gitDirLooksUsable(ctx, linkedGitDir) {
 		if err := fs.writeLinkedGitFile(rt, commonRT, linkedGitFile); err != nil {
 			return err
 		}
@@ -1205,6 +1205,8 @@ func (fs *Dat9FS) ensureLinkedGitStateRestored(ctx context.Context, rt *gitWorks
 		rt.restored = true
 		rt.mu.Unlock()
 		return nil
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
 	}
 	state, err := fs.client.GetGitState(ctx, rt.workspace.WorkspaceID)
 	if err != nil {

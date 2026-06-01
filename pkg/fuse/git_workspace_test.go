@@ -1223,6 +1223,62 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 	}
 }
 
+func TestLinkedGitWorkspaceRestoreIgnoresStaleCommonGitdir(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	linkedRepo := createLinkedGitWorktreeForTest(t)
+	commonState, err := archiveLocalGitDir(linkedRepo.commonGitDir)
+	if err != nil {
+		t.Fatalf("archive common git state: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(linkedRepo.linkedWorktree, "README.md"), []byte("staged linked worktree content\n"), 0o644); err != nil {
+		t.Fatalf("write linked readme: %v", err)
+	}
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "add", "README.md")
+	stagedIndex := fuseGitOutputForTest(t, "", "--git-dir", linkedRepo.linkedGitDir, "ls-files", "-s", "--", "README.md")
+	linkedState, err := archiveLocalGitDir(linkedRepo.linkedGitDir)
+	if err != nil {
+		t.Fatalf("archive linked git state: %v", err)
+	}
+
+	localRoot := t.TempDir()
+	overlay := NewLocalOverlay(localRoot)
+	if err := overlay.EnsureRoot(); err != nil {
+		t.Fatalf("EnsureRoot: %v", err)
+	}
+	commonGitDir, err := overlay.abs("/repo/.git")
+	if err != nil {
+		t.Fatalf("common git dir: %v", err)
+	}
+	if err := extractGitArchive(commonState, commonGitDir); err != nil {
+		t.Fatalf("extract common git state: %v", err)
+	}
+
+	fixture := newGitStateOnlyFixture(t)
+	fixture.states["linked"] = client.GitState{
+		WorkspaceID:      "linked",
+		CheckpointCommit: linkedRepo.headCommit,
+		StorageType:      gitStateStorageTarGzNoObjects,
+		SizeBytes:        int64(len(linkedState)),
+		Content:          linkedState,
+	}
+	fs, commonRT, linkedRT := newLinkedGitWorkspaceTestFS(localRoot, overlay, fixture.client(), linkedRepo)
+	commonRT.restored = true
+
+	if err := fs.ensureGitStateRestored(context.Background(), linkedRT); err != nil {
+		t.Fatalf("ensure linked git state restored: %v", err)
+	}
+	restoredLinkedGitDir, err := fs.linkedGitDir(linkedRT, commonRT)
+	if err != nil {
+		t.Fatalf("linked gitdir: %v", err)
+	}
+	restoredIndex := fuseGitOutputForTest(t, "", "--git-dir", restoredLinkedGitDir, "ls-files", "-s", "--", "README.md")
+	if restoredIndex != stagedIndex {
+		t.Fatalf("restored linked index = %q, want %q", restoredIndex, stagedIndex)
+	}
+}
+
 func TestLinkedGitWorkspaceCheckpointUsesLinkedGitdir(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found")
