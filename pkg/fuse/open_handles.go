@@ -83,6 +83,24 @@ func (idx *OpenHandleIndex) SnapshotPath(p string) []*FileHandle {
 	return out
 }
 
+// SnapshotInode returns a point-in-time copy of handles currently indexed by inode.
+func (idx *OpenHandleIndex) SnapshotInode(ino uint64) []*FileHandle {
+	if idx == nil || ino == 0 {
+		return nil
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	handles := idx.byInode[ino]
+	if len(handles) == 0 {
+		return nil
+	}
+	out := make([]*FileHandle, 0, len(handles))
+	for fh := range handles {
+		out = append(out, fh)
+	}
+	return out
+}
+
 func (idx *OpenHandleIndex) RenamePathPrefix(oldPath, newPath string) map[*FileHandle]string {
 	if idx == nil || oldPath == "" || newPath == "" {
 		return nil

@@ -63,7 +63,8 @@ func (s *Store) CreateJournal(ctx context.Context, tenantID string, req journal.
 	}
 
 	var out *journal.Journal
-	for attempt := 0; attempt < 3; attempt++ {
+	const maxCreateAttempts = 8
+	for attempt := 0; attempt < maxCreateAttempts; attempt++ {
 		out = nil
 		err = s.InTx(ctx, func(tx *sql.Tx) error {
 			existing, existingCreateHash, err := selectJournalTx(ctx, tx, tenantID, req.JournalID, true)
@@ -127,7 +128,7 @@ func (s *Store) CreateJournal(ctx context.Context, tenantID string, req journal.
 		if !isRetryableJournalCreateConflict(err) {
 			break
 		}
-		time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
+		time.Sleep(time.Duration(1<<attempt) * 5 * time.Millisecond)
 	}
 	if err != nil {
 		opErr = err

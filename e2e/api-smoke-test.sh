@@ -13,7 +13,7 @@
 #  9) Semantic text recall checks (`grep` with paraphrase query)
 # 10) Image-associated recall checks (caption text + image file)
 # 11) SQL endpoint sanity query
-# 12) Copy, rename, delete
+# 12) Copy, hardlink, rename, delete
 # 13) Final list verification
 # 14) 100MB multipart upload via POST /v1/uploads/initiate + download checksum
 # 15) Max-upload boundary check (limit allowed, limit+1 rejected)
@@ -119,6 +119,12 @@ curl_body_code() {
 
 http_code() { printf '%s' "$1" | awk -F'__HTTP__' 'NF>1{print $2}' | tr -d '\n'; }
 json_body() { printf '%s' "$1" | sed '/__HTTP__/d'; }
+
+header_value() {
+  local header_file="$1"
+  local header_name="$2"
+  awk -F': *' -v name="$header_name" 'tolower($1)==tolower(name){v=$2} END{gsub(/\r/,"",v); print v}' "$header_file"
+}
 
 json_is_valid() {
   printf '%s' "$1" | jq -e . >/dev/null 2>&1
@@ -532,7 +538,7 @@ check_eq "POST /v1/sql returns 200" "$code" "200"
 sql_n=$(printf '%s' "$body" | jq -r '.[0].n')
 check_eq "SQL query result n=1" "$sql_n" "1"
 
-step "12" "Copy, rename, delete"
+step "12" "Copy, hardlink, rename, delete"
 copy_body="$(mktemp)"
 copy_code=$(curl -sS -o "$copy_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Copy-Source: /$ROOT_DIR/README.md" "$BASE/v1/fs/$ROOT_DIR/README-copy.md?copy")
 copy_attempt=1
@@ -544,6 +550,49 @@ while [ "$copy_code" = "429" ] && [ "$copy_attempt" -lt "$REQUEST_MAX_RETRIES" ]
 done
 check_eq "POST ?copy returns 200" "$copy_code" "200"
 rm -f "$copy_body"
+
+hardlink_src="${ROOT_DIR}/hardlink-source.txt"
+hardlink_dst="${ROOT_DIR}/hardlink-link.txt"
+resp=$(curl_body_code PUT "$BASE/v1/fs/$hardlink_src" "$API_KEY" "hardlink-original-${TS}")
+code=$(http_code "$resp")
+check_eq "PUT hardlink source returns 200" "$code" "200"
+
+hardlink_body="$(mktemp)"
+hardlink_code=$(curl -sS -o "$hardlink_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Hardlink-Source: /$hardlink_src" "$BASE/v1/fs/$hardlink_dst?hardlink=1")
+hardlink_attempt=1
+while [ "$hardlink_code" = "429" ] && [ "$hardlink_attempt" -lt "$REQUEST_MAX_RETRIES" ]; do
+  info "throttled (429), retrying ${hardlink_attempt}/${REQUEST_MAX_RETRIES}: hardlink"
+  hardlink_attempt=$((hardlink_attempt + 1))
+  sleep "$REQUEST_RETRY_SLEEP_S"
+  hardlink_code=$(curl -sS -o "$hardlink_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Hardlink-Source: /$hardlink_src" "$BASE/v1/fs/$hardlink_dst?hardlink=1")
+done
+check_eq "POST ?hardlink returns 200" "$hardlink_code" "200"
+rm -f "$hardlink_body"
+
+hardlink_src_headers="$(mktemp)"
+hardlink_dst_headers="$(mktemp)"
+hardlink_src_head=$(curl -sS -D "$hardlink_src_headers" -o /dev/null -w "%{http_code}" -I -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/$hardlink_src")
+hardlink_dst_head=$(curl -sS -D "$hardlink_dst_headers" -o /dev/null -w "%{http_code}" -I -H "Authorization: Bearer $API_KEY" "$BASE/v1/fs/$hardlink_dst")
+check_eq "HEAD hardlink source returns 200" "$hardlink_src_head" "200"
+check_eq "HEAD hardlink link returns 200" "$hardlink_dst_head" "200"
+hardlink_src_id=$(header_value "$hardlink_src_headers" "X-Dat9-Resource-ID")
+hardlink_dst_id=$(header_value "$hardlink_dst_headers" "X-Dat9-Resource-ID")
+hardlink_src_nlink=$(header_value "$hardlink_src_headers" "X-Dat9-Nlink")
+hardlink_dst_nlink=$(header_value "$hardlink_dst_headers" "X-Dat9-Nlink")
+rm -f "$hardlink_src_headers" "$hardlink_dst_headers"
+check_cmd "hardlink source resource_id is present" test -n "$hardlink_src_id"
+check_eq "hardlink resource_id matches source" "$hardlink_dst_id" "$hardlink_src_id"
+check_cmd "hardlink source nlink >= 2" bash -c 'test "${1:-0}" -ge 2' -- "$hardlink_src_nlink"
+check_cmd "hardlink link nlink >= 2" bash -c 'test "${1:-0}" -ge 2' -- "$hardlink_dst_nlink"
+
+resp=$(curl_body_code PUT "$BASE/v1/fs/$hardlink_dst" "$API_KEY" "hardlink-updated-${TS}")
+code=$(http_code "$resp")
+check_eq "PUT hardlink link returns 200" "$code" "200"
+resp=$(curl_body_code GET "$BASE/v1/fs/$hardlink_src" "$API_KEY")
+code=$(http_code "$resp")
+body=$(json_body "$resp")
+check_eq "GET hardlink source returns 200" "$code" "200"
+check_eq "writing hardlink updates source content" "$body" "hardlink-updated-${TS}"
 
 rename_body="$(mktemp)"
 rename_code=$(curl -sS -o "$rename_body" -w "%{http_code}" -X POST -H "Authorization: Bearer $API_KEY" -H "X-Dat9-Rename-Source: /$BACKEND_DIR/config.yaml" "$BASE/v1/fs/$BACKEND_DIR/config-renamed.yaml?rename")
@@ -577,9 +626,11 @@ check_eq "GET /v1/fs/$ROOT_DIR?list returns 200" "$code" "200"
 backend_exists=$(printf '%s' "$body" | jq -r 'any(.entries[]; .name=="backend" and .isDir==true)')
 frontend_exists=$(printf '%s' "$body" | jq -r 'any(.entries[]; .name=="frontend" and .isDir==true)')
 copy_exists=$(printf '%s' "$body" | jq -r 'any(.entries[]; .name=="README-copy.md")')
+hardlink_exists=$(printf '%s' "$body" | jq -r 'any(.entries[]; .name=="hardlink-link.txt")')
 check_eq "backend directory still exists" "$backend_exists" "true"
 check_eq "frontend directory still exists" "$frontend_exists" "true"
 check_eq "copied file removed" "$copy_exists" "false"
+check_eq "hardlink file remains visible" "$hardlink_exists" "true"
 
 if [ "$RUN_LARGE_FILE" = "1" ]; then
   step "14" "Large file multipart upload via body initiate (${LARGE_FILE_MB}MB)"

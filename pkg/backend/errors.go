@@ -14,3 +14,7 @@ var ErrNotInlineStorage = errors.New("file is not stored inline")
 // ErrInvalidSymlinkTarget reports that a symbolic link target is empty or
 // contains bytes that cannot be represented by the FUSE symlink contract.
 var ErrInvalidSymlinkTarget = errors.New("invalid symlink target")
+
+// ErrInvalidHardlinkTarget reports that a hardlink source cannot be linked,
+// for example because it names a directory.
+var ErrInvalidHardlinkTarget = errors.New("invalid hardlink target")

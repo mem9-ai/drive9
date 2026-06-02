@@ -9,7 +9,7 @@
 //	create  provision a new database and owner context
 //	ctx     manage contexts (show, add, import, fork, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, mkdir, chmod,
-//	        symlink, sh, grep, find)
+//	        symlink, hardlink, sh, grep, find)
 //	token  issue and revoke workspace-zone scoped filesystem tokens
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	journal append-only agent/workflow journal operations
@@ -276,6 +276,8 @@ func runFS(args []string) {
 		err = cli.Chmod(c, rest)
 	case "symlink":
 		err = cli.Symlink(c, rest)
+	case "hardlink":
+		err = cli.Hardlink(c, rest)
 	case "sh":
 		err = cli.Sh(c, rest)
 	case "grep":
@@ -367,6 +369,8 @@ commands:
   chmod <mode> <path>  change file permissions (octal, e.g. 644)
   symlink <target> <link>
                        create symbolic link
+  hardlink <target> <link>
+                       create hard link
   rm [-r|--recursive] <path>
                        remove file or directory tree
   sh                  interactive shell

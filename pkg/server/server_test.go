@@ -343,8 +343,10 @@ func TestListDir(t *testing.T) {
 
 	var result struct {
 		Entries []struct {
-			Name  string `json:"name"`
-			IsDir bool   `json:"isDir"`
+			Name       string `json:"name"`
+			IsDir      bool   `json:"isDir"`
+			ResourceID string `json:"resource_id"`
+			Nlink      uint32 `json:"nlink"`
 		} `json:"entries"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -352,6 +354,12 @@ func TestListDir(t *testing.T) {
 	}
 	if len(result.Entries) != 2 {
 		t.Fatalf("expected 2 entries, got %d", len(result.Entries))
+	}
+	if result.Entries[0].ResourceID == "" {
+		t.Fatal("list entry resource_id is empty")
+	}
+	if result.Entries[0].Nlink != 1 {
+		t.Fatalf("list entry nlink = %d, want 1", result.Entries[0].Nlink)
 	}
 }
 
@@ -1460,6 +1468,106 @@ func TestCopy(t *testing.T) {
 	_ = resp.Body.Close()
 	if string(body) != "shared" {
 		t.Errorf("got %q", body)
+	}
+}
+
+func TestHardlinkRoundTrip(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/src.txt", strings.NewReader("shared"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write src: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/dst.txt?hardlink=1", nil)
+	req.Header.Set("X-Dat9-Hardlink-Source", "/src.txt")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("hardlink: %d", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/src.txt", nil)
+	srcStat, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = srcStat.Body.Close()
+	if srcStat.StatusCode != http.StatusOK {
+		t.Fatalf("stat src: %d", srcStat.StatusCode)
+	}
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/dst.txt", nil)
+	dstStat, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = dstStat.Body.Close()
+	if dstStat.StatusCode != http.StatusOK {
+		t.Fatalf("stat dst: %d", dstStat.StatusCode)
+	}
+	if srcStat.Header.Get("X-Dat9-Resource-ID") == "" {
+		t.Fatal("src resource id is empty")
+	}
+	if srcStat.Header.Get("X-Dat9-Resource-ID") != dstStat.Header.Get("X-Dat9-Resource-ID") {
+		t.Fatalf("resource ids differ: src=%q dst=%q",
+			srcStat.Header.Get("X-Dat9-Resource-ID"), dstStat.Header.Get("X-Dat9-Resource-ID"))
+	}
+	if got := srcStat.Header.Get("X-Dat9-Nlink"); got != "2" {
+		t.Fatalf("src nlink = %q, want 2", got)
+	}
+	if got := dstStat.Header.Get("X-Dat9-Nlink"); got != "2" {
+		t.Fatalf("dst nlink = %q, want 2", got)
+	}
+
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/dst.txt", strings.NewReader("updated"))
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write dst: %d", resp.StatusCode)
+	}
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/src.txt", nil)
+	srcStatAfter, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = srcStatAfter.Body.Close()
+	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/dst.txt", nil)
+	dstStatAfter, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = dstStatAfter.Body.Close()
+	if srcStatAfter.Header.Get("X-Dat9-Resource-ID") != dstStatAfter.Header.Get("X-Dat9-Resource-ID") {
+		t.Fatalf("resource ids differ after overwrite: src=%q dst=%q",
+			srcStatAfter.Header.Get("X-Dat9-Resource-ID"), dstStatAfter.Header.Get("X-Dat9-Resource-ID"))
+	}
+	if got := srcStatAfter.Header.Get("X-Dat9-Nlink"); got != "2" {
+		t.Fatalf("src nlink after overwrite = %q, want 2", got)
+	}
+	if got := dstStatAfter.Header.Get("X-Dat9-Nlink"); got != "2" {
+		t.Fatalf("dst nlink after overwrite = %q, want 2", got)
+	}
+	resp, err = http.Get(ts.URL + "/v1/fs/src.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if string(body) != "updated" {
+		t.Fatalf("src body = %q, want updated", body)
 	}
 }
 

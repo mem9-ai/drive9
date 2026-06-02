@@ -27,6 +27,7 @@ var (
 	ErrUploadNotActive         = errors.New("upload is not in UPLOADING state")
 	ErrUploadExpired           = errors.New("upload has expired")
 	ErrPathConflict            = errors.New("path already exists")
+	ErrInvalidLinkTarget       = errors.New("invalid link target")
 	ErrUploadConflict          = errors.New("active upload already exists for this path")
 	ErrIdempotencyConflict     = errors.New("duplicate idempotency key")
 	ErrJournalConflict         = errors.New("journal create conflict")
@@ -509,6 +510,127 @@ func (s *Store) RefCount(ctx context.Context, fileID string) (count int64, err e
 
 	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_nodes WHERE file_id = ?`, fileID).Scan(&count)
 	return count, err
+}
+
+// RefCounts returns path-reference counts for the supplied file IDs.
+func (s *Store) RefCounts(ctx context.Context, fileIDs []string) (counts map[string]int64, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "ref_counts", start, &err)
+
+	counts = make(map[string]int64)
+	seen := make(map[string]struct{}, len(fileIDs))
+	unique := make([]string, 0, len(fileIDs))
+	for _, fileID := range fileIDs {
+		if fileID == "" {
+			continue
+		}
+		if _, ok := seen[fileID]; ok {
+			continue
+		}
+		seen[fileID] = struct{}{}
+		unique = append(unique, fileID)
+	}
+	const batchSize = 500
+	for start := 0; start < len(unique); start += batchSize {
+		end := start + batchSize
+		if end > len(unique) {
+			end = len(unique)
+		}
+		batch := unique[start:end]
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT file_id, COUNT(*) FROM file_nodes WHERE file_id IN (`+questionPlaceholders(len(batch))+`) GROUP BY file_id`,
+			stringsToAny(batch)...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var fileID string
+			var count int64
+			if err := rows.Scan(&fileID, &count); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			counts[fileID] = count
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return counts, nil
+}
+
+// LinkFileNode atomically creates dstPath as another directory entry for the
+// same confirmed file entity referenced by srcPath.
+func (s *Store) LinkFileNode(ctx context.Context, srcPath, dstPath, dstParentPath, dstName, nodeID string, createdAt time.Time) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "link_file_node", start, &err)
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.LinkFileNodeTx(ctx, tx, srcPath, dstPath, dstParentPath, dstName, nodeID, createdAt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// LinkFileNodeTx creates a hardlink node inside an existing transaction.
+func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath, dstParentPath, dstName, nodeID string, createdAt time.Time) error {
+	if dstParentPath != "/" {
+		var parentIsDir bool
+		err := db.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, dstParentPath).
+			Scan(&parentIsDir)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if !parentIsDir {
+			return ErrNotFound
+		}
+	}
+
+	var fileID, inodeID sql.NullString
+	var isDir bool
+	err := db.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, srcPath).
+		Scan(&fileID, &inodeID, &isDir)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if isDir {
+		return ErrInvalidLinkTarget
+	}
+	if !fileID.Valid || fileID.String == "" {
+		return ErrNotFound
+	}
+	if err := s.lockConfirmedFileForAttachTx(db, fileID.String); err != nil {
+		return err
+	}
+	linkInodeID := fileID.String
+	if inodeID.Valid && inodeID.String != "" {
+		linkInodeID = inodeID.String
+	}
+	_, err = db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at)
+		VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
+		nodeID, dstPath, dstParentPath, dstName, fileID.String, linkInodeID, createdAt.UTC())
+	if isUniqueViolation(err) {
+		return ErrPathConflict
+	}
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) EnsureParentDirs(ctx context.Context, path string, genID func() string) error {

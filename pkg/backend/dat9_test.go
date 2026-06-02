@@ -474,6 +474,12 @@ func TestMkdirAndReadDir(t *testing.T) {
 	if entries[0].Name != "a.txt" || entries[1].Name != "b.txt" {
 		t.Errorf("unexpected: %+v", entries)
 	}
+	if got := entries[0].Meta.Content["resource_id"]; got == "" {
+		t.Fatal("ReadDir entry resource_id is empty")
+	}
+	if got := entries[0].Meta.Content["nlink"]; got != "1" {
+		t.Fatalf("ReadDir entry nlink = %q, want 1", got)
+	}
 }
 
 func TestRemove(t *testing.T) {
@@ -650,6 +656,68 @@ func TestZeroCopyCp(t *testing.T) {
 	}
 }
 
+func TestHardlinkFileSharesContentAndRejectsDirectories(t *testing.T) {
+	b := newTestBackend(t)
+	if _, err := b.Write("/a.txt", []byte("shared"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HardlinkFile("/a.txt", "/b.txt"); err != nil {
+		t.Fatalf("HardlinkFile: %v", err)
+	}
+	if _, err := b.Write("/b.txt", []byte("updated"), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	dataA, err := b.Read("/a.txt", 0, -1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(dataA) != "updated" {
+		t.Fatalf("a.txt = %q, want updated", dataA)
+	}
+	nf, err := b.Store().Stat(context.Background(), "/a.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	count, err := b.Store().RefCount(context.Background(), nf.File.FileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("refcount = %d, want 2", count)
+	}
+	entries, err := b.ReadDir("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) < 2 {
+		t.Fatalf("root entries = %d, want at least 2", len(entries))
+	}
+	resourceID := entries[0].Meta.Content["resource_id"]
+	if resourceID == "" {
+		t.Fatal("hardlink ReadDir resource_id is empty")
+	}
+	for _, entry := range entries {
+		if entry.Name != "a.txt" && entry.Name != "b.txt" {
+			continue
+		}
+		if got := entry.Meta.Content["resource_id"]; got != resourceID {
+			t.Fatalf("%s resource_id = %q, want %q", entry.Name, got, resourceID)
+		}
+		if got := entry.Meta.Content["nlink"]; got != "2" {
+			t.Fatalf("%s nlink = %q, want 2", entry.Name, got)
+		}
+	}
+	if err := b.HardlinkFile("/a.txt", "/b.txt"); !errors.Is(err, datastore.ErrPathConflict) {
+		t.Fatalf("duplicate HardlinkFile error = %v, want ErrPathConflict", err)
+	}
+	if err := b.Mkdir("/dir", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.HardlinkFile("/dir/", "/dir-link"); !errors.Is(err, ErrInvalidHardlinkTarget) {
+		t.Fatalf("directory HardlinkFile error = %v, want ErrInvalidHardlinkTarget", err)
+	}
+}
+
 func TestAutoCreateParentDirs(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/a/b/c/file.txt", []byte("deep"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -815,7 +883,6 @@ func TestOpenAndOpenWrite(t *testing.T) {
 		t.Errorf("got %q", readData)
 	}
 }
-
 
 func TestChmod(t *testing.T) {
 	b := newTestBackend(t)

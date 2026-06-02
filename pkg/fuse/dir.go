@@ -14,13 +14,15 @@ const (
 
 // CachedFileInfo matches the client.FileInfo shape but avoids importing client.
 type CachedFileInfo struct {
-	Name     string
-	Size     int64
-	IsDir    bool
-	Mtime    time.Time
-	Revision int64
-	Mode     uint32 // permission bits
-	HasMode  bool   // true when Mode is explicitly known (including 0)
+	Name       string
+	Size       int64
+	IsDir      bool
+	Mtime      time.Time
+	Revision   int64
+	Mode       uint32 // permission bits
+	HasMode    bool   // true when Mode is explicitly known (including 0)
+	ResourceID string
+	Nlink      uint32
 }
 
 type namespaceLookupKind uint8
