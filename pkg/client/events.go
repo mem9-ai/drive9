@@ -29,9 +29,21 @@ type ResetEvent struct {
 	Actor  string `json:"actor,omitempty"`
 }
 
+// HeartbeatEvent is a server stream-current marker. Seq is the latest server
+// event sequence flushed before this heartbeat.
+type HeartbeatEvent struct {
+	Seq uint64 `json:"seq"`
+}
+
 // EventHandler receives SSE events. Exactly one of the pointer arguments is
 // non-nil per call.
 type EventHandler func(change *ChangeEvent, reset *ResetEvent)
+
+// EventLifecycle receives SSE stream lifecycle notifications.
+type EventLifecycle struct {
+	OnDisconnected func(error)
+	OnCurrent      func(seq uint64)
+}
 
 const (
 	sseInitialBackoff = 1 * time.Second
@@ -43,6 +55,11 @@ const (
 // The caller should cancel ctx to stop watching.
 // actor is the per-mount identifier used for self-event filtering.
 func (c *Client) WatchEvents(ctx context.Context, actor string, handler EventHandler) {
+	c.WatchEventsWithLifecycle(ctx, actor, handler, EventLifecycle{})
+}
+
+// WatchEventsWithLifecycle is WatchEvents with optional lifecycle callbacks.
+func (c *Client) WatchEventsWithLifecycle(ctx context.Context, actor string, handler EventHandler, lifecycle EventLifecycle) {
 	var lastSeq uint64
 	backoff := sseInitialBackoff
 
@@ -55,12 +72,22 @@ func (c *Client) WatchEvents(ctx context.Context, actor string, handler EventHan
 				lastSeq = reset.Seq
 			}
 			handler(change, reset)
+		}, func(seq uint64) {
+			if seq > lastSeq {
+				lastSeq = seq
+			}
+			if lifecycle.OnCurrent != nil {
+				lifecycle.OnCurrent(seq)
+			}
 		})
 
 		select {
 		case <-ctx.Done():
 			return
 		default:
+		}
+		if lifecycle.OnDisconnected != nil {
+			lifecycle.OnDisconnected(err)
 		}
 
 		// Always backoff on disconnect (err or clean EOF).
@@ -80,7 +107,7 @@ func (c *Client) WatchEvents(ctx context.Context, actor string, handler EventHan
 	}
 }
 
-func (c *Client) streamEvents(ctx context.Context, since uint64, actor string, handler EventHandler) error {
+func (c *Client) streamEvents(ctx context.Context, since uint64, actor string, handler EventHandler, onCurrent func(seq uint64)) error {
 	url := fmt.Sprintf("%s/v1/events?since=%d", c.baseURL, since)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -114,7 +141,7 @@ func (c *Client) streamEvents(ctx context.Context, since uint64, actor string, h
 		if line == "" {
 			// End of event.
 			if dataLine != "" {
-				parseAndDispatch(eventType, dataLine, handler)
+				parseAndDispatch(eventType, dataLine, handler, onCurrent)
 			}
 			eventType = ""
 			dataLine = ""
@@ -130,7 +157,7 @@ func (c *Client) streamEvents(ctx context.Context, since uint64, actor string, h
 	return scanner.Err()
 }
 
-func parseAndDispatch(eventType, data string, handler EventHandler) {
+func parseAndDispatch(eventType, data string, handler EventHandler, onCurrent func(seq uint64)) {
 	switch eventType {
 	case "file_changed":
 		var ev ChangeEvent
@@ -145,6 +172,12 @@ func parseAndDispatch(eventType, data string, handler EventHandler) {
 		}
 		handler(nil, &ev)
 	case "heartbeat":
-		// Heartbeats are connection-liveness signals only; do not dispatch.
+		var ev HeartbeatEvent
+		if err := json.Unmarshal([]byte(data), &ev); err != nil {
+			return
+		}
+		if onCurrent != nil {
+			onCurrent(ev.Seq)
+		}
 	}
 }

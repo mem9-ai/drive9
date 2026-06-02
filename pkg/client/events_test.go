@@ -11,7 +11,7 @@ func TestParseAndDispatchResetIncludesStructuralFields(t *testing.T) {
 			t.Fatalf("change=%+v, want nil", change)
 		}
 		got = reset
-	})
+	}, nil)
 
 	if got == nil {
 		t.Fatal("reset event was not dispatched")
@@ -30,5 +30,23 @@ func TestParseAndDispatchResetIncludesStructuralFields(t *testing.T) {
 	}
 	if got.Actor != "actor1" {
 		t.Errorf("Actor=%q, want actor1", got.Actor)
+	}
+}
+
+func TestParseAndDispatchHeartbeatMarksStreamCurrent(t *testing.T) {
+	var gotSeq uint64
+	var handlerCalled bool
+
+	parseAndDispatch("heartbeat", `{"seq":42}`, func(*ChangeEvent, *ResetEvent) {
+		handlerCalled = true
+	}, func(seq uint64) {
+		gotSeq = seq
+	})
+
+	if handlerCalled {
+		t.Fatal("heartbeat should not dispatch a filesystem event")
+	}
+	if gotSeq != 42 {
+		t.Fatalf("current seq = %d, want 42", gotSeq)
 	}
 }

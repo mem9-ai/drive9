@@ -36,15 +36,19 @@ type Dat9FS struct {
 	dirHandles  *HandleTable[*DirHandle]
 	readCache   *ReadCache
 	dirCache    *DirCache
-	readSlots   chan struct{}
-	dirtyMu     sync.Mutex
-	dirtyInodes map[uint64]dirtyInodeState
-	dirtySeq    uint64
-	modeSeq     atomic.Uint64
-	uid         uint32
-	gid         uint32
-	opts        *MountOptions
-	debouncer   *flushDebouncer
+	// statCacheUnverified is true while the SSE stream is not known-current.
+	// In that state, file stat cache hits embedded in DirCache must fall back
+	// to HEAD revalidation instead of serving TTL-only attrs.
+	statCacheUnverified atomic.Bool
+	readSlots           chan struct{}
+	dirtyMu             sync.Mutex
+	dirtyInodes         map[uint64]dirtyInodeState
+	dirtySeq            uint64
+	modeSeq             atomic.Uint64
+	uid                 uint32
+	gid                 uint32
+	opts                *MountOptions
+	debouncer           *flushDebouncer
 
 	// Write-back cache: Flush writes small files to local disk, Release
 	// triggers async upload. Nil when CacheDir is not configured.
@@ -1914,6 +1918,30 @@ func (fs *Dat9FS) cacheFileForPath(p string, size int64, mtime time.Time, revisi
 	})
 }
 
+func (fs *Dat9FS) cacheEntryForPath(p string, entry *InodeEntry) {
+	if fs == nil || fs.dirCache == nil || p == "/" || entry == nil {
+		return
+	}
+	parentPath, name := cacheParentName(p)
+	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+}
+
+func (fs *Dat9FS) markStatCacheUnverified() {
+	if fs != nil {
+		fs.statCacheUnverified.Store(true)
+	}
+}
+
+func (fs *Dat9FS) markStatCacheVerified() {
+	if fs != nil {
+		fs.statCacheUnverified.Store(false)
+	}
+}
+
+func (fs *Dat9FS) statCacheVerified() bool {
+	return fs == nil || !fs.statCacheUnverified.Load()
+}
+
 func (fs *Dat9FS) cacheNegativePath(p string) {
 	if fs == nil || fs.dirCache == nil || p == "/" || isLockFilePath(p) {
 		return
@@ -2129,6 +2157,12 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 	result := fs.dirCache.Lookup(parentPath, name)
 	switch result.kind {
 	case namespaceLookupPositive:
+		if isLockFilePath(childP) {
+			if fs.perf != nil {
+				fs.perf.dirCacheMiss.add(1)
+			}
+			return false, gofuse.OK
+		}
 		if fs.perf != nil {
 			fs.perf.dirCacheHit.add(1)
 			fs.perf.namespacePositiveHit.add(1)
@@ -2184,6 +2218,50 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 		}
 		return false, gofuse.OK
 	}
+}
+
+func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
+	if fs == nil || fs.dirCache == nil || entry == nil || entry.Path == "/" || entry.IsDir || isLockFilePath(entry.Path) || !fs.statCacheVerified() {
+		return nil, false
+	}
+	parentPath, name := cacheParentName(entry.Path)
+	result := fs.dirCache.Lookup(parentPath, name)
+	if result.kind != namespaceLookupPositive {
+		return nil, false
+	}
+	item := result.item
+	if item.IsDir != entry.IsDir {
+		return nil, false
+	}
+	if item.Revision <= 0 && !item.IsDir {
+		return nil, false
+	}
+	if entry.Revision > 0 && item.Revision > 0 && item.Revision < entry.Revision {
+		return nil, false
+	}
+	mtime := item.Mtime
+	if mtime.IsZero() {
+		mtime = entry.Mtime
+	}
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
+	cached := *entry
+	cached.Size = item.Size
+	cached.IsDir = item.IsDir
+	cached.Mtime = mtime
+	if item.Revision > 0 {
+		cached.Revision = item.Revision
+		fs.inodes.UpdateRevision(entry.Ino, item.Revision)
+	}
+	fs.inodes.UpdateSize(entry.Ino, item.Size)
+	fs.inodes.UpdateMtime(entry.Ino, mtime)
+	if item.HasMode {
+		cached.Mode = item.Mode
+		cached.HasMode = true
+		fs.inodes.UpdateMode(entry.Ino, item.Mode)
+	}
+	return &cached, true
 }
 
 // --- RawFileSystem methods ---------------------------------------------------
@@ -2556,6 +2634,12 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 				pendingFound = true
 			}
 		}
+		if !pendingFound {
+			if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
+				entry = cachedEntry
+				pendingFound = true
+			}
+		}
 		if !pendingFound && input.NodeId != 1 {
 			stat, err := fs.getAttrStatWithRetry(cancel, entry.Path)
 			if err != nil {
@@ -2580,7 +2664,9 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	} else if input.NodeId != 1 {
 		// Some deployments do not support HEAD/stat on directories.
 		// Keep directory attrs from inode map and only refresh regular files.
-		if !entry.IsDir {
+		if cachedEntry, ok := fs.cachedAttrEntry(entry); ok {
+			entry = cachedEntry
+		} else if !entry.IsDir {
 			stat, err := fs.getAttrStatWithRetry(cancel, entry.Path)
 			if err != nil {
 				return httpToFuseStatus(err)
@@ -2624,6 +2710,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		if st != gofuse.OK {
 			return st
 		}
+		metadataChanged := false
 		restoreErr := fs.ensureGitStateForLocalPath(ctx, entry.Path)
 		if restoreErr != nil {
 			return httpToFuseStatus(restoreErr)
@@ -2634,6 +2721,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			}
 			entry.Mtime = mtime
 			fs.inodes.UpdateMtime(input.NodeId, mtime)
+			metadataChanged = true
 		}
 		if input.Valid&gofuse.FATTR_MODE != 0 {
 			mode := input.Mode & 0o777
@@ -2646,6 +2734,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			}
 			entry.Mode = entryMode
 			fs.inodes.UpdateMode(input.NodeId, entryMode)
+			metadataChanged = true
 		}
 		if input.Valid&gofuse.FATTR_SIZE != 0 {
 			if entry.IsDir {
@@ -2663,6 +2752,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				entry = refreshed
 			}
 		}
+		if metadataChanged {
+			fs.cacheEntryForPath(entry.Path, entry)
+		}
 		fs.fillAttr(entry, &out.Attr)
 		out.SetTimeout(fs.opts.AttrTTL)
 		return gofuse.OK
@@ -2673,10 +2765,13 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		return fs.setGitAttr(ctx, input, entry, out)
 	}
 
+	metadataChanged := false
+
 	// Handle mtime updates
 	if mtime, ok := input.GetMTime(); ok {
 		entry.Mtime = mtime
 		fs.inodes.UpdateMtime(input.NodeId, mtime)
+		metadataChanged = true
 	}
 
 	// Handle mode (chmod)
@@ -2719,6 +2814,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		}
 		entry.Mode = entryMode
 		fs.inodes.UpdateMode(input.NodeId, entryMode)
+		metadataChanged = true
 	}
 
 	// Handle truncate
@@ -2787,6 +2883,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		// no need for an explicit notifyInode here.
 	}
 
+	if metadataChanged {
+		fs.cacheEntryForPath(entry.Path, entry)
+	}
 	fs.fillAttr(entry, &out.Attr)
 	out.SetTimeout(fs.opts.AttrTTL)
 	return gofuse.OK

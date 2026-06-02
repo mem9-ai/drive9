@@ -161,6 +161,61 @@ func TestSSEWatcherHandleChangeInvalidatesChildDirNamespace(t *testing.T) {
 	}
 }
 
+func TestSSEWatcherHandleEventChangeInvalidatesButKeepsStatCacheUnverified(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize: 1 << 20,
+		DirTTL:    5 * time.Second,
+	}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+	fs.markStatCacheUnverified()
+	fs.readCache.Put("/docs/readme.md", []byte("old content"), 1)
+	fs.dirCache.Put("/docs", []CachedFileInfo{{Name: "readme.md", Size: 50}})
+
+	w := &SSEWatcher{fs: fs, actor: "my-actor"}
+	w.handleEvent(&client.ChangeEvent{
+		Seq:   1,
+		Path:  "/docs/readme.md",
+		Op:    "write",
+		Actor: "other-actor",
+	}, nil)
+
+	if _, ok := fs.readCache.Get("/docs/readme.md", 1); ok {
+		t.Error("readCache entry should be invalidated after handled change")
+	}
+	if _, ok := fs.dirCache.Get("/docs"); ok {
+		t.Error("dirCache entry should be invalidated after handled change")
+	}
+	if fs.statCacheVerified() {
+		t.Error("stat cache should remain unverified after handled change without replay-complete marker")
+	}
+}
+
+func TestSSEWatcherStreamCurrentVerifiesStatCache(t *testing.T) {
+	opts := &MountOptions{
+		CacheSize: 1 << 20,
+		DirTTL:    5 * time.Second,
+	}
+	opts.setDefaults()
+	fs := &Dat9FS{
+		inodes:    NewInodeToPath(),
+		readCache: NewReadCache(opts.CacheSize, 0),
+		dirCache:  NewDirCache(opts.DirTTL),
+	}
+	fs.markStatCacheUnverified()
+
+	w := &SSEWatcher{fs: fs, actor: "my-actor"}
+	w.handleStreamCurrent(42)
+
+	if !fs.statCacheVerified() {
+		t.Error("stream-current callback should verify stat cache")
+	}
+}
+
 func TestSSEWatcherHandleChangeFiltersAndRebasesRemoteRoot(t *testing.T) {
 	opts := &MountOptions{
 		CacheSize:  1 << 20,
@@ -292,6 +347,7 @@ func TestSSEWatcherHandleEventReset(t *testing.T) {
 
 	fs.readCache.Put("/test.txt", []byte("data"), 1)
 	fs.dirCache.Put("/", []CachedFileInfo{{Name: "test.txt", Size: 4}})
+	fs.markStatCacheUnverified()
 
 	w := &SSEWatcher{fs: fs, actor: "my-actor"}
 
@@ -303,6 +359,9 @@ func TestSSEWatcherHandleEventReset(t *testing.T) {
 	}
 	if _, ok := fs.dirCache.Get("/"); ok {
 		t.Error("dirCache should be cleared after reset")
+	}
+	if !fs.statCacheVerified() {
+		t.Error("stat cache should be verified after handled reset invalidation")
 	}
 }
 

@@ -41,7 +41,7 @@ type MountOptions struct {
 	DirTTL                time.Duration // DirCache TTL (default 10s)
 	AttrTTL               time.Duration // kernel attr cache TTL (default 60s)
 	EntryTTL              time.Duration // kernel entry cache TTL (default 60s)
-	NegativeEntryTTL      time.Duration // kernel negative entry cache TTL (default 10s)
+	NegativeEntryTTL      time.Duration // kernel negative entry cache TTL (default 1s)
 	FlushDebounce         time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
 	SyncMode              SyncMode      // interactive, strict, or auto (default auto)
 	WritePolicy           WritePolicy   // writeback, close-sync, or write-sync (default writeback)
@@ -91,7 +91,7 @@ func (o *MountOptions) setDefaults() {
 		o.EntryTTL = defaultPositiveKernelCacheTTL
 	}
 	if o.NegativeEntryTTL <= 0 {
-		o.NegativeEntryTTL = 10 * time.Second
+		o.NegativeEntryTTL = time.Second
 	}
 	// FlushDebounce: 0 means disabled, negative means unset (use default).
 	if o.FlushDebounce < 0 {

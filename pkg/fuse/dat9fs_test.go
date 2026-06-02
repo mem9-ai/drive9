@@ -22,6 +22,28 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
+type testErrorRecorder struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (r *testErrorRecorder) Recordf(format string, args ...interface{}) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err == nil {
+		r.err = fmt.Errorf(format, args...)
+	}
+}
+
+func (r *testErrorRecorder) Check(t *testing.T) {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+}
+
 func newTestDat9FS(tb testing.TB, size int64, get func(http.ResponseWriter, *http.Request)) (*Dat9FS, uint64, func()) {
 	tb.Helper()
 
@@ -246,6 +268,66 @@ func BenchmarkDat9FS_SmallFileOpen(b *testing.B) {
 				fs.clearDirtySize(ino, fh.DirtySeq)
 			}
 			fs.fileHandles.Delete(out.Fh)
+		}
+	})
+}
+
+func BenchmarkDat9FS_GetAttr(b *testing.B) {
+	const filePath = "/cached.txt"
+
+	b.Run("remote-head", func(b *testing.B) {
+		fs, ino, cleanup := newTestDat9FS(b, 12, func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("data"))
+		})
+		defer cleanup()
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			var out gofuse.AttrOut
+			st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+			if st != gofuse.OK {
+				b.Fatalf("GetAttr status = %v, want OK", st)
+			}
+			benchmarkIntSink += int(out.Size)
+		}
+	})
+
+	b.Run("dir-cache-hit", func(b *testing.B) {
+		var remoteCalls atomic.Int32
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			remoteCalls.Add(1)
+			http.Error(w, "unexpected remote call", http.StatusInternalServerError)
+		}))
+		defer ts.Close()
+
+		opts := &MountOptions{}
+		opts.setDefaults()
+		fs := NewDat9FS(newTestClient(ts.URL), opts)
+		ino := fs.inodes.Lookup(filePath, false, 1, time.Unix(1, 0))
+		fs.dirCache.Upsert("/", CachedFileInfo{
+			Name:     "cached.txt",
+			Size:     12,
+			IsDir:    false,
+			Mtime:    time.Unix(123, 0),
+			Revision: 7,
+			Mode:     0o600,
+			HasMode:  true,
+		})
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			var out gofuse.AttrOut
+			st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+			if st != gofuse.OK {
+				b.Fatalf("GetAttr status = %v, want OK", st)
+			}
+			benchmarkIntSink += int(out.Size)
+		}
+		b.StopTimer()
+		if got := remoteCalls.Load(); got != 0 {
+			b.Fatalf("remote calls = %d, want 0", got)
 		}
 	})
 }
@@ -1267,6 +1349,280 @@ func TestGetAttrDirectoryDoesNotRequireRemoteStat(t *testing.T) {
 	}
 }
 
+func TestGetAttrUsesRevisionBoundDirCacheStatWithoutRemoteHead(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "unexpected remote call", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/cached.txt", false, 1, time.Unix(1, 0))
+	mtime := time.Unix(123, 0)
+	fs.dirCache.Upsert("/", CachedFileInfo{
+		Name:     "cached.txt",
+		Size:     12,
+		IsDir:    false,
+		Mtime:    mtime,
+		Revision: 7,
+		Mode:     0o600,
+		HasMode:  true,
+	})
+
+	var out gofuse.AttrOut
+	st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+	if got, want := out.Size, uint64(12); got != want {
+		t.Fatalf("GetAttr size = %d, want %d", got, want)
+	}
+	if got, want := out.Mode&0o777, uint32(0o600); got != want {
+		t.Fatalf("GetAttr mode = %o, want %o", got, want)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Revision != 7 {
+		t.Fatalf("inode revision = %d, want 7", entry.Revision)
+	}
+	if !entry.Mtime.Equal(mtime) {
+		t.Fatalf("inode mtime = %s, want %s", entry.Mtime, mtime)
+	}
+}
+
+func TestGetAttrIgnoresOlderDirCacheRevision(t *testing.T) {
+	var headCalls atomic.Int32
+	var handlerErrors testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			handlerErrors.Recordf("method = %s, want HEAD", r.Method)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", "33")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "10")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/cached.txt", false, 1, time.Unix(1, 0))
+	fs.inodes.UpdateRevision(ino, 9)
+	fs.dirCache.Upsert("/", CachedFileInfo{
+		Name:     "cached.txt",
+		Size:     12,
+		IsDir:    false,
+		Revision: 7,
+	})
+
+	var out gofuse.AttrOut
+	st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	handlerErrors.Check(t)
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+	if got, want := out.Size, uint64(33); got != want {
+		t.Fatalf("GetAttr size = %d, want %d", got, want)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Revision != 10 {
+		t.Fatalf("inode revision = %d, want 10", entry.Revision)
+	}
+}
+
+func TestGetAttrSSEChangeInvalidatesCachedStat(t *testing.T) {
+	var headCalls atomic.Int32
+	var handlerErrors testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			handlerErrors.Recordf("method = %s, want HEAD", r.Method)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", "44")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "8")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/docs/readme.md", false, 12, time.Unix(1, 0))
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.dirCache.Upsert("/docs", CachedFileInfo{
+		Name:     "readme.md",
+		Size:     12,
+		IsDir:    false,
+		Revision: 7,
+	})
+
+	w := &SSEWatcher{fs: fs, actor: "mount-b"}
+	w.handleChange(&client.ChangeEvent{
+		Seq:   1,
+		Path:  "/docs/readme.md",
+		Op:    "write",
+		Actor: "mount-a",
+	})
+
+	var out gofuse.AttrOut
+	st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	handlerErrors.Check(t)
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+	if got, want := out.Size, uint64(44); got != want {
+		t.Fatalf("GetAttr size = %d, want %d", got, want)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Revision != 8 {
+		t.Fatalf("inode revision = %d, want 8", entry.Revision)
+	}
+}
+
+func TestSetAttrRefreshesDirCacheStatMetadata(t *testing.T) {
+	var chmodCalls atomic.Int32
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodHead:
+			headCalls.Add(1)
+			http.Error(w, "unexpected stale-cache revalidation", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	oldMtime := time.Unix(10, 0)
+	newMtime := time.Unix(123, 0)
+	ino := fs.inodes.Lookup("/cached.txt", false, 12, oldMtime)
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.dirCache.Upsert("/", CachedFileInfo{
+		Name:     "cached.txt",
+		Size:     12,
+		IsDir:    false,
+		Mtime:    oldMtime,
+		Revision: 7,
+		Mode:     0o644,
+		HasMode:  true,
+	})
+
+	var setOut gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE | gofuse.FATTR_MTIME,
+			Mode:     0o600,
+			Mtime:    uint64(newMtime.Unix()),
+		},
+	}, &setOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if got := chmodCalls.Load(); got != 1 {
+		t.Fatalf("chmod calls = %d, want 1", got)
+	}
+
+	var out gofuse.AttrOut
+	st = fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	if got := headCalls.Load(); got != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", got)
+	}
+	if got, want := out.Mode&0o777, uint32(0o600); got != want {
+		t.Fatalf("GetAttr mode = %o, want %o", got, want)
+	}
+	if got, want := out.Mtime, uint64(newMtime.Unix()); got != want {
+		t.Fatalf("GetAttr mtime = %d, want %d", got, want)
+	}
+}
+
+func TestGetAttrRevalidatesDirCacheStatWhenSSEUnverified(t *testing.T) {
+	var headCalls atomic.Int32
+	var handlerErrors testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			handlerErrors.Recordf("method = %s, want HEAD", r.Method)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", "44")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "8")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/cached.txt", false, 12, time.Unix(1, 0))
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.dirCache.Upsert("/", CachedFileInfo{
+		Name:     "cached.txt",
+		Size:     12,
+		IsDir:    false,
+		Revision: 7,
+	})
+	fs.markStatCacheUnverified()
+
+	var out gofuse.AttrOut
+	st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	handlerErrors.Check(t)
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+	if got, want := out.Size, uint64(44); got != want {
+		t.Fatalf("GetAttr size = %d, want %d", got, want)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Revision != 8 {
+		t.Fatalf("inode revision = %d, want 8", entry.Revision)
+	}
+}
+
 func TestGetAttrRetriesTransientCanceledStat(t *testing.T) {
 	var headCalls atomic.Int32
 	firstHeadStarted := make(chan struct{}, 1)
@@ -1839,6 +2195,79 @@ func TestLookupLockFileIgnoresCompleteNamespaceMiss(t *testing.T) {
 	if got := headCalls.Load(); got != 1 {
 		t.Fatalf("HEAD calls = %d, want 1", got)
 	}
+}
+
+func TestLookupLockFileIgnoresPositiveDirCache(t *testing.T) {
+	var handlerErrors testErrorRecorder
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			handlerErrors.Recordf("method = %s, want HEAD", r.Method)
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		headCalls.Add(1)
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.dirCache.Put("/repo/.git", []CachedFileInfo{{
+		Name:     "config.lock",
+		Size:     251,
+		Revision: 7,
+	}})
+	gitIno := fs.inodes.Lookup("/repo/.git", true, 0, time.Now())
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: gitIno}, "config.lock", &out)
+	if st != gofuse.ENOENT {
+		t.Fatalf("Lookup status = %v, want ENOENT", st)
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+	handlerErrors.Check(t)
+}
+
+func TestGetAttrLockFileIgnoresPositiveDirCache(t *testing.T) {
+	var handlerErrors testErrorRecorder
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			handlerErrors.Recordf("method = %s, want HEAD", r.Method)
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+			return
+		}
+		headCalls.Add(1)
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.dirCache.Put("/repo/.git", []CachedFileInfo{{
+		Name:     "config.lock",
+		Size:     251,
+		Revision: 7,
+	}})
+	lockIno := fs.inodes.Lookup("/repo/.git/config.lock", false, 251, time.Now())
+	fs.inodes.UpdateRevision(lockIno, 7)
+
+	var out gofuse.AttrOut
+	st := fs.GetAttr(nil, &gofuse.GetAttrIn{
+		InHeader: gofuse.InHeader{NodeId: lockIno},
+	}, &out)
+	if st != gofuse.ENOENT {
+		t.Fatalf("GetAttr status = %v, want ENOENT", st)
+	}
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+	handlerErrors.Check(t)
 }
 
 func TestLookupSessionCreatedDirMissAvoidsRemoteStat(t *testing.T) {
@@ -3051,8 +3480,8 @@ func TestDefaultTTLIs60Seconds(t *testing.T) {
 	if opts.EntryTTL != defaultPositiveKernelCacheTTL {
 		t.Fatalf("default EntryTTL = %v, want %v", opts.EntryTTL, defaultPositiveKernelCacheTTL)
 	}
-	if opts.NegativeEntryTTL != 10*time.Second {
-		t.Fatalf("default NegativeEntryTTL = %v, want 10s", opts.NegativeEntryTTL)
+	if opts.NegativeEntryTTL != time.Second {
+		t.Fatalf("default NegativeEntryTTL = %v, want 1s", opts.NegativeEntryTTL)
 	}
 }
 
