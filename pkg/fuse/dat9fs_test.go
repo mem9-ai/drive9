@@ -1104,6 +1104,125 @@ func TestDat9FSReadSingleFlightOwnerCancelDoesNotFailPiggybacker(t *testing.T) {
 	}
 }
 
+func TestDat9FSReadSingleFlightUnresponsiveFetchIsBounded(t *testing.T) {
+	const (
+		path = "/file.bin"
+		rev  = int64(9)
+	)
+	data := []byte("hung-read-data")
+	started := make(chan struct{}, 1)
+	firstCtxDone := make(chan struct{}, 1)
+	var getCalls atomic.Int32
+	var (
+		handlerMu  sync.Mutex
+		handlerErr error
+	)
+	recordHandlerErr := func(err error) {
+		handlerMu.Lock()
+		defer handlerMu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.Path != "/v1/fs/file.bin" {
+				recordHandlerErr(fmt.Errorf("GET path = %q, want /v1/fs/file.bin", r.URL.Path))
+				http.NotFound(w, r)
+				return
+			}
+			call := getCalls.Add(1)
+			if call == 1 {
+				started <- struct{}{}
+				<-r.Context().Done()
+				firstCtxDone <- struct{}{}
+				return
+			}
+			http.Error(w, "retry should not hang", http.StatusBadRequest)
+		default:
+			recordHandlerErr(fmt.Errorf("unexpected method %s", r.Method))
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.remoteReadTimeout = 30 * time.Millisecond
+	fs.readSlots = make(chan struct{}, 1)
+	ino := fs.inodes.Lookup(path, false, int64(len(data)), time.Now())
+	fs.inodes.UpdateRevision(ino, rev)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	readDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st, err := readDat9FSTestBytes(fs, ino, out.Fh, len(data))
+		if err != nil {
+			readDone <- gofuse.EIO
+			return
+		}
+		readDone <- st
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("backend GET did not start")
+	}
+
+	select {
+	case <-firstCtxDone:
+	case <-time.After(time.Second):
+		t.Fatal("unresponsive backend GET was not cancelled by bounded shared context")
+	}
+
+	select {
+	case st := <-readDone:
+		if st == gofuse.OK {
+			t.Fatal("Read status = OK, want failure for hung backend")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Read did not return after bounded shared context expired")
+	}
+
+	if got := fs.readFlight.Inflight(); got != 0 {
+		t.Fatalf("readFlight.Inflight() = %d, want 0 after bounded failure", got)
+	}
+	slotCtx, slotCancel := context.WithTimeout(context.Background(), time.Second)
+	releaseSlot, err := fs.acquireRemoteReadSlot(slotCtx)
+	slotCancel()
+	if err != nil {
+		t.Fatalf("acquireRemoteReadSlot after bounded failure: %v", err)
+	}
+	releaseSlot()
+
+	if got := getCalls.Load(); got < 1 {
+		t.Fatalf("GET calls = %d, want at least 1", got)
+	}
+	handlerMu.Lock()
+	handlerError := handlerErr
+	handlerMu.Unlock()
+	if handlerError != nil {
+		t.Fatal(handlerError)
+	}
+}
+
 func TestCreateWriteThroughShadow(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)

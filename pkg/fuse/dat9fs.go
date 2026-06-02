@@ -101,6 +101,9 @@ type Dat9FS struct {
 	// simultaneously, only one HTTP request is made; the others share the
 	// result. See cache invalidation spec §9.8 T24.
 	readFlight *SingleFlight
+	// remoteReadTimeout bounds detached shared read fetches. Defaults to
+	// fuseTimeout; tests may shorten it to exercise timeout paths.
+	remoteReadTimeout time.Duration
 
 	// localPolicy classifies coding-agent paths that should be routed to
 	// local-only storage instead of the Drive9 remote backend.
@@ -217,6 +220,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		gitCheckpoints:    newFlushDebouncer(gitCheckpointDebounce),
 		gitOverlayPending: make(map[string]map[string]pendingGitOverlayEntry),
 		readFlight:        NewSingleFlight(),
+		remoteReadTimeout: fuseTimeout,
 	}
 }
 
@@ -343,6 +347,13 @@ func fuseCtxWithTimeout(cancel <-chan struct{}, timeout time.Duration) (context.
 		}
 	}()
 	return ctx, cf
+}
+
+func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = fuseTimeout
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), timeout)
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -4816,17 +4827,13 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// the observed revision so that concurrent reads after a revision
 		// change do not share stale in-flight results.
 		sfKey := fmt.Sprintf("%s@%d", p, cacheRev)
-		// Use a detached context for the shared HTTP fetch so that
-		// cancellation of the owner's FUSE request does not fail
-		// piggybacking readers. The shared work must be independent
-		// of any single caller's lifecycle. We apply a fresh
-		// fuseTimeout so the fetch is still bounded even though the
-		// caller cancel is detached.
-		fetchCtx, fetchCancel := context.WithTimeout(
-			context.WithoutCancel(ctx), fuseTimeout,
-		)
-		defer fetchCancel()
 		data, err, _ := fs.readFlight.Do(ctx, sfKey, func() ([]byte, error) {
+			// Use a detached context for the shared HTTP fetch so that
+			// cancellation of the owner's FUSE request does not fail
+			// piggybacking readers. Apply a fresh bounded timeout so the
+			// shared in-flight key and read slot cannot hang forever.
+			fetchCtx, fetchCancel := detachedSharedReadCtx(ctx, fs.remoteReadTimeout)
+			defer fetchCancel()
 			releaseReadSlot, slotErr := fs.acquireRemoteReadSlot(fetchCtx)
 			if slotErr != nil {
 				return nil, slotErr
