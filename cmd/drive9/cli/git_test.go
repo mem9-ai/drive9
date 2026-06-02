@@ -116,6 +116,97 @@ func TestGitFastCloneArgs(t *testing.T) {
 	}
 }
 
+func TestGitFastWorktreeAddArgs(t *testing.T) {
+	args := gitFastWorktreeAddArgs("/mnt/base", "/mnt/wt", "feature", false, "abc123")
+	if got, want := strings.Join(args, " "), "-C /mnt/base worktree add --no-checkout -b feature /mnt/wt abc123"; got != want {
+		t.Fatalf("branch worktree args = %q, want %q", got, want)
+	}
+	args = gitFastWorktreeAddArgs("/mnt/base", "/mnt/wt", "", true, "abc123")
+	if got, want := strings.Join(args, " "), "-C /mnt/base worktree add --no-checkout --detach /mnt/wt abc123"; got != want {
+		t.Fatalf("detached worktree args = %q, want %q", got, want)
+	}
+	args = gitFastWorktreeAddArgs("/mnt/base", "/mnt/wt", "", false, "feature")
+	if got, want := strings.Join(args, " "), "-C /mnt/base worktree add --no-checkout /mnt/wt feature"; got != want {
+		t.Fatalf("existing branch worktree args = %q, want %q", got, want)
+	}
+	args = gitFastWorktreeAddArgs("/mnt/base", "/mnt/wt", "", false, "")
+	if got, want := strings.Join(args, " "), "-C /mnt/base worktree add --no-checkout /mnt/wt"; got != want {
+		t.Fatalf("omitted commitish worktree args = %q, want %q", got, want)
+	}
+}
+
+func TestGitFastWorktreeAddCommitPreservesExistingBranchish(t *testing.T) {
+	if got := gitFastWorktreeAddCommit("", false, "", "abc123"); got != "" {
+		t.Fatalf("omitted commit arg = %q, want empty", got)
+	}
+	if got := gitFastWorktreeAddCommit("", false, "feature", "abc123"); got != "feature" {
+		t.Fatalf("commit arg = %q, want original branchish", got)
+	}
+	if got := gitFastWorktreeAddCommit("new-feature", false, "feature", "abc123"); got != "abc123" {
+		t.Fatalf("new branch commit arg = %q, want resolved commit", got)
+	}
+	if got := gitFastWorktreeAddCommit("", true, "feature", "abc123"); got != "abc123" {
+		t.Fatalf("detached commit arg = %q, want resolved commit", got)
+	}
+}
+
+func TestGitWorktreeAddNoCommitishCreatesAttachedBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	root := t.TempDir()
+	base := filepath.Join(root, "base")
+	worktree := filepath.Join(root, "topic")
+	runTestGit(t, "", "init", "-b", "main", base)
+	runTestGit(t, base, "config", "user.email", "drive9-test@example.invalid")
+	runTestGit(t, base, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(base, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runTestGit(t, base, "add", ".")
+	runTestGit(t, base, "commit", "-m", "initial")
+
+	args := gitFastWorktreeAddArgs(base, worktree, "", false, gitFastWorktreeAddCommit("", false, "", ""))
+	runTestGit(t, "", args...)
+	branch := gitOutputForTest(t, worktree, "symbolic-ref", "--short", "HEAD")
+	if branch != "topic" {
+		t.Fatalf("branch = %q, want topic", branch)
+	}
+}
+
+func TestGitWorktreeStatusClean(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	repo := t.TempDir()
+	runTestGit(t, "", "init", "-b", "main", repo)
+	runTestGit(t, repo, "config", "user.email", "drive9-test@example.invalid")
+	runTestGit(t, repo, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runTestGit(t, repo, "add", ".")
+	runTestGit(t, repo, "commit", "-m", "initial")
+
+	clean, status, err := gitWorktreeStatusClean(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("gitWorktreeStatusClean clean repo: %v", err)
+	}
+	if !clean || status != "" {
+		t.Fatalf("clean=%t status=%q, want clean empty status", clean, status)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "dirty.txt"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	clean, status, err = gitWorktreeStatusClean(context.Background(), repo)
+	if err != nil {
+		t.Fatalf("gitWorktreeStatusClean dirty repo: %v", err)
+	}
+	if clean || !strings.Contains(status, "dirty.txt") {
+		t.Fatalf("clean=%t status=%q, want dirty status", clean, status)
+	}
+}
+
 func TestResolveGitHydrateMode(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -276,6 +367,18 @@ func TestArchiveGitStateDirSkipsObjectDatabases(t *testing.T) {
 	}
 }
 
+func TestParseGitDirFileResolvesRelativeGitDir(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "worktree")
+	got, err := parseGitDirFile([]byte("gitdir: ../repo/.git/worktrees/wt\n"), base)
+	if err != nil {
+		t.Fatalf("parseGitDirFile: %v", err)
+	}
+	want := filepath.Clean(filepath.Join(base, "../repo/.git/worktrees/wt"))
+	if got != want {
+		t.Fatalf("gitdir = %q, want %q", got, want)
+	}
+}
+
 func TestResolveMountedGitTargetUsesMountMetadata(t *testing.T) {
 	mountPoint := t.TempDir()
 	localRoot := t.TempDir()
@@ -305,6 +408,25 @@ func TestResolveMountedGitTargetUsesMountMetadata(t *testing.T) {
 	wantLocalGitDir := filepath.Join(localRoot, "overlay", "repos", "drive9", ".git")
 	if resolved.LocalGitDir != wantLocalGitDir {
 		t.Fatalf("LocalGitDir = %q, want %q", resolved.LocalGitDir, wantLocalGitDir)
+	}
+}
+
+func TestLocalPathForRemoteInMount(t *testing.T) {
+	mountPoint := t.TempDir()
+	resolved := mountedGitTarget{
+		MountPoint: mountPoint,
+		RemoteRoot: "/remote/root/",
+	}
+	got, err := localPathForRemoteInMount(resolved, "/remote/root/repos/wt/")
+	if err != nil {
+		t.Fatalf("localPathForRemoteInMount: %v", err)
+	}
+	want := filepath.Join(mountPoint, "repos", "wt")
+	if got != want {
+		t.Fatalf("local path = %q, want %q", got, want)
+	}
+	if _, err := localPathForRemoteInMount(resolved, "/other/repos/wt/"); err == nil {
+		t.Fatalf("localPathForRemoteInMount outside root err = nil, want error")
 	}
 }
 

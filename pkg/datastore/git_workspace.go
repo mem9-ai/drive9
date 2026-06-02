@@ -12,6 +12,7 @@ import (
 )
 
 type GitWorkspaceMode string
+type GitWorkspaceKind string
 type GitWorkspaceStatus string
 type GitTreeNodeKind string
 type GitOverlayOp string
@@ -20,6 +21,8 @@ type GitOverlayKind string
 const (
 	GitWorkspaceModeFast         GitWorkspaceMode   = "fast"
 	GitWorkspaceModeFastBlobless GitWorkspaceMode   = "fast-blobless"
+	GitWorkspaceKindMain         GitWorkspaceKind   = "main"
+	GitWorkspaceKindLinked       GitWorkspaceKind   = "linked"
 	GitWorkspaceStatusLive       GitWorkspaceStatus = "active"
 	GitWorkspaceStatusDeleted    GitWorkspaceStatus = "deleted"
 
@@ -42,17 +45,21 @@ const (
 // GitWorkspace is the authoritative drive9 record for a git-backed worktree.
 // Clean files are represented by git object metadata rather than file_nodes.
 type GitWorkspace struct {
-	WorkspaceID string
-	RootPath    string
-	RepoURL     string
-	RemoteName  string
-	BranchName  string
-	BaseCommit  string
-	HeadCommit  string
-	Mode        GitWorkspaceMode
-	Status      GitWorkspaceStatus
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	WorkspaceID  string
+	RootPath     string
+	RepoURL      string
+	RemoteName   string
+	BranchName   string
+	BaseCommit   string
+	HeadCommit   string
+	Mode         GitWorkspaceMode
+	Kind         GitWorkspaceKind
+	CommonID     string
+	WorktreeName string
+	GitDirRel    string
+	Status       GitWorkspaceStatus
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 // GitTreeNode describes one entry from a commit tree relative to a workspace
@@ -136,14 +143,18 @@ func (s *Store) UpsertGitWorkspace(ctx context.Context, ws GitWorkspace) error {
 	if ws.Mode == "" {
 		ws.Mode = GitWorkspaceModeFast
 	}
+	if ws.Kind == "" {
+		ws.Kind = GitWorkspaceKindMain
+	}
 	if ws.Status == "" {
 		ws.Status = GitWorkspaceStatusLive
 	}
 	_, err = s.db.ExecContext(ctx, `
 INSERT INTO git_workspaces (
 	workspace_id, root_path, repo_url, remote_name, branch_name,
-	base_commit, head_commit, mode, status, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
+	base_commit, head_commit, mode, workspace_kind, common_workspace_id,
+	worktree_name, gitdir_rel, status, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
 ON DUPLICATE KEY UPDATE
 	repo_url = VALUES(repo_url),
 	remote_name = VALUES(remote_name),
@@ -151,10 +162,15 @@ ON DUPLICATE KEY UPDATE
 	base_commit = VALUES(base_commit),
 	head_commit = VALUES(head_commit),
 	mode = VALUES(mode),
+	workspace_kind = VALUES(workspace_kind),
+	common_workspace_id = VALUES(common_workspace_id),
+	worktree_name = VALUES(worktree_name),
+	gitdir_rel = VALUES(gitdir_rel),
 	status = VALUES(status),
 	updated_at = UTC_TIMESTAMP(3)`,
 		ws.WorkspaceID, ws.RootPath, ws.RepoURL, ws.RemoteName, ws.BranchName,
-		ws.BaseCommit, ws.HeadCommit, string(ws.Mode), string(ws.Status))
+		ws.BaseCommit, ws.HeadCommit, string(ws.Mode), string(ws.Kind), ws.CommonID,
+		ws.WorktreeName, ws.GitDirRel, string(ws.Status))
 	if err != nil {
 		return fmt.Errorf("upsert git workspace %s: %w", ws.WorkspaceID, err)
 	}
@@ -164,7 +180,8 @@ ON DUPLICATE KEY UPDATE
 func (s *Store) GetGitWorkspace(ctx context.Context, workspaceID string) (*GitWorkspace, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT workspace_id, root_path, repo_url, remote_name, branch_name,
-	base_commit, head_commit, mode, status, created_at, updated_at
+	base_commit, head_commit, mode, workspace_kind, common_workspace_id,
+	worktree_name, gitdir_rel, status, created_at, updated_at
 FROM git_workspaces
 WHERE workspace_id = ?`, workspaceID)
 	return scanGitWorkspace(row)
@@ -177,7 +194,8 @@ func (s *Store) GetGitWorkspaceByRoot(ctx context.Context, rootPath string) (*Gi
 	}
 	row := s.db.QueryRowContext(ctx, `
 	SELECT workspace_id, root_path, repo_url, remote_name, branch_name,
-		base_commit, head_commit, mode, status, created_at, updated_at
+		base_commit, head_commit, mode, workspace_kind, common_workspace_id,
+		worktree_name, gitdir_rel, status, created_at, updated_at
 	FROM git_workspaces
 	WHERE root_path = ?`, root)
 	return scanGitWorkspace(row)
@@ -186,7 +204,8 @@ func (s *Store) GetGitWorkspaceByRoot(ctx context.Context, rootPath string) (*Gi
 func (s *Store) ListGitWorkspaces(ctx context.Context) ([]GitWorkspace, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT workspace_id, root_path, repo_url, remote_name, branch_name,
-	base_commit, head_commit, mode, status, created_at, updated_at
+	base_commit, head_commit, mode, workspace_kind, common_workspace_id,
+	worktree_name, gitdir_rel, status, created_at, updated_at
 FROM git_workspaces
 WHERE status = ?
 	ORDER BY root_path`, string(GitWorkspaceStatusLive))
@@ -267,10 +286,11 @@ type gitWorkspaceScanner interface {
 
 func scanGitWorkspace(row gitWorkspaceScanner) (*GitWorkspace, error) {
 	var ws GitWorkspace
-	var mode, status string
+	var mode, kind, status string
 	if err := row.Scan(
 		&ws.WorkspaceID, &ws.RootPath, &ws.RepoURL, &ws.RemoteName, &ws.BranchName,
-		&ws.BaseCommit, &ws.HeadCommit, &mode, &status, &ws.CreatedAt, &ws.UpdatedAt,
+		&ws.BaseCommit, &ws.HeadCommit, &mode, &kind, &ws.CommonID,
+		&ws.WorktreeName, &ws.GitDirRel, &status, &ws.CreatedAt, &ws.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -278,6 +298,7 @@ func scanGitWorkspace(row gitWorkspaceScanner) (*GitWorkspace, error) {
 		return nil, err
 	}
 	ws.Mode = GitWorkspaceMode(mode)
+	ws.Kind = GitWorkspaceKind(kind)
 	ws.Status = GitWorkspaceStatus(status)
 	return &ws, nil
 }

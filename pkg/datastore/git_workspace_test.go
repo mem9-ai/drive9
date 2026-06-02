@@ -5,7 +5,53 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
+
+func TestGitWorkspaceLinkedMetadataRoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	initGitWorkspaceTestSchema(t, s)
+	ctx := context.Background()
+	main := GitWorkspace{
+		WorkspaceID: "base",
+		RootPath:    "/repo/",
+		RepoURL:     "https://github.com/example/repo.git",
+		RemoteName:  "origin",
+		BranchName:  "main",
+		BaseCommit:  strings.Repeat("1", 40),
+		HeadCommit:  strings.Repeat("1", 40),
+		Mode:        GitWorkspaceModeFast,
+		Kind:        GitWorkspaceKindMain,
+	}
+	if err := s.UpsertGitWorkspace(ctx, main); err != nil {
+		t.Fatalf("UpsertGitWorkspace main: %v", err)
+	}
+	linked := GitWorkspace{
+		WorkspaceID:  "wt",
+		RootPath:     "/repo-wt/",
+		RepoURL:      main.RepoURL,
+		RemoteName:   "origin",
+		BranchName:   "feature",
+		BaseCommit:   strings.Repeat("2", 40),
+		HeadCommit:   strings.Repeat("2", 40),
+		Mode:         GitWorkspaceModeFastBlobless,
+		Kind:         GitWorkspaceKindLinked,
+		CommonID:     main.WorkspaceID,
+		WorktreeName: "wt",
+		GitDirRel:    "worktrees/wt",
+	}
+	if err := s.UpsertGitWorkspace(ctx, linked); err != nil {
+		t.Fatalf("UpsertGitWorkspace linked: %v", err)
+	}
+	got, err := s.GetGitWorkspaceByRoot(ctx, "/repo-wt")
+	if err != nil {
+		t.Fatalf("GetGitWorkspaceByRoot linked: %v", err)
+	}
+	if got.Kind != GitWorkspaceKindLinked || got.CommonID != "base" || got.WorktreeName != "wt" || got.GitDirRel != "worktrees/wt" {
+		t.Fatalf("linked metadata = %+v", got)
+	}
+}
 
 func TestGitObjectPackRoundTrip(t *testing.T) {
 	s := newTestStore(t)
@@ -38,6 +84,19 @@ func TestGitObjectPackRoundTrip(t *testing.T) {
 	}
 	if len(packs) != 1 || packs[0].PackID != "pack1" || len(packs[0].ContentBlob) != 0 {
 		t.Fatalf("listed packs = %+v, want metadata only", packs)
+	}
+}
+
+func initGitWorkspaceTestSchema(t *testing.T, s *Store) {
+	t.Helper()
+	for _, stmt := range schema.GitWorkspaceTiDBSchemaStatements() {
+		if _, err := s.DB().Exec(stmt); err != nil {
+			msg := strings.ToLower(err.Error())
+			if strings.Contains(msg, "duplicate key name") || strings.Contains(msg, "duplicate column") || strings.Contains(msg, "already exist") {
+				continue
+			}
+			t.Fatal(err)
+		}
 	}
 }
 
