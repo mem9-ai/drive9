@@ -174,13 +174,18 @@ func TestSSEEndpointLiveEvent(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Publish a new event after connection is established.
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		bus.Publish("/new.txt", "write", "remote-actor")
-	}()
-
 	scanner := bufio.NewScanner(resp.Body)
+
+	current, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial stream-current heartbeat")
+	}
+	if current.Event != "heartbeat" {
+		t.Fatalf("initial event=%q, want heartbeat", current.Event)
+	}
+
+	bus.Publish("/new.txt", "write", "remote-actor")
+
 	ev, ok := readSSEEvent(scanner)
 	if !ok {
 		t.Fatal("expected live event")
@@ -325,13 +330,18 @@ func TestSSEStructuralOpLiveEmitsReset(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Publish a structural op live.
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		bus.Publish("/old", "rename", "remote-actor")
-	}()
-
 	scanner := bufio.NewScanner(resp.Body)
+
+	current, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial stream-current heartbeat")
+	}
+	if current.Event != "heartbeat" {
+		t.Fatalf("initial event=%q, want heartbeat", current.Event)
+	}
+
+	bus.Publish("/old", "rename", "remote-actor")
+
 	ev, ok := readSSEEvent(scanner)
 	if !ok {
 		t.Fatal("expected live event")
