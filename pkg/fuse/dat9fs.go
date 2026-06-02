@@ -4816,25 +4816,32 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// the observed revision so that concurrent reads after a revision
 		// change do not share stale in-flight results.
 		sfKey := fmt.Sprintf("%s@%d", p, cacheRev)
-		data, err, isOwner := fs.readFlight.Do(sfKey, func() ([]byte, error) {
-			releaseReadSlot, err := fs.acquireRemoteReadSlot(ctx)
-			if err != nil {
-				return nil, err
+		data, err, _ := fs.readFlight.Do(ctx, sfKey, func() ([]byte, error) {
+			releaseReadSlot, slotErr := fs.acquireRemoteReadSlot(ctx)
+			if slotErr != nil {
+				return nil, slotErr
 			}
 			defer releaseReadSlot()
-			return fs.readSmallFileWithRetry(ctx, p)
+			fetchData, fetchErr := fs.readSmallFileWithRetry(ctx, p)
+			if fetchErr != nil {
+				return nil, fetchErr
+			}
+			// Populate cache inside the flight callback so the entry
+			// is visible before the flight key is released. This closes
+			// the window where a concurrent reader could miss both the
+			// cache and the in-flight dedup.
+			fs.readCache.PutOwned(p, fetchData, cacheRev)
+			return fetchData, nil
 		})
 		if err != nil {
 			source = "small-read-error"
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, gofuse.EINTR
+			}
 			if errors.Is(err, errReadRetriesExhausted) {
 				return nil, gofuse.EIO
 			}
 			return nil, httpToFuseStatus(err)
-		}
-		// Only the owner stores into the cache — piggybackers use
-		// the shared result directly to avoid redundant cache churn.
-		if isOwner {
-			fs.readCache.PutOwned(p, data, cacheRev)
 		}
 		offset := int64(input.Offset)
 		if offset >= int64(len(data)) {

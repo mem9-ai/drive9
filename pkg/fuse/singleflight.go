@@ -1,18 +1,15 @@
 package fuse
 
-import "sync"
-
-// singleflightResult holds the result of a singleflight call.
-type singleflightResult struct {
-	data []byte
-	err  error
-}
+import (
+	"context"
+	"sync"
+)
 
 // singleflightCall represents an in-progress or completed call.
 type singleflightCall struct {
-	wg  sync.WaitGroup
-	val []byte
-	err error
+	done chan struct{} // closed when the call completes
+	val  []byte
+	err  error
 }
 
 // SingleFlight deduplicates concurrent calls for the same key.
@@ -34,22 +31,31 @@ func NewSingleFlight() *SingleFlight {
 
 // Do executes fn once for the given key, deduplicating concurrent calls.
 // If a call for key is already in progress, Do blocks until it completes
-// and returns the same result. The returned data slice is shared among
+// or the context is cancelled. The returned data slice is shared among
 // all callers for the same key — callers MUST NOT mutate it.
 //
 // The boolean return value is true if the caller was the one that
 // executed fn (the "owner"), false if it piggybacked on another call.
-func (sf *SingleFlight) Do(key string, fn func() ([]byte, error)) ([]byte, error, bool) {
+//
+// When a piggybacker's context is cancelled before the owner finishes,
+// Do returns ctx.Err(). The owner call is NOT cancelled — it runs to
+// completion so that other waiters (and the cache) still get the result.
+func (sf *SingleFlight) Do(ctx context.Context, key string, fn func() ([]byte, error)) ([]byte, error, bool) {
 	sf.mu.Lock()
 	if c, ok := sf.calls[key]; ok {
 		// Another goroutine is already fetching this key.
 		sf.mu.Unlock()
-		c.wg.Wait()
-		return c.val, c.err, false
+		select {
+		case <-c.done:
+			return c.val, c.err, false
+		case <-ctx.Done():
+			return nil, ctx.Err(), false
+		}
 	}
 
-	c := &singleflightCall{}
-	c.wg.Add(1)
+	c := &singleflightCall{
+		done: make(chan struct{}),
+	}
 	sf.calls[key] = c
 	sf.mu.Unlock()
 
@@ -61,7 +67,7 @@ func (sf *SingleFlight) Do(key string, fn func() ([]byte, error)) ([]byte, error
 	delete(sf.calls, key)
 	sf.mu.Unlock()
 
-	c.wg.Done()
+	close(c.done)
 
 	return c.val, c.err, true
 }
