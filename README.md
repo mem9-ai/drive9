@@ -305,6 +305,14 @@ SSE events from `/v1/events` invalidate caches for foreign changes. Local
 same-mount mutations update userspace caches directly and avoid redundant kernel
 notify storms.
 
+Revision-bound `GetAttr` hits from the directory cache are disabled by default
+because the current SSE event stream is process-local. Enable
+`drive9 mount --trust-process-local-events` only when tenant mutations and
+`/v1/events` are guaranteed to use the same server process through
+single-server/sticky routing, or when the deployment provides a cluster-wide
+durable event stream. Without that explicit trust boundary, regular-file
+`GetAttr` falls back to remote HEAD revalidation.
+
 ## HTTP API
 
 Authenticate HTTP API calls with `Authorization: Bearer $DRIVE9_API_KEY`.

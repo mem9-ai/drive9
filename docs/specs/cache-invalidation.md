@@ -37,7 +37,8 @@ This spec describes the **target architecture** for P1 cache implementation. The
 ## 2. Definitions
 
 - **revision**: A monotonically increasing integer assigned by the server to each file mutation. Every write produces a new revision. Note: chmod does NOT currently increment revision or emit SSE (see §1.1 prerequisites).
-- **SSE**: Server-Sent Events stream from `/v1/events`. Delivers `ChangeEvent` (per-path, for write/upload_complete/create/symlink ops) and `ResetEvent` (full invalidation, including for structural ops like rename/delete/mkdir/copy).
+- **SSE**: Server-Sent Events stream from `/v1/events`. Delivers `ChangeEvent` (per-path, for write/upload_complete/create/symlink ops), `ResetEvent` (full invalidation, including for structural ops like rename/delete/mkdir/copy), and heartbeat/current markers after replay/reset catch-up.
+- **trusted event stream**: An SSE stream that is safe to use as a freshness guarantee for revision-bound stat-cache hits. The current server event bus is process-local, so the stream is trusted only for single-server/sticky-routing deployments, or for future deployments with a cluster-wide durable event stream. Mounts must fail closed unless the operator explicitly enables this trust boundary.
 - **stale**: Cache entry whose revision is older than the server's current revision for that path.
 - **orphan**: Cache entry for a path/file that no longer exists on the server.
 - **structural op**: An operation that affects paths beyond the single target (rename, delete, mkdir, copy). The server converts these to `ResetEvent` because targeted single-path invalidation cannot reliably cover old paths, subtrees, and parent directory caches.
@@ -186,8 +187,10 @@ When the SSE connection drops:
    - For **directories**: Directory revision is not exposed by the current API (see §1.1). During SSE disconnect, directory cache entries fall back to TTL-only validity. After TTL expires, the next readdir fetches from server.
 4. When SSE reconnects:
    - The client reconnects with its last seen sequence number (`WatchEvents` in `pkg/client/events.go:50`).
-   - If the server's ring buffer can replay events since that sequence: server replays missed events. Each replayed event triggers normal invalidation (§4.1/§4.2). "Unverified" flag is cleared for entries that survive replay without invalidation.
-   - If the server cannot replay (sequence too old, server restart): server sends a `ResetEvent`. All caches are fully invalidated. "Unverified" flag is moot (everything is cleared).
+   - If the server's ring buffer can replay events since that sequence: server replays missed events. Each replayed event triggers normal invalidation (§4.1/§4.2). The server then emits a heartbeat/current marker. Only that marker can clear the "unverified" flag for entries that survive replay without invalidation.
+   - If the server cannot replay (sequence too old, server restart): server sends a `ResetEvent`, then a heartbeat/current marker. All caches are fully invalidated before the stream is considered verified.
+
+Revision-bound stat-cache hits may use the verified state only when the mount is configured to trust the SSE deployment boundary. With the current process-local event bus, default mounts do not trust SSE for regular-file `GetAttr` freshness and must fall back to remote HEAD revalidation.
 
 **Rationale**: Option A (block reads) would make the mount unusable during network hiccups. Option B (bounded stale) is complex to tune. Option C is pragmatic: reads continue with lazy revalidation, and missed events are replayed or full invalidation happens on reconnect.
 

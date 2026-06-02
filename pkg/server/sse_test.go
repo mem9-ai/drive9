@@ -174,13 +174,18 @@ func TestSSEEndpointLiveEvent(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Publish a new event after connection is established.
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		bus.Publish("/new.txt", "write", "remote-actor")
-	}()
-
 	scanner := bufio.NewScanner(resp.Body)
+
+	current, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial stream-current heartbeat")
+	}
+	if current.Event != "heartbeat" {
+		t.Fatalf("initial event=%q, want heartbeat", current.Event)
+	}
+
+	bus.Publish("/new.txt", "write", "remote-actor")
+
 	ev, ok := readSSEEvent(scanner)
 	if !ok {
 		t.Fatal("expected live event")
@@ -325,13 +330,18 @@ func TestSSEStructuralOpLiveEmitsReset(t *testing.T) {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// Publish a structural op live.
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		bus.Publish("/old", "rename", "remote-actor")
-	}()
-
 	scanner := bufio.NewScanner(resp.Body)
+
+	current, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial stream-current heartbeat")
+	}
+	if current.Event != "heartbeat" {
+		t.Fatalf("initial event=%q, want heartbeat", current.Event)
+	}
+
+	bus.Publish("/old", "rename", "remote-actor")
+
 	ev, ok := readSSEEvent(scanner)
 	if !ok {
 		t.Fatal("expected live event")
@@ -502,6 +512,17 @@ func TestSSEBurstFlush(t *testing.T) {
 
 	scanner := bufio.NewScanner(resp.Body)
 
+	// Initial replay is empty for since=1, but the server must still emit a
+	// current heartbeat immediately so clients can clear reconnect-unverified
+	// cache state without waiting for the periodic heartbeat.
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial current heartbeat")
+	}
+	if ev.Event != "heartbeat" {
+		t.Fatalf("expected initial heartbeat, got %q", ev.Event)
+	}
+
 	// Publish a burst of 3 events concurrently.
 	go func() {
 		time.Sleep(50 * time.Millisecond)
@@ -512,8 +533,6 @@ func TestSSEBurstFlush(t *testing.T) {
 
 	// Read first event with a timeout well under heartbeat (30s).
 	done := make(chan struct{})
-	var ev sseEvent
-	var ok bool
 	go func() {
 		ev, ok = readSSEEvent(scanner)
 		close(done)

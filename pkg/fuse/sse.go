@@ -22,6 +22,9 @@ type SSEWatcher struct {
 // StartSSEWatcher starts a background goroutine that connects to the
 // server's /v1/events SSE endpoint and invalidates local caches.
 func StartSSEWatcher(fs *Dat9FS, c *client.Client, actor string) *SSEWatcher {
+	if fs != nil {
+		fs.markStatCacheUnverified()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	w := &SSEWatcher{
 		fs:     fs,
@@ -31,7 +34,14 @@ func StartSSEWatcher(fs *Dat9FS, c *client.Client, actor string) *SSEWatcher {
 	}
 	go func() {
 		defer close(w.doneCh)
-		c.WatchEvents(ctx, actor, w.handleEvent)
+		c.WatchEventsWithLifecycle(ctx, actor, w.handleEvent, client.EventLifecycle{
+			OnDisconnected: func(error) {
+				if w.fs != nil {
+					w.fs.markStatCacheUnverified()
+				}
+			},
+			OnCurrent: w.handleStreamCurrent,
+		})
 	}()
 	return w
 }
@@ -40,6 +50,12 @@ func StartSSEWatcher(fs *Dat9FS, c *client.Client, actor string) *SSEWatcher {
 func (w *SSEWatcher) Stop() {
 	w.cancel()
 	<-w.doneCh
+}
+
+func (w *SSEWatcher) handleStreamCurrent(uint64) {
+	if w.fs != nil {
+		w.fs.markStatCacheVerified()
+	}
 }
 
 func (w *SSEWatcher) handleEvent(change *client.ChangeEvent, reset *client.ResetEvent) {
@@ -69,6 +85,9 @@ func (w *SSEWatcher) handleEvent(change *client.ChangeEvent, reset *client.Reset
 		}
 		// Only handle resets with an explicit reason (not heartbeats).
 		w.handleReset(reset)
+		if w.fs != nil {
+			w.fs.markStatCacheVerified()
+		}
 	}
 }
 

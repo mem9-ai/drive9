@@ -104,6 +104,7 @@ func fsMountCmd(args []string) error {
 	prefetchMaxFileBytes := fs.Int64("readdir-prefetch-max-file-bytes", 50_000, "maximum individual file size prefetched by readdir prefetch")
 	prefetchMaxBytes := fs.Int64("readdir-prefetch-max-bytes", 1<<20, "maximum aggregate bytes prefetched per directory read")
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
+	trustProcessLocalEvents := fs.Bool("trust-process-local-events", false, "allow revision-bound GetAttr dir-cache hits using process-local SSE freshness; only safe for single-server/sticky routing or cluster-wide event streams")
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
 	profile := fs.String("profile", "", "mount profile: interactive, coding-agent (empty for default)")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root for --profile=coding-agent")
@@ -160,6 +161,7 @@ func fsMountCmd(args []string) error {
 
 	lookupRetryCountGiven := flagProvided(fs, "lookup-retry-count")
 	lookupRetryTimeoutGiven := flagProvided(fs, "lookup-retry-timeout")
+	trustProcessLocalEventsGiven := flagProvided(fs, "trust-process-local-events")
 	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout, lookupRetryCountGiven, lookupRetryTimeoutGiven); err != nil {
 		return err
 	}
@@ -206,6 +208,9 @@ func fsMountCmd(args []string) error {
 
 	if resolved == MountModeWebDAV && *readOnly {
 		return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
+	}
+	if resolved == MountModeWebDAV && trustProcessLocalEventsGiven {
+		return fmt.Errorf("drive9 mount: --trust-process-local-events is only supported with --mode=fuse")
 	}
 	if runtime.GOOS == "windows" && resolved == MountModeFUSE {
 		return mountFuse(&mountFuseOptions{
@@ -272,6 +277,7 @@ func fsMountCmd(args []string) error {
 		PrefetchMaxFileBytes:  *prefetchMaxFileBytes,
 		PrefetchMaxBytes:      *prefetchMaxBytes,
 		PrefetchTimeout:       *prefetchTimeout,
+		TrustLocalEvents:      *trustProcessLocalEvents,
 		SyncMode:              syncModeVal,
 		WritePolicy:           writePolicyVal,
 		Profile:               *profile,
