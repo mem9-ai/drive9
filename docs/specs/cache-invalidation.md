@@ -8,52 +8,88 @@
 
 Define the invalidation semantics for all FUSE-side caches (read cache, directory/stat cache, negative cache). Every cache implementation in the FUSE layer MUST follow this spec. No cache may serve data that contradicts the server's current revision.
 
+### 1.1 Current State vs Proposed
+
+This spec describes the **target architecture** for P1 cache implementation. The table below clarifies what exists today vs what needs to be built.
+
+| Component | Current State | Proposed (this spec) |
+|---|---|---|
+| File read cache | In-memory LRU, whole-file, path-keyed, revision-aware (`pkg/fuse/read.go`) | Add disk-backed layer (#486) with byte-range blocks; in-memory layer unchanged |
+| Directory cache | TTL-based with positive/negative entries, `CachedFileInfo` has `Revision` field (`pkg/fuse/dir.go`) | Add SSE-driven invalidation on top of existing TTL |
+| Stat/attr cache | Embedded in directory cache | Same, with revision-bound validity |
+| Negative cache | Embedded in directory cache (`NegativeTimeout` = 1s) | Same semantics, formalized rules |
+| SSE invalidation | `pkg/fuse/sse.go` — handles `ChangeEvent` and `ResetEvent`, self-filters by actor | Extend to cover new disk cache layer |
+| Disk read cache | Does not exist | New (#486) |
+| Singleflight | Does not exist | New (#488) |
+
+**API prerequisites** (NOT in scope of this spec, tracked as separate issues):
+
+- **chmod SSE event**: `handleChmod` (server.go:2033-2069) does NOT call `publishEvent`. Remote chmod changes are invisible to other mounts until TTL expiry. Needs server fix.
+- **Directory revision**: `handleStat` only returns `X-Dat9-Revision` when `nf.File != nil` (server.go:1865-1866). Directories have no revision exposed. Until this is fixed, directory cache validity relies on SSE invalidation + TTL only (no revision-based lazy revalidation for directories).
+
 ## 2. Definitions
 
-- **revision**: A monotonically increasing integer assigned by the server to each file/directory mutation. Every write, rename, chmod, or delete produces a new revision.
-- **SSE**: Server-Sent Events stream from `/v1/events`. Delivers `ChangeEvent` (per-path) and `ResetEvent` (full invalidation).
+- **revision**: A monotonically increasing integer assigned by the server to each file mutation. Every write produces a new revision. Note: chmod does NOT currently increment revision or emit SSE (see §1.1 prerequisites).
+- **SSE**: Server-Sent Events stream from `/v1/events`. Delivers `ChangeEvent` (per-path, for write/upload_complete/create/symlink ops) and `ResetEvent` (full invalidation, including for structural ops like rename/delete/mkdir/copy).
 - **stale**: Cache entry whose revision is older than the server's current revision for that path.
 - **orphan**: Cache entry for a path/file that no longer exists on the server.
+- **structural op**: An operation that affects paths beyond the single target (rename, delete, mkdir, copy). The server converts these to `ResetEvent` because targeted single-path invalidation cannot reliably cover old paths, subtrees, and parent directory caches.
 
 ## 3. Cache Key Structure
 
-### 3.1 File Read Cache (disk-backed)
+### 3.1 File Read Cache
 
-```
-Key = (file_id, revision, offset, length)
+**Current (in-memory):**
+
+```text
+Key = (path)
+Value = { data: []byte, revision, expires }
 ```
 
-- `file_id`: Stable file identifier (path or server-assigned ID).
+- `path`: Absolute path within the mount. This is the key used by the existing `ReadCache` in `pkg/fuse/read.go`.
 - `revision`: The file revision at the time of fetch.
-- `offset` + `length`: Byte range within the file.
+- Whole-file cache (no byte-range splitting). Maximum file size: `read-cache-max-file` (default 1MB).
+- A cache hit is valid ONLY if the entry's revision matches the current known revision for that file.
+
+**Proposed (disk-backed, #486):**
+
+```text
+Key = (path, revision, offset, length)
+```
+
+- `path`: Same path used by the in-memory layer.
+- `revision`: The file revision at the time of fetch.
+- `offset` + `length`: Byte range within the file (block-aligned).
+- Disk cache stores larger files in fixed-size blocks.
 - A cache hit is valid ONLY if the entry's revision matches the current known revision for that file.
 
 ### 3.2 Directory Cache
 
-```
+```text
 Key = (dir_path)
-Value = { entries: [...], revision: dir_revision, expires: timestamp }
+Value = { entries: [...], expires: timestamp }
 ```
 
 - `dir_path`: Absolute path of the directory within the mount.
-- `revision`: The directory's revision at the time the listing was fetched.
-- `expires`: TTL-based expiry as a secondary safeguard (not primary invalidation).
-- A cache hit is valid ONLY if no SSE invalidation has been received for this directory since the entry was stored.
+- `expires`: TTL-based expiry (primary invalidation mechanism for directories, since directory revision is not yet exposed by the server API — see §1.1).
+- SSE invalidation (ChangeEvent for child paths, or ResetEvent for structural ops) also triggers invalidation.
+- A cache hit is valid ONLY if: (a) no SSE invalidation has been received for this directory since the entry was stored, AND (b) the entry is not marked "unverified" due to SSE disconnect.
 
 ### 3.3 Stat/Attr Cache
 
-```
+```text
 Key = (file_path)
 Value = { size, mtime, mode, revision, expires: timestamp }
 ```
 
 - Stat cache entries are stored as part of the directory cache (readdir returns stat info).
 - Individual stat lookups may also populate this cache.
-- Validity: same as directory cache — SSE invalidation or revision mismatch.
+- For files: `revision` field enables revision-based validity checks.
+- For directories: `revision` is not available from the server API (see §1.1). Validity relies on SSE + TTL only.
 
 ### 3.4 Negative Cache
 
-```
+```text
 Key = (parent_dir, child_name)
 Value = { expires: timestamp }
 ```
@@ -66,25 +102,35 @@ Value = { expires: timestamp }
 
 ### 4.1 SSE ChangeEvent
 
+The server sends `ChangeEvent` for non-structural operations: `write`, `upload_complete`, `create`, `symlink`. Structural operations (rename, delete, mkdir, copy) are sent as `ResetEvent` instead (see §4.2).
+
 When SSE delivers a `ChangeEvent` for path P:
 
-1. **File read cache**: Invalidate ALL entries where `file_id` matches P.
+1. **File read cache**: Invalidate ALL entries where path matches P (both in-memory and disk layers).
 2. **Directory cache**: Invalidate the entry for `parent(P)`.
 3. **Stat cache**: Invalidate the entry for P.
 4. **Negative cache**: Remove negative entry for `(parent(P), basename(P))`.
 5. **Kernel cache**: Notify kernel via `NotifyInvalInode` and `NotifyInvalEntry`.
 
-This is already implemented in `pkg/fuse/sse.go:handleChange()`.
+This is already implemented in `pkg/fuse/sse.go:handleChange()` for the in-memory read cache and kernel notifications. Disk cache invalidation (#486) will extend this.
 
 ### 4.2 SSE ResetEvent
+
+The server sends `ResetEvent` in these cases:
+
+1. **Structural operations**: rename, delete, mkdir, copy — converted by `isStructuralOp()` in `pkg/server/sse.go:313-319`. These are sent as reset because targeted single-path invalidation cannot reliably cover old paths, subtrees, and parent directory caches.
+2. **Sequence gap**: Client reconnects with a `since` value that the server's ring buffer can no longer replay (`seq_too_old`).
+3. **Server restart**: Client's `since` is ahead of the server's current head (`server_restart`).
+4. **Initial sync**: Client connects with `since=0` (`initial_sync`).
 
 When SSE delivers a `ResetEvent`:
 
 1. Invalidate ALL entries in ALL caches (read, dir, stat, negative).
 2. Notify kernel for all known inodes.
-3. This is the nuclear option — used when the server cannot enumerate individual changes (e.g., bulk import, schema migration).
 
 This is already implemented in `pkg/fuse/sse.go:handleReset()`.
+
+**Note**: Structural-op resets carry `path`, `op`, and `actor` fields in the payload. Future optimization MAY use these for targeted invalidation instead of full reset, but the current spec requires full invalidation for safety.
 
 ### 4.3 Local Mutation
 
@@ -92,7 +138,7 @@ When this mount performs a write, rename, unlink, mkdir, or chmod:
 
 1. Invalidate affected cache entries immediately (before the server responds).
 2. Do NOT wait for SSE echo — the local mutation is authoritative for this mount.
-3. SSE self-filtering (`actor` check) prevents double-invalidation.
+3. SSE self-filtering (`actor` field matching) prevents double-invalidation. Each mount instance MUST use a unique actor ID.
 
 ### 4.4 Revision Mismatch on Server Response
 
@@ -111,29 +157,31 @@ When the SSE connection drops:
 1. Mark all caches as "unverified" (set a flag, do NOT delete entries).
 2. Continue serving cached data.
 3. On next cache hit for an unverified entry:
-   - Issue a lightweight HTTP HEAD / conditional GET to the server.
-   - If revision matches: re-verify the entry, clear "unverified" flag.
-   - If revision differs: invalidate and re-fetch.
+   - For **files**: Issue a lightweight HTTP HEAD to the server (`handleStat`, which returns `X-Dat9-Revision`). Compare revision. If match: re-verify the entry, clear "unverified" flag. If mismatch: invalidate and re-fetch.
+   - For **directories**: Directory revision is not exposed by the current API (see §1.1). During SSE disconnect, directory cache entries fall back to TTL-only validity. After TTL expires, the next readdir fetches from server.
 4. When SSE reconnects:
-   - Server sends a `ResetEvent` (current behavior).
-   - All caches are fully invalidated.
-   - "Unverified" flag is cleared (replaced by full invalidation).
+   - The client reconnects with its last seen sequence number (`WatchEvents` in `pkg/client/events.go:50`).
+   - If the server's ring buffer can replay events since that sequence: server replays missed events. Each replayed event triggers normal invalidation (§4.1/§4.2). "Unverified" flag is cleared for entries that survive replay without invalidation.
+   - If the server cannot replay (sequence too old, server restart): server sends a `ResetEvent`. All caches are fully invalidated. "Unverified" flag is moot (everything is cleared).
 
-**Rationale**: Option A (block reads) would make the mount unusable during network hiccups. Option B (bounded stale) is complex to tune. Option C is pragmatic: reads continue with lazy revalidation, and full invalidation happens on reconnect.
+**Rationale**: Option A (block reads) would make the mount unusable during network hiccups. Option B (bounded stale) is complex to tune. Option C is pragmatic: reads continue with lazy revalidation, and missed events are replayed or full invalidation happens on reconnect.
 
 **Staleness window**: Between SSE disconnect and the next read of a given path, data may be stale. This is bounded by:
-- The time until the next read triggers revalidation.
-- The time until SSE reconnects and triggers a full reset.
+- For files: the time until the next read triggers a HEAD revalidation check.
+- For directories: the remaining TTL on the directory cache entry.
+- For negative cache: the remaining TTL (default 1s). A file created remotely during disconnect may be masked by a negative entry for up to 1 second.
 
-**Acceptable because**: The current system already has TTL-based caching with similar staleness characteristics. Option C makes it strictly better (revision-check on read vs pure TTL expiry).
+**Acceptable because**: The current system already has TTL-based caching with similar staleness characteristics. Option C makes it strictly better for files (revision-check on read vs pure TTL expiry). For directories, behavior is unchanged until the server exposes directory revisions.
 
 ## 6. Multi-Mount Isolation
 
 When multiple mounts access the same workspace:
 
-1. Mount A writes file F → server updates revision → SSE broadcasts ChangeEvent.
-2. Mount B receives ChangeEvent → invalidates its cache for F.
+1. Mount A writes file F -> server updates revision -> SSE broadcasts ChangeEvent (or ResetEvent for structural ops).
+2. Mount B receives the event -> invalidates its cache for F.
 3. Mount B's next read of F fetches the new revision from server.
+
+**Requirement**: Each mount instance MUST use a unique actor ID for SSE self-filtering. Two mounts sharing an actor ID would cause SSE events from one mount to be silently filtered by the other, leading to stale caches.
 
 **Edge case: SSE delivery delay**
 
@@ -165,50 +213,63 @@ Implementation requirement: Invalidation MUST take priority over eviction. An in
 |---|---|
 | `stat(path)` returns ENOENT | Cache `(parent, name)` as negative, TTL = `NegativeTimeout` |
 | SSE ChangeEvent for `path` | Remove negative entry for `(parent(path), basename(path))` |
+| SSE ResetEvent (any reason) | Remove ALL negative entries |
 | Local `create(path)` | Remove negative entry for `(parent(path), basename(path))` |
 | Directory cache invalidated | Remove ALL negative entries for that directory |
 | TTL expires | Remove negative entry |
-| SSE ResetEvent | Remove ALL negative entries |
 
 **NegativeTimeout**: Configurable, default 1 second. Must be short to avoid masking newly created files.
+
+**SSE disconnect behavior**: During SSE disconnect, negative entries continue to use TTL-only expiry. A file created remotely may be masked for up to `NegativeTimeout` (1s default). This is acceptable given the short default TTL.
 
 ## 9. Test Scenarios
 
 Each scenario MUST have a corresponding test before the cache implementation is merged.
 
 ### 9.1 Basic correctness
-- T1: Read file → cache hit → read again → served from cache (same revision)
-- T2: Read file → SSE invalidate → read again → fetched from server (new revision)
-- T3: Readdir → cache hit → readdir again → served from cache
-- T4: Readdir → SSE invalidate parent → readdir again → fetched from server
+- T1: Read file -> cache hit -> read again -> served from cache (same revision)
+- T2: Read file -> SSE ChangeEvent -> read again -> fetched from server (new revision)
+- T3: Readdir -> cache hit -> readdir again -> served from cache
+- T4: Readdir -> SSE ChangeEvent for child -> readdir again -> fetched from server
 
 ### 9.2 Revision binding
-- T5: Cache entry with revision R1, server has R2 → cache miss, re-fetch
-- T6: Cache entry with revision R1, server still R1 → cache hit
-- T7: File deleted (revision gone) → cache entry orphaned → invalidated by SSE
+- T5: Cache entry with revision R1, server has R2 -> cache miss, re-fetch
+- T6: Cache entry with revision R1, server still R1 -> cache hit
+- T7: File deleted -> SSE ResetEvent (structural op) -> cache entry invalidated
 
 ### 9.3 SSE disconnect
-- T8: SSE disconnects → reads continue (lazy revalidation)
-- T9: SSE disconnects → read triggers HEAD check → revision matches → serve cached
-- T10: SSE disconnects → read triggers HEAD check → revision differs → re-fetch
-- T11: SSE reconnects → ResetEvent → all caches invalidated
+- T8: SSE disconnects -> reads continue (lazy revalidation)
+- T9: SSE disconnects -> file read triggers HEAD check -> revision matches -> serve cached
+- T10: SSE disconnects -> file read triggers HEAD check -> revision differs -> re-fetch
+- T11: SSE reconnects with replay -> missed events applied -> affected entries invalidated
+- T12: SSE reconnects with reset (seq_too_old) -> all caches invalidated
 
-### 9.4 Multi-mount
-- T12: Mount A writes → Mount B's cache invalidated via SSE → B reads new data
-- T13: Mount A writes → SSE delayed → Mount B reads stale → SSE arrives → B's cache invalidated
+### 9.4 SSE event types
+- T13: Structural op (rename) -> ResetEvent received -> all caches invalidated
+- T14: Non-structural op (write) -> ChangeEvent received -> targeted invalidation
+- T15: Self-event filtering -> local write does not trigger SSE-driven re-invalidation
 
-### 9.5 Negative cache
-- T14: stat(nonexistent) → negative cached → stat again → ENOENT from cache
-- T15: stat(nonexistent) → negative cached → create file → negative removed → stat returns file
-- T16: Negative TTL expires → next stat goes to server
+### 9.5 Multi-mount
+- T16: Mount A writes -> Mount B's cache invalidated via SSE -> B reads new data
+- T17: Mount A writes -> SSE delayed -> Mount B reads stale -> SSE arrives -> B's cache invalidated
 
-### 9.6 Eviction vs invalidation
-- T17: Cache full → LRU evicts entry → re-read fetches with current revision
-- T18: Cache entry invalidated → even if capacity available, entry not served
+### 9.6 Negative cache
+- T18: stat(nonexistent) -> negative cached -> stat again -> ENOENT from cache
+- T19: stat(nonexistent) -> negative cached -> SSE ChangeEvent for path -> negative removed -> stat goes to server
+- T20: Negative TTL expires -> next stat goes to server
+- T21: SSE ResetEvent -> all negative entries removed
 
-### 9.7 Concurrent access
-- T19: Two goroutines read same file simultaneously → singleflight, one HTTP call
-- T20: Read and SSE invalidation race → read returns either old or new, never corrupt
+### 9.7 Eviction vs invalidation
+- T22: Cache full -> LRU evicts entry -> re-read fetches with current revision
+- T23: Cache entry invalidated -> even if capacity available, entry not served
+
+### 9.8 Concurrent access
+- T24: Two goroutines read same file simultaneously -> singleflight, one HTTP call
+- T25: Read and SSE invalidation race -> read returns either old or new, never corrupt
+
+### 9.9 Local mutation
+- T26: Local write -> cache entry invalidated immediately (before server response)
+- T27: Local mkdir -> directory cache for parent invalidated
 
 ## 10. Configuration
 
@@ -225,5 +286,5 @@ Each scenario MUST have a corresponding test before the cache implementation is 
 ## 11. Non-goals
 
 - This spec does NOT cover write-back cache invalidation. Write-path caching requires GC/session safety (#490) first.
-- This spec does NOT define server-side API changes. If the server needs to return additional data (e.g., stat info in readdir), that is a separate issue.
+- This spec does NOT define server-side API changes (chmod SSE event, directory revision API). Those are tracked as separate prerequisite issues (see §1.1).
 - This spec does NOT define cache storage format (on-disk layout, compression, checksums). That is an implementation detail for #486.
