@@ -626,6 +626,315 @@ func TestReadCacheCachesMediumSmallFileAfterFirstRead(t *testing.T) {
 	}
 }
 
+func readDat9FSTestBytes(fs *Dat9FS, ino, fh uint64, size int) ([]byte, gofuse.Status, error) {
+	buf := make([]byte, size)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fh,
+		Offset:   0,
+		Size:     uint32(size),
+	}, buf)
+	if st != gofuse.OK {
+		return nil, st, nil
+	}
+	if result == nil {
+		return nil, st, errors.New("nil read result")
+	}
+	data, _ := result.Bytes(buf)
+	return append([]byte(nil), data...), st, nil
+}
+
+func TestDat9FSReadSingleFlightSameRevisionDedupsBackendRead(t *testing.T) {
+	const (
+		path    = "/file.bin"
+		rev     = int64(7)
+		readers = 3
+	)
+	data := []byte("same-revision-data")
+	started := make(chan struct{}, readers)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseReads := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	t.Cleanup(releaseReads)
+	var getCalls atomic.Int32
+	var (
+		handlerMu  sync.Mutex
+		handlerErr error
+	)
+	recordHandlerErr := func(err error) {
+		handlerMu.Lock()
+		defer handlerMu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.Path != "/v1/fs/file.bin" {
+				recordHandlerErr(fmt.Errorf("GET path = %q, want /v1/fs/file.bin", r.URL.Path))
+				http.NotFound(w, r)
+				return
+			}
+			getCalls.Add(1)
+			started <- struct{}{}
+			<-release
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			_, _ = w.Write(data)
+		default:
+			recordHandlerErr(fmt.Errorf("unexpected method %s", r.Method))
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(path, false, int64(len(data)), time.Now())
+	fs.inodes.UpdateRevision(ino, rev)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	var wg sync.WaitGroup
+	errs := make(chan error, readers)
+	results := make(chan []byte, readers)
+	startReaders := make(chan struct{})
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startReaders
+			got, st, err := readDat9FSTestBytes(fs, ino, out.Fh, len(data))
+			if err != nil {
+				errs <- err
+				return
+			}
+			if st != gofuse.OK {
+				errs <- fmt.Errorf("Read status = %v, want OK", st)
+				return
+			}
+			results <- got
+		}()
+	}
+	close(startReaders)
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		releaseReads()
+		t.Fatal("backend GET did not start")
+	}
+	waitForWaiters(t, fs.readFlight, fmt.Sprintf("%s@%d", path, rev), readers-1)
+	releaseReads()
+	wg.Wait()
+	close(errs)
+	close(results)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for got := range results {
+		if !bytes.Equal(got, data) {
+			t.Fatalf("Read data = %q, want %q", got, data)
+		}
+	}
+	if got := getCalls.Load(); got != 1 {
+		t.Fatalf("GET calls = %d, want 1", got)
+	}
+	if cached, ok := fs.readCache.Get(path, rev); !ok || !bytes.Equal(cached, data) {
+		t.Fatalf("readCache.Get(%q, %d) = %q, %v; want cached data", path, rev, cached, ok)
+	}
+	handlerMu.Lock()
+	err := handlerErr
+	handlerMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDat9FSReadSingleFlightDifferentRevisionNotShared(t *testing.T) {
+	const path = "/file.bin"
+	rev1Data := []byte("revision-one")
+	rev2Data := []byte("revision-two")
+	started := make(chan int32, 3)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseReads := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	t.Cleanup(releaseReads)
+	var getCalls atomic.Int32
+	var (
+		handlerMu  sync.Mutex
+		handlerErr error
+	)
+	recordHandlerErr := func(err error) {
+		handlerMu.Lock()
+		defer handlerMu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(rev2Data)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.Path != "/v1/fs/file.bin" {
+				recordHandlerErr(fmt.Errorf("GET path = %q, want /v1/fs/file.bin", r.URL.Path))
+				http.NotFound(w, r)
+				return
+			}
+			call := getCalls.Add(1)
+			started <- call
+			<-release
+			switch call {
+			case 1:
+				w.Header().Set("Content-Length", strconv.Itoa(len(rev1Data)))
+				_, _ = w.Write(rev1Data)
+			case 2:
+				w.Header().Set("Content-Length", strconv.Itoa(len(rev2Data)))
+				_, _ = w.Write(rev2Data)
+			default:
+				recordHandlerErr(fmt.Errorf("GET call count = %d, want <= 2", call))
+				http.Error(w, "unexpected extra read", http.StatusInternalServerError)
+			}
+		default:
+			recordHandlerErr(fmt.Errorf("unexpected method %s", r.Method))
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(path, false, int64(len(rev2Data)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	firstDone := make(chan []byte, 1)
+	firstErr := make(chan error, 1)
+	go func() {
+		got, st, err := readDat9FSTestBytes(fs, ino, out.Fh, len(rev2Data))
+		if err != nil {
+			firstErr <- err
+			return
+		}
+		if st != gofuse.OK {
+			firstErr <- fmt.Errorf("first Read status = %v, want OK", st)
+			return
+		}
+		firstDone <- got
+	}()
+
+	select {
+	case call := <-started:
+		if call != 1 {
+			releaseReads()
+			t.Fatalf("first started GET call = %d, want 1", call)
+		}
+	case <-time.After(time.Second):
+		releaseReads()
+		t.Fatal("first backend GET did not start")
+	}
+
+	// Simulate a revalidated lookup/invalidation advancing the observed
+	// revision while the old revision read is still in flight.
+	fs.inodes.UpdateRevision(ino, 2)
+
+	secondDone := make(chan []byte, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		got, st, err := readDat9FSTestBytes(fs, ino, out.Fh, len(rev2Data))
+		if err != nil {
+			secondErr <- err
+			return
+		}
+		if st != gofuse.OK {
+			secondErr <- fmt.Errorf("second Read status = %v, want OK", st)
+			return
+		}
+		secondDone <- got
+	}()
+
+	select {
+	case call := <-started:
+		if call != 2 {
+			releaseReads()
+			t.Fatalf("second started GET call = %d, want 2", call)
+		}
+	case <-time.After(time.Second):
+		releaseReads()
+		t.Fatal("second backend GET did not start; reads for different revisions were likely shared")
+	}
+
+	releaseReads()
+
+	var first []byte
+	select {
+	case err := <-firstErr:
+		t.Fatal(err)
+	case first = <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first Read did not finish")
+	}
+	var second []byte
+	select {
+	case err := <-secondErr:
+		t.Fatal(err)
+	case second = <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second Read did not finish")
+	}
+
+	if !bytes.Equal(first, rev1Data) {
+		t.Fatalf("first Read data = %q, want %q", first, rev1Data)
+	}
+	if !bytes.Equal(second, rev2Data) {
+		t.Fatalf("second Read data = %q, want %q", second, rev2Data)
+	}
+	if got := getCalls.Load(); got != 2 {
+		t.Fatalf("GET calls = %d, want 2", got)
+	}
+	handlerMu.Lock()
+	err := handlerErr
+	handlerMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCreateWriteThroughShadow(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)
