@@ -6,7 +6,14 @@
 
 ## 1. Purpose
 
-Define the invalidation semantics for all FUSE-side caches (read cache, directory/stat cache, negative cache). Every cache implementation in the FUSE layer MUST follow this spec. No cache may serve data that contradicts the server's current revision.
+Define the invalidation semantics for all FUSE-side caches (read cache, directory/stat cache, negative cache). Every cache implementation in the FUSE layer MUST follow this spec.
+
+**Consistency invariant**: When the SSE connection is healthy, no cache may serve data that contradicts the server's current revision. During SSE disconnect, bounded staleness is permitted under the lazy revalidation rules defined in §5:
+- **File read cache**: stale until the next read triggers a HEAD revalidation check.
+- **Directory/stat cache**: stale until TTL expires (directory revision not yet exposed by server API).
+- **Negative cache**: stale for up to `NegativeTimeout` (default 1 second).
+
+These staleness windows are strictly bounded and documented. Upon SSE reconnect, either event replay or full reset eliminates all staleness.
 
 ### 1.1 Current State vs Proposed
 
