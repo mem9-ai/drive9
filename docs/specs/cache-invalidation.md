@@ -107,16 +107,34 @@ Value = { expires: timestamp }
 
 ## 4. Invalidation Triggers
 
+### 4.0 Operation → SSE Event Routing
+
+Every server mutation maps to exactly one SSE event type. This table is the authoritative routing for cache invalidation:
+
+| Server operation | SSE event | Invalidation scope | Notes |
+|---|---|---|---|
+| `write` | ChangeEvent | Targeted (path P) | File content changed |
+| `upload_complete` | ChangeEvent | Targeted (path P) | Multipart upload finalized |
+| `create` | ChangeEvent | Targeted (path P) | New file/symlink |
+| `symlink` | ChangeEvent | Targeted (path P) | New symbolic link |
+| `rename` | ResetEvent | Full (all caches) | Source path, dest path, both parents, subtrees affected |
+| `delete` | ResetEvent | Full (all caches) | Path + parent dir + potential subtree |
+| `mkdir` | ResetEvent | Full (all caches) | Parent dir structure changed |
+| `copy` | ResetEvent | Full (all caches) | Source metadata + dest path + dest parent |
+| `chmod` | *(none)* | *(not invalidated)* | **Known gap**: `handleChmod` does not call `publishEvent` or increment revision. See §1.1 prerequisites. Remote chmod is invisible until TTL expiry. |
+
+**Why structural ops use ResetEvent**: Targeted single-path invalidation cannot reliably cover all affected caches. For example, `rename(A, B)` affects: read cache for A, stat cache for A, stat cache for B, dir cache for `parent(A)`, dir cache for `parent(B)`, negative cache for `(parent(B), basename(B))`, and any subtree under A if A is a directory. Full reset is the safe default; future optimization MAY use the `path`/`op` payload fields for targeted invalidation.
+
 ### 4.1 SSE ChangeEvent
 
-The server sends `ChangeEvent` for non-structural operations: `write`, `upload_complete`, `create`, `symlink`. Structural operations (rename, delete, mkdir, copy) are sent as `ResetEvent` instead (see §4.2).
+The server sends `ChangeEvent` for non-structural operations: `write`, `upload_complete`, `create`, `symlink` (see §4.0 routing table). All ChangeEvent ops use the same invalidation logic because they affect a single path.
 
 When SSE delivers a `ChangeEvent` for path P:
 
 1. **File read cache**: Invalidate ALL entries where path matches P (both in-memory and disk layers).
-2. **Directory cache**: Invalidate the entry for `parent(P)`.
-3. **Stat cache**: Invalidate the entry for P.
-4. **Negative cache**: Remove negative entry for `(parent(P), basename(P))`.
+2. **Directory cache**: Invalidate the entry for `parent(P)` (the child list changed).
+3. **Stat cache**: Invalidate the entry for P (size/mtime/revision changed).
+4. **Negative cache**: Remove negative entry for `(parent(P), basename(P))` (path may now exist).
 5. **Kernel cache**: Notify kernel via `NotifyInvalInode` and `NotifyInvalEntry`.
 
 This is already implemented in `pkg/fuse/sse.go:handleChange()` for the in-memory read cache and kernel notifications. Disk cache invalidation (#486) will extend this.
@@ -125,7 +143,7 @@ This is already implemented in `pkg/fuse/sse.go:handleChange()` for the in-memor
 
 The server sends `ResetEvent` in these cases:
 
-1. **Structural operations**: rename, delete, mkdir, copy — converted by `isStructuralOp()` in `pkg/server/sse.go:313-319`. These are sent as reset because targeted single-path invalidation cannot reliably cover old paths, subtrees, and parent directory caches.
+1. **Structural operations**: rename, delete, mkdir, copy — converted by `isStructuralOp()` in `pkg/server/sse.go:313-319`. These use full invalidation because targeted invalidation cannot reliably cover source paths, destination paths, parent directories, subtrees, and negative cache entries across all affected locations (see §4.0 for per-op rationale).
 2. **Sequence gap**: Client reconnects with a `since` value that the server's ring buffer can no longer replay (`seq_too_old`).
 3. **Server restart**: Client's `since` is ahead of the server's current head (`server_restart`).
 4. **Initial sync**: Client connects with `since=0` (`initial_sync`).
@@ -277,6 +295,12 @@ Each scenario MUST have a corresponding test before the cache implementation is 
 ### 9.9 Local mutation
 - T26: Local write -> cache entry invalidated immediately (before server response)
 - T27: Local mkdir -> directory cache for parent invalidated
+- T28: Local write fails (server 500) -> cache entry stays invalidated (not restored to pre-write state)
+
+### 9.10 Structural operation boundaries
+- T29: Remote rename(A, B) -> ResetEvent -> read cache for A invalidated, dir cache for parent(A) and parent(B) invalidated, negative cache for B cleared
+- T30: Own rename(A, B) -> local invalidation covers A + B + parents -> SSE self-filters the echo ResetEvent -> no double-invalidation
+- T31: Remote delete of directory with children -> ResetEvent -> all caches invalidated including subtree entries
 
 ## 10. Configuration
 
