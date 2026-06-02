@@ -46,6 +46,7 @@ type mountFuseOptions struct {
 	PrefetchMaxFileBytes  int64
 	PrefetchMaxBytes      int64
 	PrefetchTimeout       time.Duration
+	TrustLocalEvents      bool
 	SyncMode              fuseSyncMode
 	WritePolicy           fuseWritePolicy
 	Profile               string

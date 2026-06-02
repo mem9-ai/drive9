@@ -502,6 +502,17 @@ func TestSSEBurstFlush(t *testing.T) {
 
 	scanner := bufio.NewScanner(resp.Body)
 
+	// Initial replay is empty for since=1, but the server must still emit a
+	// current heartbeat immediately so clients can clear reconnect-unverified
+	// cache state without waiting for the periodic heartbeat.
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial current heartbeat")
+	}
+	if ev.Event != "heartbeat" {
+		t.Fatalf("expected initial heartbeat, got %q", ev.Event)
+	}
+
 	// Publish a burst of 3 events concurrently.
 	go func() {
 		time.Sleep(50 * time.Millisecond)
@@ -512,8 +523,6 @@ func TestSSEBurstFlush(t *testing.T) {
 
 	// Read first event with a timeout well under heartbeat (30s).
 	done := make(chan struct{})
-	var ev sseEvent
-	var ok bool
 	go func() {
 		ev, ok = readSSEEvent(scanner)
 		close(done)

@@ -38,7 +38,10 @@ type Dat9FS struct {
 	dirCache    *DirCache
 	// statCacheUnverified is true while the SSE stream is not known-current.
 	// In that state, file stat cache hits embedded in DirCache must fall back
-	// to HEAD revalidation instead of serving TTL-only attrs.
+	// to HEAD revalidation instead of serving TTL-only attrs. Even when the
+	// stream is current, revision-bound file stat hits are enabled only when
+	// MountOptions.TrustLocalEvents explicitly allows process-local SSE
+	// freshness for this deployment.
 	statCacheUnverified atomic.Bool
 	readSlots           chan struct{}
 	dirtyMu             sync.Mutex
@@ -1942,6 +1945,13 @@ func (fs *Dat9FS) statCacheVerified() bool {
 	return fs == nil || !fs.statCacheUnverified.Load()
 }
 
+func (fs *Dat9FS) statCacheTrustedAndVerified() bool {
+	if fs == nil || fs.opts == nil || !fs.opts.TrustLocalEvents {
+		return false
+	}
+	return fs.statCacheVerified()
+}
+
 func (fs *Dat9FS) cacheNegativePath(p string) {
 	if fs == nil || fs.dirCache == nil || p == "/" || isLockFilePath(p) {
 		return
@@ -2221,7 +2231,7 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 }
 
 func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
-	if fs == nil || fs.dirCache == nil || entry == nil || entry.Path == "/" || entry.IsDir || isLockFilePath(entry.Path) || !fs.statCacheVerified() {
+	if fs == nil || fs.dirCache == nil || entry == nil || entry.Path == "/" || entry.IsDir || isLockFilePath(entry.Path) || !fs.statCacheTrustedAndVerified() {
 		return nil, false
 	}
 	parentPath, name := cacheParentName(entry.Path)

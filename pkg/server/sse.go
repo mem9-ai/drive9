@@ -213,8 +213,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			lastSeen = ev.Seq
 		}
 	}
+	// End the initial replay/reset phase with an immediate heartbeat so
+	// clients have an explicit stream-current marker. This lets caches that
+	// were marked unverified on disconnect become verified without waiting
+	// for the periodic heartbeat.
+	sendSSEHeartbeat(bw, lastSeen)
 	// Flush initial replay/reset immediately so the client receives the
-	// cursor position without waiting for the first heartbeat.
+	// cursor position without waiting for the periodic heartbeat.
 	if err := bw.Flush(); err != nil {
 		return
 	}

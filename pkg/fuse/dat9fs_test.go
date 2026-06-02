@@ -44,6 +44,12 @@ func (r *testErrorRecorder) Check(t *testing.T) {
 	}
 }
 
+func trustedProcessLocalEventsOptions() *MountOptions {
+	opts := &MountOptions{TrustLocalEvents: true}
+	opts.setDefaults()
+	return opts
+}
+
 func newTestDat9FS(tb testing.TB, size int64, get func(http.ResponseWriter, *http.Request)) (*Dat9FS, uint64, func()) {
 	tb.Helper()
 
@@ -301,9 +307,7 @@ func BenchmarkDat9FS_GetAttr(b *testing.B) {
 		}))
 		defer ts.Close()
 
-		opts := &MountOptions{}
-		opts.setDefaults()
-		fs := NewDat9FS(newTestClient(ts.URL), opts)
+		fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
 		ino := fs.inodes.Lookup(filePath, false, 1, time.Unix(1, 0))
 		fs.dirCache.Upsert("/", CachedFileInfo{
 			Name:     "cached.txt",
@@ -1357,9 +1361,7 @@ func TestGetAttrUsesRevisionBoundDirCacheStatWithoutRemoteHead(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
 	ino := fs.inodes.Lookup("/cached.txt", false, 1, time.Unix(1, 0))
 	mtime := time.Unix(123, 0)
 	fs.dirCache.Upsert("/", CachedFileInfo{
@@ -1398,6 +1400,48 @@ func TestGetAttrUsesRevisionBoundDirCacheStatWithoutRemoteHead(t *testing.T) {
 	}
 }
 
+func TestGetAttrDoesNotTrustLocalEventsByDefault(t *testing.T) {
+	var headCalls atomic.Int32
+	var handlerErrors testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			handlerErrors.Recordf("method = %s, want HEAD", r.Method)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", "33")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "8")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/cached.txt", false, 1, time.Unix(1, 0))
+	fs.dirCache.Upsert("/", CachedFileInfo{
+		Name:     "cached.txt",
+		Size:     12,
+		IsDir:    false,
+		Revision: 7,
+	})
+
+	var out gofuse.AttrOut
+	st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	handlerErrors.Check(t)
+	if got := headCalls.Load(); got != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", got)
+	}
+	if got, want := out.Size, uint64(33); got != want {
+		t.Fatalf("GetAttr size = %d, want %d", got, want)
+	}
+}
+
 func TestGetAttrIgnoresOlderDirCacheRevision(t *testing.T) {
 	var headCalls atomic.Int32
 	var handlerErrors testErrorRecorder
@@ -1415,9 +1459,7 @@ func TestGetAttrIgnoresOlderDirCacheRevision(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
 	ino := fs.inodes.Lookup("/cached.txt", false, 1, time.Unix(1, 0))
 	fs.inodes.UpdateRevision(ino, 9)
 	fs.dirCache.Upsert("/", CachedFileInfo{
@@ -1465,9 +1507,7 @@ func TestGetAttrSSEChangeInvalidatesCachedStat(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
 	ino := fs.inodes.Lookup("/docs/readme.md", false, 12, time.Unix(1, 0))
 	fs.inodes.UpdateRevision(ino, 7)
 	fs.dirCache.Upsert("/docs", CachedFileInfo{
@@ -1523,9 +1563,7 @@ func TestSetAttrRefreshesDirCacheStatMetadata(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
 	oldMtime := time.Unix(10, 0)
 	newMtime := time.Unix(123, 0)
 	ino := fs.inodes.Lookup("/cached.txt", false, 12, oldMtime)
@@ -1589,9 +1627,7 @@ func TestGetAttrRevalidatesDirCacheStatWhenSSEUnverified(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
 	ino := fs.inodes.Lookup("/cached.txt", false, 12, time.Unix(1, 0))
 	fs.inodes.UpdateRevision(ino, 7)
 	fs.dirCache.Upsert("/", CachedFileInfo{
@@ -2246,9 +2282,7 @@ func TestGetAttrLockFileIgnoresPositiveDirCache(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
 	fs.dirCache.Put("/repo/.git", []CachedFileInfo{{
 		Name:     "config.lock",
 		Size:     251,

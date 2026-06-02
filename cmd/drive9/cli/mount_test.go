@@ -721,6 +721,76 @@ func TestMountCmdLeavesLegacyDirStatFallbackDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestMountCmdPassesTrustLocalEventsOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--trust-process-local-events",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if !got.TrustLocalEvents {
+		t.Fatal("TrustLocalEvents = false, want true")
+	}
+}
+
+func TestMountCmdLeavesTrustLocalEventsDisabledByDefault(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.TrustLocalEvents {
+		t.Fatal("TrustLocalEvents = true, want false")
+	}
+}
+
+func TestMountCmdRejectsTrustLocalEventsWithWebDAV(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "webdav",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--trust-process-local-events",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--trust-process-local-events") {
+		t.Fatalf("MountCmd error = %v, want trust-process-local-events validation error", err)
+	}
+}
+
 func TestMountCmdPassesReadCacheMaxFileOption(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })

@@ -60,6 +60,7 @@ type MountOptions struct {
 	PrefetchMaxFileBytes  int64         // maximum individual file size prefetched (default 50KB)
 	PrefetchMaxBytes      int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
 	PrefetchTimeout       time.Duration // timeout for one readdir prefetch batch (default 1s)
+	TrustLocalEvents      bool          // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
 	AllowOther            bool          // allow other users to access mount
 	ReadOnly              bool          // mount as read-only
 	Debug                 bool          // enable FUSE debug logging

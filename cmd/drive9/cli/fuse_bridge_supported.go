@@ -39,6 +39,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		PrefetchMaxFileBytes:  opts.PrefetchMaxFileBytes,
 		PrefetchMaxBytes:      opts.PrefetchMaxBytes,
 		PrefetchTimeout:       opts.PrefetchTimeout,
+		TrustLocalEvents:      opts.TrustLocalEvents,
 		SyncMode:              mode,
 		WritePolicy:           writePolicy,
 		Profile:               opts.Profile,
