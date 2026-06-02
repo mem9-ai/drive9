@@ -4819,8 +4819,13 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// Use a detached context for the shared HTTP fetch so that
 		// cancellation of the owner's FUSE request does not fail
 		// piggybacking readers. The shared work must be independent
-		// of any single caller's lifecycle.
-		fetchCtx := context.WithoutCancel(ctx)
+		// of any single caller's lifecycle. We apply a fresh
+		// fuseTimeout so the fetch is still bounded even though the
+		// caller cancel is detached.
+		fetchCtx, fetchCancel := context.WithTimeout(
+			context.WithoutCancel(ctx), fuseTimeout,
+		)
+		defer fetchCancel()
 		data, err, _ := fs.readFlight.Do(ctx, sfKey, func() ([]byte, error) {
 			releaseReadSlot, slotErr := fs.acquireRemoteReadSlot(fetchCtx)
 			if slotErr != nil {
