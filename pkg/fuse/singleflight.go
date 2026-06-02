@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 )
@@ -63,8 +64,17 @@ func (sf *SingleFlight) Do(ctx context.Context, key string, fn func() ([]byte, e
 	sf.calls[key] = c
 	sf.mu.Unlock()
 
-	// Execute the function.
-	c.val, c.err = fn()
+	// Execute the function. Recover from panics so that the in-flight
+	// entry is always cleaned up — otherwise a panic would leave
+	// sf.calls[key] stuck and all future waiters would hang.
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				c.err = fmt.Errorf("singleflight: fn panicked: %v", r)
+			}
+		}()
+		c.val, c.err = fn()
+	}()
 
 	// Remove from map and wake waiters.
 	sf.mu.Lock()

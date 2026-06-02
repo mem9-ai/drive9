@@ -935,6 +935,175 @@ func TestDat9FSReadSingleFlightDifferentRevisionNotShared(t *testing.T) {
 	}
 }
 
+// TestDat9FSReadSingleFlightOwnerCancelDoesNotFailPiggybacker verifies that
+// cancelling the owner's FUSE request context does not fail piggybacking
+// readers. The shared HTTP fetch uses a detached context so it runs to
+// completion regardless of the owner's cancellation.
+func TestDat9FSReadSingleFlightOwnerCancelDoesNotFailPiggybacker(t *testing.T) {
+	const (
+		path = "/file.bin"
+		rev  = int64(3)
+	)
+	data := []byte("owner-cancel-data")
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseReads := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	t.Cleanup(releaseReads)
+	var getCalls atomic.Int32
+	var (
+		handlerMu  sync.Mutex
+		handlerErr error
+	)
+	recordHandlerErr := func(err error) {
+		handlerMu.Lock()
+		defer handlerMu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			if r.URL.Path != "/v1/fs/file.bin" {
+				recordHandlerErr(fmt.Errorf("GET path = %q, want /v1/fs/file.bin", r.URL.Path))
+				http.NotFound(w, r)
+				return
+			}
+			getCalls.Add(1)
+			started <- struct{}{}
+			<-release
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			_, _ = w.Write(data)
+		default:
+			recordHandlerErr(fmt.Errorf("unexpected method %s", r.Method))
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(path, false, int64(len(data)), time.Now())
+	fs.inodes.UpdateRevision(ino, rev)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+
+	sfKey := fmt.Sprintf("%s@%d", path, rev)
+
+	// Owner read with a cancel channel we control.
+	ownerCancel := make(chan struct{})
+	ownerDone := make(chan struct{})
+	var ownerResult []byte
+	var ownerSt gofuse.Status
+	go func() {
+		defer close(ownerDone)
+		buf := make([]byte, len(data))
+		var result gofuse.ReadResult
+		result, ownerSt = fs.Read(ownerCancel, &gofuse.ReadIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       out.Fh,
+			Offset:   0,
+			Size:     uint32(len(data)),
+		}, buf)
+		if result != nil {
+			ownerResult, _ = result.Bytes(buf)
+			ownerResult = append([]byte(nil), ownerResult...)
+		}
+	}()
+
+	// Wait for the backend GET to start (owner is in the flight callback).
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		releaseReads()
+		t.Fatal("backend GET did not start")
+	}
+
+	// Start a piggybacker reader (no cancel).
+	piggyDone := make(chan []byte, 1)
+	piggyErr := make(chan error, 1)
+	go func() {
+		got, st, err := readDat9FSTestBytes(fs, ino, out.Fh, len(data))
+		if err != nil {
+			piggyErr <- err
+			return
+		}
+		if st != gofuse.OK {
+			piggyErr <- fmt.Errorf("piggy Read status = %v, want OK", st)
+			return
+		}
+		piggyDone <- got
+	}()
+
+	// Wait for the piggybacker to attach to the in-flight entry.
+	waitForWaiters(t, fs.readFlight, sfKey, 1)
+
+	// Cancel the owner's FUSE context while the HTTP fetch is in-flight.
+	// Because the singleflight callback uses a detached context
+	// (context.WithoutCancel), this cancel does NOT fail the shared HTTP
+	// fetch. The owner is executing fn() directly so it blocks until the
+	// fetch completes — the cancel only affects piggybackers' select.
+	close(ownerCancel)
+
+	// Release the HTTP fetch — the detached context is still valid despite
+	// the owner cancel.
+	releaseReads()
+
+	// Owner should complete with OK (detached fetch succeeded).
+	select {
+	case <-ownerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("owner Read did not return")
+	}
+	if ownerSt != gofuse.OK {
+		t.Fatalf("owner status = %v, want OK (detached fetch should succeed)", ownerSt)
+	}
+	if !bytes.Equal(ownerResult, data) {
+		t.Fatalf("owner data = %q, want %q", ownerResult, data)
+	}
+
+	// Piggybacker must also succeed with correct data.
+	select {
+	case err := <-piggyErr:
+		t.Fatalf("piggybacker failed: %v", err)
+	case got := <-piggyDone:
+		if !bytes.Equal(got, data) {
+			t.Fatalf("piggybacker data = %q, want %q", got, data)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("piggybacker Read did not finish")
+	}
+
+	// Only one GET should have been made.
+	if got := getCalls.Load(); got != 1 {
+		t.Fatalf("GET calls = %d, want 1", got)
+	}
+
+	handlerMu.Lock()
+	err := handlerErr
+	handlerMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCreateWriteThroughShadow(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusMethodNotAllowed)

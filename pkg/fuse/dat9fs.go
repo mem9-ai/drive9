@@ -4816,13 +4816,18 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// the observed revision so that concurrent reads after a revision
 		// change do not share stale in-flight results.
 		sfKey := fmt.Sprintf("%s@%d", p, cacheRev)
+		// Use a detached context for the shared HTTP fetch so that
+		// cancellation of the owner's FUSE request does not fail
+		// piggybacking readers. The shared work must be independent
+		// of any single caller's lifecycle.
+		fetchCtx := context.WithoutCancel(ctx)
 		data, err, _ := fs.readFlight.Do(ctx, sfKey, func() ([]byte, error) {
-			releaseReadSlot, slotErr := fs.acquireRemoteReadSlot(ctx)
+			releaseReadSlot, slotErr := fs.acquireRemoteReadSlot(fetchCtx)
 			if slotErr != nil {
 				return nil, slotErr
 			}
 			defer releaseReadSlot()
-			fetchData, fetchErr := fs.readSmallFileWithRetry(ctx, p)
+			fetchData, fetchErr := fs.readSmallFileWithRetry(fetchCtx, p)
 			if fetchErr != nil {
 				return nil, fetchErr
 			}

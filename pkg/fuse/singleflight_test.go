@@ -3,6 +3,7 @@ package fuse
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -341,6 +342,101 @@ func TestSingleFlightSamePathDifferentRevisionNotShared(t *testing.T) {
 	}
 	if got := callsR2.Load(); got != 1 {
 		t.Fatalf("rev2 fn called %d times, want 1", got)
+	}
+}
+
+func TestSingleFlightPanicRecovery(t *testing.T) {
+	// When fn panics, the in-flight entry must still be cleaned up so that
+	// subsequent calls for the same key do not hang forever.
+	sf := NewSingleFlight()
+
+	// First call panics — should be recovered and returned as an error.
+	data, err, owner := sf.Do(context.Background(), "panic-key", func() ([]byte, error) {
+		panic("boom")
+	})
+	if data != nil {
+		t.Fatalf("data = %v, want nil after panic", data)
+	}
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("err = %v, want error containing 'boom'", err)
+	}
+	if !owner {
+		t.Fatalf("owner = false, want true")
+	}
+	if got := sf.Inflight(); got != 0 {
+		t.Fatalf("inflight = %d, want 0 after panic recovery", got)
+	}
+
+	// Verify a subsequent call for the same key works normally.
+	data2, err2, owner2 := sf.Do(context.Background(), "panic-key", func() ([]byte, error) {
+		return []byte("ok"), nil
+	})
+	if err2 != nil {
+		t.Fatalf("post-panic err = %v, want nil", err2)
+	}
+	if string(data2) != "ok" {
+		t.Fatalf("post-panic data = %q, want %q", data2, "ok")
+	}
+	if !owner2 {
+		t.Fatalf("post-panic owner = false, want true")
+	}
+}
+
+func TestSingleFlightPanicRecoveryWithWaiters(t *testing.T) {
+	// When the owner panics while piggybackers are waiting, all waiters
+	// should receive the panic-converted error.
+	sf := NewSingleFlight()
+
+	ownerStarted := make(chan struct{})
+	const nPiggy = 3
+
+	var wg sync.WaitGroup
+	errs := make([]error, nPiggy)
+
+	// Start owner.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _, _ = sf.Do(context.Background(), "panic-wait-key", func() ([]byte, error) {
+			close(ownerStarted)
+			// Wait for waiters to attach before panicking.
+			deadline := time.After(2 * time.Second)
+			for sf.Waiters("panic-wait-key") < nPiggy {
+				select {
+				case <-deadline:
+					t.Error("timed out waiting for piggybackers")
+					return nil, nil
+				default:
+					time.Sleep(1 * time.Millisecond)
+				}
+			}
+			panic("owner-panic")
+		})
+	}()
+
+	<-ownerStarted
+
+	// Start piggybackers.
+	for i := 0; i < nPiggy; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			_, errs[idx], _ = sf.Do(context.Background(), "panic-wait-key", func() ([]byte, error) {
+				t.Error("piggybacker fn should not be called")
+				return nil, nil
+			})
+		}(i)
+	}
+
+	wg.Wait()
+
+	for i, err := range errs {
+		if err == nil || !strings.Contains(err.Error(), "owner-panic") {
+			t.Errorf("piggy[%d] err = %v, want error containing 'owner-panic'", i, err)
+		}
+	}
+	if got := sf.Inflight(); got != 0 {
+		t.Fatalf("inflight = %d, want 0 after panic", got)
 	}
 }
 
