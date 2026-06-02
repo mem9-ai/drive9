@@ -199,7 +199,7 @@ func TestSingleFlightInflight(t *testing.T) {
 	release := make(chan struct{})
 
 	go func() {
-		sf.Do(context.Background(), "inflight-key", func() ([]byte, error) {
+		_, _, _ = sf.Do(context.Background(), "inflight-key", func() ([]byte, error) {
 			close(started)
 			<-release
 			return []byte("done"), nil
@@ -212,12 +212,9 @@ func TestSingleFlightInflight(t *testing.T) {
 	}
 	close(release)
 
-	// Wait for completion using a channel-based poll instead of time.Sleep.
+	// Wait for completion using a bounded poll instead of time.Sleep.
 	deadline := time.After(2 * time.Second)
-	for {
-		if sf.Inflight() == 0 {
-			break
-		}
+	for sf.Inflight() != 0 {
 		select {
 		case <-deadline:
 			t.Fatal("timed out waiting for inflight to reach 0")
@@ -255,7 +252,7 @@ func TestSingleFlightConcurrentDifferentKeysDoNotBlock(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sf.Do(context.Background(), "block-A", func() ([]byte, error) {
+		_, _, _ = sf.Do(context.Background(), "block-A", func() ([]byte, error) {
 			close(startedA)
 			<-blockA
 			return []byte("a"), nil
@@ -268,7 +265,7 @@ func TestSingleFlightConcurrentDifferentKeysDoNotBlock(t *testing.T) {
 	// Key B should not be blocked by key A.
 	done := make(chan struct{})
 	go func() {
-		sf.Do(context.Background(), "free-B", func() ([]byte, error) {
+		_, _, _ = sf.Do(context.Background(), "free-B", func() ([]byte, error) {
 			return []byte("b"), nil
 		})
 		close(done)
@@ -422,7 +419,7 @@ func TestSingleFlightContextCancelOwnerNotAffected(t *testing.T) {
 	// Owner goroutine.
 	go func() {
 		defer wg.Done()
-		sf.Do(context.Background(), "owner-key", func() ([]byte, error) {
+		_, _, _ = sf.Do(context.Background(), "owner-key", func() ([]byte, error) {
 			calls.Add(1)
 			close(ownerStarted)
 			<-ownerRelease
@@ -440,7 +437,7 @@ func TestSingleFlightContextCancelOwnerNotAffected(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		piggyCtxs[i] = cancel
 		go func() {
-			sf.Do(ctx, "owner-key", func() ([]byte, error) {
+			_, _, _ = sf.Do(ctx, "owner-key", func() ([]byte, error) {
 				t.Error("piggybacker fn should not be called")
 				return nil, nil
 			})
