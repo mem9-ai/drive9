@@ -3,13 +3,15 @@ package fuse
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
 
 // singleflightCall represents an in-progress or completed call.
 type singleflightCall struct {
-	done chan struct{} // closed when the call completes
-	val  []byte
-	err  error
+	done    chan struct{} // closed when the call completes
+	waiters atomic.Int32 // number of piggybackers currently in select
+	val     []byte
+	err     error
 }
 
 // SingleFlight deduplicates concurrent calls for the same key.
@@ -45,6 +47,8 @@ func (sf *SingleFlight) Do(ctx context.Context, key string, fn func() ([]byte, e
 	if c, ok := sf.calls[key]; ok {
 		// Another goroutine is already fetching this key.
 		sf.mu.Unlock()
+		c.waiters.Add(1)
+		defer c.waiters.Add(-1)
 		select {
 		case <-c.done:
 			return c.val, c.err, false
@@ -78,4 +82,18 @@ func (sf *SingleFlight) Inflight() int {
 	sf.mu.Lock()
 	defer sf.mu.Unlock()
 	return len(sf.calls)
+}
+
+// Waiters returns the number of piggybackers currently waiting for the
+// given key. Returns 0 if the key is not in-flight. This is intended
+// for testing only — it allows deterministic synchronization without
+// time.Sleep.
+func (sf *SingleFlight) Waiters(key string) int {
+	sf.mu.Lock()
+	c, ok := sf.calls[key]
+	sf.mu.Unlock()
+	if !ok {
+		return 0
+	}
+	return int(c.waiters.Load())
 }

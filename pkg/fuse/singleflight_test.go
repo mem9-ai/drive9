@@ -9,6 +9,23 @@ import (
 	"time"
 )
 
+// waitForWaiters polls sf.Waiters(key) until it reaches wantN or the
+// timeout fires. This replaces non-deterministic time.Sleep in tests
+// that need to prove piggybackers have entered the select inside Do.
+func waitForWaiters(t *testing.T, sf *SingleFlight, key string, wantN int) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for sf.Waiters(key) < wantN {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d waiters on key %q (got %d)",
+				wantN, key, sf.Waiters(key))
+		default:
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+}
+
 func TestSingleFlightBasicDedup(t *testing.T) {
 	sf := NewSingleFlight()
 
@@ -367,8 +384,9 @@ func TestSingleFlightContextCancelPiggybacker(t *testing.T) {
 		close(piggyDone)
 	}()
 
-	// Give the piggybacker time to enter Do and block on the owner.
-	time.Sleep(10 * time.Millisecond)
+	// Deterministically wait until the piggybacker has entered the select
+	// inside Do (proven by Waiters count reaching 1).
+	waitForWaiters(t, sf, "cancel-key", 1)
 
 	// Cancel the piggybacker's context.
 	cancel()
@@ -445,8 +463,9 @@ func TestSingleFlightContextCancelOwnerNotAffected(t *testing.T) {
 		}()
 	}
 
-	// Give piggybackers time to block.
-	time.Sleep(10 * time.Millisecond)
+	// Deterministically wait until all piggybackers have entered the select
+	// inside Do (proven by Waiters count reaching nPiggy).
+	waitForWaiters(t, sf, "owner-key", nPiggy)
 
 	// Cancel all piggybackers.
 	for _, cancel := range piggyCtxs {
