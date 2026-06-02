@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -67,7 +68,10 @@ func JournalNew(args []string) error {
 	asJSON := fs.Bool("json", false, "print JSON")
 	fs.Var(&meta, "meta", "metadata key=value")
 	fs.Var(&meta, "m", "metadata key=value")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return printJournalHelp(fs, "usage: drive9 journal new [flags]")
+		}
 		return err
 	}
 	if fs.NArg() != 0 {
@@ -114,7 +118,22 @@ func JournalAppend(args []string) error {
 	jsonArray := fs.Bool("json-array", false, "read JSON array")
 	fs.Var(&subjects, "subject", "subject")
 	fs.Var(&subjects, "s", "subject")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return printJournalHelp(fs,
+				"usage: drive9 journal append <journal> [flags]",
+				"",
+				"Read journal entries from stdin.",
+				"Default format is JSONL (one JSON object per line).",
+				"Use --json-array to read a JSON array instead.",
+				"",
+				"Each entry needs a 'type' field either in the input or via --type/-t.",
+				"",
+				"Example:",
+				`  echo '{"type":"task.started","summary":{"msg":"hello"}}' | drive9 journal append my-journal`,
+				"",
+			)
+		}
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -128,10 +147,11 @@ func JournalAppend(args []string) error {
 	if err != nil {
 		return err
 	}
+	applyDefaultJournalEntryTypes(entries, resolvedType)
+	if err := validateJournalEntryTypes(entries, *jsonArray); err != nil {
+		return err
+	}
 	for i := range entries {
-		if entries[i].Type == "" {
-			entries[i].Type = resolvedType
-		}
 		if *source != "" {
 			entries[i].Source = *source
 		}
@@ -160,14 +180,16 @@ func readJournalEntriesFromStdin(r io.Reader, jsonArray bool) ([]journal.EntryIn
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4<<20)
 	var entries []journal.EntryInput
+	lineNum := 0
 	for scanner.Scan() {
+		lineNum++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
 		var entry journal.EntryInput
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
-			return nil, fmt.Errorf("decode JSONL: %w", err)
+			return nil, fmt.Errorf("decode JSONL at line %d: %w", lineNum, err)
 		}
 		entries = append(entries, entry)
 	}
@@ -187,7 +209,10 @@ func JournalCat(args []string) error {
 	limit := fs.Int("limit", journal.DefaultLimit, "limit")
 	follow := fs.Bool("f", false, "follow")
 	fs.BoolVar(follow, "follow", false, "follow")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return printJournalHelp(fs, "usage: drive9 journal cat <journal> [flags]")
+		}
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -234,7 +259,10 @@ func JournalFind(args []string) error {
 	fs.Var(&subjects, "s", "subject")
 	fs.Var(&meta, "meta", "metadata key=value")
 	fs.Var(&meta, "m", "metadata key=value")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return printJournalHelp(fs, "usage: drive9 journal find [flags]")
+		}
 		return err
 	}
 	if fs.NArg() != 0 {
@@ -317,7 +345,10 @@ func JournalVerify(args []string) error {
 	fs := flag.NewFlagSet("journal verify", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	asJSON := fs.Bool("json", false, "print JSON")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return printJournalHelp(fs, "usage: drive9 journal verify <journal> [flags]")
+		}
 		return err
 	}
 	if fs.NArg() != 1 {
@@ -363,6 +394,74 @@ func parseJournalAssignments(values []string) ([]journal.Label, error) {
 		return nil, nil
 	}
 	return journal.NormalizeLabels(out), nil
+}
+
+func printJournalHelp(fs *flag.FlagSet, lines ...string) error {
+	for _, line := range lines {
+		_, _ = fmt.Fprintln(os.Stderr, line)
+	}
+	_, _ = fmt.Fprintln(os.Stderr, "flags:")
+	fs.SetOutput(os.Stderr)
+	fs.PrintDefaults()
+	return nil
+}
+
+func applyDefaultJournalEntryTypes(entries []journal.EntryInput, defaultType string) {
+	for i := range entries {
+		if entries[i].Type == "" {
+			entries[i].Type = defaultType
+		}
+	}
+}
+
+func validateJournalEntryTypes(entries []journal.EntryInput, jsonArray bool) error {
+	for i := range entries {
+		if entries[i].Type == "" {
+			if jsonArray {
+				return fmt.Errorf("journal entry %d missing required 'type' field; provide --type/-t <type> or include \"type\":\"...\" in each JSON array item", i+1)
+			}
+			return fmt.Errorf("journal entry %d missing required 'type' field; provide --type/-t <type> or include \"type\":\"...\" in each JSONL line", i+1)
+		}
+	}
+	return nil
+}
+
+// isBoolFlag reports whether the named flag in fs is a boolean flag.
+func isBoolFlag(fs *flag.FlagSet, name string) bool {
+	f := fs.Lookup(name)
+	if f == nil {
+		return false
+	}
+	_, ok := f.Value.(interface{ IsBoolFlag() bool })
+	return ok
+}
+
+// normalizeHelpFlags converts standalone "-h" tokens to "-help" so that
+// Go's flag package prints usage instead of erroring.  It skips conversion
+// when "-h" is a value for a non-bool flag (determined dynamically from fs)
+// or when it appears after "--".
+func normalizeHelpFlags(args []string, fs *flag.FlagSet) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		if a == "--" {
+			copy(out[i:], args[i:])
+			return out
+		}
+		if i > 0 && a == "-h" {
+			prev := strings.TrimLeft(args[i-1], "-")
+			if f := fs.Lookup(prev); f != nil && !isBoolFlag(fs, prev) {
+				// -h is a value for a non-bool flag, don't rewrite.
+				out[i] = a
+				continue
+			}
+		}
+		if a == "-h" {
+			out[i] = "-help"
+		} else {
+			out[i] = a
+		}
+	}
+	return out
 }
 
 func parseJournalCLITimeOrDuration(raw string) (time.Time, error) {
