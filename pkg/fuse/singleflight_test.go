@@ -230,3 +230,44 @@ func TestSingleFlightConcurrentDifferentKeysDoNotBlock(t *testing.T) {
 	close(blockA)
 	wg.Wait()
 }
+
+func TestSingleFlightSamePathDifferentRevisionNotShared(t *testing.T) {
+	// Regression: when a file's revision changes, concurrent reads for the
+	// same path but different revisions must NOT share results. The
+	// singleflight key in Dat9FS.Read includes the revision, so
+	// "file.txt@1" and "file.txt@2" are independent keys.
+	sf := NewSingleFlight()
+
+	var callsR1, callsR2 atomic.Int32
+	var wg sync.WaitGroup
+	ready := make(chan struct{})
+
+	// 3 goroutines for path@rev1, 3 for path@rev2.
+	for i := 0; i < 3; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			<-ready
+			sf.Do("file.txt@1", func() ([]byte, error) {
+				callsR1.Add(1)
+				time.Sleep(30 * time.Millisecond)
+				return []byte("data-rev1"), nil
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			<-ready
+			sf.Do("file.txt@2", func() ([]byte, error) {
+				callsR2.Add(1)
+				time.Sleep(30 * time.Millisecond)
+				return []byte("data-rev2"), nil
+			})
+		}()
+	}
+	close(ready)
+	wg.Wait()
+
+	// Each revision should trigger exactly one fetch.
+	require.Equal(t, int32(1), callsR1.Load(), "rev1 fn called once")
+	require.Equal(t, int32(1), callsR2.Load(), "rev2 fn called once")
+}

@@ -4811,9 +4811,12 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		}
 
 		// Cache miss: read the file and store it. Singleflight ensures
-		// only one HTTP request per path when multiple goroutines miss
-		// the cache simultaneously (spec §9.8 T24).
-		data, err, isOwner := fs.readFlight.Do(p, func() ([]byte, error) {
+		// only one HTTP request per path+revision when multiple goroutines
+		// miss the cache simultaneously (spec §9.8 T24). The key includes
+		// the observed revision so that concurrent reads after a revision
+		// change do not share stale in-flight results.
+		sfKey := fmt.Sprintf("%s@%d", p, cacheRev)
+		data, err, isOwner := fs.readFlight.Do(sfKey, func() ([]byte, error) {
 			releaseReadSlot, err := fs.acquireRemoteReadSlot(ctx)
 			if err != nil {
 				return nil, err
