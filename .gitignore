@@ -36,6 +36,7 @@ Thumbs.db
 dist/
 build/
 tmp/
+.codex-gocache/
 /dat9
 /drive9
 /drive9-server
@@ -44,3 +45,7 @@ __pycache__/
 
 # Local review artifacts
 second_opinion*
+
+# E2E generated reports
+e2e/reports/
+third_party/pjdfstest/

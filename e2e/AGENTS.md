@@ -239,6 +239,29 @@ developer machines or EC2-style validation rather than the default smoke path.
 7. Platform-aware `stat` for macOS (`stat -f %Lp`) and Linux (`stat -c %a`)
 8. Cleanup of remote permission test trees
 
+### On-demand matrix scripts
+
+These are not part of the normal E2E smoke entry points. Run them only when a
+task explicitly asks for a broad compatibility matrix or Git feature matrix.
+They use the same live endpoint conventions as the smoke scripts and mount real
+FUSE. `posix-feature-matrix.sh` uses pjdfstest as the sole POSIX compatibility
+baseline; setup/provisioning is only test harness plumbing and is not counted
+as POSIX feature coverage. `git-feature-matrix.sh` generates a local bare Git
+remote fixture for deterministic Git coverage. Reports are written to
+`e2e/reports/posix-feature-report-<timestamp>.md` and
+`e2e/reports/git-feature-report-<timestamp>.md`.
+
+1. Provision tenant unless `DRIVE9_API_KEY` is already set
+2. Prepare `drive9` CLI binary (`CLI_SOURCE=build` or `official`)
+3. Validate FUSE prerequisites only enough to mount a writable test target for pjdfstest
+4. Run pjdfstest for POSIX syscall compatibility; skip this row when pjdfstest/prove/root prerequisites are missing
+5. For POSIX reports, summarize total/pass/failed counts from pjdfstest/prove cases and render pjdfstest `.t` files as the checkbox matrix
+6. Generate a local Git fixture repo with executable files, symlinks, binary files, ignore rules, branches, tags, and merge/rebase/conflict graphs
+7. Validate `drive9 git clone --fast`, blobless hydrate-off, hydrate-sync, and explicit `drive9 git hydrate`
+8. Run Git readiness, working-tree, index, diff/patch, commit, branch, merge, conflict, rebase, stash, fetch, pull, push branch, and push tag probes
+9. Validate Drive9 Git workspace behavior: tree manifest registration, `.git` checkpoint restore, overlay upsert/whiteout/chmod/symlink/dir entries across remount, committed local state, staged-object restore, and ignored-file non-durability
+10. Emit a Markdown checkbox matrix: `- [x]` for passed feature probes; unchecked entries for `UNSUPPORTED`, `SKIP`, and `FAIL` with observed errno or command-output summaries
+
 ### `fuse-release-gate.sh`
 
 1. Runs `fuse-smoke-test.sh` with `FUSE_STRICT_PREREQS=1`
@@ -309,6 +332,15 @@ developer machines or EC2-style validation rather than the default smoke path.
 | `GIT_WORKSPACE_CLONE_TIMEOUT_S` | `600` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_GIT_TIMEOUT_S` | `120` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_HYDRATE` | `sync` | `git-workspace-smoke-test.sh` |
+| `FEATURE_MATRIX_REPORT_DIR` | `e2e/reports` | on-demand matrix scripts |
+| `FEATURE_MATRIX_STRICT_ALL` | `0` | on-demand matrix scripts |
+| `PJDFSTEST_DIR` | - | on-demand `posix-feature-matrix.sh` |
+| `PJDFSTEST_TESTS` | - | on-demand `posix-feature-matrix.sh` |
+| `PJDFSTEST_BIN` | auto-detected from `PJDFSTEST_DIR` or `PATH` | on-demand `posix-feature-matrix.sh` |
+| `PJDFSTEST_TIMEOUT_S` | `900` | on-demand `posix-feature-matrix.sh` |
+| `PJDFSTEST_ALLOW_NONROOT` | `0` | on-demand `posix-feature-matrix.sh` |
+| `GIT_MATRIX_TIMEOUT_S` | `240` | on-demand `git-feature-matrix.sh` |
+| `GIT_MATRIX_RUN_OVERSIZED` | `1` | on-demand `git-feature-matrix.sh` |
 
 ## Conventions
 

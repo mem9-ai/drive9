@@ -70,6 +70,28 @@ bash e2e/posix-permission-smoke-test.sh
 bash e2e/smoke-all.sh
 ```
 
+#### On-demand POSIX compatibility matrix
+
+`posix-feature-matrix.sh` is not part of the normal E2E smoke entry points.
+Run it only when you explicitly need a pjdfstest-based POSIX compatibility
+report:
+
+```bash
+PJDFSTEST_DIR=/path/to/pjdfstest bash e2e/posix-feature-matrix.sh
+```
+
+It writes `e2e/reports/posix-feature-report-<timestamp>.md` and counts results
+using pjdfstest/prove cases.
+
+- Knobs: `FEATURE_MATRIX_REPORT_DIR`, `FEATURE_MATRIX_STRICT_ALL`,
+  `PJDFSTEST_DIR`, `PJDFSTEST_TESTS`, `PJDFSTEST_BIN`,
+  `PJDFSTEST_TIMEOUT_S`, and `PJDFSTEST_ALLOW_NONROOT`.
+- Build pjdfstest before running so either `$PJDFSTEST_DIR/pjdfstest` exists
+  or `pjdfstest` is on `PATH`. The runner adds the pjdfstest binary directory
+  to `PATH` while invoking `prove`.
+- Matrix reports use `- [x]` only for passed pjdfstest `.t` files. Failed or
+  skipped entries remain unchecked with observed output summaries.
+
 ### Local via `drive9-server-local`
 
 The local smoke flow that is currently exercised on this machine uses
