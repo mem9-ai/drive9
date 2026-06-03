@@ -248,8 +248,12 @@ FUSE. `posix-feature-matrix.sh` uses pjdfstest as the sole POSIX compatibility
 baseline; setup/provisioning is only test harness plumbing and is not counted
 as POSIX feature coverage. `git-feature-matrix.sh` generates a local bare Git
 remote fixture for deterministic Git coverage. Reports are written to
-`e2e/reports/posix-feature-report-<timestamp>.md` and
-`e2e/reports/git-feature-report-<timestamp>.md`.
+`$FEATURE_MATRIX_REPORT_DIR/<report-name>-<timestamp>.md`; by default that is a
+flat path such as `e2e/reports/posix-feature-report-<timestamp>.md` or
+`e2e/reports/git-feature-report-<timestamp>.md`. If
+`FEATURE_MATRIX_REPORT_DIR` is set to a run-specific directory, reports are
+nested under that directory instead, and checked-in samples should be read using
+the layout captured by that run.
 
 1. Provision tenant unless `DRIVE9_API_KEY` is already set
 2. Prepare `drive9` CLI binary (`CLI_SOURCE=build` or `official`)

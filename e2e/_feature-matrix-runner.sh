@@ -93,8 +93,18 @@ with open(results_path, encoding="utf-8") as fh:
             continue
         rows.append(row)
 
+def is_pjdfstest_row(row):
+    return row[1] == "pjdfstest" or row[1].startswith("pjdfstest/")
+
+def is_posix_infra_failure(row):
+    if row[0] == "PASS":
+        return False
+    haystack = " ".join(row[1:]).lower()
+    markers = ("provision", "prereq", "prerequisite", "mount")
+    return any(marker in haystack for marker in markers)
+
 if suite == "posix":
-    rows = [row for row in rows if row[1] == "pjdfstest" or row[1].startswith("pjdfstest/")]
+    rows = [row for row in rows if is_pjdfstest_row(row) or is_posix_infra_failure(row)]
 
 counts = collections.Counter(row[0] for row in rows)
 categories = collections.defaultdict(list)
@@ -146,15 +156,21 @@ PY
 
 finish() {
   local rc=$?
+  local report_rc=0
+  local mounts_still_attached=0
   set +e
   for mp in "${MOUNT_POINTS[@]:-}"; do
     stop_mount "$mp" >/dev/null 2>&1 || true
+    if [ -n "$mp" ] && is_mounted "$mp"; then
+      mounts_still_attached=1
+      echo "MOUNT_STILL_ATTACHED=$mp"
+    fi
   done
   if [ -n "${CLI_BIN:-}" ]; then
     rm -f "$CLI_BIN" >/dev/null 2>&1 || true
   fi
   if [ -n "${REPORT_PATH:-}" ] && [ -n "${RESULTS_TSV:-}" ] && [ -f "$RESULTS_TSV" ]; then
-    write_report || true
+    write_report || report_rc=$?
     echo "REPORT=$REPORT_PATH"
     if [ -f "$REPORT_PATH" ]; then
       awk '
@@ -165,7 +181,11 @@ finish() {
     fi
   fi
   if [ -n "${RUN_ROOT:-}" ] && [ -d "$RUN_ROOT" ]; then
-    rm -rf "$RUN_ROOT" >/dev/null 2>&1 || true
+    if [ "$rc" -eq 0 ] && [ "$report_rc" -eq 0 ] && [ "$mounts_still_attached" -eq 0 ]; then
+      rm -rf "$RUN_ROOT" >/dev/null 2>&1 || true
+    else
+      echo "RUN_ROOT=$RUN_ROOT"
+    fi
   fi
   exit "$rc"
 }
@@ -1352,7 +1372,7 @@ main() {
 
   local fail_count unchecked_count
   fail_count="$(awk -F'\t' '$1=="FAIL"{c++} END{print c+0}' "$RESULTS_TSV")"
-  unchecked_count="$(awk -F'\t' '$1!="PASS"{c++} END{print c+0}' "$RESULTS_TSV")"
+  unchecked_count="$(awk -F'\t' '$1!="PASS" && $1!="META"{c++} END{print c+0}' "$RESULTS_TSV")"
   if [ "$fail_count" -ne 0 ]; then
     return 1
   fi

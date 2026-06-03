@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -97,6 +98,48 @@ def build_fixture(root: Path) -> dict[str, str]:
     }
 
 
+def is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+def safe_delete_bases() -> list[Path]:
+    bases = [Path(tempfile.gettempdir()), Path("/tmp"), Path("/private/tmp")]
+    env_base = os.environ.get("DRIVE9_GIT_FIXTURE_SAFE_DELETE_BASE")
+    if env_base:
+        bases.append(Path(env_base))
+    resolved = []
+    for base in bases:
+        try:
+            resolved.append(base.resolve())
+        except OSError:
+            continue
+    return resolved
+
+
+def ensure_safe_to_delete(root: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    resolved = root.resolve()
+    dangerous = {Path("/").resolve(), Path.home().resolve(), repo_root}
+    if (
+        resolved in dangerous
+        or is_relative_to(repo_root, resolved)
+        or is_relative_to(resolved, repo_root)
+    ):
+        raise ValueError(f"{resolved} is a protected path")
+
+    for base in safe_delete_bases():
+        if resolved != base and is_relative_to(resolved, base):
+            return
+    raise ValueError(
+        f"{resolved} is outside the allowed temp roots; set "
+        "DRIVE9_GIT_FIXTURE_SAFE_DELETE_BASE to permit a dedicated fixture directory"
+    )
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", help="empty directory where fixture repositories will be created")
@@ -105,6 +148,11 @@ def main(argv: list[str]) -> int:
 
     root = Path(args.root).resolve()
     if args.force and root.exists():
+        try:
+            ensure_safe_to_delete(root)
+        except ValueError as exc:
+            print(f"refusing to remove fixture root: {exc}", file=sys.stderr)
+            return 2
         shutil.rmtree(root)
     info = build_fixture(root)
     print(json.dumps(info, sort_keys=True))

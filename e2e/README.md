@@ -80,8 +80,10 @@ report:
 PJDFSTEST_DIR=/path/to/pjdfstest bash e2e/posix-feature-matrix.sh
 ```
 
-It writes `e2e/reports/posix-feature-report-<timestamp>.md` and counts results
-using pjdfstest/prove cases.
+By default it writes directly under `e2e/reports/`, for example
+`e2e/reports/posix-feature-report-<timestamp>.md`, and counts results using
+pjdfstest/prove cases. If `FEATURE_MATRIX_REPORT_DIR` points at a run-specific
+directory, the same report filename is written inside that directory instead.
 
 - Knobs: `FEATURE_MATRIX_REPORT_DIR`, `FEATURE_MATRIX_STRICT_ALL`,
   `PJDFSTEST_DIR`, `PJDFSTEST_TESTS`, `PJDFSTEST_BIN`,
