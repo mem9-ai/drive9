@@ -2090,8 +2090,8 @@ func (fs *Dat9FS) updateEntryFromStat(entry *InodeEntry, stat *client.StatResult
 	return entry
 }
 
-func (fs *Dat9FS) revalidateReadCacheEntryIfUnverified(cancel <-chan struct{}, p string, entry *InodeEntry) (*InodeEntry, error) {
-	if fs == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || fs.statCacheVerified() {
+func (fs *Dat9FS) revalidateReadCacheEntryIfUntrusted(cancel <-chan struct{}, p string, entry *InodeEntry) (*InodeEntry, error) {
+	if fs == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || fs.statCacheTrustedAndVerified() {
 		return entry, nil
 	}
 	cachedRevision := entry.Revision
@@ -5290,11 +5290,15 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 
 	p := fh.Path
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
-	if refreshed, err := fs.revalidateReadCacheEntryIfUnverified(cancel, p, entry); err != nil {
-		source = "read-cache-revalidate-error"
-		return nil, httpToFuseStatus(err)
-	} else {
-		entry = refreshed
+	revalidatedForRead := false
+	if entry != nil && !fs.statCacheVerified() {
+		if refreshed, err := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry); err != nil {
+			source = "read-cache-revalidate-error"
+			return nil, httpToFuseStatus(err)
+		} else {
+			entry = refreshed
+			revalidatedForRead = true
+		}
 	}
 
 	// Try prefetcher for large read-only files
@@ -5405,6 +5409,24 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	rangeSize := int64(input.Size)
 	if key, ok := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize); ok {
 		if data, ok := fs.diskReadCache.Get(key); ok {
+			if !fs.statCacheTrustedAndVerified() && !revalidatedForRead {
+				refreshed, err := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry)
+				if err != nil {
+					source = "read-cache-revalidate-error"
+					return nil, httpToFuseStatus(err)
+				}
+				entry = refreshed
+				refreshedKey, refreshedOK := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize)
+				if !refreshedOK {
+					ok = false
+				} else if refreshedKey != key {
+					key = refreshedKey
+					data, ok = fs.diskReadCache.Get(key)
+				}
+				if !ok {
+					goto diskReadCacheMiss
+				}
+			}
 			if fs.perf != nil {
 				fs.perf.readCacheHit.add(1)
 			}
@@ -5415,6 +5437,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			}
 			return gofuse.ReadResultData(data), gofuse.OK
 		}
+	diskReadCacheMiss:
 		if fs.perf != nil {
 			fs.perf.readCacheMiss.add(1)
 		}

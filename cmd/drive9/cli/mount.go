@@ -190,8 +190,8 @@ func fsMountCmd(args []string) error {
 	if *diskReadCacheSize <= 0 {
 		return fmt.Errorf("drive9 mount: --disk-read-cache-size-mb must be > 0")
 	}
-	if *diskReadCacheFreeRatio < 0 || *diskReadCacheFreeRatio >= 1 {
-		return fmt.Errorf("drive9 mount: --disk-read-cache-free-ratio must be >= 0 and < 1")
+	if *diskReadCacheFreeRatio <= 0 || *diskReadCacheFreeRatio >= 1 {
+		return fmt.Errorf("drive9 mount: --disk-read-cache-free-ratio must be > 0 and < 1")
 	}
 	normalizedLookupRetryCount := lookupRetryCountFlagValue(lookupRetryCountGiven, *lookupRetryCount)
 	normalizedLookupRetryTimeout := durationFlagValue(fs, "lookup-retry-timeout", *lookupRetryTimeout)

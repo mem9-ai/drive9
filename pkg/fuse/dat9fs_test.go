@@ -95,8 +95,7 @@ func newTestDat9FSWithRangeObject(tb testing.TB, size int64, object func(http.Re
 		}
 	}))
 
-	opts := &MountOptions{}
-	opts.setDefaults()
+	opts := trustedProcessLocalEventsOptions()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	ino := fs.inodes.Lookup("/file.bin", false, size, time.Now())
 	return fs, ino, ts.Close
@@ -1119,6 +1118,54 @@ func TestDat9FSDiskReadCacheUnverifiedRevisionMismatchRefetches(t *testing.T) {
 	waitForDiskReadCacheEntry(t, fs.diskReadCache, newKey)
 	if got, ok := fs.diskReadCache.Get(oldKey); ok {
 		t.Fatalf("old revision cache still hit after mismatch: %q", got)
+	}
+	if calls := headCalls.Load(); calls != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", calls)
+	}
+	if calls := objectReads.Load(); calls != 1 {
+		t.Fatalf("object reads = %d, want 1", calls)
+	}
+}
+
+func TestDat9FSDiskReadCacheRevalidatesWhenLocalEventsUntrusted(t *testing.T) {
+	const path = "/file.bin"
+	const oldRev = int64(7)
+	const newRev = int64(8)
+	var headCalls atomic.Int32
+	var objectReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithStatAndRangeObject(t, defaultReadCacheMaxFileSize+1024, func(w http.ResponseWriter, r *http.Request) {
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", strconv.Itoa(defaultReadCacheMaxFileSize+1024))
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(newRev, 10))
+		w.WriteHeader(http.StatusOK)
+	}, func(w http.ResponseWriter, r *http.Request) {
+		objectReads.Add(1)
+		if got := r.Header.Get("Range"); got != "bytes=0-4" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("fresh"))
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.markStatCacheVerified()
+	fs.inodes.UpdateRevision(ino, oldRev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	oldKey := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: oldRev, Offset: 0, Length: 5}
+	newKey := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: newRev, Offset: 0, Length: 5}
+	fs.diskReadCache.PutOwned(oldKey, []byte("stale"))
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 5)
+	if err != nil || st != gofuse.OK || string(got) != "fresh" {
+		t.Fatalf("read = %q, %v, %v; want fresh OK", got, st, err)
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, newKey)
+	if got, ok := fs.diskReadCache.Get(oldKey); ok {
+		t.Fatalf("old revision cache still hit after untrusted revalidation: %q", got)
 	}
 	if calls := headCalls.Load(); calls != 1 {
 		t.Fatalf("HEAD calls = %d, want 1", calls)
