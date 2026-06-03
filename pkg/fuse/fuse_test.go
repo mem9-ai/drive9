@@ -2297,6 +2297,32 @@ func TestDiskReadCachePutGet(t *testing.T) {
 	}
 }
 
+func TestDiskReadCacheArtifactsArePrivate(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewDiskReadCache(DiskReadCacheOptions{Dir: dir, MaxSize: 1 << 20, FreeRatio: -1})
+	if err != nil {
+		t.Fatalf("NewDiskReadCache: %v", err)
+	}
+	t.Cleanup(cache.Close)
+	dirInfo, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("cache dir stat: %v", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != 0o700 {
+		t.Fatalf("cache dir mode = %o, want 700", got)
+	}
+
+	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}
+	cache.PutOwned(key, []byte("hello"))
+	info, err := os.Stat(cache.pathForDigest(key.digest()))
+	if err != nil {
+		t.Fatalf("cache file stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("cache file mode = %o, want 600", got)
+	}
+}
+
 func TestDiskReadCachePendingMemoryIsServedAndIsolated(t *testing.T) {
 	cache := newTestDiskReadCache(t, 1<<20)
 	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}
@@ -2353,7 +2379,7 @@ func TestDiskReadCacheRevisionMismatchMisses(t *testing.T) {
 }
 
 func TestDiskReadCacheCapacityEvictsLRU(t *testing.T) {
-	cache := newTestDiskReadCache(t, 6)
+	cache := newTestDiskReadCache(t, 220)
 	first := DiskReadCacheKey{FileID: "file-1", Path: "/first.bin", Revision: 1, Offset: 0, Length: 4}
 	second := DiskReadCacheKey{FileID: "file-2", Path: "/second.bin", Revision: 1, Offset: 0, Length: 4}
 	cache.PutOwned(first, []byte("1111"))
@@ -2365,6 +2391,22 @@ func TestDiskReadCacheCapacityEvictsLRU(t *testing.T) {
 	got, ok := cache.Get(second)
 	if !ok || string(got) != "2222" {
 		t.Fatalf("second cache entry = %q, %v; want 2222 hit", got, ok)
+	}
+}
+
+func TestDiskReadCacheCapacityCountsFileOverhead(t *testing.T) {
+	cache := newTestDiskReadCache(t, 220)
+	first := DiskReadCacheKey{FileID: "file-1", Path: "/first.bin", Revision: 1, Offset: 0, Length: 1}
+	second := DiskReadCacheKey{FileID: "file-2", Path: "/second.bin", Revision: 1, Offset: 0, Length: 1}
+	cache.PutOwned(first, []byte("1"))
+	cache.PutOwned(second, []byte("2"))
+
+	if got, ok := cache.Get(first); ok {
+		t.Fatalf("first cache entry hit after file-overhead capacity eviction: %q", got)
+	}
+	got, ok := cache.Get(second)
+	if !ok || string(got) != "2" {
+		t.Fatalf("second cache entry = %q, %v; want 2 hit", got, ok)
 	}
 }
 
@@ -2381,6 +2423,17 @@ func TestDiskReadCacheCorruptionMissesAndRemovesEntry(t *testing.T) {
 	}
 	if cache.Len() != 0 {
 		t.Fatalf("cache Len = %d, want corrupt entry removed", cache.Len())
+	}
+}
+
+func TestDiskReadCacheClosePreventsFutureAsyncPuts(t *testing.T) {
+	cache := newTestDiskReadCache(t, 1<<20)
+	cache.Close()
+	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}
+	cache.PutAsync(key, []byte("hello"))
+
+	if got, ok := cache.Get(key); ok {
+		t.Fatalf("closed cache hit after PutAsync: %q", got)
 	}
 }
 
@@ -2415,5 +2468,6 @@ func newTestDiskReadCache(t *testing.T, maxSize int64) *DiskReadCache {
 	if err != nil {
 		t.Fatalf("NewDiskReadCache: %v", err)
 	}
+	t.Cleanup(cache.Close)
 	return cache
 }

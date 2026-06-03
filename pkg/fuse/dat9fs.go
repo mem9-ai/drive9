@@ -7184,6 +7184,10 @@ func (fs *Dat9FS) FlushAll() {
 		fs.commitQueue.DrainAll()
 	}
 
+	if fs.diskReadCache != nil {
+		fs.diskReadCache.Close()
+	}
+
 	// Close journal.
 	if fs.journal != nil {
 		_ = fs.journal.Close()

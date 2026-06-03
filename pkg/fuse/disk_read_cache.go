@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"container/list"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -81,6 +82,9 @@ type diskReadCachePending struct {
 
 type DiskReadCache struct {
 	mu        sync.Mutex
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
 	dir       string
 	maxSize   int64
 	freeRatio float64
@@ -88,6 +92,7 @@ type DiskReadCache struct {
 	pending   map[string]diskReadCachePending
 	order     *list.List
 	size      int64
+	closed    bool
 }
 
 func NewDiskReadCache(opts DiskReadCacheOptions) (*DiskReadCache, error) {
@@ -102,10 +107,16 @@ func NewDiskReadCache(opts DiskReadCacheOptions) (*DiskReadCache, error) {
 	} else if opts.FreeRatio == 0 {
 		opts.FreeRatio = defaultDiskReadCacheFreeRatio
 	}
-	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
+	if err := os.MkdirAll(opts.Dir, 0o700); err != nil {
 		return nil, err
 	}
+	if err := os.Chmod(opts.Dir, 0o700); err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	cache := &DiskReadCache{
+		ctx:       ctx,
+		cancel:    cancel,
 		dir:       opts.Dir,
 		maxSize:   opts.MaxSize,
 		freeRatio: opts.FreeRatio,
@@ -167,10 +178,18 @@ func (c *DiskReadCache) PutAsync(key DiskReadCacheKey, data []byte) {
 	digest := key.digest()
 	seq := diskReadCacheTempSeq.Add(1)
 	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
 	c.pending[digest] = diskReadCachePending{key: key, data: stored, seq: seq}
+	c.wg.Add(1)
 	c.mu.Unlock()
 	go func() {
-		c.putOwned(key, stored, seq)
+		defer c.wg.Done()
+		if c.ctx.Err() == nil {
+			c.putOwned(key, stored, seq)
+		}
 		c.clearPending(digest, seq)
 	}()
 }
@@ -193,6 +212,10 @@ func (c *DiskReadCache) putOwned(key DiskReadCacheKey, data []byte, pendingSeq u
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		_ = os.Remove(tmp)
+		return
+	}
 	if pendingSeq != 0 {
 		pending, ok := c.pending[digest]
 		if !ok || pending.seq != pendingSeq {
@@ -204,15 +227,20 @@ func (c *DiskReadCache) putOwned(key DiskReadCacheKey, data []byte, pendingSeq u
 		_ = os.Remove(tmp)
 		return
 	}
+	fileSize, err := diskReadCacheFileSize(path)
+	if err != nil {
+		_ = os.Remove(path)
+		return
+	}
 
 	if existing, ok := c.items[digest]; ok {
 		c.size -= existing.size
 		existing.path = path
-		existing.size = int64(len(data))
+		existing.size = fileSize
 		c.size += existing.size
 		c.order.MoveToFront(existing.elem)
 	} else {
-		entry := &diskReadCacheEntry{key: key, path: path, size: int64(len(data))}
+		entry := &diskReadCacheEntry{key: key, path: path, size: fileSize}
 		entry.elem = c.order.PushFront(entry)
 		c.items[digest] = entry
 		c.size += entry.size
@@ -279,6 +307,24 @@ func (c *DiskReadCache) InvalidateAll() {
 	}
 }
 
+func (c *DiskReadCache) Close() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.cancel()
+	for digest := range c.pending {
+		delete(c.pending, digest)
+	}
+	c.mu.Unlock()
+	c.wg.Wait()
+}
+
 func (c *DiskReadCache) Len() int {
 	if c == nil {
 		return 0
@@ -339,7 +385,7 @@ func (c *DiskReadCache) recoverIndex() error {
 		}
 		recoveredEntries = append(recoveredEntries, recovered{
 			digest: strings.TrimSuffix(name, diskReadCacheEntryExt),
-			entry:  &diskReadCacheEntry{key: key, path: fullPath, size: header.Size},
+			entry:  &diskReadCacheEntry{key: key, path: fullPath, size: info.Size()},
 			mtime:  info.ModTime(),
 		})
 	}
@@ -389,7 +435,10 @@ func (c *DiskReadCache) removeEntryLocked(digest string, entry *diskReadCacheEnt
 }
 
 func writeDiskReadCacheFile(path string, key DiskReadCacheKey, data []byte) error {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
@@ -421,6 +470,14 @@ func writeDiskReadCacheFile(path string, key DiskReadCacheKey, data []byte) erro
 		return err
 	}
 	return file.Close()
+}
+
+func diskReadCacheFileSize(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
 }
 
 func readDiskReadCacheFile(path string, key DiskReadCacheKey) ([]byte, error) {

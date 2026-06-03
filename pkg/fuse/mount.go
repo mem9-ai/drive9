@@ -231,7 +231,8 @@ func Mount(opts *MountOptions) error {
 	mountHash := ""
 	if cacheBase != "" {
 		mountHash = MountHash(opts.Server, opts.MountPoint, opts.RemoteRoot)
-		readCacheDir := filepath.Join(cacheBase, mountHash, "read")
+		readCacheHash := MountReadCacheHash(opts.Server, opts.MountPoint, opts.RemoteRoot, mountCredentialKind(opts), mountCredentialSecret(opts))
+		readCacheDir := filepath.Join(cacheBase, readCacheHash, "read")
 		diskReadCache, err := NewDiskReadCache(DiskReadCacheOptions{
 			Dir:       readCacheDir,
 			MaxSize:   opts.DiskReadCacheSize,
@@ -537,6 +538,20 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 		return fmt.Errorf("mount: %w", err)
 	}
 	return nil
+}
+
+func mountCredentialKind(opts *MountOptions) string {
+	if opts.Token != "" {
+		return "token"
+	}
+	return "api_key"
+}
+
+func mountCredentialSecret(opts *MountOptions) string {
+	if opts.Token != "" {
+		return opts.Token
+	}
+	return opts.APIKey
 }
 
 func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {

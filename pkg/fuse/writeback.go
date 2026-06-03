@@ -628,3 +628,16 @@ func MountHash(serverURL, mountPoint string, remoteRoot ...string) string {
 	h := sha256.Sum256([]byte(input))
 	return hex.EncodeToString(h[:8]) // 16 hex chars
 }
+
+// MountReadCacheHash computes the persistent read-cache namespace. Unlike the
+// write-back cache namespace, it includes a credential digest because read-cache
+// entries contain remote file bytes and can survive remounts.
+func MountReadCacheHash(serverURL, mountPoint, remoteRoot, credentialKind, credential string) string {
+	if remoteRoot == "" {
+		remoteRoot = "/"
+	}
+	credentialDigest := sha256.Sum256([]byte(credentialKind + "\x00" + credential))
+	input := serverURL + "\x00" + mountPoint + "\x00" + remoteRoot + "\x00" + credentialKind + "\x00" + hex.EncodeToString(credentialDigest[:])
+	h := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(h[:8])
+}
