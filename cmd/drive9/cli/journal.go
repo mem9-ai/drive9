@@ -57,7 +57,21 @@ func journalUsage() string {
 	return "usage: drive9 journal <new|append|cat|find|verify>"
 }
 
+func journalNewUsage() string { return "usage: drive9 journal new [flags]" }
+
+func journalAppendUsage() string { return "usage: drive9 journal append <journal> [flags]" }
+
+func journalCatUsage() string { return "usage: drive9 journal cat <journal> [flags]" }
+
+func journalFindUsage() string { return "usage: drive9 journal find [flags]" }
+
+func journalVerifyUsage() string { return "usage: drive9 journal verify <journal> [--json]" }
+
 func JournalNew(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, journalNewUsage())
+		return nil
+	}
 	fs := flag.NewFlagSet("journal new", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var meta repeatStrings
@@ -75,7 +89,7 @@ func JournalNew(args []string) error {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return fmt.Errorf("usage: drive9 journal new [flags]")
+		return fmt.Errorf("%s", journalNewUsage())
 	}
 	resolvedKind := *kind
 	if *kindShort != journal.DefaultKind {
@@ -108,6 +122,10 @@ func JournalNew(args []string) error {
 }
 
 func JournalAppend(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, journalAppendUsage())
+		return nil
+	}
 	fs := flag.NewFlagSet("journal append", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var subjects repeatStrings
@@ -137,7 +155,7 @@ func JournalAppend(args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 journal append <journal> [flags]")
+		return fmt.Errorf("%s", journalAppendUsage())
 	}
 	resolvedType := *defaultType
 	if *defaultTypeShort != "" {
@@ -203,6 +221,10 @@ func readJournalEntriesFromStdin(r io.Reader, jsonArray bool) ([]journal.EntryIn
 }
 
 func JournalCat(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, journalCatUsage())
+		return nil
+	}
 	fs := flag.NewFlagSet("journal cat", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	after := fs.Int64("after", 0, "start after sequence")
@@ -216,7 +238,7 @@ func JournalCat(args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 journal cat <journal> [flags]")
+		return fmt.Errorf("%s", journalCatUsage())
 	}
 	c := NewFromEnv()
 	journalID := fs.Arg(0)
@@ -240,6 +262,10 @@ func JournalCat(args []string) error {
 }
 
 func JournalFind(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, journalFindUsage())
+		return nil
+	}
 	fs := flag.NewFlagSet("journal find", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	var subjects repeatStrings
@@ -266,7 +292,7 @@ func JournalFind(args []string) error {
 		return err
 	}
 	if fs.NArg() != 0 {
-		return fmt.Errorf("usage: drive9 journal find [flags]")
+		return fmt.Errorf("%s", journalFindUsage())
 	}
 	resolvedType := *entryType
 	if *entryTypeShort != "" {
@@ -342,6 +368,10 @@ func JournalFind(args []string) error {
 }
 
 func JournalVerify(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, journalVerifyUsage())
+		return nil
+	}
 	fs := flag.NewFlagSet("journal verify", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	asJSON := fs.Bool("json", false, "print JSON")
@@ -352,7 +382,7 @@ func JournalVerify(args []string) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return fmt.Errorf("usage: drive9 journal verify <journal> [--json]")
+		return fmt.Errorf("%s", journalVerifyUsage())
 	}
 	c := NewFromEnv()
 	result, err := c.VerifyJournal(context.Background(), fs.Arg(0))

@@ -63,6 +63,92 @@ func TestSecretSetRefusesToOverwriteOnConflict(t *testing.T) {
 	}
 }
 
+func TestSecretRmTreatsHelpLikeNamesAsData(t *testing.T) {
+	var deleted []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.NotFound(w, r)
+			return
+		}
+		deleted = append(deleted, r.URL.Path)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", srv.URL)
+	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	if err := SecretRm([]string{"help"}); err != nil {
+		t.Fatalf("SecretRm(help): %v", err)
+	}
+	if err := SecretRm([]string{"--", "--help"}); err != nil {
+		t.Fatalf("SecretRm(-- --help): %v", err)
+	}
+	want := []string{"/v1/vault/secrets/help", "/v1/vault/secrets/--help"}
+	if strings.Join(deleted, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("deleted paths = %v, want %v", deleted, want)
+	}
+}
+
+func TestSecretSetAndGetTreatEscapedDashPrefixedNamesAsData(t *testing.T) {
+	var createdName, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/vault/secrets":
+			var body struct {
+				Name   string            `json:"name"`
+				Fields map[string]string `json:"fields"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode create request: %v", err)
+			}
+			createdName = body.Name
+			if body.Fields["key"] != "value" {
+				t.Fatalf("fields = %#v, want key=value", body.Fields)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"name":"--help"}`))
+		case r.Method == http.MethodGet:
+			gotPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"key":"value"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", srv.URL)
+	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	if err := SecretSet([]string{"--", "--help", "key=value"}); err != nil {
+		t.Fatalf("SecretSet(-- --help key=value): %v", err)
+	}
+	if createdName != "--help" {
+		t.Fatalf("created name = %q, want --help", createdName)
+	}
+	t.Setenv("DRIVE9_SERVER", srv.URL)
+	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+	resetCredentialCacheForTest()
+	out := captureStdout(t, func() {
+		if err := SecretGet([]string{"--", "--help"}); err != nil {
+			t.Fatalf("SecretGet(-- --help): %v", err)
+		}
+	})
+	if gotPath != "/v1/vault/secrets/--help/value" {
+		t.Fatalf("get path = %q, want /v1/vault/secrets/--help/value", gotPath)
+	}
+	if !strings.Contains(out, `"key": "value"`) {
+		t.Fatalf("output = %q", out)
+	}
+}
+
 func TestSecretGetUsesCapabilityToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer cap-token" {
@@ -117,6 +203,74 @@ func TestSecretGrantPrintsGrantMetadata(t *testing.T) {
 	// Pre-V2a label must be gone so automation can't false-positive on the old id field.
 	if strings.Contains(out, "token_id=") {
 		t.Fatalf("output still contains legacy token_id= label: %q", out)
+	}
+}
+
+func TestSecretGrantTreatsEscapedDashPrefixedScopeAsData(t *testing.T) {
+	var gotScope []any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/vault/grants" {
+			http.NotFound(w, r)
+			return
+		}
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		gotScope, _ = req["scope"].([]any)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"token":"vt_abc","grant_id":"grt_123","expires_at":"2026-04-14T00:00:00Z","scope":["--help"],"perm":"read"}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", srv.URL)
+	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	_ = captureStdout(t, func() {
+		if err := SecretGrant([]string{"--agent", "deploy-agent", "--ttl", "1h", "--perm", "read", "--", "--help"}); err != nil {
+			t.Fatalf("SecretGrant(... -- --help): %v", err)
+		}
+	})
+	if len(gotScope) != 1 || gotScope[0] != "--help" {
+		t.Fatalf("scope = %#v, want [--help]", gotScope)
+	}
+}
+
+func TestSecretGrantAgentFlagValueCanBeHelpLike(t *testing.T) {
+	var gotAgent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/vault/grants" {
+			http.NotFound(w, r)
+			return
+		}
+		var req map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		gotAgent, _ = req["agent"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"token":"vt_abc","grant_id":"grt_123","expires_at":"2026-04-14T00:00:00Z","scope":["aws-prod"],"perm":"read"}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", srv.URL)
+	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	_ = captureStdout(t, func() {
+		if err := SecretGrant([]string{"--agent", "--help", "--ttl", "1h", "--perm", "read", "aws-prod"}); err != nil {
+			t.Fatalf("SecretGrant --agent --help: %v", err)
+		}
+	})
+	if gotAgent != "--help" {
+		t.Fatalf("agent = %q, want --help", gotAgent)
 	}
 }
 
@@ -235,6 +389,35 @@ func TestSecretAuditFiltersClientSide(t *testing.T) {
 	})
 	if !strings.Contains(out, `"agent_id": "deploy-agent"`) || strings.Contains(out, `"agent_id": "test-agent"`) {
 		t.Fatalf("output = %q", out)
+	}
+}
+
+func TestSecretAuditSecretFilterCanBeHelpLike(t *testing.T) {
+	var gotSecret string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/vault/audit" {
+			http.NotFound(w, r)
+			return
+		}
+		gotSecret = r.URL.Query().Get("secret")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"events":[]}`))
+	}))
+	defer srv.Close()
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("DRIVE9_SERVER", srv.URL)
+	t.Setenv("DRIVE9_API_KEY", "tenant-key")
+	resetCredentialCacheForTest()
+	t.Cleanup(resetCredentialCacheForTest)
+
+	if _, err := captureStdoutE(t, func() error {
+		return SecretAudit([]string{"--secret", "--help"})
+	}); err != nil {
+		t.Fatalf("SecretAudit --secret --help: %v", err)
+	}
+	if gotSecret != "--help" {
+		t.Fatalf("secret query = %q, want --help", gotSecret)
 	}
 }
 

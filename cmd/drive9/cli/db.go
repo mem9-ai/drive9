@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 
 	"github.com/mem9-ai/dat9/pkg/client"
 )
@@ -16,6 +17,10 @@ import (
 //
 // See migration call-out #4 in the impl PR body.
 func Create(args []string) error {
+	if IsHelpArgsWithValueFlags(args, "--name", "--server") {
+		_, _ = fmt.Fprintln(os.Stdout, createUsage())
+		return nil
+	}
 	name := ""
 	serverFlag := ""
 	serverFlagGiven := false
@@ -36,7 +41,7 @@ func Create(args []string) error {
 			serverFlag = args[i]
 			serverFlagGiven = true
 		default:
-			return fmt.Errorf("unknown flag %q\nusage: drive9 create [--name NAME] [--server URL]", args[i])
+			return fmt.Errorf("unknown flag %q\n%s", args[i], createUsage())
 		}
 	}
 
@@ -107,3 +112,5 @@ func Create(args []string) error {
 	fmt.Printf("config: %s\n", configPath())
 	return nil
 }
+
+func createUsage() string { return "usage: drive9 create [--name NAME] [--server URL]" }

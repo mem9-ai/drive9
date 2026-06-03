@@ -40,6 +40,10 @@ func Token(args []string) error {
 	case "revoke":
 		return TokenRevoke(args[1:])
 	case "list", "ls":
+		if IsHelpArgs(args[1:]) {
+			_, _ = fmt.Fprintln(os.Stdout, tokenListUsage())
+			return nil
+		}
 		// Deprecated alias; warn on stderr then dispatch through
 		// the canonical ctx-list filter path. Keeps existing
 		// scripts working for one release.
@@ -47,6 +51,10 @@ func Token(args []string) error {
 		fmt.Fprintln(os.Stderr, "         This command will be removed in a future release.")
 		return Ctx([]string{"list", "--type", "fs_scoped"})
 	case "forget":
+		if IsHelpArgs(args[1:]) {
+			_, _ = fmt.Fprintln(os.Stdout, tokenForgetUsage())
+			return nil
+		}
 		// Deprecated alias; warn on stderr then dispatch through
 		// `drive9 ctx rm <name>` which owns local namespace cleanup.
 		fmt.Fprintln(os.Stderr, "WARNING: `drive9 token forget` is deprecated; use `drive9 ctx rm <name>` instead.")
@@ -91,7 +99,23 @@ func tokenUsageErr() error {
 	return fmt.Errorf("%s", tokenUsage())
 }
 
+func tokenIssueUsage() string {
+	return "usage: drive9 token issue [name] --ttl <duration> --allow <prefix:ops>"
+}
+
+func tokenListUsage() string { return "usage: drive9 token list" }
+
+func tokenForgetUsage() string { return "usage: drive9 token forget <name>" }
+
+func tokenRevokeUsage() string {
+	return "usage: drive9 token revoke <name|-> [--api-key-file <path>]"
+}
+
 func TokenIssue(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, tokenIssueUsage())
+		return nil
+	}
 	var (
 		subject   string
 		ttlRaw    string
@@ -211,8 +235,12 @@ func rollbackIssuedTokenAfterSaveFailure(c *client.Client, apiKey string, saveEr
 }
 
 func TokenList(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, tokenListUsage())
+		return nil
+	}
 	if len(args) != 0 {
-		return fmt.Errorf("usage: drive9 token list")
+		return fmt.Errorf("%s", tokenListUsage())
 	}
 	cfg := loadConfig()
 	names := make([]string, 0, len(cfg.Contexts))
@@ -243,8 +271,12 @@ func TokenList(args []string) error {
 }
 
 func TokenForget(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, tokenForgetUsage())
+		return nil
+	}
 	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
-		return fmt.Errorf("usage: drive9 token forget <name>")
+		return fmt.Errorf("%s", tokenForgetUsage())
 	}
 	name := strings.TrimSpace(args[0])
 	cfg := loadConfig()
@@ -264,25 +296,37 @@ func TokenForget(args []string) error {
 }
 
 func TokenRevoke(args []string) error {
+	if IsHelpArgsWithValueFlags(args, "--api-key-file") {
+		_, _ = fmt.Fprintln(os.Stdout, tokenRevokeUsage())
+		return nil
+	}
+	args, escaped := stripLeadingDashDash(args)
 	var apiKeyFile string
 	pos := make([]string, 0, 1)
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--api-key-file":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--api-key-file requires a value")
+	if escaped {
+		if len(args) != 1 {
+			return fmt.Errorf("%s", tokenRevokeUsage())
+		}
+		pos = append(pos, args[0])
+	} else {
+		for i := 0; i < len(args); i++ {
+			switch args[i] {
+			case "--api-key-file":
+				if i+1 >= len(args) {
+					return fmt.Errorf("--api-key-file requires a value")
+				}
+				i++
+				apiKeyFile = args[i]
+			default:
+				pos = append(pos, args[i])
 			}
-			i++
-			apiKeyFile = args[i]
-		default:
-			pos = append(pos, args[i])
 		}
 	}
 	if apiKeyFile != "" && len(pos) > 0 {
 		return fmt.Errorf("--api-key-file cannot be combined with a token name or id")
 	}
 	if apiKeyFile == "" && len(pos) != 1 {
-		return fmt.Errorf("usage: drive9 token revoke <name|->")
+		return fmt.Errorf("%s", tokenRevokeUsage())
 	}
 
 	var (
@@ -294,7 +338,7 @@ func TokenRevoke(args []string) error {
 	switch {
 	case apiKeyFile != "":
 		targetAPIKey, err = readTokenAPIKeyFile(apiKeyFile)
-	case pos[0] == "-":
+	case !escaped && pos[0] == "-":
 		targetAPIKey, err = readTokenAPIKeyStdin()
 	default:
 		target := strings.TrimSpace(pos[0])

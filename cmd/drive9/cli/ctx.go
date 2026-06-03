@@ -57,9 +57,29 @@ func ctxUsage() string {
   import                                              add delegated context from stdin (default when stdin is a pipe)
   fork [<new>] [--from <ctx>] [--json]                create a copy-on-write fork context
   ls [-l|--json] [--type <kind>|--scoped]             list contexts (filter by type: owner|delegated|fs_scoped)
-  use <name>                                          activate a context
+  use [--] <name>                                     activate a context
   rm <name>                                           remove a local context name (does NOT revoke server-side credential)`
 }
+
+func ctxShowUsage() string { return "usage: drive9 ctx show [--json] [--reveal]" }
+
+func ctxAddUsage() string {
+	return "usage: drive9 ctx add --api-key <key> [--name <n>] [--server <url>]"
+}
+
+func ctxImportUsage() string {
+	return "usage: drive9 ctx import [--from-file <path|->] [--name <name>]"
+}
+
+func ctxForkUsage() string {
+	return "usage: drive9 ctx fork [<new>] [--from <ctx>] [--json]"
+}
+
+func ctxListUsage() string {
+	return "usage: drive9 ctx ls [-l|--json] [--type <kind>|--scoped]"
+}
+
+func ctxUseUsage() string { return "usage: drive9 ctx use [--] <name>" }
 
 type ctxShowEntry struct {
 	Name      string     `json:"name"`
@@ -79,6 +99,10 @@ type ctxShowEntry struct {
 }
 
 func ctxShowCmd(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, ctxShowUsage())
+		return nil
+	}
 	asJSON := false
 	reveal := false
 	for _, arg := range args {
@@ -89,9 +113,9 @@ func ctxShowCmd(args []string) error {
 			reveal = true
 		default:
 			if strings.HasPrefix(arg, "-") {
-				return fmt.Errorf("unknown flag %q\nusage: drive9 ctx show [--json] [--reveal]", arg)
+				return fmt.Errorf("unknown flag %q\n%s", arg, ctxShowUsage())
 			}
-			return fmt.Errorf("unexpected argument %q\nusage: drive9 ctx show [--json] [--reveal]", arg)
+			return fmt.Errorf("unexpected argument %q\n%s", arg, ctxShowUsage())
 		}
 	}
 
@@ -299,6 +323,10 @@ func formatSecretForDisplay(secret string, reveal bool) string {
 // re-entry) so the invariant "exactly one place writes ~/.drive9/config" is
 // preserved.
 func ctxAddCmd(args []string) error {
+	if IsHelpArgsWithValueFlags(args, "--api-key", "--name", "--server") {
+		_, _ = fmt.Fprintln(os.Stdout, ctxAddUsage())
+		return nil
+	}
 	var (
 		apiKey string
 		name   string
@@ -325,7 +353,7 @@ func ctxAddCmd(args []string) error {
 			i++
 			server = args[i]
 		default:
-			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx add --api-key <key> [--name <n>] [--server <url>]", args[i])
+			return fmt.Errorf("unknown flag %q\n%s", args[i], ctxAddUsage())
 		}
 	}
 	if apiKey == "" {
@@ -384,6 +412,10 @@ func ctxAdd(cfg *Config, name string, ctx *Context) (*Context, error) {
 }
 
 func ctxForkCmd(args []string) error {
+	if IsHelpArgsWithValueFlags(args, "--from") {
+		_, _ = fmt.Fprintln(os.Stdout, ctxForkUsage())
+		return nil
+	}
 	newName := ""
 	fromName := ""
 	jsonOut := false
@@ -399,10 +431,10 @@ func ctxForkCmd(args []string) error {
 			jsonOut = true
 		default:
 			if strings.HasPrefix(args[i], "-") {
-				return fmt.Errorf("unknown flag %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--json]", args[i])
+				return fmt.Errorf("unknown flag %q\n%s", args[i], ctxForkUsage())
 			}
 			if newName != "" {
-				return fmt.Errorf("unexpected argument %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--json]", args[i])
+				return fmt.Errorf("unexpected argument %q\n%s", args[i], ctxForkUsage())
 			}
 			newName = args[i]
 		}
@@ -513,6 +545,10 @@ type forkCtxResult struct {
 //  3. parseable delegated but exp already past     -> command error (§17 short-circuit #1)
 //  4. parseable delegated with exp in the future   -> TOFU on iss, store
 func ctxImportCmd(args []string) error {
+	if IsHelpArgsWithValueFlags(args, "--from-file", "--name") {
+		_, _ = fmt.Fprintln(os.Stdout, ctxImportUsage())
+		return nil
+	}
 	var (
 		fromFile string
 		name     string
@@ -725,6 +761,10 @@ func scopeRootSegment(scope string) string {
 //
 // Status is computed locally from ExpiresAt at display time (§17 short-circuit).
 func ctxListCmd(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, ctxListUsage())
+		return nil
+	}
 	longForm := false
 	asJSON := false
 	typeFilter := ""
@@ -750,7 +790,7 @@ func ctxListCmd(args []string) error {
 				typeFilter = strings.TrimPrefix(args[i], "--type=")
 				continue
 			}
-			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx ls [-l|--json] [--type <kind>|--scoped]", args[i])
+			return fmt.Errorf("unknown flag %q\n%s", args[i], ctxListUsage())
 		}
 	}
 	if longForm && asJSON {
@@ -930,8 +970,17 @@ func formatExpiresAt(t time.Time) string {
 //
 // Per §17 short-circuit, an already-expired delegated context is refused.
 func ctxUseCmd(args []string) error {
-	if len(args) != 1 || strings.HasPrefix(args[0], "--") {
-		return fmt.Errorf("usage: drive9 ctx use <name>")
+	escaped := false
+	if len(args) > 0 && args[0] == "--" {
+		escaped = true
+		args = args[1:]
+	}
+	if !escaped && IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, ctxUseUsage())
+		return nil
+	}
+	if len(args) != 1 || (!escaped && strings.HasPrefix(args[0], "--")) {
+		return fmt.Errorf("%s", ctxUseUsage())
 	}
 	name := args[0]
 	cfg := loadConfig()
@@ -1006,6 +1055,13 @@ func ctxUseDescriptor(c *Context) string {
 //
 // Acceptance from #drive9:67e75a87 task #11 thread.
 func ctxRmCmd(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, ctxRmUsage())
+		return nil
+	}
+	if len(args) > 0 && args[0] == "--" {
+		args = args[1:]
+	}
 	if len(args) != 1 {
 		return fmt.Errorf("%s", ctxRmUsage())
 	}

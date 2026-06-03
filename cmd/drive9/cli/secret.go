@@ -62,7 +62,31 @@ func Secret(args []string) error {
 }
 
 func vaultUsage() string {
-	return "usage drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>"
+	return "usage: drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>"
+}
+
+func vaultSetUsage() string {
+	return "usage: drive9 vault set <name> <field=value|field=@file|field=-> [more fields]"
+}
+
+func vaultGetUsage() string { return "usage: drive9 vault get <name[/field]> [--json|--env]" }
+
+func vaultWithUsage() string {
+	return "usage: drive9 vault with /n/vault/<secret> -- <command...>"
+}
+
+func vaultLsUsage() string { return "usage: drive9 vault ls [--json]" }
+
+func vaultRmUsage() string { return "usage: drive9 vault rm <name>" }
+
+func vaultGrantUsage() string {
+	return "usage: drive9 vault grant --agent <agent> --perm <read|write> --ttl <duration> <scope...> [--json|--token-only]"
+}
+
+func vaultRevokeUsage() string { return "usage: drive9 vault revoke <id>" }
+
+func vaultAuditUsage() string {
+	return "usage: drive9 vault audit [--secret <name>] [--agent <agent>] [--since <duration>] [--limit <n>] [--json]"
 }
 
 // SecretSet creates a new secret. It deliberately does NOT update in place on
@@ -73,8 +97,13 @@ func vaultUsage() string {
 // then re-set, or `drive9 vault put /n/vault/<name> --from <dir>` for the
 // atomic wholesale-replace path.
 func SecretSet(args []string) error {
+	args, escaped := stripLeadingDashDash(args)
+	if !escaped && IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, vaultSetUsage())
+		return nil
+	}
 	if len(args) < 2 {
-		return fmt.Errorf("usage drive9 vault set <name> <field=value|field=@file|field=-> [more fields]")
+		return fmt.Errorf("%s", vaultSetUsage())
 	}
 	name := args[0]
 	if err := validateSecretName(name); err != nil {
@@ -102,8 +131,13 @@ func SecretSet(args []string) error {
 
 // SecretGet reads a whole secret or one field.
 func SecretGet(args []string) error {
+	args, escaped := stripLeadingDashDash(args)
+	if !escaped && IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, vaultGetUsage())
+		return nil
+	}
 	if len(args) < 1 {
-		return fmt.Errorf("usage drive9 vault get <name[/field]> [--json|--env]")
+		return fmt.Errorf("%s", vaultGetUsage())
 	}
 	ref := args[0]
 	name, field, err := parseSecretRef(ref)
@@ -201,8 +235,12 @@ const vaultPathPrefix = "/n/vault/"
 //     Only those three are scrubbed; unrelated DRIVE9_* (profiling, log
 //     level) pass through untouched.
 func SecretWith(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, vaultWithUsage())
+		return nil
+	}
 	if len(args) < 3 {
-		return fmt.Errorf("usage drive9 vault with /n/vault/<secret> -- <command...>")
+		return fmt.Errorf("%s", vaultWithUsage())
 	}
 	name, err := parseVaultPath(args[0])
 	if err != nil {
@@ -214,11 +252,11 @@ func SecretWith(args []string) error {
 	// for `vault with`, and accept-and-ignore here would undercut that
 	// contract (reviewer blocker flagged by adv-1 on PR #306).
 	if args[1] != "--" {
-		return fmt.Errorf("usage drive9 vault with /n/vault/<secret> -- <command...> (unexpected argument %q before `--`)", args[1])
+		return fmt.Errorf("%s (unexpected argument %q before `--`)", vaultWithUsage(), args[1])
 	}
 	cmdArgs := args[2:]
 	if len(cmdArgs) == 0 {
-		return fmt.Errorf("usage drive9 vault with /n/vault/<secret> -- <command...>")
+		return fmt.Errorf("%s", vaultWithUsage())
 	}
 
 	c, ownerMode, err := newVaultReadClientFromEnv()
@@ -361,13 +399,17 @@ func scrubDrive9CredEnv(base []string) []string {
 // any ambient tenant API key/config so agents do not silently enumerate the
 // whole tenant when a scoped token was intentionally provided.
 func SecretLs(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, vaultLsUsage())
+		return nil
+	}
 	asJSON := false
 	for _, arg := range args {
 		switch arg {
 		case "--json":
 			asJSON = true
 		default:
-			return fmt.Errorf("usage drive9 vault ls [--json]")
+			return fmt.Errorf("%s", vaultLsUsage())
 		}
 	}
 
@@ -404,8 +446,13 @@ func SecretLs(args []string) error {
 
 // SecretRm deletes a secret.
 func SecretRm(args []string) error {
+	args, escaped := stripLeadingDashDash(args)
+	if !escaped && IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, vaultRmUsage())
+		return nil
+	}
 	if len(args) != 1 {
-		return fmt.Errorf("usage drive9 vault rm <name>")
+		return fmt.Errorf("%s", vaultRmUsage())
 	}
 	name := args[0]
 	if err := validateSecretName(name); err != nil {
@@ -430,6 +477,10 @@ func SecretRm(args []string) error {
 //   - --json: full VaultGrantIssueResponse (adds scope and perm to the key set)
 //   - --token-only: <token>\n  (byte-identical to the pre-V2a shape)
 func SecretGrant(args []string) error {
+	if IsHelpArgsWithValueFlags(args, "--agent", "--ttl", "--perm") {
+		_, _ = fmt.Fprintln(os.Stdout, vaultGrantUsage())
+		return nil
+	}
 	var (
 		agentID   string
 		ttlRaw    string
@@ -463,6 +514,9 @@ func SecretGrant(args []string) error {
 			asJSON = true
 		case "--token-only":
 			tokenOnly = true
+		case "--":
+			scope = append(scope, args[i+1:]...)
+			i = len(args)
 		default:
 			if strings.HasPrefix(arg, "--") {
 				return fmt.Errorf("unknown flag %q", arg)
@@ -537,8 +591,12 @@ func SecretGrant(args []string) error {
 // to RevokeVaultToken. Both endpoints remain live until the legacy cleanup
 // wave.
 func SecretRevoke(args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, vaultRevokeUsage())
+		return nil
+	}
 	if len(args) != 1 {
-		return fmt.Errorf("usage drive9 vault revoke <id>")
+		return fmt.Errorf("%s", vaultRevokeUsage())
 	}
 	id := args[0]
 	c, err := newVaultManagementClientFromEnv()
@@ -553,6 +611,10 @@ func SecretRevoke(args []string) error {
 
 // SecretAudit queries vault audit events and applies client-side filters.
 func SecretAudit(args []string) error {
+	if IsHelpArgsWithValueFlags(args, "--secret", "--agent", "--since", "--limit") {
+		_, _ = fmt.Fprintln(os.Stdout, vaultAuditUsage())
+		return nil
+	}
 	var (
 		secretName string
 		agentID    string

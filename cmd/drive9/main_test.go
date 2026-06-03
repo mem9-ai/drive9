@@ -115,16 +115,94 @@ func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
 			firstLine: "usage: drive9 ctx rm <name>",
 		},
 		{
+			name:      "ctx import help after value",
+			cmd:       "ctx",
+			args:      []string{"import", "--name", "imported", "--help"},
+			firstLine: "usage: drive9 ctx import [--from-file <path|->] [--name <name>]",
+		},
+		{
+			name:      "create",
+			cmd:       "create",
+			args:      []string{"--name", "example", "--help"},
+			firstLine: "usage: drive9 create [--name NAME] [--server URL]",
+		},
+		{
+			name:      "fs cat",
+			cmd:       "fs",
+			args:      []string{"cat", "--offset", "--help"},
+			firstLine: "usage: drive9 fs cat [--offset N --length N] <path>",
+		},
+		{
+			name:      "fs symlink",
+			cmd:       "fs",
+			args:      []string{"symlink", "/target", "--help"},
+			firstLine: "usage: drive9 fs symlink <target> <link>",
+		},
+		{
+			name:      "mount",
+			cmd:       "mount",
+			args:      []string{"--cache-dir", "--help"},
+			firstLine: "usage: drive9 mount [flags] [:/remote] <mountpoint>",
+		},
+		{
+			name:      "mount vault",
+			cmd:       "mount",
+			args:      []string{"vault", "--server", "--help"},
+			firstLine: "usage: drive9 mount vault [flags] <mountpoint>",
+		},
+		{
+			name:      "umount",
+			cmd:       "umount",
+			args:      []string{"--timeout", "--help"},
+			firstLine: "usage: drive9 umount [--timeout duration] <mountpoint>",
+		},
+		{
 			name:      "journal",
 			cmd:       "journal",
 			args:      []string{"--help"},
 			firstLine: "usage: drive9 journal <new|append|cat|find|verify>",
 		},
 		{
+			name:      "journal append",
+			cmd:       "journal",
+			args:      []string{"append", "jrn_test", "--source", "--help"},
+			firstLine: "usage: drive9 journal append <journal> [flags]",
+		},
+		{
 			name:      "vault",
 			cmd:       "vault",
 			args:      []string{"--help"},
-			firstLine: "usage drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>",
+			firstLine: "usage: drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>",
+		},
+		{
+			name:      "vault put",
+			cmd:       "vault",
+			args:      []string{"put", "/n/vault/aws", "--help"},
+			firstLine: "usage: drive9 vault put /n/vault/<secret> --from <dir>",
+		},
+		{
+			name:      "token issue",
+			cmd:       "token",
+			args:      []string{"issue", "--ttl", "--help"},
+			firstLine: "usage: drive9 token issue [name] --ttl <duration> --allow <prefix:ops>",
+		},
+		{
+			name:      "token list",
+			cmd:       "token",
+			args:      []string{"list", "--help"},
+			firstLine: "usage: drive9 token list",
+		},
+		{
+			name:      "token forget",
+			cmd:       "token",
+			args:      []string{"forget", "--help"},
+			firstLine: "usage: drive9 token forget <name>",
+		},
+		{
+			name:      "doctor fuse",
+			cmd:       "doctor",
+			args:      []string{"fuse", "--mountpoint", "--help"},
+			firstLine: "usage: drive9 doctor fuse [--mountpoint path] [--cache-dir path] [--server url] [--timeout duration]",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -184,6 +262,88 @@ func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
 			}
 			if stderr != "" {
 				t.Errorf("stderr = %q, want empty stderr for explicit help", stderr)
+			}
+		})
+	}
+}
+
+func TestFSSubcommandHelpSkipsCpValueFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sub  string
+		args []string
+		want bool
+	}{
+		{
+			name: "cp description value",
+			sub:  "cp",
+			args: []string{"--description", "--help", "local.txt", ":/x"},
+			want: false,
+		},
+		{
+			name: "cp tag value",
+			sub:  "cp",
+			args: []string{"--tag", "--help", "local.txt", ":/x"},
+			want: false,
+		},
+		{
+			name: "cp explicit help after value",
+			sub:  "cp",
+			args: []string{"--description", "note", "--help"},
+			want: true,
+		},
+		{
+			name: "cp escaped help",
+			sub:  "cp",
+			args: []string{"--", "--help"},
+			want: false,
+		},
+		{
+			name: "cat existing generic scan",
+			sub:  "cat",
+			args: []string{"--offset", "--help"},
+			want: true,
+		},
+		{
+			name: "find name value",
+			sub:  "find",
+			args: []string{"/docs", "-name", "--help"},
+			want: false,
+		},
+		{
+			name: "find tag value",
+			sub:  "find",
+			args: []string{"/docs", "-tag", "-h"},
+			want: false,
+		},
+		{
+			name: "find newer value",
+			sub:  "find",
+			args: []string{"/docs", "-newer", "-help"},
+			want: false,
+		},
+		{
+			name: "find older value",
+			sub:  "find",
+			args: []string{"/docs", "-older", "--help"},
+			want: false,
+		},
+		{
+			name: "find size value",
+			sub:  "find",
+			args: []string{"/docs", "-size", "-h"},
+			want: false,
+		},
+		{
+			name: "find explicit help after value",
+			sub:  "find",
+			args: []string{"/docs", "-name", "*.md", "--help"},
+			want: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := fsSubcommandHasHelp(tc.sub, tc.args); got != tc.want {
+				t.Fatalf("fsSubcommandHasHelp(%q, %v) = %v, want %v", tc.sub, tc.args, got, tc.want)
 			}
 		})
 	}

@@ -9,6 +9,10 @@ import (
 )
 
 func SQL(c *client.Client, args []string) error {
+	if IsHelpArgs(args) {
+		_, _ = fmt.Fprintln(os.Stdout, sqlUsage())
+		return nil
+	}
 	var query string
 
 	for i := 0; i < len(args); i++ {
@@ -30,12 +34,12 @@ func SQL(c *client.Client, args []string) error {
 			}
 			query = string(data)
 		default:
-			return fmt.Errorf("unknown flag %q\nusage: drive9 db sql -q \"SELECT ...\"", args[i])
+			return fmt.Errorf("unknown flag %q\n%s", args[i], sqlUsage())
 		}
 	}
 
 	if query == "" {
-		return fmt.Errorf("usage: drive9 db sql -q \"SELECT ...\" or drive9 db sql -f query.sql")
+		return fmt.Errorf("%s or drive9 db sql -f query.sql", sqlUsage())
 	}
 
 	rows, err := c.SQL(query)
@@ -47,3 +51,5 @@ func SQL(c *client.Client, args []string) error {
 	enc.SetIndent("", "  ")
 	return enc.Encode(rows)
 }
+
+func sqlUsage() string { return "usage: drive9 db sql -q \"SELECT ...\"" }
