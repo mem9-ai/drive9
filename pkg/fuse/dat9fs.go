@@ -103,6 +103,15 @@ type Dat9FS struct {
 	// perf contains optional mount-level counters. Nil when disabled.
 	perf *fusePerfCounters
 
+	// readFlight deduplicates concurrent HTTP reads for the same file path.
+	// When multiple FUSE goroutines read the same uncached small file
+	// simultaneously, only one HTTP request is made; the others share the
+	// result. See cache invalidation spec §9.8 T24.
+	readFlight *SingleFlight
+	// remoteReadTimeout bounds detached shared read fetches. Defaults to
+	// fuseTimeout; tests may shorten it to exercise timeout paths.
+	remoteReadTimeout time.Duration
+
 	// localPolicy classifies coding-agent paths that should be routed to
 	// local-only storage instead of the Drive9 remote backend.
 	localPolicy *LocalPolicy
@@ -217,6 +226,8 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		git:               newGitWorkspaceLayer(),
 		gitCheckpoints:    newFlushDebouncer(gitCheckpointDebounce),
 		gitOverlayPending: make(map[string]map[string]pendingGitOverlayEntry),
+		readFlight:        NewSingleFlight(),
+		remoteReadTimeout: fuseTimeout,
 	}
 }
 
@@ -343,6 +354,13 @@ func fuseCtxWithTimeout(cancel <-chan struct{}, timeout time.Duration) (context.
 		}
 	}()
 	return ctx, cf
+}
+
+func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = fuseTimeout
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), timeout)
 }
 
 // --- helpers -----------------------------------------------------------------
@@ -5207,26 +5225,45 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			fs.perf.readCacheMiss.add(1)
 		}
 
-		// Cache miss: read the file and store it. No separate Stat needed —
-		// ReadCtx fetches the data in one round-trip. Uses detached retry
-		// so a single FUSE interrupt doesn't permanently return EAGAIN.
-		data, err := func() ([]byte, error) {
-			releaseReadSlot, err := fs.acquireRemoteReadSlot(ctx)
-			if err != nil {
-				return nil, err
+		// Cache miss: read the file and store it. Singleflight ensures
+		// only one HTTP request per path+revision when multiple goroutines
+		// miss the cache simultaneously (spec §9.8 T24). The key includes
+		// the observed revision so that concurrent reads after a revision
+		// change do not share stale in-flight results.
+		sfKey := fmt.Sprintf("%s@%d", p, cacheRev)
+		data, err, _ := fs.readFlight.Do(ctx, sfKey, func() ([]byte, error) {
+			// Use a detached context for the shared HTTP fetch so that
+			// cancellation of the owner's FUSE request does not fail
+			// piggybacking readers. Apply a fresh bounded timeout so the
+			// shared in-flight key and read slot cannot hang forever.
+			fetchCtx, fetchCancel := detachedSharedReadCtx(ctx, fs.remoteReadTimeout)
+			defer fetchCancel()
+			releaseReadSlot, slotErr := fs.acquireRemoteReadSlot(fetchCtx)
+			if slotErr != nil {
+				return nil, slotErr
 			}
 			defer releaseReadSlot()
-			return fs.readSmallFileWithRetry(ctx, p)
-		}()
+			fetchData, fetchErr := fs.readSmallFileWithRetry(fetchCtx, p)
+			if fetchErr != nil {
+				return nil, fetchErr
+			}
+			// Populate cache inside the flight callback so the entry
+			// is visible before the flight key is released. This closes
+			// the window where a concurrent reader could miss both the
+			// cache and the in-flight dedup.
+			fs.readCache.PutOwned(p, fetchData, cacheRev)
+			return fetchData, nil
+		})
 		if err != nil {
 			source = "small-read-error"
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return nil, gofuse.EINTR
+			}
 			if errors.Is(err, errReadRetriesExhausted) {
 				return nil, gofuse.EIO
 			}
 			return nil, httpToFuseStatus(err)
 		}
-		// Store with the revision from the prior Stat/Lookup.
-		fs.readCache.PutOwned(p, data, cacheRev)
 		offset := int64(input.Offset)
 		if offset >= int64(len(data)) {
 			source = "small-read-eof"
