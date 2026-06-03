@@ -74,6 +74,59 @@ func newTestDat9FS(tb testing.TB, size int64, get func(http.ResponseWriter, *htt
 	return fs, ino, ts.Close
 }
 
+func newTestDat9FSWithRangeObject(tb testing.TB, size int64, object func(http.ResponseWriter, *http.Request)) (*Dat9FS, uint64, func()) {
+	tb.Helper()
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			w.Header().Set("Location", ts.URL+"/object")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object":
+			object(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, size, time.Now())
+	return fs, ino, ts.Close
+}
+
+func newTestDat9FSWithStatAndRangeObject(tb testing.TB, size int64, stat func(http.ResponseWriter, *http.Request), object func(http.ResponseWriter, *http.Request)) (*Dat9FS, uint64, func()) {
+	tb.Helper()
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			stat(w, r)
+		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			w.Header().Set("Location", ts.URL+"/object")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object":
+			object(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, size, time.Now())
+	return fs, ino, ts.Close
+}
+
 func TestInitSynchronouslyWarmsInlineThreshold(t *testing.T) {
 	// Pre-fix this was a goroutine, so the very first FUSE Create/Flush
 	// after mount could see the 50KB fallback even when the server
@@ -728,6 +781,360 @@ func readDat9FSTestBytes(fs *Dat9FS, ino, fh uint64, size int) ([]byte, gofuse.S
 	}
 	data, _ := result.Bytes(buf)
 	return append([]byte(nil), data...), st, nil
+}
+
+func readDat9FSTestRange(fs *Dat9FS, ino, fh uint64, offset int64, size int) ([]byte, gofuse.Status, error) {
+	buf := make([]byte, size)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fh,
+		Offset:   uint64(offset),
+		Size:     uint32(size),
+	}, buf)
+	if st != gofuse.OK {
+		return nil, st, nil
+	}
+	if result == nil {
+		return nil, st, errors.New("nil read result")
+	}
+	data, _ := result.Bytes(buf)
+	return append([]byte(nil), data...), st, nil
+}
+
+func openDat9FSTestHandle(t *testing.T, fs *Dat9FS, ino uint64, path string) uint64 {
+	t.Helper()
+	fh := &FileHandle{Ino: ino, Path: path}
+	return fs.allocateFileHandle(fh)
+}
+
+func waitForDiskReadCacheEntry(t *testing.T, cache *DiskReadCache, key DiskReadCacheKey) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for {
+		if cacheHasPersistedDiskReadCacheEntry(cache, key) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for disk read cache entry")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func cacheHasPersistedDiskReadCacheEntry(cache *DiskReadCache, key DiskReadCacheKey) bool {
+	if cache == nil {
+		return false
+	}
+	digest := key.digest()
+	cache.mu.Lock()
+	_, pending := cache.pending[digest]
+	cache.mu.Unlock()
+	if pending {
+		return false
+	}
+	_, err := readDiskReadCacheFile(cache.pathForDigest(key.digest()), key)
+	return err == nil
+}
+
+func TestDat9FSDiskReadCacheRangeReadThrough(t *testing.T) {
+	const (
+		path = "/file.bin"
+		rev  = int64(7)
+	)
+	data := bytes.Repeat([]byte("x"), defaultReadCacheMaxFileSize+1024)
+	var objectReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		objectReads.Add(1)
+		if got := r.Header.Get("Range"); got != "bytes=128-191" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[128:192])
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	key, ok := fs.diskReadCacheKey(path, mustGetInodeEntry(t, fs, ino), 128, 64)
+	if !ok {
+		t.Fatal("disk read cache key unavailable")
+	}
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 128, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[128:192]) {
+		t.Fatalf("first read = %q, %v; want cached range OK", got, st)
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, key)
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, 128, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[128:192]) {
+		t.Fatalf("second read = %q, %v; want cached range OK", got, st)
+	}
+	if calls := objectReads.Load(); calls != 1 {
+		t.Fatalf("object reads = %d, want 1", calls)
+	}
+}
+
+func TestDat9FSDiskReadCacheRevisionInvalidatesByKey(t *testing.T) {
+	const path = "/file.bin"
+	data := bytes.Repeat([]byte("a"), defaultReadCacheMaxFileSize+1024)
+	var objectReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		call := objectReads.Add(1)
+		if got := r.Header.Get("Range"); got != "bytes=0-2" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		if call == 1 {
+			_, _ = w.Write([]byte("old"))
+			return
+		}
+		_, _ = w.Write([]byte("new"))
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+
+	fs.inodes.UpdateRevision(ino, 1)
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 3)
+	if err != nil || st != gofuse.OK || string(got) != "old" {
+		t.Fatalf("rev1 read = %q, %v, %v; want old OK", got, st, err)
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: 1, Offset: 0, Length: 3})
+
+	fs.inodes.UpdateRevision(ino, 2)
+	got, st, err = readDat9FSTestRange(fs, ino, fh, 0, 3)
+	if err != nil || st != gofuse.OK || string(got) != "new" {
+		t.Fatalf("rev2 read = %q, %v, %v; want new OK", got, st, err)
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: 2, Offset: 0, Length: 3})
+	if calls := objectReads.Load(); calls != 2 {
+		t.Fatalf("object reads = %d, want 2 for revision change", calls)
+	}
+}
+
+func TestDat9FSDiskReadCacheCorruptionRefetches(t *testing.T) {
+	const (
+		path = "/file.bin"
+		rev  = int64(7)
+	)
+	data := bytes.Repeat([]byte("z"), defaultReadCacheMaxFileSize+1024)
+	var objectReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		call := objectReads.Add(1)
+		if got := r.Header.Get("Range"); got != "bytes=0-2" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		if call == 1 {
+			_, _ = w.Write([]byte("bad"))
+			return
+		}
+		_, _ = w.Write([]byte("ok!"))
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: rev, Offset: 0, Length: 3}
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 3)
+	if err != nil || st != gofuse.OK || string(got) != "bad" {
+		t.Fatalf("first read = %q, %v, %v; want bad OK", got, st, err)
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, key)
+	if err := os.WriteFile(fs.diskReadCache.pathForDigest(key.digest()), []byte(`{"file_id":"path:/file.bin","path":"/file.bin","revision":7,"offset":0,"length":3,"size":3,"crc32":1}`+"\nbad"), 0o644); err != nil {
+		t.Fatalf("corrupt disk cache: %v", err)
+	}
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, 0, 3)
+	if err != nil || st != gofuse.OK || string(got) != "ok!" {
+		t.Fatalf("second read = %q, %v, %v; want ok! after refetch", got, st, err)
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, key)
+	if calls := objectReads.Load(); calls != 2 {
+		t.Fatalf("object reads = %d, want 2 after corruption refetch", calls)
+	}
+}
+
+func TestDat9FSDiskReadCacheConcurrentSameKeyDedupsBackendRead(t *testing.T) {
+	const (
+		path    = "/file.bin"
+		rev     = int64(7)
+		readers = 3
+	)
+	data := bytes.Repeat([]byte("q"), defaultReadCacheMaxFileSize+1024)
+	started := make(chan struct{}, readers)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	var objectReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		objectReads.Add(1)
+		if got := r.Header.Get("Range"); got != "bytes=0-63" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		started <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[:64])
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, readers)
+	startReaders := make(chan struct{})
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startReaders
+			got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 64)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if st != gofuse.OK || !bytes.Equal(got, data[:64]) {
+				errs <- fmt.Errorf("Read = %q, %v; want range OK", got, st)
+			}
+		}()
+	}
+	close(startReaders)
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("backend GET did not start")
+	}
+	waitForWaiters(t, fs.readFlight, DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: rev, Offset: 0, Length: 64}.flightKey(), readers-1)
+	releaseOnce.Do(func() { close(release) })
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: rev, Offset: 0, Length: 64})
+	if calls := objectReads.Load(); calls != 1 {
+		t.Fatalf("object reads = %d, want 1", calls)
+	}
+}
+
+func TestDat9FSDiskReadCacheUnverifiedRevisionMatchServesCachedAfterHead(t *testing.T) {
+	const (
+		path = "/file.bin"
+		rev  = int64(7)
+	)
+	var headCalls atomic.Int32
+	var objectReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithStatAndRangeObject(t, defaultReadCacheMaxFileSize+1024, func(w http.ResponseWriter, r *http.Request) {
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", strconv.Itoa(defaultReadCacheMaxFileSize+1024))
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+		w.WriteHeader(http.StatusOK)
+	}, func(w http.ResponseWriter, r *http.Request) {
+		objectReads.Add(1)
+		http.Error(w, "unexpected object read", http.StatusInternalServerError)
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	key := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: rev, Offset: 0, Length: 5}
+	fs.diskReadCache.PutOwned(key, []byte("hello"))
+	fs.markStatCacheUnverified()
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 5)
+	if err != nil || st != gofuse.OK || string(got) != "hello" {
+		t.Fatalf("read = %q, %v, %v; want cached hello OK", got, st, err)
+	}
+	if calls := headCalls.Load(); calls != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", calls)
+	}
+	if calls := objectReads.Load(); calls != 0 {
+		t.Fatalf("object reads = %d, want 0", calls)
+	}
+}
+
+func TestDat9FSDiskReadCacheUnverifiedRevisionMismatchRefetches(t *testing.T) {
+	const path = "/file.bin"
+	const oldRev = int64(7)
+	const newRev = int64(8)
+	var headCalls atomic.Int32
+	var objectReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithStatAndRangeObject(t, defaultReadCacheMaxFileSize+1024, func(w http.ResponseWriter, r *http.Request) {
+		headCalls.Add(1)
+		w.Header().Set("Content-Length", strconv.Itoa(defaultReadCacheMaxFileSize+1024))
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", strconv.FormatInt(newRev, 10))
+		w.WriteHeader(http.StatusOK)
+	}, func(w http.ResponseWriter, r *http.Request) {
+		objectReads.Add(1)
+		if got := r.Header.Get("Range"); got != "bytes=0-4" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte("fresh"))
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.inodes.UpdateRevision(ino, oldRev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	oldKey := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: oldRev, Offset: 0, Length: 5}
+	newKey := DiskReadCacheKey{FileID: pathDiskReadCacheFileID(path), Path: path, Revision: newRev, Offset: 0, Length: 5}
+	fs.diskReadCache.PutOwned(oldKey, []byte("stale"))
+	fs.markStatCacheUnverified()
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 5)
+	if err != nil || st != gofuse.OK || string(got) != "fresh" {
+		t.Fatalf("read = %q, %v, %v; want fresh OK", got, st, err)
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, newKey)
+	if got, ok := fs.diskReadCache.Get(oldKey); ok {
+		t.Fatalf("old revision cache still hit after mismatch: %q", got)
+	}
+	if calls := headCalls.Load(); calls != 1 {
+		t.Fatalf("HEAD calls = %d, want 1", calls)
+	}
+	if calls := objectReads.Load(); calls != 1 {
+		t.Fatalf("object reads = %d, want 1", calls)
+	}
+}
+
+func mustGetInodeEntry(t *testing.T, fs *Dat9FS, ino uint64) *InodeEntry {
+	t.Helper()
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatalf("inode %d missing", ino)
+	}
+	return entry
 }
 
 func TestDat9FSReadSingleFlightSameRevisionDedupsBackendRead(t *testing.T) {

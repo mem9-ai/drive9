@@ -132,6 +132,9 @@ func (w *SSEWatcher) handleReset(resets ...*client.ResetEvent) {
 
 	// 1. Clear all user-space caches.
 	w.fs.readCache.InvalidateAll()
+	if w.fs.diskReadCache != nil {
+		w.fs.diskReadCache.InvalidateAll()
+	}
 	w.fs.clearAllReadTargets()
 	w.fs.dirCache.InvalidateAll()
 

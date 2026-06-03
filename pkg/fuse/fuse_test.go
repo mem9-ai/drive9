@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -2279,4 +2281,139 @@ func BenchmarkReadCache_GetPut(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		benchmarkBytesSink, _ = rc.Get("/test.txt", 1)
 	}
+}
+
+func TestDiskReadCachePutGet(t *testing.T) {
+	cache := newTestDiskReadCache(t, 1<<20)
+	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 4096, Length: 5}
+	cache.PutOwned(key, []byte("hello"))
+
+	got, ok := cache.Get(key)
+	if !ok {
+		t.Fatal("disk read cache miss, want hit")
+	}
+	if string(got) != "hello" {
+		t.Fatalf("cache data = %q, want hello", got)
+	}
+}
+
+func TestDiskReadCachePendingMemoryIsServedAndIsolated(t *testing.T) {
+	cache := newTestDiskReadCache(t, 1<<20)
+	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}
+	digest := key.digest()
+	cache.mu.Lock()
+	cache.pending[digest] = diskReadCachePending{key: key, data: []byte("hello"), seq: 1}
+	cache.mu.Unlock()
+
+	got, ok := cache.Get(key)
+	if !ok {
+		t.Fatal("disk read cache miss, want pending hit")
+	}
+	if string(got) != "hello" {
+		t.Fatalf("pending cache data = %q, want hello", got)
+	}
+	got[0] = 'x'
+	got, ok = cache.Get(key)
+	if !ok || string(got) != "hello" {
+		t.Fatalf("pending cache data after mutation = %q, %v; want isolated hello hit", got, ok)
+	}
+}
+
+func TestDiskReadCacheAsyncPutInvalidatedBeforeCommitDoesNotReappear(t *testing.T) {
+	cache := newTestDiskReadCache(t, 1<<20)
+	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}
+	digest := key.digest()
+	seq := diskReadCacheTempSeq.Add(1)
+	data := []byte("hello")
+
+	cache.mu.Lock()
+	cache.pending[digest] = diskReadCachePending{key: key, data: data, seq: seq}
+	cache.mu.Unlock()
+
+	cache.InvalidateFile("file-1")
+	cache.putOwned(key, data, seq)
+
+	if got, ok := cache.Get(key); ok {
+		t.Fatalf("invalidated async cache entry hit: %q", got)
+	}
+	if _, err := os.Stat(cache.pathForDigest(digest)); !os.IsNotExist(err) {
+		t.Fatalf("invalidated async cache file stat err = %v, want not exists", err)
+	}
+}
+
+func TestDiskReadCacheRevisionMismatchMisses(t *testing.T) {
+	cache := newTestDiskReadCache(t, 1<<20)
+	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}
+	cache.PutOwned(key, []byte("hello"))
+	key.Revision = 8
+
+	if got, ok := cache.Get(key); ok {
+		t.Fatalf("cache hit for different revision: %q", got)
+	}
+}
+
+func TestDiskReadCacheCapacityEvictsLRU(t *testing.T) {
+	cache := newTestDiskReadCache(t, 6)
+	first := DiskReadCacheKey{FileID: "file-1", Path: "/first.bin", Revision: 1, Offset: 0, Length: 4}
+	second := DiskReadCacheKey{FileID: "file-2", Path: "/second.bin", Revision: 1, Offset: 0, Length: 4}
+	cache.PutOwned(first, []byte("1111"))
+	cache.PutOwned(second, []byte("2222"))
+
+	if got, ok := cache.Get(first); ok {
+		t.Fatalf("first cache entry hit after capacity eviction: %q", got)
+	}
+	got, ok := cache.Get(second)
+	if !ok || string(got) != "2222" {
+		t.Fatalf("second cache entry = %q, %v; want 2222 hit", got, ok)
+	}
+}
+
+func TestDiskReadCacheCorruptionMissesAndRemovesEntry(t *testing.T) {
+	cache := newTestDiskReadCache(t, 1<<20)
+	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}
+	cache.PutOwned(key, []byte("hello"))
+	if err := os.WriteFile(cache.pathForDigest(key.digest()), []byte(`{"file_id":"file-1","revision":7,"offset":0,"length":5,"size":5,"crc32":1}`+"\nhello"), 0o644); err != nil {
+		t.Fatalf("corrupt cache entry: %v", err)
+	}
+
+	if got, ok := cache.Get(key); ok {
+		t.Fatalf("corrupt cache entry hit: %q", got)
+	}
+	if cache.Len() != 0 {
+		t.Fatalf("cache Len = %d, want corrupt entry removed", cache.Len())
+	}
+}
+
+func TestDiskReadCacheStartupRecoveryAndTempCleanup(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewDiskReadCache(DiskReadCacheOptions{Dir: dir, MaxSize: 1 << 20, FreeRatio: 0})
+	if err != nil {
+		t.Fatalf("NewDiskReadCache: %v", err)
+	}
+	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}
+	cache.PutOwned(key, []byte("hello"))
+	if err := os.WriteFile(filepath.Join(dir, "orphan.tmp"), []byte("partial"), 0o644); err != nil {
+		t.Fatalf("write temp entry: %v", err)
+	}
+
+	recovered, err := NewDiskReadCache(DiskReadCacheOptions{Dir: dir, MaxSize: 1 << 20, FreeRatio: 0})
+	if err != nil {
+		t.Fatalf("recover DiskReadCache: %v", err)
+	}
+	got, ok := recovered.Get(key)
+	if !ok || string(got) != "hello" {
+		t.Fatalf("recovered cache entry = %q, %v; want hello hit", got, ok)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "orphan.tmp")); !os.IsNotExist(err) {
+		t.Fatalf("orphan temp stat err = %v, want not exists", err)
+	}
+}
+
+func newTestDiskReadCache(t *testing.T, maxSize int64) *DiskReadCache {
+	t.Helper()
+	cache, err := NewDiskReadCache(DiskReadCacheOptions{Dir: t.TempDir(), MaxSize: maxSize, FreeRatio: -1})
+	if err != nil {
+		t.Fatalf("NewDiskReadCache: %v", err)
+	}
+	return cache
 }

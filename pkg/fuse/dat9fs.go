@@ -29,13 +29,14 @@ import (
 type Dat9FS struct {
 	gofuse.RawFileSystem
 
-	client      *client.Client
-	inodes      *InodeToPath
-	fileHandles *HandleTable[*FileHandle]
-	openHandles *OpenHandleIndex
-	dirHandles  *HandleTable[*DirHandle]
-	readCache   *ReadCache
-	dirCache    *DirCache
+	client        *client.Client
+	inodes        *InodeToPath
+	fileHandles   *HandleTable[*FileHandle]
+	openHandles   *OpenHandleIndex
+	dirHandles    *HandleTable[*DirHandle]
+	readCache     *ReadCache
+	diskReadCache *DiskReadCache
+	dirCache      *DirCache
 	// statCacheUnverified is true while the SSE stream is not known-current.
 	// In that state, file stat cache hits embedded in DirCache must fall back
 	// to HEAD revalidation instead of serving TTL-only attrs. Even when the
@@ -1629,7 +1630,50 @@ func (fs *Dat9FS) invalidateReadCacheAndTargetsExcept(p string, skip *FileHandle
 	if fs.readCache != nil {
 		fs.readCache.Invalidate(p)
 	}
+	fs.invalidateDiskReadCacheForPath(p)
 	fs.clearReadTargetsForPathExcept(p, skip)
+}
+
+func (fs *Dat9FS) invalidateDiskReadCacheForPath(p string) {
+	if fs == nil || fs.diskReadCache == nil || p == "" {
+		return
+	}
+	fs.diskReadCache.InvalidateFile(pathDiskReadCacheFileID(p))
+	if fs.inodes != nil {
+		if ino, ok := fs.inodes.GetInode(p); ok {
+			if entry, ok := fs.inodes.GetEntry(ino); ok && entry != nil && entry.ResourceID != "" {
+				fs.diskReadCache.InvalidateFile(entry.ResourceID)
+			}
+		}
+	}
+}
+
+func (fs *Dat9FS) invalidateDiskReadCachePrefix(prefix string) {
+	if fs == nil || fs.diskReadCache == nil || prefix == "" {
+		return
+	}
+	fs.diskReadCache.InvalidatePathPrefix(prefix)
+}
+
+func diskReadCacheFileID(p string, entry *InodeEntry) string {
+	if entry != nil && entry.ResourceID != "" {
+		return entry.ResourceID
+	}
+	return pathDiskReadCacheFileID(p)
+}
+
+func (fs *Dat9FS) diskReadCacheKey(p string, entry *InodeEntry, offset, size int64) (DiskReadCacheKey, bool) {
+	if fs == nil || fs.diskReadCache == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || offset < 0 || size <= 0 {
+		return DiskReadCacheKey{}, false
+	}
+	key := DiskReadCacheKey{
+		FileID:   diskReadCacheFileID(p, entry),
+		Path:     p,
+		Revision: entry.Revision,
+		Offset:   offset,
+		Length:   size,
+	}
+	return key, key.valid()
 }
 
 // readStreamRangeWithRetry performs a range read with bounded detached retry
@@ -1683,6 +1727,31 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, fh 
 		fs.perf.readRetryExhausted.add(1)
 	}
 	return nil, 0, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
+}
+
+func (fs *Dat9FS) readDiskCachedRange(ctx context.Context, path string, fh *FileHandle, key DiskReadCacheKey) ([]byte, int, error) {
+	data, err, _ := fs.readFlight.Do(ctx, key.flightKey(), func() ([]byte, error) {
+		if cached, ok := fs.diskReadCache.Get(key); ok {
+			return cached, nil
+		}
+		fetchCtx, fetchCancel := detachedSharedReadCtx(ctx, fs.remoteReadTimeout)
+		defer fetchCancel()
+		releaseReadSlot, slotErr := fs.acquireRemoteReadSlot(fetchCtx)
+		if slotErr != nil {
+			return nil, slotErr
+		}
+		defer releaseReadSlot()
+		fetchData, _, fetchErr := fs.readStreamRangeWithRetry(fetchCtx, path, fh, key.Offset, key.Length)
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		fs.diskReadCache.PutAsync(key, fetchData)
+		return fetchData, nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return data, len(data), nil
 }
 
 // doRangeRead performs a single range read attempt: open stream + read body.
@@ -1991,6 +2060,50 @@ func (fs *Dat9FS) statCacheTrustedAndVerified() bool {
 		return false
 	}
 	return fs.statCacheVerified()
+}
+
+func (fs *Dat9FS) updateEntryFromStat(entry *InodeEntry, stat *client.StatResult) *InodeEntry {
+	if fs == nil || entry == nil || stat == nil {
+		return entry
+	}
+	entry.Size = stat.Size
+	entry.IsDir = stat.IsDir
+	fs.inodes.UpdateSize(entry.Ino, stat.Size)
+	if stat.ResourceID != "" || stat.Nlink > 0 {
+		fs.inodes.SetIdentity(entry.Ino, stat.ResourceID, stat.Nlink)
+		entry.ResourceID = stat.ResourceID
+		entry.Nlink = stat.Nlink
+	}
+	if stat.Revision > 0 {
+		entry.Revision = stat.Revision
+		fs.inodes.UpdateRevision(entry.Ino, stat.Revision)
+	}
+	if stat.HasMode {
+		entry.Mode = stat.Mode
+		entry.HasMode = true
+		fs.inodes.UpdateMode(entry.Ino, stat.Mode)
+	}
+	if !stat.Mtime.IsZero() {
+		entry.Mtime = stat.Mtime
+		fs.inodes.UpdateMtime(entry.Ino, stat.Mtime)
+	}
+	return entry
+}
+
+func (fs *Dat9FS) revalidateReadCacheEntryIfUnverified(cancel <-chan struct{}, p string, entry *InodeEntry) (*InodeEntry, error) {
+	if fs == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || fs.statCacheVerified() {
+		return entry, nil
+	}
+	cachedRevision := entry.Revision
+	stat, err := fs.getAttrStatWithRetry(cancel, p)
+	if err != nil {
+		return nil, err
+	}
+	entry = fs.updateEntryFromStat(entry, stat)
+	if stat == nil || stat.IsDir || stat.Revision <= 0 || stat.Revision != cachedRevision {
+		fs.invalidateReadCacheAndTargets(p)
+	}
+	return entry, nil
 }
 
 func (fs *Dat9FS) cacheNegativePath(p string) {
@@ -3681,6 +3794,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	fs.inodes.Remove(childP)
 	fs.dirCache.InvalidatePrefix(childP)
 	fs.readCache.InvalidatePrefix(childP + "/")
+	fs.invalidateDiskReadCachePrefix(childP + "/")
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Remove(parentPath, name)
@@ -3844,6 +3958,8 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	fs.invalidateReadCacheAndTargets(newP)
 	fs.readCache.InvalidatePrefix(oldP + "/")
 	fs.readCache.InvalidatePrefix(newP + "/")
+	fs.invalidateDiskReadCachePrefix(oldP + "/")
+	fs.invalidateDiskReadCachePrefix(newP + "/")
 
 	oldParent, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Remove(oldParent, path.Base(oldP))
@@ -5173,6 +5289,13 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	p := fh.Path
+	entry, _ := fs.inodes.GetEntry(fh.Ino)
+	if refreshed, err := fs.revalidateReadCacheEntryIfUnverified(cancel, p, entry); err != nil {
+		source = "read-cache-revalidate-error"
+		return nil, httpToFuseStatus(err)
+	} else {
+		entry = refreshed
+	}
 
 	// Try prefetcher for large read-only files
 	if fh.Prefetch != nil {
@@ -5199,7 +5322,6 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// Try read cache for small files. Use revision-aware cache: if the
 	// InodeEntry has a stored revision from the last Lookup/GetAttr, pass
 	// it to the cache for validation. Cache hit only if revision matches.
-	entry, _ := fs.inodes.GetEntry(fh.Ino)
 	if entry != nil && entry.Size <= fs.readCache.MaxFileSize() && entry.Size > 0 {
 		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
@@ -5277,6 +5399,43 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		source = "small-read"
 		bytesRead = int(end - offset)
 		return gofuse.ReadResultData(data[offset:end]), gofuse.OK
+	}
+
+	rangeOffset := int64(input.Offset)
+	rangeSize := int64(input.Size)
+	if key, ok := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize); ok {
+		if data, ok := fs.diskReadCache.Get(key); ok {
+			if fs.perf != nil {
+				fs.perf.readCacheHit.add(1)
+			}
+			source = "disk-read-cache-hit"
+			bytesRead = len(data)
+			if fh.Prefetch != nil {
+				fh.Prefetch.OnRead(rangeOffset, len(data))
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
+		if fs.perf != nil {
+			fs.perf.readCacheMiss.add(1)
+		}
+		source = "disk-read-cache-miss"
+		rangeStart := time.Now()
+		data, n, err := fs.readDiskCachedRange(ctx, p, fh, key)
+		if err != nil {
+			fs.debugf("read disk-cache range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
+			if errors.Is(err, errReadRetriesExhausted) {
+				return nil, gofuse.EIO
+			}
+			return nil, httpToFuseStatus(err)
+		}
+		if fs.debugEnabled() && time.Since(rangeStart) >= fuseDebugSlowReadThreshold {
+			fs.debugf("read disk-cache range done path=%s off=%d req=%d got=%d source=%s dur=%s", p, input.Offset, input.Size, n, source, time.Since(rangeStart))
+		}
+		bytesRead = n
+		if fh.Prefetch != nil {
+			fh.Prefetch.OnRead(rangeOffset, n)
+		}
+		return gofuse.ReadResultData(data), gofuse.OK
 	}
 
 	// Large file or unknown size: range read (avoids O(offset) discard).

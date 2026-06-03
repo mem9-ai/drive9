@@ -90,6 +90,8 @@ func fsMountCmd(args []string) error {
 	cacheDir := fs.String("cache-dir", "", "write-back cache directory (default ~/.cache/drive9)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 1, "maximum single file size admitted to read cache in MB")
+	diskReadCacheSize := fs.Int64("disk-read-cache-size-mb", 1024, "disk-backed read cache size in MB")
+	diskReadCacheFreeRatio := fs.Float64("disk-read-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before disk read cache evicts")
 	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
 	attrTTL := fs.Duration("attr-ttl", 10*time.Second, "kernel attr cache TTL")
 	entryTTL := fs.Duration("entry-ttl", 10*time.Second, "kernel entry cache TTL")
@@ -185,6 +187,12 @@ func fsMountCmd(args []string) error {
 	if *readCacheMaxFile <= 0 {
 		return fmt.Errorf("drive9 mount: --read-cache-max-file-mb must be > 0")
 	}
+	if *diskReadCacheSize <= 0 {
+		return fmt.Errorf("drive9 mount: --disk-read-cache-size-mb must be > 0")
+	}
+	if *diskReadCacheFreeRatio < 0 || *diskReadCacheFreeRatio >= 1 {
+		return fmt.Errorf("drive9 mount: --disk-read-cache-free-ratio must be >= 0 and < 1")
+	}
 	normalizedLookupRetryCount := lookupRetryCountFlagValue(lookupRetryCountGiven, *lookupRetryCount)
 	normalizedLookupRetryTimeout := durationFlagValue(fs, "lookup-retry-timeout", *lookupRetryTimeout)
 	normalizedDirTTL := durationFlagValue(fs, "dir-ttl", *dirTTL)
@@ -257,40 +265,42 @@ func fsMountCmd(args []string) error {
 
 	// FUSE path (existing behavior).
 	opts := &mountFuseOptions{
-		Server:                *server,
-		APIKey:                *apiKey,
-		Token:                 token,
-		MountPoint:            mountPoint,
-		RemoteRoot:            remoteRoot,
-		CacheDir:              *cacheDir,
-		CacheSize:             int64(*cacheSize) << 20,
-		ReadCacheMaxFileBytes: *readCacheMaxFile << 20,
-		DirTTL:                normalizedDirTTL,
-		AttrTTL:               normalizedAttrTTL,
-		EntryTTL:              normalizedEntryTTL,
-		FlushDebounce:         *flushDebounce,
-		LookupRetryCount:      normalizedLookupRetryCount,
-		LookupRetryTimeout:    normalizedLookupRetryTimeout,
-		LegacyDirStatFallback: *legacyDirStatFallback,
-		ReadDirPrefetch:       *readDirPrefetch,
-		PrefetchMaxFiles:      *prefetchMaxFiles,
-		PrefetchMaxFileBytes:  *prefetchMaxFileBytes,
-		PrefetchMaxBytes:      *prefetchMaxBytes,
-		PrefetchTimeout:       *prefetchTimeout,
-		TrustLocalEvents:      *trustProcessLocalEvents,
-		SyncMode:              syncModeVal,
-		WritePolicy:           writePolicyVal,
-		Profile:               *profile,
-		LocalRoot:             normalizedLocalRoot,
-		LocalOnlyPatterns:     append([]string(nil), localOnlyPatterns...),
-		RemoteOnlyPatterns:    append([]string(nil), remoteOnlyPatterns...),
-		UploadConcurrency:     *uploadConcurrency,
-		ReadConcurrency:       *readConcurrency,
-		SyncRead:              *syncRead,
-		AllowOther:            *allowOther,
-		ReadOnly:              *readOnly,
-		Debug:                 *debug,
-		PerfCounters:          *perfCounters,
+		Server:                 *server,
+		APIKey:                 *apiKey,
+		Token:                  token,
+		MountPoint:             mountPoint,
+		RemoteRoot:             remoteRoot,
+		CacheDir:               *cacheDir,
+		CacheSize:              int64(*cacheSize) << 20,
+		ReadCacheMaxFileBytes:  *readCacheMaxFile << 20,
+		DiskReadCacheSize:      *diskReadCacheSize << 20,
+		DiskReadCacheFreeRatio: *diskReadCacheFreeRatio,
+		DirTTL:                 normalizedDirTTL,
+		AttrTTL:                normalizedAttrTTL,
+		EntryTTL:               normalizedEntryTTL,
+		FlushDebounce:          *flushDebounce,
+		LookupRetryCount:       normalizedLookupRetryCount,
+		LookupRetryTimeout:     normalizedLookupRetryTimeout,
+		LegacyDirStatFallback:  *legacyDirStatFallback,
+		ReadDirPrefetch:        *readDirPrefetch,
+		PrefetchMaxFiles:       *prefetchMaxFiles,
+		PrefetchMaxFileBytes:   *prefetchMaxFileBytes,
+		PrefetchMaxBytes:       *prefetchMaxBytes,
+		PrefetchTimeout:        *prefetchTimeout,
+		TrustLocalEvents:       *trustProcessLocalEvents,
+		SyncMode:               syncModeVal,
+		WritePolicy:            writePolicyVal,
+		Profile:                *profile,
+		LocalRoot:              normalizedLocalRoot,
+		LocalOnlyPatterns:      append([]string(nil), localOnlyPatterns...),
+		RemoteOnlyPatterns:     append([]string(nil), remoteOnlyPatterns...),
+		UploadConcurrency:      *uploadConcurrency,
+		ReadConcurrency:        *readConcurrency,
+		SyncRead:               *syncRead,
+		AllowOther:             *allowOther,
+		ReadOnly:               *readOnly,
+		Debug:                  *debug,
+		PerfCounters:           *perfCounters,
 	}
 
 	return mountFuse(opts)
