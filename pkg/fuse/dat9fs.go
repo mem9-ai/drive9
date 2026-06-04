@@ -1891,6 +1891,9 @@ func (fs *Dat9FS) readDiskCachedRangeWithContext(ctx context.Context, path strin
 		if fetchErr != nil {
 			return nil, fetchErr
 		}
+		if int64(len(fetchData)) != key.Length {
+			return nil, io.ErrUnexpectedEOF
+		}
 		fs.diskReadCache.PutAsync(key, fetchData)
 		return fetchData, nil
 	})

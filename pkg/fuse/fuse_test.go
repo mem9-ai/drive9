@@ -2611,6 +2611,26 @@ func TestDiskReadCachePendingMemoryIsServedAndIsolated(t *testing.T) {
 	}
 }
 
+func TestDiskReadCacheRejectsLengthMismatch(t *testing.T) {
+	cache := newTestDiskReadCache(t, 1<<20)
+	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}
+
+	cache.Put(key, []byte("hey"))
+	if got, ok := cache.Get(key); ok {
+		t.Fatalf("disk read cache hit after short Put = %q, want miss", got)
+	}
+
+	cache.PutAsync(key, []byte("hey"))
+	if got, ok := cache.Get(key); ok {
+		t.Fatalf("disk read cache pending hit after short PutAsync = %q, want miss", got)
+	}
+
+	cache.PutOwned(key, []byte("hello"))
+	if got, ok := cache.Get(key); !ok || string(got) != "hello" {
+		t.Fatalf("disk read cache full PutOwned = %q, %v; want hello hit", got, ok)
+	}
+}
+
 func TestDiskReadCacheAsyncPutInvalidatedBeforeCommitDoesNotReappear(t *testing.T) {
 	cache := newTestDiskReadCache(t, 1<<20)
 	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}

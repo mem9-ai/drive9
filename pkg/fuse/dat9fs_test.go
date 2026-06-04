@@ -991,6 +991,52 @@ func TestDat9FSParallelDiskReadFetchesBlocksInParallelAndCaches(t *testing.T) {
 	}
 }
 
+func TestDat9FSDiskReadCacheRejectsShortBackendResponse(t *testing.T) {
+	const (
+		path      = "/file.bin"
+		rev       = int64(7)
+		blockSize = int64(64)
+	)
+	data := bytes.Repeat([]byte("a"), int(blockSize))
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, blockSize, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Range"); got != "bytes=0-63" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[:blockSize/2])
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.readCache = NewReadCacheWithMaxFileSize(1<<20, 0, 1)
+	fs.opts.ParallelReadBlockSize = blockSize
+	fs.opts.ParallelReadConcurrency = 2
+	fs.inodes.UpdateRevision(ino, rev)
+	fhID := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fhID)
+	fh, ok := fs.fileHandles.Get(fhID)
+	if !ok {
+		t.Fatal("file handle missing")
+	}
+	entry := mustGetInodeEntry(t, fs, ino)
+	key, ok := fs.diskReadCacheKey(path, entry, 0, blockSize)
+	if !ok {
+		t.Fatal("disk cache block key unavailable")
+	}
+
+	got, _, err := fs.readDiskCachedRange(context.Background(), path, fh, key)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("readDiskCachedRange error = %v, want unexpected EOF", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("readDiskCachedRange data len = %d, want 0 on short response", len(got))
+	}
+	if cached, ok := fs.diskReadCache.Get(key); ok {
+		t.Fatalf("disk read cache hit after short backend response = len %d, want miss", len(cached))
+	}
+}
+
 func TestDat9FSParallelDiskReadHandlesPartialFinalBlock(t *testing.T) {
 	const (
 		path      = "/file.bin"
