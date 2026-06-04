@@ -25,7 +25,8 @@ type InodeEntry struct {
 	HasGID     bool
 	Mode       uint32 // permission bits
 	HasMode    bool   // true when mode is explicitly known (including 0)
-	Revision   int64  // server-side revision for cache validation
+	Rdev       uint32
+	Revision   int64 // server-side revision for cache validation
 }
 
 // InodeToPath provides a bidirectional mapping between inode numbers and
@@ -427,6 +428,16 @@ func (m *InodeToPath) UpdateRevision(ino uint64, revision int64) {
 // UpdateMode updates the permission bits of the entry identified by ino.
 func (m *InodeToPath) UpdateMode(ino uint64, mode uint32) {
 	m.SetModeState(ino, mode, true)
+}
+
+// UpdateRdev updates the device number of the entry identified by ino.
+func (m *InodeToPath) UpdateRdev(ino uint64, rdev uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Rdev = rdev
+	}
 }
 
 // SetModeState updates both permission bits and whether they are authoritative.

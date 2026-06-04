@@ -2769,6 +2769,115 @@ func TestSetAttrModeUpdatesPendingMetadataWithoutRemoteChmod(t *testing.T) {
 	}
 }
 
+func TestMknodMetadataOnlySpecialNodeLifecycle(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		if r.Method == http.MethodHead {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "unexpected remote mutation", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	var out gofuse.EntryOut
+	st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{
+			NodeId: 1,
+			Caller: gofuse.Caller{
+				Owner: gofuse.Owner{Uid: 65534, Gid: 65533},
+			},
+		},
+		Mode: uint32(syscall.S_IFIFO) | 0o644,
+		Rdev: 12,
+	}, "pipe", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 1 {
+		t.Fatalf("remote calls after Mknod = %d, want one HEAD probe", got)
+	}
+	if got, want := out.Mode&uint32(syscall.S_IFMT), uint32(syscall.S_IFIFO); got != want {
+		t.Fatalf("Mknod kind = %o, want %o", got, want)
+	}
+	if got, want := out.Mode&0o7777, uint32(0o644); got != want {
+		t.Fatalf("Mknod mode = %o, want %o", got, want)
+	}
+	if out.Uid != 65534 || out.Gid != 65533 {
+		t.Fatalf("Mknod owner = %d:%d, want 65534:65533", out.Uid, out.Gid)
+	}
+	if out.Rdev != 12 {
+		t.Fatalf("Mknod rdev = %d, want 12", out.Rdev)
+	}
+
+	var lookup gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "pipe", &lookup)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 1 {
+		t.Fatalf("remote calls after Lookup = %d, want unchanged", got)
+	}
+
+	var attr gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: out.NodeId},
+			Valid:    gofuse.FATTR_MODE | gofuse.FATTR_UID | gofuse.FATTR_GID,
+			Mode:     0o6755,
+			Owner:    gofuse.Owner{Uid: 123, Gid: 456},
+		},
+	}, &attr)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if got, want := attr.Mode&uint32(syscall.S_IFMT), uint32(syscall.S_IFIFO); got != want {
+		t.Fatalf("SetAttr kind = %o, want %o", got, want)
+	}
+	if got, want := attr.Mode&0o7777, uint32(0o6755); got != want {
+		t.Fatalf("SetAttr mode = %o, want %o", got, want)
+	}
+	if attr.Uid != 123 || attr.Gid != 456 {
+		t.Fatalf("SetAttr owner = %d:%d, want 123:456", attr.Uid, attr.Gid)
+	}
+	if got := remoteCalls.Load(); got != 1 {
+		t.Fatalf("remote calls after SetAttr = %d, want unchanged", got)
+	}
+
+	entries := fs.mergePendingDirEntries("/", nil)
+	var listed bool
+	for _, e := range entries {
+		if e.Name == "pipe" {
+			listed = true
+			if got, want := e.Mode&uint32(syscall.S_IFMT), uint32(syscall.S_IFIFO); got != want {
+				t.Fatalf("dir entry kind = %o, want %o", got, want)
+			}
+		}
+	}
+	if !listed {
+		t.Fatal("special node missing from listDir")
+	}
+
+	st = fs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "pipe", "renamed-pipe")
+	if st != gofuse.OK {
+		t.Fatalf("Rename status = %v, want OK", st)
+	}
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "renamed-pipe", &lookup)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup renamed status = %v, want OK", st)
+	}
+
+	st = fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "renamed-pipe")
+	if st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if _, ok := fs.specialNodeEntry("/renamed-pipe"); ok {
+		t.Fatal("special node still present after unlink")
+	}
+}
+
 func TestGetAttrRevalidatesDirCacheStatWhenSSEUnverified(t *testing.T) {
 	var headCalls atomic.Int32
 	var handlerErrors testErrorRecorder

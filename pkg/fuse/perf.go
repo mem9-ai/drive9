@@ -27,6 +27,7 @@ const (
 	perfFuseRelease
 	perfFuseCreate
 	perfFuseMkdir
+	perfFuseMknod
 	perfFuseUnlink
 	perfFuseRmdir
 	perfFuseRename
@@ -52,6 +53,7 @@ var perfFuseOpNames = [...]string{
 	perfFuseRelease:     "release",
 	perfFuseCreate:      "create",
 	perfFuseMkdir:       "mkdir",
+	perfFuseMknod:       "mknod",
 	perfFuseUnlink:      "unlink",
 	perfFuseRmdir:       "rmdir",
 	perfFuseRename:      "rename",

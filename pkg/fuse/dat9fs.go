@@ -51,6 +51,8 @@ type Dat9FS struct {
 	dirtyInodes         map[uint64]dirtyInodeState
 	dirtySeq            uint64
 	modeSeq             atomic.Uint64
+	specialMu           sync.RWMutex
+	specialByPath       map[string]uint64
 	uid                 uint32
 	gid                 uint32
 	opts                *MountOptions
@@ -218,6 +220,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
 		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
 		dirtyInodes:       make(map[uint64]dirtyInodeState),
+		specialByPath:     make(map[string]uint64),
 		uid:               uint32(os.Getuid()),
 		gid:               uint32(os.Getgid()),
 		opts:              opts,
@@ -1308,7 +1311,14 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 		if !entry.HasMode {
 			mode = 0644
 		}
-		out.Mode = syscall.S_IFREG | (mode & posixPermissionModeMask)
+		fileKind := uint32(syscall.S_IFREG)
+		if entry.HasMode {
+			if kind := mode & fileKindModeMask; kind != 0 {
+				fileKind = kind
+			}
+		}
+		out.Mode = fileKind | (mode & posixPermissionModeMask)
+		out.Rdev = entry.Rdev
 		out.Nlink = entry.Nlink
 		if out.Nlink == 0 {
 			out.Nlink = 1
@@ -1336,8 +1346,10 @@ func dirEntryMode(isDir, hasMode bool, mode uint32) uint32 {
 	if hasMode {
 		perm = mode & posixPermissionModeMask
 	}
-	if hasMode && isSymlinkMode(mode) {
-		return uint32(syscall.S_IFLNK) | perm
+	if hasMode {
+		if kind := mode & fileKindModeMask; kind != 0 {
+			return kind | perm
+		}
 	}
 	return uint32(syscall.S_IFREG) | perm
 }
@@ -2565,6 +2577,12 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	if entry, ok := fs.specialNodeEntry(childP); ok {
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
 	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
 		if st != gofuse.OK {
 			return st
@@ -2734,6 +2752,9 @@ func (fs *Dat9FS) shouldPreserveForgottenInode(entry *InodeEntry) bool {
 	if entry == nil {
 		return false
 	}
+	if entryIsMetadataOnlySpecial(entry) {
+		return true
+	}
 	if fs.hasOpenHandle(entry.Ino, entry.Path) {
 		return true
 	}
@@ -2869,6 +2890,11 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	if entryIsMetadataOnlySpecial(entry) {
+		fs.fillAttr(entry, &out.Attr)
+		out.SetTimeout(fs.opts.AttrTTL)
+		return gofuse.OK
+	}
 	if overlay, local, st := fs.localOverlayForPath(ctx, entry.Path); local {
 		if st != gofuse.OK {
 			return st
@@ -3053,6 +3079,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	if entryIsMetadataOnlySpecial(entry) {
+		return fs.setMetadataOnlySpecialAttr(input, entry, out)
+	}
 	if overlay, local, st := fs.localOverlayForPath(ctx, entry.Path); local {
 		if st != gofuse.OK {
 			return st
@@ -3352,6 +3381,110 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 }
 
 // --- Directory operations ----------------------------------------------------
+
+func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseMknod, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
+
+	childP, st := fs.childPath(input.NodeId, name)
+	if st != gofuse.OK {
+		return st
+	}
+
+	mode := metadataNodeMode(input.Mode)
+	switch mode & fileKindModeMask {
+	case 0, syscall.S_IFREG:
+		return fs.mknodRegular(cancel, input, name, childP, mode, out)
+	}
+	if !metadataOnlySpecialMode(mode) {
+		return gofuse.Status(syscall.ENOTSUP)
+	}
+	if _, ok := fs.specialNodeEntry(childP); ok {
+		return gofuse.Status(syscall.EEXIST)
+	}
+	if fs.hasPendingLocalState(childP) || fs.hasQueuedCommit(childP) {
+		return gofuse.Status(syscall.EEXIST)
+	}
+	if exists, err := fs.remotePathExistsDetached(childP); err != nil {
+		return httpToFuseStatus(err)
+	} else if exists {
+		return gofuse.Status(syscall.EEXIST)
+	}
+
+	now := time.Now()
+	ino := fs.inodes.Lookup(childP, false, 0, now)
+	fs.inodes.UpdateMode(ino, mode)
+	fs.inodes.UpdateRdev(ino, input.Rdev)
+	fs.inodes.UpdateOwner(ino, input.Caller.Uid, input.Caller.Gid, true, true)
+	fs.inodes.UpdateAtime(ino, now)
+	fs.inodes.UpdateMtime(ino, now)
+	fs.inodes.UpdateCtime(ino, now)
+	fs.addSpecialNode(childP, ino)
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		return gofuse.EIO
+	}
+	parentPath, _ := fs.inodes.GetPath(input.NodeId)
+	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.fillEntryOut(entry, out)
+	return gofuse.OK
+}
+
+func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, name, childP string, mode uint32, out *gofuse.EntryOut) gofuse.Status {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
+	writeStart := fs.perfStart()
+	err := fs.client.WriteCtxConditional(ctx, fs.remotePath(childP), nil, 0)
+	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+
+	perm := mode & posixPermissionModeMask
+	if perm != defaultRegularFileMode {
+		chmodStart := fs.perfStart()
+		err = fs.client.ChmodCtx(ctx, fs.remotePath(childP), perm)
+		fs.perfRecordRemote(perfRemoteMutation, chmodStart, err, 0)
+		if err != nil {
+			return httpToFuseStatus(err)
+		}
+	}
+
+	mtime := time.Now()
+	var revision int64
+	var resourceID string
+	var nlink uint32
+	statStart := fs.perfStart()
+	stat, statErr := fs.client.StatCtx(ctx, fs.remotePath(childP))
+	fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
+	if statErr == nil && stat != nil {
+		if !stat.Mtime.IsZero() {
+			mtime = stat.Mtime
+		}
+		revision = stat.Revision
+		resourceID = stat.ResourceID
+		nlink = stat.Nlink
+	}
+
+	ino := fs.inodes.LookupWithIdentity(childP, resourceID, nlink, false, 0, mtime)
+	if revision > 0 {
+		fs.inodes.UpdateRevision(ino, revision)
+	}
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|perm)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		return gofuse.EIO
+	}
+	parentPath, _ := fs.inodes.GetPath(input.NodeId)
+	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.fillEntryOut(entry, out)
+	return gofuse.OK
+}
 
 func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
@@ -3680,6 +3813,14 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	childP, st := fs.childPath(header.NodeId, name)
 	if st != gofuse.OK {
 		return st
+	}
+	if _, ok := fs.specialNodeEntry(childP); ok {
+		fs.removeSpecialNode(childP)
+		fs.inodes.RemoveLink(childP)
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Remove(parentPath, name)
+		fs.cacheNegativePath(childP)
+		return gofuse.OK
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
@@ -4158,6 +4299,32 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		return st
 	}
 	if oldP == newP {
+		return gofuse.OK
+	}
+	if _, ok := fs.specialNodeEntry(oldP); ok {
+		if _, targetSpecial := fs.specialNodeEntry(newP); !targetSpecial {
+			if fs.hasPendingLocalState(newP) || fs.hasQueuedCommit(newP) {
+				return gofuse.Status(syscall.EEXIST)
+			}
+			if exists, err := fs.remotePathExistsDetached(newP); err != nil {
+				return httpToFuseStatus(err)
+			} else if exists {
+				return gofuse.Status(syscall.EEXIST)
+			}
+		}
+		fs.removeSpecialNode(newP)
+		fs.inodes.RemoveLink(newP)
+		if !fs.renameSpecialNode(oldP, newP) {
+			return gofuse.ENOENT
+		}
+		fs.inodes.Rename(oldP, newP)
+		oldParent, _ := fs.inodes.GetPath(input.NodeId)
+		newParent, _ := fs.inodes.GetPath(input.Newdir)
+		fs.dirCache.Remove(oldParent, oldName)
+		if entry, ok := fs.specialNodeEntry(newP); ok {
+			fs.dirCache.Upsert(newParent, cachedInfoFromEntry(newName, entry))
+		}
+		fs.cacheNegativePath(oldP)
 		return gofuse.OK
 	}
 	oldLayer := fs.observePathPolicyWithContext(ctx, oldP)
@@ -4672,6 +4839,7 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 		}
 	}
 
+	entries = append(entries, fs.specialNodeDirEntries(dirPath, existing)...)
 	return entries
 }
 
@@ -4924,6 +5092,9 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	if entry != nil {
 		if entryIsSymlink(entry) {
 			return gofuse.Status(syscall.ELOOP)
+		}
+		if entryIsMetadataOnlySpecial(entry) {
+			return gofuse.Status(syscall.ENXIO)
 		}
 		fh.OrigSize = entry.Size
 		fh.BaseRev = entry.Revision
