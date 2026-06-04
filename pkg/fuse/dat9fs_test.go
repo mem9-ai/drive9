@@ -2992,6 +2992,103 @@ func TestMknodMetadataOnlySpecialNodeLifecycle(t *testing.T) {
 	}
 }
 
+func TestMknodMetadataOnlySpecialUsesNegativeCacheForStaleRemoteStat(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		if r.Method == http.MethodHead && r.URL.Path == "/v1/fs/stale" {
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Error(w, "unexpected remote call", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	fs.cacheNegativePath("/stale")
+
+	var out gofuse.EntryOut
+	st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFIFO) | 0o644,
+	}, "stale", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+	if _, ok := fs.specialNodeEntry("/stale"); !ok {
+		t.Fatal("special node missing")
+	}
+}
+
+func TestLinkMetadataOnlySpecialNodeCreatesLocalAlias(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		if r.Method == http.MethodHead {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "unexpected remote mutation", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	var out gofuse.EntryOut
+	st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFIFO) | 0o644,
+	}, "pipe", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+
+	var linkOut gofuse.EntryOut
+	st = fs.Link(nil, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: out.NodeId,
+	}, "pipe-link", &linkOut)
+	if st != gofuse.OK {
+		t.Fatalf("Link status = %v, want OK", st)
+	}
+	if got := linkOut.NodeId; got != out.NodeId {
+		t.Fatalf("link node id = %d, want %d", got, out.NodeId)
+	}
+	if got := linkOut.Nlink; got != 2 {
+		t.Fatalf("link nlink = %d, want 2", got)
+	}
+	if _, ok := fs.specialNodeEntry("/pipe-link"); !ok {
+		t.Fatal("linked special node missing")
+	}
+
+	var lookup gofuse.EntryOut
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "pipe", &lookup)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := lookup.Nlink; got != 2 {
+		t.Fatalf("source nlink = %d, want 2", got)
+	}
+
+	st = fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "pipe-link")
+	if st != gofuse.OK {
+		t.Fatalf("Unlink alias status = %v, want OK", st)
+	}
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "pipe", &lookup)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup after unlink status = %v, want OK", st)
+	}
+	if got := lookup.Nlink; got != 1 {
+		t.Fatalf("source nlink after unlink = %d, want 1", got)
+	}
+	if got := remoteCalls.Load(); got != 2 {
+		t.Fatalf("remote calls = %d, want HEAD probes only", got)
+	}
+}
+
 func TestSetAttrModeRejectsNonOwnerMetadataOnlySpecialNode(t *testing.T) {
 	var remoteCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -3049,6 +3146,342 @@ func TestSetAttrModeRejectsNonOwnerMetadataOnlySpecialNode(t *testing.T) {
 	}
 	if !entry.Ctime.Equal(oldCTime) {
 		t.Fatalf("ctime = %v, want unchanged %v", entry.Ctime, oldCTime)
+	}
+}
+
+func TestRenameRejectsStickySourceParentWhenCallerOwnsNeitherParentNorSource(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "rename should fail before remote mutation", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	stickyIno := fs.inodes.Lookup("/sticky", true, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(stickyIno, uint32(syscall.S_IFDIR)|0o1777)
+	fs.inodes.UpdateOwner(stickyIno, 0, 0, true, true)
+	dstIno := fs.inodes.Lookup("/dst", true, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(dstIno, uint32(syscall.S_IFDIR)|0o777)
+	fs.inodes.UpdateOwner(dstIno, 65534, 65534, true, true)
+	srcIno := fs.inodes.Lookup("/sticky/file", false, 1, time.Unix(10, 0))
+	fs.inodes.UpdateMode(srcIno, uint32(syscall.S_IFREG)|0o644)
+	fs.inodes.UpdateOwner(srcIno, 0, 0, true, true)
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{
+			NodeId: stickyIno,
+			Caller: gofuse.Caller{
+				Owner: gofuse.Owner{Uid: 65534, Gid: 65534},
+			},
+		},
+		Newdir: dstIno,
+	}, "file", "file")
+	if st != gofuse.EPERM {
+		t.Fatalf("Rename status = %v, want EPERM", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+	if _, ok := fs.inodes.GetInode("/sticky/file"); !ok {
+		t.Fatal("source inode should remain after rejected rename")
+	}
+}
+
+func TestRenameRejectsStickyTargetParentWhenCallerOwnsNeitherParentNorTarget(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "rename should fail before remote mutation", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	srcParentIno := fs.inodes.Lookup("/src", true, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(srcParentIno, uint32(syscall.S_IFDIR)|0o777)
+	fs.inodes.UpdateOwner(srcParentIno, 65534, 65534, true, true)
+	stickyIno := fs.inodes.Lookup("/sticky", true, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(stickyIno, uint32(syscall.S_IFDIR)|0o1777)
+	fs.inodes.UpdateOwner(stickyIno, 0, 0, true, true)
+	srcIno := fs.inodes.Lookup("/src/file", false, 1, time.Unix(10, 0))
+	fs.inodes.UpdateMode(srcIno, uint32(syscall.S_IFREG)|0o644)
+	fs.inodes.UpdateOwner(srcIno, 65534, 65534, true, true)
+	targetIno := fs.inodes.Lookup("/sticky/target", false, 1, time.Unix(10, 0))
+	fs.inodes.UpdateMode(targetIno, uint32(syscall.S_IFREG)|0o644)
+	fs.inodes.UpdateOwner(targetIno, 0, 0, true, true)
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{
+			NodeId: srcParentIno,
+			Caller: gofuse.Caller{
+				Owner: gofuse.Owner{Uid: 65534, Gid: 65534},
+			},
+		},
+		Newdir: stickyIno,
+	}, "file", "target")
+	if st != gofuse.EPERM {
+		t.Fatalf("Rename status = %v, want EPERM", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+	if _, ok := fs.inodes.GetInode("/src/file"); !ok {
+		t.Fatal("source inode should remain after rejected rename")
+	}
+}
+
+func TestRenameMetadataOnlySpecialReplacesRemoteFile(t *testing.T) {
+	var deleteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/pipe":
+			http.Error(w, "not found", http.StatusNotFound)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/target":
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(uint32(syscall.S_IFREG)|0o644), 10))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/target":
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	var out gofuse.EntryOut
+	st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFIFO) | 0o644,
+	}, "pipe", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+
+	st = fs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "pipe", "target")
+	if st != gofuse.OK {
+		t.Fatalf("Rename status = %v, want OK", st)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("delete calls = %d, want 1", got)
+	}
+	if _, ok := fs.specialNodeEntry("/pipe"); ok {
+		t.Fatal("old special node still present")
+	}
+	if _, ok := fs.specialNodeEntry("/target"); !ok {
+		t.Fatal("renamed special node missing at target")
+	}
+}
+
+func TestRenameRemoteFileReplacesMetadataOnlySpecialTarget(t *testing.T) {
+	var renameCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/src":
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(uint32(syscall.S_IFREG)|0o644), 10))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/target":
+			http.Error(w, "not found", http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/target" && r.URL.RawQuery == "rename":
+			renameCalls.Add(1)
+			if got := r.Header.Get("X-Dat9-Rename-Source"); got != "/src" {
+				t.Errorf("rename source = %q, want /src", got)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	srcIno := fs.inodes.Lookup("/src", false, 1, time.Unix(10, 0))
+	fs.inodes.UpdateMode(srcIno, uint32(syscall.S_IFREG)|0o644)
+	var out gofuse.EntryOut
+	st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Mode:     uint32(syscall.S_IFIFO) | 0o644,
+	}, "target", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+
+	st = fs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "src", "target")
+	if st != gofuse.OK {
+		t.Fatalf("Rename status = %v, want OK", st)
+	}
+	if got := renameCalls.Load(); got != 1 {
+		t.Fatalf("rename calls = %d, want 1", got)
+	}
+	if _, ok := fs.specialNodeEntry("/target"); ok {
+		t.Fatal("special target still present after remote rename")
+	}
+	if _, ok := fs.inodes.GetInode("/src"); ok {
+		t.Fatal("old source inode still mapped")
+	}
+	if _, ok := fs.inodes.GetInode("/target"); !ok {
+		t.Fatal("target inode missing after rename")
+	}
+}
+
+func TestRenameRemoteDirReplacesEmptyRemoteDirTarget(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	record := func(event string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, event)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/target" && r.URL.RawQuery == "list=1":
+			record("list-target")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"entries":[]}`))
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/target" && r.URL.RawQuery == "kind=dir":
+			record("delete-target")
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/target" && r.URL.RawQuery == "rename":
+			record("rename")
+			if got := r.Header.Get("X-Dat9-Rename-Source"); got != "/src" {
+				t.Errorf("rename source = %q, want /src", got)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	srcIno := fs.inodes.Lookup("/src", true, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(srcIno, uint32(syscall.S_IFDIR)|0o755)
+	targetIno := fs.inodes.Lookup("/target", true, 0, time.Unix(11, 0))
+	fs.inodes.UpdateMode(targetIno, uint32(syscall.S_IFDIR)|0o755)
+
+	st := fs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "src", "target")
+	if st != gofuse.OK {
+		t.Fatalf("Rename status = %v, want OK", st)
+	}
+
+	mu.Lock()
+	gotEvents := strings.Join(events, ",")
+	mu.Unlock()
+	if gotEvents != "list-target,delete-target,rename" {
+		t.Fatalf("events = %q, want list-target,delete-target,rename", gotEvents)
+	}
+	if _, ok := fs.inodes.GetInode("/src"); ok {
+		t.Fatal("old source inode still mapped")
+	}
+	if _, ok := fs.inodes.GetInode("/target"); !ok {
+		t.Fatal("target inode missing after rename")
+	}
+}
+
+func TestFinishLocalRenameDirectoryAcrossParentsUpdatesParentNlink(t *testing.T) {
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), trustedProcessLocalEventsOptions())
+	now := time.Unix(10, 0)
+	srcParentIno := fs.inodes.Lookup("/src-parent", true, 0, now)
+	dstParentIno := fs.inodes.Lookup("/dst-parent", true, 0, now)
+	fs.inodes.UpdateLinkCount(srcParentIno, 3)
+	fs.inodes.UpdateLinkCount(dstParentIno, 2)
+	childIno := fs.inodes.Lookup("/src-parent/child", true, 0, now)
+	fs.inodes.UpdateLinkCount(childIno, 2)
+
+	fs.finishLocalRename(&gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: srcParentIno},
+		Newdir:   dstParentIno,
+	}, "/src-parent/child", "/dst-parent/child")
+
+	srcParent, ok := fs.inodes.GetEntry(srcParentIno)
+	if !ok {
+		t.Fatal("source parent missing")
+	}
+	if got := srcParent.Nlink; got != 2 {
+		t.Fatalf("source parent nlink = %d, want 2", got)
+	}
+	dstParent, ok := fs.inodes.GetEntry(dstParentIno)
+	if !ok {
+		t.Fatal("target parent missing")
+	}
+	if got := dstParent.Nlink; got != 3 {
+		t.Fatalf("target parent nlink = %d, want 3", got)
+	}
+	if _, ok := fs.inodes.GetInode("/src-parent/child"); ok {
+		t.Fatal("old child path still mapped")
+	}
+	if got, ok := fs.inodes.GetInode("/dst-parent/child"); !ok || got != childIno {
+		t.Fatalf("new child inode = %d/%v, want %d/true", got, ok, childIno)
+	}
+}
+
+func TestRenameZeroByteRemoteFileToMissingTargetFallsBackToCreateDelete(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	record := func(event string) {
+		mu.Lock()
+		defer mu.Unlock()
+		events = append(events, event)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/target":
+			http.Error(w, "not found", http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/target" && r.URL.RawQuery == "rename":
+			record("rename")
+			http.Error(w, "not found", http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/target" && r.URL.RawQuery == "create=1":
+			record("create-target")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 12})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/src" && r.URL.RawQuery == "kind=file":
+			record("delete-src")
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	srcIno := fs.inodes.Lookup("/src", false, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(srcIno, uint32(syscall.S_IFREG)|0o644)
+
+	st := fs.Rename(nil, &gofuse.RenameIn{InHeader: gofuse.InHeader{NodeId: 1}, Newdir: 1}, "src", "target")
+	if st != gofuse.OK {
+		t.Fatalf("Rename status = %v, want OK", st)
+	}
+
+	mu.Lock()
+	gotEvents := strings.Join(events, ",")
+	mu.Unlock()
+	if gotEvents != "rename,create-target,delete-src" {
+		t.Fatalf("events = %q, want rename,create-target,delete-src", gotEvents)
+	}
+	if _, ok := fs.inodes.GetInode("/src"); ok {
+		t.Fatal("old source inode still mapped")
+	}
+	if targetIno, ok := fs.inodes.GetInode("/target"); !ok {
+		t.Fatal("target inode missing after rename")
+	} else if targetIno != srcIno {
+		t.Fatalf("target inode = %d, want original source inode %d", targetIno, srcIno)
+	}
+}
+
+func TestChildPathRejectsOverlongNameAndPath(t *testing.T) {
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), trustedProcessLocalEventsOptions())
+
+	if _, st := fs.childPath(1, strings.Repeat("a", posixNameMax+1)); st != gofuse.Status(syscall.ENAMETOOLONG) {
+		t.Fatalf("overlong name status = %v, want ENAMETOOLONG", st)
+	}
+
+	parent := "/" + strings.Repeat("a", posixPathMax-2)
+	parentIno := fs.inodes.Lookup(parent, true, 0, time.Unix(10, 0))
+	if _, st := fs.childPath(parentIno, "bb"); st != gofuse.Status(syscall.ENAMETOOLONG) {
+		t.Fatalf("overlong path status = %v, want ENAMETOOLONG", st)
 	}
 }
 
@@ -3444,6 +3877,66 @@ func TestSymlinkCreatesRemoteLinkAndCachesEntry(t *testing.T) {
 	}
 	if string(got) != target {
 		t.Fatalf("Readlink target = %q, want %q", got, target)
+	}
+}
+
+func TestSymlinkRetriesNegativeCachedStaleDirectoryConflict(t *testing.T) {
+	const target = "test"
+	symlinkMode := uint32(syscall.S_IFLNK) | 0o777
+	var postCalls atomic.Int32
+	var deleteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/link":
+			if got := r.URL.Query().Get("symlink"); got != "1" {
+				t.Errorf("symlink query = %q, want 1", got)
+			}
+			if postCalls.Add(1) == 1 {
+				http.Error(w, "exists", http.StatusConflict)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/link":
+			if postCalls.Load() < 2 {
+				w.Header().Set("X-Dat9-IsDir", "true")
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(target)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(symlinkMode), 10))
+			w.Header().Set("X-Dat9-Revision", "13")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/link":
+			deleteCalls.Add(1)
+			if got := r.URL.Query().Get("kind"); got != "dir" {
+				t.Errorf("delete kind = %q, want dir", got)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/link":
+			_, _ = w.Write([]byte(target))
+		default:
+			http.Error(w, "unexpected "+r.Method+" "+r.URL.String(), http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	fs.cacheNegativePath("/link")
+
+	var out gofuse.EntryOut
+	st := fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, target, "link", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Symlink status = %v, want OK", st)
+	}
+	if got := postCalls.Load(); got != 2 {
+		t.Fatalf("POST calls = %d, want 2", got)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("DELETE calls = %d, want 1", got)
+	}
+	if got := out.Mode & uint32(syscall.S_IFMT); got != uint32(syscall.S_IFLNK) {
+		t.Fatalf("Symlink mode type = %o, want symlink", got)
 	}
 }
 

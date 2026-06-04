@@ -468,7 +468,7 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 	// Update the entry itself.
 	delete(m.byPath, oldPath)
 	if replacedIno, ok := m.byPath[newPath]; ok && replacedIno != ino {
-		m.removePathLocked(newPath, false)
+		m.removePathLocked(newPath, true)
 	}
 	m.byPath[newPath] = ino
 	if entry.Paths == nil {
@@ -615,8 +615,11 @@ func (m *InodeToPath) removePathLocked(path string, consumeLink bool) {
 	}
 	delete(m.byPath, path)
 	delete(entry.Paths, path)
-	if consumeLink && !entry.IsDir && entry.Nlink > 1 {
-		entry.Nlink--
+	if consumeLink && !entry.IsDir {
+		if entry.Nlink > 1 {
+			entry.Nlink--
+		}
+		entry.Ctime = time.Now()
 	}
 	if entry.Path == path {
 		entry.Path = ""

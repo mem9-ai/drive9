@@ -371,15 +371,31 @@ func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (conte
 
 // --- helpers -----------------------------------------------------------------
 
+const (
+	posixNameMax = 255
+	posixPathMax = 4095
+)
+
 func (fs *Dat9FS) childPath(parentIno uint64, name string) (string, gofuse.Status) {
+	if len(name) > posixNameMax {
+		return "", gofuse.Status(syscall.ENAMETOOLONG)
+	}
 	parentPath, ok := fs.inodes.GetPath(parentIno)
 	if !ok {
 		return "", gofuse.ENOENT
 	}
 	if parentPath == "/" {
-		return "/" + name, gofuse.OK
+		p := "/" + name
+		if len(p) > posixPathMax {
+			return "", gofuse.Status(syscall.ENAMETOOLONG)
+		}
+		return p, gofuse.OK
 	}
-	return parentPath + "/" + name, gofuse.OK
+	p := parentPath + "/" + name
+	if len(p) > posixPathMax {
+		return "", gofuse.Status(syscall.ENAMETOOLONG)
+	}
+	return p, gofuse.OK
 }
 
 func parentDir(p string) string {
@@ -1295,7 +1311,10 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 			mode = 0755
 		}
 		out.Mode = syscall.S_IFDIR | (mode & posixPermissionModeMask)
-		out.Nlink = 2
+		out.Nlink = entry.Nlink
+		if out.Nlink == 0 {
+			out.Nlink = 2
+		}
 	} else if entryIsSymlink(entry) {
 		mode := entry.Mode & posixPermissionModeMask
 		if !entry.HasMode {
@@ -2067,6 +2086,32 @@ func (fs *Dat9FS) cacheEntryForPath(p string, entry *InodeEntry) {
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
 }
 
+func (fs *Dat9FS) adjustDirectoryLinkCount(dirPath string, delta int32) {
+	if fs == nil || dirPath == "" {
+		return
+	}
+	ino, ok := fs.inodes.GetInode(dirPath)
+	if !ok {
+		return
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok || !entry.IsDir {
+		return
+	}
+	nlink := entry.Nlink
+	if nlink == 0 {
+		nlink = 2
+	}
+	next := int64(nlink) + int64(delta)
+	if next < 2 {
+		next = 2
+	}
+	fs.inodes.UpdateLinkCount(ino, uint32(next))
+	if updated, ok := fs.inodes.GetEntry(ino); ok {
+		fs.cacheEntryForPath(dirPath, updated)
+	}
+}
+
 func (fs *Dat9FS) markStatCacheUnverified() {
 	if fs != nil {
 		fs.statCacheUnverified.Store(true)
@@ -2140,6 +2185,14 @@ func (fs *Dat9FS) cacheNegativePath(p string) {
 	}
 	parentPath, name := cacheParentName(p)
 	fs.dirCache.MarkNegative(parentPath, name)
+}
+
+func (fs *Dat9FS) hasNegativePathCache(p string) bool {
+	if fs == nil || fs.dirCache == nil || p == "/" {
+		return false
+	}
+	parentPath, name := cacheParentName(p)
+	return fs.dirCache.Lookup(parentPath, name).kind == namespaceLookupNegative
 }
 
 func (fs *Dat9FS) negativeEntryTTL(p string) time.Duration {
@@ -3480,10 +3533,12 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 	if fs.hasPendingLocalState(childP) || fs.hasQueuedCommit(childP) {
 		return gofuse.Status(syscall.EEXIST)
 	}
-	if exists, err := fs.remotePathExistsDetached(childP); err != nil {
-		return httpToFuseStatus(err)
-	} else if exists {
-		return gofuse.Status(syscall.EEXIST)
+	if !fs.hasNegativePathCache(childP) {
+		if exists, err := fs.remotePathExistsDetached(childP); err != nil {
+			return httpToFuseStatus(err)
+		} else if exists {
+			return gofuse.Status(syscall.EEXIST)
+		}
 	}
 
 	now := time.Now()
@@ -3593,6 +3648,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 			return st
 		}
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
+		fs.adjustDirectoryLinkCount(parentPath, 1)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
@@ -3603,6 +3659,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 			return st
 		}
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
+		fs.adjustDirectoryLinkCount(parentPath, 1)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
@@ -3621,6 +3678,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	}
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
+	fs.adjustDirectoryLinkCount(parentPath, 1)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
 	fs.dirCache.MarkSessionCreatedDir(childP)
 	// Kernel already receives the new entry via the Mkdir reply —
@@ -3682,6 +3740,11 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	err := fs.client.SymlinkCtx(ctx, pointedTo, fs.remotePath(childP))
 	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
 	if err != nil {
+		if isConflictErr(err) && fs.hasNegativePathCache(childP) {
+			err = fs.retrySymlinkAfterNegativeCacheConflict(ctx, pointedTo, childP)
+		}
+	}
+	if err != nil {
 		if isTransientLookupErr(err) {
 			stat, probeErr := fs.remotePathStatDetached(childP)
 			if probeErr == nil && stat != nil && stat.HasMode && isSymlinkMode(stat.Mode) {
@@ -3728,6 +3791,29 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	return gofuse.OK
 }
 
+func (fs *Dat9FS) retrySymlinkAfterNegativeCacheConflict(ctx context.Context, pointedTo, childP string) error {
+	stat, statErr := fs.remotePathStatDetached(childP)
+	if statErr != nil && !isNotFoundErr(statErr) {
+		return statErr
+	}
+	if statErr == nil && stat != nil {
+		var deleteErr error
+		if stat.IsDir {
+			deleteErr = fs.deleteRemoteDirWithInterruptRecovery(ctx, childP)
+		} else {
+			deleteErr = fs.deleteRemoteFileWithInterruptRecovery(ctx, childP)
+		}
+		if deleteErr != nil && !isNotFoundErr(deleteErr) {
+			return deleteErr
+		}
+	}
+
+	mutationStart := fs.perfStart()
+	err := fs.client.SymlinkCtx(ctx, pointedTo, fs.remotePath(childP))
+	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
+	return err
+}
+
 func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseLink, perfStart, status, 0) }()
@@ -3752,6 +3838,9 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	}
 	if srcP == dstP {
 		return gofuse.Status(syscall.EEXIST)
+	}
+	if entryIsMetadataOnlySpecial(srcEntry) {
+		return fs.linkMetadataOnlySpecial(input, srcEntry, srcP, dstP, name, out)
 	}
 
 	ctx, cf := fuseCtx(cancel)
@@ -4061,6 +4150,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		fs.inodes.Remove(childP)
 		fs.dirCache.InvalidatePrefix(childP)
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.adjustDirectoryLinkCount(parentPath, -1)
 		fs.dirCache.Remove(parentPath, name)
 		fs.cacheNegativePath(childP)
 		fs.scheduleGitStateCheckpoint(childP)
@@ -4086,6 +4176,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 				return st
 			}
 			parentPath, _ := fs.inodes.GetPath(header.NodeId)
+			fs.adjustDirectoryLinkCount(parentPath, -1)
 			fs.dirCache.Remove(parentPath, name)
 			fs.dirCache.InvalidatePrefix(childP)
 			return gofuse.OK
@@ -4095,6 +4186,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			return st
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.adjustDirectoryLinkCount(parentPath, -1)
 		fs.dirCache.Remove(parentPath, name)
 		fs.dirCache.InvalidatePrefix(childP)
 		return gofuse.OK
@@ -4154,6 +4246,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	fs.invalidateDiskReadCachePrefix(childP + "/")
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
+	fs.adjustDirectoryLinkCount(parentPath, -1)
 	fs.dirCache.Remove(parentPath, name)
 	fs.cacheNegativePath(childP)
 	// Kernel initiated the rmdir and receives OK — it already
@@ -4279,6 +4372,9 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 }
 
 func (fs *Dat9FS) pendingRenameTargetExists(ctx context.Context, p string) (bool, error) {
+	if _, ok := fs.specialNodeEntry(p); ok {
+		return true, nil
+	}
 	if fs.pendingIndex != nil {
 		if _, ok := fs.pendingIndex.GetMeta(p); ok {
 			return true, nil
@@ -4310,6 +4406,18 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	if oldIno, ok := fs.inodes.GetInode(oldP); ok {
 		oldEntry, oldEntryOK = fs.inodes.GetEntry(oldIno)
 	}
+	oldParent, ok := fs.inodes.GetPath(input.NodeId)
+	if !ok {
+		oldParent = parentDir(oldP)
+	}
+	newParent := oldParent
+	if input.Newdir != input.NodeId {
+		if p, ok := fs.inodes.GetPath(input.Newdir); ok {
+			newParent = p
+		} else {
+			newParent = parentDir(newP)
+		}
+	}
 	fs.inodes.Rename(oldP, newP)
 	fs.invalidateReadCacheAndTargets(oldP)
 	fs.invalidateReadCacheAndTargets(newP)
@@ -4318,14 +4426,13 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	fs.invalidateDiskReadCachePrefix(oldP + "/")
 	fs.invalidateDiskReadCachePrefix(newP + "/")
 
-	oldParent, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Remove(oldParent, path.Base(oldP))
 	fs.cacheNegativePath(oldP)
 	fs.dirCache.InvalidatePrefix(oldP)
 	fs.dirCache.InvalidatePrefix(newP)
-	newParent := oldParent
-	if input.Newdir != input.NodeId {
-		newParent, _ = fs.inodes.GetPath(input.Newdir)
+	if oldEntryOK && oldEntry.IsDir && oldParent != newParent {
+		fs.adjustDirectoryLinkCount(oldParent, -1)
+		fs.adjustDirectoryLinkCount(newParent, 1)
 	}
 	if oldEntryOK {
 		fs.dirCache.Upsert(newParent, cachedInfoFromEntry(path.Base(newP), oldEntry))
@@ -4375,32 +4482,6 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	if oldP == newP {
 		return gofuse.OK
 	}
-	if _, ok := fs.specialNodeEntry(oldP); ok {
-		if _, targetSpecial := fs.specialNodeEntry(newP); !targetSpecial {
-			if fs.hasPendingLocalState(newP) || fs.hasQueuedCommit(newP) {
-				return gofuse.Status(syscall.EEXIST)
-			}
-			if exists, err := fs.remotePathExistsDetached(newP); err != nil {
-				return httpToFuseStatus(err)
-			} else if exists {
-				return gofuse.Status(syscall.EEXIST)
-			}
-		}
-		fs.removeSpecialNode(newP)
-		fs.inodes.RemoveLink(newP)
-		if !fs.renameSpecialNode(oldP, newP) {
-			return gofuse.ENOENT
-		}
-		fs.inodes.Rename(oldP, newP)
-		oldParent, _ := fs.inodes.GetPath(input.NodeId)
-		newParent, _ := fs.inodes.GetPath(input.Newdir)
-		fs.dirCache.Remove(oldParent, oldName)
-		if entry, ok := fs.specialNodeEntry(newP); ok {
-			fs.dirCache.Upsert(newParent, cachedInfoFromEntry(newName, entry))
-		}
-		fs.cacheNegativePath(oldP)
-		return gofuse.OK
-	}
 	oldLayer := fs.observePathPolicyWithContext(ctx, oldP)
 	newLayer := fs.observePathPolicyWithContext(ctx, newP)
 	if fs.localOverlay != nil {
@@ -4431,6 +4512,19 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 	if handled, st := fs.renameGitPath(ctx, input, oldP, newP); handled {
 		return st
+	}
+
+	oldInfo, newInfo, st := fs.renamePreflight(ctx, input, oldP, newP)
+	if st != gofuse.OK {
+		return st
+	}
+	if oldInfo.special {
+		return fs.renameMetadataOnlySpecial(ctx, input, oldP, newP, newInfo)
+	}
+	if newInfo.special {
+		if st := fs.removeRenameSpecialTarget(ctx, newInfo); st != gofuse.OK {
+			return st
+		}
 	}
 
 	pendingRename, err := fs.renamePendingNewCommit(ctx, input, oldP, newP)
@@ -4502,7 +4596,13 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
+	if st := fs.prepareRenameDirReplacement(ctx, oldInfo, newInfo); st != gofuse.OK {
+		return st
+	}
 	if err := fs.renameRemoteWithTransientRetry(ctx, oldP, newP); err != nil {
+		if handled, st := fs.renameRemoteFileToMissingTargetFallback(ctx, input, oldInfo, newInfo, err); handled {
+			return st
+		}
 		return httpToFuseStatus(err)
 	}
 	if pendingRename == pendingRenameRemoteFallbackCleanupOld {

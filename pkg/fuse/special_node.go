@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"context"
 	"path"
 	"sort"
 	"syscall"
@@ -72,6 +73,45 @@ func (fs *Dat9FS) renameSpecialNode(oldP, newP string) bool {
 	delete(fs.specialByPath, newP)
 	fs.specialByPath[newP] = ino
 	return true
+}
+
+func (fs *Dat9FS) linkMetadataOnlySpecial(input *gofuse.LinkIn, srcEntry *InodeEntry, srcP, dstP, name string, out *gofuse.EntryOut) gofuse.Status {
+	if _, ok := fs.specialNodeEntry(dstP); ok {
+		return gofuse.Status(syscall.EEXIST)
+	}
+	if fs.openHandles.Has(0, dstP) || fs.hasPendingLocalState(dstP) || fs.hasQueuedCommit(dstP) {
+		return gofuse.Status(syscall.EEXIST)
+	}
+	if !fs.hasNegativePathCache(dstP) {
+		ctx, cancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+		exists, err := fs.pendingRenameTargetExists(ctx, dstP)
+		cancel()
+		if err != nil {
+			return httpToFuseStatus(err)
+		}
+		if exists {
+			return gofuse.Status(syscall.EEXIST)
+		}
+	}
+
+	nlink := srcEntry.Nlink + 1
+	if nlink < 2 {
+		nlink = 2
+	}
+	if !fs.inodes.AddAlias(input.Oldnodeid, dstP, "", nlink, false, srcEntry.Size, time.Now()) {
+		return gofuse.EIO
+	}
+	fs.addSpecialNode(dstP, input.Oldnodeid)
+
+	entry, ok := fs.inodes.GetEntry(input.Oldnodeid)
+	if !ok {
+		return gofuse.EIO
+	}
+	parentPath, _ := fs.inodes.GetPath(input.NodeId)
+	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.cacheEntryForPath(srcP, entry)
+	fs.fillEntryOut(entry, out)
+	return gofuse.OK
 }
 
 func (fs *Dat9FS) specialNodeDirEntries(dirPath string, existing map[string]struct{}) []DirEntry {
