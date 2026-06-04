@@ -34,6 +34,7 @@ const (
 	perfFuseReadlink
 	perfFuseSymlink
 	perfFuseLink
+	perfFuseAccess
 	perfFuseOpCount
 )
 
@@ -58,6 +59,7 @@ var perfFuseOpNames = [...]string{
 	perfFuseReadlink:    "readlink",
 	perfFuseSymlink:     "symlink",
 	perfFuseLink:        "link",
+	perfFuseAccess:      "access",
 }
 
 type perfRemoteOp int

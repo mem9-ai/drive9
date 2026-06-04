@@ -2661,6 +2661,114 @@ func TestSetAttrRefreshesDirCacheStatMetadata(t *testing.T) {
 	}
 }
 
+func TestSetAttrModePreservesSpecialPermissionBits(t *testing.T) {
+	var chmodCalls atomic.Int32
+	var gotMode uint32
+	var handlerErrors testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls.Add(1)
+			var req struct {
+				Mode uint32 `json:"mode"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				handlerErrors.Recordf("decode chmod body: %v", err)
+				http.Error(w, "bad body", http.StatusBadRequest)
+				return
+			}
+			gotMode = req.Mode
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	ino := fs.inodes.Lookup("/special.txt", false, 12, time.Unix(10, 0))
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o6755,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	handlerErrors.Check(t)
+	if got := chmodCalls.Load(); got != 1 {
+		t.Fatalf("chmod calls = %d, want 1", got)
+	}
+	if gotMode != 0o6755 {
+		t.Fatalf("chmod mode = %o, want 06755", gotMode)
+	}
+	if got, want := out.Mode&0o7777, uint32(0o6755); got != want {
+		t.Fatalf("SetAttr mode = %o, want %o", got, want)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	if got, want := entry.Mode&0o7777, uint32(0o6755); got != want {
+		t.Fatalf("inode mode = %o, want %o", got, want)
+	}
+}
+
+func TestSetAttrModeUpdatesPendingMetadataWithoutRemoteChmod(t *testing.T) {
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("chmod") {
+			chmodCalls.Add(1)
+			http.Error(w, "remote object not committed yet", http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewPendingIndex: %v", err)
+	}
+	fs.pendingIndex = idx
+
+	const path = "/pending-new.txt"
+	if _, err := fs.pendingIndex.PutWithBaseRevAndMode(path, 0, PendingNew, 0, 0, false); err != nil {
+		t.Fatalf("PutWithBaseRevAndMode: %v", err)
+	}
+	ino := fs.inodes.Lookup(path, false, 0, time.Unix(10, 0))
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o755,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if got := chmodCalls.Load(); got != 0 {
+		t.Fatalf("remote chmod calls = %d, want 0", got)
+	}
+	meta, ok := fs.pendingIndex.GetMeta(path)
+	if !ok {
+		t.Fatal("pending metadata missing")
+	}
+	if !meta.HasMode || meta.Mode != 0o755 {
+		t.Fatalf("pending mode = %o/%t, want 755/true", meta.Mode, meta.HasMode)
+	}
+	if got, want := out.Mode&0o777, uint32(0o755); got != want {
+		t.Fatalf("SetAttr mode = %o, want %o", got, want)
+	}
+}
+
 func TestGetAttrRevalidatesDirCacheStatWhenSSEUnverified(t *testing.T) {
 	var headCalls atomic.Int32
 	var handlerErrors testErrorRecorder
@@ -6551,6 +6659,123 @@ func TestSetAttr_MtimeNow(t *testing.T) {
 	}
 }
 
+func TestSetAttr_AtimeUpdate(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 42))
+	})
+	defer cleanup()
+
+	atime := time.Date(2025, 2, 3, 4, 5, 6, 0, time.UTC)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_ATIME,
+			Atime:    uint64(atime.Unix()),
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if !entry.Atime.Equal(atime) {
+		t.Fatalf("Atime = %v, want %v", entry.Atime, atime)
+	}
+	if out.Atime != uint64(atime.Unix()) {
+		t.Fatalf("out.Atime = %d, want %d", out.Atime, atime.Unix())
+	}
+}
+
+func TestSetAttr_OwnerUpdate(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 42))
+	})
+	defer cleanup()
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_UID | gofuse.FATTR_GID,
+			Owner:    gofuse.Owner{Uid: 1234, Gid: 5678},
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("entry not found")
+	}
+	if !entry.HasUID || !entry.HasGID || entry.Uid != 1234 || entry.Gid != 5678 {
+		t.Fatalf("owner = uid:%d/%t gid:%d/%t, want 1234/true 5678/true", entry.Uid, entry.HasUID, entry.Gid, entry.HasGID)
+	}
+	if out.Uid != 1234 || out.Gid != 5678 {
+		t.Fatalf("out owner = %d:%d, want 1234:5678", out.Uid, out.Gid)
+	}
+}
+
+func TestAccess_ChecksModeAndOwner(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 42))
+	})
+	defer cleanup()
+
+	fs.inodes.UpdateMode(ino, 0o640)
+	fs.inodes.UpdateOwner(ino, 1001, 1002, true, true)
+
+	tests := []struct {
+		name   string
+		uid    uint32
+		gid    uint32
+		mask   uint32
+		status gofuse.Status
+	}{
+		{name: "owner read write", uid: 1001, gid: 9000, mask: gofuse.R_OK | gofuse.W_OK, status: gofuse.OK},
+		{name: "owner missing execute", uid: 1001, gid: 9000, mask: gofuse.R_OK | gofuse.X_OK, status: gofuse.EACCES},
+		{name: "group read", uid: 9001, gid: 1002, mask: gofuse.R_OK, status: gofuse.OK},
+		{name: "group missing write", uid: 9001, gid: 1002, mask: gofuse.W_OK, status: gofuse.EACCES},
+		{name: "other missing read", uid: 9001, gid: 9002, mask: gofuse.R_OK, status: gofuse.EACCES},
+		{name: "f ok", uid: 9001, gid: 9002, mask: gofuse.F_OK, status: gofuse.OK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st := fs.Access(nil, &gofuse.AccessIn{
+				InHeader: gofuse.InHeader{
+					NodeId: ino,
+					Caller: gofuse.Caller{
+						Owner: gofuse.Owner{Uid: tt.uid, Gid: tt.gid},
+					},
+				},
+				Mask: tt.mask,
+			})
+			if st != tt.status {
+				t.Fatalf("Access status = %v, want %v", st, tt.status)
+			}
+		})
+	}
+}
+
+func TestAccess_MissingInode(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	st := fs.Access(nil, &gofuse.AccessIn{
+		InHeader: gofuse.InHeader{NodeId: 999},
+		Mask:     gofuse.F_OK,
+	})
+	if st != gofuse.ENOENT {
+		t.Fatalf("Access status = %v, want ENOENT", st)
+	}
+}
+
 func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 	var currentRevision atomic.Int64
 	currentRevision.Store(1)
@@ -6588,6 +6813,7 @@ func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 	fs.inodes.UpdateRevision(ino, 1)
 
 	var attrOut gofuse.AttrOut
+	before := time.Now()
 	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
 		SetAttrInCommon: gofuse.SetAttrInCommon{
 			InHeader: gofuse.InHeader{NodeId: ino},
@@ -6595,6 +6821,7 @@ func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 			Size:     0,
 		},
 	}, &attrOut)
+	after := time.Now()
 	if st != gofuse.OK {
 		t.Fatalf("SetAttr status = %v, want OK", st)
 	}
@@ -6605,6 +6832,9 @@ func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 	}
 	if entry.Revision != 2 {
 		t.Fatalf("inode revision = %d, want 2", entry.Revision)
+	}
+	if entry.Ctime.Before(before) || entry.Ctime.After(after) {
+		t.Fatalf("inode ctime = %v, expected between %v and %v", entry.Ctime, before, after)
 	}
 
 	var openOut gofuse.OpenOut

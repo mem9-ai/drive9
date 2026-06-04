@@ -68,7 +68,7 @@ func (o *LocalOverlay) Mkdir(localPath string, mode uint32) error {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return err
 	}
-	return os.Mkdir(abs, fs.FileMode(mode&0o777))
+	return os.Mkdir(abs, fs.FileMode(mode&posixPermissionModeMask))
 }
 
 func (o *LocalOverlay) OpenFile(localPath string, flags uint32, mode uint32) (*os.File, error) {
@@ -81,7 +81,7 @@ func (o *LocalOverlay) OpenFile(localPath string, flags uint32, mode uint32) (*o
 			return nil, err
 		}
 	}
-	return os.OpenFile(abs, int(flags), fs.FileMode(mode&0o777))
+	return os.OpenFile(abs, int(flags), fs.FileMode(mode&posixPermissionModeMask))
 }
 
 func (o *LocalOverlay) Symlink(target, localPath string) error {
@@ -146,7 +146,7 @@ func (o *LocalOverlay) Chmod(localPath string, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	return os.Chmod(abs, fs.FileMode(mode&0o777))
+	return os.Chmod(abs, fs.FileMode(mode&posixPermissionModeMask))
 }
 
 func (o *LocalOverlay) Truncate(localPath string, size int64) error {

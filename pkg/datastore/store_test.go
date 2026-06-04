@@ -1293,6 +1293,41 @@ func TestChmodPreservesFileTypeBits(t *testing.T) {
 	}
 }
 
+func TestChmodPreservesSpecialPermissionBits(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{
+		FileID:      "f1",
+		StorageType: StorageDB9,
+		StorageRef:  "/blobs/f1",
+		SizeBytes:   6,
+		Revision:    1,
+		Mode:        0o100644,
+		Status:      StatusConfirmed,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/special", ParentPath: "/", Name: "special", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Chmod(ctx, "/special", 0o6755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != 0o106755 {
+		t.Errorf("mode=%o, want 0o106755", got.Mode)
+	}
+}
+
 func TestChmodNotFound(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

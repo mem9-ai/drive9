@@ -10,8 +10,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -780,7 +782,7 @@ func (fs *Dat9FS) pendingKindForHandle(fh *FileHandle) PendingKind {
 }
 
 func createInputMode(inputMode uint32) (uint32, bool) {
-	mode := inputMode & 0o777
+	mode := inputMode & posixPermissionModeMask
 	return mode, mode != defaultRegularFileMode
 }
 
@@ -791,7 +793,7 @@ func (fs *Dat9FS) modeForPendingHandle(fh *FileHandle) (uint32, bool) {
 		return 0, false
 	}
 	if fh.HasPendingMode {
-		return fh.PendingMode & 0o777, true
+		return fh.PendingMode & posixPermissionModeMask, true
 	}
 	return 0, false
 }
@@ -810,7 +812,7 @@ func (fs *Dat9FS) setPendingModeLocked(fh *FileHandle, mode uint32, gen uint64) 
 	if gen == 0 {
 		gen = fs.nextPendingModeGen()
 	}
-	fh.PendingMode = mode & 0o777
+	fh.PendingMode = mode & posixPermissionModeMask
 	fh.HasPendingMode = true
 	fh.PendingModeGen = gen
 }
@@ -823,7 +825,7 @@ func clearPendingModeLocked(fh *FileHandle) {
 }
 
 func pendingModeMatchesLocked(fh *FileHandle, mode uint32, gen uint64) bool {
-	return fh != nil && fh.HasPendingMode && fh.PendingModeGen == gen && fh.PendingMode&0o777 == mode&0o777
+	return fh != nil && fh.HasPendingMode && fh.PendingModeGen == gen && fh.PendingMode&posixPermissionModeMask == mode&posixPermissionModeMask
 }
 
 func (fs *Dat9FS) fileHandlesForInode(ino uint64) []*FileHandle {
@@ -837,7 +839,7 @@ func (fs *Dat9FS) fileHandlesForInode(ino uint64) []*FileHandle {
 }
 
 func (fs *Dat9FS) setPendingMetadataMode(path string, mode uint32) {
-	mode &= 0o777
+	mode &= posixPermissionModeMask
 	if fs.pendingIndex != nil {
 		if err := fs.pendingIndex.UpdateMode(path, mode); err != nil {
 			log.Printf("pending index mode update failed for %s: %v", path, err)
@@ -879,7 +881,7 @@ func (fs *Dat9FS) clearPendingModeForInodeGeneration(ino uint64, skip *FileHandl
 }
 
 func (fs *Dat9FS) applyRemoteMode(ctx context.Context, localPath string, mode uint32) error {
-	mode &= 0o777
+	mode &= posixPermissionModeMask
 	start := fs.perfStart()
 	err := fs.client.ChmodCtx(ctx, fs.remotePath(localPath), mode)
 	fs.perfRecordRemote(perfRemoteMutation, start, err, 0)
@@ -1089,7 +1091,7 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 		fh.BaseRev = rev
 	}
 	if meta.HasMode {
-		mode := meta.Mode & 0o777
+		mode := meta.Mode & posixPermissionModeMask
 		fs.setPendingModeLocked(fh, mode, 0)
 		fs.inodes.UpdateMode(fh.Ino, mode)
 	}
@@ -1121,7 +1123,7 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 		fs.inodes.UpdateRevision(fh.Ino, meta.BaseRev)
 	}
 	if meta.HasMode {
-		mode := meta.Mode & 0o777
+		mode := meta.Mode & posixPermissionModeMask
 		fs.setPendingModeLocked(fh, mode, 0)
 		fs.inodes.UpdateMode(fh.Ino, mode)
 	}
@@ -1262,23 +1264,37 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 	out.Size = uint64(size)
 	out.Blocks = (uint64(size) + 511) / 512
 	out.Uid = fs.uid
+	if entry.HasUID {
+		out.Uid = entry.Uid
+	}
 	out.Gid = fs.gid
+	if entry.HasGID {
+		out.Gid = entry.Gid
+	}
 
 	mtime := entry.Mtime
 	if mtime.IsZero() {
 		mtime = time.Now()
 	}
-	out.SetTimes(&mtime, &mtime, &mtime)
+	atime := entry.Atime
+	if atime.IsZero() {
+		atime = mtime
+	}
+	ctime := entry.Ctime
+	if ctime.IsZero() {
+		ctime = mtime
+	}
+	out.SetTimes(&atime, &mtime, &ctime)
 
 	if entry.IsDir {
 		mode := entry.Mode
 		if !entry.HasMode {
 			mode = 0755
 		}
-		out.Mode = syscall.S_IFDIR | (mode & 0o777)
+		out.Mode = syscall.S_IFDIR | (mode & posixPermissionModeMask)
 		out.Nlink = 2
 	} else if entryIsSymlink(entry) {
-		mode := entry.Mode & 0o777
+		mode := entry.Mode & posixPermissionModeMask
 		if !entry.HasMode {
 			mode = 0o777
 		}
@@ -1292,7 +1308,7 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 		if !entry.HasMode {
 			mode = 0644
 		}
-		out.Mode = syscall.S_IFREG | (mode & 0o777)
+		out.Mode = syscall.S_IFREG | (mode & posixPermissionModeMask)
 		out.Nlink = entry.Nlink
 		if out.Nlink == 0 {
 			out.Nlink = 1
@@ -1312,13 +1328,13 @@ func dirEntryMode(isDir, hasMode bool, mode uint32) uint32 {
 	if isDir {
 		perm := uint32(0o755)
 		if hasMode {
-			perm = mode & 0o777
+			perm = mode & posixPermissionModeMask
 		}
 		return uint32(syscall.S_IFDIR) | perm
 	}
 	perm := uint32(0o644)
 	if hasMode {
-		perm = mode & 0o777
+		perm = mode & posixPermissionModeMask
 	}
 	if hasMode && isSymlinkMode(mode) {
 		return uint32(syscall.S_IFLNK) | perm
@@ -2729,6 +2745,16 @@ func (fs *Dat9FS) hasOpenHandle(ino uint64, p string) bool {
 }
 
 func (fs *Dat9FS) hasPendingLocalState(p string) bool {
+	if fs.hasPendingMetadataState(p) {
+		return true
+	}
+	if fs.shadowStore != nil && fs.shadowStore.Has(p) {
+		return true
+	}
+	return false
+}
+
+func (fs *Dat9FS) hasPendingMetadataState(p string) bool {
 	if fs.pendingIndex != nil {
 		if _, ok := fs.pendingIndex.GetMeta(p); ok {
 			return true
@@ -2738,9 +2764,6 @@ func (fs *Dat9FS) hasPendingLocalState(p string) bool {
 		if _, ok := fs.writeBack.GetMeta(p); ok {
 			return true
 		}
-	}
-	if fs.shadowStore != nil && fs.shadowStore.Has(p) {
-		return true
 	}
 	return false
 }
@@ -2967,6 +2990,57 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	return gofuse.OK
 }
 
+func (fs *Dat9FS) Access(cancel <-chan struct{}, input *gofuse.AccessIn) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseAccess, perfStart, status, 0) }()
+
+	var out gofuse.AttrOut
+	if st := fs.GetAttr(cancel, &gofuse.GetAttrIn{InHeader: input.InHeader}, &out); st != gofuse.OK {
+		return st
+	}
+	if !hasPOSIXAccess(input.Caller.Owner, gofuse.Owner{Uid: out.Uid, Gid: out.Gid}, out.Mode, input.Mask) {
+		return gofuse.EACCES
+	}
+	return gofuse.OK
+}
+
+func hasPOSIXAccess(caller gofuse.Owner, file gofuse.Owner, mode uint32, mask uint32) bool {
+	mask &= 0o7
+	if mask == gofuse.F_OK {
+		return true
+	}
+	if caller.Uid == 0 {
+		return true
+	}
+
+	perm := mode & 0o777
+	if caller.Uid == file.Uid {
+		return perm&(mask<<6) == mask<<6
+	}
+	if caller.Gid == file.Gid || callerInSupplementaryGroup(caller.Uid, file.Gid) {
+		return perm&(mask<<3) == mask<<3
+	}
+	return perm&mask == mask
+}
+
+func callerInSupplementaryGroup(uid, gid uint32) bool {
+	u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10))
+	if err != nil {
+		return false
+	}
+	groups, err := u.GroupIds()
+	if err != nil {
+		return false
+	}
+	target := strconv.FormatUint(uint64(gid), 10)
+	for _, group := range groups {
+		if group == target {
+			return true
+		}
+	}
+	return false
+}
+
 func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseSetAttr, perfStart, status, 0) }()
@@ -2996,8 +3070,27 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			fs.inodes.UpdateMtime(input.NodeId, mtime)
 			metadataChanged = true
 		}
+		if atime, ok := input.GetATime(); ok {
+			entry.Atime = atime
+			fs.inodes.UpdateAtime(input.NodeId, atime)
+			metadataChanged = true
+		}
+		ownerUID, hasUID := input.GetUID()
+		ownerGID, hasGID := input.GetGID()
+		if hasUID || hasGID {
+			if hasUID {
+				entry.Uid = ownerUID
+				entry.HasUID = true
+			}
+			if hasGID {
+				entry.Gid = ownerGID
+				entry.HasGID = true
+			}
+			fs.inodes.UpdateOwner(input.NodeId, ownerUID, ownerGID, hasUID, hasGID)
+			metadataChanged = true
+		}
 		if input.Valid&gofuse.FATTR_MODE != 0 {
-			mode := input.Mode & 0o777
+			mode := input.Mode & posixPermissionModeMask
 			if err := overlay.Chmod(entry.Path, mode); err != nil {
 				return localErrToFuseStatus(err)
 			}
@@ -3006,6 +3099,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				entryMode |= uint32(syscall.S_IFLNK)
 			}
 			entry.Mode = entryMode
+			entry.HasMode = true
 			fs.inodes.UpdateMode(input.NodeId, entryMode)
 			metadataChanged = true
 		}
@@ -3013,11 +3107,15 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if entry.IsDir {
 				return gofuse.Status(syscall.EISDIR)
 			}
+			oldSize := entry.Size
 			if err := overlay.Truncate(entry.Path, int64(input.Size)); err != nil {
 				return localErrToFuseStatus(err)
 			}
 			entry.Size = int64(input.Size)
 			fs.inodes.UpdateSize(input.NodeId, int64(input.Size))
+			if entry.Size != oldSize {
+				metadataChanged = true
+			}
 		}
 		info, err := overlay.Lstat(entry.Path)
 		if err == nil {
@@ -3026,6 +3124,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			}
 		}
 		if metadataChanged {
+			ctime := time.Now()
+			entry.Ctime = ctime
+			fs.inodes.UpdateCtime(input.NodeId, ctime)
 			fs.cacheEntryForPath(entry.Path, entry)
 		}
 		fs.fillAttr(entry, &out.Attr)
@@ -3047,9 +3148,33 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		metadataChanged = true
 	}
 
+	// Handle atime updates.
+	if atime, ok := input.GetATime(); ok {
+		entry.Atime = atime
+		fs.inodes.UpdateAtime(input.NodeId, atime)
+		metadataChanged = true
+	}
+
+	// Handle owner updates. Drive9 does not persist uid/gid remotely yet, but
+	// the FUSE mount should report the ownership it has acknowledged.
+	ownerUID, hasUID := input.GetUID()
+	ownerGID, hasGID := input.GetGID()
+	if hasUID || hasGID {
+		if hasUID {
+			entry.Uid = ownerUID
+			entry.HasUID = true
+		}
+		if hasGID {
+			entry.Gid = ownerGID
+			entry.HasGID = true
+		}
+		fs.inodes.UpdateOwner(input.NodeId, ownerUID, ownerGID, hasUID, hasGID)
+		metadataChanged = true
+	}
+
 	// Handle mode (chmod)
 	if input.Valid&gofuse.FATTR_MODE != 0 {
-		mode := input.Mode & 0777
+		mode := input.Mode & posixPermissionModeMask
 		entryMode := mode
 		if entryIsSymlink(entry) {
 			entryMode |= uint32(syscall.S_IFLNK)
@@ -3075,10 +3200,19 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			}
 			h.Unlock()
 		}
-		if hasDirtyHandle {
-			fs.setPendingMetadataMode(entry.Path, mode)
+		hasPendingMetadata := false
+		if !hasDirtyHandle && fs.hasQueuedCommit(entry.Path) {
+			if fs.commitQueue != nil {
+				fs.commitQueue.WaitPath(entry.Path)
+			}
 		}
 		if !hasDirtyHandle {
+			hasPendingMetadata = fs.hasPendingMetadataState(entry.Path)
+		}
+		if hasDirtyHandle || hasPendingMetadata {
+			fs.setPendingMetadataMode(entry.Path, mode)
+		}
+		if !hasDirtyHandle && !hasPendingMetadata {
 			ctx, cf := fuseCtx(cancel)
 			defer cf()
 			if err := fs.client.ChmodCtx(ctx, fs.remotePath(entry.Path), mode); err != nil {
@@ -3086,6 +3220,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			}
 		}
 		entry.Mode = entryMode
+		entry.HasMode = true
 		fs.inodes.UpdateMode(input.NodeId, entryMode)
 		metadataChanged = true
 	}
@@ -3093,6 +3228,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	// Handle truncate
 	if input.Valid&gofuse.FATTR_SIZE != 0 {
 		newSize := int64(input.Size)
+		oldSize := entry.Size
 
 		if input.Valid&gofuse.FATTR_FH != 0 {
 			// ftruncate(fd, size): truncate the open write buffer.
@@ -3152,11 +3288,17 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		}
 		entry.Size = newSize
 		fs.inodes.UpdateSize(input.NodeId, newSize)
+		if newSize != oldSize {
+			metadataChanged = true
+		}
 		// Kernel already receives updated attrs via the SetAttr reply —
 		// no need for an explicit notifyInode here.
 	}
 
 	if metadataChanged {
+		ctime := time.Now()
+		entry.Ctime = ctime
+		fs.inodes.UpdateCtime(input.NodeId, ctime)
 		fs.cacheEntryForPath(entry.Path, entry)
 	}
 	fs.fillAttr(entry, &out.Attr)
@@ -3224,7 +3366,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	mode := input.Mode & 0o777
+	mode := input.Mode & posixPermissionModeMask
 	if overlay, local, st := fs.localOverlayForDirPath(ctx, childP); local {
 		if st != gofuse.OK {
 			return st
@@ -6344,7 +6486,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 		if fh.HasPendingMode {
 			ino := fh.Ino
-			mode := fh.PendingMode & 0o777
+			mode := fh.PendingMode & posixPermissionModeMask
 			modeGen := fh.PendingModeGen
 			clearPendingModeLocked(fh)
 			fh.Unlock()
@@ -6391,7 +6533,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		defer func() {
 			fh.Lock()
 			hasPendingMode := fh.HasPendingMode
-			pendingMode := fh.PendingMode & 0o777
+			pendingMode := fh.PendingMode & posixPermissionModeMask
 			pendingModeGen := fh.PendingModeGen
 			previousMode := fh.PreviousMode
 			hasPreviousMode := fh.HasPreviousMode
@@ -7277,7 +7419,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		fs.inodes.UpdateRevision(entry.Inode, committedRev)
 		fs.inodes.UpdateSize(entry.Inode, entry.Size)
 		if entry.HasMode {
-			fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
+			fs.inodes.UpdateMode(entry.Inode, entry.Mode&posixPermissionModeMask)
 		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), committedRev)
 		// Local async commit completion — this is not an external change.
@@ -7286,7 +7428,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 	} else {
 		fs.invalidateReadCacheAndTargets(entry.Path)
 		if entry.HasMode && entry.Inode > 0 {
-			fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
+			fs.inodes.UpdateMode(entry.Inode, entry.Mode&posixPermissionModeMask)
 		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
 	}

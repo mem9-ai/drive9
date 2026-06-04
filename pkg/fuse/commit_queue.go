@@ -775,7 +775,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) e
 	if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var err error
-		mode := entry.Mode & 0o777
+		mode := entry.Mode & posixPermissionModeMask
 		err = retryPostUploadMode(ctx, func() error {
 			start := time.Now()
 			applyErr := cq.client.ChmodCtx(ctx, cq.remotePath(entry.Path), mode)

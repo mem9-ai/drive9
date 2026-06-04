@@ -16,7 +16,13 @@ type InodeEntry struct {
 	IsDir      bool
 	Nlookup    int64 // kernel lookup reference count
 	Size       int64
+	Atime      time.Time
 	Mtime      time.Time
+	Ctime      time.Time
+	Uid        uint32
+	Gid        uint32
+	HasUID     bool
+	HasGID     bool
 	Mode       uint32 // permission bits
 	HasMode    bool   // true when mode is explicitly known (including 0)
 	Revision   int64  // server-side revision for cache validation
@@ -368,6 +374,43 @@ func (m *InodeToPath) UpdateMtime(ino uint64, mtime time.Time) {
 
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Mtime = mtime
+	}
+}
+
+// UpdateAtime updates the atime of the entry identified by the given inode.
+func (m *InodeToPath) UpdateAtime(ino uint64, atime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Atime = atime
+	}
+}
+
+// UpdateCtime updates the ctime of the entry identified by the given inode.
+func (m *InodeToPath) UpdateCtime(ino uint64, ctime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Ctime = ctime
+	}
+}
+
+// UpdateOwner updates the uid/gid of the entry identified by the given inode.
+func (m *InodeToPath) UpdateOwner(ino uint64, uid, gid uint32, hasUID, hasGID bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		if hasUID {
+			entry.Uid = uid
+			entry.HasUID = true
+		}
+		if hasGID {
+			entry.Gid = gid
+			entry.HasGID = true
+		}
 	}
 }
 

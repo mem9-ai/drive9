@@ -45,7 +45,10 @@ const (
 	StorageS3  StorageType = "s3"
 )
 
-const fileTypeModeMask uint32 = 0o170000
+const (
+	fileTypeModeMask   uint32 = 0o170000
+	permissionModeMask uint32 = 0o7777
+)
 
 type StorageEncryptionMode string
 
@@ -1105,7 +1108,7 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 		}
 		return err
 	}
-	mode = (mode & 0o777) | (currentMode & fileTypeModeMask)
+	mode = (mode & permissionModeMask) | (currentMode & fileTypeModeMask)
 	res, err := s.db.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE inode_id = ? AND status = 'CONFIRMED'`, mode, inodeID)
 	if err != nil {
 		return err
