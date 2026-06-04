@@ -871,6 +871,22 @@ func TestMountHash_Deterministic(t *testing.T) {
 	}
 }
 
+func TestMountReadCacheHashIncludesCredential(t *testing.T) {
+	base := MountReadCacheHash("https://example.com", "/mnt/data", "/", "api_key", "key-a")
+	if base != MountReadCacheHash("https://example.com", "/mnt/data", "/", "api_key", "key-a") {
+		t.Fatal("MountReadCacheHash should be deterministic")
+	}
+	if base == MountReadCacheHash("https://example.com", "/mnt/data", "/", "api_key", "key-b") {
+		t.Fatal("different API keys should produce different read-cache namespaces")
+	}
+	if base == MountReadCacheHash("https://example.com", "/mnt/data", "/", "token", "key-a") {
+		t.Fatal("different credential kinds should produce different read-cache namespaces")
+	}
+	if base == MountReadCacheHash("https://example.com", "/mnt/data", "/subtree", "api_key", "key-a") {
+		t.Fatal("different remote roots should produce different read-cache namespaces")
+	}
+}
+
 // TestFlush_WriteBack_SmallFile verifies that Flush() writes to local cache
 // and returns immediately (no HTTP upload) when write-back is enabled.
 func TestFlush_WriteBack_SmallFile(t *testing.T) {
