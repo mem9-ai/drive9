@@ -2718,6 +2718,120 @@ func TestSetAttrModePreservesSpecialPermissionBits(t *testing.T) {
 	}
 }
 
+func TestSetAttrModeRejectsNonOwner(t *testing.T) {
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("chmod") {
+			chmodCalls.Add(1)
+			http.Error(w, "non-owner chmod should not reach server", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	ino := fs.inodes.Lookup("/owned.txt", false, 12, time.Unix(10, 0))
+	oldCTime := time.Unix(20, 0)
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|0o644)
+	fs.inodes.UpdateOwner(ino, 1001, 1002, true, true)
+	fs.inodes.UpdateCtime(ino, oldCTime)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{
+				NodeId: ino,
+				Caller: gofuse.Caller{
+					Owner: gofuse.Owner{Uid: 65534, Gid: 65534},
+				},
+			},
+			Valid: gofuse.FATTR_MODE,
+			Mode:  0o111,
+		},
+	}, &out)
+	if st != gofuse.EPERM {
+		t.Fatalf("SetAttr status = %v, want EPERM", st)
+	}
+	if got := chmodCalls.Load(); got != 0 {
+		t.Fatalf("remote chmod calls = %d, want 0", got)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	if got, want := entry.Mode&0o7777, uint32(0o644); got != want {
+		t.Fatalf("inode mode = %o, want %o", got, want)
+	}
+	if !entry.Ctime.Equal(oldCTime) {
+		t.Fatalf("ctime = %v, want unchanged %v", entry.Ctime, oldCTime)
+	}
+}
+
+func TestSetAttrModeClearsSetGIDForRegularFileWhenCallerNotInFileGroup(t *testing.T) {
+	var chmodCalls atomic.Int32
+	var gotMode uint32
+	var handlerErrors testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls.Add(1)
+			var req struct {
+				Mode uint32 `json:"mode"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				handlerErrors.Recordf("decode chmod body: %v", err)
+				http.Error(w, "bad body", http.StatusBadRequest)
+				return
+			}
+			gotMode = req.Mode
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	ino := fs.inodes.Lookup("/setgid.txt", false, 12, time.Unix(10, 0))
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|0o2755)
+	fs.inodes.UpdateOwner(ino, 65534, 65534, true, true)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{
+				NodeId: ino,
+				Caller: gofuse.Caller{
+					Owner: gofuse.Owner{Uid: 65534, Gid: 65533},
+				},
+			},
+			Valid: gofuse.FATTR_MODE,
+			Mode:  0o2755,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	handlerErrors.Check(t)
+	if got := chmodCalls.Load(); got != 1 {
+		t.Fatalf("chmod calls = %d, want 1", got)
+	}
+	if gotMode != 0o755 {
+		t.Fatalf("remote chmod mode = %o, want 0755", gotMode)
+	}
+	if got, want := out.Mode&0o7777, uint32(0o755); got != want {
+		t.Fatalf("SetAttr mode = %o, want %o", got, want)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	if got, want := entry.Mode&0o7777, uint32(0o755); got != want {
+		t.Fatalf("inode mode = %o, want %o", got, want)
+	}
+}
+
 func TestSetAttrModeUpdatesPendingMetadataWithoutRemoteChmod(t *testing.T) {
 	var chmodCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2875,6 +2989,66 @@ func TestMknodMetadataOnlySpecialNodeLifecycle(t *testing.T) {
 	}
 	if _, ok := fs.specialNodeEntry("/renamed-pipe"); ok {
 		t.Fatal("special node still present after unlink")
+	}
+}
+
+func TestSetAttrModeRejectsNonOwnerMetadataOnlySpecialNode(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		if r.Method == http.MethodHead {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, "unexpected remote mutation", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	var entryOut gofuse.EntryOut
+	st := fs.Mknod(nil, &gofuse.MknodIn{
+		InHeader: gofuse.InHeader{
+			NodeId: 1,
+			Caller: gofuse.Caller{
+				Owner: gofuse.Owner{Uid: 1001, Gid: 1002},
+			},
+		},
+		Mode: uint32(syscall.S_IFIFO) | 0o644,
+	}, "pipe", &entryOut)
+	if st != gofuse.OK {
+		t.Fatalf("Mknod status = %v, want OK", st)
+	}
+	oldCTime := time.Unix(20, 0)
+	fs.inodes.UpdateCtime(entryOut.NodeId, oldCTime)
+
+	var attr gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{
+				NodeId: entryOut.NodeId,
+				Caller: gofuse.Caller{
+					Owner: gofuse.Owner{Uid: 65534, Gid: 65534},
+				},
+			},
+			Valid: gofuse.FATTR_MODE,
+			Mode:  0o111,
+		},
+	}, &attr)
+	if st != gofuse.EPERM {
+		t.Fatalf("SetAttr status = %v, want EPERM", st)
+	}
+	if got := remoteCalls.Load(); got != 1 {
+		t.Fatalf("remote calls = %d, want only initial HEAD", got)
+	}
+	entry, ok := fs.inodes.GetEntry(entryOut.NodeId)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	if got, want := entry.Mode&0o7777, uint32(0o644); got != want {
+		t.Fatalf("inode mode = %o, want %o", got, want)
+	}
+	if !entry.Ctime.Equal(oldCTime) {
+		t.Fatalf("ctime = %v, want unchanged %v", entry.Ctime, oldCTime)
 	}
 }
 

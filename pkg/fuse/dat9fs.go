@@ -3067,6 +3067,72 @@ func callerInSupplementaryGroup(uid, gid uint32) bool {
 	return false
 }
 
+const setGIDPermissionBit uint32 = 0o2000
+
+func (fs *Dat9FS) entryOwner(entry *InodeEntry) gofuse.Owner {
+	owner := gofuse.Owner{Uid: fs.uid, Gid: fs.gid}
+	if entry == nil {
+		return owner
+	}
+	if entry.HasUID {
+		owner.Uid = entry.Uid
+	}
+	if entry.HasGID {
+		owner.Gid = entry.Gid
+	}
+	return owner
+}
+
+func entryIsRegularFile(entry *InodeEntry) bool {
+	if entry == nil || entry.IsDir {
+		return false
+	}
+	if !entry.HasMode {
+		return true
+	}
+	kind := entry.Mode & fileKindModeMask
+	return kind == 0 || kind == uint32(syscall.S_IFREG)
+}
+
+func (fs *Dat9FS) setAttrModeForCaller(input *gofuse.SetAttrIn, entry *InodeEntry) (uint32, gofuse.Status) {
+	caller := input.Caller.Owner
+	owner := fs.entryOwner(entry)
+	if caller.Uid != 0 && caller.Uid != owner.Uid {
+		return 0, gofuse.EPERM
+	}
+
+	mode := input.Mode & posixPermissionModeMask
+	if caller.Uid != 0 && entryIsRegularFile(entry) && mode&setGIDPermissionBit != 0 {
+		if caller.Gid != owner.Gid && !processHasSupplementaryGroup(input.Caller.Pid, owner.Gid) {
+			mode &^= setGIDPermissionBit
+		}
+	}
+	return mode, gofuse.OK
+}
+
+func processHasSupplementaryGroup(pid, gid uint32) bool {
+	if pid == 0 {
+		return false
+	}
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return false
+	}
+	target := strconv.FormatUint(uint64(gid), 10)
+	for _, line := range strings.Split(string(status), "\n") {
+		if !strings.HasPrefix(line, "Groups:") {
+			continue
+		}
+		for _, group := range strings.Fields(strings.TrimPrefix(line, "Groups:")) {
+			if group == target {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
 func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseSetAttr, perfStart, status, 0) }()
@@ -3119,7 +3185,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			metadataChanged = true
 		}
 		if input.Valid&gofuse.FATTR_MODE != 0 {
-			mode := input.Mode & posixPermissionModeMask
+			mode, st := fs.setAttrModeForCaller(input, entry)
+			if st != gofuse.OK {
+				return st
+			}
 			if err := overlay.Chmod(entry.Path, mode); err != nil {
 				return localErrToFuseStatus(err)
 			}
@@ -3203,7 +3272,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 
 	// Handle mode (chmod)
 	if input.Valid&gofuse.FATTR_MODE != 0 {
-		mode := input.Mode & posixPermissionModeMask
+		mode, st := fs.setAttrModeForCaller(input, entry)
+		if st != gofuse.OK {
+			return st
+		}
 		entryMode := mode
 		if entryIsSymlink(entry) {
 			entryMode |= uint32(syscall.S_IFLNK)
@@ -3476,6 +3548,7 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 		fs.inodes.UpdateRevision(ino, revision)
 	}
 	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|perm)
+	fs.inodes.UpdateOwner(ino, input.Caller.Uid, input.Caller.Gid, true, true)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -3541,6 +3614,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 
 	ino := fs.inodes.Lookup(childP, true, 0, time.Now())
 	fs.inodes.UpdateMode(ino, mode)
+	fs.inodes.UpdateOwner(ino, input.Caller.Uid, input.Caller.Gid, true, true)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -5005,6 +5079,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	ino := fs.inodes.Lookup(childP, false, 0, time.Now())
 	fs.inodes.UpdateMode(ino, mode)
+	fs.inodes.UpdateOwner(ino, input.Caller.Uid, input.Caller.Gid, true, true)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO

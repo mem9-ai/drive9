@@ -153,7 +153,11 @@ func (fs *Dat9FS) setMetadataOnlySpecialAttr(input *gofuse.SetAttrIn, entry *Ino
 	}
 
 	if input.Valid&gofuse.FATTR_MODE != 0 {
-		mode := (entry.Mode & fileKindModeMask) | (input.Mode & posixPermissionModeMask)
+		perm, st := fs.setAttrModeForCaller(input, entry)
+		if st != gofuse.OK {
+			return st
+		}
+		mode := (entry.Mode & fileKindModeMask) | perm
 		entry.Mode = mode
 		entry.HasMode = true
 		fs.inodes.UpdateMode(input.NodeId, mode)
