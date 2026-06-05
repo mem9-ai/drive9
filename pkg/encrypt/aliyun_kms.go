@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 
+	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials/provider"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/kms"
 )
@@ -28,7 +29,15 @@ func NewAliyunKMSEncryptor(region, keyID string) (*AliyunKMSEncryptor, error) {
 			provider.NewInstanceCredentialsProvider(),
 		},
 	)
-	client, err := kms.NewClientWithProvider(region, chain)
+	cred, err := chain.Resolve()
+	if err != nil {
+		return nil, fmt.Errorf("aliyun kms credentials: %w", err)
+	}
+
+	config := sdk.NewConfig()
+	config.Scheme = "HTTPS"
+
+	client, err := kms.NewClientWithOptions(region, config, cred)
 	if err != nil {
 		return nil, fmt.Errorf("create aliyun kms client: %w", err)
 	}
