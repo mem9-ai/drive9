@@ -383,9 +383,6 @@ environment:
   DRIVE9_ENCRYPT_TYPE local_aes|kms|aliyun_kms
   DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
   DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms), Aliyun KMS key id (required for aliyun_kms)
-  ALIBABA_CLOUD_ACCESS_KEY_ID     Aliyun RAM access key id (required for aliyun_kms)
-  ALIBABA_CLOUD_ACCESS_KEY_SECRET Aliyun RAM access key secret (required for aliyun_kms)
-  ALIBABA_CLOUD_SECURITY_TOKEN    Aliyun STS security token (optional, for aliyun_kms)
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)

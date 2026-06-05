@@ -24,12 +24,6 @@ func NewAliyunKMSEncryptor(region, keyID string) (*AliyunKMSEncryptor, error) {
 	accessKeyID := os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_ID")
 	accessKeySecret := os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
 	securityToken := os.Getenv("ALIBABA_CLOUD_SECURITY_TOKEN")
-	if accessKeyID == "" {
-		return nil, fmt.Errorf("ALIBABA_CLOUD_ACCESS_KEY_ID is required")
-	}
-	if accessKeySecret == "" {
-		return nil, fmt.Errorf("ALIBABA_CLOUD_ACCESS_KEY_SECRET is required")
-	}
 	var client *kms.Client
 	var err error
 	if securityToken != "" {
