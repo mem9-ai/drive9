@@ -14,4 +14,5 @@ export FUSE_GIT_CLONE_URL="${FUSE_GIT_CLONE_URL:-https://github.com/octocat/Hell
 export FUSE_GIT_CLONE_TIMEOUT_S="${FUSE_GIT_CLONE_TIMEOUT_S:-180}"
 export FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 
-exec bash "$SCRIPT_DIR/fuse-smoke-test.sh"
+bash "$SCRIPT_DIR/fuse-smoke-test.sh"
+bash "$SCRIPT_DIR/fuse-correctness-workload.sh"
