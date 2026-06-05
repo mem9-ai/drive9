@@ -19,7 +19,7 @@ including local single-tenant validation via `drive9-server-local`.
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/hardlink/rename/stat semantics, cross-channel consistency, read-only and error-path checks |
 | `fuse-correctness-workload.sh` | Real read-only FUSE workload over a manifest fixture: `find`, `grep`, `stat`, `cat`, `sha256`, symlink, hardlink, unicode/space paths, empty files, binary files, and 8MiB+ files |
 | `fuse-concurrency-stress.sh` | Real writable FUSE concurrency workload with parallel writers/readers, atomic rename, unlink churn, open-handle rename reads, and deterministic final manifest checks |
-| `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, mount-log audit, manifest-based FUSE correctness workload, and bounded concurrency stress |
+| `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, mount-log audit, and manifest-based FUSE correctness workload; set `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress |
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
 | `smoke-all.sh` | Runs API + CLI + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_GIT_WORKSPACE_SMOKE=1` to include Git workspace coverage |
@@ -67,6 +67,9 @@ bash e2e/git-workspace-smoke-test.sh
 
 # Strict FUSE release gate used by CI
 bash e2e/fuse-release-gate.sh
+
+# Add the concurrency stress workload to the strict FUSE release gate.
+RUN_FUSE_CONCURRENCY_STRESS=1 bash e2e/fuse-release-gate.sh
 
 # Use official released drive9 CLI for FUSE smoke
 CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
@@ -180,6 +183,9 @@ bash e2e/fuse-concurrency-stress.sh
 # Strict FUSE release gate using the repo build.
 bash e2e/fuse-release-gate.sh
 
+# Strict FUSE release gate plus bounded concurrency stress.
+RUN_FUSE_CONCURRENCY_STRESS=1 bash e2e/fuse-release-gate.sh
+
 # POSIX permission smoke (API + CLI + FUSE).
 bash e2e/posix-permission-smoke-test.sh
 
@@ -237,7 +243,7 @@ CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
 - FUSE mount readiness knobs are `MOUNT_READY_TIMEOUT_S`, `MOUNT_READY_INTERVAL_S`, and `FUSE_MOUNT_ROOT`.
 - FUSE correctness workload knobs are `FUSE_CORRECTNESS_LARGE_MB` and `FUSE_CORRECTNESS_KEEP_ARTIFACTS`.
 - FUSE concurrency workload knobs are `FUSE_CONCURRENCY_WORKERS`, `FUSE_CONCURRENCY_FILES_PER_WORKER`, `FUSE_CONCURRENCY_READER_WORKERS`, `FUSE_CONCURRENCY_PAYLOAD_KB`, `FUSE_CONCURRENCY_TIMEOUT_S`, and `FUSE_CONCURRENCY_KEEP_ARTIFACTS`.
-- FUSE release-gate knobs are `FUSE_STRICT_PREREQS`, `RUN_FUSE_GIT_CLONE`, `FUSE_GIT_CLONE_URL`, `FUSE_GIT_CLONE_TIMEOUT_S`, `RUN_FUSE_UMOUNT_DURABLE`, `FUSE_UMOUNT_TIMEOUT`, `RUN_FUSE_LOG_AUDIT`, and the FUSE correctness/concurrency workload knobs.
+- FUSE release-gate knobs are `FUSE_STRICT_PREREQS`, `RUN_FUSE_GIT_CLONE`, `FUSE_GIT_CLONE_URL`, `FUSE_GIT_CLONE_TIMEOUT_S`, `RUN_FUSE_UMOUNT_DURABLE`, `FUSE_UMOUNT_TIMEOUT`, `RUN_FUSE_LOG_AUDIT`, `RUN_FUSE_CONCURRENCY_STRESS`, and the FUSE correctness/concurrency workload knobs.
 - Git workspace smoke defaults to `drive9`, `kimi-cli`, and `kimi-code`. Override with `GIT_WORKSPACE_REPOS='slug=https://example/repo.git,...'`.
 - Git workspace scenarios default to `agent_edit_add_commit,agent_patch_apply,sandbox_restore`; tune with `GIT_WORKSPACE_SCENARIOS`.
 - Git workspace file-count knobs are `GIT_WORKSPACE_EXISTING_FILES`, `GIT_WORKSPACE_NEW_FILES`, and `GIT_WORKSPACE_PATCH_FILES`.
@@ -249,4 +255,4 @@ CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
 - CLI upload-limit boundary check is enabled by default via `RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1`.
 - `CLI_UPLOAD_LIMIT_BYTES` controls the boundary value checked by CLI e2e (default `10737418240`).
 - `fuse-smoke-test.sh` will `SKIP` when host prerequisites are missing (for example no `/dev/fuse`) unless `FUSE_STRICT_PREREQS=1`.
-- `fuse-release-gate.sh` is the strict CI/release entry point and enables git clone/status/log, durable `umount --timeout` remount checks, mount-log audit, manifest read correctness, and bounded concurrency stress.
+- `fuse-release-gate.sh` is the strict CI/release entry point and enables git clone/status/log, durable `umount --timeout` remount checks, mount-log audit, and manifest read correctness. Set `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress.

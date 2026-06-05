@@ -323,7 +323,9 @@ the layout captured by that run.
 2. Enables small-repo git clone/status/log coverage
 3. Enables durable `umount --timeout` followed by remount visibility checks
 4. Enables mount-log audit and dumps mount logs on failure
-5. Runs manifest read correctness and bounded concurrency stress workloads
+5. Runs manifest read correctness workload
+6. Runs bounded concurrency stress workload only when
+   `RUN_FUSE_CONCURRENCY_STRESS=1`
 
 ### `smoke-all.sh`
 
