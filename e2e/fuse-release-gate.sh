@@ -16,3 +16,4 @@ export FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 
 bash "$SCRIPT_DIR/fuse-smoke-test.sh"
 bash "$SCRIPT_DIR/fuse-correctness-workload.sh"
+bash "$SCRIPT_DIR/fuse-concurrency-stress.sh"
