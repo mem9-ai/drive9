@@ -328,6 +328,15 @@ def add_expected(rel, data):
     }
 
 
+def is_transient_path(rel):
+    parts = rel.split(os.sep)
+    if rel == ".go-fuse-epoll-hack" or rel.endswith("/.go-fuse-epoll-hack"):
+        return True
+    if rel.startswith("churn/"):
+        return True
+    return any(part.startswith(".") or ".tmp." in part or part.endswith(".tmp") for part in parts)
+
+
 def fsync_parent(path):
     parent = os.path.dirname(path)
     if not parent:
@@ -411,7 +420,7 @@ def reader(reader_id):
                 for name in files:
                     path = os.path.join(current_root, name)
                     rel = os.path.relpath(path, root)
-                    if "/." in f"/{rel}" or rel.endswith(".tmp") or rel.startswith("churn/"):
+                    if is_transient_path(rel):
                         continue
                     try:
                         with open(path, "rb") as f:
@@ -454,7 +463,7 @@ def build_actual():
         for name in files:
             path = os.path.join(current_root, name)
             rel = os.path.relpath(path, root)
-            if rel == ".go-fuse-epoll-hack" or rel.endswith("/.go-fuse-epoll-hack"):
+            if is_transient_path(rel):
                 continue
             with open(path, "rb") as f:
                 data = f.read()
