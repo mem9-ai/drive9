@@ -46,18 +46,24 @@ jobs:
         run: |
           INPUT_TAG='${{ inputs.image_tag }}'
           if [ -n "$INPUT_TAG" ]; then
+            case "$INPUT_TAG" in
+              *[![:alnum:]_.-]*)
+                echo "Invalid image tag override" >&2
+                exit 1
+                ;;
+            esac
             IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$INPUT_TAG"
           else
-            IMAGE=$(kubectl --context dev -n ${{ env.DEPLOY_NAMESPACE }} \
-              get deployment/${{ env.K8S_DEPLOYMENT }} \
-              -o jsonpath='{.spec.template.spec.containers[?(@.name=="dat9-server")].image}')
+            IMAGE=$(kubectl --context dev -n "${{ env.DEPLOY_NAMESPACE }}" \
+              get "deployment/${{ env.K8S_DEPLOYMENT }}" \
+              -o 'jsonpath={.spec.template.spec.containers[?(@.name=="dat9-server")].image}')
           fi
           if [ -z "$IMAGE" ]; then
             echo "Failed to resolve image" >&2
             exit 1
           fi
           echo "Promoting image: $IMAGE"
-          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          printf '%s=%s\n' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
 
       - name: Deploy to ap-southeast-1
         if: inputs.region == '' || inputs.region == 'ap-southeast-1'
@@ -66,11 +72,11 @@ jobs:
             --name prod-dat9 \
             --region ap-southeast-1 \
             --alias prod
-          kubectl --context prod -n ${{ env.DEPLOY_NAMESPACE }} \
-            set image deployment/${{ env.K8S_DEPLOYMENT }} \
-            ${{ env.K8S_DEPLOYMENT }}=${{ env.IMAGE }}
-          kubectl --context prod -n ${{ env.DEPLOY_NAMESPACE }} \
-            rollout status deployment/${{ env.K8S_DEPLOYMENT }} \
+          kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
+            set image "deployment/${{ env.K8S_DEPLOYMENT }}" \
+            "${{ env.K8S_DEPLOYMENT }}=$IMAGE"
+          kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
+            rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
             --timeout=180s
 
       - name: Configure AWS credentials for us-east-1
@@ -86,9 +92,9 @@ jobs:
           aws eks update-kubeconfig \
             --name prod-dat9-us \
             --region us-east-1
-          kubectl -n ${{ env.DEPLOY_NAMESPACE }} \
-            set image deployment/${{ env.K8S_DEPLOYMENT }} \
-            ${{ env.K8S_DEPLOYMENT }}=${{ env.IMAGE }}
-          kubectl -n ${{ env.DEPLOY_NAMESPACE }} \
-            rollout status deployment/${{ env.K8S_DEPLOYMENT }} \
+          kubectl -n "${{ env.DEPLOY_NAMESPACE }}" \
+            set image "deployment/${{ env.K8S_DEPLOYMENT }}" \
+            "${{ env.K8S_DEPLOYMENT }}=$IMAGE"
+          kubectl -n "${{ env.DEPLOY_NAMESPACE }}" \
+            rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
             --timeout=180s
