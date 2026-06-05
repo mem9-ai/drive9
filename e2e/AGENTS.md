@@ -49,6 +49,9 @@ bash e2e/fuse-smoke-test.sh
 # Manifest-based FUSE read correctness workload
 bash e2e/fuse-correctness-workload.sh
 
+# Bounded FUSE concurrency stress workload
+bash e2e/fuse-concurrency-stress.sh
+
 # Git workspace smoke (fast-blobless clone + common agent Git workloads)
 bash e2e/git-workspace-smoke-test.sh
 
@@ -232,6 +235,25 @@ deterministic read-correctness coverage, not a write/concurrency/Git workload.
 9. Verify the read-only mount rejects writes
 10. Preserve run root, fixture root, and mount log on failure
 
+### `fuse-concurrency-stress.sh`
+
+Host support: Linux and macOS only. This script needs real FUSE support and is
+deterministic writable concurrency coverage, not a Git or cross-mount workload.
+
+1. Provision tenant unless `DRIVE9_API_KEY` is already set
+2. Prepare `drive9` CLI binary (build local or download official release)
+3. Mount a fresh writable namespace through real FUSE
+4. Run parallel writer threads that create files via temp-write/fsync/atomic
+   rename, append per-worker logs, churn create/unlink temp files, rename
+   directories into final locations, and verify open-handle reads across rename
+5. Run concurrent reader threads that continuously walk/read the mounted tree
+   and reject mixed, short, or corrupted reads of atomically published files
+6. Verify the final mounted tree exactly matches a deterministic manifest
+7. Unmount, copy the remote tree back through the CLI, and verify the remote
+   snapshot matches the same manifest
+8. Preserve run root, mount log, expected/actual manifests, and reader error log
+   on failure
+
 ### `git-workspace-smoke-test.sh`
 
 Host support: Linux and macOS only. This script needs real FUSE support and
@@ -301,6 +323,9 @@ the layout captured by that run.
 2. Enables small-repo git clone/status/log coverage
 3. Enables durable `umount --timeout` followed by remount visibility checks
 4. Enables mount-log audit and dumps mount logs on failure
+5. Runs manifest read correctness workload
+6. Runs bounded concurrency stress workload only when
+   `RUN_FUSE_CONCURRENCY_STRESS=1`
 
 ### `smoke-all.sh`
 
@@ -341,18 +366,24 @@ the layout captured by that run.
 | `RUN_CLI_FORK_CHECKS` | `1` (auto-skip when `/v1/fork` is unavailable) | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
-| `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh` |
-| `CLI_RELEASE_BASE_URL` | `https://drive9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh` |
-| `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh` |
-| `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh` |
-| `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh` |
-| `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh` |
-| `CLI_MAX_RETRIES` | `8` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh` |
-| `CLI_RETRY_SLEEP_S` | `2` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh` |
-| `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh` |
-| `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh` |
+| `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `CLI_RELEASE_BASE_URL` | `https://drive9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `CLI_MAX_RETRIES` | `8` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `CLI_RETRY_SLEEP_S` | `2` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
 | `FUSE_CORRECTNESS_LARGE_MB` | `9` | `fuse-correctness-workload.sh` |
 | `FUSE_CORRECTNESS_KEEP_ARTIFACTS` | `0` | `fuse-correctness-workload.sh` |
+| `FUSE_CONCURRENCY_WORKERS` | `4` | `fuse-concurrency-stress.sh` |
+| `FUSE_CONCURRENCY_FILES_PER_WORKER` | `8` | `fuse-concurrency-stress.sh` |
+| `FUSE_CONCURRENCY_READER_WORKERS` | `2` | `fuse-concurrency-stress.sh` |
+| `FUSE_CONCURRENCY_PAYLOAD_KB` | `32` | `fuse-concurrency-stress.sh` |
+| `FUSE_CONCURRENCY_TIMEOUT_S` | `120` | `fuse-concurrency-stress.sh` |
+| `FUSE_CONCURRENCY_KEEP_ARTIFACTS` | `0` | `fuse-concurrency-stress.sh` |
 | `RUN_FUSE_GIT_CLONE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `FUSE_GIT_CLONE_URL` | `https://github.com/octocat/Hello-World.git` | `fuse-smoke-test.sh` |
 | `FUSE_GIT_CLONE_TIMEOUT_S` | `180` | `fuse-smoke-test.sh` |
