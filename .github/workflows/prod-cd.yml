@@ -3,10 +3,11 @@ on:
   workflow_dispatch:
     inputs:
       region:
-        description: "Target region (empty = all regions)"
-        required: false
+        description: "Target region"
+        required: true
         type: choice
         options:
+          - all
           - ap-southeast-1
           - us-east-1
       image_tag:
@@ -22,7 +23,7 @@ env:
 
 jobs:
   deploy:
-    name: Deploy${{ inputs.region && format(' to {0}', inputs.region) || ' all regions' }}
+    name: Deploy to ${{ inputs.region }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
@@ -66,7 +67,7 @@ jobs:
           printf '%s=%s\n' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
 
       - name: Deploy to ap-southeast-1
-        if: inputs.region == '' || inputs.region == 'ap-southeast-1'
+        if: inputs.region == 'all' || inputs.region == 'ap-southeast-1'
         run: |
           aws eks update-kubeconfig \
             --name prod-dat9 \
@@ -79,22 +80,35 @@ jobs:
             rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
             --timeout=180s
 
+      - name: Rollback ap-southeast-1 on failure
+        if: failure() && (inputs.region == 'all' || inputs.region == 'ap-southeast-1')
+        run: |
+          kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
+            rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
+
       - name: Configure AWS credentials for us-east-1
-        if: inputs.region == '' || inputs.region == 'us-east-1'
+        if: inputs.region == 'all' || inputs.region == 'us-east-1'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ASSUME_ARN_US }}
           aws-region: us-east-1
 
       - name: Deploy to us-east-1
-        if: inputs.region == '' || inputs.region == 'us-east-1'
+        if: inputs.region == 'all' || inputs.region == 'us-east-1'
         run: |
           aws eks update-kubeconfig \
             --name prod-dat9-us \
-            --region us-east-1
-          kubectl -n "${{ env.DEPLOY_NAMESPACE }}" \
+            --region us-east-1 \
+            --alias us
+          kubectl --context us -n "${{ env.DEPLOY_NAMESPACE }}" \
             set image "deployment/${{ env.K8S_DEPLOYMENT }}" \
             "${{ env.K8S_DEPLOYMENT }}=$IMAGE"
-          kubectl -n "${{ env.DEPLOY_NAMESPACE }}" \
+          kubectl --context us -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
             --timeout=180s
+
+      - name: Rollback us-east-1 on failure
+        if: failure() && (inputs.region == 'all' || inputs.region == 'us-east-1')
+        run: |
+          kubectl --context us -n "${{ env.DEPLOY_NAMESPACE }}" \
+            rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
