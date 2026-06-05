@@ -243,7 +243,7 @@ stat_nlink() {
 relative_sorted_find() {
   local root="$1"
   local type_flag="$2"
-  find "$root" -type "$type_flag" -print | python3 - "$root" <<'PY'
+  find "$root" -type "$type_flag" -print | python3 -c '
 import os
 import sys
 root = os.path.abspath(sys.argv[1])
@@ -258,13 +258,13 @@ for line in sys.stdin:
     items.append(rel)
 for item in sorted(items):
     print(item)
-PY
+' "$root"
 }
 
 grep_relative_matches() {
   local pattern="$1"
   shift
-  { grep -R -l -- "$pattern" "$@" || true; } | python3 - "$MOUNT_POINT" <<'PY'
+  { grep -R -l -- "$pattern" "$@" || true; } | python3 -c '
 import os
 import sys
 root = os.path.abspath(sys.argv[1])
@@ -274,7 +274,7 @@ for line in sys.stdin:
     items.append(os.path.relpath(path, root))
 for item in sorted(items):
     print(item)
-PY
+' "$MOUNT_POINT"
 }
 
 create_fixture_tree() {
