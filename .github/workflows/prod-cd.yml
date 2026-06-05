@@ -30,7 +30,7 @@ jobs:
       contents: read
 
     steps:
-      - name: Configure AWS credentials for dev (ap-southeast-1)
+      - name: Configure AWS credentials (ap-southeast-1)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ASSUME_ARN_PROD }}
@@ -67,8 +67,10 @@ jobs:
           printf '%s=%s\n' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
 
       - name: Deploy to ap-southeast-1
+        id: deploy-sg
         if: inputs.region == 'all' || inputs.region == 'ap-southeast-1'
         run: |
+          echo "sg-deploy=1" >> "$GITHUB_ENV"
           aws eks update-kubeconfig \
             --name prod-dat9 \
             --region ap-southeast-1 \
@@ -81,12 +83,12 @@ jobs:
             --timeout=180s
 
       - name: Rollback ap-southeast-1 on failure
-        if: failure() && (inputs.region == 'all' || inputs.region == 'ap-southeast-1')
+        if: failure() && steps.deploy-sg.outcome == 'failure'
         run: |
           kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
 
-      - name: Configure AWS credentials for us-east-1
+      - name: Configure AWS credentials (us-east-1)
         if: inputs.region == 'all' || inputs.region == 'us-east-1'
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -94,8 +96,10 @@ jobs:
           aws-region: us-east-1
 
       - name: Deploy to us-east-1
+        id: deploy-us
         if: inputs.region == 'all' || inputs.region == 'us-east-1'
         run: |
+          echo "us-deploy=1" >> "$GITHUB_ENV"
           aws eks update-kubeconfig \
             --name prod-dat9-us \
             --region us-east-1 \
@@ -108,7 +112,7 @@ jobs:
             --timeout=180s
 
       - name: Rollback us-east-1 on failure
-        if: failure() && (inputs.region == 'all' || inputs.region == 'us-east-1')
+        if: failure() && steps.deploy-us.outcome == 'failure'
         run: |
           kubectl --context us -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
