@@ -36,3 +36,17 @@ func TestFactoryKMSEncryptorRequiresKey(t *testing.T) {
 		t.Fatal("expected kms key validation error")
 	}
 }
+
+func TestFactoryAliyunKMSRequiresKey(t *testing.T) {
+	_, err := New(context.Background(), Config{Type: TypeAliyunKMS, Region: "cn-hangzhou"})
+	if err == nil {
+		t.Fatal("expected aliyun_kms key validation error")
+	}
+}
+
+func TestFactoryAliyunKMSRequiresRegion(t *testing.T) {
+	_, err := New(context.Background(), Config{Type: TypeAliyunKMS, Key: "test-key"})
+	if err == nil {
+		t.Fatal("expected aliyun_kms region validation error")
+	}
+}
