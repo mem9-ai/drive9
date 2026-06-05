@@ -23,13 +23,20 @@ func NewAliyunKMSEncryptor(region, keyID string) (*AliyunKMSEncryptor, error) {
 	}
 	accessKeyID := os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_ID")
 	accessKeySecret := os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+	securityToken := os.Getenv("ALIBABA_CLOUD_SECURITY_TOKEN")
 	if accessKeyID == "" {
 		return nil, fmt.Errorf("ALIBABA_CLOUD_ACCESS_KEY_ID is required")
 	}
 	if accessKeySecret == "" {
 		return nil, fmt.Errorf("ALIBABA_CLOUD_ACCESS_KEY_SECRET is required")
 	}
-	client, err := kms.NewClientWithAccessKey(region, accessKeyID, accessKeySecret)
+	var client *kms.Client
+	var err error
+	if securityToken != "" {
+		client, err = kms.NewClientWithStsToken(region, accessKeyID, accessKeySecret, securityToken)
+	} else {
+		client, err = kms.NewClientWithAccessKey(region, accessKeyID, accessKeySecret)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("create aliyun kms client: %w", err)
 	}
@@ -45,7 +52,11 @@ func (e *AliyunKMSEncryptor) Encrypt(ctx context.Context, plaintext []byte) ([]b
 	if err != nil {
 		return nil, fmt.Errorf("aliyun kms encrypt: %w", err)
 	}
-	return base64.StdEncoding.DecodeString(resp.CiphertextBlob)
+	ciphertext, err := base64.StdEncoding.DecodeString(resp.CiphertextBlob)
+	if err != nil {
+		return nil, fmt.Errorf("aliyun kms encrypt: decode ciphertext: %w", err)
+	}
+	return ciphertext, nil
 }
 
 func (e *AliyunKMSEncryptor) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error) {
@@ -56,5 +67,9 @@ func (e *AliyunKMSEncryptor) Decrypt(ctx context.Context, ciphertext []byte) ([]
 	if err != nil {
 		return nil, fmt.Errorf("aliyun kms decrypt: %w", err)
 	}
-	return base64.StdEncoding.DecodeString(resp.Plaintext)
+	plaintext, err := base64.StdEncoding.DecodeString(resp.Plaintext)
+	if err != nil {
+		return nil, fmt.Errorf("aliyun kms decrypt: decode plaintext: %w", err)
+	}
+	return plaintext, nil
 }

@@ -174,17 +174,17 @@ func buildEncryptor() (encrypt.Encryptor, error) {
 
 	eKey := masterHex
 	eType := encrypt.Type(encryptType)
-	if eType == encrypt.TypeKMS {
+	if eType == encrypt.TypeKMS || eType == encrypt.TypeAliyunKMS {
 		eKey = kmsKey
 		if eKey == "" {
-			return nil, fmt.Errorf("DRIVE9_ENCRYPT_KEY is required when DRIVE9_ENCRYPT_TYPE=kms")
+			return nil, fmt.Errorf("DRIVE9_ENCRYPT_KEY is required when DRIVE9_ENCRYPT_TYPE=%s", encryptType)
 		}
 	}
-	if eKey == "" && eType != encrypt.TypeKMS {
+	if eKey == "" && eType != encrypt.TypeKMS && eType != encrypt.TypeAliyunKMS {
 		// Attempt hex decode — if DRIVE9_MASTER_KEY is not set, fail early.
 		return nil, fmt.Errorf("DRIVE9_MASTER_KEY is required for encrypting/decrypting tenant DB passwords")
 	}
-	if eType != encrypt.TypeKMS {
+	if eType != encrypt.TypeKMS && eType != encrypt.TypeAliyunKMS {
 		if _, err := hex.DecodeString(eKey); err != nil {
 			return nil, fmt.Errorf("invalid DRIVE9_MASTER_KEY hex: %w", err)
 		}
