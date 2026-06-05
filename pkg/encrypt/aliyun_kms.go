@@ -23,6 +23,12 @@ func NewAliyunKMSEncryptor(region, keyID string) (*AliyunKMSEncryptor, error) {
 	}
 	accessKeyID := os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_ID")
 	accessKeySecret := os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+	if accessKeyID == "" {
+		return nil, fmt.Errorf("ALIBABA_CLOUD_ACCESS_KEY_ID is required")
+	}
+	if accessKeySecret == "" {
+		return nil, fmt.Errorf("ALIBABA_CLOUD_ACCESS_KEY_SECRET is required")
+	}
 	client, err := kms.NewClientWithAccessKey(region, accessKeyID, accessKeySecret)
 	if err != nil {
 		return nil, fmt.Errorf("create aliyun kms client: %w", err)
