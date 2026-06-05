@@ -188,7 +188,7 @@ func main() {
 		}
 		eKey := masterHex
 		eType := encrypt.Type(encryptType)
-		if eType == encrypt.TypeKMS {
+		if eType == encrypt.TypeKMS || eType == encrypt.TypeAliyunKMS {
 			eKey = kmsKey
 		}
 		enc, err := encrypt.New(context.Background(), encrypt.Config{
@@ -380,10 +380,10 @@ environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
   DRIVE9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DRIVE9_META_DSN    control-plane MySQL DSN (required)
-  DRIVE9_ENCRYPT_TYPE local_aes|kms
-  DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
-  DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms)
-  DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
+   DRIVE9_ENCRYPT_TYPE local_aes|kms|aliyun_kms
+   DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
+   DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms), Aliyun KMS key id (required for aliyun_kms)
+   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
