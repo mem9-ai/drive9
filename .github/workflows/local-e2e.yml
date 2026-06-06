@@ -15,6 +15,23 @@ on:
       - "go.sum"
       - "Makefile"
   workflow_dispatch:
+    inputs:
+      run_fuse_sqlite_churn:
+        description: "Run opt-in FUSE SQLite churn workload"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+      run_fuse_sqlite_concurrency:
+        description: "Run opt-in FUSE SQLite readers/writer workload"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
 
 permissions:
   contents: read
@@ -31,6 +48,8 @@ env:
   DRIVE9_LOCAL_EMBEDDING_MODE: app
   RUN_SEMANTIC_CHECKS: "0"
   RUN_CLI_SEMANTIC_CHECKS: "0"
+  RUN_FUSE_SQLITE_CHURN: ${{ github.event.inputs.run_fuse_sqlite_churn || '0' }}
+  RUN_FUSE_SQLITE_CONCURRENCY: ${{ github.event.inputs.run_fuse_sqlite_concurrency || '0' }}
 
 jobs:
   local-e2e:
