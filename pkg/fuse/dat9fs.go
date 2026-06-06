@@ -1707,6 +1707,103 @@ restartLoop:
 	}
 }
 
+func (fs *Dat9FS) readSQLitePersistentJournalDirtyRange(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+	if fs == nil || fs.openHandles == nil || !isSQLitePersistentJournalPath(path) || reqSize == 0 {
+		return nil, 0, false, gofuse.OK
+	}
+
+	type candidate struct {
+		fh       *FileHandle
+		dirtySeq uint64
+	}
+
+restartLoop:
+	for {
+		var candidates []candidate
+		for _, src := range fs.openHandles.SnapshotPath(path) {
+			if src == nil || src == skip {
+				continue
+			}
+			if !src.TryLock() {
+				continue
+			}
+			if src.Dirty != nil && src.DirtySeq > 0 {
+				candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
+			}
+			src.Unlock()
+		}
+		sort.SliceStable(candidates, func(i, j int) bool {
+			return candidates[i].dirtySeq > candidates[j].dirtySeq
+		})
+
+	candidateLoop:
+		for _, c := range candidates {
+			src := c.fh
+			if !src.TryLock() {
+				continue
+			}
+			if src.Dirty == nil || src.DirtySeq == 0 {
+				src.Unlock()
+				continue
+			}
+			if src.DirtySeq != c.dirtySeq {
+				src.Unlock()
+				continue restartLoop
+			}
+			end := offset + int64(reqSize)
+			size := src.Dirty.Size()
+			if offset < 0 || end <= offset || end > size {
+				src.Unlock()
+				continue
+			}
+			buf := make([]byte, reqSize)
+
+			if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
+				src.Unlock()
+				n, err := fs.shadowStore.ReadAt(path, offset, buf)
+				if err != nil && !errors.Is(err, io.EOF) {
+					fs.debugf("read sqlite sidecar shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
+					continue
+				}
+				if n != int(reqSize) {
+					continue
+				}
+				return buf[:n], n, true, gofuse.OK
+			}
+
+			ps := src.Dirty.PartSize()
+			firstPart := int(offset / ps)
+			lastPart := int((end - 1) / ps)
+			touchesEvicted := false
+			if evicted := src.Dirty.StreamedPartIndices(); len(evicted) > 0 {
+				for p := firstPart; p <= lastPart; p++ {
+					if evicted[p] && !src.Dirty.IsPartLoaded(p) {
+						touchesEvicted = true
+						break
+					}
+				}
+			}
+			if touchesEvicted {
+				src.Unlock()
+				continue
+			}
+			for p := firstPart; p <= lastPart; p++ {
+				if !src.Dirty.IsPartLoaded(p) {
+					if err := src.Dirty.EnsureLoaded(p); err != nil {
+						src.Unlock()
+						fs.debugf("read sqlite sidecar dirty incomplete path=%s part=%d err=%v", path, p, err)
+						continue candidateLoop
+					}
+				}
+			}
+			src.Dirty.ReadAt(offset, buf)
+			src.Unlock()
+			return buf, len(buf), true, gofuse.OK
+		}
+		return nil, 0, false, gofuse.OK
+	}
+}
+
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 	size := entry.Size
 	if size < 0 {
@@ -5690,6 +5787,15 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// serve reads from those ranges — the data is on S3 but not in memory.
 	// For such ranges we fall through to the server read path.
 	if fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
+		if data, n, ok, st := fs.readSQLitePersistentJournalDirtyRange(fh.Path, fh, int64(input.Offset), input.Size); ok {
+			fh.Unlock()
+			source = "sqlite-sidecar-same-path-dirty"
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
 		if fh.Dirty.Size() == 0 && (fh.IsNew || fh.BaseRev == 0 || fh.OrigSize == 0) {
 			fh.Unlock()
 			source = "sqlite-sidecar-clean-empty-eof"
@@ -5835,6 +5941,14 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	if fh.Dirty == nil && isSQLitePersistentJournalPath(fh.Path) {
+		if data, n, ok, st := fs.readSQLitePersistentJournalDirtyRange(fh.Path, fh, int64(input.Offset), input.Size); ok {
+			source = "sqlite-sidecar-same-path-dirty"
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
 		entry, _ := fs.inodes.GetEntry(fh.Ino)
 		if (entry == nil || (entry.Size == 0 && entry.Revision == 0)) && fs.hasOpenPendingSQLitePersistentJournalCreate(fh.Path, fh) {
 			source = "sqlite-sidecar-open-empty-eof"

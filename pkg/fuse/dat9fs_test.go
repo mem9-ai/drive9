@@ -6841,10 +6841,10 @@ func TestReadSQLiteSamePathDirtyHandleBeforeRemote(t *testing.T) {
 	}
 }
 
-func TestReadSQLitePersistentJournalUsesRemoteCommittedBytesBeforeDirtyHandle(t *testing.T) {
+func TestReadSQLitePersistentJournalSkipsIncompleteDirtyHandle(t *testing.T) {
 	const filePath = "/workload.db-wal"
 	stable := []byte("stable committed wal bytes")
-	dirty := []byte("partial in-flight wal bytes")
+	dirty := []byte("partial")
 	var objectGets atomic.Int64
 
 	var ts *httptest.Server
@@ -6915,6 +6915,122 @@ func TestReadSQLitePersistentJournalUsesRemoteCommittedBytesBeforeDirtyHandle(t 
 	}
 	if got := objectGets.Load(); got != 1 {
 		t.Fatalf("object gets = %d, want 1", got)
+	}
+}
+
+func TestReadSQLitePersistentJournalUsesCompleteDirtyHandleBeforeRemote(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	want := bytes.Repeat([]byte{0x5a}, 4096)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted when same-mount WAL dirty range is complete", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+
+	reader := &FileHandle{Ino: ino, Path: filePath}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, len(want))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(want)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes = %q, want complete dirty WAL bytes", got)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalCleanWritableHandleUsesCompleteDirtyHandle(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	want := bytes.Repeat([]byte{0x6b}, 4096)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted when same-mount WAL dirty range is complete", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+
+	cleanBuffer := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if err := cleanBuffer.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	cleanBuffer.ClearDirty()
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    cleanBuffer,
+		IsNew:    true,
+		OrigSize: 0,
+		BaseRev:  0,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, len(want))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(want)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes = %q, want complete dirty WAL bytes", got)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
 	}
 }
 
