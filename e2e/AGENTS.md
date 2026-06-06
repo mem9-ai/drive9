@@ -339,8 +339,9 @@ the layout captured by that run.
 3. Enables durable `umount --timeout` followed by remount visibility checks
 4. Enables mount-log audit and dumps mount logs on failure
 5. Runs manifest read correctness workload
-6. Runs SQLite rollback-journal correctness workload only when
-   `RUN_FUSE_SQLITE_CORRECTNESS=1`
+6. Runs SQLite rollback-journal correctness workload by default; set
+   `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip it temporarily while diagnosing
+   host-specific FUSE failures
 7. Runs bounded concurrency stress workload only when
    `RUN_FUSE_CONCURRENCY_STRESS=1`
 
@@ -395,7 +396,7 @@ the layout captured by that run.
 | `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh` |
 | `FUSE_CORRECTNESS_LARGE_MB` | `9` | `fuse-correctness-workload.sh` |
 | `FUSE_CORRECTNESS_KEEP_ARTIFACTS` | `0` | `fuse-correctness-workload.sh` |
-| `RUN_FUSE_SQLITE_CORRECTNESS` | `0` | `fuse-release-gate.sh` |
+| `RUN_FUSE_SQLITE_CORRECTNESS` | `1` | `fuse-release-gate.sh` |
 | `FUSE_SQLITE_ROWS` | `64` | `fuse-sqlite-correctness.sh` |
 | `FUSE_SQLITE_KEEP_ARTIFACTS` | `0` | `fuse-sqlite-correctness.sh` |
 | `RUN_FUSE_SQLITE_WAL` | `0` | `fuse-sqlite-correctness.sh` |
