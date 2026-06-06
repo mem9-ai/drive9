@@ -650,8 +650,9 @@ func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error 
 }
 
 // uploadEntry uploads entry data to the server. Returns (committedRev, error).
-// committedRev > 0 when direct PUT is used (server returns revision inline);
-// committedRev == 0 for multipart uploads or ShadowSpill streams.
+// committedRev > 0 when the server-returned revision is available
+// (direct PUT or ShadowSpill streams). Larger buffered multipart uploads
+// currently return 0.
 func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int64, error) {
 	if cq.shadows == nil {
 		return 0, fmt.Errorf("no shadow store")

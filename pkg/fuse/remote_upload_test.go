@@ -23,9 +23,11 @@ type multipartUploadRecorder struct {
 	wantSize         int64
 	wantParts        int
 	wantExpected     *int64
+	committedRev     int64
 	initiateCalls    atomic.Int32
 	presignCalls     atomic.Int32
 	completeCalls    atomic.Int32
+	statCalls        atomic.Int32
 	s3PutCalls       atomic.Int32
 	directFilePuts   atomic.Int32
 	mu               sync.Mutex
@@ -41,12 +43,24 @@ func newMultipartUploadRecorder(t *testing.T, wantPath string, wantSize int64, w
 		wantSize:     wantSize,
 		wantParts:    int((wantSize + int64(s3client.PartSize) - 1) / int64(s3client.PartSize)),
 		wantExpected: wantExpected,
+		committedRev: 42,
 	}
 
 	rec.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
 			rec.directFilePuts.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+
+		case r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			rec.statCalls.Add(1)
+			gotPath := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+			if gotPath != rec.wantPath {
+				t.Fatalf("stat path = %q, want %q", gotPath, rec.wantPath)
+			}
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rec.committedRev, 10))
+			w.Header().Set("Content-Length", strconv.FormatInt(rec.wantSize, 10))
 			w.WriteHeader(http.StatusOK)
 			return
 
@@ -186,8 +200,8 @@ func TestUploadFromShadowRemoteWithRevisionStreamsSmallSpill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("uploadFromShadowRemoteWithRevision: %v", err)
 	}
-	if committedRev != 0 {
-		t.Fatalf("committed revision = %d, want 0 for multipart stream", committedRev)
+	if committedRev != rec.committedRev {
+		t.Fatalf("committed revision = %d, want %d", committedRev, rec.committedRev)
 	}
 	if rec.directFilePuts.Load() != 0 {
 		t.Fatalf("direct PUT count = %d, want 0", rec.directFilePuts.Load())
@@ -195,6 +209,9 @@ func TestUploadFromShadowRemoteWithRevisionStreamsSmallSpill(t *testing.T) {
 	if rec.initiateCalls.Load() != 1 || rec.presignCalls.Load() != 1 || rec.completeCalls.Load() != 1 || rec.s3PutCalls.Load() != 1 {
 		t.Fatalf("multipart flow calls = initiate:%d presign:%d complete:%d s3put:%d, want 1 each",
 			rec.initiateCalls.Load(), rec.presignCalls.Load(), rec.completeCalls.Load(), rec.s3PutCalls.Load())
+	}
+	if rec.statCalls.Load() != 1 {
+		t.Fatalf("stat calls = %d, want 1", rec.statCalls.Load())
 	}
 
 	rec.mu.Lock()

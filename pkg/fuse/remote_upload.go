@@ -38,7 +38,14 @@ func uploadFromShadowRemoteWithRevision(ctx context.Context, c *client.Client, s
 	}
 	ra := &shadowReaderAt{store: shadows, path: localPath}
 	sr := io.NewSectionReader(ra, 0, size)
-	return 0, c.WriteMultipartStreamConditional(ctx, remotePath, sr, size, nil, expectedRevision)
+	if err := c.WriteMultipartStreamConditional(ctx, remotePath, sr, size, nil, expectedRevision); err != nil {
+		return 0, err
+	}
+	stat, err := c.StatCtx(ctx, remotePath)
+	if err != nil {
+		return 0, err
+	}
+	return stat.Revision, nil
 }
 
 // shadowReaderAt adapts ShadowStore.ReadAt into an io.ReaderAt.

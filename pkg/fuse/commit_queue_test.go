@@ -915,9 +915,16 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	data := bytes.Repeat([]byte("shadowspill-data-"), 100) // ~1700 bytes
 	var gotExpected int64
 	var gotBody []byte
+	var statCalls atomic.Int32
+	var successRev int64
 	var ts *httptest.Server
 	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/big.bin":
+			statCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "13")
+			w.Header().Set("Content-Length", "1700")
+			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
 			var req struct {
 				Path             string `json:"path"`
@@ -983,6 +990,12 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		if entry.Path != "/big.bin" {
+			t.Fatalf("OnSuccess path = %q, want /big.bin", entry.Path)
+		}
+		successRev = committedRev
+	}
 	if err := cq.Enqueue(&CommitEntry{
 		Path:        "/big.bin",
 		BaseRev:     12,
@@ -999,6 +1012,12 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	}
 	if !bytes.Equal(gotBody, data) {
 		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
+	}
+	if statCalls.Load() != 1 {
+		t.Fatalf("stat calls = %d, want 1", statCalls.Load())
+	}
+	if successRev != 13 {
+		t.Fatalf("OnSuccess committedRev = %d, want 13", successRev)
 	}
 	if pending.HasPending("/big.bin") {
 		t.Fatal("pending entry should be removed after successful ShadowSpill commit")
@@ -1070,9 +1089,16 @@ func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
 func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 	data := bytes.Repeat([]byte("recover-"), 200)
 	var gotBody []byte
+	var statCalls atomic.Int32
+	var successRev int64
 	var ts *httptest.Server
 	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/recover.bin":
+			statCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "9")
+			w.Header().Set("Content-Length", "1600")
+			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
 			var req struct {
 				Path             string `json:"path"`
@@ -1168,12 +1194,24 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 	// RecoverPending should reconstruct CommitEntry with ShadowSpill=true,
 	// causing uploadEntry to use streaming (uploadFromShadow) not ReadAll.
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow2, pending2, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		if entry.Path != "/recover.bin" {
+			t.Fatalf("OnSuccess path = %q, want /recover.bin", entry.Path)
+		}
+		successRev = committedRev
+	}
 	cq.RecoverPending()
 	cq.DrainAll()
 
 	// Verify data arrived correctly at the server (streaming upload worked).
 	if !bytes.Equal(gotBody, data) {
 		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
+	}
+	if statCalls.Load() != 1 {
+		t.Fatalf("stat calls = %d, want 1", statCalls.Load())
+	}
+	if successRev != 9 {
+		t.Fatalf("OnSuccess committedRev = %d, want 9", successRev)
 	}
 	if pending2.HasPending("/recover.bin") {
 		t.Fatal("pending entry should be removed after successful recovery upload")
