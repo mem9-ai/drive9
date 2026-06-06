@@ -1558,6 +1558,47 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 	return false
 }
 
+func (fs *Dat9FS) hasOpenPendingSQLitePersistentJournalCreate(path string, skip *FileHandle) bool {
+	if fs == nil || fs.openHandles == nil || !isSQLitePersistentJournalPath(path) {
+		return false
+	}
+	for _, src := range fs.openHandles.SnapshotPath(path) {
+		if src == nil || src == skip {
+			continue
+		}
+		if !src.TryLock() {
+			continue
+		}
+		ok := src.Dirty != nil && src.IsNew && src.BaseRev == 0 && src.OrigSize == 0
+		src.Unlock()
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) prepareSQLitePersistentJournalLocalCreateWritableOpen(fh *FileHandle) bool {
+	if fh == nil || fh.Dirty == nil || !isSQLitePersistentJournalPath(fh.Path) {
+		return false
+	}
+	if fh.BaseRev != 0 || fh.OrigSize != 0 {
+		return false
+	}
+	if !fs.hasOpenPendingSQLitePersistentJournalCreate(fh.Path, fh) {
+		return false
+	}
+	if err := fh.Dirty.Truncate(0); err != nil {
+		log.Printf("sqlite sidecar local-create open truncate failed for %s: %v", fh.Path, err)
+		return false
+	}
+	fh.Dirty.ClearDirty()
+	fh.IsNew = true
+	fh.ZeroBase = true
+	fh.OrigSize = 0
+	return true
+}
+
 func (fs *Dat9FS) readSamePathDirtyHandle(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
 	if isSQLitePersistentJournalPath(path) {
 		return nil, 0, false, gofuse.OK
@@ -5421,6 +5462,9 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		// random writes don't discard the original file data.
 		if input.Flags&syscall.O_TRUNC == 0 {
 			preloaded := false
+			if fs.prepareSQLitePersistentJournalLocalCreateWritableOpen(fh) {
+				preloaded = true
+			}
 			if fs.loadWritableHandleFromOpenHandleLocked(fh) {
 				preloaded = true
 			}
@@ -5646,6 +5690,12 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// serve reads from those ranges — the data is on S3 but not in memory.
 	// For such ranges we fall through to the server read path.
 	if fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
+		if fh.Dirty.Size() == 0 && (fh.IsNew || fh.BaseRev == 0 || fh.OrigSize == 0) {
+			fh.Unlock()
+			source = "sqlite-sidecar-clean-empty-eof"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
 		source = "sqlite-sidecar-clean-remote"
 		fh.Unlock()
 		// Clean O_RDWR SQLite sidecar handles are reader snapshots. Do not
@@ -5782,6 +5832,15 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// Fall through to server read below
 	} else {
 		fh.Unlock()
+	}
+
+	if fh.Dirty == nil && isSQLitePersistentJournalPath(fh.Path) {
+		entry, _ := fs.inodes.GetEntry(fh.Ino)
+		if (entry == nil || (entry.Size == 0 && entry.Revision == 0)) && fs.hasOpenPendingSQLitePersistentJournalCreate(fh.Path, fh) {
+			source = "sqlite-sidecar-open-empty-eof"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
 	}
 
 	if fh.Layer == PathLayerGitWorkspace {

@@ -6655,6 +6655,60 @@ func TestOpenWritablePreloadSkipsSQLitePersistentJournalOpenHandle(t *testing.T)
 	}
 }
 
+func TestOpenWritableSQLitePersistentJournalLocalCreateDoesNotStatRemote(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for local uncommitted sqlite sidecar create", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/workload.db-wal"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	creator := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		IsNew:    true,
+		OrigSize: 0,
+		BaseRev:  0,
+	}
+	if err := creator.Dirty.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	creator.DirtySeq = fs.markDirtySize(ino, 0)
+	fs.openHandles.Add(creator)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+	reopened, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("reopened handle not found")
+	}
+	defer fs.deleteFileHandle(out.Fh, reopened)
+	reopened.Lock()
+	isNew := reopened.IsNew
+	baseRev := reopened.BaseRev
+	size := reopened.Dirty.Size()
+	reopened.Unlock()
+	if !isNew || baseRev != 0 || size != 0 {
+		t.Fatalf("reopened state isNew=%t baseRev=%d size=%d, want true/0/0", isNew, baseRev, size)
+	}
+}
+
 func TestOpenWritablePreloadReadsShadowBeforeEvictedBuffer(t *testing.T) {
 	var remoteCalls atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -6934,6 +6988,112 @@ func TestReadSQLitePersistentJournalCleanWritableHandleUsesRemoteCommittedBytes(
 	}
 	if got := objectGets.Load(); got != 1 {
 		t.Fatalf("object gets = %d, want 1", got)
+	}
+}
+
+func TestReadSQLitePersistentJournalCleanNewWritableHandleReturnsEOF(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for clean local-new sqlite sidecar", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/workload.db-wal"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	cleanBuffer := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if err := cleanBuffer.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	cleanBuffer.ClearDirty()
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    cleanBuffer,
+		IsNew:    true,
+		OrigSize: 0,
+		BaseRev:  0,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 16)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if len(got) != 0 {
+		t.Fatalf("read bytes = %q, want EOF", got)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalReadOnlyHandleSeesOpenEmptySidecarEOF(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for open empty sqlite sidecar", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/workload.db-wal"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	creator := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		IsNew:    true,
+		OrigSize: 0,
+		BaseRev:  0,
+	}
+	if err := creator.Dirty.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	creator.DirtySeq = fs.markDirtySize(ino, 0)
+	fs.openHandles.Add(creator)
+
+	reader := &FileHandle{Ino: ino, Path: filePath}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 16)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if len(got) != 0 {
+		t.Fatalf("read bytes = %q, want EOF", got)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
 	}
 }
 
