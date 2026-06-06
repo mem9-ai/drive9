@@ -307,7 +307,11 @@ drive9_retry() {
 }
 
 run_sqlite_workload() {
-  python3 - "$WORK_MOUNT" "$EXPECTED_JSON" "$FUSE_SQLITE_ROWS" "$RUN_FUSE_SQLITE_WAL" "$RUN_FUSE_SQLITE_CHURN" "$FUSE_SQLITE_CHURN_ROUNDS" "$RUN_FUSE_SQLITE_CONCURRENCY" "$FUSE_SQLITE_CONCURRENCY_READERS" "$FUSE_SQLITE_CONCURRENCY_WRITES" <<'PY'
+  local timeout_cmd=()
+  if [ "$FUSE_SQLITE_WORKLOAD_TIMEOUT_S" != "0" ] && command -v timeout >/dev/null 2>&1; then
+    timeout_cmd=(timeout --kill-after=10s "${FUSE_SQLITE_WORKLOAD_TIMEOUT_S}s")
+  fi
+  "${timeout_cmd[@]}" python3 - "$WORK_MOUNT" "$EXPECTED_JSON" "$FUSE_SQLITE_ROWS" "$RUN_FUSE_SQLITE_WAL" "$RUN_FUSE_SQLITE_CHURN" "$FUSE_SQLITE_CHURN_ROUNDS" "$RUN_FUSE_SQLITE_CONCURRENCY" "$FUSE_SQLITE_CONCURRENCY_READERS" "$FUSE_SQLITE_CONCURRENCY_WRITES" <<'PY'
 import hashlib
 import json
 import os
