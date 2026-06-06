@@ -1956,10 +1956,14 @@ func (fs *Dat9FS) clearReadTargetsForPathExcept(p string, skip *FileHandle) {
 		return
 	}
 	for _, fh := range fs.openHandles.SnapshotPath(p) {
-		if fh == skip {
+		if fh == nil || fh == skip {
 			continue
 		}
-		clearReadTargetForHandle(fh)
+		if !fh.TryLock() {
+			continue
+		}
+		clearReadTargetForLockedHandle(fh)
+		fh.Unlock()
 	}
 }
 
