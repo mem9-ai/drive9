@@ -6918,7 +6918,7 @@ func TestReadSQLitePersistentJournalSkipsIncompleteDirtyHandle(t *testing.T) {
 	}
 }
 
-func TestReadSQLitePersistentJournalUsesCommittedCacheBeforeInFlightDirty(t *testing.T) {
+func TestReadSQLitePersistentJournalUsesCompleteDirtyRangeBeforeCommittedCache(t *testing.T) {
 	const filePath = "/workload.db-wal"
 	committed := bytes.Repeat([]byte{0x5a}, 4096)
 	dirty := bytes.Repeat([]byte{0x7c}, 4096)
@@ -6926,7 +6926,7 @@ func TestReadSQLitePersistentJournalUsesCommittedCacheBeforeInFlightDirty(t *tes
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		remoteCalls.Add(1)
-		http.Error(w, "remote should not be consulted when committed WAL cache is available", http.StatusInternalServerError)
+		http.Error(w, "remote should not be consulted when same-mount WAL bytes are available", http.StatusInternalServerError)
 	}))
 	defer ts.Close()
 
@@ -6966,15 +6966,179 @@ func TestReadSQLitePersistentJournalUsesCommittedCacheBeforeInFlightDirty(t *tes
 	if st != gofuse.OK {
 		t.Fatalf("result.Bytes status = %v, want OK", st)
 	}
-	if !bytes.Equal(got, committed) {
-		t.Fatalf("read bytes = %q, want committed WAL cache bytes", got)
+	if !bytes.Equal(got, dirty) {
+		t.Fatalf("read bytes = %q, want complete dirty WAL bytes", got)
 	}
 	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
 		t.Fatalf("remote calls = %d, want 0", gotCalls)
 	}
 }
 
-func TestReadSQLitePersistentJournalCleanWritableHandleUsesCommittedCacheBeforeInFlightDirty(t *testing.T) {
+func TestReadSQLitePersistentJournalUsesCompleteDirtyRangeBeyondCommittedCache(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	committed := bytes.Repeat([]byte{0x5a}, 4096)
+	dirty := append(bytes.Repeat([]byte{0x5a}, 4096), bytes.Repeat([]byte{0x7c}, 4096)...)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted when complete same-mount WAL bytes are available", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(committed)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision(filePath, 7)
+	fs.readCache.Put(filePath, committed, 7)
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, dirty); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(dirty)))
+	fs.openHandles.Add(writer)
+
+	reader := &FileHandle{Ino: ino, Path: filePath}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 4096)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   4096,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if want := dirty[4096:]; !bytes.Equal(got, want) {
+		t.Fatalf("read bytes = %x, want complete dirty WAL range %x", got[:4], want[:4])
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalDirtyRangeRequiresFullRequest(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	dirty := append(bytes.Repeat([]byte{0x5a}, 4096), bytes.Repeat([]byte{0x7c}, 512)...)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be called by helper", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(dirty)), time.Now())
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, dirty); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(dirty)))
+	fs.openHandles.Add(writer)
+
+	if _, n, ok, st := fs.readSQLitePersistentJournalDirtyRange(filePath, nil, 4096, 4096); ok || st != gofuse.OK || n != 0 {
+		t.Fatalf("dirty range claimed=%t n=%d status=%v, want no claim/OK", ok, n, st)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalWaitsForCompleteDirtyRangeBeforeCommittedCache(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	committed := bytes.Repeat([]byte{0x5a}, 4096)
+	dirtyFirst := bytes.Repeat([]byte{0x5a}, 4096)
+	dirtySecond := bytes.Repeat([]byte{0x7c}, 4096)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted while same-mount WAL bytes are still completing", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(committed)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision(filePath, 7)
+	fs.readCache.Put(filePath, committed, 7)
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, dirtyFirst); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(dirtyFirst)))
+	fs.openHandles.Add(writer)
+
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-ready
+		time.Sleep(10 * time.Millisecond)
+		writer.Lock()
+		defer writer.Unlock()
+		if _, err := writer.Dirty.Write(int64(len(dirtyFirst)), dirtySecond); err != nil {
+			t.Errorf("writer dirty append failed: %v", err)
+			return
+		}
+		writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+	}()
+	close(ready)
+
+	reader := &FileHandle{Ino: ino, Path: filePath}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, len(dirtySecond))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   uint64(len(dirtyFirst)),
+		Size:     uint32(len(buf)),
+	}, buf)
+	<-done
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, dirtySecond) {
+		t.Fatalf("read bytes = %x, want completed dirty WAL range %x", got[:4], dirtySecond[:4])
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalCleanWritableHandleUsesCompleteDirtyRangeBeforeCommittedCache(t *testing.T) {
 	const filePath = "/workload.db-wal"
 	committed := bytes.Repeat([]byte{0x6b}, 4096)
 	dirty := bytes.Repeat([]byte{0x19}, 4096)
@@ -6982,7 +7146,7 @@ func TestReadSQLitePersistentJournalCleanWritableHandleUsesCommittedCacheBeforeI
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		remoteCalls.Add(1)
-		http.Error(w, "remote should not be consulted when committed WAL cache is available", http.StatusInternalServerError)
+		http.Error(w, "remote should not be consulted when same-mount WAL bytes are available", http.StatusInternalServerError)
 	}))
 	defer ts.Close()
 
@@ -7033,11 +7197,148 @@ func TestReadSQLitePersistentJournalCleanWritableHandleUsesCommittedCacheBeforeI
 	if st != gofuse.OK {
 		t.Fatalf("result.Bytes status = %v, want OK", st)
 	}
-	if !bytes.Equal(got, committed) {
-		t.Fatalf("read bytes = %q, want committed WAL cache bytes", got)
+	if !bytes.Equal(got, dirty) {
+		t.Fatalf("read bytes = %q, want complete dirty WAL bytes", got)
 	}
 	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
 		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalEmptyShadowCreateUsesSiblingDirtyRange(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	dirtyFirst := bytes.Repeat([]byte{0x1a}, 4096)
+	dirtySecond := bytes.Repeat([]byte{0x2b}, 4096)
+	dirty := append(dirtyFirst, dirtySecond...)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted when same-mount WAL bytes are available", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, dirty); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+	fs.openHandles.Add(writer)
+
+	if err := fs.shadowStore.Ensure(filePath, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	emptyCreate := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Flags:       syscall.O_RDWR | syscall.O_CREAT,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		IsNew:       true,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+	emptyCreate.Dirty.touched = true
+	emptyCreate.DirtySeq = fs.markDirtySize(ino, 0)
+	readerID := fs.allocateFileHandle(emptyCreate)
+	defer fs.deleteFileHandle(readerID, emptyCreate)
+
+	buf := make([]byte, len(dirtySecond))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   uint64(len(dirtyFirst)),
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, dirtySecond) {
+		t.Fatalf("read bytes = %x, want sibling dirty WAL bytes %x", got[:4], dirtySecond[:4])
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestFlushSQLitePersistentJournalSkipsStaleEmptyCreateAfterSiblingCommit(t *testing.T) {
+	const filePath = "/workload.db-wal"
+
+	for _, tc := range []struct {
+		name    string
+		isNew   bool
+		baseRev int64
+	}{
+		{name: "pending create not refreshed", isNew: true, baseRev: 0},
+		{name: "pending create already refreshed", isNew: false, baseRev: 41},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var remoteCalls atomic.Int64
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				remoteCalls.Add(1)
+				http.Error(w, "stale empty sidecar create must not overwrite committed WAL", http.StatusInternalServerError)
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+			fs.recordCommittedRevision(filePath, 41)
+			fs.inodes.UpdateRevision(ino, 41)
+
+			staleCreate := &FileHandle{
+				Ino:      ino,
+				Path:     filePath,
+				Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+				IsNew:    tc.isNew,
+				OrigSize: 0,
+				BaseRev:  tc.baseRev,
+			}
+			staleCreate.Dirty.touched = true
+			staleCreate.DirtySeq = fs.markDirtySize(ino, 0)
+
+			staleCreate.Lock()
+			st := fs.flushHandle(context.Background(), staleCreate)
+			staleCreate.Unlock()
+			if st != gofuse.OK {
+				t.Fatalf("flushHandle status = %v, want OK", st)
+			}
+			if got := remoteCalls.Load(); got != 0 {
+				t.Fatalf("remote calls = %d, want 0", got)
+			}
+			if staleCreate.IsNew {
+				t.Fatalf("stale empty create still marked new")
+			}
+			if staleCreate.BaseRev != 41 {
+				t.Fatalf("BaseRev = %d, want adopted committed revision 41", staleCreate.BaseRev)
+			}
+			if staleCreate.DirtySeq != 0 {
+				t.Fatalf("DirtySeq = %d, want cleared", staleCreate.DirtySeq)
+			}
+			if staleCreate.Dirty.HasDirtyParts() {
+				t.Fatalf("dirty state still set after stale empty create was cleared")
+			}
+		})
 	}
 }
 

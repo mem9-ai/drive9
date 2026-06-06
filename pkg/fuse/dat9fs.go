@@ -283,6 +283,9 @@ const (
 	// logged, to avoid noisy logs on hot lookup paths.
 	lookupRetrySuccessLogEvery uint64 = 200
 
+	sqliteSidecarDirtyWaitTimeout  = 250 * time.Millisecond
+	sqliteSidecarDirtyWaitInterval = time.Millisecond
+
 	// namespaceMutationRetryTimeout bounds detached retries for idempotent-ish
 	// namespace mutations after a FUSE interrupt or transient backend error.
 	namespaceMutationRetryTimeout = 2 * time.Second
@@ -1279,6 +1282,34 @@ func (fs *Dat9FS) cacheCommittedSQLitePersistentJournalLocked(fh *FileHandle, re
 	return true
 }
 
+func (fs *Dat9FS) clearStaleSQLitePersistentJournalEmptyCreateLocked(fh *FileHandle) bool {
+	if fs == nil || fh == nil || fh.Dirty == nil || !isSQLitePersistentJournalPath(fh.Path) {
+		return false
+	}
+	if fh.Dirty.Size() != 0 || fh.Dirty.hasDirtyPartMarks() || fh.ZeroBase || fh.Flags&syscall.O_TRUNC != 0 {
+		return false
+	}
+	revision := fs.latestCommittedRevision(fh.Path)
+	if revision <= 0 {
+		return false
+	}
+
+	if fh.DirtySeq != 0 {
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fh.DirtySeq = 0
+	}
+	fh.Dirty.ClearDirty()
+	fh.IsNew = false
+	fh.ZeroBase = false
+	fh.BaseRev = revision
+	if fh.Streamer != nil {
+		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	}
+	fs.inodes.UpdateRevision(fh.Ino, revision)
+	clearReadTargetForLockedHandle(fh)
+	return true
+}
+
 func writeBufferHasLoadedFullRange(wb *WriteBuffer) bool {
 	if wb == nil {
 		return false
@@ -1647,6 +1678,137 @@ func (fs *Dat9FS) readSamePathDirtyHandle(path string, skip *FileHandle, offset 
 		return nil, 0, false, gofuse.OK
 	}
 	return fs.readSamePathDirtyHandleAllowJournals(path, skip, offset, reqSize)
+}
+
+func (fs *Dat9FS) readSQLitePersistentJournalDirtyRange(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+	data, n, ok, st, _ := fs.readSQLitePersistentJournalDirtyRangeOnce(path, skip, offset, reqSize)
+	return data, n, ok, st
+}
+
+func (fs *Dat9FS) readSQLitePersistentJournalDirtyRangeOnce(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, bool) {
+	if fs == nil || fs.openHandles == nil || !isSQLitePersistentJournalPath(path) || path == "" || reqSize == 0 || offset < 0 {
+		return nil, 0, false, gofuse.OK, false
+	}
+	end := offset + int64(reqSize)
+	if end <= offset {
+		return nil, 0, false, gofuse.EINVAL, false
+	}
+
+	type candidate struct {
+		fh       *FileHandle
+		dirtySeq uint64
+	}
+
+restartLoop:
+	for {
+		var candidates []candidate
+		pending := false
+		for _, src := range fs.openHandles.SnapshotPath(path) {
+			if src == nil || src == skip {
+				continue
+			}
+			if !src.TryLock() {
+				pending = true
+				continue
+			}
+			if src.Dirty != nil && src.DirtySeq > 0 {
+				candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
+			}
+			src.Unlock()
+		}
+		sort.SliceStable(candidates, func(i, j int) bool {
+			return candidates[i].dirtySeq > candidates[j].dirtySeq
+		})
+
+	candidateLoop:
+		for _, c := range candidates {
+			src := c.fh
+			if !src.TryLock() {
+				continue
+			}
+			if src.Dirty == nil || src.DirtySeq == 0 {
+				src.Unlock()
+				continue
+			}
+			if src.DirtySeq != c.dirtySeq {
+				src.Unlock()
+				pending = true
+				continue restartLoop
+			}
+			if end > src.Dirty.Size() {
+				pending = true
+				src.Unlock()
+				continue
+			}
+
+			buf := make([]byte, int(reqSize))
+			if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
+				src.Unlock()
+				n, err := fs.shadowStore.ReadAt(path, offset, buf)
+				if err != nil && !errors.Is(err, io.EOF) {
+					fs.debugf("read sqlite sidecar shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
+					pending = true
+					continue
+				}
+				if n != len(buf) {
+					pending = true
+					continue
+				}
+				return buf, n, true, gofuse.OK, false
+			}
+
+			ps := src.Dirty.PartSize()
+			firstPart := int(offset / ps)
+			lastPart := int((end - 1) / ps)
+			if evicted := src.Dirty.StreamedPartIndices(); len(evicted) > 0 {
+				for p := firstPart; p <= lastPart; p++ {
+					if evicted[p] && !src.Dirty.IsPartLoaded(p) {
+						src.Unlock()
+						pending = true
+						continue candidateLoop
+					}
+				}
+			}
+			for p := firstPart; p <= lastPart; p++ {
+				if !src.Dirty.IsPartLoaded(p) {
+					src.Unlock()
+					pending = true
+					continue candidateLoop
+				}
+			}
+			n := src.Dirty.ReadAt(offset, buf)
+			src.Unlock()
+			if n != len(buf) {
+				pending = true
+				continue
+			}
+			return buf, n, true, gofuse.OK, false
+		}
+		return nil, 0, false, gofuse.OK, pending
+	}
+}
+
+func (fs *Dat9FS) readSQLitePersistentJournalVisibleRange(path string, skip *FileHandle, fallbackRevision int64, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, string) {
+	deadline := time.Now().Add(sqliteSidecarDirtyWaitTimeout)
+	for {
+		dirtyData, dirtyN, dirtyOK, st, pending := fs.readSQLitePersistentJournalDirtyRangeOnce(path, skip, offset, reqSize)
+		if dirtyOK || st != gofuse.OK {
+			return dirtyData, dirtyN, dirtyOK, st, "sqlite-sidecar-same-path-dirty"
+		}
+		if !pending {
+			break
+		}
+		if time.Now().After(deadline) {
+			fs.debugf("read sqlite sidecar dirty wait expired path=%s off=%d req=%d", path, offset, reqSize)
+			break
+		}
+		time.Sleep(sqliteSidecarDirtyWaitInterval)
+	}
+	cachedData, cachedN, cachedOK := fs.readSQLitePersistentJournalCommittedCache(path, fallbackRevision, offset, reqSize)
+	if cachedOK {
+		return cachedData, cachedN, true, gofuse.OK, "sqlite-sidecar-committed-cache"
+	}
+	return nil, 0, false, gofuse.OK, ""
 }
 
 func (fs *Dat9FS) readSamePathDirtyHandleAllowJournals(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
@@ -5659,6 +5821,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			return
 		}
 		d := time.Since(start)
+		if isSQLiteDirectIOPath(logPath) {
+			fs.debugf("read path=%s fh=%d ino=%d off=%d req=%d got=%d source=%s status=%d dur=%s", logPath, input.Fh, logIno, input.Offset, input.Size, bytesRead, source, status, d)
+			return
+		}
 		if status == gofuse.OK && d < fuseDebugSlowReadThreshold {
 			return
 		}
@@ -5727,6 +5893,23 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		return gofuse.ReadResultData(data), gofuse.OK
 	}
 
+	if fh.ShadowSpill && fs.shadowStore != nil && fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.Dirty.Size() == 0 && !fh.Dirty.hasDirtyPartMarks() && !fh.ZeroBase && fh.Flags&syscall.O_TRUNC == 0 {
+		handlePath := fh.Path
+		baseRev := fh.BaseRev
+		fh.Unlock()
+		if data, n, ok, st, src := fs.readSQLitePersistentJournalVisibleRange(handlePath, fh, baseRev, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+			source = src
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
+		source = "sqlite-sidecar-shadow-empty-eof"
+		bytesRead = 0
+		return gofuse.ReadResultData(nil), gofuse.OK
+	}
+
 	// ShadowSpill: read from shadow file (the authoritative data source).
 	// Dirty has evicted parts so ReadAt would return incomplete data.
 	if fh.ShadowSpill && fs.shadowStore != nil {
@@ -5762,20 +5945,24 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// serve reads from those ranges — the data is on S3 but not in memory.
 	// For such ranges we fall through to the server read path.
 	if fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
-		if data, n, ok := fs.readSQLitePersistentJournalCommittedCache(fh.Path, fh.BaseRev, int64(input.Offset), input.Size); ok {
-			fh.Unlock()
-			source = "sqlite-sidecar-committed-cache"
+		handlePath := fh.Path
+		baseRev := fh.BaseRev
+		cleanEmptyEOF := fh.Dirty.Size() == 0 && (fh.IsNew || fh.BaseRev == 0 || fh.OrigSize == 0)
+		fh.Unlock()
+		if data, n, ok, st, src := fs.readSQLitePersistentJournalVisibleRange(handlePath, fh, baseRev, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+			source = src
 			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
 			return gofuse.ReadResultData(data), gofuse.OK
 		}
-		if fh.Dirty.Size() == 0 && (fh.IsNew || fh.BaseRev == 0 || fh.OrigSize == 0) {
-			fh.Unlock()
+		if cleanEmptyEOF {
 			source = "sqlite-sidecar-clean-empty-eof"
 			bytesRead = 0
 			return gofuse.ReadResultData(nil), gofuse.OK
 		}
 		source = "sqlite-sidecar-clean-remote"
-		fh.Unlock()
 		// Clean O_RDWR SQLite sidecar handles are reader snapshots. Do not
 		// serve their preloaded WAL/journal bytes from the writable buffer:
 		// the shared -shm can point readers at a newer fsync-committed sidecar
@@ -5913,9 +6100,12 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	if fh.Dirty == nil && isSQLitePersistentJournalPath(fh.Path) {
-		if data, n, ok := fs.readSQLitePersistentJournalCommittedCache(fh.Path, fh.BaseRev, int64(input.Offset), input.Size); ok {
-			source = "sqlite-sidecar-committed-cache"
+		if data, n, ok, st, src := fs.readSQLitePersistentJournalVisibleRange(fh.Path, fh, fh.BaseRev, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+			source = src
 			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
 			return gofuse.ReadResultData(data), gofuse.OK
 		}
 		entry, _ := fs.inodes.GetEntry(fh.Ino)
@@ -6566,6 +6756,9 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 // network I/O, matching flushHandle's locking contract.
 func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
 	if fh == nil || fh.Dirty == nil {
+		return gofuse.OK
+	}
+	if fs.clearStaleSQLitePersistentJournalEmptyCreateLocked(fh) {
 		return gofuse.OK
 	}
 	if !fh.Dirty.HasDirtyParts() {
@@ -7686,6 +7879,10 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}()
 	if fh.Dirty == nil {
 		phase = "no-dirty-buffer"
+		return gofuse.OK
+	}
+	if fs.clearStaleSQLitePersistentJournalEmptyCreateLocked(fh) {
+		phase = "stale-sqlite-sidecar-empty-create"
 		return gofuse.OK
 	}
 	if !fh.Dirty.HasDirtyParts() {

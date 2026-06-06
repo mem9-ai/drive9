@@ -961,7 +961,7 @@ cleanup() {
     echo "Mount log: $MOUNT_LOG"
     if [ "$FUSE_SQLITE_MOUNT_DEBUG" = "1" ] && [ -f "$MOUNT_LOG" ]; then
       echo "=== mount log tail ==="
-      tail -n 400 "$MOUNT_LOG" || true
+      tail -n 3000 "$MOUNT_LOG" || true
     fi
     echo "Expected SQLite manifest: $EXPECTED_JSON"
     echo "Mounted SQLite manifest: $ACTUAL_MOUNT_JSON"
