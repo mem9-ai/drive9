@@ -6922,6 +6922,56 @@ func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	}
 }
 
+func TestFlushHandle_AdoptsSameMountCommittedRevision(t *testing.T) {
+	var gotExpected string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
+			if gotExpected != "8" {
+				http.Error(w, "bad expected revision", http.StatusConflict)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 9})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/wal.db-wal", false, 4, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision("/wal.db-wal", 8)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/wal.db-wal",
+		Dirty:   NewWriteBuffer("/wal.db-wal", maxPreloadSize, 0),
+		BaseRev: 7,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("next")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if gotExpected != "8" {
+		t.Fatalf("X-Dat9-Expected-Revision = %q, want 8", gotExpected)
+	}
+	if fh.BaseRev != 9 {
+		t.Fatalf("fh.BaseRev = %d, want 9", fh.BaseRev)
+	}
+}
+
 func TestReleaseNewEmptyFileUsesCreateAction(t *testing.T) {
 	var (
 		mu          sync.Mutex

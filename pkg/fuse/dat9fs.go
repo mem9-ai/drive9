@@ -36,6 +36,8 @@ type Dat9FS struct {
 	openHandles   *OpenHandleIndex
 	locks         *fuseLockTable
 	dirHandles    *HandleTable[*DirHandle]
+	committedMu   sync.Mutex
+	committedRev  map[string]int64
 	readCache     *ReadCache
 	diskReadCache *DiskReadCache
 	dirCache      *DirCache
@@ -218,6 +220,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		openHandles:       NewOpenHandleIndex(),
 		locks:             newFuseLockTable(),
 		dirHandles:        NewHandleTable[*DirHandle](),
+		committedRev:      make(map[string]int64),
 		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
 		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
 		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
@@ -731,10 +734,58 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision i
 	}
 }
 
+func (fs *Dat9FS) recordCommittedRevision(path string, revision int64) {
+	if fs == nil || path == "" || revision <= 0 {
+		return
+	}
+	fs.committedMu.Lock()
+	if fs.committedRev == nil {
+		fs.committedRev = make(map[string]int64)
+	}
+	if revision > fs.committedRev[path] {
+		fs.committedRev[path] = revision
+	}
+	fs.committedMu.Unlock()
+}
+
+func (fs *Dat9FS) latestCommittedRevision(path string) int64 {
+	if fs == nil || path == "" {
+		return 0
+	}
+	fs.committedMu.Lock()
+	revision := fs.committedRev[path]
+	fs.committedMu.Unlock()
+	return revision
+}
+
+func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
+	if fs == nil || fh == nil || fh.IsNew {
+		return
+	}
+	revision := fs.latestCommittedRevision(fh.Path)
+	if revision <= fh.BaseRev {
+		return
+	}
+	fh.BaseRev = revision
+	if fh.Streamer != nil {
+		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	}
+	if fh.ShadowReady && fs.shadowStore != nil {
+		size := int64(0)
+		if fh.Dirty != nil {
+			size = fh.Dirty.Size()
+		}
+		if err := fs.shadowStore.Ensure(fh.Path, size, revision); err != nil {
+			log.Printf("shadow base revision adopt failed for %s: %v", fh.Path, err)
+		}
+	}
+}
+
 func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64) {
 	if fs == nil || fh == nil || revision <= 0 {
 		return
 	}
+	fs.recordCommittedRevision(fh.Path, revision)
 	fh.IsNew = false
 	fh.BaseRev = revision
 	fs.inodes.UpdateRevision(fh.Ino, revision)
@@ -1042,6 +1093,11 @@ func expectedRevisionForHandle(fh *FileHandle) int64 {
 	return -1
 }
 
+func (fs *Dat9FS) expectedRevisionForHandleLocked(fh *FileHandle) int64 {
+	fs.adoptCommittedRevisionLocked(fh)
+	return expectedRevisionForHandle(fh)
+}
+
 func committedRevisionFromExpectedRevision(expectedRevision int64) (int64, bool) {
 	if expectedRevision < 0 {
 		return 0, false
@@ -1090,6 +1146,7 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	if !fs.canStageShadowFastLocked(fh) {
 		return syscall.ENOTSUP
 	}
+	fs.adoptCommittedRevisionLocked(fh)
 
 	size := fh.Dirty.Size()
 	if fh.ShadowReady {
@@ -1128,6 +1185,7 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 	if fh.Dirty == nil {
 		return nil
 	}
+	fs.adoptCommittedRevisionLocked(fh)
 	if !fh.ShadowReady && !fh.IsNew && !fh.Dirty.CanMaterializeFull() {
 		return syscall.ENOTSUP
 	}
@@ -5801,7 +5859,7 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 	}
 
 	size := fh.Dirty.Size()
-	expectedRevision := expectedRevisionForHandle(fh)
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	var (
 		data         []byte
 		committedRev int64
@@ -5931,7 +5989,7 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 
 	size := fh.Dirty.Size()
 	if fh.ShadowSpill && fs.shadowStore != nil {
-		expectedRevision := expectedRevisionForHandle(fh)
+		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("sync handle shadowspill upload start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
 		fh.Unlock()
@@ -5981,7 +6039,7 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 }
 
 func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
-	expectedRevision := expectedRevisionForHandle(fh)
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	writeStart := time.Now()
 	fs.debugf("sync empty create start path=%s expected_rev=%d", fh.Path, expectedRevision)
 	committedRev, err := fs.client.CreateFileCtx(ctx, fs.remotePath(fh.Path))
@@ -6203,7 +6261,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 			defer uploadCancel()
 			phase = "large-shadowspill-sync-upload"
-			expectedRevision := expectedRevisionForHandle(fh)
+			expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 			uploadStart := time.Now()
 			fs.debugf("flush shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 			fh.Unlock()
@@ -6413,7 +6471,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	// ShadowSpill strict: synchronous streaming upload from shadow.
 	if fh.ShadowSpill && fs.shadowStore != nil {
 		size := fh.Dirty.Size()
-		expectedRevision := expectedRevisionForHandle(fh)
+		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 		defer uploadCancel()
 		phase = "shadowspill-sync-upload"
@@ -6468,6 +6526,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if fs.writeBack != nil && fs.uploader != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq {
 		// Snapshot matches current dirty state — safe to upload.
 		phase = "writeback-upload-sync"
+		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
 		committedRev, err := fs.uploader.UploadSyncWithRevision(ctx, fh.Path)
@@ -6496,7 +6555,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		if committedRev > 0 {
 			fs.markHandleRemoteCommittedLocked(fh, committedRev)
 		} else {
-			fs.finalizeHandleFlushLocked(fh, expectedRevisionForHandle(fh))
+			fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		}
 	} else if fs.writeBack != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq != fh.DirtySeq {
 		// Snapshot is stale — discard it so we don't upload old data.
@@ -6764,7 +6823,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				phase = "shadowspill-sync-upload"
 				uploadStart := time.Now()
 				fs.debugf("release shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
-				uploadErr := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
+				uploadErr := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), fs.expectedRevisionForHandleLocked(fh))
 				var uploadBytes uint64
 				if size > 0 {
 					uploadBytes = uint64(size)
@@ -6930,7 +6989,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	ino := fh.Ino
 	handle := fh               // capture for goroutine
 	snapshotSeq := fh.DirtySeq // capture current dirty sequence
-	expectedRevision := expectedRevisionForHandle(fh)
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 
 	fs.debouncer.Schedule(filePath, func() {
 		handle.Lock()
@@ -7175,7 +7234,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 
 	// Path 2: No streaming uploader or small file — materialize all data for upload.
 	data := fh.Dirty.bytesView()
-	expectedRevision := expectedRevisionForHandle(fh)
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	var committedRev int64
 
 	// Use the negotiated server threshold (not the heuristic-only inline
@@ -7403,6 +7462,12 @@ func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, a
 // It seeds readCache and updates inode revision when committedRev is available,
 // or invalidates the cache otherwise.
 func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
+	if entry == nil {
+		return
+	}
+	if committedRev > 0 {
+		fs.recordCommittedRevision(entry.Path, committedRev)
+	}
 	if committedRev > 0 && entry.Inode > 0 {
 		fs.clearReadTargetsForPath(entry.Path)
 		// Seed readCache from shadow data before the shadow file is removed.
