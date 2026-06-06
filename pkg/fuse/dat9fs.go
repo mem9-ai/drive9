@@ -2040,40 +2040,20 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, loc
 		size int64
 	}
 	var candidates []candidate
-
-	targetIno := uint64(0)
-	if fs.inodes != nil {
-		if ino, ok := fs.inodes.GetInode(localPath); ok {
-			targetIno = ino
+	for _, fh := range fs.openHandles.SnapshotPath(localPath) {
+		if fh == nil {
+			continue
 		}
-	}
-	seen := make(map[*FileHandle]struct{})
-	collect := func(handles []*FileHandle) {
-		for _, fh := range handles {
-			if fh == nil {
-				continue
-			}
-			if _, ok := seen[fh]; ok {
-				continue
-			}
-			seen[fh] = struct{}{}
-			inodeSize := fs.inodeSnapshotSize(fh.Ino)
-			fh.Lock()
-			handlePath := fh.Path
-			handleIno := fh.Ino
-			size, eligible := unlinkSnapshotSizeLocked(fh, inodeSize)
-			fh.Unlock()
+		inodeSize := fs.inodeSnapshotSize(fh.Ino)
+		fh.Lock()
+		handlePath := fh.Path
+		size, eligible := unlinkSnapshotSizeLocked(fh, inodeSize)
+		fh.Unlock()
 
-			sameFile := handlePath == localPath || (targetIno != 0 && handleIno == targetIno)
-			if !eligible || !sameFile || size < 0 || size > maxPreloadSize {
-				continue
-			}
-			candidates = append(candidates, candidate{fh: fh, size: size})
+		if !eligible || handlePath != localPath || size < 0 || size > maxPreloadSize {
+			continue
 		}
-	}
-	collect(fs.openHandles.SnapshotPath(localPath))
-	if targetIno != 0 {
-		collect(fs.openHandles.SnapshotInode(targetIno))
+		candidates = append(candidates, candidate{fh: fh, size: size})
 	}
 
 	snapshots := make(map[int64][]byte)
@@ -2096,11 +2076,8 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, loc
 
 		inodeSize := fs.inodeSnapshotSize(cand.fh.Ino)
 		cand.fh.Lock()
-		handlePath := cand.fh.Path
-		handleIno := cand.fh.Ino
 		_, eligible := unlinkSnapshotSizeLocked(cand.fh, inodeSize)
-		sameFile := handlePath == localPath || (targetIno != 0 && handleIno == targetIno)
-		if sameFile && eligible {
+		if cand.fh.Path == localPath && eligible {
 			cand.fh.UnlinkedData = cloneBytes(data)
 			clearReadTargetForLockedHandle(cand.fh)
 		}
