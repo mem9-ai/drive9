@@ -904,6 +904,27 @@ func TestDat9FSSQLitePersistentJournalBypassesDiskReadCacheKey(t *testing.T) {
 	}
 }
 
+func TestDat9FSSQLiteMainDatabaseDiskReadCacheDependsOnOpenSidecar(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+
+	const dbPath = "/repo/workload.db"
+	entry := &InodeEntry{Path: dbPath, Size: 4096, Revision: 7}
+	if _, ok := fs.diskReadCacheKey(dbPath, entry, 0, 1024); !ok {
+		t.Fatal("sqlite main database disk read cache key unavailable without sidecar")
+	}
+
+	walHandle := &FileHandle{Ino: 11, Path: dbPath + "-wal"}
+	walHandleID := fs.allocateFileHandle(walHandle)
+	defer fs.deleteFileHandle(walHandleID, walHandle)
+
+	if key, ok := fs.diskReadCacheKey(dbPath, entry, 0, 1024); ok {
+		t.Fatalf("sqlite main database disk read cache key with active sidecar = %+v, want disabled", key)
+	}
+}
+
 func TestDat9FSReadSQLitePersistentJournalBypassesSmallReadCache(t *testing.T) {
 	const path = "/repo/workload.db-wal"
 	var reads atomic.Int32
@@ -951,6 +972,109 @@ func TestDat9FSReadSQLitePersistentJournalBypassesSmallReadCache(t *testing.T) {
 	}
 	if calls := reads.Load(); calls != 2 {
 		t.Fatalf("server reads = %d, want 2", calls)
+	}
+	recorder.Check(t)
+}
+
+func TestDat9FSReadSQLiteMainDatabaseBypassesSmallReadCacheWithOpenSidecar(t *testing.T) {
+	const path = "/repo/workload.db"
+	var reads atomic.Int32
+	var recorder testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs/repo/workload.db" {
+			recorder.Recordf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		switch reads.Add(1) {
+		case 1:
+			_, _ = w.Write([]byte("old-db"))
+		case 2:
+			_, _ = w.Write([]byte("new-db"))
+		default:
+			recorder.Recordf("unexpected read count")
+			http.Error(w, "unexpected read count", http.StatusTooManyRequests)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(path, false, 6, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	walHandle := &FileHandle{Ino: ino + 1, Path: path + "-wal"}
+	walHandleID := fs.allocateFileHandle(walHandle)
+	defer fs.deleteFileHandle(walHandleID, walHandle)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "old-db" {
+		t.Fatalf("first read = %q, %v; want old-db OK", got, st)
+	}
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, 0, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "new-db" {
+		t.Fatalf("second read = %q, %v; want new-db OK", got, st)
+	}
+	if calls := reads.Load(); calls != 2 {
+		t.Fatalf("server reads = %d, want 2", calls)
+	}
+	recorder.Check(t)
+}
+
+func TestDat9FSReadSQLiteMainDatabaseUsesSmallReadCacheWithoutOpenSidecar(t *testing.T) {
+	const path = "/repo/workload.db"
+	var reads atomic.Int32
+	var recorder testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs/repo/workload.db" {
+			recorder.Recordf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		switch reads.Add(1) {
+		case 1:
+			_, _ = w.Write([]byte("cached"))
+		default:
+			recorder.Recordf("unexpected read count")
+			http.Error(w, "unexpected read count", http.StatusTooManyRequests)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(path, false, 6, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "cached" {
+		t.Fatalf("first read = %q, %v; want cached OK", got, st)
+	}
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, 0, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "cached" {
+		t.Fatalf("second read = %q, %v; want cached OK", got, st)
+	}
+	if calls := reads.Load(); calls != 1 {
+		t.Fatalf("server reads = %d, want 1", calls)
 	}
 	recorder.Check(t)
 }

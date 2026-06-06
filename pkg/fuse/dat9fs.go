@@ -472,8 +472,43 @@ func isSQLitePersistentJournalPath(localPath string) bool {
 	return strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-journal")
 }
 
-func bypassStableRemoteReadCaches(localPath string) bool {
+func isSQLiteMainDatabasePath(localPath string) bool {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil {
+		return false
+	}
+	name := path.Base(canonical)
+	if name == "" || name == "." || name == "/" {
+		return false
+	}
+	return strings.HasSuffix(name, ".db") || strings.HasSuffix(name, ".sqlite") || strings.HasSuffix(name, ".sqlite3")
+}
+
+func bypassStableRemoteReadCachesForSQLiteSidecar(localPath string) bool {
 	return isSQLitePersistentJournalPath(localPath)
+}
+
+func sqliteMainDatabaseSidecarPaths(localPath string) []string {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil || !isSQLiteMainDatabasePath(canonical) {
+		return nil
+	}
+	return []string{canonical + "-wal", canonical + "-journal", canonical + "-shm"}
+}
+
+func (fs *Dat9FS) bypassStableRemoteReadCaches(localPath string) bool {
+	if bypassStableRemoteReadCachesForSQLiteSidecar(localPath) {
+		return true
+	}
+	if fs == nil || fs.openHandles == nil || !isSQLiteMainDatabasePath(localPath) {
+		return false
+	}
+	for _, sidecarPath := range sqliteMainDatabaseSidecarPaths(localPath) {
+		if fs.openHandles.Has(0, sidecarPath) {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath string) bool {
@@ -485,14 +520,10 @@ func isSQLiteVisibleSamePathDirtyPath(localPath string) bool {
 	if err != nil {
 		return false
 	}
-	name := path.Base(canonical)
 	if isSQLitePersistentJournalPath(canonical) {
 		return true
 	}
-	if name == "" || name == "." || name == "/" {
-		return false
-	}
-	return strings.HasSuffix(name, ".db") || strings.HasSuffix(name, ".sqlite") || strings.HasSuffix(name, ".sqlite3")
+	return isSQLiteMainDatabasePath(canonical)
 }
 
 func remoteOpenFlagsForHandle(fh *FileHandle) uint32 {
@@ -1915,7 +1946,7 @@ func (fs *Dat9FS) readTargetForHandle(ctx context.Context, fh *FileHandle) *clie
 	target := fh.ReadTarget
 	handlePath := fh.Path
 	remotePath := fs.remotePath(handlePath)
-	if bypassStableRemoteReadCaches(handlePath) {
+	if fs.bypassStableRemoteReadCaches(handlePath) {
 		if target != nil {
 			fh.ReadTarget = nil
 			if fh.Prefetch != nil {
@@ -2148,7 +2179,7 @@ func diskReadCacheFileID(p string, entry *InodeEntry) string {
 }
 
 func (fs *Dat9FS) diskReadCacheKey(p string, entry *InodeEntry, offset, size int64) (DiskReadCacheKey, bool) {
-	if fs == nil || fs.diskReadCache == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || offset < 0 || size <= 0 || bypassStableRemoteReadCaches(p) {
+	if fs == nil || fs.diskReadCache == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || offset < 0 || size <= 0 || fs.bypassStableRemoteReadCaches(p) {
 		return DiskReadCacheKey{}, false
 	}
 	key := DiskReadCacheKey{
@@ -5797,7 +5828,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	p := fh.Path
-	bypassStableCaches := bypassStableRemoteReadCaches(p)
+	bypassStableCaches := fs.bypassStableRemoteReadCaches(p)
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
 	revalidatedForRead := false
 	if entry != nil && !fs.statCacheVerified() {
