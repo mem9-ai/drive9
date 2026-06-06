@@ -7430,6 +7430,46 @@ func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.
 	}
 }
 
+func TestFinalizeHandleFlushLocked_RecordsAndRefreshesSamePathRevision(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	ino := fs.inodes.Lookup("/stream.db-wal", false, 4, time.Now())
+	writer := &FileHandle{
+		Ino:     ino,
+		Path:    "/stream.db-wal",
+		Dirty:   NewWriteBuffer("/stream.db-wal", maxPreloadSize, 0),
+		BaseRev: 11,
+	}
+	sibling := &FileHandle{
+		Ino:      ino,
+		Path:     "/stream.db-wal",
+		Dirty:    NewWriteBuffer("/stream.db-wal", maxPreloadSize, 0),
+		BaseRev:  11,
+		Streamer: NewStreamUploader(nil, "/stream.db-wal", 11),
+	}
+	fs.openHandles.Add(writer)
+	fs.openHandles.Add(sibling)
+
+	writer.Lock()
+	fs.finalizeHandleFlushLocked(writer, 11)
+	writer.Unlock()
+
+	if got := fs.latestCommittedRevision("/stream.db-wal"); got != 12 {
+		t.Fatalf("latest committed revision = %d, want 12", got)
+	}
+	if writer.BaseRev != 12 {
+		t.Fatalf("writer BaseRev = %d, want 12", writer.BaseRev)
+	}
+	if sibling.BaseRev != 12 {
+		t.Fatalf("sibling BaseRev = %d, want 12", sibling.BaseRev)
+	}
+	if got := sibling.Streamer.ExpectedRevision(); got != 12 {
+		t.Fatalf("sibling streamer expected revision = %d, want 12", got)
+	}
+}
+
 func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	const callerPID = 4242
 

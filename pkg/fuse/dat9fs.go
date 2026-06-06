@@ -1169,6 +1169,8 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
 		fh.BaseRev = revision
 		fs.inodes.UpdateRevision(fh.Ino, revision)
+		fs.recordCommittedRevision(fh.Path, revision)
+		fs.refreshCommittedRevisionForOpenHandles(fh.Path, revision, fh)
 	} else {
 		// The flush succeeded, but it was unconditional, so the precise
 		// post-commit revision is unknown. Clear the cached revision instead of
@@ -7260,7 +7262,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// size and uploads from pendingParts), not Path 1b's UploadAll.
 	if fh.Streamer != nil && fh.Streamer.Started() {
 		phase = "finish-streaming"
-		expectedRevision := fh.Streamer.ExpectedRevision()
+		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		partSize := fh.Dirty.PartSize()
 		numParts := int((size + partSize - 1) / partSize)
 		lastPartNum := numParts // 1-based
@@ -7334,7 +7336,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// (non-sequential writes) — upload all parts in parallel at flush time.
 	if fh.Streamer != nil && size >= fs.inlineThreshold() {
 		phase = "upload-all"
-		expectedRevision := fh.Streamer.ExpectedRevision()
+		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
 		partSnapshots := make(map[int][]byte, numParts)
 		for pn := 1; pn <= numParts; pn++ {
