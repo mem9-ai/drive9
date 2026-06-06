@@ -6617,6 +6617,61 @@ func TestReadSQLiteSamePathDirtyHandleBeforeShadowStore(t *testing.T) {
 	}
 }
 
+func TestReadSQLiteSamePathDirtyHandleWaitsForLockedCandidate(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	const filePath = "/workload.db-wal"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	want := []byte("locked writer bytes")
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+
+	writer.Lock()
+	done := make(chan struct{})
+	var (
+		gotData []byte
+		gotN    int
+		gotOK   bool
+		gotSt   gofuse.Status
+	)
+	go func() {
+		defer close(done)
+		gotData, gotN, gotOK, gotSt = fs.readSamePathDirtyHandle(filePath, nil, 0, 64)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("read returned before active writer handle unlocked")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	writer.Unlock()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("read did not return after writer handle unlocked")
+	}
+	if !gotOK {
+		t.Fatal("read should claim the same-path dirty writer")
+	}
+	if gotSt != gofuse.OK {
+		t.Fatalf("status = %v, want OK", gotSt)
+	}
+	if gotN != len(want) || !bytes.Equal(gotData, want) {
+		t.Fatalf("read = %q/%d, want %q/%d", gotData, gotN, want, len(want))
+	}
+}
+
 func TestReadSQLiteSamePathDirtyHandleSkipsIncompleteCandidate(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

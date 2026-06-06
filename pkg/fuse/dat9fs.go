@@ -1456,86 +1456,96 @@ func (fs *Dat9FS) readSamePathDirtyHandle(path string, skip *FileHandle, offset 
 		fh       *FileHandle
 		dirtySeq uint64
 	}
-	var candidates []candidate
-	for _, src := range fs.openHandles.SnapshotPath(path) {
-		if src == nil || src == skip {
-			continue
-		}
-		src.Lock()
-		if src.Dirty != nil && src.DirtySeq > 0 {
-			candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
-		}
-		src.Unlock()
-	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return candidates[i].dirtySeq > candidates[j].dirtySeq
-	})
 
-candidateLoop:
-	for _, c := range candidates {
-		src := c.fh
-		if !src.TryLock() {
-			continue
-		}
-		if src.Dirty == nil || src.DirtySeq != c.dirtySeq {
-			src.Unlock()
-			continue
-		}
-		size := src.Dirty.Size()
-		if offset >= size {
-			src.Unlock()
-			return nil, 0, true, gofuse.OK
-		}
-		end := offset + int64(reqSize)
-		if end > size {
-			end = size
-		}
-		if end <= offset {
-			src.Unlock()
-			return nil, 0, true, gofuse.OK
-		}
-		buf := make([]byte, end-offset)
-
-		if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
-			src.Unlock()
-			n, err := fs.shadowStore.ReadAt(path, offset, buf)
-			if err != nil {
-				fs.debugf("read same-path shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
+restartLoop:
+	for {
+		var candidates []candidate
+		for _, src := range fs.openHandles.SnapshotPath(path) {
+			if src == nil || src == skip {
 				continue
 			}
-			return buf[:n], n, true, gofuse.OK
-		}
-
-		ps := src.Dirty.PartSize()
-		firstPart := int(offset / ps)
-		lastPart := int((end - 1) / ps)
-		touchesEvicted := false
-		if evicted := src.Dirty.StreamedPartIndices(); len(evicted) > 0 {
-			for p := firstPart; p <= lastPart; p++ {
-				if evicted[p] && !src.Dirty.IsPartLoaded(p) {
-					touchesEvicted = true
-					break
-				}
+			src.Lock()
+			if src.Dirty != nil && src.DirtySeq > 0 {
+				candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
 			}
-		}
-		if touchesEvicted {
 			src.Unlock()
-			continue
 		}
-		for p := firstPart; p <= lastPart; p++ {
-			if !src.Dirty.IsPartLoaded(p) {
-				if err := src.Dirty.EnsureLoaded(p); err != nil {
-					src.Unlock()
-					fs.debugf("read same-path dirty incomplete path=%s part=%d err=%v", path, p, err)
-					continue candidateLoop
+		sort.SliceStable(candidates, func(i, j int) bool {
+			return candidates[i].dirtySeq > candidates[j].dirtySeq
+		})
+
+	candidateLoop:
+		for _, c := range candidates {
+			src := c.fh
+			if !src.TryLock() {
+				src.Lock()
+				src.Unlock()
+				continue restartLoop
+			}
+			if src.Dirty == nil || src.DirtySeq == 0 {
+				src.Unlock()
+				continue
+			}
+			if src.DirtySeq != c.dirtySeq {
+				src.Unlock()
+				continue restartLoop
+			}
+			size := src.Dirty.Size()
+			if offset >= size {
+				src.Unlock()
+				return nil, 0, true, gofuse.OK
+			}
+			end := offset + int64(reqSize)
+			if end > size {
+				end = size
+			}
+			if end <= offset {
+				src.Unlock()
+				return nil, 0, true, gofuse.OK
+			}
+			buf := make([]byte, end-offset)
+
+			if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
+				src.Unlock()
+				n, err := fs.shadowStore.ReadAt(path, offset, buf)
+				if err != nil {
+					fs.debugf("read same-path shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
+					continue
+				}
+				return buf[:n], n, true, gofuse.OK
+			}
+
+			ps := src.Dirty.PartSize()
+			firstPart := int(offset / ps)
+			lastPart := int((end - 1) / ps)
+			touchesEvicted := false
+			if evicted := src.Dirty.StreamedPartIndices(); len(evicted) > 0 {
+				for p := firstPart; p <= lastPart; p++ {
+					if evicted[p] && !src.Dirty.IsPartLoaded(p) {
+						touchesEvicted = true
+						break
+					}
 				}
 			}
+			if touchesEvicted {
+				src.Unlock()
+				continue
+			}
+			for p := firstPart; p <= lastPart; p++ {
+				if !src.Dirty.IsPartLoaded(p) {
+					if err := src.Dirty.EnsureLoaded(p); err != nil {
+						src.Unlock()
+						fs.debugf("read same-path dirty incomplete path=%s part=%d err=%v", path, p, err)
+						continue candidateLoop
+					}
+				}
+			}
+			src.Dirty.ReadAt(offset, buf)
+			src.Unlock()
+			return buf, len(buf), true, gofuse.OK
 		}
-		src.Dirty.ReadAt(offset, buf)
-		src.Unlock()
-		return buf, len(buf), true, gofuse.OK
+		return nil, 0, false, gofuse.OK
 	}
-	return nil, 0, false, gofuse.OK
 }
 
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
