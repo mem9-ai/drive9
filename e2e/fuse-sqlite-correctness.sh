@@ -513,6 +513,16 @@ def build_concurrent_db(path):
         with lock:
             errors.append(f"{label}: {exc!r}")
 
+    def stop_readers():
+        done.set()
+        alive = []
+        for index, thread in enumerate(threads):
+            thread.join(timeout=5)
+            if thread.is_alive():
+                alive.append(index)
+        if alive:
+            raise AssertionError(f"reader threads did not stop: {alive}")
+
     def reader(reader_id):
         try:
             rconn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
@@ -535,6 +545,8 @@ def build_concurrent_db(path):
     for thread in threads:
         thread.start()
 
+    wconn = None
+    readers_stopped = False
     try:
         wconn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
         wconn.execute("PRAGMA busy_timeout=30000")
@@ -557,16 +569,23 @@ def build_concurrent_db(path):
         integrity = scalar(wconn, "PRAGMA integrity_check")
         if integrity != "ok":
             raise AssertionError(f"concurrent writer integrity_check={integrity}")
+        stop_readers()
+        readers_stopped = True
         checkpoint = wconn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         if checkpoint is None or checkpoint[0] not in (0, 1):
             raise AssertionError(f"unexpected wal checkpoint result={checkpoint}")
         wconn.close()
+        wconn = None
     except Exception as exc:  # noqa: BLE001 - surfaced into shell failure
         record_error("writer", exc)
     finally:
-        done.set()
-        for thread in threads:
-            thread.join(timeout=5)
+        if not readers_stopped:
+            try:
+                stop_readers()
+            except Exception as exc:  # noqa: BLE001 - surfaced into shell failure
+                record_error("readers", exc)
+        if wconn is not None:
+            wconn.close()
 
     if errors:
         raise AssertionError("; ".join(errors))
