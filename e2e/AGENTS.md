@@ -349,8 +349,8 @@ the layout captured by that run.
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
 | `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |
 | `BATCH_SMALL_FILE_COUNT` | `10` | `api-smoke-test.sh` |
-| `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh` |
-| `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh` |
+| `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
 | `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` | `api-smoke-test.sh` |
 | `UPLOAD_LIMIT_BYTES` | `10737418240` | `api-smoke-test.sh` |
 | `RUN_SEMANTIC_CHECKS` | `1` | `api-smoke-test.sh` |
@@ -372,8 +372,8 @@ the layout captured by that run.
 | `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
 | `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
 | `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
-| `CLI_MAX_RETRIES` | `8` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
-| `CLI_RETRY_SLEEP_S` | `2` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `CLI_MAX_RETRIES` | `8` | `fuse-smoke-test.sh` |
+| `CLI_RETRY_SLEEP_S` | `2` | `fuse-smoke-test.sh` |
 | `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
 | `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
 | `FUSE_CORRECTNESS_LARGE_MB` | `9` | `fuse-correctness-workload.sh` |

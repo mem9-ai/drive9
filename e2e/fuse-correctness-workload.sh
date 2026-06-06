@@ -22,8 +22,8 @@ FUSE_CORRECTNESS_LARGE_MB="${FUSE_CORRECTNESS_LARGE_MB:-9}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
 CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
-CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
-CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
+REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
+REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
 
 PASS=0
 FAIL=0
@@ -54,6 +54,19 @@ check_cmd() {
     echo "FAIL $desc"
     FAIL=$((FAIL + 1))
   fi
+}
+
+require_cmd() {
+  local name="$1"
+  TOTAL=$((TOTAL + 1))
+  if command -v "$name" >/dev/null 2>&1; then
+    echo "PASS $name is available"
+    PASS=$((PASS + 1))
+    return 0
+  fi
+  echo "FAIL $name is available" >&2
+  FAIL=$((FAIL + 1))
+  exit 1
 }
 
 skip() {
@@ -91,15 +104,20 @@ detect_release_target() {
 
 download_official_cli() {
   local target_version="$CLI_RELEASE_VERSION"
+  local unversioned_url versioned_url download_url
   detect_release_target || return 1
+  unversioned_url="$CLI_RELEASE_BASE_URL/drive9-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH"
   if [ -z "$target_version" ]; then
-    target_version=$(curl -fsSL "$CLI_RELEASE_BASE_URL/version" | tr -d '[:space:]')
+    target_version=$(curl -fsSL "$CLI_RELEASE_BASE_URL/version" 2>/dev/null | tr -d '[:space:]' || true)
   fi
-  if [ -z "$target_version" ]; then
-    echo "failed to resolve release version from $CLI_RELEASE_BASE_URL/version" >&2
-    return 1
+  download_url="$unversioned_url"
+  if [ -n "$target_version" ]; then
+    versioned_url="$CLI_RELEASE_BASE_URL/drive9-$target_version-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH"
+    if curl -fsI "$versioned_url" >/dev/null 2>&1; then
+      download_url="$versioned_url"
+    fi
   fi
-  curl -fsSL "$CLI_RELEASE_BASE_URL/drive9-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH" -o "$CLI_BIN"
+  curl -fsSL "$download_url" -o "$CLI_BIN"
   chmod +x "$CLI_BIN"
   local actual_version
   actual_version="$($CLI_BIN --version 2>/dev/null | awk '{print $2}')"
@@ -187,17 +205,36 @@ curl_body_code() {
   local method="$1"
   local url="$2"
   local auth="${3:-}"
-  local body_file code
-  body_file="$(mktemp)"
-  if [ -n "$auth" ]; then
-    code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" -H "Authorization: Bearer $auth" "$url")
-  else
-    code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" "$url")
-  fi
-  cat "$body_file"
-  echo
-  echo "__HTTP__${code}"
-  rm -f "$body_file"
+
+  local attempt=1
+  while :; do
+    local body_file code rc
+    body_file="$(mktemp)"
+    set +e
+    if [ -n "$auth" ]; then
+      code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" -H "Authorization: Bearer $auth" "$url")
+      rc=$?
+    else
+      code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" "$url")
+      rc=$?
+    fi
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      code="000"
+    fi
+
+    if { [ "$rc" -eq 0 ] && [ "$code" != "429" ] && [ "$code" != "403" ]; } || [ "$attempt" -ge "$REQUEST_MAX_RETRIES" ]; then
+      cat "$body_file"
+      echo
+      echo "__HTTP__${code}"
+      rm -f "$body_file"
+      return "$rc"
+    fi
+
+    rm -f "$body_file"
+    attempt=$((attempt + 1))
+    sleep "$REQUEST_RETRY_SLEEP_S"
+  done
 }
 
 http_code() { printf '%s' "$1" | awk -F'__HTTP__' 'NF>1{print $2}' | tr -d '\n'; }
@@ -454,9 +491,9 @@ drive9_retry() {
       printf '%s' "$out"
       return 0
     fi
-    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 403"* || "$out" == *"403 Forbidden"* ]]; then
+    if [ "$attempt" -lt "$REQUEST_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 403"* || "$out" == *"403 Forbidden"* ]]; then
       attempt=$((attempt + 1))
-      sleep "$CLI_RETRY_SLEEP_S"
+      sleep "$REQUEST_RETRY_SLEEP_S"
       continue
     fi
     printf '%s\n' "$out" >&2
@@ -470,16 +507,15 @@ echo "CLI_SOURCE=$CLI_SOURCE"
 echo "FUSE_STRICT_PREREQS=$FUSE_STRICT_PREREQS"
 echo "FUSE_CORRECTNESS_LARGE_MB=$FUSE_CORRECTNESS_LARGE_MB"
 
-check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
-check_cmd "python3 is available" bash -c 'command -v python3 >/dev/null'
-check_cmd "grep is available" bash -c 'command -v grep >/dev/null'
-check_cmd "find is available" bash -c 'command -v find >/dev/null'
-check_cmd "stat is available" bash -c 'command -v stat >/dev/null'
-check_cmd "readlink is available" bash -c 'command -v readlink >/dev/null'
+require_cmd curl
+require_cmd jq
+require_cmd python3
+require_cmd grep
+require_cmd find
+require_cmd stat
+require_cmd readlink
 if [ "$CLI_SOURCE" = "build" ]; then
-  check_cmd "go is available" bash -c 'command -v go >/dev/null'
-else
-  check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
+  require_cmd go
 fi
 
 if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then

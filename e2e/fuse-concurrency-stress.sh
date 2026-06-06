@@ -26,8 +26,8 @@ FUSE_CONCURRENCY_TIMEOUT_S="${FUSE_CONCURRENCY_TIMEOUT_S:-120}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
 CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
-CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
-CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
+REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
+REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
 
 PASS=0
 FAIL=0
@@ -58,6 +58,19 @@ check_cmd() {
     echo "FAIL $desc"
     FAIL=$((FAIL + 1))
   fi
+}
+
+require_cmd() {
+  local name="$1"
+  TOTAL=$((TOTAL + 1))
+  if command -v "$name" >/dev/null 2>&1; then
+    echo "PASS $name is available"
+    PASS=$((PASS + 1))
+    return 0
+  fi
+  echo "FAIL $name is available" >&2
+  FAIL=$((FAIL + 1))
+  exit 1
 }
 
 skip() {
@@ -95,15 +108,20 @@ detect_release_target() {
 
 download_official_cli() {
   local target_version="$CLI_RELEASE_VERSION"
+  local unversioned_url versioned_url download_url
   detect_release_target || return 1
+  unversioned_url="$CLI_RELEASE_BASE_URL/drive9-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH"
   if [ -z "$target_version" ]; then
-    target_version=$(curl -fsSL "$CLI_RELEASE_BASE_URL/version" | tr -d '[:space:]')
+    target_version=$(curl -fsSL "$CLI_RELEASE_BASE_URL/version" 2>/dev/null | tr -d '[:space:]' || true)
   fi
-  if [ -z "$target_version" ]; then
-    echo "failed to resolve release version from $CLI_RELEASE_BASE_URL/version" >&2
-    return 1
+  download_url="$unversioned_url"
+  if [ -n "$target_version" ]; then
+    versioned_url="$CLI_RELEASE_BASE_URL/drive9-$target_version-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH"
+    if curl -fsI "$versioned_url" >/dev/null 2>&1; then
+      download_url="$versioned_url"
+    fi
   fi
-  curl -fsSL "$CLI_RELEASE_BASE_URL/drive9-$CLI_RELEASE_OS-$CLI_RELEASE_ARCH" -o "$CLI_BIN"
+  curl -fsSL "$download_url" -o "$CLI_BIN"
   chmod +x "$CLI_BIN"
   local actual_version
   actual_version="$($CLI_BIN --version 2>/dev/null | awk '{print $2}')"
@@ -207,26 +225,32 @@ curl_body_code() {
 
   local attempt=1
   while :; do
-    local body_file
+    local body_file code rc
     body_file="$(mktemp)"
-    local code
+    set +e
     if [ -n "$auth" ]; then
       code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" -H "Authorization: Bearer $auth" "$url")
+      rc=$?
     else
       code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" "$url")
+      rc=$?
+    fi
+    set -e
+    if [ "$rc" -ne 0 ]; then
+      code="000"
     fi
 
-    if { [ "$code" != "429" ] && [ "$code" != "403" ]; } || [ "$attempt" -ge "$CLI_MAX_RETRIES" ]; then
+    if { [ "$rc" -eq 0 ] && [ "$code" != "429" ] && [ "$code" != "403" ]; } || [ "$attempt" -ge "$REQUEST_MAX_RETRIES" ]; then
       cat "$body_file"
       echo
       echo "__HTTP__${code}"
       rm -f "$body_file"
-      return
+      return "$rc"
     fi
 
     rm -f "$body_file"
     attempt=$((attempt + 1))
-    sleep "$CLI_RETRY_SLEEP_S"
+    sleep "$REQUEST_RETRY_SLEEP_S"
   done
 }
 
@@ -245,9 +269,9 @@ drive9_retry() {
       printf '%s' "$out"
       return 0
     fi
-    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 403"* || "$out" == *"403 Forbidden"* ]]; then
+    if [ "$attempt" -lt "$REQUEST_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 403"* || "$out" == *"403 Forbidden"* ]]; then
       attempt=$((attempt + 1))
-      sleep "$CLI_RETRY_SLEEP_S"
+      sleep "$REQUEST_RETRY_SLEEP_S"
       continue
     fi
     printf '%s\n' "$out" >&2
@@ -586,12 +610,11 @@ echo "FUSE_CONCURRENCY_READER_WORKERS=$FUSE_CONCURRENCY_READER_WORKERS"
 echo "FUSE_CONCURRENCY_PAYLOAD_KB=$FUSE_CONCURRENCY_PAYLOAD_KB"
 echo "FUSE_CONCURRENCY_TIMEOUT_S=$FUSE_CONCURRENCY_TIMEOUT_S"
 
-check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
-check_cmd "python3 is available" bash -c 'command -v python3 >/dev/null'
+require_cmd curl
+require_cmd jq
+require_cmd python3
 if [ "$CLI_SOURCE" = "build" ]; then
-  check_cmd "go is available" bash -c 'command -v go >/dev/null'
-else
-  check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
+  require_cmd go
 fi
 
 if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
@@ -659,6 +682,7 @@ drive9() {
 
 TS="$(date +%s)"
 RUN_ROOT="$(mktemp -d "$FUSE_MOUNT_ROOT/drive9-fuse-concurrency-${TS}.XXXXXX")"
+RUN_ID="$(basename "$RUN_ROOT")"
 MOUNT_POINT="$RUN_ROOT/mount"
 MOUNT_LOG="$RUN_ROOT/mount.log"
 REMOTE_SNAPSHOT="$RUN_ROOT/remote-snapshot"
@@ -666,7 +690,7 @@ EXPECTED_MANIFEST="$RUN_ROOT/expected-manifest.json"
 ACTUAL_MANIFEST="$RUN_ROOT/actual-mounted-manifest.json"
 REMOTE_MANIFEST="$RUN_ROOT/actual-remote-manifest.json"
 READER_ERRORS="$RUN_ROOT/reader-errors.log"
-ROOT_REL="fuse-concurrency-${TS}"
+ROOT_REL="$RUN_ID"
 ROOT_REMOTE="/$ROOT_REL"
 WORK_MOUNT="$MOUNT_POINT/$ROOT_REL/work"
 WORK_REMOTE="$ROOT_REMOTE/work"
