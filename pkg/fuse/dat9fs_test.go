@@ -6952,6 +6952,89 @@ func TestUnlinkSQLiteWALUsesLatestInodeSizeForStaleOpenReadHandle(t *testing.T) 
 	}
 }
 
+func TestReadSQLiteWALMissingRemoteReturnsEOF(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	var remoteReads atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath {
+			remoteReads.Add(1)
+			http.NotFound(w, r)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 4096, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: 4096,
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if len(got) != 0 {
+		t.Fatalf("read bytes after missing WAL = %q, want EOF", got)
+	}
+	if got := remoteReads.Load(); got == 0 {
+		t.Fatal("remote read was not exercised")
+	}
+}
+
+func TestReadNormalMissingRemoteStillReturnsENOENT(t *testing.T) {
+	const filePath = "/missing.bin"
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 4096, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: 4096,
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	_, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     64,
+	}, make([]byte, 64))
+	if st != gofuse.ENOENT {
+		t.Fatalf("Read status = %v, want ENOENT", st)
+	}
+}
+
 func TestReadSQLiteSamePathDirtyHandleSkipsLockedCandidate(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

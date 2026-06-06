@@ -2000,6 +2000,13 @@ func readUnlinkedData(fh *FileHandle, offset int64, size uint32) ([]byte, int, b
 	return data, len(data), true
 }
 
+func missingSQLiteSidecarReadIsEOF(fh *FileHandle, err error) bool {
+	if fh == nil || fh.Dirty != nil || !isNotFoundErr(err) {
+		return false
+	}
+	return isSQLitePersistentJournalPath(fh.Path)
+}
+
 func unlinkSnapshotSizeLocked(fh *FileHandle, inodeSize int64) (int64, bool) {
 	if fh == nil || fh.UnlinkedData != nil {
 		return 0, false
@@ -5872,6 +5879,11 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		})
 		if err != nil {
 			source = "small-read-error"
+			if missingSQLiteSidecarReadIsEOF(fh, err) {
+				source = "sqlite-sidecar-missing-eof"
+				bytesRead = 0
+				return gofuse.ReadResultData(nil), gofuse.OK
+			}
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, gofuse.EINTR
 			}
@@ -5936,6 +5948,11 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		data, n, err := fs.readDiskCachedRange(ctx, p, fh, key)
 		if err != nil {
 			fs.debugf("read disk-cache range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
+			if missingSQLiteSidecarReadIsEOF(fh, err) {
+				source = "sqlite-sidecar-missing-eof"
+				bytesRead = 0
+				return gofuse.ReadResultData(nil), gofuse.OK
+			}
 			if errors.Is(err, errReadRetriesExhausted) {
 				return nil, gofuse.EIO
 			}
@@ -5968,6 +5985,11 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}()
 	if err != nil {
 		fs.debugf("read range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
+		if missingSQLiteSidecarReadIsEOF(fh, err) {
+			source = "sqlite-sidecar-missing-eof"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
 		if errors.Is(err, errReadRetriesExhausted) {
 			return nil, gofuse.EIO
 		}
