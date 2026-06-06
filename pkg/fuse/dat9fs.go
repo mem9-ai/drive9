@@ -524,17 +524,18 @@ func isSQLiteVisibleSamePathDirtyPath(localPath string) bool {
 	if err != nil {
 		return false
 	}
-	if isSQLitePersistentJournalPath(canonical) {
-		return true
-	}
 	return isSQLiteMainDatabasePath(canonical)
+}
+
+func isSQLiteDirectIOPath(localPath string) bool {
+	return isSQLiteVisibleSamePathDirtyPath(localPath) || isSQLitePersistentJournalPath(localPath)
 }
 
 func remoteOpenFlagsForHandle(fh *FileHandle) uint32 {
 	if fh == nil {
 		return gofuse.FOPEN_KEEP_CACHE
 	}
-	if isSQLiteVisibleSamePathDirtyPath(fh.Path) {
+	if isSQLiteDirectIOPath(fh.Path) {
 		return gofuse.FOPEN_DIRECT_IO
 	}
 	if fh.Dirty != nil {
@@ -1555,6 +1556,13 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 }
 
 func (fs *Dat9FS) readSamePathDirtyHandle(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+	if isSQLitePersistentJournalPath(path) {
+		return nil, 0, false, gofuse.OK
+	}
+	return fs.readSamePathDirtyHandleAllowJournals(path, skip, offset, reqSize)
+}
+
+func (fs *Dat9FS) readSamePathDirtyHandleAllowJournals(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
 	if fs == nil || fs.openHandles == nil || path == "" || reqSize == 0 {
 		return nil, 0, false, gofuse.OK
 	}
@@ -2128,7 +2136,7 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPat
 		data, ok := snapshots[cand.size]
 		if !ok {
 			if cand.size > 0 {
-				if dirtyData, n, claimed, st := fs.readSamePathDirtyHandle(localPath, nil, 0, uint32(cand.size)); claimed && st == gofuse.OK {
+				if dirtyData, n, claimed, st := fs.readSamePathDirtyHandleAllowJournals(localPath, nil, 0, uint32(cand.size)); claimed && st == gofuse.OK {
 					data = dirtyData[:n]
 				} else {
 					snapshotCtx, cancel := context.WithTimeout(ctx, readTransientRetryTimeout)
@@ -5802,7 +5810,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			sz = fs.shadowStore.SizeGen(fh.ShadowGen)
 			useGen = sz >= 0
 		}
-		if !useGen {
+		if !useGen && !isSQLitePersistentJournalPath(fh.Path) {
 			if fs.shadowStore.Has(fh.Path) {
 				sz = fs.shadowStore.Size(fh.Path)
 			}
