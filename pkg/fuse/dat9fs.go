@@ -1455,6 +1455,7 @@ func (fs *Dat9FS) readSamePathDirtyHandle(path string, skip *FileHandle, offset 
 		return candidates[i].dirtySeq > candidates[j].dirtySeq
 	})
 
+candidateLoop:
 	for _, c := range candidates {
 		src := c.fh
 		if !src.TryLock() {
@@ -1509,7 +1510,8 @@ func (fs *Dat9FS) readSamePathDirtyHandle(path string, skip *FileHandle, offset 
 			if !src.Dirty.IsPartLoaded(p) {
 				if err := src.Dirty.EnsureLoaded(p); err != nil {
 					src.Unlock()
-					return nil, 0, true, gofuse.EIO
+					fs.debugf("read same-path dirty incomplete path=%s part=%d err=%v", path, p, err)
+					continue candidateLoop
 				}
 			}
 		}

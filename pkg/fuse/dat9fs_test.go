@@ -6577,6 +6577,35 @@ func TestReadSQLiteSamePathDirtyHandleBeforeShadowStore(t *testing.T) {
 	}
 }
 
+func TestReadSQLiteSamePathDirtyHandleSkipsIncompleteCandidate(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	const filePath = "/workload.db"
+	ino := fs.inodes.Lookup(filePath, false, 4096, time.Now())
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	writer.Dirty.totalSize = 4096
+	writer.Dirty.remoteSize = 4096
+	writer.Dirty.LoadPart = func(partNumber int) ([]byte, error) {
+		return nil, errors.New("remote clean range unavailable")
+	}
+	writer.DirtySeq = 1
+	fs.openHandles.Add(writer)
+
+	_, _, ok, st := fs.readSamePathDirtyHandle(filePath, nil, 0, 128)
+	if ok {
+		t.Fatal("incomplete same-path dirty candidate should not claim the read")
+	}
+	if st != gofuse.OK {
+		t.Fatalf("status = %v, want OK", st)
+	}
+}
+
 func TestOpenWritablePreloadPreservesExistingOrigSize(t *testing.T) {
 	var remoteCalls atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
