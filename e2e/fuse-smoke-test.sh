@@ -309,6 +309,53 @@ print(h.hexdigest())
 PY
 }
 
+wait_remote_file_hash_eq() {
+  local remote_path="$1"
+  local want_hash="$2"
+  local local_path="$3"
+  local timeout_s="${4:-$REMOTE_VISIBILITY_TIMEOUT_S}"
+  local interval_s="${5:-$REMOTE_VISIBILITY_INTERVAL_S}"
+  local deadline
+  local out rc got_hash
+  deadline=$(python3 - "$timeout_s" <<'PY'
+import sys
+import time
+print(time.time() + float(sys.argv[1]))
+PY
+)
+
+  while :; do
+    rm -f "$local_path"
+    set +e
+    out=$(drive9 fs cp ":$remote_path" "$local_path" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ] && [ -f "$local_path" ]; then
+      got_hash=$(sha256_file "$local_path")
+      if [ "$got_hash" = "$want_hash" ]; then
+        printf '%s' "$got_hash"
+        return 0
+      fi
+    elif [[ "$out" != *"not found"* && "$out" != *"Too Many Requests"* && "$out" != *"HTTP 429"* && "$out" != *"HTTP 403"* && "$out" != *"403 Forbidden"* ]]; then
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+
+    if python3 - "$deadline" <<'PY'
+import sys
+import time
+raise SystemExit(0 if time.time() >= float(sys.argv[1]) else 1)
+PY
+    then
+      printf 'wait_remote_file_hash_eq: timeout path=%s want_hash=%s last_hash=%s\n' \
+        "$remote_path" "$want_hash" "${got_hash:-<none>}" >&2
+      return 1
+    fi
+
+    sleep "$interval_s"
+  done
+}
+
 write_pattern_file() {
   local file_path="$1"
   local size="$2"
@@ -1008,41 +1055,50 @@ PY
 
     echo "[10.1] mounted tier-transition parity"
     write_pattern_file "$TIER_MOUNT" 10240 17
+    tier_small_initial_hash=$(sha256_file "$TIER_MOUNT")
     tier_small_initial_size=$(wait_remote_stat_field_eq "$TIER_REMOTE" "size" "10240")
     check_eq "tier transition initial 10KiB size matches remote stat" "$tier_small_initial_size" "10240"
-    rm -f "$TIER_DOWNLOADED"
-    drive9_retry fs cp ":$TIER_REMOTE" "$TIER_DOWNLOADED" >/dev/null
-    tier_small_initial_hash=$(sha256_file "$TIER_MOUNT")
-    tier_small_initial_remote_hash=$(sha256_file "$TIER_DOWNLOADED")
+    if tier_small_initial_remote_hash=$(wait_remote_file_hash_eq "$TIER_REMOTE" "$tier_small_initial_hash" "$TIER_DOWNLOADED"); then
+      :
+    else
+      tier_small_initial_remote_hash=""
+    fi
     check_eq "tier transition initial 10KiB checksum matches" "$tier_small_initial_remote_hash" "$tier_small_initial_hash"
 
     write_pattern_file "$TIER_MOUNT" 8388608 43
+    tier_large_hash=$(sha256_file "$TIER_MOUNT")
     tier_large_size=$(wait_remote_stat_field_eq "$TIER_REMOTE" "size" "8388608" "$LARGE_FILE_VISIBILITY_TIMEOUT_S" "$LARGE_FILE_VISIBILITY_INTERVAL_S")
     check_eq "tier transition 8MiB A size matches remote stat" "$tier_large_size" "8388608"
-    rm -f "$TIER_DOWNLOADED"
-    drive9_retry fs cp ":$TIER_REMOTE" "$TIER_DOWNLOADED" >/dev/null
-    tier_large_hash=$(sha256_file "$TIER_MOUNT")
-    tier_large_remote_hash=$(sha256_file "$TIER_DOWNLOADED")
+    if tier_large_remote_hash=$(wait_remote_file_hash_eq "$TIER_REMOTE" "$tier_large_hash" "$TIER_DOWNLOADED" "$LARGE_FILE_VISIBILITY_TIMEOUT_S" "$LARGE_FILE_VISIBILITY_INTERVAL_S"); then
+      :
+    else
+      tier_large_remote_hash=""
+    fi
     check_eq "tier transition 8MiB A checksum matches" "$tier_large_remote_hash" "$tier_large_hash"
 
     write_pattern_file "$TIER_MOUNT" 8388608 67
+    tier_large_second_hash=$(sha256_file "$TIER_MOUNT")
     tier_large_second_size=$(wait_remote_stat_field_eq "$TIER_REMOTE" "size" "8388608" "$LARGE_FILE_VISIBILITY_TIMEOUT_S" "$LARGE_FILE_VISIBILITY_INTERVAL_S")
     check_eq "tier transition 8MiB B size matches remote stat" "$tier_large_second_size" "8388608"
-    rm -f "$TIER_DOWNLOADED"
-    drive9_retry fs cp ":$TIER_REMOTE" "$TIER_DOWNLOADED" >/dev/null
-    tier_large_second_hash=$(sha256_file "$TIER_MOUNT")
-    tier_large_second_remote_hash=$(sha256_file "$TIER_DOWNLOADED")
+    if tier_large_second_remote_hash=$(wait_remote_file_hash_eq "$TIER_REMOTE" "$tier_large_second_hash" "$TIER_DOWNLOADED" "$LARGE_FILE_VISIBILITY_TIMEOUT_S" "$LARGE_FILE_VISIBILITY_INTERVAL_S"); then
+      :
+    else
+      tier_large_second_remote_hash=""
+    fi
     check_eq "tier transition 8MiB B checksum matches" "$tier_large_second_remote_hash" "$tier_large_second_hash"
 
     write_pattern_file "$TIER_MOUNT" 10240 89
+    tier_small_final_hash=$(sha256_file "$TIER_MOUNT")
     tier_small_final_size=$(wait_remote_stat_field_eq "$TIER_REMOTE" "size" "10240")
     check_eq "tier transition final 10KiB size matches remote stat" "$tier_small_final_size" "10240"
-    rm -f "$TIER_DOWNLOADED"
-    drive9_retry fs cp ":$TIER_REMOTE" "$TIER_DOWNLOADED" >/dev/null
-    tier_small_final_hash=$(sha256_file "$TIER_MOUNT")
-    tier_small_final_remote_hash=$(sha256_file "$TIER_DOWNLOADED")
+    if tier_small_final_remote_hash=$(wait_remote_file_hash_eq "$TIER_REMOTE" "$tier_small_final_hash" "$TIER_DOWNLOADED"); then
+      :
+    else
+      tier_small_final_remote_hash=""
+    fi
     check_eq "tier transition final 10KiB checksum matches" "$tier_small_final_remote_hash" "$tier_small_final_hash"
 
+    rw_mount_available=true
     if unmount_mount; then
       check_eq "rw mount unmounted after tier transition" "true" "true"
     else
@@ -1053,8 +1109,9 @@ PY
       check_eq "rw mount remounted after tier transition" "true" "true"
     else
       check_eq "rw mount remounted after tier transition" "false" "true"
+      rw_mount_available=false
     fi
-    if is_mounted "$MOUNT_POINT"; then
+    if [ "$rw_mount_available" = "true" ] && is_mounted "$MOUNT_POINT"; then
       check_cmd "tier transition file visible after remount" wait_path_exists "$TIER_MOUNT"
       if [ -f "$TIER_MOUNT" ]; then
         tier_remount_hash=$(sha256_file "$TIER_MOUNT")
@@ -1062,11 +1119,15 @@ PY
         tier_remount_hash=""
       fi
       check_eq "tier transition final checksum survives remount" "$tier_remount_hash" "$tier_small_final_hash"
+    else
+      echo "SKIP tier transition remount content checks because rw mount is unavailable"
+      rw_mount_available=false
     fi
   else
     echo "SKIP large-file boundary after mount directory rename failure (tracked in issue #248)"
   fi
 
+  if [ "${rw_mount_available:-true}" = "true" ] && is_mounted "$MOUNT_POINT"; then
   echo "[11] error semantics"
   check_cmd_fail "cat missing file via mount fails" cat "$MOUNT_POINT/${ROOT_REL}/no-such-file.txt"
 
@@ -1150,6 +1211,11 @@ PY
     check_eq "final mount unmounted" "true" "true"
   else
     check_eq "final mount unmounted" "false" "true"
+    stop_mount
+  fi
+  else
+    echo "SKIP remaining mounted checks because rw mount is unavailable after tier transition remount"
+    drive9_retry fs rm -r "$ROOT_REMOTE" >/dev/null 2>&1 || true
     stop_mount
   fi
   # End of the writable-alpha branch opened after the nested mkdir checks.
