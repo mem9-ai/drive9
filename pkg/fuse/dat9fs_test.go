@@ -7146,6 +7146,83 @@ func TestUnlinkSQLiteWALUsesLatestInodeSizeForStaleOpenReadHandle(t *testing.T) 
 	}
 }
 
+func TestFtruncateSQLiteWALPreservesOpenReaderSnapshot(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	want := []byte("sqlite wal bytes before checkpoint truncate")
+	var remoteReads atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			remoteReads.Add(1)
+		}
+		http.Error(w, "remote should not be consulted for same-mount sqlite wal snapshot", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(want)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: int64(len(want)),
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	writer := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: int64(len(want)),
+		BaseRev:  7,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatalf("writer dirty write: %v", err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+	writerID := fs.allocateFileHandle(writer)
+	defer fs.deleteFileHandle(writerID, writer)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE | gofuse.FATTR_FH,
+			Fh:       writerID,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr ftruncate status = %v, want OK", st)
+	}
+
+	buf := make([]byte, 128)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("reader bytes after ftruncate = %q, want %q", got, want)
+	}
+	if got := remoteReads.Load(); got != 0 {
+		t.Fatalf("remote reads = %d, want 0", got)
+	}
+}
+
 func TestReadSQLiteSamePathDirtyHandleSkipsLockedCandidate(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

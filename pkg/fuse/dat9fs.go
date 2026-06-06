@@ -515,6 +515,10 @@ func shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath string) bool {
 	return isSQLitePersistentJournalPath(localPath)
 }
 
+func shouldSnapshotOpenSQLiteSidecarOnTruncate(localPath string, newSize int64) bool {
+	return newSize == 0 && isSQLitePersistentJournalPath(localPath)
+}
+
 func isSQLiteVisibleSamePathDirtyPath(localPath string) bool {
 	canonical, err := pathutil.Canonicalize(localPath)
 	if err != nil {
@@ -2081,6 +2085,20 @@ func (fs *Dat9FS) inodeSnapshotSize(ino uint64) int64 {
 }
 
 func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, localPath string) error {
+	if !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
+		return nil
+	}
+	return fs.snapshotOpenSQLiteSidecarHandles(ctx, localPath, nil)
+}
+
+func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeTruncate(ctx context.Context, localPath string, skip *FileHandle, newSize int64) error {
+	if !shouldSnapshotOpenSQLiteSidecarOnTruncate(localPath, newSize) {
+		return nil
+	}
+	return fs.snapshotOpenSQLiteSidecarHandles(ctx, localPath, skip)
+}
+
+func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPath string, skip *FileHandle) error {
 	if fs == nil || fs.openHandles == nil || !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
 		return nil
 	}
@@ -2090,7 +2108,7 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, loc
 	}
 	var candidates []candidate
 	for _, fh := range fs.openHandles.SnapshotPath(localPath) {
-		if fh == nil {
+		if fh == nil || fh == skip {
 			continue
 		}
 		inodeSize := fs.inodeSnapshotSize(fh.Ino)
@@ -2110,12 +2128,16 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, loc
 		data, ok := snapshots[cand.size]
 		if !ok {
 			if cand.size > 0 {
-				snapshotCtx, cancel := context.WithTimeout(ctx, readTransientRetryTimeout)
-				var err error
-				data, _, err = fs.doRangeRead(snapshotCtx, localPath, nil, 0, cand.size)
-				cancel()
-				if err != nil {
-					return err
+				if dirtyData, n, claimed, st := fs.readSamePathDirtyHandle(localPath, nil, 0, uint32(cand.size)); claimed && st == gofuse.OK {
+					data = dirtyData[:n]
+				} else {
+					snapshotCtx, cancel := context.WithTimeout(ctx, readTransientRetryTimeout)
+					var err error
+					data, _, err = fs.doRangeRead(snapshotCtx, localPath, nil, 0, cand.size)
+					cancel()
+					if err != nil {
+						return err
+					}
 				}
 			} else {
 				data = []byte{}
@@ -3613,6 +3635,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		if input.Valid&gofuse.FATTR_FH != 0 {
 			// ftruncate(fd, size): truncate the open write buffer.
 			fh, ok := fs.fileHandles.Get(input.Fh)
+			if ok {
+				if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, fh, newSize); err != nil {
+					return httpToFuseStatus(err)
+				}
+			}
 			if ok && fh.Dirty != nil {
 				fh.Lock()
 				if err := fs.truncateWritableHandleLocked(fh, newSize); err != nil {
@@ -3628,6 +3655,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if newSize == 0 {
 				ctx, cf := fuseCtx(cancel)
 				defer cf()
+				if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, nil, newSize); err != nil {
+					return httpToFuseStatus(err)
+				}
 				apiPath := fs.remotePath(entry.Path)
 				writeStart := fs.perfStart()
 				err := fs.client.WriteCtx(ctx, apiPath, nil)
