@@ -21,6 +21,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
 type testErrorRecorder struct {
@@ -7199,6 +7200,47 @@ func TestFlushHandle_AdoptsSameMountCommittedRevision(t *testing.T) {
 	}
 	if fh.BaseRev != 9 {
 		t.Fatalf("fh.BaseRev = %d, want 9", fh.BaseRev)
+	}
+}
+
+func TestFlushHandle_RefreshesStartedStreamerRevision(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), s3client.PartSize+32)
+	expectedRevision := int64(8)
+	rec := newMultipartUploadRecorder(t, "/stream.db-wal", int64(len(data)), &expectedRevision)
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(rec.client(), opts)
+	ino := fs.inodes.Lookup("/stream.db-wal", false, int64(len(data)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision("/stream.db-wal", expectedRevision)
+
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     "/stream.db-wal",
+		Dirty:    NewWriteBuffer("/stream.db-wal", maxPreloadSize, 0),
+		BaseRev:  7,
+		Streamer: NewStreamUploader(rec.client(), "/stream.db-wal", 7),
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := fh.Streamer.SubmitPart(context.Background(), 1, data[:s3client.PartSize], nil); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if got := rec.initiateCalls.Load(); got != 1 {
+		t.Fatalf("initiate calls = %d, want 1", got)
+	}
+	if fh.BaseRev != expectedRevision+1 {
+		t.Fatalf("fh.BaseRev = %d, want %d", fh.BaseRev, expectedRevision+1)
 	}
 }
 

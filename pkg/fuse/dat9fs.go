@@ -7285,6 +7285,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		dirtyParts := fh.Dirty.DirtyStreamedParts()
 
 		streamer := fh.Streamer
+		streamer.RefreshExpectedRevision(expectedRevision)
 
 		// Release fh.mu before network calls — FinishStreaming does
 		// synchronous uploads that may take minutes.
@@ -7349,6 +7350,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 
 		streamer := fh.Streamer
+		streamer.RefreshExpectedRevision(expectedRevision)
 
 		// Release fh.mu during network call (same deadlock avoidance as Path 1a).
 		uploadStart := time.Now()
