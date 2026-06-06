@@ -164,6 +164,46 @@ func (rec *multipartUploadRecorder) client() *client.Client {
 	return newTestClient(rec.server.URL)
 }
 
+func TestUploadFromShadowRemoteWithRevisionStreamsSmallSpill(t *testing.T) {
+	const remotePath = "/sqlite/workload.db-journal"
+	data := []byte("small sqlite journal frame")
+	expectedRevision := int64(3)
+	rec := newMultipartUploadRecorder(t, remotePath, int64(len(data)), &expectedRevision)
+
+	c := rec.client()
+	c.SetSmallFileThresholdForTests(50_000)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(remotePath, data, expectedRevision); err != nil {
+		t.Fatal(err)
+	}
+
+	committedRev, err := uploadFromShadowRemoteWithRevision(context.Background(), c, shadow, remotePath, remotePath, expectedRevision)
+	if err != nil {
+		t.Fatalf("uploadFromShadowRemoteWithRevision: %v", err)
+	}
+	if committedRev != 0 {
+		t.Fatalf("committed revision = %d, want 0 for multipart stream", committedRev)
+	}
+	if rec.directFilePuts.Load() != 0 {
+		t.Fatalf("direct PUT count = %d, want 0", rec.directFilePuts.Load())
+	}
+	if rec.initiateCalls.Load() != 1 || rec.presignCalls.Load() != 1 || rec.completeCalls.Load() != 1 || rec.s3PutCalls.Load() != 1 {
+		t.Fatalf("multipart flow calls = initiate:%d presign:%d complete:%d s3put:%d, want 1 each",
+			rec.initiateCalls.Load(), rec.presignCalls.Load(), rec.completeCalls.Load(), rec.s3PutCalls.Load())
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.gotUploadedBytes != int64(len(data)) {
+		t.Fatalf("uploaded bytes = %d, want %d", rec.gotUploadedBytes, len(data))
+	}
+}
+
 func TestCommitQueueLargeOverwriteUsesMultipartUpload(t *testing.T) {
 	const remotePath = "/large-overwrite.bin"
 	data := make([]byte, s3client.PartSize)

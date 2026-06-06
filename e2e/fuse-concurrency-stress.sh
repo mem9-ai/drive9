@@ -738,7 +738,7 @@ if is_mounted "$MOUNT_POINT"; then
   check_cmd "unmount concurrency mount" unmount_mount
   MOUNT_PID=""
   mkdir -p "$REMOTE_SNAPSHOT"
-  drive9_retry fs cp ":$WORK_REMOTE" "$REMOTE_SNAPSHOT" >/dev/null
+  drive9_retry fs cp -r ":$WORK_REMOTE" "$REMOTE_SNAPSHOT" >/dev/null
   if [ -d "$REMOTE_SNAPSHOT/work" ]; then
     REMOTE_WORK_SNAPSHOT="$REMOTE_SNAPSHOT/work"
   else

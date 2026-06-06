@@ -3,6 +3,7 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -911,13 +912,56 @@ func TestCommitQueueRecoverPendingSkipsLegacyOverwriteWithoutBaseRev(t *testing.
 // uploaded via streaming (uploadFromShadow) rather than ReadAll, and that
 // the server receives the correct data and expected revision.
 func TestCommitQueueShadowSpillUpload(t *testing.T) {
-	var gotExpected string
+	data := bytes.Repeat([]byte("shadowspill-data-"), 100) // ~1700 bytes
+	var gotExpected int64
 	var gotBody []byte
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
-		body, _ := io.ReadAll(r.Body)
-		gotBody = body
-		w.WriteHeader(http.StatusOK)
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode initiate request: %v", err)
+			}
+			if req.Path != "/big.bin" {
+				t.Fatalf("initiate path = %q, want /big.bin", req.Path)
+			}
+			if req.TotalSize != int64(len(data)) {
+				t.Fatalf("initiate total_size = %d, want %d", req.TotalSize, len(data))
+			}
+			if req.ExpectedRevision == nil {
+				t.Fatal("initiate expected_revision missing")
+			}
+			gotExpected = *req.ExpectedRevision
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "u1",
+				"key":         "object-key",
+				"part_size":   int64(len(data)),
+				"total_parts": 1,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/u1/1",
+					"size":   int64(len(data)),
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/u1/1":
+			body, _ := io.ReadAll(r.Body)
+			gotBody = body
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
 	}))
 	defer ts.Close()
 
@@ -931,8 +975,6 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Write data to shadow file (simulates what Write() + ShadowSpill does).
-	data := bytes.Repeat([]byte("shadowspill-data-"), 100) // ~1700 bytes
 	if err := shadow.WriteFull("/big.bin", data, 12); err != nil {
 		t.Fatal(err)
 	}
@@ -952,8 +994,8 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	}
 	cq.DrainAll()
 
-	if gotExpected != "12" {
-		t.Fatalf("expected revision header = %q, want 12", gotExpected)
+	if gotExpected != 12 {
+		t.Fatalf("expected revision = %d, want 12", gotExpected)
 	}
 	if !bytes.Equal(gotBody, data) {
 		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
@@ -1026,11 +1068,54 @@ func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
 // preserves the ShadowSpill flag so recovered entries use streaming upload
 // (not ReadAll which would OOM for large files).
 func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
+	data := bytes.Repeat([]byte("recover-"), 200)
 	var gotBody []byte
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		gotBody = body
-		w.WriteHeader(http.StatusOK)
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode initiate request: %v", err)
+			}
+			if req.Path != "/recover.bin" {
+				t.Fatalf("initiate path = %q, want /recover.bin", req.Path)
+			}
+			if req.TotalSize != int64(len(data)) {
+				t.Fatalf("initiate total_size = %d, want %d", req.TotalSize, len(data))
+			}
+			if req.ExpectedRevision == nil || *req.ExpectedRevision != 8 {
+				t.Fatalf("initiate expected_revision = %v, want 8", req.ExpectedRevision)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "u1",
+				"key":         "object-key",
+				"part_size":   int64(len(data)),
+				"total_parts": 1,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/u1/1",
+					"size":   int64(len(data)),
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/u1/1":
+			body, _ := io.ReadAll(r.Body)
+			gotBody = body
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
 	}))
 	defer ts.Close()
 
@@ -1046,7 +1131,6 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data := bytes.Repeat([]byte("recover-"), 200)
 	if err := shadow1.WriteFull("/recover.bin", data, 8); err != nil {
 		t.Fatal(err)
 	}

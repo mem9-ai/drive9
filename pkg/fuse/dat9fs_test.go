@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -2286,6 +2287,118 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 	}
 	if completeParts != 1 {
 		t.Fatalf("complete parts = %d, want 1", completeParts)
+	}
+}
+
+func TestFlushSmallNewFileRefreshesSiblingHandleRevision(t *testing.T) {
+	const filePath = "/sqlite/workload.db-journal"
+
+	var (
+		mu        sync.Mutex
+		revision  int64
+		content   []byte
+		expected  []int64
+		serverErr error
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/v1/fs/sqlite/workload.db-journal" {
+			http.NotFound(w, r)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			mu.Lock()
+			if serverErr == nil {
+				serverErr = err
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		gotExpected, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+		if err != nil {
+			mu.Lock()
+			if serverErr == nil {
+				serverErr = fmt.Errorf("expected revision header: %w", err)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		expected = append(expected, gotExpected)
+		if gotExpected != revision {
+			http.Error(w, "revision conflict", http.StatusConflict)
+			return
+		}
+		revision++
+		content = append([]byte(nil), body...)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": revision})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+
+	first := NewWriteBuffer(filePath, 0, 0)
+	if _, err := first.Write(0, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	fh1 := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: first,
+		IsNew: true,
+	}
+	fh1.DirtySeq = fs.markDirtySize(ino, first.Size())
+	fh1ID := fs.allocateFileHandle(fh1)
+
+	second := NewWriteBuffer(filePath, 0, 0)
+	if _, err := second.Write(0, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	fh2 := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: second,
+		IsNew: true,
+	}
+	fh2.DirtySeq = fs.markDirtySize(ino, second.Size())
+	fh2ID := fs.allocateFileHandle(fh2)
+
+	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fh1ID}); st != gofuse.OK {
+		t.Fatalf("first Flush status = %v, want OK", st)
+	}
+	if fh2.IsNew {
+		t.Fatal("second handle should no longer be create-if-absent after sibling commit")
+	}
+	if fh2.BaseRev != 1 {
+		t.Fatalf("second handle BaseRev = %d, want 1", fh2.BaseRev)
+	}
+
+	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fh2ID}); st != gofuse.OK {
+		t.Fatalf("second Flush status = %v, want OK", st)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if serverErr != nil {
+		t.Fatal(serverErr)
+	}
+	if !reflect.DeepEqual(expected, []int64{0, 1}) {
+		t.Fatalf("expected revisions = %v, want [0 1]", expected)
+	}
+	if revision != 2 {
+		t.Fatalf("server revision = %d, want 2", revision)
+	}
+	if string(content) != "second" {
+		t.Fatalf("server content = %q, want second", content)
 	}
 }
 
