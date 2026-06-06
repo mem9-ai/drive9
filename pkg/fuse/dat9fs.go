@@ -33,6 +33,7 @@ type Dat9FS struct {
 	inodes        *InodeToPath
 	fileHandles   *HandleTable[*FileHandle]
 	openHandles   *OpenHandleIndex
+	locks         *fuseLockTable
 	dirHandles    *HandleTable[*DirHandle]
 	readCache     *ReadCache
 	diskReadCache *DiskReadCache
@@ -211,6 +212,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		inodes:            NewInodeToPath(),
 		fileHandles:       NewHandleTable[*FileHandle](),
 		openHandles:       NewOpenHandleIndex(),
+		locks:             newFuseLockTable(),
 		dirHandles:        NewHandleTable[*DirHandle](),
 		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
 		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
@@ -6374,6 +6376,9 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 	perfStart := fs.perfStart()
 	releaseStatus := gofuse.OK
 	defer func() { fs.perfRecordFuse(perfFuseRelease, perfStart, releaseStatus, 0) }()
+	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
+		fs.locks.release(input.NodeId, lockOwner)
+	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if ok {
 		ctx, cf := fuseCtx(cancel)
