@@ -30,17 +30,19 @@ import (
 type Dat9FS struct {
 	gofuse.RawFileSystem
 
-	client        *client.Client
-	inodes        *InodeToPath
-	fileHandles   *HandleTable[*FileHandle]
-	openHandles   *OpenHandleIndex
-	locks         *fuseLockTable
-	dirHandles    *HandleTable[*DirHandle]
-	committedMu   sync.Mutex
-	committedRev  map[string]int64
-	readCache     *ReadCache
-	diskReadCache *DiskReadCache
-	dirCache      *DirCache
+	client            *client.Client
+	inodes            *InodeToPath
+	fileHandles       *HandleTable[*FileHandle]
+	openHandles       *OpenHandleIndex
+	locks             *fuseLockTable
+	dirHandles        *HandleTable[*DirHandle]
+	committedMu       sync.Mutex
+	committedRev      map[string]int64
+	remoteCommitMu    sync.Mutex
+	remoteCommitLocks map[string]*sync.Mutex
+	readCache         *ReadCache
+	diskReadCache     *DiskReadCache
+	dirCache          *DirCache
 	// statCacheUnverified is true while the SSE stream is not known-current.
 	// In that state, file stat cache hits embedded in DirCache must fall back
 	// to HEAD revalidation instead of serving TTL-only attrs. Even when the
@@ -221,6 +223,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		locks:             newFuseLockTable(),
 		dirHandles:        NewHandleTable[*DirHandle](),
 		committedRev:      make(map[string]int64),
+		remoteCommitLocks: make(map[string]*sync.Mutex),
 		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
 		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
 		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
@@ -808,6 +811,25 @@ func (fs *Dat9FS) latestCommittedRevision(path string) int64 {
 	revision := fs.committedRev[path]
 	fs.committedMu.Unlock()
 	return revision
+}
+
+func (fs *Dat9FS) lockRemoteCommitPath(path string) func() {
+	if fs == nil || path == "" {
+		return func() {}
+	}
+	fs.remoteCommitMu.Lock()
+	if fs.remoteCommitLocks == nil {
+		fs.remoteCommitLocks = make(map[string]*sync.Mutex)
+	}
+	lock := fs.remoteCommitLocks[path]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		fs.remoteCommitLocks[path] = lock
+	}
+	fs.remoteCommitMu.Unlock()
+
+	lock.Lock()
+	return lock.Unlock
 }
 
 func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
@@ -6013,6 +6035,8 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 	}
 
 	size := fh.Dirty.Size()
+	unlockRemoteCommit := fs.lockRemoteCommitPath(fh.Path)
+	defer unlockRemoteCommit()
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	var (
 		data         []byte
@@ -6143,6 +6167,8 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 
 	size := fh.Dirty.Size()
 	if fh.ShadowSpill && fs.shadowStore != nil {
+		unlockRemoteCommit := fs.lockRemoteCommitPath(fh.Path)
+		defer unlockRemoteCommit()
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("sync handle shadowspill upload start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
@@ -6193,6 +6219,8 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 }
 
 func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
+	unlockRemoteCommit := fs.lockRemoteCommitPath(fh.Path)
+	defer unlockRemoteCommit()
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	writeStart := time.Now()
 	fs.debugf("sync empty create start path=%s expected_rev=%d", fh.Path, expectedRevision)
@@ -7253,6 +7281,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 
 	size := fh.Dirty.Size()
+	unlockRemoteCommit := fs.lockRemoteCommitPath(fh.Path)
+	defer unlockRemoteCommit()
 
 	var err error
 

@@ -7244,6 +7244,112 @@ func TestFlushHandle_RefreshesStartedStreamerRevision(t *testing.T) {
 	}
 }
 
+func TestFlushHandle_SerializesSamePathRemoteCommits(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		revision   int64 = 7
+		handlerErr error
+		putCalls   atomic.Int32
+		inFlight   atomic.Int32
+		gotHeaders []string
+	)
+	recordHandlerErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		putCalls.Add(1)
+		if got := inFlight.Add(1); got != 1 {
+			recordHandlerErr(fmt.Errorf("concurrent remote PUTs in flight = %d, want serialized", got))
+		}
+		defer inFlight.Add(-1)
+		time.Sleep(25 * time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+		expected := r.Header.Get("X-Dat9-Expected-Revision")
+		gotHeaders = append(gotHeaders, expected)
+		if expected != strconv.FormatInt(revision, 10) {
+			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+			return
+		}
+		revision++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": revision})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/wal.db-wal", false, 4, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	makeHandle := func(data string) *FileHandle {
+		fh := &FileHandle{
+			Ino:     ino,
+			Path:    "/wal.db-wal",
+			Dirty:   NewWriteBuffer("/wal.db-wal", maxPreloadSize, 0),
+			BaseRev: 7,
+		}
+		if _, err := fh.Dirty.Write(0, []byte(data)); err != nil {
+			t.Fatal(err)
+		}
+		fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+		return fh
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan error, 2)
+	for _, fh := range []*FileHandle{makeHandle("aaaa"), makeHandle("bbbb")} {
+		go func(fh *FileHandle) {
+			<-start
+			fh.Lock()
+			st := fs.flushHandle(context.Background(), fh)
+			fh.Unlock()
+			if st != gofuse.OK {
+				errCh <- fmt.Errorf("flushHandle status = %v, want OK", st)
+				return
+			}
+			errCh <- nil
+		}(fh)
+	}
+	close(start)
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := putCalls.Load(); got != 2 {
+		t.Fatalf("PUT calls = %d, want 2", got)
+	}
+	mu.Lock()
+	err := handlerErr
+	headers := append([]string(nil), gotHeaders...)
+	finalRevision := revision
+	mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(headers) != 2 || headers[0] != "7" || headers[1] != "8" {
+		t.Fatalf("expected revision headers = %v, want [7 8]", headers)
+	}
+	if finalRevision != 9 {
+		t.Fatalf("server revision = %d, want 9", finalRevision)
+	}
+	if got := fs.latestCommittedRevision("/wal.db-wal"); got != 9 {
+		t.Fatalf("latest committed revision = %d, want 9", got)
+	}
+}
+
 func TestCommittedRevisionTrackerForgetClearsPath(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
