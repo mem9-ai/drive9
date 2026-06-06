@@ -25,6 +25,7 @@ FUSE_SQLITE_ROWS="${FUSE_SQLITE_ROWS:-64}"
 FUSE_SQLITE_CHURN_ROUNDS="${FUSE_SQLITE_CHURN_ROUNDS:-4}"
 FUSE_SQLITE_CONCURRENCY_READERS="${FUSE_SQLITE_CONCURRENCY_READERS:-4}"
 FUSE_SQLITE_CONCURRENCY_WRITES="${FUSE_SQLITE_CONCURRENCY_WRITES:-40}"
+FUSE_SQLITE_WORKLOAD_TIMEOUT_S="${FUSE_SQLITE_WORKLOAD_TIMEOUT_S:-240}"
 RUN_FUSE_SQLITE_WAL="${RUN_FUSE_SQLITE_WAL:-0}"
 RUN_FUSE_SQLITE_CHURN="${RUN_FUSE_SQLITE_CHURN:-0}"
 RUN_FUSE_SQLITE_CONCURRENCY="${RUN_FUSE_SQLITE_CONCURRENCY:-0}"
@@ -325,6 +326,22 @@ churn_rounds = int(sys.argv[6])
 run_concurrency = sys.argv[7] == "1"
 concurrency_readers = int(sys.argv[8])
 concurrency_writes = int(sys.argv[9])
+workload_timeout_s = int(os.environ.get("FUSE_SQLITE_WORKLOAD_TIMEOUT_S", "240"))
+
+
+def log(message):
+    print(f"[sqlite-workload] {message}", file=sys.stderr, flush=True)
+
+
+def timeout_exit():
+    log(f"timeout after {workload_timeout_s}s")
+    os._exit(124)
+
+
+if workload_timeout_s > 0:
+    watchdog = threading.Timer(workload_timeout_s, timeout_exit)
+    watchdog.daemon = True
+    watchdog.start()
 
 
 def payload(kind, index):
@@ -485,6 +502,7 @@ def build_churn_db(path):
 
 
 def build_concurrent_db(path):
+    log("concurrency: setup start")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     conn = connect(path)
     journal = scalar(conn, "PRAGMA journal_mode=WAL").lower()
@@ -544,6 +562,7 @@ def build_concurrent_db(path):
     threads = [threading.Thread(target=reader, args=(reader_id,), daemon=True) for reader_id in range(concurrency_readers)]
     for thread in threads:
         thread.start()
+    log(f"concurrency: started {len(threads)} readers")
 
     wconn = None
     readers_stopped = False
@@ -565,12 +584,17 @@ def build_concurrent_db(path):
                 (item_id, write_no, digest),
             )
             wconn.execute("COMMIT")
+            if write_no == 1 or write_no == concurrency_writes or write_no % 10 == 0:
+                log(f"concurrency: committed {write_no}/{concurrency_writes}")
             time.sleep(0.003)
+        log("concurrency: writer integrity_check start")
         integrity = scalar(wconn, "PRAGMA integrity_check")
         if integrity != "ok":
             raise AssertionError(f"concurrent writer integrity_check={integrity}")
+        log("concurrency: stopping readers before checkpoint")
         stop_readers()
         readers_stopped = True
+        log("concurrency: checkpoint truncate start")
         checkpoint = wconn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         if checkpoint is None or checkpoint[0] not in (0, 1):
             raise AssertionError(f"unexpected wal checkpoint result={checkpoint}")
@@ -592,6 +616,7 @@ def build_concurrent_db(path):
     if concurrency_readers > 0 and min(observations) == 0:
         raise AssertionError(f"reader observations too low: {observations}")
 
+    log("concurrency: final fingerprint start")
     conn = connect(path)
     event_count = scalar(conn, "SELECT COUNT(*) FROM events")
     if event_count != concurrency_writes:
@@ -606,15 +631,22 @@ def build_concurrent_db(path):
 
 shutil.rmtree(root, ignore_errors=True)
 os.makedirs(root, exist_ok=True)
-expected = {
-    "rollback": build_rollback_db(os.path.join(root, "rollback", "workload.db")),
-}
+expected = {}
+log("rollback: start")
+expected["rollback"] = build_rollback_db(os.path.join(root, "rollback", "workload.db"))
+log("rollback: done")
 if run_wal:
+    log("wal: start")
     expected["wal"] = build_wal_db(os.path.join(root, "wal", "workload.db"))
+    log("wal: done")
 if run_churn:
+    log("churn: start")
     expected["churn"] = build_churn_db(os.path.join(root, "churn", "workload.db"))
+    log("churn: done")
 if run_concurrency:
+    log("concurrency: start")
     expected["concurrency"] = build_concurrent_db(os.path.join(root, "concurrency", "workload.db"))
+    log("concurrency: done")
 with open(expected_path, "w", encoding="utf-8") as handle:
     json.dump(expected, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -752,6 +784,7 @@ echo "FUSE_SQLITE_ROWS=$FUSE_SQLITE_ROWS"
 echo "FUSE_SQLITE_CHURN_ROUNDS=$FUSE_SQLITE_CHURN_ROUNDS"
 echo "FUSE_SQLITE_CONCURRENCY_READERS=$FUSE_SQLITE_CONCURRENCY_READERS"
 echo "FUSE_SQLITE_CONCURRENCY_WRITES=$FUSE_SQLITE_CONCURRENCY_WRITES"
+echo "FUSE_SQLITE_WORKLOAD_TIMEOUT_S=$FUSE_SQLITE_WORKLOAD_TIMEOUT_S"
 echo "RUN_FUSE_SQLITE_WAL=$RUN_FUSE_SQLITE_WAL"
 echo "RUN_FUSE_SQLITE_CHURN=$RUN_FUSE_SQLITE_CHURN"
 echo "RUN_FUSE_SQLITE_CONCURRENCY=$RUN_FUSE_SQLITE_CONCURRENCY"
@@ -770,6 +803,10 @@ if ! [[ "$FUSE_SQLITE_CONCURRENCY_READERS" =~ ^[0-9]+$ ]] || [ "$FUSE_SQLITE_CON
 fi
 if ! [[ "$FUSE_SQLITE_CONCURRENCY_WRITES" =~ ^[0-9]+$ ]] || [ "$FUSE_SQLITE_CONCURRENCY_WRITES" -lt 1 ]; then
   echo "invalid FUSE_SQLITE_CONCURRENCY_WRITES: must be >= 1" >&2
+  exit 1
+fi
+if ! [[ "$FUSE_SQLITE_WORKLOAD_TIMEOUT_S" =~ ^[0-9]+$ ]]; then
+  echo "invalid FUSE_SQLITE_WORKLOAD_TIMEOUT_S: must be >= 0" >&2
   exit 1
 fi
 for flag_name in RUN_FUSE_SQLITE_WAL RUN_FUSE_SQLITE_CHURN RUN_FUSE_SQLITE_CONCURRENCY; do

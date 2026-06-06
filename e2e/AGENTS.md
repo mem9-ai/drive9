@@ -403,6 +403,7 @@ the layout captured by that run.
 | `FUSE_SQLITE_CHURN_ROUNDS` | `4` | `fuse-sqlite-correctness.sh` |
 | `FUSE_SQLITE_CONCURRENCY_READERS` | `4` | `fuse-sqlite-correctness.sh` |
 | `FUSE_SQLITE_CONCURRENCY_WRITES` | `40` | `fuse-sqlite-correctness.sh` |
+| `FUSE_SQLITE_WORKLOAD_TIMEOUT_S` | `240` | `fuse-sqlite-correctness.sh` |
 | `FUSE_SQLITE_KEEP_ARTIFACTS` | `0` | `fuse-sqlite-correctness.sh` |
 | `RUN_FUSE_SQLITE_WAL` | `0` | `fuse-sqlite-correctness.sh` |
 | `RUN_FUSE_SQLITE_CHURN` | `0` | `fuse-sqlite-correctness.sh` |
