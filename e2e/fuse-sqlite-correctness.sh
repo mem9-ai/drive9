@@ -222,15 +222,20 @@ stop_mount() {
 
 unmount_mount() {
   if is_mounted "$MOUNT_POINT"; then
-    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT"
+    if ! drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT"; then
+      return 1
+    fi
   fi
-  wait_mount_state unmounted
+  if ! wait_mount_state unmounted; then
+    return 1
+  fi
   if [ -n "${MOUNT_PID:-}" ]; then
     set +e
     wait "$MOUNT_PID" >/dev/null 2>&1
     MOUNT_PID=""
     set -e
   fi
+  return 0
 }
 
 curl_body_code() {

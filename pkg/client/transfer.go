@@ -355,6 +355,28 @@ func (c *Client) WriteStreamConditional(ctx context.Context, path string, r io.R
 	return err
 }
 
+// WriteMultipartStreamConditional uploads a seekable stream through the
+// multipart protocol regardless of the negotiated small-file threshold. It is
+// intended for spill-file callers that must preserve an off-heap invariant and
+// therefore cannot use the direct-PUT path, which materializes the full reader
+// into memory before sending.
+func (c *Client) WriteMultipartStreamConditional(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
+	if size <= 0 {
+		return fmt.Errorf("multipart upload requires positive size")
+	}
+	summary := &UploadSummary{
+		Type:       "upload_summary",
+		StartedAt:  time.Now(),
+		RemotePath: path,
+		TotalBytes: size,
+	}
+	err := c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, nil, "")
+	if err == errV2NotAvailable {
+		err = c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, nil, "")
+	}
+	return err
+}
+
 func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string, description string) (*UploadSummary, error) {
 	// Large uploads only send tags on complete, but validation must happen
 	// before any initiate/presign/upload work so invalid tags fail early.
