@@ -562,6 +562,7 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 		MaxWrite:      128 * 1024,      // 128KB per write request (default 64KB)
 		MaxBackground: 32,              // concurrent background FUSE requests (default 12)
 		SyncRead:      opts.SyncRead,   // disables FUSE_CAP_ASYNC_READ; one read in flight per file handle
+		EnableLocks:   true,
 		Debug:         opts.Debug,
 		AllowOther:    opts.AllowOther,
 	}
