@@ -6972,6 +6972,19 @@ func TestFlushHandle_AdoptsSameMountCommittedRevision(t *testing.T) {
 	}
 }
 
+func TestCommittedRevisionTrackerForgetClearsPath(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	fs.recordCommittedRevision("/wal.db-wal", 8)
+	fs.forgetCommittedRevision("/wal.db-wal")
+
+	if got := fs.latestCommittedRevision("/wal.db-wal"); got != 0 {
+		t.Fatalf("latest committed revision after forget = %d, want 0", got)
+	}
+}
+
 func TestReleaseNewEmptyFileUsesCreateAction(t *testing.T) {
 	var (
 		mu          sync.Mutex

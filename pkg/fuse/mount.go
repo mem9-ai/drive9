@@ -339,6 +339,7 @@ func Mount(opts *MountOptions) error {
 			if wbCache != nil {
 				uploader := NewWriteBackUploader(c, wbCache, opts.UploadConcurrency, opts.RemoteRoot)
 				uploader.SetPerfCounters(dat9fs.perf)
+				uploader.OnSuccess = dat9fs.onWriteBackUploadSuccess
 				dat9fs.SetWriteBack(wbCache, uploader)
 				// Recover pending uploads only when the newer commit queue is
 				// unavailable. Otherwise commitQueue owns shadow-backed recovery.

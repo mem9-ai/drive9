@@ -787,6 +787,52 @@ func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
 	}
 }
 
+func TestWriteBackUploader_OnSuccessReceivesCommittedRevision(t *testing.T) {
+	var gotExpected string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			w.Header().Set("X-Dat9-Revision", "24")
+			w.Header().Set("Content-Length", "4")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := newTestClient(ts.URL)
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	var (
+		successMeta WriteBackMeta
+		successRev  int64
+	)
+	uploader.OnSuccess = func(meta WriteBackMeta, committedRev int64) {
+		successMeta = meta
+		successRev = committedRev
+	}
+
+	_ = cache.PutWithBaseRev("/existing.txt", []byte("edit"), 4, PendingOverwrite, 23)
+	uploader.Submit("/existing.txt")
+	uploader.DrainAll()
+
+	if gotExpected != "23" {
+		t.Fatalf("X-Dat9-Expected-Revision = %q, want %q", gotExpected, "23")
+	}
+	if successMeta.Path != "/existing.txt" {
+		t.Fatalf("OnSuccess path = %q, want /existing.txt", successMeta.Path)
+	}
+	if successRev != 24 {
+		t.Fatalf("OnSuccess committedRev = %d, want 24", successRev)
+	}
+}
+
 func TestWriteBackUploader_PendingOverwriteWithoutBaseRevRetainsCache(t *testing.T) {
 	var putCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

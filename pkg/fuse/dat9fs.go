@@ -748,6 +748,15 @@ func (fs *Dat9FS) recordCommittedRevision(path string, revision int64) {
 	fs.committedMu.Unlock()
 }
 
+func (fs *Dat9FS) forgetCommittedRevision(path string) {
+	if fs == nil || path == "" {
+		return
+	}
+	fs.committedMu.Lock()
+	delete(fs.committedRev, path)
+	fs.committedMu.Unlock()
+}
+
 func (fs *Dat9FS) latestCommittedRevision(path string) int64 {
 	if fs == nil || path == "" {
 		return 0
@@ -3706,6 +3715,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.dirCache.Remove(parentPath, name)
 		fs.cacheNegativePath(childP)
 		fs.scheduleGitStateCheckpoint(childP)
+		fs.forgetCommittedRevision(childP)
 		return gofuse.OK
 	}
 	if entry, handled := fs.gitEntry(ctx, childP, false); handled {
@@ -3733,6 +3743,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}()
 
 	pendingNew := false
+	if fs.debouncer != nil {
+		fs.debouncer.Cancel(childP)
+	}
 	if fs.writeBack != nil && fs.uploader != nil {
 		// Wait for any in-flight upload to finish so it doesn't "revive"
 		// the file on the server after we delete it.
@@ -3803,6 +3816,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 
 	fs.inodes.RemoveLink(childP)
 	fs.invalidateReadCacheAndTargets(childP)
+	fs.forgetCommittedRevision(childP)
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Remove(parentPath, name)
@@ -7019,6 +7033,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		// The handle stays locked across upload + finalize so concurrent writes
 		// cannot advance live state for data outside this committed snapshot.
 		if committedRev > 0 {
+			fs.recordCommittedRevision(filePath, committedRev)
 			handle.IsNew = false
 			handle.BaseRev = committedRev
 			fs.inodes.UpdateRevision(ino, committedRev)
@@ -7462,6 +7477,9 @@ func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, a
 // It seeds readCache and updates inode revision when committedRev is available,
 // or invalidates the cache otherwise.
 func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
+	if fs == nil {
+		return
+	}
 	if entry == nil {
 		return
 	}
@@ -7494,6 +7512,17 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
 	}
+}
+
+func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int64) {
+	if fs == nil {
+		return
+	}
+	if committedRev > 0 {
+		fs.recordCommittedRevision(meta.Path, committedRev)
+		fs.refreshCommittedRevisionForOpenHandles(meta.Path, committedRev, nil)
+	}
+	fs.cacheFileForPath(meta.Path, meta.Size, time.Now(), committedRev)
 }
 
 func (fs *Dat9FS) onCommitQueueCleanup(entry *CommitEntry) {

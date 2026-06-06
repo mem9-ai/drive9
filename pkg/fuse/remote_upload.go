@@ -16,6 +16,17 @@ func uploadBufferedRemoteFile(ctx context.Context, c *client.Client, remotePath 
 	return c.WriteStreamConditional(ctx, remotePath, bytes.NewReader(data), int64(len(data)), nil, expectedRevision)
 }
 
+func uploadBufferedRemoteFileWithRevision(ctx context.Context, c *client.Client, remotePath string, data []byte, expectedRevision int64) (int64, error) {
+	if err := c.WriteStreamConditional(ctx, remotePath, bytes.NewReader(data), int64(len(data)), nil, expectedRevision); err != nil {
+		return 0, err
+	}
+	stat, err := c.StatCtx(ctx, remotePath)
+	if err != nil {
+		return 0, err
+	}
+	return stat.Revision, nil
+}
+
 // uploadFromShadowRemote streams a shadow file to the server without loading
 // the entire file into memory. localPath identifies the shadow entry;
 // remotePath is the API destination (may differ when using RemoteRoot).
