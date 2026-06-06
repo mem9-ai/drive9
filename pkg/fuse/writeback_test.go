@@ -2289,6 +2289,133 @@ func TestFsync_NoDuplicateUpload(t *testing.T) {
 	uploader.DrainAll()
 }
 
+func TestFsyncShadowSpillCommitRefreshesRevisionAndClearsPending(t *testing.T) {
+	const filePath = "/workload.db-journal"
+	var (
+		mu                sync.Mutex
+		revision          int64
+		expectedRevisions []int64
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			if string(body) == "" {
+				t.Error("PUT body should not be empty")
+			}
+			got, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				t.Errorf("expected revision header: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			expectedRevisions = append(expectedRevisions, got)
+			if got != revision {
+				http.Error(w, "revision conflict", http.StatusConflict)
+				return
+			}
+			revision++
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": revision})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.syncMode = SyncStrict
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, strings.TrimPrefix(filePath, "/"), &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle missing")
+	}
+	if !fh.ShadowSpill {
+		t.Fatal("created journal handle should use shadow spill")
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, []byte("first journal frame")); st != gofuse.OK {
+		t.Fatalf("first Write: %v", st)
+	}
+	if !shadow.Has(filePath) {
+		t.Fatal("shadow should contain staged journal before fsync")
+	}
+
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("first Fsync: %v", st)
+	}
+	if fh.IsNew {
+		t.Fatal("handle should not remain create-if-absent after first fsync")
+	}
+	if fh.BaseRev != 1 {
+		t.Fatalf("BaseRev after first fsync = %d, want 1", fh.BaseRev)
+	}
+	if pending.HasPending(filePath) {
+		t.Fatal("pending index should be cleared after remote-durable fsync")
+	}
+	if shadow.Has(filePath) {
+		t.Fatal("shadow should be cleared after remote-durable fsync")
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, []byte("second journal frame")); st != gofuse.OK {
+		t.Fatalf("second Write: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("second Fsync: %v", st)
+	}
+	if fh.BaseRev != 2 {
+		t.Fatalf("BaseRev after second fsync = %d, want 2", fh.BaseRev)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(expectedRevisions) != 2 || expectedRevisions[0] != 0 || expectedRevisions[1] != 1 {
+		t.Fatalf("expected revisions = %v, want [0 1]", expectedRevisions)
+	}
+}
+
 // TestSamePathConsecutiveSaves verifies that rapid consecutive saves to the
 // same path don't result in stale data overwriting fresh data, thanks to
 // the generation check in uploadOne.

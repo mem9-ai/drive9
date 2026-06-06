@@ -667,7 +667,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	// multi-GiB files into memory. Uses io.SectionReader over the shadow fd.
 	if entry.ShadowSpill {
 		start := time.Now()
-		err := uploadFromShadowRemote(ctx, cq.client, cq.shadows, entry.Path, apiPath, expectedRevision)
+		committedRev, err := uploadFromShadowRemoteWithRevision(ctx, cq.client, cq.shadows, entry.Path, apiPath, expectedRevision)
 		if cq.perf != nil {
 			var bytes uint64
 			if entry.Size > 0 {
@@ -675,7 +675,7 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 			}
 			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), bytes)
 		}
-		return 0, err
+		return committedRev, err
 	}
 
 	// Non-ShadowSpill: read full content into memory.
