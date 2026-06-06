@@ -472,6 +472,10 @@ func isSQLitePersistentJournalPath(localPath string) bool {
 	return strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-journal")
 }
 
+func bypassStableRemoteReadCaches(localPath string) bool {
+	return isSQLitePersistentJournalPath(localPath)
+}
+
 func shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath string) bool {
 	return isSQLitePersistentJournalPath(localPath)
 }
@@ -1911,6 +1915,16 @@ func (fs *Dat9FS) readTargetForHandle(ctx context.Context, fh *FileHandle) *clie
 	target := fh.ReadTarget
 	handlePath := fh.Path
 	remotePath := fs.remotePath(handlePath)
+	if bypassStableRemoteReadCaches(handlePath) {
+		if target != nil {
+			fh.ReadTarget = nil
+			if fh.Prefetch != nil {
+				fh.Prefetch.SetReadTarget(nil)
+			}
+		}
+		fh.Unlock()
+		return nil
+	}
 	fh.Unlock()
 	if target != nil {
 		return target
@@ -2134,7 +2148,7 @@ func diskReadCacheFileID(p string, entry *InodeEntry) string {
 }
 
 func (fs *Dat9FS) diskReadCacheKey(p string, entry *InodeEntry, offset, size int64) (DiskReadCacheKey, bool) {
-	if fs == nil || fs.diskReadCache == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || offset < 0 || size <= 0 {
+	if fs == nil || fs.diskReadCache == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || offset < 0 || size <= 0 || bypassStableRemoteReadCaches(p) {
 		return DiskReadCacheKey{}, false
 	}
 	key := DiskReadCacheKey{
@@ -5783,6 +5797,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	p := fh.Path
+	bypassStableCaches := bypassStableRemoteReadCaches(p)
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
 	revalidatedForRead := false
 	if entry != nil && !fs.statCacheVerified() {
@@ -5796,7 +5811,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	// Try prefetcher for large read-only files
-	if fh.Prefetch != nil {
+	if fh.Prefetch != nil && !bypassStableCaches {
 		offset := int64(input.Offset)
 		size := int(input.Size)
 		if data, ok := fh.Prefetch.Get(offset, size); ok {
@@ -5820,7 +5835,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// Try read cache for small files. Use revision-aware cache: if the
 	// InodeEntry has a stored revision from the last Lookup/GetAttr, pass
 	// it to the cache for validation. Cache hit only if revision matches.
-	if entry != nil && entry.Size <= fs.readCache.MaxFileSize() && entry.Size > 0 {
+	if entry != nil && entry.Size <= fs.readCache.MaxFileSize() && entry.Size > 0 && !bypassStableCaches {
 		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
 		if data, ok := fs.readCache.Get(p, cacheRev); ok {
@@ -5926,7 +5941,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			}
 			source = "disk-read-cache-hit"
 			bytesRead = len(data)
-			if fh.Prefetch != nil {
+			if fh.Prefetch != nil && !bypassStableCaches {
 				fh.Prefetch.OnRead(rangeOffset, len(data))
 			}
 			return gofuse.ReadResultData(data), gofuse.OK
@@ -5949,7 +5964,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			fs.debugf("read disk-cache range done path=%s off=%d req=%d got=%d source=%s dur=%s", p, input.Offset, input.Size, n, source, time.Since(rangeStart))
 		}
 		bytesRead = n
-		if fh.Prefetch != nil {
+		if fh.Prefetch != nil && !bypassStableCaches {
 			fh.Prefetch.OnRead(rangeOffset, n)
 		}
 		return gofuse.ReadResultData(data), gofuse.OK
@@ -5981,7 +5996,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		fs.debugf("read range done path=%s off=%d req=%d got=%d source=%s dur=%s", p, input.Offset, input.Size, n, source, time.Since(rangeStart))
 	}
 	bytesRead = n
-	if fh.Prefetch != nil {
+	if fh.Prefetch != nil && !bypassStableCaches {
 		fh.Prefetch.OnRead(int64(input.Offset), n)
 	}
 	return gofuse.ReadResultData(data), gofuse.OK

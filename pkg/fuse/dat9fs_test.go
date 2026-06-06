@@ -885,6 +885,76 @@ func TestDat9FSDiskReadCacheRangeReadThrough(t *testing.T) {
 	}
 }
 
+func TestDat9FSSQLitePersistentJournalBypassesDiskReadCacheKey(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+
+	regular := &InodeEntry{Path: "/repo/regular.bin", Size: 4096, Revision: 7}
+	if _, ok := fs.diskReadCacheKey(regular.Path, regular, 0, 1024); !ok {
+		t.Fatal("regular file disk read cache key unavailable")
+	}
+
+	for _, path := range []string{"/repo/workload.db-wal", "/repo/workload.db-journal"} {
+		entry := &InodeEntry{Path: path, Size: 4096, Revision: 7}
+		if key, ok := fs.diskReadCacheKey(path, entry, 0, 1024); ok {
+			t.Fatalf("disk read cache key for %s = %+v, want disabled", path, key)
+		}
+	}
+}
+
+func TestDat9FSReadSQLitePersistentJournalBypassesSmallReadCache(t *testing.T) {
+	const path = "/repo/workload.db-wal"
+	var reads atomic.Int32
+	var recorder testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs/repo/workload.db-wal" {
+			recorder.Recordf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		switch reads.Add(1) {
+		case 1:
+			_, _ = w.Write([]byte("old-wal"))
+		case 2:
+			_, _ = w.Write([]byte("new-wal"))
+		default:
+			recorder.Recordf("unexpected read count")
+			http.Error(w, "unexpected read count", http.StatusTooManyRequests)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(path, false, 7, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "old-wal" {
+		t.Fatalf("first read = %q, %v; want old-wal OK", got, st)
+	}
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, 0, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "new-wal" {
+		t.Fatalf("second read = %q, %v; want new-wal OK", got, st)
+	}
+	if calls := reads.Load(); calls != 2 {
+		t.Fatalf("server reads = %d, want 2", calls)
+	}
+	recorder.Check(t)
+}
+
 func TestDat9FSDiskReadCacheRevisionInvalidatesByKey(t *testing.T) {
 	const path = "/file.bin"
 	data := bytes.Repeat([]byte("a"), defaultReadCacheMaxFileSize+1024)
@@ -11169,6 +11239,30 @@ func TestReadTargetForHandleDropsResolvedTargetAfterPathChange(t *testing.T) {
 	}
 	if fh.ReadTarget != nil {
 		t.Fatalf("handle cached target = %+v, want nil", fh.ReadTarget)
+	}
+}
+
+func TestReadTargetForHandleBypassesSQLitePersistentJournal(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	target := &client.ReadTarget{ObjectURL: "http://old.example/object"}
+	fh := &FileHandle{Path: "/repo/workload.db-wal", ReadTarget: target}
+	fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath(fh.Path), 4096)
+	fh.Prefetch.SetReadTarget(target)
+
+	if got := fs.readTargetForHandle(context.Background(), fh); got != nil {
+		t.Fatalf("read target = %+v, want nil", got)
+	}
+	if fh.ReadTarget != nil {
+		t.Fatalf("handle cached target = %+v, want cleared", fh.ReadTarget)
+	}
+	fh.Prefetch.mu.Lock()
+	prefetchTarget := fh.Prefetch.target
+	fh.Prefetch.mu.Unlock()
+	if prefetchTarget != nil {
+		t.Fatalf("prefetch target = %+v, want cleared", prefetchTarget)
 	}
 }
 
