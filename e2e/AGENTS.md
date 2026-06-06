@@ -235,6 +235,21 @@ deterministic read-correctness coverage, not a write/concurrency/Git workload.
 9. Verify the read-only mount rejects writes
 10. Preserve run root, fixture root, and mount log on failure
 
+### `fuse-sqlite-correctness.sh`
+
+Host support: Linux and macOS only. This script needs real FUSE support and is
+deterministic SQLite rollback-journal correctness coverage, not concurrency,
+performance, or crash recovery. Set `RUN_FUSE_SQLITE_WAL=1` to add the WAL detector.
+
+1. Provision tenant unless `DRIVE9_API_KEY` is already set
+2. Prepare `drive9` CLI binary (build local or download official release)
+3. Mount a fresh writable namespace through real FUSE
+4. Create deterministic SQLite databases in rollback-journal mode, plus WAL when `RUN_FUSE_SQLITE_WAL=1`
+5. Verify `PRAGMA integrity_check` and logical fingerprints while mounted
+6. Unmount, remount, and verify the same logical fingerprints
+7. Copy the remote tree back through the CLI and verify snapshot integrity
+8. Preserve run root, mount log, and expected/actual manifests on failure
+
 ### `fuse-concurrency-stress.sh`
 
 Host support: Linux and macOS only. This script needs real FUSE support and is
@@ -324,7 +339,9 @@ the layout captured by that run.
 3. Enables durable `umount --timeout` followed by remount visibility checks
 4. Enables mount-log audit and dumps mount logs on failure
 5. Runs manifest read correctness workload
-6. Runs bounded concurrency stress workload only when
+6. Runs SQLite rollback-journal correctness workload only when
+   `RUN_FUSE_SQLITE_CORRECTNESS=1`
+7. Runs bounded concurrency stress workload only when
    `RUN_FUSE_CONCURRENCY_STRESS=1`
 
 ### `smoke-all.sh`
@@ -349,8 +366,8 @@ the layout captured by that run.
 | `RUN_LARGE_FILE` | `1` | `api-smoke-test.sh` |
 | `LARGE_FILE_MB` | `100` | `api-smoke-test.sh` |
 | `BATCH_SMALL_FILE_COUNT` | `10` | `api-smoke-test.sh` |
-| `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
-| `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `REQUEST_MAX_RETRIES` | `8` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh` |
+| `REQUEST_RETRY_SLEEP_S` | `2` | `api-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh` |
 | `RUN_UPLOAD_LIMIT_BOUNDARY` | `1` | `api-smoke-test.sh` |
 | `UPLOAD_LIMIT_BYTES` | `10737418240` | `api-smoke-test.sh` |
 | `RUN_SEMANTIC_CHECKS` | `1` | `api-smoke-test.sh` |
@@ -366,18 +383,22 @@ the layout captured by that run.
 | `RUN_CLI_FORK_CHECKS` | `1` (auto-skip when `/v1/fork` is unavailable) | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_TIMEOUT_S` | `90` | `cli-smoke-test.sh` |
 | `CLI_SEMANTIC_INTERVAL_S` | `3` | `cli-smoke-test.sh` |
-| `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
-| `CLI_RELEASE_BASE_URL` | `https://drive9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
-| `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
-| `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
-| `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
-| `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `CLI_SOURCE` | `build` (`build` or `official`) | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh` |
+| `CLI_RELEASE_BASE_URL` | `https://drive9.ai/releases` | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh` |
+| `CLI_RELEASE_VERSION` | *(latest)* | `cli-smoke-test.sh`, `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh` |
+| `MOUNT_READY_TIMEOUT_S` | `20` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh` |
+| `MOUNT_READY_INTERVAL_S` | `1` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh` |
+| `FUSE_MOUNT_ROOT` | `/tmp` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh` |
 | `CLI_MAX_RETRIES` | `8` | `fuse-smoke-test.sh` |
 | `CLI_RETRY_SLEEP_S` | `2` | `fuse-smoke-test.sh` |
-| `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
-| `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-concurrency-stress.sh` |
+| `FUSE_STRICT_PREREQS` | `0` (`1` in release gate) | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh` |
+| `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh` |
 | `FUSE_CORRECTNESS_LARGE_MB` | `9` | `fuse-correctness-workload.sh` |
 | `FUSE_CORRECTNESS_KEEP_ARTIFACTS` | `0` | `fuse-correctness-workload.sh` |
+| `RUN_FUSE_SQLITE_CORRECTNESS` | `0` | `fuse-release-gate.sh` |
+| `FUSE_SQLITE_ROWS` | `64` | `fuse-sqlite-correctness.sh` |
+| `FUSE_SQLITE_KEEP_ARTIFACTS` | `0` | `fuse-sqlite-correctness.sh` |
+| `RUN_FUSE_SQLITE_WAL` | `0` | `fuse-sqlite-correctness.sh` |
 | `FUSE_CONCURRENCY_WORKERS` | `4` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_FILES_PER_WORKER` | `8` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_READER_WORKERS` | `2` | `fuse-concurrency-stress.sh` |
