@@ -1257,6 +1257,49 @@ func committedRevisionFromExpectedRevision(expectedRevision int64) (int64, bool)
 	return expectedRevision + 1, true
 }
 
+func sqliteCommittedRevision(committedRev, expectedRevision int64) int64 {
+	if committedRev > 0 {
+		return committedRev
+	}
+	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+		return revision
+	}
+	return 0
+}
+
+func (fs *Dat9FS) cacheCommittedSQLitePersistentJournalLocked(fh *FileHandle, revision int64) bool {
+	if fs == nil || fs.readCache == nil || fh == nil || fh.Dirty == nil || revision <= 0 || !isSQLitePersistentJournalPath(fh.Path) {
+		return false
+	}
+	size := fh.Dirty.Size()
+	if size > fs.readCache.MaxFileSize() || !writeBufferHasLoadedFullRange(fh.Dirty) {
+		return false
+	}
+	fs.readCache.Put(fh.Path, fh.Dirty.bytesView(), revision)
+	return true
+}
+
+func writeBufferHasLoadedFullRange(wb *WriteBuffer) bool {
+	if wb == nil {
+		return false
+	}
+	size := wb.Size()
+	if size == 0 {
+		return true
+	}
+	partSize := wb.PartSize()
+	if partSize <= 0 {
+		return false
+	}
+	parts := int((size + partSize - 1) / partSize)
+	for part := 0; part < parts; part++ {
+		if !wb.IsPartLoaded(part) {
+			return false
+		}
+	}
+	return true
+}
+
 // finalizeHandleFlushLocked updates the live handle and inode cache after a
 // successful upload using the exact CAS revision that completed, when known.
 // Callers must hold fh.mu.
@@ -1707,101 +1750,33 @@ restartLoop:
 	}
 }
 
-func (fs *Dat9FS) readSQLitePersistentJournalDirtyRange(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
-	if fs == nil || fs.openHandles == nil || !isSQLitePersistentJournalPath(path) || reqSize == 0 {
-		return nil, 0, false, gofuse.OK
+func (fs *Dat9FS) readSQLitePersistentJournalCommittedCache(path string, fallbackRevision int64, offset int64, reqSize uint32) ([]byte, int, bool) {
+	if fs == nil || fs.readCache == nil || !isSQLitePersistentJournalPath(path) || reqSize == 0 || offset < 0 {
+		return nil, 0, false
 	}
-
-	type candidate struct {
-		fh       *FileHandle
-		dirtySeq uint64
+	revision := fs.latestCommittedRevision(path)
+	if revision <= 0 {
+		revision = fallbackRevision
 	}
-
-restartLoop:
-	for {
-		var candidates []candidate
-		for _, src := range fs.openHandles.SnapshotPath(path) {
-			if src == nil || src == skip {
-				continue
-			}
-			if !src.TryLock() {
-				continue
-			}
-			if src.Dirty != nil && src.DirtySeq > 0 {
-				candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
-			}
-			src.Unlock()
-		}
-		sort.SliceStable(candidates, func(i, j int) bool {
-			return candidates[i].dirtySeq > candidates[j].dirtySeq
-		})
-
-	candidateLoop:
-		for _, c := range candidates {
-			src := c.fh
-			if !src.TryLock() {
-				continue
-			}
-			if src.Dirty == nil || src.DirtySeq == 0 {
-				src.Unlock()
-				continue
-			}
-			if src.DirtySeq != c.dirtySeq {
-				src.Unlock()
-				continue restartLoop
-			}
-			end := offset + int64(reqSize)
-			size := src.Dirty.Size()
-			if offset < 0 || end <= offset || end > size {
-				src.Unlock()
-				continue
-			}
-			buf := make([]byte, reqSize)
-
-			if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
-				src.Unlock()
-				n, err := fs.shadowStore.ReadAt(path, offset, buf)
-				if err != nil && !errors.Is(err, io.EOF) {
-					fs.debugf("read sqlite sidecar shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
-					continue
-				}
-				if n != int(reqSize) {
-					continue
-				}
-				return buf[:n], n, true, gofuse.OK
-			}
-
-			ps := src.Dirty.PartSize()
-			firstPart := int(offset / ps)
-			lastPart := int((end - 1) / ps)
-			touchesEvicted := false
-			if evicted := src.Dirty.StreamedPartIndices(); len(evicted) > 0 {
-				for p := firstPart; p <= lastPart; p++ {
-					if evicted[p] && !src.Dirty.IsPartLoaded(p) {
-						touchesEvicted = true
-						break
-					}
-				}
-			}
-			if touchesEvicted {
-				src.Unlock()
-				continue
-			}
-			for p := firstPart; p <= lastPart; p++ {
-				if !src.Dirty.IsPartLoaded(p) {
-					if err := src.Dirty.EnsureLoaded(p); err != nil {
-						src.Unlock()
-						fs.debugf("read sqlite sidecar dirty incomplete path=%s part=%d err=%v", path, p, err)
-						continue candidateLoop
-					}
-				}
-			}
-			src.Dirty.ReadAt(offset, buf)
-			src.Unlock()
-			return buf, len(buf), true, gofuse.OK
-		}
-		return nil, 0, false, gofuse.OK
+	if revision <= 0 {
+		return nil, 0, false
 	}
+	data, ok := fs.readCache.Get(path, revision)
+	if !ok {
+		return nil, 0, false
+	}
+	if offset >= int64(len(data)) {
+		return nil, 0, true
+	}
+	end := offset + int64(reqSize)
+	if end > int64(len(data)) {
+		end = int64(len(data))
+	}
+	if end <= offset {
+		return nil, 0, true
+	}
+	out := cloneBytes(data[offset:end])
+	return out, len(out), true
 }
 
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
@@ -2277,8 +2252,8 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPat
 		data, ok := snapshots[cand.size]
 		if !ok {
 			if cand.size > 0 {
-				if dirtyData, n, claimed, st := fs.readSamePathDirtyHandleAllowJournals(localPath, nil, 0, uint32(cand.size)); claimed && st == gofuse.OK {
-					data = dirtyData[:n]
+				if cachedData, n, claimed := fs.readSQLitePersistentJournalCommittedCache(localPath, 0, 0, uint32(cand.size)); claimed && int64(n) == cand.size {
+					data = cachedData[:n]
 				} else {
 					snapshotCtx, cancel := context.WithTimeout(ctx, readTransientRetryTimeout)
 					var err error
@@ -5787,13 +5762,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// serve reads from those ranges — the data is on S3 but not in memory.
 	// For such ranges we fall through to the server read path.
 	if fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
-		if data, n, ok, st := fs.readSQLitePersistentJournalDirtyRange(fh.Path, fh, int64(input.Offset), input.Size); ok {
+		if data, n, ok := fs.readSQLitePersistentJournalCommittedCache(fh.Path, fh.BaseRev, int64(input.Offset), input.Size); ok {
 			fh.Unlock()
-			source = "sqlite-sidecar-same-path-dirty"
+			source = "sqlite-sidecar-committed-cache"
 			bytesRead = n
-			if st != gofuse.OK {
-				return nil, st
-			}
 			return gofuse.ReadResultData(data), gofuse.OK
 		}
 		if fh.Dirty.Size() == 0 && (fh.IsNew || fh.BaseRev == 0 || fh.OrigSize == 0) {
@@ -5941,12 +5913,9 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	if fh.Dirty == nil && isSQLitePersistentJournalPath(fh.Path) {
-		if data, n, ok, st := fs.readSQLitePersistentJournalDirtyRange(fh.Path, fh, int64(input.Offset), input.Size); ok {
-			source = "sqlite-sidecar-same-path-dirty"
+		if data, n, ok := fs.readSQLitePersistentJournalCommittedCache(fh.Path, fh.BaseRev, int64(input.Offset), input.Size); ok {
+			source = "sqlite-sidecar-committed-cache"
 			bytesRead = n
-			if st != gofuse.OK {
-				return nil, st
-			}
 			return gofuse.ReadResultData(data), gofuse.OK
 		}
 		entry, _ := fs.inodes.GetEntry(fh.Ino)
@@ -6568,6 +6537,8 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		return httpToFuseStatus(err)
 	}
 
+	sidecarRevision := sqliteCommittedRevision(committedRev, expectedRevision)
+	sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
 	fh.Dirty.ClearDirty()
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.DirtySeq = 0
@@ -6576,6 +6547,10 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		fs.clearReadTargetsForPathExcept(fh.Path, fh)
 		fs.readCache.Put(fh.Path, data, committedRev)
 		fs.markHandleRemoteCommittedLocked(fh, committedRev)
+	} else if sidecarCached {
+		clearReadTargetForLockedHandle(fh)
+		fs.clearReadTargetsForPathExcept(fh.Path, fh)
+		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 	} else {
 		clearReadTargetForLockedHandle(fh)
 		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
@@ -7780,11 +7755,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			return httpToFuseStatus(err)
 		}
 
+		sidecarRevision := sqliteCommittedRevision(0, expectedRevision)
+		sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 		clearReadTargetForLockedHandle(fh)
-		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		if sidecarCached {
+			fs.clearReadTargetsForPathExcept(fh.Path, fh)
+		} else {
+			fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		}
 		fs.inodes.UpdateSize(fh.Ino, size)
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		// Remove stale shadow so subsequent read-only opens don't serve
@@ -7843,11 +7824,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			return httpToFuseStatus(err)
 		}
 
+		sidecarRevision := sqliteCommittedRevision(0, expectedRevision)
+		sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 		clearReadTargetForLockedHandle(fh)
-		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		if sidecarCached {
+			fs.clearReadTargetsForPathExcept(fh.Path, fh)
+		} else {
+			fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		}
 		fs.inodes.UpdateSize(fh.Ino, size)
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		// Remove stale shadow (same reason as Path 1a above).
@@ -7961,6 +7948,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		return httpToFuseStatus(err)
 	}
 
+	sidecarRevision := sqliteCommittedRevision(committedRev, expectedRevision)
+	sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
 	fh.Dirty.ClearDirty()
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.DirtySeq = 0
@@ -7969,6 +7958,10 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.clearReadTargetsForPathExcept(fh.Path, fh)
 		fs.readCache.Put(fh.Path, data, committedRev)
 		fs.markHandleRemoteCommittedLocked(fh, committedRev)
+	} else if sidecarCached {
+		clearReadTargetForLockedHandle(fh)
+		fs.clearReadTargetsForPathExcept(fh.Path, fh)
+		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 	} else {
 		clearReadTargetForLockedHandle(fh)
 		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
