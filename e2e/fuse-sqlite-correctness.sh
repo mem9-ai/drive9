@@ -26,6 +26,7 @@ FUSE_SQLITE_CHURN_ROUNDS="${FUSE_SQLITE_CHURN_ROUNDS:-4}"
 FUSE_SQLITE_CONCURRENCY_READERS="${FUSE_SQLITE_CONCURRENCY_READERS:-4}"
 FUSE_SQLITE_CONCURRENCY_WRITES="${FUSE_SQLITE_CONCURRENCY_WRITES:-40}"
 FUSE_SQLITE_WORKLOAD_TIMEOUT_S="${FUSE_SQLITE_WORKLOAD_TIMEOUT_S:-240}"
+FUSE_SQLITE_MOUNT_DEBUG="${FUSE_SQLITE_MOUNT_DEBUG:-0}"
 RUN_FUSE_SQLITE_WAL="${RUN_FUSE_SQLITE_WAL:-0}"
 RUN_FUSE_SQLITE_CHURN="${RUN_FUSE_SQLITE_CHURN:-0}"
 RUN_FUSE_SQLITE_CONCURRENCY="${RUN_FUSE_SQLITE_CONCURRENCY:-0}"
@@ -199,11 +200,17 @@ wait_mount_state() {
 }
 
 start_mount() {
+  local mount_args=(mount)
+  if [ "$FUSE_SQLITE_MOUNT_DEBUG" = "1" ]; then
+    mount_args+=(--debug)
+  fi
+  mount_args+=("$MOUNT_POINT")
   {
     echo "=== drive9 sqlite mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
     echo "root_remote=$ROOT_REMOTE"
+    echo "mount_args=${mount_args[*]}"
   } >>"$MOUNT_LOG"
-  drive9 mount "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+  drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
 
   if wait_mount_state mounted; then
@@ -915,6 +922,10 @@ cleanup() {
   else
     echo "Artifacts preserved at $RUN_ROOT"
     echo "Mount log: $MOUNT_LOG"
+    if [ "$FUSE_SQLITE_MOUNT_DEBUG" = "1" ] && [ -f "$MOUNT_LOG" ]; then
+      echo "=== mount log tail ==="
+      tail -n 400 "$MOUNT_LOG" || true
+    fi
     echo "Expected SQLite manifest: $EXPECTED_JSON"
     echo "Mounted SQLite manifest: $ACTUAL_MOUNT_JSON"
     echo "Remounted SQLite manifest: $ACTUAL_REMOUNT_JSON"
