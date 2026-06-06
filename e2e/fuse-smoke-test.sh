@@ -309,6 +309,30 @@ print(h.hexdigest())
 PY
 }
 
+write_pattern_file() {
+  local file_path="$1"
+  local size="$2"
+  local seed="$3"
+  python3 - "$file_path" "$size" "$seed" <<'PY'
+import sys
+
+path = sys.argv[1]
+size = int(sys.argv[2])
+seed = int(sys.argv[3])
+chunk = bytearray(1024 * 1024)
+remaining = size
+offset = 0
+with open(path, "wb") as handle:
+    while remaining > 0:
+        n = min(len(chunk), remaining)
+        for idx in range(n):
+            chunk[idx] = (offset + idx * 31 + seed) % 251
+        handle.write(chunk[:n])
+        offset += n
+        remaining -= n
+PY
+}
+
 wait_mount_state() {
   local expect="$1"
   local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
@@ -631,6 +655,7 @@ MOUNT_POINT="$ROOT_MOUNT"
 MOUNT_LOG="$FUSE_MOUNT_ROOT/drive9-fuse-smoke-${TS}.log"
 SEED_LOCAL="$FUSE_MOUNT_ROOT/drive9-fuse-seed-${TS}.txt"
 LARGE_DOWNLOADED="$FUSE_MOUNT_ROOT/drive9-fuse-large-down-${TS}.bin"
+TIER_DOWNLOADED="$FUSE_MOUNT_ROOT/drive9-fuse-tier-down-${TS}.bin"
 
 set +e
 ls_out=$(drive9 fs ls / 2>&1)
@@ -674,6 +699,9 @@ MOUNT_TO_CLI_MOUNT="$MOUNT_POINT/$MOUNT_TO_CLI_REL"
 LARGE_REL="${RW_ALPHA_RENAMED_REL}/large-8m.bin"
 LARGE_REMOTE="/${LARGE_REL}"
 LARGE_MOUNT="$MOUNT_POINT/$LARGE_REL"
+TIER_REL="${RW_ALPHA_RENAMED_REL}/tier-transition.bin"
+TIER_REMOTE="/${TIER_REL}"
+TIER_MOUNT="$MOUNT_POINT/$TIER_REL"
 GIT_PROBE_REL="${ROOT_REL}/git-config-probe"
 GIT_PROBE_MOUNT="$MOUNT_POINT/$GIT_PROBE_REL"
 GIT_PROBE_ORIGIN="https://github.com/mem9-ai/drive9.git"
@@ -694,7 +722,7 @@ printf "seed-%s" "$TS" > "$SEED_LOCAL"
 MOUNT_PID=""
 cleanup() {
   stop_mount
-  rm -f "$SEED_LOCAL" "$LARGE_DOWNLOADED" "$CLI_BIN"
+  rm -f "$SEED_LOCAL" "$LARGE_DOWNLOADED" "$TIER_DOWNLOADED" "$CLI_BIN"
   rm -rf "${MOUNT_POINT:?}" || true
 }
 on_exit() {
@@ -977,6 +1005,64 @@ PY
     large_src_hash=$(sha256_file "$LARGE_MOUNT")
     large_dst_hash=$(sha256_file "$LARGE_DOWNLOADED")
     check_eq "large file checksum matches" "$large_dst_hash" "$large_src_hash"
+
+    echo "[10.1] mounted tier-transition parity"
+    write_pattern_file "$TIER_MOUNT" 10240 17
+    tier_small_initial_size=$(wait_remote_stat_field_eq "$TIER_REMOTE" "size" "10240")
+    check_eq "tier transition initial 10KiB size matches remote stat" "$tier_small_initial_size" "10240"
+    rm -f "$TIER_DOWNLOADED"
+    drive9_retry fs cp ":$TIER_REMOTE" "$TIER_DOWNLOADED" >/dev/null
+    tier_small_initial_hash=$(sha256_file "$TIER_MOUNT")
+    tier_small_initial_remote_hash=$(sha256_file "$TIER_DOWNLOADED")
+    check_eq "tier transition initial 10KiB checksum matches" "$tier_small_initial_remote_hash" "$tier_small_initial_hash"
+
+    write_pattern_file "$TIER_MOUNT" 8388608 43
+    tier_large_size=$(wait_remote_stat_field_eq "$TIER_REMOTE" "size" "8388608" "$LARGE_FILE_VISIBILITY_TIMEOUT_S" "$LARGE_FILE_VISIBILITY_INTERVAL_S")
+    check_eq "tier transition 8MiB A size matches remote stat" "$tier_large_size" "8388608"
+    rm -f "$TIER_DOWNLOADED"
+    drive9_retry fs cp ":$TIER_REMOTE" "$TIER_DOWNLOADED" >/dev/null
+    tier_large_hash=$(sha256_file "$TIER_MOUNT")
+    tier_large_remote_hash=$(sha256_file "$TIER_DOWNLOADED")
+    check_eq "tier transition 8MiB A checksum matches" "$tier_large_remote_hash" "$tier_large_hash"
+
+    write_pattern_file "$TIER_MOUNT" 8388608 67
+    tier_large_second_size=$(wait_remote_stat_field_eq "$TIER_REMOTE" "size" "8388608" "$LARGE_FILE_VISIBILITY_TIMEOUT_S" "$LARGE_FILE_VISIBILITY_INTERVAL_S")
+    check_eq "tier transition 8MiB B size matches remote stat" "$tier_large_second_size" "8388608"
+    rm -f "$TIER_DOWNLOADED"
+    drive9_retry fs cp ":$TIER_REMOTE" "$TIER_DOWNLOADED" >/dev/null
+    tier_large_second_hash=$(sha256_file "$TIER_MOUNT")
+    tier_large_second_remote_hash=$(sha256_file "$TIER_DOWNLOADED")
+    check_eq "tier transition 8MiB B checksum matches" "$tier_large_second_remote_hash" "$tier_large_second_hash"
+
+    write_pattern_file "$TIER_MOUNT" 10240 89
+    tier_small_final_size=$(wait_remote_stat_field_eq "$TIER_REMOTE" "size" "10240")
+    check_eq "tier transition final 10KiB size matches remote stat" "$tier_small_final_size" "10240"
+    rm -f "$TIER_DOWNLOADED"
+    drive9_retry fs cp ":$TIER_REMOTE" "$TIER_DOWNLOADED" >/dev/null
+    tier_small_final_hash=$(sha256_file "$TIER_MOUNT")
+    tier_small_final_remote_hash=$(sha256_file "$TIER_DOWNLOADED")
+    check_eq "tier transition final 10KiB checksum matches" "$tier_small_final_remote_hash" "$tier_small_final_hash"
+
+    if unmount_mount; then
+      check_eq "rw mount unmounted after tier transition" "true" "true"
+    else
+      check_eq "rw mount unmounted after tier transition" "false" "true"
+      stop_mount
+    fi
+    if start_mount rw; then
+      check_eq "rw mount remounted after tier transition" "true" "true"
+    else
+      check_eq "rw mount remounted after tier transition" "false" "true"
+    fi
+    if is_mounted "$MOUNT_POINT"; then
+      check_cmd "tier transition file visible after remount" wait_path_exists "$TIER_MOUNT"
+      if [ -f "$TIER_MOUNT" ]; then
+        tier_remount_hash=$(sha256_file "$TIER_MOUNT")
+      else
+        tier_remount_hash=""
+      fi
+      check_eq "tier transition final checksum survives remount" "$tier_remount_hash" "$tier_small_final_hash"
+    fi
   else
     echo "SKIP large-file boundary after mount directory rename failure (tracked in issue #248)"
   fi

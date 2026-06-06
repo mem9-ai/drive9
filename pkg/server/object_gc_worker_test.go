@@ -1,15 +1,19 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/go-sql-driver/mysql"
+	backendpkg "github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
@@ -193,4 +197,193 @@ func TestObjectGCDeletesUnreachableBlob(t *testing.T) {
 	if state != meta.ObjectGCCandidateDeleted || lastError != "" {
 		t.Fatalf("candidate state=%s last_error=%q", state, lastError)
 	}
+}
+
+func TestObjectGCPostponesReachableBlob(t *testing.T) {
+	rt := newObjectGCTestRuntime(t)
+	ctx := context.Background()
+	namespaceID := "ns-reachable"
+	ownerID := "owner-reachable"
+	path := "/reachable.bin"
+	payload := deterministicObjectGCPayload(8*1024*1024, 0x61)
+
+	rt.upsertNamespace(t, namespaceID, ownerID)
+	rt.insertTenant(t, ownerID, meta.TenantActive, meta.TenantKindLive, namespaceID)
+	owner := objectGCTenant(t, rt, ownerID)
+	ownerBackend, release, err := rt.pool.Acquire(ctx, owner)
+	if err != nil {
+		t.Fatalf("acquire owner backend: %v", err)
+	}
+	if _, err := ownerBackend.Write(path, payload, 0, filesystem.WriteFlagCreate); err != nil {
+		release()
+		t.Fatalf("create s3 file: %v", err)
+	}
+	storageRef := objectGCFileStorageRef(t, ownerBackend, path)
+	assertObjectGCS3ObjectBytes(t, ownerBackend, storageRef, payload)
+	release()
+
+	candidate := rt.enqueueCandidate(t, namespaceID, storageRef)
+	worker := &objectGCWorker{meta: rt.meta, pool: rt.pool}
+	if err := worker.processCandidate(ctx, candidate); err != nil {
+		t.Fatal(err)
+	}
+
+	state, lastError := objectGCCandidateRow(t, rt.meta.DB(), namespaceID, storageRef)
+	if state != meta.ObjectGCCandidatePending || lastError != "storage ref still reachable" {
+		t.Fatalf("candidate state=%s last_error=%q", state, lastError)
+	}
+	ownerBackend, release, err = rt.pool.Acquire(ctx, owner)
+	if err != nil {
+		t.Fatalf("reacquire owner backend: %v", err)
+	}
+	defer release()
+	assertObjectGCS3ObjectBytes(t, ownerBackend, storageRef, payload)
+	assertObjectGCBackendVisibleBytes(t, ownerBackend, path, payload)
+}
+
+func TestObjectGCSweepsTierTransitionObsoleteBlobKeepsCurrentContent(t *testing.T) {
+	rt := newObjectGCTestRuntime(t)
+	ctx := context.Background()
+	namespaceID := "ns-tier-sweep"
+	ownerID := "owner-tier-sweep"
+	path := "/tier-sweep.bin"
+	initialInline := deterministicObjectGCPayload(10*1024, 0x12)
+	largeS3 := deterministicObjectGCPayload(8*1024*1024, 0x34)
+	finalInline := deterministicObjectGCPayload(10*1024, 0x56)
+
+	rt.upsertNamespace(t, namespaceID, ownerID)
+	rt.insertTenant(t, ownerID, meta.TenantActive, meta.TenantKindLive, namespaceID)
+	owner := objectGCTenant(t, rt, ownerID)
+	ownerBackend, release, err := rt.pool.Acquire(ctx, owner)
+	if err != nil {
+		t.Fatalf("acquire owner backend: %v", err)
+	}
+	if _, err := ownerBackend.Write(path, initialInline, 0, filesystem.WriteFlagCreate); err != nil {
+		release()
+		t.Fatalf("create inline file: %v", err)
+	}
+	if _, err := ownerBackend.Write(path, largeS3, 0, filesystem.WriteFlagTruncate); err != nil {
+		release()
+		t.Fatalf("overwrite inline -> s3: %v", err)
+	}
+	obsoleteRef := objectGCFileStorageRef(t, ownerBackend, path)
+	assertObjectGCS3ObjectBytes(t, ownerBackend, obsoleteRef, largeS3)
+	if _, err := ownerBackend.Write(path, finalInline, 0, filesystem.WriteFlagTruncate); err != nil {
+		release()
+		t.Fatalf("overwrite s3 -> inline: %v", err)
+	}
+	assertObjectGCBackendVisibleBytes(t, ownerBackend, path, finalInline)
+	if reachable, err := ownerBackend.HasConfirmedS3StorageRef(ctx, datastore.StorageRefHash(obsoleteRef), obsoleteRef); err != nil {
+		release()
+		t.Fatalf("check obsolete ref reachability: %v", err)
+	} else if reachable {
+		release()
+		t.Fatalf("obsolete ref %q is still confirmed after inline overwrite", obsoleteRef)
+	}
+	release()
+
+	candidates, err := rt.meta.ListDueObjectGCCandidates(ctx, time.Now().UTC().Add(8*24*time.Hour), 10)
+	if err != nil {
+		t.Fatalf("list due object gc candidates: %v", err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidate count = %d, want 1: %+v", len(candidates), candidates)
+	}
+	candidate := candidates[0]
+	if candidate.NamespaceID != namespaceID || candidate.StorageRef != obsoleteRef || candidate.Reason != meta.ObjectGCReasonOverwrite {
+		t.Fatalf("candidate = %+v, want namespace=%q ref=%q reason=%q", candidate, namespaceID, obsoleteRef, meta.ObjectGCReasonOverwrite)
+	}
+
+	worker := &objectGCWorker{meta: rt.meta, pool: rt.pool}
+	if err := worker.processCandidate(ctx, candidate); err != nil {
+		t.Fatal(err)
+	}
+
+	state, lastError := objectGCCandidateRow(t, rt.meta.DB(), namespaceID, obsoleteRef)
+	if state != meta.ObjectGCCandidateDeleted || lastError != "" {
+		t.Fatalf("candidate state=%s last_error=%q", state, lastError)
+	}
+	ownerBackend, release, err = rt.pool.Acquire(ctx, owner)
+	if err != nil {
+		t.Fatalf("reacquire owner backend: %v", err)
+	}
+	defer release()
+	assertObjectGCS3ObjectMissing(t, ownerBackend, obsoleteRef)
+	assertObjectGCBackendVisibleBytes(t, ownerBackend, path, finalInline)
+	currentRef := objectGCFileStorageRef(t, ownerBackend, path)
+	if currentRef != "inline" {
+		t.Fatalf("current storage ref = %q, want inline", currentRef)
+	}
+}
+
+func objectGCTenant(t *testing.T, rt *objectGCTestRuntime, tenantID string) *meta.Tenant {
+	t.Helper()
+	tenant, err := rt.meta.GetTenant(context.Background(), tenantID)
+	if err != nil {
+		t.Fatalf("get tenant %s: %v", tenantID, err)
+	}
+	return tenant
+}
+
+func objectGCFileStorageRef(t *testing.T, backendFS *backendpkg.Dat9Backend, path string) string {
+	t.Helper()
+	node, err := backendFS.Store().Stat(context.Background(), path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if node.File == nil {
+		t.Fatalf("stat %s returned no file", path)
+	}
+	return node.File.StorageRef
+}
+
+func assertObjectGCBackendVisibleBytes(t *testing.T, backendFS *backendpkg.Dat9Backend, path string, want []byte) {
+	t.Helper()
+	info, err := backendFS.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if info.Size != int64(len(want)) {
+		t.Fatalf("visible size for %s = %d, want %d", path, info.Size, len(want))
+	}
+	got, err := backendFS.Read(path, 0, int64(len(want)+1))
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("visible bytes for %s mismatch: got %d bytes want %d bytes", path, len(got), len(want))
+	}
+}
+
+func assertObjectGCS3ObjectBytes(t *testing.T, backendFS *backendpkg.Dat9Backend, storageRef string, want []byte) {
+	t.Helper()
+	reader, err := backendFS.S3().GetObject(context.Background(), storageRef)
+	if err != nil {
+		t.Fatalf("get s3 object %q: %v", storageRef, err)
+	}
+	defer func() { _ = reader.Close() }()
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read s3 object %q: %v", storageRef, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("s3 object %q mismatch: got %d bytes want %d bytes", storageRef, len(got), len(want))
+	}
+}
+
+func assertObjectGCS3ObjectMissing(t *testing.T, backendFS *backendpkg.Dat9Backend, storageRef string) {
+	t.Helper()
+	reader, err := backendFS.S3().GetObject(context.Background(), storageRef)
+	if err == nil {
+		_ = reader.Close()
+		t.Fatalf("s3 object %q still exists after object gc", storageRef)
+	}
+}
+
+func deterministicObjectGCPayload(size int, seed byte) []byte {
+	out := make([]byte, size)
+	for idx := range out {
+		out[idx] = byte((idx*29 + int(seed)) % 251)
+	}
+	return out
 }
