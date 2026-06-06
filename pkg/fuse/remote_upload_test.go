@@ -200,8 +200,8 @@ func TestUploadFromShadowRemoteWithRevisionStreamsSmallSpill(t *testing.T) {
 	if err != nil {
 		t.Fatalf("uploadFromShadowRemoteWithRevision: %v", err)
 	}
-	if committedRev != rec.committedRev {
-		t.Fatalf("committed revision = %d, want %d", committedRev, rec.committedRev)
+	if committedRev != 0 {
+		t.Fatalf("committed revision = %d, want 0 for multipart stream", committedRev)
 	}
 	if rec.directFilePuts.Load() != 0 {
 		t.Fatalf("direct PUT count = %d, want 0", rec.directFilePuts.Load())
@@ -210,8 +210,8 @@ func TestUploadFromShadowRemoteWithRevisionStreamsSmallSpill(t *testing.T) {
 		t.Fatalf("multipart flow calls = initiate:%d presign:%d complete:%d s3put:%d, want 1 each",
 			rec.initiateCalls.Load(), rec.presignCalls.Load(), rec.completeCalls.Load(), rec.s3PutCalls.Load())
 	}
-	if rec.statCalls.Load() != 1 {
-		t.Fatalf("stat calls = %d, want 1", rec.statCalls.Load())
+	if rec.statCalls.Load() != 0 {
+		t.Fatalf("stat calls = %d, want 0", rec.statCalls.Load())
 	}
 
 	rec.mu.Lock()

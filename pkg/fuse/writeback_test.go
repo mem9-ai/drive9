@@ -787,7 +787,7 @@ func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
 	}
 }
 
-func TestWriteBackUploader_OnSuccessReceivesCommittedRevision(t *testing.T) {
+func TestWriteBackUploader_OnSuccessReceivesUnknownStreamRevision(t *testing.T) {
 	var gotExpected string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -828,8 +828,8 @@ func TestWriteBackUploader_OnSuccessReceivesCommittedRevision(t *testing.T) {
 	if successMeta.Path != "/existing.txt" {
 		t.Fatalf("OnSuccess path = %q, want /existing.txt", successMeta.Path)
 	}
-	if successRev != 24 {
-		t.Fatalf("OnSuccess committedRev = %d, want 24", successRev)
+	if successRev != 0 {
+		t.Fatalf("OnSuccess committedRev = %d, want 0 for stream upload", successRev)
 	}
 }
 

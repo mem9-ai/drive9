@@ -20,11 +20,7 @@ func uploadBufferedRemoteFileWithRevision(ctx context.Context, c *client.Client,
 	if err := c.WriteStreamConditional(ctx, remotePath, bytes.NewReader(data), int64(len(data)), nil, expectedRevision); err != nil {
 		return 0, err
 	}
-	stat, err := c.StatCtx(ctx, remotePath)
-	if err != nil {
-		return 0, err
-	}
-	return stat.Revision, nil
+	return 0, nil
 }
 
 // uploadFromShadowRemote streams a shadow file to the server without loading
@@ -52,11 +48,7 @@ func uploadFromShadowRemoteWithRevision(ctx context.Context, c *client.Client, s
 	if err := c.WriteMultipartStreamConditional(ctx, remotePath, sr, size, nil, expectedRevision); err != nil {
 		return 0, err
 	}
-	stat, err := c.StatCtx(ctx, remotePath)
-	if err != nil {
-		return 0, err
-	}
-	return stat.Revision, nil
+	return 0, nil
 }
 
 // shadowReaderAt adapts ShadowStore.ReadAt into an io.ReaderAt.

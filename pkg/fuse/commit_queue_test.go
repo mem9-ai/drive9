@@ -1013,11 +1013,11 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	if !bytes.Equal(gotBody, data) {
 		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
 	}
-	if statCalls.Load() != 1 {
-		t.Fatalf("stat calls = %d, want 1", statCalls.Load())
+	if statCalls.Load() != 0 {
+		t.Fatalf("stat calls = %d, want 0", statCalls.Load())
 	}
-	if successRev != 13 {
-		t.Fatalf("OnSuccess committedRev = %d, want 13", successRev)
+	if successRev != 0 {
+		t.Fatalf("OnSuccess committedRev = %d, want 0 for multipart stream", successRev)
 	}
 	if pending.HasPending("/big.bin") {
 		t.Fatal("pending entry should be removed after successful ShadowSpill commit")
@@ -1207,11 +1207,11 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 	if !bytes.Equal(gotBody, data) {
 		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
 	}
-	if statCalls.Load() != 1 {
-		t.Fatalf("stat calls = %d, want 1", statCalls.Load())
+	if statCalls.Load() != 0 {
+		t.Fatalf("stat calls = %d, want 0", statCalls.Load())
 	}
-	if successRev != 9 {
-		t.Fatalf("OnSuccess committedRev = %d, want 9", successRev)
+	if successRev != 0 {
+		t.Fatalf("OnSuccess committedRev = %d, want 0 for multipart stream", successRev)
 	}
 	if pending2.HasPending("/recover.bin") {
 		t.Fatal("pending entry should be removed after successful recovery upload")

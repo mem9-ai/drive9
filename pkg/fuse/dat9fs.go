@@ -794,12 +794,42 @@ func (fs *Dat9FS) recordCommittedRevision(path string, revision int64) {
 	fs.committedMu.Unlock()
 }
 
+func (fs *Dat9FS) replaceCommittedRevision(path string, revision int64) {
+	if fs == nil || path == "" {
+		return
+	}
+	fs.committedMu.Lock()
+	if revision <= 0 {
+		delete(fs.committedRev, path)
+	} else {
+		if fs.committedRev == nil {
+			fs.committedRev = make(map[string]int64)
+		}
+		fs.committedRev[path] = revision
+	}
+	fs.committedMu.Unlock()
+}
+
 func (fs *Dat9FS) forgetCommittedRevision(path string) {
 	if fs == nil || path == "" {
 		return
 	}
 	fs.committedMu.Lock()
 	delete(fs.committedRev, path)
+	fs.committedMu.Unlock()
+}
+
+func (fs *Dat9FS) forgetCommittedRevisionPrefix(path string) {
+	if fs == nil || path == "" {
+		return
+	}
+	prefix := path + "/"
+	fs.committedMu.Lock()
+	for p := range fs.committedRev {
+		if p == path || strings.HasPrefix(p, prefix) {
+			delete(fs.committedRev, p)
+		}
+	}
 	fs.committedMu.Unlock()
 }
 
@@ -859,7 +889,11 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	if fs == nil || fh == nil || revision <= 0 {
 		return
 	}
-	fs.recordCommittedRevision(fh.Path, revision)
+	if fh.IsNew {
+		fs.replaceCommittedRevision(fh.Path, revision)
+	} else {
+		fs.recordCommittedRevision(fh.Path, revision)
+	}
 	fh.IsNew = false
 	fh.BaseRev = revision
 	fs.inodes.UpdateRevision(fh.Ino, revision)
@@ -1187,11 +1221,16 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 		return
 	}
 
+	wasNew := fh.IsNew
 	fh.IsNew = false
 	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
 		fh.BaseRev = revision
 		fs.inodes.UpdateRevision(fh.Ino, revision)
-		fs.recordCommittedRevision(fh.Path, revision)
+		if wasNew {
+			fs.replaceCommittedRevision(fh.Path, revision)
+		} else {
+			fs.recordCommittedRevision(fh.Path, revision)
+		}
 		fs.refreshCommittedRevisionForOpenHandles(fh.Path, revision, fh)
 	} else {
 		// The flush succeeded, but it was unconditional, so the precise
@@ -1199,6 +1238,7 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 		// keeping a known-stale positive value.
 		fh.BaseRev = 0
 		fs.inodes.UpdateRevision(fh.Ino, 0)
+		fs.forgetCommittedRevision(fh.Path)
 	}
 	if fh.Streamer != nil {
 		fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
@@ -1488,7 +1528,9 @@ restartLoop:
 			if src == nil || src == skip {
 				continue
 			}
-			src.Lock()
+			if !src.TryLock() {
+				continue
+			}
 			if src.Dirty != nil && src.DirtySeq > 0 {
 				candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
 			}
@@ -1502,9 +1544,7 @@ restartLoop:
 		for _, c := range candidates {
 			src := c.fh
 			if !src.TryLock() {
-				src.Lock()
-				src.Unlock()
-				continue restartLoop
+				continue
 			}
 			if src.Dirty == nil || src.DirtySeq == 0 {
 				src.Unlock()
@@ -4027,6 +4067,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		}
 		fs.inodes.Remove(childP)
 		fs.dirCache.InvalidatePrefix(childP)
+		fs.forgetCommittedRevisionPrefix(childP)
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.cacheNegativePath(childP)
@@ -4055,6 +4096,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			parentPath, _ := fs.inodes.GetPath(header.NodeId)
 			fs.dirCache.Remove(parentPath, name)
 			fs.dirCache.InvalidatePrefix(childP)
+			fs.forgetCommittedRevisionPrefix(childP)
 			return gofuse.OK
 		}
 		st := fs.putGitWhiteout(ctx, childP)
@@ -4064,6 +4106,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.dirCache.InvalidatePrefix(childP)
+		fs.forgetCommittedRevisionPrefix(childP)
 		return gofuse.OK
 	}
 	start := time.Now()
@@ -4119,6 +4162,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	fs.dirCache.InvalidatePrefix(childP)
 	fs.readCache.InvalidatePrefix(childP + "/")
 	fs.invalidateDiskReadCachePrefix(childP + "/")
+	fs.forgetCommittedRevisionPrefix(childP)
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Remove(parentPath, name)
@@ -4284,6 +4328,8 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	fs.readCache.InvalidatePrefix(newP + "/")
 	fs.invalidateDiskReadCachePrefix(oldP + "/")
 	fs.invalidateDiskReadCachePrefix(newP + "/")
+	fs.forgetCommittedRevisionPrefix(oldP)
+	fs.forgetCommittedRevisionPrefix(newP)
 
 	oldParent, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Remove(oldParent, path.Base(oldP))
@@ -7662,7 +7708,13 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		return
 	}
 	if committedRev > 0 {
-		fs.recordCommittedRevision(entry.Path, committedRev)
+		if entry.Kind == PendingNew {
+			fs.replaceCommittedRevision(entry.Path, committedRev)
+		} else {
+			fs.recordCommittedRevision(entry.Path, committedRev)
+		}
+	} else {
+		fs.forgetCommittedRevision(entry.Path)
 	}
 	if committedRev > 0 && entry.Inode > 0 {
 		fs.clearReadTargetsForPath(entry.Path)
@@ -7697,8 +7749,14 @@ func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int6
 		return
 	}
 	if committedRev > 0 {
-		fs.recordCommittedRevision(meta.Path, committedRev)
+		if meta.Kind == PendingNew {
+			fs.replaceCommittedRevision(meta.Path, committedRev)
+		} else {
+			fs.recordCommittedRevision(meta.Path, committedRev)
+		}
 		fs.refreshCommittedRevisionForOpenHandles(meta.Path, committedRev, nil)
+	} else {
+		fs.forgetCommittedRevision(meta.Path)
 	}
 	fs.cacheFileForPath(meta.Path, meta.Size, time.Now(), committedRev)
 }

@@ -6618,7 +6618,7 @@ func TestReadSQLiteSamePathDirtyHandleBeforeShadowStore(t *testing.T) {
 	}
 }
 
-func TestReadSQLiteSamePathDirtyHandleWaitsForLockedCandidate(t *testing.T) {
+func TestReadSQLiteSamePathDirtyHandleSkipsLockedCandidate(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
@@ -6640,36 +6640,25 @@ func TestReadSQLiteSamePathDirtyHandleWaitsForLockedCandidate(t *testing.T) {
 	writer.Lock()
 	done := make(chan struct{})
 	var (
-		gotData []byte
-		gotN    int
-		gotOK   bool
-		gotSt   gofuse.Status
+		gotOK bool
+		gotSt gofuse.Status
 	)
 	go func() {
 		defer close(done)
-		gotData, gotN, gotOK, gotSt = fs.readSamePathDirtyHandle(filePath, nil, 0, 64)
+		_, _, gotOK, gotSt = fs.readSamePathDirtyHandle(filePath, nil, 0, 64)
 	}()
 
 	select {
 	case <-done:
-		t.Fatal("read returned before active writer handle unlocked")
-	case <-time.After(20 * time.Millisecond):
-	}
-
-	writer.Unlock()
-	select {
-	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("read did not return after writer handle unlocked")
+		t.Fatal("read blocked on locked same-path dirty writer")
 	}
-	if !gotOK {
-		t.Fatal("read should claim the same-path dirty writer")
+	writer.Unlock()
+	if gotOK {
+		t.Fatal("locked same-path dirty candidate should not claim the read")
 	}
 	if gotSt != gofuse.OK {
 		t.Fatalf("status = %v, want OK", gotSt)
-	}
-	if gotN != len(want) || !bytes.Equal(gotData, want) {
-		t.Fatalf("read = %q/%d, want %q/%d", gotData, gotN, want, len(want))
 	}
 }
 
@@ -7360,6 +7349,43 @@ func TestCommittedRevisionTrackerForgetClearsPath(t *testing.T) {
 
 	if got := fs.latestCommittedRevision("/wal.db-wal"); got != 0 {
 		t.Fatalf("latest committed revision after forget = %d, want 0", got)
+	}
+}
+
+func TestCommittedRevisionTrackerReplaceAllowsNewEpoch(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	fs.recordCommittedRevision("/wal.db-wal", 8)
+	fs.replaceCommittedRevision("/wal.db-wal", 1)
+
+	if got := fs.latestCommittedRevision("/wal.db-wal"); got != 1 {
+		t.Fatalf("latest committed revision after replace = %d, want 1", got)
+	}
+}
+
+func TestFinishLocalRenameClearsCommittedRevisionEpochs(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	oldDir := fs.inodes.Lookup("/old", true, 0, time.Now())
+	newDir := fs.inodes.Lookup("/new", true, 0, time.Now())
+	fs.inodes.Lookup("/old/workload.db-wal", false, 1, time.Now())
+	fs.inodes.Lookup("/new/workload.db-wal", false, 1, time.Now())
+
+	fs.recordCommittedRevision("/old/workload.db-wal", 8)
+	fs.recordCommittedRevision("/new/workload.db-wal", 5)
+	fs.finishLocalRename(&gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: oldDir},
+		Newdir:   newDir,
+	}, "/old/workload.db-wal", "/new/workload.db-wal")
+
+	if got := fs.latestCommittedRevision("/old/workload.db-wal"); got != 0 {
+		t.Fatalf("old path committed revision = %d, want 0", got)
+	}
+	if got := fs.latestCommittedRevision("/new/workload.db-wal"); got != 0 {
+		t.Fatalf("new path committed revision = %d, want 0", got)
 	}
 }
 
