@@ -537,10 +537,33 @@ def build_concurrent_db(path):
     lock = threading.Lock()
     errors = []
     observations = [0 for _ in range(concurrency_readers)]
+    phase = {"writer": "starting"}
 
-    def record_error(label, exc):
+    def set_phase(value):
         with lock:
-            errors.append(f"{label}: {exc!r}")
+            phase["writer"] = value
+
+    def sqlite_error_detail(exc):
+        parts = []
+        code = getattr(exc, "sqlite_errorcode", None)
+        name = getattr(exc, "sqlite_errorname", None)
+        if code is not None:
+            parts.append(f"sqlite_errorcode={code}")
+        if name is not None:
+            parts.append(f"sqlite_errorname={name}")
+        return " ".join(parts)
+
+    def record_error(label, exc, *, sql=None, loop=None):
+        with lock:
+            detail = sqlite_error_detail(exc)
+            context = [f"writer_phase={phase['writer']}"]
+            if loop is not None:
+                context.append(f"loop={loop}")
+            if sql is not None:
+                context.append(f"sql={sql!r}")
+            if detail:
+                context.append(detail)
+            errors.append(f"{label}: {exc!r} ({', '.join(context)})")
 
     def stop_readers():
         done.set()
@@ -553,13 +576,20 @@ def build_concurrent_db(path):
             raise AssertionError(f"reader threads did not stop: {alive}")
 
     def reader(reader_id):
+        loop_no = 0
+        sql = None
         try:
             rconn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
-            rconn.execute("PRAGMA busy_timeout=30000")
-            rconn.execute("PRAGMA mmap_size=0")
-            rconn.execute("PRAGMA query_only=ON")
+            sql = "PRAGMA busy_timeout=30000"
+            rconn.execute(sql)
+            sql = "PRAGMA mmap_size=0"
+            rconn.execute(sql)
+            sql = "PRAGMA query_only=ON"
+            rconn.execute(sql)
             while not done.is_set():
-                count, max_version = rconn.execute("SELECT COUNT(*), COALESCE(MAX(version), 0) FROM items").fetchone()
+                loop_no += 1
+                sql = "SELECT COUNT(*), COALESCE(MAX(version), 0) FROM items"
+                count, max_version = rconn.execute(sql).fetchone()
                 if count != item_count:
                     raise AssertionError(f"reader {reader_id}: count={count} want={item_count}")
                 if max_version < 0:
@@ -568,7 +598,7 @@ def build_concurrent_db(path):
                 time.sleep(0.002)
             rconn.close()
         except Exception as exc:  # noqa: BLE001 - surfaced into shell failure
-            record_error(f"reader-{reader_id}", exc)
+            record_error(f"reader-{reader_id}", exc, sql=sql, loop=loop_no)
 
     threads = [threading.Thread(target=reader, args=(reader_id,), daemon=True) for reader_id in range(concurrency_readers)]
     for thread in threads:
@@ -578,10 +608,13 @@ def build_concurrent_db(path):
     wconn = None
     readers_stopped = False
     try:
+        set_phase("writer connect")
         wconn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
+        set_phase("writer pragmas")
         wconn.execute("PRAGMA busy_timeout=30000")
         wconn.execute("PRAGMA mmap_size=0")
         for write_no in range(1, concurrency_writes + 1):
+            set_phase(f"writer transaction {write_no}/{concurrency_writes}")
             item_id = ((write_no - 1) % item_count) + 1
             data = payload("concurrent-write", write_no)
             digest = checksum(data)
@@ -598,17 +631,21 @@ def build_concurrent_db(path):
             if write_no == 1 or write_no == concurrency_writes or write_no % 10 == 0:
                 log(f"concurrency: committed {write_no}/{concurrency_writes}")
             time.sleep(0.003)
+        set_phase("writer integrity_check")
         log("concurrency: writer integrity_check start")
         integrity = scalar(wconn, "PRAGMA integrity_check")
         if integrity != "ok":
             raise AssertionError(f"concurrent writer integrity_check={integrity}")
+        set_phase("stopping readers")
         log("concurrency: stopping readers before checkpoint")
         stop_readers()
         readers_stopped = True
+        set_phase("checkpoint truncate")
         log("concurrency: checkpoint truncate start")
         checkpoint = wconn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         if checkpoint is None or checkpoint[0] not in (0, 1):
             raise AssertionError(f"unexpected wal checkpoint result={checkpoint}")
+        set_phase("closing writer")
         wconn.close()
         wconn = None
     except Exception as exc:  # noqa: BLE001 - surfaced into shell failure
