@@ -6804,6 +6804,154 @@ func TestUnlinkSQLiteWALPreservesCleanWritableReadHandle(t *testing.T) {
 	}
 }
 
+func TestUnlinkSQLiteWALPreservesEmptyOpenReadHandle(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	var deleted atomic.Bool
+	var remoteReads atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+filePath:
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && (r.URL.Path == "/v1/fs"+filePath || r.URL.Path == "/object"):
+			remoteReads.Add(1)
+			http.NotFound(w, r)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+filePath:
+			remoteReads.Add(1)
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: 0,
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if !deleted.Load() {
+		t.Fatal("remote delete was not called")
+	}
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if len(got) != 0 {
+		t.Fatalf("read bytes after empty unlink = %q, want EOF", got)
+	}
+	if got := remoteReads.Load(); got != 0 {
+		t.Fatalf("remote reads after empty unlink snapshot = %d, want 0", got)
+	}
+}
+
+func TestUnlinkSQLiteWALUsesLatestInodeSizeForStaleOpenReadHandle(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	want := []byte("sqlite wal bytes after reader opened")
+	var deleted atomic.Bool
+	var objectGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Location", ts.URL+"/object")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object":
+			objectGets.Add(1)
+			if deleted.Load() {
+				http.Error(w, "object deleted", http.StatusGone)
+				return
+			}
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(want)-1) {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(want)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+filePath:
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	fs.inodes.UpdateSize(ino, int64(len(want)))
+	fs.inodes.UpdateRevision(ino, 7)
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: 0,
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if !deleted.Load() {
+		t.Fatal("remote delete was not called")
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after unlink snapshot = %d, want 1", got)
+	}
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes after stale-size unlink = %q, want %q", got, want)
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after open-handle read = %d, want still 1", got)
+	}
+}
+
 func TestReadSQLiteSamePathDirtyHandleSkipsLockedCandidate(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

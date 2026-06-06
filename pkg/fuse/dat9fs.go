@@ -2000,17 +2000,35 @@ func readUnlinkedData(fh *FileHandle, offset int64, size uint32) ([]byte, int, b
 	return data, len(data), true
 }
 
-func unlinkSnapshotSizeLocked(fh *FileHandle) (int64, bool) {
+func unlinkSnapshotSizeLocked(fh *FileHandle, inodeSize int64) (int64, bool) {
 	if fh == nil || fh.UnlinkedData != nil {
 		return 0, false
 	}
+	size := fh.OrigSize
+	if inodeSize > size {
+		size = inodeSize
+	}
 	if fh.Dirty == nil {
-		return fh.OrigSize, true
+		return size, true
 	}
 	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
 		return 0, false
 	}
-	return fh.Dirty.Size(), true
+	if dirtySize := fh.Dirty.Size(); dirtySize > size {
+		size = dirtySize
+	}
+	return size, true
+}
+
+func (fs *Dat9FS) inodeSnapshotSize(ino uint64) int64 {
+	if fs == nil || fs.inodes == nil {
+		return -1
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok || entry == nil || entry.IsDir {
+		return -1
+	}
+	return entry.Size
 }
 
 func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, localPath string) error {
@@ -2026,9 +2044,10 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, loc
 		if fh == nil {
 			continue
 		}
+		inodeSize := fs.inodeSnapshotSize(fh.Ino)
 		fh.Lock()
 		handlePath := fh.Path
-		size, eligible := unlinkSnapshotSizeLocked(fh)
+		size, eligible := unlinkSnapshotSizeLocked(fh, inodeSize)
 		fh.Unlock()
 
 		if !eligible || handlePath != localPath || size < 0 || size > maxPreloadSize {
@@ -2049,12 +2068,15 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, loc
 				if err != nil {
 					return err
 				}
+			} else {
+				data = []byte{}
 			}
 			snapshots[cand.size] = data
 		}
 
+		inodeSize := fs.inodeSnapshotSize(cand.fh.Ino)
 		cand.fh.Lock()
-		_, eligible := unlinkSnapshotSizeLocked(cand.fh)
+		_, eligible := unlinkSnapshotSizeLocked(cand.fh, inodeSize)
 		if cand.fh.Path == localPath && eligible {
 			cand.fh.UnlinkedData = cloneBytes(data)
 			clearReadTargetForLockedHandle(cand.fh)
