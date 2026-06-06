@@ -1576,7 +1576,7 @@ restartLoop:
 			if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
 				src.Unlock()
 				n, err := fs.shadowStore.ReadAt(path, offset, buf)
-				if err != nil {
+				if err != nil && !errors.Is(err, io.EOF) {
 					fs.debugf("read same-path shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
 					continue
 				}
@@ -2000,6 +2000,19 @@ func readUnlinkedData(fh *FileHandle, offset int64, size uint32) ([]byte, int, b
 	return data, len(data), true
 }
 
+func unlinkSnapshotSizeLocked(fh *FileHandle) (int64, bool) {
+	if fh == nil || fh.UnlinkedData != nil {
+		return 0, false
+	}
+	if fh.Dirty == nil {
+		return fh.OrigSize, true
+	}
+	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		return 0, false
+	}
+	return fh.Dirty.Size(), true
+}
+
 func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, localPath string) error {
 	if fs == nil || fs.openHandles == nil || !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
 		return nil
@@ -2014,15 +2027,11 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, loc
 			continue
 		}
 		fh.Lock()
-		if fh.Dirty != nil || fh.UnlinkedData != nil {
-			fh.Unlock()
-			continue
-		}
 		handlePath := fh.Path
-		size := fh.OrigSize
+		size, eligible := unlinkSnapshotSizeLocked(fh)
 		fh.Unlock()
 
-		if handlePath != localPath || size < 0 || size > maxPreloadSize {
+		if !eligible || handlePath != localPath || size < 0 || size > maxPreloadSize {
 			continue
 		}
 		candidates = append(candidates, candidate{fh: fh, size: size})
@@ -2045,7 +2054,8 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, loc
 		}
 
 		cand.fh.Lock()
-		if cand.fh.Path == localPath && cand.fh.Dirty == nil && cand.fh.UnlinkedData == nil {
+		_, eligible := unlinkSnapshotSizeLocked(cand.fh)
+		if cand.fh.Path == localPath && eligible {
 			cand.fh.UnlinkedData = cloneBytes(data)
 			clearReadTargetForLockedHandle(cand.fh)
 		}
@@ -5507,7 +5517,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		fh.Unlock()
 		result := make([]byte, end-offset)
 		n, err := fs.shadowStore.ReadAt(fh.Path, offset, result)
-		if err != nil {
+		if err != nil && !errors.Is(err, io.EOF) {
 			source = "shadow-spill-error"
 			return nil, gofuse.EIO
 		}
@@ -5715,7 +5725,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			} else {
 				n, err = fs.shadowStore.ReadAt(fh.Path, offset, buf)
 			}
-			if err == nil && n > 0 {
+			if (err == nil || errors.Is(err, io.EOF)) && n >= 0 {
 				source = "shadow-store"
 				bytesRead = n
 				return gofuse.ReadResultData(buf[:n]), gofuse.OK

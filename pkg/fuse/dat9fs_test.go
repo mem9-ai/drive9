@@ -6709,6 +6709,101 @@ func TestUnlinkSQLiteWALPreservesOpenReadHandle(t *testing.T) {
 	}
 }
 
+func TestUnlinkSQLiteWALPreservesCleanWritableReadHandle(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	want := []byte("sqlite wal snapshot bytes")
+	var deleted atomic.Bool
+	var objectGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(want)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Location", ts.URL+"/object")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object":
+			objectGets.Add(1)
+			if deleted.Load() {
+				http.Error(w, "object deleted", http.StatusGone)
+				return
+			}
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(want)-1) {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(want)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+filePath:
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(want)), time.Now())
+	cleanDirty := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	cleanDirty.totalSize = int64(len(want))
+	cleanDirty.remoteSize = int64(len(want))
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: int64(len(want)),
+		BaseRev:  7,
+		Dirty:    cleanDirty,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if !deleted.Load() {
+		t.Fatal("remote delete was not called")
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after unlink snapshot = %d, want 1", got)
+	}
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes after unlink = %q, want %q", got, want)
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after open-handle read = %d, want still 1", got)
+	}
+}
+
 func TestReadSQLiteSamePathDirtyHandleSkipsLockedCandidate(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
@@ -6779,6 +6874,53 @@ func TestReadSQLiteSamePathDirtyHandleSkipsIncompleteCandidate(t *testing.T) {
 	}
 	if st != gofuse.OK {
 		t.Fatalf("status = %v, want OK", st)
+	}
+}
+
+func TestReadSQLiteSamePathDirtyShadowEOFIsShortRead(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "remote should not be consulted for same-mount sqlite shadow data", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewShadowStore: %v", err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	const filePath = "/workload.db-wal"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	want := []byte("latest wal bytes")
+	if _, err := fs.shadowStore.WriteAt(filePath, 0, want, 1); err != nil {
+		t.Fatalf("WriteAt shadow: %v", err)
+	}
+	writer := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		ShadowReady: true,
+	}
+	writer.Dirty.totalSize = int64(len(want) + 16)
+	writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+	fs.openHandles.Add(writer)
+
+	got, n, ok, st := fs.readSamePathDirtyHandle(filePath, nil, 0, uint32(len(want)+16))
+	if !ok {
+		t.Fatal("same-path shadow candidate should claim the read")
+	}
+	if st != gofuse.OK {
+		t.Fatalf("status = %v, want OK", st)
+	}
+	if n != len(want) {
+		t.Fatalf("bytes read = %d, want %d", n, len(want))
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes = %q, want %q", got, want)
 	}
 }
 
