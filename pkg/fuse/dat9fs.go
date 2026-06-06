@@ -2004,6 +2004,11 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, loc
 	if fs == nil || fs.openHandles == nil || !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
 		return nil
 	}
+	type candidate struct {
+		fh   *FileHandle
+		size int64
+	}
+	var candidates []candidate
 	for _, fh := range fs.openHandles.SnapshotPath(localPath) {
 		if fh == nil {
 			continue
@@ -2020,21 +2025,31 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, loc
 		if handlePath != localPath || size < 0 || size > maxPreloadSize {
 			continue
 		}
-		var data []byte
-		if size > 0 {
-			var err error
-			data, _, err = fs.readStreamRangeWithRetry(ctx, handlePath, fh, 0, size)
-			if err != nil {
-				return err
+		candidates = append(candidates, candidate{fh: fh, size: size})
+	}
+
+	snapshots := make(map[int64][]byte)
+	for _, cand := range candidates {
+		data, ok := snapshots[cand.size]
+		if !ok {
+			if cand.size > 0 {
+				snapshotCtx, cancel := context.WithTimeout(ctx, readTransientRetryTimeout)
+				var err error
+				data, _, err = fs.doRangeRead(snapshotCtx, localPath, nil, 0, cand.size)
+				cancel()
+				if err != nil {
+					return err
+				}
 			}
+			snapshots[cand.size] = data
 		}
 
-		fh.Lock()
-		if fh.Path == handlePath && fh.Dirty == nil && fh.UnlinkedData == nil {
-			fh.UnlinkedData = cloneBytes(data)
-			clearReadTargetForLockedHandle(fh)
+		cand.fh.Lock()
+		if cand.fh.Path == localPath && cand.fh.Dirty == nil && cand.fh.UnlinkedData == nil {
+			cand.fh.UnlinkedData = cloneBytes(data)
+			clearReadTargetForLockedHandle(cand.fh)
 		}
-		fh.Unlock()
+		cand.fh.Unlock()
 	}
 	return nil
 }
