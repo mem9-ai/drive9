@@ -2191,6 +2191,8 @@ func TestReopenAfterClose_ReadsPendingCache(t *testing.T) {
 // when write-back cache has already persisted the data.
 func TestFsync_NoDuplicateUpload(t *testing.T) {
 	var httpPutCalls atomic.Int32
+	var gotExpected atomic.Int64
+	gotExpected.Store(-1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
@@ -2206,8 +2208,14 @@ func TestFsync_NoDuplicateUpload(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		case http.MethodPut:
 			httpPutCalls.Add(1)
+			if header := r.Header.Get("X-Dat9-Expected-Revision"); header != "" {
+				if rev, err := strconv.ParseInt(header, 10, 64); err == nil {
+					gotExpected.Store(rev)
+				}
+			}
 			_, _ = io.ReadAll(r.Body)
 			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": 1})
 		default:
 			w.WriteHeader(http.StatusOK)
 		}
@@ -2263,6 +2271,19 @@ func TestFsync_NoDuplicateUpload(t *testing.T) {
 	// Exactly 1 PUT expected (UploadSync), not 2.
 	if diff := putsAfter - putsBefore; diff != 1 {
 		t.Fatalf("Fsync made %d PUT calls, want exactly 1 (double upload detected)", diff)
+	}
+	if gotExpected.Load() != 0 {
+		t.Fatalf("Fsync expected revision = %d, want 0", gotExpected.Load())
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.BaseRev != 1 {
+		t.Fatalf("handle base revision after Fsync = %d, want 1", fh.BaseRev)
+	}
+	if fh.IsNew {
+		t.Fatal("handle should no longer be new after Fsync upload")
 	}
 
 	uploader.DrainAll()

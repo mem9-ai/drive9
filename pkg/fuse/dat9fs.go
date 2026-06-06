@@ -674,6 +674,27 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 	}
 }
 
+func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision int64, skip *FileHandle) {
+	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 {
+		return
+	}
+
+	for _, fh := range fs.openHandles.SnapshotPath(path) {
+		if fh == nil || fh == skip {
+			continue
+		}
+		fh.Lock()
+		if fh.Dirty != nil {
+			fh.IsNew = false
+			fh.BaseRev = revision
+			if fh.Streamer != nil {
+				fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+			}
+		}
+		fh.Unlock()
+	}
+}
+
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
 	statStart := fs.perfStart()
 	stat, err := fs.client.StatCtx(ctx, fs.remotePath(fh.Path))
@@ -5817,6 +5838,7 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		fh.IsNew = false
 		fh.BaseRev = committedRev
 		fs.inodes.UpdateRevision(fh.Ino, committedRev)
+		fs.refreshCommittedRevisionForOpenHandles(fh.Path, committedRev, fh)
 		if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() > 0 {
 			fh.ZeroBase = false
 		}
@@ -5919,6 +5941,7 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 		fh.IsNew = false
 		fh.BaseRev = committedRev
 		fs.inodes.UpdateRevision(fh.Ino, committedRev)
+		fs.refreshCommittedRevisionForOpenHandles(fh.Path, committedRev, fh)
 		fs.readCache.Put(fh.Path, nil, committedRev)
 	} else {
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
@@ -6338,7 +6361,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		phase = "writeback-upload-sync"
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
-		err := fs.uploader.UploadSync(ctx, fh.Path)
+		committedRev, err := fs.uploader.UploadSyncWithRevision(ctx, fh.Path)
 		fs.debugDurationf(uploadStart, 0, "fsync writeback upload done path=%s err=%v", fh.Path, err)
 		if err != nil {
 			log.Printf("fsync writeback upload failed for %s: %v", fh.Path, err)
@@ -6360,6 +6383,14 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			fh.Dirty.ClearDirty()
 			fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 			fh.WriteBackSeq = 0
+		}
+		if committedRev > 0 {
+			fh.IsNew = false
+			fh.BaseRev = committedRev
+			fs.inodes.UpdateRevision(fh.Ino, committedRev)
+			fs.refreshCommittedRevisionForOpenHandles(fh.Path, committedRev, fh)
+		} else {
+			fs.finalizeHandleFlushLocked(fh, expectedRevisionForHandle(fh))
 		}
 	} else if fs.writeBack != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq != fh.DirtySeq {
 		// Snapshot is stale — discard it so we don't upload old data.
@@ -6826,6 +6857,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 			handle.IsNew = false
 			handle.BaseRev = committedRev
 			fs.inodes.UpdateRevision(ino, committedRev)
+			fs.refreshCommittedRevisionForOpenHandles(filePath, committedRev, handle)
 			if handle.ZeroBase && handle.Dirty != nil && handle.Dirty.Size() > 0 {
 				handle.ZeroBase = false
 			}
@@ -7143,6 +7175,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fh.IsNew = false
 		fh.BaseRev = committedRev
 		fs.inodes.UpdateRevision(fh.Ino, committedRev)
+		fs.refreshCommittedRevisionForOpenHandles(fh.Path, committedRev, fh)
 		if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() > 0 {
 			fh.ZeroBase = false
 		}
@@ -7281,6 +7314,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		}
 		fs.inodes.UpdateRevision(entry.Inode, committedRev)
 		fs.inodes.UpdateSize(entry.Inode, entry.Size)
+		fs.refreshCommittedRevisionForOpenHandles(entry.Path, committedRev, nil)
 		if entry.HasMode {
 			fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
 		}
