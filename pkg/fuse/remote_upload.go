@@ -33,17 +33,12 @@ func uploadFromShadowRemoteWithRevision(ctx context.Context, c *client.Client, s
 	if size < 0 {
 		return 0, io.ErrUnexpectedEOF
 	}
-	threshold := c.CachedSmallFileThreshold()
-	if size == 0 || (threshold > 0 && size < threshold) {
-		data, err := shadows.ReadAll(localPath)
-		if err != nil {
-			return 0, err
-		}
-		return c.WriteCtxConditionalWithRevision(ctx, remotePath, data, expectedRevision)
+	if size == 0 {
+		return c.WriteCtxConditionalWithRevision(ctx, remotePath, nil, expectedRevision)
 	}
 	ra := &shadowReaderAt{store: shadows, path: localPath}
 	sr := io.NewSectionReader(ra, 0, size)
-	return 0, c.WriteStreamConditional(ctx, remotePath, sr, size, nil, expectedRevision)
+	return 0, c.WriteMultipartStreamConditional(ctx, remotePath, sr, size, nil, expectedRevision)
 }
 
 // shadowReaderAt adapts ShadowStore.ReadAt into an io.ReaderAt.

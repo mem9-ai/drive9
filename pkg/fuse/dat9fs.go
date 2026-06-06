@@ -683,7 +683,14 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision i
 		if fh == nil || fh == skip {
 			continue
 		}
-		fh.Lock()
+		// This method is called from commit paths that may already hold another
+		// same-path handle lock. Never block on sibling handles here: two
+		// concurrent commits can otherwise deadlock by each holding one handle
+		// and waiting for the other. A locked sibling is actively mutating or
+		// committing and will refresh its own revision through its commit path.
+		if !fh.TryLock() {
+			continue
+		}
 		if fh.Dirty != nil {
 			fh.IsNew = false
 			fh.BaseRev = revision
