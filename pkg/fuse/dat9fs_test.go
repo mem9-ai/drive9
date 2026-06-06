@@ -4846,6 +4846,46 @@ func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlySQLiteUsesDirectIO(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	ino := fs.inodes.Lookup("/workload.db", false, 4096, time.Now())
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO for SQLite reader coherence", out.OpenFlags)
+	}
+}
+
+func TestOpenWritableSQLiteUsesDirectIO(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	ino := fs.inodes.Lookup("/workload.db", false, 4, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.readCache.Put("/workload.db", []byte("seed"), 1)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO for SQLite writer coherence", out.OpenFlags)
+	}
+}
+
 func TestOpenReadOnlyCacheableFileSkipsPrefetcher(t *testing.T) {
 	size := int64(defaultReadCacheMaxFileSize)
 	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {

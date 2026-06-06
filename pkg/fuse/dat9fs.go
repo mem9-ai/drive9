@@ -484,6 +484,22 @@ func isSQLiteVisibleSamePathDirtyPath(localPath string) bool {
 	return strings.HasSuffix(name, ".db") || strings.HasSuffix(name, ".sqlite") || strings.HasSuffix(name, ".sqlite3")
 }
 
+func remoteOpenFlagsForHandle(fh *FileHandle) uint32 {
+	if fh == nil {
+		return gofuse.FOPEN_KEEP_CACHE
+	}
+	if isSQLiteVisibleSamePathDirtyPath(fh.Path) {
+		return gofuse.FOPEN_DIRECT_IO
+	}
+	if fh.Dirty != nil {
+		if fh.Flags&syscall.O_TRUNC != 0 || fh.OrigSize >= smallFileShadowThreshold {
+			return gofuse.FOPEN_DIRECT_IO
+		}
+		return gofuse.FOPEN_KEEP_CACHE
+	}
+	return gofuse.FOPEN_KEEP_CACHE
+}
+
 func (fs *Dat9FS) localEntry(localPath string, info os.FileInfo, incrementLookup bool) (*InodeEntry, gofuse.Status) {
 	entry := entryFromLocalInfo(localPath, info)
 	var ino uint64
@@ -5028,10 +5044,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
 	out.Fh = fs.allocateFileHandle(fh)
-	// Use cached I/O for small/interactive files. Kernel coalesces writes
-	// and serves reads from page cache after first access.
-	// Keep DIRECT_IO for O_TRUNC streaming files.
-	out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+	out.OpenFlags = remoteOpenFlagsForHandle(fh)
 	fs.fillEntryOut(entry, &out.EntryOut)
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
@@ -5227,21 +5240,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	}
 
 	out.Fh = fs.allocateFileHandle(fh)
-	if fh.Dirty != nil {
-		// Use cached I/O for small/interactive files (< 64MB, no O_TRUNC).
-		// Kernel coalesces writes and serves reads from page cache.
-		// Keep DIRECT_IO for O_TRUNC or large streaming files.
-		if input.Flags&syscall.O_TRUNC != 0 || fh.OrigSize >= smallFileShadowThreshold {
-			out.OpenFlags = gofuse.FOPEN_DIRECT_IO
-		} else {
-			out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
-		}
-	} else {
-		// Read-only opens need kernel caching so mmap-based readers (notably
-		// git pack access) do not SIGBUS on macFUSE. Prefetch-backed reads
-		// still populate the userspace prefetcher on cache misses.
-		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
-	}
+	out.OpenFlags = remoteOpenFlagsForHandle(fh)
 	fs.debugf("open path=%s fh=%d ino=%d flags=0x%x open_flags=%d dirty=%t prefetch=%t orig_size=%d base_rev=%d shadow_ready=%t shadow_spill=%t write_policy=%s", p, out.Fh, fh.Ino, input.Flags, out.OpenFlags, fh.Dirty != nil, fh.Prefetch != nil, fh.OrigSize, fh.BaseRev, fh.ShadowReady, fh.ShadowSpill, fh.WritePolicy)
 	return gofuse.OK
 }
