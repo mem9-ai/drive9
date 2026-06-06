@@ -1436,6 +1436,9 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 	if fs.openHandles == nil || fh == nil || fh.Dirty == nil {
 		return false
 	}
+	if isSQLitePersistentJournalPath(fh.Path) {
+		return false
+	}
 
 	type candidate struct {
 		src          *FileHandle
@@ -5642,7 +5645,14 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// However, if the handle has evicted (streaming-uploaded) parts, we cannot
 	// serve reads from those ranges — the data is on S3 but not in memory.
 	// For such ranges we fall through to the server read path.
-	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
+	if fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
+		source = "sqlite-sidecar-clean-remote"
+		fh.Unlock()
+		// Clean O_RDWR SQLite sidecar handles are reader snapshots. Do not
+		// serve their preloaded WAL/journal bytes from the writable buffer:
+		// the shared -shm can point readers at a newer fsync-committed sidecar
+		// extent, and a stale clean buffer would produce short reads.
+	} else if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
 		offset := int64(input.Offset)
 		size := fh.Dirty.Size()
 		if offset >= size {
