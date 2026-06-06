@@ -472,6 +472,10 @@ func isSQLitePersistentJournalPath(localPath string) bool {
 	return strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-journal")
 }
 
+func shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath string) bool {
+	return isSQLitePersistentJournalPath(localPath)
+}
+
 func isSQLiteVisibleSamePathDirtyPath(localPath string) bool {
 	canonical, err := pathutil.Canonicalize(localPath)
 	if err != nil {
@@ -1976,6 +1980,63 @@ func (fs *Dat9FS) clearAllReadTargets() {
 	fs.fileHandles.ForEach(func(_ uint64, fh *FileHandle) {
 		clearReadTargetForHandle(fh)
 	})
+}
+
+func readUnlinkedData(fh *FileHandle, offset int64, size uint32) ([]byte, int, bool) {
+	if fh == nil || fh.UnlinkedData == nil {
+		return nil, 0, false
+	}
+	if size == 0 || offset >= int64(len(fh.UnlinkedData)) {
+		return nil, 0, true
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	end := offset + int64(size)
+	if end > int64(len(fh.UnlinkedData)) {
+		end = int64(len(fh.UnlinkedData))
+	}
+	data := cloneBytes(fh.UnlinkedData[offset:end])
+	return data, len(data), true
+}
+
+func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, localPath string) error {
+	if fs == nil || fs.openHandles == nil || !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
+		return nil
+	}
+	for _, fh := range fs.openHandles.SnapshotPath(localPath) {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		if fh.Dirty != nil || fh.UnlinkedData != nil {
+			fh.Unlock()
+			continue
+		}
+		handlePath := fh.Path
+		size := fh.OrigSize
+		fh.Unlock()
+
+		if handlePath != localPath || size < 0 || size > maxPreloadSize {
+			continue
+		}
+		var data []byte
+		if size > 0 {
+			var err error
+			data, _, err = fs.readStreamRangeWithRetry(ctx, handlePath, fh, 0, size)
+			if err != nil {
+				return err
+			}
+		}
+
+		fh.Lock()
+		if fh.Path == handlePath && fh.Dirty == nil && fh.UnlinkedData == nil {
+			fh.UnlinkedData = cloneBytes(data)
+			clearReadTargetForLockedHandle(fh)
+		}
+		fh.Unlock()
+	}
+	return nil
 }
 
 func (fs *Dat9FS) invalidateReadCacheAndTargets(p string) {
@@ -4007,6 +4068,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if !pendingNew {
 		ctx, cf := fuseCtx(cancel)
 		defer cf()
+		if err := fs.snapshotOpenSQLiteSidecarBeforeUnlink(ctx, childP); err != nil {
+			status = httpToFuseStatus(err)
+			return status
+		}
 
 		// File existed on server (or unknown) — issue remote DELETE.
 		// Tolerate 404 in case it was already deleted.
@@ -5401,6 +5466,12 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		source = "git-local-file"
 		bytesRead = n
 		return gofuse.ReadResultData(data[:n]), gofuse.OK
+	}
+	if data, n, ok := readUnlinkedData(fh, int64(input.Offset), input.Size); ok {
+		fh.Unlock()
+		source = "unlinked-snapshot"
+		bytesRead = n
+		return gofuse.ReadResultData(data), gofuse.OK
 	}
 
 	// ShadowSpill: read from shadow file (the authoritative data source).

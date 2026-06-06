@@ -32,6 +32,7 @@ type FileHandle struct {
 	Streamer          *StreamUploader // nil for small files / read-only; manages background part uploads
 	Prefetch          *Prefetcher     // nil for writable handles; sequential read prefetcher
 	ReadTarget        *client.ReadTarget
+	UnlinkedData      []byte      // snapshot for POSIX unlink-open reads on small SQLite sidecars
 	WritePolicy       WritePolicy // per-handle remote durability policy chosen at open/create
 	GitWorkspaceID    string      // set for handles served by the git workspace layer
 	GitRelPath        string
