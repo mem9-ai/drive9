@@ -457,6 +457,18 @@ func isSQLiteWALIndexPath(localPath string) bool {
 	return strings.TrimSuffix(name, "-shm") != ""
 }
 
+func isSQLitePersistentJournalPath(localPath string) bool {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil {
+		return false
+	}
+	name := path.Base(canonical)
+	if name == "-wal" || name == "-journal" {
+		return false
+	}
+	return strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-journal")
+}
+
 func (fs *Dat9FS) localEntry(localPath string, info os.FileInfo, incrementLookup bool) (*InodeEntry, gofuse.Status) {
 	entry := entryFromLocalInfo(localPath, info)
 	var ino uint64
@@ -6175,6 +6187,8 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		return fs.syncHandleToRemoteLocked(syncCtx, fh)
 	}
 
+	requiresRemoteSync := isSQLitePersistentJournalPath(fh.Path)
+
 	// Write-back path: small dirty files are persisted to local disk
 	// and return immediately. The actual HTTP upload happens in Release
 	// (async). This reduces Flush latency from ~100-300ms to ~1-5ms.
@@ -6184,7 +6198,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	// Release will see HasDirtyParts() == true and fall through to the
 	// synchronous flushHandle path, uploading the latest data. The cache
 	// entry is just a snapshot for the async-upload fast path.
-	if fs.writeBack != nil && fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
+	if !requiresRemoteSync && fs.writeBack != nil && fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
 		// Same generation already cached — no new writes since last Flush.
 		if fh.WriteBackSeq > 0 && fh.WriteBackSeq == fh.DirtySeq {
 			phase = "writeback-same-seq"
@@ -6254,7 +6268,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		// ShadowSpill interactive path: stage shadow journal + set ShadowCommitReady.
 		// Does NOT use snapshotWriteBackLocked or WriteBackSeq — those assume
 		// writeBack cache holds complete file data, which ShadowSpill does not.
-		if fh.ShadowSpill && fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
+		if !requiresRemoteSync && fh.ShadowSpill && fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
 			phase = "large-shadowspill-stage"
 			size := fh.Dirty.Size()
 			stageStart := time.Now()
@@ -6323,7 +6337,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			return gofuse.OK
 		}
 
-		if fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
+		if !requiresRemoteSync && fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
 			if fs.canStageShadowFastLocked(fh) || fh.Dirty.CanMaterializeFull() {
 				phase = "large-stage-shadow"
 				size := fh.Dirty.Size()
@@ -6433,7 +6447,8 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 
 	// Interactive mode: Fsync = local durable only. Shadow file + journal
 	// ensure crash safety. Remote commit happens asynchronously.
-	if fs.syncMode == SyncInteractive {
+	requiresRemoteSync := isSQLitePersistentJournalPath(fh.Path)
+	if fs.syncMode == SyncInteractive && !requiresRemoteSync {
 		if fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
 			phase = "interactive-clean"
 			return gofuse.OK
@@ -6797,7 +6812,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		}
 
 		// ShadowSpill Release: CommitQueue streaming from shadow, no writeBack.
-		if fh.ShadowSpill && fh.ShadowCommitReady && fs.commitQueue != nil && fs.shadowStore != nil {
+		if !isSQLitePersistentJournalPath(fh.Path) && fh.ShadowSpill && fh.ShadowCommitReady && fs.commitQueue != nil && fs.shadowStore != nil {
 			phase = "shadowspill-commit"
 			lockStart := time.Now()
 			fh.Lock()
@@ -6868,7 +6883,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		// AND no new writes have happened since. If the DirtySeq changed,
 		// the cache snapshot is stale — fall through to synchronous upload
 		// which will upload the latest buffer data.
-		if fs.writeBack != nil && fs.uploader != nil {
+		if !isSQLitePersistentJournalPath(fh.Path) && fs.writeBack != nil && fs.uploader != nil {
 			phase = "writeback-check"
 			lockStart := time.Now()
 			fh.Lock()
@@ -6986,6 +7001,9 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 // Caller must hold fh.mu.
 func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, force bool) gofuse.Status {
 	if force || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
+		return fs.flushHandle(ctx, fh)
+	}
+	if isSQLitePersistentJournalPath(fh.Path) {
 		return fs.flushHandle(ctx, fh)
 	}
 

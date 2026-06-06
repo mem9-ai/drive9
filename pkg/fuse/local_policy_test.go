@@ -150,3 +150,28 @@ func TestSQLiteWALIndexPathMatching(t *testing.T) {
 		}
 	}
 }
+
+func TestSQLitePersistentJournalPathMatching(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "/repo/workload.db-wal", want: true},
+		{path: "/repo/workload.sqlite-wal", want: true},
+		{path: "/repo/workload-wal", want: true},
+		{path: "/repo/workload.db-journal", want: true},
+		{path: "/repo/workload.sqlite-journal", want: true},
+		{path: "/repo/workload-journal", want: true},
+		{path: "/repo/workload.db-shm", want: false},
+		{path: "/repo/workload.db", want: false},
+		{path: "/repo/-wal", want: false},
+		{path: "/repo/-journal", want: false},
+		{path: `repo\\workload.db-wal`, want: false},
+	}
+
+	for _, test := range tests {
+		if got := isSQLitePersistentJournalPath(test.path); got != test.want {
+			t.Errorf("isSQLitePersistentJournalPath(%q) = %t, want %t", test.path, got, test.want)
+		}
+	}
+}
