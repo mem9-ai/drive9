@@ -694,7 +694,7 @@ if is_mounted "$MOUNT_POINT"; then
         check_eq "unmount SQLite remount" "true" "true"
         MOUNT_PID=""
         mkdir -p "$REMOTE_SNAPSHOT"
-        drive9_retry fs cp ":$WORK_REMOTE" "$REMOTE_SNAPSHOT" >/dev/null
+        drive9_retry fs cp -r ":$WORK_REMOTE" "$REMOTE_SNAPSHOT" >/dev/null
         REMOTE_WORK_SNAPSHOT="$(remote_snapshot_root)"
         verify_sqlite_tree "remote SQLite snapshot integrity_check and logical fingerprint match" "$REMOTE_WORK_SNAPSHOT" "$ACTUAL_REMOTE_JSON"
       else
