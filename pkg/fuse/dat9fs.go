@@ -5499,6 +5499,17 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		return gofuse.ReadResultData(data), gofuse.OK
 	}
 
+	if fh.Dirty == nil && isSQLiteVisibleSamePathDirtyPath(fh.Path) {
+		if data, n, ok, st := fs.readSamePathDirtyHandle(fh.Path, fh, int64(input.Offset), input.Size); ok {
+			source = "same-path-dirty"
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
+	}
+
 	// Read path priority for pending files:
 	// 1. ShadowStore (local SSD) — for files staged by Flush
 	// 2. WriteBackCache.Get (local disk, full file) — legacy path
@@ -5565,16 +5576,6 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			source = "writeback-cache"
 			bytesRead = int(end - offset)
 			return gofuse.ReadResultData(wbData[offset:end]), gofuse.OK
-		}
-	}
-	if fh.Dirty == nil && isSQLiteVisibleSamePathDirtyPath(fh.Path) {
-		if data, n, ok, st := fs.readSamePathDirtyHandle(fh.Path, fh, int64(input.Offset), input.Size); ok {
-			source = "same-path-dirty"
-			bytesRead = n
-			if st != gofuse.OK {
-				return nil, st
-			}
-			return gofuse.ReadResultData(data), gofuse.OK
 		}
 	}
 
