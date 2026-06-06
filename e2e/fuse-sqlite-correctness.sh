@@ -690,6 +690,33 @@ PY
   fi
 }
 
+assert_no_sqlite_shm_files() {
+  local desc="$1"
+  local root="$2"
+  TOTAL=$((TOTAL + 1))
+  if python3 - "$root" <<'PY'
+import os
+import sys
+
+root = os.path.abspath(sys.argv[1])
+matches = []
+for dirpath, _, filenames in os.walk(root):
+    for name in filenames:
+        if name.endswith("-shm"):
+            matches.append(os.path.relpath(os.path.join(dirpath, name), root))
+if matches:
+    print("remote snapshot contains transient SQLite shm files:", ", ".join(sorted(matches)), file=sys.stderr)
+    raise SystemExit(1)
+PY
+  then
+    echo "PASS $desc"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL $desc"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 remote_snapshot_root() {
   if [ -d "$REMOTE_SNAPSHOT/sqlite" ]; then
     printf '%s' "$REMOTE_SNAPSHOT/sqlite"
@@ -889,6 +916,7 @@ if is_mounted "$MOUNT_POINT"; then
         drive9_retry fs cp -r ":$WORK_REMOTE" "$REMOTE_SNAPSHOT" >/dev/null
         REMOTE_WORK_SNAPSHOT="$(remote_snapshot_root)"
         verify_sqlite_tree "remote SQLite snapshot integrity_check and logical fingerprint match" "$REMOTE_WORK_SNAPSHOT" "$ACTUAL_REMOTE_JSON"
+        assert_no_sqlite_shm_files "remote SQLite snapshot excludes transient shm sidecars" "$REMOTE_WORK_SNAPSHOT"
       else
         check_eq "unmount SQLite remount" "false" "true"
       fi

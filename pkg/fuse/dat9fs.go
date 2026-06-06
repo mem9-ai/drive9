@@ -21,6 +21,7 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/mountpath"
+	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
@@ -119,7 +120,10 @@ type Dat9FS struct {
 	localPolicy *LocalPolicy
 	// localOverlay stores local-only paths under MountOptions.LocalRoot.
 	localOverlay *LocalOverlay
-	git          *gitWorkspaceLayer
+	// transientLocalOverlay stores mount-local runtime sidecars that must be
+	// shared by all handles in one mount, but must not become remote state.
+	transientLocalOverlay *LocalOverlay
+	git                   *gitWorkspaceLayer
 	// gitCheckpoints coalesces lightweight .git state checkpoints so Git
 	// porcelain close/rename/unlink paths do not synchronously run rev-list.
 	gitCheckpoints *flushDebouncer
@@ -407,6 +411,12 @@ func (fs *Dat9FS) localOverlayForDirPath(ctx context.Context, localPath string) 
 }
 
 func (fs *Dat9FS) localOverlayForPathWithHint(ctx context.Context, localPath string, dirHint bool) (*LocalOverlay, bool, gofuse.Status) {
+	if fs.usesTransientLocalOverlay(localPath, dirHint) {
+		if fs.transientLocalOverlay == nil {
+			return nil, true, gofuse.EIO
+		}
+		return fs.transientLocalOverlay, true, gofuse.OK
+	}
 	var layer PathLayer
 	if dirHint {
 		layer = fs.observeDirPathPolicyWithContext(ctx, localPath)
@@ -423,6 +433,25 @@ func (fs *Dat9FS) localOverlayForPathWithHint(ctx context.Context, localPath str
 		return nil, true, gofuse.EIO
 	}
 	return fs.localOverlay, true, gofuse.OK
+}
+
+func (fs *Dat9FS) usesTransientLocalOverlay(localPath string, dirHint bool) bool {
+	if fs == nil || dirHint || fs.opts == nil || fs.opts.ReadOnly || fs.transientLocalOverlay == nil {
+		return false
+	}
+	return isSQLiteWALIndexPath(localPath)
+}
+
+func isSQLiteWALIndexPath(localPath string) bool {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil {
+		return false
+	}
+	name := path.Base(canonical)
+	if name == "-shm" || !strings.HasSuffix(name, "-shm") {
+		return false
+	}
+	return strings.TrimSuffix(name, "-shm") != ""
 }
 
 func (fs *Dat9FS) localEntry(localPath string, info os.FileInfo, incrementLookup bool) (*InodeEntry, gofuse.Status) {
@@ -4589,10 +4618,18 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 }
 
 func (fs *Dat9FS) mergeLocalDirEntries(ctx context.Context, dirPath string, entries []DirEntry) ([]DirEntry, error) {
-	if fs.localOverlay == nil {
+	merged, err := fs.mergeOverlayDirEntries(ctx, dirPath, entries, fs.localOverlay)
+	if err != nil {
+		return nil, err
+	}
+	return fs.mergeOverlayDirEntries(ctx, dirPath, merged, fs.transientLocalOverlay)
+}
+
+func (fs *Dat9FS) mergeOverlayDirEntries(ctx context.Context, dirPath string, entries []DirEntry, overlay *LocalOverlay) ([]DirEntry, error) {
+	if overlay == nil {
 		return entries, nil
 	}
-	items, err := fs.localOverlay.ReadDir(dirPath)
+	items, err := overlay.ReadDir(dirPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return entries, nil
@@ -4629,7 +4666,7 @@ func (fs *Dat9FS) localOverlayDirEntries(ctx context.Context, dirPath string, it
 		if item.Info.IsDir() {
 			layer = fs.observeDirPathPolicyWithContext(ctx, childP)
 		}
-		if layer != PathLayerLocalOnly {
+		if layer != PathLayerLocalOnly && !fs.usesTransientLocalOverlay(childP, item.Info.IsDir()) {
 			continue
 		}
 		info := item.Info

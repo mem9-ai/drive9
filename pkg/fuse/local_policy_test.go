@@ -129,3 +129,24 @@ func TestLocalPolicyRuntimePathWhitespaceIsNotTrimmedIntoMatch(t *testing.T) {
 		t.Fatalf("runtime path with spaced .git segment = %s, want remote persistent", got)
 	}
 }
+
+func TestSQLiteWALIndexPathMatching(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "/repo/workload.db-shm", want: true},
+		{path: "/repo/workload.sqlite-shm", want: true},
+		{path: "/repo/workload-shm", want: true},
+		{path: "/repo/workload.db-wal", want: false},
+		{path: "/repo/workload.db-journal", want: false},
+		{path: "/repo/-shm", want: false},
+		{path: `repo\\workload.db-shm`, want: false},
+	}
+
+	for _, test := range tests {
+		if got := isSQLiteWALIndexPath(test.path); got != test.want {
+			t.Errorf("isSQLiteWALIndexPath(%q) = %t, want %t", test.path, got, test.want)
+		}
+	}
+}

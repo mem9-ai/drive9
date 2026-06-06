@@ -5216,6 +5216,108 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 	}
 }
 
+func TestSQLiteWALIndexSidecarUsesTransientLocalOverlay(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be used for sqlite wal-index sidecars", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	transientRoot := t.TempDir()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.transientLocalOverlay = NewLocalOverlay(transientRoot)
+	if err := fs.transientLocalOverlay.EnsureRoot(); err != nil {
+		t.Fatalf("EnsureRoot transient overlay: %v", err)
+	}
+
+	ctx := context.Background()
+	if overlay, local, st := fs.localOverlayForPath(ctx, "/repo/workload.db-shm"); !local || st != gofuse.OK || overlay != fs.transientLocalOverlay {
+		t.Fatalf("sqlite -shm overlay = (%p, %t, %v), want transient local overlay", overlay, local, st)
+	}
+	for _, persistentPath := range []string{"/repo/workload.db", "/repo/workload.db-wal", "/repo/workload.db-journal"} {
+		if overlay, local, st := fs.localOverlayForPath(ctx, persistentPath); local || st != gofuse.OK || overlay != nil {
+			t.Fatalf("%s overlay = (%p, %t, %v), want remote persistent", persistentPath, overlay, local, st)
+		}
+	}
+
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "workload.db-shm", &createOut); st != gofuse.OK {
+		t.Fatalf("Create workload.db-shm: %v", st)
+	}
+
+	content := []byte("sqlite wal-index bytes")
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(content)),
+	}, content)
+	if st != gofuse.OK {
+		t.Fatalf("Write workload.db-shm: %v", st)
+	}
+	if written != uint32(len(content)) {
+		t.Fatalf("Write bytes = %d, want %d", written, len(content))
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush workload.db-shm: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+
+	localPath := transientRoot + "/overlay/repo/workload.db-shm"
+	gotFile, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("ReadFile transient overlay: %v", err)
+	}
+	if string(gotFile) != string(content) {
+		t.Fatalf("transient overlay content = %q, want %q", gotFile, content)
+	}
+
+	entries, err := fs.mergeLocalDirEntries(ctx, "/repo", nil)
+	if err != nil {
+		t.Fatalf("mergeLocalDirEntries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "workload.db-shm" {
+		t.Fatalf("merged entries = %#v, want workload.db-shm only", entries)
+	}
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "workload.db-shm", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup workload.db-shm: %v", st)
+	}
+	var openOut gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &openOut); st != gofuse.OK {
+		t.Fatalf("Open workload.db-shm: %v", st)
+	}
+	buf := make([]byte, len(content)+8)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read workload.db-shm: %v", st)
+	}
+	got, _ := result.Bytes(buf)
+	if string(got) != string(content) {
+		t.Fatalf("Read workload.db-shm = %q, want %q", got, content)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+}
+
 func TestCodingAgentLocalOverlayFlushSkipsSyncForGeneratedPath(t *testing.T) {
 	var syncCalls atomic.Int32
 	previousSync := syncOpenLocalFile
