@@ -469,6 +469,21 @@ func isSQLitePersistentJournalPath(localPath string) bool {
 	return strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-journal")
 }
 
+func isSQLiteVisibleSamePathDirtyPath(localPath string) bool {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil {
+		return false
+	}
+	name := path.Base(canonical)
+	if isSQLitePersistentJournalPath(canonical) {
+		return true
+	}
+	if name == "" || name == "." || name == "/" {
+		return false
+	}
+	return strings.HasSuffix(name, ".db") || strings.HasSuffix(name, ".sqlite") || strings.HasSuffix(name, ".sqlite3")
+}
+
 func (fs *Dat9FS) localEntry(localPath string, info os.FileInfo, incrementLookup bool) (*InodeEntry, gofuse.Status) {
 	entry := entryFromLocalInfo(localPath, info)
 	var ino uint64
@@ -1414,6 +1429,95 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		return true
 	}
 	return false
+}
+
+func (fs *Dat9FS) readSamePathDirtyHandle(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+	if fs == nil || fs.openHandles == nil || path == "" || reqSize == 0 {
+		return nil, 0, false, gofuse.OK
+	}
+
+	type candidate struct {
+		fh       *FileHandle
+		dirtySeq uint64
+	}
+	var candidates []candidate
+	for _, src := range fs.openHandles.SnapshotPath(path) {
+		if src == nil || src == skip {
+			continue
+		}
+		src.Lock()
+		if src.Dirty != nil && src.DirtySeq > 0 {
+			candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
+		}
+		src.Unlock()
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return candidates[i].dirtySeq > candidates[j].dirtySeq
+	})
+
+	for _, c := range candidates {
+		src := c.fh
+		if !src.TryLock() {
+			continue
+		}
+		if src.Dirty == nil || src.DirtySeq != c.dirtySeq {
+			src.Unlock()
+			continue
+		}
+		size := src.Dirty.Size()
+		if offset >= size {
+			src.Unlock()
+			return nil, 0, true, gofuse.OK
+		}
+		end := offset + int64(reqSize)
+		if end > size {
+			end = size
+		}
+		if end <= offset {
+			src.Unlock()
+			return nil, 0, true, gofuse.OK
+		}
+		buf := make([]byte, end-offset)
+
+		if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
+			src.Unlock()
+			n, err := fs.shadowStore.ReadAt(path, offset, buf)
+			if err != nil {
+				fs.debugf("read same-path shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
+				continue
+			}
+			return buf[:n], n, true, gofuse.OK
+		}
+
+		ps := src.Dirty.PartSize()
+		firstPart := int(offset / ps)
+		lastPart := int((end - 1) / ps)
+		touchesEvicted := false
+		if evicted := src.Dirty.StreamedPartIndices(); len(evicted) > 0 {
+			for p := firstPart; p <= lastPart; p++ {
+				if evicted[p] && !src.Dirty.IsPartLoaded(p) {
+					touchesEvicted = true
+					break
+				}
+			}
+		}
+		if touchesEvicted {
+			src.Unlock()
+			continue
+		}
+		for p := firstPart; p <= lastPart; p++ {
+			if !src.Dirty.IsPartLoaded(p) {
+				if err := src.Dirty.EnsureLoaded(p); err != nil {
+					src.Unlock()
+					return nil, 0, true, gofuse.EIO
+				}
+			}
+		}
+		src.Dirty.ReadAt(offset, buf)
+		src.Unlock()
+		return buf, len(buf), true, gofuse.OK
+	}
+	return nil, 0, false, gofuse.OK
 }
 
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
@@ -5461,6 +5565,16 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			source = "writeback-cache"
 			bytesRead = int(end - offset)
 			return gofuse.ReadResultData(wbData[offset:end]), gofuse.OK
+		}
+	}
+	if fh.Dirty == nil && isSQLiteVisibleSamePathDirtyPath(fh.Path) {
+		if data, n, ok, st := fs.readSamePathDirtyHandle(fh.Path, fh, int64(input.Offset), input.Size); ok {
+			source = "same-path-dirty"
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
 		}
 	}
 

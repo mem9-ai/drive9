@@ -6471,6 +6471,56 @@ func TestOpenWritablePreloadReadsShadowBeforeEvictedBuffer(t *testing.T) {
 	}
 }
 
+func TestReadSQLiteSamePathDirtyHandleBeforeRemote(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for same-mount sqlite dirty data", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/workload.db-wal", false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  "/workload.db-wal",
+		Dirty: fs.newWriteBuffer("/workload.db-wal", maxPreloadSize, 0),
+	}
+	want := []byte("latest wal bytes")
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+
+	reader := &FileHandle{Ino: ino, Path: "/workload.db-wal"}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes = %q, want %q", got, want)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
 func TestOpenWritablePreloadPreservesExistingOrigSize(t *testing.T) {
 	var remoteCalls atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
