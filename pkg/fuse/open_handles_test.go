@@ -195,3 +195,57 @@ func TestDat9FSClearReadTargetsForPath(t *testing.T) {
 		t.Fatal("non-matching prefetch read target was cleared")
 	}
 }
+
+func TestDat9FSClearReadTargetsForPathSkipsLockedSibling(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	target := &client.ReadTarget{ObjectURL: "http://old.example/object"}
+	current := &FileHandle{Ino: 10, Path: "/file.txt", ReadTarget: target}
+	lockedSibling := &FileHandle{Ino: 11, Path: "/file.txt", ReadTarget: target}
+	lockedSibling.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/file.txt"), 4)
+	lockedSibling.Prefetch.SetReadTarget(target)
+	unlockedSibling := &FileHandle{Ino: 12, Path: "/file.txt", ReadTarget: target}
+	unlockedSibling.Prefetch = NewPrefetcher(fs.client, fs.remotePath("/file.txt"), 4)
+	unlockedSibling.Prefetch.SetReadTarget(target)
+	fs.allocateFileHandle(current)
+	fs.allocateFileHandle(lockedSibling)
+	fs.allocateFileHandle(unlockedSibling)
+
+	lockedSibling.Lock()
+	defer lockedSibling.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		fs.clearReadTargetsForPathExcept("/file.txt", current)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("clearReadTargetsForPathExcept blocked on a locked sibling handle")
+	}
+	if current.ReadTarget == nil {
+		t.Fatal("skipped current handle read target was cleared")
+	}
+	if lockedSibling.ReadTarget == nil {
+		t.Fatal("locked sibling read target was cleared")
+	}
+	lockedSibling.Prefetch.mu.Lock()
+	lockedPrefetchTarget := lockedSibling.Prefetch.target
+	lockedSibling.Prefetch.mu.Unlock()
+	if lockedPrefetchTarget == nil {
+		t.Fatal("locked sibling prefetch target was cleared")
+	}
+	if unlockedSibling.ReadTarget != nil {
+		t.Fatal("unlocked sibling read target was not cleared")
+	}
+	unlockedSibling.Prefetch.mu.Lock()
+	unlockedPrefetchTarget := unlockedSibling.Prefetch.target
+	unlockedSibling.Prefetch.mu.Unlock()
+	if unlockedPrefetchTarget != nil {
+		t.Fatal("unlocked sibling prefetch target was not cleared")
+	}
+}
