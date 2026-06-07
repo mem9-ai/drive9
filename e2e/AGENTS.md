@@ -292,6 +292,21 @@ It asserts workload correctness and emits JSON metrics artifacts for comparison.
 8. Preserve run root, mount log, and metrics artifact on failure or when
    `FUSE_PERF_KEEP_ARTIFACTS=1`
 
+### `scripts/compare-fuse-performance-metrics.sh`
+
+This is a warning-only performance regression reporter for `local-e2e.yml`.
+Run it after `RUN_FUSE_PERFORMANCE_BASELINE=1` produces artifacts and before
+the current run is archived. It fetches the previous Drive9 archive manifest
+from `/benchmarks/fuse-performance/branches/<branch>/latest.json`, falls back to
+`/benchmarks/fuse-performance/latest.json`, downloads the archived
+`performance-metrics-*.json`, and writes `performance-compare-*.json` plus
+`performance-compare-*.md` into the same artifact directory.
+
+Regression warnings and missing historical baselines do not fail the workflow.
+The script must fail closed for invalid current metrics, missing Drive9
+credentials when comparison is enabled, malformed archived manifests, malformed
+baseline metrics, or multiple current metrics files.
+
 ### `git-workspace-smoke-test.sh`
 
 Host support: Linux and macOS only. This script needs real FUSE support and
@@ -370,9 +385,11 @@ the layout captured by that run.
 8. Runs threshold-free FUSE performance baseline metrics only when
    `RUN_FUSE_PERFORMANCE_BASELINE=1`
 
-`local-e2e.yml` runs concurrency stress as a separate scheduled/manual step
-after the release gate and metrics archive. The archive step runs first, but
-scheduled/manual stress failures still fail the workflow when stress is enabled.
+`local-e2e.yml` runs the warning-only performance compare before archiving the
+current metrics so a run cannot compare against itself. It runs concurrency
+stress as a separate scheduled/manual step after the release gate and metrics
+archive. Scheduled/manual stress failures still fail the workflow when stress is
+enabled.
 
 ### `smoke-all.sh`
 
@@ -443,6 +460,7 @@ scheduled/manual stress failures still fail the workflow when stress is enabled.
 | `FUSE_CONCURRENCY_KEEP_ARTIFACTS` | `0` | `fuse-concurrency-stress.sh` |
 | `RUN_FUSE_PERFORMANCE_BASELINE` | `0` | `fuse-release-gate.sh` |
 | `ARCHIVE_FUSE_PERFORMANCE_METRICS` | `0` (`1` in the scheduled daily heavy `local-e2e` run) | `local-e2e.yml` |
+| `COMPARE_FUSE_PERFORMANCE_METRICS` | `0` (`1` in the scheduled daily heavy `local-e2e` run) | `local-e2e.yml` |
 | `FUSE_CONCURRENCY_STRESS_REQUIRED` | `0` (`1` for scheduled `local-e2e` runs or manual runs with `run_fuse_concurrency_stress=1`) | `local-e2e.yml` |
 | `FUSE_PERF_SMALL_FILES` | `64` | `fuse-performance-baseline.sh` |
 | `FUSE_PERF_SMALL_BYTES` | `1024` | `fuse-performance-baseline.sh` |
@@ -451,8 +469,9 @@ scheduled/manual stress failures still fail the workflow when stress is enabled.
 | `FUSE_PERF_SQLITE_ROWS` | `256` | `fuse-performance-baseline.sh` |
 | `FUSE_PERF_KEEP_ARTIFACTS` | `0` | `fuse-performance-baseline.sh` |
 | `FUSE_PERF_ARTIFACT_DIR` | - | `fuse-performance-baseline.sh`, `local-e2e.yml` |
+| `FUSE_PERF_COMPARE_WARN_RATIO` | `0.30` | `scripts/compare-fuse-performance-metrics.sh` |
 | `DRIVE9_PERF_ARCHIVE_ROOT` | `/benchmarks/fuse-performance` | `scripts/archive-fuse-performance-metrics.sh` |
-| `DRIVE9_PERF_SOURCE_DIR` | `$FUSE_PERF_ARTIFACT_DIR` | `scripts/archive-fuse-performance-metrics.sh` |
+| `DRIVE9_PERF_SOURCE_DIR` | `$FUSE_PERF_ARTIFACT_DIR` | `scripts/archive-fuse-performance-metrics.sh`, `scripts/compare-fuse-performance-metrics.sh` |
 | `RUN_FUSE_GIT_CLONE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `FUSE_GIT_CLONE_URL` | `https://github.com/octocat/Hello-World.git` | `fuse-smoke-test.sh` |
 | `FUSE_GIT_CLONE_TIMEOUT_S` | `180` | `fuse-smoke-test.sh` |
