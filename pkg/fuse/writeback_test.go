@@ -2191,6 +2191,8 @@ func TestReopenAfterClose_ReadsPendingCache(t *testing.T) {
 // when write-back cache has already persisted the data.
 func TestFsync_NoDuplicateUpload(t *testing.T) {
 	var httpPutCalls atomic.Int32
+	var gotExpected atomic.Int64
+	gotExpected.Store(-1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
@@ -2206,8 +2208,14 @@ func TestFsync_NoDuplicateUpload(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		case http.MethodPut:
 			httpPutCalls.Add(1)
+			if header := r.Header.Get("X-Dat9-Expected-Revision"); header != "" {
+				if rev, err := strconv.ParseInt(header, 10, 64); err == nil {
+					gotExpected.Store(rev)
+				}
+			}
 			_, _ = io.ReadAll(r.Body)
 			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": 1})
 		default:
 			w.WriteHeader(http.StatusOK)
 		}
@@ -2264,8 +2272,276 @@ func TestFsync_NoDuplicateUpload(t *testing.T) {
 	if diff := putsAfter - putsBefore; diff != 1 {
 		t.Fatalf("Fsync made %d PUT calls, want exactly 1 (double upload detected)", diff)
 	}
+	if gotExpected.Load() != 0 {
+		t.Fatalf("Fsync expected revision = %d, want 0", gotExpected.Load())
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.BaseRev != 1 {
+		t.Fatalf("handle base revision after Fsync = %d, want 1", fh.BaseRev)
+	}
+	if fh.IsNew {
+		t.Fatal("handle should no longer be new after Fsync upload")
+	}
 
 	uploader.DrainAll()
+}
+
+func TestFsyncShadowSpillCommitRefreshesRevisionAndClearsPending(t *testing.T) {
+	const filePath = "/workload.db-journal"
+	var (
+		mu                sync.Mutex
+		revision          int64
+		expectedRevisions []int64
+		uploadSizes       = make(map[string]int64)
+		uploadBodies      = make(map[string][]byte)
+	)
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate" {
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.Path != filePath {
+				t.Errorf("initiate path = %q, want %q", req.Path, filePath)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.TotalSize <= 0 {
+				t.Errorf("initiate total_size = %d, want > 0", req.TotalSize)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.ExpectedRevision == nil {
+				t.Error("initiate expected_revision missing")
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			expectedRevisions = append(expectedRevisions, *req.ExpectedRevision)
+			if *req.ExpectedRevision != revision {
+				http.Error(w, "revision conflict", http.StatusConflict)
+				return
+			}
+			uploadID := fmt.Sprintf("upload-%d", len(expectedRevisions))
+			uploadSizes[uploadID] = req.TotalSize
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   uploadID,
+				"key":         "object-key",
+				"part_size":   req.TotalSize,
+				"total_parts": 1,
+			})
+			return
+		}
+		if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/presign-batch") {
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/presign-batch")
+			mu.Lock()
+			size := uploadSizes[uploadID]
+			mu.Unlock()
+			if size <= 0 {
+				t.Errorf("presign unknown upload_id %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/" + uploadID + "/1",
+					"size":   size,
+				}},
+			})
+			return
+		}
+		if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/") {
+			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/s3/"), "/")
+			if len(parts) != 2 {
+				t.Errorf("bad s3 upload path %q", r.URL.Path)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			if len(body) == 0 {
+				t.Error("multipart part body should not be empty")
+			}
+			mu.Lock()
+			uploadBodies[parts[0]] = body
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/complete") {
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/complete")
+			mu.Lock()
+			defer mu.Unlock()
+			if len(uploadBodies[uploadID]) == 0 {
+				t.Errorf("complete before uploading body for %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			revision++
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			if r.URL.RawQuery == "list=1" {
+				_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		case http.MethodPut:
+			body, _ := io.ReadAll(r.Body)
+			if len(body) == 0 {
+				t.Error("direct PUT body should not be empty")
+			}
+			got, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				t.Errorf("expected revision header: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			expectedRevisions = append(expectedRevisions, got)
+			if got != revision {
+				http.Error(w, "revision conflict", http.StatusConflict)
+				return
+			}
+			revision++
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": revision})
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.syncMode = SyncStrict
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+	}, strings.TrimPrefix(filePath, "/"), &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle missing")
+	}
+	if !fh.ShadowSpill {
+		t.Fatal("created journal handle should use shadow spill")
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, []byte("first journal frame")); st != gofuse.OK {
+		t.Fatalf("first Write: %v", st)
+	}
+	if !shadow.Has(filePath) {
+		t.Fatal("shadow should contain staged journal before fsync")
+	}
+
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("first Fsync: %v", st)
+	}
+	if fh.IsNew {
+		t.Fatal("handle should not remain create-if-absent after first fsync")
+	}
+	if fh.BaseRev != 1 {
+		t.Fatalf("BaseRev after first fsync = %d, want 1", fh.BaseRev)
+	}
+	if pending.HasPending(filePath) {
+		t.Fatal("pending index should be cleared after remote-durable fsync")
+	}
+	if shadow.Has(filePath) {
+		t.Fatal("shadow should be cleared after remote-durable fsync")
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, []byte("second journal frame")); st != gofuse.OK {
+		t.Fatalf("second Write: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("second Fsync: %v", st)
+	}
+	if fh.BaseRev != 2 {
+		t.Fatalf("BaseRev after second fsync = %d, want 2", fh.BaseRev)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(expectedRevisions) != 2 || expectedRevisions[0] != 0 || expectedRevisions[1] != 1 {
+		t.Fatalf("expected revisions = %v, want [0 1]", expectedRevisions)
+	}
+}
+
+func TestRefreshCommittedRevisionSkipsLockedSiblingHandle(t *testing.T) {
+	fs := &Dat9FS{openHandles: NewOpenHandleIndex(), inodes: NewInodeToPath()}
+	current := &FileHandle{Ino: 1, Path: "/same.db", Dirty: NewWriteBuffer("/same.db", 1024, 1024), BaseRev: 1}
+	sibling := &FileHandle{Ino: 2, Path: "/same.db", Dirty: NewWriteBuffer("/same.db", 1024, 1024), BaseRev: 1}
+	fs.openHandles.Add(current)
+	fs.openHandles.Add(sibling)
+
+	sibling.Lock()
+	defer sibling.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		current.Lock()
+		defer current.Unlock()
+		fs.markHandleRemoteCommittedLocked(current, 2)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("markHandleRemoteCommittedLocked blocked on a locked sibling handle")
+	}
+	if current.BaseRev != 2 {
+		t.Fatalf("current BaseRev = %d, want 2", current.BaseRev)
+	}
+	if sibling.BaseRev != 1 {
+		t.Fatalf("locked sibling BaseRev = %d, want unchanged 1", sibling.BaseRev)
+	}
 }
 
 // TestSamePathConsecutiveSaves verifies that rapid consecutive saves to the

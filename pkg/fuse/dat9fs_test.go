@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -838,6 +840,21 @@ func cacheHasPersistedDiskReadCacheEntry(cache *DiskReadCache, key DiskReadCache
 	return err == nil
 }
 
+func parseTestBytesRange(header string) (int64, int64, bool) {
+	var start, end int64
+	n, err := fmt.Sscanf(header, "bytes=%d-%d", &start, &end)
+	return start, end, n == 2 && err == nil && start >= 0 && end >= start
+}
+
+func observeMaxInt32(max *atomic.Int32, value int32) {
+	for {
+		old := max.Load()
+		if value <= old || max.CompareAndSwap(old, value) {
+			return
+		}
+	}
+}
+
 func TestDat9FSDiskReadCacheRangeReadThrough(t *testing.T) {
 	const (
 		path = "/file.bin"
@@ -883,6 +900,371 @@ func TestDat9FSDiskReadCacheRangeReadThrough(t *testing.T) {
 	}
 	if calls := objectReads.Load(); calls != 1 {
 		t.Fatalf("object reads = %d, want 1", calls)
+	}
+}
+
+func TestDat9FSDiskReadCacheSingleRangeFinalEOFRead(t *testing.T) {
+	const (
+		path        = "/file.bin"
+		rev         = int64(7)
+		requestSize = 64
+	)
+	data := bytes.Repeat([]byte("x"), defaultReadCacheMaxFileSize+96)
+	for i := 0; i < 16; i++ {
+		data[len(data)-16+i] = byte('a' + i)
+	}
+	offset := int64(len(data) - 16)
+	var objectReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		objectReads.Add(1)
+		wantRange := fmt.Sprintf("bytes=%d-%d", offset, len(data)-1)
+		if got := r.Header.Get("Range"); got != wantRange {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[offset:])
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	entry := mustGetInodeEntry(t, fs, ino)
+	key, ok := fs.diskReadCacheKey(path, entry, offset, 16)
+	if !ok {
+		t.Fatal("disk read cache final key unavailable")
+	}
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, offset, requestSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[offset:]) {
+		t.Fatalf("final EOF read = %q, %v; want trimmed final bytes OK", got, st)
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, key)
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, offset, requestSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[offset:]) {
+		t.Fatalf("cached final EOF read = %q, %v; want trimmed final bytes OK", got, st)
+	}
+	if calls := objectReads.Load(); calls != 1 {
+		t.Fatalf("object reads = %d, want 1 after cached final read", calls)
+	}
+}
+
+func TestDat9FSParallelDiskReadFetchesBlocksInParallelAndCaches(t *testing.T) {
+	const (
+		path        = "/file.bin"
+		rev         = int64(7)
+		blockSize   = int64(64)
+		concurrency = 2
+	)
+	data := make([]byte, 4*blockSize)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	var objectReads atomic.Int32
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	var rangesMu sync.Mutex
+	ranges := make([]string, 0, 4)
+	recorder := &testErrorRecorder{}
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		objectReads.Add(1)
+		rangeHeader := r.Header.Get("Range")
+		rangesMu.Lock()
+		ranges = append(ranges, rangeHeader)
+		rangesMu.Unlock()
+		cur := inFlight.Add(1)
+		observeMaxInt32(&maxInFlight, cur)
+		defer inFlight.Add(-1)
+		time.Sleep(50 * time.Millisecond)
+
+		start, end, ok := parseTestBytesRange(rangeHeader)
+		if !ok || end >= int64(len(data)) {
+			recorder.Recordf("wrong range: %s", rangeHeader)
+			http.Error(w, "wrong range", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[start : end+1])
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.readCache = NewReadCacheWithMaxFileSize(1<<20, 0, 1)
+	fs.opts.ParallelReadBlockSize = blockSize
+	fs.opts.ParallelReadConcurrency = concurrency
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	entry := mustGetInodeEntry(t, fs, ino)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, len(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data) {
+		t.Fatalf("parallel read = len %d, %v; want full data OK", len(got), st)
+	}
+	recorder.Check(t)
+	if got := maxInFlight.Load(); got < 2 {
+		t.Fatalf("max concurrent object reads = %d, want >= 2", got)
+	}
+	if got := maxInFlight.Load(); got > concurrency {
+		t.Fatalf("max concurrent object reads = %d, want <= %d", got, concurrency)
+	}
+	for offset := int64(0); offset < int64(len(data)); offset += blockSize {
+		key, ok := fs.diskReadCacheKey(path, entry, offset, blockSize)
+		if !ok {
+			t.Fatalf("disk cache block key unavailable at offset %d", offset)
+		}
+		waitForDiskReadCacheEntry(t, fs.diskReadCache, key)
+	}
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, 0, len(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data) {
+		t.Fatalf("cached parallel read = len %d, %v; want full data OK", len(got), st)
+	}
+	if calls := objectReads.Load(); calls != 4 {
+		t.Fatalf("object reads = %d, want 4 after cached second read", calls)
+	}
+
+	rangesMu.Lock()
+	seen := append([]string(nil), ranges...)
+	rangesMu.Unlock()
+	sort.Strings(seen)
+	want := []string{"bytes=0-63", "bytes=128-191", "bytes=192-255", "bytes=64-127"}
+	if !reflect.DeepEqual(seen, want) {
+		t.Fatalf("ranges = %v, want %v", seen, want)
+	}
+}
+
+func TestDat9FSDiskReadCacheRejectsShortBackendResponse(t *testing.T) {
+	const (
+		path      = "/file.bin"
+		rev       = int64(7)
+		blockSize = int64(64)
+	)
+	data := bytes.Repeat([]byte("a"), int(blockSize))
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, blockSize, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Range"); got != "bytes=0-63" {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[:blockSize/2])
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.readCache = NewReadCacheWithMaxFileSize(1<<20, 0, 1)
+	fs.opts.ParallelReadBlockSize = blockSize
+	fs.opts.ParallelReadConcurrency = 2
+	fs.inodes.UpdateRevision(ino, rev)
+	fhID := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fhID)
+	fh, ok := fs.fileHandles.Get(fhID)
+	if !ok {
+		t.Fatal("file handle missing")
+	}
+	entry := mustGetInodeEntry(t, fs, ino)
+	key, ok := fs.diskReadCacheKey(path, entry, 0, blockSize)
+	if !ok {
+		t.Fatal("disk cache block key unavailable")
+	}
+
+	got, _, err := fs.readDiskCachedRange(context.Background(), path, fh, key)
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("readDiskCachedRange error = %v, want unexpected EOF", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("readDiskCachedRange data len = %d, want 0 on short response", len(got))
+	}
+	if cached, ok := fs.diskReadCache.Get(key); ok {
+		t.Fatalf("disk read cache hit after short backend response = len %d, want miss", len(cached))
+	}
+}
+
+func TestDat9FSParallelDiskReadHandlesPartialFinalBlock(t *testing.T) {
+	const (
+		path      = "/file.bin"
+		rev       = int64(7)
+		blockSize = int64(64)
+	)
+	data := make([]byte, 150)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	var rangesMu sync.Mutex
+	ranges := make([]string, 0, 3)
+	recorder := &testErrorRecorder{}
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		rangesMu.Lock()
+		ranges = append(ranges, rangeHeader)
+		rangesMu.Unlock()
+		start, end, ok := parseTestBytesRange(rangeHeader)
+		if !ok || end >= int64(len(data)) {
+			recorder.Recordf("wrong range: %s", rangeHeader)
+			http.Error(w, "wrong range", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[start : end+1])
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.readCache = NewReadCacheWithMaxFileSize(1<<20, 0, 1)
+	fs.opts.ParallelReadBlockSize = blockSize
+	fs.opts.ParallelReadConcurrency = 3
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 256)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data) {
+		t.Fatalf("partial final block read = len %d, %v; want EOF-trimmed data OK", len(got), st)
+	}
+	recorder.Check(t)
+	rangesMu.Lock()
+	seen := append([]string(nil), ranges...)
+	rangesMu.Unlock()
+	sort.Strings(seen)
+	want := []string{"bytes=0-63", "bytes=128-149", "bytes=64-127"}
+	if !reflect.DeepEqual(seen, want) {
+		t.Fatalf("ranges = %v, want %v", seen, want)
+	}
+}
+
+func TestDat9FSParallelDiskReadPropagatesBlockError(t *testing.T) {
+	const (
+		path      = "/file.bin"
+		rev       = int64(7)
+		blockSize = int64(64)
+	)
+	data := make([]byte, 3*blockSize)
+	for i := range data {
+		data[i] = byte(i)
+	}
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		if rangeHeader == "bytes=64-127" {
+			http.Error(w, "blocked range", http.StatusBadGateway)
+			return
+		}
+		start, end, ok := parseTestBytesRange(rangeHeader)
+		if !ok || end >= int64(len(data)) {
+			http.Error(w, "wrong range", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[start : end+1])
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.readCache = NewReadCacheWithMaxFileSize(1<<20, 0, 1)
+	fs.opts.ParallelReadBlockSize = blockSize
+	fs.opts.ParallelReadConcurrency = 3
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+
+	_, st, err := readDat9FSTestRange(fs, ino, fh, 0, len(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st == gofuse.OK {
+		t.Fatal("parallel read status = OK, want block error propagated")
+	}
+}
+
+func TestDat9FSParallelDiskReadStopsQueuedBlocksAfterFirstError(t *testing.T) {
+	const (
+		path      = "/file.bin"
+		rev       = int64(7)
+		blockSize = int64(64)
+	)
+	data := make([]byte, 4*blockSize)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	slowStarted := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	var slowOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseSlow) }) })
+	var unexpectedQueuedReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		switch rangeHeader {
+		case "bytes=0-63":
+			http.Error(w, "blocked range", http.StatusBadGateway)
+			return
+		case "bytes=64-127":
+			slowOnce.Do(func() { close(slowStarted) })
+			<-releaseSlow
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data[64:128])
+			return
+		default:
+			unexpectedQueuedReads.Add(1)
+			w.WriteHeader(http.StatusPartialContent)
+			start, end, ok := parseTestBytesRange(rangeHeader)
+			if ok && end < int64(len(data)) {
+				_, _ = w.Write(data[start : end+1])
+			}
+		}
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.readCache = NewReadCacheWithMaxFileSize(1<<20, 0, 1)
+	fs.opts.ParallelReadBlockSize = blockSize
+	fs.opts.ParallelReadConcurrency = 2
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		_, st, err := readDat9FSTestRange(fs, ino, fh, 0, len(data))
+		if err != nil {
+			t.Errorf("Read: %v", err)
+		}
+		done <- st
+	}()
+	select {
+	case <-slowStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second in-flight block did not start")
+	}
+	time.Sleep(50 * time.Millisecond)
+	releaseOnce.Do(func() { close(releaseSlow) })
+	select {
+	case st := <-done:
+		if st == gofuse.OK {
+			t.Fatal("parallel read status = OK, want first block error propagated")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("parallel read did not finish after releasing in-flight block")
+	}
+	if got := unexpectedQueuedReads.Load(); got != 0 {
+		t.Fatalf("queued block reads after first error = %d, want 0", got)
 	}
 }
 
@@ -2289,6 +2671,118 @@ func TestFlushNewLargeWriteStreamCarriesCreateIfAbsentRevision(t *testing.T) {
 	}
 	if completeParts != 1 {
 		t.Fatalf("complete parts = %d, want 1", completeParts)
+	}
+}
+
+func TestFlushSmallNewFileRefreshesSiblingHandleRevision(t *testing.T) {
+	const filePath = "/sqlite/workload.db-journal"
+
+	var (
+		mu        sync.Mutex
+		revision  int64
+		content   []byte
+		expected  []int64
+		serverErr error
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || r.URL.Path != "/v1/fs/sqlite/workload.db-journal" {
+			http.NotFound(w, r)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			mu.Lock()
+			if serverErr == nil {
+				serverErr = err
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		gotExpected, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+		if err != nil {
+			mu.Lock()
+			if serverErr == nil {
+				serverErr = fmt.Errorf("expected revision header: %w", err)
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		expected = append(expected, gotExpected)
+		if gotExpected != revision {
+			http.Error(w, "revision conflict", http.StatusConflict)
+			return
+		}
+		revision++
+		content = append([]byte(nil), body...)
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": revision})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+
+	first := NewWriteBuffer(filePath, 0, 0)
+	if _, err := first.Write(0, []byte("first")); err != nil {
+		t.Fatal(err)
+	}
+	fh1 := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: first,
+		IsNew: true,
+	}
+	fh1.DirtySeq = fs.markDirtySize(ino, first.Size())
+	fh1ID := fs.allocateFileHandle(fh1)
+
+	second := NewWriteBuffer(filePath, 0, 0)
+	if _, err := second.Write(0, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	fh2 := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: second,
+		IsNew: true,
+	}
+	fh2.DirtySeq = fs.markDirtySize(ino, second.Size())
+	fh2ID := fs.allocateFileHandle(fh2)
+
+	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fh1ID}); st != gofuse.OK {
+		t.Fatalf("first Flush status = %v, want OK", st)
+	}
+	if fh2.IsNew {
+		t.Fatal("second handle should no longer be create-if-absent after sibling commit")
+	}
+	if fh2.BaseRev != 1 {
+		t.Fatalf("second handle BaseRev = %d, want 1", fh2.BaseRev)
+	}
+
+	if st := fs.Flush(nil, &gofuse.FlushIn{InHeader: gofuse.InHeader{NodeId: ino}, Fh: fh2ID}); st != gofuse.OK {
+		t.Fatalf("second Flush status = %v, want OK", st)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if serverErr != nil {
+		t.Fatal(serverErr)
+	}
+	if !reflect.DeepEqual(expected, []int64{0, 1}) {
+		t.Fatalf("expected revisions = %v, want [0 1]", expected)
+	}
+	if revision != 2 {
+		t.Fatalf("server revision = %d, want 2", revision)
+	}
+	if string(content) != "second" {
+		t.Fatalf("server content = %q, want second", content)
 	}
 }
 
@@ -6211,6 +6705,26 @@ func TestMountOptionsReadConcurrencyDefaults(t *testing.T) {
 	explicit.setDefaults()
 	if explicit.ReadConcurrency != 7 {
 		t.Fatalf("explicit ReadConcurrency = %d, want 7", explicit.ReadConcurrency)
+	}
+}
+
+func TestMountOptionsParallelReadDefaults(t *testing.T) {
+	defaults := &MountOptions{}
+	defaults.setDefaults()
+	if defaults.ParallelReadConcurrency != defaultParallelReadConcurrency {
+		t.Fatalf("default ParallelReadConcurrency = %d, want %d", defaults.ParallelReadConcurrency, defaultParallelReadConcurrency)
+	}
+	if defaults.ParallelReadBlockSize != defaultParallelReadBlockSize {
+		t.Fatalf("default ParallelReadBlockSize = %d, want %d", defaults.ParallelReadBlockSize, defaultParallelReadBlockSize)
+	}
+
+	explicit := &MountOptions{ParallelReadConcurrency: 7, ParallelReadBlockSize: 2 << 20}
+	explicit.setDefaults()
+	if explicit.ParallelReadConcurrency != 7 {
+		t.Fatalf("explicit ParallelReadConcurrency = %d, want 7", explicit.ParallelReadConcurrency)
+	}
+	if explicit.ParallelReadBlockSize != 2<<20 {
+		t.Fatalf("explicit ParallelReadBlockSize = %d, want %d", explicit.ParallelReadBlockSize, int64(2<<20))
 	}
 }
 

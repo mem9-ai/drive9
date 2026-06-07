@@ -30,44 +30,46 @@ import (
 // its entire lifetime (Invariant #3). To change credentials, umount and
 // remount; there is no in-process rebind.
 type MountOptions struct {
-	Server                 string        // drive9 server URL
-	APIKey                 string        // owner API key (mutually exclusive with Token)
-	Token                  string        // delegated capability JWT (mutually exclusive with APIKey)
-	MountPoint             string        // local mount point
-	RemoteRoot             string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
-	CacheDir               string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
-	CacheSize              int64         // ReadCache max size in bytes (default 128MB)
-	ReadCacheMaxFileBytes  int64         // largest single file admitted to ReadCache (default 1MiB)
-	DiskReadCacheSize      int64         // disk-backed read cache max size in bytes (default 1GiB)
-	DiskReadCacheFreeRatio float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
-	DirTTL                 time.Duration // DirCache TTL (default 10s)
-	AttrTTL                time.Duration // kernel attr cache TTL (default 60s)
-	EntryTTL               time.Duration // kernel entry cache TTL (default 60s)
-	NegativeEntryTTL       time.Duration // kernel negative entry cache TTL (default 1s)
-	FlushDebounce          time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
-	SyncMode               SyncMode      // interactive, strict, or auto (default auto)
-	WritePolicy            WritePolicy   // writeback, close-sync, or write-sync (default writeback)
-	Profile                string        // mount profile: "interactive", "coding-agent", "" (default)
-	LocalRoot              string        // local-only overlay root for coding-agent mounts
-	LocalOnlyPatterns      []string      // additional local-only path patterns for coding-agent mounts
-	RemoteOnlyPatterns     []string      // remote-persistent override path patterns for coding-agent mounts
-	UploadConcurrency      int           // number of background upload workers (default 4)
-	ReadConcurrency        int           // maximum concurrent backend reads issued by FUSE (default 24)
-	SyncRead               bool          // disable kernel async read dispatch; at most one read in flight per file handle
-	LookupRetryCount       int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
-	LookupRetryTimeout     time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
-	LegacyDirStatFallback  bool          // on Lookup stat 404, list parent to support legacy servers without directory stat
-	ReadDirPrefetch        bool          // prefetch small files after readdir into ReadCache (default false)
-	PrefetchMaxFiles       int           // maximum files prefetched per directory read (default 32 when enabled)
-	PrefetchMaxFileBytes   int64         // maximum individual file size prefetched (default 50KB)
-	PrefetchMaxBytes       int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
-	PrefetchTimeout        time.Duration // timeout for one readdir prefetch batch (default 1s)
-	TrustLocalEvents       bool          // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
-	AllowOther             bool          // allow other users to access mount
-	ReadOnly               bool          // mount as read-only
-	Debug                  bool          // enable FUSE debug logging
-	PerfCounters           bool          // print low-overhead FUSE perf counter summary on shutdown
-	EnableGitWorkspaces    bool          // enable fast-clone git workspace overlay discovery
+	Server                  string        // drive9 server URL
+	APIKey                  string        // owner API key (mutually exclusive with Token)
+	Token                   string        // delegated capability JWT (mutually exclusive with APIKey)
+	MountPoint              string        // local mount point
+	RemoteRoot              string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
+	CacheDir                string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
+	CacheSize               int64         // ReadCache max size in bytes (default 128MB)
+	ReadCacheMaxFileBytes   int64         // largest single file admitted to ReadCache (default 1MiB)
+	DiskReadCacheSize       int64         // disk-backed read cache max size in bytes (default 1GiB)
+	DiskReadCacheFreeRatio  float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
+	DirTTL                  time.Duration // DirCache TTL (default 10s)
+	AttrTTL                 time.Duration // kernel attr cache TTL (default 60s)
+	EntryTTL                time.Duration // kernel entry cache TTL (default 60s)
+	NegativeEntryTTL        time.Duration // kernel negative entry cache TTL (default 1s)
+	FlushDebounce           time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
+	SyncMode                SyncMode      // interactive, strict, or auto (default auto)
+	WritePolicy             WritePolicy   // writeback, close-sync, or write-sync (default writeback)
+	Profile                 string        // mount profile: "interactive", "coding-agent", "" (default)
+	LocalRoot               string        // local-only overlay root for coding-agent mounts
+	LocalOnlyPatterns       []string      // additional local-only path patterns for coding-agent mounts
+	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for coding-agent mounts
+	UploadConcurrency       int           // number of background upload workers (default 4)
+	ReadConcurrency         int           // maximum concurrent backend reads issued by FUSE (default 24)
+	ParallelReadConcurrency int           // maximum concurrent block reads for one large FUSE read (default 4)
+	ParallelReadBlockSize   int64         // block size for parallel large-file reads in bytes (default 1MiB)
+	SyncRead                bool          // disable kernel async read dispatch; at most one read in flight per file handle
+	LookupRetryCount        int           // detached retries after transient Lookup/GetAttr stat failures (default 2)
+	LookupRetryTimeout      time.Duration // timeout per detached stat retry after interrupt/transient errors (default 250ms)
+	LegacyDirStatFallback   bool          // on Lookup stat 404, list parent to support legacy servers without directory stat
+	ReadDirPrefetch         bool          // prefetch small files after readdir into ReadCache (default false)
+	PrefetchMaxFiles        int           // maximum files prefetched per directory read (default 32 when enabled)
+	PrefetchMaxFileBytes    int64         // maximum individual file size prefetched (default 50KB)
+	PrefetchMaxBytes        int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
+	PrefetchTimeout         time.Duration // timeout for one readdir prefetch batch (default 1s)
+	TrustLocalEvents        bool          // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
+	AllowOther              bool          // allow other users to access mount
+	ReadOnly                bool          // mount as read-only
+	Debug                   bool          // enable FUSE debug logging
+	PerfCounters            bool          // print low-overhead FUSE perf counter summary on shutdown
+	EnableGitWorkspaces     bool          // enable fast-clone git workspace overlay discovery
 }
 
 const defaultUploadConcurrency = 16
@@ -111,6 +113,12 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.ReadConcurrency <= 0 {
 		o.ReadConcurrency = defaultRemoteReadConcurrency
+	}
+	if o.ParallelReadConcurrency <= 0 {
+		o.ParallelReadConcurrency = defaultParallelReadConcurrency
+	}
+	if o.ParallelReadBlockSize <= 0 {
+		o.ParallelReadBlockSize = defaultParallelReadBlockSize
 	}
 	if o.LookupRetryCount < 0 {
 		// Negative values are CLI-internal sentinels meaning retries were
@@ -562,6 +570,7 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 		MaxWrite:      128 * 1024,      // 128KB per write request (default 64KB)
 		MaxBackground: 32,              // concurrent background FUSE requests (default 12)
 		SyncRead:      opts.SyncRead,   // disables FUSE_CAP_ASYNC_READ; one read in flight per file handle
+		EnableLocks:   true,
 		Debug:         opts.Debug,
 		AllowOther:    opts.AllowOther,
 	}

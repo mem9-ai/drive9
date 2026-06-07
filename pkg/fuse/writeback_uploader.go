@@ -150,6 +150,13 @@ func (u *WriteBackUploader) Submit(localPath string) {
 	}
 }
 
+func (u *WriteBackUploader) directPutThreshold() int64 {
+	if u != nil && u.client != nil {
+		return u.client.CachedSmallFileThreshold()
+	}
+	return 0
+}
+
 // WaitPath blocks until any in-flight upload for localPath completes.
 // Returns immediately if no upload is in progress for this path.
 // This must be called by Rename/Unlink before operating on the local path
@@ -355,22 +362,27 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 // generation protection. Used by Fsync/Rename which require the data to be
 // persisted remotely before returning.
 func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) error {
+	_, err := u.UploadSyncWithRevision(ctx, localPath)
+	return err
+}
+
+func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPath string) (int64, error) {
 	// Wait for any in-flight background upload to complete first.
 	u.WaitPath(localPath)
 
 	meta, ok := u.cache.GetMeta(localPath)
 	if !ok {
-		return nil // not in cache (may have been uploaded by the background worker we just waited for)
+		return 0, nil // not in cache (may have been uploaded by the background worker we just waited for)
 	}
 	gen := meta.Generation
 
 	if meta.Kind == PendingChmod {
-		return u.applyPendingChmod(ctx, localPath, meta, gen, true)
+		return 0, u.applyPendingChmod(ctx, localPath, meta, gen, true)
 	}
 
 	data, ok := u.cache.getView(localPath)
 	if !ok {
-		return nil
+		return 0, nil
 	}
 
 	expectedRevision, err := expectedRevisionForWriteBack(meta)
@@ -382,12 +394,19 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 			log.Printf("writeback uploadsync: legacy overwrite without base revision for %s, falling back to unconditional write", localPath)
 			expectedRevision = -1
 		} else {
-			return fmt.Errorf("resolve expected revision for %s: %w", localPath, err)
+			return 0, fmt.Errorf("resolve expected revision for %s: %w", localPath, err)
 		}
 	}
 
+	var committedRev int64
 	uploadStart := time.Now()
-	err = uploadBufferedRemoteFile(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
+	threshold := u.directPutThreshold()
+	useDirectPUT := meta.Size == 0 || (threshold > 0 && meta.Size < threshold)
+	if useDirectPUT {
+		committedRev, err = u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, expectedRevision)
+	} else {
+		err = uploadBufferedRemoteFile(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
+	}
 	if u.perf != nil {
 		u.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(uploadStart), uint64(len(data)))
 	}
@@ -395,7 +414,7 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 		if u.perf != nil {
 			u.perf.uploaderFailure.add(1)
 		}
-		return err
+		return 0, err
 	}
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
 	err = u.applyMode(chmodCtx, meta)
@@ -405,9 +424,9 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 			u.perf.uploaderFailure.add(1)
 		}
 		if _, markErr := u.cache.MarkChmodPending(localPath, gen); markErr != nil {
-			return fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
+			return 0, fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
 		}
-		return err
+		return 0, err
 	}
 
 	// Only remove if generation matches — a concurrent Put() may have written newer data.
@@ -418,7 +437,7 @@ func (u *WriteBackUploader) UploadSync(ctx context.Context, localPath string) er
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
 	}
-	return nil
+	return committedRev, nil
 }
 
 func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath string, meta *WriteBackMeta, gen uint64, sync bool) error {

@@ -54,6 +54,9 @@ type FileHandle struct {
 // Lock acquires the file handle mutex.
 func (fh *FileHandle) Lock() { fh.mu.Lock() }
 
+// TryLock attempts to acquire the file handle mutex without blocking.
+func (fh *FileHandle) TryLock() bool { return fh.mu.TryLock() }
+
 // Unlock releases the file handle mutex.
 func (fh *FileHandle) Unlock() { fh.mu.Unlock() }
 

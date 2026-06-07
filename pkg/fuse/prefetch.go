@@ -28,9 +28,9 @@ type prefetchBlock struct {
 // Prefetcher detects sequential read patterns and prefetches upcoming data
 // blocks in the background, reducing HTTP round-trips for large file reads.
 //
-// Design: a single HTTP request fetches a large window of data. The result
-// is split into read-aligned chunks, each stored at its own offset key.
-// Get() uses exact-offset matching — no sub-block scanning needed.
+// Design: a prefetch window is split into bounded range requests. Fetched
+// ranges are then split into read-aligned chunks, each stored at its own
+// offset key. Get() uses exact-offset matching — no sub-block scanning needed.
 //
 // Concurrency: Prefetcher is fully self-synchronized via p.mu.
 // Callers do NOT need to hold any external lock.
@@ -43,21 +43,23 @@ type prefetchBlock struct {
 // Lifecycle: call Close() when the file handle is released to cancel
 // inflight prefetches and prevent goroutine leaks.
 type Prefetcher struct {
-	mu         sync.Mutex
-	nextExpect int64 // next expected offset (for sequential detection)
-	window     int64 // current prefetch window (adaptive)
-	readSize   int   // observed FUSE read size (for chunk splitting)
-	cache      map[int64]*prefetchBlock
-	inflight   map[int64]bool
-	client     *client.Client
-	target     *client.ReadTarget
-	path       atomic.Value
-	fileSize   int64
-	cancel     context.CancelFunc // cancels all inflight prefetch goroutines
-	ctx        context.Context    // parent context for prefetch goroutines
-	closed     bool
-	debug      bool
-	perf       *fusePerfCounters
+	mu               sync.Mutex
+	nextExpect       int64 // next expected offset (for sequential detection)
+	window           int64 // current prefetch window (adaptive)
+	readSize         int   // observed FUSE read size (for chunk splitting)
+	cache            map[int64]*prefetchBlock
+	inflight         map[int64]bool
+	client           *client.Client
+	target           *client.ReadTarget
+	fetchConcurrency int
+	fetchBlockSize   int64
+	path             atomic.Value
+	fileSize         int64
+	cancel           context.CancelFunc // cancels all inflight prefetch goroutines
+	ctx              context.Context    // parent context for prefetch goroutines
+	closed           bool
+	debug            bool
+	perf             *fusePerfCounters
 }
 
 // NewPrefetcher creates a Prefetcher for the given file.
@@ -68,18 +70,36 @@ func NewPrefetcher(c *client.Client, path string, fileSize int64, debug ...bool)
 		debugEnabled = debug[0]
 	}
 	p := &Prefetcher{
-		nextExpect: 0,
-		window:     prefetchMinWindow,
-		cache:      make(map[int64]*prefetchBlock),
-		inflight:   make(map[int64]bool),
-		client:     c,
-		fileSize:   fileSize,
-		ctx:        ctx,
-		cancel:     cancel,
-		debug:      debugEnabled,
+		nextExpect:       0,
+		window:           prefetchMinWindow,
+		cache:            make(map[int64]*prefetchBlock),
+		inflight:         make(map[int64]bool),
+		client:           c,
+		fetchConcurrency: defaultParallelReadConcurrency,
+		fetchBlockSize:   defaultParallelReadBlockSize,
+		fileSize:         fileSize,
+		ctx:              ctx,
+		cancel:           cancel,
+		debug:            debugEnabled,
 	}
 	p.path.Store(path)
 	return p
+}
+
+func (p *Prefetcher) SetParallelRead(concurrency int, blockSize int64) {
+	if p == nil {
+		return
+	}
+	if concurrency <= 0 {
+		concurrency = defaultParallelReadConcurrency
+	}
+	if blockSize <= 0 {
+		blockSize = defaultParallelReadBlockSize
+	}
+	p.mu.Lock()
+	p.fetchConcurrency = concurrency
+	p.fetchBlockSize = blockSize
+	p.mu.Unlock()
 }
 
 func (p *Prefetcher) SetPerfCounters(perf *fusePerfCounters) {
@@ -258,9 +278,9 @@ func (p *Prefetcher) Close() {
 	p.debugf("close path=%s cache=%d inflight=%d", p.pathString(), cacheLen, inflightLen)
 }
 
-// startPrefetch launches a background fetch. Caller must hold p.mu.
-// It fetches [offset, offset+length) in one HTTP request, then splits
-// the result into read-aligned chunks stored at their own offset keys.
+// startPrefetch launches background fetches. Caller must hold p.mu.
+// It fetches [offset, offset+length) as bounded parallel range requests,
+// then splits results into read-aligned chunks stored at their own offset keys.
 func (p *Prefetcher) startPrefetch(offset, length int64) {
 	if p.client == nil {
 		return // no client available (e.g., in tests)
@@ -324,11 +344,12 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 	p.inflight[offset] = true
 	fetchPath := p.pathString()
 	target := p.target
+	fetchConcurrency := p.fetchConcurrency
+	fetchBlockSize := alignPrefetchFetchBlockSize(p.fetchBlockSize, chunkSize)
 	p.debugf("start path=%s offset=%d length=%d chunk_size=%d chunks=%d window=%d", fetchPath, offset, length, chunkSize, nChunks, p.window)
 
 	ctx := p.ctx
 	go func() {
-		start := time.Now()
 		defer func() {
 			p.mu.Lock()
 			delete(p.inflight, offset)
@@ -336,57 +357,143 @@ func (p *Prefetcher) startPrefetch(offset, length int64) {
 			close(ready)
 		}()
 
-		var rc io.ReadCloser
-		var err error
-		if target != nil {
-			rc, err = p.client.ReadObjectRange(ctx, target, offset, length)
-			if client.IsPresignExpired(err) {
-				p.SetReadTarget(nil)
-				rc, err = p.client.ReadStreamRange(ctx, fetchPath, offset, length)
+		fetchCtx, fetchCancel := context.WithCancel(ctx)
+		defer fetchCancel()
+		fetches := prefetchFetchPlan(offset, length, fetchBlockSize)
+		workerCount := minInt(len(fetches), fetchConcurrency)
+		if workerCount <= 0 {
+			workerCount = 1
+		}
+		jobs := make(chan prefetchFetch)
+		go func() {
+			defer close(jobs)
+			for _, fetch := range fetches {
+				select {
+				case jobs <- fetch:
+				case <-fetchCtx.Done():
+					return
+				}
 			}
-		} else {
+		}()
+
+		var wg sync.WaitGroup
+		for range workerCount {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-fetchCtx.Done():
+						return
+					case fetch, ok := <-jobs:
+						if !ok {
+							return
+						}
+						start := time.Now()
+						data, err := p.fetchRange(fetchCtx, fetchPath, target, fetch.offset, fetch.length)
+						if p.perf != nil {
+							p.perf.recordRemoteOp(perfRemoteRead, err, time.Since(start), uint64(len(data)))
+						}
+						if err != nil {
+							p.markPrefetchBlocks(blocks, fetch, chunkSize, nil, err)
+							p.debugf("fetch error path=%s offset=%d length=%d dur=%s err=%v", fetchPath, fetch.offset, fetch.length, time.Since(start), err)
+							fetchCancel()
+							continue
+						}
+						p.markPrefetchBlocks(blocks, fetch, chunkSize, data, nil)
+						p.debugf("fetch done path=%s offset=%d length=%d got=%d dur=%s", fetchPath, fetch.offset, fetch.length, len(data), time.Since(start))
+					}
+				}
+			}()
+		}
+		wg.Wait()
+	}()
+}
+
+type prefetchFetch struct {
+	offset int64
+	length int64
+}
+
+func alignPrefetchFetchBlockSize(blockSize, chunkSize int64) int64 {
+	if chunkSize <= 0 {
+		return blockSize
+	}
+	if blockSize <= 0 {
+		return chunkSize
+	}
+	if blockSize < chunkSize {
+		return chunkSize
+	}
+	if rem := blockSize % chunkSize; rem != 0 {
+		blockSize += chunkSize - rem
+	}
+	return blockSize
+}
+
+func prefetchFetchPlan(offset, length, blockSize int64) []prefetchFetch {
+	if length <= 0 {
+		return nil
+	}
+	if blockSize <= 0 || blockSize > length {
+		blockSize = length
+	}
+	fetches := make([]prefetchFetch, 0, int((length+blockSize-1)/blockSize))
+	for fetchOffset := offset; fetchOffset < offset+length; fetchOffset += blockSize {
+		fetchLength := blockSize
+		if fetchOffset+fetchLength > offset+length {
+			fetchLength = offset + length - fetchOffset
+		}
+		fetches = append(fetches, prefetchFetch{offset: fetchOffset, length: fetchLength})
+	}
+	return fetches
+}
+
+func (p *Prefetcher) fetchRange(ctx context.Context, fetchPath string, target *client.ReadTarget, offset, length int64) ([]byte, error) {
+	var rc io.ReadCloser
+	var err error
+	if target != nil {
+		rc, err = p.client.ReadObjectRange(ctx, target, offset, length)
+		if client.IsPresignExpired(err) {
+			p.SetReadTarget(nil)
 			rc, err = p.client.ReadStreamRange(ctx, fetchPath, offset, length)
 		}
-		if err != nil {
-			if p.perf != nil {
-				p.perf.recordRemoteOp(perfRemoteRead, err, time.Since(start), 0)
-			}
-			for _, b := range blocks {
-				b.err = err
-			}
-			p.debugf("fetch open error path=%s offset=%d length=%d dur=%s err=%v", fetchPath, offset, length, time.Since(start), err)
-			return
-		}
-		defer func() { _ = rc.Close() }()
+	} else {
+		rc, err = p.client.ReadStreamRange(ctx, fetchPath, offset, length)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+	return io.ReadAll(rc)
+}
 
-		data, err := io.ReadAll(rc)
-		if p.perf != nil {
-			p.perf.recordRemoteOp(perfRemoteRead, err, time.Since(start), uint64(len(data)))
+func (p *Prefetcher) markPrefetchBlocks(blocks []*prefetchBlock, fetch prefetchFetch, chunkSize int64, data []byte, err error) {
+	fetchEnd := fetch.offset + fetch.length
+	for _, b := range blocks {
+		if b.offset < fetch.offset || b.offset >= fetchEnd {
+			continue
 		}
 		if err != nil {
-			for _, b := range blocks {
-				b.err = err
-			}
-			p.debugf("fetch read error path=%s offset=%d length=%d got=%d dur=%s err=%v", fetchPath, offset, length, len(data), time.Since(start), err)
-			return
+			b.err = err
+			continue
 		}
-
-		// Split data into chunks.
-		for i, b := range blocks {
-			start := int64(i) * chunkSize
-			end := start + chunkSize
-			if end > int64(len(data)) {
-				end = int64(len(data))
-			}
-			if start >= int64(len(data)) {
-				b.err = io.ErrUnexpectedEOF
-				continue
-			}
-			// Copy to give each chunk its own backing array.
-			chunk := make([]byte, end-start)
-			copy(chunk, data[start:end])
-			b.data = chunk
+		start := b.offset - fetch.offset
+		expected := chunkSize
+		if p.fileSize > 0 && b.offset+expected > p.fileSize {
+			expected = p.fileSize - b.offset
 		}
-		p.debugf("fetch done path=%s offset=%d length=%d got=%d chunks=%d dur=%s", fetchPath, offset, length, len(data), nChunks, time.Since(start))
-	}()
+		if expected <= 0 {
+			b.err = io.ErrUnexpectedEOF
+			continue
+		}
+		end := start + expected
+		if start >= int64(len(data)) || end > int64(len(data)) {
+			b.err = io.ErrUnexpectedEOF
+			continue
+		}
+		chunk := make([]byte, end-start)
+		copy(chunk, data[start:end])
+		b.data = chunk
+	}
 }
