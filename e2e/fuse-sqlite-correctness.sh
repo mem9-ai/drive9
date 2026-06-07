@@ -4,8 +4,9 @@
 # This script mounts a fresh writable namespace through real FUSE, runs SQLite
 # workloads in rollback-journal mode by default, verifies PRAGMA integrity_check,
 # unmounts/remounts, and verifies the remote snapshot. Set RUN_FUSE_SQLITE_WAL=1
-# to add the current WAL detector. It intentionally avoids concurrent
-# readers/writers, performance baselines, and crash/recovery checks; those are
+# to add the WAL detector, RUN_FUSE_SQLITE_CHURN=1 to add repeated large DB
+# rewrites, and RUN_FUSE_SQLITE_CONCURRENCY=1 to add a bounded WAL
+# readers/writer detector. Performance baselines and crash/recovery checks are
 # separate workload classes.
 
 set -euo pipefail
@@ -21,7 +22,14 @@ FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 FUSE_SQLITE_KEEP_ARTIFACTS="${FUSE_SQLITE_KEEP_ARTIFACTS:-0}"
 FUSE_SQLITE_ROWS="${FUSE_SQLITE_ROWS:-64}"
+FUSE_SQLITE_CHURN_ROUNDS="${FUSE_SQLITE_CHURN_ROUNDS:-4}"
+FUSE_SQLITE_CONCURRENCY_READERS="${FUSE_SQLITE_CONCURRENCY_READERS:-4}"
+FUSE_SQLITE_CONCURRENCY_WRITES="${FUSE_SQLITE_CONCURRENCY_WRITES:-40}"
+FUSE_SQLITE_WORKLOAD_TIMEOUT_S="${FUSE_SQLITE_WORKLOAD_TIMEOUT_S:-240}"
+FUSE_SQLITE_MOUNT_DEBUG="${FUSE_SQLITE_MOUNT_DEBUG:-0}"
 RUN_FUSE_SQLITE_WAL="${RUN_FUSE_SQLITE_WAL:-0}"
+RUN_FUSE_SQLITE_CHURN="${RUN_FUSE_SQLITE_CHURN:-0}"
+RUN_FUSE_SQLITE_CONCURRENCY="${RUN_FUSE_SQLITE_CONCURRENCY:-0}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
 CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
@@ -192,11 +200,17 @@ wait_mount_state() {
 }
 
 start_mount() {
+  local mount_args=(mount)
+  if [ "$FUSE_SQLITE_MOUNT_DEBUG" = "1" ]; then
+    mount_args+=(--debug)
+  fi
+  mount_args+=("$MOUNT_POINT")
   {
     echo "=== drive9 sqlite mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
     echo "root_remote=$ROOT_REMOTE"
+    echo "mount_args=${mount_args[*]}"
   } >>"$MOUNT_LOG"
-  drive9 mount "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+  drive9 "${mount_args[@]}" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
 
   if wait_mount_state mounted; then
@@ -300,24 +314,59 @@ drive9_retry() {
 }
 
 run_sqlite_workload() {
-  python3 - "$WORK_MOUNT" "$EXPECTED_JSON" "$FUSE_SQLITE_ROWS" "$RUN_FUSE_SQLITE_WAL" <<'PY'
+  local timeout_cmd=()
+  if [ "$FUSE_SQLITE_WORKLOAD_TIMEOUT_S" != "0" ] && command -v timeout >/dev/null 2>&1; then
+    timeout_cmd=(timeout --kill-after=10s "${FUSE_SQLITE_WORKLOAD_TIMEOUT_S}s")
+  fi
+  "${timeout_cmd[@]}" python3 - "$WORK_MOUNT" "$EXPECTED_JSON" "$FUSE_SQLITE_ROWS" "$RUN_FUSE_SQLITE_WAL" "$RUN_FUSE_SQLITE_CHURN" "$FUSE_SQLITE_CHURN_ROUNDS" "$RUN_FUSE_SQLITE_CONCURRENCY" "$FUSE_SQLITE_CONCURRENCY_READERS" "$FUSE_SQLITE_CONCURRENCY_WRITES" <<'PY'
 import hashlib
 import json
 import os
 import shutil
 import sqlite3
 import sys
+import threading
+import time
 
 root = os.path.abspath(sys.argv[1])
 expected_path = sys.argv[2]
 rows = int(sys.argv[3])
 run_wal = sys.argv[4] == "1"
+run_churn = sys.argv[5] == "1"
+churn_rounds = int(sys.argv[6])
+run_concurrency = sys.argv[7] == "1"
+concurrency_readers = int(sys.argv[8])
+concurrency_writes = int(sys.argv[9])
+workload_timeout_s = int(os.environ.get("FUSE_SQLITE_WORKLOAD_TIMEOUT_S", "240"))
+
+
+def log(message):
+    print(f"[sqlite-workload] {message}", file=sys.stderr, flush=True)
+
+
+def timeout_exit():
+    log(f"timeout after {workload_timeout_s}s")
+    os._exit(124)
+
+
+if workload_timeout_s > 0:
+    watchdog = threading.Timer(workload_timeout_s, timeout_exit)
+    watchdog.daemon = True
+    watchdog.start()
 
 
 def payload(kind, index):
     seed = f"drive9-sqlite kind={kind} index={index}\n".encode()
     body = bytearray()
     for counter in range(8):
+        body.extend(hashlib.sha256(seed + counter.to_bytes(4, "big")).digest())
+    return bytes(body)
+
+
+def large_payload(kind, index, round_no):
+    seed = f"drive9-sqlite-large kind={kind} index={index} round={round_no}\n".encode()
+    body = bytearray()
+    for counter in range(128):
         body.extend(hashlib.sha256(seed + counter.to_bytes(4, "big")).digest())
     return bytes(body)
 
@@ -338,22 +387,32 @@ def scalar(conn, sql, params=()):
     return conn.execute(sql, params).fetchone()[0]
 
 
+def fingerprint_items(conn):
+    rows = list(conn.execute("SELECT id, checksum, payload FROM items ORDER BY id"))
+    digest = hashlib.sha256()
+    payload_bytes = 0
+    for item_id, item_checksum, item_payload in rows:
+        actual_checksum = checksum(item_payload)
+        if actual_checksum != item_checksum:
+            raise AssertionError(
+                f"payload checksum mismatch row={item_id} stored={item_checksum} actual={actual_checksum}"
+            )
+        digest.update(actual_checksum.encode())
+        digest.update(b"\n")
+        payload_bytes += len(item_payload)
+    return len(rows), payload_bytes, digest.hexdigest()
+
+
 def fingerprint(conn):
     integrity = scalar(conn, "PRAGMA integrity_check")
     if integrity != "ok":
         raise AssertionError(f"integrity_check={integrity}")
-    rows = list(conn.execute("SELECT checksum, LENGTH(payload) FROM items ORDER BY id"))
-    digest = hashlib.sha256()
-    payload_bytes = 0
-    for item_checksum, item_size in rows:
-        digest.update(item_checksum.encode())
-        digest.update(b"\n")
-        payload_bytes += item_size
+    row_count, payload_bytes, checksums_digest = fingerprint_items(conn)
     rolled_back = scalar(conn, "SELECT COUNT(*) FROM items WHERE bucket='rolled_back'")
     return {
-        "count": len(rows),
+        "count": row_count,
         "payload_bytes": payload_bytes,
-        "checksums_digest": digest.hexdigest(),
+        "checksums_digest": checksums_digest,
         "rolled_back_rows": rolled_back,
     }
 
@@ -361,7 +420,7 @@ def fingerprint(conn):
 def create_schema(conn):
     conn.execute(
         "CREATE TABLE IF NOT EXISTS items "
-        "(id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, payload BLOB NOT NULL, checksum TEXT NOT NULL)"
+        "(id INTEGER PRIMARY KEY, bucket TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0, payload BLOB NOT NULL, checksum TEXT NOT NULL)"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_items_bucket ON items(bucket)")
 
@@ -379,14 +438,14 @@ def build_wal_db(path):
         for index in range(rows):
             data = payload("wal-insert", index)
             conn.execute(
-                "INSERT INTO items(id, bucket, payload, checksum) VALUES (?, ?, ?, ?)",
-                (index + 1, "wal", data, checksum(data)),
+                "INSERT INTO items(id, bucket, version, payload, checksum) VALUES (?, ?, ?, ?, ?)",
+                (index + 1, "wal", 1, data, checksum(data)),
             )
     with conn:
         for index in range(0, rows, 3):
             data = payload("wal-update", index)
             conn.execute(
-                "UPDATE items SET bucket=?, payload=?, checksum=? WHERE id=?",
+                "UPDATE items SET bucket=?, version=version+1, payload=?, checksum=? WHERE id=?",
                 ("wal-updated", data, checksum(data), index + 1),
             )
     expected = fingerprint(conn)
@@ -407,21 +466,21 @@ def build_rollback_db(path):
         for index in range(rows):
             data = payload("rollback-insert", index)
             conn.execute(
-                "INSERT INTO items(id, bucket, payload, checksum) VALUES (?, ?, ?, ?)",
-                (index + 1, "rollback", data, checksum(data)),
+                "INSERT INTO items(id, bucket, version, payload, checksum) VALUES (?, ?, ?, ?, ?)",
+                (index + 1, "rollback", 1, data, checksum(data)),
             )
     conn.execute("BEGIN IMMEDIATE")
     data = payload("rolled-back", 0)
     conn.execute(
-        "INSERT INTO items(id, bucket, payload, checksum) VALUES (?, ?, ?, ?)",
-        (rows + 1, "rolled_back", data, checksum(data)),
+        "INSERT INTO items(id, bucket, version, payload, checksum) VALUES (?, ?, ?, ?, ?)",
+        (rows + 1, "rolled_back", 1, data, checksum(data)),
     )
     conn.rollback()
     with conn:
         for index in range(1, rows, 4):
             data = payload("rollback-update", index)
             conn.execute(
-                "UPDATE items SET bucket=?, payload=?, checksum=? WHERE id=?",
+                "UPDATE items SET bucket=?, version=version+1, payload=?, checksum=? WHERE id=?",
                 ("rollback-updated", data, checksum(data), index + 1),
             )
     expected = fingerprint(conn)
@@ -430,13 +489,222 @@ def build_rollback_db(path):
     return expected
 
 
+def build_churn_db(path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = connect(path)
+    journal = scalar(conn, "PRAGMA journal_mode=DELETE").lower()
+    if journal != "delete":
+        raise AssertionError(f"churn journal_mode={journal}")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+    create_schema(conn)
+    churn_rows = max(rows, 32)
+    with conn:
+        for index in range(churn_rows):
+            data = large_payload("churn-insert", index, 0)
+            conn.execute(
+                "INSERT INTO items(id, bucket, version, payload, checksum) VALUES (?, ?, ?, ?, ?)",
+                (index + 1, "churn", 0, data, checksum(data)),
+            )
+    for round_no in range(1, churn_rounds + 1):
+        with conn:
+            for index in range(churn_rows):
+                data = large_payload("churn-update", index, round_no)
+                conn.execute(
+                    "UPDATE items SET bucket=?, version=?, payload=?, checksum=? WHERE id=?",
+                    (f"churn-round-{round_no}", round_no, data, checksum(data), index + 1),
+                )
+        conn.execute("PRAGMA incremental_vacuum")
+    expected = fingerprint(conn)
+    expected["journal_mode"] = journal
+    expected["churn_rounds"] = churn_rounds
+    conn.close()
+    return expected
+
+
+def build_concurrent_db(path):
+    log("concurrency: setup start")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn = connect(path)
+    journal = scalar(conn, "PRAGMA journal_mode=WAL").lower()
+    if journal != "wal":
+        raise AssertionError(f"concurrency journal_mode={journal}")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA wal_autocheckpoint=0")
+    create_schema(conn)
+    conn.execute("CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL, version INTEGER NOT NULL, checksum TEXT NOT NULL)")
+    item_count = max(8, min(rows, 32))
+    with conn:
+        for index in range(item_count):
+            data = payload("concurrent-seed", index)
+            conn.execute(
+                "INSERT INTO items(id, bucket, version, payload, checksum) VALUES (?, ?, ?, ?, ?)",
+                (index + 1, "concurrent", 0, data, checksum(data)),
+            )
+    conn.close()
+
+    done = threading.Event()
+    lock = threading.Lock()
+    errors = []
+    observations = [0 for _ in range(concurrency_readers)]
+    phase = {"writer": "starting"}
+
+    def set_phase(value):
+        with lock:
+            phase["writer"] = value
+
+    def sqlite_error_detail(exc):
+        parts = []
+        code = getattr(exc, "sqlite_errorcode", None)
+        name = getattr(exc, "sqlite_errorname", None)
+        if code is not None:
+            parts.append(f"sqlite_errorcode={code}")
+        if name is not None:
+            parts.append(f"sqlite_errorname={name}")
+        return " ".join(parts)
+
+    def record_error(label, exc, *, sql=None, loop=None):
+        with lock:
+            detail = sqlite_error_detail(exc)
+            context = [f"writer_phase={phase['writer']}"]
+            if loop is not None:
+                context.append(f"loop={loop}")
+            if sql is not None:
+                context.append(f"sql={sql!r}")
+            if detail:
+                context.append(detail)
+            errors.append(f"{label}: {exc!r} ({', '.join(context)})")
+
+    def stop_readers():
+        done.set()
+        alive = []
+        for index, thread in enumerate(threads):
+            thread.join(timeout=5)
+            if thread.is_alive():
+                alive.append(index)
+        if alive:
+            raise AssertionError(f"reader threads did not stop: {alive}")
+
+    def reader(reader_id):
+        loop_no = 0
+        sql = None
+        try:
+            rconn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
+            sql = "PRAGMA busy_timeout=30000"
+            rconn.execute(sql)
+            sql = "PRAGMA mmap_size=0"
+            rconn.execute(sql)
+            sql = "PRAGMA query_only=ON"
+            rconn.execute(sql)
+            while not done.is_set():
+                loop_no += 1
+                sql = "SELECT COUNT(*), COALESCE(MAX(version), 0) FROM items"
+                count, max_version = rconn.execute(sql).fetchone()
+                if count != item_count:
+                    raise AssertionError(f"reader {reader_id}: count={count} want={item_count}")
+                if max_version < 0:
+                    raise AssertionError(f"reader {reader_id}: negative max_version={max_version}")
+                observations[reader_id] += 1
+                time.sleep(0.002)
+            rconn.close()
+        except Exception as exc:  # noqa: BLE001 - surfaced into shell failure
+            record_error(f"reader-{reader_id}", exc, sql=sql, loop=loop_no)
+
+    threads = [threading.Thread(target=reader, args=(reader_id,), daemon=True) for reader_id in range(concurrency_readers)]
+    for thread in threads:
+        thread.start()
+    log(f"concurrency: started {len(threads)} readers")
+
+    wconn = None
+    readers_stopped = False
+    try:
+        set_phase("writer connect")
+        wconn = sqlite3.connect(path, timeout=30.0, isolation_level=None)
+        set_phase("writer pragmas")
+        wconn.execute("PRAGMA busy_timeout=30000")
+        wconn.execute("PRAGMA mmap_size=0")
+        for write_no in range(1, concurrency_writes + 1):
+            set_phase(f"writer transaction {write_no}/{concurrency_writes}")
+            item_id = ((write_no - 1) % item_count) + 1
+            data = payload("concurrent-write", write_no)
+            digest = checksum(data)
+            wconn.execute("BEGIN IMMEDIATE")
+            wconn.execute(
+                "UPDATE items SET bucket=?, version=?, payload=?, checksum=? WHERE id=?",
+                ("concurrent-updated", write_no, data, digest, item_id),
+            )
+            wconn.execute(
+                "INSERT INTO events(item_id, version, checksum) VALUES (?, ?, ?)",
+                (item_id, write_no, digest),
+            )
+            wconn.execute("COMMIT")
+            if write_no == 1 or write_no == concurrency_writes or write_no % 10 == 0:
+                log(f"concurrency: committed {write_no}/{concurrency_writes}")
+            time.sleep(0.003)
+        set_phase("writer integrity_check")
+        log("concurrency: writer integrity_check start")
+        integrity = scalar(wconn, "PRAGMA integrity_check")
+        if integrity != "ok":
+            raise AssertionError(f"concurrent writer integrity_check={integrity}")
+        set_phase("stopping readers")
+        log("concurrency: stopping readers before checkpoint")
+        stop_readers()
+        readers_stopped = True
+        set_phase("checkpoint truncate")
+        log("concurrency: checkpoint truncate start")
+        checkpoint = wconn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if checkpoint is None or checkpoint[0] not in (0, 1):
+            raise AssertionError(f"unexpected wal checkpoint result={checkpoint}")
+        set_phase("closing writer")
+        wconn.close()
+        wconn = None
+    except Exception as exc:  # noqa: BLE001 - surfaced into shell failure
+        record_error("writer", exc)
+    finally:
+        if not readers_stopped:
+            try:
+                stop_readers()
+            except Exception as exc:  # noqa: BLE001 - surfaced into shell failure
+                record_error("readers", exc)
+        if wconn is not None:
+            wconn.close()
+
+    if errors:
+        raise AssertionError("; ".join(errors))
+    if concurrency_readers > 0 and min(observations) == 0:
+        raise AssertionError(f"reader observations too low: {observations}")
+
+    log("concurrency: final fingerprint start")
+    conn = connect(path)
+    event_count = scalar(conn, "SELECT COUNT(*) FROM events")
+    if event_count != concurrency_writes:
+        raise AssertionError(f"event_count={event_count} want={concurrency_writes}")
+    expected = fingerprint(conn)
+    expected["journal_mode"] = journal
+    expected["writer_events"] = event_count
+    expected["reader_observations_min"] = min(observations) if observations else 0
+    conn.close()
+    return expected
+
+
 shutil.rmtree(root, ignore_errors=True)
 os.makedirs(root, exist_ok=True)
-expected = {
-    "rollback": build_rollback_db(os.path.join(root, "rollback", "workload.db")),
-}
+expected = {}
+log("rollback: start")
+expected["rollback"] = build_rollback_db(os.path.join(root, "rollback", "workload.db"))
+log("rollback: done")
 if run_wal:
+    log("wal: start")
     expected["wal"] = build_wal_db(os.path.join(root, "wal", "workload.db"))
+    log("wal: done")
+if run_churn:
+    log("churn: start")
+    expected["churn"] = build_churn_db(os.path.join(root, "churn", "workload.db"))
+    log("churn: done")
+if run_concurrency:
+    log("concurrency: start")
+    expected["concurrency"] = build_concurrent_db(os.path.join(root, "concurrency", "workload.db"))
+    log("concurrency: done")
 with open(expected_path, "w", encoding="utf-8") as handle:
     json.dump(expected, handle, indent=2, sort_keys=True)
     handle.write("\n")
@@ -472,9 +740,26 @@ def scalar(conn, sql, params=()):
     return conn.execute(sql, params).fetchone()[0]
 
 
-def fingerprint(path, expected_journal):
+def fingerprint_items(conn, path):
+    rows = list(conn.execute("SELECT id, checksum, payload FROM items ORDER BY id"))
+    digest = hashlib.sha256()
+    payload_bytes = 0
+    for item_id, item_checksum, item_payload in rows:
+        actual_checksum = hashlib.sha256(item_payload).hexdigest()
+        if actual_checksum != item_checksum:
+            raise AssertionError(
+                f"{path}: payload checksum mismatch row={item_id} stored={item_checksum} actual={actual_checksum}"
+            )
+        digest.update(actual_checksum.encode())
+        digest.update(b"\n")
+        payload_bytes += len(item_payload)
+    return len(rows), payload_bytes, digest.hexdigest()
+
+
+def fingerprint(path, expected_case):
     if not os.path.exists(path):
         raise AssertionError(f"missing sqlite db: {path}")
+    expected_journal = expected_case["journal_mode"]
     conn = connect(path)
     integrity = scalar(conn, "PRAGMA integrity_check")
     if integrity != "ok":
@@ -482,27 +767,28 @@ def fingerprint(path, expected_journal):
     journal = scalar(conn, "PRAGMA journal_mode").lower()
     if journal != expected_journal:
         raise AssertionError(f"{path}: journal_mode={journal} want={expected_journal}")
-    rows = list(conn.execute("SELECT checksum, LENGTH(payload) FROM items ORDER BY id"))
-    digest = hashlib.sha256()
-    payload_bytes = 0
-    for item_checksum, item_size in rows:
-        digest.update(item_checksum.encode())
-        digest.update(b"\n")
-        payload_bytes += item_size
+    row_count, payload_bytes, checksums_digest = fingerprint_items(conn, path)
     rolled_back = scalar(conn, "SELECT COUNT(*) FROM items WHERE bucket='rolled_back'")
-    conn.close()
-    return {
-        "count": len(rows),
+    out = {
+        "count": row_count,
         "payload_bytes": payload_bytes,
-        "checksums_digest": digest.hexdigest(),
+        "checksums_digest": checksums_digest,
         "rolled_back_rows": rolled_back,
         "journal_mode": journal,
     }
+    if "churn_rounds" in expected_case:
+        out["churn_rounds"] = expected_case["churn_rounds"]
+    if "writer_events" in expected_case:
+        event_count = scalar(conn, "SELECT COUNT(*) FROM events")
+        out["writer_events"] = event_count
+        out["reader_observations_min"] = expected_case["reader_observations_min"]
+    conn.close()
+    return out
 
 with open(expected_path, encoding="utf-8") as handle:
     expected = json.load(handle)
 actual = {
-    name: fingerprint(os.path.join(root, name, "workload.db"), want["journal_mode"])
+    name: fingerprint(os.path.join(root, name, "workload.db"), want)
     for name, want in sorted(expected.items())
 }
 with open(actual_path, "w", encoding="utf-8") as handle:
@@ -512,6 +798,33 @@ if actual != expected:
     print("sqlite fingerprint mismatch", file=sys.stderr)
     print("expected=", json.dumps(expected, indent=2, sort_keys=True), file=sys.stderr)
     print("actual=", json.dumps(actual, indent=2, sort_keys=True), file=sys.stderr)
+    raise SystemExit(1)
+PY
+  then
+    echo "PASS $desc"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL $desc"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_no_sqlite_shm_files() {
+  local desc="$1"
+  local root="$2"
+  TOTAL=$((TOTAL + 1))
+  if python3 - "$root" <<'PY'
+import os
+import sys
+
+root = os.path.abspath(sys.argv[1])
+matches = []
+for dirpath, _, filenames in os.walk(root):
+    for name in filenames:
+        if name.endswith("-shm"):
+            matches.append(os.path.relpath(os.path.join(dirpath, name), root))
+if matches:
+    print("remote snapshot contains transient SQLite shm files:", ", ".join(sorted(matches)), file=sys.stderr)
     raise SystemExit(1)
 PY
   then
@@ -536,7 +849,44 @@ echo "BASE=$BASE"
 echo "CLI_SOURCE=$CLI_SOURCE"
 echo "FUSE_STRICT_PREREQS=$FUSE_STRICT_PREREQS"
 echo "FUSE_SQLITE_ROWS=$FUSE_SQLITE_ROWS"
+echo "FUSE_SQLITE_CHURN_ROUNDS=$FUSE_SQLITE_CHURN_ROUNDS"
+echo "FUSE_SQLITE_CONCURRENCY_READERS=$FUSE_SQLITE_CONCURRENCY_READERS"
+echo "FUSE_SQLITE_CONCURRENCY_WRITES=$FUSE_SQLITE_CONCURRENCY_WRITES"
+echo "FUSE_SQLITE_WORKLOAD_TIMEOUT_S=$FUSE_SQLITE_WORKLOAD_TIMEOUT_S"
 echo "RUN_FUSE_SQLITE_WAL=$RUN_FUSE_SQLITE_WAL"
+echo "RUN_FUSE_SQLITE_CHURN=$RUN_FUSE_SQLITE_CHURN"
+echo "RUN_FUSE_SQLITE_CONCURRENCY=$RUN_FUSE_SQLITE_CONCURRENCY"
+
+if ! [[ "$FUSE_SQLITE_ROWS" =~ ^[0-9]+$ ]] || [ "$FUSE_SQLITE_ROWS" -lt 4 ]; then
+  echo "invalid FUSE_SQLITE_ROWS: must be >= 4" >&2
+  exit 1
+fi
+if ! [[ "$FUSE_SQLITE_CHURN_ROUNDS" =~ ^[0-9]+$ ]] || [ "$FUSE_SQLITE_CHURN_ROUNDS" -lt 1 ]; then
+  echo "invalid FUSE_SQLITE_CHURN_ROUNDS: must be >= 1" >&2
+  exit 1
+fi
+if ! [[ "$FUSE_SQLITE_CONCURRENCY_READERS" =~ ^[0-9]+$ ]] || [ "$FUSE_SQLITE_CONCURRENCY_READERS" -lt 1 ]; then
+  echo "invalid FUSE_SQLITE_CONCURRENCY_READERS: must be >= 1" >&2
+  exit 1
+fi
+if ! [[ "$FUSE_SQLITE_CONCURRENCY_WRITES" =~ ^[0-9]+$ ]] || [ "$FUSE_SQLITE_CONCURRENCY_WRITES" -lt 1 ]; then
+  echo "invalid FUSE_SQLITE_CONCURRENCY_WRITES: must be >= 1" >&2
+  exit 1
+fi
+if ! [[ "$FUSE_SQLITE_WORKLOAD_TIMEOUT_S" =~ ^[0-9]+$ ]]; then
+  echo "invalid FUSE_SQLITE_WORKLOAD_TIMEOUT_S: must be >= 0" >&2
+  exit 1
+fi
+for flag_name in RUN_FUSE_SQLITE_WAL RUN_FUSE_SQLITE_CHURN RUN_FUSE_SQLITE_CONCURRENCY; do
+  flag_value="${!flag_name}"
+  case "$flag_value" in
+    0|1) ;;
+    *)
+      echo "invalid $flag_name: expected 0 or 1" >&2
+      exit 1
+      ;;
+  esac
+done
 
 require_cmd curl
 require_cmd jq
@@ -558,18 +908,6 @@ if [ "$(uname -s)" = "Linux" ]; then
     skip_or_fail "/dev/fuse not available"
   fi
 fi
-
-if ! [[ "$FUSE_SQLITE_ROWS" =~ ^[0-9]+$ ]] || [ "$FUSE_SQLITE_ROWS" -lt 4 ]; then
-  echo "invalid FUSE_SQLITE_ROWS: must be >= 4" >&2
-  exit 1
-fi
-case "$RUN_FUSE_SQLITE_WAL" in
-  0|1) ;;
-  *)
-    echo "invalid RUN_FUSE_SQLITE_WAL: expected 0 or 1" >&2
-    exit 1
-    ;;
-esac
 
 echo "[1] provision tenant"
 if [ -n "$DRIVE9_API_KEY" ]; then
@@ -641,6 +979,10 @@ cleanup() {
   else
     echo "Artifacts preserved at $RUN_ROOT"
     echo "Mount log: $MOUNT_LOG"
+    if [ "$FUSE_SQLITE_MOUNT_DEBUG" = "1" ] && [ -f "$MOUNT_LOG" ]; then
+      echo "=== mount log tail ==="
+      tail -n 3000 "$MOUNT_LOG" || true
+    fi
     echo "Expected SQLite manifest: $EXPECTED_JSON"
     echo "Mounted SQLite manifest: $ACTUAL_MOUNT_JSON"
     echo "Remounted SQLite manifest: $ACTUAL_REMOUNT_JSON"
@@ -702,6 +1044,7 @@ if is_mounted "$MOUNT_POINT"; then
         drive9_retry fs cp -r ":$WORK_REMOTE" "$REMOTE_SNAPSHOT" >/dev/null
         REMOTE_WORK_SNAPSHOT="$(remote_snapshot_root)"
         verify_sqlite_tree "remote SQLite snapshot integrity_check and logical fingerprint match" "$REMOTE_WORK_SNAPSHOT" "$ACTUAL_REMOTE_JSON"
+        assert_no_sqlite_shm_files "remote SQLite snapshot excludes transient shm sidecars" "$REMOTE_WORK_SNAPSHOT"
       else
         check_eq "unmount SQLite remount" "false" "true"
       fi

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
@@ -148,6 +149,77 @@ func TestLayerSymlinkReadlinkUsesLayerTarget(t *testing.T) {
 	}
 }
 
+func TestLayerChmodPreservesSymlinkModeAcrossRelistLookupReadlink(t *testing.T) {
+	var got clientLayerEntryRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode layer entry: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+			LayerID: "layer-1",
+			Path:    got.Path,
+			Op:      got.Op,
+			Kind:    got.Kind,
+			Mode:    got.Mode,
+		})
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	fs.markLayerSymlink("/link", "target.txt", symlinkMode())
+
+	if err := fs.upsertLayerChmod(context.Background(), "/link", 0o600); err != nil {
+		t.Fatalf("upsertLayerChmod: %v", err)
+	}
+	if got.Path != "/repo/link" || got.Op != "chmod" || got.Kind != "symlink" || got.Mode != 0o600 {
+		t.Fatalf("chmod request = %+v, want symlink chmod", got)
+	}
+	target, mode, ok := fs.layerSymlink("/link")
+	if !ok || target != "target.txt" {
+		t.Fatalf("layer symlink = (%q, %t), want target.txt true", target, ok)
+	}
+	if mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFLNK) {
+		t.Fatalf("layer symlink mode type = %#o, want S_IFLNK", mode&uint32(syscall.S_IFMT))
+	}
+	if mode&0o777 != 0o600 {
+		t.Fatalf("layer symlink mode perms = %#o, want 0600", mode&0o777)
+	}
+
+	entries := fs.mergeLayerNamespaceEntries("/", nil)
+	if len(entries) != 1 || entries[0].Name != "link" {
+		t.Fatalf("merged entries = %+v, want single link entry", entries)
+	}
+	if entries[0].Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFLNK) {
+		t.Fatalf("merged link type = %#o, want S_IFLNK", entries[0].Mode&uint32(syscall.S_IFMT))
+	}
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "link", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if out.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFLNK) {
+		t.Fatalf("Lookup mode type = %#o, want S_IFLNK", out.Mode&uint32(syscall.S_IFMT))
+	}
+	gotTarget, st := fs.Readlink(nil, &gofuse.InHeader{NodeId: out.NodeId})
+	if st != gofuse.OK {
+		t.Fatalf("Readlink status = %v, want OK", st)
+	}
+	if !bytes.Equal(gotTarget, []byte("target.txt")) {
+		t.Fatalf("Readlink target = %q, want target.txt", gotTarget)
+	}
+}
+
 func TestLayerChmodUsesDirectoryKind(t *testing.T) {
 	var got clientLayerEntryRequest
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -244,6 +316,30 @@ func TestLayerRmdirRejectsOverlayOnlyChildren(t *testing.T) {
 	}
 	if !pending.HasPending("/dir/file.txt") {
 		t.Fatal("pending child was removed despite failed rmdir")
+	}
+}
+
+func TestLayerRmdirRejectsOpenHandleChild(t *testing.T) {
+	fs := NewDat9FS(client.New("http://127.0.0.1", ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	fs.inodes.Lookup("/dir", true, 0, time.Now())
+	childIno := fs.inodes.Lookup("/dir/file.txt", false, 0, time.Now())
+	fhID := fs.fileHandles.Allocate(&FileHandle{
+		Ino:   childIno,
+		Path:  "/dir/file.txt",
+		Dirty: fs.newWriteBuffer("/dir/file.txt", maxPreloadSize, 0),
+		IsNew: true,
+	})
+	defer fs.fileHandles.Delete(fhID)
+
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.Status(syscall.ENOTEMPTY) {
+		t.Fatalf("Rmdir status = %v, want ENOTEMPTY", st)
+	}
+	if fs.isLayerWhiteout("/dir") {
+		t.Fatal("rmdir created a layer whiteout despite live open child")
 	}
 }
 
