@@ -1444,6 +1444,18 @@ func (fs *Dat9FS) stageShadowForQueuedCommitLocked(fh *FileHandle, durable bool)
 	return err
 }
 
+func (fs *Dat9FS) stageShadowForLocalDurabilityLocked(fh *FileHandle, durable bool) error {
+	if fh != nil && fh.RemoteCommitUnlock != nil {
+		return fs.stageShadowLocked(fh, durable)
+	}
+	unlockRemoteCommit := func() {}
+	if fh != nil {
+		unlockRemoteCommit = fs.lockWritableRemoteCommitPath(fh.Path)
+	}
+	defer unlockRemoteCommit()
+	return fs.stageShadowLocked(fh, durable)
+}
+
 func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 	if fs.writeBack == nil {
 		return nil
@@ -7625,7 +7637,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			// ShadowSpill: stage shadow + journal, no writeBack snapshot.
 			phase = "interactive-shadowspill-stage"
 			stageStart := time.Now()
-			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			err := fs.stageShadowForLocalDurabilityLocked(fh, true)
 			fs.debugDurationf(stageStart, 0, "fsync shadowspill stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
 				fh.ShadowCommitReady = true
@@ -7643,7 +7655,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		} else {
 			phase = "interactive-stage"
 			stageStart := time.Now()
-			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			err := fs.stageShadowForLocalDurabilityLocked(fh, true)
 			fs.debugDurationf(stageStart, 0, "fsync stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
 				if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
@@ -7778,6 +7790,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		defer cf()
 		fs.observePathPolicyWithContext(ctx, fh.Path)
 		flushStatus := gofuse.OK
+		preservePendingModeOnReleaseFailure := false
 		defer func() {
 			if fh.Prefetch != nil {
 				fh.Prefetch.Close()
@@ -7853,6 +7866,9 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			}
 
 			// Flush failed — revert the in-memory mode so local GetAttr doesn't lie.
+			if preservePendingModeOnReleaseFailure {
+				return
+			}
 			fh.Lock()
 			stillCurrent := pendingModeMatchesLocked(fh, pendingMode, pendingModeGen)
 			if stillCurrent {
@@ -8040,31 +8056,31 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				} else {
 					fallbackCommittedRev = committedRev
 					fh.Lock()
-					clearReadTargetForLockedHandle(fh)
-					if committedRev > 0 {
-						fs.clearReadTargetsForPathExcept(fh.Path, fh)
-						fs.markHandleRemoteCommittedLocked(fh, committedRev)
+					if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+						flushStatus = httpToFuseStatus(err)
+						preservePendingModeOnReleaseFailure = true
+						log.Printf("release: ShadowSpill pending chmod failed for %s after sync upload: %v", fh.Path, err)
 					} else {
-						fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
-						fs.finalizeHandleFlushLocked(fh, expectedRevision)
-						if fs.shadowStore != nil {
-							fs.shadowStore.Remove(fh.Path)
-							fh.ShadowReady = false
-							fh.ShadowSpill = false
-							fh.ShadowCommitReady = false
+						clearReadTargetForLockedHandle(fh)
+						if committedRev > 0 {
+							fs.clearReadTargetsForPathExcept(fh.Path, fh)
+							fs.markHandleRemoteCommittedLocked(fh, committedRev)
+						} else {
+							fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+							fs.finalizeHandleFlushLocked(fh, expectedRevision)
+							if fs.shadowStore != nil {
+								fs.shadowStore.Remove(fh.Path)
+								fh.ShadowReady = false
+								fh.ShadowSpill = false
+								fh.ShadowCommitReady = false
+							}
+							if fs.pendingIndex != nil {
+								fs.pendingIndex.Remove(fh.Path)
+							}
 						}
-						if fs.pendingIndex != nil {
-							fs.pendingIndex.Remove(fh.Path)
-						}
-					}
-					fs.inodes.UpdateSize(fh.Ino, size)
-					if hasMode {
-						fs.inodes.UpdateMode(fh.Ino, mode&0o777)
+						fs.inodes.UpdateSize(fh.Ino, size)
 					}
 					fh.Unlock()
-					if hasMode {
-						fs.clearPendingModeForInode(fh.Ino)
-					}
 				}
 				uploadCancel()
 			} else if hasMode {

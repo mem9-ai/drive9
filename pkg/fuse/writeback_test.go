@@ -2398,6 +2398,76 @@ func TestFsync_NoDuplicateUpload(t *testing.T) {
 	uploader.DrainAll()
 }
 
+func TestFsyncInteractiveStageDoesNotRetainRemoteCommitPathLock(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "remote should not be used by interactive fsync staging", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncInteractive}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+	}, "fsync-stage.bin", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("locally durable bytes")); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync: %v", st)
+	}
+
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle missing")
+	}
+	fh.Lock()
+	retained := fh.RemoteCommitUnlock != nil
+	commitReady := fh.ShadowCommitReady
+	fh.Unlock()
+	if retained {
+		t.Fatal("Fsync must not retain a same-path remote commit lock until Release")
+	}
+	if !commitReady {
+		t.Fatal("interactive Fsync should still stage a Release commit snapshot")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		unlock := fs.lockWritableRemoteCommitPath("/fsync-stage.bin")
+		unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("same-path remote commit lock remained held after Fsync returned")
+	}
+}
+
 func TestFsyncShadowSpillCommitRefreshesRevisionAndClearsPending(t *testing.T) {
 	const filePath = "/workload.db-journal"
 	var (
@@ -2620,6 +2690,261 @@ func TestFsyncShadowSpillCommitRefreshesRevisionAndClearsPending(t *testing.T) {
 	if len(expectedRevisions) != 2 || expectedRevisions[0] != 0 || expectedRevisions[1] != 1 {
 		t.Fatalf("expected revisions = %v, want [0 1]", expectedRevisions)
 	}
+}
+
+func TestReleaseShadowSpillFallbackAppliesPendingMode(t *testing.T) {
+	const filePath = "/shadowspill-mode.bin"
+	rec := newShadowSpillFallbackRecorder(t, filePath, http.StatusOK)
+
+	fs, fhID, ino, shadow, pending := newShadowSpillFallbackFS(t, rec.client(), filePath)
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fhID,
+	})
+
+	if rec.uploads() != 1 {
+		t.Fatalf("uploads = %d, want 1", rec.uploads())
+	}
+	if got := rec.chmodModes(); len(got) != 1 || got[0] != "755" {
+		t.Fatalf("chmod modes = %v, want [755]", got)
+	}
+	if pending.HasPending(filePath) {
+		t.Fatal("pending entry should be removed after fallback upload and chmod")
+	}
+	if shadow.Has(filePath) {
+		t.Fatal("shadow should be removed after fallback upload and chmod")
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	if entry.Mode&0o777 != 0o755 {
+		t.Fatalf("inode mode = %o, want 755", entry.Mode&0o777)
+	}
+}
+
+func TestReleaseShadowSpillFallbackPreservesPendingModeOnChmodFailure(t *testing.T) {
+	const filePath = "/shadowspill-mode-fail.bin"
+	rec := newShadowSpillFallbackRecorder(t, filePath, http.StatusInternalServerError)
+
+	fs, fhID, ino, shadow, pending := newShadowSpillFallbackFS(t, rec.client(), filePath)
+
+	fsHandle, ok := fs.fileHandles.Get(fhID)
+	if !ok {
+		t.Fatal("created handle missing")
+	}
+	fsHandle.Lock()
+	initialModeGen := fsHandle.PendingModeGen
+	fsHandle.Unlock()
+
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fhID,
+	})
+
+	if rec.uploads() != 1 {
+		t.Fatalf("uploads = %d, want 1", rec.uploads())
+	}
+	if got := rec.chmodModes(); len(got) != 1 || got[0] != "755" {
+		t.Fatalf("chmod modes = %v, want [755]", got)
+	}
+	if !pending.HasPending(filePath) {
+		t.Fatal("pending entry should remain when fallback chmod fails")
+	}
+	meta, ok := pending.GetMeta(filePath)
+	if !ok {
+		t.Fatal("pending metadata missing after chmod failure")
+	}
+	if !meta.HasMode || meta.Mode&0o777 != 0o755 {
+		t.Fatalf("pending mode = has:%t mode:%o, want has:true mode:755", meta.HasMode, meta.Mode&0o777)
+	}
+	if !shadow.Has(filePath) {
+		t.Fatal("shadow should remain when fallback chmod fails")
+	}
+	if initialModeGen == 0 {
+		t.Fatal("test setup expected pending mode generation")
+	}
+}
+
+type shadowSpillFallbackRecorder struct {
+	t           *testing.T
+	server      *httptest.Server
+	wantPath    string
+	chmodStatus int
+	mu          sync.Mutex
+	uploadSizes map[string]int64
+	uploadCount int
+	modes       []string
+}
+
+func newShadowSpillFallbackRecorder(t *testing.T, wantPath string, chmodStatus int) *shadowSpillFallbackRecorder {
+	t.Helper()
+	rec := &shadowSpillFallbackRecorder{
+		t:           t,
+		wantPath:    wantPath,
+		chmodStatus: chmodStatus,
+		uploadSizes: make(map[string]int64),
+	}
+	rec.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+rec.wantPath && r.URL.Query().Has("chmod"):
+			var req struct {
+				Mode uint32 `json:"mode"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode chmod: %v", err)
+			}
+			rec.mu.Lock()
+			rec.modes = append(rec.modes, strconv.FormatUint(uint64(req.Mode&0o777), 8))
+			status := rec.chmodStatus
+			rec.mu.Unlock()
+			if status == 0 {
+				status = http.StatusOK
+			}
+			w.WriteHeader(status)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode initiate: %v", err)
+			}
+			if req.Path != rec.wantPath {
+				t.Fatalf("initiate path = %q, want %q", req.Path, rec.wantPath)
+			}
+			if req.ExpectedRevision == nil || *req.ExpectedRevision != 0 {
+				t.Fatalf("expected_revision = %v, want 0", req.ExpectedRevision)
+			}
+			uploadID := "upload-1"
+			rec.mu.Lock()
+			rec.uploadSizes[uploadID] = req.TotalSize
+			rec.mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   uploadID,
+				"key":         "object-key",
+				"part_size":   req.TotalSize,
+				"total_parts": 1,
+			})
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/presign-batch"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/presign-batch")
+			rec.mu.Lock()
+			size := rec.uploadSizes[uploadID]
+			rec.mu.Unlock()
+			if size <= 0 {
+				t.Fatalf("unknown upload id %q", uploadID)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    rec.server.URL + "/s3/" + uploadID + "/1",
+					"size":   size,
+				}},
+			})
+			return
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/"):
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read part body: %v", err)
+			}
+			if len(body) == 0 {
+				t.Fatal("multipart part body should not be empty")
+			}
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/complete"):
+			rec.mu.Lock()
+			rec.uploadCount++
+			rec.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	t.Cleanup(rec.server.Close)
+	return rec
+}
+
+func (rec *shadowSpillFallbackRecorder) client() *client.Client {
+	return newTestClient(rec.server.URL)
+}
+
+func (rec *shadowSpillFallbackRecorder) uploads() int {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return rec.uploadCount
+}
+
+func (rec *shadowSpillFallbackRecorder) chmodModes() []string {
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	return append([]string(nil), rec.modes...)
+}
+
+func newShadowSpillFallbackFS(t *testing.T, c *client.Client, filePath string) (*Dat9FS, uint64, uint64, *ShadowStore, *PendingIndex) {
+	t.Helper()
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncInteractive}
+	opts.setDefaults()
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(shadow.Close)
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	queue := NewCommitQueue(c, shadow, pending, nil, 1, 1, fs.remoteRoot())
+	queue.DrainAll()
+	fs.commitQueue = queue
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     0o755,
+	}, strings.TrimPrefix(filePath, "/"), &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, bytes.Repeat([]byte("x"), 128)); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync: %v", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle missing")
+	}
+	fh.Lock()
+	commitReady := fh.ShadowCommitReady
+	hasMode := fh.HasPendingMode
+	mode := fh.PendingMode & 0o777
+	fh.Unlock()
+	if !commitReady {
+		t.Fatal("test setup expected ShadowSpill commit-ready handle")
+	}
+	if !hasMode || mode != 0o755 {
+		t.Fatalf("test setup pending mode = has:%t mode:%o, want has:true mode:755", hasMode, mode)
+	}
+	return fs, createOut.Fh, createOut.NodeId, shadow, pending
 }
 
 func TestRefreshCommittedRevisionSkipsLockedSiblingHandle(t *testing.T) {
