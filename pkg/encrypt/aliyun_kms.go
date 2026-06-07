@@ -33,7 +33,7 @@ func NewAliyunKMSEncryptor(region, keyID, endpoint string) (*AliyunKMSEncryptor,
 	return &AliyunKMSEncryptor{client: client, keyID: keyID, endpoint: endpoint}, nil
 }
 
-func (e *AliyunKMSEncryptor) Encrypt(ctx context.Context, plaintext []byte) ([]byte, error) {
+func (e *AliyunKMSEncryptor) Encrypt(_ context.Context, plaintext []byte) ([]byte, error) {
 	req := kms.CreateEncryptRequest()
 	req.KeyId = e.keyID
 	req.Plaintext = base64.StdEncoding.EncodeToString(plaintext)
@@ -52,7 +52,7 @@ func (e *AliyunKMSEncryptor) Encrypt(ctx context.Context, plaintext []byte) ([]b
 	return ciphertext, nil
 }
 
-func (e *AliyunKMSEncryptor) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error) {
+func (e *AliyunKMSEncryptor) Decrypt(_ context.Context, ciphertext []byte) ([]byte, error) {
 	req := kms.CreateDecryptRequest()
 	req.CiphertextBlob = base64.StdEncoding.EncodeToString(ciphertext)
 	if e.endpoint != "" {
