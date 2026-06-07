@@ -455,8 +455,8 @@ lives in e2e scripts and local Ubuntu/macOS runs. Pull requests run
 read/write correctness, Git clone/config lockfile coverage, remount checks, and
 rollback-journal SQLite correctness. Heavier FUSE gates are opt-in for manual
 `workflow_dispatch` runs and enabled by the daily scheduled run: ordinary FUSE
-concurrency stress, SQLite WAL/churn/readers-writer correctness, and the FUSE
-performance baseline.
+concurrency stress, POSIX/fsx-style random write-truncate-rename coverage,
+SQLite WAL/churn/readers-writer correctness, and the FUSE performance baseline.
 
 The performance baseline emits JSON metrics for small-file I/O, large-file
 I/O, rollback-journal SQLite transactions, WAL SQLite transactions, and WAL
@@ -468,9 +468,9 @@ Drive9 CI workspace by setting `ARCHIVE_FUSE_PERFORMANCE_METRICS=1`.
 
 For reference, mature FUSE projects such as JuiceFS also run much broader
 periodic suites (`pjdfstest`, LTP fs/fsx/fcntl, random-op stress, xattr, and
-vdbench/fio-style benchmarks). Drive9 currently covers the highest-risk project
-paths directly; those external POSIX/fault suites remain good candidates for
-separate scheduled jobs if broader filesystem compatibility becomes the gate.
+vdbench/fio-style benchmarks). Drive9 now includes a lightweight fsx-style
+scheduled/manual gate; full external POSIX/fault suites remain good candidates
+for separate jobs if broader filesystem compatibility becomes the gate.
 
 The simplest manual sanity check is a real mount plus Git workflow:
 

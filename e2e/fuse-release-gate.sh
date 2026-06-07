@@ -11,6 +11,7 @@ export RUN_FUSE_GIT_CLONE="${RUN_FUSE_GIT_CLONE:-1}"
 export RUN_FUSE_UMOUNT_DURABLE="${RUN_FUSE_UMOUNT_DURABLE:-1}"
 export RUN_FUSE_LOG_AUDIT="${RUN_FUSE_LOG_AUDIT:-1}"
 export RUN_FUSE_CONCURRENCY_STRESS="${RUN_FUSE_CONCURRENCY_STRESS:-0}"
+export RUN_FUSE_POSIX_FSX="${RUN_FUSE_POSIX_FSX:-0}"
 export RUN_FUSE_SQLITE_CORRECTNESS="${RUN_FUSE_SQLITE_CORRECTNESS:-1}"
 export RUN_FUSE_PERFORMANCE_BASELINE="${RUN_FUSE_PERFORMANCE_BASELINE:-0}"
 export FUSE_GIT_CLONE_URL="${FUSE_GIT_CLONE_URL:-https://github.com/octocat/Hello-World.git}"
@@ -27,6 +28,9 @@ if [ "$RUN_FUSE_SQLITE_CORRECTNESS" = "1" ]; then
 fi
 if [ "$RUN_FUSE_CONCURRENCY_STRESS" = "1" ]; then
   bash "$SCRIPT_DIR/fuse-concurrency-stress.sh"
+fi
+if [ "$RUN_FUSE_POSIX_FSX" = "1" ]; then
+  bash "$SCRIPT_DIR/fuse-posix-fsx-gate.sh"
 fi
 if [ "$RUN_FUSE_PERFORMANCE_BASELINE" = "1" ]; then
   bash "$SCRIPT_DIR/fuse-performance-baseline.sh"

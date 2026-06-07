@@ -20,8 +20,9 @@ including local single-tenant validation via `drive9-server-local`.
 | `fuse-correctness-workload.sh` | Real read-only FUSE workload over a manifest fixture: `find`, `grep`, `stat`, `cat`, `sha256`, symlink, hardlink, unicode/space paths, empty files, binary files, and 8MiB+ files |
 | `fuse-sqlite-correctness.sh` | Real writable FUSE SQLite correctness workload with rollback-journal mode, `PRAGMA integrity_check`, unmount/remount parity, and remote snapshot verification; set `RUN_FUSE_SQLITE_WAL=1` for WAL, `RUN_FUSE_SQLITE_CHURN=1` for repeated large-DB rewrite churn, and `RUN_FUSE_SQLITE_CONCURRENCY=1` for the bounded readers/writer detector |
 | `fuse-concurrency-stress.sh` | Real writable FUSE concurrency workload with parallel writers/readers, atomic rename, unlink churn, open-handle rename reads, and deterministic final manifest checks |
+| `fuse-posix-fsx-gate.sh` | Opt-in JuiceFS-style POSIX/fsx subset over real writable FUSE: deterministic random write/read/truncate, atomic rename replacement, unlink-open reads, directory fsync, final model hash, unmount, and remote snapshot parity |
 | `fuse-performance-baseline.sh` | Opt-in real writable FUSE baseline that records small-file, large-file, repeated large-read, and SQLite transaction/read metrics as JSON artifacts without hardcoded throughput thresholds; SQLite reads verify stored row payload bytes against row checksums |
-| `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, mount-log audit, manifest-based FUSE correctness workload, and SQLite rollback-journal correctness; set `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip SQLite temporarily, `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress, and `RUN_FUSE_PERFORMANCE_BASELINE=1` to add performance metrics |
+| `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, mount-log audit, manifest-based FUSE correctness workload, and SQLite rollback-journal correctness; set `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip SQLite temporarily, `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress, `RUN_FUSE_POSIX_FSX=1` to add the POSIX/fsx subset, and `RUN_FUSE_PERFORMANCE_BASELINE=1` to add performance metrics |
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
 | `smoke-all.sh` | Runs API + CLI + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_GIT_WORKSPACE_SMOKE=1` to include Git workspace coverage |
@@ -66,6 +67,9 @@ bash e2e/fuse-sqlite-correctness.sh
 # Bounded concurrency stress on a real writable FUSE mount.
 bash e2e/fuse-concurrency-stress.sh
 
+# JuiceFS-style POSIX/fsx subset on a real writable FUSE mount.
+bash e2e/fuse-posix-fsx-gate.sh
+
 # Opt-in performance baseline with JSON metrics artifacts.
 bash e2e/fuse-performance-baseline.sh
 
@@ -79,6 +83,9 @@ bash e2e/fuse-release-gate.sh
 # Add the concurrency stress workload to the strict FUSE release gate.
 RUN_FUSE_CONCURRENCY_STRESS=1 bash e2e/fuse-release-gate.sh
 
+# Add the POSIX/fsx subset to the strict FUSE release gate.
+RUN_FUSE_POSIX_FSX=1 bash e2e/fuse-release-gate.sh
+
 # Add the threshold-free performance baseline to the strict FUSE release gate.
 RUN_FUSE_PERFORMANCE_BASELINE=1 bash e2e/fuse-release-gate.sh
 
@@ -91,6 +98,7 @@ CLI_SOURCE=official bash e2e/fuse-smoke-test.sh
 CLI_SOURCE=official bash e2e/fuse-correctness-workload.sh
 CLI_SOURCE=official bash e2e/fuse-sqlite-correctness.sh
 CLI_SOURCE=official bash e2e/fuse-concurrency-stress.sh
+CLI_SOURCE=official bash e2e/fuse-posix-fsx-gate.sh
 CLI_SOURCE=official bash e2e/fuse-performance-baseline.sh
 CLI_SOURCE=official bash e2e/fuse-release-gate.sh
 CLI_SOURCE=official bash e2e/posix-permission-smoke-test.sh
@@ -197,6 +205,9 @@ bash e2e/fuse-correctness-workload.sh
 # Deterministic concurrency workload using parallel reads/writes/rename/unlink.
 bash e2e/fuse-concurrency-stress.sh
 
+# Deterministic fsx-style workload using random writes/truncates/renames.
+bash e2e/fuse-posix-fsx-gate.sh
+
 # Opt-in small-file, large-file, and SQLite performance baseline.
 bash e2e/fuse-performance-baseline.sh
 
@@ -205,6 +216,9 @@ bash e2e/fuse-release-gate.sh
 
 # Strict FUSE release gate plus bounded concurrency stress.
 RUN_FUSE_CONCURRENCY_STRESS=1 bash e2e/fuse-release-gate.sh
+
+# Strict FUSE release gate plus POSIX/fsx subset.
+RUN_FUSE_POSIX_FSX=1 bash e2e/fuse-release-gate.sh
 
 # Strict FUSE release gate plus threshold-free performance metrics.
 RUN_FUSE_PERFORMANCE_BASELINE=1 bash e2e/fuse-release-gate.sh
@@ -269,10 +283,11 @@ CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
 - FUSE correctness workload knobs are `FUSE_CORRECTNESS_LARGE_MB` and `FUSE_CORRECTNESS_KEEP_ARTIFACTS`.
 - FUSE SQLite correctness workload knobs are `FUSE_SQLITE_ROWS`, `FUSE_SQLITE_CHURN_ROUNDS`, `FUSE_SQLITE_CONCURRENCY_READERS`, `FUSE_SQLITE_CONCURRENCY_WRITES`, `FUSE_SQLITE_WORKLOAD_TIMEOUT_S`, `FUSE_SQLITE_KEEP_ARTIFACTS`, `RUN_FUSE_SQLITE_WAL`, `RUN_FUSE_SQLITE_CHURN`, and `RUN_FUSE_SQLITE_CONCURRENCY`.
 - FUSE concurrency workload knobs are `FUSE_CONCURRENCY_WORKERS`, `FUSE_CONCURRENCY_FILES_PER_WORKER`, `FUSE_CONCURRENCY_READER_WORKERS`, `FUSE_CONCURRENCY_PAYLOAD_KB`, `FUSE_CONCURRENCY_TIMEOUT_S`, and `FUSE_CONCURRENCY_KEEP_ARTIFACTS`.
+- FUSE POSIX/fsx workload knobs are `FUSE_POSIX_FSX_OPS`, `FUSE_POSIX_FSX_MAX_BYTES`, `FUSE_POSIX_FSX_SEED`, `FUSE_POSIX_FSX_TIMEOUT_S`, and `FUSE_POSIX_FSX_KEEP_ARTIFACTS`. When enabled in CI, failures are hard failures.
 - FUSE performance baseline knobs are `FUSE_PERF_SMALL_FILES`, `FUSE_PERF_SMALL_BYTES`, `FUSE_PERF_LARGE_MB`, `FUSE_PERF_READ_PASSES`, `FUSE_PERF_SQLITE_ROWS`, `FUSE_PERF_KEEP_ARTIFACTS`, and `FUSE_PERF_ARTIFACT_DIR`. The baseline records small-file, large-file, rollback-journal SQLite, WAL SQLite, and WAL checkpoint metrics; SQLite rows are read back as payload bytes and SHA-256 verified before metrics are accepted.
-- `local-e2e.yml` does not run the performance baseline or heavy FUSE detectors on ordinary PR triggers. Use manual `workflow_dispatch` inputs `run_fuse_concurrency_stress=1`, `run_fuse_sqlite_wal=1`, `run_fuse_sqlite_churn=1`, `run_fuse_sqlite_concurrency=1`, and `run_fuse_performance_baseline=1` to enable them on demand. The scheduled daily run enables all of these flags; concurrency stress runs as a separate step after the release gate and metrics archive, and a stress failure fails the scheduled workflow.
+- `local-e2e.yml` does not run the performance baseline or heavy FUSE detectors on ordinary PR triggers. Use manual `workflow_dispatch` inputs `run_fuse_concurrency_stress=1`, `run_fuse_posix_fsx=1`, `run_fuse_sqlite_wal=1`, `run_fuse_sqlite_churn=1`, `run_fuse_sqlite_concurrency=1`, and `run_fuse_performance_baseline=1` to enable them on demand. The scheduled daily run enables all of these flags; concurrency stress and POSIX/fsx run as separate hard-fail steps after the release gate and metrics archive.
 - Set `archive_fuse_performance_metrics=1` on manual `local-e2e` runs, or use the daily scheduled run, to copy `performance-metrics-*.json`, mount logs, and an archive manifest to the Drive9 CI workspace under `/benchmarks/fuse-performance/<YYYY>/<MM>/<DD>/<branch>/<sha>/<run_id>-<attempt>/`. The same files are still uploaded as the GitHub artifact `fuse-performance-baseline`.
-- FUSE release-gate knobs are `FUSE_STRICT_PREREQS`, `RUN_FUSE_GIT_CLONE`, `FUSE_GIT_CLONE_URL`, `FUSE_GIT_CLONE_TIMEOUT_S`, `RUN_FUSE_UMOUNT_DURABLE`, `FUSE_UMOUNT_TIMEOUT`, `RUN_FUSE_LOG_AUDIT`, `RUN_FUSE_SQLITE_CORRECTNESS`, `RUN_FUSE_CONCURRENCY_STRESS`, `RUN_FUSE_PERFORMANCE_BASELINE`, and the FUSE correctness/SQLite/concurrency/performance workload knobs. `local-e2e.yml` intentionally overrides `RUN_FUSE_CONCURRENCY_STRESS=0` for its release-gate step and runs `fuse-concurrency-stress.sh` separately.
+- FUSE release-gate knobs are `FUSE_STRICT_PREREQS`, `RUN_FUSE_GIT_CLONE`, `FUSE_GIT_CLONE_URL`, `FUSE_GIT_CLONE_TIMEOUT_S`, `RUN_FUSE_UMOUNT_DURABLE`, `FUSE_UMOUNT_TIMEOUT`, `RUN_FUSE_LOG_AUDIT`, `RUN_FUSE_SQLITE_CORRECTNESS`, `RUN_FUSE_CONCURRENCY_STRESS`, `RUN_FUSE_POSIX_FSX`, `RUN_FUSE_PERFORMANCE_BASELINE`, and the FUSE correctness/SQLite/concurrency/POSIX/fsx/performance workload knobs. `local-e2e.yml` intentionally overrides `RUN_FUSE_CONCURRENCY_STRESS=0` for its release-gate step and runs `fuse-concurrency-stress.sh` separately.
 - Git workspace smoke defaults to `drive9`, `kimi-cli`, and `kimi-code`. Override with `GIT_WORKSPACE_REPOS='slug=https://example/repo.git,...'`.
 - Git workspace scenarios default to `agent_edit_add_commit,agent_patch_apply,sandbox_restore`; tune with `GIT_WORKSPACE_SCENARIOS`.
 - Git workspace file-count knobs are `GIT_WORKSPACE_EXISTING_FILES`, `GIT_WORKSPACE_NEW_FILES`, and `GIT_WORKSPACE_PATCH_FILES`.
@@ -284,4 +299,4 @@ CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
 - CLI upload-limit boundary check is enabled by default via `RUN_CLI_UPLOAD_LIMIT_BOUNDARY=1`.
 - `CLI_UPLOAD_LIMIT_BYTES` controls the boundary value checked by CLI e2e (default `10737418240`).
 - `fuse-smoke-test.sh` will `SKIP` when host prerequisites are missing (for example no `/dev/fuse`) unless `FUSE_STRICT_PREREQS=1`.
-- `fuse-release-gate.sh` is the strict CI/release entry point and enables git clone/status/log, durable `umount --timeout` remount checks, mount-log audit, manifest read correctness, and SQLite rollback-journal correctness. Set `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip SQLite temporarily while diagnosing host-specific FUSE failures, `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress, or `RUN_FUSE_PERFORMANCE_BASELINE=1` to add threshold-free performance metrics.
+- `fuse-release-gate.sh` is the strict CI/release entry point and enables git clone/status/log, durable `umount --timeout` remount checks, mount-log audit, manifest read correctness, and SQLite rollback-journal correctness. Set `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip SQLite temporarily while diagnosing host-specific FUSE failures, `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress, `RUN_FUSE_POSIX_FSX=1` to add fsx-style POSIX coverage, or `RUN_FUSE_PERFORMANCE_BASELINE=1` to add threshold-free performance metrics.

@@ -27,6 +27,14 @@ on:
         options:
           - "0"
           - "1"
+      run_fuse_posix_fsx:
+        description: "Run opt-in FUSE POSIX/fsx-style workload"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
       run_fuse_sqlite_wal:
         description: "Run opt-in FUSE SQLite WAL workload"
         required: false
@@ -84,6 +92,7 @@ env:
   RUN_SEMANTIC_CHECKS: "0"
   RUN_CLI_SEMANTIC_CHECKS: "0"
   RUN_FUSE_CONCURRENCY_STRESS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_concurrency_stress || '0') }}
+  RUN_FUSE_POSIX_FSX: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_posix_fsx || '0') }}
   RUN_FUSE_SQLITE_WAL: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_sqlite_wal || '0') }}
   RUN_FUSE_SQLITE_CHURN: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_sqlite_churn || '0') }}
   RUN_FUSE_SQLITE_CONCURRENCY: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_sqlite_concurrency || '0') }}
@@ -231,6 +240,11 @@ jobs:
         if: env.RUN_FUSE_CONCURRENCY_STRESS == '1'
         run: bash e2e/fuse-concurrency-stress.sh
 
+      - name: Run FUSE POSIX/fsx gate
+        id: fuse-posix-fsx
+        if: env.RUN_FUSE_POSIX_FSX == '1'
+        run: bash e2e/fuse-posix-fsx-gate.sh
+
       - name: Publish local e2e summary
         if: always()
         run: |
@@ -244,9 +258,11 @@ jobs:
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
             echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
+            echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
             echo
             echo "FUSE concurrency stress: \`RUN_FUSE_CONCURRENCY_STRESS=${RUN_FUSE_CONCURRENCY_STRESS}\`"
             echo "FUSE concurrency stress required: \`FUSE_CONCURRENCY_STRESS_REQUIRED=${FUSE_CONCURRENCY_STRESS_REQUIRED}\`"
+            echo "FUSE POSIX/fsx gate: \`RUN_FUSE_POSIX_FSX=${RUN_FUSE_POSIX_FSX}\`"
             echo "FUSE SQLite WAL: \`RUN_FUSE_SQLITE_WAL=${RUN_FUSE_SQLITE_WAL}\`"
             echo "FUSE SQLite churn: \`RUN_FUSE_SQLITE_CHURN=${RUN_FUSE_SQLITE_CHURN}\`"
             echo "FUSE SQLite concurrency: \`RUN_FUSE_SQLITE_CONCURRENCY=${RUN_FUSE_SQLITE_CONCURRENCY}\`"
@@ -304,6 +320,9 @@ jobs:
           check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
           if [ "${FUSE_CONCURRENCY_STRESS_REQUIRED}" = "1" ]; then
             check_required "FUSE concurrency stress" "${{ steps.fuse-concurrency-stress.outcome }}"
+          fi
+          if [ "${RUN_FUSE_POSIX_FSX}" = "1" ]; then
+            check_required "FUSE POSIX/fsx gate" "${{ steps.fuse-posix-fsx.outcome }}"
           fi
 
           exit "$failed"
