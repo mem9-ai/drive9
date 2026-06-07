@@ -19,7 +19,7 @@ sanitize_component() {
 }
 
 remote_ref() {
-  printf 'drive9:%s' "$1"
+  printf ':%s' "$1"
 }
 
 download_drive9_cli() {
