@@ -900,6 +900,61 @@ func TestDat9FSDiskReadCacheRangeReadThrough(t *testing.T) {
 	}
 }
 
+func TestDat9FSDiskReadCacheSingleRangeFinalEOFRead(t *testing.T) {
+	const (
+		path        = "/file.bin"
+		rev         = int64(7)
+		requestSize = 64
+	)
+	data := bytes.Repeat([]byte("x"), defaultReadCacheMaxFileSize+96)
+	for i := 0; i < 16; i++ {
+		data[len(data)-16+i] = byte('a' + i)
+	}
+	offset := int64(len(data) - 16)
+	var objectReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		objectReads.Add(1)
+		wantRange := fmt.Sprintf("bytes=%d-%d", offset, len(data)-1)
+		if got := r.Header.Get("Range"); got != wantRange {
+			http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(data[offset:])
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	entry := mustGetInodeEntry(t, fs, ino)
+	key, ok := fs.diskReadCacheKey(path, entry, offset, 16)
+	if !ok {
+		t.Fatal("disk read cache final key unavailable")
+	}
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, offset, requestSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[offset:]) {
+		t.Fatalf("final EOF read = %q, %v; want trimmed final bytes OK", got, st)
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, key)
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, offset, requestSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[offset:]) {
+		t.Fatalf("cached final EOF read = %q, %v; want trimmed final bytes OK", got, st)
+	}
+	if calls := objectReads.Load(); calls != 1 {
+		t.Fatalf("object reads = %d, want 1 after cached final read", calls)
+	}
+}
+
 func TestDat9FSParallelDiskReadFetchesBlocksInParallelAndCaches(t *testing.T) {
 	const (
 		path        = "/file.bin"

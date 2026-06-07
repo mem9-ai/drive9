@@ -1751,6 +1751,20 @@ func (fs *Dat9FS) diskReadCacheKey(p string, entry *InodeEntry, offset, size int
 	return key, key.valid()
 }
 
+func diskReadCacheReadSize(entry *InodeEntry, offset, requested int64) (int64, bool) {
+	if entry == nil || offset < 0 || requested <= 0 {
+		return requested, false
+	}
+	if offset >= entry.Size {
+		return 0, true
+	}
+	end := offset + requested
+	if end < offset || end > entry.Size {
+		return entry.Size - offset, false
+	}
+	return requested, false
+}
+
 // readStreamRangeWithRetry performs a range read with bounded detached retry
 // on transient failures. Wraps both the ReadStreamRange open and io.ReadFull
 // body read as a single retriable unit. On body-stage transient failure, the
@@ -5731,7 +5745,13 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	rangeOffset := int64(input.Offset)
-	rangeSize := int64(input.Size)
+	requestedRangeSize := int64(input.Size)
+	rangeSize, eof := diskReadCacheReadSize(entry, rangeOffset, requestedRangeSize)
+	if eof {
+		source = "disk-read-cache-eof"
+		bytesRead = 0
+		return gofuse.ReadResultData(nil), gofuse.OK
+	}
 	if key, ok := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize); ok {
 		if data, ok := fs.diskReadCache.Get(key); ok {
 			if !fs.statCacheTrustedAndVerified() && !revalidatedForRead {
@@ -5741,6 +5761,13 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 					return nil, httpToFuseStatus(err)
 				}
 				entry = refreshed
+				refreshedRangeSize, refreshedEOF := diskReadCacheReadSize(entry, rangeOffset, requestedRangeSize)
+				if refreshedEOF {
+					source = "disk-read-cache-eof"
+					bytesRead = 0
+					return gofuse.ReadResultData(nil), gofuse.OK
+				}
+				rangeSize = refreshedRangeSize
 				refreshedKey, refreshedOK := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize)
 				if !refreshedOK {
 					ok = false
