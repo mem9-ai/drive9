@@ -284,7 +284,7 @@ It asserts workload correctness and emits JSON metrics artifacts for comparison.
 4. Write and read deterministic small files with checksum verification
 5. Write one deterministic large file and read it multiple times with checksum verification
 6. Create a SQLite rollback-journal database, run insert/update/read transactions,
-   and verify `PRAGMA integrity_check`
+   recompute payload checksums from read row bytes, and verify `PRAGMA integrity_check`
 7. Emit `performance-metrics.json` with seconds, bytes, MiB/s, file rates,
    row rates, and correctness fingerprints
 8. Preserve run root, mount log, and metrics artifact on failure or when

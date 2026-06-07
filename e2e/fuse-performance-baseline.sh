@@ -501,12 +501,16 @@ def sqlite_workload(db_path):
     update_seconds = time.perf_counter() - update_start
 
     read_start = time.perf_counter()
-    rows = list(conn.execute("SELECT id, version, checksum, LENGTH(payload) FROM items ORDER BY id"))
+    rows = list(conn.execute("SELECT id, version, checksum, payload FROM items ORDER BY id"))
     read_seconds = time.perf_counter() - read_start
     digest = hashlib.sha256()
     payload_bytes = 0
     max_version = 0
-    for row_id, version, checksum, size in rows:
+    for row_id, version, checksum, payload in rows:
+        payload_hash = hashlib.sha256(payload).hexdigest()
+        if payload_hash != checksum:
+            raise AssertionError(f"sqlite payload checksum mismatch row={row_id}")
+        size = len(payload)
         digest.update(f"{row_id}:{version}:{checksum}:{size}\n".encode())
         payload_bytes += size
         max_version = max(max_version, version)
@@ -522,6 +526,7 @@ def sqlite_workload(db_path):
         "read_seconds": read_seconds,
         "rows": len(rows),
         "update_rows": update_rows,
+        "payload_verified_rows": len(rows),
         "max_version": max_version,
         "payload_bytes": payload_bytes,
         "fingerprint": digest.hexdigest(),
@@ -587,6 +592,7 @@ metrics["workloads"]["sqlite_read_aggregate"] = metric(
     extra={
         "journal_mode": sqlite_result["journal_mode"],
         "max_version": sqlite_result["max_version"],
+        "payload_verified_rows": sqlite_result["payload_verified_rows"],
         "integrity_check": sqlite_result["integrity_check"],
     },
 )
@@ -734,6 +740,7 @@ if is_mounted "$MOUNT_POINT"; then
   if [ -f "$METRICS_JSON" ]; then
     check_cmd "performance metrics json is valid" jq_check '.schema == "drive9-fuse-performance/v1"' "$METRICS_JSON"
     check_cmd "performance metrics include sqlite rows" jq_check --argjson rows "$FUSE_PERF_SQLITE_ROWS" '.workloads.sqlite_read_aggregate.rows == $rows' "$METRICS_JSON"
+    check_cmd "performance metrics verify sqlite payload rows" jq_check --argjson rows "$FUSE_PERF_SQLITE_ROWS" '.workloads.sqlite_read_aggregate.payload_verified_rows == $rows' "$METRICS_JSON"
     check_cmd "performance metrics include large read passes" jq_check --argjson passes "$FUSE_PERF_READ_PASSES" '.workloads.large_file_reads | length == $passes' "$METRICS_JSON"
     echo "Performance metrics artifact: $METRICS_JSON"
     cat "$METRICS_JSON"
