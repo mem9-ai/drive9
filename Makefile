@@ -46,7 +46,7 @@ BUILDINFO_LDFLAGS = -X github.com/mem9-ai/dat9/pkg/buildinfo.Version=$(if $(VERS
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local docker-build
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local e2e-local docker-build
 
 mod:
 	$(GO) mod tidy
@@ -115,6 +115,9 @@ build-server-local:
 
 run-server-local: build-server-local
 	@source ./scripts/drive9-server-local-env.sh && "./$(LOCAL_SERVER_BIN)"
+
+e2e-local:
+	bash e2e/local-smoke.sh
 
 build-cli:
 	mkdir -p $(BIN_DIR)

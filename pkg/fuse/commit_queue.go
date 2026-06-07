@@ -72,6 +72,7 @@ type CommitQueue struct {
 	maxPending   int
 	client       *client.Client
 	remoteRoot   string
+	layerRef     string
 	shadows      *ShadowStore
 	index        *PendingIndex
 	journal      *Journal
@@ -129,6 +130,24 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 
 func (cq *CommitQueue) SetPerfCounters(perf *fusePerfCounters) {
 	cq.perf = perf
+}
+
+func (cq *CommitQueue) SetLayerRef(layerRef string) {
+	if cq == nil {
+		return
+	}
+	cq.mu.Lock()
+	cq.layerRef = strings.TrimSpace(layerRef)
+	cq.mu.Unlock()
+}
+
+func (cq *CommitQueue) layerRefSnapshot() string {
+	if cq == nil {
+		return ""
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	return cq.layerRef
 }
 
 func (cq *CommitQueue) remotePath(localPath string) string {
@@ -662,6 +681,10 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 		return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
 	}
 	apiPath := cq.remotePath(entry.Path)
+	layerRef := cq.layerRefSnapshot()
+	if layerRef != "" {
+		return cq.uploadLayerEntry(ctx, layerRef, entry, apiPath, expectedRevision)
+	}
 
 	// ShadowSpill entries: stream directly from shadow file to avoid loading
 	// multi-GiB files into memory. Uses io.SectionReader over the shadow fd.
@@ -705,6 +728,30 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	// Larger non-ShadowSpill files: multipart upload.
 	start := time.Now()
 	err = uploadBufferedRemoteFile(ctx, cq.client, apiPath, data, expectedRevision)
+	if cq.perf != nil {
+		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
+	}
+	return 0, err
+}
+
+func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string, expectedRevision int64) (int64, error) {
+	data, err := cq.shadows.ReadAll(entry.Path)
+	if err != nil {
+		return 0, fmt.Errorf("read shadow: %w", err)
+	}
+	req := client.FSLayerEntryRequest{
+		Path:         apiPath,
+		Op:           "upsert",
+		Kind:         "file",
+		BaseRevision: expectedRevision,
+		Content:      data,
+		SizeBytes:    entry.Size,
+	}
+	if entry.HasMode {
+		req.Mode = entry.Mode & 0o777
+	}
+	start := time.Now()
+	_, err = cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
 	if cq.perf != nil {
 		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
 	}
@@ -772,7 +819,7 @@ func (cq *CommitQueue) rebuildQueuedIndexLocked() {
 }
 
 func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) error {
-	if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
+	if cq.layerRefSnapshot() == "" && shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var err error
 		mode := entry.Mode & 0o777
@@ -813,7 +860,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) e
 	if cq.shadows != nil {
 		cq.shadows.Remove(entry.Path)
 	}
-	if cq.index != nil {
+	if cq.index != nil && cq.layerRefSnapshot() == "" {
 		cq.index.Remove(entry.Path)
 	}
 	if cq.OnCleanup != nil {

@@ -35,6 +35,8 @@ const (
 	defaultS3Dir          = "/tmp/drive9-local-s3"
 	defaultS3Region       = "us-east-1"
 	envLocalEmbeddingMode = "DRIVE9_LOCAL_EMBEDDING_MODE"
+
+	localEmbeddingModeNone schema.TiDBEmbeddingMode = "none"
 )
 
 type localS3Config struct {
@@ -108,14 +110,7 @@ func main() {
 		if !explicitEmbeddingMode {
 			initMode = schema.TiDBEmbeddingModeAuto
 		}
-		initOpts := schema.InitTiDBTenantSchemaOptions{}
-		if initMode == schema.TiDBEmbeddingModeApp {
-			// drive9-server-local can bootstrap app-managed schema on TiDB builds
-			// that lack optional FTS/vector index features; shared schema init paths
-			// remain strict.
-			initOpts.AllowUnsupportedOptionalIndexes = true
-		}
-		if err := localTiDBSchemaInitializer(startupCtx, localDSN, initMode, initOpts); err != nil {
+		if err := initLocalTenantSchema(startupCtx, localDSN, initMode); err != nil {
 			die(fmt.Errorf("init local tenant schema: %w", err))
 		}
 		logLocalStartupStep(startupCtx, startupStart, stepStart, "init_local_tenant_schema",
@@ -341,7 +336,7 @@ environment:
   DRIVE9_LOCAL_DSN   local tenant TiDB/MySQL DSN (required)
   DRIVE9_LOCAL_API_KEY fixed API key returned by local /v1/provision and accepted by /v1/status (default: local-dev-key)
   DRIVE9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
-  DRIVE9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
+  DRIVE9_LOCAL_EMBEDDING_MODE auto|app|none|detect (default: auto when initing schema, detect otherwise)
   DRIVE9_LOCAL_META_DSN  local control-plane MySQL DSN for central quota (optional; enables server-mode quota enforcement)
   DRIVE9_VAULT_MASTER_KEY 32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
@@ -511,10 +506,26 @@ func (c localS3Config) localDir() string {
 }
 
 var (
-	localTiDBEmbeddingModeDetector = schema.DetectTiDBEmbeddingMode
-	localTiDBSchemaValidator       = schema.EnsureTiDBSchemaForMode
-	localTiDBSchemaInitializer     = schema.InitTiDBTenantSchemaForModeWithOptionsContext
+	localTiDBEmbeddingModeDetector    = schema.DetectTiDBEmbeddingMode
+	localTiDBSchemaValidator          = schema.EnsureTiDBSchemaForMode
+	localTiDBSchemaInitializer        = schema.InitTiDBTenantSchemaForModeWithOptionsContext
+	localNoEmbeddingSchemaValidator   = schema.ValidateMySQLNoEmbeddingTenantSchema
+	localNoEmbeddingSchemaInitializer = schema.InitMySQLNoEmbeddingTenantSchemaContext
 )
+
+func initLocalTenantSchema(ctx context.Context, dsn string, mode schema.TiDBEmbeddingMode) error {
+	if mode == localEmbeddingModeNone {
+		return localNoEmbeddingSchemaInitializer(ctx, dsn)
+	}
+	initOpts := schema.InitTiDBTenantSchemaOptions{}
+	if mode == schema.TiDBEmbeddingModeApp {
+		// drive9-server-local can bootstrap app-managed schema on TiDB builds
+		// that lack optional FTS/vector index features; shared schema init paths
+		// remain strict.
+		initOpts.AllowUnsupportedOptionalIndexes = true
+	}
+	return localTiDBSchemaInitializer(ctx, dsn, mode, initOpts)
+}
 
 func detectLocalTiDBEmbeddingMode(ctx context.Context, db *sql.DB, schemaInitialized bool, requestedMode schema.TiDBEmbeddingMode, explicitMode bool) (schema.TiDBEmbeddingMode, error) {
 	if explicitMode {
@@ -523,6 +534,12 @@ func detectLocalTiDBEmbeddingMode(ctx context.Context, db *sql.DB, schemaInitial
 		}
 		if db == nil {
 			return schema.TiDBEmbeddingModeUnknown, fmt.Errorf("nil db")
+		}
+		if requestedMode == localEmbeddingModeNone {
+			if err := localNoEmbeddingSchemaValidator(ctx, db); err != nil {
+				return schema.TiDBEmbeddingModeUnknown, err
+			}
+			return requestedMode, nil
 		}
 		if err := localTiDBSchemaValidator(ctx, db, requestedMode); err != nil {
 			return schema.TiDBEmbeddingModeUnknown, err
@@ -559,8 +576,10 @@ func localEmbeddingModeFromEnv() (schema.TiDBEmbeddingMode, bool, error) {
 		return schema.TiDBEmbeddingModeAuto, true, nil
 	case "app", string(schema.TiDBEmbeddingModeApp):
 		return schema.TiDBEmbeddingModeApp, true, nil
+	case "none", "skip", "disabled", "off":
+		return localEmbeddingModeNone, true, nil
 	default:
-		return schema.TiDBEmbeddingModeUnknown, false, fmt.Errorf("%s must be one of auto, app, or detect", envLocalEmbeddingMode)
+		return schema.TiDBEmbeddingModeUnknown, false, fmt.Errorf("%s must be one of auto, app, none, or detect", envLocalEmbeddingMode)
 	}
 }
 

@@ -131,6 +131,9 @@ type Dat9FS struct {
 	gitOverlayWG      sync.WaitGroup
 	gitOverlaySeq     atomic.Uint64
 	gitOverlayPending map[string]map[string]pendingGitOverlayEntry
+	layerMu           sync.RWMutex
+	layerWhiteouts    map[string]struct{}
+	layerDirs         map[string]uint32
 
 	// smallFileMax mirrors the server's inline_threshold (fetched lazily via
 	// the dat9 client). When 0, defaultSmallFileThreshold is used. Use the
@@ -416,6 +419,267 @@ func (fs *Dat9FS) remoteRoot() string {
 
 func (fs *Dat9FS) remotePath(localPath string) string {
 	return mountpath.ToRemote(fs.remoteRoot(), localPath)
+}
+
+func (fs *Dat9FS) layerRef() string {
+	if fs == nil || fs.opts == nil {
+		return ""
+	}
+	return strings.TrimSpace(fs.opts.LayerRef)
+}
+
+func (fs *Dat9FS) layerEnabled() bool {
+	return fs.layerRef() != ""
+}
+
+func (fs *Dat9FS) upsertLayerEntry(ctx context.Context, req client.FSLayerEntryRequest, bytes uint64) error {
+	layerRef := fs.layerRef()
+	if layerRef == "" {
+		return fmt.Errorf("fs layer is not configured")
+	}
+	start := fs.perfStart()
+	_, err := fs.client.UpsertFSLayerEntry(ctx, layerRef, req)
+	fs.perfRecordRemote(perfRemoteMutation, start, err, bytes)
+	return err
+}
+
+func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []byte, expectedRevision int64, mode uint32, hasMode bool) error {
+	req := client.FSLayerEntryRequest{
+		Path:         fs.remotePath(localPath),
+		Op:           "upsert",
+		Kind:         "file",
+		BaseRevision: expectedRevision,
+		Content:      data,
+		SizeBytes:    int64(len(data)),
+	}
+	if hasMode {
+		req.Mode = mode & 0o777
+	}
+	return fs.upsertLayerEntry(ctx, req, uint64(len(data)))
+}
+
+func (fs *Dat9FS) upsertLayerMkdir(ctx context.Context, localPath string, mode uint32) error {
+	if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+		Path: fs.remotePath(localPath),
+		Op:   "mkdir",
+		Kind: "dir",
+		Mode: mode & 0o777,
+	}, 0); err != nil {
+		return err
+	}
+	fs.markLayerDir(localPath, mode)
+	return nil
+}
+
+func (fs *Dat9FS) upsertLayerWhiteout(ctx context.Context, localPath string, kind deleteKind) error {
+	entryKind := "file"
+	if kind == deleteKindDir {
+		entryKind = "dir"
+	}
+	if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+		Path: fs.remotePath(localPath),
+		Op:   "whiteout",
+		Kind: entryKind,
+	}, 0); err != nil {
+		return err
+	}
+	fs.markLayerWhiteout(localPath)
+	return nil
+}
+
+func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode uint32) error {
+	return fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+		Path: fs.remotePath(localPath),
+		Op:   "chmod",
+		Kind: "file",
+		Mode: mode & 0o777,
+	}, 0)
+}
+
+func (fs *Dat9FS) upsertLayerSymlink(ctx context.Context, localPath string, target string) error {
+	return fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+		Path:        fs.remotePath(localPath),
+		Op:          "symlink",
+		Kind:        "symlink",
+		ContentText: target,
+		SizeBytes:   int64(len(target)),
+	}, uint64(len(target)))
+}
+
+func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalPath string) error {
+	oldRemote := fs.remotePath(oldLocalPath)
+	newRemote := fs.remotePath(newLocalPath)
+	var (
+		data    []byte
+		mode    uint32
+		hasMode bool
+	)
+	if fs.pendingIndex != nil {
+		if meta, ok := fs.pendingIndex.GetMeta(oldLocalPath); ok {
+			mode = meta.Mode
+			hasMode = meta.HasMode
+			if fs.shadowStore != nil && fs.shadowStore.Has(oldLocalPath) {
+				var err error
+				data, err = fs.shadowStore.ReadAll(oldLocalPath)
+				if err != nil {
+					return err
+				}
+			} else {
+				entry, err := fs.client.GetFSLayerEntry(ctx, fs.layerRef(), oldRemote)
+				if err != nil && !isNotFoundErr(err) {
+					return err
+				}
+				if err == nil {
+					data = entry.Content
+					if entry.Mode != 0 {
+						mode = entry.Mode
+						hasMode = true
+					}
+				}
+			}
+		}
+	}
+	if data == nil {
+		sourceStat, err := fs.client.StatCtx(ctx, oldRemote)
+		if err != nil {
+			return err
+		}
+		if sourceStat.IsDir {
+			return fmt.Errorf("directory rename is not supported in fs layer mounts")
+		}
+		data, err = fs.client.ReadCtx(ctx, oldRemote)
+		if err != nil {
+			return err
+		}
+		mode = sourceStat.Mode
+		hasMode = sourceStat.HasMode
+	}
+	targetBaseRev := int64(0)
+	kind := PendingNew
+	if targetStat, err := fs.client.StatCtx(ctx, newRemote); err == nil {
+		if targetStat.IsDir {
+			return fmt.Errorf("rename target %s is a directory", newRemote)
+		}
+		targetBaseRev = targetStat.Revision
+		kind = PendingOverwrite
+	} else if !isNotFoundErr(err) {
+		return err
+	}
+	req := client.FSLayerEntryRequest{
+		Path:         newRemote,
+		Op:           "upsert",
+		Kind:         "file",
+		BaseRevision: targetBaseRev,
+		Content:      data,
+		SizeBytes:    int64(len(data)),
+	}
+	if hasMode {
+		req.Mode = mode & 0o777
+	}
+	if err := fs.upsertLayerEntry(ctx, req, uint64(len(data))); err != nil {
+		return err
+	}
+	if fs.shadowStore != nil {
+		if err := fs.shadowStore.WriteFull(newLocalPath, data, targetBaseRev); err != nil {
+			return err
+		}
+	}
+	if fs.pendingIndex != nil {
+		if _, err := fs.pendingIndex.PutWithBaseRevAndMode(newLocalPath, int64(len(data)), kind, targetBaseRev, mode, hasMode); err != nil {
+			return err
+		}
+	}
+	if err := fs.upsertLayerWhiteout(ctx, oldLocalPath, deleteKindFile); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (fs *Dat9FS) commitLayerShadowLocked(ctx context.Context, fh *FileHandle, shadowSpill bool) error {
+	if fs.commitQueue == nil {
+		return fmt.Errorf("missing commit queue")
+	}
+	if fs.shadowStore == nil || !fs.shadowStore.Has(fh.Path) {
+		return fmt.Errorf("missing shadow for %s", fh.Path)
+	}
+	size := int64(0)
+	if fh.Dirty != nil {
+		size = fh.Dirty.Size()
+	}
+	mode, hasMode := fs.modeForPendingHandle(fh)
+	entry := &CommitEntry{
+		Path:        fh.Path,
+		Inode:       fh.Ino,
+		BaseRev:     fh.BaseRev,
+		Size:        size,
+		Kind:        fs.pendingKindForHandle(fh),
+		ShadowSpill: shadowSpill,
+		Mode:        mode,
+		HasMode:     hasMode,
+	}
+	fh.Unlock()
+	err := fs.commitQueue.CommitNow(ctx, entry)
+	fh.Lock()
+	if err != nil {
+		return err
+	}
+	if hasMode {
+		fs.clearPendingModeForInodeGeneration(fh.Ino, fh, mode&0o777, fh.PendingModeGen)
+		clearPendingModeLocked(fh)
+	}
+	if fh.Dirty != nil {
+		fh.Dirty.ClearDirty()
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fh.DirtySeq = 0
+	}
+	fh.WriteBackSeq = 0
+	return nil
+}
+
+func (fs *Dat9FS) markLayerWhiteout(localPath string) {
+	if fs == nil || localPath == "" {
+		return
+	}
+	fs.layerMu.Lock()
+	if fs.layerWhiteouts == nil {
+		fs.layerWhiteouts = make(map[string]struct{})
+	}
+	fs.layerWhiteouts[localPath] = struct{}{}
+	delete(fs.layerDirs, localPath)
+	fs.layerMu.Unlock()
+}
+
+func (fs *Dat9FS) markLayerDir(localPath string, mode uint32) {
+	if fs == nil || localPath == "" {
+		return
+	}
+	fs.layerMu.Lock()
+	if fs.layerDirs == nil {
+		fs.layerDirs = make(map[string]uint32)
+	}
+	fs.layerDirs[localPath] = mode & 0o777
+	delete(fs.layerWhiteouts, localPath)
+	fs.layerMu.Unlock()
+}
+
+func (fs *Dat9FS) isLayerWhiteout(localPath string) bool {
+	if fs == nil || !fs.layerEnabled() {
+		return false
+	}
+	fs.layerMu.RLock()
+	_, ok := fs.layerWhiteouts[localPath]
+	fs.layerMu.RUnlock()
+	return ok
+}
+
+func (fs *Dat9FS) layerDirMode(localPath string) (uint32, bool) {
+	if fs == nil || !fs.layerEnabled() {
+		return 0, false
+	}
+	fs.layerMu.RLock()
+	mode, ok := fs.layerDirs[localPath]
+	fs.layerMu.RUnlock()
+	return mode, ok
 }
 
 func (fs *Dat9FS) localOverlayForPath(ctx context.Context, localPath string) (*LocalOverlay, bool, gofuse.Status) {
@@ -955,6 +1219,12 @@ func (fs *Dat9FS) clearPendingModeForInodeGeneration(ino uint64, skip *FileHandl
 
 func (fs *Dat9FS) applyRemoteMode(ctx context.Context, localPath string, mode uint32) error {
 	mode &= 0o777
+	if fs.layerEnabled() {
+		if err := fs.upsertLayerChmod(ctx, localPath, mode); err != nil {
+			return fmt.Errorf("layer chmod %s to %o: %w", localPath, mode, err)
+		}
+		return nil
+	}
 	start := fs.perfStart()
 	err := fs.client.ChmodCtx(ctx, fs.remotePath(localPath), mode)
 	fs.perfRecordRemote(perfRemoteMutation, start, err, 0)
@@ -2532,6 +2802,9 @@ func (fs *Dat9FS) remoteHardlinkCommittedDetached(srcP, dstP string) bool {
 }
 
 func (fs *Dat9FS) hardlinkRemoteWithTransientRecovery(ctx context.Context, srcP, dstP string) error {
+	if fs.layerEnabled() {
+		return fmt.Errorf("hardlink is not supported in fs layer mounts")
+	}
 	srcRemote := fs.remotePath(srcP)
 	dstRemote := fs.remotePath(dstP)
 	mutationStart := fs.perfStart()
@@ -2576,6 +2849,11 @@ func (fs *Dat9FS) hardlinkRemoteWithTransientRecovery(ctx context.Context, srcP,
 func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string, mode uint32) error {
 	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
+	if fs.layerEnabled() {
+		err := fs.upsertLayerMkdir(ctx, localPath, mode)
+		cf()
+		return err
+	}
 	mutationStart := fs.perfStart()
 	err := fs.client.MkdirCtx(ctx, apiPath, mode)
 	cf()
@@ -2636,6 +2914,9 @@ func (fs *Dat9FS) deleteRemoteDirWithInterruptRecovery(ctx context.Context, loca
 }
 
 func (fs *Dat9FS) deleteRemotePathWithInterruptRecovery(ctx context.Context, localPath string, kind deleteKind) error {
+	if fs.layerEnabled() {
+		return fs.upsertLayerWhiteout(ctx, localPath, kind)
+	}
 	mutationStart := fs.perfStart()
 	remotePath := fs.remotePath(localPath)
 	var err error
@@ -2663,6 +2944,9 @@ func (fs *Dat9FS) deleteRemotePathWithInterruptRecovery(ctx context.Context, loc
 }
 
 func (fs *Dat9FS) renameRemoteWithTransientRetry(ctx context.Context, oldP, newP string) error {
+	if fs.layerEnabled() {
+		return fs.upsertLayerRename(ctx, oldP, newP)
+	}
 	oldRemote := fs.remotePath(oldP)
 	newRemote := fs.remotePath(newP)
 	mutationStart := fs.perfStart()
@@ -2918,6 +3202,23 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			out.NodeId = 0
 			out.SetEntryTimeout(fs.negativeEntryTTL(childP))
 			return gofuse.ENOENT
+		}
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
+	if fs.isLayerWhiteout(childP) {
+		out.NodeId = 0
+		out.SetEntryTimeout(fs.negativeEntryTTL(childP))
+		return gofuse.ENOENT
+	}
+	if mode, ok := fs.layerDirMode(childP); ok {
+		ino := fs.inodes.Lookup(childP, true, 0, time.Now())
+		fs.inodes.UpdateMode(ino, mode)
+		entry, ok := fs.inodes.GetEntry(ino)
+		if !ok {
+			return gofuse.EIO
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
@@ -3419,7 +3720,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		if !hasDirtyHandle {
 			ctx, cf := fuseCtx(cancel)
 			defer cf()
-			if err := fs.client.ChmodCtx(ctx, fs.remotePath(entry.Path), mode); err != nil {
+			if err := fs.applyRemoteMode(ctx, entry.Path, mode); err != nil {
 				return httpToFuseStatus(err)
 			}
 		}
@@ -3667,11 +3968,16 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 		return gofuse.OK
 	}
 
-	mutationStart := fs.perfStart()
-	err := fs.client.SymlinkCtx(ctx, pointedTo, fs.remotePath(childP))
-	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
+	var err error
+	if fs.layerEnabled() {
+		err = fs.upsertLayerSymlink(ctx, childP, pointedTo)
+	} else {
+		mutationStart := fs.perfStart()
+		err = fs.client.SymlinkCtx(ctx, pointedTo, fs.remotePath(childP))
+		fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
+	}
 	if err != nil {
-		if isTransientLookupErr(err) {
+		if !fs.layerEnabled() && isTransientLookupErr(err) {
 			stat, probeErr := fs.remotePathStatDetached(childP)
 			if probeErr == nil && stat != nil && stat.HasMode && isSymlinkMode(stat.Mode) {
 				err = nil
@@ -4217,6 +4523,9 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 	}
 
 	if fs.shadowStore != nil {
+		if fs.layerEnabled() && !fs.shadowStore.Has(oldP) {
+			return pendingRenameRemoteFallback, nil
+		}
 		if !fs.shadowStore.Rename(oldP, newP) {
 			return pendingRenameHandled, fmt.Errorf("move pending shadow %s -> %s failed", oldP, newP)
 		}
@@ -4720,7 +5029,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 			fs.perf.dirCacheHit.add(1)
 		}
 		entries := fs.cachedToDirEntries(dirPath, cached)
-		return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergePendingDirEntries(dirPath, entries))
+		return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
 	}
 	if fs.perf != nil {
 		fs.perf.dirCacheMiss.add(1)
@@ -4740,7 +5049,7 @@ func (fs *Dat9FS) listDir(ctx context.Context, dirPath string) ([]DirEntry, erro
 	fs.prefetchReadCacheForDir(ctx, dirPath, cached)
 
 	entries := fs.cachedToDirEntries(dirPath, cached)
-	return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergePendingDirEntries(dirPath, entries))
+	return fs.mergeLocalDirEntries(ctx, dirPath, fs.mergeLayerNamespaceEntries(dirPath, fs.mergePendingDirEntries(dirPath, entries)))
 }
 
 func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []CachedFileInfo) {
@@ -4868,6 +5177,70 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 		}
 	}
 
+	return entries
+}
+
+func (fs *Dat9FS) mergeLayerNamespaceEntries(dirPath string, entries []DirEntry) []DirEntry {
+	if fs == nil || !fs.layerEnabled() {
+		return entries
+	}
+	fs.layerMu.RLock()
+	if len(fs.layerWhiteouts) == 0 && len(fs.layerDirs) == 0 {
+		fs.layerMu.RUnlock()
+		return entries
+	}
+	whiteouts := make(map[string]struct{})
+	for p := range fs.layerWhiteouts {
+		if parentDir(p) == dirPath {
+			whiteouts[path.Base(p)] = struct{}{}
+		}
+	}
+	dirs := make(map[string]uint32)
+	for p, mode := range fs.layerDirs {
+		if parentDir(p) == dirPath {
+			dirs[path.Base(p)] = mode
+		}
+	}
+	fs.layerMu.RUnlock()
+
+	if len(whiteouts) > 0 {
+		filtered := entries[:0]
+		for _, entry := range entries {
+			if _, ok := whiteouts[entry.Name]; ok {
+				continue
+			}
+			filtered = append(filtered, entry)
+		}
+		entries = filtered
+	}
+	if len(dirs) == 0 {
+		return entries
+	}
+	existing := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		existing[entry.Name] = struct{}{}
+	}
+	for name, mode := range dirs {
+		if _, ok := existing[name]; ok {
+			continue
+		}
+		childP := dirEntryChildPath(dirPath, name)
+		ino := fs.inodes.EnsureInode(childP, true, 0, time.Now())
+		fs.inodes.UpdateMode(ino, mode)
+		entries = append(entries, DirEntry{
+			Name:        name,
+			Ino:         ino,
+			Mode:        dirEntryMode(true, true, mode),
+			Mtime:       time.Now(),
+			AttrMode:    mode,
+			HasMode:     true,
+			IsDir:       true,
+			HasMetadata: true,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name < entries[j].Name
+	})
 	return entries
 }
 
@@ -5070,7 +5443,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		wb.OnPartFull = func(partIdx int, data []byte) {
 			wb.EvictPart(partIdx)
 		}
-	} else if fh.WritePolicy != WritePolicyWriteSync {
+	} else if fh.WritePolicy != WritePolicyWriteSync && !fs.layerEnabled() {
 		// Normal mode: attach streaming uploader for sequential write streaming.
 		fh.Streamer = NewStreamUploader(fs.client, childP, expectedRevisionForHandle(fh), fs.remoteRoot())
 		streamer := fh.Streamer
@@ -5249,7 +5622,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				wb.OnPartFull = func(partIdx int, data []byte) {
 					wb.EvictPart(partIdx)
 				}
-			} else if fh.WritePolicy != WritePolicyWriteSync {
+			} else if fh.WritePolicy != WritePolicyWriteSync && !fs.layerEnabled() {
 				// Normal mode: attach streaming uploader with OnPartFull wiring.
 				fh.Streamer = NewStreamUploader(fs.client, p, expectedRevisionForHandle(fh), fs.remoteRoot())
 				streamer := fh.Streamer
@@ -6067,6 +6440,9 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 	if fh == nil || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
 		return gofuse.OK
 	}
+	if fs.layerEnabled() {
+		return fs.flushHandle(ctx, fh)
+	}
 
 	size := fh.Dirty.Size()
 	expectedRevision := expectedRevisionForHandle(fh)
@@ -6196,6 +6572,9 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 		}
 		return gofuse.OK
 	}
+	if fs.layerEnabled() {
+		return fs.flushHandle(ctx, fh)
+	}
 
 	size := fh.Dirty.Size()
 	if fh.ShadowSpill && fs.shadowStore != nil {
@@ -6250,6 +6629,28 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 
 func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
 	expectedRevision := expectedRevisionForHandle(fh)
+	if fs.layerEnabled() {
+		if err := fs.upsertLayerFile(ctx, fh.Path, nil, expectedRevision, 0, false); err != nil {
+			log.Printf("sync empty layer create failed for %s: %v", fh.Path, err)
+			return httpToFuseStatus(err)
+		}
+		if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
+			log.Printf("sync empty layer create pending chmod failed for %s: %v", fh.Path, err)
+			return httpToFuseStatus(err)
+		}
+		if fh.DirtySeq != 0 {
+			fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+			fh.DirtySeq = 0
+		}
+		clearReadTargetForLockedHandle(fh)
+		fs.readCache.Put(fh.Path, nil, 0)
+		fs.inodes.UpdateSize(fh.Ino, 0)
+		fs.cacheFileForPath(fh.Path, 0, time.Now(), 0)
+		if fs.pendingIndex != nil {
+			_, _ = fs.pendingIndex.PutWithBaseRev(fh.Path, 0, fs.pendingKindForHandle(fh), fh.BaseRev)
+		}
+		return gofuse.OK
+	}
 	writeStart := time.Now()
 	fs.debugf("sync empty create start path=%s expected_rev=%d", fh.Path, expectedRevision)
 	committedRev, err := fs.client.CreateFileCtx(ctx, fs.remotePath(fh.Path))
@@ -6470,6 +6871,18 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			size := fh.Dirty.Size()
 			uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 			defer uploadCancel()
+			if fs.layerEnabled() {
+				phase = "large-shadowspill-layer-sync-upload"
+				uploadStart := time.Now()
+				fs.debugf("flush layer shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
+				err := fs.commitLayerShadowLocked(uploadCtx, fh, true)
+				fs.debugDurationf(uploadStart, 0, "flush layer shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
+				if err != nil {
+					log.Printf("flush: layer ShadowSpill sync upload failed for %s: %v", fh.Path, err)
+					return httpToFuseStatus(err)
+				}
+				return gofuse.OK
+			}
 			phase = "large-shadowspill-sync-upload"
 			expectedRevision := expectedRevisionForHandle(fh)
 			uploadStart := time.Now()
@@ -6684,6 +7097,18 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		expectedRevision := expectedRevisionForHandle(fh)
 		uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 		defer uploadCancel()
+		if fs.layerEnabled() {
+			phase = "shadowspill-layer-sync-upload"
+			uploadStart := time.Now()
+			fs.debugf("fsync layer shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
+			err := fs.commitLayerShadowLocked(uploadCtx, fh, true)
+			fs.debugDurationf(uploadStart, 0, "fsync layer shadowspill upload done path=%s size=%d err=%v", fh.Path, size, err)
+			if err != nil {
+				log.Printf("fsync: layer ShadowSpill sync upload failed for %s: %v", fh.Path, err)
+				return httpToFuseStatus(err)
+			}
+			return gofuse.OK
+		}
 		phase = "shadowspill-sync-upload"
 		uploadStart := time.Now()
 		fs.debugf("fsync shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
@@ -6736,6 +7161,40 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if fs.writeBack != nil && fs.uploader != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq {
 		// Snapshot matches current dirty state — safe to upload.
 		phase = "writeback-upload-sync"
+		if fs.layerEnabled() {
+			if fs.commitQueue == nil || fs.shadowStore == nil || !fs.shadowStore.Has(fh.Path) {
+				log.Printf("fsync layer upload failed for %s: missing commit queue shadow", fh.Path)
+				return gofuse.EIO
+			}
+			mode, hasMode := fs.modeForPendingHandle(fh)
+			entry := &CommitEntry{
+				Path:    fh.Path,
+				Inode:   fh.Ino,
+				BaseRev: fh.BaseRev,
+				Size:    fh.Dirty.Size(),
+				Kind:    fs.pendingKindForHandle(fh),
+				Mode:    mode,
+				HasMode: hasMode,
+			}
+			uploadStart := time.Now()
+			fs.debugf("fsync layer upload start path=%s", fh.Path)
+			err := fs.commitQueue.CommitNow(ctx, entry)
+			fs.debugDurationf(uploadStart, 0, "fsync layer upload done path=%s err=%v", fh.Path, err)
+			if err != nil {
+				log.Printf("fsync layer upload failed for %s: %v", fh.Path, err)
+				return httpToFuseStatus(err)
+			}
+			if hasMode {
+				fs.clearPendingModeForInodeGeneration(fh.Ino, fh, mode&0o777, fh.PendingModeGen)
+				clearPendingModeLocked(fh)
+			}
+			if fh.Dirty != nil {
+				fh.Dirty.ClearDirty()
+				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+				fh.WriteBackSeq = 0
+			}
+			return gofuse.OK
+		}
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
 		committedRev, err := fs.uploader.UploadSyncWithRevision(ctx, fh.Path)
@@ -7028,22 +7487,27 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				// Fallback: synchronous streaming upload from shadow.
 				// Do NOT use uploader.Submit — it reads from writeBack cache.
 				log.Printf("release: ShadowSpill commitQueue enqueue failed for %s: %v, falling back to sync upload", fh.Path, err)
-				uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
-				phase = "shadowspill-sync-upload"
-				uploadStart := time.Now()
-				fs.debugf("release shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
-				uploadErr := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
-				var uploadBytes uint64
-				if size > 0 {
-					uploadBytes = uint64(size)
-				}
-				fs.perfRecordRemote(perfRemoteWrite, uploadStart, uploadErr, uploadBytes)
-				fs.debugDurationf(uploadStart, 0, "release shadowspill upload done path=%s size=%d err=%v", fh.Path, size, uploadErr)
-				if uploadErr != nil {
+				if fs.layerEnabled() {
 					flushStatus = gofuse.EIO
-					log.Printf("release: ShadowSpill sync upload failed for %s: %v", fh.Path, uploadErr)
+					log.Printf("release: layer mode preserves ShadowSpill pending state for %s after enqueue failure", fh.Path)
+				} else {
+					uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
+					phase = "shadowspill-sync-upload"
+					uploadStart := time.Now()
+					fs.debugf("release shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
+					uploadErr := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
+					var uploadBytes uint64
+					if size > 0 {
+						uploadBytes = uint64(size)
+					}
+					fs.perfRecordRemote(perfRemoteWrite, uploadStart, uploadErr, uploadBytes)
+					fs.debugDurationf(uploadStart, 0, "release shadowspill upload done path=%s size=%d err=%v", fh.Path, size, uploadErr)
+					if uploadErr != nil {
+						flushStatus = gofuse.EIO
+						log.Printf("release: ShadowSpill sync upload failed for %s: %v", fh.Path, uploadErr)
+					}
+					uploadCancel()
 				}
-				uploadCancel()
 			} else if hasMode {
 				fs.clearPendingModeForInode(fh.Ino)
 			}
@@ -7107,6 +7571,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					err := fs.commitQueue.Enqueue(entry)
 					fs.debugDurationf(enqueueStart, 0, "release commit enqueue done path=%s size=%d err=%v", fh.Path, entry.Size, err)
 					if err != nil {
+						if fs.layerEnabled() {
+							flushStatus = gofuse.EIO
+							log.Printf("release: layer commitQueue enqueue failed for %s: %v", fh.Path, err)
+							return
+						}
 						// Backpressure — fall back to legacy uploader.
 						fs.debugf("release uploader submit fallback path=%s", fh.Path)
 						fs.uploader.Submit(fh.Path)
@@ -7117,6 +7586,11 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 						fs.writeBack.Remove(fh.Path)
 					}
 				} else {
+					if fs.layerEnabled() {
+						flushStatus = gofuse.EIO
+						log.Printf("release: layer mode requires commitQueue for %s", fh.Path)
+						return
+					}
 					// Async upload — the uploader will read from cache and upload.
 					fs.debugf("release uploader submit path=%s", fh.Path)
 					fs.uploader.Submit(fh.Path)
@@ -7180,6 +7654,9 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 // When force is false and the file is small, the upload may be deferred.
 // Caller must hold fh.mu.
 func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, force bool) gofuse.Status {
+	if fs.layerEnabled() {
+		return fs.flushHandle(ctx, fh)
+	}
 	if force || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
 		return fs.flushHandle(ctx, fh)
 	}
@@ -7303,6 +7780,48 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	size := fh.Dirty.Size()
 
 	var err error
+	if fs.layerEnabled() {
+		if fh.ShadowSpill || (fh.Streamer != nil && fh.Streamer.Started()) || !fh.Dirty.CanMaterializeFull() {
+			if fh.ShadowSpill {
+				if err := fs.commitLayerShadowLocked(ctx, fh, true); err != nil {
+					log.Printf("layer shadowspill flush failed for %s: %v", fh.Path, err)
+					return httpToFuseStatus(err)
+				}
+				return gofuse.OK
+			}
+			log.Printf("layer flush cannot materialize full file for %s", fh.Path)
+			return gofuse.EIO
+		}
+		data := fh.Dirty.bytesView()
+		mode, hasMode := fs.modeForPendingHandle(fh)
+		expectedRevision := expectedRevisionForHandle(fh)
+		if err := fs.upsertLayerFile(ctx, fh.Path, data, expectedRevision, mode, hasMode); err != nil {
+			log.Printf("layer flush failed for %s: %v", fh.Path, err)
+			return httpToFuseStatus(err)
+		}
+		if fh.Dirty != nil {
+			fh.Dirty.ClearDirty()
+		}
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fh.DirtySeq = 0
+		clearReadTargetForLockedHandle(fh)
+		if len(data) <= int(fs.readCache.MaxFileSize()) {
+			fs.readCache.Put(fh.Path, data, 0)
+		}
+		fs.inodes.UpdateSize(fh.Ino, size)
+		if hasMode {
+			fs.inodes.UpdateMode(fh.Ino, mode&0o777)
+			fs.clearPendingModeForInodeGeneration(fh.Ino, fh, mode&0o777, fh.PendingModeGen)
+			clearPendingModeLocked(fh)
+		}
+		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
+		if fs.pendingIndex != nil {
+			if _, putErr := fs.pendingIndex.PutWithBaseRevAndMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode); putErr != nil {
+				log.Printf("layer flush pending index update failed for %s: %v", fh.Path, putErr)
+			}
+		}
+		return gofuse.OK
+	}
 
 	// Path 1a: Streaming mode — parts were submitted during Write() and are
 	// buffered in the StreamUploader's pendingParts. We must finalize via
@@ -7671,6 +8190,20 @@ func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, a
 // It seeds readCache and updates inode revision when committedRev is available,
 // or invalidates the cache otherwise.
 func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
+	if fs.layerEnabled() {
+		fs.clearReadTargetsForPath(entry.Path)
+		if fs.shadowStore != nil && entry.Size <= fs.readCache.MaxFileSize() {
+			if data, err := fs.shadowStore.ReadAll(entry.Path); err == nil {
+				fs.readCache.PutOwned(entry.Path, data, 0)
+			}
+		}
+		fs.inodes.UpdateSize(entry.Inode, entry.Size)
+		if entry.HasMode {
+			fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
+		}
+		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
+		return
+	}
 	if committedRev > 0 && entry.Inode > 0 {
 		fs.clearReadTargetsForPath(entry.Path)
 		// Seed readCache from shadow data before the shadow file is removed.

@@ -9,7 +9,7 @@
 //	create  provision a new database and owner context
 //	ctx     manage contexts (show, add, import, fork, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, mkdir, chmod,
-//	        symlink, hardlink, sh, grep, find)
+//	        symlink, hardlink, sh, grep, find, layer)
 //	token  issue and revoke workspace-zone scoped filesystem tokens
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	journal append-only agent/workflow journal operations
@@ -284,6 +284,8 @@ func runFS(args []string) {
 		err = cli.Grep(c, rest)
 	case "find":
 		err = cli.Find(c, rest)
+	case "layer":
+		err = cli.Layer(c, rest)
 	case "-h", "-help", "--help", "help":
 		fsUsage(0)
 	default:
@@ -382,6 +384,14 @@ commands:
     -newer <YYYY-MM-DD>  modified after date
     -older <YYYY-MM-DD>  modified before date
     -size <+N|-N>        size filter in bytes
+  layer <command>      manage filesystem layers
+    create [flags] <base-root>
+    list [--json]
+    status [--json] <layer>
+    diff [--json] <layer>
+    checkpoint [flags] <layer>
+    rollback <layer>
+    commit <layer>
 
 global:
   -h, --help, help       show this help

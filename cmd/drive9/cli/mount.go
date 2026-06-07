@@ -113,6 +113,8 @@ func fsMountCmd(args []string) error {
 	trustProcessLocalEvents := fs.Bool("trust-process-local-events", false, "allow revision-bound GetAttr dir-cache hits using process-local SSE freshness; only safe for single-server/sticky routing or cluster-wide event streams")
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
 	profile := fs.String("profile", "", "mount profile: interactive, coding-agent (empty for default)")
+	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
+	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root for --profile=coding-agent")
 	var localOnlyPatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
@@ -230,11 +232,22 @@ func fsMountCmd(args []string) error {
 	if resolved == MountModeWebDAV && trustProcessLocalEventsGiven {
 		return fmt.Errorf("drive9 mount: --trust-process-local-events is only supported with --mode=fuse")
 	}
+	if resolved == MountModeWebDAV && strings.TrimSpace(*layerRef) != "" {
+		return fmt.Errorf("drive9 mount: --layer is only supported with --mode=fuse")
+	}
+	if resolved == MountModeWebDAV && strings.TrimSpace(*checkpointRef) != "" {
+		return fmt.Errorf("drive9 mount: --checkpoint is only supported with --mode=fuse")
+	}
+	if strings.TrimSpace(*checkpointRef) != "" && strings.TrimSpace(*layerRef) == "" {
+		return fmt.Errorf("drive9 mount: --checkpoint requires --layer")
+	}
 	if runtime.GOOS == "windows" && resolved == MountModeFUSE {
 		return mountFuse(&mountFuseOptions{
 			MountPoint:         mountPoint,
 			RemoteRoot:         remoteRoot,
 			Profile:            *profile,
+			LayerRef:           strings.TrimSpace(*layerRef),
+			CheckpointRef:      strings.TrimSpace(*checkpointRef),
 			LocalRoot:          normalizedLocalRoot,
 			LocalOnlyPatterns:  append([]string(nil), localOnlyPatterns...),
 			RemoteOnlyPatterns: append([]string(nil), remoteOnlyPatterns...),
@@ -301,6 +314,8 @@ func fsMountCmd(args []string) error {
 		SyncMode:                syncModeVal,
 		WritePolicy:             writePolicyVal,
 		Profile:                 *profile,
+		LayerRef:                strings.TrimSpace(*layerRef),
+		CheckpointRef:           strings.TrimSpace(*checkpointRef),
 		LocalRoot:               normalizedLocalRoot,
 		LocalOnlyPatterns:       append([]string(nil), localOnlyPatterns...),
 		RemoteOnlyPatterns:      append([]string(nil), remoteOnlyPatterns...),

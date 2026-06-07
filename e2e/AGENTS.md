@@ -43,6 +43,9 @@ bash e2e/cli-smoke-test.sh
 # Journal smoke (provision + journal create/append/find/verify)
 bash e2e/journal-smoke-test.sh
 
+# Layer filesystem smoke (create/status/diff/checkpoint/rollback/commit)
+bash e2e/layer-fs-smoke-test.sh
+
 # FUSE smoke (mount + bidirectional filesystem checks)
 bash e2e/fuse-smoke-test.sh
 
@@ -73,6 +76,21 @@ When the task is specifically about local validation on this machine, prefer
 `scripts/drive9-server-local-env.sh` is the source of truth for local default
 environment values.
 
+For a disposable local e2e run that does not depend on TiDB auto-embedding,
+Ollama, or a hosted dev deployment:
+
+```bash
+make e2e-local
+```
+
+This starts a temporary MySQL container, initializes
+`DRIVE9_LOCAL_EMBEDDING_MODE=none`, starts `drive9-server-local`, and runs
+`e2e/smoke-all.sh` with semantic checks disabled and `RUN_FUSE_SMOKE=0` by
+default. Set `DRIVE9_LOCAL_DSN` to reuse an existing local database instead of
+starting a container. Set `RUN_FUSE_SMOKE=1` only when the machine has native
+FUSE support; macOS WebDAV fallback does not satisfy the symlink/hardlink FUSE
+smoke assertions.
+
 ### Prerequisites
 
 - Choose one of the following local validation setups before startup:
@@ -83,6 +101,9 @@ environment values.
   Create the database referenced by `DRIVE9_LOCAL_DSN` before startup, then
   make sure the embedding endpoint is available. The default env script expects
   Ollama at `http://127.0.0.1:11434` with model `bge-m3`.
+- Use ordinary MySQL with `DRIVE9_LOCAL_EMBEDDING_MODE=none` for non-semantic
+  local filesystem/layer/journal/FUSE smoke coverage. Disable semantic checks
+  with `RUN_SEMANTIC_CHECKS=0 RUN_CLI_SEMANTIC_CHECKS=0`.
 
 ### Terminal 1: start `drive9-server-local`
 

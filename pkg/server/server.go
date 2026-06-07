@@ -202,6 +202,9 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/journal-entries", business)
 	mux.Handle("/v1/git-workspaces", business)
 	mux.Handle("/v1/git-workspaces/", business)
+	mux.Handle("/v1/fs-layers", business)
+	mux.Handle("/v1/fs-layers/", business)
+	mux.Handle("/v1/fs-layer-checkpoints/", business)
 	// Vault management API goes through tenant auth.
 	mux.Handle("/v1/vault/secrets", business)
 	mux.Handle("/v1/vault/secrets/", business)
@@ -532,6 +535,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleJournal(w, r)
 	case r.URL.Path == "/v1/git-workspaces" || strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/"):
 		s.handleGitWorkspaces(w, r)
+	case r.URL.Path == "/v1/fs-layers" || strings.HasPrefix(r.URL.Path, "/v1/fs-layers/") || strings.HasPrefix(r.URL.Path, "/v1/fs-layer-checkpoints/"):
+		s.handleFSLayers(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:

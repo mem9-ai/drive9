@@ -19,6 +19,9 @@
 #   mycli --host 127.0.0.1 --port 4000 -u root -e "CREATE DATABASE IF NOT EXISTS drive9_local;"
 : "${DRIVE9_LOCAL_DSN:=root@tcp(127.0.0.1:4000)/drive9_local?parseTime=true}"
 : "${DRIVE9_LOCAL_API_KEY:=local-dev-key}"
+# Use none/skip/disabled to bootstrap against ordinary MySQL without TiDB
+# FTS/VECTOR/EMBED_TEXT support. Semantic e2e checks must be disabled in that mode.
+# : "${DRIVE9_LOCAL_EMBEDDING_MODE:=none}"
 # Leave DRIVE9_LOCAL_INIT_SCHEMA unset to use the built-in default (false).
 # : "${DRIVE9_LOCAL_INIT_SCHEMA:=false}"
 
@@ -47,10 +50,17 @@
 # ollama pull bge-m3 # "bge-m3" provide 1024-dimensional embeddings.
 # curl http://localhost:11434/v1/embeddings -H "Content-Type: application/json" -d '{"model":"bge-m3", "input": "This is an embedding test"}'
 
-# Background semantic embedding worker.
-: "${DRIVE9_EMBED_API_BASE:=http://127.0.0.1:11434}"
-: "${DRIVE9_EMBED_API_KEY:=ollama}"
-: "${DRIVE9_EMBED_MODEL:=bge-m3}"
+# Background semantic embedding worker. Defaults are only populated when the
+# local schema mode can make use of embeddings.
+case "${DRIVE9_LOCAL_EMBEDDING_MODE:-}" in
+  none|skip|disabled|off)
+    ;;
+  *)
+    : "${DRIVE9_EMBED_API_BASE:=http://127.0.0.1:11434}"
+    : "${DRIVE9_EMBED_API_KEY:=ollama}"
+    : "${DRIVE9_EMBED_MODEL:=bge-m3}"
+    ;;
+esac
 # Leave the following unset to keep using the program defaults:
 # DRIVE9_EMBED_TIMEOUT_SECONDS=20
 # DRIVE9_SEMANTIC_WORKERS=1
@@ -95,9 +105,15 @@ if [[ -z "${DRIVE9_S3_BUCKET:-}" ]]; then
 else
   unset DRIVE9_S3_DIR
 fi
-export DRIVE9_EMBED_API_BASE
-export DRIVE9_EMBED_API_KEY
-export DRIVE9_EMBED_MODEL
+if [[ -n "${DRIVE9_EMBED_API_BASE:-}" ]]; then
+  export DRIVE9_EMBED_API_BASE
+fi
+if [[ -n "${DRIVE9_EMBED_API_KEY:-}" ]]; then
+  export DRIVE9_EMBED_API_KEY
+fi
+if [[ -n "${DRIVE9_EMBED_MODEL:-}" ]]; then
+  export DRIVE9_EMBED_MODEL
+fi
 
 echo "Environment loaded for drive9-server-local."
 if [[ -n "${DRIVE9_S3_BUCKET:-}" ]]; then

@@ -71,7 +71,7 @@ func initMigrateSchema(dsn string) {
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
 			msg := err.Error()
-			if strings.Contains(msg, "Duplicate key name") || strings.Contains(msg, "already exists") {
+			if strings.Contains(msg, "Duplicate key name") || strings.Contains(msg, "already exists") || strings.Contains(msg, "Duplicate column") {
 				continue
 			}
 			log.Fatalf("init schema: %v", err)

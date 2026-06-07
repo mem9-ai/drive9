@@ -16,6 +16,7 @@ including local single-tenant validation via `drive9-server-local`.
 | `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download |
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
+| `layer-fs-smoke-test.sh` | Layer filesystem API+CLI workflow: create by name/tag, entry diff, checkpoint lookup, rollback state, and commit into base filesystem |
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/hardlink/rename/stat semantics, cross-channel consistency, mounted 10KiB→8MiB→10KiB tier-transition parity, read-only and error-path checks |
 | `fuse-correctness-workload.sh` | Real read-only FUSE workload over a manifest fixture: `find`, `grep`, `stat`, `cat`, `sha256`, symlink, hardlink, unicode/space paths, empty files, binary files, and 8MiB+ files |
 | `fuse-sqlite-correctness.sh` | Real writable FUSE SQLite correctness workload with rollback-journal mode, `PRAGMA integrity_check`, unmount/remount parity, and remote snapshot verification; set `RUN_FUSE_SQLITE_WAL=1` to add the WAL detector |
@@ -23,7 +24,8 @@ including local single-tenant validation via `drive9-server-local`.
 | `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, mount-log audit, manifest-based FUSE correctness workload, and SQLite rollback-journal correctness; set `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip SQLite temporarily and `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress |
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
-| `smoke-all.sh` | Runs API + CLI + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_GIT_WORKSPACE_SMOKE=1` to include Git workspace coverage |
+| `smoke-all.sh` | Runs API + CLI + journal + layer FS + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_FUSE_SMOKE=0` to skip FUSE symlink/hardlink coverage and `RUN_GIT_WORKSPACE_SMOKE=1` to include Git workspace coverage |
+| `local-smoke.sh` | Starts `drive9-server-local` with a disposable local DB by default, then runs `smoke-all.sh` with semantic checks disabled and FUSE smoke skipped unless `RUN_FUSE_SMOKE=1` |
 
 ## Run
 
@@ -50,6 +52,9 @@ bash e2e/api-smoke-test.sh
 DRIVE9_API_KEY=drive9_xxx bash e2e/api-smoke-test-existing-key.sh
 
 bash e2e/cli-smoke-test.sh
+
+# Layer filesystem API+CLI smoke
+bash e2e/layer-fs-smoke-test.sh
 
 # Use official released drive9 CLI instead of local build
 CLI_SOURCE=official bash e2e/cli-smoke-test.sh
@@ -120,12 +125,31 @@ The local smoke flow that is currently exercised on this machine uses
 `scripts/drive9-server-local-env.sh` is the source of truth for local default
 environment values.
 
+For a disposable local run that does not depend on TiDB auto-embedding, Ollama,
+or a hosted dev deployment, use:
+
+```bash
+make e2e-local
+```
+
+`make e2e-local` runs `e2e/local-smoke.sh`, which starts a temporary MySQL
+container by default, initializes the local no-embedding tenant schema, starts
+`drive9-server-local`, and runs `e2e/smoke-all.sh` with semantic checks and
+upload-limit boundary checks disabled. It also skips `fuse-smoke-test.sh` by
+default because local macOS runs may fall back to WebDAV, which cannot support
+the symlink/hardlink assertions in that script. Override `DRIVE9_LOCAL_DSN` to
+reuse an existing database instead of starting a container, and set
+`RUN_FUSE_SMOKE=1` when a native FUSE setup is available.
+
 1. Confirm local prerequisites.
 
 - Create the local database referenced by `DRIVE9_LOCAL_DSN` before startup.
 - For full smoke coverage, ensure the embedding endpoint is available. The
   default env script expects Ollama at `http://127.0.0.1:11434` with model
   `bge-m3`.
+- For MySQL-only local validation without embeddings, set
+  `DRIVE9_LOCAL_EMBEDDING_MODE=none` and disable semantic smoke checks:
+  `RUN_SEMANTIC_CHECKS=0 RUN_CLI_SEMANTIC_CHECKS=0`.
 
 2. In terminal 1, start `drive9-server-local` from the repository root.
 

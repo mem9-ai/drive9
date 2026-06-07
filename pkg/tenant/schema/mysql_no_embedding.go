@@ -2,27 +2,22 @@ package schema
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
-	"strconv"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"go.uber.org/zap"
 )
 
-// Keep this statement list aligned with any external workflow that manages the
-// app-embedding TiDB schema directly. If you change columns, indexes,
-// generated expressions, or constraints here, update that external workflow at
-// the same time.
+// MySQLNoEmbeddingTenantSchemaStatements returns a local-development tenant
+// schema that avoids TiDB-only FTS/VECTOR/EMBED_TEXT features.
 //
-// There is intentionally no drive9-server dump-init-sql --provider export path
-// for this app-managed statement list.
-func tidbAppEmbeddingSchemaStatements() []string {
-	stmts := tidbAppEmbeddingBaseSchemaStatements()
-	stmts = append(stmts, tidbAppEmbeddingOptionalSchemaStatements()...)
-	return stmts
-}
-
-func tidbAppEmbeddingBaseSchemaStatements() []string {
+// This schema is intentionally not used for production tenant provisioning. It
+// exists to make drive9-server-local and e2e smoke tests runnable against an
+// ordinary MySQL-compatible database while preserving the same core filesystem,
+// layer, journal, git workspace, and vault tables.
+func MySQLNoEmbeddingTenantSchemaStatements() []string {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
@@ -38,6 +33,33 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
 		`CREATE INDEX idx_inode_id ON file_nodes(inode_id)`,
+
+		`CREATE TABLE IF NOT EXISTS files (
+			file_id                    VARCHAR(64) PRIMARY KEY,
+			storage_type               VARCHAR(32) NOT NULL,
+			storage_ref                TEXT NOT NULL,
+			storage_ref_hash           VARCHAR(64) NOT NULL DEFAULT '',
+			storage_encryption_mode    VARCHAR(16) NOT NULL DEFAULT 'legacy',
+			storage_encryption_key_id  VARCHAR(256) NOT NULL DEFAULT '',
+			content_blob               LONGBLOB,
+			content_type               VARCHAR(255),
+			size_bytes                 BIGINT NOT NULL DEFAULT 0,
+			checksum_sha256            VARCHAR(128),
+			revision                   BIGINT NOT NULL DEFAULT 1,
+			status                     VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+			source_id                  VARCHAR(255),
+			content_text               LONGTEXT,
+			description                LONGTEXT,
+			embedding                  LONGTEXT,
+			embedding_revision         BIGINT,
+			description_embedding      LONGTEXT,
+			description_embedding_revision BIGINT,
+			created_at                 DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			confirmed_at               DATETIME(3),
+			expires_at                 DATETIME(3)
+		)`,
+		`CREATE INDEX idx_status ON files(status, created_at)`,
+		`CREATE INDEX idx_files_storage_ref_hash ON files(storage_ref_hash)`,
 
 		`CREATE TABLE IF NOT EXISTS inodes (
 			inode_id     VARCHAR(64) PRIMARY KEY,
@@ -68,9 +90,9 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			inode_id                           VARCHAR(64) PRIMARY KEY,
 			content_text                       LONGTEXT,
 			description                        LONGTEXT,
-			embedding                          VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `),
+			embedding                          LONGTEXT,
 			embedding_revision                 BIGINT,
-			description_embedding              VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `),
+			description_embedding              LONGTEXT,
 			description_embedding_revision     BIGINT
 		)`,
 		`CREATE TABLE IF NOT EXISTS file_tags (
@@ -169,52 +191,58 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 	return stmts
 }
 
-func tidbAppEmbeddingOptionalSchemaStatements() []string {
-	return []string{
-
-		`ALTER TABLE semantic
-			ADD FULLTEXT INDEX idx_semantic_fts_content(content_text)
-			WITH PARSER MULTILINGUAL
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE semantic
-			ADD FULLTEXT INDEX idx_semantic_fts_description(description)
-			WITH PARSER MULTILINGUAL
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE semantic
-			ADD VECTOR INDEX idx_semantic_cosine((VEC_COSINE_DISTANCE(embedding)))
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE semantic
-			ADD VECTOR INDEX idx_semantic_desc_cosine((VEC_COSINE_DISTANCE(description_embedding)))
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-	}
-}
-
-func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTenantSchemaOptions) error {
+// InitMySQLNoEmbeddingTenantSchemaContext initializes the local no-embedding
+// tenant schema on any MySQL-compatible database. It deliberately skips TiDB
+// capability checks and TiDB-only optional indexes.
+func InitMySQLNoEmbeddingTenantSchemaContext(ctx context.Context, dsn string) error {
+	start := time.Now()
+	logger.Info(ctx, "tenant_mysql_no_embedding_schema_init_started")
 	db, err := OpenTiDBSchemaDB(ctx, dsn)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = closeTiDBSchemaDB(db) }()
-	if !IsTiDBCluster(ctx, db) {
-		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
-	}
-	if err := ExecSchemaStatementsContext(ctx, db, tidbAppEmbeddingBaseSchemaStatements()); err != nil {
+	if err := ExecSchemaStatementsContext(ctx, db, MySQLNoEmbeddingTenantSchemaStatements()); err != nil {
 		return err
 	}
-	if opts.AllowUnsupportedOptionalIndexes {
-		// Local-only compatibility mode can continue without these indexes; other
-		// callers still execute the same statements strictly below.
-		skipped, err := ExecOptionalSchemaStatements(ctx, db, tidbAppEmbeddingOptionalSchemaStatements())
-		if err != nil {
-			return err
-		}
-		if skipped > 0 {
-			logger.Warn(ctx, "tidb_app_optional_indexes_skipped",
-				zap.Int("skipped_count", skipped),
-				zap.String("reason", "allow_unsupported_optional_indexes"))
-		}
-	} else if err := ExecSchemaStatementsContext(ctx, db, tidbAppEmbeddingOptionalSchemaStatements()); err != nil {
+	if err := ValidateMySQLNoEmbeddingTenantSchema(ctx, db); err != nil {
 		return err
 	}
-	return ValidateTiDBSchemaForMode(ctx, db, TiDBEmbeddingModeApp)
+	logger.Info(ctx, "tenant_mysql_no_embedding_schema_init_finished",
+		zap.Float64("duration_ms", float64(time.Since(start).Microseconds())/1000.0))
+	return nil
+}
+
+// ValidateMySQLNoEmbeddingTenantSchema performs a light contract check for the
+// local no-embedding schema. Production TiDB paths still use
+// ValidateTiDBSchemaForMode for exact schema validation.
+func ValidateMySQLNoEmbeddingTenantSchema(ctx context.Context, db *sql.DB) error {
+	if db == nil {
+		return fmt.Errorf("nil db")
+	}
+	required := []string{
+		"file_nodes",
+		"inodes",
+		"contents",
+		"semantic",
+		"uploads",
+		"fs_layers",
+		"fs_layer_entries",
+		"fs_layer_checkpoints",
+		"journals",
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM information_schema.tables
+		WHERE table_schema = DATABASE()
+			AND table_name IN (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		required[0], required[1], required[2], required[3], required[4],
+		required[5], required[6], required[7], required[8],
+	).Scan(&count); err != nil {
+		return fmt.Errorf("validate local no-embedding schema: %w", err)
+	}
+	if count != len(required) {
+		return fmt.Errorf("local no-embedding schema missing required tables: got %d want %d", count, len(required))
+	}
+	return nil
 }

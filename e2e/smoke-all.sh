@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Run all drive9 smoke tests (API + CLI + journal + FUSE).
+# Run all drive9 smoke tests (API + CLI + journal + layer FS + FUSE).
 
 set -euo pipefail
 
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
+RUN_FUSE_SMOKE="${RUN_FUSE_SMOKE:-1}"
 
 PASS=0
 FAIL=0
@@ -35,7 +36,14 @@ echo "BASE=$BASE"
 run_case "api" "e2e/api-smoke-test.sh"
 run_case "cli" "e2e/cli-smoke-test.sh"
 run_case "journal" "e2e/journal-smoke-test.sh"
-run_case "fuse" "e2e/fuse-smoke-test.sh"
+run_case "layer-fs" "e2e/layer-fs-smoke-test.sh"
+if [ "$RUN_FUSE_SMOKE" = "1" ]; then
+  run_case "fuse" "e2e/fuse-smoke-test.sh"
+else
+  echo
+  echo "=== [fuse] e2e/fuse-smoke-test.sh ==="
+  echo "SKIP [fuse] set RUN_FUSE_SMOKE=1 to run FUSE symlink/hardlink coverage"
+fi
 run_case "posix-permission" "e2e/posix-permission-smoke-test.sh"
 if [ "$RUN_GIT_WORKSPACE_SMOKE" = "1" ]; then
   run_case "git-workspace" "e2e/git-workspace-smoke-test.sh"

@@ -48,6 +48,8 @@ type MountOptions struct {
 	SyncMode                SyncMode      // interactive, strict, or auto (default auto)
 	WritePolicy             WritePolicy   // writeback, close-sync, or write-sync (default writeback)
 	Profile                 string        // mount profile: "interactive", "coding-agent", "" (default)
+	LayerRef                string        // optional writable fs layer ref (layer_id, name, or tag ref)
+	CheckpointRef           string        // optional checkpoint ref to restore as the layer view baseline
 	LocalRoot               string        // local-only overlay root for coding-agent mounts
 	LocalOnlyPatterns       []string      // additional local-only path patterns for coding-agent mounts
 	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for coding-agent mounts
@@ -174,6 +176,11 @@ func Mount(opts *MountOptions) error {
 	if opts.APIKey == "" && opts.Token == "" {
 		return fmt.Errorf("mount: either APIKey (owner) or Token (delegated) is required")
 	}
+	opts.LayerRef = strings.TrimSpace(opts.LayerRef)
+	opts.CheckpointRef = strings.TrimSpace(opts.CheckpointRef)
+	if opts.CheckpointRef != "" && opts.LayerRef == "" {
+		return fmt.Errorf("mount: CheckpointRef requires LayerRef")
+	}
 
 	// Generate per-mount actor ID for SSE self-filtering.
 	actorID := generateMountID()
@@ -219,6 +226,17 @@ func Mount(opts *MountOptions) error {
 		} else if !stat.IsDir {
 			return fmt.Errorf("remote root %q is not a directory", remoteRoot)
 		}
+	}
+	if opts.LayerRef != "" {
+		layer, err := c.GetFSLayer(context.Background(), opts.LayerRef)
+		if err != nil {
+			return fmt.Errorf("mount: resolve fs layer %q: %w", opts.LayerRef, err)
+		}
+		if layer.State != "active" {
+			return fmt.Errorf("mount: fs layer %q is %s, want active", opts.LayerRef, layer.State)
+		}
+		opts.LayerRef = layer.LayerID
+		fmt.Fprintf(os.Stderr, "drive9: fs layer: %s\n", layer.LayerID)
 	}
 
 	// Build FUSE filesystem
@@ -324,10 +342,16 @@ func Mount(opts *MountOptions) error {
 			// Initialize CommitQueue for background remote commits.
 			if shadowStore != nil && pendingIdx != nil {
 				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending, opts.RemoteRoot)
+				cq.SetLayerRef(opts.LayerRef)
 				cq.SetPerfCounters(dat9fs.perf)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
 				cq.OnCleanup = dat9fs.onCommitQueueCleanup
 				cq.RecoverPending()
+				if opts.LayerRef != "" {
+					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
+						fmt.Fprintf(os.Stderr, "drive9: restore fs layer entries failed: %v\n", err)
+					}
+				}
 				dat9fs.commitQueue = cq
 			}
 
@@ -544,6 +568,123 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	}
 	if err := validateLocalPolicyPatterns(opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns); err != nil {
 		return fmt.Errorf("mount: %w", err)
+	}
+	return nil
+}
+
+func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS) error {
+	if c == nil || opts == nil || shadows == nil || pending == nil || strings.TrimSpace(opts.LayerRef) == "" {
+		return nil
+	}
+	var maxSeq int64
+	hasCheckpoint := false
+	if strings.TrimSpace(opts.CheckpointRef) != "" {
+		checkpoint, err := c.GetFSLayerCheckpoint(ctx, opts.CheckpointRef)
+		if err != nil {
+			return fmt.Errorf("read fs layer checkpoint %s: %w", opts.CheckpointRef, err)
+		}
+		if checkpoint.LayerID != opts.LayerRef {
+			return fmt.Errorf("checkpoint %s belongs to layer %s, want %s", opts.CheckpointRef, checkpoint.LayerID, opts.LayerRef)
+		}
+		maxSeq = checkpoint.DurableSeq
+		hasCheckpoint = true
+	}
+	entries, err := c.DiffFSLayer(ctx, opts.LayerRef)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if hasCheckpoint && entry.EntrySeq > maxSeq {
+			continue
+		}
+		localPath, ok := mountpath.ToLocal(opts.RemoteRoot, entry.Path)
+		if !ok {
+			continue
+		}
+		switch entry.Op {
+		case "whiteout":
+			if fs != nil {
+				fs.markLayerWhiteout(localPath)
+			}
+			continue
+		case "mkdir":
+			if fs != nil {
+				fs.markLayerDir(localPath, entry.Mode)
+			}
+			continue
+		case "rename":
+			if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry); err != nil {
+				return err
+			}
+			continue
+		}
+		if entry.Op != "upsert" || entry.Kind != "file" {
+			continue
+		}
+		if _, ok := pending.GetMeta(localPath); ok {
+			continue
+		}
+		fullEntry, err := c.GetFSLayerEntry(ctx, opts.LayerRef, entry.Path)
+		if err != nil {
+			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
+		}
+		if err := shadows.WriteFull(localPath, fullEntry.Content, fullEntry.BaseRevision); err != nil {
+			return fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
+		}
+		kind := PendingOverwrite
+		if fullEntry.BaseRevision == 0 {
+			kind = PendingNew
+		}
+		if _, err := pending.PutWithBaseRevAndMode(localPath, int64(len(fullEntry.Content)), kind, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
+		}
+	}
+	return nil
+}
+
+func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry) error {
+	if entry == nil {
+		return nil
+	}
+	fullEntry := entry
+	if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
+		fetched, err := c.GetFSLayerEntry(ctx, opts.LayerRef, entry.Path)
+		if err != nil {
+			return fmt.Errorf("restore fs layer rename entry %s: %w", entry.Path, err)
+		}
+		fullEntry = fetched
+	}
+	targetRemote := strings.TrimSpace(fullEntry.ContentText)
+	if targetRemote == "" && len(fullEntry.Content) > 0 {
+		targetRemote = strings.TrimSpace(string(fullEntry.Content))
+	}
+	if targetRemote == "" {
+		return fmt.Errorf("restore fs layer rename entry %s: missing target", entry.Path)
+	}
+	if fs != nil {
+		fs.markLayerWhiteout(oldLocalPath)
+	}
+	newLocalPath, ok := mountpath.ToLocal(opts.RemoteRoot, targetRemote)
+	if !ok {
+		return nil
+	}
+	movedShadow := shadows.Rename(oldLocalPath, newLocalPath)
+	movedPending := pending.RenamePending(oldLocalPath, newLocalPath)
+	if movedShadow || movedPending {
+		return nil
+	}
+	if pending.HasPending(newLocalPath) {
+		return nil
+	}
+	data, err := c.ReadCtx(ctx, fullEntry.Path)
+	if err != nil {
+		return fmt.Errorf("restore fs layer renamed source %s: %w", fullEntry.Path, err)
+	}
+	if err := shadows.WriteFull(newLocalPath, data, 0); err != nil {
+		return fmt.Errorf("restore fs layer renamed shadow %s: %w", newLocalPath, err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode(newLocalPath, int64(len(data)), PendingNew, 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+		return fmt.Errorf("restore fs layer renamed pending %s: %w", newLocalPath, err)
 	}
 	return nil
 }
