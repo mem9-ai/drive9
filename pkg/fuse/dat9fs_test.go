@@ -13822,6 +13822,45 @@ func TestOnCommitQueueSuccess_NoKernelNotify_SeedsReadCache(t *testing.T) {
 	}
 }
 
+func TestOnCommitQueueSuccessMultipartRefreshesInodeSize(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	filePath := "/final/w0/file-000.txt"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("initial inode entry not found")
+	}
+	if entry.Size != 0 {
+		t.Fatalf("initial inode size = %d, want 0", entry.Size)
+	}
+
+	const wantSize = 32820
+	fs.onCommitQueueSuccess(&CommitEntry{
+		Path:  filePath,
+		Inode: ino,
+		Size:  wantSize,
+	}, 0)
+
+	entry, ok = fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Size != wantSize {
+		t.Fatalf("inode size = %d, want %d", entry.Size, wantSize)
+	}
+
+	lookup := fs.dirCache.Lookup("/final/w0", "file-000.txt")
+	if lookup.kind != namespaceLookupPositive {
+		t.Fatal("dirCache entry not found")
+	}
+	if lookup.item.Size != wantSize {
+		t.Fatalf("dirCache size = %d, want %d", lookup.item.Size, wantSize)
+	}
+}
+
 // TestSSEForeignChange_StillNotifiesKernel verifies that SSE-driven
 // invalidation (from a foreign actor) still produces kernel notify calls
 // through the actual SSEWatcher.handleEvent code path. Only local-initiated

@@ -9014,8 +9014,12 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		// are updated above. Kernel will see new attrs on next access.
 	} else {
 		fs.invalidateReadCacheAndTargets(entry.Path)
-		if entry.HasMode && entry.Inode > 0 {
-			fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
+		if entry.Inode > 0 {
+			fs.inodes.UpdateSize(entry.Inode, entry.Size)
+			fs.inodes.UpdateMtime(entry.Inode, time.Now())
+			if entry.HasMode {
+				fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
+			}
 		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
 	}
