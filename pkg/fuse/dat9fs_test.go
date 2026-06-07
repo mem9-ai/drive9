@@ -219,6 +219,76 @@ func TestNegotiatedInlineThresholdSeparatesProtocolFromHeuristic(t *testing.T) {
 	}
 }
 
+func TestUnknownInlineThresholdNonEmptyHandleUploadUsesMultipart(t *testing.T) {
+	const filePath = "/unknown-threshold.bin"
+	data := []byte("non-empty write before inline threshold warmup")
+
+	for _, tc := range []struct {
+		name string
+		run  func(*Dat9FS, *FileHandle) gofuse.Status
+	}{
+		{
+			name: "flush",
+			run: func(fs *Dat9FS, fh *FileHandle) gofuse.Status {
+				return fs.flushHandle(context.Background(), fh)
+			},
+		},
+		{
+			name: "write-sync",
+			run: func(fs *Dat9FS, fh *FileHandle) gofuse.Status {
+				return fs.syncWriteHandleToRemoteLocked(context.Background(), fh)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expectedRevision := int64(0)
+			rec := newMultipartUploadRecorder(t, filePath, int64(len(data)), &expectedRevision)
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(client.New(rec.server.URL, ""), opts)
+			if got := fs.negotiatedInlineThreshold(); got != 0 {
+				t.Fatalf("negotiatedInlineThreshold = %d, want 0", got)
+			}
+
+			ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+			fh := &FileHandle{
+				Ino:      ino,
+				Path:     filePath,
+				Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+				IsNew:    true,
+				OrigSize: 0,
+			}
+			if _, err := fh.Dirty.Write(0, data); err != nil {
+				t.Fatal(err)
+			}
+			fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+
+			fh.Lock()
+			st := tc.run(fs, fh)
+			fh.Unlock()
+			if st != gofuse.OK {
+				t.Fatalf("upload status = %v, want OK", st)
+			}
+			if got := rec.directFilePuts.Load(); got != 0 {
+				t.Fatalf("direct PUT calls = %d, want 0", got)
+			}
+			if got := rec.initiateCalls.Load(); got != 1 {
+				t.Fatalf("multipart initiate calls = %d, want 1", got)
+			}
+			if got := rec.completeCalls.Load(); got != 1 {
+				t.Fatalf("multipart complete calls = %d, want 1", got)
+			}
+			rec.mu.Lock()
+			uploadedBytes := rec.gotUploadedBytes
+			rec.mu.Unlock()
+			if uploadedBytes != int64(len(data)) {
+				t.Fatalf("uploaded bytes = %d, want %d", uploadedBytes, len(data))
+			}
+		})
+	}
+}
+
 func BenchmarkDat9FS_SmallFileOpen(b *testing.B) {
 	const (
 		filePath = "/file.bin"

@@ -6966,7 +6966,7 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
 			fs.debugDurationf(writeStart, 0, "write-sync small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
 		}
-	} else if fh.OrigSize >= threshold {
+	} else if threshold > 0 && fh.OrigSize >= threshold {
 		dirtyParts := fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {
 			partSnapshots := make(map[int][]byte, len(dirtyParts))
@@ -8387,7 +8387,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
 			fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
 		}
-	} else if fh.OrigSize >= threshold {
+	} else if threshold > 0 && fh.OrigSize >= threshold {
 		phase = "patch-file"
 		dirtyParts := fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {

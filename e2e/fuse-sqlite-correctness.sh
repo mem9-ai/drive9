@@ -387,22 +387,32 @@ def scalar(conn, sql, params=()):
     return conn.execute(sql, params).fetchone()[0]
 
 
+def fingerprint_items(conn):
+    rows = list(conn.execute("SELECT id, checksum, payload FROM items ORDER BY id"))
+    digest = hashlib.sha256()
+    payload_bytes = 0
+    for item_id, item_checksum, item_payload in rows:
+        actual_checksum = checksum(item_payload)
+        if actual_checksum != item_checksum:
+            raise AssertionError(
+                f"payload checksum mismatch row={item_id} stored={item_checksum} actual={actual_checksum}"
+            )
+        digest.update(actual_checksum.encode())
+        digest.update(b"\n")
+        payload_bytes += len(item_payload)
+    return len(rows), payload_bytes, digest.hexdigest()
+
+
 def fingerprint(conn):
     integrity = scalar(conn, "PRAGMA integrity_check")
     if integrity != "ok":
         raise AssertionError(f"integrity_check={integrity}")
-    rows = list(conn.execute("SELECT checksum, LENGTH(payload) FROM items ORDER BY id"))
-    digest = hashlib.sha256()
-    payload_bytes = 0
-    for item_checksum, item_size in rows:
-        digest.update(item_checksum.encode())
-        digest.update(b"\n")
-        payload_bytes += item_size
+    row_count, payload_bytes, checksums_digest = fingerprint_items(conn)
     rolled_back = scalar(conn, "SELECT COUNT(*) FROM items WHERE bucket='rolled_back'")
     return {
-        "count": len(rows),
+        "count": row_count,
         "payload_bytes": payload_bytes,
-        "checksums_digest": digest.hexdigest(),
+        "checksums_digest": checksums_digest,
         "rolled_back_rows": rolled_back,
     }
 
@@ -730,6 +740,22 @@ def scalar(conn, sql, params=()):
     return conn.execute(sql, params).fetchone()[0]
 
 
+def fingerprint_items(conn, path):
+    rows = list(conn.execute("SELECT id, checksum, payload FROM items ORDER BY id"))
+    digest = hashlib.sha256()
+    payload_bytes = 0
+    for item_id, item_checksum, item_payload in rows:
+        actual_checksum = hashlib.sha256(item_payload).hexdigest()
+        if actual_checksum != item_checksum:
+            raise AssertionError(
+                f"{path}: payload checksum mismatch row={item_id} stored={item_checksum} actual={actual_checksum}"
+            )
+        digest.update(actual_checksum.encode())
+        digest.update(b"\n")
+        payload_bytes += len(item_payload)
+    return len(rows), payload_bytes, digest.hexdigest()
+
+
 def fingerprint(path, expected_case):
     if not os.path.exists(path):
         raise AssertionError(f"missing sqlite db: {path}")
@@ -741,18 +767,12 @@ def fingerprint(path, expected_case):
     journal = scalar(conn, "PRAGMA journal_mode").lower()
     if journal != expected_journal:
         raise AssertionError(f"{path}: journal_mode={journal} want={expected_journal}")
-    rows = list(conn.execute("SELECT checksum, LENGTH(payload) FROM items ORDER BY id"))
-    digest = hashlib.sha256()
-    payload_bytes = 0
-    for item_checksum, item_size in rows:
-        digest.update(item_checksum.encode())
-        digest.update(b"\n")
-        payload_bytes += item_size
+    row_count, payload_bytes, checksums_digest = fingerprint_items(conn, path)
     rolled_back = scalar(conn, "SELECT COUNT(*) FROM items WHERE bucket='rolled_back'")
     out = {
-        "count": len(rows),
+        "count": row_count,
         "payload_bytes": payload_bytes,
-        "checksums_digest": digest.hexdigest(),
+        "checksums_digest": checksums_digest,
         "rolled_back_rows": rolled_back,
         "journal_mode": journal,
     }
