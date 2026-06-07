@@ -853,6 +853,31 @@ func TestCommitQueueLayerModeRetainsShadowAndPendingAfterUpload(t *testing.T) {
 	if !pending.HasPending("/layered.bin") {
 		t.Fatal("layer pending metadata should be retained after upload")
 	}
+	meta, ok := pending.GetMeta("/layered.bin")
+	if !ok || meta.Kind != PendingOverwrite {
+		t.Fatalf("layer pending metadata after upload = %+v, want PendingOverwrite", meta)
+	}
+	data2 := []byte("layer data v2")
+	if err := shadow.WriteFull("/layered.bin", data2, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/layered.bin", int64(len(data2)), PendingOverwrite, 0); err != nil {
+		t.Fatal(err)
+	}
+	cq2 := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq2.SetLayerRef("layer-1")
+	if err := cq2.Enqueue(&CommitEntry{
+		Path:    "/layered.bin",
+		BaseRev: 0,
+		Size:    int64(len(data2)),
+		Kind:    PendingOverwrite,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq2.DrainAll()
+	if !bytes.Equal(gotContent, data2) {
+		t.Fatalf("second uploaded content = %q, want %q", gotContent, data2)
+	}
 }
 
 // --- Auto-resolve tests (LWW MVP) ---

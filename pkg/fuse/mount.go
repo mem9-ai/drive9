@@ -657,11 +657,7 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		if err := shadows.WriteFull(localPath, fullEntry.Content, fullEntry.BaseRevision); err != nil {
 			return fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
 		}
-		kind := PendingOverwrite
-		if fullEntry.BaseRevision == 0 {
-			kind = PendingNew
-		}
-		if _, err := pending.PutWithBaseRevAndMode(localPath, int64(len(fullEntry.Content)), kind, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+		if _, err := pending.PutWithBaseRevAndMode(localPath, int64(len(fullEntry.Content)), PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
 			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
 		}
 	}
@@ -716,7 +712,7 @@ func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountO
 	if err := shadows.WriteFull(newLocalPath, data, 0); err != nil {
 		return fmt.Errorf("restore fs layer renamed shadow %s: %w", newLocalPath, err)
 	}
-	if _, err := pending.PutWithBaseRevAndMode(newLocalPath, int64(len(data)), PendingNew, 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+	if _, err := pending.PutWithBaseRevAndMode(newLocalPath, int64(len(data)), PendingOverwrite, 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
 		return fmt.Errorf("restore fs layer renamed pending %s: %w", newLocalPath, err)
 	}
 	return nil

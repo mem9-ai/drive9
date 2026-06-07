@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"syscall"
 	"testing"
 	"time"
 
@@ -95,6 +96,9 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if !pending.HasPending("/a.txt") {
 		t.Fatal("a.txt pending metadata missing")
 	}
+	if meta, ok := pending.GetMeta("/a.txt"); !ok || meta.Kind != PendingOverwrite {
+		t.Fatalf("a.txt pending meta = %+v, want PendingOverwrite", meta)
+	}
 	if !fs.isLayerWhiteout("/old.txt") {
 		t.Fatal("old.txt whiteout missing")
 	}
@@ -117,6 +121,9 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if !pending.HasPending("/renamed-to.txt") {
 		t.Fatal("renamed target pending metadata missing")
 	}
+	if meta, ok := pending.GetMeta("/renamed-to.txt"); !ok || meta.Kind != PendingOverwrite {
+		t.Fatalf("renamed target pending meta = %+v, want PendingOverwrite", meta)
+	}
 	if pending.HasPending("/b.txt") || shadow.Has("/b.txt") {
 		t.Fatal("b.txt should not be restored past checkpoint seq")
 	}
@@ -138,6 +145,68 @@ func TestLayerSymlinkReadlinkUsesLayerTarget(t *testing.T) {
 	}
 	if !bytes.Equal(got, []byte("target.txt")) {
 		t.Fatalf("Readlink target = %q, want target.txt", got)
+	}
+}
+
+func TestLayerChmodUsesDirectoryKind(t *testing.T) {
+	var got clientLayerEntryRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode layer entry: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+			LayerID: "layer-1",
+			Path:    got.Path,
+			Op:      got.Op,
+			Kind:    got.Kind,
+			Mode:    got.Mode,
+		})
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	fs.markLayerDir("/dir", 0o755)
+	if err := fs.upsertLayerChmod(context.Background(), "/dir", 0o700); err != nil {
+		t.Fatalf("upsertLayerChmod: %v", err)
+	}
+	if got.Path != "/repo/dir" || got.Op != "chmod" || got.Kind != "dir" || got.Mode != 0o700 {
+		t.Fatalf("chmod request = %+v, want directory chmod", got)
+	}
+	if mode, ok := fs.layerDirMode("/dir"); !ok || mode != 0o700 {
+		t.Fatalf("layer dir mode = (%#o, %t), want 0700 true", mode, ok)
+	}
+}
+
+func TestLayerRmdirRejectsOverlayOnlyChildren(t *testing.T) {
+	fs := NewDat9FS(client.New("http://127.0.0.1", ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.pendingIndex = pending
+	if _, err := pending.PutWithBaseRev("/dir/file.txt", 1, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	fs.inodes.Lookup("/dir", true, 0, time.Now())
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.Status(syscall.ENOTEMPTY) {
+		t.Fatalf("Rmdir status = %v, want ENOTEMPTY", st)
+	}
+	if !pending.HasPending("/dir/file.txt") {
+		t.Fatal("pending child was removed despite failed rmdir")
 	}
 }
 

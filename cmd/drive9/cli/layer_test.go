@@ -50,6 +50,14 @@ func TestLayerCreatePrintsLayerID(t *testing.T) {
 	}
 }
 
+func TestLayerCreateRejectsDuplicateTag(t *testing.T) {
+	c := client.New("http://127.0.0.1", "")
+	err := Layer(c, []string{"create", "--tag", "task=auth", "--tag", "task=review", ":/repo"})
+	if err == nil || !strings.Contains(err.Error(), `duplicate layer tag "task"`) {
+		t.Fatalf("Layer create duplicate tag err=%v, want duplicate tag error", err)
+	}
+}
+
 func TestLayerCommitPrintsResult(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/task=auth/commit" {

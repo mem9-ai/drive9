@@ -219,3 +219,21 @@ func TestFSLayerCommitRollsBackAppliedEntriesOnFailure(t *testing.T) {
 		t.Fatalf("layer state=%s, want conflicted", layer.State)
 	}
 }
+
+func TestFSLayerCommitPreflightChecksBaseInodeID(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if err := s.fallback.MkdirCtx(ctx, "/repo", 0o755); err != nil {
+		t.Fatalf("MkdirCtx: %v", err)
+	}
+	conflicts := preflightFSLayerCommit(ctx, s.fallback, []datastore.FSLayerEntry{{
+		Path:        "/repo/",
+		Op:          datastore.FSLayerEntryOpChmod,
+		Kind:        datastore.FSLayerEntryKindDir,
+		BaseInodeID: "stale-inode",
+		Mode:        0o700,
+	}})
+	if len(conflicts) != 1 || conflicts[0].Reason != "base inode changed" {
+		t.Fatalf("conflicts=%+v, want base inode changed", conflicts)
+	}
+}

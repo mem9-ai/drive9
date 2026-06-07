@@ -7,6 +7,8 @@ BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 API_KEY="${DRIVE9_API_KEY:-}"
 POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-120}"
 POLL_INTERVAL_S="${POLL_INTERVAL_S:-5}"
+REQUEST_MAX_RETRIES="${REQUEST_MAX_RETRIES:-8}"
+REQUEST_RETRY_SLEEP_S="${REQUEST_RETRY_SLEEP_S:-2}"
 CLI_SOURCE="${CLI_SOURCE:-build}"
 CLI_RELEASE_BASE_URL="${CLI_RELEASE_BASE_URL:-https://drive9.ai/releases}"
 CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
@@ -74,19 +76,45 @@ curl_body_code() {
   local data="${4:-}"
   local body_file
   local code
+  local curl_rc
+  local attempt
+  local -a args
 
   body_file="$(mktemp)"
-  if [ -n "$auth" ] && [ -n "$data" ]; then
-    code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" \
-      -H "Authorization: Bearer $auth" \
-      -H "Content-Type: application/json" \
-      --data-binary "$data" "$url")
-  elif [ -n "$auth" ]; then
-    code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" \
-      -H "Authorization: Bearer $auth" "$url")
-  else
-    code=$(curl -sS -o "$body_file" -w "%{http_code}" -X "$method" "$url")
-  fi
+  attempt=1
+  while :; do
+    : >"$body_file"
+    args=(-sS -o "$body_file" -w "%{http_code}" -X "$method")
+    if [ -n "$auth" ]; then
+      args+=(-H "Authorization: Bearer $auth")
+    fi
+    if [ -n "$data" ]; then
+      args+=(-H "Content-Type: application/json" --data-binary "$data")
+    fi
+    if code=$(curl "${args[@]}" "$url"); then
+      curl_rc=0
+    else
+      curl_rc=$?
+      code="000"
+    fi
+    if [ "$attempt" -ge "$REQUEST_MAX_RETRIES" ]; then
+      break
+    fi
+    case "$code" in
+      000|429|5??)
+        echo "retrying $method $url after HTTP $code (attempt $attempt/$REQUEST_MAX_RETRIES)" >&2
+        sleep "$REQUEST_RETRY_SLEEP_S"
+        attempt=$((attempt + 1))
+        continue
+        ;;
+    esac
+    if [ "$curl_rc" -eq 0 ]; then
+      break
+    fi
+    echo "retrying $method $url after curl exit $curl_rc (attempt $attempt/$REQUEST_MAX_RETRIES)" >&2
+    sleep "$REQUEST_RETRY_SLEEP_S"
+    attempt=$((attempt + 1))
+  done
   cat "$body_file"
   echo
   echo "__HTTP__${code}"
@@ -226,11 +254,10 @@ echo "=== drive9 layer filesystem smoke test ==="
 echo "BASE=$BASE"
 
 check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
+check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
 check_cmd "python3 is available" bash -c 'command -v python3 >/dev/null'
 if [ "$CLI_SOURCE" = "build" ]; then
   check_cmd "go is available" bash -c 'command -v go >/dev/null'
-else
-  check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
 fi
 
 if [ -z "$API_KEY" ]; then

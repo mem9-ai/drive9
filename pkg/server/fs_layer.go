@@ -771,6 +771,31 @@ func preflightFSLayerCommit(ctx context.Context, b *backendpkg.Dat9Backend, entr
 			continue
 		}
 		if entry.BaseRevision <= 0 {
+			nf, err := b.StatNodeCtx(ctx, entry.Path)
+			if errors.Is(err, datastore.ErrNotFound) {
+				conflicts = append(conflicts, fsLayerCommitConflict{
+					Path:   entry.Path,
+					Reason: "base path missing",
+				})
+				continue
+			}
+			if err != nil {
+				conflicts = append(conflicts, fsLayerCommitConflict{Path: entry.Path, Reason: err.Error()})
+				continue
+			}
+			baseInodeID := ""
+			if nf.Node.InodeID != "" {
+				baseInodeID = nf.Node.InodeID
+			}
+			if nf.File != nil && nf.File.FileID != "" {
+				baseInodeID = nf.File.FileID
+			}
+			if baseInodeID != entry.BaseInodeID {
+				conflicts = append(conflicts, fsLayerCommitConflict{
+					Path:   entry.Path,
+					Reason: "base inode changed",
+				})
+			}
 			continue
 		}
 		nf, err := b.StatNodeCtx(ctx, entry.Path)

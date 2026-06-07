@@ -228,16 +228,19 @@ func ValidateMySQLNoEmbeddingTenantSchema(ctx context.Context, db *sql.DB) error
 		"uploads",
 		"fs_layers",
 		"fs_layer_entries",
+		"fs_layer_tags",
+		"fs_layer_events",
 		"fs_layer_checkpoints",
 		"journals",
 	}
 	var count int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
-		FROM information_schema.tables
-		WHERE table_schema = DATABASE()
-			AND table_name IN (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			FROM information_schema.tables
+			WHERE table_schema = DATABASE()
+				AND table_name IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		required[0], required[1], required[2], required[3], required[4],
-		required[5], required[6], required[7], required[8],
+		required[5], required[6], required[7], required[8], required[9],
+		required[10],
 	).Scan(&count); err != nil {
 		return fmt.Errorf("validate local no-embedding schema: %w", err)
 	}

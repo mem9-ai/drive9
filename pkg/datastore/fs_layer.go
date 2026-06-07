@@ -361,12 +361,15 @@ func (s *Store) UpsertFSLayerEntry(ctx context.Context, entry *FSLayerEntry) err
 		return fmt.Errorf("begin upsert fs layer entry transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	var existingLayerID string
-	if err := tx.QueryRowContext(ctx, `SELECT layer_id FROM fs_layers WHERE layer_id = ? FOR UPDATE`, entry.LayerID).Scan(&existingLayerID); err != nil {
+	var baseRoot string
+	if err := tx.QueryRowContext(ctx, `SELECT base_root_path FROM fs_layers WHERE layer_id = ? FOR UPDATE`, entry.LayerID).Scan(&baseRoot); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		return fmt.Errorf("read fs layer %s: %w", entry.LayerID, err)
+	}
+	if err := validateFSLayerEntryWithinBaseRoot(entry, baseRoot); err != nil {
+		return err
 	}
 	if entry.EntrySeq <= 0 {
 		var seq sql.NullInt64
@@ -517,7 +520,7 @@ func (s *Store) CreateFSLayerCheckpoint(ctx context.Context, checkpoint *FSLayer
 	}
 	defer func() { _ = tx.Rollback() }()
 	var existingLayerID string
-	if err := tx.QueryRowContext(ctx, `SELECT layer_id FROM fs_layers WHERE layer_id = ?`, checkpoint.LayerID).Scan(&existingLayerID); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT layer_id FROM fs_layers WHERE layer_id = ? FOR UPDATE`, checkpoint.LayerID).Scan(&existingLayerID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
@@ -529,6 +532,8 @@ func (s *Store) CreateFSLayerCheckpoint(ctx context.Context, checkpoint *FSLayer
 	}
 	if seq.Valid {
 		checkpoint.DurableSeq = seq.Int64
+	} else {
+		checkpoint.DurableSeq = 0
 	}
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO fs_layer_checkpoints (checkpoint_id, layer_id, durable_seq, label, created_at)
@@ -716,7 +721,14 @@ func normalizeFSLayerEntry(entry *FSLayerEntry) error {
 		return err
 	}
 	if entry.Kind == "" {
-		entry.Kind = FSLayerEntryKindFile
+		switch entry.Op {
+		case FSLayerEntryOpMkdir:
+			entry.Kind = FSLayerEntryKindDir
+		case FSLayerEntryOpSymlink:
+			entry.Kind = FSLayerEntryKindSymlink
+		default:
+			entry.Kind = FSLayerEntryKindFile
+		}
 	}
 	if err := validateFSLayerEntryKind(entry.Kind); err != nil {
 		return err
@@ -748,6 +760,44 @@ func normalizeFSLayerEntry(entry *FSLayerEntry) error {
 		entry.StorageRefHash = StorageRefHash(entry.StorageRef)
 	}
 	return nil
+}
+
+func validateFSLayerEntryWithinBaseRoot(entry *FSLayerEntry, baseRoot string) error {
+	root, err := pathutil.CanonicalizeDir(baseRoot)
+	if err != nil {
+		return fmt.Errorf("invalid fs layer base root: %w", err)
+	}
+	if !fsLayerPathWithinBaseRoot(entry.Path, root) {
+		return fmt.Errorf("fs layer entry path %q is outside base root %q", entry.Path, root)
+	}
+	if entry.Op != FSLayerEntryOpRename {
+		return nil
+	}
+	target := strings.TrimSpace(entry.ContentText)
+	if target == "" && len(entry.ContentBlob) > 0 {
+		target = strings.TrimSpace(string(entry.ContentBlob))
+	}
+	if target == "" {
+		return nil
+	}
+	targetPath, err := canonicalFSLayerLookupPath(target)
+	if err != nil {
+		return fmt.Errorf("invalid fs layer rename target: %w", err)
+	}
+	if !fsLayerPathWithinBaseRoot(targetPath, root) {
+		return fmt.Errorf("fs layer rename target %q is outside base root %q", targetPath, root)
+	}
+	return nil
+}
+
+func fsLayerPathWithinBaseRoot(p, baseRoot string) bool {
+	if baseRoot == "/" {
+		return strings.HasPrefix(p, "/")
+	}
+	if p == baseRoot {
+		return true
+	}
+	return strings.HasPrefix(p, baseRoot)
 }
 
 func validateFSLayerState(state FSLayerState) error {

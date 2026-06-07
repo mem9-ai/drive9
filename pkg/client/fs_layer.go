@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -353,6 +354,14 @@ func (c *Client) CommitFSLayer(ctx context.Context, layerID string) (*FSLayerCom
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusConflict {
+			body, _ := io.ReadAll(resp.Body)
+			var out FSLayerCommit
+			if err := json.Unmarshal(body, &out); err == nil && (out.Status != "" || len(out.Conflicts) > 0) {
+				return &out, &StatusError{StatusCode: resp.StatusCode, Message: "fs layer commit conflict"}
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+		}
 		return nil, readError(resp)
 	}
 	var out FSLayerCommit

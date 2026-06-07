@@ -19,6 +19,8 @@ LISTEN_ADDR="${DRIVE9_LISTEN_ADDR:-}"
 PUBLIC_URL="${DRIVE9_PUBLIC_URL:-}"
 SERVER_LOG="${DRIVE9_LOCAL_E2E_SERVER_LOG:-}"
 RUN_SMOKE_SCRIPT="${DRIVE9_LOCAL_E2E_SMOKE_SCRIPT:-e2e/smoke-all.sh}"
+POLL_TIMEOUT_S="${POLL_TIMEOUT_S:-90}"
+POLL_INTERVAL_S="${POLL_INTERVAL_S:-1}"
 
 DB_CONTAINER=""
 SERVER_PID=""
@@ -34,7 +36,11 @@ cleanup() {
   if [ -n "$DB_CONTAINER" ] && [ "$KEEP_DB" != "1" ]; then
     "$DB_RUNTIME" rm -f "$DB_CONTAINER" >/dev/null 2>&1 || true
   fi
-  rm -rf "$TMP_DIR"
+  if [ "$rc" -eq 0 ]; then
+    rm -rf "$TMP_DIR"
+  else
+    echo "Local smoke failed; preserving artifacts at $TMP_DIR" >&2
+  fi
   exit "$rc"
 }
 trap cleanup EXIT
@@ -88,7 +94,7 @@ start_mysql_container() {
     "$DB_IMAGE" >/dev/null
 
   local deadline port
-  deadline=$(($(date +%s) + 90))
+  deadline=$(($(date +%s) + POLL_TIMEOUT_S))
   port=""
   while :; do
     port=$("$DB_RUNTIME" port "$DB_CONTAINER" 3306/tcp 2>/dev/null | awk -F: 'END{print $NF}')
@@ -99,7 +105,7 @@ start_mysql_container() {
       echo "timed out waiting for container port mapping" >&2
       exit 1
     fi
-    sleep 1
+    sleep "$POLL_INTERVAL_S"
   done
 
   while :; do
@@ -111,7 +117,7 @@ start_mysql_container() {
       "$DB_RUNTIME" logs "$DB_CONTAINER" >&2 || true
       exit 1
     fi
-    sleep 2
+    sleep "$POLL_INTERVAL_S"
   done
 
   DRIVE9_LOCAL_DSN="root:${DB_PASSWORD}@tcp(127.0.0.1:${port})/${DB_NAME}?parseTime=true"
@@ -120,7 +126,7 @@ start_mysql_container() {
 
 wait_server() {
   local deadline code
-  deadline=$(($(date +%s) + 90))
+  deadline=$(($(date +%s) + POLL_TIMEOUT_S))
   while :; do
     code=$(curl -sS -o /dev/null -w "%{http_code}" "$PUBLIC_URL/healthz" 2>/dev/null || true)
     if [ "$code" = "200" ]; then
@@ -140,7 +146,7 @@ wait_server() {
       fi
       exit 1
     fi
-    sleep 1
+    sleep "$POLL_INTERVAL_S"
   done
 }
 
@@ -205,6 +211,8 @@ env -u DRIVE9_VAULT_TOKEN \
   RUN_UPLOAD_LIMIT_BOUNDARY="${RUN_UPLOAD_LIMIT_BOUNDARY:-0}" \
   RUN_CLI_UPLOAD_LIMIT_BOUNDARY="${RUN_CLI_UPLOAD_LIMIT_BOUNDARY:-0}" \
   RUN_FUSE_SMOKE="${RUN_FUSE_SMOKE:-0}" \
+  POLL_TIMEOUT_S="$POLL_TIMEOUT_S" \
+  POLL_INTERVAL_S="$POLL_INTERVAL_S" \
   LARGE_FILE_MB="${LARGE_FILE_MB:-8}" \
   CLI_LARGE_FILE_MB="${CLI_LARGE_FILE_MB:-8}" \
   CLI_SOURCE="${CLI_SOURCE:-build}" \

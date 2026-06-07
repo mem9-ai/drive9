@@ -679,11 +679,11 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	}
 
 	expectedRevision := entry.BaseRev
-	if entry.Kind == PendingOverwrite && expectedRevision <= 0 {
+	layerRef := cq.layerRefSnapshot()
+	if entry.Kind == PendingOverwrite && expectedRevision <= 0 && layerRef == "" {
 		return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
 	}
 	apiPath := cq.remotePath(entry.Path)
-	layerRef := cq.layerRefSnapshot()
 	if layerRef != "" {
 		return cq.uploadLayerEntry(ctx, layerRef, entry, apiPath, expectedRevision)
 	}
@@ -873,6 +873,11 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) e
 	}
 	if cq.index != nil && cq.layerRefSnapshot() == "" {
 		cq.index.Remove(entry.Path)
+	}
+	if cq.index != nil && cq.layerRefSnapshot() != "" {
+		if err := cq.index.MarkCommitted(entry.Path, committedRev); err != nil {
+			return err
+		}
 	}
 	if cq.OnCleanup != nil {
 		cq.OnCleanup(entry)

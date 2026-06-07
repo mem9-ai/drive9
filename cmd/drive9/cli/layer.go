@@ -284,6 +284,9 @@ func parseLayerTags(values []string) (map[string]string, error) {
 		if key == "" {
 			return nil, fmt.Errorf("invalid layer tag %q (empty key)", raw)
 		}
+		if _, exists := out[key]; exists {
+			return nil, fmt.Errorf("duplicate layer tag %q", key)
+		}
 		out[key] = strings.TrimSpace(value)
 	}
 	return out, nil

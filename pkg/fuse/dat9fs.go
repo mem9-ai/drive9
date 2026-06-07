@@ -494,12 +494,56 @@ func (fs *Dat9FS) upsertLayerWhiteout(ctx context.Context, localPath string, kin
 }
 
 func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode uint32) error {
-	return fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+	kind := fs.layerEntryKind(ctx, localPath)
+	if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
 		Path: fs.remotePath(localPath),
 		Op:   "chmod",
-		Kind: "file",
+		Kind: kind,
 		Mode: mode & 0o777,
-	}, 0)
+	}, 0); err != nil {
+		return err
+	}
+	switch kind {
+	case "dir":
+		fs.markLayerDir(localPath, mode)
+	case "symlink":
+		if target, _, ok := fs.layerSymlink(localPath); ok {
+			fs.markLayerSymlink(localPath, target, mode)
+		}
+	}
+	return nil
+}
+
+func (fs *Dat9FS) layerEntryKind(ctx context.Context, localPath string) string {
+	if _, ok := fs.layerDirMode(localPath); ok {
+		return "dir"
+	}
+	if _, _, ok := fs.layerSymlink(localPath); ok {
+		return "symlink"
+	}
+	if fs != nil && fs.inodes != nil {
+		if ino, ok := fs.inodes.GetInode(localPath); ok {
+			if entry, ok := fs.inodes.GetEntry(ino); ok {
+				if entry.IsDir {
+					return "dir"
+				}
+				if entryIsSymlink(entry) {
+					return "symlink"
+				}
+			}
+		}
+	}
+	if fs != nil && fs.client != nil {
+		if stat, err := fs.client.StatCtx(ctx, fs.remotePath(localPath)); err == nil && stat != nil {
+			if stat.IsDir {
+				return "dir"
+			}
+			if stat.HasMode && isSymlinkMode(stat.Mode) {
+				return "symlink"
+			}
+		}
+	}
+	return "file"
 }
 
 func (fs *Dat9FS) upsertLayerSymlink(ctx context.Context, localPath string, target string) error {
@@ -719,6 +763,37 @@ func (fs *Dat9FS) layerSymlink(localPath string) (string, uint32, bool) {
 	state, ok := fs.layerSymlinks[localPath]
 	fs.layerMu.RUnlock()
 	return state.Target, state.Mode, ok
+}
+
+func (fs *Dat9FS) layerDirHasOverlayChildren(localPath string) bool {
+	if fs == nil || !fs.layerEnabled() {
+		return false
+	}
+	prefix := strings.TrimRight(localPath, "/") + "/"
+	if prefix == "/" {
+		return true
+	}
+	if fs.pendingIndex != nil && len(fs.pendingIndex.ListByPrefix(prefix)) > 0 {
+		return true
+	}
+	if fs.writeBack != nil && len(fs.writeBack.ListByPrefix(prefix)) > 0 {
+		return true
+	}
+	fs.layerMu.RLock()
+	for p := range fs.layerDirs {
+		if p != localPath && strings.HasPrefix(p, prefix) {
+			fs.layerMu.RUnlock()
+			return true
+		}
+	}
+	for p := range fs.layerSymlinks {
+		if strings.HasPrefix(p, prefix) {
+			fs.layerMu.RUnlock()
+			return true
+		}
+	}
+	fs.layerMu.RUnlock()
+	return false
 }
 
 func (fs *Dat9FS) localOverlayForPath(ctx context.Context, localPath string) (*LocalOverlay, bool, gofuse.Status) {
@@ -4446,6 +4521,11 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	defer func() {
 		fs.debugf("rmdir done path=%s status=%d dur=%s", childP, status, time.Since(start))
 	}()
+
+	if fs.layerDirHasOverlayChildren(childP) {
+		status = gofuse.Status(syscall.ENOTEMPTY)
+		return status
+	}
 
 	deleteStart := time.Now()
 	fs.debugf("rmdir remote delete start path=%s", childP)
