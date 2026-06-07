@@ -243,6 +243,19 @@ func Mount(opts *MountOptions) error {
 		} else {
 			dat9fs.diskReadCache = diskReadCache
 		}
+		if !opts.ReadOnly {
+			transientRoot := filepath.Join(cacheBase, mountHash, "transient")
+			if err := os.MkdirAll(transientRoot, 0o700); err != nil {
+				fmt.Fprintf(os.Stderr, "drive9: transient local overlay init failed: %v (continuing without)\n", err)
+			} else {
+				transientOverlay := NewLocalOverlay(transientRoot)
+				if err := transientOverlay.EnsureRoot(); err != nil {
+					fmt.Fprintf(os.Stderr, "drive9: transient local overlay init failed: %v (continuing without)\n", err)
+				} else {
+					dat9fs.transientLocalOverlay = transientOverlay
+				}
+			}
+		}
 	}
 
 	// Initialize write-back cache, shadow store, and pending index.
@@ -326,6 +339,7 @@ func Mount(opts *MountOptions) error {
 			if wbCache != nil {
 				uploader := NewWriteBackUploader(c, wbCache, opts.UploadConcurrency, opts.RemoteRoot)
 				uploader.SetPerfCounters(dat9fs.perf)
+				uploader.OnSuccess = dat9fs.onWriteBackUploadSuccess
 				dat9fs.SetWriteBack(wbCache, uploader)
 				// Recover pending uploads only when the newer commit queue is
 				// unavailable. Otherwise commitQueue owns shadow-backed recovery.

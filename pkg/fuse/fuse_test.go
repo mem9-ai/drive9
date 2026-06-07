@@ -1442,6 +1442,22 @@ func TestStreamUploader_NotStartedBeforeUploadAll(t *testing.T) {
 	}
 }
 
+func TestStreamUploaderRefreshExpectedRevisionAfterBufferedPart(t *testing.T) {
+	su := NewStreamUploader(nil, "/test", 7)
+	if err := su.SubmitPart(context.Background(), 1, []byte("part"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !su.Started() {
+		t.Fatal("SubmitPart should mark buffered streaming as started")
+	}
+	if !su.RefreshExpectedRevision(8) {
+		t.Fatal("RefreshExpectedRevision should succeed before remote writer exists")
+	}
+	if got := su.ExpectedRevision(); got != 8 {
+		t.Fatalf("ExpectedRevision = %d, want 8", got)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Sequential write detection tests
 // ---------------------------------------------------------------------------
