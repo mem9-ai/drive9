@@ -68,7 +68,7 @@ func (o *LocalOverlay) Mkdir(localPath string, mode uint32) error {
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return err
 	}
-	return os.Mkdir(abs, fs.FileMode(mode&posixPermissionModeMask))
+	return os.Mkdir(abs, localOverlayFileMode(mode))
 }
 
 func (o *LocalOverlay) OpenFile(localPath string, flags uint32, mode uint32) (*os.File, error) {
@@ -81,7 +81,7 @@ func (o *LocalOverlay) OpenFile(localPath string, flags uint32, mode uint32) (*o
 			return nil, err
 		}
 	}
-	return os.OpenFile(abs, int(flags), fs.FileMode(mode&posixPermissionModeMask))
+	return os.OpenFile(abs, int(flags), localOverlayFileMode(mode))
 }
 
 func (o *LocalOverlay) Symlink(target, localPath string) error {
@@ -146,7 +146,7 @@ func (o *LocalOverlay) Chmod(localPath string, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	return os.Chmod(abs, fs.FileMode(mode&posixPermissionModeMask))
+	return os.Chmod(abs, localOverlayFileMode(mode))
 }
 
 func (o *LocalOverlay) Truncate(localPath string, size int64) error {
@@ -221,7 +221,7 @@ func inodeModeFromFileInfo(info fs.FileInfo) (mode uint32, hasMode bool, isDir b
 	if info == nil {
 		return 0, false, false
 	}
-	perm := uint32(info.Mode().Perm())
+	perm := localOverlayPOSIXMode(info.Mode())
 	switch {
 	case info.IsDir():
 		return perm, true, true
@@ -230,6 +230,34 @@ func inodeModeFromFileInfo(info fs.FileInfo) (mode uint32, hasMode bool, isDir b
 	default:
 		return perm, true, false
 	}
+}
+
+func localOverlayFileMode(mode uint32) fs.FileMode {
+	fm := fs.FileMode(mode & 0o777)
+	if mode&0o4000 != 0 {
+		fm |= fs.ModeSetuid
+	}
+	if mode&0o2000 != 0 {
+		fm |= fs.ModeSetgid
+	}
+	if mode&0o1000 != 0 {
+		fm |= fs.ModeSticky
+	}
+	return fm
+}
+
+func localOverlayPOSIXMode(mode fs.FileMode) uint32 {
+	perm := uint32(mode.Perm())
+	if mode&fs.ModeSetuid != 0 {
+		perm |= 0o4000
+	}
+	if mode&fs.ModeSetgid != 0 {
+		perm |= 0o2000
+	}
+	if mode&fs.ModeSticky != 0 {
+		perm |= 0o1000
+	}
+	return perm
 }
 
 func localErrToFuseStatus(err error) gofuse.Status {

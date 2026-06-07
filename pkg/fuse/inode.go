@@ -241,14 +241,7 @@ func (m *InodeToPath) GetEntry(ino uint64) (*InodeEntry, bool) {
 	if !ok {
 		return nil, false
 	}
-	cp := *entry
-	if entry.Paths != nil {
-		cp.Paths = make(map[string]struct{}, len(entry.Paths))
-		for p := range entry.Paths {
-			cp.Paths[p] = struct{}{}
-		}
-	}
-	return &cp, true
+	return copyInodeEntryLocked(entry), true
 }
 
 // Forget decrements the Nlookup count for the given inode by nlookup. If the
@@ -330,6 +323,25 @@ func (m *InodeToPath) AddAlias(ino uint64, path, resourceID string, nlink uint32
 	return true
 }
 
+// AddAliasIfAbsent maps path to an existing inode only when path is still free.
+func (m *InodeToPath) AddAliasIfAbsent(ino uint64, path, resourceID string, nlink uint32, isDir bool, size int64, mtime time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.byPath[path]; exists {
+		return false
+	}
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return false
+	}
+	m.addPathLocked(entry, path)
+	entry.Path = path
+	entry.Nlookup++
+	m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
+	return true
+}
+
 // SetIdentity records a stable resource identity for an existing inode.
 func (m *InodeToPath) SetIdentity(ino uint64, resourceID string, nlink uint32) {
 	m.mu.Lock()
@@ -356,6 +368,27 @@ func (m *InodeToPath) UpdateLinkCount(ino uint64, nlink uint32) {
 	if entry, ok := m.byInode[ino]; ok {
 		entry.Nlink = nlink
 	}
+}
+
+// AdjustLinkCount atomically adjusts the known link count for an inode.
+func (m *InodeToPath) AdjustLinkCount(ino uint64, delta int32) (*InodeEntry, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok || !entry.IsDir {
+		return nil, false
+	}
+	nlink := entry.Nlink
+	if nlink == 0 {
+		nlink = 2
+	}
+	next := int64(nlink) + int64(delta)
+	if next < 2 {
+		next = 2
+	}
+	entry.Nlink = uint32(next)
+	return copyInodeEntryLocked(entry), true
 }
 
 // UpdateSize updates the size of the entry identified by the given inode.
@@ -631,4 +664,15 @@ func (m *InodeToPath) removePathLocked(path string, consumeLink bool) {
 	if entry.Path == "" && len(entry.Paths) == 0 {
 		m.removeEntryLocked(ino, entry)
 	}
+}
+
+func copyInodeEntryLocked(entry *InodeEntry) *InodeEntry {
+	cp := *entry
+	if entry.Paths != nil {
+		cp.Paths = make(map[string]struct{}, len(entry.Paths))
+		for p := range entry.Paths {
+			cp.Paths[p] = struct{}{}
+		}
+	}
+	return &cp
 }

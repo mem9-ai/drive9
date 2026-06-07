@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/user"
 	"path"
 	"sort"
 	"strconv"
@@ -2094,20 +2093,7 @@ func (fs *Dat9FS) adjustDirectoryLinkCount(dirPath string, delta int32) {
 	if !ok {
 		return
 	}
-	entry, ok := fs.inodes.GetEntry(ino)
-	if !ok || !entry.IsDir {
-		return
-	}
-	nlink := entry.Nlink
-	if nlink == 0 {
-		nlink = 2
-	}
-	next := int64(nlink) + int64(delta)
-	if next < 2 {
-		next = 2
-	}
-	fs.inodes.UpdateLinkCount(ino, uint32(next))
-	if updated, ok := fs.inodes.GetEntry(ino); ok {
+	if updated, ok := fs.inodes.AdjustLinkCount(ino, delta); ok {
 		fs.cacheEntryForPath(dirPath, updated)
 	}
 }
@@ -3077,47 +3063,34 @@ func (fs *Dat9FS) Access(cancel <-chan struct{}, input *gofuse.AccessIn) (status
 	if st := fs.GetAttr(cancel, &gofuse.GetAttrIn{InHeader: input.InHeader}, &out); st != gofuse.OK {
 		return st
 	}
-	if !hasPOSIXAccess(input.Caller.Owner, gofuse.Owner{Uid: out.Uid, Gid: out.Gid}, out.Mode, input.Mask) {
+	if !hasPOSIXAccess(input.Owner, gofuse.Owner{Uid: out.Uid, Gid: out.Gid}, out.Mode, input.Mask, func(gid uint32) bool {
+		return processHasSupplementaryGroup(input.Pid, gid)
+	}) {
 		return gofuse.EACCES
 	}
 	return gofuse.OK
 }
 
-func hasPOSIXAccess(caller gofuse.Owner, file gofuse.Owner, mode uint32, mask uint32) bool {
+func hasPOSIXAccess(caller gofuse.Owner, file gofuse.Owner, mode uint32, mask uint32, inSupplementaryGroup func(uint32) bool) bool {
 	mask &= 0o7
 	if mask == gofuse.F_OK {
 		return true
 	}
 	if caller.Uid == 0 {
-		return true
+		if mask&gofuse.X_OK == 0 {
+			return true
+		}
+		return mode&0o111 != 0
 	}
 
 	perm := mode & 0o777
 	if caller.Uid == file.Uid {
 		return perm&(mask<<6) == mask<<6
 	}
-	if caller.Gid == file.Gid || callerInSupplementaryGroup(caller.Uid, file.Gid) {
+	if caller.Gid == file.Gid || (inSupplementaryGroup != nil && inSupplementaryGroup(file.Gid)) {
 		return perm&(mask<<3) == mask<<3
 	}
 	return perm&mask == mask
-}
-
-func callerInSupplementaryGroup(uid, gid uint32) bool {
-	u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10))
-	if err != nil {
-		return false
-	}
-	groups, err := u.GroupIds()
-	if err != nil {
-		return false
-	}
-	target := strconv.FormatUint(uint64(gid), 10)
-	for _, group := range groups {
-		if group == target {
-			return true
-		}
-	}
-	return false
 }
 
 const setGIDPermissionBit uint32 = 0o2000
@@ -3148,7 +3121,7 @@ func entryIsRegularFile(entry *InodeEntry) bool {
 }
 
 func (fs *Dat9FS) setAttrModeForCaller(input *gofuse.SetAttrIn, entry *InodeEntry) (uint32, gofuse.Status) {
-	caller := input.Caller.Owner
+	caller := input.InHeader.Owner
 	owner := fs.entryOwner(entry)
 	if caller.Uid != 0 && caller.Uid != owner.Uid {
 		return 0, gofuse.EPERM
@@ -3156,11 +3129,31 @@ func (fs *Dat9FS) setAttrModeForCaller(input *gofuse.SetAttrIn, entry *InodeEntr
 
 	mode := input.Mode & posixPermissionModeMask
 	if caller.Uid != 0 && entryIsRegularFile(entry) && mode&setGIDPermissionBit != 0 {
-		if caller.Gid != owner.Gid && !processHasSupplementaryGroup(input.Caller.Pid, owner.Gid) {
+		if caller.Gid != owner.Gid && !processHasSupplementaryGroup(input.Pid, owner.Gid) {
 			mode &^= setGIDPermissionBit
 		}
 	}
 	return mode, gofuse.OK
+}
+
+func (fs *Dat9FS) checkSetAttrOwnerForCaller(input *gofuse.SetAttrIn, entry *InodeEntry, uid uint32, hasUID bool, gid uint32, hasGID bool) gofuse.Status {
+	if !hasUID && !hasGID {
+		return gofuse.OK
+	}
+	caller := input.InHeader.Owner
+	current := fs.entryOwner(entry)
+	if hasUID && uid != current.Uid && caller.Uid != 0 {
+		return gofuse.EPERM
+	}
+	if hasGID && gid != current.Gid && caller.Uid != 0 {
+		if caller.Uid != current.Uid {
+			return gofuse.EPERM
+		}
+		if caller.Gid != gid && !processHasSupplementaryGroup(input.Pid, gid) {
+			return gofuse.EPERM
+		}
+	}
+	return gofuse.OK
 }
 
 func processHasSupplementaryGroup(pid, gid uint32) bool {
@@ -3226,6 +3219,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		ownerUID, hasUID := input.GetUID()
 		ownerGID, hasGID := input.GetGID()
 		if hasUID || hasGID {
+			if st := fs.checkSetAttrOwnerForCaller(input, entry, ownerUID, hasUID, ownerGID, hasGID); st != gofuse.OK {
+				return st
+			}
 			if hasUID {
 				entry.Uid = ownerUID
 				entry.HasUID = true
@@ -3311,6 +3307,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	ownerUID, hasUID := input.GetUID()
 	ownerGID, hasGID := input.GetGID()
 	if hasUID || hasGID {
+		if st := fs.checkSetAttrOwnerForCaller(input, entry, ownerUID, hasUID, ownerGID, hasGID); st != gofuse.OK {
+			return st
+		}
 		if hasUID {
 			entry.Uid = ownerUID
 			entry.HasUID = true
@@ -3545,7 +3544,7 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 	ino := fs.inodes.Lookup(childP, false, 0, now)
 	fs.inodes.UpdateMode(ino, mode)
 	fs.inodes.UpdateRdev(ino, input.Rdev)
-	fs.inodes.UpdateOwner(ino, input.Caller.Uid, input.Caller.Gid, true, true)
+	fs.inodes.UpdateOwner(ino, input.Uid, input.Gid, true, true)
 	fs.inodes.UpdateAtime(ino, now)
 	fs.inodes.UpdateMtime(ino, now)
 	fs.inodes.UpdateCtime(ino, now)
@@ -3578,6 +3577,9 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 		err = fs.client.ChmodCtx(ctx, fs.remotePath(childP), perm)
 		fs.perfRecordRemote(perfRemoteMutation, chmodStart, err, 0)
 		if err != nil {
+			if rollbackErr := fs.deleteRemoteFileWithInterruptRecovery(ctx, childP); rollbackErr != nil && !isNotFoundErr(rollbackErr) {
+				log.Printf("mknod: rollback remote file %s after chmod failure failed: %v", childP, rollbackErr)
+			}
 			return httpToFuseStatus(err)
 		}
 	}
@@ -3603,7 +3605,7 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 		fs.inodes.UpdateRevision(ino, revision)
 	}
 	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|perm)
-	fs.inodes.UpdateOwner(ino, input.Caller.Uid, input.Caller.Gid, true, true)
+	fs.inodes.UpdateOwner(ino, input.Uid, input.Gid, true, true)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -3671,7 +3673,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 
 	ino := fs.inodes.Lookup(childP, true, 0, time.Now())
 	fs.inodes.UpdateMode(ino, mode)
-	fs.inodes.UpdateOwner(ino, input.Caller.Uid, input.Caller.Gid, true, true)
+	fs.inodes.UpdateOwner(ino, input.Uid, input.Gid, true, true)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -3840,7 +3842,7 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 		return gofuse.Status(syscall.EEXIST)
 	}
 	if entryIsMetadataOnlySpecial(srcEntry) {
-		return fs.linkMetadataOnlySpecial(input, srcEntry, srcP, dstP, name, out)
+		return fs.linkMetadataOnlySpecial(input, srcEntry, dstP, name, out)
 	}
 
 	ctx, cf := fuseCtx(cancel)
@@ -5179,7 +5181,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	ino := fs.inodes.Lookup(childP, false, 0, time.Now())
 	fs.inodes.UpdateMode(ino, mode)
-	fs.inodes.UpdateOwner(ino, input.Caller.Uid, input.Caller.Gid, true, true)
+	fs.inodes.UpdateOwner(ino, input.Uid, input.Gid, true, true)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO

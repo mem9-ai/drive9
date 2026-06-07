@@ -82,7 +82,7 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 		}
 	}
 
-	caller := input.Caller.Owner
+	caller := input.Owner
 	if st := fs.renameCheckParentAccess(caller, oldParentInfo); st != gofuse.OK {
 		return oldInfo, renamePathInfo{}, st
 	}
@@ -130,7 +130,7 @@ func (fs *Dat9FS) renameCheckParentAccess(caller gofuse.Owner, parent renamePath
 	if caller.Uid == 0 {
 		return gofuse.OK
 	}
-	if !hasPOSIXAccess(caller, parent.owner(fs), parent.modeOrDefault(), gofuse.W_OK|gofuse.X_OK) {
+	if !hasPOSIXAccess(caller, parent.owner(fs), parent.modeOrDefault(), gofuse.W_OK|gofuse.X_OK, nil) {
 		return gofuse.EACCES
 	}
 	return gofuse.OK
@@ -325,6 +325,9 @@ func (fs *Dat9FS) renameRemoteFileToMissingTargetFallback(ctx context.Context, i
 		return false, gofuse.OK
 	}
 	if oldInfo.entry == nil || !entryIsRegularFile(oldInfo.entry) || oldInfo.entry.Size != 0 {
+		return false, gofuse.OK
+	}
+	if oldInfo.entry.Nlink > 1 || len(oldInfo.entry.Paths) > 1 {
 		return false, gofuse.OK
 	}
 

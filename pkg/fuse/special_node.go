@@ -75,7 +75,7 @@ func (fs *Dat9FS) renameSpecialNode(oldP, newP string) bool {
 	return true
 }
 
-func (fs *Dat9FS) linkMetadataOnlySpecial(input *gofuse.LinkIn, srcEntry *InodeEntry, srcP, dstP, name string, out *gofuse.EntryOut) gofuse.Status {
+func (fs *Dat9FS) linkMetadataOnlySpecial(input *gofuse.LinkIn, srcEntry *InodeEntry, dstP, name string, out *gofuse.EntryOut) gofuse.Status {
 	if _, ok := fs.specialNodeEntry(dstP); ok {
 		return gofuse.Status(syscall.EEXIST)
 	}
@@ -98,8 +98,8 @@ func (fs *Dat9FS) linkMetadataOnlySpecial(input *gofuse.LinkIn, srcEntry *InodeE
 	if nlink < 2 {
 		nlink = 2
 	}
-	if !fs.inodes.AddAlias(input.Oldnodeid, dstP, "", nlink, false, srcEntry.Size, time.Now()) {
-		return gofuse.EIO
+	if !fs.inodes.AddAliasIfAbsent(input.Oldnodeid, dstP, "", nlink, false, srcEntry.Size, time.Now()) {
+		return gofuse.Status(syscall.EEXIST)
 	}
 	fs.addSpecialNode(dstP, input.Oldnodeid)
 
@@ -109,7 +109,9 @@ func (fs *Dat9FS) linkMetadataOnlySpecial(input *gofuse.LinkIn, srcEntry *InodeE
 	}
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
-	fs.cacheEntryForPath(srcP, entry)
+	for aliasPath := range entry.Paths {
+		fs.cacheEntryForPath(aliasPath, entry)
+	}
 	fs.fillEntryOut(entry, out)
 	return gofuse.OK
 }
@@ -180,6 +182,9 @@ func (fs *Dat9FS) setMetadataOnlySpecialAttr(input *gofuse.SetAttrIn, entry *Ino
 	ownerUID, hasUID := input.GetUID()
 	ownerGID, hasGID := input.GetGID()
 	if hasUID || hasGID {
+		if st := fs.checkSetAttrOwnerForCaller(input, entry, ownerUID, hasUID, ownerGID, hasGID); st != gofuse.OK {
+			return st
+		}
 		if hasUID {
 			entry.Uid = ownerUID
 			entry.HasUID = true
@@ -208,7 +213,9 @@ func (fs *Dat9FS) setMetadataOnlySpecialAttr(input *gofuse.SetAttrIn, entry *Ino
 		ctime := time.Now()
 		entry.Ctime = ctime
 		fs.inodes.UpdateCtime(input.NodeId, ctime)
-		fs.cacheEntryForPath(entry.Path, entry)
+		for aliasPath := range entry.Paths {
+			fs.cacheEntryForPath(aliasPath, entry)
+		}
 	}
 	fs.fillAttr(entry, &out.Attr)
 	out.SetTimeout(fs.opts.AttrTTL)
