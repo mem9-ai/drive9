@@ -498,25 +498,6 @@ WHERE checkpoint_id = ?`, checkpointID)
 	return scanFSLayerCheckpoint(row)
 }
 
-func (s *Store) nextFSLayerSeq(ctx context.Context, layerID string) (int64, error) {
-	seq, err := s.maxFSLayerSeq(ctx, layerID)
-	if err != nil {
-		return 0, err
-	}
-	return seq + 1, nil
-}
-
-func (s *Store) maxFSLayerSeq(ctx context.Context, layerID string) (int64, error) {
-	var seq sql.NullInt64
-	if err := s.db.QueryRowContext(ctx, `SELECT MAX(entry_seq) FROM fs_layer_entries WHERE layer_id = ?`, layerID).Scan(&seq); err != nil {
-		return 0, fmt.Errorf("read fs layer max seq: %w", err)
-	}
-	if !seq.Valid {
-		return 0, nil
-	}
-	return seq.Int64, nil
-}
-
 func scanFSLayer(row interface{ Scan(dest ...any) error }) (*FSLayer, error) {
 	var layer FSLayer
 	var state, durability string
