@@ -187,6 +187,43 @@ func TestLayerChmodUsesDirectoryKind(t *testing.T) {
 	}
 }
 
+func TestLayerFileUpsertClearsStaleNamespaceState(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var req clientLayerEntryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode layer entry: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(client.FSLayerEntry{LayerID: "layer-1", Path: req.Path, Op: req.Op, Kind: req.Kind})
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	fs.markLayerSymlink("/file.txt", "old-target", symlinkMode())
+	if err := fs.upsertLayerFile(context.Background(), "/file.txt", []byte("file"), 0, 0o644, true); err != nil {
+		t.Fatalf("upsertLayerFile over symlink: %v", err)
+	}
+	if _, _, ok := fs.layerSymlink("/file.txt"); ok {
+		t.Fatal("file upsert left stale layer symlink")
+	}
+	fs.markLayerWhiteout("/file.txt")
+	if err := fs.upsertLayerFile(context.Background(), "/file.txt", []byte("file2"), 0, 0o644, true); err != nil {
+		t.Fatalf("upsertLayerFile over whiteout: %v", err)
+	}
+	if fs.isLayerWhiteout("/file.txt") {
+		t.Fatal("file upsert left stale layer whiteout")
+	}
+}
+
 func TestLayerRmdirRejectsOverlayOnlyChildren(t *testing.T) {
 	fs := NewDat9FS(client.New("http://127.0.0.1", ""), &MountOptions{
 		LayerRef:   "layer-1",
@@ -207,6 +244,53 @@ func TestLayerRmdirRejectsOverlayOnlyChildren(t *testing.T) {
 	}
 	if !pending.HasPending("/dir/file.txt") {
 		t.Fatal("pending child was removed despite failed rmdir")
+	}
+}
+
+func TestLayerRenamePreservesLayerSymlink(t *testing.T) {
+	var requests []clientLayerEntryRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var req clientLayerEntryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode layer entry: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		requests = append(requests, req)
+		_ = json.NewEncoder(w).Encode(client.FSLayerEntry{LayerID: "layer-1", Path: req.Path, Op: req.Op, Kind: req.Kind})
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	fs.markLayerSymlink("/link", "target.txt", symlinkMode())
+	if err := fs.upsertLayerRename(context.Background(), "/link", "/moved"); err != nil {
+		t.Fatalf("upsertLayerRename symlink: %v", err)
+	}
+	if len(requests) != 2 {
+		t.Fatalf("requests len = %d, want 2: %+v", len(requests), requests)
+	}
+	if requests[0].Path != "/repo/moved" || requests[0].Op != "symlink" || requests[0].Kind != "symlink" || requests[0].ContentText != "target.txt" {
+		t.Fatalf("symlink rename request = %+v", requests[0])
+	}
+	if requests[1].Path != "/repo/link" || requests[1].Op != "whiteout" {
+		t.Fatalf("symlink source whiteout request = %+v", requests[1])
+	}
+	if target, _, ok := fs.layerSymlink("/moved"); !ok || target != "target.txt" {
+		t.Fatalf("moved symlink = (%q, %t), want target.txt true", target, ok)
+	}
+	if _, _, ok := fs.layerSymlink("/link"); ok {
+		t.Fatal("old symlink state still present")
+	}
+	if !fs.isLayerWhiteout("/link") {
+		t.Fatal("old symlink source whiteout missing")
 	}
 }
 

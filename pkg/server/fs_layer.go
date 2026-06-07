@@ -404,6 +404,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	}
 	entries, err := store.ListFSLayerEntries(r.Context(), layer.LayerID)
 	if err != nil {
+		_ = store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateConflicted)
 		writeFSLayerStoreError(w, err)
 		return
 	}
@@ -431,6 +432,11 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		return
 	}
 	snapshots := snapshotFSLayerCommit(r.Context(), b, entries)
+	if err := validateFSLayerCommitSnapshots(snapshots); err != nil {
+		_ = store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateConflicted)
+		errJSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	for i := range entries {
 		if err := applyFSLayerEntry(r.Context(), b, &entries[i]); err != nil {
 			rollbackErr := rollbackFSLayerCommit(r.Context(), b, snapshots)
@@ -444,7 +450,13 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		}
 	}
 	if err := store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateCommitted); err != nil {
-		writeFSLayerStoreError(w, err)
+		rollbackErr := rollbackFSLayerCommit(r.Context(), b, snapshots)
+		_ = store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateConflicted)
+		if rollbackErr != nil {
+			errJSON(w, http.StatusInternalServerError, fmt.Sprintf("finalize fs layer commit %s: %v; rollback failed: %v", layer.LayerID, err, rollbackErr))
+			return
+		}
+		errJSON(w, http.StatusInternalServerError, fmt.Sprintf("finalize fs layer commit %s: %v", layer.LayerID, err))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -629,6 +641,15 @@ func snapshotFSLayerCommit(ctx context.Context, b *backendpkg.Dat9Backend, entri
 		out = append(out, snap)
 	}
 	return out
+}
+
+func validateFSLayerCommitSnapshots(snapshots []fsLayerBaseSnapshot) error {
+	for i := range snapshots {
+		if !snapshots[i].SnapshotOK {
+			return fmt.Errorf("snapshot fs layer base path %s failed", snapshots[i].Path)
+		}
+	}
+	return nil
 }
 
 func snapshotFSLayerBasePath(ctx context.Context, b *backendpkg.Dat9Backend, path string) fsLayerBaseSnapshot {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -303,6 +304,7 @@ type clientLayerEntryRequest struct {
 	Kind         string `json:"kind"`
 	BaseRevision int64  `json:"base_revision"`
 	Content      []byte `json:"content"`
+	ContentText  string `json:"content_text"`
 	SizeBytes    int64  `json:"size_bytes"`
 	Mode         uint32 `json:"mode"`
 }
@@ -878,6 +880,31 @@ func TestCommitQueueLayerModeRetainsShadowAndPendingAfterUpload(t *testing.T) {
 	if !bytes.Equal(gotContent, data2) {
 		t.Fatalf("second uploaded content = %q, want %q", gotContent, data2)
 	}
+}
+
+func TestCommitQueueLayerUploadRejectsSizeMismatch(t *testing.T) {
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/mismatch.bin", []byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cq := NewCommitQueue(newTestClient("http://127.0.0.1"), shadow, pending, nil, 1, 8)
+	_, err = cq.uploadLayerEntry(context.Background(), "layer-1", &CommitEntry{
+		Path: "/mismatch.bin",
+		Size: 99,
+		Kind: PendingNew,
+	}, "/mismatch.bin", 0)
+	if err == nil || !strings.Contains(err.Error(), "size mismatch") {
+		t.Fatalf("uploadLayerEntry err=%v, want size mismatch", err)
+	}
+	cq.DrainAll()
 }
 
 // --- Auto-resolve tests (LWW MVP) ---

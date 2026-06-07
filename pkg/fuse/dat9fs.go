@@ -461,7 +461,11 @@ func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []
 	if hasMode {
 		req.Mode = mode & 0o777
 	}
-	return fs.upsertLayerEntry(ctx, req, uint64(len(data)))
+	if err := fs.upsertLayerEntry(ctx, req, uint64(len(data))); err != nil {
+		return err
+	}
+	fs.markLayerFile(localPath)
+	return nil
 }
 
 func (fs *Dat9FS) upsertLayerMkdir(ctx context.Context, localPath string, mode uint32) error {
@@ -563,6 +567,26 @@ func (fs *Dat9FS) upsertLayerSymlink(ctx context.Context, localPath string, targ
 func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalPath string) error {
 	oldRemote := fs.remotePath(oldLocalPath)
 	newRemote := fs.remotePath(newLocalPath)
+	if target, mode, ok := fs.layerSymlink(oldLocalPath); ok {
+		if mode == 0 {
+			mode = symlinkMode()
+		}
+		if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+			Path:        newRemote,
+			Op:          "symlink",
+			Kind:        "symlink",
+			ContentText: target,
+			SizeBytes:   int64(len(target)),
+			Mode:        mode,
+		}, uint64(len(target))); err != nil {
+			return err
+		}
+		fs.markLayerSymlink(newLocalPath, target, mode)
+		if err := fs.upsertLayerWhiteout(ctx, oldLocalPath, deleteKindFile); err != nil {
+			return err
+		}
+		return nil
+	}
 	var (
 		data    []byte
 		mode    uint32
@@ -699,6 +723,17 @@ func (fs *Dat9FS) markLayerWhiteout(localPath string) {
 		fs.layerWhiteouts = make(map[string]struct{})
 	}
 	fs.layerWhiteouts[localPath] = struct{}{}
+	delete(fs.layerDirs, localPath)
+	delete(fs.layerSymlinks, localPath)
+	fs.layerMu.Unlock()
+}
+
+func (fs *Dat9FS) markLayerFile(localPath string) {
+	if fs == nil || localPath == "" {
+		return
+	}
+	fs.layerMu.Lock()
+	delete(fs.layerWhiteouts, localPath)
 	delete(fs.layerDirs, localPath)
 	delete(fs.layerSymlinks, localPath)
 	fs.layerMu.Unlock()

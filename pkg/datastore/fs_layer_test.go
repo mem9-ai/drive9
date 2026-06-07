@@ -92,6 +92,31 @@ func TestFSLayerRefAmbiguous(t *testing.T) {
 	}
 }
 
+func TestFSLayerRollbackRejectsCommittedAndCommitting(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	for _, tt := range []struct {
+		id    string
+		state FSLayerState
+	}{
+		{id: "layer-committed", state: FSLayerStateCommitted},
+		{id: "layer-committing", state: FSLayerStateCommitting},
+	} {
+		if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: tt.id, BaseRootPath: "/repo", State: tt.state}); err != nil {
+			t.Fatalf("CreateFSLayer %s: %v", tt.id, err)
+		}
+		if err := s.RollbackFSLayer(ctx, tt.id); !errors.Is(err, ErrFSLayerStateConflict) {
+			t.Fatalf("RollbackFSLayer %s err=%v, want ErrFSLayerStateConflict", tt.id, err)
+		}
+	}
+	if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: "layer-conflicted", BaseRootPath: "/repo", State: FSLayerStateConflicted}); err != nil {
+		t.Fatalf("CreateFSLayer conflicted: %v", err)
+	}
+	if err := s.RollbackFSLayer(ctx, "layer-conflicted"); err != nil {
+		t.Fatalf("RollbackFSLayer conflicted: %v", err)
+	}
+}
+
 func TestFSLayerEntriesAndCheckpoint(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

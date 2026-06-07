@@ -747,13 +747,17 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 	if int64(len(data)) > maxInlineLayerEntryBytes {
 		return 0, fmt.Errorf("layer entry %s is %d bytes; inline layer uploads are limited to %d bytes", entry.Path, len(data), maxInlineLayerEntryBytes)
 	}
+	actualSize := int64(len(data))
+	if entry.Size != actualSize {
+		return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
+	}
 	req := client.FSLayerEntryRequest{
 		Path:         apiPath,
 		Op:           "upsert",
 		Kind:         "file",
 		BaseRevision: expectedRevision,
 		Content:      data,
-		SizeBytes:    entry.Size,
+		SizeBytes:    actualSize,
 	}
 	if entry.HasMode {
 		req.Mode = entry.Mode & 0o777

@@ -237,3 +237,13 @@ func TestFSLayerCommitPreflightChecksBaseInodeID(t *testing.T) {
 		t.Fatalf("conflicts=%+v, want base inode changed", conflicts)
 	}
 }
+
+func TestValidateFSLayerCommitSnapshotsRejectsIncomplete(t *testing.T) {
+	err := validateFSLayerCommitSnapshots([]fsLayerBaseSnapshot{{
+		Path:       "/repo/a.txt",
+		SnapshotOK: false,
+	}})
+	if err == nil {
+		t.Fatal("validateFSLayerCommitSnapshots succeeded, want error")
+	}
+}

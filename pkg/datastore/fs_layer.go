@@ -346,6 +346,17 @@ WHERE layer_id = ? AND state IN (?, ?)`,
 }
 
 func (s *Store) RollbackFSLayer(ctx context.Context, layerID string) error {
+	layer, err := s.GetFSLayer(ctx, layerID)
+	if err != nil {
+		return err
+	}
+	switch layer.State {
+	case FSLayerStateActive, FSLayerStateSealed, FSLayerStateConflicted:
+	case FSLayerStateAbandoned:
+		return nil
+	default:
+		return ErrFSLayerStateConflict
+	}
 	return s.SetFSLayerState(ctx, layerID, FSLayerStateAbandoned)
 }
 
