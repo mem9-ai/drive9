@@ -15,6 +15,15 @@ on:
       - "go.sum"
       - "Makefile"
   workflow_dispatch:
+    inputs:
+      run_fuse_performance_baseline:
+        description: "Run opt-in FUSE performance baseline and upload metrics artifacts"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
 
 permissions:
   contents: read
@@ -31,6 +40,8 @@ env:
   DRIVE9_LOCAL_EMBEDDING_MODE: app
   RUN_SEMANTIC_CHECKS: "0"
   RUN_CLI_SEMANTIC_CHECKS: "0"
+  RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_fuse_performance_baseline || '0' }}
+  FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
 
 jobs:
   local-e2e:
@@ -151,7 +162,17 @@ jobs:
             echo "| Existing-key smoke | ${{ steps.existing-key-smoke.outcome || 'skipped' }} |"
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
+            echo
+            echo "FUSE performance baseline: \`RUN_FUSE_PERFORMANCE_BASELINE=${RUN_FUSE_PERFORMANCE_BASELINE}\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload FUSE performance artifacts
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.run_fuse_performance_baseline == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuse-performance-baseline
+          path: e2e-artifacts/fuse-performance
+          if-no-files-found: warn
 
       - name: Dump TiDB playground logs
         if: always()
