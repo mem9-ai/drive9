@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -173,67 +172,18 @@ func TestPackRemoteArchiveUploadsPackFile(t *testing.T) {
 	mustWriteFile(t, filepath.Join(localRoot, "overlay", "repo", "dist", "app.js"), []byte("bundle\n"), 0o644)
 
 	var uploaded []byte
-	var completeTags map[string]string
-	var initiatedPath string
-	var initiatedSize int64
-	directPUTCalled := false
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var gotTags []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
-		case "POST /v2/uploads/initiate":
-			var req struct {
-				Path      string `json:"path"`
-				TotalSize int64  `json:"total_size"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				t.Fatalf("decode initiate: %v", err)
-			}
-			initiatedPath = req.Path
-			initiatedSize = req.TotalSize
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusAccepted)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"upload_id":   "u1",
-				"key":         "packs/archive.tar.gz",
-				"part_size":   req.TotalSize,
-				"total_parts": 1,
-				"expires_at":  time.Now().Add(time.Hour).Format(time.RFC3339),
-				"resumable":   true,
-				"checksum_contract": map[string]any{
-					"supported": []string{},
-					"required":  false,
-				},
-			})
-		case "POST /v2/uploads/u1/presign-batch":
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"parts": []map[string]any{{
-					"number":     1,
-					"url":        srv.URL + "/s3/u1/1",
-					"size":       initiatedSize,
-					"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
-				}},
-			})
-		case "PUT /s3/u1/1":
+		case "PUT /v1/fs/packs/archive.tar.gz":
+			gotTags = append([]string(nil), r.Header.Values("X-Dat9-Tag")...)
 			var err error
 			uploaded, err = io.ReadAll(r.Body)
 			if err != nil {
 				t.Fatalf("read upload body: %v", err)
 			}
-			w.Header().Set("ETag", "etag-1")
-			w.WriteHeader(http.StatusOK)
-		case "POST /v2/uploads/u1/complete":
-			var req struct {
-				Tags map[string]string `json:"tags"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				t.Fatalf("decode complete: %v", err)
-			}
-			completeTags = req.Tags
-			w.WriteHeader(http.StatusOK)
-		case "PUT /v1/fs/packs/archive.tar.gz":
-			directPUTCalled = true
-			http.Error(w, "direct PUT must not be used for pack archives", http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"revision":1}`))
 		default:
 			http.NotFound(w, r)
 		}
@@ -250,21 +200,12 @@ func TestPackRemoteArchiveUploadsPackFile(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("packRemoteArchive: %v", err)
 	}
-	if directPUTCalled {
-		t.Fatal("pack archive used direct PUT; want forced multipart/S3 path")
-	}
-	if initiatedPath != "/packs/archive.tar.gz" {
-		t.Fatalf("initiated path = %q, want /packs/archive.tar.gz", initiatedPath)
-	}
 	if len(uploaded) == 0 {
-		t.Fatal("fake S3 endpoint did not receive archive bytes")
+		t.Fatal("server did not receive archive bytes")
 	}
-	wantTags := map[string]string{
-		"drive9.pack.format":  "drive9.pack.v1",
-		"drive9.pack.profile": "coding-agent",
-	}
-	if !reflect.DeepEqual(completeTags, wantTags) {
-		t.Fatalf("complete tags = %v, want %v", completeTags, wantTags)
+	wantTags := []string{"drive9.pack.format=drive9.pack.v1", "drive9.pack.profile=coding-agent"}
+	if !reflect.DeepEqual(gotTags, wantTags) {
+		t.Fatalf("X-Dat9-Tag = %v, want %v", gotTags, wantTags)
 	}
 
 	dstLocalRoot := t.TempDir()

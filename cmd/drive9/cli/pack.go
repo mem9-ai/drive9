@@ -244,7 +244,7 @@ func packRemoteArchive(ctx context.Context, c *client.Client, archivePath string
 	if err != nil {
 		return fmt.Errorf("stat temporary pack archive: %w", err)
 	}
-	summary, err := c.WriteMultipartStreamWithSummary(ctx, archivePath, f, info.Size(), printProgress, client.WithTags(packArchiveTags(opts.Profile)))
+	summary, err := c.WriteStreamWithSummary(ctx, archivePath, f, info.Size(), printProgress, client.WithTags(packArchiveTags(opts.Profile)))
 	if err != nil {
 		return err
 	}
