@@ -2508,6 +2508,9 @@ func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.
 		nextUploadID int
 		finalWrites  int
 	)
+	completeEntered := make(chan struct{})
+	allowComplete := make(chan struct{})
+	var completeOnce sync.Once
 	var ts *httptest.Server
 	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -2591,6 +2594,12 @@ func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
+			completeOnce.Do(func() {
+				close(completeEntered)
+				mu.Unlock()
+				<-allowComplete
+				mu.Lock()
+			})
 			remote[state.path] = append([]byte(nil), state.body...)
 			mu.Unlock()
 			w.WriteHeader(http.StatusOK)
@@ -2682,6 +2691,37 @@ func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.
 	}); st != gofuse.OK {
 		t.Fatalf("Fsync: %v", st)
 	}
+
+	select {
+	case <-completeEntered:
+	case <-time.After(time.Second):
+		t.Fatal("queued fsync commit did not reach upload complete")
+	}
+
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+			Offset:   uint64(len(first)),
+		}, second)
+		writeDone <- st
+	}()
+	select {
+	case st := <-writeDone:
+		t.Fatalf("second Write completed while queued fsync commit was in-flight: %v", st)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(allowComplete)
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("second Write: %v", st)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second Write did not finish after queued fsync commit completed")
+	}
 	queue.WaitPath(filePath)
 	mu.Lock()
 	gotAfterFsync := append([]byte(nil), remote[filePath]...)
@@ -2703,13 +2743,6 @@ func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.
 		t.Fatalf("handle after queued commit = shadow_ready:%t shadow_spill:%t is_new:%t, want all false", shadowReady, shadowSpill, isNew)
 	}
 
-	if _, st := fs.Write(nil, &gofuse.WriteIn{
-		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
-		Fh:       createOut.Fh,
-		Offset:   uint64(len(first)),
-	}, second); st != gofuse.OK {
-		t.Fatalf("second Write: %v", st)
-	}
 	fs.Release(nil, &gofuse.ReleaseIn{
 		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
 		Fh:       createOut.Fh,
@@ -2720,6 +2753,52 @@ func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.
 	mu.Unlock()
 	if !bytes.Equal(gotFinal, wantFinal) {
 		t.Fatalf("final remote body = %q, want %q", gotFinal, wantFinal)
+	}
+}
+
+func TestClearRemovedCommittedShadowKeepsCurrentWriteLock(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	const filePath = "/same.bin"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       fs.newWriteBuffer(filePath, 0, 0),
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+
+	unlockCurrentWrite := fs.lockHandleRemoteCommitPathLocked(fh)
+	if !fs.clearRemovedCommittedShadowLocked(fh, 0, 0, false) {
+		t.Fatal("clearRemovedCommittedShadowLocked returned false")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		unlock := fs.lockWritableRemoteCommitPath(filePath)
+		unlock()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("stale-shadow cleanup released the current write path lock")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	unlockCurrentWrite()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("same-path waiter did not unblock after current write released the lock")
 	}
 }
 

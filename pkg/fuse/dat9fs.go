@@ -858,12 +858,12 @@ func (fs *Dat9FS) clearRemovedCommittedShadowForOpenHandles(path string, committ
 		if !fh.TryLock() {
 			continue
 		}
-		fs.clearRemovedCommittedShadowLocked(fh, committedRev, committedSize)
+		fs.clearRemovedCommittedShadowLocked(fh, committedRev, committedSize, true)
 		fh.Unlock()
 	}
 }
 
-func (fs *Dat9FS) clearRemovedCommittedShadowLocked(fh *FileHandle, committedRev, committedSize int64) bool {
+func (fs *Dat9FS) clearRemovedCommittedShadowLocked(fh *FileHandle, committedRev, committedSize int64, releaseRemoteCommitLock bool) bool {
 	if fs == nil || fh == nil || fs.shadowStore == nil || !fh.ShadowReady || fs.shadowStore.Has(fh.Path) {
 		return false
 	}
@@ -883,7 +883,9 @@ func (fs *Dat9FS) clearRemovedCommittedShadowLocked(fh *FileHandle, committedRev
 	fh.ShadowSpill = false
 	fh.ShadowCommitReady = false
 	fh.ShadowCommitSeq = 0
-	fs.releaseHandleRemoteCommitPathLocked(fh)
+	if releaseRemoteCommitLock {
+		fs.releaseHandleRemoteCommitPathLocked(fh)
+	}
 	fs.rebindCleanWriteBufferToRemoteLocked(fh, committedSize)
 	return true
 }
@@ -1051,7 +1053,7 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 	}
 	revision := fs.latestCommittedRevision(fh.Path)
 	if revision <= 0 {
-		fs.clearRemovedCommittedShadowLocked(fh, 0, fs.committedHandleSizeLocked(fh))
+		fs.clearRemovedCommittedShadowLocked(fh, 0, fs.committedHandleSizeLocked(fh), false)
 		return
 	}
 	advanced := revision > fh.BaseRev
@@ -1062,7 +1064,7 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 			fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
 		}
 	}
-	if fs.clearRemovedCommittedShadowLocked(fh, revision, fs.committedHandleSizeLocked(fh)) {
+	if fs.clearRemovedCommittedShadowLocked(fh, revision, fs.committedHandleSizeLocked(fh), false) {
 		return
 	}
 	if advanced && fh.ShadowReady && fs.shadowStore != nil {
