@@ -11480,8 +11480,8 @@ func TestSetAttr_PathTruncateExtendUsesMultipartWhenAboveInlineThreshold(t *test
 func TestSetAttr_PathTruncateHugeSizeReturnsEFBIG(t *testing.T) {
 	var putCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.Method == http.MethodPut:
+		switch r.Method {
+		case http.MethodPut:
 			putCalls.Add(1)
 			w.WriteHeader(http.StatusOK)
 		default:

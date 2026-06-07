@@ -4850,10 +4850,10 @@ func (fs *Dat9FS) checkOpenAccess(ctx context.Context, input *gofuse.OpenIn, ent
 	if entry == nil {
 		return gofuse.ENOENT
 	}
-	if st := fs.checkPathSearchAccess(ctx, input.InHeader.Owner, input.Pid, entry.Path); st != gofuse.OK {
+	if st := fs.checkPathSearchAccess(ctx, input.Owner, input.Pid, entry.Path); st != gofuse.OK {
 		return st
 	}
-	if !hasPOSIXAccess(input.InHeader.Owner, fs.entryOwner(entry), dirEntryMode(entry.IsDir, entry.HasMode, entry.Mode), openAccessMask(input.Flags), func(gid uint32) bool {
+	if !hasPOSIXAccess(input.Owner, fs.entryOwner(entry), dirEntryMode(entry.IsDir, entry.HasMode, entry.Mode), openAccessMask(input.Flags), func(gid uint32) bool {
 		return processHasSupplementaryGroup(input.Pid, gid)
 	}) {
 		return gofuse.EACCES
@@ -4862,7 +4862,7 @@ func (fs *Dat9FS) checkOpenAccess(ctx context.Context, input *gofuse.OpenIn, ent
 }
 
 func (fs *Dat9FS) setAttrModeForCaller(input *gofuse.SetAttrIn, entry *InodeEntry) (uint32, gofuse.Status) {
-	caller := input.InHeader.Owner
+	caller := setAttrCallerOwner(input)
 	owner := fs.entryOwner(entry)
 	if caller.Uid != 0 && caller.Uid != owner.Uid {
 		return 0, gofuse.EPERM
@@ -4881,7 +4881,7 @@ func (fs *Dat9FS) checkSetAttrOwnerForCaller(input *gofuse.SetAttrIn, entry *Ino
 	if !hasUID && !hasGID {
 		return gofuse.OK
 	}
-	caller := input.InHeader.Owner
+	caller := setAttrCallerOwner(input)
 	current := fs.entryOwner(entry)
 	if hasUID && uid != current.Uid && caller.Uid != 0 {
 		return gofuse.EPERM
@@ -4920,6 +4920,15 @@ func processHasSupplementaryGroup(pid, gid uint32) bool {
 	return false
 }
 
+func setAttrCallerOwner(input *gofuse.SetAttrIn) gofuse.Owner {
+	if input == nil {
+		return gofuse.Owner{}
+	}
+	//nolint:staticcheck // SetAttrIn also has a payload Owner; promoted input.Owner is not the caller.
+	header := input.SetAttrInCommon.InHeader
+	return gofuse.Owner{Uid: header.Uid, Gid: header.Gid}
+}
+
 func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseSetAttr, perfStart, status, 0) }()
@@ -4931,7 +4940,8 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		if entry, ok := fs.inodes.GetEntry(input.NodeId); ok {
 			path = entry.Path
 		}
-		fs.debugf("setattr failed path=%s node=%d valid=0x%x mode=%o caller=%d:%d status=%d", path, input.NodeId, input.Valid, input.Mode, input.InHeader.Owner.Uid, input.InHeader.Owner.Gid, status)
+		caller := setAttrCallerOwner(input)
+		fs.debugf("setattr failed path=%s node=%d valid=0x%x mode=%o caller=%d:%d status=%d", path, input.NodeId, input.Valid, input.Mode, caller.Uid, caller.Gid, status)
 	}()
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
@@ -4946,7 +4956,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		return fs.setMetadataOnlySpecialAttr(input, entry, out)
 	}
 	if input.Valid&gofuse.FATTR_FH == 0 {
-		if st := fs.checkPathSearchAccess(ctx, input.InHeader.Owner, input.Pid, entry.Path); st != gofuse.OK {
+		if st := fs.checkPathSearchAccess(ctx, setAttrCallerOwner(input), input.Pid, entry.Path); st != gofuse.OK {
 			return st
 		}
 	}
