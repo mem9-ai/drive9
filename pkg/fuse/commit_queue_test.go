@@ -113,6 +113,52 @@ func TestCommitQueueBeginInFlightSerializesSamePath(t *testing.T) {
 	cq.endInFlight(second)
 }
 
+func TestCommitQueueBeginInFlightPreservesSamePathFIFO(t *testing.T) {
+	first := &CommitEntry{Path: "/same.txt"}
+	second := &CommitEntry{Path: "/same.txt"}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{first, second},
+		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
+		inFlight:     make(map[string]*CommitEntry),
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	secondDone := make(chan struct{})
+	go func() {
+		if !cq.beginInFlight(second) {
+			t.Errorf("begin second in-flight returned false")
+		}
+		close(secondDone)
+	}()
+
+	select {
+	case <-secondDone:
+		t.Fatal("second same-path entry became in-flight before older queued entry")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	if !cq.beginInFlight(first) {
+		t.Fatal("begin first in-flight returned false")
+	}
+
+	select {
+	case <-secondDone:
+		t.Fatal("second same-path entry became in-flight while first was in-flight")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	cq.endInFlight(first)
+	cq.removeFromQueue(first)
+
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second same-path entry did not become in-flight after older entry completed")
+	}
+	cq.endInFlight(second)
+	cq.removeFromQueue(second)
+}
+
 func TestCommitQueueCommitNowHoldsPathLockThroughSuccessCleanup(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

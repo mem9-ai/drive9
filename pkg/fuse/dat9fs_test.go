@@ -6058,7 +6058,8 @@ func TestWaitQueuedRemoteCommitBeforeWriteBlocksUntilQueuedCommitDone(t *testing
 
 	done := make(chan struct{})
 	go func() {
-		fs.waitQueuedRemoteCommitBeforeWrite(path)
+		unlock := fs.waitQueuedRemoteCommitBeforeWrite(path)
+		unlock()
 		close(done)
 	}()
 

@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -789,17 +790,58 @@ func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
 
 func TestWriteBackUploader_OnSuccessReceivesUnknownStreamRevision(t *testing.T) {
 	var gotExpected string
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPut:
-			gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
+	data := []byte("edit")
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode initiate request: %v", err)
+			}
+			if req.Path != "/existing.txt" {
+				t.Fatalf("initiate path = %q, want /existing.txt", req.Path)
+			}
+			if req.TotalSize != int64(len(data)) {
+				t.Fatalf("initiate total_size = %d, want %d", req.TotalSize, len(data))
+			}
+			if req.ExpectedRevision == nil {
+				t.Fatal("initiate expected_revision missing")
+			}
+			gotExpected = strconv.FormatInt(*req.ExpectedRevision, 10)
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "u1",
+				"key":         "object-key",
+				"part_size":   int64(len(data)),
+				"total_parts": 1,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/u1/1",
+					"size":   int64(len(data)),
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/u1/1":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read part body: %v", err)
+			}
+			if !bytes.Equal(body, data) {
+				t.Fatalf("part body = %q, want %q", body, data)
+			}
+			w.Header().Set("ETag", "etag-1")
 			w.WriteHeader(http.StatusOK)
-		case http.MethodHead:
-			w.Header().Set("X-Dat9-Revision", "24")
-			w.Header().Set("Content-Length", "4")
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/complete":
 			w.WriteHeader(http.StatusOK)
 		default:
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
 		}
 	}))
 	defer ts.Close()
@@ -807,6 +849,7 @@ func TestWriteBackUploader_OnSuccessReceivesUnknownStreamRevision(t *testing.T) 
 	dir := t.TempDir()
 	cache, _ := NewWriteBackCache(dir)
 	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
 	uploader := NewWriteBackUploader(c, cache, 1)
 
 	var (
@@ -818,7 +861,7 @@ func TestWriteBackUploader_OnSuccessReceivesUnknownStreamRevision(t *testing.T) 
 		successRev = committedRev
 	}
 
-	_ = cache.PutWithBaseRev("/existing.txt", []byte("edit"), 4, PendingOverwrite, 23)
+	_ = cache.PutWithBaseRev("/existing.txt", data, int64(len(data)), PendingOverwrite, 23)
 	uploader.Submit("/existing.txt")
 	uploader.DrainAll()
 

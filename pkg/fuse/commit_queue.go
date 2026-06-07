@@ -540,7 +540,8 @@ func (cq *CommitQueue) beginInFlight(entry *CommitEntry) bool {
 		if cq.inFlight == nil {
 			cq.inFlight = make(map[string]*CommitEntry)
 		}
-		if cq.inFlight[entry.Path] == nil {
+		oldest := cq.oldestQueuedForPathLocked(entry.Path)
+		if cq.inFlight[entry.Path] == nil && (oldest == nil || oldest == entry) {
 			cq.inFlight[entry.Path] = entry
 			cq.mu.Unlock()
 			return true
@@ -548,6 +549,19 @@ func (cq *CommitQueue) beginInFlight(entry *CommitEntry) bool {
 		cq.mu.Unlock()
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+func (cq *CommitQueue) oldestQueuedForPathLocked(path string) *CommitEntry {
+	if cq == nil || path == "" {
+		return nil
+	}
+	for _, queued := range cq.queue {
+		if queued == nil || queued.Path != path || queued.canceled {
+			continue
+		}
+		return queued
+	}
+	return nil
 }
 
 func (cq *CommitQueue) endInFlight(entry *CommitEntry) {
