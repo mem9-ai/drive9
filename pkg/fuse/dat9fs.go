@@ -9020,6 +9020,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 			if entry.HasMode {
 				fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
 			}
+			fs.notifyInode(entry.Inode)
 		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
 	}

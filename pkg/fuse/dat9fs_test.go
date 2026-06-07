@@ -13838,11 +13838,15 @@ func TestOnCommitQueueSuccessMultipartRefreshesInodeSize(t *testing.T) {
 	}
 
 	const wantSize = 32820
+	before := fs.notifyCount.Load()
 	fs.onCommitQueueSuccess(&CommitEntry{
 		Path:  filePath,
 		Inode: ino,
 		Size:  wantSize,
 	}, 0)
+	if got := fs.notifyCount.Load() - before; got != 1 {
+		t.Fatalf("kernel inode notify count = %d, want 1", got)
+	}
 
 	entry, ok = fs.inodes.GetEntry(ino)
 	if !ok {
