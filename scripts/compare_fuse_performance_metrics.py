@@ -46,19 +46,9 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def validate_metrics(doc: dict[str, Any], label: str) -> None:
-    if doc.get("schema") != METRICS_SCHEMA:
-        raise CompareError(f"{label} metrics schema must be {METRICS_SCHEMA}")
-    workloads = doc.get("workloads")
-    if not isinstance(workloads, dict):
-        raise CompareError(f"{label} metrics must include workloads object")
-    params = doc.get("params")
-    if not isinstance(params, dict):
-        raise CompareError(f"{label} metrics must include params object")
-
-    for param in REQUIRED_PARAMS:
-        value = params.get(param)
-        if not isinstance(value, int) or value <= 0:
-            raise CompareError(f"{label} params.{param} must be a positive integer")
+    validate_metrics_shape(doc, label)
+    workloads = doc["workloads"]
+    params = doc["params"]
 
     expected_rows = params["sqlite_rows"]
     validate_sqlite_read_workload(workloads, "sqlite_read_aggregate", expected_rows, label)
@@ -73,10 +63,34 @@ def validate_metrics(doc: dict[str, Any], label: str) -> None:
         for metric in required_metrics:
             require_positive_metric(entry, metric, f"{label} workloads.{workload}")
 
+    validate_large_file_reads(workloads, params["read_passes"], label)
+
+
+def validate_baseline_metrics(doc: dict[str, Any], label: str) -> None:
+    validate_metrics_shape(doc, label)
+    validate_large_file_reads(doc["workloads"], doc["params"]["read_passes"], label)
+
+
+def validate_metrics_shape(doc: dict[str, Any], label: str) -> None:
+    if doc.get("schema") != METRICS_SCHEMA:
+        raise CompareError(f"{label} metrics schema must be {METRICS_SCHEMA}")
+    workloads = doc.get("workloads")
+    if not isinstance(workloads, dict):
+        raise CompareError(f"{label} metrics must include workloads object")
+    params = doc.get("params")
+    if not isinstance(params, dict):
+        raise CompareError(f"{label} metrics must include params object")
+
+    for param in REQUIRED_PARAMS:
+        value = params.get(param)
+        if not isinstance(value, int) or value <= 0:
+            raise CompareError(f"{label} params.{param} must be a positive integer")
+
+
+def validate_large_file_reads(workloads: dict[str, Any], read_passes: int, label: str) -> None:
     large_reads = workloads.get("large_file_reads")
     if not isinstance(large_reads, list):
         raise CompareError(f"{label} metrics must include large_file_reads list")
-    read_passes = params["read_passes"]
     if len(large_reads) != read_passes:
         raise CompareError(f"{label} large_file_reads length={len(large_reads)} does not match read_passes={read_passes}")
     for index, entry in enumerate(large_reads, start=1):
@@ -223,7 +237,7 @@ def compare_metrics(
         if missing_baseline_reason:
             warnings.append(missing_baseline_reason)
     else:
-        validate_metrics(baseline, "baseline")
+        validate_baseline_metrics(baseline, "baseline")
         warnings.extend(param_mismatch_warnings(current, baseline))
         if warnings:
             status = "warning"

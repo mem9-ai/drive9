@@ -193,6 +193,29 @@ class FusePerformanceCompareTest(unittest.TestCase):
                 missing_baseline_reason=None,
             )
 
+    def test_baseline_without_wal_metrics_warns_and_compares_existing_workloads(self):
+        baseline = metrics()
+        for workload in (
+            "sqlite_wal_read_aggregate",
+            "sqlite_wal_insert_transaction",
+            "sqlite_wal_update_transaction",
+            "sqlite_wal_checkpoint_truncate",
+        ):
+            del baseline["workloads"][workload]
+
+        report = compare.compare_metrics(
+            metrics(),
+            baseline,
+            warning_ratio=0.30,
+            current_ref="current",
+            baseline_ref="baseline",
+            missing_baseline_reason=None,
+        )
+
+        self.assertEqual(report["status"], "warning")
+        self.assertGreater(len(report["comparisons"]), 0)
+        self.assertTrue(any("baseline missing workload sqlite_wal_read_aggregate" in warning for warning in report["warnings"]))
+
     def test_param_mismatch_is_warning_and_skips_comparison(self):
         current = metrics()
         baseline = metrics()
