@@ -1275,16 +1275,22 @@ func TestDat9FSParallelDiskReadStopsQueuedBlocksAfterFirstError(t *testing.T) {
 		data[i] = byte(i)
 	}
 	slowStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
 	releaseSlow := make(chan struct{})
 	var slowOnce sync.Once
+	var releaseFirstOnce sync.Once
 	var releaseOnce sync.Once
-	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseSlow) }) })
+	t.Cleanup(func() {
+		releaseFirstOnce.Do(func() { close(releaseFirst) })
+		releaseOnce.Do(func() { close(releaseSlow) })
+	})
 	var unexpectedQueuedReads atomic.Int32
 
 	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
 		rangeHeader := r.Header.Get("Range")
 		switch rangeHeader {
 		case "bytes=0-63":
+			<-releaseFirst
 			http.Error(w, "blocked range", http.StatusBadGateway)
 			return
 		case "bytes=64-127":
@@ -1324,6 +1330,7 @@ func TestDat9FSParallelDiskReadStopsQueuedBlocksAfterFirstError(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("second in-flight block did not start")
 	}
+	releaseFirstOnce.Do(func() { close(releaseFirst) })
 	time.Sleep(50 * time.Millisecond)
 	releaseOnce.Do(func() { close(releaseSlow) })
 	select {
