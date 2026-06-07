@@ -8322,6 +8322,219 @@ func TestReadSQLiteSamePathDirtyHandleBeforeShadowStore(t *testing.T) {
 	}
 }
 
+func TestUnlinkPreservesOpenReadHandleSnapshot(t *testing.T) {
+	const filePath = "/unlink-open.bin"
+	want := []byte("open handle must keep these bytes after unlink")
+	var deleted atomic.Bool
+	var objectGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(want)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Location", ts.URL+"/object/unlink-open")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object/unlink-open":
+			objectGets.Add(1)
+			if deleted.Load() {
+				http.Error(w, "object deleted", http.StatusGone)
+				return
+			}
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(want)-1) {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(want)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+filePath:
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(want)), time.Now())
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: int64(len(want)),
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if !deleted.Load() {
+		t.Fatal("remote delete was not called")
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after unlink snapshot = %d, want 1", got)
+	}
+
+	buf := make([]byte, 128)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes after unlink = %q, want %q", got, want)
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after open-handle read = %d, want still 1", got)
+	}
+}
+
+func TestRenameReplacePreservesOpenDestinationSnapshotAndSourceHandle(t *testing.T) {
+	const oldPath = "/replace-source.bin"
+	const newPath = "/work.bin"
+	oldDst := []byte("destination bytes that an existing open fh must retain")
+	replacement := []byte("replacement bytes from the renamed source")
+	var renamed atomic.Bool
+	var oldDstObjectGets atomic.Int64
+	var replacementPathGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+newPath:
+			if renamed.Load() {
+				replacementPathGets.Add(1)
+				_, _ = w.Write(replacement)
+				return
+			}
+			w.Header().Set("Location", ts.URL+"/object/old-dst")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object/old-dst":
+			oldDstObjectGets.Add(1)
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(oldDst)-1) {
+				http.Error(w, "wrong old destination range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(oldDst)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newPath && r.URL.RawQuery == "rename":
+			if got := r.Header.Get("X-Dat9-Rename-Source"); got != oldPath {
+				http.Error(w, "wrong rename source: "+got, http.StatusBadRequest)
+				return
+			}
+			renamed.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcIno := fs.inodes.Lookup(oldPath, false, int64(len(replacement)), time.Now())
+	dstIno := fs.inodes.Lookup(newPath, false, int64(len(oldDst)), time.Now())
+	sourceHandle := &FileHandle{
+		Ino:      srcIno,
+		Path:     oldPath,
+		OrigSize: int64(len(replacement)),
+		BaseRev:  11,
+	}
+	sourceID := fs.allocateFileHandle(sourceHandle)
+	defer fs.deleteFileHandle(sourceID, sourceHandle)
+	dstHandle := &FileHandle{
+		Ino:      dstIno,
+		Path:     newPath,
+		OrigSize: int64(len(oldDst)),
+		BaseRev:  7,
+	}
+	dstID := fs.allocateFileHandle(dstHandle)
+	defer fs.deleteFileHandle(dstID, dstHandle)
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, strings.TrimPrefix(oldPath, "/"), strings.TrimPrefix(newPath, "/"))
+	if st != gofuse.OK {
+		t.Fatalf("Rename status = %v, want OK", st)
+	}
+	if !renamed.Load() {
+		t.Fatal("remote rename was not called")
+	}
+	if sourceHandle.Path != newPath {
+		t.Fatalf("source handle path = %q, want %q", sourceHandle.Path, newPath)
+	}
+	if got := oldDstObjectGets.Load(); got != 1 {
+		t.Fatalf("old destination object gets after replacement snapshot = %d, want 1", got)
+	}
+
+	buf := make([]byte, 128)
+	dstResult, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dstIno},
+		Fh:       dstID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("destination Read status = %v, want OK", st)
+	}
+	gotDst, st := dstResult.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("destination result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(gotDst, oldDst) {
+		t.Fatalf("destination handle read bytes = %q, want original %q", gotDst, oldDst)
+	}
+	if got := oldDstObjectGets.Load(); got != 1 {
+		t.Fatalf("old destination object gets after destination handle read = %d, want still 1", got)
+	}
+
+	sourceResult, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: srcIno},
+		Fh:       sourceID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("source Read status = %v, want OK", st)
+	}
+	gotSource, st := sourceResult.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("source result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(gotSource, replacement) {
+		t.Fatalf("source handle read bytes = %q, want replacement %q", gotSource, replacement)
+	}
+	if got := replacementPathGets.Load(); got != 1 {
+		t.Fatalf("replacement path gets = %d, want 1", got)
+	}
+}
+
 func TestUnlinkSQLiteWALPreservesOpenReadHandle(t *testing.T) {
 	const filePath = "/workload.db-wal"
 	want := []byte("sqlite wal snapshot bytes")

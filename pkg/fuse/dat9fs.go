@@ -2570,11 +2570,12 @@ func (fs *Dat9FS) inodeSnapshotSize(ino uint64) int64 {
 	return entry.Size
 }
 
-func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, localPath string) error {
-	if !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
-		return nil
-	}
-	return fs.snapshotOpenSQLiteSidecarHandles(ctx, localPath, nil)
+func (fs *Dat9FS) snapshotOpenHandlesBeforeUnlink(ctx context.Context, localPath string) error {
+	return fs.snapshotOpenHandlesForPath(ctx, localPath, nil)
+}
+
+func (fs *Dat9FS) snapshotOpenHandlesBeforePathReplacement(ctx context.Context, localPath string) error {
+	return fs.snapshotOpenHandlesForPath(ctx, localPath, nil)
 }
 
 func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeTruncate(ctx context.Context, localPath string, skip *FileHandle, newSize int64) error {
@@ -2586,6 +2587,13 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeTruncate(ctx context.Context, l
 
 func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPath string, skip *FileHandle) error {
 	if fs == nil || fs.openHandles == nil || !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
+		return nil
+	}
+	return fs.snapshotOpenHandlesForPath(ctx, localPath, skip)
+}
+
+func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath string, skip *FileHandle) error {
+	if fs == nil || fs.openHandles == nil || localPath == "" {
 		return nil
 	}
 	type candidate struct {
@@ -2608,25 +2616,18 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPat
 		}
 		candidates = append(candidates, candidate{fh: fh, size: size})
 	}
+	if len(candidates) == 0 {
+		return nil
+	}
 
 	snapshots := make(map[int64][]byte)
 	for _, cand := range candidates {
 		data, ok := snapshots[cand.size]
 		if !ok {
-			if cand.size > 0 {
-				if cachedData, n, claimed := fs.readSQLitePersistentJournalCommittedCache(localPath, 0, 0, uint32(cand.size)); claimed && int64(n) == cand.size {
-					data = cachedData[:n]
-				} else {
-					snapshotCtx, cancel := context.WithTimeout(ctx, readTransientRetryTimeout)
-					var err error
-					data, _, err = fs.doRangeRead(snapshotCtx, localPath, nil, 0, cand.size)
-					cancel()
-					if err != nil {
-						return err
-					}
-				}
-			} else {
-				data = []byte{}
+			var err error
+			data, err = fs.readOpenHandleSnapshot(ctx, localPath, cand.size)
+			if err != nil {
+				return err
 			}
 			snapshots[cand.size] = data
 		}
@@ -2641,6 +2642,43 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPat
 		cand.fh.Unlock()
 	}
 	return nil
+}
+
+func (fs *Dat9FS) readOpenHandleSnapshot(ctx context.Context, localPath string, size int64) ([]byte, error) {
+	if size < 0 || size > maxPreloadSize {
+		return nil, fmt.Errorf("open-handle snapshot size out of range for %s: %d", localPath, size)
+	}
+	if fs.shadowStore != nil {
+		if shadowSize := fs.shadowStore.Size(localPath); shadowSize >= 0 && shadowSize <= maxPreloadSize {
+			data, err := fs.shadowStore.ReadAll(localPath)
+			if err == nil {
+				return cloneBytes(data), nil
+			}
+		}
+	}
+	if fs.writeBack != nil {
+		if data, ok := fs.writeBack.getView(localPath); ok {
+			return cloneBytes(data), nil
+		}
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+	if isSQLitePersistentJournalPath(localPath) {
+		if cachedData, n, claimed := fs.readSQLitePersistentJournalCommittedCache(localPath, 0, 0, uint32(size)); claimed && int64(n) == size {
+			return cloneBytes(cachedData[:n]), nil
+		}
+	}
+	snapshotCtx, cancel := context.WithTimeout(ctx, readTransientRetryTimeout)
+	data, _, err := fs.doRangeRead(snapshotCtx, localPath, nil, 0, size)
+	cancel()
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != size {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return data, nil
 }
 
 func (fs *Dat9FS) invalidateReadCacheAndTargets(p string) {
@@ -4952,6 +4990,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if fs.debouncer != nil {
 		fs.debouncer.Cancel(childP)
 	}
+	if err := fs.snapshotOpenHandlesBeforeUnlink(ctx, childP); err != nil {
+		status = httpToFuseStatus(err)
+		return status
+	}
 	if fs.writeBack != nil && fs.uploader != nil {
 		// Wait for any in-flight upload to finish so it doesn't "revive"
 		// the file on the server after we delete it.
@@ -5003,13 +5045,6 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}
 
 	if !pendingNew {
-		ctx, cf := fuseCtx(cancel)
-		defer cf()
-		if err := fs.snapshotOpenSQLiteSidecarBeforeUnlink(ctx, childP); err != nil {
-			status = httpToFuseStatus(err)
-			return status
-		}
-
 		// File existed on server (or unknown) — issue remote DELETE.
 		// Tolerate 404 in case it was already deleted.
 		deleteStart := time.Now()
@@ -5426,6 +5461,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 	if handled, st := fs.renameGitPath(ctx, input, oldP, newP); handled {
 		return st
+	}
+	if err := fs.snapshotOpenHandlesBeforePathReplacement(ctx, newP); err != nil {
+		return httpToFuseStatus(err)
 	}
 
 	pendingRename, err := fs.renamePendingNewCommit(ctx, input, oldP, newP)
