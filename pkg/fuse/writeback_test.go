@@ -2490,6 +2490,239 @@ func TestFsyncInteractiveStageEnqueuesBeforeReleasingPath(t *testing.T) {
 	}
 }
 
+func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.T) {
+	const filePath = "/fsync-rewrite.bin"
+	first := []byte("first")
+	second := []byte("-second")
+	wantFinal := append(append([]byte(nil), first...), second...)
+
+	type uploadState struct {
+		path string
+		size int64
+		body []byte
+	}
+	var (
+		mu           sync.Mutex
+		remote       = make(map[string][]byte)
+		uploads      = make(map[string]*uploadState)
+		nextUploadID int
+		finalWrites  int
+	)
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "ok",
+				"limits": map[string]any{"inline_threshold": 1024},
+			})
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path      string `json:"path"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.Path != filePath {
+				t.Errorf("initiate path = %q, want %q", req.Path, filePath)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			nextUploadID++
+			uploadID := fmt.Sprintf("upload-%d", nextUploadID)
+			uploads[uploadID] = &uploadState{path: req.Path, size: req.TotalSize}
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   uploadID,
+				"key":         "object-key",
+				"part_size":   req.TotalSize,
+				"total_parts": 1,
+			})
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/presign-batch"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/presign-batch")
+			mu.Lock()
+			state := uploads[uploadID]
+			mu.Unlock()
+			if state == nil {
+				t.Errorf("presign unknown upload_id %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/" + uploadID + "/1",
+					"size":   state.size,
+				}},
+			})
+			return
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/"):
+			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/s3/"), "/")
+			if len(parts) != 2 {
+				t.Errorf("bad s3 path %q", r.URL.Path)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			if uploads[parts[0]] == nil {
+				t.Errorf("put unknown upload_id %q", parts[0])
+			} else {
+				uploads[parts[0]].body = append([]byte(nil), body...)
+			}
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/complete"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/complete")
+			mu.Lock()
+			state := uploads[uploadID]
+			if state == nil || len(state.body) == 0 {
+				mu.Unlock()
+				t.Errorf("complete before body for %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			remote[state.path] = append([]byte(nil), state.body...)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+			return
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+filePath:
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			finalWrites++
+			remote[filePath] = append([]byte(nil), body...)
+			revision := finalWrites + 1
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": revision})
+			return
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			mu.Lock()
+			data := append([]byte(nil), remote[filePath]...)
+			mu.Unlock()
+			if len(data) == 0 {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+				var start, end int
+				if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-%d", &start, &end); err == nil && start >= 0 && start < len(data) {
+					if end >= len(data) {
+						end = len(data) - 1
+					}
+					w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+					w.WriteHeader(http.StatusPartialContent)
+					_, _ = w.Write(data[start : end+1])
+					return
+				}
+			}
+			_, _ = w.Write(data)
+			return
+		case r.Method == http.MethodGet && r.URL.RawQuery == "list=1":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+			return
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncInteractive}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	queue := NewCommitQueue(c, shadow, pending, nil, 1, 8, fs.remoteRoot())
+	queue.PathLock = fs.lockRemoteCommitPath
+	queue.OnSuccess = fs.onCommitQueueSuccess
+	queue.OnCleanup = fs.onCommitQueueCleanup
+	defer queue.DrainAll()
+	fs.commitQueue = queue
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+		Mode:     defaultRegularFileMode,
+	}, strings.TrimPrefix(filePath, "/"), &createOut); st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, first); st != gofuse.OK {
+		t.Fatalf("first Write: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync: %v", st)
+	}
+	queue.WaitPath(filePath)
+	mu.Lock()
+	gotAfterFsync := append([]byte(nil), remote[filePath]...)
+	mu.Unlock()
+	if !bytes.Equal(gotAfterFsync, first) {
+		t.Fatalf("queued fsync body = %q, want %q", gotAfterFsync, first)
+	}
+
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created handle missing")
+	}
+	fh.Lock()
+	shadowReady := fh.ShadowReady
+	shadowSpill := fh.ShadowSpill
+	isNew := fh.IsNew
+	fh.Unlock()
+	if shadowReady || shadowSpill || isNew {
+		t.Fatalf("handle after queued commit = shadow_ready:%t shadow_spill:%t is_new:%t, want all false", shadowReady, shadowSpill, isNew)
+	}
+
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   uint64(len(first)),
+	}, second); st != gofuse.OK {
+		t.Fatalf("second Write: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	mu.Lock()
+	gotFinal := append([]byte(nil), remote[filePath]...)
+	mu.Unlock()
+	if !bytes.Equal(gotFinal, wantFinal) {
+		t.Fatalf("final remote body = %q, want %q", gotFinal, wantFinal)
+	}
+}
+
 func TestFsyncShadowSpillCommitRefreshesRevisionAndClearsPending(t *testing.T) {
 	const filePath = "/workload.db-journal"
 	var (

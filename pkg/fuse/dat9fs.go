@@ -847,6 +847,122 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision i
 	}
 }
 
+func (fs *Dat9FS) clearRemovedCommittedShadowForOpenHandles(path string, committedRev, committedSize int64) {
+	if fs == nil || fs.openHandles == nil || path == "" {
+		return
+	}
+	for _, fh := range fs.openHandles.SnapshotPath(path) {
+		if fh == nil {
+			continue
+		}
+		if !fh.TryLock() {
+			continue
+		}
+		fs.clearRemovedCommittedShadowLocked(fh, committedRev, committedSize)
+		fh.Unlock()
+	}
+}
+
+func (fs *Dat9FS) clearRemovedCommittedShadowLocked(fh *FileHandle, committedRev, committedSize int64) bool {
+	if fs == nil || fh == nil || fs.shadowStore == nil || !fh.ShadowReady || fs.shadowStore.Has(fh.Path) {
+		return false
+	}
+	if fs.hasPendingLocalState(fh.Path) {
+		return false
+	}
+	fh.IsNew = false
+	if committedRev > 0 {
+		fh.BaseRev = committedRev
+	} else {
+		fh.BaseRev = 0
+	}
+	if fh.Streamer != nil {
+		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	}
+	fh.ShadowReady = false
+	fh.ShadowSpill = false
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
+	fs.releaseHandleRemoteCommitPathLocked(fh)
+	fs.rebindCleanWriteBufferToRemoteLocked(fh, committedSize)
+	return true
+}
+
+func (fs *Dat9FS) committedHandleSizeLocked(fh *FileHandle) int64 {
+	if fs == nil || fh == nil {
+		return 0
+	}
+	if entry, ok := fs.inodes.GetEntry(fh.Ino); ok && entry != nil {
+		return entry.Size
+	}
+	if fh.Dirty != nil {
+		return fh.Dirty.Size()
+	}
+	return 0
+}
+
+func (fs *Dat9FS) rebindCleanWriteBufferToRemoteLocked(fh *FileHandle, committedSize int64) {
+	if fs == nil || fh == nil || fh.Dirty == nil || fh.Dirty.HasDirtyParts() {
+		return
+	}
+	if committedSize < 0 {
+		committedSize = 0
+	}
+	if fh.Dirty.smallFileData != nil && int64(len(fh.Dirty.smallFileData)) < committedSize {
+		fh.Dirty.migrateToPartMode()
+	}
+	fh.Dirty.totalSize = committedSize
+	fh.Dirty.remoteSize = committedSize
+	fh.Dirty.appendCursor = committedSize
+	fh.Dirty.sequential = true
+	fh.Dirty.uploadedParts = nil
+	fh.Dirty.OnPartFull = nil
+	fh.Streamer = nil
+
+	c := fs.client
+	partSize := fh.Dirty.PartSize()
+	fh.Dirty.LoadPart = func(partNum int) ([]byte, error) {
+		filePath := fh.Path
+		remoteFilePath := fs.remotePath(filePath)
+		partIdx := partNum - 1
+		offset := int64(partIdx) * partSize
+		length := partSize
+		if offset+length > committedSize {
+			length = committedSize - offset
+		}
+		if length <= 0 {
+			return nil, nil
+		}
+
+		lpCtx, lpCf := context.WithTimeout(context.Background(), fuseTimeout)
+		defer lpCf()
+		releaseReadSlot, err := fs.acquireRemoteReadSlot(lpCtx)
+		if err != nil {
+			return nil, err
+		}
+		defer releaseReadSlot()
+
+		loadStart := time.Now()
+		fs.debugf("committed dirty load part start path=%s part=%d off=%d len=%d", filePath, partNum, offset, length)
+		rc, err := c.ReadStreamRange(lpCtx, remoteFilePath, offset, length)
+		if err != nil {
+			fs.perfRecordRemote(perfRemoteRead, loadStart, err, 0)
+			fs.debugDurationf(loadStart, 0, "committed dirty load part open failed path=%s part=%d off=%d len=%d err=%v", filePath, partNum, offset, length, err)
+			return nil, err
+		}
+		defer func() { _ = rc.Close() }()
+
+		data, err := io.ReadAll(rc)
+		fs.perfRecordRemote(perfRemoteRead, loadStart, err, uint64(len(data)))
+		if err != nil {
+			fs.debugDurationf(loadStart, 0, "committed dirty load part read failed path=%s part=%d off=%d len=%d got=%d err=%v", filePath, partNum, offset, length, len(data), err)
+			return nil, err
+		}
+		fs.debugDurationf(loadStart, 0, "committed dirty load part done path=%s part=%d off=%d len=%d got=%d err=<nil>", filePath, partNum, offset, length, len(data))
+		return data, nil
+	}
+}
+
 func (fs *Dat9FS) recordCommittedRevision(path string, revision int64) {
 	if fs == nil || path == "" || revision <= 0 {
 		return
@@ -934,15 +1050,22 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 		return
 	}
 	revision := fs.latestCommittedRevision(fh.Path)
-	if revision <= fh.BaseRev {
+	if revision <= 0 {
+		fs.clearRemovedCommittedShadowLocked(fh, 0, fs.committedHandleSizeLocked(fh))
 		return
 	}
-	fh.IsNew = false
-	fh.BaseRev = revision
-	if fh.Streamer != nil {
-		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	advanced := revision > fh.BaseRev
+	if advanced {
+		fh.IsNew = false
+		fh.BaseRev = revision
+		if fh.Streamer != nil {
+			fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+		}
 	}
-	if fh.ShadowReady && fs.shadowStore != nil {
+	if fs.clearRemovedCommittedShadowLocked(fh, revision, fs.committedHandleSizeLocked(fh)) {
+		return
+	}
+	if advanced && fh.ShadowReady && fs.shadowStore != nil {
 		size := int64(0)
 		if fh.Dirty != nil {
 			size = fh.Dirty.Size()
@@ -1444,18 +1567,6 @@ func (fs *Dat9FS) stageShadowForQueuedCommitLocked(fh *FileHandle, durable bool)
 		fs.releaseHandleRemoteCommitPathLocked(fh)
 	}
 	return err
-}
-
-func (fs *Dat9FS) stageShadowForLocalDurabilityLocked(fh *FileHandle, durable bool) error {
-	if fh != nil && fh.RemoteCommitUnlock != nil {
-		return fs.stageShadowLocked(fh, durable)
-	}
-	unlockRemoteCommit := func() {}
-	if fh != nil {
-		unlockRemoteCommit = fs.lockWritableRemoteCommitPath(fh.Path)
-	}
-	defer unlockRemoteCommit()
-	return fs.stageShadowLocked(fh, durable)
 }
 
 func (fs *Dat9FS) enqueueStagedShadowCommitLocked(fh *FileHandle) error {
@@ -8888,6 +8999,7 @@ func (fs *Dat9FS) onCommitQueueCleanup(entry *CommitEntry) {
 	if entry == nil || entry.Inode == 0 {
 		return
 	}
+	fs.clearRemovedCommittedShadowForOpenHandles(entry.Path, fs.latestCommittedRevision(entry.Path), entry.Size)
 	fs.cleanupCommittedInode(entry.Inode, entry.Path)
 }
 
