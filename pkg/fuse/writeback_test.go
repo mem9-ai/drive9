@@ -2398,9 +2398,9 @@ func TestFsync_NoDuplicateUpload(t *testing.T) {
 	uploader.DrainAll()
 }
 
-func TestFsyncInteractiveStageDoesNotRetainRemoteCommitPathLock(t *testing.T) {
+func TestFsyncInteractiveStageEnqueuesBeforeReleasingPath(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "remote should not be used by interactive fsync staging", http.StatusInternalServerError)
+		http.Error(w, "remote should not be used before queued fsync commit is processed", http.StatusInternalServerError)
 	}))
 	defer ts.Close()
 
@@ -2418,6 +2418,14 @@ func TestFsyncInteractiveStageDoesNotRetainRemoteCommitPathLock(t *testing.T) {
 	}
 	fs.shadowStore = shadow
 	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   4,
+		shadows:      shadow,
+		index:        pending,
+		inFlight:     make(map[string]*CommitEntry),
+		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
+		workCh:       make(chan *CommitEntry, 8),
+	}
 
 	var createOut gofuse.CreateOut
 	st := fs.Create(nil, &gofuse.CreateIn{
@@ -2447,12 +2455,19 @@ func TestFsyncInteractiveStageDoesNotRetainRemoteCommitPathLock(t *testing.T) {
 	fh.Lock()
 	retained := fh.RemoteCommitUnlock != nil
 	commitReady := fh.ShadowCommitReady
+	dirtySeq := fh.DirtySeq
 	fh.Unlock()
 	if retained {
 		t.Fatal("Fsync must not retain a same-path remote commit lock until Release")
 	}
-	if !commitReady {
-		t.Fatal("interactive Fsync should still stage a Release commit snapshot")
+	if commitReady {
+		t.Fatal("Fsync should enqueue the staged commit immediately instead of deferring it until Release")
+	}
+	if dirtySeq != 0 {
+		t.Fatalf("DirtySeq after queued Fsync = %d, want 0", dirtySeq)
+	}
+	if !fs.commitQueue.HasPath("/fsync-stage.bin") {
+		t.Fatal("Fsync returned before the staged commit was visible in CommitQueue")
 	}
 
 	done := make(chan struct{})
@@ -2463,8 +2478,15 @@ func TestFsyncInteractiveStageDoesNotRetainRemoteCommitPathLock(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(250 * time.Millisecond):
-		t.Fatal("same-path remote commit lock remained held after Fsync returned")
+		t.Fatal("same-path writer was not blocked by the queued Fsync commit")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	fs.commitQueue.CancelPath("/fsync-stage.bin")
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("same-path writer did not unblock after queued Fsync commit was removed")
 	}
 }
 

@@ -27,6 +27,7 @@ type FileHandle struct {
 	ShadowReady        bool            // true when the local shadow file is a safe full snapshot
 	ShadowSpill        bool            // true when shadow is the authoritative data source (large IsNew/ZeroBase files)
 	ShadowCommitReady  bool            // true when ShadowSpill Flush has staged shadow for async commit
+	ShadowCommitSeq    uint64          // DirtySeq captured when ShadowCommitReady was staged
 	ShadowPinned       bool            // true when this handle has pinned the shadow (must Unpin on Release)
 	ShadowGen          uint64          // generation token from Pin/PinIfExists (passed to Unpin)
 	Streamer           *StreamUploader // nil for small files / read-only; manages background part uploads

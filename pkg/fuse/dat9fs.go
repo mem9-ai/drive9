@@ -930,13 +930,14 @@ func (fs *Dat9FS) lockRemoteCommitPath(path string) func() {
 }
 
 func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
-	if fs == nil || fh == nil || fh.IsNew {
+	if fs == nil || fh == nil {
 		return
 	}
 	revision := fs.latestCommittedRevision(fh.Path)
 	if revision <= fh.BaseRev {
 		return
 	}
+	fh.IsNew = false
 	fh.BaseRev = revision
 	if fh.Streamer != nil {
 		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
@@ -980,6 +981,7 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	fh.ShadowReady = false
 	fh.ShadowSpill = false
 	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
 }
 
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
@@ -1454,6 +1456,44 @@ func (fs *Dat9FS) stageShadowForLocalDurabilityLocked(fh *FileHandle, durable bo
 	}
 	defer unlockRemoteCommit()
 	return fs.stageShadowLocked(fh, durable)
+}
+
+func (fs *Dat9FS) enqueueStagedShadowCommitLocked(fh *FileHandle) error {
+	if fs == nil || fh == nil || fh.Dirty == nil || fs.commitQueue == nil || fs.shadowStore == nil || !fs.shadowStore.Has(fh.Path) {
+		return syscall.ENOTSUP
+	}
+	size := fh.Dirty.Size()
+	mode, hasMode := fs.modeForPendingHandle(fh)
+	entry := &CommitEntry{
+		Path:        fh.Path,
+		Inode:       fh.Ino,
+		BaseRev:     fh.BaseRev,
+		Size:        size,
+		Kind:        fs.pendingKindForHandle(fh),
+		ShadowSpill: fh.ShadowSpill,
+		Mode:        mode,
+		HasMode:     hasMode,
+	}
+	if err := fs.commitQueue.Enqueue(entry); err != nil {
+		return err
+	}
+	fh.Dirty.ClearDirty()
+	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+	fh.DirtySeq = 0
+	fh.WriteBackSeq = 0
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
+	if fs.writeBack != nil {
+		fs.writeBack.Remove(fh.Path)
+	}
+	if hasMode {
+		clearPendingModeLocked(fh)
+		fh.Unlock()
+		fs.clearPendingModeForInodeExcept(fh.Ino, fh)
+		fh.Lock()
+	}
+	fs.releaseHandleRemoteCommitPathLocked(fh)
+	return nil
 }
 
 func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
@@ -6916,6 +6956,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 
 	unlockRemoteCommit := fs.lockHandleRemoteCommitPathLocked(fh)
 	defer unlockRemoteCommit()
+	fs.adoptCommittedRevisionLocked(fh)
 
 	if fh.Dirty == nil {
 		source = "new-dirty-buffer"
@@ -7034,6 +7075,7 @@ func (fs *Dat9FS) restoreFailedWriteSyncLocked(fh *FileHandle, snapshot *writeBu
 		fh.ShadowReady = false
 		fh.ShadowSpill = false
 		fh.ShadowCommitReady = false
+		fh.ShadowCommitSeq = 0
 	}
 }
 
@@ -7214,6 +7256,7 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 		fh.ShadowCommitReady = false
+		fh.ShadowCommitSeq = 0
 		clearReadTargetForLockedHandle(fh)
 		if committedRev > 0 {
 			fs.clearReadTargetsForPathExcept(fh.Path, fh)
@@ -7226,6 +7269,7 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 				fh.ShadowReady = false
 				fh.ShadowSpill = false
 				fh.ShadowCommitReady = false
+				fh.ShadowCommitSeq = 0
 			}
 			if fs.pendingIndex != nil {
 				fs.pendingIndex.Remove(fh.Path)
@@ -7280,6 +7324,7 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 		fh.ShadowReady = false
 		fh.ShadowSpill = false
 		fh.ShadowCommitReady = false
+		fh.ShadowCommitSeq = 0
 	}
 	if fs.pendingIndex != nil {
 		fs.pendingIndex.Remove(fh.Path)
@@ -7459,6 +7504,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				log.Printf("flush: shadow stage failed for ShadowSpill %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
 			} else {
 				fh.ShadowCommitReady = true
+				fh.ShadowCommitSeq = fh.DirtySeq
 				return gofuse.OK
 			}
 		}
@@ -7510,6 +7556,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				fh.ShadowReady = false
 				fh.ShadowSpill = false
 				fh.ShadowCommitReady = false
+				fh.ShadowCommitSeq = 0
 			}
 			if fs.pendingIndex != nil {
 				fs.pendingIndex.Remove(fh.Path)
@@ -7637,10 +7684,20 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			// ShadowSpill: stage shadow + journal, no writeBack snapshot.
 			phase = "interactive-shadowspill-stage"
 			stageStart := time.Now()
-			err := fs.stageShadowForLocalDurabilityLocked(fh, true)
+			err := fs.stageShadowForQueuedCommitLocked(fh, true)
 			fs.debugDurationf(stageStart, 0, "fsync shadowspill stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
-				fh.ShadowCommitReady = true
+				if fs.commitQueue != nil {
+					phase = "interactive-shadowspill-enqueue"
+					if err := fs.enqueueStagedShadowCommitLocked(fh); err != nil {
+						log.Printf("fsync: enqueue staged ShadowSpill commit failed for %s: %v; deferring to Release", fh.Path, err)
+						fh.ShadowCommitReady = true
+						fh.ShadowCommitSeq = fh.DirtySeq
+					}
+				} else {
+					fh.ShadowCommitReady = true
+					fh.ShadowCommitSeq = fh.DirtySeq
+				}
 				if fs.journal != nil {
 					entry := JournalEntry{
 						Op:      JournalFsync,
@@ -7655,13 +7712,23 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		} else {
 			phase = "interactive-stage"
 			stageStart := time.Now()
-			err := fs.stageShadowForLocalDurabilityLocked(fh, true)
+			err := fs.stageShadowForQueuedCommitLocked(fh, true)
 			fs.debugDurationf(stageStart, 0, "fsync stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
-				if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
-					log.Printf("fsync writeback snapshot failed for %s: %v", fh.Path, err)
+				if fs.commitQueue != nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path) {
+					phase = "interactive-enqueue"
+					if err := fs.enqueueStagedShadowCommitLocked(fh); err != nil {
+						fs.releaseHandleRemoteCommitPathLocked(fh)
+						log.Printf("fsync: enqueue staged commit failed for %s: %v", fh.Path, err)
+						return gofuse.EIO
+					}
+				} else {
+					fs.releaseHandleRemoteCommitPathLocked(fh)
+					if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
+						log.Printf("fsync writeback snapshot failed for %s: %v", fh.Path, err)
+					}
+					fh.WriteBackSeq = fh.DirtySeq
 				}
-				fh.WriteBackSeq = fh.DirtySeq
 				// Journal fsync for local durability (when journal is available).
 				if fs.journal != nil {
 					entry := JournalEntry{
@@ -7723,6 +7790,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 				fh.ShadowReady = false
 				fh.ShadowSpill = false
 				fh.ShadowCommitReady = false
+				fh.ShadowCommitSeq = 0
 			}
 			if fs.pendingIndex != nil {
 				fs.pendingIndex.Remove(fh.Path)
@@ -8000,7 +8068,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		}
 
 		// ShadowSpill Release: CommitQueue streaming from shadow, no writeBack.
-		if !isSQLitePersistentJournalPath(fh.Path) && fh.ShadowSpill && fh.ShadowCommitReady && fs.commitQueue != nil && fs.shadowStore != nil {
+		if !isSQLitePersistentJournalPath(fh.Path) && fh.ShadowSpill && fh.ShadowCommitReady && fh.ShadowCommitSeq == fh.DirtySeq && fs.commitQueue != nil && fs.shadowStore != nil {
 			phase = "shadowspill-commit"
 			lockStart := time.Now()
 			fh.Lock()
@@ -8012,6 +8080,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			size := fh.Dirty.Size()
 			fh.DirtySeq = 0
 			fh.ShadowCommitReady = false
+			fh.ShadowCommitSeq = 0
 			mode, hasMode := fs.modeForPendingHandle(fh)
 			expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 			unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
@@ -8073,6 +8142,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 								fh.ShadowReady = false
 								fh.ShadowSpill = false
 								fh.ShadowCommitReady = false
+								fh.ShadowCommitSeq = 0
 							}
 							if fs.pendingIndex != nil {
 								fs.pendingIndex.Remove(fh.Path)
@@ -8098,6 +8168,13 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			// No notifyInode needed; userspace caches are invalidated above.
 			return
 		}
+		fh.Lock()
+		if fh.ShadowCommitReady && fh.ShadowCommitSeq != 0 && fh.ShadowCommitSeq != fh.DirtySeq {
+			fh.ShadowCommitReady = false
+			fh.ShadowCommitSeq = 0
+			fs.releaseHandleRemoteCommitPathLocked(fh)
+		}
+		fh.Unlock()
 
 		// Check if Flush already wrote this file to the write-back cache
 		// AND no new writes have happened since. If the DirtySeq changed,
