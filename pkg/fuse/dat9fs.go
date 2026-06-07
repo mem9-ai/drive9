@@ -85,8 +85,8 @@ type Dat9FS struct {
 
 	// server is the go-fuse server, set during Init(). Used to send
 	// kernel cache invalidation notifications (EntryNotify, InodeNotify)
-	// for external/SSE-driven changes that the kernel doesn't know about.
-	// Local FUSE mutations avoid server notify because handlers can be running
+	// for external/SSE-driven changes and rename target replacement. Most
+	// local FUSE mutations avoid server notify because handlers can be running
 	// on the same worker pool that services notify-triggered revalidation.
 	server *gofuse.Server
 
@@ -5387,6 +5387,20 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 		fs.dirCache.Upsert(newParent, cachedInfoFromEntry(path.Base(newP), oldEntry))
 	}
 	fs.retargetOpenHandlesForRename(oldP, newP)
+	fs.notifyRenameTarget(input.Newdir, path.Base(newP), newP)
+}
+
+func (fs *Dat9FS) notifyRenameTarget(parentIno uint64, name, p string) {
+	// Rename can publish a previously pending temp file under a path that
+	// concurrent readers already looked up as absent or zero-sized. Invalidate
+	// both the target dentry and inode so the kernel cannot keep satisfying
+	// reads from stale attrs while userspace state has the correct size.
+	if parentIno != 0 && name != "" && name != "." && name != "/" {
+		fs.notifyEntry(parentIno, name)
+	}
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		fs.notifyInode(ino)
+	}
 }
 
 func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {

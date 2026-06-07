@@ -12097,6 +12097,17 @@ func TestAtomicTempWriteFsyncReleaseRenamePreservesMultipartBody(t *testing.T) {
 			mu.Unlock()
 			w.WriteHeader(http.StatusOK)
 			return
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+newP:
+			mu.Lock()
+			body, ok := remote[newP]
+			mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			return
 		case r.Method == http.MethodGet && r.URL.RawQuery == "list=1":
 			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
 			return
@@ -12157,11 +12168,15 @@ func TestAtomicTempWriteFsyncReleaseRenamePreservesMultipartBody(t *testing.T) {
 		Fh:       createOut.Fh,
 	})
 
+	beforeRenameNotify := fs.notifyCount.Load()
 	if st := fs.Rename(nil, &gofuse.RenameIn{
 		InHeader: gofuse.InHeader{NodeId: parentIno},
 		Newdir:   parentIno,
 	}, "file-000.txt.tmp.123.456", "file-000.txt"); st != gofuse.OK {
 		t.Fatalf("Rename temp to final: %v", st)
+	}
+	if got := fs.notifyCount.Load() - beforeRenameNotify; got != 2 {
+		t.Fatalf("rename notify count = %d, want 2", got)
 	}
 	queue.DrainAll()
 
@@ -12185,6 +12200,43 @@ func TestAtomicTempWriteFsyncReleaseRenamePreservesMultipartBody(t *testing.T) {
 	}
 	if shadow.Has(oldP) {
 		t.Fatal("old temp shadow still exists")
+	}
+	newIno, ok := fs.inodes.GetInode(newP)
+	if !ok {
+		t.Fatal("final inode missing after rename")
+	}
+	entry, ok := fs.inodes.GetEntry(newIno)
+	if !ok {
+		t.Fatal("final inode entry missing after rename")
+	}
+	if entry.Size != int64(len(data)) {
+		t.Fatalf("final inode size = %d, want %d", entry.Size, len(data))
+	}
+	if cached := fs.dirCache.Lookup("/work/final/w0", "file-000.txt"); cached.kind != namespaceLookupPositive || cached.item.Size != int64(len(data)) {
+		t.Fatalf("final dirCache entry = %+v, want positive size %d", cached, len(data))
+	}
+
+	var openOut gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: newIno},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &openOut); st != gofuse.OK {
+		t.Fatalf("Open final: %v", st)
+	}
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: newIno},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(data)),
+	}, make([]byte, len(data)))
+	if st != gofuse.OK {
+		t.Fatalf("Read final: %v", st)
+	}
+	gotRead, readStatus := result.Bytes(make([]byte, len(data)))
+	if readStatus != gofuse.OK {
+		t.Fatalf("Read final bytes: %v", readStatus)
+	}
+	if !bytes.Equal(gotRead, data) {
+		t.Fatalf("final mounted read sha=%x size=%d, want sha=%x size=%d", sha256.Sum256(gotRead), len(gotRead), sha256.Sum256(data), len(data))
 	}
 }
 
@@ -13651,15 +13703,6 @@ func TestLocalMutations_NotifyBudget(t *testing.T) {
 				return fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "existingdir")
 			},
 		},
-		{
-			name: "Rename",
-			fn: func() gofuse.Status {
-				return fs.Rename(nil, &gofuse.RenameIn{
-					InHeader: gofuse.InHeader{NodeId: 1},
-					Newdir:   1,
-				}, "config.lock", "config")
-			},
-		},
 	}
 
 	for _, tc := range tests {
@@ -13674,6 +13717,45 @@ func TestLocalMutations_NotifyBudget(t *testing.T) {
 				t.Fatalf("%s produced %d kernel notify calls, want 0", tc.name, delta)
 			}
 		})
+	}
+}
+
+func TestRenameNotifiesTargetDentryAndInode(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "rename":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			w.Header().Set("Content-Length", "100")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	fs.inodes.Lookup("/config.lock", false, 100, time.Now())
+	fs.inodes.Lookup("/config", false, 0, time.Now())
+
+	before := fs.notifyCount.Load()
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, "config.lock", "config")
+	if st != gofuse.OK {
+		t.Fatalf("Rename returned %v, want OK", st)
+	}
+	if delta := fs.notifyCount.Load() - before; delta != 2 {
+		t.Fatalf("Rename produced %d kernel notify calls, want 2", delta)
+	}
+	entry, ok := fs.inodes.GetInode("/config")
+	if !ok || entry == 0 {
+		t.Fatal("renamed target inode missing")
 	}
 }
 
