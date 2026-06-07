@@ -35,13 +35,14 @@ const (
 var defaultCodingAgentPackNames = []string{".git", "dist", "build", "target"}
 
 type packManifest struct {
-	Format     string              `json:"format"`
-	Version    int                 `json:"version"`
-	CreatedAt  time.Time           `json:"created_at"`
-	Profile    string              `json:"profile,omitempty"`
-	RemoteRoot string              `json:"remote_root,omitempty"`
-	Paths      []string            `json:"paths"`
-	Entries    []packManifestEntry `json:"entries"`
+	Format       string              `json:"format"`
+	Version      int                 `json:"version"`
+	CreatedAt    time.Time           `json:"created_at"`
+	Profile      string              `json:"profile,omitempty"`
+	RemoteRoot   string              `json:"remote_root,omitempty"`
+	Paths        []string            `json:"paths"`
+	ReplacePaths []string            `json:"replace_paths,omitempty"`
+	Entries      []packManifestEntry `json:"entries"`
 }
 
 type packManifestEntry struct {
@@ -311,14 +312,16 @@ func writePackArchive(ctx context.Context, w io.Writer, opts packOptions) (*pack
 	if err != nil {
 		return nil, err
 	}
+	paths := packSourcePaths(sources)
 	manifest := packManifest{
-		Format:     packArchiveFormat,
-		Version:    1,
-		CreatedAt:  time.Now().UTC(),
-		Profile:    strings.TrimSpace(opts.Profile),
-		RemoteRoot: remoteRoot,
-		Paths:      packSourcePaths(sources),
-		Entries:    packManifestEntries(items),
+		Format:       packArchiveFormat,
+		Version:      1,
+		CreatedAt:    time.Now().UTC(),
+		Profile:      strings.TrimSpace(opts.Profile),
+		RemoteRoot:   remoteRoot,
+		Paths:        paths,
+		ReplacePaths: packReplacePaths(opts, paths),
+		Entries:      packManifestEntries(items),
 	}
 
 	gz := gzip.NewWriter(w)
@@ -357,9 +360,17 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	if !filepath.IsAbs(opts.LocalRoot) {
 		return nil, fmt.Errorf("drive9 unpack: --local-root must be an absolute path")
 	}
-	overlayRoot := filepath.Join(opts.LocalRoot, "overlay")
-	if err := os.MkdirAll(overlayRoot, 0o755); err != nil {
-		return nil, fmt.Errorf("prepare local overlay root: %w", err)
+	localParent := filepath.Dir(filepath.Clean(opts.LocalRoot))
+	if err := os.MkdirAll(localParent, 0o755); err != nil {
+		return nil, fmt.Errorf("prepare local root parent: %w", err)
+	}
+	stageRoot, err := os.MkdirTemp(localParent, ".drive9-unpack-")
+	if err != nil {
+		return nil, fmt.Errorf("create staged unpack root: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(stageRoot) }()
+	if err := os.MkdirAll(filepath.Join(stageRoot, "overlay"), 0o755); err != nil {
+		return nil, fmt.Errorf("prepare staged overlay root: %w", err)
 	}
 
 	gz, err := gzip.NewReader(r)
@@ -369,7 +380,6 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	defer func() { _ = gz.Close() }()
 	tr := tar.NewReader(gz)
 	manifest := packManifest{Format: packArchiveFormat, Version: 1}
-	replaced := false
 	sawManifest := false
 	var dirTimes []packDirTime
 	for {
@@ -391,18 +401,12 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 			if manifest.Format != packArchiveFormat {
 				return nil, fmt.Errorf("unsupported pack format %q", manifest.Format)
 			}
-			if opts.Replace && !replaced {
-				if err := removeManifestPaths(opts.LocalRoot, manifest.Paths); err != nil {
-					return nil, err
-				}
-				replaced = true
-			}
 			continue
 		}
 		if !sawManifest {
 			return nil, fmt.Errorf("invalid pack archive: missing leading %s", packManifestEntryName)
 		}
-		if err := extractPackEntry(opts.LocalRoot, hdr, tr, &dirTimes); err != nil {
+		if err := extractPackEntry(stageRoot, hdr, tr, &dirTimes); err != nil {
 			return nil, err
 		}
 	}
@@ -411,6 +415,9 @@ func extractPackArchive(ctx context.Context, r io.Reader, opts unpackOptions) (*
 	}
 	for i := len(dirTimes) - 1; i >= 0; i-- {
 		_ = os.Chtimes(dirTimes[i].Path, dirTimes[i].ModTime, dirTimes[i].ModTime)
+	}
+	if err := installStagedPack(opts.LocalRoot, stageRoot, manifest, opts.Replace); err != nil {
+		return nil, err
 	}
 	return &manifest, nil
 }
@@ -662,6 +669,40 @@ func packSourcePaths(sources []packSource) []string {
 	return out
 }
 
+func packReplacePaths(opts packOptions, paths []string) []string {
+	if len(opts.Paths) != 0 || strings.TrimSpace(opts.Profile) != "coding-agent" {
+		return nil
+	}
+	parents := map[string]struct{}{}
+	for _, archivePath := range paths {
+		parents[path.Dir(archivePath)] = struct{}{}
+	}
+	if len(parents) == 0 {
+		prefix, err := canonicalArchivePath(opts.LocalPrefix)
+		if err != nil || prefix == "/" {
+			return nil
+		}
+		parents[prefix] = struct{}{}
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(parents)*len(defaultCodingAgentPackNames))
+	for parent := range parents {
+		for _, name := range defaultCodingAgentPackNames {
+			archivePath := path.Join(parent, name)
+			if !strings.HasPrefix(archivePath, "/") {
+				archivePath = "/" + archivePath
+			}
+			if _, ok := seen[archivePath]; ok {
+				continue
+			}
+			seen[archivePath] = struct{}{}
+			out = append(out, archivePath)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func packManifestEntries(items []packItem) []packManifestEntry {
 	out := make([]packManifestEntry, len(items))
 	for i, item := range items {
@@ -809,13 +850,22 @@ func extractPackEntry(localRoot string, hdr *tar.Header, r io.Reader, dirTimes *
 	mode := fs.FileMode(hdr.Mode & 0o777)
 	switch hdr.Typeflag {
 	case tar.TypeDir:
+		if err := ensureNoSymlinkPath(localRoot, target, true); err != nil {
+			return err
+		}
 		if err := os.MkdirAll(target, mode); err != nil {
 			return fmt.Errorf("mkdir unpack target %s: %w", target, err)
 		}
 		*dirTimes = append(*dirTimes, packDirTime{Path: target, ModTime: hdr.ModTime})
 	case tar.TypeReg, 0:
+		if err := ensureNoSymlinkPath(localRoot, filepath.Dir(target), true); err != nil {
+			return err
+		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return fmt.Errorf("mkdir unpack parent %s: %w", filepath.Dir(target), err)
+		}
+		if err := ensureNoSymlinkPath(localRoot, filepath.Dir(target), true); err != nil {
+			return err
 		}
 		if err := os.RemoveAll(target); err != nil {
 			return fmt.Errorf("replace unpack target %s: %w", target, err)
@@ -834,8 +884,17 @@ func extractPackEntry(localRoot string, hdr *tar.Header, r io.Reader, dirTimes *
 		}
 		_ = os.Chtimes(target, hdr.ModTime, hdr.ModTime)
 	case tar.TypeSymlink:
+		if err := validatePackSymlinkTarget(hdr.Linkname); err != nil {
+			return err
+		}
+		if err := ensureNoSymlinkPath(localRoot, filepath.Dir(target), true); err != nil {
+			return err
+		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return fmt.Errorf("mkdir unpack parent %s: %w", filepath.Dir(target), err)
+		}
+		if err := ensureNoSymlinkPath(localRoot, filepath.Dir(target), true); err != nil {
+			return err
 		}
 		if err := os.RemoveAll(target); err != nil {
 			return fmt.Errorf("replace unpack symlink %s: %w", target, err)
@@ -849,23 +908,198 @@ func extractPackEntry(localRoot string, hdr *tar.Header, r io.Reader, dirTimes *
 	return nil
 }
 
+func validatePackSymlinkTarget(linkname string) error {
+	if linkname == "" || strings.ContainsRune(linkname, '\x00') || strings.Contains(linkname, "\\") {
+		return fmt.Errorf("unsafe pack symlink target %q", linkname)
+	}
+	if path.IsAbs(linkname) || filepath.IsAbs(linkname) {
+		return fmt.Errorf("unsafe pack symlink target %q", linkname)
+	}
+	cleaned := path.Clean(filepath.ToSlash(linkname))
+	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return fmt.Errorf("unsafe pack symlink target %q", linkname)
+	}
+	return nil
+}
+
+func ensureNoSymlinkPath(localRoot, target string, includeTarget bool) error {
+	overlayRoot := filepath.Clean(filepath.Join(localRoot, "overlay"))
+	cleanTarget := filepath.Clean(target)
+	if cleanTarget != overlayRoot && !strings.HasPrefix(cleanTarget, overlayRoot+string(filepath.Separator)) {
+		return fmt.Errorf("pack target %q escapes local overlay root", target)
+	}
+	if info, err := os.Lstat(overlayRoot); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("stat unpack path %s: %w", overlayRoot, err)
+		}
+	} else if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("refusing to unpack through symlink %s", overlayRoot)
+	}
+	rel, err := filepath.Rel(overlayRoot, cleanTarget)
+	if err != nil {
+		return err
+	}
+	if rel == "." {
+		return nil
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	limit := len(parts)
+	if !includeTarget {
+		limit--
+	}
+	cur := overlayRoot
+	for i := 0; i < limit; i++ {
+		cur = filepath.Join(cur, parts[i])
+		info, err := os.Lstat(cur)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return fmt.Errorf("stat unpack path %s: %w", cur, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to unpack through symlink %s", cur)
+		}
+	}
+	return nil
+}
+
 func removeManifestPaths(localRoot string, paths []string) error {
 	for _, archivePath := range paths {
-		archivePath, err := canonicalArchivePath(archivePath)
+		rel, err := manifestPathRel(archivePath)
 		if err != nil {
-			return fmt.Errorf("invalid manifest path %q: %w", archivePath, err)
-		}
-		rel := strings.TrimPrefix(archivePath, "/")
-		if rel == "" {
-			return fmt.Errorf("refusing to replace local overlay root from pack manifest")
+			return err
 		}
 		target, err := safeOverlayTarget(localRoot, rel)
 		if err != nil {
 			return err
 		}
+		if err := ensureNoSymlinkPath(localRoot, target, false); err != nil {
+			return err
+		}
 		if err := os.RemoveAll(target); err != nil {
 			return fmt.Errorf("replace unpack root %s: %w", target, err)
 		}
+	}
+	return nil
+}
+
+func installStagedPack(localRoot, stageRoot string, manifest packManifest, replace bool) error {
+	paths := manifest.Paths
+	if replace {
+		paths = manifestReplacePaths(manifest)
+		if err := removeManifestPaths(localRoot, paths); err != nil {
+			return err
+		}
+	}
+	for _, archivePath := range paths {
+		rel, err := manifestPathRel(archivePath)
+		if err != nil {
+			return err
+		}
+		src, err := safeOverlayTarget(stageRoot, rel)
+		if err != nil {
+			return err
+		}
+		if _, err := os.Lstat(src); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("stat staged unpack path %s: %w", src, err)
+		}
+		dst, err := safeOverlayTarget(localRoot, rel)
+		if err != nil {
+			return err
+		}
+		if replace {
+			if err := moveStagedPath(localRoot, src, dst); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := mergeStagedPath(localRoot, src, dst); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func manifestReplacePaths(manifest packManifest) []string {
+	if len(manifest.ReplacePaths) > 0 {
+		return manifest.ReplacePaths
+	}
+	return manifest.Paths
+}
+
+func manifestPathRel(archivePath string) (string, error) {
+	canonical, err := canonicalArchivePath(archivePath)
+	if err != nil {
+		return "", fmt.Errorf("invalid manifest path %q: %w", archivePath, err)
+	}
+	rel := strings.TrimPrefix(canonical, "/")
+	if rel == "" {
+		return "", fmt.Errorf("refusing to replace local overlay root from pack manifest")
+	}
+	return rel, nil
+}
+
+func moveStagedPath(localRoot, src, dst string) error {
+	if err := ensureNoSymlinkPath(localRoot, filepath.Dir(dst), true); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("mkdir unpack parent %s: %w", filepath.Dir(dst), err)
+	}
+	if err := ensureNoSymlinkPath(localRoot, filepath.Dir(dst), true); err != nil {
+		return err
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("install unpack path %s: %w", dst, err)
+	}
+	return nil
+}
+
+func mergeStagedPath(localRoot, src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return fmt.Errorf("stat staged unpack path %s: %w", src, err)
+	}
+	if info.IsDir() {
+		if err := ensureNoSymlinkPath(localRoot, dst, true); err != nil {
+			return err
+		}
+		if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+			return fmt.Errorf("mkdir unpack target %s: %w", dst, err)
+		}
+		if err := ensureNoSymlinkPath(localRoot, dst, true); err != nil {
+			return err
+		}
+		entries, err := os.ReadDir(src)
+		if err != nil {
+			return fmt.Errorf("read staged unpack dir %s: %w", src, err)
+		}
+		for _, entry := range entries {
+			if err := mergeStagedPath(localRoot, filepath.Join(src, entry.Name()), filepath.Join(dst, entry.Name())); err != nil {
+				return err
+			}
+		}
+		_ = os.Chtimes(dst, info.ModTime(), info.ModTime())
+		return nil
+	}
+	if err := ensureNoSymlinkPath(localRoot, filepath.Dir(dst), true); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("mkdir unpack parent %s: %w", filepath.Dir(dst), err)
+	}
+	if err := ensureNoSymlinkPath(localRoot, filepath.Dir(dst), true); err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dst); err != nil {
+		return fmt.Errorf("replace unpack target %s: %w", dst, err)
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return fmt.Errorf("install unpack path %s: %w", dst, err)
 	}
 	return nil
 }

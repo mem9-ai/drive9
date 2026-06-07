@@ -775,16 +775,10 @@ func prependPackArchiveArg(existing []string, archive string) []string {
 }
 
 func defaultPackAfterUnmount(ctx context.Context, state mountstate.ProcessState, archives []string, paths []string) error {
-	r := ResolveCredentials()
-	server := r.Server
-	if strings.TrimSpace(state.Server) != "" {
-		server = state.Server
+	c, err := packClientFromMountState(state)
+	if err != nil {
+		return err
 	}
-	apiKey := ""
-	if r.Kind == CredentialOwner || r.Kind == CredentialFSScoped {
-		apiKey = r.APIKey
-	}
-	c := client.New(server, apiKey)
 	warmCtx, cancel := context.WithTimeout(ctx, fsClientWarmTimeout)
 	c.Warm(warmCtx)
 	cancel()
@@ -804,6 +798,76 @@ func defaultPackAfterUnmount(ctx context.Context, state mountstate.ProcessState,
 		}
 	}
 	return nil
+}
+
+type mountPackAuth struct {
+	Server string
+	APIKey string
+	Token  string
+}
+
+func packClientFromMountState(state mountstate.ProcessState) (*client.Client, error) {
+	auth, err := packAuthFromMountState(state)
+	if err != nil {
+		return nil, err
+	}
+	if auth.Token != "" {
+		return client.NewWithToken(auth.Server, auth.Token), nil
+	}
+	return client.New(auth.Server, auth.APIKey), nil
+}
+
+func packAuthFromMountState(state mountstate.ProcessState) (mountPackAuth, error) {
+	server := strings.TrimSpace(state.Server)
+	kind := strings.TrimSpace(state.CredentialKind)
+	apiKey := strings.TrimSpace(state.APIKey)
+	token := strings.TrimSpace(state.Token)
+	switch kind {
+	case mountstate.CredentialKindAPIKey:
+		if apiKey == "" {
+			return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing API key")
+		}
+		if server == "" {
+			return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing server")
+		}
+		return mountPackAuth{Server: server, APIKey: apiKey}, nil
+	case mountstate.CredentialKindToken:
+		if token == "" {
+			return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing delegated token")
+		}
+		if server == "" {
+			return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing server")
+		}
+		return mountPackAuth{Server: server, Token: token}, nil
+	case "":
+		if apiKey != "" || token != "" {
+			if server == "" {
+				return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing server")
+			}
+			return mountPackAuth{Server: server, APIKey: apiKey, Token: token}, nil
+		}
+	default:
+		return mountPackAuth{}, fmt.Errorf("drive9 umount: unsupported mount credential kind %q", kind)
+	}
+
+	// Compatibility for pid files written before mount credential snapshots.
+	r := ResolveCredentials()
+	if server == "" {
+		server = r.Server
+	}
+	switch r.Kind {
+	case CredentialOwner, CredentialFSScoped:
+		apiKey = r.APIKey
+	case CredentialDelegated:
+		token = r.Token
+	}
+	if server == "" {
+		return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing server")
+	}
+	if apiKey == "" && token == "" {
+		return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing credentials")
+	}
+	return mountPackAuth{Server: server, APIKey: apiKey, Token: token}, nil
 }
 
 func waitForPIDExit(pid int, timeout time.Duration, deps umountDeps) error {

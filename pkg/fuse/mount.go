@@ -371,13 +371,20 @@ func Mount(opts *MountOptions) error {
 	if resolvedMountPoint, resolveErr := filepath.EvalSymlinks(stateMountPoint); resolveErr == nil {
 		stateMountPoint = resolvedMountPoint
 	}
+	credentialKind := mountstate.CredentialKindAPIKey
+	if opts.Token != "" {
+		credentialKind = mountstate.CredentialKindToken
+	}
 	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
-		PID:        os.Getpid(),
-		MountPoint: stateMountPoint,
-		RemoteRoot: opts.RemoteRoot,
-		Profile:    opts.Profile,
-		LocalRoot:  opts.LocalRoot,
-		Server:     opts.Server,
+		PID:            os.Getpid(),
+		MountPoint:     stateMountPoint,
+		RemoteRoot:     opts.RemoteRoot,
+		Profile:        opts.Profile,
+		LocalRoot:      opts.LocalRoot,
+		Server:         opts.Server,
+		CredentialKind: credentialKind,
+		APIKey:         opts.APIKey,
+		Token:          opts.Token,
 	})
 	if err != nil {
 		sseWatcher.Stop()

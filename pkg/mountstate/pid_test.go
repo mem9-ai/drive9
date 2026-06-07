@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -78,7 +79,13 @@ func TestReadPIDRejectsInvalidFile(t *testing.T) {
 
 func TestWriteReadProcessState(t *testing.T) {
 	mountPoint := filepath.Join(t.TempDir(), "mnt")
-	want := ProcessState{PID: 12345, CreationTime: 67890}
+	want := ProcessState{
+		PID:            12345,
+		CreationTime:   67890,
+		Server:         "https://drive9.example",
+		CredentialKind: CredentialKindAPIKey,
+		APIKey:         "sk-mounted",
+	}
 
 	path, err := WriteProcessState(mountPoint, want)
 	if err != nil {
@@ -95,6 +102,25 @@ func TestWriteReadProcessState(t *testing.T) {
 	}
 	if gotPath != path {
 		t.Fatalf("ReadProcessState path = %q, want %q", gotPath, path)
+	}
+}
+
+func TestWriteProcessStateUsesPrivatePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows file modes do not preserve POSIX permission bits")
+	}
+	mountPoint := filepath.Join(t.TempDir(), "mnt")
+	path, err := WriteProcessState(mountPoint, ProcessState{PID: 12345, CredentialKind: CredentialKindToken, Token: "tok"})
+	if err != nil {
+		t.Fatalf("WriteProcessState: %v", err)
+	}
+	defer func() { _ = os.Remove(path) }()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat process state: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("process state permissions = %v, want 0600", got)
 	}
 }
 
