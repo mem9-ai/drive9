@@ -24,9 +24,10 @@ import (
 //
 //	DRIVE9_META_DSN      — central server DB DSN (required)
 //	DRIVE9_MASTER_KEY    — AES master key hex for decrypting tenant DB passwords (required unless KMS)
-//	DRIVE9_ENCRYPT_TYPE  — "local_aes" (default) or "kms"
-//	DRIVE9_ENCRYPT_KEY   — KMS key ARN (when encrypt type is kms)
-//	DRIVE9_S3_REGION     — AWS region for KMS (default us-east-1)
+//	DRIVE9_ENCRYPT_TYPE  — "local_aes" (default) or "kms" or "aliyun_kms"
+//	DRIVE9_ENCRYPT_KEY   — KMS key ARN/alias (when encrypt type is kms or aliyun_kms)
+//	DRIVE9_S3_REGION     — AWS/Aliyun region for KMS (default us-east-1)
+//	DRIVE9_ALIYUN_KMS_ENDPOINT — custom Aliyun KMS endpoint, e.g. a VPC endpoint (optional)
 func runBackfillQuota(args []string) error {
 	dryRun := false
 	for _, arg := range args {
@@ -171,6 +172,7 @@ func buildEncryptor() (encrypt.Encryptor, error) {
 	encryptType := envOr("DRIVE9_ENCRYPT_TYPE", "local_aes")
 	masterHex := os.Getenv("DRIVE9_MASTER_KEY")
 	kmsKey := os.Getenv("DRIVE9_ENCRYPT_KEY")
+	aliyunKMSEndpoint := os.Getenv("DRIVE9_ALIYUN_KMS_ENDPOINT")
 
 	eKey := masterHex
 	eType := encrypt.Type(encryptType)
@@ -190,8 +192,9 @@ func buildEncryptor() (encrypt.Encryptor, error) {
 		}
 	}
 	return encrypt.New(context.Background(), encrypt.Config{
-		Type:   eType,
-		Key:    eKey,
-		Region: envOr("DRIVE9_S3_REGION", "us-east-1"),
+		Type:              eType,
+		Key:               eKey,
+		Region:            envOr("DRIVE9_S3_REGION", "us-east-1"),
+		AliyunKMSEndpoint: aliyunKMSEndpoint,
 	})
 }
