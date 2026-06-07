@@ -1,79 +1,118 @@
 name: Deploy server to prod
-
 on:
   workflow_dispatch:
     inputs:
+      region:
+        description: "Target region"
+        required: true
+        type: choice
+        options:
+          - all
+          - ap-southeast-1
+          - us-east-1
       image_tag:
-        description: "Optional image tag override (default: use current dev deployment image)"
+        description: "Image tag override (default: resolve from dev deployment)"
         required: false
         type: string
 
 env:
-  AWS_REGION: ${{ secrets.AWS_REGION }}
   ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-  AWS_ASSUME_ARN_PROD: ${{ secrets.AWS_ASSUME_ARN_PROD }}
   ECR_REPOSITORY: dat9-server
-  EKS_DEV_CLUSTER: dev-dat9
-  EKS_PROD_CLUSTER: prod-dat9
   DEPLOY_NAMESPACE: dat9
   K8S_DEPLOYMENT: dat9-server
 
 jobs:
   deploy:
-    name: Promote dev image to prod
+    name: Deploy to ${{ inputs.region }}
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
 
     steps:
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (ap-southeast-1)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ env.AWS_ASSUME_ARN_PROD }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ASSUME_ARN_PROD }}
+          aws-region: ap-southeast-1
 
-      - name: Update kubeconfig for dev and prod
+      - name: Update kubeconfig for dev
         run: |
           aws eks update-kubeconfig \
-            --name ${{ env.EKS_DEV_CLUSTER }} \
-            --region ${{ env.AWS_REGION }} \
+            --name dev-dat9 \
+            --region ap-southeast-1 \
             --alias dev
-          aws eks update-kubeconfig \
-            --name ${{ env.EKS_PROD_CLUSTER }} \
-            --region ${{ env.AWS_REGION }} \
-            --alias prod
 
       - name: Resolve image from dev
         run: |
           INPUT_TAG='${{ inputs.image_tag }}'
           if [ -n "$INPUT_TAG" ]; then
+            case "$INPUT_TAG" in
+              *[![:alnum:]_.-]*)
+                echo "Invalid image tag override" >&2
+                exit 1
+                ;;
+            esac
             IMAGE="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:$INPUT_TAG"
           else
-            IMAGE=$(kubectl --context dev -n ${{ env.DEPLOY_NAMESPACE }} \
-              get deployment/${{ env.K8S_DEPLOYMENT }} \
-              -o jsonpath='{.spec.template.spec.containers[?(@.name=="dat9-server")].image}')
+            IMAGE=$(kubectl --context dev -n "${{ env.DEPLOY_NAMESPACE }}" \
+              get "deployment/${{ env.K8S_DEPLOYMENT }}" \
+              -o 'jsonpath={.spec.template.spec.containers[?(@.name=="dat9-server")].image}')
           fi
-
           if [ -z "$IMAGE" ]; then
             echo "Failed to resolve image" >&2
             exit 1
           fi
-
           echo "Promoting image: $IMAGE"
-          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          printf '%s=%s\n' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
 
-      - name: Deploy to prod
+      - name: Deploy to ap-southeast-1
+        id: deploy-sg
+        if: inputs.region == 'all' || inputs.region == 'ap-southeast-1'
         run: |
-          kubectl --context prod -n ${{ env.DEPLOY_NAMESPACE }} \
-            set image deployment/${{ env.K8S_DEPLOYMENT }} \
-            ${{ env.K8S_DEPLOYMENT }}=${{ env.IMAGE }}
-          kubectl --context prod -n ${{ env.DEPLOY_NAMESPACE }} \
-            rollout status deployment/${{ env.K8S_DEPLOYMENT }} \
+          echo "sg-deploy=1" >> "$GITHUB_ENV"
+          aws eks update-kubeconfig \
+            --name prod-dat9 \
+            --region ap-southeast-1 \
+            --alias prod
+          kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
+            set image "deployment/${{ env.K8S_DEPLOYMENT }}" \
+            "${{ env.K8S_DEPLOYMENT }}=$IMAGE"
+          kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
+            rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
             --timeout=180s
 
-      - name: Rollback on failed deploy
-        if: failure()
+      - name: Rollback ap-southeast-1 on failure
+        if: failure() && steps.deploy-sg.outcome == 'failure'
         run: |
-          kubectl --context prod -n ${{ env.DEPLOY_NAMESPACE }} \
-            rollout undo deployment/${{ env.K8S_DEPLOYMENT }}
+          kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
+            rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
+
+      - name: Configure AWS credentials (us-east-1)
+        if: inputs.region == 'all' || inputs.region == 'us-east-1'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ASSUME_ARN_US }}
+          aws-region: us-east-1
+
+      - name: Deploy to us-east-1
+        id: deploy-us
+        if: inputs.region == 'all' || inputs.region == 'us-east-1'
+        run: |
+          echo "us-deploy=1" >> "$GITHUB_ENV"
+          aws eks update-kubeconfig \
+            --name prod-dat9-us \
+            --region us-east-1 \
+            --alias us
+          kubectl --context us -n "${{ env.DEPLOY_NAMESPACE }}" \
+            set image "deployment/${{ env.K8S_DEPLOYMENT }}" \
+            "${{ env.K8S_DEPLOYMENT }}=$IMAGE"
+          kubectl --context us -n "${{ env.DEPLOY_NAMESPACE }}" \
+            rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
+            --timeout=180s
+
+      - name: Rollback us-east-1 on failure
+        if: failure() && steps.deploy-us.outcome == 'failure'
+        run: |
+          kubectl --context us -n "${{ env.DEPLOY_NAMESPACE }}" \
+            rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"

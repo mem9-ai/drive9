@@ -22,7 +22,6 @@ type Config struct {
 	Type   Type
 	Key    string // hex master key for local_aes, KMS key id/alias for kms/aliyun_kms
 	Region string // aws/aliyun region for kms
-
 	// AliyunKMSEndpoint overrides the default Aliyun KMS endpoint, e.g. a VPC endpoint.
 	// Leave empty to use the default public endpoint for the region.
 	AliyunKMSEndpoint string
