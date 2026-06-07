@@ -7313,6 +7313,50 @@ func TestOpenWritablePreloadChoosesNewestOpenHandle(t *testing.T) {
 	}
 }
 
+func TestOpenWritablePreloadSkipsCleanSiblingReboundToNewRevision(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	const filePath = "/workload.db"
+	stale := []byte("sqlite db before checkpoint")
+	committedSize := int64(len("sqlite db after checkpoint with event rows"))
+	ino := fs.inodes.Lookup(filePath, false, int64(len(stale)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	sibling := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: int64(len(stale)),
+		BaseRev:  1,
+	}
+	if _, err := sibling.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	sibling.Dirty.ClearDirty()
+	fs.openHandles.Add(sibling)
+
+	fs.inodes.UpdateSize(ino, committedSize)
+	fs.refreshCommittedRevisionForOpenHandles(filePath, 2, nil)
+
+	if sibling.BaseRev != 2 {
+		t.Fatalf("sibling BaseRev = %d, want 2", sibling.BaseRev)
+	}
+	target := &FileHandle{
+		Ino:     ino,
+		Path:    filePath,
+		Dirty:   fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		BaseRev: 2,
+	}
+	if fs.loadWritableHandleFromOpenHandleLocked(target) {
+		t.Fatal("clean sibling rebound to a newer revision must not be used as preload data")
+	}
+	if got := target.Dirty.Size(); got != 0 {
+		t.Fatalf("target dirty size = %d, want 0", got)
+	}
+}
+
 func TestOpenWritablePreloadSkipsSQLitePersistentJournalOpenHandle(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

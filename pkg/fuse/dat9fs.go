@@ -840,10 +840,14 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision i
 			continue
 		}
 		if fh.Dirty != nil {
+			cleanBuffer := fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts()
 			fh.IsNew = false
 			fh.BaseRev = revision
 			if fh.Streamer != nil {
 				fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+			}
+			if cleanBuffer {
+				fs.rebindCleanWriteBufferToRemoteLocked(fh, fs.committedHandleSizeLocked(fh))
 			}
 		}
 		fh.Unlock()
@@ -913,20 +917,24 @@ func (fs *Dat9FS) rebindCleanWriteBufferToRemoteLocked(fh *FileHandle, committed
 	if committedSize < 0 {
 		committedSize = 0
 	}
-	if fh.Dirty.smallFileData != nil && int64(len(fh.Dirty.smallFileData)) < committedSize {
-		fh.Dirty.migrateToPartMode()
+	old := fh.Dirty
+	maxSize := old.maxSize
+	if maxSize < committedSize {
+		maxSize = committedSize * 2
+		if maxSize < maxPreloadSize {
+			maxSize = maxPreloadSize
+		}
 	}
-	fh.Dirty.totalSize = committedSize
-	fh.Dirty.remoteSize = committedSize
-	fh.Dirty.appendCursor = committedSize
-	fh.Dirty.sequential = true
-	fh.Dirty.uploadedParts = nil
-	fh.Dirty.OnPartFull = nil
-	fh.Streamer = nil
+	partSize := old.PartSize()
+	next := fs.newWriteBuffer(fh.Path, maxSize, partSize)
+	next.totalSize = committedSize
+	next.remoteSize = committedSize
+	next.appendCursor = committedSize
+	next.sequential = true
+	fh.Dirty = next
 
 	c := fs.client
-	partSize := fh.Dirty.PartSize()
-	fh.Dirty.LoadPart = func(partNum int) ([]byte, error) {
+	next.LoadPart = func(partNum int) ([]byte, error) {
 		filePath := fh.Path
 		remoteFilePath := fs.remotePath(filePath)
 		partIdx := partNum - 1
@@ -1093,6 +1101,9 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	fh.IsNew = false
 	fh.BaseRev = revision
 	fs.inodes.UpdateRevision(fh.Ino, revision)
+	if fh.Dirty != nil {
+		fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+	}
 	fs.refreshCommittedRevisionForOpenHandles(fh.Path, revision, fh)
 	if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() > 0 {
 		fh.ZeroBase = false
@@ -1494,6 +1505,9 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
 		fh.BaseRev = revision
 		fs.inodes.UpdateRevision(fh.Ino, revision)
+		if fh.Dirty != nil {
+			fs.inodes.UpdateSize(fh.Ino, fh.Dirty.Size())
+		}
 		if wasNew {
 			fs.replaceCommittedRevision(fh.Path, revision)
 		} else {
