@@ -5511,6 +5511,44 @@ func TestOpenReadOnlySQLiteUsesDirectIO(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlyPendingShadowUsesDirectIO(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	path := "/handles/open-renamed.txt"
+	data := []byte("pending shadow bytes")
+	if err := shadow.WriteFull(path, data, 0); err != nil {
+		t.Fatalf("WriteFull: %v", err)
+	}
+	ino := fs.inodes.Lookup(path, false, int64(len(data)), time.Now())
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO for pending shadow coherence", out.OpenFlags)
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if !fh.ShadowPinned || fh.ShadowGen == 0 {
+		t.Fatalf("shadow pin = (%v, %d), want pinned generation", fh.ShadowPinned, fh.ShadowGen)
+	}
+}
+
 func TestOpenWritableSQLiteUsesDirectIO(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

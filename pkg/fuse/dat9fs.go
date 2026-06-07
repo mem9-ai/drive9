@@ -561,6 +561,9 @@ func remoteOpenFlagsForHandle(fh *FileHandle) uint32 {
 	if isSQLiteDirectIOPath(fh.Path) {
 		return gofuse.FOPEN_DIRECT_IO
 	}
+	if fh.ShadowPinned || fh.ShadowReady || fh.ShadowSpill {
+		return gofuse.FOPEN_DIRECT_IO
+	}
 	if fh.Dirty != nil {
 		if fh.Flags&syscall.O_TRUNC != 0 || fh.OrigSize >= smallFileShadowThreshold {
 			return gofuse.FOPEN_DIRECT_IO
