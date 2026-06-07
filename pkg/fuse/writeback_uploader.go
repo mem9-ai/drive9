@@ -36,6 +36,8 @@ type pathState struct {
 	done chan struct{} // closed when the current upload finishes
 }
 
+type WriteBackSuccessFunc func(meta WriteBackMeta, committedRev int64)
+
 // WriteBackUploader consumes pending write-back cache entries and uploads
 // them to the server in the background. It runs a fixed number of worker
 // goroutines that read from a shared channel.
@@ -57,7 +59,8 @@ type WriteBackUploader struct {
 	inflightMu sync.Mutex
 	inflight   map[string]*pathState
 
-	perf *fusePerfCounters
+	perf      *fusePerfCounters
+	OnSuccess WriteBackSuccessFunc
 }
 
 // NewWriteBackUploader creates and starts a background uploader with
@@ -289,7 +292,10 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	}
 
 	// Retry with exponential backoff.
-	var lastErr error
+	var (
+		lastErr      error
+		committedRev int64
+	)
 	for attempt := 0; attempt <= uploadMaxRetries; attempt++ {
 		if attempt > 0 {
 			delay := time.Duration(float64(uploadBackoffBase) * math.Pow(2, float64(attempt-1)))
@@ -301,7 +307,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), uploadTimeout)
 		uploadStart := time.Now()
-		lastErr = uploadBufferedRemoteFile(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
+		committedRev, lastErr = uploadBufferedRemoteFileWithRevision(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
 		cancel()
 		if u.perf != nil {
 			u.perf.recordRemoteOp(perfRemoteWrite, lastErr, time.Since(uploadStart), uint64(len(data)))
@@ -355,6 +361,9 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
 	}
+	if u.OnSuccess != nil {
+		u.OnSuccess(*meta, committedRev)
+	}
 }
 
 // UploadSync synchronously uploads a single path from the cache to the server.
@@ -405,7 +414,7 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	if useDirectPUT {
 		committedRev, err = u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, expectedRevision)
 	} else {
-		err = uploadBufferedRemoteFile(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
+		committedRev, err = uploadBufferedRemoteFileWithRevision(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
 	}
 	if u.perf != nil {
 		u.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(uploadStart), uint64(len(data)))

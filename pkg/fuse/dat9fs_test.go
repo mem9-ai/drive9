@@ -23,6 +23,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
 type testErrorRecorder struct {
@@ -218,6 +219,76 @@ func TestNegotiatedInlineThresholdSeparatesProtocolFromHeuristic(t *testing.T) {
 	}
 	if got := fs.inlineThreshold(); got != defaultSmallFileThreshold {
 		t.Fatalf("pre-warm inlineThreshold = %d, want %d (heuristic fallback)", got, defaultSmallFileThreshold)
+	}
+}
+
+func TestUnknownInlineThresholdNonEmptyHandleUploadUsesMultipart(t *testing.T) {
+	const filePath = "/unknown-threshold.bin"
+	data := []byte("non-empty write before inline threshold warmup")
+
+	for _, tc := range []struct {
+		name string
+		run  func(*Dat9FS, *FileHandle) gofuse.Status
+	}{
+		{
+			name: "flush",
+			run: func(fs *Dat9FS, fh *FileHandle) gofuse.Status {
+				return fs.flushHandle(context.Background(), fh)
+			},
+		},
+		{
+			name: "write-sync",
+			run: func(fs *Dat9FS, fh *FileHandle) gofuse.Status {
+				return fs.syncWriteHandleToRemoteLocked(context.Background(), fh)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expectedRevision := int64(0)
+			rec := newMultipartUploadRecorder(t, filePath, int64(len(data)), &expectedRevision)
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(client.New(rec.server.URL, ""), opts)
+			if got := fs.negotiatedInlineThreshold(); got != 0 {
+				t.Fatalf("negotiatedInlineThreshold = %d, want 0", got)
+			}
+
+			ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+			fh := &FileHandle{
+				Ino:      ino,
+				Path:     filePath,
+				Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+				IsNew:    true,
+				OrigSize: 0,
+			}
+			if _, err := fh.Dirty.Write(0, data); err != nil {
+				t.Fatal(err)
+			}
+			fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+
+			fh.Lock()
+			st := tc.run(fs, fh)
+			fh.Unlock()
+			if st != gofuse.OK {
+				t.Fatalf("upload status = %v, want OK", st)
+			}
+			if got := rec.directFilePuts.Load(); got != 0 {
+				t.Fatalf("direct PUT calls = %d, want 0", got)
+			}
+			if got := rec.initiateCalls.Load(); got != 1 {
+				t.Fatalf("multipart initiate calls = %d, want 1", got)
+			}
+			if got := rec.completeCalls.Load(); got != 1 {
+				t.Fatalf("multipart complete calls = %d, want 1", got)
+			}
+			rec.mu.Lock()
+			uploadedBytes := rec.gotUploadedBytes
+			rec.mu.Unlock()
+			if uploadedBytes != int64(len(data)) {
+				t.Fatalf("uploaded bytes = %d, want %d", uploadedBytes, len(data))
+			}
+		})
 	}
 }
 
@@ -1266,6 +1337,200 @@ func TestDat9FSParallelDiskReadStopsQueuedBlocksAfterFirstError(t *testing.T) {
 	if got := unexpectedQueuedReads.Load(); got != 0 {
 		t.Fatalf("queued block reads after first error = %d, want 0", got)
 	}
+}
+
+func TestDat9FSSQLitePersistentJournalBypassesDiskReadCacheKey(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+
+	regular := &InodeEntry{Path: "/repo/regular.bin", Size: 4096, Revision: 7}
+	if _, ok := fs.diskReadCacheKey(regular.Path, regular, 0, 1024); !ok {
+		t.Fatal("regular file disk read cache key unavailable")
+	}
+
+	for _, path := range []string{"/repo/workload.db-wal", "/repo/workload.db-journal"} {
+		entry := &InodeEntry{Path: path, Size: 4096, Revision: 7}
+		if key, ok := fs.diskReadCacheKey(path, entry, 0, 1024); ok {
+			t.Fatalf("disk read cache key for %s = %+v, want disabled", path, key)
+		}
+	}
+}
+
+func TestDat9FSSQLiteMainDatabaseDiskReadCacheDependsOnOpenSidecar(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs.diskReadCache = newTestDiskReadCache(t, 1<<20)
+
+	const dbPath = "/repo/workload.db"
+	entry := &InodeEntry{Path: dbPath, Size: 4096, Revision: 7}
+	if _, ok := fs.diskReadCacheKey(dbPath, entry, 0, 1024); !ok {
+		t.Fatal("sqlite main database disk read cache key unavailable without sidecar")
+	}
+
+	walHandle := &FileHandle{Ino: 11, Path: dbPath + "-wal"}
+	walHandleID := fs.allocateFileHandle(walHandle)
+	defer fs.deleteFileHandle(walHandleID, walHandle)
+
+	if key, ok := fs.diskReadCacheKey(dbPath, entry, 0, 1024); ok {
+		t.Fatalf("sqlite main database disk read cache key with active sidecar = %+v, want disabled", key)
+	}
+}
+
+func TestDat9FSReadSQLitePersistentJournalBypassesSmallReadCache(t *testing.T) {
+	const path = "/repo/workload.db-wal"
+	var reads atomic.Int32
+	var recorder testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs/repo/workload.db-wal" {
+			recorder.Recordf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		switch reads.Add(1) {
+		case 1:
+			_, _ = w.Write([]byte("old-wal"))
+		case 2:
+			_, _ = w.Write([]byte("new-wal"))
+		default:
+			recorder.Recordf("unexpected read count")
+			http.Error(w, "unexpected read count", http.StatusTooManyRequests)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(path, false, 7, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "old-wal" {
+		t.Fatalf("first read = %q, %v; want old-wal OK", got, st)
+	}
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, 0, 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "new-wal" {
+		t.Fatalf("second read = %q, %v; want new-wal OK", got, st)
+	}
+	if calls := reads.Load(); calls != 2 {
+		t.Fatalf("server reads = %d, want 2", calls)
+	}
+	recorder.Check(t)
+}
+
+func TestDat9FSReadSQLiteMainDatabaseBypassesSmallReadCacheWithOpenSidecar(t *testing.T) {
+	const path = "/repo/workload.db"
+	var reads atomic.Int32
+	var recorder testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs/repo/workload.db" {
+			recorder.Recordf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		switch reads.Add(1) {
+		case 1:
+			_, _ = w.Write([]byte("old-db"))
+		case 2:
+			_, _ = w.Write([]byte("new-db"))
+		default:
+			recorder.Recordf("unexpected read count")
+			http.Error(w, "unexpected read count", http.StatusTooManyRequests)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(path, false, 6, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	walHandle := &FileHandle{Ino: ino + 1, Path: path + "-wal"}
+	walHandleID := fs.allocateFileHandle(walHandle)
+	defer fs.deleteFileHandle(walHandleID, walHandle)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "old-db" {
+		t.Fatalf("first read = %q, %v; want old-db OK", got, st)
+	}
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, 0, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "new-db" {
+		t.Fatalf("second read = %q, %v; want new-db OK", got, st)
+	}
+	if calls := reads.Load(); calls != 2 {
+		t.Fatalf("server reads = %d, want 2", calls)
+	}
+	recorder.Check(t)
+}
+
+func TestDat9FSReadSQLiteMainDatabaseUsesSmallReadCacheWithoutOpenSidecar(t *testing.T) {
+	const path = "/repo/workload.db"
+	var reads atomic.Int32
+	var recorder testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs/repo/workload.db" {
+			recorder.Recordf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		switch reads.Add(1) {
+		case 1:
+			_, _ = w.Write([]byte("cached"))
+		default:
+			recorder.Recordf("unexpected read count")
+			http.Error(w, "unexpected read count", http.StatusTooManyRequests)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(path, false, 6, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "cached" {
+		t.Fatalf("first read = %q, %v; want cached OK", got, st)
+	}
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, 0, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || string(got) != "cached" {
+		t.Fatalf("second read = %q, %v; want cached OK", got, st)
+	}
+	if calls := reads.Load(); calls != 1 {
+		t.Fatalf("server reads = %d, want 1", calls)
+	}
+	recorder.Check(t)
 }
 
 func TestDat9FSDiskReadCacheRevisionInvalidatesByKey(t *testing.T) {
@@ -6522,6 +6787,46 @@ func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlySQLiteUsesDirectIO(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	ino := fs.inodes.Lookup("/workload.db", false, 4096, time.Now())
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO for SQLite reader coherence", out.OpenFlags)
+	}
+}
+
+func TestOpenWritableSQLiteUsesDirectIO(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	ino := fs.inodes.Lookup("/workload.db", false, 4, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.readCache.Put("/workload.db", []byte("seed"), 1)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO for SQLite writer coherence", out.OpenFlags)
+	}
+}
+
 func TestOpenReadOnlyCacheableFileSkipsPrefetcher(t *testing.T) {
 	size := int64(defaultReadCacheMaxFileSize)
 	fs, ino, cleanup := newTestDat9FS(t, size, func(w http.ResponseWriter, r *http.Request) {
@@ -6909,6 +7214,162 @@ func TestCodingAgentLocalOverlayCreateReadWriteDoesNotUseRemote(t *testing.T) {
 
 	if got := remoteCalls.Load(); got != 0 {
 		t.Fatalf("remote calls = %d, want 0", got)
+	}
+}
+
+func TestSQLiteWALIndexSidecarUsesTransientLocalOverlay(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be used for sqlite wal-index sidecars", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	transientRoot := t.TempDir()
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.transientLocalOverlay = NewLocalOverlay(transientRoot)
+	if err := fs.transientLocalOverlay.EnsureRoot(); err != nil {
+		t.Fatalf("EnsureRoot transient overlay: %v", err)
+	}
+
+	ctx := context.Background()
+	if overlay, local, st := fs.localOverlayForPath(ctx, "/repo/workload.db-shm"); !local || st != gofuse.OK || overlay != fs.transientLocalOverlay {
+		t.Fatalf("sqlite -shm overlay = (%p, %t, %v), want transient local overlay", overlay, local, st)
+	}
+	for _, persistentPath := range []string{"/repo/workload.db", "/repo/workload.db-wal", "/repo/workload.db-journal"} {
+		if overlay, local, st := fs.localOverlayForPath(ctx, persistentPath); local || st != gofuse.OK || overlay != nil {
+			t.Fatalf("%s overlay = (%p, %t, %v), want remote persistent", persistentPath, overlay, local, st)
+		}
+	}
+
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_RDWR),
+		Mode:     0o644,
+	}, "workload.db-shm", &createOut); st != gofuse.OK {
+		t.Fatalf("Create workload.db-shm: %v", st)
+	}
+
+	content := []byte("sqlite wal-index bytes")
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Size:     uint32(len(content)),
+	}, content)
+	if st != gofuse.OK {
+		t.Fatalf("Write workload.db-shm: %v", st)
+	}
+	if written != uint32(len(content)) {
+		t.Fatalf("Write bytes = %d, want %d", written, len(content))
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: createOut.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush workload.db-shm: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+
+	localPath := transientRoot + "/overlay/repo/workload.db-shm"
+	gotFile, err := os.ReadFile(localPath)
+	if err != nil {
+		t.Fatalf("ReadFile transient overlay: %v", err)
+	}
+	if string(gotFile) != string(content) {
+		t.Fatalf("transient overlay content = %q, want %q", gotFile, content)
+	}
+
+	entries, err := fs.mergeLocalDirEntries(ctx, "/repo", nil)
+	if err != nil {
+		t.Fatalf("mergeLocalDirEntries: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name != "workload.db-shm" {
+		t.Fatalf("merged entries = %#v, want workload.db-shm only", entries)
+	}
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "workload.db-shm", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup workload.db-shm: %v", st)
+	}
+	var openOut gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &openOut); st != gofuse.OK {
+		t.Fatalf("Open workload.db-shm: %v", st)
+	}
+	buf := make([]byte, len(content)+8)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read workload.db-shm: %v", st)
+	}
+	got, _ := result.Bytes(buf)
+	if string(got) != string(content) {
+		t.Fatalf("Read workload.db-shm = %q, want %q", got, content)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: openOut.Fh})
+
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+}
+
+func TestSQLiteWALIndexSidecarFailsClosedWhenTransientOverlayMissing(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be used for sqlite wal-index sidecars", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	overlay, local, st := fs.localOverlayForPath(context.Background(), "/repo/workload.db-shm")
+	if overlay != nil || !local || st != gofuse.EIO {
+		t.Fatalf("sqlite -shm missing overlay = (%p, %t, %v), want local EIO", overlay, local, st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+}
+
+func TestWaitQueuedRemoteCommitBeforeWriteBlocksUntilQueuedCommitDone(t *testing.T) {
+	path := "/repo/data.bin"
+	entry := &CommitEntry{Path: path}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{entry},
+		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
+		inFlight:     make(map[string]*CommitEntry),
+	}
+	cq.rebuildQueuedIndexLocked()
+	fs := &Dat9FS{commitQueue: cq}
+
+	done := make(chan struct{})
+	go func() {
+		unlock := fs.waitQueuedRemoteCommitBeforeWrite(path)
+		unlock()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("waitQueuedRemoteCommitBeforeWrite returned while commit was queued")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	cq.removeFromQueue(entry)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("waitQueuedRemoteCommitBeforeWrite did not return after queue removal")
 	}
 }
 
@@ -8002,6 +8463,91 @@ func TestOpenWritablePreloadChoosesNewestOpenHandle(t *testing.T) {
 	}
 }
 
+func TestOpenWritablePreloadSkipsSQLitePersistentJournalOpenHandle(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	const filePath = "/workload.db-wal"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, []byte("partial in-flight wal bytes")); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+	fs.openHandles.Add(writer)
+
+	target := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if fs.loadWritableHandleFromOpenHandleLocked(target) {
+		t.Fatal("sqlite persistent journal must not preload in-flight bytes from sibling writer")
+	}
+	if got := target.Dirty.Size(); got != 0 {
+		t.Fatalf("target dirty size = %d, want 0", got)
+	}
+}
+
+func TestOpenWritableSQLitePersistentJournalLocalCreateDoesNotStatRemote(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for local uncommitted sqlite sidecar create", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/workload.db-wal"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	creator := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		IsNew:    true,
+		OrigSize: 0,
+		BaseRev:  0,
+	}
+	if err := creator.Dirty.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	creator.DirtySeq = fs.markDirtySize(ino, 0)
+	fs.openHandles.Add(creator)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDWR),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+	reopened, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("reopened handle not found")
+	}
+	defer fs.deleteFileHandle(out.Fh, reopened)
+	reopened.Lock()
+	isNew := reopened.IsNew
+	baseRev := reopened.BaseRev
+	size := reopened.Dirty.Size()
+	reopened.Unlock()
+	if !isNew || baseRev != 0 || size != 0 {
+		t.Fatalf("reopened state isNew=%t baseRev=%d size=%d, want true/0/0", isNew, baseRev, size)
+	}
+}
+
 func TestOpenWritablePreloadReadsShadowBeforeEvictedBuffer(t *testing.T) {
 	var remoteCalls atomic.Int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -8081,6 +8627,1383 @@ func TestOpenWritablePreloadReadsShadowBeforeEvictedBuffer(t *testing.T) {
 	}
 	if origSize != 0 {
 		t.Fatalf("reopened OrigSize = %d, want 0 for pending new file", origSize)
+	}
+}
+
+func TestReadSQLiteSamePathDirtyHandleBeforeRemote(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for same-mount sqlite main-db dirty data", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/workload.db", false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  "/workload.db",
+		Dirty: fs.newWriteBuffer("/workload.db", maxPreloadSize, 0),
+	}
+	want := []byte("latest main db bytes")
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+
+	reader := &FileHandle{Ino: ino, Path: "/workload.db"}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes = %q, want %q", got, want)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalSkipsIncompleteDirtyHandle(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	stable := []byte("stable committed wal bytes")
+	dirty := []byte("partial")
+	var objectGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+filePath:
+			w.Header().Set("Content-Length", strconv.Itoa(len(stable)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			w.Header().Set("Location", ts.URL+"/object")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object":
+			objectGets.Add(1)
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(stable)-1) {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(stable)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(stable)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, dirty); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(dirty)))
+	fs.openHandles.Add(writer)
+
+	if _, _, ok, st := fs.readSamePathDirtyHandle(filePath, nil, 0, uint32(len(dirty))); ok || st != gofuse.OK {
+		t.Fatalf("persistent journal same-path dirty claimed=%t status=%v, want false/OK", ok, st)
+	}
+
+	reader := &FileHandle{Ino: ino, Path: filePath, OrigSize: int64(len(stable)), BaseRev: 7}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(stable)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, stable) {
+		t.Fatalf("read bytes = %q, want committed remote bytes %q", got, stable)
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets = %d, want 1", got)
+	}
+}
+
+func TestReadSQLitePersistentJournalUsesCompleteDirtyRangeBeforeCommittedCache(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	committed := bytes.Repeat([]byte{0x5a}, 4096)
+	dirty := bytes.Repeat([]byte{0x7c}, 4096)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted when same-mount WAL bytes are available", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(committed)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision(filePath, 7)
+	fs.readCache.Put(filePath, committed, 7)
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, dirty); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(dirty)))
+	fs.openHandles.Add(writer)
+
+	reader := &FileHandle{Ino: ino, Path: filePath}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, len(committed))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(committed)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, dirty) {
+		t.Fatalf("read bytes = %q, want complete dirty WAL bytes", got)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalUsesCompleteDirtyRangeBeyondCommittedCache(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	committed := bytes.Repeat([]byte{0x5a}, 4096)
+	dirty := append(bytes.Repeat([]byte{0x5a}, 4096), bytes.Repeat([]byte{0x7c}, 4096)...)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted when complete same-mount WAL bytes are available", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(committed)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision(filePath, 7)
+	fs.readCache.Put(filePath, committed, 7)
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, dirty); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(dirty)))
+	fs.openHandles.Add(writer)
+
+	reader := &FileHandle{Ino: ino, Path: filePath}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 4096)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   4096,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if want := dirty[4096:]; !bytes.Equal(got, want) {
+		t.Fatalf("read bytes = %x, want complete dirty WAL range %x", got[:4], want[:4])
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalDirtyRangeRequiresFullRequest(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	dirty := append(bytes.Repeat([]byte{0x5a}, 4096), bytes.Repeat([]byte{0x7c}, 512)...)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be called by helper", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(dirty)), time.Now())
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, dirty); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(dirty)))
+	fs.openHandles.Add(writer)
+
+	if _, n, ok, st := fs.readSQLitePersistentJournalDirtyRange(filePath, nil, 4096, 4096); ok || st != gofuse.OK || n != 0 {
+		t.Fatalf("dirty range claimed=%t n=%d status=%v, want no claim/OK", ok, n, st)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalWaitsForCompleteDirtyRangeBeforeCommittedCache(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	committed := bytes.Repeat([]byte{0x5a}, 4096)
+	dirtyFirst := bytes.Repeat([]byte{0x5a}, 4096)
+	dirtySecond := bytes.Repeat([]byte{0x7c}, 4096)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted while same-mount WAL bytes are still completing", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(committed)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision(filePath, 7)
+	fs.readCache.Put(filePath, committed, 7)
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, dirtyFirst); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(dirtyFirst)))
+	fs.openHandles.Add(writer)
+
+	ready := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		<-ready
+		time.Sleep(10 * time.Millisecond)
+		writer.Lock()
+		defer writer.Unlock()
+		if _, err := writer.Dirty.Write(int64(len(dirtyFirst)), dirtySecond); err != nil {
+			t.Errorf("writer dirty append failed: %v", err)
+			return
+		}
+		writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+	}()
+	close(ready)
+
+	reader := &FileHandle{Ino: ino, Path: filePath}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, len(dirtySecond))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   uint64(len(dirtyFirst)),
+		Size:     uint32(len(buf)),
+	}, buf)
+	<-done
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, dirtySecond) {
+		t.Fatalf("read bytes = %x, want completed dirty WAL range %x", got[:4], dirtySecond[:4])
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalCleanWritableHandleUsesCompleteDirtyRangeBeforeCommittedCache(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	committed := bytes.Repeat([]byte{0x6b}, 4096)
+	dirty := bytes.Repeat([]byte{0x19}, 4096)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted when same-mount WAL bytes are available", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(committed)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision(filePath, 7)
+	fs.readCache.Put(filePath, committed, 7)
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, dirty); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(dirty)))
+	fs.openHandles.Add(writer)
+
+	cleanBuffer := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if err := cleanBuffer.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	cleanBuffer.ClearDirty()
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    cleanBuffer,
+		OrigSize: int64(len(committed)),
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, len(committed))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(committed)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, dirty) {
+		t.Fatalf("read bytes = %q, want complete dirty WAL bytes", got)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalEmptyShadowCreateUsesSiblingDirtyRange(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	dirtyFirst := bytes.Repeat([]byte{0x1a}, 4096)
+	dirtySecond := bytes.Repeat([]byte{0x2b}, 4096)
+	dirty := append(dirtyFirst, dirtySecond...)
+	var remoteCalls atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted when same-mount WAL bytes are available", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, dirty); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+	fs.openHandles.Add(writer)
+
+	if err := fs.shadowStore.Ensure(filePath, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	emptyCreate := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Flags:       syscall.O_RDWR | syscall.O_CREAT,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		IsNew:       true,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+	emptyCreate.Dirty.touched = true
+	emptyCreate.DirtySeq = fs.markDirtySize(ino, 0)
+	readerID := fs.allocateFileHandle(emptyCreate)
+	defer fs.deleteFileHandle(readerID, emptyCreate)
+
+	buf := make([]byte, len(dirtySecond))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   uint64(len(dirtyFirst)),
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, dirtySecond) {
+		t.Fatalf("read bytes = %x, want sibling dirty WAL bytes %x", got[:4], dirtySecond[:4])
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestFlushSQLitePersistentJournalSkipsStaleEmptyCreateAfterSiblingCommit(t *testing.T) {
+	const filePath = "/workload.db-wal"
+
+	for _, tc := range []struct {
+		name    string
+		isNew   bool
+		baseRev int64
+	}{
+		{name: "pending create not refreshed", isNew: true, baseRev: 0},
+		{name: "pending create already refreshed", isNew: false, baseRev: 41},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var remoteCalls atomic.Int64
+
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				remoteCalls.Add(1)
+				http.Error(w, "stale empty sidecar create must not overwrite committed WAL", http.StatusInternalServerError)
+			}))
+			defer ts.Close()
+
+			opts := &MountOptions{}
+			opts.setDefaults()
+			fs := NewDat9FS(newTestClient(ts.URL), opts)
+			ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+			fs.recordCommittedRevision(filePath, 41)
+			fs.inodes.UpdateRevision(ino, 41)
+
+			staleCreate := &FileHandle{
+				Ino:      ino,
+				Path:     filePath,
+				Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+				IsNew:    tc.isNew,
+				OrigSize: 0,
+				BaseRev:  tc.baseRev,
+			}
+			staleCreate.Dirty.touched = true
+			staleCreate.DirtySeq = fs.markDirtySize(ino, 0)
+
+			staleCreate.Lock()
+			st := fs.flushHandle(context.Background(), staleCreate)
+			staleCreate.Unlock()
+			if st != gofuse.OK {
+				t.Fatalf("flushHandle status = %v, want OK", st)
+			}
+			if got := remoteCalls.Load(); got != 0 {
+				t.Fatalf("remote calls = %d, want 0", got)
+			}
+			if staleCreate.IsNew {
+				t.Fatalf("stale empty create still marked new")
+			}
+			if staleCreate.BaseRev != 41 {
+				t.Fatalf("BaseRev = %d, want adopted committed revision 41", staleCreate.BaseRev)
+			}
+			if staleCreate.DirtySeq != 0 {
+				t.Fatalf("DirtySeq = %d, want cleared", staleCreate.DirtySeq)
+			}
+			if staleCreate.Dirty.HasDirtyParts() {
+				t.Fatalf("dirty state still set after stale empty create was cleared")
+			}
+		})
+	}
+}
+
+func TestFlushSQLitePersistentJournalUploadAllSeedsCommittedCache(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	data := bytes.Repeat([]byte{0x42}, int(DefaultPartSize)+1024)
+	expectedRevision := int64(0)
+	rec := newMultipartUploadRecorder(t, filePath, int64(len(data)), &expectedRevision)
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(rec.client(), opts)
+	fs.readCache = NewReadCacheWithMaxFileSize(defaultReadCacheMaxSize, defaultReadCacheTTL, int64(len(data)))
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		Streamer: NewStreamUploader(rec.client(), filePath, expectedRevision),
+		IsNew:    true,
+	}
+	if _, err := writer.Dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+	writer.Lock()
+	st := fs.flushHandle(context.Background(), writer)
+	writer.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if rec.initiateCalls.Load() != 1 || rec.completeCalls.Load() != 1 {
+		t.Fatalf("multipart calls = initiate:%d complete:%d, want 1 each", rec.initiateCalls.Load(), rec.completeCalls.Load())
+	}
+
+	reader := &FileHandle{Ino: ino, Path: filePath}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+	buf := make([]byte, len(data))
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(data)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("read bytes len=%d want=%d equal=%t", len(got), len(data), bytes.Equal(got, data))
+	}
+	if got := rec.statCalls.Load(); got != 0 {
+		t.Fatalf("remote stat calls during read = %d, want 0", got)
+	}
+}
+
+func TestReadSQLitePersistentJournalCleanWritableHandleUsesRemoteCommittedBytes(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	stale := []byte("stale preloaded wal bytes")
+	committed := []byte("newer fsync committed wal bytes")
+	var objectGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+filePath:
+			w.Header().Set("Content-Length", strconv.Itoa(len(committed)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "8")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			w.Header().Set("Location", ts.URL+"/object")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object":
+			objectGets.Add(1)
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(committed)-1) {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(committed)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(committed)), time.Now())
+	fs.inodes.UpdateRevision(ino, 8)
+	cleanBuffer := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if _, err := cleanBuffer.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	cleanBuffer.ClearDirty()
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: int64(len(stale)),
+		BaseRev:  7,
+		Dirty:    cleanBuffer,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(committed)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, committed) {
+		t.Fatalf("read bytes = %q, want committed remote bytes %q", got, committed)
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets = %d, want 1", got)
+	}
+}
+
+func TestReadSQLitePersistentJournalCleanNewWritableHandleReturnsEOF(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for clean local-new sqlite sidecar", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/workload.db-wal"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	cleanBuffer := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	if err := cleanBuffer.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	cleanBuffer.ClearDirty()
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    cleanBuffer,
+		IsNew:    true,
+		OrigSize: 0,
+		BaseRev:  0,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 16)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if len(got) != 0 {
+		t.Fatalf("read bytes = %q, want EOF", got)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLitePersistentJournalReadOnlyHandleSeesOpenEmptySidecarEOF(t *testing.T) {
+	var remoteCalls atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be consulted for open empty sqlite sidecar", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/workload.db-wal"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	creator := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		IsNew:    true,
+		OrigSize: 0,
+		BaseRev:  0,
+	}
+	if err := creator.Dirty.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	creator.DirtySeq = fs.markDirtySize(ino, 0)
+	fs.openHandles.Add(creator)
+
+	reader := &FileHandle{Ino: ino, Path: filePath}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 16)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if len(got) != 0 {
+		t.Fatalf("read bytes = %q, want EOF", got)
+	}
+	if gotCalls := remoteCalls.Load(); gotCalls != 0 {
+		t.Fatalf("remote calls = %d, want 0", gotCalls)
+	}
+}
+
+func TestReadSQLiteSamePathDirtyHandleBeforeShadowStore(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "remote should not be consulted for same-mount sqlite main-db dirty data", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewShadowStore: %v", err)
+	}
+	fs.shadowStore = shadow
+
+	const filePath = "/workload.db"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	stale := []byte("stale main db bytes")
+	if _, err := fs.shadowStore.WriteAt(filePath, 0, stale, 1); err != nil {
+		t.Fatalf("WriteAt stale shadow: %v", err)
+	}
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	want := []byte("latest main db bytes")
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+
+	reader := &FileHandle{Ino: ino, Path: filePath}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes = %q, want latest dirty bytes %q", got, want)
+	}
+}
+
+func TestUnlinkSQLiteWALPreservesOpenReadHandle(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	want := []byte("sqlite wal snapshot bytes")
+	var deleted atomic.Bool
+	var objectGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(want)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Location", ts.URL+"/object")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object":
+			objectGets.Add(1)
+			if deleted.Load() {
+				http.Error(w, "object deleted", http.StatusGone)
+				return
+			}
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(want)-1) {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(want)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+filePath:
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(want)), time.Now())
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: int64(len(want)),
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if !deleted.Load() {
+		t.Fatal("remote delete was not called")
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after unlink snapshot = %d, want 1", got)
+	}
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes after unlink = %q, want %q", got, want)
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after open-handle read = %d, want still 1", got)
+	}
+}
+
+func TestUnlinkSQLiteWALPreservesCleanWritableReadHandle(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	want := []byte("sqlite wal snapshot bytes")
+	var deleted atomic.Bool
+	var objectGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(want)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Location", ts.URL+"/object")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object":
+			objectGets.Add(1)
+			if deleted.Load() {
+				http.Error(w, "object deleted", http.StatusGone)
+				return
+			}
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(want)-1) {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(want)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+filePath:
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(want)), time.Now())
+	cleanDirty := fs.newWriteBuffer(filePath, maxPreloadSize, 0)
+	cleanDirty.totalSize = int64(len(want))
+	cleanDirty.remoteSize = int64(len(want))
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: int64(len(want)),
+		BaseRev:  7,
+		Dirty:    cleanDirty,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if !deleted.Load() {
+		t.Fatal("remote delete was not called")
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after unlink snapshot = %d, want 1", got)
+	}
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes after unlink = %q, want %q", got, want)
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after open-handle read = %d, want still 1", got)
+	}
+}
+
+func TestUnlinkSQLiteWALPreservesEmptyOpenReadHandle(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	var deleted atomic.Bool
+	var remoteReads atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+filePath:
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && (r.URL.Path == "/v1/fs"+filePath || r.URL.Path == "/object"):
+			remoteReads.Add(1)
+			http.NotFound(w, r)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+filePath:
+			remoteReads.Add(1)
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: 0,
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if !deleted.Load() {
+		t.Fatal("remote delete was not called")
+	}
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if len(got) != 0 {
+		t.Fatalf("read bytes after empty unlink = %q, want EOF", got)
+	}
+	if got := remoteReads.Load(); got != 0 {
+		t.Fatalf("remote reads after empty unlink snapshot = %d, want 0", got)
+	}
+}
+
+func TestUnlinkSQLiteWALUsesLatestInodeSizeForStaleOpenReadHandle(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	want := []byte("sqlite wal bytes after reader opened")
+	var deleted atomic.Bool
+	var objectGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Location", ts.URL+"/object")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object":
+			objectGets.Add(1)
+			if deleted.Load() {
+				http.Error(w, "object deleted", http.StatusGone)
+				return
+			}
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(want)-1) {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(want)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+filePath:
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	fs.inodes.UpdateSize(ino, int64(len(want)))
+	fs.inodes.UpdateRevision(ino, 7)
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: 0,
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if !deleted.Load() {
+		t.Fatal("remote delete was not called")
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after unlink snapshot = %d, want 1", got)
+	}
+
+	buf := make([]byte, 64)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes after stale-size unlink = %q, want %q", got, want)
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after open-handle read = %d, want still 1", got)
+	}
+}
+
+func TestFtruncateSQLiteWALPreservesOpenReaderSnapshot(t *testing.T) {
+	const filePath = "/workload.db-wal"
+	want := []byte("sqlite wal bytes before checkpoint truncate")
+	inFlight := []byte("sqlite wal in-flight writer bytes that are not fsync committed")
+	var remoteReads atomic.Int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			remoteReads.Add(1)
+		}
+		http.Error(w, "remote should not be consulted for same-mount sqlite wal snapshot", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(want)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision(filePath, 7)
+	fs.readCache.Put(filePath, want, 7)
+
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: int64(len(want)),
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	writer := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: int64(len(want)),
+		BaseRev:  7,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	if _, err := writer.Dirty.Write(0, inFlight); err != nil {
+		t.Fatalf("writer dirty write: %v", err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+	writerID := fs.allocateFileHandle(writer)
+	defer fs.deleteFileHandle(writerID, writer)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE | gofuse.FATTR_FH,
+			Fh:       writerID,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr ftruncate status = %v, want OK", st)
+	}
+
+	buf := make([]byte, 128)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("reader bytes after ftruncate = %q, want %q", got, want)
+	}
+	if got := remoteReads.Load(); got != 0 {
+		t.Fatalf("remote reads = %d, want 0", got)
+	}
+}
+
+func TestReadSQLiteSamePathDirtyHandleSkipsLockedCandidate(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	const filePath = "/workload.db"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	want := []byte("locked writer bytes")
+	if _, err := writer.Dirty.Write(0, want); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, int64(len(want)))
+	fs.openHandles.Add(writer)
+
+	writer.Lock()
+	done := make(chan struct{})
+	var (
+		gotOK bool
+		gotSt gofuse.Status
+	)
+	go func() {
+		defer close(done)
+		_, _, gotOK, gotSt = fs.readSamePathDirtyHandle(filePath, nil, 0, 64)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("read blocked on locked same-path dirty writer")
+	}
+	writer.Unlock()
+	if gotOK {
+		t.Fatal("locked same-path dirty candidate should not claim the read")
+	}
+	if gotSt != gofuse.OK {
+		t.Fatalf("status = %v, want OK", gotSt)
+	}
+}
+
+func TestReadSQLiteSamePathDirtyHandleSkipsIncompleteCandidate(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	const filePath = "/workload.db"
+	ino := fs.inodes.Lookup(filePath, false, 4096, time.Now())
+	writer := &FileHandle{
+		Ino:   ino,
+		Path:  filePath,
+		Dirty: fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+	}
+	writer.Dirty.totalSize = 4096
+	writer.Dirty.remoteSize = 4096
+	writer.Dirty.LoadPart = func(partNumber int) ([]byte, error) {
+		return nil, errors.New("remote clean range unavailable")
+	}
+	writer.DirtySeq = 1
+	fs.openHandles.Add(writer)
+
+	_, _, ok, st := fs.readSamePathDirtyHandle(filePath, nil, 0, 128)
+	if ok {
+		t.Fatal("incomplete same-path dirty candidate should not claim the read")
+	}
+	if st != gofuse.OK {
+		t.Fatalf("status = %v, want OK", st)
+	}
+}
+
+func TestReadSQLiteSamePathDirtyShadowEOFIsShortRead(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "remote should not be consulted for same-mount sqlite shadow data", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewShadowStore: %v", err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	const filePath = "/workload.db"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	want := []byte("latest main db bytes")
+	if _, err := fs.shadowStore.WriteAt(filePath, 0, want, 1); err != nil {
+		t.Fatalf("WriteAt shadow: %v", err)
+	}
+	writer := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		ShadowReady: true,
+	}
+	writer.Dirty.totalSize = int64(len(want) + 16)
+	writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+	fs.openHandles.Add(writer)
+
+	got, n, ok, st := fs.readSamePathDirtyHandle(filePath, nil, 0, uint32(len(want)+16))
+	if !ok {
+		t.Fatal("same-path shadow candidate should claim the read")
+	}
+	if st != gofuse.OK {
+		t.Fatalf("status = %v, want OK", st)
+	}
+	if n != len(want) {
+		t.Fatalf("bytes read = %d, want %d", n, len(want))
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes = %q, want %q", got, want)
 	}
 }
 
@@ -8702,6 +10625,253 @@ func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	}
 }
 
+func TestFlushHandle_AdoptsSameMountCommittedRevision(t *testing.T) {
+	var gotExpected string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
+			if gotExpected != "8" {
+				http.Error(w, "bad expected revision", http.StatusConflict)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 9})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/wal.db-wal", false, 4, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision("/wal.db-wal", 8)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/wal.db-wal",
+		Dirty:   NewWriteBuffer("/wal.db-wal", maxPreloadSize, 0),
+		BaseRev: 7,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("next")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if gotExpected != "8" {
+		t.Fatalf("X-Dat9-Expected-Revision = %q, want 8", gotExpected)
+	}
+	if fh.BaseRev != 9 {
+		t.Fatalf("fh.BaseRev = %d, want 9", fh.BaseRev)
+	}
+}
+
+func TestFlushHandle_RefreshesStartedStreamerRevision(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), s3client.PartSize+32)
+	expectedRevision := int64(8)
+	rec := newMultipartUploadRecorder(t, "/stream.db-wal", int64(len(data)), &expectedRevision)
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(rec.client(), opts)
+	ino := fs.inodes.Lookup("/stream.db-wal", false, int64(len(data)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.recordCommittedRevision("/stream.db-wal", expectedRevision)
+
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     "/stream.db-wal",
+		Dirty:    NewWriteBuffer("/stream.db-wal", maxPreloadSize, 0),
+		BaseRev:  7,
+		Streamer: NewStreamUploader(rec.client(), "/stream.db-wal", 7),
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := fh.Streamer.SubmitPart(context.Background(), 1, data[:s3client.PartSize], nil); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if got := rec.initiateCalls.Load(); got != 1 {
+		t.Fatalf("initiate calls = %d, want 1", got)
+	}
+	if fh.BaseRev != expectedRevision+1 {
+		t.Fatalf("fh.BaseRev = %d, want %d", fh.BaseRev, expectedRevision+1)
+	}
+}
+
+func TestFlushHandle_SerializesSamePathRemoteCommits(t *testing.T) {
+	var (
+		mu         sync.Mutex
+		revision   int64 = 7
+		handlerErr error
+		putCalls   atomic.Int32
+		inFlight   atomic.Int32
+		gotHeaders []string
+	)
+	recordHandlerErr := func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if handlerErr == nil {
+			handlerErr = err
+		}
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		putCalls.Add(1)
+		if got := inFlight.Add(1); got != 1 {
+			recordHandlerErr(fmt.Errorf("concurrent remote PUTs in flight = %d, want serialized", got))
+		}
+		defer inFlight.Add(-1)
+		time.Sleep(25 * time.Millisecond)
+
+		mu.Lock()
+		defer mu.Unlock()
+		expected := r.Header.Get("X-Dat9-Expected-Revision")
+		gotHeaders = append(gotHeaders, expected)
+		if expected != strconv.FormatInt(revision, 10) {
+			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+			return
+		}
+		revision++
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": revision})
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/wal.db-wal", false, 4, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	makeHandle := func(data string) *FileHandle {
+		fh := &FileHandle{
+			Ino:     ino,
+			Path:    "/wal.db-wal",
+			Dirty:   NewWriteBuffer("/wal.db-wal", maxPreloadSize, 0),
+			BaseRev: 7,
+		}
+		if _, err := fh.Dirty.Write(0, []byte(data)); err != nil {
+			t.Fatal(err)
+		}
+		fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+		return fh
+	}
+
+	start := make(chan struct{})
+	errCh := make(chan error, 2)
+	for _, fh := range []*FileHandle{makeHandle("aaaa"), makeHandle("bbbb")} {
+		go func(fh *FileHandle) {
+			<-start
+			fh.Lock()
+			st := fs.flushHandle(context.Background(), fh)
+			fh.Unlock()
+			if st != gofuse.OK {
+				errCh <- fmt.Errorf("flushHandle status = %v, want OK", st)
+				return
+			}
+			errCh <- nil
+		}(fh)
+	}
+	close(start)
+	for i := 0; i < 2; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := putCalls.Load(); got != 2 {
+		t.Fatalf("PUT calls = %d, want 2", got)
+	}
+	mu.Lock()
+	err := handlerErr
+	headers := append([]string(nil), gotHeaders...)
+	finalRevision := revision
+	mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(headers) != 2 || headers[0] != "7" || headers[1] != "8" {
+		t.Fatalf("expected revision headers = %v, want [7 8]", headers)
+	}
+	if finalRevision != 9 {
+		t.Fatalf("server revision = %d, want 9", finalRevision)
+	}
+	if got := fs.latestCommittedRevision("/wal.db-wal"); got != 9 {
+		t.Fatalf("latest committed revision = %d, want 9", got)
+	}
+}
+
+func TestCommittedRevisionTrackerForgetClearsPath(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	fs.recordCommittedRevision("/wal.db-wal", 8)
+	fs.forgetCommittedRevision("/wal.db-wal")
+
+	if got := fs.latestCommittedRevision("/wal.db-wal"); got != 0 {
+		t.Fatalf("latest committed revision after forget = %d, want 0", got)
+	}
+}
+
+func TestCommittedRevisionTrackerReplaceAllowsNewEpoch(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	fs.recordCommittedRevision("/wal.db-wal", 8)
+	fs.replaceCommittedRevision("/wal.db-wal", 1)
+
+	if got := fs.latestCommittedRevision("/wal.db-wal"); got != 1 {
+		t.Fatalf("latest committed revision after replace = %d, want 1", got)
+	}
+}
+
+func TestFinishLocalRenameClearsCommittedRevisionEpochs(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	oldDir := fs.inodes.Lookup("/old", true, 0, time.Now())
+	newDir := fs.inodes.Lookup("/new", true, 0, time.Now())
+	fs.inodes.Lookup("/old/workload.db-wal", false, 1, time.Now())
+	fs.inodes.Lookup("/new/workload.db-wal", false, 1, time.Now())
+
+	fs.recordCommittedRevision("/old/workload.db-wal", 8)
+	fs.recordCommittedRevision("/new/workload.db-wal", 5)
+	fs.finishLocalRename(&gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: oldDir},
+		Newdir:   newDir,
+	}, "/old/workload.db-wal", "/new/workload.db-wal")
+
+	if got := fs.latestCommittedRevision("/old/workload.db-wal"); got != 0 {
+		t.Fatalf("old path committed revision = %d, want 0", got)
+	}
+	if got := fs.latestCommittedRevision("/new/workload.db-wal"); got != 0 {
+		t.Fatalf("new path committed revision = %d, want 0", got)
+	}
+}
+
 func TestReleaseNewEmptyFileUsesCreateAction(t *testing.T) {
 	var (
 		mu          sync.Mutex
@@ -8914,6 +11084,46 @@ func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.
 	}
 	if fh.Streamer.HasStreamedParts() {
 		t.Fatal("streamer should clear prior streamed parts after successful flush")
+	}
+}
+
+func TestFinalizeHandleFlushLocked_RecordsAndRefreshesSamePathRevision(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	ino := fs.inodes.Lookup("/stream.db-wal", false, 4, time.Now())
+	writer := &FileHandle{
+		Ino:     ino,
+		Path:    "/stream.db-wal",
+		Dirty:   NewWriteBuffer("/stream.db-wal", maxPreloadSize, 0),
+		BaseRev: 11,
+	}
+	sibling := &FileHandle{
+		Ino:      ino,
+		Path:     "/stream.db-wal",
+		Dirty:    NewWriteBuffer("/stream.db-wal", maxPreloadSize, 0),
+		BaseRev:  11,
+		Streamer: NewStreamUploader(nil, "/stream.db-wal", 11),
+	}
+	fs.openHandles.Add(writer)
+	fs.openHandles.Add(sibling)
+
+	writer.Lock()
+	fs.finalizeHandleFlushLocked(writer, 11)
+	writer.Unlock()
+
+	if got := fs.latestCommittedRevision("/stream.db-wal"); got != 12 {
+		t.Fatalf("latest committed revision = %d, want 12", got)
+	}
+	if writer.BaseRev != 12 {
+		t.Fatalf("writer BaseRev = %d, want 12", writer.BaseRev)
+	}
+	if sibling.BaseRev != 12 {
+		t.Fatalf("sibling BaseRev = %d, want 12", sibling.BaseRev)
+	}
+	if got := sibling.Streamer.ExpectedRevision(); got != 12 {
+		t.Fatalf("sibling streamer expected revision = %d, want 12", got)
 	}
 }
 
@@ -12509,6 +14719,30 @@ func TestReadTargetForHandleDropsResolvedTargetAfterPathChange(t *testing.T) {
 	}
 	if fh.ReadTarget != nil {
 		t.Fatalf("handle cached target = %+v, want nil", fh.ReadTarget)
+	}
+}
+
+func TestReadTargetForHandleBypassesSQLitePersistentJournal(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	target := &client.ReadTarget{ObjectURL: "http://old.example/object"}
+	fh := &FileHandle{Path: "/repo/workload.db-wal", ReadTarget: target}
+	fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath(fh.Path), 4096)
+	fh.Prefetch.SetReadTarget(target)
+
+	if got := fs.readTargetForHandle(context.Background(), fh); got != nil {
+		t.Fatalf("read target = %+v, want nil", got)
+	}
+	if fh.ReadTarget != nil {
+		t.Fatalf("handle cached target = %+v, want cleared", fh.ReadTarget)
+	}
+	fh.Prefetch.mu.Lock()
+	prefetchTarget := fh.Prefetch.target
+	fh.Prefetch.mu.Unlock()
+	if prefetchTarget != nil {
+		t.Fatalf("prefetch target = %+v, want cleared", prefetchTarget)
 	}
 }
 
