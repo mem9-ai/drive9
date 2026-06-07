@@ -47,6 +47,8 @@ var tokenHandler = cli.Token
 var doctorHandler = cli.Doctor
 var journalHandler = cli.Journal
 var gitHandler = cli.Git
+var packHandler = cli.PackCommand
+var unpackHandler = cli.UnpackCommand
 
 func main() {
 	if logger.CLIEnabled() {
@@ -173,6 +175,20 @@ func dispatch(cmd string, args []string) {
 				sub = " " + args[0]
 			}
 			fatal("git"+sub, err)
+		}
+	case "pack":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "pack"))
+		}
+		if err := packHandler(args); err != nil {
+			fatal("pack", err)
+		}
+	case "unpack":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "unpack"))
+		}
+		if err := unpackHandler(args); err != nil {
+			fatal("unpack", err)
 		}
 	case "mount":
 		if cliLogger != nil {
@@ -332,6 +348,10 @@ func usage(code int) {
 			"                         append-only agent/workflow journal operations\n"+
 			"  git clone --fast <repo-url> <mounted-path>\n"+
 			"                         git-aware fast clone workflow\n"+
+			"  pack [flags] <archive> [path...]\n"+
+			"                         archive coding-agent local overlay paths to drive9\n"+
+			"  unpack [flags] <archive>\n"+
+			"                         restore a drive9 pack archive to a local overlay\n"+
 			"  mount [flags] [:/remote] <mountpoint>\n"+
 			"                         mount drive9 filesystem\n"+
 			"  mount vault [flags] <mountpoint>\n"+

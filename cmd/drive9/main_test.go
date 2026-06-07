@@ -357,6 +357,72 @@ func TestDispatchGitVerbReachesHandler(t *testing.T) {
 	}
 }
 
+func TestDispatchPackVerbReachesHandler(t *testing.T) {
+	origHandler := packHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		packHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	packHandler = func(args []string) error {
+		called = true
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("pack", []string{":/packs/archive.tar.gz", ".git"})
+
+	if !called {
+		t.Fatal("pack handler was not invoked for `drive9 pack ...`")
+	}
+	want := []string{":/packs/archive.tar.gz", ".git"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
+		}
+	}
+}
+
+func TestDispatchUnpackVerbReachesHandler(t *testing.T) {
+	origHandler := unpackHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		unpackHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	unpackHandler = func(args []string) error {
+		called = true
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("unpack", []string{":/packs/archive.tar.gz", "--local-root", "/tmp/drive9-local"})
+
+	if !called {
+		t.Fatal("unpack handler was not invoked for `drive9 unpack ...`")
+	}
+	want := []string{":/packs/archive.tar.gz", "--local-root", "/tmp/drive9-local"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
+		}
+	}
+}
+
 // V2b hard-cut (G-V2b-1 / G-V2b-3): `drive9 secret <sub>` MUST NOT reach the
 // vault handler and MUST NOT get a bespoke rename hint — it falls into the
 // generic `unknown command` path shared with any typo. This pins the "no

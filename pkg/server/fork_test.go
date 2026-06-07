@@ -302,6 +302,7 @@ func TestCreateForkTenantPersistsGeneratedBranchPassword(t *testing.T) {
 	createInput := rt.prov.createBranchInput(0)
 	if createInput == nil {
 		t.Fatal("CreateBranch was not called with source cluster info")
+		return
 	}
 	if createInput.Password != string(gotPassword) {
 		t.Fatalf("CreateBranch password = %q, want persisted fork password", createInput.Password)
