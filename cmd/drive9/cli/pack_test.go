@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -172,18 +173,67 @@ func TestPackRemoteArchiveUploadsPackFile(t *testing.T) {
 	mustWriteFile(t, filepath.Join(localRoot, "overlay", "repo", "dist", "app.js"), []byte("bundle\n"), 0o644)
 
 	var uploaded []byte
-	var gotTags []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var completeTags map[string]string
+	var initiatedPath string
+	var initiatedSize int64
+	directPUTCalled := false
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
-		case "PUT /v1/fs/packs/archive.tar.gz":
-			gotTags = append([]string(nil), r.Header.Values("X-Dat9-Tag")...)
+		case "POST /v2/uploads/initiate":
+			var req struct {
+				Path      string `json:"path"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode initiate: %v", err)
+			}
+			initiatedPath = req.Path
+			initiatedSize = req.TotalSize
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "u1",
+				"key":         "packs/archive.tar.gz",
+				"part_size":   req.TotalSize,
+				"total_parts": 1,
+				"expires_at":  time.Now().Add(time.Hour).Format(time.RFC3339),
+				"resumable":   true,
+				"checksum_contract": map[string]any{
+					"supported": []string{},
+					"required":  false,
+				},
+			})
+		case "POST /v2/uploads/u1/presign-batch":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number":     1,
+					"url":        srv.URL + "/s3/u1/1",
+					"size":       initiatedSize,
+					"expires_at": time.Now().Add(time.Hour).Format(time.RFC3339),
+				}},
+			})
+		case "PUT /s3/u1/1":
 			var err error
 			uploaded, err = io.ReadAll(r.Body)
 			if err != nil {
 				t.Fatalf("read upload body: %v", err)
 			}
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"revision":1}`))
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+		case "POST /v2/uploads/u1/complete":
+			var req struct {
+				Tags map[string]string `json:"tags"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode complete: %v", err)
+			}
+			completeTags = req.Tags
+			w.WriteHeader(http.StatusOK)
+		case "PUT /v1/fs/packs/archive.tar.gz":
+			directPUTCalled = true
+			http.Error(w, "direct PUT must not be used for pack archives", http.StatusInternalServerError)
 		default:
 			http.NotFound(w, r)
 		}
@@ -195,15 +245,26 @@ func TestPackRemoteArchiveUploadsPackFile(t *testing.T) {
 	if err := packRemoteArchive(context.Background(), c, "/packs/archive.tar.gz", packOptions{
 		LocalRoot:  localRoot,
 		RemoteRoot: "/remote",
+		Profile:    "coding-agent",
 		Paths:      []string{"repo/dist"},
 	}); err != nil {
 		t.Fatalf("packRemoteArchive: %v", err)
 	}
-	if len(uploaded) == 0 {
-		t.Fatal("server did not receive archive bytes")
+	if directPUTCalled {
+		t.Fatal("pack archive used direct PUT; want forced multipart/S3 path")
 	}
-	if !reflect.DeepEqual(gotTags, []string{"drive9.pack.format=drive9.pack.v1"}) {
-		t.Fatalf("X-Dat9-Tag = %v, want pack format tag", gotTags)
+	if initiatedPath != "/packs/archive.tar.gz" {
+		t.Fatalf("initiated path = %q, want /packs/archive.tar.gz", initiatedPath)
+	}
+	if len(uploaded) == 0 {
+		t.Fatal("fake S3 endpoint did not receive archive bytes")
+	}
+	wantTags := map[string]string{
+		"drive9.pack.format":  "drive9.pack.v1",
+		"drive9.pack.profile": "coding-agent",
+	}
+	if !reflect.DeepEqual(completeTags, wantTags) {
+		t.Fatalf("complete tags = %v, want %v", completeTags, wantTags)
 	}
 
 	dstLocalRoot := t.TempDir()
@@ -214,6 +275,16 @@ func TestPackRemoteArchiveUploadsPackFile(t *testing.T) {
 		t.Fatalf("extract uploaded archive: %v", err)
 	}
 	assertFileContent(t, filepath.Join(dstLocalRoot, "overlay", "repo", "dist", "app.js"), "bundle\n")
+}
+
+func TestDefaultCodingAgentPackArchivePath(t *testing.T) {
+	got, err := defaultCodingAgentPackArchivePath("/remote/root")
+	if err != nil {
+		t.Fatalf("defaultCodingAgentPackArchivePath: %v", err)
+	}
+	if !strings.HasPrefix(got, codingAgentPackRoot+"/root-") || !strings.HasSuffix(got, ".tar.gz") {
+		t.Fatalf("default archive path = %q, want coding-agent hidden pack path", got)
+	}
 }
 
 func TestRunUmountPacksAfterUnmount(t *testing.T) {
@@ -256,8 +327,13 @@ func TestRunUmountPacksAfterUnmount(t *testing.T) {
 			if !reflect.DeepEqual(gotState, state) {
 				t.Fatalf("pack state = %#v, want %#v", gotState, state)
 			}
-			if !reflect.DeepEqual(archives, []string{":/packs/archive.tar.gz"}) {
-				t.Fatalf("archives = %v", archives)
+			defaultArchive, err := defaultCodingAgentPackArchivePath(state.RemoteRoot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantArchives := []string{":" + defaultArchive, ":/packs/archive.tar.gz"}
+			if !reflect.DeepEqual(archives, wantArchives) {
+				t.Fatalf("archives = %v, want %v", archives, wantArchives)
 			}
 			gotPaths = append([]string(nil), paths...)
 			return nil
@@ -274,6 +350,49 @@ func TestRunUmountPacksAfterUnmount(t *testing.T) {
 	}
 	if !reflect.DeepEqual(gotPaths, []string{".git"}) {
 		t.Fatalf("pack paths = %v, want [.git]", gotPaths)
+	}
+}
+
+func TestRunUmountAutoPacksCodingAgentMount(t *testing.T) {
+	state := mountstate.ProcessState{
+		PID:        1234,
+		MountPoint: "/mnt/drive9",
+		RemoteRoot: "/remote",
+		Profile:    "coding-agent",
+		LocalRoot:  filepath.Join(t.TempDir(), "local"),
+	}
+	var gotArchives []string
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:      func(argv []string) error { return nil },
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return state, "/tmp/drive9.pid", nil
+		},
+		readPID: func(string) (int, string, error) {
+			return state.PID, "/tmp/drive9.pid", nil
+		},
+		pidAlive: func(int) bool { return false },
+		packAfterUnmount: func(ctx context.Context, gotState mountstate.ProcessState, archives []string, paths []string) error {
+			gotArchives = append([]string(nil), archives...)
+			if len(paths) != 0 {
+				t.Fatalf("auto pack paths = %v, want profile defaults", paths)
+			}
+			return nil
+		},
+		now:       time.Now,
+		sleep:     func(time.Duration) {},
+		printErrf: func(string, ...any) {},
+	}
+	if err := runUmount([]string{"/mnt/drive9"}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	defaultArchive, err := defaultCodingAgentPackArchivePath(state.RemoteRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(gotArchives, []string{":" + defaultArchive}) {
+		t.Fatalf("archives = %v, want default archive", gotArchives)
 	}
 }
 
@@ -325,6 +444,52 @@ func TestMountCmdUnpacksBeforeFuseMount(t *testing.T) {
 		t.Fatal("mountFuse was not called")
 	}
 	assertFileContent(t, filepath.Join(localRoot, "overlay", "repo", ".git", "config"), "restored\n")
+}
+
+func TestMountCmdAutoUnpacksCodingAgentPackBeforeFuseMount(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	srcLocalRoot := t.TempDir()
+	mustWriteFile(t, filepath.Join(srcLocalRoot, "overlay", "repo", ".git", "config"), []byte("auto-restored\n"), 0o644)
+	var archive bytes.Buffer
+	if _, err := writePackArchive(context.Background(), &archive, packOptions{
+		LocalRoot:  srcLocalRoot,
+		RemoteRoot: "/remote",
+		Paths:      []string{"repo/.git"},
+	}); err != nil {
+		t.Fatalf("writePackArchive: %v", err)
+	}
+	defaultArchive, err := defaultCodingAgentPackArchivePath("/remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v1/fs" + defaultArchive:
+			_, _ = w.Write(archive.Bytes())
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	localRoot := t.TempDir()
+	mountFuse = func(opts *mountFuseOptions) error { return nil }
+
+	if err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", srv.URL,
+		"--api-key", "sk-test",
+		"--profile", "coding-agent",
+		"--local-root", localRoot,
+		":/remote",
+		t.TempDir(),
+	}); err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	assertFileContent(t, filepath.Join(localRoot, "overlay", "repo", ".git", "config"), "auto-restored\n")
 }
 
 func mustWriteFile(t *testing.T, path string, data []byte, mode os.FileMode) {

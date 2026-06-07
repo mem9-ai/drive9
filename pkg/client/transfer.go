@@ -361,8 +361,28 @@ func (c *Client) WriteStreamConditional(ctx context.Context, path string, r io.R
 // therefore cannot use the direct-PUT path, which materializes the full reader
 // into memory before sending.
 func (c *Client) WriteMultipartStreamConditional(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64) error {
+	_, err := c.WriteMultipartStreamConditionalWithSummary(ctx, path, ra, size, progress, expectedRevision)
+	return err
+}
+
+// WriteMultipartStreamWithSummary uploads a seekable stream through the
+// multipart protocol regardless of the negotiated small-file threshold.
+func (c *Client) WriteMultipartStreamWithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, opts ...WriteOption) (*UploadSummary, error) {
+	return c.WriteMultipartStreamConditionalWithSummary(ctx, path, ra, size, progress, -1, opts...)
+}
+
+// WriteMultipartStreamConditionalWithSummary uploads a seekable stream through
+// the multipart protocol regardless of threshold, with optional CAS semantics.
+func (c *Client) WriteMultipartStreamConditionalWithSummary(ctx context.Context, path string, ra io.ReaderAt, size int64, progress ProgressFunc, expectedRevision int64, opts ...WriteOption) (*UploadSummary, error) {
+	o := &writeOptions{}
+	for _, opt := range opts {
+		opt(o)
+	}
+	if err := validateTags(o.tags); err != nil {
+		return nil, err
+	}
 	if size <= 0 {
-		return fmt.Errorf("multipart upload requires positive size")
+		return nil, fmt.Errorf("multipart upload requires positive size")
 	}
 	summary := &UploadSummary{
 		Type:       "upload_summary",
@@ -370,11 +390,14 @@ func (c *Client) WriteMultipartStreamConditional(ctx context.Context, path strin
 		RemotePath: path,
 		TotalBytes: size,
 	}
-	err := c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, nil, "")
+	err := c.writeStreamV2WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, o.tags, o.description)
 	if err == errV2NotAvailable {
-		err = c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, nil, "")
+		err = c.writeStreamV1WithSummary(ctx, path, ra, size, progress, expectedRevision, summary, o.tags, o.description)
 	}
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return finishUploadSummary(summary), nil
 }
 
 func (c *Client) writeStreamConditionalWithSummary(ctx context.Context, path string, r io.Reader, size int64, progress ProgressFunc, expectedRevision int64, tags map[string]string, description string) (*UploadSummary, error) {

@@ -330,8 +330,18 @@ BATCH_LOCAL_DIR="/tmp/drive9-cli-batch-${TS}"
 BATCH_REMOTE_DIR="/cli-${TS}-batch"
 PACK_LOCAL_ROOT="/tmp/drive9-cli-pack-local-${TS}"
 PACK_RESTORE_ROOT="/tmp/drive9-cli-pack-restore-${TS}"
-PACK_REMOTE_DIR="/cli-${TS}-pack"
-PACK_REMOTE_ARCHIVE="$PACK_REMOTE_DIR/archive.tar.gz"
+PACK_REMOTE_ROOT="/workspace"
+PACK_REMOTE_ARCHIVE="$(python3 - "$PACK_REMOTE_ROOT" <<'PY'
+import hashlib
+import posixpath
+import sys
+
+root = sys.argv[1]
+label = posixpath.basename(root.rstrip("/")) or "root"
+safe = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in label).strip(".-") or "root"
+print(f"/.drive9/packs/coding-agent/{safe}-{hashlib.sha256(root.encode()).hexdigest()[:16]}.tar.gz")
+PY
+)"
 LARGE_LOCAL="/tmp/drive9-cli-large-${TS}.bin"
 LARGE_REMOTE="/cli-${TS}-large-${CLI_LARGE_FILE_MB}m.bin"
 LARGE_DOWNLOADED="/tmp/drive9-cli-large-${TS}.download.bin"
@@ -525,8 +535,7 @@ printf "[core]\n\trepositoryformatversion = 0\n" > "$PACK_LOCAL_ROOT/overlay/rep
 printf "ref: refs/heads/main\n" > "$PACK_LOCAL_ROOT/overlay/repo/.git/HEAD"
 printf "bundle-%s\n" "$TS" > "$PACK_LOCAL_ROOT/overlay/repo/dist/app.js"
 printf "not-packed-%s\n" "$TS" > "$PACK_LOCAL_ROOT/overlay/repo/src/main.go"
-drive9_retry fs mkdir "$PACK_REMOTE_DIR" >/dev/null
-drive9_retry pack --local-root "$PACK_LOCAL_ROOT" --remote-root /workspace --profile coding-agent ":$PACK_REMOTE_ARCHIVE" >/dev/null
+drive9_retry pack --local-root "$PACK_LOCAL_ROOT" --remote-root "$PACK_REMOTE_ROOT" --profile coding-agent >/dev/null
 pack_archive_stat="$(drive9_retry fs stat "$PACK_REMOTE_ARCHIVE")"
 pack_archive_size=$(python3 - "$pack_archive_stat" <<'PY'
 import sys
@@ -537,7 +546,7 @@ for line in sys.argv[1].splitlines():
 PY
 )
 check_cmd "pack archive has non-zero remote size" bash -c 'test "${1:-0}" -gt 0' -- "$pack_archive_size"
-drive9_retry unpack --local-root "$PACK_RESTORE_ROOT" ":$PACK_REMOTE_ARCHIVE" >/dev/null
+drive9_retry unpack --local-root "$PACK_RESTORE_ROOT" --remote-root "$PACK_REMOTE_ROOT" --profile coding-agent >/dev/null
 restored_git_config="$(cat "$PACK_RESTORE_ROOT/overlay/repo/.git/config")"
 check_eq "unpack restores .git config" "$restored_git_config" $'[core]\n\trepositoryformatversion = 0'
 restored_dist="$(cat "$PACK_RESTORE_ROOT/overlay/repo/dist/app.js")"
@@ -681,7 +690,6 @@ if [ "$CLI_IMAGE_UPLOADED" = "1" ]; then
 fi
 drive9_retry fs rm "$LARGE_REMOTE" >/dev/null
 drive9_retry fs rm "$PACK_REMOTE_ARCHIVE" >/dev/null
-drive9_retry fs rm -r "$PACK_REMOTE_DIR" >/dev/null
 drive9_retry fs rm "$cp_dir_remote_path" >/dev/null
 drive9_retry fs rm "$cp_dir_remote_copy_path" >/dev/null
 drive9_retry fs rm -r "$CP_DIR_REMOTE" >/dev/null

@@ -15,7 +15,7 @@ including local single-tenant validation via `drive9-server-local`.
 |--------|--------------------|
 | `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download |
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
-| `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
+| `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, default-slot `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/hardlink/rename/stat semantics, cross-channel consistency, mounted 10KiB→8MiB→10KiB tier-transition parity, read-only and error-path checks |
 | `fuse-correctness-workload.sh` | Real read-only FUSE workload over a manifest fixture: `find`, `grep`, `stat`, `cat`, `sha256`, symlink, hardlink, unicode/space paths, empty files, binary files, and 8MiB+ files |
 | `fuse-sqlite-correctness.sh` | Real writable FUSE SQLite correctness workload with rollback-journal mode, `PRAGMA integrity_check`, unmount/remount parity, and remote snapshot verification; set `RUN_FUSE_SQLITE_WAL=1` to add the WAL detector |

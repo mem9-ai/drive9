@@ -1104,6 +1104,7 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 		"--api-key", "sk-test",
 		"--profile", "coding-agent",
 		"--local-root", " " + localRoot + " ",
+		"--no-auto-unpack",
 		"--local-only", "**/node_modules/**",
 		"--remote-only", "**/node_modules/keep/**",
 		t.TempDir(),

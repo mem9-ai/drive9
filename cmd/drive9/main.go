@@ -348,9 +348,9 @@ func usage(code int) {
 			"                         append-only agent/workflow journal operations\n"+
 			"  git clone --fast <repo-url> <mounted-path>\n"+
 			"                         git-aware fast clone workflow\n"+
-			"  pack [flags] <archive> [path...]\n"+
-			"                         archive coding-agent local overlay paths to drive9\n"+
-			"  unpack [flags] <archive>\n"+
+			"  pack [flags] [archive] [path...]\n"+
+			"                         archive coding-agent local overlay paths to drive9/S3\n"+
+			"  unpack [flags] [archive]\n"+
 			"                         restore a drive9 pack archive to a local overlay\n"+
 			"  mount [flags] [:/remote] <mountpoint>\n"+
 			"                         mount drive9 filesystem\n"+
