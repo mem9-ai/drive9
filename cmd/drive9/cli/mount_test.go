@@ -862,6 +862,39 @@ func TestMountCmdPassesReadConcurrencyOption(t *testing.T) {
 	}
 }
 
+func TestMountCmdPassesParallelReadOptions(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--parallel-read-concurrency", "3",
+		"--parallel-read-block-size-mb", "2",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ParallelReadConcurrency != 3 {
+		t.Fatalf("ParallelReadConcurrency = %d, want 3", got.ParallelReadConcurrency)
+	}
+	if got.ParallelReadBlockSize != 2<<20 {
+		t.Fatalf("ParallelReadBlockSize = %d, want %d", got.ParallelReadBlockSize, int64(2<<20))
+	}
+}
+
 func TestMountCmdPassesUploadConcurrencyOption(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
@@ -901,6 +934,32 @@ func TestMountCmdRejectsInvalidReadConcurrency(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "--read-concurrency") {
 		t.Fatalf("MountCmd error = %v, want read-concurrency validation error", err)
+	}
+}
+
+func TestMountCmdRejectsInvalidParallelReadConcurrency(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--parallel-read-concurrency", "0",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--parallel-read-concurrency") {
+		t.Fatalf("MountCmd error = %v, want parallel-read-concurrency validation error", err)
+	}
+}
+
+func TestMountCmdRejectsInvalidParallelReadBlockSize(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--parallel-read-block-size-mb", "0",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--parallel-read-block-size-mb") {
+		t.Fatalf("MountCmd error = %v, want parallel-read-block-size validation error", err)
 	}
 }
 

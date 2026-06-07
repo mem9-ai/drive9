@@ -290,6 +290,12 @@ const (
 	// mount. This protects Drive9/S3/TiDB from read floods; it does not reserve
 	// kernel FUSE MaxBackground slots before go-fuse dispatches a request.
 	defaultRemoteReadConcurrency = 24
+
+	// defaultParallelReadConcurrency bounds block fan-out inside one large
+	// FUSE read. The mount-wide readSlots limiter still caps total backend
+	// read pressure across handles.
+	defaultParallelReadConcurrency = 4
+	defaultParallelReadBlockSize   = 1 << 20
 )
 
 func readConcurrencyOrDefault(n int) int {
@@ -297,6 +303,20 @@ func readConcurrencyOrDefault(n int) int {
 		return defaultRemoteReadConcurrency
 	}
 	return n
+}
+
+func (fs *Dat9FS) parallelReadConcurrency() int {
+	if fs != nil && fs.opts != nil && fs.opts.ParallelReadConcurrency > 0 {
+		return fs.opts.ParallelReadConcurrency
+	}
+	return defaultParallelReadConcurrency
+}
+
+func (fs *Dat9FS) parallelReadBlockSize() int64 {
+	if fs != nil && fs.opts != nil && fs.opts.ParallelReadBlockSize > 0 {
+		return fs.opts.ParallelReadBlockSize
+	}
+	return defaultParallelReadBlockSize
 }
 
 func (fs *Dat9FS) acquireRemoteReadSlot(ctx context.Context) (func(), error) {
@@ -1731,6 +1751,20 @@ func (fs *Dat9FS) diskReadCacheKey(p string, entry *InodeEntry, offset, size int
 	return key, key.valid()
 }
 
+func diskReadCacheReadSize(entry *InodeEntry, offset, requested int64) (int64, bool) {
+	if entry == nil || offset < 0 || requested <= 0 {
+		return requested, false
+	}
+	if offset >= entry.Size {
+		return 0, true
+	}
+	end := offset + requested
+	if end < offset || end > entry.Size {
+		return entry.Size - offset, false
+	}
+	return requested, false
+}
+
 // readStreamRangeWithRetry performs a range read with bounded detached retry
 // on transient failures. Wraps both the ReadStreamRange open and io.ReadFull
 // body read as a single retriable unit. On body-stage transient failure, the
@@ -1784,21 +1818,95 @@ func (fs *Dat9FS) readStreamRangeWithRetry(ctx context.Context, path string, fh 
 	return nil, 0, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
 }
 
+func (fs *Dat9FS) readStreamRangeWithRetryBoundToContext(ctx context.Context, path string, fh *FileHandle, offset, size int64) ([]byte, int, error) {
+	target := fs.readTargetForHandle(ctx, fh)
+	data, n, err := fs.doRangeRead(ctx, path, target, offset, size)
+	if client.IsPresignExpired(err) && ctx.Err() == nil {
+		clearReadTargetForHandle(fh)
+		retryCtx, retryCancel := context.WithTimeout(ctx, readTransientRetryTimeout)
+		target = fs.readTargetForHandle(retryCtx, fh)
+		data, n, err = fs.doRangeRead(retryCtx, path, target, offset, size)
+		retryCancel()
+		if err == nil && fs.perf != nil {
+			fs.perf.readRetrySuccess.add(1)
+		}
+	}
+	if err == nil || !isTransientReadErr(err) || ctx.Err() != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, ctxErr
+		}
+		return data, n, err
+	}
+
+	if fs.perf != nil {
+		fs.perf.readRetryTotal.add(1)
+	}
+	lastErr := err
+	for range readTransientRetryCount {
+		retryCtx, retryCancel := context.WithTimeout(ctx, readTransientRetryTimeout)
+		data, n, err = fs.doRangeRead(retryCtx, path, target, offset, size)
+		if client.IsPresignExpired(err) && ctx.Err() == nil {
+			clearReadTargetForHandle(fh)
+			target = fs.readTargetForHandle(retryCtx, fh)
+			data, n, err = fs.doRangeRead(retryCtx, path, target, offset, size)
+		}
+		retryCancel()
+		if err == nil {
+			if fs.perf != nil {
+				fs.perf.readRetrySuccess.add(1)
+			}
+			return data, n, nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, 0, ctxErr
+		}
+		if !isTransientReadErr(err) {
+			return nil, 0, err
+		}
+		lastErr = err
+	}
+	if fs.perf != nil {
+		fs.perf.readRetryExhausted.add(1)
+	}
+	return nil, 0, fmt.Errorf("%w: %s: %v", errReadRetriesExhausted, path, lastErr)
+}
+
 func (fs *Dat9FS) readDiskCachedRange(ctx context.Context, path string, fh *FileHandle, key DiskReadCacheKey) ([]byte, int, error) {
+	return fs.readDiskCachedRangeWithContext(ctx, path, fh, key, true)
+}
+
+func (fs *Dat9FS) readDiskCachedRangeCancellable(ctx context.Context, path string, fh *FileHandle, key DiskReadCacheKey) ([]byte, int, error) {
+	return fs.readDiskCachedRangeWithContext(ctx, path, fh, key, false)
+}
+
+func (fs *Dat9FS) readDiskCachedRangeWithContext(ctx context.Context, path string, fh *FileHandle, key DiskReadCacheKey, detachFetch bool) ([]byte, int, error) {
 	data, err, _ := fs.readFlight.Do(ctx, key.flightKey(), func() ([]byte, error) {
 		if cached, ok := fs.diskReadCache.Get(key); ok {
 			return cached, nil
 		}
-		fetchCtx, fetchCancel := detachedSharedReadCtx(ctx, fs.remoteReadTimeout)
+		fetchCtx := ctx
+		fetchCancel := func() {}
+		if detachFetch {
+			fetchCtx, fetchCancel = detachedSharedReadCtx(ctx, fs.remoteReadTimeout)
+		}
 		defer fetchCancel()
 		releaseReadSlot, slotErr := fs.acquireRemoteReadSlot(fetchCtx)
 		if slotErr != nil {
 			return nil, slotErr
 		}
 		defer releaseReadSlot()
-		fetchData, _, fetchErr := fs.readStreamRangeWithRetry(fetchCtx, path, fh, key.Offset, key.Length)
+		var fetchData []byte
+		var fetchErr error
+		if detachFetch {
+			fetchData, _, fetchErr = fs.readStreamRangeWithRetry(fetchCtx, path, fh, key.Offset, key.Length)
+		} else {
+			fetchData, _, fetchErr = fs.readStreamRangeWithRetryBoundToContext(fetchCtx, path, fh, key.Offset, key.Length)
+		}
 		if fetchErr != nil {
 			return nil, fetchErr
+		}
+		if int64(len(fetchData)) != key.Length {
+			return nil, io.ErrUnexpectedEOF
 		}
 		fs.diskReadCache.PutAsync(key, fetchData)
 		return fetchData, nil
@@ -1807,6 +1915,181 @@ func (fs *Dat9FS) readDiskCachedRange(ctx context.Context, path string, fh *File
 		return nil, 0, err
 	}
 	return data, len(data), nil
+}
+
+type diskReadBlock struct {
+	key       DiskReadCacheKey
+	copyFrom  int64
+	copyUntil int64
+	outOffset int64
+}
+
+func (fs *Dat9FS) diskReadBlocks(path string, entry *InodeEntry, offset, size int64) []diskReadBlock {
+	blockSize := fs.parallelReadBlockSize()
+	if blockSize <= 0 || entry == nil || entry.Size <= 0 || offset < 0 || size <= 0 || offset >= entry.Size {
+		return nil
+	}
+	end := offset + size
+	if end < offset || end > entry.Size {
+		end = entry.Size
+	}
+	if end <= offset {
+		return nil
+	}
+
+	fileID := diskReadCacheFileID(path, entry)
+	blocks := make([]diskReadBlock, 0, int((end-offset+blockSize-1)/blockSize))
+	for blockOffset := (offset / blockSize) * blockSize; blockOffset < end; blockOffset += blockSize {
+		blockEnd := blockOffset + blockSize
+		if blockEnd > entry.Size {
+			blockEnd = entry.Size
+		}
+		key := DiskReadCacheKey{
+			FileID:   fileID,
+			Path:     path,
+			Revision: entry.Revision,
+			Offset:   blockOffset,
+			Length:   blockEnd - blockOffset,
+		}
+		if !key.valid() {
+			continue
+		}
+		copyStart := maxInt64(offset, blockOffset)
+		copyEnd := minInt64(end, blockEnd)
+		if copyEnd <= copyStart {
+			continue
+		}
+		blocks = append(blocks, diskReadBlock{
+			key:       key,
+			copyFrom:  copyStart - blockOffset,
+			copyUntil: copyEnd - blockOffset,
+			outOffset: copyStart - offset,
+		})
+	}
+	return blocks
+}
+
+type diskReadBlockResult struct {
+	index int
+	data  []byte
+	err   error
+}
+
+func (fs *Dat9FS) readDiskCachedBlocks(ctx context.Context, path string, fh *FileHandle, entry *InodeEntry, offset, size int64) ([]byte, int, error) {
+	blocks := fs.diskReadBlocks(path, entry, offset, size)
+	if len(blocks) == 0 {
+		return nil, 0, nil
+	}
+	total := int64(0)
+	for _, block := range blocks {
+		end := block.outOffset + block.copyUntil - block.copyFrom
+		if end > total {
+			total = end
+		}
+	}
+	if total <= 0 {
+		return nil, 0, nil
+	}
+
+	out := make([]byte, total)
+	workerCount := minInt(len(blocks), fs.parallelReadConcurrency())
+	if workerCount <= 0 {
+		workerCount = 1
+	}
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan int)
+	results := make(chan diskReadBlockResult, len(blocks))
+	var wg sync.WaitGroup
+
+	go func() {
+		defer close(jobs)
+		for index := range blocks {
+			select {
+			case jobs <- index:
+			case <-readCtx.Done():
+				return
+			}
+		}
+	}()
+
+	for range workerCount {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-readCtx.Done():
+					return
+				case index, ok := <-jobs:
+					if !ok {
+						return
+					}
+					block := blocks[index]
+					data, _, err := fs.readDiskCachedRangeCancellable(readCtx, path, fh, block.key)
+					if err == nil && int64(len(data)) < block.copyUntil {
+						err = io.ErrUnexpectedEOF
+					}
+					if err == nil {
+						start := block.copyFrom
+						end := block.copyUntil
+						chunk := make([]byte, end-start)
+						copy(chunk, data[start:end])
+						data = chunk
+					} else {
+						data = nil
+						cancel()
+					}
+					results <- diskReadBlockResult{index: index, data: data, err: err}
+				}
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var firstErr error
+	for result := range results {
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			continue
+		}
+		block := blocks[result.index]
+		copy(out[block.outOffset:], result.data)
+	}
+	if firstErr != nil {
+		return nil, 0, firstErr
+	}
+	if err := readCtx.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, len(out), nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func minInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // doRangeRead performs a single range read attempt: open stream + read body.
@@ -4986,6 +5269,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		entry, _ := fs.inodes.GetEntry(input.NodeId)
 		if entry != nil && entry.Size > fs.readCache.MaxFileSize() {
 			fh.Prefetch = NewPrefetcher(fs.client, fs.remotePath(p), entry.Size, fs.debugEnabled())
+			fh.Prefetch.SetParallelRead(fs.parallelReadConcurrency(), fs.parallelReadBlockSize())
 			fh.Prefetch.SetPerfCounters(fs.perf)
 		}
 		// Atomically pin shadow for read-only opens so commit queue cleanup
@@ -5461,7 +5745,13 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	rangeOffset := int64(input.Offset)
-	rangeSize := int64(input.Size)
+	requestedRangeSize := int64(input.Size)
+	rangeSize, eof := diskReadCacheReadSize(entry, rangeOffset, requestedRangeSize)
+	if eof {
+		source = "disk-read-cache-eof"
+		bytesRead = 0
+		return gofuse.ReadResultData(nil), gofuse.OK
+	}
 	if key, ok := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize); ok {
 		if data, ok := fs.diskReadCache.Get(key); ok {
 			if !fs.statCacheTrustedAndVerified() && !revalidatedForRead {
@@ -5471,6 +5761,13 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 					return nil, httpToFuseStatus(err)
 				}
 				entry = refreshed
+				refreshedRangeSize, refreshedEOF := diskReadCacheReadSize(entry, rangeOffset, requestedRangeSize)
+				if refreshedEOF {
+					source = "disk-read-cache-eof"
+					bytesRead = 0
+					return gofuse.ReadResultData(nil), gofuse.OK
+				}
+				rangeSize = refreshedRangeSize
 				refreshedKey, refreshedOK := fs.diskReadCacheKey(p, entry, rangeOffset, rangeSize)
 				if !refreshedOK {
 					ok = false
@@ -5496,9 +5793,17 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		if fs.perf != nil {
 			fs.perf.readCacheMiss.add(1)
 		}
-		source = "disk-read-cache-miss"
 		rangeStart := time.Now()
-		data, n, err := fs.readDiskCachedRange(ctx, p, fh, key)
+		var data []byte
+		var n int
+		var err error
+		if rangeSize > fs.parallelReadBlockSize() && fs.parallelReadConcurrency() > 1 {
+			source = "disk-read-cache-parallel-miss"
+			data, n, err = fs.readDiskCachedBlocks(ctx, p, fh, entry, rangeOffset, rangeSize)
+		} else {
+			source = "disk-read-cache-miss"
+			data, n, err = fs.readDiskCachedRange(ctx, p, fh, key)
+		}
 		if err != nil {
 			fs.debugf("read disk-cache range error path=%s off=%d req=%d got=%d source=%s dur=%s err=%v", p, input.Offset, input.Size, n, source, time.Since(rangeStart), err)
 			if errors.Is(err, errReadRetriesExhausted) {
