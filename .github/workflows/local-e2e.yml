@@ -16,6 +16,22 @@ on:
       - "Makefile"
   workflow_dispatch:
     inputs:
+      run_fuse_sqlite_churn:
+        description: "Run opt-in FUSE SQLite churn workload"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+      run_fuse_sqlite_concurrency:
+        description: "Run opt-in FUSE SQLite readers/writer workload"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
       run_fuse_performance_baseline:
         description: "Run opt-in FUSE performance baseline and upload metrics artifacts"
         required: false
@@ -40,6 +56,8 @@ env:
   DRIVE9_LOCAL_EMBEDDING_MODE: app
   RUN_SEMANTIC_CHECKS: "0"
   RUN_CLI_SEMANTIC_CHECKS: "0"
+  RUN_FUSE_SQLITE_CHURN: ${{ github.event.inputs.run_fuse_sqlite_churn || '0' }}
+  RUN_FUSE_SQLITE_CONCURRENCY: ${{ github.event.inputs.run_fuse_sqlite_concurrency || '0' }}
   RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_fuse_performance_baseline || '0' }}
   FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
 

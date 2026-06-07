@@ -21,6 +21,7 @@ import (
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/mountpath"
+	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/s3client"
 )
 
@@ -29,15 +30,19 @@ import (
 type Dat9FS struct {
 	gofuse.RawFileSystem
 
-	client        *client.Client
-	inodes        *InodeToPath
-	fileHandles   *HandleTable[*FileHandle]
-	openHandles   *OpenHandleIndex
-	locks         *fuseLockTable
-	dirHandles    *HandleTable[*DirHandle]
-	readCache     *ReadCache
-	diskReadCache *DiskReadCache
-	dirCache      *DirCache
+	client            *client.Client
+	inodes            *InodeToPath
+	fileHandles       *HandleTable[*FileHandle]
+	openHandles       *OpenHandleIndex
+	locks             *fuseLockTable
+	dirHandles        *HandleTable[*DirHandle]
+	committedMu       sync.Mutex
+	committedRev      map[string]int64
+	remoteCommitMu    sync.Mutex
+	remoteCommitLocks map[string]*sync.Mutex
+	readCache         *ReadCache
+	diskReadCache     *DiskReadCache
+	dirCache          *DirCache
 	// statCacheUnverified is true while the SSE stream is not known-current.
 	// In that state, file stat cache hits embedded in DirCache must fall back
 	// to HEAD revalidation instead of serving TTL-only attrs. Even when the
@@ -119,7 +124,10 @@ type Dat9FS struct {
 	localPolicy *LocalPolicy
 	// localOverlay stores local-only paths under MountOptions.LocalRoot.
 	localOverlay *LocalOverlay
-	git          *gitWorkspaceLayer
+	// transientLocalOverlay stores mount-local runtime sidecars that must be
+	// shared by all handles in one mount, but must not become remote state.
+	transientLocalOverlay *LocalOverlay
+	git                   *gitWorkspaceLayer
 	// gitCheckpoints coalesces lightweight .git state checkpoints so Git
 	// porcelain close/rename/unlink paths do not synchronously run rev-list.
 	gitCheckpoints *flushDebouncer
@@ -214,6 +222,8 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		openHandles:       NewOpenHandleIndex(),
 		locks:             newFuseLockTable(),
 		dirHandles:        NewHandleTable[*DirHandle](),
+		committedRev:      make(map[string]int64),
+		remoteCommitLocks: make(map[string]*sync.Mutex),
 		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
 		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
 		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
@@ -272,6 +282,9 @@ const (
 	// lookupRetrySuccessLogEvery controls how often successful retry recovery is
 	// logged, to avoid noisy logs on hot lookup paths.
 	lookupRetrySuccessLogEvery uint64 = 200
+
+	sqliteSidecarDirtyWaitTimeout  = 250 * time.Millisecond
+	sqliteSidecarDirtyWaitInterval = time.Millisecond
 
 	// namespaceMutationRetryTimeout bounds detached retries for idempotent-ish
 	// namespace mutations after a FUSE interrupt or transient backend error.
@@ -427,6 +440,12 @@ func (fs *Dat9FS) localOverlayForDirPath(ctx context.Context, localPath string) 
 }
 
 func (fs *Dat9FS) localOverlayForPathWithHint(ctx context.Context, localPath string, dirHint bool) (*LocalOverlay, bool, gofuse.Status) {
+	if fs.usesTransientLocalOverlay(localPath, dirHint) {
+		if fs.transientLocalOverlay == nil {
+			return nil, true, gofuse.EIO
+		}
+		return fs.transientLocalOverlay, true, gofuse.OK
+	}
 	var layer PathLayer
 	if dirHint {
 		layer = fs.observeDirPathPolicyWithContext(ctx, localPath)
@@ -443,6 +462,112 @@ func (fs *Dat9FS) localOverlayForPathWithHint(ctx context.Context, localPath str
 		return nil, true, gofuse.EIO
 	}
 	return fs.localOverlay, true, gofuse.OK
+}
+
+func (fs *Dat9FS) usesTransientLocalOverlay(localPath string, dirHint bool) bool {
+	if fs == nil || dirHint || fs.opts == nil || fs.opts.ReadOnly || fs.transientLocalOverlay == nil {
+		return false
+	}
+	return isSQLiteWALIndexPath(localPath)
+}
+
+func isSQLiteWALIndexPath(localPath string) bool {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil {
+		return false
+	}
+	name := path.Base(canonical)
+	if name == "-shm" || !strings.HasSuffix(name, "-shm") {
+		return false
+	}
+	return strings.TrimSuffix(name, "-shm") != ""
+}
+
+func isSQLitePersistentJournalPath(localPath string) bool {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil {
+		return false
+	}
+	name := path.Base(canonical)
+	if name == "-wal" || name == "-journal" {
+		return false
+	}
+	return strings.HasSuffix(name, "-wal") || strings.HasSuffix(name, "-journal")
+}
+
+func isSQLiteMainDatabasePath(localPath string) bool {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil {
+		return false
+	}
+	name := path.Base(canonical)
+	if name == "" || name == "." || name == "/" {
+		return false
+	}
+	return strings.HasSuffix(name, ".db") || strings.HasSuffix(name, ".sqlite") || strings.HasSuffix(name, ".sqlite3")
+}
+
+func bypassStableRemoteReadCachesForSQLiteSidecar(localPath string) bool {
+	return isSQLitePersistentJournalPath(localPath)
+}
+
+func sqliteMainDatabaseSidecarPaths(localPath string) []string {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil || !isSQLiteMainDatabasePath(canonical) {
+		return nil
+	}
+	return []string{canonical + "-wal", canonical + "-journal", canonical + "-shm"}
+}
+
+func (fs *Dat9FS) bypassStableRemoteReadCaches(localPath string) bool {
+	if bypassStableRemoteReadCachesForSQLiteSidecar(localPath) {
+		return true
+	}
+	if fs == nil || fs.openHandles == nil || !isSQLiteMainDatabasePath(localPath) {
+		return false
+	}
+	for _, sidecarPath := range sqliteMainDatabaseSidecarPaths(localPath) {
+		if fs.openHandles.Has(0, sidecarPath) {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath string) bool {
+	return isSQLitePersistentJournalPath(localPath)
+}
+
+func shouldSnapshotOpenSQLiteSidecarOnTruncate(localPath string, newSize int64) bool {
+	return newSize == 0 && isSQLitePersistentJournalPath(localPath)
+}
+
+func isSQLiteVisibleSamePathDirtyPath(localPath string) bool {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil {
+		return false
+	}
+	return isSQLiteMainDatabasePath(canonical)
+}
+
+func isSQLiteDirectIOPath(localPath string) bool {
+	return isSQLiteVisibleSamePathDirtyPath(localPath) || isSQLitePersistentJournalPath(localPath)
+}
+
+func remoteOpenFlagsForHandle(fh *FileHandle) uint32 {
+	if fh == nil {
+		return gofuse.FOPEN_KEEP_CACHE
+	}
+	if isSQLiteDirectIOPath(fh.Path) {
+		return gofuse.FOPEN_DIRECT_IO
+	}
+	if fh.Dirty != nil {
+		if fh.Flags&syscall.O_TRUNC != 0 || fh.OrigSize >= smallFileShadowThreshold {
+			return gofuse.FOPEN_DIRECT_IO
+		}
+		return gofuse.FOPEN_KEEP_CACHE
+	}
+	return gofuse.FOPEN_KEEP_CACHE
 }
 
 func (fs *Dat9FS) localEntry(localPath string, info os.FileInfo, incrementLookup bool) (*InodeEntry, gofuse.Status) {
@@ -722,9 +847,119 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision i
 	}
 }
 
+func (fs *Dat9FS) recordCommittedRevision(path string, revision int64) {
+	if fs == nil || path == "" || revision <= 0 {
+		return
+	}
+	fs.committedMu.Lock()
+	if fs.committedRev == nil {
+		fs.committedRev = make(map[string]int64)
+	}
+	if revision > fs.committedRev[path] {
+		fs.committedRev[path] = revision
+	}
+	fs.committedMu.Unlock()
+}
+
+func (fs *Dat9FS) replaceCommittedRevision(path string, revision int64) {
+	if fs == nil || path == "" {
+		return
+	}
+	fs.committedMu.Lock()
+	if revision <= 0 {
+		delete(fs.committedRev, path)
+	} else {
+		if fs.committedRev == nil {
+			fs.committedRev = make(map[string]int64)
+		}
+		fs.committedRev[path] = revision
+	}
+	fs.committedMu.Unlock()
+}
+
+func (fs *Dat9FS) forgetCommittedRevision(path string) {
+	if fs == nil || path == "" {
+		return
+	}
+	fs.committedMu.Lock()
+	delete(fs.committedRev, path)
+	fs.committedMu.Unlock()
+}
+
+func (fs *Dat9FS) forgetCommittedRevisionPrefix(path string) {
+	if fs == nil || path == "" {
+		return
+	}
+	prefix := path + "/"
+	fs.committedMu.Lock()
+	for p := range fs.committedRev {
+		if p == path || strings.HasPrefix(p, prefix) {
+			delete(fs.committedRev, p)
+		}
+	}
+	fs.committedMu.Unlock()
+}
+
+func (fs *Dat9FS) latestCommittedRevision(path string) int64 {
+	if fs == nil || path == "" {
+		return 0
+	}
+	fs.committedMu.Lock()
+	revision := fs.committedRev[path]
+	fs.committedMu.Unlock()
+	return revision
+}
+
+func (fs *Dat9FS) lockRemoteCommitPath(path string) func() {
+	if fs == nil || path == "" {
+		return func() {}
+	}
+	fs.remoteCommitMu.Lock()
+	if fs.remoteCommitLocks == nil {
+		fs.remoteCommitLocks = make(map[string]*sync.Mutex)
+	}
+	lock := fs.remoteCommitLocks[path]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		fs.remoteCommitLocks[path] = lock
+	}
+	fs.remoteCommitMu.Unlock()
+
+	lock.Lock()
+	return lock.Unlock
+}
+
+func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
+	if fs == nil || fh == nil || fh.IsNew {
+		return
+	}
+	revision := fs.latestCommittedRevision(fh.Path)
+	if revision <= fh.BaseRev {
+		return
+	}
+	fh.BaseRev = revision
+	if fh.Streamer != nil {
+		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	}
+	if fh.ShadowReady && fs.shadowStore != nil {
+		size := int64(0)
+		if fh.Dirty != nil {
+			size = fh.Dirty.Size()
+		}
+		if err := fs.shadowStore.Ensure(fh.Path, size, revision); err != nil {
+			log.Printf("shadow base revision adopt failed for %s: %v", fh.Path, err)
+		}
+	}
+}
+
 func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64) {
 	if fs == nil || fh == nil || revision <= 0 {
 		return
+	}
+	if fh.IsNew {
+		fs.replaceCommittedRevision(fh.Path, revision)
+	} else {
+		fs.recordCommittedRevision(fh.Path, revision)
 	}
 	fh.IsNew = false
 	fh.BaseRev = revision
@@ -1033,11 +1268,87 @@ func expectedRevisionForHandle(fh *FileHandle) int64 {
 	return -1
 }
 
+func (fs *Dat9FS) expectedRevisionForHandleLocked(fh *FileHandle) int64 {
+	fs.adoptCommittedRevisionLocked(fh)
+	return expectedRevisionForHandle(fh)
+}
+
 func committedRevisionFromExpectedRevision(expectedRevision int64) (int64, bool) {
 	if expectedRevision < 0 {
 		return 0, false
 	}
 	return expectedRevision + 1, true
+}
+
+func sqliteCommittedRevision(committedRev, expectedRevision int64) int64 {
+	if committedRev > 0 {
+		return committedRev
+	}
+	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+		return revision
+	}
+	return 0
+}
+
+func (fs *Dat9FS) cacheCommittedSQLitePersistentJournalLocked(fh *FileHandle, revision int64) bool {
+	if fs == nil || fs.readCache == nil || fh == nil || fh.Dirty == nil || revision <= 0 || !isSQLitePersistentJournalPath(fh.Path) {
+		return false
+	}
+	size := fh.Dirty.Size()
+	if size > fs.readCache.MaxFileSize() || !writeBufferHasLoadedFullRange(fh.Dirty) {
+		return false
+	}
+	fs.readCache.Put(fh.Path, fh.Dirty.bytesView(), revision)
+	return true
+}
+
+func (fs *Dat9FS) clearStaleSQLitePersistentJournalEmptyCreateLocked(fh *FileHandle) bool {
+	if fs == nil || fh == nil || fh.Dirty == nil || !isSQLitePersistentJournalPath(fh.Path) {
+		return false
+	}
+	if fh.Dirty.Size() != 0 || fh.Dirty.hasDirtyPartMarks() || fh.ZeroBase || fh.Flags&syscall.O_TRUNC != 0 {
+		return false
+	}
+	revision := fs.latestCommittedRevision(fh.Path)
+	if revision <= 0 {
+		return false
+	}
+
+	if fh.DirtySeq != 0 {
+		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+		fh.DirtySeq = 0
+	}
+	fh.Dirty.ClearDirty()
+	fh.IsNew = false
+	fh.ZeroBase = false
+	fh.BaseRev = revision
+	if fh.Streamer != nil {
+		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	}
+	fs.inodes.UpdateRevision(fh.Ino, revision)
+	clearReadTargetForLockedHandle(fh)
+	return true
+}
+
+func writeBufferHasLoadedFullRange(wb *WriteBuffer) bool {
+	if wb == nil {
+		return false
+	}
+	size := wb.Size()
+	if size == 0 {
+		return true
+	}
+	partSize := wb.PartSize()
+	if partSize <= 0 {
+		return false
+	}
+	parts := int((size + partSize - 1) / partSize)
+	for part := 0; part < parts; part++ {
+		if !wb.IsPartLoaded(part) {
+			return false
+		}
+	}
+	return true
 }
 
 // finalizeHandleFlushLocked updates the live handle and inode cache after a
@@ -1048,16 +1359,24 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 		return
 	}
 
+	wasNew := fh.IsNew
 	fh.IsNew = false
 	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
 		fh.BaseRev = revision
 		fs.inodes.UpdateRevision(fh.Ino, revision)
+		if wasNew {
+			fs.replaceCommittedRevision(fh.Path, revision)
+		} else {
+			fs.recordCommittedRevision(fh.Path, revision)
+		}
+		fs.refreshCommittedRevisionForOpenHandles(fh.Path, revision, fh)
 	} else {
 		// The flush succeeded, but it was unconditional, so the precise
 		// post-commit revision is unknown. Clear the cached revision instead of
 		// keeping a known-stale positive value.
 		fh.BaseRev = 0
 		fs.inodes.UpdateRevision(fh.Ino, 0)
+		fs.forgetCommittedRevision(fh.Path)
 	}
 	if fh.Streamer != nil {
 		fh.Streamer.ResetForNextWrite(expectedRevisionForHandle(fh))
@@ -1081,6 +1400,7 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	if !fs.canStageShadowFastLocked(fh) {
 		return syscall.ENOTSUP
 	}
+	fs.adoptCommittedRevisionLocked(fh)
 
 	size := fh.Dirty.Size()
 	if fh.ShadowReady {
@@ -1119,6 +1439,7 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 	if fh.Dirty == nil {
 		return nil
 	}
+	fs.adoptCommittedRevisionLocked(fh)
 	if !fh.ShadowReady && !fh.IsNew && !fh.Dirty.CanMaterializeFull() {
 		return syscall.ENOTSUP
 	}
@@ -1207,6 +1528,9 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 
 func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 	if fs.openHandles == nil || fh == nil || fh.Dirty == nil {
+		return false
+	}
+	if isSQLitePersistentJournalPath(fh.Path) {
 		return false
 	}
 
@@ -1326,6 +1650,315 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 		return true
 	}
 	return false
+}
+
+func (fs *Dat9FS) hasOpenPendingSQLitePersistentJournalCreate(path string, skip *FileHandle) bool {
+	if fs == nil || fs.openHandles == nil || !isSQLitePersistentJournalPath(path) {
+		return false
+	}
+	for _, src := range fs.openHandles.SnapshotPath(path) {
+		if src == nil || src == skip {
+			continue
+		}
+		if !src.TryLock() {
+			continue
+		}
+		ok := src.Dirty != nil && src.IsNew && src.BaseRev == 0 && src.OrigSize == 0
+		src.Unlock()
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) prepareSQLitePersistentJournalLocalCreateWritableOpen(fh *FileHandle) bool {
+	if fh == nil || fh.Dirty == nil || !isSQLitePersistentJournalPath(fh.Path) {
+		return false
+	}
+	if fh.BaseRev != 0 || fh.OrigSize != 0 {
+		return false
+	}
+	if !fs.hasOpenPendingSQLitePersistentJournalCreate(fh.Path, fh) {
+		return false
+	}
+	if err := fh.Dirty.Truncate(0); err != nil {
+		log.Printf("sqlite sidecar local-create open truncate failed for %s: %v", fh.Path, err)
+		return false
+	}
+	fh.Dirty.ClearDirty()
+	fh.IsNew = true
+	fh.ZeroBase = true
+	fh.OrigSize = 0
+	return true
+}
+
+func (fs *Dat9FS) readSamePathDirtyHandle(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+	if isSQLitePersistentJournalPath(path) {
+		return nil, 0, false, gofuse.OK
+	}
+	return fs.readSamePathDirtyHandleAllowJournals(path, skip, offset, reqSize)
+}
+
+func (fs *Dat9FS) readSQLitePersistentJournalDirtyRange(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+	data, n, ok, st, _ := fs.readSQLitePersistentJournalDirtyRangeOnce(path, skip, offset, reqSize)
+	return data, n, ok, st
+}
+
+func (fs *Dat9FS) readSQLitePersistentJournalDirtyRangeOnce(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, bool) {
+	if fs == nil || fs.openHandles == nil || !isSQLitePersistentJournalPath(path) || path == "" || reqSize == 0 || offset < 0 {
+		return nil, 0, false, gofuse.OK, false
+	}
+	end := offset + int64(reqSize)
+	if end <= offset {
+		return nil, 0, false, gofuse.EINVAL, false
+	}
+
+	type candidate struct {
+		fh       *FileHandle
+		dirtySeq uint64
+	}
+
+restartLoop:
+	for {
+		var candidates []candidate
+		pending := false
+		for _, src := range fs.openHandles.SnapshotPath(path) {
+			if src == nil || src == skip {
+				continue
+			}
+			if !src.TryLock() {
+				pending = true
+				continue
+			}
+			if src.Dirty != nil && src.DirtySeq > 0 {
+				candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
+			}
+			src.Unlock()
+		}
+		sort.SliceStable(candidates, func(i, j int) bool {
+			return candidates[i].dirtySeq > candidates[j].dirtySeq
+		})
+
+	candidateLoop:
+		for _, c := range candidates {
+			src := c.fh
+			if !src.TryLock() {
+				continue
+			}
+			if src.Dirty == nil || src.DirtySeq == 0 {
+				src.Unlock()
+				continue
+			}
+			if src.DirtySeq != c.dirtySeq {
+				src.Unlock()
+				pending = true
+				continue restartLoop
+			}
+			if end > src.Dirty.Size() {
+				pending = true
+				src.Unlock()
+				continue
+			}
+
+			buf := make([]byte, int(reqSize))
+			if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
+				src.Unlock()
+				n, err := fs.shadowStore.ReadAt(path, offset, buf)
+				if err != nil && !errors.Is(err, io.EOF) {
+					fs.debugf("read sqlite sidecar shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
+					pending = true
+					continue
+				}
+				if n != len(buf) {
+					pending = true
+					continue
+				}
+				return buf, n, true, gofuse.OK, false
+			}
+
+			ps := src.Dirty.PartSize()
+			firstPart := int(offset / ps)
+			lastPart := int((end - 1) / ps)
+			if evicted := src.Dirty.StreamedPartIndices(); len(evicted) > 0 {
+				for p := firstPart; p <= lastPart; p++ {
+					if evicted[p] && !src.Dirty.IsPartLoaded(p) {
+						src.Unlock()
+						pending = true
+						continue candidateLoop
+					}
+				}
+			}
+			for p := firstPart; p <= lastPart; p++ {
+				if !src.Dirty.IsPartLoaded(p) {
+					src.Unlock()
+					pending = true
+					continue candidateLoop
+				}
+			}
+			n := src.Dirty.ReadAt(offset, buf)
+			src.Unlock()
+			if n != len(buf) {
+				pending = true
+				continue
+			}
+			return buf, n, true, gofuse.OK, false
+		}
+		return nil, 0, false, gofuse.OK, pending
+	}
+}
+
+func (fs *Dat9FS) readSQLitePersistentJournalVisibleRange(path string, skip *FileHandle, fallbackRevision int64, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status, string) {
+	deadline := time.Now().Add(sqliteSidecarDirtyWaitTimeout)
+	for {
+		dirtyData, dirtyN, dirtyOK, st, pending := fs.readSQLitePersistentJournalDirtyRangeOnce(path, skip, offset, reqSize)
+		if dirtyOK || st != gofuse.OK {
+			return dirtyData, dirtyN, dirtyOK, st, "sqlite-sidecar-same-path-dirty"
+		}
+		if !pending {
+			break
+		}
+		if time.Now().After(deadline) {
+			fs.debugf("read sqlite sidecar dirty wait expired path=%s off=%d req=%d", path, offset, reqSize)
+			break
+		}
+		time.Sleep(sqliteSidecarDirtyWaitInterval)
+	}
+	cachedData, cachedN, cachedOK := fs.readSQLitePersistentJournalCommittedCache(path, fallbackRevision, offset, reqSize)
+	if cachedOK {
+		return cachedData, cachedN, true, gofuse.OK, "sqlite-sidecar-committed-cache"
+	}
+	return nil, 0, false, gofuse.OK, ""
+}
+
+func (fs *Dat9FS) readSamePathDirtyHandleAllowJournals(path string, skip *FileHandle, offset int64, reqSize uint32) ([]byte, int, bool, gofuse.Status) {
+	if fs == nil || fs.openHandles == nil || path == "" || reqSize == 0 {
+		return nil, 0, false, gofuse.OK
+	}
+
+	type candidate struct {
+		fh       *FileHandle
+		dirtySeq uint64
+	}
+
+restartLoop:
+	for {
+		var candidates []candidate
+		for _, src := range fs.openHandles.SnapshotPath(path) {
+			if src == nil || src == skip {
+				continue
+			}
+			if !src.TryLock() {
+				continue
+			}
+			if src.Dirty != nil && src.DirtySeq > 0 {
+				candidates = append(candidates, candidate{fh: src, dirtySeq: src.DirtySeq})
+			}
+			src.Unlock()
+		}
+		sort.SliceStable(candidates, func(i, j int) bool {
+			return candidates[i].dirtySeq > candidates[j].dirtySeq
+		})
+
+	candidateLoop:
+		for _, c := range candidates {
+			src := c.fh
+			if !src.TryLock() {
+				continue
+			}
+			if src.Dirty == nil || src.DirtySeq == 0 {
+				src.Unlock()
+				continue
+			}
+			if src.DirtySeq != c.dirtySeq {
+				src.Unlock()
+				continue restartLoop
+			}
+			size := src.Dirty.Size()
+			if offset >= size {
+				src.Unlock()
+				return nil, 0, true, gofuse.OK
+			}
+			end := offset + int64(reqSize)
+			if end > size {
+				end = size
+			}
+			if end <= offset {
+				src.Unlock()
+				return nil, 0, true, gofuse.OK
+			}
+			buf := make([]byte, end-offset)
+
+			if fs.shadowStore != nil && (src.ShadowReady || src.ShadowSpill) {
+				src.Unlock()
+				n, err := fs.shadowStore.ReadAt(path, offset, buf)
+				if err != nil && !errors.Is(err, io.EOF) {
+					fs.debugf("read same-path shadow miss path=%s off=%d req=%d err=%v", path, offset, reqSize, err)
+					continue
+				}
+				return buf[:n], n, true, gofuse.OK
+			}
+
+			ps := src.Dirty.PartSize()
+			firstPart := int(offset / ps)
+			lastPart := int((end - 1) / ps)
+			touchesEvicted := false
+			if evicted := src.Dirty.StreamedPartIndices(); len(evicted) > 0 {
+				for p := firstPart; p <= lastPart; p++ {
+					if evicted[p] && !src.Dirty.IsPartLoaded(p) {
+						touchesEvicted = true
+						break
+					}
+				}
+			}
+			if touchesEvicted {
+				src.Unlock()
+				continue
+			}
+			for p := firstPart; p <= lastPart; p++ {
+				if !src.Dirty.IsPartLoaded(p) {
+					if err := src.Dirty.EnsureLoaded(p); err != nil {
+						src.Unlock()
+						fs.debugf("read same-path dirty incomplete path=%s part=%d err=%v", path, p, err)
+						continue candidateLoop
+					}
+				}
+			}
+			src.Dirty.ReadAt(offset, buf)
+			src.Unlock()
+			return buf, len(buf), true, gofuse.OK
+		}
+		return nil, 0, false, gofuse.OK
+	}
+}
+
+func (fs *Dat9FS) readSQLitePersistentJournalCommittedCache(path string, fallbackRevision int64, offset int64, reqSize uint32) ([]byte, int, bool) {
+	if fs == nil || fs.readCache == nil || !isSQLitePersistentJournalPath(path) || reqSize == 0 || offset < 0 {
+		return nil, 0, false
+	}
+	revision := fs.latestCommittedRevision(path)
+	if revision <= 0 {
+		revision = fallbackRevision
+	}
+	if revision <= 0 {
+		return nil, 0, false
+	}
+	data, ok := fs.readCache.Get(path, revision)
+	if !ok {
+		return nil, 0, false
+	}
+	if offset >= int64(len(data)) {
+		return nil, 0, true
+	}
+	end := offset + int64(reqSize)
+	if end > int64(len(data)) {
+		end = int64(len(data))
+	}
+	if end <= offset {
+		return nil, 0, true
+	}
+	out := cloneBytes(data[offset:end])
+	return out, len(out), true
 }
 
 func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
@@ -1623,6 +2256,16 @@ func (fs *Dat9FS) readTargetForHandle(ctx context.Context, fh *FileHandle) *clie
 	target := fh.ReadTarget
 	handlePath := fh.Path
 	remotePath := fs.remotePath(handlePath)
+	if fs.bypassStableRemoteReadCaches(handlePath) {
+		if target != nil {
+			fh.ReadTarget = nil
+			if fh.Prefetch != nil {
+				fh.Prefetch.SetReadTarget(nil)
+			}
+		}
+		fh.Unlock()
+		return nil
+	}
 	fh.Unlock()
 	if target != nil {
 		return target
@@ -1668,10 +2311,14 @@ func (fs *Dat9FS) clearReadTargetsForPathExcept(p string, skip *FileHandle) {
 		return
 	}
 	for _, fh := range fs.openHandles.SnapshotPath(p) {
-		if fh == skip {
+		if fh == nil || fh == skip {
 			continue
 		}
-		clearReadTargetForHandle(fh)
+		if !fh.TryLock() {
+			continue
+		}
+		clearReadTargetForLockedHandle(fh)
+		fh.Unlock()
 	}
 }
 
@@ -1692,6 +2339,128 @@ func (fs *Dat9FS) clearAllReadTargets() {
 	fs.fileHandles.ForEach(func(_ uint64, fh *FileHandle) {
 		clearReadTargetForHandle(fh)
 	})
+}
+
+func readUnlinkedData(fh *FileHandle, offset int64, size uint32) ([]byte, int, bool) {
+	if fh == nil || fh.UnlinkedData == nil {
+		return nil, 0, false
+	}
+	if size == 0 || offset >= int64(len(fh.UnlinkedData)) {
+		return nil, 0, true
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	end := offset + int64(size)
+	if end > int64(len(fh.UnlinkedData)) {
+		end = int64(len(fh.UnlinkedData))
+	}
+	data := cloneBytes(fh.UnlinkedData[offset:end])
+	return data, len(data), true
+}
+
+func unlinkSnapshotSizeLocked(fh *FileHandle, inodeSize int64) (int64, bool) {
+	if fh == nil || fh.UnlinkedData != nil {
+		return 0, false
+	}
+	size := fh.OrigSize
+	if inodeSize > size {
+		size = inodeSize
+	}
+	if fh.Dirty == nil {
+		return size, true
+	}
+	if fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		return 0, false
+	}
+	if dirtySize := fh.Dirty.Size(); dirtySize > size {
+		size = dirtySize
+	}
+	return size, true
+}
+
+func (fs *Dat9FS) inodeSnapshotSize(ino uint64) int64 {
+	if fs == nil || fs.inodes == nil {
+		return -1
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok || entry == nil || entry.IsDir {
+		return -1
+	}
+	return entry.Size
+}
+
+func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, localPath string) error {
+	if !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
+		return nil
+	}
+	return fs.snapshotOpenSQLiteSidecarHandles(ctx, localPath, nil)
+}
+
+func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeTruncate(ctx context.Context, localPath string, skip *FileHandle, newSize int64) error {
+	if !shouldSnapshotOpenSQLiteSidecarOnTruncate(localPath, newSize) {
+		return nil
+	}
+	return fs.snapshotOpenSQLiteSidecarHandles(ctx, localPath, skip)
+}
+
+func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPath string, skip *FileHandle) error {
+	if fs == nil || fs.openHandles == nil || !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
+		return nil
+	}
+	type candidate struct {
+		fh   *FileHandle
+		size int64
+	}
+	var candidates []candidate
+	for _, fh := range fs.openHandles.SnapshotPath(localPath) {
+		if fh == nil || fh == skip {
+			continue
+		}
+		inodeSize := fs.inodeSnapshotSize(fh.Ino)
+		fh.Lock()
+		handlePath := fh.Path
+		size, eligible := unlinkSnapshotSizeLocked(fh, inodeSize)
+		fh.Unlock()
+
+		if !eligible || handlePath != localPath || size < 0 || size > maxPreloadSize {
+			continue
+		}
+		candidates = append(candidates, candidate{fh: fh, size: size})
+	}
+
+	snapshots := make(map[int64][]byte)
+	for _, cand := range candidates {
+		data, ok := snapshots[cand.size]
+		if !ok {
+			if cand.size > 0 {
+				if cachedData, n, claimed := fs.readSQLitePersistentJournalCommittedCache(localPath, 0, 0, uint32(cand.size)); claimed && int64(n) == cand.size {
+					data = cachedData[:n]
+				} else {
+					snapshotCtx, cancel := context.WithTimeout(ctx, readTransientRetryTimeout)
+					var err error
+					data, _, err = fs.doRangeRead(snapshotCtx, localPath, nil, 0, cand.size)
+					cancel()
+					if err != nil {
+						return err
+					}
+				}
+			} else {
+				data = []byte{}
+			}
+			snapshots[cand.size] = data
+		}
+
+		inodeSize := fs.inodeSnapshotSize(cand.fh.Ino)
+		cand.fh.Lock()
+		_, eligible := unlinkSnapshotSizeLocked(cand.fh, inodeSize)
+		if cand.fh.Path == localPath && eligible {
+			cand.fh.UnlinkedData = cloneBytes(data)
+			clearReadTargetForLockedHandle(cand.fh)
+		}
+		cand.fh.Unlock()
+	}
+	return nil
 }
 
 func (fs *Dat9FS) invalidateReadCacheAndTargets(p string) {
@@ -1738,7 +2507,7 @@ func diskReadCacheFileID(p string, entry *InodeEntry) string {
 }
 
 func (fs *Dat9FS) diskReadCacheKey(p string, entry *InodeEntry, offset, size int64) (DiskReadCacheKey, bool) {
-	if fs == nil || fs.diskReadCache == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || offset < 0 || size <= 0 {
+	if fs == nil || fs.diskReadCache == nil || entry == nil || entry.IsDir || entry.Revision <= 0 || offset < 0 || size <= 0 || fs.bypassStableRemoteReadCaches(p) {
 		return DiskReadCacheKey{}, false
 	}
 	key := DiskReadCacheKey{
@@ -3435,6 +4204,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		if input.Valid&gofuse.FATTR_FH != 0 {
 			// ftruncate(fd, size): truncate the open write buffer.
 			fh, ok := fs.fileHandles.Get(input.Fh)
+			if ok {
+				if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, fh, newSize); err != nil {
+					return httpToFuseStatus(err)
+				}
+			}
 			if ok && fh.Dirty != nil {
 				fh.Lock()
 				if err := fs.truncateWritableHandleLocked(fh, newSize); err != nil {
@@ -3450,6 +4224,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if newSize == 0 {
 				ctx, cf := fuseCtx(cancel)
 				defer cf()
+				if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, nil, newSize); err != nil {
+					return httpToFuseStatus(err)
+				}
 				apiPath := fs.remotePath(entry.Path)
 				writeStart := fs.perfStart()
 				err := fs.client.WriteCtx(ctx, apiPath, nil)
@@ -3902,6 +4679,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.dirCache.Remove(parentPath, name)
 		fs.cacheNegativePath(childP)
 		fs.scheduleGitStateCheckpoint(childP)
+		fs.forgetCommittedRevision(childP)
 		return gofuse.OK
 	}
 	if entry, handled := fs.gitEntry(ctx, childP, false); handled {
@@ -3929,6 +4707,9 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}()
 
 	pendingNew := false
+	if fs.debouncer != nil {
+		fs.debouncer.Cancel(childP)
+	}
 	if fs.writeBack != nil && fs.uploader != nil {
 		// Wait for any in-flight upload to finish so it doesn't "revive"
 		// the file on the server after we delete it.
@@ -3982,6 +4763,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if !pendingNew {
 		ctx, cf := fuseCtx(cancel)
 		defer cf()
+		if err := fs.snapshotOpenSQLiteSidecarBeforeUnlink(ctx, childP); err != nil {
+			status = httpToFuseStatus(err)
+			return status
+		}
 
 		// File existed on server (or unknown) — issue remote DELETE.
 		// Tolerate 404 in case it was already deleted.
@@ -3999,6 +4784,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 
 	fs.inodes.RemoveLink(childP)
 	fs.invalidateReadCacheAndTargets(childP)
+	fs.forgetCommittedRevision(childP)
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Remove(parentPath, name)
@@ -4041,6 +4827,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		}
 		fs.inodes.Remove(childP)
 		fs.dirCache.InvalidatePrefix(childP)
+		fs.forgetCommittedRevisionPrefix(childP)
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.cacheNegativePath(childP)
@@ -4069,6 +4856,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			parentPath, _ := fs.inodes.GetPath(header.NodeId)
 			fs.dirCache.Remove(parentPath, name)
 			fs.dirCache.InvalidatePrefix(childP)
+			fs.forgetCommittedRevisionPrefix(childP)
 			return gofuse.OK
 		}
 		st := fs.putGitWhiteout(ctx, childP)
@@ -4078,6 +4866,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
 		fs.dirCache.InvalidatePrefix(childP)
+		fs.forgetCommittedRevisionPrefix(childP)
 		return gofuse.OK
 	}
 	start := time.Now()
@@ -4133,6 +4922,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	fs.dirCache.InvalidatePrefix(childP)
 	fs.readCache.InvalidatePrefix(childP + "/")
 	fs.invalidateDiskReadCachePrefix(childP + "/")
+	fs.forgetCommittedRevisionPrefix(childP)
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Remove(parentPath, name)
@@ -4298,6 +5088,8 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	fs.readCache.InvalidatePrefix(newP + "/")
 	fs.invalidateDiskReadCachePrefix(oldP + "/")
 	fs.invalidateDiskReadCachePrefix(newP + "/")
+	fs.forgetCommittedRevisionPrefix(oldP)
+	fs.forgetCommittedRevisionPrefix(newP)
 
 	oldParent, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Remove(oldParent, path.Base(oldP))
@@ -4872,10 +5664,18 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 }
 
 func (fs *Dat9FS) mergeLocalDirEntries(ctx context.Context, dirPath string, entries []DirEntry) ([]DirEntry, error) {
-	if fs.localOverlay == nil {
+	merged, err := fs.mergeOverlayDirEntries(ctx, dirPath, entries, fs.localOverlay)
+	if err != nil {
+		return nil, err
+	}
+	return fs.mergeOverlayDirEntries(ctx, dirPath, merged, fs.transientLocalOverlay)
+}
+
+func (fs *Dat9FS) mergeOverlayDirEntries(ctx context.Context, dirPath string, entries []DirEntry, overlay *LocalOverlay) ([]DirEntry, error) {
+	if overlay == nil {
 		return entries, nil
 	}
-	items, err := fs.localOverlay.ReadDir(dirPath)
+	items, err := overlay.ReadDir(dirPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return entries, nil
@@ -4912,7 +5712,7 @@ func (fs *Dat9FS) localOverlayDirEntries(ctx context.Context, dirPath string, it
 		if item.Info.IsDir() {
 			layer = fs.observeDirPathPolicyWithContext(ctx, childP)
 		}
-		if layer != PathLayerLocalOnly {
+		if layer != PathLayerLocalOnly && !fs.usesTransientLocalOverlay(childP, item.Info.IsDir()) {
 			continue
 		}
 		info := item.Info
@@ -5084,10 +5884,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
 	out.Fh = fs.allocateFileHandle(fh)
-	// Use cached I/O for small/interactive files. Kernel coalesces writes
-	// and serves reads from page cache after first access.
-	// Keep DIRECT_IO for O_TRUNC streaming files.
-	out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
+	out.OpenFlags = remoteOpenFlagsForHandle(fh)
 	fs.fillEntryOut(entry, &out.EntryOut)
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
@@ -5182,6 +5979,9 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		// random writes don't discard the original file data.
 		if input.Flags&syscall.O_TRUNC == 0 {
 			preloaded := false
+			if fs.prepareSQLitePersistentJournalLocalCreateWritableOpen(fh) {
+				preloaded = true
+			}
 			if fs.loadWritableHandleFromOpenHandleLocked(fh) {
 				preloaded = true
 			}
@@ -5284,21 +6084,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 	}
 
 	out.Fh = fs.allocateFileHandle(fh)
-	if fh.Dirty != nil {
-		// Use cached I/O for small/interactive files (< 64MB, no O_TRUNC).
-		// Kernel coalesces writes and serves reads from page cache.
-		// Keep DIRECT_IO for O_TRUNC or large streaming files.
-		if input.Flags&syscall.O_TRUNC != 0 || fh.OrigSize >= smallFileShadowThreshold {
-			out.OpenFlags = gofuse.FOPEN_DIRECT_IO
-		} else {
-			out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
-		}
-	} else {
-		// Read-only opens need kernel caching so mmap-based readers (notably
-		// git pack access) do not SIGBUS on macFUSE. Prefetch-backed reads
-		// still populate the userspace prefetcher on cache misses.
-		out.OpenFlags = gofuse.FOPEN_KEEP_CACHE
-	}
+	out.OpenFlags = remoteOpenFlagsForHandle(fh)
 	fs.debugf("open path=%s fh=%d ino=%d flags=0x%x open_flags=%d dirty=%t prefetch=%t orig_size=%d base_rev=%d shadow_ready=%t shadow_spill=%t write_policy=%s", p, out.Fh, fh.Ino, input.Flags, out.OpenFlags, fh.Dirty != nil, fh.Prefetch != nil, fh.OrigSize, fh.BaseRev, fh.ShadowReady, fh.ShadowSpill, fh.WritePolicy)
 	return gofuse.OK
 }
@@ -5319,6 +6105,10 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			return
 		}
 		d := time.Since(start)
+		if isSQLiteDirectIOPath(logPath) {
+			fs.debugf("read path=%s fh=%d ino=%d off=%d req=%d got=%d source=%s status=%d dur=%s", logPath, input.Fh, logIno, input.Offset, input.Size, bytesRead, source, status, d)
+			return
+		}
 		if status == gofuse.OK && d < fuseDebugSlowReadThreshold {
 			return
 		}
@@ -5380,6 +6170,29 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		bytesRead = n
 		return gofuse.ReadResultData(data[:n]), gofuse.OK
 	}
+	if data, n, ok := readUnlinkedData(fh, int64(input.Offset), input.Size); ok {
+		fh.Unlock()
+		source = "unlinked-snapshot"
+		bytesRead = n
+		return gofuse.ReadResultData(data), gofuse.OK
+	}
+
+	if fh.ShadowSpill && fs.shadowStore != nil && fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.Dirty.Size() == 0 && !fh.Dirty.hasDirtyPartMarks() && !fh.ZeroBase && fh.Flags&syscall.O_TRUNC == 0 {
+		handlePath := fh.Path
+		baseRev := fh.BaseRev
+		fh.Unlock()
+		if data, n, ok, st, src := fs.readSQLitePersistentJournalVisibleRange(handlePath, fh, baseRev, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+			source = src
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
+		source = "sqlite-sidecar-shadow-empty-eof"
+		bytesRead = 0
+		return gofuse.ReadResultData(nil), gofuse.OK
+	}
 
 	// ShadowSpill: read from shadow file (the authoritative data source).
 	// Dirty has evicted parts so ReadAt would return incomplete data.
@@ -5399,7 +6212,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		fh.Unlock()
 		result := make([]byte, end-offset)
 		n, err := fs.shadowStore.ReadAt(fh.Path, offset, result)
-		if err != nil {
+		if err != nil && !errors.Is(err, io.EOF) {
 			source = "shadow-spill-error"
 			return nil, gofuse.EIO
 		}
@@ -5415,7 +6228,30 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// However, if the handle has evicted (streaming-uploaded) parts, we cannot
 	// serve reads from those ranges — the data is on S3 but not in memory.
 	// For such ranges we fall through to the server read path.
-	if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
+	if fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts() {
+		handlePath := fh.Path
+		baseRev := fh.BaseRev
+		cleanEmptyEOF := fh.Dirty.Size() == 0 && (fh.IsNew || fh.BaseRev == 0 || fh.OrigSize == 0)
+		fh.Unlock()
+		if data, n, ok, st, src := fs.readSQLitePersistentJournalVisibleRange(handlePath, fh, baseRev, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+			source = src
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
+		if cleanEmptyEOF {
+			source = "sqlite-sidecar-clean-empty-eof"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		source = "sqlite-sidecar-clean-remote"
+		// Clean O_RDWR SQLite sidecar handles are reader snapshots. Do not
+		// serve their preloaded WAL/journal bytes from the writable buffer:
+		// the shared -shm can point readers at a newer fsync-committed sidecar
+		// extent, and a stale clean buffer would produce short reads.
+	} else if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
 		offset := int64(input.Offset)
 		size := fh.Dirty.Size()
 		if offset >= size {
@@ -5547,6 +6383,23 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		fh.Unlock()
 	}
 
+	if fh.Dirty == nil && isSQLitePersistentJournalPath(fh.Path) {
+		if data, n, ok, st, src := fs.readSQLitePersistentJournalVisibleRange(fh.Path, fh, fh.BaseRev, int64(input.Offset), input.Size); ok || st != gofuse.OK {
+			source = src
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
+		entry, _ := fs.inodes.GetEntry(fh.Ino)
+		if (entry == nil || (entry.Size == 0 && entry.Revision == 0)) && fs.hasOpenPendingSQLitePersistentJournalCreate(fh.Path, fh) {
+			source = "sqlite-sidecar-open-empty-eof"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+	}
+
 	if fh.Layer == PathLayerGitWorkspace {
 		data, err := fs.readGitFile(ctx, fh.Path, int64(input.Offset), int64(input.Size))
 		if err != nil {
@@ -5556,6 +6409,17 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		source = "git-workspace"
 		bytesRead = len(data)
 		return gofuse.ReadResultData(data), gofuse.OK
+	}
+
+	if fh.Dirty == nil && isSQLiteVisibleSamePathDirtyPath(fh.Path) {
+		if data, n, ok, st := fs.readSamePathDirtyHandle(fh.Path, fh, int64(input.Offset), input.Size); ok {
+			source = "same-path-dirty"
+			bytesRead = n
+			if st != gofuse.OK {
+				return nil, st
+			}
+			return gofuse.ReadResultData(data), gofuse.OK
+		}
 	}
 
 	// Read path priority for pending files:
@@ -5572,7 +6436,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			sz = fs.shadowStore.SizeGen(fh.ShadowGen)
 			useGen = sz >= 0
 		}
-		if !useGen {
+		if !useGen && !isSQLitePersistentJournalPath(fh.Path) {
 			if fs.shadowStore.Has(fh.Path) {
 				sz = fs.shadowStore.Size(fh.Path)
 			}
@@ -5596,7 +6460,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			} else {
 				n, err = fs.shadowStore.ReadAt(fh.Path, offset, buf)
 			}
-			if err == nil && n > 0 {
+			if (err == nil || errors.Is(err, io.EOF)) && n >= 0 {
 				source = "shadow-store"
 				bytesRead = n
 				return gofuse.ReadResultData(buf[:n]), gofuse.OK
@@ -5628,6 +6492,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	p := fh.Path
+	bypassStableCaches := fs.bypassStableRemoteReadCaches(p)
 	entry, _ := fs.inodes.GetEntry(fh.Ino)
 	revalidatedForRead := false
 	if entry != nil && !fs.statCacheVerified() {
@@ -5641,7 +6506,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	}
 
 	// Try prefetcher for large read-only files
-	if fh.Prefetch != nil {
+	if fh.Prefetch != nil && !bypassStableCaches {
 		offset := int64(input.Offset)
 		size := int(input.Size)
 		if data, ok := fh.Prefetch.Get(offset, size); ok {
@@ -5665,7 +6530,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	// Try read cache for small files. Use revision-aware cache: if the
 	// InodeEntry has a stored revision from the last Lookup/GetAttr, pass
 	// it to the cache for validation. Cache hit only if revision matches.
-	if entry != nil && entry.Size <= fs.readCache.MaxFileSize() && entry.Size > 0 {
+	if entry != nil && entry.Size <= fs.readCache.MaxFileSize() && entry.Size > 0 && !bypassStableCaches {
 		cacheRev := entry.Revision // use revision from last Stat/Lookup
 		// Fast path: serve from cache without any HTTP call.
 		if data, ok := fs.readCache.Get(p, cacheRev); ok {
@@ -5784,7 +6649,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			}
 			source = "disk-read-cache-hit"
 			bytesRead = len(data)
-			if fh.Prefetch != nil {
+			if fh.Prefetch != nil && !bypassStableCaches {
 				fh.Prefetch.OnRead(rangeOffset, len(data))
 			}
 			return gofuse.ReadResultData(data), gofuse.OK
@@ -5815,7 +6680,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			fs.debugf("read disk-cache range done path=%s off=%d req=%d got=%d source=%s dur=%s", p, input.Offset, input.Size, n, source, time.Since(rangeStart))
 		}
 		bytesRead = n
-		if fh.Prefetch != nil {
+		if fh.Prefetch != nil && !bypassStableCaches {
 			fh.Prefetch.OnRead(rangeOffset, n)
 		}
 		return gofuse.ReadResultData(data), gofuse.OK
@@ -5847,7 +6712,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		fs.debugf("read range done path=%s off=%d req=%d got=%d source=%s dur=%s", p, input.Offset, input.Size, n, source, time.Since(rangeStart))
 	}
 	bytesRead = n
-	if fh.Prefetch != nil {
+	if fh.Prefetch != nil && !bypassStableCaches {
 		fh.Prefetch.OnRead(int64(input.Offset), n)
 	}
 	return gofuse.ReadResultData(data), gofuse.OK
@@ -6069,7 +6934,9 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 	}
 
 	size := fh.Dirty.Size()
-	expectedRevision := expectedRevisionForHandle(fh)
+	unlockRemoteCommit := fs.lockRemoteCommitPath(fh.Path)
+	defer unlockRemoteCommit()
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	var (
 		data         []byte
 		committedRev int64
@@ -6165,6 +7032,8 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		return httpToFuseStatus(err)
 	}
 
+	sidecarRevision := sqliteCommittedRevision(committedRev, expectedRevision)
+	sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
 	fh.Dirty.ClearDirty()
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.DirtySeq = 0
@@ -6173,6 +7042,10 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 		fs.clearReadTargetsForPathExcept(fh.Path, fh)
 		fs.readCache.Put(fh.Path, data, committedRev)
 		fs.markHandleRemoteCommittedLocked(fh, committedRev)
+	} else if sidecarCached {
+		clearReadTargetForLockedHandle(fh)
+		fs.clearReadTargetsForPathExcept(fh.Path, fh)
+		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 	} else {
 		clearReadTargetForLockedHandle(fh)
 		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
@@ -6190,6 +7063,9 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 	if fh == nil || fh.Dirty == nil {
 		return gofuse.OK
 	}
+	if fs.clearStaleSQLitePersistentJournalEmptyCreateLocked(fh) {
+		return gofuse.OK
+	}
 	if !fh.Dirty.HasDirtyParts() {
 		if fh.IsNew && fh.Dirty.Size() == 0 {
 			return fs.createEmptyHandleRemoteLocked(ctx, fh)
@@ -6199,7 +7075,9 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 
 	size := fh.Dirty.Size()
 	if fh.ShadowSpill && fs.shadowStore != nil {
-		expectedRevision := expectedRevisionForHandle(fh)
+		unlockRemoteCommit := fs.lockRemoteCommitPath(fh.Path)
+		defer unlockRemoteCommit()
+		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("sync handle shadowspill upload start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
 		fh.Unlock()
@@ -6249,7 +7127,9 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 }
 
 func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
-	expectedRevision := expectedRevisionForHandle(fh)
+	unlockRemoteCommit := fs.lockRemoteCommitPath(fh.Path)
+	defer unlockRemoteCommit()
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	writeStart := time.Now()
 	fs.debugf("sync empty create start path=%s expected_rev=%d", fh.Path, expectedRevision)
 	committedRev, err := fs.client.CreateFileCtx(ctx, fs.remotePath(fh.Path))
@@ -6297,6 +7177,9 @@ func (fs *Dat9FS) createEmptyHandleRemoteLocked(ctx context.Context, fh *FileHan
 func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseFlush, perfStart, status, 0) }()
+	if lockOwner := fuseLockOwner(input.LockOwner, input.Pid, input.Fh); lockOwner != 0 {
+		fs.locks.release(input.NodeId, lockOwner)
+	}
 	fh, ok := fs.fileHandles.Get(input.Fh)
 	if !ok {
 		return gofuse.OK
@@ -6371,6 +7254,8 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		return fs.syncHandleToRemoteLocked(syncCtx, fh)
 	}
 
+	requiresRemoteSync := isSQLitePersistentJournalPath(fh.Path)
+
 	// Write-back path: small dirty files are persisted to local disk
 	// and return immediately. The actual HTTP upload happens in Release
 	// (async). This reduces Flush latency from ~100-300ms to ~1-5ms.
@@ -6380,7 +7265,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	// Release will see HasDirtyParts() == true and fall through to the
 	// synchronous flushHandle path, uploading the latest data. The cache
 	// entry is just a snapshot for the async-upload fast path.
-	if fs.writeBack != nil && fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
+	if !requiresRemoteSync && fs.writeBack != nil && fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
 		// Same generation already cached — no new writes since last Flush.
 		if fh.WriteBackSeq > 0 && fh.WriteBackSeq == fh.DirtySeq {
 			phase = "writeback-same-seq"
@@ -6450,7 +7335,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 		// ShadowSpill interactive path: stage shadow journal + set ShadowCommitReady.
 		// Does NOT use snapshotWriteBackLocked or WriteBackSeq — those assume
 		// writeBack cache holds complete file data, which ShadowSpill does not.
-		if fh.ShadowSpill && fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
+		if !requiresRemoteSync && fh.ShadowSpill && fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
 			phase = "large-shadowspill-stage"
 			size := fh.Dirty.Size()
 			stageStart := time.Now()
@@ -6471,7 +7356,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 			defer uploadCancel()
 			phase = "large-shadowspill-sync-upload"
-			expectedRevision := expectedRevisionForHandle(fh)
+			expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 			uploadStart := time.Now()
 			fs.debugf("flush shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
 			fh.Unlock()
@@ -6519,7 +7404,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			return gofuse.OK
 		}
 
-		if fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
+		if !requiresRemoteSync && fs.syncMode == SyncInteractive && fs.shadowStore != nil && fs.pendingIndex != nil {
 			if fs.canStageShadowFastLocked(fh) || fh.Dirty.CanMaterializeFull() {
 				phase = "large-stage-shadow"
 				size := fh.Dirty.Size()
@@ -6629,7 +7514,8 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 
 	// Interactive mode: Fsync = local durable only. Shadow file + journal
 	// ensure crash safety. Remote commit happens asynchronously.
-	if fs.syncMode == SyncInteractive {
+	requiresRemoteSync := isSQLitePersistentJournalPath(fh.Path)
+	if fs.syncMode == SyncInteractive && !requiresRemoteSync {
 		if fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
 			phase = "interactive-clean"
 			return gofuse.OK
@@ -6681,7 +7567,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	// ShadowSpill strict: synchronous streaming upload from shadow.
 	if fh.ShadowSpill && fs.shadowStore != nil {
 		size := fh.Dirty.Size()
-		expectedRevision := expectedRevisionForHandle(fh)
+		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		uploadCtx, uploadCancel := fuseCtxWithTimeout(cancel, releaseTimeout(size))
 		defer uploadCancel()
 		phase = "shadowspill-sync-upload"
@@ -6736,6 +7622,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if fs.writeBack != nil && fs.uploader != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq {
 		// Snapshot matches current dirty state — safe to upload.
 		phase = "writeback-upload-sync"
+		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
 		committedRev, err := fs.uploader.UploadSyncWithRevision(ctx, fh.Path)
@@ -6764,7 +7651,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		if committedRev > 0 {
 			fs.markHandleRemoteCommittedLocked(fh, committedRev)
 		} else {
-			fs.finalizeHandleFlushLocked(fh, expectedRevisionForHandle(fh))
+			fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		}
 	} else if fs.writeBack != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq != fh.DirtySeq {
 		// Snapshot is stale — discard it so we don't upload old data.
@@ -6992,7 +7879,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		}
 
 		// ShadowSpill Release: CommitQueue streaming from shadow, no writeBack.
-		if fh.ShadowSpill && fh.ShadowCommitReady && fs.commitQueue != nil && fs.shadowStore != nil {
+		if !isSQLitePersistentJournalPath(fh.Path) && fh.ShadowSpill && fh.ShadowCommitReady && fs.commitQueue != nil && fs.shadowStore != nil {
 			phase = "shadowspill-commit"
 			lockStart := time.Now()
 			fh.Lock()
@@ -7032,7 +7919,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				phase = "shadowspill-sync-upload"
 				uploadStart := time.Now()
 				fs.debugf("release shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
-				uploadErr := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevisionForHandle(fh))
+				uploadErr := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), fs.expectedRevisionForHandleLocked(fh))
 				var uploadBytes uint64
 				if size > 0 {
 					uploadBytes = uint64(size)
@@ -7063,7 +7950,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		// AND no new writes have happened since. If the DirtySeq changed,
 		// the cache snapshot is stale — fall through to synchronous upload
 		// which will upload the latest buffer data.
-		if fs.writeBack != nil && fs.uploader != nil {
+		if !isSQLitePersistentJournalPath(fh.Path) && fs.writeBack != nil && fs.uploader != nil {
 			phase = "writeback-check"
 			lockStart := time.Now()
 			fh.Lock()
@@ -7183,6 +8070,9 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	if force || fh.Dirty == nil || !fh.Dirty.HasDirtyParts() {
 		return fs.flushHandle(ctx, fh)
 	}
+	if isSQLitePersistentJournalPath(fh.Path) {
+		return fs.flushHandle(ctx, fh)
+	}
 
 	size := fh.Dirty.Size()
 	if size >= fs.inlineThreshold() || fs.debouncer.delay <= 0 {
@@ -7198,7 +8088,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 	ino := fh.Ino
 	handle := fh               // capture for goroutine
 	snapshotSeq := fh.DirtySeq // capture current dirty sequence
-	expectedRevision := expectedRevisionForHandle(fh)
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 
 	fs.debouncer.Schedule(filePath, func() {
 		handle.Lock()
@@ -7228,6 +8118,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		// The handle stays locked across upload + finalize so concurrent writes
 		// cannot advance live state for data outside this committed snapshot.
 		if committedRev > 0 {
+			fs.recordCommittedRevision(filePath, committedRev)
 			handle.IsNew = false
 			handle.BaseRev = committedRev
 			fs.inodes.UpdateRevision(ino, committedRev)
@@ -7295,12 +8186,18 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		phase = "no-dirty-buffer"
 		return gofuse.OK
 	}
+	if fs.clearStaleSQLitePersistentJournalEmptyCreateLocked(fh) {
+		phase = "stale-sqlite-sidecar-empty-create"
+		return gofuse.OK
+	}
 	if !fh.Dirty.HasDirtyParts() {
 		phase = "no-dirty-parts"
 		return gofuse.OK
 	}
 
 	size := fh.Dirty.Size()
+	unlockRemoteCommit := fs.lockRemoteCommitPath(fh.Path)
+	defer unlockRemoteCommit()
 
 	var err error
 
@@ -7310,7 +8207,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// size and uploads from pendingParts), not Path 1b's UploadAll.
 	if fh.Streamer != nil && fh.Streamer.Started() {
 		phase = "finish-streaming"
-		expectedRevision := fh.Streamer.ExpectedRevision()
+		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		partSize := fh.Dirty.PartSize()
 		numParts := int((size + partSize - 1) / partSize)
 		lastPartNum := numParts // 1-based
@@ -7333,6 +8230,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		dirtyParts := fh.Dirty.DirtyStreamedParts()
 
 		streamer := fh.Streamer
+		streamer.RefreshExpectedRevision(expectedRevision)
 
 		// Release fh.mu before network calls — FinishStreaming does
 		// synchronous uploads that may take minutes.
@@ -7359,11 +8257,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			return httpToFuseStatus(err)
 		}
 
+		sidecarRevision := sqliteCommittedRevision(0, expectedRevision)
+		sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 		clearReadTargetForLockedHandle(fh)
-		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		if sidecarCached {
+			fs.clearReadTargetsForPathExcept(fh.Path, fh)
+		} else {
+			fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		}
 		fs.inodes.UpdateSize(fh.Ino, size)
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		// Remove stale shadow so subsequent read-only opens don't serve
@@ -7384,7 +8288,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// (non-sequential writes) — upload all parts in parallel at flush time.
 	if fh.Streamer != nil && size >= fs.inlineThreshold() {
 		phase = "upload-all"
-		expectedRevision := fh.Streamer.ExpectedRevision()
+		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		numParts := int((size + fh.Dirty.PartSize() - 1) / fh.Dirty.PartSize())
 		partSnapshots := make(map[int][]byte, numParts)
 		for pn := 1; pn <= numParts; pn++ {
@@ -7397,6 +8301,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 
 		streamer := fh.Streamer
+		streamer.RefreshExpectedRevision(expectedRevision)
 
 		// Release fh.mu during network call (same deadlock avoidance as Path 1a).
 		uploadStart := time.Now()
@@ -7421,11 +8326,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			return httpToFuseStatus(err)
 		}
 
+		sidecarRevision := sqliteCommittedRevision(0, expectedRevision)
+		sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 		fh.DirtySeq = 0
 		clearReadTargetForLockedHandle(fh)
-		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		if sidecarCached {
+			fs.clearReadTargetsForPathExcept(fh.Path, fh)
+		} else {
+			fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		}
 		fs.inodes.UpdateSize(fh.Ino, size)
 		fs.cacheFileForPath(fh.Path, size, time.Now(), 0)
 		// Remove stale shadow (same reason as Path 1a above).
@@ -7443,7 +8354,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 
 	// Path 2: No streaming uploader or small file — materialize all data for upload.
 	data := fh.Dirty.bytesView()
-	expectedRevision := expectedRevisionForHandle(fh)
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	var committedRev int64
 
 	// Use the negotiated server threshold (not the heuristic-only inline
@@ -7539,6 +8450,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		return httpToFuseStatus(err)
 	}
 
+	sidecarRevision := sqliteCommittedRevision(committedRev, expectedRevision)
+	sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
 	fh.Dirty.ClearDirty()
 	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 	fh.DirtySeq = 0
@@ -7547,6 +8460,10 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.clearReadTargetsForPathExcept(fh.Path, fh)
 		fs.readCache.Put(fh.Path, data, committedRev)
 		fs.markHandleRemoteCommittedLocked(fh, committedRev)
+	} else if sidecarCached {
+		clearReadTargetForLockedHandle(fh)
+		fs.clearReadTargetsForPathExcept(fh.Path, fh)
+		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 	} else {
 		clearReadTargetForLockedHandle(fh)
 		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
@@ -7671,6 +8588,21 @@ func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, a
 // It seeds readCache and updates inode revision when committedRev is available,
 // or invalidates the cache otherwise.
 func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
+	if fs == nil {
+		return
+	}
+	if entry == nil {
+		return
+	}
+	if committedRev > 0 {
+		if entry.Kind == PendingNew {
+			fs.replaceCommittedRevision(entry.Path, committedRev)
+		} else {
+			fs.recordCommittedRevision(entry.Path, committedRev)
+		}
+	} else {
+		fs.forgetCommittedRevision(entry.Path)
+	}
 	if committedRev > 0 && entry.Inode > 0 {
 		fs.clearReadTargetsForPath(entry.Path)
 		// Seed readCache from shadow data before the shadow file is removed.
@@ -7697,6 +8629,23 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
 	}
+}
+
+func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int64) {
+	if fs == nil {
+		return
+	}
+	if committedRev > 0 {
+		if meta.Kind == PendingNew {
+			fs.replaceCommittedRevision(meta.Path, committedRev)
+		} else {
+			fs.recordCommittedRevision(meta.Path, committedRev)
+		}
+		fs.refreshCommittedRevisionForOpenHandles(meta.Path, committedRev, nil)
+	} else {
+		fs.forgetCommittedRevision(meta.Path)
+	}
+	fs.cacheFileForPath(meta.Path, meta.Size, time.Now(), committedRev)
 }
 
 func (fs *Dat9FS) onCommitQueueCleanup(entry *CommitEntry) {

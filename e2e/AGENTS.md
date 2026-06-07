@@ -241,13 +241,15 @@ deterministic read-correctness coverage, not a write/concurrency/Git workload.
 ### `fuse-sqlite-correctness.sh`
 
 Host support: Linux and macOS only. This script needs real FUSE support and is
-deterministic SQLite rollback-journal correctness coverage, not concurrency,
-performance, or crash recovery. Set `RUN_FUSE_SQLITE_WAL=1` to add the WAL detector.
+deterministic SQLite rollback-journal correctness coverage, not performance or
+crash recovery. Set `RUN_FUSE_SQLITE_WAL=1` to add the WAL detector,
+`RUN_FUSE_SQLITE_CHURN=1` to add repeated large-DB rewrite churn, and `RUN_FUSE_SQLITE_CONCURRENCY=1`
+to add a bounded WAL readers/writer detector.
 
 1. Provision tenant unless `DRIVE9_API_KEY` is already set
 2. Prepare `drive9` CLI binary (build local or download official release)
 3. Mount a fresh writable namespace through real FUSE
-4. Create deterministic SQLite databases in rollback-journal mode, plus WAL when `RUN_FUSE_SQLITE_WAL=1`
+4. Create deterministic SQLite databases in rollback-journal mode, plus optional WAL/churn/concurrency cases
 5. Verify `PRAGMA integrity_check` and logical fingerprints while mounted
 6. Unmount, remount, and verify the same logical fingerprints
 7. Copy the remote tree back through the CLI and verify snapshot integrity
@@ -421,8 +423,14 @@ the layout captured by that run.
 | `FUSE_CORRECTNESS_KEEP_ARTIFACTS` | `0` | `fuse-correctness-workload.sh` |
 | `RUN_FUSE_SQLITE_CORRECTNESS` | `1` | `fuse-release-gate.sh` |
 | `FUSE_SQLITE_ROWS` | `64` | `fuse-sqlite-correctness.sh` |
+| `FUSE_SQLITE_CHURN_ROUNDS` | `4` | `fuse-sqlite-correctness.sh` |
+| `FUSE_SQLITE_CONCURRENCY_READERS` | `4` | `fuse-sqlite-correctness.sh` |
+| `FUSE_SQLITE_CONCURRENCY_WRITES` | `40` | `fuse-sqlite-correctness.sh` |
+| `FUSE_SQLITE_WORKLOAD_TIMEOUT_S` | `240` | `fuse-sqlite-correctness.sh` |
 | `FUSE_SQLITE_KEEP_ARTIFACTS` | `0` | `fuse-sqlite-correctness.sh` |
 | `RUN_FUSE_SQLITE_WAL` | `0` | `fuse-sqlite-correctness.sh` |
+| `RUN_FUSE_SQLITE_CHURN` | `0` | `fuse-sqlite-correctness.sh` |
+| `RUN_FUSE_SQLITE_CONCURRENCY` | `0` | `fuse-sqlite-correctness.sh` |
 | `FUSE_CONCURRENCY_WORKERS` | `4` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_FILES_PER_WORKER` | `8` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_READER_WORKERS` | `2` | `fuse-concurrency-stress.sh` |

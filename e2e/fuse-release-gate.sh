@@ -20,6 +20,9 @@ export FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 bash "$SCRIPT_DIR/fuse-smoke-test.sh"
 bash "$SCRIPT_DIR/fuse-correctness-workload.sh"
 if [ "$RUN_FUSE_SQLITE_CORRECTNESS" = "1" ]; then
+  if [ "${RUN_FUSE_SQLITE_CONCURRENCY:-0}" = "1" ]; then
+    export FUSE_SQLITE_MOUNT_DEBUG="${FUSE_SQLITE_MOUNT_DEBUG:-1}"
+  fi
   bash "$SCRIPT_DIR/fuse-sqlite-correctness.sh"
 fi
 if [ "$RUN_FUSE_CONCURRENCY_STRESS" = "1" ]; then
