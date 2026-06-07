@@ -171,10 +171,24 @@ func (c *Client) GetFSLayer(ctx context.Context, layerID string) (*FSLayer, erro
 }
 
 func (c *Client) DiffFSLayer(ctx context.Context, layerID string) ([]FSLayerEntry, error) {
+	return c.diffFSLayer(ctx, layerID, nil)
+}
+
+func (c *Client) DiffFSLayerAtSeq(ctx context.Context, layerID string, maxSeq int64) ([]FSLayerEntry, error) {
+	if maxSeq < 0 {
+		return nil, fmt.Errorf("maxSeq must be non-negative")
+	}
+	return c.diffFSLayer(ctx, layerID, &maxSeq)
+}
+
+func (c *Client) diffFSLayer(ctx context.Context, layerID string, maxSeq *int64) ([]FSLayerEntry, error) {
 	if strings.TrimSpace(layerID) == "" {
 		return nil, fmt.Errorf("layerID must not be empty")
 	}
 	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/diff"
+	if maxSeq != nil {
+		u += "?max_seq=" + url.QueryEscape(fmt.Sprintf("%d", *maxSeq))
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -226,6 +240,17 @@ func (c *Client) UpsertFSLayerEntry(ctx context.Context, layerID string, req FSL
 }
 
 func (c *Client) GetFSLayerEntry(ctx context.Context, layerID, path string) (*FSLayerEntry, error) {
+	return c.getFSLayerEntry(ctx, layerID, path, nil)
+}
+
+func (c *Client) GetFSLayerEntryAtSeq(ctx context.Context, layerID, path string, maxSeq int64) (*FSLayerEntry, error) {
+	if maxSeq < 0 {
+		return nil, fmt.Errorf("maxSeq must be non-negative")
+	}
+	return c.getFSLayerEntry(ctx, layerID, path, &maxSeq)
+}
+
+func (c *Client) getFSLayerEntry(ctx context.Context, layerID, path string, maxSeq *int64) (*FSLayerEntry, error) {
 	if strings.TrimSpace(layerID) == "" {
 		return nil, fmt.Errorf("layerID must not be empty")
 	}
@@ -233,6 +258,9 @@ func (c *Client) GetFSLayerEntry(ctx context.Context, layerID, path string) (*FS
 		return nil, fmt.Errorf("path must not be empty")
 	}
 	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/entries?path=" + url.QueryEscape(path)
+	if maxSeq != nil {
+		u += "&max_seq=" + url.QueryEscape(fmt.Sprintf("%d", *maxSeq))
+	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err

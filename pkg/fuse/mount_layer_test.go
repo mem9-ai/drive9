@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
+	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
@@ -22,13 +24,18 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 				DurableSeq:   1,
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/diff":
+			if r.URL.Query().Get("max_seq") != "1" {
+				t.Errorf("diff max_seq = %q, want 1", r.URL.Query().Get("max_seq"))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"entries": []client.FSLayerEntry{
 					{LayerID: "layer-1", Path: "/repo/a.txt", Op: "upsert", Kind: "file", BaseRevision: 0, SizeBytes: 1, EntrySeq: 1},
 					{LayerID: "layer-1", Path: "/repo/old.txt", Op: "whiteout", Kind: "file", EntrySeq: 1},
 					{LayerID: "layer-1", Path: "/repo/newdir/", Op: "mkdir", Kind: "dir", Mode: 0o755, EntrySeq: 1},
+					{LayerID: "layer-1", Path: "/repo/link", Op: "symlink", Kind: "symlink", ContentText: "target.txt", Mode: symlinkMode(), SizeBytes: 10, EntrySeq: 1},
 					{LayerID: "layer-1", Path: "/repo/renamed-from.txt", Op: "rename", Kind: "file", ContentText: "/repo/renamed-to.txt", Mode: 0o644, EntrySeq: 1},
-					{LayerID: "layer-1", Path: "/repo/b.txt", Op: "upsert", Kind: "file", BaseRevision: 0, SizeBytes: 1, EntrySeq: 2},
 				},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/entries":
@@ -94,6 +101,9 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if mode, ok := fs.layerDirMode("/newdir"); !ok || mode != 0o755 {
 		t.Fatalf("newdir layer dir = (%#o, %t), want 0755 true", mode, ok)
 	}
+	if target, _, ok := fs.layerSymlink("/link"); !ok || target != "target.txt" {
+		t.Fatalf("layer symlink = (%q, %t), want target.txt true", target, ok)
+	}
 	renamed, err := shadow.ReadAll("/renamed-to.txt")
 	if err != nil {
 		t.Fatalf("ReadAll restored renamed target: %v", err)
@@ -109,6 +119,25 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	}
 	if pending.HasPending("/b.txt") || shadow.Has("/b.txt") {
 		t.Fatal("b.txt should not be restored past checkpoint seq")
+	}
+}
+
+func TestLayerSymlinkReadlinkUsesLayerTarget(t *testing.T) {
+	fs := NewDat9FS(client.New("http://127.0.0.1", ""), &MountOptions{
+		LayerRef:              "layer-1",
+		RemoteRoot:            "/repo",
+		CacheSize:             1 << 20,
+		ReadCacheMaxFileBytes: 1 << 20,
+	})
+	fs.markLayerSymlink("/link", "target.txt", symlinkMode())
+	ino := fs.inodes.Lookup("/link", false, int64(len("target.txt")), time.Now())
+	fs.inodes.UpdateMode(ino, symlinkMode())
+	got, st := fs.Readlink(nil, &gofuse.InHeader{NodeId: ino})
+	if st != gofuse.OK {
+		t.Fatalf("Readlink status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, []byte("target.txt")) {
+		t.Fatalf("Readlink target = %q, want target.txt", got)
 	}
 }
 

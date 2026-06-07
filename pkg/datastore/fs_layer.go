@@ -17,10 +17,12 @@ type FSLayerEntryOp string
 type FSLayerEntryKind string
 
 var ErrFSLayerRefAmbiguous = errors.New("fs layer ref is ambiguous")
+var ErrFSLayerStateConflict = errors.New("fs layer state conflict")
 
 const (
 	FSLayerStateActive     FSLayerState = "active"
 	FSLayerStateSealed     FSLayerState = "sealed"
+	FSLayerStateCommitting FSLayerState = "committing"
 	FSLayerStateCommitted  FSLayerState = "committed"
 	FSLayerStateAbandoned  FSLayerState = "abandoned"
 	FSLayerStateConflicted FSLayerState = "conflicted"
@@ -296,7 +298,7 @@ func (s *Store) SetFSLayerState(ctx context.Context, layerID string, state FSLay
 	}
 	query := `UPDATE fs_layers SET state = ?, updated_at = UTC_TIMESTAMP(3)`
 	args := []any{string(state)}
-	if state == FSLayerStateSealed || state == FSLayerStateCommitted || state == FSLayerStateAbandoned {
+	if state == FSLayerStateSealed || state == FSLayerStateCommitting || state == FSLayerStateCommitted || state == FSLayerStateAbandoned || state == FSLayerStateConflicted {
 		query += `, sealed_at = COALESCE(sealed_at, UTC_TIMESTAMP(3))`
 	}
 	query += ` WHERE layer_id = ?`
@@ -315,6 +317,32 @@ func (s *Store) SetFSLayerState(ctx context.Context, layerID string, state FSLay
 		}
 	}
 	return nil
+}
+
+func (s *Store) BeginFSLayerCommit(ctx context.Context, layerID string) error {
+	layerID = strings.TrimSpace(layerID)
+	if layerID == "" {
+		return fmt.Errorf("fs layer id is required")
+	}
+	res, err := s.db.ExecContext(ctx, `
+UPDATE fs_layers
+SET state = ?, sealed_at = COALESCE(sealed_at, UTC_TIMESTAMP(3)), updated_at = UTC_TIMESTAMP(3)
+WHERE layer_id = ? AND state IN (?, ?)`,
+		string(FSLayerStateCommitting), layerID, string(FSLayerStateActive), string(FSLayerStateSealed))
+	if err != nil {
+		return fmt.Errorf("begin fs layer commit %s: %w", layerID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	if _, err := s.GetFSLayer(ctx, layerID); err != nil {
+		return err
+	}
+	return ErrFSLayerStateConflict
 }
 
 func (s *Store) RollbackFSLayer(ctx context.Context, layerID string) error {
@@ -355,27 +383,7 @@ INSERT INTO fs_layer_entries (
 	layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind, base_inode_id, base_revision,
 	storage_type, storage_ref, storage_ref_hash, content_blob, content_type, content_text, checksum_sha256,
 	size_bytes, mode, entry_seq, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))
-ON DUPLICATE KEY UPDATE
-	path = VALUES(path),
-	parent_path = VALUES(parent_path),
-	parent_path_hash = VALUES(parent_path_hash),
-	name = VALUES(name),
-	op = VALUES(op),
-	kind = VALUES(kind),
-	base_inode_id = VALUES(base_inode_id),
-	base_revision = VALUES(base_revision),
-	storage_type = VALUES(storage_type),
-	storage_ref = VALUES(storage_ref),
-	storage_ref_hash = VALUES(storage_ref_hash),
-	content_blob = VALUES(content_blob),
-	content_type = VALUES(content_type),
-	content_text = VALUES(content_text),
-	checksum_sha256 = VALUES(checksum_sha256),
-	size_bytes = VALUES(size_bytes),
-	mode = VALUES(mode),
-	entry_seq = VALUES(entry_seq),
-	updated_at = UTC_TIMESTAMP(3)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))`,
 		entry.LayerID, entry.Path, entry.PathHash, entry.ParentPath, entry.ParentPathHash, entry.Name,
 		string(entry.Op), string(entry.Kind), entry.BaseInodeID, entry.BaseRevision, entry.StorageType,
 		entry.StorageRef, entry.StorageRefHash, nilBytes(entry.ContentBlob), nullStr(entry.ContentType),
@@ -403,7 +411,32 @@ SELECT layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind,
 	storage_type, storage_ref, storage_ref_hash, content_blob, content_type, content_text, checksum_sha256,
 	size_bytes, mode, entry_seq, created_at, updated_at
 FROM fs_layer_entries
-WHERE layer_id = ? AND path_hash = ? AND path = ?`, layerID, fsLayerPathHash(canonical), canonical)
+WHERE layer_id = ? AND path_hash = ? AND path = ?
+ORDER BY entry_seq DESC
+LIMIT 1`, layerID, fsLayerPathHash(canonical), canonical)
+	return scanFSLayerEntry(row)
+}
+
+func (s *Store) GetFSLayerEntryAtSeq(ctx context.Context, layerID, path string, maxSeq int64) (*FSLayerEntry, error) {
+	layerID = strings.TrimSpace(layerID)
+	if layerID == "" {
+		return nil, fmt.Errorf("fs layer id is required")
+	}
+	if maxSeq < 0 {
+		return nil, fmt.Errorf("fs layer max seq must be non-negative")
+	}
+	canonical, err := canonicalFSLayerLookupPath(path)
+	if err != nil {
+		return nil, err
+	}
+	row := s.db.QueryRowContext(ctx, `
+SELECT layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind, base_inode_id, base_revision,
+	storage_type, storage_ref, storage_ref_hash, content_blob, content_type, content_text, checksum_sha256,
+	size_bytes, mode, entry_seq, created_at, updated_at
+FROM fs_layer_entries
+WHERE layer_id = ? AND path_hash = ? AND path = ? AND entry_seq <= ?
+ORDER BY entry_seq DESC
+LIMIT 1`, layerID, fsLayerPathHash(canonical), canonical, maxSeq)
 	return scanFSLayerEntry(row)
 }
 
@@ -412,13 +445,42 @@ func (s *Store) ListFSLayerEntries(ctx context.Context, layerID string) ([]FSLay
 	if layerID == "" {
 		return nil, fmt.Errorf("fs layer id is required")
 	}
-	rows, err := s.db.QueryContext(ctx, `
-SELECT layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind, base_inode_id, base_revision,
-	storage_type, storage_ref, storage_ref_hash, content_blob, content_type, content_text, checksum_sha256,
-	size_bytes, mode, entry_seq, created_at, updated_at
-FROM fs_layer_entries
-WHERE layer_id = ?
-ORDER BY entry_seq, path`, layerID)
+	return s.listFSLayerEntriesLatest(ctx, layerID, nil)
+}
+
+func (s *Store) ListFSLayerEntriesAtSeq(ctx context.Context, layerID string, maxSeq int64) ([]FSLayerEntry, error) {
+	if maxSeq < 0 {
+		return nil, fmt.Errorf("fs layer max seq must be non-negative")
+	}
+	return s.listFSLayerEntriesLatest(ctx, layerID, &maxSeq)
+}
+
+func (s *Store) listFSLayerEntriesLatest(ctx context.Context, layerID string, maxSeq *int64) ([]FSLayerEntry, error) {
+	layerID = strings.TrimSpace(layerID)
+	if layerID == "" {
+		return nil, fmt.Errorf("fs layer id is required")
+	}
+	where := "WHERE layer_id = ?"
+	args := []any{layerID}
+	if maxSeq != nil {
+		where += " AND entry_seq <= ?"
+		args = append(args, *maxSeq)
+	}
+	query := `
+SELECT e.layer_id, e.path, e.path_hash, e.parent_path, e.parent_path_hash, e.name, e.op, e.kind, e.base_inode_id, e.base_revision,
+	e.storage_type, e.storage_ref, e.storage_ref_hash, e.content_blob, e.content_type, e.content_text, e.checksum_sha256,
+	e.size_bytes, e.mode, e.entry_seq, e.created_at, e.updated_at
+FROM fs_layer_entries e
+JOIN (
+	SELECT path_hash, path, MAX(entry_seq) AS entry_seq
+	FROM fs_layer_entries
+	` + where + `
+	GROUP BY path_hash, path
+) latest ON latest.path_hash = e.path_hash AND latest.path = e.path AND latest.entry_seq = e.entry_seq
+WHERE e.layer_id = ?
+ORDER BY e.entry_seq, e.path`
+	args = append(args, layerID)
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list fs layer entries: %w", err)
 	}
@@ -690,7 +752,7 @@ func normalizeFSLayerEntry(entry *FSLayerEntry) error {
 
 func validateFSLayerState(state FSLayerState) error {
 	switch state {
-	case FSLayerStateActive, FSLayerStateSealed, FSLayerStateCommitted, FSLayerStateAbandoned, FSLayerStateConflicted:
+	case FSLayerStateActive, FSLayerStateSealed, FSLayerStateCommitting, FSLayerStateCommitted, FSLayerStateAbandoned, FSLayerStateConflicted:
 		return nil
 	default:
 		return fmt.Errorf("invalid fs layer state %q", state)

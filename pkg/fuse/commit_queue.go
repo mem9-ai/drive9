@@ -17,6 +17,8 @@ import (
 
 var errCommitPostUpload = errors.New("commit post-upload step failed")
 
+const maxInlineLayerEntryBytes = 96 << 20
+
 // directPutThreshold returns the size limit below which commit queue workers
 // use direct PUT (WriteCtxConditionalWithRevision) instead of multipart
 // upload. Must match the server's inline_threshold — the server rejects
@@ -735,9 +737,15 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 }
 
 func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string, expectedRevision int64) (int64, error) {
+	if entry.Size > maxInlineLayerEntryBytes {
+		return 0, fmt.Errorf("layer entry %s is %d bytes; inline layer uploads are limited to %d bytes", entry.Path, entry.Size, maxInlineLayerEntryBytes)
+	}
 	data, err := cq.shadows.ReadAll(entry.Path)
 	if err != nil {
 		return 0, fmt.Errorf("read shadow: %w", err)
+	}
+	if int64(len(data)) > maxInlineLayerEntryBytes {
+		return 0, fmt.Errorf("layer entry %s is %d bytes; inline layer uploads are limited to %d bytes", entry.Path, len(data), maxInlineLayerEntryBytes)
 	}
 	req := client.FSLayerEntryRequest{
 		Path:         apiPath,
@@ -856,8 +864,11 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) e
 		cq.OnSuccess(entry, committedRev)
 	}
 
-	// Clean up shadow and pending index.
-	if cq.shadows != nil {
+	// Clean up shadow and pending index. Layer mounts intentionally retain
+	// both until the layer is committed or rolled back: pendingIndex remains
+	// the local metadata source, and shadowStore remains the local data source
+	// for large files that are not admitted to readCache.
+	if cq.shadows != nil && cq.layerRefSnapshot() == "" {
 		cq.shadows.Remove(entry.Path)
 	}
 	if cq.index != nil && cq.layerRefSnapshot() == "" {

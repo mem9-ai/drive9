@@ -54,7 +54,7 @@ func FSLayerTiDBSchemaStatements() []string {
 			entry_seq        BIGINT NOT NULL DEFAULT 0,
 			created_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at       DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-			PRIMARY KEY (layer_id, path_hash)
+			PRIMARY KEY (layer_id, path_hash, entry_seq)
 		)`,
 		`CREATE INDEX idx_fs_layer_entries_parent ON fs_layer_entries(layer_id, parent_path_hash)`,
 		`CREATE INDEX idx_fs_layer_entries_seq ON fs_layer_entries(layer_id, entry_seq)`,
@@ -139,7 +139,7 @@ func FSLayerDB9SchemaStatements() []string {
 			entry_seq        BIGINT NOT NULL DEFAULT 0,
 			created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			PRIMARY KEY (layer_id, path_hash)
+			PRIMARY KEY (layer_id, path_hash, entry_seq)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_fs_layer_entries_parent ON fs_layer_entries(layer_id, parent_path_hash)`,
 		`CREATE INDEX IF NOT EXISTS idx_fs_layer_entries_seq ON fs_layer_entries(layer_id, entry_seq)`,

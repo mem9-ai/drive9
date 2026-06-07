@@ -162,6 +162,39 @@ func TestFSLayerEntriesAndCheckpoint(t *testing.T) {
 	if gotLayer.DurableSeq != 2 {
 		t.Fatalf("layer durable_seq=%d, want 2", gotLayer.DurableSeq)
 	}
+	fileV2 := FSLayerEntry{
+		LayerID:     "layer-entries",
+		Path:        "/repo/tmp/a.txt",
+		Op:          FSLayerEntryOpUpsert,
+		Kind:        FSLayerEntryKindFile,
+		ContentBlob: []byte("goodbye"),
+		ContentType: "text/plain",
+		SizeBytes:   7,
+	}
+	if err := s.UpsertFSLayerEntry(ctx, &fileV2); err != nil {
+		t.Fatalf("UpsertFSLayerEntry file v2: %v", err)
+	}
+	current, err := s.GetFSLayerEntry(ctx, "layer-entries", "/repo/tmp/a.txt")
+	if err != nil {
+		t.Fatalf("GetFSLayerEntry current: %v", err)
+	}
+	if current.EntrySeq != 3 || !bytes.Equal(current.ContentBlob, []byte("goodbye")) {
+		t.Fatalf("current entry = %+v", current)
+	}
+	atCheckpoint, err := s.GetFSLayerEntryAtSeq(ctx, "layer-entries", "/repo/tmp/a.txt", gotCheckpoint.DurableSeq)
+	if err != nil {
+		t.Fatalf("GetFSLayerEntryAtSeq: %v", err)
+	}
+	if atCheckpoint.EntrySeq != 2 || !bytes.Equal(atCheckpoint.ContentBlob, []byte("hello")) {
+		t.Fatalf("checkpoint entry = %+v, want seq=2 hello", atCheckpoint)
+	}
+	checkpointEntries, err := s.ListFSLayerEntriesAtSeq(ctx, "layer-entries", gotCheckpoint.DurableSeq)
+	if err != nil {
+		t.Fatalf("ListFSLayerEntriesAtSeq: %v", err)
+	}
+	if len(checkpointEntries) != 2 || checkpointEntries[1].EntrySeq != 2 || !bytes.Equal(checkpointEntries[1].ContentBlob, []byte("hello")) {
+		t.Fatalf("checkpoint entries = %+v", checkpointEntries)
+	}
 }
 
 func TestFSLayerNotFound(t *testing.T) {

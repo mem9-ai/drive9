@@ -217,8 +217,8 @@ func TestCommitQueueLayerUploadWritesEntryAndKeepsPending(t *testing.T) {
 	if !pending.HasPending("/ok.txt") {
 		t.Fatal("pending entry should remain after successful layer upload")
 	}
-	if shadow.Has("/ok.txt") {
-		t.Fatal("shadow should be removed after successful layer upload")
+	if !shadow.Has("/ok.txt") {
+		t.Fatal("shadow should remain after successful layer upload")
 	}
 }
 
@@ -781,6 +781,78 @@ func TestCommitQueueDirectPutRouting(t *testing.T) {
 			t.Fatal("shadow should be removed after commit")
 		}
 	})
+}
+
+func TestCommitQueueLayerModeRetainsShadowAndPendingAfterUpload(t *testing.T) {
+	var gotContent []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var req struct {
+			Path    string `json:"path"`
+			Content []byte `json:"content"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		if req.Path != "/layered.bin" {
+			t.Errorf("request path = %q, want /layered.bin", req.Path)
+		}
+		gotContent = append([]byte(nil), req.Content...)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"layer_id":  "layer-1",
+			"path":      req.Path,
+			"op":        "upsert",
+			"kind":      "file",
+			"entry_seq": 1,
+		})
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("layer data")
+	if err := shadow.WriteFull("/layered.bin", data, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/layered.bin", int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.SetLayerRef("layer-1")
+	if err := cq.Enqueue(&CommitEntry{
+		Path:    "/layered.bin",
+		BaseRev: 0,
+		Size:    int64(len(data)),
+		Kind:    PendingNew,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if !bytes.Equal(gotContent, data) {
+		t.Fatalf("uploaded content = %q, want %q", gotContent, data)
+	}
+	if !shadow.Has("/layered.bin") {
+		t.Fatal("layer shadow should be retained after upload")
+	}
+	if !pending.HasPending("/layered.bin") {
+		t.Fatal("layer pending metadata should be retained after upload")
+	}
 }
 
 // --- Auto-resolve tests (LWW MVP) ---

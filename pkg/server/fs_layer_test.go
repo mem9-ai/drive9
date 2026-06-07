@@ -3,10 +3,13 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/datastore"
 )
 
 func TestFSLayerAPIFlow(t *testing.T) {
@@ -142,5 +145,77 @@ func TestFSLayerDiffMissingLayerReturnsNotFound(t *testing.T) {
 	c := client.New(ts.URL, "")
 	if _, err := c.DiffFSLayer(context.Background(), "missing"); !client.IsNotFound(err) {
 		t.Fatalf("DiffFSLayer missing err=%v, want not found", err)
+	}
+}
+
+func TestFSLayerRejectsEntryOutsideBaseRoot(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-scope",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	_, err := c.UpsertFSLayerEntry(ctx, "layer-scope", client.FSLayerEntryRequest{
+		Path:    "/other/owned.txt",
+		Op:      "upsert",
+		Kind:    "file",
+		Content: []byte("owned"),
+	})
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("UpsertFSLayerEntry outside root err=%v, want 400", err)
+	}
+}
+
+func TestFSLayerCommitRollsBackAppliedEntriesOnFailure(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-rollback-commit",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-rollback-commit", client.FSLayerEntryRequest{
+		Path:    "/repo/first.txt",
+		Op:      "upsert",
+		Kind:    "file",
+		Content: []byte("first"),
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry first: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-rollback-commit", client.FSLayerEntryRequest{
+		Path:       "/repo/second.txt",
+		Op:         "upsert",
+		Kind:       "file",
+		StorageRef: "external-not-supported",
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry second: %v", err)
+	}
+	if _, err := c.CommitFSLayer(ctx, "layer-rollback-commit"); err == nil {
+		t.Fatal("CommitFSLayer unexpectedly succeeded")
+	}
+	if _, err := s.fallback.ReadCtx(ctx, "/repo/first.txt", 0, -1); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("first entry after failed commit err=%v, want ErrNotFound", err)
+	}
+	if _, err := s.fallback.StatNodeCtx(ctx, "/repo/"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("auto-created parent after failed commit err=%v, want ErrNotFound", err)
+	}
+	layer, err := c.GetFSLayer(ctx, "layer-rollback-commit")
+	if err != nil {
+		t.Fatalf("GetFSLayer: %v", err)
+	}
+	if layer.State != "conflicted" {
+		t.Fatalf("layer state=%s, want conflicted", layer.State)
 	}
 }

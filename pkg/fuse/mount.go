@@ -257,6 +257,9 @@ func Mount(opts *MountOptions) error {
 	mountHash := ""
 	if cacheBase != "" {
 		mountHash = MountHash(opts.Server, opts.MountPoint, opts.RemoteRoot)
+		if opts.LayerRef != "" {
+			mountHash = MountLayerHash(opts.Server, opts.MountPoint, opts.RemoteRoot, opts.LayerRef, opts.CheckpointRef)
+		}
 		readCacheHash := MountReadCacheHash(opts.Server, opts.MountPoint, opts.RemoteRoot, mountCredentialKind(opts), mountCredentialSecret(opts))
 		readCacheDir := filepath.Join(cacheBase, readCacheHash, "read")
 		diskReadCache, err := NewDiskReadCache(DiskReadCacheOptions{
@@ -589,14 +592,17 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		maxSeq = checkpoint.DurableSeq
 		hasCheckpoint = true
 	}
-	entries, err := c.DiffFSLayer(ctx, opts.LayerRef)
+	var entries []client.FSLayerEntry
+	var err error
+	if hasCheckpoint {
+		entries, err = c.DiffFSLayerAtSeq(ctx, opts.LayerRef, maxSeq)
+	} else {
+		entries, err = c.DiffFSLayer(ctx, opts.LayerRef)
+	}
 	if err != nil {
 		return err
 	}
 	for _, entry := range entries {
-		if hasCheckpoint && entry.EntrySeq > maxSeq {
-			continue
-		}
 		localPath, ok := mountpath.ToLocal(opts.RemoteRoot, entry.Path)
 		if !ok {
 			continue
@@ -613,8 +619,28 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 			}
 			continue
 		case "rename":
-			if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry); err != nil {
+			if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, hasCheckpoint, maxSeq); err != nil {
 				return err
+			}
+			continue
+		case "symlink":
+			fullEntry := &entry
+			if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
+				fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, hasCheckpoint, maxSeq)
+				if err != nil {
+					return fmt.Errorf("restore fs layer symlink entry %s: %w", entry.Path, err)
+				}
+				fullEntry = fetched
+			}
+			target := strings.TrimSpace(fullEntry.ContentText)
+			if target == "" && len(fullEntry.Content) > 0 {
+				target = string(fullEntry.Content)
+			}
+			if target == "" {
+				return fmt.Errorf("restore fs layer symlink entry %s: missing target", entry.Path)
+			}
+			if fs != nil {
+				fs.markLayerSymlink(localPath, target, entry.Mode)
 			}
 			continue
 		}
@@ -624,7 +650,7 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		if _, ok := pending.GetMeta(localPath); ok {
 			continue
 		}
-		fullEntry, err := c.GetFSLayerEntry(ctx, opts.LayerRef, entry.Path)
+		fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, hasCheckpoint, maxSeq)
 		if err != nil {
 			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
 		}
@@ -642,13 +668,20 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 	return nil
 }
 
-func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry) error {
+func getLayerEntryForRestore(ctx context.Context, c *client.Client, layerID, path string, hasCheckpoint bool, maxSeq int64) (*client.FSLayerEntry, error) {
+	if hasCheckpoint {
+		return c.GetFSLayerEntryAtSeq(ctx, layerID, path, maxSeq)
+	}
+	return c.GetFSLayerEntry(ctx, layerID, path)
+}
+
+func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry, hasCheckpoint bool, maxSeq int64) error {
 	if entry == nil {
 		return nil
 	}
 	fullEntry := entry
 	if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
-		fetched, err := c.GetFSLayerEntry(ctx, opts.LayerRef, entry.Path)
+		fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, hasCheckpoint, maxSeq)
 		if err != nil {
 			return fmt.Errorf("restore fs layer rename entry %s: %w", entry.Path, err)
 		}
