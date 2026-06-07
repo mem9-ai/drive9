@@ -14,8 +14,27 @@ on:
       - "go.mod"
       - "go.sum"
       - "Makefile"
+  schedule:
+    # Daily heavy FUSE gate at 20:17 UTC / 04:17 Asia/Shanghai.
+    - cron: "17 20 * * *"
   workflow_dispatch:
     inputs:
+      run_fuse_concurrency_stress:
+        description: "Run opt-in FUSE concurrency stress workload"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+      run_fuse_sqlite_wal:
+        description: "Run opt-in FUSE SQLite WAL workload"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
       run_fuse_sqlite_churn:
         description: "Run opt-in FUSE SQLite churn workload"
         required: false
@@ -40,6 +59,14 @@ on:
         options:
           - "0"
           - "1"
+      archive_fuse_performance_metrics:
+        description: "Archive FUSE performance metrics to the Drive9 CI workspace"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
 
 permissions:
   contents: read
@@ -56,9 +83,12 @@ env:
   DRIVE9_LOCAL_EMBEDDING_MODE: app
   RUN_SEMANTIC_CHECKS: "0"
   RUN_CLI_SEMANTIC_CHECKS: "0"
-  RUN_FUSE_SQLITE_CHURN: ${{ github.event.inputs.run_fuse_sqlite_churn || '0' }}
-  RUN_FUSE_SQLITE_CONCURRENCY: ${{ github.event.inputs.run_fuse_sqlite_concurrency || '0' }}
-  RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'workflow_dispatch' && inputs.run_fuse_performance_baseline || '0' }}
+  RUN_FUSE_CONCURRENCY_STRESS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_concurrency_stress || '0') }}
+  RUN_FUSE_SQLITE_WAL: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_sqlite_wal || '0') }}
+  RUN_FUSE_SQLITE_CHURN: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_sqlite_churn || '0') }}
+  RUN_FUSE_SQLITE_CONCURRENCY: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_sqlite_concurrency || '0') }}
+  RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_performance_baseline || '0') }}
+  ARCHIVE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.archive_fuse_performance_metrics || '0') }}
   FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
 
 jobs:
@@ -181,16 +211,37 @@ jobs:
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
             echo
+            echo "FUSE concurrency stress: \`RUN_FUSE_CONCURRENCY_STRESS=${RUN_FUSE_CONCURRENCY_STRESS}\`"
+            echo "FUSE SQLite WAL: \`RUN_FUSE_SQLITE_WAL=${RUN_FUSE_SQLITE_WAL}\`"
+            echo "FUSE SQLite churn: \`RUN_FUSE_SQLITE_CHURN=${RUN_FUSE_SQLITE_CHURN}\`"
+            echo "FUSE SQLite concurrency: \`RUN_FUSE_SQLITE_CONCURRENCY=${RUN_FUSE_SQLITE_CONCURRENCY}\`"
             echo "FUSE performance baseline: \`RUN_FUSE_PERFORMANCE_BASELINE=${RUN_FUSE_PERFORMANCE_BASELINE}\`"
+            echo "Archive FUSE performance metrics: \`ARCHIVE_FUSE_PERFORMANCE_METRICS=${ARCHIVE_FUSE_PERFORMANCE_METRICS}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload FUSE performance artifacts
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.run_fuse_performance_baseline == '1'
+        if: always() && env.RUN_FUSE_PERFORMANCE_BASELINE == '1'
         uses: actions/upload-artifact@v4
         with:
           name: fuse-performance-baseline
           path: e2e-artifacts/fuse-performance
           if-no-files-found: warn
+
+      - name: Archive FUSE performance metrics to Drive9
+        if: always() && env.RUN_FUSE_PERFORMANCE_BASELINE == '1' && env.ARCHIVE_FUSE_PERFORMANCE_METRICS == '1'
+        env:
+          DRIVE9_SERVER: https://api.drive9.ai
+          DRIVE9_API_KEY: ${{ secrets.DRIVE9_ARCHIVE_API_KEY }}
+          DRIVE9_PERF_SOURCE_DIR: ${{ env.FUSE_PERF_ARTIFACT_DIR }}
+          DRIVE9_PERF_ARCHIVE_ROOT: /benchmarks/fuse-performance
+          DRIVE9_PERF_REPOSITORY: ${{ github.repository }}
+          DRIVE9_PERF_BRANCH: ${{ github.ref_name }}
+          DRIVE9_PERF_SHA: ${{ github.sha }}
+          DRIVE9_PERF_RUN_ID: ${{ github.run_id }}
+          DRIVE9_PERF_RUN_ATTEMPT: ${{ github.run_attempt }}
+          DRIVE9_PERF_WORKFLOW: ${{ github.workflow }}
+          DRIVE9_PERF_EVENT_NAME: ${{ github.event_name }}
+        run: bash scripts/archive-fuse-performance-metrics.sh
 
       - name: Dump TiDB playground logs
         if: always()

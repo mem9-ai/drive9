@@ -438,6 +438,7 @@ the layout captured by that run.
 | `FUSE_CONCURRENCY_TIMEOUT_S` | `120` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_KEEP_ARTIFACTS` | `0` | `fuse-concurrency-stress.sh` |
 | `RUN_FUSE_PERFORMANCE_BASELINE` | `0` | `fuse-release-gate.sh` |
+| `ARCHIVE_FUSE_PERFORMANCE_METRICS` | `0` (`1` in the scheduled daily heavy `local-e2e` run) | `local-e2e.yml` |
 | `FUSE_PERF_SMALL_FILES` | `64` | `fuse-performance-baseline.sh` |
 | `FUSE_PERF_SMALL_BYTES` | `1024` | `fuse-performance-baseline.sh` |
 | `FUSE_PERF_LARGE_MB` | `16` | `fuse-performance-baseline.sh` |
@@ -445,6 +446,8 @@ the layout captured by that run.
 | `FUSE_PERF_SQLITE_ROWS` | `256` | `fuse-performance-baseline.sh` |
 | `FUSE_PERF_KEEP_ARTIFACTS` | `0` | `fuse-performance-baseline.sh` |
 | `FUSE_PERF_ARTIFACT_DIR` | - | `fuse-performance-baseline.sh`, `local-e2e.yml` |
+| `DRIVE9_PERF_ARCHIVE_ROOT` | `/benchmarks/fuse-performance` | `scripts/archive-fuse-performance-metrics.sh` |
+| `DRIVE9_PERF_SOURCE_DIR` | `$FUSE_PERF_ARTIFACT_DIR` | `scripts/archive-fuse-performance-metrics.sh` |
 | `RUN_FUSE_GIT_CLONE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `FUSE_GIT_CLONE_URL` | `https://github.com/octocat/Hello-World.git` | `fuse-smoke-test.sh` |
 | `FUSE_GIT_CLONE_TIMEOUT_S` | `180` | `fuse-smoke-test.sh` |

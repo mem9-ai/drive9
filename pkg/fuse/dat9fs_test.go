@@ -1264,6 +1264,7 @@ func TestDat9FSParallelDiskReadStopsQueuedBlocksAfterFirstError(t *testing.T) {
 	if got := unexpectedQueuedReads.Load(); got != 0 {
 		t.Fatalf("queued block reads after first error = %d, want 0", got)
 	}
+}
 
 func TestDat9FSSQLitePersistentJournalBypassesDiskReadCacheKey(t *testing.T) {
 	opts := &MountOptions{}
