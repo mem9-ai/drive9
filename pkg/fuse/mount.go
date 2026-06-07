@@ -252,7 +252,7 @@ func Mount(opts *MountOptions) error {
 			dat9fs.diskReadCache = diskReadCache
 		}
 		if !opts.ReadOnly {
-			transientRoot := filepath.Join(cacheBase, mountHash, "transient")
+			transientRoot := transientOverlayRoot(cacheBase, readCacheHash)
 			if err := os.MkdirAll(transientRoot, 0o700); err != nil {
 				fmt.Fprintf(os.Stderr, "drive9: transient local overlay init failed: %v (continuing without)\n", err)
 			} else {
@@ -340,6 +340,7 @@ func Mount(opts *MountOptions) error {
 				cq.SetPerfCounters(dat9fs.perf)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
 				cq.OnCleanup = dat9fs.onCommitQueueCleanup
+				cq.PathLock = dat9fs.lockRemoteCommitPath
 				cq.RecoverPending()
 				dat9fs.commitQueue = cq
 			}
@@ -574,6 +575,18 @@ func mountCredentialSecret(opts *MountOptions) string {
 		return opts.Token
 	}
 	return opts.APIKey
+}
+
+func transientOverlayRoot(cacheBase, readCacheHash string) string {
+	return filepath.Join(cacheBase, readCacheHash, "transient", transientOverlayMountID())
+}
+
+func transientOverlayMountID() string {
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err == nil {
+		return fmt.Sprintf("%d-%s", os.Getpid(), hex.EncodeToString(suffix[:]))
+	}
+	return fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
 }
 
 func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {

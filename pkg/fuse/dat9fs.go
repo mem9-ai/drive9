@@ -465,7 +465,7 @@ func (fs *Dat9FS) localOverlayForPathWithHint(ctx context.Context, localPath str
 }
 
 func (fs *Dat9FS) usesTransientLocalOverlay(localPath string, dirHint bool) bool {
-	if fs == nil || dirHint || fs.opts == nil || fs.opts.ReadOnly || fs.transientLocalOverlay == nil {
+	if fs == nil || dirHint || fs.opts == nil || fs.opts.ReadOnly {
 		return false
 	}
 	return isSQLiteWALIndexPath(localPath)
@@ -1430,6 +1430,12 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 		}
 	}
 	return nil
+}
+
+func (fs *Dat9FS) stageShadowForQueuedCommitLocked(fh *FileHandle, durable bool) error {
+	unlockRemoteCommit := fs.lockWritableRemoteCommitPath(fh.Path)
+	defer unlockRemoteCommit()
+	return fs.stageShadowLocked(fh, durable)
 }
 
 func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
@@ -3856,6 +3862,33 @@ func (fs *Dat9FS) hasQueuedCommit(p string) bool {
 	return fs.commitQueue != nil && fs.commitQueue.HasPath(p)
 }
 
+func (fs *Dat9FS) waitQueuedRemoteCommitBeforeWrite(p string) {
+	if fs == nil || p == "" {
+		return
+	}
+	unlockRemoteCommit := fs.lockWritableRemoteCommitPath(p)
+	unlockRemoteCommit()
+}
+
+func (fs *Dat9FS) lockWritableRemoteCommitPath(p string) func() {
+	if fs == nil || p == "" {
+		return func() {}
+	}
+	for {
+		if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
+			fs.commitQueue.WaitPath(p)
+			continue
+		}
+		unlockRemoteCommit := fs.lockRemoteCommitPath(p)
+		if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
+			unlockRemoteCommit()
+			fs.commitQueue.WaitPath(p)
+			continue
+		}
+		return unlockRemoteCommit
+	}
+}
+
 func (fs *Dat9FS) syncOpenSourceForHardlink(ctx context.Context, ino uint64) gofuse.Status {
 	type candidate struct {
 		fh       *FileHandle
@@ -4144,6 +4177,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		defer cf()
 		return fs.setGitAttr(ctx, input, entry, out)
 	}
+	fs.waitQueuedRemoteCommitBeforeWrite(entry.Path)
 
 	metadataChanged := false
 
@@ -5018,6 +5052,12 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 		return pendingRenameHandled, fmt.Errorf("move pending index %s -> %s failed", oldP, newP)
 	}
 
+	unlockRemoteCommit := func() {}
+	if fs.commitQueue != nil {
+		unlockRemoteCommit = fs.lockRemoteCommitPath(newP)
+	}
+	defer unlockRemoteCommit()
+
 	fs.finishLocalRename(input, oldP, newP)
 
 	if fs.commitQueue != nil {
@@ -5036,12 +5076,12 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 			// Git treats a successful tmp_obj_* -> <sha> rename as making the
 			// object database complete. Do not acknowledge that rename while the
 			// content-addressed object is only queued for best-effort upload.
-			if commitErr := fs.commitQueue.CommitNow(ctx, entry); commitErr != nil {
+			if commitErr := fs.commitQueue.commitNowPathLocked(ctx, entry); commitErr != nil {
 				return pendingRenameHandled, fmt.Errorf("sync commit git loose object rename %s: %w", newP, commitErr)
 			}
 		} else if err := fs.commitQueue.Enqueue(entry); err != nil {
 			log.Printf("rename: enqueue pending-new commit for %s failed, falling back to sync commit: %v", newP, err)
-			if commitErr := fs.commitQueue.CommitNow(ctx, entry); commitErr != nil {
+			if commitErr := fs.commitQueue.commitNowPathLocked(ctx, entry); commitErr != nil {
 				return pendingRenameHandled, fmt.Errorf("sync commit pending-new rename %s: %w", newP, commitErr)
 			}
 		}
@@ -5830,6 +5870,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
 		return gofuse.OK
 	}
+	fs.waitQueuedRemoteCommitBeforeWrite(childP)
 
 	ino := fs.inodes.Lookup(childP, false, 0, time.Now())
 	fs.inodes.UpdateMode(ino, mode)
@@ -5972,6 +6013,7 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if fs.opts.ReadOnly {
 			return gofuse.EROFS
 		}
+		fs.waitQueuedRemoteCommitBeforeWrite(p)
 
 		fh.Dirty = fs.newWriteBuffer(p, maxPreloadSize, 0)
 
@@ -6749,6 +6791,9 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, fh.Path)
+	if localFileHandleOpenedWritable(fh) {
+		fs.waitQueuedRemoteCommitBeforeWrite(fh.Path)
+	}
 
 	lockStart := time.Now()
 	fh.Lock()
@@ -6834,7 +6879,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			return 0, gofuse.Status(syscall.ENOSPC)
 		}
 		shadowStart := time.Now()
-		if _, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev); err != nil {
+		unlockRemoteCommit := fs.lockWritableRemoteCommitPath(fh.Path)
+		_, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev)
+		unlockRemoteCommit()
+		if err != nil {
 			log.Printf("shadow write failed for ShadowSpill %s: %v", fh.Path, err)
 			source = "shadow-spill-error"
 			return 0, gofuse.EIO
@@ -6855,7 +6903,10 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	// Non-ShadowSpill: write-through to shadow after Dirty (best-effort).
 	if !fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
 		shadowStart := time.Now()
-		if _, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev); err != nil {
+		unlockRemoteCommit := fs.lockWritableRemoteCommitPath(fh.Path)
+		_, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev)
+		unlockRemoteCommit()
+		if err != nil {
 			log.Printf("shadow write-through failed for %s: %v", fh.Path, err)
 			fs.shadowStore.Remove(fh.Path)
 			fh.ShadowReady = false
@@ -7187,6 +7238,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	fs.observePathPolicyWithContext(ctx, fh.Path)
+	if localFileHandleOpenedWritable(fh) {
+		fs.waitQueuedRemoteCommitBeforeWrite(fh.Path)
+	}
 
 	start := time.Now()
 	phase := "start"
@@ -7285,7 +7339,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					phase = "small-stage-shadow"
 					stageStart := time.Now()
 					fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
-					err := fs.stageShadowLocked(fh, true)
+					err := fs.stageShadowForQueuedCommitLocked(fh, true)
 					fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
 					if err != nil {
 						log.Printf("shadow stage failed for %s: %v, falling through", fh.Path, err)
@@ -7340,7 +7394,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			size := fh.Dirty.Size()
 			stageStart := time.Now()
 			fs.debugf("flush shadowspill stage start path=%s size=%d durable=true", fh.Path, size)
-			err := fs.stageShadowLocked(fh, true)
+			err := fs.stageShadowForQueuedCommitLocked(fh, true)
 			fs.debugDurationf(stageStart, 0, "flush shadowspill stage done path=%s size=%d err=%v", fh.Path, size, err)
 			if err != nil {
 				log.Printf("flush: shadow stage failed for ShadowSpill %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
@@ -7410,7 +7464,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 				size := fh.Dirty.Size()
 				stageStart := time.Now()
 				fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
-				err := fs.stageShadowLocked(fh, true)
+				err := fs.stageShadowForQueuedCommitLocked(fh, true)
 				fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
 				if err != nil {
 					log.Printf("flush: shadow stage failed for %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
@@ -7524,7 +7578,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			// ShadowSpill: stage shadow + journal, no writeBack snapshot.
 			phase = "interactive-shadowspill-stage"
 			stageStart := time.Now()
-			err := fs.stageShadowLocked(fh, true)
+			err := fs.stageShadowForQueuedCommitLocked(fh, true)
 			fs.debugDurationf(stageStart, 0, "fsync shadowspill stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
 				fh.ShadowCommitReady = true
@@ -7542,7 +7596,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		} else {
 			phase = "interactive-stage"
 			stageStart := time.Now()
-			err := fs.stageShadowLocked(fh, true)
+			err := fs.stageShadowForQueuedCommitLocked(fh, true)
 			fs.debugDurationf(stageStart, 0, "fsync stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
 				if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
@@ -7848,6 +7902,9 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			}
 			return
 		}
+		if localFileHandleOpenedWritable(fh) {
+			fs.waitQueuedRemoteCommitBeforeWrite(fh.Path)
+		}
 
 		// Cancel any pending debounce for this path — Release always flushes immediately.
 		phase = "cancel-debounce"
@@ -7892,6 +7949,8 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			fh.DirtySeq = 0
 			fh.ShadowCommitReady = false
 			mode, hasMode := fs.modeForPendingHandle(fh)
+			expectedRevision := fs.expectedRevisionForHandleLocked(fh)
+			unlockRemoteCommit := fs.lockRemoteCommitPath(fh.Path)
 			fh.Unlock()
 
 			entry := &CommitEntry{
@@ -7919,7 +7978,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				phase = "shadowspill-sync-upload"
 				uploadStart := time.Now()
 				fs.debugf("release shadowspill upload start path=%s size=%d timeout=%s", fh.Path, size, releaseTimeout(size))
-				uploadErr := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), fs.expectedRevisionForHandleLocked(fh))
+				uploadErr := uploadFromShadowRemote(uploadCtx, fs.client, fs.shadowStore, fh.Path, fs.remotePath(fh.Path), expectedRevision)
 				var uploadBytes uint64
 				if size > 0 {
 					uploadBytes = uint64(size)
@@ -7934,6 +7993,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			} else if hasMode {
 				fs.clearPendingModeForInode(fh.Ino)
 			}
+			unlockRemoteCommit()
 
 			fs.invalidateReadCacheAndTargets(fh.Path)
 			if flushStatus == gofuse.OK {
@@ -7972,11 +8032,16 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 				fh.DirtySeq = 0
 				fh.WriteBackSeq = 0
+				useCommitQueue := fs.commitQueue != nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path)
+				var unlockRemoteCommit func()
+				if useCommitQueue {
+					unlockRemoteCommit = fs.lockRemoteCommitPath(fh.Path)
+				}
 				fh.Unlock()
 
 				// Enqueue to CommitQueue if available (P1), otherwise
 				// use the legacy uploader.
-				if fs.commitQueue != nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path) {
+				if useCommitQueue {
 					entry := &CommitEntry{
 						Path:    fh.Path,
 						Inode:   fh.Ino,
@@ -8003,6 +8068,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 						// serve stale data to Lookup/Read.
 						fs.writeBack.Remove(fh.Path)
 					}
+					unlockRemoteCommit()
 				} else {
 					// Async upload — the uploader will read from cache and upload.
 					fs.debugf("release uploader submit path=%s", fh.Path)

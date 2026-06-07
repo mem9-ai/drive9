@@ -933,6 +933,26 @@ func TestMountReadCacheHashIncludesCredential(t *testing.T) {
 	}
 }
 
+func TestTransientOverlayRootUsesCredentialScopedMountInstance(t *testing.T) {
+	cacheBase := t.TempDir()
+	readCacheHashA := MountReadCacheHash("https://example.com", "/mnt/data", "/", "api_key", "key-a")
+	readCacheHashB := MountReadCacheHash("https://example.com", "/mnt/data", "/", "api_key", "key-b")
+
+	rootA1 := transientOverlayRoot(cacheBase, readCacheHashA)
+	rootA2 := transientOverlayRoot(cacheBase, readCacheHashA)
+	rootB := transientOverlayRoot(cacheBase, readCacheHashB)
+
+	if rootA1 == rootA2 {
+		t.Fatal("transient overlay roots for separate mount instances should differ")
+	}
+	if !strings.Contains(rootA1, readCacheHashA) {
+		t.Fatalf("transient overlay root %q should include credential-scoped read-cache hash %q", rootA1, readCacheHashA)
+	}
+	if strings.Contains(rootA1, readCacheHashB) || rootA1 == rootB {
+		t.Fatal("different credentials should not share transient overlay roots")
+	}
+}
+
 // TestFlush_WriteBack_SmallFile verifies that Flush() writes to local cache
 // and returns immediately (no HTTP upload) when write-back is enabled.
 func TestFlush_WriteBack_SmallFile(t *testing.T) {

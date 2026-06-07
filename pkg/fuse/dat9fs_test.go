@@ -6024,6 +6024,59 @@ func TestSQLiteWALIndexSidecarUsesTransientLocalOverlay(t *testing.T) {
 	}
 }
 
+func TestSQLiteWALIndexSidecarFailsClosedWhenTransientOverlayMissing(t *testing.T) {
+	var remoteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		remoteCalls.Add(1)
+		http.Error(w, "remote should not be used for sqlite wal-index sidecars", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	overlay, local, st := fs.localOverlayForPath(context.Background(), "/repo/workload.db-shm")
+	if overlay != nil || !local || st != gofuse.EIO {
+		t.Fatalf("sqlite -shm missing overlay = (%p, %t, %v), want local EIO", overlay, local, st)
+	}
+	if got := remoteCalls.Load(); got != 0 {
+		t.Fatalf("remote calls = %d, want 0", got)
+	}
+}
+
+func TestWaitQueuedRemoteCommitBeforeWriteBlocksUntilQueuedCommitDone(t *testing.T) {
+	path := "/repo/data.bin"
+	entry := &CommitEntry{Path: path}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{entry},
+		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
+		inFlight:     make(map[string]*CommitEntry),
+	}
+	cq.rebuildQueuedIndexLocked()
+	fs := &Dat9FS{commitQueue: cq}
+
+	done := make(chan struct{})
+	go func() {
+		fs.waitQueuedRemoteCommitBeforeWrite(path)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("waitQueuedRemoteCommitBeforeWrite returned while commit was queued")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	cq.removeFromQueue(entry)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("waitQueuedRemoteCommitBeforeWrite did not return after queue removal")
+	}
+}
+
 func TestCodingAgentLocalOverlayFlushSkipsSyncForGeneratedPath(t *testing.T) {
 	var syncCalls atomic.Int32
 	previousSync := syncOpenLocalFile

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -71,6 +72,102 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 	}
 	if shadow.Has("/ok.txt") {
 		t.Fatal("shadow should be removed after successful commit")
+	}
+}
+
+func TestCommitQueueBeginInFlightSerializesSamePath(t *testing.T) {
+	cq := &CommitQueue{inFlight: make(map[string]*CommitEntry)}
+	first := &CommitEntry{Path: "/same.txt"}
+	second := &CommitEntry{Path: "/same.txt"}
+	other := &CommitEntry{Path: "/other.txt"}
+
+	if !cq.beginInFlight(first) {
+		t.Fatal("begin first in-flight returned false")
+	}
+	if !cq.beginInFlight(other) {
+		t.Fatal("begin other-path in-flight returned false")
+	}
+	cq.endInFlight(other)
+
+	done := make(chan struct{})
+	go func() {
+		if !cq.beginInFlight(second) {
+			t.Errorf("begin second in-flight returned false")
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("second same-path entry became in-flight before first ended")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	cq.endInFlight(first)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("second same-path entry did not become in-flight after first ended")
+	}
+	cq.endInFlight(second)
+}
+
+func TestCommitQueueCommitNowHoldsPathLockThroughSuccessCleanup(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":9}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/locked.txt", []byte("data"), 8); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/locked.txt", 4, PendingOverwrite, 8); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	locked := false
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	cq.PathLock = func(path string) func() {
+		mu.Lock()
+		if path != "/locked.txt" {
+			t.Errorf("PathLock path = %q, want /locked.txt", path)
+		}
+		locked = true
+		mu.Unlock()
+		return func() {
+			mu.Lock()
+			locked = false
+			mu.Unlock()
+		}
+	}
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !locked {
+			t.Error("PathLock was not held during OnSuccess cleanup")
+		}
+	}
+
+	if err := cq.CommitNow(context.Background(), &CommitEntry{
+		Path:    "/locked.txt",
+		BaseRev: 8,
+		Size:    4,
+		Kind:    PendingOverwrite,
+	}); err != nil {
+		t.Fatalf("CommitNow: %v", err)
 	}
 }
 
