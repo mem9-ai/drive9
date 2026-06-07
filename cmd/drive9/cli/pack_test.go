@@ -112,6 +112,89 @@ func TestPackArchiveDefaultReplacePathsRemoveMissingSiblings(t *testing.T) {
 	}
 }
 
+func TestPackRemoteArchivePreservesReplacePathsWhenDefaultRootsAllDeleted(t *testing.T) {
+	remoteRoot := "/workspace"
+	defaultArchive, err := defaultCodingAgentPackArchivePath(remoteRoot)
+	if err != nil {
+		t.Fatalf("defaultCodingAgentPackArchivePath: %v", err)
+	}
+
+	var stored []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v1/fs" + defaultArchive:
+			if len(stored) == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			_, _ = w.Write(stored)
+		case "PUT /v1/fs" + defaultArchive:
+			var err error
+			stored, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read upload body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"revision":1}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "sk-test")
+	c.SetSmallFileThresholdForTests(1 << 30)
+
+	archiveA := t.TempDir()
+	mustWriteFile(t, filepath.Join(archiveA, "overlay", "repo", ".git", "config"), []byte("git\n"), 0o644)
+	if err := packRemoteArchive(context.Background(), c, defaultArchive, packOptions{
+		LocalRoot:  archiveA,
+		RemoteRoot: remoteRoot,
+		Profile:    "coding-agent",
+	}); err != nil {
+		t.Fatalf("pack archive A: %v", err)
+	}
+
+	archiveB := t.TempDir()
+	mustWriteFile(t, filepath.Join(archiveB, "overlay", "repo", "src", "main.go"), []byte("package main\n"), 0o644)
+	if err := packRemoteArchive(context.Background(), c, defaultArchive, packOptions{
+		LocalRoot:  archiveB,
+		RemoteRoot: remoteRoot,
+		Profile:    "coding-agent",
+	}); err != nil {
+		t.Fatalf("pack archive B: %v", err)
+	}
+
+	manifest, err := readPackArchiveManifest(context.Background(), bytes.NewReader(stored))
+	if err != nil {
+		t.Fatalf("read uploaded manifest: %v", err)
+	}
+	if len(manifest.Paths) != 0 {
+		t.Fatalf("archive B paths = %v, want empty after all default roots deleted", manifest.Paths)
+	}
+	if len(manifest.Entries) != 0 {
+		t.Fatalf("archive B entries = %v, want empty after all default roots deleted", manifest.Entries)
+	}
+	wantReplacePaths := []string{"/repo/.git", "/repo/build", "/repo/dist", "/repo/target"}
+	if !reflect.DeepEqual(manifest.ReplacePaths, wantReplacePaths) {
+		t.Fatalf("archive B replace_paths = %v, want %v", manifest.ReplacePaths, wantReplacePaths)
+	}
+
+	dstLocalRoot := t.TempDir()
+	mustWriteFile(t, filepath.Join(dstLocalRoot, "overlay", "repo", ".git", "config"), []byte("stale git\n"), 0o644)
+	mustWriteFile(t, filepath.Join(dstLocalRoot, "overlay", "repo", "src", "main.go"), []byte("keep source\n"), 0o644)
+	if _, err := extractPackArchive(context.Background(), bytes.NewReader(stored), unpackOptions{
+		LocalRoot: dstLocalRoot,
+		Replace:   true,
+	}); err != nil {
+		t.Fatalf("extract archive B: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dstLocalRoot, "overlay", "repo", ".git")); !os.IsNotExist(err) {
+		t.Fatalf("stale .git still exists after replace tombstone: err=%v", err)
+	}
+	assertFileContent(t, filepath.Join(dstLocalRoot, "overlay", "repo", "src", "main.go"), "keep source\n")
+}
+
 func TestResolvePackSourcesMapsRemoteRootToLocalOverlay(t *testing.T) {
 	localRoot := t.TempDir()
 	mustWriteFile(t, filepath.Join(localRoot, "overlay", "repo", ".git", "config"), []byte("git"), 0o644)

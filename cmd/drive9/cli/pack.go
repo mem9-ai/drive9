@@ -56,12 +56,13 @@ type packManifestEntry struct {
 }
 
 type packOptions struct {
-	LocalRoot   string
-	RemoteRoot  string
-	LocalPrefix string
-	Profile     string
-	Paths       []string
-	SkipMissing bool
+	LocalRoot            string
+	RemoteRoot           string
+	LocalPrefix          string
+	Profile              string
+	Paths                []string
+	SkipMissing          bool
+	PreviousReplacePaths []string
 }
 
 type unpackOptions struct {
@@ -217,6 +218,11 @@ func packRemoteArchive(ctx context.Context, c *client.Client, archivePath string
 	if strings.HasSuffix(archivePath, "/") {
 		return fmt.Errorf("drive9 pack: remote archive path must be a file, got %q", archivePath)
 	}
+	previousReplacePaths, err := readExistingPackReplacePaths(ctx, c, archivePath, opts)
+	if err != nil {
+		return err
+	}
+	opts.PreviousReplacePaths = previousReplacePaths
 	tmp, err := os.CreateTemp("", "drive9-pack-*.tar.gz")
 	if err != nil {
 		return fmt.Errorf("create temporary pack archive: %w", err)
@@ -282,6 +288,55 @@ func unpackRemoteArchive(ctx context.Context, c *client.Client, archivePath stri
 	fmt.Fprintf(os.Stderr, "drive9: unpacked %d paths (%d entries) from :%s\n",
 		len(manifest.Paths), len(manifest.Entries), archivePath)
 	return nil
+}
+
+func readExistingPackReplacePaths(ctx context.Context, c *client.Client, archivePath string, opts packOptions) ([]string, error) {
+	if len(opts.Paths) != 0 || strings.TrimSpace(opts.Profile) != "coding-agent" {
+		return nil, nil
+	}
+	rc, err := c.ReadStream(ctx, archivePath)
+	if err != nil {
+		if client.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read existing pack archive :%s: %w", archivePath, err)
+	}
+	defer func() { _ = rc.Close() }()
+	manifest, err := readPackArchiveManifest(ctx, rc)
+	if err != nil {
+		return nil, fmt.Errorf("read existing pack manifest :%s: %w", archivePath, err)
+	}
+	return manifestReplacePaths(*manifest), nil
+}
+
+func readPackArchiveManifest(ctx context.Context, r io.Reader) (*packManifest, error) {
+	gz, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, fmt.Errorf("open pack gzip stream: %w", err)
+	}
+	defer func() { _ = gz.Close() }()
+	tr := tar.NewReader(gz)
+	hdr, err := tr.Next()
+	if errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("invalid pack archive: missing %s", packManifestEntryName)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read pack manifest entry: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if hdr.Name != packManifestEntryName {
+		return nil, fmt.Errorf("invalid pack archive: missing leading %s", packManifestEntryName)
+	}
+	var manifest packManifest
+	if err := json.NewDecoder(tr).Decode(&manifest); err != nil {
+		return nil, fmt.Errorf("decode pack manifest: %w", err)
+	}
+	if manifest.Format != packArchiveFormat {
+		return nil, fmt.Errorf("unsupported pack format %q", manifest.Format)
+	}
+	return &manifest, nil
 }
 
 func packArchiveTags(profile string) map[string]string {
@@ -679,13 +734,23 @@ func packReplacePaths(opts packOptions, paths []string) []string {
 	}
 	if len(parents) == 0 {
 		prefix, err := canonicalArchivePath(opts.LocalPrefix)
-		if err != nil || prefix == "/" {
-			return nil
+		if err == nil && prefix != "/" {
+			parents[prefix] = struct{}{}
 		}
-		parents[prefix] = struct{}{}
 	}
 	seen := map[string]struct{}{}
-	out := make([]string, 0, len(parents)*len(defaultCodingAgentPackNames))
+	out := make([]string, 0, len(opts.PreviousReplacePaths)+len(parents)*len(defaultCodingAgentPackNames))
+	for _, archivePath := range opts.PreviousReplacePaths {
+		archivePath, err := canonicalArchivePath(archivePath)
+		if err != nil || archivePath == "/" {
+			continue
+		}
+		if _, ok := seen[archivePath]; ok {
+			continue
+		}
+		seen[archivePath] = struct{}{}
+		out = append(out, archivePath)
+	}
 	for parent := range parents {
 		for _, name := range defaultCodingAgentPackNames {
 			archivePath := path.Join(parent, name)
