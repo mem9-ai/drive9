@@ -238,12 +238,12 @@ jobs:
 
       - name: Run FUSE concurrency stress
         id: fuse-concurrency-stress
-        if: env.RUN_FUSE_CONCURRENCY_STRESS == '1'
+        if: always() && env.RUN_FUSE_CONCURRENCY_STRESS == '1'
         run: bash e2e/fuse-concurrency-stress.sh
 
       - name: Run FUSE POSIX/fsx gate
         id: fuse-posix-fsx
-        if: env.RUN_FUSE_POSIX_FSX == '1'
+        if: always() && env.RUN_FUSE_POSIX_FSX == '1'
         run: bash e2e/fuse-posix-fsx-gate.sh
 
       - name: Publish local e2e summary
