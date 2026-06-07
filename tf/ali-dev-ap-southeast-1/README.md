@@ -15,7 +15,7 @@ Managed here:
 
 1. VPC, worker VSwitches, Terway pod VSwitches, and ACK security group.
 2. ACK managed Kubernetes cluster and one node pool.
-3. KMS key for Kubernetes secret encryption and drive9 object encryption.
+3. KMS key for drive9 object encryption and OSS SSE-KMS.
 4. OSS bucket with private ACL, versioning, and SSE-KMS.
 5. KMS secret policy reference for the drive9 server bootstrap secret.
 6. RRSA RAM roles and policies for the drive9 server service account and
@@ -30,6 +30,8 @@ Not managed here yet:
 3. TiDB, db9, observability, DNS, and certificate resources.
 4. Kubernetes manifests that annotate service accounts or configure External
    Secrets `SecretStore` RRSA fields.
+5. ACK Kubernetes Secret encryption. This dev environment intentionally leaves
+   ACK secret-at-rest encryption disabled.
 
 ## Local workflow
 
