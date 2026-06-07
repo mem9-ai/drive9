@@ -119,6 +119,32 @@ func TestDat9FSReleaseDropsOwnerLocks(t *testing.T) {
 	}
 }
 
+func TestDat9FSFlushDropsOwnerLocks(t *testing.T) {
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), &MountOptions{})
+	writeLock := gofuse.FileLock{Start: 0, End: 1023, Typ: uint32(syscall.F_WRLCK), Pid: 1001}
+	if st := fs.SetLk(nil, lockInput(10, 1, 1, 1001, writeLock)); st != gofuse.OK {
+		t.Fatalf("SetLk writer status = %v, want OK", st)
+	}
+
+	if st := fs.Flush(nil, &gofuse.FlushIn{
+		InHeader: gofuse.InHeader{
+			NodeId: 10,
+			Caller: gofuse.Caller{
+				Pid: 1001,
+			},
+		},
+		Fh:        1,
+		LockOwner: 1,
+	}); st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+
+	readLock := gofuse.FileLock{Start: 0, End: 1023, Typ: uint32(syscall.F_RDLCK), Pid: 1002}
+	if st := fs.SetLk(nil, lockInput(10, 2, 2, 1002, readLock)); st != gofuse.OK {
+		t.Fatalf("SetLk after flush status = %v, want OK", st)
+	}
+}
+
 func TestDat9FSFileLocksRejectInvalidType(t *testing.T) {
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), &MountOptions{})
 	lock := gofuse.FileLock{Start: 0, End: 1023, Typ: 99, Pid: 1001}

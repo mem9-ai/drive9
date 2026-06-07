@@ -609,6 +609,18 @@ func (wb *WriteBuffer) HasDirtyParts() bool {
 	return false
 }
 
+func (wb *WriteBuffer) hasDirtyPartMarks() bool {
+	if wb == nil {
+		return false
+	}
+	for _, dirty := range wb.dirtyParts {
+		if dirty {
+			return true
+		}
+	}
+	return false
+}
+
 // Bytes returns the buffer contents as a contiguous byte slice.
 // This materializes all parts into a single allocation.
 // For backward compatibility with code that reads from the buffer.

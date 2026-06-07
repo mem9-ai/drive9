@@ -66,7 +66,9 @@ func (su *StreamUploader) Started() bool {
 }
 
 // RefreshExpectedRevision updates the conditional revision used for future
-// upload initiation if streaming has not started yet.
+// upload initiation while the remote upload has not started yet. SubmitPart
+// only buffers bytes locally for a later FinishStreaming call, so pending
+// buffered parts can still safely adopt a newer same-mount committed revision.
 func (su *StreamUploader) RefreshExpectedRevision(revision int64) bool {
 	if revision < 0 {
 		return false
@@ -74,7 +76,7 @@ func (su *StreamUploader) RefreshExpectedRevision(revision int64) bool {
 
 	su.mu.Lock()
 	defer su.mu.Unlock()
-	if su.started {
+	if su.writer != nil {
 		return false
 	}
 	su.expectedRevision = revision

@@ -85,6 +85,10 @@ type CommitQueue struct {
 	// OnCleanup is called after local commit state has been removed.
 	OnCleanup CommitCleanupFunc
 
+	// PathLock serializes upload and cleanup against Dat9FS same-path shadow
+	// mutations. When unset, the queue still serializes same-path entries.
+	PathLock func(path string) func()
+
 	// workCh dispatches entries to upload workers. The buffer is always
 	// larger than maxPending so Enqueue never blocks.
 	workCh chan *CommitEntry
@@ -137,6 +141,13 @@ func (cq *CommitQueue) remotePath(localPath string) string {
 		root = cq.remoteRoot
 	}
 	return mountpath.ToRemote(root, localPath)
+}
+
+func (cq *CommitQueue) lockPath(path string) func() {
+	if cq != nil && cq.PathLock != nil {
+		return cq.PathLock(path)
+	}
+	return func() {}
 }
 
 // Enqueue adds a commit entry to the queue. Returns an error if the queue
@@ -500,20 +511,68 @@ func (cq *CommitQueue) worker() {
 			continue
 		}
 
-		// Mark as in-flight so WaitPath blocks until cleanup finishes.
-		cq.mu.Lock()
-		cq.inFlight[entry.Path] = entry
-		cq.mu.Unlock()
+		// Mark as in-flight so WaitPath blocks until cleanup finishes. Entries
+		// for the same path must not upload concurrently because uploadEntry
+		// reads the mutable per-path shadow.
+		if !cq.beginInFlight(entry) {
+			cq.removeFromQueue(entry)
+			log.Printf("commit queue: entry for %s was canceled before in-flight", entry.Path)
+			continue
+		}
 
 		cq.commitOne(entry)
 
 		// Clear in-flight after all cleanup is done.
+		cq.endInFlight(entry)
+	}
+}
+
+func (cq *CommitQueue) beginInFlight(entry *CommitEntry) bool {
+	if cq == nil || entry == nil {
+		return false
+	}
+	for {
 		cq.mu.Lock()
-		if cq.inFlight[entry.Path] == entry {
-			delete(cq.inFlight, entry.Path)
+		if entry.canceled {
+			cq.mu.Unlock()
+			return false
+		}
+		if cq.inFlight == nil {
+			cq.inFlight = make(map[string]*CommitEntry)
+		}
+		oldest := cq.oldestQueuedForPathLocked(entry.Path)
+		if cq.inFlight[entry.Path] == nil && (oldest == nil || oldest == entry) {
+			cq.inFlight[entry.Path] = entry
+			cq.mu.Unlock()
+			return true
 		}
 		cq.mu.Unlock()
+		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+func (cq *CommitQueue) oldestQueuedForPathLocked(path string) *CommitEntry {
+	if cq == nil || path == "" {
+		return nil
+	}
+	for _, queued := range cq.queue {
+		if queued == nil || queued.Path != path || queued.canceled {
+			continue
+		}
+		return queued
+	}
+	return nil
+}
+
+func (cq *CommitQueue) endInFlight(entry *CommitEntry) {
+	if cq == nil || entry == nil {
+		return
+	}
+	cq.mu.Lock()
+	if cq.inFlight[entry.Path] == entry {
+		delete(cq.inFlight, entry.Path)
+	}
+	cq.mu.Unlock()
 }
 
 // commitOne uploads a single entry to the server with exponential backoff.
@@ -581,6 +640,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		entry.cancelUpload = cancel
 		cq.mu.Unlock()
 
+		unlockPath := cq.lockPath(entry.Path)
 		committedRev, err := cq.uploadEntry(ctx, entry)
 		cq.mu.Lock()
 		entry.cancelUpload = nil
@@ -589,14 +649,17 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 
 		if err == nil {
 			if err := cq.onCommitSuccess(entry, committedRev); err == nil {
+				unlockPath()
 				return
 			} else {
+				unlockPath()
 				log.Printf("commit queue: post-upload attempt %d/%d failed for %s: %v", attempt+1, maxRetries, entry.Path, err)
 				cq.onCommitPostUploadFailure(entry, err)
 				return
 			}
 		}
 		if cq.isEntryCanceled(entry) {
+			unlockPath()
 			cq.removeFromQueue(entry)
 			log.Printf("commit queue: entry for %s was canceled during upload", entry.Path)
 			return
@@ -604,8 +667,10 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		if errors.Is(err, client.ErrConflict) {
 			log.Printf("commit queue: conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
 			cq.tryAutoResolveConflict(entry)
+			unlockPath()
 			return
 		}
+		unlockPath()
 		lastErr = err
 		log.Printf("commit queue: upload attempt %d/%d failed for %s: %v", attempt+1, maxRetries, entry.Path, err)
 	}
@@ -633,6 +698,12 @@ func sleepWithCancel(ctx context.Context, delay time.Duration) bool {
 // by workers. It is used as a fallback when the async queue rejects an entry
 // after local state has already moved to the final path.
 func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error {
+	unlockPath := cq.lockPath(entry.Path)
+	defer unlockPath()
+	return cq.commitNowPathLocked(ctx, entry)
+}
+
+func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEntry) error {
 	committedRev, err := cq.uploadEntry(ctx, entry)
 	if err != nil {
 		if cq.perf != nil {
@@ -650,8 +721,9 @@ func (cq *CommitQueue) CommitNow(ctx context.Context, entry *CommitEntry) error 
 }
 
 // uploadEntry uploads entry data to the server. Returns (committedRev, error).
-// committedRev > 0 when direct PUT is used (server returns revision inline);
-// committedRev == 0 for multipart uploads or ShadowSpill streams.
+// committedRev > 0 only when the server-returned revision is available
+// (direct PUT). Multipart/streaming uploads return 0 because the current
+// complete response does not expose the exact committed revision.
 func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int64, error) {
 	if cq.shadows == nil {
 		return 0, fmt.Errorf("no shadow store")
