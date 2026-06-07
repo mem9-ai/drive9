@@ -5385,6 +5385,8 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	}
 	if oldEntryOK {
 		fs.dirCache.Upsert(newParent, cachedInfoFromEntry(path.Base(newP), oldEntry))
+	} else {
+		fs.dirCache.Invalidate(newParent)
 	}
 	fs.retargetOpenHandlesForRename(oldP, newP)
 	fs.notifyRenameTarget(input.Newdir, path.Base(newP), newP)
@@ -7964,6 +7966,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 				fs.pendingIndex.Remove(fh.Path)
 			}
 		}
+		fs.inodes.UpdateSize(fh.Ino, size)
 		return gofuse.OK
 	}
 
@@ -7971,6 +7974,12 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if fs.writeBack != nil && fs.uploader != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq {
 		// Snapshot matches current dirty state — safe to upload.
 		phase = "writeback-upload-sync"
+		size := int64(0)
+		if fh.Dirty != nil {
+			size = fh.Dirty.Size()
+		} else if meta, ok := fs.writeBack.GetMeta(fh.Path); ok && meta != nil {
+			size = meta.Size
+		}
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
@@ -8002,6 +8011,8 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		} else {
 			fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		}
+		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
 	} else if fs.writeBack != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq != fh.DirtySeq {
 		// Snapshot is stale — discard it so we don't upload old data.
 		phase = "writeback-stale"

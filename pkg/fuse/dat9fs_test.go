@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"reflect"
 	"sort"
 	"strconv"
@@ -12237,6 +12238,186 @@ func TestAtomicTempWriteFsyncReleaseRenamePreservesMultipartBody(t *testing.T) {
 	}
 	if !bytes.Equal(gotRead, data) {
 		t.Fatalf("final mounted read sha=%x size=%d, want sha=%x size=%d", sha256.Sum256(gotRead), len(gotRead), sha256.Sum256(data), len(data))
+	}
+}
+
+func TestFsyncStrictShadowSpillRefreshesStaleInodeSize(t *testing.T) {
+	filePath := "/work/final/w0/file-000.txt.tmp.123.456"
+	data := bytes.Repeat([]byte("drive9-concurrency-final-000\n"), 128)
+
+	type uploadState struct {
+		path string
+		size int64
+		body []byte
+	}
+	var (
+		mu           sync.Mutex
+		uploads      = make(map[string]*uploadState)
+		nextUploadID int
+	)
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path      string `json:"path"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.Path != filePath {
+				t.Errorf("initiate path = %q, want %q", req.Path, filePath)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			nextUploadID++
+			uploadID := fmt.Sprintf("upload-%d", nextUploadID)
+			uploads[uploadID] = &uploadState{path: req.Path, size: req.TotalSize}
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   uploadID,
+				"key":         "object-key",
+				"part_size":   req.TotalSize,
+				"total_parts": 1,
+			})
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/presign-batch"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/presign-batch")
+			mu.Lock()
+			state := uploads[uploadID]
+			mu.Unlock()
+			if state == nil {
+				t.Errorf("presign unknown upload_id %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/" + uploadID + "/1",
+					"size":   state.size,
+				}},
+			})
+			return
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/"):
+			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/s3/"), "/")
+			if len(parts) != 2 {
+				t.Errorf("bad s3 path %q", r.URL.Path)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			state := uploads[parts[0]]
+			if state == nil {
+				t.Errorf("put unknown upload_id %q", parts[0])
+			} else {
+				state.body = append([]byte(nil), body...)
+			}
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/complete"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/complete")
+			mu.Lock()
+			state := uploads[uploadID]
+			if state == nil || !bytes.Equal(state.body, data) {
+				mu.Unlock()
+				t.Errorf("complete body mismatch for %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+			return
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	parentIno := fs.inodes.Lookup("/work/final/w0", true, 0, time.Now())
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: parentIno},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC),
+		Mode:     defaultRegularFileMode,
+	}, "file-000.txt.tmp.123.456", &createOut); st != gofuse.OK {
+		t.Fatalf("Create temp: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write temp: %v", st)
+	}
+
+	fs.inodes.UpdateSize(createOut.NodeId, 0)
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync temp: %v", st)
+	}
+	entry, ok := fs.inodes.GetEntry(createOut.NodeId)
+	if !ok {
+		t.Fatal("temp inode entry missing after fsync")
+	}
+	if entry.Size != int64(len(data)) {
+		t.Fatalf("temp inode size after fsync = %d, want %d", entry.Size, len(data))
+	}
+}
+
+func TestFinishLocalRenameInvalidatesTargetParentWhenSourceInodeGone(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	parentPath := "/work/final/w0"
+	oldP := parentPath + "/file-000.txt.tmp.123.456"
+	newP := parentPath + "/file-000.txt"
+	parentIno := fs.inodes.Lookup(parentPath, true, 0, time.Now())
+	fs.dirCache.Put(parentPath, []CachedFileInfo{{
+		Name:  path.Base(newP),
+		Size:  0,
+		IsDir: false,
+		Mtime: time.Now(),
+	}})
+
+	fs.finishLocalRename(&gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: parentIno},
+		Newdir:   parentIno,
+	}, oldP, newP)
+
+	if cached := fs.dirCache.Lookup(parentPath, path.Base(newP)); cached.kind == namespaceLookupPositive {
+		t.Fatalf("target parent cache kept stale positive entry after source inode was gone: %+v", cached.item)
 	}
 }
 
