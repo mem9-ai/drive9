@@ -463,15 +463,17 @@ def large_file_read(path, want_hash):
     return os.path.getsize(path)
 
 
-def sqlite_workload(db_path):
+def sqlite_workload(db_path, requested_journal_mode, label):
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=30.0)
     conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA mmap_size=0")
-    journal_mode = conn.execute("PRAGMA journal_mode=DELETE").fetchone()[0].lower()
-    if journal_mode != "delete":
-        raise AssertionError(f"sqlite journal_mode={journal_mode}")
+    journal_mode = conn.execute(f"PRAGMA journal_mode={requested_journal_mode.upper()}").fetchone()[0].lower()
+    if journal_mode != requested_journal_mode.lower():
+        raise AssertionError(f"sqlite journal_mode={journal_mode} want={requested_journal_mode.lower()}")
     conn.execute("PRAGMA synchronous=FULL")
+    if journal_mode == "wal":
+        conn.execute("PRAGMA wal_autocheckpoint=0")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS items "
         "(id INTEGER PRIMARY KEY, version INTEGER NOT NULL, payload BLOB NOT NULL, checksum TEXT NOT NULL)"
@@ -481,7 +483,7 @@ def sqlite_workload(db_path):
     insert_start = time.perf_counter()
     with conn:
         for row_id in range(1, sqlite_rows + 1):
-            payload = deterministic_bytes(f"sqlite-insert:{row_id}", 512)
+            payload = deterministic_bytes(f"{label}-insert:{row_id}", 512)
             conn.execute(
                 "INSERT INTO items(id, version, payload, checksum) VALUES (?, ?, ?, ?)",
                 (row_id, 1, payload, hashlib.sha256(payload).hexdigest()),
@@ -492,7 +494,7 @@ def sqlite_workload(db_path):
     update_start = time.perf_counter()
     with conn:
         for row_id in range(1, sqlite_rows + 1, 3):
-            payload = deterministic_bytes(f"sqlite-update:{row_id}", 512)
+            payload = deterministic_bytes(f"{label}-update:{row_id}", 512)
             conn.execute(
                 "UPDATE items SET version=?, payload=?, checksum=? WHERE id=?",
                 (2, payload, hashlib.sha256(payload).hexdigest(), row_id),
@@ -517,6 +519,18 @@ def sqlite_workload(db_path):
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
     if integrity != "ok":
         raise AssertionError(f"sqlite integrity_check={integrity}")
+    checkpoint_seconds = 0.0
+    checkpoint_result = None
+    post_checkpoint_integrity = integrity
+    if journal_mode == "wal":
+        checkpoint_start = time.perf_counter()
+        checkpoint_result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        checkpoint_seconds = time.perf_counter() - checkpoint_start
+        if checkpoint_result is None or checkpoint_result[0] != 0:
+            raise AssertionError(f"sqlite wal_checkpoint(TRUNCATE)={checkpoint_result}")
+        post_checkpoint_integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if post_checkpoint_integrity != "ok":
+            raise AssertionError(f"sqlite post-checkpoint integrity_check={post_checkpoint_integrity}")
     conn.close()
 
     return {
@@ -531,6 +545,9 @@ def sqlite_workload(db_path):
         "payload_bytes": payload_bytes,
         "fingerprint": digest.hexdigest(),
         "integrity_check": integrity,
+        "checkpoint_seconds": checkpoint_seconds,
+        "checkpoint_result": list(checkpoint_result) if checkpoint_result is not None else None,
+        "post_checkpoint_integrity_check": post_checkpoint_integrity,
     }
 
 
@@ -576,7 +593,7 @@ for read_index in range(read_passes):
 metrics["workloads"]["large_file_reads"] = large_reads
 
 sqlite_path = os.path.join(root, "sqlite", "perf.db")
-sqlite_result = sqlite_workload(sqlite_path)
+sqlite_result = sqlite_workload(sqlite_path, "delete", "sqlite-delete")
 metrics["workloads"]["sqlite_insert_transaction"] = metric(
     sqlite_result["insert_seconds"],
     rows=sqlite_result["rows"],
@@ -597,6 +614,39 @@ metrics["workloads"]["sqlite_read_aggregate"] = metric(
     },
 )
 metrics["correctness"]["sqlite_fingerprint"] = sqlite_result["fingerprint"]
+
+sqlite_wal_path = os.path.join(root, "sqlite-wal", "perf.db")
+sqlite_wal_result = sqlite_workload(sqlite_wal_path, "wal", "sqlite-wal")
+metrics["workloads"]["sqlite_wal_insert_transaction"] = metric(
+    sqlite_wal_result["insert_seconds"],
+    rows=sqlite_wal_result["rows"],
+)
+metrics["workloads"]["sqlite_wal_update_transaction"] = metric(
+    sqlite_wal_result["update_seconds"],
+    rows=sqlite_wal_result["update_rows"],
+)
+metrics["workloads"]["sqlite_wal_read_aggregate"] = metric(
+    sqlite_wal_result["read_seconds"],
+    bytes_count=sqlite_wal_result["payload_bytes"],
+    rows=sqlite_wal_result["rows"],
+    extra={
+        "journal_mode": sqlite_wal_result["journal_mode"],
+        "max_version": sqlite_wal_result["max_version"],
+        "payload_verified_rows": sqlite_wal_result["payload_verified_rows"],
+        "integrity_check": sqlite_wal_result["integrity_check"],
+    },
+)
+metrics["workloads"]["sqlite_wal_checkpoint_truncate"] = metric(
+    sqlite_wal_result["checkpoint_seconds"],
+    rows=sqlite_wal_result["rows"],
+    extra={
+        "checkpoint_busy": sqlite_wal_result["checkpoint_result"][0],
+        "checkpoint_log_frames": sqlite_wal_result["checkpoint_result"][1],
+        "checkpointed_frames": sqlite_wal_result["checkpoint_result"][2],
+        "integrity_check": sqlite_wal_result["post_checkpoint_integrity_check"],
+    },
+)
+metrics["correctness"]["sqlite_wal_fingerprint"] = sqlite_wal_result["fingerprint"]
 
 with open(metrics_path, "w", encoding="utf-8") as handle:
     json.dump(metrics, handle, indent=2, sort_keys=True)
@@ -741,6 +791,9 @@ if is_mounted "$MOUNT_POINT"; then
     check_cmd "performance metrics json is valid" jq_check '.schema == "drive9-fuse-performance/v1"' "$METRICS_JSON"
     check_cmd "performance metrics include sqlite rows" jq_check --argjson rows "$FUSE_PERF_SQLITE_ROWS" '.workloads.sqlite_read_aggregate.rows == $rows' "$METRICS_JSON"
     check_cmd "performance metrics verify sqlite payload rows" jq_check --argjson rows "$FUSE_PERF_SQLITE_ROWS" '.workloads.sqlite_read_aggregate.payload_verified_rows == $rows' "$METRICS_JSON"
+    check_cmd "performance metrics include sqlite WAL rows" jq_check --argjson rows "$FUSE_PERF_SQLITE_ROWS" '.workloads.sqlite_wal_read_aggregate.rows == $rows' "$METRICS_JSON"
+    check_cmd "performance metrics verify sqlite WAL payload rows" jq_check --argjson rows "$FUSE_PERF_SQLITE_ROWS" '.workloads.sqlite_wal_read_aggregate.payload_verified_rows == $rows' "$METRICS_JSON"
+    check_cmd "performance metrics include sqlite WAL checkpoint" jq_check '.workloads.sqlite_wal_checkpoint_truncate.integrity_check == "ok" and .workloads.sqlite_wal_checkpoint_truncate.checkpoint_busy == 0' "$METRICS_JSON"
     check_cmd "performance metrics include large read passes" jq_check --argjson passes "$FUSE_PERF_READ_PASSES" '.workloads.large_file_reads | length == $passes' "$METRICS_JSON"
     echo "Performance metrics artifact: $METRICS_JSON"
     cat "$METRICS_JSON"
