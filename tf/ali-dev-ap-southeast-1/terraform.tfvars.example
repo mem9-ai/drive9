@@ -1,0 +1,43 @@
+acr_instance_id                 = "cri-example"
+alicloud_account_id             = "1234567890123456"
+alicloud_profile                = "your-aliyun-profile"
+alicloud_region                 = "ap-southeast-1"
+component                       = "drive9-server"
+oss_bucket_name                 = null
+project                         = "drive9"
+service_cidr                    = "172.20.0.0/16"
+server_namespace                = "drive9"
+server_secret_encryption_key_id = "key-example"
+server_secret_name              = "example/drive9/server"
+server_service_account_name     = "drive9-sa"
+vpc_cidr                        = "10.0.0.0/16"
+
+worker_vswitches = {
+  a = {
+    cidr_block = "10.0.0.0/20"
+    zone_index = 0
+  }
+  b = {
+    cidr_block = "10.0.16.0/20"
+    zone_index = 1
+  }
+  c = {
+    cidr_block = "10.0.32.0/20"
+    zone_index = 2
+  }
+}
+
+pod_vswitches = {
+  a = {
+    cidr_block = "10.0.64.0/20"
+    zone_index = 0
+  }
+  b = {
+    cidr_block = "10.0.80.0/20"
+    zone_index = 1
+  }
+  c = {
+    cidr_block = "10.0.96.0/20"
+    zone_index = 2
+  }
+}

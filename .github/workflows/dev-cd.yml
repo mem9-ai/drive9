@@ -23,6 +23,13 @@ env:
   ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
   AWS_ASSUME_ARN: ${{ secrets.AWS_ASSUME_ARN }}
   ECR_REPOSITORY: dat9-server
+  ALICLOUD_REGION: ap-southeast-1
+  ALICLOUD_ACK_CLUSTER_ID: c4dad0ecde1e94472a36fec0498e181ed
+  ALICLOUD_ACR_INSTANCE_ID: cri-o1k17vrutnkytn35
+  ALICLOUD_ACR_REGISTRY: 5935480747139440-registry.ap-southeast-1.cr.aliyuncs.com
+  ALICLOUD_ASSUME_ARN: acs:ram::5935480747139440:role/dev-dat9-ack-ap-southeast-1-github-deploy
+  ALICLOUD_OIDC_PROVIDER_ARN: acs:ram::5935480747139440:oidc-provider/github-actions
+  ALICLOUD_REPOSITORY: drive9/dat9-server
   EKS_CLUSTER: dev-dat9
   DEPLOY_NAMESPACE: dat9
   K8S_DEPLOYMENT: dat9-server
@@ -91,6 +98,104 @@ jobs:
             --timeout=180s
 
       - name: Rollback on failed deploy
+        if: failure()
+        run: |
+          kubectl rollout undo deployment/${{ env.K8S_DEPLOYMENT }} \
+            -n ${{ env.DEPLOY_NAMESPACE }}
+
+  deploy-ack:
+    name: Build and deploy to Alicloud ACK dev
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.deploy_ref || github.ref }}
+
+      - name: Resolve image tag
+        run: |
+          REF_NAME="${{ github.event_name == 'workflow_dispatch' && inputs.deploy_ref || github.ref_name }}"
+          REF_NAME=${REF_NAME#refs/heads/}
+          REF_NAME=${REF_NAME#refs/tags/}
+          REF_NAME=${REF_NAME//\//-}
+          REF_NAME=$(printf '%s' "$REF_NAME" | tr -c '[:alnum:]_.-' '-')
+          TAG="${REF_NAME}-$(git rev-parse --short=7 HEAD)"
+          echo "IMAGE_TAG=$TAG" >> "$GITHUB_ENV"
+
+      - name: Checkout agfs dependency
+        run: |
+          git clone --depth 1 https://github.com/c4pt0r/agfs ../agfs
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Configure Alicloud credentials
+        id: alicloud-credentials
+        uses: aliyun/configure-aliyun-credentials-action@v1.1.0
+        with:
+          role-to-assume: ${{ env.ALICLOUD_ASSUME_ARN }}
+          oidc-provider-arn: ${{ env.ALICLOUD_OIDC_PROVIDER_ARN }}
+          role-session-name: github-${{ github.run_id }}
+          role-session-expiration: 1800
+          audience: sts.aliyuncs.com
+
+      - name: Log in to ACR
+        uses: aliyun/acr-login@v1.0.6
+        with:
+          access-key-id: ${{ steps.alicloud-credentials.outputs.aliyun-access-key-id }}
+          access-key-secret: ${{ steps.alicloud-credentials.outputs.aliyun-access-key-secret }}
+          security-token: ${{ steps.alicloud-credentials.outputs.aliyun-security-token }}
+          region-id: ${{ env.ALICLOUD_REGION }}
+          instance-id: ${{ env.ALICLOUD_ACR_INSTANCE_ID }}
+          login-server: ${{ env.ALICLOUD_ACR_REGISTRY }}
+
+      - name: Build and push image
+        run: |
+          make docker-build IMAGE_REPO=${{ env.ALICLOUD_ACR_REGISTRY }}/${{ env.ALICLOUD_REPOSITORY }} IMAGE_TAG=${{ env.IMAGE_TAG }}
+          docker push ${{ env.ALICLOUD_ACR_REGISTRY }}/${{ env.ALICLOUD_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: v1.36.1
+
+      - name: Install ack-ram-tool
+        run: |
+          curl -fsSL \
+            -o /tmp/ack-ram-tool.tar.gz \
+            https://github.com/AliyunContainerService/ack-ram-tool/releases/download/v0.19.0/ack-ram-tool_0.19.0_Linux_x86_64.tar.gz
+          mkdir -p /tmp/ack-ram-tool
+          tar -xzf /tmp/ack-ram-tool.tar.gz -C /tmp/ack-ram-tool
+          sudo install -m 0755 "$(find /tmp/ack-ram-tool -type f -name ack-ram-tool | head -n 1)" /usr/local/bin/ack-ram-tool
+          ack-ram-tool version
+
+      - name: Update kubeconfig
+        run: |
+          ack-ram-tool credential-plugin get-kubeconfig \
+            --cluster-id ${{ env.ALICLOUD_ACK_CLUSTER_ID }} \
+            --mode ram-authenticator-token \
+            --region-id ${{ env.ALICLOUD_REGION }} \
+            --ignore-aliyun-cli-credentials \
+            > "$RUNNER_TEMP/ack-kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/ack-kubeconfig" >> "$GITHUB_ENV"
+
+      - name: Deploy to ACK
+        run: |
+          kubectl set image deployment/${{ env.K8S_DEPLOYMENT }} \
+            ${{ env.K8S_DEPLOYMENT }}=${{ env.ALICLOUD_ACR_REGISTRY }}/${{ env.ALICLOUD_REPOSITORY }}:${{ env.IMAGE_TAG }} \
+            -n ${{ env.DEPLOY_NAMESPACE }}
+          kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT }} \
+            -n ${{ env.DEPLOY_NAMESPACE }} \
+            --timeout=180s
+
+      - name: Rollback ACK on failed deploy
         if: failure()
         run: |
           kubectl rollout undo deployment/${{ env.K8S_DEPLOYMENT }} \
