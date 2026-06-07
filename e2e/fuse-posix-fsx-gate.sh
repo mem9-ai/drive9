@@ -283,6 +283,44 @@ random_state = random.Random(seed)
 model = bytearray()
 primary = os.path.join(root, "fsx", "work.bin")
 alternate = os.path.join(root, "fsx", "work-renamed.bin")
+current_op = {"index": "setup", "type": "initialize"}
+failure_reported = False
+
+
+def set_op(index, op_type, **fields):
+    current_op.clear()
+    current_op.update({"index": index, "type": op_type})
+    current_op.update(fields)
+
+
+def first_mismatch(got, want):
+    for index, (got_byte, want_byte) in enumerate(zip(got, want)):
+        if got_byte != want_byte:
+            return index, got_byte, want_byte
+    if len(got) != len(want):
+        index = min(len(got), len(want))
+        got_byte = got[index] if index < len(got) else None
+        want_byte = want[index] if index < len(want) else None
+        return index, got_byte, want_byte
+    return None, None, None
+
+
+def report_failure(reason, **fields):
+    global failure_reported
+    failure_reported = True
+    details = {
+        "reason": reason,
+        "seed": seed,
+        "model_size": len(model),
+        "op": dict(current_op),
+    }
+    details.update(fields)
+    print("fsx failure:", json.dumps(details, sort_keys=True), file=sys.stderr)
+
+
+def fail(reason, **fields):
+    report_failure(reason, **fields)
+    raise AssertionError(reason)
 
 
 def deterministic_bytes(label, size):
@@ -333,7 +371,20 @@ def read_verify(path, offset, size):
         got = handle.read(size)
     want = bytes(model[offset:offset + size])
     if got != want:
-        raise AssertionError(f"read mismatch offset={offset} size={size} got={len(got)} want={len(want)}")
+        mismatch_offset, got_byte, want_byte = first_mismatch(got, want)
+        fail(
+            "read mismatch",
+            path=os.path.relpath(path, root),
+            offset=offset,
+            requested_size=size,
+            got_len=len(got),
+            want_len=len(want),
+            got_sha256=hashlib.sha256(got).hexdigest(),
+            want_sha256=hashlib.sha256(want).hexdigest(),
+            first_mismatch_offset=mismatch_offset,
+            got_byte=got_byte,
+            want_byte=want_byte,
+        )
 
 
 def atomic_replace(path, data):
@@ -348,16 +399,28 @@ def atomic_replace(path, data):
 
 
 def verify_unlink_open():
+    set_op("unlink-open", "unlink_open", size=4096)
     path = os.path.join(root, "fsx", "unlink-open.bin")
     data = deterministic_bytes("unlink-open", 4096)
     atomic_replace(path, data)
     with open(path, "rb") as handle:
         os.unlink(path)
         if os.path.exists(path):
-            raise AssertionError("unlink-open path still exists")
+            fail("unlink-open path still exists", path=os.path.relpath(path, root))
         got = handle.read()
     if got != data:
-        raise AssertionError("unlink-open handle did not retain original bytes")
+        mismatch_offset, got_byte, want_byte = first_mismatch(got, data)
+        fail(
+            "unlink-open handle did not retain original bytes",
+            path=os.path.relpath(path, root),
+            got_len=len(got),
+            want_len=len(data),
+            got_sha256=hashlib.sha256(got).hexdigest(),
+            want_sha256=hashlib.sha256(data).hexdigest(),
+            first_mismatch_offset=mismatch_offset,
+            got_byte=got_byte,
+            want_byte=want_byte,
+        )
     fsync_parent(path)
 
 
@@ -370,7 +433,18 @@ def verify_rename_replace(path):
         fsync_parent(path)
         got = handle.read()
     if got != replacement:
-        raise AssertionError("open source handle changed after rename replace")
+        mismatch_offset, got_byte, want_byte = first_mismatch(got, replacement)
+        fail(
+            "open source handle changed after rename replace",
+            path=os.path.relpath(path, root),
+            got_len=len(got),
+            want_len=len(replacement),
+            got_sha256=hashlib.sha256(got).hexdigest(),
+            want_sha256=hashlib.sha256(replacement).hexdigest(),
+            first_mismatch_offset=mismatch_offset,
+            got_byte=got_byte,
+            want_byte=want_byte,
+        )
     model[:] = replacement
 
 
@@ -383,31 +457,44 @@ for index in range(ops):
         raise TimeoutError(f"fsx workload exceeded {timeout_s}s")
     choice = random_state.randrange(100)
     current = primary
-    if choice < 48:
-        length = random_state.randint(1, min(max_bytes, 16384))
-        offset = random_state.randint(0, max(0, max_bytes - length))
-        data = deterministic_bytes(f"write:{index}:{offset}:{length}", length)
-        write_model(current, offset, data)
-    elif choice < 68:
-        new_size = random_state.randint(0, max_bytes)
-        truncate_model(current, new_size)
-    elif choice < 86:
-        if len(model) == 0:
-            read_verify(current, 0, 1)
+    try:
+        if choice < 48:
+            length = random_state.randint(1, min(max_bytes, 16384))
+            offset = random_state.randint(0, max(0, max_bytes - length))
+            set_op(index, "write", offset=offset, size=length, before_size=len(model))
+            data = deterministic_bytes(f"write:{index}:{offset}:{length}", length)
+            write_model(current, offset, data)
+        elif choice < 68:
+            new_size = random_state.randint(0, max_bytes)
+            set_op(index, "truncate", size=new_size, before_size=len(model))
+            truncate_model(current, new_size)
+        elif choice < 86:
+            if len(model) == 0:
+                set_op(index, "read", offset=0, size=1, before_size=0)
+                read_verify(current, 0, 1)
+            else:
+                offset = random_state.randint(0, len(model))
+                length = random_state.randint(0, min(16384, max(0, len(model) - offset)))
+                set_op(index, "read", offset=offset, size=length, before_size=len(model))
+                read_verify(current, offset, length)
+        elif choice < 94:
+            set_op(index, "rename_roundtrip", before_size=len(model))
+            os.replace(primary, alternate)
+            fsync_parent(alternate)
+            os.replace(alternate, primary)
+            fsync_parent(primary)
+            set_op(index, "rename_roundtrip_read", offset=0, size=len(model), before_size=len(model))
+            read_verify(primary, 0, len(model))
         else:
-            offset = random_state.randint(0, len(model))
-            length = random_state.randint(0, min(16384, max(0, len(model) - offset)))
-            read_verify(current, offset, length)
-    elif choice < 94:
-        os.replace(primary, alternate)
-        fsync_parent(alternate)
-        os.replace(alternate, primary)
-        fsync_parent(primary)
-        read_verify(primary, 0, len(model))
-    else:
-        verify_rename_replace(primary)
+            set_op(index, "rename_replace", replacement_size=min(max_bytes, 8192), before_size=len(model))
+            verify_rename_replace(primary)
+    except Exception as exc:
+        if not failure_reported:
+            report_failure("operation failed", exception=repr(exc))
+        raise
 
 verify_unlink_open()
+set_op("final", "final_read", offset=0, size=len(model), before_size=len(model))
 read_verify(primary, 0, len(model))
 expected = {
     "fsx/work.bin": {

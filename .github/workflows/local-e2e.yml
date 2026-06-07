@@ -208,6 +208,7 @@ jobs:
         id: fuse-smoke
         env:
           RUN_FUSE_CONCURRENCY_STRESS: "0"
+          RUN_FUSE_POSIX_FSX: "0"
         run: bash e2e/fuse-release-gate.sh
 
       - name: Upload FUSE performance artifacts

@@ -26,12 +26,12 @@ if [ "$RUN_FUSE_SQLITE_CORRECTNESS" = "1" ]; then
   fi
   bash "$SCRIPT_DIR/fuse-sqlite-correctness.sh"
 fi
+if [ "$RUN_FUSE_PERFORMANCE_BASELINE" = "1" ]; then
+  bash "$SCRIPT_DIR/fuse-performance-baseline.sh"
+fi
 if [ "$RUN_FUSE_CONCURRENCY_STRESS" = "1" ]; then
   bash "$SCRIPT_DIR/fuse-concurrency-stress.sh"
 fi
 if [ "$RUN_FUSE_POSIX_FSX" = "1" ]; then
   bash "$SCRIPT_DIR/fuse-posix-fsx-gate.sh"
-fi
-if [ "$RUN_FUSE_PERFORMANCE_BASELINE" = "1" ]; then
-  bash "$SCRIPT_DIR/fuse-performance-baseline.sh"
 fi
