@@ -3,6 +3,7 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -286,6 +287,130 @@ func TestUnknownInlineThresholdNonEmptyHandleUploadUsesMultipart(t *testing.T) {
 				t.Fatalf("uploaded bytes = %d, want %d", uploadedBytes, len(data))
 			}
 		})
+	}
+}
+
+func TestFlushHandlePatchAfterLazyTruncatePreservesRemotePrefix(t *testing.T) {
+	const (
+		filePath = "/patch-truncate.bin"
+		origSize = 300_000
+		newSize  = 202_324
+		baseRev  = 7
+	)
+
+	remote := make([]byte, origSize)
+	for i := range remote {
+		remote[i] = byte((i*31)%251 + 1)
+	}
+
+	var (
+		mu          sync.Mutex
+		patchCalls  atomic.Int32
+		uploadCalls atomic.Int32
+		uploaded    []byte
+	)
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			_, _ = w.Write(remote)
+			return
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs"+filePath:
+			patchCalls.Add(1)
+			var req struct {
+				NewSize          int64 `json:"new_size"`
+				DirtyParts       []int `json:"dirty_parts"`
+				PartSize         int64 `json:"part_size"`
+				ExpectedRevision int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode patch request: %v", err)
+			}
+			if req.NewSize != newSize {
+				t.Fatalf("patch new_size = %d, want %d", req.NewSize, newSize)
+			}
+			if !reflect.DeepEqual(req.DirtyParts, []int{1}) {
+				t.Fatalf("patch dirty_parts = %v, want [1]", req.DirtyParts)
+			}
+			if req.PartSize != DefaultPartSize {
+				t.Fatalf("patch part_size = %d, want %d", req.PartSize, DefaultPartSize)
+			}
+			if req.ExpectedRevision != baseRev {
+				t.Fatalf("patch expected_revision = %d, want %d", req.ExpectedRevision, baseRev)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id": "patch-upload-1",
+				"part_size": int64(DefaultPartSize),
+				"upload_parts": []map[string]any{
+					{
+						"number": 1,
+						"url":    ts.URL + "/s3/patch-upload-1/1",
+						"size":   int64(newSize),
+					},
+				},
+				"copied_parts": []int{},
+			})
+			return
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/patch-upload-1/1":
+			uploadCalls.Add(1)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read patch upload: %v", err)
+			}
+			mu.Lock()
+			uploaded = append(uploaded[:0], body...)
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/patch-upload-1/complete":
+			w.WriteHeader(http.StatusOK)
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, origSize, time.Now())
+	fs.inodes.UpdateRevision(ino, baseRev)
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: origSize,
+		BaseRev:  baseRev,
+	}
+	fs.rebindCleanWriteBufferToRemoteLocked(fh, origSize)
+
+	fh.Lock()
+	if err := fs.truncateWritableHandleLocked(fh, newSize); err != nil {
+		fh.Unlock()
+		t.Fatalf("truncateWritableHandleLocked: %v", err)
+	}
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if got := patchCalls.Load(); got != 1 {
+		t.Fatalf("patch calls = %d, want 1", got)
+	}
+	if got := uploadCalls.Load(); got != 1 {
+		t.Fatalf("patch upload calls = %d, want 1", got)
+	}
+	mu.Lock()
+	got := append([]byte(nil), uploaded...)
+	mu.Unlock()
+	if !bytes.Equal(got, remote[:newSize]) {
+		gotHash := sha256.Sum256(got)
+		wantHash := sha256.Sum256(remote[:newSize])
+		t.Fatalf("patch upload did not preserve prefix: got_sha256=%x want_sha256=%x", gotHash, wantHash)
 	}
 }
 
