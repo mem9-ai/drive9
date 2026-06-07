@@ -44,6 +44,10 @@ type FileHandle struct {
 	PreviousMode      uint32 // mode before PendingMode was set (for rollback on flush failure)
 	HasPreviousMode   bool   // true when previous mode state was snapshotted
 	PreviousModeKnown bool   // true when PreviousMode was authoritative
+	Unlinked          bool   // true after the directory entry was removed while this handle stayed open
+	UnlinkedSnapshot  bool   // true when UnlinkedData is an authoritative read snapshot
+	UnlinkedData      []byte // read-only snapshot for open-but-unlinked remote files
+	UnlinkedSize      int64
 	mu                sync.Mutex
 }
 
@@ -74,6 +78,10 @@ type DirEntry struct {
 	Revision   int64
 	AttrMode   uint32
 	HasMode    bool
+	Uid        uint32
+	Gid        uint32
+	HasUID     bool
+	HasGID     bool
 	IsDir      bool
 	ResourceID string
 	Nlink      uint32

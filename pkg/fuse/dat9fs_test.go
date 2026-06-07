@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,7 +70,9 @@ func newTestDat9FS(tb testing.TB, size int64, get func(http.ResponseWriter, *htt
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
 	ino := fs.inodes.Lookup("/file.bin", false, size, time.Now())
 	return fs, ino, ts.Close
 }
@@ -2703,8 +2706,8 @@ func TestSetAttrModePreservesSpecialPermissionBits(t *testing.T) {
 	if got := chmodCalls.Load(); got != 1 {
 		t.Fatalf("chmod calls = %d, want 1", got)
 	}
-	if gotMode != 0o6755 {
-		t.Fatalf("chmod mode = %o, want 06755", gotMode)
+	if gotMode != 0o755 {
+		t.Fatalf("remote chmod mode = %o, want 0755", gotMode)
 	}
 	if got, want := out.Mode&0o7777, uint32(0o6755); got != want {
 		t.Fatalf("SetAttr mode = %o, want %o", got, want)
@@ -2715,6 +2718,191 @@ func TestSetAttrModePreservesSpecialPermissionBits(t *testing.T) {
 	}
 	if got, want := entry.Mode&0o7777, uint32(0o6755); got != want {
 		t.Fatalf("inode mode = %o, want %o", got, want)
+	}
+}
+
+func TestSetAttrModeUsesDirectoryRemotePath(t *testing.T) {
+	var chmodCalls atomic.Int32
+	var gotPath string
+	var gotMode uint32
+	var handlerErrors testErrorRecorder
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls.Add(1)
+			gotPath = r.URL.Path
+			var req struct {
+				Mode uint32 `json:"mode"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				handlerErrors.Recordf("decode chmod body: %v", err)
+				http.Error(w, "bad body", http.StatusBadRequest)
+				return
+			}
+			gotMode = req.Mode
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	ino := fs.inodes.Lookup("/dir", true, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFDIR)|0o755)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     uint32(syscall.S_IFDIR) | 0o1755,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	handlerErrors.Check(t)
+	if got := chmodCalls.Load(); got != 1 {
+		t.Fatalf("chmod calls = %d, want 1", got)
+	}
+	if gotPath != "/v1/fs/dir/" {
+		t.Fatalf("chmod path = %q, want /v1/fs/dir/", gotPath)
+	}
+	if gotMode != 0o755 {
+		t.Fatalf("remote chmod mode = %o, want 0755", gotMode)
+	}
+	if got, want := out.Mode&0o7777, uint32(0o1755); got != want {
+		t.Fatalf("SetAttr mode = %o, want %o", got, want)
+	}
+}
+
+func TestSetAttrModeRetriesTransientPostUploadNotFound(t *testing.T) {
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("chmod") {
+			if chmodCalls.Add(1) == 1 {
+				http.Error(w, "not yet visible", http.StatusNotFound)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	ino := fs.inodes.Lookup("/racy.txt", false, 12, time.Unix(10, 0))
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|0o644)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o600,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if got := chmodCalls.Load(); got != 2 {
+		t.Fatalf("remote chmod calls = %d, want 2", got)
+	}
+	if got, want := out.Mode&0o7777, uint32(0o600); got != want {
+		t.Fatalf("SetAttr mode = %o, want %o", got, want)
+	}
+}
+
+func TestSetAttrModeKeepsLocalMetadataWhenRemoteChmodNotFoundButTargetExists(t *testing.T) {
+	var chmodCalls atomic.Int32
+	var statCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls.Add(1)
+			http.Error(w, "not found", http.StatusNotFound)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/chowned.txt":
+			statCalls.Add(1)
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	ino := fs.inodes.Lookup("/chowned.txt", false, 12, time.Unix(10, 0))
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|0o755)
+	fs.inodes.UpdateOwner(ino, 65534, 65534, true, true)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{
+				NodeId: ino,
+				Caller: gofuse.Caller{
+					Owner: gofuse.Owner{Uid: 65534, Gid: 65534},
+				},
+			},
+			Valid: gofuse.FATTR_MODE,
+			Mode:  0o2755,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if got := chmodCalls.Load(); got != 1 {
+		t.Fatalf("remote chmod calls = %d, want 1", got)
+	}
+	if got := statCalls.Load(); got != 1 {
+		t.Fatalf("remote stat calls = %d, want 1", got)
+	}
+	if got, want := out.Mode&0o7777, uint32(0o2755); got != want {
+		t.Fatalf("SetAttr mode = %o, want %o", got, want)
+	}
+}
+
+func TestSetAttrModeRemoteChmodNotFoundStillFailsWhenTargetMissing(t *testing.T) {
+	var chmodCalls atomic.Int32
+	var statCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("chmod"):
+			chmodCalls.Add(1)
+			http.Error(w, "not found", http.StatusNotFound)
+		case r.Method == http.MethodHead:
+			statCalls.Add(1)
+			http.Error(w, "missing", http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	ino := fs.inodes.Lookup("/missing-remotely.txt", false, 12, time.Unix(10, 0))
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|0o755)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o600,
+		},
+	}, &out)
+	if st != gofuse.ENOENT {
+		t.Fatalf("SetAttr status = %v, want ENOENT", st)
+	}
+	if got := chmodCalls.Load(); got != postUploadModeAttempts {
+		t.Fatalf("remote chmod calls = %d, want %d", got, postUploadModeAttempts)
+	}
+	if got := statCalls.Load(); got != postUploadModeAttempts {
+		t.Fatalf("remote stat calls = %d, want %d", got, postUploadModeAttempts)
 	}
 }
 
@@ -2765,6 +2953,99 @@ func TestSetAttrModeRejectsNonOwner(t *testing.T) {
 	}
 	if !entry.Ctime.Equal(oldCTime) {
 		t.Fatalf("ctime = %v, want unchanged %v", entry.Ctime, oldCTime)
+	}
+}
+
+func TestSetAttrPathModeRequiresParentSearchPermission(t *testing.T) {
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("chmod") {
+			chmodCalls.Add(1)
+			http.Error(w, "chmod should not reach server without parent search permission", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	parentIno := fs.inodes.Lookup("/locked", true, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(parentIno, uint32(syscall.S_IFDIR)|0o644)
+	fs.inodes.UpdateOwner(parentIno, 1001, 1001, true, true)
+	ino := fs.inodes.Lookup("/locked/file.txt", false, 12, time.Unix(10, 0))
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|0o644)
+	fs.inodes.UpdateOwner(ino, 65534, 65534, true, true)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{
+				NodeId: ino,
+				Caller: gofuse.Caller{
+					Owner: gofuse.Owner{Uid: 65534, Gid: 65534},
+				},
+			},
+			Valid: gofuse.FATTR_MODE,
+			Mode:  0o600,
+		},
+	}, &out)
+	if st != gofuse.EACCES {
+		t.Fatalf("SetAttr status = %v, want EACCES", st)
+	}
+	if got := chmodCalls.Load(); got != 0 {
+		t.Fatalf("remote chmod calls = %d, want 0", got)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	if got, want := entry.Mode&0o7777, uint32(0o644); got != want {
+		t.Fatalf("inode mode = %o, want %o", got, want)
+	}
+}
+
+func TestSetAttrFileHandleModeSkipsParentSearchPermission(t *testing.T) {
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Query().Has("chmod") {
+			chmodCalls.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	parentIno := fs.inodes.Lookup("/locked", true, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(parentIno, uint32(syscall.S_IFDIR)|0o644)
+	fs.inodes.UpdateOwner(parentIno, 1001, 1001, true, true)
+	ino := fs.inodes.Lookup("/locked/file.txt", false, 12, time.Unix(10, 0))
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|0o644)
+	fs.inodes.UpdateOwner(ino, 65534, 65534, true, true)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{
+				NodeId: ino,
+				Caller: gofuse.Caller{
+					Owner: gofuse.Owner{Uid: 65534, Gid: 65534},
+				},
+			},
+			Valid: gofuse.FATTR_MODE | gofuse.FATTR_FH,
+			Fh:    99,
+			Mode:  0o600,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if got := chmodCalls.Load(); got != 1 {
+		t.Fatalf("remote chmod calls = %d, want 1", got)
+	}
+	if got, want := out.Mode&0o7777, uint32(0o600); got != want {
+		t.Fatalf("SetAttr mode = %o, want %o", got, want)
 	}
 }
 
@@ -3418,6 +3699,35 @@ func TestFinishLocalRenameDirectoryAcrossParentsUpdatesParentNlink(t *testing.T)
 	}
 }
 
+func TestCreateTouchesParentDirectoryChangeTime(t *testing.T) {
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), trustedProcessLocalEventsOptions())
+	oldTime := time.Unix(10, 0)
+	parentIno := fs.inodes.Lookup("/dir", true, 0, oldTime)
+	fs.inodes.UpdateMtime(parentIno, oldTime)
+	fs.inodes.UpdateCtime(parentIno, oldTime)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: parentIno},
+		Flags:    uint32(syscall.O_WRONLY),
+		Mode:     0o644,
+	}, "file", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+
+	parent, ok := fs.inodes.GetEntry(parentIno)
+	if !ok {
+		t.Fatal("parent inode missing")
+	}
+	if !parent.Mtime.After(oldTime) {
+		t.Fatalf("parent mtime = %v, want after %v", parent.Mtime, oldTime)
+	}
+	if !parent.Ctime.After(oldTime) {
+		t.Fatalf("parent ctime = %v, want after %v", parent.Ctime, oldTime)
+	}
+}
+
 func TestRenameZeroByteRemoteFileToMissingTargetFallsBackToCreateDelete(t *testing.T) {
 	var mu sync.Mutex
 	var events []string
@@ -3476,6 +3786,14 @@ func TestChildPathRejectsOverlongNameAndPath(t *testing.T) {
 
 	if _, st := fs.childPath(1, strings.Repeat("a", posixNameMax+1)); st != gofuse.Status(syscall.ENAMETOOLONG) {
 		t.Fatalf("overlong name status = %v, want ENAMETOOLONG", st)
+	}
+
+	maxParent := "/" + strings.Repeat("a", posixPathMax-4)
+	maxParentIno := fs.inodes.Lookup(maxParent, true, 0, time.Unix(10, 0))
+	if child, st := fs.childPath(maxParentIno, "cc"); st != gofuse.OK {
+		t.Fatalf("max path status = %v, want OK", st)
+	} else if len(child) != posixPathMax {
+		t.Fatalf("max path length = %d, want %d", len(child), posixPathMax)
 	}
 
 	parent := "/" + strings.Repeat("a", posixPathMax-2)
@@ -3759,6 +4077,57 @@ func TestLookupRecognizesRemoteSymlinkMode(t *testing.T) {
 	}
 	if string(got) != string(target) {
 		t.Fatalf("Readlink target = %q, want %q", got, target)
+	}
+}
+
+func TestSetAttrSymlinkTimesSurviveGetAttr(t *testing.T) {
+	var headCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			headCalls.Add(1)
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/link", false, 6, time.Unix(100, 0))
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFLNK)|0o777)
+	fs.inodes.UpdateRevision(ino, 11)
+
+	atime := time.Unix(1960000000, 0)
+	mtime := time.Unix(1970000000, 0)
+	var setOut gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_ATIME | gofuse.FATTR_MTIME,
+			Atime:    uint64(atime.Unix()),
+			Mtime:    uint64(mtime.Unix()),
+		},
+	}, &setOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if setOut.Mtime != uint64(mtime.Unix()) {
+		t.Fatalf("SetAttr mtime = %d, want %d", setOut.Mtime, mtime.Unix())
+	}
+
+	var out gofuse.AttrOut
+	st = fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	if got := headCalls.Load(); got != 0 {
+		t.Fatalf("HEAD calls = %d, want 0", got)
+	}
+	if out.Atime != uint64(atime.Unix()) {
+		t.Fatalf("GetAttr atime = %d, want %d", out.Atime, atime.Unix())
+	}
+	if out.Mtime != uint64(mtime.Unix()) {
+		t.Fatalf("GetAttr mtime = %d, want %d", out.Mtime, mtime.Unix())
 	}
 }
 
@@ -4100,6 +4469,48 @@ func TestLinkKeepsDestinationPathWhenDestinationStatForbidden(t *testing.T) {
 	}
 	if entry.ResourceID != "file-1" {
 		t.Fatalf("resource id = %q, want file-1", entry.ResourceID)
+	}
+}
+
+func TestLinkUpdatesSourceCtime(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "6")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.Header().Set("X-Dat9-Resource-ID", "file-1")
+			w.Header().Set("X-Dat9-Nlink", "2")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	oldTime := time.Now().Add(-time.Hour)
+	srcIno := fs.inodes.LookupWithIdentity("/src.txt", "file-1", 1, false, 6, oldTime)
+	fs.inodes.UpdateCtime(srcIno, oldTime)
+
+	var out gofuse.EntryOut
+	st := fs.Link(nil, &gofuse.LinkIn{
+		InHeader:  gofuse.InHeader{NodeId: 1},
+		Oldnodeid: srcIno,
+	}, "dst.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Link status = %v, want OK", st)
+	}
+	entry, ok := fs.inodes.GetEntry(srcIno)
+	if !ok {
+		t.Fatal("source entry missing")
+	}
+	if !entry.Ctime.After(oldTime) {
+		t.Fatalf("source ctime = %v, want after %v", entry.Ctime, oldTime)
 	}
 }
 
@@ -6203,6 +6614,23 @@ func TestGoFuseMountOptionsMapsSyncRead(t *testing.T) {
 	}
 }
 
+func TestGoFuseMountOptionsAllowOtherUsesDefaultPermissionsOnLinux(t *testing.T) {
+	opts := newGoFuseMountOptions(&MountOptions{AllowOther: true})
+	hasDefaultPermissions := false
+	for _, opt := range opts.Options {
+		if opt == "default_permissions" {
+			hasDefaultPermissions = true
+			break
+		}
+	}
+	if runtime.GOOS == "linux" && !hasDefaultPermissions {
+		t.Fatal("AllowOther linux mount missing default_permissions")
+	}
+	if runtime.GOOS != "linux" && hasDefaultPermissions {
+		t.Fatal("non-linux mount should not force default_permissions")
+	}
+}
+
 func TestLookupReturnsTTLInEntryOut(t *testing.T) {
 	fs, _, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(make([]byte, 42))
@@ -6459,6 +6887,8 @@ func TestReleaseRetriesDeferredChmodNotFound(t *testing.T) {
 				return
 			}
 			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/release-retry.txt":
+			http.Error(w, "not found", http.StatusNotFound)
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
@@ -7552,6 +7982,51 @@ func TestAccess_MissingInode(t *testing.T) {
 	}
 }
 
+func TestOpen_ChecksModeAndOwner(t *testing.T) {
+	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 42))
+	})
+	defer cleanup()
+
+	fs.inodes.UpdateOwner(ino, 1001, 1002, true, true)
+
+	tests := []struct {
+		name   string
+		mode   uint32
+		uid    uint32
+		gid    uint32
+		flags  uint32
+		status gofuse.Status
+	}{
+		{name: "owner write denied", mode: 0o400, uid: 1001, gid: 1002, flags: uint32(syscall.O_WRONLY), status: gofuse.EACCES},
+		{name: "owner read denied", mode: 0o200, uid: 1001, gid: 1002, flags: uint32(syscall.O_RDONLY), status: gofuse.EACCES},
+		{name: "other read write denied", mode: 0o600, uid: 65534, gid: 65534, flags: uint32(syscall.O_RDWR), status: gofuse.EACCES},
+		{name: "read truncate needs write", mode: 0o400, uid: 1001, gid: 1002, flags: uint32(syscall.O_RDONLY | syscall.O_TRUNC), status: gofuse.EACCES},
+		{name: "owner read allowed", mode: 0o400, uid: 1001, gid: 1002, flags: uint32(syscall.O_RDONLY), status: gofuse.OK},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|tt.mode)
+			var out gofuse.OpenOut
+			st := fs.Open(nil, &gofuse.OpenIn{
+				InHeader: gofuse.InHeader{
+					NodeId: ino,
+					Caller: gofuse.Caller{
+						Owner: gofuse.Owner{Uid: tt.uid, Gid: tt.gid},
+					},
+				},
+				Flags: tt.flags,
+			}, &out)
+			if st != tt.status {
+				t.Fatalf("Open status = %v, want %v", st, tt.status)
+			}
+			if st == gofuse.OK {
+				fs.Release(nil, &gofuse.ReleaseIn{Fh: out.Fh})
+			}
+		})
+	}
+}
+
 func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 	var currentRevision atomic.Int64
 	currentRevision.Store(1)
@@ -7986,7 +8461,9 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
 	ino := fs.inodes.Lookup("/file.bin", false, int64(len(content)), time.Now())
 	fs.inodes.UpdateRevision(ino, revision)
 	fs.inodes.UpdateSize(ino, int64(len(content)))
@@ -8054,6 +8531,259 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	}
 	if revision != 3 {
 		t.Fatalf("remote revision = %d, want 3", revision)
+	}
+}
+
+func TestSetAttr_PathTruncateReadModifyWrite(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		revision int64 = 1
+		content        = []byte("abcdef")
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "active",
+				"max_upload_bytes": maxPathTruncateInMemoryBytes,
+			})
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/file.bin":
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(content)), 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/file.bin":
+			mu.Lock()
+			defer mu.Unlock()
+			_, _ = w.Write(content)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/file.bin":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			content = append([]byte(nil), body...)
+			revision++
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/file.bin", false, int64(len(content)), time.Now())
+	fs.inodes.UpdateRevision(ino, revision)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     3,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr shrink status = %v, want OK", st)
+	}
+	if got, want := string(content), "abc"; got != want {
+		t.Fatalf("content after shrink = %q, want %q", got, want)
+	}
+	if out.Size != 3 {
+		t.Fatalf("out.Size after shrink = %d, want 3", out.Size)
+	}
+
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     5,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr extend status = %v, want OK", st)
+	}
+	if want := []byte{'a', 'b', 'c', 0, 0}; !bytes.Equal(content, want) {
+		t.Fatalf("content after extend = %v, want %v", content, want)
+	}
+	if out.Size != 5 {
+		t.Fatalf("out.Size after extend = %d, want 5", out.Size)
+	}
+}
+
+func TestSetAttr_PathTruncateExtendUsesMultipartWhenAboveInlineThreshold(t *testing.T) {
+	const fileSize = 1234567
+
+	var (
+		mu            sync.Mutex
+		content       []byte
+		revision      int64 = 1
+		initiateTotal int64
+		completeParts int
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "active",
+				"max_upload_bytes": int64(1024),
+				"inline_threshold": int64(1024),
+			})
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/file.bin":
+			mu.Lock()
+			defer mu.Unlock()
+			w.Header().Set("Content-Length", strconv.FormatInt(int64(len(content)), 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path      string `json:"path"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad initiate body", http.StatusBadRequest)
+				return
+			}
+			if req.Path != "/file.bin" {
+				http.Error(w, "bad path", http.StatusBadRequest)
+				return
+			}
+			initiateTotal = req.TotalSize
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "up-1",
+				"key":         "blobs/up-1",
+				"part_size":   8 << 20,
+				"total_parts": 1,
+				"expires_at":  time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+				"resumable":   false,
+				"checksum_contract": map[string]any{
+					"supported": []string{"SHA-256"},
+					"required":  false,
+				},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-1/presign-batch":
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number":     1,
+					"url":        "http://" + r.Host + "/upload/1",
+					"size":       fileSize,
+					"headers":    map[string]string{},
+					"expires_at": time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/upload/1":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			content = append([]byte(nil), body...)
+			mu.Unlock()
+			w.Header().Set("ETag", `"etag-1"`)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/up-1/complete":
+			var req struct {
+				Parts []struct {
+					Number int    `json:"number"`
+					ETag   string `json:"etag"`
+				} `json:"parts"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad complete body", http.StatusBadRequest)
+				return
+			}
+			completeParts = len(req.Parts)
+			mu.Lock()
+			revision++
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.Warm(context.Background())
+	fs := NewDat9FS(c, opts)
+	ino := fs.inodes.Lookup("/file.bin", false, 0, time.Now())
+	fs.inodes.UpdateRevision(ino, revision)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     fileSize,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if initiateTotal != fileSize {
+		t.Fatalf("multipart initiate total_size = %d, want %d", initiateTotal, fileSize)
+	}
+	if completeParts != 1 {
+		t.Fatalf("multipart complete parts = %d, want 1", completeParts)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(content) != fileSize {
+		t.Fatalf("uploaded content size = %d, want %d", len(content), fileSize)
+	}
+	if !bytes.Equal(content[:16], make([]byte, 16)) {
+		t.Fatal("extended content prefix should be zero-filled")
+	}
+	if out.Size != fileSize {
+		t.Fatalf("out.Size = %d, want %d", out.Size, fileSize)
+	}
+}
+
+func TestSetAttr_PathTruncateHugeSizeReturnsEFBIG(t *testing.T) {
+	var putCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/huge.bin", false, 0, time.Now())
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     999999999999999,
+		},
+	}, &out)
+	if st != gofuse.Status(syscall.EFBIG) {
+		t.Fatalf("SetAttr status = %v, want EFBIG", st)
+	}
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("remote write calls = %d, want 0", got)
 	}
 }
 
@@ -10070,6 +10800,127 @@ func TestUnlinkRemoteDeleteAcceptsGoneAfterInterrupt(t *testing.T) {
 	}
 }
 
+func TestUnlinkPreservesOpenReadHandleAfterPathRemoval(t *testing.T) {
+	const path = "/file.txt"
+	data := []byte("Hello, World!")
+	var getCalls atomic.Int32
+	var deleteCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+path:
+			getCalls.Add(1)
+			_, _ = w.Write(data)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+path:
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.LookupWithIdentity(path, "file-1", 1, false, int64(len(data)), time.Now())
+	fh := &FileHandle{Ino: ino, Path: path}
+	fhID := fs.allocateFileHandle(fh)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "file.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("delete calls = %d, want 1", got)
+	}
+	if got := getCalls.Load(); got != 1 {
+		t.Fatalf("snapshot GET calls = %d, want 1", got)
+	}
+	if _, ok := fs.inodes.GetInode(path); ok {
+		t.Fatal("unlinked path still has visible inode mapping")
+	}
+	if fs.openHandles.Has(0, path) {
+		t.Fatal("unlinked handle still occupies path index")
+	}
+	if !fs.openHandles.Has(ino, "") {
+		t.Fatal("unlinked handle missing from inode index")
+	}
+
+	var attr gofuse.AttrOut
+	if st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &attr); st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	if attr.Nlink != 0 {
+		t.Fatalf("nlink = %d, want 0 for open-but-unlinked file", attr.Nlink)
+	}
+
+	buf := make([]byte, len(data))
+	res, st := fs.Read(nil, &gofuse.ReadIn{Fh: fhID, Size: uint32(len(buf))}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, _ := res.Bytes(buf)
+	if string(got) != string(data) {
+		t.Fatalf("read data = %q, want %q", string(got), string(data))
+	}
+}
+
+func TestUnlinkPreservesDirtyOpenHandleRead(t *testing.T) {
+	const path = "/file.txt"
+	data := []byte("Hello,_World!")
+	var deleteCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+path {
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.LookupWithIdentity(path, "file-1", 1, false, 0, time.Now())
+	dirty := fs.newWriteBuffer(path, 1024, 0)
+	if _, err := dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{Ino: ino, Path: path, Dirty: dirty}
+	fh.DirtySeq = fs.markDirtySize(ino, dirty.Size())
+	fhID := fs.allocateFileHandle(fh)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, "file.txt"); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("delete calls = %d, want 1", got)
+	}
+
+	var attr gofuse.AttrOut
+	if st := fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, &attr); st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	if attr.Nlink != 0 {
+		t.Fatalf("nlink = %d, want 0 for open-but-unlinked file", attr.Nlink)
+	}
+	if attr.Size != uint64(len(data)) {
+		t.Fatalf("size = %d, want %d", attr.Size, len(data))
+	}
+
+	buf := make([]byte, len(data))
+	res, st := fs.Read(nil, &gofuse.ReadIn{Fh: fhID, Size: uint32(len(buf))}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, _ := res.Bytes(buf)
+	if string(got) != string(data) {
+		t.Fatalf("read data = %q, want %q", string(got), string(data))
+	}
+}
+
 func TestUnlinkAndRmdirUseDeleteKindHints(t *testing.T) {
 	var fileQuery atomic.Value
 	var dirQuery atomic.Value
@@ -10106,6 +10957,78 @@ func TestUnlinkAndRmdirUseDeleteKindHints(t *testing.T) {
 	}
 	if got, _ := dirQuery.Load().(string); got != "kind=dir" {
 		t.Fatalf("dir delete query = %q, want kind=dir", got)
+	}
+}
+
+func TestRmdirRejectsKnownLocalChild(t *testing.T) {
+	var deleteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deleteCalls.Add(1)
+			http.Error(w, "delete should not be called for known non-empty dir", http.StatusInternalServerError)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	childIno := fs.inodes.Lookup("/dir/pipe", false, 0, time.Now())
+	fs.inodes.UpdateMode(childIno, uint32(syscall.S_IFIFO)|0o644)
+	fs.dirCache.Upsert("/dir", CachedFileInfo{Name: "pipe", HasMode: true, Mode: uint32(syscall.S_IFIFO) | 0o644})
+
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.Status(syscall.ENOTEMPTY) {
+		t.Fatalf("Rmdir status = %v, want ENOTEMPTY", st)
+	}
+	if got := deleteCalls.Load(); got != 0 {
+		t.Fatalf("remote delete calls = %d, want 0", got)
+	}
+	if _, ok := fs.inodes.GetEntry(dirIno); !ok {
+		t.Fatal("non-empty rmdir should keep directory inode")
+	}
+}
+
+func TestRmdirRejectsRemoteChildBeforeDelete(t *testing.T) {
+	var deleteCalls atomic.Int32
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir" && r.URL.Query().Has("list"):
+			listCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{{
+					"name":  "file.txt",
+					"isDir": false,
+					"size":  1,
+				}},
+			})
+		case r.Method == http.MethodDelete:
+			deleteCalls.Add(1)
+			http.Error(w, "delete should not be called for remote non-empty dir", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.inodes.Lookup("/dir", true, 0, time.Now())
+
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.Status(syscall.ENOTEMPTY) {
+		t.Fatalf("Rmdir status = %v, want ENOTEMPTY", st)
+	}
+	if got := listCalls.Load(); got != 1 {
+		t.Fatalf("remote list calls = %d, want 1", got)
+	}
+	if got := deleteCalls.Load(); got != 0 {
+		t.Fatalf("remote delete calls = %d, want 0", got)
 	}
 }
 

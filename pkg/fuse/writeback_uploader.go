@@ -98,9 +98,10 @@ func (u *WriteBackUploader) applyMode(ctx context.Context, meta *WriteBackMeta) 
 		return nil
 	}
 	mode := meta.Mode & posixPermissionModeMask
+	remoteMode := remoteChmodMode(mode)
 	err := retryPostUploadMode(ctx, func() error {
 		start := time.Now()
-		applyErr := u.client.ChmodCtx(ctx, u.remotePath(meta.Path), mode)
+		applyErr := u.client.ChmodCtx(ctx, u.remotePath(meta.Path), remoteMode)
 		if u.perf != nil {
 			u.perf.recordRemoteOp(perfRemoteMutation, applyErr, time.Since(start), 0)
 		}

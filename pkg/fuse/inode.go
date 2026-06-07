@@ -27,6 +27,7 @@ type InodeEntry struct {
 	HasMode    bool   // true when mode is explicitly known (including 0)
 	Rdev       uint32
 	Revision   int64 // server-side revision for cache validation
+	Unlinked   bool  // path was removed while open handles still reference this inode
 }
 
 // InodeToPath provides a bidirectional mapping between inode numbers and
@@ -314,7 +315,7 @@ func (m *InodeToPath) AddAlias(ino uint64, path, resourceID string, nlink uint32
 		return false
 	}
 	if replaced, exists := m.byPath[path]; exists && replaced != ino {
-		m.removePathLocked(path, false)
+		m.removePathLocked(path, false, false)
 	}
 	m.addPathLocked(entry, path)
 	entry.Path = path
@@ -501,7 +502,7 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 	// Update the entry itself.
 	delete(m.byPath, oldPath)
 	if replacedIno, ok := m.byPath[newPath]; ok && replacedIno != ino {
-		m.removePathLocked(newPath, true)
+		m.removePathLocked(newPath, true, false)
 	}
 	m.byPath[newPath] = ino
 	if entry.Paths == nil {
@@ -566,7 +567,7 @@ func (m *InodeToPath) Remove(path string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.removePathLocked(path, false)
+	m.removePathLocked(path, false, false)
 }
 
 // RemoveLink removes one path mapping for a successful unlink-like operation.
@@ -574,7 +575,16 @@ func (m *InodeToPath) RemoveLink(path string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.removePathLocked(path, true)
+	m.removePathLocked(path, true, false)
+}
+
+// RemoveLinkPreserve removes one visible path mapping while preserving the
+// inode entry if this was the last link and an open file handle still needs it.
+func (m *InodeToPath) RemoveLinkPreserve(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.removePathLocked(path, true, true)
 }
 
 func inodeResourceKey(resourceID string, isDir bool) string {
@@ -636,7 +646,7 @@ func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
 	delete(m.byInode, ino)
 }
 
-func (m *InodeToPath) removePathLocked(path string, consumeLink bool) {
+func (m *InodeToPath) removePathLocked(path string, consumeLink bool, preserveIfLast bool) {
 	ino, ok := m.byPath[path]
 	if !ok {
 		return
@@ -651,6 +661,8 @@ func (m *InodeToPath) removePathLocked(path string, consumeLink bool) {
 	if consumeLink && !entry.IsDir {
 		if entry.Nlink > 1 {
 			entry.Nlink--
+		} else if preserveIfLast {
+			entry.Nlink = 0
 		}
 		entry.Ctime = time.Now()
 	}
@@ -662,8 +674,16 @@ func (m *InodeToPath) removePathLocked(path string, consumeLink bool) {
 		}
 	}
 	if entry.Path == "" && len(entry.Paths) == 0 {
+		if preserveIfLast && !entry.IsDir {
+			entry.Path = path
+			entry.Unlinked = true
+			entry.Nlink = 0
+			return
+		}
 		m.removeEntryLocked(ino, entry)
+		return
 	}
+	entry.Unlinked = false
 }
 
 func copyInodeEntryLocked(entry *InodeEntry) *InodeEntry {

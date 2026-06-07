@@ -567,6 +567,9 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 	}
 	if runtime.GOOS == "linux" {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
+		if opts.AllowOther {
+			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
+		}
 	}
 	if runtime.GOOS == "darwin" {
 		// macFUSE can reject open/readdir before requests reach the daemon if

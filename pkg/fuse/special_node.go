@@ -101,6 +101,7 @@ func (fs *Dat9FS) linkMetadataOnlySpecial(input *gofuse.LinkIn, srcEntry *InodeE
 	if !fs.inodes.AddAliasIfAbsent(input.Oldnodeid, dstP, "", nlink, false, srcEntry.Size, time.Now()) {
 		return gofuse.Status(syscall.EEXIST)
 	}
+	fs.inodes.UpdateCtime(input.Oldnodeid, time.Now())
 	fs.addSpecialNode(dstP, input.Oldnodeid)
 
 	entry, ok := fs.inodes.GetEntry(input.Oldnodeid)
@@ -109,6 +110,7 @@ func (fs *Dat9FS) linkMetadataOnlySpecial(input *gofuse.LinkIn, srcEntry *InodeE
 	}
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	for aliasPath := range entry.Paths {
 		fs.cacheEntryForPath(aliasPath, entry)
 	}

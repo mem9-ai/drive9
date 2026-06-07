@@ -430,6 +430,8 @@ order = []
 current = None
 file_start_re = re.compile(r"^(?P<path>\S+/tests/(?P<rel>[^ ]+?\.t))\s+\.*\s*$")
 plan_re = re.compile(r"^1\.\.(\d+)\s*$")
+not_ok_re = re.compile(r"^not ok\s+\d+(?:\b|\s|$)", re.IGNORECASE)
+todo_re = re.compile(r"#\s*TODO\b", re.IGNORECASE)
 failed_file_re = re.compile(r"^\S+/tests/(?P<rel>[^ ]+?\.t)\s+\(Wstat:\s*\d+\s+Tests:\s*(?P<tests>\d+)\s+Failed:\s*(?P<failed>\d+)\)")
 
 for line in text.splitlines():
@@ -457,7 +459,7 @@ for line in text.splitlines():
 
 failed_cases = sum(failed for _, failed in failed_files.values())
 if status != "PASS" and failed_cases == 0:
-    failed_cases = sum(1 for line in text.splitlines() if re.match(r"^not ok\s+\d+(?:\b|\s|$)", line))
+    failed_cases = sum(1 for line in text.splitlines() if not_ok_re.match(line) and not todo_re.search(line))
 if total_cases is None:
     total_cases = sum(plans.values())
 if status == "PASS":
@@ -466,7 +468,7 @@ passed_cases = max(total_cases - failed_cases, 0)
 
 if total_files is None:
     total_files = len(order)
-failed_file_count = len(failed_files) if status != "PASS" else 0
+failed_file_count = sum(1 for _, failed in failed_files.values() if failed > 0) if status != "PASS" else 0
 passed_file_count = max(total_files - failed_file_count, 0)
 
 summary = {
@@ -1315,7 +1317,7 @@ main() {
 
   local rw_mount="$RUN_ROOT/mount-rw"
   local rw_log="$RUN_ROOT/mount-rw.log"
-  if start_mount "$rw_mount" "$rw_log" --mode=fuse --durability=write-sync ":/" "$rw_mount"; then
+  if start_mount "$rw_mount" "$rw_log" --mode=fuse --allow-other --durability=write-sync ":/" "$rw_mount"; then
     :
   else
     record "FAIL" "pjdfstest" "pjdfstest setup mount" "rw mount failed; see $rw_log"

@@ -372,8 +372,10 @@ func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (conte
 
 const (
 	posixNameMax = 255
-	posixPathMax = 4095
+	posixPathMax = 4096
 )
+
+const maxPathTruncateInMemoryBytes int64 = 64 << 20
 
 func (fs *Dat9FS) childPath(parentIno uint64, name string) (string, gofuse.Status) {
 	if len(name) > posixNameMax {
@@ -899,14 +901,145 @@ func (fs *Dat9FS) clearPendingModeForInodeGeneration(ino uint64, skip *FileHandl
 }
 
 func (fs *Dat9FS) applyRemoteMode(ctx context.Context, localPath string, mode uint32) error {
-	mode &= posixPermissionModeMask
+	localMode := mode & posixPermissionModeMask
+	remoteMode := remoteChmodMode(localMode)
+	remotePath := fs.remotePath(localPath)
 	start := fs.perfStart()
-	err := fs.client.ChmodCtx(ctx, fs.remotePath(localPath), mode)
+	err := fs.client.ChmodCtx(ctx, remotePath, remoteMode)
 	fs.perfRecordRemote(perfRemoteMutation, start, err, 0)
+	fs.debugf("chmod remote done local=%s remote=%s local_mode=%o remote_mode=%o err=%v", localPath, remotePath, localMode, remoteMode, err)
 	if err != nil {
-		return fmt.Errorf("chmod %s to %o: %w", localPath, mode, err)
+		if fs.remoteChmodNotFoundCanStayLocal(ctx, localPath, remotePath, localMode, remoteMode, err) {
+			return nil
+		}
+		return fmt.Errorf("chmod %s to %o: %w", localPath, localMode, err)
 	}
 	return nil
+}
+
+func (fs *Dat9FS) remoteChmodNotFoundCanStayLocal(ctx context.Context, localPath, remotePath string, localMode, remoteMode uint32, chmodErr error) bool {
+	if !client.IsNotFound(chmodErr) {
+		return false
+	}
+	if fs.remoteChmodPathExists(ctx, remotePath) {
+		fs.debugf("chmod remote not found but target exists; keeping local metadata local=%s remote=%s local_mode=%o remote_mode=%o", localPath, remotePath, localMode, remoteMode)
+		return true
+	}
+	if strings.HasSuffix(remotePath, "/") {
+		withoutSlash := strings.TrimRight(remotePath, "/")
+		if withoutSlash != "" && withoutSlash != remotePath && fs.remoteChmodPathExists(ctx, withoutSlash) {
+			fs.debugf("chmod remote not found but target exists without slash; keeping local metadata local=%s remote=%s stat_remote=%s local_mode=%o remote_mode=%o", localPath, remotePath, withoutSlash, localMode, remoteMode)
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) remoteChmodPathExists(ctx context.Context, remotePath string) bool {
+	start := fs.perfStart()
+	_, err := fs.client.StatCtx(ctx, remotePath)
+	fs.perfRecordRemote(perfRemoteStat, start, err, 0)
+	if err == nil {
+		return true
+	}
+	fs.debugf("chmod remote existence check failed remote=%s err=%v", remotePath, err)
+	return false
+}
+
+func remoteDirectoryPath(p string) string {
+	if p == "/" || strings.HasSuffix(p, "/") {
+		return p
+	}
+	return p + "/"
+}
+
+func (fs *Dat9FS) applyRemoteModeForEntry(ctx context.Context, entry *InodeEntry, mode uint32) error {
+	if entry == nil {
+		return fmt.Errorf("chmod missing inode entry")
+	}
+	if entry != nil && entry.IsDir {
+		localMode := mode & posixPermissionModeMask
+		remoteMode := remoteChmodMode(localMode)
+		remotePath := remoteDirectoryPath(fs.remotePath(entry.Path))
+		start := fs.perfStart()
+		err := fs.client.ChmodCtx(ctx, remotePath, remoteMode)
+		fs.perfRecordRemote(perfRemoteMutation, start, err, 0)
+		fs.debugf("chmod remote done local=%s remote=%s local_mode=%o remote_mode=%o err=%v", entry.Path, remotePath, localMode, remoteMode, err)
+		if err != nil {
+			if fs.remoteChmodNotFoundCanStayLocal(ctx, entry.Path, remotePath, localMode, remoteMode, err) {
+				return nil
+			}
+			return fmt.Errorf("chmod %s to %o: %w", entry.Path, localMode, err)
+		}
+		return nil
+	}
+	return fs.applyRemoteMode(ctx, entry.Path, mode)
+}
+
+func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, ino uint64, pid uint32, newSize int64) gofuse.Status {
+	if newSize < 0 {
+		return gofuse.Status(syscall.EINVAL)
+	}
+	if newSize > int64(int(^uint(0)>>1)) {
+		return gofuse.Status(syscall.EFBIG)
+	}
+	if newSize > maxPathTruncateInMemoryBytes {
+		return gofuse.Status(syscall.EFBIG)
+	}
+
+	apiPath := fs.remotePath(entry.Path)
+	var data []byte
+	if newSize > 0 {
+		if entry.Size > 0 {
+			readStart := fs.perfStart()
+			var err error
+			data, err = fs.client.ReadCtx(ctx, apiPath)
+			if err != nil {
+				fs.perfRecordRemote(perfRemoteRead, readStart, err, 0)
+				return httpToFuseStatus(err)
+			}
+			fs.perfRecordRemote(perfRemoteRead, readStart, nil, uint64(len(data)))
+		}
+		targetSize := int(newSize)
+		if int64(len(data)) > newSize {
+			data = data[:targetSize]
+		} else if int64(len(data)) < newSize {
+			resized := make([]byte, targetSize)
+			copy(resized, data)
+			data = resized
+		}
+	}
+
+	writeStart := fs.perfStart()
+	err := uploadBufferedRemoteFile(ctx, fs.client, apiPath, data, -1)
+	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+
+	var refreshedRevision int64
+	var refreshedMtime time.Time
+	statStart := fs.perfStart()
+	stat, statErr := fs.client.StatCtx(ctx, apiPath)
+	fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
+	if statErr != nil {
+		log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, ino, statErr)
+	} else if stat != nil {
+		if stat.Revision > 0 {
+			refreshedRevision = stat.Revision
+			entry.Revision = stat.Revision
+			fs.inodes.UpdateRevision(ino, stat.Revision)
+			fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, pid)
+		}
+		if !stat.Mtime.IsZero() {
+			refreshedMtime = stat.Mtime
+			entry.Mtime = stat.Mtime
+			fs.inodes.UpdateMtime(ino, stat.Mtime)
+		}
+	}
+	fs.invalidateReadCacheAndTargets(entry.Path)
+	fs.cacheFileForPath(entry.Path, newSize, refreshedMtime, refreshedRevision)
+	return gofuse.OK
 }
 
 // applyPendingModeForHandleLocked applies a deferred chmod after the data
@@ -1321,7 +1454,7 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 		}
 		out.Mode = uint32(syscall.S_IFLNK) | mode
 		out.Nlink = entry.Nlink
-		if out.Nlink == 0 {
+		if out.Nlink == 0 && !entry.Unlinked {
 			out.Nlink = 1
 		}
 	} else {
@@ -1338,7 +1471,7 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 		out.Mode = fileKind | (mode & posixPermissionModeMask)
 		out.Rdev = entry.Rdev
 		out.Nlink = entry.Nlink
-		if out.Nlink == 0 {
+		if out.Nlink == 0 && !entry.Unlinked {
 			out.Nlink = 1
 		}
 	}
@@ -2018,6 +2151,10 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		Revision:   entry.Revision,
 		Mode:       entry.Mode,
 		HasMode:    entry.HasMode,
+		Uid:        entry.Uid,
+		Gid:        entry.Gid,
+		HasUID:     entry.HasUID,
+		HasGID:     entry.HasGID,
 		ResourceID: entry.ResourceID,
 		Nlink:      entry.Nlink,
 	}
@@ -2095,6 +2232,24 @@ func (fs *Dat9FS) adjustDirectoryLinkCount(dirPath string, delta int32) {
 	}
 	if updated, ok := fs.inodes.AdjustLinkCount(ino, delta); ok {
 		fs.cacheEntryForPath(dirPath, updated)
+	}
+}
+
+func (fs *Dat9FS) touchDirectoryChangeTime(dirPath string, t time.Time) {
+	if fs == nil || dirPath == "" {
+		return
+	}
+	if t.IsZero() {
+		t = time.Now()
+	}
+	ino, ok := fs.inodes.GetInode(dirPath)
+	if !ok {
+		return
+	}
+	fs.inodes.UpdateMtime(ino, t)
+	fs.inodes.UpdateCtime(ino, t)
+	if entry, ok := fs.inodes.GetEntry(ino); ok {
+		fs.cacheEntryForPath(dirPath, entry)
 	}
 }
 
@@ -2246,6 +2401,62 @@ func (fs *Dat9FS) remotePathStatDetached(localPath string) (*client.StatResult, 
 	stat, err := fs.client.StatCtx(retryCtx, fs.remotePath(localPath))
 	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 	return stat, err
+}
+
+func isDirectChildPath(parentPath, childPath string) bool {
+	if parentPath == "" || childPath == "" || childPath == parentPath {
+		return false
+	}
+	var rest string
+	if parentPath == "/" {
+		if !strings.HasPrefix(childPath, "/") {
+			return false
+		}
+		rest = strings.TrimPrefix(childPath, "/")
+	} else {
+		prefix := parentPath + "/"
+		if !strings.HasPrefix(childPath, prefix) {
+			return false
+		}
+		rest = strings.TrimPrefix(childPath, prefix)
+	}
+	return rest != "" && !strings.Contains(rest, "/")
+}
+
+func (fs *Dat9FS) hasKnownLocalDirectoryChildren(dirPath string) bool {
+	if fs == nil {
+		return false
+	}
+	if fs.dirCache != nil && fs.dirCache.HasPositiveEntries(dirPath) {
+		return true
+	}
+	for _, entry := range fs.inodes.Snapshot() {
+		if entry.Unlinked {
+			continue
+		}
+		for p := range entry.Paths {
+			if isDirectChildPath(dirPath, p) {
+				return true
+			}
+		}
+		if isDirectChildPath(dirPath, entry.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string) (bool, error) {
+	listStart := fs.perfStart()
+	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
+	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
+	if err != nil {
+		return false, err
+	}
+	if fs.dirCache != nil {
+		fs.dirCache.Put(dirPath, cachedFileInfos(items))
+	}
+	return len(items) > 0, nil
 }
 
 func (fs *Dat9FS) remoteHardlinkCommittedDetached(srcP, dstP string) bool {
@@ -2535,6 +2746,13 @@ func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
 	cached.Size = item.Size
 	cached.IsDir = item.IsDir
 	cached.Mtime = mtime
+	if item.HasUID || item.HasGID {
+		cached.Uid = item.Uid
+		cached.Gid = item.Gid
+		cached.HasUID = item.HasUID
+		cached.HasGID = item.HasGID
+		fs.inodes.UpdateOwner(entry.Ino, item.Uid, item.Gid, item.HasUID, item.HasGID)
+	}
 	if item.Revision > 0 {
 		cached.Revision = item.Revision
 		fs.inodes.UpdateRevision(entry.Ino, item.Revision)
@@ -2804,6 +3022,75 @@ func (fs *Dat9FS) hasOpenHandle(ino uint64, p string) bool {
 	return fs.openHandles.Has(ino, p)
 }
 
+func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapshotRemote bool) bool {
+	if fs.openHandles == nil || p == "" {
+		return false
+	}
+	handles := fs.openHandles.SnapshotPath(p)
+	if len(handles) == 0 {
+		return false
+	}
+
+	var size int64
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		if entry, ok := fs.inodes.GetEntry(ino); ok {
+			size = entry.Size
+		}
+	}
+
+	snapshotOK := false
+	var snapshot []byte
+	if snapshotRemote {
+		needsSnapshot := false
+		for _, fh := range handles {
+			if fh == nil {
+				continue
+			}
+			fh.Lock()
+			needsSnapshot = fh.Dirty == nil && fh.LocalFile == nil && fh.Layer != PathLayerGitWorkspace
+			fh.Unlock()
+			if needsSnapshot {
+				break
+			}
+		}
+		if needsSnapshot {
+			if size == 0 {
+				snapshotOK = true
+			} else if size <= maxPathTruncateInMemoryBytes {
+				readStart := fs.perfStart()
+				data, err := fs.client.ReadCtx(ctx, fs.remotePath(p))
+				if err == nil {
+					snapshot = data
+					snapshotOK = true
+				} else {
+					log.Printf("open-unlink snapshot failed for %s: %v", p, err)
+				}
+				fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(data)))
+			}
+		}
+	}
+
+	for _, fh := range handles {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		fh.Unlinked = true
+		if fh.Dirty != nil {
+			fh.UnlinkedSize = fh.Dirty.Size()
+		} else if snapshotOK {
+			fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
+			fh.UnlinkedSnapshot = true
+			fh.UnlinkedSize = int64(len(snapshot))
+		} else {
+			fh.UnlinkedSize = size
+		}
+		fh.Unlock()
+	}
+	fs.openHandles.UnlinkPath(p)
+	return true
+}
+
 func (fs *Dat9FS) hasPendingLocalState(p string) bool {
 	if fs.hasPendingMetadataState(p) {
 		return true
@@ -2930,6 +3217,19 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if entryIsMetadataOnlySpecial(entry) {
+		fs.fillAttr(entry, &out.Attr)
+		out.SetTimeout(fs.opts.AttrTTL)
+		return gofuse.OK
+	}
+	if entry.Unlinked {
+		if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
+			entry.Size = size
+		}
+		fs.fillAttr(entry, &out.Attr)
+		out.SetTimeout(fs.opts.AttrTTL)
+		return gofuse.OK
+	}
+	if entryIsSymlink(entry) {
 		fs.fillAttr(entry, &out.Attr)
 		out.SetTimeout(fs.opts.AttrTTL)
 		return gofuse.OK
@@ -3093,6 +3393,13 @@ func hasPOSIXAccess(caller gofuse.Owner, file gofuse.Owner, mode uint32, mask ui
 	return perm&mask == mask
 }
 
+func hasPOSIXSearchAccess(caller gofuse.Owner, file gofuse.Owner, mode uint32, inSupplementaryGroup func(uint32) bool) bool {
+	if caller.Uid == 0 {
+		return true
+	}
+	return hasPOSIXAccess(caller, file, mode, gofuse.X_OK, inSupplementaryGroup)
+}
+
 const setGIDPermissionBit uint32 = 0o2000
 
 func (fs *Dat9FS) entryOwner(entry *InodeEntry) gofuse.Owner {
@@ -3118,6 +3425,96 @@ func entryIsRegularFile(entry *InodeEntry) bool {
 	}
 	kind := entry.Mode & fileKindModeMask
 	return kind == 0 || kind == uint32(syscall.S_IFREG)
+}
+
+func (fs *Dat9FS) checkPathSearchAccess(ctx context.Context, caller gofuse.Owner, pid uint32, p string) gofuse.Status {
+	if p == "/" {
+		return gofuse.OK
+	}
+	for dir := parentDir(p); ; dir = parentDir(dir) {
+		entry, st := fs.pathSearchEntry(ctx, dir)
+		if st == gofuse.ENOENT {
+			return gofuse.OK
+		}
+		if st != gofuse.OK {
+			return st
+		}
+		if !entry.IsDir {
+			return gofuse.Status(syscall.ENOTDIR)
+		}
+		if !hasPOSIXSearchAccess(caller, fs.entryOwner(entry), dirEntryMode(true, entry.HasMode, entry.Mode), func(gid uint32) bool {
+			return processHasSupplementaryGroup(pid, gid)
+		}) {
+			return gofuse.EACCES
+		}
+		if dir == "/" {
+			return gofuse.OK
+		}
+	}
+}
+
+func (fs *Dat9FS) pathSearchEntry(ctx context.Context, p string) (*InodeEntry, gofuse.Status) {
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		if entry, ok := fs.inodes.GetEntry(ino); ok {
+			return entry, gofuse.OK
+		}
+	}
+	statStart := fs.perfStart()
+	stat, err := fs.client.StatCtx(ctx, fs.remotePath(p))
+	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
+	if err != nil {
+		return nil, httpToFuseStatus(err)
+	}
+	if stat == nil || !stat.IsDir {
+		return nil, gofuse.Status(syscall.ENOTDIR)
+	}
+	mtime := stat.Mtime
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
+	ino := fs.inodes.EnsureInodeWithIdentity(p, stat.ResourceID, stat.Nlink, true, stat.Size, mtime)
+	if stat.Revision > 0 {
+		fs.inodes.UpdateRevision(ino, stat.Revision)
+	}
+	if stat.HasMode {
+		fs.inodes.UpdateMode(ino, stat.Mode)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		return nil, gofuse.EIO
+	}
+	return entry, gofuse.OK
+}
+
+func openAccessMask(flags uint32) uint32 {
+	var mask uint32
+	switch flags & syscall.O_ACCMODE {
+	case syscall.O_WRONLY:
+		mask = gofuse.W_OK
+	case syscall.O_RDWR:
+		mask = gofuse.R_OK | gofuse.W_OK
+	default:
+		mask = gofuse.R_OK
+	}
+	if flags&syscall.O_TRUNC != 0 {
+		mask |= gofuse.W_OK
+	}
+	return mask
+}
+
+func (fs *Dat9FS) checkOpenAccess(ctx context.Context, input *gofuse.OpenIn, entry *InodeEntry) gofuse.Status {
+	if entry == nil {
+		return gofuse.ENOENT
+	}
+	if st := fs.checkPathSearchAccess(ctx, input.InHeader.Owner, input.Pid, entry.Path); st != gofuse.OK {
+		return st
+	}
+	if !hasPOSIXAccess(input.InHeader.Owner, fs.entryOwner(entry), dirEntryMode(entry.IsDir, entry.HasMode, entry.Mode), openAccessMask(input.Flags), func(gid uint32) bool {
+		return processHasSupplementaryGroup(input.Pid, gid)
+	}) {
+		return gofuse.EACCES
+	}
+	return gofuse.OK
 }
 
 func (fs *Dat9FS) setAttrModeForCaller(input *gofuse.SetAttrIn, entry *InodeEntry) (uint32, gofuse.Status) {
@@ -3182,6 +3579,16 @@ func processHasSupplementaryGroup(pid, gid uint32) bool {
 func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseSetAttr, perfStart, status, 0) }()
+	defer func() {
+		if status == gofuse.OK || !fs.debugEnabled() {
+			return
+		}
+		path := "<unknown>"
+		if entry, ok := fs.inodes.GetEntry(input.NodeId); ok {
+			path = entry.Path
+		}
+		fs.debugf("setattr failed path=%s node=%d valid=0x%x mode=%o caller=%d:%d status=%d", path, input.NodeId, input.Valid, input.Mode, input.InHeader.Owner.Uid, input.InHeader.Owner.Gid, status)
+	}()
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
@@ -3193,6 +3600,11 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	defer cf()
 	if entryIsMetadataOnlySpecial(entry) {
 		return fs.setMetadataOnlySpecialAttr(input, entry, out)
+	}
+	if input.Valid&gofuse.FATTR_FH == 0 {
+		if st := fs.checkPathSearchAccess(ctx, input.InHeader.Owner, input.Pid, entry.Path); st != gofuse.OK {
+			return st
+		}
 	}
 	if overlay, local, st := fs.localOverlayForPath(ctx, entry.Path); local {
 		if st != gofuse.OK {
@@ -3368,7 +3780,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		if !hasDirtyHandle && !hasPendingMetadata {
 			ctx, cf := fuseCtx(cancel)
 			defer cf()
-			if err := fs.client.ChmodCtx(ctx, fs.remotePath(entry.Path), mode); err != nil {
+			if err := retryPostUploadMode(ctx, func() error {
+				return fs.applyRemoteModeForEntry(ctx, entry, mode)
+			}); err != nil {
 				return httpToFuseStatus(err)
 			}
 		}
@@ -3395,48 +3809,10 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				fh.Unlock()
 			}
 		} else {
-			// truncate(path, size): no open file handle — must persist
-			// to the server. We only support truncate-to-zero, which is
-			// the common case (e.g. shell "> file").
-			if newSize == 0 {
-				ctx, cf := fuseCtx(cancel)
-				defer cf()
-				apiPath := fs.remotePath(entry.Path)
-				writeStart := fs.perfStart()
-				err := fs.client.WriteCtx(ctx, apiPath, nil)
-				fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
-				if err != nil {
-					return httpToFuseStatus(err)
-				}
-				// Refresh the inode revision after the server-side truncate so a
-				// subsequent writable open does not reuse the stale pre-truncate
-				// base revision and conflict with its own zero-byte write.
-				var refreshedRevision int64
-				var refreshedMtime time.Time
-				statStart := fs.perfStart()
-				stat, statErr := fs.client.StatCtx(ctx, apiPath)
-				fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
-				if statErr != nil {
-					log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, input.NodeId, statErr)
-				} else if stat != nil {
-					if stat.Revision > 0 {
-						refreshedRevision = stat.Revision
-						entry.Revision = stat.Revision
-						fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-						fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, input.Pid)
-					}
-					if !stat.Mtime.IsZero() {
-						refreshedMtime = stat.Mtime
-						entry.Mtime = stat.Mtime
-						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
-					}
-				}
-				fs.invalidateReadCacheAndTargets(entry.Path)
-				fs.cacheFileForPath(entry.Path, 0, refreshedMtime, refreshedRevision)
-			} else if newSize != entry.Size {
-				// Arbitrary truncate without an open handle is not
-				// supported — dat9 has no server-side truncate API.
-				return gofuse.Status(syscall.ENOTSUP)
+			ctx, cf := fuseCtx(cancel)
+			defer cf()
+			if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
+				return st
 			}
 		}
 		entry.Size = newSize
@@ -3556,6 +3932,7 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 	}
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, now)
 	fs.fillEntryOut(entry, out)
 	return gofuse.OK
 }
@@ -3572,9 +3949,10 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 	}
 
 	perm := mode & posixPermissionModeMask
-	if perm != defaultRegularFileMode {
+	remotePerm := remoteChmodMode(perm)
+	if remotePerm != defaultRegularFileMode {
 		chmodStart := fs.perfStart()
-		err = fs.client.ChmodCtx(ctx, fs.remotePath(childP), perm)
+		err = fs.client.ChmodCtx(ctx, fs.remotePath(childP), remotePerm)
 		fs.perfRecordRemote(perfRemoteMutation, chmodStart, err, 0)
 		if err != nil {
 			if rollbackErr := fs.deleteRemoteFileWithInterruptRecovery(ctx, childP); rollbackErr != nil && !isNotFoundErr(rollbackErr) {
@@ -3612,6 +3990,7 @@ func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, na
 	}
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.fillEntryOut(entry, out)
 	return gofuse.OK
 }
@@ -3652,6 +4031,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
 		fs.adjustDirectoryLinkCount(parentPath, 1)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
 	}
@@ -3663,6 +4043,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
 		fs.adjustDirectoryLinkCount(parentPath, 1)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
 	}
@@ -3682,6 +4063,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.adjustDirectoryLinkCount(parentPath, 1)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.dirCache.MarkSessionCreatedDir(childP)
 	// Kernel already receives the new entry via the Mkdir reply —
 	// no need for notifyEntry/notifyInode here.
@@ -3724,6 +4106,7 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
 	}
@@ -3734,6 +4117,7 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
 	}
@@ -3788,6 +4172,7 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	}
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.invalidateReadCacheAndTargets(childP)
 	fs.fillEntryOut(entry, out)
 	return gofuse.OK
@@ -3878,12 +4263,15 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 			return gofuse.EIO
 		}
 		fs.inodes.SetModeState(input.Oldnodeid, mode, hasMode)
+		linkTime := time.Now()
+		fs.inodes.UpdateCtime(input.Oldnodeid, linkTime)
 		entry, ok := fs.inodes.GetEntry(input.Oldnodeid)
 		if !ok {
 			return gofuse.EIO
 		}
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
 	}
@@ -3947,6 +4335,8 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	if !fs.inodes.AddAlias(input.Oldnodeid, dstP, resourceID, nlink, isDir, size, mtime) {
 		return gofuse.EIO
 	}
+	linkTime := time.Now()
+	fs.inodes.UpdateCtime(input.Oldnodeid, linkTime)
 	if stat != nil {
 		if stat.Revision > 0 {
 			fs.inodes.UpdateRevision(input.Oldnodeid, stat.Revision)
@@ -3961,6 +4351,7 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	}
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	if srcParent := parentDir(srcP); srcParent != parentPath {
 		fs.dirCache.Invalidate(srcParent)
 	}
@@ -3984,6 +4375,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		fs.inodes.RemoveLink(childP)
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.cacheNegativePath(childP)
 		return gofuse.OK
 	}
@@ -4004,12 +4396,18 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if info.IsDir() {
 			return gofuse.Status(syscall.EISDIR)
 		}
+		preserveOpen := fs.markOpenHandlesUnlinked(ctx, childP, false)
 		if err := overlay.Remove(childP); err != nil {
 			return localErrToFuseStatus(err)
 		}
-		fs.inodes.RemoveLink(childP)
+		if preserveOpen {
+			fs.inodes.RemoveLinkPreserve(childP)
+		} else {
+			fs.inodes.RemoveLink(childP)
+		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.cacheNegativePath(childP)
 		fs.scheduleGitStateCheckpoint(childP)
 		return gofuse.OK
@@ -4029,6 +4427,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		return gofuse.OK
 	}
 	start := time.Now()
@@ -4039,6 +4438,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}()
 
 	pendingNew := false
+	preserveOpen := fs.markOpenHandlesUnlinked(ctx, childP, true)
 	if fs.writeBack != nil && fs.uploader != nil {
 		// Wait for any in-flight upload to finish so it doesn't "revive"
 		// the file on the server after we delete it.
@@ -4107,11 +4507,16 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 	}
 
-	fs.inodes.RemoveLink(childP)
+	if preserveOpen {
+		fs.inodes.RemoveLinkPreserve(childP)
+	} else {
+		fs.inodes.RemoveLink(childP)
+	}
 	fs.invalidateReadCacheAndTargets(childP)
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Remove(parentPath, name)
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.cacheNegativePath(childP)
 	// Kernel initiated the unlink and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
@@ -4154,6 +4559,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.adjustDirectoryLinkCount(parentPath, -1)
 		fs.dirCache.Remove(parentPath, name)
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.cacheNegativePath(childP)
 		fs.scheduleGitStateCheckpoint(childP)
 		return gofuse.OK
@@ -4180,6 +4586,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			parentPath, _ := fs.inodes.GetPath(header.NodeId)
 			fs.adjustDirectoryLinkCount(parentPath, -1)
 			fs.dirCache.Remove(parentPath, name)
+			fs.touchDirectoryChangeTime(parentPath, time.Now())
 			fs.dirCache.InvalidatePrefix(childP)
 			return gofuse.OK
 		}
@@ -4190,6 +4597,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.adjustDirectoryLinkCount(parentPath, -1)
 		fs.dirCache.Remove(parentPath, name)
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.dirCache.InvalidatePrefix(childP)
 		return gofuse.OK
 	}
@@ -4199,6 +4607,17 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	defer func() {
 		fs.debugf("rmdir done path=%s status=%d dur=%s", childP, status, time.Since(start))
 	}()
+
+	if fs.hasKnownLocalDirectoryChildren(childP) {
+		status = gofuse.Status(syscall.ENOTEMPTY)
+		return status
+	}
+	if hasChildren, err := fs.remoteDirectoryHasChildren(ctx, childP); err == nil && hasChildren {
+		status = gofuse.Status(syscall.ENOTEMPTY)
+		return status
+	} else if err != nil {
+		fs.debugf("rmdir pre-delete list failed path=%s err=%v", childP, err)
+	}
 
 	deleteStart := time.Now()
 	fs.debugf("rmdir remote delete start path=%s", childP)
@@ -4250,6 +4669,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.adjustDirectoryLinkCount(parentPath, -1)
 	fs.dirCache.Remove(parentPath, name)
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.cacheNegativePath(childP)
 	// Kernel initiated the rmdir and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
@@ -4438,6 +4858,11 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	}
 	if oldEntryOK {
 		fs.dirCache.Upsert(newParent, cachedInfoFromEntry(path.Base(newP), oldEntry))
+	}
+	touchTime := time.Now()
+	fs.touchDirectoryChangeTime(oldParent, touchTime)
+	if newParent != oldParent {
+		fs.touchDirectoryChangeTime(newParent, touchTime)
 	}
 	fs.retargetOpenHandlesForRename(oldP, newP)
 }
@@ -4764,6 +5189,9 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 	hasMode := false
 	var resourceID string
 	var nlink uint32
+	var uid, gid uint32
+	hasUID := false
+	hasGID := false
 
 	if e.HasMetadata {
 		isDir = e.IsDir
@@ -4774,6 +5202,10 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 		revision = e.Revision
 		mode = e.AttrMode
 		hasMode = e.HasMode
+		uid = e.Uid
+		gid = e.Gid
+		hasUID = e.HasUID
+		hasGID = e.HasGID
 		resourceID = e.ResourceID
 		nlink = e.Nlink
 	} else if item, ok := fs.dirEntryMetadata(dirPath, childP, e.Name); ok {
@@ -4785,6 +5217,10 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 		revision = item.Revision
 		mode = item.Mode
 		hasMode = item.HasMode
+		uid = item.Uid
+		gid = item.Gid
+		hasUID = item.HasUID
+		hasGID = item.HasGID
 		resourceID = item.ResourceID
 		nlink = item.Nlink
 	}
@@ -4795,6 +5231,9 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 	}
 	if hasMode {
 		fs.inodes.UpdateMode(ino, mode)
+	}
+	if hasUID || hasGID {
+		fs.inodes.UpdateOwner(ino, uid, gid, hasUID, hasGID)
 	}
 	return ino
 }
@@ -4829,6 +5268,10 @@ func dirEntryFromCachedInfo(item CachedFileInfo, ino uint64) DirEntry {
 		Revision:    item.Revision,
 		AttrMode:    item.Mode,
 		HasMode:     item.HasMode,
+		Uid:         item.Uid,
+		Gid:         item.Gid,
+		HasUID:      item.HasUID,
+		HasGID:      item.HasGID,
 		IsDir:       item.IsDir,
 		ResourceID:  item.ResourceID,
 		Nlink:       item.Nlink,
@@ -5099,6 +5542,9 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		if item.HasMode {
 			fs.inodes.UpdateMode(ino, item.Mode)
 		}
+		if item.HasUID || item.HasGID {
+			fs.inodes.UpdateOwner(ino, item.Uid, item.Gid, item.HasUID, item.HasGID)
+		}
 
 		entries = append(entries, dirEntryFromCachedInfo(item, ino))
 	}
@@ -5164,6 +5610,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		return gofuse.OK
 	}
 	if _, rel, ok := fs.gitWorkspaceForPath(ctx, childP); ok && rel != "" {
@@ -5176,6 +5623,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		fs.fillEntryOut(entry, &out.EntryOut)
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		return gofuse.OK
 	}
 
@@ -5241,6 +5689,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	// Kernel initiated the create and receives the new entry via reply —
 	// no need for notifyEntry/notifyInode here.
 	return gofuse.OK
@@ -5275,6 +5724,9 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		}
 		fh.OrigSize = entry.Size
 		fh.BaseRev = entry.Revision
+	}
+	if st := fs.checkOpenAccess(ctx, input, entry); st != gofuse.OK {
+		return st
 	}
 
 	// Allocate write buffer for writable opens
@@ -5696,6 +6148,40 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// Fall through to server read below
 	} else {
 		fh.Unlock()
+	}
+
+	fh.Lock()
+	unlinked := fh.Unlinked && fh.Dirty == nil
+	unlinkedSnapshot := fh.UnlinkedSnapshot
+	unlinkedSize := fh.UnlinkedSize
+	var unlinkedData []byte
+	if unlinkedSnapshot {
+		unlinkedData = append([]byte(nil), fh.UnlinkedData...)
+	}
+	fh.Unlock()
+	if unlinked {
+		offset := int64(input.Offset)
+		if unlinkedSnapshot {
+			if offset >= int64(len(unlinkedData)) {
+				source = "unlinked-snapshot-eof"
+				bytesRead = 0
+				return gofuse.ReadResultData(nil), gofuse.OK
+			}
+			end := offset + int64(input.Size)
+			if end > int64(len(unlinkedData)) {
+				end = int64(len(unlinkedData))
+			}
+			source = "unlinked-snapshot"
+			bytesRead = int(end - offset)
+			return gofuse.ReadResultData(unlinkedData[offset:end]), gofuse.OK
+		}
+		if offset >= unlinkedSize {
+			source = "unlinked-eof"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		source = "unlinked-no-snapshot"
+		return nil, gofuse.EIO
 	}
 
 	if fh.Layer == PathLayerGitWorkspace {
