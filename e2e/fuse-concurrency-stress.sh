@@ -18,6 +18,7 @@ FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
 FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-0}"
 FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
 FUSE_CONCURRENCY_KEEP_ARTIFACTS="${FUSE_CONCURRENCY_KEEP_ARTIFACTS:-0}"
+FUSE_CONCURRENCY_ARTIFACT_DIR="${FUSE_CONCURRENCY_ARTIFACT_DIR:-}"
 FUSE_CONCURRENCY_WORKERS="${FUSE_CONCURRENCY_WORKERS:-4}"
 FUSE_CONCURRENCY_FILES_PER_WORKER="${FUSE_CONCURRENCY_FILES_PER_WORKER:-8}"
 FUSE_CONCURRENCY_READER_WORKERS="${FUSE_CONCURRENCY_READER_WORKERS:-2}"
@@ -305,6 +306,7 @@ reader_errors = []
 errors_lock = threading.Lock()
 stop_readers = threading.Event()
 expected = {}
+expected_payloads = {}
 
 
 def record_error(message):
@@ -346,10 +348,40 @@ def expected_renamed_dir_file(worker, index):
 
 
 def add_expected(rel, data):
+    expected_payloads[rel] = data
     expected[rel] = {
         "size": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
     }
+
+
+def first_diff_offset(want, got):
+    for offset, (want_byte, got_byte) in enumerate(zip(want, got)):
+        if want_byte != got_byte:
+            return offset
+    if len(want) != len(got):
+        return min(len(want), len(got))
+    return -1
+
+
+def sample_hex(data, offset, length=32):
+    if offset < 0:
+        offset = 0
+    start = max(0, offset - (length // 2))
+    end = min(len(data), start + length)
+    return data[start:end].hex()
+
+
+def describe_payload_mismatch(rel, want, got):
+    diff = first_diff_offset(want, got)
+    return (
+        f"{rel}: expected_size={len(want)} actual_size={len(got)} "
+        f"expected_sha256={hashlib.sha256(want).hexdigest()} "
+        f"actual_sha256={hashlib.sha256(got).hexdigest()} "
+        f"first_diff={diff} "
+        f"expected_hex={sample_hex(want, diff)} "
+        f"actual_hex={sample_hex(got, diff)}"
+    )
 
 
 def is_transient_path(rel):
@@ -463,7 +495,10 @@ def reader(reader_id):
                             continue
                         want = payload(worker, index, "final")
                         if data != want:
-                            record_reader_error(f"reader={reader_id} mixed/short final read {rel}: got={len(data)} want={len(want)}")
+                            record_reader_error(
+                                f"reader={reader_id} mixed/short final read "
+                                + describe_payload_mismatch(rel, want, data)
+                            )
         except Exception:
             record_reader_error(traceback.format_exc())
         time.sleep(0.01)
@@ -482,6 +517,7 @@ def build_expected():
 
 def build_actual():
     actual = {}
+    actual_payloads = {}
     for current_root, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d != ".go-fuse-epoll-hack"]
         for name in files:
@@ -491,11 +527,12 @@ def build_actual():
                 continue
             with open(path, "rb") as f:
                 data = f.read()
+            actual_payloads[rel] = data
             actual[rel] = {
                 "size": len(data),
                 "sha256": hashlib.sha256(data).hexdigest(),
             }
-    return actual
+    return actual, actual_payloads
 
 
 shutil.rmtree(root, ignore_errors=True)
@@ -519,7 +556,7 @@ stop_readers.set()
 for thread in reader_threads:
     thread.join(5)
 
-actual = build_actual()
+actual, actual_payloads = build_actual()
 with open(expected_manifest, "w", encoding="utf-8") as f:
     json.dump(expected, f, indent=2, sort_keys=True)
     f.write("\n")
@@ -542,6 +579,11 @@ if extra:
     record_error("extra files: " + ", ".join(extra[:20]))
 if mismatched:
     record_error("mismatched files: " + ", ".join(mismatched[:20]))
+    for rel in mismatched[:20]:
+        record_error(
+            "mismatch detail: "
+            + describe_payload_mismatch(rel, expected_payloads[rel], actual_payloads[rel])
+        )
 if reader_errors:
     record_error(f"reader observed {len(reader_errors)} inconsistent reads; see {reader_errors_path}")
 
@@ -589,6 +631,16 @@ if actual != expected:
     print("extra:", sorted(set(actual) - set(expected))[:20], file=sys.stderr)
     mismatched = sorted(rel for rel in set(expected) & set(actual) if expected[rel] != actual[rel])
     print("mismatched:", mismatched[:20], file=sys.stderr)
+    for rel in mismatched[:20]:
+        print(
+            "mismatch detail:",
+            rel,
+            "expected_size=", expected[rel].get("size"),
+            "actual_size=", actual[rel].get("size"),
+            "expected_sha256=", expected[rel].get("sha256"),
+            "actual_sha256=", actual[rel].get("sha256"),
+            file=sys.stderr,
+        )
     raise SystemExit(1)
 PY
   then
@@ -681,7 +733,12 @@ drive9() {
 }
 
 TS="$(date +%s)"
-RUN_ROOT="$(mktemp -d "$FUSE_MOUNT_ROOT/drive9-fuse-concurrency-${TS}.XXXXXX")"
+if [ -n "$FUSE_CONCURRENCY_ARTIFACT_DIR" ]; then
+  mkdir -p "$FUSE_CONCURRENCY_ARTIFACT_DIR"
+  RUN_ROOT="$(mktemp -d "$FUSE_CONCURRENCY_ARTIFACT_DIR/drive9-fuse-concurrency-${TS}.XXXXXX")"
+else
+  RUN_ROOT="$(mktemp -d "$FUSE_MOUNT_ROOT/drive9-fuse-concurrency-${TS}.XXXXXX")"
+fi
 RUN_ID="$(basename "$RUN_ROOT")"
 MOUNT_POINT="$RUN_ROOT/mount"
 MOUNT_LOG="$RUN_ROOT/mount.log"

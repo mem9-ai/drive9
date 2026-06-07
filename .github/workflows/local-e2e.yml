@@ -100,6 +100,7 @@ env:
   ARCHIVE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.archive_fuse_performance_metrics || '0') }}
   FUSE_CONCURRENCY_STRESS_REQUIRED: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_concurrency_stress == '1')) && '1' || '0' }}
   FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
+  FUSE_CONCURRENCY_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-concurrency
 
 jobs:
   local-e2e:
@@ -239,7 +240,17 @@ jobs:
       - name: Run FUSE concurrency stress
         id: fuse-concurrency-stress
         if: always() && env.RUN_FUSE_CONCURRENCY_STRESS == '1'
+        env:
+          FUSE_CONCURRENCY_KEEP_ARTIFACTS: "1"
         run: bash e2e/fuse-concurrency-stress.sh
+
+      - name: Upload FUSE concurrency artifacts
+        if: always() && env.RUN_FUSE_CONCURRENCY_STRESS == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuse-concurrency-stress
+          path: e2e-artifacts/fuse-concurrency
+          if-no-files-found: warn
 
       - name: Run FUSE POSIX/fsx gate
         id: fuse-posix-fsx

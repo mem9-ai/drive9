@@ -11935,6 +11935,259 @@ func TestRenamePendingNewCommitUsesRemoteRenameWhenCanceledUploadBecameVisible(t
 	}
 }
 
+func TestAtomicTempWriteFsyncReleaseRenamePreservesMultipartBody(t *testing.T) {
+	oldP := "/work/final/w0/file-000.txt.tmp.123.456"
+	newP := "/work/final/w0/file-000.txt"
+	data := bytes.Repeat([]byte("drive9-concurrency-final-000\n"), 2048)
+
+	type uploadState struct {
+		path string
+		size int64
+		body []byte
+	}
+	var (
+		mu           sync.Mutex
+		remote       = make(map[string][]byte)
+		uploads      = make(map[string]*uploadState)
+		nextUploadID int
+		renameCalls  int
+		finalUploads int
+	)
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "active",
+				"limits": map[string]any{"inline_threshold": 1},
+			})
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path      string `json:"path"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.Path != oldP && req.Path != newP {
+				t.Errorf("initiate path = %q, want %q or %q", req.Path, oldP, newP)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			nextUploadID++
+			uploadID := fmt.Sprintf("upload-%d", nextUploadID)
+			uploads[uploadID] = &uploadState{path: req.Path, size: req.TotalSize}
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   uploadID,
+				"key":         "object-key",
+				"part_size":   req.TotalSize,
+				"total_parts": 1,
+			})
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/presign-batch"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/presign-batch")
+			mu.Lock()
+			state := uploads[uploadID]
+			mu.Unlock()
+			if state == nil {
+				t.Errorf("presign unknown upload_id %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/" + uploadID + "/1",
+					"size":   state.size,
+				}},
+			})
+			return
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/"):
+			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/s3/"), "/")
+			if len(parts) != 2 {
+				t.Errorf("bad s3 path %q", r.URL.Path)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			if uploads[parts[0]] == nil {
+				t.Errorf("put unknown upload_id %q", parts[0])
+			} else {
+				uploads[parts[0]].body = append([]byte(nil), body...)
+			}
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/complete"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/complete")
+			mu.Lock()
+			state := uploads[uploadID]
+			if state == nil || len(state.body) == 0 {
+				mu.Unlock()
+				t.Errorf("complete before body for %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			remote[state.path] = append([]byte(nil), state.body...)
+			if state.path == newP {
+				finalUploads++
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/abort"):
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+newP:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if !bytes.Equal(body, data) {
+				http.Error(w, "unexpected final path body", http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			finalUploads++
+			remote[newP] = append([]byte(nil), body...)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 2})
+			return
+		case r.Method == http.MethodHead && (r.URL.Path == "/v1/fs"+oldP || r.URL.Path == "/v1/fs"+newP):
+			path := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+			mu.Lock()
+			body, ok := remote[path]
+			mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newP && r.URL.RawQuery == "rename":
+			if got := r.Header.Get("X-Dat9-Rename-Source"); got != oldP {
+				t.Errorf("rename source = %q, want %q", got, oldP)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			body, ok := remote[oldP]
+			if !ok {
+				mu.Unlock()
+				t.Errorf("remote rename before temp path visible")
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			remote[newP] = append([]byte(nil), body...)
+			delete(remote, oldP)
+			renameCalls++
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodGet && r.URL.RawQuery == "list=1":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+			return
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncInteractive}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	queue := NewCommitQueue(c, shadow, pending, nil, 1, 8, fs.remoteRoot())
+	queue.PathLock = fs.lockRemoteCommitPath
+	queue.OnSuccess = fs.onCommitQueueSuccess
+	queue.OnCleanup = fs.onCommitQueueCleanup
+	fs.commitQueue = queue
+	defer queue.DrainAll()
+
+	parentIno := fs.inodes.Lookup("/work/final/w0", true, 0, time.Now())
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: parentIno},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC),
+		Mode:     defaultRegularFileMode,
+	}, "file-000.txt.tmp.123.456", &createOut); st != gofuse.OK {
+		t.Fatalf("Create temp: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write temp: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync temp: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	if st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: parentIno},
+		Newdir:   parentIno,
+	}, "file-000.txt.tmp.123.456", "file-000.txt"); st != gofuse.OK {
+		t.Fatalf("Rename temp to final: %v", st)
+	}
+	queue.DrainAll()
+
+	mu.Lock()
+	gotFinal := append([]byte(nil), remote[newP]...)
+	_, oldExists := remote[oldP]
+	gotRenameCalls := renameCalls
+	gotFinalUploads := finalUploads
+	mu.Unlock()
+	if !bytes.Equal(gotFinal, data) {
+		t.Fatalf("final remote body sha=%x size=%d, want sha=%x size=%d", sha256.Sum256(gotFinal), len(gotFinal), sha256.Sum256(data), len(data))
+	}
+	if oldExists {
+		t.Fatal("old temp path still exists after remote rename")
+	}
+	if gotRenameCalls+gotFinalUploads != 1 {
+		t.Fatalf("finalization count: remote renames=%d direct uploads=%d, want exactly one", gotRenameCalls, gotFinalUploads)
+	}
+	if pending.HasPending(oldP) {
+		t.Fatal("old temp path still pending")
+	}
+	if shadow.Has(oldP) {
+		t.Fatal("old temp shadow still exists")
+	}
+}
+
 func TestRenamePendingNewCommitSyncCommitsWhenQueueStopped(t *testing.T) {
 	oldP := "/repo/.git/objects/70/tmp_obj_sync"
 	newP := "/repo/.git/objects/70/24234d93f61104585962ac664bc5a7ed1d241d"
