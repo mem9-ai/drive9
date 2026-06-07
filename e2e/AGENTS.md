@@ -370,6 +370,10 @@ the layout captured by that run.
 8. Runs threshold-free FUSE performance baseline metrics only when
    `RUN_FUSE_PERFORMANCE_BASELINE=1`
 
+`local-e2e.yml` runs concurrency stress as a separate scheduled/manual
+diagnostic step after the release gate and metrics archive. This keeps
+performance metrics archival independent from stress failures.
+
 ### `smoke-all.sh`
 
 1. Runs `api-smoke-test.sh`
@@ -439,6 +443,7 @@ the layout captured by that run.
 | `FUSE_CONCURRENCY_KEEP_ARTIFACTS` | `0` | `fuse-concurrency-stress.sh` |
 | `RUN_FUSE_PERFORMANCE_BASELINE` | `0` | `fuse-release-gate.sh` |
 | `ARCHIVE_FUSE_PERFORMANCE_METRICS` | `0` (`1` in the scheduled daily heavy `local-e2e` run) | `local-e2e.yml` |
+| `FUSE_CONCURRENCY_STRESS_REQUIRED` | `0` (`1` for manual `local-e2e` runs with `run_fuse_concurrency_stress=1`) | `local-e2e.yml` |
 | `FUSE_PERF_SMALL_FILES` | `64` | `fuse-performance-baseline.sh` |
 | `FUSE_PERF_SMALL_BYTES` | `1024` | `fuse-performance-baseline.sh` |
 | `FUSE_PERF_LARGE_MB` | `16` | `fuse-performance-baseline.sh` |

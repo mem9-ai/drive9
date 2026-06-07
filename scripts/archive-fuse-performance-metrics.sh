@@ -63,6 +63,7 @@ SOURCE_DIR="${DRIVE9_PERF_SOURCE_DIR:-${FUSE_PERF_ARTIFACT_DIR:-}}"
 ARCHIVE_ROOT="${DRIVE9_PERF_ARCHIVE_ROOT:-/benchmarks/fuse-performance}"
 ARCHIVE_ROOT="${ARCHIVE_ROOT%/}"
 DRY_RUN="${DRIVE9_PERF_ARCHIVE_DRY_RUN:-0}"
+ALLOW_EMPTY="${DRIVE9_PERF_ARCHIVE_ALLOW_EMPTY:-0}"
 REPOSITORY="${DRIVE9_PERF_REPOSITORY:-${GITHUB_REPOSITORY:-mem9-ai/drive9}}"
 BRANCH="${DRIVE9_PERF_BRANCH:-${GITHUB_REF_NAME:-unknown}}"
 SHA="${DRIVE9_PERF_SHA:-${GITHUB_SHA:-unknown}}"
@@ -72,14 +73,26 @@ WORKFLOW="${DRIVE9_PERF_WORKFLOW:-${GITHUB_WORKFLOW:-local-e2e}}"
 EVENT_NAME="${DRIVE9_PERF_EVENT_NAME:-${GITHUB_EVENT_NAME:-manual}}"
 
 [ -n "$SOURCE_DIR" ] || die "DRIVE9_PERF_SOURCE_DIR or FUSE_PERF_ARTIFACT_DIR is required"
-[ -d "$SOURCE_DIR" ] || die "performance artifact directory does not exist: $SOURCE_DIR"
+if [ ! -d "$SOURCE_DIR" ]; then
+  if [ "$ALLOW_EMPTY" = "1" ]; then
+    info "skip archive; performance artifact directory does not exist: $SOURCE_DIR"
+    exit 0
+  fi
+  die "performance artifact directory does not exist: $SOURCE_DIR"
+fi
 
 require_cmd curl
 require_cmd python3
 require_cmd sed
 
 metrics_count="$(find "$SOURCE_DIR" -type f -name 'performance-metrics-*.json' | wc -l | tr -d '[:space:]')"
-[ "$metrics_count" -gt 0 ] || die "no performance-metrics-*.json files found in $SOURCE_DIR"
+if [ "$metrics_count" -eq 0 ]; then
+  if [ "$ALLOW_EMPTY" = "1" ]; then
+    info "skip archive; no performance-metrics-*.json files found in $SOURCE_DIR"
+    exit 0
+  fi
+  die "no performance-metrics-*.json files found in $SOURCE_DIR"
+fi
 
 date_path="$(date -u '+%Y/%m/%d')"
 branch_slug="$(sanitize_component "$BRANCH")"
