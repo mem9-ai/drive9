@@ -990,7 +990,7 @@ func gitRun(ctx context.Context, repoDir string, args ...string) error {
 }
 
 func gitListTree(ctx context.Context, repoDir, commitSHA string) ([]client.GitTreeNode, error) {
-	full := []string{"-C", repoDir, "ls-tree", "-r", "-t", "-l", "-z", commitSHA}
+	full := gitListTreeArgs(repoDir, commitSHA)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -1007,6 +1007,10 @@ func gitListTree(ctx context.Context, repoDir, commitSHA string) ([]client.GitTr
 		return nil, fmt.Errorf("parse git ls-tree: %w", err)
 	}
 	return nodes, nil
+}
+
+func gitListTreeArgs(repoDir, commitSHA string) []string {
+	return []string{"-C", repoDir, "ls-tree", "-r", "-t", "-z", commitSHA}
 }
 
 func parseGitLsTree(out []byte) ([]client.GitTreeNode, error) {
