@@ -518,7 +518,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		opts.StorageNamespaceID = ns.ID
 		prefix := ns.Prefix
 		s3ClientStart := time.Now()
-		s3c, err := s3client.NewAWS(ctx, s3client.AWSConfig{
+		s3c, err := s3client.New(ctx, s3client.AWSConfig{
 			Region:          p.cfg.S3Region,
 			Bucket:          p.cfg.S3Bucket,
 			Prefix:          prefix,

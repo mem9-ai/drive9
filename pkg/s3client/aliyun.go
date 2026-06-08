@@ -7,9 +7,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	alibabasdk "github.com/aliyun/alibaba-cloud-sdk-go/sdk"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/sts"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 )
 
 // aliyunCredentials returns the Alibaba Cloud access credentials from the
@@ -103,5 +104,35 @@ func (p *rrsaProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 	}
 	p.expiresAt = expiry
 	return p.cached, nil
+}
+
+// credentialsForAliyun resolves the Alibaba Cloud credential priority chain:
+//  1. cfg.AccessKeyID (explicit static)
+//  2. ACK RRSA: OIDC token file → STS AssumeRoleWithOIDC
+//  3. ALIBABA_CLOUD_ACCESS_KEY_ID / SECRET env vars (static)
+//
+// Returns nil, nil when no credentials are configured; the SDK will fail on
+// first use.
+func credentialsForAliyun(cfg AWSConfig) (aws.CredentialsProvider, error) {
+	if cfg.AccessKeyID != "" {
+		return credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken), nil
+	}
+	if p, ok := rrsaCredentialsProvider(); ok {
+		return p, nil
+	}
+	accessKeyID, secretAccessKey, sessionToken := aliyunCredentials()
+	if accessKeyID != "" {
+		return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, sessionToken), nil
+	}
+	return nil, nil
+}
+
+// newAliyun builds an AWSS3Client using the Aliyun credential priority chain.
+func newAliyun(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
+	provider, err := credentialsForAliyun(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return buildS3Client(ctx, cfg, provider)
 }
 

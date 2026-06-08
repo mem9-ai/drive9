@@ -76,31 +76,6 @@ func RoleLogValue(roleARN string) string {
 	return roleARN
 }
 
-func staticCredentialsProvider(cfg AWSConfig) (aws.CredentialsProvider, bool, error) {
-	// 1. Explicit static credentials take highest priority.
-	accessKeyID := cfg.AccessKeyID
-	secretAccessKey := cfg.SecretAccessKey
-	sessionToken := cfg.SessionToken
-
-	if accessKeyID != "" {
-		return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, sessionToken), true, nil
-	}
-
-	if isAliyunEndpoint(cfg.Endpoint) {
-		// 2. ACK RRSA: exchange OIDC token for temporary STS credentials.
-		if p, ok := rrsaCredentialsProvider(); ok {
-			return p, true, nil
-		}
-		// 3. Fall back to ALIBABA_CLOUD_ACCESS_KEY_ID / SECRET env vars.
-		accessKeyID, secretAccessKey, sessionToken = aliyunCredentials()
-		if accessKeyID != "" {
-			return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, sessionToken), true, nil
-		}
-	}
-
-	return nil, false, nil
-}
-
 func applyS3Options(cfg AWSConfig) func(*s3.Options) {
 	return func(o *s3.Options) {
 		if cfg.Endpoint != "" {
@@ -110,10 +85,34 @@ func applyS3Options(cfg AWSConfig) func(*s3.Options) {
 	}
 }
 
-func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
+// New creates an S3-compatible client. The endpoint in cfg determines which
+// credential chain is used:
+//   - Aliyun OSS endpoints (*.aliyuncs.com): explicit key → RRSA → ALIBABA_CLOUD env
+//   - All other endpoints: explicit key → AWS default chain
+func New(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
+	if isAliyunEndpoint(cfg.Endpoint) {
+		return newAliyun(ctx, cfg)
+	}
+	return newAWS(ctx, cfg)
+}
+
+// newAWS builds an AWSS3Client using AWS credentials. When cfg.AccessKeyID is
+// set, static credentials are used; otherwise the SDK default chain
+// (env → profile → instance metadata) applies.
+func newAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
+	var provider aws.CredentialsProvider
+	if cfg.AccessKeyID != "" {
+		provider = credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken)
+	}
+	return buildS3Client(ctx, cfg, provider)
+}
+
+// buildS3Client assembles the AWS SDK config and constructs the final
+// AWSS3Client. provider may be nil to use the SDK default credential chain.
+func buildS3Client(ctx context.Context, cfg AWSConfig, provider aws.CredentialsProvider) (*AWSS3Client, error) {
 	var transport *http.Transport
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
 		transport = t.Clone()
@@ -133,11 +132,7 @@ func NewAWS(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 		awsconfig.WithHTTPClient(&http.Client{Transport: transport}),
 	}
 
-	provider, ok, err := staticCredentialsProvider(cfg)
-	if err != nil {
-		return nil, err
-	}
-	if ok {
+	if provider != nil {
 		loadOptions = append(loadOptions, awsconfig.WithCredentialsProvider(provider))
 	}
 
