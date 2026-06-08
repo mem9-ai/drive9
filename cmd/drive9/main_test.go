@@ -87,6 +87,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"profile show [profile]",
 		"mount [flags] [:/remote] <mountpoint>",
 		"mount vault [flags] <mountpoint>",
+		"umount <mountpoint>",
 		"doctor fuse",
 		"-h, --help, help",
 	} {

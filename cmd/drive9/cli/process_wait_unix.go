@@ -46,11 +46,27 @@ func waitForProcessExitByPID(pid int, timeout time.Duration) error {
 	}
 }
 
-func processCreationTimeByPID(pid int) (uint64, error) {
-	_ = pid
-	return 0, nil
-}
-
 func terminateMountProcess(state mountstate.ProcessState, waitTimeout time.Duration) error {
+	if state.PID <= 0 {
+		return fmt.Errorf("invalid mount process pid %d", state.PID)
+	}
+	if state.MountKind == mountstate.MountKindWebDAV {
+		if state.CreationTime == 0 {
+			return fmt.Errorf("%w: mount pid file for pid %d is missing ownership metadata", errMountProcessStateUnsafe, state.PID)
+		}
+		actualCreationTime, err := processCreationTimeByPID(state.PID)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
+				return fmt.Errorf("%w: mount process pid %d is no longer running", errMountProcessStateStale, state.PID)
+			}
+			return fmt.Errorf("drive9 umount: inspect mount process pid %d: %w", state.PID, err)
+		}
+		if actualCreationTime == 0 {
+			return fmt.Errorf("%w: mount process pid %d has no ownership metadata", errMountProcessStateUnsafe, state.PID)
+		}
+		if actualCreationTime != state.CreationTime {
+			return fmt.Errorf("%w: mount process pid %d no longer matches recorded ownership", errMountProcessStateStale, state.PID)
+		}
+	}
 	return terminateProcess(state.PID, waitTimeout)
 }

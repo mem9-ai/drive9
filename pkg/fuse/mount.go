@@ -401,6 +401,7 @@ func Mount(opts *MountOptions) error {
 	}
 	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
 		PID:            os.Getpid(),
+		MountKind:      mountstate.MountKindFUSE,
 		MountPoint:     stateMountPoint,
 		RemoteRoot:     opts.RemoteRoot,
 		Profile:        opts.Profile,
