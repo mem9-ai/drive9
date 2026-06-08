@@ -51,6 +51,10 @@ type PoolConfig struct {
 	// tidb_cloud_starter). Use when the TiDB Cloud cluster does not have a
 	// supported auto-embedding provider configured.
 	DisableDatabaseAutoEmbedding bool
+
+	TiDBAutoEmbeddingConfig  schema.TiDBAutoEmbeddingConfig
+	TiDBAutoEmbeddingAPIKey  string
+	TiDBAutoEmbeddingAPIBase string
 }
 
 type Pool struct {
@@ -663,12 +667,19 @@ func (p *Pool) migrateSplitTables(ctx context.Context, db *sql.DB, provider stri
 
 func (p *Pool) autoEmbeddingProfileForTenant(ctx context.Context, t *meta.Tenant) (tenantAutoEmbeddingProfile, error) {
 	if p.metaStore == nil || t == nil || t.ID == "" {
-		return defaultTenantAutoEmbeddingProfile()
+		return p.defaultTenantAutoEmbeddingProfile(ctx)
 	}
-	profile, err := p.metaStore.EnsureTenantAutoEmbeddingProfile(ctx, t.ID)
+	profile, err := p.metaStore.GetTenantAutoEmbeddingProfile(ctx, t.ID)
 	if err != nil {
-		return tenantAutoEmbeddingProfile{}, err
+		if !errors.Is(err, meta.ErrNotFound) {
+			return tenantAutoEmbeddingProfile{}, err
+		}
+		return p.backfillTenantAutoEmbeddingProfile(ctx, t.ID)
 	}
+	return p.tenantAutoEmbeddingProfileFromMeta(ctx, profile)
+}
+
+func (p *Pool) tenantAutoEmbeddingProfileFromMeta(ctx context.Context, profile *meta.TenantAutoEmbeddingProfile) (tenantAutoEmbeddingProfile, error) {
 	schemaProfile := schema.TiDBAutoEmbeddingProfile{
 		Model:       profile.Model,
 		Dimensions:  profile.Dimensions,
@@ -692,20 +703,61 @@ func (p *Pool) autoEmbeddingProfileForTenant(ctx context.Context, t *meta.Tenant
 	}, nil
 }
 
-func defaultTenantAutoEmbeddingProfile() (tenantAutoEmbeddingProfile, error) {
-	schemaProfile, err := schema.TiDBAutoEmbeddingProfileFromConfig(schema.TiDBAutoEmbeddingConfig{
-		Model:      schema.DefaultTiDBAutoEmbeddingModel,
-		Dimensions: schema.DefaultTiDBAutoEmbeddingDimensions,
-	})
+func (p *Pool) backfillTenantAutoEmbeddingProfile(ctx context.Context, tenantID string) (tenantAutoEmbeddingProfile, error) {
+	defaultProfile, apiKeyCipher, err := p.defaultTenantAutoEmbeddingProfileWithCipher(ctx)
 	if err != nil {
-		return tenantAutoEmbeddingProfile{}, fmt.Errorf("build default tenant auto-embedding profile: %w", err)
+		return tenantAutoEmbeddingProfile{}, err
+	}
+	now := time.Now().UTC()
+	if err := p.metaStore.UpsertTenantAutoEmbeddingProfile(ctx, &meta.TenantAutoEmbeddingProfile{
+		TenantID:     tenantID,
+		Model:        defaultProfile.schemaProfile.Model,
+		Dimensions:   defaultProfile.schemaProfile.Dimensions,
+		OptionsJSON:  defaultProfile.schemaProfile.OptionsJSON,
+		APIBase:      defaultProfile.provider.APIBase,
+		APIKeyCipher: apiKeyCipher,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}); err != nil {
+		return tenantAutoEmbeddingProfile{}, err
+	}
+	return defaultProfile, nil
+}
+
+func (p *Pool) defaultTenantAutoEmbeddingProfile(ctx context.Context) (tenantAutoEmbeddingProfile, error) {
+	profile, _, err := p.defaultTenantAutoEmbeddingProfileWithCipher(ctx)
+	return profile, err
+}
+
+func (p *Pool) defaultTenantAutoEmbeddingProfileWithCipher(ctx context.Context) (tenantAutoEmbeddingProfile, []byte, error) {
+	schemaProfile, err := schema.TiDBAutoEmbeddingProfileFromConfig(p.defaultTiDBAutoEmbeddingConfig())
+	if err != nil {
+		return tenantAutoEmbeddingProfile{}, nil, fmt.Errorf("build default tenant auto-embedding profile: %w", err)
+	}
+	apiKey := strings.TrimSpace(p.cfg.TiDBAutoEmbeddingAPIKey)
+	var apiKeyCipher []byte
+	if apiKey != "" {
+		cipher, err := p.enc.Encrypt(ctx, []byte(apiKey))
+		if err != nil {
+			return tenantAutoEmbeddingProfile{}, nil, fmt.Errorf("encrypt default tenant auto-embedding api key: %w", err)
+		}
+		apiKeyCipher = cipher
 	}
 	return tenantAutoEmbeddingProfile{
 		schemaProfile: schemaProfile,
 		provider: schema.TiDBAutoEmbeddingProviderConfig{
-			Model: schemaProfile.Model,
+			Model:   schemaProfile.Model,
+			APIKey:  apiKey,
+			APIBase: strings.TrimSpace(p.cfg.TiDBAutoEmbeddingAPIBase),
 		},
-	}, nil
+	}, apiKeyCipher, nil
+}
+
+func (p *Pool) defaultTiDBAutoEmbeddingConfig() schema.TiDBAutoEmbeddingConfig {
+	if p.cfg.TiDBAutoEmbeddingConfig.Model == "" && p.cfg.TiDBAutoEmbeddingConfig.Dimensions == 0 {
+		return schema.CurrentTiDBAutoEmbeddingConfig()
+	}
+	return p.cfg.TiDBAutoEmbeddingConfig
 }
 
 func (p *Pool) shouldPeriodicValidateTiDBSchemaOnOpen() bool {

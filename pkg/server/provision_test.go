@@ -497,6 +497,67 @@ func TestAutoEmbeddingProfileForTenantEnsuresDefaultProfile(t *testing.T) {
 	}
 }
 
+func TestAutoEmbeddingProfileForTenantBackfillsConfiguredProfile(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	srv := NewWithConfig(Config{
+		Meta: metaStore,
+		Pool: pool,
+		TiDBAutoEmbeddingConfig: tenantschema.TiDBAutoEmbeddingConfig{
+			Model:      "openai/text-embedding-3-small",
+			Dimensions: 1536,
+		},
+		TiDBAutoEmbeddingAPIKey:  "sk-server-backfill",
+		TiDBAutoEmbeddingAPIBase: "https://example.openai.azure.com",
+	})
+	defer srv.Close()
+
+	profile, err := srv.autoEmbeddingProfileForTenant(context.Background(), "tenant-configured-profile")
+	if err != nil {
+		t.Fatalf("autoEmbeddingProfileForTenant: %v", err)
+	}
+	if profile.Model != "openai/text-embedding-3-small" || profile.Dimensions != 1536 {
+		t.Fatalf("profile = %+v", profile)
+	}
+
+	stored, err := metaStore.GetTenantAutoEmbeddingProfile(context.Background(), "tenant-configured-profile")
+	if err != nil {
+		t.Fatalf("GetTenantAutoEmbeddingProfile: %v", err)
+	}
+	if stored.Model != "openai/text-embedding-3-small" || stored.Dimensions != 1536 {
+		t.Fatalf("stored profile = %+v", stored)
+	}
+	if stored.OptionsJSON != `{"dimensions":1536}` {
+		t.Fatalf("stored options_json = %q", stored.OptionsJSON)
+	}
+	if stored.APIBase != "https://example.openai.azure.com" {
+		t.Fatalf("stored api_base = %q", stored.APIBase)
+	}
+	plain, err := pool.Decrypt(context.Background(), stored.APIKeyCipher)
+	if err != nil {
+		t.Fatalf("decrypt API key: %v", err)
+	}
+	if string(plain) != "sk-server-backfill" {
+		t.Fatalf("decrypted API key = %q", string(plain))
+	}
+}
+
 func TestAutoEmbeddingProfileForTenantWithoutMetaUsesConfiguredDefault(t *testing.T) {
 	srv := NewWithConfig(Config{
 		TiDBAutoEmbeddingConfig: tenantschema.TiDBAutoEmbeddingConfig{

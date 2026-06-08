@@ -3322,7 +3322,7 @@ func (s *Server) copyAutoEmbeddingProfileForFork(ctx context.Context, sourceTena
 	if !tenant.UsesTiDBAutoEmbedding(provider) {
 		return nil
 	}
-	sourceProfile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, sourceTenantID)
+	sourceProfile, err := s.ensureAutoEmbeddingMetaProfileForTenant(ctx, sourceTenantID)
 	if err != nil {
 		return err
 	}
@@ -3342,7 +3342,7 @@ func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID str
 	if s.meta == nil {
 		return tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
 	}
-	profile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, tenantID)
+	profile, err := s.ensureAutoEmbeddingMetaProfileForTenant(ctx, tenantID)
 	if err != nil {
 		return tenantschema.TiDBAutoEmbeddingProfile{}, err
 	}
@@ -3351,6 +3351,28 @@ func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID str
 		Dimensions:  profile.Dimensions,
 		OptionsJSON: profile.OptionsJSON,
 	}, nil
+}
+
+func (s *Server) ensureAutoEmbeddingMetaProfileForTenant(ctx context.Context, tenantID string) (*meta.TenantAutoEmbeddingProfile, error) {
+	profile, err := s.meta.GetTenantAutoEmbeddingProfile(ctx, tenantID)
+	if err == nil {
+		return profile, nil
+	}
+	if !errors.Is(err, meta.ErrNotFound) {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	profile, err = s.defaultAutoEmbeddingProfileForTenant(ctx, tenantID, tenant.ProviderTiDBZero, now)
+	if err != nil {
+		return nil, err
+	}
+	if profile == nil {
+		return nil, meta.ErrNotFound
+	}
+	if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, profile); err != nil {
+		return nil, err
+	}
+	return profile, nil
 }
 
 func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(context.Context, string) error) func(context.Context, string) error {
