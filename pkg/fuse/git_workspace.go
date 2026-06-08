@@ -3138,14 +3138,6 @@ func (fs *Dat9FS) syncGitDirtyMirrors() {
 	}
 }
 
-func (fs *Dat9FS) syncGitDirtyMirrorForRuntime(rt *gitWorkspaceRuntime) {
-	if fs == nil || rt == nil || rt.workspace.WorkspaceID == "" || rt.workspace.HeadCommit == "" {
-		return
-	}
-	dirtyRoot := filepath.Join(strings.TrimSpace(fs.opts.LocalRoot), "git-workspaces", rt.workspace.WorkspaceID, rt.workspace.HeadCommit, "dirty")
-	fs.syncGitDirtyMirrorRoot(rt.workspace.WorkspaceID, rt, dirtyRoot)
-}
-
 func (fs *Dat9FS) syncGitDirtyMirrorRoot(workspaceID string, rt *gitWorkspaceRuntime, dirtyRoot string) {
 	if fs == nil || workspaceID == "" || dirtyRoot == "" {
 		return
