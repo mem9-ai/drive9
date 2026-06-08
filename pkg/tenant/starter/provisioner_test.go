@@ -154,6 +154,51 @@ func TestProvisionSkipsSpendingLimitWhenUnset(t *testing.T) {
 	}
 }
 
+func TestProvisionValidatesRequiredTakeoverMetadata(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    map[string]any
+		wantErr string
+	}{
+		{
+			name: "missing cluster id",
+			body: map[string]any{
+				"userPrefix": "u1",
+				"endpoints":  map[string]any{"public": map[string]any{"host": "db.example", "port": 4000}},
+			},
+			wantErr: "starter response missing cluster id",
+		},
+		{
+			name: "missing user prefix",
+			body: map[string]any{
+				"clusterId": "c1",
+				"endpoints": map[string]any{"public": map[string]any{"host": "db.example", "port": 4000}},
+			},
+			wantErr: "starter response missing user prefix",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/v1beta1/clusters:takeoverFromPool" {
+					t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+				}
+				_ = json.NewEncoder(w).Encode(tt.body)
+			}))
+			defer ts.Close()
+
+			p := &Provisioner{apiURL: ts.URL, poolID: "pool-1", client: ts.Client()}
+			_, err := p.Provision(context.Background(), "tenant-1")
+			if err == nil {
+				t.Fatal("expected metadata validation error")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
 func TestProvisionReturnsSpendingLimitUpdateError(t *testing.T) {
 	limit := int32(2500)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

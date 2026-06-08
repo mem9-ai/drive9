@@ -104,10 +104,13 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	if out.Endpoints.Public.Host == "" || out.Endpoints.Public.Port == 0 {
 		return nil, fmt.Errorf("starter response missing endpoint")
 	}
+	if out.ClusterID == "" {
+		return nil, fmt.Errorf("starter response missing cluster id")
+	}
+	if out.UserPrefix == "" {
+		return nil, fmt.Errorf("starter response missing user prefix")
+	}
 	if p.defaultSpendLimit != nil {
-		if out.ClusterID == "" {
-			return nil, fmt.Errorf("starter response missing cluster id")
-		}
 		if err := p.UpdateSpendingLimit(ctx, out.ClusterID, *p.defaultSpendLimit); err != nil {
 			return nil, fmt.Errorf("update starter spending limit for cluster %s: %w", out.ClusterID, err)
 		}
