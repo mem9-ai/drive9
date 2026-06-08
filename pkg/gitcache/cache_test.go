@@ -64,6 +64,42 @@ func TestSanitizeGitConfigCredentials(t *testing.T) {
 	}
 }
 
+func TestWorkspaceDeletedMarkerLifecycle(t *testing.T) {
+	localRoot := t.TempDir()
+	ctx := context.Background()
+
+	if WorkspaceDeleted(ctx, localRoot, "ws1") {
+		t.Fatal("WorkspaceDeleted before mark = true, want false")
+	}
+	if err := MarkWorkspaceDeleted(ctx, localRoot, "ws1"); err != nil {
+		t.Fatalf("MarkWorkspaceDeleted: %v", err)
+	}
+	if !WorkspaceDeleted(ctx, localRoot, "ws1") {
+		t.Fatal("WorkspaceDeleted after mark = false, want true")
+	}
+	if err := ClearWorkspaceDeleted(ctx, localRoot, "ws1"); err != nil {
+		t.Fatalf("ClearWorkspaceDeleted: %v", err)
+	}
+	if WorkspaceDeleted(ctx, localRoot, "ws1") {
+		t.Fatal("WorkspaceDeleted after clear = true, want false")
+	}
+	if _, ok := WorkspaceRefreshMarkerTime(ctx, localRoot, "ws1"); !ok {
+		t.Fatal("WorkspaceRefreshMarkerTime after clear ok = false, want true")
+	}
+}
+
+func TestWorkspaceDeletedMarkerHonorsCanceledContext(t *testing.T) {
+	localRoot := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := MarkWorkspaceDeleted(ctx, localRoot, "ws1"); err == nil {
+		t.Fatal("MarkWorkspaceDeleted with canceled context err = nil, want error")
+	}
+	if WorkspaceDeleted(context.Background(), localRoot, "ws1") {
+		t.Fatal("WorkspaceDeleted after canceled mark = true, want false")
+	}
+}
+
 func TestExtractCodeloadTarRejectsTraversal(t *testing.T) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)

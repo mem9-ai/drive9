@@ -75,7 +75,26 @@ func TestParseGitLsTreeWithoutSizes(t *testing.T) {
 	}
 }
 
-func TestGitListTreeIncludesBlobSizes(t *testing.T) {
+func TestGitListTreeArgsIncludesBlobSizeLookupForFast(t *testing.T) {
+	args := gitListTreeArgs("/mnt/repo", "abc123", true)
+	if got, want := strings.Join(args, " "), "-C /mnt/repo ls-tree -r -t -l -z abc123"; got != want {
+		t.Fatalf("gitListTreeArgs = %q, want %q", got, want)
+	}
+}
+
+func TestGitListTreeArgsAvoidsBlobSizeLookupForBlobless(t *testing.T) {
+	args := gitListTreeArgs("/mnt/repo", "abc123", false)
+	if got, want := strings.Join(args, " "), "-C /mnt/repo ls-tree -r -t -z abc123"; got != want {
+		t.Fatalf("gitListTreeArgs = %q, want %q", got, want)
+	}
+	for _, arg := range args {
+		if arg == "-l" || arg == "--long" {
+			t.Fatalf("gitListTreeArgs includes blob size lookup arg %q: %v", arg, args)
+		}
+	}
+}
+
+func TestGitListTreeLeavesBlobSizesUnknown(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found")
 	}
@@ -90,7 +109,7 @@ func TestGitListTreeIncludesBlobSizes(t *testing.T) {
 	runTestGit(t, root, "commit", "-m", "initial")
 	head := gitOutputForTest(t, root, "rev-parse", "HEAD")
 
-	nodes, err := gitListTree(context.Background(), root, head)
+	nodes, err := gitListTree(context.Background(), root, head, false)
 	if err != nil {
 		t.Fatalf("gitListTree: %v", err)
 	}
@@ -100,8 +119,19 @@ func TestGitListTreeIncludesBlobSizes(t *testing.T) {
 	if nodes[0].Path != "README.md" {
 		t.Fatalf("node path = %q, want README.md", nodes[0].Path)
 	}
+	if nodes[0].SizeBytes != -1 {
+		t.Fatalf("SizeBytes = %d, want -1", nodes[0].SizeBytes)
+	}
+
+	nodes, err = gitListTree(context.Background(), root, head, true)
+	if err != nil {
+		t.Fatalf("gitListTree with sizes: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("len(nodes with sizes) = %d, want 1", len(nodes))
+	}
 	if nodes[0].SizeBytes != 6 {
-		t.Fatalf("SizeBytes = %d, want 6", nodes[0].SizeBytes)
+		t.Fatalf("SizeBytes with sizes = %d, want 6", nodes[0].SizeBytes)
 	}
 }
 
