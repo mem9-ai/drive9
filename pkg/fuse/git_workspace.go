@@ -1141,6 +1141,9 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 		return err
 	}
 	if gitDirLooksUsable(ctx, gitDir) {
+		if err := fs.applyRestoredGitHeadOverlay(ctx, rt, gitDir); err != nil {
+			return err
+		}
 		rt.mu.Lock()
 		rt.restored = true
 		rt.mu.Unlock()
@@ -1158,6 +1161,9 @@ func (fs *Dat9FS) ensureGitStateRestored(ctx context.Context, rt *gitWorkspaceRu
 	}
 	if !gitDirLooksUsable(ctx, gitDir) {
 		return fmt.Errorf("git workspace %s restored unusable .git state", rt.workspace.WorkspaceID)
+	}
+	if err := fs.applyRestoredGitHeadOverlay(ctx, rt, gitDir); err != nil {
+		return err
 	}
 	rt.mu.Lock()
 	rt.restored = true
@@ -1408,6 +1414,217 @@ func (fs *Dat9FS) restoreGitObjectPacks(ctx context.Context, rt *gitWorkspaceRun
 		}
 	}
 	return nil
+}
+
+type gitHeadTreeEntry struct {
+	path string
+	kind string
+	mode string
+	oid  string
+	size int64
+}
+
+func (fs *Dat9FS) applyRestoredGitHeadOverlay(ctx context.Context, rt *gitWorkspaceRuntime, gitDir string) error {
+	if rt == nil {
+		return nil
+	}
+	overlay, err := buildRestoredGitHeadOverlay(ctx, gitDir, rt)
+	if err != nil || len(overlay) == 0 {
+		return err
+	}
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	for rel, entry := range overlay {
+		if _, exists := rt.overlay[rel]; exists {
+			continue
+		}
+		rt.overlay[rel] = entry
+	}
+	return nil
+}
+
+func buildRestoredGitHeadOverlay(ctx context.Context, gitDir string, rt *gitWorkspaceRuntime) (map[string]client.GitOverlayEntry, error) {
+	if rt == nil {
+		return nil, nil
+	}
+	head, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	headCommit := strings.ToLower(strings.TrimSpace(string(head)))
+	if headCommit == "" || strings.EqualFold(headCommit, strings.TrimSpace(rt.workspace.HeadCommit)) {
+		return nil, nil
+	}
+
+	baseNodes, existingOverlay := rt.gitHeadOverlayInputs()
+	headTree, err := gitHeadTreeEntries(ctx, gitDir)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now()
+	out := make(map[string]client.GitOverlayEntry)
+	for rel, headEntry := range headTree {
+		if _, exists := existingOverlay[rel]; exists {
+			continue
+		}
+		base, hasBase := baseNodes[rel]
+		if hasBase && gitHeadEntryMatchesBase(headEntry, base) {
+			continue
+		}
+		entry := client.GitOverlayEntry{
+			WorkspaceID:   rt.workspace.WorkspaceID,
+			Path:          rel,
+			Op:            "upsert",
+			Kind:          headEntry.kind,
+			Mode:          headEntry.mode,
+			SizeBytes:     headEntry.size,
+			BaseObjectSHA: base.ObjectSHA,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+		if headEntry.kind == "file" || headEntry.kind == "symlink" {
+			content, err := gitCatBlobNoLazy(ctx, gitDir, headEntry.oid)
+			if err != nil {
+				return nil, err
+			}
+			sum := sha256.Sum256(content)
+			entry.Content = content
+			entry.SizeBytes = int64(len(content))
+			entry.ChecksumSHA256 = hex.EncodeToString(sum[:])
+		}
+		out[rel] = entry
+	}
+	for rel, base := range baseNodes {
+		if _, exists := existingOverlay[rel]; exists {
+			continue
+		}
+		if _, exists := headTree[rel]; exists {
+			continue
+		}
+		out[rel] = client.GitOverlayEntry{
+			WorkspaceID:   rt.workspace.WorkspaceID,
+			Path:          rel,
+			Op:            "whiteout",
+			Kind:          base.Kind,
+			Mode:          base.Mode,
+			BaseObjectSHA: base.ObjectSHA,
+			CreatedAt:     now,
+			UpdatedAt:     now,
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+func (rt *gitWorkspaceRuntime) gitHeadOverlayInputs() (map[string]client.GitTreeNode, map[string]struct{}) {
+	baseNodes := make(map[string]client.GitTreeNode)
+	existingOverlay := make(map[string]struct{})
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	for rel, node := range rt.nodes {
+		if node.Kind == "dir" {
+			continue
+		}
+		baseNodes[rel] = node
+	}
+	for rel := range rt.overlay {
+		existingOverlay[rel] = struct{}{}
+	}
+	return baseNodes, existingOverlay
+}
+
+func gitHeadTreeEntries(ctx context.Context, gitDir string) (map[string]gitHeadTreeEntry, error) {
+	out, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "ls-tree", "-r", "-z", "--full-tree", "HEAD")
+	if err != nil {
+		return nil, err
+	}
+	entries := make(map[string]gitHeadTreeEntry)
+	var blobIDs []string
+	for _, rec := range bytes.Split(out, []byte{0}) {
+		if len(rec) == 0 {
+			continue
+		}
+		tab := bytes.IndexByte(rec, '\t')
+		if tab < 0 {
+			continue
+		}
+		meta := strings.Fields(string(rec[:tab]))
+		if len(meta) < 3 {
+			continue
+		}
+		rel := strings.Trim(filepath.ToSlash(string(rec[tab+1:])), "/")
+		if rel == "" || rel == ".git" || strings.HasPrefix(rel, ".git/") {
+			continue
+		}
+		mode, typ, oid := meta[0], meta[1], strings.ToLower(meta[2])
+		kind := gitHeadTreeKind(mode, typ)
+		if kind == "" {
+			continue
+		}
+		entries[rel] = gitHeadTreeEntry{path: rel, kind: kind, mode: mode, oid: oid}
+		if kind == "file" || kind == "symlink" {
+			blobIDs = append(blobIDs, oid)
+		}
+	}
+	info, err := gitObjectInfoBatch(ctx, gitDir, blobIDs)
+	if err != nil {
+		return nil, err
+	}
+	for rel, entry := range entries {
+		if entry.kind != "file" && entry.kind != "symlink" {
+			continue
+		}
+		object := info[entry.oid]
+		if object.typ == "" || object.typ == "missing" {
+			return nil, fmt.Errorf("git HEAD tree object %s for %s is missing", entry.oid, rel)
+		}
+		if object.typ != "blob" {
+			return nil, fmt.Errorf("git HEAD tree object %s for %s is %s, want blob", entry.oid, rel, object.typ)
+		}
+		if object.size > gitLocalObjectMaxBlobBytes {
+			return nil, fmt.Errorf("git HEAD tree object %s for %s is %d bytes, exceeds local restore limit %d", entry.oid, rel, object.size, gitLocalObjectMaxBlobBytes)
+		}
+		entry.size = object.size
+		entries[rel] = entry
+	}
+	return entries, nil
+}
+
+func gitHeadTreeKind(mode, typ string) string {
+	switch {
+	case typ == "blob" && mode == "120000":
+		return "symlink"
+	case typ == "blob":
+		return "file"
+	case typ == "commit":
+		return "submodule"
+	default:
+		return ""
+	}
+}
+
+func gitHeadEntryMatchesBase(head gitHeadTreeEntry, base client.GitTreeNode) bool {
+	return strings.EqualFold(head.oid, base.ObjectSHA) &&
+		head.kind == base.Kind &&
+		head.mode == base.Mode
+}
+
+func gitCatBlobNoLazy(ctx context.Context, gitDir, objectSHA string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "cat-file", "blob", objectSHA)
+	setGitNoLazyEnv(cmd)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	data, err := cmd.Output()
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return nil, fmt.Errorf("git cat-file blob %s: %w: %s", objectSHA, err, msg)
+		}
+		return nil, fmt.Errorf("git cat-file blob %s: %w", objectSHA, err)
+	}
+	return data, nil
 }
 
 func (fs *Dat9FS) ensureGitStateForLocalPath(ctx context.Context, localPath string) error {

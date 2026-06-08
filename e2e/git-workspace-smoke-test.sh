@@ -139,20 +139,44 @@ is_mounted() {
 run_with_timeout() {
   local seconds="$1"
   shift
-  "$@" &
-  local cmd_pid=$!
-  (
-    sleep "$seconds"
-    kill "$cmd_pid" >/dev/null 2>&1 || true
-  ) &
-  local watchdog_pid=$!
-  set +e
-  wait "$cmd_pid"
-  local rc=$?
-  set -e
-  kill "$watchdog_pid" >/dev/null 2>&1 || true
-  wait "$watchdog_pid" 2>/dev/null || true
-  return "$rc"
+  python3 - "$seconds" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+seconds = float(sys.argv[1])
+cmd = sys.argv[2:]
+
+proc = subprocess.Popen(cmd, start_new_session=True)
+deadline = time.monotonic() + seconds
+while True:
+    rc = proc.poll()
+    if rc is not None:
+        raise SystemExit(rc if rc >= 0 else 128 + abs(rc))
+    if time.monotonic() >= deadline:
+        break
+    time.sleep(0.2)
+
+try:
+    os.killpg(proc.pid, signal.SIGTERM)
+except ProcessLookupError:
+    raise SystemExit(124)
+
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    if proc.poll() is not None:
+        raise SystemExit(124)
+    time.sleep(0.2)
+
+try:
+    os.killpg(proc.pid, signal.SIGKILL)
+except ProcessLookupError:
+    pass
+proc.wait()
+raise SystemExit(124)
+PY
 }
 
 curl_body_code() {

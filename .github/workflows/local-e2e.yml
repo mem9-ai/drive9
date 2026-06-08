@@ -308,6 +308,7 @@ jobs:
         env:
           FUSE_STRICT_PREREQS: "1"
           RUN_GIT_WORKSPACE_SMOKE: "1"
+          GIT_WORKSPACE_CLONE_TIMEOUT_S: "1800"
         run: bash e2e/smoke-all.sh
 
       - name: Run Git feature matrix
