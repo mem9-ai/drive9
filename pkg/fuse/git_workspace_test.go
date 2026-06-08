@@ -1127,6 +1127,45 @@ func TestLinkedGitStatePathMapsToLinkedRuntime(t *testing.T) {
 	}
 }
 
+func TestLinkedGitStatePathSkipsLocallyDeletedRuntime(t *testing.T) {
+	localRoot := t.TempDir()
+	fs := &Dat9FS{
+		opts: &MountOptions{EnableGitWorkspaces: true, LocalRoot: localRoot},
+		git:  newGitWorkspaceLayer(),
+	}
+	common := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{WorkspaceID: "base", WorkspaceKind: "main"},
+		localRoot: "/repo",
+	}
+	linked := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID:       "wt",
+			WorkspaceKind:     "linked",
+			CommonWorkspaceID: "base",
+			WorktreeName:      "wt",
+		},
+		localRoot: "/repo-wt",
+	}
+	fs.git.workspaces = []*gitWorkspaceRuntime{linked, common}
+	if err := gitcache.MarkWorkspaceDeleted(localRoot, "wt"); err != nil {
+		t.Fatalf("MarkWorkspaceDeleted: %v", err)
+	}
+
+	got, rel, ok := fs.loadedGitWorkspaceForGitStatePath("/repo/.git/worktrees/wt/index")
+	if !ok {
+		t.Fatalf("common git state path was not resolved")
+	}
+	if got != common {
+		t.Fatalf("runtime = %s, want common", got.workspace.WorkspaceID)
+	}
+	if rel != ".git/worktrees/wt/index" {
+		t.Fatalf("rel = %q, want common git state rel", rel)
+	}
+	if _, _, ok := fs.loadedGitWorkspaceForPath("/repo-wt/README.md"); ok {
+		t.Fatalf("deleted linked workspace root should not resolve")
+	}
+}
+
 func TestWriteLinkedGitFileUsesRelativeMountPath(t *testing.T) {
 	localRoot := t.TempDir()
 	overlay := NewLocalOverlay(localRoot)

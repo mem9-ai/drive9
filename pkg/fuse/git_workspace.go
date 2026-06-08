@@ -119,6 +119,9 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 	var loadErrs []error
 	for i := range workspaces {
 		ws := workspaces[i]
+		if fs.gitWorkspaceDeletedLocally(ws.WorkspaceID) {
+			continue
+		}
 		localRoot, ok := fs.localPath(strings.TrimSuffix(ws.RootPath, "/"))
 		if !ok {
 			continue
@@ -236,6 +239,9 @@ func (fs *Dat9FS) loadedGitWorkspaceForPath(localPath string) (*gitWorkspaceRunt
 	fs.git.mu.Lock()
 	defer fs.git.mu.Unlock()
 	for _, rt := range fs.git.workspaces {
+		if fs.gitWorkspaceRuntimeDeletedLocally(rt) {
+			continue
+		}
 		root := rt.localRoot
 		if root == "/" {
 			return rt, strings.TrimPrefix(clean, "/"), true
@@ -249,6 +255,20 @@ func (fs *Dat9FS) loadedGitWorkspaceForPath(localPath string) (*gitWorkspaceRunt
 		}
 	}
 	return nil, "", false
+}
+
+func (fs *Dat9FS) gitWorkspaceRuntimeDeletedLocally(rt *gitWorkspaceRuntime) bool {
+	if rt == nil {
+		return false
+	}
+	return fs.gitWorkspaceDeletedLocally(rt.workspace.WorkspaceID)
+}
+
+func (fs *Dat9FS) gitWorkspaceDeletedLocally(workspaceID string) bool {
+	if fs == nil || fs.opts == nil {
+		return false
+	}
+	return gitcache.WorkspaceDeleted(fs.opts.LocalRoot, workspaceID)
 }
 
 func (fs *Dat9FS) loadedGitWorkspaceForGitStatePath(localPath string) (*gitWorkspaceRuntime, string, bool) {
@@ -279,6 +299,9 @@ func (fs *Dat9FS) linkedWorkspaceForCommonGitStatePath(commonRT *gitWorkspaceRun
 	fs.git.mu.Lock()
 	defer fs.git.mu.Unlock()
 	for _, candidate := range fs.git.workspaces {
+		if fs.gitWorkspaceRuntimeDeletedLocally(candidate) {
+			continue
+		}
 		if candidate.workspace.CommonWorkspaceID == commonRT.workspace.WorkspaceID && candidate.workspace.WorktreeName == name {
 			if rest == "" {
 				return candidate, ".git", true
@@ -296,6 +319,9 @@ func (fs *Dat9FS) gitWorkspaceRuntimeByID(workspaceID string) (*gitWorkspaceRunt
 	fs.git.mu.Lock()
 	defer fs.git.mu.Unlock()
 	for _, rt := range fs.git.workspaces {
+		if fs.gitWorkspaceRuntimeDeletedLocally(rt) {
+			continue
+		}
 		if rt.workspace.WorkspaceID == workspaceID {
 			return rt, true
 		}

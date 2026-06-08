@@ -504,6 +504,9 @@ func gitWorktreeRemove(args []string) error {
 		return fmt.Errorf("delete linked git workspace: %w", err)
 	}
 	cancel()
+	if err := markLocalGitWorkspaceDeleted(resolved, ws.WorkspaceID); err != nil {
+		return fmt.Errorf("mark linked git workspace deleted locally: %w", err)
+	}
 	if overlayRoot, err := localOverlayRootForMountedTarget(resolved); err == nil && overlayRoot != "" {
 		if err := os.RemoveAll(overlayRoot); err != nil {
 			return fmt.Errorf("remove linked local overlay root: %w", err)
@@ -786,6 +789,17 @@ func localOverlayRootForMountedTarget(resolved mountedGitTarget) (string, error)
 		localPath = filepath.Join(localPath, resolved.MountRel)
 	}
 	return localPath, nil
+}
+
+func markLocalGitWorkspaceDeleted(resolved mountedGitTarget, workspaceID string) error {
+	localRoot := strings.TrimSpace(resolved.LocalRoot)
+	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {
+		return nil
+	}
+	if !filepath.IsAbs(localRoot) {
+		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
+	}
+	return gitcache.MarkWorkspaceDeleted(localRoot, workspaceID)
 }
 
 func sameDrive9Mount(a, b mountedGitTarget) bool {

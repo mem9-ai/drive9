@@ -90,6 +90,38 @@ func HydrateLogPath(localRoot, workspaceID, commit string) string {
 	return filepath.Join(CacheRoot(localRoot, workspaceID, commit), "hydrate.log")
 }
 
+// WorkspaceDeletedMarkerPath returns the local marker path used to hide a
+// deleted workspace from a still-running FUSE mount before the next backend
+// refresh observes the deletion.
+func WorkspaceDeletedMarkerPath(localRoot, workspaceID string) string {
+	return filepath.Join(localRoot, "git-workspaces", "deleted", safePathSegment(workspaceID))
+}
+
+// MarkWorkspaceDeleted records that a workspace was deleted in this local root.
+func MarkWorkspaceDeleted(localRoot, workspaceID string) error {
+	localRoot = strings.TrimSpace(localRoot)
+	workspaceID = strings.TrimSpace(workspaceID)
+	if localRoot == "" || workspaceID == "" {
+		return nil
+	}
+	marker := WorkspaceDeletedMarkerPath(localRoot, workspaceID)
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(marker, []byte("deleted\n"), 0o644)
+}
+
+// WorkspaceDeleted reports whether a local deletion marker exists.
+func WorkspaceDeleted(localRoot, workspaceID string) bool {
+	localRoot = strings.TrimSpace(localRoot)
+	workspaceID = strings.TrimSpace(workspaceID)
+	if localRoot == "" || workspaceID == "" {
+		return false
+	}
+	_, err := os.Stat(WorkspaceDeletedMarkerPath(localRoot, workspaceID))
+	return err == nil
+}
+
 // ReadTreeFile reads a materialized clean tree file or symlink. The boolean is
 // false when the materialized path is simply absent.
 func ReadTreeFile(ctx context.Context, localRoot, workspaceID, commit, rel string, offset, size int64) ([]byte, bool, error) {
