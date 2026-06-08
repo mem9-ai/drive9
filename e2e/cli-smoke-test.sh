@@ -332,15 +332,17 @@ PACK_LOCAL_ROOT="/tmp/drive9-cli-pack-local-${TS}"
 PACK_RESTORE_ROOT="/tmp/drive9-cli-pack-restore-${TS}"
 PACK_REMOTE_ROOT="/workspace"
 PACK_PROFILE="e2e-pack"
-PACK_REMOTE_ARCHIVE="$(python3 - "$PACK_REMOTE_ROOT" <<'PY'
+PACK_REMOTE_ARCHIVE="$(python3 - "$PACK_REMOTE_ROOT" "$PACK_PROFILE" <<'PY'
 import hashlib
 import posixpath
 import sys
 
 root = sys.argv[1]
+profile = sys.argv[2] or "coding-agent"
 label = posixpath.basename(root.rstrip("/")) or "root"
 safe = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in label).strip(".-") or "root"
-print(f"/.drive9/packs/{safe}-{hashlib.sha256(root.encode()).hexdigest()[:16]}.tar.gz")
+digest = hashlib.sha256((profile + "\0" + root).encode()).hexdigest()[:16]
+print(f"/.drive9/packs/{safe}-{digest}.tar.gz")
 PY
 )"
 LARGE_LOCAL="/tmp/drive9-cli-large-${TS}.bin"
