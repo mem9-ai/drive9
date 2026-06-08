@@ -9050,14 +9050,16 @@ func (fs *Dat9FS) FlushAll() {
 		cf()
 	}
 
-	// Git workspace dirty mirrors are the local durable copy-on-write cache.
-	// Sweep them once during graceful shutdown so a missed handle flush cannot
-	// lose working-tree content across sandbox replacement.
-	fs.syncGitDirtyMirrors()
-
 	// Drain git workspace overlay commits queued by interactive writeback.
 	// These include both file payloads and metadata entries such as chmod,
-	// mkdir, symlink, and whiteout.
+	// mkdir, symlink, and whiteout. Do this before sweeping dirty mirrors so
+	// older queued overlay writes cannot overwrite newer mirror content.
+	fs.drainGitOverlayWrites()
+
+	// Git workspace dirty mirrors are the local durable copy-on-write cache.
+	// Sweep them during graceful shutdown so a missed handle flush cannot lose
+	// working-tree content across sandbox replacement.
+	fs.syncGitDirtyMirrors()
 	fs.drainGitOverlayWrites()
 
 	// Drain coalesced .git checkpoints and then checkpoint every loaded git

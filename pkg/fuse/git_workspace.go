@@ -209,7 +209,7 @@ func (fs *Dat9FS) hasLocalGitStateHint(localPath string) bool {
 		return false
 	}
 	clean := path.Clean(localPath)
-	if clean == "." || clean == "/" {
+	if clean == "." {
 		return false
 	}
 	for _, part := range strings.Split(strings.Trim(clean, "/"), "/") {
@@ -217,9 +217,12 @@ func (fs *Dat9FS) hasLocalGitStateHint(localPath string) bool {
 			return false
 		}
 	}
-	for cur := clean; cur != "." && cur != "/"; cur = path.Dir(cur) {
+	for cur := clean; cur != "."; cur = path.Dir(cur) {
 		if _, err := fs.localOverlay.Lstat(path.Join(cur, ".git")); err == nil {
 			return true
+		}
+		if cur == "/" {
+			break
 		}
 	}
 	return false
@@ -1185,8 +1188,9 @@ func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime,
 	if fs.perfEnabled() {
 		fs.perf.gitCleanReadCount.add(1)
 	}
+	nodeCommit := gitNodeCommit(rt, n)
 	if localRoot := strings.TrimSpace(fs.opts.LocalRoot); localRoot != "" {
-		data, hit, err := gitcache.ReadTreeFile(ctx, localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, rel, offset, size)
+		data, hit, err := gitcache.ReadTreeFile(ctx, localRoot, rt.workspace.WorkspaceID, nodeCommit, rel, offset, size)
 		if err != nil {
 			return nil, err
 		}
@@ -1199,7 +1203,7 @@ func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime,
 			}
 			return data, nil
 		}
-		data, hit, err = gitcache.ReadBlob(ctx, localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, n.ObjectSHA, offset, size)
+		data, hit, err = gitcache.ReadBlob(ctx, localRoot, rt.workspace.WorkspaceID, nodeCommit, n.ObjectSHA, offset, size)
 		if err != nil {
 			return nil, err
 		}
@@ -1216,7 +1220,7 @@ func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime,
 	if fs.perfEnabled() {
 		fs.perf.gitCleanCacheMiss.add(1)
 	}
-	data, err := fs.materializeGitBlob(ctx, rt, n.ObjectSHA)
+	data, err := fs.materializeGitBlob(ctx, rt, nodeCommit, n.ObjectSHA)
 	if err != nil {
 		return nil, err
 	}
@@ -1231,7 +1235,7 @@ func (fs *Dat9FS) updateGitKnownSize(rt *gitWorkspaceRuntime, localPath, rel str
 	if ino, ok := fs.inodes.GetInode(localPath); ok {
 		fs.inodes.UpdateSize(ino, size)
 	}
-	rt.updateCleanNodeSize(rel, size)
+	rt.updateCleanNodeSize(rel, gitNodeCommit(rt, n), size)
 }
 
 func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceRuntime, rel string, n client.GitTreeNode) int64 {
@@ -1244,30 +1248,55 @@ func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceR
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	nodeCommit := gitNodeCommit(rt, n)
 	if localRoot := strings.TrimSpace(fs.opts.LocalRoot); localRoot != "" {
-		if size, hit, err := gitcache.StatTreeFile(ctx, localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, rel); err == nil && hit {
-			rt.updateCleanNodeSize(rel, size)
+		if size, hit, err := gitcache.StatTreeFile(ctx, localRoot, rt.workspace.WorkspaceID, nodeCommit, rel); err == nil && hit {
+			rt.updateCleanNodeSize(rel, nodeCommit, size)
 			return size
 		}
-		if size, hit, err := gitcache.StatBlob(ctx, localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, n.ObjectSHA); err == nil && hit {
-			rt.updateCleanNodeSize(rel, size)
+		if size, hit, err := gitcache.StatBlob(ctx, localRoot, rt.workspace.WorkspaceID, nodeCommit, n.ObjectSHA); err == nil && hit {
+			rt.updateCleanNodeSize(rel, nodeCommit, size)
 			return size
 		}
 	}
 	if n.ObjectSHA != "" {
 		if size, err := fs.gitCatFileBlobSize(ctx, rt, n.ObjectSHA); err == nil {
-			rt.updateCleanNodeSize(rel, size)
+			rt.updateCleanNodeSize(rel, nodeCommit, size)
 			return size
 		}
 	}
 	return n.SizeBytes
 }
 
-func (rt *gitWorkspaceRuntime) updateCleanNodeSize(rel string, size int64) {
+func gitNodeCommit(rt *gitWorkspaceRuntime, n client.GitTreeNode) string {
+	if commit := strings.TrimSpace(n.CommitSHA); commit != "" {
+		return commit
+	}
+	if rt == nil {
+		return ""
+	}
+	return rt.workspace.HeadCommit
+}
+
+func (rt *gitWorkspaceRuntime) updateCleanNodeSize(rel, commit string, size int64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	commit = strings.TrimSpace(commit)
+	shouldUpdate := func(n client.GitTreeNode, expectedCommit string) bool {
+		if n.SizeBytes >= 0 {
+			return false
+		}
+		if commit == "" {
+			return true
+		}
+		if nodeCommit := strings.TrimSpace(n.CommitSHA); nodeCommit != "" {
+			return strings.EqualFold(nodeCommit, commit)
+		}
+		expectedCommit = strings.TrimSpace(expectedCommit)
+		return expectedCommit == "" || strings.EqualFold(expectedCommit, commit)
+	}
 	n, ok := rt.nodes[rel]
-	if ok && n.SizeBytes < 0 {
+	if ok && shouldUpdate(n, rt.workspace.HeadCommit) {
 		n.SizeBytes = size
 		rt.nodes[rel] = n
 		children := rt.children[n.ParentPath]
@@ -1280,7 +1309,7 @@ func (rt *gitWorkspaceRuntime) updateCleanNodeSize(rel string, size int64) {
 		}
 	}
 	n, ok = rt.localNodes[rel]
-	if ok && n.SizeBytes < 0 {
+	if ok && shouldUpdate(n, rt.localTreeCommit) {
 		n.SizeBytes = size
 		rt.localNodes[rel] = n
 		children := rt.localChildren[n.ParentPath]
@@ -1294,11 +1323,15 @@ func (rt *gitWorkspaceRuntime) updateCleanNodeSize(rel string, size int64) {
 	}
 }
 
-func (fs *Dat9FS) materializeGitBlob(ctx context.Context, rt *gitWorkspaceRuntime, objectSHA string) ([]byte, error) {
+func (fs *Dat9FS) materializeGitBlob(ctx context.Context, rt *gitWorkspaceRuntime, commit, objectSHA string) ([]byte, error) {
 	if fs == nil || fs.git == nil || rt == nil {
 		return nil, os.ErrNotExist
 	}
-	key := rt.workspace.WorkspaceID + ":" + rt.workspace.HeadCommit + ":" + objectSHA
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		commit = rt.workspace.HeadCommit
+	}
+	key := rt.workspace.WorkspaceID + ":" + commit + ":" + objectSHA
 	fs.git.mu.Lock()
 	if fs.git.materialize == nil {
 		fs.git.materialize = make(map[string]*gitMaterializeCall)
@@ -1316,7 +1349,7 @@ func (fs *Dat9FS) materializeGitBlob(ctx context.Context, rt *gitWorkspaceRuntim
 	fs.git.materialize[key] = call
 	fs.git.mu.Unlock()
 
-	call.data, call.err = fs.materializeGitBlobOnce(ctx, rt, objectSHA)
+	call.data, call.err = fs.materializeGitBlobOnce(ctx, rt, commit, objectSHA)
 	close(call.done)
 
 	fs.git.mu.Lock()
@@ -1325,9 +1358,9 @@ func (fs *Dat9FS) materializeGitBlob(ctx context.Context, rt *gitWorkspaceRuntim
 	return call.data, call.err
 }
 
-func (fs *Dat9FS) materializeGitBlobOnce(ctx context.Context, rt *gitWorkspaceRuntime, objectSHA string) ([]byte, error) {
+func (fs *Dat9FS) materializeGitBlobOnce(ctx context.Context, rt *gitWorkspaceRuntime, commit, objectSHA string) ([]byte, error) {
 	if localRoot := strings.TrimSpace(fs.opts.LocalRoot); localRoot != "" {
-		data, hit, err := gitcache.ReadBlob(ctx, localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, objectSHA, 0, -1)
+		data, hit, err := gitcache.ReadBlob(ctx, localRoot, rt.workspace.WorkspaceID, commit, objectSHA, 0, -1)
 		if err != nil {
 			return nil, err
 		}
@@ -1343,7 +1376,7 @@ func (fs *Dat9FS) materializeGitBlobOnce(ctx context.Context, rt *gitWorkspaceRu
 		return nil, err
 	}
 	if localRoot := strings.TrimSpace(fs.opts.LocalRoot); localRoot != "" {
-		if err := gitcache.WriteBlob(ctx, localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, objectSHA, data); err != nil {
+		if err := gitcache.WriteBlob(ctx, localRoot, rt.workspace.WorkspaceID, commit, objectSHA, data); err != nil {
 			return nil, err
 		}
 	}
@@ -2923,7 +2956,7 @@ func (fs *Dat9FS) applyGitOverlayMirrorEntry(fh *FileHandle, size int64) {
 	if fs == nil || fh == nil || fh.Layer != PathLayerGitWorkspace || fh.GitWorkspaceID == "" || fh.GitRelPath == "" {
 		return
 	}
-	fs.applyGitOverlayEntry(fh.GitWorkspaceID, client.GitOverlayEntry{
+	entry := client.GitOverlayEntry{
 		WorkspaceID:    fh.GitWorkspaceID,
 		Path:           fh.GitRelPath,
 		Op:             "upsert",
@@ -2933,7 +2966,9 @@ func (fs *Dat9FS) applyGitOverlayMirrorEntry(fh *FileHandle, size int64) {
 		BaseObjectSHA:  fh.GitBaseObjectSHA,
 		ChecksumSHA256: "",
 		UpdatedAt:      time.Now(),
-	})
+	}
+	fs.rememberPendingGitOverlayEntry(fh.GitWorkspaceID, entry)
+	fs.applyGitOverlayEntry(fh.GitWorkspaceID, entry)
 }
 
 func (fs *Dat9FS) rememberPendingGitOverlayEntry(workspaceID string, entry client.GitOverlayEntry) uint64 {
@@ -3831,10 +3866,24 @@ func (fs *Dat9FS) copyGitFileOverlay(ctx context.Context, rt *gitWorkspaceRuntim
 		if e.BaseObjectSHA != "" {
 			base = e.BaseObjectSHA
 		}
-	} else if n, ok := rt.cleanNode(oldRel); ok {
-		size = n.SizeBytes
-		mode = n.Mode
-		kind = n.Kind
+	} else {
+		var (
+			n  client.GitTreeNode
+			ok bool
+		)
+		if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
+			n, ok = rt.localHeadNode(oldRel)
+		} else {
+			n, ok = rt.cleanNode(oldRel)
+		}
+		if ok {
+			size = n.SizeBytes
+			if size < 0 {
+				size = fs.resolveGitCleanNodeSize(ctx, rt, oldRel, n)
+			}
+			mode = n.Mode
+			kind = n.Kind
+		}
 	}
 	data, err := fs.readGitFile(ctx, oldLocal, 0, size)
 	if err != nil {
