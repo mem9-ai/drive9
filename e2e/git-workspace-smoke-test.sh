@@ -266,7 +266,7 @@ start_mount() {
     echo "local_root=$local_root"
   } >>"$MOUNT_LOG"
 
-  local args=(mount --mode=fuse --profile=coding-agent --local-root "$local_root" --durability=interactive --perf-counters)
+  local args=(mount --foreground --mode=fuse --profile=coding-agent --local-root "$local_root" --durability=interactive --perf-counters)
   if [ "$GIT_WORKSPACE_ALLOW_OTHER" = "1" ]; then
     args+=(--allow-other)
   fi
