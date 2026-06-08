@@ -320,6 +320,7 @@ jobs:
           GIT_WORKSPACE_REPOS: "drive9=https://github.com/mem9-ai/drive9.git"
           GIT_WORKSPACE_SCENARIOS: "agent_edit_add_commit"
           GIT_WORKSPACE_CLONE_TIMEOUT_S: "600"
+          MOUNT_READY_TIMEOUT_S: "60"
         run: bash e2e/smoke-all.sh
 
       - name: Run Git feature matrix
@@ -328,6 +329,7 @@ jobs:
         continue-on-error: true
         env:
           FUSE_STRICT_PREREQS: "1"
+          MOUNT_READY_TIMEOUT_S: "60"
         run: bash e2e/git-feature-matrix.sh
 
       - name: Upload feature matrix artifacts
