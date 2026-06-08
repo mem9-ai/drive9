@@ -77,21 +77,28 @@ func RoleLogValue(roleARN string) string {
 }
 
 func staticCredentialsProvider(cfg AWSConfig) (aws.CredentialsProvider, bool, error) {
+	// 1. Explicit static credentials take highest priority.
 	accessKeyID := cfg.AccessKeyID
 	secretAccessKey := cfg.SecretAccessKey
 	sessionToken := cfg.SessionToken
 
-	if accessKeyID == "" && isAliyunEndpoint(cfg.Endpoint) {
-		// On Alibaba Cloud ACK, credentials are injected via RRSA or ECS RAM roles
-		// as ALIBABA_CLOUD_* env vars. Only apply this fallback for Aliyun endpoints
-		// to avoid using Aliyun credentials against AWS services by mistake.
-		accessKeyID, secretAccessKey, sessionToken = aliyunCredentials()
+	if accessKeyID != "" {
+		return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, sessionToken), true, nil
 	}
 
-	if accessKeyID == "" {
-		return nil, false, nil
+	if isAliyunEndpoint(cfg.Endpoint) {
+		// 2. ACK RRSA: exchange OIDC token for temporary STS credentials.
+		if p, ok := rrsaCredentialsProvider(); ok {
+			return p, true, nil
+		}
+		// 3. Fall back to ALIBABA_CLOUD_ACCESS_KEY_ID / SECRET env vars.
+		accessKeyID, secretAccessKey, sessionToken = aliyunCredentials()
+		if accessKeyID != "" {
+			return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, sessionToken), true, nil
+		}
 	}
-	return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, sessionToken), true, nil
+
+	return nil, false, nil
 }
 
 func applyS3Options(cfg AWSConfig) func(*s3.Options) {
