@@ -2,10 +2,8 @@ package encrypt
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/base64"
 	"fmt"
-	"net/http"
 
 	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
 	"github.com/aliyun/alibaba-cloud-sdk-go/services/kms"
@@ -27,17 +25,15 @@ func NewAliyunKMSEncryptor(region, keyID, endpoint string) (*AliyunKMSEncryptor,
 
 	config := sdk.NewConfig()
 	config.Scheme = "HTTPS"
-	if endpoint != "" {
-		// VPC/dedicated-gateway certificates are signed by an Aliyun internal CA
-		// not present in the system trust store; skip verification for custom endpoints.
-		config.Transport = &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
-		}
-	}
 
 	client, err := kms.NewClientWithOptions(region, config, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create aliyun kms client: %w", err)
+	}
+	if endpoint != "" {
+		// VPC/dedicated-gateway certificates are signed by an Aliyun internal CA
+		// not present in the system trust store; skip verification for custom endpoints.
+		client.SetHTTPSInsecure(true)
 	}
 	return &AliyunKMSEncryptor{client: client, keyID: keyID, endpoint: endpoint}, nil
 }
