@@ -1790,6 +1790,24 @@ func parseInlineIndexDefinition(tableName, def string) (indexName, createSQL str
 	if name, cols, ok := parseConstraintUniqueIndexDefinition(def); ok {
 		return name, fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols), true
 	}
+	if strings.HasPrefix(normalized, "fulltext index ") || strings.HasPrefix(normalized, "fulltext key ") {
+		prefix := "FULLTEXT INDEX"
+		if strings.HasPrefix(normalized, "fulltext key ") {
+			prefix = "FULLTEXT KEY"
+		}
+		name, cols := parseIndexNameAndColumns(def, prefix)
+		if name == "" || cols == "" {
+			return "", "", false
+		}
+		return name, fmt.Sprintf("CREATE FULLTEXT INDEX %s ON %s%s", name, tableName, cols), true
+	}
+	if strings.HasPrefix(normalized, "vector index ") {
+		name, cols := parseIndexNameAndColumns(def, "VECTOR INDEX")
+		if name == "" || cols == "" {
+			return "", "", false
+		}
+		return name, fmt.Sprintf("CREATE VECTOR INDEX %s ON %s%s", name, tableName, cols), true
+	}
 	if strings.HasPrefix(normalized, "index ") || strings.HasPrefix(normalized, "key ") {
 		prefix := "INDEX"
 		if strings.HasPrefix(normalized, "key ") {
@@ -2008,6 +2026,12 @@ func parseCreateIndexStatement(stmt string) (tableName, indexName, createSQL str
 	switch {
 	case strings.HasPrefix(normalized, "create unique index "):
 		prefix = "create unique index "
+	case strings.HasPrefix(normalized, "create fulltext index "):
+		prefix = "create fulltext index "
+	case strings.HasPrefix(normalized, "create vector index "):
+		prefix = "create vector index "
+	case strings.HasPrefix(normalized, "create spatial index "):
+		prefix = "create spatial index "
 	case strings.HasPrefix(normalized, "create index "):
 		prefix = "create index "
 	default:
@@ -2071,10 +2095,22 @@ func parseAlterTableAddIndexStatement(stmt string) (tableName, indexName, create
 		if len(nameFields) == 0 {
 			return "", "", "", false
 		}
-		return table, strings.ToLower(nameFields[0]), strings.TrimSpace(stmt), true
+		createSQL := strings.TrimSpace(stmt)
+		if marker == " add fulltext index " || marker == " add vector index " {
+			createSQL = stripColumnarReplicaOnDemand(createSQL)
+		}
+		return table, strings.ToLower(nameFields[0]), createSQL, true
 	}
 
 	return "", "", "", false
+}
+
+func stripColumnarReplicaOnDemand(stmt string) string {
+	idx := strings.LastIndex(strings.ToLower(stmt), "add_columnar_replica_on_demand")
+	if idx < 0 {
+		return stmt
+	}
+	return strings.TrimSpace(stmt[:idx])
 }
 
 func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt string) []tidbSchemaDiff {
@@ -2182,6 +2218,18 @@ func parseObservedTiDBIndexes(createStmt string) (map[string]struct{}, bool) {
 			}
 		case strings.HasPrefix(normalized, "unique index "):
 			if name, _ := parseIndexNameAndColumns(def, "UNIQUE INDEX"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "fulltext index "):
+			if name, _ := parseIndexNameAndColumns(def, "FULLTEXT INDEX"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "fulltext key "):
+			if name, _ := parseIndexNameAndColumns(def, "FULLTEXT KEY"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "vector index "):
+			if name, _ := parseIndexNameAndColumns(def, "VECTOR INDEX"); name != "" {
 				observed[name] = struct{}{}
 			}
 		case strings.HasPrefix(normalized, "index "):
