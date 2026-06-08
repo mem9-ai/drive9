@@ -2675,6 +2675,34 @@ func TestGitWorkspaceTruncateOpenRefreshesDirtyMirror(t *testing.T) {
 		t.Fatalf("appended readGitFile = %q, want %q", got, appended)
 	}
 
+	var truncateOpen gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &truncateOpen); st != gofuse.OK {
+		t.Fatalf("truncate Open status = %v, want OK", st)
+	}
+	shortContent := []byte("short\n")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       truncateOpen.Fh,
+		Offset:   0,
+		Size:     uint32(len(shortContent)),
+	}, shortContent); st != gofuse.OK {
+		t.Fatalf("truncate Write status = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: truncateOpen.Fh}); st != gofuse.OK {
+		t.Fatalf("truncate Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: truncateOpen.Fh})
+	got, err = fs.readGitFile(context.Background(), "/repo/README.md", 0, -1)
+	if err != nil {
+		t.Fatalf("read truncated git file: %v", err)
+	}
+	if !bytes.Equal(got, shortContent) {
+		t.Fatalf("truncated readGitFile = %q, want %q", got, shortContent)
+	}
+
 	var restoreOpen gofuse.OpenOut
 	if st := fs.Open(nil, &gofuse.OpenIn{
 		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},

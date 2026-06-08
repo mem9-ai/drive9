@@ -3443,6 +3443,16 @@ func (fs *Dat9FS) openGitDirtyMirrorFile(rt *gitWorkspaceRuntime, rel string, fl
 	if err != nil {
 		return nil, false
 	}
+	if flags&uint32(syscall.O_TRUNC) != 0 {
+		if err := file.Truncate(0); err != nil {
+			_ = file.Close()
+			return nil, false
+		}
+		if _, err := file.Seek(0, 0); err != nil {
+			_ = file.Close()
+			return nil, false
+		}
+	}
 	return file, true
 }
 
