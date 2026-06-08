@@ -1260,7 +1260,17 @@ func (m *semanticWorkerManager) taskTypesForProvider(provider string) []semantic
 		if m.pool == nil {
 			return nil
 		}
-		return m.pool.AutoSemanticTaskTypes()
+		if types := m.pool.AutoSemanticTaskTypes(); types != nil {
+			return types
+		}
+		// Pool returned nil. If auto-embedding is explicitly disabled, route
+		// TiDB tenants through app-managed task types so they can be processed
+		// by an external embedder. Otherwise (pool has no image/audio extract
+		// configured) fall through to nil — TiDB tenant is skipped entirely.
+		if m.pool.IsAutoEmbeddingDisabled() {
+			return m.appManagedTaskTypes()
+		}
+		return nil
 	}
 	return m.appManagedTaskTypes()
 }
@@ -1283,7 +1293,22 @@ func (m *semanticWorkerManager) taskTypesForTarget(b *backend.Dat9Backend) []sem
 	if b.UsesDatabaseAutoEmbedding() {
 		return b.AutoSemanticTaskTypes()
 	}
-	return m.appManagedTaskTypes()
+	// Database auto-embedding is not active for this backend. Image/audio extract
+	// tasks are independent of EMBED_TEXT and should still be claimable when the
+	// runtime is wired. App-managed embed tasks are included if an embedder is
+	// configured.
+	var out []semantic.TaskType
+	if b.SupportsAsyncImageExtract() {
+		out = append(out, semantic.TaskTypeImgExtractText)
+	}
+	if b.SupportsAsyncAudioExtract() {
+		out = append(out, semantic.TaskTypeAudioExtractText)
+	}
+	out = append(out, m.appManagedTaskTypes()...)
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func imageExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.ImageExtractTaskSpec {

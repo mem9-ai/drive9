@@ -1,0 +1,162 @@
+package s3client
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	alibabasdk "github.com/aliyun/alibaba-cloud-sdk-go/sdk"
+	"github.com/aliyun/alibaba-cloud-sdk-go/services/sts"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+)
+
+// aliyunCredentials returns the Alibaba Cloud access credentials from the
+// standard ALIBABA_CLOUD_* environment variables. Returns empty strings when
+// the variables are not set.
+func aliyunCredentials() (accessKeyID, secretAccessKey, securityToken string) {
+	return os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_ID"),
+		os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET"),
+		os.Getenv("ALIBABA_CLOUD_SECURITY_TOKEN")
+}
+
+// isAliyunEndpoint reports whether endpoint points to an Aliyun OSS service.
+// It inspects the host portion of the URL and checks for an aliyuncs.com domain
+// boundary, preventing false matches from query/path substrings or crafted
+// hostnames like "aliyuncs.com.evil.com".
+func isAliyunEndpoint(endpoint string) bool {
+	if len(endpoint) == 0 {
+		return false
+	}
+	// Strip scheme (e.g. "https://").
+	host := endpoint
+	if i := strings.Index(endpoint, "://"); i >= 0 {
+		host = endpoint[i+3:]
+	}
+	// Strip path, query, port.
+	if i := strings.IndexAny(host, "/:?"); i >= 0 {
+		host = host[:i]
+	}
+	// Match host == "aliyuncs.com" or host ends with ".aliyuncs.com".
+	return host == "aliyuncs.com" || strings.HasSuffix(host, ".aliyuncs.com")
+}
+
+// rrsaCredentials detects whether ACK RRSA env vars are present and returns a
+// *rrsaProvider that exchanges the OIDC token for temporary Alibaba Cloud STS
+// credentials via AssumeRoleWithOIDC. region is passed through to the STS client.
+// Returns nil, false when RRSA env vars are not set.
+func rrsaCredentialsProvider(region string) (*rrsaProvider, bool) {
+	roleARN := os.Getenv("ALIBABA_CLOUD_ROLE_ARN")
+	oidcProviderARN := os.Getenv("ALIBABA_CLOUD_OIDC_PROVIDER_ARN")
+	tokenFile := os.Getenv("ALIBABA_CLOUD_OIDC_TOKEN_FILE")
+	if roleARN == "" || oidcProviderARN == "" || tokenFile == "" {
+		return nil, false
+	}
+	return &rrsaProvider{
+		region:          region,
+		roleARN:         roleARN,
+		oidcProviderARN: oidcProviderARN,
+		tokenFile:       tokenFile,
+	}, true
+}
+
+// rrsaProvider implements aws.CredentialsProvider using ACK RRSA.
+type rrsaProvider struct {
+	region          string
+	roleARN         string
+	oidcProviderARN string
+	tokenFile       string
+
+	mu        sync.Mutex
+	cached    aws.Credentials
+	expiresAt time.Time
+}
+
+func (p *rrsaProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if time.Now().Before(p.expiresAt.Add(-5 * time.Minute)) {
+		return p.cached, nil
+	}
+	if p.region == "" {
+		return aws.Credentials{}, fmt.Errorf("rrsa: region is required for STS AssumeRoleWithOIDC; set S3 region or ALIBABA_CLOUD_REGION_ID")
+	}
+	tokenBytes, err := os.ReadFile(p.tokenFile)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("rrsa: read oidc token: %w", err)
+	}
+	cfg := alibabasdk.NewConfig().WithScheme("HTTPS")
+	stsClient, err := sts.NewClientWithOptions(p.region, cfg, nil)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("rrsa: create sts client: %w", err)
+	}
+	req := sts.CreateAssumeRoleWithOIDCRequest()
+	req.RoleArn = p.roleARN
+	req.OIDCProviderArn = p.oidcProviderARN
+	req.OIDCToken = strings.TrimSpace(string(tokenBytes))
+	req.RoleSessionName = "drive9-rrsa"
+	req.DurationSeconds = "3600"
+
+	resp, err := stsClient.AssumeRoleWithOIDC(req)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("rrsa: AssumeRoleWithOIDC: %w", err)
+	}
+	creds := resp.Credentials
+	expiry, err := time.Parse(time.RFC3339, creds.Expiration)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("rrsa: parse expiration %q: %w", creds.Expiration, err)
+	}
+	p.cached = aws.Credentials{
+		AccessKeyID:     creds.AccessKeyId,
+		SecretAccessKey: creds.AccessKeySecret,
+		SessionToken:    creds.SecurityToken,
+		Source:          "AliyunRRSA",
+		CanExpire:       true,
+		Expires:         expiry,
+	}
+	p.expiresAt = expiry
+	return p.cached, nil
+}
+
+// credentialsForAliyun resolves the Alibaba Cloud credential priority chain:
+//  1. cfg.AccessKeyID (explicit static)
+//  2. ACK RRSA: OIDC token file → STS AssumeRoleWithOIDC
+//  3. ALIBABA_CLOUD_ACCESS_KEY_ID / SECRET env vars (static)
+//
+// Region for RRSA: cfg.Region is used; falls back to ALIBABA_CLOUD_REGION_ID env var.
+// Returns nil when no credentials are configured.
+func credentialsForAliyun(cfg AWSConfig) (aws.CredentialsProvider, error) {
+	if cfg.AccessKeyID != "" {
+		return credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken), nil
+	}
+	region := cfg.Region
+	if region == "" {
+		region = os.Getenv("ALIBABA_CLOUD_REGION_ID")
+	}
+	if p, ok := rrsaCredentialsProvider(region); ok {
+		if p.region == "" {
+			return nil, fmt.Errorf("s3: RRSA credentials require a region; set S3 region or ALIBABA_CLOUD_REGION_ID")
+		}
+		return p, nil
+	}
+	accessKeyID, secretAccessKey, sessionToken := aliyunCredentials()
+	if accessKeyID != "" {
+		if secretAccessKey == "" {
+			return nil, fmt.Errorf("s3: ALIBABA_CLOUD_ACCESS_KEY_ID is set but ALIBABA_CLOUD_ACCESS_KEY_SECRET is empty")
+		}
+		return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, sessionToken), nil
+	}
+	return nil, nil
+}
+
+// newAliyun builds an AWSS3Client using the Aliyun credential priority chain.
+func newAliyun(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
+	provider, err := credentialsForAliyun(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return buildS3Client(ctx, cfg, provider)
+}

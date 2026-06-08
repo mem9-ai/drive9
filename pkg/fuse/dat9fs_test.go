@@ -3,6 +3,7 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path"
 	"reflect"
 	"sort"
 	"strconv"
@@ -286,6 +288,132 @@ func TestUnknownInlineThresholdNonEmptyHandleUploadUsesMultipart(t *testing.T) {
 				t.Fatalf("uploaded bytes = %d, want %d", uploadedBytes, len(data))
 			}
 		})
+	}
+}
+
+func TestFlushHandlePatchAfterLazyTruncatePreservesRemotePrefix(t *testing.T) {
+	const (
+		filePath = "/patch-truncate.bin"
+		origSize = 300_000
+		newSize  = 202_324
+		baseRev  = 7
+	)
+
+	remote := make([]byte, origSize)
+	for i := range remote {
+		remote[i] = byte((i*31)%251 + 1)
+	}
+
+	var (
+		mu          sync.Mutex
+		patchCalls  atomic.Int32
+		uploadCalls atomic.Int32
+		uploaded    []byte
+	)
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			_, _ = w.Write(remote)
+			return
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs"+filePath:
+			patchCalls.Add(1)
+			var req struct {
+				NewSize          int64 `json:"new_size"`
+				DirtyParts       []int `json:"dirty_parts"`
+				PartSize         int64 `json:"part_size"`
+				ExpectedRevision int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode patch request: %v", err)
+			}
+			if req.NewSize != newSize {
+				t.Fatalf("patch new_size = %d, want %d", req.NewSize, newSize)
+			}
+			if !reflect.DeepEqual(req.DirtyParts, []int{1}) {
+				t.Fatalf("patch dirty_parts = %v, want [1]", req.DirtyParts)
+			}
+			if req.PartSize != DefaultPartSize {
+				t.Fatalf("patch part_size = %d, want %d", req.PartSize, DefaultPartSize)
+			}
+			if req.ExpectedRevision != baseRev {
+				t.Fatalf("patch expected_revision = %d, want %d", req.ExpectedRevision, baseRev)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id": "patch-upload-1",
+				"part_size": int64(DefaultPartSize),
+				"upload_parts": []map[string]any{
+					{
+						"number": 1,
+						"url":    ts.URL + "/s3/patch-upload-1/1",
+						"size":   int64(newSize),
+					},
+				},
+				"copied_parts": []int{},
+			})
+			return
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/patch-upload-1/1":
+			uploadCalls.Add(1)
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read patch upload: %v", err)
+			}
+			mu.Lock()
+			uploaded = append(uploaded[:0], body...)
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/patch-upload-1/complete":
+			w.WriteHeader(http.StatusOK)
+			return
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, origSize, time.Now())
+	fs.inodes.UpdateRevision(ino, baseRev)
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: origSize,
+		BaseRev:  baseRev,
+	}
+	fh.Lock()
+	fs.rebindCleanWriteBufferToRemoteLocked(fh, origSize)
+	fh.Unlock()
+
+	fh.Lock()
+	if err := fs.truncateWritableHandleLocked(fh, newSize); err != nil {
+		fh.Unlock()
+		t.Fatalf("truncateWritableHandleLocked: %v", err)
+	}
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if got := patchCalls.Load(); got != 1 {
+		t.Fatalf("patch calls = %d, want 1", got)
+	}
+	if got := uploadCalls.Load(); got != 1 {
+		t.Fatalf("patch upload calls = %d, want 1", got)
+	}
+	mu.Lock()
+	got := append([]byte(nil), uploaded...)
+	mu.Unlock()
+	if !bytes.Equal(got, remote[:newSize]) {
+		gotHash := sha256.Sum256(got)
+		wantHash := sha256.Sum256(remote[:newSize])
+		t.Fatalf("patch upload did not preserve prefix: got_sha256=%x want_sha256=%x", gotHash, wantHash)
 	}
 }
 
@@ -1282,6 +1410,11 @@ func TestDat9FSParallelDiskReadStopsQueuedBlocksAfterFirstError(t *testing.T) {
 		rangeHeader := r.Header.Get("Range")
 		switch rangeHeader {
 		case "bytes=0-63":
+			select {
+			case <-slowStarted:
+			case <-r.Context().Done():
+				return
+			}
 			http.Error(w, "blocked range", http.StatusBadGateway)
 			return
 		case "bytes=64-127":
@@ -5511,6 +5644,52 @@ func TestOpenReadOnlySQLiteUsesDirectIO(t *testing.T) {
 	}
 }
 
+func TestOpenReadOnlyPendingShadowUsesDirectIO(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.pendingIndex = pending
+
+	path := "/handles/open-renamed.txt"
+	data := []byte("pending shadow bytes")
+	if err := shadow.WriteFull(path, data, 0); err != nil {
+		t.Fatalf("WriteFull: %v", err)
+	}
+	if _, err := pending.PutWithBaseRev(path, int64(len(data)), PendingOverwrite, 0); err != nil {
+		t.Fatalf("PutWithBaseRev: %v", err)
+	}
+	ino := fs.inodes.Lookup(path, false, int64(len(data)), time.Now())
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if out.OpenFlags != gofuse.FOPEN_DIRECT_IO {
+		t.Fatalf("open flags = %d, want FOPEN_DIRECT_IO for pending shadow coherence", out.OpenFlags)
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if !fh.ShadowPinned || fh.ShadowGen == 0 {
+		t.Fatalf("shadow pin = (%v, %d), want pinned generation", fh.ShadowPinned, fh.ShadowGen)
+	}
+}
+
 func TestOpenWritableSQLiteUsesDirectIO(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
@@ -5938,6 +6117,7 @@ func TestSQLiteWALIndexSidecarUsesTransientLocalOverlay(t *testing.T) {
 	if err := fs.transientLocalOverlay.EnsureRoot(); err != nil {
 		t.Fatalf("EnsureRoot transient overlay: %v", err)
 	}
+	fs.openHandles.Add(&FileHandle{Path: "/repo/workload.db"})
 
 	ctx := context.Background()
 	if overlay, local, st := fs.localOverlayForPath(ctx, "/repo/workload.db-shm"); !local || st != gofuse.OK || overlay != fs.transientLocalOverlay {
@@ -6035,6 +6215,7 @@ func TestSQLiteWALIndexSidecarFailsClosedWhenTransientOverlayMissing(t *testing.
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.openHandles.Add(&FileHandle{Path: "/repo/workload.db"})
 
 	overlay, local, st := fs.localOverlayForPath(context.Background(), "/repo/workload.db-shm")
 	if overlay != nil || !local || st != gofuse.EIO {
@@ -7149,6 +7330,358 @@ func TestOpenWritablePreloadChoosesNewestOpenHandle(t *testing.T) {
 	}
 }
 
+func TestOpenWritablePreloadSkipsCleanSiblingReboundToNewRevision(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	const filePath = "/workload.db"
+	stale := []byte("sqlite db before checkpoint")
+	committedSize := int64(len("sqlite db after checkpoint with event rows"))
+	ino := fs.inodes.Lookup(filePath, false, int64(len(stale)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	sibling := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: int64(len(stale)),
+		BaseRev:  1,
+	}
+	if _, err := sibling.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	sibling.Dirty.ClearDirty()
+	fs.openHandles.Add(sibling)
+
+	fs.inodes.UpdateSize(ino, committedSize)
+	fs.refreshCommittedRevisionForOpenHandles(filePath, 2, nil)
+
+	if sibling.BaseRev != 2 {
+		t.Fatalf("sibling BaseRev = %d, want 2", sibling.BaseRev)
+	}
+	if sibling.OrigSize != committedSize {
+		t.Fatalf("sibling OrigSize = %d, want %d", sibling.OrigSize, committedSize)
+	}
+	target := &FileHandle{
+		Ino:     ino,
+		Path:    filePath,
+		Dirty:   fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		BaseRev: 2,
+	}
+	if fs.loadWritableHandleFromOpenHandleLocked(target) {
+		t.Fatal("clean sibling rebound to a newer revision must not be used as preload data")
+	}
+	if got := target.Dirty.Size(); got != 0 {
+		t.Fatalf("target dirty size = %d, want 0", got)
+	}
+}
+
+func TestReadCleanWritableHandleRefreshesSkippedCommittedRevision(t *testing.T) {
+	stale := []byte("sqlite db before checkpoint")
+	fresh := []byte("sqlite db after checkpoint with event rows")
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(fresh)), func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fresh)
+			return
+		}
+		start, end, ok := parseTestBytesRange(r.Header.Get("Range"))
+		if !ok {
+			t.Errorf("Range = %q, want bytes range", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if start < 0 || end >= int64(len(fresh)) {
+			t.Errorf("Range = %q outside fresh object", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(fresh[start : end+1])
+	})
+	defer cleanup()
+
+	const filePath = "/file.bin"
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: int64(len(stale)),
+		BaseRev:  1,
+	}
+	if _, err := fh.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fhID := fs.allocateFileHandle(fh)
+
+	fs.inodes.UpdateSize(ino, int64(len(fresh)))
+	fs.recordCommittedRevision(filePath, 2)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fhID, 0, len(fresh))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, fresh) {
+		t.Fatalf("Read returned stale clean buffer: got %q want %q", got, fresh)
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if fh.BaseRev != 2 {
+		t.Fatalf("fh.BaseRev = %d, want 2", fh.BaseRev)
+	}
+	if fh.OrigSize != int64(len(fresh)) {
+		t.Fatalf("fh.OrigSize = %d, want %d", fh.OrigSize, len(fresh))
+	}
+}
+
+func TestReadCleanShadowBackedHandleRefreshesRemovedCommittedShadow(t *testing.T) {
+	stale := []byte("old shadow bytes")
+	fresh := []byte("fresh committed remote bytes")
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(fresh)), func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fresh)
+			return
+		}
+		start, end, ok := parseTestBytesRange(r.Header.Get("Range"))
+		if !ok {
+			t.Errorf("Range = %q, want bytes range", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if start < 0 || end >= int64(len(fresh)) {
+			t.Errorf("Range = %q outside fresh object", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(fresh[start : end+1])
+	})
+	defer cleanup()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	const filePath = "/file.bin"
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize:    int64(len(stale)),
+		BaseRev:     1,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+	if _, err := fh.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fhID := fs.allocateFileHandle(fh)
+
+	fs.inodes.UpdateSize(ino, int64(len(fresh)))
+	fs.recordCommittedRevision(filePath, 2)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fhID, 0, len(fresh))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, fresh) {
+		t.Fatalf("Read returned stale removed shadow: got %q want %q", got, fresh)
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if fh.BaseRev != 2 {
+		t.Fatalf("fh.BaseRev = %d, want 2", fh.BaseRev)
+	}
+	if fh.OrigSize != int64(len(fresh)) {
+		t.Fatalf("fh.OrigSize = %d, want %d", fh.OrigSize, len(fresh))
+	}
+	if fh.ShadowReady || fh.ShadowSpill || fh.ShadowCommitReady {
+		t.Fatalf("shadow flags = ready:%t spill:%t commit:%t, want all false", fh.ShadowReady, fh.ShadowSpill, fh.ShadowCommitReady)
+	}
+}
+
+func TestReadCleanShadowBackedHandleRefreshesActiveStaleShadow(t *testing.T) {
+	stale := []byte("old active shadow bytes")
+	fresh := []byte("fresh committed remote bytes")
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(fresh)), func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fresh)
+			return
+		}
+		start, end, ok := parseTestBytesRange(r.Header.Get("Range"))
+		if !ok {
+			t.Errorf("Range = %q, want bytes range", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if start < 0 || end >= int64(len(fresh)) {
+			t.Errorf("Range = %q outside fresh object", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(fresh[start : end+1])
+	})
+	defer cleanup()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	const filePath = "/file.bin"
+	if err := shadow.WriteFull(filePath, stale, 1); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize:    int64(len(stale)),
+		BaseRev:     1,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+	if _, err := fh.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fhID := fs.allocateFileHandle(fh)
+
+	fs.inodes.UpdateSize(ino, int64(len(fresh)))
+	fs.recordCommittedRevision(filePath, 2)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fhID, 0, len(fresh))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, fresh) {
+		t.Fatalf("Read returned stale active shadow: got %q want %q", got, fresh)
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if fh.BaseRev != 2 {
+		t.Fatalf("fh.BaseRev = %d, want 2", fh.BaseRev)
+	}
+	if fh.OrigSize != int64(len(fresh)) {
+		t.Fatalf("fh.OrigSize = %d, want %d", fh.OrigSize, len(fresh))
+	}
+	if fh.ShadowReady || fh.ShadowSpill || fh.ShadowCommitReady {
+		t.Fatalf("shadow flags = ready:%t spill:%t commit:%t, want all false", fh.ShadowReady, fh.ShadowSpill, fh.ShadowCommitReady)
+	}
+
+	var roOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &roOut)
+	if st != gofuse.OK {
+		t.Fatalf("read-only Open status = %v, want OK", st)
+	}
+	got, st, err = readDat9FSTestRange(fs, ino, roOut.Fh, 0, len(fresh))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("read-only Read status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, fresh) {
+		t.Fatalf("read-only handle pinned stale active shadow: got %q want %q", got, fresh)
+	}
+}
+
+func TestDebouncedFlushPublishesSizeBeforeRefreshingCleanSibling(t *testing.T) {
+	stale := []byte("old")
+	fresh := []byte("fresh committed bytes")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read PUT body: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if !bytes.Equal(body, fresh) {
+				t.Errorf("PUT body = %q, want %q", body, fresh)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 2})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: time.Hour}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/small.txt"
+	ino := fs.inodes.Lookup(filePath, false, int64(len(stale)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	writer := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: int64(len(stale)),
+		BaseRev:  1,
+	}
+	if _, err := writer.Dirty.Write(0, fresh); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+
+	sibling := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: int64(len(stale)),
+		BaseRev:  1,
+	}
+	if _, err := sibling.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	sibling.Dirty.ClearDirty()
+	fs.openHandles.Add(sibling)
+
+	writer.Lock()
+	st := fs.flushHandleDebounced(context.Background(), writer, false)
+	writer.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandleDebounced status = %v, want OK", st)
+	}
+	fs.debouncer.FlushAll()
+
+	if sibling.BaseRev != 2 {
+		t.Fatalf("sibling BaseRev = %d, want 2", sibling.BaseRev)
+	}
+	if sibling.OrigSize != int64(len(fresh)) {
+		t.Fatalf("sibling OrigSize = %d, want %d", sibling.OrigSize, len(fresh))
+	}
+}
+
 func TestOpenWritablePreloadSkipsSQLitePersistentJournalOpenHandle(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
@@ -8156,6 +8689,219 @@ func TestReadSQLiteSamePathDirtyHandleBeforeShadowStore(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("read bytes = %q, want latest dirty bytes %q", got, want)
+	}
+}
+
+func TestUnlinkPreservesOpenReadHandleSnapshot(t *testing.T) {
+	const filePath = "/unlink-open.bin"
+	want := []byte("open handle must keep these bytes after unlink")
+	var deleted atomic.Bool
+	var objectGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(want)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Location", ts.URL+"/object/unlink-open")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object/unlink-open":
+			objectGets.Add(1)
+			if deleted.Load() {
+				http.Error(w, "object deleted", http.StatusGone)
+				return
+			}
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(want)-1) {
+				http.Error(w, "wrong range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(want)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+filePath:
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(want)), time.Now())
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: int64(len(want)),
+		BaseRev:  7,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	defer fs.deleteFileHandle(readerID, reader)
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if !deleted.Load() {
+		t.Fatal("remote delete was not called")
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after unlink snapshot = %d, want 1", got)
+	}
+
+	buf := make([]byte, 128)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("read bytes after unlink = %q, want %q", got, want)
+	}
+	if got := objectGets.Load(); got != 1 {
+		t.Fatalf("object gets after open-handle read = %d, want still 1", got)
+	}
+}
+
+func TestRenameReplacePreservesOpenDestinationSnapshotAndSourceHandle(t *testing.T) {
+	const oldPath = "/replace-source.bin"
+	const newPath = "/work.bin"
+	oldDst := []byte("destination bytes that an existing open fh must retain")
+	replacement := []byte("replacement bytes from the renamed source")
+	var renamed atomic.Bool
+	var oldDstObjectGets atomic.Int64
+	var replacementPathGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+newPath:
+			if renamed.Load() {
+				replacementPathGets.Add(1)
+				_, _ = w.Write(replacement)
+				return
+			}
+			w.Header().Set("Location", ts.URL+"/object/old-dst")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object/old-dst":
+			oldDstObjectGets.Add(1)
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(oldDst)-1) {
+				http.Error(w, "wrong old destination range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(oldDst)
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newPath && r.URL.RawQuery == "rename":
+			if got := r.Header.Get("X-Dat9-Rename-Source"); got != oldPath {
+				http.Error(w, "wrong rename source: "+got, http.StatusBadRequest)
+				return
+			}
+			renamed.Store(true)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	srcIno := fs.inodes.Lookup(oldPath, false, int64(len(replacement)), time.Now())
+	dstIno := fs.inodes.Lookup(newPath, false, int64(len(oldDst)), time.Now())
+	sourceHandle := &FileHandle{
+		Ino:      srcIno,
+		Path:     oldPath,
+		OrigSize: int64(len(replacement)),
+		BaseRev:  11,
+	}
+	sourceID := fs.allocateFileHandle(sourceHandle)
+	defer fs.deleteFileHandle(sourceID, sourceHandle)
+	dstHandle := &FileHandle{
+		Ino:      dstIno,
+		Path:     newPath,
+		OrigSize: int64(len(oldDst)),
+		BaseRev:  7,
+	}
+	dstID := fs.allocateFileHandle(dstHandle)
+	defer fs.deleteFileHandle(dstID, dstHandle)
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, strings.TrimPrefix(oldPath, "/"), strings.TrimPrefix(newPath, "/"))
+	if st != gofuse.OK {
+		t.Fatalf("Rename status = %v, want OK", st)
+	}
+	if !renamed.Load() {
+		t.Fatal("remote rename was not called")
+	}
+	if sourceHandle.Path != newPath {
+		t.Fatalf("source handle path = %q, want %q", sourceHandle.Path, newPath)
+	}
+	if got := oldDstObjectGets.Load(); got != 1 {
+		t.Fatalf("old destination object gets after replacement snapshot = %d, want 1", got)
+	}
+
+	buf := make([]byte, 128)
+	dstResult, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: dstIno},
+		Fh:       dstID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("destination Read status = %v, want OK", st)
+	}
+	gotDst, st := dstResult.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("destination result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(gotDst, oldDst) {
+		t.Fatalf("destination handle read bytes = %q, want original %q", gotDst, oldDst)
+	}
+	if got := oldDstObjectGets.Load(); got != 1 {
+		t.Fatalf("old destination object gets after destination handle read = %d, want still 1", got)
+	}
+
+	sourceResult, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: srcIno},
+		Fh:       sourceID,
+		Offset:   0,
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("source Read status = %v, want OK", st)
+	}
+	gotSource, st := sourceResult.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("source result.Bytes status = %v, want OK", st)
+	}
+	if !bytes.Equal(gotSource, replacement) {
+		t.Fatalf("source handle read bytes = %q, want replacement %q", gotSource, replacement)
+	}
+	if got := replacementPathGets.Load(); got != 1 {
+		t.Fatalf("replacement path gets = %d, want 1", got)
 	}
 }
 
@@ -11559,6 +12305,491 @@ func TestRenamePendingNewCommitUsesRemoteRenameWhenCanceledUploadBecameVisible(t
 	}
 }
 
+func TestAtomicTempWriteFsyncReleaseRenamePreservesMultipartBody(t *testing.T) {
+	oldP := "/work/final/w0/file-000.txt.tmp.123.456"
+	newP := "/work/final/w0/file-000.txt"
+	data := bytes.Repeat([]byte("drive9-concurrency-final-000\n"), 2048)
+
+	type uploadState struct {
+		path string
+		size int64
+		body []byte
+	}
+	var (
+		mu           sync.Mutex
+		remote       = make(map[string][]byte)
+		uploads      = make(map[string]*uploadState)
+		nextUploadID int
+		renameCalls  int
+		finalUploads int
+	)
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "active",
+				"limits": map[string]any{"inline_threshold": 1},
+			})
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path      string `json:"path"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.Path != oldP && req.Path != newP {
+				t.Errorf("initiate path = %q, want %q or %q", req.Path, oldP, newP)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			nextUploadID++
+			uploadID := fmt.Sprintf("upload-%d", nextUploadID)
+			uploads[uploadID] = &uploadState{path: req.Path, size: req.TotalSize}
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   uploadID,
+				"key":         "object-key",
+				"part_size":   req.TotalSize,
+				"total_parts": 1,
+			})
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/presign-batch"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/presign-batch")
+			mu.Lock()
+			state := uploads[uploadID]
+			mu.Unlock()
+			if state == nil {
+				t.Errorf("presign unknown upload_id %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/" + uploadID + "/1",
+					"size":   state.size,
+				}},
+			})
+			return
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/"):
+			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/s3/"), "/")
+			if len(parts) != 2 {
+				t.Errorf("bad s3 path %q", r.URL.Path)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			if uploads[parts[0]] == nil {
+				t.Errorf("put unknown upload_id %q", parts[0])
+			} else {
+				uploads[parts[0]].body = append([]byte(nil), body...)
+			}
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/complete"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/complete")
+			mu.Lock()
+			state := uploads[uploadID]
+			if state == nil || len(state.body) == 0 {
+				mu.Unlock()
+				t.Errorf("complete before body for %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			remote[state.path] = append([]byte(nil), state.body...)
+			if state.path == newP {
+				finalUploads++
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/abort"):
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+newP:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if !bytes.Equal(body, data) {
+				http.Error(w, "unexpected final path body", http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			finalUploads++
+			remote[newP] = append([]byte(nil), body...)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 2})
+			return
+		case r.Method == http.MethodHead && (r.URL.Path == "/v1/fs"+oldP || r.URL.Path == "/v1/fs"+newP):
+			path := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+			mu.Lock()
+			body, ok := remote[path]
+			mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "1")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+newP && r.URL.RawQuery == "rename":
+			if got := r.Header.Get("X-Dat9-Rename-Source"); got != oldP {
+				t.Errorf("rename source = %q, want %q", got, oldP)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			body, ok := remote[oldP]
+			if !ok {
+				mu.Unlock()
+				t.Errorf("remote rename before temp path visible")
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			remote[newP] = append([]byte(nil), body...)
+			delete(remote, oldP)
+			renameCalls++
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+newP:
+			mu.Lock()
+			body, ok := remote[newP]
+			mu.Unlock()
+			if !ok {
+				http.NotFound(w, r)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+			return
+		case r.Method == http.MethodGet && r.URL.RawQuery == "list=1":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []any{}})
+			return
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncInteractive}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	queue := NewCommitQueue(c, shadow, pending, nil, 1, 8, fs.remoteRoot())
+	queue.PathLock = fs.lockRemoteCommitPath
+	queue.OnSuccess = fs.onCommitQueueSuccess
+	queue.OnCleanup = fs.onCommitQueueCleanup
+	fs.commitQueue = queue
+	defer queue.DrainAll()
+
+	parentIno := fs.inodes.Lookup("/work/final/w0", true, 0, time.Now())
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: parentIno},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC),
+		Mode:     defaultRegularFileMode,
+	}, "file-000.txt.tmp.123.456", &createOut); st != gofuse.OK {
+		t.Fatalf("Create temp: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write temp: %v", st)
+	}
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync temp: %v", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	})
+
+	beforeRenameNotify := fs.notifyCount.Load()
+	if st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: parentIno},
+		Newdir:   parentIno,
+	}, "file-000.txt.tmp.123.456", "file-000.txt"); st != gofuse.OK {
+		t.Fatalf("Rename temp to final: %v", st)
+	}
+	if got := fs.notifyCount.Load() - beforeRenameNotify; got != 2 {
+		t.Fatalf("rename notify count = %d, want 2", got)
+	}
+	queue.DrainAll()
+
+	mu.Lock()
+	gotFinal := append([]byte(nil), remote[newP]...)
+	_, oldExists := remote[oldP]
+	gotRenameCalls := renameCalls
+	gotFinalUploads := finalUploads
+	mu.Unlock()
+	if !bytes.Equal(gotFinal, data) {
+		t.Fatalf("final remote body sha=%x size=%d, want sha=%x size=%d", sha256.Sum256(gotFinal), len(gotFinal), sha256.Sum256(data), len(data))
+	}
+	if oldExists {
+		t.Fatal("old temp path still exists after remote rename")
+	}
+	if gotRenameCalls+gotFinalUploads != 1 {
+		t.Fatalf("finalization count: remote renames=%d direct uploads=%d, want exactly one", gotRenameCalls, gotFinalUploads)
+	}
+	if pending.HasPending(oldP) {
+		t.Fatal("old temp path still pending")
+	}
+	if shadow.Has(oldP) {
+		t.Fatal("old temp shadow still exists")
+	}
+	newIno, ok := fs.inodes.GetInode(newP)
+	if !ok {
+		t.Fatal("final inode missing after rename")
+	}
+	entry, ok := fs.inodes.GetEntry(newIno)
+	if !ok {
+		t.Fatal("final inode entry missing after rename")
+	}
+	if entry.Size != int64(len(data)) {
+		t.Fatalf("final inode size = %d, want %d", entry.Size, len(data))
+	}
+	if cached := fs.dirCache.Lookup("/work/final/w0", "file-000.txt"); cached.kind != namespaceLookupPositive || cached.item.Size != int64(len(data)) {
+		t.Fatalf("final dirCache entry = %+v, want positive size %d", cached, len(data))
+	}
+
+	var openOut gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: newIno},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &openOut); st != gofuse.OK {
+		t.Fatalf("Open final: %v", st)
+	}
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: newIno},
+		Fh:       openOut.Fh,
+		Size:     uint32(len(data)),
+	}, make([]byte, len(data)))
+	if st != gofuse.OK {
+		t.Fatalf("Read final: %v", st)
+	}
+	gotRead, readStatus := result.Bytes(make([]byte, len(data)))
+	if readStatus != gofuse.OK {
+		t.Fatalf("Read final bytes: %v", readStatus)
+	}
+	if !bytes.Equal(gotRead, data) {
+		t.Fatalf("final mounted read sha=%x size=%d, want sha=%x size=%d", sha256.Sum256(gotRead), len(gotRead), sha256.Sum256(data), len(data))
+	}
+}
+
+func TestFsyncStrictShadowSpillRefreshesStaleInodeSize(t *testing.T) {
+	filePath := "/work/final/w0/file-000.txt.tmp.123.456"
+	data := bytes.Repeat([]byte("drive9-concurrency-final-000\n"), 128)
+
+	type uploadState struct {
+		path string
+		size int64
+		body []byte
+	}
+	var (
+		mu           sync.Mutex
+		uploads      = make(map[string]*uploadState)
+		nextUploadID int
+	)
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path      string `json:"path"`
+				TotalSize int64  `json:"total_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.Path != filePath {
+				t.Errorf("initiate path = %q, want %q", req.Path, filePath)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			nextUploadID++
+			uploadID := fmt.Sprintf("upload-%d", nextUploadID)
+			uploads[uploadID] = &uploadState{path: req.Path, size: req.TotalSize}
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   uploadID,
+				"key":         "object-key",
+				"part_size":   req.TotalSize,
+				"total_parts": 1,
+			})
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/presign-batch"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/presign-batch")
+			mu.Lock()
+			state := uploads[uploadID]
+			mu.Unlock()
+			if state == nil {
+				t.Errorf("presign unknown upload_id %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/" + uploadID + "/1",
+					"size":   state.size,
+				}},
+			})
+			return
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/s3/"):
+			parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/s3/"), "/")
+			if len(parts) != 2 {
+				t.Errorf("bad s3 path %q", r.URL.Path)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			state := uploads[parts[0]]
+			if state == nil {
+				t.Errorf("put unknown upload_id %q", parts[0])
+			} else {
+				state.body = append([]byte(nil), body...)
+			}
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v2/uploads/") && strings.HasSuffix(r.URL.Path, "/complete"):
+			uploadID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v2/uploads/"), "/complete")
+			mu.Lock()
+			state := uploads[uploadID]
+			if state == nil || !bytes.Equal(state.body, data) {
+				mu.Unlock()
+				t.Errorf("complete body mismatch for %q", uploadID)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+			return
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncStrict}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	parentIno := fs.inodes.Lookup("/work/final/w0", true, 0, time.Now())
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: parentIno},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC),
+		Mode:     defaultRegularFileMode,
+	}, "file-000.txt.tmp.123.456", &createOut); st != gofuse.OK {
+		t.Fatalf("Create temp: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, data); st != gofuse.OK {
+		t.Fatalf("Write temp: %v", st)
+	}
+
+	fs.inodes.UpdateSize(createOut.NodeId, 0)
+	if st := fs.Fsync(nil, &gofuse.FsyncIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}); st != gofuse.OK {
+		t.Fatalf("Fsync temp: %v", st)
+	}
+	entry, ok := fs.inodes.GetEntry(createOut.NodeId)
+	if !ok {
+		t.Fatal("temp inode entry missing after fsync")
+	}
+	if entry.Size != int64(len(data)) {
+		t.Fatalf("temp inode size after fsync = %d, want %d", entry.Size, len(data))
+	}
+}
+
+func TestFinishLocalRenameInvalidatesTargetParentWhenSourceInodeGone(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	parentPath := "/work/final/w0"
+	oldP := parentPath + "/file-000.txt.tmp.123.456"
+	newP := parentPath + "/file-000.txt"
+	parentIno := fs.inodes.Lookup(parentPath, true, 0, time.Now())
+	fs.dirCache.Put(parentPath, []CachedFileInfo{{
+		Name:  path.Base(newP),
+		Size:  0,
+		IsDir: false,
+		Mtime: time.Now(),
+	}})
+
+	fs.finishLocalRename(&gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: parentIno},
+		Newdir:   parentIno,
+	}, oldP, newP)
+
+	if cached := fs.dirCache.Lookup(parentPath, path.Base(newP)); cached.kind == namespaceLookupPositive {
+		t.Fatalf("target parent cache kept stale positive entry after source inode was gone: %+v", cached.item)
+	}
+}
+
 func TestRenamePendingNewCommitSyncCommitsWhenQueueStopped(t *testing.T) {
 	oldP := "/repo/.git/objects/70/tmp_obj_sync"
 	newP := "/repo/.git/objects/70/24234d93f61104585962ac664bc5a7ed1d241d"
@@ -12743,6 +13974,57 @@ func TestReadStreamRangeWithRetryRefreshesExpiredReadTarget(t *testing.T) {
 	}
 }
 
+func TestReadOpenHandleSnapshotRetriesTransientRangeRead(t *testing.T) {
+	var objectCalls atomic.Int32
+	data := []byte("snapshot bytes after retry")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/snapshot.bin":
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/snapshot", r.Host))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/snapshot":
+			call := objectCalls.Add(1)
+			if call == 1 {
+				w.Header().Set("Content-Length", "1048576")
+				w.WriteHeader(http.StatusOK)
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				<-r.Context().Done()
+				return
+			}
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(data)-1) {
+				t.Errorf("Range = %q, want full snapshot range", got)
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	got, err := fs.readOpenHandleSnapshot(ctx, "/snapshot.bin", int64(len(data)))
+	if err != nil {
+		t.Fatalf("readOpenHandleSnapshot: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("snapshot = %q, want %q", got, data)
+	}
+	if objectCalls.Load() != 2 {
+		t.Fatalf("object calls = %d, want 2", objectCalls.Load())
+	}
+}
+
 func TestReadTargetForHandleDropsResolvedTargetAfterPathChange(t *testing.T) {
 	resolveStarted := make(chan struct{})
 	allowResolve := make(chan struct{})
@@ -13022,15 +14304,6 @@ func TestLocalMutations_NotifyBudget(t *testing.T) {
 				return fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "existingdir")
 			},
 		},
-		{
-			name: "Rename",
-			fn: func() gofuse.Status {
-				return fs.Rename(nil, &gofuse.RenameIn{
-					InHeader: gofuse.InHeader{NodeId: 1},
-					Newdir:   1,
-				}, "config.lock", "config")
-			},
-		},
 	}
 
 	for _, tc := range tests {
@@ -13045,6 +14318,45 @@ func TestLocalMutations_NotifyBudget(t *testing.T) {
 				t.Fatalf("%s produced %d kernel notify calls, want 0", tc.name, delta)
 			}
 		})
+	}
+}
+
+func TestRenameNotifiesTargetDentryAndInode(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.RawQuery == "rename":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead:
+			w.Header().Set("Content-Length", "100")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	fs.inodes.Lookup("/config.lock", false, 100, time.Now())
+	fs.inodes.Lookup("/config", false, 0, time.Now())
+
+	before := fs.notifyCount.Load()
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, "config.lock", "config")
+	if st != gofuse.OK {
+		t.Fatalf("Rename returned %v, want OK", st)
+	}
+	if delta := fs.notifyCount.Load() - before; delta != 2 {
+		t.Fatalf("Rename produced %d kernel notify calls, want 2", delta)
+	}
+	entry, ok := fs.inodes.GetInode("/config")
+	if !ok || entry == 0 {
+		t.Fatal("renamed target inode missing")
 	}
 }
 
@@ -13190,6 +14502,49 @@ func TestOnCommitQueueSuccess_NoKernelNotify_SeedsReadCache(t *testing.T) {
 	// Verify dirCache was invalidated.
 	if _, cached := fs.dirCache.Get("/"); cached {
 		t.Fatal("parent dirCache should have been invalidated")
+	}
+}
+
+func TestOnCommitQueueSuccessMultipartRefreshesInodeSize(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+
+	filePath := "/final/w0/file-000.txt"
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("initial inode entry not found")
+	}
+	if entry.Size != 0 {
+		t.Fatalf("initial inode size = %d, want 0", entry.Size)
+	}
+
+	const wantSize = 32820
+	before := fs.notifyCount.Load()
+	fs.onCommitQueueSuccess(&CommitEntry{
+		Path:  filePath,
+		Inode: ino,
+		Size:  wantSize,
+	}, 0)
+	if got := fs.notifyCount.Load() - before; got != 1 {
+		t.Fatalf("kernel inode notify count = %d, want 1", got)
+	}
+
+	entry, ok = fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found")
+	}
+	if entry.Size != wantSize {
+		t.Fatalf("inode size = %d, want %d", entry.Size, wantSize)
+	}
+
+	lookup := fs.dirCache.Lookup("/final/w0", "file-000.txt")
+	if lookup.kind != namespaceLookupPositive {
+		t.Fatal("dirCache entry not found")
+	}
+	if lookup.item.Size != wantSize {
+		t.Fatalf("dirCache size = %d, want %d", lookup.item.Size, wantSize)
 	}
 }
 

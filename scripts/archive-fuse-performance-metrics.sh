@@ -103,7 +103,7 @@ branch_latest_dir="${ARCHIVE_ROOT}/branches/${branch_slug}"
 manifest="$(mktemp)"
 latest_manifest="$(mktemp)"
 
-python3 - "$SOURCE_DIR" "$manifest" <<'PY'
+python3 - "$SOURCE_DIR" "$manifest" "$remote_dir" "${branch_latest_dir}/latest.json" "${ARCHIVE_ROOT}/latest.json" <<'PY'
 import hashlib
 import json
 import os
@@ -113,6 +113,9 @@ from pathlib import Path
 
 source = Path(sys.argv[1]).resolve()
 manifest_path = Path(sys.argv[2])
+archive_path = sys.argv[3]
+branch_latest_path = sys.argv[4]
+global_latest_path = sys.argv[5]
 files = []
 for path in sorted(p for p in source.rglob("*") if p.is_file()):
     data = path.read_bytes()
@@ -132,6 +135,9 @@ doc = {
     "workflow": os.environ.get("DRIVE9_PERF_WORKFLOW") or os.environ.get("GITHUB_WORKFLOW") or "local-e2e",
     "event_name": os.environ.get("DRIVE9_PERF_EVENT_NAME") or os.environ.get("GITHUB_EVENT_NAME") or "manual",
     "archived_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "archive_path": archive_path,
+    "branch_latest_path": branch_latest_path,
+    "global_latest_path": global_latest_path,
     "files": files,
 }
 manifest_path.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")

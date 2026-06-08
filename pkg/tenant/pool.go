@@ -45,6 +45,12 @@ type PoolConfig struct {
 	// ensure/validate steps during Acquire. Used in tests that run
 	// against plain MySQL but need a TiDB-class provider for vault.
 	SkipTiDBSchemaCheck bool
+
+	// DisableDatabaseAutoEmbedding forces DatabaseAutoEmbedding=false for all
+	// tenants, even when the provider normally enables it (tidb_zero,
+	// tidb_cloud_starter). Use when the TiDB Cloud cluster does not have a
+	// supported auto-embedding provider configured.
+	DisableDatabaseAutoEmbedding bool
 }
 
 type Pool struct {
@@ -399,10 +405,22 @@ func (p *Pool) AutoSemanticTaskTypes() []semantic.TaskType {
 	if backend.AsyncAudioExtractWillWireRuntime(p.cfg.BackendOptions.AsyncAudioExtract) {
 		out = append(out, semantic.TaskTypeAudioExtractText)
 	}
+	// When database auto-embedding is disabled, image/audio extract tasks are
+	// still valid (they don't depend on EMBED_TEXT). However the semantic worker
+	// routing for TiDB auto-embedding is suppressed, which is handled in
+	// taskTypesForProvider via IsAutoEmbeddingDisabled().
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// IsAutoEmbeddingDisabled reports whether database auto-embedding has been
+// explicitly disabled for this pool via DisableDatabaseAutoEmbedding.
+// This is distinct from AutoSemanticTaskTypes returning nil because no
+// image/audio extract is configured.
+func (p *Pool) IsAutoEmbeddingDisabled() bool {
+	return p != nil && p.cfg.DisableDatabaseAutoEmbedding
 }
 
 func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantID string) (out *backend.Dat9Backend) {
@@ -444,7 +462,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	}
 	opts.TenantID = t.ID
 	opts.S3EncryptionPolicy = resolvedEncryptionPolicy
-	if UsesTiDBAutoEmbedding(t.Provider) {
+	if UsesTiDBAutoEmbedding(t.Provider) && !p.cfg.DisableDatabaseAutoEmbedding {
 		opts.DatabaseAutoEmbedding = true
 	}
 	query := "parseTime=true"
@@ -456,6 +474,9 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	store, err := datastore.Open(dsn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open datastore: %w", err)
+	}
+	if p.cfg.DisableDatabaseAutoEmbedding && UsesTiDBAutoEmbedding(t.Provider) {
+		store.DisableAutoEmbedTextWrites()
 	}
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
@@ -509,7 +530,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		opts.StorageNamespaceID = ns.ID
 		prefix := ns.Prefix
 		s3ClientStart := time.Now()
-		s3c, err := s3client.NewAWS(ctx, s3client.AWSConfig{
+		s3c, err := s3client.New(ctx, s3client.AWSConfig{
 			Region:          p.cfg.S3Region,
 			Bucket:          p.cfg.S3Bucket,
 			Prefix:          prefix,

@@ -57,6 +57,7 @@ type mountFuseOptions struct {
 	LocalRoot               string
 	LocalOnlyPatterns       []string
 	RemoteOnlyPatterns      []string
+	PackPaths               []string
 	UploadConcurrency       int
 	ReadConcurrency         int
 	ParallelReadConcurrency int

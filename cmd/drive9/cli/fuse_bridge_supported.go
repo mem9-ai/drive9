@@ -50,6 +50,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		LocalRoot:               opts.LocalRoot,
 		LocalOnlyPatterns:       opts.LocalOnlyPatterns,
 		RemoteOnlyPatterns:      opts.RemoteOnlyPatterns,
+		PackPaths:               opts.PackPaths,
 		UploadConcurrency:       opts.UploadConcurrency,
 		ReadConcurrency:         opts.ReadConcurrency,
 		ParallelReadConcurrency: opts.ParallelReadConcurrency,
