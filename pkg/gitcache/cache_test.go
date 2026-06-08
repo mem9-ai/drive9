@@ -86,13 +86,14 @@ func TestWorkspaceDeletedMarkerLifecycle(t *testing.T) {
 }
 
 func TestWorkspaceDeletedMarkerHonorsCanceledContext(t *testing.T) {
+	localRoot := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := MarkWorkspaceDeleted(ctx, t.TempDir(), "ws1"); err == nil {
+	if err := MarkWorkspaceDeleted(ctx, localRoot, "ws1"); err == nil {
 		t.Fatal("MarkWorkspaceDeleted with canceled context err = nil, want error")
 	}
-	if WorkspaceDeleted(ctx, t.TempDir(), "ws1") {
-		t.Fatal("WorkspaceDeleted with canceled context = true, want false")
+	if WorkspaceDeleted(context.Background(), localRoot, "ws1") {
+		t.Fatal("WorkspaceDeleted after canceled mark = true, want false")
 	}
 }
 

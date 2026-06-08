@@ -72,6 +72,10 @@ func (rt *gitWorkspaceRuntime) isLinked() bool {
 	return rt != nil && rt.workspace.WorkspaceKind == "linked"
 }
 
+func gitWorkspaceIsFastBlobless(rt *gitWorkspaceRuntime) bool {
+	return rt != nil && rt.workspace.Mode == gitWorkspaceModeFastBlobless
+}
+
 type gitMaterializeCall struct {
 	done chan struct{}
 	data []byte
@@ -1317,6 +1321,9 @@ func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceR
 			rt.updateCleanNodeSize(rel, nodeCommit, size)
 			return size
 		}
+	}
+	if gitWorkspaceIsFastBlobless(rt) {
+		return n.SizeBytes
 	}
 	if n.ObjectSHA != "" {
 		if size, err := fs.gitCatFileBlobSize(ctx, rt, n.ObjectSHA); err == nil {

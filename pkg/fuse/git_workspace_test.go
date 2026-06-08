@@ -1860,6 +1860,28 @@ func TestGitWorkspaceUnknownSizeLookupUsesBlobCacheSize(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceBloblessUnknownSizeLookupSkipsGitSizeProbe(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.mode = gitWorkspaceModeFastBlobless
+	fixture.readmeSize = -1
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, PerfCounters: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := lookupOut.Size; got != 0 {
+		t.Fatalf("Lookup size = %d, want unknown/0", got)
+	}
+	snap := fs.perf.snapshot()
+	if got := snap.Counters["git_cat_file_count"]; got != 0 {
+		t.Fatalf("git_cat_file_count = %d, want 0", got)
+	}
+}
+
 func TestGitWorkspaceOverlayWinsOverCleanCache(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	fixture.overlay["README.md"] = client.GitOverlayEntry{

@@ -164,9 +164,6 @@ func gitClone(args []string) error {
 	if err != nil {
 		return fmt.Errorf("register git workspace: %w", err)
 	}
-	if err := clearLocalGitWorkspaceDeleted(cmdCtx, resolved, ws.WorkspaceID); err != nil {
-		return fmt.Errorf("clear stale local git workspace deletion marker: %w", err)
-	}
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	if err := c.ReplaceGitTree(ctx, ws.WorkspaceID, client.GitTreeReplaceRequest{
 		CommitSHA: head,
@@ -202,6 +199,9 @@ func gitClone(args []string) error {
 				fmt.Fprintf(os.Stderr, "drive9: warning: could not start background hydrate: %v\n", err)
 			}
 		}
+	}
+	if err := clearLocalGitWorkspaceDeleted(cmdCtx, resolved, ws.WorkspaceID); err != nil {
+		return fmt.Errorf("clear stale local git workspace deletion marker: %w", err)
 	}
 	return nil
 }
@@ -367,9 +367,6 @@ func gitWorktreeAdd(args []string) error {
 	if err != nil {
 		return fmt.Errorf("register linked git workspace: %w", err)
 	}
-	if err := clearLocalGitWorkspaceDeleted(cmdCtx, worktreeResolved, ws.WorkspaceID); err != nil {
-		return fmt.Errorf("clear stale linked git workspace deletion marker: %w", err)
-	}
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	if err := c.ReplaceGitTree(ctx, ws.WorkspaceID, client.GitTreeReplaceRequest{
 		CommitSHA: head,
@@ -408,6 +405,9 @@ func gitWorktreeAdd(args []string) error {
 				fmt.Fprintf(os.Stderr, "drive9: warning: could not start background hydrate: %v\n", err)
 			}
 		}
+	}
+	if err := clearLocalGitWorkspaceDeleted(cmdCtx, worktreeResolved, ws.WorkspaceID); err != nil {
+		return fmt.Errorf("clear stale linked git workspace deletion marker: %w", err)
 	}
 	return nil
 }
