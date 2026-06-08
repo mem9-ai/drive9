@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -82,14 +81,11 @@ func staticCredentialsProvider(cfg AWSConfig) (aws.CredentialsProvider, bool, er
 	secretAccessKey := cfg.SecretAccessKey
 	sessionToken := cfg.SessionToken
 
-	if accessKeyID == "" && strings.Contains(cfg.Endpoint, "aliyuncs.com") {
-		// On Alibaba Cloud ACK, credentials are injected as ALIBABA_CLOUD_* env
-		// vars (RRSA, ECS RAM role, credential helper). Only apply this fallback
-		// when the endpoint is an Aliyun endpoint to avoid using Aliyun credentials
-		// against AWS services by mistake.
-		accessKeyID = os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_ID")
-		secretAccessKey = os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
-		sessionToken = os.Getenv("ALIBABA_CLOUD_SECURITY_TOKEN")
+	if accessKeyID == "" && isAliyunEndpoint(cfg.Endpoint) {
+		// On Alibaba Cloud ACK, credentials are injected via RRSA or ECS RAM roles
+		// as ALIBABA_CLOUD_* env vars. Only apply this fallback for Aliyun endpoints
+		// to avoid using Aliyun credentials against AWS services by mistake.
+		accessKeyID, secretAccessKey, sessionToken = aliyunCredentials()
 	}
 
 	if accessKeyID == "" {
