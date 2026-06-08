@@ -129,3 +129,94 @@ func TestLocalPolicyRuntimePathWhitespaceIsNotTrimmedIntoMatch(t *testing.T) {
 		t.Fatalf("runtime path with spaced .git segment = %s, want remote persistent", got)
 	}
 }
+
+func TestSQLiteWALIndexPathMatching(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "/repo/workload.db-shm", want: true},
+		{path: "/repo/workload.sqlite-shm", want: true},
+		{path: "/repo/workload-shm", want: true},
+		{path: "/repo/workload.db-wal", want: false},
+		{path: "/repo/workload.db-journal", want: false},
+		{path: "/repo/-shm", want: false},
+		{path: `repo\\workload.db-shm`, want: false},
+	}
+
+	for _, test := range tests {
+		if got := isSQLiteWALIndexPath(test.path); got != test.want {
+			t.Errorf("isSQLiteWALIndexPath(%q) = %t, want %t", test.path, got, test.want)
+		}
+	}
+}
+
+func TestSQLitePersistentJournalPathMatching(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "/repo/workload.db-wal", want: true},
+		{path: "/repo/workload.sqlite-wal", want: true},
+		{path: "/repo/workload-wal", want: true},
+		{path: "/repo/workload.db-journal", want: true},
+		{path: "/repo/workload.sqlite-journal", want: true},
+		{path: "/repo/workload-journal", want: true},
+		{path: "/repo/workload.db-shm", want: false},
+		{path: "/repo/workload.db", want: false},
+		{path: "/repo/-wal", want: false},
+		{path: "/repo/-journal", want: false},
+		{path: `repo\\workload.db-wal`, want: false},
+	}
+
+	for _, test := range tests {
+		if got := isSQLitePersistentJournalPath(test.path); got != test.want {
+			t.Errorf("isSQLitePersistentJournalPath(%q) = %t, want %t", test.path, got, test.want)
+		}
+	}
+}
+
+func TestSQLiteVisibleSamePathDirtyPathMatching(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "/repo/workload.db", want: true},
+		{path: "/repo/workload.sqlite", want: true},
+		{path: "/repo/workload.sqlite3", want: true},
+		{path: "/repo/workload.db-wal", want: false},
+		{path: "/repo/workload.db-journal", want: false},
+		{path: "/repo/workload.db-shm", want: false},
+		{path: "/repo/notes.txt", want: false},
+		{path: "/repo/db", want: false},
+		{path: `repo\\workload.db`, want: false},
+	}
+
+	for _, test := range tests {
+		if got := isSQLiteVisibleSamePathDirtyPath(test.path); got != test.want {
+			t.Errorf("isSQLiteVisibleSamePathDirtyPath(%q) = %t, want %t", test.path, got, test.want)
+		}
+	}
+}
+
+func TestSQLiteDirectIOPathMatching(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{path: "/repo/workload.db", want: true},
+		{path: "/repo/workload.sqlite", want: true},
+		{path: "/repo/workload.sqlite3", want: true},
+		{path: "/repo/workload.db-wal", want: true},
+		{path: "/repo/workload.db-journal", want: true},
+		{path: "/repo/workload.db-shm", want: false},
+		{path: "/repo/notes.txt", want: false},
+		{path: `repo\\workload.db-wal`, want: false},
+	}
+
+	for _, test := range tests {
+		if got := isSQLiteDirectIOPath(test.path); got != test.want {
+			t.Errorf("isSQLiteDirectIOPath(%q) = %t, want %t", test.path, got, test.want)
+		}
+	}
+}

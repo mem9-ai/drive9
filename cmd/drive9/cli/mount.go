@@ -25,9 +25,11 @@ import (
 )
 
 const (
-	defaultFuseLookupRetryCount   = 3
-	defaultFuseLookupRetryTimeout = 2 * time.Second
-	defaultFuseReadConcurrency    = 24
+	defaultFuseLookupRetryCount        = 3
+	defaultFuseLookupRetryTimeout      = 2 * time.Second
+	defaultFuseReadConcurrency         = 24
+	defaultFuseParallelReadConcurrency = 4
+	defaultFuseParallelReadBlockSizeMB = 1
 )
 
 var (
@@ -101,6 +103,8 @@ func fsMountCmd(args []string) error {
 	lookupRetryCount := fs.Int("lookup-retry-count", defaultFuseLookupRetryCount, "detached retries after transient Lookup/GetAttr stat failures (set 0 to disable)")
 	lookupRetryTimeout := fs.Duration("lookup-retry-timeout", defaultFuseLookupRetryTimeout, "timeout per detached Lookup/GetAttr stat retry (must be > 0 when set)")
 	readConcurrency := fs.Int("read-concurrency", defaultFuseReadConcurrency, "maximum concurrent backend reads issued by FUSE")
+	parallelReadConcurrency := fs.Int("parallel-read-concurrency", defaultFuseParallelReadConcurrency, "maximum concurrent block reads for one large FUSE read")
+	parallelReadBlockSize := fs.Int64("parallel-read-block-size-mb", defaultFuseParallelReadBlockSizeMB, "block size in MB for parallel large-file reads")
 	syncRead := fs.Bool("fuse-sync-read", false, "disable kernel async read dispatch; at most one read in flight per file handle")
 	legacyDirStatFallback := fs.Bool("legacy-dir-stat-fallback", false, "on Lookup stat 404, list parent to support legacy servers without directory stat")
 	readDirPrefetch := fs.Bool("readdir-prefetch", false, "prefetch small files after directory reads into the read cache")
@@ -174,6 +178,12 @@ func fsMountCmd(args []string) error {
 	}
 	if *readConcurrency <= 0 {
 		return fmt.Errorf("drive9 mount: --read-concurrency must be > 0")
+	}
+	if *parallelReadConcurrency <= 0 {
+		return fmt.Errorf("drive9 mount: --parallel-read-concurrency must be > 0")
+	}
+	if *parallelReadBlockSize <= 0 {
+		return fmt.Errorf("drive9 mount: --parallel-read-block-size-mb must be > 0")
 	}
 	if *uploadConcurrency <= 0 {
 		return fmt.Errorf("drive9 mount: --upload-concurrency must be > 0")
@@ -350,43 +360,45 @@ func fsMountCmd(args []string) error {
 
 	// FUSE path (existing behavior).
 	opts := &mountFuseOptions{
-		Server:                 *server,
-		APIKey:                 *apiKey,
-		Token:                  token,
-		MountPoint:             mountPoint,
-		RemoteRoot:             remoteRoot,
-		CacheDir:               *cacheDir,
-		CacheSize:              int64(*cacheSize) << 20,
-		ReadCacheMaxFileBytes:  *readCacheMaxFile << 20,
-		DiskReadCacheSize:      *diskReadCacheSize << 20,
-		DiskReadCacheFreeRatio: *diskReadCacheFreeRatio,
-		DirTTL:                 normalizedDirTTL,
-		AttrTTL:                normalizedAttrTTL,
-		EntryTTL:               normalizedEntryTTL,
-		FlushDebounce:          *flushDebounce,
-		LookupRetryCount:       normalizedLookupRetryCount,
-		LookupRetryTimeout:     normalizedLookupRetryTimeout,
-		LegacyDirStatFallback:  *legacyDirStatFallback,
-		ReadDirPrefetch:        *readDirPrefetch,
-		PrefetchMaxFiles:       *prefetchMaxFiles,
-		PrefetchMaxFileBytes:   *prefetchMaxFileBytes,
-		PrefetchMaxBytes:       *prefetchMaxBytes,
-		PrefetchTimeout:        *prefetchTimeout,
-		TrustLocalEvents:       *trustProcessLocalEvents,
-		SyncMode:               syncModeVal,
-		WritePolicy:            writePolicyVal,
-		Profile:                profileCfg.Name,
-		LocalRoot:              normalizedLocalRoot,
-		LocalOnlyPatterns:      append([]string(nil), effectiveLocalOnlyPatterns...),
-		RemoteOnlyPatterns:     append([]string(nil), effectiveRemoteOnlyPatterns...),
-		PackPaths:              append([]string(nil), effectivePackPaths...),
-		UploadConcurrency:      *uploadConcurrency,
-		ReadConcurrency:        *readConcurrency,
-		SyncRead:               *syncRead,
-		AllowOther:             *allowOther,
-		ReadOnly:               *readOnly,
-		Debug:                  *debug,
-		PerfCounters:           *perfCounters,
+		Server:                  *server,
+		APIKey:                  *apiKey,
+		Token:                   token,
+		MountPoint:              mountPoint,
+		RemoteRoot:              remoteRoot,
+		CacheDir:                *cacheDir,
+		CacheSize:               int64(*cacheSize) << 20,
+		ReadCacheMaxFileBytes:   *readCacheMaxFile << 20,
+		DiskReadCacheSize:       *diskReadCacheSize << 20,
+		DiskReadCacheFreeRatio:  *diskReadCacheFreeRatio,
+		DirTTL:                  normalizedDirTTL,
+		AttrTTL:                 normalizedAttrTTL,
+		EntryTTL:                normalizedEntryTTL,
+		FlushDebounce:           *flushDebounce,
+		LookupRetryCount:        normalizedLookupRetryCount,
+		LookupRetryTimeout:      normalizedLookupRetryTimeout,
+		LegacyDirStatFallback:   *legacyDirStatFallback,
+		ReadDirPrefetch:         *readDirPrefetch,
+		PrefetchMaxFiles:        *prefetchMaxFiles,
+		PrefetchMaxFileBytes:    *prefetchMaxFileBytes,
+		PrefetchMaxBytes:        *prefetchMaxBytes,
+		PrefetchTimeout:         *prefetchTimeout,
+		TrustLocalEvents:        *trustProcessLocalEvents,
+		SyncMode:                syncModeVal,
+		WritePolicy:             writePolicyVal,
+		Profile:                 profileCfg.Name,
+		LocalRoot:               normalizedLocalRoot,
+		LocalOnlyPatterns:       append([]string(nil), effectiveLocalOnlyPatterns...),
+		RemoteOnlyPatterns:      append([]string(nil), effectiveRemoteOnlyPatterns...),
+		PackPaths:               append([]string(nil), effectivePackPaths...),
+		UploadConcurrency:       *uploadConcurrency,
+		ReadConcurrency:         *readConcurrency,
+		ParallelReadConcurrency: *parallelReadConcurrency,
+		ParallelReadBlockSize:   *parallelReadBlockSize << 20,
+		SyncRead:                *syncRead,
+		AllowOther:              *allowOther,
+		ReadOnly:                *readOnly,
+		Debug:                   *debug,
+		PerfCounters:            *perfCounters,
 	}
 
 	return mountFuse(opts)
