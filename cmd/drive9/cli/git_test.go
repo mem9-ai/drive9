@@ -75,7 +75,7 @@ func TestParseGitLsTreeWithoutSizes(t *testing.T) {
 	}
 }
 
-func TestGitListTreeOmitsBlobSizes(t *testing.T) {
+func TestGitListTreeIncludesBlobSizes(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found")
 	}
@@ -100,8 +100,8 @@ func TestGitListTreeOmitsBlobSizes(t *testing.T) {
 	if nodes[0].Path != "README.md" {
 		t.Fatalf("node path = %q, want README.md", nodes[0].Path)
 	}
-	if nodes[0].SizeBytes != -1 {
-		t.Fatalf("SizeBytes = %d, want -1", nodes[0].SizeBytes)
+	if nodes[0].SizeBytes != 6 {
+		t.Fatalf("SizeBytes = %d, want 6", nodes[0].SizeBytes)
 	}
 }
 
