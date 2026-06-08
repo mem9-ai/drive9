@@ -2675,10 +2675,20 @@ func TestGitWorkspaceTruncateOpenRefreshesDirtyMirror(t *testing.T) {
 		t.Fatalf("appended readGitFile = %q, want %q", got, appended)
 	}
 
+	var truncateAttr gofuse.AttrOut
+	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &truncateAttr); st != gofuse.OK {
+		t.Fatalf("truncate SetAttr status = %v, want OK", st)
+	}
 	var truncateOpen gofuse.OpenOut
 	if st := fs.Open(nil, &gofuse.OpenIn{
 		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
-		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+		Flags:    uint32(syscall.O_WRONLY),
 	}, &truncateOpen); st != gofuse.OK {
 		t.Fatalf("truncate Open status = %v, want OK", st)
 	}

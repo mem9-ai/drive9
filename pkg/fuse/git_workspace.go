@@ -1107,6 +1107,17 @@ func (fs *Dat9FS) removeGitDirtyMirror(rt *gitWorkspaceRuntime, rel string) {
 	_ = os.Remove(mirrorPath)
 }
 
+func (fs *Dat9FS) replaceGitDirtyMirror(rt *gitWorkspaceRuntime, rel string, data []byte) {
+	mirrorPath, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel)
+	if !ok {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(mirrorPath), 0o755); err != nil {
+		return
+	}
+	_ = os.WriteFile(mirrorPath, data, 0o644)
+}
+
 func (fs *Dat9FS) readGitDirtyMirror(rt *gitWorkspaceRuntime, rel string, offset, size int64) ([]byte, bool, error) {
 	mirrorPath, ok := fs.gitWorkspaceDirtyMirrorPath(rt, rel)
 	if !ok {
@@ -3582,6 +3593,7 @@ func (fs *Dat9FS) setGitAttr(ctx context.Context, input *gofuse.SetAttrIn, entry
 			if _, err := fs.putGitOverlay(ctx, rt.workspace.WorkspaceID, req); err != nil {
 				return httpToFuseStatus(err)
 			}
+			fs.replaceGitDirtyMirror(rt, rel, data)
 		}
 		entry.Size = newSize
 		fs.inodes.UpdateSize(input.NodeId, newSize)
