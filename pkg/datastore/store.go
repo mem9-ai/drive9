@@ -1071,7 +1071,7 @@ type execer interface {
 type noopResult struct{}
 
 func (noopResult) LastInsertId() (int64, error) { return 0, nil }
-func (noopResult) RowsAffected() (int64, error)  { return 0, nil }
+func (noopResult) RowsAffected() (int64, error) { return 0, nil }
 
 // FileStorageMeta holds the lightweight storage metadata needed by upload
 // overwrite logic, fetched with FOR UPDATE row locking.
