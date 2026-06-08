@@ -663,7 +663,7 @@ func (p *Pool) migrateSplitTables(ctx context.Context, db *sql.DB, provider stri
 
 func (p *Pool) autoEmbeddingProfileForTenant(ctx context.Context, t *meta.Tenant) (tenantAutoEmbeddingProfile, error) {
 	if p.metaStore == nil || t == nil || t.ID == "" {
-		return defaultTenantAutoEmbeddingProfile(), nil
+		return defaultTenantAutoEmbeddingProfile()
 	}
 	profile, err := p.metaStore.EnsureTenantAutoEmbeddingProfile(ctx, t.ID)
 	if err != nil {
@@ -692,20 +692,20 @@ func (p *Pool) autoEmbeddingProfileForTenant(ctx context.Context, t *meta.Tenant
 	}, nil
 }
 
-func defaultTenantAutoEmbeddingProfile() tenantAutoEmbeddingProfile {
+func defaultTenantAutoEmbeddingProfile() (tenantAutoEmbeddingProfile, error) {
 	schemaProfile, err := schema.TiDBAutoEmbeddingProfileFromConfig(schema.TiDBAutoEmbeddingConfig{
 		Model:      schema.DefaultTiDBAutoEmbeddingModel,
 		Dimensions: schema.DefaultTiDBAutoEmbeddingDimensions,
 	})
 	if err != nil {
-		panic(err)
+		return tenantAutoEmbeddingProfile{}, fmt.Errorf("build default tenant auto-embedding profile: %w", err)
 	}
 	return tenantAutoEmbeddingProfile{
 		schemaProfile: schemaProfile,
 		provider: schema.TiDBAutoEmbeddingProviderConfig{
 			Model: schemaProfile.Model,
 		},
-	}
+	}, nil
 }
 
 func (p *Pool) shouldPeriodicValidateTiDBSchemaOnOpen() bool {

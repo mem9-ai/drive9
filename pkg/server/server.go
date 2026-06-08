@@ -3343,10 +3343,7 @@ func (s *Server) copyAutoEmbeddingProfileForFork(ctx context.Context, sourceTena
 
 func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID string) (tenantschema.TiDBAutoEmbeddingProfile, error) {
 	if s.meta == nil {
-		return tenantschema.TiDBAutoEmbeddingProfileFromConfig(tenantschema.TiDBAutoEmbeddingConfig{
-			Model:      tenantschema.DefaultTiDBAutoEmbeddingModel,
-			Dimensions: tenantschema.DefaultTiDBAutoEmbeddingDimensions,
-		})
+		return tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
 	}
 	profile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, tenantID)
 	if err != nil {

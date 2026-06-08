@@ -421,10 +421,24 @@ func TestValidateTiDBAutoEmbeddingDiffsAcceptsMixedCaseModelProfile(t *testing.T
 }
 
 func TestTiDBSQLStringLiteralEscapesBackslashesAndQuotes(t *testing.T) {
-	got := tidbSQLStringLiteral("model\\with'quote")
-	want := "'model\\\\with''quote'"
+	got := tidbSQLStringLiteral("model\\with'quote\nline\rzero\x00tab\t")
+	want := "'model\\\\with''quote\\nline\\rzero\\0tab\\t'"
 	if got != want {
 		t.Fatalf("tidbSQLStringLiteral()=%q, want %q", got, want)
+	}
+}
+
+func TestTiDBAutoEmbeddingRenderConfigForProfileRejectsMismatchedOptionsJSON(t *testing.T) {
+	_, err := tidbAutoEmbeddingRenderConfigForProfile(TiDBAutoEmbeddingProfile{
+		Model:       "openai/text-embedding-3-small",
+		Dimensions:  1536,
+		OptionsJSON: `{"dimensions":512}`,
+	})
+	if err == nil {
+		t.Fatal("expected mismatched options_json to fail")
+	}
+	if !strings.Contains(err.Error(), "options_json") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

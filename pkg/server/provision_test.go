@@ -494,6 +494,27 @@ func TestAutoEmbeddingProfileForTenantEnsuresDefaultProfile(t *testing.T) {
 	}
 }
 
+func TestAutoEmbeddingProfileForTenantWithoutMetaUsesConfiguredDefault(t *testing.T) {
+	srv := NewWithConfig(Config{
+		TiDBAutoEmbeddingConfig: tenantschema.TiDBAutoEmbeddingConfig{
+			Model:      "openai/text-embedding-3-small",
+			Dimensions: 1536,
+		},
+	})
+	defer srv.Close()
+
+	profile, err := srv.autoEmbeddingProfileForTenant(context.Background(), "tenant-without-meta")
+	if err != nil {
+		t.Fatalf("autoEmbeddingProfileForTenant: %v", err)
+	}
+	if profile.Model != "openai/text-embedding-3-small" {
+		t.Fatalf("profile model = %q", profile.Model)
+	}
+	if profile.Dimensions != 1536 {
+		t.Fatalf("profile dimensions = %d", profile.Dimensions)
+	}
+}
+
 func TestProvisionPersistsTenantBeforeProvisionFailure(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

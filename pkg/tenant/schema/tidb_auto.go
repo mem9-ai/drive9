@@ -542,6 +542,9 @@ func tidbAutoEmbeddingRenderConfigForProfile(profile TiDBAutoEmbeddingProfile) (
 		if err := json.Unmarshal([]byte(optionsJSON), &options); err != nil {
 			return tidbAutoEmbeddingRenderConfig{}, fmt.Errorf("decode TiDB auto-embedding options_json: %w", err)
 		}
+		if err := validateTiDBAutoEmbeddingProfileOptions(normalized, options); err != nil {
+			return tidbAutoEmbeddingRenderConfig{}, err
+		}
 		canonical, err := json.Marshal(options)
 		if err != nil {
 			return tidbAutoEmbeddingRenderConfig{}, fmt.Errorf("encode TiDB auto-embedding options_json: %w", err)
@@ -553,6 +556,33 @@ func tidbAutoEmbeddingRenderConfigForProfile(profile TiDBAutoEmbeddingProfile) (
 		dimensions:  normalized.Dimensions,
 		optionsJSON: optionsJSON,
 	}, nil
+}
+
+func validateTiDBAutoEmbeddingProfileOptions(cfg TiDBAutoEmbeddingConfig, options map[string]any) error {
+	expectedJSON, err := tidbAutoEmbeddingOptionsJSONFor(cfg)
+	if err != nil {
+		return err
+	}
+	var expected map[string]any
+	if err := json.Unmarshal([]byte(expectedJSON), &expected); err != nil {
+		return fmt.Errorf("decode expected TiDB auto-embedding options_json: %w", err)
+	}
+	for key, want := range expected {
+		got, ok := options[key]
+		if !ok {
+			return fmt.Errorf("TiDB auto-embedding options_json missing required key %q for %s=%q", key, EnvTiDBAutoEmbeddingModel, cfg.Model)
+		}
+		if !equalJSONValue(got, want) {
+			return fmt.Errorf("TiDB auto-embedding options_json key %q does not match %s=%q and %s=%d", key, EnvTiDBAutoEmbeddingModel, cfg.Model, EnvTiDBAutoEmbeddingDimensions, cfg.Dimensions)
+		}
+	}
+	return nil
+}
+
+func equalJSONValue(a, b any) bool {
+	aRaw, aErr := json.Marshal(a)
+	bRaw, bErr := json.Marshal(b)
+	return aErr == nil && bErr == nil && string(aRaw) == string(bRaw)
 }
 
 func currentTiDBAutoEmbeddingRenderConfig() tidbAutoEmbeddingRenderConfig {
@@ -858,7 +888,14 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 }
 
 func tidbSQLStringLiteral(s string) string {
-	escaped := strings.NewReplacer(`\`, `\\`, `'`, `''`).Replace(s)
+	escaped := strings.NewReplacer(
+		`\`, `\\`,
+		`'`, `''`,
+		"\x00", `\0`,
+		"\n", `\n`,
+		"\r", `\r`,
+		"\t", `\t`,
+	).Replace(s)
 	return "'" + escaped + "'"
 }
 
