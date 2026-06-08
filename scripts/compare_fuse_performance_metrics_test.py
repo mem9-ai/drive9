@@ -126,6 +126,26 @@ class FusePerformanceCompareTest(unittest.TestCase):
         self.assertFalse(report["warning_only"])
         self.assertEqual(report["comparisons"], [])
 
+    def test_fail_on_regression_precedes_later_warnings(self):
+        current = metrics(rows_per_second=60.0)
+        baseline = metrics(rows_per_second=100.0)
+        del baseline["workloads"]["sqlite_wal_read_aggregate"]
+
+        report = compare.compare_metrics(
+            current,
+            baseline,
+            warning_ratio=0.30,
+            fail_on_regression=True,
+            current_ref="current",
+            baseline_ref="baseline",
+            missing_baseline_reason=None,
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertFalse(report["warning_only"])
+        self.assertTrue(any("baseline missing workload sqlite_wal_read_aggregate" in warning for warning in report["warnings"]))
+        self.assertTrue(any(row["status"] == "regressed" for row in report["comparisons"]))
+
     def test_missing_baseline_still_validates_current_metrics(self):
         report = compare.compare_metrics(
             metrics(),

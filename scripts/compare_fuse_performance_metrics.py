@@ -218,6 +218,12 @@ def finite_number(value: Any) -> float | None:
     return None
 
 
+def mark_warning(status: str) -> str:
+    if status == "failed":
+        return status
+    return "warning"
+
+
 def compare_metrics(
     current: dict[str, Any],
     baseline: dict[str, Any] | None,
@@ -249,7 +255,7 @@ def compare_metrics(
                 baseline_entry = baseline_entries.get(workload)
                 if not baseline_entry:
                     warnings.append(f"baseline missing workload {workload}")
-                    status = "warning"
+                    status = mark_warning(status)
                     continue
                 for metric in HIGHER_IS_BETTER:
                     current_value = finite_number(current_entry.get(metric))
@@ -260,13 +266,16 @@ def compare_metrics(
                         if current_value <= 0:
                             continue
                         warnings.append(f"baseline {workload}.{metric} is not positive")
-                        status = "warning"
+                        status = mark_warning(status)
                         continue
                     ratio = current_value / baseline_value
                     comparison_status = "ok"
                     if ratio < (1.0 - warning_ratio):
                         comparison_status = "regressed"
-                        status = "failed" if fail_on_regression else "warning"
+                        if fail_on_regression:
+                            status = "failed"
+                        else:
+                            status = mark_warning(status)
                     comparisons.append(
                         {
                             "workload": workload,
