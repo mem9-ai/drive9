@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -64,10 +63,12 @@ func (f *fakeProvisioner) ProvisionCallCount() int {
 type profileAwareFakeProvisioner struct {
 	fakeProvisioner
 	profileInitCalls atomic.Int32
+	lastProfile      tenantschema.TiDBAutoEmbeddingProfile
 }
 
-func (f *profileAwareFakeProvisioner) InitSchemaForAutoEmbeddingProfile(context.Context, string, tenantschema.TiDBAutoEmbeddingProfile) error {
+func (f *profileAwareFakeProvisioner) InitSchemaForAutoEmbeddingProfile(_ context.Context, _ string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
 	f.profileInitCalls.Add(1)
+	f.lastProfile = profile
 	return nil
 }
 
@@ -364,7 +365,7 @@ func TestProvisionPersistsEncryptedAutoEmbeddingProfile(t *testing.T) {
 	}
 }
 
-func TestProvisionSkipsAutoEmbeddingProfileWhenDatabaseAutoEmbeddingDisabled(t *testing.T) {
+func TestProvisionPersistsAutoEmbeddingProfileWhenDatabaseAutoEmbeddingDisabled(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -416,30 +417,32 @@ func TestProvisionSkipsAutoEmbeddingProfileWhenDatabaseAutoEmbeddingDisabled(t *
 	if err != nil {
 		t.Fatalf("provisionTenant: %v", err)
 	}
-	if _, err := metaStore.GetTenantAutoEmbeddingProfile(context.Background(), res.TenantID); !errors.Is(err, meta.ErrNotFound) {
-		t.Fatalf("GetTenantAutoEmbeddingProfile error = %v, want %v", err, meta.ErrNotFound)
+	profile, err := metaStore.GetTenantAutoEmbeddingProfile(context.Background(), res.TenantID)
+	if err != nil {
+		t.Fatalf("GetTenantAutoEmbeddingProfile: %v", err)
+	}
+	if profile.Model != "openai/text-embedding-3-small" || profile.Dimensions != 1536 {
+		t.Fatalf("profile = %+v", profile)
+	}
+	if len(profile.APIKeyCipher) != 0 {
+		t.Fatal("disabled auto-embedding profile should not store an empty API key cipher")
 	}
 }
 
-func TestSchemaInitForTenantUsesAppManagedModeWhenDatabaseAutoEmbeddingDisabled(t *testing.T) {
+func TestSchemaInitForTenantUsesAutoEmbeddingProfileWhenDatabaseAutoEmbeddingDisabled(t *testing.T) {
 	prov := &profileAwareFakeProvisioner{
 		fakeProvisioner: fakeProvisioner{provider: tenant.ProviderTiDBZero},
 	}
 	srv := NewWithConfig(Config{
 		Provisioner:                  prov,
 		DisableDatabaseAutoEmbedding: true,
+		TiDBAutoEmbeddingConfig: tenantschema.TiDBAutoEmbeddingConfig{
+			Model:      "openai/text-embedding-3-small",
+			Dimensions: 1536,
+		},
 	})
 	defer srv.Close()
 
-	origEnsure := ensureTiDBSchemaForModeDSN
-	var gotMode tenantschema.TiDBEmbeddingMode
-	ensureTiDBSchemaForModeDSN = func(_ context.Context, _ string, mode tenantschema.TiDBEmbeddingMode) error {
-		gotMode = mode
-		return nil
-	}
-	t.Cleanup(func() {
-		ensureTiDBSchemaForModeDSN = origEnsure
-	})
 	fallbackCalled := false
 	init := srv.schemaInitForTenant("tenant-disabled", tenant.ProviderTiDBZero, func(context.Context, string) error {
 		fallbackCalled = true
@@ -449,14 +452,14 @@ func TestSchemaInitForTenantUsesAppManagedModeWhenDatabaseAutoEmbeddingDisabled(
 	if err := init(context.Background(), "dsn"); err != nil {
 		t.Fatalf("schema init: %v", err)
 	}
-	if gotMode != tenantschema.TiDBEmbeddingModeApp {
-		t.Fatalf("schema init mode = %q, want %q", gotMode, tenantschema.TiDBEmbeddingModeApp)
-	}
 	if fallbackCalled {
 		t.Fatal("fallback InitSchema was called")
 	}
-	if prov.profileInitCalls.Load() != 0 {
-		t.Fatalf("profile init calls = %d, want 0", prov.profileInitCalls.Load())
+	if prov.profileInitCalls.Load() != 1 {
+		t.Fatalf("profile init calls = %d, want 1", prov.profileInitCalls.Load())
+	}
+	if prov.lastProfile.Model != "openai/text-embedding-3-small" || prov.lastProfile.Dimensions != 1536 {
+		t.Fatalf("profile init profile = %+v", prov.lastProfile)
 	}
 }
 
