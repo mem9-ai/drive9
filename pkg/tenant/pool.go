@@ -70,8 +70,9 @@ type tenantAutoEmbeddingProfile struct {
 }
 
 var (
-	ensureTiDBSchemaForMode   = schema.EnsureTiDBSchemaForMode
-	validateTiDBSchemaForMode = schema.ValidateTiDBSchemaForMode
+	applyTiDBAutoEmbeddingProviderConfig      = schema.ApplyTiDBAutoEmbeddingProviderConfig
+	ensureTiDBSchemaForAutoEmbeddingProfile   = schema.EnsureTiDBSchemaForAutoEmbeddingProfile
+	validateTiDBSchemaForAutoEmbeddingProfile = schema.ValidateTiDBSchemaForAutoEmbeddingProfile
 	// Validate once on the first version-matched open after process start, then
 	// periodically thereafter to catch out-of-band schema drift without putting a
 	// full schema diff on every tenant open.
@@ -492,7 +493,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
 		}
-		if err := schema.ApplyTiDBAutoEmbeddingProviderConfig(ctx, store.DB(), autoEmbeddingProfile.provider); err != nil {
+		if err := applyTiDBAutoEmbeddingProviderConfig(ctx, store.DB(), autoEmbeddingProfile.provider); err != nil {
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
 		}
@@ -504,7 +505,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			}
 			if t.SchemaVersion != targetSchemaVersion {
 				ensureSchemaStart := time.Now()
-				if err := schema.EnsureTiDBSchemaForAutoEmbeddingProfile(ctx, store.DB(), autoEmbeddingProfile.schemaProfile); err != nil {
+				if err := ensureTiDBSchemaForAutoEmbeddingProfile(ctx, store.DB(), autoEmbeddingProfile.schemaProfile); err != nil {
 					_ = store.Close()
 					return nil, nil, fmt.Errorf("ensure tidb auto-embedding schema: %w", err)
 				}
@@ -522,7 +523,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 				}
 			} else if p.shouldPeriodicValidateTiDBSchemaOnOpen() {
 				validateSchemaStart := time.Now()
-				if err := schema.ValidateTiDBSchemaForAutoEmbeddingProfile(ctx, store.DB(), autoEmbeddingProfile.schemaProfile); err != nil {
+				if err := validateTiDBSchemaForAutoEmbeddingProfile(ctx, store.DB(), autoEmbeddingProfile.schemaProfile); err != nil {
 					_ = store.Close()
 					return nil, nil, fmt.Errorf("validate tidb auto-embedding schema: %w", err)
 				}

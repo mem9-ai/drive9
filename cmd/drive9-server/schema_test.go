@@ -168,11 +168,10 @@ func TestTiDBAutoEmbeddingProviderConfigRequirements(t *testing.T) {
 			wantErr: tenantschema.EnvTiDBAutoEmbeddingAPIKey,
 		},
 		{
-			name:    "openai rejects api base",
+			name:    "openai accepts api key and api base for azure endpoint",
 			model:   "openai/text-embedding-3-small",
 			apiKey:  "sk-test",
 			apiBase: "https://example.openai.azure.com",
-			wantErr: tenantschema.EnvTiDBAutoEmbeddingAPIBase,
 		},
 		{
 			name:   "openai accepts api key only",

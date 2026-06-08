@@ -396,6 +396,38 @@ func TestValidateTiDBAutoEmbeddingDiffsAllowsWritableDescriptionEmbeddingCompat(
 	}
 }
 
+func TestValidateTiDBAutoEmbeddingDiffsAcceptsMixedCaseModelProfile(t *testing.T) {
+	cfg, err := tidbAutoEmbeddingRenderConfigFor(TiDBAutoEmbeddingConfig{
+		Model: "huggingface/BAAI/bge-m3",
+	})
+	if err != nil {
+		t.Fatalf("render profile config: %v", err)
+	}
+	meta := testSemanticTableMeta(TiDBEmbeddingModeAuto)
+	meta.columns["embedding"] = tidbColumnMeta{
+		columnType:           "vector(1024)",
+		extra:                "STORED GENERATED",
+		generationExpression: "embed_text(_utf8mb4'huggingface/baai/bge-m3', `content_text`, _utf8mb4'{}')",
+	}
+	meta.columns["description_embedding"] = tidbColumnMeta{
+		columnType:           "vector(1024)",
+		extra:                "STORED GENERATED",
+		generationExpression: "embed_text(_utf8mb4'huggingface/baai/bge-m3', `description`, _utf8mb4'{}')",
+	}
+
+	if diffs := validateTiDBAutoEmbeddingDiffsWithConfig(meta, cfg); len(diffs) != 0 {
+		t.Fatalf("expected mixed-case model profile to validate, got %#v", diffs)
+	}
+}
+
+func TestTiDBSQLStringLiteralEscapesBackslashesAndQuotes(t *testing.T) {
+	got := tidbSQLStringLiteral("model\\with'quote")
+	want := "'model\\\\with''quote'"
+	if got != want {
+		t.Fatalf("tidbSQLStringLiteral()=%q, want %q", got, want)
+	}
+}
+
 func TestDiffTiDBTableMetaReportsMissingRequiredIndex(t *testing.T) {
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
 	meta := testUploadsTableMeta(true)

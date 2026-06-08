@@ -53,12 +53,12 @@
 # export DRIVE9_TIDB_AUTO_EMBEDDING_MODEL=openai/text-embedding-3-small
 # export DRIVE9_TIDB_AUTO_EMBEDDING_DIMENSIONS=1536
 # export DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY=sk-...
-# Supported provider prefixes include openai, azure_openai, cohere, jina_ai,
-# gemini, huggingface, and nvidia_nim. Known models use documented default
+# Supported provider prefixes include openai, cohere, jina_ai, gemini,
+# huggingface, nvidia_nim, and nvidia. Known models use documented default
 # dimensions; unknown BYOK models require DRIVE9_TIDB_AUTO_EMBEDDING_DIMENSIONS.
 # The hosted Titan default needs neither API key nor base endpoint. OpenAI
-# needs only DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY. Azure OpenAI needs both
-# DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY and DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE.
+# needs DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY; set DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE
+# as well when using an Azure OpenAI endpoint.
 
 # Background semantic embedding worker.
 : "${DRIVE9_EMBED_API_BASE:=http://127.0.0.1:11434}"

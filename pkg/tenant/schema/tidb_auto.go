@@ -371,7 +371,7 @@ func TiDBAutoEmbeddingProviderRequirementsForModel(model string) (TiDBAutoEmbedd
 	case strings.HasPrefix(model, "azure_openai/"):
 		return TiDBAutoEmbeddingProviderRequirements{APIKeyRequired: true, APIBaseRequired: true, APIBaseAllowed: true}, nil
 	case strings.HasPrefix(model, "openai/"):
-		return TiDBAutoEmbeddingProviderRequirements{APIKeyRequired: true}, nil
+		return TiDBAutoEmbeddingProviderRequirements{APIKeyRequired: true, APIBaseAllowed: true}, nil
 	case strings.HasPrefix(model, "cohere/"),
 		strings.HasPrefix(model, "jina_ai/"),
 		strings.HasPrefix(model, "gemini/"),
@@ -858,7 +858,8 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 }
 
 func tidbSQLStringLiteral(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	escaped := strings.NewReplacer(`\`, `\\`, `'`, `''`).Replace(s)
+	return "'" + escaped + "'"
 }
 
 // DetectTiDBEmbeddingMode inspects the TiDB embedding contract and reports
@@ -2602,9 +2603,9 @@ func validateTiDBAutoEmbeddingTableDiffs(meta tidbTableMeta, tableName string, c
 			errMsg  string
 		}{
 			{"embed_text(", fmt.Sprintf("%s schema contract: %s generated expression must use EMBED_TEXT", tableName, spec.column)},
-			{cfg.model, fmt.Sprintf("%s schema contract: %s model contract mismatch", tableName, spec.column)},
+			{normalizeSQLFragment(cfg.model), fmt.Sprintf("%s schema contract: %s model contract mismatch", tableName, spec.column)},
 			{spec.source, fmt.Sprintf("%s schema contract: generated expression must derive from %s", tableName, spec.source)},
-			{cfg.optionsJSON, fmt.Sprintf("%s schema contract: %s dimensions option mismatch", tableName, spec.column)},
+			{normalizeSQLFragment(cfg.optionsJSON), fmt.Sprintf("%s schema contract: %s dimensions option mismatch", tableName, spec.column)},
 		}
 		for _, check := range checks {
 			if !strings.Contains(expr, check.pattern) {

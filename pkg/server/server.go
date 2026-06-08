@@ -60,6 +60,9 @@ type Config struct {
 	TiDBAutoEmbeddingConfig  tenantschema.TiDBAutoEmbeddingConfig
 	TiDBAutoEmbeddingAPIKey  string
 	TiDBAutoEmbeddingAPIBase string
+	// DisableDatabaseAutoEmbedding keeps TiDB tenants on app-managed embedding
+	// schema even when the provider supports database-managed EMBED_TEXT.
+	DisableDatabaseAutoEmbedding bool
 }
 
 type SlockOAuthClient interface {
@@ -93,6 +96,7 @@ type Server struct {
 	objectGCWorker      *objectGCWorker
 	slockOAuth          SlockOAuthClient
 	tidbAutoEmbedding   tenantAutoEmbeddingDefault
+	disableDBAutoEmbed  bool
 	forkWorkerCtx       context.Context
 	forkWorkerCancel    context.CancelFunc
 	forkWorkerWG        sync.WaitGroup
@@ -107,11 +111,12 @@ type tenantAutoEmbeddingDefault struct {
 }
 
 var (
-	schemaInitRetryWindow    = 10 * time.Minute
-	schemaInitInitialBackoff = 2 * time.Second
-	schemaInitMaxBackoff     = 30 * time.Second
-	pendingTenantStaleAfter  = 10 * time.Minute
-	pendingTenantSweepEvery  = time.Minute
+	schemaInitRetryWindow      = 10 * time.Minute
+	schemaInitInitialBackoff   = 2 * time.Second
+	schemaInitMaxBackoff       = 30 * time.Second
+	pendingTenantStaleAfter    = 10 * time.Minute
+	pendingTenantSweepEvery    = time.Minute
+	ensureTiDBSchemaForModeDSN = tenantschema.EnsureTiDBSchemaForModeDSN
 )
 
 // DefaultMaxUploadBytes is the server-wide fallback upload size limit.
@@ -195,6 +200,7 @@ func NewWithConfig(cfg Config) *Server {
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
 			apiBase: strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIBase),
 		},
+		disableDBAutoEmbed:  cfg.DisableDatabaseAutoEmbedding || (cfg.Pool != nil && cfg.Pool.IsAutoEmbeddingDisabled()),
 		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
@@ -3276,8 +3282,12 @@ func defaultTiDBAutoEmbeddingConfig(cfg tenantschema.TiDBAutoEmbeddingConfig) te
 	return cfg
 }
 
+func (s *Server) usesDatabaseAutoEmbeddingForProvider(provider string) bool {
+	return tenant.UsesTiDBAutoEmbedding(provider) && !s.disableDBAutoEmbed
+}
+
 func (s *Server) defaultAutoEmbeddingProfileForTenant(ctx context.Context, tenantID, provider string, now time.Time) (*meta.TenantAutoEmbeddingProfile, error) {
-	if !tenant.UsesTiDBAutoEmbedding(provider) {
+	if !s.usesDatabaseAutoEmbeddingForProvider(provider) {
 		return nil, nil
 	}
 	schemaProfile, err := tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
@@ -3311,7 +3321,10 @@ func (s *Server) defaultAutoEmbeddingProfileForTenant(ctx context.Context, tenan
 	}, nil
 }
 
-func (s *Server) copyAutoEmbeddingProfileForFork(ctx context.Context, sourceTenantID, forkTenantID string, now time.Time) error {
+func (s *Server) copyAutoEmbeddingProfileForFork(ctx context.Context, sourceTenantID, forkTenantID, provider string, now time.Time) error {
+	if !s.usesDatabaseAutoEmbeddingForProvider(provider) {
+		return nil
+	}
 	sourceProfile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, sourceTenantID)
 	if err != nil {
 		return err
@@ -3349,6 +3362,11 @@ func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID str
 func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(context.Context, string) error) func(context.Context, string) error {
 	if !tenant.UsesTiDBAutoEmbedding(provider) {
 		return fallback
+	}
+	if s.disableDBAutoEmbed {
+		return func(ctx context.Context, dsn string) error {
+			return ensureTiDBSchemaForModeDSN(ctx, dsn, tenantschema.TiDBEmbeddingModeApp)
+		}
 	}
 	profileAware, ok := s.provisioner.(autoEmbeddingSchemaProvisioner)
 	if !ok {

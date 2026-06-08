@@ -205,7 +205,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	if err := s.meta.InsertTenant(ctx, &forkRoot); err != nil {
 		return nil, err
 	}
-	if err := s.copyAutoEmbeddingProfileForFork(ctx, source.ID, forkID, now); err != nil {
+	if err := s.copyAutoEmbeddingProfileForFork(ctx, source.ID, forkID, source.Provider, now); err != nil {
 		s.markForkFailed(ctx, forkID)
 		return nil, err
 	}

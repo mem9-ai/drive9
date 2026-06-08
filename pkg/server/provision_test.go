@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -58,6 +59,16 @@ func (f *fakeProvisioner) Provision(_ context.Context, tenantID string) (*tenant
 
 func (f *fakeProvisioner) ProvisionCallCount() int {
 	return int(f.provisionCalls.Load())
+}
+
+type profileAwareFakeProvisioner struct {
+	fakeProvisioner
+	profileInitCalls atomic.Int32
+}
+
+func (f *profileAwareFakeProvisioner) InitSchemaForAutoEmbeddingProfile(context.Context, string, tenantschema.TiDBAutoEmbeddingProfile) error {
+	f.profileInitCalls.Add(1)
+	return nil
 }
 
 func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
@@ -350,6 +361,102 @@ func TestProvisionPersistsEncryptedAutoEmbeddingProfile(t *testing.T) {
 	}
 	if string(plain) != "sk-profile-test" {
 		t.Fatalf("decrypted API key = %q", string(plain))
+	}
+}
+
+func TestProvisionSkipsAutoEmbeddingProfileWhenDatabaseAutoEmbeddingDisabled(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{
+		S3Dir:                        mustTempDir(t),
+		PublicURL:                    "http://localhost",
+		DisableDatabaseAutoEmbedding: true,
+	}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{
+		ClusterID: "cluster-disabled-profile",
+		Host:      "127.0.0.1",
+		Port:      4000,
+		Username:  "root",
+		Password:  "db-pass",
+		DBName:    "tenant_db",
+	}}
+	srv := NewWithConfig(Config{
+		Meta:        metaStore,
+		Pool:        pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
+		TiDBAutoEmbeddingConfig: tenantschema.TiDBAutoEmbeddingConfig{
+			Model:      "openai/text-embedding-3-small",
+			Dimensions: 1536,
+		},
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	res, err := srv.provisionTenant(context.Background(), provisionTenantOptions{KeyName: "default"})
+	if err != nil {
+		t.Fatalf("provisionTenant: %v", err)
+	}
+	if _, err := metaStore.GetTenantAutoEmbeddingProfile(context.Background(), res.TenantID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("GetTenantAutoEmbeddingProfile error = %v, want %v", err, meta.ErrNotFound)
+	}
+}
+
+func TestSchemaInitForTenantUsesAppManagedModeWhenDatabaseAutoEmbeddingDisabled(t *testing.T) {
+	prov := &profileAwareFakeProvisioner{
+		fakeProvisioner: fakeProvisioner{provider: tenant.ProviderTiDBZero},
+	}
+	srv := NewWithConfig(Config{
+		Provisioner:                  prov,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	origEnsure := ensureTiDBSchemaForModeDSN
+	var gotMode tenantschema.TiDBEmbeddingMode
+	ensureTiDBSchemaForModeDSN = func(_ context.Context, _ string, mode tenantschema.TiDBEmbeddingMode) error {
+		gotMode = mode
+		return nil
+	}
+	t.Cleanup(func() {
+		ensureTiDBSchemaForModeDSN = origEnsure
+	})
+	fallbackCalled := false
+	init := srv.schemaInitForTenant("tenant-disabled", tenant.ProviderTiDBZero, func(context.Context, string) error {
+		fallbackCalled = true
+		return nil
+	})
+
+	if err := init(context.Background(), "dsn"); err != nil {
+		t.Fatalf("schema init: %v", err)
+	}
+	if gotMode != tenantschema.TiDBEmbeddingModeApp {
+		t.Fatalf("schema init mode = %q, want %q", gotMode, tenantschema.TiDBEmbeddingModeApp)
+	}
+	if fallbackCalled {
+		t.Fatal("fallback InitSchema was called")
+	}
+	if prov.profileInitCalls.Load() != 0 {
+		t.Fatalf("profile init calls = %d, want 0", prov.profileInitCalls.Load())
 	}
 }
 

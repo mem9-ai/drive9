@@ -357,14 +357,14 @@ environment:
   DRIVE9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
   DRIVE9_TIDB_AUTO_EMBEDDING_MODEL TiDB EMBED_TEXT model for auto-embedding generated columns
                                    supported provider prefixes include tidbcloud_free/amazon, tidbcloud_free/cohere,
-                                   openai, azure_openai, cohere, jina_ai, gemini, huggingface, nvidia_nim
+                                   openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
                                    (default: tidbcloud_free/amazon/titan-embed-text-v2)
   DRIVE9_TIDB_AUTO_EMBEDDING_DIMENSIONS TiDB EMBED_TEXT vector dimensions
                                         known models use documented defaults; unknown BYOK models require this value
   DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY provider API key for BYOK auto-embedding models
-                                    required by openai, azure_openai, cohere, jina_ai, gemini, huggingface, nvidia_nim
+                                    required by openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
   DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE provider base endpoint for models that require it
-                                     required by azure_openai; unsupported for the hosted Titan default and OpenAI
+                                     optional for openai models; set it for Azure OpenAI endpoints
   DRIVE9_LOCAL_META_DSN  local control-plane MySQL DSN for central quota (optional; enables server-mode quota enforcement)
   DRIVE9_VAULT_MASTER_KEY 32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
