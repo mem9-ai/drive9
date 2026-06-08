@@ -1166,6 +1166,34 @@ func TestLinkedGitStatePathSkipsLocallyDeletedRuntime(t *testing.T) {
 	}
 }
 
+func TestGitTreeInodeUsesStableMtime(t *testing.T) {
+	fs := &Dat9FS{inodes: NewInodeToPath()}
+	createdAt := time.Unix(123, 456).UTC()
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			CreatedAt:   createdAt,
+		},
+	}
+	node := client.GitTreeNode{
+		Path:      "README.md",
+		Kind:      "file",
+		Mode:      "100644",
+		SizeBytes: 9,
+	}
+
+	first := fs.gitTreeInode(context.Background(), rt, "/repo/README.md", "README.md", node, true)
+	time.Sleep(time.Millisecond)
+	second := fs.gitTreeInode(context.Background(), rt, "/repo/README.md", "README.md", node, true)
+
+	if first.Ino != second.Ino {
+		t.Fatalf("inode changed: first=%d second=%d", first.Ino, second.Ino)
+	}
+	if !second.Mtime.Equal(createdAt) {
+		t.Fatalf("mtime = %s, want stable workspace mtime %s", second.Mtime, createdAt)
+	}
+}
+
 func TestWriteLinkedGitFileUsesRelativeMountPath(t *testing.T) {
 	localRoot := t.TempDir()
 	overlay := NewLocalOverlay(localRoot)

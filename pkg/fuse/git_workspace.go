@@ -38,6 +38,8 @@ const gitWorkspaceModeFastBlobless = "fast-blobless"
 const gitLocalObjectMaxBlobBytes int64 = 5 << 20
 const gitLocalObjectMaxPackBytes int64 = 256 << 20
 
+var gitCleanTreeDefaultMtime = time.Unix(1, 0).UTC()
+
 type gitWorkspaceLayer struct {
 	mu         sync.Mutex
 	checkpoint sync.Mutex
@@ -812,7 +814,7 @@ func (fs *Dat9FS) gitTreeInode(ctx context.Context, rt *gitWorkspaceRuntime, loc
 	} else if size < 0 {
 		size = fs.resolveGitCleanNodeSize(ctx, rt, rel, n)
 	}
-	return fs.gitInode(localPath, isDir, size, mode, hasMode, incrementLookup)
+	return fs.gitInodeWithMtime(localPath, isDir, size, mode, hasMode, gitCleanTreeMtime(rt), incrementLookup)
 }
 
 func (fs *Dat9FS) gitOverlayInode(ctx context.Context, rt *gitWorkspaceRuntime, rel string, e client.GitOverlayEntry, incrementLookup bool) *InodeEntry {
@@ -863,15 +865,29 @@ func (fs *Dat9FS) gitOverlayInode(ctx context.Context, rt *gitWorkspaceRuntime, 
 }
 
 func (fs *Dat9FS) gitInode(localPath string, isDir bool, size int64, mode uint32, hasMode bool, incrementLookup bool) *InodeEntry {
+	return fs.gitInodeWithMtime(localPath, isDir, size, mode, hasMode, time.Now(), incrementLookup)
+}
+
+func (fs *Dat9FS) gitInodeWithMtime(localPath string, isDir bool, size int64, mode uint32, hasMode bool, mtime time.Time, incrementLookup bool) *InodeEntry {
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
 	var ino uint64
 	if incrementLookup {
-		ino = fs.inodes.Lookup(localPath, isDir, size, time.Now())
+		ino = fs.inodes.Lookup(localPath, isDir, size, mtime)
 	} else {
-		ino = fs.inodes.EnsureInode(localPath, isDir, size, time.Now())
+		ino = fs.inodes.EnsureInode(localPath, isDir, size, mtime)
 	}
 	fs.inodes.SetModeState(ino, mode, hasMode)
 	entry, _ := fs.inodes.GetEntry(ino)
 	return entry
+}
+
+func gitCleanTreeMtime(rt *gitWorkspaceRuntime) time.Time {
+	if rt != nil && !rt.workspace.CreatedAt.IsZero() {
+		return rt.workspace.CreatedAt
+	}
+	return gitCleanTreeDefaultMtime
 }
 
 func gitNodeMode(n client.GitTreeNode) (mode uint32, hasMode bool, isDir bool) {
