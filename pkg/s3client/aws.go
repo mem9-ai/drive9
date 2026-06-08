@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -77,11 +78,24 @@ func RoleLogValue(roleARN string) string {
 }
 
 func staticCredentialsProvider(cfg AWSConfig) (aws.CredentialsProvider, bool, error) {
-	hasAccessKey := cfg.AccessKeyID != ""
-	if !hasAccessKey {
+	accessKeyID := cfg.AccessKeyID
+	secretAccessKey := cfg.SecretAccessKey
+	sessionToken := cfg.SessionToken
+
+	if accessKeyID == "" {
+		// Fall back to Alibaba Cloud standard credential environment variables.
+		// These are automatically injected by ACK RRSA, ECS RAM roles, and the
+		// Alibaba Cloud credential helper, making OSS usable without explicit
+		// static key configuration.
+		accessKeyID = os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_ID")
+		secretAccessKey = os.Getenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET")
+		sessionToken = os.Getenv("ALIBABA_CLOUD_SECURITY_TOKEN")
+	}
+
+	if accessKeyID == "" {
 		return nil, false, nil
 	}
-	return credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken), true, nil
+	return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, sessionToken), true, nil
 }
 
 func applyS3Options(cfg AWSConfig) func(*s3.Options) {
