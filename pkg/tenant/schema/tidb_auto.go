@@ -1388,10 +1388,6 @@ func normalizeColumnTypeForCompare(s string) string {
 	}
 }
 
-func diffTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode) ([]tidbSchemaDiff, error) {
-	return diffTiDBSchemaForModeWithConfig(ctx, db, mode, currentTiDBAutoEmbeddingRenderConfig())
-}
-
 func diffTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) ([]tidbSchemaDiff, error) {
 	start := time.Now()
 	spec, err := tidbSchemaSpecForModeWithConfig(mode, cfg)
@@ -1589,10 +1585,6 @@ func legacyTiDBFilesTableSpecForModeWithConfig(mode TiDBEmbeddingMode, cfg tidbA
 		return table, nil
 	}
 	return tidbTableSpec{}, errors.New("legacy files table spec missing")
-}
-
-func legacyTiDBFilesSchemaStatementsForMode(mode TiDBEmbeddingMode) ([]string, error) {
-	return legacyTiDBFilesSchemaStatementsForModeWithConfig(mode, currentTiDBAutoEmbeddingRenderConfig())
 }
 
 func legacyTiDBFilesSchemaStatementsForModeWithConfig(mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) ([]string, error) {
@@ -2567,10 +2559,6 @@ func validateTiDBAutoEmbeddingDiffs(meta tidbTableMeta) []tidbSchemaDiff {
 
 func validateTiDBAutoEmbeddingDiffsWithConfig(meta tidbTableMeta, cfg tidbAutoEmbeddingRenderConfig) []tidbSchemaDiff {
 	return validateTiDBAutoEmbeddingTableDiffs(meta, "semantic", cfg)
-}
-
-func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
-	return validateTiDBAutoEmbeddingFilesDiffsWithConfig(meta, currentTiDBAutoEmbeddingRenderConfig())
 }
 
 func validateTiDBAutoEmbeddingFilesDiffsWithConfig(meta tidbTableMeta, cfg tidbAutoEmbeddingRenderConfig) []tidbSchemaDiff {
