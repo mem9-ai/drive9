@@ -236,9 +236,6 @@ func main() {
 			S3EncryptionPolicy:           s3cfg.EncryptionPolicy,
 			BackendOptions:               backendOptions,
 			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
-			TiDBAutoEmbeddingConfig:      autoEmbeddingConfig,
-			TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
-			TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
 		}, enc)
 		defer pool.Close()
 	}
