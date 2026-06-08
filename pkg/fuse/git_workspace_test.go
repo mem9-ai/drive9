@@ -1535,6 +1535,39 @@ func TestGitWorkspaceCleanReadUsesMaterializedTreeCache(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceUnknownSizeLookupUsesMaterializedTreeCacheSize(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.readmeSize = -1
+	localRoot := t.TempDir()
+	content := []byte("cached base\n")
+	treePath := filepath.Join(gitcache.TreeRoot(localRoot, "ws1", fixtureHeadCommit), "README.md")
+	if err := os.MkdirAll(filepath.Dir(treePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(treePath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true, PerfCounters: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := lookupOut.Size; got != uint64(len(content)) {
+		t.Fatalf("Lookup size = %d, want %d", got, len(content))
+	}
+	if entry, ok := fs.inodes.GetEntry(lookupOut.NodeId); !ok || entry.Size != int64(len(content)) {
+		t.Fatalf("inode size = entry %v ok %t, want %d", entry, ok, len(content))
+	}
+	snap := fs.perf.snapshot()
+	if got := snap.Counters["git_cat_file_count"]; got != 0 {
+		t.Fatalf("git_cat_file_count = %d, want 0", got)
+	}
+}
+
 func TestGitObjectDatabasePathsSkipDirectCheckpoint(t *testing.T) {
 	if !localPathMayBeGitState("/repo/.git/index") {
 		t.Fatal(".git/index should be git state")
@@ -1577,6 +1610,35 @@ func TestGitWorkspaceCleanReadUsesBlobCache(t *testing.T) {
 	if got := snap.Counters["git_clean_blob_cache_hit"]; got != 1 {
 		t.Fatalf("git_clean_blob_cache_hit = %d, want 1", got)
 	}
+	if got := snap.Counters["git_cat_file_count"]; got != 0 {
+		t.Fatalf("git_cat_file_count = %d, want 0", got)
+	}
+}
+
+func TestGitWorkspaceUnknownSizeLookupUsesBlobCacheSize(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.readmeSize = -1
+	localRoot := t.TempDir()
+	content := []byte("cached blob\n")
+	if err := gitcache.WriteBlob(context.Background(), localRoot, "ws1", fixtureHeadCommit, fixture.readmeObjectSHA, content); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true, PerfCounters: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := lookupOut.Size; got != uint64(len(content)) {
+		t.Fatalf("Lookup size = %d, want %d", got, len(content))
+	}
+	if entry, ok := fs.inodes.GetEntry(lookupOut.NodeId); !ok || entry.Size != int64(len(content)) {
+		t.Fatalf("inode size = entry %v ok %t, want %d", entry, ok, len(content))
+	}
+	snap := fs.perf.snapshot()
 	if got := snap.Counters["git_cat_file_count"]; got != 0 {
 		t.Fatalf("git_cat_file_count = %d, want 0", got)
 	}
@@ -2406,8 +2468,8 @@ func TestGitWorkspaceUnknownSizeWritableOpenPreservesBaseContent(t *testing.T) {
 	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
 		t.Fatalf("Lookup status = %v, want OK", st)
 	}
-	if got := lookupOut.Size; got != 0 {
-		t.Fatalf("Lookup size = %d, want 0 attr fallback for unknown size", got)
+	if got := lookupOut.Size; got != uint64(len(content)) {
+		t.Fatalf("Lookup size = %d, want %d from git object size fallback", got, len(content))
 	}
 
 	var openOut gofuse.OpenOut

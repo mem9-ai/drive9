@@ -131,6 +131,29 @@ func ReadTreeFile(ctx context.Context, localRoot, workspaceID, commit, rel strin
 	return readFileRange(f, info.Size(), offset, size)
 }
 
+// StatTreeFile returns the size of a materialized clean tree file or symlink.
+// The boolean is false when the materialized path is absent or not file-like.
+func StatTreeFile(ctx context.Context, localRoot, workspaceID, commit, rel string) (int64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	p, err := treeFilePath(localRoot, workspaceID, commit, rel)
+	if err != nil {
+		return 0, false, err
+	}
+	info, err := os.Lstat(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if info.IsDir() {
+		return 0, false, nil
+	}
+	return info.Size(), true, nil
+}
+
 // ReadBlob reads a cached blob.
 func ReadBlob(ctx context.Context, localRoot, workspaceID, commit, objectSHA string, offset, size int64) ([]byte, bool, error) {
 	if err := ctx.Err(); err != nil {
@@ -156,6 +179,29 @@ func ReadBlob(ctx context.Context, localRoot, workspaceID, commit, objectSHA str
 	}
 	defer func() { _ = f.Close() }()
 	return readFileRange(f, info.Size(), offset, size)
+}
+
+// StatBlob returns the size of a cached blob. The boolean is false when the
+// blob is absent or not a regular file.
+func StatBlob(ctx context.Context, localRoot, workspaceID, commit, objectSHA string) (int64, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err
+	}
+	p, err := BlobPath(localRoot, workspaceID, commit, objectSHA)
+	if err != nil {
+		return 0, false, err
+	}
+	info, err := os.Stat(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return 0, false, nil
+	}
+	return info.Size(), true, nil
 }
 
 // WriteBlob writes a blob cache entry atomically. Existing entries are kept.

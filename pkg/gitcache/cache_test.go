@@ -189,6 +189,69 @@ func TestReadTreeFileReadsSymlinkTarget(t *testing.T) {
 	}
 }
 
+func TestStatTreeFileReturnsRegularAndSymlinkSizes(t *testing.T) {
+	localRoot := t.TempDir()
+	root := TreeRoot(localRoot, "ws1", "commit1")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("README.md", filepath.Join(root, "link")); err != nil {
+		t.Fatal(err)
+	}
+
+	size, hit, err := StatTreeFile(context.Background(), localRoot, "ws1", "commit1", "README.md")
+	if err != nil {
+		t.Fatalf("StatTreeFile regular: %v", err)
+	}
+	if !hit || size != int64(len("hello\n")) {
+		t.Fatalf("StatTreeFile regular = size %d hit %t, want %d true", size, hit, len("hello\n"))
+	}
+
+	size, hit, err = StatTreeFile(context.Background(), localRoot, "ws1", "commit1", "link")
+	if err != nil {
+		t.Fatalf("StatTreeFile symlink: %v", err)
+	}
+	if !hit || size != int64(len("README.md")) {
+		t.Fatalf("StatTreeFile symlink = size %d hit %t, want %d true", size, hit, len("README.md"))
+	}
+
+	size, hit, err = StatTreeFile(context.Background(), localRoot, "ws1", "commit1", "missing")
+	if err != nil {
+		t.Fatalf("StatTreeFile missing: %v", err)
+	}
+	if hit || size != 0 {
+		t.Fatalf("StatTreeFile missing = size %d hit %t, want 0 false", size, hit)
+	}
+}
+
+func TestStatBlobReturnsCachedBlobSize(t *testing.T) {
+	localRoot := t.TempDir()
+	data := []byte("cached blob\n")
+	sha := gitBlobSHA(data)
+	if err := WriteBlob(context.Background(), localRoot, "ws1", "commit1", sha, data); err != nil {
+		t.Fatal(err)
+	}
+
+	size, hit, err := StatBlob(context.Background(), localRoot, "ws1", "commit1", sha)
+	if err != nil {
+		t.Fatalf("StatBlob: %v", err)
+	}
+	if !hit || size != int64(len(data)) {
+		t.Fatalf("StatBlob = size %d hit %t, want %d true", size, hit, len(data))
+	}
+
+	size, hit, err = StatBlob(context.Background(), localRoot, "ws1", "commit1", "2222222222222222222222222222222222222222")
+	if err != nil {
+		t.Fatalf("StatBlob missing: %v", err)
+	}
+	if hit || size != 0 {
+		t.Fatalf("StatBlob missing = size %d hit %t, want 0 false", size, hit)
+	}
+}
+
 func TestHydrateWritesCleanTreeObjectsToGitObjectDB(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found")

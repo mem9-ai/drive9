@@ -541,10 +541,10 @@ func (fs *Dat9FS) gitEntry(ctx context.Context, localPath string, incrementLooku
 		if e.Op == "whiteout" {
 			return nil, true
 		}
-		return fs.gitOverlayInode(rt, rel, e, incrementLookup), true
+		return fs.gitOverlayInode(ctx, rt, rel, e, incrementLookup), true
 	}
 	if n, ok := rt.cleanNode(rel); ok {
-		return fs.gitTreeInode(localPath, n, incrementLookup), true
+		return fs.gitTreeInode(ctx, rt, localPath, rel, n, incrementLookup), true
 	}
 	if rt.hasImpliedDir(rel) {
 		return fs.gitInode(localPath, true, 0, 0o755, true, incrementLookup), true
@@ -570,23 +570,25 @@ func (rt *gitWorkspaceRuntime) hasImpliedDir(rel string) bool {
 	return false
 }
 
-func (fs *Dat9FS) gitTreeInode(localPath string, n client.GitTreeNode, incrementLookup bool) *InodeEntry {
+func (fs *Dat9FS) gitTreeInode(ctx context.Context, rt *gitWorkspaceRuntime, localPath, rel string, n client.GitTreeNode, incrementLookup bool) *InodeEntry {
 	mode, hasMode, isDir := gitNodeMode(n)
 	size := n.SizeBytes
 	if isDir {
 		size = 0
+	} else if size < 0 {
+		size = fs.resolveGitCleanNodeSize(ctx, rt, rel, n)
 	}
 	return fs.gitInode(localPath, isDir, size, mode, hasMode, incrementLookup)
 }
 
-func (fs *Dat9FS) gitOverlayInode(rt *gitWorkspaceRuntime, rel string, e client.GitOverlayEntry, incrementLookup bool) *InodeEntry {
+func (fs *Dat9FS) gitOverlayInode(ctx context.Context, rt *gitWorkspaceRuntime, rel string, e client.GitOverlayEntry, incrementLookup bool) *InodeEntry {
 	localPath := path.Join(rt.localRoot, rel)
 	if rt.localRoot == "/" {
 		localPath = "/" + rel
 	}
 	if e.Op == "chmod" {
 		if n, ok := rt.cleanNode(rel); ok {
-			base := fs.gitTreeInode(localPath, n, incrementLookup)
+			base := fs.gitTreeInode(ctx, rt, localPath, rel, n, incrementLookup)
 			if parsed, ok := parseGitMode(e.Mode); ok && base != nil {
 				fs.inodes.SetModeState(base.Ino, parsed, true)
 				base.Mode = parsed
@@ -691,7 +693,7 @@ func (fs *Dat9FS) listGitDir(ctx context.Context, dirPath string) ([]DirEntry, b
 		if rt.localRoot == "/" {
 			localPath = "/" + n.Path
 		}
-		entry := fs.gitTreeInode(localPath, n, false)
+		entry := fs.gitTreeInode(ctx, rt, localPath, n.Path, n, false)
 		if entry == nil {
 			continue
 		}
@@ -725,7 +727,7 @@ func (fs *Dat9FS) listGitDir(ctx context.Context, dirPath string) ([]DirEntry, b
 			delete(entriesByName, childRel)
 			continue
 		}
-		entry := fs.gitOverlayInode(rt, p, e, false)
+		entry := fs.gitOverlayInode(ctx, rt, p, e, false)
 		entriesByName[childRel] = DirEntry{
 			Name:        childRel,
 			Ino:         entry.Ino,
@@ -805,7 +807,7 @@ func gitWorkspaceOpenFlags(rt *gitWorkspaceRuntime, rel string, flags uint32) ui
 	return gofuse.FOPEN_KEEP_CACHE
 }
 
-func (fs *Dat9FS) gitWorkspaceCurrentSize(rt *gitWorkspaceRuntime, rel string) (int64, bool) {
+func (fs *Dat9FS) gitWorkspaceCurrentSize(ctx context.Context, rt *gitWorkspaceRuntime, rel string) (int64, bool) {
 	if rt == nil || rel == "" {
 		return 0, false
 	}
@@ -826,6 +828,9 @@ func (fs *Dat9FS) gitWorkspaceCurrentSize(rt *gitWorkspaceRuntime, rel string) (
 	if n, ok := rt.cleanNode(rel); ok {
 		if n.Kind == "dir" || n.Kind == "submodule" {
 			return 0, false
+		}
+		if n.SizeBytes < 0 {
+			return fs.resolveGitCleanNodeSize(ctx, rt, rel, n), true
 		}
 		return n.SizeBytes, true
 	}
@@ -983,6 +988,35 @@ func (fs *Dat9FS) updateGitKnownSize(rt *gitWorkspaceRuntime, localPath, rel str
 	rt.updateCleanNodeSize(rel, size)
 }
 
+func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceRuntime, rel string, n client.GitTreeNode) int64 {
+	if n.SizeBytes >= 0 || n.Kind == "dir" || n.Kind == "submodule" {
+		if n.Kind == "dir" {
+			return 0
+		}
+		return n.SizeBytes
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if localRoot := strings.TrimSpace(fs.opts.LocalRoot); localRoot != "" {
+		if size, hit, err := gitcache.StatTreeFile(ctx, localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, rel); err == nil && hit {
+			rt.updateCleanNodeSize(rel, size)
+			return size
+		}
+		if size, hit, err := gitcache.StatBlob(ctx, localRoot, rt.workspace.WorkspaceID, rt.workspace.HeadCommit, n.ObjectSHA); err == nil && hit {
+			rt.updateCleanNodeSize(rel, size)
+			return size
+		}
+	}
+	if n.ObjectSHA != "" {
+		if size, err := fs.gitCatFileBlobSize(ctx, rt, n.ObjectSHA); err == nil {
+			rt.updateCleanNodeSize(rel, size)
+			return size
+		}
+	}
+	return n.SizeBytes
+}
+
 func (rt *gitWorkspaceRuntime) updateCleanNodeSize(rel string, size int64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
@@ -1056,6 +1090,43 @@ func (fs *Dat9FS) materializeGitBlobOnce(ctx context.Context, rt *gitWorkspaceRu
 		}
 	}
 	return data, nil
+}
+
+func (fs *Dat9FS) gitCatFileBlobSize(ctx context.Context, rt *gitWorkspaceRuntime, objectSHA string) (int64, error) {
+	if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
+		return 0, err
+	}
+	gitDir, err := fs.gitDirForRuntime(rt)
+	if err != nil {
+		return 0, err
+	}
+	start := time.Now()
+	if fs.perfEnabled() {
+		fs.perf.gitCatFileCount.add(1)
+	}
+	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "cat-file", "-s", objectSHA)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	dur := time.Since(start)
+	if fs.perfEnabled() {
+		fs.perf.gitCatFileTotalNS.add(uint64(dur))
+		if dur >= 50*time.Millisecond {
+			fs.perf.gitCatFileSlowCount.add(1)
+		}
+	}
+	if err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg != "" {
+			return 0, fmt.Errorf("git cat-file -s %s: %w: %s", objectSHA, err, msg)
+		}
+		return 0, err
+	}
+	size, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse git cat-file -s %s output %q: %w", objectSHA, strings.TrimSpace(string(out)), err)
+	}
+	return size, nil
 }
 
 func (fs *Dat9FS) gitCatFileBlob(ctx context.Context, rt *gitWorkspaceRuntime, objectSHA string) ([]byte, error) {
@@ -3024,7 +3095,7 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 	}
 
 	size := fh.OrigSize
-	if currentSize, ok := fs.gitWorkspaceCurrentSize(rt, rel); ok {
+	if currentSize, ok := fs.gitWorkspaceCurrentSize(ctx, rt, rel); ok {
 		size = currentSize
 		fh.OrigSize = currentSize
 		fs.inodes.UpdateSize(fh.Ino, currentSize)
