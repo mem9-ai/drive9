@@ -1884,6 +1884,7 @@ func TestGitWorkspaceCleanReadSingleflightsCatFile(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	content := []byte("hello base\n")
 	repo := createGitRepoWithReadme(t, content)
+	fixture.headCommit = fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
 	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
 	if err != nil {
 		t.Fatalf("archiveLocalGitDir: %v", err)
