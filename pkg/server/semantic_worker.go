@@ -1260,7 +1260,12 @@ func (m *semanticWorkerManager) taskTypesForProvider(provider string) []semantic
 		if m.pool == nil {
 			return nil
 		}
-		return m.pool.AutoSemanticTaskTypes()
+		if types := m.pool.AutoSemanticTaskTypes(); types != nil {
+			return types
+		}
+		// Pool returned nil: database auto-embedding is disabled for this pool.
+		// Route TiDB tenants through app-managed task types like non-TiDB providers.
+		return m.appManagedTaskTypes()
 	}
 	return m.appManagedTaskTypes()
 }

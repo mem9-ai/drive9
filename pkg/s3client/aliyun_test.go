@@ -77,7 +77,8 @@ func TestCredentialsForAliyunRRSAPriority(t *testing.T) {
 	t.Setenv("ALIBABA_CLOUD_ACCESS_KEY_ID", "env-ak")
 	t.Setenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "env-sk")
 
-	provider, err := credentialsForAliyun(AWSConfig{})
+	// Pass region explicitly so the RRSA provider can construct the STS client.
+	provider, err := credentialsForAliyun(AWSConfig{Region: "cn-hangzhou"})
 	if err != nil {
 		t.Fatalf("credentialsForAliyun() error = %v", err)
 	}
@@ -85,16 +86,17 @@ func TestCredentialsForAliyunRRSAPriority(t *testing.T) {
 		t.Fatal("credentialsForAliyun() provider = nil, want non-nil")
 	}
 
-	// Verify the provider is the RRSA cache wrapper, not a plain static provider.
-	// We don't call Retrieve here because that would hit the real STS endpoint.
-	// It's enough that RRSA env vars caused a non-nil provider to be selected over
-	// the static env key path.
-	_ = provider
+	// Verify the returned provider is *rrsaProvider (not a static credentials provider),
+	// confirming that RRSA takes priority over the ALIBABA_CLOUD_ACCESS_KEY_* env vars.
+	if _, ok := provider.(*rrsaProvider); !ok {
+		t.Fatalf("credentialsForAliyun() provider type = %T, want *rrsaProvider", provider)
+	}
 }
 
 func TestRRSAProviderCacheHit(t *testing.T) {
 	future := time.Now().Add(30 * time.Minute)
 	p := &rrsaProvider{
+		region:          "cn-hangzhou",
 		roleARN:         "arn",
 		oidcProviderARN: "parn",
 		tokenFile:       "/nonexistent",
@@ -123,6 +125,7 @@ func TestRRSAProviderCacheHit(t *testing.T) {
 
 func TestRRSAProviderTokenFileNotFound(t *testing.T) {
 	p := &rrsaProvider{
+		region:          "cn-hangzhou",
 		roleARN:         "arn",
 		oidcProviderARN: "parn",
 		tokenFile:       "/nonexistent/oidc-token",

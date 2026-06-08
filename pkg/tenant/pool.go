@@ -398,6 +398,12 @@ func (p *Pool) AutoSemanticTaskTypes() []semantic.TaskType {
 	if p == nil {
 		return nil
 	}
+	// When database auto-embedding is disabled, TiDB tenants no longer use the
+	// TiDB-auto task path; return nil so the semantic worker falls through to
+	// app-managed task types for those tenants.
+	if p.cfg.DisableDatabaseAutoEmbedding {
+		return nil
+	}
 	var out []semantic.TaskType
 	if backend.AsyncImageExtractWillWireRuntime(p.cfg.BackendOptions.AsyncImageExtract) {
 		out = append(out, semantic.TaskTypeImgExtractText)

@@ -38,32 +38,34 @@ func containsAliyunDomain(s string) bool {
 }
 
 // rrsaCredentials detects whether ACK RRSA env vars are present and returns a
-// refreshing aws.CredentialsProvider that exchanges the OIDC token for
-// temporary Alibaba Cloud STS credentials via AssumeRoleWithOIDC.
+// *rrsaProvider that exchanges the OIDC token for temporary Alibaba Cloud STS
+// credentials via AssumeRoleWithOIDC. region is passed through to the STS client.
 // Returns nil, false when RRSA env vars are not set.
-func rrsaCredentialsProvider() (aws.CredentialsProvider, bool) {
+func rrsaCredentialsProvider(region string) (*rrsaProvider, bool) {
 	roleARN := os.Getenv("ALIBABA_CLOUD_ROLE_ARN")
 	oidcProviderARN := os.Getenv("ALIBABA_CLOUD_OIDC_PROVIDER_ARN")
 	tokenFile := os.Getenv("ALIBABA_CLOUD_OIDC_TOKEN_FILE")
 	if roleARN == "" || oidcProviderARN == "" || tokenFile == "" {
 		return nil, false
 	}
-	return aws.NewCredentialsCache(&rrsaProvider{
+	return &rrsaProvider{
+		region:          region,
 		roleARN:         roleARN,
 		oidcProviderARN: oidcProviderARN,
 		tokenFile:       tokenFile,
-	}), true
+	}, true
 }
 
 // rrsaProvider implements aws.CredentialsProvider using ACK RRSA.
 type rrsaProvider struct {
+	region          string
 	roleARN         string
 	oidcProviderARN string
 	tokenFile       string
 
-	mu          sync.Mutex
-	cached      aws.Credentials
-	expiresAt   time.Time
+	mu        sync.Mutex
+	cached    aws.Credentials
+	expiresAt time.Time
 }
 
 func (p *rrsaProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
@@ -72,12 +74,15 @@ func (p *rrsaProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 	if time.Now().Before(p.expiresAt.Add(-5 * time.Minute)) {
 		return p.cached, nil
 	}
+	if p.region == "" {
+		return aws.Credentials{}, fmt.Errorf("rrsa: region is required for STS AssumeRoleWithOIDC; set S3 region or ALIBABA_CLOUD_REGION_ID")
+	}
 	tokenBytes, err := os.ReadFile(p.tokenFile)
 	if err != nil {
 		return aws.Credentials{}, fmt.Errorf("rrsa: read oidc token: %w", err)
 	}
 	cfg := alibabasdk.NewConfig().WithScheme("HTTPS")
-	stsClient, err := sts.NewClientWithOptions("ap-southeast-1", cfg, nil)
+	stsClient, err := sts.NewClientWithOptions(p.region, cfg, nil)
 	if err != nil {
 		return aws.Credentials{}, fmt.Errorf("rrsa: create sts client: %w", err)
 	}
@@ -93,7 +98,10 @@ func (p *rrsaProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 		return aws.Credentials{}, fmt.Errorf("rrsa: AssumeRoleWithOIDC: %w", err)
 	}
 	creds := resp.Credentials
-	expiry, _ := time.Parse(time.RFC3339, creds.Expiration)
+	expiry, err := time.Parse(time.RFC3339, creds.Expiration)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("rrsa: parse expiration %q: %w", creds.Expiration, err)
+	}
 	p.cached = aws.Credentials{
 		AccessKeyID:     creds.AccessKeyId,
 		SecretAccessKey: creds.AccessKeySecret,
@@ -111,17 +119,27 @@ func (p *rrsaProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 //  2. ACK RRSA: OIDC token file → STS AssumeRoleWithOIDC
 //  3. ALIBABA_CLOUD_ACCESS_KEY_ID / SECRET env vars (static)
 //
-// Returns nil, nil when no credentials are configured; the SDK will fail on
-// first use.
+// Region for RRSA: cfg.Region is used; falls back to ALIBABA_CLOUD_REGION_ID env var.
+// Returns nil when no credentials are configured.
 func credentialsForAliyun(cfg AWSConfig) (aws.CredentialsProvider, error) {
 	if cfg.AccessKeyID != "" {
 		return credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken), nil
 	}
-	if p, ok := rrsaCredentialsProvider(); ok {
+	region := cfg.Region
+	if region == "" {
+		region = os.Getenv("ALIBABA_CLOUD_REGION_ID")
+	}
+	if p, ok := rrsaCredentialsProvider(region); ok {
+		if p.region == "" {
+			return nil, fmt.Errorf("s3: RRSA credentials require a region; set S3 region or ALIBABA_CLOUD_REGION_ID")
+		}
 		return p, nil
 	}
 	accessKeyID, secretAccessKey, sessionToken := aliyunCredentials()
 	if accessKeyID != "" {
+		if secretAccessKey == "" {
+			return nil, fmt.Errorf("s3: ALIBABA_CLOUD_ACCESS_KEY_ID is set but ALIBABA_CLOUD_ACCESS_KEY_SECRET is empty")
+		}
 		return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, sessionToken), nil
 	}
 	return nil, nil
