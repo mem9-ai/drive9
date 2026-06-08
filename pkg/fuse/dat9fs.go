@@ -1696,10 +1696,11 @@ func (fs *Dat9FS) enqueueStagedShadowCommitLocked(fh *FileHandle) error {
 	}
 	size := fh.Dirty.Size()
 	mode, hasMode := fs.modeForPendingHandle(fh)
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	entry := &CommitEntry{
 		Path:        fh.Path,
 		Inode:       fh.Ino,
-		BaseRev:     fh.BaseRev,
+		BaseRev:     expectedRevision,
 		Size:        size,
 		Kind:        fs.pendingKindForHandle(fh),
 		ShadowSpill: fh.ShadowSpill,
@@ -8389,7 +8390,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			entry := &CommitEntry{
 				Path:        fh.Path,
 				Inode:       fh.Ino,
-				BaseRev:     fh.BaseRev,
+				BaseRev:     expectedRevision,
 				Size:        size,
 				Kind:        PendingOverwrite,
 				ShadowSpill: true,
@@ -8498,6 +8499,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			if canUseCache {
 				phase = "writeback-cache-release"
 				mode, hasMode := fs.modeForPendingHandle(fh)
+				expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 				fh.Dirty.ClearDirty()
 				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 				fh.DirtySeq = 0
@@ -8515,7 +8517,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					entry := &CommitEntry{
 						Path:    fh.Path,
 						Inode:   fh.Ino,
-						BaseRev: fh.BaseRev,
+						BaseRev: expectedRevision,
 						Size:    fh.Dirty.Size(),
 						Kind:    PendingOverwrite,
 						Mode:    mode,
