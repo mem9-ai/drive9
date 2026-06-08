@@ -7583,6 +7583,25 @@ func TestReadCleanShadowBackedHandleRefreshesActiveStaleShadow(t *testing.T) {
 	if fh.ShadowReady || fh.ShadowSpill || fh.ShadowCommitReady {
 		t.Fatalf("shadow flags = ready:%t spill:%t commit:%t, want all false", fh.ShadowReady, fh.ShadowSpill, fh.ShadowCommitReady)
 	}
+
+	var roOut gofuse.OpenOut
+	st = fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &roOut)
+	if st != gofuse.OK {
+		t.Fatalf("read-only Open status = %v, want OK", st)
+	}
+	got, st, err = readDat9FSTestRange(fs, ino, roOut.Fh, 0, len(fresh))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("read-only Read status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, fresh) {
+		t.Fatalf("read-only handle pinned stale active shadow: got %q want %q", got, fresh)
+	}
 }
 
 func TestDebouncedFlushPublishesSizeBeforeRefreshingCleanSibling(t *testing.T) {

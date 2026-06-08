@@ -885,6 +885,9 @@ func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) b
 		return true
 	}
 	if fh.ShadowReady || fh.ShadowSpill {
+		if fs.canRemoveActiveStaleShadowForCleanRefreshLocked(fh) {
+			fs.shadowStore.Remove(fh.Path)
+		}
 		fh.ShadowReady = false
 		fh.ShadowSpill = false
 		fh.ShadowCommitReady = false
@@ -892,6 +895,59 @@ func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) b
 	}
 	fs.rebindCleanWriteBufferToRemoteLocked(fh, fs.committedHandleSizeLocked(fh))
 	return true
+}
+
+func (fs *Dat9FS) canRemoveActiveStaleShadowForCleanRefreshLocked(fh *FileHandle) bool {
+	if fs == nil || fh == nil || fs.shadowStore == nil || fh.Path == "" || !fs.shadowStore.Has(fh.Path) {
+		return false
+	}
+	if fs.hasPendingLocalStateExceptShadow(fh.Path) {
+		return false
+	}
+	if fs.hasOtherPendingOpenHandleState(fh.Path, fh) {
+		return false
+	}
+	return true
+}
+
+func (fs *Dat9FS) hasPendingLocalStateExceptShadow(p string) bool {
+	if fs == nil {
+		return false
+	}
+	if fs.pendingIndex != nil {
+		if _, ok := fs.pendingIndex.GetMeta(p); ok {
+			return true
+		}
+	}
+	if fs.writeBack != nil {
+		if _, ok := fs.writeBack.GetMeta(p); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) hasOtherPendingOpenHandleState(path string, skip *FileHandle) bool {
+	if fs == nil || fs.openHandles == nil || path == "" {
+		return false
+	}
+	for _, fh := range fs.openHandles.SnapshotPath(path) {
+		if fh == nil || fh == skip {
+			continue
+		}
+		if !fh.TryLock() {
+			return true
+		}
+		pending := fh.IsNew || fh.DirtySeq != 0 || fh.WriteBackSeq != 0 || fh.ShadowCommitReady
+		if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
+			pending = true
+		}
+		fh.Unlock()
+		if pending {
+			return true
+		}
+	}
+	return false
 }
 
 func (fs *Dat9FS) clearRemovedCommittedShadowForOpenHandles(path string, committedRev, committedSize int64) {
