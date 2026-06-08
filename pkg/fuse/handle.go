@@ -11,44 +11,50 @@ import (
 // FileHandle represents an open file in the FUSE filesystem.
 // WriteBuffer is defined in write.go and supports offset-based writes.
 type FileHandle struct {
-	Ino               uint64
-	Path              string
-	Layer             PathLayer
-	LocalFile         *os.File
-	Flags             uint32          // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
-	OpenPID           uint32          // PID that opened the handle, when supplied by the kernel
-	Dirty             *WriteBuffer    // write buffer, nil for read-only opens
-	DirtySeq          uint64          // monotonic sequence for authoritative dirty-size tracking
-	WriteBackSeq      uint64          // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
-	OrigSize          int64           // original file size at open time (for patch detection)
-	BaseRev           int64           // server revision at open time (for conflict detection)
-	ZeroBase          bool            // true when the handle has adopted an explicit empty-file baseline
-	IsNew             bool            // true if created via Create() (no prior remote existence)
-	ShadowReady       bool            // true when the local shadow file is a safe full snapshot
-	ShadowSpill       bool            // true when shadow is the authoritative data source (large IsNew/ZeroBase files)
-	ShadowCommitReady bool            // true when ShadowSpill Flush has staged shadow for async commit
-	ShadowPinned      bool            // true when this handle has pinned the shadow (must Unpin on Release)
-	ShadowGen         uint64          // generation token from Pin/PinIfExists (passed to Unpin)
-	Streamer          *StreamUploader // nil for small files / read-only; manages background part uploads
-	Prefetch          *Prefetcher     // nil for writable handles; sequential read prefetcher
-	ReadTarget        *client.ReadTarget
-	WritePolicy       WritePolicy // per-handle remote durability policy chosen at open/create
-	GitWorkspaceID    string      // set for handles served by the git workspace layer
-	GitRelPath        string
-	GitKind           string
-	GitMode           string
-	GitBaseObjectSHA  string
-	PendingMode       uint32 // mode change deferred because a dirty handle was open
-	HasPendingMode    bool   // true when PendingMode should be applied on Release
-	PendingModeGen    uint64 // generation for PendingMode, used to avoid clearing newer chmods
-	PreviousMode      uint32 // mode before PendingMode was set (for rollback on flush failure)
-	HasPreviousMode   bool   // true when previous mode state was snapshotted
-	PreviousModeKnown bool   // true when PreviousMode was authoritative
-	mu                sync.Mutex
+	Ino                uint64
+	Path               string
+	Layer              PathLayer
+	LocalFile          *os.File
+	Flags              uint32          // O_RDONLY, O_WRONLY, O_RDWR, O_APPEND, etc.
+	OpenPID            uint32          // PID that opened the handle, when supplied by the kernel
+	Dirty              *WriteBuffer    // write buffer, nil for read-only opens
+	DirtySeq           uint64          // monotonic sequence for authoritative dirty-size tracking
+	WriteBackSeq       uint64          // DirtySeq at time of write-back cache snapshot (0 = no snapshot)
+	OrigSize           int64           // original file size at open time (for patch detection)
+	BaseRev            int64           // server revision at open time (for conflict detection)
+	ZeroBase           bool            // true when the handle has adopted an explicit empty-file baseline
+	IsNew              bool            // true if created via Create() (no prior remote existence)
+	ShadowReady        bool            // true when the local shadow file is a safe full snapshot
+	ShadowSpill        bool            // true when shadow is the authoritative data source (large IsNew/ZeroBase files)
+	ShadowCommitReady  bool            // true when ShadowSpill Flush has staged shadow for async commit
+	ShadowCommitSeq    uint64          // DirtySeq captured when ShadowCommitReady was staged
+	ShadowPinned       bool            // true when this handle has pinned the shadow (must Unpin on Release)
+	ShadowGen          uint64          // generation token from Pin/PinIfExists (passed to Unpin)
+	Streamer           *StreamUploader // nil for small files / read-only; manages background part uploads
+	Prefetch           *Prefetcher     // nil for writable handles; sequential read prefetcher
+	ReadTarget         *client.ReadTarget
+	UnlinkedData       []byte      // snapshot for POSIX unlink-open reads on small SQLite sidecars
+	WritePolicy        WritePolicy // per-handle remote durability policy chosen at open/create
+	GitWorkspaceID     string      // set for handles served by the git workspace layer
+	GitRelPath         string
+	GitKind            string
+	GitMode            string
+	GitBaseObjectSHA   string
+	PendingMode        uint32 // mode change deferred because a dirty handle was open
+	HasPendingMode     bool   // true when PendingMode should be applied on Release
+	PendingModeGen     uint64 // generation for PendingMode, used to avoid clearing newer chmods
+	PreviousMode       uint32 // mode before PendingMode was set (for rollback on flush failure)
+	HasPreviousMode    bool   // true when previous mode state was snapshotted
+	PreviousModeKnown  bool   // true when PreviousMode was authoritative
+	RemoteCommitUnlock func() // held same-path commit lock while local shadow state is reserved
+	mu                 sync.Mutex
 }
 
 // Lock acquires the file handle mutex.
 func (fh *FileHandle) Lock() { fh.mu.Lock() }
+
+// TryLock attempts to acquire the file handle mutex without blocking.
+func (fh *FileHandle) TryLock() bool { return fh.mu.TryLock() }
 
 // Unlock releases the file handle mutex.
 func (fh *FileHandle) Unlock() { fh.mu.Unlock() }

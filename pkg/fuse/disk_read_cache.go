@@ -161,7 +161,7 @@ func (c *DiskReadCache) Get(key DiskReadCacheKey) ([]byte, bool) {
 }
 
 func (c *DiskReadCache) Put(key DiskReadCacheKey, data []byte) {
-	if c == nil {
+	if c == nil || int64(len(data)) != key.Length {
 		return
 	}
 	stored := make([]byte, len(data))
@@ -170,7 +170,7 @@ func (c *DiskReadCache) Put(key DiskReadCacheKey, data []byte) {
 }
 
 func (c *DiskReadCache) PutAsync(key DiskReadCacheKey, data []byte) {
-	if c == nil || !key.valid() || int64(len(data)) > c.maxSize {
+	if c == nil || !key.valid() || int64(len(data)) != key.Length || int64(len(data)) > c.maxSize {
 		return
 	}
 	stored := make([]byte, len(data))
@@ -199,7 +199,7 @@ func (c *DiskReadCache) PutOwned(key DiskReadCacheKey, data []byte) {
 }
 
 func (c *DiskReadCache) putOwned(key DiskReadCacheKey, data []byte, pendingSeq uint64) {
-	if c == nil || !key.valid() || int64(len(data)) > c.maxSize {
+	if c == nil || !key.valid() || int64(len(data)) != key.Length || int64(len(data)) > c.maxSize {
 		return
 	}
 	digest := key.digest()

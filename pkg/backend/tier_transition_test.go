@@ -67,6 +67,57 @@ func TestBackendTierTransitionInlineToS3ToInlineCleansStorage(t *testing.T) {
 	assertOverwriteGCCandidate(t, fake, "ns-tier-transition", large.storageRef)
 }
 
+func TestBackendTierTransitionMultipleS3OverwritesQueueAllObsoleteRefs(t *testing.T) {
+	backendFS, fake := newCentralQuotaBackend(t)
+	backendFS.storageNamespaceID = "ns-tier-transition-multi"
+
+	ctx := context.Background()
+	path := "/tier-transition-multi.bin"
+	initialInline := deterministicTierPayload(10*1024, 0x13)
+	largeA := deterministicTierPayload(8*1024*1024, 0x24)
+	largeB := deterministicTierPayload(8*1024*1024, 0x35)
+	finalInline := deterministicTierPayload(10*1024, 0x46)
+
+	if _, err := backendFS.Write(path, initialInline, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("create inline file: %v", err)
+	}
+	if _, err := backendFS.Write(path, largeA, 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("overwrite inline -> s3 A: %v", err)
+	}
+	stateA := loadBackendTierState(t, backendFS, path)
+	assertS3TierState(t, stateA, largeA)
+	assertS3ObjectBytes(t, backendFS, stateA.storageRef, largeA)
+
+	if _, err := backendFS.Write(path, largeB, 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("overwrite s3 A -> s3 B: %v", err)
+	}
+	stateB := loadBackendTierState(t, backendFS, path)
+	assertS3TierState(t, stateB, largeB)
+	assertS3ObjectBytes(t, backendFS, stateB.storageRef, largeB)
+	if stateB.storageRef == stateA.storageRef {
+		t.Fatalf("s3 overwrite reused storage ref %q", stateB.storageRef)
+	}
+
+	if _, err := backendFS.Write(path, finalInline, 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("overwrite s3 B -> inline: %v", err)
+	}
+	finalState := loadBackendTierState(t, backendFS, path)
+	assertInlineTierState(t, finalState, finalInline)
+	assertBackendVisibleBytes(t, backendFS, path, finalInline)
+
+	for _, obsoleteRef := range []string{stateA.storageRef, stateB.storageRef} {
+		stillReferenced, err := backendFS.Store().HasConfirmedS3StorageRef(ctx, datastore.StorageRefHash(obsoleteRef), obsoleteRef)
+		if err != nil {
+			t.Fatalf("check obsolete s3 reference %q: %v", obsoleteRef, err)
+		}
+		if stillReferenced {
+			t.Fatalf("obsolete s3 ref %q is still referenced by confirmed content", obsoleteRef)
+		}
+		assertOverwriteGCCandidate(t, fake, "ns-tier-transition-multi", obsoleteRef)
+	}
+	assertOverwriteGCCandidateCount(t, fake, "ns-tier-transition-multi", []string{stateA.storageRef, stateB.storageRef})
+}
+
 type backendTierState struct {
 	fileID            string
 	storageType       datastore.StorageType
@@ -242,6 +293,32 @@ func assertOverwriteGCCandidate(t *testing.T, fake *fakeMetaQuotaStore, namespac
 		}
 	}
 	t.Fatalf("missing overwrite gc candidate for %q in namespace %q: %+v", storageRef, namespaceID, fake.objectGCCandidates)
+}
+
+func assertOverwriteGCCandidateCount(t *testing.T, fake *fakeMetaQuotaStore, namespaceID string, storageRefs []string) {
+	t.Helper()
+
+	want := make(map[string]int, len(storageRefs))
+	for _, storageRef := range storageRefs {
+		want[storageRef]++
+	}
+	got := make(map[string]int, len(storageRefs))
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	for _, candidate := range fake.objectGCCandidates {
+		if candidate.NamespaceID == namespaceID && candidate.Reason == meta.ObjectGCReasonOverwrite {
+			got[candidate.StorageRef]++
+		}
+	}
+	for storageRef, count := range want {
+		if got[storageRef] != count {
+			t.Fatalf("overwrite gc candidate count for %q = %d, want %d; all=%+v",
+				storageRef, got[storageRef], count, fake.objectGCCandidates)
+		}
+	}
+	if len(got) != len(want) {
+		t.Fatalf("overwrite gc candidate refs = %+v, want exactly %+v", got, want)
+	}
 }
 
 func deterministicTierPayload(size int, seed byte) []byte {

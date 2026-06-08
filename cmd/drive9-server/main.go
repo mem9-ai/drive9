@@ -135,6 +135,7 @@ func main() {
 	encryptType := envOr("DRIVE9_ENCRYPT_TYPE", "local_aes")
 	masterHex := os.Getenv("DRIVE9_MASTER_KEY")
 	kmsKey := os.Getenv("DRIVE9_ENCRYPT_KEY")
+	aliyunKMSEndpoint := strings.TrimSpace(os.Getenv("DRIVE9_ALIYUN_KMS_ENDPOINT"))
 	tokenHex := os.Getenv("DRIVE9_TOKEN_SIGNING_KEY")
 	vaultMKHex := os.Getenv("DRIVE9_VAULT_MASTER_KEY")
 	providerType := envOr("DRIVE9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
@@ -192,9 +193,10 @@ func main() {
 			eKey = kmsKey
 		}
 		enc, err := encrypt.New(context.Background(), encrypt.Config{
-			Type:   eType,
-			Key:    eKey,
-			Region: s3cfg.Region,
+			Type:              eType,
+			Key:               eKey,
+			Region:            s3cfg.Region,
+			AliyunKMSEndpoint: aliyunKMSEndpoint,
 		})
 		if err != nil {
 			die(fmt.Errorf("create encryptor: %w", err))
@@ -383,6 +385,8 @@ environment:
   DRIVE9_ENCRYPT_TYPE local_aes|kms|aliyun_kms
   DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
   DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms), Aliyun KMS key id (required for aliyun_kms)
+  DRIVE9_ALIYUN_KMS_ENDPOINT custom Aliyun KMS endpoint, e.g. a VPC endpoint (no https:// prefix)
+                             note: aliyun_kms reads the Aliyun region from DRIVE9_S3_REGION
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)

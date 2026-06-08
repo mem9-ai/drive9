@@ -3,9 +3,11 @@ package fuse
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -70,6 +72,148 @@ func TestCommitQueueConditionalCommitSuccess(t *testing.T) {
 	}
 	if shadow.Has("/ok.txt") {
 		t.Fatal("shadow should be removed after successful commit")
+	}
+}
+
+func TestCommitQueueBeginInFlightSerializesSamePath(t *testing.T) {
+	cq := &CommitQueue{inFlight: make(map[string]*CommitEntry)}
+	first := &CommitEntry{Path: "/same.txt"}
+	second := &CommitEntry{Path: "/same.txt"}
+	other := &CommitEntry{Path: "/other.txt"}
+
+	if !cq.beginInFlight(first) {
+		t.Fatal("begin first in-flight returned false")
+	}
+	if !cq.beginInFlight(other) {
+		t.Fatal("begin other-path in-flight returned false")
+	}
+	cq.endInFlight(other)
+
+	done := make(chan struct{})
+	go func() {
+		if !cq.beginInFlight(second) {
+			t.Errorf("begin second in-flight returned false")
+		}
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("second same-path entry became in-flight before first ended")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	cq.endInFlight(first)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("second same-path entry did not become in-flight after first ended")
+	}
+	cq.endInFlight(second)
+}
+
+func TestCommitQueueBeginInFlightPreservesSamePathFIFO(t *testing.T) {
+	first := &CommitEntry{Path: "/same.txt"}
+	second := &CommitEntry{Path: "/same.txt"}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{first, second},
+		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
+		inFlight:     make(map[string]*CommitEntry),
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	secondDone := make(chan struct{})
+	go func() {
+		if !cq.beginInFlight(second) {
+			t.Errorf("begin second in-flight returned false")
+		}
+		close(secondDone)
+	}()
+
+	select {
+	case <-secondDone:
+		t.Fatal("second same-path entry became in-flight before older queued entry")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	if !cq.beginInFlight(first) {
+		t.Fatal("begin first in-flight returned false")
+	}
+
+	select {
+	case <-secondDone:
+		t.Fatal("second same-path entry became in-flight while first was in-flight")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	cq.endInFlight(first)
+	cq.removeFromQueue(first)
+
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second same-path entry did not become in-flight after older entry completed")
+	}
+	cq.endInFlight(second)
+	cq.removeFromQueue(second)
+}
+
+func TestCommitQueueCommitNowHoldsPathLockThroughSuccessCleanup(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":9}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/locked.txt", []byte("data"), 8); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/locked.txt", 4, PendingOverwrite, 8); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	locked := false
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	defer cq.DrainAll()
+	cq.PathLock = func(path string) func() {
+		mu.Lock()
+		if path != "/locked.txt" {
+			t.Errorf("PathLock path = %q, want /locked.txt", path)
+		}
+		locked = true
+		mu.Unlock()
+		return func() {
+			mu.Lock()
+			locked = false
+			mu.Unlock()
+		}
+	}
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !locked {
+			t.Error("PathLock was not held during OnSuccess cleanup")
+		}
+	}
+
+	if err := cq.CommitNow(context.Background(), &CommitEntry{
+		Path:    "/locked.txt",
+		BaseRev: 8,
+		Size:    4,
+		Kind:    PendingOverwrite,
+	}); err != nil {
+		t.Fatalf("CommitNow: %v", err)
 	}
 }
 
@@ -911,13 +1055,63 @@ func TestCommitQueueRecoverPendingSkipsLegacyOverwriteWithoutBaseRev(t *testing.
 // uploaded via streaming (uploadFromShadow) rather than ReadAll, and that
 // the server receives the correct data and expected revision.
 func TestCommitQueueShadowSpillUpload(t *testing.T) {
-	var gotExpected string
+	data := bytes.Repeat([]byte("shadowspill-data-"), 100) // ~1700 bytes
+	var gotExpected int64
 	var gotBody []byte
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotExpected = r.Header.Get("X-Dat9-Expected-Revision")
-		body, _ := io.ReadAll(r.Body)
-		gotBody = body
-		w.WriteHeader(http.StatusOK)
+	var statCalls atomic.Int32
+	var successRev int64
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/big.bin":
+			statCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "13")
+			w.Header().Set("Content-Length", "1700")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode initiate request: %v", err)
+			}
+			if req.Path != "/big.bin" {
+				t.Fatalf("initiate path = %q, want /big.bin", req.Path)
+			}
+			if req.TotalSize != int64(len(data)) {
+				t.Fatalf("initiate total_size = %d, want %d", req.TotalSize, len(data))
+			}
+			if req.ExpectedRevision == nil {
+				t.Fatal("initiate expected_revision missing")
+			}
+			gotExpected = *req.ExpectedRevision
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "u1",
+				"key":         "object-key",
+				"part_size":   int64(len(data)),
+				"total_parts": 1,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/u1/1",
+					"size":   int64(len(data)),
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/u1/1":
+			body, _ := io.ReadAll(r.Body)
+			gotBody = body
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
 	}))
 	defer ts.Close()
 
@@ -931,8 +1125,6 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Write data to shadow file (simulates what Write() + ShadowSpill does).
-	data := bytes.Repeat([]byte("shadowspill-data-"), 100) // ~1700 bytes
 	if err := shadow.WriteFull("/big.bin", data, 12); err != nil {
 		t.Fatal(err)
 	}
@@ -941,6 +1133,12 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		if entry.Path != "/big.bin" {
+			t.Fatalf("OnSuccess path = %q, want /big.bin", entry.Path)
+		}
+		successRev = committedRev
+	}
 	if err := cq.Enqueue(&CommitEntry{
 		Path:        "/big.bin",
 		BaseRev:     12,
@@ -952,11 +1150,17 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	}
 	cq.DrainAll()
 
-	if gotExpected != "12" {
-		t.Fatalf("expected revision header = %q, want 12", gotExpected)
+	if gotExpected != 12 {
+		t.Fatalf("expected revision = %d, want 12", gotExpected)
 	}
 	if !bytes.Equal(gotBody, data) {
 		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
+	}
+	if statCalls.Load() != 0 {
+		t.Fatalf("stat calls = %d, want 0", statCalls.Load())
+	}
+	if successRev != 0 {
+		t.Fatalf("OnSuccess committedRev = %d, want 0 for multipart stream", successRev)
 	}
 	if pending.HasPending("/big.bin") {
 		t.Fatal("pending entry should be removed after successful ShadowSpill commit")
@@ -1026,11 +1230,61 @@ func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
 // preserves the ShadowSpill flag so recovered entries use streaming upload
 // (not ReadAll which would OOM for large files).
 func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
+	data := bytes.Repeat([]byte("recover-"), 200)
 	var gotBody []byte
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		gotBody = body
-		w.WriteHeader(http.StatusOK)
+	var statCalls atomic.Int32
+	var successRev int64
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/recover.bin":
+			statCalls.Add(1)
+			w.Header().Set("X-Dat9-Revision", "9")
+			w.Header().Set("Content-Length", "1600")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode initiate request: %v", err)
+			}
+			if req.Path != "/recover.bin" {
+				t.Fatalf("initiate path = %q, want /recover.bin", req.Path)
+			}
+			if req.TotalSize != int64(len(data)) {
+				t.Fatalf("initiate total_size = %d, want %d", req.TotalSize, len(data))
+			}
+			if req.ExpectedRevision == nil || *req.ExpectedRevision != 8 {
+				t.Fatalf("initiate expected_revision = %v, want 8", req.ExpectedRevision)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "u1",
+				"key":         "object-key",
+				"part_size":   int64(len(data)),
+				"total_parts": 1,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/u1/1",
+					"size":   int64(len(data)),
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/u1/1":
+			body, _ := io.ReadAll(r.Body)
+			gotBody = body
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
 	}))
 	defer ts.Close()
 
@@ -1046,7 +1300,6 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	data := bytes.Repeat([]byte("recover-"), 200)
 	if err := shadow1.WriteFull("/recover.bin", data, 8); err != nil {
 		t.Fatal(err)
 	}
@@ -1084,12 +1337,24 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 	// RecoverPending should reconstruct CommitEntry with ShadowSpill=true,
 	// causing uploadEntry to use streaming (uploadFromShadow) not ReadAll.
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow2, pending2, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		if entry.Path != "/recover.bin" {
+			t.Fatalf("OnSuccess path = %q, want /recover.bin", entry.Path)
+		}
+		successRev = committedRev
+	}
 	cq.RecoverPending()
 	cq.DrainAll()
 
 	// Verify data arrived correctly at the server (streaming upload worked).
 	if !bytes.Equal(gotBody, data) {
 		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
+	}
+	if statCalls.Load() != 0 {
+		t.Fatalf("stat calls = %d, want 0", statCalls.Load())
+	}
+	if successRev != 0 {
+		t.Fatalf("OnSuccess committedRev = %d, want 0 for multipart stream", successRev)
 	}
 	if pending2.HasPending("/recover.bin") {
 		t.Fatal("pending entry should be removed after successful recovery upload")

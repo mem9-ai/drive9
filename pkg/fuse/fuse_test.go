@@ -8,9 +8,12 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/dat9/pkg/client"
 )
 
 var (
@@ -1380,6 +1383,269 @@ func TestPrefetcher_LargeReadSizeDoesNotReturnShortPrefetch(t *testing.T) {
 	}
 }
 
+func TestPrefetcher_ParallelFetchesLargeWindow(t *testing.T) {
+	const (
+		readSize    = 1 << 20
+		windowSize  = 4 << 20
+		concurrency = 2
+	)
+	fileData := make([]byte, windowSize)
+	for i := range fileData {
+		fileData[i] = byte(i % 251)
+	}
+	var readCalls atomic.Int32
+	var inFlight atomic.Int32
+	var maxInFlight atomic.Int32
+	ranges := make(chan string, 4)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		rangeHeader := r.Header.Get("Range")
+		ranges <- rangeHeader
+		readCalls.Add(1)
+		cur := inFlight.Add(1)
+		observeMaxInt32(&maxInFlight, cur)
+		defer inFlight.Add(-1)
+		time.Sleep(50 * time.Millisecond)
+
+		start, end, ok := parseTestBytesRange(rangeHeader)
+		if !ok || end >= int64(len(fileData)) {
+			http.Error(w, "wrong range", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(fileData)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(fileData[start : end+1])
+	}))
+	defer ts.Close()
+
+	p := NewPrefetcher(newTestClient(ts.URL), "/bigfile.bin", int64(len(fileData)))
+	defer p.Close()
+	p.SetReadTarget(&client.ReadTarget{ObjectURL: ts.URL})
+	p.SetParallelRead(concurrency, readSize)
+	p.mu.Lock()
+	p.readSize = readSize
+	p.startPrefetch(0, windowSize)
+	p.mu.Unlock()
+
+	for offset := int64(0); offset < windowSize; offset += readSize {
+		data, ok := p.Get(offset, readSize)
+		if !ok {
+			t.Fatalf("prefetch get offset=%d = miss, want hit", offset)
+		}
+		if !bytes.Equal(data, fileData[offset:offset+readSize]) {
+			t.Fatalf("prefetch data mismatch at offset %d", offset)
+		}
+	}
+	if got := readCalls.Load(); got != 4 {
+		t.Fatalf("read calls = %d, want 4", got)
+	}
+	if got := maxInFlight.Load(); got < 2 {
+		t.Fatalf("max concurrent prefetch reads = %d, want >= 2", got)
+	}
+	if got := maxInFlight.Load(); got > concurrency {
+		t.Fatalf("max concurrent prefetch reads = %d, want <= %d", got, concurrency)
+	}
+
+	want := map[string]int{
+		"bytes=0-1048575":       1,
+		"bytes=1048576-2097151": 1,
+		"bytes=2097152-3145727": 1,
+		"bytes=3145728-4194303": 1,
+	}
+	for range 4 {
+		got := <-ranges
+		want[got]--
+	}
+	for got, count := range want {
+		if count != 0 {
+			t.Fatalf("range %s count delta = %d, want 0", got, count)
+		}
+	}
+}
+
+func TestPrefetcher_AlignsFetchRangesToReadChunks(t *testing.T) {
+	const (
+		readSize       = 64
+		windowSize     = 256
+		fetchBlockSize = 96
+	)
+	fileData := make([]byte, windowSize)
+	for i := range fileData {
+		fileData[i] = byte(i)
+	}
+	ranges := make(chan string, 2)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		rangeHeader := r.Header.Get("Range")
+		ranges <- rangeHeader
+		start, end, ok := parseTestBytesRange(rangeHeader)
+		if !ok || end >= int64(len(fileData)) {
+			http.Error(w, "wrong range", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(fileData)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(fileData[start : end+1])
+	}))
+	defer ts.Close()
+
+	p := NewPrefetcher(newTestClient(ts.URL), "/bigfile.bin", int64(len(fileData)))
+	defer p.Close()
+	p.SetReadTarget(&client.ReadTarget{ObjectURL: ts.URL})
+	p.SetParallelRead(2, fetchBlockSize)
+	p.mu.Lock()
+	p.readSize = readSize
+	p.startPrefetch(0, windowSize)
+	p.mu.Unlock()
+
+	for offset := int64(0); offset < windowSize; offset += readSize {
+		data, ok := p.Get(offset, readSize)
+		if !ok {
+			t.Fatalf("prefetch get offset=%d = miss, want hit", offset)
+		}
+		if !bytes.Equal(data, fileData[offset:offset+readSize]) {
+			t.Fatalf("prefetch data mismatch at offset %d", offset)
+		}
+	}
+
+	want := map[string]int{
+		"bytes=0-127":   1,
+		"bytes=128-255": 1,
+	}
+	for range 2 {
+		got := <-ranges
+		want[got]--
+	}
+	for got, count := range want {
+		if count != 0 {
+			t.Fatalf("range %s count delta = %d, want 0", got, count)
+		}
+	}
+}
+
+func TestPrefetcher_AllowsShortFinalEOFChunk(t *testing.T) {
+	const (
+		readSize       = 64
+		fileSize       = 150
+		fetchBlockSize = 96
+	)
+	fileData := make([]byte, fileSize)
+	for i := range fileData {
+		fileData[i] = byte(i)
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		start, end, ok := parseTestBytesRange(r.Header.Get("Range"))
+		if !ok || end >= int64(len(fileData)) {
+			http.Error(w, "wrong range", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(fileData)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(fileData[start : end+1])
+	}))
+	defer ts.Close()
+
+	p := NewPrefetcher(newTestClient(ts.URL), "/short.bin", int64(len(fileData)))
+	defer p.Close()
+	p.SetReadTarget(&client.ReadTarget{ObjectURL: ts.URL})
+	p.SetParallelRead(2, fetchBlockSize)
+	p.mu.Lock()
+	p.readSize = readSize
+	p.startPrefetch(0, int64(len(fileData)))
+	p.mu.Unlock()
+
+	data, ok := p.Get(128, readSize)
+	if !ok {
+		t.Fatal("final EOF prefetch chunk = miss, want hit")
+	}
+	if !bytes.Equal(data, fileData[128:]) {
+		t.Fatalf("final EOF prefetch chunk mismatch: got %d bytes, want %d", len(data), len(fileData[128:]))
+	}
+}
+
+func TestPrefetcher_StopsQueuedFetchesAfterFirstError(t *testing.T) {
+	const (
+		readSize    = 64
+		windowSize  = 256
+		concurrency = 2
+	)
+	fileData := make([]byte, windowSize)
+	for i := range fileData {
+		fileData[i] = byte(i)
+	}
+	slowStarted := make(chan struct{})
+	releaseSlow := make(chan struct{})
+	var slowOnce sync.Once
+	var releaseOnce sync.Once
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseSlow) }) })
+	var unexpectedQueuedReads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		rangeHeader := r.Header.Get("Range")
+		switch rangeHeader {
+		case "bytes=0-63":
+			select {
+			case <-slowStarted:
+			case <-time.After(time.Second):
+				http.Error(w, "slow range did not start", http.StatusInternalServerError)
+				return
+			}
+			http.Error(w, "blocked range", http.StatusBadGateway)
+			return
+		case "bytes=64-127":
+			slowOnce.Do(func() { close(slowStarted) })
+			<-releaseSlow
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(fileData[64:128])
+			return
+		default:
+			unexpectedQueuedReads.Add(1)
+			w.WriteHeader(http.StatusPartialContent)
+			start, end, ok := parseTestBytesRange(rangeHeader)
+			if ok && end < int64(len(fileData)) {
+				_, _ = w.Write(fileData[start : end+1])
+			}
+		}
+	}))
+	defer ts.Close()
+
+	p := NewPrefetcher(newTestClient(ts.URL), "/bigfile.bin", int64(len(fileData)))
+	defer p.Close()
+	p.SetReadTarget(&client.ReadTarget{ObjectURL: ts.URL})
+	p.SetParallelRead(concurrency, readSize)
+	p.mu.Lock()
+	p.readSize = readSize
+	p.startPrefetch(0, windowSize)
+	p.mu.Unlock()
+
+	select {
+	case <-slowStarted:
+	case <-time.After(time.Second):
+		t.Fatal("second in-flight prefetch did not start")
+	}
+	time.Sleep(50 * time.Millisecond)
+	releaseOnce.Do(func() { close(releaseSlow) })
+	if _, ok := p.Get(0, readSize); ok {
+		t.Fatal("errored prefetch block returned a hit")
+	}
+	if got := unexpectedQueuedReads.Load(); got != 0 {
+		t.Fatalf("queued prefetch reads after first error = %d, want 0", got)
+	}
+}
+
 // TestPrefetcher_ChunkCapBound verifies that chunk count never exceeds
 // prefetchMaxBlocks, even with tiny readSize and large window.
 func TestPrefetcher_ChunkCapBound(t *testing.T) {
@@ -1439,6 +1705,22 @@ func TestStreamUploader_NotStartedBeforeUploadAll(t *testing.T) {
 	su := NewStreamUploader(nil, "/test", -1)
 	if su.Started() {
 		t.Fatal("should not be started before UploadAll")
+	}
+}
+
+func TestStreamUploaderRefreshExpectedRevisionAfterBufferedPart(t *testing.T) {
+	su := NewStreamUploader(nil, "/test", 7)
+	if err := su.SubmitPart(context.Background(), 1, []byte("part"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !su.Started() {
+		t.Fatal("SubmitPart should mark buffered streaming as started")
+	}
+	if !su.RefreshExpectedRevision(8) {
+		t.Fatal("RefreshExpectedRevision should succeed before remote writer exists")
+	}
+	if got := su.ExpectedRevision(); got != 8 {
+		t.Fatalf("ExpectedRevision = %d, want 8", got)
 	}
 }
 
@@ -2342,6 +2624,26 @@ func TestDiskReadCachePendingMemoryIsServedAndIsolated(t *testing.T) {
 	got, ok = cache.Get(key)
 	if !ok || string(got) != "hello" {
 		t.Fatalf("pending cache data after mutation = %q, %v; want isolated hello hit", got, ok)
+	}
+}
+
+func TestDiskReadCacheRejectsLengthMismatch(t *testing.T) {
+	cache := newTestDiskReadCache(t, 1<<20)
+	key := DiskReadCacheKey{FileID: "file-1", Path: "/file.bin", Revision: 7, Offset: 0, Length: 5}
+
+	cache.Put(key, []byte("hey"))
+	if got, ok := cache.Get(key); ok {
+		t.Fatalf("disk read cache hit after short Put = %q, want miss", got)
+	}
+
+	cache.PutAsync(key, []byte("hey"))
+	if got, ok := cache.Get(key); ok {
+		t.Fatalf("disk read cache pending hit after short PutAsync = %q, want miss", got)
+	}
+
+	cache.PutOwned(key, []byte("hello"))
+	if got, ok := cache.Get(key); !ok || string(got) != "hello" {
+		t.Fatalf("disk read cache full PutOwned = %q, %v; want hello hit", got, ok)
 	}
 }
 
