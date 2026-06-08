@@ -1,7 +1,0 @@
-.terraform/
-terraform.tfstate.d/
-terraform.tfstate
-terraform.tfstate.*
-*.tfplan
-*.tfvars
-!*.tfvars.example

@@ -27,7 +27,7 @@ env:
   ALICLOUD_ACK_CLUSTER_ID: c4dad0ecde1e94472a36fec0498e181ed
   ALICLOUD_ACR_INSTANCE_ID: cri-o1k17vrutnkytn35
   ALICLOUD_ACR_REGISTRY: 5935480747139440-registry.ap-southeast-1.cr.aliyuncs.com
-  ALICLOUD_ASSUME_ARN: acs:ram::5935480747139440:role/dev-dat9-ack-ap-southeast-1-github-deploy
+  ALICLOUD_ASSUME_ARN: acs:ram::5935480747139440:role/prod-dat9-ack-ap-southeast-1-github-deploy
   ALICLOUD_OIDC_PROVIDER_ARN: acs:ram::5935480747139440:oidc-provider/github-actions
   ALICLOUD_REPOSITORY: drive9/dat9-server
   EKS_CLUSTER: dev-dat9
