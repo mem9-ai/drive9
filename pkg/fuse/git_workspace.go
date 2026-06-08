@@ -90,11 +90,19 @@ func newGitWorkspaceLayer() *gitWorkspaceLayer {
 }
 
 func (fs *Dat9FS) ensureGitWorkspaces(ctx context.Context) error {
+	return fs.ensureGitWorkspacesWithRefresh(ctx, false)
+}
+
+func (fs *Dat9FS) forceRefreshGitWorkspaces(ctx context.Context) error {
+	return fs.ensureGitWorkspacesWithRefresh(ctx, true)
+}
+
+func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool) error {
 	if fs == nil || fs.git == nil || fs.client == nil {
 		return nil
 	}
 	fs.git.mu.Lock()
-	if fs.git.loaded && time.Since(fs.git.loadedAt) < gitWorkspaceRefreshInterval {
+	if !force && fs.git.loaded && time.Since(fs.git.loadedAt) < gitWorkspaceRefreshInterval {
 		fs.git.mu.Unlock()
 		return nil
 	}
@@ -173,30 +181,43 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 	if ctx == nil {
 		ctx = context.TODO()
 	}
-	ctx, cancel := context.WithTimeout(ctx, fuseTimeout)
-	if err := fs.ensureGitWorkspaces(ctx); err != nil {
+	baseCtx := ctx
+	ensureCtx, cancel := context.WithTimeout(baseCtx, fuseTimeout)
+	if err := fs.ensureGitWorkspaces(ensureCtx); err != nil {
 		log.Printf("git workspace refresh failed for %s: %v", localPath, err)
 	}
 	cancel()
 
-	clean := path.Clean(localPath)
-	fs.git.mu.Lock()
-	defer fs.git.mu.Unlock()
-	for _, rt := range fs.git.workspaces {
-		root := rt.localRoot
-		if root == "/" {
-			rel := strings.TrimPrefix(clean, "/")
+	if rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath); ok {
+		return rt, rel, true
+	}
+	if fs.hasLocalGitStateHint(localPath) {
+		refreshCtx, refreshCancel := context.WithTimeout(baseCtx, fuseTimeout)
+		if err := fs.forceRefreshGitWorkspaces(refreshCtx); err != nil {
+			log.Printf("git workspace forced refresh failed for %s: %v", localPath, err)
+		}
+		refreshCancel()
+		if rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath); ok {
 			return rt, rel, true
-		}
-		if clean == root {
-			return rt, "", true
-		}
-		prefix := root + "/"
-		if strings.HasPrefix(clean, prefix) {
-			return rt, strings.TrimPrefix(clean, prefix), true
 		}
 	}
 	return nil, "", false
+}
+
+func (fs *Dat9FS) hasLocalGitStateHint(localPath string) bool {
+	if fs == nil || fs.localOverlay == nil {
+		return false
+	}
+	clean := path.Clean(localPath)
+	if clean == "." || clean == "/" {
+		return false
+	}
+	for cur := clean; cur != "." && cur != "/"; cur = path.Dir(cur) {
+		if _, err := fs.localOverlay.Lstat(path.Join(cur, ".git")); err == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (fs *Dat9FS) loadedGitWorkspaceForPath(localPath string) (*gitWorkspaceRuntime, string, bool) {

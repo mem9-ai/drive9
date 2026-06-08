@@ -503,6 +503,48 @@ func TestEnsureGitWorkspacesKeepsPreviousSnapshotOnLoadFailure(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceForPathForceRefreshesAfterLocalGitAppears(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.deleted = true
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.localOverlay.EnsureRoot(); err != nil {
+		t.Fatalf("EnsureRoot: %v", err)
+	}
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("initial ensureGitWorkspaces: %v", err)
+	}
+	fs.git.mu.Lock()
+	initialLoadedAt := fs.git.loadedAt
+	initialCount := len(fs.git.workspaces)
+	fs.git.mu.Unlock()
+	if initialCount != 0 {
+		t.Fatalf("initial workspace count = %d, want 0", initialCount)
+	}
+	if err := fs.localOverlay.Mkdir("/repo/.git", 0o755); err != nil {
+		t.Fatalf("create local .git hint: %v", err)
+	}
+	fixture.mu.Lock()
+	fixture.deleted = false
+	fixture.mu.Unlock()
+
+	entry, handled := fs.gitEntry(context.Background(), "/repo/README.md", false)
+	if !handled || entry == nil {
+		t.Fatalf("gitEntry handled=%t entry=%v, want forced refresh to load README", handled, entry)
+	}
+	fs.git.mu.Lock()
+	loadedAt := fs.git.loadedAt
+	count := len(fs.git.workspaces)
+	fs.git.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("workspace count after forced refresh = %d, want 1", count)
+	}
+	if !loadedAt.After(initialLoadedAt) {
+		t.Fatalf("loadedAt did not advance after forced refresh")
+	}
+}
+
 func TestGitWorkspaceWriteSyncWritesOverlay(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
