@@ -477,7 +477,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	if err != nil {
 		return nil, nil, fmt.Errorf("open datastore: %w", err)
 	}
-	if p.cfg.DisableDatabaseAutoEmbedding {
+	if p.cfg.DisableDatabaseAutoEmbedding && UsesTiDBAutoEmbedding(t.Provider) {
 		store.DisableAutoEmbedTextWrites()
 	}
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0

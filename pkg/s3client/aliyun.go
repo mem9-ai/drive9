@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,18 +24,24 @@ func aliyunCredentials() (accessKeyID, secretAccessKey, securityToken string) {
 }
 
 // isAliyunEndpoint reports whether endpoint points to an Aliyun OSS service.
+// It inspects the host portion of the URL and checks for an aliyuncs.com domain
+// boundary, preventing false matches from query/path substrings or crafted
+// hostnames like "aliyuncs.com.evil.com".
 func isAliyunEndpoint(endpoint string) bool {
-	return len(endpoint) > 0 && containsAliyunDomain(endpoint)
-}
-
-func containsAliyunDomain(s string) bool {
-	// Cover oss-*.aliyuncs.com and kms*.aliyuncs.com variants.
-	for i := 0; i+len("aliyuncs.com") <= len(s); i++ {
-		if s[i:i+len("aliyuncs.com")] == "aliyuncs.com" {
-			return true
-		}
+	if len(endpoint) == 0 {
+		return false
 	}
-	return false
+	// Strip scheme (e.g. "https://").
+	host := endpoint
+	if i := strings.Index(endpoint, "://"); i >= 0 {
+		host = endpoint[i+3:]
+	}
+	// Strip path, query, port.
+	if i := strings.IndexAny(host, "/:?"); i >= 0 {
+		host = host[:i]
+	}
+	// Match host == "aliyuncs.com" or host ends with ".aliyuncs.com".
+	return host == "aliyuncs.com" || strings.HasSuffix(host, ".aliyuncs.com")
 }
 
 // rrsaCredentials detects whether ACK RRSA env vars are present and returns a
@@ -89,7 +96,7 @@ func (p *rrsaProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 	req := sts.CreateAssumeRoleWithOIDCRequest()
 	req.RoleArn = p.roleARN
 	req.OIDCProviderArn = p.oidcProviderARN
-	req.OIDCToken = string(tokenBytes)
+	req.OIDCToken = strings.TrimSpace(string(tokenBytes))
 	req.RoleSessionName = "drive9-rrsa"
 	req.DurationSeconds = "3600"
 

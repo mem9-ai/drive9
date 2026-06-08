@@ -88,7 +88,8 @@ func applyS3Options(cfg AWSConfig) func(*s3.Options) {
 // New creates an S3-compatible client. The endpoint in cfg determines which
 // credential chain is used:
 //   - Aliyun OSS endpoints (*.aliyuncs.com): explicit key → RRSA → ALIBABA_CLOUD env
-//   - All other endpoints: explicit key → AWS default chain
+//     → AWS SDK default chain (if none of the above are configured)
+//   - All other endpoints: explicit key → AWS SDK default chain
 func New(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err

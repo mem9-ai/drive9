@@ -19,6 +19,11 @@ func TestIsAliyunEndpoint(t *testing.T) {
 		{"https://oss-ap-southeast-1.aliyuncs.com", true},
 		{"https://kms.cn-hangzhou.aliyuncs.com", true},
 		{"http://oss-cn-beijing.aliyuncs.com", true},
+		// Port should be stripped before matching.
+		{"https://oss-cn-hangzhou.aliyuncs.com:443", true},
+		// Domain boundary: must end with .aliyuncs.com, not just contain it.
+		{"https://evil.com/path?aliyuncs.com", false},
+		{"https://aliyuncs.com.evil.com", false},
 		{"https://s3.amazonaws.com", false},
 		{"https://s3.us-east-1.amazonaws.com", false},
 		{"https://minio.example.com:9000", false},

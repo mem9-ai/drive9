@@ -110,9 +110,14 @@ func TestCredentialsForAliyunExplicitKey(t *testing.T) {
 }
 
 func TestCredentialsForAliyunNoCredentials(t *testing.T) {
-	// Ensure ALIBABA_CLOUD env vars are unset so the fallback returns nil.
+	// Clear the full set of env vars that credentialsForAliyun consults so the
+	// test is not order-dependent or sensitive to the ambient environment.
 	t.Setenv("ALIBABA_CLOUD_ACCESS_KEY_ID", "")
+	t.Setenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "")
+	t.Setenv("ALIBABA_CLOUD_SECURITY_TOKEN", "")
 	t.Setenv("ALIBABA_CLOUD_ROLE_ARN", "")
+	t.Setenv("ALIBABA_CLOUD_OIDC_PROVIDER_ARN", "")
+	t.Setenv("ALIBABA_CLOUD_OIDC_TOKEN_FILE", "")
 
 	provider, err := credentialsForAliyun(AWSConfig{})
 	if err != nil {
