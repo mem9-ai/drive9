@@ -264,7 +264,15 @@ jobs:
           if-no-files-found: warn
 
       - name: Archive FUSE performance metrics to Drive9
-        if: always() && env.RUN_FUSE_PERFORMANCE_BASELINE == '1' && env.ARCHIVE_FUSE_PERFORMANCE_METRICS == '1'
+        if: >
+          always() &&
+          env.RUN_FUSE_PERFORMANCE_BASELINE == '1' &&
+          env.ARCHIVE_FUSE_PERFORMANCE_METRICS == '1' &&
+          (
+            env.COMPARE_FUSE_PERFORMANCE_METRICS != '1' ||
+            steps.fuse_performance_compare.outcome == 'success' ||
+            steps.fuse_performance_compare.outcome == 'skipped'
+          )
         env:
           DRIVE9_SERVER: https://api.drive9.ai
           DRIVE9_API_KEY: ${{ secrets.DRIVE9_ARCHIVE_API_KEY }}
