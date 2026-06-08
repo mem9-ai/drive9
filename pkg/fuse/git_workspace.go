@@ -38,6 +38,8 @@ const gitWorkspaceModeFastBlobless = "fast-blobless"
 const gitLocalObjectMaxBlobBytes int64 = 5 << 20
 const gitLocalObjectMaxPackBytes int64 = 256 << 20
 
+var gitCleanTreeDefaultMtime = time.Unix(1, 0).UTC()
+
 type gitWorkspaceLayer struct {
 	mu         sync.Mutex
 	checkpoint sync.Mutex
@@ -58,16 +60,41 @@ type gitWorkspaceRuntime struct {
 	nodes     map[string]client.GitTreeNode
 	children  map[string][]client.GitTreeNode
 	overlay   map[string]client.GitOverlayEntry
+	loadedAt  time.Time
 	restored  bool
 
 	localTreeCommit   string
 	localNodes        map[string]client.GitTreeNode
 	localChildren     map[string][]client.GitTreeNode
 	localTreeLoadedAt time.Time
+	locallyDeleted    bool
 }
 
 func (rt *gitWorkspaceRuntime) isLinked() bool {
 	return rt != nil && rt.workspace.WorkspaceKind == "linked"
+}
+
+func (rt *gitWorkspaceRuntime) markLocallyDeleted() {
+	if rt == nil {
+		return
+	}
+	rt.mu.Lock()
+	rt.locallyDeleted = true
+	rt.mu.Unlock()
+}
+
+func (rt *gitWorkspaceRuntime) isLocallyDeleted() bool {
+	if rt == nil {
+		return false
+	}
+	rt.mu.RLock()
+	deleted := rt.locallyDeleted
+	rt.mu.RUnlock()
+	return deleted
+}
+
+func gitWorkspaceIsFastBlobless(rt *gitWorkspaceRuntime) bool {
+	return rt != nil && rt.workspace.Mode == gitWorkspaceModeFastBlobless
 }
 
 type gitMaterializeCall struct {
@@ -119,6 +146,9 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 	var loadErrs []error
 	for i := range workspaces {
 		ws := workspaces[i]
+		if fs.gitWorkspaceDeletedLocally(ctx, ws.WorkspaceID) {
+			continue
+		}
 		localRoot, ok := fs.localPath(strings.TrimSuffix(ws.RootPath, "/"))
 		if !ok {
 			continue
@@ -161,11 +191,15 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 	sort.Slice(loaded, func(i, j int) bool {
 		return len(loaded[i].localRoot) > len(loaded[j].localRoot)
 	})
+	loadedAt := time.Now()
+	for _, rt := range loaded {
+		rt.loadedAt = loadedAt
+	}
 
 	fs.git.mu.Lock()
 	fs.git.workspaces = loaded
 	fs.git.loaded = true
-	fs.git.loadedAt = time.Now()
+	fs.git.loadedAt = loadedAt
 	fs.git.mu.Unlock()
 
 	for _, rt := range loaded {
@@ -187,6 +221,13 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 		log.Printf("git workspace refresh failed for %s: %v", localPath, err)
 	}
 	cancel()
+	if fs.gitWorkspaceCacheInvalidatedLocally(baseCtx) {
+		refreshCtx, refreshCancel := context.WithTimeout(baseCtx, fuseTimeout)
+		if err := fs.forceRefreshGitWorkspaces(refreshCtx); err != nil {
+			log.Printf("git workspace forced refresh failed for invalidated cache %s: %v", localPath, err)
+		}
+		refreshCancel()
+	}
 
 	if rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath); ok {
 		return rt, rel, true
@@ -234,8 +275,13 @@ func (fs *Dat9FS) loadedGitWorkspaceForPath(localPath string) (*gitWorkspaceRunt
 	}
 	clean := path.Clean(localPath)
 	fs.git.mu.Lock()
-	defer fs.git.mu.Unlock()
-	for _, rt := range fs.git.workspaces {
+	workspaces := make([]*gitWorkspaceRuntime, len(fs.git.workspaces))
+	copy(workspaces, fs.git.workspaces)
+	fs.git.mu.Unlock()
+	for _, rt := range workspaces {
+		if fs.gitWorkspaceRuntimeHiddenLocally(context.Background(), rt) {
+			continue
+		}
 		root := rt.localRoot
 		if root == "/" {
 			return rt, strings.TrimPrefix(clean, "/"), true
@@ -249,6 +295,54 @@ func (fs *Dat9FS) loadedGitWorkspaceForPath(localPath string) (*gitWorkspaceRunt
 		}
 	}
 	return nil, "", false
+}
+
+func (fs *Dat9FS) gitWorkspaceRuntimeHiddenLocally(ctx context.Context, rt *gitWorkspaceRuntime) bool {
+	if rt == nil {
+		return false
+	}
+	if rt.isLocallyDeleted() {
+		return true
+	}
+	if fs.gitWorkspaceDeletedLocally(ctx, rt.workspace.WorkspaceID) {
+		rt.markLocallyDeleted()
+		return true
+	}
+	return fs.gitWorkspaceRuntimeRefreshInvalidated(ctx, rt)
+}
+
+func (fs *Dat9FS) gitWorkspaceDeletedLocally(ctx context.Context, workspaceID string) bool {
+	if fs == nil || fs.opts == nil {
+		return false
+	}
+	return gitcache.WorkspaceDeleted(ctx, fs.opts.LocalRoot, workspaceID)
+}
+
+func (fs *Dat9FS) gitWorkspaceRuntimeRefreshInvalidated(ctx context.Context, rt *gitWorkspaceRuntime) bool {
+	if fs == nil || fs.opts == nil || rt == nil {
+		return false
+	}
+	markerTime, ok := gitcache.WorkspaceRefreshMarkerTime(ctx, fs.opts.LocalRoot, rt.workspace.WorkspaceID)
+	if !ok {
+		return false
+	}
+	return markerTime.After(rt.loadedAt)
+}
+
+func (fs *Dat9FS) gitWorkspaceCacheInvalidatedLocally(ctx context.Context) bool {
+	if fs == nil || fs.git == nil || fs.opts == nil {
+		return false
+	}
+	fs.git.mu.Lock()
+	workspaces := make([]*gitWorkspaceRuntime, len(fs.git.workspaces))
+	copy(workspaces, fs.git.workspaces)
+	fs.git.mu.Unlock()
+	for _, rt := range workspaces {
+		if fs.gitWorkspaceRuntimeRefreshInvalidated(ctx, rt) {
+			return true
+		}
+	}
+	return false
 }
 
 func (fs *Dat9FS) loadedGitWorkspaceForGitStatePath(localPath string) (*gitWorkspaceRuntime, string, bool) {
@@ -277,8 +371,13 @@ func (fs *Dat9FS) linkedWorkspaceForCommonGitStatePath(commonRT *gitWorkspaceRun
 		return nil, "", false
 	}
 	fs.git.mu.Lock()
-	defer fs.git.mu.Unlock()
-	for _, candidate := range fs.git.workspaces {
+	workspaces := make([]*gitWorkspaceRuntime, len(fs.git.workspaces))
+	copy(workspaces, fs.git.workspaces)
+	fs.git.mu.Unlock()
+	for _, candidate := range workspaces {
+		if fs.gitWorkspaceRuntimeHiddenLocally(context.Background(), candidate) {
+			continue
+		}
 		if candidate.workspace.CommonWorkspaceID == commonRT.workspace.WorkspaceID && candidate.workspace.WorktreeName == name {
 			if rest == "" {
 				return candidate, ".git", true
@@ -294,8 +393,13 @@ func (fs *Dat9FS) gitWorkspaceRuntimeByID(workspaceID string) (*gitWorkspaceRunt
 		return nil, false
 	}
 	fs.git.mu.Lock()
-	defer fs.git.mu.Unlock()
-	for _, rt := range fs.git.workspaces {
+	workspaces := make([]*gitWorkspaceRuntime, len(fs.git.workspaces))
+	copy(workspaces, fs.git.workspaces)
+	fs.git.mu.Unlock()
+	for _, rt := range workspaces {
+		if fs.gitWorkspaceRuntimeHiddenLocally(context.Background(), rt) {
+			continue
+		}
 		if rt.workspace.WorkspaceID == workspaceID {
 			return rt, true
 		}
@@ -786,7 +890,7 @@ func (fs *Dat9FS) gitTreeInode(ctx context.Context, rt *gitWorkspaceRuntime, loc
 	} else if size < 0 {
 		size = fs.resolveGitCleanNodeSize(ctx, rt, rel, n)
 	}
-	return fs.gitInode(localPath, isDir, size, mode, hasMode, incrementLookup)
+	return fs.gitInodeWithMtime(localPath, isDir, size, mode, hasMode, gitCleanTreeMtime(rt), incrementLookup)
 }
 
 func (fs *Dat9FS) gitOverlayInode(ctx context.Context, rt *gitWorkspaceRuntime, rel string, e client.GitOverlayEntry, incrementLookup bool) *InodeEntry {
@@ -837,15 +941,40 @@ func (fs *Dat9FS) gitOverlayInode(ctx context.Context, rt *gitWorkspaceRuntime, 
 }
 
 func (fs *Dat9FS) gitInode(localPath string, isDir bool, size int64, mode uint32, hasMode bool, incrementLookup bool) *InodeEntry {
+	return fs.gitInodeWithMtime(localPath, isDir, size, mode, hasMode, time.Now(), incrementLookup)
+}
+
+func (fs *Dat9FS) gitInodeWithMtime(localPath string, isDir bool, size int64, mode uint32, hasMode bool, mtime time.Time, incrementLookup bool) *InodeEntry {
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
 	var ino uint64
 	if incrementLookup {
-		ino = fs.inodes.Lookup(localPath, isDir, size, time.Now())
+		ino = fs.inodes.Lookup(localPath, isDir, size, mtime)
 	} else {
-		ino = fs.inodes.EnsureInode(localPath, isDir, size, time.Now())
+		ino = fs.inodes.EnsureInode(localPath, isDir, size, mtime)
 	}
 	fs.inodes.SetModeState(ino, mode, hasMode)
 	entry, _ := fs.inodes.GetEntry(ino)
 	return entry
+}
+
+func gitCleanTreeMtime(rt *gitWorkspaceRuntime) time.Time {
+	base := gitCleanTreeDefaultMtime
+	commit := ""
+	if rt != nil {
+		if !rt.workspace.CreatedAt.IsZero() {
+			base = rt.workspace.CreatedAt
+		}
+		commit = strings.TrimSpace(rt.workspace.HeadCommit)
+	}
+	if commit == "" {
+		return base
+	}
+	sum := sha256.Sum256([]byte(strings.ToLower(commit)))
+	raw := uint32(sum[0])<<24 | uint32(sum[1])<<16 | uint32(sum[2])<<8 | uint32(sum[3])
+	nsec := int64(raw % uint32(time.Second))
+	return time.Unix(base.Unix(), nsec).UTC()
 }
 
 func gitNodeMode(n client.GitTreeNode) (mode uint32, hasMode bool, isDir bool) {
@@ -1259,6 +1388,9 @@ func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceR
 			return size
 		}
 	}
+	if gitWorkspaceIsFastBlobless(rt) {
+		return n.SizeBytes
+	}
 	if n.ObjectSHA != "" {
 		if size, err := fs.gitCatFileBlobSize(ctx, rt, n.ObjectSHA); err == nil {
 			rt.updateCleanNodeSize(rel, nodeCommit, size)
@@ -1396,6 +1528,7 @@ func (fs *Dat9FS) gitCatFileBlobSize(ctx context.Context, rt *gitWorkspaceRuntim
 		fs.perf.gitCatFileCount.add(1)
 	}
 	cmd := exec.CommandContext(ctx, "git", "--git-dir", gitDir, "cat-file", "-s", objectSHA)
+	setGitNoLazyEnv(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	out, err := cmd.Output()
@@ -1854,6 +1987,13 @@ func buildRestoredGitHeadOverlay(ctx context.Context, gitDir string, rt *gitWork
 			UpdatedAt:     now,
 		}
 		if headEntry.kind == "file" || headEntry.kind == "symlink" {
+			object, err := gitRestoredHeadBlobInfo(ctx, gitDir, headEntry.oid, rel)
+			if err != nil {
+				return nil, err
+			}
+			if object.size > gitLocalObjectMaxBlobBytes {
+				return nil, fmt.Errorf("git HEAD tree object %s for %s is %d bytes, exceeds local restore limit %d", headEntry.oid, rel, object.size, gitLocalObjectMaxBlobBytes)
+			}
 			content, err := gitCatBlobNoLazy(ctx, gitDir, headEntry.oid)
 			if err != nil {
 				return nil, err
@@ -1889,6 +2029,21 @@ func buildRestoredGitHeadOverlay(ctx context.Context, gitDir string, rt *gitWork
 	return out, nil
 }
 
+func gitRestoredHeadBlobInfo(ctx context.Context, gitDir, oid, rel string) (gitObjectInfo, error) {
+	info, err := gitObjectInfoBatch(ctx, gitDir, []string{oid})
+	if err != nil {
+		return gitObjectInfo{}, err
+	}
+	object := info[oid]
+	if object.typ == "" || object.typ == "missing" {
+		return gitObjectInfo{}, fmt.Errorf("git HEAD tree object %s for %s is missing", oid, rel)
+	}
+	if object.typ != "blob" {
+		return gitObjectInfo{}, fmt.Errorf("git HEAD tree object %s for %s is %s, want blob", oid, rel, object.typ)
+	}
+	return object, nil
+}
+
 func (rt *gitWorkspaceRuntime) gitHeadOverlayInputs() (map[string]client.GitTreeNode, map[string]struct{}) {
 	baseNodes := make(map[string]client.GitTreeNode)
 	existingOverlay := make(map[string]struct{})
@@ -1912,7 +2067,6 @@ func gitHeadTreeEntries(ctx context.Context, gitDir string) (map[string]gitHeadT
 		return nil, err
 	}
 	entries := make(map[string]gitHeadTreeEntry)
-	var blobIDs []string
 	for _, rec := range bytes.Split(out, []byte{0}) {
 		if len(rec) == 0 {
 			continue
@@ -1934,31 +2088,7 @@ func gitHeadTreeEntries(ctx context.Context, gitDir string) (map[string]gitHeadT
 		if kind == "" {
 			continue
 		}
-		entries[rel] = gitHeadTreeEntry{path: rel, kind: kind, mode: mode, oid: oid}
-		if kind == "file" || kind == "symlink" {
-			blobIDs = append(blobIDs, oid)
-		}
-	}
-	info, err := gitObjectInfoBatch(ctx, gitDir, blobIDs)
-	if err != nil {
-		return nil, err
-	}
-	for rel, entry := range entries {
-		if entry.kind != "file" && entry.kind != "symlink" {
-			continue
-		}
-		object := info[entry.oid]
-		if object.typ == "" || object.typ == "missing" {
-			return nil, fmt.Errorf("git HEAD tree object %s for %s is missing", entry.oid, rel)
-		}
-		if object.typ != "blob" {
-			return nil, fmt.Errorf("git HEAD tree object %s for %s is %s, want blob", entry.oid, rel, object.typ)
-		}
-		if object.size > gitLocalObjectMaxBlobBytes {
-			return nil, fmt.Errorf("git HEAD tree object %s for %s is %d bytes, exceeds local restore limit %d", entry.oid, rel, object.size, gitLocalObjectMaxBlobBytes)
-		}
-		entry.size = object.size
-		entries[rel] = entry
+		entries[rel] = gitHeadTreeEntry{path: rel, kind: kind, mode: mode, oid: oid, size: -1}
 	}
 	return entries, nil
 }

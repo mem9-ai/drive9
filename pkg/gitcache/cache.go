@@ -90,6 +90,113 @@ func HydrateLogPath(localRoot, workspaceID, commit string) string {
 	return filepath.Join(CacheRoot(localRoot, workspaceID, commit), "hydrate.log")
 }
 
+// WorkspaceDeletedMarkerPath returns the local marker path used to hide a
+// deleted workspace from a still-running FUSE mount before the next backend
+// refresh observes the deletion.
+func WorkspaceDeletedMarkerPath(localRoot, workspaceID string) string {
+	return filepath.Join(localRoot, "git-workspaces", "deleted", safePathSegment(workspaceID))
+}
+
+// WorkspaceRefreshMarkerPath returns the local marker path used to tell a
+// still-running FUSE mount that a workspace with a reused ID must be refreshed
+// before the cached runtime can be trusted again.
+func WorkspaceRefreshMarkerPath(localRoot, workspaceID string) string {
+	return filepath.Join(localRoot, "git-workspaces", "refresh", safePathSegment(workspaceID))
+}
+
+// MarkWorkspaceDeleted records that a workspace was deleted in this local root.
+func MarkWorkspaceDeleted(ctx context.Context, localRoot, workspaceID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	localRoot = strings.TrimSpace(localRoot)
+	workspaceID = strings.TrimSpace(workspaceID)
+	if localRoot == "" || workspaceID == "" {
+		return nil
+	}
+	marker := WorkspaceDeletedMarkerPath(localRoot, workspaceID)
+	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		return fmt.Errorf("create workspace deleted marker dir %q: %w", filepath.Dir(marker), err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.WriteFile(marker, []byte("deleted\n"), 0o644); err != nil {
+		return fmt.Errorf("write workspace deleted marker %q: %w", marker, err)
+	}
+	return nil
+}
+
+// ClearWorkspaceDeleted removes a local deletion marker when a workspace ID is reused.
+func ClearWorkspaceDeleted(ctx context.Context, localRoot, workspaceID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	localRoot = strings.TrimSpace(localRoot)
+	workspaceID = strings.TrimSpace(workspaceID)
+	if localRoot == "" || workspaceID == "" {
+		return nil
+	}
+	refreshMarker := WorkspaceRefreshMarkerPath(localRoot, workspaceID)
+	if err := os.MkdirAll(filepath.Dir(refreshMarker), 0o755); err != nil {
+		return fmt.Errorf("create workspace refresh marker dir %q: %w", filepath.Dir(refreshMarker), err)
+	}
+	if err := os.WriteFile(refreshMarker, []byte(time.Now().UTC().Format(time.RFC3339Nano)+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write workspace refresh marker %q: %w", refreshMarker, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	marker := WorkspaceDeletedMarkerPath(localRoot, workspaceID)
+	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove workspace deleted marker %q: %w", marker, err)
+	}
+	return nil
+}
+
+// WorkspaceRefreshMarkerTime returns the mtime for the local refresh marker.
+func WorkspaceRefreshMarkerTime(ctx context.Context, localRoot, workspaceID string) (time.Time, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return time.Time{}, false
+	}
+	localRoot = strings.TrimSpace(localRoot)
+	workspaceID = strings.TrimSpace(workspaceID)
+	if localRoot == "" || workspaceID == "" {
+		return time.Time{}, false
+	}
+	info, err := os.Stat(WorkspaceRefreshMarkerPath(localRoot, workspaceID))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return info.ModTime(), true
+}
+
+// WorkspaceDeleted reports whether a local deletion marker exists.
+func WorkspaceDeleted(ctx context.Context, localRoot, workspaceID string) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	localRoot = strings.TrimSpace(localRoot)
+	workspaceID = strings.TrimSpace(workspaceID)
+	if localRoot == "" || workspaceID == "" {
+		return false
+	}
+	_, err := os.Stat(WorkspaceDeletedMarkerPath(localRoot, workspaceID))
+	return err == nil
+}
+
 // ReadTreeFile reads a materialized clean tree file or symlink. The boolean is
 // false when the materialized path is simply absent.
 func ReadTreeFile(ctx context.Context, localRoot, workspaceID, commit, rel string, offset, size int64) ([]byte, bool, error) {
