@@ -333,23 +333,28 @@ func TestPoolCreateBackendPeriodicallyValidatesSchemaWhenVersionMatches(t *testi
 	tenant.Provider = ProviderTiDBZero
 	tenant.SchemaVersion = schema.CurrentTiDBTenantSchemaVersion
 
-	origEnsure := ensureTiDBSchemaForMode
-	origValidate := validateTiDBSchemaForMode
+	origEnsure := ensureTiDBSchemaForAutoEmbeddingProfile
+	origValidate := validateTiDBSchemaForAutoEmbeddingProfile
+	origApply := applyTiDBAutoEmbeddingProviderConfig
 	origEvery := periodicTiDBSchemaValidationEvery
 	ensureCalls := 0
 	validateCalls := 0
-	ensureTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+	ensureTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
 		ensureCalls++
 		return nil
 	}
-	validateTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+	validateTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
 		validateCalls++
+		return nil
+	}
+	applyTiDBAutoEmbeddingProviderConfig = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProviderConfig) error {
 		return nil
 	}
 	periodicTiDBSchemaValidationEvery = 4
 	t.Cleanup(func() {
-		ensureTiDBSchemaForMode = origEnsure
-		validateTiDBSchemaForMode = origValidate
+		ensureTiDBSchemaForAutoEmbeddingProfile = origEnsure
+		validateTiDBSchemaForAutoEmbeddingProfile = origValidate
+		applyTiDBAutoEmbeddingProviderConfig = origApply
 		periodicTiDBSchemaValidationEvery = origEvery
 	})
 
@@ -365,10 +370,10 @@ func TestPoolCreateBackendPeriodicallyValidatesSchemaWhenVersionMatches(t *testi
 	}
 
 	if ensureCalls != 0 {
-		t.Fatalf("ensureTiDBSchemaForMode called %d times, want 0", ensureCalls)
+		t.Fatalf("ensureTiDBSchemaForAutoEmbeddingProfile called %d times, want 0", ensureCalls)
 	}
 	if validateCalls != 2 {
-		t.Fatalf("validateTiDBSchemaForMode called %d times, want 2", validateCalls)
+		t.Fatalf("validateTiDBSchemaForAutoEmbeddingProfile called %d times, want 2", validateCalls)
 	}
 }
 
@@ -377,19 +382,24 @@ func TestPoolCreateBackendReturnsValidationErrorWhenPeriodicCheckFails(t *testin
 	tenant.Provider = ProviderTiDBZero
 	tenant.SchemaVersion = schema.CurrentTiDBTenantSchemaVersion
 
-	origEnsure := ensureTiDBSchemaForMode
-	origValidate := validateTiDBSchemaForMode
+	origEnsure := ensureTiDBSchemaForAutoEmbeddingProfile
+	origValidate := validateTiDBSchemaForAutoEmbeddingProfile
+	origApply := applyTiDBAutoEmbeddingProviderConfig
 	origEvery := periodicTiDBSchemaValidationEvery
-	ensureTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+	ensureTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
 		return nil
 	}
-	validateTiDBSchemaForMode = func(context.Context, *sql.DB, schema.TiDBEmbeddingMode) error {
+	validateTiDBSchemaForAutoEmbeddingProfile = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProfile) error {
 		return fmt.Errorf("schema drift")
+	}
+	applyTiDBAutoEmbeddingProviderConfig = func(context.Context, *sql.DB, schema.TiDBAutoEmbeddingProviderConfig) error {
+		return nil
 	}
 	periodicTiDBSchemaValidationEvery = 1
 	t.Cleanup(func() {
-		ensureTiDBSchemaForMode = origEnsure
-		validateTiDBSchemaForMode = origValidate
+		ensureTiDBSchemaForAutoEmbeddingProfile = origEnsure
+		validateTiDBSchemaForAutoEmbeddingProfile = origValidate
+		applyTiDBAutoEmbeddingProviderConfig = origApply
 		periodicTiDBSchemaValidationEvery = origEvery
 	})
 

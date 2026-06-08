@@ -205,6 +205,10 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	if err := s.meta.InsertTenant(ctx, &forkRoot); err != nil {
 		return nil, err
 	}
+	if err := s.copyAutoEmbeddingProfileForFork(ctx, source.ID, forkID, source.Provider, now); err != nil {
+		s.markForkFailedAndCleanup(ctx, forkID)
+		return nil, err
+	}
 
 	sourceCluster := clusterInfoFromTenant(source)
 	sourceCluster.Password = forkPassword
@@ -383,7 +387,7 @@ func (s *Server) provisionForkTenantOnce(ctx context.Context, forkID string) err
 	if err != nil {
 		return err
 	}
-	if err := s.provisioner.InitSchema(ctx, dsn); err != nil {
+	if err := s.schemaInitForTenant(forkID, forkTenant.Provider, s.provisioner.InitSchema)(ctx, dsn); err != nil {
 		return err
 	}
 	store, err := datastore.Open(dsn)
@@ -406,7 +410,15 @@ func (s *Server) provisionForkTenantOnce(ctx context.Context, forkID string) err
 	if err := s.backfillForkQuota(ctx, forkID, store); err != nil {
 		return err
 	}
-	if err := s.meta.UpdateTenantSchemaVersion(ctx, forkID, schema.CurrentTiDBTenantSchemaVersion); err != nil {
+	profile, err := s.autoEmbeddingProfileForTenant(ctx, forkID)
+	if err != nil {
+		return err
+	}
+	version, err := schema.TiDBTenantSchemaVersionForAutoEmbeddingProfile(profile)
+	if err != nil {
+		return err
+	}
+	if err := s.meta.UpdateTenantSchemaVersion(ctx, forkID, version); err != nil {
 		return err
 	}
 	return s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantActive)
@@ -656,7 +668,12 @@ func (s *Server) cleanupForkTenant(ctx context.Context, tenantID string) {
 	}
 	_ = s.meta.AbortActiveUploadReservations(ctx, tenantID)
 	if t.BranchID == "" {
-		logger.Error(ctx, "fork_cleanup_missing_branch_id", zap.String("tenant_id", tenantID), zap.String("status", string(t.Status)))
+		logger.Warn(ctx, "fork_cleanup_missing_branch_id", zap.String("tenant_id", tenantID), zap.String("status", string(t.Status)))
+		if t.Status == meta.TenantFailed || t.Status == meta.TenantDeleting {
+			if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
+				logger.Error(ctx, "fork_cleanup_mark_deleted_failed", zap.String("tenant_id", tenantID), zap.Error(err))
+			}
+		}
 		return
 	}
 	if t.Status != meta.TenantDeleting {

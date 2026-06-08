@@ -18,6 +18,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/encrypt"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	tenantschema "github.com/mem9-ai/dat9/pkg/tenant/schema"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 )
 
@@ -57,6 +58,18 @@ func (f *fakeProvisioner) Provision(_ context.Context, tenantID string) (*tenant
 
 func (f *fakeProvisioner) ProvisionCallCount() int {
 	return int(f.provisionCalls.Load())
+}
+
+type profileAwareFakeProvisioner struct {
+	fakeProvisioner
+	profileInitCalls atomic.Int32
+	lastProfile      tenantschema.TiDBAutoEmbeddingProfile
+}
+
+func (f *profileAwareFakeProvisioner) InitSchemaForAutoEmbeddingProfile(_ context.Context, _ string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
+	f.profileInitCalls.Add(1)
+	f.lastProfile = profile
+	return nil
 }
 
 func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {
@@ -273,6 +286,235 @@ func TestProvisionUsesConfiguredProvisioner(t *testing.T) {
 	}
 	if provider != tenant.ProviderTiDBZero || clusterID != "cluster-1" {
 		t.Fatalf("unexpected tenant row: status=%s provider=%s cluster_id=%s", status, provider, clusterID)
+	}
+}
+
+func TestProvisionPersistsEncryptedAutoEmbeddingProfile(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{
+		ClusterID: "cluster-profile",
+		Host:      "127.0.0.1",
+		Port:      4000,
+		Username:  "root",
+		Password:  "db-pass",
+		DBName:    "tenant_db",
+	}}
+	srv := NewWithConfig(Config{
+		Meta:        metaStore,
+		Pool:        pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
+		TiDBAutoEmbeddingConfig: tenantschema.TiDBAutoEmbeddingConfig{
+			Model:      "openai/text-embedding-3-small",
+			Dimensions: 1536,
+		},
+		TiDBAutoEmbeddingAPIKey: "sk-profile-test",
+	})
+	defer srv.Close()
+
+	res, err := srv.provisionTenant(context.Background(), provisionTenantOptions{KeyName: "default"})
+	if err != nil {
+		t.Fatalf("provisionTenant: %v", err)
+	}
+	profile, err := metaStore.GetTenantAutoEmbeddingProfile(context.Background(), res.TenantID)
+	if err != nil {
+		t.Fatalf("GetTenantAutoEmbeddingProfile: %v", err)
+	}
+	if profile.Model != "openai/text-embedding-3-small" {
+		t.Fatalf("profile model = %q", profile.Model)
+	}
+	if profile.Dimensions != 1536 {
+		t.Fatalf("profile dimensions = %d", profile.Dimensions)
+	}
+	if profile.OptionsJSON != `{"dimensions":1536}` {
+		t.Fatalf("profile options_json = %q", profile.OptionsJSON)
+	}
+	if profile.APIBase != "" {
+		t.Fatalf("profile api_base = %q", profile.APIBase)
+	}
+	if string(profile.APIKeyCipher) == "sk-profile-test" {
+		t.Fatal("profile API key was stored in plaintext")
+	}
+	plain, err := pool.Decrypt(context.Background(), profile.APIKeyCipher)
+	if err != nil {
+		t.Fatalf("decrypt profile API key: %v", err)
+	}
+	if string(plain) != "sk-profile-test" {
+		t.Fatalf("decrypted API key = %q", string(plain))
+	}
+}
+
+func TestProvisionPersistsAutoEmbeddingProfileWhenDatabaseAutoEmbeddingDisabled(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{
+		S3Dir:                        mustTempDir(t),
+		PublicURL:                    "http://localhost",
+		DisableDatabaseAutoEmbedding: true,
+	}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBZero, cluster: &tenant.ClusterInfo{
+		ClusterID: "cluster-disabled-profile",
+		Host:      "127.0.0.1",
+		Port:      4000,
+		Username:  "root",
+		Password:  "db-pass",
+		DBName:    "tenant_db",
+	}}
+	srv := NewWithConfig(Config{
+		Meta:        metaStore,
+		Pool:        pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
+		TiDBAutoEmbeddingConfig: tenantschema.TiDBAutoEmbeddingConfig{
+			Model:      "openai/text-embedding-3-small",
+			Dimensions: 1536,
+		},
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	res, err := srv.provisionTenant(context.Background(), provisionTenantOptions{KeyName: "default"})
+	if err != nil {
+		t.Fatalf("provisionTenant: %v", err)
+	}
+	profile, err := metaStore.GetTenantAutoEmbeddingProfile(context.Background(), res.TenantID)
+	if err != nil {
+		t.Fatalf("GetTenantAutoEmbeddingProfile: %v", err)
+	}
+	if profile.Model != "openai/text-embedding-3-small" || profile.Dimensions != 1536 {
+		t.Fatalf("profile = %+v", profile)
+	}
+	if len(profile.APIKeyCipher) != 0 {
+		t.Fatal("disabled auto-embedding profile should not store an empty API key cipher")
+	}
+}
+
+func TestSchemaInitForTenantUsesAutoEmbeddingProfileWhenDatabaseAutoEmbeddingDisabled(t *testing.T) {
+	prov := &profileAwareFakeProvisioner{
+		fakeProvisioner: fakeProvisioner{provider: tenant.ProviderTiDBZero},
+	}
+	srv := NewWithConfig(Config{
+		Provisioner:                  prov,
+		DisableDatabaseAutoEmbedding: true,
+		TiDBAutoEmbeddingConfig: tenantschema.TiDBAutoEmbeddingConfig{
+			Model:      "openai/text-embedding-3-small",
+			Dimensions: 1536,
+		},
+	})
+	defer srv.Close()
+
+	fallbackCalled := false
+	init := srv.schemaInitForTenant("tenant-disabled", tenant.ProviderTiDBZero, func(context.Context, string) error {
+		fallbackCalled = true
+		return nil
+	})
+
+	if err := init(context.Background(), "dsn"); err != nil {
+		t.Fatalf("schema init: %v", err)
+	}
+	if fallbackCalled {
+		t.Fatal("fallback InitSchema was called")
+	}
+	if prov.profileInitCalls.Load() != 1 {
+		t.Fatalf("profile init calls = %d, want 1", prov.profileInitCalls.Load())
+	}
+	if prov.lastProfile.Model != "openai/text-embedding-3-small" || prov.lastProfile.Dimensions != 1536 {
+		t.Fatalf("profile init profile = %+v", prov.lastProfile)
+	}
+}
+
+func TestAutoEmbeddingProfileForTenantEnsuresDefaultProfile(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	srv := NewWithConfig(Config{Meta: metaStore})
+	defer srv.Close()
+
+	profile, err := srv.autoEmbeddingProfileForTenant(context.Background(), "tenant-default-profile")
+	if err != nil {
+		t.Fatalf("autoEmbeddingProfileForTenant: %v", err)
+	}
+	if profile.Model != tenantschema.DefaultTiDBAutoEmbeddingModel {
+		t.Fatalf("profile model = %q", profile.Model)
+	}
+	if profile.Dimensions != tenantschema.DefaultTiDBAutoEmbeddingDimensions {
+		t.Fatalf("profile dimensions = %d", profile.Dimensions)
+	}
+	if profile.OptionsJSON != `{"dimensions":1024}` {
+		t.Fatalf("profile options_json = %q", profile.OptionsJSON)
+	}
+
+	stored, err := metaStore.GetTenantAutoEmbeddingProfile(context.Background(), "tenant-default-profile")
+	if err != nil {
+		t.Fatalf("GetTenantAutoEmbeddingProfile: %v", err)
+	}
+	if stored.Model != tenantschema.DefaultTiDBAutoEmbeddingModel || stored.Dimensions != tenantschema.DefaultTiDBAutoEmbeddingDimensions {
+		t.Fatalf("stored default profile = %+v", stored)
+	}
+}
+
+func TestAutoEmbeddingProfileForTenantWithoutMetaUsesConfiguredDefault(t *testing.T) {
+	srv := NewWithConfig(Config{
+		TiDBAutoEmbeddingConfig: tenantschema.TiDBAutoEmbeddingConfig{
+			Model:      "openai/text-embedding-3-small",
+			Dimensions: 1536,
+		},
+	})
+	defer srv.Close()
+
+	profile, err := srv.autoEmbeddingProfileForTenant(context.Background(), "tenant-without-meta")
+	if err != nil {
+		t.Fatalf("autoEmbeddingProfileForTenant: %v", err)
+	}
+	if profile.Model != "openai/text-embedding-3-small" {
+		t.Fatalf("profile model = %q", profile.Model)
+	}
+	if profile.Dimensions != 1536 {
+		t.Fatalf("profile dimensions = %d", profile.Dimensions)
 	}
 }
 

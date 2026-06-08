@@ -18,14 +18,36 @@ func InitTiDBTenantSchema(dsn string) error {
 // InitTiDBTenantSchemaStatementsForMode returns the exact DDL statements used
 // by TiDB tenant schema init for the requested embedding mode.
 func InitTiDBTenantSchemaStatementsForMode(mode TiDBEmbeddingMode) ([]string, error) {
+	return initTiDBTenantSchemaStatementsForModeWithConfig(mode, currentTiDBAutoEmbeddingRenderConfig())
+}
+
+func initTiDBTenantSchemaStatementsForModeWithConfig(mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) ([]string, error) {
 	switch mode {
 	case TiDBEmbeddingModeAuto:
-		return CloneStatements(tidbAutoEmbeddingSchemaStatements()), nil
+		return CloneStatements(tidbAutoEmbeddingSchemaStatementsForConfig(cfg)), nil
 	case TiDBEmbeddingModeApp:
 		return CloneStatements(tidbAppEmbeddingSchemaStatements()), nil
 	default:
 		return nil, validateTiDBSchemaMode(mode)
 	}
+}
+
+// InitTiDBTenantSchemaStatementsForAutoEmbeddingConfig returns tenant init DDL
+// rendered from a tenant-persisted auto-embedding profile.
+func InitTiDBTenantSchemaStatementsForAutoEmbeddingConfig(cfg TiDBAutoEmbeddingConfig) ([]string, error) {
+	render, err := tidbAutoEmbeddingRenderConfigFor(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return CloneStatements(tidbAutoEmbeddingSchemaStatementsForConfig(render)), nil
+}
+
+func InitTiDBTenantSchemaStatementsForAutoEmbeddingProfile(profile TiDBAutoEmbeddingProfile) ([]string, error) {
+	render, err := tidbAutoEmbeddingRenderConfigForProfile(profile)
+	if err != nil {
+		return nil, err
+	}
+	return CloneStatements(tidbAutoEmbeddingSchemaStatementsForConfig(render)), nil
 }
 
 // InitTiDBTenantSchemaForMode initializes the TiDB tenant schema for the
@@ -53,4 +75,14 @@ func InitTiDBTenantSchemaForModeWithOptionsContext(ctx context.Context, dsn stri
 	default:
 		return validateTiDBSchemaMode(mode)
 	}
+}
+
+// InitTiDBTenantSchemaForAutoEmbeddingConfigContext initializes the TiDB auto
+// embedding schema rendered from a tenant-persisted profile.
+func InitTiDBTenantSchemaForAutoEmbeddingConfigContext(ctx context.Context, dsn string, cfg TiDBAutoEmbeddingConfig) error {
+	return initTiDBAutoEmbeddingSchemaWithConfig(ctx, dsn, cfg)
+}
+
+func InitTiDBTenantSchemaForAutoEmbeddingProfileContext(ctx context.Context, dsn string, profile TiDBAutoEmbeddingProfile) error {
+	return initTiDBAutoEmbeddingSchemaWithProfile(ctx, dsn, profile)
 }
