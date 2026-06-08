@@ -60,16 +60,37 @@ type gitWorkspaceRuntime struct {
 	nodes     map[string]client.GitTreeNode
 	children  map[string][]client.GitTreeNode
 	overlay   map[string]client.GitOverlayEntry
+	loadedAt  time.Time
 	restored  bool
 
 	localTreeCommit   string
 	localNodes        map[string]client.GitTreeNode
 	localChildren     map[string][]client.GitTreeNode
 	localTreeLoadedAt time.Time
+	locallyDeleted    bool
 }
 
 func (rt *gitWorkspaceRuntime) isLinked() bool {
 	return rt != nil && rt.workspace.WorkspaceKind == "linked"
+}
+
+func (rt *gitWorkspaceRuntime) markLocallyDeleted() {
+	if rt == nil {
+		return
+	}
+	rt.mu.Lock()
+	rt.locallyDeleted = true
+	rt.mu.Unlock()
+}
+
+func (rt *gitWorkspaceRuntime) isLocallyDeleted() bool {
+	if rt == nil {
+		return false
+	}
+	rt.mu.RLock()
+	deleted := rt.locallyDeleted
+	rt.mu.RUnlock()
+	return deleted
 }
 
 func gitWorkspaceIsFastBlobless(rt *gitWorkspaceRuntime) bool {
@@ -170,11 +191,15 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 	sort.Slice(loaded, func(i, j int) bool {
 		return len(loaded[i].localRoot) > len(loaded[j].localRoot)
 	})
+	loadedAt := time.Now()
+	for _, rt := range loaded {
+		rt.loadedAt = loadedAt
+	}
 
 	fs.git.mu.Lock()
 	fs.git.workspaces = loaded
 	fs.git.loaded = true
-	fs.git.loadedAt = time.Now()
+	fs.git.loadedAt = loadedAt
 	fs.git.mu.Unlock()
 
 	for _, rt := range loaded {
@@ -196,6 +221,13 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 		log.Printf("git workspace refresh failed for %s: %v", localPath, err)
 	}
 	cancel()
+	if fs.gitWorkspaceCacheInvalidatedLocally(baseCtx) {
+		refreshCtx, refreshCancel := context.WithTimeout(baseCtx, fuseTimeout)
+		if err := fs.forceRefreshGitWorkspaces(refreshCtx); err != nil {
+			log.Printf("git workspace forced refresh failed for invalidated cache %s: %v", localPath, err)
+		}
+		refreshCancel()
+	}
 
 	if rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath); ok {
 		return rt, rel, true
@@ -247,7 +279,7 @@ func (fs *Dat9FS) loadedGitWorkspaceForPath(localPath string) (*gitWorkspaceRunt
 	copy(workspaces, fs.git.workspaces)
 	fs.git.mu.Unlock()
 	for _, rt := range workspaces {
-		if fs.gitWorkspaceRuntimeDeletedLocally(context.Background(), rt) {
+		if fs.gitWorkspaceRuntimeHiddenLocally(context.Background(), rt) {
 			continue
 		}
 		root := rt.localRoot
@@ -265,11 +297,18 @@ func (fs *Dat9FS) loadedGitWorkspaceForPath(localPath string) (*gitWorkspaceRunt
 	return nil, "", false
 }
 
-func (fs *Dat9FS) gitWorkspaceRuntimeDeletedLocally(ctx context.Context, rt *gitWorkspaceRuntime) bool {
+func (fs *Dat9FS) gitWorkspaceRuntimeHiddenLocally(ctx context.Context, rt *gitWorkspaceRuntime) bool {
 	if rt == nil {
 		return false
 	}
-	return fs.gitWorkspaceDeletedLocally(ctx, rt.workspace.WorkspaceID)
+	if rt.isLocallyDeleted() {
+		return true
+	}
+	if fs.gitWorkspaceDeletedLocally(ctx, rt.workspace.WorkspaceID) {
+		rt.markLocallyDeleted()
+		return true
+	}
+	return fs.gitWorkspaceRuntimeRefreshInvalidated(ctx, rt)
 }
 
 func (fs *Dat9FS) gitWorkspaceDeletedLocally(ctx context.Context, workspaceID string) bool {
@@ -277,6 +316,33 @@ func (fs *Dat9FS) gitWorkspaceDeletedLocally(ctx context.Context, workspaceID st
 		return false
 	}
 	return gitcache.WorkspaceDeleted(ctx, fs.opts.LocalRoot, workspaceID)
+}
+
+func (fs *Dat9FS) gitWorkspaceRuntimeRefreshInvalidated(ctx context.Context, rt *gitWorkspaceRuntime) bool {
+	if fs == nil || fs.opts == nil || rt == nil {
+		return false
+	}
+	markerTime, ok := gitcache.WorkspaceRefreshMarkerTime(ctx, fs.opts.LocalRoot, rt.workspace.WorkspaceID)
+	if !ok {
+		return false
+	}
+	return markerTime.After(rt.loadedAt)
+}
+
+func (fs *Dat9FS) gitWorkspaceCacheInvalidatedLocally(ctx context.Context) bool {
+	if fs == nil || fs.git == nil || fs.opts == nil {
+		return false
+	}
+	fs.git.mu.Lock()
+	workspaces := make([]*gitWorkspaceRuntime, len(fs.git.workspaces))
+	copy(workspaces, fs.git.workspaces)
+	fs.git.mu.Unlock()
+	for _, rt := range workspaces {
+		if fs.gitWorkspaceRuntimeRefreshInvalidated(ctx, rt) {
+			return true
+		}
+	}
+	return false
 }
 
 func (fs *Dat9FS) loadedGitWorkspaceForGitStatePath(localPath string) (*gitWorkspaceRuntime, string, bool) {
@@ -309,7 +375,7 @@ func (fs *Dat9FS) linkedWorkspaceForCommonGitStatePath(commonRT *gitWorkspaceRun
 	copy(workspaces, fs.git.workspaces)
 	fs.git.mu.Unlock()
 	for _, candidate := range workspaces {
-		if fs.gitWorkspaceRuntimeDeletedLocally(context.Background(), candidate) {
+		if fs.gitWorkspaceRuntimeHiddenLocally(context.Background(), candidate) {
 			continue
 		}
 		if candidate.workspace.CommonWorkspaceID == commonRT.workspace.WorkspaceID && candidate.workspace.WorktreeName == name {
@@ -331,7 +397,7 @@ func (fs *Dat9FS) gitWorkspaceRuntimeByID(workspaceID string) (*gitWorkspaceRunt
 	copy(workspaces, fs.git.workspaces)
 	fs.git.mu.Unlock()
 	for _, rt := range workspaces {
-		if fs.gitWorkspaceRuntimeDeletedLocally(context.Background(), rt) {
+		if fs.gitWorkspaceRuntimeHiddenLocally(context.Background(), rt) {
 			continue
 		}
 		if rt.workspace.WorkspaceID == workspaceID {

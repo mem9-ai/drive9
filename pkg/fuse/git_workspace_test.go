@@ -545,6 +545,57 @@ func TestGitWorkspaceForPathForceRefreshesAfterLocalGitAppears(t *testing.T) {
 	}
 }
 
+func TestLoadedGitWorkspaceForPathSkipsRefreshInvalidatedRuntime(t *testing.T) {
+	localRoot := t.TempDir()
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{WorkspaceID: "ws1"},
+		localRoot: "/repo",
+		loadedAt:  time.Now().Add(-time.Minute),
+	}
+	fs := &Dat9FS{
+		opts: &MountOptions{EnableGitWorkspaces: true, LocalRoot: localRoot},
+		git:  newGitWorkspaceLayer(),
+	}
+	fs.git.workspaces = []*gitWorkspaceRuntime{rt}
+	if err := gitcache.ClearWorkspaceDeleted(context.Background(), localRoot, "ws1"); err != nil {
+		t.Fatalf("ClearWorkspaceDeleted: %v", err)
+	}
+
+	if _, _, ok := fs.loadedGitWorkspaceForPath("/repo/README.md"); ok {
+		t.Fatalf("refresh-invalidated runtime should not resolve")
+	}
+}
+
+func TestGitWorkspaceForPathForceRefreshesAfterWorkspaceRefreshMarker(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	localRoot := t.TempDir()
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+	fs.git.mu.Lock()
+	if len(fs.git.workspaces) != 1 {
+		t.Fatalf("workspace count = %d, want 1", len(fs.git.workspaces))
+	}
+	oldRT := fs.git.workspaces[0]
+	oldRT.loadedAt = time.Now().Add(-time.Minute)
+	fs.git.loadedAt = time.Now()
+	fs.git.mu.Unlock()
+	if err := gitcache.ClearWorkspaceDeleted(context.Background(), localRoot, "ws1"); err != nil {
+		t.Fatalf("ClearWorkspaceDeleted: %v", err)
+	}
+
+	got, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/README.md")
+	if !ok {
+		t.Fatalf("gitWorkspaceForPath ok = false, want true after refresh")
+	}
+	if got == oldRT {
+		t.Fatalf("gitWorkspaceForPath returned stale runtime after refresh marker")
+	}
+}
+
 func TestGitWorkspaceWriteSyncWritesOverlay(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}

@@ -122,7 +122,7 @@ func gitClone(args []string) error {
 	if branchErr != nil {
 		branch = ""
 	}
-	nodes, err := gitListTree(cmdCtx, target, head)
+	nodes, err := gitListTree(cmdCtx, target, head, !*blobless)
 	if err != nil {
 		return err
 	}
@@ -321,7 +321,7 @@ func gitWorktreeAdd(args []string) error {
 	if branchErr != nil {
 		branchName = ""
 	}
-	nodes, err := gitListTree(cmdCtx, worktreePath, head)
+	nodes, err := gitListTree(cmdCtx, worktreePath, head, !linkedBlobless)
 	if err != nil {
 		return err
 	}
@@ -1027,8 +1027,8 @@ func gitRun(ctx context.Context, repoDir string, args ...string) error {
 	return nil
 }
 
-func gitListTree(ctx context.Context, repoDir, commitSHA string) ([]client.GitTreeNode, error) {
-	full := gitListTreeArgs(repoDir, commitSHA)
+func gitListTree(ctx context.Context, repoDir, commitSHA string, includeSizes bool) ([]client.GitTreeNode, error) {
+	full := gitListTreeArgs(repoDir, commitSHA, includeSizes)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -1047,8 +1047,12 @@ func gitListTree(ctx context.Context, repoDir, commitSHA string) ([]client.GitTr
 	return nodes, nil
 }
 
-func gitListTreeArgs(repoDir, commitSHA string) []string {
-	return []string{"-C", repoDir, "ls-tree", "-r", "-t", "-z", commitSHA}
+func gitListTreeArgs(repoDir, commitSHA string, includeSizes bool) []string {
+	args := []string{"-C", repoDir, "ls-tree", "-r", "-t"}
+	if includeSizes {
+		args = append(args, "-l")
+	}
+	return append(args, "-z", commitSHA)
 }
 
 func parseGitLsTree(out []byte) ([]client.GitTreeNode, error) {

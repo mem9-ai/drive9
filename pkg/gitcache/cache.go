@@ -97,6 +97,13 @@ func WorkspaceDeletedMarkerPath(localRoot, workspaceID string) string {
 	return filepath.Join(localRoot, "git-workspaces", "deleted", safePathSegment(workspaceID))
 }
 
+// WorkspaceRefreshMarkerPath returns the local marker path used to tell a
+// still-running FUSE mount that a workspace with a reused ID must be refreshed
+// before the cached runtime can be trusted again.
+func WorkspaceRefreshMarkerPath(localRoot, workspaceID string) string {
+	return filepath.Join(localRoot, "git-workspaces", "refresh", safePathSegment(workspaceID))
+}
+
 // MarkWorkspaceDeleted records that a workspace was deleted in this local root.
 func MarkWorkspaceDeleted(ctx context.Context, localRoot, workspaceID string) error {
 	if ctx == nil {
@@ -136,11 +143,41 @@ func ClearWorkspaceDeleted(ctx context.Context, localRoot, workspaceID string) e
 	if localRoot == "" || workspaceID == "" {
 		return nil
 	}
+	refreshMarker := WorkspaceRefreshMarkerPath(localRoot, workspaceID)
+	if err := os.MkdirAll(filepath.Dir(refreshMarker), 0o755); err != nil {
+		return fmt.Errorf("create workspace refresh marker dir %q: %w", filepath.Dir(refreshMarker), err)
+	}
+	if err := os.WriteFile(refreshMarker, []byte(time.Now().UTC().Format(time.RFC3339Nano)+"\n"), 0o644); err != nil {
+		return fmt.Errorf("write workspace refresh marker %q: %w", refreshMarker, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	marker := WorkspaceDeletedMarkerPath(localRoot, workspaceID)
 	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove workspace deleted marker %q: %w", marker, err)
 	}
 	return nil
+}
+
+// WorkspaceRefreshMarkerTime returns the mtime for the local refresh marker.
+func WorkspaceRefreshMarkerTime(ctx context.Context, localRoot, workspaceID string) (time.Time, bool) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return time.Time{}, false
+	}
+	localRoot = strings.TrimSpace(localRoot)
+	workspaceID = strings.TrimSpace(workspaceID)
+	if localRoot == "" || workspaceID == "" {
+		return time.Time{}, false
+	}
+	info, err := os.Stat(WorkspaceRefreshMarkerPath(localRoot, workspaceID))
+	if err != nil {
+		return time.Time{}, false
+	}
+	return info.ModTime(), true
 }
 
 // WorkspaceDeleted reports whether a local deletion marker exists.

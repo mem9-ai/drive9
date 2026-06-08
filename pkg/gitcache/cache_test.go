@@ -83,6 +83,9 @@ func TestWorkspaceDeletedMarkerLifecycle(t *testing.T) {
 	if WorkspaceDeleted(ctx, localRoot, "ws1") {
 		t.Fatal("WorkspaceDeleted after clear = true, want false")
 	}
+	if _, ok := WorkspaceRefreshMarkerTime(ctx, localRoot, "ws1"); !ok {
+		t.Fatal("WorkspaceRefreshMarkerTime after clear ok = false, want true")
+	}
 }
 
 func TestWorkspaceDeletedMarkerHonorsCanceledContext(t *testing.T) {
