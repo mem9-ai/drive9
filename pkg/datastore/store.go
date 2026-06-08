@@ -924,7 +924,13 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 		if err != nil {
 			return nil, err
 		}
-		// Dual-write to split tables
+		// Dual-write to split tables.
+		// Skip when auto-embed text writes are disabled: writing content_text
+		// triggers recomputation of GENERATED embedding columns (EMBED_TEXT),
+		// which fails with error 1105 when the provider is unavailable.
+		if s.disableAutoEmbedTextWrites {
+			return res, nil
+		}
 		if expectedRevision > 0 {
 			if _, err := db.Exec(`UPDATE semantic SET content_text = ?
 				WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
@@ -941,6 +947,12 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 		return res, nil
 	}
 	// New tenant without legacy files: write directly to semantic.
+	// Skip when auto-embed text writes are disabled: any write to content_text
+	// triggers EMBED_TEXT() recomputation on the GENERATED embedding column,
+	// which fails with error 1105 when the provider is not available on this cluster.
+	if s.disableAutoEmbedTextWrites {
+		return noopResult{}, nil
+	}
 	if expectedRevision > 0 {
 		return db.Exec(`UPDATE semantic SET content_text = ?
 			WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
@@ -1053,6 +1065,13 @@ type execer interface {
 	ExecContext(ctx context.Context, query string, args ...interface{}) (sql.Result, error)
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 }
+
+// noopResult is a sql.Result that reports zero rows affected and zero last
+// insert ID. Used as a placeholder when a write is intentionally skipped.
+type noopResult struct{}
+
+func (noopResult) LastInsertId() (int64, error) { return 0, nil }
+func (noopResult) RowsAffected() (int64, error)  { return 0, nil }
 
 // FileStorageMeta holds the lightweight storage metadata needed by upload
 // overwrite logic, fetched with FOR UPDATE row locking.
