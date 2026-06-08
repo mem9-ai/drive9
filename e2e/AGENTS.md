@@ -55,6 +55,9 @@ bash e2e/fuse-concurrency-stress.sh
 # Opt-in FUSE performance baseline metrics workload
 bash e2e/fuse-performance-baseline.sh
 
+# Strict FUSE release gate plus all optional FUSE workloads
+RUN_FUSE_ALL_WORKLOADS=1 bash e2e/fuse-release-gate.sh
+
 # Git workspace smoke (fast-blobless clone + common agent Git workloads)
 bash e2e/git-workspace-smoke-test.sh
 
@@ -117,6 +120,7 @@ DRIVE9_API_KEY='local-dev-key' bash e2e/api-smoke-test-existing-key.sh
 bash e2e/cli-smoke-test.sh
 bash e2e/fuse-smoke-test.sh
 bash e2e/git-workspace-smoke-test.sh
+RUN_FUSE_ALL_WORKLOADS=1 bash e2e/fuse-release-gate.sh
 bash e2e/smoke-all.sh
 ```
 
@@ -383,8 +387,13 @@ the layout captured by that run.
    host-specific FUSE failures
 7. Runs bounded concurrency stress workload only when
    `RUN_FUSE_CONCURRENCY_STRESS=1`
-8. Runs threshold-free FUSE performance baseline metrics only when
+8. Runs POSIX/fsx workload only when `RUN_FUSE_POSIX_FSX=1`
+9. Runs threshold-free FUSE performance baseline metrics only when
    `RUN_FUSE_PERFORMANCE_BASELINE=1`
+
+Set `RUN_FUSE_ALL_WORKLOADS=1` to default the optional concurrency,
+POSIX/fsx, and performance workloads to enabled in one release-gate command.
+Explicit per-workload env vars still take precedence.
 
 `local-e2e.yml` runs the warning-only performance compare before archiving the
 current metrics so a run cannot compare against itself. It runs concurrency
@@ -443,6 +452,7 @@ enabled.
 | `FUSE_UMOUNT_TIMEOUT` | `60s` | `fuse-smoke-test.sh`, `fuse-correctness-workload.sh`, `fuse-sqlite-correctness.sh`, `fuse-concurrency-stress.sh`, `fuse-performance-baseline.sh` |
 | `FUSE_CORRECTNESS_LARGE_MB` | `9` | `fuse-correctness-workload.sh` |
 | `FUSE_CORRECTNESS_KEEP_ARTIFACTS` | `0` | `fuse-correctness-workload.sh` |
+| `RUN_FUSE_ALL_WORKLOADS` | `0` | `fuse-release-gate.sh` |
 | `RUN_FUSE_SQLITE_CORRECTNESS` | `1` | `fuse-release-gate.sh` |
 | `FUSE_SQLITE_ROWS` | `64` | `fuse-sqlite-correctness.sh` |
 | `FUSE_SQLITE_CHURN_ROUNDS` | `4` | `fuse-sqlite-correctness.sh` |
@@ -459,6 +469,8 @@ enabled.
 | `FUSE_CONCURRENCY_PAYLOAD_KB` | `32` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_TIMEOUT_S` | `120` | `fuse-concurrency-stress.sh` |
 | `FUSE_CONCURRENCY_KEEP_ARTIFACTS` | `0` | `fuse-concurrency-stress.sh` |
+| `RUN_FUSE_CONCURRENCY_STRESS` | `0` | `fuse-release-gate.sh` |
+| `RUN_FUSE_POSIX_FSX` | `0` | `fuse-release-gate.sh` |
 | `RUN_FUSE_PERFORMANCE_BASELINE` | `0` | `fuse-release-gate.sh` |
 | `ARCHIVE_FUSE_PERFORMANCE_METRICS` | `0` (`1` in the scheduled daily heavy `local-e2e` run) | `local-e2e.yml` |
 | `COMPARE_FUSE_PERFORMANCE_METRICS` | `0` (`1` in the scheduled daily heavy `local-e2e` run) | `local-e2e.yml` |
