@@ -394,6 +394,8 @@ Important environment variables:
 ```text
 DRIVE9_META_DSN                 control-plane MySQL/TiDB DSN
 DRIVE9_TENANT_PROVIDER          db9 | tidb_zero | tidb_cloud_starter
+DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT
+                                default TiDB Cloud Starter spendingLimit.monthly in USD cents
 DRIVE9_TOKEN_SIGNING_KEY        32-byte hex JWT signing key
 DRIVE9_ENCRYPT_TYPE             local_aes | kms
 DRIVE9_MASTER_KEY               local AES key

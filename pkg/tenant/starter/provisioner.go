@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,18 +22,20 @@ import (
 )
 
 const (
-	envTiDBAPIURL    = "DRIVE9_TIDBCLOUD_API_URL"
-	envTiDBAPIKey    = "DRIVE9_TIDBCLOUD_API_KEY"
-	envTiDBAPISecret = "DRIVE9_TIDBCLOUD_API_SECRET"
-	envTiDBPoolID    = "DRIVE9_TIDBCLOUD_POOL_ID"
+	envTiDBAPIURL     = "DRIVE9_TIDBCLOUD_API_URL"
+	envTiDBAPIKey     = "DRIVE9_TIDBCLOUD_API_KEY"
+	envTiDBAPISecret  = "DRIVE9_TIDBCLOUD_API_SECRET"
+	envTiDBPoolID     = "DRIVE9_TIDBCLOUD_POOL_ID"
+	envTiDBSpendLimit = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
 )
 
 type Provisioner struct {
-	apiURL    string
-	apiKey    string
-	apiSecret string
-	poolID    string
-	client    *http.Client
+	apiURL            string
+	apiKey            string
+	apiSecret         string
+	poolID            string
+	defaultSpendLimit *int32
+	client            *http.Client
 }
 
 func NewProvisionerFromEnv() (*Provisioner, error) {
@@ -43,12 +46,17 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 	if apiURL == "" || apiKey == "" || apiSecret == "" || poolID == "" {
 		return nil, fmt.Errorf("%s, %s, %s and %s are required", envTiDBAPIURL, envTiDBAPIKey, envTiDBAPISecret, envTiDBPoolID)
 	}
+	defaultSpendLimit, err := parseDefaultSpendLimit(os.Getenv(envTiDBSpendLimit))
+	if err != nil {
+		return nil, err
+	}
 	return &Provisioner{
-		apiURL:    strings.TrimRight(apiURL, "/"),
-		apiKey:    apiKey,
-		apiSecret: apiSecret,
-		poolID:    poolID,
-		client:    &http.Client{Timeout: 60 * time.Second},
+		apiURL:            strings.TrimRight(apiURL, "/"),
+		apiKey:            apiKey,
+		apiSecret:         apiSecret,
+		poolID:            poolID,
+		defaultSpendLimit: defaultSpendLimit,
+		client:            &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
 
@@ -96,6 +104,14 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	if out.Endpoints.Public.Host == "" || out.Endpoints.Public.Port == 0 {
 		return nil, fmt.Errorf("starter response missing endpoint")
 	}
+	if p.defaultSpendLimit != nil {
+		if out.ClusterID == "" {
+			return nil, fmt.Errorf("starter response missing cluster id")
+		}
+		if err := p.UpdateSpendingLimit(ctx, out.ClusterID, *p.defaultSpendLimit); err != nil {
+			return nil, err
+		}
+	}
 
 	return &tenant.ClusterInfo{
 		TenantID:  tenantID,
@@ -107,6 +123,48 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 		DBName:    "test",
 		Provider:  tenant.ProviderTiDBCloudStarter,
 	}, nil
+}
+
+func parseDefaultSpendLimit(raw string) (*int32, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	monthly, err := strconv.ParseInt(raw, 10, 32)
+	if err != nil || monthly < 0 {
+		return nil, fmt.Errorf("invalid %s: must be a non-negative integer in USD cents", envTiDBSpendLimit)
+	}
+	out := int32(monthly)
+	return &out, nil
+}
+
+func (p *Provisioner) UpdateSpendingLimit(ctx context.Context, clusterID string, monthly int32) error {
+	if clusterID == "" {
+		return fmt.Errorf("cluster id is required")
+	}
+	if monthly < 0 {
+		return fmt.Errorf("spending limit must be non-negative")
+	}
+	body, err := json.Marshal(map[string]any{
+		"updateMask": "spendingLimit.monthly",
+		"cluster": map[string]any{
+			"spendingLimit": map[string]int32{"monthly": monthly},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, clusterID)
+	resp, err := p.doDigestAuthRequest(ctx, http.MethodPatch, endpoint, body)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("starter spending limit update status %d: %s", resp.StatusCode, string(raw))
+	}
+	return nil
 }
 
 func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
