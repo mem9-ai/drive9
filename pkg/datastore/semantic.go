@@ -9,11 +9,11 @@ import (
 
 // Semantic represents a row in the semantic table (search & enrichment).
 type Semantic struct {
-	InodeID                        string
-	ContentText                    string
-	Description                    string
-	EmbeddingRevision              *int64
-	DescriptionEmbeddingRevision   *int64
+	InodeID                      string
+	ContentText                  string
+	Description                  string
+	EmbeddingRevision            *int64
+	DescriptionEmbeddingRevision *int64
 }
 
 // InsertSemantic inserts a semantic row.
