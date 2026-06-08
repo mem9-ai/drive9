@@ -1897,6 +1897,13 @@ func TestGitWorkspaceCleanReadSingleflightsCatFile(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/README.md")
+	if !ok {
+		t.Fatal("git workspace not loaded")
+	}
+	if err := fs.ensureGitStateRestored(context.Background(), rt); err != nil {
+		t.Fatalf("ensureGitStateRestored: %v", err)
+	}
 	const readers = 20
 	var wg sync.WaitGroup
 	errs := make(chan error, readers)
