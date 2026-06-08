@@ -45,6 +45,12 @@ type PoolConfig struct {
 	// ensure/validate steps during Acquire. Used in tests that run
 	// against plain MySQL but need a TiDB-class provider for vault.
 	SkipTiDBSchemaCheck bool
+
+	// DisableDatabaseAutoEmbedding forces DatabaseAutoEmbedding=false for all
+	// tenants, even when the provider normally enables it (tidb_zero,
+	// tidb_cloud_starter). Use when the TiDB Cloud cluster does not have a
+	// supported auto-embedding provider configured.
+	DisableDatabaseAutoEmbedding bool
 }
 
 type Pool struct {
@@ -444,7 +450,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	}
 	opts.TenantID = t.ID
 	opts.S3EncryptionPolicy = resolvedEncryptionPolicy
-	if UsesTiDBAutoEmbedding(t.Provider) {
+	if UsesTiDBAutoEmbedding(t.Provider) && !p.cfg.DisableDatabaseAutoEmbedding {
 		opts.DatabaseAutoEmbedding = true
 	}
 	query := "parseTime=true"
