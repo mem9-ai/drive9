@@ -47,6 +47,19 @@
 # ollama pull bge-m3 # "bge-m3" provide 1024-dimensional embeddings.
 # curl http://localhost:11434/v1/embeddings -H "Content-Type: application/json" -d '{"model":"bge-m3", "input": "This is an embedding test"}'
 
+# TiDB database-managed auto-embedding generated columns.
+# Leave these unset to use TiDB Cloud's free Amazon Titan text embedding default.
+# For BYOK TiDB auto-embedding, set a supported provider/model, for example:
+# export DRIVE9_TIDB_AUTO_EMBEDDING_MODEL=openai/text-embedding-3-small
+# export DRIVE9_TIDB_AUTO_EMBEDDING_DIMENSIONS=1536
+# export DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY=sk-...
+# Supported provider prefixes include openai, azure_openai, cohere, jina_ai,
+# gemini, huggingface, and nvidia_nim. Known models use documented default
+# dimensions; unknown BYOK models require DRIVE9_TIDB_AUTO_EMBEDDING_DIMENSIONS.
+# The hosted Titan default needs neither API key nor base endpoint. OpenAI
+# needs only DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY. Azure OpenAI needs both
+# DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY and DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE.
+
 # Background semantic embedding worker.
 : "${DRIVE9_EMBED_API_BASE:=http://127.0.0.1:11434}"
 : "${DRIVE9_EMBED_API_KEY:=ollama}"

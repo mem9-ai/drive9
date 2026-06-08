@@ -85,6 +85,17 @@ type Tenant struct {
 	UpdatedAt          time.Time
 }
 
+type TenantAutoEmbeddingProfile struct {
+	TenantID     string
+	Model        string
+	Dimensions   int
+	OptionsJSON  string
+	APIBase      string
+	APIKeyCipher []byte
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
 type StorageNamespaceState string
 
 const (
@@ -382,6 +393,16 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_tenant_provider (provider),
 			INDEX idx_tenant_namespace (storage_namespace_id, kind, status),
 			INDEX idx_tenant_parent (parent_tenant_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS tenant_auto_embedding_profiles (
+			tenant_id      VARCHAR(64) PRIMARY KEY,
+			model          VARCHAR(255) NOT NULL DEFAULT 'tidbcloud_free/amazon/titan-embed-text-v2',
+			dimensions     INT UNSIGNED NOT NULL DEFAULT 1024,
+			options_json   VARCHAR(2048) NOT NULL DEFAULT '{"dimensions":1024}',
+			api_base       TEXT NULL,
+			api_key_cipher VARBINARY(2048) NULL,
+			created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
 		`CREATE TABLE IF NOT EXISTS storage_namespaces (
 			namespace_id    VARCHAR(64) PRIMARY KEY,
@@ -1016,6 +1037,68 @@ func (s *Store) InsertTenant(ctx context.Context, t *Tenant) (err error) {
 		return ErrDuplicate
 	}
 	return err
+}
+
+func (s *Store) UpsertTenantAutoEmbeddingProfile(ctx context.Context, p *TenantAutoEmbeddingProfile) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "upsert_tenant_auto_embedding_profile", start, &err)
+	if p == nil {
+		return fmt.Errorf("nil tenant auto-embedding profile")
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_auto_embedding_profiles
+		(tenant_id, model, dimensions, options_json, api_base, api_key_cipher, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			model = VALUES(model),
+			dimensions = VALUES(dimensions),
+			options_json = VALUES(options_json),
+			api_base = VALUES(api_base),
+			api_key_cipher = VALUES(api_key_cipher),
+			updated_at = VALUES(updated_at)`,
+		p.TenantID, p.Model, p.Dimensions, p.OptionsJSON, nullStr(p.APIBase), nullableBytes(p.APIKeyCipher),
+		p.CreatedAt.UTC(), p.UpdatedAt.UTC())
+	return err
+}
+
+func (s *Store) GetTenantAutoEmbeddingProfile(ctx context.Context, tenantID string) (out *TenantAutoEmbeddingProfile, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_tenant_auto_embedding_profile", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT tenant_id, model, dimensions, options_json,
+			api_base, api_key_cipher, created_at, updated_at
+		FROM tenant_auto_embedding_profiles WHERE tenant_id = ?`, tenantID)
+	var rec TenantAutoEmbeddingProfile
+	var apiBase sql.NullString
+	var apiKeyCipher []byte
+	if err = row.Scan(&rec.TenantID, &rec.Model, &rec.Dimensions, &rec.OptionsJSON,
+		&apiBase, &apiKeyCipher, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = ErrNotFound
+			return nil, err
+		}
+		return nil, err
+	}
+	if apiBase.Valid {
+		rec.APIBase = apiBase.String
+	}
+	rec.APIKeyCipher = apiKeyCipher
+	return &rec, nil
+}
+
+func (s *Store) EnsureTenantAutoEmbeddingProfile(ctx context.Context, tenantID string) (out *TenantAutoEmbeddingProfile, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "ensure_tenant_auto_embedding_profile", start, &err)
+	profile, err := s.GetTenantAutoEmbeddingProfile(ctx, tenantID)
+	if err == nil {
+		return profile, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_auto_embedding_profiles (tenant_id) VALUES (?)`, tenantID)
+	if err != nil && !isDuplicateEntry(err) {
+		return nil, err
+	}
+	return s.GetTenantAutoEmbeddingProfile(ctx, tenantID)
 }
 
 func (s *Store) InsertAPIKey(ctx context.Context, k *APIKey) (err error) {

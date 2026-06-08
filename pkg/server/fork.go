@@ -205,6 +205,10 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	if err := s.meta.InsertTenant(ctx, &forkRoot); err != nil {
 		return nil, err
 	}
+	if err := s.copyAutoEmbeddingProfileForFork(ctx, source.ID, forkID, now); err != nil {
+		s.markForkFailed(ctx, forkID)
+		return nil, err
+	}
 
 	sourceCluster := clusterInfoFromTenant(source)
 	sourceCluster.Password = forkPassword
@@ -383,7 +387,7 @@ func (s *Server) provisionForkTenantOnce(ctx context.Context, forkID string) err
 	if err != nil {
 		return err
 	}
-	if err := s.provisioner.InitSchema(ctx, dsn); err != nil {
+	if err := s.schemaInitForTenant(forkID, forkTenant.Provider, s.provisioner.InitSchema)(ctx, dsn); err != nil {
 		return err
 	}
 	store, err := datastore.Open(dsn)
@@ -406,7 +410,15 @@ func (s *Server) provisionForkTenantOnce(ctx context.Context, forkID string) err
 	if err := s.backfillForkQuota(ctx, forkID, store); err != nil {
 		return err
 	}
-	if err := s.meta.UpdateTenantSchemaVersion(ctx, forkID, schema.CurrentTiDBTenantSchemaVersion); err != nil {
+	profile, err := s.autoEmbeddingProfileForTenant(ctx, forkID)
+	if err != nil {
+		return err
+	}
+	version, err := schema.TiDBTenantSchemaVersionForAutoEmbeddingProfile(profile)
+	if err != nil {
+		return err
+	}
+	if err := s.meta.UpdateTenantSchemaVersion(ctx, forkID, version); err != nil {
 		return err
 	}
 	return s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantActive)
