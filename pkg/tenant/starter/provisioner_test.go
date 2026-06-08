@@ -144,6 +144,7 @@ func TestProvisionBranchReturnsBranchIDOnPostCreateValidationError(t *testing.T)
 	}
 	if out == nil {
 		t.Fatal("expected partial cluster info")
+		return
 	}
 	if out.ClusterID != "c1" || out.BranchID != "b-created" {
 		t.Fatalf("partial cluster info = %#v", out)

@@ -12,6 +12,7 @@ import (
 const (
 	MountProfileInteractive = "interactive"
 	MountProfileCodingAgent = "coding-agent"
+	MountProfileNone        = "none"
 )
 
 type PathLayer string
@@ -39,7 +40,7 @@ type LocalPolicy struct {
 
 func NewLocalPolicy(profile string, localOnlyPatterns []string, remoteOnlyPatterns []string) *LocalPolicy {
 	policy := &LocalPolicy{}
-	if profile != MountProfileCodingAgent && len(localOnlyPatterns) == 0 && len(remoteOnlyPatterns) == 0 {
+	if !profileAllowsLocalPolicy(profile) && len(localOnlyPatterns) == 0 && len(remoteOnlyPatterns) == 0 {
 		return policy
 	}
 
@@ -52,12 +53,33 @@ func NewLocalPolicy(profile string, localOnlyPatterns []string, remoteOnlyPatter
 }
 
 func validMountProfile(profile string) bool {
-	switch profile {
-	case "", MountProfileInteractive, MountProfileCodingAgent:
+	return validMountProfileName(profile)
+}
+
+func profileAllowsLocalPolicy(profile string) bool {
+	profile = strings.TrimSpace(profile)
+	return profile != "" && profile != MountProfileInteractive && profile != MountProfileNone
+}
+
+func validMountProfileName(profile string) bool {
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
 		return true
-	default:
+	}
+	if profile == "." || profile == ".." || strings.ContainsAny(profile, `/\`) {
 		return false
 	}
+	for _, r := range profile {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_' || r == '.':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func defaultCodingAgentLocalOnlyPatterns(profile string) []string {

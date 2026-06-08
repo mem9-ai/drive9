@@ -160,7 +160,7 @@ prepare_cli_binary
 check_cmd "drive9 binary ready" test -x "$CLI_BIN"
 
 drive9() {
-  DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
+  env DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" HOME="$CLI_ENV_HOME" "$CLI_BIN" "$@"
 }
 
 drive9_ctx() {
@@ -308,6 +308,7 @@ PY
 }
 
 TS="$(date +%s)"
+CLI_ENV_HOME="$(mktemp -d)"
 CLI_CTX_HOME="$(mktemp -d)"
 SMALL_LOCAL="/tmp/drive9-cli-small-${TS}.txt"
 SMALL_REMOTE="/cli-${TS}-small.txt"
@@ -327,6 +328,23 @@ SEM_TEXT_OTHER="/cli-${TS}-dog-story.txt"
 IMAGE_CAPTION_REMOTE="/cli-${TS}-image.caption.txt"
 BATCH_LOCAL_DIR="/tmp/drive9-cli-batch-${TS}"
 BATCH_REMOTE_DIR="/cli-${TS}-batch"
+PACK_LOCAL_ROOT="/tmp/drive9-cli-pack-local-${TS}"
+PACK_RESTORE_ROOT="/tmp/drive9-cli-pack-restore-${TS}"
+PACK_REMOTE_ROOT="/workspace"
+PACK_PROFILE="e2e-pack"
+PACK_REMOTE_ARCHIVE="$(python3 - "$PACK_REMOTE_ROOT" "$PACK_PROFILE" <<'PY'
+import hashlib
+import posixpath
+import sys
+
+root = sys.argv[1]
+profile = sys.argv[2] or "coding-agent"
+label = posixpath.basename(root.rstrip("/")) or "root"
+safe = "".join(ch if ch.isalnum() or ch in "-_." else "-" for ch in label).strip(".-") or "root"
+digest = hashlib.sha256((profile + "\0" + root).encode()).hexdigest()[:16]
+print(f"/.drive9/packs/{safe}-{digest}.tar.gz")
+PY
+)"
 LARGE_LOCAL="/tmp/drive9-cli-large-${TS}.bin"
 LARGE_REMOTE="/cli-${TS}-large-${CLI_LARGE_FILE_MB}m.bin"
 LARGE_DOWNLOADED="/tmp/drive9-cli-large-${TS}.download.bin"
@@ -514,6 +532,42 @@ check_eq "overwrite with single --tag updates owner" "$tag_owner2" "updated"
 tag_topic2="$(jq -r 'if (.tags // {} | has("topic")) then "present" else "missing" end' <<<"$tag_stat_json2")"
 check_eq "overwrite with single --tag clears old topic tag" "$tag_topic2" "missing"
 
+echo "[4.2] cli pack/unpack local overlay archive checks"
+mkdir -p "$PACK_LOCAL_ROOT/overlay/repo/.git" "$PACK_LOCAL_ROOT/overlay/repo/dist" "$PACK_LOCAL_ROOT/overlay/repo/src"
+mkdir -p "$CLI_ENV_HOME/.drive9/profiles"
+cat > "$CLI_ENV_HOME/.drive9/profiles/$PACK_PROFILE" <<'EOF'
+[pack]
+.git
+dist
+EOF
+printf "[core]\n\trepositoryformatversion = 0\n" > "$PACK_LOCAL_ROOT/overlay/repo/.git/config"
+printf "ref: refs/heads/main\n" > "$PACK_LOCAL_ROOT/overlay/repo/.git/HEAD"
+printf "bundle-%s\n" "$TS" > "$PACK_LOCAL_ROOT/overlay/repo/dist/app.js"
+printf "not-packed-%s\n" "$TS" > "$PACK_LOCAL_ROOT/overlay/repo/src/main.go"
+drive9_retry profile show "$PACK_PROFILE" >/dev/null
+drive9_retry pack --local-root "$PACK_LOCAL_ROOT" --remote-root "$PACK_REMOTE_ROOT" --profile "$PACK_PROFILE" >/dev/null
+pack_archive_stat="$(drive9_retry fs stat "$PACK_REMOTE_ARCHIVE")"
+pack_archive_size=$(python3 - "$pack_archive_stat" <<'PY'
+import sys
+for line in sys.argv[1].splitlines():
+    if line.strip().startswith("size:"):
+        print(line.split(":",1)[1].strip())
+        break
+PY
+)
+check_cmd "pack archive has non-zero remote size" bash -c 'test "${1:-0}" -gt 0' -- "$pack_archive_size"
+drive9_retry unpack --local-root "$PACK_RESTORE_ROOT" --remote-root "$PACK_REMOTE_ROOT" --profile "$PACK_PROFILE" >/dev/null
+restored_git_config="$(cat "$PACK_RESTORE_ROOT/overlay/repo/.git/config")"
+check_eq "unpack restores .git config" "$restored_git_config" $'[core]\n\trepositoryformatversion = 0'
+restored_dist="$(cat "$PACK_RESTORE_ROOT/overlay/repo/dist/app.js")"
+check_eq "unpack restores dist artifact" "$restored_dist" "bundle-${TS}"
+if [ -e "$PACK_RESTORE_ROOT/overlay/repo/src/main.go" ]; then
+  restored_src_present="true"
+else
+  restored_src_present="false"
+fi
+check_eq "configured profile pack skips ordinary source file" "$restored_src_present" "false"
+
 echo "[5] batch small-file upload/list/read via cli"
 mkdir -p "$BATCH_LOCAL_DIR"
 for i in $(seq 1 "$CLI_BATCH_SMALL_FILE_COUNT"); do
@@ -645,6 +699,7 @@ if [ "$CLI_IMAGE_UPLOADED" = "1" ]; then
   drive9_retry fs rm "$IMAGE_REMOTE" >/dev/null
 fi
 drive9_retry fs rm "$LARGE_REMOTE" >/dev/null
+drive9_retry fs rm "$PACK_REMOTE_ARCHIVE" >/dev/null
 drive9_retry fs rm "$cp_dir_remote_path" >/dev/null
 drive9_retry fs rm "$cp_dir_remote_copy_path" >/dev/null
 drive9_retry fs rm -r "$CP_DIR_REMOTE" >/dev/null
@@ -790,7 +845,7 @@ rm -f "$pfile" "$CLI_BIN" "$SMALL_LOCAL" "$HARDLINK_LOCAL" "$IMAGE_LOCAL" "$LARG
 rm -f "$TAG_LOCAL"
 rm -f "$FORK_LOCAL"
 rm -f "/tmp/drive9-cli-sem-target-${TS}.txt" "/tmp/drive9-cli-sem-other-${TS}.txt" "/tmp/drive9-cli-image-caption-${TS}.txt"
-rm -rf "$BATCH_LOCAL_DIR" "$CP_DIR_LOCAL" "$CLI_CTX_HOME"
+rm -rf "$BATCH_LOCAL_DIR" "$CP_DIR_LOCAL" "$PACK_LOCAL_ROOT" "$PACK_RESTORE_ROOT" "$CLI_ENV_HOME" "$CLI_CTX_HOME"
 
 echo "RESULT: $PASS passed, $FAIL failed, $SKIP skipped, $TOTAL total"
 exit "$FAIL"
