@@ -470,6 +470,18 @@ func (wb *WriteBuffer) markDirty(start, end int64) {
 	}
 }
 
+func (wb *WriteBuffer) ensureRetainedDirtyPartLoaded(retainedEnd int64) error {
+	if retainedEnd <= 0 || wb.smallFileData != nil || wb.LoadPart == nil || wb.partSize <= 0 {
+		return nil
+	}
+	partIdx := int((retainedEnd - 1) / wb.partSize)
+	partStart := int64(partIdx) * wb.partSize
+	if partStart >= wb.remoteSize {
+		return nil
+	}
+	return wb.ensurePart(partIdx)
+}
+
 // Truncate resizes the buffer to size.
 // Shrinks if size < current length, zero-extends if size > current length.
 // Returns syscall.EFBIG if size exceeds maxSize.
@@ -491,6 +503,10 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 			wb.touched = true
 			wb.dirtyParts[0] = true
 			return nil
+		}
+
+		if err := wb.ensureRetainedDirtyPartLoaded(size); err != nil {
+			return err
 		}
 
 		// Mark affected parts as dirty
@@ -551,6 +567,11 @@ func (wb *WriteBuffer) Truncate(size int64) error {
 			// Migrate to part mode for larger size
 			wb.migrateToPartMode()
 			return wb.Truncate(size)
+		}
+		if cur > 0 && cur%wb.partSize != 0 {
+			if err := wb.ensureRetainedDirtyPartLoaded(cur); err != nil {
+				return err
+			}
 		}
 		// Mark the extended region as dirty
 		wb.markDirty(cur, size)

@@ -309,6 +309,50 @@ func TestShadowStoreRenamePinState(t *testing.T) {
 	ss.Unpin(gen)
 }
 
+func TestShadowStoreRenameReplacesDestinationGeneration(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	dst := NewWriteBuffer("/final.txt", 0, 0)
+	_, _ = dst.Write(0, []byte("old-final"))
+	if err := ss.WriteExtents("/final.txt", dst, 1); err != nil {
+		t.Fatal(err)
+	}
+	oldGen := ss.Pin("/final.txt")
+	ss.Unpin(oldGen)
+
+	src := NewWriteBuffer("/tmp.txt", 0, 0)
+	_, _ = src.Write(0, []byte("new-final"))
+	if err := ss.WriteExtents("/tmp.txt", src, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	if !ss.Rename("/tmp.txt", "/final.txt") {
+		t.Fatal("rename failed")
+	}
+
+	newGen, ok := ss.PinIfExists("/final.txt")
+	if !ok {
+		t.Fatal("expected renamed destination to be pinnable")
+	}
+	if newGen == oldGen {
+		t.Fatalf("renamed destination reused stale generation %d", oldGen)
+	}
+	buf := make([]byte, len("new-final"))
+	n, err := ss.ReadAtGen(newGen, 0, buf)
+	if err != nil {
+		t.Fatalf("ReadAtGen renamed destination: %v", err)
+	}
+	if n != len(buf) || !bytes.Equal(buf[:n], []byte("new-final")) {
+		t.Fatalf("ReadAtGen renamed destination = %q, want new-final", buf[:n])
+	}
+	ss.Unpin(newGen)
+}
+
 func TestShadowStoreRenameFailureRollbackPinState(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStore(dir)

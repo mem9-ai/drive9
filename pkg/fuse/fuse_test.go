@@ -946,6 +946,97 @@ func TestWriteBuffer_LazyLoad_UnloadedPartReturnsZeros(t *testing.T) {
 	}
 }
 
+func TestWriteBuffer_LazyTruncateShrinkLoadsRetainedDirtyPart(t *testing.T) {
+	const partSize = int64(16)
+	remote := []byte("ABCDEFGHIJKLMNOPabcdefghijklmnop")
+	wb := NewWriteBuffer("/test", 0, partSize)
+	wb.totalSize = int64(len(remote))
+	wb.remoteSize = int64(len(remote))
+
+	loadCalls := 0
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		loadCalls++
+		start := int64(partNum-1) * partSize
+		end := start + partSize
+		if end > int64(len(remote)) {
+			end = int64(len(remote))
+		}
+		part := make([]byte, end-start)
+		copy(part, remote[start:end])
+		return part, nil
+	}
+
+	if err := wb.Truncate(10); err != nil {
+		t.Fatal(err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("LoadPart calls = %d, want 1", loadCalls)
+	}
+	if got := string(wb.PartData(1)); got != "ABCDEFGHIJ" {
+		t.Fatalf("dirty retained part = %q, want %q", got, "ABCDEFGHIJ")
+	}
+}
+
+func TestWriteBuffer_LazyTruncateBoundaryLoadsRetainedDirtyPart(t *testing.T) {
+	const partSize = int64(16)
+	remote := []byte("ABCDEFGHIJKLMNOPabcdefghijklmnop")
+	wb := NewWriteBuffer("/test", 0, partSize)
+	wb.totalSize = int64(len(remote))
+	wb.remoteSize = int64(len(remote))
+
+	loadCalls := 0
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		loadCalls++
+		start := int64(partNum-1) * partSize
+		end := start + partSize
+		part := make([]byte, end-start)
+		copy(part, remote[start:end])
+		return part, nil
+	}
+
+	if err := wb.Truncate(partSize); err != nil {
+		t.Fatal(err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("LoadPart calls = %d, want 1", loadCalls)
+	}
+	if got := string(wb.PartData(1)); got != "ABCDEFGHIJKLMNOP" {
+		t.Fatalf("boundary retained part = %q, want %q", got, "ABCDEFGHIJKLMNOP")
+	}
+}
+
+func TestWriteBuffer_LazyTruncateExtendLoadsRetainedDirtyPart(t *testing.T) {
+	const partSize = int64(16)
+	remote := []byte("ABCDEFGHIJ")
+	wb := NewWriteBuffer("/test", 0, partSize)
+	wb.totalSize = int64(len(remote))
+	wb.remoteSize = int64(len(remote))
+
+	loadCalls := 0
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		loadCalls++
+		part := make([]byte, len(remote))
+		copy(part, remote)
+		return part, nil
+	}
+
+	if err := wb.Truncate(14); err != nil {
+		t.Fatal(err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("LoadPart calls = %d, want 1", loadCalls)
+	}
+	got := wb.PartData(1)
+	if string(got[:10]) != "ABCDEFGHIJ" {
+		t.Fatalf("extended retained prefix = %q, want %q", got[:10], "ABCDEFGHIJ")
+	}
+	for i, b := range got[10:] {
+		if b != 0 {
+			t.Fatalf("extended byte %d = %d, want 0", i+10, b)
+		}
+	}
+}
+
 func TestWriteBuffer_RewritePartPreservesLatestData(t *testing.T) {
 	// Verify that rewriting a full part keeps the latest data in the buffer.
 	// This is critical: FUSE writers can revisit earlier offsets before close

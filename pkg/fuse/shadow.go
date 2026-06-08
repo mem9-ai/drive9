@@ -584,11 +584,22 @@ func (s *ShadowStore) Remove(remotePath string) {
 // Rename moves a shadow file from oldPath to newPath.
 func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	sf, ok := s.files[oldPath]
 	if !ok {
-		s.mu.Unlock()
 		return false
 	}
+
+	oldSP := s.shadowPath(oldPath)
+	newSP := s.shadowPath(newPath)
+	if err := os.Rename(oldSP, newSP); err != nil {
+		return false
+	}
+
+	replacedSF := s.files[newPath]
+	replacedGen := s.active[newPath]
+
 	delete(s.files, oldPath)
 	s.files[newPath] = sf
 	// Transfer generation mapping to new path.
@@ -596,23 +607,24 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 	if oldGen != 0 {
 		s.active[newPath] = oldGen
 		delete(s.active, oldPath)
+	} else if replacedGen != 0 {
+		delete(s.active, newPath)
 	}
-	s.mu.Unlock()
-
-	// Rename on disk.
-	oldSP := s.shadowPath(oldPath)
-	newSP := s.shadowPath(newPath)
-	if err := os.Rename(oldSP, newSP); err != nil {
-		// Rollback in-memory state on disk failure.
-		s.mu.Lock()
-		delete(s.files, newPath)
-		s.files[oldPath] = sf
-		if oldGen != 0 {
-			s.active[oldPath] = oldGen
-			delete(s.active, newPath)
+	if replacedGen != 0 && replacedGen != oldGen {
+		delete(s.genFile, replacedGen)
+		if s.refs[replacedGen] > 0 && replacedSF != nil {
+			s.retired[replacedGen] = &retiredShadow{
+				fd:   replacedSF.fd,
+				size: replacedSF.size,
+			}
+		} else {
+			delete(s.refs, replacedGen)
+			if replacedSF != nil {
+				_ = replacedSF.fd.Close()
+			}
 		}
-		s.mu.Unlock()
-		return false
+	} else if replacedSF != nil && replacedSF != sf {
+		_ = replacedSF.fd.Close()
 	}
 	return true
 }

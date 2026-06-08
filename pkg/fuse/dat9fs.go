@@ -85,8 +85,8 @@ type Dat9FS struct {
 
 	// server is the go-fuse server, set during Init(). Used to send
 	// kernel cache invalidation notifications (EntryNotify, InodeNotify)
-	// for external/SSE-driven changes that the kernel doesn't know about.
-	// Local FUSE mutations avoid server notify because handlers can be running
+	// for external/SSE-driven changes and rename target replacement. Most
+	// local FUSE mutations avoid server notify because handlers can be running
 	// on the same worker pool that services notify-triggered revalidation.
 	server *gofuse.Server
 
@@ -468,7 +468,7 @@ func (fs *Dat9FS) usesTransientLocalOverlay(localPath string, dirHint bool) bool
 	if fs == nil || dirHint || fs.opts == nil || fs.opts.ReadOnly {
 		return false
 	}
-	return isSQLiteWALIndexPath(localPath)
+	return fs.isConfirmedSQLiteWALIndexPath(localPath)
 }
 
 func isSQLiteWALIndexPath(localPath string) bool {
@@ -481,6 +481,20 @@ func isSQLiteWALIndexPath(localPath string) bool {
 		return false
 	}
 	return strings.TrimSuffix(name, "-shm") != ""
+}
+
+func (fs *Dat9FS) isConfirmedSQLiteWALIndexPath(localPath string) bool {
+	canonical, err := pathutil.Canonicalize(localPath)
+	if err != nil || !isSQLiteWALIndexPath(canonical) {
+		return false
+	}
+	if fs == nil || fs.openHandles == nil {
+		return false
+	}
+	dbPath := strings.TrimSuffix(canonical, "-shm")
+	return fs.openHandles.Has(0, dbPath) ||
+		fs.openHandles.Has(0, dbPath+"-wal") ||
+		fs.openHandles.Has(0, dbPath+"-journal")
 }
 
 func isSQLitePersistentJournalPath(localPath string) bool {
@@ -559,6 +573,9 @@ func remoteOpenFlagsForHandle(fh *FileHandle) uint32 {
 		return gofuse.FOPEN_KEEP_CACHE
 	}
 	if isSQLiteDirectIOPath(fh.Path) {
+		return gofuse.FOPEN_DIRECT_IO
+	}
+	if fh.ShadowPinned || fh.ShadowReady || fh.ShadowSpill {
 		return gofuse.FOPEN_DIRECT_IO
 	}
 	if fh.Dirty != nil {
@@ -831,20 +848,106 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision i
 		// This method is called from commit paths that may already hold another
 		// same-path handle lock. Never block on sibling handles here: two
 		// concurrent commits can otherwise deadlock by each holding one handle
-		// and waiting for the other. A locked sibling is actively mutating or
-		// committing and will refresh its own revision through its commit path.
+		// and waiting for the other. Clean locked siblings refresh lazily in
+		// Read before serving any loaded clean writable-buffer bytes.
 		if !fh.TryLock() {
 			continue
 		}
 		if fh.Dirty != nil {
+			cleanBuffer := fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts()
 			fh.IsNew = false
 			fh.BaseRev = revision
 			if fh.Streamer != nil {
 				fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
 			}
+			if cleanBuffer {
+				fs.rebindCleanWriteBufferToRemoteLocked(fh, fs.committedHandleSizeLocked(fh))
+			}
 		}
 		fh.Unlock()
 	}
+}
+
+func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) bool {
+	if fs == nil || fh == nil || fh.Dirty == nil || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
+		return false
+	}
+	revision := fs.latestCommittedRevision(fh.Path)
+	if revision <= 0 || revision <= fh.BaseRev {
+		return false
+	}
+	fh.IsNew = false
+	fh.BaseRev = revision
+	if fh.Streamer != nil {
+		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	}
+	if fs.clearRemovedCommittedShadowLocked(fh, revision, fs.committedHandleSizeLocked(fh), false) {
+		return true
+	}
+	if fh.ShadowReady || fh.ShadowSpill {
+		if fs.canRemoveActiveStaleShadowForCleanRefreshLocked(fh) {
+			fs.shadowStore.Remove(fh.Path)
+		}
+		fh.ShadowReady = false
+		fh.ShadowSpill = false
+		fh.ShadowCommitReady = false
+		fh.ShadowCommitSeq = 0
+	}
+	fs.rebindCleanWriteBufferToRemoteLocked(fh, fs.committedHandleSizeLocked(fh))
+	return true
+}
+
+func (fs *Dat9FS) canRemoveActiveStaleShadowForCleanRefreshLocked(fh *FileHandle) bool {
+	if fs == nil || fh == nil || fs.shadowStore == nil || fh.Path == "" || !fs.shadowStore.Has(fh.Path) {
+		return false
+	}
+	if fs.hasPendingLocalStateExceptShadow(fh.Path) {
+		return false
+	}
+	if fs.hasOtherPendingOpenHandleState(fh.Path, fh) {
+		return false
+	}
+	return true
+}
+
+func (fs *Dat9FS) hasPendingLocalStateExceptShadow(p string) bool {
+	if fs == nil {
+		return false
+	}
+	if fs.pendingIndex != nil {
+		if _, ok := fs.pendingIndex.GetMeta(p); ok {
+			return true
+		}
+	}
+	if fs.writeBack != nil {
+		if _, ok := fs.writeBack.GetMeta(p); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) hasOtherPendingOpenHandleState(path string, skip *FileHandle) bool {
+	if fs == nil || fs.openHandles == nil || path == "" {
+		return false
+	}
+	for _, fh := range fs.openHandles.SnapshotPath(path) {
+		if fh == nil || fh == skip {
+			continue
+		}
+		if !fh.TryLock() {
+			return true
+		}
+		pending := fh.IsNew || fh.DirtySeq != 0 || fh.WriteBackSeq != 0 || fh.ShadowCommitReady
+		if fh.Dirty != nil && fh.Dirty.HasDirtyParts() {
+			pending = true
+		}
+		fh.Unlock()
+		if pending {
+			return true
+		}
+	}
+	return false
 }
 
 func (fs *Dat9FS) clearRemovedCommittedShadowForOpenHandles(path string, committedRev, committedSize int64) {
@@ -910,20 +1013,26 @@ func (fs *Dat9FS) rebindCleanWriteBufferToRemoteLocked(fh *FileHandle, committed
 	if committedSize < 0 {
 		committedSize = 0
 	}
-	if fh.Dirty.smallFileData != nil && int64(len(fh.Dirty.smallFileData)) < committedSize {
-		fh.Dirty.migrateToPartMode()
+	old := fh.Dirty
+	maxSize := old.maxSize
+	if maxSize < committedSize {
+		maxSize = committedSize * 2
+		if maxSize < maxPreloadSize {
+			maxSize = maxPreloadSize
+		}
 	}
-	fh.Dirty.totalSize = committedSize
-	fh.Dirty.remoteSize = committedSize
-	fh.Dirty.appendCursor = committedSize
-	fh.Dirty.sequential = true
-	fh.Dirty.uploadedParts = nil
-	fh.Dirty.OnPartFull = nil
-	fh.Streamer = nil
+	partSize := old.PartSize()
+	next := fs.newWriteBuffer(fh.Path, maxSize, partSize)
+	next.totalSize = committedSize
+	next.remoteSize = committedSize
+	next.appendCursor = committedSize
+	next.sequential = true
+	fh.Dirty = next
+	fh.OrigSize = committedSize
+	clearReadTargetForLockedHandle(fh)
 
 	c := fs.client
-	partSize := fh.Dirty.PartSize()
-	fh.Dirty.LoadPart = func(partNum int) ([]byte, error) {
+	next.LoadPart = func(partNum int) ([]byte, error) {
 		filePath := fh.Path
 		remoteFilePath := fs.remotePath(filePath)
 		partIdx := partNum - 1
@@ -1090,6 +1199,11 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	fh.IsNew = false
 	fh.BaseRev = revision
 	fs.inodes.UpdateRevision(fh.Ino, revision)
+	if fh.Dirty != nil {
+		size := fh.Dirty.Size()
+		fh.OrigSize = size
+		fs.inodes.UpdateSize(fh.Ino, size)
+	}
 	fs.refreshCommittedRevisionForOpenHandles(fh.Path, revision, fh)
 	if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() > 0 {
 		fh.ZeroBase = false
@@ -1491,6 +1605,11 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
 		fh.BaseRev = revision
 		fs.inodes.UpdateRevision(fh.Ino, revision)
+		if fh.Dirty != nil {
+			size := fh.Dirty.Size()
+			fh.OrigSize = size
+			fs.inodes.UpdateSize(fh.Ino, size)
+		}
 		if wasNew {
 			fs.replaceCommittedRevision(fh.Path, revision)
 		} else {
@@ -2567,11 +2686,12 @@ func (fs *Dat9FS) inodeSnapshotSize(ino uint64) int64 {
 	return entry.Size
 }
 
-func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeUnlink(ctx context.Context, localPath string) error {
-	if !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
-		return nil
-	}
-	return fs.snapshotOpenSQLiteSidecarHandles(ctx, localPath, nil)
+func (fs *Dat9FS) snapshotOpenHandlesBeforeUnlink(ctx context.Context, localPath string) error {
+	return fs.snapshotOpenHandlesForPath(ctx, localPath, nil)
+}
+
+func (fs *Dat9FS) snapshotOpenHandlesBeforePathReplacement(ctx context.Context, localPath string) error {
+	return fs.snapshotOpenHandlesForPath(ctx, localPath, nil)
 }
 
 func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeTruncate(ctx context.Context, localPath string, skip *FileHandle, newSize int64) error {
@@ -2583,6 +2703,13 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarBeforeTruncate(ctx context.Context, l
 
 func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPath string, skip *FileHandle) error {
 	if fs == nil || fs.openHandles == nil || !shouldSnapshotOpenSQLiteSidecarOnUnlink(localPath) {
+		return nil
+	}
+	return fs.snapshotOpenHandlesForPath(ctx, localPath, skip)
+}
+
+func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath string, skip *FileHandle) error {
+	if fs == nil || fs.openHandles == nil || localPath == "" {
 		return nil
 	}
 	type candidate struct {
@@ -2605,25 +2732,18 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPat
 		}
 		candidates = append(candidates, candidate{fh: fh, size: size})
 	}
+	if len(candidates) == 0 {
+		return nil
+	}
 
 	snapshots := make(map[int64][]byte)
 	for _, cand := range candidates {
 		data, ok := snapshots[cand.size]
 		if !ok {
-			if cand.size > 0 {
-				if cachedData, n, claimed := fs.readSQLitePersistentJournalCommittedCache(localPath, 0, 0, uint32(cand.size)); claimed && int64(n) == cand.size {
-					data = cachedData[:n]
-				} else {
-					snapshotCtx, cancel := context.WithTimeout(ctx, readTransientRetryTimeout)
-					var err error
-					data, _, err = fs.doRangeRead(snapshotCtx, localPath, nil, 0, cand.size)
-					cancel()
-					if err != nil {
-						return err
-					}
-				}
-			} else {
-				data = []byte{}
+			var err error
+			data, err = fs.readOpenHandleSnapshot(ctx, localPath, cand.size)
+			if err != nil {
+				return err
 			}
 			snapshots[cand.size] = data
 		}
@@ -2638,6 +2758,46 @@ func (fs *Dat9FS) snapshotOpenSQLiteSidecarHandles(ctx context.Context, localPat
 		cand.fh.Unlock()
 	}
 	return nil
+}
+
+func (fs *Dat9FS) readOpenHandleSnapshot(ctx context.Context, localPath string, size int64) ([]byte, error) {
+	if size < 0 || size > maxPreloadSize {
+		return nil, fmt.Errorf("open-handle snapshot size out of range for %s: %d", localPath, size)
+	}
+	if fs.shadowStore != nil {
+		if shadowSize := fs.shadowStore.Size(localPath); shadowSize >= 0 && shadowSize <= maxPreloadSize {
+			data, err := fs.shadowStore.ReadAll(localPath)
+			if err == nil {
+				return cloneBytes(data), nil
+			}
+		}
+	}
+	if fs.writeBack != nil {
+		if data, ok := fs.writeBack.getView(localPath); ok {
+			return cloneBytes(data), nil
+		}
+	}
+	if size == 0 {
+		return []byte{}, nil
+	}
+	if isSQLitePersistentJournalPath(localPath) {
+		if cachedData, n, claimed := fs.readSQLitePersistentJournalCommittedCache(localPath, 0, 0, uint32(size)); claimed && int64(n) == size {
+			return cloneBytes(cachedData[:n]), nil
+		}
+	}
+	releaseReadSlot, err := fs.acquireRemoteReadSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	data, _, err := fs.readStreamRangeWithRetry(ctx, localPath, nil, 0, size)
+	releaseReadSlot()
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != size {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return data, nil
 }
 
 func (fs *Dat9FS) invalidateReadCacheAndTargets(p string) {
@@ -4949,6 +5109,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if fs.debouncer != nil {
 		fs.debouncer.Cancel(childP)
 	}
+	if err := fs.snapshotOpenHandlesBeforeUnlink(ctx, childP); err != nil {
+		status = httpToFuseStatus(err)
+		return status
+	}
 	if fs.writeBack != nil && fs.uploader != nil {
 		// Wait for any in-flight upload to finish so it doesn't "revive"
 		// the file on the server after we delete it.
@@ -5000,13 +5164,6 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}
 
 	if !pendingNew {
-		ctx, cf := fuseCtx(cancel)
-		defer cf()
-		if err := fs.snapshotOpenSQLiteSidecarBeforeUnlink(ctx, childP); err != nil {
-			status = httpToFuseStatus(err)
-			return status
-		}
-
 		// File existed on server (or unknown) — issue remote DELETE.
 		// Tolerate 404 in case it was already deleted.
 		deleteStart := time.Now()
@@ -5347,8 +5504,24 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	}
 	if oldEntryOK {
 		fs.dirCache.Upsert(newParent, cachedInfoFromEntry(path.Base(newP), oldEntry))
+	} else {
+		fs.dirCache.Invalidate(newParent)
 	}
 	fs.retargetOpenHandlesForRename(oldP, newP)
+	fs.notifyRenameTarget(input.Newdir, path.Base(newP), newP)
+}
+
+func (fs *Dat9FS) notifyRenameTarget(parentIno uint64, name, p string) {
+	// Rename can publish a previously pending temp file under a path that
+	// concurrent readers already looked up as absent or zero-sized. Invalidate
+	// both the target dentry and inode so the kernel cannot keep satisfying
+	// reads from stale attrs while userspace state has the correct size.
+	if parentIno != 0 && name != "" && name != "." && name != "/" {
+		fs.notifyEntry(parentIno, name)
+	}
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		fs.notifyInode(ino)
+	}
 }
 
 func (fs *Dat9FS) retargetOpenHandlesForRename(oldP, newP string) {
@@ -5423,6 +5596,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 	if handled, st := fs.renameGitPath(ctx, input, oldP, newP); handled {
 		return st
+	}
+	if err := fs.snapshotOpenHandlesBeforePathReplacement(ctx, newP); err != nil {
+		return httpToFuseStatus(err)
 	}
 
 	pendingRename, err := fs.renamePendingNewCommit(ctx, input, oldP, newP)
@@ -6433,6 +6609,7 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		bytesRead = n
 		return gofuse.ReadResultData(data), gofuse.OK
 	}
+	fs.refreshCleanCommittedRevisionForHandleLocked(fh)
 
 	if fh.ShadowSpill && fs.shadowStore != nil && fh.Dirty != nil && isSQLitePersistentJournalPath(fh.Path) && fh.Dirty.Size() == 0 && !fh.Dirty.hasDirtyPartMarks() && !fh.ZeroBase && fh.Flags&syscall.O_TRUNC == 0 {
 		handlePath := fh.Path
@@ -7213,6 +7390,7 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 
 	threshold := fs.negotiatedInlineThreshold()
 	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
+	canPatchExisting := threshold > 0 && fh.OrigSize >= threshold && size <= fh.OrigSize
 	if useDirectPUT || fh.OrigSize < threshold {
 		data = fh.Dirty.bytesView()
 	}
@@ -7234,7 +7412,7 @@ func (fs *Dat9FS) syncWriteHandleToRemoteLocked(ctx context.Context, fh *FileHan
 			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
 			fs.debugDurationf(writeStart, 0, "write-sync small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
 		}
-	} else if threshold > 0 && fh.OrigSize >= threshold {
+	} else if canPatchExisting {
 		dirtyParts := fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {
 			partSnapshots := make(map[int][]byte, len(dirtyParts))
@@ -7909,6 +8087,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 				fs.pendingIndex.Remove(fh.Path)
 			}
 		}
+		fs.inodes.UpdateSize(fh.Ino, size)
 		return gofuse.OK
 	}
 
@@ -7916,6 +8095,12 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 	if fs.writeBack != nil && fs.uploader != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq == fh.DirtySeq {
 		// Snapshot matches current dirty state — safe to upload.
 		phase = "writeback-upload-sync"
+		size := int64(0)
+		if fh.Dirty != nil {
+			size = fh.Dirty.Size()
+		} else if meta, ok := fs.writeBack.GetMeta(fh.Path); ok && meta != nil {
+			size = meta.Size
+		}
 		expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 		uploadStart := time.Now()
 		fs.debugf("fsync writeback upload start path=%s", fh.Path)
@@ -7947,6 +8132,8 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		} else {
 			fs.finalizeHandleFlushLocked(fh, expectedRevision)
 		}
+		fs.inodes.UpdateSize(fh.Ino, size)
+		fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
 	} else if fs.writeBack != nil && fh.WriteBackSeq != 0 && fh.WriteBackSeq != fh.DirtySeq {
 		// Snapshot is stale — discard it so we don't upload old data.
 		phase = "writeback-stale"
@@ -8470,7 +8657,9 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 			fs.recordCommittedRevision(filePath, committedRev)
 			handle.IsNew = false
 			handle.BaseRev = committedRev
+			fs.inodes.UpdateSize(ino, int64(len(data)))
 			fs.inodes.UpdateRevision(ino, committedRev)
+			handle.OrigSize = int64(len(data))
 			fs.refreshCommittedRevisionForOpenHandles(filePath, committedRev, handle)
 			if handle.ZeroBase && handle.Dirty != nil && handle.Dirty.Size() > 0 {
 				handle.ZeroBase = false
@@ -8973,8 +9162,13 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		// are updated above. Kernel will see new attrs on next access.
 	} else {
 		fs.invalidateReadCacheAndTargets(entry.Path)
-		if entry.HasMode && entry.Inode > 0 {
-			fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
+		if entry.Inode > 0 {
+			fs.inodes.UpdateSize(entry.Inode, entry.Size)
+			fs.inodes.UpdateMtime(entry.Inode, time.Now())
+			if entry.HasMode {
+				fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
+			}
+			fs.notifyInode(entry.Inode)
 		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), 0)
 	}

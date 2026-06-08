@@ -151,6 +151,24 @@ func TestSQLiteWALIndexPathMatching(t *testing.T) {
 	}
 }
 
+func TestTransientSQLiteWALIndexRequiresOpenSidecarOwner(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1:1"), opts)
+
+	if fs.usesTransientLocalOverlay("/repo/notes-shm", false) {
+		t.Fatal("regular *-shm path without an open database owner must not use transient overlay")
+	}
+
+	fs.openHandles.Add(&FileHandle{Path: "/repo/workload"})
+	if !fs.usesTransientLocalOverlay("/repo/workload-shm", false) {
+		t.Fatal("open database owner should make matching -shm path transient")
+	}
+	if fs.usesTransientLocalOverlay("/repo/notes-shm", false) {
+		t.Fatal("unrelated open database owner must not make another -shm path transient")
+	}
+}
+
 func TestSQLitePersistentJournalPathMatching(t *testing.T) {
 	tests := []struct {
 		path string
