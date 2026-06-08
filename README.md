@@ -102,13 +102,15 @@ drive9 fs rm -r :/old-dir
 
 ```bash
 mkdir -p ~/drive9
-drive9 mount :/ ~/drive9 --debug
+drive9 mount --debug :/ ~/drive9
 
-# In another shell:
 git clone https://github.com/mem9-ai/drive9.git ~/drive9/drive9
 
 drive9 umount ~/drive9
 ```
+
+`drive9 mount` starts in the background by default. Use `--foreground` to keep
+the mount process attached to the current terminal until it is unmounted.
 
 The mount command accepts an optional remote root:
 

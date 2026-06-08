@@ -886,6 +886,7 @@ func TestMountCmdUnpacksBeforeFuseMount(t *testing.T) {
 	}
 
 	if err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", srv.URL,
 		"--api-key", "sk-test",
@@ -936,6 +937,7 @@ func TestMountCmdAutoUnpacksCodingAgentPackBeforeFuseMount(t *testing.T) {
 	mountFuse = func(opts *mountFuseOptions) error { return nil }
 
 	if err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", srv.URL,
 		"--api-key", "sk-test",

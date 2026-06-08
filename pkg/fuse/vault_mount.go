@@ -6,12 +6,14 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
 
 // VaultMountOptions configures a `drive9 mount vault <path>` mount.
@@ -122,6 +124,28 @@ func MountVault(opts *VaultMountOptions) error {
 	if err := server.WaitMount(); err != nil {
 		return fmt.Errorf("fuse wait mount (vault): %w", err)
 	}
+
+	stateMountPoint := opts.MountPoint
+	if absMountPoint, absErr := filepath.Abs(stateMountPoint); absErr == nil {
+		stateMountPoint = absMountPoint
+	}
+	if resolvedMountPoint, resolveErr := filepath.EvalSymlinks(stateMountPoint); resolveErr == nil {
+		stateMountPoint = resolvedMountPoint
+	}
+	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
+		PID:        os.Getpid(),
+		MountKind:  mountstate.MountKindVault,
+		MountPoint: stateMountPoint,
+	})
+	if err != nil {
+		_ = server.Unmount()
+		return fmt.Errorf("write vault mount pid file: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, err)
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

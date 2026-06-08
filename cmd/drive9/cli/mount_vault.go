@@ -24,9 +24,14 @@ import (
 // vault_mount.go for the per-row anchors. This file owns only the CLI
 // surface (flag parsing + cred resolution + handing off to MountVault).
 func VaultMountCmd(args []string) error {
+	return vaultMountCmd(args, false)
+}
+
+func vaultMountCmd(args []string, background bool) error {
 	fs := flag.NewFlagSet("mount vault", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
+	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
 	dirTTL := fs.Duration("dir-ttl", 5*time.Second, "vault list / field cache TTL")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
@@ -67,6 +72,16 @@ func VaultMountCmd(args []string) error {
 	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
 	if err != nil {
 		return err
+	}
+
+	if background && !*foreground {
+		return startMountBackground(mountBackgroundRequest{
+			Args:       append([]string{"vault"}, args...),
+			MountPoint: mountPoint,
+			Server:     serverVal,
+			APIKey:     apiKeyVal,
+			Token:      tokenVal,
+		})
 	}
 
 	opts := &vaultMountOptions{
