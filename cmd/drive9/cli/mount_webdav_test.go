@@ -214,6 +214,21 @@ func TestMountCmd_WebDAVRejectsReadOnly(t *testing.T) {
 	}
 }
 
+func TestMountCmdWebDAVDefaultProfileDoesNotReadCodingAgentProfile(t *testing.T) {
+	writeTestProfile(t, "coding-agent", "[unknown]\n.git\n")
+
+	err := fsMountCmd([]string{"--mode=webdav", "--read-only", "/tmp/drive9-webdav-test"})
+	if err == nil {
+		t.Fatal("expected error for --read-only with WebDAV mode")
+	}
+	if !strings.Contains(err.Error(), "--read-only is not supported with WebDAV mode") {
+		t.Fatalf("error = %v, want read-only WebDAV rejection", err)
+	}
+	if strings.Contains(err.Error(), "unknown section") {
+		t.Fatalf("WebDAV default profile should not read coding-agent profile file: %v", err)
+	}
+}
+
 // TestNewWebDAVHandler verifies the handler constructor doesn't panic.
 func TestNewWebDAVHandler(t *testing.T) {
 	c := client.New("http://127.0.0.1:1", "test-key")

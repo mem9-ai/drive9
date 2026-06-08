@@ -84,6 +84,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"ctx use <name>",
 		"token <issue|revoke>",
 		"journal <new|append|cat|find|verify>",
+		"profile show [profile]",
 		"mount [flags] [:/remote] <mountpoint>",
 		"mount vault [flags] <mountpoint>",
 		"doctor fuse",
@@ -413,6 +414,39 @@ func TestDispatchUnpackVerbReachesHandler(t *testing.T) {
 		t.Fatal("unpack handler was not invoked for `drive9 unpack ...`")
 	}
 	want := []string{":/packs/archive.tar.gz", "--local-root", "/tmp/drive9-local"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
+		}
+	}
+}
+
+func TestDispatchProfileVerbReachesHandler(t *testing.T) {
+	origHandler := profileHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		profileHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	profileHandler = func(args []string) error {
+		called = true
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("profile", []string{"show", "coding-agent"})
+
+	if !called {
+		t.Fatal("profile handler was not invoked for `drive9 profile ...`")
+	}
+	want := []string{"show", "coding-agent"}
 	if len(gotArgs) != len(want) {
 		t.Fatalf("args = %v, want %v", gotArgs, want)
 	}

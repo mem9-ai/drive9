@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -97,7 +98,7 @@ func TestWriteReadProcessState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadProcessState: %v", err)
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ReadProcessState = %#v, want %#v", got, want)
 	}
 	if gotPath != path {
@@ -140,7 +141,7 @@ func TestWriteProcessStateReplacesExistingFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadProcessState: %v", err)
 	}
-	if got != (ProcessState{PID: 222, CreationTime: 2}) {
+	if want := (ProcessState{PID: 222, CreationTime: 2}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("ReadProcessState = %#v, want replacement state", got)
 	}
 	if gotPath != path {

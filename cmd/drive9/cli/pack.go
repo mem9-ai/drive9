@@ -29,10 +29,8 @@ const (
 	packArchiveFormat      = "drive9.pack.v1"
 	packManifestEntryName  = ".drive9-pack-manifest.json"
 	packArchiveEntryPrefix = "entries/"
-	codingAgentPackRoot    = "/.drive9/packs/coding-agent"
+	defaultPackRoot        = "/.drive9/packs"
 )
-
-var defaultCodingAgentPackNames = []string{".git", "dist", "build", "target"}
 
 type packManifest struct {
 	Format       string              `json:"format"`
@@ -61,6 +59,7 @@ type packOptions struct {
 	LocalPrefix          string
 	Profile              string
 	Paths                []string
+	ProfilePackPaths     []string
 	SkipMissing          bool
 	PreviousReplacePaths []string
 }
@@ -91,6 +90,7 @@ type mountedPackTarget struct {
 	RemoteRoot string
 	Profile    string
 	LocalRoot  string
+	PackPaths  []string
 }
 
 // PackCommand is the top-level `drive9 pack` entry point.
@@ -103,11 +103,11 @@ func UnpackCommand(args []string) error {
 	return Unpack(NewFromEnv(), args)
 }
 
-// Pack writes a tar.gz snapshot of selected local coding-agent overlay paths
+// Pack writes a tar.gz snapshot of selected local overlay paths
 // to a Drive9 remote file.
 func Pack(c *client.Client, args []string) error {
 	fs := flag.NewFlagSet("pack", flag.ContinueOnError)
-	localRoot := fs.String("local-root", "", "coding-agent local overlay root")
+	localRoot := fs.String("local-root", "", "profile local overlay root")
 	remoteRoot := fs.String("remote-root", "/", "remote root used to resolve relative pack paths")
 	profile := fs.String("profile", "", "profile defaults to use when no paths are provided (coding-agent)")
 	mountTarget := fs.String("mount", "", "mounted path whose drive9 mount metadata provides local-root, remote-root, and profile")
@@ -143,30 +143,49 @@ func Pack(c *client.Client, args []string) error {
 		if strings.TrimSpace(*profile) == "" {
 			*profile = resolved.Profile
 		}
+		profilePackPaths := append([]string(nil), resolved.PackPaths...)
 		localPrefix = filepath.ToSlash(resolved.MountRel)
 		if localPrefix == "." {
 			localPrefix = ""
 		}
+		archiveClient, archivePath, err := clientForPackArchiveArg(c, archiveArg, *remoteRoot, *profile)
+		if err != nil {
+			return err
+		}
+		return packRemoteArchive(context.Background(), archiveClient, archivePath, packOptions{
+			LocalRoot:        *localRoot,
+			RemoteRoot:       *remoteRoot,
+			LocalPrefix:      localPrefix,
+			Profile:          *profile,
+			Paths:            paths,
+			ProfilePackPaths: profilePackPaths,
+		})
 	}
 
+	profileCfg, err := loadProfileConfig(*profile)
+	if err != nil {
+		return err
+	}
+	*profile = profileCfg.Name
 	archiveClient, archivePath, err := clientForPackArchiveArg(c, archiveArg, *remoteRoot, *profile)
 	if err != nil {
 		return err
 	}
 	return packRemoteArchive(context.Background(), archiveClient, archivePath, packOptions{
-		LocalRoot:   *localRoot,
-		RemoteRoot:  *remoteRoot,
-		LocalPrefix: localPrefix,
-		Profile:     *profile,
-		Paths:       paths,
+		LocalRoot:        *localRoot,
+		RemoteRoot:       *remoteRoot,
+		LocalPrefix:      localPrefix,
+		Profile:          *profile,
+		Paths:            paths,
+		ProfilePackPaths: profileCfg.PackPaths,
 	})
 }
 
-// Unpack restores a Drive9 pack archive into a coding-agent local overlay.
+// Unpack restores a Drive9 pack archive into a local overlay.
 func Unpack(c *client.Client, args []string) error {
 	fs := flag.NewFlagSet("unpack", flag.ContinueOnError)
-	localRoot := fs.String("local-root", "", "coding-agent local overlay root")
-	remoteRoot := fs.String("remote-root", "/", "remote root used to resolve the default coding-agent pack archive")
+	localRoot := fs.String("local-root", "", "profile local overlay root")
+	remoteRoot := fs.String("remote-root", "/", "remote root used to resolve the default profile pack archive")
 	profile := fs.String("profile", "", "profile defaults to use when no archive is provided (coding-agent)")
 	mountTarget := fs.String("mount", "", "mounted path whose drive9 mount metadata provides local-root")
 	noReplace := fs.Bool("no-replace", false, "do not remove archived root paths before extracting")
@@ -291,7 +310,7 @@ func unpackRemoteArchive(ctx context.Context, c *client.Client, archivePath stri
 }
 
 func readExistingPackReplacePaths(ctx context.Context, c *client.Client, archivePath string, opts packOptions) ([]string, error) {
-	if len(opts.Paths) != 0 || strings.TrimSpace(opts.Profile) != "coding-agent" {
+	if strings.TrimSpace(opts.Profile) == noneMountProfile || len(opts.ProfilePackPaths) == 0 {
 		return nil, nil
 	}
 	rc, err := c.ReadStream(ctx, archivePath)
@@ -353,6 +372,9 @@ func writePackArchive(ctx context.Context, w io.Writer, opts packOptions) (*pack
 	}
 	if !filepath.IsAbs(opts.LocalRoot) {
 		return nil, fmt.Errorf("drive9 pack: --local-root must be an absolute path")
+	}
+	if len(opts.Paths) == 0 && len(opts.ProfilePackPaths) == 0 {
+		return nil, fmt.Errorf("drive9 pack: path arguments are required unless the profile config has [pack] paths")
 	}
 	remoteRoot, err := mountpath.NormalizeRoot(strings.TrimSpace(opts.RemoteRoot))
 	if err != nil {
@@ -523,14 +545,27 @@ func writePackItem(tw *tar.Writer, item packItem) error {
 }
 
 func resolvePackSources(opts packOptions) ([]packSource, error) {
-	if len(opts.Paths) == 0 {
-		if opts.Profile != "coding-agent" {
-			return nil, fmt.Errorf("drive9 pack: path arguments are required unless --profile=coding-agent is set")
+	var out []packSource
+	if len(opts.ProfilePackPaths) > 0 {
+		sources, err := resolveProfilePackSources(opts)
+		if err != nil {
+			return nil, err
 		}
-		return discoverCodingAgentPackSources(opts.LocalRoot, opts.RemoteRoot, opts.LocalPrefix)
+		out = append(out, sources...)
 	}
+	if len(opts.Paths) > 0 {
+		sources, err := resolveExplicitPackSources(opts, opts.Paths, false)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sources...)
+	}
+	return normalizePackSources(out), nil
+}
+
+func resolveExplicitPackSources(opts packOptions, paths []string, skipMissing bool) ([]packSource, error) {
 	out := make([]packSource, 0, len(opts.Paths))
-	for _, raw := range opts.Paths {
+	for _, raw := range paths {
 		archivePath, remotePath, err := resolvePackPath(opts.RemoteRoot, opts.LocalPrefix, raw)
 		if err != nil {
 			return nil, err
@@ -540,7 +575,7 @@ func resolvePackSources(opts packOptions) ([]packSource, error) {
 			return nil, err
 		}
 		if _, err := os.Lstat(localPath); err != nil {
-			if opts.SkipMissing && errors.Is(err, os.ErrNotExist) {
+			if (opts.SkipMissing || skipMissing) && errors.Is(err, os.ErrNotExist) {
 				continue
 			}
 			return nil, fmt.Errorf("stat pack path %s (%s): %w", remotePath, localPath, err)
@@ -550,7 +585,60 @@ func resolvePackSources(opts packOptions) ([]packSource, error) {
 	return normalizePackSources(out), nil
 }
 
-func discoverCodingAgentPackSources(localRoot, remoteRoot string, localPrefix string) ([]packSource, error) {
+func resolveProfilePackSources(opts packOptions) ([]packSource, error) {
+	if len(opts.ProfilePackPaths) == 0 {
+		return nil, nil
+	}
+	names, explicit := splitProfilePackPaths(opts.ProfilePackPaths)
+	var out []packSource
+	if len(names) > 0 {
+		sources, err := discoverNamedPackSources(opts.LocalRoot, opts.RemoteRoot, opts.LocalPrefix, names)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sources...)
+	}
+	if len(explicit) > 0 {
+		sources, err := resolveExplicitPackSources(opts, explicit, true)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sources...)
+	}
+	return normalizePackSources(out), nil
+}
+
+func splitProfilePackPaths(paths []string) (names []string, explicit []string) {
+	seenNames := map[string]struct{}{}
+	for _, raw := range paths {
+		if name, ok := profilePackRootName(raw); ok {
+			if _, seen := seenNames[name]; !seen {
+				seenNames[name] = struct{}{}
+				names = append(names, name)
+			}
+			continue
+		}
+		if strings.TrimSpace(raw) != "" {
+			explicit = append(explicit, raw)
+		}
+	}
+	sort.Strings(names)
+	return names, explicit
+}
+
+func profilePackRootName(raw string) (string, bool) {
+	value := strings.TrimSpace(raw)
+	value = strings.TrimSuffix(value, "/")
+	if value == "" || value == "." || value == ".." {
+		return "", false
+	}
+	if strings.ContainsAny(value, `/\*?[`) {
+		return "", false
+	}
+	return value, true
+}
+
+func discoverNamedPackSources(localRoot, remoteRoot string, localPrefix string, packNames []string) ([]packSource, error) {
 	prefixPath, err := canonicalArchivePath(localPrefix)
 	if err != nil {
 		return nil, err
@@ -566,7 +654,7 @@ func discoverCodingAgentPackSources(localRoot, remoteRoot string, localPrefix st
 		return nil, fmt.Errorf("stat profile pack root %s: %w", root, err)
 	}
 	names := map[string]struct{}{}
-	for _, name := range defaultCodingAgentPackNames {
+	for _, name := range packNames {
 		names[name] = struct{}{}
 	}
 	var out []packSource
@@ -592,7 +680,7 @@ func discoverCodingAgentPackSources(localRoot, remoteRoot string, localPrefix st
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("discover coding-agent pack paths: %w", err)
+		return nil, fmt.Errorf("discover profile pack paths: %w", err)
 	}
 	return normalizePackSources(out), nil
 }
@@ -725,9 +813,11 @@ func packSourcePaths(sources []packSource) []string {
 }
 
 func packReplacePaths(opts packOptions, paths []string) []string {
-	if len(opts.Paths) != 0 || strings.TrimSpace(opts.Profile) != "coding-agent" {
+	if strings.TrimSpace(opts.Profile) == noneMountProfile {
 		return nil
 	}
+	packNames, explicitPaths := splitProfilePackPaths(opts.ProfilePackPaths)
+	explicitPaths = append(explicitPaths, opts.Paths...)
 	parents := map[string]struct{}{}
 	for _, archivePath := range paths {
 		parents[path.Dir(archivePath)] = struct{}{}
@@ -739,7 +829,7 @@ func packReplacePaths(opts packOptions, paths []string) []string {
 		}
 	}
 	seen := map[string]struct{}{}
-	out := make([]string, 0, len(opts.PreviousReplacePaths)+len(parents)*len(defaultCodingAgentPackNames))
+	out := make([]string, 0, len(opts.PreviousReplacePaths)+len(explicitPaths)+len(parents)*len(packNames))
 	for _, archivePath := range opts.PreviousReplacePaths {
 		archivePath, err := canonicalArchivePath(archivePath)
 		if err != nil || archivePath == "/" {
@@ -751,8 +841,19 @@ func packReplacePaths(opts packOptions, paths []string) []string {
 		seen[archivePath] = struct{}{}
 		out = append(out, archivePath)
 	}
+	for _, raw := range explicitPaths {
+		archivePath, _, err := resolvePackPath(opts.RemoteRoot, opts.LocalPrefix, raw)
+		if err != nil || archivePath == "/" {
+			continue
+		}
+		if _, ok := seen[archivePath]; ok {
+			continue
+		}
+		seen[archivePath] = struct{}{}
+		out = append(out, archivePath)
+	}
 	for parent := range parents {
-		for _, name := range defaultCodingAgentPackNames {
+		for _, name := range packNames {
 			archivePath := path.Join(parent, name)
 			if !strings.HasPrefix(archivePath, "/") {
 				archivePath = "/" + archivePath
@@ -1226,17 +1327,17 @@ func clientForPackArchiveArg(defaultClient *client.Client, raw string, remoteRoo
 	if strings.TrimSpace(raw) != "" {
 		return clientForRemoteArchiveArg(defaultClient, raw)
 	}
-	if profile != "coding-agent" {
-		return nil, "", fmt.Errorf("default pack archive requires --profile=coding-agent or an explicit remote archive path")
+	if strings.TrimSpace(profile) == noneMountProfile {
+		return nil, "", fmt.Errorf("default pack archive requires an overlay profile or an explicit remote archive path")
 	}
-	archivePath, err := defaultCodingAgentPackArchivePath(remoteRoot)
+	archivePath, err := defaultPackArchivePath(remoteRoot)
 	if err != nil {
 		return nil, "", err
 	}
 	return defaultClient, archivePath, nil
 }
 
-func defaultCodingAgentPackArchivePath(remoteRoot string) (string, error) {
+func defaultPackArchivePath(remoteRoot string) (string, error) {
 	remoteRoot, err := mountpath.NormalizeRoot(strings.TrimSpace(remoteRoot))
 	if err != nil {
 		return "", fmt.Errorf("drive9 pack: %w", err)
@@ -1248,7 +1349,7 @@ func defaultCodingAgentPackArchivePath(remoteRoot string) (string, error) {
 		label = "root"
 	}
 	label = safePackArchiveLabel(label)
-	return fmt.Sprintf("%s/%s-%s.tar.gz", codingAgentPackRoot, label, hash), nil
+	return fmt.Sprintf("%s/%s-%s.tar.gz", defaultPackRoot, label, hash), nil
 }
 
 func safePackArchiveLabel(label string) string {
@@ -1284,7 +1385,7 @@ func resolveMountedPackTarget(target string) (mountedPackTarget, error) {
 		state, _, err := mountstate.ReadProcessState(candidate)
 		if err == nil {
 			if strings.TrimSpace(state.LocalRoot) == "" {
-				return mountedPackTarget{}, fmt.Errorf("drive9 mount metadata for %q does not include local_root; remount with --profile=coding-agent --local-root", candidate)
+				return mountedPackTarget{}, fmt.Errorf("drive9 mount metadata for %q does not include local_root; remount with an overlay profile", candidate)
 			}
 			if strings.TrimSpace(state.RemoteRoot) == "" {
 				return mountedPackTarget{}, fmt.Errorf("drive9 mount metadata for %q does not include remote_root; remount with a newer drive9 CLI", candidate)
@@ -1312,6 +1413,7 @@ func resolveMountedPackTarget(target string) (mountedPackTarget, error) {
 				RemoteRoot: remoteRoot,
 				Profile:    state.Profile,
 				LocalRoot:  state.LocalRoot,
+				PackPaths:  append([]string(nil), state.PackPaths...),
 			}, nil
 		}
 		if !errors.Is(err, os.ErrNotExist) {

@@ -14,6 +14,7 @@
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	journal append-only agent/workflow journal operations
 //	git     git-aware drive9 workflows
+//	profile show mount profile configuration
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
 //	doctor  diagnose local drive9 runtime prerequisites
@@ -49,6 +50,7 @@ var journalHandler = cli.Journal
 var gitHandler = cli.Git
 var packHandler = cli.PackCommand
 var unpackHandler = cli.UnpackCommand
+var profileHandler = cli.Profile
 
 func main() {
 	if logger.CLIEnabled() {
@@ -189,6 +191,17 @@ func dispatch(cmd string, args []string) {
 		}
 		if err := unpackHandler(args); err != nil {
 			fatal("unpack", err)
+		}
+	case "profile":
+		if cliLogger != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = args[0]
+			}
+			logger.Info(context.Background(), "cli_command", zap.String("command", "profile"), zap.String("subcommand", sub))
+		}
+		if err := profileHandler(args); err != nil {
+			fatal("profile", err)
 		}
 	case "mount":
 		if cliLogger != nil {
@@ -352,6 +365,8 @@ func usage(code int) {
 			"                         archive coding-agent local overlay paths to drive9/S3\n"+
 			"  unpack [flags] [archive]\n"+
 			"                         restore a drive9 pack archive to a local overlay\n"+
+			"  profile show [profile]\n"+
+			"                         print mount profile configuration\n"+
 			"  mount [flags] [:/remote] <mountpoint>\n"+
 			"                         mount drive9 filesystem\n"+
 			"  mount vault [flags] <mountpoint>\n"+

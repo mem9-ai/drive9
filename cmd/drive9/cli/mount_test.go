@@ -1105,7 +1105,7 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 		"--profile", "coding-agent",
 		"--local-root", " " + localRoot + " ",
 		"--no-auto-unpack",
-		"--local-only", "**/node_modules/**",
+		"--local-only", "**/.custom-cache/**",
 		"--remote-only", "**/node_modules/keep/**",
 		t.TempDir(),
 	})
@@ -1121,20 +1121,24 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 	if got.LocalRoot != localRoot {
 		t.Fatalf("LocalRoot = %q, want %q", got.LocalRoot, localRoot)
 	}
-	if !reflect.DeepEqual(got.LocalOnlyPatterns, []string{"**/node_modules/**"}) {
-		t.Fatalf("LocalOnlyPatterns = %v", got.LocalOnlyPatterns)
+	wantLocalOnly := append(builtinCodingAgentLocalOnlyPatterns(), "**/.custom-cache/**")
+	if !reflect.DeepEqual(got.LocalOnlyPatterns, wantLocalOnly) {
+		t.Fatalf("LocalOnlyPatterns = %v, want %v", got.LocalOnlyPatterns, wantLocalOnly)
 	}
 	if !reflect.DeepEqual(got.RemoteOnlyPatterns, []string{"**/node_modules/keep/**"}) {
 		t.Fatalf("RemoteOnlyPatterns = %v", got.RemoteOnlyPatterns)
 	}
 }
 
-func TestMountCmdCodingAgentProfileRequiresLocalRoot(t *testing.T) {
+func TestMountCmdCodingAgentProfileGeneratesDefaultLocalRoot(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
+	t.Setenv("HOME", t.TempDir())
+	var got *mountFuseOptions
 	mountFuse = func(opts *mountFuseOptions) error {
-		t.Fatal("mountFuse should not be called")
+		copied := *opts
+		got = &copied
 		return nil
 	}
 
@@ -1145,21 +1149,35 @@ func TestMountCmdCodingAgentProfileRequiresLocalRoot(t *testing.T) {
 		"--profile", "coding-agent",
 		t.TempDir(),
 	})
-	if err == nil || !strings.Contains(err.Error(), "requires --local-root") {
-		t.Fatalf("error = %v, want missing local-root validation error", err)
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	want, err := defaultMountLocalRoot("https://drive9.example", "/", mountCredentialCacheKey("sk-test", ""))
+	if err != nil {
+		t.Fatalf("defaultMountLocalRoot: %v", err)
+	}
+	if got.LocalRoot != want {
+		t.Fatalf("LocalRoot = %q, want default %q", got.LocalRoot, want)
+	}
+	if strings.Contains(got.LocalRoot, "coding-agent") {
+		t.Fatalf("LocalRoot = %q, should not include profile name", got.LocalRoot)
 	}
 }
 
-func TestMountCmdLocalPolicyFlagsRequireCodingAgentProfile(t *testing.T) {
+func TestMountCmdLocalPolicyFlagsRequireOverlayProfile(t *testing.T) {
 	err := MountCmd([]string{
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
+		"--profile", "none",
 		"--local-only", "**/.git/**",
 		t.TempDir(),
 	})
-	if err == nil || !strings.Contains(err.Error(), "--profile=coding-agent") {
-		t.Fatalf("error = %v, want coding-agent profile validation error", err)
+	if err == nil || !strings.Contains(err.Error(), "overlay profile") {
+		t.Fatalf("error = %v, want overlay profile validation error", err)
 	}
 }
 

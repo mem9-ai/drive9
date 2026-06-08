@@ -35,10 +35,11 @@ func TestPackArchiveRoundTripCodingAgentDefaults(t *testing.T) {
 
 	var buf bytes.Buffer
 	manifest, err := writePackArchive(context.Background(), &buf, packOptions{
-		LocalRoot:   srcLocalRoot,
-		RemoteRoot:  "/remote/root",
-		LocalPrefix: "repo",
-		Profile:     "coding-agent",
+		LocalRoot:        srcLocalRoot,
+		RemoteRoot:       "/remote/root",
+		LocalPrefix:      "repo",
+		Profile:          "coding-agent",
+		ProfilePackPaths: []string{".git", "dist", "build", "target"},
 	})
 	if err != nil {
 		t.Fatalf("writePackArchive: %v", err)
@@ -85,10 +86,11 @@ func TestPackArchiveDefaultReplacePathsRemoveMissingSiblings(t *testing.T) {
 
 	var buf bytes.Buffer
 	manifest, err := writePackArchive(context.Background(), &buf, packOptions{
-		LocalRoot:   srcLocalRoot,
-		RemoteRoot:  "/remote/root",
-		LocalPrefix: "repo",
-		Profile:     "coding-agent",
+		LocalRoot:        srcLocalRoot,
+		RemoteRoot:       "/remote/root",
+		LocalPrefix:      "repo",
+		Profile:          "coding-agent",
+		ProfilePackPaths: []string{".git", "dist", "build", "target"},
 	})
 	if err != nil {
 		t.Fatalf("writePackArchive: %v", err)
@@ -112,11 +114,23 @@ func TestPackArchiveDefaultReplacePathsRemoveMissingSiblings(t *testing.T) {
 	}
 }
 
+func TestPackArchiveRequiresPathsWhenProfileHasNoPackPaths(t *testing.T) {
+	var buf bytes.Buffer
+	_, err := writePackArchive(context.Background(), &buf, packOptions{
+		LocalRoot:  t.TempDir(),
+		RemoteRoot: "/remote/root",
+		Profile:    "coding-agent",
+	})
+	if err == nil || !strings.Contains(err.Error(), "[pack] paths") {
+		t.Fatalf("writePackArchive error = %v, want missing pack paths error", err)
+	}
+}
+
 func TestPackRemoteArchivePreservesReplacePathsWhenDefaultRootsAllDeleted(t *testing.T) {
 	remoteRoot := "/workspace"
-	defaultArchive, err := defaultCodingAgentPackArchivePath(remoteRoot)
+	defaultArchive, err := defaultPackArchivePath(remoteRoot)
 	if err != nil {
-		t.Fatalf("defaultCodingAgentPackArchivePath: %v", err)
+		t.Fatalf("defaultPackArchivePath: %v", err)
 	}
 
 	var stored []byte
@@ -148,9 +162,10 @@ func TestPackRemoteArchivePreservesReplacePathsWhenDefaultRootsAllDeleted(t *tes
 	archiveA := t.TempDir()
 	mustWriteFile(t, filepath.Join(archiveA, "overlay", "repo", ".git", "config"), []byte("git\n"), 0o644)
 	if err := packRemoteArchive(context.Background(), c, defaultArchive, packOptions{
-		LocalRoot:  archiveA,
-		RemoteRoot: remoteRoot,
-		Profile:    "coding-agent",
+		LocalRoot:        archiveA,
+		RemoteRoot:       remoteRoot,
+		Profile:          "coding-agent",
+		ProfilePackPaths: []string{".git", "dist", "build", "target"},
 	}); err != nil {
 		t.Fatalf("pack archive A: %v", err)
 	}
@@ -158,9 +173,10 @@ func TestPackRemoteArchivePreservesReplacePathsWhenDefaultRootsAllDeleted(t *tes
 	archiveB := t.TempDir()
 	mustWriteFile(t, filepath.Join(archiveB, "overlay", "repo", "src", "main.go"), []byte("package main\n"), 0o644)
 	if err := packRemoteArchive(context.Background(), c, defaultArchive, packOptions{
-		LocalRoot:  archiveB,
-		RemoteRoot: remoteRoot,
-		Profile:    "coding-agent",
+		LocalRoot:        archiveB,
+		RemoteRoot:       remoteRoot,
+		Profile:          "coding-agent",
+		ProfilePackPaths: []string{".git", "dist", "build", "target"},
 	}); err != nil {
 		t.Fatalf("pack archive B: %v", err)
 	}
@@ -473,13 +489,16 @@ func TestPackRemoteArchiveUploadsPackFile(t *testing.T) {
 	assertFileContent(t, filepath.Join(dstLocalRoot, "overlay", "repo", "dist", "app.js"), "bundle\n")
 }
 
-func TestDefaultCodingAgentPackArchivePath(t *testing.T) {
-	got, err := defaultCodingAgentPackArchivePath("/remote/root")
+func TestDefaultPackArchivePath(t *testing.T) {
+	got, err := defaultPackArchivePath("/remote/root")
 	if err != nil {
-		t.Fatalf("defaultCodingAgentPackArchivePath: %v", err)
+		t.Fatalf("defaultPackArchivePath: %v", err)
 	}
-	if !strings.HasPrefix(got, codingAgentPackRoot+"/root-") || !strings.HasSuffix(got, ".tar.gz") {
-		t.Fatalf("default archive path = %q, want coding-agent hidden pack path", got)
+	if !strings.HasPrefix(got, defaultPackRoot+"/root-") || !strings.HasSuffix(got, ".tar.gz") {
+		t.Fatalf("default archive path = %q, want hidden pack path", got)
+	}
+	if strings.Contains(got, "coding-agent") {
+		t.Fatalf("default archive path = %q, should not include profile name", got)
 	}
 }
 
@@ -490,6 +509,7 @@ func TestRunUmountPacksAfterUnmount(t *testing.T) {
 		RemoteRoot: "/remote",
 		Profile:    "coding-agent",
 		LocalRoot:  filepath.Join(t.TempDir(), "local"),
+		PackPaths:  []string{".git"},
 	}
 	var calls []string
 	var gotPaths []string
@@ -523,7 +543,7 @@ func TestRunUmountPacksAfterUnmount(t *testing.T) {
 			if !reflect.DeepEqual(gotState, state) {
 				t.Fatalf("pack state = %#v, want %#v", gotState, state)
 			}
-			defaultArchive, err := defaultCodingAgentPackArchivePath(state.RemoteRoot)
+			defaultArchive, err := defaultPackArchivePath(state.RemoteRoot)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -556,6 +576,7 @@ func TestRunUmountAutoPacksCodingAgentMount(t *testing.T) {
 		RemoteRoot: "/remote",
 		Profile:    "coding-agent",
 		LocalRoot:  filepath.Join(t.TempDir(), "local"),
+		PackPaths:  []string{".git"},
 	}
 	var gotArchives []string
 	deps := umountDeps{
@@ -583,12 +604,48 @@ func TestRunUmountAutoPacksCodingAgentMount(t *testing.T) {
 	if err := runUmount([]string{"/mnt/drive9"}, deps); err != nil {
 		t.Fatalf("runUmount: %v", err)
 	}
-	defaultArchive, err := defaultCodingAgentPackArchivePath(state.RemoteRoot)
+	defaultArchive, err := defaultPackArchivePath(state.RemoteRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(gotArchives, []string{":" + defaultArchive}) {
 		t.Fatalf("archives = %v, want default archive", gotArchives)
+	}
+}
+
+func TestRunUmountDoesNotAutoPackWhenProfileHasNoPackPaths(t *testing.T) {
+	state := mountstate.ProcessState{
+		PID:        1234,
+		MountPoint: "/mnt/drive9",
+		RemoteRoot: "/remote",
+		Profile:    "coding-agent",
+		LocalRoot:  filepath.Join(t.TempDir(), "local"),
+	}
+	packCalled := false
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run:      func(argv []string) error { return nil },
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return state, "/tmp/drive9.pid", nil
+		},
+		readPID: func(string) (int, string, error) {
+			return state.PID, "/tmp/drive9.pid", nil
+		},
+		pidAlive: func(int) bool { return false },
+		packAfterUnmount: func(context.Context, mountstate.ProcessState, []string, []string) error {
+			packCalled = true
+			return nil
+		},
+		now:       time.Now,
+		sleep:     func(time.Duration) {},
+		printErrf: func(string, ...any) {},
+	}
+	if err := runUmount([]string{"/mnt/drive9"}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	if packCalled {
+		t.Fatal("packAfterUnmount was called for a profile with no pack paths")
 	}
 }
 
@@ -661,6 +718,7 @@ func TestMountCmdUnpacksBeforeFuseMount(t *testing.T) {
 func TestMountCmdAutoUnpacksCodingAgentPackBeforeFuseMount(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
+	writeTestProfile(t, "with-pack", "[pack]\n.git\n")
 
 	srcLocalRoot := t.TempDir()
 	mustWriteFile(t, filepath.Join(srcLocalRoot, "overlay", "repo", ".git", "config"), []byte("auto-restored\n"), 0o644)
@@ -672,7 +730,7 @@ func TestMountCmdAutoUnpacksCodingAgentPackBeforeFuseMount(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("writePackArchive: %v", err)
 	}
-	defaultArchive, err := defaultCodingAgentPackArchivePath("/remote")
+	defaultArchive, err := defaultPackArchivePath("/remote")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -694,7 +752,7 @@ func TestMountCmdAutoUnpacksCodingAgentPackBeforeFuseMount(t *testing.T) {
 		"--mode", "fuse",
 		"--server", srv.URL,
 		"--api-key", "sk-test",
-		"--profile", "coding-agent",
+		"--profile", "with-pack",
 		"--local-root", localRoot,
 		":/remote",
 		t.TempDir(),
@@ -702,6 +760,20 @@ func TestMountCmdAutoUnpacksCodingAgentPackBeforeFuseMount(t *testing.T) {
 		t.Fatalf("MountCmd: %v", err)
 	}
 	assertFileContent(t, filepath.Join(localRoot, "overlay", "repo", ".git", "config"), "auto-restored\n")
+}
+
+func writeTestProfile(t *testing.T, name string, body string) {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".drive9", "profiles")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%s): %v", dir, err)
+	}
+	path := filepath.Join(dir, name)
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile(%s): %v", path, err)
+	}
 }
 
 func mustWriteFile(t *testing.T, path string, data []byte, mode os.FileMode) {

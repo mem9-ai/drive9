@@ -47,10 +47,11 @@ type MountOptions struct {
 	FlushDebounce          time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
 	SyncMode               SyncMode      // interactive, strict, or auto (default auto)
 	WritePolicy            WritePolicy   // writeback, close-sync, or write-sync (default writeback)
-	Profile                string        // mount profile: "interactive", "coding-agent", "" (default)
-	LocalRoot              string        // local-only overlay root for coding-agent mounts
-	LocalOnlyPatterns      []string      // additional local-only path patterns for coding-agent mounts
-	RemoteOnlyPatterns     []string      // remote-persistent override path patterns for coding-agent mounts
+	Profile                string        // mount profile: "interactive", "coding-agent", "none", or a custom profile name
+	LocalRoot              string        // local-only overlay root for overlay-profile mounts
+	LocalOnlyPatterns      []string      // additional local-only path patterns for overlay-profile mounts
+	RemoteOnlyPatterns     []string      // remote-persistent override path patterns for overlay-profile mounts
+	PackPaths              []string      // local overlay paths auto-packed after unmount
 	UploadConcurrency      int           // number of background upload workers (default 4)
 	ReadConcurrency        int           // maximum concurrent backend reads issued by FUSE (default 24)
 	SyncRead               bool          // disable kernel async read dispatch; at most one read in flight per file handle
@@ -382,6 +383,7 @@ func Mount(opts *MountOptions) error {
 		Profile:        opts.Profile,
 		LocalRoot:      opts.LocalRoot,
 		Server:         opts.Server,
+		PackPaths:      append([]string(nil), opts.PackPaths...),
 		CredentialKind: credentialKind,
 		APIKey:         opts.APIKey,
 		Token:          opts.Token,
@@ -528,15 +530,15 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	if opts.EnableGitWorkspaces && opts.LocalRoot == "" {
 		return fmt.Errorf("mount: EnableGitWorkspaces requires LocalRoot")
 	}
-	hasLocalPolicy := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0
-	if opts.Profile != MountProfileCodingAgent {
-		if hasLocalPolicy {
-			return fmt.Errorf("mount: local policy options require profile %q", MountProfileCodingAgent)
+	hasOverlayOptions := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0 || len(opts.PackPaths) > 0
+	if !profileAllowsLocalPolicy(opts.Profile) {
+		if hasOverlayOptions {
+			return fmt.Errorf("mount: overlay options require an overlay profile")
 		}
 		return nil
 	}
 	if opts.LocalRoot == "" {
-		return fmt.Errorf("mount: profile %q requires LocalRoot", MountProfileCodingAgent)
+		return fmt.Errorf("mount: profile %q requires LocalRoot", opts.Profile)
 	}
 	if !filepath.IsAbs(opts.LocalRoot) {
 		return fmt.Errorf("mount: LocalRoot must be an absolute path")

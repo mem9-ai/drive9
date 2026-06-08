@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -108,14 +110,14 @@ func fsMountCmd(args []string) error {
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	trustProcessLocalEvents := fs.Bool("trust-process-local-events", false, "allow revision-bound GetAttr dir-cache hits using process-local SSE freshness; only safe for single-server/sticky routing or cluster-wide event streams")
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
-	profile := fs.String("profile", "", "mount profile: interactive, coding-agent (empty for default)")
-	localRoot := fs.String("local-root", "", "local-only overlay storage root for --profile=coding-agent")
+	profile := fs.String("profile", "", "mount profile: coding-agent (default), none, interactive, or a ~/.drive9/profiles/<name> file")
+	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	var localOnlyPatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
 	var unpackArchives stringListFlag
-	noAutoUnpack := fs.Bool("no-auto-unpack", false, "disable automatic coding-agent pack restore before mounting")
-	fs.Var(&localOnlyPatterns, "local-only", "additional local-only path pattern for coding-agent overlay routing (repeatable, e.g. **/node_modules/**)")
-	fs.Var(&remoteOnlyPatterns, "remote-only", "remote-persistent override path pattern for coding-agent overlay routing (repeatable)")
+	noAutoUnpack := fs.Bool("no-auto-unpack", false, "disable automatic profile pack restore before mounting")
+	fs.Var(&localOnlyPatterns, "local-only", "additional local-only path pattern for overlay routing (repeatable, e.g. **/node_modules/**)")
+	fs.Var(&remoteOnlyPatterns, "remote-only", "remote-persistent override path pattern for overlay routing (repeatable)")
 	fs.Var(&unpackArchives, "unpack", "restore a drive9 pack archive into --local-root before mounting (repeatable)")
 	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
@@ -179,10 +181,25 @@ func fsMountCmd(args []string) error {
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
 	}
-	normalizedLocalRoot := strings.TrimSpace(*localRoot)
-	if err := validateMountProfileFlags(*profile, normalizedLocalRoot, localOnlyPatterns, remoteOnlyPatterns); err != nil {
-		return err
+
+	profileGiven := flagProvided(fs, "profile")
+	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
+	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
+	var profileCfg profileConfig
+	if !profileGiven && resolved == MountModeWebDAV {
+		profileCfg = builtinNoneProfile()
+	} else {
+		var err error
+		profileCfg, err = loadProfileConfig(*profile)
+		if err != nil {
+			return err
+		}
 	}
+	*profile = profileCfg.Name
+	effectiveLocalOnlyPatterns := mergeProfileValues(profileCfg.LocalOnlyPatterns, localOnlyPatterns)
+	effectiveRemoteOnlyPatterns := mergeProfileValues(profileCfg.RemoteOnlyPatterns, remoteOnlyPatterns)
+	effectivePackPaths := mergeProfileValues(profileCfg.PackPaths)
+	normalizedLocalRoot := strings.TrimSpace(*localRoot)
 	syncModeVal, writePolicyVal, err := parseFuseDurability(*durability)
 	if err != nil {
 		return err
@@ -210,39 +227,18 @@ func fsMountCmd(args []string) error {
 		return err
 	}
 
-	// Resolve auto mode to a concrete backend.
-	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
-	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
-	if *profile == "coding-agent" && resolved != MountModeFUSE {
-		return fmt.Errorf("drive9 mount: --profile=coding-agent requires --mode=fuse")
+	overlayProfile := profileAllowsOverlay(profileCfg.Name)
+	if overlayProfile && resolved != MountModeFUSE {
+		return fmt.Errorf("drive9 mount: --profile=%s requires --mode=fuse", profileCfg.Name)
 	}
-	if len(unpackArchives) > 0 {
-		if resolved != MountModeFUSE {
-			return fmt.Errorf("drive9 mount: --unpack is only supported with --mode=fuse")
-		}
-		if *profile != "coding-agent" {
-			return fmt.Errorf("drive9 mount: --unpack requires --profile=coding-agent")
-		}
-	}
-
 	if resolved == MountModeWebDAV && *readOnly {
 		return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
 	}
 	if resolved == MountModeWebDAV && trustProcessLocalEventsGiven {
 		return fmt.Errorf("drive9 mount: --trust-process-local-events is only supported with --mode=fuse")
 	}
-	autoUnpack := *profile == "coding-agent" && !*noAutoUnpack
-	if runtime.GOOS == "windows" && resolved == MountModeFUSE && len(unpackArchives) == 0 && !autoUnpack {
-		return mountFuse(&mountFuseOptions{
-			MountPoint:         mountPoint,
-			RemoteRoot:         remoteRoot,
-			Profile:            *profile,
-			LocalRoot:          normalizedLocalRoot,
-			LocalOnlyPatterns:  append([]string(nil), localOnlyPatterns...),
-			RemoteOnlyPatterns: append([]string(nil), remoteOnlyPatterns...),
-			ReadOnly:           *readOnly,
-			Debug:              *debug,
-		})
+	if resolved == MountModeWebDAV && *durability != string(fuseDurabilityAuto) {
+		return fmt.Errorf("--durability is only supported with --mode=fuse; WebDAV mounts always use their native write behavior")
 	}
 
 	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
@@ -252,11 +248,41 @@ func fsMountCmd(args []string) error {
 	*server, *apiKey = serverVal, apiKeyVal
 	token := tokenVal
 
+	if len(unpackArchives) > 0 {
+		if resolved != MountModeFUSE {
+			return fmt.Errorf("drive9 mount: --unpack is only supported with --mode=fuse")
+		}
+		if !overlayProfile {
+			return fmt.Errorf("drive9 mount: --unpack requires an overlay profile")
+		}
+	}
+	if normalizedLocalRoot == "" && overlayProfile && resolved == MountModeFUSE {
+		normalizedLocalRoot, err = defaultMountLocalRoot(*server, remoteRoot, mountCredentialCacheKey(apiKeyVal, tokenVal))
+		if err != nil {
+			return err
+		}
+	}
+	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
+		return err
+	}
+
+	autoUnpack := overlayProfile && len(effectivePackPaths) > 0 && !*noAutoUnpack
+	if runtime.GOOS == "windows" && resolved == MountModeFUSE && len(unpackArchives) == 0 && !autoUnpack {
+		return mountFuse(&mountFuseOptions{
+			MountPoint:         mountPoint,
+			RemoteRoot:         remoteRoot,
+			Profile:            profileCfg.Name,
+			LocalRoot:          normalizedLocalRoot,
+			LocalOnlyPatterns:  append([]string(nil), effectiveLocalOnlyPatterns...),
+			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
+			PackPaths:          append([]string(nil), effectivePackPaths...),
+			ReadOnly:           *readOnly,
+			Debug:              *debug,
+		})
+	}
+
 	// WebDAV path: create client, start local WebDAV server, invoke mount_webdav.
 	if resolved == MountModeWebDAV {
-		if *durability != string(fuseDurabilityAuto) {
-			return fmt.Errorf("--durability is only supported with --mode=fuse; WebDAV mounts always use their native write behavior")
-		}
 		var c *client.Client
 		if token != "" {
 			c = client.NewWithToken(*server, token)
@@ -283,7 +309,7 @@ func fsMountCmd(args []string) error {
 			c = client.New(*server, *apiKey)
 		}
 		if autoUnpack {
-			archivePath, err := defaultCodingAgentPackArchivePath(remoteRoot)
+			archivePath, err := defaultPackArchivePath(remoteRoot)
 			if err != nil {
 				return err
 			}
@@ -312,10 +338,11 @@ func fsMountCmd(args []string) error {
 		return mountFuse(&mountFuseOptions{
 			MountPoint:         mountPoint,
 			RemoteRoot:         remoteRoot,
-			Profile:            *profile,
+			Profile:            profileCfg.Name,
 			LocalRoot:          normalizedLocalRoot,
-			LocalOnlyPatterns:  append([]string(nil), localOnlyPatterns...),
-			RemoteOnlyPatterns: append([]string(nil), remoteOnlyPatterns...),
+			LocalOnlyPatterns:  append([]string(nil), effectiveLocalOnlyPatterns...),
+			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
+			PackPaths:          append([]string(nil), effectivePackPaths...),
 			ReadOnly:           *readOnly,
 			Debug:              *debug,
 		})
@@ -348,10 +375,11 @@ func fsMountCmd(args []string) error {
 		TrustLocalEvents:       *trustProcessLocalEvents,
 		SyncMode:               syncModeVal,
 		WritePolicy:            writePolicyVal,
-		Profile:                *profile,
+		Profile:                profileCfg.Name,
 		LocalRoot:              normalizedLocalRoot,
-		LocalOnlyPatterns:      append([]string(nil), localOnlyPatterns...),
-		RemoteOnlyPatterns:     append([]string(nil), remoteOnlyPatterns...),
+		LocalOnlyPatterns:      append([]string(nil), effectiveLocalOnlyPatterns...),
+		RemoteOnlyPatterns:     append([]string(nil), effectiveRemoteOnlyPatterns...),
+		PackPaths:              append([]string(nil), effectivePackPaths...),
 		UploadConcurrency:      *uploadConcurrency,
 		ReadConcurrency:        *readConcurrency,
 		SyncRead:               *syncRead,
@@ -436,21 +464,19 @@ func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int
 	return nil
 }
 
-func validateMountProfileFlags(profile string, localRoot string, localOnlyPatterns []string, remoteOnlyPatterns []string) error {
-	switch profile {
-	case "", "interactive", "coding-agent":
-	default:
-		return fmt.Errorf("drive9 mount: unknown --profile %q (valid: interactive, coding-agent)", profile)
+func validateMountProfileFlags(profile string, localRoot string, localOnlyPatterns []string, remoteOnlyPatterns []string, packPaths []string) error {
+	if err := validateProfileName(profile); err != nil {
+		return err
 	}
-	hasPolicyFlags := localRoot != "" || len(localOnlyPatterns) > 0 || len(remoteOnlyPatterns) > 0
-	if profile != "coding-agent" {
+	hasPolicyFlags := localRoot != "" || len(localOnlyPatterns) > 0 || len(remoteOnlyPatterns) > 0 || len(packPaths) > 0
+	if !profileAllowsOverlay(profile) {
 		if hasPolicyFlags {
-			return fmt.Errorf("drive9 mount: --local-root, --local-only, and --remote-only require --profile=coding-agent")
+			return fmt.Errorf("drive9 mount: --local-root, --local-only, --remote-only, and pack paths require an overlay profile")
 		}
 		return nil
 	}
 	if strings.TrimSpace(localRoot) == "" {
-		return fmt.Errorf("drive9 mount: --profile=coding-agent requires --local-root")
+		return fmt.Errorf("drive9 mount: --profile=%s requires --local-root", profile)
 	}
 	if !filepath.IsAbs(localRoot) {
 		return fmt.Errorf("drive9 mount: --local-root must be an absolute path")
@@ -459,6 +485,60 @@ func validateMountProfileFlags(profile string, localRoot string, localOnlyPatter
 		return err
 	}
 	return nil
+}
+
+func profileAllowsOverlay(profile string) bool {
+	profile = strings.TrimSpace(profile)
+	return profile != "" && profile != "interactive" && profile != noneMountProfile
+}
+
+func defaultMountLocalRoot(server string, remoteRoot string, credentialKey string) (string, error) {
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheRoot) == "" {
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			if err != nil {
+				return "", fmt.Errorf("drive9 mount: cannot determine cache directory: %w", err)
+			}
+			return "", fmt.Errorf("drive9 mount: cannot determine cache directory: %w", homeErr)
+		}
+		cacheRoot = filepath.Join(home, ".cache")
+	}
+	remoteRoot, err = mountpath.NormalizeRoot(remoteRoot)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(server) + "\n" + remoteRoot + "\n" + credentialKey))
+	hash := hex.EncodeToString(sum[:8])
+	label := safePackArchiveLabel(pathBase(remoteRoot))
+	if label == "" {
+		label = "root"
+	}
+	return filepath.Join(cacheRoot, "drive9", "mounts", label+"-"+hash), nil
+}
+
+func mountCredentialCacheKey(apiKey, token string) string {
+	credential := strings.TrimSpace(apiKey)
+	if credential == "" {
+		credential = strings.TrimSpace(token)
+	}
+	if credential == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(credential))
+	return hex.EncodeToString(sum[:8])
+}
+
+func pathBase(value string) string {
+	value = strings.TrimSuffix(value, "/")
+	if value == "" {
+		return "root"
+	}
+	idx := strings.LastIndex(value, "/")
+	if idx >= 0 {
+		value = value[idx+1:]
+	}
+	return value
 }
 
 func validateMountPolicyPatterns(patternGroups ...[]string) error {
@@ -564,10 +644,10 @@ func defaultUmountDeps() umountDeps {
 func runUmount(args []string, deps umountDeps) error {
 	fs := flag.NewFlagSet("umount", flag.ContinueOnError)
 	waitTimeout := fs.Duration("timeout", 60*time.Second, "time to wait for the drive9 mount process to exit after unmount; 0 disables waiting")
-	noAutoPack := fs.Bool("no-auto-pack", false, "disable automatic coding-agent pack upload after unmount")
+	noAutoPack := fs.Bool("no-auto-pack", false, "disable automatic profile pack upload after unmount")
 	var packArchives stringListFlag
 	var packPaths stringListFlag
-	fs.Var(&packArchives, "pack", "also pack coding-agent local overlay paths to this remote archive after unmount (repeatable)")
+	fs.Var(&packArchives, "pack", "also pack profile local overlay paths to this remote archive after unmount (repeatable)")
 	fs.Var(&packPaths, "pack-path", "local overlay path to include in the automatic/default pack (repeatable; relative paths resolve under the mount remote root)")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: drive9 umount [--timeout duration] [--pack :/archive.tar.gz] [--pack-path path]... [--no-auto-pack] <mountpoint>\n\nflags:\n")
@@ -618,11 +698,11 @@ func runUmount(args []string, deps umountDeps) error {
 				return err
 			}
 		}
-		if !*noAutoPack && packState.Profile == "coding-agent" {
+		if !*noAutoPack && (len(packState.PackPaths) > 0 || len(packPaths) > 0) {
 			if err := validateUmountPackState(packState); err != nil {
 				return err
 			}
-			defaultArchive, err := defaultCodingAgentPackArchivePath(packState.RemoteRoot)
+			defaultArchive, err := defaultPackArchivePath(packState.RemoteRoot)
 			if err != nil {
 				return err
 			}
@@ -630,7 +710,7 @@ func runUmount(args []string, deps umountDeps) error {
 		}
 	}
 	if len(packPaths) > 0 && len(packArchiveArgs) == 0 {
-		return fmt.Errorf("drive9 umount: --pack-path requires a coding-agent auto-pack mount or --pack")
+		return fmt.Errorf("drive9 umount: --pack-path requires an auto-pack mount or --pack")
 	}
 
 	argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
@@ -738,9 +818,6 @@ func runUmount(args []string, deps umountDeps) error {
 }
 
 func validateUmountPackState(state mountstate.ProcessState) error {
-	if state.Profile != "coding-agent" {
-		return fmt.Errorf("drive9 umount: --pack requires a --profile=coding-agent mount")
-	}
 	if strings.TrimSpace(state.LocalRoot) == "" {
 		return fmt.Errorf("drive9 umount: --pack requires mount metadata with local_root")
 	}
@@ -783,10 +860,11 @@ func defaultPackAfterUnmount(ctx context.Context, state mountstate.ProcessState,
 	c.Warm(warmCtx)
 	cancel()
 	opts := packOptions{
-		LocalRoot:  state.LocalRoot,
-		RemoteRoot: state.RemoteRoot,
-		Profile:    state.Profile,
-		Paths:      append([]string(nil), paths...),
+		LocalRoot:        state.LocalRoot,
+		RemoteRoot:       state.RemoteRoot,
+		Profile:          state.Profile,
+		Paths:            append([]string(nil), paths...),
+		ProfilePackPaths: append([]string(nil), state.PackPaths...),
 	}
 	for _, archiveArg := range archives {
 		archiveClient, archivePath, err := clientForRemoteArchiveArg(c, archiveArg)
