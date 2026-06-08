@@ -387,7 +387,9 @@ func TestFlushHandlePatchAfterLazyTruncatePreservesRemotePrefix(t *testing.T) {
 		OrigSize: origSize,
 		BaseRev:  baseRev,
 	}
+	fh.Lock()
 	fs.rebindCleanWriteBufferToRemoteLocked(fh, origSize)
+	fh.Unlock()
 
 	fh.Lock()
 	if err := fs.truncateWritableHandleLocked(fh, newSize); err != nil {
@@ -5647,11 +5649,19 @@ func TestOpenReadOnlyPendingShadowUsesDirectIO(t *testing.T) {
 	}
 	defer shadow.Close()
 	fs.shadowStore = shadow
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.pendingIndex = pending
 
 	path := "/handles/open-renamed.txt"
 	data := []byte("pending shadow bytes")
 	if err := shadow.WriteFull(path, data, 0); err != nil {
 		t.Fatalf("WriteFull: %v", err)
+	}
+	if _, err := pending.PutWithBaseRev(path, int64(len(data)), PendingOverwrite, 0); err != nil {
+		t.Fatalf("PutWithBaseRev: %v", err)
 	}
 	ino := fs.inodes.Lookup(path, false, int64(len(data)), time.Now())
 
@@ -6102,6 +6112,7 @@ func TestSQLiteWALIndexSidecarUsesTransientLocalOverlay(t *testing.T) {
 	if err := fs.transientLocalOverlay.EnsureRoot(); err != nil {
 		t.Fatalf("EnsureRoot transient overlay: %v", err)
 	}
+	fs.openHandles.Add(&FileHandle{Path: "/repo/workload.db"})
 
 	ctx := context.Background()
 	if overlay, local, st := fs.localOverlayForPath(ctx, "/repo/workload.db-shm"); !local || st != gofuse.OK || overlay != fs.transientLocalOverlay {
@@ -6199,6 +6210,7 @@ func TestSQLiteWALIndexSidecarFailsClosedWhenTransientOverlayMissing(t *testing.
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.openHandles.Add(&FileHandle{Path: "/repo/workload.db"})
 
 	overlay, local, st := fs.localOverlayForPath(context.Background(), "/repo/workload.db-shm")
 	if overlay != nil || !local || st != gofuse.EIO {
@@ -7343,6 +7355,9 @@ func TestOpenWritablePreloadSkipsCleanSiblingReboundToNewRevision(t *testing.T) 
 	if sibling.BaseRev != 2 {
 		t.Fatalf("sibling BaseRev = %d, want 2", sibling.BaseRev)
 	}
+	if sibling.OrigSize != committedSize {
+		t.Fatalf("sibling OrigSize = %d, want %d", sibling.OrigSize, committedSize)
+	}
 	target := &FileHandle{
 		Ino:     ino,
 		Path:    filePath,
@@ -7354,6 +7369,68 @@ func TestOpenWritablePreloadSkipsCleanSiblingReboundToNewRevision(t *testing.T) 
 	}
 	if got := target.Dirty.Size(); got != 0 {
 		t.Fatalf("target dirty size = %d, want 0", got)
+	}
+}
+
+func TestReadCleanWritableHandleRefreshesSkippedCommittedRevision(t *testing.T) {
+	stale := []byte("sqlite db before checkpoint")
+	fresh := []byte("sqlite db after checkpoint with event rows")
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(fresh)), func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fresh)
+			return
+		}
+		start, end, ok := parseTestBytesRange(r.Header.Get("Range"))
+		if !ok {
+			t.Errorf("Range = %q, want bytes range", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if start < 0 || end >= int64(len(fresh)) {
+			t.Errorf("Range = %q outside fresh object", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(fresh[start : end+1])
+	})
+	defer cleanup()
+
+	const filePath = "/file.bin"
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: int64(len(stale)),
+		BaseRev:  1,
+	}
+	if _, err := fh.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fhID := fs.allocateFileHandle(fh)
+
+	fs.inodes.UpdateSize(ino, int64(len(fresh)))
+	fs.recordCommittedRevision(filePath, 2)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fhID, 0, len(fresh))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, fresh) {
+		t.Fatalf("Read returned stale clean buffer: got %q want %q", got, fresh)
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if fh.BaseRev != 2 {
+		t.Fatalf("fh.BaseRev = %d, want 2", fh.BaseRev)
+	}
+	if fh.OrigSize != int64(len(fresh)) {
+		t.Fatalf("fh.OrigSize = %d, want %d", fh.OrigSize, len(fresh))
 	}
 }
 
@@ -13646,6 +13723,57 @@ func TestReadStreamRangeWithRetryRefreshesExpiredReadTarget(t *testing.T) {
 	}
 	if fh.ReadTarget == nil || !strings.Contains(fh.ReadTarget.ObjectURL, "/s3/fresh") {
 		t.Fatalf("read target = %+v, want fresh target", fh.ReadTarget)
+	}
+}
+
+func TestReadOpenHandleSnapshotRetriesTransientRangeRead(t *testing.T) {
+	var objectCalls atomic.Int32
+	data := []byte("snapshot bytes after retry")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/fs/snapshot.bin":
+			w.Header().Set("Location", fmt.Sprintf("http://%s/s3/snapshot", r.Host))
+			w.WriteHeader(http.StatusFound)
+		case "/s3/snapshot":
+			call := objectCalls.Add(1)
+			if call == 1 {
+				w.Header().Set("Content-Length", "1048576")
+				w.WriteHeader(http.StatusOK)
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				<-r.Context().Done()
+				return
+			}
+			if got := r.Header.Get("Range"); got != fmt.Sprintf("bytes=0-%d", len(data)-1) {
+				t.Errorf("Range = %q, want full snapshot range", got)
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(data)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	got, err := fs.readOpenHandleSnapshot(ctx, "/snapshot.bin", int64(len(data)))
+	if err != nil {
+		t.Fatalf("readOpenHandleSnapshot: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("snapshot = %q, want %q", got, data)
+	}
+	if objectCalls.Load() != 2 {
+		t.Fatalf("object calls = %d, want 2", objectCalls.Load())
 	}
 }
 
