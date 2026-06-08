@@ -98,7 +98,13 @@ func WorkspaceDeletedMarkerPath(localRoot, workspaceID string) string {
 }
 
 // MarkWorkspaceDeleted records that a workspace was deleted in this local root.
-func MarkWorkspaceDeleted(localRoot, workspaceID string) error {
+func MarkWorkspaceDeleted(ctx context.Context, localRoot, workspaceID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	localRoot = strings.TrimSpace(localRoot)
 	workspaceID = strings.TrimSpace(workspaceID)
 	if localRoot == "" || workspaceID == "" {
@@ -106,13 +112,45 @@ func MarkWorkspaceDeleted(localRoot, workspaceID string) error {
 	}
 	marker := WorkspaceDeletedMarkerPath(localRoot, workspaceID)
 	if err := os.MkdirAll(filepath.Dir(marker), 0o755); err != nil {
+		return fmt.Errorf("create workspace deleted marker dir %q: %w", filepath.Dir(marker), err)
+	}
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return os.WriteFile(marker, []byte("deleted\n"), 0o644)
+	if err := os.WriteFile(marker, []byte("deleted\n"), 0o644); err != nil {
+		return fmt.Errorf("write workspace deleted marker %q: %w", marker, err)
+	}
+	return nil
+}
+
+// ClearWorkspaceDeleted removes a local deletion marker when a workspace ID is reused.
+func ClearWorkspaceDeleted(ctx context.Context, localRoot, workspaceID string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	localRoot = strings.TrimSpace(localRoot)
+	workspaceID = strings.TrimSpace(workspaceID)
+	if localRoot == "" || workspaceID == "" {
+		return nil
+	}
+	marker := WorkspaceDeletedMarkerPath(localRoot, workspaceID)
+	if err := os.Remove(marker); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove workspace deleted marker %q: %w", marker, err)
+	}
+	return nil
 }
 
 // WorkspaceDeleted reports whether a local deletion marker exists.
-func WorkspaceDeleted(localRoot, workspaceID string) bool {
+func WorkspaceDeleted(ctx context.Context, localRoot, workspaceID string) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if ctx.Err() != nil {
+		return false
+	}
 	localRoot = strings.TrimSpace(localRoot)
 	workspaceID = strings.TrimSpace(workspaceID)
 	if localRoot == "" || workspaceID == "" {

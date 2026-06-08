@@ -1147,7 +1147,7 @@ func TestLinkedGitStatePathSkipsLocallyDeletedRuntime(t *testing.T) {
 		localRoot: "/repo-wt",
 	}
 	fs.git.workspaces = []*gitWorkspaceRuntime{linked, common}
-	if err := gitcache.MarkWorkspaceDeleted(localRoot, "wt"); err != nil {
+	if err := gitcache.MarkWorkspaceDeleted(context.Background(), localRoot, "wt"); err != nil {
 		t.Fatalf("MarkWorkspaceDeleted: %v", err)
 	}
 
@@ -1173,6 +1173,7 @@ func TestGitTreeInodeUsesStableMtime(t *testing.T) {
 		workspace: client.GitWorkspace{
 			WorkspaceID: "ws1",
 			CreatedAt:   createdAt,
+			HeadCommit:  "1111111111111111111111111111111111111111",
 		},
 	}
 	node := client.GitTreeNode{
@@ -1189,8 +1190,13 @@ func TestGitTreeInodeUsesStableMtime(t *testing.T) {
 	if first.Ino != second.Ino {
 		t.Fatalf("inode changed: first=%d second=%d", first.Ino, second.Ino)
 	}
-	if !second.Mtime.Equal(createdAt) {
-		t.Fatalf("mtime = %s, want stable workspace mtime %s", second.Mtime, createdAt)
+	if !second.Mtime.Equal(gitCleanTreeMtime(rt)) {
+		t.Fatalf("mtime = %s, want stable workspace mtime %s", second.Mtime, gitCleanTreeMtime(rt))
+	}
+	rt.workspace.HeadCommit = "2222222222222222222222222222222222222222"
+	third := fs.gitTreeInode(context.Background(), rt, "/repo/README.md", "README.md", node, true)
+	if third.Mtime.Equal(second.Mtime) {
+		t.Fatalf("mtime did not change when head commit changed: %s", third.Mtime)
 	}
 }
 
@@ -1230,6 +1236,35 @@ func TestGitHeadTreeEntriesDoesNotRequireBlobObjects(t *testing.T) {
 	}
 	if entry.oid != blob || entry.size != -1 {
 		t.Fatalf("entry = %+v, want oid=%s size=-1", entry, blob)
+	}
+}
+
+func TestBuildRestoredGitHeadOverlayRejectsOversizedBlob(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	repo := t.TempDir()
+	runFuseTestGit(t, "", "init", "-b", "main", repo)
+	runFuseTestGit(t, repo, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, repo, "config", "user.name", "Drive9 Test")
+	large := bytes.Repeat([]byte("x"), int(gitLocalObjectMaxBlobBytes)+1)
+	if err := os.WriteFile(filepath.Join(repo, "large.bin"), large, 0o644); err != nil {
+		t.Fatalf("write large.bin: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", "large.bin")
+	runFuseTestGit(t, repo, "commit", "-m", "large")
+
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			HeadCommit:  "0000000000000000000000000000000000000000",
+		},
+		nodes:   map[string]client.GitTreeNode{},
+		overlay: map[string]client.GitOverlayEntry{},
+	}
+	_, err := buildRestoredGitHeadOverlay(context.Background(), filepath.Join(repo, ".git"), rt)
+	if err == nil || !strings.Contains(err.Error(), "exceeds local restore limit") {
+		t.Fatalf("buildRestoredGitHeadOverlay err = %v, want oversized blob error", err)
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -135,7 +136,7 @@ func gitClone(args []string) error {
 	if enrichErr != nil {
 		fmt.Fprintf(os.Stderr, "drive9: warning: could not enrich GitHub tree sizes: %v\n", enrichErr)
 		if unknown := unknownGitTreeFileSizeCount(nodes); unknown > 0 {
-			fmt.Fprintf(os.Stderr, "drive9: warning: %d git file sizes remain unknown; git status may need to read those blobs lazily\n", unknown)
+			fmt.Fprintf(os.Stderr, "drive9: warning: %d git file sizes remain unknown; stat metadata will stay unknown until file content is read\n", unknown)
 		}
 	} else {
 		nodes = enriched
@@ -162,6 +163,9 @@ func gitClone(args []string) error {
 	cancel()
 	if err != nil {
 		return fmt.Errorf("register git workspace: %w", err)
+	}
+	if err := clearLocalGitWorkspaceDeleted(cmdCtx, resolved, ws.WorkspaceID); err != nil {
+		return fmt.Errorf("clear stale local git workspace deletion marker: %w", err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	if err := c.ReplaceGitTree(ctx, ws.WorkspaceID, client.GitTreeReplaceRequest{
@@ -331,7 +335,7 @@ func gitWorktreeAdd(args []string) error {
 	if enrichErr != nil {
 		fmt.Fprintf(os.Stderr, "drive9: warning: could not enrich GitHub tree sizes: %v\n", enrichErr)
 		if unknown := unknownGitTreeFileSizeCount(nodes); unknown > 0 {
-			fmt.Fprintf(os.Stderr, "drive9: warning: %d git file sizes remain unknown; git status may need to read those blobs lazily\n", unknown)
+			fmt.Fprintf(os.Stderr, "drive9: warning: %d git file sizes remain unknown; stat metadata will stay unknown until file content is read\n", unknown)
 		}
 	} else {
 		nodes = enriched
@@ -362,6 +366,9 @@ func gitWorktreeAdd(args []string) error {
 	cancel()
 	if err != nil {
 		return fmt.Errorf("register linked git workspace: %w", err)
+	}
+	if err := clearLocalGitWorkspaceDeleted(cmdCtx, worktreeResolved, ws.WorkspaceID); err != nil {
+		return fmt.Errorf("clear stale linked git workspace deletion marker: %w", err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), gitWorkspaceAPITimeout)
 	if err := c.ReplaceGitTree(ctx, ws.WorkspaceID, client.GitTreeReplaceRequest{
@@ -504,16 +511,22 @@ func gitWorktreeRemove(args []string) error {
 		return fmt.Errorf("delete linked git workspace: %w", err)
 	}
 	cancel()
-	if err := markLocalGitWorkspaceDeleted(resolved, ws.WorkspaceID); err != nil {
-		return fmt.Errorf("mark linked git workspace deleted locally: %w", err)
+	var cleanupErrs []error
+	if err := markLocalGitWorkspaceDeleted(cmdCtx, resolved, ws.WorkspaceID); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("mark linked git workspace deleted locally: %w", err))
 	}
 	if overlayRoot, err := localOverlayRootForMountedTarget(resolved); err == nil && overlayRoot != "" {
 		if err := os.RemoveAll(overlayRoot); err != nil {
-			return fmt.Errorf("remove linked local overlay root: %w", err)
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove linked local overlay root: %w", err))
 		}
+	} else if err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("resolve linked local overlay root: %w", err))
 	}
 	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "drive9: warning: could not remove empty worktree root %s: %v\n", target, err)
+	}
+	if err := errors.Join(cleanupErrs...); err != nil {
+		return err
 	}
 	fmt.Fprintf(os.Stderr, "drive9: removed linked git workspace %s at :%s\n", ws.WorkspaceID, resolved.RemotePath)
 	return nil
@@ -791,7 +804,7 @@ func localOverlayRootForMountedTarget(resolved mountedGitTarget) (string, error)
 	return localPath, nil
 }
 
-func markLocalGitWorkspaceDeleted(resolved mountedGitTarget, workspaceID string) error {
+func markLocalGitWorkspaceDeleted(ctx context.Context, resolved mountedGitTarget, workspaceID string) error {
 	localRoot := strings.TrimSpace(resolved.LocalRoot)
 	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {
 		return nil
@@ -799,7 +812,18 @@ func markLocalGitWorkspaceDeleted(resolved mountedGitTarget, workspaceID string)
 	if !filepath.IsAbs(localRoot) {
 		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
 	}
-	return gitcache.MarkWorkspaceDeleted(localRoot, workspaceID)
+	return gitcache.MarkWorkspaceDeleted(ctx, localRoot, workspaceID)
+}
+
+func clearLocalGitWorkspaceDeleted(ctx context.Context, resolved mountedGitTarget, workspaceID string) error {
+	localRoot := strings.TrimSpace(resolved.LocalRoot)
+	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {
+		return nil
+	}
+	if !filepath.IsAbs(localRoot) {
+		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
+	}
+	return gitcache.ClearWorkspaceDeleted(ctx, localRoot, workspaceID)
 }
 
 func sameDrive9Mount(a, b mountedGitTarget) bool {
