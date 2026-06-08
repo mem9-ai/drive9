@@ -34,8 +34,12 @@ func TestNewProvisionerFromEnvRejectsInvalidDefaultSpendingLimit(t *testing.T) {
 	t.Setenv(envTiDBPoolID, "pool")
 	t.Setenv(envTiDBSpendLimit, "-1")
 
-	if _, err := NewProvisionerFromEnv(); err == nil {
+	_, err := NewProvisionerFromEnv()
+	if err == nil {
 		t.Fatal("expected invalid default spending limit error")
+	}
+	if !strings.Contains(err.Error(), envTiDBSpendLimit) || !strings.Contains(err.Error(), "-1") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -172,6 +176,9 @@ func TestProvisionReturnsSpendingLimitUpdateError(t *testing.T) {
 	_, err := p.Provision(context.Background(), "tenant-1")
 	if err == nil {
 		t.Fatal("expected spending limit update error")
+	}
+	if !strings.Contains(err.Error(), "update starter spending limit for cluster c1") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 	if !strings.Contains(err.Error(), "starter spending limit update status 400") {
 		t.Fatalf("unexpected error: %v", err)

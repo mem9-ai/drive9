@@ -109,7 +109,7 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 			return nil, fmt.Errorf("starter response missing cluster id")
 		}
 		if err := p.UpdateSpendingLimit(ctx, out.ClusterID, *p.defaultSpendLimit); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("update starter spending limit for cluster %s: %w", out.ClusterID, err)
 		}
 	}
 
@@ -126,13 +126,13 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 }
 
 func parseDefaultSpendLimit(raw string) (*int32, error) {
-	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, nil
 	}
-	monthly, err := strconv.ParseInt(raw, 10, 32)
+	trimmed := strings.TrimSpace(raw)
+	monthly, err := strconv.ParseInt(trimmed, 10, 32)
 	if err != nil || monthly < 0 {
-		return nil, fmt.Errorf("invalid %s: must be a non-negative integer in USD cents", envTiDBSpendLimit)
+		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer in USD cents", envTiDBSpendLimit, raw)
 	}
 	out := int32(monthly)
 	return &out, nil
