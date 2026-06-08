@@ -417,6 +417,14 @@ func (p *Pool) AutoSemanticTaskTypes() []semantic.TaskType {
 	return out
 }
 
+// IsAutoEmbeddingDisabled reports whether database auto-embedding has been
+// explicitly disabled for this pool via DisableDatabaseAutoEmbedding.
+// This is distinct from AutoSemanticTaskTypes returning nil because no
+// image/audio extract is configured.
+func (p *Pool) IsAutoEmbeddingDisabled() bool {
+	return p != nil && p.cfg.DisableDatabaseAutoEmbedding
+}
+
 func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantID string) (out *backend.Dat9Backend) {
 	start := time.Now()
 	var err error
