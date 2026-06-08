@@ -915,6 +915,10 @@ func (b *Dat9Backend) ConfirmUploadWithTags(ctx context.Context, uploadID string
 func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Upload, parts []s3client.Part, tags map[string]string) error {
 	start := time.Now()
 	uploadID := upload.UploadID
+	if err := rejectRootFileNodePath(upload.TargetPath); err != nil {
+		metrics.RecordOperation("backend", "finalize_upload", "error", time.Since(start))
+		return err
+	}
 	expectedRevision := uploadExpectedRevision(upload)
 
 	completeMultipartStart := time.Now()

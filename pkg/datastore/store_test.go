@@ -299,16 +299,53 @@ func TestListDir(t *testing.T) {
 
 func TestInsertNodeRejectsRootDentry(t *testing.T) {
 	s := newTestStore(t)
-	err := s.InsertNode(context.Background(), &FileNode{
-		NodeID:      "root-self",
+	for _, name := range []string{"/", "root-alias"} {
+		err := s.InsertNode(context.Background(), &FileNode{
+			NodeID:      "root-" + name,
+			Path:        "/",
+			ParentPath:  "/",
+			Name:        name,
+			IsDirectory: true,
+			CreatedAt:   time.Now(),
+		})
+		if !errors.Is(err, ErrInvalidRootDentry) {
+			t.Fatalf("InsertNode root dentry name %q error = %v, want %v", name, err, ErrInvalidRootDentry)
+		}
+	}
+}
+
+func TestStoreRejectsRootPathWrites(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+
+	err := s.InsertNodeTx(s.DB(), &FileNode{
+		NodeID:      "root-tx",
 		Path:        "/",
 		ParentPath:  "/",
-		Name:        "/",
+		Name:        "root-alias",
 		IsDirectory: true,
-		CreatedAt:   time.Now(),
+		CreatedAt:   now,
 	})
 	if !errors.Is(err, ErrInvalidRootDentry) {
-		t.Fatalf("InsertNode root dentry error = %v, want %v", err, ErrInvalidRootDentry)
+		t.Fatalf("InsertNodeTx root path error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if err := s.UpdateNodePath(context.Background(), "/src.txt", "/", "/", "root-alias"); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("UpdateNodePath root destination error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if err := s.UpdateNodePath(context.Background(), "/", "/dst.txt", "/", "dst.txt"); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("UpdateNodePath root source error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if _, err := s.RenameFileReplacingTarget(context.Background(), "/src.txt", "/", "/", "root-alias"); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("RenameFileReplacingTarget root destination error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if _, err := s.RenameFileReplacingTarget(context.Background(), "/", "/dst.txt", "/", "dst.txt"); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("RenameFileReplacingTarget root source error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if err := s.LinkFileNodeTx(context.Background(), s.DB(), "/src.txt", "/", "/", "root-alias", "link-root", now); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("LinkFileNodeTx root destination error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if err := s.LinkFileNodeTx(context.Background(), s.DB(), "/", "/dst.txt", "/", "dst.txt", "link-dst", now); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("LinkFileNodeTx root source error = %v, want %v", err, ErrInvalidRootDentry)
 	}
 }
 
@@ -318,7 +355,7 @@ func TestListDirSkipsHistoricalRootDentry(t *testing.T) {
 	if _, err := s.DB().Exec(`
 		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, created_at)
 		VALUES (?, ?, ?, ?, 1, ?)`,
-		"root-self", "/", "/", "/", now); err != nil {
+		"root-self", "/", "/", "root-alias", now); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.InsertNode(context.Background(), &FileNode{
@@ -379,7 +416,7 @@ func TestListNodesSkipsHistoricalRootDentry(t *testing.T) {
 	if _, err := s.DB().Exec(`
 		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, created_at)
 		VALUES (?, ?, ?, ?, 1, ?)`,
-		"root-self", "/", "/", "/", now); err != nil {
+		"root-self", "/", "/", "root-alias", now); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.InsertNode(context.Background(), &FileNode{

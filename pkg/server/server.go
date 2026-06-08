@@ -2379,6 +2379,13 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "uploads_list_failed", "path", path, "status", status, "error", err)...)
 		metricEvent(r.Context(), "metadb_query", "api", "uploads_list", "result", "error")
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}

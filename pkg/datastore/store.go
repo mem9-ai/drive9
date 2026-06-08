@@ -226,12 +226,12 @@ func (s *Store) columnExists(table, column string) bool {
 
 // --- file_nodes operations ---
 
-func isRootDentryFields(path, parentPath, name string) bool {
-	return path == "/" && parentPath == "/" && name == "/"
+func isRootFileNodePath(path string) bool {
+	return path == "/"
 }
 
-func isRootSelfDentry(n FileNode) bool {
-	return isRootDentryFields(n.Path, n.ParentPath, n.Name)
+func isRootFileNode(n FileNode) bool {
+	return isRootFileNodePath(n.Path)
 }
 
 func (s *Store) InsertNode(ctx context.Context, n *FileNode) error {
@@ -239,7 +239,7 @@ func (s *Store) InsertNode(ctx context.Context, n *FileNode) error {
 	var opErr error
 	defer observeStoreOp(ctx, "insert_node", start, &opErr)
 
-	if isRootSelfDentry(*n) {
+	if isRootFileNode(*n) {
 		opErr = ErrInvalidRootDentry
 		return ErrInvalidRootDentry
 	}
@@ -282,7 +282,7 @@ func (s *Store) ListNodes(ctx context.Context, parentPath string) (out []*FileNo
 		if err != nil {
 			return nil, err
 		}
-		if isRootSelfDentry(*n) {
+		if isRootFileNode(*n) {
 			continue
 		}
 		nodes = append(nodes, n)
@@ -356,7 +356,7 @@ func (s *Store) UpdateNodePath(ctx context.Context, oldPath, newPath, newParentP
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_node_path", start, &err)
 
-	if isRootDentryFields(newPath, newParentPath, newName) {
+	if isRootFileNodePath(oldPath) || isRootFileNodePath(newPath) {
 		return ErrInvalidRootDentry
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE file_nodes SET path = ?, parent_path = ?, name = ?
@@ -378,7 +378,7 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 	start := time.Now()
 	defer observeStoreOp(ctx, "rename_file_replacing_target", start, &err)
 
-	if isRootDentryFields(newPath, newParentPath, newName) {
+	if isRootFileNodePath(oldPath) || isRootFileNodePath(newPath) {
 		return nil, ErrInvalidRootDentry
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -618,7 +618,7 @@ func (s *Store) LinkFileNode(ctx context.Context, srcPath, dstPath, dstParentPat
 
 // LinkFileNodeTx creates a hardlink node inside an existing transaction.
 func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath, dstParentPath, dstName, nodeID string, createdAt time.Time) error {
-	if isRootDentryFields(dstPath, dstParentPath, dstName) {
+	if isRootFileNodePath(srcPath) || isRootFileNodePath(dstPath) {
 		return ErrInvalidRootDentry
 	}
 	if dstParentPath != "/" {
@@ -1281,7 +1281,7 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 }
 
 func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
-	if isRootSelfDentry(*n) {
+	if isRootFileNode(*n) {
 		return ErrInvalidRootDentry
 	}
 	if !n.IsDirectory && n.FileID != "" {
@@ -1718,7 +1718,7 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 		n.IsDirectory = isDir != 0
 		n.FileID = nodeFileID.String
 		n.CreatedAt = nodeCreatedAt.UTC()
-		if isRootSelfDentry(n) {
+		if isRootFileNode(n) {
 			continue
 		}
 		nf := &NodeWithFile{Node: n}
