@@ -924,10 +924,9 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 		if err != nil {
 			return nil, err
 		}
-		// Dual-write to split tables.
-		// Skip when auto-embed text writes are disabled: writing content_text
-		// triggers recomputation of GENERATED embedding columns (EMBED_TEXT),
-		// which fails with error 1105 when the provider is unavailable.
+		// Skip when auto-embed text writes are disabled: return after updating
+		// files table, skip semantic dual-write. Return the real res so
+		// RowsAffected() reflects whether the files row actually matched.
 		if s.disableAutoEmbedTextWrites {
 			return res, nil
 		}
@@ -950,8 +949,26 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 	// Skip when auto-embed text writes are disabled: any write to content_text
 	// triggers EMBED_TEXT() recomputation on the GENERATED embedding column,
 	// which fails with error 1105 when the provider is not available on this cluster.
+	// We still gate on the revision/status check so stale tasks are correctly
+	// rejected (returning 0 rows), while current tasks return 1 so the caller
+	// can proceed to write tags (stored in file_tags, unaffected by EMBED_TEXT).
 	if s.disableAutoEmbedTextWrites {
-		return noopResult{}, nil
+		var n int
+		var err error
+		if expectedRevision > 0 {
+			err = db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?`,
+				fileID, expectedRevision).Scan(&n)
+		} else {
+			err = db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED'`,
+				fileID).Scan(&n)
+		}
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return noopResult{0}, nil // stale or not found: report 0 rows
+			}
+			return nil, fmt.Errorf("check inode for search text skip: %w", err)
+		}
+		return noopResult{1}, nil // found: report 1 row so tags are written
 	}
 	if expectedRevision > 0 {
 		return db.Exec(`UPDATE semantic SET content_text = ?
@@ -1066,12 +1083,13 @@ type execer interface {
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 }
 
-// noopResult is a sql.Result that reports zero rows affected and zero last
-// insert ID. Used as a placeholder when a write is intentionally skipped.
-type noopResult struct{}
+// noopResult is a sql.Result that reports a configurable number of rows
+// affected and zero last insert ID. Used when a write is intentionally skipped
+// but the caller may need to know whether the target row existed.
+type noopResult struct{ rows int64 }
 
-func (noopResult) LastInsertId() (int64, error) { return 0, nil }
-func (noopResult) RowsAffected() (int64, error) { return 0, nil }
+func (r noopResult) LastInsertId() (int64, error) { return 0, nil }
+func (r noopResult) RowsAffected() (int64, error)  { return r.rows, nil }
 
 // FileStorageMeta holds the lightweight storage metadata needed by upload
 // overwrite logic, fetched with FOR UPDATE row locking.
