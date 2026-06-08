@@ -144,6 +144,14 @@ func Pack(c *client.Client, args []string) error {
 			*profile = resolved.Profile
 		}
 		profilePackPaths := append([]string(nil), resolved.PackPaths...)
+		if flagProvided(fs, "profile") {
+			profileCfg, err := loadProfileConfig(*profile)
+			if err != nil {
+				return err
+			}
+			*profile = profileCfg.Name
+			profilePackPaths = append([]string(nil), profileCfg.PackPaths...)
+		}
 		localPrefix = filepath.ToSlash(resolved.MountRel)
 		if localPrefix == "." {
 			localPrefix = ""
@@ -219,6 +227,13 @@ func Unpack(c *client.Client, args []string) error {
 	archiveArg := ""
 	if fs.NArg() == 1 {
 		archiveArg = fs.Arg(0)
+	}
+	if strings.TrimSpace(*profile) == "" {
+		profileCfg, err := loadProfileConfig(*profile)
+		if err != nil {
+			return err
+		}
+		*profile = profileCfg.Name
 	}
 	archiveClient, archivePath, err := clientForPackArchiveArg(c, archiveArg, *remoteRoot, *profile)
 	if err != nil {
@@ -1330,26 +1345,34 @@ func clientForPackArchiveArg(defaultClient *client.Client, raw string, remoteRoo
 	if strings.TrimSpace(profile) == noneMountProfile {
 		return nil, "", fmt.Errorf("default pack archive requires an overlay profile or an explicit remote archive path")
 	}
-	archivePath, err := defaultPackArchivePath(remoteRoot)
+	archivePath, err := defaultPackArchivePath(remoteRoot, profile)
 	if err != nil {
 		return nil, "", err
 	}
 	return defaultClient, archivePath, nil
 }
 
-func defaultPackArchivePath(remoteRoot string) (string, error) {
+func defaultPackArchivePath(remoteRoot string, profile string) (string, error) {
 	remoteRoot, err := mountpath.NormalizeRoot(strings.TrimSpace(remoteRoot))
 	if err != nil {
 		return "", fmt.Errorf("drive9 pack: %w", err)
 	}
-	sum := sha256.Sum256([]byte(remoteRoot))
+	profile = strings.TrimSpace(profile)
+	if profile == "" {
+		profile = defaultMountProfile
+	}
+	if err := validateProfileName(profile); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(profile + "\x00" + remoteRoot))
 	hash := hex.EncodeToString(sum[:8])
 	label := path.Base(remoteRoot)
 	if label == "." || label == "/" || label == "" {
 		label = "root"
 	}
 	label = safePackArchiveLabel(label)
-	return fmt.Sprintf("%s/%s-%s.tar.gz", defaultPackRoot, label, hash), nil
+	profileLabel := safePackArchiveLabel(profile)
+	return fmt.Sprintf("%s/%s/%s-%s.tar.gz", defaultPackRoot, profileLabel, label, hash), nil
 }
 
 func safePackArchiveLabel(label string) string {

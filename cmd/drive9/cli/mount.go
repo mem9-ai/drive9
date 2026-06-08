@@ -319,7 +319,7 @@ func fsMountCmd(args []string) error {
 			c = client.New(*server, *apiKey)
 		}
 		if autoUnpack {
-			archivePath, err := defaultPackArchivePath(remoteRoot)
+			archivePath, err := defaultPackArchivePath(remoteRoot, profileCfg.Name)
 			if err != nil {
 				return err
 			}
@@ -714,7 +714,7 @@ func runUmount(args []string, deps umountDeps) error {
 			if err := validateUmountPackState(packState); err != nil {
 				return err
 			}
-			defaultArchive, err := defaultPackArchivePath(packState.RemoteRoot)
+			defaultArchive, err := defaultPackArchivePath(packState.RemoteRoot, packState.Profile)
 			if err != nil {
 				return err
 			}

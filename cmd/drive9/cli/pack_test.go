@@ -128,7 +128,7 @@ func TestPackArchiveRequiresPathsWhenProfileHasNoPackPaths(t *testing.T) {
 
 func TestPackRemoteArchivePreservesReplacePathsWhenDefaultRootsAllDeleted(t *testing.T) {
 	remoteRoot := "/workspace"
-	defaultArchive, err := defaultPackArchivePath(remoteRoot)
+	defaultArchive, err := defaultPackArchivePath(remoteRoot, "coding-agent")
 	if err != nil {
 		t.Fatalf("defaultPackArchivePath: %v", err)
 	}
@@ -490,15 +490,118 @@ func TestPackRemoteArchiveUploadsPackFile(t *testing.T) {
 }
 
 func TestDefaultPackArchivePath(t *testing.T) {
-	got, err := defaultPackArchivePath("/remote/root")
+	got, err := defaultPackArchivePath("/remote/root", "coding-agent")
 	if err != nil {
 		t.Fatalf("defaultPackArchivePath: %v", err)
 	}
-	if !strings.HasPrefix(got, defaultPackRoot+"/root-") || !strings.HasSuffix(got, ".tar.gz") {
+	if !strings.HasPrefix(got, defaultPackRoot+"/coding-agent/root-") || !strings.HasSuffix(got, ".tar.gz") {
 		t.Fatalf("default archive path = %q, want hidden pack path", got)
 	}
-	if strings.Contains(got, "coding-agent") {
-		t.Fatalf("default archive path = %q, should not include profile name", got)
+	custom, err := defaultPackArchivePath("/remote/root", "with-pack")
+	if err != nil {
+		t.Fatalf("defaultPackArchivePath custom: %v", err)
+	}
+	if !strings.HasPrefix(custom, defaultPackRoot+"/with-pack/root-") || !strings.HasSuffix(custom, ".tar.gz") {
+		t.Fatalf("custom default archive path = %q, want profile-scoped hidden pack path", custom)
+	}
+	if custom == got {
+		t.Fatalf("default archive path is not profile-scoped: %q", got)
+	}
+}
+
+func TestPackMountProfileOverrideUsesEffectiveProfilePackPaths(t *testing.T) {
+	writeTestProfile(t, "with-pack", "[pack]\ndist\n")
+
+	mountPoint := t.TempDir()
+	localRoot := t.TempDir()
+	mustWriteFile(t, filepath.Join(localRoot, "overlay", ".git", "config"), []byte("git\n"), 0o644)
+	mustWriteFile(t, filepath.Join(localRoot, "overlay", "dist", "app.js"), []byte("bundle\n"), 0o644)
+	_, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
+		PID:        os.Getpid(),
+		MountPoint: mountPoint,
+		RemoteRoot: "/remote",
+		Profile:    "coding-agent",
+		LocalRoot:  localRoot,
+		PackPaths:  []string{".git"},
+	})
+	if err != nil {
+		t.Fatalf("WriteProcessState: %v", err)
+	}
+
+	var uploaded []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /v1/fs/packs/custom.tar.gz":
+			http.NotFound(w, r)
+		case "PUT /v1/fs/packs/custom.tar.gz":
+			var err error
+			uploaded, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read upload body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"revision":1}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, "sk-test")
+	c.SetSmallFileThresholdForTests(1 << 30)
+
+	if err := Pack(c, []string{"--mount", mountPoint, "--profile", "with-pack", ":/packs/custom.tar.gz"}); err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
+	manifest, err := readPackArchiveManifest(context.Background(), bytes.NewReader(uploaded))
+	if err != nil {
+		t.Fatalf("read uploaded manifest: %v", err)
+	}
+	if manifest.Profile != "with-pack" {
+		t.Fatalf("manifest profile = %q, want with-pack", manifest.Profile)
+	}
+	if !reflect.DeepEqual(manifest.Paths, []string{"/dist"}) {
+		t.Fatalf("manifest paths = %v, want custom profile pack path only", manifest.Paths)
+	}
+	for _, entry := range manifest.Entries {
+		if strings.HasPrefix(entry.Path, "/.git") {
+			t.Fatalf("mounted coding-agent pack path leaked into custom profile archive: %#v", entry)
+		}
+	}
+}
+
+func TestPackMountProfileNoneDoesNotUseMountPackPaths(t *testing.T) {
+	mountPoint := t.TempDir()
+	localRoot := t.TempDir()
+	mustWriteFile(t, filepath.Join(localRoot, "overlay", ".git", "config"), []byte("git\n"), 0o644)
+	_, err := mountstate.WriteProcessState(mountPoint, mountstate.ProcessState{
+		PID:        os.Getpid(),
+		MountPoint: mountPoint,
+		RemoteRoot: "/remote",
+		Profile:    "coding-agent",
+		LocalRoot:  localRoot,
+		PackPaths:  []string{".git"},
+	})
+	if err != nil {
+		t.Fatalf("WriteProcessState: %v", err)
+	}
+
+	uploadCalled := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			uploadCalled = true
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+	c := client.New(srv.URL, "sk-test")
+	c.SetSmallFileThresholdForTests(1 << 30)
+
+	err = Pack(c, []string{"--mount", mountPoint, "--profile", "none", ":/packs/none.tar.gz"})
+	if err == nil || !strings.Contains(err.Error(), "[pack] paths") {
+		t.Fatalf("Pack error = %v, want missing pack paths error", err)
+	}
+	if uploadCalled {
+		t.Fatal("pack uploaded archive using mount-state pack paths despite --profile=none")
 	}
 }
 
@@ -543,7 +646,7 @@ func TestRunUmountPacksAfterUnmount(t *testing.T) {
 			if !reflect.DeepEqual(gotState, state) {
 				t.Fatalf("pack state = %#v, want %#v", gotState, state)
 			}
-			defaultArchive, err := defaultPackArchivePath(state.RemoteRoot)
+			defaultArchive, err := defaultPackArchivePath(state.RemoteRoot, state.Profile)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -604,7 +707,7 @@ func TestRunUmountAutoPacksCodingAgentMount(t *testing.T) {
 	if err := runUmount([]string{"/mnt/drive9"}, deps); err != nil {
 		t.Fatalf("runUmount: %v", err)
 	}
-	defaultArchive, err := defaultPackArchivePath(state.RemoteRoot)
+	defaultArchive, err := defaultPackArchivePath(state.RemoteRoot, state.Profile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -730,7 +833,7 @@ func TestMountCmdAutoUnpacksCodingAgentPackBeforeFuseMount(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("writePackArchive: %v", err)
 	}
-	defaultArchive, err := defaultPackArchivePath("/remote")
+	defaultArchive, err := defaultPackArchivePath("/remote", "with-pack")
 	if err != nil {
 		t.Fatal(err)
 	}
