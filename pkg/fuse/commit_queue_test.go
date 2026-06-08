@@ -758,6 +758,7 @@ func TestCommitQueueDirectPutRouting(t *testing.T) {
 // Test axis 1: 409 → fetch → LWW re-upload succeeds.
 func TestCommitQueueAutoResolveLWW(t *testing.T) {
 	var uploadCalls, statCalls, readCalls int
+	var successRev int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
@@ -808,6 +809,12 @@ func TestCommitQueueAutoResolveLWW(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		if entry.Path != "/lww.txt" {
+			t.Fatalf("OnSuccess path = %q, want /lww.txt", entry.Path)
+		}
+		successRev = committedRev
+	}
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/lww.txt",
 		BaseRev: 5,
@@ -827,6 +834,9 @@ func TestCommitQueueAutoResolveLWW(t *testing.T) {
 	if readCalls != 1 {
 		t.Fatalf("read calls = %d, want 1", readCalls)
 	}
+	if successRev != 11 {
+		t.Fatalf("OnSuccess committedRev = %d, want 11 from resolved server revision", successRev)
+	}
 	// Success: shadow and pending should be cleaned up.
 	if pending.HasPending("/lww.txt") {
 		t.Fatal("pending entry should be removed after successful LWW")
@@ -839,6 +849,7 @@ func TestCommitQueueAutoResolveLWW(t *testing.T) {
 // Test axis 2: 409 → fetch → content matches → idempotent success.
 func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 	var uploadCalls int
+	var successRev int64
 	sameContent := []byte("identical!")
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -875,6 +886,12 @@ func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		if entry.Path != "/idem.txt" {
+			t.Fatalf("OnSuccess path = %q, want /idem.txt", entry.Path)
+		}
+		successRev = committedRev
+	}
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/idem.txt",
 		BaseRev: 5,
@@ -889,6 +906,9 @@ func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 	// No LWW re-upload because content matched.
 	if uploadCalls != 1 {
 		t.Fatalf("upload calls = %d, want 1 (initial 409 only, no LWW re-upload)", uploadCalls)
+	}
+	if successRev != 8 {
+		t.Fatalf("OnSuccess committedRev = %d, want matching server revision", successRev)
 	}
 	// Idempotent: should be cleaned up without a second upload.
 	if pending.HasPending("/idem.txt") {
