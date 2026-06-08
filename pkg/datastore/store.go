@@ -147,6 +147,10 @@ type Upload struct {
 type Store struct {
 	db             *sql.DB
 	useLegacyFiles bool // true when the legacy `files` table exists and needs dual-write
+	// disableAutoEmbedTextWrites suppresses content_text/description writes to the
+	// semantic table so TiDB does not attempt to compute EMBED_TEXT() generated
+	// columns when the cluster has no supported auto-embedding provider.
+	disableAutoEmbedTextWrites bool
 }
 
 func Open(dsn string) (*Store, error) {
@@ -175,6 +179,12 @@ func (s *Store) DB() *sql.DB  { return s.db }
 // tenant database. When false, all writes skip the `files` table entirely
 // and only target the split tables (inodes / contents / semantic).
 func (s *Store) HasLegacyFiles() bool { return s.useLegacyFiles }
+
+// DisableAutoEmbedTextWrites configures the store to omit content_text and
+// description when inserting/updating the semantic table. Use this when the
+// TiDB Cloud cluster has no supported auto-embedding provider so that
+// EMBED_TEXT() generated columns are not triggered.
+func (s *Store) DisableAutoEmbedTextWrites() { s.disableAutoEmbedTextWrites = true }
 
 func (s *Store) detectLegacyFiles(ctx context.Context) (bool, error) {
 	var n int
@@ -744,10 +754,12 @@ func (s *Store) insertSplitTablesTx(tx execer, f *File) error {
 	}
 	semantic := &Semantic{
 		InodeID:                      f.FileID,
-		ContentText:                  f.ContentText,
-		Description:                  f.Description,
 		EmbeddingRevision:            f.EmbeddingRevision,
 		DescriptionEmbeddingRevision: f.DescriptionEmbeddingRevision,
+	}
+	if !s.disableAutoEmbedTextWrites {
+		semantic.ContentText = f.ContentText
+		semantic.Description = f.Description
 	}
 	if err := s.InsertSemanticTx(tx, semantic); err != nil {
 		return fmt.Errorf("insert semantic: %w", err)
