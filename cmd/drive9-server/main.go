@@ -387,6 +387,7 @@ environment:
   DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms), Aliyun KMS key id (required for aliyun_kms)
   DRIVE9_ALIYUN_KMS_ENDPOINT custom Aliyun KMS endpoint, e.g. a VPC endpoint (no https:// prefix)
                              note: aliyun_kms reads the Aliyun region from DRIVE9_S3_REGION
+                             note: TLS verification is skipped automatically when this is set
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
