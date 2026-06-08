@@ -310,6 +310,12 @@ drive9() {
   DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
 }
 
+drive9_with_timeout() {
+  local seconds="$1"
+  shift
+  run_with_timeout "$seconds" env "DRIVE9_SERVER=$BASE" "DRIVE9_API_KEY=$API_KEY" "$CLI_BIN" "$@"
+}
+
 git_cmd() {
   if [ "$GIT_WORKSPACE_TRACE_GIT" = "1" ]; then
     {
@@ -324,8 +330,8 @@ git_cmd() {
 clone_fast_blobless() {
   local repo_url="$1"
   local target="$2"
-  run_with_timeout "$GIT_WORKSPACE_CLONE_TIMEOUT_S" \
-    drive9 git clone --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" "$repo_url" "$target"
+  drive9_with_timeout "$GIT_WORKSPACE_CLONE_TIMEOUT_S" \
+    git clone --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" "$repo_url" "$target"
 }
 
 fast_worktree_add() {
@@ -333,8 +339,8 @@ fast_worktree_add() {
   local worktree="$2"
   local branch="$3"
   local commitish="$4"
-  run_with_timeout "$GIT_WORKSPACE_CLONE_TIMEOUT_S" \
-    drive9 git worktree add --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" -b "$branch" "$base_repo" "$worktree" "$commitish"
+  drive9_with_timeout "$GIT_WORKSPACE_CLONE_TIMEOUT_S" \
+    git worktree add --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" -b "$branch" "$base_repo" "$worktree" "$commitish"
 }
 
 configure_git_identity() {
