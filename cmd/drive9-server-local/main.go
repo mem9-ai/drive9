@@ -176,7 +176,7 @@ func main() {
 	stepStart = time.Now()
 	switch s3cfg.Mode {
 	case "aws":
-		s3c, err = s3client.NewAWS(startupCtx, s3client.AWSConfig{
+		s3c, err = s3client.New(startupCtx, s3client.AWSConfig{
 			Region:          s3cfg.Region,
 			Bucket:          s3cfg.Bucket,
 			Prefix:          s3cfg.Prefix,

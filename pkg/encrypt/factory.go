@@ -24,6 +24,8 @@ type Config struct {
 	Region string // aws/aliyun region for kms
 	// AliyunKMSEndpoint overrides the default Aliyun KMS endpoint, e.g. a VPC endpoint.
 	// Leave empty to use the default public endpoint for the region.
+	// When non-empty, TLS certificate verification is skipped automatically because
+	// VPC/dedicated-gateway certs are signed by an Aliyun internal CA.
 	AliyunKMSEndpoint string
 }
 

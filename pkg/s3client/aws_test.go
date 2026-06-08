@@ -81,17 +81,17 @@ func TestAWSConfigValidate(t *testing.T) {
 	}
 }
 
-func TestStaticCredentialsProviderFromAWSConfig(t *testing.T) {
-	provider, ok, err := staticCredentialsProvider(AWSConfig{
+func TestCredentialsForAliyunExplicitKey(t *testing.T) {
+	provider, err := credentialsForAliyun(AWSConfig{
 		AccessKeyID:     "test-ak",
 		SecretAccessKey: "test-sk",
 		SessionToken:    "test-token",
 	})
 	if err != nil {
-		t.Fatalf("staticCredentialsProvider() error = %v", err)
+		t.Fatalf("credentialsForAliyun() error = %v", err)
 	}
-	if !ok {
-		t.Fatal("staticCredentialsProvider() ok = false, want true")
+	if provider == nil {
+		t.Fatal("credentialsForAliyun() provider = nil, want non-nil")
 	}
 
 	creds, err := provider.Retrieve(context.Background())
@@ -107,16 +107,24 @@ func TestStaticCredentialsProviderFromAWSConfig(t *testing.T) {
 	if creds.SessionToken != "test-token" {
 		t.Fatalf("SessionToken = %q, want %q", creds.SessionToken, "test-token")
 	}
+}
 
-	provider, ok, err = staticCredentialsProvider(AWSConfig{})
+func TestCredentialsForAliyunNoCredentials(t *testing.T) {
+	// Clear the full set of env vars that credentialsForAliyun consults so the
+	// test is not order-dependent or sensitive to the ambient environment.
+	t.Setenv("ALIBABA_CLOUD_ACCESS_KEY_ID", "")
+	t.Setenv("ALIBABA_CLOUD_ACCESS_KEY_SECRET", "")
+	t.Setenv("ALIBABA_CLOUD_SECURITY_TOKEN", "")
+	t.Setenv("ALIBABA_CLOUD_ROLE_ARN", "")
+	t.Setenv("ALIBABA_CLOUD_OIDC_PROVIDER_ARN", "")
+	t.Setenv("ALIBABA_CLOUD_OIDC_TOKEN_FILE", "")
+
+	provider, err := credentialsForAliyun(AWSConfig{})
 	if err != nil {
-		t.Fatalf("staticCredentialsProvider(empty) error = %v", err)
-	}
-	if ok {
-		t.Fatal("staticCredentialsProvider(empty) ok = true, want false")
+		t.Fatalf("credentialsForAliyun(empty) error = %v", err)
 	}
 	if provider != nil {
-		t.Fatalf("staticCredentialsProvider(empty) provider = %#v, want nil", provider)
+		t.Fatalf("credentialsForAliyun(empty) provider = %#v, want nil", provider)
 	}
 }
 

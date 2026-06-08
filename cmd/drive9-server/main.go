@@ -207,19 +207,20 @@ func main() {
 		}
 
 		pool = tenant.NewPool(tenant.PoolConfig{
-			S3Dir:              s3cfg.Dir,
-			PublicURL:          publicBaseURL(addr),
-			S3Bucket:           s3cfg.Bucket,
-			S3Region:           s3cfg.Region,
-			S3Prefix:           s3cfg.Prefix,
-			S3RoleARN:          s3cfg.RoleARN,
-			S3Endpoint:         s3cfg.Endpoint,
-			S3ForcePathStyle:   s3cfg.ForcePathStyle,
-			S3AccessKeyID:      s3cfg.AccessKeyID,
-			S3SecretAccessKey:  s3cfg.SecretAccessKey,
-			S3SessionToken:     s3cfg.SessionToken,
-			S3EncryptionPolicy: s3cfg.EncryptionPolicy,
-			BackendOptions:     backendOptions,
+			S3Dir:                        s3cfg.Dir,
+			PublicURL:                    publicBaseURL(addr),
+			S3Bucket:                     s3cfg.Bucket,
+			S3Region:                     s3cfg.Region,
+			S3Prefix:                     s3cfg.Prefix,
+			S3RoleARN:                    s3cfg.RoleARN,
+			S3Endpoint:                   s3cfg.Endpoint,
+			S3ForcePathStyle:             s3cfg.ForcePathStyle,
+			S3AccessKeyID:                s3cfg.AccessKeyID,
+			S3SecretAccessKey:            s3cfg.SecretAccessKey,
+			S3SessionToken:               s3cfg.SessionToken,
+			S3EncryptionPolicy:           s3cfg.EncryptionPolicy,
+			BackendOptions:               backendOptions,
+			DisableDatabaseAutoEmbedding: envBool("DRIVE9_DISABLE_AUTO_EMBEDDING", false),
 		}, enc)
 		defer pool.Close()
 	}
@@ -387,12 +388,15 @@ environment:
   DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms), Aliyun KMS key id (required for aliyun_kms)
   DRIVE9_ALIYUN_KMS_ENDPOINT custom Aliyun KMS endpoint, e.g. a VPC endpoint (no https:// prefix)
                              note: aliyun_kms reads the Aliyun region from DRIVE9_S3_REGION
+                             note: TLS verification is skipped automatically when this is set
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
+  DRIVE9_DISABLE_AUTO_EMBEDDING true|false disable TiDB database-managed auto-embedding (default: false)
+                                set to true when the TiDB Cloud cluster has no supported embedding provider
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
   DRIVE9_SLOCK_API_ORIGIN Slock API origin (required when DRIVE9_SLOCK_ORIGIN is set)

@@ -30,6 +30,11 @@ func NewAliyunKMSEncryptor(region, keyID, endpoint string) (*AliyunKMSEncryptor,
 	if err != nil {
 		return nil, fmt.Errorf("create aliyun kms client: %w", err)
 	}
+	if endpoint != "" {
+		// VPC/dedicated-gateway certificates are signed by an Aliyun internal CA
+		// not present in the system trust store; skip verification for custom endpoints.
+		client.SetHTTPSInsecure(true)
+	}
 	return &AliyunKMSEncryptor{client: client, keyID: keyID, endpoint: endpoint}, nil
 }
 
