@@ -59,6 +59,11 @@ type gitWorkspaceRuntime struct {
 	children  map[string][]client.GitTreeNode
 	overlay   map[string]client.GitOverlayEntry
 	restored  bool
+
+	localTreeCommit   string
+	localNodes        map[string]client.GitTreeNode
+	localChildren     map[string][]client.GitTreeNode
+	localTreeLoadedAt time.Time
 }
 
 func (rt *gitWorkspaceRuntime) isLinked() bool {
@@ -376,6 +381,12 @@ func (fs *Dat9FS) gitWorkspaceOwnsPath(ctx context.Context, localPath string) bo
 	if _, ok := rt.overlayEntry(rel); ok {
 		return true
 	}
+	if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
+		if _, ok := rt.localHeadNode(rel); ok {
+			return true
+		}
+		return rt.hasLocalHeadImpliedDir(rel)
+	}
 	if _, ok := rt.cleanNode(rel); ok {
 		return true
 	}
@@ -400,6 +411,14 @@ func (fs *Dat9FS) gitIgnoredPathLocalOnly(ctx context.Context, localPath string,
 	}
 	if _, ok := rt.overlayEntry(rel); ok {
 		return false
+	}
+	if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
+		if _, ok := rt.localHeadNode(rel); ok {
+			return false
+		}
+		if rt.hasLocalHeadImpliedDir(rel) {
+			return false
+		}
 	}
 	if _, ok := rt.cleanNode(rel); ok {
 		return false
@@ -499,6 +518,16 @@ func (rt *gitWorkspaceRuntime) cleanNode(rel string) (client.GitTreeNode, bool) 
 	return n, ok
 }
 
+func (rt *gitWorkspaceRuntime) localHeadNode(rel string) (client.GitTreeNode, bool) {
+	if rt == nil {
+		return client.GitTreeNode{}, false
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	n, ok := rt.localNodes[rel]
+	return n, ok
+}
+
 type gitOverlaySnapshot struct {
 	path  string
 	entry client.GitOverlayEntry
@@ -511,6 +540,18 @@ func (rt *gitWorkspaceRuntime) childrenFor(rel string) []client.GitTreeNode {
 	rt.mu.RLock()
 	defer rt.mu.RUnlock()
 	children := rt.children[rel]
+	out := make([]client.GitTreeNode, len(children))
+	copy(out, children)
+	return out
+}
+
+func (rt *gitWorkspaceRuntime) localHeadChildrenFor(rel string) []client.GitTreeNode {
+	if rt == nil {
+		return nil
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	children := rt.localChildren[rel]
 	out := make([]client.GitTreeNode, len(children))
 	copy(out, children)
 	return out
@@ -543,6 +584,15 @@ func (fs *Dat9FS) gitEntry(ctx context.Context, localPath string, incrementLooku
 		}
 		return fs.gitOverlayInode(ctx, rt, rel, e, incrementLookup), true
 	}
+	if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
+		if n, ok := rt.localHeadNode(rel); ok {
+			return fs.gitTreeInode(ctx, rt, localPath, rel, n, incrementLookup), true
+		}
+		if rt.hasLocalHeadImpliedDir(rel) {
+			return fs.gitInode(localPath, true, 0, 0o755, true, incrementLookup), true
+		}
+		return nil, true
+	}
 	if n, ok := rt.cleanNode(rel); ok {
 		return fs.gitTreeInode(ctx, rt, localPath, rel, n, incrementLookup), true
 	}
@@ -550,6 +600,123 @@ func (fs *Dat9FS) gitEntry(ctx context.Context, localPath string, incrementLooku
 		return fs.gitInode(localPath, true, 0, 0o755, true, incrementLookup), true
 	}
 	return nil, true
+}
+
+func (fs *Dat9FS) ensureGitLocalHeadTree(ctx context.Context, rt *gitWorkspaceRuntime) (bool, error) {
+	if fs == nil || rt == nil {
+		return false, nil
+	}
+	rt.mu.RLock()
+	if rt.localTreeCommit != "" {
+		active := rt.localNodes != nil
+		rt.mu.RUnlock()
+		return active, nil
+	}
+	rt.mu.RUnlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := fs.ensureGitStateRestored(ctx, rt); err != nil {
+		return false, err
+	}
+	gitDir, err := fs.gitDirForRuntime(rt)
+	if err != nil {
+		return false, err
+	}
+	headOut, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "rev-parse", "--verify", "HEAD")
+	if err != nil {
+		return false, err
+	}
+	head := strings.ToLower(strings.TrimSpace(string(headOut)))
+	if !isGitObjectID(head) || strings.EqualFold(head, rt.workspace.HeadCommit) {
+		rt.mu.Lock()
+		rt.localTreeCommit = head
+		rt.localNodes = nil
+		rt.localChildren = nil
+		rt.localTreeLoadedAt = time.Time{}
+		rt.mu.Unlock()
+		return false, nil
+	}
+
+	treeOut, err := gitCommandOutputNoLazy(ctx, "--git-dir", gitDir, "ls-tree", "-r", "-t", "-z", head)
+	if err != nil {
+		return false, err
+	}
+	nodes, children := parseLocalGitTree(rt.workspace.WorkspaceID, head, treeOut)
+	rt.mu.Lock()
+	rt.localTreeCommit = head
+	rt.localNodes = nodes
+	rt.localChildren = children
+	rt.localTreeLoadedAt = time.Now()
+	rt.mu.Unlock()
+	return true, nil
+}
+
+func (rt *gitWorkspaceRuntime) clearLocalHeadTree() {
+	if rt == nil {
+		return
+	}
+	rt.mu.Lock()
+	rt.localTreeCommit = ""
+	rt.localNodes = nil
+	rt.localChildren = nil
+	rt.localTreeLoadedAt = time.Time{}
+	rt.mu.Unlock()
+}
+
+func parseLocalGitTree(workspaceID, commit string, raw []byte) (map[string]client.GitTreeNode, map[string][]client.GitTreeNode) {
+	nodes := make(map[string]client.GitTreeNode)
+	children := make(map[string][]client.GitTreeNode)
+	for _, rec := range bytes.Split(raw, []byte{0}) {
+		if len(rec) == 0 {
+			continue
+		}
+		tab := bytes.IndexByte(rec, '\t')
+		if tab < 0 {
+			continue
+		}
+		meta := strings.Fields(string(rec[:tab]))
+		if len(meta) < 3 {
+			continue
+		}
+		mode, typ, objectSHA := meta[0], meta[1], meta[2]
+		rel := strings.TrimPrefix(path.Clean("/"+string(rec[tab+1:])), "/")
+		if rel == "" || rel == "." {
+			continue
+		}
+		kind := "file"
+		switch typ {
+		case "tree":
+			kind = "dir"
+		case "commit":
+			kind = "submodule"
+		case "blob":
+			if mode == "120000" {
+				kind = "symlink"
+			}
+		}
+		parent := path.Dir(rel)
+		if parent == "." {
+			parent = ""
+		}
+		node := client.GitTreeNode{
+			WorkspaceID: workspaceID,
+			CommitSHA:   commit,
+			Path:        rel,
+			ParentPath:  parent,
+			Name:        path.Base(rel),
+			Kind:        kind,
+			Mode:        mode,
+			ObjectSHA:   objectSHA,
+			SizeBytes:   -1,
+		}
+		nodes[rel] = node
+		children[parent] = append(children[parent], node)
+	}
+	for parent := range children {
+		sort.Slice(children[parent], func(i, j int) bool { return children[parent][i].Name < children[parent][j].Name })
+	}
+	return nodes, children
 }
 
 func (rt *gitWorkspaceRuntime) hasImpliedDir(rel string) bool {
@@ -566,6 +733,18 @@ func (rt *gitWorkspaceRuntime) hasImpliedDir(rel string) bool {
 		if e.Op != "whiteout" && strings.HasPrefix(p, prefix) {
 			return true
 		}
+	}
+	return false
+}
+
+func (rt *gitWorkspaceRuntime) hasLocalHeadImpliedDir(rel string) bool {
+	if rel == "" {
+		return true
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	if _, ok := rt.localChildren[rel]; ok {
+		return true
 	}
 	return false
 }
@@ -587,7 +766,11 @@ func (fs *Dat9FS) gitOverlayInode(ctx context.Context, rt *gitWorkspaceRuntime, 
 		localPath = "/" + rel
 	}
 	if e.Op == "chmod" {
-		if n, ok := rt.cleanNode(rel); ok {
+		n, ok := rt.cleanNode(rel)
+		if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
+			n, ok = rt.localHeadNode(rel)
+		}
+		if ok {
 			base := fs.gitTreeInode(ctx, rt, localPath, rel, n, incrementLookup)
 			if parsed, ok := parseGitMode(e.Mode); ok && base != nil {
 				fs.inodes.SetModeState(base.Ino, parsed, true)
@@ -669,6 +852,7 @@ func (fs *Dat9FS) listGitDir(ctx context.Context, dirPath string) ([]DirEntry, b
 	if !ok {
 		return nil, false, nil
 	}
+	localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt)
 	if rel != "" {
 		if e, ok := rt.overlayEntry(rel); ok {
 			if e.Op == "whiteout" {
@@ -676,6 +860,14 @@ func (fs *Dat9FS) listGitDir(ctx context.Context, dirPath string) ([]DirEntry, b
 			}
 			if e.Kind != "dir" {
 				return nil, true, syscall.ENOTDIR
+			}
+		} else if localTree {
+			if n, ok := rt.localHeadNode(rel); ok {
+				if n.Kind != "dir" {
+					return nil, true, syscall.ENOTDIR
+				}
+			} else if !rt.hasLocalHeadImpliedDir(rel) {
+				return nil, true, os.ErrNotExist
 			}
 		} else if n, ok := rt.cleanNode(rel); ok {
 			if n.Kind != "dir" {
@@ -688,7 +880,11 @@ func (fs *Dat9FS) listGitDir(ctx context.Context, dirPath string) ([]DirEntry, b
 	entriesByName := make(map[string]DirEntry)
 	whiteouts := make(map[string]struct{})
 	overlays := rt.overlaySnapshot()
-	for _, n := range rt.childrenFor(rel) {
+	children := rt.childrenFor(rel)
+	if localTree {
+		children = rt.localHeadChildrenFor(rel)
+	}
+	for _, n := range children {
 		localPath := path.Join(rt.localRoot, n.Path)
 		if rt.localRoot == "/" {
 			localPath = "/" + n.Path
@@ -787,6 +983,9 @@ func (fs *Dat9FS) readGitFile(ctx context.Context, localPath string, offset, siz
 		}
 	}
 	n, ok := rt.cleanNode(rel)
+	if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
+		n, ok = rt.localHeadNode(rel)
+	}
 	if !ok {
 		return nil, os.ErrNotExist
 	}
@@ -825,7 +1024,17 @@ func (fs *Dat9FS) gitWorkspaceCurrentSize(ctx context.Context, rt *gitWorkspaceR
 			return e.SizeBytes, true
 		}
 	}
-	if n, ok := rt.cleanNode(rel); ok {
+	if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
+		if n, ok := rt.localHeadNode(rel); ok {
+			if n.Kind == "dir" || n.Kind == "submodule" {
+				return 0, false
+			}
+			if n.SizeBytes < 0 {
+				return fs.resolveGitCleanNodeSize(ctx, rt, rel, n), true
+			}
+			return n.SizeBytes, true
+		}
+	} else if n, ok := rt.cleanNode(rel); ok {
 		if n.Kind == "dir" || n.Kind == "submodule" {
 			return 0, false
 		}
@@ -1021,17 +1230,29 @@ func (rt *gitWorkspaceRuntime) updateCleanNodeSize(rel string, size int64) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	n, ok := rt.nodes[rel]
-	if !ok || n.SizeBytes >= 0 {
-		return
+	if ok && n.SizeBytes < 0 {
+		n.SizeBytes = size
+		rt.nodes[rel] = n
+		children := rt.children[n.ParentPath]
+		for i := range children {
+			if children[i].Path == rel {
+				children[i].SizeBytes = size
+				rt.children[n.ParentPath] = children
+				break
+			}
+		}
 	}
-	n.SizeBytes = size
-	rt.nodes[rel] = n
-	children := rt.children[n.ParentPath]
-	for i := range children {
-		if children[i].Path == rel {
-			children[i].SizeBytes = size
-			rt.children[n.ParentPath] = children
-			return
+	n, ok = rt.localNodes[rel]
+	if ok && n.SizeBytes < 0 {
+		n.SizeBytes = size
+		rt.localNodes[rel] = n
+		children := rt.localChildren[n.ParentPath]
+		for i := range children {
+			if children[i].Path == rel {
+				children[i].SizeBytes = size
+				rt.localChildren[n.ParentPath] = children
+				break
+			}
 		}
 	}
 }
@@ -1741,6 +1962,7 @@ func (fs *Dat9FS) scheduleGitStateCheckpoint(localPath string) {
 	if !ok || (rel != ".git" && !strings.HasPrefix(rel, ".git/")) {
 		return
 	}
+	rt.clearLocalHeadTree()
 	key := gitWorkspaceCacheKey(rt)
 	fs.gitCheckpoints.Schedule(key, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
@@ -1759,6 +1981,7 @@ func (fs *Dat9FS) checkpointGitStateForPath(ctx context.Context, localPath strin
 	if !ok || (rel != ".git" && !strings.HasPrefix(rel, ".git/")) {
 		return nil
 	}
+	rt.clearLocalHeadTree()
 	if fs.gitCheckpoints != nil {
 		fs.gitCheckpoints.Cancel(gitWorkspaceCacheKey(rt))
 	}
@@ -1778,6 +2001,26 @@ func (fs *Dat9FS) drainGitStateCheckpoints() {
 		return
 	}
 	fs.gitCheckpoints.FlushAll()
+}
+
+func (fs *Dat9FS) checkpointAllGitWorkspaces() {
+	if fs == nil || fs.git == nil {
+		return
+	}
+	fs.git.mu.Lock()
+	workspaces := make([]*gitWorkspaceRuntime, len(fs.git.workspaces))
+	copy(workspaces, fs.git.workspaces)
+	fs.git.mu.Unlock()
+	if len(workspaces) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitCheckpointTimeout)
+	defer cancel()
+	for _, rt := range workspaces {
+		if err := fs.checkpointGitStateForRuntime(ctx, rt); err != nil {
+			log.Printf("git state final checkpoint failed for workspace %s root %s: %v", rt.workspace.WorkspaceID, rt.workspace.RootPath, err)
+		}
+	}
 }
 
 func (fs *Dat9FS) checkpointGitStateForRuntime(ctx context.Context, rt *gitWorkspaceRuntime) error {
@@ -3068,6 +3311,12 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 		fh.GitKind = e.Kind
 		fh.GitMode = e.Mode
 		fh.GitBaseObjectSHA = e.BaseObjectSHA
+	} else if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
+		if n, ok := rt.localHeadNode(rel); ok {
+			fh.GitKind = n.Kind
+			fh.GitMode = n.Mode
+			fh.GitBaseObjectSHA = n.ObjectSHA
+		}
 	} else if n, ok := rt.cleanNode(rel); ok {
 		fh.GitKind = n.Kind
 		fh.GitMode = n.Mode
@@ -3220,7 +3469,7 @@ func (fs *Dat9FS) setGitAttr(ctx context.Context, input *gofuse.SetAttrIn, entry
 				Op:            "chmod",
 				Kind:          gitOverlayKindForEntry(entry),
 				Mode:          gitFileModeString(entryMode, entry.IsDir),
-				BaseObjectSHA: gitBaseObjectSHA(rt, rel),
+				BaseObjectSHA: fs.gitBaseObjectSHA(ctx, rt, rel),
 			}
 			if _, err := fs.putGitOverlay(ctx, rt.workspace.WorkspaceID, req); err != nil {
 				return httpToFuseStatus(err)
@@ -3271,7 +3520,7 @@ func (fs *Dat9FS) setGitAttr(ctx context.Context, input *gofuse.SetAttrIn, entry
 				Op:            "upsert",
 				Kind:          "file",
 				Mode:          gitFileModeString(entry.Mode, false),
-				BaseObjectSHA: gitBaseObjectSHA(rt, rel),
+				BaseObjectSHA: fs.gitBaseObjectSHA(ctx, rt, rel),
 				Content:       data,
 				SizeBytes:     int64(len(data)),
 			}
@@ -3290,12 +3539,17 @@ func (fs *Dat9FS) setGitAttr(ctx context.Context, input *gofuse.SetAttrIn, entry
 	return gofuse.OK
 }
 
-func gitBaseObjectSHA(rt *gitWorkspaceRuntime, rel string) string {
+func (fs *Dat9FS) gitBaseObjectSHA(ctx context.Context, rt *gitWorkspaceRuntime, rel string) string {
 	if rt == nil {
 		return ""
 	}
 	if e, ok := rt.overlayEntry(rel); ok && e.BaseObjectSHA != "" {
 		return e.BaseObjectSHA
+	}
+	if localTree, _ := fs.ensureGitLocalHeadTree(ctx, rt); localTree {
+		if n, ok := rt.localHeadNode(rel); ok {
+			return n.ObjectSHA
+		}
 	}
 	if n, ok := rt.cleanNode(rel); ok {
 		return n.ObjectSHA
@@ -3400,7 +3654,7 @@ func (fs *Dat9FS) copyGitFileOverlay(ctx context.Context, rt *gitWorkspaceRuntim
 	size := int64(0)
 	mode := "100644"
 	kind := "file"
-	base := gitBaseObjectSHA(rt, oldRel)
+	base := fs.gitBaseObjectSHA(ctx, rt, oldRel)
 	if e, ok := rt.overlayEntry(oldRel); ok {
 		size = e.SizeBytes
 		mode = e.Mode

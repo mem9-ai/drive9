@@ -9049,14 +9049,16 @@ func (fs *Dat9FS) FlushAll() {
 		cf()
 	}
 
-	// Drain coalesced .git checkpoints before shutdown so replacement
-	// sandboxes can restore the latest lightweight Git state.
-	fs.drainGitStateCheckpoints()
-
 	// Drain git workspace overlay commits queued by interactive writeback.
 	// These include both file payloads and metadata entries such as chmod,
 	// mkdir, symlink, and whiteout.
 	fs.drainGitOverlayWrites()
+
+	// Drain coalesced .git checkpoints and then checkpoint every loaded git
+	// workspace once more. The final pass covers Git ref/index updates that
+	// arrived through lock-file rename sequences without a pending debounce.
+	fs.drainGitStateCheckpoints()
+	fs.checkpointAllGitWorkspaces()
 
 	// Drain all pending write-back uploads before shutting down.
 	if fs.uploader != nil {

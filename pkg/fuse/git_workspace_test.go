@@ -2672,6 +2672,65 @@ func TestGitWorkspaceTruncateOpenRefreshesDirtyMirror(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceLocalHeadTreeProvidesCommittedFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	baseContent := []byte("hello base\n")
+	localContent := []byte("committed local\n")
+	repo := createGitRepoWithReadme(t, baseContent)
+	if err := os.WriteFile(filepath.Join(repo, "committed-local.txt"), localContent, 0o644); err != nil {
+		t.Fatalf("write committed-local: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", "committed-local.txt")
+	runFuseTestGit(t, repo, "commit", "-m", "local commit")
+	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("archiveLocalGitDir: %v", err)
+	}
+
+	fixture := newGitWorkspaceFixture(t)
+	fixture.state = state
+	fixture.readmeObjectSHA = fuseGitOutputForTest(t, repo, "rev-parse", "HEAD~1:README.md")
+	fixture.readmeSize = int64(len(baseContent))
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "committed-local.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup committed-local status = %v, want OK", st)
+	}
+	if got := lookupOut.Size; got != uint64(len(localContent)) {
+		t.Fatalf("Lookup committed-local size = %d, want %d", got, len(localContent))
+	}
+	got, err := fs.readGitFile(context.Background(), "/repo/committed-local.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("read committed-local: %v", err)
+	}
+	if !bytes.Equal(got, localContent) {
+		t.Fatalf("committed-local content = %q, want %q", got, localContent)
+	}
+	entries, handled, err := fs.listGitDir(context.Background(), "/repo")
+	if err != nil {
+		t.Fatalf("listGitDir: %v", err)
+	}
+	if !handled {
+		t.Fatal("listGitDir handled = false, want true")
+	}
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		seen[entry.Name] = true
+	}
+	for _, name := range []string{"README.md", "committed-local.txt"} {
+		if !seen[name] {
+			t.Fatalf("listGitDir missing %s; entries=%v", name, seen)
+		}
+	}
+}
+
 func TestGitWorkspaceUnlinkCreateRefreshesDirtyMirror(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found")
