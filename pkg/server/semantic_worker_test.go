@@ -1789,3 +1789,89 @@ func waitForStoreTaskStatusByResource(t *testing.T, store *datastore.Store, reso
 	}
 	t.Fatalf("resource %s version %d status=%q, want %q", resourceID, version, status, want)
 }
+
+// newTestTenantPoolWithDisabledAutoEmbed creates a pool with DisableDatabaseAutoEmbedding=true
+// and optional BackendOptions.
+func newTestTenantPoolWithDisabledAutoEmbed(t *testing.T, opts backend.Options) *tenant.Pool {
+	t.Helper()
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{
+		S3Dir:                        mustTempDir(t),
+		PublicURL:                    "http://localhost",
+		BackendOptions:               opts,
+		DisableDatabaseAutoEmbedding: true,
+	}, enc)
+	t.Cleanup(func() { pool.Close() })
+	return pool
+}
+
+// TestPoolAutoSemanticTaskTypesDisabledAutoEmbed verifies that
+// Pool.AutoSemanticTaskTypes() still returns image/audio task types even when
+// DisableDatabaseAutoEmbedding=true. This is the regression case reported in
+// the startup error: the pool was returning nil, causing ValidateDurableAsync
+// ExtractRequiresSemanticWorker to fail.
+func TestPoolAutoSemanticTaskTypesDisabledAutoEmbed(t *testing.T) {
+	pool := newTestTenantPoolWithDisabledAutoEmbed(t, backend.Options{
+		AsyncImageExtract: backend.AsyncImageExtractOptions{Enabled: true},
+	})
+
+	types := pool.AutoSemanticTaskTypes()
+	if len(types) == 0 {
+		t.Fatal("AutoSemanticTaskTypes() = nil, want [img_extract_text] when image extract is enabled and auto-embed is disabled")
+	}
+	found := false
+	for _, tt := range types {
+		if tt == semantic.TaskTypeImgExtractText {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("AutoSemanticTaskTypes() = %v, want to include TaskTypeImgExtractText", types)
+	}
+	if pool.IsAutoEmbeddingDisabled() != true {
+		t.Fatal("IsAutoEmbeddingDisabled() = false, want true")
+	}
+}
+
+// TestSemanticWorkerTaskTypesForTargetDisabledAutoEmbedWithImageExtract verifies
+// that taskTypesForTarget includes img_extract_text/audio_extract_text for a
+// backend that has SupportsAsyncImageExtract/SupportsAsyncAudioExtract but
+// !UsesDatabaseAutoEmbedding (the DisableDatabaseAutoEmbedding=true case).
+func TestSemanticWorkerTaskTypesForTargetDisabledAutoEmbedWithImageExtract(t *testing.T) {
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 1,
+			Extractor: staticServerImageExtractor{text: "extract result"},
+		},
+	})
+
+	if b.UsesDatabaseAutoEmbedding() {
+		t.Skip("backend has database auto-embedding enabled; test targets the disabled path")
+	}
+	if !b.SupportsAsyncImageExtract() {
+		t.Fatal("SupportsAsyncImageExtract() = false; test requires image extract to be wired")
+	}
+
+	m := &semanticWorkerManager{}
+	m.opts.normalize()
+
+	types := m.taskTypesForTarget(b)
+	found := false
+	for _, tt := range types {
+		if tt == semantic.TaskTypeImgExtractText {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("taskTypesForTarget() = %v, want to include TaskTypeImgExtractText when SupportsAsyncImageExtract=true and !UsesDatabaseAutoEmbedding", types)
+	}
+}
