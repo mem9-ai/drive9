@@ -206,7 +206,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, err
 	}
 	if err := s.copyAutoEmbeddingProfileForFork(ctx, source.ID, forkID, source.Provider, now); err != nil {
-		s.markForkFailed(ctx, forkID)
+		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, err
 	}
 
@@ -668,7 +668,12 @@ func (s *Server) cleanupForkTenant(ctx context.Context, tenantID string) {
 	}
 	_ = s.meta.AbortActiveUploadReservations(ctx, tenantID)
 	if t.BranchID == "" {
-		logger.Error(ctx, "fork_cleanup_missing_branch_id", zap.String("tenant_id", tenantID), zap.String("status", string(t.Status)))
+		logger.Warn(ctx, "fork_cleanup_missing_branch_id", zap.String("tenant_id", tenantID), zap.String("status", string(t.Status)))
+		if t.Status == meta.TenantFailed || t.Status == meta.TenantDeleting {
+			if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
+				logger.Error(ctx, "fork_cleanup_mark_deleted_failed", zap.String("tenant_id", tenantID), zap.Error(err))
+			}
+		}
 		return
 	}
 	if t.Status != meta.TenantDeleting {
