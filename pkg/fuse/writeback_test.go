@@ -788,7 +788,7 @@ func TestWriteBackUploader_PendingOverwriteUsesBaseRevision(t *testing.T) {
 	}
 }
 
-func TestWriteBackUploader_OnSuccessReceivesUnknownStreamRevision(t *testing.T) {
+func TestWriteBackUploader_OnSuccessInfersStreamRevision(t *testing.T) {
 	var gotExpected string
 	data := []byte("edit")
 	var ts *httptest.Server
@@ -871,8 +871,8 @@ func TestWriteBackUploader_OnSuccessReceivesUnknownStreamRevision(t *testing.T) 
 	if successMeta.Path != "/existing.txt" {
 		t.Fatalf("OnSuccess path = %q, want /existing.txt", successMeta.Path)
 	}
-	if successRev != 0 {
-		t.Fatalf("OnSuccess committedRev = %d, want 0 for stream upload", successRev)
+	if successRev != 24 {
+		t.Fatalf("OnSuccess committedRev = %d, want 24 from CAS base revision", successRev)
 	}
 }
 
@@ -932,8 +932,12 @@ func TestWriteBackUploader_UploadSyncLegacyOverwriteFallsBackToUnconditional(t *
 	uploader := NewWriteBackUploader(c, cache, 1)
 
 	_ = cache.Put("/legacy-sync.txt", []byte("edit"), 4, PendingOverwrite)
-	if err := uploader.UploadSync(context.Background(), "/legacy-sync.txt"); err != nil {
-		t.Fatalf("UploadSync: %v", err)
+	committedRev, err := uploader.UploadSyncWithRevision(context.Background(), "/legacy-sync.txt")
+	if err != nil {
+		t.Fatalf("UploadSyncWithRevision: %v", err)
+	}
+	if committedRev != 0 {
+		t.Fatalf("UploadSyncWithRevision committedRev = %d, want 0 for unconditional legacy fallback", committedRev)
 	}
 
 	if putCalls.Load() != 1 {

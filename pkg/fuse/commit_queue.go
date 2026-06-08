@@ -720,6 +720,16 @@ func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEnt
 	return nil
 }
 
+func committedRevisionForExpectedRevision(expectedRevision, committedRev int64) int64 {
+	if committedRev > 0 {
+		return committedRev
+	}
+	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+		return revision
+	}
+	return 0
+}
+
 // uploadEntry uploads entry data to the server. Returns (committedRev, error).
 // committedRev > 0 only when the server-returned revision is available
 // (direct PUT). Multipart/streaming uploads return 0 because the current
@@ -844,6 +854,8 @@ func (cq *CommitQueue) rebuildQueuedIndexLocked() {
 }
 
 func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) error {
+	committedRev = committedRevisionForExpectedRevision(entry.BaseRev, committedRev)
+
 	if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var err error
