@@ -297,6 +297,87 @@ func TestListDir(t *testing.T) {
 	requireEmbeddingRevision(t, entries[0].File.EmbeddingRevision, 13)
 }
 
+func TestInsertNodeRejectsRootDentry(t *testing.T) {
+	s := newTestStore(t)
+	for _, name := range []string{"/", "root-alias"} {
+		err := s.InsertNode(context.Background(), &FileNode{
+			NodeID:      "root-" + name,
+			Path:        "/",
+			ParentPath:  "/",
+			Name:        name,
+			IsDirectory: true,
+			CreatedAt:   time.Now(),
+		})
+		if !errors.Is(err, ErrInvalidRootDentry) {
+			t.Fatalf("InsertNode root dentry name %q error = %v, want %v", name, err, ErrInvalidRootDentry)
+		}
+	}
+}
+
+func TestStoreRejectsRootPathWrites(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+
+	err := s.InsertNodeTx(s.DB(), &FileNode{
+		NodeID:      "root-tx",
+		Path:        "/",
+		ParentPath:  "/",
+		Name:        "root-alias",
+		IsDirectory: true,
+		CreatedAt:   now,
+	})
+	if !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("InsertNodeTx root path error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if err := s.UpdateNodePath(context.Background(), "/src.txt", "/", "/", "root-alias"); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("UpdateNodePath root destination error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if err := s.UpdateNodePath(context.Background(), "/", "/dst.txt", "/", "dst.txt"); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("UpdateNodePath root source error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if _, err := s.RenameFileReplacingTarget(context.Background(), "/src.txt", "/", "/", "root-alias"); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("RenameFileReplacingTarget root destination error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if _, err := s.RenameFileReplacingTarget(context.Background(), "/", "/dst.txt", "/", "dst.txt"); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("RenameFileReplacingTarget root source error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if err := s.LinkFileNodeTx(context.Background(), s.DB(), "/src.txt", "/", "/", "root-alias", "link-root", now); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("LinkFileNodeTx root destination error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	if err := s.LinkFileNodeTx(context.Background(), s.DB(), "/", "/dst.txt", "/", "dst.txt", "link-dst", now); !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("LinkFileNodeTx root source error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+}
+
+func TestListDirSkipsHistoricalRootDentry(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if _, err := s.DB().Exec(`
+		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, created_at)
+		VALUES (?, ?, ?, ?, 1, ?)`,
+		"root-self", "/", "/", "root-alias", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{
+		NodeID:      "d1",
+		Path:        "/data/",
+		ParentPath:  "/",
+		Name:        "data",
+		IsDirectory: true,
+		CreatedAt:   now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListDir(context.Background(), "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Node.Name != "data" {
+		t.Fatalf("ListDir entries = %+v, want only data", entries)
+	}
+}
+
 func TestListNodes(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
@@ -326,6 +407,35 @@ func TestListNodes(t *testing.T) {
 	}
 	if nodes[0].InodeID != "f1" {
 		t.Errorf("inode_id=%q, want f1", nodes[0].InodeID)
+	}
+}
+
+func TestListNodesSkipsHistoricalRootDentry(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if _, err := s.DB().Exec(`
+		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, created_at)
+		VALUES (?, ?, ?, ?, 1, ?)`,
+		"root-self", "/", "/", "root-alias", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{
+		NodeID:      "d1",
+		Path:        "/data/",
+		ParentPath:  "/",
+		Name:        "data",
+		IsDirectory: true,
+		CreatedAt:   now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	nodes, err := s.ListNodes(context.Background(), "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "data" {
+		t.Fatalf("ListNodes entries = %+v, want only data", nodes)
 	}
 }
 
@@ -1255,6 +1365,44 @@ func TestChmod(t *testing.T) {
 	}
 	if got.Mode != 0o600 {
 		t.Errorf("mode=%o, want 0o600", got.Mode)
+	}
+}
+
+func TestChmodRejectsHistoricalRootDentry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	const inodeID = "root-inode"
+	const originalMode = 0o755
+
+	if err := s.InsertInode(ctx, &Inode{
+		InodeID:   inodeID,
+		SizeBytes: 0,
+		Revision:  1,
+		Mode:      originalMode,
+		Status:    StatusConfirmed,
+		CreatedAt: now,
+		Mtime:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `
+		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, inode_id, created_at)
+		VALUES (?, ?, ?, ?, 1, ?, ?)`,
+		"root-node", "/", "/", "root-alias", inodeID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.Chmod(ctx, "/", 0o700)
+	if !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("Chmod(/) error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	var mode uint32
+	if err := s.DB().QueryRowContext(ctx, `SELECT mode FROM inodes WHERE inode_id = ?`, inodeID).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != originalMode {
+		t.Fatalf("root inode mode = %o, want unchanged %o", mode, originalMode)
 	}
 }
 

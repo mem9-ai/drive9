@@ -4778,6 +4778,33 @@ func TestReadDirPlusStaleSnapshotUsesStoredEntryMetadataAfterDirCacheInvalidated
 	}
 }
 
+func TestRemoteListSkipsInvalidDirEntryNames(t *testing.T) {
+	items := []client.FileInfo{
+		{Name: "/"},
+		{Name: ""},
+		{Name: "."},
+		{Name: ".."},
+		{Name: "bad/name"},
+		{Name: "ok.txt"},
+	}
+	cached := cachedFileInfos(items)
+	if len(cached) != 1 || cached[0].Name != "ok.txt" {
+		t.Fatalf("cachedFileInfos = %+v, want only ok.txt", cached)
+	}
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	entries := fs.cachedToDirEntries("/", []CachedFileInfo{
+		{Name: "/"},
+		{Name: "bad/name"},
+		{Name: "ok.txt"},
+	})
+	if len(entries) != 1 || entries[0].Name != "ok.txt" {
+		t.Fatalf("cachedToDirEntries = %+v, want only ok.txt", entries)
+	}
+}
+
 func TestLookupSSEForeignDeleteInvalidatesPositiveNamespaceHit(t *testing.T) {
 	var headCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

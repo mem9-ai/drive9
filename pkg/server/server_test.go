@@ -87,6 +87,30 @@ func insertTestS3File(t *testing.T, s *Server, p string, size int64) {
 	}
 }
 
+func insertHistoricalRootDentry(t *testing.T, s *Server, inodeID string, mode uint32) {
+	t.Helper()
+	ctx := context.Background()
+	now := time.Now().UTC()
+	store := s.fallback.Store()
+	if err := store.InsertInode(ctx, &datastore.Inode{
+		InodeID:   inodeID,
+		SizeBytes: 0,
+		Revision:  1,
+		Mode:      mode,
+		Status:    datastore.StatusConfirmed,
+		CreatedAt: now,
+		Mtime:     now,
+	}); err != nil {
+		t.Fatalf("insert root inode: %v", err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `
+		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, inode_id, created_at)
+		VALUES (?, ?, ?, ?, 1, ?, ?)`,
+		"node-"+inodeID, "/", "/", "root-alias", inodeID, now); err != nil {
+		t.Fatalf("insert historical root dentry: %v", err)
+	}
+}
+
 func newLocalTenantShimServer(t *testing.T, apiKey string) *Server {
 	t.Helper()
 
@@ -1030,6 +1054,75 @@ func TestSymlinkRoundTrip(t *testing.T) {
 	}
 	if string(body) != "../target.txt" {
 		t.Fatalf("read link payload = %q, want ../target.txt", body)
+	}
+}
+
+func TestChmodRootHistoricalDentryReturnsBadRequest(t *testing.T) {
+	s := newTestServer(t)
+	const inodeID = "root-inode"
+	const originalMode = 0o755
+	insertHistoricalRootDentry(t, s, inodeID, originalMode)
+
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/fs/?chmod=1", strings.NewReader(`{"mode":448}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+
+	var mode uint32
+	if err := s.fallback.Store().DB().QueryRowContext(context.Background(), `SELECT mode FROM inodes WHERE inode_id = ?`, inodeID).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != originalMode {
+		t.Fatalf("root inode mode = %o, want unchanged %o", mode, originalMode)
+	}
+}
+
+func TestPatchAndAppendRootReturnBadRequest(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	cases := []struct {
+		name   string
+		method string
+		url    string
+		body   string
+	}{
+		{
+			name:   "patch",
+			method: http.MethodPatch,
+			url:    ts.URL + "/v1/fs/",
+			body:   `{"new_size":1,"dirty_parts":[1]}`,
+		},
+		{
+			name:   "append",
+			method: http.MethodPost,
+			url:    ts.URL + "/v1/fs/?append=1",
+			body:   `{"append_size":1}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(tc.method, tc.url, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusBadRequest)
+			}
+		})
 	}
 }
 

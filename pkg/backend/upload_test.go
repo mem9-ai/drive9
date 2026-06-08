@@ -58,6 +58,16 @@ func newTestBackendWithS3AndOptions(t *testing.T, opts Options) *Dat9Backend {
 	return b
 }
 
+type completeRecordingS3Client struct {
+	s3client.S3Client
+	completeCalls int
+}
+
+func (c *completeRecordingS3Client) CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []s3client.Part) error {
+	c.completeCalls++
+	return c.S3Client.CompleteMultipartUpload(ctx, key, uploadID, parts)
+}
+
 func newTestBackendNoS3(t *testing.T) *Dat9Backend {
 	t.Helper()
 	initBackendSchema(t, testDSN)
@@ -219,6 +229,30 @@ func TestInitiateAndConfirmUpload(t *testing.T) {
 	}
 	if url == "" {
 		t.Error("expected non-empty presigned URL")
+	}
+}
+
+func TestFinalizeUploadRejectsRootTargetBeforeS3Complete(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	rec := &completeRecordingS3Client{S3Client: b.s3}
+	b.s3 = rec
+
+	err := b.finalizeUpload(context.Background(), &datastore.Upload{
+		UploadID:   "upload-root",
+		FileID:     "pending-root",
+		TargetPath: "/",
+		S3UploadID: "s3-root",
+		S3Key:      "blobs/root",
+		TotalSize:  1,
+		PartSize:   1,
+		PartsTotal: 1,
+		Status:     datastore.UploadUploading,
+	}, []s3client.Part{{Number: 1, Size: 1, ETag: "etag"}}, nil)
+	if !errors.Is(err, datastore.ErrInvalidRootDentry) {
+		t.Fatalf("finalizeUpload root target error = %v, want %v", err, datastore.ErrInvalidRootDentry)
+	}
+	if rec.completeCalls != 0 {
+		t.Fatalf("CompleteMultipartUpload calls = %d, want 0", rec.completeCalls)
 	}
 }
 
