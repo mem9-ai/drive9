@@ -1526,20 +1526,35 @@ func diffTiDBTable(ctx context.Context, db *sql.DB, table tidbTableSpec) ([]tidb
 }
 
 func loadObservedTiDBIndexes(ctx context.Context, db *sql.DB, tableName, createStmt string) (map[string]struct{}, bool) {
-	indexNames, err := loadTiDBIndexNames(ctx, db, tableName)
-	if err == nil {
-		return indexNames, true
+	indexNames, statErr := loadTiDBIndexNames(ctx, db, tableName)
+	if statErr != nil {
+		logger.Warn(ctx, "tenant_tidb_schema_load_index_metadata_failed",
+			zap.String("table", tableName),
+			zap.Error(statErr))
 	}
-	logger.Warn(ctx, "tenant_tidb_schema_load_index_metadata_failed",
-		zap.String("table", tableName),
-		zap.Error(err))
-	observedIndexes, ok := parseObservedTiDBIndexes(createStmt)
-	if ok {
-		return observedIndexes, true
+
+	merged := make(map[string]struct{})
+	if statErr == nil {
+		for name := range indexNames {
+			merged[name] = struct{}{}
+		}
 	}
-	logger.Warn(ctx, "tenant_tidb_schema_parse_show_create_indexes_failed",
-		zap.String("table", tableName))
-	return nil, false
+
+	if observedIndexes, ok := parseObservedTiDBIndexes(createStmt); ok {
+		for name := range observedIndexes {
+			if _, exists := merged[name]; !exists {
+				merged[name] = struct{}{}
+			}
+		}
+	} else if statErr != nil {
+		logger.Warn(ctx, "tenant_tidb_schema_parse_show_create_indexes_failed",
+			zap.String("table", tableName))
+	}
+
+	if len(merged) == 0 && statErr != nil {
+		return nil, false
+	}
+	return merged, true
 }
 
 func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
@@ -2232,6 +2247,14 @@ func parseObservedTiDBIndexes(createStmt string) (map[string]struct{}, bool) {
 			if name, _ := parseIndexNameAndColumns(def, "VECTOR INDEX"); name != "" {
 				observed[name] = struct{}{}
 			}
+		case strings.HasPrefix(normalized, "spatial index "):
+			if name, _ := parseIndexNameAndColumns(def, "SPATIAL INDEX"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "spatial key "):
+			if name, _ := parseIndexNameAndColumns(def, "SPATIAL KEY"); name != "" {
+				observed[name] = struct{}{}
+			}
 		case strings.HasPrefix(normalized, "index "):
 			if name, _ := parseIndexNameAndColumns(def, "INDEX"); name != "" {
 				observed[name] = struct{}{}
@@ -2393,10 +2416,11 @@ func isSafeAddColumnRepairSQL(sqlText string) bool {
 
 func isSafeAddIndexRepairSQL(sqlText string) bool {
 	normalized := normalizeSQLFragment(sqlText)
-	if strings.HasPrefix(normalized, "create index ") {
-		return true
-	}
-	if strings.HasPrefix(normalized, "create unique index ") {
+	if strings.HasPrefix(normalized, "create index ") ||
+		strings.HasPrefix(normalized, "create unique index ") ||
+		strings.HasPrefix(normalized, "create fulltext index ") ||
+		strings.HasPrefix(normalized, "create vector index ") ||
+		strings.HasPrefix(normalized, "create spatial index ") {
 		return true
 	}
 	if strings.HasPrefix(normalized, "alter table ") {
