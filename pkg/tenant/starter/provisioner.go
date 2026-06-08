@@ -68,6 +68,10 @@ func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
 	return schema.EnsureTiDBSchemaForModeDSN(ctx, dsn, schema.TiDBEmbeddingModeAuto)
 }
 
+func (p *Provisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, dsn string, profile schema.TiDBAutoEmbeddingProfile) error {
+	return schema.EnsureTiDBSchemaForAutoEmbeddingProfileDSN(ctx, dsn, profile)
+}
+
 func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
 	password, err := generateRandomPassword(24)
 	if err != nil {

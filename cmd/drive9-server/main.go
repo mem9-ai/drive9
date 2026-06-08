@@ -30,6 +30,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/slockoauth"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/db9"
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 	"github.com/mem9-ai/dat9/pkg/tenant/starter"
 	"github.com/mem9-ai/dat9/pkg/tenant/tidbzero"
 )
@@ -66,6 +67,7 @@ func main() {
 			_, _ = fmt.Fprint(os.Stdout, versionText())
 			return
 		case "schema":
+			die(schema.ConfigureTiDBAutoEmbeddingFromEnv())
 			die(runSchemaCommand(os.Args[2:]))
 			return
 		case "backfill-quota":
@@ -76,6 +78,9 @@ func main() {
 	if len(os.Args) > 2 {
 		usage(os.Stderr, 2)
 	}
+	autoEmbeddingConfig, err := schema.TiDBAutoEmbeddingConfigFromEnv()
+	die(err)
+	die(schema.ConfigureTiDBAutoEmbedding(autoEmbeddingConfig))
 
 	addr := envOr("DRIVE9_LISTEN_ADDR", defaultListenAddr)
 	if len(os.Args) == 2 {
@@ -103,6 +108,8 @@ func main() {
 	if err != nil {
 		die(err)
 	}
+	autoEmbeddingAPIKey := strings.TrimSpace(os.Getenv(schema.EnvTiDBAutoEmbeddingAPIKey))
+	autoEmbeddingAPIBase := strings.TrimSpace(os.Getenv(schema.EnvTiDBAutoEmbeddingAPIBase))
 	semanticEmbedder, semanticWorkerOpts, err := buildSemanticWorkerConfigFromEnv()
 	if err != nil {
 		die(err)
@@ -153,6 +160,14 @@ func main() {
 	providerType, err = tenant.NormalizeProvider(providerType)
 	if err != nil {
 		die(err)
+	}
+	disableDatabaseAutoEmbedding := envBool("DRIVE9_DISABLE_AUTO_EMBEDDING", false)
+	if tenant.UsesTiDBAutoEmbedding(providerType) && !disableDatabaseAutoEmbedding {
+		die(schema.ValidateTiDBAutoEmbeddingProviderConfig(schema.TiDBAutoEmbeddingProviderConfig{
+			Model:   autoEmbeddingConfig.Model,
+			APIKey:  autoEmbeddingAPIKey,
+			APIBase: autoEmbeddingAPIBase,
+		}))
 	}
 	logger.Info(context.Background(), "tenant_provider_selected", zap.String("provider", providerType))
 
@@ -220,7 +235,7 @@ func main() {
 			S3SessionToken:               s3cfg.SessionToken,
 			S3EncryptionPolicy:           s3cfg.EncryptionPolicy,
 			BackendOptions:               backendOptions,
-			DisableDatabaseAutoEmbedding: envBool("DRIVE9_DISABLE_AUTO_EMBEDDING", false),
+			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 		}, enc)
 		defer pool.Close()
 	}
@@ -246,17 +261,21 @@ func main() {
 		// for db9-only pools, which never hit that path but still get forced to configure
 		// DRIVE9_EMBED_* when async extract is wired on the template (PR #159 review).
 		if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
-			Meta:             store,
-			Pool:             pool,
-			Provisioner:      provisioner,
-			TokenSecret:      tokenSecret,
-			VaultMasterKey:   vaultMasterKey,
-			S3Dir:            s3cfg.Dir,
-			MaxUploadBytes:   maxUploadBytes,
-			InlineThreshold:  backendOptions.InlineThreshold,
-			Logger:           srvLogger,
-			SemanticEmbedder: semanticEmbedder,
-			SemanticWorkers:  semanticWorkerOpts,
+			Meta:                         store,
+			Pool:                         pool,
+			Provisioner:                  provisioner,
+			TokenSecret:                  tokenSecret,
+			VaultMasterKey:               vaultMasterKey,
+			S3Dir:                        s3cfg.Dir,
+			MaxUploadBytes:               maxUploadBytes,
+			InlineThreshold:              backendOptions.InlineThreshold,
+			Logger:                       srvLogger,
+			SemanticEmbedder:             semanticEmbedder,
+			SemanticWorkers:              semanticWorkerOpts,
+			TiDBAutoEmbeddingConfig:      autoEmbeddingConfig,
+			TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
+			TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
+			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 		}, backendOptions, false); err != nil {
 			die(err)
 		}
@@ -273,20 +292,24 @@ func main() {
 	}
 
 	die(server.NewWithConfig(server.Config{
-		Meta:             store,
-		Pool:             pool,
-		Provisioner:      provisioner,
-		TokenSecret:      tokenSecret,
-		VaultMasterKey:   vaultMasterKey,
-		VaultIssuerURL:   vaultIssuerURL(addr),
-		PublicURL:        publicBaseURL(addr),
-		S3Dir:            s3cfg.Dir,
-		MaxUploadBytes:   maxUploadBytes,
-		InlineThreshold:  backendOptions.InlineThreshold,
-		Logger:           srvLogger,
-		SemanticEmbedder: semanticEmbedder,
-		SemanticWorkers:  semanticWorkerOpts,
-		SlockOAuth:       slockOAuth,
+		Meta:                         store,
+		Pool:                         pool,
+		Provisioner:                  provisioner,
+		TokenSecret:                  tokenSecret,
+		VaultMasterKey:               vaultMasterKey,
+		VaultIssuerURL:               vaultIssuerURL(addr),
+		PublicURL:                    publicBaseURL(addr),
+		S3Dir:                        s3cfg.Dir,
+		MaxUploadBytes:               maxUploadBytes,
+		InlineThreshold:              backendOptions.InlineThreshold,
+		Logger:                       srvLogger,
+		SemanticEmbedder:             semanticEmbedder,
+		SemanticWorkers:              semanticWorkerOpts,
+		SlockOAuth:                   slockOAuth,
+		TiDBAutoEmbeddingConfig:      autoEmbeddingConfig,
+		TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
+		TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
+		DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 	}).ListenAndServe(addr))
 }
 
@@ -397,6 +420,16 @@ environment:
   DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
   DRIVE9_DISABLE_AUTO_EMBEDDING true|false disable TiDB database-managed auto-embedding (default: false)
                                 set to true when the TiDB Cloud cluster has no supported embedding provider
+  DRIVE9_TIDB_AUTO_EMBEDDING_MODEL TiDB EMBED_TEXT model for auto-embedding generated columns
+                                   supported provider prefixes include tidbcloud_free/amazon, tidbcloud_free/cohere,
+                                   openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
+                                   (default: tidbcloud_free/amazon/titan-embed-text-v2)
+  DRIVE9_TIDB_AUTO_EMBEDDING_DIMENSIONS TiDB EMBED_TEXT vector dimensions
+                                        known models use documented defaults; unknown BYOK models require this value
+  DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY provider API key for BYOK auto-embedding models
+                                    required by openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
+  DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE provider base endpoint for models that require it
+                                     optional for openai models; set it for Azure OpenAI endpoints
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
   DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default Starter spendingLimit.monthly in USD cents; applied after pool takeover
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*

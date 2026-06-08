@@ -28,6 +28,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/slockoauth"
 	"github.com/mem9-ai/dat9/pkg/tagutil"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	tenantschema "github.com/mem9-ai/dat9/pkg/tenant/schema"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/traceid"
 	"github.com/mem9-ai/dat9/pkg/vault"
@@ -55,12 +56,23 @@ type Config struct {
 	SemanticEmbedder embedding.Client
 	SemanticWorkers  SemanticWorkerOptions
 	SlockOAuth       SlockOAuthClient
+
+	TiDBAutoEmbeddingConfig  tenantschema.TiDBAutoEmbeddingConfig
+	TiDBAutoEmbeddingAPIKey  string
+	TiDBAutoEmbeddingAPIBase string
+	// DisableDatabaseAutoEmbedding suppresses runtime writes that would trigger
+	// TiDB EMBED_TEXT, but TiDB tenants still use the normal auto schema.
+	DisableDatabaseAutoEmbedding bool
 }
 
 type SlockOAuthClient interface {
 	LoginURL() string
 	ExchangeCode(ctx context.Context, code string) (slockoauth.Token, error)
 	Userinfo(ctx context.Context, accessToken string) (slockoauth.UserInfo, error)
+}
+
+type autoEmbeddingSchemaProvisioner interface {
+	InitSchemaForAutoEmbeddingProfile(context.Context, string, tenantschema.TiDBAutoEmbeddingProfile) error
 }
 
 type Server struct {
@@ -83,11 +95,19 @@ type Server struct {
 	journalCursorSecret []byte
 	objectGCWorker      *objectGCWorker
 	slockOAuth          SlockOAuthClient
+	tidbAutoEmbedding   tenantAutoEmbeddingDefault
+	disableDBAutoEmbed  bool
 	forkWorkerCtx       context.Context
 	forkWorkerCancel    context.CancelFunc
 	forkWorkerWG        sync.WaitGroup
 	forkWorkerMu        sync.Mutex
 	forkWorkerClosed    bool
+}
+
+type tenantAutoEmbeddingDefault struct {
+	config  tenantschema.TiDBAutoEmbeddingConfig
+	apiKey  string
+	apiBase string
 }
 
 var (
@@ -159,21 +179,27 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
-		fallback:            cfg.Backend,
-		meta:                cfg.Meta,
-		pool:                cfg.Pool,
-		tokenSecret:         cfg.TokenSecret,
-		localTenantAPIKey:   strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:             vaultMK,
-		vaultIssuerURL:      strings.TrimSpace(cfg.VaultIssuerURL),
-		publicURL:           strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
-		provisioner:         cfg.Provisioner,
-		maxUploadBytes:      maxUpload,
-		inlineThreshold:     inlineThreshold,
-		metrics:             newServerMetrics(),
-		logger:              logger,
-		events:              newEventBuses(),
-		slockOAuth:          cfg.SlockOAuth,
+		fallback:          cfg.Backend,
+		meta:              cfg.Meta,
+		pool:              cfg.Pool,
+		tokenSecret:       cfg.TokenSecret,
+		localTenantAPIKey: strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:           vaultMK,
+		vaultIssuerURL:    strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:         strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
+		provisioner:       cfg.Provisioner,
+		maxUploadBytes:    maxUpload,
+		inlineThreshold:   inlineThreshold,
+		metrics:           newServerMetrics(),
+		logger:            logger,
+		events:            newEventBuses(),
+		slockOAuth:        cfg.SlockOAuth,
+		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
+			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
+			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
+			apiBase: strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIBase),
+		},
+		disableDBAutoEmbed:  cfg.DisableDatabaseAutoEmbedding || (cfg.Pool != nil && cfg.Pool.IsAutoEmbeddingDisabled()),
 		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
@@ -372,7 +398,7 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 			return
 		}
 		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
-		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.provisioner.InitSchema)
+		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.schemaInitForTenant(t.ID, t.Provider, s.provisioner.InitSchema))
 	})
 }
 
@@ -3248,6 +3274,102 @@ func newProvisionTenantError(status int, message string, err error) *provisionTe
 	return &provisionTenantError{status: status, message: message, err: err}
 }
 
+func defaultTiDBAutoEmbeddingConfig(cfg tenantschema.TiDBAutoEmbeddingConfig) tenantschema.TiDBAutoEmbeddingConfig {
+	if cfg.Model == "" && cfg.Dimensions == 0 {
+		return tenantschema.CurrentTiDBAutoEmbeddingConfig()
+	}
+	return cfg
+}
+
+func (s *Server) defaultAutoEmbeddingProfileForTenant(ctx context.Context, tenantID, provider string, now time.Time) (*meta.TenantAutoEmbeddingProfile, error) {
+	if !tenant.UsesTiDBAutoEmbedding(provider) {
+		return nil, nil
+	}
+	schemaProfile, err := tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
+	if err != nil {
+		return nil, err
+	}
+	if !s.disableDBAutoEmbed {
+		if err := tenantschema.ValidateTiDBAutoEmbeddingProviderConfig(tenantschema.TiDBAutoEmbeddingProviderConfig{
+			Model:   schemaProfile.Model,
+			APIKey:  s.tidbAutoEmbedding.apiKey,
+			APIBase: s.tidbAutoEmbedding.apiBase,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	var apiKeyCipher []byte
+	if s.tidbAutoEmbedding.apiKey != "" {
+		cipher, err := s.pool.Encrypt(ctx, []byte(s.tidbAutoEmbedding.apiKey))
+		if err != nil {
+			return nil, fmt.Errorf("encrypt tenant auto-embedding api key: %w", err)
+		}
+		apiKeyCipher = cipher
+	}
+	return &meta.TenantAutoEmbeddingProfile{
+		TenantID:     tenantID,
+		Model:        schemaProfile.Model,
+		Dimensions:   schemaProfile.Dimensions,
+		OptionsJSON:  schemaProfile.OptionsJSON,
+		APIBase:      s.tidbAutoEmbedding.apiBase,
+		APIKeyCipher: apiKeyCipher,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}, nil
+}
+
+func (s *Server) copyAutoEmbeddingProfileForFork(ctx context.Context, sourceTenantID, forkTenantID, provider string, now time.Time) error {
+	if !tenant.UsesTiDBAutoEmbedding(provider) {
+		return nil
+	}
+	sourceProfile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, sourceTenantID)
+	if err != nil {
+		return err
+	}
+	return s.meta.UpsertTenantAutoEmbeddingProfile(ctx, &meta.TenantAutoEmbeddingProfile{
+		TenantID:     forkTenantID,
+		Model:        sourceProfile.Model,
+		Dimensions:   sourceProfile.Dimensions,
+		OptionsJSON:  sourceProfile.OptionsJSON,
+		APIBase:      sourceProfile.APIBase,
+		APIKeyCipher: append([]byte(nil), sourceProfile.APIKeyCipher...),
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	})
+}
+
+func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID string) (tenantschema.TiDBAutoEmbeddingProfile, error) {
+	if s.meta == nil {
+		return tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
+	}
+	profile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, tenantID)
+	if err != nil {
+		return tenantschema.TiDBAutoEmbeddingProfile{}, err
+	}
+	return tenantschema.TiDBAutoEmbeddingProfile{
+		Model:       profile.Model,
+		Dimensions:  profile.Dimensions,
+		OptionsJSON: profile.OptionsJSON,
+	}, nil
+}
+
+func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(context.Context, string) error) func(context.Context, string) error {
+	if !tenant.UsesTiDBAutoEmbedding(provider) {
+		return fallback
+	}
+	profileAware, ok := s.provisioner.(autoEmbeddingSchemaProvisioner)
+	if !ok {
+		return fallback
+	}
+	return func(ctx context.Context, dsn string) error {
+		profile, err := s.autoEmbeddingProfileForTenant(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
+		}
+		return profileAware.InitSchemaForAutoEmbeddingProfile(ctx, dsn, profile)
+	}
+}
+
 func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
 	rawProvider := s.provisioner.ProviderType()
 	provider, err := tenant.NormalizeProvider(rawProvider)
@@ -3264,6 +3386,12 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		keyName = "default"
 	}
 	now := time.Now().UTC()
+	autoProfile, err := s.defaultAutoEmbeddingProfileForTenant(ctx, tenantID, provider, now)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_auto_embedding_profile_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to build tenant auto-embedding profile", err)
+	}
 	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantPending,
@@ -3284,6 +3412,17 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant", err)
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
+
+	if autoProfile != nil {
+		if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, autoProfile); err != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_auto_embedding_profile_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+				logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+			}
+			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant auto-embedding profile", err)
+		}
+	}
 
 	cluster, err := s.provisioner.Provision(ctx, tenantID)
 	if err != nil {
@@ -3390,7 +3529,7 @@ func (s *Server) startProvisionedTenantSchemaInit(ctx context.Context, res *prov
 	}
 	// Tenant remains in provisioning state until schema initialization succeeds.
 	s.startServerWorker(ctx, func(workerCtx context.Context) {
-		s.initTenantSchemaAsync(workerCtx, res.TenantID, res.TenantDSN, res.Provider, s.provisioner.InitSchema)
+		s.initTenantSchemaAsync(workerCtx, res.TenantID, res.TenantDSN, res.Provider, s.schemaInitForTenant(res.TenantID, res.Provider, s.provisioner.InitSchema))
 	})
 }
 

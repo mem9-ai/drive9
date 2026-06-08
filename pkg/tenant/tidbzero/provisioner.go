@@ -36,6 +36,10 @@ func (p *Provisioner) InitSchema(_ context.Context, dsn string) error {
 	return schema.InitTiDBTenantSchema(dsn)
 }
 
+func (p *Provisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, dsn string, profile schema.TiDBAutoEmbeddingProfile) error {
+	return schema.InitTiDBTenantSchemaForAutoEmbeddingProfileContext(ctx, dsn, profile)
+}
+
 func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
 	type reqBody struct {
 		Tag string `json:"tag"`

@@ -60,6 +60,7 @@ func main() {
 		_, _ = fmt.Fprint(os.Stdout, versionText())
 		return
 	}
+	die(schema.ConfigureTiDBAutoEmbeddingFromEnv())
 
 	startupCtx := context.Background()
 	startupStart := time.Now()
@@ -154,6 +155,18 @@ func main() {
 		die(fmt.Errorf("detect local embedding mode: %w", err))
 	}
 	backendOpts.DatabaseAutoEmbedding = localEmbeddingMode == schema.TiDBEmbeddingModeAuto
+	if backendOpts.DatabaseAutoEmbedding {
+		autoEmbeddingAPIKey := strings.TrimSpace(os.Getenv(schema.EnvTiDBAutoEmbeddingAPIKey))
+		autoEmbeddingAPIBase := strings.TrimSpace(os.Getenv(schema.EnvTiDBAutoEmbeddingAPIBase))
+		autoEmbeddingConfig := schema.CurrentTiDBAutoEmbeddingConfig()
+		if err := schema.ApplyTiDBAutoEmbeddingProviderConfig(startupCtx, store.DB(), schema.TiDBAutoEmbeddingProviderConfig{
+			Model:   autoEmbeddingConfig.Model,
+			APIKey:  autoEmbeddingAPIKey,
+			APIBase: autoEmbeddingAPIBase,
+		}); err != nil {
+			die(fmt.Errorf("apply local auto-embedding provider config: %w", err))
+		}
+	}
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "detect_local_embedding_mode",
 		zap.String("embedding_mode", string(localEmbeddingMode)))
 
@@ -342,6 +355,16 @@ environment:
   DRIVE9_LOCAL_API_KEY fixed API key returned by local /v1/provision and accepted by /v1/status (default: local-dev-key)
   DRIVE9_LOCAL_INIT_SCHEMA initialize tenant schema on startup (default: false)
   DRIVE9_LOCAL_EMBEDDING_MODE auto|app|detect (default: auto when initing schema, detect otherwise)
+  DRIVE9_TIDB_AUTO_EMBEDDING_MODEL TiDB EMBED_TEXT model for auto-embedding generated columns
+                                   supported provider prefixes include tidbcloud_free/amazon, tidbcloud_free/cohere,
+                                   openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
+                                   (default: tidbcloud_free/amazon/titan-embed-text-v2)
+  DRIVE9_TIDB_AUTO_EMBEDDING_DIMENSIONS TiDB EMBED_TEXT vector dimensions
+                                        known models use documented defaults; unknown BYOK models require this value
+  DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY provider API key for BYOK auto-embedding models
+                                    required by openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
+  DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE provider base endpoint for models that require it
+                                     optional for openai models; set it for Azure OpenAI endpoints
   DRIVE9_LOCAL_META_DSN  local control-plane MySQL DSN for central quota (optional; enables server-mode quota enforcement)
   DRIVE9_VAULT_MASTER_KEY 32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
