@@ -1364,7 +1364,7 @@ func defaultPackArchivePath(remoteRoot string, profile string) (string, error) {
 	if err := validateProfileName(profile); err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256([]byte(remoteRoot))
+	sum := sha256.Sum256([]byte(profile + "\x00" + remoteRoot))
 	hash := hex.EncodeToString(sum[:8])
 	label := path.Base(remoteRoot)
 	if label == "." || label == "/" || label == "" {

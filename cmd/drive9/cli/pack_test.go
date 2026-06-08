@@ -504,8 +504,92 @@ func TestDefaultPackArchivePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("defaultPackArchivePath custom: %v", err)
 	}
-	if custom != got {
-		t.Fatalf("custom default archive path = %q, want same path as default profile %q", custom, got)
+	if !strings.HasPrefix(custom, defaultPackRoot+"/root-") || !strings.HasSuffix(custom, ".tar.gz") {
+		t.Fatalf("custom default archive path = %q, want flat hidden pack path", custom)
+	}
+	if strings.Contains(custom, "with-pack") {
+		t.Fatalf("custom default archive path = %q, should not include profile name", custom)
+	}
+	if custom == got {
+		t.Fatalf("custom default archive path = %q, want profile-isolated path distinct from %q", custom, got)
+	}
+}
+
+func TestDefaultPackArchivePathSeparatesProfilesForSameRemoteRoot(t *testing.T) {
+	remoteRoot := "/remote/root"
+	codingArchive, err := defaultPackArchivePath(remoteRoot, "coding-agent")
+	if err != nil {
+		t.Fatalf("defaultPackArchivePath coding-agent: %v", err)
+	}
+	customArchive, err := defaultPackArchivePath(remoteRoot, "with-pack")
+	if err != nil {
+		t.Fatalf("defaultPackArchivePath custom: %v", err)
+	}
+	if codingArchive == customArchive {
+		t.Fatalf("default archive path collision for same remote root: %q", codingArchive)
+	}
+
+	stored := map[string][]byte{}
+	var readErr error
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut || !strings.HasPrefix(r.URL.Path, "/v1/fs"+defaultPackRoot+"/") {
+			http.NotFound(w, r)
+			return
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			readErr = err
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		stored[strings.TrimPrefix(r.URL.Path, "/v1/fs")] = append([]byte(nil), body...)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"revision":1}`))
+	}))
+	defer srv.Close()
+
+	localRoot := t.TempDir()
+	mustWriteFile(t, filepath.Join(localRoot, "overlay", ".git", "config"), []byte("git\n"), 0o644)
+	mustWriteFile(t, filepath.Join(localRoot, "overlay", "dist", "app.js"), []byte("bundle\n"), 0o644)
+	c := client.New(srv.URL, "sk-test")
+	c.SetSmallFileThresholdForTests(1 << 30)
+
+	if err := packRemoteArchive(context.Background(), c, codingArchive, packOptions{
+		LocalRoot:        localRoot,
+		RemoteRoot:       remoteRoot,
+		Profile:          "coding-agent",
+		ProfilePackPaths: []string{".git"},
+	}); err != nil {
+		t.Fatalf("pack coding-agent archive: %v", err)
+	}
+	if err := packRemoteArchive(context.Background(), c, customArchive, packOptions{
+		LocalRoot:        localRoot,
+		RemoteRoot:       remoteRoot,
+		Profile:          "with-pack",
+		ProfilePackPaths: []string{"dist"},
+	}); err != nil {
+		t.Fatalf("pack custom archive: %v", err)
+	}
+	if readErr != nil {
+		t.Fatalf("read upload body: %v", readErr)
+	}
+	if len(stored) != 2 {
+		t.Fatalf("stored archive count = %d, want 2; paths=%v", len(stored), reflect.ValueOf(stored).MapKeys())
+	}
+
+	codingManifest, err := readPackArchiveManifest(context.Background(), bytes.NewReader(stored[codingArchive]))
+	if err != nil {
+		t.Fatalf("read coding-agent manifest: %v", err)
+	}
+	if codingManifest.Profile != "coding-agent" || !reflect.DeepEqual(codingManifest.Paths, []string{"/.git"}) {
+		t.Fatalf("coding-agent manifest profile/paths = %q/%v, want coding-agent/[/.git]", codingManifest.Profile, codingManifest.Paths)
+	}
+	customManifest, err := readPackArchiveManifest(context.Background(), bytes.NewReader(stored[customArchive]))
+	if err != nil {
+		t.Fatalf("read custom manifest: %v", err)
+	}
+	if customManifest.Profile != "with-pack" || !reflect.DeepEqual(customManifest.Paths, []string{"/dist"}) {
+		t.Fatalf("custom manifest profile/paths = %q/%v, want with-pack/[/dist]", customManifest.Profile, customManifest.Paths)
 	}
 }
 
