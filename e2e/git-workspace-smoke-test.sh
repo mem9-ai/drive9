@@ -149,19 +149,29 @@ import time
 seconds = float(sys.argv[1])
 cmd = sys.argv[2:]
 
+def exit_code(rc):
+    return rc if rc >= 0 else 128 + abs(rc)
+
 proc = subprocess.Popen(cmd, start_new_session=True)
 deadline = time.monotonic() + seconds
 while True:
     rc = proc.poll()
     if rc is not None:
-        raise SystemExit(rc if rc >= 0 else 128 + abs(rc))
+        raise SystemExit(exit_code(rc))
     if time.monotonic() >= deadline:
         break
     time.sleep(0.2)
 
+rc = proc.poll()
+if rc is not None:
+    raise SystemExit(exit_code(rc))
+
 try:
     os.killpg(proc.pid, signal.SIGTERM)
 except ProcessLookupError:
+    rc = proc.poll()
+    if rc is not None:
+        raise SystemExit(exit_code(rc))
     raise SystemExit(124)
 
 deadline = time.monotonic() + 5

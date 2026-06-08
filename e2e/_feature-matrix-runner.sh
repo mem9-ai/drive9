@@ -624,7 +624,7 @@ stop_mount() {
   local umount_rc=0
   set +e
   if [ -n "$mount_point" ] && is_mounted "$mount_point"; then
-    "$CLI_BIN" umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$mount_point" >/dev/null 2>&1
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$mount_point" >/dev/null 2>&1
     umount_rc=$?
     wait_mount_state "$mount_point" unmounted >/dev/null 2>&1 || true
     if is_mounted "$mount_point"; then
