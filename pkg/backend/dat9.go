@@ -373,6 +373,13 @@ func (b *Dat9Backend) ChmodCtx(ctx context.Context, path string, mode uint32) (e
 	start := time.Now()
 	defer func() { observeBackend(ctx, "chmod", err, start) }()
 
+	path, err = pathutil.Canonicalize(path)
+	if err != nil {
+		return err
+	}
+	if path == "/" {
+		return datastore.ErrInvalidRootDentry
+	}
 	resolvedPath, _, err := b.resolveNodePath(ctx, path)
 	if err != nil {
 		return err

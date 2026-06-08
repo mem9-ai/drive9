@@ -28,7 +28,7 @@ var (
 	ErrUploadExpired           = errors.New("upload has expired")
 	ErrPathConflict            = errors.New("path already exists")
 	ErrInvalidLinkTarget       = errors.New("invalid link target")
-	ErrInvalidRootDentry       = errors.New("root path is implicit and cannot be stored as a file node")
+	ErrInvalidRootDentry       = errors.New("root path is implicit and cannot be mutated as a file node")
 	ErrUploadConflict          = errors.New("active upload already exists for this path")
 	ErrIdempotencyConflict     = errors.New("duplicate idempotency key")
 	ErrJournalConflict         = errors.New("journal create conflict")
@@ -1163,6 +1163,9 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 	start := time.Now()
 	defer observeStoreOp(ctx, "chmod", start, &err)
 
+	if isRootFileNodePath(path) {
+		return ErrInvalidRootDentry
+	}
 	node, err := s.GetNode(ctx, path)
 	if err != nil {
 		return err

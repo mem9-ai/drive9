@@ -1536,6 +1536,10 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_patch", "result", "error")
+			return
+		}
 		if errors.Is(err, backend.ErrNotS3Stored) || errors.Is(err, backend.ErrS3NotConfigured) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_unsupported_target", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_patch", "result", "error")
@@ -1628,6 +1632,10 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_not_found", "path", path)...)
 			metricEvent(r.Context(), "fs_append", "result", "error")
 			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_append", "result", "error")
 			return
 		}
 		if errors.Is(err, backend.ErrNotS3Stored) || errors.Is(err, backend.ErrS3NotConfigured) {
@@ -2242,6 +2250,9 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 	if err := b.ChmodCtx(r.Context(), path, req.Mode); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "not found")
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "chmod_failed", "path", path, "error", err)...)

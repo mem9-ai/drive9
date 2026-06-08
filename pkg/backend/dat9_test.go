@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/internal/testmysql"
@@ -933,6 +934,44 @@ func TestChmod(t *testing.T) {
 	}
 	if info.Mode != 0o600 {
 		t.Errorf("mode=%o, want 0o600", info.Mode)
+	}
+}
+
+func TestChmodRootHistoricalDentryRejected(t *testing.T) {
+	b := newTestBackend(t)
+	ctx := context.Background()
+	now := time.Now()
+	const inodeID = "root-inode"
+	const originalMode = 0o755
+
+	if err := b.Store().InsertInode(ctx, &datastore.Inode{
+		InodeID:   inodeID,
+		SizeBytes: 0,
+		Revision:  1,
+		Mode:      originalMode,
+		Status:    datastore.StatusConfirmed,
+		CreatedAt: now,
+		Mtime:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Store().DB().ExecContext(ctx, `
+		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, inode_id, created_at)
+		VALUES (?, ?, ?, ?, 1, ?, ?)`,
+		"root-node", "/", "/", "root-alias", inodeID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	err := b.ChmodCtx(ctx, "/", 0o700)
+	if !errors.Is(err, datastore.ErrInvalidRootDentry) {
+		t.Fatalf("ChmodCtx(/) error = %v, want %v", err, datastore.ErrInvalidRootDentry)
+	}
+	var mode uint32
+	if err := b.Store().DB().QueryRowContext(ctx, `SELECT mode FROM inodes WHERE inode_id = ?`, inodeID).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != originalMode {
+		t.Fatalf("root inode mode = %o, want unchanged %o", mode, originalMode)
 	}
 }
 

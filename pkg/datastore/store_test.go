@@ -1368,6 +1368,44 @@ func TestChmod(t *testing.T) {
 	}
 }
 
+func TestChmodRejectsHistoricalRootDentry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	const inodeID = "root-inode"
+	const originalMode = 0o755
+
+	if err := s.InsertInode(ctx, &Inode{
+		InodeID:   inodeID,
+		SizeBytes: 0,
+		Revision:  1,
+		Mode:      originalMode,
+		Status:    StatusConfirmed,
+		CreatedAt: now,
+		Mtime:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `
+		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, inode_id, created_at)
+		VALUES (?, ?, ?, ?, 1, ?, ?)`,
+		"root-node", "/", "/", "root-alias", inodeID, now); err != nil {
+		t.Fatal(err)
+	}
+
+	err := s.Chmod(ctx, "/", 0o700)
+	if !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("Chmod(/) error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+	var mode uint32
+	if err := s.DB().QueryRowContext(ctx, `SELECT mode FROM inodes WHERE inode_id = ?`, inodeID).Scan(&mode); err != nil {
+		t.Fatal(err)
+	}
+	if mode != originalMode {
+		t.Fatalf("root inode mode = %o, want unchanged %o", mode, originalMode)
+	}
+}
+
 func TestChmodPreservesFileTypeBits(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
