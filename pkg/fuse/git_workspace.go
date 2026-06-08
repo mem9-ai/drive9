@@ -212,6 +212,11 @@ func (fs *Dat9FS) hasLocalGitStateHint(localPath string) bool {
 	if clean == "." || clean == "/" {
 		return false
 	}
+	for _, part := range strings.Split(strings.Trim(clean, "/"), "/") {
+		if part == ".git" {
+			return false
+		}
+	}
 	for cur := clean; cur != "." && cur != "/"; cur = path.Dir(cur) {
 		if _, err := fs.localOverlay.Lstat(path.Join(cur, ".git")); err == nil {
 			return true
