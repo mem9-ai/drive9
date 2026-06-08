@@ -2846,6 +2846,67 @@ func TestGitWorkspaceCreatePublishesDirtyMirrorBeforeFlush(t *testing.T) {
 	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
 }
 
+func TestGitWorkspaceDirtyMirrorSweepUploadsContent(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/README.md")
+	if !ok {
+		t.Fatal("git workspace not loaded")
+	}
+	content := []byte("mirror only\n")
+	fs.replaceGitDirtyMirror(rt, "mirror-only.txt", content)
+	fs.applyGitOverlayEntry("ws1", client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "mirror-only.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   int64(len(content)),
+	})
+
+	fs.syncGitDirtyMirrors()
+
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["mirror-only.txt"]
+	fixture.mu.Unlock()
+	if !ok {
+		t.Fatal("mirror-only.txt overlay missing after dirty mirror sweep")
+	}
+	if !bytes.Equal(entry.Content, content) {
+		t.Fatalf("overlay content = %q, want %q", entry.Content, content)
+	}
+}
+
+func TestGitWorkspaceDirtyMirrorSweepUploadsUnloadedRuntime(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	localRoot := t.TempDir()
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	content := []byte("unloaded runtime mirror\n")
+	dirtyPath := filepath.Join(localRoot, "git-workspaces", "ws1", "local-head", "dirty", "nested", "mirror-only.txt")
+	if err := os.MkdirAll(filepath.Dir(dirtyPath), 0o755); err != nil {
+		t.Fatalf("mkdir dirty mirror: %v", err)
+	}
+	if err := os.WriteFile(dirtyPath, content, 0o644); err != nil {
+		t.Fatalf("write dirty mirror: %v", err)
+	}
+
+	fs.syncGitDirtyMirrors()
+
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["nested/mirror-only.txt"]
+	fixture.mu.Unlock()
+	if !ok {
+		t.Fatal("nested/mirror-only.txt overlay missing after dirty mirror sweep")
+	}
+	if !bytes.Equal(entry.Content, content) {
+		t.Fatalf("overlay content = %q, want %q", entry.Content, content)
+	}
+}
+
 func TestGitWorkspaceUnlinkCreateRefreshesDirtyMirror(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found")

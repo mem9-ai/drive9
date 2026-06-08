@@ -1099,7 +1099,7 @@ run_restore_suite() {
     python3 - "$restore_repo/oversized-staged.bin" <<'PY'
 import sys
 from pathlib import Path
-Path(sys.argv[1]).write_bytes(b"D9" * (3 * 1024 * 1024 + 1))
+Path(sys.argv[1]).write_bytes(b"D" * (5 * 1024 * 1024 + 1))
 PY
     git_cmd_record "$restore_repo" "Drive9 Git Workspace Behavior" "stage oversized object before remount" add oversized-staged.bin
   else

@@ -3096,6 +3096,116 @@ func (fs *Dat9FS) drainGitOverlayWrites() {
 	}
 }
 
+func (fs *Dat9FS) syncGitDirtyMirrors() {
+	if fs == nil || fs.git == nil || fs.opts == nil || strings.TrimSpace(fs.opts.LocalRoot) == "" {
+		return
+	}
+	localRoot := strings.TrimSpace(fs.opts.LocalRoot)
+	workspaceRoot := filepath.Join(localRoot, "git-workspaces")
+	fs.git.mu.Lock()
+	runtimes := make(map[string]*gitWorkspaceRuntime, len(fs.git.workspaces))
+	for _, rt := range fs.git.workspaces {
+		if rt != nil && rt.workspace.WorkspaceID != "" {
+			runtimes[rt.workspace.WorkspaceID] = rt
+		}
+	}
+	fs.git.mu.Unlock()
+
+	workspaceDirs, err := os.ReadDir(workspaceRoot)
+	if err != nil {
+		return
+	}
+	for _, workspaceDir := range workspaceDirs {
+		if !workspaceDir.IsDir() {
+			continue
+		}
+		workspaceID := workspaceDir.Name()
+		if strings.TrimSpace(workspaceID) == "" {
+			continue
+		}
+		commitDirs, err := os.ReadDir(filepath.Join(workspaceRoot, workspaceID))
+		if err != nil {
+			continue
+		}
+		rt := runtimes[workspaceID]
+		for _, commitDir := range commitDirs {
+			if !commitDir.IsDir() {
+				continue
+			}
+			dirtyRoot := filepath.Join(workspaceRoot, workspaceID, commitDir.Name(), "dirty")
+			fs.syncGitDirtyMirrorRoot(workspaceID, rt, dirtyRoot)
+		}
+	}
+}
+
+func (fs *Dat9FS) syncGitDirtyMirrorForRuntime(rt *gitWorkspaceRuntime) {
+	if fs == nil || rt == nil || rt.workspace.WorkspaceID == "" || rt.workspace.HeadCommit == "" {
+		return
+	}
+	dirtyRoot := filepath.Join(strings.TrimSpace(fs.opts.LocalRoot), "git-workspaces", rt.workspace.WorkspaceID, rt.workspace.HeadCommit, "dirty")
+	fs.syncGitDirtyMirrorRoot(rt.workspace.WorkspaceID, rt, dirtyRoot)
+}
+
+func (fs *Dat9FS) syncGitDirtyMirrorRoot(workspaceID string, rt *gitWorkspaceRuntime, dirtyRoot string) {
+	if fs == nil || workspaceID == "" || dirtyRoot == "" {
+		return
+	}
+	info, err := os.Stat(dirtyRoot)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	_ = filepath.WalkDir(dirtyRoot, func(p string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(dirtyRoot, p)
+		if err != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		if rel == "." || rel == "" {
+			return nil
+		}
+		data, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		mode := "100644"
+		kind := "file"
+		base := ""
+		if e, ok := rt.overlayEntry(rel); ok {
+			if e.Op == "whiteout" {
+				return nil
+			}
+			if e.Mode != "" {
+				mode = e.Mode
+			}
+			if e.Kind != "" {
+				kind = e.Kind
+			}
+			base = e.BaseObjectSHA
+		}
+		if stat, err := d.Info(); err == nil && mode == "100644" && stat.Mode()&0o111 != 0 {
+			mode = "100755"
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), releaseTimeout(int64(len(data))))
+		_, err = fs.putGitOverlayWithPolicy(ctx, workspaceID, client.GitOverlayEntryRequest{
+			Path:          rel,
+			Op:            "upsert",
+			Kind:          kind,
+			Mode:          mode,
+			BaseObjectSHA: base,
+			Content:       data,
+			SizeBytes:     int64(len(data)),
+		}, WritePolicyWriteSync, true)
+		cancel()
+		if err != nil {
+			log.Printf("git workspace dirty mirror sync failed workspace=%s root=%s path=%s: %v", workspaceID, dirtyRoot, rel, err)
+		}
+		return nil
+	})
+}
+
 func (fs *Dat9FS) flushGitHandleLocked(ctx context.Context, fh *FileHandle) gofuse.Status {
 	return fs.flushGitHandleLockedWithPolicy(ctx, fh, false)
 }
