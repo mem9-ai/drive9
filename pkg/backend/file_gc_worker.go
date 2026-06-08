@@ -103,20 +103,37 @@ func (w *FileGCWorker) run(ctx context.Context) {
 }
 
 func (w *FileGCWorker) processAvailable(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	now := time.Now().UTC()
 	if _, err := w.backend.store.RecoverExpiredFileGCTasks(ctx, now, w.opts.RecoverLimit); err != nil {
+		if isContextDone(err) {
+			return
+		}
 		logger.Warn(ctx, "file_gc_recover_expired_failed", zap.Error(err))
 		metrics.RecordOperation("file_gc", "recover_expired", "error", 0)
 	}
 	for i := 0; i < w.opts.BatchSize; i++ {
+		if ctx.Err() != nil {
+			return
+		}
 		processed, err := w.backend.processOneFileGCTask(ctx, w.opts)
 		if err != nil {
+			if isContextDone(err) {
+				return
+			}
 			logger.Warn(ctx, "file_gc_task_process_failed", zap.Error(err))
+			return
 		}
 		if !processed {
 			return
 		}
 	}
+}
+
+func isContextDone(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // ProcessOneFileGCTask processes at most one queued cleanup task. It is exposed
