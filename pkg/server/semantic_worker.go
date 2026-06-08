@@ -1293,7 +1293,22 @@ func (m *semanticWorkerManager) taskTypesForTarget(b *backend.Dat9Backend) []sem
 	if b.UsesDatabaseAutoEmbedding() {
 		return b.AutoSemanticTaskTypes()
 	}
-	return m.appManagedTaskTypes()
+	// Database auto-embedding is not active for this backend. Image/audio extract
+	// tasks are independent of EMBED_TEXT and should still be claimable when the
+	// runtime is wired. App-managed embed tasks are included if an embedder is
+	// configured.
+	var out []semantic.TaskType
+	if b.SupportsAsyncImageExtract() {
+		out = append(out, semantic.TaskTypeImgExtractText)
+	}
+	if b.SupportsAsyncAudioExtract() {
+		out = append(out, semantic.TaskTypeAudioExtractText)
+	}
+	out = append(out, m.appManagedTaskTypes()...)
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func imageExtractTaskSpecFromSemanticTask(task *semantic.Task) backend.ImageExtractTaskSpec {
