@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Strict FUSE release gate. Unlike the general smoke script, this fails when
 # host FUSE prerequisites are unavailable and enables git/remount/log checks.
+# Set RUN_FUSE_ALL_WORKLOADS=1 to enable all optional release-gate FUSE
+# workloads in one command.
 
 set -euo pipefail
 
@@ -10,10 +12,20 @@ export FUSE_STRICT_PREREQS="${FUSE_STRICT_PREREQS:-1}"
 export RUN_FUSE_GIT_CLONE="${RUN_FUSE_GIT_CLONE:-1}"
 export RUN_FUSE_UMOUNT_DURABLE="${RUN_FUSE_UMOUNT_DURABLE:-1}"
 export RUN_FUSE_LOG_AUDIT="${RUN_FUSE_LOG_AUDIT:-1}"
-export RUN_FUSE_CONCURRENCY_STRESS="${RUN_FUSE_CONCURRENCY_STRESS:-0}"
-export RUN_FUSE_POSIX_FSX="${RUN_FUSE_POSIX_FSX:-0}"
+export RUN_FUSE_ALL_WORKLOADS="${RUN_FUSE_ALL_WORKLOADS:-0}"
+if [[ "$RUN_FUSE_ALL_WORKLOADS" = "1" ]]; then
+  : "${RUN_FUSE_CONCURRENCY_STRESS:=1}"
+  : "${RUN_FUSE_POSIX_FSX:=1}"
+  : "${RUN_FUSE_PERFORMANCE_BASELINE:=1}"
+else
+  : "${RUN_FUSE_CONCURRENCY_STRESS:=0}"
+  : "${RUN_FUSE_POSIX_FSX:=0}"
+  : "${RUN_FUSE_PERFORMANCE_BASELINE:=0}"
+fi
+export RUN_FUSE_CONCURRENCY_STRESS
+export RUN_FUSE_POSIX_FSX
 export RUN_FUSE_SQLITE_CORRECTNESS="${RUN_FUSE_SQLITE_CORRECTNESS:-1}"
-export RUN_FUSE_PERFORMANCE_BASELINE="${RUN_FUSE_PERFORMANCE_BASELINE:-0}"
+export RUN_FUSE_PERFORMANCE_BASELINE
 export FUSE_GIT_CLONE_URL="${FUSE_GIT_CLONE_URL:-https://github.com/octocat/Hello-World.git}"
 export FUSE_GIT_CLONE_TIMEOUT_S="${FUSE_GIT_CLONE_TIMEOUT_S:-180}"
 export FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
