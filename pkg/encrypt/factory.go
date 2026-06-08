@@ -22,6 +22,9 @@ type Config struct {
 	Type   Type
 	Key    string // hex master key for local_aes, KMS key id/alias for kms/aliyun_kms
 	Region string // aws/aliyun region for kms
+	// AliyunKMSEndpoint overrides the default Aliyun KMS endpoint, e.g. a VPC endpoint.
+	// Leave empty to use the default public endpoint for the region.
+	AliyunKMSEndpoint string
 }
 
 func New(ctx context.Context, cfg Config) (Encryptor, error) {
@@ -51,7 +54,7 @@ func New(ctx context.Context, cfg Config) (Encryptor, error) {
 		if cfg.Region == "" {
 			return nil, fmt.Errorf("aliyun_kms requires region")
 		}
-		return NewAliyunKMSEncryptor(cfg.Region, cfg.Key)
+		return NewAliyunKMSEncryptor(cfg.Region, cfg.Key, cfg.AliyunKMSEndpoint)
 	default:
 		return nil, fmt.Errorf("unsupported encrypt type: %s", cfg.Type)
 	}
