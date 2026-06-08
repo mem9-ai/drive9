@@ -218,9 +218,12 @@ func TestProvisionReturnsSpendingLimitUpdateError(t *testing.T) {
 	defer ts.Close()
 
 	p := &Provisioner{apiURL: ts.URL, poolID: "pool-1", defaultSpendLimit: &limit, client: ts.Client()}
-	_, err := p.Provision(context.Background(), "tenant-1")
+	out, err := p.Provision(context.Background(), "tenant-1")
 	if err == nil {
 		t.Fatal("expected spending limit update error")
+	}
+	if out == nil || out.ClusterID != "c1" || out.Username != "u1.root" || out.Password == "" {
+		t.Fatalf("partial cluster info = %#v, want created cluster", out)
 	}
 	if !strings.Contains(err.Error(), "update starter spending limit for cluster c1") {
 		t.Fatalf("unexpected error: %v", err)

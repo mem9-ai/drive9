@@ -110,13 +110,7 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 	if out.UserPrefix == "" {
 		return nil, fmt.Errorf("starter response missing user prefix")
 	}
-	if p.defaultSpendLimit != nil {
-		if err := p.UpdateSpendingLimit(ctx, out.ClusterID, *p.defaultSpendLimit); err != nil {
-			return nil, fmt.Errorf("update starter spending limit for cluster %s: %w", out.ClusterID, err)
-		}
-	}
-
-	return &tenant.ClusterInfo{
+	cluster := &tenant.ClusterInfo{
 		TenantID:  tenantID,
 		ClusterID: out.ClusterID,
 		Host:      out.Endpoints.Public.Host,
@@ -125,7 +119,14 @@ func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.C
 		Password:  password,
 		DBName:    "test",
 		Provider:  tenant.ProviderTiDBCloudStarter,
-	}, nil
+	}
+	if p.defaultSpendLimit != nil {
+		if err := p.UpdateSpendingLimit(ctx, out.ClusterID, *p.defaultSpendLimit); err != nil {
+			return cluster, fmt.Errorf("update starter spending limit for cluster %s: %w", out.ClusterID, err)
+		}
+	}
+
+	return cluster, nil
 }
 
 func parseDefaultSpendLimit(raw string) (*int32, error) {
