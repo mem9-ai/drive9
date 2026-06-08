@@ -3289,6 +3289,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
+		s.persistFailedProvisionClusterInfo(context.Background(), tenantID, provider, cluster)
 		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
 		}
@@ -3353,6 +3354,34 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		Provider:  provider,
 		TenantDSN: tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
 	}, nil
+}
+
+func (s *Server) persistFailedProvisionClusterInfo(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo) {
+	if cluster == nil || cluster.ClusterID == "" {
+		return
+	}
+	cluster.Provider = provider
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_encrypt_password_failed", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
+		return
+	}
+	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
+		DBHost:           cluster.Host,
+		DBPort:           cluster.Port,
+		DBUser:           cluster.Username,
+		DBPasswordCipher: cipherPass,
+		DBName:           cluster.DBName,
+		DBTLS:            true,
+		Provider:         provider,
+		ClusterID:        cluster.ClusterID,
+		ClaimURL:         cluster.ClaimURL,
+		ClaimExpiresAt:   cluster.ClaimExpiresAt,
+	}); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_persist_connection_failed", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
+		return
+	}
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_persisted", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID)...)
 }
 
 func (s *Server) startProvisionedTenantSchemaInit(ctx context.Context, res *provisionTenantResult) {

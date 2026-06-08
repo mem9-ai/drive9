@@ -398,6 +398,7 @@ environment:
   DRIVE9_DISABLE_AUTO_EMBEDDING true|false disable TiDB database-managed auto-embedding (default: false)
                                 set to true when the TiDB Cloud cluster has no supported embedding provider
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
+  DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default Starter spendingLimit.monthly in USD cents; applied after pool takeover
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
   DRIVE9_SLOCK_API_ORIGIN Slock API origin (required when DRIVE9_SLOCK_ORIGIN is set)
   DRIVE9_SLOCK_CLIENT_ID Slock connected-app client id (required when DRIVE9_SLOCK_ORIGIN is set)
