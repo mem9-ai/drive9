@@ -10,11 +10,12 @@ import (
 )
 
 type AliyunKMSEncryptor struct {
-	client *kms.Client
-	keyID  string
+	client   *kms.Client
+	keyID    string
+	endpoint string // optional custom endpoint; set as request Domain when non-empty
 }
 
-func NewAliyunKMSEncryptor(region, keyID string) (*AliyunKMSEncryptor, error) {
+func NewAliyunKMSEncryptor(region, keyID, endpoint string) (*AliyunKMSEncryptor, error) {
 	if region == "" {
 		return nil, fmt.Errorf("aliyun kms region is required")
 	}
@@ -29,13 +30,16 @@ func NewAliyunKMSEncryptor(region, keyID string) (*AliyunKMSEncryptor, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create aliyun kms client: %w", err)
 	}
-	return &AliyunKMSEncryptor{client: client, keyID: keyID}, nil
+	return &AliyunKMSEncryptor{client: client, keyID: keyID, endpoint: endpoint}, nil
 }
 
-func (e *AliyunKMSEncryptor) Encrypt(ctx context.Context, plaintext []byte) ([]byte, error) {
+func (e *AliyunKMSEncryptor) Encrypt(_ context.Context, plaintext []byte) ([]byte, error) {
 	req := kms.CreateEncryptRequest()
 	req.KeyId = e.keyID
 	req.Plaintext = base64.StdEncoding.EncodeToString(plaintext)
+	if e.endpoint != "" {
+		req.Domain = e.endpoint
+	}
 
 	resp, err := e.client.Encrypt(req)
 	if err != nil {
@@ -48,17 +52,20 @@ func (e *AliyunKMSEncryptor) Encrypt(ctx context.Context, plaintext []byte) ([]b
 	return ciphertext, nil
 }
 
-func (e *AliyunKMSEncryptor) Decrypt(ctx context.Context, ciphertext []byte) ([]byte, error) {
+func (e *AliyunKMSEncryptor) Decrypt(_ context.Context, ciphertext []byte) ([]byte, error) {
 	req := kms.CreateDecryptRequest()
 	req.CiphertextBlob = base64.StdEncoding.EncodeToString(ciphertext)
+	if e.endpoint != "" {
+		req.Domain = e.endpoint
+	}
 
 	resp, err := e.client.Decrypt(req)
 	if err != nil {
 		return nil, fmt.Errorf("aliyun kms decrypt: %w", err)
 	}
-	plaintext, err := base64.StdEncoding.DecodeString(resp.Plaintext)
+	plain, err := base64.StdEncoding.DecodeString(resp.Plaintext)
 	if err != nil {
 		return nil, fmt.Errorf("aliyun kms decrypt: decode plaintext: %w", err)
 	}
-	return plaintext, nil
+	return plain, nil
 }
