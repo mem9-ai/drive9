@@ -1205,6 +1205,15 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 		t.Skip("git not found")
 	}
 	linkedRepo := createLinkedGitWorktreeForTest(t)
+	const linkedReadme = "linked local commit\n"
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(linkedRepo.linkedWorktree, "README.md"), []byte(linkedReadme), 0o644); err != nil {
+		t.Fatalf("write linked readme: %v", err)
+	}
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "add", "README.md")
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "commit", "-m", "linked local commit")
+	linkedHead := fuseGitOutputForTest(t, linkedRepo.linkedWorktree, "rev-parse", "HEAD")
 	commonState, err := archiveLocalGitDir(linkedRepo.commonGitDir)
 	if err != nil {
 		t.Fatalf("archive common git state: %v", err)
@@ -1233,7 +1242,7 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 	fixture := newGitStateOnlyFixture(t)
 	fixture.states["linked"] = client.GitState{
 		WorkspaceID:      "linked",
-		CheckpointCommit: linkedRepo.headCommit,
+		CheckpointCommit: linkedHead,
 		StorageType:      gitStateStorageTarGzNoObjects,
 		SizeBytes:        int64(len(linkedState)),
 		Content:          linkedState,
@@ -1277,8 +1286,15 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 		t.Fatalf("restored commondir = %q, want ../../..", commonDir)
 	}
 	gotHead := fuseGitOutputForTest(t, "", "--git-dir", restoredLinkedGitDir, "rev-parse", "HEAD")
-	if gotHead != linkedRepo.headCommit {
-		t.Fatalf("linked HEAD = %s, want %s", gotHead, linkedRepo.headCommit)
+	if gotHead != linkedHead {
+		t.Fatalf("linked HEAD = %s, want %s", gotHead, linkedHead)
+	}
+	entry, ok := linkedRT.overlayEntry("README.md")
+	if !ok {
+		t.Fatalf("linked README.md restored HEAD overlay missing")
+	}
+	if entry.Op != "upsert" || string(entry.Content) != linkedReadme {
+		t.Fatalf("linked README.md overlay = %+v content=%q, want restored HEAD content", entry, entry.Content)
 	}
 }
 
@@ -2098,6 +2114,99 @@ func TestBuildLocalGitObjectPackPreservesSmallLocalCommit(t *testing.T) {
 	}
 	if got := fuseGitOutputForTest(t, restored, "log", "-1", "--pretty=%s"); got != "local commit" {
 		t.Fatalf("restored HEAD subject = %q, want local commit", got)
+	}
+}
+
+func TestRestoredGitHeadOverlayMaterializesLocalCommitTree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	src := createGitRepoWithReadme(t, []byte("hello base\n"))
+	if err := os.MkdirAll(filepath.Join(src, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "docs", "guide.md"), []byte("guide\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runFuseTestGit(t, src, "add", ".")
+	runFuseTestGit(t, src, "commit", "-m", "add guide")
+	baseHead := fuseGitOutputForTest(t, src, "rev-parse", "HEAD")
+	readmeSHA := fuseGitOutputForTest(t, src, "hash-object", "README.md")
+	guideSHA := fuseGitOutputForTest(t, src, "hash-object", "docs/guide.md")
+
+	work := filepath.Join(t.TempDir(), "work")
+	runFuseTestGit(t, "", "clone", src, work)
+	runFuseTestGit(t, work, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, work, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(work, "committed-local.txt"), []byte("committed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runFuseTestGit(t, work, "rm", "docs/guide.md")
+	runFuseTestGit(t, work, "add", "committed-local.txt")
+	runFuseTestGit(t, work, "commit", "-m", "local workspace commit")
+
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			RemoteName:  "origin",
+			HeadCommit:  baseHead,
+		},
+		nodes: map[string]client.GitTreeNode{
+			"README.md": {
+				Path:      "README.md",
+				Kind:      "file",
+				Mode:      "100644",
+				ObjectSHA: readmeSHA,
+				SizeBytes: int64(len("hello base\n")),
+			},
+			"docs/guide.md": {
+				Path:      "docs/guide.md",
+				Kind:      "file",
+				Mode:      "100644",
+				ObjectSHA: guideSHA,
+				SizeBytes: int64(len("guide\n")),
+			},
+		},
+		overlay: map[string]client.GitOverlayEntry{},
+	}
+	pack, sanitize, err := buildLocalGitObjectPack(context.Background(), filepath.Join(work, ".git"), rt)
+	if err != nil {
+		t.Fatalf("buildLocalGitObjectPack: %v", err)
+	}
+	if len(pack) == 0 {
+		t.Fatalf("pack is empty, want local commit objects")
+	}
+	state, err := archiveLocalGitStateForCheckpoint(context.Background(), filepath.Join(work, ".git"), rt, sanitize)
+	if err != nil {
+		t.Fatalf("archiveLocalGitStateForCheckpoint: %v", err)
+	}
+
+	restored := filepath.Join(t.TempDir(), "restored")
+	runFuseTestGit(t, "", "clone", "--no-checkout", src, restored)
+	unpackGitPackForTest(t, filepath.Join(restored, ".git"), pack)
+	if err := extractGitArchive(state, filepath.Join(restored, ".git")); err != nil {
+		t.Fatalf("extractGitArchive: %v", err)
+	}
+	overlay, err := buildRestoredGitHeadOverlay(context.Background(), filepath.Join(restored, ".git"), rt)
+	if err != nil {
+		t.Fatalf("buildRestoredGitHeadOverlay: %v", err)
+	}
+	committed, ok := overlay["committed-local.txt"]
+	if !ok {
+		t.Fatalf("committed-local.txt overlay missing")
+	}
+	if committed.Op != "upsert" || committed.Kind != "file" || string(committed.Content) != "committed\n" {
+		t.Fatalf("committed-local.txt overlay = %+v content=%q, want file upsert", committed, committed.Content)
+	}
+	whiteout, ok := overlay["docs/guide.md"]
+	if !ok {
+		t.Fatalf("docs/guide.md whiteout missing")
+	}
+	if whiteout.Op != "whiteout" || whiteout.BaseObjectSHA != guideSHA {
+		t.Fatalf("docs/guide.md overlay = %+v, want whiteout with base SHA", whiteout)
+	}
+	if _, ok := overlay["README.md"]; ok {
+		t.Fatalf("README.md overlay present for unchanged base file")
 	}
 }
 

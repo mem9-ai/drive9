@@ -218,11 +218,18 @@ def finite_number(value: Any) -> float | None:
     return None
 
 
+def mark_warning(status: str) -> str:
+    if status == "failed":
+        return status
+    return "warning"
+
+
 def compare_metrics(
     current: dict[str, Any],
     baseline: dict[str, Any] | None,
     *,
     warning_ratio: float,
+    fail_on_regression: bool = False,
     current_ref: str,
     baseline_ref: str | None,
     missing_baseline_reason: str | None,
@@ -248,7 +255,7 @@ def compare_metrics(
                 baseline_entry = baseline_entries.get(workload)
                 if not baseline_entry:
                     warnings.append(f"baseline missing workload {workload}")
-                    status = "warning"
+                    status = mark_warning(status)
                     continue
                 for metric in HIGHER_IS_BETTER:
                     current_value = finite_number(current_entry.get(metric))
@@ -259,13 +266,16 @@ def compare_metrics(
                         if current_value <= 0:
                             continue
                         warnings.append(f"baseline {workload}.{metric} is not positive")
-                        status = "warning"
+                        status = mark_warning(status)
                         continue
                     ratio = current_value / baseline_value
                     comparison_status = "ok"
                     if ratio < (1.0 - warning_ratio):
                         comparison_status = "regressed"
-                        status = "warning"
+                        if fail_on_regression:
+                            status = "failed"
+                        else:
+                            status = mark_warning(status)
                     comparisons.append(
                         {
                             "workload": workload,
@@ -283,7 +293,7 @@ def compare_metrics(
     return {
         "schema": SCHEMA,
         "status": status,
-        "warning_only": True,
+        "warning_only": not fail_on_regression,
         "thresholds": {
             "regression_warning_ratio": warning_ratio,
             "regression_warning_percent": warning_ratio * 100.0,
@@ -315,11 +325,12 @@ def format_number(value: float) -> str:
 
 
 def render_markdown(report: dict[str, Any]) -> str:
+    mode = "warning-only" if report.get("warning_only", True) else "hard-fail regressions"
     lines = [
         "# FUSE Performance Compare",
         "",
         f"- Status: `{report['status']}`",
-        "- Mode: `warning-only`",
+        f"- Mode: `{mode}`",
         f"- Current: `{report['current']['ref']}`",
         f"- Baseline: `{report['baseline'].get('ref') or 'missing'}`",
         f"- Regression warning threshold: `{report['thresholds']['regression_warning_percent']:.1f}%`",
@@ -366,6 +377,7 @@ def run_compare(args: argparse.Namespace) -> int:
         current,
         baseline,
         warning_ratio=args.warning_ratio,
+        fail_on_regression=args.fail_on_regression,
         current_ref=args.current_ref,
         baseline_ref=args.baseline_ref,
         missing_baseline_reason=args.missing_baseline_reason,
@@ -377,6 +389,8 @@ def run_compare(args: argparse.Namespace) -> int:
     output_markdown.parent.mkdir(parents=True, exist_ok=True)
     output_json.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     output_markdown.write_text(render_markdown(report), encoding="utf-8")
+    if args.fail_on_regression and report["status"] == "failed":
+        return 3
     return 0
 
 
@@ -396,6 +410,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--output-json", required=True)
     compare.add_argument("--output-markdown", required=True)
     compare.add_argument("--warning-ratio", type=float, default=0.30)
+    compare.add_argument("--fail-on-regression", action="store_true")
     compare.add_argument("--current-ref", required=True)
     compare.add_argument("--baseline-ref")
     compare.add_argument("--missing-baseline-reason")

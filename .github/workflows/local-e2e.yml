@@ -83,6 +83,22 @@ on:
         options:
           - "0"
           - "1"
+      run_e2e_smoke_all:
+        description: "Run full local smoke-all suite, including journal, POSIX permission, FUSE smoke, and Git workspace"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+      run_git_feature_matrix:
+        description: "Run Git feature matrix against a live FUSE mount"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
 
 permissions:
   contents: read
@@ -107,15 +123,19 @@ env:
   RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_performance_baseline || '0') }}
   ARCHIVE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.archive_fuse_performance_metrics || '0') }}
   COMPARE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.compare_fuse_performance_metrics || '0') }}
+  RUN_E2E_SMOKE_ALL: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_e2e_smoke_all || '0') }}
+  RUN_GIT_FEATURE_MATRIX: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_git_feature_matrix || '0') }}
+  FUSE_PERF_COMPARE_FAIL_ON_REGRESSION: "1"
   FUSE_CONCURRENCY_STRESS_REQUIRED: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_concurrency_stress == '1')) && '1' || '0' }}
   FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
   FUSE_CONCURRENCY_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-concurrency
+  FEATURE_MATRIX_REPORT_DIR: ${{ github.workspace }}/e2e-artifacts/feature-matrix
 
 jobs:
   local-e2e:
     name: drive9-server-local e2e smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 120
 
     steps:
       - name: Checkout code
@@ -135,7 +155,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y default-mysql-client fuse3
+          sudo apt-get install -y default-mysql-client fuse3 jq
 
       - name: Cache TiUP artifacts
         uses: actions/cache@v4
@@ -244,7 +264,15 @@ jobs:
           if-no-files-found: warn
 
       - name: Archive FUSE performance metrics to Drive9
-        if: always() && env.RUN_FUSE_PERFORMANCE_BASELINE == '1' && env.ARCHIVE_FUSE_PERFORMANCE_METRICS == '1'
+        if: >
+          always() &&
+          env.RUN_FUSE_PERFORMANCE_BASELINE == '1' &&
+          env.ARCHIVE_FUSE_PERFORMANCE_METRICS == '1' &&
+          (
+            env.COMPARE_FUSE_PERFORMANCE_METRICS != '1' ||
+            steps.fuse_performance_compare.outcome == 'success' ||
+            steps.fuse_performance_compare.outcome == 'skipped'
+          )
         env:
           DRIVE9_SERVER: https://api.drive9.ai
           DRIVE9_API_KEY: ${{ secrets.DRIVE9_ARCHIVE_API_KEY }}
@@ -278,7 +306,34 @@ jobs:
       - name: Run FUSE POSIX/fsx gate
         id: fuse-posix-fsx
         if: always() && env.RUN_FUSE_POSIX_FSX == '1'
+        continue-on-error: true
         run: bash e2e/fuse-posix-fsx-gate.sh
+
+      - name: Run full smoke-all suite
+        id: smoke-all
+        if: always() && env.RUN_E2E_SMOKE_ALL == '1'
+        continue-on-error: true
+        env:
+          FUSE_STRICT_PREREQS: "1"
+          RUN_GIT_WORKSPACE_SMOKE: "1"
+          GIT_WORKSPACE_CLONE_TIMEOUT_S: "1800"
+        run: bash e2e/smoke-all.sh
+
+      - name: Run Git feature matrix
+        id: git-feature-matrix
+        if: always() && env.RUN_GIT_FEATURE_MATRIX == '1'
+        continue-on-error: true
+        env:
+          FUSE_STRICT_PREREQS: "1"
+        run: bash e2e/git-feature-matrix.sh
+
+      - name: Upload feature matrix artifacts
+        if: always() && env.RUN_GIT_FEATURE_MATRIX == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: feature-matrix
+          path: e2e-artifacts/feature-matrix
+          if-no-files-found: warn
 
       - name: Publish local e2e summary
         if: always()
@@ -295,6 +350,8 @@ jobs:
             echo "| FUSE performance compare | ${{ steps.fuse_performance_compare.outcome || 'skipped' }} |"
             echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
             echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
+            echo "| Full smoke-all suite | ${{ steps.smoke-all.outcome || 'skipped' }} |"
+            echo "| Git feature matrix | ${{ steps.git-feature-matrix.outcome || 'skipped' }} |"
             echo
             echo "FUSE concurrency stress: \`RUN_FUSE_CONCURRENCY_STRESS=${RUN_FUSE_CONCURRENCY_STRESS}\`"
             echo "FUSE concurrency stress required: \`FUSE_CONCURRENCY_STRESS_REQUIRED=${FUSE_CONCURRENCY_STRESS_REQUIRED}\`"
@@ -305,6 +362,8 @@ jobs:
             echo "FUSE performance baseline: \`RUN_FUSE_PERFORMANCE_BASELINE=${RUN_FUSE_PERFORMANCE_BASELINE}\`"
             echo "Archive FUSE performance metrics: \`ARCHIVE_FUSE_PERFORMANCE_METRICS=${ARCHIVE_FUSE_PERFORMANCE_METRICS}\`"
             echo "Compare FUSE performance metrics: \`COMPARE_FUSE_PERFORMANCE_METRICS=${COMPARE_FUSE_PERFORMANCE_METRICS}\`"
+            echo "Full smoke-all suite: \`RUN_E2E_SMOKE_ALL=${RUN_E2E_SMOKE_ALL}\`"
+            echo "Git feature matrix: \`RUN_GIT_FEATURE_MATRIX=${RUN_GIT_FEATURE_MATRIX}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Dump TiDB playground logs
@@ -363,6 +422,12 @@ jobs:
           fi
           if [ "${RUN_FUSE_POSIX_FSX}" = "1" ]; then
             check_required "FUSE POSIX/fsx gate" "${{ steps.fuse-posix-fsx.outcome }}"
+          fi
+          if [ "${RUN_E2E_SMOKE_ALL}" = "1" ]; then
+            check_required "Full smoke-all suite" "${{ steps.smoke-all.outcome }}"
+          fi
+          if [ "${RUN_GIT_FEATURE_MATRIX}" = "1" ]; then
+            check_required "Git feature matrix" "${{ steps.git-feature-matrix.outcome }}"
           fi
 
           exit "$failed"

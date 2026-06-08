@@ -66,9 +66,14 @@ SHA="${DRIVE9_PERF_SHA:-${GITHUB_SHA:-unknown}}"
 RUN_ID="${DRIVE9_PERF_RUN_ID:-${GITHUB_RUN_ID:-manual}}"
 RUN_ATTEMPT="${DRIVE9_PERF_RUN_ATTEMPT:-${GITHUB_RUN_ATTEMPT:-1}}"
 WARN_RATIO="${FUSE_PERF_COMPARE_WARN_RATIO:-0.30}"
+FAIL_ON_REGRESSION="${FUSE_PERF_COMPARE_FAIL_ON_REGRESSION:-1}"
 
 [ -n "$SOURCE_DIR" ] || die "DRIVE9_PERF_SOURCE_DIR or FUSE_PERF_ARTIFACT_DIR is required"
 [ -d "$SOURCE_DIR" ] || die "performance artifact directory does not exist: $SOURCE_DIR"
+case "$FAIL_ON_REGRESSION" in
+  0|1) ;;
+  *) die "FUSE_PERF_COMPARE_FAIL_ON_REGRESSION must be 0 or 1" ;;
+esac
 
 require_cmd curl
 require_cmd python3
@@ -151,21 +156,31 @@ fi
 
 if [ -n "$baseline_ref" ]; then
   info "compare ${current_metrics} against ${baseline_ref}"
+  compare_args=()
+  if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    compare_args+=(--fail-on-regression)
+  fi
   python3 scripts/compare_fuse_performance_metrics.py compare \
     --current "$current_metrics" \
     --baseline "$baseline_metrics" \
     --output-json "$output_json" \
     --output-markdown "$output_md" \
     --warning-ratio "$WARN_RATIO" \
+    "${compare_args[@]}" \
     --current-ref "$current_ref" \
     --baseline-ref "$baseline_ref"
 else
   info "write baseline-missing compare report: ${missing_reason}"
+  compare_args=()
+  if [ "$FAIL_ON_REGRESSION" = "1" ]; then
+    compare_args+=(--fail-on-regression)
+  fi
   python3 scripts/compare_fuse_performance_metrics.py compare \
     --current "$current_metrics" \
     --output-json "$output_json" \
     --output-markdown "$output_md" \
     --warning-ratio "$WARN_RATIO" \
+    "${compare_args[@]}" \
     --current-ref "$current_ref" \
     --missing-baseline-reason "$missing_reason"
 fi
