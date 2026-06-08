@@ -96,6 +96,36 @@ class FusePerformanceCompareTest(unittest.TestCase):
         self.assertEqual(len(regressed), 1)
         self.assertEqual(regressed[0]["status"], "regressed")
 
+    def test_fail_on_regression_marks_report_failed(self):
+        report = compare.compare_metrics(
+            metrics(rows_per_second=60.0),
+            metrics(rows_per_second=100.0),
+            warning_ratio=0.30,
+            fail_on_regression=True,
+            current_ref="current",
+            baseline_ref="baseline",
+            missing_baseline_reason=None,
+        )
+
+        self.assertEqual(report["status"], "failed")
+        self.assertFalse(report["warning_only"])
+        self.assertTrue(any(row["status"] == "regressed" for row in report["comparisons"]))
+
+    def test_fail_on_regression_does_not_fail_missing_baseline(self):
+        report = compare.compare_metrics(
+            metrics(),
+            None,
+            warning_ratio=0.30,
+            fail_on_regression=True,
+            current_ref="current",
+            baseline_ref=None,
+            missing_baseline_reason="missing",
+        )
+
+        self.assertEqual(report["status"], "baseline_missing")
+        self.assertFalse(report["warning_only"])
+        self.assertEqual(report["comparisons"], [])
+
     def test_missing_baseline_still_validates_current_metrics(self):
         report = compare.compare_metrics(
             metrics(),
@@ -278,6 +308,33 @@ class FusePerformanceCompareTest(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn("drive9-fuse-performance-compare/v1", output_json.read_text(encoding="utf-8"))
             self.assertIn("FUSE Performance Compare", output_md.read_text(encoding="utf-8"))
+
+    def test_cli_fail_on_regression_returns_nonzero_after_writing_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            current = tmp_path / "current.json"
+            baseline = tmp_path / "baseline.json"
+            output_json = tmp_path / "report.json"
+            output_md = tmp_path / "report.md"
+            current.write_text(compare.json.dumps(metrics(rows_per_second=60.0)) + "\n", encoding="utf-8")
+            baseline.write_text(compare.json.dumps(metrics(rows_per_second=100.0)) + "\n", encoding="utf-8")
+
+            rc = compare.main([
+                "compare",
+                "--current", str(current),
+                "--baseline", str(baseline),
+                "--output-json", str(output_json),
+                "--output-markdown", str(output_md),
+                "--warning-ratio", "0.30",
+                "--fail-on-regression",
+                "--current-ref", "current",
+                "--baseline-ref", "baseline",
+            ])
+
+            self.assertEqual(rc, 3)
+            report = compare.json.loads(output_json.read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "failed")
+            self.assertIn("hard-fail regressions", output_md.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

@@ -107,6 +107,7 @@ env:
   RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_performance_baseline || '0') }}
   ARCHIVE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.archive_fuse_performance_metrics || '0') }}
   COMPARE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.compare_fuse_performance_metrics || '0') }}
+  FUSE_PERF_COMPARE_FAIL_ON_REGRESSION: "1"
   FUSE_CONCURRENCY_STRESS_REQUIRED: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_concurrency_stress == '1')) && '1' || '0' }}
   FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
   FUSE_CONCURRENCY_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-concurrency
