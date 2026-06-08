@@ -494,18 +494,18 @@ func TestDefaultPackArchivePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("defaultPackArchivePath: %v", err)
 	}
-	if !strings.HasPrefix(got, defaultPackRoot+"/coding-agent/root-") || !strings.HasSuffix(got, ".tar.gz") {
+	if !strings.HasPrefix(got, defaultPackRoot+"/root-") || !strings.HasSuffix(got, ".tar.gz") {
 		t.Fatalf("default archive path = %q, want hidden pack path", got)
+	}
+	if strings.Contains(got, "coding-agent") {
+		t.Fatalf("default archive path = %q, should not include profile name", got)
 	}
 	custom, err := defaultPackArchivePath("/remote/root", "with-pack")
 	if err != nil {
 		t.Fatalf("defaultPackArchivePath custom: %v", err)
 	}
-	if !strings.HasPrefix(custom, defaultPackRoot+"/with-pack/root-") || !strings.HasSuffix(custom, ".tar.gz") {
-		t.Fatalf("custom default archive path = %q, want profile-scoped hidden pack path", custom)
-	}
-	if custom == got {
-		t.Fatalf("default archive path is not profile-scoped: %q", got)
+	if custom != got {
+		t.Fatalf("custom default archive path = %q, want same path as default profile %q", custom, got)
 	}
 }
 
