@@ -648,7 +648,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cancel()
 
 		if err == nil {
-			if err := cq.onCommitSuccess(entry, committedRev); err == nil {
+			if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err == nil {
 				unlockPath()
 				return
 			} else {
@@ -711,13 +711,23 @@ func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEnt
 		}
 		return err
 	}
-	if err := cq.onCommitSuccess(entry, committedRev); err != nil {
+	if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err != nil {
 		if cq.perf != nil {
 			cq.perf.commitFailure.add(1)
 		}
 		return err
 	}
 	return nil
+}
+
+func committedRevisionForExpectedRevision(expectedRevision, committedRev int64) int64 {
+	if committedRev > 0 {
+		return committedRev
+	}
+	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+		return revision
+	}
+	return 0
 }
 
 // uploadEntry uploads entry data to the server. Returns (committedRev, error).
@@ -843,7 +853,9 @@ func (cq *CommitQueue) rebuildQueuedIndexLocked() {
 	}
 }
 
-func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) error {
+func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, committedRev int64) error {
+	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+
 	if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var err error
@@ -980,7 +992,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	// Branch 1: idempotent — content already matches server.
 	if bytes.Equal(localData, serverData) {
 		log.Printf("commit queue: auto-resolved conflict for %s (idempotent, content matches server rev %d)", entry.Path, serverRev)
-		if err := cq.onCommitSuccess(entry, 0); err != nil {
+		if err := cq.onCommitSuccess(entry, serverRev, serverRev); err != nil {
 			cq.onCommitPostUploadFailure(entry, err)
 		}
 		return
@@ -1008,7 +1020,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	}
 
 	log.Printf("commit queue: auto-resolved conflict for %s via LWW (overwrote rev %d → new upload based on rev %d)", entry.Path, entry.BaseRev, serverRev)
-	if err := cq.onCommitSuccess(entry, 0); err != nil {
+	if err := cq.onCommitSuccess(entry, serverRev, 0); err != nil {
 		cq.onCommitPostUploadFailure(entry, err)
 	}
 }
