@@ -1194,6 +1194,45 @@ func TestGitTreeInodeUsesStableMtime(t *testing.T) {
 	}
 }
 
+func TestGitHeadTreeEntriesDoesNotRequireBlobObjects(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	repo := t.TempDir()
+	runFuseTestGit(t, "", "init", "-b", "main", repo)
+	runFuseTestGit(t, repo, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, repo, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", ".")
+	runFuseTestGit(t, repo, "commit", "-m", "initial")
+	cmd := exec.Command("git", "-C", repo, "rev-parse", "HEAD:README.md")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD:README.md: %v", err)
+	}
+	blob := strings.TrimSpace(string(out))
+	if len(blob) < 4 {
+		t.Fatalf("blob oid %q too short", blob)
+	}
+	if err := os.Remove(filepath.Join(repo, ".git", "objects", blob[:2], blob[2:])); err != nil {
+		t.Fatalf("remove blob object: %v", err)
+	}
+
+	entries, err := gitHeadTreeEntries(context.Background(), filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("gitHeadTreeEntries: %v", err)
+	}
+	entry, ok := entries["README.md"]
+	if !ok {
+		t.Fatalf("README.md missing from entries: %#v", entries)
+	}
+	if entry.oid != blob || entry.size != -1 {
+		t.Fatalf("entry = %+v, want oid=%s size=-1", entry, blob)
+	}
+}
+
 func TestWriteLinkedGitFileUsesRelativeMountPath(t *testing.T) {
 	localRoot := t.TempDir()
 	overlay := NewLocalOverlay(localRoot)

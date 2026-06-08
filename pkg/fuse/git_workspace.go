@@ -1954,7 +1954,6 @@ func gitHeadTreeEntries(ctx context.Context, gitDir string) (map[string]gitHeadT
 		return nil, err
 	}
 	entries := make(map[string]gitHeadTreeEntry)
-	var blobIDs []string
 	for _, rec := range bytes.Split(out, []byte{0}) {
 		if len(rec) == 0 {
 			continue
@@ -1976,31 +1975,7 @@ func gitHeadTreeEntries(ctx context.Context, gitDir string) (map[string]gitHeadT
 		if kind == "" {
 			continue
 		}
-		entries[rel] = gitHeadTreeEntry{path: rel, kind: kind, mode: mode, oid: oid}
-		if kind == "file" || kind == "symlink" {
-			blobIDs = append(blobIDs, oid)
-		}
-	}
-	info, err := gitObjectInfoBatch(ctx, gitDir, blobIDs)
-	if err != nil {
-		return nil, err
-	}
-	for rel, entry := range entries {
-		if entry.kind != "file" && entry.kind != "symlink" {
-			continue
-		}
-		object := info[entry.oid]
-		if object.typ == "" || object.typ == "missing" {
-			return nil, fmt.Errorf("git HEAD tree object %s for %s is missing", entry.oid, rel)
-		}
-		if object.typ != "blob" {
-			return nil, fmt.Errorf("git HEAD tree object %s for %s is %s, want blob", entry.oid, rel, object.typ)
-		}
-		if object.size > gitLocalObjectMaxBlobBytes {
-			return nil, fmt.Errorf("git HEAD tree object %s for %s is %d bytes, exceeds local restore limit %d", entry.oid, rel, object.size, gitLocalObjectMaxBlobBytes)
-		}
-		entry.size = object.size
-		entries[rel] = entry
+		entries[rel] = gitHeadTreeEntry{path: rel, kind: kind, mode: mode, oid: oid, size: -1}
 	}
 	return entries, nil
 }
