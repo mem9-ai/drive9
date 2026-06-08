@@ -872,9 +872,6 @@ func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) b
 	if fs == nil || fh == nil || fh.Dirty == nil || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
 		return false
 	}
-	if fh.ShadowReady || fh.ShadowSpill {
-		return false
-	}
 	revision := fs.latestCommittedRevision(fh.Path)
 	if revision <= 0 || revision <= fh.BaseRev {
 		return false
@@ -883,6 +880,15 @@ func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) b
 	fh.BaseRev = revision
 	if fh.Streamer != nil {
 		fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+	}
+	if fs.clearRemovedCommittedShadowLocked(fh, revision, fs.committedHandleSizeLocked(fh), false) {
+		return true
+	}
+	if fh.ShadowReady || fh.ShadowSpill {
+		fh.ShadowReady = false
+		fh.ShadowSpill = false
+		fh.ShadowCommitReady = false
+		fh.ShadowCommitSeq = 0
 	}
 	fs.rebindCleanWriteBufferToRemoteLocked(fh, fs.committedHandleSizeLocked(fh))
 	return true
@@ -8595,6 +8601,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 			fs.recordCommittedRevision(filePath, committedRev)
 			handle.IsNew = false
 			handle.BaseRev = committedRev
+			fs.inodes.UpdateSize(ino, int64(len(data)))
 			fs.inodes.UpdateRevision(ino, committedRev)
 			handle.OrigSize = int64(len(data))
 			fs.refreshCommittedRevisionForOpenHandles(filePath, committedRev, handle)

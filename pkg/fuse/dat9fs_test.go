@@ -7434,6 +7434,230 @@ func TestReadCleanWritableHandleRefreshesSkippedCommittedRevision(t *testing.T) 
 	}
 }
 
+func TestReadCleanShadowBackedHandleRefreshesRemovedCommittedShadow(t *testing.T) {
+	stale := []byte("old shadow bytes")
+	fresh := []byte("fresh committed remote bytes")
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(fresh)), func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fresh)
+			return
+		}
+		start, end, ok := parseTestBytesRange(r.Header.Get("Range"))
+		if !ok {
+			t.Errorf("Range = %q, want bytes range", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if start < 0 || end >= int64(len(fresh)) {
+			t.Errorf("Range = %q outside fresh object", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(fresh[start : end+1])
+	})
+	defer cleanup()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	const filePath = "/file.bin"
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize:    int64(len(stale)),
+		BaseRev:     1,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+	if _, err := fh.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fhID := fs.allocateFileHandle(fh)
+
+	fs.inodes.UpdateSize(ino, int64(len(fresh)))
+	fs.recordCommittedRevision(filePath, 2)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fhID, 0, len(fresh))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, fresh) {
+		t.Fatalf("Read returned stale removed shadow: got %q want %q", got, fresh)
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if fh.BaseRev != 2 {
+		t.Fatalf("fh.BaseRev = %d, want 2", fh.BaseRev)
+	}
+	if fh.OrigSize != int64(len(fresh)) {
+		t.Fatalf("fh.OrigSize = %d, want %d", fh.OrigSize, len(fresh))
+	}
+	if fh.ShadowReady || fh.ShadowSpill || fh.ShadowCommitReady {
+		t.Fatalf("shadow flags = ready:%t spill:%t commit:%t, want all false", fh.ShadowReady, fh.ShadowSpill, fh.ShadowCommitReady)
+	}
+}
+
+func TestReadCleanShadowBackedHandleRefreshesActiveStaleShadow(t *testing.T) {
+	stale := []byte("old active shadow bytes")
+	fresh := []byte("fresh committed remote bytes")
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(fresh)), func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == "" {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fresh)
+			return
+		}
+		start, end, ok := parseTestBytesRange(r.Header.Get("Range"))
+		if !ok {
+			t.Errorf("Range = %q, want bytes range", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if start < 0 || end >= int64(len(fresh)) {
+			t.Errorf("Range = %q outside fresh object", r.Header.Get("Range"))
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(fresh[start : end+1])
+	})
+	defer cleanup()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	const filePath = "/file.bin"
+	if err := shadow.WriteFull(filePath, stale, 1); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize:    int64(len(stale)),
+		BaseRev:     1,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+	if _, err := fh.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fhID := fs.allocateFileHandle(fh)
+
+	fs.inodes.UpdateSize(ino, int64(len(fresh)))
+	fs.recordCommittedRevision(filePath, 2)
+
+	got, st, err := readDat9FSTestRange(fs, ino, fhID, 0, len(fresh))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, fresh) {
+		t.Fatalf("Read returned stale active shadow: got %q want %q", got, fresh)
+	}
+	fh.Lock()
+	defer fh.Unlock()
+	if fh.BaseRev != 2 {
+		t.Fatalf("fh.BaseRev = %d, want 2", fh.BaseRev)
+	}
+	if fh.OrigSize != int64(len(fresh)) {
+		t.Fatalf("fh.OrigSize = %d, want %d", fh.OrigSize, len(fresh))
+	}
+	if fh.ShadowReady || fh.ShadowSpill || fh.ShadowCommitReady {
+		t.Fatalf("shadow flags = ready:%t spill:%t commit:%t, want all false", fh.ShadowReady, fh.ShadowSpill, fh.ShadowCommitReady)
+	}
+}
+
+func TestDebouncedFlushPublishesSizeBeforeRefreshingCleanSibling(t *testing.T) {
+	stale := []byte("old")
+	fresh := []byte("fresh committed bytes")
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read PUT body: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if !bytes.Equal(body, fresh) {
+				t.Errorf("PUT body = %q, want %q", body, fresh)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 2})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: time.Hour}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	const filePath = "/small.txt"
+	ino := fs.inodes.Lookup(filePath, false, int64(len(stale)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	writer := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: int64(len(stale)),
+		BaseRev:  1,
+	}
+	if _, err := writer.Dirty.Write(0, fresh); err != nil {
+		t.Fatal(err)
+	}
+	writer.DirtySeq = fs.markDirtySize(ino, writer.Dirty.Size())
+
+	sibling := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: int64(len(stale)),
+		BaseRev:  1,
+	}
+	if _, err := sibling.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	sibling.Dirty.ClearDirty()
+	fs.openHandles.Add(sibling)
+
+	writer.Lock()
+	st := fs.flushHandleDebounced(context.Background(), writer, false)
+	writer.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandleDebounced status = %v, want OK", st)
+	}
+	fs.debouncer.FlushAll()
+
+	if sibling.BaseRev != 2 {
+		t.Fatalf("sibling BaseRev = %d, want 2", sibling.BaseRev)
+	}
+	if sibling.OrigSize != int64(len(fresh)) {
+		t.Fatalf("sibling OrigSize = %d, want %d", sibling.OrigSize, len(fresh))
+	}
+}
+
 func TestOpenWritablePreloadSkipsSQLitePersistentJournalOpenHandle(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
