@@ -1282,6 +1282,11 @@ func TestDat9FSParallelDiskReadStopsQueuedBlocksAfterFirstError(t *testing.T) {
 		rangeHeader := r.Header.Get("Range")
 		switch rangeHeader {
 		case "bytes=0-63":
+			select {
+			case <-slowStarted:
+			case <-r.Context().Done():
+				return
+			}
 			http.Error(w, "blocked range", http.StatusBadGateway)
 			return
 		case "bytes=64-127":
