@@ -1207,6 +1207,9 @@ func (fs *Dat9FS) ensureLinkedGitStateRestored(ctx context.Context, rt *gitWorks
 		if err := fs.writeLinkedGitFile(rt, commonRT, linkedGitFile); err != nil {
 			return err
 		}
+		if err := fs.applyRestoredGitHeadOverlay(ctx, rt, linkedGitDir); err != nil {
+			return err
+		}
 		rt.mu.Lock()
 		rt.restored = true
 		rt.mu.Unlock()
@@ -1233,6 +1236,9 @@ func (fs *Dat9FS) ensureLinkedGitStateRestored(ctx context.Context, rt *gitWorks
 	}
 	if !gitDirLooksUsable(ctx, linkedGitDir) {
 		return fmt.Errorf("git workspace %s restored unusable linked .git state", rt.workspace.WorkspaceID)
+	}
+	if err := fs.applyRestoredGitHeadOverlay(ctx, rt, linkedGitDir); err != nil {
+		return err
 	}
 	rt.mu.Lock()
 	rt.restored = true
@@ -1434,6 +1440,9 @@ func (fs *Dat9FS) applyRestoredGitHeadOverlay(ctx context.Context, rt *gitWorksp
 	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
+	if rt.overlay == nil {
+		rt.overlay = make(map[string]client.GitOverlayEntry)
+	}
 	for rel, entry := range overlay {
 		if _, exists := rt.overlay[rel]; exists {
 			continue

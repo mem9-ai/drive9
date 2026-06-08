@@ -1146,6 +1146,15 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 		t.Skip("git not found")
 	}
 	linkedRepo := createLinkedGitWorktreeForTest(t)
+	const linkedReadme = "linked local commit\n"
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(linkedRepo.linkedWorktree, "README.md"), []byte(linkedReadme), 0o644); err != nil {
+		t.Fatalf("write linked readme: %v", err)
+	}
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "add", "README.md")
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "commit", "-m", "linked local commit")
+	linkedHead := fuseGitOutputForTest(t, linkedRepo.linkedWorktree, "rev-parse", "HEAD")
 	commonState, err := archiveLocalGitDir(linkedRepo.commonGitDir)
 	if err != nil {
 		t.Fatalf("archive common git state: %v", err)
@@ -1174,7 +1183,7 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 	fixture := newGitStateOnlyFixture(t)
 	fixture.states["linked"] = client.GitState{
 		WorkspaceID:      "linked",
-		CheckpointCommit: linkedRepo.headCommit,
+		CheckpointCommit: linkedHead,
 		StorageType:      gitStateStorageTarGzNoObjects,
 		SizeBytes:        int64(len(linkedState)),
 		Content:          linkedState,
@@ -1218,8 +1227,15 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 		t.Fatalf("restored commondir = %q, want ../../..", commonDir)
 	}
 	gotHead := fuseGitOutputForTest(t, "", "--git-dir", restoredLinkedGitDir, "rev-parse", "HEAD")
-	if gotHead != linkedRepo.headCommit {
-		t.Fatalf("linked HEAD = %s, want %s", gotHead, linkedRepo.headCommit)
+	if gotHead != linkedHead {
+		t.Fatalf("linked HEAD = %s, want %s", gotHead, linkedHead)
+	}
+	entry, ok := linkedRT.overlayEntry("README.md")
+	if !ok {
+		t.Fatalf("linked README.md restored HEAD overlay missing")
+	}
+	if entry.Op != "upsert" || string(entry.Content) != linkedReadme {
+		t.Fatalf("linked README.md overlay = %+v content=%q, want restored HEAD content", entry, entry.Content)
 	}
 }
 
