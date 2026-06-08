@@ -7232,6 +7232,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, info.Size())
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
+			fs.applyGitOverlayMirrorEntry(fh, info.Size())
 		}
 		if fh.WritePolicy == WritePolicyWriteSync {
 			source = "git-local-write-sync"

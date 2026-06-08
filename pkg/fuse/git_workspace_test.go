@@ -2731,6 +2731,41 @@ func TestGitWorkspaceLocalHeadTreeProvidesCommittedFiles(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceCreatePublishesDirtyMirrorBeforeFlush(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC),
+		Mode:     0o644,
+	}, "stash-new.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	content := []byte("stash untracked\n")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+		Size:     uint32(len(content)),
+	}, content); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	got, err := fs.readGitFile(context.Background(), "/repo/stash-new.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("readGitFile before flush: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("readGitFile before flush = %q, want %q", got, content)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+}
+
 func TestGitWorkspaceUnlinkCreateRefreshesDirtyMirror(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found")

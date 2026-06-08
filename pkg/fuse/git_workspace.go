@@ -2882,6 +2882,23 @@ func (fs *Dat9FS) applyGitOverlayEntry(workspaceID string, entry client.GitOverl
 	}
 }
 
+func (fs *Dat9FS) applyGitOverlayMirrorEntry(fh *FileHandle, size int64) {
+	if fs == nil || fh == nil || fh.Layer != PathLayerGitWorkspace || fh.GitWorkspaceID == "" || fh.GitRelPath == "" {
+		return
+	}
+	fs.applyGitOverlayEntry(fh.GitWorkspaceID, client.GitOverlayEntry{
+		WorkspaceID:    fh.GitWorkspaceID,
+		Path:           fh.GitRelPath,
+		Op:             "upsert",
+		Kind:           fh.GitKind,
+		Mode:           gitModeForHandle(fh),
+		SizeBytes:      size,
+		BaseObjectSHA:  fh.GitBaseObjectSHA,
+		ChecksumSHA256: "",
+		UpdatedAt:      time.Now(),
+	})
+}
+
 func (fs *Dat9FS) rememberPendingGitOverlayEntry(workspaceID string, entry client.GitOverlayEntry) uint64 {
 	if fs == nil {
 		return 0
@@ -3293,6 +3310,7 @@ func (fs *Dat9FS) gitCreateHandle(ctx context.Context, localPath string, flags u
 	}
 	if file, ok := fs.openGitDirtyMirrorFile(rt, rel, flags|uint32(syscall.O_TRUNC), nil); ok {
 		fh.LocalFile = file
+		fs.applyGitOverlayMirrorEntry(fh, 0)
 	}
 	fh.DirtySeq = fs.markDirtySize(ino, 0)
 	return fh, entry, gofuse.OK
@@ -3338,6 +3356,7 @@ func (fs *Dat9FS) prepareGitOpenHandle(ctx context.Context, fh *FileHandle, flag
 		fs.inodes.UpdateSize(fh.Ino, 0)
 		if file, ok := fs.openGitDirtyMirrorFile(rt, rel, flags, nil); ok {
 			fh.LocalFile = file
+			fs.applyGitOverlayMirrorEntry(fh, 0)
 			return gofuse.OK
 		}
 		return gofuse.OK
