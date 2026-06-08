@@ -7233,6 +7233,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, info.Size())
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
+			fs.applyGitOverlayMirrorEntry(fh, info.Size())
 		}
 		if fh.WritePolicy == WritePolicyWriteSync {
 			source = "git-local-write-sync"
@@ -9051,14 +9052,23 @@ func (fs *Dat9FS) FlushAll() {
 		cf()
 	}
 
-	// Drain coalesced .git checkpoints before shutdown so replacement
-	// sandboxes can restore the latest lightweight Git state.
-	fs.drainGitStateCheckpoints()
-
 	// Drain git workspace overlay commits queued by interactive writeback.
 	// These include both file payloads and metadata entries such as chmod,
-	// mkdir, symlink, and whiteout.
+	// mkdir, symlink, and whiteout. Do this before sweeping dirty mirrors so
+	// older queued overlay writes cannot overwrite newer mirror content.
 	fs.drainGitOverlayWrites()
+
+	// Git workspace dirty mirrors are the local durable copy-on-write cache.
+	// Sweep them during graceful shutdown so a missed handle flush cannot lose
+	// working-tree content across sandbox replacement.
+	fs.syncGitDirtyMirrors()
+	fs.drainGitOverlayWrites()
+
+	// Drain coalesced .git checkpoints and then checkpoint every loaded git
+	// workspace once more. The final pass covers Git ref/index updates that
+	// arrived through lock-file rename sequences without a pending debounce.
+	fs.drainGitStateCheckpoints()
+	fs.checkpointAllGitWorkspaces()
 
 	// Drain all pending write-back uploads before shutting down.
 	if fs.uploader != nil {

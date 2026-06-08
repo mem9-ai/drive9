@@ -143,7 +143,6 @@ func gitClone(args []string) error {
 	if err := initializeFastCloneIndex(cmdCtx, target, head); err != nil {
 		return err
 	}
-	configureFastCloneGitOptimizations(cmdCtx, target)
 
 	mode := "fast"
 	if *blobless {
@@ -173,6 +172,7 @@ func gitClone(args []string) error {
 		return fmt.Errorf("register git tree manifest: %w", err)
 	}
 	cancel()
+	configureFastCloneGitOptimizations(cmdCtx, target)
 	gitDir, err := mainGitStateDirForTarget(target, resolved)
 	if err != nil {
 		return err
@@ -312,7 +312,6 @@ func gitWorktreeAdd(args []string) error {
 	if err := initializeFastCloneIndex(cmdCtx, worktreePath, head); err != nil {
 		return err
 	}
-	configureFastCloneGitOptimizations(cmdCtx, worktreePath)
 
 	branchName, branchErr := gitOutput(cmdCtx, worktreePath, "symbolic-ref", "--short", "-q", "HEAD")
 	if branchErr != nil {
@@ -373,6 +372,7 @@ func gitWorktreeAdd(args []string) error {
 		return fmt.Errorf("register linked git tree manifest: %w", err)
 	}
 	cancel()
+	configureFastCloneGitOptimizations(cmdCtx, worktreePath)
 	if err := uploadGitStateCheckpoint(cmdCtx, c, ws.WorkspaceID, head, linkedGitDir); err != nil {
 		return err
 	}
