@@ -1386,6 +1386,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 				errJSON(w, http.StatusConflict, err.Error())
 				return
 			}
+			if errJSONInvalidRootDentry(w, err) {
+				metricEvent(r.Context(), "fs_write", "result", "error")
+				return
+			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_upload_initiate_failed", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSONInternalStorage(w)
@@ -1436,6 +1440,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_conflict", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_write", "result", "error")
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_failed", "path", path, "error", err)...)
@@ -2032,6 +2040,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "kind", kind, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2067,6 +2078,9 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_not_found", "src_path", srcPath, "dst_path", dstPath)...)
 			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "copy_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
@@ -2110,6 +2124,9 @@ func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath 
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "hardlink_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2151,6 +2168,9 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "rename_failed", "old_path", oldPath, "new_path", newPath, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2180,6 +2200,9 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_conflict", "path", path, "error", err)...)
 			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "mkdir_failed", "path", path, "error", err)...)
@@ -2245,6 +2268,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "create_failed", "path", path, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2302,6 +2328,9 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_conflict", "path", path, "error", err)...)
 			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "symlink_failed", "path", path, "error", err)...)
@@ -2477,6 +2506,10 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_failed", "path", req.Path, "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSONInternalStorage(w)
@@ -2586,6 +2619,10 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_revision_conflict", "upload_id", uploadID, "error", err)...)
 			metricEvent(r.Context(), "upload_complete", "result", "conflict")
 			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "upload_complete", "result", "error")
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_failed", "upload_id", uploadID, "error", err)...)
@@ -2934,6 +2971,10 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_failed", "path", req.Path, "error", err)...)
 		metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
 		errJSONInternalStorage(w)
@@ -3142,6 +3183,10 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_client_protocol_error", "upload_id", uploadID, "error", err)...)
 			metricEvent(r.Context(), "v2_upload_complete", "result", "error")
 			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "v2_upload_complete", "result", "error")
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_failed", "upload_id", uploadID, "error", err)...)
@@ -3675,6 +3720,14 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func errJSONInvalidRootDentry(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, datastore.ErrInvalidRootDentry) {
+		return false
+	}
+	errJSON(w, http.StatusBadRequest, err.Error())
+	return true
 }
 
 const internalStorageErrorMessage = "storage backend unavailable; contact support"

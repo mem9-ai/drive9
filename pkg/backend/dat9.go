@@ -199,6 +199,9 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 	if err != nil {
 		return err
 	}
+	if err := rejectRootFileNodePath(path); err != nil {
+		return err
+	}
 
 	fileID := b.genID()
 	now := time.Now()
@@ -267,6 +270,9 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 	if err != nil {
 		return err
 	}
+	if err := rejectRootFileNodePath(linkPath); err != nil {
+		return err
+	}
 
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
 		return err
@@ -322,6 +328,9 @@ func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (e
 	dirPath, err := pathutil.CanonicalizeDir(path)
 	if err != nil {
 		return err
+	}
+	if dirPath == "/" {
+		return nil
 	}
 	err = b.store.EnsureParentDirs(ctx, dirPath, b.genID)
 	if err != nil {
@@ -383,6 +392,9 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 	if err != nil {
 		return err
 	}
+	if path == "/" {
+		return datastore.ErrInvalidRootDentry
+	}
 	if node.IsDirectory {
 		return b.store.DeleteEmptyDir(ctx, path)
 	}
@@ -398,6 +410,9 @@ func (b *Dat9Backend) RemoveFileCtx(ctx context.Context, path string) (err error
 	if err != nil {
 		return err
 	}
+	if err := rejectRootFileNodePath(path); err != nil {
+		return err
+	}
 	_, err = b.store.DeleteFileWithRefCheck(ctx, path)
 	return err
 }
@@ -409,6 +424,9 @@ func (b *Dat9Backend) RemoveDirCtx(ctx context.Context, path string) (err error)
 	path, err = pathutil.CanonicalizeDir(path)
 	if err != nil {
 		return err
+	}
+	if path == "/" {
+		return datastore.ErrInvalidRootDentry
 	}
 	return b.store.DeleteEmptyDir(ctx, path)
 }
@@ -424,6 +442,9 @@ func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error)
 	path, node, err := b.resolveNodePath(ctx, path)
 	if err != nil {
 		return err
+	}
+	if path == "/" {
+		return datastore.ErrInvalidRootDentry
 	}
 	if !node.IsDirectory {
 		_, err = b.store.DeleteFileWithRefCheck(ctx, path)
@@ -444,6 +465,9 @@ func (b *Dat9Backend) ReadCtx(ctx context.Context, path string, offset int64, si
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
 		return nil, err
+	}
+	if path == "/" {
+		return nil, datastore.ErrNotFound
 	}
 	nf, err := b.store.Stat(ctx, path)
 	if err != nil {
@@ -514,6 +538,9 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
+		return 0, 0, err
+	}
+	if err := rejectRootFileNodePath(path); err != nil {
 		return 0, 0, err
 	}
 
@@ -1006,6 +1033,9 @@ func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (plan *ReadP
 	if err != nil {
 		return nil, err
 	}
+	if resolvedPath == "/" {
+		return nil, datastore.ErrNotFound
+	}
 	phase = "stat_for_read"
 	logger.InfoBenchTiming(ctx, "backend_read_plan_start",
 		zap.String("path", path),
@@ -1070,6 +1100,9 @@ func (b *Dat9Backend) ReadInlinePlanCtx(ctx context.Context, path string) (plan 
 	resolvedPath, err := pathutil.Canonicalize(path)
 	if err != nil {
 		return nil, err
+	}
+	if resolvedPath == "/" {
+		return nil, datastore.ErrNotFound
 	}
 	nf, err := b.store.StatForRead(ctx, resolvedPath)
 	if err != nil {
@@ -1144,6 +1177,9 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 		return err
 	}
 	newPath = canonicalizePathForKind(newPath, node.IsDirectory)
+	if oldPath == "/" || newPath == "/" {
+		return datastore.ErrInvalidRootDentry
+	}
 	if oldPath == newPath {
 		return nil
 	}
@@ -1205,8 +1241,14 @@ func (b *Dat9Backend) CopyFileCtx(ctx context.Context, srcPath, dstPath string) 
 	if err != nil {
 		return err
 	}
+	if srcPath == "/" {
+		return datastore.ErrNotFound
+	}
 	dstPath, err = pathutil.Canonicalize(dstPath)
 	if err != nil {
+		return err
+	}
+	if err := rejectRootFileNodePath(dstPath); err != nil {
 		return err
 	}
 	srcNode, err := b.store.GetNode(ctx, srcPath)
@@ -1244,9 +1286,15 @@ func (b *Dat9Backend) HardlinkFileCtx(ctx context.Context, srcPath, dstPath stri
 	if err != nil {
 		return err
 	}
+	if err := rejectRootFileNodePath(dstPath); err != nil {
+		return err
+	}
 	srcPath, srcNode, err := b.resolveNodePath(ctx, srcPath)
 	if err != nil {
 		return err
+	}
+	if srcPath == "/" {
+		return datastore.ErrNotFound
 	}
 	if srcPath == dstPath {
 		return datastore.ErrPathConflict
@@ -1378,6 +1426,13 @@ func (w *writeCloser) Close() error {
 }
 
 // --- helpers ---
+
+func rejectRootFileNodePath(path string) error {
+	if path == "/" {
+		return datastore.ErrInvalidRootDentry
+	}
+	return nil
+}
 
 func normalizePath(path string) string {
 	if pathutil.IsDir(path) {

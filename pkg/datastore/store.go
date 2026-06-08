@@ -28,6 +28,7 @@ var (
 	ErrUploadExpired           = errors.New("upload has expired")
 	ErrPathConflict            = errors.New("path already exists")
 	ErrInvalidLinkTarget       = errors.New("invalid link target")
+	ErrInvalidRootDentry       = errors.New("root path is implicit and cannot be stored as a file node")
 	ErrUploadConflict          = errors.New("active upload already exists for this path")
 	ErrIdempotencyConflict     = errors.New("duplicate idempotency key")
 	ErrJournalConflict         = errors.New("journal create conflict")
@@ -225,11 +226,23 @@ func (s *Store) columnExists(table, column string) bool {
 
 // --- file_nodes operations ---
 
+func isRootDentryFields(path, parentPath, name string) bool {
+	return path == "/" && parentPath == "/" && name == "/"
+}
+
+func isRootSelfDentry(n FileNode) bool {
+	return isRootDentryFields(n.Path, n.ParentPath, n.Name)
+}
+
 func (s *Store) InsertNode(ctx context.Context, n *FileNode) error {
 	start := time.Now()
 	var opErr error
 	defer observeStoreOp(ctx, "insert_node", start, &opErr)
 
+	if isRootSelfDentry(*n) {
+		opErr = ErrInvalidRootDentry
+		return ErrInvalidRootDentry
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())
@@ -268,6 +281,9 @@ func (s *Store) ListNodes(ctx context.Context, parentPath string) (out []*FileNo
 		n, err := scanNode(rows)
 		if err != nil {
 			return nil, err
+		}
+		if isRootSelfDentry(*n) {
+			continue
 		}
 		nodes = append(nodes, n)
 	}
@@ -340,6 +356,9 @@ func (s *Store) UpdateNodePath(ctx context.Context, oldPath, newPath, newParentP
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_node_path", start, &err)
 
+	if isRootDentryFields(newPath, newParentPath, newName) {
+		return ErrInvalidRootDentry
+	}
 	res, err := s.db.ExecContext(ctx, `UPDATE file_nodes SET path = ?, parent_path = ?, name = ?
 		WHERE path = ?`, newPath, newParentPath, newName, oldPath)
 	if err != nil {
@@ -359,6 +378,9 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 	start := time.Now()
 	defer observeStoreOp(ctx, "rename_file_replacing_target", start, &err)
 
+	if isRootDentryFields(newPath, newParentPath, newName) {
+		return nil, ErrInvalidRootDentry
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -462,6 +484,9 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 	start := time.Now()
 	defer observeStoreOp(ctx, "rename_dir", start, &err)
 
+	if oldPrefix == "/" || newPrefix == "/" {
+		return 0, ErrInvalidRootDentry
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -593,6 +618,9 @@ func (s *Store) LinkFileNode(ctx context.Context, srcPath, dstPath, dstParentPat
 
 // LinkFileNodeTx creates a hardlink node inside an existing transaction.
 func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath, dstParentPath, dstName, nodeID string, createdAt time.Time) error {
+	if isRootDentryFields(dstPath, dstParentPath, dstName) {
+		return ErrInvalidRootDentry
+	}
 	if dstParentPath != "/" {
 		var parentIsDir bool
 		err := db.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, dstParentPath).
@@ -1253,6 +1281,9 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 }
 
 func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
+	if isRootSelfDentry(*n) {
+		return ErrInvalidRootDentry
+	}
 	if !n.IsDirectory && n.FileID != "" {
 		if err := s.lockConfirmedFileForAttachTx(db, n.FileID); err != nil {
 			return err
@@ -1687,6 +1718,9 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 		n.IsDirectory = isDir != 0
 		n.FileID = nodeFileID.String
 		n.CreatedAt = nodeCreatedAt.UTC()
+		if isRootSelfDentry(n) {
+			continue
+		}
 		nf := &NodeWithFile{Node: n}
 		if fFileID.Valid {
 			nf.File = &File{

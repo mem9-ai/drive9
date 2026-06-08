@@ -752,6 +752,39 @@ func TestEnsureParentDirsNoRootSelfInsert(t *testing.T) {
 	}
 }
 
+func TestMkdirRootIsIdempotentAndDoesNotCreateDentry(t *testing.T) {
+	b := newTestBackend(t)
+	if err := b.MkdirCtx(context.Background(), "/", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.MkdirCtx(context.Background(), "/", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := b.Store().GetNode(context.Background(), "/"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("GetNode(/) error = %v, want %v", err, datastore.ErrNotFound)
+	}
+	entries, err := b.ReadDir("/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name == "/" {
+			t.Fatalf("root dir should not appear as its own child: %+v", e)
+		}
+	}
+}
+
+func TestWriteRootRejected(t *testing.T) {
+	b := newTestBackend(t)
+	_, err := b.Write("/", []byte("x"), 0, filesystem.WriteFlagCreate)
+	if !errors.Is(err, datastore.ErrInvalidRootDentry) {
+		t.Fatalf("Write(/) error = %v, want %v", err, datastore.ErrInvalidRootDentry)
+	}
+	if _, err := b.Store().GetNode(context.Background(), "/"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("GetNode(/) error = %v, want %v", err, datastore.ErrNotFound)
+	}
+}
+
 func TestOffsetWritePreservesTail(t *testing.T) {
 	b := newTestBackend(t)
 	if _, err := b.Write("/f.txt", []byte("ABCDEFGH"), 0, filesystem.WriteFlagCreate); err != nil {

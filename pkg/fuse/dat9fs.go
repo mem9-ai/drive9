@@ -3337,13 +3337,16 @@ func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string
 }
 
 func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
-	cached := make([]CachedFileInfo, len(items))
-	for i, item := range items {
+	cached := make([]CachedFileInfo, 0, len(items))
+	for _, item := range items {
+		if !validDirEntryName(item.Name) {
+			continue
+		}
 		var mtime time.Time
 		if item.Mtime > 0 {
 			mtime = time.Unix(item.Mtime, 0)
 		}
-		cached[i] = CachedFileInfo{
+		cached = append(cached, CachedFileInfo{
 			Name:       item.Name,
 			Size:       item.Size,
 			IsDir:      item.IsDir,
@@ -3352,7 +3355,7 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 			HasMode:    item.HasMode,
 			ResourceID: item.ResourceID,
 			Nlink:      item.Nlink,
-		}
+		})
 	}
 	return cached
 }
@@ -5757,6 +5760,9 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 
 	for i := int(input.Offset); i < len(dh.Entries); i++ {
 		e := dh.Entries[i]
+		if !validDirEntryName(e.Name) {
+			continue
+		}
 		if !out.AddDirEntry(gofuse.DirEntry{
 			Name: e.Name,
 			Ino:  e.Ino,
@@ -5791,6 +5797,9 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 
 	for i := int(input.Offset); i < len(dh.Entries); i++ {
 		e := dh.Entries[i]
+		if !validDirEntryName(e.Name) {
+			continue
+		}
 		if _, ok := fs.inodes.GetEntry(e.Ino); !ok {
 			e.Ino = fs.recreateDirEntryInode(dh.Path, e)
 			dh.Entries[i].Ino = e.Ino
@@ -6160,6 +6169,9 @@ func listDirErrToFuseStatus(err error) gofuse.Status {
 func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []DirEntry {
 	entries := make([]DirEntry, 0, len(items))
 	for _, item := range items {
+		if !validDirEntryName(item.Name) {
+			continue
+		}
 		childP := dirEntryChildPath(dirPath, item.Name)
 
 		mtime := item.Mtime
@@ -6177,6 +6189,14 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		entries = append(entries, dirEntryFromCachedInfo(item, ino))
 	}
 	return entries
+}
+
+func validDirEntryName(name string) bool {
+	return name != "" &&
+		name != "." &&
+		name != ".." &&
+		!strings.ContainsRune(name, '/') &&
+		!strings.ContainsRune(name, 0)
 }
 
 func dirEntryChildPath(dirPath, name string) string {

@@ -73,6 +73,9 @@ func (b *Dat9Backend) InitiateAppendUploadIfRevision(ctx context.Context, path s
 	if err != nil {
 		return nil, fmt.Errorf("canonicalize append path %q: %w", path, err)
 	}
+	if err := rejectRootFileNodePath(path); err != nil {
+		return nil, err
+	}
 	if b.s3 == nil {
 		return nil, ErrS3NotConfigured
 	}
@@ -151,6 +154,10 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
+		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		return nil, err
+	}
+	if err := rejectRootFileNodePath(path); err != nil {
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
 		return nil, err
 	}

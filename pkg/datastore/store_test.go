@@ -297,6 +297,50 @@ func TestListDir(t *testing.T) {
 	requireEmbeddingRevision(t, entries[0].File.EmbeddingRevision, 13)
 }
 
+func TestInsertNodeRejectsRootDentry(t *testing.T) {
+	s := newTestStore(t)
+	err := s.InsertNode(context.Background(), &FileNode{
+		NodeID:      "root-self",
+		Path:        "/",
+		ParentPath:  "/",
+		Name:        "/",
+		IsDirectory: true,
+		CreatedAt:   time.Now(),
+	})
+	if !errors.Is(err, ErrInvalidRootDentry) {
+		t.Fatalf("InsertNode root dentry error = %v, want %v", err, ErrInvalidRootDentry)
+	}
+}
+
+func TestListDirSkipsHistoricalRootDentry(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if _, err := s.DB().Exec(`
+		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, created_at)
+		VALUES (?, ?, ?, ?, 1, ?)`,
+		"root-self", "/", "/", "/", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{
+		NodeID:      "d1",
+		Path:        "/data/",
+		ParentPath:  "/",
+		Name:        "data",
+		IsDirectory: true,
+		CreatedAt:   now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := s.ListDir(context.Background(), "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Node.Name != "data" {
+		t.Fatalf("ListDir entries = %+v, want only data", entries)
+	}
+}
+
 func TestListNodes(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
@@ -326,6 +370,35 @@ func TestListNodes(t *testing.T) {
 	}
 	if nodes[0].InodeID != "f1" {
 		t.Errorf("inode_id=%q, want f1", nodes[0].InodeID)
+	}
+}
+
+func TestListNodesSkipsHistoricalRootDentry(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if _, err := s.DB().Exec(`
+		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, created_at)
+		VALUES (?, ?, ?, ?, 1, ?)`,
+		"root-self", "/", "/", "/", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{
+		NodeID:      "d1",
+		Path:        "/data/",
+		ParentPath:  "/",
+		Name:        "data",
+		IsDirectory: true,
+		CreatedAt:   now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	nodes, err := s.ListNodes(context.Background(), "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "data" {
+		t.Fatalf("ListNodes entries = %+v, want only data", nodes)
 	}
 }
 
