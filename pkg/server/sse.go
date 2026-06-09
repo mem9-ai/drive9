@@ -8,16 +8,23 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/dat9/pkg/metrics"
 )
 
 const (
-	sseHeartbeatInterval = 30 * time.Second
-	sseFlushBatchSize    = 10
-	sseFlushMaxDelay     = 1 * time.Millisecond
+	sseHeartbeatInterval     = 30 * time.Second
+	sseFlushBatchSize        = 10
+	sseFlushMaxDelay         = 1 * time.Millisecond
+	ssePersistentReplayLimit = eventBusRingSize
+	ssePersistentRetention   = eventBusRingSize * 10
 )
+
+var sseActiveConnections atomic.Int64
 
 // stopTimer drains a timer's channel after stopping it to prevent spurious
 // ticks. Returns true if the timer was stopped before it fired.
@@ -150,7 +157,33 @@ func (s *Server) tenantEventBus(r *http.Request) *EventBus {
 func (s *Server) publishEvent(r *http.Request, path, op string) {
 	actor := r.Header.Get("X-Dat9-Actor")
 	bus := s.tenantEventBus(r)
+	start := time.Now()
+	if b := backendFromRequest(r); b != nil && b.Store() != nil {
+		ev, err := b.Store().InsertFSEvent(r.Context(), path, op, actor)
+		if err == nil {
+			recordSSEOperation("persist", "ok", start)
+			if ev.Seq > ssePersistentRetention {
+				if _, pruneErr := b.Store().PruneFSEventsBefore(r.Context(), ev.Seq-ssePersistentRetention+1); pruneErr != nil {
+					recordSSEOperation("retention_sweep", "error", start)
+				} else {
+					recordSSEOperation("retention_sweep", "ok", start)
+				}
+			}
+			bus.PublishEvent(ChangeEvent{
+				Seq:   ev.Seq,
+				Path:  ev.Path,
+				Op:    ev.Op,
+				Actor: ev.Actor,
+				Ts:    ev.Ts,
+			})
+			recordSSEOperation("publish", "ok", start)
+			return
+		}
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "sse_persist_failed", "path", path, "op", op, "error", err)...)
+		recordSSEOperation("persist", "error", start)
+	}
 	bus.Publish(path, op, actor)
+	recordSSEOperation("publish", "volatile", start)
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -186,26 +219,23 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+	metrics.RecordGauge("sse", "active_connections", float64(sseActiveConnections.Add(1)))
+	defer metrics.RecordGauge("sse", "active_connections", float64(sseActiveConnections.Add(-1)))
 
 	ctx := r.Context()
 
 	// Phase 1: Replay or Reset.
-	// EventsSince returns headSeq from the same lock acquisition as the
-	// ring scan, so reset cursor and ring state are a consistent snapshot.
-	events, headSeq, ok := bus.EventsSince(since)
+	// Prefer the durable event log when tenant storage is available. The
+	// in-memory ring remains the live fan-out path and fallback for tests /
+	// single-tenant setups without a scoped backend.
+	events, headSeq, ok, replayReason := s.eventsSince(r.Context(), bStoreFromRequest(r), bus, since)
 	lastSeen := since
 
 	bw := newSSEBufferedWriter(w, flusher)
 
 	if !ok {
-		reason := "initial_sync"
-		if since > 0 {
-			reason = "seq_too_old"
-			if since > headSeq {
-				reason = "server_restart"
-			}
-		}
-		sendSSEReset(bw, headSeq, reason)
+		sendSSEReset(bw, headSeq, replayReason)
+		recordSSEOperation("reset", replayReason, time.Time{})
 		lastSeen = headSeq
 	} else {
 		for _, ev := range events {
@@ -244,6 +274,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-ctx.Done():
+			recordSSEOperation("disconnect", "client_cancelled", time.Time{})
 			return
 		case <-heartbeat.C:
 			sendSSEHeartbeat(bw, lastSeen)
@@ -263,6 +294,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			flushC = nil
 		case _, open := <-notify:
 			if !open {
+				recordSSEOperation("disconnect", "server_closed", time.Time{})
 				return
 			}
 			liveEvents, liveHead, liveOK := bus.EventsSince(lastSeen)
@@ -309,6 +341,96 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+func bStoreFromRequest(r *http.Request) *datastore.Store {
+	b := backendFromRequest(r)
+	if b == nil {
+		return nil
+	}
+	return b.Store()
+}
+
+func (s *Server) eventsSince(ctx context.Context, store *datastore.Store, bus *EventBus, since uint64) ([]ChangeEvent, uint64, bool, string) {
+	if store != nil {
+		events, headSeq, ok, reason, err := persistentEventsSince(ctx, store, since)
+		if err == nil {
+			return events, headSeq, ok, reason
+		}
+		logger.Error(ctx, "server_event", eventFields(ctx, "sse_replay_persistent_failed", "error", err)...)
+	}
+	events, headSeq, ok := bus.EventsSince(since)
+	if !ok {
+		reason := "initial_sync"
+		if since > 0 {
+			reason = "seq_too_old"
+			if since > headSeq {
+				reason = "server_restart"
+			}
+		}
+		return nil, headSeq, false, reason
+	}
+	return events, headSeq, true, ""
+}
+
+func persistentEventsSince(ctx context.Context, store *datastore.Store, since uint64) ([]ChangeEvent, uint64, bool, string, error) {
+	start := time.Now()
+	oldestSeq, headSeq, count, err := store.FSEventBounds(ctx)
+	if err != nil {
+		recordSSEOperation("replay", "error", start)
+		return nil, 0, false, "", err
+	}
+
+	if since == 0 {
+		recordSSEOperation("replay", "initial_sync", start)
+		return nil, headSeq, false, "initial_sync", nil
+	}
+	if count == 0 {
+		recordSSEOperation("replay", "server_restart", start)
+		return nil, headSeq, false, "server_restart", nil
+	}
+	if since > headSeq {
+		recordSSEOperation("replay", "server_restart", start)
+		return nil, headSeq, false, "server_restart", nil
+	}
+	if oldestSeq > 0 && since+1 < oldestSeq {
+		recordSSEOperation("replay", "seq_too_old", start)
+		return nil, headSeq, false, "seq_too_old", nil
+	}
+	if since == headSeq {
+		recordSSEOperation("replay", "ok", start)
+		return nil, headSeq, true, "", nil
+	}
+
+	events, err := store.ListFSEventsSince(ctx, since, ssePersistentReplayLimit+1)
+	if err != nil {
+		recordSSEOperation("replay", "error", start)
+		return nil, 0, false, "", err
+	}
+	if len(events) > ssePersistentReplayLimit {
+		recordSSEOperation("replay", "seq_too_old", start)
+		return nil, headSeq, false, "seq_too_old", nil
+	}
+	out := make([]ChangeEvent, 0, len(events))
+	for _, ev := range events {
+		out = append(out, ChangeEvent{
+			Seq:   ev.Seq,
+			Path:  ev.Path,
+			Op:    ev.Op,
+			Actor: ev.Actor,
+			Ts:    ev.Ts,
+		})
+	}
+	recordSSEOperation("replay", "ok", start)
+	return out, headSeq, true, "", nil
+}
+
+func recordSSEOperation(operation, result string, start time.Time) {
+	var d time.Duration
+	if !start.IsZero() {
+		d = time.Since(start)
+	}
+	metrics.RecordOperation("sse", operation, result, d)
 }
 
 // isStructuralOp returns true for operations that change namespace structure

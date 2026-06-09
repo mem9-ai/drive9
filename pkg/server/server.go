@@ -2278,6 +2278,7 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "chmod_ok", "path", path)...)
+	s.publishEvent(r, path, "chmod")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 

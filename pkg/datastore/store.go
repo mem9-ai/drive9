@@ -1186,7 +1186,7 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 		return err
 	}
 	mode = (mode & 0o777) | (currentMode & fileTypeModeMask)
-	res, err := s.db.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE inode_id = ? AND status = 'CONFIRMED'`, mode, inodeID)
+	res, err := s.db.ExecContext(ctx, `UPDATE inodes SET mode = ?, revision = revision + 1, mtime = CURRENT_TIMESTAMP(3) WHERE inode_id = ? AND status = 'CONFIRMED'`, mode, inodeID)
 	if err != nil {
 		return err
 	}

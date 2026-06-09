@@ -7,11 +7,11 @@ import (
 
 // ChangeEvent represents a single filesystem mutation event.
 type ChangeEvent struct {
-	Seq   uint64 `json:"seq"`              // monotonic per-bus sequence number
-	Path  string `json:"path"`             // affected path
-	Op    string `json:"op"`               // "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
-	Actor string `json:"actor,omitempty"`  // X-Dat9-Actor header value (per-mount ID)
-	Ts    int64  `json:"ts"`               // unix milliseconds
+	Seq   uint64 `json:"seq"`             // monotonic per-bus sequence number
+	Path  string `json:"path"`            // affected path
+	Op    string `json:"op"`              // "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
+	Actor string `json:"actor,omitempty"` // X-Dat9-Actor header value (per-mount ID)
+	Ts    int64  `json:"ts"`              // unix milliseconds
 }
 
 const (
@@ -49,6 +49,29 @@ func (eb *EventBus) Publish(path, op, actor string) {
 		Actor: actor,
 		Ts:    time.Now().UnixMilli(),
 	}
+	eb.publishLocked(ev)
+	eb.mu.Unlock()
+}
+
+// PublishEvent appends an event whose sequence was assigned by a durable event
+// log. It is used by the SSE endpoint so reconnect replay and live delivery use
+// the same cursor space.
+func (eb *EventBus) PublishEvent(ev ChangeEvent) {
+	eb.mu.Lock()
+	if ev.Seq == 0 {
+		eb.seq++
+		ev.Seq = eb.seq
+	} else if ev.Seq > eb.seq {
+		eb.seq = ev.Seq
+	}
+	if ev.Ts == 0 {
+		ev.Ts = time.Now().UnixMilli()
+	}
+	eb.publishLocked(ev)
+	eb.mu.Unlock()
+}
+
+func (eb *EventBus) publishLocked(ev ChangeEvent) {
 	eb.ring[eb.head] = ev
 	eb.head = (eb.head + 1) % eventBusRingSize
 	if eb.count < eventBusRingSize {
@@ -62,7 +85,6 @@ func (eb *EventBus) Publish(path, op, actor string) {
 		default:
 		}
 	}
-	eb.mu.Unlock()
 }
 
 // Subscribe registers a new listener. Returns a unique ID and a signal channel.

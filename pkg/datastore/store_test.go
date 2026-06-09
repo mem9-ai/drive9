@@ -1366,6 +1366,9 @@ func TestChmod(t *testing.T) {
 	if got.Mode != 0o600 {
 		t.Errorf("mode=%o, want 0o600", got.Mode)
 	}
+	if got.Revision != 2 {
+		t.Errorf("revision=%d, want 2", got.Revision)
+	}
 }
 
 func TestChmodRejectsHistoricalRootDentry(t *testing.T) {
