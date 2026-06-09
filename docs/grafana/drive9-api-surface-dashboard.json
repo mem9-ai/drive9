@@ -121,7 +121,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval]))",
+          "expr": "sum(rate(drive9_http_requests_total{route=~\"$route\"}[$__rate_interval]))",
           "legendFormat": "http_rps",
           "refId": "A"
         }
@@ -188,7 +188,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(drive9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval])))",
           "legendFormat": "http_p95",
           "refId": "A"
         }
@@ -255,7 +255,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(drive9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval])))",
           "legendFormat": "http_p99",
           "refId": "A"
         }
@@ -322,7 +322,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(dat9_http_inflight_requests{route=~\"$route\"})",
+          "expr": "sum(drive9_http_inflight_requests{route=~\"$route\"})",
           "legendFormat": "inflight",
           "refId": "A"
         }
@@ -389,7 +389,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])), 0.000001)",
+          "expr": "sum(rate(drive9_http_requests_total{route=~\"$route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(drive9_http_requests_total{route=~\"$route\"}[$__rate_interval])), 0.000001)",
           "legendFormat": "http_5xx_ratio",
           "refId": "A"
         }
@@ -456,7 +456,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$route\",status=~\"4..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])), 0.000001)",
+          "expr": "sum(rate(drive9_http_requests_total{route=~\"$route\",status=~\"4..\"}[$__rate_interval])) / clamp_min(sum(rate(drive9_http_requests_total{route=~\"$route\"}[$__rate_interval])), 0.000001)",
           "legendFormat": "http_4xx_ratio",
           "refId": "A"
         }
@@ -503,7 +503,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, sum by (route) (rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval])))",
+          "expr": "topk(12, sum by (route) (rate(drive9_http_requests_total{route=~\"$route\"}[$__rate_interval])))",
           "legendFormat": "{{route}}",
           "refId": "A"
         }
@@ -550,7 +550,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.95, sum by (le, route) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, route) (rate(drive9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
           "legendFormat": "{{route}} p95",
           "refId": "A"
         },
@@ -559,7 +559,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.99, sum by (le, route) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, route) (rate(drive9_http_request_duration_seconds_bucket{route=~\"$route\"}[$__rate_interval]))))",
           "legendFormat": "{{route}} p99",
           "refId": "B"
         }
@@ -606,7 +606,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (status) (rate(dat9_http_requests_total{route=~\"$route\"}[$__rate_interval]))",
+          "expr": "sum by (status) (rate(drive9_http_requests_total{route=~\"$route\"}[$__rate_interval]))",
           "legendFormat": "status={{status}}",
           "refId": "A"
         }
@@ -653,7 +653,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, sum by (route, status) (rate(dat9_http_requests_total{route=~\"$route\",status!~\"2..|3..\"}[$__rate_interval])))",
+          "expr": "topk(12, sum by (route, status) (rate(drive9_http_requests_total{route=~\"$route\",status!~\"2..|3..\"}[$__rate_interval])))",
           "legendFormat": "{{route}} / {{status}}",
           "refId": "A"
         },
@@ -662,7 +662,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(dat9_http_inflight_requests{route=~\"$route\"})",
+          "expr": "sum(drive9_http_inflight_requests{route=~\"$route\"})",
           "legendFormat": "inflight",
           "refId": "B"
         }
@@ -709,7 +709,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (event, result) (rate(dat9_tenant_events_total{event=~\"tenant_provision|tenant_schema_init\"}[$__rate_interval]))",
+          "expr": "sum by (event, result) (rate(drive9_business_events_total{event=~\"tenant_provision|tenant_schema_init\"}[$__rate_interval]))",
           "legendFormat": "{{event}} {{result}}",
           "refId": "A"
         }
@@ -756,7 +756,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (event, result) (rate(dat9_tenant_events_total{event=~\"tenant_provision|tenant_schema_init\",result!~\"ok|accepted\"}[$__rate_interval]))",
+          "expr": "sum by (event, result) (rate(drive9_business_events_total{event=~\"tenant_provision|tenant_schema_init\",result!~\"ok|accepted\"}[$__rate_interval]))",
           "legendFormat": "{{event}} {{result}}",
           "refId": "A"
         }
@@ -805,14 +805,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_http_requests_total{route=~\"/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*\"}, route)",
+        "definition": "label_values(drive9_http_requests_total{route=~\"/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*\"}, route)",
         "hide": 0,
         "includeAll": true,
         "label": "API Route",
         "multi": true,
         "name": "route",
         "options": [],
-        "query": "label_values(dat9_http_requests_total{route=~\"/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*\"}, route)",
+        "query": "label_values(drive9_http_requests_total{route=~\"/v1/provision|/v1/status|/v1/sql|/v1/events|/v1/vault/.*|/s3/.*\"}, route)",
         "refresh": 2,
         "regex": "",
         "sort": 1,

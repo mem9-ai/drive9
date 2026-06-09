@@ -39,51 +39,51 @@ func TestBackendRuntimeMetricsAggregateAcrossBackends(t *testing.T) {
 	})
 
 	metricsText := readBackendMetrics()
-	if !strings.Contains(metricsText, "dat9_module_up{module=\"image_extract\"} 1") {
+	if !strings.Contains(metricsText, "drive9_module_up{module=\"image_extract\"} 1") {
 		t.Fatalf("metrics missing aggregated image_extract availability: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_gauge{component=\"image_extract\",name=\"queue_capacity\"} 8") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\"} 8") {
 		t.Fatalf("metrics missing aggregated image queue capacity: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_gauge{component=\"image_extract\",name=\"workers\"} 3") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"workers\"} 3") {
 		t.Fatalf("metrics missing aggregated image workers: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\"} 4096") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\"} 4096") {
 		t.Fatalf("metrics missing aggregated audio max bytes: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_gauge{component=\"audio_extract\",name=\"task_timeout_seconds\"} 3") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"task_timeout_seconds\"} 3") {
 		t.Fatalf("metrics missing aggregated audio timeout: %s", metricsText)
 	}
 
 	b1.Close()
 
 	metricsText = readBackendMetrics()
-	if !strings.Contains(metricsText, "dat9_module_up{module=\"image_extract\"} 1") {
+	if !strings.Contains(metricsText, "drive9_module_up{module=\"image_extract\"} 1") {
 		t.Fatalf("metrics should keep image_extract available while one backend remains: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_gauge{component=\"image_extract\",name=\"queue_capacity\"} 3") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\"} 3") {
 		t.Fatalf("metrics should retain remaining image queue capacity: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_gauge{component=\"image_extract\",name=\"workers\"} 1") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"workers\"} 1") {
 		t.Fatalf("metrics should retain remaining image workers: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\"} 2048") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\"} 2048") {
 		t.Fatalf("metrics should retain remaining audio max bytes: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_gauge{component=\"audio_extract\",name=\"max_extract_text_bytes\"} 555") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_extract_text_bytes\"} 555") {
 		t.Fatalf("metrics should retain remaining audio text limit: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_gauge{component=\"audio_extract\",name=\"task_timeout_seconds\"} 2") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"task_timeout_seconds\"} 2") {
 		t.Fatalf("metrics should retain remaining audio timeout: %s", metricsText)
 	}
 
 	b2.Close()
 
 	metricsText = readBackendMetrics()
-	if !strings.Contains(metricsText, "dat9_module_up{module=\"image_extract\"} 0") {
+	if !strings.Contains(metricsText, "drive9_module_up{module=\"image_extract\"} 0") {
 		t.Fatalf("metrics should mark image_extract unavailable once all backends close: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_module_up{module=\"audio_extract\"} 0") {
+	if !strings.Contains(metricsText, "drive9_module_up{module=\"audio_extract\"} 0") {
 		t.Fatalf("metrics should mark audio_extract unavailable once all backends close: %s", metricsText)
 	}
 }

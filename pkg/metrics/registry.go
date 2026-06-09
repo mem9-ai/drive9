@@ -322,21 +322,21 @@ func (r *Registry) writeModules(w io.Writer) {
 	}
 	sort.Strings(names)
 
-	_, _ = fmt.Fprintln(w, "# HELP dat9_module_up Module availability state")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_module_up gauge")
+	_, _ = fmt.Fprintln(w, "# HELP drive9_module_up Module availability state")
+	_, _ = fmt.Fprintln(w, "# TYPE drive9_module_up gauge")
 	for _, module := range names {
-		writeMetricLine(w, "dat9_module_up", labelsKey([]Attribute{Attr("module", module)}), formatFloat(modules[module].up))
+		writeMetricLine(w, "drive9_module_up", labelsKey([]Attribute{Attr("module", module)}), formatFloat(modules[module].up))
 	}
 
-	_, _ = fmt.Fprintln(w, "# HELP dat9_module_uptime_seconds Module uptime in seconds since first registration")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_module_uptime_seconds gauge")
+	_, _ = fmt.Fprintln(w, "# HELP drive9_module_uptime_seconds Module uptime in seconds since first registration")
+	_, _ = fmt.Fprintln(w, "# TYPE drive9_module_uptime_seconds gauge")
 	for _, module := range names {
 		state := modules[module]
 		uptime := 0.0
 		if !state.registeredAt.IsZero() {
 			uptime = now.Sub(state.registeredAt).Seconds()
 		}
-		writeMetricLine(w, "dat9_module_uptime_seconds", labelsKey([]Attribute{Attr("module", module)}), formatFloat(uptime))
+		writeMetricLine(w, "drive9_module_uptime_seconds", labelsKey([]Attribute{Attr("module", module)}), formatFloat(uptime))
 	}
 }
 

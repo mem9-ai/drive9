@@ -121,7 +121,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
+          "expr": "sum(rate(drive9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
           "legendFormat": "upload_rps",
           "refId": "A"
         }
@@ -188,7 +188,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(drive9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval])))",
           "legendFormat": "upload_http_p95",
           "refId": "A"
         }
@@ -255,7 +255,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(drive9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval])))",
           "legendFormat": "upload_http_p99",
           "refId": "A"
         }
@@ -322,7 +322,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(drive9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval])))",
           "legendFormat": "upload_service_p95",
           "refId": "A"
         }
@@ -389,7 +389,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route=~\"$http_route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval])), 1)",
+          "expr": "sum(rate(drive9_http_requests_total{route=~\"$http_route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(drive9_http_requests_total{route=~\"$http_route\"}[$__rate_interval])), 1)",
           "legendFormat": "upload_5xx_ratio",
           "refId": "A"
         }
@@ -456,7 +456,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(dat9_http_inflight_requests{route=~\"$http_route\"})",
+          "expr": "sum(drive9_http_inflight_requests{route=~\"$http_route\"})",
           "legendFormat": "upload_inflight",
           "refId": "A"
         }
@@ -503,7 +503,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (route, method) (rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
+          "expr": "sum by (route, method) (rate(drive9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
           "legendFormat": "{{method}} {{route}}",
           "refId": "A"
         }
@@ -550,7 +550,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.95, sum by (le, route, method) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, route, method) (rate(drive9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval]))))",
           "legendFormat": "{{method}} {{route}} p95",
           "refId": "A"
         },
@@ -559,7 +559,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.99, sum by (le, route, method) (rate(dat9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, route, method) (rate(drive9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval]))))",
           "legendFormat": "{{method}} {{route}} p99",
           "refId": "B"
         }
@@ -606,7 +606,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (status) (rate(dat9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
+          "expr": "sum by (status) (rate(drive9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
           "legendFormat": "{{status}}",
           "refId": "A"
         }
@@ -653,7 +653,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (operation, result) (rate(dat9_service_operations_total{operation=~\"$service_operation\"}[$__rate_interval]))",
+          "expr": "sum by (operation, result) (rate(drive9_service_operations_total{operation=~\"$service_operation\"}[$__rate_interval]))",
           "legendFormat": "{{operation}} / {{result}}",
           "refId": "A"
         }
@@ -700,7 +700,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(drive9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval]))))",
           "legendFormat": "{{operation}} p95",
           "refId": "A"
         },
@@ -709,7 +709,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(dat9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(drive9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval]))))",
           "legendFormat": "{{operation}} p99",
           "refId": "B"
         }
@@ -756,7 +756,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (event, result) (rate(dat9_tenant_events_total{event=~\"$event\"}[$__rate_interval]))",
+          "expr": "sum by (event, result) (rate(drive9_business_events_total{event=~\"$event\"}[$__rate_interval]))",
           "legendFormat": "{{event}} / {{result}}",
           "refId": "A"
         }
@@ -803,7 +803,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (operation, result) (rate(dat9_service_operations_total{component=\"s3client\"}[$__rate_interval]))",
+          "expr": "sum by (operation, result) (rate(drive9_service_operations_total{component=\"s3client\"}[$__rate_interval]))",
           "legendFormat": "{{operation}} / {{result}}",
           "refId": "A"
         }
@@ -850,7 +850,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(dat9_service_operation_duration_seconds_bucket{component=\"s3client\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(drive9_service_operation_duration_seconds_bucket{component=\"s3client\"}[$__rate_interval]))))",
           "legendFormat": "{{operation}} p95",
           "refId": "A"
         },
@@ -859,7 +859,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(dat9_service_operation_duration_seconds_bucket{component=\"s3client\"}[$__rate_interval]))))",
+          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(drive9_service_operation_duration_seconds_bucket{component=\"s3client\"}[$__rate_interval]))))",
           "legendFormat": "{{operation}} p99",
           "refId": "B"
         }
@@ -908,14 +908,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_http_requests_total{route=~\"/v1/uploads.*|/v2/uploads.*\"}, route)",
+        "definition": "label_values(drive9_http_requests_total{route=~\"/v1/uploads.*|/v2/uploads.*\"}, route)",
         "hide": 0,
         "includeAll": true,
         "label": "HTTP Route",
         "multi": true,
         "name": "http_route",
         "options": [],
-        "query": "label_values(dat9_http_requests_total{route=~\"/v1/uploads.*|/v2/uploads.*\"}, route)",
+        "query": "label_values(drive9_http_requests_total{route=~\"/v1/uploads.*|/v2/uploads.*\"}, route)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -932,14 +932,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_service_operations_total{operation=~\"upload_.*|v2_upload_.*|v2_presign_.*|complete_upload|resume_upload|abort_upload\"}, operation)",
+        "definition": "label_values(drive9_service_operations_total{operation=~\"upload_.*|v2_upload_.*|v2_presign_.*|complete_upload|resume_upload|abort_upload\"}, operation)",
         "hide": 0,
         "includeAll": true,
         "label": "Service Operation",
         "multi": true,
         "name": "service_operation",
         "options": [],
-        "query": "label_values(dat9_service_operations_total{operation=~\"upload_.*|v2_upload_.*|v2_presign_.*|complete_upload|resume_upload|abort_upload\"}, operation)",
+        "query": "label_values(drive9_service_operations_total{operation=~\"upload_.*|v2_upload_.*|v2_presign_.*|complete_upload|resume_upload|abort_upload\"}, operation)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -956,14 +956,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_tenant_events_total{event=~\"upload_.*|v2_upload_.*|v2_presign_.*\"}, event)",
+        "definition": "label_values(drive9_business_events_total{event=~\"upload_.*|v2_upload_.*|v2_presign_.*\"}, event)",
         "hide": 0,
         "includeAll": true,
         "label": "Tenant Event",
         "multi": true,
         "name": "event",
         "options": [],
-        "query": "label_values(dat9_tenant_events_total{event=~\"upload_.*|v2_upload_.*|v2_presign_.*\"}, event)",
+        "query": "label_values(drive9_business_events_total{event=~\"upload_.*|v2_upload_.*|v2_presign_.*\"}, event)",
         "refresh": 2,
         "regex": "",
         "sort": 1,

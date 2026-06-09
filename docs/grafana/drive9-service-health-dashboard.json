@@ -28,6 +28,17 @@
       "keepTime": true,
       "tags": [],
       "targetBlank": false,
+      "title": "Tenant Usage",
+      "type": "link",
+      "url": "/d/drive9-tenant-usage"
+    },
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
       "title": "API Surface Drill-Down",
       "type": "link",
       "url": "/d/drive9-api-surface"
@@ -165,7 +176,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_db_pool_wait_count_total{role=~\"$db_role\"}[$__rate_interval]))",
+          "expr": "sum(rate(drive9_db_pool_wait_count_total{role=~\"$db_role\"}[$__rate_interval]))",
           "legendFormat": "db_waits_per_second",
           "refId": "A"
         }
@@ -232,7 +243,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(1 - dat9_module_up{module=~\"$module\"})",
+          "expr": "sum(1 - drive9_module_up{module=~\"$module\"})",
           "legendFormat": "down_modules",
           "refId": "A"
         }
@@ -299,7 +310,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route!~\"/healthz|/metrics|other\"}[$__rate_interval]))",
+          "expr": "sum(rate(drive9_http_requests_total{route!~\"/healthz|/metrics|other\"}[$__rate_interval]))",
           "legendFormat": "http_rps",
           "refId": "A"
         }
@@ -366,7 +377,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_http_requests_total{route!~\"/healthz|/metrics|other\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_http_requests_total{route!~\"/healthz|/metrics|other\"}[$__rate_interval])), 0.000001)",
+          "expr": "sum(rate(drive9_http_requests_total{route!~\"/healthz|/metrics|other\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(drive9_http_requests_total{route!~\"/healthz|/metrics|other\"}[$__rate_interval])), 0.000001)",
           "legendFormat": "http_5xx_ratio",
           "refId": "A"
         }
@@ -433,7 +444,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_http_request_duration_seconds_bucket{route!~\"/healthz|/metrics|other\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(drive9_http_request_duration_seconds_bucket{route!~\"/healthz|/metrics|other\"}[$__rate_interval])))",
           "legendFormat": "http_p99",
           "refId": "A"
         }
@@ -500,7 +511,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_http_inflight_requests",
+          "expr": "drive9_http_inflight_requests",
           "legendFormat": "http_inflight",
           "refId": "A"
         }
@@ -547,7 +558,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_module_up{module=~\"$module\"}",
+          "expr": "drive9_module_up{module=~\"$module\"}",
           "legendFormat": "{{module}} up",
           "refId": "A"
         }
@@ -594,7 +605,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(8, histogram_quantile(0.95, sum by (le, route) (rate(dat9_http_request_duration_seconds_bucket{route!~\"/healthz|/metrics|other\"}[$__rate_interval]))))",
+          "expr": "topk(8, histogram_quantile(0.95, sum by (le, route) (rate(drive9_http_request_duration_seconds_bucket{route!~\"/healthz|/metrics|other\"}[$__rate_interval]))))",
           "legendFormat": "{{route}} p95",
           "refId": "A"
         }
@@ -641,7 +652,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, sum by (route, status) (rate(dat9_http_requests_total{route!~\"/healthz|/metrics|other\",status!~\"2..|3..\"}[$__rate_interval])))",
+          "expr": "topk(12, sum by (route, status) (rate(drive9_http_requests_total{route!~\"/healthz|/metrics|other\",status!~\"2..|3..\"}[$__rate_interval])))",
           "legendFormat": "{{route}} {{status}}",
           "refId": "A"
         }
@@ -688,7 +699,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (component) (rate(dat9_service_operations_total{component=~\"$component\",result=~\"error|deadline_exceeded|canceled|bad_conn\"}[$__rate_interval])) / clamp_min(sum by (component) (rate(dat9_service_operations_total{component=~\"$component\"}[$__rate_interval])), 0.000001)",
+          "expr": "sum by (component) (rate(drive9_service_operations_total{component=~\"$component\",result=~\"error|deadline_exceeded|canceled|bad_conn\"}[$__rate_interval])) / clamp_min(sum by (component) (rate(drive9_service_operations_total{component=~\"$component\"}[$__rate_interval])), 0.000001)",
           "legendFormat": "{{component}} error_ratio",
           "refId": "A"
         }
@@ -735,7 +746,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (role, state) (dat9_db_pool_connections{role=~\"$db_role\"})",
+          "expr": "sum by (role, state) (drive9_db_pool_connections{role=~\"$db_role\"})",
           "legendFormat": "{{role}} {{state}}",
           "refId": "A"
         }
@@ -782,7 +793,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, role) (rate(dat9_db_operation_duration_seconds_bucket{role=~\"$db_role\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, role) (rate(drive9_db_operation_duration_seconds_bucket{role=~\"$db_role\"}[$__rate_interval])))",
           "legendFormat": "{{role}} db_p95",
           "refId": "A"
         }
@@ -829,7 +840,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_module_uptime_seconds{module=~\"$module\"}",
+          "expr": "drive9_module_uptime_seconds{module=~\"$module\"}",
           "legendFormat": "{{module}} uptime",
           "refId": "A"
         }
@@ -877,14 +888,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_module_up, module)",
+        "definition": "label_values(drive9_module_up, module)",
         "hide": 0,
         "includeAll": true,
         "label": "Module",
         "multi": true,
         "name": "module",
         "options": [],
-        "query": "label_values(dat9_module_up, module)",
+        "query": "label_values(drive9_module_up, module)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -901,14 +912,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_service_operations_total, component)",
+        "definition": "label_values(drive9_service_operations_total, component)",
         "hide": 0,
         "includeAll": true,
         "label": "Component",
         "multi": true,
         "name": "component",
         "options": [],
-        "query": "label_values(dat9_service_operations_total, component)",
+        "query": "label_values(drive9_service_operations_total, component)",
         "refresh": 2,
         "regex": "",
         "sort": 1,
@@ -925,14 +936,14 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dat9_db_pool_registered, role)",
+        "definition": "label_values(drive9_db_pool_registered, role)",
         "hide": 0,
         "includeAll": true,
         "label": "DB Role",
         "multi": true,
         "name": "db_role",
         "options": [],
-        "query": "label_values(dat9_db_pool_registered, role)",
+        "query": "label_values(drive9_db_pool_registered, role)",
         "refresh": 2,
         "regex": "",
         "sort": 1,

@@ -1996,43 +1996,63 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	text := string(body)
-	if !strings.Contains(text, "dat9_http_requests_total") {
+	if !strings.Contains(text, "drive9_http_requests_total") {
 		t.Fatalf("expected requests metric in response: %s", text)
 	}
 	if !strings.Contains(text, `route="/v1/fs/*"`) {
 		t.Fatalf("expected fs route metric label in response: %s", text)
 	}
-	if !strings.Contains(text, "dat9_http_inflight_requests") {
+	if !strings.Contains(text, "drive9_http_inflight_requests") {
 		t.Fatalf("expected inflight metric in response: %s", text)
 	}
-	if !strings.Contains(text, `dat9_http_inflight_requests{route="/v1/fs/*"} 0.000000`) {
+	if !strings.Contains(text, `drive9_http_inflight_requests{route="/v1/fs/*"} 0.000000`) {
 		t.Fatalf("expected route-scoped inflight metric in response: %s", text)
 	}
-	if !strings.Contains(text, `dat9_service_operations_total{component="backend",operation="exec_sql",result="ok"}`) {
+	if !strings.Contains(text, `drive9_service_operations_total{component="backend",operation="exec_sql",result="ok"}`) {
 		t.Fatalf("expected backend service metric in response: %s", text)
 	}
-	if !strings.Contains(text, `dat9_http_request_duration_seconds_bucket{method="GET",route="/v1/fs/*",le="0.1"}`) {
+	if !strings.Contains(text, `drive9_http_request_duration_seconds_bucket{method="GET",route="/v1/fs/*",le="0.1"}`) {
 		t.Fatalf("expected http duration histogram bucket in response: %s", text)
 	}
-	if !strings.Contains(text, `dat9_service_operation_duration_seconds_bucket{component="backend",operation="exec_sql",result="ok",le="0.01"}`) {
+	if !strings.Contains(text, `drive9_service_operation_duration_seconds_bucket{component="backend",operation="exec_sql",result="ok",le="0.01"}`) {
 		t.Fatalf("expected service operation histogram bucket in response: %s", text)
 	}
-	if !strings.Contains(text, `dat9_db_operations_total{operation="`) || !strings.Contains(text, `role="user"`) {
+	if !strings.Contains(text, `drive9_db_operations_total{operation="`) || !strings.Contains(text, `role="user"`) {
 		t.Fatalf("expected user db operation metric in response: %s", text)
 	}
-	if strings.Contains(text, `tenant_id="`) {
-		t.Fatalf("expected db operation metrics to avoid tenant_id labels: %s", text)
+	for _, line := range strings.Split(text, "\n") {
+		if strings.HasPrefix(line, "drive9_db_") && strings.Contains(line, `tenant_id="`) {
+			t.Fatalf("expected db operation metrics to avoid tenant_id labels: %s", line)
+		}
 	}
-	if !strings.Contains(text, `dat9_db_pool_registered{role="user"}`) {
+	if !strings.Contains(text, `drive9_db_pool_registered{role="user"}`) {
 		t.Fatalf("expected user db pool metric in response: %s", text)
 	}
-	if !strings.Contains(text, `dat9_tenant_events_total{event="fs_write",result="ok"}`) {
+	if !strings.Contains(text, `drive9_tenant_requests_total{action="write",result="ok",status="200",status_class="2xx",surface="fs",tenant_id="local"}`) {
+		t.Fatalf("expected tenant request usage metric in response: %s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_request_duration_seconds_bucket{action="read",result="ok",status="200",status_class="2xx",surface="fs",tenant_id="local",le="0.1"}`) {
+		t.Fatalf("expected tenant request duration usage metric in response: %s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_inflight_requests{action="read",surface="fs",tenant_id="local"} 0.000000`) {
+		t.Fatalf("expected tenant in-flight usage metric in response: %s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_http_bytes_total{action="write",direction="request",surface="fs",tenant_id="local"}`) {
+		t.Fatalf("expected tenant HTTP byte metric in response: %s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_file_bytes_total{action="write",direction="write",surface="fs",tenant_id="local"}`) {
+		t.Fatalf("expected tenant file write byte metric in response: %s", text)
+	}
+	if !strings.Contains(text, `drive9_tenant_file_bytes_total{action="read",direction="read",surface="fs",tenant_id="local"}`) {
+		t.Fatalf("expected tenant file read byte metric in response: %s", text)
+	}
+	if !strings.Contains(text, `drive9_business_events_total{event="fs_write",result="ok"}`) {
 		t.Fatalf("expected fs_write tenant event metric in response: %s", text)
 	}
-	if !strings.Contains(text, `dat9_tenant_events_total{event="fs_read",result="ok"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="fs_read",result="ok"}`) {
 		t.Fatalf("expected fs_read tenant event metric in response: %s", text)
 	}
-	if !strings.Contains(text, `dat9_tenant_events_total{event="tenant_provision",result="error"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="tenant_provision",result="error"}`) {
 		t.Fatalf("expected tenant_provision error metric in response: %s", text)
 	}
 }
@@ -2100,13 +2120,13 @@ func TestUploadActionMetrics(t *testing.T) {
 	body, _ := io.ReadAll(metricsResp.Body)
 	text := string(body)
 
-	if !strings.Contains(text, `dat9_tenant_events_total{event="upload_complete",result="error"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="upload_complete",result="error"}`) {
 		t.Fatalf("expected upload_complete metric, got: %s", text)
 	}
-	if !strings.Contains(text, `dat9_tenant_events_total{event="upload_resume",result="error"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="upload_resume",result="error"}`) {
 		t.Fatalf("expected upload_resume metric, got: %s", text)
 	}
-	if !strings.Contains(text, `dat9_tenant_events_total{event="upload_abort",result="error"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="upload_abort",result="error"}`) {
 		t.Fatalf("expected upload_abort metric, got: %s", text)
 	}
 }
