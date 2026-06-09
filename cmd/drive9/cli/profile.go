@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	defaultMountProfile = "coding-agent"
-	noneMountProfile    = "none"
+	defaultMountProfile  = "coding-agent"
+	noneMountProfile     = "none"
+	portableMountProfile = "portable"
 )
 
 type profileConfig struct {
@@ -91,6 +92,9 @@ func loadProfileConfig(name string) (profileConfig, error) {
 	if name == defaultMountProfile {
 		return builtinCodingAgentProfile(), nil
 	}
+	if name == portableMountProfile {
+		return builtinPortableProfile(), nil
+	}
 	return profileConfig{}, fmt.Errorf("drive9 profile %q not found in %s", name, profileConfigDir())
 }
 
@@ -141,6 +145,16 @@ func builtinCodingAgentProfile() profileConfig {
 		LocalOnlyPatterns:  builtinCodingAgentLocalOnlyPatterns(),
 		RemoteOnlyPatterns: nil,
 		PackPaths:          nil,
+	}
+}
+
+func builtinPortableProfile() profileConfig {
+	return profileConfig{
+		Name:               portableMountProfile,
+		Source:             "builtin:portable",
+		LocalOnlyPatterns:  builtinCodingAgentLocalOnlyPatterns(),
+		RemoteOnlyPatterns: nil,
+		PackPaths:          []string{"/"},
 	}
 }
 

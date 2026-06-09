@@ -80,6 +80,60 @@ func TestPackArchiveRoundTripCodingAgentDefaults(t *testing.T) {
 	}
 }
 
+func TestPackArchivePortablePacksExistingLocalOverlayOnly(t *testing.T) {
+	srcLocalRoot := t.TempDir()
+	repoRoot := filepath.Join(srcLocalRoot, "overlay", "repo")
+	mustWriteFile(t, filepath.Join(repoRoot, ".git", "config"), []byte("git\n"), 0o600)
+	mustWriteFile(t, filepath.Join(repoRoot, "dist", "app.js"), []byte("bundle\n"), 0o644)
+	mustWriteFile(t, filepath.Join(repoRoot, "src", "main.go"), []byte("package main\n"), 0o644)
+	mustWriteFile(t, filepath.Join(srcLocalRoot, "cache", "remote-managed.txt"), []byte("not overlay\n"), 0o644)
+
+	var buf bytes.Buffer
+	manifest, err := writePackArchive(context.Background(), &buf, packOptions{
+		LocalRoot:        srcLocalRoot,
+		RemoteRoot:       "/remote/root",
+		Profile:          "portable",
+		ProfilePackPaths: []string{"/"},
+	})
+	if err != nil {
+		t.Fatalf("writePackArchive: %v", err)
+	}
+	wantPaths := []string{"/repo"}
+	if !reflect.DeepEqual(manifest.Paths, wantPaths) {
+		t.Fatalf("manifest paths = %v, want %v", manifest.Paths, wantPaths)
+	}
+	if !reflect.DeepEqual(manifest.ReplacePaths, wantPaths) {
+		t.Fatalf("manifest replace_paths = %v, want %v", manifest.ReplacePaths, wantPaths)
+	}
+	entries := map[string]bool{}
+	for _, entry := range manifest.Entries {
+		entries[entry.Path] = true
+		if strings.Contains(entry.Path, "remote-managed") || strings.HasPrefix(entry.Path, "/cache/") {
+			t.Fatalf("portable packed non-overlay entry: %#v", entry)
+		}
+	}
+	for _, want := range []string{"/repo/.git/config", "/repo/dist/app.js", "/repo/src/main.go"} {
+		if !entries[want] {
+			t.Fatalf("portable archive missing local overlay entry %s; entries=%v", want, manifest.Entries)
+		}
+	}
+
+	dstLocalRoot := t.TempDir()
+	mustWriteFile(t, filepath.Join(dstLocalRoot, "overlay", "repo", "stale.txt"), []byte("stale\n"), 0o644)
+	if _, err := extractPackArchive(context.Background(), bytes.NewReader(buf.Bytes()), unpackOptions{
+		LocalRoot: dstLocalRoot,
+		Replace:   true,
+	}); err != nil {
+		t.Fatalf("extractPackArchive: %v", err)
+	}
+	assertFileContent(t, filepath.Join(dstLocalRoot, "overlay", "repo", ".git", "config"), "git\n")
+	assertFileContent(t, filepath.Join(dstLocalRoot, "overlay", "repo", "dist", "app.js"), "bundle\n")
+	assertFileContent(t, filepath.Join(dstLocalRoot, "overlay", "repo", "src", "main.go"), "package main\n")
+	if _, err := os.Lstat(filepath.Join(dstLocalRoot, "overlay", "repo", "stale.txt")); !os.IsNotExist(err) {
+		t.Fatalf("stale portable file still exists after replace: err=%v", err)
+	}
+}
+
 func TestPackArchiveDefaultReplacePathsRemoveMissingSiblings(t *testing.T) {
 	srcLocalRoot := t.TempDir()
 	mustWriteFile(t, filepath.Join(srcLocalRoot, "overlay", "repo", ".git", "config"), []byte("git\n"), 0o644)

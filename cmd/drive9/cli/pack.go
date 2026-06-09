@@ -604,8 +604,15 @@ func resolveProfilePackSources(opts packOptions) ([]packSource, error) {
 	if len(opts.ProfilePackPaths) == 0 {
 		return nil, nil
 	}
-	names, explicit := splitProfilePackPaths(opts.ProfilePackPaths)
+	names, explicit, allLocal := splitProfilePackPaths(opts.ProfilePackPaths)
 	var out []packSource
+	if allLocal {
+		sources, err := discoverAllLocalPackSources(opts.LocalRoot, opts.RemoteRoot, opts.LocalPrefix)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, sources...)
+	}
 	if len(names) > 0 {
 		sources, err := discoverNamedPackSources(opts.LocalRoot, opts.RemoteRoot, opts.LocalPrefix, names)
 		if err != nil {
@@ -623,9 +630,13 @@ func resolveProfilePackSources(opts packOptions) ([]packSource, error) {
 	return normalizePackSources(out), nil
 }
 
-func splitProfilePackPaths(paths []string) (names []string, explicit []string) {
+func splitProfilePackPaths(paths []string) (names []string, explicit []string, allLocal bool) {
 	seenNames := map[string]struct{}{}
 	for _, raw := range paths {
+		if profilePackAllLocal(raw) {
+			allLocal = true
+			continue
+		}
 		if name, ok := profilePackRootName(raw); ok {
 			if _, seen := seenNames[name]; !seen {
 				seenNames[name] = struct{}{}
@@ -638,7 +649,13 @@ func splitProfilePackPaths(paths []string) (names []string, explicit []string) {
 		}
 	}
 	sort.Strings(names)
-	return names, explicit
+	return names, explicit, allLocal
+}
+
+func profilePackAllLocal(raw string) bool {
+	value := strings.TrimSpace(raw)
+	value = strings.TrimSuffix(value, "/")
+	return value == "" || value == "."
 }
 
 func profilePackRootName(raw string) (string, bool) {
@@ -651,6 +668,43 @@ func profilePackRootName(raw string) (string, bool) {
 		return "", false
 	}
 	return value, true
+}
+
+func discoverAllLocalPackSources(localRoot, remoteRoot string, localPrefix string) ([]packSource, error) {
+	prefixPath, err := canonicalArchivePath(localPrefix)
+	if err != nil {
+		return nil, err
+	}
+	root, err := overlayPathForArchivePath(localRoot, prefixPath)
+	if err != nil {
+		return nil, err
+	}
+	info, err := os.Lstat(root)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("stat profile pack root %s: %w", root, err)
+	}
+	if !info.IsDir() {
+		remotePath := mountpath.ToRemote(remoteRoot, prefixPath)
+		return []packSource{{ArchivePath: prefixPath, RemotePath: remotePath, LocalPath: root}}, nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("read profile pack root %s: %w", root, err)
+	}
+	out := make([]packSource, 0, len(entries))
+	for _, entry := range entries {
+		localPath := filepath.Join(root, entry.Name())
+		archivePath, err := archivePathForOverlay(localRoot, localPath)
+		if err != nil {
+			return nil, err
+		}
+		remotePath := mountpath.ToRemote(remoteRoot, archivePath)
+		out = append(out, packSource{ArchivePath: archivePath, RemotePath: remotePath, LocalPath: localPath})
+	}
+	return normalizePackSources(out), nil
 }
 
 func discoverNamedPackSources(localRoot, remoteRoot string, localPrefix string, packNames []string) ([]packSource, error) {
@@ -831,7 +885,7 @@ func packReplacePaths(opts packOptions, paths []string) []string {
 	if strings.TrimSpace(opts.Profile) == noneMountProfile {
 		return nil
 	}
-	packNames, explicitPaths := splitProfilePackPaths(opts.ProfilePackPaths)
+	packNames, explicitPaths, allLocal := splitProfilePackPaths(opts.ProfilePackPaths)
 	explicitPaths = append(explicitPaths, opts.Paths...)
 	parents := map[string]struct{}{}
 	for _, archivePath := range paths {
@@ -855,6 +909,19 @@ func packReplacePaths(opts packOptions, paths []string) []string {
 		}
 		seen[archivePath] = struct{}{}
 		out = append(out, archivePath)
+	}
+	if allLocal {
+		for _, archivePath := range paths {
+			archivePath, err := canonicalArchivePath(archivePath)
+			if err != nil || archivePath == "/" {
+				continue
+			}
+			if _, ok := seen[archivePath]; ok {
+				continue
+			}
+			seen[archivePath] = struct{}{}
+			out = append(out, archivePath)
+		}
 	}
 	for _, raw := range explicitPaths {
 		archivePath, _, err := resolvePackPath(opts.RemoteRoot, opts.LocalPrefix, raw)
