@@ -5,6 +5,7 @@ set -euo pipefail
 
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
+RUN_PORTABLE_PACK_E2E="${RUN_PORTABLE_PACK_E2E:-0}"
 
 PASS=0
 FAIL=0
@@ -43,6 +44,13 @@ else
   echo
   echo "=== [git-workspace] e2e/git-workspace-smoke-test.sh ==="
   echo "SKIP [git-workspace] set RUN_GIT_WORKSPACE_SMOKE=1 to run fast-clone Git workspace coverage"
+fi
+if [ "$RUN_PORTABLE_PACK_E2E" = "1" ]; then
+  run_case "portable-pack-unpack" "e2e/portable-pack-unpack-e2e.sh"
+else
+  echo
+  echo "=== [portable-pack-unpack] e2e/portable-pack-unpack-e2e.sh ==="
+  echo "SKIP [portable-pack-unpack] set RUN_PORTABLE_PACK_E2E=1 to run portable profile pack/unpack coverage"
 fi
 
 echo

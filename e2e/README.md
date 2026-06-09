@@ -16,6 +16,7 @@ including local single-tenant validation via `drive9-server-local`.
 | `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download |
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, default-slot `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
+| `portable-pack-unpack-e2e.sh` | Portable profile pack/unpack over a deterministic local repo: offline npm `file:` install creates `node_modules`, Git staged/unstaged/untracked status changes are captured, pack writes the default hidden archive, fresh local-root unpack restores overlay files, symlinks, `.git`, `node_modules`, branch, HEAD, and `git status` |
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/hardlink/rename/stat semantics, cross-channel consistency, mounted 10KiB→8MiB→10KiB tier-transition parity, read-only and error-path checks |
 | `fuse-correctness-workload.sh` | Real read-only FUSE workload over a manifest fixture: `find`, `grep`, `stat`, `cat`, `sha256`, symlink, hardlink, unicode/space paths, empty files, binary files, and 8MiB+ files |
 | `fuse-sqlite-correctness.sh` | Real writable FUSE SQLite correctness workload with rollback-journal mode, `PRAGMA integrity_check`, unmount/remount parity, and remote snapshot verification; set `RUN_FUSE_SQLITE_WAL=1` for WAL, `RUN_FUSE_SQLITE_CHURN=1` for repeated large-DB rewrite churn, and `RUN_FUSE_SQLITE_CONCURRENCY=1` for the bounded readers/writer detector |
@@ -55,6 +56,12 @@ bash e2e/cli-smoke-test.sh
 
 # Use official released drive9 CLI instead of local build
 CLI_SOURCE=official bash e2e/cli-smoke-test.sh
+
+# Portable profile pack/unpack over a stable local Git/npm fixture.
+bash e2e/portable-pack-unpack-e2e.sh
+
+# Use official released drive9 CLI for portable profile pack/unpack.
+CLI_SOURCE=official bash e2e/portable-pack-unpack-e2e.sh
 
 bash e2e/fuse-smoke-test.sh
 
@@ -114,6 +121,9 @@ CLI_SOURCE=official bash e2e/posix-permission-smoke-test.sh
 bash e2e/posix-permission-smoke-test.sh
 
 bash e2e/smoke-all.sh
+
+# Include portable profile pack/unpack coverage in smoke-all.
+RUN_PORTABLE_PACK_E2E=1 bash e2e/smoke-all.sh
 ```
 
 #### On-demand POSIX compatibility matrix

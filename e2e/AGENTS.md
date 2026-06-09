@@ -40,6 +40,9 @@ DRIVE9_API_KEY=drive9_xxx bash e2e/api-smoke-test-existing-key.sh
 # CLI smoke (provision + drive9 fs workflows + large file cp)
 bash e2e/cli-smoke-test.sh
 
+# Portable profile pack/unpack over a deterministic local Git/npm fixture
+bash e2e/portable-pack-unpack-e2e.sh
+
 # Journal smoke (provision + journal create/append/find/verify)
 bash e2e/journal-smoke-test.sh
 
@@ -69,6 +72,9 @@ bash e2e/smoke-all.sh
 
 # Include Git workspace smoke in smoke-all when desired
 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
+
+# Include portable profile pack/unpack coverage in smoke-all when desired
+RUN_PORTABLE_PACK_E2E=1 bash e2e/smoke-all.sh
 ```
 
 ### Local via `drive9-server-local`
@@ -184,6 +190,27 @@ use the same value as `DRIVE9_API_KEY` here.
 10. CLI image flow (`fs cp` jpg + `fs find -name "*.jpg"`)
 11. CLI large-file flow (`cp` upload multipart + `cp` download + checksum verification)
 12. CLI upload-limit boundary (`10GiB` initiate accepted, `10GiB+1` rejected)
+
+### `portable-pack-unpack-e2e.sh`
+
+This script is intentionally separate from the broad CLI smoke so it can cover
+portable profile semantics without making the default suite slower. It does not
+depend on GitHub or the npm registry.
+
+1. Provision tenant unless `DRIVE9_API_KEY` is already set
+2. Prepare `drive9` CLI binary (build local or download official release)
+3. Build a deterministic local fixture under `local-root/overlay/workspace/app`
+4. Run offline `npm install` from a local `file:` dependency to create
+   `node_modules`
+5. Initialize `.git`, commit the fixture, switch to a feature branch, then
+   create staged, unstaged, deleted, and untracked Git status changes
+6. Capture a normalized overlay manifest and Git branch/HEAD/status
+7. `drive9 pack --profile portable` to the default hidden pack archive
+8. `drive9 unpack --profile portable` into a fresh local root
+9. Verify the restored overlay manifest, `.git`, branch, HEAD, Git status,
+   `node_modules`, symlinks, and representative file contents all match
+10. Verify non-overlay local-root content, such as `local-root/cache`, is not
+    restored
 
 ### `journal-smoke-test.sh`
 
