@@ -438,7 +438,8 @@ enabled.
 2. Runs `cli-smoke-test.sh`
 3. Runs `journal-smoke-test.sh`
 4. Runs `fuse-smoke-test.sh`
-5. Aggregates pass/fail at script level for quick regression checks
+5. Runs `portable-pack-unpack-e2e.sh` when `RUN_PORTABLE_PACK_E2E=1`
+6. Aggregates pass/fail at script level for quick regression checks
 
 ## Environment variables
 
@@ -523,6 +524,7 @@ enabled.
 | `RUN_FUSE_UMOUNT_DURABLE` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `RUN_FUSE_LOG_AUDIT` | `0` (`1` in release gate) | `fuse-smoke-test.sh` |
 | `RUN_GIT_WORKSPACE_SMOKE` | `0` | `smoke-all.sh` |
+| `RUN_PORTABLE_PACK_E2E` | `0` | `smoke-all.sh`; `portable-pack-unpack-e2e.sh` is required separately by `local-e2e.yml` |
 | `GIT_WORKSPACE_REPOS` | `drive9=...,kimi-cli=...,kimi-code=...` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_SCENARIOS` | `agent_edit_add_commit,agent_patch_apply,sandbox_restore,fast_worktree` | `git-workspace-smoke-test.sh` |
 | `GIT_WORKSPACE_EXISTING_FILES` | `20` | `git-workspace-smoke-test.sh` |
