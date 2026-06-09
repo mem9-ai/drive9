@@ -934,6 +934,42 @@ func (fs *Dat9FS) layerDirHasOpenChild(prefix string) bool {
 	return false
 }
 
+func (fs *Dat9FS) lookupLayerNamespaceEntry(parentIno uint64, childP, name string, out *gofuse.EntryOut) (bool, gofuse.Status) {
+	if fs == nil || !fs.layerEnabled() {
+		return false, gofuse.OK
+	}
+	if fs.isLayerWhiteout(childP) {
+		out.NodeId = 0
+		out.SetEntryTimeout(fs.negativeEntryTTL(childP))
+		return true, gofuse.ENOENT
+	}
+	if mode, ok := fs.layerDirMode(childP); ok {
+		ino := fs.inodes.Lookup(childP, true, 0, time.Now())
+		fs.inodes.UpdateMode(ino, mode)
+		entry, ok := fs.inodes.GetEntry(ino)
+		if !ok {
+			return true, gofuse.EIO
+		}
+		parentPath, _ := fs.inodes.GetPath(parentIno)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.fillEntryOut(entry, out)
+		return true, gofuse.OK
+	}
+	if target, mode, ok := fs.layerSymlink(childP); ok {
+		ino := fs.inodes.Lookup(childP, false, int64(len(target)), time.Now())
+		fs.inodes.UpdateMode(ino, mode)
+		entry, ok := fs.inodes.GetEntry(ino)
+		if !ok {
+			return true, gofuse.EIO
+		}
+		parentPath, _ := fs.inodes.GetPath(parentIno)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.fillEntryOut(entry, out)
+		return true, gofuse.OK
+	}
+	return false, gofuse.OK
+}
+
 func (fs *Dat9FS) localOverlayForPath(ctx context.Context, localPath string) (*LocalOverlay, bool, gofuse.Status) {
 	return fs.localOverlayForPathWithHint(ctx, localPath, false)
 }
@@ -4520,6 +4556,9 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	if handled, status := fs.lookupLayerNamespaceEntry(header.NodeId, childP, name, out); handled {
+		return status
+	}
 	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
 		if st != gofuse.OK {
 			return st
@@ -4551,35 +4590,6 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 			out.NodeId = 0
 			out.SetEntryTimeout(fs.negativeEntryTTL(childP))
 			return gofuse.ENOENT
-		}
-		parentPath, _ := fs.inodes.GetPath(header.NodeId)
-		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
-		fs.fillEntryOut(entry, out)
-		return gofuse.OK
-	}
-	if fs.isLayerWhiteout(childP) {
-		out.NodeId = 0
-		out.SetEntryTimeout(fs.negativeEntryTTL(childP))
-		return gofuse.ENOENT
-	}
-	if mode, ok := fs.layerDirMode(childP); ok {
-		ino := fs.inodes.Lookup(childP, true, 0, time.Now())
-		fs.inodes.UpdateMode(ino, mode)
-		entry, ok := fs.inodes.GetEntry(ino)
-		if !ok {
-			return gofuse.EIO
-		}
-		parentPath, _ := fs.inodes.GetPath(header.NodeId)
-		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
-		fs.fillEntryOut(entry, out)
-		return gofuse.OK
-	}
-	if target, mode, ok := fs.layerSymlink(childP); ok {
-		ino := fs.inodes.Lookup(childP, false, int64(len(target)), time.Now())
-		fs.inodes.UpdateMode(ino, mode)
-		entry, ok := fs.inodes.GetEntry(ino)
-		if !ok {
-			return gofuse.EIO
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
@@ -5247,6 +5257,9 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	if target, _, ok := fs.layerSymlink(entry.Path); ok {
+		return []byte(target), gofuse.OK
+	}
 	if overlay, local, st := fs.localOverlayForPath(ctx, entry.Path); local {
 		if st != gofuse.OK {
 			return nil, st
@@ -5268,9 +5281,6 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 			return nil, gitReadErrToFuseStatus(err)
 		}
 		return target, gofuse.OK
-	}
-	if target, _, ok := fs.layerSymlink(entry.Path); ok {
-		return []byte(target), gofuse.OK
 	}
 	target, err := fs.readSmallFileWithRetry(ctx, entry.Path)
 	if err != nil {

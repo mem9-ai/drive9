@@ -155,6 +155,37 @@ func TestLayerSymlinkReadlinkUsesLayerTarget(t *testing.T) {
 	}
 }
 
+func TestLayerSymlinkLookupAndReadlinkPreferLayerOverLocalPolicy(t *testing.T) {
+	fs := NewDat9FS(client.New("http://127.0.0.1", ""), &MountOptions{
+		LayerRef:              "layer-1",
+		RemoteRoot:            "/repo",
+		LocalRoot:             t.TempDir(),
+		LocalOnlyPatterns:     []string{"**/link"},
+		CacheSize:             1 << 20,
+		ReadCacheMaxFileBytes: 1 << 20,
+	})
+	if got := fs.observePathPolicy("/link"); got != PathLayerLocalOnly {
+		t.Fatalf("policy for /link = %s, want local-only", got)
+	}
+	fs.markLayerSymlink("/link", "base.txt", symlinkMode())
+
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "link", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if out.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFLNK) {
+		t.Fatalf("Lookup mode type = %#o, want S_IFLNK", out.Mode&uint32(syscall.S_IFMT))
+	}
+	got, st := fs.Readlink(nil, &gofuse.InHeader{NodeId: out.NodeId})
+	if st != gofuse.OK {
+		t.Fatalf("Readlink status = %v, want OK", st)
+	}
+	if !bytes.Equal(got, []byte("base.txt")) {
+		t.Fatalf("Readlink target = %q, want base.txt", got)
+	}
+}
+
 func TestLayerChmodPreservesSymlinkModeAcrossRelistLookupReadlink(t *testing.T) {
 	var got clientLayerEntryRequest
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

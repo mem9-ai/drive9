@@ -70,6 +70,17 @@ check_cmd_fail() {
   fi
 }
 
+readlink_target_for_check() {
+  local path="$1"
+  local out
+  if out=$(readlink "$path" 2>&1); then
+    printf '%s' "$out"
+    return 0
+  fi
+  printf 'readlink failed: %s' "$out"
+  return 0
+}
+
 skip_layer_fuse() {
   echo "SKIP layer FUSE restore smoke: $*"
 }
@@ -772,7 +783,7 @@ if require_layer_fuse_prereqs; then
   check_cmd_fail "checkpoint restore keeps whiteout" test -e "$mount_b/delete.txt"
   check_cmd_fail "checkpoint restore hides rename source" test -e "$mount_b/move.txt"
   check_eq "checkpoint restore keeps rename target" "$(cat "$mount_b/moved.txt")" "$(cat "$fuse_move_local")"
-  check_eq "checkpoint restore keeps symlink" "$(readlink "$mount_b/link")" "base.txt"
+  check_eq "checkpoint restore keeps symlink" "$(readlink_target_for_check "$mount_b/link")" "base.txt"
   check_cmd_fail "checkpoint restore excludes later write" test -e "$mount_b/after.txt"
   check_cmd "unmount checkpoint restore mount" unmount_layer_mount
   check_cmd "checkpoint restore mount log clean" audit_mount_log "$log_b"
