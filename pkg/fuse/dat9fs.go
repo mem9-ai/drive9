@@ -551,6 +551,28 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 		}
 	}
 	kind := fs.layerEntryKind(ctx, localPath)
+	if kind == "file" && fs.client != nil {
+		entry, err := fs.client.GetFSLayerEntry(ctx, fs.layerRef(), fs.remotePath(localPath))
+		if err == nil && entry != nil && entry.Op == "upsert" && entry.Kind == "file" {
+			baseRev := entry.BaseRevision
+			pendingKind := PendingNew
+			if baseRev > 0 {
+				pendingKind = PendingOverwrite
+			}
+			if err := fs.upsertLayerFile(ctx, localPath, entry.Content, baseRev, mode, true); err != nil {
+				return err
+			}
+			if fs.pendingIndex != nil {
+				if _, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(entry.Content)), pendingKind, baseRev, mode, true); err != nil {
+					return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
+				}
+			}
+			return nil
+		}
+		if err != nil && !isNotFoundErr(err) {
+			return err
+		}
+	}
 	if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
 		Path: fs.remotePath(localPath),
 		Op:   "chmod",
@@ -5345,39 +5367,41 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
-		if st != gofuse.OK {
-			return st
+	if !fs.layerEnabled() {
+		if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
+			if st != gofuse.OK {
+				return st
+			}
+			restoreErr := fs.ensureGitStateForLocalPath(ctx, childP)
+			if restoreErr != nil {
+				return httpToFuseStatus(restoreErr)
+			}
+			if err := overlay.Symlink(pointedTo, childP); err != nil {
+				return localErrToFuseStatus(err)
+			}
+			info, err := overlay.Lstat(childP)
+			if err != nil {
+				return localErrToFuseStatus(err)
+			}
+			entry, st := fs.localEntry(childP, info, true)
+			if st != gofuse.OK {
+				return st
+			}
+			parentPath, _ := fs.inodes.GetPath(header.NodeId)
+			fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+			fs.fillEntryOut(entry, out)
+			return gofuse.OK
 		}
-		restoreErr := fs.ensureGitStateForLocalPath(ctx, childP)
-		if restoreErr != nil {
-			return httpToFuseStatus(restoreErr)
+		if _, rel, ok := fs.gitWorkspaceForPath(ctx, childP); ok && rel != "" {
+			entry, st := fs.putGitSymlink(ctx, childP, pointedTo)
+			if st != gofuse.OK {
+				return st
+			}
+			parentPath, _ := fs.inodes.GetPath(header.NodeId)
+			fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+			fs.fillEntryOut(entry, out)
+			return gofuse.OK
 		}
-		if err := overlay.Symlink(pointedTo, childP); err != nil {
-			return localErrToFuseStatus(err)
-		}
-		info, err := overlay.Lstat(childP)
-		if err != nil {
-			return localErrToFuseStatus(err)
-		}
-		entry, st := fs.localEntry(childP, info, true)
-		if st != gofuse.OK {
-			return st
-		}
-		parentPath, _ := fs.inodes.GetPath(header.NodeId)
-		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
-		fs.fillEntryOut(entry, out)
-		return gofuse.OK
-	}
-	if _, rel, ok := fs.gitWorkspaceForPath(ctx, childP); ok && rel != "" {
-		entry, st := fs.putGitSymlink(ctx, childP, pointedTo)
-		if st != gofuse.OK {
-			return st
-		}
-		parentPath, _ := fs.inodes.GetPath(header.NodeId)
-		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
-		fs.fillEntryOut(entry, out)
-		return gofuse.OK
 	}
 
 	var err error

@@ -402,6 +402,83 @@ func TestLayerChmodCoalescesShadowFileWithoutPendingMeta(t *testing.T) {
 	}
 }
 
+func TestLayerChmodCoalescesExistingLayerUpsertContent(t *testing.T) {
+	var got clientLayerEntryRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+			if r.URL.Query().Get("path") != "/repo/new.txt" {
+				t.Errorf("entry path query = %q, want /repo/new.txt", r.URL.Query().Get("path"))
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+				LayerID:      "layer-1",
+				Path:         "/repo/new.txt",
+				Op:           "upsert",
+				Kind:         "file",
+				BaseRevision: 0,
+				Content:      []byte("data"),
+				Mode:         0o644,
+			})
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/repo/new.txt":
+			w.WriteHeader(http.StatusNotFound)
+			return
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode layer entry: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+			LayerID:      "layer-1",
+			Path:         got.Path,
+			Op:           got.Op,
+			Kind:         got.Kind,
+			Mode:         got.Mode,
+			Content:      got.Content,
+			BaseRevision: got.BaseRevision,
+		})
+	}))
+	defer ts.Close()
+
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	fs.pendingIndex = pending
+
+	if err := fs.upsertLayerChmod(context.Background(), "/new.txt", 0o600); err != nil {
+		t.Fatalf("upsertLayerChmod: %v", err)
+	}
+	if got.Path != "/repo/new.txt" || got.Op != "upsert" || got.Kind != "file" {
+		t.Fatalf("chmod coalesced request = %+v, want file upsert", got)
+	}
+	if !bytes.Equal(got.Content, []byte("data")) {
+		t.Fatalf("coalesced content = %q, want data", got.Content)
+	}
+	if got.BaseRevision != 0 {
+		t.Fatalf("base revision = %d, want 0", got.BaseRevision)
+	}
+	if got.Mode != 0o600 {
+		t.Fatalf("mode = %#o, want 0600", got.Mode)
+	}
+	meta, ok := pending.GetMeta("/new.txt")
+	if !ok || meta.Kind != PendingNew || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending mode = %+v, want PendingNew 0600", meta)
+	}
+}
+
 func TestLayerFileUpsertClearsStaleNamespaceState(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {

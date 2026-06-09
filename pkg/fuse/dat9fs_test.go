@@ -3948,6 +3948,62 @@ func TestSymlinkCreatesRemoteLinkAndCachesEntry(t *testing.T) {
 	}
 }
 
+func TestLayerSymlinkWritesLayerEntry(t *testing.T) {
+	const target = "base.txt"
+	var got client.FSLayerEntryRequest
+	var layerPosts atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+			layerPosts.Add(1)
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Errorf("decode body: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+				LayerID:     "layer-1",
+				Path:        got.Path,
+				Op:          got.Op,
+				Kind:        got.Kind,
+				ContentText: got.ContentText,
+				Mode:        got.Mode,
+			})
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
+			t.Errorf("layer symlink used base fs symlink endpoint: %s", r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == http.MethodHead:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/",
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.EntryOut
+	st := fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, target, "link", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Symlink status = %v, want OK", st)
+	}
+	if layerPosts.Load() != 1 {
+		t.Fatalf("layer POST calls = %d, want 1", layerPosts.Load())
+	}
+	if got.Path != "/link" || got.Op != "symlink" || got.Kind != "symlink" || got.ContentText != target {
+		t.Fatalf("layer symlink request = %+v, want symlink entry", got)
+	}
+	readTarget, st := fs.Readlink(nil, &gofuse.InHeader{NodeId: out.NodeId})
+	if st != gofuse.OK || string(readTarget) != target {
+		t.Fatalf("Readlink = (%q, %v), want %q OK", readTarget, st, target)
+	}
+}
+
 func TestLinkCreatesRemoteHardlinkAndCachesAlias(t *testing.T) {
 	var gotSource string
 	var postCalls atomic.Int32
