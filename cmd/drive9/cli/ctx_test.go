@@ -880,6 +880,11 @@ func TestCtxListDisplaysTenantID(t *testing.T) {
 // pins it.
 func TestF13_NoDaemonStateBetweenCalls(t *testing.T) {
 	home := withIsolatedHome(t)
+	tmpRoot := filepath.Join(home, "tmp")
+	if err := os.MkdirAll(tmpRoot, 0o700); err != nil {
+		t.Fatalf("mkdir temp root: %v", err)
+	}
+	t.Setenv("TMPDIR", tmpRoot)
 	// Snapshot pre-state of common leak sinks.
 	preEntries := func() []string {
 		var out []string

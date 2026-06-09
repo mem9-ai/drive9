@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -121,7 +122,7 @@ func gitClone(args []string) error {
 	if branchErr != nil {
 		branch = ""
 	}
-	nodes, err := gitListTree(cmdCtx, target, head)
+	nodes, err := gitListTree(cmdCtx, target, head, !*blobless)
 	if err != nil {
 		return err
 	}
@@ -135,7 +136,7 @@ func gitClone(args []string) error {
 	if enrichErr != nil {
 		fmt.Fprintf(os.Stderr, "drive9: warning: could not enrich GitHub tree sizes: %v\n", enrichErr)
 		if unknown := unknownGitTreeFileSizeCount(nodes); unknown > 0 {
-			fmt.Fprintf(os.Stderr, "drive9: warning: %d git file sizes remain unknown; git status may need to read those blobs lazily\n", unknown)
+			fmt.Fprintf(os.Stderr, "drive9: warning: %d git file sizes remain unknown; stat metadata will stay unknown until file content is read\n", unknown)
 		}
 	} else {
 		nodes = enriched
@@ -143,7 +144,6 @@ func gitClone(args []string) error {
 	if err := initializeFastCloneIndex(cmdCtx, target, head); err != nil {
 		return err
 	}
-	configureFastCloneGitOptimizations(cmdCtx, target)
 
 	mode := "fast"
 	if *blobless {
@@ -173,6 +173,7 @@ func gitClone(args []string) error {
 		return fmt.Errorf("register git tree manifest: %w", err)
 	}
 	cancel()
+	configureFastCloneGitOptimizations(cmdCtx, target)
 	gitDir, err := mainGitStateDirForTarget(target, resolved)
 	if err != nil {
 		return err
@@ -198,6 +199,9 @@ func gitClone(args []string) error {
 				fmt.Fprintf(os.Stderr, "drive9: warning: could not start background hydrate: %v\n", err)
 			}
 		}
+	}
+	if err := clearLocalGitWorkspaceDeleted(cmdCtx, resolved, ws.WorkspaceID); err != nil {
+		return fmt.Errorf("clear stale local git workspace deletion marker: %w", err)
 	}
 	return nil
 }
@@ -312,13 +316,12 @@ func gitWorktreeAdd(args []string) error {
 	if err := initializeFastCloneIndex(cmdCtx, worktreePath, head); err != nil {
 		return err
 	}
-	configureFastCloneGitOptimizations(cmdCtx, worktreePath)
 
 	branchName, branchErr := gitOutput(cmdCtx, worktreePath, "symbolic-ref", "--short", "-q", "HEAD")
 	if branchErr != nil {
 		branchName = ""
 	}
-	nodes, err := gitListTree(cmdCtx, worktreePath, head)
+	nodes, err := gitListTree(cmdCtx, worktreePath, head, !linkedBlobless)
 	if err != nil {
 		return err
 	}
@@ -332,7 +335,7 @@ func gitWorktreeAdd(args []string) error {
 	if enrichErr != nil {
 		fmt.Fprintf(os.Stderr, "drive9: warning: could not enrich GitHub tree sizes: %v\n", enrichErr)
 		if unknown := unknownGitTreeFileSizeCount(nodes); unknown > 0 {
-			fmt.Fprintf(os.Stderr, "drive9: warning: %d git file sizes remain unknown; git status may need to read those blobs lazily\n", unknown)
+			fmt.Fprintf(os.Stderr, "drive9: warning: %d git file sizes remain unknown; stat metadata will stay unknown until file content is read\n", unknown)
 		}
 	} else {
 		nodes = enriched
@@ -373,6 +376,7 @@ func gitWorktreeAdd(args []string) error {
 		return fmt.Errorf("register linked git tree manifest: %w", err)
 	}
 	cancel()
+	configureFastCloneGitOptimizations(cmdCtx, worktreePath)
 	if err := uploadGitStateCheckpoint(cmdCtx, c, ws.WorkspaceID, head, linkedGitDir); err != nil {
 		return err
 	}
@@ -401,6 +405,9 @@ func gitWorktreeAdd(args []string) error {
 				fmt.Fprintf(os.Stderr, "drive9: warning: could not start background hydrate: %v\n", err)
 			}
 		}
+	}
+	if err := clearLocalGitWorkspaceDeleted(cmdCtx, worktreeResolved, ws.WorkspaceID); err != nil {
+		return fmt.Errorf("clear stale linked git workspace deletion marker: %w", err)
 	}
 	return nil
 }
@@ -504,13 +511,22 @@ func gitWorktreeRemove(args []string) error {
 		return fmt.Errorf("delete linked git workspace: %w", err)
 	}
 	cancel()
+	var cleanupErrs []error
+	if err := markLocalGitWorkspaceDeleted(cmdCtx, resolved, ws.WorkspaceID); err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("mark linked git workspace deleted locally: %w", err))
+	}
 	if overlayRoot, err := localOverlayRootForMountedTarget(resolved); err == nil && overlayRoot != "" {
 		if err := os.RemoveAll(overlayRoot); err != nil {
-			return fmt.Errorf("remove linked local overlay root: %w", err)
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("remove linked local overlay root: %w", err))
 		}
+	} else if err != nil {
+		cleanupErrs = append(cleanupErrs, fmt.Errorf("resolve linked local overlay root: %w", err))
 	}
 	if err := os.Remove(target); err != nil && !os.IsNotExist(err) {
 		fmt.Fprintf(os.Stderr, "drive9: warning: could not remove empty worktree root %s: %v\n", target, err)
+	}
+	if err := errors.Join(cleanupErrs...); err != nil {
+		return err
 	}
 	fmt.Fprintf(os.Stderr, "drive9: removed linked git workspace %s at :%s\n", ws.WorkspaceID, resolved.RemotePath)
 	return nil
@@ -788,6 +804,28 @@ func localOverlayRootForMountedTarget(resolved mountedGitTarget) (string, error)
 	return localPath, nil
 }
 
+func markLocalGitWorkspaceDeleted(ctx context.Context, resolved mountedGitTarget, workspaceID string) error {
+	localRoot := strings.TrimSpace(resolved.LocalRoot)
+	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {
+		return nil
+	}
+	if !filepath.IsAbs(localRoot) {
+		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
+	}
+	return gitcache.MarkWorkspaceDeleted(ctx, localRoot, workspaceID)
+}
+
+func clearLocalGitWorkspaceDeleted(ctx context.Context, resolved mountedGitTarget, workspaceID string) error {
+	localRoot := strings.TrimSpace(resolved.LocalRoot)
+	if localRoot == "" || strings.TrimSpace(workspaceID) == "" {
+		return nil
+	}
+	if !filepath.IsAbs(localRoot) {
+		return fmt.Errorf("drive9 mount metadata local_root must be absolute, got %q", localRoot)
+	}
+	return gitcache.ClearWorkspaceDeleted(ctx, localRoot, workspaceID)
+}
+
 func sameDrive9Mount(a, b mountedGitTarget) bool {
 	return filepath.Clean(a.MountPoint) == filepath.Clean(b.MountPoint) &&
 		strings.TrimRight(a.RemoteRoot, "/") == strings.TrimRight(b.RemoteRoot, "/") &&
@@ -989,8 +1027,8 @@ func gitRun(ctx context.Context, repoDir string, args ...string) error {
 	return nil
 }
 
-func gitListTree(ctx context.Context, repoDir, commitSHA string) ([]client.GitTreeNode, error) {
-	full := []string{"-C", repoDir, "ls-tree", "-r", "-t", "-z", commitSHA}
+func gitListTree(ctx context.Context, repoDir, commitSHA string, includeSizes bool) ([]client.GitTreeNode, error) {
+	full := gitListTreeArgs(repoDir, commitSHA, includeSizes)
 	cmd := exec.CommandContext(ctx, "git", full...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -1007,6 +1045,14 @@ func gitListTree(ctx context.Context, repoDir, commitSHA string) ([]client.GitTr
 		return nil, fmt.Errorf("parse git ls-tree: %w", err)
 	}
 	return nodes, nil
+}
+
+func gitListTreeArgs(repoDir, commitSHA string, includeSizes bool) []string {
+	args := []string{"-C", repoDir, "ls-tree", "-r", "-t"}
+	if includeSizes {
+		args = append(args, "-l")
+	}
+	return append(args, "-z", commitSHA)
 }
 
 func parseGitLsTree(out []byte) ([]client.GitTreeNode, error) {

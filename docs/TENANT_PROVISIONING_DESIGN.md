@@ -377,6 +377,8 @@ DRIVE9_TIDBCLOUD_API_URL=https://<tidb-cloud-api>
 DRIVE9_TIDBCLOUD_API_KEY=<key>
 DRIVE9_TIDBCLOUD_API_SECRET=<secret>
 DRIVE9_TIDBCLOUD_POOL_ID=<pool-id>
+DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT=<non-negative-integer-usd-cents>
+# Example: 500 means $5.00. Negative and non-integer values are rejected.
 
 # meta db
 DRIVE9_META_DSN=<meta-db-dsn>

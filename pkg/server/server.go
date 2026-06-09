@@ -28,6 +28,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/slockoauth"
 	"github.com/mem9-ai/dat9/pkg/tagutil"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	tenantschema "github.com/mem9-ai/dat9/pkg/tenant/schema"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/traceid"
 	"github.com/mem9-ai/dat9/pkg/vault"
@@ -55,12 +56,23 @@ type Config struct {
 	SemanticEmbedder embedding.Client
 	SemanticWorkers  SemanticWorkerOptions
 	SlockOAuth       SlockOAuthClient
+
+	TiDBAutoEmbeddingConfig  tenantschema.TiDBAutoEmbeddingConfig
+	TiDBAutoEmbeddingAPIKey  string
+	TiDBAutoEmbeddingAPIBase string
+	// DisableDatabaseAutoEmbedding suppresses runtime writes that would trigger
+	// TiDB EMBED_TEXT, but TiDB tenants still use the normal auto schema.
+	DisableDatabaseAutoEmbedding bool
 }
 
 type SlockOAuthClient interface {
 	LoginURL() string
 	ExchangeCode(ctx context.Context, code string) (slockoauth.Token, error)
 	Userinfo(ctx context.Context, accessToken string) (slockoauth.UserInfo, error)
+}
+
+type autoEmbeddingSchemaProvisioner interface {
+	InitSchemaForAutoEmbeddingProfile(context.Context, string, tenantschema.TiDBAutoEmbeddingProfile) error
 }
 
 type Server struct {
@@ -83,11 +95,19 @@ type Server struct {
 	journalCursorSecret []byte
 	objectGCWorker      *objectGCWorker
 	slockOAuth          SlockOAuthClient
+	tidbAutoEmbedding   tenantAutoEmbeddingDefault
+	disableDBAutoEmbed  bool
 	forkWorkerCtx       context.Context
 	forkWorkerCancel    context.CancelFunc
 	forkWorkerWG        sync.WaitGroup
 	forkWorkerMu        sync.Mutex
 	forkWorkerClosed    bool
+}
+
+type tenantAutoEmbeddingDefault struct {
+	config  tenantschema.TiDBAutoEmbeddingConfig
+	apiKey  string
+	apiBase string
 }
 
 var (
@@ -159,21 +179,27 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
-		fallback:            cfg.Backend,
-		meta:                cfg.Meta,
-		pool:                cfg.Pool,
-		tokenSecret:         cfg.TokenSecret,
-		localTenantAPIKey:   strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:             vaultMK,
-		vaultIssuerURL:      strings.TrimSpace(cfg.VaultIssuerURL),
-		publicURL:           strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
-		provisioner:         cfg.Provisioner,
-		maxUploadBytes:      maxUpload,
-		inlineThreshold:     inlineThreshold,
-		metrics:             newServerMetrics(),
-		logger:              logger,
-		events:              newEventBuses(),
-		slockOAuth:          cfg.SlockOAuth,
+		fallback:          cfg.Backend,
+		meta:              cfg.Meta,
+		pool:              cfg.Pool,
+		tokenSecret:       cfg.TokenSecret,
+		localTenantAPIKey: strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:           vaultMK,
+		vaultIssuerURL:    strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:         strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
+		provisioner:       cfg.Provisioner,
+		maxUploadBytes:    maxUpload,
+		inlineThreshold:   inlineThreshold,
+		metrics:           newServerMetrics(),
+		logger:            logger,
+		events:            newEventBuses(),
+		slockOAuth:        cfg.SlockOAuth,
+		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
+			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
+			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
+			apiBase: strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIBase),
+		},
+		disableDBAutoEmbed:  cfg.DisableDatabaseAutoEmbedding || (cfg.Pool != nil && cfg.Pool.IsAutoEmbeddingDisabled()),
 		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
@@ -259,8 +285,13 @@ func NewWithConfig(cfg Config) *Server {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			r.URL.Path = "/" + sub
-			localS3.Handler().ServeHTTP(w, r)
+			setRequestMetricTenant(r.Context(), tenantID, "", "", classifyTenantRequest(r))
+			subReq := r.Clone(r.Context())
+			subURL := *r.URL
+			subURL.Path = "/" + sub
+			subURL.RawPath = ""
+			subReq.URL = &subURL
+			localS3.Handler().ServeHTTP(w, subReq)
 		}))
 	}
 
@@ -375,7 +406,7 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 			return
 		}
 		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
-		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.provisioner.InitSchema)
+		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.schemaInitForTenant(t.ID, t.Provider, s.provisioner.InitSchema))
 	})
 }
 
@@ -490,6 +521,7 @@ func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handl
 			Backend:            b,
 			JournalPermissions: ownerJournalPermissions(),
 		}
+		setRequestMetricScope(r.Context(), scope, classifyTenantRequest(r))
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
 }
@@ -868,6 +900,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
+	setRequestMetricTenant(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, classifyTenantRequest(r))
 	if resolved.APIKey.Status != meta.APIKeyActive {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_inactive", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "status", resolved.APIKey.Status)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
@@ -942,6 +975,7 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
+	setRequestMetricTenant(r.Context(), "local", "local", "local", classifyTenantRequest(r))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", "local", "status", "active")...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
@@ -1056,6 +1090,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_presigned_redirect", "path", path)...)
 		metricEvent(r.Context(), "fs_read", "result", "ok")
+		recordTenantFileBytes(r.Context(), "fs", "read", "read", plan.Size)
 		http.Redirect(w, r, plan.PresignURL, http.StatusFound)
 		return
 	}
@@ -1069,6 +1104,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_ok", "path", path, "bytes", len(plan.InlineData))...)
 	metricEvent(r.Context(), "fs_read", "result", "ok")
+	recordTenantFileBytes(r.Context(), "fs", "read", "read", int64(len(plan.InlineData)))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(plan.InlineData)))
 	_, _ = w.Write(plan.InlineData)
@@ -1365,6 +1401,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 				errJSON(w, http.StatusConflict, err.Error())
 				return
 			}
+			if errJSONInvalidRootDentry(w, err) {
+				metricEvent(r.Context(), "fs_write", "result", "error")
+				return
+			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_upload_initiate_failed", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSONInternalStorage(w)
@@ -1417,6 +1457,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSONInternalStorage(w)
@@ -1424,6 +1468,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_ok", "path", path, "bytes", len(data))...)
 	metricEvent(r.Context(), "fs_write", "result", "ok")
+	recordTenantFileBytes(r.Context(), "fs", "write", "write", int64(len(data)))
 	s.publishEvent(r, path, "write")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": committedRevision})
 }
@@ -1505,6 +1550,10 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_not_found", "path", path)...)
 			metricEvent(r.Context(), "fs_patch", "result", "error")
 			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_patch", "result", "error")
 			return
 		}
 		if errors.Is(err, backend.ErrNotS3Stored) || errors.Is(err, backend.ErrS3NotConfigured) {
@@ -1599,6 +1648,10 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_not_found", "path", path)...)
 			metricEvent(r.Context(), "fs_append", "result", "error")
 			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_append", "result", "error")
 			return
 		}
 		if errors.Is(err, backend.ErrNotS3Stored) || errors.Is(err, backend.ErrS3NotConfigured) {
@@ -1744,6 +1797,13 @@ func (s *Server) handleBatchReadSmall(w http.ResponseWriter, r *http.Request) {
 		}
 		results[i] = s.batchReadSmallOne(r.Context(), b, path, maxBytes)
 	}
+	var readBytes int64
+	for _, result := range results {
+		if result.Status == http.StatusOK {
+			readBytes += int64(len(result.Data))
+		}
+	}
+	recordTenantFileBytes(r.Context(), "fs", "batch_read_small", "read", readBytes)
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "batch_read_small_ok", "count", len(results), "max_bytes", maxBytes)...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(batchReadSmallResponse{Results: results})
@@ -2011,6 +2071,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "kind", kind, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2046,6 +2109,9 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_not_found", "src_path", srcPath, "dst_path", dstPath)...)
 			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "copy_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
@@ -2089,6 +2155,9 @@ func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath 
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "hardlink_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2130,6 +2199,9 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "rename_failed", "old_path", oldPath, "new_path", newPath, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2159,6 +2231,9 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_conflict", "path", path, "error", err)...)
 			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "mkdir_failed", "path", path, "error", err)...)
@@ -2200,6 +2275,9 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusNotFound, "not found")
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "chmod_failed", "path", path, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2222,6 +2300,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_conflict", "path", path, "error", err)...)
 			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "create_failed", "path", path, "error", err)...)
@@ -2283,6 +2364,9 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "symlink_failed", "path", path, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2329,6 +2413,13 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "uploads_list_failed", "path", path, "status", status, "error", err)...)
 		metricEvent(r.Context(), "metadb_query", "api", "uploads_list", "result", "error")
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2456,6 +2547,10 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_failed", "path", req.Path, "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSONInternalStorage(w)
@@ -2567,6 +2662,10 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "upload_complete", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_failed", "upload_id", uploadID, "error", err)...)
 		metricEvent(r.Context(), "upload_complete", "result", "error")
 		errJSONInternalStorage(w)
@@ -2574,6 +2673,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_ok", "upload_id", uploadID)...)
 	metricEvent(r.Context(), "upload_complete", "result", "ok")
+	recordTenantFileBytes(r.Context(), "upload", "complete", "write", upload.TotalSize)
 	s.publishEvent(r, upload.TargetPath, "upload_complete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
@@ -2913,6 +3013,10 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_failed", "path", req.Path, "error", err)...)
 		metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
 		errJSONInternalStorage(w)
@@ -3123,6 +3227,10 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "v2_upload_complete", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_failed", "upload_id", uploadID, "error", err)...)
 		metricEvent(r.Context(), "v2_upload_complete", "result", "error")
 		errJSONInternalStorage(w)
@@ -3130,6 +3238,7 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_ok", "upload_id", uploadID)...)
 	metricEvent(r.Context(), "v2_upload_complete", "result", "ok")
+	recordTenantFileBytes(r.Context(), "upload", "complete", "write", upload.TotalSize)
 	s.publishEvent(r, upload.TargetPath, "upload_complete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "completed"})
 }
@@ -3202,6 +3311,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "failed to provision tenant")
 		return
 	}
+	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3253,6 +3363,102 @@ func newProvisionTenantError(status int, message string, err error) *provisionTe
 	return &provisionTenantError{status: status, message: message, err: err}
 }
 
+func defaultTiDBAutoEmbeddingConfig(cfg tenantschema.TiDBAutoEmbeddingConfig) tenantschema.TiDBAutoEmbeddingConfig {
+	if cfg.Model == "" && cfg.Dimensions == 0 {
+		return tenantschema.CurrentTiDBAutoEmbeddingConfig()
+	}
+	return cfg
+}
+
+func (s *Server) defaultAutoEmbeddingProfileForTenant(ctx context.Context, tenantID, provider string, now time.Time) (*meta.TenantAutoEmbeddingProfile, error) {
+	if !tenant.UsesTiDBAutoEmbedding(provider) {
+		return nil, nil
+	}
+	schemaProfile, err := tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
+	if err != nil {
+		return nil, err
+	}
+	if !s.disableDBAutoEmbed {
+		if err := tenantschema.ValidateTiDBAutoEmbeddingProviderConfig(tenantschema.TiDBAutoEmbeddingProviderConfig{
+			Model:   schemaProfile.Model,
+			APIKey:  s.tidbAutoEmbedding.apiKey,
+			APIBase: s.tidbAutoEmbedding.apiBase,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	var apiKeyCipher []byte
+	if s.tidbAutoEmbedding.apiKey != "" {
+		cipher, err := s.pool.Encrypt(ctx, []byte(s.tidbAutoEmbedding.apiKey))
+		if err != nil {
+			return nil, fmt.Errorf("encrypt tenant auto-embedding api key: %w", err)
+		}
+		apiKeyCipher = cipher
+	}
+	return &meta.TenantAutoEmbeddingProfile{
+		TenantID:     tenantID,
+		Model:        schemaProfile.Model,
+		Dimensions:   schemaProfile.Dimensions,
+		OptionsJSON:  schemaProfile.OptionsJSON,
+		APIBase:      s.tidbAutoEmbedding.apiBase,
+		APIKeyCipher: apiKeyCipher,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}, nil
+}
+
+func (s *Server) copyAutoEmbeddingProfileForFork(ctx context.Context, sourceTenantID, forkTenantID, provider string, now time.Time) error {
+	if !tenant.UsesTiDBAutoEmbedding(provider) {
+		return nil
+	}
+	sourceProfile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, sourceTenantID)
+	if err != nil {
+		return err
+	}
+	return s.meta.UpsertTenantAutoEmbeddingProfile(ctx, &meta.TenantAutoEmbeddingProfile{
+		TenantID:     forkTenantID,
+		Model:        sourceProfile.Model,
+		Dimensions:   sourceProfile.Dimensions,
+		OptionsJSON:  sourceProfile.OptionsJSON,
+		APIBase:      sourceProfile.APIBase,
+		APIKeyCipher: append([]byte(nil), sourceProfile.APIKeyCipher...),
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	})
+}
+
+func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID string) (tenantschema.TiDBAutoEmbeddingProfile, error) {
+	if s.meta == nil {
+		return tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
+	}
+	profile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, tenantID)
+	if err != nil {
+		return tenantschema.TiDBAutoEmbeddingProfile{}, err
+	}
+	return tenantschema.TiDBAutoEmbeddingProfile{
+		Model:       profile.Model,
+		Dimensions:  profile.Dimensions,
+		OptionsJSON: profile.OptionsJSON,
+	}, nil
+}
+
+func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(context.Context, string) error) func(context.Context, string) error {
+	if !tenant.UsesTiDBAutoEmbedding(provider) {
+		return fallback
+	}
+	profileAware, ok := s.provisioner.(autoEmbeddingSchemaProvisioner)
+	if !ok {
+		return fallback
+	}
+	return func(ctx context.Context, dsn string) error {
+		profile, err := s.autoEmbeddingProfileForTenant(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
+		}
+		return profileAware.InitSchemaForAutoEmbeddingProfile(ctx, dsn, profile)
+	}
+}
+
 func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
 	rawProvider := s.provisioner.ProviderType()
 	provider, err := tenant.NormalizeProvider(rawProvider)
@@ -3263,12 +3469,19 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	tenantID := token.NewID()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
+	setRequestMetricTenant(ctx, tenantID, "", provider, tenantRequestClass{surface: "provision", action: "post"})
 
 	keyName := strings.TrimSpace(opts.KeyName)
 	if keyName == "" {
 		keyName = "default"
 	}
 	now := time.Now().UTC()
+	autoProfile, err := s.defaultAutoEmbeddingProfileForTenant(ctx, tenantID, provider, now)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_auto_embedding_profile_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to build tenant auto-embedding profile", err)
+	}
 	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantPending,
@@ -3290,10 +3503,22 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
 
+	if autoProfile != nil {
+		if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, autoProfile); err != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_auto_embedding_profile_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+				logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+			}
+			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant auto-embedding profile", err)
+		}
+	}
+
 	cluster, err := s.provisioner.Provision(ctx, tenantID)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
+		s.persistFailedProvisionClusterInfo(context.Background(), tenantID, provider, cluster)
 		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
 		}
@@ -3360,13 +3585,41 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}, nil
 }
 
+func (s *Server) persistFailedProvisionClusterInfo(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo) {
+	if cluster == nil || cluster.ClusterID == "" {
+		return
+	}
+	cluster.Provider = provider
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_encrypt_password_failed", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
+		return
+	}
+	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
+		DBHost:           cluster.Host,
+		DBPort:           cluster.Port,
+		DBUser:           cluster.Username,
+		DBPasswordCipher: cipherPass,
+		DBName:           cluster.DBName,
+		DBTLS:            true,
+		Provider:         provider,
+		ClusterID:        cluster.ClusterID,
+		ClaimURL:         cluster.ClaimURL,
+		ClaimExpiresAt:   cluster.ClaimExpiresAt,
+	}); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_persist_connection_failed", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
+		return
+	}
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_persisted", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID)...)
+}
+
 func (s *Server) startProvisionedTenantSchemaInit(ctx context.Context, res *provisionTenantResult) {
 	if res == nil || res.TenantID == "" || res.TenantDSN == "" || s.provisioner == nil {
 		return
 	}
 	// Tenant remains in provisioning state until schema initialization succeeds.
 	s.startServerWorker(ctx, func(workerCtx context.Context) {
-		s.initTenantSchemaAsync(workerCtx, res.TenantID, res.TenantDSN, res.Provider, s.provisioner.InitSchema)
+		s.initTenantSchemaAsync(workerCtx, res.TenantID, res.TenantDSN, res.Provider, s.schemaInitForTenant(res.TenantID, res.Provider, s.provisioner.InitSchema))
 	})
 }
 
@@ -3413,6 +3666,7 @@ func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string,
 // compatibility path so e2e scripts can obtain one stable API key without
 // enabling the multi-tenant provision flow.
 func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Request) {
+	setRequestMetricTenant(r.Context(), "local", "local", "local", classifyTenantRequest(r))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", "local", "provider", "local")...)
 	metricEvent(r.Context(), "tenant_provision", "provider", "local", "result", "ok")
 	w.Header().Set("Content-Type", "application/json")
@@ -3512,6 +3766,14 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+func errJSONInvalidRootDentry(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, datastore.ErrInvalidRootDentry) {
+		return false
+	}
+	errJSON(w, http.StatusBadRequest, err.Error())
+	return true
 }
 
 const internalStorageErrorMessage = "storage backend unavailable; contact support"

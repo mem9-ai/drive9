@@ -1055,6 +1055,7 @@ func TestCommitQueueLayerUploadRejectsSizeMismatch(t *testing.T) {
 // Test axis 1: 409 → fetch → LWW re-upload succeeds.
 func TestCommitQueueAutoResolveLWW(t *testing.T) {
 	var uploadCalls, statCalls, readCalls int
+	var successRev int64
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodHead:
@@ -1105,6 +1106,12 @@ func TestCommitQueueAutoResolveLWW(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		if entry.Path != "/lww.txt" {
+			t.Fatalf("OnSuccess path = %q, want /lww.txt", entry.Path)
+		}
+		successRev = committedRev
+	}
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/lww.txt",
 		BaseRev: 5,
@@ -1124,6 +1131,9 @@ func TestCommitQueueAutoResolveLWW(t *testing.T) {
 	if readCalls != 1 {
 		t.Fatalf("read calls = %d, want 1", readCalls)
 	}
+	if successRev != 11 {
+		t.Fatalf("OnSuccess committedRev = %d, want 11 from resolved server revision", successRev)
+	}
 	// Success: shadow and pending should be cleaned up.
 	if pending.HasPending("/lww.txt") {
 		t.Fatal("pending entry should be removed after successful LWW")
@@ -1136,6 +1146,7 @@ func TestCommitQueueAutoResolveLWW(t *testing.T) {
 // Test axis 2: 409 → fetch → content matches → idempotent success.
 func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 	var uploadCalls int
+	var successRev int64
 	sameContent := []byte("identical!")
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -1172,6 +1183,12 @@ func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 	}
 
 	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		if entry.Path != "/idem.txt" {
+			t.Fatalf("OnSuccess path = %q, want /idem.txt", entry.Path)
+		}
+		successRev = committedRev
+	}
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/idem.txt",
 		BaseRev: 5,
@@ -1186,6 +1203,9 @@ func TestCommitQueueAutoResolveIdempotent(t *testing.T) {
 	// No LWW re-upload because content matched.
 	if uploadCalls != 1 {
 		t.Fatalf("upload calls = %d, want 1 (initial 409 only, no LWW re-upload)", uploadCalls)
+	}
+	if successRev != 8 {
+		t.Fatalf("OnSuccess committedRev = %d, want matching server revision", successRev)
 	}
 	// Idempotent: should be cleaned up without a second upload.
 	if pending.HasPending("/idem.txt") {
@@ -1456,14 +1476,142 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	if statCalls.Load() != 0 {
 		t.Fatalf("stat calls = %d, want 0", statCalls.Load())
 	}
-	if successRev != 0 {
-		t.Fatalf("OnSuccess committedRev = %d, want 0 for multipart stream", successRev)
+	if successRev != 13 {
+		t.Fatalf("OnSuccess committedRev = %d, want 13 from CAS base revision", successRev)
 	}
 	if pending.HasPending("/big.bin") {
 		t.Fatal("pending entry should be removed after successful ShadowSpill commit")
 	}
 	if shadow.Has("/big.bin") {
 		t.Fatal("shadow should be removed after successful ShadowSpill commit")
+	}
+}
+
+func TestCommitQueueMultipartCreateInfersRevisionForOpenHandle(t *testing.T) {
+	data := bytes.Repeat([]byte("d"), 1024)
+	const path = "/workload.db"
+	var gotExpected int64 = -1
+	var gotBody []byte
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			var req struct {
+				Path             string `json:"path"`
+				TotalSize        int64  `json:"total_size"`
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("decode initiate request: %v", err)
+			}
+			if req.Path != path {
+				t.Fatalf("initiate path = %q, want %q", req.Path, path)
+			}
+			if req.TotalSize != int64(len(data)) {
+				t.Fatalf("initiate total_size = %d, want %d", req.TotalSize, len(data))
+			}
+			if req.ExpectedRevision == nil {
+				t.Fatal("initiate expected_revision missing")
+			}
+			gotExpected = *req.ExpectedRevision
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "u1",
+				"key":         "object-key",
+				"part_size":   int64(len(data)),
+				"total_parts": 1,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/u1/1",
+					"size":   int64(len(data)),
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/u1/1":
+			var err error
+			gotBody, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read part body: %v", err)
+			}
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u1/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.PathLock = fs.lockRemoteCommitPath
+	cq.OnSuccess = fs.onCommitQueueSuccess
+	cq.OnCleanup = fs.onCommitQueueCleanup
+	fs.commitQueue = cq
+
+	if err := shadow.WriteFull(path, data, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutShadowSpill(path, int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	ino := fs.inodes.Lookup(path, false, int64(len(data)), time.Now())
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        path,
+		Dirty:       fs.newWriteBuffer(path, maxPreloadSize, 0),
+		IsNew:       true,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+	fhID := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(fhID, fh)
+
+	if err := cq.Enqueue(&CommitEntry{
+		Path:        path,
+		Inode:       ino,
+		BaseRev:     0,
+		Size:        int64(len(data)),
+		Kind:        PendingNew,
+		ShadowSpill: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if gotExpected != 0 {
+		t.Fatalf("expected revision = %d, want create-if-absent 0", gotExpected)
+	}
+	if !bytes.Equal(gotBody, data) {
+		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
+	}
+	if fh.IsNew {
+		t.Fatal("open handle remained PendingNew after successful multipart create")
+	}
+	if fh.BaseRev != 1 {
+		t.Fatalf("open handle BaseRev = %d, want inferred committed revision 1", fh.BaseRev)
+	}
+	if pending.HasPending(path) {
+		t.Fatal("pending entry should be removed after commit")
+	}
+	if shadow.Has(path) {
+		t.Fatal("shadow should be removed after commit")
 	}
 }
 
@@ -1650,8 +1798,8 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 	if statCalls.Load() != 0 {
 		t.Fatalf("stat calls = %d, want 0", statCalls.Load())
 	}
-	if successRev != 0 {
-		t.Fatalf("OnSuccess committedRev = %d, want 0 for multipart stream", successRev)
+	if successRev != 9 {
+		t.Fatalf("OnSuccess committedRev = %d, want 9 from recovered CAS base revision", successRev)
 	}
 	if pending2.HasPending("/recover.bin") {
 		t.Fatal("pending entry should be removed after successful recovery upload")

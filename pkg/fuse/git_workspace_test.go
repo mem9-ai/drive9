@@ -503,6 +503,99 @@ func TestEnsureGitWorkspacesKeepsPreviousSnapshotOnLoadFailure(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceForPathForceRefreshesAfterLocalGitAppears(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.deleted = true
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.localOverlay.EnsureRoot(); err != nil {
+		t.Fatalf("EnsureRoot: %v", err)
+	}
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("initial ensureGitWorkspaces: %v", err)
+	}
+	fs.git.mu.Lock()
+	initialLoadedAt := fs.git.loadedAt
+	initialCount := len(fs.git.workspaces)
+	fs.git.mu.Unlock()
+	if initialCount != 0 {
+		t.Fatalf("initial workspace count = %d, want 0", initialCount)
+	}
+	if err := fs.localOverlay.Mkdir("/repo/.git", 0o755); err != nil {
+		t.Fatalf("create local .git hint: %v", err)
+	}
+	fixture.mu.Lock()
+	fixture.deleted = false
+	fixture.mu.Unlock()
+
+	entry, handled := fs.gitEntry(context.Background(), "/repo/README.md", false)
+	if !handled || entry == nil {
+		t.Fatalf("gitEntry handled=%t entry=%v, want forced refresh to load README", handled, entry)
+	}
+	fs.git.mu.Lock()
+	loadedAt := fs.git.loadedAt
+	count := len(fs.git.workspaces)
+	fs.git.mu.Unlock()
+	if count != 1 {
+		t.Fatalf("workspace count after forced refresh = %d, want 1", count)
+	}
+	if !loadedAt.After(initialLoadedAt) {
+		t.Fatalf("loadedAt did not advance after forced refresh")
+	}
+}
+
+func TestLoadedGitWorkspaceForPathSkipsRefreshInvalidatedRuntime(t *testing.T) {
+	localRoot := t.TempDir()
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{WorkspaceID: "ws1"},
+		localRoot: "/repo",
+		loadedAt:  time.Now().Add(-time.Minute),
+	}
+	fs := &Dat9FS{
+		opts: &MountOptions{EnableGitWorkspaces: true, LocalRoot: localRoot},
+		git:  newGitWorkspaceLayer(),
+	}
+	fs.git.workspaces = []*gitWorkspaceRuntime{rt}
+	if err := gitcache.ClearWorkspaceDeleted(context.Background(), localRoot, "ws1"); err != nil {
+		t.Fatalf("ClearWorkspaceDeleted: %v", err)
+	}
+
+	if _, _, ok := fs.loadedGitWorkspaceForPath("/repo/README.md"); ok {
+		t.Fatalf("refresh-invalidated runtime should not resolve")
+	}
+}
+
+func TestGitWorkspaceForPathForceRefreshesAfterWorkspaceRefreshMarker(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	localRoot := t.TempDir()
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensureGitWorkspaces: %v", err)
+	}
+	fs.git.mu.Lock()
+	if len(fs.git.workspaces) != 1 {
+		t.Fatalf("workspace count = %d, want 1", len(fs.git.workspaces))
+	}
+	oldRT := fs.git.workspaces[0]
+	oldRT.loadedAt = time.Now().Add(-time.Minute)
+	fs.git.loadedAt = time.Now()
+	fs.git.mu.Unlock()
+	if err := gitcache.ClearWorkspaceDeleted(context.Background(), localRoot, "ws1"); err != nil {
+		t.Fatalf("ClearWorkspaceDeleted: %v", err)
+	}
+
+	got, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/README.md")
+	if !ok {
+		t.Fatalf("gitWorkspaceForPath ok = false, want true after refresh")
+	}
+	if got == oldRT {
+		t.Fatalf("gitWorkspaceForPath returned stale runtime after refresh marker")
+	}
+}
+
 func TestGitWorkspaceWriteSyncWritesOverlay(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
@@ -1036,6 +1129,23 @@ func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceLocalStateHintChecksMountRootGitDir(t *testing.T) {
+	localRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(localRoot, "overlay", ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+
+	if !fs.hasLocalGitStateHint("/README.md") {
+		t.Fatal("hasLocalGitStateHint missed mount-root .git")
+	}
+	if fs.hasLocalGitStateHint("/.git/config") {
+		t.Fatal("hasLocalGitStateHint should ignore paths inside .git")
+	}
+}
+
 func TestLinkedGitStatePathMapsToLinkedRuntime(t *testing.T) {
 	fs := &Dat9FS{
 		opts: &MountOptions{EnableGitWorkspaces: true},
@@ -1065,6 +1175,147 @@ func TestLinkedGitStatePathMapsToLinkedRuntime(t *testing.T) {
 	}
 	if rel != ".git/index" {
 		t.Fatalf("rel = %q, want .git/index", rel)
+	}
+}
+
+func TestLinkedGitStatePathSkipsLocallyDeletedRuntime(t *testing.T) {
+	localRoot := t.TempDir()
+	fs := &Dat9FS{
+		opts: &MountOptions{EnableGitWorkspaces: true, LocalRoot: localRoot},
+		git:  newGitWorkspaceLayer(),
+	}
+	common := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{WorkspaceID: "base", WorkspaceKind: "main"},
+		localRoot: "/repo",
+	}
+	linked := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID:       "wt",
+			WorkspaceKind:     "linked",
+			CommonWorkspaceID: "base",
+			WorktreeName:      "wt",
+		},
+		localRoot: "/repo-wt",
+	}
+	fs.git.workspaces = []*gitWorkspaceRuntime{linked, common}
+	if err := gitcache.MarkWorkspaceDeleted(context.Background(), localRoot, "wt"); err != nil {
+		t.Fatalf("MarkWorkspaceDeleted: %v", err)
+	}
+
+	got, rel, ok := fs.loadedGitWorkspaceForGitStatePath("/repo/.git/worktrees/wt/index")
+	if !ok {
+		t.Fatalf("common git state path was not resolved")
+	}
+	if got != common {
+		t.Fatalf("runtime = %s, want common", got.workspace.WorkspaceID)
+	}
+	if rel != ".git/worktrees/wt/index" {
+		t.Fatalf("rel = %q, want common git state rel", rel)
+	}
+	if _, _, ok := fs.loadedGitWorkspaceForPath("/repo-wt/README.md"); ok {
+		t.Fatalf("deleted linked workspace root should not resolve")
+	}
+}
+
+func TestGitTreeInodeUsesStableMtime(t *testing.T) {
+	fs := &Dat9FS{inodes: NewInodeToPath()}
+	createdAt := time.Unix(123, 456).UTC()
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			CreatedAt:   createdAt,
+			HeadCommit:  "1111111111111111111111111111111111111111",
+		},
+	}
+	node := client.GitTreeNode{
+		Path:      "README.md",
+		Kind:      "file",
+		Mode:      "100644",
+		SizeBytes: 9,
+	}
+
+	first := fs.gitTreeInode(context.Background(), rt, "/repo/README.md", "README.md", node, true)
+	time.Sleep(time.Millisecond)
+	second := fs.gitTreeInode(context.Background(), rt, "/repo/README.md", "README.md", node, true)
+
+	if first.Ino != second.Ino {
+		t.Fatalf("inode changed: first=%d second=%d", first.Ino, second.Ino)
+	}
+	if !second.Mtime.Equal(gitCleanTreeMtime(rt)) {
+		t.Fatalf("mtime = %s, want stable workspace mtime %s", second.Mtime, gitCleanTreeMtime(rt))
+	}
+	rt.workspace.HeadCommit = "2222222222222222222222222222222222222222"
+	third := fs.gitTreeInode(context.Background(), rt, "/repo/README.md", "README.md", node, true)
+	if third.Mtime.Equal(second.Mtime) {
+		t.Fatalf("mtime did not change when head commit changed: %s", third.Mtime)
+	}
+}
+
+func TestGitHeadTreeEntriesDoesNotRequireBlobObjects(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	repo := t.TempDir()
+	runFuseTestGit(t, "", "init", "-b", "main", repo)
+	runFuseTestGit(t, repo, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, repo, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", ".")
+	runFuseTestGit(t, repo, "commit", "-m", "initial")
+	cmd := exec.Command("git", "-C", repo, "rev-parse", "HEAD:README.md")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("git rev-parse HEAD:README.md: %v", err)
+	}
+	blob := strings.TrimSpace(string(out))
+	if len(blob) < 4 {
+		t.Fatalf("blob oid %q too short", blob)
+	}
+	if err := os.Remove(filepath.Join(repo, ".git", "objects", blob[:2], blob[2:])); err != nil {
+		t.Fatalf("remove blob object: %v", err)
+	}
+
+	entries, err := gitHeadTreeEntries(context.Background(), filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("gitHeadTreeEntries: %v", err)
+	}
+	entry, ok := entries["README.md"]
+	if !ok {
+		t.Fatalf("README.md missing from entries: %#v", entries)
+	}
+	if entry.oid != blob || entry.size != -1 {
+		t.Fatalf("entry = %+v, want oid=%s size=-1", entry, blob)
+	}
+}
+
+func TestBuildRestoredGitHeadOverlayRejectsOversizedBlob(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	repo := t.TempDir()
+	runFuseTestGit(t, "", "init", "-b", "main", repo)
+	runFuseTestGit(t, repo, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, repo, "config", "user.name", "Drive9 Test")
+	large := bytes.Repeat([]byte("x"), int(gitLocalObjectMaxBlobBytes)+1)
+	if err := os.WriteFile(filepath.Join(repo, "large.bin"), large, 0o644); err != nil {
+		t.Fatalf("write large.bin: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", "large.bin")
+	runFuseTestGit(t, repo, "commit", "-m", "large")
+
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			HeadCommit:  "0000000000000000000000000000000000000000",
+		},
+		nodes:   map[string]client.GitTreeNode{},
+		overlay: map[string]client.GitOverlayEntry{},
+	}
+	_, err := buildRestoredGitHeadOverlay(context.Background(), filepath.Join(repo, ".git"), rt)
+	if err == nil || !strings.Contains(err.Error(), "exceeds local restore limit") {
+		t.Fatalf("buildRestoredGitHeadOverlay err = %v, want oversized blob error", err)
 	}
 }
 
@@ -1146,6 +1397,15 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 		t.Skip("git not found")
 	}
 	linkedRepo := createLinkedGitWorktreeForTest(t)
+	const linkedReadme = "linked local commit\n"
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(linkedRepo.linkedWorktree, "README.md"), []byte(linkedReadme), 0o644); err != nil {
+		t.Fatalf("write linked readme: %v", err)
+	}
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "add", "README.md")
+	runFuseTestGit(t, linkedRepo.linkedWorktree, "commit", "-m", "linked local commit")
+	linkedHead := fuseGitOutputForTest(t, linkedRepo.linkedWorktree, "rev-parse", "HEAD")
 	commonState, err := archiveLocalGitDir(linkedRepo.commonGitDir)
 	if err != nil {
 		t.Fatalf("archive common git state: %v", err)
@@ -1174,7 +1434,7 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 	fixture := newGitStateOnlyFixture(t)
 	fixture.states["linked"] = client.GitState{
 		WorkspaceID:      "linked",
-		CheckpointCommit: linkedRepo.headCommit,
+		CheckpointCommit: linkedHead,
 		StorageType:      gitStateStorageTarGzNoObjects,
 		SizeBytes:        int64(len(linkedState)),
 		Content:          linkedState,
@@ -1218,8 +1478,15 @@ func TestLinkedGitWorkspaceRestoresGitStateWithCommonRuntime(t *testing.T) {
 		t.Fatalf("restored commondir = %q, want ../../..", commonDir)
 	}
 	gotHead := fuseGitOutputForTest(t, "", "--git-dir", restoredLinkedGitDir, "rev-parse", "HEAD")
-	if gotHead != linkedRepo.headCommit {
-		t.Fatalf("linked HEAD = %s, want %s", gotHead, linkedRepo.headCommit)
+	if gotHead != linkedHead {
+		t.Fatalf("linked HEAD = %s, want %s", gotHead, linkedHead)
+	}
+	entry, ok := linkedRT.overlayEntry("README.md")
+	if !ok {
+		t.Fatalf("linked README.md restored HEAD overlay missing")
+	}
+	if entry.Op != "upsert" || string(entry.Content) != linkedReadme {
+		t.Fatalf("linked README.md overlay = %+v content=%q, want restored HEAD content", entry, entry.Content)
 	}
 }
 
@@ -1535,6 +1802,39 @@ func TestGitWorkspaceCleanReadUsesMaterializedTreeCache(t *testing.T) {
 	}
 }
 
+func TestGitWorkspaceUnknownSizeLookupUsesMaterializedTreeCacheSize(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.readmeSize = -1
+	localRoot := t.TempDir()
+	content := []byte("cached base\n")
+	treePath := filepath.Join(gitcache.TreeRoot(localRoot, "ws1", fixtureHeadCommit), "README.md")
+	if err := os.MkdirAll(filepath.Dir(treePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(treePath, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true, PerfCounters: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := lookupOut.Size; got != uint64(len(content)) {
+		t.Fatalf("Lookup size = %d, want %d", got, len(content))
+	}
+	if entry, ok := fs.inodes.GetEntry(lookupOut.NodeId); !ok || entry.Size != int64(len(content)) {
+		t.Fatalf("inode size = entry %v ok %t, want %d", entry, ok, len(content))
+	}
+	snap := fs.perf.snapshot()
+	if got := snap.Counters["git_cat_file_count"]; got != 0 {
+		t.Fatalf("git_cat_file_count = %d, want 0", got)
+	}
+}
+
 func TestGitObjectDatabasePathsSkipDirectCheckpoint(t *testing.T) {
 	if !localPathMayBeGitState("/repo/.git/index") {
 		t.Fatal(".git/index should be git state")
@@ -1577,6 +1877,203 @@ func TestGitWorkspaceCleanReadUsesBlobCache(t *testing.T) {
 	if got := snap.Counters["git_clean_blob_cache_hit"]; got != 1 {
 		t.Fatalf("git_clean_blob_cache_hit = %d, want 1", got)
 	}
+	if got := snap.Counters["git_cat_file_count"]; got != 0 {
+		t.Fatalf("git_cat_file_count = %d, want 0", got)
+	}
+}
+
+func TestGitWorkspaceUnknownSizeLookupUsesBlobCacheSize(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.readmeSize = -1
+	localRoot := t.TempDir()
+	content := []byte("cached blob\n")
+	if err := gitcache.WriteBlob(context.Background(), localRoot, "ws1", fixtureHeadCommit, fixture.readmeObjectSHA, content); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true, PerfCounters: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := lookupOut.Size; got != uint64(len(content)) {
+		t.Fatalf("Lookup size = %d, want %d", got, len(content))
+	}
+	if entry, ok := fs.inodes.GetEntry(lookupOut.NodeId); !ok || entry.Size != int64(len(content)) {
+		t.Fatalf("inode size = entry %v ok %t, want %d", entry, ok, len(content))
+	}
+	snap := fs.perf.snapshot()
+	if got := snap.Counters["git_cat_file_count"]; got != 0 {
+		t.Fatalf("git_cat_file_count = %d, want 0", got)
+	}
+}
+
+func TestGitLocalHeadTreeSizeFillInheritsBaseManifestSize(t *testing.T) {
+	objectSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	localCommit := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	raw := []byte("100644 blob " + objectSHA + "\tREADME.md\x00")
+	nodes, children := parseLocalGitTree("ws1", localCommit, raw)
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			HeadCommit:  fixtureHeadCommit,
+		},
+		nodes: map[string]client.GitTreeNode{
+			"README.md": {
+				Path:      "README.md",
+				Kind:      "file",
+				Mode:      "100644",
+				ObjectSHA: objectSHA,
+				SizeBytes: 123,
+			},
+		},
+	}
+	fs := &Dat9FS{opts: &MountOptions{}}
+	if err := fs.fillLocalGitTreeSizes(context.Background(), rt, "", nodes, children); err != nil {
+		t.Fatalf("fillLocalGitTreeSizes: %v", err)
+	}
+	if got := nodes["README.md"].SizeBytes; got != 123 {
+		t.Fatalf("local node size = %d, want inherited base size", got)
+	}
+	if got := children[""][0].SizeBytes; got != 123 {
+		t.Fatalf("local child size = %d, want inherited base size", got)
+	}
+}
+
+func TestGitLocalHeadTreeSizeFillUsesBaseBlobCache(t *testing.T) {
+	objectSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	localCommit := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	content := []byte("cached base object\n")
+	localRoot := t.TempDir()
+	if err := gitcache.WriteBlob(context.Background(), localRoot, "ws1", fixtureHeadCommit, objectSHA, content); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte("100644 blob " + objectSHA + "\tREADME.md\x00")
+	nodes, children := parseLocalGitTree("ws1", localCommit, raw)
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			HeadCommit:  fixtureHeadCommit,
+		},
+		nodes: map[string]client.GitTreeNode{
+			"README.md": {
+				Path:      "README.md",
+				Kind:      "file",
+				Mode:      "100644",
+				ObjectSHA: objectSHA,
+				SizeBytes: -1,
+			},
+		},
+	}
+	fs := &Dat9FS{opts: &MountOptions{LocalRoot: localRoot}}
+	if err := fs.fillLocalGitTreeSizes(context.Background(), rt, "", nodes, children); err != nil {
+		t.Fatalf("fillLocalGitTreeSizes: %v", err)
+	}
+	if got := nodes["README.md"].SizeBytes; got != int64(len(content)) {
+		t.Fatalf("local node size = %d, want base blob cache size %d", got, len(content))
+	}
+}
+
+func TestGitLocalHeadTreeSizeFillBatchChecksLocalBlob(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	baseContent := []byte("hello base\n")
+	localContent := []byte("hello local commit\n")
+	repo := createGitRepoWithReadme(t, baseContent)
+	baseCommit := fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
+	baseSHA := fuseGitOutputForTest(t, repo, "hash-object", "README.md")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), localContent, 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", "README.md")
+	runFuseTestGit(t, repo, "commit", "-m", "local")
+	localCommit := fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
+	localSHA := fuseGitOutputForTest(t, repo, "hash-object", "README.md")
+	treeOut, err := gitCommandOutputNoLazy(context.Background(), "--git-dir", filepath.Join(repo, ".git"), "ls-tree", "-r", "-t", "-z", localCommit)
+	if err != nil {
+		t.Fatalf("git ls-tree: %v", err)
+	}
+	nodes, children := parseLocalGitTree("ws1", localCommit, treeOut)
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			HeadCommit:  baseCommit,
+		},
+		nodes: map[string]client.GitTreeNode{
+			"README.md": {
+				Path:      "README.md",
+				Kind:      "file",
+				Mode:      "100644",
+				ObjectSHA: baseSHA,
+				SizeBytes: int64(len(baseContent)),
+			},
+		},
+	}
+	fs := &Dat9FS{opts: &MountOptions{}}
+	if err := fs.fillLocalGitTreeSizes(context.Background(), rt, filepath.Join(repo, ".git"), nodes, children); err != nil {
+		t.Fatalf("fillLocalGitTreeSizes: %v", err)
+	}
+	if got := nodes["README.md"].ObjectSHA; got != localSHA {
+		t.Fatalf("local object = %s, want %s", got, localSHA)
+	}
+	if got := nodes["README.md"].SizeBytes; got != int64(len(localContent)) {
+		t.Fatalf("local node size = %d, want local blob size %d", got, len(localContent))
+	}
+}
+
+func TestGitWorkspaceLocalHeadReadUsesBaseBlobCache(t *testing.T) {
+	objectSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	baseCommit := fixtureHeadCommit
+	localCommit := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	content := []byte("cached base object\n")
+	localRoot := t.TempDir()
+	if err := gitcache.WriteBlob(context.Background(), localRoot, "ws1", baseCommit, objectSHA, content); err != nil {
+		t.Fatal(err)
+	}
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			HeadCommit:  baseCommit,
+		},
+	}
+	fs := &Dat9FS{opts: &MountOptions{LocalRoot: localRoot}, git: newGitWorkspaceLayer(), inodes: NewInodeToPath()}
+	got, err := fs.readGitCleanFile(context.Background(), rt, "/repo/README.md", "README.md", client.GitTreeNode{
+		CommitSHA: localCommit,
+		Path:      "README.md",
+		Kind:      "file",
+		Mode:      "100644",
+		ObjectSHA: objectSHA,
+		SizeBytes: int64(len(content)),
+	}, 0, -1)
+	if err != nil {
+		t.Fatalf("readGitCleanFile: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("readGitCleanFile = %q, want %q", got, content)
+	}
+}
+
+func TestGitWorkspaceBloblessUnknownSizeLookupSkipsGitSizeProbe(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.mode = gitWorkspaceModeFastBlobless
+	fixture.readmeSize = -1
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, PerfCounters: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup status = %v, want OK", st)
+	}
+	if got := lookupOut.Size; got != 0 {
+		t.Fatalf("Lookup size = %d, want unknown/0", got)
+	}
+	snap := fs.perf.snapshot()
 	if got := snap.Counters["git_cat_file_count"]; got != 0 {
 		t.Fatalf("git_cat_file_count = %d, want 0", got)
 	}
@@ -1763,6 +2260,7 @@ func TestGitWorkspaceCleanReadSingleflightsCatFile(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	content := []byte("hello base\n")
 	repo := createGitRepoWithReadme(t, content)
+	fixture.headCommit = fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
 	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
 	if err != nil {
 		t.Fatalf("archiveLocalGitDir: %v", err)
@@ -1775,6 +2273,13 @@ func TestGitWorkspaceCleanReadSingleflightsCatFile(t *testing.T) {
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(fixture.client(), opts)
+	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/README.md")
+	if !ok {
+		t.Fatal("git workspace not loaded")
+	}
+	if err := fs.ensureGitStateRestored(context.Background(), rt); err != nil {
+		t.Fatalf("ensureGitStateRestored: %v", err)
+	}
 	const readers = 20
 	var wg sync.WaitGroup
 	errs := make(chan error, readers)
@@ -1969,6 +2474,99 @@ func TestBuildLocalGitObjectPackPreservesSmallLocalCommit(t *testing.T) {
 	}
 	if got := fuseGitOutputForTest(t, restored, "log", "-1", "--pretty=%s"); got != "local commit" {
 		t.Fatalf("restored HEAD subject = %q, want local commit", got)
+	}
+}
+
+func TestRestoredGitHeadOverlayMaterializesLocalCommitTree(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	src := createGitRepoWithReadme(t, []byte("hello base\n"))
+	if err := os.MkdirAll(filepath.Join(src, "docs"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "docs", "guide.md"), []byte("guide\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runFuseTestGit(t, src, "add", ".")
+	runFuseTestGit(t, src, "commit", "-m", "add guide")
+	baseHead := fuseGitOutputForTest(t, src, "rev-parse", "HEAD")
+	readmeSHA := fuseGitOutputForTest(t, src, "hash-object", "README.md")
+	guideSHA := fuseGitOutputForTest(t, src, "hash-object", "docs/guide.md")
+
+	work := filepath.Join(t.TempDir(), "work")
+	runFuseTestGit(t, "", "clone", src, work)
+	runFuseTestGit(t, work, "config", "user.email", "drive9-test@example.invalid")
+	runFuseTestGit(t, work, "config", "user.name", "Drive9 Test")
+	if err := os.WriteFile(filepath.Join(work, "committed-local.txt"), []byte("committed\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runFuseTestGit(t, work, "rm", "docs/guide.md")
+	runFuseTestGit(t, work, "add", "committed-local.txt")
+	runFuseTestGit(t, work, "commit", "-m", "local workspace commit")
+
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			RemoteName:  "origin",
+			HeadCommit:  baseHead,
+		},
+		nodes: map[string]client.GitTreeNode{
+			"README.md": {
+				Path:      "README.md",
+				Kind:      "file",
+				Mode:      "100644",
+				ObjectSHA: readmeSHA,
+				SizeBytes: int64(len("hello base\n")),
+			},
+			"docs/guide.md": {
+				Path:      "docs/guide.md",
+				Kind:      "file",
+				Mode:      "100644",
+				ObjectSHA: guideSHA,
+				SizeBytes: int64(len("guide\n")),
+			},
+		},
+		overlay: map[string]client.GitOverlayEntry{},
+	}
+	pack, sanitize, err := buildLocalGitObjectPack(context.Background(), filepath.Join(work, ".git"), rt)
+	if err != nil {
+		t.Fatalf("buildLocalGitObjectPack: %v", err)
+	}
+	if len(pack) == 0 {
+		t.Fatalf("pack is empty, want local commit objects")
+	}
+	state, err := archiveLocalGitStateForCheckpoint(context.Background(), filepath.Join(work, ".git"), rt, sanitize)
+	if err != nil {
+		t.Fatalf("archiveLocalGitStateForCheckpoint: %v", err)
+	}
+
+	restored := filepath.Join(t.TempDir(), "restored")
+	runFuseTestGit(t, "", "clone", "--no-checkout", src, restored)
+	unpackGitPackForTest(t, filepath.Join(restored, ".git"), pack)
+	if err := extractGitArchive(state, filepath.Join(restored, ".git")); err != nil {
+		t.Fatalf("extractGitArchive: %v", err)
+	}
+	overlay, err := buildRestoredGitHeadOverlay(context.Background(), filepath.Join(restored, ".git"), rt)
+	if err != nil {
+		t.Fatalf("buildRestoredGitHeadOverlay: %v", err)
+	}
+	committed, ok := overlay["committed-local.txt"]
+	if !ok {
+		t.Fatalf("committed-local.txt overlay missing")
+	}
+	if committed.Op != "upsert" || committed.Kind != "file" || string(committed.Content) != "committed\n" {
+		t.Fatalf("committed-local.txt overlay = %+v content=%q, want file upsert", committed, committed.Content)
+	}
+	whiteout, ok := overlay["docs/guide.md"]
+	if !ok {
+		t.Fatalf("docs/guide.md whiteout missing")
+	}
+	if whiteout.Op != "whiteout" || whiteout.BaseObjectSHA != guideSHA {
+		t.Fatalf("docs/guide.md overlay = %+v, want whiteout with base SHA", whiteout)
+	}
+	if _, ok := overlay["README.md"]; ok {
+		t.Fatalf("README.md overlay present for unchanged base file")
 	}
 }
 
@@ -2406,8 +3004,8 @@ func TestGitWorkspaceUnknownSizeWritableOpenPreservesBaseContent(t *testing.T) {
 	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
 		t.Fatalf("Lookup status = %v, want OK", st)
 	}
-	if got := lookupOut.Size; got != 0 {
-		t.Fatalf("Lookup size = %d, want 0 attr fallback for unknown size", got)
+	if got := lookupOut.Size; got != uint64(len(content)) {
+		t.Fatalf("Lookup size = %d, want %d from git object size fallback", got, len(content))
 	}
 
 	var openOut gofuse.OpenOut
@@ -2571,6 +3169,44 @@ func TestGitWorkspaceTruncateOpenRefreshesDirtyMirror(t *testing.T) {
 		t.Fatalf("appended readGitFile = %q, want %q", got, appended)
 	}
 
+	var truncateAttr gofuse.AttrOut
+	if st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &truncateAttr); st != gofuse.OK {
+		t.Fatalf("truncate SetAttr status = %v, want OK", st)
+	}
+	var truncateOpen gofuse.OpenOut
+	if st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &truncateOpen); st != gofuse.OK {
+		t.Fatalf("truncate Open status = %v, want OK", st)
+	}
+	shortContent := []byte("short\n")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
+		Fh:       truncateOpen.Fh,
+		Offset:   0,
+		Size:     uint32(len(shortContent)),
+	}, shortContent); st != gofuse.OK {
+		t.Fatalf("truncate Write status = %v, want OK", st)
+	}
+	if st := fs.Flush(nil, &gofuse.FlushIn{Fh: truncateOpen.Fh}); st != gofuse.OK {
+		t.Fatalf("truncate Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: truncateOpen.Fh})
+	got, err = fs.readGitFile(context.Background(), "/repo/README.md", 0, -1)
+	if err != nil {
+		t.Fatalf("read truncated git file: %v", err)
+	}
+	if !bytes.Equal(got, shortContent) {
+		t.Fatalf("truncated readGitFile = %q, want %q", got, shortContent)
+	}
+
 	var restoreOpen gofuse.OpenOut
 	if st := fs.Open(nil, &gofuse.OpenIn{
 		InHeader: gofuse.InHeader{NodeId: lookupOut.NodeId},
@@ -2607,6 +3243,275 @@ func TestGitWorkspaceTruncateOpenRefreshesDirtyMirror(t *testing.T) {
 	}
 	if !bytes.Equal(entry.Content, content) {
 		t.Fatalf("restored overlay content = %q, want %q", entry.Content, content)
+	}
+}
+
+func TestGitWorkspaceLocalHeadTreeProvidesCommittedFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	baseContent := []byte("hello base\n")
+	localContent := []byte("committed local\n")
+	repo := createGitRepoWithReadme(t, baseContent)
+	if err := os.WriteFile(filepath.Join(repo, "committed-local.txt"), localContent, 0o644); err != nil {
+		t.Fatalf("write committed-local: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", "committed-local.txt")
+	runFuseTestGit(t, repo, "commit", "-m", "local commit")
+	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("archiveLocalGitDir: %v", err)
+	}
+
+	fixture := newGitWorkspaceFixture(t)
+	fixture.state = state
+	fixture.readmeObjectSHA = fuseGitOutputForTest(t, repo, "rev-parse", "HEAD~1:README.md")
+	fixture.readmeSize = int64(len(baseContent))
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "committed-local.txt", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup committed-local status = %v, want OK", st)
+	}
+	if got := lookupOut.Size; got != uint64(len(localContent)) {
+		t.Fatalf("Lookup committed-local size = %d, want %d", got, len(localContent))
+	}
+	got, err := fs.readGitFile(context.Background(), "/repo/committed-local.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("read committed-local: %v", err)
+	}
+	if !bytes.Equal(got, localContent) {
+		t.Fatalf("committed-local content = %q, want %q", got, localContent)
+	}
+	entries, handled, err := fs.listGitDir(context.Background(), "/repo")
+	if err != nil {
+		t.Fatalf("listGitDir: %v", err)
+	}
+	if !handled {
+		t.Fatal("listGitDir handled = false, want true")
+	}
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		seen[entry.Name] = true
+	}
+	for _, name := range []string{"README.md", "committed-local.txt"} {
+		if !seen[name] {
+			t.Fatalf("listGitDir missing %s; entries=%v", name, seen)
+		}
+	}
+}
+
+func TestGitWorkspaceLocalHeadReadUsesSelectedCommitCache(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	baseContent := []byte("base\n")
+	localContent := []byte("committed local README\n")
+	repo := createGitRepoWithReadme(t, baseContent)
+	baseCommit := fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
+	baseSHA := fuseGitOutputForTest(t, repo, "hash-object", "README.md")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), localContent, 0o644); err != nil {
+		t.Fatalf("write local README: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", "README.md")
+	runFuseTestGit(t, repo, "commit", "-m", "local README")
+	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("archiveLocalGitDir: %v", err)
+	}
+
+	fixture := newGitWorkspaceFixture(t)
+	fixture.headCommit = baseCommit
+	fixture.state = state
+	fixture.readmeObjectSHA = baseSHA
+	fixture.readmeSize = -1
+
+	localRoot := t.TempDir()
+	treePath := filepath.Join(gitcache.TreeRoot(localRoot, "ws1", baseCommit), "README.md")
+	if err := os.MkdirAll(filepath.Dir(treePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(treePath, baseContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var lookupOut gofuse.EntryOut
+	if st := fs.Lookup(nil, &gofuse.InHeader{NodeId: repoIno}, "README.md", &lookupOut); st != gofuse.OK {
+		t.Fatalf("Lookup README status = %v, want OK", st)
+	}
+	if got := lookupOut.Size; got != uint64(len(localContent)) {
+		t.Fatalf("Lookup README size = %d, want %d", got, len(localContent))
+	}
+
+	got, err := fs.readGitFile(context.Background(), "/repo/README.md", 0, -1)
+	if err != nil {
+		t.Fatalf("read README: %v", err)
+	}
+	if !bytes.Equal(got, localContent) {
+		t.Fatalf("README content = %q, want %q", got, localContent)
+	}
+}
+
+func TestGitWorkspaceRenameLocalHeadOnlyFilePreservesContent(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	baseContent := []byte("hello base\n")
+	localContent := []byte("committed local file\n")
+	repo := createGitRepoWithReadme(t, baseContent)
+	baseCommit := fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
+	baseSHA := fuseGitOutputForTest(t, repo, "hash-object", "README.md")
+	if err := os.WriteFile(filepath.Join(repo, "committed-local.txt"), localContent, 0o644); err != nil {
+		t.Fatalf("write committed-local: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", "committed-local.txt")
+	runFuseTestGit(t, repo, "commit", "-m", "local file")
+	state, err := archiveLocalGitDir(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("archiveLocalGitDir: %v", err)
+	}
+
+	fixture := newGitWorkspaceFixture(t)
+	fixture.headCommit = baseCommit
+	fixture.state = state
+	fixture.readmeObjectSHA = baseSHA
+	fixture.readmeSize = int64(len(baseContent))
+
+	opts := &MountOptions{LocalRoot: t.TempDir(), WritePolicy: WritePolicyWriteSync, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	st := fs.Rename(nil, &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Newdir:   repoIno,
+	}, "committed-local.txt", "renamed-local.txt")
+	if st != gofuse.OK {
+		t.Fatalf("Rename status = %v, want OK", st)
+	}
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["renamed-local.txt"]
+	fixture.mu.Unlock()
+	if !ok {
+		t.Fatal("renamed-local overlay entry missing")
+	}
+	if !bytes.Equal(entry.Content, localContent) {
+		t.Fatalf("renamed-local content = %q, want %q", entry.Content, localContent)
+	}
+}
+
+func TestGitWorkspaceCreatePublishesDirtyMirrorBeforeFlush(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	repoIno := fs.inodes.Lookup("/repo", true, 0, time.Now())
+
+	var createOut gofuse.CreateOut
+	if st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: repoIno},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT | syscall.O_TRUNC),
+		Mode:     0o644,
+	}, "stash-new.txt", &createOut); st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	content := []byte("stash untracked\n")
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+		Size:     uint32(len(content)),
+	}, content); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+
+	got, err := fs.readGitFile(context.Background(), "/repo/stash-new.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("readGitFile before flush: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("readGitFile before flush = %q, want %q", got, content)
+	}
+	if err := fs.forceRefreshGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("forceRefreshGitWorkspaces: %v", err)
+	}
+	got, err = fs.readGitFile(context.Background(), "/repo/stash-new.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("readGitFile after refresh before flush: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("readGitFile after refresh before flush = %q, want %q", got, content)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+}
+
+func TestGitWorkspaceDirtyMirrorSweepUploadsContent(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	rt, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/README.md")
+	if !ok {
+		t.Fatal("git workspace not loaded")
+	}
+	content := []byte("mirror only\n")
+	fs.replaceGitDirtyMirror(rt, "mirror-only.txt", content)
+	fs.applyGitOverlayEntry("ws1", client.GitOverlayEntry{
+		WorkspaceID: "ws1",
+		Path:        "mirror-only.txt",
+		Op:          "upsert",
+		Kind:        "file",
+		Mode:        "100644",
+		SizeBytes:   int64(len(content)),
+	})
+
+	fs.syncGitDirtyMirrors()
+
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["mirror-only.txt"]
+	fixture.mu.Unlock()
+	if !ok {
+		t.Fatal("mirror-only.txt overlay missing after dirty mirror sweep")
+	}
+	if !bytes.Equal(entry.Content, content) {
+		t.Fatalf("overlay content = %q, want %q", entry.Content, content)
+	}
+}
+
+func TestGitWorkspaceDirtyMirrorSweepUploadsUnloadedRuntime(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	localRoot := t.TempDir()
+	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	content := []byte("unloaded runtime mirror\n")
+	dirtyPath := filepath.Join(localRoot, "git-workspaces", "ws1", "local-head", "dirty", "nested", "mirror-only.txt")
+	if err := os.MkdirAll(filepath.Dir(dirtyPath), 0o755); err != nil {
+		t.Fatalf("mkdir dirty mirror: %v", err)
+	}
+	if err := os.WriteFile(dirtyPath, content, 0o644); err != nil {
+		t.Fatalf("write dirty mirror: %v", err)
+	}
+
+	fs.syncGitDirtyMirrors()
+
+	fixture.mu.Lock()
+	entry, ok := fixture.overlay["nested/mirror-only.txt"]
+	fixture.mu.Unlock()
+	if !ok {
+		t.Fatal("nested/mirror-only.txt overlay missing after dirty mirror sweep")
+	}
+	if !bytes.Equal(entry.Content, content) {
+		t.Fatalf("overlay content = %q, want %q", entry.Content, content)
 	}
 }
 

@@ -26,6 +26,15 @@ func fakeLookPath(binMap map[string]bool) func(string) (string, error) {
 	}
 }
 
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
+}
+
 func TestUmountArgvDarwin(t *testing.T) {
 	got, err := umountArgv("darwin", fakeLookPath(nil), "/mnt/drive9")
 	if err != nil {
@@ -186,9 +195,12 @@ func TestRunUmountDoesNotBlockOnStalePID(t *testing.T) {
 		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
 		run:      func([]string) error { return nil },
 		readProcessState: func(string) (mountstate.ProcessState, string, error) {
-			return mountstate.ProcessState{}, "", errors.New("readProcessState should not be called on non-Windows")
+			return mountstate.ProcessState{PID: 1234}, "/tmp/drive9.pid", nil
 		},
-		readPID: func(string) (int, string, error) { return 1234, "/tmp/drive9.pid", nil },
+		readPID: func(string) (int, string, error) {
+			t.Fatal("readPID should not be called when process state is available")
+			return 0, "", nil
+		},
 		pidAlive: func(int) bool {
 			aliveCalls++
 			return false
@@ -212,9 +224,12 @@ func TestRunUmountNoPIDFileReturnsSuccess(t *testing.T) {
 		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
 		run:      func([]string) error { return nil },
 		readProcessState: func(string) (mountstate.ProcessState, string, error) {
-			return mountstate.ProcessState{}, "", errors.New("readProcessState should not be called on non-Windows")
+			return mountstate.ProcessState{}, "/tmp/drive9.pid", os.ErrNotExist
 		},
-		readPID:   func(string) (int, string, error) { return 0, "/tmp/drive9.pid", os.ErrNotExist },
+		readPID: func(string) (int, string, error) {
+			t.Fatal("readPID should not be called when process state reader reports no file")
+			return 0, "", nil
+		},
 		terminate: func(int, time.Duration) error { t.Fatal("terminate should not be called without pid file"); return nil },
 		remove:    func(string) error { t.Fatal("remove should not be called without pid file"); return nil },
 		pidAlive:  func(int) bool { t.Fatal("pidAlive should not be called without pid file"); return false },
@@ -228,16 +243,16 @@ func TestRunUmountNoPIDFileReturnsSuccess(t *testing.T) {
 	}
 }
 
-func TestRunUmountNonWindowsTimeoutZeroSkipsPIDRead(t *testing.T) {
+func TestRunUmountNonWindowsTimeoutZeroSkipsPIDWait(t *testing.T) {
 	deps := umountDeps{
 		goos:     "linux",
 		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
 		run:      func([]string) error { return nil },
 		readProcessState: func(string) (mountstate.ProcessState, string, error) {
-			return mountstate.ProcessState{}, "", errors.New("readProcessState should not be called on non-Windows")
+			return mountstate.ProcessState{}, "/tmp/drive9.pid", os.ErrNotExist
 		},
 		readPID: func(string) (int, string, error) {
-			t.Fatal("readPID should not be called when timeout is zero on non-Windows")
+			t.Fatal("readPID should not be called when timeout is zero on non-Windows FUSE path")
 			return 0, "", nil
 		},
 		terminate: func(int, time.Duration) error {
@@ -259,6 +274,137 @@ func TestRunUmountNonWindowsTimeoutZeroSkipsPIDRead(t *testing.T) {
 
 	if err := runUmount([]string{"--timeout", "0", "/mnt/drive9"}, deps); err != nil {
 		t.Fatalf("runUmount: %v", err)
+	}
+}
+
+func TestRunUmountTerminatesNonWindowsWebDAVBridge(t *testing.T) {
+	runCalls := 0
+	stateReads := 0
+	terminateCalls := 0
+	removeCalls := 0
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run: func(argv []string) error {
+			runCalls++
+			want := []string{"fusermount3", "-u", "/mnt/drive9"}
+			if !reflect.DeepEqual(argv, want) {
+				t.Fatalf("argv = %v, want %v", argv, want)
+			}
+			return nil
+		},
+		readProcessState: func(mountPoint string) (mountstate.ProcessState, string, error) {
+			stateReads++
+			if mountPoint != "/mnt/drive9" {
+				t.Fatalf("mountPoint = %q", mountPoint)
+			}
+			return mountstate.ProcessState{PID: 1234, MountKind: mountstate.MountKindWebDAV}, "/tmp/drive9-webdav.pid", nil
+		},
+		readPID: func(string) (int, string, error) {
+			t.Fatal("readPID should not be called when process state is available")
+			return 0, "", nil
+		},
+		terminateState: func(state mountstate.ProcessState, waitTimeout time.Duration) error {
+			terminateCalls++
+			if state.PID != 1234 {
+				t.Fatalf("pid = %d, want 1234", state.PID)
+			}
+			if waitTimeout != 250*time.Millisecond {
+				t.Fatalf("waitTimeout = %s, want 250ms", waitTimeout)
+			}
+			return nil
+		},
+		remove: func(path string) error {
+			removeCalls++
+			if path != "/tmp/drive9-webdav.pid" {
+				t.Fatalf("path = %q, want /tmp/drive9-webdav.pid", path)
+			}
+			return nil
+		},
+		pidAlive:  func(int) bool { t.Fatal("pidAlive should not be called for WebDAV bridge termination"); return false },
+		now:       time.Now,
+		sleep:     func(time.Duration) {},
+		printErrf: func(string, ...any) {},
+	}
+
+	if err := runUmount([]string{"--timeout", "250ms", "/mnt/drive9"}, deps); err != nil {
+		t.Fatalf("runUmount: %v", err)
+	}
+	if runCalls != 1 {
+		t.Fatalf("runCalls = %d, want 1", runCalls)
+	}
+	if stateReads < 1 {
+		t.Fatal("readProcessState was not called")
+	}
+	if terminateCalls != 1 {
+		t.Fatalf("terminateCalls = %d, want 1", terminateCalls)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
+	}
+}
+
+func TestRunUmountNonWindowsWebDAVStillCleansUpAfterUnmountFailure(t *testing.T) {
+	runErr := errors.New("fusermount failed")
+	runCalls := 0
+	terminateCalls := 0
+	removeCalls := 0
+	deps := umountDeps{
+		goos:     "linux",
+		lookPath: fakeLookPath(map[string]bool{"fusermount3": true}),
+		run: func(argv []string) error {
+			runCalls++
+			want := []string{"fusermount3", "-u", "/mnt/drive9"}
+			if !reflect.DeepEqual(argv, want) {
+				t.Fatalf("argv = %v, want %v", argv, want)
+			}
+			return runErr
+		},
+		readProcessState: func(mountPoint string) (mountstate.ProcessState, string, error) {
+			if mountPoint != "/mnt/drive9" {
+				t.Fatalf("mountPoint = %q", mountPoint)
+			}
+			return mountstate.ProcessState{
+				PID:          1234,
+				CreationTime: 99,
+				MountKind:    mountstate.MountKindWebDAV,
+			}, "/tmp/drive9-webdav.pid", nil
+		},
+		terminateState: func(state mountstate.ProcessState, waitTimeout time.Duration) error {
+			terminateCalls++
+			if state.PID != 1234 {
+				t.Fatalf("pid = %d, want 1234", state.PID)
+			}
+			if waitTimeout != 250*time.Millisecond {
+				t.Fatalf("waitTimeout = %s, want 250ms", waitTimeout)
+			}
+			return nil
+		},
+		remove: func(path string) error {
+			removeCalls++
+			if path != "/tmp/drive9-webdav.pid" {
+				t.Fatalf("path = %q, want /tmp/drive9-webdav.pid", path)
+			}
+			return nil
+		},
+		pidAlive:  func(int) bool { t.Fatal("pidAlive should not be called for WebDAV bridge termination"); return false },
+		now:       time.Now,
+		sleep:     func(time.Duration) {},
+		printErrf: func(string, ...any) {},
+	}
+
+	err := runUmount([]string{"--timeout", "250ms", "/mnt/drive9"}, deps)
+	if !errors.Is(err, runErr) {
+		t.Fatalf("err = %v, want %v", err, runErr)
+	}
+	if runCalls != 1 {
+		t.Fatalf("runCalls = %d, want 1", runCalls)
+	}
+	if terminateCalls != 1 {
+		t.Fatalf("terminateCalls = %d, want 1", terminateCalls)
+	}
+	if removeCalls != 1 {
+		t.Fatalf("removeCalls = %d, want 1", removeCalls)
 	}
 }
 
@@ -426,6 +572,31 @@ func TestTerminateProcessWaitsAfterSuccessfulKill(t *testing.T) {
 		t.Fatal("waitForProcessExit was not called after successful kill")
 	}
 	_, _ = cmd.Process.Wait()
+}
+
+func TestTerminateMountProcessRejectsUnsafeWebDAVState(t *testing.T) {
+	err := terminateMountProcess(mountstate.ProcessState{
+		PID:       os.Getpid(),
+		MountKind: mountstate.MountKindWebDAV,
+	}, time.Millisecond)
+	if !errors.Is(err, errMountProcessStateUnsafe) {
+		t.Fatalf("err = %v, want unsafe mount process state", err)
+	}
+}
+
+func TestTerminateMountProcessRejectsStaleWebDAVState(t *testing.T) {
+	creationTime, err := processCreationTimeByPID(os.Getpid())
+	if err != nil {
+		t.Fatalf("processCreationTimeByPID: %v", err)
+	}
+	err = terminateMountProcess(mountstate.ProcessState{
+		PID:          os.Getpid(),
+		CreationTime: creationTime + 1,
+		MountKind:    mountstate.MountKindWebDAV,
+	}, time.Millisecond)
+	if !errors.Is(err, errMountProcessStateStale) {
+		t.Fatalf("err = %v, want stale mount process state", err)
+	}
 }
 
 func TestRunUmountWindowsStalePIDFileDoesNotTerminateProcess(t *testing.T) {
@@ -660,6 +831,190 @@ func TestResolveMountCredentials_MissingServer(t *testing.T) {
 	}
 }
 
+func TestMountCmdStartsBackgroundByDefault(t *testing.T) {
+	oldStartMountBackground := startMountBackground
+	oldMountFuse := mountFuse
+	t.Cleanup(func() {
+		startMountBackground = oldStartMountBackground
+		mountFuse = oldMountFuse
+	})
+
+	var got mountBackgroundRequest
+	startMountBackground = func(req mountBackgroundRequest) error {
+		got = req
+		return nil
+	}
+	mountFuse = func(*mountFuseOptions) error {
+		t.Fatal("mountFuse should not run in-process for default background mount")
+		return nil
+	}
+
+	mountPoint := t.TempDir()
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "interactive",
+		mountPoint,
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got.MountPoint != mountPoint {
+		t.Fatalf("MountPoint = %q, want %q", got.MountPoint, mountPoint)
+	}
+	if got.Server != "https://drive9.example" || got.APIKey != "sk-test" || got.Token != "" {
+		t.Fatalf("background credentials = server %q api %q token %q", got.Server, got.APIKey, got.Token)
+	}
+	if containsString(got.Args, "--foreground") {
+		t.Fatalf("background request args = %v, should preserve original user args", got.Args)
+	}
+}
+
+func TestMountCmdVaultStartsBackgroundByDefault(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("vault FUSE mounts are unsupported on Windows")
+	}
+	oldStartMountBackground := startMountBackground
+	oldMountVault := mountVault
+	t.Cleanup(func() {
+		startMountBackground = oldStartMountBackground
+		mountVault = oldMountVault
+	})
+
+	var got mountBackgroundRequest
+	startMountBackground = func(req mountBackgroundRequest) error {
+		got = req
+		return nil
+	}
+	mountVault = func(*vaultMountOptions) error {
+		t.Fatal("mountVault should not run in-process for default background vault mount")
+		return nil
+	}
+
+	mountPoint := t.TempDir()
+	err := MountCmd([]string{
+		"vault",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		mountPoint,
+	})
+	if err != nil {
+		t.Fatalf("MountCmd vault: %v", err)
+	}
+	if got.MountPoint != mountPoint {
+		t.Fatalf("MountPoint = %q, want %q", got.MountPoint, mountPoint)
+	}
+	wantArgs := []string{"vault", "--server", "https://drive9.example", "--api-key", "sk-test", mountPoint}
+	if !reflect.DeepEqual(got.Args, wantArgs) {
+		t.Fatalf("Args = %v, want %v", got.Args, wantArgs)
+	}
+}
+
+func TestForegroundMountCommandArgs(t *testing.T) {
+	tests := []struct {
+		name string
+		in   []string
+		want []string
+	}{
+		{
+			name: "fs",
+			in:   []string{"--mode", "fuse", "/mnt/drive9"},
+			want: []string{"mount", "--foreground", "--mode", "fuse", "/mnt/drive9"},
+		},
+		{
+			name: "vault",
+			in:   []string{"vault", "--dir-ttl", "1s", "/mnt/vault"},
+			want: []string{"mount", "vault", "--foreground", "--dir-ttl", "1s", "/mnt/vault"},
+		},
+		{
+			name: "fs strip split api key",
+			in:   []string{"--mode", "fuse", "--api-key", "sk-secret", "--server", "https://drive9.example", "/mnt/drive9"},
+			want: []string{"mount", "--foreground", "--mode", "fuse", "--server", "https://drive9.example", "/mnt/drive9"},
+		},
+		{
+			name: "fs strip equals api key",
+			in:   []string{"--api-key=sk-secret", "--debug", "/mnt/drive9"},
+			want: []string{"mount", "--foreground", "--debug", "/mnt/drive9"},
+		},
+		{
+			name: "vault strip api key",
+			in:   []string{"vault", "--api-key", "sk-secret", "--dir-ttl", "1s", "/mnt/vault"},
+			want: []string{"mount", "vault", "--foreground", "--dir-ttl", "1s", "/mnt/vault"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := foregroundMountCommandArgs(tt.in); !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("foregroundMountCommandArgs(%v) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWaitForBackgroundMountReadyStopsChildOnStateReadError(t *testing.T) {
+	readErr := errors.New("invalid mount state")
+	mountPoint := t.TempDir()
+	stateMountPoint := backgroundMountStatePoint(mountPoint)
+	waitCh := make(chan error, 1)
+	now := time.Unix(100, 0)
+	terminateCalls := 0
+	deps := backgroundMountReadyDeps{
+		readProcessState: func(gotMountPoint string) (mountstate.ProcessState, string, error) {
+			if gotMountPoint != stateMountPoint {
+				t.Fatalf("mountPoint = %q, want %q", gotMountPoint, stateMountPoint)
+			}
+			return mountstate.ProcessState{}, "", readErr
+		},
+		terminate: func(pid int, waitTimeout time.Duration) error {
+			terminateCalls++
+			if pid != 1234 {
+				t.Fatalf("pid = %d, want 1234", pid)
+			}
+			if waitTimeout != 5*time.Second {
+				t.Fatalf("waitTimeout = %s, want 5s", waitTimeout)
+			}
+			waitCh <- errors.New("signal: terminated")
+			return nil
+		},
+		now:   func() time.Time { return now },
+		sleep: func(d time.Duration) { now = now.Add(d) },
+	}
+
+	err := waitForBackgroundMountReadyWithDeps(mountPoint, 1234, waitCh, "/tmp/drive9.log", time.Second, deps)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("err = %v, want %v", err, readErr)
+	}
+	if terminateCalls != 1 {
+		t.Fatalf("terminateCalls = %d, want 1", terminateCalls)
+	}
+	select {
+	case leftover := <-waitCh:
+		t.Fatalf("waitCh was not drained after termination: %v", leftover)
+	default:
+	}
+}
+
+func TestMountBackgroundEnvSnapshotsCredentials(t *testing.T) {
+	got := mountBackgroundEnv([]string{
+		"PATH=/bin",
+		EnvServer + "=https://old.example",
+		EnvAPIKey + "=old-key",
+		EnvVaultToken + "=old-token",
+	}, mountBackgroundRequest{
+		Server: "https://drive9.example",
+		Token:  "jwt-token",
+	})
+	want := []string{
+		"PATH=/bin",
+		EnvServer + "=https://drive9.example",
+		EnvVaultToken + "=jwt-token",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("env = %v, want %v", got, want)
+	}
+}
+
 func TestMountCmdPassesLegacyDirStatFallbackOption(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
@@ -672,6 +1027,7 @@ func TestMountCmdPassesLegacyDirStatFallbackOption(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -705,6 +1061,7 @@ func TestMountCmdLeavesLegacyDirStatFallbackDisabledByDefault(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -733,6 +1090,7 @@ func TestMountCmdPassesLayerRefOption(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -790,6 +1148,7 @@ func TestMountCmdPassesTrustLocalEventsOption(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -819,6 +1178,7 @@ func TestMountCmdLeavesTrustLocalEventsDisabledByDefault(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -860,6 +1220,7 @@ func TestMountCmdPassesReadCacheMaxFileOption(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -879,6 +1240,7 @@ func TestMountCmdPassesReadCacheMaxFileOption(t *testing.T) {
 
 func TestMountCmdRejectsZeroDiskReadCacheFreeRatio(t *testing.T) {
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -902,6 +1264,7 @@ func TestMountCmdPassesReadConcurrencyOption(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -931,6 +1294,7 @@ func TestMountCmdPassesParallelReadOptions(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -964,6 +1328,7 @@ func TestMountCmdPassesUploadConcurrencyOption(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -983,6 +1348,7 @@ func TestMountCmdPassesUploadConcurrencyOption(t *testing.T) {
 
 func TestMountCmdRejectsInvalidReadConcurrency(t *testing.T) {
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -996,6 +1362,7 @@ func TestMountCmdRejectsInvalidReadConcurrency(t *testing.T) {
 
 func TestMountCmdRejectsInvalidParallelReadConcurrency(t *testing.T) {
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -1009,6 +1376,7 @@ func TestMountCmdRejectsInvalidParallelReadConcurrency(t *testing.T) {
 
 func TestMountCmdRejectsInvalidParallelReadBlockSize(t *testing.T) {
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -1022,6 +1390,7 @@ func TestMountCmdRejectsInvalidParallelReadBlockSize(t *testing.T) {
 
 func TestMountCmdRejectsInvalidUploadConcurrency(t *testing.T) {
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -1045,6 +1414,7 @@ func TestMountCmdPassesFuseSyncReadOption(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -1113,6 +1483,7 @@ func TestMountCmdMapsDurabilityOption(t *testing.T) {
 			}
 
 			args := []string{
+				"--foreground",
 				"--mode", "fuse",
 				"--server", "https://drive9.example",
 				"--api-key", "sk-test",
@@ -1145,6 +1516,7 @@ func TestMountCmdLeavesDefaultTTLsUnsetForFuseDefaults(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -1176,6 +1548,7 @@ func TestMountCmdPreservesExplicitTTLs(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -1215,6 +1588,7 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 
 	localRoot := t.TempDir()
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
@@ -1259,6 +1633,7 @@ func TestMountCmdCodingAgentProfileGeneratesDefaultLocalRoot(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",

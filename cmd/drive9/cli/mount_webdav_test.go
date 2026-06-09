@@ -343,12 +343,33 @@ func TestWebDAVMountLifecycle(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("mount command was not invoked")
 	}
-	_, _, err := mountstate.ReadPID(mountPoint)
-	if !errors.Is(err, os.ErrNotExist) {
-		if err == nil {
-			t.Fatalf("expected no pid file for non-Windows WebDAV mount at %q", mountPoint)
+	var (
+		state   mountstate.ProcessState
+		pidFile string
+		err     error
+	)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		state, pidFile, err = mountstate.ReadProcessState(mountPoint)
+		if err == nil && state.PID == os.Getpid() {
+			break
 		}
-		t.Fatalf("ReadPID(%q): %v", mountPoint, err)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("ReadPID(%q): %v", mountPoint, err)
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("ReadPID(%q): timed out waiting for current pid file", mountPoint)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if state.PID != os.Getpid() {
+		t.Fatalf("pid = %d, want %d", state.PID, os.Getpid())
+	}
+	if state.MountKind != mountstate.MountKindWebDAV {
+		t.Fatalf("MountKind = %q, want %q", state.MountKind, mountstate.MountKindWebDAV)
+	}
+	if state.CreationTime == 0 {
+		t.Fatal("CreationTime = 0, want process ownership metadata")
 	}
 
 	signals <- os.Interrupt
@@ -363,6 +384,13 @@ func TestWebDAVMountLifecycle(t *testing.T) {
 	}
 	if !unmounted.Load() {
 		t.Fatal("unmount callback was not called")
+	}
+	_, _, err = mountstate.ReadPID(mountPoint)
+	if !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			t.Fatalf("expected pid file %q to be removed", pidFile)
+		}
+		t.Fatalf("pid file %q not removed cleanly: %v", pidFile, err)
 	}
 }
 
@@ -422,19 +450,25 @@ func TestWebDAVMountLifecycleWindowsNormalizesDriveLetter(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		state, pidFile, err = mountstate.ReadProcessState(stateMountPoint)
-		if err == nil {
+		if err == nil && state.PID == os.Getpid() {
 			break
 		}
-		if !errors.Is(err, os.ErrNotExist) {
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("ReadPID(%q): %v", stateMountPoint, err)
 		}
 		if !time.Now().Before(deadline) {
-			t.Fatalf("ReadPID(%q): timed out waiting for pid file", stateMountPoint)
+			t.Fatalf("ReadPID(%q): timed out waiting for current pid file", stateMountPoint)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if state.PID != os.Getpid() {
 		t.Fatalf("pid = %d, want %d", state.PID, os.Getpid())
+	}
+	if state.MountKind != mountstate.MountKindWebDAV {
+		t.Fatalf("MountKind = %q, want %q", state.MountKind, mountstate.MountKindWebDAV)
+	}
+	if state.CreationTime == 0 {
+		t.Fatal("CreationTime = 0, want process ownership metadata")
 	}
 
 	signals <- os.Interrupt

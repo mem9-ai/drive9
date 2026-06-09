@@ -102,13 +102,15 @@ drive9 fs rm -r :/old-dir
 
 ```bash
 mkdir -p ~/drive9
-drive9 mount :/ ~/drive9 --debug
+drive9 mount --debug :/ ~/drive9
 
-# In another shell:
 git clone https://github.com/mem9-ai/drive9.git ~/drive9/drive9
 
 drive9 umount ~/drive9
 ```
+
+`drive9 mount` starts in the background by default. Use `--foreground` to keep
+the mount process attached to the current terminal until it is unmounted.
 
 The mount command accepts an optional remote root:
 
@@ -394,6 +396,8 @@ Important environment variables:
 ```text
 DRIVE9_META_DSN                 control-plane MySQL/TiDB DSN
 DRIVE9_TENANT_PROVIDER          db9 | tidb_zero | tidb_cloud_starter
+DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT
+                                default TiDB Cloud Starter spendingLimit.monthly in USD cents
 DRIVE9_TOKEN_SIGNING_KEY        32-byte hex JWT signing key
 DRIVE9_ENCRYPT_TYPE             local_aes | kms
 DRIVE9_MASTER_KEY               local AES key

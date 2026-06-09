@@ -30,12 +30,23 @@ const (
 	defaultFuseReadConcurrency         = 24
 	defaultFuseParallelReadConcurrency = 4
 	defaultFuseParallelReadBlockSizeMB = 1
+	defaultMountBackgroundReadyTimeout = 30 * time.Second
 )
 
 var (
 	errMountProcessStateStale  = errors.New("drive9 umount: stale mount process state")
 	errMountProcessStateUnsafe = errors.New("drive9 umount: unsafe mount process state")
 )
+
+type mountBackgroundRequest struct {
+	Args       []string
+	MountPoint string
+	Server     string
+	APIKey     string
+	Token      string
+}
+
+var startMountBackground = startMountBackgroundImpl
 
 // MountCmd handles the "drive9 mount" command.
 //
@@ -60,10 +71,10 @@ func MountCmd(args []string) error {
 	fmt.Fprint(os.Stderr, buildinfo.String("drive9 mount"))
 	if len(args) > 0 {
 		if args[0] == "vault" {
-			return VaultMountCmd(args[1:])
+			return vaultMountCmd(args[1:], true)
 		}
 	}
-	return fsMountCmd(args)
+	return fsMountCmdWithBackground(args, true)
 }
 
 // fsMountCmd is the pre-V2e writable fs mount entry point.
@@ -83,14 +94,21 @@ func MountCmd(args []string) error {
 // `vault reauth` is not part of M1; see docs/specs/vault-interaction-end-state.md
 // section 17.
 //
-// drive9fuse.Mount runs in-process (no fork/exec); credentials flow through
-// MountOptions{Server, APIKey, Token}, not through the child's environment.
-// This makes the resolver's Unsetenv-after-read mitigation safe for mount.
+// In foreground mode, drive9fuse.Mount runs in-process and credentials flow
+// through MountOptions{Server, APIKey, Token}. In default background mode,
+// this command starts a fresh `drive9 mount --foreground` child and passes the
+// resolved credential snapshot through that child's environment; the child
+// consumes and unsets those env vars through the normal resolver path.
 func fsMountCmd(args []string) error {
+	return fsMountCmdWithBackground(args, false)
+}
+
+func fsMountCmdWithBackground(args []string, background bool) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
 	mode := fs.String("mode", "auto", "mount mode: auto, fuse, or webdav")
+	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
 	cacheDir := fs.String("cache-dir", "", "write-back cache directory (default ~/.cache/drive9)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 1, "maximum single file size admitted to read cache in MB")
@@ -304,6 +322,16 @@ func fsMountCmd(args []string) error {
 		})
 	}
 
+	if background && !*foreground {
+		return startMountBackground(mountBackgroundRequest{
+			Args:       append([]string(nil), args...),
+			MountPoint: mountPoint,
+			Server:     serverVal,
+			APIKey:     apiKeyVal,
+			Token:      tokenVal,
+		})
+	}
+
 	// WebDAV path: create client, start local WebDAV server, invoke mount_webdav.
 	if resolved == MountModeWebDAV {
 		var c *client.Client
@@ -419,6 +447,225 @@ func fsMountCmd(args []string) error {
 	}
 
 	return mountFuse(opts)
+}
+
+func startMountBackgroundImpl(req mountBackgroundRequest) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("drive9 mount: locate executable: %w", err)
+	}
+	logPath, logFile, err := openMountBackgroundLog(req.MountPoint)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = logFile.Close() }()
+
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		return fmt.Errorf("drive9 mount: open %s: %w", os.DevNull, err)
+	}
+	defer func() { _ = devNull.Close() }()
+
+	cmd := exec.Command(exe, foregroundMountCommandArgs(req.Args)...)
+	cmd.Env = mountBackgroundEnv(os.Environ(), req)
+	cmd.Stdin = devNull
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	configureMountBackgroundCommand(cmd)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("drive9 mount: start background mount: %w", err)
+	}
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	if err := waitForBackgroundMountReady(req.MountPoint, cmd.Process.Pid, waitCh, logPath, defaultMountBackgroundReadyTimeout); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "drive9: mount running in background (pid: %d, log: %s)\n", cmd.Process.Pid, logPath)
+	fmt.Fprintf(os.Stderr, "drive9: unmount with `drive9 umount %s`\n", req.MountPoint)
+	return nil
+}
+
+func foregroundMountCommandArgs(args []string) []string {
+	out := []string{"mount"}
+	if len(args) > 0 && args[0] == "vault" {
+		out = append(out, "vault", "--foreground")
+		out = append(out, stripBackgroundOnlyCredentialArgs(args[1:])...)
+		return out
+	}
+	out = append(out, "--foreground")
+	out = append(out, stripBackgroundOnlyCredentialArgs(args)...)
+	return out
+}
+
+func stripBackgroundOnlyCredentialArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--api-key" {
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--api-key=") {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+func mountBackgroundEnv(environ []string, req mountBackgroundRequest) []string {
+	out := make([]string, 0, len(environ)+2)
+	for _, kv := range environ {
+		if strings.HasPrefix(kv, EnvServer+"=") ||
+			strings.HasPrefix(kv, EnvAPIKey+"=") ||
+			strings.HasPrefix(kv, EnvVaultToken+"=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	if req.Server != "" {
+		out = append(out, EnvServer+"="+req.Server)
+	}
+	if req.Token != "" {
+		out = append(out, EnvVaultToken+"="+req.Token)
+	} else if req.APIKey != "" {
+		out = append(out, EnvAPIKey+"="+req.APIKey)
+	}
+	return out
+}
+
+func openMountBackgroundLog(mountPoint string) (string, *os.File, error) {
+	path, err := mountBackgroundLogPath(mountPoint)
+	if err != nil {
+		return "", nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", nil, fmt.Errorf("drive9 mount: open background log %s: %w", path, err)
+	}
+	_, _ = fmt.Fprintf(f, "\n--- drive9 mount background start %s ---\n", time.Now().Format(time.RFC3339))
+	return path, f, nil
+}
+
+func mountBackgroundLogPath(mountPoint string) (string, error) {
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheRoot) == "" {
+		cacheRoot = os.TempDir()
+	}
+	dir := filepath.Join(cacheRoot, "drive9", "mount-logs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("drive9 mount: create background log directory: %w", err)
+	}
+	canonical := filepath.Clean(mountPoint)
+	if abs, err := filepath.Abs(canonical); err == nil {
+		canonical = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(canonical); err == nil {
+		canonical = resolved
+	}
+	sum := sha256.Sum256([]byte(canonical))
+	return filepath.Join(dir, "mount-"+hex.EncodeToString(sum[:8])+".log"), nil
+}
+
+func waitForBackgroundMountReady(mountPoint string, pid int, waitCh <-chan error, logPath string, timeout time.Duration) error {
+	return waitForBackgroundMountReadyWithDeps(mountPoint, pid, waitCh, logPath, timeout, backgroundMountReadyDeps{
+		readProcessState: mountstate.ReadProcessState,
+		terminate:        terminateProcess,
+		now:              time.Now,
+		sleep:            time.Sleep,
+	})
+}
+
+type backgroundMountReadyDeps struct {
+	readProcessState func(string) (mountstate.ProcessState, string, error)
+	terminate        func(int, time.Duration) error
+	now              func() time.Time
+	sleep            func(time.Duration)
+}
+
+func waitForBackgroundMountReadyWithDeps(mountPoint string, pid int, waitCh <-chan error, logPath string, timeout time.Duration, deps backgroundMountReadyDeps) error {
+	if deps.readProcessState == nil {
+		deps.readProcessState = mountstate.ReadProcessState
+	}
+	if deps.terminate == nil {
+		deps.terminate = terminateProcess
+	}
+	if deps.now == nil {
+		deps.now = time.Now
+	}
+	if deps.sleep == nil {
+		deps.sleep = time.Sleep
+	}
+	stateMountPoint := backgroundMountStatePoint(mountPoint)
+	deadline := deps.now().Add(timeout)
+	for {
+		select {
+		case err := <-waitCh:
+			if err != nil {
+				return fmt.Errorf("drive9 mount: background mount exited before becoming ready: %w (log: %s)", err, logPath)
+			}
+			return fmt.Errorf("drive9 mount: background mount exited before becoming ready (log: %s)", logPath)
+		default:
+		}
+
+		state, _, err := deps.readProcessState(stateMountPoint)
+		if err == nil {
+			if state.PID == pid {
+				return nil
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			if stopErr := stopBackgroundMountProcess(pid, waitCh, deps, 5*time.Second); stopErr != nil {
+				return fmt.Errorf("drive9 mount: read mount process state: %w; failed to stop background mount pid %d: %v", err, pid, stopErr)
+			}
+			return fmt.Errorf("drive9 mount: read mount process state: %w", err)
+		}
+
+		if !deps.now().Before(deadline) {
+			_ = stopBackgroundMountProcess(pid, waitCh, deps, 5*time.Second)
+			return fmt.Errorf("drive9 mount: timed out waiting for background mount to become ready after %s (log: %s)", timeout, logPath)
+		}
+		deps.sleep(50 * time.Millisecond)
+	}
+}
+
+func stopBackgroundMountProcess(pid int, waitCh <-chan error, deps backgroundMountReadyDeps, timeout time.Duration) error {
+	var stopErr error
+	if deps.terminate != nil {
+		stopErr = deps.terminate(pid, timeout)
+	}
+	if waitCh == nil {
+		return stopErr
+	}
+	deadline := deps.now().Add(timeout)
+	for {
+		select {
+		case <-waitCh:
+			return stopErr
+		default:
+		}
+		if timeout <= 0 || !deps.now().Before(deadline) {
+			if stopErr != nil {
+				return stopErr
+			}
+			return fmt.Errorf("background mount pid %d did not exit after stop request", pid)
+		}
+		deps.sleep(10 * time.Millisecond)
+	}
+}
+
+func backgroundMountStatePoint(mountPoint string) string {
+	if runtime.GOOS == "windows" {
+		if stateMountPoint, err := webdavMountStatePoint(runtime.GOOS, mountPoint); err == nil {
+			return stateMountPoint
+		}
+	}
+	return mountPoint
 }
 
 // newWebDAVHandler creates an http.Handler that serves drive9 content over WebDAV.
@@ -747,12 +994,6 @@ func runUmount(args []string, deps umountDeps) error {
 		return err
 	}
 	runErr := deps.run(argv)
-	if deps.goos != "windows" && runErr != nil {
-		return runErr
-	}
-	if deps.goos != "windows" && *waitTimeout == 0 {
-		return runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths)
-	}
 	if deps.goos == "windows" {
 		var (
 			state mountstate.ProcessState
@@ -822,28 +1063,87 @@ func runUmount(args []string, deps umountDeps) error {
 		return runErr
 	}
 
-	pid, path, err := deps.readPID(stateMountPoint)
+	state, path, stateOK, err := readUnmountProcessState(deps, stateMountPoint)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			if runErr == nil {
-				if err := runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths); err != nil {
-					return err
-				}
-			}
-			return runErr
-		}
 		if runErr != nil {
 			return runErr
 		}
 		return err
 	}
+	if stateOK && state.MountKind == mountstate.MountKindWebDAV {
+		if deps.terminateState != nil {
+			err = deps.terminateState(state, *waitTimeout)
+		} else if deps.terminate != nil {
+			err = deps.terminate(state.PID, *waitTimeout)
+		} else {
+			err = fmt.Errorf("drive9 umount: no process terminator configured for WebDAV mount")
+		}
+		if err != nil {
+			if errors.Is(err, errMountProcessStateStale) || errors.Is(err, errMountProcessStateUnsafe) {
+				if path != "" && deps.remove != nil {
+					if removeErr := deps.remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && runErr == nil {
+						return fmt.Errorf("drive9 umount: remove mount pid file %s: %w", path, removeErr)
+					}
+				}
+				if errors.Is(err, errMountProcessStateStale) {
+					if deps.printErrf != nil {
+						deps.printErrf("drive9 umount: removed stale mount pid file %s without terminating any process\n", path)
+					}
+					return runErr
+				}
+			}
+			if runErr != nil {
+				return runErr
+			}
+			return fmt.Errorf("%w (pid file: %s)", err, path)
+		}
+		if path != "" && deps.remove != nil {
+			if err := deps.remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				if runErr != nil {
+					return runErr
+				}
+				return fmt.Errorf("drive9 umount: remove mount pid file %s: %w", path, err)
+			}
+		}
+		if runErr != nil {
+			return runErr
+		}
+		return runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths)
+	}
+	if runErr != nil {
+		return runErr
+	}
 	if *waitTimeout == 0 {
 		return runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths)
 	}
-	if err := waitForPIDExit(pid, *waitTimeout, deps); err != nil {
+	if !stateOK {
+		return runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths)
+	}
+	if err := waitForPIDExit(state.PID, *waitTimeout, deps); err != nil {
 		return fmt.Errorf("%w (pid file: %s)", err, path)
 	}
 	return runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths)
+}
+
+func readUnmountProcessState(deps umountDeps, mountPoint string) (mountstate.ProcessState, string, bool, error) {
+	if deps.readProcessState != nil {
+		state, path, err := deps.readProcessState(mountPoint)
+		if err == nil {
+			return state, path, true, nil
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return mountstate.ProcessState{}, path, false, nil
+		}
+		return mountstate.ProcessState{}, path, false, err
+	}
+	pid, path, err := deps.readPID(mountPoint)
+	if err == nil {
+		return mountstate.ProcessState{PID: pid}, path, true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return mountstate.ProcessState{}, path, false, nil
+	}
+	return mountstate.ProcessState{}, path, false, err
 }
 
 func validateUmountPackState(state mountstate.ProcessState) error {

@@ -2144,10 +2144,11 @@ func (fs *Dat9FS) enqueueStagedShadowCommitLocked(fh *FileHandle) error {
 	}
 	size := fh.Dirty.Size()
 	mode, hasMode := fs.modeForPendingHandle(fh)
+	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	entry := &CommitEntry{
 		Path:        fh.Path,
 		Inode:       fh.Ino,
-		BaseRev:     fh.BaseRev,
+		BaseRev:     expectedRevision,
 		Size:        size,
 		Kind:        fs.pendingKindForHandle(fh),
 		ShadowSpill: fh.ShadowSpill,
@@ -3784,13 +3785,16 @@ func (fs *Dat9FS) getAttrStatWithRetry(cancel <-chan struct{}, remotePath string
 }
 
 func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
-	cached := make([]CachedFileInfo, len(items))
-	for i, item := range items {
+	cached := make([]CachedFileInfo, 0, len(items))
+	for _, item := range items {
+		if !validDirEntryName(item.Name) {
+			continue
+		}
 		var mtime time.Time
 		if item.Mtime > 0 {
 			mtime = time.Unix(item.Mtime, 0)
 		}
-		cached[i] = CachedFileInfo{
+		cached = append(cached, CachedFileInfo{
 			Name:       item.Name,
 			Size:       item.Size,
 			IsDir:      item.IsDir,
@@ -3799,7 +3803,7 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 			HasMode:    item.HasMode,
 			ResourceID: item.ResourceID,
 			Nlink:      item.Nlink,
-		}
+		})
 	}
 	return cached
 }
@@ -6263,6 +6267,9 @@ func (fs *Dat9FS) ReadDir(cancel <-chan struct{}, input *gofuse.ReadIn, out *gof
 
 	for i := int(input.Offset); i < len(dh.Entries); i++ {
 		e := dh.Entries[i]
+		if !validDirEntryName(e.Name) {
+			continue
+		}
 		if !out.AddDirEntry(gofuse.DirEntry{
 			Name: e.Name,
 			Ino:  e.Ino,
@@ -6297,6 +6304,9 @@ func (fs *Dat9FS) ReadDirPlus(cancel <-chan struct{}, input *gofuse.ReadIn, out 
 
 	for i := int(input.Offset); i < len(dh.Entries); i++ {
 		e := dh.Entries[i]
+		if !validDirEntryName(e.Name) {
+			continue
+		}
 		if _, ok := fs.inodes.GetEntry(e.Ino); !ok {
 			e.Ino = fs.recreateDirEntryInode(dh.Path, e)
 			dh.Entries[i].Ino = e.Ino
@@ -6756,6 +6766,9 @@ func listDirErrToFuseStatus(err error) gofuse.Status {
 func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []DirEntry {
 	entries := make([]DirEntry, 0, len(items))
 	for _, item := range items {
+		if !validDirEntryName(item.Name) {
+			continue
+		}
 		childP := dirEntryChildPath(dirPath, item.Name)
 
 		mtime := item.Mtime
@@ -6773,6 +6786,14 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		entries = append(entries, dirEntryFromCachedInfo(item, ino))
 	}
 	return entries
+}
+
+func validDirEntryName(name string) bool {
+	return name != "" &&
+		name != "." &&
+		name != ".." &&
+		!strings.ContainsRune(name, '/') &&
+		!strings.ContainsRune(name, 0)
 }
 
 func dirEntryChildPath(dirPath, name string) string {
@@ -7829,6 +7850,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, info.Size())
 			fs.inodes.UpdateSize(fh.Ino, info.Size())
 			fs.inodes.UpdateMtime(fh.Ino, info.ModTime())
+			fs.applyGitOverlayMirrorEntry(fh, info.Size())
 		}
 		if fh.WritePolicy == WritePolicyWriteSync {
 			source = "git-local-write-sync"
@@ -9074,7 +9096,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			entry := &CommitEntry{
 				Path:        fh.Path,
 				Inode:       fh.Ino,
-				BaseRev:     fh.BaseRev,
+				BaseRev:     expectedRevision,
 				Size:        size,
 				Kind:        PendingOverwrite,
 				ShadowSpill: true,
@@ -9188,6 +9210,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 			if canUseCache {
 				phase = "writeback-cache-release"
 				mode, hasMode := fs.modeForPendingHandle(fh)
+				expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 				fh.Dirty.ClearDirty()
 				fs.clearDirtySize(fh.Ino, fh.DirtySeq)
 				fh.DirtySeq = 0
@@ -9205,7 +9228,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 					entry := &CommitEntry{
 						Path:    fh.Path,
 						Inode:   fh.Ino,
-						BaseRev: fh.BaseRev,
+						BaseRev: expectedRevision,
 						Size:    fh.Dirty.Size(),
 						Kind:    PendingOverwrite,
 						Mode:    mode,
@@ -9794,14 +9817,23 @@ func (fs *Dat9FS) FlushAll() {
 		cf()
 	}
 
-	// Drain coalesced .git checkpoints before shutdown so replacement
-	// sandboxes can restore the latest lightweight Git state.
-	fs.drainGitStateCheckpoints()
-
 	// Drain git workspace overlay commits queued by interactive writeback.
 	// These include both file payloads and metadata entries such as chmod,
-	// mkdir, symlink, and whiteout.
+	// mkdir, symlink, and whiteout. Do this before sweeping dirty mirrors so
+	// older queued overlay writes cannot overwrite newer mirror content.
 	fs.drainGitOverlayWrites()
+
+	// Git workspace dirty mirrors are the local durable copy-on-write cache.
+	// Sweep them during graceful shutdown so a missed handle flush cannot lose
+	// working-tree content across sandbox replacement.
+	fs.syncGitDirtyMirrors()
+	fs.drainGitOverlayWrites()
+
+	// Drain coalesced .git checkpoints and then checkpoint every loaded git
+	// workspace once more. The final pass covers Git ref/index updates that
+	// arrived through lock-file rename sequences without a pending debounce.
+	fs.drainGitStateCheckpoints()
+	fs.checkpointAllGitWorkspaces()
 
 	// Drain all pending write-back uploads before shutting down.
 	if fs.uploader != nil {

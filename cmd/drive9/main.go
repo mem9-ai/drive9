@@ -51,6 +51,7 @@ var gitHandler = cli.Git
 var packHandler = cli.PackCommand
 var unpackHandler = cli.UnpackCommand
 var profileHandler = cli.Profile
+var umountHandler = cli.UmountCmd
 
 func main() {
 	if logger.CLIEnabled() {
@@ -214,7 +215,7 @@ func dispatch(cmd string, args []string) {
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "umount"))
 		}
-		if err := cli.UmountCmd(args); err != nil {
+		if err := umountHandler(args); err != nil {
 			fatal("umount", err)
 		}
 	case "doctor":

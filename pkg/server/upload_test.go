@@ -1236,6 +1236,22 @@ func TestListUploadsEndpoint(t *testing.T) {
 	}
 }
 
+func TestListUploadsEndpointRootPathReturnsNotFound(t *testing.T) {
+	s, _ := newTestServerWithS3(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/v1/uploads?path=/&status=UPLOADING")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusNotFound)
+	}
+}
+
 func TestOneUploadPerPath(t *testing.T) {
 	s, _ := newTestServerWithS3(t)
 	ts := httptest.NewServer(s)

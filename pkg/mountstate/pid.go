@@ -15,6 +15,7 @@ import (
 type ProcessState struct {
 	PID            int      `json:"pid"`
 	CreationTime   uint64   `json:"creation_time,omitempty"`
+	MountKind      string   `json:"mount_kind,omitempty"`
 	MountPoint     string   `json:"mount_point,omitempty"`
 	RemoteRoot     string   `json:"remote_root,omitempty"`
 	Profile        string   `json:"profile,omitempty"`
@@ -29,6 +30,10 @@ type ProcessState struct {
 const (
 	CredentialKindAPIKey = "api_key"
 	CredentialKindToken  = "token"
+
+	MountKindFUSE   = "fuse"
+	MountKindVault  = "vault"
+	MountKindWebDAV = "webdav"
 )
 
 func PIDFilePath(mountPoint string) string {

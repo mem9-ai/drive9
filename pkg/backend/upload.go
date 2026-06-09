@@ -233,6 +233,10 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
 	}
+	if err := rejectRootFileNodePath(path); err != nil {
+		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+		return nil, err
+	}
 	if b.s3 == nil {
 		err := ErrS3NotConfigured
 		logger.Error(ctx, "backend_initiate_upload_s3_missing", zap.String("path", path), zap.Error(err))
@@ -388,6 +392,10 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
 		logger.Warn(ctx, "backend_initiate_upload_v2_invalid_path", zap.String("path", path), zap.Error(err))
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, err
+	}
+	if err := rejectRootFileNodePath(path); err != nil {
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
 	}
@@ -907,6 +915,10 @@ func (b *Dat9Backend) ConfirmUploadWithTags(ctx context.Context, uploadID string
 func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Upload, parts []s3client.Part, tags map[string]string) error {
 	start := time.Now()
 	uploadID := upload.UploadID
+	if err := rejectRootFileNodePath(upload.TargetPath); err != nil {
+		metrics.RecordOperation("backend", "finalize_upload", "error", time.Since(start))
+		return err
+	}
 	expectedRevision := uploadExpectedRevision(upload)
 
 	completeMultipartStart := time.Now()
@@ -1293,6 +1305,9 @@ func (b *Dat9Backend) ListUploads(ctx context.Context, path string, status datas
 	if err != nil {
 		return nil, err
 	}
+	if path == "/" {
+		return nil, datastore.ErrNotFound
+	}
 	return b.store.ListUploadsByPath(ctx, path, status)
 }
 
@@ -1303,6 +1318,10 @@ func (b *Dat9Backend) PresignGetObject(ctx context.Context, path string) (string
 	if err != nil {
 		metrics.RecordOperation("backend", "presign_get_object", "error", time.Since(start))
 		return "", err
+	}
+	if path == "/" {
+		metrics.RecordOperation("backend", "presign_get_object", "error", time.Since(start))
+		return "", datastore.ErrNotFound
 	}
 	nf, err := b.store.Stat(ctx, path)
 	if err != nil {

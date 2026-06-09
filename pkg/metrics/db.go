@@ -33,8 +33,8 @@ var globalDB = &dbMetrics{
 }
 
 var dbMeter = globalMeterProvider.Meter("db")
-var dbOperationsTotal = dbMeter.Int64Counter("dat9_db_operations_total", "Database operations by role/operation/result")
-var dbOperationDuration = dbMeter.Float64Histogram("dat9_db_operation_duration_seconds", "Database operation duration histogram", dbOperationDurationBounds)
+var dbOperationsTotal = dbMeter.Int64Counter("drive9_db_operations_total", "Database operations by role/operation/result")
+var dbOperationDuration = dbMeter.Float64Histogram("drive9_db_operation_duration_seconds", "Database operation duration histogram", dbOperationDurationBounds)
 
 func RecordDBOperation(role, operation, result string, d time.Duration) {
 	RegisterModule("db")
@@ -92,42 +92,42 @@ func writeDBPrometheus(w http.ResponseWriter) {
 	}
 	roles := SortedKeys(poolTotals)
 
-	_, _ = fmt.Fprintln(w, "# HELP dat9_db_pool_registered Database pools currently registered for metrics by role")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_db_pool_registered gauge")
+	_, _ = fmt.Fprintln(w, "# HELP drive9_db_pool_registered Database pools currently registered for metrics by role")
+	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_pool_registered gauge")
 	for _, role := range roles {
-		_, _ = fmt.Fprintf(w, "dat9_db_pool_registered{role=\"%s\"} %d\n", EscapePromLabel(role), poolTotals[role].registered)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_registered{role=\"%s\"} %d\n", EscapePromLabel(role), poolTotals[role].registered)
 	}
 
-	_, _ = fmt.Fprintln(w, "# HELP dat9_db_pool_connections Aggregated database pool connections by role/state")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_db_pool_connections gauge")
+	_, _ = fmt.Fprintln(w, "# HELP drive9_db_pool_connections Aggregated database pool connections by role/state")
+	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_pool_connections gauge")
 	for _, role := range roles {
 		totals := poolTotals[role]
 		escapedRole := EscapePromLabel(role)
-		_, _ = fmt.Fprintf(w, "dat9_db_pool_connections{role=\"%s\",state=\"open\"} %d\n", escapedRole, totals.openConnections)
-		_, _ = fmt.Fprintf(w, "dat9_db_pool_connections{role=\"%s\",state=\"in_use\"} %d\n", escapedRole, totals.inUseConnections)
-		_, _ = fmt.Fprintf(w, "dat9_db_pool_connections{role=\"%s\",state=\"idle\"} %d\n", escapedRole, totals.idleConnections)
-		_, _ = fmt.Fprintf(w, "dat9_db_pool_connections{role=\"%s\",state=\"max_open\"} %d\n", escapedRole, totals.maxOpenConnections)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{role=\"%s\",state=\"open\"} %d\n", escapedRole, totals.openConnections)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{role=\"%s\",state=\"in_use\"} %d\n", escapedRole, totals.inUseConnections)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{role=\"%s\",state=\"idle\"} %d\n", escapedRole, totals.idleConnections)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_connections{role=\"%s\",state=\"max_open\"} %d\n", escapedRole, totals.maxOpenConnections)
 	}
 
-	_, _ = fmt.Fprintln(w, "# HELP dat9_db_pool_wait_count_total Aggregated database pool wait count by role")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_db_pool_wait_count_total counter")
+	_, _ = fmt.Fprintln(w, "# HELP drive9_db_pool_wait_count_total Aggregated database pool wait count by role")
+	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_pool_wait_count_total counter")
 	for _, role := range roles {
-		_, _ = fmt.Fprintf(w, "dat9_db_pool_wait_count_total{role=\"%s\"} %d\n", EscapePromLabel(role), poolTotals[role].waitCount)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_wait_count_total{role=\"%s\"} %d\n", EscapePromLabel(role), poolTotals[role].waitCount)
 	}
 
-	_, _ = fmt.Fprintln(w, "# HELP dat9_db_pool_wait_duration_seconds_total Aggregated database pool wait duration by role")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_db_pool_wait_duration_seconds_total counter")
+	_, _ = fmt.Fprintln(w, "# HELP drive9_db_pool_wait_duration_seconds_total Aggregated database pool wait duration by role")
+	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_pool_wait_duration_seconds_total counter")
 	for _, role := range roles {
-		_, _ = fmt.Fprintf(w, "dat9_db_pool_wait_duration_seconds_total{role=\"%s\"} %.6f\n", EscapePromLabel(role), poolTotals[role].waitDuration)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_wait_duration_seconds_total{role=\"%s\"} %.6f\n", EscapePromLabel(role), poolTotals[role].waitDuration)
 	}
 
-	_, _ = fmt.Fprintln(w, "# HELP dat9_db_pool_closes_total Aggregated database pool closes by role/reason")
-	_, _ = fmt.Fprintln(w, "# TYPE dat9_db_pool_closes_total counter")
+	_, _ = fmt.Fprintln(w, "# HELP drive9_db_pool_closes_total Aggregated database pool closes by role/reason")
+	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_pool_closes_total counter")
 	for _, role := range roles {
 		totals := poolTotals[role]
 		escapedRole := EscapePromLabel(role)
-		_, _ = fmt.Fprintf(w, "dat9_db_pool_closes_total{role=\"%s\",reason=\"max_idle\"} %d\n", escapedRole, totals.maxIdleClosed)
-		_, _ = fmt.Fprintf(w, "dat9_db_pool_closes_total{role=\"%s\",reason=\"max_idle_time\"} %d\n", escapedRole, totals.maxIdleTimeClosed)
-		_, _ = fmt.Fprintf(w, "dat9_db_pool_closes_total{role=\"%s\",reason=\"max_lifetime\"} %d\n", escapedRole, totals.maxLifetimeClosed)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_closes_total{role=\"%s\",reason=\"max_idle\"} %d\n", escapedRole, totals.maxIdleClosed)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_closes_total{role=\"%s\",reason=\"max_idle_time\"} %d\n", escapedRole, totals.maxIdleTimeClosed)
+		_, _ = fmt.Fprintf(w, "drive9_db_pool_closes_total{role=\"%s\",reason=\"max_lifetime\"} %d\n", escapedRole, totals.maxLifetimeClosed)
 	}
 }

@@ -396,6 +396,52 @@ func TestValidateTiDBAutoEmbeddingDiffsAllowsWritableDescriptionEmbeddingCompat(
 	}
 }
 
+func TestValidateTiDBAutoEmbeddingDiffsAcceptsMixedCaseModelProfile(t *testing.T) {
+	cfg, err := tidbAutoEmbeddingRenderConfigFor(TiDBAutoEmbeddingConfig{
+		Model: "huggingface/BAAI/bge-m3",
+	})
+	if err != nil {
+		t.Fatalf("render profile config: %v", err)
+	}
+	meta := testSemanticTableMeta(TiDBEmbeddingModeAuto)
+	meta.columns["embedding"] = tidbColumnMeta{
+		columnType:           "vector(1024)",
+		extra:                "STORED GENERATED",
+		generationExpression: "embed_text(_utf8mb4'huggingface/baai/bge-m3', `content_text`, _utf8mb4'{}')",
+	}
+	meta.columns["description_embedding"] = tidbColumnMeta{
+		columnType:           "vector(1024)",
+		extra:                "STORED GENERATED",
+		generationExpression: "embed_text(_utf8mb4'huggingface/baai/bge-m3', `description`, _utf8mb4'{}')",
+	}
+
+	if diffs := validateTiDBAutoEmbeddingDiffsWithConfig(meta, cfg); len(diffs) != 0 {
+		t.Fatalf("expected mixed-case model profile to validate, got %#v", diffs)
+	}
+}
+
+func TestTiDBSQLStringLiteralEscapesBackslashesAndQuotes(t *testing.T) {
+	got := tidbSQLStringLiteral("model\\with'quote\nline\rzero\x00tab\t")
+	want := "'model\\\\with''quote\\nline\\rzero\\0tab\\t'"
+	if got != want {
+		t.Fatalf("tidbSQLStringLiteral()=%q, want %q", got, want)
+	}
+}
+
+func TestTiDBAutoEmbeddingRenderConfigForProfileRejectsMismatchedOptionsJSON(t *testing.T) {
+	_, err := tidbAutoEmbeddingRenderConfigForProfile(TiDBAutoEmbeddingProfile{
+		Model:       "openai/text-embedding-3-small",
+		Dimensions:  1536,
+		OptionsJSON: `{"dimensions":512}`,
+	})
+	if err == nil {
+		t.Fatal("expected mismatched options_json to fail")
+	}
+	if !strings.Contains(err.Error(), "options_json") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestDiffTiDBTableMetaReportsMissingRequiredIndex(t *testing.T) {
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
 	meta := testUploadsTableMeta(true)
@@ -985,6 +1031,123 @@ func TestParseAlterTableAddIndexStatementAcceptsUniqueKey(t *testing.T) {
 	}
 	if createSQL != "ALTER TABLE uploads ADD UNIQUE KEY uk_uploads_target (target_path)" {
 		t.Fatalf("createSQL=%q", createSQL)
+	}
+}
+
+func TestStripColumnarReplicaOnDemand(t *testing.T) {
+	tests := []struct {
+		name string
+		stmt string
+		want string
+	}{
+		{
+			name: "fulltext index with add_columnar_replica_on_demand",
+			stmt: "ALTER TABLE semantic ADD FULLTEXT INDEX idx_semantic_fts_description(description) WITH PARSER MULTILINGUAL ADD_COLUMNAR_REPLICA_ON_DEMAND",
+			want: "ALTER TABLE semantic ADD FULLTEXT INDEX idx_semantic_fts_description(description) WITH PARSER MULTILINGUAL",
+		},
+		{
+			name: "vector index with add_columnar_replica_on_demand",
+			stmt: "ALTER TABLE semantic ADD VECTOR INDEX idx_semantic_cosine((VEC_COSINE_DISTANCE(embedding))) ADD_COLUMNAR_REPLICA_ON_DEMAND",
+			want: "ALTER TABLE semantic ADD VECTOR INDEX idx_semantic_cosine((VEC_COSINE_DISTANCE(embedding)))",
+		},
+		{
+			name: "no add_columnar_replica_on_demand",
+			stmt: "ALTER TABLE uploads ADD UNIQUE KEY uk_uploads_target (target_path)",
+			want: "ALTER TABLE uploads ADD UNIQUE KEY uk_uploads_target (target_path)",
+		},
+		{
+			name: "regular add index without columnar",
+			stmt: "ALTER TABLE contents ADD INDEX idx_contents_ref (storage_ref_hash)",
+			want: "ALTER TABLE contents ADD INDEX idx_contents_ref (storage_ref_hash)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripColumnarReplicaOnDemand(tt.stmt)
+			if got != tt.want {
+				t.Fatalf("stripColumnarReplicaOnDemand()=%q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseAlterTableAddFulltextIndexStripsColumnarReplicaOnDemand(t *testing.T) {
+	stmt := `ALTER TABLE semantic
+		ADD FULLTEXT INDEX idx_semantic_fts_description(description)
+		WITH PARSER MULTILINGUAL
+		ADD_COLUMNAR_REPLICA_ON_DEMAND`
+
+	tableName, indexName, createSQL, ok := parseAlterTableAddIndexStatement(stmt)
+	if !ok {
+		t.Fatal("expected ALTER TABLE with ADD FULLTEXT INDEX to parse")
+	}
+	if tableName != "semantic" {
+		t.Fatalf("tableName=%q, want semantic", tableName)
+	}
+	if indexName != "idx_semantic_fts_description" {
+		t.Fatalf("indexName=%q, want idx_semantic_fts_description", indexName)
+	}
+	if strings.Contains(strings.ToLower(createSQL), "add_columnar_replica_on_demand") {
+		t.Fatalf("createSQL must not contain ADD_COLUMNAR_REPLICA_ON_DEMAND: %q", createSQL)
+	}
+	if !strings.Contains(createSQL, "ADD FULLTEXT INDEX") {
+		t.Fatalf("createSQL must contain ADD FULLTEXT INDEX: %q", createSQL)
+	}
+}
+
+func TestParseAlterTableAddVectorIndexStripsColumnarReplicaOnDemand(t *testing.T) {
+	stmt := `ALTER TABLE semantic
+		ADD VECTOR INDEX idx_semantic_cosine((VEC_COSINE_DISTANCE(embedding)))
+		ADD_COLUMNAR_REPLICA_ON_DEMAND`
+
+	tableName, indexName, createSQL, ok := parseAlterTableAddIndexStatement(stmt)
+	if !ok {
+		t.Fatal("expected ALTER TABLE with ADD VECTOR INDEX to parse")
+	}
+	if tableName != "semantic" {
+		t.Fatalf("tableName=%q, want semantic", tableName)
+	}
+	if indexName != "idx_semantic_cosine" {
+		t.Fatalf("indexName=%q, want idx_semantic_cosine", indexName)
+	}
+	if strings.Contains(strings.ToLower(createSQL), "add_columnar_replica_on_demand") {
+		t.Fatalf("createSQL must not contain ADD_COLUMNAR_REPLICA_ON_DEMAND: %q", createSQL)
+	}
+	if !strings.Contains(createSQL, "ADD VECTOR INDEX") {
+		t.Fatalf("createSQL must contain ADD VECTOR INDEX: %q", createSQL)
+	}
+}
+
+func TestParseObservedTiDBIndexesRecognizesFulltextAndVector(t *testing.T) {
+	createStmt := `CREATE TABLE semantic (
+		inode_id VARCHAR(64) PRIMARY KEY,
+		content_text LONGTEXT,
+		description LONGTEXT,
+		embedding VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT('m', content_text, '{}')) STORED,
+		description_embedding VECTOR(1024) GENERATED ALWAYS AS (EMBED_TEXT('m', description, '{}')) STORED,
+		FULLTEXT INDEX idx_semantic_fts_content (content_text),
+		FULLTEXT KEY idx_semantic_fts_description (description),
+		VECTOR INDEX idx_semantic_cosine ((VEC_COSINE_DISTANCE(embedding))),
+		VECTOR INDEX idx_semantic_desc_cosine ((VEC_COSINE_DISTANCE(description_embedding)))
+	)`
+	observed, ok := parseObservedTiDBIndexes(createStmt)
+	if !ok {
+		t.Fatal("expected observed indexes parse to succeed")
+	}
+	if !hasObservedTiDBIndex(observed, "idx_semantic_fts_content") {
+		t.Fatalf("expected idx_semantic_fts_content FULLTEXT INDEX to be observed, got %#v", observed)
+	}
+	if !hasObservedTiDBIndex(observed, "idx_semantic_fts_description") {
+		t.Fatalf("expected idx_semantic_fts_description FULLTEXT KEY to be observed, got %#v", observed)
+	}
+	if !hasObservedTiDBIndex(observed, "idx_semantic_cosine") {
+		t.Fatalf("expected idx_semantic_cosine VECTOR INDEX to be observed, got %#v", observed)
+	}
+	if !hasObservedTiDBIndex(observed, "idx_semantic_desc_cosine") {
+		t.Fatalf("expected idx_semantic_desc_cosine VECTOR INDEX to be observed, got %#v", observed)
+	}
+	if !hasObservedTiDBIndex(observed, "primary") {
+		t.Fatal("expected primary key to be observed from inline PRIMARY KEY column")
 	}
 }
 
