@@ -1354,6 +1354,10 @@ func TestChmod(t *testing.T) {
 	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
+	var beforeMtime time.Time
+	if err := s.DB().QueryRowContext(ctx, `SELECT mtime FROM inodes WHERE inode_id = ?`, "f1").Scan(&beforeMtime); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := s.Chmod(ctx, "/a.txt", 0o600); err != nil {
 		t.Fatal(err)
@@ -1368,6 +1372,13 @@ func TestChmod(t *testing.T) {
 	}
 	if got.Revision != 2 {
 		t.Errorf("revision=%d, want 2", got.Revision)
+	}
+	var afterMtime time.Time
+	if err := s.DB().QueryRowContext(ctx, `SELECT mtime FROM inodes WHERE inode_id = ?`, "f1").Scan(&afterMtime); err != nil {
+		t.Fatal(err)
+	}
+	if !afterMtime.After(beforeMtime) {
+		t.Errorf("mtime=%s, want after %s", afterMtime, beforeMtime)
 	}
 }
 

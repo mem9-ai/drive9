@@ -9,7 +9,7 @@ import (
 type ChangeEvent struct {
 	Seq   uint64 `json:"seq"`             // monotonic per-bus sequence number
 	Path  string `json:"path"`            // affected path
-	Op    string `json:"op"`              // "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
+	Op    string `json:"op"`              // filesystem mutation op, for example "write", "delete", "rename", "mkdir", "copy", "upload_complete", or "chmod"
 	Actor string `json:"actor,omitempty"` // X-Dat9-Actor header value (per-mount ID)
 	Ts    int64  `json:"ts"`              // unix milliseconds
 }
@@ -22,6 +22,8 @@ const (
 // EventBus is a per-tenant in-memory event hub backed by a fixed-size ring buffer.
 // Single-instance only — does not survive restarts or replicate across processes.
 type EventBus struct {
+	durableMu sync.Mutex
+
 	mu        sync.Mutex
 	seq       uint64 // monotonic counter, protected by mu
 	ring      [eventBusRingSize]ChangeEvent
@@ -61,6 +63,9 @@ func (eb *EventBus) PublishEvent(ev ChangeEvent) {
 	if ev.Seq == 0 {
 		eb.seq++
 		ev.Seq = eb.seq
+	} else if ev.Seq <= eb.seq {
+		eb.mu.Unlock()
+		return
 	} else if ev.Seq > eb.seq {
 		eb.seq = ev.Seq
 	}

@@ -59,6 +59,23 @@ func TestEventBusReplay(t *testing.T) {
 	}
 }
 
+func TestEventBusPublishEventIgnoresOlderSeq(t *testing.T) {
+	bus := NewEventBus()
+	bus.PublishEvent(ChangeEvent{Seq: 2, Path: "/b.txt", Op: "write", Ts: 1})
+	bus.PublishEvent(ChangeEvent{Seq: 1, Path: "/a.txt", Op: "write", Ts: 1})
+
+	if got := bus.Seq(); got != 2 {
+		t.Fatalf("seq=%d, want 2", got)
+	}
+	events, _, ok := bus.EventsSince(1)
+	if !ok {
+		t.Fatal("EventsSince(1) returned not ok")
+	}
+	if len(events) != 1 || events[0].Seq != 2 || events[0].Path != "/b.txt" {
+		t.Fatalf("events=%+v, want only seq 2", events)
+	}
+}
+
 func TestEventBusCaughtUp(t *testing.T) {
 	bus := NewEventBus()
 	bus.Publish("/a.txt", "write", "")

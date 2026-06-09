@@ -3,7 +3,6 @@ package datastore
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"time"
 )
 
@@ -113,9 +112,5 @@ func (s *Store) PruneFSEventsBefore(ctx context.Context, keepFromSeq uint64) (de
 	if err != nil {
 		return 0, err
 	}
-	deleted, err = res.RowsAffected()
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
-	}
-	return deleted, err
+	return res.RowsAffected()
 }
