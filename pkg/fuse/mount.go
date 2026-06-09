@@ -643,6 +643,27 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 				fs.markLayerDir(localPath, entry.Mode)
 			}
 			continue
+		case "chmod":
+			if pending != nil {
+				if err := pending.UpdateMode(localPath, entry.Mode); err != nil {
+					return fmt.Errorf("restore fs layer chmod pending %s: %w", localPath, err)
+				}
+			}
+			if fs != nil {
+				switch entry.Kind {
+				case "dir":
+					fs.markLayerDir(localPath, entry.Mode)
+				case "symlink":
+					if target, existingMode, ok := fs.layerSymlink(localPath); ok {
+						nextMode := (existingMode &^ uint32(0o777)) | (entry.Mode & 0o777)
+						if nextMode&uint32(syscall.S_IFMT) == 0 {
+							nextMode |= uint32(syscall.S_IFLNK)
+						}
+						fs.markLayerSymlink(localPath, target, nextMode)
+					}
+				}
+			}
+			continue
 		case "rename":
 			if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, hasCheckpoint, maxSeq); err != nil {
 				return err

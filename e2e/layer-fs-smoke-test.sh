@@ -15,10 +15,22 @@ CLI_RELEASE_VERSION="${CLI_RELEASE_VERSION:-}"
 CLI_MAX_RETRIES="${CLI_MAX_RETRIES:-8}"
 CLI_RETRY_SLEEP_S="${CLI_RETRY_SLEEP_S:-2}"
 CLI_HOME="${DRIVE9_E2E_CLI_HOME:-$(mktemp -d)}"
+RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-0}"
+LAYER_FUSE_STRICT_PREREQS="${LAYER_FUSE_STRICT_PREREQS:-$RUN_LAYER_FUSE_SMOKE}"
+FUSE_MOUNT_ROOT="${FUSE_MOUNT_ROOT:-/tmp}"
+FUSE_UMOUNT_TIMEOUT="${FUSE_UMOUNT_TIMEOUT:-60s}"
+MOUNT_READY_TIMEOUT_S="${MOUNT_READY_TIMEOUT_S:-20}"
+MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
+LAYER_DIFF_TIMEOUT_S="${LAYER_DIFF_TIMEOUT_S:-20}"
+LAYER_DIFF_INTERVAL_S="${LAYER_DIFF_INTERVAL_S:-1}"
+LAYER_FUSE_LOG_AUDIT_PATTERN="${LAYER_FUSE_LOG_AUDIT_PATTERN:-panic|fatal error|Resource temporarily unavailable}"
 
 PASS=0
 FAIL=0
 TOTAL=0
+MOUNT_POINT=""
+MOUNT_PID=""
+MOUNT_LOG=""
 
 check_eq() {
   local desc="$1" got="$2" want="$3"
@@ -56,6 +68,19 @@ check_cmd_fail() {
     echo "PASS $desc"
     PASS=$((PASS + 1))
   fi
+}
+
+skip_layer_fuse() {
+  echo "SKIP layer FUSE restore smoke: $*"
+}
+
+fail_layer_fuse_prereq() {
+  if [ "$LAYER_FUSE_STRICT_PREREQS" = "1" ]; then
+    echo "FAIL layer FUSE restore smoke: $*" >&2
+    exit 1
+  fi
+  skip_layer_fuse "$@"
+  return 0
 }
 
 http_code() { printf '%s' "$1" | awk -F'__HTTP__' 'NF>1{print $2}' | tr -d '\n'; }
@@ -119,6 +144,86 @@ curl_body_code() {
   echo
   echo "__HTTP__${code}"
   rm -f "$body_file"
+}
+
+is_mounted_path() {
+  local mount_point="$1"
+  local physical_mount_point
+  physical_mount_point="$(cd "$(dirname "$mount_point")" 2>/dev/null && pwd -P)/$(basename "$mount_point")"
+  if command -v mountpoint >/dev/null 2>&1; then
+    mountpoint -q "$mount_point"
+    return
+  fi
+  mount | awk -v mp="$mount_point" -v pmp="$physical_mount_point" '{for(i=1;i<=NF;i++) if($i=="on" && ($(i+1)==mp || $(i+1)==pmp)) found=1} END{exit !found}'
+}
+
+force_unmount() {
+  local mount_point="$1"
+  case "$(uname -s)" in
+    Darwin)
+      umount "$mount_point" >/dev/null 2>&1 || diskutil unmount force "$mount_point" >/dev/null 2>&1 || true
+      ;;
+    Linux)
+      fusermount3 -uz "$mount_point" >/dev/null 2>&1 || fusermount -uz "$mount_point" >/dev/null 2>&1 || umount -l "$mount_point" >/dev/null 2>&1 || true
+      ;;
+  esac
+}
+
+wait_mount_state() {
+  local expect="$1"
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  while :; do
+    if [ "$expect" = "mounted" ] && is_mounted_path "$MOUNT_POINT"; then
+      return 0
+    fi
+    if [ "$expect" = "unmounted" ] && ! is_mounted_path "$MOUNT_POINT"; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
+}
+
+wait_mount_log_ready() {
+  local log_file="$1"
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  while :; do
+    if [ -f "$log_file" ] && grep -q "drive9: mounted on " "$log_file"; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
+}
+
+dump_mount_log() {
+  if [ -n "${MOUNT_LOG:-}" ] && [ -f "$MOUNT_LOG" ]; then
+    echo "=== drive9 layer mount log: $MOUNT_LOG ==="
+    cat "$MOUNT_LOG"
+  fi
+}
+
+stop_mount() {
+  set +e
+  if [ -n "${MOUNT_POINT:-}" ] && is_mounted_path "$MOUNT_POINT"; then
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT" >/dev/null 2>&1 || true
+    wait_mount_state unmounted >/dev/null 2>&1 || true
+    if is_mounted_path "$MOUNT_POINT"; then
+      force_unmount "$MOUNT_POINT"
+      wait_mount_state unmounted >/dev/null 2>&1 || true
+    fi
+  fi
+  if [ -n "${MOUNT_PID:-}" ] && kill -0 "$MOUNT_PID" >/dev/null 2>&1; then
+    kill "$MOUNT_PID" >/dev/null 2>&1 || true
+    wait "$MOUNT_PID" >/dev/null 2>&1 || true
+  fi
+  MOUNT_PID=""
+  MOUNT_POINT=""
+  set -e
 }
 
 provision_key() {
@@ -224,18 +329,131 @@ drive9_retry() {
   done
 }
 
+start_layer_mount() {
+  local layer_ref="$1"
+  local checkpoint_ref="$2"
+  local remote_root="$3"
+  local mount_point="$4"
+  local local_root="$5"
+  local mount_log="$6"
+  MOUNT_POINT="$mount_point"
+  MOUNT_LOG="$mount_log"
+  mkdir -p "$MOUNT_POINT" "$local_root"
+  {
+    echo "=== drive9 layer mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
+    echo "layer_ref=$layer_ref"
+    echo "checkpoint_ref=$checkpoint_ref"
+    echo "remote_root=$remote_root"
+    echo "mount_point=$MOUNT_POINT"
+    echo "local_root=$local_root"
+  } >>"$MOUNT_LOG"
+
+  local args=(mount --foreground --mode=fuse --profile=coding-agent --local-root "$local_root" --durability=write-sync --flush-debounce=0 --layer "$layer_ref")
+  if [ -n "$checkpoint_ref" ]; then
+    args+=(--checkpoint "$checkpoint_ref")
+  fi
+  args+=(":$remote_root" "$MOUNT_POINT")
+  drive9 "${args[@]}" >>"$MOUNT_LOG" 2>&1 &
+  MOUNT_PID="$!"
+  wait_mount_state mounted
+  wait_mount_log_ready "$MOUNT_LOG"
+}
+
+unmount_layer_mount() {
+  if [ -z "${MOUNT_POINT:-}" ]; then
+    return 0
+  fi
+  if is_mounted_path "$MOUNT_POINT"; then
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$MOUNT_POINT"
+  fi
+  wait_mount_state unmounted
+  if [ -n "${MOUNT_PID:-}" ]; then
+    set +e
+    wait "$MOUNT_PID" >/dev/null 2>&1
+    MOUNT_PID=""
+    set -e
+  fi
+}
+
+audit_mount_log() {
+  local log_file="$1"
+  if [ ! -f "$log_file" ]; then
+    echo "mount log missing: $log_file" >&2
+    return 1
+  fi
+  if grep -Eina "$LAYER_FUSE_LOG_AUDIT_PATTERN" "$log_file"; then
+    echo "mount log contains layer FUSE failure pattern" >&2
+    return 1
+  fi
+  return 0
+}
+
+wait_layer_diff_count() {
+  local layer_ref="$1"
+  local want="$2"
+  local deadline=$(( $(date +%s) + LAYER_DIFF_TIMEOUT_S ))
+  local out rc got
+  while :; do
+    set +e
+    out=$(drive9 fs layer diff --json "$layer_ref" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      got=$(printf '%s' "$out" | jq -r '.entries | length')
+      if [ "$got" = "$want" ]; then
+        printf '%s' "$got"
+        return 0
+      fi
+    elif [[ "$out" != *"Too Many Requests"* && "$out" != *"HTTP 429"* && "$out" != *"not found"* ]]; then
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      printf 'wait_layer_diff_count: timeout layer=%s want=%s got=%s\n' "$layer_ref" "$want" "${got:-<none>}" >&2
+      return 1
+    fi
+    sleep "$LAYER_DIFF_INTERVAL_S"
+  done
+}
+
 put_layer_entry() {
   local layer_ref="$1"
   local path="$2"
   local op="$3"
   local kind="$4"
   local text="${5:-}"
+  local mode="${6:-420}"
   local content_b64=""
   local body resp code ref_escaped
 
-  if [ "$op" = "upsert" ] || [ "$op" = "symlink" ]; then
+  if [ "$op" = "upsert" ] || [ "$op" = "symlink" ] || [ "$op" = "rename" ]; then
     content_b64=$(printf '%s' "$text" | base64 | tr -d '\n')
   fi
+  body=$(jq -n \
+    --arg path "$path" \
+    --arg op "$op" \
+    --arg kind "$kind" \
+    --argjson mode "$mode" \
+    --arg content "$content_b64" \
+    --arg text "$text" \
+    '{path:$path, op:$op, kind:$kind, mode:$mode}
+      + (if $content != "" then {content:$content, content_text:$text} else {} end)')
+  ref_escaped=$(url_escape "$layer_ref")
+  resp=$(curl_body_code POST "$BASE/v1/fs-layers/$ref_escaped/entries" "$API_KEY" "$body")
+  code=$(http_code "$resp")
+  check_eq "upsert layer entry $path via $layer_ref" "$code" "200"
+}
+
+put_layer_entry_expect_code() {
+  local desc="$1"
+  local want_code="$2"
+  local layer_ref="$3"
+  local path="$4"
+  local op="$5"
+  local kind="$6"
+  local text="${7:-}"
+  local ref_escaped content_b64 body resp
+  content_b64=$(printf '%s' "$text" | base64 | tr -d '\n')
   body=$(jq -n \
     --arg path "$path" \
     --arg op "$op" \
@@ -246,12 +464,39 @@ put_layer_entry() {
       + (if $content != "" then {content:$content, content_text:$text} else {} end)')
   ref_escaped=$(url_escape "$layer_ref")
   resp=$(curl_body_code POST "$BASE/v1/fs-layers/$ref_escaped/entries" "$API_KEY" "$body")
-  code=$(http_code "$resp")
-  check_eq "upsert layer entry $path via $layer_ref" "$code" "200"
+  check_eq "$desc" "$(http_code "$resp")" "$want_code"
 }
+
+require_layer_fuse_prereqs() {
+  if [ "$RUN_LAYER_FUSE_SMOKE" != "1" ]; then
+    skip_layer_fuse "set RUN_LAYER_FUSE_SMOKE=1 to run real FUSE layer restore coverage"
+    return 1
+  fi
+  case "$(uname -s)" in
+    Linux|Darwin) ;;
+    *)
+      fail_layer_fuse_prereq "unsupported OS: $(uname -s)"
+      return 1
+      ;;
+  esac
+  if [ "$(uname -s)" = "Linux" ]; then
+    if ! command -v fusermount >/dev/null 2>&1 && ! command -v fusermount3 >/dev/null 2>&1; then
+      fail_layer_fuse_prereq "fusermount/fusermount3 is required"
+      return 1
+    fi
+    if [ ! -e /dev/fuse ]; then
+      fail_layer_fuse_prereq "/dev/fuse not available"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+trap stop_mount EXIT
 
 echo "=== drive9 layer filesystem smoke test ==="
 echo "BASE=$BASE"
+echo "RUN_LAYER_FUSE_SMOKE=$RUN_LAYER_FUSE_SMOKE"
 
 check_cmd "jq is available" bash -c 'command -v jq >/dev/null'
 check_cmd "curl is available" bash -c 'command -v curl >/dev/null'
@@ -274,16 +519,39 @@ root="/layer-smoke-${ts}"
 base_file="${root}/base.txt"
 new_file="${root}/new.txt"
 extra_file="${root}/extra.txt"
+api_dir="${root}/api-dir"
+api_dir_file="${api_dir}/nested.txt"
+delete_file="${root}/delete-me.txt"
+delete_dir="${root}/delete-dir"
+delete_dir_file="${delete_dir}/gone.txt"
+rename_src="${root}/rename-src.txt"
+rename_dst="${root}/rename-dst.txt"
+symlink_path="${root}/api-link"
+conflict_file="${root}/conflict.txt"
 rollback_file="${root}/rollback-only.txt"
 base_local="/tmp/drive9-layer-base-${ts}.txt"
+delete_local="/tmp/drive9-layer-delete-${ts}.txt"
+rename_local="/tmp/drive9-layer-rename-${ts}.txt"
+conflict_local="/tmp/drive9-layer-conflict-${ts}.txt"
+conflict_mutated_local="/tmp/drive9-layer-conflict-mutated-${ts}.txt"
 layer_name="layer-smoke-${ts}"
 rollback_name="layer-smoke-rollback-${ts}"
+conflict_name="layer-smoke-conflict-${ts}"
 unique_tag="unique_${ts}"
 ckpt_id="ckpt_smoke_${ts}"
 
 printf 'base before layer %s\n' "$ts" >"$base_local"
+printf 'delete file before layer %s\n' "$ts" >"$delete_local"
+printf 'rename source before layer %s\n' "$ts" >"$rename_local"
+printf 'conflict base before layer %s\n' "$ts" >"$conflict_local"
+printf 'conflict base changed outside layer %s\n' "$ts" >"$conflict_mutated_local"
 drive9_retry fs mkdir "$root" >/dev/null
+drive9_retry fs mkdir "$delete_dir" >/dev/null
 drive9_retry fs cp "$base_local" ":$base_file" >/dev/null
+drive9_retry fs cp "$delete_local" ":$delete_file" >/dev/null
+drive9_retry fs cp "$delete_local" ":$delete_dir_file" >/dev/null
+drive9_retry fs cp "$rename_local" ":$rename_src" >/dev/null
+drive9_retry fs cp "$conflict_local" ":$conflict_file" >/dev/null
 check_eq "base file visible before layer" "$(drive9_retry fs cat "$base_file")" "$(cat "$base_local")"
 
 layer_json=$(drive9_retry fs layer create \
@@ -312,6 +580,7 @@ diff_json=$(drive9_retry fs layer diff --json "tag:run=$ts")
 diff_count=$(printf '%s' "$diff_json" | jq '.entries | length')
 check_eq "layer diff shows two entries" "$diff_count" "2"
 check_eq "base entry content_text present in diff" "$(printf '%s' "$diff_json" | jq -r --arg p "$base_file" '.entries[] | select(.path==$p) | .content_text')" "base edited in layer ${ts}"
+check_eq "layer list resolves named layer" "$(drive9_retry fs layer list --json | jq -r --arg id "$layer_id" '[.layers[] | select(.layer_id==$id)] | length')" "1"
 
 checkpoint_json=$(drive9_retry fs layer checkpoint --id "$ckpt_id" --label before-extra --json "$layer_name")
 check_eq "checkpoint uses requested id" "$(printf '%s' "$checkpoint_json" | jq -r '.checkpoint_id')" "$ckpt_id"
@@ -323,8 +592,18 @@ check_eq "GET checkpoint returns 200" "$(http_code "$checkpoint_resp")" "200"
 check_eq "GET checkpoint resolves layer id" "$(json_body "$checkpoint_resp" | jq -r '.layer_id')" "$layer_id"
 
 put_layer_entry "$layer_name" "$extra_file" "upsert" "file" "extra after checkpoint ${ts}"
+put_layer_entry "$layer_name" "${api_dir}/" "mkdir" "dir" "" 493
+put_layer_entry "$layer_name" "$api_dir_file" "upsert" "file" "nested after checkpoint ${ts}"
+put_layer_entry "$layer_name" "$delete_file" "whiteout" "file"
+put_layer_entry "$layer_name" "${delete_dir}/" "whiteout" "dir"
+put_layer_entry "$layer_name" "$symlink_path" "symlink" "symlink" "base.txt" 41471
+put_layer_entry "$layer_name" "$rename_src" "rename" "file" "$rename_dst"
+put_layer_entry_expect_code "entry outside base root is rejected" "400" "$layer_name" "/outside-layer-${ts}/owned.txt" "upsert" "file" "owned"
 diff_after_extra=$(drive9_retry fs layer diff --json "$layer_id")
-check_eq "layer diff shows three entries after checkpoint" "$(printf '%s' "$diff_after_extra" | jq '.entries | length')" "3"
+check_eq "layer diff shows full API entry set after checkpoint" "$(printf '%s' "$diff_after_extra" | jq '.entries | length')" "9"
+diff_at_checkpoint=$(curl_body_code GET "$BASE/v1/fs-layers/$(url_escape "$layer_id")/diff?max_seq=2" "$API_KEY")
+check_eq "layer diff max_seq returns 200" "$(http_code "$diff_at_checkpoint")" "200"
+check_eq "layer diff max_seq excludes post-checkpoint entries" "$(json_body "$diff_at_checkpoint" | jq '.entries | length')" "2"
 
 rollback_json=$(drive9_retry fs layer create \
   --name "$rollback_name" \
@@ -339,9 +618,25 @@ rollback_status=$(drive9_retry fs layer status --json "$rollback_name")
 check_eq "rollback layer state is abandoned" "$(printf '%s' "$rollback_status" | jq -r '.state')" "abandoned"
 check_cmd_fail "abandoned layer file is not visible in base" drive9 fs cat "$rollback_file"
 
+conflict_json=$(drive9_retry fs layer create \
+  --name "$conflict_name" \
+  --tag "conflict_run=$ts" \
+  --json \
+  ":$root")
+conflict_id=$(printf '%s' "$conflict_json" | jq -r '.layer_id // empty')
+check_cmd "conflict layer create returns id" test -n "$conflict_id"
+put_layer_entry "$conflict_name" "$conflict_file" "upsert" "file" "conflict layer edit ${ts}"
+drive9_retry fs cp "$conflict_mutated_local" ":$conflict_file" >/dev/null
+conflict_commit_resp=$(curl_body_code POST "$BASE/v1/fs-layers/$(url_escape "tag:conflict_run=$ts")/commit" "$API_KEY" "{}")
+check_eq "conflicting commit returns 409" "$(http_code "$conflict_commit_resp")" "409"
+check_eq "conflicting commit reports base revision changed" "$(json_body "$conflict_commit_resp" | jq -r '.conflicts[0].reason')" "base revision changed"
+conflict_status=$(drive9_retry fs layer status --json "$conflict_id")
+check_eq "conflicting layer state is conflicted" "$(printf '%s' "$conflict_status" | jq -r '.state')" "conflicted"
+check_eq "conflicting commit preserves mutated base" "$(drive9_retry fs cat "$conflict_file")" "$(cat "$conflict_mutated_local")"
+
 commit_out=$(drive9_retry fs layer commit "tag:$unique_tag")
 case "$commit_out" in
-  committed\ layer="$layer_id"\ applied=3) commit_status="ok" ;;
+  committed\ layer="$layer_id"\ applied=9) commit_status="ok" ;;
   *) commit_status="$commit_out" ;;
 esac
 check_eq "commit by tag key succeeds" "$commit_status" "ok"
@@ -351,6 +646,95 @@ check_eq "committed layer state is committed" "$(printf '%s' "$committed_status"
 check_eq "base file updated after commit" "$(drive9_retry fs cat "$base_file")" "base edited in layer ${ts}"
 check_eq "new file visible after commit" "$(drive9_retry fs cat "$new_file")" "new file from layer ${ts}"
 check_eq "extra file visible after commit" "$(drive9_retry fs cat "$extra_file")" "extra after checkpoint ${ts}"
+check_eq "nested mkdir/upsert visible after commit" "$(drive9_retry fs cat "$api_dir_file")" "nested after checkpoint ${ts}"
+check_cmd_fail "whiteout file removed after commit" drive9 fs cat "$delete_file"
+check_cmd_fail "whiteout directory child removed after commit" drive9 fs cat "$delete_dir_file"
+check_cmd_fail "rename source removed after commit" drive9 fs cat "$rename_src"
+check_eq "rename target visible after commit" "$(drive9_retry fs cat "$rename_dst")" "$(cat "$rename_local")"
+
+if require_layer_fuse_prereqs; then
+  echo "[fuse] layer mount restore coverage"
+  fuse_root="/layer-fuse-${ts}"
+  fuse_layer_name="layer-fuse-${ts}"
+  fuse_ckpt_id="ckpt_fuse_${ts}"
+  fuse_base_local="/tmp/drive9-layer-fuse-base-${ts}.txt"
+  fuse_delete_local="/tmp/drive9-layer-fuse-delete-${ts}.txt"
+  fuse_move_local="/tmp/drive9-layer-fuse-move-${ts}.txt"
+  printf 'fuse base before layer %s\n' "$ts" >"$fuse_base_local"
+  printf 'fuse delete before layer %s\n' "$ts" >"$fuse_delete_local"
+  printf 'fuse move before layer %s\n' "$ts" >"$fuse_move_local"
+
+  drive9_retry fs mkdir "$fuse_root" >/dev/null
+  drive9_retry fs cp "$fuse_base_local" ":${fuse_root}/base.txt" >/dev/null
+  drive9_retry fs cp "$fuse_delete_local" ":${fuse_root}/delete.txt" >/dev/null
+  drive9_retry fs cp "$fuse_move_local" ":${fuse_root}/move.txt" >/dev/null
+
+  fuse_layer_json=$(drive9_retry fs layer create \
+    --name "$fuse_layer_name" \
+    --tag "fuse_run=$ts" \
+    --durability restore-safe \
+    --json \
+    ":$fuse_root")
+  fuse_layer_id=$(printf '%s' "$fuse_layer_json" | jq -r '.layer_id // empty')
+  check_cmd "fuse layer create returns id" test -n "$fuse_layer_id"
+
+  mount_a="${FUSE_MOUNT_ROOT%/}/drive9-layer-a-${ts}"
+  local_a="/tmp/drive9-layer-local-a-${ts}"
+  log_a="/tmp/drive9-layer-a-${ts}.log"
+  start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_a" "$local_a" "$log_a"
+  check_eq "layer mount reads base before edit" "$(cat "$mount_a/base.txt")" "$(cat "$fuse_base_local")"
+  printf 'fuse base edited in layer %s\n' "$ts" >"$mount_a/base.txt"
+  printf 'fuse new file %s\n' "$ts" >"$mount_a/new.txt"
+  chmod 0600 "$mount_a/new.txt"
+  mkdir "$mount_a/dir"
+  printf 'fuse nested file %s\n' "$ts" >"$mount_a/dir/nested.txt"
+  rm "$mount_a/delete.txt"
+  mv "$mount_a/move.txt" "$mount_a/moved.txt"
+  ln -s base.txt "$mount_a/link"
+  check_eq "layer diff receives FUSE writes" "$(wait_layer_diff_count "tag:fuse_run=$ts" "8")" "8"
+  fuse_checkpoint_json=$(drive9_retry fs layer checkpoint --id "$fuse_ckpt_id" --label fuse-before-after --json "$fuse_layer_name")
+  check_eq "fuse checkpoint resolves layer id" "$(printf '%s' "$fuse_checkpoint_json" | jq -r '.layer_id')" "$fuse_layer_id"
+  printf 'fuse after checkpoint %s\n' "$ts" >"$mount_a/after.txt"
+  check_eq "layer diff receives post-checkpoint FUSE write" "$(wait_layer_diff_count "tag:fuse_run=$ts" "9")" "9"
+  check_cmd "unmount first layer mount" unmount_layer_mount
+  check_cmd "first layer mount log clean" audit_mount_log "$log_a"
+
+  mount_b="${FUSE_MOUNT_ROOT%/}/drive9-layer-b-${ts}"
+  local_b="/tmp/drive9-layer-local-b-${ts}"
+  log_b="/tmp/drive9-layer-b-${ts}.log"
+  start_layer_mount "$fuse_layer_name" "$fuse_ckpt_id" "$fuse_root" "$mount_b" "$local_b" "$log_b"
+  check_eq "checkpoint restore keeps edited base" "$(cat "$mount_b/base.txt")" "fuse base edited in layer ${ts}"
+  check_eq "checkpoint restore keeps new file" "$(cat "$mount_b/new.txt")" "fuse new file ${ts}"
+  check_eq "checkpoint restore keeps new file mode" "$(stat -c %a "$mount_b/new.txt" 2>/dev/null || stat -f %Lp "$mount_b/new.txt")" "600"
+  check_eq "checkpoint restore keeps nested file" "$(cat "$mount_b/dir/nested.txt")" "fuse nested file ${ts}"
+  check_cmd_fail "checkpoint restore keeps whiteout" test -e "$mount_b/delete.txt"
+  check_cmd_fail "checkpoint restore hides rename source" test -e "$mount_b/move.txt"
+  check_eq "checkpoint restore keeps rename target" "$(cat "$mount_b/moved.txt")" "$(cat "$fuse_move_local")"
+  check_eq "checkpoint restore keeps symlink" "$(readlink "$mount_b/link")" "base.txt"
+  check_cmd_fail "checkpoint restore excludes later write" test -e "$mount_b/after.txt"
+  check_cmd "unmount checkpoint restore mount" unmount_layer_mount
+  check_cmd "checkpoint restore mount log clean" audit_mount_log "$log_b"
+
+  mount_c="${FUSE_MOUNT_ROOT%/}/drive9-layer-c-${ts}"
+  local_c="/tmp/drive9-layer-local-c-${ts}"
+  log_c="/tmp/drive9-layer-c-${ts}.log"
+  start_layer_mount "tag:fuse_run=$ts" "" "$fuse_root" "$mount_c" "$local_c" "$log_c"
+  check_eq "fresh restore includes post-checkpoint write" "$(cat "$mount_c/after.txt")" "fuse after checkpoint ${ts}"
+  check_cmd "unmount full restore mount" unmount_layer_mount
+  check_cmd "full restore mount log clean" audit_mount_log "$log_c"
+
+  fuse_commit_out=$(drive9_retry fs layer commit "tag:fuse_run=$ts")
+  case "$fuse_commit_out" in
+    committed\ layer="$fuse_layer_id"\ applied=9) fuse_commit_status="ok" ;;
+    *) fuse_commit_status="$fuse_commit_out" ;;
+  esac
+  check_eq "commit FUSE layer after restore succeeds" "$fuse_commit_status" "ok"
+  check_eq "committed FUSE base visible" "$(drive9_retry fs cat "${fuse_root}/base.txt")" "fuse base edited in layer ${ts}"
+  check_eq "committed FUSE after file visible" "$(drive9_retry fs cat "${fuse_root}/after.txt")" "fuse after checkpoint ${ts}"
+  check_cmd_fail "committed FUSE whiteout visible in base" drive9 fs cat "${fuse_root}/delete.txt"
+  check_cmd_fail "committed FUSE rename source visible in base" drive9 fs cat "${fuse_root}/move.txt"
+  check_eq "committed FUSE rename target visible" "$(drive9_retry fs cat "${fuse_root}/moved.txt")" "$(cat "$fuse_move_local")"
+fi
 
 echo "RESULT: $PASS/$TOTAL passed, $FAIL failed"
 exit "$FAIL"

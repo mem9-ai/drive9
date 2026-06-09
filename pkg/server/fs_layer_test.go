@@ -137,6 +137,54 @@ func TestFSLayerAPIFlow(t *testing.T) {
 	}
 }
 
+func TestFSLayerCommitWhiteoutDirectoryRemovesTree(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	req, err := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/repo/delete-dir/gone.txt", bytes.NewReader([]byte("gone")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write baseline file status=%d, want 200", resp.StatusCode)
+	}
+
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-dir-whiteout",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-dir-whiteout", client.FSLayerEntryRequest{
+		Path: "/repo/delete-dir/",
+		Op:   "whiteout",
+		Kind: "dir",
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry dir whiteout: %v", err)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-dir-whiteout")
+	if err != nil {
+		t.Fatalf("CommitFSLayer: %v", err)
+	}
+	if commit.Status != "committed" || commit.Applied != 1 {
+		t.Fatalf("commit = %+v, want committed applied=1", commit)
+	}
+	if _, err := s.fallback.StatNodeCtx(ctx, "/repo/delete-dir/"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("deleted dir stat err=%v, want ErrNotFound", err)
+	}
+	if _, err := s.fallback.StatNodeCtx(ctx, "/repo/delete-dir/gone.txt"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("deleted child stat err=%v, want ErrNotFound", err)
+	}
+}
+
 func TestFSLayerDiffMissingLayerReturnsNotFound(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

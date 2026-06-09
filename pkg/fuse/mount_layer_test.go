@@ -34,9 +34,12 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"entries": []client.FSLayerEntry{
 					{LayerID: "layer-1", Path: "/repo/a.txt", Op: "upsert", Kind: "file", BaseRevision: 0, SizeBytes: 1, EntrySeq: 1},
+					{LayerID: "layer-1", Path: "/repo/a.txt", Op: "chmod", Kind: "file", Mode: 0o600, EntrySeq: 1},
 					{LayerID: "layer-1", Path: "/repo/old.txt", Op: "whiteout", Kind: "file", EntrySeq: 1},
 					{LayerID: "layer-1", Path: "/repo/newdir/", Op: "mkdir", Kind: "dir", Mode: 0o755, EntrySeq: 1},
+					{LayerID: "layer-1", Path: "/repo/newdir/", Op: "chmod", Kind: "dir", Mode: 0o700, EntrySeq: 1},
 					{LayerID: "layer-1", Path: "/repo/link", Op: "symlink", Kind: "symlink", ContentText: "target.txt", Mode: symlinkMode(), SizeBytes: 10, EntrySeq: 1},
+					{LayerID: "layer-1", Path: "/repo/link", Op: "chmod", Kind: "symlink", Mode: 0o600, EntrySeq: 1},
 					{LayerID: "layer-1", Path: "/repo/renamed-from.txt", Op: "rename", Kind: "file", ContentText: "/repo/renamed-to.txt", Mode: 0o644, EntrySeq: 1},
 				},
 			})
@@ -100,14 +103,17 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if meta, ok := pending.GetMeta("/a.txt"); !ok || meta.Kind != PendingOverwrite {
 		t.Fatalf("a.txt pending meta = %+v, want PendingOverwrite", meta)
 	}
+	if meta, ok := pending.GetMeta("/a.txt"); !ok || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("a.txt pending mode = %+v, want 0600", meta)
+	}
 	if !fs.isLayerWhiteout("/old.txt") {
 		t.Fatal("old.txt whiteout missing")
 	}
-	if mode, ok := fs.layerDirMode("/newdir"); !ok || mode != 0o755 {
-		t.Fatalf("newdir layer dir = (%#o, %t), want 0755 true", mode, ok)
+	if mode, ok := fs.layerDirMode("/newdir"); !ok || mode != 0o700 {
+		t.Fatalf("newdir layer dir = (%#o, %t), want 0700 true", mode, ok)
 	}
-	if target, _, ok := fs.layerSymlink("/link"); !ok || target != "target.txt" {
-		t.Fatalf("layer symlink = (%q, %t), want target.txt true", target, ok)
+	if target, mode, ok := fs.layerSymlink("/link"); !ok || target != "target.txt" || mode&0o777 != 0o600 {
+		t.Fatalf("layer symlink = (%q, %#o, %t), want target.txt 0600 true", target, mode, ok)
 	}
 	renamed, err := shadow.ReadAll("/renamed-to.txt")
 	if err != nil {
@@ -256,6 +262,73 @@ func TestLayerChmodUsesDirectoryKind(t *testing.T) {
 	}
 	if mode, ok := fs.layerDirMode("/dir"); !ok || mode != 0o700 {
 		t.Fatalf("layer dir mode = (%#o, %t), want 0700 true", mode, ok)
+	}
+}
+
+func TestLayerChmodCoalescesPendingFileContent(t *testing.T) {
+	var got clientLayerEntryRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode layer entry: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+			LayerID: "layer-1",
+			Path:    got.Path,
+			Op:      got.Op,
+			Kind:    got.Kind,
+			Mode:    got.Mode,
+			Content: got.Content,
+		})
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/new.txt", []byte("data"), 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode("/new.txt", 4, PendingOverwrite, 7, 0o644, true); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	if err := fs.upsertLayerChmod(context.Background(), "/new.txt", 0o600); err != nil {
+		t.Fatalf("upsertLayerChmod: %v", err)
+	}
+	if got.Path != "/repo/new.txt" || got.Op != "upsert" || got.Kind != "file" {
+		t.Fatalf("chmod coalesced request = %+v, want file upsert", got)
+	}
+	if !bytes.Equal(got.Content, []byte("data")) {
+		t.Fatalf("coalesced content = %q, want data", got.Content)
+	}
+	if got.BaseRevision != 7 {
+		t.Fatalf("base revision = %d, want 7", got.BaseRevision)
+	}
+	if got.Mode != 0o600 {
+		t.Fatalf("mode = %#o, want 0600", got.Mode)
+	}
+	meta, ok := pending.GetMeta("/new.txt")
+	if !ok || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending mode = %+v, want 0600", meta)
 	}
 }
 

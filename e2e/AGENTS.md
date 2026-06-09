@@ -43,7 +43,7 @@ bash e2e/cli-smoke-test.sh
 # Journal smoke (provision + journal create/append/find/verify)
 bash e2e/journal-smoke-test.sh
 
-# Layer filesystem smoke (create/status/diff/checkpoint/rollback/commit)
+# Layer filesystem smoke (API/CLI entries + optional FUSE restore/commit)
 bash e2e/layer-fs-smoke-test.sh
 
 # FUSE smoke (mount + bidirectional filesystem checks)
@@ -92,10 +92,11 @@ make e2e-local
 This starts a temporary MySQL container, initializes
 `DRIVE9_LOCAL_EMBEDDING_MODE=none`, starts `drive9-server-local`, and runs
 `e2e/smoke-all.sh` with semantic checks disabled and `RUN_FUSE_SMOKE=0` by
-default. Set `DRIVE9_LOCAL_DSN` to reuse an existing local database instead of
-starting a container. Set `RUN_FUSE_SMOKE=1` only when the machine has native
-FUSE support; macOS WebDAV fallback does not satisfy the symlink/hardlink FUSE
-smoke assertions.
+default. `smoke-all.sh` derives `RUN_LAYER_FUSE_SMOKE` from `RUN_FUSE_SMOKE`.
+Set `DRIVE9_LOCAL_DSN` to reuse an existing local database instead of starting a
+container. Set `RUN_FUSE_SMOKE=1` only when the machine has native FUSE support;
+macOS WebDAV fallback does not satisfy the symlink/hardlink FUSE smoke
+assertions.
 
 ### Prerequisites
 

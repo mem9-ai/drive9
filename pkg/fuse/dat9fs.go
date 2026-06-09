@@ -511,6 +511,20 @@ func (fs *Dat9FS) upsertLayerWhiteout(ctx context.Context, localPath string, kin
 }
 
 func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode uint32) error {
+	if fs.pendingIndex != nil && fs.shadowStore != nil {
+		if meta, ok := fs.pendingIndex.GetMeta(localPath); ok {
+			data, err := fs.shadowStore.ReadAll(localPath)
+			if err == nil {
+				if err := fs.upsertLayerFile(ctx, localPath, data, meta.BaseRev, mode, true); err != nil {
+					return err
+				}
+				if err := fs.pendingIndex.UpdateMode(localPath, mode); err != nil {
+					return fmt.Errorf("update pending mode for layer chmod %s: %w", localPath, err)
+				}
+				return nil
+			}
+		}
+	}
 	kind := fs.layerEntryKind(ctx, localPath)
 	if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
 		Path: fs.remotePath(localPath),
