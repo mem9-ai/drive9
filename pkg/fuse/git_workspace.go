@@ -776,6 +776,9 @@ func (fs *Dat9FS) ensureGitLocalHeadTree(ctx context.Context, rt *gitWorkspaceRu
 		return false, err
 	}
 	nodes, children := parseLocalGitTree(rt.workspace.WorkspaceID, head, treeOut)
+	if err := fs.fillLocalGitTreeSizes(ctx, rt, gitDir, nodes, children); err != nil {
+		log.Printf("git workspace local HEAD size fill failed workspace=%s head=%s: %v", rt.workspace.WorkspaceID, head, err)
+	}
 	rt.mu.Lock()
 	rt.localTreeCommit = head
 	rt.localNodes = nodes
@@ -850,6 +853,109 @@ func parseLocalGitTree(workspaceID, commit string, raw []byte) (map[string]clien
 		sort.Slice(children[parent], func(i, j int) bool { return children[parent][i].Name < children[parent][j].Name })
 	}
 	return nodes, children
+}
+
+func (fs *Dat9FS) fillLocalGitTreeSizes(ctx context.Context, rt *gitWorkspaceRuntime, gitDir string, nodes map[string]client.GitTreeNode, children map[string][]client.GitTreeNode) error {
+	if fs == nil || rt == nil || len(nodes) == 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	sizeByObject, baseCommit, workspaceID := rt.knownBaseGitObjectSizes()
+	localRoot := ""
+	if fs.opts != nil {
+		localRoot = strings.TrimSpace(fs.opts.LocalRoot)
+	}
+	missing := make(map[string]struct{})
+	for rel, n := range nodes {
+		if !gitNodeHasBlobSize(n) {
+			continue
+		}
+		oid := strings.ToLower(strings.TrimSpace(n.ObjectSHA))
+		if oid == "" {
+			continue
+		}
+		if size, ok := sizeByObject[oid]; ok {
+			setGitTreeNodeSize(nodes, children, rel, size)
+			continue
+		}
+		if localRoot != "" && workspaceID != "" && baseCommit != "" {
+			if size, hit, err := gitcache.StatBlob(ctx, localRoot, workspaceID, baseCommit, oid); err != nil {
+				return err
+			} else if hit {
+				sizeByObject[oid] = size
+				setGitTreeNodeSize(nodes, children, rel, size)
+				continue
+			}
+		}
+		missing[oid] = struct{}{}
+	}
+	if len(missing) == 0 || strings.TrimSpace(gitDir) == "" {
+		return nil
+	}
+	ids := mapKeys(missing)
+	sort.Strings(ids)
+	infos, err := gitObjectInfoBatch(ctx, gitDir, ids)
+	if err != nil {
+		return err
+	}
+	for rel, n := range nodes {
+		if !gitNodeHasBlobSize(n) || n.SizeBytes >= 0 {
+			continue
+		}
+		oid := strings.ToLower(strings.TrimSpace(n.ObjectSHA))
+		info := infos[oid]
+		if info.typ != "blob" || info.size < 0 {
+			continue
+		}
+		setGitTreeNodeSize(nodes, children, rel, info.size)
+	}
+	return nil
+}
+
+func (rt *gitWorkspaceRuntime) knownBaseGitObjectSizes() (map[string]int64, string, string) {
+	sizeByObject := make(map[string]int64)
+	if rt == nil {
+		return sizeByObject, "", ""
+	}
+	rt.mu.RLock()
+	defer rt.mu.RUnlock()
+	for _, n := range rt.nodes {
+		if !gitNodeHasBlobSize(n) || n.SizeBytes < 0 {
+			continue
+		}
+		oid := strings.ToLower(strings.TrimSpace(n.ObjectSHA))
+		if oid == "" {
+			continue
+		}
+		sizeByObject[oid] = n.SizeBytes
+	}
+	return sizeByObject, rt.workspace.HeadCommit, rt.workspace.WorkspaceID
+}
+
+func gitNodeHasBlobSize(n client.GitTreeNode) bool {
+	return n.Kind == "file" || n.Kind == "symlink"
+}
+
+func setGitTreeNodeSize(nodes map[string]client.GitTreeNode, children map[string][]client.GitTreeNode, rel string, size int64) {
+	if size < 0 {
+		return
+	}
+	n, ok := nodes[rel]
+	if !ok {
+		return
+	}
+	n.SizeBytes = size
+	nodes[rel] = n
+	childNodes := children[n.ParentPath]
+	for i := range childNodes {
+		if childNodes[i].Path == rel {
+			childNodes[i].SizeBytes = size
+			children[n.ParentPath] = childNodes
+			return
+		}
+	}
 }
 
 func (rt *gitWorkspaceRuntime) hasImpliedDir(rel string) bool {
@@ -1345,6 +1451,22 @@ func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime,
 			}
 			return data, nil
 		}
+		baseCommit := strings.TrimSpace(rt.workspace.HeadCommit)
+		if baseCommit != "" && !strings.EqualFold(baseCommit, nodeCommit) {
+			data, hit, err = gitcache.ReadBlob(ctx, localRoot, rt.workspace.WorkspaceID, baseCommit, n.ObjectSHA, offset, size)
+			if err != nil {
+				return nil, err
+			}
+			if hit {
+				if fs.perfEnabled() {
+					fs.perf.gitCleanBlobCacheHit.add(1)
+				}
+				if offset == 0 && size < 0 {
+					fs.updateGitKnownSize(rt, localPath, rel, n, int64(len(data)))
+				}
+				return data, nil
+			}
+		}
 	}
 	if fs.perfEnabled() {
 		fs.perf.gitCleanCacheMiss.add(1)
@@ -1386,6 +1508,13 @@ func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceR
 		if size, hit, err := gitcache.StatBlob(ctx, localRoot, rt.workspace.WorkspaceID, nodeCommit, n.ObjectSHA); err == nil && hit {
 			rt.updateCleanNodeSize(rel, nodeCommit, size)
 			return size
+		}
+		baseCommit := strings.TrimSpace(rt.workspace.HeadCommit)
+		if baseCommit != "" && !strings.EqualFold(baseCommit, nodeCommit) {
+			if size, hit, err := gitcache.StatBlob(ctx, localRoot, rt.workspace.WorkspaceID, baseCommit, n.ObjectSHA); err == nil && hit {
+				rt.updateCleanNodeSize(rel, nodeCommit, size)
+				return size
+			}
 		}
 	}
 	if gitWorkspaceIsFastBlobless(rt) {
