@@ -133,6 +133,21 @@ public class Drive9Client(
         }
     }
 
+    public suspend fun statMetadata(path: String): Drive9StatMetadataResult = withContext(Dispatchers.IO) {
+        val body = request("GET", "${fsUrl(path)}?stat=1").use { it.text() }
+        val obj = json.parseToJsonElement(body).jsonObject
+        Drive9StatMetadataResult(
+            size = obj["size"]?.jsonPrimitive?.longOrNull ?: 0L,
+            isDir = obj["isdir"]?.jsonPrimitive?.booleanOrNull ?: false,
+            resourceId = obj["resource_id"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+            revision = obj["revision"]?.jsonPrimitive?.longOrNull ?: 0L,
+            mtimeUnix = obj["mtime"]?.jsonPrimitive?.longOrNull,
+            contentType = obj["content_type"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+            semanticText = obj["semantic_text"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+            tags = obj["tags"]?.jsonObject?.toStringMap() ?: emptyMap(),
+        )
+    }
+
     public suspend fun delete(path: String): Unit = withContext(Dispatchers.IO) {
         request("DELETE", fsUrl(path)).close()
     }
@@ -1049,6 +1064,17 @@ public data class Drive9StatResult(
     val isDir: Boolean,
     val revision: Long,
     val mtimeUnix: Long?,
+)
+
+public data class Drive9StatMetadataResult(
+    val size: Long,
+    val isDir: Boolean,
+    val resourceId: String,
+    val revision: Long,
+    val mtimeUnix: Long?,
+    val contentType: String,
+    val semanticText: String,
+    val tags: Map<String, String>,
 )
 
 public data class Drive9SearchResult(

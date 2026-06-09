@@ -4,6 +4,7 @@ export { StreamWriter } from "./stream.js";
 export type {
   FileInfo,
   StatResult,
+  StatMetadataResult,
   SearchResult,
   PartURL,
   UploadPlan,

@@ -130,6 +130,7 @@ describe("Client basic ops", () => {
     const find = await client.find("/", { type: "file" });
     expect(find.length).toBe(1);
   });
+
 });
 
 describe("Config loading", () => {

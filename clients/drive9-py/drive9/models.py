@@ -24,6 +24,19 @@ class StatResult:
 
 
 @dataclass
+class StatMetadataResult:
+    """Represents enriched file metadata from GET ?stat=1."""
+    size: int
+    is_dir: bool
+    resource_id: str
+    revision: int
+    mtime: Optional[int] = None
+    content_type: str = ""
+    semantic_text: str = ""
+    tags: Optional[dict] = None
+
+
+@dataclass
 class SearchResult:
     """Represents a search result."""
     path: str

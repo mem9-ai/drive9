@@ -42,6 +42,10 @@ rows = client.sql('SELECT * FROM files WHERE path = "/hello.txt"')
 results = client.grep("hello", "/data/", limit=10)
 results = client.find("/data/", {"name": "*.txt"})
 
+# Enriched metadata
+meta = client.stat_metadata("/hello.txt")
+print(meta.content_type, meta.semantic_text, meta.tags)
+
 # Stream upload / download
 with open("large.bin", "rb") as f:
     client.write_stream("/large.bin", f, size=os.path.getsize("large.bin"))
@@ -51,6 +55,10 @@ with open("out.bin", "wb") as f:
     f.write(body.read())
 body.close()
 ```
+
+`stat_metadata` returns enriched file metadata - size, is_dir, resource_id,
+revision, mtime, content_type, semantic_text, and tags - by calling
+`GET /v1/fs/{path}?stat=1`.
 
 ## Run tests
 

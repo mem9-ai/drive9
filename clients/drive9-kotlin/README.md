@@ -18,7 +18,7 @@ require Rust, generated bindings, shared libraries, or a regeneration step.
 - `Drive9Client(baseUrl, apiKey)`
 - `Drive9Client.defaultClient()`, `withSmallFileThreshold`, `baseUrl`, `apiKey`
 - `write`, `writeWithRevision`, `read`, `uploadFile`, `downloadFile`
-- `list`, `stat`, `delete`, `copy`, `rename`, `mkdir`
+- `list`, `stat`, `statMetadata`, `delete`, `copy`, `rename`, `mkdir`
 - `grep`, `find`, `sql`
 - `downloadFlow`, `downloadRangeFlow`, `uploadFlow`
 - `newStreamUpload` / `Drive9StreamUpload` for v2 multipart stream upload
@@ -27,6 +27,10 @@ require Rust, generated bindings, shared libraries, or a regeneration step.
 
 `baseUrl` may include a trailing slash. If `apiKey` is non-empty, requests send
 `Authorization: Bearer <apiKey>`; an empty key sends no authorization header.
+
+`statMetadata` returns enriched file metadata - size, isDir, resourceId,
+revision, mtime, contentType, semanticText, and tags - by calling
+`GET /v1/fs/{path}?stat=1`.
 
 ## Parity notes
 
