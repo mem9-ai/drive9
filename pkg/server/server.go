@@ -282,6 +282,7 @@ func NewWithConfig(cfg Config) *Server {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
+			setRequestMetricTenant(r.Context(), tenantID, "", "", classifyTenantRequest(r))
 			subReq := r.Clone(r.Context())
 			subURL := *r.URL
 			subURL.Path = "/" + sub
@@ -894,6 +895,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
+	setRequestMetricTenant(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, classifyTenantRequest(r))
 	if resolved.APIKey.Status != meta.APIKeyActive {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_inactive", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "status", resolved.APIKey.Status)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
@@ -968,6 +970,7 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
+	setRequestMetricTenant(r.Context(), "local", "local", "local", classifyTenantRequest(r))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", "local", "status", "active")...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
@@ -3303,6 +3306,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "failed to provision tenant")
 		return
 	}
+	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3460,6 +3464,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	tenantID := token.NewID()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
+	setRequestMetricTenant(ctx, tenantID, "", provider, tenantRequestClass{surface: "provision", action: "post"})
 
 	keyName := strings.TrimSpace(opts.KeyName)
 	if keyName == "" {
@@ -3656,6 +3661,7 @@ func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string,
 // compatibility path so e2e scripts can obtain one stable API key without
 // enabling the multi-tenant provision flow.
 func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Request) {
+	setRequestMetricTenant(r.Context(), "local", "local", "local", classifyTenantRequest(r))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", "local", "provider", "local")...)
 	metricEvent(r.Context(), "tenant_provision", "provider", "local", "result", "ok")
 	w.Header().Set("Content-Type", "application/json")

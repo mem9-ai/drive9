@@ -97,8 +97,8 @@ func TestRequestTenantID(t *testing.T) {
 		{path: "/s3/local/upload/u1/1", want: "local"},
 		{path: "/s3/upload/u1/1", want: "local"},
 		{path: "/s3/objects/blob", want: "local"},
-		{path: "/s3/tenant-a/upload/u1/1", want: "tenant-a"},
-		{path: "/s3/tenant-a/objects/blob", want: "tenant-a"},
+		{path: "/s3/tenant-a/upload/u1/1", want: ""},
+		{path: "/s3/tenant-a/objects/blob", want: ""},
 		{path: "/v1/fs/doc.txt", want: ""},
 	}
 
@@ -110,6 +110,17 @@ func TestRequestTenantID(t *testing.T) {
 		if got := requestTenantID(req); got != tc.want {
 			t.Fatalf("requestTenantID(%q) = %q, want %q", tc.path, got, tc.want)
 		}
+	}
+
+	req, err := http.NewRequest(http.MethodGet, "http://example.test/s3/tenant-a/objects/blob", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := withRequestMetricState(req.Context(), &requestMetricState{})
+	req = req.WithContext(ctx)
+	setRequestMetricTenant(req.Context(), "tenant-a", "", "", tenantRequestClass{surface: "object_store", action: "get_object"})
+	if got := requestTenantID(req); got != "tenant-a" {
+		t.Fatalf("requestTenantID with verified scope = %q, want tenant-a", got)
 	}
 }
 

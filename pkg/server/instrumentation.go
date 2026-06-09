@@ -139,6 +139,19 @@ func requestMetricScope(ctx context.Context) (tenantID, apiKeyID, provider strin
 	return state.tenantID, state.apiKeyID, state.provider
 }
 
+func requestMetricClass(ctx context.Context) (tenantRequestClass, bool) {
+	state := requestMetricStateFromContext(ctx)
+	if state == nil {
+		return tenantRequestClass{}, false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.tenantID == "" || state.surface == "" || state.action == "" {
+		return tenantRequestClass{}, false
+	}
+	return tenantRequestClass{surface: state.surface, action: state.action}, true
+}
+
 func finishRequestMetricTenant(ctx context.Context) {
 	state := requestMetricStateFromContext(ctx)
 	if state == nil {
@@ -534,10 +547,9 @@ func requestTenantID(r *http.Request) string {
 	if r.URL != nil && strings.HasPrefix(r.URL.Path, "/s3/") {
 		rest := strings.TrimPrefix(r.URL.Path, "/s3/")
 		if tenant, _, ok := strings.Cut(rest, "/"); ok && tenant != "" {
-			if tenant == "upload" || tenant == "objects" {
+			if tenant == "local" || tenant == "upload" || tenant == "objects" {
 				return "local"
 			}
-			return tenant
 		}
 	}
 	return ""
@@ -549,18 +561,15 @@ func recordTenantHTTPRequest(r *http.Request, status int, d time.Duration, respo
 		return
 	}
 	class := classifyTenantRequest(r)
+	if scopedClass, ok := requestMetricClass(r.Context()); ok {
+		class = scopedClass
+	}
 	metrics.RecordTenantRequest(tenantID, class.surface, class.action, tenantRequestResult(status), status, d)
 	if r.ContentLength > 0 {
 		metrics.RecordTenantHTTPBytes(tenantID, class.surface, class.action, "request", r.ContentLength)
-		if class.surface == "object_store" && class.action == "upload_part" && status >= 200 && status < 300 {
-			metrics.RecordTenantFileBytes(tenantID, class.surface, class.action, "write", r.ContentLength)
-		}
 	}
 	if responseBytes > 0 {
 		metrics.RecordTenantHTTPBytes(tenantID, class.surface, class.action, "response", int64(responseBytes))
-		if class.surface == "object_store" && class.action == "get_object" && status >= 200 && status < 300 {
-			metrics.RecordTenantFileBytes(tenantID, class.surface, class.action, "read", int64(responseBytes))
-		}
 	}
 }
 
