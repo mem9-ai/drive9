@@ -511,18 +511,43 @@ func (fs *Dat9FS) upsertLayerWhiteout(ctx context.Context, localPath string, kin
 }
 
 func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode uint32) error {
-	if fs.pendingIndex != nil && fs.shadowStore != nil {
-		if meta, ok := fs.pendingIndex.GetMeta(localPath); ok {
-			data, err := fs.shadowStore.ReadAll(localPath)
-			if err == nil {
-				if err := fs.upsertLayerFile(ctx, localPath, data, meta.BaseRev, mode, true); err != nil {
+	if fs.shadowStore != nil {
+		data, err := fs.shadowStore.ReadAll(localPath)
+		if err == nil {
+			baseRev := int64(0)
+			pendingKind := PendingNew
+			hadPending := false
+			if fs.pendingIndex != nil {
+				if meta, ok := fs.pendingIndex.GetMeta(localPath); ok {
+					baseRev = meta.BaseRev
+					pendingKind = meta.Kind
+					hadPending = true
+				}
+			}
+			if !hadPending && fs.client != nil {
+				stat, err := fs.client.StatCtx(ctx, fs.remotePath(localPath))
+				if err == nil && stat != nil && !stat.IsDir {
+					baseRev = stat.Revision
+					pendingKind = PendingOverwrite
+				} else if err != nil && !isNotFoundErr(err) {
 					return err
+				}
+			}
+			if err := fs.upsertLayerFile(ctx, localPath, data, baseRev, mode, true); err != nil {
+				return err
+			}
+			if fs.pendingIndex != nil {
+				if !hadPending {
+					if _, err := fs.pendingIndex.PutWithBaseRevAndMode(localPath, int64(len(data)), pendingKind, baseRev, mode, true); err != nil {
+						return fmt.Errorf("put pending mode for layer chmod %s: %w", localPath, err)
+					}
+					return nil
 				}
 				if err := fs.pendingIndex.UpdateMode(localPath, mode); err != nil {
 					return fmt.Errorf("update pending mode for layer chmod %s: %w", localPath, err)
 				}
-				return nil
 			}
+			return nil
 		}
 	}
 	kind := fs.layerEntryKind(ctx, localPath)

@@ -416,6 +416,51 @@ wait_layer_diff_count() {
   done
 }
 
+wait_layer_diff_entries() {
+  local layer_ref="$1"
+  local want="$2"
+  shift 2
+  local -a expected=("$@")
+  local deadline=$(( $(date +%s) + LAYER_DIFF_TIMEOUT_S ))
+  local out rc got ok i p op
+  while :; do
+    set +e
+    out=$(drive9 fs layer diff --json "$layer_ref" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      got=$(printf '%s' "$out" | jq -r '.entries | length')
+      ok=1
+      if [ "$got" != "$want" ]; then
+        ok=0
+      else
+        i=0
+        while [ "$i" -lt "${#expected[@]}" ]; do
+          p="${expected[$i]}"
+          op="${expected[$((i + 1))]}"
+          if ! printf '%s' "$out" | jq -e --arg p "$p" --arg op "$op" '.entries[] | select(.path == $p and .op == $op)' >/dev/null; then
+            ok=0
+            break
+          fi
+          i=$((i + 2))
+        done
+      fi
+      if [ "$ok" -eq 1 ]; then
+        printf '%s' "$got"
+        return 0
+      fi
+    elif [[ "$out" != *"Too Many Requests"* && "$out" != *"HTTP 429"* && "$out" != *"not found"* ]]; then
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      printf 'wait_layer_diff_entries: timeout layer=%s want=%s got=%s expected=%s\n' "$layer_ref" "$want" "${got:-<none>}" "${expected[*]}" >&2
+      return 1
+    fi
+    sleep "$LAYER_DIFF_INTERVAL_S"
+  done
+}
+
 put_layer_entry() {
   local layer_ref="$1"
   local path="$2"
@@ -691,11 +736,28 @@ if require_layer_fuse_prereqs; then
   rm "$mount_a/delete.txt"
   mv "$mount_a/move.txt" "$mount_a/moved.txt"
   ln -s base.txt "$mount_a/link"
-  check_eq "layer diff receives FUSE writes" "$(wait_layer_diff_count "tag:fuse_run=$ts" "8")" "8"
+  check_eq "layer diff receives FUSE writes" "$(wait_layer_diff_entries "tag:fuse_run=$ts" "8" \
+    "${fuse_root}/base.txt" "upsert" \
+    "${fuse_root}/new.txt" "upsert" \
+    "${fuse_root}/dir/" "mkdir" \
+    "${fuse_root}/dir/nested.txt" "upsert" \
+    "${fuse_root}/delete.txt" "whiteout" \
+    "${fuse_root}/move.txt" "whiteout" \
+    "${fuse_root}/moved.txt" "upsert" \
+    "${fuse_root}/link" "symlink")" "8"
   fuse_checkpoint_json=$(drive9_retry fs layer checkpoint --id "$fuse_ckpt_id" --label fuse-before-after --json "$fuse_layer_name")
   check_eq "fuse checkpoint resolves layer id" "$(printf '%s' "$fuse_checkpoint_json" | jq -r '.layer_id')" "$fuse_layer_id"
   printf 'fuse after checkpoint %s\n' "$ts" >"$mount_a/after.txt"
-  check_eq "layer diff receives post-checkpoint FUSE write" "$(wait_layer_diff_count "tag:fuse_run=$ts" "9")" "9"
+  check_eq "layer diff receives post-checkpoint FUSE write" "$(wait_layer_diff_entries "tag:fuse_run=$ts" "9" \
+    "${fuse_root}/base.txt" "upsert" \
+    "${fuse_root}/new.txt" "upsert" \
+    "${fuse_root}/dir/" "mkdir" \
+    "${fuse_root}/dir/nested.txt" "upsert" \
+    "${fuse_root}/delete.txt" "whiteout" \
+    "${fuse_root}/move.txt" "whiteout" \
+    "${fuse_root}/moved.txt" "upsert" \
+    "${fuse_root}/link" "symlink" \
+    "${fuse_root}/after.txt" "upsert")" "9"
   check_cmd "unmount first layer mount" unmount_layer_mount
   check_cmd "first layer mount log clean" audit_mount_log "$log_a"
 
