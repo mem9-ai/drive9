@@ -1911,6 +1911,152 @@ func TestGitWorkspaceUnknownSizeLookupUsesBlobCacheSize(t *testing.T) {
 	}
 }
 
+func TestGitLocalHeadTreeSizeFillInheritsBaseManifestSize(t *testing.T) {
+	objectSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	localCommit := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	raw := []byte("100644 blob " + objectSHA + "\tREADME.md\x00")
+	nodes, children := parseLocalGitTree("ws1", localCommit, raw)
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			HeadCommit:  fixtureHeadCommit,
+		},
+		nodes: map[string]client.GitTreeNode{
+			"README.md": {
+				Path:      "README.md",
+				Kind:      "file",
+				Mode:      "100644",
+				ObjectSHA: objectSHA,
+				SizeBytes: 123,
+			},
+		},
+	}
+	fs := &Dat9FS{opts: &MountOptions{}}
+	if err := fs.fillLocalGitTreeSizes(context.Background(), rt, "", nodes, children); err != nil {
+		t.Fatalf("fillLocalGitTreeSizes: %v", err)
+	}
+	if got := nodes["README.md"].SizeBytes; got != 123 {
+		t.Fatalf("local node size = %d, want inherited base size", got)
+	}
+	if got := children[""][0].SizeBytes; got != 123 {
+		t.Fatalf("local child size = %d, want inherited base size", got)
+	}
+}
+
+func TestGitLocalHeadTreeSizeFillUsesBaseBlobCache(t *testing.T) {
+	objectSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	localCommit := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	content := []byte("cached base object\n")
+	localRoot := t.TempDir()
+	if err := gitcache.WriteBlob(context.Background(), localRoot, "ws1", fixtureHeadCommit, objectSHA, content); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte("100644 blob " + objectSHA + "\tREADME.md\x00")
+	nodes, children := parseLocalGitTree("ws1", localCommit, raw)
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			HeadCommit:  fixtureHeadCommit,
+		},
+		nodes: map[string]client.GitTreeNode{
+			"README.md": {
+				Path:      "README.md",
+				Kind:      "file",
+				Mode:      "100644",
+				ObjectSHA: objectSHA,
+				SizeBytes: -1,
+			},
+		},
+	}
+	fs := &Dat9FS{opts: &MountOptions{LocalRoot: localRoot}}
+	if err := fs.fillLocalGitTreeSizes(context.Background(), rt, "", nodes, children); err != nil {
+		t.Fatalf("fillLocalGitTreeSizes: %v", err)
+	}
+	if got := nodes["README.md"].SizeBytes; got != int64(len(content)) {
+		t.Fatalf("local node size = %d, want base blob cache size %d", got, len(content))
+	}
+}
+
+func TestGitLocalHeadTreeSizeFillBatchChecksLocalBlob(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found")
+	}
+	baseContent := []byte("hello base\n")
+	localContent := []byte("hello local commit\n")
+	repo := createGitRepoWithReadme(t, baseContent)
+	baseCommit := fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
+	baseSHA := fuseGitOutputForTest(t, repo, "hash-object", "README.md")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), localContent, 0o644); err != nil {
+		t.Fatalf("write README: %v", err)
+	}
+	runFuseTestGit(t, repo, "add", "README.md")
+	runFuseTestGit(t, repo, "commit", "-m", "local")
+	localCommit := fuseGitOutputForTest(t, repo, "rev-parse", "HEAD")
+	localSHA := fuseGitOutputForTest(t, repo, "hash-object", "README.md")
+	treeOut, err := gitCommandOutputNoLazy(context.Background(), "--git-dir", filepath.Join(repo, ".git"), "ls-tree", "-r", "-t", "-z", localCommit)
+	if err != nil {
+		t.Fatalf("git ls-tree: %v", err)
+	}
+	nodes, children := parseLocalGitTree("ws1", localCommit, treeOut)
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			HeadCommit:  baseCommit,
+		},
+		nodes: map[string]client.GitTreeNode{
+			"README.md": {
+				Path:      "README.md",
+				Kind:      "file",
+				Mode:      "100644",
+				ObjectSHA: baseSHA,
+				SizeBytes: int64(len(baseContent)),
+			},
+		},
+	}
+	fs := &Dat9FS{opts: &MountOptions{}}
+	if err := fs.fillLocalGitTreeSizes(context.Background(), rt, filepath.Join(repo, ".git"), nodes, children); err != nil {
+		t.Fatalf("fillLocalGitTreeSizes: %v", err)
+	}
+	if got := nodes["README.md"].ObjectSHA; got != localSHA {
+		t.Fatalf("local object = %s, want %s", got, localSHA)
+	}
+	if got := nodes["README.md"].SizeBytes; got != int64(len(localContent)) {
+		t.Fatalf("local node size = %d, want local blob size %d", got, len(localContent))
+	}
+}
+
+func TestGitWorkspaceLocalHeadReadUsesBaseBlobCache(t *testing.T) {
+	objectSHA := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	baseCommit := fixtureHeadCommit
+	localCommit := "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	content := []byte("cached base object\n")
+	localRoot := t.TempDir()
+	if err := gitcache.WriteBlob(context.Background(), localRoot, "ws1", baseCommit, objectSHA, content); err != nil {
+		t.Fatal(err)
+	}
+	rt := &gitWorkspaceRuntime{
+		workspace: client.GitWorkspace{
+			WorkspaceID: "ws1",
+			HeadCommit:  baseCommit,
+		},
+	}
+	fs := &Dat9FS{opts: &MountOptions{LocalRoot: localRoot}, git: newGitWorkspaceLayer(), inodes: NewInodeToPath()}
+	got, err := fs.readGitCleanFile(context.Background(), rt, "/repo/README.md", "README.md", client.GitTreeNode{
+		CommitSHA: localCommit,
+		Path:      "README.md",
+		Kind:      "file",
+		Mode:      "100644",
+		ObjectSHA: objectSHA,
+		SizeBytes: int64(len(content)),
+	}, 0, -1)
+	if err != nil {
+		t.Fatalf("readGitCleanFile: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("readGitCleanFile = %q, want %q", got, content)
+	}
+}
+
 func TestGitWorkspaceBloblessUnknownSizeLookupSkipsGitSizeProbe(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	fixture.mode = gitWorkspaceModeFastBlobless
