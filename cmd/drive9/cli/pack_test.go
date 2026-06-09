@@ -363,7 +363,58 @@ func TestExtractPackArchiveDoesNotReplaceUntilArchiveValidated(t *testing.T) {
 	assertFileContent(t, filepath.Join(localRoot, "overlay", "repo", ".git", "config"), "old\n")
 }
 
-func TestExtractPackArchiveRejectsUnsafeSymlinkTarget(t *testing.T) {
+func TestExtractPackArchivePreservesPortableSymlinkTargets(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	manifest := []byte(`{"format":"drive9.pack.v1","version":1,"paths":["/repo"],"entries":[{"path":"/repo/absolute","type":"symlink","linkname":"/opt/tool/bin/python"},{"path":"/repo/pkg-link","type":"symlink","linkname":"../store/pkg"}]}`)
+	if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
+		t.Fatalf("manifest header: %v", err)
+	}
+	if _, err := tw.Write(manifest); err != nil {
+		t.Fatalf("manifest write: %v", err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/absolute", Typeflag: tar.TypeSymlink, Linkname: "/opt/tool/bin/python", Mode: 0o777}); err != nil {
+		t.Fatalf("absolute symlink header: %v", err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/pkg-link", Typeflag: tar.TypeSymlink, Linkname: "../store/pkg", Mode: 0o777}); err != nil {
+		t.Fatalf("relative symlink header: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	localRoot := t.TempDir()
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(buf.Bytes()), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	})
+	if err != nil {
+		t.Fatalf("extractPackArchive: %v", err)
+	}
+	absolute, err := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "absolute"))
+	if err != nil {
+		t.Fatalf("read absolute symlink: %v", err)
+	}
+	if absolute != "/opt/tool/bin/python" {
+		t.Fatalf("absolute symlink = %q, want /opt/tool/bin/python", absolute)
+	}
+	relative, err := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "pkg-link"))
+	if err != nil {
+		t.Fatalf("read relative symlink: %v", err)
+	}
+	if relative != "../store/pkg" {
+		t.Fatalf("relative symlink = %q, want ../store/pkg", relative)
+	}
+}
+
+func TestExtractPackArchiveRejectsInvalidSymlinkTarget(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink semantics differ on Windows")
 	}
@@ -377,7 +428,7 @@ func TestExtractPackArchiveRejectsUnsafeSymlinkTarget(t *testing.T) {
 	if _, err := tw.Write(manifest); err != nil {
 		t.Fatalf("manifest write: %v", err)
 	}
-	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/link", Typeflag: tar.TypeSymlink, Linkname: "../outside", Mode: 0o777}); err != nil {
+	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/link", Typeflag: tar.TypeSymlink, Linkname: "", Mode: 0o777}); err != nil {
 		t.Fatalf("symlink header: %v", err)
 	}
 	if err := tw.Close(); err != nil {

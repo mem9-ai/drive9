@@ -1160,13 +1160,6 @@ func validatePackSymlinkTarget(linkname string) error {
 	if linkname == "" || strings.ContainsRune(linkname, '\x00') || strings.Contains(linkname, "\\") {
 		return fmt.Errorf("unsafe pack symlink target %q", linkname)
 	}
-	if path.IsAbs(linkname) || filepath.IsAbs(linkname) {
-		return fmt.Errorf("unsafe pack symlink target %q", linkname)
-	}
-	cleaned := path.Clean(filepath.ToSlash(linkname))
-	if cleaned == "." || cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return fmt.Errorf("unsafe pack symlink target %q", linkname)
-	}
 	return nil
 }
 
