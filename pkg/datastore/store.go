@@ -2896,10 +2896,16 @@ func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error
 			result = "not_found"
 		case errors.Is(*errp, ErrPathConflict), errors.Is(*errp, ErrUploadConflict), errors.Is(*errp, ErrIdempotencyConflict):
 			result = "conflict"
+		case errors.Is(*errp, context.Canceled):
+			result = "canceled"
+		case errors.Is(*errp, context.DeadlineExceeded):
+			result = "deadline_exceeded"
 		default:
 			result = "error"
 		}
-		logger.Error(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+		if result != "canceled" && result != "deadline_exceeded" {
+			logger.Error(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+		}
 	}
 	logger.InfoBenchTiming(ctx, "datastore_op_timing",
 		zap.String("operation", op),
