@@ -61,14 +61,18 @@ RUN_FUSE_ALL_WORKLOADS=1 bash e2e/fuse-release-gate.sh
 # Git workspace smoke (fast-blobless clone + common agent Git workloads)
 bash e2e/git-workspace-smoke-test.sh
 
+# Lightweight Git operations smoke for PR local e2e
+bash e2e/git-ops-smoke-test.sh
+
 # POSIX permission smoke (API/CLI/FUSE chmod and mkdir mode)
 bash e2e/posix-permission-smoke-test.sh
 
-# Run all smoke scripts in sequence
+# Run the default smoke-all sequence once
 bash e2e/smoke-all.sh
 
-# Include Git workspace smoke in smoke-all when desired
-RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
+# Or enable optional Git coverage in that same single smoke-all run.
+# Set either variable to 1 as needed; setting both includes both Git suites.
+RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
 ```
 
 ### Local via `drive9-server-local`
@@ -119,6 +123,7 @@ bash e2e/api-smoke-test.sh
 DRIVE9_API_KEY='local-dev-key' bash e2e/api-smoke-test-existing-key.sh
 bash e2e/cli-smoke-test.sh
 bash e2e/fuse-smoke-test.sh
+bash e2e/git-ops-smoke-test.sh
 bash e2e/git-workspace-smoke-test.sh
 RUN_FUSE_ALL_WORKLOADS=1 bash e2e/fuse-release-gate.sh
 bash e2e/smoke-all.sh
@@ -242,6 +247,22 @@ deterministic read-correctness coverage, not a write/concurrency/Git workload.
    unicode, nested, hardlink, and symlink paths, and that no-match grep fails
 9. Verify the read-only mount rejects writes
 10. Preserve run root, fixture root, and mount log on failure
+
+### `git-ops-smoke-test.sh`
+
+This is the lightweight Git gate for local PR e2e. It creates a small local
+bare Git remote with `git_fixture.py`, so it does not require GitHub, dev/prod
+deployments, or externally published tenant schema.
+
+For both `coding-agent` and a test-local `portable` overlay profile, it runs
+native `git clone`, `drive9 git clone --fast`, and
+`drive9 git clone --fast --blobless --hydrate=off`. Each case verifies clean
+reads, branch creation, commit, stash, staged/unstaged/untracked state, then
+unmounts and remounts the same Drive9 remote root with a fresh local root.
+
+Native clone cases use explicit `.git` pack/unpack for sandbox replacement.
+Fast clone cases disable auto-pack and must recover through Git workspace
+checkpoint/restore.
 
 ### `fuse-sqlite-correctness.sh`
 
