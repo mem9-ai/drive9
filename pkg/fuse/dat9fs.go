@@ -4916,6 +4916,31 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	if fs.isLayerWhiteout(entry.Path) {
+		return gofuse.ENOENT
+	}
+	if mode, ok := fs.layerDirMode(entry.Path); ok {
+		entry.IsDir = true
+		entry.Size = 0
+		entry.Mode = mode
+		entry.HasMode = true
+		fs.inodes.UpdateSize(input.NodeId, 0)
+		fs.inodes.UpdateMode(input.NodeId, mode)
+		fs.fillAttr(entry, &out.Attr)
+		out.SetTimeout(fs.opts.AttrTTL)
+		return gofuse.OK
+	}
+	if target, mode, ok := fs.layerSymlink(entry.Path); ok {
+		entry.IsDir = false
+		entry.Size = int64(len(target))
+		entry.Mode = mode
+		entry.HasMode = true
+		fs.inodes.UpdateSize(input.NodeId, int64(len(target)))
+		fs.inodes.UpdateMode(input.NodeId, mode)
+		fs.fillAttr(entry, &out.Attr)
+		out.SetTimeout(fs.opts.AttrTTL)
+		return gofuse.OK
+	}
 	if overlay, local, st := fs.localOverlayForPath(ctx, entry.Path); local {
 		if st != gofuse.OK {
 			return st

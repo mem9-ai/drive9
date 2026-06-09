@@ -177,6 +177,17 @@ func TestLayerSymlinkLookupAndReadlinkPreferLayerOverLocalPolicy(t *testing.T) {
 	if out.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFLNK) {
 		t.Fatalf("Lookup mode type = %#o, want S_IFLNK", out.Mode&uint32(syscall.S_IFMT))
 	}
+	var attr gofuse.AttrOut
+	st = fs.GetAttr(nil, &gofuse.GetAttrIn{InHeader: gofuse.InHeader{NodeId: out.NodeId}}, &attr)
+	if st != gofuse.OK {
+		t.Fatalf("GetAttr status = %v, want OK", st)
+	}
+	if attr.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFLNK) {
+		t.Fatalf("GetAttr mode type = %#o, want S_IFLNK", attr.Mode&uint32(syscall.S_IFMT))
+	}
+	if attr.Size != uint64(len("base.txt")) {
+		t.Fatalf("GetAttr size = %d, want %d", attr.Size, len("base.txt"))
+	}
 	got, st := fs.Readlink(nil, &gofuse.InHeader{NodeId: out.NodeId})
 	if st != gofuse.OK {
 		t.Fatalf("Readlink status = %v, want OK", st)
