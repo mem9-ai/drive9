@@ -3998,6 +3998,9 @@ func TestLayerSymlinkWritesLayerEntry(t *testing.T) {
 	if got.Path != "/link" || got.Op != "symlink" || got.Kind != "symlink" || got.ContentText != target {
 		t.Fatalf("layer symlink request = %+v, want symlink entry", got)
 	}
+	if got.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFLNK) {
+		t.Fatalf("layer symlink mode type = %#o, want S_IFLNK", got.Mode&uint32(syscall.S_IFMT))
+	}
 	readTarget, st := fs.Readlink(nil, &gofuse.InHeader{NodeId: out.NodeId})
 	if st != gofuse.OK || string(readTarget) != target {
 		t.Fatalf("Readlink = (%q, %v), want %q OK", readTarget, st, target)

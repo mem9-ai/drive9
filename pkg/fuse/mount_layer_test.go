@@ -38,7 +38,7 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 					{LayerID: "layer-1", Path: "/repo/old.txt", Op: "whiteout", Kind: "file", EntrySeq: 1},
 					{LayerID: "layer-1", Path: "/repo/newdir/", Op: "mkdir", Kind: "dir", Mode: 0o755, EntrySeq: 1},
 					{LayerID: "layer-1", Path: "/repo/newdir/", Op: "chmod", Kind: "dir", Mode: 0o700, EntrySeq: 1},
-					{LayerID: "layer-1", Path: "/repo/link", Op: "symlink", Kind: "symlink", ContentText: "target.txt", Mode: symlinkMode(), SizeBytes: 10, EntrySeq: 1},
+					{LayerID: "layer-1", Path: "/repo/link", Op: "symlink", Kind: "symlink", ContentText: "target.txt", Mode: 0o777, SizeBytes: 10, EntrySeq: 1},
 					{LayerID: "layer-1", Path: "/repo/link", Op: "chmod", Kind: "symlink", Mode: 0o600, EntrySeq: 1},
 					{LayerID: "layer-1", Path: "/repo/renamed-from.txt", Op: "rename", Kind: "file", ContentText: "/repo/renamed-to.txt", Mode: 0o644, EntrySeq: 1},
 				},

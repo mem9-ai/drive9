@@ -635,6 +635,7 @@ func (fs *Dat9FS) upsertLayerSymlink(ctx context.Context, localPath string, targ
 		Kind:        "symlink",
 		ContentText: target,
 		SizeBytes:   int64(len(target)),
+		Mode:        symlinkMode(),
 	}, uint64(len(target))); err != nil {
 		return err
 	}
@@ -837,6 +838,8 @@ func (fs *Dat9FS) markLayerSymlink(localPath, target string, mode uint32) {
 	}
 	if mode == 0 {
 		mode = symlinkMode()
+	} else if mode&uint32(syscall.S_IFMT) == 0 {
+		mode = uint32(syscall.S_IFLNK) | (mode & 0o777)
 	}
 	fs.layerMu.Lock()
 	if fs.layerSymlinks == nil {
