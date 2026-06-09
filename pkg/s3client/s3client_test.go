@@ -118,16 +118,16 @@ func TestS3MetricsExposed(t *testing.T) {
 	}
 
 	metricsText := readS3Metrics()
-	if !strings.Contains(metricsText, "dat9_module_up{module=\"s3client\"} 1") {
+	if !strings.Contains(metricsText, "drive9_module_up{module=\"s3client\"} 1") {
 		t.Fatalf("metrics missing s3client module availability: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_operations_total{component=\"s3client\",operation=\"put_object\",result=\"ok\"}") {
+	if !strings.Contains(metricsText, "drive9_service_operations_total{component=\"s3client\",operation=\"put_object\",result=\"ok\"}") {
 		t.Fatalf("metrics missing s3client put_object counter: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_operations_total{component=\"s3client\",operation=\"get_object\",result=\"ok\"}") {
+	if !strings.Contains(metricsText, "drive9_service_operations_total{component=\"s3client\",operation=\"get_object\",result=\"ok\"}") {
 		t.Fatalf("metrics missing s3client get_object counter: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_operation_duration_seconds_count{component=\"s3client\",operation=\"get_object\",result=\"ok\"}") {
+	if !strings.Contains(metricsText, "drive9_service_operation_duration_seconds_count{component=\"s3client\",operation=\"get_object\",result=\"ok\"}") {
 		t.Fatalf("metrics missing s3client duration histogram: %s", metricsText)
 	}
 }

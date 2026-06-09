@@ -513,6 +513,7 @@ func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handl
 			Backend:            b,
 			JournalPermissions: ownerJournalPermissions(),
 		}
+		setRequestMetricScope(r.Context(), scope, classifyTenantRequest(r))
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
 }
@@ -1090,6 +1091,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_ok", "path", path, "bytes", len(plan.InlineData))...)
 	metricEvent(r.Context(), "fs_read", "result", "ok")
+	recordTenantFileBytes(r.Context(), "fs", "read", "read", int64(len(plan.InlineData)))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(plan.InlineData)))
 	_, _ = w.Write(plan.InlineData)
@@ -1453,6 +1455,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_ok", "path", path, "bytes", len(data))...)
 	metricEvent(r.Context(), "fs_write", "result", "ok")
+	recordTenantFileBytes(r.Context(), "fs", "write", "write", int64(len(data)))
 	s.publishEvent(r, path, "write")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": committedRevision})
 }
@@ -1781,6 +1784,13 @@ func (s *Server) handleBatchReadSmall(w http.ResponseWriter, r *http.Request) {
 		}
 		results[i] = s.batchReadSmallOne(r.Context(), b, path, maxBytes)
 	}
+	var readBytes int64
+	for _, result := range results {
+		if result.Status == http.StatusOK {
+			readBytes += int64(len(result.Data))
+		}
+	}
+	recordTenantFileBytes(r.Context(), "fs", "batch_read_small", "read", readBytes)
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "batch_read_small_ok", "count", len(results), "max_bytes", maxBytes)...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(batchReadSmallResponse{Results: results})
@@ -2650,6 +2660,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_ok", "upload_id", uploadID)...)
 	metricEvent(r.Context(), "upload_complete", "result", "ok")
+	recordTenantFileBytes(r.Context(), "upload", "complete", "write", upload.TotalSize)
 	s.publishEvent(r, upload.TargetPath, "upload_complete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
@@ -3214,6 +3225,7 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_ok", "upload_id", uploadID)...)
 	metricEvent(r.Context(), "v2_upload_complete", "result", "ok")
+	recordTenantFileBytes(r.Context(), "upload", "complete", "write", upload.TotalSize)
 	s.publishEvent(r, upload.TargetPath, "upload_complete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "completed"})
 }

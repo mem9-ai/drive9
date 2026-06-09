@@ -332,6 +332,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			IsScoped:           isScoped,
 			FSScopes:           fsScopes,
 		}
+		setRequestMetricScope(r.Context(), scope, classifyTenantRequest(r))
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
 }
@@ -375,6 +376,7 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 		defer release()
 
 		scope := &TenantScope{TenantID: tenantID, Provider: tenant.Provider, Backend: b}
+		setRequestMetricScope(r.Context(), scope, classifyTenantRequest(r))
 		sub := strings.TrimPrefix(r.URL.Path, "/v1/vault/read")
 		s.handleVaultRead(w, r.WithContext(withScope(r.Context(), scope)), sub)
 	})

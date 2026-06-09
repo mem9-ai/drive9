@@ -146,6 +146,7 @@ func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, deltaBytes i
 		metrics.RecordOperation("server_quota", "storage_check", "fail_open", 0)
 		return nil // fail-open
 	}
+	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
 	if cfg.MaxStorageBytes <= 0 {
 		return nil // quota not configured
 	}
@@ -181,10 +182,25 @@ func (b *Dat9Backend) mediaLLMQuotaExceededServer(ctx context.Context) bool {
 		metrics.RecordOperation("server_quota", "media_check", "fail_open", 0)
 		return false // fail-open
 	}
+	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
 	if cfg.MaxMediaLLMFiles <= 0 {
 		return false
 	}
 	return usage.MediaFileCount > cfg.MaxMediaLLMFiles
+}
+
+func recordTenantQuotaSnapshot(tenantID string, usage *QuotaUsageView, cfg *QuotaConfigView) {
+	if tenantID == "" || usage == nil {
+		return
+	}
+	metrics.RecordTenantStorageBytes(tenantID, "confirmed", usage.StorageBytes)
+	metrics.RecordTenantStorageBytes(tenantID, "reserved", usage.ReservedBytes)
+	metrics.RecordTenantMediaFiles(tenantID, "confirmed", usage.MediaFileCount)
+	if cfg == nil {
+		return
+	}
+	metrics.RecordTenantStorageBytes(tenantID, "limit", cfg.MaxStorageBytes)
+	metrics.RecordTenantMediaFiles(tenantID, "limit", cfg.MaxMediaLLMFiles)
 }
 
 // mediaLLMQuotaExceededServerTx checks the server DB counter for media file
