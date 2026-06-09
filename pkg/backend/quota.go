@@ -199,8 +199,12 @@ func recordTenantQuotaSnapshot(tenantID string, usage *QuotaUsageView, cfg *Quot
 	if cfg == nil {
 		return
 	}
-	metrics.RecordTenantStorageBytes(tenantID, "limit", cfg.MaxStorageBytes)
-	metrics.RecordTenantMediaFiles(tenantID, "limit", cfg.MaxMediaLLMFiles)
+	if cfg.MaxStorageBytes > 0 {
+		metrics.RecordTenantStorageBytes(tenantID, "limit", cfg.MaxStorageBytes)
+	}
+	if cfg.MaxMediaLLMFiles > 0 {
+		metrics.RecordTenantMediaFiles(tenantID, "limit", cfg.MaxMediaLLMFiles)
+	}
 }
 
 // mediaLLMQuotaExceededServerTx checks the server DB counter for media file

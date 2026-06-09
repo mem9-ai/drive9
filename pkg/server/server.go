@@ -282,8 +282,12 @@ func NewWithConfig(cfg Config) *Server {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			r.URL.Path = "/" + sub
-			localS3.Handler().ServeHTTP(w, r)
+			subReq := r.Clone(r.Context())
+			subURL := *r.URL
+			subURL.Path = "/" + sub
+			subURL.RawPath = ""
+			subReq.URL = &subURL
+			localS3.Handler().ServeHTTP(w, subReq)
 		}))
 	}
 
@@ -1078,6 +1082,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_presigned_redirect", "path", path)...)
 		metricEvent(r.Context(), "fs_read", "result", "ok")
+		recordTenantFileBytes(r.Context(), "fs", "read", "read", plan.Size)
 		http.Redirect(w, r, plan.PresignURL, http.StatusFound)
 		return
 	}

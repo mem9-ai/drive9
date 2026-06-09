@@ -2,6 +2,10 @@
 
 This directory uses a usage-first layout plus focused incident drill-downs.
 
+## Breaking metric migration
+
+This dashboard set expects the `drive9_*` Prometheus namespace. The previous `dat9_*` metric names are intentionally not dual-emitted by Drive9 after this metrics contract rewrite. Existing external dashboards, alerts, and recording rules must be migrated from `dat9_*` to `drive9_*` at the same time as this server rollout.
+
 ## 1. Usage dashboard
 
 - `drive9-tenant-usage-dashboard.json`: first-stop dashboard for tenant-level product usage: active tenants, request frequency, in-flight requests, logical file reads/writes, HTTP transport bytes, storage/media quota state, latency, and non-OK rates by tenant/surface/action. Use this to answer `who is using Drive9, how much, and through which workflows?`
