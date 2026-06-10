@@ -1,6 +1,11 @@
 package client
 
-import "testing"
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
 
 func TestParseAndDispatchResetIncludesStructuralFields(t *testing.T) {
 	data := `{"seq":7,"reason":"structural_change","path":"/old","op":"rename","actor":"actor1"}`
@@ -48,5 +53,35 @@ func TestParseAndDispatchHeartbeatMarksStreamCurrent(t *testing.T) {
 	}
 	if gotSeq != 42 {
 		t.Fatalf("current seq = %d, want 42", gotSeq)
+	}
+}
+
+func TestStreamEventsParsesMultilineDataAndComments(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(": comment\n"))
+		_, _ = w.Write([]byte("event: file_changed\n"))
+		_, _ = w.Write([]byte(`data: {"seq":9,` + "\n"))
+		_, _ = w.Write([]byte(`data: "path":"/multi.txt","op":"write","ts":1}` + "\n\n"))
+	}))
+	defer ts.Close()
+
+	c := New(ts.URL, "")
+	var got *ChangeEvent
+	err := c.streamEvents(context.Background(), 0, "", func(change *ChangeEvent, reset *ResetEvent) {
+		if reset != nil {
+			t.Fatalf("reset=%+v, want nil", reset)
+		}
+		got = change
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("change event was not dispatched")
+	}
+	if got.Seq != 9 || got.Path != "/multi.txt" || got.Op != "write" {
+		t.Fatalf("change=%+v, want multiline write event", got)
 	}
 }

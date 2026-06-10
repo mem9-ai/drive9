@@ -166,6 +166,15 @@ func InitSchemaStatements() []string {
 			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage(created_at)`,
+		`CREATE TABLE IF NOT EXISTS fs_events (
+			seq        BIGSERIAL PRIMARY KEY,
+			path       VARCHAR(512) NOT NULL,
+			op         VARCHAR(64) NOT NULL,
+			actor      VARCHAR(255),
+			ts         BIGINT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_fs_events_created ON fs_events(created_at)`,
 	}
 	core = append(core, schema.GitWorkspaceDB9SchemaStatements()...)
 	core = append(core, schema.FSLayerDB9SchemaStatements()...)
