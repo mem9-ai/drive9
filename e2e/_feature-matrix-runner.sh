@@ -606,7 +606,7 @@ start_mount() {
     printf ' %q' "$@"
     printf '\n'
   } >>"$log_file"
-  env "DRIVE9_SERVER=$BASE" "DRIVE9_API_KEY=$API_KEY" "$CLI_BIN" mount "$@" >>"$log_file" 2>&1 &
+  env "DRIVE9_SERVER=$BASE" "DRIVE9_API_KEY=$API_KEY" "$CLI_BIN" mount --foreground "$@" >>"$log_file" 2>&1 &
   local mount_pid=$!
   if wait_mount_state "$mount_point" mounted; then
     MOUNT_POINTS+=("$mount_point")
@@ -621,10 +621,11 @@ start_mount() {
 
 stop_mount() {
   local mount_point="$1"
+  shift
   local umount_rc=0
   set +e
   if [ -n "$mount_point" ] && is_mounted "$mount_point"; then
-    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$mount_point" >/dev/null 2>&1
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$@" "$mount_point" >/dev/null 2>&1
     umount_rc=$?
     wait_mount_state "$mount_point" unmounted >/dev/null 2>&1 || true
     if is_mounted "$mount_point"; then
@@ -1064,6 +1065,7 @@ run_git_flow_suite() {
 run_restore_suite() {
   local git_root_rel="$1" file_url="$2" mount_point="$3" local_root_a="$4" log_file_a="$5"
   local restore_repo="$mount_point/restore-workspace"
+  local restore_pack_archive=":/$git_root_rel/restore-workspace-local-git.tar.gz"
   record_drive9_cmd "Git Clone Modes" "restore workspace clone" "$GIT_MATRIX_TIMEOUT_S" git clone --fast --blobless --hydrate=sync "$file_url" "$restore_repo"
   if ! repo_ready "$restore_repo" "Sandbox Restore" "restore workspace repo ready"; then
     return
@@ -1110,7 +1112,7 @@ PY
   fi
   record_status_contains "$restore_repo" "Sandbox Restore" "dirty status before remount" 'README\.md'
 
-  if stop_mount "$mount_point" && ! is_mounted "$mount_point"; then
+  if stop_mount "$mount_point" --pack "$restore_pack_archive" --pack-path .git && ! is_mounted "$mount_point"; then
     record "PASS" "Drive9 Git Workspace Behavior" "unmount drains git workspace state" "rw coding-agent mount unmounted"
   else
     record "FAIL" "Drive9 Git Workspace Behavior" "unmount drains git workspace state" "rw coding-agent mount did not gracefully unmount"
@@ -1120,7 +1122,7 @@ PY
   local local_root_b="$RUN_ROOT/git-local-b"
   local log_file_b="$RUN_ROOT/git-mount-b.log"
   mkdir -p "$mount_point_b" "$local_root_b"
-  if start_mount "$mount_point_b" "$log_file_b" --mode=fuse --profile=coding-agent --local-root "$local_root_b" --durability=interactive ":/$git_root_rel" "$mount_point_b"; then
+  if start_mount "$mount_point_b" "$log_file_b" --mode=fuse --profile=coding-agent --local-root "$local_root_b" --unpack "$restore_pack_archive" --durability=interactive ":/$git_root_rel" "$mount_point_b"; then
     record "PASS" "Drive9 Git Workspace Behavior" "fresh local-root remount starts" "mounted"
   else
     record "FAIL" "Drive9 Git Workspace Behavior" "fresh local-root remount starts" "see $log_file_b"
@@ -1169,13 +1171,13 @@ PY
       record "FAIL" "Drive9 Git Workspace Behavior" "oversized staged object downgrade" "status=${status:-<empty>}"
     fi
   fi
-  mkdir -p "$restore_repo/ignored-build"
-  printf 'local ignored\n' > "$restore_repo/ignored-build/cache.tmp"
+  mkdir -p "$restore_repo/build"
+  printf 'local ignored\n' > "$restore_repo/build/cache.tmp"
   stop_mount "$mount_point_b" >/dev/null 2>&1 || true
   mkdir -p "$mount_point_b" "$RUN_ROOT/git-local-c"
-  if start_mount "$mount_point_b" "$RUN_ROOT/git-mount-c.log" --mode=fuse --profile=coding-agent --local-root "$RUN_ROOT/git-local-c" --durability=interactive ":/$git_root_rel" "$mount_point_b"; then
-    if [ ! -e "$mount_point_b/restore-workspace/ignored-build/cache.tmp" ]; then
-      record "PASS" "Sandbox Restore" "ignored generated files are non-durable by design" "ignored-build/cache.tmp absent after fresh local root"
+  if start_mount "$mount_point_b" "$RUN_ROOT/git-mount-c.log" --mode=fuse --profile=coding-agent --local-root "$RUN_ROOT/git-local-c" --unpack "$restore_pack_archive" --durability=interactive ":/$git_root_rel" "$mount_point_b"; then
+    if [ ! -e "$mount_point_b/restore-workspace/build/cache.tmp" ]; then
+      record "PASS" "Sandbox Restore" "ignored generated files are non-durable by design" "build/cache.tmp absent after fresh local root"
     else
       record "FAIL" "Sandbox Restore" "ignored generated files are non-durable by design" "ignored file unexpectedly restored"
     fi
@@ -1321,7 +1323,7 @@ main() {
     :
   else
     record "FAIL" "pjdfstest" "pjdfstest setup mount" "rw mount failed; see $rw_log"
-    return
+    return 1
   fi
 
   run_pjdfstest_suite "$rw_mount" "$root_rel"
@@ -1345,7 +1347,7 @@ main() {
     record "PASS" "Drive9 Git Workspace Behavior" "coding-agent mount starts" "mounted"
   else
     record "FAIL" "Drive9 Git Workspace Behavior" "coding-agent mount starts" "mount failed"
-    return
+    return 1
   fi
 
   clone_drive9_repo "drive9 git clone --fast" "$bare_repo" "$git_mount/fast-full"
