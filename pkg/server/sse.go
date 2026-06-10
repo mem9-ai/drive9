@@ -561,6 +561,10 @@ func isStructuralOp(op string) bool {
 }
 
 func sendSSEEvent(w *sseBufferedWriter, ev ChangeEvent) {
+	if ev.Op == eventBusForceResetOp {
+		sendSSEReset(w, ev.Seq, sseResultSeqTooOld)
+		return
+	}
 	if isStructuralOp(ev.Op) {
 		// Structural ops are sent as reset events per the accepted design.
 		sendSSEStructuralReset(w, ev)

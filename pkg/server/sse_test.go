@@ -489,6 +489,57 @@ func TestSSEStructuralOpLiveEmitsReset(t *testing.T) {
 	}
 }
 
+func TestSSEForceResetSignalLiveEmitsReset(t *testing.T) {
+	srv := &Server{events: newEventBuses()}
+	bus := srv.events.get("")
+	bus.PublishEvent(ChangeEvent{Seq: 5, Path: "/seed.txt", Op: "write", Ts: 1})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=5", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	current, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial stream-current heartbeat")
+	}
+	if current.Event != "heartbeat" {
+		t.Fatalf("initial event=%q, want heartbeat", current.Event)
+	}
+
+	bus.PublishEvent(ChangeEvent{Seq: 7, Path: "/gap.txt", Op: "write", Ts: 1})
+
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected live reset event")
+	}
+	if ev.Event != "reset" {
+		t.Fatalf("event=%q, want reset", ev.Event)
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
+		t.Fatalf("unmarshal force reset: %v", err)
+	}
+	if data["reason"] != "seq_too_old" {
+		t.Fatalf("reason=%v, want seq_too_old", data["reason"])
+	}
+	if data["seq"] != float64(6) {
+		t.Fatalf("seq=%v, want 6", data["seq"])
+	}
+}
+
 func TestSSEEndpointMethodNotAllowed(t *testing.T) {
 	srv := &Server{events: newEventBuses()}
 	w := httptest.NewRecorder()

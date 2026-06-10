@@ -17,6 +17,7 @@ type ChangeEvent struct {
 const (
 	eventBusRingSize         = 10000
 	eventBusListenerChanSize = 1 // signal-only channel
+	eventBusForceResetOp     = "__sse_force_reset__"
 )
 
 // EventBus is a per-tenant in-memory event hub backed by a fixed-size ring buffer.
@@ -55,15 +56,18 @@ func (eb *EventBus) Publish(path, op, actor string) {
 
 // PublishEvent appends an event whose sequence was assigned by a durable event
 // log. It is used by the SSE endpoint so reconnect replay and live delivery use
-// the same cursor space when possible. If the in-memory cursor is already ahead
-// because of a volatile fallback or out-of-order publish, the event is remapped
-// to the next in-memory sequence so live subscribers still receive the
-// invalidation; reconnecting clients ahead of the durable head will reset.
+// the same cursor space when possible. If the durable event arrives out of order
+// or behind a volatile fallback cursor, publish a reset signal instead of
+// renumbering the durable event into a different live ordering.
 func (eb *EventBus) PublishEvent(ev ChangeEvent) {
 	eb.mu.Lock()
-	if ev.Seq == 0 || ev.Seq <= eb.seq {
+	if ev.Seq == 0 {
 		eb.seq++
 		ev.Seq = eb.seq
+	} else if eb.seq > 0 && ev.Seq != eb.seq+1 {
+		eb.publishResetLocked()
+		eb.mu.Unlock()
+		return
 	} else if ev.Seq > eb.seq {
 		eb.seq = ev.Seq
 	}
@@ -72,6 +76,15 @@ func (eb *EventBus) PublishEvent(ev ChangeEvent) {
 	}
 	eb.publishLocked(ev)
 	eb.mu.Unlock()
+}
+
+func (eb *EventBus) publishResetLocked() {
+	eb.seq++
+	eb.publishLocked(ChangeEvent{
+		Seq: eb.seq,
+		Op:  eventBusForceResetOp,
+		Ts:  time.Now().UnixMilli(),
+	})
 }
 
 func (eb *EventBus) publishLocked(ev ChangeEvent) {
