@@ -136,9 +136,9 @@ func (s *Server) handleFSLayers(w http.ResponseWriter, r *http.Request) {
 	}
 	store := b.Store()
 	switch {
-	case strings.HasPrefix(r.URL.Path, "/v1/fs-layer-checkpoints/"):
+	case strings.HasPrefix(r.URL.Path, "/v1/layer-checkpoints/"):
 		s.handleFSLayerCheckpointObject(w, r, store)
-	case r.URL.Path == "/v1/fs-layers":
+	case r.URL.Path == "/v1/layers":
 		switch r.Method {
 		case http.MethodPost:
 			s.handleFSLayerCreate(w, r, store)
@@ -147,7 +147,7 @@ func (s *Server) handleFSLayers(w http.ResponseWriter, r *http.Request) {
 		default:
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
-	case strings.HasPrefix(r.URL.Path, "/v1/fs-layers/"):
+	case strings.HasPrefix(r.URL.Path, "/v1/layers/"):
 		s.handleFSLayerObject(w, r, b, store)
 	default:
 		errJSON(w, http.StatusNotFound, "not found")
@@ -159,7 +159,7 @@ func (s *Server) handleFSLayerCheckpointObject(w http.ResponseWriter, r *http.Re
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	rawID := strings.TrimPrefix(r.URL.Path, "/v1/fs-layer-checkpoints/")
+	rawID := strings.TrimPrefix(r.URL.Path, "/v1/layer-checkpoints/")
 	if rawID == "" {
 		errJSON(w, http.StatusNotFound, "not found")
 		return
@@ -229,7 +229,7 @@ func (s *Server) handleFSLayerList(w http.ResponseWriter, r *http.Request, store
 }
 
 func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *backendpkg.Dat9Backend, store *datastore.Store) {
-	rest := strings.TrimPrefix(r.URL.Path, "/v1/fs-layers/")
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/layers/")
 	rawID, sub, hasSub := strings.Cut(rest, "/")
 	if rawID == "" {
 		errJSON(w, http.StatusNotFound, "not found")
@@ -280,7 +280,7 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"entries": out})
-	case sub == "checkpoint":
+	case sub == "checkpoints":
 		if r.Method != http.MethodPost {
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 			return

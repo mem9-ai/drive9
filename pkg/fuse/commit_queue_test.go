@@ -81,7 +81,7 @@ func TestCommitQueueLayerEntryShadowSpillUploadsObject(t *testing.T) {
 	var gotPath, gotSize, gotBaseRevision, gotMode string
 	var gotBody []byte
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/objects" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/objects" {
 			http.NotFound(w, r)
 			return
 		}
@@ -346,7 +346,7 @@ func TestCommitQueueLayerUploadWritesEntryAndKeepsPending(t *testing.T) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -404,7 +404,7 @@ func TestCommitQueueLayerUploadWritesEntryAndKeepsPending(t *testing.T) {
 	if got := putCalls.Load(); got != 0 {
 		t.Fatalf("base PUT calls = %d, want 0", got)
 	}
-	if gotPath != "/v1/fs-layers/layer-1/entries" {
+	if gotPath != "/v1/layers/layer-1/entries" {
 		t.Fatalf("layer path = %q", gotPath)
 	}
 	if gotReq.Path != "/remote/ok.txt" || gotReq.Op != "upsert" || gotReq.Kind != "file" {
@@ -434,7 +434,7 @@ func TestCommitQueueLayerUploadAcceptsShadowSpillWithoutBaseWrite(t *testing.T) 
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/objects" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/objects" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -995,7 +995,7 @@ func TestCommitQueueDirectPutRouting(t *testing.T) {
 func TestCommitQueueLayerModeRetainsShadowAndPendingAfterUpload(t *testing.T) {
 	var gotContent []byte
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
 			return

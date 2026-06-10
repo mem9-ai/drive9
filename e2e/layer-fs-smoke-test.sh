@@ -521,7 +521,7 @@ put_layer_entry() {
     '{path:$path, op:$op, kind:$kind, mode:$mode}
       + (if $content != "" then {content:$content, content_text:$text} else {} end)')
   ref_escaped=$(url_escape "$layer_ref")
-  resp=$(curl_body_code POST "$BASE/v1/fs-layers/$ref_escaped/entries" "$API_KEY" "$body")
+  resp=$(curl_body_code POST "$BASE/v1/layers/$ref_escaped/entries" "$API_KEY" "$body")
   code=$(http_code "$resp")
   check_eq "upsert layer entry $path via $layer_ref" "$code" "200"
 }
@@ -545,7 +545,7 @@ put_layer_entry_expect_code() {
     '{path:$path, op:$op, kind:$kind, mode:420}
       + (if $content != "" then {content:$content, content_text:$text} else {} end)')
   ref_escaped=$(url_escape "$layer_ref")
-  resp=$(curl_body_code POST "$BASE/v1/fs-layers/$ref_escaped/entries" "$API_KEY" "$body")
+  resp=$(curl_body_code POST "$BASE/v1/layers/$ref_escaped/entries" "$API_KEY" "$body")
   check_eq "$desc" "$(http_code "$resp")" "$want_code"
 }
 
@@ -673,7 +673,7 @@ check_eq "checkpoint uses requested id" "$(printf '%s' "$checkpoint_json" | jq -
 check_eq "checkpoint durable seq captures first two entries" "$(printf '%s' "$checkpoint_json" | jq -r '.durable_seq')" "2"
 
 checkpoint_ref=$(url_escape "$ckpt_id")
-checkpoint_resp=$(curl_body_code GET "$BASE/v1/fs-layer-checkpoints/$checkpoint_ref" "$API_KEY")
+checkpoint_resp=$(curl_body_code GET "$BASE/v1/layer-checkpoints/$checkpoint_ref" "$API_KEY")
 check_eq "GET checkpoint returns 200" "$(http_code "$checkpoint_resp")" "200"
 check_eq "GET checkpoint resolves layer id" "$(json_body "$checkpoint_resp" | jq -r '.layer_id')" "$layer_id"
 
@@ -687,7 +687,7 @@ put_layer_entry "$layer_name" "$rename_src" "rename" "file" "$rename_dst"
 put_layer_entry_expect_code "entry outside base root is rejected" "400" "$layer_name" "/outside-layer-${ts}/owned.txt" "upsert" "file" "owned"
 diff_after_extra=$(drive9_retry fs layer diff --json "$layer_id")
 check_eq "layer diff shows full API entry set after checkpoint" "$(printf '%s' "$diff_after_extra" | jq '.entries | length')" "9"
-diff_at_checkpoint=$(curl_body_code GET "$BASE/v1/fs-layers/$(url_escape "$layer_id")/diff?max_seq=2" "$API_KEY")
+diff_at_checkpoint=$(curl_body_code GET "$BASE/v1/layers/$(url_escape "$layer_id")/diff?max_seq=2" "$API_KEY")
 check_eq "layer diff max_seq returns 200" "$(http_code "$diff_at_checkpoint")" "200"
 check_eq "layer diff max_seq excludes post-checkpoint entries" "$(json_body "$diff_at_checkpoint" | jq '.entries | length')" "2"
 
@@ -713,7 +713,7 @@ conflict_id=$(printf '%s' "$conflict_json" | jq -r '.layer_id // empty')
 check_cmd "conflict layer create returns id" test -n "$conflict_id"
 put_layer_entry "$conflict_name" "$conflict_file" "upsert" "file" "conflict layer edit ${ts}"
 drive9_retry fs cp "$conflict_mutated_local" ":$conflict_file" >/dev/null
-conflict_commit_resp=$(curl_body_code POST "$BASE/v1/fs-layers/$(url_escape "tag:conflict_run=$ts")/commit" "$API_KEY" "{}")
+conflict_commit_resp=$(curl_body_code POST "$BASE/v1/layers/$(url_escape "tag:conflict_run=$ts")/commit" "$API_KEY" "{}")
 check_eq "conflicting commit returns 409" "$(http_code "$conflict_commit_resp")" "409"
 check_eq "conflicting commit reports base revision changed" "$(json_body "$conflict_commit_resp" | jq -r '.conflicts[0].reason')" "base revision changed"
 conflict_status=$(drive9_retry fs layer status --json "$conflict_id")
@@ -728,7 +728,7 @@ dir_conflict_json=$(drive9_retry fs layer create \
 dir_conflict_id=$(printf '%s' "$dir_conflict_json" | jq -r '.layer_id // empty')
 check_cmd "directory whiteout conflict layer create returns id" test -n "$dir_conflict_id"
 put_layer_entry "$dir_conflict_name" "${delete_dir}/" "whiteout" "dir"
-dir_conflict_commit_resp=$(curl_body_code POST "$BASE/v1/fs-layers/$(url_escape "tag:dir_conflict_run=$ts")/commit" "$API_KEY" "{}")
+dir_conflict_commit_resp=$(curl_body_code POST "$BASE/v1/layers/$(url_escape "tag:dir_conflict_run=$ts")/commit" "$API_KEY" "{}")
 check_eq "non-empty directory whiteout returns 409" "$(http_code "$dir_conflict_commit_resp")" "409"
 check_eq "non-empty directory whiteout reports reason" "$(json_body "$dir_conflict_commit_resp" | jq -r '.conflicts[0].reason')" "directory whiteout requires empty directory"
 check_eq "non-empty directory whiteout preserves child" "$(drive9_retry fs cat "$delete_dir_file")" "$(cat "$delete_local")"

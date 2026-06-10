@@ -399,12 +399,12 @@ CREATE INDEX idx_fs_layer_op
 
 Server：
 
-- `POST /v1/fs-layers`：创建 layer。
-- `GET /v1/fs-layers/{id}`：查看状态。
-- `GET /v1/fs-layers/{id}/diff`：查看 staged changes。
-- `POST /v1/fs-layers/{id}/snapshot`：创建 child layer。
-- `POST /v1/fs-layers/{id}/commit`：all-or-nothing commit。
-- `POST /v1/fs-layers/{id}/rollback`：abandon。
+- `POST /v1/layers`：创建 layer。
+- `GET /v1/layers/{id}`：查看状态。
+- `GET /v1/layers/{id}/diff`：查看 staged changes。
+- `POST /v1/layers/{id}/checkpoints`：创建 restore checkpoint。
+- `POST /v1/layers/{id}/commit`：all-or-nothing commit。
+- `POST /v1/layers/{id}/rollback`：abandon。
 - 现有 `/v1/fs/{path}` 通过 header 选择 layer，例如 `Drive9-Layer-ID`，避免污染 path。
 
 CLI：

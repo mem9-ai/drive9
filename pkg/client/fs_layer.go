@@ -120,7 +120,7 @@ func (c *Client) CreateFSLayer(ctx context.Context, req FSLayerCreateRequest) (*
 	if err != nil {
 		return nil, err
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/fs-layers", bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/layers", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +141,7 @@ func (c *Client) CreateFSLayer(ctx context.Context, req FSLayerCreateRequest) (*
 }
 
 func (c *Client) ListFSLayers(ctx context.Context) ([]FSLayer, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/fs-layers", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/layers", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +166,7 @@ func (c *Client) GetFSLayer(ctx context.Context, layerID string) (*FSLayer, erro
 	if strings.TrimSpace(layerID) == "" {
 		return nil, fmt.Errorf("layerID must not be empty")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/fs-layers/"+url.PathEscape(layerID), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/layers/"+url.PathEscape(layerID), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -200,7 +200,7 @@ func (c *Client) diffFSLayer(ctx context.Context, layerID string, maxSeq *int64)
 	if strings.TrimSpace(layerID) == "" {
 		return nil, fmt.Errorf("layerID must not be empty")
 	}
-	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/diff"
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/diff"
 	if maxSeq != nil {
 		u += "?max_seq=" + url.QueryEscape(fmt.Sprintf("%d", *maxSeq))
 	}
@@ -233,7 +233,7 @@ func (c *Client) UpsertFSLayerEntry(ctx context.Context, layerID string, req FSL
 	if err != nil {
 		return nil, err
 	}
-	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/entries"
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/entries"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -270,7 +270,7 @@ func (c *Client) UploadFSLayerFile(ctx context.Context, layerID, path string, bo
 	if hasMode {
 		q.Set("mode", fmt.Sprintf("%o", mode&0o777))
 	}
-	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/objects?" + q.Encode()
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/objects?" + q.Encode()
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u, body)
 	if err != nil {
 		return nil, err
@@ -313,7 +313,7 @@ func (c *Client) ReadFSLayerFileStream(ctx context.Context, layerID, path string
 	if maxSeq != nil {
 		q.Set("max_seq", fmt.Sprintf("%d", *maxSeq))
 	}
-	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/objects?" + q.Encode()
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/objects?" + q.Encode()
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -347,7 +347,7 @@ func (c *Client) getFSLayerEntry(ctx context.Context, layerID, path string, maxS
 	if strings.TrimSpace(path) == "" {
 		return nil, fmt.Errorf("path must not be empty")
 	}
-	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/entries?path=" + url.QueryEscape(path)
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/entries?path=" + url.QueryEscape(path)
 	if maxSeq != nil {
 		u += "&max_seq=" + url.QueryEscape(fmt.Sprintf("%d", *maxSeq))
 	}
@@ -378,7 +378,7 @@ func (c *Client) CheckpointFSLayer(ctx context.Context, layerID string, req FSLa
 	if err != nil {
 		return nil, err
 	}
-	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/checkpoint"
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/checkpoints"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
@@ -403,7 +403,7 @@ func (c *Client) GetFSLayerCheckpoint(ctx context.Context, checkpointID string) 
 	if strings.TrimSpace(checkpointID) == "" {
 		return nil, fmt.Errorf("checkpointID must not be empty")
 	}
-	u := c.baseURL + "/v1/fs-layer-checkpoints/" + url.PathEscape(checkpointID)
+	u := c.baseURL + "/v1/layer-checkpoints/" + url.PathEscape(checkpointID)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -431,7 +431,7 @@ func (c *Client) ListFSLayerEvents(ctx context.Context, layerID string, since in
 	if since > 0 {
 		q.Set("since", fmt.Sprintf("%d", since))
 	}
-	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/events"
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/events"
 	if encoded := q.Encode(); encoded != "" {
 		u += "?" + encoded
 	}
@@ -464,7 +464,7 @@ func (c *Client) CommitFSLayer(ctx context.Context, layerID string) (*FSLayerCom
 	if strings.TrimSpace(layerID) == "" {
 		return nil, fmt.Errorf("layerID must not be empty")
 	}
-	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/commit"
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/commit"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return nil, err
@@ -503,7 +503,7 @@ func (c *Client) postFSLayerAction(ctx context.Context, layerID, action string) 
 	if strings.TrimSpace(layerID) == "" {
 		return fmt.Errorf("layerID must not be empty")
 	}
-	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/" + action
+	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/" + action
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader([]byte("{}")))
 	if err != nil {
 		return err

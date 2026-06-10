@@ -19,13 +19,13 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layer-checkpoints/cp1":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layer-checkpoints/cp1":
 			_ = json.NewEncoder(w).Encode(client.FSLayerCheckpoint{
 				CheckpointID: "cp1",
 				LayerID:      "layer-1",
 				DurableSeq:   1,
 			})
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/diff":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
 			if r.URL.Query().Get("max_seq") != "1" {
 				t.Errorf("diff max_seq = %q, want 1", r.URL.Query().Get("max_seq"))
 				w.WriteHeader(http.StatusInternalServerError)
@@ -43,7 +43,7 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 					{LayerID: "layer-1", Path: "/repo/renamed-from.txt", Op: "rename", Kind: "file", ContentText: "/repo/renamed-to.txt", Mode: 0o644, EntrySeq: 1},
 				},
 			})
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
 			if r.URL.Query().Get("path") != "/repo/a.txt" {
 				t.Errorf("unexpected entry path query: %q", r.URL.RawQuery)
 				w.WriteHeader(http.StatusInternalServerError)
@@ -153,16 +153,16 @@ func TestRestoreLayerEntriesStreamsObjectBackedFile(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/diff":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
 			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{entry}})
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
 			if r.URL.Query().Get("path") != "/repo/large.bin" {
 				t.Errorf("unexpected entry query: %q", r.URL.RawQuery)
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
 			_ = json.NewEncoder(w).Encode(entry)
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/objects":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/objects":
 			if r.URL.Query().Get("path") != "/repo/large.bin" {
 				t.Errorf("unexpected object query: %q", r.URL.RawQuery)
 				w.WriteHeader(http.StatusInternalServerError)
@@ -212,7 +212,7 @@ func TestRestoreLayerChmodOnlyFileRecordsModeOverlay(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/diff":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"entries": []client.FSLayerEntry{
 					{LayerID: "layer-1", Path: "/repo/base.txt", Op: "chmod", Kind: "file", Mode: 0o600, EntrySeq: 1},
@@ -329,7 +329,7 @@ func TestLayerSymlinkLookupAndReadlinkPreferLayerOverLocalPolicy(t *testing.T) {
 func TestLayerChmodPreservesSymlinkModeAcrossRelistLookupReadlink(t *testing.T) {
 	var got clientLayerEntryRequest
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -400,7 +400,7 @@ func TestLayerChmodPreservesSymlinkModeAcrossRelistLookupReadlink(t *testing.T) 
 func TestLayerChmodUsesDirectoryKind(t *testing.T) {
 	var got clientLayerEntryRequest
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -439,7 +439,7 @@ func TestLayerChmodUsesDirectoryKind(t *testing.T) {
 func TestLayerChmodCoalescesPendingFileContent(t *testing.T) {
 	var got clientLayerEntryRequest
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -510,7 +510,7 @@ func TestLayerChmodCoalescesShadowFileWithoutPendingMeta(t *testing.T) {
 		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/repo/new.txt":
 			w.WriteHeader(http.StatusNotFound)
 			return
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries":
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
@@ -577,7 +577,7 @@ func TestLayerChmodCoalescesExistingLayerUpsertContent(t *testing.T) {
 	var got clientLayerEntryRequest
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
 			if r.URL.Query().Get("path") != "/repo/new.txt" {
 				t.Errorf("entry path query = %q, want /repo/new.txt", r.URL.Query().Get("path"))
 				w.WriteHeader(http.StatusBadRequest)
@@ -593,7 +593,7 @@ func TestLayerChmodCoalescesExistingLayerUpsertContent(t *testing.T) {
 				Mode:         0o644,
 			})
 			return
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries":
 		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/repo/new.txt":
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -652,7 +652,7 @@ func TestLayerChmodCoalescesExistingLayerUpsertContent(t *testing.T) {
 
 func TestLayerFileUpsertClearsStaleNamespaceState(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -747,7 +747,7 @@ func TestLayerRmdirRejectsNonEmptyBaseDir(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"results": []client.BatchStatResult{{Path: "/repo/dir/child.txt", Status: http.StatusOK, Size: 1}},
 			})
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries":
 			layerWrites++
 			w.WriteHeader(http.StatusInternalServerError)
 		default:
@@ -778,7 +778,7 @@ func TestLayerRmdirRejectsNonEmptyBaseDir(t *testing.T) {
 func TestLayerSymlinkHonorsLocalOnlyOverlay(t *testing.T) {
 	var layerWrites int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodPost && r.URL.Path == "/v1/fs-layers/layer-1/entries" {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries" {
 			layerWrites++
 		}
 		w.WriteHeader(http.StatusInternalServerError)
@@ -815,7 +815,7 @@ func TestLayerSymlinkHonorsLocalOnlyOverlay(t *testing.T) {
 func TestLayerRenamePreservesLayerSymlink(t *testing.T) {
 	var requests []clientLayerEntryRequest
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/entries" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
@@ -873,7 +873,7 @@ func TestLayerRenameCopyUpMaterializesTarget(t *testing.T) {
 			http.NotFound(w, r)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/old.txt":
 			_, _ = w.Write([]byte("old-data"))
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries":
 			var req clientLayerEntryRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Errorf("decode layer entry: %v", err)
@@ -945,7 +945,7 @@ func TestLayerRenameCopyUpUsesExistingLayerEntry(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
 			if r.URL.Query().Get("path") != "/repo/old.txt" {
 				t.Errorf("unexpected layer entry query: %q", r.URL.RawQuery)
 				w.WriteHeader(http.StatusInternalServerError)
@@ -964,7 +964,7 @@ func TestLayerRenameCopyUpUsesExistingLayerEntry(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/old.txt":
 			t.Error("rename read base old path; want existing layer entry")
 			w.WriteHeader(http.StatusInternalServerError)
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries":
 			var req clientLayerEntryRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Errorf("decode layer entry: %v", err)

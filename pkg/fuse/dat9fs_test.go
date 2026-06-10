@@ -3954,7 +3954,7 @@ func TestLayerSymlinkWritesLayerEntry(t *testing.T) {
 	var layerPosts atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries":
 			layerPosts.Add(1)
 			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 				t.Errorf("decode body: %v", err)

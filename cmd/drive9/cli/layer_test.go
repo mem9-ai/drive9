@@ -15,7 +15,7 @@ import (
 
 func TestLayerCreatePrintsLayerID(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers" {
 			http.NotFound(w, r)
 			return
 		}
@@ -63,7 +63,7 @@ func TestCpLayerLocalUploadUsesFSLayerEntry(t *testing.T) {
 		switch r.Method + " " + r.URL.Path {
 		case "HEAD /v1/fs/repo/layer.txt":
 			http.NotFound(w, r)
-		case "POST /v1/fs-layers/layer-1/entries":
+		case "POST /v1/layers/layer-1/entries":
 			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 				t.Fatalf("decode entry request: %v", err)
 			}
@@ -131,7 +131,7 @@ func TestLayerCreateRejectsDuplicateTag(t *testing.T) {
 
 func TestLayerCommitPrintsResult(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/task=auth/commit" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/task=auth/commit" {
 			http.NotFound(w, r)
 			return
 		}
@@ -156,7 +156,7 @@ func TestLayerCommitPrintsResult(t *testing.T) {
 
 func TestLayerDiffTextOutput(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/fs-layers/layer-1/diff" {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/layers/layer-1/diff" {
 			http.NotFound(w, r)
 			return
 		}

@@ -12,7 +12,7 @@ import (
 
 func TestCommitFSLayerReturnsConflictBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/fs-layers/layer-1/commit" {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/commit" {
 			http.NotFound(w, r)
 			return
 		}
@@ -47,7 +47,7 @@ func TestCommitFSLayerReturnsConflictBody(t *testing.T) {
 func TestCommitFSLayerConflictBodyReadError(t *testing.T) {
 	c := New("http://drive9.test", "")
 	c.httpClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		if req.Method != http.MethodPost || req.URL.Path != "/v1/fs-layers/layer-1/commit" {
+		if req.Method != http.MethodPost || req.URL.Path != "/v1/layers/layer-1/commit" {
 			t.Fatalf("unexpected request: %s %s", req.Method, req.URL.String())
 		}
 		return &http.Response{

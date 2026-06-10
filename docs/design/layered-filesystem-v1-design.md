@@ -403,20 +403,20 @@ created_at
 新增 API：
 
 ```text
-POST /v1/fs-layers
-GET  /v1/fs-layers
-GET  /v1/fs-layers/{layer-ref}
-GET  /v1/fs-layers/{layer-ref}/diff
-GET  /v1/fs-layers/{layer-ref}/entries?path=/...
-POST /v1/fs-layers/{layer-ref}/entries
-POST /v1/fs-layers/{layer-ref}/checkpoint
-POST /v1/fs-layers/{layer-ref}/commit
-POST /v1/fs-layers/{layer-ref}/rollback
-GET  /v1/fs-layer-checkpoints/{checkpoint-id}
+POST /v1/layers
+GET  /v1/layers
+GET  /v1/layers/{layer-ref}
+GET  /v1/layers/{layer-ref}/diff
+GET  /v1/layers/{layer-ref}/entries?path=/...
+POST /v1/layers/{layer-ref}/entries
+POST /v1/layers/{layer-ref}/checkpoints
+POST /v1/layers/{layer-ref}/commit
+POST /v1/layers/{layer-ref}/rollback
+GET  /v1/layer-checkpoints/{checkpoint-id}
 ```
 
 V1 保持现有 `/v1/fs` API 代码路径不变。layer mount 通过显式
-`/v1/fs-layers/{layer-ref}/entries` 写 layer entry；没有 `--layer` 或
+`/v1/layers/{layer-ref}/entries` 写 layer entry；没有 `--layer` 或
 layer API 调用时，旧客户端仍走原来的 `/v1/fs` 读写路径和性能路径。
 
 ```text
