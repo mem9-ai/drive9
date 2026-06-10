@@ -440,9 +440,12 @@ func TestAtomicStateWrite(t *testing.T) {
 	require.Equal(t, "v0.9.0", got.LatestVersion)
 	require.Equal(t, "v0.8.5", got.SkippedVersion)
 
-	// Verify no temp file left behind.
-	_, err := os.Stat(path + ".tmp")
-	require.True(t, os.IsNotExist(err), "temp file should be cleaned up")
+	// Verify no temp files left behind.
+	entries, err := os.ReadDir(filepath.Dir(path))
+	require.NoError(t, err)
+	for _, e := range entries {
+		require.False(t, strings.Contains(e.Name(), ".tmp"), "temp file %s should be cleaned up", e.Name())
+	}
 }
 
 func TestSkipVersion(t *testing.T) {
@@ -496,8 +499,9 @@ func clearCIEnv(t *testing.T) {
 		"CODEBUILD_BUILD_ID", "CODESPACES",
 		"DRIVE9_NO_UPDATE_CHECK",
 	} {
+		// t.Setenv sets the var for the test duration and restores on cleanup.
+		// Setting to "" effectively unsets it for os.Getenv("...") != "" checks.
 		t.Setenv(v, "")
-		os.Unsetenv(v)
 	}
 }
 

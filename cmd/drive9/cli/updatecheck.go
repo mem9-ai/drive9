@@ -35,7 +35,9 @@ const updateCheckTTL = 24 * time.Hour
 const updateCheckTimeout = 1 * time.Second
 
 // updateLatestURL is the endpoint that returns the latest release metadata.
-// Override via DRIVE9_UPDATE_URL for testing.
+// Override via DRIVE9_UPDATE_URL for testing or internal mirrors. This only
+// affects the version-check fetch URL; the install command shown to the user
+// is always the default public URL.
 var updateLatestURL = "https://drive9.ai/releases/latest.json"
 
 // ReleaseInfo holds metadata about a release fetched from the update endpoint.
@@ -87,8 +89,8 @@ func ShouldCheckForUpdate(currentVersion, command string) bool {
 		return false
 	}
 
-	// Both stdout and stderr must be TTY.
-	if !isTerminal(os.Stdout) || !isTerminal(os.Stderr) {
+	// All update output goes to stderr; only check stderr TTY.
+	if !isTerminal(os.Stderr) {
 		return false
 	}
 
@@ -236,9 +238,6 @@ func trimV(v string) string {
 }
 
 func installCommand() string {
-	if url := os.Getenv("DRIVE9_UPDATE_URL"); url != "" {
-		return fmt.Sprintf("curl -fsSL %s | sh", url)
-	}
 	return "curl -fsSL https://drive9.ai/install.sh | sh"
 }
 
@@ -269,6 +268,7 @@ func readUpdateState(path string) *updateState {
 }
 
 // writeUpdateState persists state using atomic write (write-to-temp + rename).
+// Errors are silently ignored — update check state is best-effort.
 func writeUpdateState(path string, s *updateState) {
 	if path == "" || s == nil {
 		return
@@ -281,12 +281,25 @@ func writeUpdateState(path string, s *updateState) {
 	if err != nil {
 		return
 	}
-	// Atomic write: write to temp file, then rename.
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// Atomic write: create temp file in the same directory (avoids
+	// cross-device rename failures), then rename over the target.
+	tmpFile, err := os.CreateTemp(dir, ".update-check-*.tmp")
+	if err != nil {
 		return
 	}
-	_ = os.Rename(tmp, path)
+	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+	}
 }
 
 func fetchLatestRelease(ctx context.Context) *ReleaseInfo {
