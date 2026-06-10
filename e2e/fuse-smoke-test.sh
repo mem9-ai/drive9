@@ -1078,8 +1078,10 @@ PY
 
     write_pattern_file "$TIER_MOUNT" 8388608 67
     tier_large_second_hash=$(sha256_file "$TIER_MOUNT")
-    tier_large_second_size=$(wait_remote_stat_field_eq "$TIER_REMOTE" "size" "8388608" "$LARGE_FILE_VISIBILITY_TIMEOUT_S" "$LARGE_FILE_VISIBILITY_INTERVAL_S")
-    check_eq "tier transition 8MiB B size matches remote stat" "$tier_large_second_size" "8388608"
+    # Same-size overwrite (8MiB A → 8MiB B): size-only wait would return
+    # immediately because the remote file already has size 8388608.
+    # Poll on content hash instead — wait_remote_file_hash_eq downloads
+    # and checks the sha256 on each iteration until the new pattern lands.
     if tier_large_second_remote_hash=$(wait_remote_file_hash_eq "$TIER_REMOTE" "$tier_large_second_hash" "$TIER_DOWNLOADED" "$LARGE_FILE_VISIBILITY_TIMEOUT_S" "$LARGE_FILE_VISIBILITY_INTERVAL_S"); then
       :
     else
