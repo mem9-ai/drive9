@@ -747,7 +747,7 @@ check_eq "new file visible after commit" "$(drive9_retry fs cat "$new_file")" "n
 check_eq "extra file visible after commit" "$(drive9_retry fs cat "$extra_file")" "extra after checkpoint ${ts}"
 check_eq "nested mkdir/upsert visible after commit" "$(drive9_retry fs cat "$api_dir_file")" "nested after checkpoint ${ts}"
 check_cmd_fail "whiteout file removed after commit" drive9 fs cat "$delete_file"
-check_cmd_fail "whiteout empty directory removed after commit" drive9 fs ls "$empty_delete_dir"
+check_cmd_fail "whiteout empty directory removed after commit" drive9 fs stat "$empty_delete_dir"
 check_cmd_fail "rename source removed after commit" drive9 fs cat "$rename_src"
 check_eq "rename target visible after commit" "$(drive9_retry fs cat "$rename_dst")" "$(cat "$rename_local")"
 
