@@ -76,7 +76,27 @@ func main() {
 		usage(2)
 	}
 
-	dispatch(os.Args[1], os.Args[2:])
+	cmd := os.Args[1]
+
+	// Start async update check before command execution (gh CLI pattern).
+	// The goroutine has its own 1s HTTP timeout; we drain the channel
+	// after dispatch returns so we never block the user's command.
+	var updateResultCh chan *cli.ReleaseInfo
+	if cli.ShouldCheckForUpdate(buildinfo.Version, cmd) {
+		updateResultCh = make(chan *cli.ReleaseInfo, 1)
+		go func() {
+			updateResultCh <- cli.CheckForUpdate(context.Background(), buildinfo.Version)
+		}()
+	}
+
+	dispatch(cmd, os.Args[2:])
+
+	// Show update notice after command completes (never before).
+	if updateResultCh != nil {
+		if rel := <-updateResultCh; rel != nil {
+			cli.PrintUpdateNotice(rel, buildinfo.Version)
+		}
+	}
 }
 
 // dispatch routes a parsed (verb, args) pair to the matching command handler.
