@@ -3562,6 +3562,37 @@ func (fs *Dat9FS) cacheNegativePath(p string) {
 	fs.dirCache.MarkNegative(parentPath, name)
 }
 
+// maybeListOnNegativeLookupStorm converts a burst of remote ENOENT lookups
+// under one directory into a single ListDir. Workloads that probe many
+// missing names (fio layout passes, build systems, archive extraction)
+// otherwise pay one remote stat per name; one listing lets the namespace
+// cache answer the rest of the burst locally under the same negative-TTL
+// staleness contract.
+//
+// Lock files are excluded because lookupFromDirCache deliberately bypasses
+// the namespace cache for them, so a listing could never absorb their misses
+// and each lock probe would re-trigger escalation.
+func (fs *Dat9FS) maybeListOnNegativeLookupStorm(cancel <-chan struct{}, parentPath, childP string) {
+	if fs.dirCache == nil || isLockFilePath(childP) || fs.opts.LegacyDirStatFallback {
+		return
+	}
+	if !fs.dirCache.RecordRemoteNegative(parentPath) {
+		return
+	}
+	if fs.perf != nil {
+		fs.perf.lookupStormList.add(1)
+	}
+	items, err := fs.lookupListWithRetry(cancel, parentPath)
+	if err != nil || !fs.dirCache.CanAnswerMisses(parentPath) {
+		// Listing failed or was too large to mark complete; cool down so a
+		// sustained probe storm cannot hammer the server with listings.
+		fs.dirCache.DeferEscalation(parentPath)
+		fs.debugf("lookup storm list deferred dir=%s items=%d err=%v", parentPath, len(items), err)
+		return
+	}
+	fs.debugf("lookup storm list dir=%s items=%d", parentPath, len(items))
+}
+
 func (fs *Dat9FS) negativeEntryTTL(p string) time.Duration {
 	if isLockFilePath(p) {
 		return 0
@@ -4127,6 +4158,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		// Cache negative lookup: tell kernel this entry doesn't exist
 		// for NegativeEntryTTL so it doesn't re-ask immediately.
 		fs.cacheNegativePath(childP)
+		fs.maybeListOnNegativeLookupStorm(cancel, parentPath, childP)
 		out.NodeId = 0
 		out.SetEntryTimeout(fs.negativeEntryTTL(childP))
 		return gofuse.ENOENT

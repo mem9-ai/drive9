@@ -105,6 +105,7 @@ type fusePerfCounters struct {
 	namespaceCompleteMiss atomicUint64
 	namespaceSessionMiss  atomicUint64
 	namespacePartialMiss  atomicUint64
+	lookupStormList       atomicUint64
 
 	lookupRetryTotal     atomicUint64
 	lookupRetrySuccess   atomicUint64
@@ -280,6 +281,7 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	snap.Counters["namespace_complete_miss"] = p.namespaceCompleteMiss.load()
 	snap.Counters["namespace_session_miss"] = p.namespaceSessionMiss.load()
 	snap.Counters["namespace_partial_miss"] = p.namespacePartialMiss.load()
+	snap.Counters["lookup_storm_list"] = p.lookupStormList.load()
 	snap.Counters["lookup_retry_total"] = p.lookupRetryTotal.load()
 	snap.Counters["lookup_retry_success"] = p.lookupRetrySuccess.load()
 	snap.Counters["lookup_retry_exhausted"] = p.lookupRetryExhausted.load()
