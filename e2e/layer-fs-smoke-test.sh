@@ -24,6 +24,7 @@ MOUNT_READY_INTERVAL_S="${MOUNT_READY_INTERVAL_S:-1}"
 LAYER_DIFF_TIMEOUT_S="${LAYER_DIFF_TIMEOUT_S:-20}"
 LAYER_DIFF_INTERVAL_S="${LAYER_DIFF_INTERVAL_S:-1}"
 LAYER_FUSE_LOG_AUDIT_PATTERN="${LAYER_FUSE_LOG_AUDIT_PATTERN:-panic|fatal error|Resource temporarily unavailable|restore fs layer entries failed}"
+LAYER_CLI_LARGE_FILE_MB="${LAYER_CLI_LARGE_FILE_MB:-100}"
 
 PASS=0
 FAIL=0
@@ -79,6 +80,29 @@ readlink_target_for_check() {
   fi
   printf 'readlink failed: %s' "$out"
   return 0
+}
+
+sha256_file() {
+  local file_path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file_path" | cut -d' ' -f1
+    return
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file_path" | cut -d' ' -f1
+    return
+  fi
+  python3 - "$file_path" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+h = hashlib.sha256()
+with pathlib.Path(sys.argv[1]).open("rb") as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+        h.update(chunk)
+print(h.hexdigest())
+PY
 }
 
 skip_layer_fuse() {
@@ -582,6 +606,7 @@ api_dir_file="${api_dir}/nested.txt"
 delete_file="${root}/delete-me.txt"
 delete_dir="${root}/delete-dir"
 delete_dir_file="${delete_dir}/gone.txt"
+empty_delete_dir="${root}/empty-delete-dir"
 rename_src="${root}/rename-src.txt"
 rename_dst="${root}/rename-dst.txt"
 symlink_path="${root}/api-link"
@@ -595,6 +620,8 @@ conflict_mutated_local="/tmp/drive9-layer-conflict-mutated-${ts}.txt"
 layer_name="layer-smoke-${ts}"
 rollback_name="layer-smoke-rollback-${ts}"
 conflict_name="layer-smoke-conflict-${ts}"
+dir_conflict_name="layer-smoke-dir-conflict-${ts}"
+cli_layer_name="layer-smoke-cli-${ts}"
 unique_tag="unique_${ts}"
 ckpt_id="ckpt_smoke_${ts}"
 
@@ -605,6 +632,7 @@ printf 'conflict base before layer %s\n' "$ts" >"$conflict_local"
 printf 'conflict base changed outside layer %s\n' "$ts" >"$conflict_mutated_local"
 drive9_retry fs mkdir "$root" >/dev/null
 drive9_retry fs mkdir "$delete_dir" >/dev/null
+drive9_retry fs mkdir "$empty_delete_dir" >/dev/null
 drive9_retry fs cp "$base_local" ":$base_file" >/dev/null
 drive9_retry fs cp "$delete_local" ":$delete_file" >/dev/null
 drive9_retry fs cp "$delete_local" ":$delete_dir_file" >/dev/null
@@ -653,7 +681,7 @@ put_layer_entry "$layer_name" "$extra_file" "upsert" "file" "extra after checkpo
 put_layer_entry "$layer_name" "${api_dir}/" "mkdir" "dir" "" 493
 put_layer_entry "$layer_name" "$api_dir_file" "upsert" "file" "nested after checkpoint ${ts}"
 put_layer_entry "$layer_name" "$delete_file" "whiteout" "file"
-put_layer_entry "$layer_name" "${delete_dir}/" "whiteout" "dir"
+put_layer_entry "$layer_name" "${empty_delete_dir}/" "whiteout" "dir"
 put_layer_entry "$layer_name" "$symlink_path" "symlink" "symlink" "base.txt" 41471
 put_layer_entry "$layer_name" "$rename_src" "rename" "file" "$rename_dst"
 put_layer_entry_expect_code "entry outside base root is rejected" "400" "$layer_name" "/outside-layer-${ts}/owned.txt" "upsert" "file" "owned"
@@ -692,6 +720,19 @@ conflict_status=$(drive9_retry fs layer status --json "$conflict_id")
 check_eq "conflicting layer state is conflicted" "$(printf '%s' "$conflict_status" | jq -r '.state')" "conflicted"
 check_eq "conflicting commit preserves mutated base" "$(drive9_retry fs cat "$conflict_file")" "$(cat "$conflict_mutated_local")"
 
+dir_conflict_json=$(drive9_retry fs layer create \
+  --name "$dir_conflict_name" \
+  --tag "dir_conflict_run=$ts" \
+  --json \
+  ":$root")
+dir_conflict_id=$(printf '%s' "$dir_conflict_json" | jq -r '.layer_id // empty')
+check_cmd "directory whiteout conflict layer create returns id" test -n "$dir_conflict_id"
+put_layer_entry "$dir_conflict_name" "${delete_dir}/" "whiteout" "dir"
+dir_conflict_commit_resp=$(curl_body_code POST "$BASE/v1/fs-layers/$(url_escape "tag:dir_conflict_run=$ts")/commit" "$API_KEY" "{}")
+check_eq "non-empty directory whiteout returns 409" "$(http_code "$dir_conflict_commit_resp")" "409"
+check_eq "non-empty directory whiteout reports reason" "$(json_body "$dir_conflict_commit_resp" | jq -r '.conflicts[0].reason')" "directory whiteout requires empty directory"
+check_eq "non-empty directory whiteout preserves child" "$(drive9_retry fs cat "$delete_dir_file")" "$(cat "$delete_local")"
+
 commit_out=$(drive9_retry fs layer commit "tag:$unique_tag")
 case "$commit_out" in
   committed\ layer="$layer_id"\ applied=9) commit_status="ok" ;;
@@ -706,9 +747,55 @@ check_eq "new file visible after commit" "$(drive9_retry fs cat "$new_file")" "n
 check_eq "extra file visible after commit" "$(drive9_retry fs cat "$extra_file")" "extra after checkpoint ${ts}"
 check_eq "nested mkdir/upsert visible after commit" "$(drive9_retry fs cat "$api_dir_file")" "nested after checkpoint ${ts}"
 check_cmd_fail "whiteout file removed after commit" drive9 fs cat "$delete_file"
-check_cmd_fail "whiteout directory child removed after commit" drive9 fs cat "$delete_dir_file"
+check_cmd_fail "whiteout empty directory removed after commit" drive9 fs ls "$empty_delete_dir"
 check_cmd_fail "rename source removed after commit" drive9 fs cat "$rename_src"
 check_eq "rename target visible after commit" "$(drive9_retry fs cat "$rename_dst")" "$(cat "$rename_local")"
+
+echo "[cli-layer] explicit --layer write/search/large-file coverage"
+cli_layer_json=$(drive9_retry fs layer create \
+  --name "$cli_layer_name" \
+  --tag "cli_layer_run=$ts" \
+  --json \
+  ":$root")
+cli_layer_id=$(printf '%s' "$cli_layer_json" | jq -r '.layer_id // empty')
+check_cmd "CLI layer create returns id" test -n "$cli_layer_id"
+cli_small_local="/tmp/drive9-layer-cli-small-${ts}.txt"
+cli_large_local="/tmp/drive9-layer-cli-large-${ts}.bin"
+cli_large_download="/tmp/drive9-layer-cli-large-downloaded-${ts}.bin"
+cli_small_remote="${root}/cli-layer-small.txt"
+cli_large_remote="${root}/cli-layer-large.bin"
+cli_dir_remote="${root}/cli-layer-dir"
+printf 'cli layer needle %s\n' "$ts" >"$cli_small_local"
+python3 - "$cli_large_local" "$LAYER_CLI_LARGE_FILE_MB" "$ts" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+mb = int(sys.argv[2])
+seed = f"drive9 layer large {sys.argv[3]}\n".encode()
+block = (seed * ((1024 * 1024 // len(seed)) + 1))[:1024 * 1024]
+with path.open("wb") as f:
+    for _ in range(mb):
+        f.write(block)
+    f.write(b"drive9-layer-large-tail\n")
+PY
+drive9_retry fs cp --layer "$cli_layer_name" "$cli_small_local" ":$cli_small_remote" >/dev/null
+drive9_retry fs cp --layer "$cli_layer_name" "$cli_large_local" ":$cli_large_remote" >/dev/null
+drive9_retry fs mkdir --layer "$cli_layer_name" "$cli_dir_remote" >/dev/null
+check_cmd_fail "CLI --layer small file is not visible in base before commit" drive9 fs cat "$cli_small_remote"
+grep_layer_out=$(drive9_retry fs grep --layer "$cli_layer_name" "cli layer needle" "$root")
+check_eq "CLI grep --layer sees overlay file" "$(printf '%s\n' "$grep_layer_out" | grep -F "$cli_small_remote" | wc -l | tr -d ' ')" "1"
+find_layer_out=$(drive9_retry fs find --layer "$cli_layer_name" "$root")
+check_eq "CLI find --layer sees overlay file" "$(printf '%s\n' "$find_layer_out" | grep -F "$cli_small_remote" | wc -l | tr -d ' ')" "1"
+cli_commit_out=$(drive9_retry fs layer commit "tag:cli_layer_run=$ts")
+case "$cli_commit_out" in
+  committed\ layer="$cli_layer_id"\ applied=3) cli_commit_status="ok" ;;
+  *) cli_commit_status="$cli_commit_out" ;;
+esac
+check_eq "commit CLI --layer writes succeeds" "$cli_commit_status" "ok"
+check_eq "CLI --layer small file visible after commit" "$(drive9_retry fs cat "$cli_small_remote")" "$(cat "$cli_small_local")"
+drive9_retry fs cp ":$cli_large_remote" "$cli_large_download" >/dev/null
+check_eq "CLI --layer large file hash after commit" "$(sha256_file "$cli_large_download")" "$(sha256_file "$cli_large_local")"
 
 if require_layer_fuse_prereqs; then
   echo "[fuse] layer mount restore coverage"

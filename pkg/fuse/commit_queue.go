@@ -819,8 +819,21 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 }
 
 func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string, expectedRevision int64) (int64, error) {
-	if entry.Size > maxInlineLayerEntryBytes {
-		return 0, fmt.Errorf("layer entry %s is %d bytes; inline layer uploads are limited to %d bytes", entry.Path, entry.Size, maxInlineLayerEntryBytes)
+	if entry.Size > maxInlineLayerEntryBytes || entry.ShadowSpill {
+		fd, actualSize, err := cq.shadows.Open(entry.Path)
+		if err != nil {
+			return 0, fmt.Errorf("open shadow stream: %w", err)
+		}
+		defer func() { _ = fd.Close() }()
+		if entry.Size != actualSize {
+			return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
+		}
+		start := time.Now()
+		_, err = cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
+		if cq.perf != nil {
+			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(actualSize))
+		}
+		return 0, err
 	}
 	data, err := cq.shadows.ReadAll(entry.Path)
 	if err != nil {

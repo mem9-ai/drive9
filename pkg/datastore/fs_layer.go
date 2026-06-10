@@ -58,28 +58,30 @@ type FSLayer struct {
 }
 
 type FSLayerEntry struct {
-	LayerID        string
-	Path           string
-	PathHash       string
-	ParentPath     string
-	ParentPathHash string
-	Name           string
-	Op             FSLayerEntryOp
-	Kind           FSLayerEntryKind
-	BaseInodeID    string
-	BaseRevision   int64
-	StorageType    string
-	StorageRef     string
-	StorageRefHash string
-	ContentBlob    []byte
-	ContentType    string
-	ContentText    string
-	ChecksumSHA256 string
-	SizeBytes      int64
-	Mode           uint32
-	EntrySeq       int64
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	LayerID                string
+	Path                   string
+	PathHash               string
+	ParentPath             string
+	ParentPathHash         string
+	Name                   string
+	Op                     FSLayerEntryOp
+	Kind                   FSLayerEntryKind
+	BaseInodeID            string
+	BaseRevision           int64
+	StorageType            string
+	StorageRef             string
+	StorageRefHash         string
+	StorageEncryptionMode  StorageEncryptionMode
+	StorageEncryptionKeyID string
+	ContentBlob            []byte
+	ContentType            string
+	ContentText            string
+	ChecksumSHA256         string
+	SizeBytes              int64
+	Mode                   uint32
+	EntrySeq               int64
+	CreatedAt              time.Time
+	UpdatedAt              time.Time
 }
 
 type FSLayerCheckpoint struct {
@@ -88,6 +90,16 @@ type FSLayerCheckpoint struct {
 	DurableSeq   int64
 	Label        string
 	CreatedAt    time.Time
+}
+
+type FSLayerEvent struct {
+	EventID   string
+	LayerID   string
+	Seq       int64
+	ActorID   string
+	Op        string
+	Path      string
+	CreatedAt time.Time
 }
 
 func (s *Store) CreateFSLayer(ctx context.Context, layer *FSLayer) error {
@@ -327,8 +339,8 @@ func (s *Store) BeginFSLayerCommit(ctx context.Context, layerID string) error {
 	res, err := s.db.ExecContext(ctx, `
 UPDATE fs_layers
 SET state = ?, sealed_at = COALESCE(sealed_at, UTC_TIMESTAMP(3)), updated_at = UTC_TIMESTAMP(3)
-WHERE layer_id = ? AND state IN (?, ?)`,
-		string(FSLayerStateCommitting), layerID, string(FSLayerStateActive), string(FSLayerStateSealed))
+WHERE layer_id = ? AND state IN (?, ?, ?)`,
+		string(FSLayerStateCommitting), layerID, string(FSLayerStateActive), string(FSLayerStateSealed), string(FSLayerStateCommitting))
 	if err != nil {
 		return fmt.Errorf("begin fs layer commit %s: %w", layerID, err)
 	}
@@ -401,15 +413,24 @@ func (s *Store) UpsertFSLayerEntry(ctx context.Context, entry *FSLayerEntry) err
 	_, err = tx.ExecContext(ctx, `
 INSERT INTO fs_layer_entries (
 	layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind, base_inode_id, base_revision,
-	storage_type, storage_ref, storage_ref_hash, content_blob, content_type, content_text, checksum_sha256,
-	size_bytes, mode, entry_seq, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))`,
+	storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
+	content_blob, content_type, content_text, checksum_sha256, size_bytes, mode, entry_seq, created_at, updated_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(3), UTC_TIMESTAMP(3))`,
 		entry.LayerID, entry.Path, entry.PathHash, entry.ParentPath, entry.ParentPathHash, entry.Name,
 		string(entry.Op), string(entry.Kind), entry.BaseInodeID, entry.BaseRevision, entry.StorageType,
-		entry.StorageRef, entry.StorageRefHash, nilBytes(entry.ContentBlob), nullStr(entry.ContentType),
+		entry.StorageRef, entry.StorageRefHash, fileStorageEncryptionModeForWrite(entry.StorageEncryptionMode),
+		storageEncryptionKeyIDForWrite(entry.StorageEncryptionMode, entry.StorageEncryptionKeyID),
+		nilBytes(entry.ContentBlob), nullStr(entry.ContentType),
 		nullStr(entry.ContentText), entry.ChecksumSHA256, entry.SizeBytes, entry.Mode, entry.EntrySeq)
 	if err != nil {
 		return fmt.Errorf("upsert fs layer entry %s:%s: %w", entry.LayerID, entry.Path, err)
+	}
+	eventID := fmt.Sprintf("%s:%d", entry.LayerID, entry.EntrySeq)
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO fs_layer_events (event_id, layer_id, seq, actor_id, op, path, created_at)
+VALUES (?, ?, ?, '', ?, ?, UTC_TIMESTAMP(3))`,
+		eventID, entry.LayerID, entry.EntrySeq, string(entry.Op), entry.Path); err != nil {
+		return fmt.Errorf("insert fs layer event %s:%s: %w", entry.LayerID, entry.Path, err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit upsert fs layer entry %s:%s: %w", entry.LayerID, entry.Path, err)
@@ -428,8 +449,8 @@ func (s *Store) GetFSLayerEntry(ctx context.Context, layerID, path string) (*FSL
 	}
 	row := s.db.QueryRowContext(ctx, `
 SELECT layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind, base_inode_id, base_revision,
-	storage_type, storage_ref, storage_ref_hash, content_blob, content_type, content_text, checksum_sha256,
-	size_bytes, mode, entry_seq, created_at, updated_at
+	storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
+	content_blob, content_type, content_text, checksum_sha256, size_bytes, mode, entry_seq, created_at, updated_at
 FROM fs_layer_entries
 WHERE layer_id = ? AND path_hash = ? AND path = ?
 ORDER BY entry_seq DESC
@@ -451,8 +472,8 @@ func (s *Store) GetFSLayerEntryAtSeq(ctx context.Context, layerID, path string, 
 	}
 	row := s.db.QueryRowContext(ctx, `
 SELECT layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind, base_inode_id, base_revision,
-	storage_type, storage_ref, storage_ref_hash, content_blob, content_type, content_text, checksum_sha256,
-	size_bytes, mode, entry_seq, created_at, updated_at
+	storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
+	content_blob, content_type, content_text, checksum_sha256, size_bytes, mode, entry_seq, created_at, updated_at
 FROM fs_layer_entries
 WHERE layer_id = ? AND path_hash = ? AND path = ? AND entry_seq <= ?
 ORDER BY entry_seq DESC
@@ -488,8 +509,8 @@ func (s *Store) listFSLayerEntriesLatest(ctx context.Context, layerID string, ma
 	}
 	query := `
 SELECT e.layer_id, e.path, e.path_hash, e.parent_path, e.parent_path_hash, e.name, e.op, e.kind, e.base_inode_id, e.base_revision,
-	e.storage_type, e.storage_ref, e.storage_ref_hash, e.content_blob, e.content_type, e.content_text, e.checksum_sha256,
-	e.size_bytes, e.mode, e.entry_seq, e.created_at, e.updated_at
+	e.storage_type, e.storage_ref, e.storage_ref_hash, e.storage_encryption_mode, e.storage_encryption_key_id,
+	e.content_blob, e.content_type, e.content_text, e.checksum_sha256, e.size_bytes, e.mode, e.entry_seq, e.created_at, e.updated_at
 FROM fs_layer_entries e
 JOIN (
 		SELECT layer_id, path_hash, path, MAX(entry_seq) AS entry_seq
@@ -580,6 +601,42 @@ SELECT checkpoint_id, layer_id, durable_seq, label, created_at
 FROM fs_layer_checkpoints
 WHERE checkpoint_id = ?`, checkpointID)
 	return scanFSLayerCheckpoint(row)
+}
+
+func (s *Store) ListFSLayerEvents(ctx context.Context, layerID string, since int64, limit int) ([]FSLayerEvent, error) {
+	layerID = strings.TrimSpace(layerID)
+	if layerID == "" {
+		return nil, fmt.Errorf("fs layer id is required")
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT event_id, layer_id, seq, actor_id, op, path, created_at
+FROM fs_layer_events
+WHERE layer_id = ? AND seq > ?
+ORDER BY seq ASC
+LIMIT ?`, layerID, since, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list fs layer events %s: %w", layerID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []FSLayerEvent
+	for rows.Next() {
+		var ev FSLayerEvent
+		if err := rows.Scan(&ev.EventID, &ev.LayerID, &ev.Seq, &ev.ActorID, &ev.Op, &ev.Path, &ev.CreatedAt); err != nil {
+			return nil, err
+		}
+		ev.CreatedAt = ev.CreatedAt.UTC()
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if out == nil {
+		out = []FSLayerEvent{}
+	}
+	return out, nil
 }
 
 func scanFSLayer(row interface{ Scan(dest ...any) error }) (*FSLayer, error) {
@@ -688,12 +745,13 @@ func scanFSLayerEntry(row interface{ Scan(dest ...any) error }) (*FSLayerEntry, 
 	var entry FSLayerEntry
 	var op, kind string
 	var contentBlob []byte
-	var contentType, contentText sql.NullString
+	var contentType, contentText, storageEncryptionMode, storageEncryptionKeyID sql.NullString
 	var mode int64
 	if err := row.Scan(
 		&entry.LayerID, &entry.Path, &entry.PathHash, &entry.ParentPath, &entry.ParentPathHash,
 		&entry.Name, &op, &kind, &entry.BaseInodeID, &entry.BaseRevision, &entry.StorageType,
-		&entry.StorageRef, &entry.StorageRefHash, &contentBlob, &contentType, &contentText,
+		&entry.StorageRef, &entry.StorageRefHash, &storageEncryptionMode, &storageEncryptionKeyID,
+		&contentBlob, &contentType, &contentText,
 		&entry.ChecksumSHA256, &entry.SizeBytes, &mode, &entry.EntrySeq, &entry.CreatedAt, &entry.UpdatedAt,
 	); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -706,6 +764,8 @@ func scanFSLayerEntry(row interface{ Scan(dest ...any) error }) (*FSLayerEntry, 
 	entry.ContentBlob = contentBlob
 	entry.ContentType = contentType.String
 	entry.ContentText = contentText.String
+	entry.StorageEncryptionMode = StorageEncryptionMode(storageEncryptionMode.String)
+	entry.StorageEncryptionKeyID = storageEncryptionKeyID.String
 	entry.Mode = uint32(mode)
 	entry.CreatedAt = entry.CreatedAt.UTC()
 	entry.UpdatedAt = entry.UpdatedAt.UTC()

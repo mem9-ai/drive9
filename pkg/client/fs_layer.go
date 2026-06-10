@@ -36,42 +36,46 @@ type FSLayer struct {
 }
 
 type FSLayerEntry struct {
-	LayerID        string    `json:"layer_id"`
-	Path           string    `json:"path"`
-	ParentPath     string    `json:"parent_path"`
-	Name           string    `json:"name"`
-	Op             string    `json:"op"`
-	Kind           string    `json:"kind"`
-	BaseInodeID    string    `json:"base_inode_id"`
-	BaseRevision   int64     `json:"base_revision"`
-	StorageType    string    `json:"storage_type"`
-	StorageRef     string    `json:"storage_ref"`
-	StorageRefHash string    `json:"storage_ref_hash"`
-	ChecksumSHA256 string    `json:"checksum_sha256"`
-	SizeBytes      int64     `json:"size_bytes"`
-	Mode           uint32    `json:"mode"`
-	Content        []byte    `json:"content,omitempty"`
-	ContentText    string    `json:"content_text,omitempty"`
-	EntrySeq       int64     `json:"entry_seq"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	LayerID                string    `json:"layer_id"`
+	Path                   string    `json:"path"`
+	ParentPath             string    `json:"parent_path"`
+	Name                   string    `json:"name"`
+	Op                     string    `json:"op"`
+	Kind                   string    `json:"kind"`
+	BaseInodeID            string    `json:"base_inode_id"`
+	BaseRevision           int64     `json:"base_revision"`
+	StorageType            string    `json:"storage_type"`
+	StorageRef             string    `json:"storage_ref"`
+	StorageRefHash         string    `json:"storage_ref_hash"`
+	StorageEncryptionMode  string    `json:"storage_encryption_mode"`
+	StorageEncryptionKeyID string    `json:"storage_encryption_key_id"`
+	ChecksumSHA256         string    `json:"checksum_sha256"`
+	SizeBytes              int64     `json:"size_bytes"`
+	Mode                   uint32    `json:"mode"`
+	Content                []byte    `json:"content,omitempty"`
+	ContentText            string    `json:"content_text,omitempty"`
+	EntrySeq               int64     `json:"entry_seq"`
+	CreatedAt              time.Time `json:"created_at"`
+	UpdatedAt              time.Time `json:"updated_at"`
 }
 
 type FSLayerEntryRequest struct {
-	Path           string `json:"path"`
-	Op             string `json:"op,omitempty"`
-	Kind           string `json:"kind,omitempty"`
-	BaseInodeID    string `json:"base_inode_id,omitempty"`
-	BaseRevision   int64  `json:"base_revision,omitempty"`
-	StorageType    string `json:"storage_type,omitempty"`
-	StorageRef     string `json:"storage_ref,omitempty"`
-	StorageRefHash string `json:"storage_ref_hash,omitempty"`
-	Content        []byte `json:"content,omitempty"`
-	ContentType    string `json:"content_type,omitempty"`
-	ContentText    string `json:"content_text,omitempty"`
-	ChecksumSHA256 string `json:"checksum_sha256,omitempty"`
-	SizeBytes      int64  `json:"size_bytes,omitempty"`
-	Mode           uint32 `json:"mode,omitempty"`
+	Path                   string `json:"path"`
+	Op                     string `json:"op,omitempty"`
+	Kind                   string `json:"kind,omitempty"`
+	BaseInodeID            string `json:"base_inode_id,omitempty"`
+	BaseRevision           int64  `json:"base_revision,omitempty"`
+	StorageType            string `json:"storage_type,omitempty"`
+	StorageRef             string `json:"storage_ref,omitempty"`
+	StorageRefHash         string `json:"storage_ref_hash,omitempty"`
+	StorageEncryptionMode  string `json:"storage_encryption_mode,omitempty"`
+	StorageEncryptionKeyID string `json:"storage_encryption_key_id,omitempty"`
+	Content                []byte `json:"content,omitempty"`
+	ContentType            string `json:"content_type,omitempty"`
+	ContentText            string `json:"content_text,omitempty"`
+	ChecksumSHA256         string `json:"checksum_sha256,omitempty"`
+	SizeBytes              int64  `json:"size_bytes,omitempty"`
+	Mode                   uint32 `json:"mode,omitempty"`
 }
 
 type FSLayerCommit struct {
@@ -99,6 +103,16 @@ type FSLayerCheckpoint struct {
 	DurableSeq   int64     `json:"durable_seq"`
 	Label        string    `json:"label"`
 	CreatedAt    time.Time `json:"created_at"`
+}
+
+type FSLayerEvent struct {
+	EventID   string    `json:"event_id"`
+	LayerID   string    `json:"layer_id"`
+	Seq       int64     `json:"seq"`
+	ActorID   string    `json:"actor_id"`
+	Op        string    `json:"op"`
+	Path      string    `json:"path"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 func (c *Client) CreateFSLayer(ctx context.Context, req FSLayerCreateRequest) (*FSLayer, error) {
@@ -240,6 +254,81 @@ func (c *Client) UpsertFSLayerEntry(ctx context.Context, layerID string, req FSL
 	return &out, nil
 }
 
+func (c *Client) UploadFSLayerFile(ctx context.Context, layerID, path string, body io.Reader, size int64, baseRevision int64, mode uint32, hasMode bool) (*FSLayerEntry, error) {
+	if strings.TrimSpace(layerID) == "" {
+		return nil, fmt.Errorf("layerID must not be empty")
+	}
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("path must not be empty")
+	}
+	q := url.Values{}
+	q.Set("path", path)
+	q.Set("size", fmt.Sprintf("%d", size))
+	if baseRevision > 0 {
+		q.Set("base_revision", fmt.Sprintf("%d", baseRevision))
+	}
+	if hasMode {
+		q.Set("mode", fmt.Sprintf("%o", mode&0o777))
+	}
+	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/objects?" + q.Encode()
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, u, body)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.ContentLength = size
+	httpReq.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out FSLayerEntry
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode fs layer object entry: %w", err)
+	}
+	return &out, nil
+}
+
+func (c *Client) ReadFSLayerFile(ctx context.Context, layerID, path string, maxSeq *int64) ([]byte, error) {
+	rc, err := c.ReadFSLayerFileStream(ctx, layerID, path, maxSeq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rc.Close() }()
+	return io.ReadAll(rc)
+}
+
+func (c *Client) ReadFSLayerFileStream(ctx context.Context, layerID, path string, maxSeq *int64) (io.ReadCloser, error) {
+	if strings.TrimSpace(layerID) == "" {
+		return nil, fmt.Errorf("layerID must not be empty")
+	}
+	if strings.TrimSpace(path) == "" {
+		return nil, fmt.Errorf("path must not be empty")
+	}
+	q := url.Values{}
+	q.Set("path", path)
+	if maxSeq != nil {
+		q.Set("max_seq", fmt.Sprintf("%d", *maxSeq))
+	}
+	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/objects?" + q.Encode()
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 300 {
+		defer func() { _ = resp.Body.Close() }()
+		return nil, readError(resp)
+	}
+	return resp.Body, nil
+}
+
 func (c *Client) GetFSLayerEntry(ctx context.Context, layerID, path string) (*FSLayerEntry, error) {
 	return c.getFSLayerEntry(ctx, layerID, path, nil)
 }
@@ -332,6 +421,39 @@ func (c *Client) GetFSLayerCheckpoint(ctx context.Context, checkpointID string) 
 		return nil, fmt.Errorf("decode fs layer checkpoint: %w", err)
 	}
 	return &out, nil
+}
+
+func (c *Client) ListFSLayerEvents(ctx context.Context, layerID string, since int64) ([]FSLayerEvent, error) {
+	if strings.TrimSpace(layerID) == "" {
+		return nil, fmt.Errorf("layerID must not be empty")
+	}
+	q := url.Values{}
+	if since > 0 {
+		q.Set("since", fmt.Sprintf("%d", since))
+	}
+	u := c.baseURL + "/v1/fs-layers/" + url.PathEscape(layerID) + "/events"
+	if encoded := q.Encode(); encoded != "" {
+		u += "?" + encoded
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out struct {
+		Events []FSLayerEvent `json:"events"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode fs layer events: %w", err)
+	}
+	return out.Events, nil
 }
 
 func (c *Client) RollbackFSLayer(ctx context.Context, layerID string) error {

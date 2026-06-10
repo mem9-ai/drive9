@@ -39,6 +39,7 @@ func Cp(c *client.Client, args []string) error {
 	resume := false
 	appendMode := false
 	recursive := false
+	layerRef := ""
 	var tags map[string]string
 	var description string
 	filtered := make([]string, 0, len(args))
@@ -51,6 +52,14 @@ func Cp(c *client.Client, args []string) error {
 			appendMode = true
 		case a == "-r" || a == "--recursive":
 			recursive = true
+		case a == "--layer":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--layer requires argument")
+			}
+			i++
+			layerRef = strings.TrimSpace(args[i])
+		case strings.HasPrefix(a, "--layer="):
+			layerRef = strings.TrimSpace(strings.TrimPrefix(a, "--layer="))
 		case a == "--tag":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--tag requires key=value argument")
@@ -88,6 +97,23 @@ func Cp(c *client.Client, args []string) error {
 	}
 	if resume && appendMode {
 		return fmt.Errorf("--resume and --append cannot be used together")
+	}
+	if layerRef != "" {
+		if recursive {
+			return layerRefMustBeEmpty(layerRef, "-r/--recursive")
+		}
+		if appendMode {
+			return layerRefMustBeEmpty(layerRef, "--append")
+		}
+		if resume {
+			return layerRefMustBeEmpty(layerRef, "--resume")
+		}
+		if len(tags) > 0 {
+			return layerRefMustBeEmpty(layerRef, "--tag")
+		}
+		if description != "" {
+			return layerRefMustBeEmpty(layerRef, "--description")
+		}
 	}
 	if appendMode && len(tags) > 0 {
 		return fmt.Errorf("--append and --tag cannot be used together")
@@ -177,6 +203,9 @@ func Cp(c *client.Client, args []string) error {
 
 	switch {
 	case src == "-" && dstIsRemote:
+		if err := requireNoLayerWithRemoteContext(layerRef, dstRP, dst); err != nil {
+			return err
+		}
 		if dstRP.Context != "" {
 			var err error
 			c, err = newFSClientForContext(dstRP.Context)
@@ -188,9 +217,12 @@ func Cp(c *client.Client, args []string) error {
 		if err != nil {
 			return err
 		}
-		data, err := io.ReadAll(os.Stdin)
+		data, err := readAllStdin()
 		if err != nil {
-			return fmt.Errorf("read stdin: %w", err)
+			return err
+		}
+		if layerRef != "" {
+			return uploadBytesToLayer(ctx, c, layerRef, resolvedDst, data, 0o644, true)
 		}
 		if appendMode {
 			return c.AppendStream(ctx, resolvedDst, bytes.NewReader(data), int64(len(data)), printProgress)
@@ -220,6 +252,9 @@ func Cp(c *client.Client, args []string) error {
 		return streamToStdout(ctx, c, srcRP.Path)
 
 	case !srcIsRemote && dstIsRemote:
+		if err := requireNoLayerWithRemoteContext(layerRef, dstRP, dst); err != nil {
+			return err
+		}
 		if dstRP.Context != "" {
 			var err error
 			c, err = newFSClientForContext(dstRP.Context)
@@ -231,6 +266,9 @@ func Cp(c *client.Client, args []string) error {
 		if err != nil {
 			return err
 		}
+		if layerRef != "" {
+			return uploadLocalFileToLayer(ctx, c, layerRef, src, resolvedDst)
+		}
 		if appendMode {
 			return appendFile(ctx, c, src, resolvedDst)
 		}
@@ -240,6 +278,9 @@ func Cp(c *client.Client, args []string) error {
 		return uploadFileWithTagsAndDescription(ctx, c, src, resolvedDst, tags, description)
 
 	case srcIsRemote && !dstIsRemote:
+		if layerRef != "" {
+			return fmt.Errorf("--layer is only supported for uploads or remote-to-remote copy targets")
+		}
 		if srcRP.Context != "" {
 			var err error
 			c, err = newFSClientForContext(srcRP.Context)
@@ -254,6 +295,14 @@ func Cp(c *client.Client, args []string) error {
 		return downloadFile(ctx, c, srcRP.Path, resolvedDst)
 
 	case srcIsRemote && dstIsRemote:
+		if layerRef != "" {
+			if err := requireNoLayerWithRemoteContext(layerRef, srcRP, src); err != nil {
+				return err
+			}
+			if err := requireNoLayerWithRemoteContext(layerRef, dstRP, dst); err != nil {
+				return err
+			}
+		}
 		switch {
 		case srcRP.Context == "" && dstRP.Context == "":
 		case srcRP.Context != "" && dstRP.Context != "" && srcRP.Context == dstRP.Context:
@@ -268,6 +317,19 @@ func Cp(c *client.Client, args []string) error {
 		resolvedDst, err := resolveRemoteCopyTarget(ctx, c, dstRP.Path, pathpkg.Base(srcRP.Path))
 		if err != nil {
 			return err
+		}
+		if layerRef != "" {
+			data, err := c.ReadCtx(ctx, srcRP.Path)
+			if err != nil {
+				return err
+			}
+			mode := uint32(0)
+			hasMode := false
+			if stat, err := c.StatCtx(ctx, srcRP.Path); err == nil && stat.HasMode {
+				mode = stat.Mode & 0o777
+				hasMode = true
+			}
+			return uploadBytesToLayer(ctx, c, layerRef, resolvedDst, data, mode, hasMode)
 		}
 		return c.Copy(srcRP.Path, resolvedDst)
 

@@ -2,8 +2,11 @@ package cli
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -47,6 +50,74 @@ func TestLayerCreatePrintsLayerID(t *testing.T) {
 	}
 	if strings.TrimSpace(out) != "layer-1" {
 		t.Fatalf("stdout = %q, want layer-1", out)
+	}
+}
+
+func TestCpLayerLocalUploadUsesFSLayerEntry(t *testing.T) {
+	localPath := filepath.Join(t.TempDir(), "layer.txt")
+	if err := os.WriteFile(localPath, []byte("layer upload"), 0o640); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	var got client.FSLayerEntryRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "HEAD /v1/fs/repo/layer.txt":
+			http.NotFound(w, r)
+		case "POST /v1/fs-layers/layer-1/entries":
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Fatalf("decode entry request: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+				LayerID:   "layer-1",
+				Path:      got.Path,
+				Op:        got.Op,
+				Kind:      got.Kind,
+				SizeBytes: got.SizeBytes,
+				Mode:      got.Mode,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	if err := Cp(c, []string{"--layer", "layer-1", localPath, ":/repo/layer.txt"}); err != nil {
+		t.Fatalf("Cp --layer: %v", err)
+	}
+	if got.Path != "/repo/layer.txt" || got.Op != "upsert" || got.Kind != "file" || string(got.Content) != "layer upload" || got.Mode != 0o640 {
+		t.Fatalf("entry request = %+v", got)
+	}
+}
+
+func TestSearchCommandsPassLayerParam(t *testing.T) {
+	var grepLayer, findLayer string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/" && r.URL.Query().Has("grep"):
+			grepLayer = r.URL.Query().Get("layer")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[]`)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/" && r.URL.Query().Has("find"):
+			findLayer = r.URL.Query().Get("layer")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `[]`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	c := client.New(srv.URL, "")
+	if err := Grep(c, []string{"--layer", "task=search", "needle", ":/repo/"}); err != nil {
+		t.Fatalf("Grep --layer: %v", err)
+	}
+	if err := Find(c, []string{"--layer", "task=search", ":/repo/"}); err != nil {
+		t.Fatalf("Find --layer: %v", err)
+	}
+	if grepLayer != "task=search" || findLayer != "task=search" {
+		t.Fatalf("grepLayer=%q findLayer=%q, want task=search", grepLayer, findLayer)
 	}
 }
 

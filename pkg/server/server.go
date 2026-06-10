@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	pathpkg "path"
 	"strconv"
 	"strings"
 	"sync"
@@ -815,14 +816,14 @@ func isScopedFSGetQueryAllowed(q url.Values) bool {
 		// handleStatMetadata reads only ?stat.
 		return queryKeysSubsetOf(q, []string{"stat"})
 	case q.Has("grep"):
-		// handleGrep reads ?grep and ?limit.
-		return queryKeysSubsetOf(q, []string{"grep", "limit"})
+		// handleGrep reads ?grep, ?limit, and optional ?layer.
+		return queryKeysSubsetOf(q, []string{"grep", "limit", "layer"})
 	case q.Has("find"):
 		// handleFind reads ?find, ?name, ?tag, ?newer, ?older,
-		// ?minsize, ?maxsize, ?limit.
+		// ?minsize, ?maxsize, ?limit, and optional ?layer.
 		return queryKeysSubsetOf(q, []string{
 			"find", "name", "tag", "newer", "older",
-			"minsize", "maxsize", "limit",
+			"minsize", "maxsize", "limit", "layer",
 		})
 	case q.Has("list"):
 		// handleList reads only ?list. (No filter params today.)
@@ -3857,6 +3858,14 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if layerRef := strings.TrimSpace(r.URL.Query().Get("layer")); layerRef != "" {
+		results, err = overlayFSLayerGrep(r.Context(), b, layerRef, query, path, limit, results)
+		if err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_layer_failed", "path", path, "query_len", len(query), "limit", limit, "layer", layerRef, "error", err)...)
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	metricEvent(r.Context(), "userdb_query", "api", "grep", "result", "ok")
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "grep_ok", "path", path, "query_len", len(query), "limit", limit, "results", len(results))...)
 	w.Header().Set("Content-Type", "application/json")
@@ -3933,8 +3942,262 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if layerRef := strings.TrimSpace(q.Get("layer")); layerRef != "" {
+		results, err = overlayFSLayerFind(r.Context(), b, layerRef, f, results)
+		if err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_layer_failed", "path", path, "layer", layerRef, "error", err)...)
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	metricEvent(r.Context(), "userdb_query", "api", "find", "result", "ok")
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "find_ok", "path", path, "results", len(results), "name", f.NameGlob, "tag_key", f.TagKey)...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(results)
+}
+
+func overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend, layerRef, query, pathPrefix string, limit int, base []datastore.SearchResult) ([]datastore.SearchResult, error) {
+	layer, entries, err := resolveSearchLayerEntries(ctx, b, layerRef)
+	if err != nil {
+		return nil, err
+	}
+	if layer == nil {
+		return base, nil
+	}
+	hiddenExact, hiddenDirs := fsLayerHiddenPaths(entries)
+	out := filterLayerHiddenResults(base, hiddenExact, hiddenDirs)
+	seen := make(map[string]struct{}, len(out))
+	for _, r := range out {
+		seen[r.Path] = struct{}{}
+	}
+	queryFold := strings.ToLower(query)
+	for i := range entries {
+		entry := &entries[i]
+		if _, ok := seen[entry.Path]; ok {
+			continue
+		}
+		if entry.Op != datastore.FSLayerEntryOpUpsert && entry.Op != datastore.FSLayerEntryOpSymlink {
+			continue
+		}
+		if !fsLayerSearchPathMatches(entry.Path, pathPrefix) {
+			continue
+		}
+		matched, err := fsLayerEntryContains(ctx, b, entry, queryFold)
+		if err != nil {
+			return nil, err
+		}
+		if !matched {
+			continue
+		}
+		out = append(out, datastore.SearchResult{
+			Path:      entry.Path,
+			Name:      pathutil.BaseName(entry.Path),
+			SizeBytes: entry.SizeBytes,
+		})
+		seen[entry.Path] = struct{}{}
+		if limit > 0 && len(out) >= limit {
+			return out[:limit], nil
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		return out[:limit], nil
+	}
+	return out, nil
+}
+
+func fsLayerEntryContains(ctx context.Context, b *backend.Dat9Backend, entry *datastore.FSLayerEntry, queryFold string) (bool, error) {
+	if queryFold == "" {
+		return true, nil
+	}
+	if entry.Op == datastore.FSLayerEntryOpSymlink {
+		data := []byte(entry.ContentText)
+		if len(data) == 0 {
+			data = entry.ContentBlob
+		}
+		return strings.Contains(strings.ToLower(string(data)), queryFold), nil
+	}
+	rc, err := b.OpenFSLayerEntryData(ctx, entry)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rc.Close() }()
+	buf := make([]byte, 64*1024)
+	overlap := ""
+	overlapBytes := len(queryFold)*4 + 8
+	for {
+		n, readErr := rc.Read(buf)
+		if n > 0 {
+			raw := overlap + string(buf[:n])
+			if strings.Contains(strings.ToLower(raw), queryFold) {
+				return true, nil
+			}
+			if len(raw) > overlapBytes {
+				overlap = raw[len(raw)-overlapBytes:]
+			} else {
+				overlap = raw
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return false, nil
+		}
+		if readErr != nil {
+			return false, readErr
+		}
+	}
+}
+
+func overlayFSLayerFind(ctx context.Context, b *backend.Dat9Backend, layerRef string, filter *datastore.FindFilter, base []datastore.SearchResult) ([]datastore.SearchResult, error) {
+	layer, entries, err := resolveSearchLayerEntries(ctx, b, layerRef)
+	if err != nil {
+		return nil, err
+	}
+	if layer == nil {
+		return base, nil
+	}
+	hiddenExact, hiddenDirs := fsLayerHiddenPaths(entries)
+	out := filterLayerHiddenResults(base, hiddenExact, hiddenDirs)
+	seen := make(map[string]struct{}, len(out))
+	for _, r := range out {
+		seen[r.Path] = struct{}{}
+	}
+	for i := range entries {
+		entry := &entries[i]
+		if entry.Op == datastore.FSLayerEntryOpWhiteout || entry.Op == datastore.FSLayerEntryOpChmod || entry.Op == datastore.FSLayerEntryOpRename {
+			continue
+		}
+		if _, ok := seen[entry.Path]; ok {
+			continue
+		}
+		if !fsLayerFindEntryMatches(entry, filter) {
+			continue
+		}
+		out = append(out, datastore.SearchResult{
+			Path:      entry.Path,
+			Name:      pathutil.BaseName(entry.Path),
+			SizeBytes: entry.SizeBytes,
+		})
+		seen[entry.Path] = struct{}{}
+		if filter != nil && filter.Limit > 0 && len(out) >= filter.Limit {
+			return out[:filter.Limit], nil
+		}
+	}
+	if filter != nil && filter.Limit > 0 && len(out) > filter.Limit {
+		return out[:filter.Limit], nil
+	}
+	return out, nil
+}
+
+func resolveSearchLayerEntries(ctx context.Context, b *backend.Dat9Backend, layerRef string) (*datastore.FSLayer, []datastore.FSLayerEntry, error) {
+	if b == nil || b.Store() == nil {
+		return nil, nil, fmt.Errorf("missing backend store")
+	}
+	layer, err := b.Store().ResolveFSLayerRef(ctx, layerRef)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch layer.State {
+	case datastore.FSLayerStateActive, datastore.FSLayerStateSealed, datastore.FSLayerStateCommitting:
+	default:
+		return nil, nil, fmt.Errorf("fs layer %s is %s", layer.LayerID, layer.State)
+	}
+	entries, err := b.Store().ListFSLayerEntries(ctx, layer.LayerID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return layer, entries, nil
+}
+
+func fsLayerHiddenPaths(entries []datastore.FSLayerEntry) (map[string]struct{}, []string) {
+	exact := make(map[string]struct{})
+	var dirs []string
+	for i := range entries {
+		entry := &entries[i]
+		switch entry.Op {
+		case datastore.FSLayerEntryOpUpsert, datastore.FSLayerEntryOpSymlink, datastore.FSLayerEntryOpMkdir:
+			exact[entry.Path] = struct{}{}
+		case datastore.FSLayerEntryOpWhiteout:
+			exact[entry.Path] = struct{}{}
+			if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
+				dir := entry.Path
+				if !strings.HasSuffix(dir, "/") {
+					dir += "/"
+				}
+				dirs = append(dirs, dir)
+			}
+		case datastore.FSLayerEntryOpRename:
+			exact[entry.Path] = struct{}{}
+			target := strings.TrimSpace(entry.ContentText)
+			if target == "" && len(entry.ContentBlob) > 0 {
+				target = strings.TrimSpace(string(entry.ContentBlob))
+			}
+			if target != "" {
+				exact[target] = struct{}{}
+			}
+		}
+	}
+	return exact, dirs
+}
+
+func filterLayerHiddenResults(base []datastore.SearchResult, exact map[string]struct{}, dirs []string) []datastore.SearchResult {
+	out := make([]datastore.SearchResult, 0, len(base))
+	for _, result := range base {
+		if _, hidden := exact[result.Path]; hidden {
+			continue
+		}
+		hidden := false
+		for _, dir := range dirs {
+			if strings.HasPrefix(result.Path, dir) {
+				hidden = true
+				break
+			}
+		}
+		if !hidden {
+			out = append(out, result)
+		}
+	}
+	return out
+}
+
+func fsLayerSearchPathMatches(path, prefix string) bool {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" || prefix == "/" {
+		return strings.HasPrefix(path, "/")
+	}
+	if strings.HasSuffix(prefix, "/") {
+		return path == prefix || strings.HasPrefix(path, prefix)
+	}
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+func fsLayerFindEntryMatches(entry *datastore.FSLayerEntry, filter *datastore.FindFilter) bool {
+	if entry == nil {
+		return false
+	}
+	if filter != nil {
+		if !fsLayerSearchPathMatches(entry.Path, filter.PathPrefix) {
+			return false
+		}
+		if filter.TagKey != "" {
+			return false
+		}
+		if filter.NameGlob != "" {
+			matched, err := pathpkg.Match(filter.NameGlob, pathutil.BaseName(entry.Path))
+			if err != nil || !matched {
+				return false
+			}
+		}
+		if filter.After != nil && !entry.UpdatedAt.After(*filter.After) {
+			return false
+		}
+		if filter.Before != nil && !entry.UpdatedAt.Before(*filter.Before) {
+			return false
+		}
+		if filter.MinSize > 0 && entry.SizeBytes < filter.MinSize {
+			return false
+		}
+		if filter.MaxSize > 0 && entry.SizeBytes > filter.MaxSize {
+			return false
+		}
+	}
+	return true
 }

@@ -242,6 +242,7 @@ func Mount(opts *MountOptions) error {
 
 	// Build FUSE filesystem
 	dat9fs := NewDat9FS(c, opts)
+	layerEventWatcherStop := func() {}
 
 	// Resolve sync mode (auto-detect RTT if needed).
 	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
@@ -369,6 +370,7 @@ func Mount(opts *MountOptions) error {
 					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
 						fmt.Fprintf(os.Stderr, "drive9: restore fs layer entries failed: %v\n", err)
 					}
+					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
 				}
 				dat9fs.commitQueue = cq
 			}
@@ -393,11 +395,16 @@ func Mount(opts *MountOptions) error {
 	// Create FUSE server
 	server, err := gofuse.NewServer(dat9fs, opts.MountPoint, fuseOpts)
 	if err != nil {
+		layerEventWatcherStop()
 		return fmt.Errorf("fuse mount: %w", err)
 	}
 
 	// Start SSE watcher for remote change notifications.
 	sseWatcher := StartSSEWatcher(dat9fs, c, actorID)
+	stopWatchers := func() {
+		sseWatcher.Stop()
+		layerEventWatcherStop()
+	}
 
 	// Start serving in a background goroutine so WaitMount can proceed.
 	// On macOS, Serve() must be running before WaitMount() returns because
@@ -413,6 +420,7 @@ func Mount(opts *MountOptions) error {
 	// thread consumes the last GOMAXPROCS slot, leaving no thread to handle
 	// the POLL request from the kernel).
 	if err := server.WaitMount(); err != nil {
+		stopWatchers()
 		return fmt.Errorf("fuse wait mount: %w", err)
 	}
 	stateMountPoint := opts.MountPoint
@@ -440,7 +448,7 @@ func Mount(opts *MountOptions) error {
 		Token:          opts.Token,
 	})
 	if err != nil {
-		sseWatcher.Stop()
+		stopWatchers()
 		dat9fs.FlushAll()
 		_ = server.Unmount()
 		return fmt.Errorf("write mount pid file: %w", err)
@@ -451,7 +459,7 @@ func Mount(opts *MountOptions) error {
 		}
 	}()
 
-	shutdown := newMountShutdown(sseWatcher.Stop, dat9fs.FlushAll)
+	shutdown := newMountShutdown(stopWatchers, dat9fs.FlushAll)
 
 	// Signal handling for graceful shutdown.
 	//
@@ -702,10 +710,36 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		if err != nil {
 			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
 		}
-		if err := shadows.WriteFull(localPath, fullEntry.Content, fullEntry.BaseRevision); err != nil {
-			return fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
+		var sizeBytes int64
+		if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
+			var maxSeqPtr *int64
+			if hasCheckpoint {
+				maxSeqPtr = &maxSeq
+			}
+			rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, maxSeqPtr)
+			if err != nil {
+				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
+			}
+			n, writeErr := shadows.WriteStream(localPath, rc, fullEntry.BaseRevision)
+			closeErr := rc.Close()
+			if writeErr != nil {
+				return fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, closeErr)
+			}
+			sizeBytes = n
+		} else {
+			content := fullEntry.Content
+			if err := shadows.WriteFull(localPath, content, fullEntry.BaseRevision); err != nil {
+				return fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
+			}
+			sizeBytes = int64(len(content))
 		}
-		if _, err := pending.PutWithBaseRevAndMode(localPath, int64(len(fullEntry.Content)), PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+		if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
+			return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
+		}
+		if _, err := pending.PutWithBaseRevAndMode(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
 			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
 		}
 	}

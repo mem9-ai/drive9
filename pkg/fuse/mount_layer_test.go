@@ -136,6 +136,78 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	}
 }
 
+func TestRestoreLayerEntriesStreamsObjectBackedFile(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), 128*1024+13)
+	objectReads := 0
+	entry := client.FSLayerEntry{
+		LayerID:     "layer-1",
+		Path:        "/repo/large.bin",
+		Op:          "upsert",
+		Kind:        "file",
+		StorageType: "s3",
+		StorageRef:  "layers/layer-1/object",
+		SizeBytes:   int64(len(payload)),
+		Mode:        0o640,
+		EntrySeq:    1,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/diff":
+			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{entry}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+			if r.URL.Query().Get("path") != "/repo/large.bin" {
+				t.Errorf("unexpected entry query: %q", r.URL.RawQuery)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(entry)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/objects":
+			if r.URL.Query().Get("path") != "/repo/large.bin" {
+				t.Errorf("unexpected object query: %q", r.URL.RawQuery)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			objectReads++
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write(payload)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreLayerEntries(context.Background(), client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	}, shadow, pending, nil); err != nil {
+		t.Fatalf("restoreLayerEntries: %v", err)
+	}
+	if objectReads != 1 {
+		t.Fatalf("object reads = %d, want 1", objectReads)
+	}
+	got, err := shadow.ReadAll("/large.bin")
+	if err != nil {
+		t.Fatalf("ReadAll restored large.bin: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("restored object payload mismatch: got %d bytes want %d", len(got), len(payload))
+	}
+	if meta, ok := pending.GetMeta("/large.bin"); !ok || meta.Size != int64(len(payload)) || !meta.HasMode || meta.Mode != 0o640 {
+		t.Fatalf("pending meta = %+v, want size %d mode 0640", meta, len(payload))
+	}
+}
+
 func TestRestoreLayerChmodOnlyFileRecordsModeOverlay(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

@@ -138,7 +138,196 @@ func TestFSLayerAPIFlow(t *testing.T) {
 	}
 }
 
-func TestFSLayerCommitWhiteoutDirectoryRemovesTree(t *testing.T) {
+func TestFSLayerObjectUploadReadAndCommitLargeFile(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-large-object",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	payload := bytes.Repeat([]byte("x"), 2<<20)
+	payload = append(payload, []byte("tail")...)
+	entry, err := c.UploadFSLayerFile(ctx, "layer-large-object", "/repo/large.bin", bytes.NewReader(payload), int64(len(payload)), 0, 0o644, true)
+	if err != nil {
+		t.Fatalf("UploadFSLayerFile: %v", err)
+	}
+	if entry.StorageType != "s3" || entry.StorageRef == "" || entry.SizeBytes != int64(len(payload)) {
+		t.Fatalf("uploaded entry = %+v", entry)
+	}
+	got, err := c.ReadFSLayerFile(ctx, "layer-large-object", "/repo/large.bin", nil)
+	if err != nil {
+		t.Fatalf("ReadFSLayerFile: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("ReadFSLayerFile payload mismatch: got %d bytes want %d", len(got), len(payload))
+	}
+	grep, err := c.GrepWithLayer("tail", "/repo", 10, "layer-large-object")
+	if err != nil {
+		t.Fatalf("GrepWithLayer large object: %v", err)
+	}
+	if len(grep) != 1 || grep[0].Path != "/repo/large.bin" {
+		t.Fatalf("GrepWithLayer large object = %+v, want /repo/large.bin", grep)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-large-object")
+	if err != nil {
+		t.Fatalf("CommitFSLayer: %v", err)
+	}
+	if commit.Status != "committed" || commit.Applied != 1 {
+		t.Fatalf("commit = %+v, want committed applied=1", commit)
+	}
+	committed, err := s.fallback.ReadCtx(ctx, "/repo/large.bin", 0, -1)
+	if err != nil {
+		t.Fatalf("ReadCtx committed: %v", err)
+	}
+	if !bytes.Equal(committed, payload) {
+		t.Fatalf("committed payload mismatch: got %d bytes want %d", len(committed), len(payload))
+	}
+}
+
+func TestFSLayerCommitRetrySkipsAlreadyAppliedEntries(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-retry",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	content := []byte("already applied")
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-retry", client.FSLayerEntryRequest{
+		Path:      "/repo/retry.txt",
+		Op:        "upsert",
+		Kind:      "file",
+		Content:   content,
+		SizeBytes: int64(len(content)),
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry: %v", err)
+	}
+	if _, _, err := s.fallback.WriteCtxIfRevisionWithTagsResult(ctx, "/repo/retry.txt", content, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, -1, nil, ""); err != nil {
+		t.Fatalf("simulate partial apply: %v", err)
+	}
+	if err := s.fallback.Store().SetFSLayerState(ctx, "layer-retry", datastore.FSLayerStateCommitting); err != nil {
+		t.Fatalf("SetFSLayerState committing: %v", err)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-retry")
+	if err != nil {
+		t.Fatalf("CommitFSLayer retry: %v", err)
+	}
+	if commit.Status != "committed" {
+		t.Fatalf("commit = %+v, want committed", commit)
+	}
+}
+
+func TestFSLayerCommitDirectoryRename(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	if err := s.fallback.MkdirCtx(ctx, "/repo/old/", 0o755); err != nil {
+		t.Fatalf("MkdirCtx old: %v", err)
+	}
+	if _, _, err := s.fallback.WriteCtxIfRevisionWithTagsResult(ctx, "/repo/old/child.txt", []byte("child"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, -1, nil, ""); err != nil {
+		t.Fatalf("write child: %v", err)
+	}
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-dir-rename",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-dir-rename", client.FSLayerEntryRequest{
+		Path:        "/repo/old/",
+		Op:          "rename",
+		Kind:        "dir",
+		ContentText: "/repo/new/",
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry rename dir: %v", err)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-dir-rename")
+	if err != nil {
+		t.Fatalf("CommitFSLayer: %v", err)
+	}
+	if commit.Status != "committed" || commit.Applied != 1 {
+		t.Fatalf("commit = %+v, want committed applied=1", commit)
+	}
+	if _, err := s.fallback.StatNodeCtx(ctx, "/repo/old/child.txt"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("old child stat err=%v, want ErrNotFound", err)
+	}
+	got, err := s.fallback.ReadCtx(ctx, "/repo/new/child.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("ReadCtx new child: %v", err)
+	}
+	if !bytes.Equal(got, []byte("child")) {
+		t.Fatalf("new child content = %q, want child", got)
+	}
+}
+
+func TestFSLayerSearchOverlayMergesLayerEntries(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if _, _, err := s.fallback.WriteCtxIfRevisionWithTagsResult(ctx, "/repo/base.txt", []byte("needle base"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, -1, nil, ""); err != nil {
+		t.Fatalf("write base: %v", err)
+	}
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{
+		LayerID:      "layer-search",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if err := s.fallback.Store().UpsertFSLayerEntry(ctx, &datastore.FSLayerEntry{
+		LayerID:     "layer-search",
+		Path:        "/repo/base.txt",
+		Op:          datastore.FSLayerEntryOpUpsert,
+		Kind:        datastore.FSLayerEntryKindFile,
+		ContentBlob: []byte("overlay without match"),
+		SizeBytes:   int64(len("overlay without match")),
+	}); err != nil {
+		t.Fatalf("Upsert base overlay: %v", err)
+	}
+	if err := s.fallback.Store().UpsertFSLayerEntry(ctx, &datastore.FSLayerEntry{
+		LayerID:     "layer-search",
+		Path:        "/repo/layer.txt",
+		Op:          datastore.FSLayerEntryOpUpsert,
+		Kind:        datastore.FSLayerEntryKindFile,
+		ContentBlob: []byte("needle layer"),
+		SizeBytes:   int64(len("needle layer")),
+	}); err != nil {
+		t.Fatalf("Upsert layer file: %v", err)
+	}
+	base := []datastore.SearchResult{{Path: "/repo/base.txt", Name: "base.txt", SizeBytes: 11}}
+	grep, err := overlayFSLayerGrep(ctx, s.fallback, "layer-search", "needle", "/repo/", 20, base)
+	if err != nil {
+		t.Fatalf("overlayFSLayerGrep: %v", err)
+	}
+	if len(grep) != 1 || grep[0].Path != "/repo/layer.txt" {
+		t.Fatalf("grep = %+v, want only layer file", grep)
+	}
+	find, err := overlayFSLayerFind(ctx, s.fallback, "layer-search", &datastore.FindFilter{PathPrefix: "/repo/"}, base)
+	if err != nil {
+		t.Fatalf("overlayFSLayerFind: %v", err)
+	}
+	gotFind := map[string]bool{}
+	for _, result := range find {
+		gotFind[result.Path] = true
+	}
+	if len(find) != 2 || !gotFind["/repo/base.txt"] || !gotFind["/repo/layer.txt"] {
+		t.Fatalf("find = %+v, want overlaid base and layer file", find)
+	}
+}
+
+func TestFSLayerCommitRejectsNonEmptyDirectoryWhiteout(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
 	defer ts.Close()
@@ -172,17 +361,53 @@ func TestFSLayerCommitWhiteoutDirectoryRemovesTree(t *testing.T) {
 		t.Fatalf("UpsertFSLayerEntry dir whiteout: %v", err)
 	}
 	commit, err := c.CommitFSLayer(ctx, "layer-dir-whiteout")
+	if err == nil {
+		t.Fatalf("CommitFSLayer err=nil commit=%+v, want conflict", commit)
+	}
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusConflict {
+		t.Fatalf("CommitFSLayer err=%v, want conflict", err)
+	}
+	if commit == nil || len(commit.Conflicts) != 1 || commit.Conflicts[0].Reason != "directory whiteout requires empty directory" {
+		t.Fatalf("commit conflict = %+v", commit)
+	}
+	if _, err := s.fallback.StatNodeCtx(ctx, "/repo/delete-dir/gone.txt"); err != nil {
+		t.Fatalf("baseline child should remain, stat err=%v", err)
+	}
+}
+
+func TestFSLayerCommitAllowsEmptyDirectoryWhiteout(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	if err := s.fallback.MkdirCtx(ctx, "/repo/empty/", 0o755); err != nil {
+		t.Fatalf("MkdirCtx: %v", err)
+	}
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-empty-whiteout",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-empty-whiteout", client.FSLayerEntryRequest{
+		Path: "/repo/empty/",
+		Op:   "whiteout",
+		Kind: "dir",
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry dir whiteout: %v", err)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-empty-whiteout")
 	if err != nil {
 		t.Fatalf("CommitFSLayer: %v", err)
 	}
 	if commit.Status != "committed" || commit.Applied != 1 {
 		t.Fatalf("commit = %+v, want committed applied=1", commit)
 	}
-	if _, err := s.fallback.StatNodeCtx(ctx, "/repo/delete-dir/"); !errors.Is(err, datastore.ErrNotFound) {
+	if _, err := s.fallback.StatNodeCtx(ctx, "/repo/empty/"); !errors.Is(err, datastore.ErrNotFound) {
 		t.Fatalf("deleted dir stat err=%v, want ErrNotFound", err)
-	}
-	if _, err := s.fallback.StatNodeCtx(ctx, "/repo/delete-dir/gone.txt"); !errors.Is(err, datastore.ErrNotFound) {
-		t.Fatalf("deleted child stat err=%v, want ErrNotFound", err)
 	}
 }
 
@@ -222,7 +447,7 @@ func TestFSLayerRejectsEntryOutsideBaseRoot(t *testing.T) {
 	}
 }
 
-func TestFSLayerRejectsDirectoryRenameEntry(t *testing.T) {
+func TestFSLayerAcceptsDirectoryRenameEntry(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
 	defer ts.Close()
@@ -235,15 +460,17 @@ func TestFSLayerRejectsDirectoryRenameEntry(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateFSLayer: %v", err)
 	}
-	_, err := c.UpsertFSLayerEntry(ctx, "layer-dir-rename", client.FSLayerEntryRequest{
+	entry, err := c.UpsertFSLayerEntry(ctx, "layer-dir-rename", client.FSLayerEntryRequest{
 		Path:        "/repo/old-dir/",
 		Op:          "rename",
 		Kind:        "dir",
 		ContentText: "/repo/new-dir/",
 	})
-	var statusErr *client.StatusError
-	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
-		t.Fatalf("UpsertFSLayerEntry directory rename err=%v, want 400", err)
+	if err != nil {
+		t.Fatalf("UpsertFSLayerEntry directory rename: %v", err)
+	}
+	if entry.Path != "/repo/old-dir/" || entry.ContentText != "/repo/new-dir/" {
+		t.Fatalf("directory rename entry path=%q target=%q", entry.Path, entry.ContentText)
 	}
 }
 
@@ -350,7 +577,7 @@ func TestFSLayerCommitPreflightChecksBaseInodeID(t *testing.T) {
 		Kind:        datastore.FSLayerEntryKindDir,
 		BaseInodeID: "stale-inode",
 		Mode:        0o700,
-	}})
+	}}, false)
 	if len(conflicts) != 1 || conflicts[0].Reason != "base inode changed" {
 		t.Fatalf("conflicts=%+v, want base inode changed", conflicts)
 	}

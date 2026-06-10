@@ -464,6 +464,16 @@ func (fs *Dat9FS) upsertLayerEntry(ctx context.Context, req client.FSLayerEntryR
 }
 
 func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []byte, expectedRevision int64, mode uint32, hasMode bool) error {
+	if int64(len(data)) > maxInlineLayerEntryBytes {
+		start := fs.perfStart()
+		_, err := fs.client.UploadFSLayerFile(ctx, fs.layerRef(), fs.remotePath(localPath), bytes.NewReader(data), int64(len(data)), expectedRevision, mode, hasMode)
+		fs.perfRecordRemote(perfRemoteMutation, start, err, uint64(len(data)))
+		if err != nil {
+			return err
+		}
+		fs.markLayerFile(localPath)
+		return nil
+	}
 	req := client.FSLayerEntryRequest{
 		Path:         fs.remotePath(localPath),
 		Op:           "upsert",
@@ -705,7 +715,26 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 			return err
 		}
 		if sourceStat.IsDir {
-			return fmt.Errorf("directory rename is not supported in fs layer mounts")
+			if targetStat, err := fs.client.StatCtx(ctx, newRemote); err == nil {
+				if targetStat.IsDir {
+					return fmt.Errorf("rename target %s is a directory", newRemote)
+				}
+				return fmt.Errorf("rename target %s exists", newRemote)
+			} else if !isNotFoundErr(err) {
+				return err
+			}
+			if err := fs.upsertLayerEntry(ctx, client.FSLayerEntryRequest{
+				Path:        oldRemote,
+				Op:          "rename",
+				Kind:        "dir",
+				ContentText: newRemote,
+				Mode:        sourceStat.Mode & 0o777,
+			}, 0); err != nil {
+				return err
+			}
+			fs.markLayerWhiteout(oldLocalPath)
+			fs.markLayerDir(newLocalPath, sourceStat.Mode&0o777)
+			return nil
 		}
 		data, err = fs.client.ReadCtx(ctx, oldRemote)
 		if err != nil {
@@ -725,18 +754,7 @@ func (fs *Dat9FS) upsertLayerRename(ctx context.Context, oldLocalPath, newLocalP
 	} else if !isNotFoundErr(err) {
 		return err
 	}
-	req := client.FSLayerEntryRequest{
-		Path:         newRemote,
-		Op:           "upsert",
-		Kind:         "file",
-		BaseRevision: targetBaseRev,
-		Content:      data,
-		SizeBytes:    int64(len(data)),
-	}
-	if hasMode {
-		req.Mode = mode & 0o777
-	}
-	if err := fs.upsertLayerEntry(ctx, req, uint64(len(data))); err != nil {
+	if err := fs.upsertLayerFile(ctx, newLocalPath, data, targetBaseRev, mode, hasMode); err != nil {
 		return err
 	}
 	if fs.shadowStore != nil {
@@ -4302,6 +4320,46 @@ func (fs *Dat9FS) hardlinkRemoteWithTransientRecovery(ctx context.Context, srcP,
 	return lastErr
 }
 
+func (fs *Dat9FS) upsertLayerHardlink(ctx context.Context, srcP, dstP string, mode uint32, hasMode bool) ([]byte, error) {
+	if fs == nil || !fs.layerEnabled() {
+		return nil, fmt.Errorf("fs layer is not configured")
+	}
+	if _, err := fs.client.StatCtx(ctx, fs.remotePath(dstP)); err == nil {
+		return nil, fmt.Errorf("hardlink target exists: %s", dstP)
+	} else if !isNotFoundErr(err) {
+		return nil, err
+	}
+	var (
+		data []byte
+		err  error
+	)
+	if fs.shadowStore != nil && fs.shadowStore.Has(srcP) {
+		data, err = fs.shadowStore.ReadAll(srcP)
+	} else {
+		data, err = fs.client.ReadCtx(ctx, fs.remotePath(srcP))
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !hasMode {
+		mode = 0o644
+	}
+	if err := fs.upsertLayerFile(ctx, dstP, data, 0, mode, true); err != nil {
+		return nil, err
+	}
+	if fs.shadowStore != nil {
+		if err := fs.shadowStore.WriteFull(dstP, data, 0); err != nil {
+			return nil, err
+		}
+	}
+	if fs.pendingIndex != nil {
+		if _, err := fs.pendingIndex.PutWithBaseRevAndMode(dstP, int64(len(data)), PendingNew, 0, mode, true); err != nil {
+			return nil, err
+		}
+	}
+	return data, nil
+}
+
 func (fs *Dat9FS) mkdirRemoteWithTransientRetry(cancel <-chan struct{}, localPath string, mode uint32) error {
 	apiPath := fs.remotePath(localPath)
 	ctx, cf := fuseCtx(cancel)
@@ -5663,6 +5721,28 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 		if fs.hasPendingLocalState(dstP) {
 			return gofuse.Status(syscall.EEXIST)
 		}
+	}
+
+	if fs.layerEnabled() {
+		data, err := fs.upsertLayerHardlink(ctx, srcP, dstP, srcEntry.Mode, srcEntry.HasMode)
+		if err != nil {
+			return httpToFuseStatus(err)
+		}
+		mode := srcEntry.Mode
+		if mode == 0 {
+			mode = 0o644
+		}
+		ino := fs.inodes.Lookup(dstP, false, int64(len(data)), time.Now())
+		fs.inodes.UpdateMode(ino, mode&0o777)
+		entry, ok := fs.inodes.GetEntry(ino)
+		if !ok {
+			return gofuse.EIO
+		}
+		parentPath, _ := fs.inodes.GetPath(input.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.invalidateReadCacheAndTargets(dstP)
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
 	}
 
 	if err := fs.hardlinkRemoteWithTransientRecovery(ctx, srcP, dstP); err != nil {
