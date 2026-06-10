@@ -1354,6 +1354,10 @@ func TestChmod(t *testing.T) {
 	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
+	fixedTime := time.Now().UTC().Add(time.Hour).Truncate(time.Millisecond)
+	if _, err := s.DB().ExecContext(ctx, `UPDATE inodes SET mtime = ?, confirmed_at = ? WHERE inode_id = ?`, fixedTime, fixedTime, "f1"); err != nil {
+		t.Fatal(err)
+	}
 	var beforeMtime time.Time
 	var beforeConfirmedAt time.Time
 	if err := s.DB().QueryRowContext(ctx, `SELECT mtime, confirmed_at FROM inodes WHERE inode_id = ?`, "f1").Scan(&beforeMtime, &beforeConfirmedAt); err != nil {

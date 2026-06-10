@@ -55,15 +55,15 @@ func (eb *EventBus) Publish(path, op, actor string) {
 
 // PublishEvent appends an event whose sequence was assigned by a durable event
 // log. It is used by the SSE endpoint so reconnect replay and live delivery use
-// the same cursor space.
+// the same cursor space when possible. If the in-memory cursor is already ahead
+// because of a volatile fallback or out-of-order publish, the event is remapped
+// to the next in-memory sequence so live subscribers still receive the
+// invalidation; reconnecting clients ahead of the durable head will reset.
 func (eb *EventBus) PublishEvent(ev ChangeEvent) {
 	eb.mu.Lock()
-	if ev.Seq == 0 {
+	if ev.Seq == 0 || ev.Seq <= eb.seq {
 		eb.seq++
 		ev.Seq = eb.seq
-	} else if ev.Seq <= eb.seq {
-		eb.mu.Unlock()
-		return
 	} else if ev.Seq > eb.seq {
 		eb.seq = ev.Seq
 	}
@@ -176,11 +176,16 @@ func (eb *EventBus) EventsSince(since uint64) (events []ChangeEvent, headSeq uin
 
 	// Walk the ring from oldest to newest, collecting events with seq > since.
 	result := make([]ChangeEvent, 0, 64)
+	expectedSeq := since + 1
 	for i := 0; i < eb.count; i++ {
 		idx := (oldestIdx + i) % eventBusRingSize
 		ev := eb.ring[idx]
 		if ev.Seq > since {
+			if ev.Seq != expectedSeq {
+				return nil, headSeq, false
+			}
 			result = append(result, ev)
+			expectedSeq++
 		}
 	}
 	return result, headSeq, true
