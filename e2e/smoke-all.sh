@@ -4,6 +4,7 @@
 set -euo pipefail
 
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+RUN_GIT_OPS_SMOKE="${RUN_GIT_OPS_SMOKE:-0}"
 RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
 RUN_FUSE_SMOKE="${RUN_FUSE_SMOKE:-1}"
 RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-$RUN_FUSE_SMOKE}"
@@ -47,6 +48,13 @@ else
   echo "SKIP [fuse] set RUN_FUSE_SMOKE=1 to run FUSE symlink/hardlink coverage"
 fi
 run_case "posix-permission" "e2e/posix-permission-smoke-test.sh"
+if [ "$RUN_GIT_OPS_SMOKE" = "1" ]; then
+  run_case "git-ops" "e2e/git-ops-smoke-test.sh"
+else
+  echo
+  echo "=== [git-ops] e2e/git-ops-smoke-test.sh ==="
+  echo "SKIP [git-ops] set RUN_GIT_OPS_SMOKE=1 to run lightweight Git clone/status/restore coverage"
+fi
 if [ "$RUN_GIT_WORKSPACE_SMOKE" = "1" ]; then
   run_case "git-workspace" "e2e/git-workspace-smoke-test.sh"
 else

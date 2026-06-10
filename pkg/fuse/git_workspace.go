@@ -882,7 +882,7 @@ func (fs *Dat9FS) fillLocalGitTreeSizes(ctx context.Context, rt *gitWorkspaceRun
 		}
 		if localRoot != "" && workspaceID != "" && baseCommit != "" {
 			if size, hit, err := gitcache.StatBlob(ctx, localRoot, workspaceID, baseCommit, oid); err != nil {
-				return err
+				log.Printf("git workspace base blob cache stat failed workspace=%s commit=%s oid=%s: %v", workspaceID, baseCommit, oid, err)
 			} else if hit {
 				sizeByObject[oid] = size
 				setGitTreeNodeSize(nodes, children, rel, size)
@@ -898,7 +898,7 @@ func (fs *Dat9FS) fillLocalGitTreeSizes(ctx context.Context, rt *gitWorkspaceRun
 	sort.Strings(ids)
 	infos, err := gitObjectInfoBatch(ctx, gitDir, ids)
 	if err != nil {
-		return err
+		return fmt.Errorf("batch check local git objects gitDir=%s ids=%v: %w", gitDir, ids, err)
 	}
 	for rel, n := range nodes {
 		if !gitNodeHasBlobSize(n) || n.SizeBytes >= 0 {
@@ -936,6 +936,10 @@ func (rt *gitWorkspaceRuntime) knownBaseGitObjectSizes() (map[string]int64, stri
 
 func gitNodeHasBlobSize(n client.GitTreeNode) bool {
 	return n.Kind == "file" || n.Kind == "symlink"
+}
+
+func gitObjectCacheKey(objectSHA string) string {
+	return strings.ToLower(strings.TrimSpace(objectSHA))
 }
 
 func setGitTreeNodeSize(nodes map[string]client.GitTreeNode, children map[string][]client.GitTreeNode, rel string, size int64) {
@@ -1424,6 +1428,7 @@ func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime,
 		fs.perf.gitCleanReadCount.add(1)
 	}
 	nodeCommit := gitNodeCommit(rt, n)
+	objectSHA := gitObjectCacheKey(n.ObjectSHA)
 	if localRoot := strings.TrimSpace(fs.opts.LocalRoot); localRoot != "" {
 		data, hit, err := gitcache.ReadTreeFile(ctx, localRoot, rt.workspace.WorkspaceID, nodeCommit, rel, offset, size)
 		if err != nil {
@@ -1438,7 +1443,7 @@ func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime,
 			}
 			return data, nil
 		}
-		data, hit, err = gitcache.ReadBlob(ctx, localRoot, rt.workspace.WorkspaceID, nodeCommit, n.ObjectSHA, offset, size)
+		data, hit, err = gitcache.ReadBlob(ctx, localRoot, rt.workspace.WorkspaceID, nodeCommit, objectSHA, offset, size)
 		if err != nil {
 			return nil, err
 		}
@@ -1453,7 +1458,7 @@ func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime,
 		}
 		baseCommit := strings.TrimSpace(rt.workspace.HeadCommit)
 		if baseCommit != "" && !strings.EqualFold(baseCommit, nodeCommit) {
-			data, hit, err = gitcache.ReadBlob(ctx, localRoot, rt.workspace.WorkspaceID, baseCommit, n.ObjectSHA, offset, size)
+			data, hit, err = gitcache.ReadBlob(ctx, localRoot, rt.workspace.WorkspaceID, baseCommit, objectSHA, offset, size)
 			if err != nil {
 				return nil, err
 			}
@@ -1471,7 +1476,7 @@ func (fs *Dat9FS) readGitCleanFile(ctx context.Context, rt *gitWorkspaceRuntime,
 	if fs.perfEnabled() {
 		fs.perf.gitCleanCacheMiss.add(1)
 	}
-	data, err := fs.materializeGitBlob(ctx, rt, nodeCommit, n.ObjectSHA)
+	data, err := fs.materializeGitBlob(ctx, rt, nodeCommit, objectSHA)
 	if err != nil {
 		return nil, err
 	}
@@ -1500,18 +1505,19 @@ func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceR
 		ctx = context.Background()
 	}
 	nodeCommit := gitNodeCommit(rt, n)
+	objectSHA := gitObjectCacheKey(n.ObjectSHA)
 	if localRoot := strings.TrimSpace(fs.opts.LocalRoot); localRoot != "" {
 		if size, hit, err := gitcache.StatTreeFile(ctx, localRoot, rt.workspace.WorkspaceID, nodeCommit, rel); err == nil && hit {
 			rt.updateCleanNodeSize(rel, nodeCommit, size)
 			return size
 		}
-		if size, hit, err := gitcache.StatBlob(ctx, localRoot, rt.workspace.WorkspaceID, nodeCommit, n.ObjectSHA); err == nil && hit {
+		if size, hit, err := gitcache.StatBlob(ctx, localRoot, rt.workspace.WorkspaceID, nodeCommit, objectSHA); err == nil && hit {
 			rt.updateCleanNodeSize(rel, nodeCommit, size)
 			return size
 		}
 		baseCommit := strings.TrimSpace(rt.workspace.HeadCommit)
 		if baseCommit != "" && !strings.EqualFold(baseCommit, nodeCommit) {
-			if size, hit, err := gitcache.StatBlob(ctx, localRoot, rt.workspace.WorkspaceID, baseCommit, n.ObjectSHA); err == nil && hit {
+			if size, hit, err := gitcache.StatBlob(ctx, localRoot, rt.workspace.WorkspaceID, baseCommit, objectSHA); err == nil && hit {
 				rt.updateCleanNodeSize(rel, nodeCommit, size)
 				return size
 			}
@@ -1520,8 +1526,8 @@ func (fs *Dat9FS) resolveGitCleanNodeSize(ctx context.Context, rt *gitWorkspaceR
 	if gitWorkspaceIsFastBlobless(rt) {
 		return n.SizeBytes
 	}
-	if n.ObjectSHA != "" {
-		if size, err := fs.gitCatFileBlobSize(ctx, rt, n.ObjectSHA); err == nil {
+	if objectSHA != "" {
+		if size, err := fs.gitCatFileBlobSize(ctx, rt, objectSHA); err == nil {
 			rt.updateCleanNodeSize(rel, nodeCommit, size)
 			return size
 		}

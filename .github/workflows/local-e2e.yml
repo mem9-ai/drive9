@@ -249,6 +249,14 @@ jobs:
           RUN_FUSE_POSIX_FSX: "0"
         run: bash e2e/fuse-release-gate.sh
 
+      - name: Run Git operations smoke
+        id: git-ops-smoke
+        continue-on-error: true
+        env:
+          DRIVE9_API_KEY: local-dev-key
+          FUSE_STRICT_PREREQS: "1"
+        run: bash e2e/git-ops-smoke-test.sh
+
       - name: Compare FUSE performance metrics
         id: fuse_performance_compare
         if: always() && env.RUN_FUSE_PERFORMANCE_BASELINE == '1' && env.COMPARE_FUSE_PERFORMANCE_METRICS == '1'
@@ -356,6 +364,7 @@ jobs:
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
             echo "| Layer FS smoke | ${{ steps.layer-fs-smoke.outcome || 'skipped' }} |"
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
+            echo "| Git operations smoke | ${{ steps.git-ops-smoke.outcome || 'skipped' }} |"
             echo "| FUSE performance compare | ${{ steps.fuse_performance_compare.outcome || 'skipped' }} |"
             echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
             echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
@@ -424,6 +433,7 @@ jobs:
           check_required "CLI smoke" "${{ steps.cli-smoke.outcome }}"
           check_required "Layer FS smoke" "${{ steps.layer-fs-smoke.outcome }}"
           check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
+          check_required "Git operations smoke" "${{ steps.git-ops-smoke.outcome }}"
           if [ "${COMPARE_FUSE_PERFORMANCE_METRICS}" = "1" ]; then
             check_required "FUSE performance compare" "${{ steps.fuse_performance_compare.outcome }}"
           fi
