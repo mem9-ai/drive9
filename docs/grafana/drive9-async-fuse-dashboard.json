@@ -132,7 +132,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_service_gauge{component=\"semantic_worker\",name=\"queue_lag_seconds\"}",
+          "expr": "drive9_service_gauge{component=\"semantic_worker\",name=\"queue_lag_seconds\"}",
           "legendFormat": "queue_lag_seconds",
           "refId": "A"
         }
@@ -199,7 +199,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_service_gauge{component=\"semantic_worker\",name=\"dead_lettered\"}",
+          "expr": "drive9_service_gauge{component=\"semantic_worker\",name=\"dead_lettered\"}",
           "legendFormat": "dead_lettered",
           "refId": "A"
         }
@@ -266,7 +266,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dat9_fuse_remote_operations_total{result=\"error\"}[$__rate_interval])) / clamp_min(sum(rate(dat9_fuse_remote_operations_total[$__rate_interval])), 0.000001)",
+          "expr": "sum(rate(drive9_fuse_remote_operations_total{result=\"error\"}[$__rate_interval])) / clamp_min(sum(rate(drive9_fuse_remote_operations_total[$__rate_interval])), 0.000001)",
           "legendFormat": "fuse_remote_error_ratio",
           "refId": "A"
         }
@@ -333,7 +333,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_fuse_remote_operation_duration_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(drive9_fuse_remote_operation_duration_seconds_bucket[$__rate_interval])))",
           "legendFormat": "fuse_remote_p95",
           "refId": "A"
         }
@@ -409,7 +409,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_service_gauge{component=\"semantic_worker\",name=~\"inflight|queued|processing|dead_lettered\"}",
+          "expr": "drive9_service_gauge{component=\"semantic_worker\",name=~\"inflight|queued|processing|dead_lettered\"}",
           "legendFormat": "semantic_worker {{name}}",
           "refId": "A"
         }
@@ -456,7 +456,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_service_gauge{component=\"semantic_worker\",name=\"queue_lag_seconds\"}",
+          "expr": "drive9_service_gauge{component=\"semantic_worker\",name=\"queue_lag_seconds\"}",
           "legendFormat": "semantic_worker queue_lag_seconds",
           "refId": "A"
         },
@@ -465,7 +465,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_service_gauge{component=\"image_extract\",name=~\"workers|queue_capacity|queue_depth\"}",
+          "expr": "drive9_service_gauge{component=\"image_extract\",name=~\"workers|queue_capacity|queue_depth\"}",
           "legendFormat": "image_extract {{name}}",
           "refId": "B"
         },
@@ -474,7 +474,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_service_gauge{component=\"audio_extract\",name=~\"task_timeout_seconds|max_audio_bytes|max_extract_text_bytes\"}",
+          "expr": "drive9_service_gauge{component=\"audio_extract\",name=~\"task_timeout_seconds|max_audio_bytes|max_extract_text_bytes\"}",
           "legendFormat": "audio_extract {{name}}",
           "refId": "C"
         }
@@ -521,7 +521,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (operation, result) (rate(dat9_fuse_remote_operations_total[$__rate_interval]))",
+          "expr": "sum by (operation, result) (rate(drive9_fuse_remote_operations_total[$__rate_interval]))",
           "legendFormat": "{{operation}} {{result}}",
           "refId": "A"
         }
@@ -568,7 +568,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(dat9_fuse_remote_operation_duration_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(drive9_fuse_remote_operation_duration_seconds_bucket[$__rate_interval])))",
           "legendFormat": "{{operation}} remote_p95",
           "refId": "A"
         }
@@ -615,7 +615,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (result) (rate(dat9_service_operations_total{component=\"audio_extract\",operation=\"process\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(drive9_service_operations_total{component=\"audio_extract\",operation=\"process\"}[$__rate_interval]))",
           "legendFormat": "audio_extract {{result}}",
           "refId": "A"
         }
@@ -662,7 +662,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(dat9_service_operation_duration_seconds_bucket{component=\"audio_extract\",operation=\"process\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(drive9_service_operation_duration_seconds_bucket{component=\"audio_extract\",operation=\"process\"}[$__rate_interval])))",
           "legendFormat": "audio_extract p95",
           "refId": "A"
         },
@@ -671,7 +671,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(dat9_service_operation_duration_seconds_bucket{component=\"audio_extract\",operation=\"process\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(drive9_service_operation_duration_seconds_bucket{component=\"audio_extract\",operation=\"process\"}[$__rate_interval])))",
           "legendFormat": "audio_extract p99",
           "refId": "B"
         }
@@ -718,7 +718,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (result) (rate(dat9_service_operations_total{component=\"image_extract\",operation=\"process\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(drive9_service_operations_total{component=\"image_extract\",operation=\"process\"}[$__rate_interval]))",
           "legendFormat": "image_extract {{result}}",
           "refId": "A"
         }
@@ -765,7 +765,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "dat9_service_gauge{component=\"image_extract\",name=\"queue_depth\"} / clamp_min(dat9_service_gauge{component=\"image_extract\",name=\"queue_capacity\"}, 1)",
+          "expr": "drive9_service_gauge{component=\"image_extract\",name=\"queue_depth\"} / clamp_min(drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\"}, 1)",
           "legendFormat": "image_extract queue_saturation",
           "refId": "A"
         }

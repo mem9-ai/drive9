@@ -49,10 +49,10 @@ func TestMetaDBMetrics(t *testing.T) {
 	rec := httptest.NewRecorder()
 	metrics.WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `dat9_db_operations_total{operation="`) || !strings.Contains(text, `role="meta"`) {
+	if !strings.Contains(text, `drive9_db_operations_total{operation="`) || !strings.Contains(text, `role="meta"`) {
 		t.Fatalf("expected meta db operation metric in response: %s", text)
 	}
-	if !strings.Contains(text, `dat9_db_pool_registered{role="meta"}`) {
+	if !strings.Contains(text, `drive9_db_pool_registered{role="meta"}`) {
 		t.Fatalf("expected meta db pool metric in response: %s", text)
 	}
 }

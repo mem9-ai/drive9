@@ -430,7 +430,7 @@ func TestRecordTenantSchemaVersionUpdateFailureRecordsMetric(t *testing.T) {
 
 func operationMetricValue(t *testing.T, output, labels string) uint64 {
 	t.Helper()
-	prefix := `dat9_service_operations_total{` + labels + `} `
+	prefix := `drive9_service_operations_total{` + labels + `} `
 	for _, line := range strings.Split(output, "\n") {
 		if !strings.HasPrefix(line, prefix) {
 			continue

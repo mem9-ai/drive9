@@ -4,6 +4,7 @@
 set -euo pipefail
 
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
+RUN_GIT_OPS_SMOKE="${RUN_GIT_OPS_SMOKE:-0}"
 RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
 RUN_PORTABLE_PACK_E2E="${RUN_PORTABLE_PACK_E2E:-0}"
 
@@ -38,6 +39,13 @@ run_case "cli" "e2e/cli-smoke-test.sh"
 run_case "journal" "e2e/journal-smoke-test.sh"
 run_case "fuse" "e2e/fuse-smoke-test.sh"
 run_case "posix-permission" "e2e/posix-permission-smoke-test.sh"
+if [ "$RUN_GIT_OPS_SMOKE" = "1" ]; then
+  run_case "git-ops" "e2e/git-ops-smoke-test.sh"
+else
+  echo
+  echo "=== [git-ops] e2e/git-ops-smoke-test.sh ==="
+  echo "SKIP [git-ops] set RUN_GIT_OPS_SMOKE=1 to run lightweight Git clone/status/restore coverage"
+fi
 if [ "$RUN_GIT_WORKSPACE_SMOKE" = "1" ]; then
   run_case "git-workspace" "e2e/git-workspace-smoke-test.sh"
 else

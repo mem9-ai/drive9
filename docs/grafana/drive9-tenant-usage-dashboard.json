@@ -15,7 +15,7 @@
       }
     ]
   },
-  "description": "Request-path drill-down dashboard for the Drive9 filesystem path, correlating /v1/fs HTTP requests with backend fs_* work.",
+  "description": "Tenant usage dashboard: request frequency, logical file IO, transport bytes, latency, and errors by tenant/surface/action.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -28,7 +28,7 @@
       "keepTime": true,
       "tags": [],
       "targetBlank": false,
-      "title": "Service Health Overview",
+      "title": "Service Health",
       "type": "link",
       "url": "/d/drive9-service-health"
     },
@@ -39,29 +39,23 @@
       "keepTime": true,
       "tags": [],
       "targetBlank": false,
-      "title": "Async And FUSE Overview",
+      "title": "Filesystem Drill-Down",
       "type": "link",
-      "url": "/d/drive9-async-fuse"
+      "url": "/d/drive9-filesystem-path"
+    },
+    {
+      "asDropdown": false,
+      "icon": "external link",
+      "includeVars": true,
+      "keepTime": true,
+      "tags": [],
+      "targetBlank": false,
+      "title": "Upload Drill-Down",
+      "type": "link",
+      "url": "/d/drive9-upload-path"
     }
   ],
-  "liveNow": false,
   "panels": [
-    {
-      "gridPos": {
-        "h": 4,
-        "w": 24,
-        "x": 0,
-        "y": 0
-      },
-      "id": 100,
-      "options": {
-        "content": "# Filesystem Path Performance\n\nCategory: request-path drill-down.\n\nUse this when the incident is clearly on the filesystem path. This dashboard owns the `/v1/fs/*` path and should be preferred over the generic API surface dashboard for filesystem symptoms. It combines HTTP `/v1/fs/*` traffic with backend `fs_*` service operations so you can separate front-door symptoms from internal work.",
-        "mode": "markdown"
-      },
-      "title": "Guide",
-      "transparent": true,
-      "type": "text"
-    },
     {
       "datasource": {
         "type": "prometheus",
@@ -69,36 +63,15 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 20
-              },
-              {
-                "color": "red",
-                "value": 100
-              }
-            ]
-          },
-          "unit": "reqps"
+          "unit": "short"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
+        "w": 6,
         "x": 0,
-        "y": 4
+        "y": 0
       },
       "id": 1,
       "options": {
@@ -121,12 +94,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(drive9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
-          "legendFormat": "fs_rps",
+          "expr": "count(count by (tenant_id) (rate(drive9_tenant_requests_total{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval]) > 0))",
+          "legendFormat": "active tenants",
           "refId": "A"
         }
       ],
-      "title": "FS HTTP RPS",
+      "title": "Active Tenants",
       "type": "stat"
     },
     {
@@ -136,36 +109,15 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.2
-              },
-              {
-                "color": "red",
-                "value": 1
-              }
-            ]
-          },
-          "unit": "s"
+          "unit": "reqps"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 4,
-        "y": 4
+        "w": 6,
+        "x": 6,
+        "y": 0
       },
       "id": 2,
       "options": {
@@ -188,12 +140,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(drive9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval])))",
-          "legendFormat": "http_p95",
+          "expr": "sum(rate(drive9_tenant_requests_total{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval]))",
+          "legendFormat": "requests/s",
           "refId": "A"
         }
       ],
-      "title": "FS HTTP P95",
+      "title": "Tenant Requests/s",
       "type": "stat"
     },
     {
@@ -203,36 +155,15 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.1
-              },
-              {
-                "color": "red",
-                "value": 0.5
-              }
-            ]
-          },
-          "unit": "s"
+          "unit": "Bps"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 8,
-        "y": 4
+        "w": 6,
+        "x": 12,
+        "y": 0
       },
       "id": 3,
       "options": {
@@ -255,12 +186,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(drive9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval])))",
-          "legendFormat": "svc_p95",
+          "expr": "sum(rate(drive9_tenant_file_bytes_total{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval]))",
+          "legendFormat": "file bytes/s",
           "refId": "A"
         }
       ],
-      "title": "FS Service P95",
+      "title": "Logical File IO",
       "type": "stat"
     },
     {
@@ -270,36 +201,15 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 0.01
-              },
-              {
-                "color": "red",
-                "value": 0.05
-              }
-            ]
-          },
           "unit": "percentunit"
         },
         "overrides": []
       },
       "gridPos": {
         "h": 4,
-        "w": 4,
-        "x": 12,
-        "y": 4
+        "w": 6,
+        "x": 18,
+        "y": 0
       },
       "id": 4,
       "options": {
@@ -322,12 +232,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(drive9_http_requests_total{route=~\"$http_route\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(drive9_http_requests_total{route=~\"$http_route\"}[$__rate_interval])), 0.000001)",
-          "legendFormat": "fs_5xx_ratio",
+          "expr": "sum(rate(drive9_tenant_requests_total{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\",result!=\"ok\"}[$__rate_interval])) / clamp_min(sum(rate(drive9_tenant_requests_total{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval])), 0.000001)",
+          "legendFormat": "non-ok ratio",
           "refId": "A"
         }
       ],
-      "title": "FS 5xx Ratio",
+      "title": "Non-OK Ratio",
       "type": "stat"
     },
     {
@@ -337,93 +247,310 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "thresholds"
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
           },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "orange",
-                "value": 20
-              },
-              {
-                "color": "red",
-                "value": 100
-              }
-            ]
+          "expr": "topk(15, sum by (tenant_id) (rate(drive9_tenant_requests_total{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval])))",
+          "legendFormat": "{{tenant_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Top Tenants by Request Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
           },
+          "expr": "topk(15, sum by (tenant_id, direction) (rate(drive9_tenant_file_bytes_total{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval])))",
+          "legendFormat": "{{tenant_id}} {{direction}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Top Tenants by Logical File IO",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (surface, action) (rate(drive9_tenant_requests_total{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval]))",
+          "legendFormat": "{{surface}}/{{action}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Usage by Surface and Action",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le, tenant_id, surface, action) (rate(drive9_tenant_request_duration_seconds_bucket{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval])))",
+          "legendFormat": "{{tenant_id}} {{surface}}/{{action}} p95",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le, tenant_id, surface, action) (rate(drive9_tenant_request_duration_seconds_bucket{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval])))",
+          "legendFormat": "{{tenant_id}} {{surface}}/{{action}} p99",
+          "refId": "B"
+        }
+      ],
+      "title": "Tenant Request Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "topk(15, sum by (tenant_id, result) (rate(drive9_tenant_requests_total{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\",result!=\"ok\"}[$__rate_interval])))",
+          "legendFormat": "{{tenant_id}} {{result}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Top Tenant Errors",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (surface, action, direction) (rate(drive9_tenant_http_bytes_total{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"}[$__rate_interval]))",
+          "legendFormat": "{{surface}}/{{action}} {{direction}}",
+          "refId": "A"
+        }
+      ],
+      "title": "HTTP Transport Bytes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "fieldConfig": {
+        "defaults": {
           "unit": "short"
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 16,
-        "y": 4
-      },
-      "id": 5,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(drive9_http_inflight_requests{route=~\"$http_route\"})",
-          "legendFormat": "fs_inflight",
-          "refId": "A"
-        }
-      ],
-      "title": "FS HTTP Inflight",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "reqps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
+        "h": 7,
+        "w": 8,
         "x": 0,
-        "y": 8
+        "y": 28
       },
       "id": 11,
       "options": {
         "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -436,12 +563,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (route, method) (rate(drive9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
-          "legendFormat": "{{method}} {{route}}",
+          "expr": "sum by (tenant_id, surface, action) (drive9_tenant_inflight_requests{tenant_id=~\"$tenant\",surface=~\"$surface\",action=~\"$action\"})",
+          "legendFormat": "{{tenant_id}} {{surface}}/{{action}}",
           "refId": "A"
         }
       ],
-      "title": "FS Route Throughput",
+      "title": "Tenant In-Flight Requests",
       "type": "timeseries"
     },
     {
@@ -451,26 +578,25 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "s"
+          "unit": "bytes"
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 8
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 28
       },
       "id": 12,
       "options": {
         "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -483,21 +609,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.95, sum by (le, route, method) (rate(drive9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval]))))",
-          "legendFormat": "{{method}} {{route}} p95",
+          "expr": "topk(15, drive9_tenant_storage_bytes{tenant_id=~\"$tenant\",state=~\"confirmed|reserved\"})",
+          "legendFormat": "{{tenant_id}} {{state}}",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "topk(12, histogram_quantile(0.99, sum by (le, route, method) (rate(drive9_http_request_duration_seconds_bucket{route=~\"$http_route\"}[$__rate_interval]))))",
-          "legendFormat": "{{method}} {{route}} p99",
-          "refId": "B"
         }
       ],
-      "title": "FS Route Tail Latency",
+      "title": "Tenant Storage Bytes",
       "type": "timeseries"
     },
     {
@@ -507,26 +624,25 @@
       },
       "fieldConfig": {
         "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "ops"
+          "unit": "percentunit"
         },
         "overrides": []
       },
       "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 16
+        "h": 7,
+        "w": 8,
+        "x": 16,
+        "y": 28
       },
       "id": 13,
       "options": {
         "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
         },
         "tooltip": {
           "mode": "multi",
@@ -539,55 +655,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (operation, result) (rate(drive9_service_operations_total{operation=~\"$service_operation\"}[$__rate_interval]))",
-          "legendFormat": "{{operation}} / {{result}}",
-          "refId": "A"
-        }
-      ],
-      "title": "FS Service Throughput",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 16
-      },
-      "id": 14,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "topk(12, histogram_quantile(0.95, sum by (le, operation) (rate(drive9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval]))))",
-          "legendFormat": "{{operation}} p95",
+          "expr": "topk(15, ((sum by (tenant_id) (drive9_tenant_storage_bytes{tenant_id=~\"$tenant\",state=~\"confirmed|reserved\"}) / sum by (tenant_id) (drive9_tenant_storage_bytes{tenant_id=~\"$tenant\",state=\"limit\"})) and on (tenant_id) (sum by (tenant_id) (drive9_tenant_storage_bytes{tenant_id=~\"$tenant\",state=\"limit\"}) > 0)))",
+          "legendFormat": "{{tenant_id}} storage",
           "refId": "A"
         },
         {
@@ -595,174 +664,21 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "topk(12, histogram_quantile(0.99, sum by (le, operation) (rate(drive9_service_operation_duration_seconds_bucket{operation=~\"$service_operation\"}[$__rate_interval]))))",
-          "legendFormat": "{{operation}} p99",
+          "expr": "topk(15, ((drive9_tenant_media_files{tenant_id=~\"$tenant\",state=\"confirmed\"} / on (tenant_id) drive9_tenant_media_files{tenant_id=~\"$tenant\",state=\"limit\"}) and on (tenant_id) (drive9_tenant_media_files{tenant_id=~\"$tenant\",state=\"limit\"} > 0)))",
+          "legendFormat": "{{tenant_id}} media files",
           "refId": "B"
         }
       ],
-      "title": "FS Service Tail Latency",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "reqps"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 24
-      },
-      "id": 15,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (status) (rate(drive9_http_requests_total{route=~\"$http_route\"}[$__rate_interval]))",
-          "legendFormat": "{{status}}",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(drive9_http_inflight_requests{route=~\"$http_route\"})",
-          "legendFormat": "inflight",
-          "refId": "B"
-        }
-      ],
-      "title": "FS HTTP Status Mix And Inflight",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 32
-      },
-      "id": 16,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (event, result) (rate(drive9_business_events_total{event=~\"fs_read|fs_write|fs_patch|fs_append\"}[$__rate_interval]))",
-          "legendFormat": "{{event}} / {{result}}",
-          "refId": "A"
-        }
-      ],
-      "title": "FS Outcome Events",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "mappings": [],
-          "unit": "ops"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 32
-      },
-      "id": 17,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom"
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (event, result) (rate(drive9_business_events_total{event=~\"fs_read|fs_write|fs_patch|fs_append\",result!~\"ok|accepted\"}[$__rate_interval]))",
-          "legendFormat": "{{event}} / {{result}}",
-          "refId": "A"
-        }
-      ],
-      "title": "FS Conflict And Error Events",
+      "title": "Tenant Quota Usage Ratio",
       "type": "timeseries"
     }
   ],
   "refresh": "30s",
-  "schemaVersion": 41,
+  "schemaVersion": 39,
   "tags": [
     "drive9",
-    "filesystem",
-    "request-path",
-    "performance",
-    "grafana",
-    "prometheus"
+    "tenant",
+    "usage"
   ],
   "templating": {
     "list": [
@@ -770,21 +686,22 @@
         "current": {
           "selected": false,
           "text": "Prometheus",
-          "value": "Prometheus"
+          "value": "prometheus"
         },
         "hide": 0,
         "includeAll": false,
-        "label": "Datasource",
+        "label": "Data source",
         "multi": false,
         "name": "datasource",
         "options": [],
         "query": "prometheus",
         "refresh": 1,
         "regex": "",
+        "skipUrlSync": false,
         "type": "datasource"
       },
       {
-        "allValue": "/v1/fs/.*",
+        "allValue": ".*",
         "current": {
           "selected": true,
           "text": "All",
@@ -794,21 +711,22 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(drive9_http_requests_total{route=~\"/v1/fs.*\"}, route)",
+        "definition": "label_values(drive9_tenant_requests_total, tenant_id)",
         "hide": 0,
         "includeAll": true,
-        "label": "HTTP Route",
+        "label": "Tenant",
         "multi": true,
-        "name": "http_route",
+        "name": "tenant",
         "options": [],
-        "query": "label_values(drive9_http_requests_total{route=~\"/v1/fs.*\"}, route)",
-        "refresh": 2,
+        "query": "label_values(drive9_tenant_requests_total, tenant_id)",
+        "refresh": 1,
         "regex": "",
+        "skipUrlSync": false,
         "sort": 1,
         "type": "query"
       },
       {
-        "allValue": "fs_.*",
+        "allValue": ".*",
         "current": {
           "selected": true,
           "text": "All",
@@ -818,16 +736,42 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(drive9_service_operations_total{operation=~\"fs_.*\"}, operation)",
+        "definition": "label_values(drive9_tenant_requests_total{tenant_id=~\"$tenant\"}, surface)",
         "hide": 0,
         "includeAll": true,
-        "label": "Service Operation",
+        "label": "Surface",
         "multi": true,
-        "name": "service_operation",
+        "name": "surface",
         "options": [],
-        "query": "label_values(drive9_service_operations_total{operation=~\"fs_.*\"}, operation)",
-        "refresh": 2,
+        "query": "label_values(drive9_tenant_requests_total{tenant_id=~\"$tenant\"}, surface)",
+        "refresh": 1,
         "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "allValue": ".*",
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(drive9_tenant_requests_total{tenant_id=~\"$tenant\",surface=~\"$surface\"}, action)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "Action",
+        "multi": true,
+        "name": "action",
+        "options": [],
+        "query": "label_values(drive9_tenant_requests_total{tenant_id=~\"$tenant\",surface=~\"$surface\"}, action)",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
         "sort": 1,
         "type": "query"
       }
@@ -839,8 +783,8 @@
   },
   "timepicker": {},
   "timezone": "",
-  "title": "Drive9 Filesystem Path Performance",
-  "uid": "drive9-filesystem-path",
+  "title": "Drive9 Tenant Usage",
+  "uid": "drive9-tenant-usage",
   "version": 1,
   "weekStart": ""
 }
