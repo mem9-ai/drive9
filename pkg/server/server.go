@@ -91,6 +91,7 @@ type Server struct {
 	logger              *zap.Logger
 	mux                 *http.ServeMux
 	events              *eventBuses
+	sseRetention        *sseRetentionSweeper
 	semanticWorker      *semanticWorkerManager
 	journalCursorSecret []byte
 	objectGCWorker      *objectGCWorker
@@ -193,6 +194,7 @@ func NewWithConfig(cfg Config) *Server {
 		metrics:           newServerMetrics(),
 		logger:            logger,
 		events:            newEventBuses(),
+		sseRetention:      newSSERetentionSweeper(),
 		slockOAuth:        cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
 			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),

@@ -198,6 +198,45 @@ func TestSSEEndpointPersistentReplayAfterMemoryBusReset(t *testing.T) {
 	}
 }
 
+func TestSSERetentionSweeperPrunesOutsideWindow(t *testing.T) {
+	srv := newTestServer(t)
+	store := srv.fallback.Store()
+	ctx := context.Background()
+
+	ev1, err := store.InsertFSEvent(ctx, "/old.txt", "write", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev2, err := store.InsertFSEvent(ctx, "/keep-a.txt", "write", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev3, err := store.InsertFSEvent(ctx, "/keep-b.txt", "chmod", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sweeper := newSSERetentionSweeper()
+	sweeper.retention = 2
+	sweeper.sweepHead(ctx, store, ev3.Seq)
+
+	events, err := store.ListFSEventsSince(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events len=%d, want 2: %+v", len(events), events)
+	}
+	if events[0].Seq != ev2.Seq || events[1].Seq != ev3.Seq {
+		t.Fatalf("kept seqs = [%d %d], want [%d %d]", events[0].Seq, events[1].Seq, ev2.Seq, ev3.Seq)
+	}
+	for _, ev := range events {
+		if ev.Seq == ev1.Seq {
+			t.Fatalf("old event was not pruned: %+v", ev)
+		}
+	}
+}
+
 func TestHandleChmodPublishesPersistentSSEEvent(t *testing.T) {
 	srv := newTestServer(t)
 	ctx := context.Background()

@@ -14,6 +14,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/metrics"
+	"go.uber.org/zap"
 )
 
 const (
@@ -22,6 +23,8 @@ const (
 	sseFlushBatchSize        = 10
 	sseFlushMaxDelay         = 1 * time.Millisecond
 	ssePersistTimeout        = 500 * time.Millisecond
+	sseRetentionSweepTimeout = 5 * time.Second
+	sseRetentionSweepEvery   = time.Minute
 	ssePersistentReplayLimit = eventBusRingSize
 	ssePersistentRetention   = eventBusRingSize * 10
 )
@@ -182,14 +185,6 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 		ev, err := b.Store().InsertFSEvent(persistCtx, path, op, actor)
 		if err == nil {
 			recordSSEOperation("persist", sseResultOK, persistStart)
-			if ev.Seq > ssePersistentRetention {
-				pruneStart := time.Now()
-				if _, pruneErr := b.Store().PruneFSEventsBefore(persistCtx, ev.Seq-ssePersistentRetention+1); pruneErr != nil {
-					recordSSEOperation("retention_sweep", sseResultError, pruneStart)
-				} else {
-					recordSSEOperation("retention_sweep", sseResultOK, pruneStart)
-				}
-			}
 			publishStart := time.Now()
 			bus.PublishEvent(ChangeEvent{
 				Seq:   ev.Seq,
@@ -199,6 +194,9 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 				Ts:    ev.Ts,
 			})
 			recordSSEOperation("publish", sseResultOK, publishStart)
+			if s.sseRetention != nil {
+				s.sseRetention.MaybeSweep(r.Context(), sseRetentionTenantKey(r), b.Store(), ev.Seq)
+			}
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "sse_persist_failed", "path", path, "op", op, "error", err)...)
@@ -207,6 +205,85 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 	start := time.Now()
 	bus.Publish(path, op, actor)
 	recordSSEOperation("publish", sseResultVolatile, start)
+}
+
+type sseRetentionSweeper struct {
+	mu          sync.Mutex
+	last        map[string]time.Time
+	running     map[string]bool
+	retention   uint64
+	minInterval time.Duration
+	timeout     time.Duration
+	now         func() time.Time
+}
+
+func newSSERetentionSweeper() *sseRetentionSweeper {
+	return &sseRetentionSweeper{
+		last:        make(map[string]time.Time),
+		running:     make(map[string]bool),
+		retention:   ssePersistentRetention,
+		minInterval: sseRetentionSweepEvery,
+		timeout:     sseRetentionSweepTimeout,
+		now:         time.Now,
+	}
+}
+
+func sseRetentionTenantKey(r *http.Request) string {
+	if scope := ScopeFromContext(r.Context()); scope != nil {
+		return scope.TenantID
+	}
+	return ""
+}
+
+func (w *sseRetentionSweeper) MaybeSweep(ctx context.Context, tenantKey string, store *datastore.Store, headSeq uint64) {
+	if w == nil || store == nil || w.retention == 0 || headSeq <= w.retention {
+		return
+	}
+	now := w.now()
+
+	w.mu.Lock()
+	if w.running[tenantKey] {
+		w.mu.Unlock()
+		return
+	}
+	if last := w.last[tenantKey]; !last.IsZero() && now.Sub(last) < w.minInterval {
+		w.mu.Unlock()
+		return
+	}
+	w.running[tenantKey] = true
+	w.last[tenantKey] = now
+	w.mu.Unlock()
+
+	go func() {
+		defer func() {
+			w.mu.Lock()
+			w.running[tenantKey] = false
+			w.mu.Unlock()
+		}()
+		sweepCtx, cancel := context.WithTimeout(backgroundWithTrace(ctx), w.timeout)
+		defer cancel()
+		w.sweepHead(sweepCtx, store, headSeq)
+	}()
+}
+
+func (w *sseRetentionSweeper) sweepHead(ctx context.Context, store *datastore.Store, headSeq uint64) {
+	if w == nil || w.retention == 0 || headSeq <= w.retention {
+		return
+	}
+	w.sweepStore(ctx, store, headSeq-w.retention+1)
+}
+
+func (w *sseRetentionSweeper) sweepStore(ctx context.Context, store *datastore.Store, keepFromSeq uint64) {
+	if store == nil || keepFromSeq == 0 {
+		return
+	}
+	start := time.Now()
+	if _, err := store.PruneFSEventsBefore(ctx, keepFromSeq); err != nil {
+		recordSSEOperation("retention_sweep", sseResultError, start)
+		logger.Warn(ctx, "sse_retention_sweep_failed", zap.Uint64("keep_from_seq", keepFromSeq), zap.Error(err))
+		return
+	}
+	recordSSEOperation("retention_sweep", sseResultOK, start)
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
