@@ -7,16 +7,17 @@ import (
 
 // ChangeEvent represents a single filesystem mutation event.
 type ChangeEvent struct {
-	Seq   uint64 `json:"seq"`              // monotonic per-bus sequence number
-	Path  string `json:"path"`             // affected path
-	Op    string `json:"op"`               // "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
-	Actor string `json:"actor,omitempty"`  // X-Dat9-Actor header value (per-mount ID)
-	Ts    int64  `json:"ts"`               // unix milliseconds
+	Seq   uint64 `json:"seq"`             // monotonic per-bus sequence number
+	Path  string `json:"path"`            // affected path
+	Op    string `json:"op"`              // filesystem mutation op, for example "write", "delete", "rename", "mkdir", "copy", "upload_complete", or "chmod"
+	Actor string `json:"actor,omitempty"` // X-Dat9-Actor header value (per-mount ID)
+	Ts    int64  `json:"ts"`              // unix milliseconds
 }
 
 const (
 	eventBusRingSize         = 10000
 	eventBusListenerChanSize = 1 // signal-only channel
+	eventBusForceResetOp     = "__sse_force_reset__"
 )
 
 // EventBus is a per-tenant in-memory event hub backed by a fixed-size ring buffer.
@@ -49,6 +50,44 @@ func (eb *EventBus) Publish(path, op, actor string) {
 		Actor: actor,
 		Ts:    time.Now().UnixMilli(),
 	}
+	eb.publishLocked(ev)
+	eb.mu.Unlock()
+}
+
+// PublishEvent appends an event whose sequence was assigned by a durable event
+// log. It is used by the SSE endpoint so reconnect replay and live delivery use
+// the same cursor space when possible. If the durable event arrives out of order
+// or behind a volatile fallback cursor, publish a reset signal instead of
+// renumbering the durable event into a different live ordering.
+func (eb *EventBus) PublishEvent(ev ChangeEvent) {
+	eb.mu.Lock()
+	if ev.Seq == 0 {
+		eb.seq++
+		ev.Seq = eb.seq
+	} else if eb.seq > 0 && ev.Seq != eb.seq+1 {
+		eb.publishResetLocked()
+		eb.mu.Unlock()
+		return
+	} else if ev.Seq > eb.seq {
+		eb.seq = ev.Seq
+	}
+	if ev.Ts == 0 {
+		ev.Ts = time.Now().UnixMilli()
+	}
+	eb.publishLocked(ev)
+	eb.mu.Unlock()
+}
+
+func (eb *EventBus) publishResetLocked() {
+	eb.seq++
+	eb.publishLocked(ChangeEvent{
+		Seq: eb.seq,
+		Op:  eventBusForceResetOp,
+		Ts:  time.Now().UnixMilli(),
+	})
+}
+
+func (eb *EventBus) publishLocked(ev ChangeEvent) {
 	eb.ring[eb.head] = ev
 	eb.head = (eb.head + 1) % eventBusRingSize
 	if eb.count < eventBusRingSize {
@@ -62,7 +101,6 @@ func (eb *EventBus) Publish(path, op, actor string) {
 		default:
 		}
 	}
-	eb.mu.Unlock()
 }
 
 // Subscribe registers a new listener. Returns a unique ID and a signal channel.
@@ -97,6 +135,14 @@ func (eb *EventBus) Seq() uint64 {
 	return eb.seq
 }
 
+func (eb *EventBus) AdvanceSeq(seq uint64) {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	if seq > eb.seq {
+		eb.seq = seq
+	}
+}
+
 // EventsSince returns all events with seq > since and the current head seq.
 // If since is too old (ring wrapped), from the future, or zero, ok is false
 // and the caller should send a reset using the returned headSeq.
@@ -123,6 +169,9 @@ func (eb *EventBus) EventsSince(since uint64) (events []ChangeEvent, headSeq uin
 	oldestSeq := eb.ring[oldestIdx].Seq
 	newestSeq := eb.ring[(eb.head-1+eventBusRingSize)%eventBusRingSize].Seq
 
+	if since == maxUint64 {
+		return nil, headSeq, false
+	}
 	if since+1 < oldestSeq {
 		// Ring has wrapped past the client's position.
 		// since+1 is the first seq the client needs; if it's older than
@@ -140,11 +189,16 @@ func (eb *EventBus) EventsSince(since uint64) (events []ChangeEvent, headSeq uin
 
 	// Walk the ring from oldest to newest, collecting events with seq > since.
 	result := make([]ChangeEvent, 0, 64)
+	expectedSeq := since + 1
 	for i := 0; i < eb.count; i++ {
 		idx := (oldestIdx + i) % eventBusRingSize
 		ev := eb.ring[idx]
 		if ev.Seq > since {
+			if ev.Seq != expectedSeq {
+				return nil, headSeq, false
+			}
 			result = append(result, ev)
+			expectedSeq++
 		}
 	}
 	return result, headSeq, true

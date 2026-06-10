@@ -31,12 +31,11 @@ This spec describes the **target architecture** for P1 cache implementation. The
 
 **API prerequisites** (NOT in scope of this spec, tracked as separate issues):
 
-- **chmod SSE event**: `handleChmod` (server.go:2033-2069) does NOT call `publishEvent`. Remote chmod changes are invisible to other mounts until TTL expiry. Needs server fix.
 - **Directory revision**: `handleStat` only returns `X-Dat9-Revision` when `nf.File != nil` (server.go:1865-1866). Directories have no revision exposed. Until this is fixed, directory cache validity relies on SSE invalidation + TTL only (no revision-based lazy revalidation for directories).
 
 ## 2. Definitions
 
-- **revision**: A monotonically increasing integer assigned by the server to each file mutation. Every write produces a new revision. Note: chmod does NOT currently increment revision or emit SSE (see §1.1 prerequisites).
+- **revision**: A monotonically increasing integer assigned by the server to each file mutation. Every write and chmod produces a new revision.
 - **SSE**: Server-Sent Events stream from `/v1/events`. Delivers `ChangeEvent` (per-path, for write/upload_complete/create/symlink ops), `ResetEvent` (full invalidation, including for structural ops like rename/delete/mkdir/copy), and heartbeat/current markers after replay/reset catch-up.
 - **trusted event stream**: An SSE stream that is safe to use as a freshness guarantee for revision-bound stat-cache hits. The current server event bus is process-local, so the stream is trusted only for single-server/sticky-routing deployments, or for future deployments with a cluster-wide durable event stream. Mounts must fail closed unless the operator explicitly enables this trust boundary.
 - **stale**: Cache entry whose revision is older than the server's current revision for that path.
@@ -122,7 +121,7 @@ Every server mutation maps to exactly one SSE event type. This table is the auth
 | `delete` | ResetEvent | Full (all caches) | Path + parent dir + potential subtree |
 | `mkdir` | ResetEvent | Full (all caches) | Parent dir structure changed |
 | `copy` | ResetEvent | Full (all caches) | Source metadata + dest path + dest parent |
-| `chmod` | *(none)* | *(not invalidated)* | **Known gap**: `handleChmod` does not call `publishEvent` or increment revision. See §1.1 prerequisites. Remote chmod is invisible until TTL expiry. |
+| `chmod` | ChangeEvent | Targeted (path P) | Mode metadata changed |
 
 **Why structural ops use ResetEvent**: Targeted single-path invalidation cannot reliably cover all affected caches. For example, `rename(A, B)` affects: read cache for A, stat cache for A, stat cache for B, dir cache for `parent(A)`, dir cache for `parent(B)`, negative cache for `(parent(B), basename(B))`, and any subtree under A if A is a directory. Full reset is the safe default; future optimization MAY use the `path`/`op` payload fields for targeted invalidation.
 
