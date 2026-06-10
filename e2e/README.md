@@ -23,9 +23,10 @@ including local single-tenant validation via `drive9-server-local`.
 | `fuse-posix-fsx-gate.sh` | Opt-in JuiceFS-style POSIX/fsx subset over real writable FUSE: deterministic random write/read/truncate, atomic rename replacement, unlink-open reads, directory fsync, final model hash, unmount, and remote snapshot parity |
 | `fuse-performance-baseline.sh` | Opt-in real writable FUSE baseline that records small-file, large-file, repeated large-read, and SQLite transaction/read metrics as JSON artifacts without hardcoded throughput thresholds; SQLite reads verify stored row payload bytes against row checksums |
 | `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, mount-log audit, manifest-based FUSE correctness workload, and SQLite rollback-journal correctness; set `RUN_FUSE_ALL_WORKLOADS=1` to add all optional release-gate workloads, `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip SQLite temporarily, `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress, `RUN_FUSE_POSIX_FSX=1` to add the POSIX/fsx subset, and `RUN_FUSE_PERFORMANCE_BASELINE=1` to add performance metrics |
+| `git-ops-smoke-test.sh` | Lightweight local Git gate using a local bare fixture: native clone, `drive9 git clone --fast`, and `drive9 git clone --fast --blobless` across `coding-agent` and `portable` profiles, followed by edit/add/commit/stash, remount into a fresh local root, and Git state/content verification |
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
-| `smoke-all.sh` | Runs API + CLI + journal + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_GIT_WORKSPACE_SMOKE=1` to include Git workspace coverage |
+| `smoke-all.sh` | Runs API + CLI + journal + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_GIT_OPS_SMOKE=1` to include lightweight Git coverage and `RUN_GIT_WORKSPACE_SMOKE=1` to include heavier Git workspace coverage |
 
 ## Run
 
@@ -76,6 +77,10 @@ bash e2e/fuse-performance-baseline.sh
 # Fast-blobless Git workspace smoke. This is intentionally opt-in for broad
 # smoke runs because it clones real repositories and needs FUSE support.
 bash e2e/git-workspace-smoke-test.sh
+
+# Lightweight Git operations smoke. This is the PR-local Git gate and uses a
+# local fixture remote instead of GitHub/dev/prod state.
+bash e2e/git-ops-smoke-test.sh
 
 # Strict FUSE release gate used by CI
 bash e2e/fuse-release-gate.sh
@@ -238,11 +243,12 @@ RUN_FUSE_PERFORMANCE_BASELINE=1 bash e2e/fuse-release-gate.sh
 # POSIX permission smoke (API + CLI + FUSE).
 bash e2e/posix-permission-smoke-test.sh
 
-# Run API + CLI + FUSE + POSIX permission in sequence.
+# Run the default smoke-all sequence once.
 bash e2e/smoke-all.sh
 
-# Include Git workspace fast-clone coverage in smoke-all.
-RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
+# Or enable optional Git coverage in that same single smoke-all run.
+# Set either variable to 1 as needed; setting both includes both Git suites.
+RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
 ```
 
 If you overrode `DRIVE9_LOCAL_API_KEY` before starting `drive9-server-local`,
@@ -258,6 +264,7 @@ CLI_SOURCE=official bash e2e/fuse-sqlite-correctness.sh
 CLI_SOURCE=official bash e2e/fuse-concurrency-stress.sh
 CLI_SOURCE=official bash e2e/fuse-performance-baseline.sh
 CLI_SOURCE=official bash e2e/fuse-release-gate.sh
+CLI_SOURCE=official bash e2e/git-ops-smoke-test.sh
 CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
 ```
 
@@ -308,6 +315,17 @@ CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
 - Git workspace file-count knobs are `GIT_WORKSPACE_EXISTING_FILES`, `GIT_WORKSPACE_NEW_FILES`, and `GIT_WORKSPACE_PATCH_FILES`.
 - Git workspace timeout knobs are `GIT_WORKSPACE_CLONE_TIMEOUT_S` and `GIT_WORKSPACE_GIT_TIMEOUT_S`.
 - Git workspace clone uses `drive9 git clone --fast --blobless --hydrate=${GIT_WORKSPACE_HYDRATE:-sync}` inside a `--profile=coding-agent` FUSE mount.
+- Git ops smoke uses `git_fixture.py` to create a local bare remote, so it
+  is suitable for `drive9-server-local` and does not depend on dev/prod tenant
+  schema rollout. It runs the matrix from `GIT_OPS_PROFILES`
+  (`coding-agent,portable`) and `GIT_OPS_CLONE_MODES`
+  (`native,fast,blobless`).
+- Git ops native clone cases use explicit `.git` pack/unpack for sandbox
+  replacement. Fast clone cases disable auto-pack and must recover through the
+  Git workspace checkpoint/restore path.
+- Git ops knobs are `GIT_OPS_HYDRATE`, `GIT_OPS_GIT_TIMEOUT_S`,
+  `GIT_OPS_CLONE_TIMEOUT_S`, `GIT_OPS_KEEP_ARTIFACTS`, and
+  `GIT_OPS_TRACE_GIT`.
 - CLI source knobs are `CLI_SOURCE` (`build` or `official`), `CLI_RELEASE_BASE_URL`, and optional `CLI_RELEASE_VERSION`.
 - API upload-limit boundary check is enabled by default via `RUN_UPLOAD_LIMIT_BOUNDARY=1`.
 - `UPLOAD_LIMIT_BYTES` controls the boundary value checked by API e2e (default `10737418240`).
