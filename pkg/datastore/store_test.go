@@ -1355,7 +1355,8 @@ func TestChmod(t *testing.T) {
 		t.Fatal(err)
 	}
 	var beforeMtime time.Time
-	if err := s.DB().QueryRowContext(ctx, `SELECT mtime FROM inodes WHERE inode_id = ?`, "f1").Scan(&beforeMtime); err != nil {
+	var beforeConfirmedAt time.Time
+	if err := s.DB().QueryRowContext(ctx, `SELECT mtime, confirmed_at FROM inodes WHERE inode_id = ?`, "f1").Scan(&beforeMtime, &beforeConfirmedAt); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1374,11 +1375,15 @@ func TestChmod(t *testing.T) {
 		t.Errorf("revision=%d, want 2", got.Revision)
 	}
 	var afterMtime time.Time
-	if err := s.DB().QueryRowContext(ctx, `SELECT mtime FROM inodes WHERE inode_id = ?`, "f1").Scan(&afterMtime); err != nil {
+	var afterConfirmedAt time.Time
+	if err := s.DB().QueryRowContext(ctx, `SELECT mtime, confirmed_at FROM inodes WHERE inode_id = ?`, "f1").Scan(&afterMtime, &afterConfirmedAt); err != nil {
 		t.Fatal(err)
 	}
 	if !afterMtime.After(beforeMtime) {
 		t.Errorf("mtime=%s, want after %s", afterMtime, beforeMtime)
+	}
+	if !afterConfirmedAt.After(beforeConfirmedAt) {
+		t.Errorf("confirmed_at=%s, want after %s", afterConfirmedAt, beforeConfirmedAt)
 	}
 }
 

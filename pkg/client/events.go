@@ -132,6 +132,7 @@ func (c *Client) streamEvents(ctx context.Context, since uint64, actor string, h
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 4<<20)
 	var eventType string
 	var dataLines []string
 

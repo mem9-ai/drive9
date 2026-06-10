@@ -17,10 +17,11 @@ import (
 )
 
 const (
+	maxUint64                = ^uint64(0)
 	sseHeartbeatInterval     = 30 * time.Second
 	sseFlushBatchSize        = 10
 	sseFlushMaxDelay         = 1 * time.Millisecond
-	ssePersistTimeout        = 5 * time.Second
+	ssePersistTimeout        = 500 * time.Millisecond
 	ssePersistentReplayLimit = eventBusRingSize
 	ssePersistentRetention   = eventBusRingSize * 10
 )
@@ -36,6 +37,7 @@ const (
 	sseResultInitialSync     sseOperationResult = "initial_sync"
 	sseResultSeqTooOld       sseOperationResult = "seq_too_old"
 	sseResultServerRestart   sseOperationResult = "server_restart"
+	sseResultNoHistory       sseOperationResult = "no_history"
 	sseResultStructural      sseOperationResult = "structural_change"
 	sseResultClientCancelled sseOperationResult = "client_cancelled"
 	sseResultServerClosed    sseOperationResult = "server_closed"
@@ -173,9 +175,6 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 	actor := r.Header.Get("X-Dat9-Actor")
 	bus := s.tenantEventBus(r)
 	if b := backendFromRequest(r); b != nil && b.Store() != nil {
-		bus.durableMu.Lock()
-		defer bus.durableMu.Unlock()
-
 		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), ssePersistTimeout)
 		defer cancel()
 
@@ -204,7 +203,6 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "sse_persist_failed", "path", path, "op", op, "error", err)...)
 		recordSSEOperation("persist", sseResultError, persistStart)
-		return
 	}
 	start := time.Now()
 	bus.Publish(path, op, actor)
@@ -254,6 +252,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// in-memory ring remains the live fan-out path and fallback for tests /
 	// single-tenant setups without a scoped backend.
 	events, headSeq, ok, replayReason := s.eventsSince(r.Context(), bStoreFromRequest(r), bus, since)
+	bus.AdvanceSeq(headSeq)
 	lastSeen := since
 
 	bw := newSSEBufferedWriter(w, flusher)
@@ -411,10 +410,14 @@ func persistentEventsSince(ctx context.Context, store *datastore.Store, since ui
 		return nil, headSeq, false, sseResultInitialSync, nil
 	}
 	if count == 0 {
+		recordSSEOperation("replay", sseResultNoHistory, start)
+		return nil, headSeq, false, sseResultNoHistory, nil
+	}
+	if since > headSeq {
 		recordSSEOperation("replay", sseResultServerRestart, start)
 		return nil, headSeq, false, sseResultServerRestart, nil
 	}
-	if since > headSeq {
+	if since == maxUint64 {
 		recordSSEOperation("replay", sseResultServerRestart, start)
 		return nil, headSeq, false, sseResultServerRestart, nil
 	}
