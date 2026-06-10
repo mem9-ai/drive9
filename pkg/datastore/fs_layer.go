@@ -372,12 +372,18 @@ func (s *Store) UpsertFSLayerEntry(ctx context.Context, entry *FSLayerEntry) err
 		return fmt.Errorf("begin upsert fs layer entry transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
-	var baseRoot string
-	if err := tx.QueryRowContext(ctx, `SELECT base_root_path FROM fs_layers WHERE layer_id = ? FOR UPDATE`, entry.LayerID).Scan(&baseRoot); err != nil {
+	var (
+		baseRoot string
+		state    string
+	)
+	if err := tx.QueryRowContext(ctx, `SELECT base_root_path, state FROM fs_layers WHERE layer_id = ? FOR UPDATE`, entry.LayerID).Scan(&baseRoot, &state); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		return fmt.Errorf("read fs layer %s: %w", entry.LayerID, err)
+	}
+	if FSLayerState(state) != FSLayerStateActive {
+		return ErrFSLayerStateConflict
 	}
 	if err := validateFSLayerEntryWithinBaseRoot(entry, baseRoot); err != nil {
 		return err
@@ -486,11 +492,11 @@ SELECT e.layer_id, e.path, e.path_hash, e.parent_path, e.parent_path_hash, e.nam
 	e.size_bytes, e.mode, e.entry_seq, e.created_at, e.updated_at
 FROM fs_layer_entries e
 JOIN (
-	SELECT path_hash, path, MAX(entry_seq) AS entry_seq
-	FROM fs_layer_entries
-	` + where + `
-	GROUP BY path_hash, path
-) latest ON latest.path_hash = e.path_hash AND latest.path = e.path AND latest.entry_seq = e.entry_seq
+		SELECT layer_id, path_hash, path, MAX(entry_seq) AS entry_seq
+		FROM fs_layer_entries
+		` + where + `
+		GROUP BY layer_id, path_hash, path
+	) latest ON latest.layer_id = e.layer_id AND latest.path_hash = e.path_hash AND latest.path = e.path AND latest.entry_seq = e.entry_seq
 WHERE e.layer_id = ?
 ORDER BY e.entry_seq, e.path`
 	args = append(args, layerID)

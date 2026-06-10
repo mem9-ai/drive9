@@ -53,7 +53,7 @@ func LayerCreate(c *client.Client, args []string) error {
 	var tags repeatStrings
 	layerID := fs.String("id", "", "layer id")
 	name := fs.String("name", "", "layer name")
-	durability := fs.String("durability", "", "restore-safe, write-through, or local-fast")
+	durability := fs.String("durability", "", "restore-safe, write-through, or local-fast (V1 records the mode; FUSE uses restore-safe behavior)")
 	actor := fs.String("actor", "", "actor id")
 	asJSON := fs.Bool("json", false, "print JSON")
 	fs.Var(&tags, "tag", "layer tag key=value (repeatable)")

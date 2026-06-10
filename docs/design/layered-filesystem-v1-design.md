@@ -314,6 +314,8 @@ created_at
 updated_at
 ```
 
+V1 存储边界：layer entry 内容当前以内联 `content_blob` 写入 metadata store，并受 server entry body limit 保护；`storage_ref` / 外置 blob layer content 是后续增强项，不作为 V1 性能或容量保证。
+
 索引要求：
 
 ```text
@@ -393,8 +395,8 @@ created_at
 
 - V1 layer mount 对普通文件 rename 采用 copy-up：目标写 `upsert` entry，源路径写 `whiteout`。
 - 如果源文件来自 base，rename 时会先从 base materialize 到目标 layer entry 和本地 shadow/pending；restore 不依赖 base 源路径仍存在。
-- API 层保留 `rename` entry 表达能力用于后续 server-side rename 优化，但 FUSE 默认不依赖它保证恢复语义。
-- directory rename 作为后续增强项，V1 不承诺完整跨 sandbox 目录树 materialize。
+- API 层的 `rename` entry 在 V1 仅允许文件 rename，commit 使用 no-replace 语义：target 已存在时返回 conflict，不覆盖 base target。
+- directory rename 作为后续增强项，V1 在 API/FUSE 层都明确拒绝，避免 rollback 时需要递归目录树 snapshot。
 
 ## API / CLI
 
@@ -457,15 +459,12 @@ MountOptions.CheckpointRef
 - 跨 sandbox restore 只承诺 durable checkpoint 之前的数据。
 - sandbox orchestrator 替换前必须执行 `checkpoint --wait`。
 
-可选模式：
-
-- `write-through`：更慢，但每次写都尽量推进后端 durable。
-- `local-fast`：最快，但只保证显式 checkpoint 后可跨 sandbox restore。
+V1 接受并保存 `write-through` / `local-fast`，用于 API/CLI 兼容和后续调度策略扩展；当前 FUSE 写入实现统一采用 `restore-safe` 行为，不根据这两个模式改变 write/flush/checkpoint 路径。任何依赖更激进或更保守 durability 的调度器，在 V1 必须仍以显式 checkpoint 作为跨 sandbox restore 边界。
 
 V1 restore-safe 边界：
 
 - 已 `close`、已 `fsync`、已 checkpoint、已 unmount drain 的 durable 文件必须可跨 sandbox restore。
-- 进程被杀时仍 open 且未 checkpoint 的 dirty handle 不承诺跨 sandbox restore，除非使用 `write-through`。
+- 进程被杀时仍 open 且未 checkpoint 的 dirty handle 不承诺跨 sandbox restore；V1 的 `write-through` 只作为已记录的意图字段，尚不提供额外保证。
 
 ## Commit / Rollback
 
@@ -530,7 +529,7 @@ layer-aware search：
 - commit conflict 保留 layer，不半提交。
 - checkpoint 后新 sandbox restore 不丢 closed/fsynced 文件。
 - local-only 目录不进入 durable layer。
-- 大文件 layer write 使用 multipart/S3，不整文件进内存。
+- 大文件 layer write 在 V1 仍受 entry body limit 约束；外置 blob/S3 layer content 作为后续增强验证。
 - layer-aware search 不返回被 whiteout/replacement 隐藏的 base hit。
 
 性能测试：
@@ -538,7 +537,7 @@ layer-aware search：
 - no-layer read/write/list benchmark 不增加额外 DB 查询。
 - layer read miss 只增加 overlay lookup。
 - layer readdir 使用 base list + layer children query + in-memory merge。
-- large write 从 shadow/S3 path 流式提交，不全量进内存。
+- 大文件 layer entry 外置存储后，再验证 shadow/S3 path 流式提交。
 
 失败恢复测试：
 

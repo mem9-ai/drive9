@@ -117,6 +117,27 @@ func TestFSLayerRollbackRejectsCommittedAndCommitting(t *testing.T) {
 	}
 }
 
+func TestFSLayerUpsertRejectsNonActiveLayer(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	if err := s.CreateFSLayer(ctx, &FSLayer{LayerID: "layer-committing-upsert", BaseRootPath: "/repo"}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if err := s.BeginFSLayerCommit(ctx, "layer-committing-upsert"); err != nil {
+		t.Fatalf("BeginFSLayerCommit: %v", err)
+	}
+	err := s.UpsertFSLayerEntry(ctx, &FSLayerEntry{
+		LayerID:     "layer-committing-upsert",
+		Path:        "/repo/late.txt",
+		Op:          FSLayerEntryOpUpsert,
+		Kind:        FSLayerEntryKindFile,
+		ContentBlob: []byte("late"),
+	})
+	if !errors.Is(err, ErrFSLayerStateConflict) {
+		t.Fatalf("UpsertFSLayerEntry err=%v, want ErrFSLayerStateConflict", err)
+	}
+}
+
 func TestFSLayerEntriesAndCheckpoint(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

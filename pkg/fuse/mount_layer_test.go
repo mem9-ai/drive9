@@ -136,6 +136,63 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	}
 }
 
+func TestRestoreLayerChmodOnlyFileRecordsModeOverlay(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs-layers/layer-1/diff":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []client.FSLayerEntry{
+					{LayerID: "layer-1", Path: "/repo/base.txt", Op: "chmod", Kind: "file", Mode: 0o600, EntrySeq: 1},
+				},
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+
+	if err := restoreLayerEntries(context.Background(), client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	}, shadow, pending, fs); err != nil {
+		t.Fatalf("restoreLayerEntries: %v", err)
+	}
+	if pending.HasPending("/base.txt") || shadow.Has("/base.txt") {
+		t.Fatal("chmod-only restore created pending data, want mode overlay only")
+	}
+	if mode, ok := fs.layerFileMode("/base.txt"); !ok || mode != 0o600 {
+		t.Errorf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
+	}
+	ino := fs.inodes.EnsureInode("/base.txt", false, 5, time.Now())
+	entries := fs.mergeLayerNamespaceEntries("/", []DirEntry{{
+		Name:        "base.txt",
+		Ino:         ino,
+		Mode:        dirEntryMode(false, true, 0o644),
+		AttrMode:    0o644,
+		HasMode:     true,
+		HasMetadata: true,
+	}})
+	if len(entries) != 1 || entries[0].AttrMode != 0o600 || entries[0].Mode&0o777 != 0o600 {
+		t.Errorf("merged chmod-only entry = %+v, want mode 0600", entries)
+	}
+}
+
 func TestLayerSymlinkReadlinkUsesLayerTarget(t *testing.T) {
 	fs := NewDat9FS(client.New("http://127.0.0.1", ""), &MountOptions{
 		LayerRef:              "layer-1",
@@ -602,6 +659,84 @@ func TestLayerRmdirRejectsOpenHandleChild(t *testing.T) {
 	}
 	if fs.isLayerWhiteout("/dir") {
 		t.Fatal("rmdir created a layer whiteout despite live open child")
+	}
+}
+
+func TestLayerRmdirRejectsNonEmptyBaseDir(t *testing.T) {
+	var layerWrites int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/dir" && r.URL.Query().Get("list") == "1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []client.FileInfo{{Name: "child.txt", Size: 1, IsDir: false}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs:batch-stat":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"results": []client.BatchStatResult{{Path: "/repo/dir/child.txt", Status: http.StatusOK, Size: 1}},
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs-layers/layer-1/entries":
+			layerWrites++
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	fs.inodes.Lookup("/dir", true, 0, time.Now())
+
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.Status(syscall.ENOTEMPTY) {
+		t.Errorf("Rmdir status = %v, want ENOTEMPTY", st)
+	}
+	if layerWrites != 0 {
+		t.Errorf("layer whiteout writes = %d, want 0", layerWrites)
+	}
+	if fs.isLayerWhiteout("/dir") {
+		t.Error("rmdir created a layer whiteout for non-empty base dir")
+	}
+}
+
+func TestLayerSymlinkHonorsLocalOnlyOverlay(t *testing.T) {
+	var layerWrites int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/fs-layers/layer-1/entries" {
+			layerWrites++
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:          "layer-1",
+		RemoteRoot:        "/repo",
+		LocalRoot:         t.TempDir(),
+		LocalOnlyPatterns: []string{"**/local-link"},
+	})
+	if err := fs.localOverlay.EnsureRoot(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out gofuse.EntryOut
+	st := fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, "target.txt", "local-link", &out)
+	if st != gofuse.OK {
+		t.Errorf("Symlink status = %v, want OK", st)
+	}
+	if layerWrites != 0 {
+		t.Errorf("layer writes = %d, want 0", layerWrites)
+	}
+	target, err := fs.localOverlay.Readlink("/local-link")
+	if err != nil {
+		t.Errorf("local overlay readlink: %v", err)
+	}
+	if target != "target.txt" {
+		t.Errorf("local overlay symlink target = %q, want target.txt", target)
 	}
 }
 

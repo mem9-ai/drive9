@@ -651,6 +651,8 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 			}
 			if fs != nil {
 				switch entry.Kind {
+				case "file":
+					fs.markLayerFileMode(localPath, entry.Mode)
 				case "dir":
 					fs.markLayerDir(localPath, entry.Mode)
 				case "symlink":

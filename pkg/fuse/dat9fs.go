@@ -141,6 +141,7 @@ type Dat9FS struct {
 	gitOverlayPending map[string]map[string]pendingGitOverlayEntry
 	layerMu           sync.RWMutex
 	layerWhiteouts    map[string]struct{}
+	layerFiles        map[string]uint32
 	layerDirs         map[string]uint32
 	layerSymlinks     map[string]layerSymlinkState
 
@@ -582,6 +583,8 @@ func (fs *Dat9FS) upsertLayerChmod(ctx context.Context, localPath string, mode u
 		return err
 	}
 	switch kind {
+	case "file":
+		fs.markLayerFileMode(localPath, mode)
 	case "dir":
 		fs.markLayerDir(localPath, mode)
 	case "symlink":
@@ -802,6 +805,7 @@ func (fs *Dat9FS) markLayerWhiteout(localPath string) {
 		fs.layerWhiteouts = make(map[string]struct{})
 	}
 	fs.layerWhiteouts[localPath] = struct{}{}
+	delete(fs.layerFiles, localPath)
 	delete(fs.layerDirs, localPath)
 	delete(fs.layerSymlinks, localPath)
 	fs.layerMu.Unlock()
@@ -812,6 +816,22 @@ func (fs *Dat9FS) markLayerFile(localPath string) {
 		return
 	}
 	fs.layerMu.Lock()
+	delete(fs.layerWhiteouts, localPath)
+	delete(fs.layerFiles, localPath)
+	delete(fs.layerDirs, localPath)
+	delete(fs.layerSymlinks, localPath)
+	fs.layerMu.Unlock()
+}
+
+func (fs *Dat9FS) markLayerFileMode(localPath string, mode uint32) {
+	if fs == nil || localPath == "" {
+		return
+	}
+	fs.layerMu.Lock()
+	if fs.layerFiles == nil {
+		fs.layerFiles = make(map[string]uint32)
+	}
+	fs.layerFiles[localPath] = mode & 0o777
 	delete(fs.layerWhiteouts, localPath)
 	delete(fs.layerDirs, localPath)
 	delete(fs.layerSymlinks, localPath)
@@ -828,6 +848,7 @@ func (fs *Dat9FS) markLayerDir(localPath string, mode uint32) {
 	}
 	fs.layerDirs[localPath] = mode & 0o777
 	delete(fs.layerWhiteouts, localPath)
+	delete(fs.layerFiles, localPath)
 	delete(fs.layerSymlinks, localPath)
 	fs.layerMu.Unlock()
 }
@@ -847,6 +868,7 @@ func (fs *Dat9FS) markLayerSymlink(localPath, target string, mode uint32) {
 	}
 	fs.layerSymlinks[localPath] = layerSymlinkState{Target: target, Mode: mode}
 	delete(fs.layerWhiteouts, localPath)
+	delete(fs.layerFiles, localPath)
 	delete(fs.layerDirs, localPath)
 	fs.layerMu.Unlock()
 }
@@ -871,6 +893,16 @@ func (fs *Dat9FS) layerDirMode(localPath string) (uint32, bool) {
 	return mode, ok
 }
 
+func (fs *Dat9FS) layerFileMode(localPath string) (uint32, bool) {
+	if fs == nil || !fs.layerEnabled() {
+		return 0, false
+	}
+	fs.layerMu.RLock()
+	mode, ok := fs.layerFiles[localPath]
+	fs.layerMu.RUnlock()
+	return mode, ok
+}
+
 func (fs *Dat9FS) layerSymlink(localPath string) (string, uint32, bool) {
 	if fs == nil || !fs.layerEnabled() {
 		return "", 0, false
@@ -879,6 +911,36 @@ func (fs *Dat9FS) layerSymlink(localPath string) (string, uint32, bool) {
 	state, ok := fs.layerSymlinks[localPath]
 	fs.layerMu.RUnlock()
 	return state.Target, state.Mode, ok
+}
+
+func (fs *Dat9FS) applyLayerFileMode(localPath string, ino uint64, entry *InodeEntry) {
+	if entry == nil || entry.IsDir || entryIsSymlink(entry) {
+		return
+	}
+	mode, ok := fs.layerFileMode(localPath)
+	if !ok {
+		return
+	}
+	entry.Mode = mode & 0o777
+	entry.HasMode = true
+	if ino != 0 {
+		fs.inodes.UpdateMode(ino, entry.Mode)
+	}
+}
+
+func (fs *Dat9FS) applyLayerFileModeToCachedInfo(localPath string, item *CachedFileInfo) {
+	if item == nil || item.IsDir {
+		return
+	}
+	if item.HasMode && isSymlinkMode(item.Mode) {
+		return
+	}
+	mode, ok := fs.layerFileMode(localPath)
+	if !ok {
+		return
+	}
+	item.Mode = mode & 0o777
+	item.HasMode = true
 }
 
 func (fs *Dat9FS) layerDirHasOverlayChildren(localPath string) bool {
@@ -899,6 +961,12 @@ func (fs *Dat9FS) layerDirHasOverlayChildren(localPath string) bool {
 		return true
 	}
 	fs.layerMu.RLock()
+	for p := range fs.layerFiles {
+		if strings.HasPrefix(p, prefix) {
+			fs.layerMu.RUnlock()
+			return true
+		}
+	}
 	for p := range fs.layerDirs {
 		if p != localPath && strings.HasPrefix(p, prefix) {
 			fs.layerMu.RUnlock()
@@ -4396,6 +4464,7 @@ func (fs *Dat9FS) lookupFromDirCache(parentPath, childP, name string, out *gofus
 			fs.perf.namespacePositiveHit.add(1)
 		}
 		item := result.item
+		fs.applyLayerFileModeToCachedInfo(childP, &item)
 		mtime := item.Mtime
 		if mtime.IsZero() {
 			mtime = time.Now()
@@ -4685,6 +4754,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 				if !ok {
 					return gofuse.EIO
 				}
+				fs.applyLayerFileMode(childP, ino, entry)
 				fs.fillEntryOut(entry, out)
 				return gofuse.OK
 			}
@@ -4714,6 +4784,7 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if !ok {
 		return gofuse.EIO
 	}
+	fs.applyLayerFileMode(childP, ino, entry)
 	fs.fillEntryOut(entry, out)
 	return gofuse.OK
 }
@@ -5060,6 +5131,7 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		}
 	}
 
+	fs.applyLayerFileMode(entry.Path, input.NodeId, entry)
 	fs.fillAttr(entry, &out.Attr)
 	out.SetTimeout(fs.opts.AttrTTL)
 	return gofuse.OK
@@ -5405,41 +5477,39 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	if !fs.layerEnabled() {
-		if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
-			if st != gofuse.OK {
-				return st
-			}
-			restoreErr := fs.ensureGitStateForLocalPath(ctx, childP)
-			if restoreErr != nil {
-				return httpToFuseStatus(restoreErr)
-			}
-			if err := overlay.Symlink(pointedTo, childP); err != nil {
-				return localErrToFuseStatus(err)
-			}
-			info, err := overlay.Lstat(childP)
-			if err != nil {
-				return localErrToFuseStatus(err)
-			}
-			entry, st := fs.localEntry(childP, info, true)
-			if st != gofuse.OK {
-				return st
-			}
-			parentPath, _ := fs.inodes.GetPath(header.NodeId)
-			fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
-			fs.fillEntryOut(entry, out)
-			return gofuse.OK
+	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
+		if st != gofuse.OK {
+			return st
 		}
-		if _, rel, ok := fs.gitWorkspaceForPath(ctx, childP); ok && rel != "" {
-			entry, st := fs.putGitSymlink(ctx, childP, pointedTo)
-			if st != gofuse.OK {
-				return st
-			}
-			parentPath, _ := fs.inodes.GetPath(header.NodeId)
-			fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
-			fs.fillEntryOut(entry, out)
-			return gofuse.OK
+		restoreErr := fs.ensureGitStateForLocalPath(ctx, childP)
+		if restoreErr != nil {
+			return httpToFuseStatus(restoreErr)
 		}
+		if err := overlay.Symlink(pointedTo, childP); err != nil {
+			return localErrToFuseStatus(err)
+		}
+		info, err := overlay.Lstat(childP)
+		if err != nil {
+			return localErrToFuseStatus(err)
+		}
+		entry, st := fs.localEntry(childP, info, true)
+		if st != gofuse.OK {
+			return st
+		}
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
+	if _, rel, ok := fs.gitWorkspaceForPath(ctx, childP); ok && rel != "" {
+		entry, st := fs.putGitSymlink(ctx, childP, pointedTo)
+		if st != gofuse.OK {
+			return st
+		}
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
 	}
 
 	var err error
@@ -5879,6 +5949,21 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	if fs.layerDirHasOverlayChildren(childP) {
 		status = gofuse.Status(syscall.ENOTEMPTY)
 		return status
+	}
+	if fs.layerEnabled() {
+		entries, err := fs.listDir(ctx, childP)
+		if err != nil {
+			if _, ok := fs.layerDirMode(childP); ok && isNotFoundErr(err) {
+				entries = nil
+			} else {
+				status = httpToFuseStatus(err)
+				return status
+			}
+		}
+		if len(entries) > 0 {
+			status = gofuse.Status(syscall.ENOTEMPTY)
+			return status
+		}
 	}
 
 	deleteStart := time.Now()
@@ -6707,7 +6792,7 @@ func (fs *Dat9FS) mergeLayerNamespaceEntries(dirPath string, entries []DirEntry)
 		return entries
 	}
 	fs.layerMu.RLock()
-	if len(fs.layerWhiteouts) == 0 && len(fs.layerDirs) == 0 && len(fs.layerSymlinks) == 0 {
+	if len(fs.layerWhiteouts) == 0 && len(fs.layerFiles) == 0 && len(fs.layerDirs) == 0 && len(fs.layerSymlinks) == 0 {
 		fs.layerMu.RUnlock()
 		return entries
 	}
@@ -6715,6 +6800,12 @@ func (fs *Dat9FS) mergeLayerNamespaceEntries(dirPath string, entries []DirEntry)
 	for p := range fs.layerWhiteouts {
 		if parentDir(p) == dirPath {
 			whiteouts[path.Base(p)] = struct{}{}
+		}
+	}
+	files := make(map[string]uint32)
+	for p, mode := range fs.layerFiles {
+		if parentDir(p) == dirPath {
+			files[path.Base(p)] = mode
 		}
 	}
 	dirs := make(map[string]uint32)
@@ -6740,6 +6831,24 @@ func (fs *Dat9FS) mergeLayerNamespaceEntries(dirPath string, entries []DirEntry)
 			filtered = append(filtered, entry)
 		}
 		entries = filtered
+	}
+	if len(files) > 0 {
+		for i := range entries {
+			if entries[i].IsDir {
+				continue
+			}
+			mode, ok := files[entries[i].Name]
+			if !ok {
+				continue
+			}
+			mode &= 0o777
+			entries[i].Mode = dirEntryMode(false, true, mode)
+			entries[i].AttrMode = mode
+			entries[i].HasMode = true
+			if entries[i].Ino != 0 {
+				fs.inodes.UpdateMode(entries[i].Ino, mode)
+			}
+		}
 	}
 	if len(dirs) == 0 && len(symlinks) == 0 {
 		return entries
@@ -6871,6 +6980,7 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 			continue
 		}
 		childP := dirEntryChildPath(dirPath, item.Name)
+		fs.applyLayerFileModeToCachedInfo(childP, &item)
 
 		mtime := item.Mtime
 		if mtime.IsZero() {

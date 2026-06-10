@@ -1105,10 +1105,10 @@ func TestMountCmdPassesLayerRefOption(t *testing.T) {
 		t.Fatal("mountFuse was not called")
 	}
 	if got.LayerRef != "task=auth" {
-		t.Fatalf("LayerRef = %q, want task=auth", got.LayerRef)
+		t.Errorf("LayerRef = %q, want task=auth", got.LayerRef)
 	}
 	if got.RemoteRoot != "/repo" {
-		t.Fatalf("RemoteRoot = %q, want /repo", got.RemoteRoot)
+		t.Errorf("RemoteRoot = %q, want /repo", got.RemoteRoot)
 	}
 }
 
@@ -1132,7 +1132,7 @@ func TestMountCmdCheckpointRequiresLayer(t *testing.T) {
 		t.Fatal("MountCmd error = nil, want checkpoint requires layer")
 	}
 	if !strings.Contains(err.Error(), "--checkpoint requires --layer") {
-		t.Fatalf("MountCmd error = %v", err)
+		t.Errorf("MountCmd error = %v", err)
 	}
 }
 

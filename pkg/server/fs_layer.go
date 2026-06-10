@@ -22,6 +22,7 @@ import (
 
 const maxFSLayerBodyBytes = 1 << 20
 const maxFSLayerEntryBodyBytes = 128 << 20
+const fsLayerRollbackTimeout = 60 * time.Second
 
 type fsLayerCreateRequest struct {
 	LayerID        string            `json:"layer_id,omitempty"`
@@ -437,10 +438,12 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(r.Context()), fsLayerRollbackTimeout)
+	defer rollbackCancel()
 	for i := range entries {
 		if err := applyFSLayerEntry(r.Context(), b, &entries[i]); err != nil {
-			rollbackErr := rollbackFSLayerCommit(r.Context(), b, snapshots)
-			_ = store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateConflicted)
+			rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, snapshots)
+			_ = store.SetFSLayerState(rollbackCtx, layer.LayerID, datastore.FSLayerStateConflicted)
 			if rollbackErr != nil {
 				errJSON(w, http.StatusInternalServerError, fmt.Sprintf("apply fs layer entry %s: %v; rollback failed: %v", entries[i].Path, err, rollbackErr))
 				return
@@ -450,8 +453,8 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		}
 	}
 	if err := store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateCommitted); err != nil {
-		rollbackErr := rollbackFSLayerCommit(r.Context(), b, snapshots)
-		_ = store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateConflicted)
+		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, snapshots)
+		_ = store.SetFSLayerState(rollbackCtx, layer.LayerID, datastore.FSLayerStateConflicted)
 		if rollbackErr != nil {
 			errJSON(w, http.StatusInternalServerError, fmt.Sprintf("finalize fs layer commit %s: %v; rollback failed: %v", layer.LayerID, err, rollbackErr))
 			return
@@ -521,9 +524,15 @@ func normalizeAndValidateFSLayerServerEntry(layer *datastore.FSLayer, entry *dat
 	}
 	entry.Path = path
 	if entry.Op == datastore.FSLayerEntryOpRename {
+		if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(path, "/") {
+			return fmt.Errorf("fs layer directory rename is not supported")
+		}
 		target := strings.TrimSpace(entry.ContentText)
 		if target == "" && len(entry.ContentBlob) > 0 {
 			target = strings.TrimSpace(string(entry.ContentBlob))
+		}
+		if strings.HasSuffix(target, "/") {
+			return fmt.Errorf("fs layer directory rename is not supported")
 		}
 		targetPath, err := canonicalFSLayerServerPath(target, "", "")
 		if err != nil {
@@ -565,6 +574,10 @@ func validateFSLayerCommitScope(layer *datastore.FSLayer, entries []datastore.FS
 			conflicts = append(conflicts, fsLayerCommitConflict{Path: entries[i].Path, Reason: "entry outside base root"})
 		}
 		if entries[i].Op == datastore.FSLayerEntryOpRename {
+			if entries[i].Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entries[i].Path, "/") {
+				conflicts = append(conflicts, fsLayerCommitConflict{Path: entries[i].Path, Reason: "directory rename unsupported"})
+				continue
+			}
 			target := strings.TrimSpace(entries[i].ContentText)
 			if target == "" && len(entries[i].ContentBlob) > 0 {
 				target = strings.TrimSpace(string(entries[i].ContentBlob))
@@ -780,6 +793,9 @@ func preflightFSLayerCommit(ctx context.Context, b *backendpkg.Dat9Backend, entr
 	var conflicts []fsLayerCommitConflict
 	for i := range entries {
 		entry := &entries[i]
+		if entry.Op == datastore.FSLayerEntryOpRename {
+			conflicts = append(conflicts, preflightFSLayerRename(ctx, b, entry)...)
+		}
 		if entry.Op == datastore.FSLayerEntryOpWhiteout && entry.BaseRevision == 0 {
 			continue
 		}
@@ -847,6 +863,43 @@ func preflightFSLayerCommit(ctx context.Context, b *backendpkg.Dat9Backend, entr
 	return conflicts
 }
 
+func preflightFSLayerRename(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) []fsLayerCommitConflict {
+	var conflicts []fsLayerCommitConflict
+	if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
+		return append(conflicts, fsLayerCommitConflict{Path: entry.Path, Reason: "directory rename unsupported"})
+	}
+	source, err := b.StatNodeCtx(ctx, entry.Path)
+	if errors.Is(err, datastore.ErrNotFound) {
+		return append(conflicts, fsLayerCommitConflict{Path: entry.Path, Reason: "base path missing"})
+	}
+	if err != nil {
+		return append(conflicts, fsLayerCommitConflict{Path: entry.Path, Reason: err.Error()})
+	}
+	if source.Node.IsDirectory {
+		return append(conflicts, fsLayerCommitConflict{Path: entry.Path, Reason: "directory rename unsupported"})
+	}
+	target := strings.TrimSpace(entry.ContentText)
+	if target == "" && len(entry.ContentBlob) > 0 {
+		target = strings.TrimSpace(string(entry.ContentBlob))
+	}
+	if target == "" {
+		return append(conflicts, fsLayerCommitConflict{Path: entry.Path, Reason: "rename target is required"})
+	}
+	targetPath, err := canonicalFSLayerServerPath(target, "", "")
+	if err != nil {
+		return append(conflicts, fsLayerCommitConflict{Path: entry.Path, Reason: "invalid rename target"})
+	}
+	if targetPath == entry.Path {
+		return conflicts
+	}
+	if _, err := b.StatNodeCtx(ctx, targetPath); err == nil {
+		return append(conflicts, fsLayerCommitConflict{Path: targetPath, Reason: "rename target exists"})
+	} else if !errors.Is(err, datastore.ErrNotFound) {
+		return append(conflicts, fsLayerCommitConflict{Path: targetPath, Reason: err.Error()})
+	}
+	return conflicts
+}
+
 func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry) error {
 	switch entry.Op {
 	case datastore.FSLayerEntryOpUpsert:
@@ -910,7 +963,7 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		if target == "" {
 			return fmt.Errorf("rename target is required")
 		}
-		return b.RenameCtx(ctx, entry.Path, target)
+		return b.RenameFileNoReplaceCtx(ctx, entry.Path, target)
 	default:
 		return fmt.Errorf("unsupported fs layer op %q", entry.Op)
 	}

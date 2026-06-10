@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/dat9/pkg/client"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 )
@@ -218,6 +219,75 @@ func TestFSLayerRejectsEntryOutsideBaseRoot(t *testing.T) {
 	var statusErr *client.StatusError
 	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
 		t.Fatalf("UpsertFSLayerEntry outside root err=%v, want 400", err)
+	}
+}
+
+func TestFSLayerRejectsDirectoryRenameEntry(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-dir-rename",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	_, err := c.UpsertFSLayerEntry(ctx, "layer-dir-rename", client.FSLayerEntryRequest{
+		Path:        "/repo/old-dir/",
+		Op:          "rename",
+		Kind:        "dir",
+		ContentText: "/repo/new-dir/",
+	})
+	var statusErr *client.StatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("UpsertFSLayerEntry directory rename err=%v, want 400", err)
+	}
+}
+
+func TestFSLayerCommitRejectsRenameTargetConflict(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	if _, err := s.fallback.WriteCtx(ctx, "/repo/source.txt", []byte("source"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if _, err := s.fallback.WriteCtx(ctx, "/repo/target.txt", []byte("target"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-rename-conflict",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-rename-conflict", client.FSLayerEntryRequest{
+		Path:        "/repo/source.txt",
+		Op:          "rename",
+		Kind:        "file",
+		ContentText: "/repo/target.txt",
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry rename: %v", err)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-rename-conflict")
+	if !errors.Is(err, client.ErrConflict) {
+		t.Fatalf("CommitFSLayer err=%v, want conflict", err)
+	}
+	if commit == nil || len(commit.Conflicts) != 1 || commit.Conflicts[0].Path != "/repo/target.txt" || commit.Conflicts[0].Reason != "rename target exists" {
+		t.Fatalf("commit conflicts = %+v, want rename target exists", commit)
+	}
+	data, err := s.fallback.ReadCtx(ctx, "/repo/target.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("ReadCtx target: %v", err)
+	}
+	if !bytes.Equal(data, []byte("target")) {
+		t.Fatalf("target data = %q, want target", data)
 	}
 }
 
