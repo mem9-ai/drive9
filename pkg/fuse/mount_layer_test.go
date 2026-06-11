@@ -146,6 +146,92 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	}
 }
 
+func TestRestoreLayerEntriesReplaysSamePathUpsertOverwrite(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+			if r.URL.Query().Get("replay") != "1" {
+				t.Errorf("diff replay = %q, want 1", r.URL.Query().Get("replay"))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []client.FSLayerEntry{
+					{LayerID: "layer-1", Path: "/repo/new.txt", Op: "upsert", Kind: "file", SizeBytes: 0, Mode: 0o644, EntrySeq: 1},
+					{LayerID: "layer-1", Path: "/repo/new.txt", Op: "upsert", Kind: "file", SizeBytes: 4, Mode: 0o600, EntrySeq: 2},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
+			if r.URL.Query().Get("path") != "/repo/new.txt" {
+				t.Errorf("entry path query: %q, want /repo/new.txt", r.URL.Query().Get("path"))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			switch r.URL.Query().Get("max_seq") {
+			case "1":
+				_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+					LayerID:   "layer-1",
+					Path:      "/repo/new.txt",
+					Op:        "upsert",
+					Kind:      "file",
+					SizeBytes: 0,
+					Mode:      0o644,
+					EntrySeq:  1,
+				})
+			case "2":
+				_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+					LayerID:   "layer-1",
+					Path:      "/repo/new.txt",
+					Op:        "upsert",
+					Kind:      "file",
+					Content:   []byte("data"),
+					SizeBytes: 4,
+					Mode:      0o600,
+					EntrySeq:  2,
+				})
+			default:
+				t.Errorf("entry max_seq = %q, want 1 or 2", r.URL.Query().Get("max_seq"))
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restoreLayerEntries(context.Background(), client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	}, shadow, pending, nil); err != nil {
+		t.Fatalf("restoreLayerEntries: %v", err)
+	}
+	got, err := shadow.ReadAll("/new.txt")
+	if err != nil {
+		t.Fatalf("ReadAll restored new.txt: %v", err)
+	}
+	if !bytes.Equal(got, []byte("data")) {
+		t.Fatalf("restored data = %q, want data", got)
+	}
+	meta, ok := pending.GetMeta("/new.txt")
+	if !ok {
+		t.Fatal("new.txt pending metadata missing")
+	}
+	if meta.Size != 4 || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending meta = %+v, want size=4 mode=0600", meta)
+	}
+}
+
 func TestRestoreLayerEntriesStreamsObjectBackedFile(t *testing.T) {
 	payload := bytes.Repeat([]byte("x"), 128*1024+13)
 	objectReads := 0
@@ -714,6 +800,91 @@ func TestLayerFileUpsertClearsStaleNamespaceState(t *testing.T) {
 	}
 	if fs.isLayerWhiteout("/file.txt") {
 		t.Fatal("file upsert left stale layer whiteout")
+	}
+}
+
+func TestLayerSetAttrTruncateWritesLayerEntryNotBase(t *testing.T) {
+	var (
+		got         clientLayerEntryRequest
+		basePutSeen bool
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/entries":
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Errorf("decode layer entry: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+				LayerID:      "layer-1",
+				Path:         got.Path,
+				Op:           got.Op,
+				Kind:         got.Kind,
+				BaseRevision: got.BaseRevision,
+				SizeBytes:    got.SizeBytes,
+				Mode:         got.Mode,
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/repo/base.txt":
+			basePutSeen = true
+			t.Errorf("unexpected base PUT for layer truncate")
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	ino := fs.inodes.Lookup("/base.txt", false, 12, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.inodes.SetModeState(ino, 0o640, true)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if basePutSeen {
+		t.Fatal("layer truncate wrote base filesystem")
+	}
+	if got.Path != "/repo/base.txt" || got.Op != "upsert" || got.Kind != "file" {
+		t.Fatalf("layer truncate request = %+v, want file upsert", got)
+	}
+	if got.BaseRevision != 7 || got.SizeBytes != 0 || len(got.Content) != 0 {
+		t.Fatalf("layer truncate content metadata = %+v, want base rev 7 empty content", got)
+	}
+	if got.Mode != 0o640 {
+		t.Fatalf("layer truncate mode = %#o, want 0640", got.Mode)
+	}
+	if !shadow.Has("/base.txt") || shadow.Size("/base.txt") != 0 {
+		t.Fatalf("shadow empty file not staged; has=%t size=%d", shadow.Has("/base.txt"), shadow.Size("/base.txt"))
+	}
+	meta, ok := pending.GetMeta("/base.txt")
+	if !ok || meta.Size != 0 || meta.BaseRev != 7 || !meta.HasMode || meta.Mode != 0o640 {
+		t.Fatalf("pending meta = %+v, want empty base rev 7 mode 0640", meta)
 	}
 }
 

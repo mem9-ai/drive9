@@ -5391,38 +5391,64 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, nil, newSize); err != nil {
 					return httpToFuseStatus(err)
 				}
-				apiPath := fs.remotePath(entry.Path)
-				writeStart := fs.perfStart()
-				err := fs.client.WriteCtx(ctx, apiPath, nil)
-				fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
-				if err != nil {
-					return httpToFuseStatus(err)
-				}
-				// Refresh the inode revision after the server-side truncate so a
-				// subsequent writable open does not reuse the stale pre-truncate
-				// base revision and conflict with its own zero-byte write.
-				var refreshedRevision int64
-				var refreshedMtime time.Time
-				statStart := fs.perfStart()
-				stat, statErr := fs.client.StatCtx(ctx, apiPath)
-				fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
-				if statErr != nil {
-					log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, input.NodeId, statErr)
-				} else if stat != nil {
-					if stat.Revision > 0 {
-						refreshedRevision = stat.Revision
-						entry.Revision = stat.Revision
-						fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-						fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, input.Pid)
+				if fs.layerEnabled() {
+					expectedRevision := entry.Revision
+					mode := uint32(0)
+					hasMode := false
+					if entry.HasMode {
+						mode = entry.Mode & 0o777
+						hasMode = true
 					}
-					if !stat.Mtime.IsZero() {
-						refreshedMtime = stat.Mtime
-						entry.Mtime = stat.Mtime
-						fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+					if err := fs.upsertLayerFile(ctx, entry.Path, nil, expectedRevision, mode, hasMode); err != nil {
+						return httpToFuseStatus(err)
 					}
+					if fs.shadowStore != nil {
+						if err := fs.shadowStore.WriteFull(entry.Path, nil, expectedRevision); err != nil {
+							return gofuse.EIO
+						}
+					}
+					if fs.pendingIndex != nil {
+						if _, err := fs.pendingIndex.PutWithBaseRevAndMode(entry.Path, 0, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
+							log.Printf("layer truncate pending index update failed for %s: %v", entry.Path, err)
+							return gofuse.EIO
+						}
+					}
+					fs.invalidateReadCacheAndTargets(entry.Path)
+					fs.cacheFileForPath(entry.Path, 0, entry.Mtime, 0)
+				} else {
+					apiPath := fs.remotePath(entry.Path)
+					writeStart := fs.perfStart()
+					err := fs.client.WriteCtx(ctx, apiPath, nil)
+					fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
+					if err != nil {
+						return httpToFuseStatus(err)
+					}
+					// Refresh the inode revision after the server-side truncate so a
+					// subsequent writable open does not reuse the stale pre-truncate
+					// base revision and conflict with its own zero-byte write.
+					var refreshedRevision int64
+					var refreshedMtime time.Time
+					statStart := fs.perfStart()
+					stat, statErr := fs.client.StatCtx(ctx, apiPath)
+					fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
+					if statErr != nil {
+						log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, input.NodeId, statErr)
+					} else if stat != nil {
+						if stat.Revision > 0 {
+							refreshedRevision = stat.Revision
+							entry.Revision = stat.Revision
+							fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
+							fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, input.Pid)
+						}
+						if !stat.Mtime.IsZero() {
+							refreshedMtime = stat.Mtime
+							entry.Mtime = stat.Mtime
+							fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
+						}
+					}
+					fs.invalidateReadCacheAndTargets(entry.Path)
+					fs.cacheFileForPath(entry.Path, 0, refreshedMtime, refreshedRevision)
 				}
-				fs.invalidateReadCacheAndTargets(entry.Path)
-				fs.cacheFileForPath(entry.Path, 0, refreshedMtime, refreshedRevision)
 			} else if newSize != entry.Size {
 				// Arbitrary truncate without an open handle is not
 				// supported — dat9 has no server-side truncate API.

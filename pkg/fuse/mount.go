@@ -635,6 +635,7 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 	if err != nil {
 		return err
 	}
+	restoredUpserts := make(map[string]struct{})
 	for _, entry := range entries {
 		localPath, ok := mountpath.ToLocal(opts.RemoteRoot, entry.Path)
 		if !ok {
@@ -704,7 +705,9 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 			continue
 		}
 		if _, ok := pending.GetMeta(localPath); ok {
-			continue
+			if _, restored := restoredUpserts[localPath]; !restored {
+				continue
+			}
 		}
 		entryMaxSeq := layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)
 		fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, entryMaxSeq)
@@ -739,6 +742,7 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		if _, err := pending.PutWithBaseRevAndMode(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
 			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
 		}
+		restoredUpserts[localPath] = struct{}{}
 	}
 	return nil
 }
