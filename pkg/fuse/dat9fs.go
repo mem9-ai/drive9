@@ -3569,6 +3569,12 @@ func (fs *Dat9FS) cacheNegativePath(p string) {
 // cache answer the rest of the burst locally under the same negative-TTL
 // staleness contract.
 //
+// The listing runs synchronously in the triggering Lookup: one request per
+// storm (rate-limited to one per escalateMissWindow) pays a List RTT instead
+// of a stat RTT. Running it async would return this ENOENT marginally sooner
+// but lengthen the window in which concurrent misses still pay individual
+// stats, and add goroutine lifecycle/cancel complexity for no measured win.
+//
 // Lock files are excluded because lookupFromDirCache deliberately bypasses
 // the namespace cache for them, so a listing could never absorb their misses
 // and each lock probe would re-trigger escalation.
@@ -3587,6 +3593,9 @@ func (fs *Dat9FS) maybeListOnNegativeLookupStorm(cancel <-chan struct{}, parentP
 		// Listing failed or was too large to mark complete; cool down so a
 		// sustained probe storm cannot hammer the server with listings.
 		fs.dirCache.DeferEscalation(parentPath)
+		if fs.perf != nil {
+			fs.perf.lookupStormDeferred.add(1)
+		}
 		fs.debugf("lookup storm list deferred dir=%s items=%d err=%v", parentPath, len(items), err)
 		return
 	}

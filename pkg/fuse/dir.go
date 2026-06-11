@@ -264,14 +264,19 @@ func (dc *DirCache) RecordRemoteNegative(dirPath string) bool {
 	entry.remoteMisses = 0
 	entry.missWindowStart = time.Time{}
 	// Suppress duplicate escalations from concurrent lookups while the
-	// caller's listing is in flight.
+	// caller's listing is in flight. Concurrent misses arriving during that
+	// RTT still fall through to individual remote stats; that tail cost is
+	// accepted to keep this path free of cross-request coordination.
 	entry.escalateNotBefore = now.Add(escalateMissWindow)
 	return true
 }
 
 // DeferEscalation applies an escalation cooldown of one full cache TTL. Used
 // after a listing failed or was too large to answer misses locally, so a
-// sustained probe storm cannot turn into repeated listings.
+// sustained probe storm cannot turn into repeated listings. This deliberately
+// overwrites the short post-escalation cooldown set by RecordRemoteNegative:
+// that one only bridges the in-flight listing, while this one says "listing
+// this directory does not pay off, stop trying for a while".
 func (dc *DirCache) DeferEscalation(dirPath string) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()

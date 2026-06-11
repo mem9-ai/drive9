@@ -4634,6 +4634,10 @@ func TestLookupNegativeStormEscalatesToSingleList(t *testing.T) {
 		}
 	}
 
+	// Misses 1-3 each pay a HEAD; the third triggers the listing, which runs
+	// synchronously inside that Lookup (the in-process test server makes this
+	// deterministic), so misses 4-10 are answered locally from the complete
+	// listing: exactly threshold HEADs and one LIST.
 	if got := headCalls.Load(); got != int32(escalateMissThreshold) {
 		t.Fatalf("HEAD calls = %d, want %d (storm should escalate to a listing)", got, escalateMissThreshold)
 	}
@@ -4690,6 +4694,9 @@ func TestLookupNegativeStormOversizedListingCoolsDown(t *testing.T) {
 
 	// Oversized listings cannot answer misses; every probe stays remote, but
 	// the cooldown must prevent more than the single listing attempt.
+	// Misses 1-3 pay HEADs and trigger the listing; it exceeds the cache
+	// limit, so DeferEscalation kicks in and misses 4-10 fall back to one
+	// HEAD each: all 10 probes stay remote but only one LIST is ever sent.
 	if got := listCalls.Load(); got != 1 {
 		t.Fatalf("LIST calls = %d, want 1 (cooldown should stop repeat listings)", got)
 	}
