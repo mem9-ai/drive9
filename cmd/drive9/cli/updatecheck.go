@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -38,6 +39,10 @@ const updateCheckTimeout = 1 * time.Second
 // Override via DRIVE9_UPDATE_URL for testing or internal mirrors. This only
 // affects the version-check fetch URL; the install command shown to the user
 // is always the default public URL.
+//
+// The release workflow (.github/workflows/release-cli.yml) publishes a plain
+// text "version" file at site/releases/version. When this endpoint returns
+// a plain text body (not JSON), we treat it as a version-only response.
 var updateLatestURL = "https://drive9.ai/releases/latest.json"
 
 // ReleaseInfo holds metadata about a release fetched from the update endpoint.
@@ -84,8 +89,11 @@ func ShouldCheckForUpdate(currentVersion, command string) bool {
 		return false
 	}
 
-	// Dev/unknown builds cannot be compared.
-	if !isValidSemver(currentVersion) {
+	// Dev/unknown builds cannot be compared. The release workflow sets
+	// VERSION to a 7-char SHA (not semver), so also allow those through —
+	// they represent real release builds that should still see update
+	// notices when a semver-tagged release becomes available.
+	if !isValidSemver(currentVersion) && !isSHAVersion(currentVersion) {
 		return false
 	}
 
@@ -107,7 +115,7 @@ func CheckForUpdate(ctx context.Context, currentVersion string) *ReleaseInfo {
 	state := readUpdateState(stateFilePath)
 	if state != nil && time.Since(state.LastCheckedAt) < updateCheckTTL {
 		// Use cached version if available and newer.
-		if state.LatestVersion != "" && isNewerVersion(state.LatestVersion, currentVersion) {
+		if state.LatestVersion != "" && isUpdateAvailable(state.LatestVersion, currentVersion) {
 			if state.SkippedVersion != "" && state.SkippedVersion == state.LatestVersion {
 				return nil
 			}
@@ -121,31 +129,44 @@ func CheckForUpdate(ctx context.Context, currentVersion string) *ReleaseInfo {
 
 	// Fetch latest release info.
 	rel := fetchLatestRelease(ctx)
-	if rel == nil {
-		return nil
-	}
 
-	// Persist state (atomic write).
+	// Always record a check timestamp, even on failure, so we don't
+	// reattempt on every CLI invocation during an outage.
 	newState := &updateState{
 		LastCheckedAt: time.Now().UTC(),
-		LatestVersion: rel.Version,
-		LatestURL:     rel.URL,
 	}
-	// Preserve skipped_version from previous state.
 	if state != nil {
 		newState.SkippedVersion = state.SkippedVersion
 	}
+	if rel != nil {
+		newState.LatestVersion = rel.Version
+		newState.LatestURL = rel.URL
+	}
 	writeUpdateState(stateFilePath, newState)
+
+	if rel == nil {
+		return nil
+	}
 
 	// Check if this version should be skipped.
 	if newState.SkippedVersion != "" && newState.SkippedVersion == rel.Version {
 		return nil
 	}
 
-	if isNewerVersion(rel.Version, currentVersion) {
+	if isUpdateAvailable(rel.Version, currentVersion) {
 		return rel
 	}
 	return nil
+}
+
+// isUpdateAvailable returns true when the user should be notified about
+// a new release. For SHA-based release builds, any valid semver latest
+// version is considered an update (we can't compare SHAs to semver).
+func isUpdateAvailable(latest, current string) bool {
+	if isSHAVersion(current) {
+		return isValidSemver(latest)
+	}
+	return isNewerVersion(latest, current)
 }
 
 // PrintUpdateNotice displays the update notice on stderr after
@@ -217,6 +238,20 @@ func isValidSemver(v string) bool {
 	return semver.IsValid(sv)
 }
 
+// isSHAVersion returns true if v looks like a short git SHA (hex, 7-12 chars),
+// which is what the release workflow sets as VERSION.
+func isSHAVersion(v string) bool {
+	if len(v) < 7 || len(v) > 12 {
+		return false
+	}
+	for _, c := range v {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
 func isNewerVersion(latest, current string) bool {
 	l := ensureVPrefix(latest)
 	c := ensureVPrefix(current)
@@ -237,8 +272,18 @@ func trimV(v string) string {
 	return strings.TrimPrefix(v, "v")
 }
 
+// installScriptURL returns the install script URL. Separated from the
+// shell command construction to avoid interpolating env vars into shell
+// pipelines.
+func installScriptURL() string {
+	return "https://drive9.ai/install.sh"
+}
+
 func installCommand() string {
-	return "curl -fsSL https://drive9.ai/install.sh | sh"
+	if isWindows() {
+		return fmt.Sprintf("powershell -Command \"irm %s | iex\"", installScriptURL())
+	}
+	return fmt.Sprintf("curl -fsSL %s | sh", installScriptURL())
 }
 
 func updateStateFilePath() string {
@@ -363,7 +408,19 @@ func executeUpdate(installCmd string) {
 	scanner.Scan()
 
 	fmt.Fprintln(os.Stderr)
-	cmd := exec.Command("sh", "-c", installCmd)
+
+	// Build the command in a platform-safe way. The install URL is a
+	// compile-time constant (installScriptURL), not user/env input,
+	// so shell injection is not a concern. We still use the platform
+	// shell to support the pipe, which is the standard install pattern.
+	var cmd *exec.Cmd
+	if isWindows() {
+		cmd = exec.Command("powershell", "-Command",
+			fmt.Sprintf("irm %s | iex", installScriptURL()))
+	} else {
+		cmd = exec.Command("sh", "-c",
+			fmt.Sprintf("curl -fsSL %s | sh", installScriptURL()))
+	}
 	cmd.Stdout = os.Stderr // Update output goes to stderr
 	cmd.Stderr = os.Stderr
 	cmd.Stdin = os.Stdin
@@ -382,6 +439,12 @@ func skipVersion(version string) {
 	}
 	state.SkippedVersion = version
 	writeUpdateState(path, state)
+}
+
+// isWindows reports whether the current platform is Windows.
+// Extracted as a var for testability.
+var isWindows = func() bool {
+	return runtime.GOOS == "windows"
 }
 
 // isTerminal checks if a file descriptor is a terminal.

@@ -10,84 +10,116 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/require"
 )
 
 func TestShouldCheckForUpdate_DevVersion(t *testing.T) {
 	setTerminal(t, true)
-	require.False(t, ShouldCheckForUpdate("dev", "fs"))
+	if ShouldCheckForUpdate("dev", "fs") {
+		t.Fatalf("expected false for dev version")
+	}
 }
 
 func TestShouldCheckForUpdate_EmptyVersion(t *testing.T) {
 	setTerminal(t, true)
-	require.False(t, ShouldCheckForUpdate("", "fs"))
+	if ShouldCheckForUpdate("", "fs") {
+		t.Fatalf("expected false for empty version")
+	}
 }
 
 func TestShouldCheckForUpdate_UnknownVersion(t *testing.T) {
 	setTerminal(t, true)
-	require.False(t, ShouldCheckForUpdate("unknown", "fs"))
+	if ShouldCheckForUpdate("unknown", "fs") {
+		t.Fatalf("expected false for unknown version")
+	}
 }
 
 func TestShouldCheckForUpdate_ValidVersion(t *testing.T) {
 	setTerminal(t, true)
 	clearCIEnv(t)
-	require.True(t, ShouldCheckForUpdate("v0.8.1", "fs"))
+	if !ShouldCheckForUpdate("v0.8.1", "fs") {
+		t.Fatalf("expected true for valid semver version")
+	}
 }
 
 func TestShouldCheckForUpdate_ValidVersionWithoutV(t *testing.T) {
 	setTerminal(t, true)
 	clearCIEnv(t)
-	require.True(t, ShouldCheckForUpdate("0.8.1", "fs"))
+	if !ShouldCheckForUpdate("0.8.1", "fs") {
+		t.Fatalf("expected true for valid version without v prefix")
+	}
+}
+
+func TestShouldCheckForUpdate_SHAVersion(t *testing.T) {
+	setTerminal(t, true)
+	clearCIEnv(t)
+	if !ShouldCheckForUpdate("abc1234", "fs") {
+		t.Fatalf("expected true for 7-char SHA release version")
+	}
 }
 
 func TestShouldCheckForUpdate_ExplicitDisable(t *testing.T) {
 	setTerminal(t, true)
 	t.Setenv("DRIVE9_NO_UPDATE_CHECK", "1")
-	require.False(t, ShouldCheckForUpdate("v0.8.1", "fs"))
+	if ShouldCheckForUpdate("v0.8.1", "fs") {
+		t.Fatalf("expected false when DRIVE9_NO_UPDATE_CHECK is set")
+	}
 }
 
 func TestShouldCheckForUpdate_CI(t *testing.T) {
 	setTerminal(t, true)
 	t.Setenv("CI", "true")
-	require.False(t, ShouldCheckForUpdate("v0.8.1", "fs"))
+	if ShouldCheckForUpdate("v0.8.1", "fs") {
+		t.Fatalf("expected false in CI")
+	}
 }
 
 func TestShouldCheckForUpdate_GitHubActions(t *testing.T) {
 	setTerminal(t, true)
 	clearCIEnv(t)
 	t.Setenv("GITHUB_ACTIONS", "true")
-	require.False(t, ShouldCheckForUpdate("v0.8.1", "fs"))
+	if ShouldCheckForUpdate("v0.8.1", "fs") {
+		t.Fatalf("expected false in GitHub Actions")
+	}
 }
 
 func TestShouldCheckForUpdate_ExcludedMount(t *testing.T) {
 	setTerminal(t, true)
 	clearCIEnv(t)
-	require.False(t, ShouldCheckForUpdate("v0.8.1", "mount"))
+	if ShouldCheckForUpdate("v0.8.1", "mount") {
+		t.Fatalf("expected false for excluded command mount")
+	}
 }
 
 func TestShouldCheckForUpdate_ExcludedUmount(t *testing.T) {
 	setTerminal(t, true)
 	clearCIEnv(t)
-	require.False(t, ShouldCheckForUpdate("v0.8.1", "umount"))
+	if ShouldCheckForUpdate("v0.8.1", "umount") {
+		t.Fatalf("expected false for excluded command umount")
+	}
 }
 
 func TestShouldCheckForUpdate_ExcludedCompletion(t *testing.T) {
 	setTerminal(t, true)
 	clearCIEnv(t)
-	require.False(t, ShouldCheckForUpdate("v0.8.1", "completion"))
+	if ShouldCheckForUpdate("v0.8.1", "completion") {
+		t.Fatalf("expected false for excluded command completion")
+	}
 }
 
 func TestShouldCheckForUpdate_ExcludedDaemon(t *testing.T) {
 	setTerminal(t, true)
 	clearCIEnv(t)
-	require.False(t, ShouldCheckForUpdate("v0.8.1", "daemon"))
+	if ShouldCheckForUpdate("v0.8.1", "daemon") {
+		t.Fatalf("expected false for excluded command daemon")
+	}
 }
 
 func TestShouldCheckForUpdate_NonTTY(t *testing.T) {
 	setTerminal(t, false)
 	clearCIEnv(t)
-	require.False(t, ShouldCheckForUpdate("v0.8.1", "fs"))
+	if ShouldCheckForUpdate("v0.8.1", "fs") {
+		t.Fatalf("expected false for non-TTY")
+	}
 }
 
 func TestIsNewerVersion(t *testing.T) {
@@ -109,7 +141,57 @@ func TestIsNewerVersion(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.latest+"_vs_"+tt.current, func(t *testing.T) {
-			require.Equal(t, tt.want, isNewerVersion(tt.latest, tt.current))
+			got := isNewerVersion(tt.latest, tt.current)
+			if got != tt.want {
+				t.Fatalf("isNewerVersion(%q, %q) = %v, want %v", tt.latest, tt.current, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsSHAVersion(t *testing.T) {
+	tests := []struct {
+		v    string
+		want bool
+	}{
+		{"abc1234", true},   // 7-char hex
+		{"deadbeef", true},  // 8-char hex
+		{"0123456789ab", true}, // 12-char hex
+		{"abc123", false},   // too short (6)
+		{"ABC1234", false},  // uppercase
+		{"ghijklm", false},  // non-hex
+		{"v0.8.1", false},   // semver
+		{"dev", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.v, func(t *testing.T) {
+			got := isSHAVersion(tt.v)
+			if got != tt.want {
+				t.Fatalf("isSHAVersion(%q) = %v, want %v", tt.v, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsUpdateAvailable(t *testing.T) {
+	tests := []struct {
+		name            string
+		latest, current string
+		want            bool
+	}{
+		{"semver newer", "v0.9.0", "v0.8.1", true},
+		{"semver same", "v0.8.1", "v0.8.1", false},
+		{"semver older", "v0.7.0", "v0.8.1", false},
+		{"sha current, semver latest", "v0.9.0", "abc1234", true},
+		{"sha current, invalid latest", "not-a-version", "abc1234", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isUpdateAvailable(tt.latest, tt.current)
+			if got != tt.want {
+				t.Fatalf("isUpdateAvailable(%q, %q) = %v, want %v", tt.latest, tt.current, got, tt.want)
+			}
 		})
 	}
 }
@@ -128,7 +210,35 @@ func TestCheckForUpdate_NetworkFailure(t *testing.T) {
 
 	// Should return nil, not panic.
 	result := CheckForUpdate(context.Background(), "v0.8.1")
-	require.Nil(t, result)
+	if result != nil {
+		t.Fatalf("expected nil on network failure, got %+v", result)
+	}
+}
+
+func TestCheckForUpdate_NetworkFailure_ThrottlesRetry(t *testing.T) {
+	callCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	withTempState(t)
+	old := updateLatestURL
+	updateLatestURL = srv.URL
+	defer func() { updateLatestURL = old }()
+
+	// First call fetches.
+	_ = CheckForUpdate(context.Background(), "v0.8.1")
+	if callCount != 1 {
+		t.Fatalf("expected 1 fetch, got %d", callCount)
+	}
+
+	// Second call within TTL should NOT refetch.
+	_ = CheckForUpdate(context.Background(), "v0.8.1")
+	if callCount != 1 {
+		t.Fatalf("expected throttled (still 1 fetch), got %d", callCount)
+	}
 }
 
 func TestCheckForUpdate_InvalidJSON(t *testing.T) {
@@ -144,7 +254,9 @@ func TestCheckForUpdate_InvalidJSON(t *testing.T) {
 	defer func() { updateLatestURL = old }()
 
 	result := CheckForUpdate(context.Background(), "v0.8.1")
-	require.Nil(t, result)
+	if result != nil {
+		t.Fatalf("expected nil on invalid JSON, got %+v", result)
+	}
 }
 
 func TestCheckForUpdate_EmptyBody(t *testing.T) {
@@ -160,7 +272,9 @@ func TestCheckForUpdate_EmptyBody(t *testing.T) {
 	defer func() { updateLatestURL = old }()
 
 	result := CheckForUpdate(context.Background(), "v0.8.1")
-	require.Nil(t, result)
+	if result != nil {
+		t.Fatalf("expected nil on empty body, got %+v", result)
+	}
 }
 
 func TestCheckForUpdate_NewerVersion(t *testing.T) {
@@ -179,8 +293,34 @@ func TestCheckForUpdate_NewerVersion(t *testing.T) {
 	defer func() { updateLatestURL = old }()
 
 	result := CheckForUpdate(context.Background(), "v0.8.1")
-	require.NotNil(t, result)
-	require.Equal(t, "v0.9.0", result.Version)
+	if result == nil {
+		t.Fatalf("expected non-nil result for newer version")
+	}
+	if result.Version != "v0.9.0" {
+		t.Fatalf("got version %q, want %q", result.Version, "v0.9.0")
+	}
+}
+
+func TestCheckForUpdate_SHACurrentVersion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(ReleaseInfo{Version: "v0.9.0"})
+	}))
+	defer srv.Close()
+
+	withTempState(t)
+	old := updateLatestURL
+	updateLatestURL = srv.URL
+	defer func() { updateLatestURL = old }()
+
+	// SHA version should see any semver as an update.
+	result := CheckForUpdate(context.Background(), "abc1234")
+	if result == nil {
+		t.Fatalf("expected update notice for SHA version")
+	}
+	if result.Version != "v0.9.0" {
+		t.Fatalf("got version %q, want %q", result.Version, "v0.9.0")
+	}
 }
 
 func TestCheckForUpdate_SameVersion(t *testing.T) {
@@ -196,7 +336,9 @@ func TestCheckForUpdate_SameVersion(t *testing.T) {
 	defer func() { updateLatestURL = old }()
 
 	result := CheckForUpdate(context.Background(), "v0.8.1")
-	require.Nil(t, result)
+	if result != nil {
+		t.Fatalf("expected nil for same version, got %+v", result)
+	}
 }
 
 func TestCheckForUpdate_OlderVersion(t *testing.T) {
@@ -212,7 +354,9 @@ func TestCheckForUpdate_OlderVersion(t *testing.T) {
 	defer func() { updateLatestURL = old }()
 
 	result := CheckForUpdate(context.Background(), "v0.8.1")
-	require.Nil(t, result)
+	if result != nil {
+		t.Fatalf("expected nil for older version, got %+v", result)
+	}
 }
 
 func TestCheckForUpdate_TTLRespected(t *testing.T) {
@@ -231,25 +375,39 @@ func TestCheckForUpdate_TTLRespected(t *testing.T) {
 
 	// First check: should fetch.
 	r1 := CheckForUpdate(context.Background(), "v0.8.1")
-	require.NotNil(t, r1)
-	require.Equal(t, 1, callCount)
+	if r1 == nil {
+		t.Fatalf("expected non-nil result on first check")
+	}
+	if callCount != 1 {
+		t.Fatalf("expected 1 fetch, got %d", callCount)
+	}
 
 	// Second check: should use cache, not fetch.
 	r2 := CheckForUpdate(context.Background(), "v0.8.1")
-	require.NotNil(t, r2)
-	require.Equal(t, 1, callCount) // No additional fetch.
+	if r2 == nil {
+		t.Fatalf("expected non-nil result from cache")
+	}
+	if callCount != 1 {
+		t.Fatalf("expected no additional fetch (still 1), got %d", callCount)
+	}
 
 	// Manually expire the TTL.
 	path := filepath.Join(stateDir, "drive9", "update-check.json")
 	state := readUpdateState(path)
-	require.NotNil(t, state)
+	if state == nil {
+		t.Fatalf("expected non-nil state after write")
+	}
 	state.LastCheckedAt = time.Now().Add(-25 * time.Hour)
 	writeUpdateState(path, state)
 
 	// Third check: TTL expired, should fetch again.
 	r3 := CheckForUpdate(context.Background(), "v0.8.1")
-	require.NotNil(t, r3)
-	require.Equal(t, 2, callCount)
+	if r3 == nil {
+		t.Fatalf("expected non-nil result after TTL expiry")
+	}
+	if callCount != 2 {
+		t.Fatalf("expected 2 fetches after TTL expiry, got %d", callCount)
+	}
 }
 
 func TestCheckForUpdate_SkippedVersion(t *testing.T) {
@@ -272,10 +430,14 @@ func TestCheckForUpdate_SkippedVersion(t *testing.T) {
 	data, _ := json.Marshal(&updateState{
 		SkippedVersion: "v0.9.0",
 	})
-	require.NoError(t, os.WriteFile(path, data, 0o600))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("failed to write state: %v", err)
+	}
 
 	result := CheckForUpdate(context.Background(), "v0.8.1")
-	require.Nil(t, result, "skipped version should not be returned")
+	if result != nil {
+		t.Fatalf("skipped version should not be returned, got %+v", result)
+	}
 }
 
 func TestCheckForUpdate_SkipOldVersionStillPromptsNewer(t *testing.T) {
@@ -298,11 +460,17 @@ func TestCheckForUpdate_SkipOldVersionStillPromptsNewer(t *testing.T) {
 	data, _ := json.Marshal(&updateState{
 		SkippedVersion: "v0.9.0",
 	})
-	require.NoError(t, os.WriteFile(path, data, 0o600))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("failed to write state: %v", err)
+	}
 
 	result := CheckForUpdate(context.Background(), "v0.8.1")
-	require.NotNil(t, result, "newer version beyond skipped should still prompt")
-	require.Equal(t, "v0.9.1", result.Version)
+	if result == nil {
+		t.Fatalf("newer version beyond skipped should still prompt")
+	}
+	if result.Version != "v0.9.1" {
+		t.Fatalf("got version %q, want %q", result.Version, "v0.9.1")
+	}
 }
 
 func TestCheckForUpdate_CorruptStateFile(t *testing.T) {
@@ -322,12 +490,18 @@ func TestCheckForUpdate_CorruptStateFile(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	require.NoError(t, os.WriteFile(path, []byte("not json {{{"), 0o600))
+	if err := os.WriteFile(path, []byte("not json {{{"), 0o600); err != nil {
+		t.Fatalf("failed to write corrupt state: %v", err)
+	}
 
 	// Should not panic; should fetch and return result.
 	result := CheckForUpdate(context.Background(), "v0.8.1")
-	require.NotNil(t, result)
-	require.Equal(t, "v0.9.0", result.Version)
+	if result == nil {
+		t.Fatalf("expected non-nil result after corrupt state")
+	}
+	if result.Version != "v0.9.0" {
+		t.Fatalf("got version %q, want %q", result.Version, "v0.9.0")
+	}
 }
 
 func TestCheckForUpdate_InvalidVersionInResponse(t *testing.T) {
@@ -343,7 +517,9 @@ func TestCheckForUpdate_InvalidVersionInResponse(t *testing.T) {
 	defer func() { updateLatestURL = old }()
 
 	result := CheckForUpdate(context.Background(), "v0.8.1")
-	require.Nil(t, result)
+	if result != nil {
+		t.Fatalf("expected nil for invalid version in response, got %+v", result)
+	}
 }
 
 func TestCheckForUpdate_ContextCancelled(t *testing.T) {
@@ -362,13 +538,17 @@ func TestCheckForUpdate_ContextCancelled(t *testing.T) {
 	cancel() // Cancel immediately.
 
 	result := CheckForUpdate(ctx, "v0.8.1")
-	require.Nil(t, result)
+	if result != nil {
+		t.Fatalf("expected nil on cancelled context, got %+v", result)
+	}
 }
 
 func TestPrintUpdateNotice_NonInteractive(t *testing.T) {
 	// Capture stderr output.
 	r, w, err := os.Pipe()
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
 
 	oldStderr := os.Stderr
 	os.Stderr = w
@@ -391,11 +571,19 @@ func TestPrintUpdateNotice_NonInteractive(t *testing.T) {
 	n, _ := r.Read(buf)
 	output := string(buf[:n])
 
-	require.Contains(t, output, "0.8.1")
-	require.Contains(t, output, "0.9.0")
-	require.Contains(t, output, "To update:")
+	if !strings.Contains(output, "0.8.1") {
+		t.Fatalf("expected output to contain %q, got %q", "0.8.1", output)
+	}
+	if !strings.Contains(output, "0.9.0") {
+		t.Fatalf("expected output to contain %q, got %q", "0.9.0", output)
+	}
+	if !strings.Contains(output, "To update:") {
+		t.Fatalf("expected output to contain %q, got %q", "To update:", output)
+	}
 	// Should NOT contain interactive choices.
-	require.NotContains(t, output, "Choose [1/2]")
+	if strings.Contains(output, "Choose [1/2]") {
+		t.Fatalf("non-interactive output should not contain interactive choices, got %q", output)
+	}
 }
 
 func TestPrintUpdateNotice_Nil(t *testing.T) {
@@ -417,7 +605,10 @@ func TestReadChoice(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
 			r := strings.NewReader(tt.input)
-			require.Equal(t, tt.want, readChoice(r))
+			got := readChoice(r)
+			if got != tt.want {
+				t.Fatalf("readChoice(%q) = %q, want %q", tt.input, got, tt.want)
+			}
 		})
 	}
 }
@@ -427,24 +618,34 @@ func TestAtomicStateWrite(t *testing.T) {
 	path := filepath.Join(dir, "drive9", "update-check.json")
 
 	state := &updateState{
-		LastCheckedAt: time.Now().UTC(),
-		LatestVersion: "v0.9.0",
-		LatestURL:     "https://example.com",
+		LastCheckedAt:  time.Now().UTC(),
+		LatestVersion:  "v0.9.0",
+		LatestURL:      "https://example.com",
 		SkippedVersion: "v0.8.5",
 	}
 	writeUpdateState(path, state)
 
 	// Verify it was written correctly.
 	got := readUpdateState(path)
-	require.NotNil(t, got)
-	require.Equal(t, "v0.9.0", got.LatestVersion)
-	require.Equal(t, "v0.8.5", got.SkippedVersion)
+	if got == nil {
+		t.Fatalf("expected non-nil state after write")
+	}
+	if got.LatestVersion != "v0.9.0" {
+		t.Fatalf("got LatestVersion %q, want %q", got.LatestVersion, "v0.9.0")
+	}
+	if got.SkippedVersion != "v0.8.5" {
+		t.Fatalf("got SkippedVersion %q, want %q", got.SkippedVersion, "v0.8.5")
+	}
 
 	// Verify no temp files left behind.
 	entries, err := os.ReadDir(filepath.Dir(path))
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("failed to read dir: %v", err)
+	}
 	for _, e := range entries {
-		require.False(t, strings.Contains(e.Name(), ".tmp"), "temp file %s should be cleaned up", e.Name())
+		if strings.Contains(e.Name(), ".tmp") {
+			t.Fatalf("temp file %s should be cleaned up", e.Name())
+		}
 	}
 }
 
@@ -455,8 +656,12 @@ func TestSkipVersion(t *testing.T) {
 
 	path := filepath.Join(stateDir, "drive9", "update-check.json")
 	state := readUpdateState(path)
-	require.NotNil(t, state)
-	require.Equal(t, "v0.9.0", state.SkippedVersion)
+	if state == nil {
+		t.Fatalf("expected non-nil state after skipVersion")
+	}
+	if state.SkippedVersion != "v0.9.0" {
+		t.Fatalf("got SkippedVersion %q, want %q", state.SkippedVersion, "v0.9.0")
+	}
 }
 
 func TestIsValidSemver(t *testing.T) {
@@ -475,7 +680,10 @@ func TestIsValidSemver(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.v, func(t *testing.T) {
-			require.Equal(t, tt.want, isValidSemver(tt.v))
+			got := isValidSemver(tt.v)
+			if got != tt.want {
+				t.Fatalf("isValidSemver(%q) = %v, want %v", tt.v, got, tt.want)
+			}
 		})
 	}
 }
