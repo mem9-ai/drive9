@@ -46,6 +46,10 @@ type fallbackImageTextExtractor struct {
 }
 
 // NewFallbackImageTextExtractor wraps an extractor with a fallback extractor.
+// The fallback only covers primary success with empty text; primary errors
+// propagate to the caller so they surface in semantic_tasks.last_error and
+// retry with backoff, instead of being permanently masked by placeholder
+// metadata text that no log retains.
 func NewFallbackImageTextExtractor(primary, fallback ImageTextExtractor) ImageTextExtractor {
 	if primary == nil {
 		return fallback
@@ -58,20 +62,21 @@ func NewFallbackImageTextExtractor(primary, fallback ImageTextExtractor) ImageTe
 
 func (e *fallbackImageTextExtractor) ExtractImageText(ctx context.Context, req ImageExtractRequest) (string, ImageExtractUsage, error) {
 	text, usage, err := e.primary.ExtractImageText(ctx, req)
-	if err == nil && strings.TrimSpace(text) != "" {
-		return text, usage, nil
-	}
 	if err != nil {
-		logger.Warn(ctx, "backend_image_extract_primary_failed_use_fallback",
+		logger.Warn(ctx, "backend_image_extract_primary_failed",
 			zap.String("file_id", req.FileID),
 			zap.String("path", req.Path),
+			zap.String("content_type", req.ContentType),
 			zap.Error(err))
 		metrics.RecordOperation("image_extract", "fallback", "primary_error", 0)
-	} else {
-		logger.Warn(ctx, "backend_image_extract_primary_empty_use_fallback",
-			zap.String("file_id", req.FileID),
-			zap.String("path", req.Path))
-		metrics.RecordOperation("image_extract", "fallback", "primary_empty", 0)
+		return "", usage, fmt.Errorf("primary image extractor: %w", err)
 	}
+	if strings.TrimSpace(text) != "" {
+		return text, usage, nil
+	}
+	logger.Warn(ctx, "backend_image_extract_primary_empty_use_fallback",
+		zap.String("file_id", req.FileID),
+		zap.String("path", req.Path))
+	metrics.RecordOperation("image_extract", "fallback", "primary_empty", 0)
 	return e.fallback.ExtractImageText(ctx, req)
 }
