@@ -2251,7 +2251,7 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 						kind:      tidbSchemaDiffMissingIndex,
 						tableName: table.name,
 						detail:    fmt.Sprintf("%s schema contract: %s index columns = (%s), want (%s)", table.name, name, strings.Join(observedColumns, ", "), strings.Join(expectedColumns, ", ")),
-						repairSQL: recreatePathHashIndexSQL(table.name, name),
+						repairSQL: dropPathHashIndexSQL(table.name, name),
 					})
 				}
 			}
@@ -2350,16 +2350,16 @@ func expectedPathHashIndexColumns(tableName, indexName string) []string {
 	}
 }
 
-func recreatePathHashIndexSQL(tableName, indexName string) string {
+func dropPathHashIndexSQL(tableName, indexName string) string {
 	switch tableName + "." + strings.ToLower(indexName) {
 	case "file_nodes.idx_path":
-		return "ALTER TABLE file_nodes DROP INDEX idx_path, ADD UNIQUE INDEX idx_path(path_hash)"
+		return "ALTER TABLE file_nodes DROP INDEX idx_path"
 	case "file_nodes.idx_parent":
-		return "ALTER TABLE file_nodes DROP INDEX idx_parent, ADD INDEX idx_parent(parent_path_hash, name)"
+		return "ALTER TABLE file_nodes DROP INDEX idx_parent"
 	case "uploads.idx_upload_path":
-		return "ALTER TABLE uploads DROP INDEX idx_upload_path, ADD INDEX idx_upload_path(target_path_hash, status)"
+		return "ALTER TABLE uploads DROP INDEX idx_upload_path"
 	case "uploads.idx_uploads_active":
-		return "ALTER TABLE uploads DROP INDEX idx_uploads_active, ADD UNIQUE INDEX idx_uploads_active(active_target_path_hash)"
+		return "ALTER TABLE uploads DROP INDEX idx_uploads_active"
 	default:
 		return ""
 	}
@@ -2630,7 +2630,7 @@ func isSafeTiDBRepairDiff(diff tidbSchemaDiff) bool {
 	case tidbSchemaDiffMissingColumn:
 		return isSafeAddColumnRepairSQL(diff.repairSQL)
 	case tidbSchemaDiffMissingIndex:
-		return isSafeAddIndexRepairSQL(diff.repairSQL)
+		return isSafeAddIndexRepairSQL(diff.repairSQL) || isSafeDropPathHashIndexRepairSQL(diff.repairSQL)
 	case tidbSchemaDiffColumnType:
 		return isSafeModifyColumnRepairSQL(diff)
 	default:
@@ -2698,6 +2698,18 @@ func isSafeAddIndexRepairSQL(sqlText string) bool {
 		}
 	}
 	return false
+}
+
+func isSafeDropPathHashIndexRepairSQL(sqlText string) bool {
+	switch normalizeSQLFragment(sqlText) {
+	case "alter table file_nodes drop index idx_path",
+		"alter table file_nodes drop index idx_parent",
+		"alter table uploads drop index idx_upload_path",
+		"alter table uploads drop index idx_uploads_active":
+		return true
+	default:
+		return false
+	}
 }
 
 func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string) error {

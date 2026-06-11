@@ -375,7 +375,7 @@ func TestPlannedTiDBSchemaRepairsDefersPathWideningUntilHashIndexesRebuilt(t *te
 			kind:      tidbSchemaDiffMissingIndex,
 			tableName: "file_nodes",
 			detail:    "file_nodes schema contract: idx_path index columns = (path), want (path_hash)",
-			repairSQL: "ALTER TABLE file_nodes DROP INDEX idx_path, ADD UNIQUE INDEX idx_path(path_hash)",
+			repairSQL: "ALTER TABLE file_nodes DROP INDEX idx_path",
 		},
 	}
 
@@ -383,7 +383,7 @@ func TestPlannedTiDBSchemaRepairsDefersPathWideningUntilHashIndexesRebuilt(t *te
 	if len(got) != 1 {
 		t.Fatalf("expected only hash index repair before widening, got %#v", got)
 	}
-	if got[0] != "ALTER TABLE file_nodes DROP INDEX idx_path, ADD UNIQUE INDEX idx_path(path_hash)" {
+	if got[0] != "ALTER TABLE file_nodes DROP INDEX idx_path" {
 		t.Fatalf("unexpected repair statement: %q", got[0])
 	}
 }
