@@ -632,6 +632,86 @@ func TestLayerChmodCoalescesPendingFileContent(t *testing.T) {
 	}
 }
 
+func TestLayerSetAttrModeCoalescesPendingFileContent(t *testing.T) {
+	var got clientLayerEntryRequest
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/layers/layer-1/entries" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode layer entry: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+			LayerID: "layer-1",
+			Path:    got.Path,
+			Op:      got.Op,
+			Kind:    got.Kind,
+			Mode:    got.Mode,
+			Content: got.Content,
+		})
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/new.txt", []byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode("/new.txt", 4, PendingNew, 0, 0o644, true); err != nil {
+		t.Fatal(err)
+	}
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	ino := fs.inodes.Lookup("/new.txt", false, 4, time.Now())
+	fs.inodes.UpdateMode(ino, 0o644)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_MODE,
+			Mode:     0o600,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if got.Path != "/repo/new.txt" || got.Op != "upsert" || got.Kind != "file" {
+		t.Fatalf("chmod coalesced request = %+v, want file upsert", got)
+	}
+	if !bytes.Equal(got.Content, []byte("data")) {
+		t.Fatalf("coalesced content = %q, want data", got.Content)
+	}
+	if got.Mode != 0o600 {
+		t.Fatalf("mode = %#o, want 0600", got.Mode)
+	}
+	meta, ok := pending.GetMeta("/new.txt")
+	if !ok || meta.Kind != PendingNew || !meta.HasMode || meta.Mode != 0o600 {
+		t.Fatalf("pending mode = %+v, want PendingNew 0600", meta)
+	}
+	if mode, ok := fs.layerFileMode("/new.txt"); !ok || mode != 0o600 {
+		t.Fatalf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
+	}
+	if got, want := out.Mode&0o777, uint32(0o600); got != want {
+		t.Fatalf("SetAttr output mode = %o, want %o", got, want)
+	}
+}
+
 func TestLayerChmodCoalescesShadowFileWithoutPendingMeta(t *testing.T) {
 	var got clientLayerEntryRequest
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

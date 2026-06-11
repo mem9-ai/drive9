@@ -6099,7 +6099,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		if hasDirtyHandle || hasPendingMetadata {
 			fs.setPendingMetadataMode(entry.Path, mode)
 		}
-		if !hasDirtyHandle && !hasPendingMetadata {
+		if !hasDirtyHandle && (!hasPendingMetadata || fs.layerEnabled()) {
 			ctx, cf := fuseCtx(cancel)
 			defer cf()
 			if err := retryPostUploadMode(ctx, func() error {
