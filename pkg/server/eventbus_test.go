@@ -59,7 +59,7 @@ func TestEventBusReplay(t *testing.T) {
 	}
 }
 
-func TestEventBusPublishEventForcesResetForOlderSeq(t *testing.T) {
+func TestEventBusPublishEventRenumbersOlderSeqAfterVolatileFallback(t *testing.T) {
 	bus := NewEventBus()
 	bus.PublishEvent(ChangeEvent{Seq: 2, Path: "/b.txt", Op: "write", Ts: 1})
 	bus.PublishEvent(ChangeEvent{Seq: 1, Path: "/a.txt", Op: "write", Ts: 1})
@@ -71,27 +71,30 @@ func TestEventBusPublishEventForcesResetForOlderSeq(t *testing.T) {
 	if !ok {
 		t.Fatal("EventsSince(1) returned not ok")
 	}
-	if len(events) != 2 || events[0].Seq != 2 || events[1].Seq != 3 || events[1].Op != eventBusForceResetOp {
-		t.Fatalf("events=%+v, want seq 2 then force-reset seq 3", events)
+	if len(events) != 2 || events[0].Seq != 2 || events[1].Seq != 3 || events[1].Path != "/a.txt" {
+		t.Fatalf("events=%+v, want durable seq 2 then renumbered live seq 3", events)
 	}
 }
 
-func TestEventBusEventsSinceRejectsSeqGaps(t *testing.T) {
+func TestEventBusEventsSinceAcceptsDurableSeqGaps(t *testing.T) {
 	bus := NewEventBus()
 	bus.PublishEvent(ChangeEvent{Seq: 1, Path: "/a.txt", Op: "write", Ts: 1})
 	bus.AdvanceSeq(2)
 	bus.PublishEvent(ChangeEvent{Seq: 3, Path: "/c.txt", Op: "write", Ts: 1})
 
 	events, headSeq, ok := bus.EventsSince(1)
-	if ok {
-		t.Fatalf("EventsSince(1) ok=true events=%+v, want reset for missing seq 2", events)
+	if !ok {
+		t.Fatal("EventsSince(1) returned not ok")
 	}
 	if headSeq != 3 {
 		t.Fatalf("headSeq=%d, want 3", headSeq)
 	}
+	if len(events) != 1 || events[0].Seq != 3 || events[0].Path != "/c.txt" {
+		t.Fatalf("events=%+v, want durable seq 3", events)
+	}
 }
 
-func TestEventBusPublishEventForcesResetAfterVolatileFallbackCollision(t *testing.T) {
+func TestEventBusPublishEventContinuesAfterVolatileFallbackCollision(t *testing.T) {
 	bus := NewEventBus()
 	bus.AdvanceSeq(5)
 	bus.Publish("/volatile.txt", "write", "")
@@ -110,8 +113,24 @@ func TestEventBusPublishEventForcesResetAfterVolatileFallbackCollision(t *testin
 	if events[0].Seq != 6 || events[0].Path != "/volatile.txt" {
 		t.Fatalf("first event=%+v, want volatile seq 6", events[0])
 	}
-	if events[1].Seq != 7 || events[1].Op != eventBusForceResetOp {
-		t.Fatalf("second event=%+v, want force-reset seq 7", events[1])
+	if events[1].Seq != 7 || events[1].Path != "/durable.txt" {
+		t.Fatalf("second event=%+v, want durable event renumbered to seq 7", events[1])
+	}
+}
+
+func TestEventBusLiveEventsSinceAllowsZeroCursor(t *testing.T) {
+	bus := NewEventBus()
+	bus.PublishEvent(ChangeEvent{Seq: 1, Path: "/first.txt", Op: "write", Ts: 1})
+
+	events, headSeq, ok := bus.LiveEventsSince(0)
+	if !ok {
+		t.Fatal("LiveEventsSince(0) returned not ok")
+	}
+	if headSeq != 1 {
+		t.Fatalf("headSeq=%d, want 1", headSeq)
+	}
+	if len(events) != 1 || events[0].Seq != 1 || events[0].Path != "/first.txt" {
+		t.Fatalf("events=%+v, want first live event", events)
 	}
 }
 

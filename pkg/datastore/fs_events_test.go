@@ -26,8 +26,8 @@ func TestFSEventLogInsertBoundsAndReplay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if oldest != ev1.Seq || head != ev2.Seq || count != 2 {
-		t.Fatalf("bounds oldest=%d head=%d count=%d; want %d %d 2", oldest, head, count, ev1.Seq, ev2.Seq)
+	if oldest != ev1.Seq || head != ev2.Seq || count != 1 {
+		t.Fatalf("bounds oldest=%d head=%d count=%d; want %d %d non-empty", oldest, head, count, ev1.Seq, ev2.Seq)
 	}
 
 	events, err := s.ListFSEventsSince(ctx, ev1.Seq, 10)

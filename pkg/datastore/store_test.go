@@ -1489,6 +1489,51 @@ func TestChmodDirectory(t *testing.T) {
 	}
 }
 
+func TestChmodDirectoryWithNullConfirmedAt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if err := s.InsertInode(ctx, &Inode{
+		InodeID:   "dir-inode",
+		SizeBytes: 0,
+		Revision:  1,
+		Mode:      0o755,
+		Status:    StatusConfirmed,
+		CreatedAt: now,
+		Mtime:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{
+		NodeID:      "dir-node",
+		Path:        "/dir/",
+		ParentPath:  "/",
+		Name:        "dir",
+		IsDirectory: true,
+		InodeID:     "dir-inode",
+		CreatedAt:   now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Chmod(ctx, "/dir/", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var mode uint32
+	var confirmedAt sql.NullTime
+	if err := s.DB().QueryRowContext(ctx, `SELECT mode, confirmed_at FROM inodes WHERE inode_id = ?`, "dir-inode").Scan(&mode, &confirmedAt); err != nil {
+		t.Fatal(err)
+	}
+	if mode != 0o700 {
+		t.Fatalf("mode=%o, want 0o700", mode)
+	}
+	if !confirmedAt.Valid {
+		t.Fatal("confirmed_at is still NULL")
+	}
+}
+
 func TestConfirmPendingFileTx(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

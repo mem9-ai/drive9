@@ -56,18 +56,20 @@ func (eb *EventBus) Publish(path, op, actor string) {
 
 // PublishEvent appends an event whose sequence was assigned by a durable event
 // log. It is used by the SSE endpoint so reconnect replay and live delivery use
-// the same cursor space when possible. If the durable event arrives out of order
-// or behind a volatile fallback cursor, publish a reset signal instead of
-// renumbering the durable event into a different live ordering.
+// the same cursor space when possible. Durable sequences may have gaps because
+// database auto-increment values are not guaranteed to be gapless. If volatile
+// fallback has already advanced the live cursor past the durable sequence,
+// publish the event at the next live sequence so connected clients still see
+// targeted invalidation; reconnecting clients will fall back to a reset when
+// their live cursor is ahead of the durable log head.
 func (eb *EventBus) PublishEvent(ev ChangeEvent) {
 	eb.mu.Lock()
 	if ev.Seq == 0 {
 		eb.seq++
 		ev.Seq = eb.seq
-	} else if eb.seq > 0 && ev.Seq != eb.seq+1 {
-		eb.publishResetLocked()
-		eb.mu.Unlock()
-		return
+	} else if ev.Seq <= eb.seq {
+		eb.seq++
+		ev.Seq = eb.seq
 	} else if ev.Seq > eb.seq {
 		eb.seq = ev.Seq
 	}
@@ -76,15 +78,6 @@ func (eb *EventBus) PublishEvent(ev ChangeEvent) {
 	}
 	eb.publishLocked(ev)
 	eb.mu.Unlock()
-}
-
-func (eb *EventBus) publishResetLocked() {
-	eb.seq++
-	eb.publishLocked(ChangeEvent{
-		Seq: eb.seq,
-		Op:  eventBusForceResetOp,
-		Ts:  time.Now().UnixMilli(),
-	})
 }
 
 func (eb *EventBus) publishLocked(ev ChangeEvent) {
@@ -188,18 +181,42 @@ func (eb *EventBus) EventsSince(since uint64) (events []ChangeEvent, headSeq uin
 	}
 
 	// Walk the ring from oldest to newest, collecting events with seq > since.
+	// Durable events are not guaranteed to have gapless sequence numbers, so a
+	// larger-than-expected next seq is still replayable as long as it is retained.
 	result := make([]ChangeEvent, 0, 64)
-	expectedSeq := since + 1
 	for i := 0; i < eb.count; i++ {
 		idx := (oldestIdx + i) % eventBusRingSize
 		ev := eb.ring[idx]
 		if ev.Seq > since {
-			if ev.Seq != expectedSeq {
-				return nil, headSeq, false
-			}
 			result = append(result, ev)
-			expectedSeq++
 		}
+	}
+	return result, headSeq, true
+}
+
+// LiveEventsSince is the live-stream variant of EventsSince. Unlike initial
+// replay, a zero cursor is valid here because a brand-new tenant can connect,
+// receive an initial reset at seq 0, and then need the first live event.
+func (eb *EventBus) LiveEventsSince(since uint64) (events []ChangeEvent, headSeq uint64, ok bool) {
+	if since == 0 {
+		return eb.eventsSinceAllowZero()
+	}
+	return eb.EventsSince(since)
+}
+
+func (eb *EventBus) eventsSinceAllowZero() (events []ChangeEvent, headSeq uint64, ok bool) {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+
+	headSeq = eb.seq
+	if eb.count == 0 {
+		return nil, headSeq, true
+	}
+	oldestIdx := (eb.head - eb.count + eventBusRingSize) % eventBusRingSize
+	result := make([]ChangeEvent, 0, eb.count)
+	for i := 0; i < eb.count; i++ {
+		idx := (oldestIdx + i) % eventBusRingSize
+		result = append(result, eb.ring[idx])
 	}
 	return result, headSeq, true
 }

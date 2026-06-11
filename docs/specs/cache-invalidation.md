@@ -36,7 +36,7 @@ This spec describes the **target architecture** for P1 cache implementation. The
 ## 2. Definitions
 
 - **revision**: A monotonically increasing integer assigned by the server to each file mutation. Every write and chmod produces a new revision.
-- **SSE**: Server-Sent Events stream from `/v1/events`. Delivers `ChangeEvent` (per-path, for write/upload_complete/create/symlink ops), `ResetEvent` (full invalidation, including for structural ops like rename/delete/mkdir/copy), and heartbeat/current markers after replay/reset catch-up.
+- **SSE**: Server-Sent Events stream from `/v1/events`. Delivers `ChangeEvent` (per-path, for write/upload_complete/create/symlink/chmod ops), `ResetEvent` (full invalidation, including for structural ops like rename/delete/mkdir/copy), and heartbeat/current markers after replay/reset catch-up.
 - **trusted event stream**: An SSE stream that is safe to use as a freshness guarantee for revision-bound stat-cache hits. The current server event bus is process-local, so the stream is trusted only for single-server/sticky-routing deployments, or for future deployments with a cluster-wide durable event stream. Mounts must fail closed unless the operator explicitly enables this trust boundary.
 - **stale**: Cache entry whose revision is older than the server's current revision for that path.
 - **orphan**: Cache entry for a path/file that no longer exists on the server.
@@ -319,5 +319,5 @@ Each scenario MUST have a corresponding test before the cache implementation is 
 ## 11. Non-goals
 
 - This spec does NOT cover write-back cache invalidation. Write-path caching requires GC/session safety (#490) first.
-- This spec does NOT define server-side API changes (chmod SSE event, directory revision API). Those are tracked as separate prerequisite issues (see §1.1).
+- This spec does NOT define directory revision API changes. Those are tracked as separate prerequisite issues (see §1.1).
 - This spec does NOT define cache storage format (on-disk layout, compression, checksums). That is an implementation detail for #486.

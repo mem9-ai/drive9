@@ -1179,7 +1179,8 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 	}
 
 	var currentMode uint32
-	var currentMtime, currentConfirmedAt time.Time
+	var currentMtime time.Time
+	var currentConfirmedAt sql.NullTime
 	if err := s.db.QueryRowContext(ctx, `SELECT mode, mtime, confirmed_at FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED'`, inodeID).Scan(&currentMode, &currentMtime, &currentConfirmedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
@@ -1191,8 +1192,8 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 	if !now.After(currentMtime) {
 		now = currentMtime.Add(time.Millisecond)
 	}
-	if !now.After(currentConfirmedAt) {
-		now = currentConfirmedAt.Add(time.Millisecond)
+	if currentConfirmedAt.Valid && !now.After(currentConfirmedAt.Time) {
+		now = currentConfirmedAt.Time.Add(time.Millisecond)
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE inodes SET mode = ?, revision = revision + 1, mtime = ?, confirmed_at = ? WHERE inode_id = ? AND status = 'CONFIRMED'`, mode, now, now, inodeID)
 	if err != nil {

@@ -44,13 +44,14 @@ func (s *Store) InsertFSEvent(ctx context.Context, path, op, actor string) (ev F
 }
 
 // FSEventBounds returns the oldest retained sequence, current head sequence,
-// and retained event count.
+// and whether any retained event exists. The count return is 0 for empty logs
+// and 1 for non-empty logs; callers only use it as an emptiness signal.
 func (s *Store) FSEventBounds(ctx context.Context) (oldestSeq, headSeq uint64, count int64, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "fs_event_bounds", start, &err)
 
 	var oldest, head sql.NullInt64
-	err = s.db.QueryRowContext(ctx, `SELECT MIN(seq), MAX(seq), COUNT(*) FROM fs_events`).Scan(&oldest, &head, &count)
+	err = s.db.QueryRowContext(ctx, `SELECT MIN(seq), MAX(seq) FROM fs_events`).Scan(&oldest, &head)
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -59,6 +60,7 @@ func (s *Store) FSEventBounds(ctx context.Context) (oldestSeq, headSeq uint64, c
 	}
 	if head.Valid && head.Int64 > 0 {
 		headSeq = uint64(head.Int64)
+		count = 1
 	}
 	return oldestSeq, headSeq, count, nil
 }

@@ -16,6 +16,34 @@ func TestVersionTextUsesDrive9ServerComponent(t *testing.T) {
 	}
 }
 
+func TestEnvPositiveInt(t *testing.T) {
+	const key = "DRIVE9_TEST_POSITIVE_INT"
+	t.Setenv(key, "")
+	got, err := envPositiveInt(key, 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 15 {
+		t.Fatalf("unset value = %d, want fallback 15", got)
+	}
+
+	t.Setenv(key, "3")
+	got, err = envPositiveInt(key, 15)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 3 {
+		t.Fatalf("parsed value = %d, want 3", got)
+	}
+
+	for _, value := range []string{"abc", "0", "-1"} {
+		t.Setenv(key, value)
+		if _, err := envPositiveInt(key, 15); err == nil {
+			t.Fatalf("envPositiveInt(%q) error = nil, want error", value)
+		}
+	}
+}
+
 func TestSlockOAuthFromEnvDisabledByDefault(t *testing.T) {
 	keys := []string{
 		"DRIVE9_SLOCK_ORIGIN",

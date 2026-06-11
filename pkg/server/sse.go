@@ -406,7 +406,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				recordSSEOperation("disconnect", sseResultServerClosed, time.Time{})
 				return
 			}
-			liveEvents, liveHead, liveOK := bus.EventsSince(lastSeen)
+			liveEvents, liveHead, liveOK := bus.LiveEventsSince(lastSeen)
 			if !liveOK {
 				// Reset must be sent immediately; buffering it would stall
 				// the client until the next heartbeat or unrelated event.
@@ -465,7 +465,13 @@ func bStoreFromRequest(r *http.Request) *datastore.Store {
 func (s *Server) eventsSince(ctx context.Context, store *datastore.Store, bus *EventBus, since uint64) ([]ChangeEvent, uint64, bool, sseOperationResult) {
 	if store != nil {
 		events, headSeq, ok, reason, err := persistentEventsSince(ctx, store, since)
+		if err == nil && ok {
+			return events, headSeq, ok, reason
+		}
 		if err == nil {
+			if events, busHeadSeq, busOK := bus.EventsSince(since); busOK {
+				return events, busHeadSeq, true, ""
+			}
 			return events, headSeq, ok, reason
 		}
 		logger.Error(ctx, "server_event", eventFields(ctx, "sse_replay_persistent_failed", "error", err)...)
@@ -486,7 +492,7 @@ func (s *Server) eventsSince(ctx context.Context, store *datastore.Store, bus *E
 
 func persistentEventsSince(ctx context.Context, store *datastore.Store, since uint64) ([]ChangeEvent, uint64, bool, sseOperationResult, error) {
 	start := time.Now()
-	oldestSeq, headSeq, count, err := store.FSEventBounds(ctx)
+	_, headSeq, count, err := store.FSEventBounds(ctx)
 	if err != nil {
 		recordSSEOperation("replay", sseResultError, start)
 		return nil, 0, false, "", err
@@ -508,10 +514,6 @@ func persistentEventsSince(ctx context.Context, store *datastore.Store, since ui
 		recordSSEOperation("replay", sseResultServerRestart, start)
 		return nil, headSeq, false, sseResultServerRestart, nil
 	}
-	if oldestSeq > 0 && since+1 < oldestSeq {
-		recordSSEOperation("replay", sseResultSeqTooOld, start)
-		return nil, headSeq, false, sseResultSeqTooOld, nil
-	}
 	if since == headSeq {
 		recordSSEOperation("replay", sseResultOK, start)
 		return nil, headSeq, true, "", nil
@@ -531,12 +533,7 @@ func persistentEventsSince(ctx context.Context, store *datastore.Store, since ui
 		return nil, headSeq, false, sseResultSeqTooOld, nil
 	}
 	out := make([]ChangeEvent, 0, len(events))
-	expectedSeq := since + 1
 	for _, ev := range events {
-		if ev.Seq != expectedSeq {
-			recordSSEOperation("replay", sseResultSeqTooOld, start)
-			return nil, headSeq, false, sseResultSeqTooOld, nil
-		}
 		out = append(out, ChangeEvent{
 			Seq:   ev.Seq,
 			Path:  ev.Path,
@@ -544,7 +541,6 @@ func persistentEventsSince(ctx context.Context, store *datastore.Store, since ui
 			Actor: ev.Actor,
 			Ts:    ev.Ts,
 		})
-		expectedSeq++
 	}
 	recordSSEOperation("replay", sseResultOK, start)
 	return out, headSeq, true, "", nil

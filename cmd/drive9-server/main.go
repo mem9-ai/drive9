@@ -114,10 +114,11 @@ func main() {
 	if err != nil {
 		die(err)
 	}
-	sseHeartbeatInterval := time.Duration(envInt("DRIVE9_SSE_HEARTBEAT_INTERVAL_SECONDS", 15)) * time.Second
-	if sseHeartbeatInterval <= 0 {
-		die(fmt.Errorf("DRIVE9_SSE_HEARTBEAT_INTERVAL_SECONDS must be positive"))
+	sseHeartbeatSeconds, err := envPositiveInt("DRIVE9_SSE_HEARTBEAT_INTERVAL_SECONDS", 15)
+	if err != nil {
+		die(err)
 	}
+	sseHeartbeatInterval := time.Duration(sseHeartbeatSeconds) * time.Second
 	if semanticEmbedder != nil && backendOptions.QueryEmbedding.Client == nil {
 		backendOptions.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
@@ -801,6 +802,18 @@ func envInt(key string, fallback int) int {
 		return fallback
 	}
 	return v
+}
+
+func envPositiveInt(key string, fallback int) (int, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return fallback, nil
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || v <= 0 {
+		return 0, fmt.Errorf("invalid %s: must be a positive integer", key)
+	}
+	return v, nil
 }
 
 func envInt64(key string, fallback int64) int64 {
