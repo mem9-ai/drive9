@@ -161,15 +161,6 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 		)`,
 		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
-		`CREATE TABLE IF NOT EXISTS fs_events (
-			seq        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-			path       VARCHAR(512) NOT NULL,
-			op         VARCHAR(64) NOT NULL,
-			actor      VARCHAR(255),
-			ts         BIGINT NOT NULL,
-			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
-		)`,
-		`CREATE INDEX idx_fs_events_created ON fs_events(created_at)`,
 	}
 	stmts = append(stmts, GitWorkspaceTiDBSchemaStatements()...)
 	stmts = append(stmts, JournalTiDBSchemaStatements()...)

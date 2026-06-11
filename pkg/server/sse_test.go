@@ -2,7 +2,6 @@ package server
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -148,127 +147,6 @@ func TestSSEEndpointReplay(t *testing.T) {
 	}
 	if data2.Path != "/c.txt" || data2.Op != "write" {
 		t.Errorf("event2 data: %+v", data2)
-	}
-}
-
-func TestSSEEndpointPersistentReplayAfterMemoryBusReset(t *testing.T) {
-	srv := newTestServer(t)
-	store := srv.fallback.Store()
-	ctx := context.Background()
-	ev1, err := store.InsertFSEvent(ctx, "/persist-a.txt", "write", "actor1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ev2, err := store.InsertFSEvent(ctx, "/persist-b.txt", "chmod", "actor2")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Simulate a server restart: persistent events remain, memory bus is empty.
-	srv.events = newEventBuses()
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		scope := &TenantScope{TenantID: "", Backend: srv.fallback}
-		srv.handleEvents(w, r.WithContext(withScope(r.Context(), scope)))
-	}))
-	defer ts.Close()
-
-	reqCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(reqCtx, "GET", fmt.Sprintf("%s?since=%d", ts.URL, ev1.Seq), nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	scanner := bufio.NewScanner(resp.Body)
-	got, ok := readSSEEvent(scanner)
-	if !ok {
-		t.Fatal("expected replayed persistent event")
-	}
-	if got.Event != "file_changed" {
-		t.Fatalf("event=%q, want file_changed", got.Event)
-	}
-	var data ChangeEvent
-	if err := json.Unmarshal([]byte(got.Data), &data); err != nil {
-		t.Fatal(err)
-	}
-	if data.Seq != ev2.Seq || data.Path != "/persist-b.txt" || data.Op != "chmod" || data.Actor != "actor2" {
-		t.Fatalf("persistent replay event = %+v, want chmod seq %d", data, ev2.Seq)
-	}
-}
-
-func TestSSERetentionSweeperPrunesOutsideWindow(t *testing.T) {
-	srv := newTestServer(t)
-	store := srv.fallback.Store()
-	ctx := context.Background()
-
-	ev1, err := store.InsertFSEvent(ctx, "/old.txt", "write", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ev2, err := store.InsertFSEvent(ctx, "/keep-a.txt", "write", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	ev3, err := store.InsertFSEvent(ctx, "/keep-b.txt", "chmod", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sweeper := newSSERetentionSweeper()
-	sweeper.retention = 2
-	sweeper.sweepHead(ctx, store, ev3.Seq)
-
-	events, err := store.ListFSEventsSince(ctx, 0, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(events) != 2 {
-		t.Fatalf("events len=%d, want 2: %+v", len(events), events)
-	}
-	if events[0].Seq != ev2.Seq || events[1].Seq != ev3.Seq {
-		t.Fatalf("kept seqs = [%d %d], want [%d %d]", events[0].Seq, events[1].Seq, ev2.Seq, ev3.Seq)
-	}
-	for _, ev := range events {
-		if ev.Seq == ev1.Seq {
-			t.Fatalf("old event was not pruned: %+v", ev)
-		}
-	}
-}
-
-func TestHandleChmodPublishesPersistentSSEEvent(t *testing.T) {
-	srv := newTestServer(t)
-	ctx := context.Background()
-	if err := srv.fallback.CreateCtx(ctx, "/chmod.txt"); err != nil {
-		t.Fatal(err)
-	}
-
-	body := bytes.NewBufferString(`{"mode":384}`)
-	req := httptest.NewRequest(http.MethodPost, "/v1/fs/chmod.txt?chmod=1", body)
-	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "", Backend: srv.fallback}))
-	rr := httptest.NewRecorder()
-	srv.handleChmod(rr, req, "/chmod.txt")
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
-
-	events, err := srv.fallback.Store().ListFSEventsSince(ctx, 0, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(events) != 1 {
-		t.Fatalf("events len=%d, want 1: %+v", len(events), events)
-	}
-	if got := events[0]; got.Path != "/chmod.txt" || got.Op != "chmod" {
-		t.Fatalf("event=%+v, want chmod event for /chmod.txt", got)
-	}
-	nf, err := srv.fallback.Store().Stat(ctx, "/chmod.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if nf.File == nil || nf.File.Revision != 2 {
-		t.Fatalf("revision=%v, want 2 after chmod", nf.File)
 	}
 }
 
@@ -486,57 +364,6 @@ func TestSSEStructuralOpLiveEmitsReset(t *testing.T) {
 	}
 	if data["op"] != "rename" {
 		t.Errorf("live rename op=%v, want rename", data["op"])
-	}
-}
-
-func TestSSEForceResetSignalLiveEmitsReset(t *testing.T) {
-	srv := &Server{events: newEventBuses()}
-	bus := srv.events.get("")
-	bus.PublishEvent(ChangeEvent{Seq: 5, Path: "/seed.txt", Op: "write", Ts: 1})
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
-		srv.handleEvents(w, r.WithContext(ctx))
-	}))
-	defer ts.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=5", nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	scanner := bufio.NewScanner(resp.Body)
-	current, ok := readSSEEvent(scanner)
-	if !ok {
-		t.Fatal("expected initial stream-current heartbeat")
-	}
-	if current.Event != "heartbeat" {
-		t.Fatalf("initial event=%q, want heartbeat", current.Event)
-	}
-
-	bus.PublishEvent(ChangeEvent{Seq: 7, Path: "/gap.txt", Op: "write", Ts: 1})
-
-	ev, ok := readSSEEvent(scanner)
-	if !ok {
-		t.Fatal("expected live reset event")
-	}
-	if ev.Event != "reset" {
-		t.Fatalf("event=%q, want reset", ev.Event)
-	}
-	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
-		t.Fatalf("unmarshal force reset: %v", err)
-	}
-	if data["reason"] != "seq_too_old" {
-		t.Fatalf("reason=%v, want seq_too_old", data["reason"])
-	}
-	if data["seq"] != float64(6) {
-		t.Fatalf("seq=%v, want 6", data["seq"])
 	}
 }
 
