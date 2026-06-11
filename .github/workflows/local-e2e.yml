@@ -318,7 +318,7 @@ jobs:
           FUSE_STRICT_PREREQS: "1"
           RUN_GIT_WORKSPACE_SMOKE: "1"
           GIT_WORKSPACE_REPOS: "drive9=https://github.com/mem9-ai/drive9.git"
-          GIT_WORKSPACE_SCENARIOS: "agent_edit_add_commit"
+          GIT_WORKSPACE_SCENARIOS: "agent_edit_add_commit,fast_worktree"
           GIT_WORKSPACE_CLONE_TIMEOUT_S: "600"
           MOUNT_READY_TIMEOUT_S: "60"
         run: bash e2e/smoke-all.sh
@@ -348,15 +348,15 @@ jobs:
             echo
             echo "| Check | Outcome |"
             echo "| --- | --- |"
-            echo "| API smoke | ${{ steps.api-smoke.conclusion || 'skipped' }} |"
-            echo "| Existing-key smoke | ${{ steps.existing-key-smoke.conclusion || 'skipped' }} |"
-            echo "| CLI smoke | ${{ steps.cli-smoke.conclusion || 'skipped' }} |"
-            echo "| FUSE release gate | ${{ steps.fuse-smoke.conclusion || 'skipped' }} |"
-            echo "| FUSE performance compare | ${{ steps.fuse_performance_compare.conclusion || 'skipped' }} |"
-            echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.conclusion || 'skipped' }} |"
-            echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.conclusion || 'skipped' }} |"
-            echo "| Full smoke-all suite | ${{ steps.smoke-all.conclusion || 'skipped' }} |"
-            echo "| Git feature matrix | ${{ steps.git-feature-matrix.conclusion || 'skipped' }} |"
+            echo "| API smoke | ${{ steps.api-smoke.outcome || 'skipped' }} |"
+            echo "| Existing-key smoke | ${{ steps.existing-key-smoke.outcome || 'skipped' }} |"
+            echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
+            echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
+            echo "| FUSE performance compare | ${{ steps.fuse_performance_compare.outcome || 'skipped' }} |"
+            echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
+            echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
+            echo "| Full smoke-all suite | ${{ steps.smoke-all.outcome || 'skipped' }} |"
+            echo "| Git feature matrix | ${{ steps.git-feature-matrix.outcome || 'skipped' }} |"
             echo
             echo "FUSE concurrency stress: \`RUN_FUSE_CONCURRENCY_STRESS=${RUN_FUSE_CONCURRENCY_STRESS}\`"
             echo "FUSE concurrency stress required: \`FUSE_CONCURRENCY_STRESS_REQUIRED=${FUSE_CONCURRENCY_STRESS_REQUIRED}\`"
@@ -415,24 +415,24 @@ jobs:
             fi
           }
 
-          check_required "API smoke" "${{ steps.api-smoke.conclusion }}"
-          check_required "Existing-key smoke" "${{ steps.existing-key-smoke.conclusion }}"
-          check_required "CLI smoke" "${{ steps.cli-smoke.conclusion }}"
-          check_required "FUSE release gate" "${{ steps.fuse-smoke.conclusion }}"
+          check_required "API smoke" "${{ steps.api-smoke.outcome }}"
+          check_required "Existing-key smoke" "${{ steps.existing-key-smoke.outcome }}"
+          check_required "CLI smoke" "${{ steps.cli-smoke.outcome }}"
+          check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
           if [ "${COMPARE_FUSE_PERFORMANCE_METRICS}" = "1" ]; then
-            check_required "FUSE performance compare" "${{ steps.fuse_performance_compare.conclusion }}"
+            check_required "FUSE performance compare" "${{ steps.fuse_performance_compare.outcome }}"
           fi
           if [ "${FUSE_CONCURRENCY_STRESS_REQUIRED}" = "1" ]; then
-            check_required "FUSE concurrency stress" "${{ steps.fuse-concurrency-stress.conclusion }}"
+            check_required "FUSE concurrency stress" "${{ steps.fuse-concurrency-stress.outcome }}"
           fi
           if [ "${RUN_FUSE_POSIX_FSX}" = "1" ]; then
-            check_required "FUSE POSIX/fsx gate" "${{ steps.fuse-posix-fsx.conclusion }}"
+            check_required "FUSE POSIX/fsx gate" "${{ steps.fuse-posix-fsx.outcome }}"
           fi
           if [ "${RUN_E2E_SMOKE_ALL}" = "1" ]; then
-            check_required "Full smoke-all suite" "${{ steps.smoke-all.conclusion }}"
+            check_required "Full smoke-all suite" "${{ steps.smoke-all.outcome }}"
           fi
           if [ "${RUN_GIT_FEATURE_MATRIX}" = "1" ]; then
-            check_required "Git feature matrix" "${{ steps.git-feature-matrix.conclusion }}"
+            check_required "Git feature matrix" "${{ steps.git-feature-matrix.outcome }}"
           fi
 
           exit "$failed"
