@@ -742,6 +742,13 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		if _, err := pending.PutWithBaseRevAndMode(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
 			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
 		}
+		if fs != nil {
+			if fullEntry.Mode != 0 {
+				fs.markLayerFileMode(localPath, fullEntry.Mode)
+			} else {
+				fs.markLayerFile(localPath)
+			}
+		}
 		restoredUpserts[localPath] = struct{}{}
 	}
 	return nil

@@ -493,7 +493,11 @@ func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []
 		if err != nil {
 			return err
 		}
-		fs.markLayerFile(localPath)
+		if hasMode {
+			fs.markLayerFileMode(localPath, mode)
+		} else {
+			fs.markLayerFile(localPath)
+		}
 		return nil
 	}
 	req := client.FSLayerEntryRequest{
@@ -510,7 +514,11 @@ func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []
 	if err := fs.upsertLayerEntry(ctx, req, uint64(len(data))); err != nil {
 		return err
 	}
-	fs.markLayerFile(localPath)
+	if hasMode {
+		fs.markLayerFileMode(localPath, mode)
+	} else {
+		fs.markLayerFile(localPath)
+	}
 	return nil
 }
 

@@ -116,6 +116,9 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	if meta, ok := pending.GetMeta("/a.txt"); !ok || !meta.HasMode || meta.Mode != 0o600 {
 		t.Fatalf("a.txt pending mode = %+v, want 0600", meta)
 	}
+	if mode, ok := fs.layerFileMode("/a.txt"); !ok || mode != 0o600 {
+		t.Fatalf("a.txt layer file mode = (%#o, %t), want 0600 true", mode, ok)
+	}
 	if !fs.isLayerWhiteout("/old.txt") {
 		t.Fatal("old.txt whiteout missing")
 	}
@@ -210,10 +213,14 @@ func TestRestoreLayerEntriesReplaysSamePathUpsertOverwrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
 	if err := restoreLayerEntries(context.Background(), client.New(ts.URL, ""), &MountOptions{
 		LayerRef:   "layer-1",
 		RemoteRoot: "/repo",
-	}, shadow, pending, nil); err != nil {
+	}, shadow, pending, fs); err != nil {
 		t.Fatalf("restoreLayerEntries: %v", err)
 	}
 	got, err := shadow.ReadAll("/new.txt")
@@ -229,6 +236,9 @@ func TestRestoreLayerEntriesReplaysSamePathUpsertOverwrite(t *testing.T) {
 	}
 	if meta.Size != 4 || !meta.HasMode || meta.Mode != 0o600 {
 		t.Fatalf("pending meta = %+v, want size=4 mode=0600", meta)
+	}
+	if mode, ok := fs.layerFileMode("/new.txt"); !ok || mode != 0o600 {
+		t.Fatalf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
 	}
 }
 
@@ -617,6 +627,9 @@ func TestLayerChmodCoalescesPendingFileContent(t *testing.T) {
 	if !ok || !meta.HasMode || meta.Mode != 0o600 {
 		t.Fatalf("pending mode = %+v, want 0600", meta)
 	}
+	if mode, ok := fs.layerFileMode("/new.txt"); !ok || mode != 0o600 {
+		t.Fatalf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
+	}
 }
 
 func TestLayerChmodCoalescesShadowFileWithoutPendingMeta(t *testing.T) {
@@ -686,6 +699,9 @@ func TestLayerChmodCoalescesShadowFileWithoutPendingMeta(t *testing.T) {
 	meta, ok := pending.GetMeta("/new.txt")
 	if !ok || meta.Kind != PendingNew || !meta.HasMode || meta.Mode != 0o600 {
 		t.Fatalf("pending mode = %+v, want PendingNew 0600", meta)
+	}
+	if mode, ok := fs.layerFileMode("/new.txt"); !ok || mode != 0o600 {
+		t.Fatalf("layer file mode = (%#o, %t), want 0600 true", mode, ok)
 	}
 }
 
