@@ -17,6 +17,8 @@ import (
 
 var errCommitPostUpload = errors.New("commit post-upload step failed")
 
+const maxInlineLayerEntryBytes = 96 << 20
+
 // directPutThreshold returns the size limit below which commit queue workers
 // use direct PUT (WriteCtxConditionalWithRevision) instead of multipart
 // upload. Must match the server's inline_threshold — the server rejects
@@ -72,6 +74,7 @@ type CommitQueue struct {
 	maxPending   int
 	client       *client.Client
 	remoteRoot   string
+	layerRef     string
 	shadows      *ShadowStore
 	index        *PendingIndex
 	journal      *Journal
@@ -133,6 +136,24 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 
 func (cq *CommitQueue) SetPerfCounters(perf *fusePerfCounters) {
 	cq.perf = perf
+}
+
+func (cq *CommitQueue) SetLayerRef(layerRef string) {
+	if cq == nil {
+		return
+	}
+	cq.mu.Lock()
+	cq.layerRef = strings.TrimSpace(layerRef)
+	cq.mu.Unlock()
+}
+
+func (cq *CommitQueue) layerRefSnapshot() string {
+	if cq == nil {
+		return ""
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	return cq.layerRef
 }
 
 func (cq *CommitQueue) remotePath(localPath string) string {
@@ -648,7 +669,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cancel()
 
 		if err == nil {
-			if err := cq.onCommitSuccess(entry, committedRev); err == nil {
+			if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err == nil {
 				unlockPath()
 				return
 			} else {
@@ -711,13 +732,23 @@ func (cq *CommitQueue) commitNowPathLocked(ctx context.Context, entry *CommitEnt
 		}
 		return err
 	}
-	if err := cq.onCommitSuccess(entry, committedRev); err != nil {
+	if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err != nil {
 		if cq.perf != nil {
 			cq.perf.commitFailure.add(1)
 		}
 		return err
 	}
 	return nil
+}
+
+func committedRevisionForExpectedRevision(expectedRevision, committedRev int64) int64 {
+	if committedRev > 0 {
+		return committedRev
+	}
+	if revision, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+		return revision
+	}
+	return 0
 }
 
 // uploadEntry uploads entry data to the server. Returns (committedRev, error).
@@ -730,10 +761,14 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	}
 
 	expectedRevision := entry.BaseRev
-	if entry.Kind == PendingOverwrite && expectedRevision <= 0 {
+	layerRef := cq.layerRefSnapshot()
+	if entry.Kind == PendingOverwrite && expectedRevision <= 0 && layerRef == "" {
 		return 0, fmt.Errorf("missing base revision for overwrite: %s", entry.Path)
 	}
 	apiPath := cq.remotePath(entry.Path)
+	if layerRef != "" {
+		return cq.uploadLayerEntry(ctx, layerRef, entry, apiPath, expectedRevision)
+	}
 
 	// ShadowSpill entries: stream directly from shadow file to avoid loading
 	// multi-GiB files into memory. Uses io.SectionReader over the shadow fd.
@@ -777,6 +812,53 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	// Larger non-ShadowSpill files: multipart upload.
 	start := time.Now()
 	err = uploadBufferedRemoteFile(ctx, cq.client, apiPath, data, expectedRevision)
+	if cq.perf != nil {
+		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
+	}
+	return 0, err
+}
+
+func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, entry *CommitEntry, apiPath string, expectedRevision int64) (int64, error) {
+	if entry.Size > maxInlineLayerEntryBytes || entry.ShadowSpill {
+		fd, actualSize, err := cq.shadows.Open(entry.Path)
+		if err != nil {
+			return 0, fmt.Errorf("open shadow stream: %w", err)
+		}
+		defer func() { _ = fd.Close() }()
+		if entry.Size != actualSize {
+			return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
+		}
+		start := time.Now()
+		_, err = cq.client.UploadFSLayerFile(ctx, layerRef, apiPath, fd, actualSize, expectedRevision, entry.Mode, entry.HasMode)
+		if cq.perf != nil {
+			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(actualSize))
+		}
+		return 0, err
+	}
+	data, err := cq.shadows.ReadAll(entry.Path)
+	if err != nil {
+		return 0, fmt.Errorf("read shadow: %w", err)
+	}
+	if int64(len(data)) > maxInlineLayerEntryBytes {
+		return 0, fmt.Errorf("layer entry %s is %d bytes; inline layer uploads are limited to %d bytes", entry.Path, len(data), maxInlineLayerEntryBytes)
+	}
+	actualSize := int64(len(data))
+	if entry.Size != actualSize {
+		return 0, fmt.Errorf("layer entry %s size mismatch: metadata=%d actual=%d", entry.Path, entry.Size, actualSize)
+	}
+	req := client.FSLayerEntryRequest{
+		Path:         apiPath,
+		Op:           "upsert",
+		Kind:         "file",
+		BaseRevision: expectedRevision,
+		Content:      data,
+		SizeBytes:    actualSize,
+	}
+	if entry.HasMode {
+		req.Mode = entry.Mode & 0o777
+	}
+	start := time.Now()
+	_, err = cq.client.UpsertFSLayerEntry(ctx, layerRef, req)
 	if cq.perf != nil {
 		cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
 	}
@@ -843,8 +925,13 @@ func (cq *CommitQueue) rebuildQueuedIndexLocked() {
 	}
 }
 
-func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) error {
-	if shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
+func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, committedRev int64) error {
+	layerRef := cq.layerRefSnapshot()
+	if layerRef == "" {
+		committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
+	}
+
+	if layerRef == "" && shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var err error
 		mode := entry.Mode & posixPermissionModeMask
@@ -882,12 +969,20 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, committedRev int64) e
 		cq.OnSuccess(entry, committedRev)
 	}
 
-	// Clean up shadow and pending index.
-	if cq.shadows != nil {
+	// Clean up shadow and pending index. Layer mounts intentionally retain
+	// both until the layer is committed or rolled back: pendingIndex remains
+	// the local metadata source, and shadowStore remains the local data source
+	// for large files that are not admitted to readCache.
+	if cq.shadows != nil && cq.layerRefSnapshot() == "" {
 		cq.shadows.Remove(entry.Path)
 	}
-	if cq.index != nil {
+	if cq.index != nil && cq.layerRefSnapshot() == "" {
 		cq.index.Remove(entry.Path)
+	}
+	if cq.index != nil && cq.layerRefSnapshot() != "" {
+		if err := cq.index.MarkCommitted(entry.Path, committedRev); err != nil {
+			return err
+		}
 	}
 	if cq.OnCleanup != nil {
 		cq.OnCleanup(entry)
@@ -981,7 +1076,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	// Branch 1: idempotent — content already matches server.
 	if bytes.Equal(localData, serverData) {
 		log.Printf("commit queue: auto-resolved conflict for %s (idempotent, content matches server rev %d)", entry.Path, serverRev)
-		if err := cq.onCommitSuccess(entry, 0); err != nil {
+		if err := cq.onCommitSuccess(entry, serverRev, serverRev); err != nil {
 			cq.onCommitPostUploadFailure(entry, err)
 		}
 		return
@@ -1009,7 +1104,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	}
 
 	log.Printf("commit queue: auto-resolved conflict for %s via LWW (overwrote rev %d → new upload based on rev %d)", entry.Path, entry.BaseRev, serverRev)
-	if err := cq.onCommitSuccess(entry, 0); err != nil {
+	if err := cq.onCommitSuccess(entry, serverRev, 0); err != nil {
 		cq.onCommitPostUploadFailure(entry, err)
 	}
 }

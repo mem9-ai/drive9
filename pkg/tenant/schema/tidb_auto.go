@@ -3,8 +3,10 @@ package schema
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,8 +30,55 @@ const (
 
 // Reference of Auto Embedding in TiDB Cloud: https://docs.pingcap.com/ai/vector-search-auto-embedding-amazon-titan/
 const (
-	tidbAutoEmbeddingModel      = "tidbcloud_free/amazon/titan-embed-text-v2"
-	TiDBAutoEmbeddingDimensions = 1024
+	// DefaultTiDBAutoEmbeddingModel is the TiDB Cloud hosted free embedding
+	// model used when no environment override is configured.
+	DefaultTiDBAutoEmbeddingModel = "tidbcloud_free/amazon/titan-embed-text-v2"
+	// DefaultTiDBAutoEmbeddingDimensions is the vector dimension for the
+	// default TiDB Cloud hosted free embedding model.
+	DefaultTiDBAutoEmbeddingDimensions = 1024
+
+	// EnvTiDBAutoEmbeddingModel overrides the model used by TiDB EMBED_TEXT
+	// generated columns in database-managed auto-embedding mode.
+	EnvTiDBAutoEmbeddingModel = "DRIVE9_TIDB_AUTO_EMBEDDING_MODEL"
+	// EnvTiDBAutoEmbeddingDimensions overrides VECTOR(n) and the provider
+	// options for database-managed auto-embedding mode.
+	EnvTiDBAutoEmbeddingDimensions = "DRIVE9_TIDB_AUTO_EMBEDDING_DIMENSIONS"
+	EnvTiDBAutoEmbeddingAPIKey     = "DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY"
+	EnvTiDBAutoEmbeddingAPIBase    = "DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE"
+)
+
+// TiDBAutoEmbeddingConfig describes the model contract baked into TiDB
+// generated vector columns.
+type TiDBAutoEmbeddingConfig struct {
+	Model      string
+	Dimensions int
+}
+
+type TiDBAutoEmbeddingProfile struct {
+	Model       string
+	Dimensions  int
+	OptionsJSON string
+}
+
+type TiDBAutoEmbeddingProviderConfig struct {
+	Model   string
+	APIKey  string
+	APIBase string
+}
+
+type TiDBAutoEmbeddingProviderRequirements struct {
+	APIKeyRequired  bool
+	APIBaseRequired bool
+	APIBaseAllowed  bool
+}
+
+var (
+	tidbAutoEmbeddingModel       = DefaultTiDBAutoEmbeddingModel
+	TiDBAutoEmbeddingDimensions  = DefaultTiDBAutoEmbeddingDimensions
+	tidbAutoEmbeddingOptionsJSON = mustTiDBAutoEmbeddingOptionsJSON(TiDBAutoEmbeddingConfig{
+		Model:      DefaultTiDBAutoEmbeddingModel,
+		Dimensions: DefaultTiDBAutoEmbeddingDimensions,
+	})
 )
 
 // CurrentTiDBTenantSchemaVersion is derived automatically from the content of
@@ -50,6 +99,516 @@ const (
 // change and trigger a one-time re-Ensure for all tenants.
 var CurrentTiDBTenantSchemaVersion = currentTiDBTenantSchemaVersion(tidbAutoEmbeddingSchemaStatements())
 
+type tidbAutoEmbeddingRenderConfig struct {
+	model       string
+	dimensions  int
+	optionsJSON string
+}
+
+type tidbAutoEmbeddingProviderSetting struct {
+	apiKeyVariable      string
+	apiBaseVariable     string
+	clearAPIBaseIfEmpty bool
+}
+
+// ConfigureTiDBAutoEmbeddingFromEnv applies the process environment overrides
+// before tenant schema DDL, schema dump, and schema version checks run.
+func ConfigureTiDBAutoEmbeddingFromEnv() error {
+	cfg, err := TiDBAutoEmbeddingConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	return ConfigureTiDBAutoEmbedding(cfg)
+}
+
+// TiDBAutoEmbeddingConfigFromEnv returns the normalized TiDB auto-embedding
+// configuration from environment variables without mutating package globals.
+func TiDBAutoEmbeddingConfigFromEnv() (TiDBAutoEmbeddingConfig, error) {
+	cfg := TiDBAutoEmbeddingConfig{
+		Model: DefaultTiDBAutoEmbeddingModel,
+	}
+	if raw := strings.TrimSpace(os.Getenv(EnvTiDBAutoEmbeddingModel)); raw != "" {
+		cfg.Model = raw
+	}
+
+	if raw := strings.TrimSpace(os.Getenv(EnvTiDBAutoEmbeddingDimensions)); raw != "" {
+		dimensions, err := strconv.Atoi(raw)
+		if err != nil {
+			return TiDBAutoEmbeddingConfig{}, fmt.Errorf("%s must be an integer: %w", EnvTiDBAutoEmbeddingDimensions, err)
+		}
+		cfg.Dimensions = dimensions
+	}
+	return normalizeTiDBAutoEmbeddingConfig(cfg)
+}
+
+// ConfigureTiDBAutoEmbedding replaces the process-wide TiDB auto-embedding
+// contract and recomputes the derived tenant schema version.
+func ConfigureTiDBAutoEmbedding(cfg TiDBAutoEmbeddingConfig) error {
+	normalized, err := normalizeTiDBAutoEmbeddingConfig(cfg)
+	if err != nil {
+		return err
+	}
+	tidbAutoEmbeddingModel = normalized.Model
+	TiDBAutoEmbeddingDimensions = normalized.Dimensions
+	render, err := tidbAutoEmbeddingRenderConfigFor(normalized)
+	if err != nil {
+		return err
+	}
+	tidbAutoEmbeddingOptionsJSON = render.optionsJSON
+	CurrentTiDBTenantSchemaVersion = currentTiDBTenantSchemaVersion(tidbAutoEmbeddingSchemaStatements())
+	return nil
+}
+
+// CurrentTiDBAutoEmbeddingConfig returns the active process-wide TiDB
+// auto-embedding contract.
+func CurrentTiDBAutoEmbeddingConfig() TiDBAutoEmbeddingConfig {
+	return TiDBAutoEmbeddingConfig{
+		Model:      tidbAutoEmbeddingModel,
+		Dimensions: TiDBAutoEmbeddingDimensions,
+	}
+}
+
+func TiDBAutoEmbeddingProfileFromConfig(cfg TiDBAutoEmbeddingConfig) (TiDBAutoEmbeddingProfile, error) {
+	render, err := tidbAutoEmbeddingRenderConfigFor(cfg)
+	if err != nil {
+		return TiDBAutoEmbeddingProfile{}, err
+	}
+	return TiDBAutoEmbeddingProfile{
+		Model:       render.model,
+		Dimensions:  render.dimensions,
+		OptionsJSON: render.optionsJSON,
+	}, nil
+}
+
+func TiDBAutoEmbeddingConfigFromProfile(profile TiDBAutoEmbeddingProfile) (TiDBAutoEmbeddingConfig, error) {
+	render, err := tidbAutoEmbeddingRenderConfigForProfile(profile)
+	if err != nil {
+		return TiDBAutoEmbeddingConfig{}, err
+	}
+	return TiDBAutoEmbeddingConfig{
+		Model:      render.model,
+		Dimensions: render.dimensions,
+	}, nil
+}
+
+type tidbAutoEmbeddingModelSpec struct {
+	defaultDimensions int
+	allowedDimensions []int
+	minDimensions     int
+	maxDimensions     int
+	// dimensionOption is the provider-specific additional_json_options key
+	// used to request a non-default output dimension. It is intentionally not
+	// normalized to "dimensions": TiDB provider docs use different keys, for
+	// example Gemini uses output_dimensionality and Cohere uses output_dimension.
+	dimensionOption string
+	// baseOptions contains provider-required options that are not exposed as
+	// top-level env vars. TiDB Cloud hosted Cohere requires insert/search input
+	// type options for generated document columns and search expressions.
+	baseOptions map[string]any
+}
+
+func normalizeTiDBAutoEmbeddingConfig(cfg TiDBAutoEmbeddingConfig) (TiDBAutoEmbeddingConfig, error) {
+	cfg.Model = strings.TrimSpace(cfg.Model)
+	if cfg.Model == "" {
+		cfg.Model = DefaultTiDBAutoEmbeddingModel
+	}
+	if err := validateTiDBAutoEmbeddingModelName(cfg.Model); err != nil {
+		return TiDBAutoEmbeddingConfig{}, err
+	}
+	spec, ok := tidbAutoEmbeddingModelSpecFor(cfg.Model)
+	if !ok {
+		return TiDBAutoEmbeddingConfig{}, fmt.Errorf("%s %q is unsupported", EnvTiDBAutoEmbeddingModel, cfg.Model)
+	}
+	if cfg.Dimensions == 0 {
+		if spec.defaultDimensions == 0 {
+			return TiDBAutoEmbeddingConfig{}, fmt.Errorf("%s is required for %s=%q", EnvTiDBAutoEmbeddingDimensions, EnvTiDBAutoEmbeddingModel, cfg.Model)
+		}
+		cfg.Dimensions = spec.defaultDimensions
+	}
+	if cfg.Dimensions <= 0 {
+		return TiDBAutoEmbeddingConfig{}, fmt.Errorf("%s must be positive", EnvTiDBAutoEmbeddingDimensions)
+	}
+	if spec.dimensionOption == "" && spec.defaultDimensions > 0 && cfg.Dimensions != spec.defaultDimensions {
+		return TiDBAutoEmbeddingConfig{}, fmt.Errorf("%s=%d is unsupported for fixed-dimension %s=%q", EnvTiDBAutoEmbeddingDimensions, cfg.Dimensions, EnvTiDBAutoEmbeddingModel, cfg.Model)
+	}
+	if len(spec.allowedDimensions) > 0 {
+		for _, allowed := range spec.allowedDimensions {
+			if cfg.Dimensions == allowed {
+				return cfg, nil
+			}
+		}
+		return TiDBAutoEmbeddingConfig{}, fmt.Errorf("%s=%d is unsupported for %s=%q", EnvTiDBAutoEmbeddingDimensions, cfg.Dimensions, EnvTiDBAutoEmbeddingModel, cfg.Model)
+	}
+	if spec.minDimensions > 0 && cfg.Dimensions < spec.minDimensions {
+		return TiDBAutoEmbeddingConfig{}, fmt.Errorf("%s=%d is below the supported minimum %d for %s=%q", EnvTiDBAutoEmbeddingDimensions, cfg.Dimensions, spec.minDimensions, EnvTiDBAutoEmbeddingModel, cfg.Model)
+	}
+	if spec.maxDimensions > 0 && cfg.Dimensions > spec.maxDimensions {
+		return TiDBAutoEmbeddingConfig{}, fmt.Errorf("%s=%d is above the supported maximum %d for %s=%q", EnvTiDBAutoEmbeddingDimensions, cfg.Dimensions, spec.maxDimensions, EnvTiDBAutoEmbeddingModel, cfg.Model)
+	}
+	return cfg, nil
+}
+
+func validateTiDBAutoEmbeddingModelName(model string) error {
+	for _, r := range model {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' {
+			continue
+		}
+		switch r {
+		case '/', '-', '_', '.', ':':
+			continue
+		default:
+			return fmt.Errorf("%s contains unsupported character %q", EnvTiDBAutoEmbeddingModel, r)
+		}
+	}
+	return nil
+}
+
+// tidbAutoEmbeddingModelSpecFor tracks the model names, dimensions, and
+// additional_json_options keys documented by PingCAP TiDB Cloud Auto Embedding.
+//
+// Keep this list aligned with:
+//   - https://docs.pingcap.com/ai/vector-search-auto-embedding-overview/
+//   - https://docs.pingcap.com/ai/vector-search-auto-embedding-amazon-titan/
+//   - https://docs.pingcap.com/ai/vector-search-auto-embedding-cohere/
+//   - https://docs.pingcap.com/ai/vector-search-auto-embedding-openai/
+//   - https://docs.pingcap.com/ai/vector-search-auto-embedding-jina-ai/
+//   - https://docs.pingcap.com/ai/vector-search-auto-embedding-gemini/
+//   - https://docs.pingcap.com/ai/vector-search-auto-embedding-hugging-face/
+//   - https://docs.pingcap.com/ai/vector-search-auto-embedding-nvidia-nim/
+//
+// Unknown BYOK models are accepted for supported provider prefixes, but callers
+// must supply dimensions explicitly so the VECTOR(n) schema matches the model.
+func tidbAutoEmbeddingModelSpecFor(model string) (tidbAutoEmbeddingModelSpec, bool) {
+	switch model {
+	case DefaultTiDBAutoEmbeddingModel:
+		return tidbAutoEmbeddingModelSpec{defaultDimensions: DefaultTiDBAutoEmbeddingDimensions, allowedDimensions: []int{256, 512, 1024}, dimensionOption: "dimensions"}, true
+	case "tidbcloud_free/cohere/embed-english-v3", "tidbcloud_free/cohere/embed-multilingual-v3":
+		return tidbAutoEmbeddingModelSpec{
+			defaultDimensions: 1024,
+			baseOptions: map[string]any{
+				"input_type":        "search_document",
+				"input_type@search": "search_query",
+			},
+		}, true
+	case "cohere/embed-v4.0":
+		return tidbAutoEmbeddingModelSpec{
+			defaultDimensions: 1536,
+			allowedDimensions: []int{256, 512, 1024, 1536},
+			dimensionOption:   "output_dimension",
+		}, true
+	case "openai/text-embedding-3-small":
+		return tidbAutoEmbeddingModelSpec{
+			defaultDimensions: 1536,
+			minDimensions:     512,
+			maxDimensions:     1536,
+			dimensionOption:   "dimensions",
+		}, true
+	case "openai/text-embedding-3-large":
+		return tidbAutoEmbeddingModelSpec{
+			defaultDimensions: 3072,
+			minDimensions:     256,
+			maxDimensions:     3072,
+			dimensionOption:   "dimensions",
+		}, true
+	case "jina_ai/jina-embeddings-v4":
+		return tidbAutoEmbeddingModelSpec{defaultDimensions: 2048, dimensionOption: "dimensions"}, true
+	case "jina_ai/jina-embeddings-v3":
+		return tidbAutoEmbeddingModelSpec{defaultDimensions: 1024, dimensionOption: "dimensions"}, true
+	case "gemini/gemini-embedding-001":
+		return tidbAutoEmbeddingModelSpec{
+			defaultDimensions: 3072,
+			minDimensions:     128,
+			maxDimensions:     3072,
+			dimensionOption:   "output_dimensionality",
+		}, true
+	case "huggingface/intfloat/multilingual-e5-large", "huggingface/BAAI/bge-m3", "huggingface/Qwen/Qwen3-Embedding-0.6B":
+		return tidbAutoEmbeddingModelSpec{defaultDimensions: 1024}, true
+	case "huggingface/sentence-transformers/all-MiniLM-L6-v2":
+		return tidbAutoEmbeddingModelSpec{defaultDimensions: 384}, true
+	case "huggingface/sentence-transformers/all-mpnet-base-v2":
+		return tidbAutoEmbeddingModelSpec{defaultDimensions: 768}, true
+	case "nvidia_nim/baai/bge-m3":
+		return tidbAutoEmbeddingModelSpec{defaultDimensions: 1024}, true
+	case "nvidia/nv-embed-v1":
+		return tidbAutoEmbeddingModelSpec{defaultDimensions: 4096}, true
+	default:
+		if strings.HasPrefix(model, "openai/") {
+			return tidbAutoEmbeddingModelSpec{dimensionOption: "dimensions"}, true
+		}
+		if strings.HasPrefix(model, "azure_openai/") {
+			return tidbAutoEmbeddingModelSpec{dimensionOption: "dimensions"}, true
+		}
+		if strings.HasPrefix(model, "cohere/") {
+			return tidbAutoEmbeddingModelSpec{dimensionOption: "output_dimension"}, true
+		}
+		if strings.HasPrefix(model, "jina_ai/") {
+			return tidbAutoEmbeddingModelSpec{dimensionOption: "dimensions"}, true
+		}
+		if strings.HasPrefix(model, "gemini/") {
+			return tidbAutoEmbeddingModelSpec{dimensionOption: "output_dimensionality"}, true
+		}
+		if strings.HasPrefix(model, "huggingface/") {
+			return tidbAutoEmbeddingModelSpec{}, true
+		}
+		if strings.HasPrefix(model, "nvidia_nim/") || strings.HasPrefix(model, "nvidia/") {
+			return tidbAutoEmbeddingModelSpec{}, true
+		}
+		return tidbAutoEmbeddingModelSpec{}, false
+	}
+}
+
+func TiDBAutoEmbeddingProviderRequirementsForModel(model string) (TiDBAutoEmbeddingProviderRequirements, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = DefaultTiDBAutoEmbeddingModel
+	}
+	if _, ok := tidbAutoEmbeddingModelSpecFor(model); !ok {
+		return TiDBAutoEmbeddingProviderRequirements{}, fmt.Errorf("%s %q is unsupported", EnvTiDBAutoEmbeddingModel, model)
+	}
+	switch {
+	case strings.HasPrefix(model, "tidbcloud_free/"):
+		return TiDBAutoEmbeddingProviderRequirements{}, nil
+	case strings.HasPrefix(model, "azure_openai/"):
+		return TiDBAutoEmbeddingProviderRequirements{APIKeyRequired: true, APIBaseRequired: true, APIBaseAllowed: true}, nil
+	case strings.HasPrefix(model, "openai/"):
+		return TiDBAutoEmbeddingProviderRequirements{APIKeyRequired: true, APIBaseAllowed: true}, nil
+	case strings.HasPrefix(model, "cohere/"),
+		strings.HasPrefix(model, "jina_ai/"),
+		strings.HasPrefix(model, "gemini/"),
+		strings.HasPrefix(model, "huggingface/"),
+		strings.HasPrefix(model, "nvidia_nim/"),
+		strings.HasPrefix(model, "nvidia/"):
+		return TiDBAutoEmbeddingProviderRequirements{APIKeyRequired: true}, nil
+	default:
+		return TiDBAutoEmbeddingProviderRequirements{}, nil
+	}
+}
+
+func ValidateTiDBAutoEmbeddingProviderConfig(cfg TiDBAutoEmbeddingProviderConfig) error {
+	model := strings.TrimSpace(cfg.Model)
+	if model == "" {
+		model = DefaultTiDBAutoEmbeddingModel
+	}
+	requirements, err := TiDBAutoEmbeddingProviderRequirementsForModel(model)
+	if err != nil {
+		return err
+	}
+	apiKey := strings.TrimSpace(cfg.APIKey)
+	apiBase := strings.TrimSpace(cfg.APIBase)
+	if requirements.APIKeyRequired && apiKey == "" {
+		return fmt.Errorf("%s is required for %s=%q", EnvTiDBAutoEmbeddingAPIKey, EnvTiDBAutoEmbeddingModel, model)
+	}
+	if requirements.APIBaseRequired && apiBase == "" {
+		return fmt.Errorf("%s is required for %s=%q", EnvTiDBAutoEmbeddingAPIBase, EnvTiDBAutoEmbeddingModel, model)
+	}
+	if !requirements.APIBaseAllowed && apiBase != "" {
+		return fmt.Errorf("%s is unsupported for %s=%q", EnvTiDBAutoEmbeddingAPIBase, EnvTiDBAutoEmbeddingModel, model)
+	}
+	return nil
+}
+
+func ApplyTiDBAutoEmbeddingProviderConfig(ctx context.Context, db *sql.DB, cfg TiDBAutoEmbeddingProviderConfig) error {
+	model := strings.TrimSpace(cfg.Model)
+	if model == "" {
+		model = DefaultTiDBAutoEmbeddingModel
+	}
+	if err := ValidateTiDBAutoEmbeddingProviderConfig(TiDBAutoEmbeddingProviderConfig{
+		Model:   model,
+		APIKey:  cfg.APIKey,
+		APIBase: cfg.APIBase,
+	}); err != nil {
+		return err
+	}
+	setting, ok, err := tidbAutoEmbeddingProviderSettingForModel(model)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return nil
+	}
+	if setting.apiKeyVariable != "" {
+		if _, err := db.ExecContext(ctx, "SET @@GLOBAL."+setting.apiKeyVariable+" = ?", strings.TrimSpace(cfg.APIKey)); err != nil {
+			return fmt.Errorf("set TiDB auto-embedding API key for %s: %w", model, err)
+		}
+	}
+	apiBase := strings.TrimSpace(cfg.APIBase)
+	if setting.apiBaseVariable != "" && (apiBase != "" || setting.clearAPIBaseIfEmpty) {
+		if _, err := db.ExecContext(ctx, "SET @@GLOBAL."+setting.apiBaseVariable+" = ?", apiBase); err != nil {
+			return fmt.Errorf("set TiDB auto-embedding API base for %s: %w", model, err)
+		}
+	}
+	return nil
+}
+
+func tidbAutoEmbeddingProviderSettingForModel(model string) (tidbAutoEmbeddingProviderSetting, bool, error) {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		model = DefaultTiDBAutoEmbeddingModel
+	}
+	if _, ok := tidbAutoEmbeddingModelSpecFor(model); !ok {
+		return tidbAutoEmbeddingProviderSetting{}, false, fmt.Errorf("%s %q is unsupported", EnvTiDBAutoEmbeddingModel, model)
+	}
+	switch {
+	case strings.HasPrefix(model, "tidbcloud_free/"):
+		return tidbAutoEmbeddingProviderSetting{}, false, nil
+	case strings.HasPrefix(model, "azure_openai/"):
+		return tidbAutoEmbeddingProviderSetting{
+			apiKeyVariable:  "TIDB_EXP_EMBED_OPENAI_API_KEY",
+			apiBaseVariable: "TIDB_EXP_EMBED_OPENAI_API_BASE",
+		}, true, nil
+	case strings.HasPrefix(model, "openai/"):
+		return tidbAutoEmbeddingProviderSetting{
+			apiKeyVariable:      "TIDB_EXP_EMBED_OPENAI_API_KEY",
+			apiBaseVariable:     "TIDB_EXP_EMBED_OPENAI_API_BASE",
+			clearAPIBaseIfEmpty: true,
+		}, true, nil
+	case strings.HasPrefix(model, "cohere/"):
+		return tidbAutoEmbeddingProviderSetting{apiKeyVariable: "TIDB_EXP_EMBED_COHERE_API_KEY"}, true, nil
+	case strings.HasPrefix(model, "jina_ai/"):
+		return tidbAutoEmbeddingProviderSetting{apiKeyVariable: "TIDB_EXP_EMBED_JINA_AI_API_KEY"}, true, nil
+	case strings.HasPrefix(model, "gemini/"):
+		return tidbAutoEmbeddingProviderSetting{apiKeyVariable: "TIDB_EXP_EMBED_GEMINI_API_KEY"}, true, nil
+	case strings.HasPrefix(model, "huggingface/"):
+		return tidbAutoEmbeddingProviderSetting{apiKeyVariable: "TIDB_EXP_EMBED_HUGGINGFACE_API_KEY"}, true, nil
+	case strings.HasPrefix(model, "nvidia_nim/"), strings.HasPrefix(model, "nvidia/"):
+		return tidbAutoEmbeddingProviderSetting{apiKeyVariable: "TIDB_EXP_EMBED_NVIDIA_NIM_API_KEY"}, true, nil
+	default:
+		return tidbAutoEmbeddingProviderSetting{}, false, nil
+	}
+}
+
+func mustTiDBAutoEmbeddingOptionsJSON(cfg TiDBAutoEmbeddingConfig) string {
+	raw, err := tidbAutoEmbeddingOptionsJSONFor(cfg)
+	if err != nil {
+		panic(err)
+	}
+	return raw
+}
+
+func tidbAutoEmbeddingOptionsJSONFor(cfg TiDBAutoEmbeddingConfig) (string, error) {
+	spec, ok := tidbAutoEmbeddingModelSpecFor(cfg.Model)
+	if !ok {
+		return "", fmt.Errorf("%s %q is unsupported", EnvTiDBAutoEmbeddingModel, cfg.Model)
+	}
+	options := make(map[string]any, len(spec.baseOptions)+1)
+	for key, value := range spec.baseOptions {
+		options[key] = value
+	}
+	if spec.dimensionOption != "" {
+		options[spec.dimensionOption] = cfg.Dimensions
+	}
+	if len(options) == 0 {
+		return "{}", nil
+	}
+	raw, err := json.Marshal(options)
+	if err != nil {
+		return "", fmt.Errorf("encode TiDB auto-embedding options: %w", err)
+	}
+	return string(raw), nil
+}
+
+func tidbAutoEmbeddingRenderConfigFor(cfg TiDBAutoEmbeddingConfig) (tidbAutoEmbeddingRenderConfig, error) {
+	normalized, err := normalizeTiDBAutoEmbeddingConfig(cfg)
+	if err != nil {
+		return tidbAutoEmbeddingRenderConfig{}, err
+	}
+	optionsJSON, err := tidbAutoEmbeddingOptionsJSONFor(normalized)
+	if err != nil {
+		return tidbAutoEmbeddingRenderConfig{}, err
+	}
+	return tidbAutoEmbeddingRenderConfig{
+		model:       normalized.Model,
+		dimensions:  normalized.Dimensions,
+		optionsJSON: optionsJSON,
+	}, nil
+}
+
+func tidbAutoEmbeddingRenderConfigForProfile(profile TiDBAutoEmbeddingProfile) (tidbAutoEmbeddingRenderConfig, error) {
+	normalized, err := normalizeTiDBAutoEmbeddingConfig(TiDBAutoEmbeddingConfig{
+		Model:      profile.Model,
+		Dimensions: profile.Dimensions,
+	})
+	if err != nil {
+		return tidbAutoEmbeddingRenderConfig{}, err
+	}
+	optionsJSON := strings.TrimSpace(profile.OptionsJSON)
+	if optionsJSON == "" {
+		optionsJSON, err = tidbAutoEmbeddingOptionsJSONFor(normalized)
+		if err != nil {
+			return tidbAutoEmbeddingRenderConfig{}, err
+		}
+	} else {
+		var options map[string]any
+		if err := json.Unmarshal([]byte(optionsJSON), &options); err != nil {
+			return tidbAutoEmbeddingRenderConfig{}, fmt.Errorf("decode TiDB auto-embedding options_json: %w", err)
+		}
+		if err := validateTiDBAutoEmbeddingProfileOptions(normalized, options); err != nil {
+			return tidbAutoEmbeddingRenderConfig{}, err
+		}
+		canonical, err := json.Marshal(options)
+		if err != nil {
+			return tidbAutoEmbeddingRenderConfig{}, fmt.Errorf("encode TiDB auto-embedding options_json: %w", err)
+		}
+		optionsJSON = string(canonical)
+	}
+	return tidbAutoEmbeddingRenderConfig{
+		model:       normalized.Model,
+		dimensions:  normalized.Dimensions,
+		optionsJSON: optionsJSON,
+	}, nil
+}
+
+func validateTiDBAutoEmbeddingProfileOptions(cfg TiDBAutoEmbeddingConfig, options map[string]any) error {
+	expectedJSON, err := tidbAutoEmbeddingOptionsJSONFor(cfg)
+	if err != nil {
+		return err
+	}
+	var expected map[string]any
+	if err := json.Unmarshal([]byte(expectedJSON), &expected); err != nil {
+		return fmt.Errorf("decode expected TiDB auto-embedding options_json: %w", err)
+	}
+	for key, want := range expected {
+		got, ok := options[key]
+		if !ok {
+			return fmt.Errorf("TiDB auto-embedding options_json missing required key %q for %s=%q", key, EnvTiDBAutoEmbeddingModel, cfg.Model)
+		}
+		if !equalJSONValue(got, want) {
+			return fmt.Errorf("TiDB auto-embedding options_json key %q does not match %s=%q and %s=%d", key, EnvTiDBAutoEmbeddingModel, cfg.Model, EnvTiDBAutoEmbeddingDimensions, cfg.Dimensions)
+		}
+	}
+	return nil
+}
+
+func equalJSONValue(a, b any) bool {
+	aRaw, aErr := json.Marshal(a)
+	bRaw, bErr := json.Marshal(b)
+	return aErr == nil && bErr == nil && string(aRaw) == string(bRaw)
+}
+
+func currentTiDBAutoEmbeddingRenderConfig() tidbAutoEmbeddingRenderConfig {
+	return tidbAutoEmbeddingRenderConfig{
+		model:       tidbAutoEmbeddingModel,
+		dimensions:  TiDBAutoEmbeddingDimensions,
+		optionsJSON: tidbAutoEmbeddingOptionsJSON,
+	}
+}
+
+func TiDBTenantSchemaVersionForAutoEmbeddingConfig(cfg TiDBAutoEmbeddingConfig) (int, error) {
+	render, err := tidbAutoEmbeddingRenderConfigFor(cfg)
+	if err != nil {
+		return 0, err
+	}
+	return currentTiDBTenantSchemaVersion(tidbAutoEmbeddingSchemaStatementsForConfig(render)), nil
+}
+
+func TiDBTenantSchemaVersionForAutoEmbeddingProfile(profile TiDBAutoEmbeddingProfile) (int, error) {
+	render, err := tidbAutoEmbeddingRenderConfigForProfile(profile)
+	if err != nil {
+		return 0, err
+	}
+	return currentTiDBTenantSchemaVersion(tidbAutoEmbeddingSchemaStatementsForConfig(render)), nil
+}
+
 func currentTiDBTenantSchemaVersion(stmts []string) int {
 	// Hash only statements that are parsed into the schema spec (CREATE TABLE,
 	// CREATE [UNIQUE] INDEX, ALTER TABLE ... ADD ... INDEX).  Statements that
@@ -69,8 +628,6 @@ func currentTiDBTenantSchemaVersion(stmts []string) int {
 	}
 	return schemaspec.CRC32Version(specStmts)
 }
-
-var tidbAutoEmbeddingOptionsJSON = fmt.Sprintf(`{"dimensions":%d}`, TiDBAutoEmbeddingDimensions)
 
 type tidbColumnMeta struct {
 	columnType           string
@@ -157,6 +714,12 @@ func (e *tidbSchemaDiffError) Error() string {
 //
 // and update tidb_cloud_starter with the exported SQL.
 func tidbAutoEmbeddingSchemaStatements() []string {
+	return tidbAutoEmbeddingSchemaStatementsForConfig(currentTiDBAutoEmbeddingRenderConfig())
+}
+
+func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfig) []string {
+	modelLiteral := tidbSQLStringLiteral(cfg.model)
+	optionsLiteral := tidbSQLStringLiteral(cfg.optionsJSON)
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
@@ -202,16 +765,16 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 			inode_id                           VARCHAR(64) PRIMARY KEY,
 			content_text                       LONGTEXT,
 			description                        LONGTEXT,
-			embedding                          VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
-				'` + tidbAutoEmbeddingModel + `',
+			embedding                          VECTOR(` + strconv.Itoa(cfg.dimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
+				` + modelLiteral + `,
 				content_text,
-				'` + tidbAutoEmbeddingOptionsJSON + `'
+				` + optionsLiteral + `
 			)) STORED,
 			embedding_revision                 BIGINT,
-			description_embedding              VECTOR(` + strconv.Itoa(TiDBAutoEmbeddingDimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
-				'` + tidbAutoEmbeddingModel + `',
+			description_embedding              VECTOR(` + strconv.Itoa(cfg.dimensions) + `) GENERATED ALWAYS AS (EMBED_TEXT(
+				` + modelLiteral + `,
 				description,
-				'` + tidbAutoEmbeddingOptionsJSON + `'
+				` + optionsLiteral + `
 			)) STORED,
 			description_embedding_revision     BIGINT
 		)`,
@@ -319,9 +882,22 @@ func tidbAutoEmbeddingSchemaStatements() []string {
 		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
 	}
 	stmts = append(stmts, GitWorkspaceTiDBSchemaStatements()...)
+	stmts = append(stmts, FSLayerTiDBSchemaStatements()...)
 	stmts = append(stmts, JournalTiDBSchemaStatements()...)
 	stmts = append(stmts, VaultTiDBSchemaStatements()...)
 	return stmts
+}
+
+func tidbSQLStringLiteral(s string) string {
+	escaped := strings.NewReplacer(
+		`\`, `\\`,
+		`'`, `''`,
+		"\x00", `\0`,
+		"\n", `\n`,
+		"\r", `\r`,
+		"\t", `\t`,
+	).Replace(s)
+	return "'" + escaped + "'"
 }
 
 // DetectTiDBEmbeddingMode inspects the TiDB embedding contract and reports
@@ -388,6 +964,26 @@ func DetectTiDBEmbeddingMode(db *sql.DB) (TiDBEmbeddingMode, error) {
 // ValidateTiDBSchemaForMode validates that an already-open TiDB connection
 // matches exactly one supported dat9 embedding contract for the requested mode.
 func ValidateTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode) error {
+	return validateTiDBSchemaForModeWithConfig(ctx, db, mode, currentTiDBAutoEmbeddingRenderConfig())
+}
+
+func ValidateTiDBSchemaForAutoEmbeddingConfig(ctx context.Context, db *sql.DB, cfg TiDBAutoEmbeddingConfig) error {
+	render, err := tidbAutoEmbeddingRenderConfigFor(cfg)
+	if err != nil {
+		return err
+	}
+	return validateTiDBSchemaForModeWithConfig(ctx, db, TiDBEmbeddingModeAuto, render)
+}
+
+func ValidateTiDBSchemaForAutoEmbeddingProfile(ctx context.Context, db *sql.DB, profile TiDBAutoEmbeddingProfile) error {
+	render, err := tidbAutoEmbeddingRenderConfigForProfile(profile)
+	if err != nil {
+		return err
+	}
+	return validateTiDBSchemaForModeWithConfig(ctx, db, TiDBEmbeddingModeAuto, render)
+}
+
+func validateTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) error {
 	start := time.Now()
 	logger.Info(ctx, "tenant_tidb_schema_validate_started",
 		zap.String("mode", string(mode)))
@@ -400,7 +996,7 @@ func ValidateTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbeddi
 	if err := validateTiDBSchemaMode(mode); err != nil {
 		return err
 	}
-	diffs, err := diffTiDBSchemaForMode(ctx, db, mode)
+	diffs, err := diffTiDBSchemaForModeWithConfig(ctx, db, mode, cfg)
 	if err != nil {
 		return err
 	}
@@ -422,6 +1018,26 @@ func ValidateTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbeddi
 // EnsureTiDBSchemaForMode repairs known launch-schema drift that can be fixed
 // in place, then validates the full TiDB schema contract for the requested mode.
 func EnsureTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode) error {
+	return ensureTiDBSchemaForModeWithConfig(ctx, db, mode, currentTiDBAutoEmbeddingRenderConfig())
+}
+
+func EnsureTiDBSchemaForAutoEmbeddingConfig(ctx context.Context, db *sql.DB, cfg TiDBAutoEmbeddingConfig) error {
+	render, err := tidbAutoEmbeddingRenderConfigFor(cfg)
+	if err != nil {
+		return err
+	}
+	return ensureTiDBSchemaForModeWithConfig(ctx, db, TiDBEmbeddingModeAuto, render)
+}
+
+func EnsureTiDBSchemaForAutoEmbeddingProfile(ctx context.Context, db *sql.DB, profile TiDBAutoEmbeddingProfile) error {
+	render, err := tidbAutoEmbeddingRenderConfigForProfile(profile)
+	if err != nil {
+		return err
+	}
+	return ensureTiDBSchemaForModeWithConfig(ctx, db, TiDBEmbeddingModeAuto, render)
+}
+
+func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) error {
 	start := time.Now()
 	attemptedPasses := 0
 	logger.Info(ctx, "tenant_tidb_schema_ensure_started",
@@ -439,7 +1055,7 @@ func EnsureTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbedding
 	for i := 0; i < maxRepairPasses; i++ {
 		attemptedPasses = i + 1
 		passStart := time.Now()
-		diffs, err := diffTiDBSchemaForMode(ctx, db, mode)
+		diffs, err := diffTiDBSchemaForModeWithConfig(ctx, db, mode, cfg)
 		if err != nil {
 			return err
 		}
@@ -478,7 +1094,7 @@ func EnsureTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbedding
 			return err
 		}
 	}
-	if err := ValidateTiDBSchemaForMode(ctx, db, mode); err != nil {
+	if err := validateTiDBSchemaForModeWithConfig(ctx, db, mode, cfg); err != nil {
 		return err
 	}
 	if err := BackfillStorageRefHashes(ctx, db); err != nil {
@@ -515,9 +1131,25 @@ func BackfillStorageRefHashes(ctx context.Context, db *sql.DB) error {
 }
 
 func initTiDBAutoEmbeddingSchema(ctx context.Context, dsn string) error {
+	return initTiDBAutoEmbeddingSchemaWithConfig(ctx, dsn, CurrentTiDBAutoEmbeddingConfig())
+}
+
+func initTiDBAutoEmbeddingSchemaWithConfig(ctx context.Context, dsn string, cfg TiDBAutoEmbeddingConfig) error {
+	profile, err := TiDBAutoEmbeddingProfileFromConfig(cfg)
+	if err != nil {
+		return err
+	}
+	return initTiDBAutoEmbeddingSchemaWithProfile(ctx, dsn, profile)
+}
+
+func initTiDBAutoEmbeddingSchemaWithProfile(ctx context.Context, dsn string, profile TiDBAutoEmbeddingProfile) error {
 	start := time.Now()
 	logger.Info(ctx, "tenant_tidb_schema_init_started",
 		zap.String("mode", string(TiDBEmbeddingModeAuto)))
+	render, err := tidbAutoEmbeddingRenderConfigForProfile(profile)
+	if err != nil {
+		return err
+	}
 	db, err := OpenTiDBSchemaDB(ctx, dsn)
 	if err != nil {
 		return err
@@ -526,10 +1158,10 @@ func initTiDBAutoEmbeddingSchema(ctx context.Context, dsn string) error {
 	if !IsTiDBCluster(ctx, db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
-	if err := ExecSchemaStatementsContext(ctx, db, tidbAutoEmbeddingSchemaStatements()); err != nil {
+	if err := ExecSchemaStatementsContext(ctx, db, tidbAutoEmbeddingSchemaStatementsForConfig(render)); err != nil {
 		return err
 	}
-	if err := ValidateTiDBSchemaForMode(ctx, db, TiDBEmbeddingModeAuto); err != nil {
+	if err := ValidateTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile); err != nil {
 		return err
 	}
 	logger.Info(ctx, "tenant_tidb_schema_init_finished",
@@ -548,6 +1180,24 @@ func ValidateTiDBSchemaForModeDSN(ctx context.Context, dsn string, mode TiDBEmbe
 	return ValidateTiDBSchemaForMode(ctx, db, mode)
 }
 
+func ValidateTiDBSchemaForAutoEmbeddingConfigDSN(ctx context.Context, dsn string, cfg TiDBAutoEmbeddingConfig) error {
+	db, err := OpenTiDBSchemaDB(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closeTiDBSchemaDB(db) }()
+	return ValidateTiDBSchemaForAutoEmbeddingConfig(ctx, db, cfg)
+}
+
+func ValidateTiDBSchemaForAutoEmbeddingProfileDSN(ctx context.Context, dsn string, profile TiDBAutoEmbeddingProfile) error {
+	db, err := OpenTiDBSchemaDB(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closeTiDBSchemaDB(db) }()
+	return ValidateTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile)
+}
+
 // EnsureTiDBSchemaForModeDSN opens a DSN, repairs known launch-schema drift,
 // validates the schema contract, and closes.
 func EnsureTiDBSchemaForModeDSN(ctx context.Context, dsn string, mode TiDBEmbeddingMode) error {
@@ -557,6 +1207,24 @@ func EnsureTiDBSchemaForModeDSN(ctx context.Context, dsn string, mode TiDBEmbedd
 	}
 	defer func() { _ = closeTiDBSchemaDB(db) }()
 	return EnsureTiDBSchemaForMode(ctx, db, mode)
+}
+
+func EnsureTiDBSchemaForAutoEmbeddingConfigDSN(ctx context.Context, dsn string, cfg TiDBAutoEmbeddingConfig) error {
+	db, err := OpenTiDBSchemaDB(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closeTiDBSchemaDB(db) }()
+	return EnsureTiDBSchemaForAutoEmbeddingConfig(ctx, db, cfg)
+}
+
+func EnsureTiDBSchemaForAutoEmbeddingProfileDSN(ctx context.Context, dsn string, profile TiDBAutoEmbeddingProfile) error {
+	db, err := OpenTiDBSchemaDB(ctx, dsn)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = closeTiDBSchemaDB(db) }()
+	return EnsureTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile)
 }
 
 func OpenTiDBSchemaDB(ctx context.Context, dsn string) (*sql.DB, error) {
@@ -759,9 +1427,9 @@ func normalizeColumnTypeForCompare(s string) string {
 	}
 }
 
-func diffTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode) ([]tidbSchemaDiff, error) {
+func diffTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) ([]tidbSchemaDiff, error) {
 	start := time.Now()
-	spec, err := tidbSchemaSpecForMode(mode)
+	spec, err := tidbSchemaSpecForModeWithConfig(mode, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -773,7 +1441,7 @@ func diffTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMo
 		}
 		diffs = append(diffs, tableDiffs...)
 	}
-	legacyFilesDiffs, err := diffLegacyTiDBFilesTableIfExists(ctx, db, mode)
+	legacyFilesDiffs, err := diffLegacyTiDBFilesTableIfExistsWithConfig(ctx, db, mode, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -787,7 +1455,11 @@ func diffTiDBSchemaForMode(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMo
 }
 
 func diffLegacyTiDBFilesTableIfExists(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode) ([]tidbSchemaDiff, error) {
-	spec, err := legacyTiDBFilesTableSpecForMode(mode)
+	return diffLegacyTiDBFilesTableIfExistsWithConfig(ctx, db, mode, currentTiDBAutoEmbeddingRenderConfig())
+}
+
+func diffLegacyTiDBFilesTableIfExistsWithConfig(ctx context.Context, db *sql.DB, mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) ([]tidbSchemaDiff, error) {
+	spec, err := legacyTiDBFilesTableSpecForModeWithConfig(mode, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -855,23 +1527,42 @@ func diffTiDBTable(ctx context.Context, db *sql.DB, table tidbTableSpec) ([]tidb
 }
 
 func loadObservedTiDBIndexes(ctx context.Context, db *sql.DB, tableName, createStmt string) (map[string]struct{}, bool) {
-	indexNames, err := loadTiDBIndexNames(ctx, db, tableName)
-	if err == nil {
-		return indexNames, true
+	indexNames, statErr := loadTiDBIndexNames(ctx, db, tableName)
+	if statErr != nil {
+		logger.Warn(ctx, "tenant_tidb_schema_load_index_metadata_failed",
+			zap.String("table", tableName),
+			zap.Error(statErr))
 	}
-	logger.Warn(ctx, "tenant_tidb_schema_load_index_metadata_failed",
-		zap.String("table", tableName),
-		zap.Error(err))
-	observedIndexes, ok := parseObservedTiDBIndexes(createStmt)
-	if ok {
-		return observedIndexes, true
+
+	merged := make(map[string]struct{})
+	if statErr == nil {
+		for name := range indexNames {
+			merged[name] = struct{}{}
+		}
 	}
-	logger.Warn(ctx, "tenant_tidb_schema_parse_show_create_indexes_failed",
-		zap.String("table", tableName))
-	return nil, false
+
+	if observedIndexes, ok := parseObservedTiDBIndexes(createStmt); ok {
+		for name := range observedIndexes {
+			if _, exists := merged[name]; !exists {
+				merged[name] = struct{}{}
+			}
+		}
+	} else if statErr != nil {
+		logger.Warn(ctx, "tenant_tidb_schema_parse_show_create_indexes_failed",
+			zap.String("table", tableName))
+	}
+
+	if len(merged) == 0 && statErr != nil {
+		return nil, false
+	}
+	return merged, true
 }
 
 func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
+	return tidbSchemaSpecForModeWithConfig(mode, currentTiDBAutoEmbeddingRenderConfig())
+}
+
+func tidbSchemaSpecForModeWithConfig(mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) (tidbSchemaSpec, error) {
 	// For app mode, use only the base (required) statements. The optional
 	// indexes (FULLTEXT, VECTOR with ADD_COLUMNAR_REPLICA_ON_DEMAND) may be
 	// silently skipped on TiDB versions that do not support that syntax, so
@@ -881,7 +1572,7 @@ func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
 		stmts = tidbAppEmbeddingBaseSchemaStatements()
 	} else {
 		var err error
-		stmts, err = InitTiDBTenantSchemaStatementsForMode(mode)
+		stmts, err = initTiDBTenantSchemaStatementsForModeWithConfig(mode, cfg)
 		if err != nil {
 			return tidbSchemaSpec{}, err
 		}
@@ -897,8 +1588,8 @@ func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
 		if mode == TiDBEmbeddingModeAuto {
 			if col, ok := spec.tables[i].columns["description_embedding"]; ok {
 				col.addSQL = fmt.Sprintf(
-					"ALTER TABLE semantic ADD COLUMN description_embedding VECTOR(%d) GENERATED ALWAYS AS (EMBED_TEXT('%s', description, '%s')) STORED",
-					TiDBAutoEmbeddingDimensions, tidbAutoEmbeddingModel, tidbAutoEmbeddingOptionsJSON,
+					"ALTER TABLE semantic ADD COLUMN description_embedding VECTOR(%d) GENERATED ALWAYS AS (EMBED_TEXT(%s, description, %s)) STORED",
+					cfg.dimensions, tidbSQLStringLiteral(cfg.model), tidbSQLStringLiteral(cfg.optionsJSON),
 				)
 				spec.tables[i].columns["description_embedding"] = col
 			}
@@ -906,7 +1597,7 @@ func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
 		spec.tables[i].validate = func(meta tidbTableMeta) []tidbSchemaDiff {
 			switch mode {
 			case TiDBEmbeddingModeAuto:
-				return validateTiDBAutoEmbeddingDiffs(meta)
+				return validateTiDBAutoEmbeddingDiffsWithConfig(meta, cfg)
 			case TiDBEmbeddingModeApp:
 				return validateTiDBAppEmbeddingDiffs(meta)
 			default:
@@ -919,7 +1610,11 @@ func tidbSchemaSpecForMode(mode TiDBEmbeddingMode) (tidbSchemaSpec, error) {
 }
 
 func legacyTiDBFilesTableSpecForMode(mode TiDBEmbeddingMode) (tidbTableSpec, error) {
-	stmts, err := legacyTiDBFilesSchemaStatementsForMode(mode)
+	return legacyTiDBFilesTableSpecForModeWithConfig(mode, currentTiDBAutoEmbeddingRenderConfig())
+}
+
+func legacyTiDBFilesTableSpecForModeWithConfig(mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) (tidbTableSpec, error) {
+	stmts, err := legacyTiDBFilesSchemaStatementsForModeWithConfig(mode, cfg)
 	if err != nil {
 		return tidbTableSpec{}, err
 	}
@@ -934,7 +1629,7 @@ func legacyTiDBFilesTableSpecForMode(mode TiDBEmbeddingMode) (tidbTableSpec, err
 		table.validate = func(meta tidbTableMeta) []tidbSchemaDiff {
 			switch mode {
 			case TiDBEmbeddingModeAuto:
-				return validateTiDBAutoEmbeddingFilesDiffs(meta)
+				return validateTiDBAutoEmbeddingFilesDiffsWithConfig(meta, cfg)
 			case TiDBEmbeddingModeApp:
 				return validateTiDBAppEmbeddingFilesDiffs(meta)
 			default:
@@ -946,14 +1641,16 @@ func legacyTiDBFilesTableSpecForMode(mode TiDBEmbeddingMode) (tidbTableSpec, err
 	return tidbTableSpec{}, errors.New("legacy files table spec missing")
 }
 
-func legacyTiDBFilesSchemaStatementsForMode(mode TiDBEmbeddingMode) ([]string, error) {
-	embeddingColumn := fmt.Sprintf("VECTOR(%d)", TiDBAutoEmbeddingDimensions)
-	descriptionEmbeddingColumn := fmt.Sprintf("VECTOR(%d)", TiDBAutoEmbeddingDimensions)
+func legacyTiDBFilesSchemaStatementsForModeWithConfig(mode TiDBEmbeddingMode, cfg tidbAutoEmbeddingRenderConfig) ([]string, error) {
+	embeddingColumn := fmt.Sprintf("VECTOR(%d)", cfg.dimensions)
+	descriptionEmbeddingColumn := fmt.Sprintf("VECTOR(%d)", cfg.dimensions)
 	if mode == TiDBEmbeddingModeAuto {
-		embeddingColumn = fmt.Sprintf("VECTOR(%d) GENERATED ALWAYS AS (EMBED_TEXT('%s', content_text, '%s')) STORED",
-			TiDBAutoEmbeddingDimensions, tidbAutoEmbeddingModel, tidbAutoEmbeddingOptionsJSON)
-		descriptionEmbeddingColumn = fmt.Sprintf("VECTOR(%d) GENERATED ALWAYS AS (EMBED_TEXT('%s', description, '%s')) STORED",
-			TiDBAutoEmbeddingDimensions, tidbAutoEmbeddingModel, tidbAutoEmbeddingOptionsJSON)
+		modelLiteral := tidbSQLStringLiteral(cfg.model)
+		optionsLiteral := tidbSQLStringLiteral(cfg.optionsJSON)
+		embeddingColumn = fmt.Sprintf("VECTOR(%d) GENERATED ALWAYS AS (EMBED_TEXT(%s, content_text, %s)) STORED",
+			cfg.dimensions, modelLiteral, optionsLiteral)
+		descriptionEmbeddingColumn = fmt.Sprintf("VECTOR(%d) GENERATED ALWAYS AS (EMBED_TEXT(%s, description, %s)) STORED",
+			cfg.dimensions, modelLiteral, optionsLiteral)
 	} else if mode != TiDBEmbeddingModeApp {
 		return nil, fmt.Errorf("unsupported TiDB embedding mode %q", mode)
 	}
@@ -1108,6 +1805,24 @@ func parseInlineIndexDefinition(tableName, def string) (indexName, createSQL str
 	}
 	if name, cols, ok := parseConstraintUniqueIndexDefinition(def); ok {
 		return name, fmt.Sprintf("CREATE UNIQUE INDEX %s ON %s%s", name, tableName, cols), true
+	}
+	if strings.HasPrefix(normalized, "fulltext index ") || strings.HasPrefix(normalized, "fulltext key ") {
+		prefix := "FULLTEXT INDEX"
+		if strings.HasPrefix(normalized, "fulltext key ") {
+			prefix = "FULLTEXT KEY"
+		}
+		name, cols := parseIndexNameAndColumns(def, prefix)
+		if name == "" || cols == "" {
+			return "", "", false
+		}
+		return name, fmt.Sprintf("CREATE FULLTEXT INDEX %s ON %s%s", name, tableName, cols), true
+	}
+	if strings.HasPrefix(normalized, "vector index ") {
+		name, cols := parseIndexNameAndColumns(def, "VECTOR INDEX")
+		if name == "" || cols == "" {
+			return "", "", false
+		}
+		return name, fmt.Sprintf("CREATE VECTOR INDEX %s ON %s%s", name, tableName, cols), true
 	}
 	if strings.HasPrefix(normalized, "index ") || strings.HasPrefix(normalized, "key ") {
 		prefix := "INDEX"
@@ -1327,6 +2042,12 @@ func parseCreateIndexStatement(stmt string) (tableName, indexName, createSQL str
 	switch {
 	case strings.HasPrefix(normalized, "create unique index "):
 		prefix = "create unique index "
+	case strings.HasPrefix(normalized, "create fulltext index "):
+		prefix = "create fulltext index "
+	case strings.HasPrefix(normalized, "create vector index "):
+		prefix = "create vector index "
+	case strings.HasPrefix(normalized, "create spatial index "):
+		prefix = "create spatial index "
 	case strings.HasPrefix(normalized, "create index "):
 		prefix = "create index "
 	default:
@@ -1390,10 +2111,22 @@ func parseAlterTableAddIndexStatement(stmt string) (tableName, indexName, create
 		if len(nameFields) == 0 {
 			return "", "", "", false
 		}
-		return table, strings.ToLower(nameFields[0]), strings.TrimSpace(stmt), true
+		createSQL := strings.TrimSpace(stmt)
+		if marker == " add fulltext index " || marker == " add vector index " {
+			createSQL = stripColumnarReplicaOnDemand(createSQL)
+		}
+		return table, strings.ToLower(nameFields[0]), createSQL, true
 	}
 
 	return "", "", "", false
+}
+
+func stripColumnarReplicaOnDemand(stmt string) string {
+	idx := strings.LastIndex(strings.ToLower(stmt), "add_columnar_replica_on_demand")
+	if idx < 0 {
+		return stmt
+	}
+	return strings.TrimSpace(stmt[:idx])
 }
 
 func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt string) []tidbSchemaDiff {
@@ -1501,6 +2234,26 @@ func parseObservedTiDBIndexes(createStmt string) (map[string]struct{}, bool) {
 			}
 		case strings.HasPrefix(normalized, "unique index "):
 			if name, _ := parseIndexNameAndColumns(def, "UNIQUE INDEX"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "fulltext index "):
+			if name, _ := parseIndexNameAndColumns(def, "FULLTEXT INDEX"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "fulltext key "):
+			if name, _ := parseIndexNameAndColumns(def, "FULLTEXT KEY"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "vector index "):
+			if name, _ := parseIndexNameAndColumns(def, "VECTOR INDEX"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "spatial index "):
+			if name, _ := parseIndexNameAndColumns(def, "SPATIAL INDEX"); name != "" {
+				observed[name] = struct{}{}
+			}
+		case strings.HasPrefix(normalized, "spatial key "):
+			if name, _ := parseIndexNameAndColumns(def, "SPATIAL KEY"); name != "" {
 				observed[name] = struct{}{}
 			}
 		case strings.HasPrefix(normalized, "index "):
@@ -1664,10 +2417,11 @@ func isSafeAddColumnRepairSQL(sqlText string) bool {
 
 func isSafeAddIndexRepairSQL(sqlText string) bool {
 	normalized := normalizeSQLFragment(sqlText)
-	if strings.HasPrefix(normalized, "create index ") {
-		return true
-	}
-	if strings.HasPrefix(normalized, "create unique index ") {
+	if strings.HasPrefix(normalized, "create index ") ||
+		strings.HasPrefix(normalized, "create unique index ") ||
+		strings.HasPrefix(normalized, "create fulltext index ") ||
+		strings.HasPrefix(normalized, "create vector index ") ||
+		strings.HasPrefix(normalized, "create spatial index ") {
 		return true
 	}
 	if strings.HasPrefix(normalized, "alter table ") {
@@ -1911,14 +2665,18 @@ func isIgnorableTiDBSchemaError(err error) bool {
 }
 
 func validateTiDBAutoEmbeddingDiffs(meta tidbTableMeta) []tidbSchemaDiff {
-	return validateTiDBAutoEmbeddingTableDiffs(meta, "semantic")
+	return validateTiDBAutoEmbeddingDiffsWithConfig(meta, currentTiDBAutoEmbeddingRenderConfig())
 }
 
-func validateTiDBAutoEmbeddingFilesDiffs(meta tidbTableMeta) []tidbSchemaDiff {
-	return validateTiDBAutoEmbeddingTableDiffs(meta, "files")
+func validateTiDBAutoEmbeddingDiffsWithConfig(meta tidbTableMeta, cfg tidbAutoEmbeddingRenderConfig) []tidbSchemaDiff {
+	return validateTiDBAutoEmbeddingTableDiffs(meta, "semantic", cfg)
 }
 
-func validateTiDBAutoEmbeddingTableDiffs(meta tidbTableMeta, tableName string) []tidbSchemaDiff {
+func validateTiDBAutoEmbeddingFilesDiffsWithConfig(meta tidbTableMeta, cfg tidbAutoEmbeddingRenderConfig) []tidbSchemaDiff {
+	return validateTiDBAutoEmbeddingTableDiffs(meta, "files", cfg)
+}
+
+func validateTiDBAutoEmbeddingTableDiffs(meta tidbTableMeta, tableName string, cfg tidbAutoEmbeddingRenderConfig) []tidbSchemaDiff {
 	var diffs []tidbSchemaDiff
 	for _, spec := range []struct {
 		column        string
@@ -1955,9 +2713,9 @@ func validateTiDBAutoEmbeddingTableDiffs(meta tidbTableMeta, tableName string) [
 			errMsg  string
 		}{
 			{"embed_text(", fmt.Sprintf("%s schema contract: %s generated expression must use EMBED_TEXT", tableName, spec.column)},
-			{tidbAutoEmbeddingModel, fmt.Sprintf("%s schema contract: %s model contract mismatch", tableName, spec.column)},
+			{normalizeSQLFragment(cfg.model), fmt.Sprintf("%s schema contract: %s model contract mismatch", tableName, spec.column)},
 			{spec.source, fmt.Sprintf("%s schema contract: generated expression must derive from %s", tableName, spec.source)},
-			{tidbAutoEmbeddingOptionsJSON, fmt.Sprintf("%s schema contract: %s dimensions option mismatch", tableName, spec.column)},
+			{normalizeSQLFragment(cfg.optionsJSON), fmt.Sprintf("%s schema contract: %s dimensions option mismatch", tableName, spec.column)},
 		}
 		for _, check := range checks {
 			if !strings.Contains(expr, check.pattern) {

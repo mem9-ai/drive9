@@ -623,9 +623,11 @@ start_mount() {
 
 stop_mount() {
   local mount_point="$1"
+  local umount_rc=0
   set +e
   if [ -n "$mount_point" ] && is_mounted "$mount_point"; then
-    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$mount_point" >/dev/null 2>&1 || true
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$mount_point" >/dev/null 2>&1
+    umount_rc=$?
     wait_mount_state "$mount_point" unmounted >/dev/null 2>&1 || true
     if is_mounted "$mount_point"; then
       force_unmount "$mount_point"
@@ -633,6 +635,7 @@ stop_mount() {
     fi
   fi
   set -e
+  return "$umount_rc"
 }
 
 wait_file_content() {
@@ -1101,7 +1104,7 @@ run_restore_suite() {
     python3 - "$restore_repo/oversized-staged.bin" <<'PY'
 import sys
 from pathlib import Path
-Path(sys.argv[1]).write_bytes(b"D9" * (3 * 1024 * 1024))
+Path(sys.argv[1]).write_bytes(b"D" * (5 * 1024 * 1024 + 1))
 PY
     git_cmd_record "$restore_repo" "Drive9 Git Workspace Behavior" "stage oversized object before remount" add oversized-staged.bin
   else
@@ -1109,11 +1112,10 @@ PY
   fi
   record_status_contains "$restore_repo" "Sandbox Restore" "dirty status before remount" 'README\.md'
 
-  stop_mount "$mount_point"
-  if ! is_mounted "$mount_point"; then
+  if stop_mount "$mount_point" && ! is_mounted "$mount_point"; then
     record "PASS" "Drive9 Git Workspace Behavior" "unmount drains git workspace state" "rw coding-agent mount unmounted"
   else
-    record "FAIL" "Drive9 Git Workspace Behavior" "unmount drains git workspace state" "rw coding-agent mount still mounted"
+    record "FAIL" "Drive9 Git Workspace Behavior" "unmount drains git workspace state" "rw coding-agent mount did not gracefully unmount"
   fi
 
   local mount_point_b="$RUN_ROOT/git-mount-b"
@@ -1171,7 +1173,7 @@ PY
   fi
   mkdir -p "$restore_repo/ignored-build"
   printf 'local ignored\n' > "$restore_repo/ignored-build/cache.tmp"
-  stop_mount "$mount_point_b"
+  stop_mount "$mount_point_b" >/dev/null 2>&1 || true
   mkdir -p "$mount_point_b" "$RUN_ROOT/git-local-c"
   if start_mount "$mount_point_b" "$RUN_ROOT/git-mount-c.log" --mode=fuse --profile=coding-agent --local-root "$RUN_ROOT/git-local-c" --durability=interactive ":/$git_root_rel" "$mount_point_b"; then
     if [ ! -e "$mount_point_b/restore-workspace/ignored-build/cache.tmp" ]; then
@@ -1182,7 +1184,7 @@ PY
   else
     record "FAIL" "Sandbox Restore" "ignored generated files are non-durable by design" "remount failed"
   fi
-  stop_mount "$mount_point_b"
+  stop_mount "$mount_point_b" >/dev/null 2>&1 || true
   [ -n "$log_file_a" ] && [ -f "$log_file_a" ] && : >"$log_file_a"
   [ -n "$local_root_a" ] && [ -d "$local_root_a" ] && : >"$local_root_a/.keep" 2>/dev/null || true
 }
@@ -1325,7 +1327,7 @@ main() {
   fi
 
   run_pjdfstest_suite "$rw_mount" "$root_rel"
-  stop_mount "$rw_mount"
+  stop_mount "$rw_mount" >/dev/null 2>&1 || true
   fi
 
   if [ "$FEATURE_MATRIX_SUITE" != "posix" ]; then

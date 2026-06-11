@@ -821,6 +821,110 @@ func TestNamespaceCache_SessionCreatedMissIsSafeNegative(t *testing.T) {
 	}
 }
 
+func TestNamespaceCache_SessionCreatedDirOutlivesNegativeTTL(t *testing.T) {
+	dc := NewNamespaceCache(300*time.Millisecond, 10*time.Millisecond, 10)
+	dc.MarkSessionCreatedDir("/dir")
+
+	time.Sleep(50 * time.Millisecond)
+	if got := dc.Lookup("/dir", "missing"); got.kind != namespaceLookupSessionMiss {
+		t.Fatalf("lookup kind after negative TTL = %v, want session miss", got.kind)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	if got := dc.Lookup("/dir", "missing"); got.kind != namespaceLookupNone {
+		t.Fatalf("lookup kind after dir TTL = %v, want none", got.kind)
+	}
+}
+
+func TestNamespaceCache_RecordRemoteNegativeEscalatesAtThreshold(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, time.Second, 10)
+
+	for i := 1; i < escalateMissThreshold; i++ {
+		if dc.RecordRemoteNegative("/dir") {
+			t.Fatalf("miss %d escalated, want escalation only at %d", i, escalateMissThreshold)
+		}
+	}
+	if !dc.RecordRemoteNegative("/dir") {
+		t.Fatalf("miss %d did not escalate", escalateMissThreshold)
+	}
+
+	// Cooldown right after an escalation suppresses duplicates.
+	for i := 0; i < escalateMissThreshold; i++ {
+		if dc.RecordRemoteNegative("/dir") {
+			t.Fatal("escalated again during post-escalation cooldown")
+		}
+	}
+}
+
+func TestNamespaceCache_RecordRemoteNegativeWindowExpiryResets(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, time.Second, 10)
+
+	dc.RecordRemoteNegative("/dir")
+	dc.RecordRemoteNegative("/dir")
+
+	// Backdate the window: the partial count must not carry over.
+	dc.mu.Lock()
+	dc.entries["/dir"].missWindowStart = time.Now().Add(-2 * escalateMissWindow)
+	dc.mu.Unlock()
+
+	for i := 1; i < escalateMissThreshold; i++ {
+		if dc.RecordRemoteNegative("/dir") {
+			t.Fatalf("miss %d of new window escalated early", i)
+		}
+	}
+	if !dc.RecordRemoteNegative("/dir") {
+		t.Fatal("fresh window did not escalate at threshold")
+	}
+}
+
+func TestNamespaceCache_DeferEscalationCoolsDown(t *testing.T) {
+	dc := NewNamespaceCache(50*time.Millisecond, 10*time.Millisecond, 10)
+	dc.DeferEscalation("/dir")
+
+	for i := 0; i < escalateMissThreshold; i++ {
+		if dc.RecordRemoteNegative("/dir") {
+			t.Fatal("escalated during cooldown")
+		}
+	}
+
+	time.Sleep(70 * time.Millisecond)
+	for i := 1; i < escalateMissThreshold; i++ {
+		if dc.RecordRemoteNegative("/dir") {
+			t.Fatalf("miss %d after cooldown escalated early", i)
+		}
+	}
+	if !dc.RecordRemoteNegative("/dir") {
+		t.Fatal("did not escalate after cooldown expired")
+	}
+}
+
+func TestNamespaceCache_CanAnswerMisses(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, 30*time.Millisecond, 2)
+
+	if dc.CanAnswerMisses("/dir") {
+		t.Fatal("empty cache should not answer misses")
+	}
+
+	dc.Put("/dir", []CachedFileInfo{{Name: "a.txt"}})
+	if !dc.CanAnswerMisses("/dir") {
+		t.Fatal("complete listing should answer misses")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if dc.CanAnswerMisses("/dir") {
+		t.Fatal("expired complete marker should not answer misses")
+	}
+
+	dc.Put("/big", []CachedFileInfo{{Name: "a"}, {Name: "b"}, {Name: "c"}})
+	if dc.CanAnswerMisses("/big") {
+		t.Fatal("oversized listing should not answer misses")
+	}
+
+	dc.MarkSessionCreatedDir("/session")
+	if !dc.CanAnswerMisses("/session") {
+		t.Fatal("session-created dir should answer misses")
+	}
+}
+
 func TestNamespaceCache_NegativeExpires(t *testing.T) {
 	dc := NewNamespaceCache(10*time.Second, time.Millisecond, 10)
 	dc.MarkNegative("/repo", "missing.txt")
@@ -942,6 +1046,97 @@ func TestWriteBuffer_LazyLoad_UnloadedPartReturnsZeros(t *testing.T) {
 	for i, b := range p1 {
 		if b != 0 {
 			t.Fatalf("byte %d = %d, want 0", i, b)
+		}
+	}
+}
+
+func TestWriteBuffer_LazyTruncateShrinkLoadsRetainedDirtyPart(t *testing.T) {
+	const partSize = int64(16)
+	remote := []byte("ABCDEFGHIJKLMNOPabcdefghijklmnop")
+	wb := NewWriteBuffer("/test", 0, partSize)
+	wb.totalSize = int64(len(remote))
+	wb.remoteSize = int64(len(remote))
+
+	loadCalls := 0
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		loadCalls++
+		start := int64(partNum-1) * partSize
+		end := start + partSize
+		if end > int64(len(remote)) {
+			end = int64(len(remote))
+		}
+		part := make([]byte, end-start)
+		copy(part, remote[start:end])
+		return part, nil
+	}
+
+	if err := wb.Truncate(10); err != nil {
+		t.Fatal(err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("LoadPart calls = %d, want 1", loadCalls)
+	}
+	if got := string(wb.PartData(1)); got != "ABCDEFGHIJ" {
+		t.Fatalf("dirty retained part = %q, want %q", got, "ABCDEFGHIJ")
+	}
+}
+
+func TestWriteBuffer_LazyTruncateBoundaryLoadsRetainedDirtyPart(t *testing.T) {
+	const partSize = int64(16)
+	remote := []byte("ABCDEFGHIJKLMNOPabcdefghijklmnop")
+	wb := NewWriteBuffer("/test", 0, partSize)
+	wb.totalSize = int64(len(remote))
+	wb.remoteSize = int64(len(remote))
+
+	loadCalls := 0
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		loadCalls++
+		start := int64(partNum-1) * partSize
+		end := start + partSize
+		part := make([]byte, end-start)
+		copy(part, remote[start:end])
+		return part, nil
+	}
+
+	if err := wb.Truncate(partSize); err != nil {
+		t.Fatal(err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("LoadPart calls = %d, want 1", loadCalls)
+	}
+	if got := string(wb.PartData(1)); got != "ABCDEFGHIJKLMNOP" {
+		t.Fatalf("boundary retained part = %q, want %q", got, "ABCDEFGHIJKLMNOP")
+	}
+}
+
+func TestWriteBuffer_LazyTruncateExtendLoadsRetainedDirtyPart(t *testing.T) {
+	const partSize = int64(16)
+	remote := []byte("ABCDEFGHIJ")
+	wb := NewWriteBuffer("/test", 0, partSize)
+	wb.totalSize = int64(len(remote))
+	wb.remoteSize = int64(len(remote))
+
+	loadCalls := 0
+	wb.LoadPart = func(partNum int) ([]byte, error) {
+		loadCalls++
+		part := make([]byte, len(remote))
+		copy(part, remote)
+		return part, nil
+	}
+
+	if err := wb.Truncate(14); err != nil {
+		t.Fatal(err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("LoadPart calls = %d, want 1", loadCalls)
+	}
+	got := wb.PartData(1)
+	if string(got[:10]) != "ABCDEFGHIJ" {
+		t.Fatalf("extended retained prefix = %q, want %q", got[:10], "ABCDEFGHIJ")
+	}
+	for i, b := range got[10:] {
+		if b != 0 {
+			t.Fatalf("extended byte %d = %d, want 0", i+10, b)
 		}
 	}
 }

@@ -28,6 +28,7 @@ var (
 	ErrUploadExpired           = errors.New("upload has expired")
 	ErrPathConflict            = errors.New("path already exists")
 	ErrInvalidLinkTarget       = errors.New("invalid link target")
+	ErrInvalidRootDentry       = errors.New("root path is implicit and cannot be mutated as a file node")
 	ErrUploadConflict          = errors.New("active upload already exists for this path")
 	ErrIdempotencyConflict     = errors.New("duplicate idempotency key")
 	ErrJournalConflict         = errors.New("journal create conflict")
@@ -150,6 +151,10 @@ type Upload struct {
 type Store struct {
 	db             *sql.DB
 	useLegacyFiles bool // true when the legacy `files` table exists and needs dual-write
+	// disableAutoEmbedTextWrites suppresses content_text/description writes to the
+	// semantic table so TiDB does not attempt to compute EMBED_TEXT() generated
+	// columns when the cluster has no supported auto-embedding provider.
+	disableAutoEmbedTextWrites bool
 }
 
 func Open(dsn string) (*Store, error) {
@@ -178,6 +183,12 @@ func (s *Store) DB() *sql.DB  { return s.db }
 // tenant database. When false, all writes skip the `files` table entirely
 // and only target the split tables (inodes / contents / semantic).
 func (s *Store) HasLegacyFiles() bool { return s.useLegacyFiles }
+
+// DisableAutoEmbedTextWrites configures the store to omit content_text and
+// description when inserting/updating the semantic table. Use this when the
+// TiDB Cloud cluster has no supported auto-embedding provider so that
+// EMBED_TEXT() generated columns are not triggered.
+func (s *Store) DisableAutoEmbedTextWrites() { s.disableAutoEmbedTextWrites = true }
 
 func (s *Store) detectLegacyFiles(ctx context.Context) (bool, error) {
 	var n int
@@ -218,11 +229,23 @@ func (s *Store) columnExists(table, column string) bool {
 
 // --- file_nodes operations ---
 
+func isRootFileNodePath(path string) bool {
+	return path == "/"
+}
+
+func isRootFileNode(n FileNode) bool {
+	return isRootFileNodePath(n.Path)
+}
+
 func (s *Store) InsertNode(ctx context.Context, n *FileNode) error {
 	start := time.Now()
 	var opErr error
 	defer observeStoreOp(ctx, "insert_node", start, &opErr)
 
+	if isRootFileNode(*n) {
+		opErr = ErrInvalidRootDentry
+		return ErrInvalidRootDentry
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())
@@ -261,6 +284,9 @@ func (s *Store) ListNodes(ctx context.Context, parentPath string) (out []*FileNo
 		n, err := scanNode(rows)
 		if err != nil {
 			return nil, err
+		}
+		if isRootFileNode(*n) {
+			continue
 		}
 		nodes = append(nodes, n)
 	}
@@ -333,6 +359,9 @@ func (s *Store) UpdateNodePath(ctx context.Context, oldPath, newPath, newParentP
 	start := time.Now()
 	defer observeStoreOp(ctx, "update_node_path", start, &err)
 
+	if isRootFileNodePath(oldPath) || isRootFileNodePath(newPath) {
+		return ErrInvalidRootDentry
+	}
 	res, err := s.db.ExecContext(ctx, `UPDATE file_nodes SET path = ?, parent_path = ?, name = ?
 		WHERE path = ?`, newPath, newParentPath, newName, oldPath)
 	if err != nil {
@@ -352,6 +381,9 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 	start := time.Now()
 	defer observeStoreOp(ctx, "rename_file_replacing_target", start, &err)
 
+	if isRootFileNodePath(oldPath) || isRootFileNodePath(newPath) {
+		return nil, ErrInvalidRootDentry
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -451,10 +483,81 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 	return out, nil
 }
 
+// RenameFileNoReplace atomically renames a file node and fails if newPath
+// already exists. It is used by fs-layer commit to avoid replacing a target
+// that may have been created after the layer entry was recorded.
+func (s *Store) RenameFileNoReplace(ctx context.Context, oldPath, newPath, newParentPath, newName string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "rename_file_no_replace", start, &err)
+
+	if isRootFileNodePath(oldPath) || isRootFileNodePath(newPath) {
+		return ErrInvalidRootDentry
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	type nodeRef struct {
+		nodeID string
+		isDir  bool
+	}
+	var old nodeRef
+	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, oldPath).
+		Scan(&old.nodeID, &old.isDir)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if old.isDir {
+		return fmt.Errorf("source is a directory: %s", oldPath)
+	}
+	if oldPath == newPath {
+		return tx.Commit()
+	}
+
+	var dst nodeRef
+	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, newPath).
+		Scan(&dst.nodeID, &dst.isDir)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	} else {
+		if dst.nodeID == old.nodeID {
+			return tx.Commit()
+		}
+		return ErrPathConflict
+	}
+
+	res, err := tx.ExecContext(ctx, `UPDATE file_nodes SET path = ?, parent_path = ?, name = ?
+		WHERE node_id = ?`, newPath, newParentPath, newName, old.nodeID)
+	if err != nil {
+		if strings.Contains(err.Error(), "Duplicate entry") {
+			return ErrPathConflict
+		}
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
 func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (count int64, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "rename_dir", start, &err)
 
+	if oldPrefix == "/" || newPrefix == "/" {
+		return 0, ErrInvalidRootDentry
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -586,6 +689,9 @@ func (s *Store) LinkFileNode(ctx context.Context, srcPath, dstPath, dstParentPat
 
 // LinkFileNodeTx creates a hardlink node inside an existing transaction.
 func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath, dstParentPath, dstName, nodeID string, createdAt time.Time) error {
+	if isRootFileNodePath(srcPath) || isRootFileNodePath(dstPath) {
+		return ErrInvalidRootDentry
+	}
 	if dstParentPath != "/" {
 		var parentIsDir bool
 		err := db.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, dstParentPath).
@@ -747,10 +853,12 @@ func (s *Store) insertSplitTablesTx(tx execer, f *File) error {
 	}
 	semantic := &Semantic{
 		InodeID:                      f.FileID,
-		ContentText:                  f.ContentText,
-		Description:                  f.Description,
 		EmbeddingRevision:            f.EmbeddingRevision,
 		DescriptionEmbeddingRevision: f.DescriptionEmbeddingRevision,
+	}
+	if !s.disableAutoEmbedTextWrites {
+		semantic.ContentText = f.ContentText
+		semantic.Description = f.Description
 	}
 	if err := s.InsertSemanticTx(tx, semantic); err != nil {
 		return fmt.Errorf("insert semantic: %w", err)
@@ -915,7 +1023,12 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 		if err != nil {
 			return nil, err
 		}
-		// Dual-write to split tables
+		// Skip when auto-embed text writes are disabled: return after updating
+		// files table, skip semantic dual-write. Return the real res so
+		// RowsAffected() reflects whether the files row actually matched.
+		if s.disableAutoEmbedTextWrites {
+			return res, nil
+		}
 		if expectedRevision > 0 {
 			if _, err := db.Exec(`UPDATE semantic SET content_text = ?
 				WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
@@ -932,6 +1045,30 @@ func (s *Store) updateFileSearchTextExec(db execer, fileID string, expectedRevis
 		return res, nil
 	}
 	// New tenant without legacy files: write directly to semantic.
+	// Skip when auto-embed text writes are disabled: any write to content_text
+	// triggers EMBED_TEXT() recomputation on the GENERATED embedding column,
+	// which fails with error 1105 when the provider is not available on this cluster.
+	// We still gate on the revision/status check so stale tasks are correctly
+	// rejected (returning 0 rows), while current tasks return 1 so the caller
+	// can proceed to write tags (stored in file_tags, unaffected by EMBED_TEXT).
+	if s.disableAutoEmbedTextWrites {
+		var n int
+		var err error
+		if expectedRevision > 0 {
+			err = db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?`,
+				fileID, expectedRevision).Scan(&n)
+		} else {
+			err = db.QueryRow(`SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED'`,
+				fileID).Scan(&n)
+		}
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return noopResult{0}, nil // stale or not found: report 0 rows
+			}
+			return nil, fmt.Errorf("check inode for search text skip: %w", err)
+		}
+		return noopResult{1}, nil // found: report 1 row so tags are written
+	}
 	if expectedRevision > 0 {
 		return db.Exec(`UPDATE semantic SET content_text = ?
 			WHERE inode_id = ? AND EXISTS (SELECT 1 FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' AND revision = ?)`,
@@ -1045,6 +1182,14 @@ type execer interface {
 	QueryRowContext(ctx context.Context, query string, args ...interface{}) *sql.Row
 }
 
+// noopResult is a sql.Result that reports a configurable number of rows
+// affected and zero last insert ID. Used when a write is intentionally skipped
+// but the caller may need to know whether the target row existed.
+type noopResult struct{ rows int64 }
+
+func (r noopResult) LastInsertId() (int64, error) { return 0, nil }
+func (r noopResult) RowsAffected() (int64, error) { return r.rows, nil }
+
 // FileStorageMeta holds the lightweight storage metadata needed by upload
 // overwrite logic, fetched with FOR UPDATE row locking.
 type FileStorageMeta struct {
@@ -1089,6 +1234,9 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 	start := time.Now()
 	defer observeStoreOp(ctx, "chmod", start, &err)
 
+	if isRootFileNodePath(path) {
+		return ErrInvalidRootDentry
+	}
 	node, err := s.GetNode(ctx, path)
 	if err != nil {
 		return err
@@ -1207,6 +1355,9 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 }
 
 func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
+	if isRootFileNode(*n) {
+		return ErrInvalidRootDentry
+	}
 	if !n.IsDirectory && n.FileID != "" {
 		if err := s.lockConfirmedFileForAttachTx(db, n.FileID); err != nil {
 			return err
@@ -1641,6 +1792,9 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 		n.IsDirectory = isDir != 0
 		n.FileID = nodeFileID.String
 		n.CreatedAt = nodeCreatedAt.UTC()
+		if isRootFileNode(n) {
+			continue
+		}
 		nf := &NodeWithFile{Node: n}
 		if fFileID.Valid {
 			nf.File = &File{
@@ -2813,10 +2967,16 @@ func observeStoreOp(ctx context.Context, op string, start time.Time, errp *error
 			result = "not_found"
 		case errors.Is(*errp, ErrPathConflict), errors.Is(*errp, ErrUploadConflict), errors.Is(*errp, ErrIdempotencyConflict):
 			result = "conflict"
+		case errors.Is(*errp, context.Canceled):
+			result = "canceled"
+		case errors.Is(*errp, context.DeadlineExceeded):
+			result = "deadline_exceeded"
 		default:
 			result = "error"
 		}
-		logger.Error(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+		if result != "canceled" && result != "deadline_exceeded" {
+			logger.Error(ctx, "datastore_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+		}
 	}
 	logger.InfoBenchTiming(ctx, "datastore_op_timing",
 		zap.String("operation", op),

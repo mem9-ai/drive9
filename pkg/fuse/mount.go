@@ -47,10 +47,13 @@ type MountOptions struct {
 	FlushDebounce           time.Duration // debounce window for small-file flush coalescing (default 2s, 0 disables); set to -1 to use default
 	SyncMode                SyncMode      // interactive, strict, or auto (default auto)
 	WritePolicy             WritePolicy   // writeback, close-sync, or write-sync (default writeback)
-	Profile                 string        // mount profile: "interactive", "coding-agent", "" (default)
-	LocalRoot               string        // local-only overlay root for coding-agent mounts
-	LocalOnlyPatterns       []string      // additional local-only path patterns for coding-agent mounts
-	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for coding-agent mounts
+	Profile                 string        // mount profile: "interactive", "coding-agent", "none", or a custom profile name
+	LayerRef                string        // optional writable fs layer ref (layer_id, name, or tag ref)
+	CheckpointRef           string        // optional checkpoint ref to restore as the layer view baseline
+	LocalRoot               string        // local-only overlay root for overlay-profile mounts
+	LocalOnlyPatterns       []string      // additional local-only path patterns for overlay-profile mounts
+	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for overlay-profile mounts
+	PackPaths               []string      // local overlay paths auto-packed after unmount
 	UploadConcurrency       int           // number of background upload workers (default 4)
 	ReadConcurrency         int           // maximum concurrent backend reads issued by FUSE (default 24)
 	ParallelReadConcurrency int           // maximum concurrent block reads for one large FUSE read (default 4)
@@ -174,6 +177,11 @@ func Mount(opts *MountOptions) error {
 	if opts.APIKey == "" && opts.Token == "" {
 		return fmt.Errorf("mount: either APIKey (owner) or Token (delegated) is required")
 	}
+	opts.LayerRef = strings.TrimSpace(opts.LayerRef)
+	opts.CheckpointRef = strings.TrimSpace(opts.CheckpointRef)
+	if opts.CheckpointRef != "" && opts.LayerRef == "" {
+		return fmt.Errorf("mount: CheckpointRef requires LayerRef")
+	}
 
 	// Generate per-mount actor ID for SSE self-filtering.
 	actorID := generateMountID()
@@ -220,9 +228,21 @@ func Mount(opts *MountOptions) error {
 			return fmt.Errorf("remote root %q is not a directory", remoteRoot)
 		}
 	}
+	if opts.LayerRef != "" {
+		layer, err := c.GetFSLayer(context.Background(), opts.LayerRef)
+		if err != nil {
+			return fmt.Errorf("mount: resolve fs layer %q: %w", opts.LayerRef, err)
+		}
+		if layer.State != "active" {
+			return fmt.Errorf("mount: fs layer %q is %s, want active", opts.LayerRef, layer.State)
+		}
+		opts.LayerRef = layer.LayerID
+		fmt.Fprintf(os.Stderr, "drive9: fs layer: %s\n", layer.LayerID)
+	}
 
 	// Build FUSE filesystem
 	dat9fs := NewDat9FS(c, opts)
+	layerEventWatcherStop := func() {}
 
 	// Resolve sync mode (auto-detect RTT if needed).
 	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
@@ -239,6 +259,9 @@ func Mount(opts *MountOptions) error {
 	mountHash := ""
 	if cacheBase != "" {
 		mountHash = MountHash(opts.Server, opts.MountPoint, opts.RemoteRoot)
+		if opts.LayerRef != "" {
+			mountHash = MountLayerHash(opts.Server, opts.MountPoint, opts.RemoteRoot, opts.LayerRef, opts.CheckpointRef)
+		}
 		readCacheHash := MountReadCacheHash(opts.Server, opts.MountPoint, opts.RemoteRoot, mountCredentialKind(opts), mountCredentialSecret(opts))
 		readCacheDir := filepath.Join(cacheBase, readCacheHash, "read")
 		diskReadCache, err := NewDiskReadCache(DiskReadCacheOptions{
@@ -337,11 +360,18 @@ func Mount(opts *MountOptions) error {
 			// Initialize CommitQueue for background remote commits.
 			if shadowStore != nil && pendingIdx != nil {
 				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending, opts.RemoteRoot)
+				cq.SetLayerRef(opts.LayerRef)
 				cq.SetPerfCounters(dat9fs.perf)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess
 				cq.OnCleanup = dat9fs.onCommitQueueCleanup
 				cq.PathLock = dat9fs.lockRemoteCommitPath
 				cq.RecoverPending()
+				if opts.LayerRef != "" {
+					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
+						fmt.Fprintf(os.Stderr, "drive9: restore fs layer entries failed: %v\n", err)
+					}
+					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
+				}
 				dat9fs.commitQueue = cq
 			}
 
@@ -365,11 +395,16 @@ func Mount(opts *MountOptions) error {
 	// Create FUSE server
 	server, err := gofuse.NewServer(dat9fs, opts.MountPoint, fuseOpts)
 	if err != nil {
+		layerEventWatcherStop()
 		return fmt.Errorf("fuse mount: %w", err)
 	}
 
 	// Start SSE watcher for remote change notifications.
 	sseWatcher := StartSSEWatcher(dat9fs, c, actorID)
+	stopWatchers := func() {
+		sseWatcher.Stop()
+		layerEventWatcherStop()
+	}
 
 	// Start serving in a background goroutine so WaitMount can proceed.
 	// On macOS, Serve() must be running before WaitMount() returns because
@@ -385,6 +420,7 @@ func Mount(opts *MountOptions) error {
 	// thread consumes the last GOMAXPROCS slot, leaving no thread to handle
 	// the POLL request from the kernel).
 	if err := server.WaitMount(); err != nil {
+		stopWatchers()
 		return fmt.Errorf("fuse wait mount: %w", err)
 	}
 	stateMountPoint := opts.MountPoint
@@ -394,16 +430,25 @@ func Mount(opts *MountOptions) error {
 	if resolvedMountPoint, resolveErr := filepath.EvalSymlinks(stateMountPoint); resolveErr == nil {
 		stateMountPoint = resolvedMountPoint
 	}
+	credentialKind := mountstate.CredentialKindAPIKey
+	if opts.Token != "" {
+		credentialKind = mountstate.CredentialKindToken
+	}
 	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
-		PID:        os.Getpid(),
-		MountPoint: stateMountPoint,
-		RemoteRoot: opts.RemoteRoot,
-		Profile:    opts.Profile,
-		LocalRoot:  opts.LocalRoot,
-		Server:     opts.Server,
+		PID:            os.Getpid(),
+		MountKind:      mountstate.MountKindFUSE,
+		MountPoint:     stateMountPoint,
+		RemoteRoot:     opts.RemoteRoot,
+		Profile:        opts.Profile,
+		LocalRoot:      opts.LocalRoot,
+		Server:         opts.Server,
+		PackPaths:      append([]string(nil), opts.PackPaths...),
+		CredentialKind: credentialKind,
+		APIKey:         opts.APIKey,
+		Token:          opts.Token,
 	})
 	if err != nil {
-		sseWatcher.Stop()
+		stopWatchers()
 		dat9fs.FlushAll()
 		_ = server.Unmount()
 		return fmt.Errorf("write mount pid file: %w", err)
@@ -414,7 +459,7 @@ func Mount(opts *MountOptions) error {
 		}
 	}()
 
-	shutdown := newMountShutdown(sseWatcher.Stop, dat9fs.FlushAll)
+	shutdown := newMountShutdown(stopWatchers, dat9fs.FlushAll)
 
 	// Signal handling for graceful shutdown.
 	//
@@ -544,21 +589,226 @@ func validateMountOptionsProfile(opts *MountOptions) error {
 	if opts.EnableGitWorkspaces && opts.LocalRoot == "" {
 		return fmt.Errorf("mount: EnableGitWorkspaces requires LocalRoot")
 	}
-	hasLocalPolicy := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0
-	if opts.Profile != MountProfileCodingAgent {
-		if hasLocalPolicy {
-			return fmt.Errorf("mount: local policy options require profile %q", MountProfileCodingAgent)
+	hasOverlayOptions := opts.LocalRoot != "" || len(opts.LocalOnlyPatterns) > 0 || len(opts.RemoteOnlyPatterns) > 0 || len(opts.PackPaths) > 0
+	if !profileAllowsLocalPolicy(opts.Profile) {
+		if hasOverlayOptions {
+			return fmt.Errorf("mount: overlay options require an overlay profile")
 		}
 		return nil
 	}
 	if opts.LocalRoot == "" {
-		return fmt.Errorf("mount: profile %q requires LocalRoot", MountProfileCodingAgent)
+		return fmt.Errorf("mount: profile %q requires LocalRoot", opts.Profile)
 	}
 	if !filepath.IsAbs(opts.LocalRoot) {
 		return fmt.Errorf("mount: LocalRoot must be an absolute path")
 	}
 	if err := validateLocalPolicyPatterns(opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns); err != nil {
 		return fmt.Errorf("mount: %w", err)
+	}
+	return nil
+}
+
+func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS) error {
+	if c == nil || opts == nil || shadows == nil || pending == nil || strings.TrimSpace(opts.LayerRef) == "" {
+		return nil
+	}
+	var maxSeq int64
+	hasCheckpoint := false
+	if strings.TrimSpace(opts.CheckpointRef) != "" {
+		checkpoint, err := c.GetFSLayerCheckpoint(ctx, opts.CheckpointRef)
+		if err != nil {
+			return fmt.Errorf("read fs layer checkpoint %s: %w", opts.CheckpointRef, err)
+		}
+		if checkpoint.LayerID != opts.LayerRef {
+			return fmt.Errorf("checkpoint %s belongs to layer %s, want %s", opts.CheckpointRef, checkpoint.LayerID, opts.LayerRef)
+		}
+		maxSeq = checkpoint.DurableSeq
+		hasCheckpoint = true
+	}
+	var entries []client.FSLayerEntry
+	var err error
+	if hasCheckpoint {
+		entries, err = c.ReplayFSLayerAtSeq(ctx, opts.LayerRef, maxSeq)
+	} else {
+		entries, err = c.ReplayFSLayer(ctx, opts.LayerRef)
+	}
+	if err != nil {
+		return err
+	}
+	restoredUpserts := make(map[string]struct{})
+	for _, entry := range entries {
+		localPath, ok := mountpath.ToLocal(opts.RemoteRoot, entry.Path)
+		if !ok {
+			continue
+		}
+		switch entry.Op {
+		case "whiteout":
+			if fs != nil {
+				fs.markLayerWhiteout(localPath)
+			}
+			continue
+		case "mkdir":
+			if fs != nil {
+				fs.markLayerDir(localPath, entry.Mode)
+			}
+			continue
+		case "chmod":
+			if pending != nil {
+				if err := pending.UpdateMode(localPath, entry.Mode); err != nil {
+					return fmt.Errorf("restore fs layer chmod pending %s: %w", localPath, err)
+				}
+			}
+			if fs != nil {
+				switch entry.Kind {
+				case "file":
+					fs.markLayerFileMode(localPath, entry.Mode)
+				case "dir":
+					fs.markLayerDir(localPath, entry.Mode)
+				case "symlink":
+					if target, existingMode, ok := fs.layerSymlink(localPath); ok {
+						nextMode := (existingMode &^ uint32(0o777)) | (entry.Mode & 0o777)
+						if nextMode&uint32(syscall.S_IFMT) == 0 {
+							nextMode |= uint32(syscall.S_IFLNK)
+						}
+						fs.markLayerSymlink(localPath, target, nextMode)
+					}
+				}
+			}
+			continue
+		case "rename":
+			if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)); err != nil {
+				return err
+			}
+			continue
+		case "symlink":
+			fullEntry := &entry
+			if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
+				fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq))
+				if err != nil {
+					return fmt.Errorf("restore fs layer symlink entry %s: %w", entry.Path, err)
+				}
+				fullEntry = fetched
+			}
+			target := strings.TrimSpace(fullEntry.ContentText)
+			if target == "" && len(fullEntry.Content) > 0 {
+				target = string(fullEntry.Content)
+			}
+			if target == "" {
+				return fmt.Errorf("restore fs layer symlink entry %s: missing target", entry.Path)
+			}
+			if fs != nil {
+				fs.markLayerSymlink(localPath, target, entry.Mode)
+			}
+			continue
+		}
+		if entry.Op != "upsert" || entry.Kind != "file" {
+			continue
+		}
+		if _, ok := pending.GetMeta(localPath); ok {
+			if _, restored := restoredUpserts[localPath]; !restored {
+				continue
+			}
+		}
+		entryMaxSeq := layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)
+		fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, entryMaxSeq)
+		if err != nil {
+			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
+		}
+		var sizeBytes int64
+		if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
+			rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
+			if err != nil {
+				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
+			}
+			n, writeErr := shadows.WriteStream(localPath, rc, fullEntry.BaseRevision)
+			closeErr := rc.Close()
+			if writeErr != nil {
+				return fmt.Errorf("restore fs layer shadow %s: %w", localPath, writeErr)
+			}
+			if closeErr != nil {
+				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, closeErr)
+			}
+			sizeBytes = n
+		} else {
+			content := fullEntry.Content
+			if err := shadows.WriteFull(localPath, content, fullEntry.BaseRevision); err != nil {
+				return fmt.Errorf("restore fs layer shadow %s: %w", localPath, err)
+			}
+			sizeBytes = int64(len(content))
+		}
+		if fullEntry.SizeBytes > 0 && sizeBytes != fullEntry.SizeBytes {
+			return fmt.Errorf("restore fs layer object %s: copied %d bytes, want %d", entry.Path, sizeBytes, fullEntry.SizeBytes)
+		}
+		if _, err := pending.PutWithBaseRevAndMode(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
+		}
+		restoredUpserts[localPath] = struct{}{}
+	}
+	return nil
+}
+
+func layerEntryFetchMaxSeq(entry *client.FSLayerEntry, hasCheckpoint bool, checkpointMaxSeq int64) *int64 {
+	if entry != nil && entry.EntrySeq > 0 {
+		seq := entry.EntrySeq
+		return &seq
+	}
+	if hasCheckpoint {
+		seq := checkpointMaxSeq
+		return &seq
+	}
+	return nil
+}
+
+func getLayerEntryForRestore(ctx context.Context, c *client.Client, layerID, path string, maxSeq *int64) (*client.FSLayerEntry, error) {
+	if maxSeq != nil {
+		return c.GetFSLayerEntryAtSeq(ctx, layerID, path, *maxSeq)
+	}
+	return c.GetFSLayerEntry(ctx, layerID, path)
+}
+
+func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry, maxSeq *int64) error {
+	if entry == nil {
+		return nil
+	}
+	fullEntry := entry
+	if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
+		fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, maxSeq)
+		if err != nil {
+			return fmt.Errorf("restore fs layer rename entry %s: %w", entry.Path, err)
+		}
+		fullEntry = fetched
+	}
+	targetRemote := strings.TrimSpace(fullEntry.ContentText)
+	if targetRemote == "" && len(fullEntry.Content) > 0 {
+		targetRemote = strings.TrimSpace(string(fullEntry.Content))
+	}
+	if targetRemote == "" {
+		return fmt.Errorf("restore fs layer rename entry %s: missing target", entry.Path)
+	}
+	if fs != nil {
+		fs.markLayerWhiteout(oldLocalPath)
+	}
+	newLocalPath, ok := mountpath.ToLocal(opts.RemoteRoot, targetRemote)
+	if !ok {
+		return nil
+	}
+	movedShadow := shadows.Rename(oldLocalPath, newLocalPath)
+	movedPending := pending.RenamePending(oldLocalPath, newLocalPath)
+	if movedShadow || movedPending {
+		return nil
+	}
+	if pending.HasPending(newLocalPath) {
+		return nil
+	}
+	data, err := c.ReadCtx(ctx, fullEntry.Path)
+	if err != nil {
+		return fmt.Errorf("restore fs layer renamed source %s: %w", fullEntry.Path, err)
+	}
+	if err := shadows.WriteFull(newLocalPath, data, 0); err != nil {
+		return fmt.Errorf("restore fs layer renamed shadow %s: %w", newLocalPath, err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode(newLocalPath, int64(len(data)), PendingOverwrite, 0, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
+		return fmt.Errorf("restore fs layer renamed pending %s: %w", newLocalPath, err)
 	}
 	return nil
 }

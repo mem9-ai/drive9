@@ -9,11 +9,12 @@
 //	create  provision a new database and owner context
 //	ctx     manage contexts (show, add, import, fork, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, mkdir, chmod,
-//	        symlink, hardlink, sh, grep, find)
+//	        symlink, hardlink, sh, grep, find, layer)
 //	token  issue and revoke workspace-zone scoped filesystem tokens
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	journal append-only agent/workflow journal operations
 //	git     git-aware drive9 workflows
+//	profile show mount profile configuration
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
 //	doctor  diagnose local drive9 runtime prerequisites
@@ -47,6 +48,10 @@ var tokenHandler = cli.Token
 var doctorHandler = cli.Doctor
 var journalHandler = cli.Journal
 var gitHandler = cli.Git
+var packHandler = cli.PackCommand
+var unpackHandler = cli.UnpackCommand
+var profileHandler = cli.Profile
+var umountHandler = cli.UmountCmd
 
 func main() {
 	if logger.CLIEnabled() {
@@ -174,6 +179,31 @@ func dispatch(cmd string, args []string) {
 			}
 			fatal("git"+sub, err)
 		}
+	case "pack":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "pack"))
+		}
+		if err := packHandler(args); err != nil {
+			fatal("pack", err)
+		}
+	case "unpack":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "unpack"))
+		}
+		if err := unpackHandler(args); err != nil {
+			fatal("unpack", err)
+		}
+	case "profile":
+		if cliLogger != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = args[0]
+			}
+			logger.Info(context.Background(), "cli_command", zap.String("command", "profile"), zap.String("subcommand", sub))
+		}
+		if err := profileHandler(args); err != nil {
+			fatal("profile", err)
+		}
 	case "mount":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "mount"))
@@ -185,7 +215,7 @@ func dispatch(cmd string, args []string) {
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "umount"))
 		}
-		if err := cli.UmountCmd(args); err != nil {
+		if err := umountHandler(args); err != nil {
 			fatal("umount", err)
 		}
 	case "doctor":
@@ -284,6 +314,8 @@ func runFS(args []string) {
 		err = cli.Grep(c, rest)
 	case "find":
 		err = cli.Find(c, rest)
+	case "layer":
+		err = cli.Layer(c, rest)
 	case "-h", "-help", "--help", "help":
 		fsUsage(0)
 	default:
@@ -332,6 +364,12 @@ func usage(code int) {
 			"                         append-only agent/workflow journal operations\n"+
 			"  git clone --fast <repo-url> <mounted-path>\n"+
 			"                         git-aware fast clone workflow\n"+
+			"  pack [flags] [archive] [path...]\n"+
+			"                         archive coding-agent local overlay paths to drive9/S3\n"+
+			"  unpack [flags] [archive]\n"+
+			"                         restore a drive9 pack archive to a local overlay\n"+
+			"  profile show [profile]\n"+
+			"                         print mount profile configuration\n"+
 			"  mount [flags] [:/remote] <mountpoint>\n"+
 			"                         mount drive9 filesystem\n"+
 			"  mount vault [flags] <mountpoint>\n"+
@@ -382,6 +420,14 @@ commands:
     -newer <YYYY-MM-DD>  modified after date
     -older <YYYY-MM-DD>  modified before date
     -size <+N|-N>        size filter in bytes
+  layer <command>      manage filesystem layers
+    create [flags] <base-root>
+    list [--json]
+    status [--json] <layer>
+    diff [--json] <layer>
+    checkpoint [flags] <layer>
+    rollback <layer>
+    commit <layer>
 
 global:
   -h, --help, help       show this help

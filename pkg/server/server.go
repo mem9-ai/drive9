@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	pathpkg "path"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/slockoauth"
 	"github.com/mem9-ai/dat9/pkg/tagutil"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	tenantschema "github.com/mem9-ai/dat9/pkg/tenant/schema"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 	"github.com/mem9-ai/dat9/pkg/traceid"
 	"github.com/mem9-ai/dat9/pkg/vault"
@@ -55,12 +57,23 @@ type Config struct {
 	SemanticEmbedder embedding.Client
 	SemanticWorkers  SemanticWorkerOptions
 	SlockOAuth       SlockOAuthClient
+
+	TiDBAutoEmbeddingConfig  tenantschema.TiDBAutoEmbeddingConfig
+	TiDBAutoEmbeddingAPIKey  string
+	TiDBAutoEmbeddingAPIBase string
+	// DisableDatabaseAutoEmbedding suppresses runtime writes that would trigger
+	// TiDB EMBED_TEXT, but TiDB tenants still use the normal auto schema.
+	DisableDatabaseAutoEmbedding bool
 }
 
 type SlockOAuthClient interface {
 	LoginURL() string
 	ExchangeCode(ctx context.Context, code string) (slockoauth.Token, error)
 	Userinfo(ctx context.Context, accessToken string) (slockoauth.UserInfo, error)
+}
+
+type autoEmbeddingSchemaProvisioner interface {
+	InitSchemaForAutoEmbeddingProfile(context.Context, string, tenantschema.TiDBAutoEmbeddingProfile) error
 }
 
 type Server struct {
@@ -83,11 +96,19 @@ type Server struct {
 	journalCursorSecret []byte
 	objectGCWorker      *objectGCWorker
 	slockOAuth          SlockOAuthClient
+	tidbAutoEmbedding   tenantAutoEmbeddingDefault
+	disableDBAutoEmbed  bool
 	forkWorkerCtx       context.Context
 	forkWorkerCancel    context.CancelFunc
 	forkWorkerWG        sync.WaitGroup
 	forkWorkerMu        sync.Mutex
 	forkWorkerClosed    bool
+}
+
+type tenantAutoEmbeddingDefault struct {
+	config  tenantschema.TiDBAutoEmbeddingConfig
+	apiKey  string
+	apiBase string
 }
 
 var (
@@ -159,21 +180,27 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
-		fallback:            cfg.Backend,
-		meta:                cfg.Meta,
-		pool:                cfg.Pool,
-		tokenSecret:         cfg.TokenSecret,
-		localTenantAPIKey:   strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:             vaultMK,
-		vaultIssuerURL:      strings.TrimSpace(cfg.VaultIssuerURL),
-		publicURL:           strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
-		provisioner:         cfg.Provisioner,
-		maxUploadBytes:      maxUpload,
-		inlineThreshold:     inlineThreshold,
-		metrics:             newServerMetrics(),
-		logger:              logger,
-		events:              newEventBuses(),
-		slockOAuth:          cfg.SlockOAuth,
+		fallback:          cfg.Backend,
+		meta:              cfg.Meta,
+		pool:              cfg.Pool,
+		tokenSecret:       cfg.TokenSecret,
+		localTenantAPIKey: strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:           vaultMK,
+		vaultIssuerURL:    strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:         strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
+		provisioner:       cfg.Provisioner,
+		maxUploadBytes:    maxUpload,
+		inlineThreshold:   inlineThreshold,
+		metrics:           newServerMetrics(),
+		logger:            logger,
+		events:            newEventBuses(),
+		slockOAuth:        cfg.SlockOAuth,
+		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
+			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
+			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
+			apiBase: strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIBase),
+		},
+		disableDBAutoEmbed:  cfg.DisableDatabaseAutoEmbedding || (cfg.Pool != nil && cfg.Pool.IsAutoEmbeddingDisabled()),
 		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
@@ -202,6 +229,9 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v1/journal-entries", business)
 	mux.Handle("/v1/git-workspaces", business)
 	mux.Handle("/v1/git-workspaces/", business)
+	mux.Handle("/v1/layers", business)
+	mux.Handle("/v1/layers/", business)
+	mux.Handle("/v1/layer-checkpoints/", business)
 	// Vault management API goes through tenant auth.
 	mux.Handle("/v1/vault/secrets", business)
 	mux.Handle("/v1/vault/secrets/", business)
@@ -256,8 +286,13 @@ func NewWithConfig(cfg Config) *Server {
 				http.Error(w, "not found", http.StatusNotFound)
 				return
 			}
-			r.URL.Path = "/" + sub
-			localS3.Handler().ServeHTTP(w, r)
+			setRequestMetricTenant(r.Context(), tenantID, "", "", classifyTenantRequest(r))
+			subReq := r.Clone(r.Context())
+			subURL := *r.URL
+			subURL.Path = "/" + sub
+			subURL.RawPath = ""
+			subReq.URL = &subURL
+			localS3.Handler().ServeHTTP(w, subReq)
 		}))
 	}
 
@@ -269,6 +304,19 @@ func NewWithConfig(cfg Config) *Server {
 		s.resumeDeletingForkTenants()
 	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
+	if s.semanticWorker != nil {
+		// Wire upload/write-commit kicks so freshly enqueued semantic tasks are
+		// claimed immediately instead of waiting for the tenant scan to come
+		// around (which can take many minutes with hundreds of active tenants).
+		if cfg.Pool != nil {
+			cfg.Pool.SetSemanticTaskNotifier(s.semanticWorker.Kick)
+		}
+		if cfg.Backend != nil {
+			cfg.Backend.SetSemanticTaskEnqueuedNotifier(func() {
+				s.semanticWorker.Kick(semanticLocalTenantID)
+			})
+		}
+	}
 	appManagedTaskTypes := semanticWorkerLogTaskTypesFromTypes(appManagedSemanticTaskTypes(cfg.SemanticEmbedder))
 	var fallbackTaskTypes, poolAutoTaskTypes []string
 	if cfg.Backend != nil {
@@ -372,7 +420,7 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 			return
 		}
 		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
-		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.provisioner.InitSchema)
+		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.schemaInitForTenant(t.ID, t.Provider, s.provisioner.InitSchema))
 	})
 }
 
@@ -487,6 +535,7 @@ func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handl
 			Backend:            b,
 			JournalPermissions: ownerJournalPermissions(),
 		}
+		setRequestMetricScope(r.Context(), scope, classifyTenantRequest(r))
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
 }
@@ -532,6 +581,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleJournal(w, r)
 	case r.URL.Path == "/v1/git-workspaces" || strings.HasPrefix(r.URL.Path, "/v1/git-workspaces/"):
 		s.handleGitWorkspaces(w, r)
+	case r.URL.Path == "/v1/layers" || strings.HasPrefix(r.URL.Path, "/v1/layers/") || strings.HasPrefix(r.URL.Path, "/v1/layer-checkpoints/"):
+		s.handleFSLayers(w, r)
 	case strings.HasPrefix(r.URL.Path, "/v1/vault/secrets"), strings.HasPrefix(r.URL.Path, "/v1/vault/tokens"), strings.HasPrefix(r.URL.Path, "/v1/vault/grants"), strings.HasPrefix(r.URL.Path, "/v1/vault/audit"):
 		s.handleVault(w, r)
 	default:
@@ -555,6 +606,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 //     chmod stays owner-only)
 //   - /v1/uploads* + /v2/uploads/* (action-aware, mirrors actual upload
 //     dispatch table; see isScopedV{1,2}UploadRouteAllowed)
+//   - /v1/layers* + /v1/layer-checkpoints/* (route-aware, with per-layer
+//     base root and per-entry path authorization in fs_layer.go)
 //
 // chmod (POST /v1/fs/<path>?chmod=1) is explicitly NOT and never will be in
 // the scoped allowlist — chmod escalates ACLs and is owner-token-only.
@@ -626,8 +679,56 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 		return isScopedV2UploadRouteAllowed(r.Method, path)
 	}
 
+	if path == "/v1/layers" || strings.HasPrefix(path, "/v1/layers/") || strings.HasPrefix(path, "/v1/layer-checkpoints/") {
+		return isScopedFSLayerRouteAllowed(r.Method, path, r.URL.Query())
+	}
+
 	// SQL, fork, events, journals, vault, status, etc.: still default-deny.
 	return false
+}
+
+func isScopedFSLayerRouteAllowed(method, path string, query url.Values) bool {
+	if path == "/v1/layers" {
+		return (method == http.MethodGet || method == http.MethodPost) && len(query) == 0
+	}
+	if strings.HasPrefix(path, "/v1/layer-checkpoints/") {
+		return method == http.MethodGet && len(query) == 0
+	}
+	if !strings.HasPrefix(path, "/v1/layers/") {
+		return false
+	}
+	rest := strings.TrimPrefix(path, "/v1/layers/")
+	if rest == "" {
+		return false
+	}
+	parts := strings.Split(rest, "/")
+	switch len(parts) {
+	case 1:
+		return method == http.MethodGet && len(query) == 0
+	case 2:
+		switch parts[1] {
+		case "diff":
+			return method == http.MethodGet && queryKeysSubsetOf(query, []string{"max_seq", "replay", "mode"})
+		case "checkpoints", "rollback", "commit":
+			return method == http.MethodPost && len(query) == 0
+		case "entries":
+			if method == http.MethodGet {
+				return queryKeysSubsetOf(query, []string{"path", "max_seq"})
+			}
+			return (method == http.MethodPost || method == http.MethodPut) && len(query) == 0
+		case "objects":
+			if method == http.MethodGet {
+				return queryKeysSubsetOf(query, []string{"path", "max_seq"})
+			}
+			return (method == http.MethodPost || method == http.MethodPut) && queryKeysSubsetOf(query, []string{"path", "size", "base_revision", "mode"})
+		case "events":
+			return method == http.MethodGet && queryKeysSubsetOf(query, []string{"since"})
+		default:
+			return false
+		}
+	default:
+		return false
+	}
 }
 
 // isScopedV1UploadRouteAllowed mirrors handleUploads (server.go ~1872) and
@@ -778,14 +879,14 @@ func isScopedFSGetQueryAllowed(q url.Values) bool {
 		// handleStatMetadata reads only ?stat.
 		return queryKeysSubsetOf(q, []string{"stat"})
 	case q.Has("grep"):
-		// handleGrep reads ?grep and ?limit.
-		return queryKeysSubsetOf(q, []string{"grep", "limit"})
+		// handleGrep reads ?grep, ?limit, and optional ?layer.
+		return queryKeysSubsetOf(q, []string{"grep", "limit", "layer"})
 	case q.Has("find"):
 		// handleFind reads ?find, ?name, ?tag, ?newer, ?older,
-		// ?minsize, ?maxsize, ?limit.
+		// ?minsize, ?maxsize, ?limit, and optional ?layer.
 		return queryKeysSubsetOf(q, []string{
 			"find", "name", "tag", "newer", "older",
-			"minsize", "maxsize", "limit",
+			"minsize", "maxsize", "limit", "layer",
 		})
 	case q.Has("list"):
 		// handleList reads only ?list. (No filter params today.)
@@ -863,6 +964,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
+	setRequestMetricTenant(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, classifyTenantRequest(r))
 	if resolved.APIKey.Status != meta.APIKeyActive {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_inactive", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "status", resolved.APIKey.Status)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
@@ -937,6 +1039,7 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
+	setRequestMetricTenant(r.Context(), "local", "local", "local", classifyTenantRequest(r))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", "local", "status", "active")...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
@@ -1051,6 +1154,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_presigned_redirect", "path", path)...)
 		metricEvent(r.Context(), "fs_read", "result", "ok")
+		recordTenantFileBytes(r.Context(), "fs", "read", "read", plan.Size)
 		http.Redirect(w, r, plan.PresignURL, http.StatusFound)
 		return
 	}
@@ -1064,6 +1168,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "read_ok", "path", path, "bytes", len(plan.InlineData))...)
 	metricEvent(r.Context(), "fs_read", "result", "ok")
+	recordTenantFileBytes(r.Context(), "fs", "read", "read", int64(len(plan.InlineData)))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(plan.InlineData)))
 	_, _ = w.Write(plan.InlineData)
@@ -1360,6 +1465,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 				errJSON(w, http.StatusConflict, err.Error())
 				return
 			}
+			if errJSONInvalidRootDentry(w, err) {
+				metricEvent(r.Context(), "fs_write", "result", "error")
+				return
+			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_upload_initiate_failed", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSONInternalStorage(w)
@@ -1412,6 +1521,10 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "write_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSONInternalStorage(w)
@@ -1419,6 +1532,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_ok", "path", path, "bytes", len(data))...)
 	metricEvent(r.Context(), "fs_write", "result", "ok")
+	recordTenantFileBytes(r.Context(), "fs", "write", "write", int64(len(data)))
 	s.publishEvent(r, path, "write")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": committedRevision})
 }
@@ -1500,6 +1614,10 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_not_found", "path", path)...)
 			metricEvent(r.Context(), "fs_patch", "result", "error")
 			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_patch", "result", "error")
 			return
 		}
 		if errors.Is(err, backend.ErrNotS3Stored) || errors.Is(err, backend.ErrS3NotConfigured) {
@@ -1594,6 +1712,10 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_not_found", "path", path)...)
 			metricEvent(r.Context(), "fs_append", "result", "error")
 			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_append", "result", "error")
 			return
 		}
 		if errors.Is(err, backend.ErrNotS3Stored) || errors.Is(err, backend.ErrS3NotConfigured) {
@@ -1739,6 +1861,13 @@ func (s *Server) handleBatchReadSmall(w http.ResponseWriter, r *http.Request) {
 		}
 		results[i] = s.batchReadSmallOne(r.Context(), b, path, maxBytes)
 	}
+	var readBytes int64
+	for _, result := range results {
+		if result.Status == http.StatusOK {
+			readBytes += int64(len(result.Data))
+		}
+	}
+	recordTenantFileBytes(r.Context(), "fs", "batch_read_small", "read", readBytes)
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "batch_read_small_ok", "count", len(results), "max_bytes", maxBytes)...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(batchReadSmallResponse{Results: results})
@@ -2006,6 +2135,9 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 			errJSON(w, http.StatusNotFound, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "kind", kind, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2041,6 +2173,9 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_not_found", "src_path", srcPath, "dst_path", dstPath)...)
 			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "copy_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
@@ -2084,6 +2219,9 @@ func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath 
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "hardlink_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2125,6 +2263,9 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "rename_failed", "old_path", oldPath, "new_path", newPath, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2154,6 +2295,9 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_conflict", "path", path, "error", err)...)
 			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "mkdir_failed", "path", path, "error", err)...)
@@ -2195,6 +2339,9 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusNotFound, "not found")
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "chmod_failed", "path", path, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2217,6 +2364,9 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_conflict", "path", path, "error", err)...)
 			errJSON(w, http.StatusConflict, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "create_failed", "path", path, "error", err)...)
@@ -2278,6 +2428,9 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "symlink_failed", "path", path, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
@@ -2324,6 +2477,13 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "uploads_list_failed", "path", path, "status", status, "error", err)...)
 		metricEvent(r.Context(), "metadb_query", "api", "uploads_list", "result", "error")
+		if errors.Is(err, datastore.ErrNotFound) {
+			errJSON(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if errJSONInvalidRootDentry(w, err) {
+			return
+		}
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -2451,6 +2611,10 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "fs_write", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_failed", "path", req.Path, "error", err)...)
 		metricEvent(r.Context(), "fs_write", "result", "error")
 		errJSONInternalStorage(w)
@@ -2562,6 +2726,10 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "upload_complete", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_failed", "upload_id", uploadID, "error", err)...)
 		metricEvent(r.Context(), "upload_complete", "result", "error")
 		errJSONInternalStorage(w)
@@ -2569,6 +2737,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_ok", "upload_id", uploadID)...)
 	metricEvent(r.Context(), "upload_complete", "result", "ok")
+	recordTenantFileBytes(r.Context(), "upload", "complete", "write", upload.TotalSize)
 	s.publishEvent(r, upload.TargetPath, "upload_complete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
@@ -2908,6 +3077,10 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 			errJSON(w, http.StatusConflict, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_failed", "path", req.Path, "error", err)...)
 		metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
 		errJSONInternalStorage(w)
@@ -3118,6 +3291,10 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		if errJSONInvalidRootDentry(w, err) {
+			metricEvent(r.Context(), "v2_upload_complete", "result", "error")
+			return
+		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_failed", "upload_id", uploadID, "error", err)...)
 		metricEvent(r.Context(), "v2_upload_complete", "result", "error")
 		errJSONInternalStorage(w)
@@ -3125,6 +3302,7 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_ok", "upload_id", uploadID)...)
 	metricEvent(r.Context(), "v2_upload_complete", "result", "ok")
+	recordTenantFileBytes(r.Context(), "upload", "complete", "write", upload.TotalSize)
 	s.publishEvent(r, upload.TargetPath, "upload_complete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "completed"})
 }
@@ -3197,6 +3375,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, "failed to provision tenant")
 		return
 	}
+	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
 
 	w.Header().Set("Content-Type", "application/json")
@@ -3248,6 +3427,102 @@ func newProvisionTenantError(status int, message string, err error) *provisionTe
 	return &provisionTenantError{status: status, message: message, err: err}
 }
 
+func defaultTiDBAutoEmbeddingConfig(cfg tenantschema.TiDBAutoEmbeddingConfig) tenantschema.TiDBAutoEmbeddingConfig {
+	if cfg.Model == "" && cfg.Dimensions == 0 {
+		return tenantschema.CurrentTiDBAutoEmbeddingConfig()
+	}
+	return cfg
+}
+
+func (s *Server) defaultAutoEmbeddingProfileForTenant(ctx context.Context, tenantID, provider string, now time.Time) (*meta.TenantAutoEmbeddingProfile, error) {
+	if !tenant.UsesTiDBAutoEmbedding(provider) {
+		return nil, nil
+	}
+	schemaProfile, err := tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
+	if err != nil {
+		return nil, err
+	}
+	if !s.disableDBAutoEmbed {
+		if err := tenantschema.ValidateTiDBAutoEmbeddingProviderConfig(tenantschema.TiDBAutoEmbeddingProviderConfig{
+			Model:   schemaProfile.Model,
+			APIKey:  s.tidbAutoEmbedding.apiKey,
+			APIBase: s.tidbAutoEmbedding.apiBase,
+		}); err != nil {
+			return nil, err
+		}
+	}
+	var apiKeyCipher []byte
+	if s.tidbAutoEmbedding.apiKey != "" {
+		cipher, err := s.pool.Encrypt(ctx, []byte(s.tidbAutoEmbedding.apiKey))
+		if err != nil {
+			return nil, fmt.Errorf("encrypt tenant auto-embedding api key: %w", err)
+		}
+		apiKeyCipher = cipher
+	}
+	return &meta.TenantAutoEmbeddingProfile{
+		TenantID:     tenantID,
+		Model:        schemaProfile.Model,
+		Dimensions:   schemaProfile.Dimensions,
+		OptionsJSON:  schemaProfile.OptionsJSON,
+		APIBase:      s.tidbAutoEmbedding.apiBase,
+		APIKeyCipher: apiKeyCipher,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}, nil
+}
+
+func (s *Server) copyAutoEmbeddingProfileForFork(ctx context.Context, sourceTenantID, forkTenantID, provider string, now time.Time) error {
+	if !tenant.UsesTiDBAutoEmbedding(provider) {
+		return nil
+	}
+	sourceProfile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, sourceTenantID)
+	if err != nil {
+		return err
+	}
+	return s.meta.UpsertTenantAutoEmbeddingProfile(ctx, &meta.TenantAutoEmbeddingProfile{
+		TenantID:     forkTenantID,
+		Model:        sourceProfile.Model,
+		Dimensions:   sourceProfile.Dimensions,
+		OptionsJSON:  sourceProfile.OptionsJSON,
+		APIBase:      sourceProfile.APIBase,
+		APIKeyCipher: append([]byte(nil), sourceProfile.APIKeyCipher...),
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	})
+}
+
+func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID string) (tenantschema.TiDBAutoEmbeddingProfile, error) {
+	if s.meta == nil {
+		return tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
+	}
+	profile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, tenantID)
+	if err != nil {
+		return tenantschema.TiDBAutoEmbeddingProfile{}, err
+	}
+	return tenantschema.TiDBAutoEmbeddingProfile{
+		Model:       profile.Model,
+		Dimensions:  profile.Dimensions,
+		OptionsJSON: profile.OptionsJSON,
+	}, nil
+}
+
+func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(context.Context, string) error) func(context.Context, string) error {
+	if !tenant.UsesTiDBAutoEmbedding(provider) {
+		return fallback
+	}
+	profileAware, ok := s.provisioner.(autoEmbeddingSchemaProvisioner)
+	if !ok {
+		return fallback
+	}
+	return func(ctx context.Context, dsn string) error {
+		profile, err := s.autoEmbeddingProfileForTenant(ctx, tenantID)
+		if err != nil {
+			return fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
+		}
+		return profileAware.InitSchemaForAutoEmbeddingProfile(ctx, dsn, profile)
+	}
+}
+
 func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOptions) (*provisionTenantResult, error) {
 	rawProvider := s.provisioner.ProviderType()
 	provider, err := tenant.NormalizeProvider(rawProvider)
@@ -3258,12 +3533,19 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	tenantID := token.NewID()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
+	setRequestMetricTenant(ctx, tenantID, "", provider, tenantRequestClass{surface: "provision", action: "post"})
 
 	keyName := strings.TrimSpace(opts.KeyName)
 	if keyName == "" {
 		keyName = "default"
 	}
 	now := time.Now().UTC()
+	autoProfile, err := s.defaultAutoEmbeddingProfileForTenant(ctx, tenantID, provider, now)
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_auto_embedding_profile_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to build tenant auto-embedding profile", err)
+	}
 	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantPending,
@@ -3285,10 +3567,22 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
 
+	if autoProfile != nil {
+		if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, autoProfile); err != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_auto_embedding_profile_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+				logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+			}
+			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant auto-embedding profile", err)
+		}
+	}
+
 	cluster, err := s.provisioner.Provision(ctx, tenantID)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
+		s.persistFailedProvisionClusterInfo(context.Background(), tenantID, provider, cluster)
 		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
 		}
@@ -3355,13 +3649,41 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}, nil
 }
 
+func (s *Server) persistFailedProvisionClusterInfo(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo) {
+	if cluster == nil || cluster.ClusterID == "" {
+		return
+	}
+	cluster.Provider = provider
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
+	if err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_encrypt_password_failed", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
+		return
+	}
+	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
+		DBHost:           cluster.Host,
+		DBPort:           cluster.Port,
+		DBUser:           cluster.Username,
+		DBPasswordCipher: cipherPass,
+		DBName:           cluster.DBName,
+		DBTLS:            true,
+		Provider:         provider,
+		ClusterID:        cluster.ClusterID,
+		ClaimURL:         cluster.ClaimURL,
+		ClaimExpiresAt:   cluster.ClaimExpiresAt,
+	}); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_persist_connection_failed", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
+		return
+	}
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_failed_cluster_persisted", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID)...)
+}
+
 func (s *Server) startProvisionedTenantSchemaInit(ctx context.Context, res *provisionTenantResult) {
 	if res == nil || res.TenantID == "" || res.TenantDSN == "" || s.provisioner == nil {
 		return
 	}
 	// Tenant remains in provisioning state until schema initialization succeeds.
 	s.startServerWorker(ctx, func(workerCtx context.Context) {
-		s.initTenantSchemaAsync(workerCtx, res.TenantID, res.TenantDSN, res.Provider, s.provisioner.InitSchema)
+		s.initTenantSchemaAsync(workerCtx, res.TenantID, res.TenantDSN, res.Provider, s.schemaInitForTenant(res.TenantID, res.Provider, s.provisioner.InitSchema))
 	})
 }
 
@@ -3408,6 +3730,7 @@ func (s *Server) issueOwnerAPIKey(ctx context.Context, tenantID, keyName string,
 // compatibility path so e2e scripts can obtain one stable API key without
 // enabling the multi-tenant provision flow.
 func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Request) {
+	setRequestMetricTenant(r.Context(), "local", "local", "local", classifyTenantRequest(r))
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_requested", "tenant_id", "local", "provider", "local")...)
 	metricEvent(r.Context(), "tenant_provision", "provider", "local", "result", "ok")
 	w.Header().Set("Content-Type", "application/json")
@@ -3509,6 +3832,14 @@ func errJSON(w http.ResponseWriter, code int, msg string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
+func errJSONInvalidRootDentry(w http.ResponseWriter, err error) bool {
+	if !errors.Is(err, datastore.ErrInvalidRootDentry) {
+		return false
+	}
+	errJSON(w, http.StatusBadRequest, err.Error())
+	return true
+}
+
 const internalStorageErrorMessage = "storage backend unavailable; contact support"
 
 func errJSONInternalStorage(w http.ResponseWriter) {
@@ -3590,6 +3921,14 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if layerRef := strings.TrimSpace(r.URL.Query().Get("layer")); layerRef != "" {
+		results, err = overlayFSLayerGrep(r.Context(), b, layerRef, query, path, limit, results)
+		if err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_layer_failed", "path", path, "query_len", len(query), "limit", limit, "layer", layerRef, "error", err)...)
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	metricEvent(r.Context(), "userdb_query", "api", "grep", "result", "ok")
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "grep_ok", "path", path, "query_len", len(query), "limit", limit, "results", len(results))...)
 	w.Header().Set("Content-Type", "application/json")
@@ -3666,8 +4005,262 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if layerRef := strings.TrimSpace(q.Get("layer")); layerRef != "" {
+		results, err = overlayFSLayerFind(r.Context(), b, layerRef, f, results)
+		if err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_layer_failed", "path", path, "layer", layerRef, "error", err)...)
+			errJSON(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	metricEvent(r.Context(), "userdb_query", "api", "find", "result", "ok")
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "find_ok", "path", path, "results", len(results), "name", f.NameGlob, "tag_key", f.TagKey)...)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(results)
+}
+
+func overlayFSLayerGrep(ctx context.Context, b *backend.Dat9Backend, layerRef, query, pathPrefix string, limit int, base []datastore.SearchResult) ([]datastore.SearchResult, error) {
+	layer, entries, err := resolveSearchLayerEntries(ctx, b, layerRef)
+	if err != nil {
+		return nil, err
+	}
+	if layer == nil {
+		return base, nil
+	}
+	hiddenExact, hiddenDirs := fsLayerHiddenPaths(entries)
+	out := filterLayerHiddenResults(base, hiddenExact, hiddenDirs)
+	seen := make(map[string]struct{}, len(out))
+	for _, r := range out {
+		seen[r.Path] = struct{}{}
+	}
+	queryFold := strings.ToLower(query)
+	for i := range entries {
+		entry := &entries[i]
+		if _, ok := seen[entry.Path]; ok {
+			continue
+		}
+		if entry.Op != datastore.FSLayerEntryOpUpsert && entry.Op != datastore.FSLayerEntryOpSymlink {
+			continue
+		}
+		if !fsLayerSearchPathMatches(entry.Path, pathPrefix) {
+			continue
+		}
+		matched, err := fsLayerEntryContains(ctx, b, entry, queryFold)
+		if err != nil {
+			return nil, err
+		}
+		if !matched {
+			continue
+		}
+		out = append(out, datastore.SearchResult{
+			Path:      entry.Path,
+			Name:      pathutil.BaseName(entry.Path),
+			SizeBytes: entry.SizeBytes,
+		})
+		seen[entry.Path] = struct{}{}
+		if limit > 0 && len(out) >= limit {
+			return out[:limit], nil
+		}
+	}
+	if limit > 0 && len(out) > limit {
+		return out[:limit], nil
+	}
+	return out, nil
+}
+
+func fsLayerEntryContains(ctx context.Context, b *backend.Dat9Backend, entry *datastore.FSLayerEntry, queryFold string) (bool, error) {
+	if queryFold == "" {
+		return true, nil
+	}
+	if entry.Op == datastore.FSLayerEntryOpSymlink {
+		data := []byte(entry.ContentText)
+		if len(data) == 0 {
+			data = entry.ContentBlob
+		}
+		return strings.Contains(strings.ToLower(string(data)), queryFold), nil
+	}
+	rc, err := b.OpenFSLayerEntryData(ctx, entry)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = rc.Close() }()
+	buf := make([]byte, 64*1024)
+	overlap := ""
+	overlapBytes := len(queryFold)*4 + 8
+	for {
+		n, readErr := rc.Read(buf)
+		if n > 0 {
+			raw := overlap + string(buf[:n])
+			if strings.Contains(strings.ToLower(raw), queryFold) {
+				return true, nil
+			}
+			if len(raw) > overlapBytes {
+				overlap = raw[len(raw)-overlapBytes:]
+			} else {
+				overlap = raw
+			}
+		}
+		if errors.Is(readErr, io.EOF) {
+			return false, nil
+		}
+		if readErr != nil {
+			return false, readErr
+		}
+	}
+}
+
+func overlayFSLayerFind(ctx context.Context, b *backend.Dat9Backend, layerRef string, filter *datastore.FindFilter, base []datastore.SearchResult) ([]datastore.SearchResult, error) {
+	layer, entries, err := resolveSearchLayerEntries(ctx, b, layerRef)
+	if err != nil {
+		return nil, err
+	}
+	if layer == nil {
+		return base, nil
+	}
+	hiddenExact, hiddenDirs := fsLayerHiddenPaths(entries)
+	out := filterLayerHiddenResults(base, hiddenExact, hiddenDirs)
+	seen := make(map[string]struct{}, len(out))
+	for _, r := range out {
+		seen[r.Path] = struct{}{}
+	}
+	for i := range entries {
+		entry := &entries[i]
+		if entry.Op == datastore.FSLayerEntryOpWhiteout || entry.Op == datastore.FSLayerEntryOpChmod || entry.Op == datastore.FSLayerEntryOpRename {
+			continue
+		}
+		if _, ok := seen[entry.Path]; ok {
+			continue
+		}
+		if !fsLayerFindEntryMatches(entry, filter) {
+			continue
+		}
+		out = append(out, datastore.SearchResult{
+			Path:      entry.Path,
+			Name:      pathutil.BaseName(entry.Path),
+			SizeBytes: entry.SizeBytes,
+		})
+		seen[entry.Path] = struct{}{}
+		if filter != nil && filter.Limit > 0 && len(out) >= filter.Limit {
+			return out[:filter.Limit], nil
+		}
+	}
+	if filter != nil && filter.Limit > 0 && len(out) > filter.Limit {
+		return out[:filter.Limit], nil
+	}
+	return out, nil
+}
+
+func resolveSearchLayerEntries(ctx context.Context, b *backend.Dat9Backend, layerRef string) (*datastore.FSLayer, []datastore.FSLayerEntry, error) {
+	if b == nil || b.Store() == nil {
+		return nil, nil, fmt.Errorf("missing backend store")
+	}
+	layer, err := b.Store().ResolveFSLayerRef(ctx, layerRef)
+	if err != nil {
+		return nil, nil, err
+	}
+	switch layer.State {
+	case datastore.FSLayerStateActive, datastore.FSLayerStateSealed, datastore.FSLayerStateCommitting:
+	default:
+		return nil, nil, fmt.Errorf("fs layer %s is %s", layer.LayerID, layer.State)
+	}
+	entries, err := b.Store().ListFSLayerEntries(ctx, layer.LayerID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return layer, entries, nil
+}
+
+func fsLayerHiddenPaths(entries []datastore.FSLayerEntry) (map[string]struct{}, []string) {
+	exact := make(map[string]struct{})
+	var dirs []string
+	for i := range entries {
+		entry := &entries[i]
+		switch entry.Op {
+		case datastore.FSLayerEntryOpUpsert, datastore.FSLayerEntryOpSymlink, datastore.FSLayerEntryOpMkdir:
+			exact[entry.Path] = struct{}{}
+		case datastore.FSLayerEntryOpWhiteout:
+			exact[entry.Path] = struct{}{}
+			if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
+				dir := entry.Path
+				if !strings.HasSuffix(dir, "/") {
+					dir += "/"
+				}
+				dirs = append(dirs, dir)
+			}
+		case datastore.FSLayerEntryOpRename:
+			exact[entry.Path] = struct{}{}
+			target := strings.TrimSpace(entry.ContentText)
+			if target == "" && len(entry.ContentBlob) > 0 {
+				target = strings.TrimSpace(string(entry.ContentBlob))
+			}
+			if target != "" {
+				exact[target] = struct{}{}
+			}
+		}
+	}
+	return exact, dirs
+}
+
+func filterLayerHiddenResults(base []datastore.SearchResult, exact map[string]struct{}, dirs []string) []datastore.SearchResult {
+	out := make([]datastore.SearchResult, 0, len(base))
+	for _, result := range base {
+		if _, hidden := exact[result.Path]; hidden {
+			continue
+		}
+		hidden := false
+		for _, dir := range dirs {
+			if strings.HasPrefix(result.Path, dir) {
+				hidden = true
+				break
+			}
+		}
+		if !hidden {
+			out = append(out, result)
+		}
+	}
+	return out
+}
+
+func fsLayerSearchPathMatches(path, prefix string) bool {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" || prefix == "/" {
+		return strings.HasPrefix(path, "/")
+	}
+	if strings.HasSuffix(prefix, "/") {
+		return path == prefix || strings.HasPrefix(path, prefix)
+	}
+	return path == prefix || strings.HasPrefix(path, prefix+"/")
+}
+
+func fsLayerFindEntryMatches(entry *datastore.FSLayerEntry, filter *datastore.FindFilter) bool {
+	if entry == nil {
+		return false
+	}
+	if filter != nil {
+		if !fsLayerSearchPathMatches(entry.Path, filter.PathPrefix) {
+			return false
+		}
+		if filter.TagKey != "" {
+			return false
+		}
+		if filter.NameGlob != "" {
+			matched, err := pathpkg.Match(filter.NameGlob, pathutil.BaseName(entry.Path))
+			if err != nil || !matched {
+				return false
+			}
+		}
+		if filter.After != nil && !entry.UpdatedAt.After(*filter.After) {
+			return false
+		}
+		if filter.Before != nil && !entry.UpdatedAt.Before(*filter.Before) {
+			return false
+		}
+		if filter.MinSize > 0 && entry.SizeBytes < filter.MinSize {
+			return false
+		}
+		if filter.MaxSize > 0 && entry.SizeBytes > filter.MaxSize {
+			return false
+		}
+	}
+	return true
 }

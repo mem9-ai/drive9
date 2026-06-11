@@ -30,6 +30,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/slockoauth"
 	"github.com/mem9-ai/dat9/pkg/tenant"
 	"github.com/mem9-ai/dat9/pkg/tenant/db9"
+	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 	"github.com/mem9-ai/dat9/pkg/tenant/starter"
 	"github.com/mem9-ai/dat9/pkg/tenant/tidbzero"
 )
@@ -66,6 +67,7 @@ func main() {
 			_, _ = fmt.Fprint(os.Stdout, versionText())
 			return
 		case "schema":
+			die(schema.ConfigureTiDBAutoEmbeddingFromEnv())
 			die(runSchemaCommand(os.Args[2:]))
 			return
 		case "backfill-quota":
@@ -76,6 +78,9 @@ func main() {
 	if len(os.Args) > 2 {
 		usage(os.Stderr, 2)
 	}
+	autoEmbeddingConfig, err := schema.TiDBAutoEmbeddingConfigFromEnv()
+	die(err)
+	die(schema.ConfigureTiDBAutoEmbedding(autoEmbeddingConfig))
 
 	addr := envOr("DRIVE9_LISTEN_ADDR", defaultListenAddr)
 	if len(os.Args) == 2 {
@@ -103,6 +108,8 @@ func main() {
 	if err != nil {
 		die(err)
 	}
+	autoEmbeddingAPIKey := strings.TrimSpace(os.Getenv(schema.EnvTiDBAutoEmbeddingAPIKey))
+	autoEmbeddingAPIBase := strings.TrimSpace(os.Getenv(schema.EnvTiDBAutoEmbeddingAPIBase))
 	semanticEmbedder, semanticWorkerOpts, err := buildSemanticWorkerConfigFromEnv()
 	if err != nil {
 		die(err)
@@ -135,6 +142,7 @@ func main() {
 	encryptType := envOr("DRIVE9_ENCRYPT_TYPE", "local_aes")
 	masterHex := os.Getenv("DRIVE9_MASTER_KEY")
 	kmsKey := os.Getenv("DRIVE9_ENCRYPT_KEY")
+	aliyunKMSEndpoint := strings.TrimSpace(os.Getenv("DRIVE9_ALIYUN_KMS_ENDPOINT"))
 	tokenHex := os.Getenv("DRIVE9_TOKEN_SIGNING_KEY")
 	vaultMKHex := os.Getenv("DRIVE9_VAULT_MASTER_KEY")
 	providerType := envOr("DRIVE9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
@@ -152,6 +160,14 @@ func main() {
 	providerType, err = tenant.NormalizeProvider(providerType)
 	if err != nil {
 		die(err)
+	}
+	disableDatabaseAutoEmbedding := envBool("DRIVE9_DISABLE_AUTO_EMBEDDING", false)
+	if tenant.UsesTiDBAutoEmbedding(providerType) && !disableDatabaseAutoEmbedding {
+		die(schema.ValidateTiDBAutoEmbeddingProviderConfig(schema.TiDBAutoEmbeddingProviderConfig{
+			Model:   autoEmbeddingConfig.Model,
+			APIKey:  autoEmbeddingAPIKey,
+			APIBase: autoEmbeddingAPIBase,
+		}))
 	}
 	logger.Info(context.Background(), "tenant_provider_selected", zap.String("provider", providerType))
 
@@ -192,9 +208,10 @@ func main() {
 			eKey = kmsKey
 		}
 		enc, err := encrypt.New(context.Background(), encrypt.Config{
-			Type:   eType,
-			Key:    eKey,
-			Region: s3cfg.Region,
+			Type:              eType,
+			Key:               eKey,
+			Region:            s3cfg.Region,
+			AliyunKMSEndpoint: aliyunKMSEndpoint,
 		})
 		if err != nil {
 			die(fmt.Errorf("create encryptor: %w", err))
@@ -205,19 +222,20 @@ func main() {
 		}
 
 		pool = tenant.NewPool(tenant.PoolConfig{
-			S3Dir:              s3cfg.Dir,
-			PublicURL:          publicBaseURL(addr),
-			S3Bucket:           s3cfg.Bucket,
-			S3Region:           s3cfg.Region,
-			S3Prefix:           s3cfg.Prefix,
-			S3RoleARN:          s3cfg.RoleARN,
-			S3Endpoint:         s3cfg.Endpoint,
-			S3ForcePathStyle:   s3cfg.ForcePathStyle,
-			S3AccessKeyID:      s3cfg.AccessKeyID,
-			S3SecretAccessKey:  s3cfg.SecretAccessKey,
-			S3SessionToken:     s3cfg.SessionToken,
-			S3EncryptionPolicy: s3cfg.EncryptionPolicy,
-			BackendOptions:     backendOptions,
+			S3Dir:                        s3cfg.Dir,
+			PublicURL:                    publicBaseURL(addr),
+			S3Bucket:                     s3cfg.Bucket,
+			S3Region:                     s3cfg.Region,
+			S3Prefix:                     s3cfg.Prefix,
+			S3RoleARN:                    s3cfg.RoleARN,
+			S3Endpoint:                   s3cfg.Endpoint,
+			S3ForcePathStyle:             s3cfg.ForcePathStyle,
+			S3AccessKeyID:                s3cfg.AccessKeyID,
+			S3SecretAccessKey:            s3cfg.SecretAccessKey,
+			S3SessionToken:               s3cfg.SessionToken,
+			S3EncryptionPolicy:           s3cfg.EncryptionPolicy,
+			BackendOptions:               backendOptions,
+			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 		}, enc)
 		defer pool.Close()
 	}
@@ -243,17 +261,21 @@ func main() {
 		// for db9-only pools, which never hit that path but still get forced to configure
 		// DRIVE9_EMBED_* when async extract is wired on the template (PR #159 review).
 		if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
-			Meta:             store,
-			Pool:             pool,
-			Provisioner:      provisioner,
-			TokenSecret:      tokenSecret,
-			VaultMasterKey:   vaultMasterKey,
-			S3Dir:            s3cfg.Dir,
-			MaxUploadBytes:   maxUploadBytes,
-			InlineThreshold:  backendOptions.InlineThreshold,
-			Logger:           srvLogger,
-			SemanticEmbedder: semanticEmbedder,
-			SemanticWorkers:  semanticWorkerOpts,
+			Meta:                         store,
+			Pool:                         pool,
+			Provisioner:                  provisioner,
+			TokenSecret:                  tokenSecret,
+			VaultMasterKey:               vaultMasterKey,
+			S3Dir:                        s3cfg.Dir,
+			MaxUploadBytes:               maxUploadBytes,
+			InlineThreshold:              backendOptions.InlineThreshold,
+			Logger:                       srvLogger,
+			SemanticEmbedder:             semanticEmbedder,
+			SemanticWorkers:              semanticWorkerOpts,
+			TiDBAutoEmbeddingConfig:      autoEmbeddingConfig,
+			TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
+			TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
+			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 		}, backendOptions, false); err != nil {
 			die(err)
 		}
@@ -270,20 +292,24 @@ func main() {
 	}
 
 	die(server.NewWithConfig(server.Config{
-		Meta:             store,
-		Pool:             pool,
-		Provisioner:      provisioner,
-		TokenSecret:      tokenSecret,
-		VaultMasterKey:   vaultMasterKey,
-		VaultIssuerURL:   vaultIssuerURL(addr),
-		PublicURL:        publicBaseURL(addr),
-		S3Dir:            s3cfg.Dir,
-		MaxUploadBytes:   maxUploadBytes,
-		InlineThreshold:  backendOptions.InlineThreshold,
-		Logger:           srvLogger,
-		SemanticEmbedder: semanticEmbedder,
-		SemanticWorkers:  semanticWorkerOpts,
-		SlockOAuth:       slockOAuth,
+		Meta:                         store,
+		Pool:                         pool,
+		Provisioner:                  provisioner,
+		TokenSecret:                  tokenSecret,
+		VaultMasterKey:               vaultMasterKey,
+		VaultIssuerURL:               vaultIssuerURL(addr),
+		PublicURL:                    publicBaseURL(addr),
+		S3Dir:                        s3cfg.Dir,
+		MaxUploadBytes:               maxUploadBytes,
+		InlineThreshold:              backendOptions.InlineThreshold,
+		Logger:                       srvLogger,
+		SemanticEmbedder:             semanticEmbedder,
+		SemanticWorkers:              semanticWorkerOpts,
+		SlockOAuth:                   slockOAuth,
+		TiDBAutoEmbeddingConfig:      autoEmbeddingConfig,
+		TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
+		TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
+		DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 	}).ListenAndServe(addr))
 }
 
@@ -383,13 +409,29 @@ environment:
   DRIVE9_ENCRYPT_TYPE local_aes|kms|aliyun_kms
   DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
   DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms), Aliyun KMS key id (required for aliyun_kms)
+  DRIVE9_ALIYUN_KMS_ENDPOINT custom Aliyun KMS endpoint, e.g. a VPC endpoint (no https:// prefix)
+                             note: aliyun_kms reads the Aliyun region from DRIVE9_S3_REGION
+                             note: TLS verification is skipped automatically when this is set
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
+  DRIVE9_DISABLE_AUTO_EMBEDDING true|false disable TiDB database-managed auto-embedding (default: false)
+                                set to true when the TiDB Cloud cluster has no supported embedding provider
+  DRIVE9_TIDB_AUTO_EMBEDDING_MODEL TiDB EMBED_TEXT model for auto-embedding generated columns
+                                   supported provider prefixes include tidbcloud_free/amazon, tidbcloud_free/cohere,
+                                   openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
+                                   (default: tidbcloud_free/amazon/titan-embed-text-v2)
+  DRIVE9_TIDB_AUTO_EMBEDDING_DIMENSIONS TiDB EMBED_TEXT vector dimensions
+                                        known models use documented defaults; unknown BYOK models require this value
+  DRIVE9_TIDB_AUTO_EMBEDDING_API_KEY provider API key for BYOK auto-embedding models
+                                    required by openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
+  DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE provider base endpoint for models that require it
+                                     optional for openai models; set it for Azure OpenAI endpoints
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
+  DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default Starter spendingLimit.monthly in USD cents; applied after pool takeover
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
   DRIVE9_SLOCK_API_ORIGIN Slock API origin (required when DRIVE9_SLOCK_ORIGIN is set)
   DRIVE9_SLOCK_CLIENT_ID Slock connected-app client id (required when DRIVE9_SLOCK_ORIGIN is set)
@@ -689,7 +731,16 @@ func buildAudioExtractOptionsFromEnv() (backend.AsyncAudioExtractOptions, error)
 }
 
 func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorkerOptions, error) {
-	var opts server.SemanticWorkerOptions
+	opts := server.SemanticWorkerOptions{
+		Workers:              envInt("DRIVE9_SEMANTIC_WORKERS", 1),
+		PollInterval:         time.Duration(envInt("DRIVE9_SEMANTIC_POLL_INTERVAL_MS", 200)) * time.Millisecond,
+		LeaseDuration:        time.Duration(envInt("DRIVE9_SEMANTIC_LEASE_SECONDS", 30)) * time.Second,
+		RecoverInterval:      time.Duration(envInt("DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
+		RetryBaseDelay:       time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
+		RetryMaxDelay:        time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
+		TenantScanLimit:      envInt("DRIVE9_SEMANTIC_TENANT_LIMIT", 128),
+		PerTenantConcurrency: envInt("DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
+	}
 	baseURL := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_API_BASE"))
 	apiKey := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_API_KEY"))
 	model := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_MODEL"))
@@ -709,16 +760,6 @@ func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorker
 	})
 	if err != nil {
 		return nil, opts, fmt.Errorf("init semantic embedder: %w", err)
-	}
-	opts = server.SemanticWorkerOptions{
-		Workers:              envInt("DRIVE9_SEMANTIC_WORKERS", 1),
-		PollInterval:         time.Duration(envInt("DRIVE9_SEMANTIC_POLL_INTERVAL_MS", 200)) * time.Millisecond,
-		LeaseDuration:        time.Duration(envInt("DRIVE9_SEMANTIC_LEASE_SECONDS", 30)) * time.Second,
-		RecoverInterval:      time.Duration(envInt("DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
-		RetryBaseDelay:       time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
-		RetryMaxDelay:        time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
-		TenantScanLimit:      envInt("DRIVE9_SEMANTIC_TENANT_LIMIT", 128),
-		PerTenantConcurrency: envInt("DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
 	}
 	logger.Info(context.Background(), "semantic_embedding_mode_openai_compatible",
 		zap.String("model", model), zap.String("base_url", baseURL))

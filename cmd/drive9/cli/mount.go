@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,12 +30,23 @@ const (
 	defaultFuseReadConcurrency         = 24
 	defaultFuseParallelReadConcurrency = 4
 	defaultFuseParallelReadBlockSizeMB = 1
+	defaultMountBackgroundReadyTimeout = 30 * time.Second
 )
 
 var (
 	errMountProcessStateStale  = errors.New("drive9 umount: stale mount process state")
 	errMountProcessStateUnsafe = errors.New("drive9 umount: unsafe mount process state")
 )
+
+type mountBackgroundRequest struct {
+	Args       []string
+	MountPoint string
+	Server     string
+	APIKey     string
+	Token      string
+}
+
+var startMountBackground = startMountBackgroundImpl
 
 // MountCmd handles the "drive9 mount" command.
 //
@@ -58,10 +71,10 @@ func MountCmd(args []string) error {
 	fmt.Fprint(os.Stderr, buildinfo.String("drive9 mount"))
 	if len(args) > 0 {
 		if args[0] == "vault" {
-			return VaultMountCmd(args[1:])
+			return vaultMountCmd(args[1:], true)
 		}
 	}
-	return fsMountCmd(args)
+	return fsMountCmdWithBackground(args, true)
 }
 
 // fsMountCmd is the pre-V2e writable fs mount entry point.
@@ -81,14 +94,21 @@ func MountCmd(args []string) error {
 // `vault reauth` is not part of M1; see docs/specs/vault-interaction-end-state.md
 // section 17.
 //
-// drive9fuse.Mount runs in-process (no fork/exec); credentials flow through
-// MountOptions{Server, APIKey, Token}, not through the child's environment.
-// This makes the resolver's Unsetenv-after-read mitigation safe for mount.
+// In foreground mode, drive9fuse.Mount runs in-process and credentials flow
+// through MountOptions{Server, APIKey, Token}. In default background mode,
+// this command starts a fresh `drive9 mount --foreground` child and passes the
+// resolved credential snapshot through that child's environment; the child
+// consumes and unsets those env vars through the normal resolver path.
 func fsMountCmd(args []string) error {
+	return fsMountCmdWithBackground(args, false)
+}
+
+func fsMountCmdWithBackground(args []string, background bool) error {
 	fs := flag.NewFlagSet("mount", flag.ExitOnError)
 	server := fs.String("server", "", "drive9 server URL (overrides $DRIVE9_SERVER and config)")
 	apiKey := fs.String("api-key", "", "owner API key (overrides $DRIVE9_API_KEY and config)")
 	mode := fs.String("mode", "auto", "mount mode: auto, fuse, or webdav")
+	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
 	cacheDir := fs.String("cache-dir", "", "write-back cache directory (default ~/.cache/drive9)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 1, "maximum single file size admitted to read cache in MB")
@@ -112,12 +132,17 @@ func fsMountCmd(args []string) error {
 	prefetchTimeout := fs.Duration("readdir-prefetch-timeout", time.Second, "timeout for one readdir prefetch batch")
 	trustProcessLocalEvents := fs.Bool("trust-process-local-events", false, "allow revision-bound GetAttr dir-cache hits using process-local SSE freshness; only safe for single-server/sticky routing or cluster-wide event streams")
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
-	profile := fs.String("profile", "", "mount profile: interactive, coding-agent (empty for default)")
-	localRoot := fs.String("local-root", "", "local-only overlay storage root for --profile=coding-agent")
+	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
+	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
+	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, interactive, or a ~/.drive9/profiles/<name> file")
+	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	var localOnlyPatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
-	fs.Var(&localOnlyPatterns, "local-only", "additional local-only path pattern for coding-agent overlay routing (repeatable, e.g. **/node_modules/**)")
-	fs.Var(&remoteOnlyPatterns, "remote-only", "remote-persistent override path pattern for coding-agent overlay routing (repeatable)")
+	var unpackArchives stringListFlag
+	noAutoUnpack := fs.Bool("no-auto-unpack", false, "disable automatic profile pack restore before mounting")
+	fs.Var(&localOnlyPatterns, "local-only", "additional local-only path pattern for overlay routing (repeatable, e.g. **/node_modules/**)")
+	fs.Var(&remoteOnlyPatterns, "remote-only", "remote-persistent override path pattern for overlay routing (repeatable)")
+	fs.Var(&unpackArchives, "unpack", "restore a drive9 pack archive into --local-root before mounting (repeatable)")
 	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
@@ -186,10 +211,25 @@ func fsMountCmd(args []string) error {
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
 	}
-	normalizedLocalRoot := strings.TrimSpace(*localRoot)
-	if err := validateMountProfileFlags(*profile, normalizedLocalRoot, localOnlyPatterns, remoteOnlyPatterns); err != nil {
-		return err
+
+	profileGiven := flagProvided(fs, "profile")
+	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
+	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
+	var profileCfg profileConfig
+	if !profileGiven && resolved == MountModeWebDAV {
+		profileCfg = builtinNoneProfile()
+	} else {
+		var err error
+		profileCfg, err = loadProfileConfig(*profile)
+		if err != nil {
+			return err
+		}
 	}
+	*profile = profileCfg.Name
+	effectiveLocalOnlyPatterns := mergeProfileValues(profileCfg.LocalOnlyPatterns, localOnlyPatterns)
+	effectiveRemoteOnlyPatterns := mergeProfileValues(profileCfg.RemoteOnlyPatterns, remoteOnlyPatterns)
+	effectivePackPaths := mergeProfileValues(profileCfg.PackPaths)
+	normalizedLocalRoot := strings.TrimSpace(*localRoot)
 	syncModeVal, writePolicyVal, err := parseFuseDurability(*durability)
 	if err != nil {
 		return err
@@ -217,30 +257,27 @@ func fsMountCmd(args []string) error {
 		return err
 	}
 
-	// Resolve auto mode to a concrete backend.
-	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
-	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
-	if *profile == "coding-agent" && resolved != MountModeFUSE {
-		return fmt.Errorf("drive9 mount: --profile=coding-agent requires --mode=fuse")
+	overlayProfile := profileAllowsOverlay(profileCfg.Name)
+	if overlayProfile && resolved != MountModeFUSE {
+		return fmt.Errorf("drive9 mount: --profile=%s requires --mode=fuse", profileCfg.Name)
 	}
-
 	if resolved == MountModeWebDAV && *readOnly {
 		return fmt.Errorf("drive9 mount: --read-only is not supported with WebDAV mode")
 	}
 	if resolved == MountModeWebDAV && trustProcessLocalEventsGiven {
 		return fmt.Errorf("drive9 mount: --trust-process-local-events is only supported with --mode=fuse")
 	}
-	if runtime.GOOS == "windows" && resolved == MountModeFUSE {
-		return mountFuse(&mountFuseOptions{
-			MountPoint:         mountPoint,
-			RemoteRoot:         remoteRoot,
-			Profile:            *profile,
-			LocalRoot:          normalizedLocalRoot,
-			LocalOnlyPatterns:  append([]string(nil), localOnlyPatterns...),
-			RemoteOnlyPatterns: append([]string(nil), remoteOnlyPatterns...),
-			ReadOnly:           *readOnly,
-			Debug:              *debug,
-		})
+	if resolved == MountModeWebDAV && *durability != string(fuseDurabilityAuto) {
+		return fmt.Errorf("--durability is only supported with --mode=fuse; WebDAV mounts always use their native write behavior")
+	}
+	if resolved == MountModeWebDAV && strings.TrimSpace(*layerRef) != "" {
+		return fmt.Errorf("drive9 mount: --layer is only supported with --mode=fuse")
+	}
+	if resolved == MountModeWebDAV && strings.TrimSpace(*checkpointRef) != "" {
+		return fmt.Errorf("drive9 mount: --checkpoint is only supported with --mode=fuse")
+	}
+	if strings.TrimSpace(*checkpointRef) != "" && strings.TrimSpace(*layerRef) == "" {
+		return fmt.Errorf("drive9 mount: --checkpoint requires --layer")
 	}
 
 	serverVal, apiKeyVal, tokenVal, err := resolveMountCredentials(ResolveCredentials(), *server, *apiKey)
@@ -250,11 +287,53 @@ func fsMountCmd(args []string) error {
 	*server, *apiKey = serverVal, apiKeyVal
 	token := tokenVal
 
+	if len(unpackArchives) > 0 {
+		if resolved != MountModeFUSE {
+			return fmt.Errorf("drive9 mount: --unpack is only supported with --mode=fuse")
+		}
+		if !overlayProfile {
+			return fmt.Errorf("drive9 mount: --unpack requires an overlay profile")
+		}
+	}
+	if normalizedLocalRoot == "" && overlayProfile && resolved == MountModeFUSE {
+		normalizedLocalRoot, err = defaultMountLocalRoot(*server, remoteRoot, mountCredentialCacheKey(apiKeyVal, tokenVal))
+		if err != nil {
+			return err
+		}
+	}
+	if err := validateMountProfileFlags(profileCfg.Name, normalizedLocalRoot, effectiveLocalOnlyPatterns, effectiveRemoteOnlyPatterns, effectivePackPaths); err != nil {
+		return err
+	}
+
+	autoUnpack := overlayProfile && len(effectivePackPaths) > 0 && !*noAutoUnpack
+	if runtime.GOOS == "windows" && resolved == MountModeFUSE && len(unpackArchives) == 0 && !autoUnpack {
+		return mountFuse(&mountFuseOptions{
+			MountPoint:         mountPoint,
+			RemoteRoot:         remoteRoot,
+			Profile:            profileCfg.Name,
+			LayerRef:           strings.TrimSpace(*layerRef),
+			CheckpointRef:      strings.TrimSpace(*checkpointRef),
+			LocalRoot:          normalizedLocalRoot,
+			LocalOnlyPatterns:  append([]string(nil), effectiveLocalOnlyPatterns...),
+			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
+			PackPaths:          append([]string(nil), effectivePackPaths...),
+			ReadOnly:           *readOnly,
+			Debug:              *debug,
+		})
+	}
+
+	if background && !*foreground {
+		return startMountBackground(mountBackgroundRequest{
+			Args:       append([]string(nil), args...),
+			MountPoint: mountPoint,
+			Server:     serverVal,
+			APIKey:     apiKeyVal,
+			Token:      tokenVal,
+		})
+	}
+
 	// WebDAV path: create client, start local WebDAV server, invoke mount_webdav.
 	if resolved == MountModeWebDAV {
-		if *durability != string(fuseDurabilityAuto) {
-			return fmt.Errorf("--durability is only supported with --mode=fuse; WebDAV mounts always use their native write behavior")
-		}
 		var c *client.Client
 		if token != "" {
 			c = client.NewWithToken(*server, token)
@@ -271,6 +350,55 @@ func fsMountCmd(args []string) error {
 		}
 
 		return webdavMount(c, mountPoint, remoteRoot)
+	}
+
+	if autoUnpack || len(unpackArchives) > 0 {
+		var c *client.Client
+		if token != "" {
+			c = client.NewWithToken(*server, token)
+		} else {
+			c = client.New(*server, *apiKey)
+		}
+		if autoUnpack {
+			archivePath, err := defaultPackArchivePath(remoteRoot, profileCfg.Name)
+			if err != nil {
+				return err
+			}
+			if _, err := unpackRemoteArchiveIfExists(context.Background(), c, archivePath, unpackOptions{
+				LocalRoot: normalizedLocalRoot,
+				Replace:   true,
+			}); err != nil {
+				return fmt.Errorf("drive9 mount: auto-unpack :%s: %w", archivePath, err)
+			}
+		}
+		for _, archiveArg := range unpackArchives {
+			archiveClient, archivePath, err := clientForRemoteArchiveArg(c, archiveArg)
+			if err != nil {
+				return err
+			}
+			if err := unpackRemoteArchive(context.Background(), archiveClient, archivePath, unpackOptions{
+				LocalRoot: normalizedLocalRoot,
+				Replace:   true,
+			}); err != nil {
+				return fmt.Errorf("drive9 mount: unpack %s: %w", archiveArg, err)
+			}
+		}
+	}
+
+	if runtime.GOOS == "windows" && resolved == MountModeFUSE {
+		return mountFuse(&mountFuseOptions{
+			MountPoint:         mountPoint,
+			RemoteRoot:         remoteRoot,
+			Profile:            profileCfg.Name,
+			LayerRef:           strings.TrimSpace(*layerRef),
+			CheckpointRef:      strings.TrimSpace(*checkpointRef),
+			LocalRoot:          normalizedLocalRoot,
+			LocalOnlyPatterns:  append([]string(nil), effectiveLocalOnlyPatterns...),
+			RemoteOnlyPatterns: append([]string(nil), effectiveRemoteOnlyPatterns...),
+			PackPaths:          append([]string(nil), effectivePackPaths...),
+			ReadOnly:           *readOnly,
+			Debug:              *debug,
+		})
 	}
 
 	// FUSE path (existing behavior).
@@ -300,10 +428,13 @@ func fsMountCmd(args []string) error {
 		TrustLocalEvents:        *trustProcessLocalEvents,
 		SyncMode:                syncModeVal,
 		WritePolicy:             writePolicyVal,
-		Profile:                 *profile,
+		Profile:                 profileCfg.Name,
+		LayerRef:                strings.TrimSpace(*layerRef),
+		CheckpointRef:           strings.TrimSpace(*checkpointRef),
 		LocalRoot:               normalizedLocalRoot,
-		LocalOnlyPatterns:       append([]string(nil), localOnlyPatterns...),
-		RemoteOnlyPatterns:      append([]string(nil), remoteOnlyPatterns...),
+		LocalOnlyPatterns:       append([]string(nil), effectiveLocalOnlyPatterns...),
+		RemoteOnlyPatterns:      append([]string(nil), effectiveRemoteOnlyPatterns...),
+		PackPaths:               append([]string(nil), effectivePackPaths...),
 		UploadConcurrency:       *uploadConcurrency,
 		ReadConcurrency:         *readConcurrency,
 		ParallelReadConcurrency: *parallelReadConcurrency,
@@ -316,6 +447,225 @@ func fsMountCmd(args []string) error {
 	}
 
 	return mountFuse(opts)
+}
+
+func startMountBackgroundImpl(req mountBackgroundRequest) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("drive9 mount: locate executable: %w", err)
+	}
+	logPath, logFile, err := openMountBackgroundLog(req.MountPoint)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = logFile.Close() }()
+
+	devNull, err := os.Open(os.DevNull)
+	if err != nil {
+		return fmt.Errorf("drive9 mount: open %s: %w", os.DevNull, err)
+	}
+	defer func() { _ = devNull.Close() }()
+
+	cmd := exec.Command(exe, foregroundMountCommandArgs(req.Args)...)
+	cmd.Env = mountBackgroundEnv(os.Environ(), req)
+	cmd.Stdin = devNull
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	configureMountBackgroundCommand(cmd)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("drive9 mount: start background mount: %w", err)
+	}
+
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	if err := waitForBackgroundMountReady(req.MountPoint, cmd.Process.Pid, waitCh, logPath, defaultMountBackgroundReadyTimeout); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "drive9: mount running in background (pid: %d, log: %s)\n", cmd.Process.Pid, logPath)
+	fmt.Fprintf(os.Stderr, "drive9: unmount with `drive9 umount %s`\n", req.MountPoint)
+	return nil
+}
+
+func foregroundMountCommandArgs(args []string) []string {
+	out := []string{"mount"}
+	if len(args) > 0 && args[0] == "vault" {
+		out = append(out, "vault", "--foreground")
+		out = append(out, stripBackgroundOnlyCredentialArgs(args[1:])...)
+		return out
+	}
+	out = append(out, "--foreground")
+	out = append(out, stripBackgroundOnlyCredentialArgs(args)...)
+	return out
+}
+
+func stripBackgroundOnlyCredentialArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--api-key" {
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, "--api-key=") {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
+}
+
+func mountBackgroundEnv(environ []string, req mountBackgroundRequest) []string {
+	out := make([]string, 0, len(environ)+2)
+	for _, kv := range environ {
+		if strings.HasPrefix(kv, EnvServer+"=") ||
+			strings.HasPrefix(kv, EnvAPIKey+"=") ||
+			strings.HasPrefix(kv, EnvVaultToken+"=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	if req.Server != "" {
+		out = append(out, EnvServer+"="+req.Server)
+	}
+	if req.Token != "" {
+		out = append(out, EnvVaultToken+"="+req.Token)
+	} else if req.APIKey != "" {
+		out = append(out, EnvAPIKey+"="+req.APIKey)
+	}
+	return out
+}
+
+func openMountBackgroundLog(mountPoint string) (string, *os.File, error) {
+	path, err := mountBackgroundLogPath(mountPoint)
+	if err != nil {
+		return "", nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return "", nil, fmt.Errorf("drive9 mount: open background log %s: %w", path, err)
+	}
+	_, _ = fmt.Fprintf(f, "\n--- drive9 mount background start %s ---\n", time.Now().Format(time.RFC3339))
+	return path, f, nil
+}
+
+func mountBackgroundLogPath(mountPoint string) (string, error) {
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheRoot) == "" {
+		cacheRoot = os.TempDir()
+	}
+	dir := filepath.Join(cacheRoot, "drive9", "mount-logs")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("drive9 mount: create background log directory: %w", err)
+	}
+	canonical := filepath.Clean(mountPoint)
+	if abs, err := filepath.Abs(canonical); err == nil {
+		canonical = abs
+	}
+	if resolved, err := filepath.EvalSymlinks(canonical); err == nil {
+		canonical = resolved
+	}
+	sum := sha256.Sum256([]byte(canonical))
+	return filepath.Join(dir, "mount-"+hex.EncodeToString(sum[:8])+".log"), nil
+}
+
+func waitForBackgroundMountReady(mountPoint string, pid int, waitCh <-chan error, logPath string, timeout time.Duration) error {
+	return waitForBackgroundMountReadyWithDeps(mountPoint, pid, waitCh, logPath, timeout, backgroundMountReadyDeps{
+		readProcessState: mountstate.ReadProcessState,
+		terminate:        terminateProcess,
+		now:              time.Now,
+		sleep:            time.Sleep,
+	})
+}
+
+type backgroundMountReadyDeps struct {
+	readProcessState func(string) (mountstate.ProcessState, string, error)
+	terminate        func(int, time.Duration) error
+	now              func() time.Time
+	sleep            func(time.Duration)
+}
+
+func waitForBackgroundMountReadyWithDeps(mountPoint string, pid int, waitCh <-chan error, logPath string, timeout time.Duration, deps backgroundMountReadyDeps) error {
+	if deps.readProcessState == nil {
+		deps.readProcessState = mountstate.ReadProcessState
+	}
+	if deps.terminate == nil {
+		deps.terminate = terminateProcess
+	}
+	if deps.now == nil {
+		deps.now = time.Now
+	}
+	if deps.sleep == nil {
+		deps.sleep = time.Sleep
+	}
+	stateMountPoint := backgroundMountStatePoint(mountPoint)
+	deadline := deps.now().Add(timeout)
+	for {
+		select {
+		case err := <-waitCh:
+			if err != nil {
+				return fmt.Errorf("drive9 mount: background mount exited before becoming ready: %w (log: %s)", err, logPath)
+			}
+			return fmt.Errorf("drive9 mount: background mount exited before becoming ready (log: %s)", logPath)
+		default:
+		}
+
+		state, _, err := deps.readProcessState(stateMountPoint)
+		if err == nil {
+			if state.PID == pid {
+				return nil
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			if stopErr := stopBackgroundMountProcess(pid, waitCh, deps, 5*time.Second); stopErr != nil {
+				return fmt.Errorf("drive9 mount: read mount process state: %w; failed to stop background mount pid %d: %v", err, pid, stopErr)
+			}
+			return fmt.Errorf("drive9 mount: read mount process state: %w", err)
+		}
+
+		if !deps.now().Before(deadline) {
+			_ = stopBackgroundMountProcess(pid, waitCh, deps, 5*time.Second)
+			return fmt.Errorf("drive9 mount: timed out waiting for background mount to become ready after %s (log: %s)", timeout, logPath)
+		}
+		deps.sleep(50 * time.Millisecond)
+	}
+}
+
+func stopBackgroundMountProcess(pid int, waitCh <-chan error, deps backgroundMountReadyDeps, timeout time.Duration) error {
+	var stopErr error
+	if deps.terminate != nil {
+		stopErr = deps.terminate(pid, timeout)
+	}
+	if waitCh == nil {
+		return stopErr
+	}
+	deadline := deps.now().Add(timeout)
+	for {
+		select {
+		case <-waitCh:
+			return stopErr
+		default:
+		}
+		if timeout <= 0 || !deps.now().Before(deadline) {
+			if stopErr != nil {
+				return stopErr
+			}
+			return fmt.Errorf("background mount pid %d did not exit after stop request", pid)
+		}
+		deps.sleep(10 * time.Millisecond)
+	}
+}
+
+func backgroundMountStatePoint(mountPoint string) string {
+	if runtime.GOOS == "windows" {
+		if stateMountPoint, err := webdavMountStatePoint(runtime.GOOS, mountPoint); err == nil {
+			return stateMountPoint
+		}
+	}
+	return mountPoint
 }
 
 // newWebDAVHandler creates an http.Handler that serves drive9 content over WebDAV.
@@ -390,21 +740,19 @@ func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int
 	return nil
 }
 
-func validateMountProfileFlags(profile string, localRoot string, localOnlyPatterns []string, remoteOnlyPatterns []string) error {
-	switch profile {
-	case "", "interactive", "coding-agent":
-	default:
-		return fmt.Errorf("drive9 mount: unknown --profile %q (valid: interactive, coding-agent)", profile)
+func validateMountProfileFlags(profile string, localRoot string, localOnlyPatterns []string, remoteOnlyPatterns []string, packPaths []string) error {
+	if err := validateProfileName(profile); err != nil {
+		return err
 	}
-	hasPolicyFlags := localRoot != "" || len(localOnlyPatterns) > 0 || len(remoteOnlyPatterns) > 0
-	if profile != "coding-agent" {
+	hasPolicyFlags := localRoot != "" || len(localOnlyPatterns) > 0 || len(remoteOnlyPatterns) > 0 || len(packPaths) > 0
+	if !profileAllowsOverlay(profile) {
 		if hasPolicyFlags {
-			return fmt.Errorf("drive9 mount: --local-root, --local-only, and --remote-only require --profile=coding-agent")
+			return fmt.Errorf("drive9 mount: --local-root, --local-only, --remote-only, and pack paths require an overlay profile")
 		}
 		return nil
 	}
 	if strings.TrimSpace(localRoot) == "" {
-		return fmt.Errorf("drive9 mount: --profile=coding-agent requires --local-root")
+		return fmt.Errorf("drive9 mount: --profile=%s requires --local-root", profile)
 	}
 	if !filepath.IsAbs(localRoot) {
 		return fmt.Errorf("drive9 mount: --local-root must be an absolute path")
@@ -413,6 +761,60 @@ func validateMountProfileFlags(profile string, localRoot string, localOnlyPatter
 		return err
 	}
 	return nil
+}
+
+func profileAllowsOverlay(profile string) bool {
+	profile = strings.TrimSpace(profile)
+	return profile != "" && profile != "interactive" && profile != noneMountProfile
+}
+
+func defaultMountLocalRoot(server string, remoteRoot string, credentialKey string) (string, error) {
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil || strings.TrimSpace(cacheRoot) == "" {
+		home, homeErr := os.UserHomeDir()
+		if homeErr != nil {
+			if err != nil {
+				return "", fmt.Errorf("drive9 mount: cannot determine cache directory: %w", err)
+			}
+			return "", fmt.Errorf("drive9 mount: cannot determine cache directory: %w", homeErr)
+		}
+		cacheRoot = filepath.Join(home, ".cache")
+	}
+	remoteRoot, err = mountpath.NormalizeRoot(remoteRoot)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(strings.TrimSpace(server) + "\n" + remoteRoot + "\n" + credentialKey))
+	hash := hex.EncodeToString(sum[:8])
+	label := safePackArchiveLabel(pathBase(remoteRoot))
+	if label == "" {
+		label = "root"
+	}
+	return filepath.Join(cacheRoot, "drive9", "mounts", label+"-"+hash), nil
+}
+
+func mountCredentialCacheKey(apiKey, token string) string {
+	credential := strings.TrimSpace(apiKey)
+	if credential == "" {
+		credential = strings.TrimSpace(token)
+	}
+	if credential == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(credential))
+	return hex.EncodeToString(sum[:8])
+}
+
+func pathBase(value string) string {
+	value = strings.TrimSuffix(value, "/")
+	if value == "" {
+		return "root"
+	}
+	idx := strings.LastIndex(value, "/")
+	if idx >= 0 {
+		value = value[idx+1:]
+	}
+	return value
 }
 
 func validateMountPolicyPatterns(patternGroups ...[]string) error {
@@ -486,6 +888,7 @@ type umountDeps struct {
 	terminateState   func(mountstate.ProcessState, time.Duration) error
 	remove           func(string) error
 	pidAlive         func(int) bool
+	packAfterUnmount func(context.Context, mountstate.ProcessState, []string, []string) error
 	now              func() time.Time
 	sleep            func(time.Duration)
 	printErrf        func(string, ...any)
@@ -507,6 +910,7 @@ func defaultUmountDeps() umountDeps {
 		terminateState:   terminateMountProcess,
 		remove:           os.Remove,
 		pidAlive:         processAlive,
+		packAfterUnmount: defaultPackAfterUnmount,
 		now:              time.Now,
 		sleep:            time.Sleep,
 		printErrf:        func(format string, args ...any) { fmt.Fprintf(os.Stderr, format, args...) },
@@ -516,8 +920,13 @@ func defaultUmountDeps() umountDeps {
 func runUmount(args []string, deps umountDeps) error {
 	fs := flag.NewFlagSet("umount", flag.ContinueOnError)
 	waitTimeout := fs.Duration("timeout", 60*time.Second, "time to wait for the drive9 mount process to exit after unmount; 0 disables waiting")
+	noAutoPack := fs.Bool("no-auto-pack", false, "disable automatic profile pack upload after unmount")
+	var packArchives stringListFlag
+	var packPaths stringListFlag
+	fs.Var(&packArchives, "pack", "also pack profile local overlay paths to this remote archive after unmount (repeatable)")
+	fs.Var(&packPaths, "pack-path", "local overlay path to include in the automatic/default pack (repeatable; relative paths resolve under the mount remote root)")
 	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: drive9 umount [--timeout duration] <mountpoint>\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: drive9 umount [--timeout duration] [--pack :/archive.tar.gz] [--pack-path path]... [--no-auto-pack] <mountpoint>\n\nflags:\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -525,7 +934,7 @@ func runUmount(args []string, deps umountDeps) error {
 	}
 	if fs.NArg() != 1 {
 		fs.Usage()
-		return fmt.Errorf("usage: drive9 umount [--timeout duration] <mountpoint>")
+		return fmt.Errorf("usage: drive9 umount [--timeout duration] [--pack :/archive.tar.gz] [--pack-path path]... [--no-auto-pack] <mountpoint>")
 	}
 	mountPoint := fs.Arg(0)
 	stateMountPoint := mountPoint
@@ -537,17 +946,54 @@ func runUmount(args []string, deps umountDeps) error {
 		}
 	}
 
+	var packState mountstate.ProcessState
+	packStateOK := false
+	needPackState := len(packArchives) > 0 || len(packPaths) > 0 || !*noAutoPack
+	if needPackState {
+		if deps.readProcessState == nil {
+			if len(packArchives) > 0 || len(packPaths) > 0 {
+				return fmt.Errorf("drive9 umount: pack requires mount process metadata")
+			}
+		} else {
+			var err error
+			packState, _, err = deps.readProcessState(stateMountPoint)
+			if err != nil {
+				if len(packArchives) > 0 || len(packPaths) > 0 {
+					return fmt.Errorf("drive9 umount: read mount state for pack: %w", err)
+				}
+			} else {
+				packStateOK = true
+			}
+		}
+	}
+
+	packArchiveArgs := append([]string(nil), packArchives...)
+	if packStateOK {
+		if len(packArchives) > 0 || len(packPaths) > 0 {
+			if err := validateUmountPackState(packState); err != nil {
+				return err
+			}
+		}
+		if !*noAutoPack && (len(packState.PackPaths) > 0 || len(packPaths) > 0) {
+			if err := validateUmountPackState(packState); err != nil {
+				return err
+			}
+			defaultArchive, err := defaultPackArchivePath(packState.RemoteRoot, packState.Profile)
+			if err != nil {
+				return err
+			}
+			packArchiveArgs = prependPackArchiveArg(packArchiveArgs, ":"+defaultArchive)
+		}
+	}
+	if len(packPaths) > 0 && len(packArchiveArgs) == 0 {
+		return fmt.Errorf("drive9 umount: --pack-path requires an auto-pack mount or --pack")
+	}
+
 	argv, err := umountArgv(deps.goos, deps.lookPath, mountPoint)
 	if err != nil {
 		return err
 	}
 	runErr := deps.run(argv)
-	if deps.goos != "windows" && runErr != nil {
-		return runErr
-	}
-	if deps.goos != "windows" && *waitTimeout == 0 {
-		return nil
-	}
 	if deps.goos == "windows" {
 		var (
 			state mountstate.ProcessState
@@ -609,26 +1055,226 @@ func runUmount(args []string, deps umountDeps) error {
 				return fmt.Errorf("drive9 umount: remove mount pid file %s: %w", path, err)
 			}
 		}
+		if runErr == nil {
+			if err := runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths); err != nil {
+				return err
+			}
+		}
 		return runErr
 	}
 
-	pid, path, err := deps.readPID(stateMountPoint)
+	state, path, stateOK, err := readUnmountProcessState(deps, stateMountPoint)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return runErr
-		}
 		if runErr != nil {
 			return runErr
 		}
 		return err
 	}
-	if *waitTimeout == 0 {
-		return nil
+	if stateOK && state.MountKind == mountstate.MountKindWebDAV {
+		if deps.terminateState != nil {
+			err = deps.terminateState(state, *waitTimeout)
+		} else if deps.terminate != nil {
+			err = deps.terminate(state.PID, *waitTimeout)
+		} else {
+			err = fmt.Errorf("drive9 umount: no process terminator configured for WebDAV mount")
+		}
+		if err != nil {
+			if errors.Is(err, errMountProcessStateStale) || errors.Is(err, errMountProcessStateUnsafe) {
+				if path != "" && deps.remove != nil {
+					if removeErr := deps.remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && runErr == nil {
+						return fmt.Errorf("drive9 umount: remove mount pid file %s: %w", path, removeErr)
+					}
+				}
+				if errors.Is(err, errMountProcessStateStale) {
+					if deps.printErrf != nil {
+						deps.printErrf("drive9 umount: removed stale mount pid file %s without terminating any process\n", path)
+					}
+					return runErr
+				}
+			}
+			if runErr != nil {
+				return runErr
+			}
+			return fmt.Errorf("%w (pid file: %s)", err, path)
+		}
+		if path != "" && deps.remove != nil {
+			if err := deps.remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+				if runErr != nil {
+					return runErr
+				}
+				return fmt.Errorf("drive9 umount: remove mount pid file %s: %w", path, err)
+			}
+		}
+		if runErr != nil {
+			return runErr
+		}
+		return runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths)
 	}
-	if err := waitForPIDExit(pid, *waitTimeout, deps); err != nil {
+	if runErr != nil {
+		return runErr
+	}
+	if *waitTimeout == 0 {
+		return runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths)
+	}
+	if !stateOK {
+		return runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths)
+	}
+	if err := waitForPIDExit(state.PID, *waitTimeout, deps); err != nil {
 		return fmt.Errorf("%w (pid file: %s)", err, path)
 	}
+	return runPackAfterUnmountIfRequested(deps, packState, packArchiveArgs, packPaths)
+}
+
+func readUnmountProcessState(deps umountDeps, mountPoint string) (mountstate.ProcessState, string, bool, error) {
+	if deps.readProcessState != nil {
+		state, path, err := deps.readProcessState(mountPoint)
+		if err == nil {
+			return state, path, true, nil
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			return mountstate.ProcessState{}, path, false, nil
+		}
+		return mountstate.ProcessState{}, path, false, err
+	}
+	pid, path, err := deps.readPID(mountPoint)
+	if err == nil {
+		return mountstate.ProcessState{PID: pid}, path, true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return mountstate.ProcessState{}, path, false, nil
+	}
+	return mountstate.ProcessState{}, path, false, err
+}
+
+func validateUmountPackState(state mountstate.ProcessState) error {
+	if strings.TrimSpace(state.LocalRoot) == "" {
+		return fmt.Errorf("drive9 umount: --pack requires mount metadata with local_root")
+	}
+	if !filepath.IsAbs(state.LocalRoot) {
+		return fmt.Errorf("drive9 umount: mount metadata local_root must be absolute, got %q", state.LocalRoot)
+	}
+	if strings.TrimSpace(state.RemoteRoot) == "" {
+		return fmt.Errorf("drive9 umount: --pack requires mount metadata with remote_root")
+	}
 	return nil
+}
+
+func runPackAfterUnmountIfRequested(deps umountDeps, state mountstate.ProcessState, archives []string, paths []string) error {
+	if len(archives) == 0 {
+		return nil
+	}
+	if deps.packAfterUnmount == nil {
+		return fmt.Errorf("drive9 umount: --pack is not available")
+	}
+	return deps.packAfterUnmount(context.Background(), state, append([]string(nil), archives...), append([]string(nil), paths...))
+}
+
+func prependPackArchiveArg(existing []string, archive string) []string {
+	out := []string{archive}
+	for _, value := range existing {
+		if value == archive {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
+func defaultPackAfterUnmount(ctx context.Context, state mountstate.ProcessState, archives []string, paths []string) error {
+	c, err := packClientFromMountState(state)
+	if err != nil {
+		return err
+	}
+	warmCtx, cancel := context.WithTimeout(ctx, fsClientWarmTimeout)
+	c.Warm(warmCtx)
+	cancel()
+	opts := packOptions{
+		LocalRoot:        state.LocalRoot,
+		RemoteRoot:       state.RemoteRoot,
+		Profile:          state.Profile,
+		Paths:            append([]string(nil), paths...),
+		ProfilePackPaths: append([]string(nil), state.PackPaths...),
+	}
+	for _, archiveArg := range archives {
+		archiveClient, archivePath, err := clientForRemoteArchiveArg(c, archiveArg)
+		if err != nil {
+			return err
+		}
+		if err := packRemoteArchive(ctx, archiveClient, archivePath, opts); err != nil {
+			return fmt.Errorf("drive9 umount: pack %s: %w", archiveArg, err)
+		}
+	}
+	return nil
+}
+
+type mountPackAuth struct {
+	Server string
+	APIKey string
+	Token  string
+}
+
+func packClientFromMountState(state mountstate.ProcessState) (*client.Client, error) {
+	auth, err := packAuthFromMountState(state)
+	if err != nil {
+		return nil, err
+	}
+	if auth.Token != "" {
+		return client.NewWithToken(auth.Server, auth.Token), nil
+	}
+	return client.New(auth.Server, auth.APIKey), nil
+}
+
+func packAuthFromMountState(state mountstate.ProcessState) (mountPackAuth, error) {
+	server := strings.TrimSpace(state.Server)
+	kind := strings.TrimSpace(state.CredentialKind)
+	apiKey := strings.TrimSpace(state.APIKey)
+	token := strings.TrimSpace(state.Token)
+	switch kind {
+	case mountstate.CredentialKindAPIKey:
+		if apiKey == "" {
+			return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing API key")
+		}
+		if server == "" {
+			return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing server")
+		}
+		return mountPackAuth{Server: server, APIKey: apiKey}, nil
+	case mountstate.CredentialKindToken:
+		if token == "" {
+			return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing delegated token")
+		}
+		if server == "" {
+			return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing server")
+		}
+		return mountPackAuth{Server: server, Token: token}, nil
+	case "":
+		if apiKey != "" || token != "" {
+			if server == "" {
+				return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing server")
+			}
+			return mountPackAuth{Server: server, APIKey: apiKey, Token: token}, nil
+		}
+	default:
+		return mountPackAuth{}, fmt.Errorf("drive9 umount: unsupported mount credential kind %q", kind)
+	}
+
+	// Compatibility for pid files written before mount credential snapshots.
+	r := ResolveCredentials()
+	if server == "" {
+		server = r.Server
+	}
+	switch r.Kind {
+	case CredentialOwner, CredentialFSScoped:
+		apiKey = r.APIKey
+	case CredentialDelegated:
+		token = r.Token
+	}
+	if server == "" {
+		return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing server")
+	}
+	if apiKey == "" && token == "" {
+		return mountPackAuth{}, fmt.Errorf("drive9 umount: mount metadata is missing credentials")
+	}
+	return mountPackAuth{Server: server, APIKey: apiKey, Token: token}, nil
 }
 
 func waitForPIDExit(pid int, timeout time.Duration, deps umountDeps) error {

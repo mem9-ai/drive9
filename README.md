@@ -102,13 +102,15 @@ drive9 fs rm -r :/old-dir
 
 ```bash
 mkdir -p ~/drive9
-drive9 mount :/ ~/drive9 --debug
+drive9 mount --debug :/ ~/drive9
 
-# In another shell:
 git clone https://github.com/mem9-ai/drive9.git ~/drive9/drive9
 
 drive9 umount ~/drive9
 ```
+
+`drive9 mount` starts in the background by default. Use `--foreground` to keep
+the mount process attached to the current terminal until it is unmounted.
 
 The mount command accepts an optional remote root:
 
@@ -394,6 +396,8 @@ Important environment variables:
 ```text
 DRIVE9_META_DSN                 control-plane MySQL/TiDB DSN
 DRIVE9_TENANT_PROVIDER          db9 | tidb_zero | tidb_cloud_starter
+DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT
+                                default TiDB Cloud Starter spendingLimit.monthly in USD cents
 DRIVE9_TOKEN_SIGNING_KEY        32-byte hex JWT signing key
 DRIVE9_ENCRYPT_TYPE             local_aes | kms
 DRIVE9_MASTER_KEY               local AES key
@@ -450,8 +454,29 @@ after the run. Do not run them in parallel with ordinary `go test` commands.
 ### FUSE / E2E Tests
 
 FUSE behavior depends on OS support and `/dev/fuse`, so real mount validation
-lives in e2e scripts and local Ubuntu/macOS runs. The important release gate is
-a real mount plus Git workflow:
+lives in e2e scripts and local Ubuntu/macOS runs. Pull requests run
+`local-e2e`, which includes the strict FUSE release gate with real mount smoke,
+read/write correctness, Git clone/config lockfile coverage, remount checks, and
+rollback-journal SQLite correctness. Heavier FUSE gates are opt-in for manual
+`workflow_dispatch` runs and enabled by the daily scheduled run: ordinary FUSE
+concurrency stress, POSIX/fsx-style random write-truncate-rename coverage,
+SQLite WAL/churn/readers-writer correctness, and the FUSE performance baseline.
+
+The performance baseline emits JSON metrics for small-file I/O, large-file
+I/O, rollback-journal SQLite transactions, WAL SQLite transactions, and WAL
+checkpoint/truncate latency. SQLite benchmark metrics are still correctness
+checked: row payload bytes are read back and SHA-256 verified, `PRAGMA
+integrity_check` must return `ok`, and WAL checkpoint must report no busy
+readers. Metrics are uploaded as GitHub artifacts and can be archived to the
+Drive9 CI workspace by setting `ARCHIVE_FUSE_PERFORMANCE_METRICS=1`.
+
+For reference, mature FUSE projects such as JuiceFS also run much broader
+periodic suites (`pjdfstest`, LTP fs/fsx/fcntl, random-op stress, xattr, and
+vdbench/fio-style benchmarks). Drive9 now includes a lightweight fsx-style
+scheduled/manual gate; full external POSIX/fault suites remain good candidates
+for separate jobs if broader filesystem compatibility becomes the gate.
+
+The simplest manual sanity check is a real mount plus Git workflow:
 
 ```bash
 drive9 mount :/ ./work --debug

@@ -52,9 +52,12 @@ type mountFuseOptions struct {
 	SyncMode                fuseSyncMode
 	WritePolicy             fuseWritePolicy
 	Profile                 string
+	LayerRef                string
+	CheckpointRef           string
 	LocalRoot               string
 	LocalOnlyPatterns       []string
 	RemoteOnlyPatterns      []string
+	PackPaths               []string
 	UploadConcurrency       int
 	ReadConcurrency         int
 	ParallelReadConcurrency int

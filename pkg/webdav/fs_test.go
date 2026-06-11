@@ -231,13 +231,13 @@ func TestHandlerMetricsExposed(t *testing.T) {
 	}
 
 	metricsText := readWebDAVMetrics()
-	if !strings.Contains(metricsText, "dat9_module_up{module=\"webdav\"} 1") {
+	if !strings.Contains(metricsText, "drive9_module_up{module=\"webdav\"} 1") {
 		t.Fatalf("metrics missing webdav module availability: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_operations_total{component=\"webdav\",operation=\"put\",result=\"conflict\"}") {
+	if !strings.Contains(metricsText, "drive9_service_operations_total{component=\"webdav\",operation=\"put\",result=\"conflict\"}") {
 		t.Fatalf("metrics missing webdav service counter: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "dat9_service_operation_duration_seconds_count{component=\"webdav\",operation=\"put\",result=\"conflict\"}") {
+	if !strings.Contains(metricsText, "drive9_service_operation_duration_seconds_count{component=\"webdav\",operation=\"put\",result=\"conflict\"}") {
 		t.Fatalf("metrics missing webdav duration histogram: %s", metricsText)
 	}
 }

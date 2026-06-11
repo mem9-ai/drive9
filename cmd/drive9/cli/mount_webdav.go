@@ -183,38 +183,41 @@ func webdavMountWithDeps(c *client.Client, mountPoint string, deps webdavMountDe
 		return explainMountError(deps.goos, mountPoint, err)
 	}
 
-	if deps.goos == "windows" {
-		stateMountPoint, err := webdavMountStatePoint(deps.goos, mountPoint)
-		if err != nil {
-			deps.unmount(deps.goos, mountPoint)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(ctx)
-			return err
-		}
-		processState := mountstate.ProcessState{PID: os.Getpid()}
-		processState.CreationTime, err = processCreationTimeByPID(processState.PID)
-		if err != nil {
-			deps.unmount(deps.goos, mountPoint)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(ctx)
-			return fmt.Errorf("webdav: inspect mount process state: %w", err)
-		}
-		pidFile, err := mountstate.WriteProcessState(stateMountPoint, processState)
-		if err != nil {
-			deps.unmount(deps.goos, mountPoint)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(ctx)
-			return fmt.Errorf("webdav: write mount pid file: %w", err)
-		}
-		defer func() {
-			if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
-				fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, err)
-			}
-		}()
+	stateMountPoint, err := webdavMountStatePoint(deps.goos, mountPoint)
+	if err != nil {
+		deps.unmount(deps.goos, mountPoint)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		return err
 	}
+	processState := mountstate.ProcessState{
+		PID:        os.Getpid(),
+		MountKind:  mountstate.MountKindWebDAV,
+		MountPoint: stateMountPoint,
+		RemoteRoot: remoteRoot,
+	}
+	processState.CreationTime, err = processCreationTimeByPID(processState.PID)
+	if err != nil {
+		deps.unmount(deps.goos, mountPoint)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		return fmt.Errorf("webdav: inspect mount process state: %w", err)
+	}
+	pidFile, err := mountstate.WriteProcessState(stateMountPoint, processState)
+	if err != nil {
+		deps.unmount(deps.goos, mountPoint)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+		return fmt.Errorf("webdav: write mount pid file: %w", err)
+	}
+	defer func() {
+		if err := os.Remove(pidFile); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "drive9: remove mount pid file %s: %v\n", pidFile, err)
+		}
+	}()
 
 	fmt.Fprintf(os.Stderr, "drive9: mounted on %s via WebDAV (server: %s)\n", mountPoint, serverURL)
 

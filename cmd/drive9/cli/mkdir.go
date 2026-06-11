@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -12,14 +13,24 @@ import (
 //	drive9 fs mkdir /path/to/dir
 //	drive9 fs mkdir :/path/to/dir
 func Mkdir(c *client.Client, args []string) error {
+	layerRef, args, err := parseLayerFlag(args)
+	if err != nil {
+		return err
+	}
 	if len(args) != 1 {
-		return fmt.Errorf("usage: drive9 fs mkdir <path>")
+		return fmt.Errorf("usage: drive9 fs mkdir [--layer <ref>] <path>")
 	}
 	path := args[0]
-	var err error
 	c, path, _, _, err = fsClientForRemoteArg(c, path)
 	if err != nil {
 		return err
+	}
+	if layerRef != "" {
+		if err := mkdirLayerPath(context.Background(), c, layerRef, path, 0o755); err != nil {
+			return err
+		}
+		fmt.Printf("created %s\n", path)
+		return nil
 	}
 	if err := c.Mkdir(path); err != nil {
 		return err

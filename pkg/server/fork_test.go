@@ -302,6 +302,7 @@ func TestCreateForkTenantPersistsGeneratedBranchPassword(t *testing.T) {
 	createInput := rt.prov.createBranchInput(0)
 	if createInput == nil {
 		t.Fatal("CreateBranch was not called with source cluster info")
+		return
 	}
 	if createInput.Password != string(gotPassword) {
 		t.Fatalf("CreateBranch password = %q, want persisted fork password", createInput.Password)
@@ -390,7 +391,7 @@ func TestCleanupDeletingForkEnqueuesFileGCTaskRefsBeforeSanitize(t *testing.T) {
 	}
 }
 
-func TestCleanupForkWithoutBranchIDDoesNotMarkDeleted(t *testing.T) {
+func TestCleanupFailedForkWithoutBranchIDMarksDeleted(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.insertForkTenant(t, "fork-missing-branch", meta.TenantFailed, "")
 
@@ -400,8 +401,8 @@ func TestCleanupForkWithoutBranchIDDoesNotMarkDeleted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != meta.TenantFailed {
-		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantFailed)
+	if got.Status != meta.TenantDeleted {
+		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleted)
 	}
 	if deleted := rt.prov.deletedBranches(); len(deleted) != 0 {
 		t.Fatalf("deleted branches = %#v, want none", deleted)

@@ -45,6 +45,12 @@ type PoolConfig struct {
 	// ensure/validate steps during Acquire. Used in tests that run
 	// against plain MySQL but need a TiDB-class provider for vault.
 	SkipTiDBSchemaCheck bool
+
+	// DisableDatabaseAutoEmbedding forces DatabaseAutoEmbedding=false for all
+	// tenants, even when the provider normally enables it (tidb_zero,
+	// tidb_cloud_starter). Use when the TiDB Cloud cluster does not have a
+	// supported auto-embedding provider configured.
+	DisableDatabaseAutoEmbedding bool
 }
 
 type Pool struct {
@@ -56,11 +62,18 @@ type Pool struct {
 	order                     *list.List
 	maxSize                   int
 	tidbSchemaValidationOpens atomic.Uint64
+	semanticTaskNotifier      atomic.Pointer[func(tenantID string)]
+}
+
+type tenantAutoEmbeddingProfile struct {
+	schemaProfile schema.TiDBAutoEmbeddingProfile
+	provider      schema.TiDBAutoEmbeddingProviderConfig
 }
 
 var (
-	ensureTiDBSchemaForMode   = schema.EnsureTiDBSchemaForMode
-	validateTiDBSchemaForMode = schema.ValidateTiDBSchemaForMode
+	applyTiDBAutoEmbeddingProviderConfig      = schema.ApplyTiDBAutoEmbeddingProviderConfig
+	ensureTiDBSchemaForAutoEmbeddingProfile   = schema.EnsureTiDBSchemaForAutoEmbeddingProfile
+	validateTiDBSchemaForAutoEmbeddingProfile = schema.ValidateTiDBSchemaForAutoEmbeddingProfile
 	// Validate once on the first version-matched open after process start, then
 	// periodically thereafter to catch out-of-band schema drift without putting a
 	// full schema diff on every tenant open.
@@ -93,6 +106,28 @@ func (p *Pool) SetMetaStore(ms *meta.Store) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.metaStore = ms
+}
+
+// SetSemanticTaskNotifier registers a callback invoked with the tenant ID
+// whenever one of this pool's backends commits a durable semantic task, so the
+// semantic worker can claim the new work immediately instead of waiting for
+// the periodic tenant scan.
+func (p *Pool) SetSemanticTaskNotifier(fn func(tenantID string)) {
+	if p == nil {
+		return
+	}
+	p.semanticTaskNotifier.Store(&fn)
+}
+
+func (p *Pool) wireSemanticTaskNotifier(b *backend.Dat9Backend, tenantID string) {
+	// Resolve the notifier at call time, not wire time, so backends created
+	// before SetSemanticTaskNotifier (e.g. during tenant resume on startup)
+	// still notify once the semantic worker registers.
+	b.SetSemanticTaskEnqueuedNotifier(func() {
+		if fn := p.semanticTaskNotifier.Load(); fn != nil && *fn != nil {
+			(*fn)(tenantID)
+		}
+	})
 }
 
 func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, err error) {
@@ -399,10 +434,22 @@ func (p *Pool) AutoSemanticTaskTypes() []semantic.TaskType {
 	if backend.AsyncAudioExtractWillWireRuntime(p.cfg.BackendOptions.AsyncAudioExtract) {
 		out = append(out, semantic.TaskTypeAudioExtractText)
 	}
+	// When database auto-embedding is disabled, image/audio extract tasks are
+	// still valid (they don't depend on EMBED_TEXT). However the semantic worker
+	// routing for TiDB auto-embedding is suppressed, which is handled in
+	// taskTypesForProvider via IsAutoEmbeddingDisabled().
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// IsAutoEmbeddingDisabled reports whether database auto-embedding has been
+// explicitly disabled for this pool via DisableDatabaseAutoEmbedding.
+// This is distinct from AutoSemanticTaskTypes returning nil because no
+// image/audio extract is configured.
+func (p *Pool) IsAutoEmbeddingDisabled() bool {
+	return p != nil && p.cfg.DisableDatabaseAutoEmbedding
 }
 
 func (p *Pool) LoadS3Backend(ctx context.Context, metaStore *meta.Store, tenantID string) (out *backend.Dat9Backend) {
@@ -444,7 +491,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	}
 	opts.TenantID = t.ID
 	opts.S3EncryptionPolicy = resolvedEncryptionPolicy
-	if UsesTiDBAutoEmbedding(t.Provider) {
+	if UsesTiDBAutoEmbedding(t.Provider) && !p.cfg.DisableDatabaseAutoEmbedding {
 		opts.DatabaseAutoEmbedding = true
 	}
 	query := "parseTime=true"
@@ -457,37 +504,54 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	if err != nil {
 		return nil, nil, fmt.Errorf("open datastore: %w", err)
 	}
+	if p.cfg.DisableDatabaseAutoEmbedding && UsesTiDBAutoEmbedding(t.Provider) {
+		store.DisableAutoEmbedTextWrites()
+	}
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
 	migrateDurationMs := 0.0
-	if !p.cfg.SkipTiDBSchemaCheck && opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
-		if t.SchemaVersion != schema.CurrentTiDBTenantSchemaVersion {
-			ensureSchemaStart := time.Now()
-			if err := ensureTiDBSchemaForMode(ctx, store.DB(), schema.TiDBEmbeddingModeAuto); err != nil {
+	if opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
+		autoEmbeddingProfile, err := p.autoEmbeddingProfileForTenant(ctx, t)
+		if err != nil {
+			_ = store.Close()
+			return nil, nil, fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
+		}
+		if err := applyTiDBAutoEmbeddingProviderConfig(ctx, store.DB(), autoEmbeddingProfile.provider); err != nil {
+			_ = store.Close()
+			return nil, nil, fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
+		}
+		if !p.cfg.SkipTiDBSchemaCheck {
+			targetSchemaVersion, err := schema.TiDBTenantSchemaVersionForAutoEmbeddingProfile(autoEmbeddingProfile.schemaProfile)
+			if err != nil {
 				_ = store.Close()
-				return nil, nil, fmt.Errorf("ensure tidb auto-embedding schema: %w", err)
+				return nil, nil, fmt.Errorf("resolve tenant auto-embedding schema version: %w", err)
 			}
-			ensureSchemaDurationMs = float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
-			if p.metaStore != nil {
-				// Record the version only after EnsureTiDBSchemaForMode has
-				// succeeded. EnsureTiDBSchemaForMode ends with a call to
-				// ValidateTiDBSchemaForMode, so by the time we reach this
-				// point the schema has been confirmed to match the spec.
-				// Any tenant whose schema diverges between two consecutive
-				// opens will be caught on the next open because its stored
-				// version will differ from CurrentTiDBTenantSchemaVersion.
-				updateSchemaVersionStart := time.Now()
-				if verErr := p.metaStore.UpdateTenantSchemaVersion(ctx, t.ID, schema.CurrentTiDBTenantSchemaVersion); verErr != nil {
-					recordTenantSchemaVersionUpdateFailure(ctx, t.ID, schema.CurrentTiDBTenantSchemaVersion, time.Since(updateSchemaVersionStart), verErr)
+			if t.SchemaVersion != targetSchemaVersion {
+				ensureSchemaStart := time.Now()
+				if err := ensureTiDBSchemaForAutoEmbeddingProfile(ctx, store.DB(), autoEmbeddingProfile.schemaProfile); err != nil {
+					_ = store.Close()
+					return nil, nil, fmt.Errorf("ensure tidb auto-embedding schema: %w", err)
 				}
+				ensureSchemaDurationMs = float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
+				if p.metaStore != nil {
+					// Record the tenant-profile-specific version only after the
+					// schema has been confirmed to match that tenant's profile.
+					// Any tenant whose schema diverges between two consecutive
+					// opens will be caught on the next open because its stored
+					// version will differ from the profile-derived target.
+					updateSchemaVersionStart := time.Now()
+					if verErr := p.metaStore.UpdateTenantSchemaVersion(ctx, t.ID, targetSchemaVersion); verErr != nil {
+						recordTenantSchemaVersionUpdateFailure(ctx, t.ID, targetSchemaVersion, time.Since(updateSchemaVersionStart), verErr)
+					}
+				}
+			} else if p.shouldPeriodicValidateTiDBSchemaOnOpen() {
+				validateSchemaStart := time.Now()
+				if err := validateTiDBSchemaForAutoEmbeddingProfile(ctx, store.DB(), autoEmbeddingProfile.schemaProfile); err != nil {
+					_ = store.Close()
+					return nil, nil, fmt.Errorf("validate tidb auto-embedding schema: %w", err)
+				}
+				ensureSchemaDurationMs = float64(time.Since(validateSchemaStart).Microseconds()) / 1000.0
 			}
-		} else if p.shouldPeriodicValidateTiDBSchemaOnOpen() {
-			validateSchemaStart := time.Now()
-			if err := validateTiDBSchemaForMode(ctx, store.DB(), schema.TiDBEmbeddingModeAuto); err != nil {
-				_ = store.Close()
-				return nil, nil, fmt.Errorf("validate tidb auto-embedding schema: %w", err)
-			}
-			ensureSchemaDurationMs = float64(time.Since(validateSchemaStart).Microseconds()) / 1000.0
 		}
 	}
 	// Run split-tables migration if needed. Only for tenants that have the
@@ -509,7 +573,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		opts.StorageNamespaceID = ns.ID
 		prefix := ns.Prefix
 		s3ClientStart := time.Now()
-		s3c, err := s3client.NewAWS(ctx, s3client.AWSConfig{
+		s3c, err := s3client.New(ctx, s3client.AWSConfig{
 			Region:          p.cfg.S3Region,
 			Bucket:          p.cfg.S3Bucket,
 			Prefix:          prefix,
@@ -545,6 +609,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(b, t.ID)
+		p.wireSemanticTaskNotifier(b, t.ID)
 		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 		return b, store, nil
 	}
@@ -585,6 +650,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(b, t.ID)
+		p.wireSemanticTaskNotifier(b, t.ID)
 		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 		return b, store, nil
 	}
@@ -607,6 +673,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("create_backend_ms", backendCreateDurationMs),
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	p.wireQuotaStore(b, t.ID)
+	p.wireSemanticTaskNotifier(b, t.ID)
 	b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 	return b, store, nil
 }
@@ -618,6 +685,53 @@ func (p *Pool) migrateSplitTables(ctx context.Context, db *sql.DB, provider stri
 	m := migrate.NewSplitTablesMigratorWithDialect(db, dialect)
 	_, err := m.Run(ctx)
 	return err
+}
+
+func (p *Pool) autoEmbeddingProfileForTenant(ctx context.Context, t *meta.Tenant) (tenantAutoEmbeddingProfile, error) {
+	if p.metaStore == nil || t == nil || t.ID == "" {
+		return defaultTenantAutoEmbeddingProfile()
+	}
+	profile, err := p.metaStore.EnsureTenantAutoEmbeddingProfile(ctx, t.ID)
+	if err != nil {
+		return tenantAutoEmbeddingProfile{}, err
+	}
+	schemaProfile := schema.TiDBAutoEmbeddingProfile{
+		Model:       profile.Model,
+		Dimensions:  profile.Dimensions,
+		OptionsJSON: profile.OptionsJSON,
+	}
+	apiKey := ""
+	if len(profile.APIKeyCipher) > 0 {
+		plain, err := p.enc.Decrypt(ctx, profile.APIKeyCipher)
+		if err != nil {
+			return tenantAutoEmbeddingProfile{}, fmt.Errorf("decrypt tenant auto-embedding api key: %w", err)
+		}
+		apiKey = string(plain)
+	}
+	return tenantAutoEmbeddingProfile{
+		schemaProfile: schemaProfile,
+		provider: schema.TiDBAutoEmbeddingProviderConfig{
+			Model:   schemaProfile.Model,
+			APIKey:  apiKey,
+			APIBase: profile.APIBase,
+		},
+	}, nil
+}
+
+func defaultTenantAutoEmbeddingProfile() (tenantAutoEmbeddingProfile, error) {
+	schemaProfile, err := schema.TiDBAutoEmbeddingProfileFromConfig(schema.TiDBAutoEmbeddingConfig{
+		Model:      schema.DefaultTiDBAutoEmbeddingModel,
+		Dimensions: schema.DefaultTiDBAutoEmbeddingDimensions,
+	})
+	if err != nil {
+		return tenantAutoEmbeddingProfile{}, fmt.Errorf("build default tenant auto-embedding profile: %w", err)
+	}
+	return tenantAutoEmbeddingProfile{
+		schemaProfile: schemaProfile,
+		provider: schema.TiDBAutoEmbeddingProviderConfig{
+			Model: schemaProfile.Model,
+		},
+	}, nil
 }
 
 func (p *Pool) shouldPeriodicValidateTiDBSchemaOnOpen() bool {

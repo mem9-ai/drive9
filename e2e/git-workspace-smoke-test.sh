@@ -139,20 +139,54 @@ is_mounted() {
 run_with_timeout() {
   local seconds="$1"
   shift
-  "$@" &
-  local cmd_pid=$!
-  (
-    sleep "$seconds"
-    kill "$cmd_pid" >/dev/null 2>&1 || true
-  ) &
-  local watchdog_pid=$!
-  set +e
-  wait "$cmd_pid"
-  local rc=$?
-  set -e
-  kill "$watchdog_pid" >/dev/null 2>&1 || true
-  wait "$watchdog_pid" 2>/dev/null || true
-  return "$rc"
+  python3 - "$seconds" "$@" <<'PY'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+seconds = float(sys.argv[1])
+cmd = sys.argv[2:]
+
+def exit_code(rc):
+    return rc if rc >= 0 else 128 + abs(rc)
+
+proc = subprocess.Popen(cmd, start_new_session=True)
+deadline = time.monotonic() + seconds
+while True:
+    rc = proc.poll()
+    if rc is not None:
+        raise SystemExit(exit_code(rc))
+    if time.monotonic() >= deadline:
+        break
+    time.sleep(0.2)
+
+rc = proc.poll()
+if rc is not None:
+    raise SystemExit(exit_code(rc))
+
+try:
+    os.killpg(proc.pid, signal.SIGTERM)
+except ProcessLookupError:
+    rc = proc.poll()
+    if rc is not None:
+        raise SystemExit(exit_code(rc))
+    raise SystemExit(124)
+
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    if proc.poll() is not None:
+        raise SystemExit(124)
+    time.sleep(0.2)
+
+try:
+    os.killpg(proc.pid, signal.SIGKILL)
+except ProcessLookupError:
+    pass
+proc.wait()
+raise SystemExit(124)
+PY
 }
 
 curl_body_code() {
@@ -232,7 +266,7 @@ start_mount() {
     echo "local_root=$local_root"
   } >>"$MOUNT_LOG"
 
-  local args=(mount --mode=fuse --profile=coding-agent --local-root "$local_root" --durability=interactive --perf-counters)
+  local args=(mount --foreground --mode=fuse --profile=coding-agent --local-root "$local_root" --durability=interactive --perf-counters)
   if [ "$GIT_WORKSPACE_ALLOW_OTHER" = "1" ]; then
     args+=(--allow-other)
   fi
@@ -286,6 +320,12 @@ drive9() {
   DRIVE9_SERVER="$BASE" DRIVE9_API_KEY="$API_KEY" "$CLI_BIN" "$@"
 }
 
+drive9_with_timeout() {
+  local seconds="$1"
+  shift
+  run_with_timeout "$seconds" env "DRIVE9_SERVER=$BASE" "DRIVE9_API_KEY=$API_KEY" "$CLI_BIN" "$@"
+}
+
 git_cmd() {
   if [ "$GIT_WORKSPACE_TRACE_GIT" = "1" ]; then
     {
@@ -300,8 +340,8 @@ git_cmd() {
 clone_fast_blobless() {
   local repo_url="$1"
   local target="$2"
-  run_with_timeout "$GIT_WORKSPACE_CLONE_TIMEOUT_S" \
-    drive9 git clone --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" "$repo_url" "$target"
+  drive9_with_timeout "$GIT_WORKSPACE_CLONE_TIMEOUT_S" \
+    git clone --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" "$repo_url" "$target"
 }
 
 fast_worktree_add() {
@@ -309,8 +349,8 @@ fast_worktree_add() {
   local worktree="$2"
   local branch="$3"
   local commitish="$4"
-  run_with_timeout "$GIT_WORKSPACE_CLONE_TIMEOUT_S" \
-    drive9 git worktree add --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" -b "$branch" "$base_repo" "$worktree" "$commitish"
+  drive9_with_timeout "$GIT_WORKSPACE_CLONE_TIMEOUT_S" \
+    git worktree add --fast --blobless "--hydrate=$GIT_WORKSPACE_HYDRATE" -b "$branch" "$base_repo" "$worktree" "$commitish"
 }
 
 configure_git_identity() {

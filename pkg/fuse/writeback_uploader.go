@@ -335,6 +335,7 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		log.Printf("writeback upload failed for %s after %d attempts: %v (will retry on next mount)", localPath, uploadMaxRetries+1, lastErr)
 		return
 	}
+	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	chmodCtx, chmodCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	modeErr := u.applyMode(chmodCtx, meta)
 	chmodCancel()
@@ -425,6 +426,7 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 		}
 		return 0, err
 	}
+	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
 	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
 	err = u.applyMode(chmodCtx, meta)
 	chmodCancel()

@@ -9,11 +9,11 @@ import (
 
 // Semantic represents a row in the semantic table (search & enrichment).
 type Semantic struct {
-	InodeID                        string
-	ContentText                    string
-	Description                    string
-	EmbeddingRevision              *int64
-	DescriptionEmbeddingRevision   *int64
+	InodeID                      string
+	ContentText                  string
+	Description                  string
+	EmbeddingRevision            *int64
+	DescriptionEmbeddingRevision *int64
 }
 
 // InsertSemantic inserts a semantic row.
@@ -45,7 +45,21 @@ func (s *Store) GetSemantic(ctx context.Context, inodeID string) (*Semantic, err
 }
 
 // UpdateSemanticTx updates semantic data inside a transaction, clearing embeddings.
+// When the store has auto-embed text writes disabled (TiDB schema with GENERATED
+// embedding columns), writing NULL to those columns is forbidden (TiDB error 3105).
+// In that case only the revision markers are cleared; content_text and description
+// are left untouched to avoid triggering EMBED_TEXT() generated column evaluation.
 func (s *Store) UpdateSemanticTx(db execer, inodeID string, contentText, description string) error {
+	if s.disableAutoEmbedTextWrites {
+		// embedding and description_embedding are GENERATED ALWAYS columns on TiDB;
+		// explicit writes (even NULL) are rejected. Only clear the revision markers
+		// so stale vector state is flagged without violating the generated-column
+		// constraint.
+		_, err := db.Exec(`UPDATE semantic SET
+			embedding_revision = NULL, description_embedding_revision = NULL
+			WHERE inode_id = ?`, inodeID)
+		return err
+	}
 	_, err := db.Exec(`UPDATE semantic SET
 		content_text = ?, description = ?,
 		embedding = NULL, embedding_revision = NULL,

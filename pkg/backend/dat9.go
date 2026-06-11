@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -117,6 +118,11 @@ type Dat9Backend struct {
 	fileGCWorker     *FileGCWorker
 	runtimeMetricsID uint64
 
+	// semanticTaskNotifier, when set, runs after a write or upload commit that
+	// enqueued at least one durable semantic task, so the semantic worker can
+	// claim it immediately instead of waiting for the tenant scan.
+	semanticTaskNotifier atomic.Pointer[func()]
+
 	// Monthly LLM cost budget (P1).
 	maxMonthlyLLMCostMillicents     int64
 	visionCostPerKTokenMillicents   int64
@@ -135,6 +141,27 @@ func newBaseBackend(store *datastore.Store) *Dat9Backend {
 		inlineThreshold:     DefaultInlineThreshold,
 		textExtractMaxBytes: DefaultTextExtractMaxBytes,
 		runtimeMetricsID:    globalBackendRuntimeMetrics.allocateID(),
+	}
+}
+
+// SetSemanticTaskEnqueuedNotifier registers fn to run after a write or upload
+// commit that enqueued at least one durable semantic task. fn must be cheap
+// and non-blocking: it is invoked inline on the write path. A dropped or
+// missing notification is safe — tasks are durable and the semantic worker's
+// periodic tenant scan claims them eventually.
+func (b *Dat9Backend) SetSemanticTaskEnqueuedNotifier(fn func()) {
+	if b == nil {
+		return
+	}
+	b.semanticTaskNotifier.Store(&fn)
+}
+
+func (b *Dat9Backend) notifySemanticTaskEnqueued(enqueued bool) {
+	if !enqueued {
+		return
+	}
+	if fn := b.semanticTaskNotifier.Load(); fn != nil && *fn != nil {
+		(*fn)()
 	}
 }
 
@@ -197,6 +224,9 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
+		return err
+	}
+	if err := rejectRootFileNodePath(path); err != nil {
 		return err
 	}
 
@@ -267,6 +297,9 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 	if err != nil {
 		return err
 	}
+	if err := rejectRootFileNodePath(linkPath); err != nil {
+		return err
+	}
 
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
 		return err
@@ -323,6 +356,9 @@ func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (e
 	if err != nil {
 		return err
 	}
+	if dirPath == "/" {
+		return nil
+	}
 	err = b.store.EnsureParentDirs(ctx, dirPath, b.genID)
 	if err != nil {
 		return err
@@ -364,6 +400,13 @@ func (b *Dat9Backend) ChmodCtx(ctx context.Context, path string, mode uint32) (e
 	start := time.Now()
 	defer func() { observeBackend(ctx, "chmod", err, start) }()
 
+	path, err = pathutil.Canonicalize(path)
+	if err != nil {
+		return err
+	}
+	if path == "/" {
+		return datastore.ErrInvalidRootDentry
+	}
 	resolvedPath, _, err := b.resolveNodePath(ctx, path)
 	if err != nil {
 		return err
@@ -383,6 +426,9 @@ func (b *Dat9Backend) RemoveCtx(ctx context.Context, path string) (err error) {
 	if err != nil {
 		return err
 	}
+	if path == "/" {
+		return datastore.ErrInvalidRootDentry
+	}
 	if node.IsDirectory {
 		return b.store.DeleteEmptyDir(ctx, path)
 	}
@@ -398,6 +444,9 @@ func (b *Dat9Backend) RemoveFileCtx(ctx context.Context, path string) (err error
 	if err != nil {
 		return err
 	}
+	if err := rejectRootFileNodePath(path); err != nil {
+		return err
+	}
 	_, err = b.store.DeleteFileWithRefCheck(ctx, path)
 	return err
 }
@@ -409,6 +458,9 @@ func (b *Dat9Backend) RemoveDirCtx(ctx context.Context, path string) (err error)
 	path, err = pathutil.CanonicalizeDir(path)
 	if err != nil {
 		return err
+	}
+	if path == "/" {
+		return datastore.ErrInvalidRootDentry
 	}
 	return b.store.DeleteEmptyDir(ctx, path)
 }
@@ -424,6 +476,9 @@ func (b *Dat9Backend) RemoveAllCtx(ctx context.Context, path string) (err error)
 	path, node, err := b.resolveNodePath(ctx, path)
 	if err != nil {
 		return err
+	}
+	if path == "/" {
+		return datastore.ErrInvalidRootDentry
 	}
 	if !node.IsDirectory {
 		_, err = b.store.DeleteFileWithRefCheck(ctx, path)
@@ -444,6 +499,9 @@ func (b *Dat9Backend) ReadCtx(ctx context.Context, path string, offset int64, si
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
 		return nil, err
+	}
+	if path == "/" {
+		return nil, datastore.ErrNotFound
 	}
 	nf, err := b.store.Stat(ctx, path)
 	if err != nil {
@@ -514,6 +572,9 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 
 	path, err = pathutil.Canonicalize(path)
 	if err != nil {
+		return 0, 0, err
+	}
+	if err := rejectRootFileNodePath(path); err != nil {
 		return 0, 0, err
 	}
 
@@ -600,7 +661,9 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 	}
 
+	var semanticTaskEnqueued bool
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		semanticTaskEnqueued = false
 		if err := b.ensureStorageQuota(ctx, tx, path, int64(len(data))); err != nil {
 			return err
 		}
@@ -635,10 +698,14 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			}
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+			semanticTaskEnqueued = created
+			return err
 		}
 		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
-			return b.enqueueEmbedTaskTx(tx, fileID, 1)
+			created, err := b.enqueueEmbedTaskTx(tx, fileID, 1)
+			semanticTaskEnqueued = created
+			return err
 		}
 		return nil
 	}); err != nil {
@@ -647,6 +714,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 		return 0, err
 	}
+	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
 	// Temporary compatibility: app embedding still relies on the legacy
 	// backend-owned image queue until its image task flow also moves to
 	// semantic_tasks.
@@ -717,7 +785,9 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	}
 
 	var newRev int64
+	var semanticTaskEnqueued bool
 	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		semanticTaskEnqueued = false
 		if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
 			return err
 		}
@@ -759,10 +829,14 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 			}
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			return b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
+			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
+			semanticTaskEnqueued = created
+			return err
 		}
 		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText, description) {
-			return b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
+			created, err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
+			semanticTaskEnqueued = created
+			return err
 		}
 		return nil
 	})
@@ -772,6 +846,7 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		}
 		return 0, 0, err
 	}
+	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
 	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
 	// Overwrite cleanup is object-level: file_gc_tasks track deleted file
 	// identities, not old blob refs for a still-live file_id.
@@ -1006,6 +1081,9 @@ func (b *Dat9Backend) ReadPlanCtx(ctx context.Context, path string) (plan *ReadP
 	if err != nil {
 		return nil, err
 	}
+	if resolvedPath == "/" {
+		return nil, datastore.ErrNotFound
+	}
 	phase = "stat_for_read"
 	logger.InfoBenchTiming(ctx, "backend_read_plan_start",
 		zap.String("path", path),
@@ -1070,6 +1148,9 @@ func (b *Dat9Backend) ReadInlinePlanCtx(ctx context.Context, path string) (plan 
 	resolvedPath, err := pathutil.Canonicalize(path)
 	if err != nil {
 		return nil, err
+	}
+	if resolvedPath == "/" {
+		return nil, datastore.ErrNotFound
 	}
 	nf, err := b.store.StatForRead(ctx, resolvedPath)
 	if err != nil {
@@ -1144,6 +1225,9 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 		return err
 	}
 	newPath = canonicalizePathForKind(newPath, node.IsDirectory)
+	if oldPath == "/" || newPath == "/" {
+		return datastore.ErrInvalidRootDentry
+	}
 	if oldPath == newPath {
 		return nil
 	}
@@ -1161,6 +1245,35 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 	}
 	_, err = b.store.RenameFileReplacingTarget(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
 	return err
+}
+
+// RenameFileNoReplaceCtx renames a file and fails with datastore.ErrPathConflict
+// if the target path already exists.
+func (b *Dat9Backend) RenameFileNoReplaceCtx(ctx context.Context, oldPath, newPath string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "rename_file_no_replace", err, start) }()
+
+	oldPath, node, err := b.resolveNodePath(ctx, oldPath)
+	if err != nil {
+		return err
+	}
+	if node.IsDirectory {
+		return fmt.Errorf("source is a directory: %s", oldPath)
+	}
+	newPath, err = pathutil.Canonicalize(newPath)
+	if err != nil {
+		return err
+	}
+	if oldPath == "/" || newPath == "/" {
+		return datastore.ErrInvalidRootDentry
+	}
+	if oldPath == newPath {
+		return nil
+	}
+	if err := b.store.EnsureParentDirs(ctx, newPath, b.genID); err != nil {
+		return err
+	}
+	return b.store.RenameFileNoReplace(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
 }
 
 func (b *Dat9Backend) Open(path string) (io.ReadCloser, error) {
@@ -1205,8 +1318,14 @@ func (b *Dat9Backend) CopyFileCtx(ctx context.Context, srcPath, dstPath string) 
 	if err != nil {
 		return err
 	}
+	if srcPath == "/" {
+		return datastore.ErrNotFound
+	}
 	dstPath, err = pathutil.Canonicalize(dstPath)
 	if err != nil {
+		return err
+	}
+	if err := rejectRootFileNodePath(dstPath); err != nil {
 		return err
 	}
 	srcNode, err := b.store.GetNode(ctx, srcPath)
@@ -1244,9 +1363,15 @@ func (b *Dat9Backend) HardlinkFileCtx(ctx context.Context, srcPath, dstPath stri
 	if err != nil {
 		return err
 	}
+	if err := rejectRootFileNodePath(dstPath); err != nil {
+		return err
+	}
 	srcPath, srcNode, err := b.resolveNodePath(ctx, srcPath)
 	if err != nil {
 		return err
+	}
+	if srcPath == "/" {
+		return datastore.ErrNotFound
 	}
 	if srcPath == dstPath {
 		return datastore.ErrPathConflict
@@ -1378,6 +1503,13 @@ func (w *writeCloser) Close() error {
 }
 
 // --- helpers ---
+
+func rejectRootFileNodePath(path string) error {
+	if path == "/" {
+		return datastore.ErrInvalidRootDentry
+	}
+	return nil
+}
 
 func normalizePath(path string) string {
 	if pathutil.IsDir(path) {
