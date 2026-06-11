@@ -565,10 +565,10 @@ func (m *semanticWorkerManager) nextTarget(ctx context.Context) (*semanticTarget
 		return nil, nil
 	}
 
-	for i := 0; i < len(refs); i++ {
-		ref, ok := m.claimTenantSlot(refs)
-		if !ok {
-			return nil, nil
+	for _, idx := range pageWalkOrder(len(refs)) {
+		ref := refs[idx]
+		if !m.tryClaimTenantSlot(ref.id) {
+			continue
 		}
 		target, err := m.targetForRef(ctx, ref)
 		if err != nil {
@@ -588,29 +588,32 @@ func (m *semanticWorkerManager) nextTarget(ctx context.Context) (*semanticTarget
 	return nil, nil
 }
 
-// claimTenantSlot picks one tenant from refs for a claim attempt. The start
-// index must be random: refs is a rotating keyset page whose length differs
-// between calls, so a persistent round-robin cursor taken modulo the current
-// page length gets clamped by the shortest page and permanently starves
-// tenants at higher in-page indices. A uniform random start visits every
-// tenant with equal probability regardless of page geometry.
-func (m *semanticWorkerManager) claimTenantSlot(refs []semanticTenantRef) (semanticTenantRef, bool) {
+// pageWalkOrder returns the visit order for one keyset page of tenants: a
+// single wrap-around walk of all indices from a uniformly random start. The
+// random start keeps scheduling fair across pages of different lengths — any
+// cursor persisted across calls and taken modulo the current page length gets
+// clamped by the shortest page and permanently starves tenants at higher
+// in-page indices. The deterministic walk after the start guarantees each
+// tenant in the page is attempted at most once per pass, so a tenant whose
+// backend consistently fails to open cannot consume retries that should move
+// on to healthy tenants.
+func pageWalkOrder(n int) []int {
+	order := make([]int, n)
+	start := rand.Intn(n)
+	for i := range order {
+		order[i] = (start + i) % n
+	}
+	return order
+}
+
+func (m *semanticWorkerManager) tryClaimTenantSlot(tenantID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(refs) == 0 {
-		return semanticTenantRef{}, false
+	if m.inflight[tenantID] >= m.opts.PerTenantConcurrency {
+		return false
 	}
-	start := rand.Intn(len(refs))
-	for i := 0; i < len(refs); i++ {
-		idx := (start + i) % len(refs)
-		ref := refs[idx]
-		if m.inflight[ref.id] >= m.opts.PerTenantConcurrency {
-			continue
-		}
-		m.inflight[ref.id]++
-		return ref, true
-	}
-	return semanticTenantRef{}, false
+	m.inflight[tenantID]++
+	return true
 }
 
 func (m *semanticWorkerManager) releaseTenantSlot(tenantID string) {

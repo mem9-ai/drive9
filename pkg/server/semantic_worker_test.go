@@ -1876,46 +1876,134 @@ func TestSemanticWorkerTaskTypesForTargetDisabledAutoEmbedWithImageExtract(t *te
 	}
 }
 
-func TestClaimTenantSlotCoversAllTenantsAcrossUnevenRotatingPages(t *testing.T) {
-	m := &semanticWorkerManager{inflight: make(map[string]int)}
-	m.opts.normalize()
-
+func TestPageWalkOrderCoversAllTenantsAcrossUnevenRotatingPages(t *testing.T) {
 	// Mirror TenantScanLimit keyset pagination over 310 active tenants:
 	// rotating pages of 128, 128, and 54. A persistent round-robin cursor
 	// taken modulo the current page length gets clamped by the short page and
 	// permanently starves tenants at higher in-page indices.
 	const total = 310
 	pageBounds := [][2]int{{0, 128}, {128, 256}, {256, total}}
-	pages := make([][]semanticTenantRef, 0, len(pageBounds))
-	for _, bounds := range pageBounds {
-		page := make([]semanticTenantRef, 0, bounds[1]-bounds[0])
-		for i := bounds[0]; i < bounds[1]; i++ {
-			page = append(page, semanticTenantRef{id: fmt.Sprintf("tenant-%03d", i)})
-		}
-		pages = append(pages, page)
-	}
 
-	picked := make(map[string]bool, total)
+	picked := make(map[int]bool, total)
 	// 200k ticks gives each tenant >500 expected picks, so the probability of
 	// any tenant being missed by uniform random starts is negligible.
-	for tick := 0; tick < 200000; tick++ {
-		refs := pages[tick%len(pages)]
-		ref, ok := m.claimTenantSlot(refs)
-		if !ok {
-			t.Fatalf("claimTenantSlot returned no slot at tick %d", tick)
+	for tick := range 200000 {
+		bounds := pageBounds[tick%len(pageBounds)]
+		n := bounds[1] - bounds[0]
+		order := pageWalkOrder(n)
+		if len(order) != n {
+			t.Fatalf("pageWalkOrder(%d) returned %d indices", n, len(order))
 		}
-		picked[ref.id] = true
-		m.releaseTenantSlot(ref.id)
+		// The walk must be a complete wrap-around permutation so that within
+		// one nextTarget pass every tenant in the page is attempted at most
+		// once and failing tenants cannot absorb retries meant for others.
+		for i := 1; i < n; i++ {
+			if order[i] != (order[i-1]+1)%n {
+				t.Fatalf("pageWalkOrder(%d) is not a wrap-around walk at position %d: %v", n, i, order)
+			}
+		}
+		// When every tenant is healthy, nextTarget picks the first index.
+		picked[bounds[0]+order[0]] = true
 	}
 
-	var starved []string
-	for i := 0; i < total; i++ {
-		id := fmt.Sprintf("tenant-%03d", i)
-		if !picked[id] {
-			starved = append(starved, id)
+	var starved []int
+	for i := range total {
+		if !picked[i] {
+			starved = append(starved, i)
 		}
 	}
 	if len(starved) > 0 {
-		t.Fatalf("%d of %d tenants never picked: %v", len(starved), total, starved)
+		t.Fatalf("%d of %d tenants never picked first: %v", len(starved), total, starved)
+	}
+}
+
+func TestSemanticWorkerNextTargetSkipsFailingTenantWithinPage(t *testing.T) {
+	initServerTenantSchema(t, testDSN)
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPool(t)
+	parsed, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port := "127.0.0.1", 3306
+	if parsed.Addr != "" {
+		h, p, _ := strings.Cut(parsed.Addr, ":")
+		if h != "" {
+			host = h
+		}
+		if p != "" {
+			_, _ = fmt.Sscanf(p, "%d", &port)
+		}
+	}
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	// The failing tenant sorts first in the keyset page (older created_at):
+	// its backend can never be acquired because port 1 refuses connections.
+	failingTenantID := token.NewID()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               failingTenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "127.0.0.1",
+		DBPort:           1,
+		DBUser:           parsed.User,
+		DBPasswordCipher: passCipher,
+		DBName:           parsed.DBName,
+		DBTLS:            false,
+		Provider:         tenant.ProviderDB9,
+		SchemaVersion:    1,
+		CreatedAt:        now.Add(-time.Hour),
+		UpdatedAt:        now.Add(-time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	healthyTenantID := token.NewID()
+	if err := metaStore.InsertTenant(context.Background(), &meta.Tenant{
+		ID:               healthyTenantID,
+		Status:           meta.TenantActive,
+		DBHost:           host,
+		DBPort:           port,
+		DBUser:           parsed.User,
+		DBPasswordCipher: passCipher,
+		DBName:           parsed.DBName,
+		DBTLS:            false,
+		Provider:         tenant.ProviderDB9,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+
+	// Every pass over the page must reach the healthy tenant: the wrap-around
+	// walk attempts each tenant at most once, so the failing tenant cannot
+	// absorb retries meant for its neighbors. Under a per-claim random picker
+	// each pass had a 25% chance of claiming the failing tenant twice and
+	// returning nil, so 30 iterations expose that regression with probability
+	// 1 - 0.75^30 ≈ 99.98%.
+	for i := range 30 {
+		target, err := m.nextTarget(context.Background())
+		if err != nil {
+			t.Fatalf("nextTarget error at iteration %d: %v", i, err)
+		}
+		if target == nil {
+			t.Fatalf("nextTarget returned nil at iteration %d; failing tenant absorbed the page walk", i)
+		}
+		tenantID := target.tenantID
+		target.release()
+		if tenantID != healthyTenantID {
+			t.Fatalf("nextTarget picked tenant %q at iteration %d, want healthy tenant %q", tenantID, i, healthyTenantID)
+		}
 	}
 }
