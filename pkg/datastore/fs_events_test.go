@@ -106,6 +106,43 @@ func TestAppendFSEventTxRollbackDoesNotConsumeSeq(t *testing.T) {
 	}
 }
 
+func TestNoopDirectoryMutationsDoNotEmitFSEvents(t *testing.T) {
+	s := newTestStore(t)
+	clearFSEventsForTest(t, s)
+	ctx := context.Background()
+
+	count, err := s.RenameDir(ctx, "/missing/", "/renamed/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("RenameDir count = %d, want 0", count)
+	}
+	orphaned, err := s.DeleteDirRecursive(ctx, "/missing/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphaned) != 0 {
+		t.Fatalf("DeleteDirRecursive orphaned len = %d, want 0", len(orphaned))
+	}
+
+	events, err := s.ListFSEventsSince(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events after no-op directory mutations = %+v, want none", events)
+	}
+
+	ev, err := s.InsertFSEvent(ctx, "/committed.txt", "write", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Seq != 1 {
+		t.Fatalf("seq after no-op directory mutations = %d, want 1", ev.Seq)
+	}
+}
+
 func clearFSEventsForTest(t *testing.T, s *Store) {
 	t.Helper()
 	if _, err := s.DB().Exec(`DELETE FROM fs_events`); err != nil {

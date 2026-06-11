@@ -538,8 +538,10 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		}
 	}
 
-	if _, err := s.AppendFSEventTx(ctx, tx, newPrefix, "rename", ""); err != nil {
-		return 0, err
+	if len(updates) > 0 {
+		if _, err := s.AppendFSEventTx(ctx, tx, newPrefix, "rename", ""); err != nil {
+			return 0, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
@@ -1887,8 +1889,13 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		return nil, err
 	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? OR path LIKE ?`,
-		dirPath, dirPath+"%"); err != nil {
+	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? OR path LIKE ?`,
+		dirPath, dirPath+"%")
+	if err != nil {
+		return nil, err
+	}
+	deletedRows, err := res.RowsAffected()
+	if err != nil {
 		return nil, err
 	}
 
@@ -1917,8 +1924,10 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		}
 	}
 
-	if _, err := s.AppendFSEventTx(ctx, tx, dirPath, "delete", ""); err != nil {
-		return nil, err
+	if deletedRows > 0 {
+		if _, err := s.AppendFSEventTx(ctx, tx, dirPath, "delete", ""); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
