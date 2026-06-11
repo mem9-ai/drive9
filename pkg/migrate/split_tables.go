@@ -240,6 +240,42 @@ func (m *SplitTablesMigrator) insertIgnore(table string, columns string, selectS
 	}
 }
 
+// execRetryingDeadlock executes a write statement, retrying transient lock
+// conflicts (MySQL Error 1213 "Deadlock found" / SQLSTATE 40001). Run is
+// idempotent and is invoked on every backend open, so concurrent opens of the
+// same tenant DB can race the full-table backfills into a deadlock; the
+// deadlock victim must retry instead of failing the backend open.
+func (m *SplitTablesMigrator) execRetryingDeadlock(ctx context.Context, query string) (sql.Result, error) {
+	const maxAttempts = 5
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		res, err := m.db.ExecContext(ctx, query)
+		if err == nil || !isLockConflictError(err) {
+			return res, err
+		}
+		lastErr = err
+		logger.Warn(ctx, "migrate_split_tables_lock_conflict_retry",
+			zap.Int("attempt", attempt),
+			zap.Error(err))
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(attempt) * 50 * time.Millisecond):
+		}
+	}
+	return nil, lastErr
+}
+
+func isLockConflictError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Deadlock found") ||
+		strings.Contains(msg, "Error 1213") ||
+		strings.Contains(msg, "40001")
+}
+
 func (m *SplitTablesMigrator) migrateInodes(ctx context.Context) (int64, error) {
 	sql := m.insertIgnore("inodes",
 		"inode_id, size_bytes, revision, mode, status, created_at, mtime, confirmed_at, expires_at",
@@ -248,7 +284,7 @@ func (m *SplitTablesMigrator) migrateInodes(ctx context.Context) (int64, error) 
 			COALESCE(confirmed_at, created_at), confirmed_at, expires_at
 		FROM files
 		WHERE status != 'DELETED'`, 0o644))
-	res, err := m.db.ExecContext(ctx, sql)
+	res, err := m.execRetryingDeadlock(ctx, sql)
 	if err != nil {
 		return 0, err
 	}
@@ -267,7 +303,7 @@ func (m *SplitTablesMigrator) migrateContents(ctx context.Context) (int64, error
 			content_blob, content_type, checksum_sha256, source_id
 		FROM files
 		WHERE status != 'DELETED'`, storageRefHashExpr))
-	res, err := m.db.ExecContext(ctx, sql)
+	res, err := m.execRetryingDeadlock(ctx, sql)
 	if err != nil {
 		return 0, err
 	}
@@ -298,7 +334,7 @@ func (m *SplitTablesMigrator) migrateSemantic(ctx context.Context) (int64, error
 
 	sql := m.insertIgnore("semantic", columns,
 		fmt.Sprintf(`SELECT %s FROM files WHERE status != 'DELETED'`, selectCols))
-	res, err := m.db.ExecContext(ctx, sql)
+	res, err := m.execRetryingDeadlock(ctx, sql)
 	if err != nil {
 		return 0, err
 	}
@@ -345,12 +381,12 @@ func (m *SplitTablesMigrator) createDirInodes(ctx context.Context) (int64, error
 			node_id, 0, 1, %d, 'CONFIRMED', created_at, created_at, created_at
 		FROM file_nodes
 		WHERE is_directory = 1`, 0o755))
-	res, err := m.db.ExecContext(ctx, sql)
+	res, err := m.execRetryingDeadlock(ctx, sql)
 	if err != nil {
 		return 0, err
 	}
 	// Link migrated directory inodes back to file_nodes.
-	if _, err := m.db.ExecContext(ctx, `
+	if _, err := m.execRetryingDeadlock(ctx, `
 		UPDATE file_nodes SET inode_id = node_id WHERE is_directory = 1 AND inode_id IS NULL
 	`); err != nil {
 		return 0, fmt.Errorf("backfill directory inode_id: %w", err)
@@ -371,7 +407,7 @@ func (m *SplitTablesMigrator) backfillSharedInodeID(ctx context.Context) (int64,
 
 	var total int64
 	for _, tbl := range tables {
-		res, err := m.db.ExecContext(ctx, fmt.Sprintf(`
+		res, err := m.execRetryingDeadlock(ctx, fmt.Sprintf(`
 			UPDATE %s
 			SET inode_id = %s
 			WHERE inode_id IS NULL AND %s IS NOT NULL
