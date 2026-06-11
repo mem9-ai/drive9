@@ -991,7 +991,7 @@ func TestPlannedTiDBSchemaRepairsAllowsHeavyAlterTableIndexRepairsWhenTableMissi
 	}
 }
 
-func TestIsSafeAddColumnRepairSQLRejectsStoredAndVirtualGeneratedColumns(t *testing.T) {
+func TestIsSafeAddColumnRepairSQLRejectsGenericStoredAndVirtualGeneratedColumns(t *testing.T) {
 	tests := []string{
 		"ALTER TABLE uploads ADD COLUMN active_target_path_old TEXT AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED",
 		"ALTER TABLE semantic ADD COLUMN embedding VECTOR(1024) AS (EMBED_TEXT('m', content_text, '{\"dimensions\":1024}')) VIRTUAL",
@@ -1005,7 +1005,7 @@ func TestIsSafeAddColumnRepairSQLRejectsStoredAndVirtualGeneratedColumns(t *test
 }
 
 func TestIsSafeAddColumnRepairSQLAllowsUploadActiveTargetHash(t *testing.T) {
-	stmt := "ALTER TABLE uploads ADD COLUMN active_target_path_hash VARCHAR(64) AS (CASE WHEN status = 'UPLOADING' THEN target_path_hash ELSE NULL END) STORED"
+	stmt := "ALTER TABLE uploads ADD COLUMN active_target_path_hash VARCHAR(64) AS (CASE WHEN status = 'UPLOADING' THEN target_path_hash ELSE NULL END) VIRTUAL"
 	if !isSafeAddColumnRepairSQL(stmt) {
 		t.Fatal("expected active_target_path_hash generated column to be safe to add")
 	}

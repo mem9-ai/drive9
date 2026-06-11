@@ -126,7 +126,7 @@ func MySQLNoEmbeddingTenantSchemaStatements() []string {
 			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			expires_at         DATETIME(3) NOT NULL,
-			active_target_path_hash VARCHAR(64) AS (CASE WHEN status = 'UPLOADING' THEN target_path_hash ELSE NULL END) STORED
+			active_target_path_hash VARCHAR(64) AS (CASE WHEN status = 'UPLOADING' THEN target_path_hash ELSE NULL END) VIRTUAL
 		)`,
 		`ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL`,
 		`CREATE INDEX idx_upload_path ON uploads(target_path_hash, status)`,
