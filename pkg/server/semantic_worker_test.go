@@ -2007,3 +2007,199 @@ func TestSemanticWorkerNextTargetSkipsFailingTenantWithinPage(t *testing.T) {
 		}
 	}
 }
+
+func TestSemanticWorkerKickDedupAndOverflow(t *testing.T) {
+	m := newSemanticWorkerManager(newTestBackendForSemanticWorker(t), nil, nil, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+
+	var nilManager *semanticWorkerManager
+	nilManager.Kick("tenant") // must be a safe no-op
+
+	m.Kick("")
+	if len(m.kicks) != 0 {
+		t.Fatalf("kicks=%d after empty tenant id, want 0", len(m.kicks))
+	}
+
+	m.Kick("tenant-a")
+	m.Kick("tenant-a")
+	if len(m.kicks) != 1 {
+		t.Fatalf("kicks=%d after duplicate kick, want 1", len(m.kicks))
+	}
+
+	for i := range semanticKickQueueCapacity {
+		m.Kick(fmt.Sprintf("tenant-fill-%d", i))
+	}
+	if len(m.kicks) != semanticKickQueueCapacity {
+		t.Fatalf("kicks=%d after overflow, want %d", len(m.kicks), semanticKickQueueCapacity)
+	}
+	// A dropped kick must not stay marked pending, or later kicks for that
+	// tenant would be deduped away forever.
+	droppedID := fmt.Sprintf("tenant-fill-%d", semanticKickQueueCapacity-1)
+	m.mu.Lock()
+	_, pending := m.kickPending[droppedID]
+	m.mu.Unlock()
+	if pending {
+		t.Fatalf("tenant %s still pending after dropped kick", droppedID)
+	}
+
+	got := <-m.kicks
+	if got != "tenant-a" {
+		t.Fatalf("first queued kick=%q, want tenant-a", got)
+	}
+	m.clearKickPending(got)
+	m.Kick("tenant-a")
+	if len(m.kicks) != semanticKickQueueCapacity {
+		t.Fatalf("kicks=%d after re-kick, want %d", len(m.kicks), semanticKickQueueCapacity)
+	}
+}
+
+func TestSemanticWorkerKickClaimsFallbackTaskWithoutScan(t *testing.T) {
+	// PollInterval and RecoverInterval of one hour park the scan and recovery
+	// loops, so only the write-commit kick can drive the claim below.
+	_, b := newTestServerWithSemanticWorker(t, staticSemanticEmbedder{vec: []float32{0.1, 0.2, 0.3}}, SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    time.Hour,
+		RecoverInterval: time.Hour,
+		LeaseDuration:   time.Minute,
+	})
+	// Let the worker finish its initial processNext pass and block in select,
+	// so a successful claim can only come from the kick.
+	time.Sleep(300 * time.Millisecond)
+	if _, err := b.Write("/docs/kick.txt", []byte("kick claims this without scan"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	nf := mustServerFile(t, b, "/docs/kick.txt")
+	waitForEmbeddingRevision(t, b, "/docs/kick.txt", 1, 5*time.Second)
+	waitForTaskStatus(t, b, nf.FileID, 1, string(semantic.TaskSucceeded), 5*time.Second)
+}
+
+func TestSemanticWorkerKickClaimsPoolTenantTaskWithoutScan(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
+	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+
+	pool := newTestTenantPool(t)
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	initServerTenantSchema(t, testDSN)
+	appStore, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testmysql.ResetDB(t, appStore.DB())
+	if err := appStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	parsedTenant, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port := "127.0.0.1", 3306
+	if parsedTenant.Addr != "" {
+		h, p, _ := strings.Cut(parsedTenant.Addr, ":")
+		if h != "" {
+			host = h
+		}
+		if p != "" {
+			_, _ = fmt.Sscanf(p, "%d", &port)
+		}
+	}
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsedTenant.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tenantMeta := &meta.Tenant{
+		ID:               token.NewID(),
+		Status:           meta.TenantActive,
+		DBHost:           host,
+		DBPort:           port,
+		DBUser:           parsedTenant.User,
+		DBPasswordCipher: passCipher,
+		DBName:           parsedTenant.DBName,
+		DBTLS:            false,
+		Provider:         tenant.ProviderDB9,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := metaStore.InsertTenant(context.Background(), tenantMeta); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := token.IssueToken(tokenSecret, tenantMeta.ID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokCipher, err := pool.Encrypt(context.Background(), []byte(tok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.InsertAPIKey(context.Background(), &meta.APIKey{
+		ID:            token.NewID(),
+		TenantID:      tenantMeta.ID,
+		KeyName:       "kick-test",
+		JWTCiphertext: tokCipher,
+		JWTHash:       token.HashToken(tok),
+		TokenVersion:  1,
+		Status:        meta.APIKeyActive,
+		IssuedAt:      now,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// PollInterval and RecoverInterval of one hour park the scan and recovery
+	// loops, so only the upload-commit kick can drive the claim below.
+	s := NewWithConfig(Config{Meta: metaStore, Pool: pool, TokenSecret: tokenSecret,
+		SemanticEmbedder: staticSemanticEmbedder{vec: []float32{0.1, 0.2}},
+		SemanticWorkers: SemanticWorkerOptions{
+			Workers:         1,
+			PollInterval:    time.Hour,
+			RecoverInterval: time.Hour,
+			LeaseDuration:   time.Minute,
+		}})
+	t.Cleanup(func() { s.Close() })
+	if s.semanticWorker == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	// Let the worker finish its initial processNext pass and block in select,
+	// so a successful claim can only come from the kick.
+	time.Sleep(300 * time.Millisecond)
+
+	body := []byte("kick claims pool tenant task without scan")
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/docs/kick.txt", strings.NewReader(string(body)))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.ContentLength = int64(len(body))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		payload, _ := io.ReadAll(resp.Body)
+		t.Fatalf("PUT status=%d body=%s", resp.StatusCode, payload)
+	}
+
+	tenantBackend, release, err := pool.Acquire(context.Background(), tenantMeta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	nf := mustServerFile(t, tenantBackend, "/docs/kick.txt")
+	waitForTaskStatus(t, tenantBackend, nf.FileID, 1, string(semantic.TaskSucceeded), 5*time.Second)
+}
