@@ -33,6 +33,14 @@ const (
 	defaultSemanticTenantScanLimit      = 128
 	defaultSemanticPerTenantConcurrency = 1
 	semanticLocalTenantID               = "local"
+	// semanticKickQueueCapacity bounds buffered upload-commit kicks; overflow
+	// kicks are dropped because the periodic tenant scan remains the durable
+	// fallback for claiming queued tasks.
+	semanticKickQueueCapacity = 256
+	// semanticKickDrainLimit caps tasks drained per kick so one busy tenant
+	// cannot monopolize a worker; the tenant is re-kicked to continue after
+	// other pending kicks get their turn.
+	semanticKickDrainLimit = 8
 )
 
 var semanticWorkerUsesTiDBAutoEmbedding = tenant.UsesTiDBAutoEmbedding
@@ -135,9 +143,12 @@ type semanticWorkerManager struct {
 	embedder embedding.Client
 	opts     SemanticWorkerOptions
 
-	mu         sync.Mutex
-	inflight   map[string]int
-	processing int
+	mu          sync.Mutex
+	inflight    map[string]int
+	processing  int
+	kickPending map[string]struct{}
+
+	kicks chan string
 
 	tenantScanCursorSet       bool
 	tenantScanCursorCreatedAt time.Time
@@ -260,7 +271,40 @@ func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Sto
 	opts.normalize()
 	m.opts = opts
 	m.inflight = make(map[string]int)
+	m.kickPending = make(map[string]struct{})
+	m.kicks = make(chan string, semanticKickQueueCapacity)
 	return m
+}
+
+// Kick prompts a worker to attempt claiming tasks for tenantID as soon as one
+// is idle, instead of waiting for the round-robin tenant scan to reach the
+// tenant. Kicks are best-effort: duplicates collapse while one is pending, and
+// the kick is dropped when the buffer is full — the periodic scan remains the
+// durable path that eventually claims every queued task.
+func (m *semanticWorkerManager) Kick(tenantID string) {
+	if m == nil || tenantID == "" {
+		return
+	}
+	m.mu.Lock()
+	if _, pending := m.kickPending[tenantID]; pending {
+		m.mu.Unlock()
+		return
+	}
+	m.kickPending[tenantID] = struct{}{}
+	m.mu.Unlock()
+	select {
+	case m.kicks <- tenantID:
+		metrics.RecordOperation("semantic_worker", "kick", "queued", 0)
+	default:
+		m.clearKickPending(tenantID)
+		metrics.RecordOperation("semantic_worker", "kick", "dropped", 0)
+	}
+}
+
+func (m *semanticWorkerManager) clearKickPending(tenantID string) {
+	m.mu.Lock()
+	delete(m.kickPending, tenantID)
+	m.mu.Unlock()
 }
 
 func (m *semanticWorkerManager) Start(ctx context.Context) {
@@ -320,6 +364,8 @@ func (m *semanticWorkerManager) workerLoop(ctx context.Context, workerID int) {
 		case <-ctx.Done():
 			logger.Info(ctx, "semantic_worker_stopped", zap.Int("worker_id", workerID))
 			return
+		case tenantID := <-m.kicks:
+			m.processKicked(ctx, tenantID)
 		case <-ticker.C:
 		}
 	}
@@ -350,7 +396,83 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 		return false
 	}
 	defer target.release()
+	return m.claimAndProcessOne(ctx, target)
+}
 
+// processKicked attempts to claim tasks for one kicked tenant immediately. It
+// is best-effort by design: every early return leaves the committed task to
+// the periodic tenant scan, which stays the durable claiming path.
+func (m *semanticWorkerManager) processKicked(ctx context.Context, tenantID string) {
+	// Clear the pending mark before claiming: a task committed after this
+	// point triggers a fresh kick, and a task committed before it is already
+	// visible to the claim below, so no enqueue can slip through unnoticed.
+	m.clearKickPending(tenantID)
+	ref, ok := m.kickRef(ctx, tenantID)
+	if !ok {
+		return
+	}
+	if !m.tryClaimTenantSlot(ref.id) {
+		// Another worker already holds this tenant's slot and its claim will
+		// observe any task committed before the kick was sent.
+		return
+	}
+	target, err := m.targetForRef(ctx, ref)
+	if err != nil {
+		logger.Warn(ctx, "semantic_worker_kick_open_store_failed",
+			zap.String("tenant_id", ref.id),
+			zap.Error(err))
+		m.releaseTenantSlot(ref.id)
+		return
+	}
+	target.release = chainReleases(target.release, func() { m.releaseTenantSlot(ref.id) })
+	defer target.release()
+	if len(target.allowedTaskTypes) == 0 {
+		return
+	}
+	for range semanticKickDrainLimit {
+		if ctx.Err() != nil {
+			return
+		}
+		if !m.claimAndProcessOne(ctx, target) {
+			return
+		}
+	}
+	m.Kick(tenantID)
+}
+
+// kickRef resolves a kicked tenant ID to a schedulable ref, applying the same
+// status and provider/task-type filters as the scan path (listTenantRefs).
+func (m *semanticWorkerManager) kickRef(ctx context.Context, tenantID string) (semanticTenantRef, bool) {
+	if tenantID == semanticLocalTenantID {
+		// Match scan behavior: the local fallback is only schedulable outside
+		// multi-tenant mode (listTenantRefs never enumerates it otherwise).
+		if m.meta == nil || m.pool == nil {
+			if m.shouldIncludeFallback() {
+				return semanticTenantRef{id: semanticLocalTenantID}, true
+			}
+		}
+		return semanticTenantRef{}, false
+	}
+	if m.meta == nil || m.pool == nil {
+		return semanticTenantRef{}, false
+	}
+	t, err := m.meta.GetTenant(ctx, tenantID)
+	if err != nil {
+		logger.Warn(ctx, "semantic_worker_kick_tenant_lookup_failed",
+			zap.String("tenant_id", tenantID),
+			zap.Error(err))
+		return semanticTenantRef{}, false
+	}
+	if t.Status != meta.TenantActive {
+		return semanticTenantRef{}, false
+	}
+	if !hasAnyTaskTypes(m.taskTypesForProvider(t.Provider)) {
+		return semanticTenantRef{}, false
+	}
+	return semanticTenantRef{id: t.ID, tenant: t}, true
+}
+
+func (m *semanticWorkerManager) claimAndProcessOne(ctx context.Context, target *semanticTarget) bool {
 	claimStart := time.Now()
 	task, found, err := target.store.ClaimSemanticTask(ctx, time.Now().UTC(), m.opts.LeaseDuration, target.allowedTaskTypes...)
 	if err != nil {

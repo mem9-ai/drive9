@@ -300,6 +300,19 @@ func NewWithConfig(cfg Config) *Server {
 		s.resumeDeletingForkTenants()
 	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
+	if s.semanticWorker != nil {
+		// Wire upload/write-commit kicks so freshly enqueued semantic tasks are
+		// claimed immediately instead of waiting for the tenant scan to come
+		// around (which can take many minutes with hundreds of active tenants).
+		if cfg.Pool != nil {
+			cfg.Pool.SetSemanticTaskNotifier(s.semanticWorker.Kick)
+		}
+		if cfg.Backend != nil {
+			cfg.Backend.SetSemanticTaskEnqueuedNotifier(func() {
+				s.semanticWorker.Kick(semanticLocalTenantID)
+			})
+		}
+	}
 	appManagedTaskTypes := semanticWorkerLogTaskTypesFromTypes(appManagedSemanticTaskTypes(cfg.SemanticEmbedder))
 	var fallbackTaskTypes, poolAutoTaskTypes []string
 	if cfg.Backend != nil {

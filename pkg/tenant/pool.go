@@ -62,6 +62,7 @@ type Pool struct {
 	order                     *list.List
 	maxSize                   int
 	tidbSchemaValidationOpens atomic.Uint64
+	semanticTaskNotifier      atomic.Pointer[func(tenantID string)]
 }
 
 type tenantAutoEmbeddingProfile struct {
@@ -105,6 +106,28 @@ func (p *Pool) SetMetaStore(ms *meta.Store) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.metaStore = ms
+}
+
+// SetSemanticTaskNotifier registers a callback invoked with the tenant ID
+// whenever one of this pool's backends commits a durable semantic task, so the
+// semantic worker can claim the new work immediately instead of waiting for
+// the periodic tenant scan.
+func (p *Pool) SetSemanticTaskNotifier(fn func(tenantID string)) {
+	if p == nil {
+		return
+	}
+	p.semanticTaskNotifier.Store(&fn)
+}
+
+func (p *Pool) wireSemanticTaskNotifier(b *backend.Dat9Backend, tenantID string) {
+	// Resolve the notifier at call time, not wire time, so backends created
+	// before SetSemanticTaskNotifier (e.g. during tenant resume on startup)
+	// still notify once the semantic worker registers.
+	b.SetSemanticTaskEnqueuedNotifier(func() {
+		if fn := p.semanticTaskNotifier.Load(); fn != nil && *fn != nil {
+			(*fn)(tenantID)
+		}
+	})
 }
 
 func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backend, err error) {
@@ -586,6 +609,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(b, t.ID)
+		p.wireSemanticTaskNotifier(b, t.ID)
 		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 		return b, store, nil
 	}
@@ -626,6 +650,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(b, t.ID)
+		p.wireSemanticTaskNotifier(b, t.ID)
 		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 		return b, store, nil
 	}
@@ -648,6 +673,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("create_backend_ms", backendCreateDurationMs),
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	p.wireQuotaStore(b, t.ID)
+	p.wireSemanticTaskNotifier(b, t.ID)
 	b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 	return b, store, nil
 }
