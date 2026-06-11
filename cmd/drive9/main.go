@@ -91,10 +91,15 @@ func main() {
 
 	dispatch(cmd, os.Args[2:])
 
-	// Show update notice after command completes (never before).
+	// Show update notice only if the goroutine has already finished;
+	// never block process exit waiting for network I/O.
 	if updateResultCh != nil {
-		if rel := <-updateResultCh; rel != nil {
-			cli.PrintUpdateNotice(rel, buildinfo.Version)
+		select {
+		case rel := <-updateResultCh:
+			if rel != nil {
+				cli.PrintUpdateNotice(rel, buildinfo.Version)
+			}
+		default:
 		}
 	}
 }
