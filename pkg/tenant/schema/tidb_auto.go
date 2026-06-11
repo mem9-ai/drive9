@@ -1055,7 +1055,10 @@ func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiD
 	if err := validateTiDBSchemaMode(mode); err != nil {
 		return err
 	}
-	const maxRepairPasses = 3
+	// Path-hash migrations from the legacy schema can need separate passes for
+	// adding hash columns, adding the active-upload generated hash column,
+	// rebuilding old same-name indexes, and finally widening path columns.
+	const maxRepairPasses = 6
 	for i := 0; i < maxRepairPasses; i++ {
 		attemptedPasses = i + 1
 		passStart := time.Now()
