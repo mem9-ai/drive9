@@ -417,7 +417,6 @@ func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (conte
 
 const (
 	posixNameMax = 255
-	posixPathMax = 4096
 )
 
 const maxPathTruncateInMemoryBytes int64 = 64 << 20
@@ -431,17 +430,9 @@ func (fs *Dat9FS) childPath(parentIno uint64, name string) (string, gofuse.Statu
 		return "", gofuse.ENOENT
 	}
 	if parentPath == "/" {
-		p := "/" + name
-		if len(p) > posixPathMax {
-			return "", gofuse.Status(syscall.ENAMETOOLONG)
-		}
-		return p, gofuse.OK
+		return "/" + name, gofuse.OK
 	}
-	p := parentPath + "/" + name
-	if len(p) > posixPathMax {
-		return "", gofuse.Status(syscall.ENAMETOOLONG)
-	}
-	return p, gofuse.OK
+	return parentPath + "/" + name, gofuse.OK
 }
 
 func parentDir(p string) string {

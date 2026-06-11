@@ -4680,25 +4680,19 @@ func TestRenameZeroByteRemoteFileToMissingTargetFallsBackToCreateDelete(t *testi
 	}
 }
 
-func TestChildPathRejectsOverlongNameAndPath(t *testing.T) {
+func TestChildPathRejectsOverlongNameAndAllowsLongPath(t *testing.T) {
 	fs := NewDat9FS(newTestClient("http://127.0.0.1"), trustedProcessLocalEventsOptions())
 
 	if _, st := fs.childPath(1, strings.Repeat("a", posixNameMax+1)); st != gofuse.Status(syscall.ENAMETOOLONG) {
 		t.Fatalf("overlong name status = %v, want ENAMETOOLONG", st)
 	}
 
-	maxParent := "/" + strings.Repeat("a", posixPathMax-4)
-	maxParentIno := fs.inodes.Lookup(maxParent, true, 0, time.Unix(10, 0))
-	if child, st := fs.childPath(maxParentIno, "cc"); st != gofuse.OK {
-		t.Fatalf("max path status = %v, want OK", st)
-	} else if len(child) != posixPathMax {
-		t.Fatalf("max path length = %d, want %d", len(child), posixPathMax)
-	}
-
-	parent := "/" + strings.Repeat("a", posixPathMax-2)
-	parentIno := fs.inodes.Lookup(parent, true, 0, time.Unix(10, 0))
-	if _, st := fs.childPath(parentIno, "bb"); st != gofuse.Status(syscall.ENAMETOOLONG) {
-		t.Fatalf("overlong path status = %v, want ENAMETOOLONG", st)
+	longParent := "/" + strings.TrimSuffix(strings.Repeat("a/", 4096), "/")
+	longParentIno := fs.inodes.Lookup(longParent, true, 0, time.Unix(10, 0))
+	if child, st := fs.childPath(longParentIno, "bb"); st != gofuse.OK {
+		t.Fatalf("long path status = %v, want OK", st)
+	} else if len(child) <= 4096 {
+		t.Fatalf("long path length = %d, want > 4096", len(child))
 	}
 }
 
