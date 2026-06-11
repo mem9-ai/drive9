@@ -21,16 +21,18 @@ func MySQLNoEmbeddingTenantSchemaStatements() []string {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
-			path         VARCHAR(512) NOT NULL,
-			parent_path  VARCHAR(512) NOT NULL,
+			path         VARCHAR(4096) NOT NULL,
+			path_hash    VARCHAR(64) NOT NULL DEFAULT '',
+			parent_path  VARCHAR(4096) NOT NULL,
+			parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 			name         VARCHAR(255) NOT NULL,
 			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
 			file_id      VARCHAR(64),
 			inode_id     VARCHAR(64),
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 		)`,
-		`CREATE UNIQUE INDEX idx_path ON file_nodes(path)`,
-		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
+		`CREATE UNIQUE INDEX idx_path ON file_nodes(path_hash)`,
+		`CREATE INDEX idx_parent ON file_nodes(parent_path_hash, name)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
 		`CREATE INDEX idx_inode_id ON file_nodes(inode_id)`,
 
@@ -107,7 +109,8 @@ func MySQLNoEmbeddingTenantSchemaStatements() []string {
 			upload_id          VARCHAR(64) PRIMARY KEY,
 			file_id            VARCHAR(64) NOT NULL,
 			inode_id           VARCHAR(64),
-			target_path        VARCHAR(512) NOT NULL,
+			target_path        VARCHAR(4096) NOT NULL,
+			target_path_hash   VARCHAR(64) NOT NULL DEFAULT '',
 			s3_upload_id       VARCHAR(255) NOT NULL,
 			s3_key             VARCHAR(2048) NOT NULL,
 			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'none',
@@ -123,12 +126,12 @@ func MySQLNoEmbeddingTenantSchemaStatements() []string {
 			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			expires_at         DATETIME(3) NOT NULL,
-			active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED
+			active_target_path_hash VARCHAR(64) AS (CASE WHEN status = 'UPLOADING' THEN target_path_hash ELSE NULL END) STORED
 		)`,
 		`ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL`,
-		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
+		`CREATE INDEX idx_upload_path ON uploads(target_path_hash, status)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
-		`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path)`,
+		`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path_hash)`,
 		`CREATE TABLE IF NOT EXISTS semantic_tasks (
 			task_id           VARCHAR(64) PRIMARY KEY,
 			task_type         VARCHAR(32) NOT NULL,

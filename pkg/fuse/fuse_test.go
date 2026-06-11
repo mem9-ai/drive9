@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -86,6 +87,28 @@ func TestInodeToPath_ForgetDirectoryKeepsMapping(t *testing.T) {
 	p, ok := m.GetPath(ino)
 	if !ok || p != "/tmp" {
 		t.Fatalf("directory inode mapping should be preserved, got %q, %v", p, ok)
+	}
+}
+
+func TestInodeToPath_ForgetOwnerMetadataKeepsMapping(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/tmp", false, 0, time.Now())
+	m.UpdateOwner(ino, 65534, 65534, true, true)
+	m.Forget(ino, 1)
+	p, ok := m.GetPath(ino)
+	if !ok || p != "/tmp" {
+		t.Fatalf("owner-tracked inode mapping should be preserved, got %q, %v", p, ok)
+	}
+}
+
+func TestInodeToPath_ForgetMetadataOnlySpecialKeepsMapping(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/pipe", false, 0, time.Now())
+	m.SetModeState(ino, uint32(syscall.S_IFIFO)|0o644, true)
+	m.Forget(ino, 1)
+	p, ok := m.GetPath(ino)
+	if !ok || p != "/pipe" {
+		t.Fatalf("metadata-only special inode mapping should be preserved, got %q, %v", p, ok)
 	}
 }
 

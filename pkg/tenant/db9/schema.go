@@ -19,16 +19,18 @@ func InitSchemaStatements() []string {
 	core := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
-			path         VARCHAR(512) NOT NULL,
-			parent_path  VARCHAR(512) NOT NULL,
+			path         VARCHAR(4096) NOT NULL,
+			path_hash    VARCHAR(64) NOT NULL DEFAULT '',
+			parent_path  VARCHAR(4096) NOT NULL,
+			parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 			name         VARCHAR(255) NOT NULL,
 			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
 			file_id      VARCHAR(64),
 			inode_id     VARCHAR(64),
 			created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_path ON file_nodes(path)`,
-		`CREATE INDEX IF NOT EXISTS idx_parent ON file_nodes(parent_path)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_path ON file_nodes(path_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_parent ON file_nodes(parent_path_hash, name)`,
 		`CREATE INDEX IF NOT EXISTS idx_file_id ON file_nodes(file_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_inode_id ON file_nodes(inode_id)`,
 		// See docs/async-embedding/async-embedding-generation-proposal.md,
@@ -84,7 +86,8 @@ func InitSchemaStatements() []string {
 			upload_id          VARCHAR(64) PRIMARY KEY,
 			file_id            VARCHAR(64) NOT NULL,
 			inode_id           VARCHAR(64),
-			target_path        VARCHAR(512) NOT NULL,
+			target_path        VARCHAR(4096) NOT NULL,
+			target_path_hash   VARCHAR(64) NOT NULL DEFAULT '',
 			s3_upload_id       VARCHAR(255) NOT NULL,
 			s3_key             VARCHAR(2048) NOT NULL,
 			total_size         BIGINT NOT NULL,
@@ -100,11 +103,11 @@ func InitSchemaStatements() []string {
 			created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			expires_at         TIMESTAMPTZ NOT NULL,
-			active_target_path VARCHAR(512) GENERATED ALWAYS AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED
+			active_target_path_hash VARCHAR(64) GENERATED ALWAYS AS (CASE WHEN status = 'UPLOADING' THEN target_path_hash ELSE NULL END) STORED
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_upload_path ON uploads(target_path, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_upload_path ON uploads(target_path_hash, status)`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_idempotency ON uploads(idempotency_key)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_active ON uploads(active_target_path)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_uploads_active ON uploads(active_target_path_hash)`,
 		// semantic_tasks groups fields by responsibility:
 		// - identity/resource binding: task_id, task_type, resource_id, resource_version
 		// - delivery state: status, attempt_count, max_attempts

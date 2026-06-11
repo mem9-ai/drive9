@@ -245,9 +245,9 @@ func (m *InodeToPath) GetEntry(ino uint64) (*InodeEntry, bool) {
 	return copyInodeEntryLocked(entry), true
 }
 
-// Forget decrements the Nlookup count for the given inode by nlookup. If the
-// resulting Nlookup is less than or equal to zero and the inode is not the
-// root (inode 1), the entry is removed from both maps.
+// Forget decrements the Nlookup count for the given inode by nlookup. Some
+// visible mappings are retained after lookup refs drop so later lookups can
+// preserve POSIX inode identity and local owner metadata across rename.
 func (m *InodeToPath) Forget(ino uint64, nlookup uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -259,14 +259,25 @@ func (m *InodeToPath) Forget(ino uint64, nlookup uint64) {
 
 	entry.Nlookup -= int64(nlookup)
 	if entry.Nlookup <= 0 && ino != 1 {
-		if entry.IsDir {
-			// Preserve directory inode->path mappings after lookup refs drop.
-			// Later mkdir/rename/rmdir calls can still reference the inode.
+		if shouldKeepForgetMapping(entry) {
 			entry.Nlookup = 0
 			return
 		}
 		m.removeEntryLocked(ino, entry)
 	}
+}
+
+func shouldKeepForgetMapping(entry *InodeEntry) bool {
+	if entry == nil {
+		return false
+	}
+	if entry.IsDir || entry.ResourceID != "" {
+		return true
+	}
+	if entry.HasUID || entry.HasGID {
+		return true
+	}
+	return entryIsMetadataOnlySpecial(entry)
 }
 
 // ForgetKeepMapping decrements the kernel lookup count without removing the

@@ -353,9 +353,9 @@ func TestListDirSkipsHistoricalRootDentry(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
 	if _, err := s.DB().Exec(`
-		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, created_at)
-		VALUES (?, ?, ?, ?, 1, ?)`,
-		"root-self", "/", "/", "root-alias", now); err != nil {
+		INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+		"root-self", "/", fileNodePathHash("/"), "/", fileNodePathHash("/"), "root-alias", now); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.InsertNode(context.Background(), &FileNode{
@@ -414,9 +414,9 @@ func TestListNodesSkipsHistoricalRootDentry(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
 	if _, err := s.DB().Exec(`
-		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, created_at)
-		VALUES (?, ?, ?, ?, 1, ?)`,
-		"root-self", "/", "/", "root-alias", now); err != nil {
+		INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+		"root-self", "/", fileNodePathHash("/"), "/", fileNodePathHash("/"), "root-alias", now); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.InsertNode(context.Background(), &FileNode{
@@ -1387,9 +1387,9 @@ func TestChmodRejectsHistoricalRootDentry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.DB().ExecContext(ctx, `
-		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, inode_id, created_at)
-		VALUES (?, ?, ?, ?, 1, ?, ?)`,
-		"root-node", "/", "/", "root-alias", inodeID, now); err != nil {
+		INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, inode_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		"root-node", "/", fileNodePathHash("/"), "/", fileNodePathHash("/"), "root-alias", inodeID, now); err != nil {
 		t.Fatal(err)
 	}
 

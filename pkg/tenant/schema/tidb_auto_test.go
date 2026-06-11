@@ -248,7 +248,7 @@ func TestMissingTableAndIndexDiffsIncludesExternalIndexes(t *testing.T) {
 		name:            "uploads",
 		createStatement: "CREATE TABLE IF NOT EXISTS uploads (...)",
 		indexes: map[string]tidbIndexSpec{
-			"idx_upload_path": {createSQL: "CREATE INDEX idx_upload_path ON uploads(target_path, status)"},
+			"idx_upload_path": {createSQL: "CREATE INDEX idx_upload_path ON uploads(target_path_hash, status)"},
 			"idx_idempotency": {createSQL: "CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)"},
 		},
 	}
@@ -269,7 +269,7 @@ func TestPlannedTiDBSchemaRepairsIncludesSafeStatementsOnly(t *testing.T) {
 	diffs := []tidbSchemaDiff{
 		{kind: tidbSchemaDiffMissingTable, tableName: "semantic_tasks", repairSQL: "CREATE TABLE IF NOT EXISTS semantic_tasks (...)"},
 		{kind: tidbSchemaDiffMissingColumn, tableName: "uploads", columnName: "expected_revision", repairSQL: "ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL"},
-		{kind: tidbSchemaDiffMissingIndex, tableName: "uploads", detail: "uploads schema contract: missing idx_upload_path index", repairSQL: "CREATE INDEX idx_upload_path ON uploads(target_path, status)"},
+		{kind: tidbSchemaDiffMissingIndex, tableName: "uploads", detail: "uploads schema contract: missing idx_upload_path index", repairSQL: "CREATE INDEX idx_upload_path ON uploads(target_path_hash, status)"},
 		{kind: tidbSchemaDiffMissingColumn, tableName: "uploads", columnName: "expected_revision", repairSQL: "ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL"},
 		{kind: tidbSchemaDiffColumnType, tableName: "semantic", columnName: "embedding_revision", detail: "semantic schema contract: embedding_revision column type = \"int\", want bigint"},
 	}
@@ -284,14 +284,14 @@ func TestPlannedTiDBSchemaRepairsIncludesSafeStatementsOnly(t *testing.T) {
 	if got[1] != "ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL" {
 		t.Fatalf("unexpected second repair statement: %q", got[1])
 	}
-	if got[2] != "CREATE INDEX idx_upload_path ON uploads(target_path, status)" {
+	if got[2] != "CREATE INDEX idx_upload_path ON uploads(target_path_hash, status)" {
 		t.Fatalf("unexpected third repair statement: %q", got[2])
 	}
 }
 
 func TestPlannedTiDBSchemaRepairsAllowsUniqueIndexOnExistingTable(t *testing.T) {
 	diffs := []tidbSchemaDiff{
-		{kind: tidbSchemaDiffMissingIndex, tableName: "uploads", detail: "uploads schema contract: missing idx_upload_path index", repairSQL: "CREATE INDEX idx_upload_path ON uploads(target_path, status)"},
+		{kind: tidbSchemaDiffMissingIndex, tableName: "uploads", detail: "uploads schema contract: missing idx_upload_path index", repairSQL: "CREATE INDEX idx_upload_path ON uploads(target_path_hash, status)"},
 		{kind: tidbSchemaDiffMissingIndex, tableName: "uploads", detail: "uploads schema contract: missing idx_idempotency index", repairSQL: "CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)"},
 	}
 
@@ -299,11 +299,92 @@ func TestPlannedTiDBSchemaRepairsAllowsUniqueIndexOnExistingTable(t *testing.T) 
 	if len(got) != 2 {
 		t.Fatalf("expected both missing indexes to be auto-repaired, got %#v", got)
 	}
-	if got[0] != "CREATE INDEX idx_upload_path ON uploads(target_path, status)" {
+	if got[0] != "CREATE INDEX idx_upload_path ON uploads(target_path_hash, status)" {
 		t.Fatalf("unexpected first repair statement: %q", got[0])
 	}
 	if got[1] != "CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)" {
 		t.Fatalf("unexpected second repair statement: %q", got[1])
+	}
+}
+
+func TestPlannedTiDBSchemaRepairsAllowsPathColumnWidening(t *testing.T) {
+	diffs := []tidbSchemaDiff{
+		{
+			kind:       tidbSchemaDiffColumnType,
+			tableName:  "file_nodes",
+			columnName: "path",
+			repairSQL:  "ALTER TABLE file_nodes MODIFY COLUMN path VARCHAR(4096) NOT NULL",
+		},
+		{
+			kind:       tidbSchemaDiffColumnType,
+			tableName:  "uploads",
+			columnName: "target_path",
+			repairSQL:  "ALTER TABLE uploads MODIFY COLUMN target_path VARCHAR(4096) NOT NULL",
+		},
+	}
+
+	got := plannedTiDBSchemaRepairs(diffs)
+	if len(got) != 2 {
+		t.Fatalf("expected path widening repairs, got %#v", got)
+	}
+}
+
+func TestPlannedTiDBSchemaRepairsDefersPathHashIndexesUntilHashColumnsExist(t *testing.T) {
+	diffs := []tidbSchemaDiff{
+		{
+			kind:       tidbSchemaDiffMissingColumn,
+			tableName:  "file_nodes",
+			columnName: "path_hash",
+			repairSQL:  "ALTER TABLE file_nodes ADD COLUMN path_hash VARCHAR(64) NOT NULL DEFAULT ''",
+		},
+		{
+			kind:      tidbSchemaDiffMissingIndex,
+			tableName: "file_nodes",
+			detail:    "file_nodes schema contract: missing idx_path index",
+			repairSQL: "CREATE UNIQUE INDEX idx_path ON file_nodes(path_hash)",
+		},
+		{
+			kind:      tidbSchemaDiffMissingIndex,
+			tableName: "uploads",
+			detail:    "uploads schema contract: missing idx_idempotency index",
+			repairSQL: "CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)",
+		},
+	}
+
+	got := plannedTiDBSchemaRepairs(diffs)
+	if len(got) != 2 {
+		t.Fatalf("expected hash index to be deferred while unrelated index remains, got %#v", got)
+	}
+	if got[0] != "ALTER TABLE file_nodes ADD COLUMN path_hash VARCHAR(64) NOT NULL DEFAULT ''" {
+		t.Fatalf("unexpected first repair statement: %q", got[0])
+	}
+	if got[1] != "CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)" {
+		t.Fatalf("unexpected second repair statement: %q", got[1])
+	}
+}
+
+func TestPlannedTiDBSchemaRepairsDefersPathWideningUntilHashIndexesRebuilt(t *testing.T) {
+	diffs := []tidbSchemaDiff{
+		{
+			kind:       tidbSchemaDiffColumnType,
+			tableName:  "file_nodes",
+			columnName: "path",
+			repairSQL:  "ALTER TABLE file_nodes MODIFY COLUMN path VARCHAR(4096) NOT NULL",
+		},
+		{
+			kind:      tidbSchemaDiffMissingIndex,
+			tableName: "file_nodes",
+			detail:    "file_nodes schema contract: idx_path index columns = (path), want (path_hash)",
+			repairSQL: "ALTER TABLE file_nodes DROP INDEX idx_path, ADD UNIQUE INDEX idx_path(path_hash)",
+		},
+	}
+
+	got := plannedTiDBSchemaRepairs(diffs)
+	if len(got) != 1 {
+		t.Fatalf("expected only hash index repair before widening, got %#v", got)
+	}
+	if got[0] != "ALTER TABLE file_nodes DROP INDEX idx_path, ADD UNIQUE INDEX idx_path(path_hash)" {
+		t.Fatalf("unexpected repair statement: %q", got[0])
 	}
 }
 
@@ -320,14 +401,27 @@ func TestParseUniqueIndexRepairStatement(t *testing.T) {
 	}
 }
 
+func TestParseUniqueIndexRepairStatementAcceptsDropAndAddAlter(t *testing.T) {
+	repair, ok := parseUniqueIndexRepairStatement("ALTER TABLE uploads DROP INDEX idx_uploads_active, ADD UNIQUE INDEX idx_uploads_active(active_target_path_hash)")
+	if !ok {
+		t.Fatal("expected combined drop/add unique index repair statement to parse")
+	}
+	if repair.tableName != "uploads" || repair.indexName != "idx_uploads_active" {
+		t.Fatalf("unexpected repair target: %#v", repair)
+	}
+	if !equalStringSlices(repair.columns, []string{"active_target_path_hash"}) {
+		t.Fatalf("unexpected repair columns: %#v", repair.columns)
+	}
+}
+
 func TestBuildUniqueIndexDuplicateCheckSQL(t *testing.T) {
 	repair := tidbUniqueIndexRepair{
 		tableName: "uploads",
 		indexName: "idx_uploads_active",
-		columns:   []string{"active_target_path"},
+		columns:   []string{"active_target_path_hash"},
 	}
 	got := buildUniqueIndexDuplicateCheckSQL(repair)
-	want := "SELECT 1 FROM `uploads` WHERE `active_target_path` IS NOT NULL GROUP BY `active_target_path` HAVING COUNT(*) > 1 LIMIT 1"
+	want := "SELECT 1 FROM `uploads` WHERE `active_target_path_hash` IS NOT NULL GROUP BY `active_target_path_hash` HAVING COUNT(*) > 1 LIMIT 1"
 	if got != want {
 		t.Fatalf("duplicate check SQL=%q, want %q", got, want)
 	}
@@ -447,7 +541,8 @@ func TestDiffTiDBTableMetaReportsMissingRequiredIndex(t *testing.T) {
 	meta := testUploadsTableMeta(true)
 	createStmt := `CREATE TABLE uploads (
 		upload_id VARCHAR(64) PRIMARY KEY,
-		target_path VARCHAR(512) NOT NULL,
+		target_path VARCHAR(4096) NOT NULL,
+		target_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 		status VARCHAR(32) NOT NULL,
 		expected_revision BIGINT NULL
 	)`
@@ -461,16 +556,60 @@ func TestDiffTiDBTableMetaReportsMissingRequiredIndex(t *testing.T) {
 	}
 }
 
+func TestDiffTiDBTableMetaReportsPathHashIndexColumnMismatch(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "file_nodes")
+	meta := tidbTableMeta{
+		tableName: "file_nodes",
+		columns: map[string]tidbColumnMeta{
+			"node_id":          {columnType: "varchar(64)"},
+			"path":             {columnType: "varchar(4096)"},
+			"path_hash":        {columnType: "varchar(64)"},
+			"parent_path":      {columnType: "varchar(4096)"},
+			"parent_path_hash": {columnType: "varchar(64)"},
+			"name":             {columnType: "varchar(255)"},
+			"is_directory":     {columnType: "tinyint(1)"},
+			"file_id":          {columnType: "varchar(64)"},
+			"inode_id":         {columnType: "varchar(64)"},
+			"created_at":       {columnType: "datetime(3)"},
+		},
+	}
+	createStmt := `CREATE TABLE file_nodes (
+		node_id VARCHAR(64) PRIMARY KEY,
+		path VARCHAR(4096) NOT NULL,
+		path_hash VARCHAR(64) NOT NULL DEFAULT '',
+		parent_path VARCHAR(4096) NOT NULL,
+		parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
+		name VARCHAR(255) NOT NULL,
+		is_directory TINYINT(1) NOT NULL DEFAULT 0,
+		file_id VARCHAR(64),
+		inode_id VARCHAR(64),
+		created_at DATETIME(3) NOT NULL,
+		UNIQUE KEY idx_path (path),
+		KEY idx_parent (parent_path, name),
+		KEY idx_file_id (file_id),
+		KEY idx_inode_id (inode_id)
+	)`
+
+	diffs := diffTiDBTableMeta(spec, meta, createStmt)
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_path index columns") {
+		t.Fatalf("expected idx_path column mismatch diff, got %#v", diffs)
+	}
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_parent index columns") {
+		t.Fatalf("expected idx_parent column mismatch diff, got %#v", diffs)
+	}
+}
+
 func TestDiffTiDBTableMetaRecognizesUniqueIndexFromCreateStatement(t *testing.T) {
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
 	meta := testUploadsTableMeta(true)
 	createStmt := `CREATE TABLE uploads (
 		upload_id VARCHAR(64) PRIMARY KEY,
-		target_path VARCHAR(512) NOT NULL,
+		target_path VARCHAR(4096) NOT NULL,
+		target_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 		status VARCHAR(32) NOT NULL,
 		expected_revision BIGINT NULL,
-		active_target_path VARCHAR(512),
-		UNIQUE KEY idx_uploads_active (active_target_path)
+		active_target_path_hash VARCHAR(64),
+		UNIQUE KEY idx_uploads_active (active_target_path_hash)
 	)`
 
 	diffs := diffTiDBTableMeta(spec, meta, createStmt)
@@ -541,8 +680,8 @@ func TestDiffTiDBTableMetaReportsIndexInspectionFailureInsteadOfFalsePositives(t
 func TestParseObservedTiDBIndexesRecognizesConstraintUnique(t *testing.T) {
 	createStmt := `CREATE TABLE uploads (
 		upload_id VARCHAR(64) PRIMARY KEY,
-		active_target_path VARCHAR(512),
-		CONSTRAINT idx_uploads_active UNIQUE (active_target_path)
+		active_target_path_hash VARCHAR(64),
+		CONSTRAINT idx_uploads_active UNIQUE (active_target_path_hash)
 	)`
 	observed, ok := parseObservedTiDBIndexes(createStmt)
 	if !ok {
@@ -557,8 +696,8 @@ func TestTiDBSchemaSpecFromStatementsParsesConstraintUniqueDefinition(t *testing
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS uploads (
 			upload_id VARCHAR(64) PRIMARY KEY,
-			active_target_path VARCHAR(512),
-			CONSTRAINT idx_uploads_active UNIQUE (active_target_path)
+			active_target_path_hash VARCHAR(64),
+			CONSTRAINT idx_uploads_active UNIQUE (active_target_path_hash)
 		)`,
 	}
 	spec, err := tidbSchemaSpecFromStatements(stmts)
@@ -576,12 +715,16 @@ func TestDiffTiDBTableMetaReportsFileNodesAndFileTagsMissingIndexes(t *testing.T
 	nodesMeta := tidbTableMeta{
 		tableName: "file_nodes",
 		columns: map[string]tidbColumnMeta{
-			"node_id":     {columnType: "varchar(64)"},
-			"path":        {columnType: "varchar(512)"},
-			"parent_path": {columnType: "varchar(512)"},
-			"name":        {columnType: "varchar(255)"},
-			"file_id":     {columnType: "varchar(64)"},
-			"created_at":  {columnType: "datetime(3)"},
+			"node_id":          {columnType: "varchar(64)"},
+			"path":             {columnType: "varchar(4096)"},
+			"path_hash":        {columnType: "varchar(64)"},
+			"parent_path":      {columnType: "varchar(4096)"},
+			"parent_path_hash": {columnType: "varchar(64)"},
+			"name":             {columnType: "varchar(255)"},
+			"is_directory":     {columnType: "tinyint(1)"},
+			"file_id":          {columnType: "varchar(64)"},
+			"inode_id":         {columnType: "varchar(64)"},
+			"created_at":       {columnType: "datetime(3)"},
 		},
 	}
 	nodesDiffs := diffTiDBTableMeta(nodesSpec, nodesMeta, `CREATE TABLE file_nodes (node_id VARCHAR(64) PRIMARY KEY)`)
@@ -663,23 +806,29 @@ func TestDiffTiDBTableMetaTreatsBooleanAndTinyIntAsEquivalent(t *testing.T) {
 	meta := tidbTableMeta{
 		tableName: "file_nodes",
 		columns: map[string]tidbColumnMeta{
-			"node_id":      {columnType: "varchar(64)"},
-			"path":         {columnType: "varchar(512)"},
-			"parent_path":  {columnType: "varchar(512)"},
-			"name":         {columnType: "varchar(255)"},
-			"is_directory": {columnType: "tinyint(1)"},
-			"file_id":      {columnType: "varchar(64)"},
-			"created_at":   {columnType: "datetime(3)"},
+			"node_id":          {columnType: "varchar(64)"},
+			"path":             {columnType: "varchar(4096)"},
+			"path_hash":        {columnType: "varchar(64)"},
+			"parent_path":      {columnType: "varchar(4096)"},
+			"parent_path_hash": {columnType: "varchar(64)"},
+			"name":             {columnType: "varchar(255)"},
+			"is_directory":     {columnType: "tinyint(1)"},
+			"file_id":          {columnType: "varchar(64)"},
+			"inode_id":         {columnType: "varchar(64)"},
+			"created_at":       {columnType: "datetime(3)"},
 		},
 	}
 
 	diffs := diffTiDBTableMeta(spec, meta, `CREATE TABLE file_nodes (
 		node_id VARCHAR(64) PRIMARY KEY,
-		path VARCHAR(512) NOT NULL,
-		parent_path VARCHAR(512) NOT NULL,
+		path VARCHAR(4096) NOT NULL,
+		path_hash VARCHAR(64) NOT NULL DEFAULT '',
+		parent_path VARCHAR(4096) NOT NULL,
+		parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 		name VARCHAR(255) NOT NULL,
 		is_directory TINYINT(1) NOT NULL DEFAULT 0,
 		file_id VARCHAR(64),
+		inode_id VARCHAR(64),
 		created_at DATETIME(3) NOT NULL
 	)`)
 
@@ -844,7 +993,7 @@ func TestPlannedTiDBSchemaRepairsAllowsHeavyAlterTableIndexRepairsWhenTableMissi
 
 func TestIsSafeAddColumnRepairSQLRejectsStoredAndVirtualGeneratedColumns(t *testing.T) {
 	tests := []string{
-		"ALTER TABLE uploads ADD COLUMN active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED",
+		"ALTER TABLE uploads ADD COLUMN active_target_path_old VARCHAR(4096) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED",
 		"ALTER TABLE semantic ADD COLUMN embedding VECTOR(1024) AS (EMBED_TEXT('m', content_text, '{\"dimensions\":1024}')) VIRTUAL",
 	}
 
@@ -852,6 +1001,13 @@ func TestIsSafeAddColumnRepairSQLRejectsStoredAndVirtualGeneratedColumns(t *test
 		if isSafeAddColumnRepairSQL(stmt) {
 			t.Fatalf("expected generated column repair to be unsafe: %s", stmt)
 		}
+	}
+}
+
+func TestIsSafeAddColumnRepairSQLAllowsUploadActiveTargetHash(t *testing.T) {
+	stmt := "ALTER TABLE uploads ADD COLUMN active_target_path_hash VARCHAR(64) AS (CASE WHEN status = 'UPLOADING' THEN target_path_hash ELSE NULL END) STORED"
+	if !isSafeAddColumnRepairSQL(stmt) {
+		t.Fatal("expected active_target_path_hash generated column to be safe to add")
 	}
 }
 
@@ -1236,7 +1392,9 @@ func testUploadsTableMeta(includeExpectedRevision bool) tidbTableMeta {
 		tableName: "uploads",
 		columns: map[string]tidbColumnMeta{
 			"upload_id":                 {columnType: "varchar(64)"},
-			"target_path":               {columnType: "varchar(512)"},
+			"target_path":               {columnType: "varchar(4096)"},
+			"target_path_hash":          {columnType: "varchar(64)"},
+			"active_target_path_hash":   {columnType: "varchar(64)"},
 			"status":                    {columnType: "varchar(32)"},
 			"storage_encryption_mode":   {columnType: "varchar(16)"},
 			"storage_encryption_key_id": {columnType: "varchar(256)"},
@@ -1250,7 +1408,7 @@ func testUploadsTableMeta(includeExpectedRevision bool) tidbTableMeta {
 
 func TestParseConstraintUniqueIndexDefinitionUsesExplicitIndexName(t *testing.T) {
 	indexName, columns, ok := parseConstraintUniqueIndexDefinition(
-		"CONSTRAINT uploads_active_constraint UNIQUE KEY idx_uploads_active (active_target_path)",
+		"CONSTRAINT uploads_active_constraint UNIQUE KEY idx_uploads_active (active_target_path_hash)",
 	)
 	if !ok {
 		t.Fatal("expected constraint unique definition to parse")
@@ -1258,8 +1416,8 @@ func TestParseConstraintUniqueIndexDefinitionUsesExplicitIndexName(t *testing.T)
 	if indexName != "idx_uploads_active" {
 		t.Fatalf("indexName=%q, want idx_uploads_active", indexName)
 	}
-	if columns != "(active_target_path)" {
-		t.Fatalf("columns=%q, want (active_target_path)", columns)
+	if columns != "(active_target_path_hash)" {
+		t.Fatalf("columns=%q, want (active_target_path_hash)", columns)
 	}
 }
 
