@@ -80,6 +80,60 @@ func TestPackArchiveRoundTripCodingAgentDefaults(t *testing.T) {
 	}
 }
 
+func TestPackArchivePortablePacksExistingLocalOverlayOnly(t *testing.T) {
+	srcLocalRoot := t.TempDir()
+	repoRoot := filepath.Join(srcLocalRoot, "overlay", "repo")
+	mustWriteFile(t, filepath.Join(repoRoot, ".git", "config"), []byte("git\n"), 0o600)
+	mustWriteFile(t, filepath.Join(repoRoot, "dist", "app.js"), []byte("bundle\n"), 0o644)
+	mustWriteFile(t, filepath.Join(repoRoot, "src", "main.go"), []byte("package main\n"), 0o644)
+	mustWriteFile(t, filepath.Join(srcLocalRoot, "cache", "remote-managed.txt"), []byte("not overlay\n"), 0o644)
+
+	var buf bytes.Buffer
+	manifest, err := writePackArchive(context.Background(), &buf, packOptions{
+		LocalRoot:        srcLocalRoot,
+		RemoteRoot:       "/remote/root",
+		Profile:          "portable",
+		ProfilePackPaths: []string{"/"},
+	})
+	if err != nil {
+		t.Fatalf("writePackArchive: %v", err)
+	}
+	wantPaths := []string{"/repo"}
+	if !reflect.DeepEqual(manifest.Paths, wantPaths) {
+		t.Fatalf("manifest paths = %v, want %v", manifest.Paths, wantPaths)
+	}
+	if !reflect.DeepEqual(manifest.ReplacePaths, wantPaths) {
+		t.Fatalf("manifest replace_paths = %v, want %v", manifest.ReplacePaths, wantPaths)
+	}
+	entries := map[string]bool{}
+	for _, entry := range manifest.Entries {
+		entries[entry.Path] = true
+		if strings.Contains(entry.Path, "remote-managed") || strings.HasPrefix(entry.Path, "/cache/") {
+			t.Fatalf("portable packed non-overlay entry: %#v", entry)
+		}
+	}
+	for _, want := range []string{"/repo/.git/config", "/repo/dist/app.js", "/repo/src/main.go"} {
+		if !entries[want] {
+			t.Fatalf("portable archive missing local overlay entry %s; entries=%v", want, manifest.Entries)
+		}
+	}
+
+	dstLocalRoot := t.TempDir()
+	mustWriteFile(t, filepath.Join(dstLocalRoot, "overlay", "repo", "stale.txt"), []byte("stale\n"), 0o644)
+	if _, err := extractPackArchive(context.Background(), bytes.NewReader(buf.Bytes()), unpackOptions{
+		LocalRoot: dstLocalRoot,
+		Replace:   true,
+	}); err != nil {
+		t.Fatalf("extractPackArchive: %v", err)
+	}
+	assertFileContent(t, filepath.Join(dstLocalRoot, "overlay", "repo", ".git", "config"), "git\n")
+	assertFileContent(t, filepath.Join(dstLocalRoot, "overlay", "repo", "dist", "app.js"), "bundle\n")
+	assertFileContent(t, filepath.Join(dstLocalRoot, "overlay", "repo", "src", "main.go"), "package main\n")
+	if _, err := os.Lstat(filepath.Join(dstLocalRoot, "overlay", "repo", "stale.txt")); !os.IsNotExist(err) {
+		t.Fatalf("stale portable file still exists after replace: err=%v", err)
+	}
+}
+
 func TestPackArchiveDefaultReplacePathsRemoveMissingSiblings(t *testing.T) {
 	srcLocalRoot := t.TempDir()
 	mustWriteFile(t, filepath.Join(srcLocalRoot, "overlay", "repo", ".git", "config"), []byte("git\n"), 0o644)
@@ -309,7 +363,58 @@ func TestExtractPackArchiveDoesNotReplaceUntilArchiveValidated(t *testing.T) {
 	assertFileContent(t, filepath.Join(localRoot, "overlay", "repo", ".git", "config"), "old\n")
 }
 
-func TestExtractPackArchiveRejectsUnsafeSymlinkTarget(t *testing.T) {
+func TestExtractPackArchivePreservesPortableSymlinkTargets(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	manifest := []byte(`{"format":"drive9.pack.v1","version":1,"paths":["/repo"],"entries":[{"path":"/repo/absolute","type":"symlink","linkname":"/opt/tool/bin/python"},{"path":"/repo/pkg-link","type":"symlink","linkname":"../store/pkg"}]}`)
+	if err := tw.WriteHeader(&tar.Header{Name: packManifestEntryName, Mode: 0o644, Size: int64(len(manifest))}); err != nil {
+		t.Fatalf("manifest header: %v", err)
+	}
+	if _, err := tw.Write(manifest); err != nil {
+		t.Fatalf("manifest write: %v", err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/absolute", Typeflag: tar.TypeSymlink, Linkname: "/opt/tool/bin/python", Mode: 0o777}); err != nil {
+		t.Fatalf("absolute symlink header: %v", err)
+	}
+	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/pkg-link", Typeflag: tar.TypeSymlink, Linkname: "../store/pkg", Mode: 0o777}); err != nil {
+		t.Fatalf("relative symlink header: %v", err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatalf("tar close: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	localRoot := t.TempDir()
+	_, err := extractPackArchive(context.Background(), bytes.NewReader(buf.Bytes()), unpackOptions{
+		LocalRoot: localRoot,
+		Replace:   true,
+	})
+	if err != nil {
+		t.Fatalf("extractPackArchive: %v", err)
+	}
+	absolute, err := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "absolute"))
+	if err != nil {
+		t.Fatalf("read absolute symlink: %v", err)
+	}
+	if absolute != "/opt/tool/bin/python" {
+		t.Fatalf("absolute symlink = %q, want /opt/tool/bin/python", absolute)
+	}
+	relative, err := os.Readlink(filepath.Join(localRoot, "overlay", "repo", "pkg-link"))
+	if err != nil {
+		t.Fatalf("read relative symlink: %v", err)
+	}
+	if relative != "../store/pkg" {
+		t.Fatalf("relative symlink = %q, want ../store/pkg", relative)
+	}
+}
+
+func TestExtractPackArchiveRejectsInvalidSymlinkTarget(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink semantics differ on Windows")
 	}
@@ -323,7 +428,7 @@ func TestExtractPackArchiveRejectsUnsafeSymlinkTarget(t *testing.T) {
 	if _, err := tw.Write(manifest); err != nil {
 		t.Fatalf("manifest write: %v", err)
 	}
-	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/link", Typeflag: tar.TypeSymlink, Linkname: "../outside", Mode: 0o777}); err != nil {
+	if err := tw.WriteHeader(&tar.Header{Name: packArchiveEntryPrefix + "repo/link", Typeflag: tar.TypeSymlink, Linkname: "", Mode: 0o777}); err != nil {
 		t.Fatalf("symlink header: %v", err)
 	}
 	if err := tw.Close(); err != nil {

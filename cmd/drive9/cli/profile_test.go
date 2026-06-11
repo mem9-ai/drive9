@@ -37,6 +37,24 @@ func TestLoadProfileConfigNoneHasNoOverlayOrPackPaths(t *testing.T) {
 	}
 }
 
+func TestLoadProfileConfigPortablePacksLocalOverlay(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	cfg, err := loadProfileConfig("portable")
+	if err != nil {
+		t.Fatalf("loadProfileConfig: %v", err)
+	}
+	if cfg.Name != "portable" {
+		t.Fatalf("Name = %q, want portable", cfg.Name)
+	}
+	if len(cfg.LocalOnlyPatterns) == 0 {
+		t.Fatal("portable profile should include coding-agent local-only overlay patterns")
+	}
+	if !reflect.DeepEqual(cfg.PackPaths, []string{"/"}) {
+		t.Fatalf("PackPaths = %v, want all local overlay marker", cfg.PackPaths)
+	}
+}
+
 func TestLoadProfileConfigReadsHomeProfile(t *testing.T) {
 	writeTestProfile(t, "custom", `
 # defaults to [local] before the first explicit section
@@ -89,6 +107,26 @@ func TestProfileShowPrintsDefaultConfig(t *testing.T) {
 	}
 	if strings.Contains(out, "/coding-agent/") {
 		t.Fatalf("profile show output = %q, should not contain profile-scoped pack path", out)
+	}
+}
+
+func TestProfileShowPrintsPortableConfig(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	out, err := captureStdoutE(t, func() error { return Profile([]string{"show", "portable"}) })
+	if err != nil {
+		t.Fatalf("Profile show portable: %v", err)
+	}
+	for _, want := range []string{
+		"# drive9 profile: portable",
+		"# source: builtin:portable",
+		"[local]",
+		"[pack]",
+		"/",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("profile show portable output = %q, want %q", out, want)
+		}
 	}
 }
 
