@@ -158,6 +158,52 @@ func TestLocalEmbeddingModeFromEnv(t *testing.T) {
 	}
 }
 
+func TestBuildSemanticWorkerConfigFromEnvReadsWorkerOptionsWithoutEmbedder(t *testing.T) {
+	keys := []string{
+		"DRIVE9_EMBED_API_BASE",
+		"DRIVE9_EMBED_API_KEY",
+		"DRIVE9_EMBED_MODEL",
+		"DRIVE9_SEMANTIC_WORKERS",
+		"DRIVE9_SEMANTIC_TENANT_LIMIT",
+	}
+	prev := make(map[string]string, len(keys))
+	for _, key := range keys {
+		prev[key] = os.Getenv(key)
+	}
+	t.Cleanup(func() {
+		for _, key := range keys {
+			if prev[key] == "" {
+				_ = os.Unsetenv(key)
+			} else {
+				_ = os.Setenv(key, prev[key])
+			}
+		}
+	})
+	for _, key := range keys {
+		_ = os.Unsetenv(key)
+	}
+	if err := os.Setenv("DRIVE9_SEMANTIC_WORKERS", "8"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_SEMANTIC_TENANT_LIMIT", "512"); err != nil {
+		t.Fatal(err)
+	}
+
+	client, opts, err := buildSemanticWorkerConfigFromEnv()
+	if err != nil {
+		t.Fatalf("buildSemanticWorkerConfigFromEnv: %v", err)
+	}
+	if client != nil {
+		t.Fatal("client configured without DRIVE9_EMBED_*")
+	}
+	if opts.Workers != 8 {
+		t.Fatalf("Workers=%d, want 8", opts.Workers)
+	}
+	if opts.TenantScanLimit != 512 {
+		t.Fatalf("TenantScanLimit=%d, want 512", opts.TenantScanLimit)
+	}
+}
+
 func TestLocalS3ConfigFromEnv(t *testing.T) {
 	keys := []string{
 		"TMPDIR",
