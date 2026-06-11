@@ -313,13 +313,13 @@ func TestPlannedTiDBSchemaRepairsAllowsPathColumnWidening(t *testing.T) {
 			kind:       tidbSchemaDiffColumnType,
 			tableName:  "file_nodes",
 			columnName: "path",
-			repairSQL:  "ALTER TABLE file_nodes MODIFY COLUMN path VARCHAR(4096) NOT NULL",
+			repairSQL:  "ALTER TABLE file_nodes MODIFY COLUMN path TEXT NOT NULL",
 		},
 		{
 			kind:       tidbSchemaDiffColumnType,
 			tableName:  "uploads",
 			columnName: "target_path",
-			repairSQL:  "ALTER TABLE uploads MODIFY COLUMN target_path VARCHAR(4096) NOT NULL",
+			repairSQL:  "ALTER TABLE uploads MODIFY COLUMN target_path TEXT NOT NULL",
 		},
 	}
 
@@ -369,7 +369,7 @@ func TestPlannedTiDBSchemaRepairsDefersPathWideningUntilHashIndexesRebuilt(t *te
 			kind:       tidbSchemaDiffColumnType,
 			tableName:  "file_nodes",
 			columnName: "path",
-			repairSQL:  "ALTER TABLE file_nodes MODIFY COLUMN path VARCHAR(4096) NOT NULL",
+			repairSQL:  "ALTER TABLE file_nodes MODIFY COLUMN path TEXT NOT NULL",
 		},
 		{
 			kind:      tidbSchemaDiffMissingIndex,
@@ -541,7 +541,7 @@ func TestDiffTiDBTableMetaReportsMissingRequiredIndex(t *testing.T) {
 	meta := testUploadsTableMeta(true)
 	createStmt := `CREATE TABLE uploads (
 		upload_id VARCHAR(64) PRIMARY KEY,
-		target_path VARCHAR(4096) NOT NULL,
+		target_path TEXT NOT NULL,
 		target_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 		status VARCHAR(32) NOT NULL,
 		expected_revision BIGINT NULL
@@ -562,9 +562,9 @@ func TestDiffTiDBTableMetaReportsPathHashIndexColumnMismatch(t *testing.T) {
 		tableName: "file_nodes",
 		columns: map[string]tidbColumnMeta{
 			"node_id":          {columnType: "varchar(64)"},
-			"path":             {columnType: "varchar(4096)"},
+			"path":             {columnType: "text"},
 			"path_hash":        {columnType: "varchar(64)"},
-			"parent_path":      {columnType: "varchar(4096)"},
+			"parent_path":      {columnType: "text"},
 			"parent_path_hash": {columnType: "varchar(64)"},
 			"name":             {columnType: "varchar(255)"},
 			"is_directory":     {columnType: "tinyint(1)"},
@@ -575,9 +575,9 @@ func TestDiffTiDBTableMetaReportsPathHashIndexColumnMismatch(t *testing.T) {
 	}
 	createStmt := `CREATE TABLE file_nodes (
 		node_id VARCHAR(64) PRIMARY KEY,
-		path VARCHAR(4096) NOT NULL,
+		path TEXT NOT NULL,
 		path_hash VARCHAR(64) NOT NULL DEFAULT '',
-		parent_path VARCHAR(4096) NOT NULL,
+		parent_path TEXT NOT NULL,
 		parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 		name VARCHAR(255) NOT NULL,
 		is_directory TINYINT(1) NOT NULL DEFAULT 0,
@@ -604,7 +604,7 @@ func TestDiffTiDBTableMetaRecognizesUniqueIndexFromCreateStatement(t *testing.T)
 	meta := testUploadsTableMeta(true)
 	createStmt := `CREATE TABLE uploads (
 		upload_id VARCHAR(64) PRIMARY KEY,
-		target_path VARCHAR(4096) NOT NULL,
+		target_path TEXT NOT NULL,
 		target_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 		status VARCHAR(32) NOT NULL,
 		expected_revision BIGINT NULL,
@@ -716,9 +716,9 @@ func TestDiffTiDBTableMetaReportsFileNodesAndFileTagsMissingIndexes(t *testing.T
 		tableName: "file_nodes",
 		columns: map[string]tidbColumnMeta{
 			"node_id":          {columnType: "varchar(64)"},
-			"path":             {columnType: "varchar(4096)"},
+			"path":             {columnType: "text"},
 			"path_hash":        {columnType: "varchar(64)"},
-			"parent_path":      {columnType: "varchar(4096)"},
+			"parent_path":      {columnType: "text"},
 			"parent_path_hash": {columnType: "varchar(64)"},
 			"name":             {columnType: "varchar(255)"},
 			"is_directory":     {columnType: "tinyint(1)"},
@@ -807,9 +807,9 @@ func TestDiffTiDBTableMetaTreatsBooleanAndTinyIntAsEquivalent(t *testing.T) {
 		tableName: "file_nodes",
 		columns: map[string]tidbColumnMeta{
 			"node_id":          {columnType: "varchar(64)"},
-			"path":             {columnType: "varchar(4096)"},
+			"path":             {columnType: "text"},
 			"path_hash":        {columnType: "varchar(64)"},
-			"parent_path":      {columnType: "varchar(4096)"},
+			"parent_path":      {columnType: "text"},
 			"parent_path_hash": {columnType: "varchar(64)"},
 			"name":             {columnType: "varchar(255)"},
 			"is_directory":     {columnType: "tinyint(1)"},
@@ -821,9 +821,9 @@ func TestDiffTiDBTableMetaTreatsBooleanAndTinyIntAsEquivalent(t *testing.T) {
 
 	diffs := diffTiDBTableMeta(spec, meta, `CREATE TABLE file_nodes (
 		node_id VARCHAR(64) PRIMARY KEY,
-		path VARCHAR(4096) NOT NULL,
+		path TEXT NOT NULL,
 		path_hash VARCHAR(64) NOT NULL DEFAULT '',
-		parent_path VARCHAR(4096) NOT NULL,
+		parent_path TEXT NOT NULL,
 		parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 		name VARCHAR(255) NOT NULL,
 		is_directory TINYINT(1) NOT NULL DEFAULT 0,
@@ -993,7 +993,7 @@ func TestPlannedTiDBSchemaRepairsAllowsHeavyAlterTableIndexRepairsWhenTableMissi
 
 func TestIsSafeAddColumnRepairSQLRejectsStoredAndVirtualGeneratedColumns(t *testing.T) {
 	tests := []string{
-		"ALTER TABLE uploads ADD COLUMN active_target_path_old VARCHAR(4096) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED",
+		"ALTER TABLE uploads ADD COLUMN active_target_path_old TEXT AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED",
 		"ALTER TABLE semantic ADD COLUMN embedding VECTOR(1024) AS (EMBED_TEXT('m', content_text, '{\"dimensions\":1024}')) VIRTUAL",
 	}
 
@@ -1392,7 +1392,7 @@ func testUploadsTableMeta(includeExpectedRevision bool) tidbTableMeta {
 		tableName: "uploads",
 		columns: map[string]tidbColumnMeta{
 			"upload_id":                 {columnType: "varchar(64)"},
-			"target_path":               {columnType: "varchar(4096)"},
+			"target_path":               {columnType: "text"},
 			"target_path_hash":          {columnType: "varchar(64)"},
 			"active_target_path_hash":   {columnType: "varchar(64)"},
 			"status":                    {columnType: "varchar(32)"},

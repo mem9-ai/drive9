@@ -26,9 +26,9 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
-			path         VARCHAR(4096) NOT NULL,
+			path         TEXT NOT NULL,
 			path_hash    VARCHAR(64) NOT NULL DEFAULT '',
-			parent_path  VARCHAR(4096) NOT NULL,
+			parent_path  TEXT NOT NULL,
 			parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 			name         VARCHAR(255) NOT NULL,
 			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
@@ -87,7 +87,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			upload_id          VARCHAR(64) PRIMARY KEY,
 			file_id            VARCHAR(64) NOT NULL,
 			inode_id           VARCHAR(64),
-			target_path        VARCHAR(4096) NOT NULL,
+			target_path        TEXT NOT NULL,
 			target_path_hash   VARCHAR(64) NOT NULL DEFAULT '',
 			s3_upload_id       VARCHAR(255) NOT NULL,
 			s3_key             VARCHAR(2048) NOT NULL,

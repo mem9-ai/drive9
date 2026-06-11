@@ -724,9 +724,9 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
-			path         VARCHAR(4096) NOT NULL,
+			path         TEXT NOT NULL,
 			path_hash    VARCHAR(64) NOT NULL DEFAULT '',
-			parent_path  VARCHAR(4096) NOT NULL,
+			parent_path  TEXT NOT NULL,
 			parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 			name         VARCHAR(255) NOT NULL,
 			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
@@ -807,7 +807,7 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 			upload_id          VARCHAR(64) PRIMARY KEY,
 			file_id            VARCHAR(64) NOT NULL,
 			inode_id           VARCHAR(64),
-			target_path        VARCHAR(4096) NOT NULL,
+			target_path        TEXT NOT NULL,
 			target_path_hash   VARCHAR(64) NOT NULL DEFAULT '',
 			s3_upload_id       VARCHAR(255) NOT NULL,
 			s3_key             VARCHAR(2048) NOT NULL,
@@ -1350,7 +1350,7 @@ func validateTiDBUploadsTableBase(meta tidbTableMeta) error {
 	if err := meta.requireColumnType("upload_id", "varchar(64)"); err != nil {
 		return err
 	}
-	if err := meta.requireColumnType("target_path", "varchar(4096)"); err != nil {
+	if err := meta.requireColumnType("target_path", "text"); err != nil {
 		return err
 	}
 	if err := meta.requireColumnType("target_path_hash", "varchar(64)"); err != nil {
@@ -2663,11 +2663,11 @@ func isSafeModifyColumnRepairSQL(diff tidbSchemaDiff) bool {
 	n := strings.TrimSuffix(normalizeSQLFragment(diff.repairSQL), ";")
 	switch diff.tableName + "." + diff.columnName {
 	case "file_nodes.path":
-		return n == "alter table file_nodes modify column path varchar(4096) not null"
+		return n == "alter table file_nodes modify column path text not null"
 	case "file_nodes.parent_path":
-		return n == "alter table file_nodes modify column parent_path varchar(4096) not null"
+		return n == "alter table file_nodes modify column parent_path text not null"
 	case "uploads.target_path":
-		return n == "alter table uploads modify column target_path varchar(4096) not null"
+		return n == "alter table uploads modify column target_path text not null"
 	default:
 		return false
 	}
