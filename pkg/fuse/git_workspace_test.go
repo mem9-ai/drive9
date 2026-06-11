@@ -40,6 +40,7 @@ type gitWorkspaceFixture struct {
 	mode            string
 	headCommit      string
 	deleted         bool
+	listRequests    int
 	server          *httptest.Server
 	repoURL         string
 	treeNodes       []client.GitTreeNode
@@ -207,6 +208,7 @@ func (f *gitWorkspaceFixture) handle(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/git-workspaces":
 		f.mu.Lock()
 		deleted := f.deleted
+		f.listRequests++
 		f.mu.Unlock()
 		if deleted {
 			_ = json.NewEncoder(w).Encode(map[string]any{"workspaces": []client.GitWorkspace{}})
@@ -503,7 +505,7 @@ func TestEnsureGitWorkspacesKeepsPreviousSnapshotOnLoadFailure(t *testing.T) {
 	}
 }
 
-func TestGitWorkspaceForPathForceRefreshesAfterLocalGitAppears(t *testing.T) {
+func TestGitWorkspaceForPathDoesNotForceRefreshAfterNativeLocalGitAppears(t *testing.T) {
 	fixture := newGitWorkspaceFixture(t)
 	fixture.deleted = true
 	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
@@ -522,6 +524,9 @@ func TestGitWorkspaceForPathForceRefreshesAfterLocalGitAppears(t *testing.T) {
 	if initialCount != 0 {
 		t.Fatalf("initial workspace count = %d, want 0", initialCount)
 	}
+	fixture.mu.Lock()
+	initialRequests := fixture.listRequests
+	fixture.mu.Unlock()
 	if err := fs.localOverlay.Mkdir("/repo/.git", 0o755); err != nil {
 		t.Fatalf("create local .git hint: %v", err)
 	}
@@ -530,18 +535,74 @@ func TestGitWorkspaceForPathForceRefreshesAfterLocalGitAppears(t *testing.T) {
 	fixture.mu.Unlock()
 
 	entry, handled := fs.gitEntry(context.Background(), "/repo/README.md", false)
-	if !handled || entry == nil {
-		t.Fatalf("gitEntry handled=%t entry=%v, want forced refresh to load README", handled, entry)
+	if handled || entry != nil {
+		t.Fatalf("gitEntry handled=%t entry=%v, want native working tree path to stay on generic FUSE path", handled, entry)
 	}
 	fs.git.mu.Lock()
 	loadedAt := fs.git.loadedAt
 	count := len(fs.git.workspaces)
 	fs.git.mu.Unlock()
-	if count != 1 {
-		t.Fatalf("workspace count after forced refresh = %d, want 1", count)
+	if count != 0 {
+		t.Fatalf("workspace count after native working tree lookup = %d, want 0", count)
 	}
-	if !loadedAt.After(initialLoadedAt) {
-		t.Fatalf("loadedAt did not advance after forced refresh")
+	if !loadedAt.Equal(initialLoadedAt) {
+		t.Fatalf("loadedAt advanced after native working tree lookup: got %s want %s", loadedAt, initialLoadedAt)
+	}
+	fixture.mu.Lock()
+	requests := fixture.listRequests
+	fixture.mu.Unlock()
+	if requests != initialRequests {
+		t.Fatalf("workspace list requests = %d, want unchanged %d", requests, initialRequests)
+	}
+}
+
+func TestGitWorkspaceForPathForceRefreshesAfterGitStatePathAccess(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	fixture.deleted = true
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true}
+	opts.setDefaults()
+	fs := NewDat9FS(fixture.client(), opts)
+	if err := fs.localOverlay.EnsureRoot(); err != nil {
+		t.Fatalf("EnsureRoot: %v", err)
+	}
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("initial ensureGitWorkspaces: %v", err)
+	}
+	if err := fs.localOverlay.Mkdir("/repo/.git", 0o755); err != nil {
+		t.Fatalf("create local .git hint: %v", err)
+	}
+	fixture.mu.Lock()
+	initialRequests := fixture.listRequests
+	fixture.deleted = false
+	fixture.mu.Unlock()
+
+	rt, rel, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/.git/config")
+	if !ok || rt == nil {
+		t.Fatalf("gitWorkspaceForPath ok=%t rt=%v, want forced refresh from git state path", ok, rt)
+	}
+	if rel != ".git/config" {
+		t.Fatalf("rel = %q, want .git/config", rel)
+	}
+	fixture.mu.Lock()
+	requestsAfterRefresh := fixture.listRequests
+	fixture.mu.Unlock()
+	if requestsAfterRefresh != initialRequests+1 {
+		t.Fatalf("workspace list requests after git state refresh = %d, want %d", requestsAfterRefresh, initialRequests+1)
+	}
+
+	fs.git.mu.Lock()
+	fs.git.workspaces = nil
+	fs.git.loaded = true
+	fs.git.loadedAt = time.Now()
+	fs.git.mu.Unlock()
+	if _, _, ok := fs.gitWorkspaceForPath(context.Background(), "/repo/.git/HEAD"); ok {
+		t.Fatal("second git state lookup should be throttled after recent forced refresh")
+	}
+	fixture.mu.Lock()
+	requestsAfterThrottle := fixture.listRequests
+	fixture.mu.Unlock()
+	if requestsAfterThrottle != requestsAfterRefresh {
+		t.Fatalf("workspace list requests after throttled git state lookup = %d, want %d", requestsAfterThrottle, requestsAfterRefresh)
 	}
 }
 
@@ -1129,20 +1190,21 @@ func TestGitWorkspaceRestoresLocalGitStateOnLookup(t *testing.T) {
 	}
 }
 
-func TestGitWorkspaceLocalStateHintChecksMountRootGitDir(t *testing.T) {
-	localRoot := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(localRoot, "overlay", ".git"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	opts := &MountOptions{LocalRoot: localRoot, EnableGitWorkspaces: true}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
-
-	if !fs.hasLocalGitStateHint("/README.md") {
-		t.Fatal("hasLocalGitStateHint missed mount-root .git")
-	}
-	if fs.hasLocalGitStateHint("/.git/config") {
-		t.Fatal("hasLocalGitStateHint should ignore paths inside .git")
+func TestGitStatePathRefreshRoot(t *testing.T) {
+	for _, tc := range []struct {
+		path string
+		root string
+		ok   bool
+	}{
+		{path: "/repo/.git", root: "/repo/.git", ok: true},
+		{path: "/repo/.git/config", root: "/repo/.git", ok: true},
+		{path: "/.git/HEAD", root: "/.git", ok: true},
+		{path: "/repo/src/main.go", ok: false},
+	} {
+		root, ok := gitStatePathRefreshRoot(tc.path)
+		if ok != tc.ok || root != tc.root {
+			t.Fatalf("gitStatePathRefreshRoot(%q) = %q, %t; want %q, %t", tc.path, root, ok, tc.root, tc.ok)
+		}
 	}
 }
 
