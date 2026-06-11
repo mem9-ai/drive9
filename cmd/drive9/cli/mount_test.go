@@ -1620,6 +1620,49 @@ func TestMountCmdCodingAgentProfilePassesPolicyOptions(t *testing.T) {
 	}
 }
 
+func TestMountCmdPortableProfilePassesCodingAgentPolicyAndAllLocalPackPath(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	t.Setenv("HOME", t.TempDir())
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	localRoot := t.TempDir()
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile", "portable",
+		"--local-root", localRoot,
+		"--no-auto-unpack",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.Profile != "portable" {
+		t.Fatalf("Profile = %q, want portable", got.Profile)
+	}
+	if got.LocalRoot != localRoot {
+		t.Fatalf("LocalRoot = %q, want %q", got.LocalRoot, localRoot)
+	}
+	if !reflect.DeepEqual(got.LocalOnlyPatterns, builtinCodingAgentLocalOnlyPatterns()) {
+		t.Fatalf("LocalOnlyPatterns = %v, want coding-agent defaults", got.LocalOnlyPatterns)
+	}
+	if !reflect.DeepEqual(got.PackPaths, []string{"/"}) {
+		t.Fatalf("PackPaths = %v, want all local overlay marker", got.PackPaths)
+	}
+}
+
 func TestMountCmdCodingAgentProfileGeneratesDefaultLocalRoot(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })

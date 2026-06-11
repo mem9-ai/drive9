@@ -257,6 +257,11 @@ jobs:
           FUSE_STRICT_PREREQS: "1"
         run: bash e2e/git-ops-smoke-test.sh
 
+      - name: Run portable pack/unpack e2e
+        id: portable-pack-unpack-e2e
+        continue-on-error: true
+        run: bash e2e/portable-pack-unpack-e2e.sh
+
       - name: Compare FUSE performance metrics
         id: fuse_performance_compare
         if: always() && env.RUN_FUSE_PERFORMANCE_BASELINE == '1' && env.COMPARE_FUSE_PERFORMANCE_METRICS == '1'
@@ -365,6 +370,7 @@ jobs:
             echo "| Layer FS smoke | ${{ steps.layer-fs-smoke.outcome || 'skipped' }} |"
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
             echo "| Git operations smoke | ${{ steps.git-ops-smoke.outcome || 'skipped' }} |"
+            echo "| Portable pack/unpack e2e | ${{ steps.portable-pack-unpack-e2e.outcome || 'skipped' }} |"
             echo "| FUSE performance compare | ${{ steps.fuse_performance_compare.outcome || 'skipped' }} |"
             echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
             echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
@@ -434,6 +440,7 @@ jobs:
           check_required "Layer FS smoke" "${{ steps.layer-fs-smoke.outcome }}"
           check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
           check_required "Git operations smoke" "${{ steps.git-ops-smoke.outcome }}"
+          check_required "Portable pack/unpack e2e" "${{ steps.portable-pack-unpack-e2e.outcome }}"
           if [ "${COMPARE_FUSE_PERFORMANCE_METRICS}" = "1" ]; then
             check_required "FUSE performance compare" "${{ steps.fuse_performance_compare.outcome }}"
           fi

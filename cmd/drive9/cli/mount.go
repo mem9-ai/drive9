@@ -134,7 +134,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	durability := fs.String("durability", string(fuseDurabilityAuto), "write durability: auto, interactive, fsync, close-sync, or write-sync")
 	layerRef := fs.String("layer", "", "mount through writable fs layer (layer id, name, or tag ref)")
 	checkpointRef := fs.String("checkpoint", "", "restore fs layer checkpoint before mounting")
-	profile := fs.String("profile", "", "mount profile: coding-agent (default), none, interactive, or a ~/.drive9/profiles/<name> file")
+	profile := fs.String("profile", "", "mount profile: coding-agent (default), portable, none, interactive, or a ~/.drive9/profiles/<name> file")
 	localRoot := fs.String("local-root", "", "local-only overlay storage root (auto-generated for overlay profiles)")
 	var localOnlyPatterns stringListFlag
 	var remoteOnlyPatterns stringListFlag
