@@ -629,6 +629,13 @@ func MountHash(serverURL, mountPoint string, remoteRoot ...string) string {
 	return hex.EncodeToString(h[:8]) // 16 hex chars
 }
 
+func MountLayerHash(serverURL, mountPoint, remoteRoot, layerRef, checkpointRef string) string {
+	base := MountHash(serverURL, mountPoint, remoteRoot)
+	input := base + "\x00layer\x00" + strings.TrimSpace(layerRef) + "\x00checkpoint\x00" + strings.TrimSpace(checkpointRef)
+	h := sha256.Sum256([]byte(input))
+	return hex.EncodeToString(h[:8])
+}
+
 // MountReadCacheHash computes the persistent read-cache namespace. Unlike the
 // write-back cache namespace, it includes a credential digest because read-cache
 // entries contain remote file bytes and can survive remounts.

@@ -16,6 +16,8 @@ including local single-tenant validation via `drive9-server-local`.
 | `api-smoke-test.sh` | Fresh provisioning, status polling, nested+batch file ops, hardlink/copy/rename/delete checks, grep/find checks, semantic text recall, image-associated recall, sql checks, large multipart upload+download |
 | `api-smoke-test-existing-key.sh` | Existing API key status/list checks |
 | `cli-smoke-test.sh` | End-to-end CLI workflow including `fs symlink`, `fs hardlink`, default-slot `pack`/`unpack`, `fs grep`/`fs find`, semantic/image-associated recall checks, image `fs cp`+`fs find`, and large multipart `fs cp` upload/download |
+| `layer-fs-smoke-test.sh` | Layer filesystem API+CLI+FUSE workflow: create by name/tag, diff/checkpoint lookup, rollback, commit, scope rejection, conflict detection, mkdir/upsert/whiteout/rename/symlink/chmod entries, and checkpoint/full restore into fresh local roots |
+| `layer-fs-smoke-test-realdev.sh` | Manual realdev wrapper for `layer-fs-smoke-test.sh`; defaults to the shared dev endpoint and enables strict FUSE restore coverage without being wired into `local-e2e` CI |
 | `portable-pack-unpack-e2e.sh` | Portable profile pack/unpack over a deterministic local repo: offline npm `file:` install creates `node_modules`, Git staged/unstaged/untracked status changes are captured, pack writes the default hidden archive, fresh local-root unpack restores overlay files, symlinks, `.git`, `node_modules`, branch, HEAD, and `git status` |
 | `fuse-smoke-test.sh` | FUSE mount lifecycle, file/dir/symlink/hardlink/rename/stat semantics, cross-channel consistency, mounted 10KiB→8MiB→10KiB tier-transition parity, read-only and error-path checks |
 | `fuse-correctness-workload.sh` | Real read-only FUSE workload over a manifest fixture: `find`, `grep`, `stat`, `cat`, `sha256`, symlink, hardlink, unicode/space paths, empty files, binary files, and 8MiB+ files |
@@ -27,7 +29,8 @@ including local single-tenant validation via `drive9-server-local`.
 | `git-ops-smoke-test.sh` | Lightweight local Git gate using a local bare fixture: native clone, `drive9 git clone --fast`, and `drive9 git clone --fast --blobless` across `coding-agent` and `portable` profiles, followed by edit/add/commit/stash, remount into a fresh local root, and Git state/content verification |
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
-| `smoke-all.sh` | Runs API + CLI + journal + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_GIT_OPS_SMOKE=1` to include lightweight Git coverage, `RUN_GIT_WORKSPACE_SMOKE=1` to include heavier Git workspace coverage, and `RUN_PORTABLE_PACK_E2E=1` to include portable pack/unpack coverage |
+| `smoke-all.sh` | Runs API + CLI + journal + layer FS + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_FUSE_SMOKE=0` to skip FUSE symlink/hardlink coverage, `RUN_GIT_OPS_SMOKE=1` to include lightweight Git coverage, `RUN_GIT_WORKSPACE_SMOKE=1` to include heavier Git workspace coverage, and `RUN_PORTABLE_PACK_E2E=1` to include portable pack/unpack coverage |
+| `local-smoke.sh` | Starts `drive9-server-local` with a disposable local DB by default, then runs `smoke-all.sh` with semantic checks disabled and FUSE smoke skipped unless `RUN_FUSE_SMOKE=1` |
 
 ## Run
 
@@ -54,6 +57,14 @@ bash e2e/api-smoke-test.sh
 DRIVE9_API_KEY=drive9_xxx bash e2e/api-smoke-test-existing-key.sh
 
 bash e2e/cli-smoke-test.sh
+
+# Layer filesystem API+CLI smoke. Set RUN_LAYER_FUSE_SMOKE=1 to also run
+# real FUSE layer checkpoint/full restore coverage.
+bash e2e/layer-fs-smoke-test.sh
+
+# Layer filesystem realdev smoke. This targets the shared dev endpoint by
+# default and runs the same layer cases with strict FUSE restore coverage.
+bash e2e/layer-fs-smoke-test-realdev.sh
 
 # Use official released drive9 CLI instead of local build
 CLI_SOURCE=official bash e2e/cli-smoke-test.sh
@@ -163,12 +174,31 @@ The local smoke flow that is currently exercised on this machine uses
 `scripts/drive9-server-local-env.sh` is the source of truth for local default
 environment values.
 
+For a disposable local run that does not depend on TiDB auto-embedding, Ollama,
+or a hosted dev deployment, use:
+
+```bash
+make e2e-local
+```
+
+`make e2e-local` runs `e2e/local-smoke.sh`, which starts a temporary MySQL
+container by default, initializes the local no-embedding tenant schema, starts
+`drive9-server-local`, and runs `e2e/smoke-all.sh` with semantic checks and
+upload-limit boundary checks disabled. It also skips `fuse-smoke-test.sh` by
+default because local macOS runs may fall back to WebDAV, which cannot support
+the symlink/hardlink assertions in that script. Override `DRIVE9_LOCAL_DSN` to
+reuse an existing database instead of starting a container, and set
+`RUN_FUSE_SMOKE=1` when a native FUSE setup is available.
+
 1. Confirm local prerequisites.
 
 - Create the local database referenced by `DRIVE9_LOCAL_DSN` before startup.
 - For full smoke coverage, ensure the embedding endpoint is available. The
   default env script expects Ollama at `http://127.0.0.1:11434` with model
   `bge-m3`.
+- For MySQL-only local validation without embeddings, set
+  `DRIVE9_LOCAL_EMBEDDING_MODE=none` and disable semantic smoke checks:
+  `RUN_SEMANTIC_CHECKS=0 RUN_CLI_SEMANTIC_CHECKS=0`.
 
 2. In terminal 1, start `drive9-server-local` from the repository root.
 
@@ -314,6 +344,7 @@ CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
 - FUSE concurrency workload knobs are `FUSE_CONCURRENCY_WORKERS`, `FUSE_CONCURRENCY_FILES_PER_WORKER`, `FUSE_CONCURRENCY_READER_WORKERS`, `FUSE_CONCURRENCY_PAYLOAD_KB`, `FUSE_CONCURRENCY_TIMEOUT_S`, and `FUSE_CONCURRENCY_KEEP_ARTIFACTS`.
 - FUSE POSIX/fsx workload knobs are `FUSE_POSIX_FSX_OPS`, `FUSE_POSIX_FSX_MAX_BYTES`, `FUSE_POSIX_FSX_SEED`, `FUSE_POSIX_FSX_TIMEOUT_S`, and `FUSE_POSIX_FSX_KEEP_ARTIFACTS`. When enabled in CI, failures are hard failures.
 - FUSE performance baseline knobs are `FUSE_PERF_SMALL_FILES`, `FUSE_PERF_SMALL_BYTES`, `FUSE_PERF_LARGE_MB`, `FUSE_PERF_READ_PASSES`, `FUSE_PERF_SQLITE_ROWS`, `FUSE_PERF_KEEP_ARTIFACTS`, `FUSE_PERF_ARTIFACT_DIR`, `FUSE_PERF_COMPARE_WARN_RATIO`, and `FUSE_PERF_COMPARE_FAIL_ON_REGRESSION`. The baseline records small-file, large-file, rollback-journal SQLite, WAL SQLite, and WAL checkpoint metrics; SQLite rows are read back as payload bytes and SHA-256 verified before metrics are accepted.
+- Layer filesystem knobs are `RUN_LAYER_FUSE_SMOKE`, `LAYER_FUSE_STRICT_PREREQS`, `LAYER_DIFF_TIMEOUT_S`, and `LAYER_DIFF_INTERVAL_S`. Ordinary PR `local-e2e.yml` runs `layer-fs-smoke-test.sh` with `RUN_LAYER_FUSE_SMOKE=1` against `drive9-server-local`, so layer schema/API/FUSE restore coverage does not depend on a dev backend deployment. `layer-fs-smoke-test-realdev.sh` is the manual shared-dev counterpart and is not wired into `local-e2e` CI. `smoke-all.sh` defaults `RUN_LAYER_FUSE_SMOKE` from `RUN_FUSE_SMOKE`.
 - Full daily local-e2e knobs are `RUN_E2E_SMOKE_ALL` and `RUN_GIT_FEATURE_MATRIX`; the scheduled run sets both to `1`, and manual `workflow_dispatch` runs can enable them with `run_e2e_smoke_all=1` and `run_git_feature_matrix=1`.
 - `local-e2e.yml` runs the lightweight portable pack/unpack e2e on ordinary PR triggers. It does not run the performance baseline or heavy FUSE/Git detectors on ordinary PR triggers. Use manual `workflow_dispatch` inputs `run_fuse_concurrency_stress=1`, `run_fuse_posix_fsx=1`, `run_fuse_sqlite_wal=1`, `run_fuse_sqlite_churn=1`, `run_fuse_sqlite_concurrency=1`, `run_fuse_performance_baseline=1`, `compare_fuse_performance_metrics=1`, `run_e2e_smoke_all=1`, and `run_git_feature_matrix=1` to enable them on demand. The scheduled daily run enables all of these flags; concurrency stress, POSIX/fsx, full smoke-all, and Git feature matrix run as separate hard-fail steps after the release gate and metrics archive, and all are attempted so one failure does not hide another workload's result. `run_e2e_smoke_all=1` also enables Git workspace smoke coverage.
 - Set `archive_fuse_performance_metrics=1` on manual `local-e2e` runs, or use the daily scheduled run, to copy `performance-metrics-*.json`, `performance-compare-*.json`, `performance-compare-*.md`, mount logs, and an archive manifest to the Drive9 CI workspace under `/benchmarks/fuse-performance/<YYYY>/<MM>/<DD>/<branch>/<sha>/<run_id>-<attempt>/`. The same files are still uploaded as the GitHub artifact `fuse-performance-baseline`.

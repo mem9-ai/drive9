@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -11,8 +12,12 @@ import (
 //	drive9 fs mv /old/path /new/path
 //	drive9 fs mv :/old/path :/new/path
 func Mv(c *client.Client, args []string) error {
+	layerRef, args, err := parseLayerFlag(args)
+	if err != nil {
+		return err
+	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs mv <old> <new>")
+		return fmt.Errorf("usage: drive9 fs mv [--layer <ref>] <old> <new>")
 	}
 	oldPath := args[0]
 	newPath := args[1]
@@ -23,6 +28,15 @@ func Mv(c *client.Client, args []string) error {
 	}
 	if newIsRemote {
 		newPath = newRP.Path
+	}
+	if layerRef != "" {
+		if err := requireNoLayerWithRemoteContext(layerRef, oldRP, args[0]); err != nil {
+			return err
+		}
+		if err := requireNoLayerWithRemoteContext(layerRef, newRP, args[1]); err != nil {
+			return err
+		}
+		return renameLayerPath(context.Background(), c, layerRef, oldPath, newPath)
 	}
 
 	switch {

@@ -1112,9 +1112,16 @@ type SearchResult struct {
 }
 
 func (c *Client) Grep(query, pathPrefix string, limit int) ([]SearchResult, error) {
+	return c.GrepWithLayer(query, pathPrefix, limit, "")
+}
+
+func (c *Client) GrepWithLayer(query, pathPrefix string, limit int, layerRef string) ([]SearchResult, error) {
 	u := c.url(pathPrefix) + "?grep=" + url.QueryEscape(query)
 	if limit > 0 {
 		u += "&limit=" + strconv.Itoa(limit)
+	}
+	if strings.TrimSpace(layerRef) != "" {
+		u += "&layer=" + url.QueryEscape(strings.TrimSpace(layerRef))
 	}
 	req, err := http.NewRequest(http.MethodGet, u, nil)
 	if err != nil {

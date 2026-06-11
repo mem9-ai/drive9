@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -12,6 +13,10 @@ import (
 //	drive9 fs rm -r /path/to/dir/
 //	drive9 fs rm --recursive :/path/to/dir/
 func Rm(c *client.Client, args []string) error {
+	layerRef, args, err := parseLayerFlag(args)
+	if err != nil {
+		return err
+	}
 	var (
 		path       string
 		parseFlags = true
@@ -42,10 +47,12 @@ func Rm(c *client.Client, args []string) error {
 		return fmt.Errorf("usage: drive9 fs rm [-r|--recursive] <path>")
 	}
 
-	var err error
 	c, path, _, _, err = fsClientForRemoteArg(c, path)
 	if err != nil {
 		return err
+	}
+	if layerRef != "" {
+		return whiteoutLayerPath(context.Background(), c, layerRef, path, recursive)
 	}
 	if recursive {
 		return c.RemoveAll(path)

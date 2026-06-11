@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Run all drive9 smoke tests (API + CLI + journal + FUSE).
+# Run all drive9 smoke tests (API + CLI + journal + layer FS + FUSE).
 
 set -euo pipefail
 
 BASE="${DRIVE9_BASE:-http://127.0.0.1:9009}"
 RUN_GIT_OPS_SMOKE="${RUN_GIT_OPS_SMOKE:-0}"
 RUN_GIT_WORKSPACE_SMOKE="${RUN_GIT_WORKSPACE_SMOKE:-0}"
+RUN_FUSE_SMOKE="${RUN_FUSE_SMOKE:-1}"
+RUN_LAYER_FUSE_SMOKE="${RUN_LAYER_FUSE_SMOKE:-$RUN_FUSE_SMOKE}"
+export RUN_LAYER_FUSE_SMOKE
 RUN_PORTABLE_PACK_E2E="${RUN_PORTABLE_PACK_E2E:-0}"
 
 PASS=0
@@ -37,7 +40,14 @@ echo "BASE=$BASE"
 run_case "api" "e2e/api-smoke-test.sh"
 run_case "cli" "e2e/cli-smoke-test.sh"
 run_case "journal" "e2e/journal-smoke-test.sh"
-run_case "fuse" "e2e/fuse-smoke-test.sh"
+run_case "layer-fs" "e2e/layer-fs-smoke-test.sh"
+if [ "$RUN_FUSE_SMOKE" = "1" ]; then
+  run_case "fuse" "e2e/fuse-smoke-test.sh"
+else
+  echo
+  echo "=== [fuse] e2e/fuse-smoke-test.sh ==="
+  echo "SKIP [fuse] set RUN_FUSE_SMOKE=1 to run FUSE symlink/hardlink coverage"
+fi
 run_case "posix-permission" "e2e/posix-permission-smoke-test.sh"
 if [ "$RUN_GIT_OPS_SMOKE" = "1" ]; then
   run_case "git-ops" "e2e/git-ops-smoke-test.sh"

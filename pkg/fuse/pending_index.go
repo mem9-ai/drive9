@@ -287,6 +287,37 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 	return nil
 }
 
+// MarkCommitted keeps the pending entry as a local overlay data source but no
+// longer treats it as never-persisted new data.
+func (idx *PendingIndex) MarkCommitted(remotePath string, committedRev int64) error {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	meta, ok := idx.items[remotePath]
+	if !ok {
+		return nil
+	}
+	updated := *meta
+	updated.Kind = PendingOverwrite
+	if committedRev > 0 {
+		updated.BaseRev = committedRev
+	}
+	updated.Generation = idx.nextGen.Add(1)
+	updated.Mtime = time.Now()
+
+	metaBytes, err := json.Marshal(&updated)
+	if err != nil {
+		return fmt.Errorf("pending index marshal committed: %w", err)
+	}
+	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+	if err := atomicWrite(metaPath, metaBytes); err != nil {
+		return fmt.Errorf("pending index mark committed: %w", err)
+	}
+	cp := updated
+	idx.items[remotePath] = &cp
+	return nil
+}
+
 // MarkConflict marks a pending entry as conflicted so that RecoverPending
 // skips it on restart. The entry is kept on disk for manual recovery.
 // The in-memory state is only updated after the disk write succeeds to

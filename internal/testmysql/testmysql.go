@@ -77,6 +77,11 @@ func OpenDB(t *testing.T, dsn string) *sql.DB {
 func ResetDB(t *testing.T, db *sql.DB) {
 	t.Helper()
 	queries := []string{
+		"DELETE FROM fs_layer_checkpoints",
+		"DELETE FROM fs_layer_events",
+		"DELETE FROM fs_layer_tags",
+		"DELETE FROM fs_layer_entries",
+		"DELETE FROM fs_layers",
 		"DELETE FROM file_gc_tasks",
 		"DELETE FROM semantic_tasks",
 		"DELETE FROM file_nodes",
@@ -121,6 +126,11 @@ func ResetMetaDB(t *testing.T, db *sql.DB) {
 func ResetDBWithoutFiles(t *testing.T, db *sql.DB) {
 	t.Helper()
 	queries := []string{
+		"DELETE FROM fs_layer_checkpoints",
+		"DELETE FROM fs_layer_events",
+		"DELETE FROM fs_layer_tags",
+		"DELETE FROM fs_layer_entries",
+		"DELETE FROM fs_layers",
 		"DELETE FROM file_gc_tasks",
 		"DELETE FROM semantic_tasks",
 		"DELETE FROM file_nodes",
