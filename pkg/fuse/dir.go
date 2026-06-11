@@ -10,6 +10,13 @@ import (
 const (
 	defaultDirCacheTTL              = 10 * time.Second
 	defaultNamespaceCacheMaxEntries = 2000
+
+	// escalateMissThreshold/escalateMissWindow detect negative-lookup storms:
+	// once this many remote ENOENT stats hit the same directory within the
+	// window, the caller should issue one listing so the remaining misses are
+	// answered locally instead of one remote stat per name.
+	escalateMissThreshold = 3
+	escalateMissWindow    = time.Second
 )
 
 // CachedFileInfo matches the client.FileInfo shape but avoids importing client.
@@ -49,6 +56,11 @@ type dirCacheEntry struct {
 	completeExpires time.Time // safe ENOENT-on-miss TTL for a complete listing
 	sessionExpires  time.Time // safe ENOENT-on-miss TTL for a session-created dir
 	negatives       map[string]time.Time
+
+	// Negative-lookup storm tracking; see RecordRemoteNegative.
+	remoteMisses      int
+	missWindowStart   time.Time
+	escalateNotBefore time.Time
 }
 
 // DirCache is a thread-safe, TTL-based namespace cache.
@@ -211,7 +223,9 @@ func (dc *DirCache) MarkNegative(parentPath, name string) {
 }
 
 // MarkSessionCreatedDir records a directory created by this mount as having a
-// locally managed empty namespace for a short TTL.
+// locally managed empty namespace for the directory TTL. Local mutations flow
+// through Upsert/Remove and foreign writes invalidate via SSE, so the marker
+// can safely outlive the negative TTL used for single-name ENOENT markers.
 func (dc *DirCache) MarkSessionCreatedDir(dirPath string) {
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -220,9 +234,71 @@ func (dc *DirCache) MarkSessionCreatedDir(dirPath string) {
 	entry := dc.ensureEntryLocked(dirPath)
 	entry.expires = now.Add(dc.ttl)
 	entry.complete = true
-	entry.completeExpires = now.Add(dc.negativeTTL)
-	entry.sessionExpires = now.Add(dc.negativeTTL)
+	entry.completeExpires = now.Add(dc.ttl)
+	entry.sessionExpires = now.Add(dc.ttl)
 	entry.negatives = make(map[string]time.Time)
+}
+
+// RecordRemoteNegative notes that a remote stat for a child of dirPath
+// returned ENOENT. It reports true when the caller should escalate to a
+// single directory listing: escalateMissThreshold misses accumulated within
+// escalateMissWindow and no escalation cooldown is active.
+func (dc *DirCache) RecordRemoteNegative(dirPath string) bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	now := time.Now()
+	entry := dc.ensureEntryLocked(dirPath)
+	if !entry.escalateNotBefore.IsZero() && now.Before(entry.escalateNotBefore) {
+		return false
+	}
+	if entry.missWindowStart.IsZero() || now.Sub(entry.missWindowStart) > escalateMissWindow {
+		entry.missWindowStart = now
+		entry.remoteMisses = 1
+		return false
+	}
+	entry.remoteMisses++
+	if entry.remoteMisses < escalateMissThreshold {
+		return false
+	}
+	entry.remoteMisses = 0
+	entry.missWindowStart = time.Time{}
+	// Suppress duplicate escalations from concurrent lookups while the
+	// caller's listing is in flight. Concurrent misses arriving during that
+	// RTT still fall through to individual remote stats; that tail cost is
+	// accepted to keep this path free of cross-request coordination.
+	entry.escalateNotBefore = now.Add(escalateMissWindow)
+	return true
+}
+
+// DeferEscalation applies an escalation cooldown of one full cache TTL. Used
+// after a listing failed or was too large to answer misses locally, so a
+// sustained probe storm cannot turn into repeated listings. This deliberately
+// overwrites the short post-escalation cooldown set by RecordRemoteNegative:
+// that one only bridges the in-flight listing, while this one says "listing
+// this directory does not pay off, stop trying for a while".
+func (dc *DirCache) DeferEscalation(dirPath string) {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	entry := dc.ensureEntryLocked(dirPath)
+	entry.escalateNotBefore = time.Now().Add(dc.ttl)
+	entry.remoteMisses = 0
+	entry.missWindowStart = time.Time{}
+}
+
+// CanAnswerMisses reports whether dirPath currently has namespace state that
+// answers child misses locally (a valid complete listing or session marker).
+func (dc *DirCache) CanAnswerMisses(dirPath string) bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	now := time.Now()
+	entry, ok := dc.getEntryLocked(dirPath, now)
+	if !ok {
+		return false
+	}
+	return entry.sessionValid(now) || entry.completeValid(now)
 }
 
 // InvalidatePrefix removes cached namespace state for dirPath and descendants.
@@ -343,6 +419,13 @@ func (e *dirCacheEntry) prune(now time.Time) {
 	if !e.sessionExpires.IsZero() && now.After(e.sessionExpires) {
 		e.sessionExpires = time.Time{}
 	}
+	if !e.missWindowStart.IsZero() && now.Sub(e.missWindowStart) > escalateMissWindow {
+		e.missWindowStart = time.Time{}
+		e.remoteMisses = 0
+	}
+	if !e.escalateNotBefore.IsZero() && now.After(e.escalateNotBefore) {
+		e.escalateNotBefore = time.Time{}
+	}
 	for name, expires := range e.negatives {
 		if now.After(expires) {
 			delete(e.negatives, name)
@@ -372,7 +455,9 @@ func (e *dirCacheEntry) negativeValid(name string, now time.Time) bool {
 }
 
 func (e *dirCacheEntry) hasState() bool {
-	return len(e.items) > 0 || len(e.negatives) > 0 || e.complete || !e.completeExpires.IsZero() || !e.sessionExpires.IsZero()
+	return len(e.items) > 0 || len(e.negatives) > 0 || e.complete ||
+		!e.completeExpires.IsZero() || !e.sessionExpires.IsZero() ||
+		!e.missWindowStart.IsZero() || !e.escalateNotBefore.IsZero()
 }
 
 func cacheParentName(p string) (string, string) {
