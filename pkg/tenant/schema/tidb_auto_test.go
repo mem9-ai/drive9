@@ -388,6 +388,76 @@ func TestPlannedTiDBSchemaRepairsDefersPathWideningUntilHashIndexesRebuilt(t *te
 	}
 }
 
+func TestPlannedTiDBSchemaRepairsDefersUploadTargetPathWideningUntilLegacyActivePathDropped(t *testing.T) {
+	diffs := []tidbSchemaDiff{
+		{
+			kind:       tidbSchemaDiffColumnType,
+			tableName:  "uploads",
+			columnName: "target_path",
+			repairSQL:  "ALTER TABLE uploads MODIFY COLUMN target_path TEXT NOT NULL",
+		},
+		{
+			kind:      tidbSchemaDiffMissingIndex,
+			tableName: "uploads",
+			detail:    "uploads schema contract: idx_uploads_active index columns = (active_target_path), want (active_target_path_hash)",
+			repairSQL: "ALTER TABLE uploads DROP INDEX idx_uploads_active",
+		},
+		{
+			kind:       tidbSchemaDiffExtraColumn,
+			tableName:  "uploads",
+			columnName: "active_target_path",
+			repairSQL:  "ALTER TABLE uploads DROP COLUMN active_target_path",
+		},
+	}
+
+	got := plannedTiDBSchemaRepairs(diffs)
+	if len(got) != 2 {
+		t.Fatalf("expected old dependency repairs before widening, got %#v", got)
+	}
+	if got[0] != "ALTER TABLE uploads DROP INDEX idx_uploads_active" {
+		t.Fatalf("unexpected first repair statement: %q", got[0])
+	}
+	if got[1] != "ALTER TABLE uploads DROP COLUMN active_target_path" {
+		t.Fatalf("unexpected second repair statement: %q", got[1])
+	}
+}
+
+func TestDiffTiDBTableMetaReportsLegacyUploadActiveTargetPath(t *testing.T) {
+	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
+	meta := testUploadsTableMeta(true)
+	meta.columns["target_path"] = tidbColumnMeta{columnType: "varchar(512)"}
+	meta.columns["active_target_path"] = tidbColumnMeta{
+		columnType:           "varchar(512)",
+		extra:                "STORED GENERATED",
+		generationExpression: "case when (`status` = _utf8mb4'UPLOADING') then `target_path` else NULL end",
+	}
+	delete(meta.columns, "active_target_path_hash")
+	createStmt := `CREATE TABLE uploads (
+		upload_id VARCHAR(64) PRIMARY KEY,
+		target_path VARCHAR(512) NOT NULL,
+		target_path_hash VARCHAR(64) NOT NULL DEFAULT '',
+		status VARCHAR(32) NOT NULL,
+		expected_revision BIGINT NULL,
+		active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED,
+		UNIQUE KEY idx_uploads_active (active_target_path)
+	)`
+
+	diffs := diffTiDBTableMeta(spec, meta, createStmt)
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffExtraColumn, "legacy active_target_path") {
+		t.Fatalf("expected legacy active_target_path diff, got %#v", diffs)
+	}
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_uploads_active index columns") {
+		t.Fatalf("expected idx_uploads_active column mismatch diff, got %#v", diffs)
+	}
+
+	plans := plannedTiDBSchemaRepairs(diffs)
+	for _, plan := range plans {
+		if plan == "ALTER TABLE uploads MODIFY COLUMN target_path TEXT NOT NULL" {
+			t.Fatalf("target_path widening must wait until legacy generated column is dropped, plans=%#v", plans)
+		}
+	}
+}
+
 func TestParseUniqueIndexRepairStatement(t *testing.T) {
 	repair, ok := parseUniqueIndexRepairStatement("ALTER TABLE semantic_tasks ADD UNIQUE KEY uk_task_resource_version(task_type, resource_id, resource_version)")
 	if !ok {

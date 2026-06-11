@@ -647,6 +647,7 @@ const (
 	tidbSchemaDiffMissingColumn tidbSchemaDiffKind = "missing_column"
 	tidbSchemaDiffMissingIndex  tidbSchemaDiffKind = "missing_index"
 	tidbSchemaDiffColumnType    tidbSchemaDiffKind = "column_type_mismatch"
+	tidbSchemaDiffExtraColumn   tidbSchemaDiffKind = "extra_column"
 	tidbSchemaDiffTableContract tidbSchemaDiffKind = "table_contract_mismatch"
 )
 
@@ -2260,7 +2261,24 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 	if table.validate != nil {
 		diffs = append(diffs, table.validate(meta)...)
 	}
+	diffs = append(diffs, legacyUploadActiveTargetPathDiffs(table, meta)...)
 	return diffs
+}
+
+func legacyUploadActiveTargetPathDiffs(table tidbTableSpec, meta tidbTableMeta) []tidbSchemaDiff {
+	if table.name != "uploads" {
+		return nil
+	}
+	if _, ok := meta.columns["active_target_path"]; !ok {
+		return nil
+	}
+	return []tidbSchemaDiff{{
+		kind:       tidbSchemaDiffExtraColumn,
+		tableName:  "uploads",
+		columnName: "active_target_path",
+		detail:     "uploads schema contract: legacy active_target_path generated column must be dropped",
+		repairSQL:  "ALTER TABLE uploads DROP COLUMN active_target_path",
+	}}
 }
 
 func hasObservedTiDBIndex(observedIndexes map[string]struct{}, indexName string) bool {
@@ -2525,7 +2543,9 @@ func plannedTiDBSchemaRepairs(diffs []tidbSchemaDiff) []string {
 	seen := make(map[string]struct{})
 	plans := make([]string, 0, len(diffs))
 	deferHashIndexes := hasMissingPathHashColumnDiff(diffs)
-	deferPathColumnWidening := deferHashIndexes || hasPathHashIndexColumnMismatchDiff(diffs)
+	deferPathColumnWidening := deferHashIndexes ||
+		hasPathHashIndexColumnMismatchDiff(diffs) ||
+		hasLegacyUploadActiveTargetPathDiff(diffs)
 	deferActiveUploadHashColumn := hasMissingColumnDiff(diffs, "uploads", "target_path_hash")
 	for _, diff := range diffs {
 		if diff.repairSQL == "" {
@@ -2633,6 +2653,8 @@ func isSafeTiDBRepairDiff(diff tidbSchemaDiff) bool {
 		return isSafeAddIndexRepairSQL(diff.repairSQL) || isSafeDropPathHashIndexRepairSQL(diff.repairSQL)
 	case tidbSchemaDiffColumnType:
 		return isSafeModifyColumnRepairSQL(diff)
+	case tidbSchemaDiffExtraColumn:
+		return isSafeDropLegacyUploadActiveTargetPathRepairSQL(diff)
 	default:
 		return false
 	}
@@ -2671,6 +2693,24 @@ func isSafeModifyColumnRepairSQL(diff tidbSchemaDiff) bool {
 	default:
 		return false
 	}
+}
+
+func hasLegacyUploadActiveTargetPathDiff(diffs []tidbSchemaDiff) bool {
+	for _, diff := range diffs {
+		if diff.kind == tidbSchemaDiffExtraColumn &&
+			diff.tableName == "uploads" &&
+			diff.columnName == "active_target_path" {
+			return true
+		}
+	}
+	return false
+}
+
+func isSafeDropLegacyUploadActiveTargetPathRepairSQL(diff tidbSchemaDiff) bool {
+	if diff.tableName != "uploads" || diff.columnName != "active_target_path" {
+		return false
+	}
+	return normalizeSQLFragment(diff.repairSQL) == "alter table uploads drop column active_target_path"
 }
 
 func isSafeAddIndexRepairSQL(sqlText string) bool {
