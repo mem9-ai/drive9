@@ -18,15 +18,15 @@ import (
 )
 
 const (
-	maxUint64                = ^uint64(0)
-	sseHeartbeatInterval     = 30 * time.Second
-	sseFlushBatchSize        = 10
-	sseFlushMaxDelay         = 1 * time.Millisecond
-	ssePersistTimeout        = 500 * time.Millisecond
-	sseRetentionSweepTimeout = 5 * time.Second
-	sseRetentionSweepEvery   = time.Minute
-	ssePersistentReplayLimit = eventBusRingSize
-	ssePersistentRetention   = eventBusRingSize * 10
+	maxUint64                   = ^uint64(0)
+	defaultSSEHeartbeatInterval = 15 * time.Second
+	sseFlushBatchSize           = 10
+	sseFlushMaxDelay            = 1 * time.Millisecond
+	ssePersistTimeout           = 500 * time.Millisecond
+	sseRetentionSweepTimeout    = 5 * time.Second
+	sseRetentionSweepEvery      = time.Minute
+	ssePersistentReplayLimit    = eventBusRingSize
+	ssePersistentRetention      = eventBusRingSize * 10
 )
 
 var sseActiveConnections atomic.Int64
@@ -319,6 +319,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+	recordSSEOperation("connect", sseResultOK, time.Time{})
 	metrics.RecordGauge("sse", "active_connections", float64(sseActiveConnections.Add(1)))
 	defer metrics.RecordGauge("sse", "active_connections", float64(sseActiveConnections.Add(-1)))
 
@@ -352,13 +353,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// Flush initial replay/reset immediately so the client receives the
 	// cursor position without waiting for the periodic heartbeat.
 	if err := bw.Flush(); err != nil {
+		recordSSEOperation("disconnect", sseResultClientCancelled, time.Time{})
 		return
 	}
 
 	// Phase 2: Live stream with micro-batching.
 	// Instead of flushing after every single event, we accumulate events
 	// and flush at heartbeat boundaries or when the batch size is reached.
-	heartbeat := time.NewTicker(sseHeartbeatInterval)
+	heartbeatInterval := s.sseHeartbeatInterval
+	if heartbeatInterval <= 0 {
+		heartbeatInterval = defaultSSEHeartbeatInterval
+	}
+	heartbeat := time.NewTicker(heartbeatInterval)
 	defer heartbeat.Stop()
 
 	// Use a nil timer that we allocate on first need. Starting with
@@ -380,6 +386,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-heartbeat.C:
 			sendSSEHeartbeat(bw, lastSeen)
 			if err := bw.Flush(); err != nil {
+				recordSSEOperation("disconnect", sseResultClientCancelled, time.Time{})
 				return
 			}
 			if flushTimer != nil {
@@ -389,6 +396,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-flushC:
 			if bw.count > 0 {
 				if err := bw.Flush(); err != nil {
+					recordSSEOperation("disconnect", sseResultClientCancelled, time.Time{})
 					return
 				}
 			}
@@ -405,6 +413,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				sendSSEReset(bw, liveHead, sseResultSeqTooOld)
 				lastSeen = liveHead
 				if err := bw.Flush(); err != nil {
+					recordSSEOperation("disconnect", sseResultClientCancelled, time.Time{})
 					return
 				}
 				if flushTimer != nil {
@@ -419,6 +428,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				if bw.count > 0 {
 					if bw.shouldFlush() {
 						if err := bw.Flush(); err != nil {
+							recordSSEOperation("disconnect", sseResultClientCancelled, time.Time{})
 							return
 						}
 						if flushTimer != nil {

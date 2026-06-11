@@ -33,7 +33,7 @@ Tenant usage metrics intentionally allow `tenant_id` as a Prometheus label, but 
 - `drive9-filesystem-path-dashboard.json`: filesystem-path analysis that owns `/v1/fs/*`, correlates HTTP traffic with `fs_*` backend work, and now includes explicit WebDAV behavior.
 - `drive9-upload-path-dashboard.json`: upload-path analysis that owns upload flows and correlates upload HTTP traffic, backend upload operations, and upload-related events.
 - `drive9-upload-s3-path-dashboard.json`: upload plus raw object-store analysis for incidents that have narrowed from upload symptoms into `s3client` throughput, errors, or latency.
-- `drive9-event-stream-dashboard.json`: SSE event-stream analysis for `/v1/events`, durable replay, reset reasons, persistence errors, and retention sweep behavior.
+- `drive9-event-stream-dashboard.json`: SSE event-stream analysis for `/v1/events`, connection churn, heartbeat interval, durable replay, reset reasons, persistence errors, and retention sweep behavior.
 
 ## 4. Data-store drill-down dashboards
 

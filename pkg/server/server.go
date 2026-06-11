@@ -51,11 +51,12 @@ type Config struct {
 	// InlineThreshold is the server-wide DB-inline vs S3 cutoff surfaced to
 	// clients via /v1/status. When 0, the value is inferred from
 	// cfg.Backend.InlineThreshold() (or omitted in responses if no backend).
-	InlineThreshold  int64
-	Logger           *zap.Logger
-	SemanticEmbedder embedding.Client
-	SemanticWorkers  SemanticWorkerOptions
-	SlockOAuth       SlockOAuthClient
+	InlineThreshold      int64
+	Logger               *zap.Logger
+	SemanticEmbedder     embedding.Client
+	SemanticWorkers      SemanticWorkerOptions
+	SSEHeartbeatInterval time.Duration
+	SlockOAuth           SlockOAuthClient
 
 	TiDBAutoEmbeddingConfig  tenantschema.TiDBAutoEmbeddingConfig
 	TiDBAutoEmbeddingAPIKey  string
@@ -76,33 +77,34 @@ type autoEmbeddingSchemaProvisioner interface {
 }
 
 type Server struct {
-	fallback            *backend.Dat9Backend
-	meta                *meta.Store
-	pool                *tenant.Pool
-	provisioner         tenant.Provisioner
-	tokenSecret         []byte
-	localTenantAPIKey   string
-	vaultMK             *vault.MasterKey
-	vaultIssuerURL      string
-	publicURL           string
-	maxUploadBytes      int64
-	inlineThreshold     int64
-	metrics             *serverMetrics
-	logger              *zap.Logger
-	mux                 *http.ServeMux
-	events              *eventBuses
-	sseRetention        *sseRetentionSweeper
-	semanticWorker      *semanticWorkerManager
-	journalCursorSecret []byte
-	objectGCWorker      *objectGCWorker
-	slockOAuth          SlockOAuthClient
-	tidbAutoEmbedding   tenantAutoEmbeddingDefault
-	disableDBAutoEmbed  bool
-	forkWorkerCtx       context.Context
-	forkWorkerCancel    context.CancelFunc
-	forkWorkerWG        sync.WaitGroup
-	forkWorkerMu        sync.Mutex
-	forkWorkerClosed    bool
+	fallback             *backend.Dat9Backend
+	meta                 *meta.Store
+	pool                 *tenant.Pool
+	provisioner          tenant.Provisioner
+	tokenSecret          []byte
+	localTenantAPIKey    string
+	vaultMK              *vault.MasterKey
+	vaultIssuerURL       string
+	publicURL            string
+	maxUploadBytes       int64
+	inlineThreshold      int64
+	metrics              *serverMetrics
+	logger               *zap.Logger
+	mux                  *http.ServeMux
+	events               *eventBuses
+	sseHeartbeatInterval time.Duration
+	sseRetention         *sseRetentionSweeper
+	semanticWorker       *semanticWorkerManager
+	journalCursorSecret  []byte
+	objectGCWorker       *objectGCWorker
+	slockOAuth           SlockOAuthClient
+	tidbAutoEmbedding    tenantAutoEmbeddingDefault
+	disableDBAutoEmbed   bool
+	forkWorkerCtx        context.Context
+	forkWorkerCancel     context.CancelFunc
+	forkWorkerWG         sync.WaitGroup
+	forkWorkerMu         sync.Mutex
+	forkWorkerClosed     bool
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -178,24 +180,29 @@ func NewWithConfig(cfg Config) *Server {
 	if inlineThreshold <= 0 {
 		inlineThreshold = backend.DefaultInlineThreshold
 	}
+	sseHeartbeatInterval := cfg.SSEHeartbeatInterval
+	if sseHeartbeatInterval <= 0 {
+		sseHeartbeatInterval = defaultSSEHeartbeatInterval
+	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
-		fallback:          cfg.Backend,
-		meta:              cfg.Meta,
-		pool:              cfg.Pool,
-		tokenSecret:       cfg.TokenSecret,
-		localTenantAPIKey: strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:           vaultMK,
-		vaultIssuerURL:    strings.TrimSpace(cfg.VaultIssuerURL),
-		publicURL:         strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
-		provisioner:       cfg.Provisioner,
-		maxUploadBytes:    maxUpload,
-		inlineThreshold:   inlineThreshold,
-		metrics:           newServerMetrics(),
-		logger:            logger,
-		events:            newEventBuses(),
-		sseRetention:      newSSERetentionSweeper(),
-		slockOAuth:        cfg.SlockOAuth,
+		fallback:             cfg.Backend,
+		meta:                 cfg.Meta,
+		pool:                 cfg.Pool,
+		tokenSecret:          cfg.TokenSecret,
+		localTenantAPIKey:    strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:              vaultMK,
+		vaultIssuerURL:       strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:            strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
+		provisioner:          cfg.Provisioner,
+		maxUploadBytes:       maxUpload,
+		inlineThreshold:      inlineThreshold,
+		metrics:              newServerMetrics(),
+		logger:               logger,
+		events:               newEventBuses(),
+		sseHeartbeatInterval: sseHeartbeatInterval,
+		sseRetention:         newSSERetentionSweeper(),
+		slockOAuth:           cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
 			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
@@ -206,6 +213,7 @@ func NewWithConfig(cfg Config) *Server {
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
 	}
+	metrics.RecordGauge("sse", "heartbeat_interval_seconds", sseHeartbeatInterval.Seconds())
 	mux := http.NewServeMux()
 
 	var business http.Handler = http.HandlerFunc(s.handleBusiness)

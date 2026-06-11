@@ -175,6 +175,10 @@ func main() {
 	if err != nil {
 		die(err)
 	}
+	sseHeartbeatInterval := time.Duration(envInt("DRIVE9_SSE_HEARTBEAT_INTERVAL_SECONDS", 15)) * time.Second
+	if sseHeartbeatInterval <= 0 {
+		die(fmt.Errorf("DRIVE9_SSE_HEARTBEAT_INTERVAL_SECONDS must be positive"))
+	}
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_semantic_worker_config")
 	// Keep the local entrypoint aligned with drive9-server: if only the background
 	// embedder is configured, grep reuses it for app-side query embedding.
@@ -277,14 +281,15 @@ func main() {
 	b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 
 	if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
-		Backend:          b,
-		LocalS3:          localS3,
-		VaultMasterKey:   vaultMasterKey,
-		S3Dir:            s3cfg.localDir(),
-		MaxUploadBytes:   maxUploadBytes,
-		Logger:           srvLogger,
-		SemanticEmbedder: semanticEmbedder,
-		SemanticWorkers:  workerOpts,
+		Backend:              b,
+		LocalS3:              localS3,
+		VaultMasterKey:       vaultMasterKey,
+		S3Dir:                s3cfg.localDir(),
+		MaxUploadBytes:       maxUploadBytes,
+		Logger:               srvLogger,
+		SemanticEmbedder:     semanticEmbedder,
+		SemanticWorkers:      workerOpts,
+		SSEHeartbeatInterval: sseHeartbeatInterval,
 	}, backendOpts, true); err != nil {
 		die(err)
 	}
@@ -292,16 +297,17 @@ func main() {
 	stepStart = time.Now()
 	localAPIKey := envOr("DRIVE9_LOCAL_API_KEY", defaultLocalAPIKey)
 	srv := server.NewWithConfig(server.Config{
-		Backend:           b,
-		LocalTenantAPIKey: localAPIKey,
-		VaultMasterKey:    vaultMasterKey,
-		VaultIssuerURL:    vaultIssuerURL(addr),
-		LocalS3:           localS3,
-		S3Dir:             s3cfg.localDir(),
-		MaxUploadBytes:    maxUploadBytes,
-		Logger:            srvLogger,
-		SemanticEmbedder:  semanticEmbedder,
-		SemanticWorkers:   workerOpts,
+		Backend:              b,
+		LocalTenantAPIKey:    localAPIKey,
+		VaultMasterKey:       vaultMasterKey,
+		VaultIssuerURL:       vaultIssuerURL(addr),
+		LocalS3:              localS3,
+		S3Dir:                s3cfg.localDir(),
+		MaxUploadBytes:       maxUploadBytes,
+		Logger:               srvLogger,
+		SemanticEmbedder:     semanticEmbedder,
+		SemanticWorkers:      workerOpts,
+		SSEHeartbeatInterval: sseHeartbeatInterval,
 	})
 	defer srv.Close()
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_server")
@@ -406,6 +412,9 @@ environment:
   DRIVE9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
   DRIVE9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
   DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
+
+  SSE event stream:
+  DRIVE9_SSE_HEARTBEAT_INTERVAL_SECONDS heartbeat interval for /v1/events streams (default: 15)
 
   Image extraction (async image -> text for search):
   DRIVE9_IMAGE_EXTRACT_ENABLED true|false (default: false)

@@ -114,6 +114,10 @@ func main() {
 	if err != nil {
 		die(err)
 	}
+	sseHeartbeatInterval := time.Duration(envInt("DRIVE9_SSE_HEARTBEAT_INTERVAL_SECONDS", 15)) * time.Second
+	if sseHeartbeatInterval <= 0 {
+		die(fmt.Errorf("DRIVE9_SSE_HEARTBEAT_INTERVAL_SECONDS must be positive"))
+	}
 	if semanticEmbedder != nil && backendOptions.QueryEmbedding.Client == nil {
 		backendOptions.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
@@ -272,6 +276,7 @@ func main() {
 			Logger:                       srvLogger,
 			SemanticEmbedder:             semanticEmbedder,
 			SemanticWorkers:              semanticWorkerOpts,
+			SSEHeartbeatInterval:         sseHeartbeatInterval,
 			TiDBAutoEmbeddingConfig:      autoEmbeddingConfig,
 			TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
 			TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
@@ -305,6 +310,7 @@ func main() {
 		Logger:                       srvLogger,
 		SemanticEmbedder:             semanticEmbedder,
 		SemanticWorkers:              semanticWorkerOpts,
+		SSEHeartbeatInterval:         sseHeartbeatInterval,
 		SlockOAuth:                   slockOAuth,
 		TiDBAutoEmbeddingConfig:      autoEmbeddingConfig,
 		TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
@@ -474,6 +480,9 @@ environment:
   DRIVE9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
   DRIVE9_SEMANTIC_TENANT_LIMIT active tenants scanned per round (default: 128)
   DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
+
+  SSE event stream:
+  DRIVE9_SSE_HEARTBEAT_INTERVAL_SECONDS heartbeat interval for /v1/events streams (default: 15)
 
   Image extraction (async image -> text for search):
   DRIVE9_IMAGE_EXTRACT_ENABLED true|false (default: false)
