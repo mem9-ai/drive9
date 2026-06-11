@@ -821,6 +821,110 @@ func TestNamespaceCache_SessionCreatedMissIsSafeNegative(t *testing.T) {
 	}
 }
 
+func TestNamespaceCache_SessionCreatedDirOutlivesNegativeTTL(t *testing.T) {
+	dc := NewNamespaceCache(300*time.Millisecond, 10*time.Millisecond, 10)
+	dc.MarkSessionCreatedDir("/dir")
+
+	time.Sleep(50 * time.Millisecond)
+	if got := dc.Lookup("/dir", "missing"); got.kind != namespaceLookupSessionMiss {
+		t.Fatalf("lookup kind after negative TTL = %v, want session miss", got.kind)
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	if got := dc.Lookup("/dir", "missing"); got.kind != namespaceLookupNone {
+		t.Fatalf("lookup kind after dir TTL = %v, want none", got.kind)
+	}
+}
+
+func TestNamespaceCache_RecordRemoteNegativeEscalatesAtThreshold(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, time.Second, 10)
+
+	for i := 1; i < escalateMissThreshold; i++ {
+		if dc.RecordRemoteNegative("/dir") {
+			t.Fatalf("miss %d escalated, want escalation only at %d", i, escalateMissThreshold)
+		}
+	}
+	if !dc.RecordRemoteNegative("/dir") {
+		t.Fatalf("miss %d did not escalate", escalateMissThreshold)
+	}
+
+	// Cooldown right after an escalation suppresses duplicates.
+	for i := 0; i < escalateMissThreshold; i++ {
+		if dc.RecordRemoteNegative("/dir") {
+			t.Fatal("escalated again during post-escalation cooldown")
+		}
+	}
+}
+
+func TestNamespaceCache_RecordRemoteNegativeWindowExpiryResets(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, time.Second, 10)
+
+	dc.RecordRemoteNegative("/dir")
+	dc.RecordRemoteNegative("/dir")
+
+	// Backdate the window: the partial count must not carry over.
+	dc.mu.Lock()
+	dc.entries["/dir"].missWindowStart = time.Now().Add(-2 * escalateMissWindow)
+	dc.mu.Unlock()
+
+	for i := 1; i < escalateMissThreshold; i++ {
+		if dc.RecordRemoteNegative("/dir") {
+			t.Fatalf("miss %d of new window escalated early", i)
+		}
+	}
+	if !dc.RecordRemoteNegative("/dir") {
+		t.Fatal("fresh window did not escalate at threshold")
+	}
+}
+
+func TestNamespaceCache_DeferEscalationCoolsDown(t *testing.T) {
+	dc := NewNamespaceCache(50*time.Millisecond, 10*time.Millisecond, 10)
+	dc.DeferEscalation("/dir")
+
+	for i := 0; i < escalateMissThreshold; i++ {
+		if dc.RecordRemoteNegative("/dir") {
+			t.Fatal("escalated during cooldown")
+		}
+	}
+
+	time.Sleep(70 * time.Millisecond)
+	for i := 1; i < escalateMissThreshold; i++ {
+		if dc.RecordRemoteNegative("/dir") {
+			t.Fatalf("miss %d after cooldown escalated early", i)
+		}
+	}
+	if !dc.RecordRemoteNegative("/dir") {
+		t.Fatal("did not escalate after cooldown expired")
+	}
+}
+
+func TestNamespaceCache_CanAnswerMisses(t *testing.T) {
+	dc := NewNamespaceCache(10*time.Second, 30*time.Millisecond, 2)
+
+	if dc.CanAnswerMisses("/dir") {
+		t.Fatal("empty cache should not answer misses")
+	}
+
+	dc.Put("/dir", []CachedFileInfo{{Name: "a.txt"}})
+	if !dc.CanAnswerMisses("/dir") {
+		t.Fatal("complete listing should answer misses")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if dc.CanAnswerMisses("/dir") {
+		t.Fatal("expired complete marker should not answer misses")
+	}
+
+	dc.Put("/big", []CachedFileInfo{{Name: "a"}, {Name: "b"}, {Name: "c"}})
+	if dc.CanAnswerMisses("/big") {
+		t.Fatal("oversized listing should not answer misses")
+	}
+
+	dc.MarkSessionCreatedDir("/session")
+	if !dc.CanAnswerMisses("/session") {
+		t.Fatal("session-created dir should answer misses")
+	}
+}
+
 func TestNamespaceCache_NegativeExpires(t *testing.T) {
 	dc := NewNamespaceCache(10*time.Second, time.Millisecond, 10)
 	dc.MarkNegative("/repo", "missing.txt")

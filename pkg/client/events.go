@@ -132,32 +132,26 @@ func (c *Client) streamEvents(ctx context.Context, since uint64, actor string, h
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 4<<20)
 	var eventType string
-	var dataLines []string
+	var dataLine string
 
 	for scanner.Scan() {
 		line := scanner.Text()
 
 		if line == "" {
 			// End of event.
-			if len(dataLines) > 0 {
-				parseAndDispatch(eventType, strings.Join(dataLines, "\n"), handler, onCurrent)
+			if dataLine != "" {
+				parseAndDispatch(eventType, dataLine, handler, onCurrent)
 			}
 			eventType = ""
-			dataLines = nil
+			dataLine = ""
 			continue
 		}
 
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-		if strings.HasPrefix(line, "event:") {
-			eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
-		} else if strings.HasPrefix(line, "data:") {
-			data := strings.TrimPrefix(line, "data:")
-			data = strings.TrimPrefix(data, " ")
-			dataLines = append(dataLines, data)
+		if strings.HasPrefix(line, "event: ") {
+			eventType = strings.TrimPrefix(line, "event: ")
+		} else if strings.HasPrefix(line, "data: ") {
+			dataLine = strings.TrimPrefix(line, "data: ")
 		}
 	}
 	return scanner.Err()

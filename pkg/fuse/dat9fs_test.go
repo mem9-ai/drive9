@@ -4662,6 +4662,108 @@ func TestLookupSSEForeignCreateInvalidatesSessionCreatedMiss(t *testing.T) {
 	}
 }
 
+func TestLookupNegativeStormEscalatesToSingleList(t *testing.T) {
+	var headCalls, listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead:
+			headCalls.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+			listCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"entries":[{"name":"existing.txt","size":4}]}`))
+		default:
+			t.Errorf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	dirIno := fs.inodes.Lookup("/bench", true, 0, time.Now())
+
+	for i := 0; i < 10; i++ {
+		var out gofuse.EntryOut
+		st := fs.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, fmt.Sprintf("file.%d", i), &out)
+		if st != gofuse.ENOENT {
+			t.Fatalf("Lookup file.%d status = %v, want ENOENT", i, st)
+		}
+	}
+
+	// Misses 1-3 each pay a HEAD; the third triggers the listing, which runs
+	// synchronously inside that Lookup (the in-process test server makes this
+	// deterministic), so misses 4-10 are answered locally from the complete
+	// listing: exactly threshold HEADs and one LIST.
+	if got := headCalls.Load(); got != int32(escalateMissThreshold) {
+		t.Fatalf("HEAD calls = %d, want %d (storm should escalate to a listing)", got, escalateMissThreshold)
+	}
+	if got := listCalls.Load(); got != 1 {
+		t.Fatalf("LIST calls = %d, want 1", got)
+	}
+
+	// The listing also serves positive lookups without another remote stat.
+	var out gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, "existing.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup existing.txt status = %v, want OK", st)
+	}
+	if got := headCalls.Load(); got != int32(escalateMissThreshold) {
+		t.Fatalf("HEAD calls after positive lookup = %d, want %d", got, escalateMissThreshold)
+	}
+}
+
+func TestLookupNegativeStormOversizedListingCoolsDown(t *testing.T) {
+	var headCalls, listCalls atomic.Int32
+	entries := make([]string, 0, defaultNamespaceCacheMaxEntries+1)
+	for i := 0; i <= defaultNamespaceCacheMaxEntries; i++ {
+		entries = append(entries, fmt.Sprintf(`{"name":"e%d","size":1}`, i))
+	}
+	listBody := `{"entries":[` + strings.Join(entries, ",") + `]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead:
+			headCalls.Add(1)
+			w.WriteHeader(http.StatusNotFound)
+		case r.Method == http.MethodGet && r.URL.Query().Get("list") == "1":
+			listCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(listBody))
+		default:
+			t.Errorf("unexpected request %s %s?%s", r.Method, r.URL.Path, r.URL.RawQuery)
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	dirIno := fs.inodes.Lookup("/huge", true, 0, time.Now())
+
+	for i := 0; i < 10; i++ {
+		var out gofuse.EntryOut
+		st := fs.Lookup(nil, &gofuse.InHeader{NodeId: dirIno}, fmt.Sprintf("file.%d", i), &out)
+		if st != gofuse.ENOENT {
+			t.Fatalf("Lookup file.%d status = %v, want ENOENT", i, st)
+		}
+	}
+
+	// Oversized listings cannot answer misses; every probe stays remote, but
+	// the cooldown must prevent more than the single listing attempt.
+	// Misses 1-3 pay HEADs and trigger the listing; it exceeds the cache
+	// limit, so DeferEscalation kicks in and misses 4-10 fall back to one
+	// HEAD each: all 10 probes stay remote but only one LIST is ever sent.
+	if got := listCalls.Load(); got != 1 {
+		t.Fatalf("LIST calls = %d, want 1 (cooldown should stop repeat listings)", got)
+	}
+	if got := headCalls.Load(); got != 10 {
+		t.Fatalf("HEAD calls = %d, want 10", got)
+	}
+}
+
 func TestReadDirPlusRecreatesStaleSnapshotInode(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()

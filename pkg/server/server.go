@@ -92,7 +92,6 @@ type Server struct {
 	logger              *zap.Logger
 	mux                 *http.ServeMux
 	events              *eventBuses
-	sseRetention        *sseRetentionSweeper
 	semanticWorker      *semanticWorkerManager
 	journalCursorSecret []byte
 	objectGCWorker      *objectGCWorker
@@ -195,7 +194,6 @@ func NewWithConfig(cfg Config) *Server {
 		metrics:           newServerMetrics(),
 		logger:            logger,
 		events:            newEventBuses(),
-		sseRetention:      newSSERetentionSweeper(),
 		slockOAuth:        cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
 			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
@@ -2286,7 +2284,6 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "chmod_ok", "path", path)...)
-	s.publishEvent(r, path, "chmod")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
