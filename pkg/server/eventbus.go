@@ -57,19 +57,16 @@ func (eb *EventBus) Publish(path, op, actor string) {
 // PublishEvent appends an event whose sequence was assigned by a durable event
 // log. It is used by the SSE endpoint so reconnect replay and live delivery use
 // the same cursor space when possible. Durable sequences may have gaps because
-// database auto-increment values are not guaranteed to be gapless. If volatile
-// fallback has already advanced the live cursor past the durable sequence,
-// publish the event at the next live sequence so connected clients still see
-// targeted invalidation; reconnecting clients will fall back to a reset when
-// their live cursor is ahead of the durable log head.
+// earlier transactions may roll back. Stale or duplicate durable events are not
+// republished because live delivery must never renumber the durable cursor.
 func (eb *EventBus) PublishEvent(ev ChangeEvent) {
 	eb.mu.Lock()
 	if ev.Seq == 0 {
 		eb.seq++
 		ev.Seq = eb.seq
 	} else if ev.Seq <= eb.seq {
-		eb.seq++
-		ev.Seq = eb.seq
+		eb.mu.Unlock()
+		return
 	} else if ev.Seq > eb.seq {
 		eb.seq = ev.Seq
 	}

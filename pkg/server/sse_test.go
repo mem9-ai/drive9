@@ -44,6 +44,9 @@ func clearFSEventsForServerTest(t *testing.T, srv *Server) {
 	if _, err := srv.fallback.Store().DB().Exec(`DELETE FROM fs_events`); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := srv.fallback.Store().DB().Exec(`DELETE FROM fs_event_seq`); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSSEEndpointSince0SendsReset(t *testing.T) {
@@ -258,7 +261,7 @@ func TestSSEEndpointPersistentReplayAllowsSeqGaps(t *testing.T) {
 	}
 }
 
-func TestSSEEndpointFallsBackToBusWhenPersistentLogHasNoHistory(t *testing.T) {
+func TestSSEEndpointDoesNotFallbackToBusWhenPersistentLogHasNoHistory(t *testing.T) {
 	srv := newTestServer(t)
 	clearFSEventsForServerTest(t, srv)
 	bus := srv.events.get("")
@@ -283,17 +286,17 @@ func TestSSEEndpointFallsBackToBusWhenPersistentLogHasNoHistory(t *testing.T) {
 	scanner := bufio.NewScanner(resp.Body)
 	got, ok := readSSEEvent(scanner)
 	if !ok {
-		t.Fatal("expected replayed volatile event")
+		t.Fatal("expected reset event")
 	}
-	if got.Event != "file_changed" {
-		t.Fatalf("event=%q, want file_changed", got.Event)
+	if got.Event != "reset" {
+		t.Fatalf("event=%q, want reset", got.Event)
 	}
-	var data ChangeEvent
+	var data map[string]interface{}
 	if err := json.Unmarshal([]byte(got.Data), &data); err != nil {
 		t.Fatal(err)
 	}
-	if data.Seq != 2 || data.Path != "/volatile-b.txt" || data.Op != "chmod" {
-		t.Fatalf("volatile replay event = %+v, want seq 2 chmod", data)
+	if data["reason"] != "no_history" {
+		t.Fatalf("reset reason=%v, want no_history", data["reason"])
 	}
 }
 
@@ -342,6 +345,7 @@ func TestHandleChmodPublishesPersistentSSEEvent(t *testing.T) {
 	if err := srv.fallback.CreateCtx(ctx, "/chmod.txt"); err != nil {
 		t.Fatal(err)
 	}
+	clearFSEventsForServerTest(t, srv)
 
 	body := bytes.NewBufferString(`{"mode":384}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/fs/chmod.txt?chmod=1", body)

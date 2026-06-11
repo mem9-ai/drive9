@@ -2,8 +2,12 @@ package datastore
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"testing"
 )
+
+var errRollbackForTest = errors.New("rollback for test")
 
 func TestFSEventLogInsertBoundsAndReplay(t *testing.T) {
 	s := newTestStore(t)
@@ -79,9 +83,35 @@ func TestFSEventLogPrune(t *testing.T) {
 	}
 }
 
+func TestAppendFSEventTxRollbackDoesNotConsumeSeq(t *testing.T) {
+	s := newTestStore(t)
+	clearFSEventsForTest(t, s)
+	ctx := context.Background()
+
+	if err := s.InTx(ctx, func(tx *sql.Tx) error {
+		if _, err := s.AppendFSEventTx(ctx, tx, "/rolled-back.txt", "write", ""); err != nil {
+			return err
+		}
+		return errRollbackForTest
+	}); err != errRollbackForTest {
+		t.Fatalf("rollback tx error = %v, want %v", err, errRollbackForTest)
+	}
+
+	ev, err := s.InsertFSEvent(ctx, "/committed.txt", "write", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Seq != 1 {
+		t.Fatalf("seq after rollback = %d, want 1", ev.Seq)
+	}
+}
+
 func clearFSEventsForTest(t *testing.T, s *Store) {
 	t.Helper()
 	if _, err := s.DB().Exec(`DELETE FROM fs_events`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().Exec(`DELETE FROM fs_event_seq`); err != nil {
 		t.Fatal(err)
 	}
 }

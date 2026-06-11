@@ -22,7 +22,6 @@ const (
 	defaultSSEHeartbeatInterval = 15 * time.Second
 	sseFlushBatchSize           = 10
 	sseFlushMaxDelay            = 1 * time.Millisecond
-	ssePersistTimeout           = 500 * time.Millisecond
 	sseRetentionSweepTimeout    = 5 * time.Second
 	sseRetentionSweepEvery      = time.Minute
 	ssePersistentReplayLimit    = eventBusRingSize
@@ -36,7 +35,6 @@ type sseOperationResult string
 const (
 	sseResultOK              sseOperationResult = "ok"
 	sseResultError           sseOperationResult = "error"
-	sseResultVolatile        sseOperationResult = "volatile"
 	sseResultInitialSync     sseOperationResult = "initial_sync"
 	sseResultSeqTooOld       sseOperationResult = "seq_too_old"
 	sseResultServerRestart   sseOperationResult = "server_restart"
@@ -174,37 +172,36 @@ func (s *Server) tenantEventBus(r *http.Request) *EventBus {
 	return s.events.get("")
 }
 
-func (s *Server) publishEvent(r *http.Request, path, op string) {
-	actor := r.Header.Get("X-Dat9-Actor")
-	bus := s.tenantEventBus(r)
-	if b := backendFromRequest(r); b != nil && b.Store() != nil {
-		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), ssePersistTimeout)
-		defer cancel()
+func eventMutationContext(r *http.Request) (context.Context, *datastore.FSEventCollector) {
+	collector := datastore.NewFSEventCollector()
+	ctx := datastore.WithFSEventActor(r.Context(), r.Header.Get("X-Dat9-Actor"))
+	ctx = datastore.WithFSEventCollector(ctx, collector)
+	return ctx, collector
+}
 
-		persistStart := time.Now()
-		ev, err := b.Store().InsertFSEvent(persistCtx, path, op, actor)
-		if err == nil {
-			recordSSEOperation("persist", sseResultOK, persistStart)
-			publishStart := time.Now()
-			bus.PublishEvent(ChangeEvent{
-				Seq:   ev.Seq,
-				Path:  ev.Path,
-				Op:    ev.Op,
-				Actor: ev.Actor,
-				Ts:    ev.Ts,
-			})
-			recordSSEOperation("publish", sseResultOK, publishStart)
-			if s.sseRetention != nil {
-				s.sseRetention.MaybeSweep(r.Context(), sseRetentionTenantKey(r), b.Store(), ev.Seq)
-			}
-			return
-		}
-		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "sse_persist_failed", "path", path, "op", op, "error", err)...)
-		recordSSEOperation("persist", sseResultError, persistStart)
+func (s *Server) publishCollectedEvents(r *http.Request, collector *datastore.FSEventCollector) {
+	if collector == nil {
+		return
 	}
-	start := time.Now()
-	bus.Publish(path, op, actor)
-	recordSSEOperation("publish", sseResultVolatile, start)
+	for _, ev := range collector.Events() {
+		recordSSEOperation("persist", sseResultOK, time.Time{})
+		s.publishDurableEvent(r, ev)
+	}
+}
+
+func (s *Server) publishDurableEvent(r *http.Request, ev datastore.FSEvent) {
+	publishStart := time.Now()
+	s.tenantEventBus(r).PublishEvent(ChangeEvent{
+		Seq:   ev.Seq,
+		Path:  ev.Path,
+		Op:    ev.Op,
+		Actor: ev.Actor,
+		Ts:    ev.Ts,
+	})
+	recordSSEOperation("publish", sseResultOK, publishStart)
+	if b := backendFromRequest(r); b != nil && b.Store() != nil && s.sseRetention != nil {
+		s.sseRetention.MaybeSweep(r.Context(), sseRetentionTenantKey(r), b.Store(), ev.Seq)
+	}
 }
 
 type sseRetentionSweeper struct {
@@ -469,9 +466,6 @@ func (s *Server) eventsSince(ctx context.Context, store *datastore.Store, bus *E
 			return events, headSeq, ok, reason
 		}
 		if err == nil {
-			if events, busHeadSeq, busOK := bus.EventsSince(since); busOK {
-				return events, busHeadSeq, true, ""
-			}
 			return events, headSeq, ok, reason
 		}
 		logger.Error(ctx, "server_event", eventFields(ctx, "sse_replay_persistent_failed", "error", err)...)

@@ -49,6 +49,7 @@ func initDatastoreSchema(t *testing.T, dsn string) {
 		`CREATE INDEX idx_file_gc_claim ON file_gc_tasks(status, available_at, lease_until, created_at)`,
 		`CREATE TABLE IF NOT EXISTS llm_usage (id BIGINT AUTO_INCREMENT PRIMARY KEY, task_type VARCHAR(32) NOT NULL, task_id VARCHAR(64) NOT NULL, cost_millicents BIGINT NOT NULL DEFAULT 0, raw_units BIGINT NOT NULL DEFAULT 0, raw_unit_type VARCHAR(16) NOT NULL, created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3))`,
 		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
+		`CREATE TABLE IF NOT EXISTS fs_event_seq (id TINYINT UNSIGNED PRIMARY KEY, next_seq BIGINT UNSIGNED NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS fs_events (seq BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, path VARCHAR(512) NOT NULL, op VARCHAR(64) NOT NULL, actor VARCHAR(255), ts BIGINT NOT NULL, created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3))`,
 		`CREATE INDEX idx_fs_events_created ON fs_events(created_at)`,
 	}

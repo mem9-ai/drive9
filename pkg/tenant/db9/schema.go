@@ -166,6 +166,10 @@ func InitSchemaStatements() []string {
 			created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_llm_usage_created ON llm_usage(created_at)`,
+		`CREATE TABLE IF NOT EXISTS fs_event_seq (
+			id       SMALLINT PRIMARY KEY,
+			next_seq BIGINT NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS fs_events (
 			seq        BIGSERIAL PRIMARY KEY,
 			path       VARCHAR(512) NOT NULL,

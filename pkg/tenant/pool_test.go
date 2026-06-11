@@ -202,6 +202,9 @@ func initTenantPoolSchema(t *testing.T, dsn string) {
 		`CREATE UNIQUE INDEX uk_file_gc_file_id ON file_gc_tasks(file_id)`,
 		`CREATE UNIQUE INDEX uk_file_gc_inode_id ON file_gc_tasks(inode_id)`,
 		`CREATE INDEX idx_file_gc_claim ON file_gc_tasks(status, available_at, lease_until, created_at)`,
+		`CREATE TABLE IF NOT EXISTS fs_event_seq (id TINYINT UNSIGNED PRIMARY KEY, next_seq BIGINT UNSIGNED NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS fs_events (seq BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, path VARCHAR(512) NOT NULL, op VARCHAR(64) NOT NULL, actor VARCHAR(255), ts BIGINT NOT NULL, created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3))`,
+		`CREATE INDEX idx_fs_events_created ON fs_events(created_at)`,
 	}
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

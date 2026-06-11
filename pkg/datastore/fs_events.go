@@ -17,30 +17,114 @@ type FSEvent struct {
 
 const defaultFSEventReplayLimit = 10000
 
+type fsEventActorKey struct{}
+type fsEventCollectorKey struct{}
+
+// WithFSEventActor attaches the actor recorded for filesystem mutation events.
+func WithFSEventActor(ctx context.Context, actor string) context.Context {
+	return context.WithValue(ctx, fsEventActorKey{}, actor)
+}
+
+// FSEventActor returns the actor attached to ctx, if any.
+func FSEventActor(ctx context.Context) string {
+	if v, ok := ctx.Value(fsEventActorKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// FSEventCollector captures durable events appended by mutation transactions so
+// callers can fan them out only after the owning transaction commits.
+type FSEventCollector struct {
+	events []FSEvent
+}
+
+// NewFSEventCollector creates an empty durable event collector.
+func NewFSEventCollector() *FSEventCollector {
+	return &FSEventCollector{}
+}
+
+// WithFSEventCollector attaches c to ctx.
+func WithFSEventCollector(ctx context.Context, c *FSEventCollector) context.Context {
+	if c == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, fsEventCollectorKey{}, c)
+}
+
+// Events returns a copy of the collected durable events.
+func (c *FSEventCollector) Events() []FSEvent {
+	if c == nil || len(c.events) == 0 {
+		return nil
+	}
+	out := make([]FSEvent, len(c.events))
+	copy(out, c.events)
+	return out
+}
+
+func recordCollectedFSEvent(ctx context.Context, ev FSEvent) {
+	if c, ok := ctx.Value(fsEventCollectorKey{}).(*FSEventCollector); ok && c != nil {
+		c.events = append(c.events, ev)
+	}
+}
+
 // InsertFSEvent appends a durable filesystem event and returns the assigned
 // tenant-local sequence number.
 func (s *Store) InsertFSEvent(ctx context.Context, path, op, actor string) (ev FSEvent, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "insert_fs_event", start, &err)
 
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		var txErr error
+		ev, txErr = s.AppendFSEventTx(ctx, tx, path, op, actor)
+		return txErr
+	})
+	return ev, err
+}
+
+// AppendFSEventTx appends a durable filesystem event inside the caller's
+// transaction. Sequence allocation is also transactional, so rolled-back
+// mutations do not consume event sequence numbers.
+func (s *Store) AppendFSEventTx(ctx context.Context, db execer, path, op, actor string) (ev FSEvent, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "append_fs_event", start, &err)
+
+	if actor == "" {
+		actor = FSEventActor(ctx)
+	}
+	seq, err := nextFSEventSeqTx(ctx, db)
+	if err != nil {
+		return FSEvent{}, err
+	}
 	ts := time.Now().UnixMilli()
-	res, err := s.db.ExecContext(ctx,
-		`INSERT INTO fs_events (path, op, actor, ts) VALUES (?, ?, ?, ?)`,
-		path, op, nullStr(actor), ts)
-	if err != nil {
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO fs_events (seq, path, op, actor, ts) VALUES (?, ?, ?, ?, ?)`,
+		seq, path, op, nullStr(actor), ts); err != nil {
 		return FSEvent{}, err
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return FSEvent{}, err
-	}
-	return FSEvent{
-		Seq:   uint64(id),
+	ev = FSEvent{
+		Seq:   seq,
 		Path:  path,
 		Op:    op,
 		Actor: actor,
 		Ts:    ts,
-	}, nil
+	}
+	recordCollectedFSEvent(ctx, ev)
+	return ev, nil
+}
+
+func nextFSEventSeqTx(ctx context.Context, db execer) (uint64, error) {
+	if _, err := db.ExecContext(ctx, `INSERT IGNORE INTO fs_event_seq (id, next_seq) SELECT 1, COALESCE(MAX(seq), 0) + 1 FROM fs_events`); err != nil {
+		return 0, err
+	}
+	var seq uint64
+	if err := db.QueryRowContext(ctx, `SELECT next_seq FROM fs_event_seq WHERE id = 1 FOR UPDATE`).Scan(&seq); err != nil {
+		return 0, err
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE fs_event_seq SET next_seq = ? WHERE id = 1`, seq+1); err != nil {
+		return 0, err
+	}
+	return seq, nil
 }
 
 // FSEventBounds returns the oldest retained sequence, current head sequence,

@@ -59,20 +59,20 @@ func TestEventBusReplay(t *testing.T) {
 	}
 }
 
-func TestEventBusPublishEventRenumbersOlderSeqAfterVolatileFallback(t *testing.T) {
+func TestEventBusPublishEventIgnoresOlderSeq(t *testing.T) {
 	bus := NewEventBus()
 	bus.PublishEvent(ChangeEvent{Seq: 2, Path: "/b.txt", Op: "write", Ts: 1})
 	bus.PublishEvent(ChangeEvent{Seq: 1, Path: "/a.txt", Op: "write", Ts: 1})
 
-	if got := bus.Seq(); got != 3 {
-		t.Fatalf("seq=%d, want 3", got)
+	if got := bus.Seq(); got != 2 {
+		t.Fatalf("seq=%d, want 2", got)
 	}
 	events, _, ok := bus.EventsSince(1)
 	if !ok {
 		t.Fatal("EventsSince(1) returned not ok")
 	}
-	if len(events) != 2 || events[0].Seq != 2 || events[1].Seq != 3 || events[1].Path != "/a.txt" {
-		t.Fatalf("events=%+v, want durable seq 2 then renumbered live seq 3", events)
+	if len(events) != 1 || events[0].Seq != 2 || events[0].Path != "/b.txt" {
+		t.Fatalf("events=%+v, want only durable seq 2", events)
 	}
 }
 
@@ -94,27 +94,20 @@ func TestEventBusEventsSinceAcceptsDurableSeqGaps(t *testing.T) {
 	}
 }
 
-func TestEventBusPublishEventContinuesAfterVolatileFallbackCollision(t *testing.T) {
+func TestEventBusPublishEventIgnoresDuplicateSeq(t *testing.T) {
 	bus := NewEventBus()
-	bus.AdvanceSeq(5)
-	bus.Publish("/volatile.txt", "write", "")
 	bus.PublishEvent(ChangeEvent{Seq: 6, Path: "/durable.txt", Op: "chmod", Ts: 1})
+	bus.PublishEvent(ChangeEvent{Seq: 6, Path: "/duplicate.txt", Op: "chmod", Ts: 1})
 
 	events, headSeq, ok := bus.EventsSince(5)
 	if !ok {
 		t.Fatal("EventsSince(5) returned not ok")
 	}
-	if headSeq != 7 {
-		t.Fatalf("headSeq=%d, want 7", headSeq)
+	if headSeq != 6 {
+		t.Fatalf("headSeq=%d, want 6", headSeq)
 	}
-	if len(events) != 2 {
-		t.Fatalf("events len=%d, want 2: %+v", len(events), events)
-	}
-	if events[0].Seq != 6 || events[0].Path != "/volatile.txt" {
-		t.Fatalf("first event=%+v, want volatile seq 6", events[0])
-	}
-	if events[1].Seq != 7 || events[1].Path != "/durable.txt" {
-		t.Fatalf("second event=%+v, want durable event renumbered to seq 7", events[1])
+	if len(events) != 1 || events[0].Seq != 6 || events[0].Path != "/durable.txt" {
+		t.Fatalf("events=%+v, want only durable seq 6", events)
 	}
 }
 
