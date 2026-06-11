@@ -12,9 +12,16 @@ import (
 func Find(c *client.Client, args []string) error {
 	path := "/"
 	params := url.Values{}
+	layerRef := ""
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
+		case "--layer":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--layer requires argument")
+			}
+			i++
+			layerRef = strings.TrimSpace(args[i])
 		case "-name":
 			if i+1 >= len(args) {
 				return fmt.Errorf("-name requires argument")
@@ -54,7 +61,9 @@ func Find(c *client.Client, args []string) error {
 				params.Set("maxsize", v)
 			}
 		default:
-			if !strings.HasPrefix(args[i], "-") {
+			if strings.HasPrefix(args[i], "--layer=") {
+				layerRef = strings.TrimSpace(strings.TrimPrefix(args[i], "--layer="))
+			} else if !strings.HasPrefix(args[i], "-") {
 				path = args[i]
 			} else {
 				return fmt.Errorf("unknown flag %q", args[i])
@@ -66,6 +75,9 @@ func Find(c *client.Client, args []string) error {
 	c, path, _, _, err = fsClientForRemoteArg(c, path)
 	if err != nil {
 		return err
+	}
+	if layerRef != "" {
+		params.Set("layer", layerRef)
 	}
 
 	results, err := c.Find(path, params)

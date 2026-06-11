@@ -741,7 +741,16 @@ func buildAudioExtractOptionsFromEnv() (backend.AsyncAudioExtractOptions, error)
 }
 
 func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorkerOptions, error) {
-	var opts server.SemanticWorkerOptions
+	opts := server.SemanticWorkerOptions{
+		Workers:              envInt("DRIVE9_SEMANTIC_WORKERS", 1),
+		PollInterval:         time.Duration(envInt("DRIVE9_SEMANTIC_POLL_INTERVAL_MS", 200)) * time.Millisecond,
+		LeaseDuration:        time.Duration(envInt("DRIVE9_SEMANTIC_LEASE_SECONDS", 30)) * time.Second,
+		RecoverInterval:      time.Duration(envInt("DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
+		RetryBaseDelay:       time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
+		RetryMaxDelay:        time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
+		TenantScanLimit:      envInt("DRIVE9_SEMANTIC_TENANT_LIMIT", 128),
+		PerTenantConcurrency: envInt("DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
+	}
 	baseURL := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_API_BASE"))
 	apiKey := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_API_KEY"))
 	model := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_MODEL"))
@@ -761,16 +770,6 @@ func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorker
 	})
 	if err != nil {
 		return nil, opts, fmt.Errorf("init semantic embedder: %w", err)
-	}
-	opts = server.SemanticWorkerOptions{
-		Workers:              envInt("DRIVE9_SEMANTIC_WORKERS", 1),
-		PollInterval:         time.Duration(envInt("DRIVE9_SEMANTIC_POLL_INTERVAL_MS", 200)) * time.Millisecond,
-		LeaseDuration:        time.Duration(envInt("DRIVE9_SEMANTIC_LEASE_SECONDS", 30)) * time.Second,
-		RecoverInterval:      time.Duration(envInt("DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
-		RetryBaseDelay:       time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
-		RetryMaxDelay:        time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
-		TenantScanLimit:      envInt("DRIVE9_SEMANTIC_TENANT_LIMIT", 128),
-		PerTenantConcurrency: envInt("DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
 	}
 	logger.Info(context.Background(), "semantic_embedding_mode_openai_compatible",
 		zap.String("model", model), zap.String("base_url", baseURL))

@@ -160,4 +160,3 @@ func newAliyun(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	}
 	return buildS3Client(ctx, cfg, provider)
 }
-

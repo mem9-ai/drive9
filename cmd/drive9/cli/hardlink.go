@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/mem9-ai/dat9/pkg/client"
@@ -12,8 +13,12 @@ import (
 //	drive9 fs hardlink :/target :/link
 //	drive9 fs hardlink ctx:/target ctx:/link
 func Hardlink(c *client.Client, args []string) error {
+	layerRef, args, err := parseLayerFlag(args)
+	if err != nil {
+		return err
+	}
 	if len(args) != 2 {
-		return fmt.Errorf("usage: drive9 fs hardlink <target> <link>")
+		return fmt.Errorf("usage: drive9 fs hardlink [--layer <ref>] <target> <link>")
 	}
 	srcPath := args[0]
 	dstPath := args[1]
@@ -24,6 +29,15 @@ func Hardlink(c *client.Client, args []string) error {
 	}
 	if dstIsRemote {
 		dstPath = dstRP.Path
+	}
+	if layerRef != "" {
+		if err := requireNoLayerWithRemoteContext(layerRef, srcRP, args[0]); err != nil {
+			return err
+		}
+		if err := requireNoLayerWithRemoteContext(layerRef, dstRP, args[1]); err != nil {
+			return err
+		}
+		return hardlinkLayerPath(context.Background(), c, layerRef, srcPath, dstPath)
 	}
 
 	switch {

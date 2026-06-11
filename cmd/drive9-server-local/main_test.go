@@ -52,9 +52,11 @@ func TestEnvPositiveInt(t *testing.T) {
 func TestDetectLocalTiDBEmbeddingMode(t *testing.T) {
 	origDetector := localTiDBEmbeddingModeDetector
 	origValidator := localTiDBSchemaValidator
+	origNoEmbeddingValidator := localNoEmbeddingSchemaValidator
 	t.Cleanup(func() {
 		localTiDBEmbeddingModeDetector = origDetector
 		localTiDBSchemaValidator = origValidator
+		localNoEmbeddingSchemaValidator = origNoEmbeddingValidator
 	})
 	ctx := context.Background()
 
@@ -64,6 +66,14 @@ func TestDetectLocalTiDBEmbeddingMode(t *testing.T) {
 	}
 	if mode != schema.TiDBEmbeddingModeApp {
 		t.Fatalf("schema-initialized explicit mode=%q, want %q", mode, schema.TiDBEmbeddingModeApp)
+	}
+
+	mode, err = detectLocalTiDBEmbeddingMode(ctx, nil, true, localEmbeddingModeNone, true)
+	if err != nil {
+		t.Fatalf("schema-initialized explicit none mode returned error: %v", err)
+	}
+	if mode != localEmbeddingModeNone {
+		t.Fatalf("schema-initialized none mode=%q, want %q", mode, localEmbeddingModeNone)
 	}
 
 	localTiDBEmbeddingModeDetector = func(*sql.DB) (schema.TiDBEmbeddingMode, error) {
@@ -84,6 +94,15 @@ func TestDetectLocalTiDBEmbeddingMode(t *testing.T) {
 	}
 	if mode != schema.TiDBEmbeddingModeApp {
 		t.Fatalf("explicit mode=%q, want %q", mode, schema.TiDBEmbeddingModeApp)
+	}
+
+	localNoEmbeddingSchemaValidator = func(context.Context, *sql.DB) error { return nil }
+	mode, err = detectLocalTiDBEmbeddingMode(ctx, &sql.DB{}, false, localEmbeddingModeNone, true)
+	if err != nil {
+		t.Fatalf("explicit none mode returned error: %v", err)
+	}
+	if mode != localEmbeddingModeNone {
+		t.Fatalf("explicit none mode=%q, want %q", mode, localEmbeddingModeNone)
 	}
 
 	localTiDBEmbeddingModeDetector = func(*sql.DB) (schema.TiDBEmbeddingMode, error) {
@@ -123,6 +142,31 @@ func TestDetectLocalTiDBEmbeddingMode(t *testing.T) {
 	}
 	if _, err := detectLocalTiDBEmbeddingMode(ctx, &sql.DB{}, false, schema.TiDBEmbeddingModeUnknown, false); err == nil {
 		t.Fatal("expected validation failure to propagate")
+	}
+}
+
+func TestInitLocalTenantSchemaSelectsNoEmbeddingInitializer(t *testing.T) {
+	origNoEmbeddingInitializer := localNoEmbeddingSchemaInitializer
+	origTiDBInitializer := localTiDBSchemaInitializer
+	t.Cleanup(func() {
+		localNoEmbeddingSchemaInitializer = origNoEmbeddingInitializer
+		localTiDBSchemaInitializer = origTiDBInitializer
+	})
+
+	calledNoEmbedding := false
+	localNoEmbeddingSchemaInitializer = func(context.Context, string) error {
+		calledNoEmbedding = true
+		return nil
+	}
+	localTiDBSchemaInitializer = func(context.Context, string, schema.TiDBEmbeddingMode, schema.InitTiDBTenantSchemaOptions) error {
+		return errors.New("tidb initializer should not be called")
+	}
+
+	if err := initLocalTenantSchema(context.Background(), "dsn", localEmbeddingModeNone); err != nil {
+		t.Fatalf("init none schema: %v", err)
+	}
+	if !calledNoEmbedding {
+		t.Fatal("expected no-embedding initializer to be called")
 	}
 }
 
@@ -167,6 +211,28 @@ func TestLocalEmbeddingModeFromEnv(t *testing.T) {
 		t.Fatalf("app mode=(%q,%v), want (app,true)", mode, explicit)
 	}
 
+	if err := os.Setenv(envLocalEmbeddingMode, "none"); err != nil {
+		t.Fatalf("set none mode: %v", err)
+	}
+	mode, explicit, err = localEmbeddingModeFromEnv()
+	if err != nil {
+		t.Fatalf("none mode returned error: %v", err)
+	}
+	if !explicit || mode != localEmbeddingModeNone {
+		t.Fatalf("none mode=(%q,%v), want (none,true)", mode, explicit)
+	}
+
+	if err := os.Setenv(envLocalEmbeddingMode, "skip"); err != nil {
+		t.Fatalf("set skip mode: %v", err)
+	}
+	mode, explicit, err = localEmbeddingModeFromEnv()
+	if err != nil {
+		t.Fatalf("skip mode returned error: %v", err)
+	}
+	if !explicit || mode != localEmbeddingModeNone {
+		t.Fatalf("skip mode=(%q,%v), want (none,true)", mode, explicit)
+	}
+
 	if err := os.Setenv(envLocalEmbeddingMode, "detect"); err != nil {
 		t.Fatalf("set detect mode: %v", err)
 	}
@@ -183,6 +249,52 @@ func TestLocalEmbeddingModeFromEnv(t *testing.T) {
 	}
 	if _, _, err := localEmbeddingModeFromEnv(); err == nil {
 		t.Fatal("expected invalid mode to fail")
+	}
+}
+
+func TestBuildSemanticWorkerConfigFromEnvReadsWorkerOptionsWithoutEmbedder(t *testing.T) {
+	keys := []string{
+		"DRIVE9_EMBED_API_BASE",
+		"DRIVE9_EMBED_API_KEY",
+		"DRIVE9_EMBED_MODEL",
+		"DRIVE9_SEMANTIC_WORKERS",
+		"DRIVE9_SEMANTIC_TENANT_LIMIT",
+	}
+	prev := make(map[string]string, len(keys))
+	for _, key := range keys {
+		prev[key] = os.Getenv(key)
+	}
+	t.Cleanup(func() {
+		for _, key := range keys {
+			if prev[key] == "" {
+				_ = os.Unsetenv(key)
+			} else {
+				_ = os.Setenv(key, prev[key])
+			}
+		}
+	})
+	for _, key := range keys {
+		_ = os.Unsetenv(key)
+	}
+	if err := os.Setenv("DRIVE9_SEMANTIC_WORKERS", "8"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Setenv("DRIVE9_SEMANTIC_TENANT_LIMIT", "512"); err != nil {
+		t.Fatal(err)
+	}
+
+	client, opts, err := buildSemanticWorkerConfigFromEnv()
+	if err != nil {
+		t.Fatalf("buildSemanticWorkerConfigFromEnv: %v", err)
+	}
+	if client != nil {
+		t.Fatal("client configured without DRIVE9_EMBED_*")
+	}
+	if opts.Workers != 8 {
+		t.Fatalf("Workers=%d, want 8", opts.Workers)
+	}
+	if opts.TenantScanLimit != 512 {
+		t.Fatalf("TenantScanLimit=%d, want 512", opts.TenantScanLimit)
 	}
 }
 

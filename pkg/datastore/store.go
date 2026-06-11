@@ -486,6 +486,74 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 	return out, nil
 }
 
+// RenameFileNoReplace atomically renames a file node and fails if newPath
+// already exists. It is used by fs-layer commit to avoid replacing a target
+// that may have been created after the layer entry was recorded.
+func (s *Store) RenameFileNoReplace(ctx context.Context, oldPath, newPath, newParentPath, newName string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "rename_file_no_replace", start, &err)
+
+	if isRootFileNodePath(oldPath) || isRootFileNodePath(newPath) {
+		return ErrInvalidRootDentry
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	type nodeRef struct {
+		nodeID string
+		isDir  bool
+	}
+	var old nodeRef
+	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, oldPath).
+		Scan(&old.nodeID, &old.isDir)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if old.isDir {
+		return fmt.Errorf("source is a directory: %s", oldPath)
+	}
+	if oldPath == newPath {
+		return tx.Commit()
+	}
+
+	var dst nodeRef
+	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, newPath).
+		Scan(&dst.nodeID, &dst.isDir)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+	} else {
+		if dst.nodeID == old.nodeID {
+			return tx.Commit()
+		}
+		return ErrPathConflict
+	}
+
+	res, err := tx.ExecContext(ctx, `UPDATE file_nodes SET path = ?, parent_path = ?, name = ?
+		WHERE node_id = ?`, newPath, newParentPath, newName, old.nodeID)
+	if err != nil {
+		if strings.Contains(err.Error(), "Duplicate entry") {
+			return ErrPathConflict
+		}
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return tx.Commit()
+}
+
 func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (count int64, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "rename_dir", start, &err)

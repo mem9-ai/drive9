@@ -234,6 +234,14 @@ jobs:
         continue-on-error: true
         run: bash e2e/cli-smoke-test.sh
 
+      - name: Run layer FS smoke
+        id: layer-fs-smoke
+        continue-on-error: true
+        env:
+          RUN_LAYER_FUSE_SMOKE: "1"
+          LAYER_FUSE_STRICT_PREREQS: "1"
+        run: bash e2e/layer-fs-smoke-test.sh
+
       - name: Run FUSE release gate
         id: fuse-smoke
         env:
@@ -359,6 +367,7 @@ jobs:
             echo "| API smoke | ${{ steps.api-smoke.outcome || 'skipped' }} |"
             echo "| Existing-key smoke | ${{ steps.existing-key-smoke.outcome || 'skipped' }} |"
             echo "| CLI smoke | ${{ steps.cli-smoke.outcome || 'skipped' }} |"
+            echo "| Layer FS smoke | ${{ steps.layer-fs-smoke.outcome || 'skipped' }} |"
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
             echo "| Git operations smoke | ${{ steps.git-ops-smoke.outcome || 'skipped' }} |"
             echo "| Portable pack/unpack e2e | ${{ steps.portable-pack-unpack-e2e.outcome || 'skipped' }} |"
@@ -428,6 +437,7 @@ jobs:
           check_required "API smoke" "${{ steps.api-smoke.outcome }}"
           check_required "Existing-key smoke" "${{ steps.existing-key-smoke.outcome }}"
           check_required "CLI smoke" "${{ steps.cli-smoke.outcome }}"
+          check_required "Layer FS smoke" "${{ steps.layer-fs-smoke.outcome }}"
           check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
           check_required "Git operations smoke" "${{ steps.git-ops-smoke.outcome }}"
           check_required "Portable pack/unpack e2e" "${{ steps.portable-pack-unpack-e2e.outcome }}"

@@ -1078,6 +1078,64 @@ func TestMountCmdLeavesLegacyDirStatFallbackDisabledByDefault(t *testing.T) {
 	}
 }
 
+func TestMountCmdPassesLayerRefOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--layer", "task=auth",
+		":/repo",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.LayerRef != "task=auth" {
+		t.Errorf("LayerRef = %q, want task=auth", got.LayerRef)
+	}
+	if got.RemoteRoot != "/repo" {
+		t.Errorf("RemoteRoot = %q, want /repo", got.RemoteRoot)
+	}
+}
+
+func TestMountCmdCheckpointRequiresLayer(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+	mountFuse = func(opts *mountFuseOptions) error {
+		t.Fatal("mountFuse should not be called")
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--checkpoint", "cp1",
+		":/repo",
+		t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("MountCmd error = nil, want checkpoint requires layer")
+	}
+	if !strings.Contains(err.Error(), "--checkpoint requires --layer") {
+		t.Errorf("MountCmd error = %v", err)
+	}
+}
+
 func TestMountCmdPassesTrustLocalEventsOption(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })

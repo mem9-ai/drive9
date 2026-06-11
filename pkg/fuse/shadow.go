@@ -2,6 +2,7 @@ package fuse
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -223,6 +224,33 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 	return nil
 }
 
+// WriteStream replaces the shadow contents by streaming from r.
+func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64) (int64, error) {
+	sf, err := s.ensureShadowFile(remotePath, baseRev)
+	if err != nil {
+		return 0, err
+	}
+	if err := sf.fd.Truncate(0); err != nil {
+		return 0, fmt.Errorf("shadow reset truncate: %w", err)
+	}
+	if _, err := sf.fd.Seek(0, 0); err != nil {
+		return 0, fmt.Errorf("shadow reset seek: %w", err)
+	}
+	n, err := io.Copy(sf.fd, r)
+	if err != nil {
+		return n, fmt.Errorf("shadow write stream: %w", err)
+	}
+	if err := sf.fd.Truncate(n); err != nil {
+		return n, fmt.Errorf("shadow final truncate: %w", err)
+	}
+
+	s.mu.Lock()
+	sf.size = n
+	sf.baseRev = baseRev
+	s.mu.Unlock()
+	return n, nil
+}
+
 // Truncate updates the shadow file length without syncing it.
 func (s *ShadowStore) Truncate(remotePath string, size int64, baseRev int64) error {
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
@@ -410,6 +438,36 @@ func (s *ShadowStore) ReadAll(remotePath string) ([]byte, error) {
 		return nil, err
 	}
 	return data, nil
+}
+
+// Open opens the current shadow file for remotePath for streaming reads.
+// The caller owns the returned file descriptor.
+func (s *ShadowStore) Open(remotePath string) (*os.File, int64, error) {
+	if s == nil {
+		return nil, 0, fmt.Errorf("nil shadow store")
+	}
+	s.mu.RLock()
+	sf, ok := s.files[remotePath]
+	var size int64
+	if ok {
+		size = sf.size
+	}
+	s.mu.RUnlock()
+
+	sp := s.shadowPath(remotePath)
+	fd, err := os.Open(sp)
+	if err != nil {
+		return nil, 0, fmt.Errorf("shadow open stream: %w", err)
+	}
+	if ok {
+		return fd, size, nil
+	}
+	fi, err := fd.Stat()
+	if err != nil {
+		_ = fd.Close()
+		return nil, 0, fmt.Errorf("shadow stream stat: %w", err)
+	}
+	return fd, fi.Size(), nil
 }
 
 // Size returns the size of a shadow file, or -1 if not found.

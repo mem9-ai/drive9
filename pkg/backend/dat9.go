@@ -1273,6 +1273,35 @@ func (b *Dat9Backend) RenameCtx(ctx context.Context, oldPath, newPath string) (e
 	return err
 }
 
+// RenameFileNoReplaceCtx renames a file and fails with datastore.ErrPathConflict
+// if the target path already exists.
+func (b *Dat9Backend) RenameFileNoReplaceCtx(ctx context.Context, oldPath, newPath string) (err error) {
+	start := time.Now()
+	defer func() { observeBackend(ctx, "rename_file_no_replace", err, start) }()
+
+	oldPath, node, err := b.resolveNodePath(ctx, oldPath)
+	if err != nil {
+		return err
+	}
+	if node.IsDirectory {
+		return fmt.Errorf("source is a directory: %s", oldPath)
+	}
+	newPath, err = pathutil.Canonicalize(newPath)
+	if err != nil {
+		return err
+	}
+	if oldPath == "/" || newPath == "/" {
+		return datastore.ErrInvalidRootDentry
+	}
+	if oldPath == newPath {
+		return nil
+	}
+	if err := b.store.EnsureParentDirs(ctx, newPath, b.genID); err != nil {
+		return err
+	}
+	return b.store.RenameFileNoReplace(ctx, oldPath, newPath, pathutil.ParentPath(newPath), pathutil.BaseName(newPath))
+}
+
 func (b *Dat9Backend) Open(path string) (io.ReadCloser, error) {
 	data, err := b.Read(path, 0, -1)
 	if err != nil {

@@ -181,6 +181,7 @@ func InitSchemaStatements() []string {
 		`CREATE INDEX IF NOT EXISTS idx_fs_events_created ON fs_events(created_at)`,
 	}
 	core = append(core, schema.GitWorkspaceDB9SchemaStatements()...)
+	core = append(core, schema.FSLayerDB9SchemaStatements()...)
 	core = append(core, schema.JournalDB9SchemaStatements()...)
 	// Vault tables are TiDB/MySQL-only and are not created via the db9
 	// PostgreSQL schema init path. They are initialized through the TiDB

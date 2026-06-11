@@ -47,9 +47,10 @@ type gitWorkspaceLayer struct {
 	loadedAt   time.Time
 	workspaces []*gitWorkspaceRuntime
 
-	materialize    map[string]*gitMaterializeCall
-	hydrateStarted map[string]struct{}
-	ignoreCache    map[string]bool
+	materialize     map[string]*gitMaterializeCall
+	hydrateStarted  map[string]struct{}
+	ignoreCache     map[string]bool
+	gitStateRefresh map[string]time.Time
 }
 
 type gitWorkspaceRuntime struct {
@@ -110,9 +111,10 @@ type pendingGitOverlayEntry struct {
 
 func newGitWorkspaceLayer() *gitWorkspaceLayer {
 	return &gitWorkspaceLayer{
-		materialize:    make(map[string]*gitMaterializeCall),
-		hydrateStarted: make(map[string]struct{}),
-		ignoreCache:    make(map[string]bool),
+		materialize:     make(map[string]*gitMaterializeCall),
+		hydrateStarted:  make(map[string]struct{}),
+		ignoreCache:     make(map[string]bool),
+		gitStateRefresh: make(map[string]time.Time),
 	}
 }
 
@@ -232,10 +234,10 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 	if rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath); ok {
 		return rt, rel, true
 	}
-	if fs.hasLocalGitStateHint(localPath) {
+	if fs.shouldForceRefreshGitWorkspacesForGitStatePath(localPath) {
 		refreshCtx, refreshCancel := context.WithTimeout(baseCtx, fuseTimeout)
 		if err := fs.forceRefreshGitWorkspaces(refreshCtx); err != nil {
-			log.Printf("git workspace forced refresh failed for %s: %v", localPath, err)
+			log.Printf("git workspace forced refresh failed for git state path %s: %v", localPath, err)
 		}
 		refreshCancel()
 		if rt, rel, ok := fs.loadedGitWorkspaceForPath(localPath); ok {
@@ -245,28 +247,42 @@ func (fs *Dat9FS) gitWorkspaceForPath(ctx context.Context, localPath string) (*g
 	return nil, "", false
 }
 
-func (fs *Dat9FS) hasLocalGitStateHint(localPath string) bool {
-	if fs == nil || fs.localOverlay == nil {
+func (fs *Dat9FS) shouldForceRefreshGitWorkspacesForGitStatePath(localPath string) bool {
+	if fs == nil || fs.git == nil {
 		return false
 	}
+	root, ok := gitStatePathRefreshRoot(localPath)
+	if !ok {
+		return false
+	}
+	now := time.Now()
+	fs.git.mu.Lock()
+	defer fs.git.mu.Unlock()
+	if fs.git.gitStateRefresh == nil {
+		fs.git.gitStateRefresh = make(map[string]time.Time)
+	}
+	if last := fs.git.gitStateRefresh[root]; !last.IsZero() && now.Sub(last) < gitWorkspaceRefreshInterval {
+		return false
+	}
+	fs.git.gitStateRefresh[root] = now
+	return true
+}
+
+func gitStatePathRefreshRoot(localPath string) (string, bool) {
 	clean := path.Clean(localPath)
 	if clean == "." {
-		return false
+		return "", false
 	}
-	for _, part := range strings.Split(strings.Trim(clean, "/"), "/") {
+	parts := strings.Split(strings.Trim(clean, "/"), "/")
+	for i, part := range parts {
 		if part == ".git" {
-			return false
+			if clean == "/" || len(parts) == 0 {
+				return "/.git", true
+			}
+			return "/" + strings.Join(parts[:i+1], "/"), true
 		}
 	}
-	for cur := clean; cur != "."; cur = path.Dir(cur) {
-		if _, err := fs.localOverlay.Lstat(path.Join(cur, ".git")); err == nil {
-			return true
-		}
-		if cur == "/" {
-			break
-		}
-	}
-	return false
+	return "", false
 }
 
 func (fs *Dat9FS) loadedGitWorkspaceForPath(localPath string) (*gitWorkspaceRuntime, string, bool) {
