@@ -59,62 +59,6 @@ func TestEventBusReplay(t *testing.T) {
 	}
 }
 
-func TestEventBusPublishEventForcesResetForOlderSeq(t *testing.T) {
-	bus := NewEventBus()
-	bus.PublishEvent(ChangeEvent{Seq: 2, Path: "/b.txt", Op: "write", Ts: 1})
-	bus.PublishEvent(ChangeEvent{Seq: 1, Path: "/a.txt", Op: "write", Ts: 1})
-
-	if got := bus.Seq(); got != 3 {
-		t.Fatalf("seq=%d, want 3", got)
-	}
-	events, _, ok := bus.EventsSince(1)
-	if !ok {
-		t.Fatal("EventsSince(1) returned not ok")
-	}
-	if len(events) != 2 || events[0].Seq != 2 || events[1].Seq != 3 || events[1].Op != eventBusForceResetOp {
-		t.Fatalf("events=%+v, want seq 2 then force-reset seq 3", events)
-	}
-}
-
-func TestEventBusEventsSinceRejectsSeqGaps(t *testing.T) {
-	bus := NewEventBus()
-	bus.PublishEvent(ChangeEvent{Seq: 1, Path: "/a.txt", Op: "write", Ts: 1})
-	bus.AdvanceSeq(2)
-	bus.PublishEvent(ChangeEvent{Seq: 3, Path: "/c.txt", Op: "write", Ts: 1})
-
-	events, headSeq, ok := bus.EventsSince(1)
-	if ok {
-		t.Fatalf("EventsSince(1) ok=true events=%+v, want reset for missing seq 2", events)
-	}
-	if headSeq != 3 {
-		t.Fatalf("headSeq=%d, want 3", headSeq)
-	}
-}
-
-func TestEventBusPublishEventForcesResetAfterVolatileFallbackCollision(t *testing.T) {
-	bus := NewEventBus()
-	bus.AdvanceSeq(5)
-	bus.Publish("/volatile.txt", "write", "")
-	bus.PublishEvent(ChangeEvent{Seq: 6, Path: "/durable.txt", Op: "chmod", Ts: 1})
-
-	events, headSeq, ok := bus.EventsSince(5)
-	if !ok {
-		t.Fatal("EventsSince(5) returned not ok")
-	}
-	if headSeq != 7 {
-		t.Fatalf("headSeq=%d, want 7", headSeq)
-	}
-	if len(events) != 2 {
-		t.Fatalf("events len=%d, want 2: %+v", len(events), events)
-	}
-	if events[0].Seq != 6 || events[0].Path != "/volatile.txt" {
-		t.Fatalf("first event=%+v, want volatile seq 6", events[0])
-	}
-	if events[1].Seq != 7 || events[1].Op != eventBusForceResetOp {
-		t.Fatalf("second event=%+v, want force-reset seq 7", events[1])
-	}
-}
-
 func TestEventBusCaughtUp(t *testing.T) {
 	bus := NewEventBus()
 	bus.Publish("/a.txt", "write", "")

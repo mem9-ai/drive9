@@ -78,7 +78,6 @@ func ResetDB(t *testing.T, db *sql.DB) {
 	t.Helper()
 	queries := []string{
 		"DELETE FROM file_gc_tasks",
-		"DELETE FROM fs_events",
 		"DELETE FROM semantic_tasks",
 		"DELETE FROM file_nodes",
 		"DELETE FROM file_tags",
@@ -123,7 +122,6 @@ func ResetDBWithoutFiles(t *testing.T, db *sql.DB) {
 	t.Helper()
 	queries := []string{
 		"DELETE FROM file_gc_tasks",
-		"DELETE FROM fs_events",
 		"DELETE FROM semantic_tasks",
 		"DELETE FROM file_nodes",
 		"DELETE FROM file_tags",
