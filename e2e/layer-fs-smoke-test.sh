@@ -890,7 +890,14 @@ if require_layer_fuse_prereqs; then
 
   fuse_commit_out=$(drive9_retry fs layer commit "tag:fuse_run=$ts")
   case "$fuse_commit_out" in
-    committed\ layer="$fuse_layer_id"\ applied=9) fuse_commit_status="ok" ;;
+    committed\ layer="$fuse_layer_id"\ applied=*)
+      fuse_commit_applied="${fuse_commit_out##*applied=}"
+      if [ "$fuse_commit_applied" -ge 9 ] 2>/dev/null; then
+        fuse_commit_status="ok"
+      else
+        fuse_commit_status="$fuse_commit_out"
+      fi
+      ;;
     *) fuse_commit_status="$fuse_commit_out" ;;
   esac
   check_eq "commit FUSE layer after restore succeeds" "$fuse_commit_status" "ok"

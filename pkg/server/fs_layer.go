@@ -734,7 +734,8 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	defer rollbackCancel()
 	touchedPaths := make(map[string]struct{})
 	for i := range entries {
-		if err := applyFSLayerEntry(r.Context(), b, &entries[i], false, touchedPaths); err != nil {
+		modeMayBeSuperseded := fsLayerEntryModeSuperseded(entries, i)
+		if err := applyFSLayerEntry(r.Context(), b, &entries[i], false, touchedPaths, modeMayBeSuperseded); err != nil {
 			rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, filterFSLayerSnapshotsForEntries(snapshots, entries[:i]))
 			_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 			if rollbackErr != nil {
@@ -1475,7 +1476,48 @@ func markFSLayerEntryTouched(touched map[string]struct{}, entry *datastore.FSLay
 	}
 }
 
-func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, recoveringCommit bool, touched map[string]struct{}) error {
+func fsLayerPathTouched(touched map[string]struct{}, path string) bool {
+	if touched == nil || path == "" {
+		return false
+	}
+	_, ok := touched[path]
+	return ok
+}
+
+func fsLayerApplyExpectedRevision(entry *datastore.FSLayerEntry, touched map[string]struct{}) int64 {
+	if entry == nil {
+		return -1
+	}
+	if fsLayerPathTouched(touched, entry.Path) {
+		return -1
+	}
+	return entry.BaseRevision
+}
+
+func fsLayerEntryModeSuperseded(entries []datastore.FSLayerEntry, idx int) bool {
+	if idx < 0 || idx >= len(entries) {
+		return false
+	}
+	path := entries[idx].Path
+	if path == "" {
+		return false
+	}
+	for i := idx + 1; i < len(entries); i++ {
+		next := &entries[i]
+		if next.Path == path {
+			return true
+		}
+		if next.Op == datastore.FSLayerEntryOpWhiteout && (next.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(next.Path, "/")) && fsLayerPathDescendsFrom(path, next.Path) {
+			return true
+		}
+		if next.Op == datastore.FSLayerEntryOpRename && (next.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(next.Path, "/")) && fsLayerPathDescendsFrom(path, next.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, recoveringCommit bool, touched map[string]struct{}, modeMayBeSuperseded bool) error {
 	if recoveringCommit {
 		applied, err := fsLayerEntryAlreadyApplied(ctx, b, entry)
 		if err != nil {
@@ -1490,8 +1532,32 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 	}
 	switch entry.Op {
 	case datastore.FSLayerEntryOpUpsert:
+		expectedRevision := fsLayerApplyExpectedRevision(entry, touched)
+		if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
+			mode := entry.Mode
+			if mode == 0 {
+				mode = 0o755
+			}
+			err := b.MkdirCtx(ctx, entry.Path, mode&0o777)
+			if errors.Is(err, datastore.ErrPathConflict) {
+				nf, statErr := b.StatNodeCtx(ctx, entry.Path)
+				if statErr != nil {
+					return statErr
+				}
+				if !nf.Node.IsDirectory {
+					return err
+				}
+				if entry.Mode != 0 {
+					return applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, modeMayBeSuperseded)
+				}
+				return nil
+			}
+			return err
+		}
 		if entry.StorageRef != "" || entry.StorageType == string(datastore.StorageS3) {
-			if _, err := b.WriteStoredObjectCtxIfRevision(ctx, entry.Path, entry); err != nil {
+			writeEntry := *entry
+			writeEntry.BaseRevision = expectedRevision
+			if _, err := b.WriteStoredObjectCtxIfRevision(ctx, entry.Path, &writeEntry); err != nil {
 				return err
 			}
 		} else {
@@ -1501,7 +1567,7 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 				entry.ContentBlob,
 				0,
 				filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate,
-				entry.BaseRevision,
+				expectedRevision,
 				nil,
 				"",
 			)
@@ -1510,7 +1576,7 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 			}
 		}
 		if entry.Mode != 0 {
-			return applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777)
+			return applyFSLayerEntryMode(ctx, b, entry.Path, entry.Mode&0o777, modeMayBeSuperseded)
 		}
 		return nil
 	case datastore.FSLayerEntryOpMkdir:
@@ -1545,7 +1611,7 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		if mode == 0 {
 			return nil
 		}
-		return b.ChmodCtx(ctx, entry.Path, mode)
+		return applyFSLayerEntryMode(ctx, b, entry.Path, mode&0o777, modeMayBeSuperseded)
 	case datastore.FSLayerEntryOpSymlink:
 		target := entry.ContentText
 		if target == "" && len(entry.ContentBlob) > 0 {
@@ -1572,22 +1638,25 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 	}
 }
 
-func applyFSLayerEntryMode(ctx context.Context, b *backendpkg.Dat9Backend, path string, mode uint32) error {
+func applyFSLayerEntryMode(ctx context.Context, b *backendpkg.Dat9Backend, path string, mode uint32, allowMissing bool) error {
 	if mode == 0 {
 		return nil
 	}
 	if err := b.ChmodCtx(ctx, path, mode); err != nil {
+		if allowMissing && errors.Is(err, datastore.ErrNotFound) {
+			return nil
+		}
 		if !errors.Is(err, datastore.ErrNotFound) {
-			return err
+			return fmt.Errorf("chmod fs layer path %s: %w", path, err)
 		}
 		nf, statErr := b.StatNodeCtx(ctx, path)
 		if statErr == nil && nf.File != nil && nf.Node.InodeID == "" {
 			return nil
 		}
 		if statErr != nil && !errors.Is(statErr, datastore.ErrNotFound) {
-			return statErr
+			return fmt.Errorf("stat fs layer chmod path %s: %w", path, statErr)
 		}
-		return err
+		return fmt.Errorf("chmod fs layer path %s: %w", path, err)
 	}
 	return nil
 }

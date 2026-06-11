@@ -257,6 +257,101 @@ func TestFSLayerCommitReplaysUpsertBeforeChmod(t *testing.T) {
 	}
 }
 
+func TestFSLayerCommitReplaysSamePathUpsertsWithoutBaseRevConflict(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-same-path-upserts",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-same-path-upserts", client.FSLayerEntryRequest{
+		Path:    "/repo/repeated.txt",
+		Op:      "upsert",
+		Kind:    "file",
+		Content: []byte("first"),
+		Mode:    0o644,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry first: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-same-path-upserts", client.FSLayerEntryRequest{
+		Path:    "/repo/repeated.txt",
+		Op:      "upsert",
+		Kind:    "file",
+		Content: []byte("second"),
+		Mode:    0o600,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry second: %v", err)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-same-path-upserts")
+	if err != nil {
+		t.Fatalf("CommitFSLayer: %v", err)
+	}
+	if commit.Status != "committed" || commit.Applied != 2 {
+		t.Fatalf("commit = %+v, want committed applied=2", commit)
+	}
+	data, err := s.fallback.ReadCtx(ctx, "/repo/repeated.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("ReadCtx: %v", err)
+	}
+	if !bytes.Equal(data, []byte("second")) {
+		t.Fatalf("data = %q, want second", data)
+	}
+	nf, err := s.fallback.StatNodeCtx(ctx, "/repo/repeated.txt")
+	if err != nil {
+		t.Fatalf("StatNodeCtx: %v", err)
+	}
+	if nf.File == nil || nf.File.Mode&0o777 != 0o600 {
+		t.Fatalf("mode = %+v, want 0600", nf.File)
+	}
+}
+
+func TestFSLayerCommitAllowsSupersededUpsertModeBeforeWhiteout(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-upsert-whiteout",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-upsert-whiteout", client.FSLayerEntryRequest{
+		Path:    "/repo/temp.txt",
+		Op:      "upsert",
+		Kind:    "file",
+		Content: []byte("temp"),
+		Mode:    0o600,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry upsert: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-upsert-whiteout", client.FSLayerEntryRequest{
+		Path: "/repo/temp.txt",
+		Op:   "whiteout",
+		Kind: "file",
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry whiteout: %v", err)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-upsert-whiteout")
+	if err != nil {
+		t.Fatalf("CommitFSLayer: %v", err)
+	}
+	if commit.Status != "committed" || commit.Applied != 2 {
+		t.Fatalf("commit = %+v, want committed applied=2", commit)
+	}
+	if _, err := s.fallback.StatNodeCtx(ctx, "/repo/temp.txt"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("temp stat err=%v, want ErrNotFound", err)
+	}
+}
+
 func TestFSLayerCommitReplaysUpsertBeforeRename(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
