@@ -126,6 +126,9 @@ func TestFSLayerUpsertRejectsNonActiveLayer(t *testing.T) {
 	if err := s.BeginFSLayerCommit(ctx, "layer-committing-upsert"); err != nil {
 		t.Fatalf("BeginFSLayerCommit: %v", err)
 	}
+	if err := s.BeginFSLayerCommit(ctx, "layer-committing-upsert"); !errors.Is(err, ErrFSLayerStateConflict) {
+		t.Fatalf("BeginFSLayerCommit reentry err=%v, want ErrFSLayerStateConflict", err)
+	}
 	err := s.UpsertFSLayerEntry(ctx, &FSLayerEntry{
 		LayerID:     "layer-committing-upsert",
 		Path:        "/repo/late.txt",
@@ -242,6 +245,13 @@ func TestFSLayerEntriesAndCheckpoint(t *testing.T) {
 	if current.EntrySeq != 4 || !bytes.Equal(current.ContentBlob, []byte("goodbye")) {
 		t.Fatalf("current entry = %+v", current)
 	}
+	logEntries, err := s.ListFSLayerEntryLog(ctx, "layer-entries")
+	if err != nil {
+		t.Fatalf("ListFSLayerEntryLog: %v", err)
+	}
+	if len(logEntries) != 4 || logEntries[0].EntrySeq != 1 || logEntries[3].EntrySeq != 4 {
+		t.Fatalf("log entries = %+v, want full ordered log", logEntries)
+	}
 	atCheckpoint, err := s.GetFSLayerEntryAtSeq(ctx, "layer-entries", "/repo/tmp/a.txt", gotCheckpoint.DurableSeq)
 	if err != nil {
 		t.Fatalf("GetFSLayerEntryAtSeq: %v", err)
@@ -255,6 +265,13 @@ func TestFSLayerEntriesAndCheckpoint(t *testing.T) {
 	}
 	if len(checkpointEntries) != 3 || checkpointEntries[2].EntrySeq != 3 || !bytes.Equal(checkpointEntries[2].ContentBlob, []byte("hello")) {
 		t.Fatalf("checkpoint entries = %+v", checkpointEntries)
+	}
+	checkpointLog, err := s.ListFSLayerEntryLogAtSeq(ctx, "layer-entries", gotCheckpoint.DurableSeq)
+	if err != nil {
+		t.Fatalf("ListFSLayerEntryLogAtSeq: %v", err)
+	}
+	if len(checkpointLog) != 3 || checkpointLog[0].EntrySeq != 1 || checkpointLog[2].EntrySeq != 3 {
+		t.Fatalf("checkpoint log = %+v, want ordered entries through checkpoint", checkpointLog)
 	}
 }
 

@@ -678,11 +678,14 @@ check_eq "GET checkpoint returns 200" "$(http_code "$checkpoint_resp")" "200"
 check_eq "GET checkpoint resolves layer id" "$(json_body "$checkpoint_resp" | jq -r '.layer_id')" "$layer_id"
 
 put_layer_entry "$layer_name" "$extra_file" "upsert" "file" "extra after checkpoint ${ts}"
+put_layer_entry "$layer_name" "$new_file" "chmod" "file" "" 384
 put_layer_entry "$layer_name" "${api_dir}/" "mkdir" "dir" "" 493
+put_layer_entry "$layer_name" "${api_dir}/" "chmod" "dir" "" 448
 put_layer_entry "$layer_name" "$api_dir_file" "upsert" "file" "nested after checkpoint ${ts}"
 put_layer_entry "$layer_name" "$delete_file" "whiteout" "file"
 put_layer_entry "$layer_name" "${empty_delete_dir}/" "whiteout" "dir"
 put_layer_entry "$layer_name" "$symlink_path" "symlink" "symlink" "base.txt" 41471
+put_layer_entry "$layer_name" "$rename_src" "upsert" "file" "rename source edited in layer ${ts}"
 put_layer_entry "$layer_name" "$rename_src" "rename" "file" "$rename_dst"
 put_layer_entry_expect_code "entry outside base root is rejected" "400" "$layer_name" "/outside-layer-${ts}/owned.txt" "upsert" "file" "owned"
 diff_after_extra=$(drive9_retry fs layer diff --json "$layer_id")
@@ -735,7 +738,7 @@ check_eq "non-empty directory whiteout preserves child" "$(drive9_retry fs cat "
 
 commit_out=$(drive9_retry fs layer commit "tag:$unique_tag")
 case "$commit_out" in
-  committed\ layer="$layer_id"\ applied=9) commit_status="ok" ;;
+  committed\ layer="$layer_id"\ applied=12) commit_status="ok" ;;
   *) commit_status="$commit_out" ;;
 esac
 check_eq "commit by tag key succeeds" "$commit_status" "ok"
@@ -749,7 +752,7 @@ check_eq "nested mkdir/upsert visible after commit" "$(drive9_retry fs cat "$api
 check_cmd_fail "whiteout file removed after commit" drive9 fs cat "$delete_file"
 check_cmd_fail "whiteout empty directory removed after commit" drive9 fs stat "$empty_delete_dir"
 check_cmd_fail "rename source removed after commit" drive9 fs cat "$rename_src"
-check_eq "rename target visible after commit" "$(drive9_retry fs cat "$rename_dst")" "$(cat "$rename_local")"
+check_eq "rename target uses layered upsert content after commit" "$(drive9_retry fs cat "$rename_dst")" "rename source edited in layer ${ts}"
 
 echo "[cli-layer] explicit --layer write/search/large-file coverage"
 cli_layer_json=$(drive9_retry fs layer create \

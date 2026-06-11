@@ -296,7 +296,7 @@ path_hash
 parent_path
 parent_path_hash
 name
-op = upsert | whiteout | mkdir | symlink | chmod
+op = upsert | whiteout | mkdir | symlink | chmod | rename
 kind = file | dir | symlink
 base_inode_id
 base_revision
@@ -314,18 +314,18 @@ created_at
 updated_at
 ```
 
-V1 存储边界：layer entry 内容当前以内联 `content_blob` 写入 metadata store，并受 server entry body limit 保护；`storage_ref` / 外置 blob layer content 是后续增强项，不作为 V1 性能或容量保证。
+V1 存储边界：小文件以内联 `content_blob` 写入 metadata store；超过 inline threshold 的 layer file content 使用 `storage_ref` 指向后端对象存储，并在 restore / commit 时流式读取，避免把大文件限制在 entry body 内。
 
 索引要求：
 
 ```text
-PRIMARY KEY (layer_id, path_hash)
+PRIMARY KEY (layer_id, path_hash, entry_seq)
 INDEX (layer_id, parent_path_hash)
 INDEX (layer_id, entry_seq)
 INDEX (layer_id, op)
 ```
 
-`path_hash` 用于保持 TiDB/MySQL 长路径索引性能；`path` 原文仍是权威值，lookup 时需要 hash + path 双重校验。
+`path_hash` 用于保持 TiDB/MySQL 长路径索引性能；`path` 原文仍是权威值，lookup 时需要 hash + path 双重校验。`entry_seq` 使同一路径多次修改保持 append-only log：用户 diff/search 使用 latest-per-path current-state 视图，commit/restore 使用 ordered replay log，避免 `upsert -> chmod`、`upsert -> rename`、`mkdir -> chmod` 这类序列被折叠后丢失数据。
 
 ### fs_layer_events
 
@@ -407,6 +407,7 @@ POST /v1/layers
 GET  /v1/layers
 GET  /v1/layers/{layer-ref}
 GET  /v1/layers/{layer-ref}/diff
+GET  /v1/layers/{layer-ref}/diff?replay=1
 GET  /v1/layers/{layer-ref}/entries?path=/...
 POST /v1/layers/{layer-ref}/entries
 POST /v1/layers/{layer-ref}/checkpoints
@@ -472,12 +473,12 @@ commit 流程：
 
 1. 执行 `checkpoint --wait`。
 2. seal layer。
-3. 计算 final diff。
+3. 读取 ordered replay log。
 4. 校验每个 base path 的 revision。
-5. 在 DB transaction 中应用到 base。
+5. 按 `entry_seq` 顺序应用到 base；失败时使用 commit 前 snapshot 对已应用 entry 做 best-effort rollback。
 6. enqueue semantic tasks。
 7. 旧 S3 refs 进入现有 GC。
-8. layer 标记 `committed`。
+8. 通过 CAS 将 layer 从 `committing` 标记为 `committed`。
 
 rollback 流程：
 
@@ -488,10 +489,11 @@ rollback 流程：
 
 冲突处理：
 
-- commit 前校验 `base_revision`。
+- commit 前校验 `base_revision` / `base_inode_id`，apply 前对 destructive / metadata-only op 做再次校验。
 - 如果 base revision 已变化，commit 返回 conflict list。
 - layer 保留为 `conflicted`，用户可审查、手动合并或 rollback。
-- 不能半提交。
+- `active|sealed -> committing -> committed|conflicted` 使用条件状态迁移；没有 commit owner/epoch 的 `committing` layer 不允许重入 commit 或 rollback，避免重复应用。
+- 当前实现是 preflight + ordered apply + best-effort rollback，不声明跨 DB/filesystem mutation 的单事务原子性；生产级别要继续引入 applied-entry ledger / commit owner lease 才能支持 crash-safe resumption。
 
 ## Search / Semantic
 
@@ -529,7 +531,7 @@ layer-aware search：
 - commit conflict 保留 layer，不半提交。
 - checkpoint 后新 sandbox restore 不丢 closed/fsynced 文件。
 - local-only 目录不进入 durable layer。
-- 大文件 layer write 在 V1 仍受 entry body limit 约束；外置 blob/S3 layer content 作为后续增强验证。
+- 大文件 layer write 通过 object-backed layer entries 验证，不受 JSON entry body limit 约束。
 - layer-aware search 不返回被 whiteout/replacement 隐藏的 base hit。
 
 性能测试：

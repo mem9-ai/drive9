@@ -593,6 +593,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 //     chmod stays owner-only)
 //   - /v1/uploads* + /v2/uploads/* (action-aware, mirrors actual upload
 //     dispatch table; see isScopedV{1,2}UploadRouteAllowed)
+//   - /v1/layers* + /v1/layer-checkpoints/* (route-aware, with per-layer
+//     base root and per-entry path authorization in fs_layer.go)
 //
 // chmod (POST /v1/fs/<path>?chmod=1) is explicitly NOT and never will be in
 // the scoped allowlist — chmod escalates ACLs and is owner-token-only.
@@ -664,8 +666,56 @@ func isScopedBusinessRequestAllowed(r *http.Request) bool {
 		return isScopedV2UploadRouteAllowed(r.Method, path)
 	}
 
+	if path == "/v1/layers" || strings.HasPrefix(path, "/v1/layers/") || strings.HasPrefix(path, "/v1/layer-checkpoints/") {
+		return isScopedFSLayerRouteAllowed(r.Method, path, r.URL.Query())
+	}
+
 	// SQL, fork, events, journals, vault, status, etc.: still default-deny.
 	return false
+}
+
+func isScopedFSLayerRouteAllowed(method, path string, query url.Values) bool {
+	if path == "/v1/layers" {
+		return (method == http.MethodGet || method == http.MethodPost) && len(query) == 0
+	}
+	if strings.HasPrefix(path, "/v1/layer-checkpoints/") {
+		return method == http.MethodGet && len(query) == 0
+	}
+	if !strings.HasPrefix(path, "/v1/layers/") {
+		return false
+	}
+	rest := strings.TrimPrefix(path, "/v1/layers/")
+	if rest == "" {
+		return false
+	}
+	parts := strings.Split(rest, "/")
+	switch len(parts) {
+	case 1:
+		return method == http.MethodGet && len(query) == 0
+	case 2:
+		switch parts[1] {
+		case "diff":
+			return method == http.MethodGet && queryKeysSubsetOf(query, []string{"max_seq", "replay", "mode"})
+		case "checkpoints", "rollback", "commit":
+			return method == http.MethodPost && len(query) == 0
+		case "entries":
+			if method == http.MethodGet {
+				return queryKeysSubsetOf(query, []string{"path", "max_seq"})
+			}
+			return (method == http.MethodPost || method == http.MethodPut) && len(query) == 0
+		case "objects":
+			if method == http.MethodGet {
+				return queryKeysSubsetOf(query, []string{"path", "max_seq"})
+			}
+			return (method == http.MethodPost || method == http.MethodPut) && queryKeysSubsetOf(query, []string{"path", "size", "base_revision", "mode"})
+		case "events":
+			return method == http.MethodGet && queryKeysSubsetOf(query, []string{"since"})
+		default:
+			return false
+		}
+	default:
+		return false
+	}
 }
 
 // isScopedV1UploadRouteAllowed mirrors handleUploads (server.go ~1872) and

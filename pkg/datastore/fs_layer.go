@@ -331,6 +331,53 @@ func (s *Store) SetFSLayerState(ctx context.Context, layerID string, state FSLay
 	return nil
 }
 
+func (s *Store) SetFSLayerStateIf(ctx context.Context, layerID string, from []FSLayerState, to FSLayerState) error {
+	layerID = strings.TrimSpace(layerID)
+	if layerID == "" {
+		return fmt.Errorf("fs layer id is required")
+	}
+	if len(from) == 0 {
+		return fmt.Errorf("fs layer source states are required")
+	}
+	if err := validateFSLayerState(to); err != nil {
+		return err
+	}
+	args := make([]any, 0, 2+len(from))
+	query := `UPDATE fs_layers SET state = ?, updated_at = UTC_TIMESTAMP(3)`
+	args = append(args, string(to))
+	if to == FSLayerStateSealed || to == FSLayerStateCommitting || to == FSLayerStateCommitted || to == FSLayerStateAbandoned || to == FSLayerStateConflicted {
+		query += `, sealed_at = COALESCE(sealed_at, UTC_TIMESTAMP(3))`
+	}
+	query += ` WHERE layer_id = ? AND state IN (`
+	args = append(args, layerID)
+	for i, state := range from {
+		if err := validateFSLayerState(state); err != nil {
+			return err
+		}
+		if i > 0 {
+			query += `, `
+		}
+		query += `?`
+		args = append(args, string(state))
+	}
+	query += `)`
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("set fs layer state %s: %w", layerID, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n > 0 {
+		return nil
+	}
+	if _, err := s.GetFSLayer(ctx, layerID); err != nil {
+		return err
+	}
+	return ErrFSLayerStateConflict
+}
+
 func (s *Store) BeginFSLayerCommit(ctx context.Context, layerID string) error {
 	layerID = strings.TrimSpace(layerID)
 	if layerID == "" {
@@ -339,8 +386,8 @@ func (s *Store) BeginFSLayerCommit(ctx context.Context, layerID string) error {
 	res, err := s.db.ExecContext(ctx, `
 UPDATE fs_layers
 SET state = ?, sealed_at = COALESCE(sealed_at, UTC_TIMESTAMP(3)), updated_at = UTC_TIMESTAMP(3)
-WHERE layer_id = ? AND state IN (?, ?, ?)`,
-		string(FSLayerStateCommitting), layerID, string(FSLayerStateActive), string(FSLayerStateSealed), string(FSLayerStateCommitting))
+WHERE layer_id = ? AND state IN (?, ?)`,
+		string(FSLayerStateCommitting), layerID, string(FSLayerStateActive), string(FSLayerStateSealed))
 	if err != nil {
 		return fmt.Errorf("begin fs layer commit %s: %w", layerID, err)
 	}
@@ -358,18 +405,80 @@ WHERE layer_id = ? AND state IN (?, ?, ?)`,
 }
 
 func (s *Store) RollbackFSLayer(ctx context.Context, layerID string) error {
-	layer, err := s.GetFSLayer(ctx, layerID)
-	if err != nil {
+	layerID = strings.TrimSpace(layerID)
+	if layerID == "" {
+		return fmt.Errorf("fs layer id is required")
+	}
+	err := s.SetFSLayerStateIf(ctx, layerID, []FSLayerState{
+		FSLayerStateActive,
+		FSLayerStateSealed,
+		FSLayerStateConflicted,
+	}, FSLayerStateAbandoned)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, ErrFSLayerStateConflict) {
 		return err
 	}
-	switch layer.State {
-	case FSLayerStateActive, FSLayerStateSealed, FSLayerStateConflicted:
-	case FSLayerStateAbandoned:
-		return nil
-	default:
-		return ErrFSLayerStateConflict
+	layer, getErr := s.GetFSLayer(ctx, layerID)
+	if getErr != nil {
+		return getErr
 	}
-	return s.SetFSLayerState(ctx, layerID, FSLayerStateAbandoned)
+	if layer.State == FSLayerStateAbandoned {
+		return nil
+	}
+	return ErrFSLayerStateConflict
+}
+
+func (s *Store) ListFSLayerEntryLog(ctx context.Context, layerID string) ([]FSLayerEntry, error) {
+	layerID = strings.TrimSpace(layerID)
+	if layerID == "" {
+		return nil, fmt.Errorf("fs layer id is required")
+	}
+	return s.listFSLayerEntryLog(ctx, layerID, nil)
+}
+
+func (s *Store) ListFSLayerEntryLogAtSeq(ctx context.Context, layerID string, maxSeq int64) ([]FSLayerEntry, error) {
+	if maxSeq < 0 {
+		return nil, fmt.Errorf("fs layer max seq must be non-negative")
+	}
+	layerID = strings.TrimSpace(layerID)
+	if layerID == "" {
+		return nil, fmt.Errorf("fs layer id is required")
+	}
+	return s.listFSLayerEntryLog(ctx, layerID, &maxSeq)
+}
+
+func (s *Store) listFSLayerEntryLog(ctx context.Context, layerID string, maxSeq *int64) ([]FSLayerEntry, error) {
+	where := "WHERE layer_id = ?"
+	args := []any{layerID}
+	if maxSeq != nil {
+		where += " AND entry_seq <= ?"
+		args = append(args, *maxSeq)
+	}
+	rows, err := s.db.QueryContext(ctx, `
+SELECT layer_id, path, path_hash, parent_path, parent_path_hash, name, op, kind, base_inode_id, base_revision,
+	storage_type, storage_ref, storage_ref_hash, storage_encryption_mode, storage_encryption_key_id,
+	content_blob, content_type, content_text, checksum_sha256, size_bytes, mode, entry_seq, created_at, updated_at
+FROM fs_layer_entries
+`+where+`
+ORDER BY entry_seq ASC, path ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list fs layer entry log: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var out []FSLayerEntry
+	for rows.Next() {
+		entry, err := scanFSLayerEntry(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan fs layer entry log: %w", err)
+		}
+		out = append(out, *entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list fs layer entry log: %w", err)
+	}
+	return out, nil
 }
 
 func (s *Store) UpsertFSLayerEntry(ctx context.Context, entry *FSLayerEntry) error {
@@ -871,10 +980,11 @@ func fsLayerPathWithinBaseRoot(p, baseRoot string) bool {
 	if baseRoot == "/" {
 		return strings.HasPrefix(p, "/")
 	}
+	baseRoot = strings.TrimRight(baseRoot, "/")
 	if p == baseRoot {
 		return true
 	}
-	return strings.HasPrefix(p, baseRoot)
+	return strings.HasPrefix(p, baseRoot+"/")
 }
 
 func validateFSLayerState(state FSLayerState) error {

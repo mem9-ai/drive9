@@ -628,9 +628,9 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 	var entries []client.FSLayerEntry
 	var err error
 	if hasCheckpoint {
-		entries, err = c.DiffFSLayerAtSeq(ctx, opts.LayerRef, maxSeq)
+		entries, err = c.ReplayFSLayerAtSeq(ctx, opts.LayerRef, maxSeq)
 	} else {
-		entries, err = c.DiffFSLayer(ctx, opts.LayerRef)
+		entries, err = c.ReplayFSLayer(ctx, opts.LayerRef)
 	}
 	if err != nil {
 		return err
@@ -675,14 +675,14 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 			}
 			continue
 		case "rename":
-			if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, hasCheckpoint, maxSeq); err != nil {
+			if err := restoreLayerRenameEntry(ctx, c, opts, shadows, pending, fs, localPath, &entry, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)); err != nil {
 				return err
 			}
 			continue
 		case "symlink":
 			fullEntry := &entry
 			if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
-				fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, hasCheckpoint, maxSeq)
+				fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq))
 				if err != nil {
 					return fmt.Errorf("restore fs layer symlink entry %s: %w", entry.Path, err)
 				}
@@ -706,17 +706,14 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		if _, ok := pending.GetMeta(localPath); ok {
 			continue
 		}
-		fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, hasCheckpoint, maxSeq)
+		entryMaxSeq := layerEntryFetchMaxSeq(&entry, hasCheckpoint, maxSeq)
+		fullEntry, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, entryMaxSeq)
 		if err != nil {
 			return fmt.Errorf("restore fs layer entry %s: %w", entry.Path, err)
 		}
 		var sizeBytes int64
 		if fullEntry.StorageRef != "" || fullEntry.StorageType == "s3" {
-			var maxSeqPtr *int64
-			if hasCheckpoint {
-				maxSeqPtr = &maxSeq
-			}
-			rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, maxSeqPtr)
+			rc, err := c.ReadFSLayerFileStream(ctx, opts.LayerRef, entry.Path, entryMaxSeq)
 			if err != nil {
 				return fmt.Errorf("restore fs layer object %s: %w", entry.Path, err)
 			}
@@ -746,20 +743,32 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 	return nil
 }
 
-func getLayerEntryForRestore(ctx context.Context, c *client.Client, layerID, path string, hasCheckpoint bool, maxSeq int64) (*client.FSLayerEntry, error) {
+func layerEntryFetchMaxSeq(entry *client.FSLayerEntry, hasCheckpoint bool, checkpointMaxSeq int64) *int64 {
+	if entry != nil && entry.EntrySeq > 0 {
+		seq := entry.EntrySeq
+		return &seq
+	}
 	if hasCheckpoint {
-		return c.GetFSLayerEntryAtSeq(ctx, layerID, path, maxSeq)
+		seq := checkpointMaxSeq
+		return &seq
+	}
+	return nil
+}
+
+func getLayerEntryForRestore(ctx context.Context, c *client.Client, layerID, path string, maxSeq *int64) (*client.FSLayerEntry, error) {
+	if maxSeq != nil {
+		return c.GetFSLayerEntryAtSeq(ctx, layerID, path, *maxSeq)
 	}
 	return c.GetFSLayerEntry(ctx, layerID, path)
 }
 
-func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry, hasCheckpoint bool, maxSeq int64) error {
+func restoreLayerRenameEntry(ctx context.Context, c *client.Client, opts *MountOptions, shadows *ShadowStore, pending *PendingIndex, fs *Dat9FS, oldLocalPath string, entry *client.FSLayerEntry, maxSeq *int64) error {
 	if entry == nil {
 		return nil
 	}
 	fullEntry := entry
 	if strings.TrimSpace(fullEntry.ContentText) == "" && len(fullEntry.Content) == 0 {
-		fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, hasCheckpoint, maxSeq)
+		fetched, err := getLayerEntryForRestore(ctx, c, opts.LayerRef, entry.Path, maxSeq)
 		if err != nil {
 			return fmt.Errorf("restore fs layer rename entry %s: %w", entry.Path, err)
 		}

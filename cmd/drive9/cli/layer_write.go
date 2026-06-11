@@ -115,10 +115,18 @@ func whiteoutLayerPath(ctx context.Context, c *client.Client, layerRef, remotePa
 }
 
 func chmodLayerPath(ctx context.Context, c *client.Client, layerRef, remotePath string, mode uint32) error {
+	kind := "file"
+	if stat, err := c.StatCtx(ctx, remotePath); err == nil && stat.IsDir {
+		kind = "dir"
+	} else if err != nil && !client.IsNotFound(err) {
+		return err
+	} else if strings.HasSuffix(remotePath, "/") {
+		kind = "dir"
+	}
 	_, err := c.UpsertFSLayerEntry(ctx, layerRef, client.FSLayerEntryRequest{
 		Path: remotePath,
 		Op:   "chmod",
-		Kind: "file",
+		Kind: kind,
 		Mode: mode & 0o777,
 	})
 	return err

@@ -196,13 +196,39 @@ func (c *Client) DiffFSLayerAtSeq(ctx context.Context, layerID string, maxSeq in
 	return c.diffFSLayer(ctx, layerID, &maxSeq)
 }
 
+func (c *Client) ReplayFSLayer(ctx context.Context, layerID string) ([]FSLayerEntry, error) {
+	return c.replayFSLayer(ctx, layerID, nil)
+}
+
+func (c *Client) ReplayFSLayerAtSeq(ctx context.Context, layerID string, maxSeq int64) ([]FSLayerEntry, error) {
+	if maxSeq < 0 {
+		return nil, fmt.Errorf("maxSeq must be non-negative")
+	}
+	return c.replayFSLayer(ctx, layerID, &maxSeq)
+}
+
 func (c *Client) diffFSLayer(ctx context.Context, layerID string, maxSeq *int64) ([]FSLayerEntry, error) {
+	return c.fetchFSLayerDiff(ctx, layerID, maxSeq, false)
+}
+
+func (c *Client) replayFSLayer(ctx context.Context, layerID string, maxSeq *int64) ([]FSLayerEntry, error) {
+	return c.fetchFSLayerDiff(ctx, layerID, maxSeq, true)
+}
+
+func (c *Client) fetchFSLayerDiff(ctx context.Context, layerID string, maxSeq *int64, replay bool) ([]FSLayerEntry, error) {
 	if strings.TrimSpace(layerID) == "" {
 		return nil, fmt.Errorf("layerID must not be empty")
 	}
 	u := c.baseURL + "/v1/layers/" + url.PathEscape(layerID) + "/diff"
+	query := url.Values{}
 	if maxSeq != nil {
-		u += "?max_seq=" + url.QueryEscape(fmt.Sprintf("%d", *maxSeq))
+		query.Set("max_seq", fmt.Sprintf("%d", *maxSeq))
+	}
+	if replay {
+		query.Set("replay", "1")
+	}
+	if len(query) > 0 {
+		u += "?" + query.Encode()
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {

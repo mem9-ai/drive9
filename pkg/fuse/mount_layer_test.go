@@ -31,6 +31,11 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
+			if r.URL.Query().Get("replay") != "1" {
+				t.Errorf("diff replay = %q, want 1", r.URL.Query().Get("replay"))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"entries": []client.FSLayerEntry{
 					{LayerID: "layer-1", Path: "/repo/a.txt", Op: "upsert", Kind: "file", BaseRevision: 0, SizeBytes: 1, EntrySeq: 1},
@@ -46,6 +51,11 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
 			if r.URL.Query().Get("path") != "/repo/a.txt" {
 				t.Errorf("unexpected entry path query: %q", r.URL.RawQuery)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if r.URL.Query().Get("max_seq") != "1" {
+				t.Errorf("entry max_seq = %q, want 1", r.URL.Query().Get("max_seq"))
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
@@ -154,6 +164,11 @@ func TestRestoreLayerEntriesStreamsObjectBackedFile(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+			if r.URL.Query().Get("replay") != "1" {
+				t.Errorf("diff replay = %q, want 1", r.URL.Query().Get("replay"))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"entries": []client.FSLayerEntry{entry}})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/entries":
 			if r.URL.Query().Get("path") != "/repo/large.bin" {
@@ -161,10 +176,20 @@ func TestRestoreLayerEntriesStreamsObjectBackedFile(t *testing.T) {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
+			if r.URL.Query().Get("max_seq") != "1" {
+				t.Errorf("entry max_seq = %q, want 1", r.URL.Query().Get("max_seq"))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(entry)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/objects":
 			if r.URL.Query().Get("path") != "/repo/large.bin" {
 				t.Errorf("unexpected object query: %q", r.URL.RawQuery)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if r.URL.Query().Get("max_seq") != "1" {
+				t.Errorf("object max_seq = %q, want 1", r.URL.Query().Get("max_seq"))
 				w.WriteHeader(http.StatusInternalServerError)
 				return
 			}
@@ -213,6 +238,11 @@ func TestRestoreLayerChmodOnlyFileRecordsModeOverlay(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/layer-1/diff":
+			if r.URL.Query().Get("replay") != "1" {
+				t.Errorf("diff replay = %q, want 1", r.URL.Query().Get("replay"))
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"entries": []client.FSLayerEntry{
 					{LayerID: "layer-1", Path: "/repo/base.txt", Op: "chmod", Kind: "file", Mode: 0o600, EntrySeq: 1},

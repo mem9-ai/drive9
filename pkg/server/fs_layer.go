@@ -174,6 +174,14 @@ func (s *Server) handleFSLayerCheckpointObject(w http.ResponseWriter, r *http.Re
 		writeFSLayerStoreError(w, err)
 		return
 	}
+	layer, err := store.GetFSLayer(r.Context(), checkpoint.LayerID)
+	if err != nil {
+		writeFSLayerStoreError(w, err)
+		return
+	}
+	if !authorizeFS(w, r, FSOpRead, layer.BaseRootPath) {
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(toFSLayerCheckpointResponse(checkpoint))
 }
@@ -193,9 +201,17 @@ func (s *Server) handleFSLayerCreate(w http.ResponseWriter, r *http.Request, sto
 	if actorID == "" {
 		actorID = strings.TrimSpace(r.Header.Get("X-Dat9-Actor"))
 	}
+	baseRoot, err := pathutil.CanonicalizeDir(req.BaseRootPath)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("invalid fs layer base root: %v", err))
+		return
+	}
+	if !authorizeFS(w, r, FSOpWrite, baseRoot) {
+		return
+	}
 	layer := datastore.FSLayer{
 		LayerID:        layerID,
-		BaseRootPath:   req.BaseRootPath,
+		BaseRootPath:   baseRoot,
 		Name:           req.Name,
 		Tags:           req.Tags,
 		DurabilityMode: datastore.FSLayerDurabilityMode(strings.TrimSpace(req.DurabilityMode)),
@@ -221,11 +237,48 @@ func (s *Server) handleFSLayerList(w http.ResponseWriter, r *http.Request, store
 		return
 	}
 	out := make([]fsLayerResponse, 0, len(layers))
+	scope := ScopeFromContext(r.Context())
+	if scope == nil {
+		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
+		return
+	}
 	for i := range layers {
+		if !fsLayerVisibleToScope(scope, &layers[i]) {
+			continue
+		}
 		out = append(out, toFSLayerResponse(&layers[i]))
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"layers": out})
+}
+
+func fsLayerVisibleToScope(scope *TenantScope, layer *datastore.FSLayer) bool {
+	if scope == nil || layer == nil {
+		return false
+	}
+	if !scope.IsScoped {
+		return true
+	}
+	return scope.AuthorizeFS(FSOpRead, layer.BaseRootPath) == nil || scope.AuthorizeFS(FSOpWrite, layer.BaseRootPath) == nil
+}
+
+func authorizeFSLayerEntryMutation(w http.ResponseWriter, r *http.Request, entry *datastore.FSLayerEntry) bool {
+	if entry == nil {
+		errJSON(w, http.StatusBadRequest, "fs layer entry is required")
+		return false
+	}
+	switch entry.Op {
+	case datastore.FSLayerEntryOpWhiteout:
+		return authorizeFS(w, r, FSOpDelete, entry.Path)
+	case datastore.FSLayerEntryOpRename:
+		target := strings.TrimSpace(entry.ContentText)
+		if target == "" && len(entry.ContentBlob) > 0 {
+			target = strings.TrimSpace(string(entry.ContentBlob))
+		}
+		return authorizeFSPair(w, r, FSOpDelete, entry.Path, FSOpWrite, target)
+	default:
+		return authorizeFS(w, r, FSOpWrite, entry.Path)
+	}
 }
 
 func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *backendpkg.Dat9Backend, store *datastore.Store) {
@@ -252,11 +305,17 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		if !authorizeFS(w, r, FSOpRead, layer.BaseRootPath) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(toFSLayerResponse(layer))
 	case sub == "diff":
 		if r.Method != http.MethodGet {
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !authorizeFS(w, r, FSOpRead, layer.BaseRootPath) {
 			return
 		}
 		maxSeq, hasMaxSeq, err := fsLayerMaxSeqFromRequest(r)
@@ -265,7 +324,12 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 			return
 		}
 		var entries []datastore.FSLayerEntry
-		if hasMaxSeq {
+		replayLog := fsLayerReplayLogFromRequest(r)
+		if replayLog && hasMaxSeq {
+			entries, err = store.ListFSLayerEntryLogAtSeq(r.Context(), layerID, maxSeq)
+		} else if replayLog {
+			entries, err = store.ListFSLayerEntryLog(r.Context(), layerID)
+		} else if hasMaxSeq {
 			entries, err = store.ListFSLayerEntriesAtSeq(r.Context(), layerID, maxSeq)
 		} else {
 			entries, err = store.ListFSLayerEntries(r.Context(), layerID)
@@ -285,10 +349,16 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		if !authorizeFS(w, r, FSOpWrite, layer.BaseRootPath) {
+			return
+		}
 		s.handleFSLayerCheckpoint(w, r, store, layerID)
 	case sub == "entries":
 		switch r.Method {
 		case http.MethodPost, http.MethodPut:
+			if !authorizeFS(w, r, FSOpWrite, layer.BaseRootPath) {
+				return
+			}
 			s.handleFSLayerEntryUpsert(w, r, b, store, layer)
 		case http.MethodGet:
 			s.handleFSLayerEntryGet(w, r, store, layer)
@@ -304,16 +374,25 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		if !authorizeFS(w, r, FSOpWrite, layer.BaseRootPath) {
+			return
+		}
 		s.handleFSLayerObjectUpload(w, r, b, store, layer)
 	case sub == "events":
 		if r.Method != http.MethodGet {
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 			return
 		}
+		if !authorizeFS(w, r, FSOpRead, layer.BaseRootPath) {
+			return
+		}
 		s.handleFSLayerEvents(w, r, store, layer)
 	case sub == "rollback":
 		if r.Method != http.MethodPost {
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !authorizeFS(w, r, FSOpWrite, layer.BaseRootPath) {
 			return
 		}
 		if err := store.RollbackFSLayer(r.Context(), layerID); err != nil {
@@ -325,6 +404,9 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 	case sub == "commit":
 		if r.Method != http.MethodPost {
 			errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		if !authorizeFS(w, r, FSOpWrite, layer.BaseRootPath) {
 			return
 		}
 		s.handleFSLayerCommit(w, r, b, store, layer)
@@ -339,15 +421,26 @@ func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request,
 		errJSON(w, http.StatusBadRequest, "path is required")
 		return
 	}
+	path, err := canonicalFSLayerServerPath(rawPath, "", string(datastore.FSLayerEntryKindFile))
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, fmt.Sprintf("invalid fs layer object path: %v", err))
+		return
+	}
+	if !fsLayerPathWithinBase(path, layer.BaseRootPath) {
+		errJSON(w, http.StatusBadRequest, "fs layer object path is outside base root")
+		return
+	}
+	if !authorizeFS(w, r, FSOpRead, path) {
+		return
+	}
 	maxSeq := parseFSLayerInt64Query(r, "max_seq")
 	var (
 		entry *datastore.FSLayerEntry
-		err   error
 	)
 	if maxSeq > 0 {
-		entry, err = store.GetFSLayerEntryAtSeq(r.Context(), layer.LayerID, rawPath, maxSeq)
+		entry, err = store.GetFSLayerEntryAtSeq(r.Context(), layer.LayerID, path, maxSeq)
 	} else {
-		entry, err = store.GetFSLayerEntry(r.Context(), layer.LayerID, rawPath)
+		entry, err = store.GetFSLayerEntry(r.Context(), layer.LayerID, path)
 	}
 	if err != nil {
 		writeFSLayerStoreError(w, err)
@@ -400,25 +493,40 @@ func (s *Server) handleFSLayerObjectUpload(w http.ResponseWriter, r *http.Reques
 		errJSON(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload too large: max %d bytes", s.maxUploadBytes))
 		return
 	}
+	prepared := datastore.FSLayerEntry{
+		LayerID:      layer.LayerID,
+		Path:         rawPath,
+		Op:           datastore.FSLayerEntryOpUpsert,
+		Kind:         datastore.FSLayerEntryKindFile,
+		BaseRevision: parseFSLayerInt64Query(r, "base_revision"),
+	}
+	if mode, ok := parseFSLayerModeQuery(r, "mode"); ok {
+		prepared.Mode = mode
+	}
+	if prepared.Mode == 0 {
+		prepared.Mode = 0o644
+	}
+	if err := normalizeAndValidateFSLayerServerEntry(layer, &prepared); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !authorizeFSLayerEntryMutation(w, r, &prepared) {
+		return
+	}
+	fillFSLayerBaseSnapshot(r.Context(), b, &prepared)
 	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
-	entry, err := b.PutFSLayerObject(r.Context(), layer.LayerID, rawPath, body, size)
+	entry, err := b.PutFSLayerObject(r.Context(), layer.LayerID, prepared.Path, body, size)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	entry.LayerID = layer.LayerID
-	entry.BaseRevision = parseFSLayerInt64Query(r, "base_revision")
-	if mode, ok := parseFSLayerModeQuery(r, "mode"); ok {
-		entry.Mode = mode
-	}
-	if entry.Mode == 0 {
-		entry.Mode = 0o644
-	}
-	fillFSLayerBaseSnapshot(r.Context(), b, entry)
-	if err := normalizeAndValidateFSLayerServerEntry(layer, entry); err != nil {
-		errJSON(w, http.StatusBadRequest, err.Error())
-		return
-	}
+	entry.Path = prepared.Path
+	entry.Op = prepared.Op
+	entry.Kind = prepared.Kind
+	entry.Mode = prepared.Mode
+	entry.BaseRevision = prepared.BaseRevision
+	entry.BaseInodeID = prepared.BaseInodeID
 	if err := store.UpsertFSLayerEntry(r.Context(), entry); err != nil {
 		writeFSLayerStoreError(w, err)
 		return
@@ -475,6 +583,9 @@ func (s *Server) handleFSLayerEntryUpsert(w http.ResponseWriter, r *http.Request
 	}
 	if err := normalizeAndValidateFSLayerServerEntry(layer, &entry); err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !authorizeFSLayerEntryMutation(w, r, &entry) {
 		return
 	}
 	if len(entry.ContentBlob) > 0 {
@@ -545,6 +656,9 @@ func (s *Server) handleFSLayerEntryGet(w http.ResponseWriter, r *http.Request, s
 		errJSON(w, http.StatusBadRequest, "fs layer entry path is outside base root")
 		return
 	}
+	if !authorizeFS(w, r, FSOpRead, path) {
+		return
+	}
 	maxSeq, hasMaxSeq, err := fsLayerMaxSeqFromRequest(r)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
@@ -573,8 +687,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		})
 		return
 	}
-	recoveringCommit := layer.State == datastore.FSLayerStateCommitting
-	if layer.State != datastore.FSLayerStateActive && layer.State != datastore.FSLayerStateSealed && !recoveringCommit {
+	if layer.State != datastore.FSLayerStateActive && layer.State != datastore.FSLayerStateSealed {
 		errJSON(w, http.StatusConflict, "fs layer is not active or sealed")
 		return
 	}
@@ -582,14 +695,14 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		writeFSLayerStoreError(w, err)
 		return
 	}
-	entries, err := store.ListFSLayerEntries(r.Context(), layer.LayerID)
+	entries, err := store.ListFSLayerEntryLog(r.Context(), layer.LayerID)
 	if err != nil {
-		_ = store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateConflicted)
+		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		writeFSLayerStoreError(w, err)
 		return
 	}
 	if conflicts := validateFSLayerCommitScope(layer, entries); len(conflicts) > 0 {
-		_ = store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateConflicted)
+		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(fsLayerCommitResponse{
@@ -599,9 +712,9 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		})
 		return
 	}
-	conflicts := preflightFSLayerCommit(r.Context(), b, entries, recoveringCommit)
+	conflicts := preflightFSLayerCommit(r.Context(), b, entries, false)
 	if len(conflicts) > 0 {
-		_ = store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateConflicted)
+		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusConflict)
 		_ = json.NewEncoder(w).Encode(fsLayerCommitResponse{
@@ -613,16 +726,17 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	}
 	snapshots := snapshotFSLayerCommit(r.Context(), b, entries)
 	if err := validateFSLayerCommitSnapshots(snapshots); err != nil {
-		_ = store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateConflicted)
+		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(r.Context()), fsLayerRollbackTimeout)
 	defer rollbackCancel()
+	touchedPaths := make(map[string]struct{})
 	for i := range entries {
-		if err := applyFSLayerEntry(r.Context(), b, &entries[i], recoveringCommit); err != nil {
-			rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, snapshots)
-			_ = store.SetFSLayerState(rollbackCtx, layer.LayerID, datastore.FSLayerStateConflicted)
+		if err := applyFSLayerEntry(r.Context(), b, &entries[i], false, touchedPaths); err != nil {
+			rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, filterFSLayerSnapshotsForEntries(snapshots, entries[:i]))
+			_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 			if rollbackErr != nil {
 				errJSON(w, http.StatusInternalServerError, fmt.Sprintf("apply fs layer entry %s: %v; rollback failed: %v", entries[i].Path, err, rollbackErr))
 				return
@@ -630,10 +744,11 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 			errJSON(w, http.StatusInternalServerError, fmt.Sprintf("apply fs layer entry %s: %v", entries[i].Path, err))
 			return
 		}
+		markFSLayerEntryTouched(touchedPaths, &entries[i])
 	}
-	if err := store.SetFSLayerState(r.Context(), layer.LayerID, datastore.FSLayerStateCommitted); err != nil {
+	if err := store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateCommitted); err != nil {
 		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, snapshots)
-		_ = store.SetFSLayerState(rollbackCtx, layer.LayerID, datastore.FSLayerStateConflicted)
+		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		if rollbackErr != nil {
 			errJSON(w, http.StatusInternalServerError, fmt.Sprintf("finalize fs layer commit %s: %v; rollback failed: %v", layer.LayerID, err, rollbackErr))
 			return
@@ -690,6 +805,15 @@ func fsLayerMaxSeqFromRequest(r *http.Request) (int64, bool, error) {
 	return seq, true, nil
 }
 
+func fsLayerReplayLogFromRequest(r *http.Request) bool {
+	raw := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("replay")))
+	if raw == "1" || raw == "true" || raw == "yes" {
+		return true
+	}
+	mode := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("mode")))
+	return mode == "log" || mode == "replay"
+}
+
 func normalizeAndValidateFSLayerServerEntry(layer *datastore.FSLayer, entry *datastore.FSLayerEntry) error {
 	if layer == nil || entry == nil {
 		return fmt.Errorf("fs layer entry is required")
@@ -734,10 +858,11 @@ func fsLayerPathWithinBase(path, baseRoot string) bool {
 	if baseRoot == "/" {
 		return strings.HasPrefix(path, "/")
 	}
+	baseRoot = strings.TrimRight(baseRoot, "/")
 	if path == baseRoot {
 		return true
 	}
-	return strings.HasPrefix(path, baseRoot)
+	return strings.HasPrefix(path, baseRoot+"/")
 }
 
 func validateFSLayerCommitScope(layer *datastore.FSLayer, entries []datastore.FSLayerEntry) []fsLayerCommitConflict {
@@ -848,6 +973,69 @@ func snapshotFSLayerCommit(ctx context.Context, b *backendpkg.Dat9Backend, entri
 	return out
 }
 
+func filterFSLayerSnapshotsForEntries(snapshots []fsLayerBaseSnapshot, entries []datastore.FSLayerEntry) []fsLayerBaseSnapshot {
+	if len(snapshots) == 0 || len(entries) == 0 {
+		return nil
+	}
+	needed := make(map[string]struct{})
+	addPath := func(p string) {
+		if p != "" {
+			needed[p] = struct{}{}
+		}
+	}
+	addParentCleanupPaths := func(p string) {
+		for parent := pathutil.ParentPath(p); parent != "/" && parent != ""; parent = pathutil.ParentPath(parent) {
+			addPath(parent)
+		}
+	}
+	addDirTreePaths := func(dir string) {
+		for i := range snapshots {
+			if snapshots[i].Path == "" || snapshots[i].Path == dir {
+				continue
+			}
+			if fsLayerPathDescendsFrom(snapshots[i].Path, dir) {
+				addPath(snapshots[i].Path)
+			}
+		}
+	}
+	for i := range entries {
+		entry := &entries[i]
+		addParentCleanupPaths(entry.Path)
+		addPath(entry.Path)
+		if entry.Op != datastore.FSLayerEntryOpRename {
+			continue
+		}
+		if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
+			addDirTreePaths(entry.Path)
+		}
+		target := strings.TrimSpace(entry.ContentText)
+		if target == "" && len(entry.ContentBlob) > 0 {
+			target = strings.TrimSpace(string(entry.ContentBlob))
+		}
+		if targetPath, err := canonicalFSLayerServerPath(target, "", string(entry.Kind)); err == nil {
+			addParentCleanupPaths(targetPath)
+			addPath(targetPath)
+		}
+	}
+	out := make([]fsLayerBaseSnapshot, 0, len(snapshots))
+	for i := range snapshots {
+		if _, ok := needed[snapshots[i].Path]; ok {
+			out = append(out, snapshots[i])
+		}
+	}
+	return out
+}
+
+func fsLayerPathDescendsFrom(path, dir string) bool {
+	if dir == "" || dir == "/" {
+		return strings.HasPrefix(path, "/")
+	}
+	if !strings.HasSuffix(dir, "/") {
+		dir += "/"
+	}
+	return strings.HasPrefix(path, dir)
+}
+
 func validateFSLayerCommitSnapshots(snapshots []fsLayerBaseSnapshot) error {
 	for i := range snapshots {
 		if !snapshots[i].SnapshotOK {
@@ -915,18 +1103,29 @@ func restoreFSLayerBaseSnapshot(ctx context.Context, b *backendpkg.Dat9Backend, 
 		}
 		return removeFSLayerBasePathIfExists(ctx, b, snap.Path)
 	}
-	if err := removeFSLayerBasePathIfExists(ctx, b, snap.Path); err != nil {
-		return err
-	}
-	if !snap.Exists {
-		return nil
-	}
 	if snap.IsDir {
+		if nf, err := b.StatNodeCtx(ctx, snap.Path); err == nil && nf.Node.IsDirectory {
+			if snap.ModeIsSet {
+				return b.ChmodCtx(ctx, snap.Path, snap.Mode&0o777)
+			}
+			return nil
+		} else if err != nil && !errors.Is(err, datastore.ErrNotFound) {
+			return err
+		}
+		if err := removeFSLayerBasePathIfExists(ctx, b, snap.Path); err != nil {
+			return err
+		}
 		mode := snap.Mode & 0o777
 		if mode == 0 {
 			mode = 0o755
 		}
 		return b.MkdirCtx(ctx, snap.Path, mode)
+	}
+	if err := removeFSLayerBasePathIfExists(ctx, b, snap.Path); err != nil {
+		return err
+	}
+	if !snap.Exists {
+		return nil
 	}
 	if snap.IsSymlink {
 		if err := b.CreateSymlinkCtx(ctx, snap.Path, snap.Target); err != nil {
@@ -954,7 +1153,7 @@ func removeFSLayerBasePathIfExists(ctx context.Context, b *backendpkg.Dat9Backen
 		return err
 	}
 	if nf.Node.IsDirectory {
-		return b.RemoveAllCtx(ctx, path)
+		return b.RemoveDirCtx(ctx, path)
 	}
 	return b.RemoveCtx(ctx, path)
 }
@@ -1220,7 +1419,63 @@ func preflightFSLayerRename(ctx context.Context, b *backendpkg.Dat9Backend, entr
 	return conflicts
 }
 
-func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, recoveringCommit bool) error {
+func ensureFSLayerEntryBaseStillMatches(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, touched map[string]struct{}) error {
+	if entry == nil || b == nil {
+		return nil
+	}
+	switch entry.Op {
+	case datastore.FSLayerEntryOpWhiteout, datastore.FSLayerEntryOpChmod, datastore.FSLayerEntryOpRename:
+	default:
+		return nil
+	}
+	if _, ok := touched[entry.Path]; ok {
+		return nil
+	}
+	if entry.BaseRevision == 0 && entry.BaseInodeID == "" {
+		return nil
+	}
+	nf, err := b.StatNodeCtx(ctx, entry.Path)
+	if errors.Is(err, datastore.ErrNotFound) {
+		return fmt.Errorf("base path missing")
+	}
+	if err != nil {
+		return err
+	}
+	if entry.BaseInodeID != "" {
+		got := nf.Node.InodeID
+		if nf.File != nil && nf.File.FileID != "" {
+			got = nf.File.FileID
+		}
+		if got != entry.BaseInodeID {
+			return fmt.Errorf("base inode changed")
+		}
+	}
+	if entry.BaseRevision > 0 && nf.File != nil && nf.File.Revision != entry.BaseRevision {
+		return fmt.Errorf("base revision changed")
+	}
+	return nil
+}
+
+func markFSLayerEntryTouched(touched map[string]struct{}, entry *datastore.FSLayerEntry) {
+	if touched == nil || entry == nil {
+		return
+	}
+	if entry.Path != "" {
+		touched[entry.Path] = struct{}{}
+	}
+	if entry.Op != datastore.FSLayerEntryOpRename {
+		return
+	}
+	target := strings.TrimSpace(entry.ContentText)
+	if target == "" && len(entry.ContentBlob) > 0 {
+		target = strings.TrimSpace(string(entry.ContentBlob))
+	}
+	if target != "" {
+		touched[target] = struct{}{}
+	}
+}
+
+func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *datastore.FSLayerEntry, recoveringCommit bool, touched map[string]struct{}) error {
 	if recoveringCommit {
 		applied, err := fsLayerEntryAlreadyApplied(ctx, b, entry)
 		if err != nil {
@@ -1229,6 +1484,9 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 		if applied {
 			return nil
 		}
+	}
+	if err := ensureFSLayerEntryBaseStillMatches(ctx, b, entry, touched); err != nil {
+		return err
 	}
 	switch entry.Op {
 	case datastore.FSLayerEntryOpUpsert:
@@ -1264,7 +1522,17 @@ func applyFSLayerEntry(ctx context.Context, b *backendpkg.Dat9Backend, entry *da
 	case datastore.FSLayerEntryOpWhiteout:
 		var err error
 		if entry.Kind == datastore.FSLayerEntryKindDir || strings.HasSuffix(entry.Path, "/") {
-			err = b.RemoveAllCtx(ctx, entry.Path)
+			children, readErr := b.ReadDirCtx(ctx, entry.Path)
+			if errors.Is(readErr, datastore.ErrNotFound) {
+				return nil
+			}
+			if readErr != nil {
+				return readErr
+			}
+			if len(children) > 0 {
+				return fmt.Errorf("directory whiteout requires empty directory")
+			}
+			err = b.RemoveDirCtx(ctx, entry.Path)
 		} else {
 			err = b.RemoveCtx(ctx, entry.Path)
 		}

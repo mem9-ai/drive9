@@ -190,7 +190,170 @@ func TestFSLayerObjectUploadReadAndCommitLargeFile(t *testing.T) {
 	}
 }
 
-func TestFSLayerCommitRetrySkipsAlreadyAppliedEntries(t *testing.T) {
+func TestFSLayerCommitReplaysUpsertBeforeChmod(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-upsert-chmod",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-upsert-chmod", client.FSLayerEntryRequest{
+		Path:    "/repo/chmod.txt",
+		Op:      "upsert",
+		Kind:    "file",
+		Content: []byte("layered chmod"),
+		Mode:    0o644,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry upsert: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-upsert-chmod", client.FSLayerEntryRequest{
+		Path: "/repo/chmod.txt",
+		Op:   "chmod",
+		Kind: "file",
+		Mode: 0o600,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry chmod: %v", err)
+	}
+	current, err := c.DiffFSLayer(ctx, "layer-upsert-chmod")
+	if err != nil {
+		t.Fatalf("DiffFSLayer: %v", err)
+	}
+	if len(current) != 1 || current[0].Op != "chmod" {
+		t.Fatalf("current diff = %+v, want latest chmod entry", current)
+	}
+	replay, err := c.ReplayFSLayer(ctx, "layer-upsert-chmod")
+	if err != nil {
+		t.Fatalf("ReplayFSLayer: %v", err)
+	}
+	if len(replay) != 2 || replay[0].Op != "upsert" || replay[1].Op != "chmod" {
+		t.Fatalf("replay = %+v, want upsert then chmod", replay)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-upsert-chmod")
+	if err != nil {
+		t.Fatalf("CommitFSLayer: %v", err)
+	}
+	if commit.Status != "committed" || commit.Applied != 2 {
+		t.Fatalf("commit = %+v, want committed applied=2", commit)
+	}
+	data, err := s.fallback.ReadCtx(ctx, "/repo/chmod.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("ReadCtx: %v", err)
+	}
+	if !bytes.Equal(data, []byte("layered chmod")) {
+		t.Fatalf("data = %q, want layered chmod", data)
+	}
+	nf, err := s.fallback.StatNodeCtx(ctx, "/repo/chmod.txt")
+	if err != nil {
+		t.Fatalf("StatNodeCtx: %v", err)
+	}
+	if nf.File == nil || nf.File.Mode&0o777 != 0o600 {
+		t.Fatalf("mode = %+v, want 0600", nf.File)
+	}
+}
+
+func TestFSLayerCommitReplaysUpsertBeforeRename(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	if _, _, err := s.fallback.WriteCtxIfRevisionWithTagsResult(ctx, "/repo/move.txt", []byte("base"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, -1, nil, ""); err != nil {
+		t.Fatalf("write base: %v", err)
+	}
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-upsert-rename",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-upsert-rename", client.FSLayerEntryRequest{
+		Path:    "/repo/move.txt",
+		Op:      "upsert",
+		Kind:    "file",
+		Content: []byte("layered move"),
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry upsert: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-upsert-rename", client.FSLayerEntryRequest{
+		Path:        "/repo/move.txt",
+		Op:          "rename",
+		Kind:        "file",
+		ContentText: "/repo/moved.txt",
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry rename: %v", err)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-upsert-rename")
+	if err != nil {
+		t.Fatalf("CommitFSLayer: %v", err)
+	}
+	if commit.Status != "committed" || commit.Applied != 2 {
+		t.Fatalf("commit = %+v, want committed applied=2", commit)
+	}
+	if _, err := s.fallback.StatNodeCtx(ctx, "/repo/move.txt"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("source stat err=%v, want ErrNotFound", err)
+	}
+	data, err := s.fallback.ReadCtx(ctx, "/repo/moved.txt", 0, -1)
+	if err != nil {
+		t.Fatalf("ReadCtx moved: %v", err)
+	}
+	if !bytes.Equal(data, []byte("layered move")) {
+		t.Fatalf("moved data = %q, want layered move", data)
+	}
+}
+
+func TestFSLayerCommitReplaysMkdirBeforeChmod(t *testing.T) {
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	ctx := context.Background()
+	c := client.New(ts.URL, "")
+	if _, err := c.CreateFSLayer(ctx, client.FSLayerCreateRequest{
+		LayerID:      "layer-mkdir-chmod",
+		BaseRootPath: "/repo",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-mkdir-chmod", client.FSLayerEntryRequest{
+		Path: "/repo/mode-dir/",
+		Op:   "mkdir",
+		Kind: "dir",
+		Mode: 0o755,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry mkdir: %v", err)
+	}
+	if _, err := c.UpsertFSLayerEntry(ctx, "layer-mkdir-chmod", client.FSLayerEntryRequest{
+		Path: "/repo/mode-dir/",
+		Op:   "chmod",
+		Kind: "dir",
+		Mode: 0o700,
+	}); err != nil {
+		t.Fatalf("UpsertFSLayerEntry chmod: %v", err)
+	}
+	commit, err := c.CommitFSLayer(ctx, "layer-mkdir-chmod")
+	if err != nil {
+		t.Fatalf("CommitFSLayer: %v", err)
+	}
+	if commit.Status != "committed" || commit.Applied != 2 {
+		t.Fatalf("commit = %+v, want committed applied=2", commit)
+	}
+	nf, err := s.fallback.StatNodeCtx(ctx, "/repo/mode-dir/")
+	if err != nil {
+		t.Fatalf("StatNodeCtx mode-dir: %v", err)
+	}
+	if !nf.Node.IsDirectory {
+		t.Fatalf("dir node = %+v, want directory", nf.Node)
+	}
+}
+
+func TestFSLayerCommitRejectsCommittingWithoutFence(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
 	defer ts.Close()
@@ -203,28 +366,19 @@ func TestFSLayerCommitRetrySkipsAlreadyAppliedEntries(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("CreateFSLayer: %v", err)
 	}
-	content := []byte("already applied")
 	if _, err := c.UpsertFSLayerEntry(ctx, "layer-retry", client.FSLayerEntryRequest{
-		Path:      "/repo/retry.txt",
-		Op:        "upsert",
-		Kind:      "file",
-		Content:   content,
-		SizeBytes: int64(len(content)),
+		Path:    "/repo/retry.txt",
+		Op:      "upsert",
+		Kind:    "file",
+		Content: []byte("pending"),
 	}); err != nil {
 		t.Fatalf("UpsertFSLayerEntry: %v", err)
-	}
-	if _, _, err := s.fallback.WriteCtxIfRevisionWithTagsResult(ctx, "/repo/retry.txt", content, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, -1, nil, ""); err != nil {
-		t.Fatalf("simulate partial apply: %v", err)
 	}
 	if err := s.fallback.Store().SetFSLayerState(ctx, "layer-retry", datastore.FSLayerStateCommitting); err != nil {
 		t.Fatalf("SetFSLayerState committing: %v", err)
 	}
-	commit, err := c.CommitFSLayer(ctx, "layer-retry")
-	if err != nil {
-		t.Fatalf("CommitFSLayer retry: %v", err)
-	}
-	if commit.Status != "committed" {
-		t.Fatalf("commit = %+v, want committed", commit)
+	if commit, err := c.CommitFSLayer(ctx, "layer-retry"); !errors.Is(err, client.ErrConflict) {
+		t.Fatalf("CommitFSLayer committing commit=%+v err=%v, want conflict", commit, err)
 	}
 }
 
@@ -444,6 +598,68 @@ func TestFSLayerRejectsEntryOutsideBaseRoot(t *testing.T) {
 	var statusErr *client.StatusError
 	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
 		t.Fatalf("UpsertFSLayerEntry outside root err=%v, want 400", err)
+	}
+}
+
+func TestFSLayerCreateRequiresScopedWriteOnBaseRoot(t *testing.T) {
+	s := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers", bytes.NewReader([]byte(`{"layer_id":"layer-denied","base_root_path":"/repo"}`)))
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			Prefix: "/other",
+			Ops:    map[FSOp]bool{FSOpRead: true, FSOpWrite: true},
+		}},
+	}
+	req = req.WithContext(withScope(req.Context(), scope))
+	rr := httptest.NewRecorder()
+	s.handleFSLayerCreate(rr, req, s.fallback.Store())
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s, want 403", rr.Code, rr.Body.String())
+	}
+	if _, err := s.fallback.Store().GetFSLayer(context.Background(), "layer-denied"); !errors.Is(err, datastore.ErrNotFound) {
+		t.Fatalf("layer-denied err=%v, want ErrNotFound", err)
+	}
+}
+
+func TestFSLayerEntryMutationRequiresScopedPathPermission(t *testing.T) {
+	s := newTestServer(t)
+	ctx := context.Background()
+	if err := s.fallback.Store().CreateFSLayer(ctx, &datastore.FSLayer{
+		LayerID:      "layer-auth",
+		BaseRootPath: "/",
+	}); err != nil {
+		t.Fatalf("CreateFSLayer: %v", err)
+	}
+	layer, err := s.fallback.Store().GetFSLayer(ctx, "layer-auth")
+	if err != nil {
+		t.Fatalf("GetFSLayer: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/layers/layer-auth/entries", bytes.NewReader([]byte(`{
+		"path": "/repo/source.txt",
+		"op": "rename",
+		"kind": "file",
+		"content_text": "/other/target.txt"
+	}`)))
+	scope := &TenantScope{
+		IsScoped: true,
+		FSScopes: []FSScope{{
+			Prefix: "/repo",
+			Ops:    map[FSOp]bool{FSOpRead: true, FSOpWrite: true, FSOpDelete: true},
+		}},
+	}
+	req = req.WithContext(withScope(req.Context(), scope))
+	rr := httptest.NewRecorder()
+	s.handleFSLayerEntryUpsert(rr, req, s.fallback, s.fallback.Store(), layer)
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("status=%d body=%s, want 403", rr.Code, rr.Body.String())
+	}
+	entries, err := s.fallback.Store().ListFSLayerEntryLog(ctx, "layer-auth")
+	if err != nil {
+		t.Fatalf("ListFSLayerEntryLog: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("entries=%+v, want none after denied mutation", entries)
 	}
 }
 
