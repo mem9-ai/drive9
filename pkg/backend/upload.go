@@ -949,7 +949,9 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	var confirmPendingFileDurationMs float64
 	var insertNodeDurationMs float64
 	var semanticEnqueueDurationMs float64
+	var semanticTaskEnqueued bool
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		semanticTaskEnqueued = false
 		stepStart := time.Now()
 		if err := b.store.CompleteUploadTx(tx, uploadID); err != nil {
 			return err
@@ -1038,7 +1040,8 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			}
 			if b.UsesDatabaseAutoEmbedding() {
 				stepStart = time.Now()
-				err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+				created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+				semanticTaskEnqueued = created
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 				if err != nil {
 					return err
@@ -1048,7 +1051,8 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			}
 			if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "", upload.Description) {
 				stepStart = time.Now()
-				err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
+				created, err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
+				semanticTaskEnqueued = created
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 				if err != nil {
 					return err
@@ -1105,7 +1109,8 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		}
 		if b.UsesDatabaseAutoEmbedding() {
 			stepStart = time.Now()
-			err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+			semanticTaskEnqueued = created
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			if err != nil {
 				return err
@@ -1115,7 +1120,8 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		}
 		if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "", upload.Description) {
 			stepStart = time.Now()
-			err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
+			created, err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
+			semanticTaskEnqueued = created
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			if err != nil {
 				return err
@@ -1132,6 +1138,7 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		return err
 	}
 	txDurationMs := uploadPhaseMs(txStart)
+	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
 
 	// Transfer server-side reservation, update file shadow state, and mark the
 	// upload-complete mutation applied in one server-DB transaction.

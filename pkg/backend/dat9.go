@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -117,6 +118,11 @@ type Dat9Backend struct {
 	fileGCWorker     *FileGCWorker
 	runtimeMetricsID uint64
 
+	// semanticTaskNotifier, when set, runs after a write or upload commit that
+	// enqueued at least one durable semantic task, so the semantic worker can
+	// claim it immediately instead of waiting for the tenant scan.
+	semanticTaskNotifier atomic.Pointer[func()]
+
 	// Monthly LLM cost budget (P1).
 	maxMonthlyLLMCostMillicents     int64
 	visionCostPerKTokenMillicents   int64
@@ -135,6 +141,27 @@ func newBaseBackend(store *datastore.Store) *Dat9Backend {
 		inlineThreshold:     DefaultInlineThreshold,
 		textExtractMaxBytes: DefaultTextExtractMaxBytes,
 		runtimeMetricsID:    globalBackendRuntimeMetrics.allocateID(),
+	}
+}
+
+// SetSemanticTaskEnqueuedNotifier registers fn to run after a write or upload
+// commit that enqueued at least one durable semantic task. fn must be cheap
+// and non-blocking: it is invoked inline on the write path. A dropped or
+// missing notification is safe — tasks are durable and the semantic worker's
+// periodic tenant scan claims them eventually.
+func (b *Dat9Backend) SetSemanticTaskEnqueuedNotifier(fn func()) {
+	if b == nil {
+		return
+	}
+	b.semanticTaskNotifier.Store(&fn)
+}
+
+func (b *Dat9Backend) notifySemanticTaskEnqueued(enqueued bool) {
+	if !enqueued {
+		return
+	}
+	if fn := b.semanticTaskNotifier.Load(); fn != nil && *fn != nil {
+		(*fn)()
 	}
 }
 
@@ -646,7 +673,9 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 	}
 
+	var semanticTaskEnqueued bool
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		semanticTaskEnqueued = false
 		if err := b.ensureStorageQuota(ctx, tx, path, int64(len(data))); err != nil {
 			return err
 		}
@@ -681,14 +710,18 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			}
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			if err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType); err != nil {
+			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+			semanticTaskEnqueued = created
+			if err != nil {
 				return err
 			}
-			_, err := b.store.AppendFSEventTx(ctx, tx, path, "write", "")
+			_, err = b.store.AppendFSEventTx(ctx, tx, path, "write", "")
 			return err
 		}
 		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
-			if err := b.enqueueEmbedTaskTx(tx, fileID, 1); err != nil {
+			created, err := b.enqueueEmbedTaskTx(tx, fileID, 1)
+			semanticTaskEnqueued = created
+			if err != nil {
 				return err
 			}
 		}
@@ -700,6 +733,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 		return 0, err
 	}
+	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
 	// Temporary compatibility: app embedding still relies on the legacy
 	// backend-owned image queue until its image task flow also moves to
 	// semantic_tasks.
@@ -770,7 +804,9 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	}
 
 	var newRev int64
+	var semanticTaskEnqueued bool
 	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		semanticTaskEnqueued = false
 		if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
 			return err
 		}
@@ -812,14 +848,18 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 			}
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			if err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType); err != nil {
+			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
+			semanticTaskEnqueued = created
+			if err != nil {
 				return err
 			}
-			_, err := b.store.AppendFSEventTx(ctx, tx, nf.Node.Path, "write", "")
+			_, err = b.store.AppendFSEventTx(ctx, tx, nf.Node.Path, "write", "")
 			return err
 		}
 		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText, description) {
-			if err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev); err != nil {
+			created, err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
+			semanticTaskEnqueued = created
+			if err != nil {
 				return err
 			}
 		}
@@ -832,6 +872,7 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		}
 		return 0, 0, err
 	}
+	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
 	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
 	// Overwrite cleanup is object-level: file_gc_tasks track deleted file
 	// identities, not old blob refs for a still-live file_id.
