@@ -1070,12 +1070,12 @@ func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiD
 			zap.Int("diff_count", len(diffs)),
 			zap.Strings("diffs", summarizeTiDBSchemaDiffs(diffs)),
 			zap.Float64("duration_ms", float64(time.Since(passStart).Microseconds())/1000.0))
+		if err := BackfillPathHashes(ctx, db); err != nil {
+			return fmt.Errorf("backfill path hashes before repair: %w", err)
+		}
 		if len(diffs) == 0 {
 			if err := BackfillStorageRefHashes(ctx, db); err != nil {
 				return fmt.Errorf("backfill storage_ref_hash: %w", err)
-			}
-			if err := BackfillPathHashes(ctx, db); err != nil {
-				return fmt.Errorf("backfill path hashes: %w", err)
 			}
 			logger.Info(ctx, "tenant_tidb_schema_ensure_finished",
 				zap.String("mode", string(mode)),
