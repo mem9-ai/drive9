@@ -1875,3 +1875,47 @@ func TestSemanticWorkerTaskTypesForTargetDisabledAutoEmbedWithImageExtract(t *te
 		t.Fatalf("taskTypesForTarget() = %v, want to include TaskTypeImgExtractText when SupportsAsyncImageExtract=true and !UsesDatabaseAutoEmbedding", types)
 	}
 }
+
+func TestClaimTenantSlotCoversAllTenantsAcrossUnevenRotatingPages(t *testing.T) {
+	m := &semanticWorkerManager{inflight: make(map[string]int)}
+	m.opts.normalize()
+
+	// Mirror TenantScanLimit keyset pagination over 310 active tenants:
+	// rotating pages of 128, 128, and 54. A persistent round-robin cursor
+	// taken modulo the current page length gets clamped by the short page and
+	// permanently starves tenants at higher in-page indices.
+	const total = 310
+	pageBounds := [][2]int{{0, 128}, {128, 256}, {256, total}}
+	pages := make([][]semanticTenantRef, 0, len(pageBounds))
+	for _, bounds := range pageBounds {
+		page := make([]semanticTenantRef, 0, bounds[1]-bounds[0])
+		for i := bounds[0]; i < bounds[1]; i++ {
+			page = append(page, semanticTenantRef{id: fmt.Sprintf("tenant-%03d", i)})
+		}
+		pages = append(pages, page)
+	}
+
+	picked := make(map[string]bool, total)
+	// 200k ticks gives each tenant >500 expected picks, so the probability of
+	// any tenant being missed by uniform random starts is negligible.
+	for tick := 0; tick < 200000; tick++ {
+		refs := pages[tick%len(pages)]
+		ref, ok := m.claimTenantSlot(refs)
+		if !ok {
+			t.Fatalf("claimTenantSlot returned no slot at tick %d", tick)
+		}
+		picked[ref.id] = true
+		m.releaseTenantSlot(ref.id)
+	}
+
+	var starved []string
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("tenant-%03d", i)
+		if !picked[id] {
+			starved = append(starved, id)
+		}
+	}
+	if len(starved) > 0 {
+		t.Fatalf("%d of %d tenants never picked: %v", len(starved), total, starved)
+	}
+}

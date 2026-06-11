@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -137,7 +138,6 @@ type semanticWorkerManager struct {
 	mu         sync.Mutex
 	inflight   map[string]int
 	processing int
-	rr         int
 
 	tenantScanCursorSet       bool
 	tenantScanCursorCreatedAt time.Time
@@ -588,13 +588,19 @@ func (m *semanticWorkerManager) nextTarget(ctx context.Context) (*semanticTarget
 	return nil, nil
 }
 
+// claimTenantSlot picks one tenant from refs for a claim attempt. The start
+// index must be random: refs is a rotating keyset page whose length differs
+// between calls, so a persistent round-robin cursor taken modulo the current
+// page length gets clamped by the shortest page and permanently starves
+// tenants at higher in-page indices. A uniform random start visits every
+// tenant with equal probability regardless of page geometry.
 func (m *semanticWorkerManager) claimTenantSlot(refs []semanticTenantRef) (semanticTenantRef, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if len(refs) == 0 {
 		return semanticTenantRef{}, false
 	}
-	start := m.rr % len(refs)
+	start := rand.Intn(len(refs))
 	for i := 0; i < len(refs); i++ {
 		idx := (start + i) % len(refs)
 		ref := refs[idx]
@@ -602,7 +608,6 @@ func (m *semanticWorkerManager) claimTenantSlot(refs []semanticTenantRef) (seman
 			continue
 		}
 		m.inflight[ref.id]++
-		m.rr = (idx + 1) % len(refs)
 		return ref, true
 	}
 	return semanticTenantRef{}, false
