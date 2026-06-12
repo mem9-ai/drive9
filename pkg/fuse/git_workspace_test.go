@@ -3938,3 +3938,45 @@ func fuseGitOutputForTest(t *testing.T, dir string, args ...string) string {
 	}
 	return string(bytes.TrimSpace(out))
 }
+
+func TestEnsureGitWorkspacesRecordsRefreshPerfCounters(t *testing.T) {
+	fixture := newGitWorkspaceFixture(t)
+	opts := &MountOptions{LocalRoot: t.TempDir(), EnableGitWorkspaces: true, PerfCounters: true}
+	opts.setDefaults()
+
+	fs := NewDat9FS(fixture.client(), opts)
+
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensure git workspaces: %v", err)
+	}
+	snap := fs.perf.snapshot()
+	if got := snap.Counters["git_workspace_refresh"]; got != 1 {
+		t.Fatalf("git_workspace_refresh = %d, want 1", got)
+	}
+	if got := snap.Counters["git_workspace_forced_refresh"]; got != 0 {
+		t.Fatalf("git_workspace_forced_refresh = %d, want 0", got)
+	}
+	if got := snap.RemoteOps["list"].count; got == 0 {
+		t.Fatal("remote list ops = 0, want > 0")
+	}
+
+	// A non-forced ensure inside the freshness window must not refresh again.
+	if err := fs.ensureGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("ensure git workspaces (cached): %v", err)
+	}
+	snap = fs.perf.snapshot()
+	if got := snap.Counters["git_workspace_refresh"]; got != 1 {
+		t.Fatalf("git_workspace_refresh after cached ensure = %d, want 1", got)
+	}
+
+	if err := fs.forceRefreshGitWorkspaces(context.Background()); err != nil {
+		t.Fatalf("force refresh git workspaces: %v", err)
+	}
+	snap = fs.perf.snapshot()
+	if got := snap.Counters["git_workspace_refresh"]; got != 2 {
+		t.Fatalf("git_workspace_refresh after force = %d, want 2", got)
+	}
+	if got := snap.Counters["git_workspace_forced_refresh"]; got != 1 {
+		t.Fatalf("git_workspace_forced_refresh after force = %d, want 1", got)
+	}
+}

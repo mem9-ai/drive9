@@ -169,6 +169,9 @@ type fusePerfCounters struct {
 	gitOverlayFailure         atomicUint64
 	gitOverlayDrainCount      atomicUint64
 	gitOverlayDrainTotalNS    atomicUint64
+
+	gitWorkspaceRefresh       atomicUint64
+	gitWorkspaceForcedRefresh atomicUint64
 }
 
 // atomicUint64 is a small wrapper around sync/atomic.Uint64. Keeping it local
@@ -338,6 +341,8 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	snap.Counters["git_overlay_failure"] = p.gitOverlayFailure.load()
 	snap.Counters["git_overlay_drain_count"] = p.gitOverlayDrainCount.load()
 	snap.Counters["git_overlay_drain_total_ns"] = p.gitOverlayDrainTotalNS.load()
+	snap.Counters["git_workspace_refresh"] = p.gitWorkspaceRefresh.load()
+	snap.Counters["git_workspace_forced_refresh"] = p.gitWorkspaceForcedRefresh.load()
 	return snap
 }
 
@@ -400,6 +405,9 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 		snap.Counters["git_overlay_failure"],
 		snap.Counters["git_overlay_drain_count"],
 		time.Duration(snap.Counters["git_overlay_drain_total_ns"]).Truncate(time.Millisecond))
+	writePerfLine(w, "drive9: perf git_workspace refresh=%d forced_refresh=%d\n",
+		snap.Counters["git_workspace_refresh"],
+		snap.Counters["git_workspace_forced_refresh"])
 }
 
 func writePerfOps(w io.Writer, group string, names []string, stats map[string]perfOpStats) {

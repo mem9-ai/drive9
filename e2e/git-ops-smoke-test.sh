@@ -25,6 +25,10 @@ GIT_OPS_KEEP_ARTIFACTS="${GIT_OPS_KEEP_ARTIFACTS:-0}"
 GIT_OPS_TRACE_GIT="${GIT_OPS_TRACE_GIT:-0}"
 GIT_OPS_LOG_AUDIT_PATTERN="${GIT_OPS_LOG_AUDIT_PATTERN:-panic|fatal error|short read|input/output error}"
 GIT_OPS_FIXTURE_TREE_FILES="${GIT_OPS_FIXTURE_TREE_FILES:-128}"
+# Regression guard for git-workspace refresh storms (one remote refresh per
+# FUSE op instead of per TTL window). Healthy refresh traffic is time-bounded
+# (~1/s TTL + ~1/s throttled force), so the budget scales with mount uptime;
+# a storm scales with op count and blows past it by an order of magnitude.
 GIT_OPS_REFRESH_GUARD="${GIT_OPS_REFRESH_GUARD:-1}"
 GIT_OPS_REFRESH_BUDGET_BASE="${GIT_OPS_REFRESH_BUDGET_BASE:-20}"
 GIT_OPS_REFRESH_BUDGET_PER_SEC="${GIT_OPS_REFRESH_BUDGET_PER_SEC:-6}"
@@ -452,13 +456,11 @@ forced_base, forced_per_sec = int(sys.argv[4]), int(sys.argv[5])
 
 UNIT_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 1e-3, "µs": 1e-6, "us": 1e-6, "ns": 1e-9}
 
-
 def parse_duration(text):
     total = 0.0
     for m in re.finditer(r"([0-9.]+)(h|ms|m|s|µs|us|ns)", text):
         total += float(m.group(1)) * UNIT_SECONDS[m.group(2)]
     return total
-
 
 uptime = refresh = forced = None
 with open(log_path, "r", errors="replace") as handle:
@@ -561,9 +563,12 @@ capture_git_state() {
   cat "$repo/untracked.txt" > "$out_dir/untracked-content.txt"
 }
 
-# Blobless workspaces register real files asynchronously after checkout. Wait for
-# the restored working tree view to settle before comparing the full porcelain
-# status snapshot, otherwise CI can observe transient "deleted" entries.
+# Blobless workspaces register tree entries with unknown blob sizes and only
+# learn them as the async hydrator fills the local git cache. Until then,
+# getattr reports a placeholder size, and `git status` flags those entries as
+# phantom-modified purely from the stat-size mismatch (it never re-reads
+# content when sizes differ). The restored state is eventually consistent, so
+# poll until status converges before asserting strict equality below.
 wait_restored_status_settled() {
   local repo="$1"
   local expected="$2"
@@ -581,7 +586,7 @@ wait_restored_status_settled() {
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
       echo "INFO restored status did not settle within ${GIT_OPS_STATUS_SETTLE_TIMEOUT_S}s" >&2
-      return 0
+      return 0 # let the strict check below report the diff
     fi
     waited=1
     sleep 1
