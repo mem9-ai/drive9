@@ -6249,20 +6249,23 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 	}
 	defer unlockRemoteCommit()
 
+	if fs.layerEnabled() && fs.shadowStore != nil && !fs.shadowStore.Has(oldP) {
+		return pendingRenameRemoteFallback, nil
+	}
+	// Crash-safe order: persist the new-path meta BEFORE moving the shadow.
+	// If we crash between the two steps, both .meta files exist and recovery
+	// keeps whichever side still has the shadow — the data is never orphaned.
+	preparedMeta, ok := fs.pendingIndex.PrepareRename(oldP, newP)
+	if !ok {
+		return pendingRenameHandled, fmt.Errorf("prepare pending index rename %s -> %s failed", oldP, newP)
+	}
 	if fs.shadowStore != nil {
-		if fs.layerEnabled() && !fs.shadowStore.Has(oldP) {
-			return pendingRenameRemoteFallback, nil
-		}
 		if !fs.shadowStore.Rename(oldP, newP) {
+			fs.pendingIndex.AbortRename(newP)
 			return pendingRenameHandled, fmt.Errorf("move pending shadow %s -> %s failed", oldP, newP)
 		}
 	}
-	if !fs.pendingIndex.RenamePending(oldP, newP) {
-		if fs.shadowStore != nil {
-			_ = fs.shadowStore.Rename(newP, oldP)
-		}
-		return pendingRenameHandled, fmt.Errorf("move pending index %s -> %s failed", oldP, newP)
-	}
+	fs.pendingIndex.CommitRename(oldP, preparedMeta)
 
 	fs.finishLocalRename(input, oldP, newP)
 
@@ -6543,13 +6546,20 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 	// Also migrate pendingIndex and shadowStore entries for descendants.
+	// Meta-first order so a crash mid-migration cannot orphan a child's data.
 	if fs.pendingIndex != nil {
 		for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
 			newChild := newP + meta.Path[len(oldP):]
-			if fs.shadowStore != nil {
-				fs.shadowStore.Rename(meta.Path, newChild)
+			preparedMeta, ok := fs.pendingIndex.PrepareRename(meta.Path, newChild)
+			if !ok {
+				continue
 			}
-			fs.pendingIndex.RenamePending(meta.Path, newChild)
+			if fs.shadowStore != nil && !fs.shadowStore.Rename(meta.Path, newChild) {
+				fs.pendingIndex.AbortRename(newChild)
+				log.Printf("rename: migrate pending child shadow %s -> %s failed", meta.Path, newChild)
+				continue
+			}
+			fs.pendingIndex.CommitRename(meta.Path, preparedMeta)
 		}
 	}
 
@@ -9009,9 +9019,11 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 				}
 				if fs.journal != nil {
 					entry := JournalEntry{
-						Op:      JournalFsync,
-						Path:    fh.Path,
-						BaseRev: fh.BaseRev,
+						Op:          JournalFsync,
+						Path:        fh.Path,
+						Length:      fh.Dirty.Size(),
+						BaseRev:     fh.BaseRev,
+						ShadowSpill: true,
 					}
 					_ = fs.journal.Append(entry)
 					_ = fs.journal.Fsync()
@@ -9043,6 +9055,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 					entry := JournalEntry{
 						Op:      JournalFsync,
 						Path:    fh.Path,
+						Length:  fh.Dirty.Size(),
 						BaseRev: fh.BaseRev,
 					}
 					_ = fs.journal.Append(entry)

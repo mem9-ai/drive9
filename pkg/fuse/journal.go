@@ -35,6 +35,10 @@ type JournalEntry struct {
 	Length    int64     `json:"length,omitempty"`    // for Write
 	BaseRev   int64     `json:"base_rev,omitempty"`
 	Timestamp int64     `json:"timestamp,omitempty"`
+	// ShadowSpill records that the fsync'd data lives in a streaming shadow
+	// file, so crash recovery must rebuild the pending entry in spill mode
+	// (streamed upload) instead of full-memory ReadAll.
+	ShadowSpill bool `json:"shadow_spill,omitempty"`
 }
 
 // Journal is an append-only WAL for crash recovery. Each entry is
@@ -252,4 +256,59 @@ func (j *Journal) Close() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return j.fd.Close()
+}
+
+// replayJournalIntoPending rebuilds pending-index entries from the WAL for
+// crash recovery. A path is resurrected only when its latest data entry
+// (fsync) is NOT superseded by a later JournalCommit/JournalUnlink marker;
+// otherwise every historically committed path would re-upload on each mount,
+// and a stale WAL entry could pair with a newer session's shadow file and
+// upload torn content under old metadata.
+//
+// Entries whose .meta survived (already present in the pending index) are
+// left untouched: the .meta file carries strictly more metadata than the WAL.
+func replayJournalIntoPending(j *Journal, idx *PendingIndex) error {
+	if j == nil || idx == nil {
+		return nil
+	}
+
+	latestData := make(map[string]JournalEntry) // path → latest fsync-like entry
+	latestDone := make(map[string]uint64)       // path → latest commit/unlink seq
+	if err := j.Replay(func(e JournalEntry) {
+		switch e.Op {
+		case JournalCommit, JournalUnlink:
+			if e.Seq > latestDone[e.Path] {
+				latestDone[e.Path] = e.Seq
+			}
+		default:
+			if prev, ok := latestData[e.Path]; !ok || e.Seq > prev.Seq {
+				latestData[e.Path] = e
+			}
+		}
+	}); err != nil {
+		return err
+	}
+
+	for path, e := range latestData {
+		if doneSeq, ok := latestDone[path]; ok && doneSeq > e.Seq {
+			continue // committed or unlinked after the last local fsync
+		}
+		if idx.HasPending(path) {
+			continue
+		}
+		kind := PendingOverwrite
+		if e.BaseRev == 0 {
+			kind = PendingNew
+		}
+		var err error
+		if e.ShadowSpill {
+			_, err = idx.PutShadowSpill(path, e.Length, kind, e.BaseRev)
+		} else {
+			_, err = idx.PutWithBaseRev(path, e.Length, kind, e.BaseRev)
+		}
+		if err != nil {
+			return fmt.Errorf("journal replay resurrect %s: %w", path, err)
+		}
+	}
+	return nil
 }

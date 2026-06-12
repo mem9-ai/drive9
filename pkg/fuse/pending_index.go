@@ -219,6 +219,69 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 	return true
 }
 
+// PrepareRename is phase one of a crash-safe rename: it persists the pending
+// entry under newPath on disk while oldPath stays authoritative in memory and
+// on disk. With both .meta files durable, a crash leaves the data reachable
+// no matter whether the shadow file has moved yet — recovery prunes whichever
+// side has no shadow. Returns the prepared meta for CommitRename, or ok=false
+// when there is no pending entry for oldPath.
+func (idx *PendingIndex) PrepareRename(oldPath, newPath string) (*WriteBackMeta, bool) {
+	idx.mu.RLock()
+	meta, ok := idx.items[oldPath]
+	if !ok {
+		idx.mu.RUnlock()
+		return nil, false
+	}
+	gen := idx.nextGen.Add(1)
+	newMeta := &WriteBackMeta{
+		Path:        newPath,
+		Size:        meta.Size,
+		Mtime:       meta.Mtime,
+		CreatedAt:   meta.CreatedAt,
+		Generation:  gen,
+		Kind:        meta.Kind,
+		BaseRev:     meta.BaseRev,
+		ShadowSpill: meta.ShadowSpill,
+		Mode:        meta.Mode,
+		HasMode:     meta.HasMode,
+	}
+	idx.mu.RUnlock()
+
+	metaBytes, err := json.Marshal(newMeta)
+	if err != nil {
+		return nil, false
+	}
+	if err := atomicWrite(filepath.Join(idx.dir, hashPath(newPath)+".meta"), metaBytes); err != nil {
+		return nil, false
+	}
+	return newMeta, true
+}
+
+// CommitRename completes a rename prepared by PrepareRename after the shadow
+// file has moved: newPath becomes authoritative in memory, oldPath is removed
+// from memory and disk.
+func (idx *PendingIndex) CommitRename(oldPath string, newMeta *WriteBackMeta) {
+	idx.mu.Lock()
+	delete(idx.items, oldPath)
+	idx.items[newMeta.Path] = newMeta
+	idx.mu.Unlock()
+
+	_ = os.Remove(filepath.Join(idx.dir, hashPath(oldPath)+".meta"))
+}
+
+// AbortRename rolls back PrepareRename by deleting the prepared on-disk meta
+// for newPath. It refuses to touch disk when newPath is live in memory, so an
+// unrelated pending entry at the target path cannot be destroyed.
+func (idx *PendingIndex) AbortRename(newPath string) {
+	idx.mu.RLock()
+	_, live := idx.items[newPath]
+	idx.mu.RUnlock()
+	if live {
+		return
+	}
+	_ = os.Remove(filepath.Join(idx.dir, hashPath(newPath)+".meta"))
+}
+
 // ListPendingPaths returns the set of remote paths that have pending entries.
 func (idx *PendingIndex) ListPendingPaths() map[string]struct{} {
 	idx.mu.RLock()

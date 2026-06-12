@@ -232,3 +232,115 @@ func TestPendingIndexRenameNonexistent(t *testing.T) {
 		t.Error("expected rename of nonexistent path to return false")
 	}
 }
+
+// TestPendingIndexPrepareCommitRename verifies the crash-safe three-phase
+// rename: after Prepare both .meta files are durable on disk (so a crash at
+// any point between shadow rename and CommitRename leaves the data
+// reachable), and Commit makes newPath authoritative.
+func TestPendingIndexPrepareCommitRename(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.PutShadowSpillWithMode("/old.txt", 42, PendingNew, 0, 0o640, true); err != nil {
+		t.Fatal(err)
+	}
+
+	newMeta, ok := idx.PrepareRename("/old.txt", "/new.txt")
+	if !ok {
+		t.Fatal("PrepareRename failed")
+	}
+
+	// Phase 1 (prepared): memory unchanged, BOTH metas durable on disk.
+	if !idx.HasPending("/old.txt") {
+		t.Error("old path must stay authoritative in memory until Commit")
+	}
+	if idx.HasPending("/new.txt") {
+		t.Error("new path must not be live in memory before Commit")
+	}
+	crash, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := crash.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if !crash.HasPending("/old.txt") || !crash.HasPending("/new.txt") {
+		t.Fatal("crash between Prepare and Commit must recover both metas (recovery prunes the one without a shadow)")
+	}
+	recovered, _ := crash.GetMeta("/new.txt")
+	if recovered.Size != 42 || recovered.Kind != PendingNew || !recovered.ShadowSpill || !recovered.HasMode || recovered.Mode != 0o640 {
+		t.Errorf("prepared meta lost fields: %+v", recovered)
+	}
+
+	// Phase 3 (commit): newPath authoritative, oldPath gone in memory + disk.
+	idx.CommitRename("/old.txt", newMeta)
+	if idx.HasPending("/old.txt") {
+		t.Error("old path still pending after Commit")
+	}
+	if !idx.HasPending("/new.txt") {
+		t.Error("new path not pending after Commit")
+	}
+	after, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := after.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if after.HasPending("/old.txt") {
+		t.Error("old .meta not removed from disk after Commit")
+	}
+	if !after.HasPending("/new.txt") {
+		t.Error("new .meta missing from disk after Commit")
+	}
+}
+
+// TestPendingIndexAbortRename verifies that Abort removes only the prepared
+// on-disk meta, and refuses to delete a meta that is live in memory.
+func TestPendingIndexAbortRename(t *testing.T) {
+	dir := t.TempDir()
+	idx, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.PutWithBaseRev("/old.txt", 10, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := idx.PrepareRename("/old.txt", "/new.txt"); !ok {
+		t.Fatal("PrepareRename failed")
+	}
+	idx.AbortRename("/new.txt")
+
+	recovered, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if recovered.HasPending("/new.txt") {
+		t.Error("aborted .meta still on disk")
+	}
+	if !recovered.HasPending("/old.txt") {
+		t.Error("old .meta lost by abort")
+	}
+
+	// Abort must not delete a live entry's meta.
+	if _, err := idx.PutWithBaseRev("/live.txt", 5, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	idx.AbortRename("/live.txt")
+	recovered2, err := NewPendingIndex(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recovered2.RecoverFromDisk(); err != nil {
+		t.Fatal(err)
+	}
+	if !recovered2.HasPending("/live.txt") {
+		t.Error("AbortRename deleted a live entry's meta")
+	}
+}

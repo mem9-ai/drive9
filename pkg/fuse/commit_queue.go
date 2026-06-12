@@ -299,10 +299,20 @@ func (cq *CommitQueue) RecoverPending() {
 			log.Printf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 			continue
 		}
+		// The shadow file is the data actually uploaded; its size is
+		// authoritative. Meta size can be stale (memory-only updates, or a
+		// WAL-resurrected entry from an older fsync) and would mis-route the
+		// direct-PUT vs multipart decision in uploadEntry.
+		size := meta.Size
+		if cq.shadows != nil {
+			if shadowSize := cq.shadows.Size(path); shadowSize >= 0 {
+				size = shadowSize
+			}
+		}
 		entry := &CommitEntry{
 			Path:        path,
 			BaseRev:     meta.BaseRev,
-			Size:        meta.Size,
+			Size:        size,
 			Kind:        meta.Kind,
 			ShadowSpill: meta.ShadowSpill,
 			Mode:        meta.Mode,
@@ -444,11 +454,23 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	if preserveLocal {
 		return
 	}
-	if cq.shadows != nil {
+	hadLocal := false
+	if cq.shadows != nil && cq.shadows.Has(path) {
+		hadLocal = true
 		cq.shadows.Remove(path)
 	}
-	if cq.index != nil {
+	if cq.index != nil && cq.index.HasPending(path) {
+		hadLocal = true
 		cq.index.Remove(path)
+	}
+	// Journal a "done" marker so crash recovery does not resurrect the
+	// unlinked path from earlier fsync frames, and so those frames compact.
+	// Only when local pending state existed, to avoid a WAL frame per unlink.
+	if hadLocal && cq.journal != nil {
+		_ = cq.journal.Append(JournalEntry{
+			Op:   JournalCommit,
+			Path: path,
+		})
 	}
 }
 
@@ -506,6 +528,12 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		}
 		if cq.index != nil {
 			cq.index.Remove(p)
+		}
+		if cq.journal != nil {
+			_ = cq.journal.Append(JournalEntry{
+				Op:   JournalCommit,
+				Path: p,
+			})
 		}
 	}
 }
@@ -1014,11 +1042,12 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 		return
 	}
 
-	// ShadowSpill large files: auto-resolve requires full-memory ReadAll +
-	// bytes.Equal which would OOM for multi-GiB files. Terminal failure instead.
+	// ShadowSpill large files: full-memory ReadAll + bytes.Equal would OOM
+	// for multi-GiB files, so no LWW. But the idempotent case (crash after
+	// upload completed, before the local cleanup — the common large-file
+	// crash window) is resolvable with a bounded-memory chunked compare.
 	if entry.ShadowSpill {
-		log.Printf("commit queue: auto-resolve skipped for ShadowSpill %s (would OOM), terminal failure", entry.Path)
-		cq.onCommitTerminalFailure(entry)
+		cq.tryResolveShadowSpillIdempotent(entry)
 		return
 	}
 
@@ -1104,6 +1133,95 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 
 	log.Printf("commit queue: auto-resolved conflict for %s via LWW (overwrote rev %d → new upload based on rev %d)", entry.Path, entry.BaseRev, serverRev)
 	if err := cq.onCommitSuccess(entry, serverRev, 0); err != nil {
+		cq.onCommitPostUploadFailure(entry, err)
+	}
+}
+
+// shadowSpillCompareChunk bounds memory during the streaming idempotency
+// comparison of large ShadowSpill files in conflict auto-resolve.
+const shadowSpillCompareChunk = 8 << 20
+
+// tryResolveShadowSpillIdempotent resolves a 409 for a ShadowSpill entry only
+// in the idempotent direction: if the server content already equals the local
+// shadow byte-for-byte (crash after a completed upload, before local cleanup),
+// the commit is marked successful. Any divergence is a terminal conflict —
+// LWW re-upload is intentionally not attempted for large files.
+func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entry *CommitEntry) {
+	if cq.shadows == nil || cq.client == nil {
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+	apiPath := cq.remotePath(entry.Path)
+
+	statCtx, statCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	statStart := time.Now()
+	stat, err := cq.client.StatCtx(statCtx, apiPath)
+	statCancel()
+	if cq.perf != nil {
+		cq.perf.recordRemoteOp(perfRemoteStat, err, time.Since(statStart), 0)
+	}
+	if err != nil {
+		log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: stat: %v", entry.Path, err)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+
+	localSize := cq.shadows.Size(entry.Path)
+	if localSize < 0 {
+		// Shadow gone — likely canceled by a concurrent Unlink/Rmdir.
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled)", entry.Path)
+			return
+		}
+		log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: shadow missing", entry.Path)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+	if stat.Size != localSize {
+		log.Printf("commit queue: ShadowSpill conflict for %s is genuine (local %d bytes vs server %d bytes), terminal failure", entry.Path, localSize, stat.Size)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+
+	buf := make([]byte, shadowSpillCompareChunk)
+	for off := int64(0); off < localSize; off += shadowSpillCompareChunk {
+		n := int64(shadowSpillCompareChunk)
+		if off+n > localSize {
+			n = localSize - off
+		}
+		readCtx, readCancel := context.WithTimeout(context.Background(), uploadTimeout)
+		readStart := time.Now()
+		serverChunk, err := cq.client.ReadAtCtx(readCtx, apiPath, off, n)
+		readCancel()
+		if cq.perf != nil {
+			cq.perf.recordRemoteOp(perfRemoteRead, err, time.Since(readStart), uint64(len(serverChunk)))
+		}
+		if err != nil {
+			log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: read server @%d: %v", entry.Path, off, err)
+			cq.onCommitTerminalFailure(entry)
+			return
+		}
+		ln, err := cq.shadows.ReadAt(entry.Path, off, buf[:n])
+		if err != nil || int64(ln) != n {
+			if cq.isEntryCanceled(entry) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled mid-read)", entry.Path)
+				return
+			}
+			log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: read shadow @%d: n=%d err=%v", entry.Path, off, ln, err)
+			cq.onCommitTerminalFailure(entry)
+			return
+		}
+		if int64(len(serverChunk)) != n || !bytes.Equal(serverChunk, buf[:n]) {
+			log.Printf("commit queue: ShadowSpill conflict for %s is genuine (content differs @%d), terminal failure", entry.Path, off)
+			cq.onCommitTerminalFailure(entry)
+			return
+		}
+	}
+
+	log.Printf("commit queue: auto-resolved ShadowSpill conflict for %s (idempotent, %d bytes match server rev %d)", entry.Path, localSize, stat.Revision)
+	if err := cq.onCommitSuccess(entry, stat.Revision, stat.Revision); err != nil {
 		cq.onCommitPostUploadFailure(entry, err)
 	}
 }
