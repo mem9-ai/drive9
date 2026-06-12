@@ -137,7 +137,15 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 	}
 	fs.git.mu.Unlock()
 
+	if fs.perfEnabled() {
+		fs.perf.gitWorkspaceRefresh.add(1)
+		if force {
+			fs.perf.gitWorkspaceForcedRefresh.add(1)
+		}
+	}
+	listStart := fs.perfStart()
 	workspaces, err := fs.client.ListGitWorkspaces(ctx)
+	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
 		if client.IsNotFound(err) {
 			err = nil
@@ -158,12 +166,16 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 		if localRoot != "/" {
 			localRoot = strings.TrimSuffix(localRoot, "/")
 		}
+		treeStart := fs.perfStart()
 		nodes, err := fs.client.ListGitTree(ctx, ws.WorkspaceID, ws.HeadCommit)
+		fs.perfRecordRemote(perfRemoteList, treeStart, err, 0)
 		if err != nil {
 			loadErrs = append(loadErrs, fmt.Errorf("load git tree workspace=%s root=%s: %w", ws.WorkspaceID, ws.RootPath, err))
 			continue
 		}
+		overlayStart := fs.perfStart()
 		overlays, err := fs.client.ListGitOverlayEntries(ctx, ws.WorkspaceID)
+		fs.perfRecordRemote(perfRemoteList, overlayStart, err, 0)
 		if err != nil && !client.IsNotFound(err) {
 			loadErrs = append(loadErrs, fmt.Errorf("load git overlay workspace=%s root=%s: %w", ws.WorkspaceID, ws.RootPath, err))
 			continue
