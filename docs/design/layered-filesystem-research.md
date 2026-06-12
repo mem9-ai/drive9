@@ -1,53 +1,53 @@
-# Drive9 Layered Filesystem 调研报告
+# Drive9 Layered Filesystem Research Report
 
-日期：2026-06-01
+Date: 2026-06-01
 
-本文调研 AgentFS、Cloudflare Sandbox SDK / ArtifactFS、Tilde、E2B、Modal、Daytona，以及 YoloFS / DeltaFS 等新兴 agent / sandbox filesystem 方案，重点研究它们如何实现 layered filesystem，并给出 Drive9 的落地建议。
+This report surveys emerging agent and sandbox filesystem systems, including AgentFS, Cloudflare Sandbox SDK / ArtifactFS, Tilde, E2B, Modal, Daytona, YoloFS, and DeltaFS. It focuses on how they implement layered filesystems and translates the findings into implementation guidance for Drive9.
 
-结论先行：Drive9 不应该照搬 AgentFS 的“单 SQLite 文件作为权威上层文件系统”，而应该把 layered fs 做成 Drive9 原生的服务端 metadata overlay：以现有 `file_nodes` / `inodes` / `contents` / `semantic` 为 base，新增通用 `fs_layers` / `fs_layer_entries` 作为 writable upper layer，复用现有 db9/S3 content plane、revision、FUSE shadow/writeback 和 Git workspace overlay 的经验。
+The main conclusion: Drive9 should not copy AgentFS' "single SQLite file as the authoritative upper filesystem" model directly. Instead, Drive9 should implement layered fs as a native server-side metadata overlay: use the existing `file_nodes` / `inodes` / `contents` / `semantic` model as the base, add generic `fs_layers` / `fs_layer_entries` tables as the writable upper layer, and reuse Drive9's existing db9/S3 content plane, revision model, FUSE shadow/writeback path, and Git workspace overlay experience.
 
-## 一句话结论
+## Executive Summary
 
-- 社区主流实现已经收敛到同一个模型：只读 base layer + 可写 upper/delta/session layer + whiteout 删除标记 + 显式 diff/commit/rollback。
-- AgentFS 的价值不只是隔离文件，而是让 upper layer 可查询、可审计、可复制。
-- Cloudflare Sandbox SDK 的价值在执行隔离；它的 filesystem 持久化依赖 backup/R2/squashfs/overlayfs，不适合作为 Drive9 的权威文件模型，但适合作为执行沙箱参考。
-- Cloudflare ArtifactFS 和 Drive9 现有 `git_workspace_*` 最接近：Git clean tree 作为 base，dirty/new/delete 作为 overlay，读时 merge，写时 copy-up 或写 upper。
-- Tilde 把 sandbox run 做成事务：成功则 commit，失败/取消/超时则 rollback。这非常适合 Drive9 的 agent session。
-- E2B / Modal 的 snapshot 更偏 VM/container/image 级 checkpoint，适合运行时 fork/resume，但不适合作为 Drive9 文件级 diff、search、commit 的主模型。
-- Daytona 的 persistent volume 更像共享持久目录，不是事务 overlay；对大数据集复用有价值，但对 agent code editing 不够安全。
-- YoloFS 和 DeltaFS 给出两个方向：agent 可见的 staged effects，以及高频 checkpoint 时冻结 writable layer 并插入新 layer。
+- The mainstream community direction has converged on the same model: read-only base layer + writable upper/delta/session layer + whiteout delete markers + explicit diff/commit/rollback.
+- AgentFS' value is not only file isolation. It also makes the upper layer queryable, auditable, and portable.
+- Cloudflare Sandbox SDK is valuable as an execution-isolation model. Its filesystem persistence relies on backup/R2/squashfs/overlayfs, so it is not a good authoritative Drive9 file model, but it is useful as an execution sandbox reference.
+- Cloudflare ArtifactFS is closest to Drive9's existing `git_workspace_*` model: a clean Git tree is the base, dirty/new/delete records are the overlay, reads are merged, and writes either copy up or write to the upper layer.
+- Tilde treats a sandbox run as a transaction: success commits, while failure, cancellation, and timeout roll back. This maps very well to Drive9 agent sessions.
+- E2B / Modal snapshots are closer to VM/container/image-level checkpoints. They are useful for runtime fork/resume, but not as Drive9's primary model for file-level diff, search, and commit.
+- Daytona persistent volumes are closer to shared durable directories than transactional overlays. They are useful for large dataset reuse, but are not safe enough for agent code editing by themselves.
+- YoloFS and DeltaFS point to two useful directions: agent-visible staged effects, and freezing the writable layer plus inserting a new layer for high-frequency checkpoints.
 
-## 主要资料来源
+## Primary Sources
 
-- [AgentFS 官网](https://www.agentfs.ai/)、[GitHub README](https://github.com/tursodatabase/agentfs)、[Copy-on-Write Overlays 文档](https://docs.turso.tech/agentfs/guides/overlay)、[SQLite schema spec](https://github.com/tursodatabase/agentfs/blob/main/SPEC.md)、[FUSE 文章](https://turso.tech/blog/agentfs-fuse)。
-- [Cloudflare Sandbox SDK 架构](https://developers.cloudflare.com/sandbox/concepts/architecture/)、[生命周期](https://developers.cloudflare.com/sandbox/concepts/sandboxes/)、[Files API](https://developers.cloudflare.com/sandbox/api/files/)、[Backup/Restore](https://developers.cloudflare.com/sandbox/guides/backup-restore/)、[Bucket mounts](https://developers.cloudflare.com/sandbox/guides/mount-buckets/)。
-- [Cloudflare ArtifactFS](https://github.com/cloudflare/artifact-fs)。
-- [Tilde Filesystem Isolation](https://docs.tilde.run/sandboxes/filesystem/)。
-- [E2B Sandbox Snapshots](https://e2b.dev/docs/sandbox/snapshots)。
-- [Modal Sandbox Snapshots](https://frontend.modal.com/docs/guide/sandbox-snapshots)。
-- [Daytona Volumes](https://www.daytona.io/docs/en/volumes/) 和 [Volume 概览](https://www.daytona.io/dotfiles/volumes)。
-- [YoloFS arXiv](https://arxiv.org/abs/2604.13536) 和 [Microsoft Research 摘要](https://www.microsoft.com/en-us/research/publication/dont-let-ai-agents-yolo-your-files-shifting-information-and-control-to-filesystems-for-agent-safety-and-autonomy/)。
-- [DeltaBox / DeltaFS arXiv](https://arxiv.org/abs/2605.22781)。
+- [AgentFS website](https://www.agentfs.ai/), [GitHub README](https://github.com/tursodatabase/agentfs), [Copy-on-Write Overlays docs](https://docs.turso.tech/agentfs/guides/overlay), [SQLite schema spec](https://github.com/tursodatabase/agentfs/blob/main/SPEC.md), and [FUSE article](https://turso.tech/blog/agentfs-fuse).
+- [Cloudflare Sandbox SDK architecture](https://developers.cloudflare.com/sandbox/concepts/architecture/), [sandbox lifecycle](https://developers.cloudflare.com/sandbox/concepts/sandboxes/), [Files API](https://developers.cloudflare.com/sandbox/api/files/), [Backup/Restore](https://developers.cloudflare.com/sandbox/guides/backup-restore/), and [Bucket mounts](https://developers.cloudflare.com/sandbox/guides/mount-buckets/).
+- [Cloudflare ArtifactFS](https://github.com/cloudflare/artifact-fs).
+- [Tilde Filesystem Isolation](https://docs.tilde.run/sandboxes/filesystem/).
+- [E2B Sandbox Snapshots](https://e2b.dev/docs/sandbox/snapshots).
+- [Modal Sandbox Snapshots](https://frontend.modal.com/docs/guide/sandbox-snapshots).
+- [Daytona Volumes](https://www.daytona.io/docs/en/volumes/) and [Volume overview](https://www.daytona.io/dotfiles/volumes).
+- [YoloFS arXiv](https://arxiv.org/abs/2604.13536) and [Microsoft Research summary](https://www.microsoft.com/en-us/research/publication/dont-let-ai-agents-yolo-your-files-shifting-information-and-control-to-filesystems-for-agent-safety-and-autonomy/).
+- [DeltaBox / DeltaFS arXiv](https://arxiv.org/abs/2605.22781).
 
-## 方案对比
+## Solution Comparison
 
-| 方案 | Base layer | Writable layer | Snapshot / fork | 对外接口 | 对 Drive9 的启发 |
+| System | Base layer | Writable layer | Snapshot / fork | External interface | Drive9 takeaway |
 | --- | --- | --- | --- | --- | --- |
-| AgentFS | 原始目录或 AgentFS SQLite filesystem | SQLite delta layer | 复制 SQLite 文件即可 snapshot/fork | Linux FUSE、macOS NFS、SDK、浏览器 OPFS | 上层 layer 必须可查询、可审计、可携带；copy-up + whiteout 足够支撑 MVP。 |
-| Cloudflare Sandbox SDK | 容器内 ephemeral filesystem；可从 backup restore | 容器 writable layer；restore 后 upper 不影响 backup | backup 存 R2，数据为 squashfs + metadata | TypeScript SDK、文件 API、inotify watch | 执行沙箱和持久文件状态要分离；默认容器状态不可当权威数据。 |
-| Cloudflare ArtifactFS | Git tree snapshot / generation | SQLite overlay metadata + upper content dir | HEAD 变化后重新索引 base，并 reconcile overlay | FUSE | Git clean tree + dirty overlay 是 Drive9 Git workspace 的同源模式，可抽象成通用 resolver。 |
-| Tilde | versioned repository state | transactional session | exit 0 commit；失败/取消/超时 rollback；可人工审批 | sandbox 内 FUSE mount | 把 agent run 视为事务；commit all-or-nothing；权限应在 syscall/open/create 阶段失败。 |
-| E2B | template / running sandbox state | sandbox 内运行时修改 | snapshot 捕获 filesystem + memory，可一对多生成新 sandbox | SDK | 适合 runtime fork，不适合作文件级 diff/search/commit 的主模型。 |
-| Modal | base image | sandbox filesystem changes | filesystem snapshot 是相对 base image 的 diff；directory snapshot 可 mount | SDK | 适合冷启动和环境复用；文件级可查询性弱于 metadata overlay。 |
-| Daytona | mount 进 sandbox 的 persistent volume | 同一共享 volume | volume 生命周期独立于 sandbox；多 sandbox 可同时 mount | FUSE volume + SDK | 适合大数据集/模型复用；不是事务层，并发同路径写入需要业务协调。 |
-| YoloFS | 用户/项目文件系统 | staged mutation layer | snapshot 帮 agent 自纠错；progressive permission 控制风险路径 | agent-native FS 研究 | FS 应向 agent/user 暴露 staged effects，而不是只在事后保护。 |
-| DeltaFS | 分层 sandbox file state | 可冻结 writable layer | checkpoint 冻结当前 upper 并插入新 upper；rollback 是 layer switch | OS-level sandbox 研究 | 高频 checkpoint/rollback 要靠 layer 切换，而不是全量复制。 |
+| AgentFS | Original directory or AgentFS SQLite filesystem | SQLite delta layer | Snapshot/fork by copying the SQLite file | Linux FUSE, macOS NFS, SDK, browser OPFS | The upper layer must be queryable, auditable, and portable. Copy-up + whiteout is enough for an MVP. |
+| Cloudflare Sandbox SDK | In-container ephemeral filesystem, optionally restored from backup | Container writable layer; the upper layer after restore does not mutate the backup | Backup stored in R2 as squashfs + metadata | TypeScript SDK, Files API, inotify watch | Execution sandbox state and durable file state should be separate. Default container state must not be authoritative data. |
+| Cloudflare ArtifactFS | Git tree snapshot / generation | SQLite overlay metadata + upper content directory | Re-index base after HEAD changes and reconcile overlay | FUSE | Git clean tree + dirty overlay is the same family as Drive9 Git workspace and can inform a generic resolver. |
+| Tilde | Versioned repository state | Transactional session | Commit on exit 0; rollback on failure/cancel/timeout; optional human approval | FUSE mount inside sandbox | Treat agent runs as transactions. Commit must be all-or-nothing. Permission failures should happen at syscall/open/create time. |
+| E2B | Template / running sandbox state | Runtime modifications inside sandbox | Snapshot captures filesystem + memory and can spawn many sandboxes | SDK | Good for runtime forks, not for Drive9's primary file-level diff/search/commit model. |
+| Modal | Base image | Sandbox filesystem changes | Filesystem snapshot is a diff from the base image; directory snapshots can be mounted | SDK | Good for cold-start and environment reuse. File-level queryability is weaker than a metadata overlay. |
+| Daytona | Persistent volume mounted into sandbox | Same shared volume | Volume lifecycle is independent from sandbox; many sandboxes can mount it | FUSE volume + SDK | Useful for large datasets/model reuse. Not a transaction layer, so concurrent writes to the same path need application coordination. |
+| YoloFS | User/project filesystem | Staged mutation layer | Snapshots help agents self-correct; progressive permissions control risky paths | Agent-native FS research | The filesystem should expose staged effects to agents/users, not only protect after the fact. |
+| DeltaFS | Layered sandbox file state | Freezable writable layer | Checkpoint freezes current upper and inserts a new upper; rollback is a layer switch | OS-level sandbox research | High-frequency checkpoint/rollback should use layer switching, not full copies. |
 
-## Layered FS 的共性机制
+## Common Layered FS Mechanics
 
 ### 1. Merged View
 
-agent 看到的是 merged view：
+The agent sees a merged view:
 
 ```text
 visible tree
@@ -55,18 +55,18 @@ visible tree
   base layer
 ```
 
-典型规则：
+Typical rules:
 
-- `stat(path)`：先查 upper；如果是 whiteout，返回 not found；否则 fallback 到 base。
-- `readdir(dir)`：base children 和 upper children 合并；同名 upper 覆盖 base；whiteout 隐藏 base child。
-- `read(path)`：upper 有内容读 upper，否则读 base。
-- `write(path)`：新文件直接写 upper；base 文件首次写入时 copy-up，然后修改 upper。
-- `delete(path)`：如果是 base 文件，写 whiteout；如果是 upper-only 文件，可直接删除 upper entry。
-- `rename(old, new)`：MVP 通常可用 old whiteout + new upsert 表达；目录 rename 需要谨慎处理。
+- `stat(path)`: check upper first; if it is a whiteout, return not found; otherwise fall back to base.
+- `readdir(dir)`: merge base children and upper children; upper entries with the same name override base entries; whiteouts hide base children.
+- `read(path)`: read upper content if present; otherwise read base.
+- `write(path)`: write new files directly to upper; on the first write to a base file, copy up and then modify upper.
+- `delete(path)`: if the file comes from base, write a whiteout; if it is upper-only, delete the upper entry directly.
+- `rename(old, new)`: MVPs usually represent this as old whiteout + new upsert; directory rename needs careful handling.
 
 ### 2. Whiteout
 
-whiteout 是 layered fs 的关键。它把“删除”变成 upper layer 的一条显式记录，而不是修改 base：
+Whiteout is the key primitive in layered fs. It turns delete into an explicit upper-layer record instead of a mutation to base:
 
 ```text
 base:  /src/a.go exists
@@ -74,193 +74,193 @@ upper: /src/a.go op=whiteout
 view:  /src/a.go not found
 ```
 
-这让 rollback 非常便宜：丢弃 upper 即可。
+This makes rollback cheap: discard the upper layer.
 
 ### 3. Copy-up
 
-当 agent 修改 base 文件时，系统一般先把 base 内容复制到 upper，再对 upper 写入。AgentFS 文档里就是这个模型；ArtifactFS 也有类似 `ensureOverlay`：如果 base blob 尚未本地化，先 hydrate，再写 upper。
+When an agent modifies a base file, systems generally copy base content into upper first, then write to upper. AgentFS documents this model directly; ArtifactFS has a similar `ensureOverlay` behavior: hydrate the base blob if it is not localized yet, then write upper.
 
-Drive9 MVP 可以先用 full-file copy-up。原因是现有 FUSE shadow/writeback 已经倾向于把写入最终变成完整对象提交。大文件后续可做 chunk/extent overlay。
+For Drive9, the MVP can start with full-file copy-up because the existing FUSE shadow/writeback path already tends to turn writes into complete object commits eventually. Large files can later use chunk/extent overlays.
 
 ### 4. Snapshot / Fork
 
-有三种主流做法：
+There are three mainstream approaches:
 
-- AgentFS：复制 SQLite session DB，或者利用 WAL/数据库层能力做 time-travel/fork。
-- DeltaFS：冻结当前 writable layer，插入新的 writable layer；rollback 切回旧 layer。
-- Modal/E2B：保存 sandbox/image/memory 的整体 snapshot。
+- AgentFS: copy the SQLite session DB, or use WAL/database-layer capabilities for time travel and fork.
+- DeltaFS: freeze the current writable layer, insert a new writable layer, and roll back by switching layers.
+- Modal/E2B: save the whole sandbox/image/memory snapshot.
 
-Drive9 更适合第二种 metadata layer 模式：冻结当前 layer，创建 child layer 指向 parent；后续通过 compaction 控制 layer depth。
+Drive9 fits the second metadata-layer model best: freeze the current layer, create a child layer that points to its parent, and control layer depth later through compaction.
 
 ### 5. Audit / Diff
 
-成熟 agent FS 都把“变更是什么”作为一等能力。AgentFS 强调 SQLite 上层可查询；Tilde 每次 sandbox commit 记录结构化 metadata；YoloFS 关注 staged effects 对 agent/user 可见。
+Mature agent filesystems treat "what changed" as a first-class capability. AgentFS emphasizes a queryable SQLite upper layer; Tilde records structured metadata for every sandbox commit; YoloFS focuses on staged effects being visible to agents and users.
 
-Drive9 应该把 diff/audit 设计在第一版，而不是事后从对象变化里反推。
+Drive9 should design diff/audit into V1 instead of trying to infer changes from object mutations after the fact.
 
-## 重点方案拆解
+## Detailed System Notes
 
 ### AgentFS
 
-AgentFS 的定位是“agent 可以用真实 CLI 工具，但不会直接破坏用户文件”。它用 SQLite 保存 agent filesystem state，并通过 FUSE/NFS/SDK/OPFS 暴露成文件系统。
+AgentFS is positioned around the idea that agents can use real CLI tools without directly damaging user files. It stores agent filesystem state in SQLite and exposes it as a filesystem through FUSE/NFS/SDK/OPFS.
 
-Layered 实现要点：
+Layered implementation points:
 
-- base layer 是原目录，只读。
-- delta layer 是 AgentFS SQLite DB。
-- read 先查 delta，再查 base。
-- write base 文件时 copy-up 到 delta。
-- delete base 文件时在 delta 写 whiteout。
-- delta 中存文件、目录、块、tool call、KV 等结构化表。
-- session DB 可复制、移动、查询，天然形成快照/审计单元。
+- The base layer is the original directory and is read-only.
+- The delta layer is an AgentFS SQLite DB.
+- Reads check delta first, then base.
+- Writes to base files copy up into delta.
+- Deletes of base files write whiteouts into delta.
+- Delta stores structured tables for files, directories, blocks, tool calls, KV, and more.
+- The session DB can be copied, moved, and queried, naturally becoming the snapshot/audit unit.
 
-优点：
+Strengths:
 
-- 极强的可移植性：一个 SQLite 文件就是一个 agent session。
-- 审计友好：文件变化和 tool calls 都在结构化 DB 中。
-- 与工具兼容：FUSE/NFS 后，`git`、`grep`、`cat` 等都能直接用。
+- Strong portability: one SQLite file is one agent session.
+- Audit-friendly: file changes and tool calls live in a structured DB.
+- Tool-compatible: after FUSE/NFS mount, `git`, `grep`, `cat`, and similar tools work directly.
 
-局限：
+Limitations:
 
-- SQLite upper layer 更适合单机/单 session portable model。
-- 服务端多租户、S3 大对象、semantic search、quota、GC 会要求额外整合。
-- full-file copy-up 对超大文件需要后续优化。
+- A SQLite upper layer is better for a single-machine, single-session portable model.
+- Server-side multitenancy, S3 large objects, semantic search, quota, and GC all need extra integration.
+- Full-file copy-up needs later optimization for very large files.
 
-Drive9 建议：
+Drive9 recommendations:
 
-- 学习 AgentFS 的 copy-up / whiteout / diff / audit 语义。
-- 不把 SQLite 作为 Drive9 权威层；Drive9 的权威 upper layer 应在 TiDB/db9 元数据表中。
-- 可以后续提供“导出 layer 为 SQLite/zip bundle”的 portability 功能。
+- Adopt AgentFS' copy-up / whiteout / diff / audit semantics.
+- Do not use SQLite as Drive9's authoritative layer. Drive9's authoritative upper layer should live in TiDB/db9 metadata tables.
+- Later, provide portability features such as exporting a layer as a SQLite/zip bundle.
 
 ### Cloudflare Sandbox SDK
 
-Cloudflare Sandbox SDK 是安全执行环境，架构上是 Worker -> Durable Object -> Container。它提供文件读写、命令执行、watch、bucket mount、backup/restore 等能力。
+Cloudflare Sandbox SDK is a secure execution environment built as Worker -> Durable Object -> Container. It provides file read/write, command execution, watch, bucket mounts, backup/restore, and related capabilities.
 
-Layered 实现相关点：
+Layered implementation points:
 
-- sandbox 自带独立 filesystem，但默认只在容器 active 期间保留；idle/restart 后状态会丢失。
-- backup/restore 用 R2 存 `data.sqsh` 和 metadata。
-- production restore 时把 backup 作为 read-only lower layer，通过 FUSE overlayfs 挂载；新写入进入 writable upper layer，不修改原 backup。
-- 本地开发 restore 不是 COW overlay，而是 `unsquashfs` 解压替换目录。
-- R2/S3 bucket 可 mount 到路径，支持 prefix 和 read-only；文档明确提醒 bucket mount 比本地 filesystem 慢。
+- Each sandbox has an independent filesystem, but by default it only persists while the container is active. State can be lost after idle/restart.
+- Backup/restore stores `data.sqsh` and metadata in R2.
+- Production restore mounts the backup as a read-only lower layer through FUSE overlayfs; new writes go into a writable upper layer and do not mutate the original backup.
+- Local development restore is not a COW overlay. It uses `unsquashfs` to unpack and replace the directory.
+- R2/S3 buckets can be mounted at paths with prefix and read-only support. The docs explicitly note that bucket mounts are slower than the local filesystem.
 
-Drive9 建议：
+Drive9 recommendations:
 
-- execution sandbox lifecycle 不应决定 Drive9 文件生命周期。
-- Drive9 layer 应作为 durable storage/session，与 Cloudflare/E2B/Modal 这类 sandbox 解耦。
-- 如果将来 Drive9 对接 Cloudflare Sandbox，可把 Drive9 layer mount/restore 到 sandbox 内，而不是把 sandbox FS 当作 Drive9 权威存储。
+- The execution sandbox lifecycle should not determine the Drive9 file lifecycle.
+- Drive9 layers should be durable storage/session objects decoupled from Cloudflare/E2B/Modal-style sandboxes.
+- If Drive9 integrates with Cloudflare Sandbox later, mount/restore Drive9 layers into the sandbox instead of treating the sandbox filesystem as Drive9's authoritative storage.
 
 ### Cloudflare ArtifactFS
 
-ArtifactFS 是 Git-backed FUSE filesystem，目标是让大 repo 快速可见，blob 按需 hydrate。它非常贴近 Drive9 当前 Git fast workspace。
+ArtifactFS is a Git-backed FUSE filesystem whose goal is to make large repositories visible quickly and hydrate blobs on demand. It is very close to Drive9's current Git fast workspace.
 
-Layered 实现相关点：
+Layered implementation points:
 
-- base 是 Git commit tree snapshot，而不是完整 checkout。
-- FUSE 立即暴露完整目录树。
-- blob 内容按需通过 Git object 读取并缓存。
-- writable overlay 存 dirty/new/delete。
-- resolver 合并 snapshot + overlay。
-- 删除用 whiteout。
-- E2E 测试覆盖 FUSE、git 操作、commit 和 overlay reconciliation。
+- The base is a Git commit tree snapshot, not a full checkout.
+- FUSE exposes the full directory tree immediately.
+- Blob content is read from Git objects on demand and cached.
+- The writable overlay stores dirty/new/delete entries.
+- The resolver merges snapshot + overlay.
+- Deletes use whiteouts.
+- E2E tests cover FUSE, Git operations, commit, and overlay reconciliation.
 
-Drive9 当前已经有类似结构：
+Drive9 already has a similar structure:
 
-- `git_workspaces` 保存 workspace 元信息。
-- `git_workspace_tree_nodes` 保存 clean tree manifest。
-- `git_workspace_overlay` 保存 dirty/new/delete/chmod/symlink。
-- FUSE 里 `pkg/fuse/git_workspace.go` 做 merged view、hydrate、overlay read/write。
+- `git_workspaces` stores workspace metadata.
+- `git_workspace_tree_nodes` stores the clean tree manifest.
+- `git_workspace_overlay` stores dirty/new/delete/chmod/symlink entries.
+- `pkg/fuse/git_workspace.go` implements merged view, hydrate, and overlay read/write in FUSE.
 
-Drive9 建议：
+Drive9 recommendations:
 
-- 通用 layered FS 应复用这套思想：base identity + overlay op + path hash + merged resolver。
-- Git workspace 保持专用 base tree，不要把 clean Git blobs 写进普通 `file_nodes`。
-- 抽象公共 overlay resolver，但不要急着把 Git workspace 表强行并入通用表。
+- The generic layered FS should reuse the same ideas: base identity + overlay op + path hash + merged resolver.
+- Git workspace should keep its specialized base tree. Do not write clean Git blobs into generic `file_nodes`.
+- Extract a common overlay resolver, but do not rush to force Git workspace tables into the generic tables.
 
 ### Tilde
 
-Tilde 的 model 是“每个 sandbox 获得一个 versioned FUSE mount，对应一个 transactional session”。sandbox 内对 mount 的写入都 staged；成功退出 commit，失败/取消/超时 rollback；同路径冲突会导致 commit failed。
+Tilde's model is: each sandbox gets a versioned FUSE mount that corresponds to a transactional session. Writes inside the sandbox mount are staged; exit success commits; failure, cancellation, or timeout rolls back. Same-path conflicts make commit fail.
 
-Drive9 建议：
+Drive9 recommendations:
 
-- 给 layer 明确状态机：`active`、`sealed`、`awaiting_approval`、`committed`、`abandoned`。
-- `commit` 必须 all-or-nothing，避免半提交。
-- 权限错误尽量在 `open/create/unlink` 发生，而不是到 commit 才发现。
-- 同一路径 base revision 冲突时 commit fail，后续提供 rebase/resolve。
+- Give layers a clear state machine: `active`, `sealed`, `awaiting_approval`, `committed`, `abandoned`.
+- `commit` must be all-or-nothing to avoid partial commits.
+- Permission errors should happen at `open/create/unlink` time whenever possible, not only at commit time.
+- If the base revision changed for the same path, commit should fail and later offer rebase/resolve.
 
-### E2B 和 Modal
+### E2B and Modal
 
-E2B snapshot 捕获 running sandbox 的 filesystem + memory，可以一对多创建新 sandbox。Modal 有 filesystem snapshot、directory snapshot、memory snapshot；filesystem snapshot 是相对 base image 的 diff，并可长期保存。
+E2B snapshots capture a running sandbox's filesystem + memory and can create many new sandboxes. Modal has filesystem snapshots, directory snapshots, and memory snapshots; filesystem snapshots are diffs relative to the base image and can be stored long-term.
 
-它们适合：
+They are useful for:
 
-- 缓存重环境，减少 cold start。
-- fork 运行时状态。
-- 复制 agent execution state。
+- Caching heavy environments to reduce cold start.
+- Forking runtime state.
+- Copying agent execution state.
 
-它们不适合作为 Drive9 主文件模型：
+They are not good as Drive9's primary file model:
 
-- 文件级 diff/search/commit/rollback 不够透明。
-- 语义检索、审计、quota、per-path conflict 需要 Drive9 自己掌握 metadata。
+- File-level diff/search/commit/rollback is not transparent enough.
+- Semantic retrieval, audit, quota, and per-path conflict handling need to be owned by Drive9 metadata.
 
-Drive9 建议：
+Drive9 recommendations:
 
-- 把 E2B/Modal snapshot 当 execution acceleration。
-- Drive9 layer ID 作为外部 sandbox 的持久文件状态句柄。
+- Treat E2B/Modal snapshots as execution acceleration.
+- Use the Drive9 layer ID as the durable file-state handle for external sandboxes.
 
 ### Daytona Volumes
 
-Daytona volumes 是 FUSE-backed persistent volume，数据落在 S3-compatible object store。它支持多个 sandbox mount 同一个 volume，并用 subpath 做隔离。
+Daytona volumes are FUSE-backed persistent volumes stored in an S3-compatible object store. Multiple sandboxes can mount the same volume, with subpaths used for isolation.
 
-对 Drive9 的启发：
+Implications for Drive9:
 
-- 对大模型、大数据集、共享 artifacts，persistent volume 很有用。
-- 但它不是事务 overlay。文档明确说明共享 FUSE volume 非 transactional，同路径并发写入是 last write wins。
-- Drive9 agent editing 需要 review/rollback/conflict，所以不能只做共享 volume。
+- Persistent volumes are useful for large models, large datasets, and shared artifacts.
+- They are not transactional overlays. The docs state that shared FUSE volumes are not transactional and concurrent writes to the same path are last-write-wins.
+- Drive9 agent editing needs review/rollback/conflict handling, so a shared volume alone is insufficient.
 
-### YoloFS 和 DeltaFS
+### YoloFS and DeltaFS
 
-YoloFS 提出 agent-native filesystem 应把信息和控制下沉到 FS：staging 隔离所有 mutation，snapshot 让 agent 能自我纠错，progressive permission 减少无谓 prompt。
+YoloFS argues that agent-native filesystems should move information and control into the filesystem: staging isolates all mutations, snapshots let agents self-correct, and progressive permissions reduce unnecessary prompts.
 
-DeltaFS 关注高频 checkpoint/rollback：文件状态分层；checkpoint 时冻结当前 writable layer 并插入新 writable layer；rollback 变成 layer switch。
+DeltaFS focuses on high-frequency checkpoint/rollback: file state is layered; checkpoint freezes the current writable layer and inserts a new writable layer; rollback becomes a layer switch.
 
-Drive9 建议：
+Drive9 recommendations:
 
-- `layer diff`、`layer status`、`layer rollback` 应该可被 agent 自己调用，而不是只给人类 UI。
-- snapshot 设计成 metadata 操作，避免全量复制。
-- layer chain 必须有 depth limit 和 compaction。
+- `layer diff`, `layer status`, and `layer rollback` should be callable by agents themselves, not only by human UI.
+- Snapshot should be a metadata operation, avoiding full copies.
+- Layer chains must have a depth limit and compaction.
 
-## Drive9 现状映射
+## Drive9 Current State Mapping
 
-当前相关代码：
+Relevant current code:
 
-- 通用文件元数据和内容：`pkg/datastore/store.go`、`pkg/datastore/file_tx.go`、`pkg/backend/dat9.go`。
-- FUSE 本地写入 staging：`pkg/fuse/shadow.go`、`pkg/fuse/writeback.go`、`pkg/fuse/commit_queue.go`。
-- coding-agent local-only overlay：`pkg/fuse/local_overlay.go`、`pkg/fuse/local_policy.go`。
-- Git 专用 layered workspace：`pkg/tenant/schema/git_workspace.go`、`pkg/datastore/git_workspace.go`、`pkg/fuse/git_workspace.go`、`docs/design/git-fast-clone-workspace.md`。
+- Generic file metadata and content: `pkg/datastore/store.go`, `pkg/datastore/file_tx.go`, `pkg/backend/dat9.go`.
+- FUSE local write staging: `pkg/fuse/shadow.go`, `pkg/fuse/writeback.go`, `pkg/fuse/commit_queue.go`.
+- Coding-agent local-only overlay: `pkg/fuse/local_overlay.go`, `pkg/fuse/local_policy.go`.
+- Git-specific layered workspace: `pkg/tenant/schema/git_workspace.go`, `pkg/datastore/git_workspace.go`, `pkg/fuse/git_workspace.go`, `docs/design/git-fast-clone-workspace.md`.
 
-Drive9 已具备：
+Drive9 already has:
 
-- 绝对路径、目录 `/` 结尾、文件非 `/` 结尾的 canonical path 规则。
-- `file_nodes` / `inodes` / `contents` / `semantic` 分离。
-- revision-based write conflict 机制。
-- DB-inline / S3 大对象分层。
-- FUSE shadow files、writeback、pending index。
-- Git workspace 的 `upsert` / `whiteout` / `chmod` / `symlink` overlay 模型。
+- Canonical path rules: absolute paths, directories ending with `/`, files not ending with `/`.
+- Separation between `file_nodes` / `inodes` / `contents` / `semantic`.
+- Revision-based write conflict detection.
+- DB-inline / S3 large-object tiering.
+- FUSE shadow files, writeback, and pending index.
+- Git workspace overlay semantics for `upsert` / `whiteout` / `chmod` / `symlink`.
 
-缺口：
+Gaps:
 
-- 普通 Drive9 文件还没有服务端通用 overlay layer。
-- API/FUSE/backend 缺少 layer-aware merged resolver。
-- 缺少 layer 生命周期、diff、commit、rollback。
-- 缺少 layer-aware search / semantic indexing。
-- 缺少通用 per-layer audit event。
+- Generic Drive9 files do not yet have a server-side generic overlay layer.
+- API/FUSE/backend lack a layer-aware merged resolver.
+- There is no layer lifecycle, diff, commit, or rollback.
+- There is no layer-aware search / semantic indexing.
+- There is no generic per-layer audit event stream.
 
-## 推荐架构
+## Recommended Architecture
 
-### 核心模型
+### Core Model
 
-新增 Drive9 原生 layer：
+Add a native Drive9 layer:
 
 ```text
 Merged view
@@ -270,11 +270,11 @@ Merged view
   search: existing semantic plane + layer scope
 ```
 
-layer 是 lightweight per-agent/per-task writable overlay，不是 tenant fork。tenant fork 可以继续作为重型隔离/分支能力存在。
+A layer is a lightweight per-agent/per-task writable overlay, not a tenant fork. Tenant fork can continue to exist as the heavier isolation/branching capability.
 
-### 表结构草案
+### Data Model Draft
 
-MVP 建议模仿 `git_workspace_overlay`，减少一次性抽象复杂度：
+The MVP should imitate `git_workspace_overlay` to avoid excessive abstraction up front:
 
 ```sql
 CREATE TABLE fs_layers (
@@ -323,91 +323,91 @@ CREATE INDEX idx_fs_layer_op
   ON fs_layer_entries(layer_id, op);
 ```
 
-设计要点：
+Design notes:
 
-- `path_hash` 复用 Drive9/Git workspace 的长路径索引策略。
-- `path` 原文仍是权威值，lookup 时 hash + path 双重校验。
-- `base_inode_id` / `base_revision` 用于 commit conflict detection。
-- `content_blob` 适合小文件；大文件仍走现有 S3 `storage_ref`。
-- 后续可以把 content 字段抽到 layer-scoped `inodes` / `contents`，但 MVP 不必一开始做过度抽象。
+- `path_hash` reuses Drive9/Git workspace's long-path indexing strategy.
+- `path` remains the authoritative value; lookup must verify both hash and path.
+- `base_inode_id` / `base_revision` are used for commit conflict detection.
+- `content_blob` is suitable for small files; large files still use the existing S3 `storage_ref`.
+- Later, content fields can move into layer-scoped `inodes` / `contents`, but the MVP should not start with that extra abstraction.
 
 ### Merged Resolver
 
-`Stat(path, layer_id)`：
+`Stat(path, layer_id)`:
 
-1. 查 exact overlay entry。
-2. `op=whiteout` 返回 not found。
-3. `op=upsert|mkdir|symlink|chmod` 返回 overlay metadata。
-4. 否则查 base。
+1. Look up the exact overlay entry.
+2. If `op=whiteout`, return not found.
+3. If `op=upsert|mkdir|symlink|chmod`, return overlay metadata.
+4. Otherwise look up base.
 
-`ReadDir(dir, layer_id)`：
+`ReadDir(dir, layer_id)`:
 
-1. list base children。
-2. list overlay children。
-3. 同名 overlay 覆盖 base。
-4. whiteout 隐藏 base child。
-5. overlay-only child 加入结果。
+1. List base children.
+2. List overlay children.
+3. Let same-name overlay entries override base.
+4. Let whiteouts hide base children.
+5. Add overlay-only children to the result.
 
-`Read(path, layer_id)`：
+`Read(path, layer_id)`:
 
-1. overlay 有内容则读 overlay。
-2. overlay 是 whiteout 则 not found。
-3. 否则读 base。
+1. If overlay has content, read overlay.
+2. If overlay is a whiteout, return not found.
+3. Otherwise read base.
 
-`Write(path, layer_id)`：
+`Write(path, layer_id)`:
 
-1. overlay-only 文件直接更新 overlay entry。
-2. base 文件首次写入：记录 `base_inode_id`、`base_revision`，copy-up 完整内容到 overlay，再写 overlay。
-3. 大文件走现有 upload/S3 path，overlay entry 只保存 storage ref。
+1. Update the overlay entry directly for overlay-only files.
+2. On the first write to a base file, record `base_inode_id` and `base_revision`, copy up the full content into overlay, then write overlay.
+3. Large files use the existing upload/S3 path; the overlay entry stores only the storage ref.
 
-`Delete(path, layer_id)`：
+`Delete(path, layer_id)`:
 
-1. overlay-only entry 可以删除或变成 tombstone。
-2. base 文件写 `op=whiteout`。
-3. 目录删除 MVP 只支持 empty dir；recursive delete 后续做批量 whiteout。
+1. Overlay-only entries can be deleted or converted to tombstones.
+2. Base files write `op=whiteout`.
+3. Directory delete in the MVP only supports empty directories; recursive delete can later use batch whiteouts.
 
-`Rename(old, new, layer_id)`：
+`Rename(old, new, layer_id)`:
 
-- MVP 支持文件/软链：old whiteout + new upsert。
-- 目录 rename 先返回 typed error 或 FUSE `EXDEV`，让调用方 fallback 到 copy/delete。
-- 后续再做 atomic recursive rename 或 `op=rename`。
+- MVP supports files and symlinks: old whiteout + new upsert.
+- Directory rename first returns a typed error or FUSE `EXDEV`, letting callers fall back to copy/delete.
+- Later versions can add atomic recursive rename or `op=rename`.
 
-`Commit(layer_id)`：
+`Commit(layer_id)`:
 
-1. seal layer，阻止新写入。
-2. 开 DB transaction。
-3. 对每个 entry 检查 base revision。
-4. upsert 写入 base `file_nodes` / `inodes` / `contents`。
-5. whiteout 执行 base delete。
-6. enqueue semantic tasks。
-7. 标记 layer committed。
-8. 对未提交/被替换 S3 refs 入 GC。
+1. Seal the layer and reject new writes.
+2. Open a DB transaction.
+3. Check base revision for every entry.
+4. Apply upserts to base `file_nodes` / `inodes` / `contents`.
+5. Apply whiteouts as base deletes.
+6. Enqueue semantic tasks.
+7. Mark the layer committed.
+8. Send uncommitted/replaced S3 refs to GC.
 
-`Rollback(layer_id)`：
+`Rollback(layer_id)`:
 
-1. 标记 layer abandoned。
-2. merged view 不再读取该 layer。
-3. overlay content 按 retention 入 GC。
+1. Mark the layer abandoned.
+2. Stop reading the layer in merged views.
+3. Send overlay content to GC according to retention.
 
-`Snapshot(layer_id)`：
+`Snapshot(layer_id)`:
 
-- seal 当前 layer 或记录 snapshot point。
-- 创建 child layer，`parent_layer_id = current_layer_id`。
-- MVP 限制 depth 为 1-2；后续增加 flatten/compaction。
+- Seal the current layer or record a snapshot point.
+- Create a child layer with `parent_layer_id = current_layer_id`.
+- Limit MVP depth to 1-2; add flatten/compaction later.
 
-## API / CLI 建议
+## API / CLI Recommendations
 
-Server：
+Server:
 
-- `POST /v1/layers`：创建 layer。
-- `GET /v1/layers/{id}`：查看状态。
-- `GET /v1/layers/{id}/diff`：查看 staged changes。
-- `POST /v1/layers/{id}/checkpoints`：创建 restore checkpoint。
-- `POST /v1/layers/{id}/commit`：all-or-nothing commit。
-- `POST /v1/layers/{id}/rollback`：abandon。
-- 现有 `/v1/fs/{path}` 通过 header 选择 layer，例如 `Drive9-Layer-ID`，避免污染 path。
+- `POST /v1/layers`: create a layer.
+- `GET /v1/layers/{id}`: inspect status.
+- `GET /v1/layers/{id}/diff`: inspect staged changes.
+- `POST /v1/layers/{id}/checkpoints`: create a restore checkpoint.
+- `POST /v1/layers/{id}/commit`: all-or-nothing commit.
+- `POST /v1/layers/{id}/rollback`: abandon.
+- Existing `/v1/fs/{path}` selects a layer through a header such as `Drive9-Layer-ID` to avoid polluting paths.
 
-CLI：
+CLI:
 
 ```bash
 drive9 fs layer create :/project --name agent-task-123
@@ -417,39 +417,39 @@ drive9 fs layer commit <layer-id>
 drive9 fs layer rollback <layer-id>
 ```
 
-FUSE：
+FUSE:
 
-- `MountOptions` 增加 `LayerID`。
-- `Stat`、`ReadDir`、`Read`、`Write`、`Mkdir`、`Rename`、`Unlink`、`Symlink`、`Chmod`、`Flush` 都走 layer-aware client。
-- coding-agent local-only overlay 继续保留，用于 `.git`、`node_modules`、build output、cache。
-- local-only state 必须清晰标注为 rebuildable，不自动进入 durable layer。
+- Add `LayerID` to `MountOptions`.
+- `Stat`, `ReadDir`, `Read`, `Write`, `Mkdir`, `Rename`, `Unlink`, `Symlink`, `Chmod`, and `Flush` all use the layer-aware client.
+- Keep the coding-agent local-only overlay for `.git`, `node_modules`, build output, and cache.
+- Local-only state must be clearly marked as rebuildable and must not automatically enter the durable layer.
 
-## Search / Semantic 语义
+## Search / Semantic Semantics
 
-Layer-aware search 的规则：
+Layer-aware search rules:
 
-- base search result 必须被 overlay whiteout / replacement 过滤。
-- overlay 新建/修改文件应在 commit 前可搜索。
-- MVP 可先做 overlay `content_text` 的 keyword/FTS。
-- P1 增加 `layer_id` 到 semantic task/resource identity，或引入 `fs_layer_semantic`。
-- commit 后，semantic entry 应进入 base inode revision，或触发重新计算。
+- Base search results must be filtered by overlay whiteouts/replacements.
+- New/modified overlay files should be searchable before commit.
+- MVP can start with keyword/FTS over overlay `content_text`.
+- P1 can add `layer_id` to semantic task/resource identity, or introduce `fs_layer_semantic`.
+- After commit, semantic entries should move to the base inode revision or trigger recomputation.
 
-关键约束：如果 layer 删除或替换了 `/foo.txt`，base 里旧 `/foo.txt` 的 semantic hit 不应出现在 layer search 结果中。
+Key constraint: if a layer deletes or replaces `/foo.txt`, the old `/foo.txt` semantic hit from base must not appear in layer search results.
 
-## 权限与安全
+## Permissions and Security
 
-建议拆分权限：
+Recommended permission split:
 
-- 读 base：需要 base read。
-- 写 layer：需要 layer write。
-- commit 到 base：对每个受影响 path 需要 base write/delete。
-- rollback：需要 layer owner 或 layer admin。
+- Read base: requires base read.
+- Write layer: requires layer write.
+- Commit to base: requires base write/delete for every affected path.
+- Rollback: requires layer owner or layer admin.
 
-参考 Tilde/YoloFS：能在 open/create/unlink 阶段失败的权限错误，就不要拖到 commit 阶段才失败。这样 agent 能立刻感知并调整行为。
+Following Tilde/YoloFS, permission errors that can fail at `open/create/unlink` should fail there instead of being delayed until commit. This lets agents observe failures immediately and adapt.
 
 ## Audit
 
-建议增加 append-only layer event stream：
+Add an append-only layer event stream:
 
 ```sql
 CREATE TABLE fs_layer_events (
@@ -467,21 +467,21 @@ CREATE TABLE fs_layer_events (
 );
 ```
 
-这让 Drive9 获得 AgentFS 最有价值的部分：layer 不只是若干 blob，而是可解释、可追溯、可审计的 agent session。后续可与现有 journal 产品打通。
+This gives Drive9 the most valuable part of AgentFS: a layer is not just a set of blobs, but an explainable, traceable, auditable agent session. Later this can integrate with the existing journal product.
 
-## 分阶段落地计划
+## Phased Implementation Plan
 
-### Phase 0：设计收敛
+### Phase 0: Design Convergence
 
-- 写 ADR/spec，明确 `fs_layers`、`fs_layer_entries`、`fs_layer_events`。
-- 确定 overlay content 是复制字段，还是引用 layer-scoped inode/content。
-- 定义 file replace、file delete、directory delete、directory rename 的冲突规则。
-- 定义 abandoned layer 和 uncommitted S3 refs 的 GC 策略。
+- Write an ADR/spec defining `fs_layers`, `fs_layer_entries`, and `fs_layer_events`.
+- Decide whether overlay content is copied fields or references to layer-scoped inode/content.
+- Define conflict rules for file replace, file delete, directory delete, and directory rename.
+- Define the GC strategy for abandoned layers and uncommitted S3 refs.
 
-### Phase 1：Backend MVP
+### Phase 1: Backend MVP
 
-- 更新 `pkg/tenant/schema/tidb_auto.go`、`tidb_app.go`、`db9/schema.go`。
-- 增加 datastore 方法：
+- Update `pkg/tenant/schema/tidb_auto.go`, `tidb_app.go`, and `db9/schema.go`.
+- Add datastore methods:
   - `CreateLayer`
   - `GetLayer`
   - `UpsertLayerEntry`
@@ -490,52 +490,52 @@ CREATE TABLE fs_layer_events (
   - `DiffLayer`
   - `CommitLayer`
   - `RollbackLayer`
-- 在 `Dat9Backend` 周围实现 layer-aware resolver。
-- 单测覆盖 `Stat`、`ReadDir`、`Read`、`Write`、`Delete`、commit conflict。
+- Implement a layer-aware resolver around `Dat9Backend`.
+- Unit tests cover `Stat`, `ReadDir`, `Read`, `Write`, `Delete`, and commit conflicts.
 
-### Phase 2：API / CLI
+### Phase 2: API / CLI
 
-- 增加 layer lifecycle endpoints。
-- client 支持 layer header/options。
-- 增加 `drive9 fs layer` 命令组。
-- 不带 layer ID 时，现有 `/v1/fs` 行为完全兼容。
+- Add layer lifecycle endpoints.
+- Add layer headers/options to the client.
+- Add the `drive9 fs layer` command group.
+- Preserve existing `/v1/fs` behavior when no layer ID is provided.
 
-### Phase 3：FUSE Agent Workflow
+### Phase 3: FUSE Agent Workflow
 
-- 增加 `drive9 mount --layer`。
-- FUSE 所有路径操作走 layer-aware client。
-- `FlushAll` / unmount 时 drain overlay writes。
-- 增加 FUSE 层 diff/rollback 测试。
+- Add `drive9 mount --layer`.
+- Route all FUSE path operations through the layer-aware client.
+- Drain overlay writes during `FlushAll` / unmount.
+- Add FUSE-level diff/rollback tests.
 
-### Phase 4：Search / Audit / Snapshot
+### Phase 4: Search / Audit / Snapshot
 
-- 接入 `fs_layer_events`。
-- layer-aware search 过滤 base hits。
-- overlay semantic indexing。
-- 增加 snapshot/child layer，带 max-depth guard。
-- 增加 compaction/flattening。
+- Integrate `fs_layer_events`.
+- Filter base hits in layer-aware search.
+- Add overlay semantic indexing.
+- Add snapshot/child layers with max-depth guard.
+- Add compaction/flattening.
 
-### Phase 5：与 Git Workspace 适度统一
+### Phase 5: Moderate Unification with Git Workspace
 
-Git workspace 有特殊的 clean Git tree、blob hydrate、`.git` checkpoint 需求，不应急于迁到通用表。但通用 layer 稳定后可以：
+Git workspace has special needs for clean Git trees, blob hydration, and `.git` checkpoints, so it should not be migrated into generic tables too early. After the generic layer stabilizes, Drive9 can:
 
-- 共享 whiteout/diff/commit 代码。
-- 抽象共同 overlay resolver interface。
-- 保持 Git base tree 独立于普通 `file_nodes`。
+- Share whiteout/diff/commit code.
+- Extract a shared overlay resolver interface.
+- Keep the Git base tree independent from generic `file_nodes`.
 
-## 风险与注意事项
+## Risks and Notes
 
-- 目录操作复杂度高，MVP 应保守处理 directory rename / recursive delete。
-- layer-aware search 如果不正确过滤 base hits，会给 agent 错误上下文。
-- S3 GC 必须同时考虑 uncommitted layer、committed base refs、tenant forks、abandoned sessions。
-- FUSE kernel cache 需要在 overlay 被外部修改时正确 invalidation。
-- layer chain 过深会拖慢 `stat/readdir/read`，必须早期限制 depth。
-- commit 必须 all-or-nothing，否则 review/rollback 语义会崩。
-- local-only overlay 和 durable layer 必须在 UI/CLI 中区分清楚，避免 agent 误以为 build output 已持久化。
+- Directory operations are complex. The MVP should handle directory rename / recursive delete conservatively.
+- If layer-aware search fails to filter base hits correctly, it will give agents incorrect context.
+- S3 GC must account for uncommitted layers, committed base refs, tenant forks, and abandoned sessions.
+- FUSE kernel cache must be invalidated correctly when an overlay is modified externally.
+- Deep layer chains will slow down `stat/readdir/read`, so depth limits are needed early.
+- Commit must be all-or-nothing; otherwise review/rollback semantics collapse.
+- Local-only overlay and durable layer must be clearly separated in UI/CLI so agents do not assume build output is persisted.
 
-## 最终建议
+## Final Recommendation
 
-Drive9 的 layered filesystem 应以这个形态落地：
+Drive9's layered filesystem should land in this shape:
 
 ```text
 existing base namespace
@@ -544,9 +544,9 @@ existing base namespace
   + explicit diff/commit/rollback
 ```
 
-这条路径吸收了 AgentFS 的安全和审计、ArtifactFS 的 lazy base + overlay resolver、Tilde 的 transactional session，又不放弃 Drive9 已有的多租户、semantic search、S3/db9 存储、FUSE writeback 和 Git workspace 基础。
+This path absorbs AgentFS' safety and audit model, ArtifactFS' lazy base + overlay resolver, and Tilde's transactional session, while preserving Drive9's existing multitenancy, semantic search, S3/db9 storage, FUSE writeback, and Git workspace foundations.
 
-最小可用产品形态：
+Minimum viable product:
 
 ```bash
 drive9 fs layer create :/repo
@@ -556,4 +556,4 @@ drive9 fs layer diff <id>
 drive9 fs layer commit <id>   # or rollback
 ```
 
-这会让 Drive9 的 agent workspace 具备四个核心能力：安全隔离、可审查、可恢复、可 fork。
+This gives Drive9 agent workspaces four core capabilities: safe isolation, reviewability, recoverability, and forkability.

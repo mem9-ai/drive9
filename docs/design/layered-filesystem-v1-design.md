@@ -1,22 +1,22 @@
 # Drive9 Layer FS V1 Design
 
-日期：2026-06-03
+Date: 2026-06-03
 
-本文给出 Drive9 Layer FS V1 设计。V1 采用业界逐渐统一的基础方向：只读 base、单 writable overlay、copy-up、whiteout、显式 checkpoint/commit/rollback。本文暂不采用 DeltaFS/DeltaBox 的多 segment stack 过度优化；DeltaFS 思想可作为后续高频 checkpoint/rollback 的演进方向。
+This document defines the Drive9 Layer FS V1 design. V1 follows the foundational direction that the industry is converging on: read-only base, one writable overlay, copy-up, whiteout, and explicit checkpoint/commit/rollback. This document does not adopt DeltaFS/DeltaBox-style multi-segment stack optimizations in V1; DeltaFS ideas remain a future direction for high-frequency checkpoint/rollback.
 
-V1 的目标是：在 Drive9 上提供 agent/sandbox 友好的 layered filesystem，同时不破坏现有 Drive9 能力和性能。无 layer 时，现有 `/v1/fs`、FUSE、Git workspace、S3 multipart、semantic search、tenant fork 行为必须保持不变。
+The goal of V1 is to provide an agent/sandbox-friendly layered filesystem on Drive9 without breaking existing Drive9 capabilities or performance. When no layer is used, existing `/v1/fs`, FUSE, Git workspace, S3 multipart, semantic search, and tenant fork behavior must remain unchanged.
 
-## 用户旅程
+## User Journey
 
-### 1. 开始一个 agent 工作会话
+### 1. Start an Agent Work Session
 
-用户从现有 Drive9 路径创建 layer：
+The user creates a layer from an existing Drive9 path:
 
 ```bash
 drive9 fs layer create :/repo --name fix-auth-bug --tag task=auth --tag env=dev --durability=restore-safe
 ```
 
-返回：
+Response:
 
 ```text
 layer_id: lyr_abc
@@ -25,13 +25,13 @@ status: active
 durability: restore-safe
 ```
 
-然后把这个 layer mount 出来：
+Then the user mounts the layer:
 
 ```bash
 drive9 mount :/repo ./repo --layer lyr_abc --profile=coding-agent
 ```
 
-后续任何需要指定 layer 的地方，都可以使用以下任一引用：
+Any place that needs a layer can use any of these references:
 
 ```bash
 drive9 mount :/repo ./repo --layer lyr_abc
@@ -40,18 +40,18 @@ drive9 mount :/repo ./repo --layer task=auth
 drive9 mount :/repo ./repo --layer tag:task=auth
 ```
 
-解析顺序为 `layer_id -> name -> tag`。如果 `name` 或 `tag` 命中多个 layer，命令必须报 conflict 并提示用户使用 layer_id 或添加更精确 tag；不能随机选择。
+Resolution order is `layer_id -> name -> tag`. If `name` or `tag` matches multiple layers, the command must return a conflict and prompt the user to use `layer_id` or a more specific tag. It must not choose randomly.
 
-用户心智模型：
+User mental model:
 
 ```text
-:/repo 的 base 不变
-agent 的修改先进 lyr_abc
+base :/repo does not change
+agent changes go into lyr_abc first
 ```
 
-### 2. Agent 正常读写
+### 2. Agent Reads and Writes Normally
 
-agent 或用户在 mount 中照常操作：
+The agent or user works normally inside the mount:
 
 ```bash
 cd ./repo
@@ -60,16 +60,16 @@ go test ./pkg/server
 npm install
 ```
 
-交互上不要求用户理解 Drive9 内部层级：
+The interaction does not require the user to understand Drive9 internals:
 
-- 源码、文档、配置等 durable 文件进入 layer。
-- `.git`、`node_modules`、build/cache 输出优先走现有 local-only overlay。
-- 文件 `close`、`fsync`、checkpoint、unmount 会把 durable layer 推进到后端。
-- 没有 layer 的普通 Drive9 mount 行为完全不变。
+- Durable files such as source code, docs, and config enter the layer.
+- `.git`, `node_modules`, and build/cache output prefer the existing local-only overlay.
+- File `close`, `fsync`, checkpoint, and unmount advance the durable layer to the backend.
+- Regular Drive9 mount behavior remains unchanged when no layer is used.
 
-### 3. 查看状态和 diff
+### 3. Inspect Status and Diff
 
-用户随时查看 layer 状态：
+The user can inspect layer status at any time:
 
 ```bash
 drive9 fs layer status lyr_abc
@@ -77,7 +77,7 @@ drive9 fs layer status fix-auth-bug
 drive9 fs layer status task=auth
 ```
 
-示例输出：
+Example output:
 
 ```text
 Layer lyr_abc active
@@ -91,24 +91,24 @@ D pkg/server/legacy_token.go
 L node_modules/        local-only, rebuildable
 ```
 
-查看 diff：
+Inspect the diff:
 
 ```bash
 drive9 fs layer diff lyr_abc
 ```
 
-diff 应像 Git diff，但明确标出 base revision、layer revision、local-only 项。
+The diff should look like Git diff, while explicitly showing base revision, layer revision, and local-only items.
 
-### 4. 创建 restore checkpoint
+### 4. Create a Restore Checkpoint
 
-在 sandbox 替换、长任务中间点、风险操作前，用户或 orchestrator 执行：
+Before sandbox replacement, at long-task intermediate points, or before risky operations, the user or orchestrator runs:
 
 ```bash
 drive9 fs layer checkpoint lyr_abc --wait --label before-refactor
 drive9 fs layer checkpoint fix-auth-bug --wait --label before-refactor
 ```
 
-返回：
+Response:
 
 ```text
 checkpoint: cp_before_refactor
@@ -116,54 +116,54 @@ durable_seq: 57
 restore_safe: true
 ```
 
-含义：
+Meaning:
 
-- checkpoint 前所有 durable 文件修改都已写入 Drive9 后端。
-- 新 sandbox 可以从这个 checkpoint 恢复。
-- 未关闭、未 fsync、未 checkpoint 的 open dirty handle 不承诺跨 sandbox 恢复。
+- All durable file changes before the checkpoint have been written to the Drive9 backend.
+- A new sandbox can restore from this checkpoint.
+- Open dirty handles that were not closed, fsynced, or checkpointed are not guaranteed to survive cross-sandbox restore.
 
-### 5. 跨 sandbox restore
+### 5. Restore Across Sandboxes
 
-新的 sandbox 启动后：
+After a new sandbox starts:
 
 ```bash
 drive9 mount :/repo ./repo --layer lyr_abc --checkpoint cp_before_refactor --profile=coding-agent
 drive9 mount :/repo ./repo --layer fix-auth-bug --checkpoint cp_before_refactor --profile=coding-agent
 ```
 
-用户看到：
+The user sees:
 
-- layer 中新增、修改、删除的 durable 文件恢复。
-- base 在 commit 前仍然不变。
-- local-only 目录按策略重新生成或懒加载。
-- Git workspace 继续使用已有 Git fast workspace restore 机制。
+- Durable files added, modified, or deleted in the layer are restored.
+- Base remains unchanged until commit.
+- Local-only directories are regenerated or lazily loaded according to policy.
+- Git workspace continues using the existing Git fast workspace restore mechanism.
 
-### 6. 完成后 commit 或 rollback
+### 6. Commit or Roll Back When Done
 
-满意时提交：
+When satisfied, commit:
 
 ```bash
 drive9 fs layer commit lyr_abc
 drive9 fs layer commit fix-auth-bug
 ```
 
-commit 是 all-or-nothing。成功后：
+Commit is all-or-nothing. On success:
 
 ```text
 base :/repo updated
 layer lyr_abc committed
 ```
 
-不满意时回滚：
+When not satisfied, roll back:
 
 ```bash
 drive9 fs layer rollback lyr_abc
 drive9 fs layer rollback task=auth
 ```
 
-base 完全不变，layer 进入 `abandoned`，后续按 retention GC。
+Base remains completely unchanged. The layer moves to `abandoned` and is later GCed according to retention.
 
-如果 base 被别人改过：
+If someone else modified base:
 
 ```text
 conflict: pkg/server/auth.go
@@ -171,11 +171,11 @@ base revision changed: 12 -> 15
 layer preserved for review
 ```
 
-用户可以重新开 layer、手动合并，或 rollback。系统不能半提交。
+The user can create a new layer, merge manually, or roll back. The system must not partially commit.
 
-## 设计原则
+## Design Principles
 
-V1 采用基础 layered FS 模型：
+V1 uses the basic layered FS model:
 
 ```text
 visible tree
@@ -183,50 +183,50 @@ visible tree
   immutable base
 ```
 
-关键原则：
+Key principles:
 
-- 无 layer 时零行为变化。
-- 有 layer 时 base 在 commit 前不可变。
-- rollback 永远不修改 base。
-- write hot path 优先本地，不把每个 `write(2)` 变成远端 round trip。
-- checkpoint/close/fsync/unmount 是 restore-safe durability barrier。
-- 后端 durable layer 是跨 sandbox restore 的权威来源。
-- local-only overlay 是性能层和 rebuildable state，不自动进入 durable layer。
-- Git workspace 保持专用实现，不强行并入通用 layer。
+- Zero behavior change when no layer is used.
+- When a layer is used, base is immutable until commit.
+- Rollback never mutates base.
+- The write hot path prefers local storage and must not turn every `write(2)` into a remote round trip.
+- Checkpoint/close/fsync/unmount are restore-safe durability barriers.
+- The backend durable layer is the authority for cross-sandbox restore.
+- Local-only overlay is a performance layer and rebuildable state; it does not automatically enter the durable layer.
+- Git workspace keeps its specialized implementation and is not forced into the generic layer.
 
-## 文件系统模型
+## Filesystem Model
 
-V1 可见树由三层组成：
+The V1 visible tree has three layers:
 
 ```text
 visible tree
-  local runtime overlay      # FUSE 热路径，本地 shadow/writeback/WAL
-  durable fs layer           # Drive9 后端权威 overlay
-  base Drive9 namespace      # 现有 file_nodes / inodes / contents / semantic
+  local runtime overlay      # FUSE hot path, local shadow/writeback/WAL
+  durable fs layer           # Drive9 backend authoritative overlay
+  base Drive9 namespace      # existing file_nodes / inodes / contents / semantic
 ```
 
-读取顺序：
+Read order:
 
-1. 本地 dirty/pending data。
-2. 后端 durable layer entry。
-3. base Drive9 文件。
+1. Local dirty/pending data.
+2. Backend durable layer entry.
+3. Base Drive9 file.
 
-写入顺序：
+Write order:
 
-1. `write(2)` 写本地 shadow/WAL。
-2. `close`、`fsync`、checkpoint、unmount 推送到后端 layer。
-3. `commit` 才应用到 base。
+1. `write(2)` writes to local shadow/WAL.
+2. `close`, `fsync`, checkpoint, and unmount push to the backend layer.
+3. Only `commit` applies changes to base.
 
-路径分类顺序：
+Path classification order:
 
-1. `local-only` policy：`.git`、`node_modules`、build/cache 输出继续走现有本地 overlay。
-2. `git_workspace`：现有 Git fast workspace 继续处理 clean tree + git overlay。
-3. `fs_layer`：普通 Drive9 文件在 layer mount/API 下走通用 layer resolver。
-4. `remote_persistent`：无 layer 或 layer miss 时走现有 base path。
+1. `local-only` policy: `.git`, `node_modules`, and build/cache output continue using the existing local overlay.
+2. `git_workspace`: the existing Git fast workspace continues handling clean tree + Git overlay.
+3. `fs_layer`: regular Drive9 files under layer mount/API use the generic layer resolver.
+4. `remote_persistent`: when there is no layer or the layer misses, use the existing base path.
 
-## 数据模型
+## Data Model
 
-新增 tenant-local 表：
+Add tenant-local tables:
 
 ```text
 fs_layers
@@ -238,7 +238,7 @@ fs_layer_tags
 
 ### fs_layers
 
-`fs_layers` 表示一次 agent session：
+`fs_layers` represents one agent session:
 
 ```text
 layer_id
@@ -252,11 +252,11 @@ updated_at
 sealed_at
 ```
 
-`name` 是可读引用，不要求全局唯一；解析时如果同名 layer 多于一个，返回 conflict。
+`name` is a human-readable reference and is not globally unique. If multiple layers share the same name during resolution, return a conflict.
 
 ### fs_layer_tags
 
-`fs_layer_tags` 支持按业务语义引用 layer：
+`fs_layer_tags` supports business-semantic layer references:
 
 ```text
 layer_id
@@ -265,7 +265,7 @@ tag_value
 created_at
 ```
 
-索引要求：
+Index requirements:
 
 ```text
 PRIMARY KEY (layer_id, tag_key)
@@ -273,7 +273,7 @@ INDEX (tag_key, tag_value)
 INDEX (tag_key)
 ```
 
-命令和 API 中的 layer ref 统一支持：
+Layer refs in commands and APIs uniformly support:
 
 ```text
 layer_id
@@ -283,11 +283,11 @@ key=value
 tag:key
 ```
 
-其中 `key=value` 只有在没有同名 layer 时按 tag 解析；`tag:key` 表示 tag key 存在匹配。所有 tag/name 引用都必须解析为唯一 layer，否则返回 conflict。
+`key=value` is resolved as a tag only when there is no same-name layer. `tag:key` means a match where the tag key exists. Every tag/name reference must resolve to exactly one layer; otherwise return a conflict.
 
 ### fs_layer_entries
 
-`fs_layer_entries` 表示 overlay 变更：
+`fs_layer_entries` represents overlay changes:
 
 ```text
 layer_id
@@ -314,9 +314,9 @@ created_at
 updated_at
 ```
 
-V1 存储边界：小文件以内联 `content_blob` 写入 metadata store；超过 inline threshold 的 layer file content 使用 `storage_ref` 指向后端对象存储，并在 restore / commit 时流式读取，避免把大文件限制在 entry body 内。
+V1 storage boundary: small files are stored inline in `content_blob` in the metadata store. Layer file content above the inline threshold uses `storage_ref` pointing to backend object storage and is streamed during restore / commit, avoiding any large-file limit in the entry body itself.
 
-索引要求：
+Index requirements:
 
 ```text
 PRIMARY KEY (layer_id, path_hash, entry_seq)
@@ -325,11 +325,11 @@ INDEX (layer_id, entry_seq)
 INDEX (layer_id, op)
 ```
 
-`path_hash` 用于保持 TiDB/MySQL 长路径索引性能；`path` 原文仍是权威值，lookup 时需要 hash + path 双重校验。`entry_seq` 使同一路径多次修改保持 append-only log：用户 diff/search 使用 latest-per-path current-state 视图，commit/restore 使用 ordered replay log，避免 `upsert -> chmod`、`upsert -> rename`、`mkdir -> chmod` 这类序列被折叠后丢失数据。
+`path_hash` preserves TiDB/MySQL long-path index performance. `path` remains the authoritative value, and lookup must verify hash + path. `entry_seq` keeps repeated modifications to the same path as an append-only log: user diff/search use the latest-per-path current-state view, while commit/restore use ordered replay logs. This avoids losing data when sequences such as `upsert -> chmod`, `upsert -> rename`, or `mkdir -> chmod` are collapsed.
 
 ### fs_layer_events
 
-`fs_layer_events` 是 append-only audit log，用于 diff、审计、agent action 解释：
+`fs_layer_events` is an append-only audit log for diff, audit, and agent-action explanation:
 
 ```text
 event_id
@@ -346,7 +346,7 @@ created_at
 
 ### fs_layer_checkpoints
 
-`fs_layer_checkpoints` 记录 durable restore point：
+`fs_layer_checkpoints` records durable restore points:
 
 ```text
 checkpoint_id
@@ -356,51 +356,51 @@ label
 created_at
 ```
 
-## Resolver 语义
+## Resolver Semantics
 
 ### stat(path)
 
-- layer 有 `whiteout`：返回 not found。
-- layer 有 `upsert`、`mkdir`、`symlink`、`chmod`：返回 layer metadata。
-- 否则查 base。
+- If the layer has `whiteout`, return not found.
+- If the layer has `upsert`, `mkdir`, `symlink`, or `chmod`, return layer metadata.
+- Otherwise look up base.
 
 ### readdir(dir)
 
-- base children + layer children 合并。
-- 同名 layer 覆盖 base。
-- whiteout 隐藏 base child。
-- local-only child 在 FUSE listing 中可见，但标记 rebuildable。
+- Merge base children + layer children.
+- Same-name layer entries override base.
+- Whiteouts hide base children.
+- Local-only children are visible in FUSE listings but marked rebuildable.
 
 ### read(path)
 
-- local dirty data 优先。
-- layer content 次之。
-- base content 兜底。
-- S3-backed layer content 继续使用 presign/read-plan 思路。
+- Local dirty data has priority.
+- Layer content comes next.
+- Base content is the fallback.
+- S3-backed layer content continues using the presign/read-plan approach.
 
 ### write(path)
 
-- 新文件直接写 layer。
-- 修改 base 文件时记录 `base_inode_id` 和 `base_revision`，内容 copy-up 到 layer。
-- 小文件 inline，大文件走现有 multipart/S3 通道。
-- base 不变。
+- New files are written directly to the layer.
+- When modifying a base file, record `base_inode_id` and `base_revision`, then copy up content to the layer.
+- Small files are inline; large files use the existing multipart/S3 path.
+- Base remains unchanged.
 
 ### delete(path)
 
-- base 文件写 `whiteout`。
-- layer-only 文件可删除 layer entry 或写 tombstone。
-- V1 只保证文件和空目录删除；recursive delete 后续扩展。
+- Base files write `whiteout`.
+- Layer-only files can delete the layer entry or write a tombstone.
+- V1 only guarantees file and empty-directory delete; recursive delete is a later extension.
 
 ### rename(old, new)
 
-- V1 layer mount 对普通文件 rename 采用 copy-up：目标写 `upsert` entry，源路径写 `whiteout`。
-- 如果源文件来自 base，rename 时会先从 base materialize 到目标 layer entry 和本地 shadow/pending；restore 不依赖 base 源路径仍存在。
-- API 层的 `rename` entry 在 V1 仅允许文件 rename，commit 使用 no-replace 语义：target 已存在时返回 conflict，不覆盖 base target。
-- directory rename 作为后续增强项，V1 在 API/FUSE 层都明确拒绝，避免 rollback 时需要递归目录树 snapshot。
+- V1 layer mount handles regular file rename by copy-up: write an `upsert` entry at the target and a `whiteout` entry at the source path.
+- If the source file comes from base, rename first materializes it from base into the target layer entry and local shadow/pending state; restore does not depend on the original base source path still existing.
+- API-level `rename` entries in V1 only allow file rename. Commit uses no-replace semantics: if the target already exists, return conflict and do not overwrite the base target.
+- Directory rename is a future enhancement. V1 rejects it explicitly in API/FUSE to avoid requiring recursive directory tree snapshots for rollback.
 
 ## API / CLI
 
-新增 API：
+New APIs:
 
 ```text
 POST /v1/layers
@@ -416,15 +416,13 @@ POST /v1/layers/{layer-ref}/rollback
 GET  /v1/layer-checkpoints/{checkpoint-id}
 ```
 
-V1 保持现有 `/v1/fs` API 代码路径不变。layer mount 通过显式
-`/v1/layers/{layer-ref}/entries` 写 layer entry；没有 `--layer` 或
-layer API 调用时，旧客户端仍走原来的 `/v1/fs` 读写路径和性能路径。
+V1 keeps the existing `/v1/fs` API code path unchanged. Layer mounts write layer entries through explicit `/v1/layers/{layer-ref}/entries`; when there is no `--layer` or layer API call, old clients still use the original `/v1/fs` read/write path and performance path.
 
 ```text
 drive9 mount :/repo ./repo --layer <layer-ref>
 ```
 
-CLI：
+CLI:
 
 ```bash
 drive9 fs layer create :/repo --name task --durability=restore-safe
@@ -436,14 +434,14 @@ drive9 fs layer rollback <layer-ref>
 drive9 mount :/repo ./repo --layer <layer-ref>
 ```
 
-FUSE mount options：
+FUSE mount options:
 
 ```text
 MountOptions.LayerRef
 MountOptions.CheckpointRef
 ```
 
-`FlushAll` 必须 drain：
+`FlushAll` must drain:
 
 - open dirty handles
 - layer checkpoint queue
@@ -451,113 +449,113 @@ MountOptions.CheckpointRef
 - existing writeback uploader
 - existing commit queue
 
-## Durability 策略
+## Durability Strategy
 
-默认 `restore-safe`：
+Default `restore-safe`:
 
-- `write(2)`：本地 durable WAL/shadow 后即可返回。
-- `close`、`fsync`、checkpoint、unmount：必须等后端 layer durable。
-- 跨 sandbox restore 只承诺 durable checkpoint 之前的数据。
-- sandbox orchestrator 替换前必须执行 `checkpoint --wait`。
+- `write(2)`: return after local durable WAL/shadow.
+- `close`, `fsync`, checkpoint, and unmount: must wait until the backend layer is durable.
+- Cross-sandbox restore only guarantees data before a durable checkpoint.
+- The sandbox orchestrator must run `checkpoint --wait` before replacement.
 
-V1 接受并保存 `write-through` / `local-fast`，用于 API/CLI 兼容和后续调度策略扩展；当前 FUSE 写入实现统一采用 `restore-safe` 行为，不根据这两个模式改变 write/flush/checkpoint 路径。任何依赖更激进或更保守 durability 的调度器，在 V1 必须仍以显式 checkpoint 作为跨 sandbox restore 边界。
+V1 accepts and stores `write-through` / `local-fast` for API/CLI compatibility and future scheduling policy extension. The current FUSE write implementation always uses `restore-safe` behavior and does not change write/flush/checkpoint paths based on those two modes. Any scheduler that depends on more aggressive or more conservative durability must still use explicit checkpoints as cross-sandbox restore boundaries in V1.
 
-V1 restore-safe 边界：
+V1 restore-safe boundary:
 
-- 已 `close`、已 `fsync`、已 checkpoint、已 unmount drain 的 durable 文件必须可跨 sandbox restore。
-- 进程被杀时仍 open 且未 checkpoint 的 dirty handle 不承诺跨 sandbox restore；V1 的 `write-through` 只作为已记录的意图字段，尚不提供额外保证。
+- Durable files that have been `close`d, `fsync`ed, checkpointed, or drained at unmount must survive cross-sandbox restore.
+- Dirty handles that are still open and uncheckpointed when a process is killed are not guaranteed to survive cross-sandbox restore. V1 `write-through` is only a recorded intent field and does not provide extra guarantees yet.
 
 ## Commit / Rollback
 
-commit 流程：
+Commit flow:
 
-1. 执行 `checkpoint --wait`。
-2. seal layer。
-3. 读取 ordered replay log。
-4. 校验每个 base path 的 revision。
-5. 按 `entry_seq` 顺序应用到 base；失败时使用 commit 前 snapshot 对已应用 entry 做 best-effort rollback。
-6. enqueue semantic tasks。
-7. 旧 S3 refs 进入现有 GC。
-8. 通过 CAS 将 layer 从 `committing` 标记为 `committed`。
+1. Run `checkpoint --wait`.
+2. Seal the layer.
+3. Read the ordered replay log.
+4. Validate each base path's revision.
+5. Apply entries to base in `entry_seq` order. If a failure occurs, use a pre-commit snapshot to perform best-effort rollback of already-applied entries.
+6. Enqueue semantic tasks.
+7. Send old S3 refs to the existing GC path.
+8. Use CAS to move the layer from `committing` to `committed`.
 
-rollback 流程：
+Rollback flow:
 
-1. layer 标记 `abandoned`。
-2. visible tree 不再读取该 layer。
-3. overlay content 按 retention 清理。
-4. base 完全不变。
+1. Mark the layer `abandoned`.
+2. Stop reading the layer in the visible tree.
+3. Clean overlay content according to retention.
+4. Leave base completely unchanged.
 
-冲突处理：
+Conflict handling:
 
-- commit 前校验 `base_revision` / `base_inode_id`，apply 前对 destructive / metadata-only op 做再次校验。
-- 如果 base revision 已变化，commit 返回 conflict list。
-- layer 保留为 `conflicted`，用户可审查、手动合并或 rollback。
-- `active|sealed -> committing -> committed|conflicted` 使用条件状态迁移；没有 commit owner/epoch 的 `committing` layer 不允许重入 commit 或 rollback，避免重复应用。
-- 当前实现是 preflight + ordered apply + best-effort rollback，不声明跨 DB/filesystem mutation 的单事务原子性；生产级别要继续引入 applied-entry ledger / commit owner lease 才能支持 crash-safe resumption。
+- Validate `base_revision` / `base_inode_id` before commit, and revalidate destructive / metadata-only ops before apply.
+- If base revision changed, commit returns a conflict list.
+- The layer remains `conflicted` so the user can review, merge manually, or roll back.
+- `active|sealed -> committing -> committed|conflicted` uses conditional state transitions. A `committing` layer without commit owner/epoch cannot re-enter commit or rollback, preventing duplicate apply.
+- The current implementation is preflight + ordered apply + best-effort rollback. It does not claim single-transaction atomicity across DB/filesystem mutations. Production-grade behavior still needs an applied-entry ledger / commit owner lease to support crash-safe resumption.
 
 ## Search / Semantic
 
-layer-aware search：
+Layer-aware search:
 
-- base hits 必须被 layer whiteout/replacement 过滤。
-- layer 新增/修改文件参与 `find` / `grep`。
-- V1 可先支持 metadata/keyword search。
-- vector/embedding 可在 V2 引入 layer-scoped semantic task 或 `fs_layer_semantic`。
+- Base hits must be filtered by layer whiteouts/replacements.
+- New/modified layer files participate in `find` / `grep`.
+- V1 can first support metadata/keyword search.
+- Vector/embedding can be introduced in V2 through layer-scoped semantic tasks or `fs_layer_semantic`.
 
-关键约束：
+Key constraint:
 
-- 如果 layer 删除或替换了 `/foo.txt`，base 中旧 `/foo.txt` 的 semantic hit 不能出现在 layer search 结果中。
+- If a layer deletes or replaces `/foo.txt`, the old `/foo.txt` semantic hit from base must not appear in layer search results.
 
 ## Compatibility
 
-必须保持：
+Must preserve:
 
-- 普通 `/v1/fs` 无 layer 行为不变。
-- 现有 FUSE writeback/shadow 性能不回退。
-- Git fast workspace 继续使用 `git_workspace_*`。
-- tenant fork 继续作为重型分支能力，不被 layer 替代。
-- S3 multipart、read redirect、batch-stat、batch-read-small 在 no-layer 下不增加开销。
-- 现有 scoped FS authorization 不被绕开；layer header 必须进入 authorization model。
+- Regular `/v1/fs` behavior when no layer is used.
+- Existing FUSE writeback/shadow performance.
+- Git fast workspace continues using `git_workspace_*`.
+- Tenant fork remains the heavy branching capability and is not replaced by layer.
+- S3 multipart, read redirect, batch-stat, and batch-read-small add no no-layer overhead.
+- Existing scoped FS authorization is not bypassed; layer headers must enter the authorization model.
 
 ## Test Plan
 
-核心测试：
+Core tests:
 
-- 无 layer 请求完全保持旧行为。
-- layer upsert 覆盖 base read/stat/list。
-- whiteout 隐藏 base。
-- rollback 后 base 可见性恢复。
-- commit 成功后 base 更新。
-- commit conflict 保留 layer，不半提交。
-- checkpoint 后新 sandbox restore 不丢 closed/fsynced 文件。
-- local-only 目录不进入 durable layer。
-- 大文件 layer write 通过 object-backed layer entries 验证，不受 JSON entry body limit 约束。
-- layer-aware search 不返回被 whiteout/replacement 隐藏的 base hit。
+- No-layer requests preserve old behavior exactly.
+- Layer upsert overrides base read/stat/list.
+- Whiteout hides base.
+- Rollback restores base visibility.
+- Successful commit updates base.
+- Commit conflict preserves the layer and does not partially commit.
+- New sandbox restore after checkpoint does not lose closed/fsynced files.
+- Local-only directories do not enter the durable layer.
+- Large layer writes are verified through object-backed layer entries and are not constrained by JSON entry body limits.
+- Layer-aware search does not return base hits hidden by whiteout/replacement.
 
-性能测试：
+Performance tests:
 
-- no-layer read/write/list benchmark 不增加额外 DB 查询。
-- layer read miss 只增加 overlay lookup。
-- layer readdir 使用 base list + layer children query + in-memory merge。
-- 大文件 layer entry 外置存储后，再验证 shadow/S3 path 流式提交。
+- No-layer read/write/list benchmarks add no extra DB queries.
+- Layer read miss adds only an overlay lookup.
+- Layer readdir uses base list + layer children query + in-memory merge.
+- After large layer entries use externalized storage, verify streaming commit through the shadow/S3 path.
 
-失败恢复测试：
+Failure-recovery tests:
 
-- 本地 WAL 写入后进程 crash，同 sandbox 重启可 recover pending。
-- checkpoint 成功后，新 sandbox 可 restore。
-- checkpoint 失败不推进 durable seq。
-- S3 上传失败不标记 entry durable。
+- After local WAL write and process crash, the same sandbox restart can recover pending data.
+- After successful checkpoint, a new sandbox can restore.
+- Failed checkpoint does not advance durable seq.
+- S3 upload failure does not mark an entry durable.
 
-## 明确不做
+## Explicit Non-goals
 
-V1 不做：
+V1 does not do:
 
-- DeltaFS 多 segment stack。
-- per-write 毫秒级 rollback。
-- process/memory checkpoint。
-- recursive directory rename。
-- recursive delete 的完整 whiteout 展开。
-- Git workspace 表迁移到通用 layer 表。
-- 将 local-only build/cache output 自动持久化。
+- DeltaFS multi-segment stack.
+- Per-write millisecond-level rollback.
+- Process/memory checkpoint.
+- Recursive directory rename.
+- Full whiteout expansion for recursive delete.
+- Migrating Git workspace tables into generic layer tables.
+- Automatically persisting local-only build/cache output.
 
-DeltaFS/DeltaBox 的多 segment checkpoint/rollback 可作为后续 V2/V3 优化方向，而不是 V1 复杂度来源。
+DeltaFS/DeltaBox multi-segment checkpoint/rollback can be a future V2/V3 optimization direction, not a source of V1 complexity.
