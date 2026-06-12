@@ -157,6 +157,25 @@ func (b *Dat9Backend) activeUploadByPath(ctx context.Context, path string) (*dat
 	return upload, nil
 }
 
+// supersedeActiveUpload aborts a pre-existing active upload session so a new
+// initiate for the same path can proceed. A session orphaned by a crashed
+// client (SIGKILL leaves no abort opportunity) would otherwise block every
+// write to the path until expires_at — 24h — which breaks crash-recovery
+// re-uploads of the very file the crash interrupted. Semantics are
+// last-initiate-wins: a still-live previous uploader fails at its next
+// presign/complete and runs its own conflict handling, and finalize's
+// expected-revision check still guards correctness. The unique
+// idx_uploads_active index remains the backstop for concurrent initiates
+// racing past the lookup.
+func (b *Dat9Backend) supersedeActiveUpload(ctx context.Context, op string, existing *datastore.Upload) error {
+	logger.Warn(ctx, "backend_"+op+"_supersede_active_upload",
+		zap.String("path", existing.TargetPath),
+		zap.String("superseded_upload_id", existing.UploadID),
+		zap.String("superseded_status", string(existing.Status)),
+		zap.Time("superseded_expires_at", existing.ExpiresAt))
+	return b.AbortUploadV2(ctx, existing.UploadID)
+}
+
 func (b *Dat9Backend) validateUploadTargetRevision(ctx context.Context, path string, expectedRevision int64) error {
 	nf, err := b.store.Stat(ctx, path)
 	if err != nil {
@@ -252,15 +271,18 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		return nil, err
 	}
 
-	// Enforce one active upload per path
+	// One active upload per path: supersede rather than 409 so dead sessions
+	// can't block the path (see supersedeActiveUpload).
 	existing, err := b.activeUploadByPath(ctx, path)
 	if err != nil {
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
 	}
 	if existing != nil {
-		metrics.RecordOperation("backend", "initiate_upload", "conflict", time.Since(start))
-		return nil, datastore.ErrUploadConflict
+		if err := b.supersedeActiveUpload(ctx, "initiate_upload", existing); err != nil {
+			metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
+		}
 	}
 
 	fileID := b.genID()
@@ -417,15 +439,19 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 
 	activeUploadLookupStart := time.Now()
 	existing, err := b.activeUploadByPath(ctx, path)
-	activeUploadLookupDurationMs := uploadPhaseMs(activeUploadLookupStart)
 	if err != nil {
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
 	}
 	if existing != nil {
-		metrics.RecordOperation("backend", "initiate_upload_v2", "conflict", time.Since(start))
-		return nil, datastore.ErrUploadConflict
+		// Supersede rather than 409 so dead sessions can't block the path
+		// (see supersedeActiveUpload).
+		if err := b.supersedeActiveUpload(ctx, "initiate_upload_v2", existing); err != nil {
+			metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
+		}
 	}
+	activeUploadLookupDurationMs := uploadPhaseMs(activeUploadLookupStart)
 
 	partSize := s3client.CalcAdaptivePartSize(totalSize)
 	parts := s3client.CalcParts(totalSize, partSize)

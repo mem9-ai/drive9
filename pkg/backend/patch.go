@@ -188,15 +188,18 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	sourceKey := nf.File.StorageRef
 	origSize := nf.File.SizeBytes
 
-	// Enforce one active upload per path
+	// One active upload per path: supersede rather than 409 so dead sessions
+	// can't block the path (see supersedeActiveUpload).
 	existing, err := b.activeUploadByPath(ctx, path)
 	if err != nil {
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
 	}
 	if existing != nil {
-		metrics.RecordOperation("backend", "patch_upload", "conflict", time.Since(start))
-		return nil, datastore.ErrUploadConflict
+		if err := b.supersedeActiveUpload(ctx, "patch_upload", existing); err != nil {
+			metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
+		}
 	}
 
 	// Use client-provided part size if valid (>= MinPartSize); otherwise
