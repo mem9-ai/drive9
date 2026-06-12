@@ -148,22 +148,22 @@ env:
   DRIVE9_LOCAL_EMBEDDING_MODE: app
   RUN_SEMANTIC_CHECKS: "0"
   RUN_CLI_SEMANTIC_CHECKS: "0"
-  RUN_FUSE_CONCURRENCY_STRESS: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_concurrency_stress) || '0') }}
-  RUN_FUSE_POSIX_FSX: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_posix_fsx) || '0') }}
-  RUN_FUSE_SQLITE_WAL: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_wal) || '0') }}
-  RUN_FUSE_SQLITE_CHURN: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_churn) || '0') }}
-  RUN_FUSE_SQLITE_CONCURRENCY: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_concurrency) || '0') }}
-  RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_performance_baseline) || '0') }}
+  RUN_FUSE_CONCURRENCY_STRESS: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_concurrency_stress) || '0') }}
+  RUN_FUSE_POSIX_FSX: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_posix_fsx) || '0') }}
+  RUN_FUSE_SQLITE_WAL: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_wal) || '0') }}
+  RUN_FUSE_SQLITE_CHURN: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_churn) || '0') }}
+  RUN_FUSE_SQLITE_CONCURRENCY: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_concurrency) || '0') }}
+  RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'schedule' && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_performance_baseline) || '0') }}
   ARCHIVE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.archive_fuse_performance_metrics || '0') }}
   COMPARE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.compare_fuse_performance_metrics || '0') }}
-  RUN_E2E_SMOKE_ALL: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_e2e_smoke_all) || '0') }}
-  RUN_GIT_FEATURE_MATRIX: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_git_feature_matrix) || '0') }}
-  RUN_POSIX_FEATURE_MATRIX: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_e2e == '1' && '1' || '0' }}
+  RUN_E2E_SMOKE_ALL: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_e2e_smoke_all) || '0') }}
+  RUN_GIT_FEATURE_MATRIX: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' && '1' || inputs.run_git_feature_matrix) || '0') }}
+  RUN_POSIX_FEATURE_MATRIX: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.run_all_e2e == '1' && '1' || '0' }}
   # Report-only: hosted-runner FUSE numbers are too noisy for a hard
   # day-over-day gate (the first two nightly runs both false-failed here).
   # Deterministic perf gating lives in e2e/fuse-write-perf-budget-test.sh.
   FUSE_PERF_COMPARE_FAIL_ON_REGRESSION: "0"
-  FUSE_CONCURRENCY_STRESS_REQUIRED: ${{ (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' || inputs.run_fuse_concurrency_stress == '1'))) && '1' || '0' }}
+  FUSE_CONCURRENCY_STRESS_REQUIRED: ${{ (github.event_name == 'schedule' || github.event_name == 'push' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' || inputs.run_fuse_concurrency_stress == '1'))) && '1' || '0' }}
   FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
   FUSE_CONCURRENCY_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-concurrency
   FEATURE_MATRIX_REPORT_DIR: ${{ github.workspace }}/e2e-artifacts/feature-matrix
