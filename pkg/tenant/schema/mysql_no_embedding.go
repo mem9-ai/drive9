@@ -214,6 +214,9 @@ func InitMySQLNoEmbeddingTenantSchemaContext(ctx context.Context, dsn string) er
 		return err
 	}
 	defer func() { _ = closeTiDBSchemaDB(db) }()
+	if err := repairMySQLPathHashSchema(ctx, db); err != nil {
+		return err
+	}
 	if err := ExecSchemaStatementsContext(ctx, db, MySQLNoEmbeddingTenantSchemaStatements()); err != nil {
 		return err
 	}

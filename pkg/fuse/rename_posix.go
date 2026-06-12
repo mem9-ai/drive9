@@ -94,9 +94,6 @@ func (fs *Dat9FS) renamePreflight(ctx context.Context, input *gofuse.RenameIn, o
 	if st := fs.renameCheckSticky(caller, oldParentInfo, oldInfo); st != gofuse.OK {
 		return oldInfo, renamePathInfo{}, st
 	}
-	if oldInfo.isDir && newParent != oldParent && caller.Uid != 0 && caller.Uid != oldInfo.owner(fs).Uid {
-		return oldInfo, renamePathInfo{}, gofuse.EACCES
-	}
 
 	newInfo, err := fs.renamePathInfo(ctx, newP)
 	if err != nil {

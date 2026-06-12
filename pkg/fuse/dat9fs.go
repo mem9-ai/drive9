@@ -2181,9 +2181,13 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 	var data []byte
 	if newSize > 0 {
 		if entry.Size > 0 {
+			readSize := newSize
+			if entry.Size < readSize {
+				readSize = entry.Size
+			}
 			readStart := fs.perfStart()
 			var err error
-			data, err = fs.client.ReadCtx(ctx, apiPath)
+			data, err = fs.client.ReadAtCtx(ctx, apiPath, 0, readSize)
 			if err != nil {
 				fs.perfRecordRemote(perfRemoteRead, readStart, err, 0)
 				return httpToFuseStatus(err)
@@ -7233,6 +7237,7 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 		}
 	}
 	fs.inodes.Rename(oldP, newP)
+	fs.renameSpecialNodeSubtree(oldP, newP)
 	fs.invalidateReadCacheAndTargets(oldP)
 	fs.invalidateReadCacheAndTargets(newP)
 	fs.readCache.InvalidatePrefix(oldP + "/")

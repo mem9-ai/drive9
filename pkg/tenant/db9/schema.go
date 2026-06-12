@@ -1,6 +1,7 @@
 package db9
 
 import (
+	"context"
 	"database/sql"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -189,6 +190,9 @@ func initDB9Schema(dsn string) error {
 		return err
 	}
 
+	if err := repairDB9PathHashSchema(context.Background(), db); err != nil {
+		return err
+	}
 	if err := schema.ExecSchemaStatements(db, InitSchemaStatements()); err != nil {
 		return err
 	}

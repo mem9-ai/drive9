@@ -4,6 +4,7 @@ import (
 	"context"
 	"path"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -73,6 +74,35 @@ func (fs *Dat9FS) renameSpecialNode(oldP, newP string) bool {
 	delete(fs.specialByPath, newP)
 	fs.specialByPath[newP] = ino
 	return true
+}
+
+func (fs *Dat9FS) renameSpecialNodeSubtree(oldP, newP string) {
+	if fs == nil || oldP == newP {
+		return
+	}
+
+	fs.specialMu.Lock()
+	defer fs.specialMu.Unlock()
+
+	oldPrefix := strings.TrimSuffix(oldP, "/") + "/"
+	updates := make(map[string]uint64)
+	for p, ino := range fs.specialByPath {
+		if p == oldP {
+			updates[newP] = ino
+			delete(fs.specialByPath, p)
+			continue
+		}
+		if strings.HasPrefix(p, oldPrefix) {
+			updates[newP+p[len(oldP):]] = ino
+			delete(fs.specialByPath, p)
+		}
+	}
+	for p := range updates {
+		delete(fs.specialByPath, p)
+	}
+	for p, ino := range updates {
+		fs.specialByPath[p] = ino
+	}
 }
 
 func (fs *Dat9FS) linkMetadataOnlySpecial(input *gofuse.LinkIn, srcEntry *InodeEntry, dstP, name string, out *gofuse.EntryOut) gofuse.Status {

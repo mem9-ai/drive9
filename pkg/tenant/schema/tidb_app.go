@@ -201,6 +201,9 @@ func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTe
 	if !IsTiDBCluster(ctx, db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
+	if err := repairMySQLPathHashSchema(ctx, db); err != nil {
+		return err
+	}
 	if err := ExecSchemaStatementsContext(ctx, db, tidbAppEmbeddingBaseSchemaStatements()); err != nil {
 		return err
 	}
@@ -219,5 +222,5 @@ func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTe
 	} else if err := ExecSchemaStatementsContext(ctx, db, tidbAppEmbeddingOptionalSchemaStatements()); err != nil {
 		return err
 	}
-	return ValidateTiDBSchemaForMode(ctx, db, TiDBEmbeddingModeApp)
+	return EnsureTiDBSchemaForMode(ctx, db, TiDBEmbeddingModeApp)
 }

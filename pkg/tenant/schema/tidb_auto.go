@@ -1202,10 +1202,13 @@ func initTiDBAutoEmbeddingSchemaWithProfile(ctx context.Context, dsn string, pro
 	if !IsTiDBCluster(ctx, db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
+	if err := repairMySQLPathHashSchema(ctx, db); err != nil {
+		return err
+	}
 	if err := ExecSchemaStatementsContext(ctx, db, tidbAutoEmbeddingSchemaStatementsForConfig(render)); err != nil {
 		return err
 	}
-	if err := ValidateTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile); err != nil {
+	if err := EnsureTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile); err != nil {
 		return err
 	}
 	logger.Info(ctx, "tenant_tidb_schema_init_finished",

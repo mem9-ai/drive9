@@ -735,6 +735,135 @@ func TestDiffTiDBTableUsesInformationSchemaIndexesForUploads(t *testing.T) {
 	}
 }
 
+func TestRepairMySQLPathHashSchemaUpgradesLegacyPathIndexes(t *testing.T) {
+	if testDSN == "" {
+		t.Skip("mysql test DSN not configured")
+	}
+
+	ctx := context.Background()
+	db, err := sql.Open("mysql", testDSN)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	for _, stmt := range []string{
+		"DROP TABLE IF EXISTS uploads",
+		"DROP TABLE IF EXISTS file_nodes",
+		`CREATE TABLE file_nodes (
+			node_id VARCHAR(64) PRIMARY KEY,
+			path VARCHAR(512) NOT NULL,
+			parent_path VARCHAR(512) NOT NULL,
+			name VARCHAR(255) NOT NULL,
+			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
+			file_id VARCHAR(64),
+			inode_id VARCHAR(64),
+			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			UNIQUE KEY idx_path (path),
+			KEY idx_parent (parent_path, name)
+		)`,
+		`CREATE TABLE uploads (
+			upload_id VARCHAR(64) PRIMARY KEY,
+			file_id VARCHAR(64) NOT NULL,
+			inode_id VARCHAR(64),
+			target_path VARCHAR(512) NOT NULL,
+			s3_upload_id VARCHAR(255) NOT NULL,
+			s3_key VARCHAR(2048) NOT NULL,
+			total_size BIGINT NOT NULL,
+			part_size BIGINT NOT NULL,
+			parts_total INT NOT NULL,
+			expected_revision BIGINT NULL,
+			status VARCHAR(32) NOT NULL DEFAULT 'UPLOADING',
+			fingerprint_sha256 VARCHAR(128),
+			idempotency_key VARCHAR(255),
+			description LONGTEXT,
+			active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) VIRTUAL,
+			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			expires_at DATETIME(3) NOT NULL,
+			KEY idx_upload_path (target_path, status),
+			UNIQUE KEY idx_idempotency (idempotency_key),
+			UNIQUE KEY idx_uploads_active (active_target_path)
+		)`,
+		`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory)
+			VALUES ('node-1', '/old/file.txt', '/old/', 'file.txt', FALSE),
+			       ('node-2', '/old/dir/', '/old/', 'dir', TRUE)`,
+		`INSERT INTO uploads (upload_id, file_id, target_path, s3_upload_id, s3_key, total_size, part_size, parts_total, idempotency_key, expires_at)
+			VALUES ('upload-1', 'file-1', '/old/file.txt', 's3-upload-1', 's3-key-1', 3, 3, 1, 'idem-1', DATE_ADD(NOW(), INTERVAL 1 HOUR))`,
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("exec setup %q: %v", schemaStatementSnippet(stmt), err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS uploads")
+		_, _ = db.ExecContext(context.Background(), "DROP TABLE IF EXISTS file_nodes")
+	})
+
+	if err := repairMySQLPathHashSchema(ctx, db); err != nil {
+		t.Fatalf("repairMySQLPathHashSchema: %v", err)
+	}
+	for _, stmt := range []string{
+		"CREATE UNIQUE INDEX idx_path ON file_nodes(path_hash)",
+		"CREATE INDEX idx_parent ON file_nodes(parent_path_hash, name)",
+		"CREATE INDEX idx_upload_path ON uploads(target_path_hash, status)",
+		"CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path_hash)",
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("exec repaired index %q: %v", stmt, err)
+		}
+	}
+
+	var nodeHashes int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_nodes
+		WHERE path_hash = LOWER(SHA2(path, 256))
+		  AND parent_path_hash = LOWER(SHA2(parent_path, 256))`).Scan(&nodeHashes); err != nil {
+		t.Fatalf("query node hashes: %v", err)
+	}
+	if nodeHashes != 2 {
+		t.Fatalf("backfilled file_nodes hashes = %d, want 2", nodeHashes)
+	}
+
+	var uploadHashes int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM uploads
+		WHERE target_path_hash = LOWER(SHA2(target_path, 256))`).Scan(&uploadHashes); err != nil {
+		t.Fatalf("query upload hashes: %v", err)
+	}
+	if uploadHashes != 1 {
+		t.Fatalf("backfilled upload hashes = %d, want 1", uploadHashes)
+	}
+
+	fileNodesCreate, err := loadShowCreateTable(ctx, db, "file_nodes")
+	if err != nil {
+		t.Fatalf("show create file_nodes: %v", err)
+	}
+	fileNodeIndexes, ok := parseObservedTiDBIndexColumns(fileNodesCreate)
+	if !ok {
+		t.Fatal("parse file_nodes indexes failed")
+	}
+	if got, want := fileNodeIndexes["idx_path"], []string{"path_hash"}; !equalStringSlices(got, want) {
+		t.Fatalf("idx_path columns = %v, want %v", got, want)
+	}
+	if got, want := fileNodeIndexes["idx_parent"], []string{"parent_path_hash", "name"}; !equalStringSlices(got, want) {
+		t.Fatalf("idx_parent columns = %v, want %v", got, want)
+	}
+
+	uploadsCreate, err := loadShowCreateTable(ctx, db, "uploads")
+	if err != nil {
+		t.Fatalf("show create uploads: %v", err)
+	}
+	uploadIndexes, ok := parseObservedTiDBIndexColumns(uploadsCreate)
+	if !ok {
+		t.Fatal("parse uploads indexes failed")
+	}
+	if got, want := uploadIndexes["idx_upload_path"], []string{"target_path_hash", "status"}; !equalStringSlices(got, want) {
+		t.Fatalf("idx_upload_path columns = %v, want %v", got, want)
+	}
+	if got, want := uploadIndexes["idx_uploads_active"], []string{"active_target_path_hash"}; !equalStringSlices(got, want) {
+		t.Fatalf("idx_uploads_active columns = %v, want %v", got, want)
+	}
+}
+
 func TestDiffTiDBTableMetaReportsIndexInspectionFailureInsteadOfFalsePositives(t *testing.T) {
 	spec := mustTiDBTableSpecByName(t, TiDBEmbeddingModeAuto, "uploads")
 	meta := testUploadsTableMeta(true)

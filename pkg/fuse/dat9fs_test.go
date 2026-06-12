@@ -4172,6 +4172,35 @@ func TestMknodMetadataOnlySpecialNodeLifecycle(t *testing.T) {
 	}
 }
 
+func TestFinishLocalRenameRetargetsSpecialNodeSubtree(t *testing.T) {
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), trustedProcessLocalEventsOptions())
+	_ = fs.inodes.Lookup("/d", true, 0, time.Unix(10, 0))
+	childIno := fs.inodes.Lookup("/d/pipe", false, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(childIno, uint32(syscall.S_IFIFO)|0o644)
+	fs.addSpecialNode("/d/pipe", childIno)
+
+	fs.finishLocalRename(&gofuse.RenameIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Newdir:   1,
+	}, "/d", "/e")
+
+	if _, ok := fs.specialNodeEntry("/d/pipe"); ok {
+		t.Fatal("old special-node path remained after directory rename")
+	}
+	if _, ok := fs.specialNodeEntry("/e/pipe"); !ok {
+		t.Fatal("renamed special-node path missing after directory rename")
+	}
+	var lookup gofuse.EntryOut
+	st := fs.Lookup(nil, &gofuse.InHeader{NodeId: 1}, "e", &lookup)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup renamed directory status = %v, want OK", st)
+	}
+	st = fs.Lookup(nil, &gofuse.InHeader{NodeId: lookup.NodeId}, "pipe", &lookup)
+	if st != gofuse.OK {
+		t.Fatalf("Lookup renamed special child status = %v, want OK", st)
+	}
+}
+
 func TestMknodMetadataOnlySpecialUsesNegativeCacheForStaleRemoteStat(t *testing.T) {
 	var remoteCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -4407,6 +4436,37 @@ func TestRenameRejectsStickyTargetParentWhenCallerOwnsNeitherParentNorTarget(t *
 	}
 	if _, ok := fs.inodes.GetInode("/src/file"); !ok {
 		t.Fatal("source inode should remain after rejected rename")
+	}
+}
+
+func TestRenamePreflightAllowsNonOwnerDirectoryAcrossWritableParents(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	fs := NewDat9FS(newTestClient(ts.URL), trustedProcessLocalEventsOptions())
+	srcParentIno := fs.inodes.Lookup("/src", true, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(srcParentIno, uint32(syscall.S_IFDIR)|0o777)
+	fs.inodes.UpdateOwner(srcParentIno, 0, 0, true, true)
+	dstParentIno := fs.inodes.Lookup("/dst", true, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(dstParentIno, uint32(syscall.S_IFDIR)|0o777)
+	fs.inodes.UpdateOwner(dstParentIno, 0, 0, true, true)
+	dirIno := fs.inodes.Lookup("/src/dir", true, 0, time.Unix(10, 0))
+	fs.inodes.UpdateMode(dirIno, uint32(syscall.S_IFDIR)|0o755)
+	fs.inodes.UpdateOwner(dirIno, 0, 0, true, true)
+
+	_, _, st := fs.renamePreflight(context.Background(), &gofuse.RenameIn{
+		InHeader: gofuse.InHeader{
+			NodeId: srcParentIno,
+			Caller: gofuse.Caller{
+				Owner: gofuse.Owner{Uid: 65534, Gid: 65534},
+			},
+		},
+		Newdir: dstParentIno,
+	}, "/src/dir", "/dst/dir")
+	if st != gofuse.OK {
+		t.Fatalf("renamePreflight status = %v, want OK", st)
 	}
 }
 
@@ -12275,6 +12335,111 @@ func TestSetAttr_PathTruncateReadModifyWrite(t *testing.T) {
 	}
 	if out.Size != 5 {
 		t.Fatalf("out.Size after extend = %d, want 5", out.Size)
+	}
+}
+
+func TestSetAttr_PathTruncateShrinkUsesRangeForRedirectedObject(t *testing.T) {
+	const existingSize int64 = 1 << 30
+
+	var (
+		mu         sync.Mutex
+		revision   int64 = 1
+		content          = []byte("abc")
+		rangeCalls int
+		fullReads  int
+	)
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status":           "active",
+				"max_upload_bytes": maxPathTruncateInMemoryBytes,
+			})
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/large.bin":
+			mu.Lock()
+			size := existingSize
+			if revision > 1 {
+				size = int64(len(content))
+			}
+			rev := revision
+			mu.Unlock()
+			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(rev, 10))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/large.bin":
+			w.Header().Set("Location", ts.URL+"/object/large.bin")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object/large.bin":
+			rangeHeader := r.Header.Get("Range")
+			if rangeHeader == "" {
+				mu.Lock()
+				fullReads++
+				mu.Unlock()
+				http.Error(w, "missing range", http.StatusInternalServerError)
+				return
+			}
+			if rangeHeader != "bytes=0-2" {
+				http.Error(w, "bad range "+rangeHeader, http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			mu.Lock()
+			rangeCalls++
+			body := append([]byte(nil), content...)
+			mu.Unlock()
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-2/%d", existingSize))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(body)
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/large.bin":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			mu.Lock()
+			content = append([]byte(nil), body...)
+			revision++
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup("/large.bin", false, existingSize, time.Now())
+	fs.inodes.UpdateRevision(ino, revision)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     3,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr shrink status = %v, want OK", st)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := string(content); got != "abc" {
+		t.Fatalf("content after shrink = %q, want abc", got)
+	}
+	if rangeCalls != 1 {
+		t.Fatalf("range calls = %d, want 1", rangeCalls)
+	}
+	if fullReads != 0 {
+		t.Fatalf("full object reads = %d, want 0", fullReads)
+	}
+	if out.Size != 3 {
+		t.Fatalf("out.Size after shrink = %d, want 3", out.Size)
 	}
 }
 
