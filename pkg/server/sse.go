@@ -496,7 +496,7 @@ func (s *Server) eventsSince(ctx context.Context, store *datastore.Store, bus *E
 
 func persistentEventsSince(ctx context.Context, store *datastore.Store, since uint64) ([]ChangeEvent, uint64, bool, sseOperationResult, error) {
 	start := time.Now()
-	_, headSeq, count, err := store.FSEventBounds(ctx)
+	oldestSeq, headSeq, count, err := store.FSEventBounds(ctx)
 	if err != nil {
 		recordSSEOperation("replay", sseResultError, start)
 		return nil, 0, false, "", err
@@ -521,6 +521,10 @@ func persistentEventsSince(ctx context.Context, store *datastore.Store, since ui
 	if since == headSeq {
 		recordSSEOperation("replay", sseResultOK, start)
 		return nil, headSeq, true, "", nil
+	}
+	if since+1 < oldestSeq {
+		recordSSEOperation("replay", sseResultSeqTooOld, start)
+		return nil, headSeq, false, sseResultSeqTooOld, nil
 	}
 
 	events, err := store.ListFSEventsSince(ctx, since, ssePersistentReplayLimit+1)

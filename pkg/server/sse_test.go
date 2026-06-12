@@ -261,6 +261,43 @@ func TestSSEEndpointPersistentReplayAllowsSeqGaps(t *testing.T) {
 	}
 }
 
+func TestPersistentEventsSinceResetsWhenSincePredatesRetainedOldest(t *testing.T) {
+	srv := newTestServer(t)
+	store := srv.fallback.Store()
+	ctx := context.Background()
+	ev1, err := store.InsertFSEvent(ctx, "/old-a.txt", "write", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertFSEvent(ctx, "/old-b.txt", "write", ""); err != nil {
+		t.Fatal(err)
+	}
+	ev3, err := store.InsertFSEvent(ctx, "/retained.txt", "chmod", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PruneFSEventsBefore(ctx, ev3.Seq); err != nil {
+		t.Fatal(err)
+	}
+
+	events, headSeq, ok, reason, err := persistentEventsSince(ctx, store, ev1.Seq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatalf("persistentEventsSince returned ok with partial retention replay: %+v", events)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events len=%d, want 0", len(events))
+	}
+	if headSeq != ev3.Seq {
+		t.Fatalf("headSeq=%d, want %d", headSeq, ev3.Seq)
+	}
+	if reason != sseResultSeqTooOld {
+		t.Fatalf("reason=%q, want %q", reason, sseResultSeqTooOld)
+	}
+}
+
 func TestSSEEndpointDoesNotFallbackToBusWhenPersistentLogHasNoHistory(t *testing.T) {
 	srv := newTestServer(t)
 	clearFSEventsForServerTest(t, srv)
