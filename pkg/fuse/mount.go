@@ -366,7 +366,7 @@ func Mount(opts *MountOptions) error {
 				cq.RecoverPending()
 				if opts.LayerRef != "" {
 					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
-						fmt.Fprintf(os.Stderr, "drive9: restore fs layer entries failed: %v\n", err)
+						return fmt.Errorf("mount: restore fs layer entries: %w", err)
 					}
 					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
 				}
