@@ -965,6 +965,127 @@ func TestReadCacheCachesMediumSmallFileAfterFirstRead(t *testing.T) {
 	}
 }
 
+// A 2MiB file sits above the old 1MiB whole-file threshold and below the
+// current default: its cold read must be one whole-file GET (no Range
+// header, no prefetcher) instead of block-split range reads.
+func TestReadTwoMiBFileUsesSingleWholeFileRequest(t *testing.T) {
+	data := bytes.Repeat([]byte("y"), 2<<20)
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getCalls.Add(1)
+			if got := r.Header.Get("Range"); got != "" {
+				http.Error(w, "unexpected range request: "+got, http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			_, _ = w.Write(data)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	const rev = 11
+	ino := fs.inodes.Lookup("/bench.bin", false, int64(len(data)), time.Now())
+	fs.inodes.UpdateRevision(ino, rev)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.Prefetch != nil {
+		t.Fatal("expected no Prefetcher for a file within the whole-file read threshold")
+	}
+
+	got, st, err := readDat9FSTestRange(fs, ino, out.Fh, 0, 128<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[:128<<10]) {
+		t.Fatalf("first read status = %v, len = %d; want OK with 128KiB prefix", st, len(got))
+	}
+	got, st, err = readDat9FSTestRange(fs, ino, out.Fh, int64(len(data))-(128<<10), 128<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[len(data)-(128<<10):]) {
+		t.Fatalf("second read status = %v, len = %d; want OK with 128KiB suffix", st, len(got))
+	}
+	if calls := getCalls.Load(); calls != 1 {
+		t.Fatalf("GET calls = %d, want 1 whole-file request", calls)
+	}
+}
+
+// Whole-file reads must persist into the disk read cache so warm reads
+// after ReadCache TTL expiry or eviction are served from local disk
+// instead of re-fetching from the remote.
+func TestReadWholeFilePopulatesDiskReadCacheTier(t *testing.T) {
+	const (
+		path = "/file.bin"
+		rev  = int64(7)
+	)
+	data := bytes.Repeat([]byte("z"), 2<<20)
+	var objectReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		objectReads.Add(1)
+		if got := r.Header.Get("Range"); got != "" {
+			http.Error(w, "unexpected range request: "+got, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 8<<20)
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	key, ok := fs.diskReadCacheKey(path, mustGetInodeEntry(t, fs, ino), 0, int64(len(data)))
+	if !ok {
+		t.Fatal("disk read cache key unavailable")
+	}
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[:64<<10]) {
+		t.Fatalf("first read status = %v, len = %d; want OK", st, len(got))
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, key)
+
+	// Simulate ReadCache TTL expiry/eviction: the next read must be served
+	// from the disk tier without another remote fetch.
+	fs.readCache.InvalidateAll()
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, int64(len(data))-(64<<10), 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[len(data)-(64<<10):]) {
+		t.Fatalf("disk-tier read status = %v, len = %d; want OK", st, len(got))
+	}
+	if calls := objectReads.Load(); calls != 1 {
+		t.Fatalf("object reads = %d, want 1 (second read must come from disk tier)", calls)
+	}
+}
+
 func readDat9FSTestBytes(fs *Dat9FS, ino, fh uint64, size int) ([]byte, gofuse.Status, error) {
 	buf := make([]byte, size)
 	result, st := fs.Read(nil, &gofuse.ReadIn{
@@ -5781,7 +5902,7 @@ func TestIsTransientLookupErr_Treats499AsTransient(t *testing.T) {
 }
 
 func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
-	size := int64(2 * 1024 * 1024) // above default read-cache admission limit
+	size := int64(defaultReadCacheMaxFileSize + 1024) // above default read-cache admission limit
 	data := make([]byte, size)
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -14328,7 +14449,7 @@ func TestDoRangeReadBodyTruncationReturnsError(t *testing.T) {
 // TestReadPrefetchNotTriggeredOnFailure verifies that Prefetch.OnRead is NOT
 // called when the remote read fails after a prefetch cache miss.
 func TestReadPrefetchNotTriggeredOnFailure(t *testing.T) {
-	fileSize := int64(2 << 20) // above default read-cache admission limit
+	fileSize := int64(defaultReadCacheMaxFileSize + 1024) // above default read-cache admission limit
 	var getCalls atomic.Int32
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

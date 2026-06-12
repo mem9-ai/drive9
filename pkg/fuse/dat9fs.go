@@ -7998,7 +7998,17 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// the observed revision so that concurrent reads after a revision
 		// change do not share stale in-flight results.
 		sfKey := fmt.Sprintf("%s@%d", p, cacheRev)
+		diskKey, diskKeyOK := fs.diskReadCacheKey(p, entry, 0, entry.Size)
 		data, err, _ := fs.readFlight.Do(ctx, sfKey, func() ([]byte, error) {
+			// Whole-file disk cache tier: survives ReadCache TTL/eviction
+			// so warm reads of small files are served from local disk
+			// instead of re-fetching from the remote.
+			if diskKeyOK {
+				if cached, ok := fs.diskReadCache.Get(diskKey); ok {
+					fs.readCache.PutOwned(p, cached, cacheRev)
+					return cached, nil
+				}
+			}
 			// Use a detached context for the shared HTTP fetch so that
 			// cancellation of the owner's FUSE request does not fail
 			// piggybacking readers. Apply a fresh bounded timeout so the
@@ -8018,6 +8028,11 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			// is visible before the flight key is released. This closes
 			// the window where a concurrent reader could miss both the
 			// cache and the in-flight dedup.
+			if diskKeyOK {
+				// PutAsync validates len(fetchData) == diskKey.Length, so a
+				// stale stat size cannot persist a truncated entry.
+				fs.diskReadCache.PutAsync(diskKey, fetchData)
+			}
 			fs.readCache.PutOwned(p, fetchData, cacheRev)
 			return fetchData, nil
 		})
