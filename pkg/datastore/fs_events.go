@@ -3,6 +3,7 @@ package datastore
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"time"
 )
 
@@ -114,11 +115,15 @@ func (s *Store) AppendFSEventTx(ctx context.Context, db execer, path, op, actor 
 }
 
 func nextFSEventSeqTx(ctx context.Context, db execer) (uint64, error) {
-	if _, err := db.ExecContext(ctx, `INSERT IGNORE INTO fs_event_seq (id, next_seq) SELECT 1, COALESCE(MAX(seq), 0) + 1 FROM fs_events`); err != nil {
-		return 0, err
-	}
 	var seq uint64
-	if err := db.QueryRowContext(ctx, `SELECT next_seq FROM fs_event_seq WHERE id = 1 FOR UPDATE`).Scan(&seq); err != nil {
+	err := db.QueryRowContext(ctx, `SELECT next_seq FROM fs_event_seq WHERE id = 1 FOR UPDATE`).Scan(&seq)
+	if errors.Is(err, sql.ErrNoRows) {
+		if _, err := db.ExecContext(ctx, `INSERT IGNORE INTO fs_event_seq (id, next_seq) SELECT 1, COALESCE(MAX(seq), 0) + 1 FROM fs_events`); err != nil {
+			return 0, err
+		}
+		err = db.QueryRowContext(ctx, `SELECT next_seq FROM fs_event_seq WHERE id = 1 FOR UPDATE`).Scan(&seq)
+	}
+	if err != nil {
 		return 0, err
 	}
 	if _, err := db.ExecContext(ctx, `UPDATE fs_event_seq SET next_seq = ? WHERE id = 1`, seq+1); err != nil {

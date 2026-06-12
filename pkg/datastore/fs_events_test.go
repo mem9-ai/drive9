@@ -106,6 +106,28 @@ func TestAppendFSEventTxRollbackDoesNotConsumeSeq(t *testing.T) {
 	}
 }
 
+func TestAppendFSEventTxInitializesSeqFromExistingEvents(t *testing.T) {
+	s := newTestStore(t)
+	clearFSEventsForTest(t, s)
+	ctx := context.Background()
+
+	if _, err := s.DB().ExecContext(ctx, `INSERT INTO fs_events (seq, path, op, actor, ts) VALUES (?, ?, ?, ?, ?)`,
+		41, "/legacy.txt", "write", "", int64(1000)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.DB().ExecContext(ctx, `DELETE FROM fs_event_seq`); err != nil {
+		t.Fatal(err)
+	}
+
+	ev, err := s.InsertFSEvent(ctx, "/next.txt", "write", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.Seq != 42 {
+		t.Fatalf("seq initialized from existing events = %d, want 42", ev.Seq)
+	}
+}
+
 func TestNoopDirectoryMutationsDoNotEmitFSEvents(t *testing.T) {
 	s := newTestStore(t)
 	clearFSEventsForTest(t, s)

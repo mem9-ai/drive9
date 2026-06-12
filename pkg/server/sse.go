@@ -462,9 +462,6 @@ func bStoreFromRequest(r *http.Request) *datastore.Store {
 func (s *Server) eventsSince(ctx context.Context, store *datastore.Store, bus *EventBus, since uint64) ([]ChangeEvent, uint64, bool, sseOperationResult) {
 	if store != nil {
 		events, headSeq, ok, reason, err := persistentEventsSince(ctx, store, since)
-		if err == nil && ok {
-			return events, headSeq, ok, reason
-		}
 		if err == nil {
 			return events, headSeq, ok, reason
 		}
