@@ -173,7 +173,8 @@ func (b *Dat9Backend) supersedeActiveUpload(ctx context.Context, op string, exis
 		zap.String("superseded_upload_id", existing.UploadID),
 		zap.String("superseded_status", string(existing.Status)),
 		zap.Time("superseded_expires_at", existing.ExpiresAt))
-	return b.AbortUploadV2(ctx, existing.UploadID)
+	_, err := b.abortUploadV2(ctx, existing.UploadID)
+	return err
 }
 
 func (b *Dat9Backend) validateUploadTargetRevision(ctx context.Context, path string, expectedRevision int64) error {
@@ -204,7 +205,7 @@ func (b *Dat9Backend) cleanupFailedFinalizeUpload(ctx context.Context, upload *d
 		return
 	}
 	b.deleteBlobCtx(ctx, upload.S3Key)
-	if err := b.store.AbortUploadV2(ctx, upload.UploadID); err != nil {
+	if _, err := b.store.AbortUploadV2(ctx, upload.UploadID); err != nil {
 		logger.Warn(ctx, "backend_finalize_upload_abort_metadata_failed", zap.String("upload_id", upload.UploadID), zap.Error(err))
 	}
 	if upload.FileID != "" {
@@ -271,23 +272,17 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		return nil, err
 	}
 
-	// One active upload per path: supersede rather than 409 so dead sessions
-	// can't block the path (see supersedeActiveUpload).
-	existing, err := b.activeUploadByPath(ctx, path)
-	if err != nil {
-		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
-		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
-	}
-	if existing != nil {
-		if err := b.supersedeActiveUpload(ctx, "initiate_upload", existing); err != nil {
-			metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
-			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
-		}
-	}
-
 	fileID := b.genID()
 	s3Key := "blobs/" + fileID
 	encOpts, encMode, encKeyID := b.s3WriteEncryption(s3Key)
+
+	// Calculate parts and validate client-provided checksum count before any
+	// remote side effects.
+	parts := s3client.CalcParts(totalSize, s3client.PartSize)
+	if len(partChecksums) > 0 && len(partChecksums) != len(parts) {
+		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+		return nil, fmt.Errorf("%w: got %d, expected %d", ErrPartChecksumCountMismatch, len(partChecksums), len(parts))
+	}
 
 	// Create S3 multipart upload — v1 uses CRC32C
 	mpu, err := b.s3.CreateMultipartUpload(ctx, s3Key, s3client.ChecksumAlgoCRC32C, encOpts)
@@ -295,13 +290,6 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		logger.Error(ctx, "backend_initiate_upload_create_multipart_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("create multipart upload: %w", err)
-	}
-
-	// Calculate parts
-	parts := s3client.CalcParts(totalSize, s3client.PartSize)
-	if len(partChecksums) > 0 && len(partChecksums) != len(parts) {
-		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
-		return nil, fmt.Errorf("%w: got %d, expected %d", ErrPartChecksumCountMismatch, len(partChecksums), len(parts))
 	}
 
 	// Presign all part URLs
@@ -331,6 +319,30 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		metrics.RecordOperation("backend", "initiate_upload", "quota_exceeded", time.Since(start))
 		return nil, err
+	}
+
+	// One active upload per path: supersede rather than 409 so dead sessions
+	// can't block the path (see supersedeActiveUpload). Do this only after
+	// the replacement request has passed validation/setup, so malformed
+	// initiates do not tear down a healthy existing session.
+	existing, err := b.activeUploadByPath(ctx, path)
+	if err != nil {
+		if reserved {
+			b.abortUploadReservation(ctx, uploadID, totalSize)
+		}
+		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
+		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
+	}
+	if existing != nil {
+		if err := b.supersedeActiveUpload(ctx, "initiate_upload", existing); err != nil {
+			if reserved {
+				b.abortUploadReservation(ctx, uploadID, totalSize)
+			}
+			_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
+			metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
+		}
 	}
 
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
@@ -437,21 +449,7 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 	}
 	validateDurationMs := uploadPhaseMs(validateStart)
 
-	activeUploadLookupStart := time.Now()
-	existing, err := b.activeUploadByPath(ctx, path)
-	if err != nil {
-		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
-		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
-	}
-	if existing != nil {
-		// Supersede rather than 409 so dead sessions can't block the path
-		// (see supersedeActiveUpload).
-		if err := b.supersedeActiveUpload(ctx, "initiate_upload_v2", existing); err != nil {
-			metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
-			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
-		}
-	}
-	activeUploadLookupDurationMs := uploadPhaseMs(activeUploadLookupStart)
+	var activeUploadLookupDurationMs float64
 
 	partSize := s3client.CalcAdaptivePartSize(totalSize)
 	parts := s3client.CalcParts(totalSize, partSize)
@@ -490,6 +488,31 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		metrics.RecordOperation("backend", "initiate_upload_v2", "quota_exceeded", time.Since(start))
 		return nil, err
 	}
+
+	activeUploadLookupStart := time.Now()
+	existing, err := b.activeUploadByPath(ctx, path)
+	if err != nil {
+		if reserved {
+			b.abortUploadReservation(ctx, uploadID, totalSize)
+		}
+		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
+	}
+	if existing != nil {
+		// Supersede rather than 409 so dead sessions can't block the path
+		// (see supersedeActiveUpload). Do this after validation/setup so a
+		// failing replacement does not tear down the existing session.
+		if err := b.supersedeActiveUpload(ctx, "initiate_upload_v2", existing); err != nil {
+			if reserved {
+				b.abortUploadReservation(ctx, uploadID, totalSize)
+			}
+			_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
+			metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
+		}
+	}
+	activeUploadLookupDurationMs = uploadPhaseMs(activeUploadLookupStart)
 
 	txStart := time.Now()
 	var quotaDurationMs float64
@@ -1292,29 +1315,39 @@ func (b *Dat9Backend) AbortUpload(ctx context.Context, uploadID string) error {
 // AbortUploadV2 cancels an upload (idempotent — returns nil for not-found or already-aborted).
 // Cleans up: aborts S3 multipart, marks upload ABORTED, marks pending file DELETED.
 func (b *Dat9Backend) AbortUploadV2(ctx context.Context, uploadID string) error {
+	_, err := b.abortUploadV2(ctx, uploadID)
+	return err
+}
+
+func (b *Dat9Backend) abortUploadV2(ctx context.Context, uploadID string) (bool, error) {
 	start := time.Now()
 	upload, err := b.store.GetUpload(ctx, uploadID)
 	if err != nil {
 		// Not found → idempotent success
 		if errors.Is(err, datastore.ErrNotFound) {
 			metrics.RecordOperation("backend", "abort_upload_v2", "ok", time.Since(start))
-			return nil
+			return false, nil
 		}
 		metrics.RecordOperation("backend", "abort_upload_v2", "error", time.Since(start))
-		return err
+		return false, err
 	}
 	// Already terminal → idempotent success
 	if upload.Status == datastore.UploadAborted || upload.Status == datastore.UploadCompleted || upload.Status == datastore.UploadExpired {
 		metrics.RecordOperation("backend", "abort_upload_v2", "ok", time.Since(start))
-		return nil
+		return false, nil
 	}
 
-	_ = b.s3.AbortMultipartUpload(ctx, upload.S3Key, upload.S3UploadID)
-	if err := b.store.AbortUploadV2(ctx, uploadID); err != nil {
+	aborted, err := b.store.AbortUploadV2(ctx, uploadID)
+	if err != nil {
 		logger.Error(ctx, "backend_abort_upload_v2_store_failed", zap.String("upload_id", uploadID), zap.Error(err))
 		metrics.RecordOperation("backend", "abort_upload_v2", "error", time.Since(start))
-		return err
+		return false, err
 	}
+	if !aborted {
+		metrics.RecordOperation("backend", "abort_upload_v2", "ok", time.Since(start))
+		return false, nil
+	}
+	_ = b.s3.AbortMultipartUpload(ctx, upload.S3Key, upload.S3UploadID)
 	// Clean up the pending file row created at initiate time.
 	if upload.FileID != "" {
 		if err := b.store.MarkFileDeleted(ctx, upload.FileID); err != nil {
@@ -1324,7 +1357,7 @@ func (b *Dat9Backend) AbortUploadV2(ctx context.Context, uploadID string) error 
 	// Release server-side reservation.
 	b.abortUploadReservation(ctx, uploadID, upload.TotalSize)
 	metrics.RecordOperation("backend", "abort_upload_v2", "ok", time.Since(start))
-	return nil
+	return true, nil
 }
 
 // GetUpload returns the upload record.

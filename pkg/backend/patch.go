@@ -188,20 +188,6 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	sourceKey := nf.File.StorageRef
 	origSize := nf.File.SizeBytes
 
-	// One active upload per path: supersede rather than 409 so dead sessions
-	// can't block the path (see supersedeActiveUpload).
-	existing, err := b.activeUploadByPath(ctx, path)
-	if err != nil {
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
-		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
-	}
-	if existing != nil {
-		if err := b.supersedeActiveUpload(ctx, "patch_upload", existing); err != nil {
-			metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
-			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
-		}
-	}
-
 	// Use client-provided part size if valid (>= MinPartSize); otherwise
 	// fall back to fixed 8 MiB for backward compatibility with old clients
 	// that compute dirty_parts at fixed 8 MiB boundaries.
@@ -322,6 +308,30 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
 		metrics.RecordOperation("backend", "patch_upload", "quota_exceeded", time.Since(start))
 		return nil, err
+	}
+
+	// One active upload per path: supersede rather than 409 so dead sessions
+	// can't block the path (see supersedeActiveUpload). Do this only after
+	// part-size validation and S3 copy/presign setup have succeeded, so a
+	// malformed replacement request does not tear down a healthy session.
+	existing, err := b.activeUploadByPath(ctx, path)
+	if err != nil {
+		if reserved {
+			b.abortUploadReservation(ctx, uploadID, newSize)
+		}
+		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
+		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
+	}
+	if existing != nil {
+		if err := b.supersedeActiveUpload(ctx, "patch_upload", existing); err != nil {
+			if reserved {
+				b.abortUploadReservation(ctx, uploadID, newSize)
+			}
+			_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
+			metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
+		}
 	}
 
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {

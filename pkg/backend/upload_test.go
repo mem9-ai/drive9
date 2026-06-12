@@ -404,7 +404,7 @@ func TestInitiatePatchUploadSupersedesActiveUploadOnSamePath(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()
 
-	data := bytes.Repeat([]byte("p"), 64<<10)
+	data := bytes.Repeat([]byte("p"), int(b.inlineThreshold))
 	if _, err := b.Write("/patch-dup.bin", data, 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
