@@ -1092,6 +1092,10 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 				created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
 				semanticTaskEnqueued = created
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
+				if err != nil {
+					return err
+				}
+				_, err = b.store.AppendFSEventTx(ctx, tx, upload.TargetPath, "upload_complete", "")
 				return err
 			}
 			if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "", upload.Description) {
@@ -1099,9 +1103,12 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 				created, err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
 				semanticTaskEnqueued = created
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
-				return err
+				if err != nil {
+					return err
+				}
 			}
-			return nil
+			_, err = b.store.AppendFSEventTx(ctx, tx, upload.TargetPath, "upload_complete", "")
+			return err
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -1154,6 +1161,10 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
 			semanticTaskEnqueued = created
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
+			if err != nil {
+				return err
+			}
+			_, err = b.store.AppendFSEventTx(ctx, tx, upload.TargetPath, "upload_complete", "")
 			return err
 		}
 		if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "", upload.Description) {
@@ -1161,9 +1172,12 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			created, err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
 			semanticTaskEnqueued = created
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
-			return err
+			if err != nil {
+				return err
+			}
 		}
-		return nil
+		_, err = b.store.AppendFSEventTx(ctx, tx, upload.TargetPath, "upload_complete", "")
+		return err
 	}); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
 		b.cleanupFailedFinalizeUpload(ctx, upload)

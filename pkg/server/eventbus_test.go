@@ -59,6 +59,74 @@ func TestEventBusReplay(t *testing.T) {
 	}
 }
 
+func TestEventBusPublishEventIgnoresOlderSeq(t *testing.T) {
+	bus := NewEventBus()
+	bus.PublishEvent(ChangeEvent{Seq: 2, Path: "/b.txt", Op: "write", Ts: 1})
+	bus.PublishEvent(ChangeEvent{Seq: 1, Path: "/a.txt", Op: "write", Ts: 1})
+
+	if got := bus.Seq(); got != 2 {
+		t.Fatalf("seq=%d, want 2", got)
+	}
+	events, _, ok := bus.EventsSince(1)
+	if !ok {
+		t.Fatal("EventsSince(1) returned not ok")
+	}
+	if len(events) != 1 || events[0].Seq != 2 || events[0].Path != "/b.txt" {
+		t.Fatalf("events=%+v, want only durable seq 2", events)
+	}
+}
+
+func TestEventBusEventsSinceAcceptsDurableSeqGaps(t *testing.T) {
+	bus := NewEventBus()
+	bus.PublishEvent(ChangeEvent{Seq: 1, Path: "/a.txt", Op: "write", Ts: 1})
+	bus.AdvanceSeq(2)
+	bus.PublishEvent(ChangeEvent{Seq: 3, Path: "/c.txt", Op: "write", Ts: 1})
+
+	events, headSeq, ok := bus.EventsSince(1)
+	if !ok {
+		t.Fatal("EventsSince(1) returned not ok")
+	}
+	if headSeq != 3 {
+		t.Fatalf("headSeq=%d, want 3", headSeq)
+	}
+	if len(events) != 1 || events[0].Seq != 3 || events[0].Path != "/c.txt" {
+		t.Fatalf("events=%+v, want durable seq 3", events)
+	}
+}
+
+func TestEventBusPublishEventIgnoresDuplicateSeq(t *testing.T) {
+	bus := NewEventBus()
+	bus.PublishEvent(ChangeEvent{Seq: 6, Path: "/durable.txt", Op: "chmod", Ts: 1})
+	bus.PublishEvent(ChangeEvent{Seq: 6, Path: "/duplicate.txt", Op: "chmod", Ts: 1})
+
+	events, headSeq, ok := bus.EventsSince(5)
+	if !ok {
+		t.Fatal("EventsSince(5) returned not ok")
+	}
+	if headSeq != 6 {
+		t.Fatalf("headSeq=%d, want 6", headSeq)
+	}
+	if len(events) != 1 || events[0].Seq != 6 || events[0].Path != "/durable.txt" {
+		t.Fatalf("events=%+v, want only durable seq 6", events)
+	}
+}
+
+func TestEventBusLiveEventsSinceAllowsZeroCursor(t *testing.T) {
+	bus := NewEventBus()
+	bus.PublishEvent(ChangeEvent{Seq: 1, Path: "/first.txt", Op: "write", Ts: 1})
+
+	events, headSeq, ok := bus.LiveEventsSince(0)
+	if !ok {
+		t.Fatal("LiveEventsSince(0) returned not ok")
+	}
+	if headSeq != 1 {
+		t.Fatalf("headSeq=%d, want 1", headSeq)
+	}
+	if len(events) != 1 || events[0].Seq != 1 || events[0].Path != "/first.txt" {
+		t.Fatalf("events=%+v, want first live event", events)
+	}
+}
+
 func TestEventBusCaughtUp(t *testing.T) {
 	bus := NewEventBus()
 	bus.Publish("/a.txt", "write", "")
@@ -134,7 +202,13 @@ func TestEventBusSubscribeNotify(t *testing.T) {
 func TestEventBusUnsubscribeCloses(t *testing.T) {
 	bus := NewEventBus()
 	id, ch := bus.Subscribe()
+	if got := bus.ListenerCount(); got != 1 {
+		t.Fatalf("ListenerCount after subscribe=%d, want 1", got)
+	}
 	bus.Unsubscribe(id)
+	if got := bus.ListenerCount(); got != 0 {
+		t.Fatalf("ListenerCount after unsubscribe=%d, want 0", got)
+	}
 
 	_, open := <-ch
 	if open {

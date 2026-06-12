@@ -265,6 +265,23 @@ func TestMissingTableAndIndexDiffsIncludesExternalIndexes(t *testing.T) {
 	}
 }
 
+func TestFSEventSeqTableIsRepairableSchemaContract(t *testing.T) {
+	for _, mode := range []TiDBEmbeddingMode{TiDBEmbeddingModeAuto, TiDBEmbeddingModeApp} {
+		table := mustTiDBTableSpecByName(t, mode, "fs_event_seq")
+		if table.createStatement == "" {
+			t.Fatalf("mode %q fs_event_seq missing create statement", mode)
+		}
+		if !equalStringSlices(table.primaryKey.columns, []string{"id"}) {
+			t.Fatalf("mode %q fs_event_seq primary key = %#v, want id", mode, table.primaryKey)
+		}
+		diff := missingTableDiff(table)
+		repairs := plannedTiDBSchemaRepairs([]tidbSchemaDiff{diff})
+		if len(repairs) != 1 || !strings.Contains(repairs[0], "CREATE TABLE IF NOT EXISTS fs_event_seq") {
+			t.Fatalf("mode %q fs_event_seq repairs = %#v, want create table", mode, repairs)
+		}
+	}
+}
+
 func TestPlannedTiDBSchemaRepairsIncludesSafeStatementsOnly(t *testing.T) {
 	diffs := []tidbSchemaDiff{
 		{kind: tidbSchemaDiffMissingTable, tableName: "semantic_tasks", repairSQL: "CREATE TABLE IF NOT EXISTS semantic_tasks (...)"},

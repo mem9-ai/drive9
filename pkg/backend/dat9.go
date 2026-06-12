@@ -268,10 +268,14 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {
 			return err
 		}
-		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
 			Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
-		})
+		}); err != nil {
+			return err
+		}
+		_, err := b.store.AppendFSEventTx(ctx, tx, path, "create", "")
+		return err
 	})
 	if err != nil {
 		if storageType == datastore.StorageS3 {
@@ -332,10 +336,14 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 		if err := b.store.EnsureParentDirsTx(tx, linkPath, b.genID); err != nil {
 			return err
 		}
-		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID: b.genID(), Path: linkPath, ParentPath: pathutil.ParentPath(linkPath),
 			Name: pathutil.BaseName(linkPath), FileID: fileID, CreatedAt: now,
-		})
+		}); err != nil {
+			return err
+		}
+		_, err := b.store.AppendFSEventTx(ctx, tx, linkPath, "symlink", "")
+		return err
 	})
 	if err != nil {
 		return err
@@ -377,7 +385,7 @@ func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (e
 		}); err != nil {
 			return err
 		}
-		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID:      b.genID(),
 			Path:        dirPath,
 			ParentPath:  pathutil.ParentPath(dirPath),
@@ -385,7 +393,11 @@ func (b *Dat9Backend) MkdirCtx(ctx context.Context, path string, perm uint32) (e
 			IsDirectory: true,
 			InodeID:     nodeID,
 			CreatedAt:   now,
-		})
+		}); err != nil {
+			return err
+		}
+		_, err := b.store.AppendFSEventTx(ctx, tx, dirPath, "mkdir", "")
+		return err
 	}); err != nil {
 		return err
 	}
@@ -700,14 +712,21 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		if b.UsesDatabaseAutoEmbedding() {
 			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
 			semanticTaskEnqueued = created
+			if err != nil {
+				return err
+			}
+			_, err = b.store.AppendFSEventTx(ctx, tx, path, "write", "")
 			return err
 		}
 		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
 			created, err := b.enqueueEmbedTaskTx(tx, fileID, 1)
 			semanticTaskEnqueued = created
-			return err
+			if err != nil {
+				return err
+			}
 		}
-		return nil
+		_, err := b.store.AppendFSEventTx(ctx, tx, path, "write", "")
+		return err
 	}); err != nil {
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
@@ -831,14 +850,21 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		if b.UsesDatabaseAutoEmbedding() {
 			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
 			semanticTaskEnqueued = created
+			if err != nil {
+				return err
+			}
+			_, err = b.store.AppendFSEventTx(ctx, tx, nf.Node.Path, "write", "")
 			return err
 		}
 		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText, description) {
 			created, err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
 			semanticTaskEnqueued = created
-			return err
+			if err != nil {
+				return err
+			}
 		}
-		return nil
+		_, err := b.store.AppendFSEventTx(ctx, tx, nf.Node.Path, "write", "")
+		return err
 	})
 	if err != nil {
 		if storageType == datastore.StorageS3 {
@@ -1345,7 +1371,8 @@ func (b *Dat9Backend) CopyFileCtx(ctx context.Context, srcPath, dstPath string) 
 		}); err != nil {
 			return fmt.Errorf("insert copied node %q: %w", dstPath, err)
 		}
-		return nil
+		_, err := b.store.AppendFSEventTx(ctx, tx, dstPath, "copy", "")
+		return err
 	})
 }
 
@@ -1383,7 +1410,14 @@ func (b *Dat9Backend) HardlinkFileCtx(ctx context.Context, srcPath, dstPath stri
 		if err := b.store.EnsureParentDirsTx(tx, dstPath, b.genID); err != nil {
 			return err
 		}
-		return b.store.LinkFileNodeTx(ctx, tx, srcPath, dstPath, pathutil.ParentPath(dstPath), pathutil.BaseName(dstPath), b.genID(), time.Now())
+		if err := b.store.LinkFileNodeTx(ctx, tx, srcPath, dstPath, pathutil.ParentPath(dstPath), pathutil.BaseName(dstPath), b.genID(), time.Now()); err != nil {
+			return err
+		}
+		if _, err := b.store.AppendFSEventTx(ctx, tx, srcPath, "hardlink", ""); err != nil {
+			return err
+		}
+		_, err := b.store.AppendFSEventTx(ctx, tx, dstPath, "hardlink", "")
+		return err
 	})
 	if errors.Is(err, datastore.ErrInvalidLinkTarget) {
 		return ErrInvalidHardlinkTarget

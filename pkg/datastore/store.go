@@ -335,6 +335,9 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	if n == 0 {
 		return ErrNotFound
 	}
+	if _, err := s.AppendFSEventTx(ctx, tx, path, "delete", ""); err != nil {
+		return err
+	}
 	err = tx.Commit()
 	return err
 }
@@ -474,6 +477,9 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 		}
 	}
 
+	if _, err := s.AppendFSEventTx(ctx, tx, newPath, "rename", ""); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -600,6 +606,11 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		}
 	}
 
+	if len(updates) > 0 {
+		if _, err := s.AppendFSEventTx(ctx, tx, newPrefix, "rename", ""); err != nil {
+			return 0, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
@@ -1246,22 +1257,36 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 		return ErrNotFound
 	}
 
-	var currentMode uint32
-	if err := s.db.QueryRowContext(ctx, `SELECT mode FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED'`, inodeID).Scan(&currentMode); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		var currentMode uint32
+		var currentMtime time.Time
+		var currentConfirmedAt sql.NullTime
+		if err := tx.QueryRowContext(ctx, `SELECT mode, mtime, confirmed_at FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED' FOR UPDATE`, inodeID).Scan(&currentMode, &currentMtime, &currentConfirmedAt); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		mode = (mode & 0o777) | (currentMode & fileTypeModeMask)
+		now := time.Now().UTC()
+		if !now.After(currentMtime) {
+			now = currentMtime.Add(time.Millisecond)
+		}
+		if currentConfirmedAt.Valid && !now.After(currentConfirmedAt.Time) {
+			now = currentConfirmedAt.Time.Add(time.Millisecond)
+		}
+		res, err := tx.ExecContext(ctx, `UPDATE inodes SET mode = ?, revision = revision + 1, mtime = ?, confirmed_at = ? WHERE inode_id = ? AND status = 'CONFIRMED'`, mode, now, now, inodeID)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
 			return ErrNotFound
 		}
-		return err
-	}
-	mode = (mode & 0o777) | (currentMode & fileTypeModeMask)
-	res, err := s.db.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE inode_id = ? AND status = 'CONFIRMED'`, mode, inodeID)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrNotFound
-	}
-	return nil
+		if _, err := s.AppendFSEventTx(ctx, tx, path, "chmod", ""); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 func (s *Store) EnsureParentDirsTx(db execer, path string, genID func() string) error {
@@ -1850,6 +1875,9 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	}
 
 	if candidate.fileID == "" {
+		if _, err := s.AppendFSEventTx(ctx, tx, path, "delete", ""); err != nil {
+			return nil, err
+		}
 		return nil, tx.Commit()
 	}
 	if err := s.lockFileIDsForDeleteTx(ctx, tx, []string{candidate.fileID}); err != nil {
@@ -1863,6 +1891,9 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 	}
 
 	if count > 0 {
+		if _, err := s.AppendFSEventTx(ctx, tx, path, "delete", ""); err != nil {
+			return nil, err
+		}
 		return nil, tx.Commit()
 	}
 
@@ -1886,6 +1917,9 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 		return nil, err
 	}
 
+	if _, err := s.AppendFSEventTx(ctx, tx, path, "delete", ""); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -1923,8 +1957,13 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		return nil, err
 	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? OR path LIKE ?`,
-		dirPath, dirPath+"%"); err != nil {
+	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? OR path LIKE ?`,
+		dirPath, dirPath+"%")
+	if err != nil {
+		return nil, err
+	}
+	deletedRows, err := res.RowsAffected()
+	if err != nil {
 		return nil, err
 	}
 
@@ -1953,6 +1992,11 @@ func (s *Store) DeleteDirRecursive(ctx context.Context, dirPath string) (out []*
 		}
 	}
 
+	if deletedRows > 0 {
+		if _, err := s.AppendFSEventTx(ctx, tx, dirPath, "delete", ""); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}

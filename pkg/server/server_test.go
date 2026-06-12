@@ -51,7 +51,20 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(b)
+	return NewWithConfig(Config{Backend: b, SSECatchup: SSECatchupOptions{Disabled: true}})
+}
+
+func TestNewWithConfigSetsSSEHeartbeatInterval(t *testing.T) {
+	defaultServer := NewWithConfig(Config{})
+	if defaultServer.sseHeartbeatInterval != defaultSSEHeartbeatInterval {
+		t.Fatalf("default SSE heartbeat interval = %s, want %s", defaultServer.sseHeartbeatInterval, defaultSSEHeartbeatInterval)
+	}
+
+	custom := 3 * time.Second
+	customServer := NewWithConfig(Config{SSEHeartbeatInterval: custom})
+	if customServer.sseHeartbeatInterval != custom {
+		t.Fatalf("custom SSE heartbeat interval = %s, want %s", customServer.sseHeartbeatInterval, custom)
+	}
 }
 
 func insertTestS3File(t *testing.T, s *Server, p string, size int64) {

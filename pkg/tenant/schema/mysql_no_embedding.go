@@ -183,6 +183,10 @@ func MySQLNoEmbeddingTenantSchemaStatements() []string {
 			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 		)`,
 		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
+		`CREATE TABLE IF NOT EXISTS fs_event_seq (
+			id       TINYINT UNSIGNED PRIMARY KEY,
+			next_seq BIGINT UNSIGNED NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS fs_events (
 			seq        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
 			path       VARCHAR(512) NOT NULL,
@@ -241,16 +245,17 @@ func ValidateMySQLNoEmbeddingTenantSchema(ctx context.Context, db *sql.DB) error
 		"fs_layer_events",
 		"fs_layer_checkpoints",
 		"journals",
+		"fs_event_seq",
 		"fs_events",
 	}
 	var count int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
 			FROM information_schema.tables
 			WHERE table_schema = DATABASE()
-				AND table_name IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				AND table_name IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		required[0], required[1], required[2], required[3], required[4],
 		required[5], required[6], required[7], required[8], required[9],
-		required[10], required[11],
+		required[10], required[11], required[12],
 	).Scan(&count); err != nil {
 		return fmt.Errorf("validate local no-embedding schema: %w", err)
 	}

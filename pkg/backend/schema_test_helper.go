@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
+
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
@@ -16,6 +17,7 @@ func initBackendSchema(t *testing.T, dsn string) {
 		t.Fatal(err)
 	}
 	defer func() { _ = db.Close() }()
+
 	stmts := schema.MySQLNoEmbeddingTenantSchemaStatements()
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {

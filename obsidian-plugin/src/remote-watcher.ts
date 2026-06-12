@@ -9,6 +9,10 @@ const SSE_MAX_BACKOFF_MS = 30_000;
 
 type NodeRequire = (name: string) => unknown;
 
+interface HeartbeatEvent {
+  seq: number;
+}
+
 export class RemoteWatcher {
   private lastSeq = 0;
   private stopped = true;
@@ -249,8 +253,13 @@ export class RemoteWatcher {
         void Promise.resolve(this.callbacks.onReset(event));
         return;
       }
-      case "heartbeat":
+      case "heartbeat": {
+        const event = safeJSONParse<HeartbeatEvent>(data);
+        if (event && event.seq > this.lastSeq) {
+          this.lastSeq = event.seq;
+        }
         return;
+      }
       default:
         return;
     }

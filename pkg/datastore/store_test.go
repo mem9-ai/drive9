@@ -1354,6 +1354,15 @@ func TestChmod(t *testing.T) {
 	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
+	fixedTime := time.Now().UTC().Add(time.Hour).Truncate(time.Millisecond)
+	if _, err := s.DB().ExecContext(ctx, `UPDATE inodes SET mtime = ?, confirmed_at = ? WHERE inode_id = ?`, fixedTime, fixedTime, "f1"); err != nil {
+		t.Fatal(err)
+	}
+	var beforeMtime time.Time
+	var beforeConfirmedAt time.Time
+	if err := s.DB().QueryRowContext(ctx, `SELECT mtime, confirmed_at FROM inodes WHERE inode_id = ?`, "f1").Scan(&beforeMtime, &beforeConfirmedAt); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := s.Chmod(ctx, "/a.txt", 0o600); err != nil {
 		t.Fatal(err)
@@ -1365,6 +1374,20 @@ func TestChmod(t *testing.T) {
 	}
 	if got.Mode != 0o600 {
 		t.Errorf("mode=%o, want 0o600", got.Mode)
+	}
+	if got.Revision != 2 {
+		t.Errorf("revision=%d, want 2", got.Revision)
+	}
+	var afterMtime time.Time
+	var afterConfirmedAt time.Time
+	if err := s.DB().QueryRowContext(ctx, `SELECT mtime, confirmed_at FROM inodes WHERE inode_id = ?`, "f1").Scan(&afterMtime, &afterConfirmedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !afterMtime.After(beforeMtime) {
+		t.Errorf("mtime=%s, want after %s", afterMtime, beforeMtime)
+	}
+	if !afterConfirmedAt.After(beforeConfirmedAt) {
+		t.Errorf("confirmed_at=%s, want after %s", afterConfirmedAt, beforeConfirmedAt)
 	}
 }
 
@@ -1463,6 +1486,51 @@ func TestChmodDirectory(t *testing.T) {
 	err := s.Chmod(ctx, "/dir/", 0o700)
 	if err == nil {
 		t.Fatal("expected error for chmod on directory")
+	}
+}
+
+func TestChmodDirectoryWithNullConfirmedAt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	if err := s.InsertInode(ctx, &Inode{
+		InodeID:   "dir-inode",
+		SizeBytes: 0,
+		Revision:  1,
+		Mode:      0o755,
+		Status:    StatusConfirmed,
+		CreatedAt: now,
+		Mtime:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{
+		NodeID:      "dir-node",
+		Path:        "/dir/",
+		ParentPath:  "/",
+		Name:        "dir",
+		IsDirectory: true,
+		InodeID:     "dir-inode",
+		CreatedAt:   now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Chmod(ctx, "/dir/", 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var mode uint32
+	var confirmedAt sql.NullTime
+	if err := s.DB().QueryRowContext(ctx, `SELECT mode, confirmed_at FROM inodes WHERE inode_id = ?`, "dir-inode").Scan(&mode, &confirmedAt); err != nil {
+		t.Fatal(err)
+	}
+	if mode != 0o700 {
+		t.Fatalf("mode=%o, want 0o700", mode)
+	}
+	if !confirmedAt.Valid {
+		t.Fatal("confirmed_at is still NULL")
 	}
 }
 

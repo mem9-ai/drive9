@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -36,6 +37,16 @@ func readSSEEvent(scanner *bufio.Scanner) (sseEvent, bool) {
 		}
 	}
 	return ev, false
+}
+
+func clearFSEventsForServerTest(t *testing.T, srv *Server) {
+	t.Helper()
+	if _, err := srv.fallback.Store().DB().Exec(`DELETE FROM fs_events`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := srv.fallback.Store().DB().Exec(`DELETE FROM fs_event_seq`); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSSEEndpointSince0SendsReset(t *testing.T) {
@@ -147,6 +158,349 @@ func TestSSEEndpointReplay(t *testing.T) {
 	}
 	if data2.Path != "/c.txt" || data2.Op != "write" {
 		t.Errorf("event2 data: %+v", data2)
+	}
+}
+
+func TestSSEEndpointPersistentReplayAfterMemoryBusReset(t *testing.T) {
+	srv := newTestServer(t)
+	store := srv.fallback.Store()
+	ctx := context.Background()
+	ev1, err := store.InsertFSEvent(ctx, "/persist-a.txt", "write", "actor1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev2, err := store.InsertFSEvent(ctx, "/persist-b.txt", "chmod", "actor2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a server restart: persistent events remain, memory bus is empty.
+	srv.events = newEventBuses()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := &TenantScope{TenantID: "", Backend: srv.fallback}
+		srv.handleEvents(w, r.WithContext(withScope(r.Context(), scope)))
+	}))
+	defer ts.Close()
+
+	reqCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(reqCtx, "GET", fmt.Sprintf("%s?since=%d", ts.URL, ev1.Seq), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	got, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected replayed persistent event")
+	}
+	if got.Event != "file_changed" {
+		t.Fatalf("event=%q, want file_changed", got.Event)
+	}
+	var data ChangeEvent
+	if err := json.Unmarshal([]byte(got.Data), &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.Seq != ev2.Seq || data.Path != "/persist-b.txt" || data.Op != "chmod" || data.Actor != "actor2" {
+		t.Fatalf("persistent replay event = %+v, want chmod seq %d", data, ev2.Seq)
+	}
+}
+
+func TestSSEEndpointPersistentReplayAllowsSeqGaps(t *testing.T) {
+	srv := newTestServer(t)
+	store := srv.fallback.Store()
+	ctx := context.Background()
+	ev1, err := store.InsertFSEvent(ctx, "/persist-a.txt", "write", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gap, err := store.InsertFSEvent(ctx, "/gap.txt", "write", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev3, err := store.InsertFSEvent(ctx, "/persist-c.txt", "chmod", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().ExecContext(ctx, `DELETE FROM fs_events WHERE seq = ?`, gap.Seq); err != nil {
+		t.Fatal(err)
+	}
+	srv.events = newEventBuses()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := &TenantScope{TenantID: "", Backend: srv.fallback}
+		srv.handleEvents(w, r.WithContext(withScope(r.Context(), scope)))
+	}))
+	defer ts.Close()
+
+	reqCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(reqCtx, "GET", fmt.Sprintf("%s?since=%d", ts.URL, ev1.Seq), nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	got, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected replayed persistent event")
+	}
+	if got.Event != "file_changed" {
+		t.Fatalf("event=%q, want file_changed", got.Event)
+	}
+	var data ChangeEvent
+	if err := json.Unmarshal([]byte(got.Data), &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.Seq != ev3.Seq || data.Path != "/persist-c.txt" {
+		t.Fatalf("persistent replay event = %+v, want seq %d path /persist-c.txt", data, ev3.Seq)
+	}
+}
+
+func TestPersistentEventsSinceResetsWhenSincePredatesRetainedOldest(t *testing.T) {
+	srv := newTestServer(t)
+	store := srv.fallback.Store()
+	ctx := context.Background()
+	ev1, err := store.InsertFSEvent(ctx, "/old-a.txt", "write", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertFSEvent(ctx, "/old-b.txt", "write", ""); err != nil {
+		t.Fatal(err)
+	}
+	ev3, err := store.InsertFSEvent(ctx, "/retained.txt", "chmod", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PruneFSEventsBefore(ctx, ev3.Seq); err != nil {
+		t.Fatal(err)
+	}
+
+	events, headSeq, ok, reason, err := persistentEventsSince(ctx, store, ev1.Seq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatalf("persistentEventsSince returned ok with partial retention replay: %+v", events)
+	}
+	if len(events) != 0 {
+		t.Fatalf("events len=%d, want 0", len(events))
+	}
+	if headSeq != ev3.Seq {
+		t.Fatalf("headSeq=%d, want %d", headSeq, ev3.Seq)
+	}
+	if reason != sseResultSeqTooOld {
+		t.Fatalf("reason=%q, want %q", reason, sseResultSeqTooOld)
+	}
+}
+
+func TestSSEEndpointDoesNotFallbackToBusWhenPersistentLogHasNoHistory(t *testing.T) {
+	srv := newTestServer(t)
+	clearFSEventsForServerTest(t, srv)
+	bus := srv.events.get("")
+	bus.Publish("/volatile-a.txt", "write", "")
+	bus.Publish("/volatile-b.txt", "chmod", "")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := &TenantScope{TenantID: "", Backend: srv.fallback}
+		srv.handleEvents(w, r.WithContext(withScope(r.Context(), scope)))
+	}))
+	defer ts.Close()
+
+	reqCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(reqCtx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	got, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected reset event")
+	}
+	if got.Event != "reset" {
+		t.Fatalf("event=%q, want reset", got.Event)
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(got.Data), &data); err != nil {
+		t.Fatal(err)
+	}
+	if data["reason"] != "no_history" {
+		t.Fatalf("reset reason=%v, want no_history", data["reason"])
+	}
+}
+
+func TestSSERetentionSweeperPrunesOutsideWindow(t *testing.T) {
+	srv := newTestServer(t)
+	store := srv.fallback.Store()
+	ctx := context.Background()
+
+	ev1, err := store.InsertFSEvent(ctx, "/old.txt", "write", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev2, err := store.InsertFSEvent(ctx, "/keep-a.txt", "write", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev3, err := store.InsertFSEvent(ctx, "/keep-b.txt", "chmod", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sweeper := newSSERetentionSweeper()
+	sweeper.retention = 2
+	sweeper.sweepHead(ctx, store, ev3.Seq)
+
+	events, err := store.ListFSEventsSince(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events len=%d, want 2: %+v", len(events), events)
+	}
+	if events[0].Seq != ev2.Seq || events[1].Seq != ev3.Seq {
+		t.Fatalf("kept seqs = [%d %d], want [%d %d]", events[0].Seq, events[1].Seq, ev2.Seq, ev3.Seq)
+	}
+	for _, ev := range events {
+		if ev.Seq == ev1.Seq {
+			t.Fatalf("old event was not pruned: %+v", ev)
+		}
+	}
+}
+
+func TestSSECatchupPublishesTenantDBEventsToLocalBus(t *testing.T) {
+	srv := newTestServer(t)
+	store := srv.fallback.Store()
+	bus := NewEventBus()
+	id, notify := bus.Subscribe()
+	defer bus.Unsubscribe(id)
+
+	manager := newSSECatchupManager(srv.fallback, nil, nil, SSECatchupOptions{
+		PollInterval:         time.Hour,
+		IdleMaxInterval:      time.Hour,
+		BatchSize:            10,
+		MaxConcurrentTenants: 1,
+	})
+	if manager == nil {
+		t.Fatal("expected catchup manager")
+	}
+	defer manager.Stop()
+
+	manager.Register("", bus, 0)
+	ev, err := store.InsertFSEvent(context.Background(), "/cross-pod.txt", "write", "pod-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.catchupTenant(activeSSECatchupTenant{tenantID: "", bus: bus, cursor: 0})
+
+	select {
+	case <-notify:
+	case <-time.After(time.Second):
+		t.Fatal("expected local bus notification from catchup")
+	}
+	events, head, ok := bus.LiveEventsSince(0)
+	if !ok {
+		t.Fatal("LiveEventsSince returned not ok")
+	}
+	if head != ev.Seq {
+		t.Fatalf("head=%d, want %d", head, ev.Seq)
+	}
+	if len(events) != 1 || events[0].Seq != ev.Seq || events[0].Path != "/cross-pod.txt" || events[0].Actor != "pod-a" {
+		t.Fatalf("catchup events=%+v, want durable event %+v", events, ev)
+	}
+}
+
+func TestSSECatchupCoalescesConnectionsPerTenantDB(t *testing.T) {
+	bus := NewEventBus()
+	manager := newSSECatchupManager(nil, nil, nil, SSECatchupOptions{Disabled: true})
+	if manager != nil {
+		t.Fatal("disabled catchup manager should be nil")
+	}
+
+	srv := newTestServer(t)
+	defer srv.Close()
+	manager = newSSECatchupManager(srv.fallback, nil, nil, SSECatchupOptions{
+		PollInterval:         time.Hour,
+		IdleMaxInterval:      time.Hour,
+		BatchSize:            10,
+		MaxConcurrentTenants: 1,
+	})
+	if manager == nil {
+		t.Fatal("expected catchup manager")
+	}
+	defer manager.Stop()
+
+	manager.Register("", bus, 1)
+	manager.Register("", bus, 2)
+	manager.mu.Lock()
+	if len(manager.tenants) != 1 {
+		t.Fatalf("registered tenant dbs=%d, want 1", len(manager.tenants))
+	}
+	if manager.tenants[""].listeners != 2 {
+		t.Fatalf("listeners=%d, want 2", manager.tenants[""].listeners)
+	}
+	if manager.tenants[""].cursor != 2 {
+		t.Fatalf("cursor=%d, want 2", manager.tenants[""].cursor)
+	}
+	manager.mu.Unlock()
+
+	manager.Unregister("", bus)
+	manager.mu.Lock()
+	if manager.tenants[""].listeners != 1 {
+		t.Fatalf("listeners after one unregister=%d, want 1", manager.tenants[""].listeners)
+	}
+	manager.mu.Unlock()
+
+	manager.Unregister("", bus)
+	manager.mu.Lock()
+	_, ok := manager.tenants[""]
+	manager.mu.Unlock()
+	if ok {
+		t.Fatal("tenant db catchup entry should be removed after last listener")
+	}
+}
+
+func TestHandleChmodPublishesPersistentSSEEvent(t *testing.T) {
+	srv := newTestServer(t)
+	ctx := context.Background()
+	if err := srv.fallback.CreateCtx(ctx, "/chmod.txt"); err != nil {
+		t.Fatal(err)
+	}
+	clearFSEventsForServerTest(t, srv)
+
+	body := bytes.NewBufferString(`{"mode":384}`)
+	req := httptest.NewRequest(http.MethodPost, "/v1/fs/chmod.txt?chmod=1", body)
+	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "", Backend: srv.fallback}))
+	rr := httptest.NewRecorder()
+	srv.handleChmod(rr, req, "/chmod.txt")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	events, err := srv.fallback.Store().ListFSEventsSince(ctx, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events len=%d, want 1: %+v", len(events), events)
+	}
+	if got := events[0]; got.Path != "/chmod.txt" || got.Op != "chmod" {
+		t.Fatalf("event=%+v, want chmod event for /chmod.txt", got)
+	}
+	nf, err := srv.fallback.Store().Stat(ctx, "/chmod.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nf.File == nil || nf.File.Revision != 2 {
+		t.Fatalf("revision=%v, want 2 after chmod", nf.File)
 	}
 }
 
@@ -364,6 +718,57 @@ func TestSSEStructuralOpLiveEmitsReset(t *testing.T) {
 	}
 	if data["op"] != "rename" {
 		t.Errorf("live rename op=%v, want rename", data["op"])
+	}
+}
+
+func TestSSEForceResetSignalLiveEmitsReset(t *testing.T) {
+	srv := &Server{events: newEventBuses()}
+	bus := srv.events.get("")
+	bus.PublishEvent(ChangeEvent{Seq: 5, Path: "/seed.txt", Op: "write", Ts: 1})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=5", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	current, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected initial stream-current heartbeat")
+	}
+	if current.Event != "heartbeat" {
+		t.Fatalf("initial event=%q, want heartbeat", current.Event)
+	}
+
+	bus.PublishEvent(ChangeEvent{Seq: 6, Op: eventBusForceResetOp, Ts: 1})
+
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected live reset event")
+	}
+	if ev.Event != "reset" {
+		t.Fatalf("event=%q, want reset", ev.Event)
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
+		t.Fatalf("unmarshal force reset: %v", err)
+	}
+	if data["reason"] != "seq_too_old" {
+		t.Fatalf("reason=%v, want seq_too_old", data["reason"])
+	}
+	if data["seq"] != float64(6) {
+		t.Fatalf("seq=%v, want 6", data["seq"])
 	}
 }
 
