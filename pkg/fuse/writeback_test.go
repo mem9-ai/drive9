@@ -2494,6 +2494,145 @@ func TestFsyncInteractiveStageEnqueuesBeforeReleasingPath(t *testing.T) {
 	}
 }
 
+// TestFsyncInteractiveWALFrameDurableBeforeEnqueue pins the crash-recovery
+// ordering invariant: the JournalFsync frame must be durable BEFORE the staged
+// commit becomes visible to the commit queue. If the order is reversed, a fast
+// worker can upload and append its JournalCommit marker first, the fsync frame
+// then gets a higher Seq, and replay resurrects a path whose upload already
+// completed.
+//
+// The test simulates a slow WAL device by holding the journal mutex: while the
+// append cannot complete, the entry must not appear in the queue. Both
+// interactive branches (ShadowSpill and regular staged) are covered.
+func TestFsyncInteractiveWALFrameDurableBeforeEnqueue(t *testing.T) {
+	t.Run("shadowspill", func(t *testing.T) { testFsyncWALFrameDurableBeforeEnqueue(t, true) })
+	t.Run("regular", func(t *testing.T) { testFsyncWALFrameDurableBeforeEnqueue(t, false) })
+}
+
+func testFsyncWALFrameDurableBeforeEnqueue(t *testing.T, spill bool) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no remote traffic expected", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncInteractive}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := NewJournal(filepath.Join(t.TempDir(), "order.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = journal.Close() }()
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.journal = journal
+	fs.commitQueue = &CommitQueue{
+		maxPending:   4,
+		shadows:      shadow,
+		index:        pending,
+		journal:      journal,
+		inFlight:     make(map[string]*CommitEntry),
+		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
+		workCh:       make(chan *CommitEntry, 8),
+	}
+
+	const remotePath = "/wal-order.bin"
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+	}, "wal-order.bin", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("ordering invariant bytes")); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	if !spill {
+		// Freshly created handles default to ShadowSpill; force the
+		// regular staged branch (small dirty buffer materialized to the
+		// shadow at fsync time).
+		fh, ok := fs.fileHandles.Get(createOut.Fh)
+		if !ok {
+			t.Fatal("created handle missing")
+		}
+		fh.Lock()
+		fh.ShadowSpill = false
+		fh.Unlock()
+	}
+
+	// Block the WAL append; Fsync must not hand the commit to the queue
+	// until the frame is on disk.
+	journal.mu.Lock()
+	fsyncDone := make(chan gofuse.Status, 1)
+	go func() {
+		fsyncDone <- fs.Fsync(nil, &gofuse.FsyncIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+		})
+	}()
+	start := time.Now()
+	for time.Since(start) < 300*time.Millisecond {
+		if fs.commitQueue.HasPath(remotePath) {
+			journal.mu.Unlock()
+			t.Fatal("staged commit visible to the queue before its JournalFsync frame was durable")
+		}
+		select {
+		case st := <-fsyncDone:
+			journal.mu.Unlock()
+			t.Fatalf("Fsync returned %v while the WAL append was blocked", st)
+		default:
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	journal.mu.Unlock()
+
+	if st := <-fsyncDone; st != gofuse.OK {
+		t.Fatalf("Fsync: %v", st)
+	}
+	if !fs.commitQueue.HasPath(remotePath) {
+		t.Fatal("staged commit not enqueued after the WAL append completed")
+	}
+	var fsyncSeq uint64
+	if err := journal.Replay(func(e JournalEntry) {
+		if e.Op == JournalFsync && e.Path == remotePath {
+			fsyncSeq = e.Seq
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fsyncSeq == 0 {
+		t.Fatal("JournalFsync frame missing after Fsync returned")
+	}
+
+	// The async commit marker (what onCommitSuccess appends) now necessarily
+	// gets a higher Seq, so replay must NOT resurrect the committed path.
+	mustAppend(t, journal, JournalEntry{Op: JournalCommit, Path: remotePath})
+	mustFsync(t, journal)
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(journal, idx); err != nil {
+		t.Fatal(err)
+	}
+	if idx.HasPending(remotePath) {
+		t.Fatal("replay resurrected a committed path: commit marker did not supersede the fsync frame")
+	}
+}
+
 func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.T) {
 	const filePath = "/fsync-rewrite.bin"
 	first := []byte("first")

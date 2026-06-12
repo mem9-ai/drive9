@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1679,13 +1680,27 @@ func TestCommitQueueMultipartCreateInfersRevisionForOpenHandle(t *testing.T) {
 	}
 }
 
-// TestCommitQueueShadowSpillConflictTerminal verifies that ShadowSpill entries
-// skip auto-resolve (which would OOM) and go straight to terminal failure.
+// TestCommitQueueShadowSpillConflictTerminal verifies that for ShadowSpill
+// entries a genuine conflict (server size differs from local shadow) goes to
+// terminal failure after a single HEAD probe — no content download, no LWW
+// re-upload, no full-memory ReadAll.
 func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
-	var calls int
+	var putCalls, headCalls, getCalls int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+		switch r.Method {
+		case http.MethodHead:
+			headCalls++
+			// Server size differs from local 4 bytes → genuine conflict.
+			w.Header().Set("X-Dat9-Revision", "9")
+			w.Header().Set("Content-Length", "999")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			getCalls++
+			http.Error(w, `{"error":"unexpected read"}`, http.StatusInternalServerError)
+		default:
+			putCalls++
+			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+		}
 	}))
 	defer ts.Close()
 
@@ -1718,10 +1733,11 @@ func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
 	}
 	cq.DrainAll()
 
-	// ShadowSpill: 409 → skip auto-resolve → terminal failure immediately.
-	// Only 1 call: the initial upload (no Stat/Read for auto-resolve).
-	if calls != 1 {
-		t.Fatalf("expected 1 call (upload only, no auto-resolve), got %d", calls)
+	if headCalls != 1 {
+		t.Fatalf("expected 1 HEAD probe for size check, got %d", headCalls)
+	}
+	if getCalls != 0 {
+		t.Fatalf("expected no content reads when sizes differ, got %d", getCalls)
 	}
 	if !pending.HasPending("/big-conflict.bin") {
 		t.Fatal("pending entry should be preserved after ShadowSpill terminal conflict")
@@ -1732,6 +1748,68 @@ func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
 	}
 	if !shadow.Has("/big-conflict.bin") {
 		t.Fatal("shadow should be preserved after ShadowSpill terminal conflict")
+	}
+}
+
+// TestCommitQueueShadowSpillConflictIdempotent verifies that when the server
+// content already equals the local shadow (crash after a completed upload,
+// before local cleanup), a ShadowSpill 409 resolves as idempotent success via
+// chunked compare instead of a phantom terminal conflict.
+func TestCommitQueueShadowSpillConflictIdempotent(t *testing.T) {
+	data := bytes.Repeat([]byte("spill-ok"), 512) // 4096 bytes
+	var putCalls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			http.ServeContent(w, r, "big.bin", time.Time{}, bytes.NewReader(data))
+		default:
+			putCalls++
+			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := shadow.WriteFull("/big.bin", data, 5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutShadowSpill("/big.bin", int64(len(data)), PendingOverwrite, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	if err := cq.Enqueue(&CommitEntry{
+		Path:        "/big.bin",
+		BaseRev:     5,
+		Size:        int64(len(data)),
+		Kind:        PendingOverwrite,
+		ShadowSpill: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if putCalls != 1 {
+		t.Fatalf("expected exactly 1 upload attempt (no LWW re-upload), got %d", putCalls)
+	}
+	if pending.HasPending("/big.bin") {
+		t.Fatal("pending entry should be removed after idempotent resolve")
+	}
+	if shadow.Has("/big.bin") {
+		t.Fatal("shadow should be removed after idempotent resolve")
 	}
 }
 
@@ -1870,5 +1948,114 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 	}
 	if shadow2.Has("/recover.bin") {
 		t.Fatal("shadow should be removed after successful recovery upload")
+	}
+}
+
+// TestCommitQueueRecoverPendingUsesShadowSize verifies that recovery routes
+// the upload by the actual shadow file size, not stale pending metadata. A
+// WAL-resurrected meta can carry an old size; routing on it would direct-PUT
+// a file the server requires to be multipart (or vice versa).
+func TestCommitQueueRecoverPendingUsesShadowSize(t *testing.T) {
+	data := []byte("0123456789abcdef") // 16 bytes, well under the 50KB threshold
+	var putBody []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/uploads/"):
+			t.Errorf("multipart initiate used for a %d-byte file — stale meta size routed the upload", len(data))
+			http.Error(w, `{"error":"unexpected multipart"}`, http.StatusBadRequest)
+		default:
+			http.Error(w, `{"error":"unexpected"}`, http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := shadow.WriteFull("/stale.bin", data, 5); err != nil {
+		t.Fatal(err)
+	}
+	// Stale meta: claims 60000 bytes (> 50KB threshold → would multipart).
+	if _, err := pending.PutWithBaseRev("/stale.bin", 60000, PendingOverwrite, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.RecoverPending()
+	cq.DrainAll()
+
+	if !bytes.Equal(putBody, data) {
+		t.Fatalf("direct PUT body = %d bytes, want %d", len(putBody), len(data))
+	}
+	if pending.HasPending("/stale.bin") {
+		t.Error("pending entry not cleaned up after recovered commit")
+	}
+}
+
+// TestCommitQueueCancelPathJournalsCommitMarker verifies that unlinking a
+// path with pending local state writes a WAL "done" marker, so a later crash
+// recovery does not resurrect the deleted file from older fsync frames.
+func TestCommitQueueCancelPathJournalsCommitMarker(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"unexpected"}`, http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	journal, err := NewJournal(dir + "/journal.wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = journal.Close() }()
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the Fsync flow: shadow + meta + WAL fsync frame.
+	if err := shadow.WriteFull("/gone.txt", []byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/gone.txt", 4, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Append(JournalEntry{Op: JournalFsync, Path: "/gone.txt", Length: 4}); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, journal, 1, 8)
+	cq.CancelPath("/gone.txt") // Unlink flow
+	cq.DrainAll()
+
+	if shadow.Has("/gone.txt") || pending.HasPending("/gone.txt") {
+		t.Fatal("cancel did not clean local state")
+	}
+
+	// Crash recovery must not resurrect the unlinked path.
+	recovered, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(journal, recovered); err != nil {
+		t.Fatal(err)
+	}
+	if recovered.HasPending("/gone.txt") {
+		t.Error("unlinked path resurrected from WAL — cancel marker missing")
 	}
 }

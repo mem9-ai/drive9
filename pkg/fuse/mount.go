@@ -324,17 +324,15 @@ func Mount(opts *MountOptions) error {
 				dat9fs.journal = journal
 				// Replay journal for crash recovery. Preserve the original kind
 				// and base revision so CommitQueue.RecoverPending can re-enqueue.
-				_ = journal.Replay(func(e JournalEntry) {
-					if pendingIdx != nil && e.Op != JournalCommit && e.Op != JournalUnlink {
-						if !pendingIdx.HasPending(e.Path) {
-							kind := PendingOverwrite
-							if e.BaseRev == 0 {
-								kind = PendingNew
-							}
-							_, _ = pendingIdx.PutWithBaseRev(e.Path, e.Length, kind, e.BaseRev)
-						}
-					}
-				})
+				if err := replayJournalIntoPending(journal, pendingIdx); err != nil {
+					fmt.Fprintf(os.Stderr, "drive9: journal replay: %v\n", err)
+				}
+				// Drop frames already covered by commit markers so the WAL does
+				// not grow unboundedly across mounts. Safe here: mount init is
+				// single-threaded, no concurrent Append yet.
+				if err := journal.Compact(); err != nil {
+					fmt.Fprintf(os.Stderr, "drive9: journal compact: %v\n", err)
+				}
 			}
 
 			// Initialize WriteBackCache before CommitQueue so that legacy

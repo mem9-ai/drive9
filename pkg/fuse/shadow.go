@@ -74,6 +74,16 @@ func NewShadowStore(dir string) (*ShadowStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("shadow store dir: %w", err)
 	}
+	// Sweep retired shadows leaked by a previous process that died while
+	// pinned readers still held them — pins cannot survive a restart, and
+	// nothing else ever deletes these files.
+	if entries, err := os.ReadDir(dir); err == nil {
+		for _, e := range entries {
+			if strings.Contains(e.Name(), ".shadow.retired.") {
+				_ = os.Remove(filepath.Join(dir, e.Name()))
+			}
+		}
+	}
 	ss := &ShadowStore{
 		dir:     dir,
 		files:   make(map[string]*ShadowFile),
