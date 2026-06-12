@@ -10,9 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -2168,15 +2166,76 @@ func (fs *Dat9FS) applyRemoteModeForEntry(ctx context.Context, entry *InodeEntry
 	return fs.applyRemoteMode(ctx, entry.Path, mode)
 }
 
+func (fs *Dat9FS) applyLayerLargeTruncate(ctx context.Context, entry *InodeEntry, newSize int64) gofuse.Status {
+	if fs.shadowStore == nil || fs.pendingIndex == nil {
+		return gofuse.EIO
+	}
+	expectedRevision := entry.Revision
+	mode := uint32(0)
+	hasMode := false
+	if entry.HasMode {
+		mode = remoteChmodMode(entry.Mode)
+		hasMode = true
+	}
+
+	if fs.shadowStore.Has(entry.Path) {
+		if err := fs.shadowStore.Truncate(entry.Path, newSize, expectedRevision); err != nil {
+			log.Printf("layer large truncate shadow truncate failed for %s: %v", entry.Path, err)
+			return gofuse.EIO
+		}
+	} else {
+		source := &remoteTruncateReaderAt{
+			ctx:          ctx,
+			client:       fs.client,
+			remotePath:   fs.remotePath(entry.Path),
+			existingSize: minInt64(entry.Size, newSize),
+			totalSize:    minInt64(entry.Size, newSize),
+		}
+		reader := io.NewSectionReader(&truncateReaderAt{
+			source:       source,
+			existingSize: minInt64(entry.Size, newSize),
+			totalSize:    newSize,
+		}, 0, newSize)
+		written, err := fs.shadowStore.WriteStream(entry.Path, reader, expectedRevision)
+		if err != nil {
+			log.Printf("layer large truncate shadow write failed for %s: %v", entry.Path, err)
+			return gofuse.EIO
+		}
+		if written != newSize {
+			log.Printf("layer large truncate shadow size mismatch for %s: wrote=%d want=%d", entry.Path, written, newSize)
+			return gofuse.EIO
+		}
+	}
+	fd, actualSize, err := fs.shadowStore.Open(entry.Path)
+	if err != nil {
+		log.Printf("layer large truncate shadow open failed for %s: %v", entry.Path, err)
+		return gofuse.EIO
+	}
+	defer func() { _ = fd.Close() }()
+	if actualSize != newSize {
+		log.Printf("layer large truncate shadow open size mismatch for %s: size=%d want=%d", entry.Path, actualSize, newSize)
+		return gofuse.EIO
+	}
+	writeStart := fs.perfStart()
+	_, err = fs.client.UploadFSLayerFile(ctx, fs.layerRef(), fs.remotePath(entry.Path), fd, actualSize, expectedRevision, mode, hasMode)
+	fs.perfRecordRemote(perfRemoteMutation, writeStart, err, uint64(newSize))
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+	if _, err := fs.pendingIndex.PutShadowSpillWithMode(entry.Path, newSize, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
+		log.Printf("layer large truncate pending index update failed for %s: %v", entry.Path, err)
+		return gofuse.EIO
+	}
+	fs.invalidateReadCacheAndTargets(entry.Path)
+	fs.cacheFileForPath(entry.Path, newSize, entry.Mtime, 0)
+	return gofuse.OK
+}
+
 func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, ino uint64, pid uint32, newSize int64) gofuse.Status {
 	if newSize < 0 {
 		return gofuse.Status(syscall.EINVAL)
 	}
 	if newSize > int64(int(^uint(0)>>1)) {
-		return gofuse.Status(syscall.EFBIG)
-	}
-
-	if fs.layerEnabled() && newSize > maxPathTruncateInMemoryBytes {
 		return gofuse.Status(syscall.EFBIG)
 	}
 
@@ -2208,6 +2267,9 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 	}
 
 	if fs.layerEnabled() {
+		if newSize > maxPathTruncateInMemoryBytes {
+			return fs.applyLayerLargeTruncate(ctx, entry, newSize)
+		}
 		expectedRevision := entry.Revision
 		mode := uint32(0)
 		hasMode := false
@@ -3585,7 +3647,7 @@ func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath stri
 		size, eligible := unlinkSnapshotSizeLocked(fh, inodeSize)
 		fh.Unlock()
 
-		if !eligible || handlePath != localPath || size < 0 || size > maxPreloadSize {
+		if !eligible || handlePath != localPath || size < 0 || size > maxPathTruncateInMemoryBytes {
 			continue
 		}
 		candidates = append(candidates, candidate{fh: fh, size: size})
@@ -3619,11 +3681,11 @@ func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath stri
 }
 
 func (fs *Dat9FS) readOpenHandleSnapshot(ctx context.Context, localPath string, size int64) ([]byte, error) {
-	if size < 0 || size > maxPreloadSize {
+	if size < 0 || size > maxPathTruncateInMemoryBytes {
 		return nil, fmt.Errorf("open-handle snapshot size out of range for %s: %d", localPath, size)
 	}
 	if fs.shadowStore != nil {
-		if shadowSize := fs.shadowStore.Size(localPath); shadowSize >= 0 && shadowSize <= maxPreloadSize {
+		if shadowSize := fs.shadowStore.Size(localPath); shadowSize >= 0 && shadowSize <= maxPathTruncateInMemoryBytes {
 			data, err := fs.shadowStore.ReadAll(localPath)
 			if err == nil {
 				return cloneBytes(data), nil
@@ -5259,40 +5321,56 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 	}
 
 	var size int64
+	var revision int64
 	if ino, ok := fs.inodes.GetInode(p); ok {
 		if entry, ok := fs.inodes.GetEntry(ino); ok {
 			size = entry.Size
+			revision = entry.Revision
 		}
 	}
 
 	snapshotOK := false
 	var snapshot []byte
+	snapshotShadowGen := uint64(0)
 	if snapshotRemote {
 		needsSnapshot := false
+		snapshotNeedCount := 0
 		for _, fh := range handles {
 			if fh == nil {
 				continue
 			}
 			fh.Lock()
-			needsSnapshot = fh.Dirty == nil && fh.LocalFile == nil && fh.Layer != PathLayerGitWorkspace && fh.UnlinkedData == nil
-			fh.Unlock()
-			if needsSnapshot {
-				break
+			handleNeedsSnapshot := cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh)
+			if handleNeedsSnapshot {
+				needsSnapshot = true
+				snapshotNeedCount++
 			}
+			fh.Unlock()
 		}
 		if needsSnapshot {
 			if size == 0 {
 				snapshotOK = true
 			} else if size <= maxPathTruncateInMemoryBytes {
 				readStart := fs.perfStart()
-				data, err := fs.client.ReadCtx(ctx, fs.remotePath(p))
-				if err == nil {
+				data, err := fs.client.ReadAtCtx(ctx, fs.remotePath(p), 0, size)
+				if err == nil && int64(len(data)) == size {
 					snapshot = data
 					snapshotOK = true
+				} else if err == nil {
+					err = io.ErrUnexpectedEOF
+					log.Printf("open-unlink snapshot short read for %s: got=%d want=%d", p, len(data), size)
 				} else {
 					log.Printf("open-unlink snapshot failed for %s: %v", p, err)
 				}
 				fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(data)))
+			} else {
+				gen, err := fs.snapshotUnlinkedRemoteToShadow(ctx, p, size, revision, snapshotNeedCount)
+				if err == nil {
+					snapshotShadowGen = gen
+					snapshotOK = true
+				} else {
+					log.Printf("open-unlink large snapshot failed for %s: %v", p, err)
+				}
 			}
 		}
 	}
@@ -5306,9 +5384,16 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 		if fh.Dirty != nil {
 			fh.UnlinkedSize = fh.Dirty.Size()
 		} else if snapshotOK {
-			fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
-			fh.UnlinkedSnapshot = true
-			fh.UnlinkedSize = int64(len(snapshot))
+			if snapshotShadowGen != 0 && cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) {
+				fh.UnlinkedData = nil
+				fh.UnlinkedSnapshot = true
+				fh.UnlinkedShadowGen = snapshotShadowGen
+				fh.UnlinkedSize = size
+			} else {
+				fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
+				fh.UnlinkedSnapshot = true
+				fh.UnlinkedSize = int64(len(snapshot))
+			}
 		} else {
 			fh.UnlinkedSize = size
 		}
@@ -5316,6 +5401,50 @@ func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapsho
 	}
 	fs.openHandles.UnlinkPath(p)
 	return true
+}
+
+func cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
+	return fh != nil &&
+		fh.Dirty == nil &&
+		fh.LocalFile == nil &&
+		fh.Layer != PathLayerGitWorkspace &&
+		fh.UnlinkedData == nil &&
+		fh.UnlinkedShadowGen == 0 &&
+		!fh.UnlinkedSnapshot
+}
+
+func (fs *Dat9FS) snapshotUnlinkedRemoteToShadow(ctx context.Context, p string, size int64, revision int64, pinCount int) (uint64, error) {
+	if fs.shadowStore == nil {
+		return 0, fmt.Errorf("no shadow store")
+	}
+	if pinCount <= 0 {
+		return 0, nil
+	}
+	if size < 0 {
+		return 0, fmt.Errorf("negative snapshot size %d", size)
+	}
+	rc, err := fs.client.ReadStream(ctx, fs.remotePath(p))
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rc.Close() }()
+
+	reader := io.LimitReader(rc, size)
+	written, err := fs.shadowStore.WriteStream(p, reader, revision)
+	if err != nil {
+		fs.shadowStore.Remove(p)
+		return 0, err
+	}
+	if written != size {
+		fs.shadowStore.Remove(p)
+		return 0, fmt.Errorf("short snapshot write %d/%d", written, size)
+	}
+	var gen uint64
+	for i := 0; i < pinCount; i++ {
+		gen = fs.shadowStore.Pin(p)
+	}
+	fs.shadowStore.Remove(p)
+	return gen, nil
 }
 
 func (fs *Dat9FS) hasPendingLocalState(p string) bool {
@@ -5876,9 +6005,6 @@ func processHasSupplementaryGroup(pid, gid uint32) bool {
 	if pid == uint32(os.Getpid()) && currentProcessHasSupplementaryGroup(gid) {
 		return true
 	}
-	if runtime.GOOS == "darwin" {
-		return processHasSupplementaryGroupDarwin(pid, gid)
-	}
 	return false
 }
 
@@ -5913,32 +6039,6 @@ func currentProcessHasSupplementaryGroup(gid uint32) bool {
 	}
 	for _, group := range groups {
 		if uint32(group) == gid {
-			return true
-		}
-	}
-	return false
-}
-
-func processHasSupplementaryGroupDarwin(pid, gid uint32) bool {
-	userOut, err := exec.Command("ps", "-o", "user=", "-p", strconv.FormatUint(uint64(pid), 10)).Output()
-	if err != nil {
-		return false
-	}
-	fields := strings.Fields(string(userOut))
-	if len(fields) == 0 {
-		return false
-	}
-	groupOut, err := exec.Command("id", "-G", fields[0]).Output()
-	if err != nil {
-		return false
-	}
-	return groupListContains(groupOut, gid)
-}
-
-func groupListContains(output []byte, gid uint32) bool {
-	for _, field := range strings.Fields(string(output)) {
-		group, err := strconv.ParseUint(field, 10, 32)
-		if err == nil && uint32(group) == gid {
 			return true
 		}
 	}
@@ -8815,14 +8915,43 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 	fh.Lock()
 	unlinked := fh.Unlinked && fh.Dirty == nil
 	unlinkedSnapshot := fh.UnlinkedSnapshot
+	unlinkedShadowGen := fh.UnlinkedShadowGen
 	unlinkedSize := fh.UnlinkedSize
 	var unlinkedData []byte
-	if unlinkedSnapshot {
+	if unlinkedSnapshot && unlinkedShadowGen == 0 {
 		unlinkedData = append([]byte(nil), fh.UnlinkedData...)
 	}
 	fh.Unlock()
 	if unlinked {
 		offset := int64(input.Offset)
+		if unlinkedShadowGen != 0 {
+			if fs.shadowStore == nil {
+				source = "unlinked-shadow-missing-store"
+				return nil, gofuse.EIO
+			}
+			if offset >= unlinkedSize {
+				source = "unlinked-shadow-eof"
+				bytesRead = 0
+				return gofuse.ReadResultData(nil), gofuse.OK
+			}
+			end := offset + int64(input.Size)
+			if end > unlinkedSize {
+				end = unlinkedSize
+			}
+			result := make([]byte, end-offset)
+			n, err := fs.shadowStore.ReadAtGen(unlinkedShadowGen, offset, result)
+			if err != nil && (!errors.Is(err, io.EOF) || n != len(result)) {
+				source = "unlinked-shadow-error"
+				return nil, gofuse.EIO
+			}
+			if n != len(result) {
+				source = "unlinked-shadow-short"
+				return nil, gofuse.EIO
+			}
+			source = "unlinked-shadow"
+			bytesRead = n
+			return gofuse.ReadResultData(result), gofuse.OK
+		}
 		if unlinkedSnapshot {
 			if offset >= int64(len(unlinkedData)) {
 				source = "unlinked-snapshot-eof"
@@ -10372,6 +10501,14 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		// Unpin shadow if this handle pinned it, so deferred removals can proceed.
 		if fh.ShadowPinned && fs.shadowStore != nil {
 			defer fs.shadowStore.Unpin(fh.ShadowGen)
+		}
+		if fs.shadowStore != nil {
+			fh.Lock()
+			unlinkedShadowGen := fh.UnlinkedShadowGen
+			fh.Unlock()
+			if unlinkedShadowGen != 0 {
+				defer fs.shadowStore.Unpin(unlinkedShadowGen)
+			}
 		}
 
 		start := time.Now()

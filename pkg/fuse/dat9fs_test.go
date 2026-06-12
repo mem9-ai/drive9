@@ -10328,6 +10328,175 @@ func TestUnlinkPreservesOpenReadHandleSnapshot(t *testing.T) {
 	}
 }
 
+func TestUnlinkPreservesLargeOpenReadHandleSnapshotInShadow(t *testing.T) {
+	const filePath = "/large-unlink-open.bin"
+	const revision = int64(7)
+	const fileSize = maxPathTruncateInMemoryBytes + 1
+
+	patternByte := func(offset int64) byte {
+		return byte(offset % 251)
+	}
+	writePattern := func(w io.Writer, start, end int64) error {
+		buf := make([]byte, 32*1024)
+		for pos := start; pos <= end; {
+			n := len(buf)
+			remaining := int(end - pos + 1)
+			if remaining < n {
+				n = remaining
+			}
+			for i := 0; i < n; i++ {
+				buf[i] = patternByte(pos + int64(i))
+			}
+			if _, err := w.Write(buf[:n]); err != nil {
+				return err
+			}
+			pos += int64(n)
+		}
+		return nil
+	}
+	expectedPattern := func(start int64, n int) []byte {
+		out := make([]byte, n)
+		for i := range out {
+			out[i] = patternByte(start + int64(i))
+		}
+		return out
+	}
+
+	var deleted atomic.Bool
+	var objectGets atomic.Int64
+
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", strconv.FormatInt(revision, 10))
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs"+filePath:
+			if deleted.Load() {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Location", ts.URL+"/object/large-unlink-open")
+			w.WriteHeader(http.StatusFound)
+		case r.Method == http.MethodGet && r.URL.Path == "/object/large-unlink-open":
+			objectGets.Add(1)
+			if deleted.Load() {
+				http.Error(w, "object deleted", http.StatusGone)
+				return
+			}
+			start := int64(0)
+			end := fileSize - 1
+			if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
+				parsedStart, parsedEnd, ok := parseTestBytesRange(rangeHeader)
+				if !ok || parsedEnd >= fileSize {
+					http.Error(w, "wrong range: "+rangeHeader, http.StatusRequestedRangeNotSatisfiable)
+					return
+				}
+				start, end = parsedStart, parsedEnd
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fileSize))
+				w.WriteHeader(http.StatusPartialContent)
+			} else {
+				w.Header().Set("Content-Length", strconv.FormatInt(fileSize, 10))
+				w.WriteHeader(http.StatusOK)
+			}
+			if err := writePattern(w, start, end); err != nil {
+				t.Errorf("write object pattern: %v", err)
+			}
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs"+filePath:
+			deleted.Store(true)
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	ino := fs.inodes.Lookup(filePath, false, fileSize, time.Now())
+	fs.inodes.UpdateRevision(ino, revision)
+	reader := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		OrigSize: fileSize,
+		BaseRev:  revision,
+	}
+	readerID := fs.allocateFileHandle(reader)
+	released := false
+	defer func() {
+		if !released {
+			fs.Release(nil, &gofuse.ReleaseIn{Fh: readerID})
+		}
+	}()
+
+	if st := fs.Unlink(nil, &gofuse.InHeader{NodeId: 1}, strings.TrimPrefix(filePath, "/")); st != gofuse.OK {
+		t.Fatalf("Unlink status = %v, want OK", st)
+	}
+	if !deleted.Load() {
+		t.Fatal("remote delete was not called")
+	}
+	reader.Lock()
+	unlinkedShadowGen := reader.UnlinkedShadowGen
+	unlinkedSize := reader.UnlinkedSize
+	reader.Unlock()
+	if unlinkedShadowGen == 0 {
+		t.Fatal("large open-unlink handle did not pin a shadow snapshot")
+	}
+	if unlinkedSize != fileSize {
+		t.Fatalf("unlinked size = %d, want %d", unlinkedSize, fileSize)
+	}
+	if got := shadow.SizeGen(unlinkedShadowGen); got != fileSize {
+		t.Fatalf("shadow generation size = %d, want %d", got, fileSize)
+	}
+	snapshotGets := objectGets.Load()
+	if snapshotGets != 1 {
+		t.Fatalf("object gets after unlink snapshot = %d, want 1", snapshotGets)
+	}
+
+	const readSize = 64
+	offset := fileSize - readSize
+	buf := make([]byte, readSize)
+	result, st := fs.Read(nil, &gofuse.ReadIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       readerID,
+		Offset:   uint64(offset),
+		Size:     uint32(len(buf)),
+	}, buf)
+	if st != gofuse.OK {
+		t.Fatalf("Read status = %v, want OK", st)
+	}
+	got, st := result.Bytes(buf)
+	if st != gofuse.OK {
+		t.Fatalf("result.Bytes status = %v, want OK", st)
+	}
+	if want := expectedPattern(offset, readSize); !bytes.Equal(got, want) {
+		t.Fatalf("read bytes after unlink = %v, want %v", got, want)
+	}
+	if got := objectGets.Load(); got != snapshotGets {
+		t.Fatalf("object gets after open-handle read = %d, want still %d", got, snapshotGets)
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: readerID})
+	released = true
+	if got := shadow.SizeGen(unlinkedShadowGen); got != -1 {
+		t.Fatalf("shadow generation size after release = %d, want -1", got)
+	}
+}
+
 func TestRenameReplacePreservesOpenDestinationSnapshotAndSourceHandle(t *testing.T) {
 	const oldPath = "/replace-source.bin"
 	const newPath = "/work.bin"

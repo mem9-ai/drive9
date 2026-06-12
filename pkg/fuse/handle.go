@@ -48,6 +48,7 @@ type FileHandle struct {
 	Unlinked           bool   // true after the directory entry was removed while this handle stayed open
 	UnlinkedSnapshot   bool   // true when UnlinkedData is an authoritative read snapshot
 	UnlinkedData       []byte // read-only snapshot for open-but-unlinked remote files
+	UnlinkedShadowGen  uint64 // generation pin for large open-unlink snapshots stored in ShadowStore
 	UnlinkedSize       int64
 	RemoteCommitUnlock func() // held same-path commit lock while local shadow state is reserved
 	mu                 sync.Mutex

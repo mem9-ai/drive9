@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
@@ -981,6 +983,140 @@ func TestLayerSetAttrTruncateWritesLayerEntryNotBase(t *testing.T) {
 	meta, ok := pending.GetMeta("/base.txt")
 	if !ok || meta.Size != 0 || meta.BaseRev != 7 || !meta.HasMode || meta.Mode != 0o640 {
 		t.Fatalf("pending meta = %+v, want empty base rev 7 mode 0640", meta)
+	}
+}
+
+func TestLayerSetAttrLargeTruncateUploadsLayerObjectFromShadow(t *testing.T) {
+	const (
+		remotePath = "/repo/base.txt"
+		localPath  = "/base.txt"
+		baseRev    = int64(7)
+		mode       = uint32(0o640)
+		newSize    = maxPathTruncateInMemoryBytes + 1
+	)
+	seed := []byte("seed")
+
+	var (
+		uploadCalls int
+		basePutSeen bool
+		baseGetSeen bool
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/layers/layer-1/objects":
+			uploadCalls++
+			if got := r.URL.Query().Get("path"); got != remotePath {
+				t.Errorf("layer object path = %q, want %q", got, remotePath)
+			}
+			if want := strconv.FormatInt(newSize, 10); r.URL.Query().Get("size") != want {
+				t.Errorf("layer object size = %q, want %s", r.URL.Query().Get("size"), want)
+			}
+			if want := strconv.FormatInt(baseRev, 10); r.URL.Query().Get("base_revision") != want {
+				t.Errorf("layer object base_revision = %q, want %s", r.URL.Query().Get("base_revision"), want)
+			}
+			if want := strconv.FormatUint(uint64(mode), 8); r.URL.Query().Get("mode") != want {
+				t.Errorf("layer object mode = %q, want %s", r.URL.Query().Get("mode"), want)
+			}
+			if r.ContentLength != newSize {
+				t.Errorf("layer object content length = %d, want %d", r.ContentLength, newSize)
+			}
+			prefix := make([]byte, len(seed))
+			if _, err := io.ReadFull(r.Body, prefix); err != nil {
+				t.Errorf("read layer object prefix: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if !bytes.Equal(prefix, seed) {
+				t.Errorf("layer object prefix = %q, want %q", prefix, seed)
+			}
+			n, err := io.Copy(io.Discard, r.Body)
+			if err != nil {
+				t.Errorf("read layer object body: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			if got := n + int64(len(prefix)); got != newSize {
+				t.Errorf("layer object body bytes = %d, want %d", got, newSize)
+			}
+			_ = json.NewEncoder(w).Encode(client.FSLayerEntry{
+				LayerID:      "layer-1",
+				Path:         remotePath,
+				Op:           "upsert",
+				Kind:         "file",
+				BaseRevision: baseRev,
+				SizeBytes:    newSize,
+				Mode:         mode,
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/repo/base.txt":
+			basePutSeen = true
+			t.Errorf("unexpected base PUT for layer large truncate")
+			w.WriteHeader(http.StatusInternalServerError)
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/repo/base.txt":
+			baseGetSeen = true
+			t.Errorf("unexpected base GET for layer large truncate with local shadow")
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(localPath, seed, baseRev); err != nil {
+		t.Fatalf("WriteFull: %v", err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs := NewDat9FS(client.New(ts.URL, ""), &MountOptions{
+		LayerRef:   "layer-1",
+		RemoteRoot: "/repo",
+	})
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	ino := fs.inodes.Lookup(localPath, false, int64(len(seed)), time.Now())
+	fs.inodes.UpdateRevision(ino, baseRev)
+	fs.inodes.SetModeState(ino, mode, true)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     uint64(newSize),
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if uploadCalls != 1 {
+		t.Fatalf("layer object upload calls = %d, want 1", uploadCalls)
+	}
+	if basePutSeen {
+		t.Fatal("layer large truncate wrote base filesystem")
+	}
+	if baseGetSeen {
+		t.Fatal("layer large truncate fetched base filesystem despite local shadow")
+	}
+	if got := shadow.Size(localPath); got != newSize {
+		t.Fatalf("shadow size = %d, want %d", got, newSize)
+	}
+	if out.Size != uint64(newSize) {
+		t.Fatalf("out.Size = %d, want %d", out.Size, newSize)
+	}
+	meta, ok := pending.GetMeta(localPath)
+	if !ok {
+		t.Fatal("missing pending meta for layer large truncate")
+	}
+	if meta.Size != newSize || meta.BaseRev != baseRev || meta.Kind != PendingOverwrite || !meta.ShadowSpill || !meta.HasMode || meta.Mode != mode {
+		t.Fatalf("pending meta = %+v, want shadow spill overwrite size %d base rev %d mode %#o", meta, newSize, baseRev, mode)
 	}
 }
 
