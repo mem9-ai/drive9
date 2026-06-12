@@ -202,7 +202,13 @@ func TestEventBusSubscribeNotify(t *testing.T) {
 func TestEventBusUnsubscribeCloses(t *testing.T) {
 	bus := NewEventBus()
 	id, ch := bus.Subscribe()
+	if got := bus.ListenerCount(); got != 1 {
+		t.Fatalf("ListenerCount after subscribe=%d, want 1", got)
+	}
 	bus.Unsubscribe(id)
+	if got := bus.ListenerCount(); got != 0 {
+		t.Fatalf("ListenerCount after unsubscribe=%d, want 0", got)
+	}
 
 	_, open := <-ch
 	if open {

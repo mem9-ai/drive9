@@ -339,6 +339,98 @@ func TestSSERetentionSweeperPrunesOutsideWindow(t *testing.T) {
 	}
 }
 
+func TestSSECatchupPublishesTenantDBEventsToLocalBus(t *testing.T) {
+	srv := newTestServer(t)
+	store := srv.fallback.Store()
+	bus := NewEventBus()
+	id, notify := bus.Subscribe()
+	defer bus.Unsubscribe(id)
+
+	manager := newSSECatchupManager(srv.fallback, nil, nil, SSECatchupOptions{
+		PollInterval:         time.Hour,
+		IdleMaxInterval:      time.Hour,
+		BatchSize:            10,
+		MaxConcurrentTenants: 1,
+	})
+	if manager == nil {
+		t.Fatal("expected catchup manager")
+	}
+	defer manager.Stop()
+
+	manager.Register("", bus, 0)
+	ev, err := store.InsertFSEvent(context.Background(), "/cross-pod.txt", "write", "pod-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.catchupTenant(activeSSECatchupTenant{tenantID: "", bus: bus, cursor: 0})
+
+	select {
+	case <-notify:
+	case <-time.After(time.Second):
+		t.Fatal("expected local bus notification from catchup")
+	}
+	events, head, ok := bus.LiveEventsSince(0)
+	if !ok {
+		t.Fatal("LiveEventsSince returned not ok")
+	}
+	if head != ev.Seq {
+		t.Fatalf("head=%d, want %d", head, ev.Seq)
+	}
+	if len(events) != 1 || events[0].Seq != ev.Seq || events[0].Path != "/cross-pod.txt" || events[0].Actor != "pod-a" {
+		t.Fatalf("catchup events=%+v, want durable event %+v", events, ev)
+	}
+}
+
+func TestSSECatchupCoalescesConnectionsPerTenantDB(t *testing.T) {
+	bus := NewEventBus()
+	manager := newSSECatchupManager(nil, nil, nil, SSECatchupOptions{Disabled: true})
+	if manager != nil {
+		t.Fatal("disabled catchup manager should be nil")
+	}
+
+	srv := newTestServer(t)
+	defer srv.Close()
+	manager = newSSECatchupManager(srv.fallback, nil, nil, SSECatchupOptions{
+		PollInterval:         time.Hour,
+		IdleMaxInterval:      time.Hour,
+		BatchSize:            10,
+		MaxConcurrentTenants: 1,
+	})
+	if manager == nil {
+		t.Fatal("expected catchup manager")
+	}
+	defer manager.Stop()
+
+	manager.Register("", bus, 1)
+	manager.Register("", bus, 2)
+	manager.mu.Lock()
+	if len(manager.tenants) != 1 {
+		t.Fatalf("registered tenant dbs=%d, want 1", len(manager.tenants))
+	}
+	if manager.tenants[""].listeners != 2 {
+		t.Fatalf("listeners=%d, want 2", manager.tenants[""].listeners)
+	}
+	if manager.tenants[""].cursor != 2 {
+		t.Fatalf("cursor=%d, want 2", manager.tenants[""].cursor)
+	}
+	manager.mu.Unlock()
+
+	manager.Unregister("", bus)
+	manager.mu.Lock()
+	if manager.tenants[""].listeners != 1 {
+		t.Fatalf("listeners after one unregister=%d, want 1", manager.tenants[""].listeners)
+	}
+	manager.mu.Unlock()
+
+	manager.Unregister("", bus)
+	manager.mu.Lock()
+	_, ok := manager.tenants[""]
+	manager.mu.Unlock()
+	if ok {
+		t.Fatal("tenant db catchup entry should be removed after last listener")
+	}
+}
+
 func TestHandleChmodPublishesPersistentSSEEvent(t *testing.T) {
 	srv := newTestServer(t)
 	ctx := context.Background()

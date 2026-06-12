@@ -119,6 +119,10 @@ func main() {
 		die(err)
 	}
 	sseHeartbeatInterval := time.Duration(sseHeartbeatSeconds) * time.Second
+	sseCatchupOpts, err := sseCatchupOptionsFromEnv()
+	if err != nil {
+		die(err)
+	}
 	if semanticEmbedder != nil && backendOptions.QueryEmbedding.Client == nil {
 		backendOptions.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
@@ -278,6 +282,7 @@ func main() {
 			SemanticEmbedder:             semanticEmbedder,
 			SemanticWorkers:              semanticWorkerOpts,
 			SSEHeartbeatInterval:         sseHeartbeatInterval,
+			SSECatchup:                   sseCatchupOpts,
 			TiDBAutoEmbeddingConfig:      autoEmbeddingConfig,
 			TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
 			TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
@@ -312,6 +317,7 @@ func main() {
 		SemanticEmbedder:             semanticEmbedder,
 		SemanticWorkers:              semanticWorkerOpts,
 		SSEHeartbeatInterval:         sseHeartbeatInterval,
+		SSECatchup:                   sseCatchupOpts,
 		SlockOAuth:                   slockOAuth,
 		TiDBAutoEmbeddingConfig:      autoEmbeddingConfig,
 		TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
@@ -325,6 +331,33 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func sseCatchupOptionsFromEnv() (server.SSECatchupOptions, error) {
+	enabled := envBool("DRIVE9_SSE_DURABLE_CATCHUP", true)
+	opts := server.SSECatchupOptions{
+		Disabled:             !enabled,
+		PollInterval:         time.Duration(envInt("DRIVE9_SSE_CATCHUP_POLL_INTERVAL_MS", 1000)) * time.Millisecond,
+		IdleMaxInterval:      time.Duration(envInt("DRIVE9_SSE_CATCHUP_IDLE_MAX_INTERVAL_MS", 10000)) * time.Millisecond,
+		BatchSize:            envInt("DRIVE9_SSE_CATCHUP_BATCH_SIZE", 1000),
+		MaxConcurrentTenants: envInt("DRIVE9_SSE_CATCHUP_MAX_CONCURRENT_TENANT_DBS", 16),
+	}
+	if !enabled {
+		return opts, nil
+	}
+	if opts.PollInterval <= 0 {
+		return opts, fmt.Errorf("invalid DRIVE9_SSE_CATCHUP_POLL_INTERVAL_MS: must be a positive integer")
+	}
+	if opts.IdleMaxInterval <= 0 {
+		return opts, fmt.Errorf("invalid DRIVE9_SSE_CATCHUP_IDLE_MAX_INTERVAL_MS: must be a positive integer")
+	}
+	if opts.BatchSize <= 0 {
+		return opts, fmt.Errorf("invalid DRIVE9_SSE_CATCHUP_BATCH_SIZE: must be a positive integer")
+	}
+	if opts.MaxConcurrentTenants <= 0 {
+		return opts, fmt.Errorf("invalid DRIVE9_SSE_CATCHUP_MAX_CONCURRENT_TENANT_DBS: must be a positive integer")
+	}
+	return opts, nil
 }
 
 func slockOAuthFromEnv() (*slockoauth.Client, error) {
@@ -484,6 +517,11 @@ environment:
 
   SSE event stream:
   DRIVE9_SSE_HEARTBEAT_INTERVAL_SECONDS heartbeat interval for /v1/events streams (default: 15)
+  DRIVE9_SSE_DURABLE_CATCHUP enable tenant-db catchup for multi-replica SSE fanout (default: true)
+  DRIVE9_SSE_CATCHUP_POLL_INTERVAL_MS active tenant-db poll interval in milliseconds (default: 1000)
+  DRIVE9_SSE_CATCHUP_IDLE_MAX_INTERVAL_MS max idle backoff in milliseconds (default: 10000)
+  DRIVE9_SSE_CATCHUP_BATCH_SIZE max fs_events read per catchup query (default: 1000)
+  DRIVE9_SSE_CATCHUP_MAX_CONCURRENT_TENANT_DBS max tenant DB catchups per Pod (default: 16)
 
   Image extraction (async image -> text for search):
   DRIVE9_IMAGE_EXTRACT_ENABLED true|false (default: false)

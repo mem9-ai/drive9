@@ -57,6 +57,7 @@ type Config struct {
 	SemanticEmbedder     embedding.Client
 	SemanticWorkers      SemanticWorkerOptions
 	SSEHeartbeatInterval time.Duration
+	SSECatchup           SSECatchupOptions
 	SlockOAuth           SlockOAuthClient
 
 	TiDBAutoEmbeddingConfig  tenantschema.TiDBAutoEmbeddingConfig
@@ -95,6 +96,7 @@ type Server struct {
 	events               *eventBuses
 	sseHeartbeatInterval time.Duration
 	sseRetention         *sseRetentionSweeper
+	sseCatchup           *sseCatchupManager
 	semanticWorker       *semanticWorkerManager
 	journalCursorSecret  []byte
 	objectGCWorker       *objectGCWorker
@@ -185,6 +187,7 @@ func NewWithConfig(cfg Config) *Server {
 	if sseHeartbeatInterval <= 0 {
 		sseHeartbeatInterval = defaultSSEHeartbeatInterval
 	}
+	sseCatchupOptions := normalizeSSECatchupOptions(cfg.SSECatchup)
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
 		fallback:             cfg.Backend,
@@ -203,6 +206,7 @@ func NewWithConfig(cfg Config) *Server {
 		events:               newEventBuses(),
 		sseHeartbeatInterval: sseHeartbeatInterval,
 		sseRetention:         newSSERetentionSweeper(),
+		sseCatchup:           newSSECatchupManager(cfg.Backend, cfg.Meta, cfg.Pool, sseCatchupOptions),
 		slockOAuth:           cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
 			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
@@ -215,6 +219,7 @@ func NewWithConfig(cfg Config) *Server {
 		forkWorkerCancel:    forkWorkerCancel,
 	}
 	metrics.RecordGauge("sse", "heartbeat_interval_seconds", sseHeartbeatInterval.Seconds())
+	recordSSECatchupGauges(sseCatchupOptions, 0, 0)
 	mux := http.NewServeMux()
 
 	var business http.Handler = http.HandlerFunc(s.handleBusiness)
@@ -369,6 +374,16 @@ func NewWithConfig(cfg Config) *Server {
 	} else {
 		logger.Info("server_object_gc_worker_disabled")
 	}
+	if s.sseCatchup != nil {
+		logger.Info("server_sse_catchup_enabled",
+			zap.Duration("poll_interval", s.sseCatchup.opts.PollInterval),
+			zap.Duration("idle_max_interval", s.sseCatchup.opts.IdleMaxInterval),
+			zap.Int("batch_size", s.sseCatchup.opts.BatchSize),
+			zap.Int("max_concurrent_tenant_dbs", s.sseCatchup.opts.MaxConcurrentTenants))
+		s.sseCatchup.Start()
+	} else {
+		logger.Info("server_sse_catchup_disabled")
+	}
 	return s
 }
 
@@ -387,6 +402,9 @@ func (s *Server) Close() {
 	}
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Stop()
+	}
+	if s.sseCatchup != nil {
+		s.sseCatchup.Stop()
 	}
 }
 

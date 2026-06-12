@@ -20,8 +20,9 @@ const (
 	eventBusForceResetOp     = "__sse_force_reset__"
 )
 
-// EventBus is a per-tenant in-memory event hub backed by a fixed-size ring buffer.
-// Single-instance only — does not survive restarts or replicate across processes.
+// EventBus is a per-tenant in-memory event hub backed by a fixed-size ring
+// buffer. It is a local fan-out cache only; durable cross-process truth lives
+// in the tenant DB fs_events table.
 type EventBus struct {
 	mu        sync.Mutex
 	seq       uint64 // monotonic counter, protected by mu
@@ -116,6 +117,13 @@ func (eb *EventBus) Unsubscribe(id uint64) {
 		delete(eb.listeners, id)
 		close(ch)
 	}
+}
+
+// ListenerCount returns the number of active local subscribers.
+func (eb *EventBus) ListenerCount() int {
+	eb.mu.Lock()
+	defer eb.mu.Unlock()
+	return len(eb.listeners)
 }
 
 // Seq returns the current sequence number (0 if no events published).

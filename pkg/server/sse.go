@@ -164,12 +164,19 @@ func (ebs *eventBuses) get(tenantID string) *EventBus {
 }
 
 func (s *Server) tenantEventBus(r *http.Request) *EventBus {
+	return s.events.get(s.sseTenantKey(r))
+}
+
+func (s *Server) sseTenantKey(r *http.Request) string {
 	scope := ScopeFromContext(r.Context())
 	if scope != nil {
-		return s.events.get(scope.TenantID)
+		if scope.TenantID == "" || (s != nil && s.fallback != nil && scope.Backend == s.fallback) {
+			return ""
+		}
+		return scope.TenantID
 	}
 	// Single-tenant / fallback mode.
-	return s.events.get("")
+	return ""
 }
 
 func eventMutationContext(r *http.Request) (context.Context, *datastore.FSEventCollector) {
@@ -308,7 +315,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	bus := s.tenantEventBus(r)
 	subID, notify := bus.Subscribe()
-	defer bus.Unsubscribe(subID)
+	tenantKey := s.sseTenantKey(r)
+	s.sseCatchup.Register(tenantKey, bus, since)
+	defer func() {
+		bus.Unsubscribe(subID)
+		s.sseCatchup.Unregister(tenantKey, bus)
+	}()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -328,6 +340,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// single-tenant setups without a scoped backend.
 	events, headSeq, ok, replayReason := s.eventsSince(r.Context(), bStoreFromRequest(r), bus, since)
 	bus.AdvanceSeq(headSeq)
+	s.sseCatchup.AdvanceCursor(tenantKey, headSeq)
 	lastSeen := since
 
 	bw := newSSEBufferedWriter(w, flusher)

@@ -51,7 +51,7 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(b)
+	return NewWithConfig(Config{Backend: b, SSECatchup: SSECatchupOptions{Disabled: true}})
 }
 
 func TestNewWithConfigSetsSSEHeartbeatInterval(t *testing.T) {
