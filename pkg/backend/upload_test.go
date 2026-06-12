@@ -328,19 +328,106 @@ func TestListUploads(t *testing.T) {
 	}
 }
 
-func TestOneUploadPerPath(t *testing.T) {
+// A crashed client (SIGKILL mid-multipart) leaves an active session behind and
+// never aborts it. A new initiate for the same path must supersede the
+// dangling session instead of 409ing until expires_at (24h), otherwise crash
+// recovery can never re-upload the interrupted file.
+func TestInitiateSupersedesActiveUploadOnSamePath(t *testing.T) {
 	b := newTestBackendWithS3(t)
 	ctx := context.Background()
 
-	_, err := b.InitiateUpload(ctx, "/dup.bin", 2<<20)
+	plan1, err := b.InitiateUpload(ctx, "/dup.bin", 2<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	// Second upload for same path should fail
-	_, err = b.InitiateUpload(ctx, "/dup.bin", 3<<20)
-	if err == nil {
-		t.Error("expected error for duplicate active upload")
+	plan2, err := b.InitiateUpload(ctx, "/dup.bin", 3<<20)
+	if err != nil {
+		t.Fatalf("expected second initiate to supersede the active session, got %v", err)
+	}
+	if plan2.UploadID == plan1.UploadID {
+		t.Fatal("expected a new upload record for the superseding initiate")
+	}
+
+	old, err := b.GetUpload(ctx, plan1.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Status != datastore.UploadAborted {
+		t.Fatalf("superseded upload status = %s, want %s", old.Status, datastore.UploadAborted)
+	}
+}
+
+func TestInitiateV2SupersedesActiveUploadOnSamePath(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	plan1, err := b.InitiateUploadV2(ctx, "/dup-v2.bin", 20<<20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Move the dangling session to UPLOADING (worst case: it holds the
+	// idx_uploads_active unique slot).
+	if _, err := b.PresignPart(ctx, plan1.UploadID, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	plan2, err := b.InitiateUploadV2(ctx, "/dup-v2.bin", 20<<20)
+	if err != nil {
+		t.Fatalf("expected second initiate to supersede the active session, got %v", err)
+	}
+	if plan2.UploadID == plan1.UploadID {
+		t.Fatal("expected a new upload record for the superseding initiate")
+	}
+
+	old, err := b.GetUpload(ctx, plan1.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Status != datastore.UploadAborted {
+		t.Fatalf("superseded upload status = %s, want %s", old.Status, datastore.UploadAborted)
+	}
+
+	// The new session must be fully usable — presign claims the unique
+	// UPLOADING slot the superseded session previously held.
+	if _, err := b.PresignPart(ctx, plan2.UploadID, 1, nil); err != nil {
+		t.Fatalf("presign on superseding upload failed: %v", err)
+	}
+
+	// The dangling session's presigned URLs must no longer be honored.
+	if _, err := b.PresignPart(ctx, plan1.UploadID, 2, nil); err == nil {
+		t.Fatal("expected presign on superseded upload to fail")
+	}
+}
+
+func TestInitiatePatchUploadSupersedesActiveUploadOnSamePath(t *testing.T) {
+	b := newTestBackendWithS3(t)
+	ctx := context.Background()
+
+	data := bytes.Repeat([]byte("p"), int(b.inlineThreshold))
+	if _, err := b.Write("/patch-dup.bin", data, 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+
+	plan1, err := b.InitiatePatchUpload(ctx, "/patch-dup.bin", int64(len(data)), []int{1}, s3client.PartSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	plan2, err := b.InitiatePatchUpload(ctx, "/patch-dup.bin", int64(len(data)), []int{1}, s3client.PartSize)
+	if err != nil {
+		t.Fatalf("expected second patch initiate to supersede the active session, got %v", err)
+	}
+	if plan2.UploadID == plan1.UploadID {
+		t.Fatal("expected a new upload record for the superseding patch initiate")
+	}
+
+	old, err := b.GetUpload(ctx, plan1.UploadID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if old.Status != datastore.UploadAborted {
+		t.Fatalf("superseded upload status = %s, want %s", old.Status, datastore.UploadAborted)
 	}
 }
 

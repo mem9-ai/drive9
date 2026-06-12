@@ -2438,15 +2438,23 @@ func (s *Store) AbortUpload(ctx context.Context, uploadID string) (err error) {
 }
 
 // AbortUploadV2 sets an upload to ABORTED from either INITIATED or UPLOADING.
-// Returns nil (idempotent) if the upload is already aborted or not found.
-func (s *Store) AbortUploadV2(ctx context.Context, uploadID string) (err error) {
+// The returned bool reports whether this call won the state transition.
+// A false, nil result means the upload was already terminal or not found.
+func (s *Store) AbortUploadV2(ctx context.Context, uploadID string) (aborted bool, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "abort_upload_v2", start, &err)
 
-	_, err = s.db.ExecContext(ctx, `UPDATE uploads SET status = 'ABORTED',
+	res, err := s.db.ExecContext(ctx, `UPDATE uploads SET status = 'ABORTED',
 		updated_at = ?
 		WHERE upload_id = ? AND status IN ('INITIATED', 'UPLOADING')`, time.Now().UTC(), uploadID)
-	return err
+	if err != nil {
+		return false, err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rowsAffected > 0, nil
 }
 
 // UpdateUploadStatus transitions an upload to a new status.

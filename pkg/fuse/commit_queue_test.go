@@ -1813,6 +1813,202 @@ func TestCommitQueueShadowSpillConflictIdempotent(t *testing.T) {
 	}
 }
 
+// TestCommitQueueAutoResolveNotFoundRetriesAsCreate verifies that a 409 whose
+// auto-resolve stat finds no remote file (e.g. the server 409ed on an upload
+// session orphaned by a crashed client, not on content) retries the upload as
+// a create instead of terminal-failing and abandoning the data.
+func TestCommitQueueAutoResolveNotFoundRetriesAsCreate(t *testing.T) {
+	var uploadCalls, statCalls int
+	var successRev int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			statCalls++
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		case http.MethodGet:
+			t.Errorf("unexpected GET %s", r.URL.String())
+			http.Error(w, `{"error":"unexpected read"}`, http.StatusInternalServerError)
+		default:
+			uploadCalls++
+			if r.Header.Get("X-Dat9-Expected-Revision") != "0" {
+				http.Error(w, `{"error":"unexpected revision"}`, http.StatusBadRequest)
+				return
+			}
+			if uploadCalls == 1 {
+				// Dangling upload session left by a crashed client.
+				http.Error(w, `{"error":"active upload already exists for this path"}`, http.StatusConflict)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := shadow.WriteFull("/recovered.txt", []byte("recovered-data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/recovered.txt", 14, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		successRev = committedRev
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:    "/recovered.txt",
+		BaseRev: 0,
+		Size:    14,
+		Kind:    PendingNew,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if uploadCalls != 2 {
+		t.Fatalf("upload calls = %d, want 2 (initial 409 + create retry)", uploadCalls)
+	}
+	if statCalls != 1 {
+		t.Fatalf("stat calls = %d, want 1", statCalls)
+	}
+	if successRev != 1 {
+		t.Fatalf("OnSuccess committedRev = %d, want 1 for a resolved create", successRev)
+	}
+	if pending.HasPending("/recovered.txt") {
+		t.Fatal("pending entry should be removed after create retry succeeds")
+	}
+	if shadow.Has("/recovered.txt") {
+		t.Fatal("shadow should be removed after create retry succeeds")
+	}
+}
+
+// TestCommitQueueShadowSpillConflictNotFoundRetriesAsCreate reproduces the
+// crash-recovery e2e failure: a SIGKILLed mount leaves a dangling server-side
+// upload session, so the recovery commit's initiate 409s even though the file
+// was never committed (stat 404). The resolve must re-upload as a create
+// rather than parking the recovered data as a terminal conflict.
+func TestCommitQueueShadowSpillConflictNotFoundRetriesAsCreate(t *testing.T) {
+	data := bytes.Repeat([]byte("recovered-spill-"), 256)
+	var initiateCalls, statCalls int
+	var gotBody []byte
+	retryExpectedRev := int64(-1)
+	var successRev int64
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead:
+			statCalls++
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			initiateCalls++
+			if initiateCalls == 1 {
+				// Dangling upload session left by the crashed client.
+				http.Error(w, `{"error":"active upload already exists for this path"}`, http.StatusConflict)
+				return
+			}
+			var req struct {
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate request: %v", err)
+			}
+			if req.ExpectedRevision != nil {
+				retryExpectedRev = *req.ExpectedRevision
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "u-retry",
+				"key":         "object-key",
+				"part_size":   int64(len(data)),
+				"total_parts": 1,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u-retry/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/u-retry/1",
+					"size":   int64(len(data)),
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/u-retry/1":
+			body, _ := io.ReadAll(r.Body)
+			gotBody = body
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u-retry/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			http.Error(w, `{"error":"unexpected request"}`, http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := shadow.WriteFull("/recovered-spill.bin", data, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutShadowSpill("/recovered-spill.bin", int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		successRev = committedRev
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:        "/recovered-spill.bin",
+		BaseRev:     0,
+		Size:        int64(len(data)),
+		Kind:        PendingNew,
+		ShadowSpill: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if initiateCalls != 2 {
+		t.Fatalf("initiate calls = %d, want 2 (initial 409 + create retry)", initiateCalls)
+	}
+	if statCalls != 1 {
+		t.Fatalf("stat calls = %d, want 1", statCalls)
+	}
+	if retryExpectedRev != 0 {
+		t.Fatalf("retry expected_revision = %d, want 0 (create)", retryExpectedRev)
+	}
+	if !bytes.Equal(gotBody, data) {
+		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
+	}
+	if successRev != 1 {
+		t.Fatalf("OnSuccess committedRev = %d, want 1 for a resolved create", successRev)
+	}
+	if pending.HasPending("/recovered-spill.bin") {
+		t.Fatal("pending entry should be removed after create retry succeeds")
+	}
+	if shadow.Has("/recovered-spill.bin") {
+		t.Fatal("shadow should be removed after create retry succeeds")
+	}
+}
+
 // TestCommitQueueRecoverPendingShadowSpill verifies that crash recovery
 // preserves the ShadowSpill flag so recovered entries use streaming upload
 // (not ReadAll which would OOM for large files).

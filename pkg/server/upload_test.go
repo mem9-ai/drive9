@@ -1252,7 +1252,9 @@ func TestListUploadsEndpointRootPathReturnsNotFound(t *testing.T) {
 	}
 }
 
-func TestOneUploadPerPath(t *testing.T) {
+// A second initiate for the same path supersedes the previous active session
+// (which a crashed client can never abort) instead of 409ing until expires_at.
+func TestSecondUploadSamePathSupersedesFirst(t *testing.T) {
 	s, _ := newTestServerWithS3(t)
 	ts := httptest.NewServer(s)
 	defer ts.Close()
@@ -1263,19 +1265,44 @@ func TestOneUploadPerPath(t *testing.T) {
 	req.ContentLength = int64(len(body))
 	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
 	resp, _ := http.DefaultClient.Do(req)
+	var plan1 backend.UploadPlan
+	_ = json.NewDecoder(resp.Body).Decode(&plan1)
 	_ = resp.Body.Close()
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("first upload: expected 202, got %d", resp.StatusCode)
 	}
 
-	// Second upload for same path should fail
+	// Second upload for same path supersedes the dangling first session.
 	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/dup-test.bin", bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
 	req.Header.Set("X-Dat9-Part-Checksums", partChecksumHeader(body))
 	resp, _ = http.DefaultClient.Do(req)
+	var plan2 backend.UploadPlan
+	_ = json.NewDecoder(resp.Body).Decode(&plan2)
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusConflict {
-		t.Fatalf("second upload: expected 409 (conflict), got %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("second upload: expected 202 (supersede), got %d", resp.StatusCode)
+	}
+	if plan2.UploadID == plan1.UploadID {
+		t.Fatal("expected a new upload record for the superseding initiate")
+	}
+
+	// Only the superseding session remains active.
+	listResp, err := http.Get(ts.URL + "/v1/uploads?path=/dup-test.bin&status=UPLOADING")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listResp.Body.Close() }()
+	var result struct {
+		Uploads []struct {
+			UploadID string `json:"upload_id"`
+		} `json:"uploads"`
+	}
+	if err := json.NewDecoder(listResp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Uploads) != 1 || result.Uploads[0].UploadID != plan2.UploadID {
+		t.Fatalf("active uploads = %+v, want only %s", result.Uploads, plan2.UploadID)
 	}
 }
 
