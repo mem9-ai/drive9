@@ -119,27 +119,34 @@ func (c *LocalS3Client) UploadPart(ctx context.Context, uploadID string, partNum
 		return "", fmt.Errorf("upload not found: %s", uploadID)
 	}
 
-	data, err := io.ReadAll(body)
-	if err != nil {
-		result = "error"
-		return "", fmt.Errorf("read part body: %w", err)
-	}
-
 	path := c.partPath(upload.key, uploadID, partNumber)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		result = "error"
 		return "", err
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	f, err := os.Create(path)
+	if err != nil {
+		result = "error"
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(f, h), body)
+	if err != nil {
+		result = "error"
+		return "", fmt.Errorf("write part body: %w", err)
+	}
+	if err := f.Close(); err != nil {
 		result = "error"
 		return "", err
 	}
 
-	h := sha256.Sum256(data)
-	etag := hex.EncodeToString(h[:16])
+	sum := h.Sum(nil)
+	etag := hex.EncodeToString(sum[:16])
 
 	c.mu.Lock()
-	upload.parts[partNumber] = &localPart{size: int64(len(data)), etag: etag}
+	upload.parts[partNumber] = &localPart{size: n, etag: etag}
 	c.mu.Unlock()
 
 	return etag, nil
@@ -178,12 +185,17 @@ func (c *LocalS3Client) CompleteMultipartUpload(ctx context.Context, key, upload
 
 	for _, p := range sorted {
 		partFile := c.partPath(upload.key, uploadID, p.Number)
-		data, err := os.ReadFile(partFile)
+		part, err := os.Open(partFile)
 		if err != nil {
 			result = "error"
-			return fmt.Errorf("read part %d: %w", p.Number, err)
+			return fmt.Errorf("open part %d: %w", p.Number, err)
 		}
-		if _, err := f.Write(data); err != nil {
+		if _, err := io.Copy(f, part); err != nil {
+			_ = part.Close()
+			result = "error"
+			return err
+		}
+		if err := part.Close(); err != nil {
 			result = "error"
 			return err
 		}
@@ -254,12 +266,17 @@ func (c *LocalS3Client) PutObject(ctx context.Context, key string, body io.Reade
 		result = "error"
 		return err
 	}
-	data, err := io.ReadAll(body)
+	f, err := os.Create(objPath)
 	if err != nil {
 		result = "error"
 		return err
 	}
-	if err := os.WriteFile(objPath, data, 0o644); err != nil {
+	defer func() { _ = f.Close() }()
+	if _, err := io.Copy(f, body); err != nil {
+		result = "error"
+		return err
+	}
+	if err := f.Close(); err != nil {
 		result = "error"
 		return err
 	}
@@ -326,31 +343,35 @@ func (c *LocalS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID st
 	}
 	defer func() { _ = f.Close() }()
 
-	size := endByte - startByte + 1
-	data := make([]byte, size)
-	n, err := f.ReadAt(data, startByte)
-	if err != nil && err != io.EOF {
-		result = "error"
-		return "", fmt.Errorf("read source range: %w", err)
-	}
-	data = data[:n]
-
-	// Write as a part file
 	path := c.partPath(upload.key, uploadID, partNumber)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		result = "error"
 		return "", err
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	part, err := os.Create(path)
+	if err != nil {
+		result = "error"
+		return "", err
+	}
+	defer func() { _ = part.Close() }()
+
+	size := endByte - startByte + 1
+	h := sha256.New()
+	n, err := io.Copy(io.MultiWriter(part, h), io.NewSectionReader(f, startByte, size))
+	if err != nil {
+		result = "error"
+		return "", fmt.Errorf("copy source range: %w", err)
+	}
+	if err := part.Close(); err != nil {
 		result = "error"
 		return "", err
 	}
 
-	h := sha256.Sum256(data)
-	etag := hex.EncodeToString(h[:16])
+	sum := h.Sum(nil)
+	etag := hex.EncodeToString(sum[:16])
 
 	c.mu.Lock()
-	upload.parts[partNumber] = &localPart{size: int64(len(data)), etag: etag}
+	upload.parts[partNumber] = &localPart{size: n, etag: etag}
 	c.mu.Unlock()
 
 	return etag, nil
