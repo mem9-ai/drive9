@@ -14,11 +14,41 @@ on:
       - "go.mod"
       - "go.sum"
       - "Makefile"
+  push:
+    # Post-merge tier: heavy suites run per merged commit (coalesced via the
+    # concurrency group below) so a red run points at a handful of commits
+    # instead of a whole day of them.
+    branches:
+      - main
+    paths:
+      - ".github/workflows/local-e2e.yml"
+      - "cmd/**"
+      - "pkg/**"
+      - "internal/**"
+      - "scripts/**"
+      - "e2e/**"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
   schedule:
     # Daily heavy FUSE gate at 20:17 UTC / 04:17 Asia/Shanghai.
     - cron: "17 20 * * *"
+  workflow_call:
+    inputs:
+      run_all_e2e:
+        required: false
+        default: "0"
+        type: string
   workflow_dispatch:
     inputs:
+      run_all_e2e:
+        description: "Run every e2e suite in this workflow (overrides the individual toggles below; perf archive/compare keep their own toggles)"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
       run_fuse_concurrency_stress:
         description: "Run opt-in FUSE concurrency stress workload"
         required: false
@@ -102,10 +132,13 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
-  group: local-e2e-${{ github.ref }}
-  cancel-in-progress: true
+  # Post-merge runs coalesce (one running + one queued, never cancelled) so
+  # bursts of merges collapse into few runs; PR runs cancel superseded pushes.
+  group: local-e2e-${{ github.event_name == 'push' && 'main-post-merge' || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   TIDB_VERSION: v8.5.5
@@ -115,18 +148,22 @@ env:
   DRIVE9_LOCAL_EMBEDDING_MODE: app
   RUN_SEMANTIC_CHECKS: "0"
   RUN_CLI_SEMANTIC_CHECKS: "0"
-  RUN_FUSE_CONCURRENCY_STRESS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_concurrency_stress || '0') }}
-  RUN_FUSE_POSIX_FSX: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_posix_fsx || '0') }}
-  RUN_FUSE_SQLITE_WAL: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_sqlite_wal || '0') }}
-  RUN_FUSE_SQLITE_CHURN: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_sqlite_churn || '0') }}
-  RUN_FUSE_SQLITE_CONCURRENCY: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_sqlite_concurrency || '0') }}
-  RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_performance_baseline || '0') }}
+  RUN_FUSE_CONCURRENCY_STRESS: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_concurrency_stress) || '0') }}
+  RUN_FUSE_POSIX_FSX: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_posix_fsx) || '0') }}
+  RUN_FUSE_SQLITE_WAL: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_wal) || '0') }}
+  RUN_FUSE_SQLITE_CHURN: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_churn) || '0') }}
+  RUN_FUSE_SQLITE_CONCURRENCY: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_sqlite_concurrency) || '0') }}
+  RUN_FUSE_PERFORMANCE_BASELINE: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_fuse_performance_baseline) || '0') }}
   ARCHIVE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.archive_fuse_performance_metrics || '0') }}
   COMPARE_FUSE_PERFORMANCE_METRICS: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.compare_fuse_performance_metrics || '0') }}
-  RUN_E2E_SMOKE_ALL: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_e2e_smoke_all || '0') }}
-  RUN_GIT_FEATURE_MATRIX: ${{ github.event_name == 'schedule' && '1' || (github.event_name == 'workflow_dispatch' && inputs.run_git_feature_matrix || '0') }}
-  FUSE_PERF_COMPARE_FAIL_ON_REGRESSION: "1"
-  FUSE_CONCURRENCY_STRESS_REQUIRED: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_fuse_concurrency_stress == '1')) && '1' || '0' }}
+  RUN_E2E_SMOKE_ALL: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_e2e_smoke_all) || '0') }}
+  RUN_GIT_FEATURE_MATRIX: ${{ (github.event_name == 'schedule' || github.event_name == 'push') && '1' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' && '1' || inputs.run_git_feature_matrix) || '0') }}
+  RUN_POSIX_FEATURE_MATRIX: ${{ github.event_name == 'workflow_dispatch' && inputs.run_all_e2e == '1' && '1' || '0' }}
+  # Report-only: hosted-runner FUSE numbers are too noisy for a hard
+  # day-over-day gate (the first two nightly runs both false-failed here).
+  # Deterministic perf gating lives in e2e/fuse-write-perf-budget-test.sh.
+  FUSE_PERF_COMPARE_FAIL_ON_REGRESSION: "0"
+  FUSE_CONCURRENCY_STRESS_REQUIRED: ${{ (github.event_name == 'schedule' || github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.run_all_e2e == '1' || inputs.run_fuse_concurrency_stress == '1'))) && '1' || '0' }}
   FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
   FUSE_CONCURRENCY_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-concurrency
   FEATURE_MATRIX_REPORT_DIR: ${{ github.workspace }}/e2e-artifacts/feature-matrix
@@ -262,6 +299,16 @@ jobs:
         continue-on-error: true
         run: bash e2e/portable-pack-unpack-e2e.sh
 
+      - name: Run FUSE crash recovery e2e
+        id: fuse-crash-recovery
+        continue-on-error: true
+        run: bash e2e/fuse-crash-recovery-test.sh
+
+      - name: Run FUSE write perf budget e2e
+        id: fuse-write-perf-budget
+        continue-on-error: true
+        run: bash e2e/fuse-write-perf-budget-test.sh
+
       - name: Compare FUSE performance metrics
         id: fuse_performance_compare
         if: always() && env.RUN_FUSE_PERFORMANCE_BASELINE == '1' && env.COMPARE_FUSE_PERFORMANCE_METRICS == '1'
@@ -348,8 +395,29 @@ jobs:
           FUSE_STRICT_PREREQS: "1"
         run: bash e2e/git-feature-matrix.sh
 
+      - name: Build pjdfstest
+        if: always() && env.RUN_POSIX_FEATURE_MATRIX == '1'
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y autoconf automake libtool
+          git clone --depth 1 https://github.com/pjd/pjdfstest /tmp/pjdfstest
+          cd /tmp/pjdfstest
+          autoreconf -ifs
+          ./configure
+          make pjdfstest
+
+      - name: Run POSIX feature matrix
+        id: posix-feature-matrix
+        if: always() && env.RUN_POSIX_FEATURE_MATRIX == '1'
+        continue-on-error: true
+        env:
+          PJDFSTEST_DIR: /tmp/pjdfstest
+          PJDFSTEST_ALLOW_NONROOT: "1"
+          FUSE_STRICT_PREREQS: "1"
+        run: bash e2e/posix-feature-matrix.sh
+
       - name: Upload feature matrix artifacts
-        if: always() && env.RUN_GIT_FEATURE_MATRIX == '1'
+        if: always() && (env.RUN_GIT_FEATURE_MATRIX == '1' || env.RUN_POSIX_FEATURE_MATRIX == '1')
         uses: actions/upload-artifact@v4
         with:
           name: feature-matrix
@@ -371,11 +439,14 @@ jobs:
             echo "| FUSE release gate | ${{ steps.fuse-smoke.outcome || 'skipped' }} |"
             echo "| Git operations smoke | ${{ steps.git-ops-smoke.outcome || 'skipped' }} |"
             echo "| Portable pack/unpack e2e | ${{ steps.portable-pack-unpack-e2e.outcome || 'skipped' }} |"
+            echo "| FUSE crash recovery e2e | ${{ steps.fuse-crash-recovery.outcome || 'skipped' }} |"
+            echo "| FUSE write perf budget e2e | ${{ steps.fuse-write-perf-budget.outcome || 'skipped' }} |"
             echo "| FUSE performance compare | ${{ steps.fuse_performance_compare.outcome || 'skipped' }} |"
             echo "| FUSE concurrency stress | ${{ steps.fuse-concurrency-stress.outcome || 'skipped' }} |"
             echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
             echo "| Full smoke-all suite | ${{ steps.smoke-all.outcome || 'skipped' }} |"
             echo "| Git feature matrix | ${{ steps.git-feature-matrix.outcome || 'skipped' }} |"
+            echo "| POSIX feature matrix | ${{ steps.posix-feature-matrix.outcome || 'skipped' }} |"
             echo
             echo "FUSE concurrency stress: \`RUN_FUSE_CONCURRENCY_STRESS=${RUN_FUSE_CONCURRENCY_STRESS}\`"
             echo "FUSE concurrency stress required: \`FUSE_CONCURRENCY_STRESS_REQUIRED=${FUSE_CONCURRENCY_STRESS_REQUIRED}\`"
@@ -388,6 +459,7 @@ jobs:
             echo "Compare FUSE performance metrics: \`COMPARE_FUSE_PERFORMANCE_METRICS=${COMPARE_FUSE_PERFORMANCE_METRICS}\`"
             echo "Full smoke-all suite: \`RUN_E2E_SMOKE_ALL=${RUN_E2E_SMOKE_ALL}\`"
             echo "Git feature matrix: \`RUN_GIT_FEATURE_MATRIX=${RUN_GIT_FEATURE_MATRIX}\`"
+            echo "POSIX feature matrix: \`RUN_POSIX_FEATURE_MATRIX=${RUN_POSIX_FEATURE_MATRIX}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Dump TiDB playground logs
@@ -441,6 +513,8 @@ jobs:
           check_required "FUSE release gate" "${{ steps.fuse-smoke.outcome }}"
           check_required "Git operations smoke" "${{ steps.git-ops-smoke.outcome }}"
           check_required "Portable pack/unpack e2e" "${{ steps.portable-pack-unpack-e2e.outcome }}"
+          check_required "FUSE crash recovery e2e" "${{ steps.fuse-crash-recovery.outcome }}"
+          check_required "FUSE write perf budget e2e" "${{ steps.fuse-write-perf-budget.outcome }}"
           if [ "${COMPARE_FUSE_PERFORMANCE_METRICS}" = "1" ]; then
             check_required "FUSE performance compare" "${{ steps.fuse_performance_compare.outcome }}"
           fi
@@ -458,3 +532,28 @@ jobs:
           fi
 
           exit "$failed"
+
+      # Scheduled/post-merge failures notify nobody by default, so a red
+      # nightly can sit unnoticed for days. File (or append to) a tracking
+      # issue instead.
+      - name: File issue on scheduled/post-merge failure
+        if: failure() && (github.event_name == 'schedule' || github.event_name == 'push')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          gh label create ci-e2e-failure --repo "$REPO" \
+            --description "Automated: local-e2e scheduled/post-merge run failed" \
+            --color D93F0B --force || true
+          body="local-e2e \`$EVENT_NAME\` run failed on \`main\` at $SHA: $RUN_URL"
+          existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --label ci-e2e-failure \
+              --title "local-e2e $EVENT_NAME run failing on main" --body "$body"
+          fi

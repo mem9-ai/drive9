@@ -27,10 +27,29 @@ including local single-tenant validation via `drive9-server-local`.
 | `fuse-performance-baseline.sh` | Opt-in real writable FUSE baseline that records small-file, large-file, repeated large-read, and SQLite transaction/read metrics as JSON artifacts without hardcoded throughput thresholds; SQLite reads verify stored row payload bytes against row checksums |
 | `fuse-release-gate.sh` | Strict FUSE release/CI gate with hard prereq failures, small-repo git clone/status/log, durable umount/remount, mount-log audit, manifest-based FUSE correctness workload, and SQLite rollback-journal correctness; set `RUN_FUSE_ALL_WORKLOADS=1` to add all optional release-gate workloads, `RUN_FUSE_SQLITE_CORRECTNESS=0` to skip SQLite temporarily, `RUN_FUSE_CONCURRENCY_STRESS=1` to add bounded concurrency stress, `RUN_FUSE_POSIX_FSX=1` to add the POSIX/fsx subset, and `RUN_FUSE_PERFORMANCE_BASELINE=1` to add performance metrics |
 | `git-ops-smoke-test.sh` | Lightweight local Git gate using a local bare fixture: native clone, `drive9 git clone --fast`, and `drive9 git clone --fast --blobless` across `coding-agent` and `portable` profiles, followed by edit/add/commit/stash, remount into a fresh local root, and Git state/content verification |
+| `fuse-crash-recovery-test.sh` | FUSE crash-recovery gate: fsync'd small files plus a large mid-upload ShadowSpill survive `kill -9` of the mount daemon, recovered commits converge remotely, unlinked files do not resurrect, and the journal WAL compacts after a clean remount |
+| `fuse-write-perf-budget-test.sh` | FUSE write-path perf budgets: fsync-heavy workload with deterministic op-count budgets (remote writes/stats/lists/mutations, commit retries/failures) plus an fsync latency ceiling, asserted from mount perf counters |
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
 | `smoke-all.sh` | Runs API + CLI + journal + layer FS + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_FUSE_SMOKE=0` to skip FUSE symlink/hardlink coverage, `RUN_GIT_OPS_SMOKE=1` to include lightweight Git coverage, `RUN_GIT_WORKSPACE_SMOKE=1` to include heavier Git workspace coverage, and `RUN_PORTABLE_PACK_E2E=1` to include portable pack/unpack coverage |
 | `local-smoke.sh` | Starts `drive9-server-local` with a disposable local DB by default, then runs `smoke-all.sh` with semantic checks disabled and FUSE smoke skipped unless `RUN_FUSE_SMOKE=1` |
+
+## CI automation tiers
+
+Every script in this directory must be wired into one of these tiers (or be
+explicitly listed as manual-only with a reason). Do not merge a new e2e script
+without adding it to `.github/workflows/local-e2e.yml`.
+
+| Tier | Trigger | What runs |
+|------|---------|-----------|
+| PR gate | `pull_request` to `main` (local-e2e) | api, existing-key, cli, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback), git-ops, portable pack/unpack, fuse-crash-recovery, fuse-write-perf-budget |
+| Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, full `smoke-all.sh` (journal, posix-permission, git-workspace), git feature matrix |
+| Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
+| Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above + POSIX feature matrix (pjdfstest, best-effort) via `run_all_e2e=1` |
+| Manual only | not wired, run by hand | `layer-fs-smoke-test-realdev.sh` (shared dev endpoint), `verify-description-e2e.sh` (Docker + Ollama), `verify-description-tidb-zero-e2e.sh` (TiDB Cloud Zero), `local-smoke.sh` (`make e2e-local` wrapper) |
+
+Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
+GitHub issue, since GitHub only notifies the workflow author otherwise.
 
 ## Run
 
