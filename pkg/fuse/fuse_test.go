@@ -150,8 +150,28 @@ func TestInodeToPath_RenameReplacesDestination(t *testing.T) {
 	if p, ok := m.GetPath(srcIno); !ok || p != "/config" {
 		t.Fatalf("source path = %q, %v; want /config, true", p, ok)
 	}
-	if p, ok := m.GetPath(dstIno); ok {
-		t.Fatalf("replaced destination inode still mapped to %q", p)
+	if gotIno, ok := m.GetInode("/config"); !ok || gotIno == dstIno {
+		t.Fatalf("destination path still resolves to replaced inode %d, %v", gotIno, ok)
+	}
+}
+
+func TestInodeToPath_RenameReplacesDestinationPreservesUnlinkedInode(t *testing.T) {
+	m := NewInodeToPath()
+	srcIno := m.Lookup("/config.lock", false, 10, time.Now())
+	dstIno := m.Lookup("/config", false, 5, time.Now())
+
+	m.Rename("/config.lock", "/config")
+
+	gotIno, ok := m.GetInode("/config")
+	if !ok || gotIno != srcIno {
+		t.Fatalf("GetInode(/config) = %d, %v; want %d, true", gotIno, ok, srcIno)
+	}
+	dstEntry, ok := m.GetEntry(dstIno)
+	if !ok {
+		t.Fatal("replaced destination inode should be preserved for open handles")
+	}
+	if !dstEntry.Unlinked || dstEntry.Nlink != 0 || dstEntry.Path != "/config" {
+		t.Fatalf("destination entry = %+v; want unlinked nlink=0 at old path", dstEntry)
 	}
 }
 

@@ -513,7 +513,7 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 	// Update the entry itself.
 	delete(m.byPath, oldPath)
 	if replacedIno, ok := m.byPath[newPath]; ok && replacedIno != ino {
-		m.removePathLocked(newPath, true, false)
+		m.removePathLocked(newPath, true, true)
 	}
 	m.byPath[newPath] = ino
 	if entry.Paths == nil {

@@ -1297,6 +1297,65 @@ func TestRenameDir(t *testing.T) {
 	}
 }
 
+func TestRenameDirReplacesEmptyTargetAtomically(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "src", Path: "/src/", ParentPath: "/", Name: "src", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "child", Path: "/src/a.txt", ParentPath: "/src/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "dst", Path: "/dst/", ParentPath: "/", Name: "dst", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := s.RenameDir(context.Background(), "/src/", "/dst/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+	if _, err := s.GetNode(context.Background(), "/src/"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("/src/ error = %v, want ErrNotFound", err)
+	}
+	got, err := s.GetNode(context.Background(), "/dst/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NodeID != "src" {
+		t.Fatalf("/dst/ node id = %q, want src", got.NodeID)
+	}
+	if _, err := s.GetNode(context.Background(), "/dst/a.txt"); err != nil {
+		t.Fatalf("/dst/a.txt missing: %v", err)
+	}
+}
+
+func TestRenameDirRejectsNonEmptyTargetWithoutDeleting(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "src", Path: "/src/", ParentPath: "/", Name: "src", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "dst", Path: "/dst/", ParentPath: "/", Name: "dst", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "dstchild", Path: "/dst/b.txt", ParentPath: "/dst/", Name: "b.txt", FileID: "f2", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.RenameDir(context.Background(), "/src/", "/dst/")
+	if !errors.Is(err, ErrPathConflict) {
+		t.Fatalf("RenameDir error = %v, want ErrPathConflict", err)
+	}
+	for _, p := range []string{"/src/", "/dst/", "/dst/b.txt"} {
+		if _, err := s.GetNode(context.Background(), p); err != nil {
+			t.Fatalf("%s should remain after failed rename: %v", p, err)
+		}
+	}
+}
+
 func TestUpdateFileContent(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()

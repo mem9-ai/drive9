@@ -4201,12 +4201,11 @@ func TestFinishLocalRenameRetargetsSpecialNodeSubtree(t *testing.T) {
 	}
 }
 
-func TestMknodMetadataOnlySpecialUsesNegativeCacheForStaleRemoteStat(t *testing.T) {
+func TestMknodMetadataOnlySpecialRevalidatesNegativeCache(t *testing.T) {
 	var remoteCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		remoteCalls.Add(1)
 		if r.Method == http.MethodHead && r.URL.Path == "/v1/fs/stale" {
-			w.Header().Set("X-Dat9-IsDir", "true")
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -4222,14 +4221,14 @@ func TestMknodMetadataOnlySpecialUsesNegativeCacheForStaleRemoteStat(t *testing.
 		InHeader: gofuse.InHeader{NodeId: 1},
 		Mode:     uint32(syscall.S_IFIFO) | 0o644,
 	}, "stale", &out)
-	if st != gofuse.OK {
-		t.Fatalf("Mknod status = %v, want OK", st)
+	if st != gofuse.Status(syscall.EEXIST) {
+		t.Fatalf("Mknod status = %v, want EEXIST", st)
 	}
-	if got := remoteCalls.Load(); got != 0 {
-		t.Fatalf("remote calls = %d, want 0", got)
+	if got := remoteCalls.Load(); got != 1 {
+		t.Fatalf("remote calls = %d, want 1", got)
 	}
-	if _, ok := fs.specialNodeEntry("/stale"); !ok {
-		t.Fatal("special node missing")
+	if _, ok := fs.specialNodeEntry("/stale"); ok {
+		t.Fatal("special node shadowed remote path")
 	}
 }
 
@@ -4610,8 +4609,8 @@ func TestRenameRemoteDirReplacesEmptyRemoteDirTarget(t *testing.T) {
 	mu.Lock()
 	gotEvents := strings.Join(events, ",")
 	mu.Unlock()
-	if gotEvents != "list-target,delete-target,rename" {
-		t.Fatalf("events = %q, want list-target,delete-target,rename", gotEvents)
+	if gotEvents != "list-target,rename" {
+		t.Fatalf("events = %q, want list-target,rename", gotEvents)
 	}
 	if _, ok := fs.inodes.GetInode("/src"); ok {
 		t.Fatal("old source inode still mapped")
@@ -5202,9 +5201,8 @@ func TestSymlinkCreatesRemoteLinkAndCachesEntry(t *testing.T) {
 	}
 }
 
-func TestSymlinkRetriesNegativeCachedStaleDirectoryConflict(t *testing.T) {
+func TestSymlinkNegativeCachedConflictDoesNotDeleteRemoteTarget(t *testing.T) {
 	const target = "test"
-	symlinkMode := uint32(syscall.S_IFLNK) | 0o777
 	var postCalls atomic.Int32
 	var deleteCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -5213,27 +5211,13 @@ func TestSymlinkRetriesNegativeCachedStaleDirectoryConflict(t *testing.T) {
 			if got := r.URL.Query().Get("symlink"); got != "1" {
 				t.Errorf("symlink query = %q, want 1", got)
 			}
-			if postCalls.Add(1) == 1 {
-				http.Error(w, "exists", http.StatusConflict)
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
+			postCalls.Add(1)
+			http.Error(w, "exists", http.StatusConflict)
 		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/link":
-			if postCalls.Load() < 2 {
-				w.Header().Set("X-Dat9-IsDir", "true")
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-			w.Header().Set("Content-Length", strconv.Itoa(len(target)))
-			w.Header().Set("X-Dat9-IsDir", "false")
-			w.Header().Set("X-Dat9-Mode", strconv.FormatUint(uint64(symlinkMode), 10))
-			w.Header().Set("X-Dat9-Revision", "13")
+			w.Header().Set("X-Dat9-IsDir", "true")
 			w.WriteHeader(http.StatusOK)
 		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/link":
 			deleteCalls.Add(1)
-			if got := r.URL.Query().Get("kind"); got != "dir" {
-				t.Errorf("delete kind = %q, want dir", got)
-			}
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/link":
 			_, _ = w.Write([]byte(target))
@@ -5248,17 +5232,14 @@ func TestSymlinkRetriesNegativeCachedStaleDirectoryConflict(t *testing.T) {
 
 	var out gofuse.EntryOut
 	st := fs.Symlink(nil, &gofuse.InHeader{NodeId: 1}, target, "link", &out)
-	if st != gofuse.OK {
-		t.Fatalf("Symlink status = %v, want OK", st)
+	if st != gofuse.Status(syscall.EEXIST) {
+		t.Fatalf("Symlink status = %v, want EEXIST", st)
 	}
-	if got := postCalls.Load(); got != 2 {
-		t.Fatalf("POST calls = %d, want 2", got)
+	if got := postCalls.Load(); got != 1 {
+		t.Fatalf("POST calls = %d, want 1", got)
 	}
-	if got := deleteCalls.Load(); got != 1 {
-		t.Fatalf("DELETE calls = %d, want 1", got)
-	}
-	if got := out.Mode & uint32(syscall.S_IFMT); got != uint32(syscall.S_IFLNK) {
-		t.Fatalf("Symlink mode type = %o, want symlink", got)
+	if got := deleteCalls.Load(); got != 0 {
+		t.Fatalf("DELETE calls = %d, want 0", got)
 	}
 }
 
@@ -12578,7 +12559,7 @@ func TestSetAttr_PathTruncateExtendUsesMultipartWhenAboveInlineThreshold(t *test
 	}
 }
 
-func TestSetAttr_PathTruncateHugeSizeReturnsEFBIG(t *testing.T) {
+func TestSetAttr_PathTruncateOverflowSizeReturnsEFBIG(t *testing.T) {
 	var putCalls atomic.Int32
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -12601,7 +12582,7 @@ func TestSetAttr_PathTruncateHugeSizeReturnsEFBIG(t *testing.T) {
 		SetAttrInCommon: gofuse.SetAttrInCommon{
 			InHeader: gofuse.InHeader{NodeId: ino},
 			Valid:    gofuse.FATTR_SIZE,
-			Size:     999999999999999,
+			Size:     uint64(1 << 63),
 		},
 	}, &out)
 	if st != gofuse.Status(syscall.EFBIG) {

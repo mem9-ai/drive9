@@ -293,30 +293,6 @@ func (fs *Dat9FS) renameMetadataOnlySpecial(ctx context.Context, input *gofuse.R
 	return gofuse.OK
 }
 
-func (fs *Dat9FS) prepareRenameDirReplacement(ctx context.Context, oldInfo, newInfo renamePathInfo) gofuse.Status {
-	if !oldInfo.isDir || !newInfo.exists || !newInfo.isDir || newInfo.special {
-		return gofuse.OK
-	}
-	if err := fs.deleteRemoteDirWithInterruptRecovery(ctx, newInfo.path); err != nil {
-		if isNotFoundErr(err) {
-			return gofuse.OK
-		}
-		if isConflictErr(err) {
-			return gofuse.Status(syscall.ENOTEMPTY)
-		}
-		return httpToFuseStatus(err)
-	}
-	fs.inodes.Remove(newInfo.path)
-	parentPath, name := cacheParentName(newInfo.path)
-	fs.adjustDirectoryLinkCount(parentPath, -1)
-	fs.dirCache.Remove(parentPath, name)
-	fs.cacheNegativePath(newInfo.path)
-	fs.dirCache.InvalidatePrefix(newInfo.path)
-	fs.readCache.InvalidatePrefix(newInfo.path + "/")
-	fs.invalidateDiskReadCachePrefix(newInfo.path + "/")
-	return gofuse.OK
-}
-
 func (fs *Dat9FS) renameRemoteFileToMissingTargetFallback(ctx context.Context, input *gofuse.RenameIn, oldInfo, newInfo renamePathInfo, renameErr error) (bool, gofuse.Status) {
 	if !isNotFoundErr(renameErr) || !oldInfo.exists || oldInfo.isDir || oldInfo.special || newInfo.exists {
 		return false, gofuse.OK

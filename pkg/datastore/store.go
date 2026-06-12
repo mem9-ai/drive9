@@ -564,14 +564,20 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 	if oldPrefix == "/" || newPrefix == "/" {
 		return 0, ErrInvalidRootDentry
 	}
+	if oldPrefix == newPrefix {
+		return 0, nil
+	}
+	if strings.HasPrefix(newPrefix, oldPrefix) {
+		return 0, ErrPathConflict
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.Query(`SELECT node_id, path, parent_path, name FROM file_nodes
-		WHERE path = ? OR path LIKE ? ORDER BY path`, oldPrefix, oldPrefix+"%")
+	rows, err := tx.QueryContext(ctx, `SELECT node_id, path, parent_path, name FROM file_nodes
+		WHERE path = ? OR path LIKE ? ORDER BY path FOR UPDATE`, oldPrefix, oldPrefix+"%")
 	if err != nil {
 		return 0, err
 	}
@@ -596,8 +602,43 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		updates = append(updates, update{nodeID, newPath, newParent, newName})
 	}
 	_ = rows.Close()
+	if len(updates) == 0 {
+		return 0, ErrNotFound
+	}
 
-	stmt, err := tx.Prepare(`UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE node_id = ?`)
+	type dstRef struct {
+		nodeID string
+		isDir  bool
+	}
+	var dst dstRef
+	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
+		fileNodePathHash(newPrefix), newPrefix).Scan(&dst.nodeID, &dst.isDir)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, err
+		}
+	} else {
+		if !dst.isDir {
+			return 0, ErrPathConflict
+		}
+		childRows, err := tx.QueryContext(ctx, `SELECT node_id FROM file_nodes WHERE parent_path_hash = ? AND parent_path = ? FOR UPDATE`,
+			fileNodePathHash(newPrefix), newPrefix)
+		if err != nil {
+			return 0, err
+		}
+		hasChild := childRows.Next()
+		if closeErr := childRows.Close(); closeErr != nil {
+			return 0, closeErr
+		}
+		if hasChild {
+			return 0, ErrPathConflict
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE node_id = ?`, dst.nodeID); err != nil {
+			return 0, err
+		}
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE node_id = ?`)
 	if err != nil {
 		return 0, err
 	}
@@ -605,6 +646,9 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 
 	for _, u := range updates {
 		if _, err := stmt.Exec(u.newPath, fileNodePathHash(u.newPath), u.newParent, fileNodePathHash(u.newParent), u.newName, u.nodeID); err != nil {
+			if isUniqueViolation(err) {
+				return 0, ErrPathConflict
+			}
 			return 0, err
 		}
 	}

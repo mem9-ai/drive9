@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -2173,13 +2175,14 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 	if newSize > int64(int(^uint(0)>>1)) {
 		return gofuse.Status(syscall.EFBIG)
 	}
-	if newSize > maxPathTruncateInMemoryBytes {
+
+	if fs.layerEnabled() && newSize > maxPathTruncateInMemoryBytes {
 		return gofuse.Status(syscall.EFBIG)
 	}
 
 	apiPath := fs.remotePath(entry.Path)
 	var data []byte
-	if newSize > 0 {
+	if newSize > 0 && newSize <= maxPathTruncateInMemoryBytes {
 		if entry.Size > 0 {
 			readSize := newSize
 			if entry.Size < readSize {
@@ -2232,8 +2235,13 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 	}
 
 	writeStart := fs.perfStart()
-	err := uploadBufferedRemoteFile(ctx, fs.client, apiPath, data, -1)
-	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
+	var err error
+	if newSize > maxPathTruncateInMemoryBytes {
+		err = uploadRemoteTruncateFile(ctx, fs.client, apiPath, entry.Size, newSize, -1)
+	} else {
+		err = uploadBufferedRemoteFile(ctx, fs.client, apiPath, data, -1)
+	}
+	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(newSize))
 	if err != nil {
 		return httpToFuseStatus(err)
 	}
@@ -5862,10 +5870,27 @@ func processHasSupplementaryGroup(pid, gid uint32) bool {
 	if pid == 0 {
 		return false
 	}
+	if ok, handled := processHasSupplementaryGroupProc(pid, gid); handled {
+		return ok
+	}
+	if pid == uint32(os.Getpid()) && currentProcessHasSupplementaryGroup(gid) {
+		return true
+	}
+	if runtime.GOOS == "darwin" {
+		return processHasSupplementaryGroupDarwin(pid, gid)
+	}
+	return false
+}
+
+func processHasSupplementaryGroupProc(pid, gid uint32) (bool, bool) {
 	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
 	if err != nil {
-		return false
+		return false, false
 	}
+	return procStatusHasGroup(status, gid), true
+}
+
+func procStatusHasGroup(status []byte, gid uint32) bool {
 	target := strconv.FormatUint(uint64(gid), 10)
 	for _, line := range strings.Split(string(status), "\n") {
 		if !strings.HasPrefix(line, "Groups:") {
@@ -5877,6 +5902,45 @@ func processHasSupplementaryGroup(pid, gid uint32) bool {
 			}
 		}
 		return false
+	}
+	return false
+}
+
+func currentProcessHasSupplementaryGroup(gid uint32) bool {
+	groups, err := os.Getgroups()
+	if err != nil {
+		return false
+	}
+	for _, group := range groups {
+		if uint32(group) == gid {
+			return true
+		}
+	}
+	return false
+}
+
+func processHasSupplementaryGroupDarwin(pid, gid uint32) bool {
+	userOut, err := exec.Command("ps", "-o", "user=", "-p", strconv.FormatUint(uint64(pid), 10)).Output()
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(string(userOut))
+	if len(fields) == 0 {
+		return false
+	}
+	groupOut, err := exec.Command("id", "-G", fields[0]).Output()
+	if err != nil {
+		return false
+	}
+	return groupListContains(groupOut, gid)
+}
+
+func groupListContains(output []byte, gid uint32) bool {
+	for _, field := range strings.Fields(string(output)) {
+		group, err := strconv.ParseUint(field, 10, 32)
+		if err == nil && uint32(group) == gid {
+			return true
+		}
 	}
 	return false
 }
@@ -6111,6 +6175,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 
 	// Handle truncate
 	if input.Valid&gofuse.FATTR_SIZE != 0 {
+		if input.Size > uint64(1<<63-1) {
+			return gofuse.Status(syscall.EFBIG)
+		}
 		newSize := int64(input.Size)
 		oldSize := entry.Size
 
@@ -6234,12 +6301,10 @@ func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name stri
 	if fs.hasPendingLocalState(childP) || fs.hasQueuedCommit(childP) {
 		return gofuse.Status(syscall.EEXIST)
 	}
-	if !fs.hasNegativePathCache(childP) {
-		if exists, err := fs.remotePathExistsDetached(childP); err != nil {
-			return httpToFuseStatus(err)
-		} else if exists {
-			return gofuse.Status(syscall.EEXIST)
-		}
+	if exists, err := fs.remotePathExistsDetached(childP); err != nil {
+		return httpToFuseStatus(err)
+	} else if exists {
+		return gofuse.Status(syscall.EEXIST)
 	}
 
 	now := time.Now()
@@ -6515,15 +6580,7 @@ func (fs *Dat9FS) retrySymlinkAfterNegativeCacheConflict(ctx context.Context, po
 		return statErr
 	}
 	if statErr == nil && stat != nil {
-		var deleteErr error
-		if stat.IsDir {
-			deleteErr = fs.deleteRemoteDirWithInterruptRecovery(ctx, childP)
-		} else {
-			deleteErr = fs.deleteRemoteFileWithInterruptRecovery(ctx, childP)
-		}
-		if deleteErr != nil && !isNotFoundErr(deleteErr) {
-			return deleteErr
-		}
+		return &client.StatusError{StatusCode: http.StatusConflict, Message: "path already exists"}
 	}
 
 	mutationStart := fs.perfStart()
@@ -7366,11 +7423,6 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	if oldInfo.special {
 		return fs.renameMetadataOnlySpecial(ctx, input, oldP, newP, newInfo)
 	}
-	if newInfo.special {
-		if st := fs.removeRenameSpecialTarget(ctx, newInfo); st != gofuse.OK {
-			return st
-		}
-	}
 
 	pendingRename, err := fs.renamePendingNewCommit(ctx, input, oldP, newP)
 	if err != nil {
@@ -7441,9 +7493,6 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 	}
 
-	if st := fs.prepareRenameDirReplacement(ctx, oldInfo, newInfo); st != gofuse.OK {
-		return st
-	}
 	if err := fs.renameRemoteWithTransientRetry(ctx, oldP, newP); err != nil {
 		if handled, st := fs.renameRemoteFileToMissingTargetFallback(ctx, input, oldInfo, newInfo, err); handled {
 			return st
@@ -7456,6 +7505,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 		if fs.pendingIndex != nil {
 			fs.pendingIndex.Remove(oldP)
+		}
+	}
+	if newInfo.special {
+		if st := fs.removeRenameSpecialTarget(ctx, newInfo); st != gofuse.OK {
+			return st
 		}
 	}
 

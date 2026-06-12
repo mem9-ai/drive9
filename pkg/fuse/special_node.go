@@ -112,16 +112,14 @@ func (fs *Dat9FS) linkMetadataOnlySpecial(input *gofuse.LinkIn, srcEntry *InodeE
 	if fs.openHandles.Has(0, dstP) || fs.hasPendingLocalState(dstP) || fs.hasQueuedCommit(dstP) {
 		return gofuse.Status(syscall.EEXIST)
 	}
-	if !fs.hasNegativePathCache(dstP) {
-		ctx, cancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
-		exists, err := fs.pendingRenameTargetExists(ctx, dstP)
-		cancel()
-		if err != nil {
-			return httpToFuseStatus(err)
-		}
-		if exists {
-			return gofuse.Status(syscall.EEXIST)
-		}
+	ctx, cancel := context.WithTimeout(context.Background(), namespaceMutationRetryTimeout)
+	exists, err := fs.pendingRenameTargetExists(ctx, dstP)
+	cancel()
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+	if exists {
+		return gofuse.Status(syscall.EEXIST)
 	}
 
 	nlink := srcEntry.Nlink + 1
