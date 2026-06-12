@@ -304,10 +304,26 @@ jobs:
         continue-on-error: true
         run: bash e2e/fuse-crash-recovery-test.sh
 
+      - name: Upload FUSE crash recovery artifacts
+        if: always() && steps.fuse-crash-recovery.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuse-crash-recovery
+          path: /tmp/drive9-fuse-crash-*/mount.log
+          if-no-files-found: warn
+
       - name: Run FUSE write perf budget e2e
         id: fuse-write-perf-budget
         continue-on-error: true
         run: bash e2e/fuse-write-perf-budget-test.sh
+
+      - name: Upload FUSE write perf artifacts
+        if: always() && steps.fuse-write-perf-budget.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuse-write-perf-budget
+          path: /tmp/drive9-fuse-write-perf-*/mount.log
+          if-no-files-found: warn
 
       - name: Compare FUSE performance metrics
         id: fuse_performance_compare
