@@ -34,6 +34,7 @@ GIT_OPS_REFRESH_BUDGET_BASE="${GIT_OPS_REFRESH_BUDGET_BASE:-20}"
 GIT_OPS_REFRESH_BUDGET_PER_SEC="${GIT_OPS_REFRESH_BUDGET_PER_SEC:-6}"
 GIT_OPS_FORCED_REFRESH_BUDGET_BASE="${GIT_OPS_FORCED_REFRESH_BUDGET_BASE:-10}"
 GIT_OPS_FORCED_REFRESH_BUDGET_PER_SEC="${GIT_OPS_FORCED_REFRESH_BUDGET_PER_SEC:-3}"
+GIT_OPS_STATUS_SETTLE_TIMEOUT_S="${GIT_OPS_STATUS_SETTLE_TIMEOUT_S:-60}"
 
 export GIT_ALLOW_PROTOCOL="${GIT_ALLOW_PROTOCOL:-file:https:http:ssh}"
 
@@ -562,6 +563,36 @@ capture_git_state() {
   cat "$repo/untracked.txt" > "$out_dir/untracked-content.txt"
 }
 
+# Blobless workspaces register tree entries with unknown blob sizes and only
+# learn them as the async hydrator fills the local git cache. Until then,
+# getattr reports a placeholder size, and `git status` flags those entries as
+# phantom-modified purely from the stat-size mismatch (it never re-reads
+# content when sizes differ). The restored state is eventually consistent, so
+# poll until status converges before asserting strict equality below.
+wait_restored_status_settled() {
+  local repo="$1"
+  local expected="$2"
+  local start
+  start=$(date +%s)
+  local deadline=$(( start + GIT_OPS_STATUS_SETTLE_TIMEOUT_S ))
+  local out waited=0
+  while :; do
+    out="$(git_cmd -C "$repo" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)"
+    if [ "$out" = "$(cat "$expected" 2>/dev/null)" ]; then
+      if [ "$waited" = "1" ]; then
+        echo "INFO restored status settled after $(( $(date +%s) - start ))s"
+      fi
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "INFO restored status did not settle within ${GIT_OPS_STATUS_SETTLE_TIMEOUT_S}s" >&2
+      return 0 # let the strict check below report the diff
+    fi
+    waited=1
+    sleep 1
+  done
+}
+
 verify_restored_git_state() {
   local repo="$1"
   local state_dir="$2"
@@ -570,6 +601,7 @@ verify_restored_git_state() {
   mkdir -p "$actual_dir"
 
   check_cmd "restored repo ready" assert_repo_ready "$repo"
+  wait_restored_status_settled "$repo" "$state_dir/status.txt"
   if ! capture_git_state "$repo" "$actual_dir"; then
     check_cmd "restored git state capture" false
     return 0
