@@ -247,9 +247,12 @@ func TestPendingIndexPrepareCommitRename(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	newMeta, ok := idx.PrepareRename("/old.txt", "/new.txt")
-	if !ok {
-		t.Fatal("PrepareRename failed")
+	newMeta, err := idx.PrepareRename("/old.txt", "/new.txt")
+	if err != nil {
+		t.Fatalf("PrepareRename: %v", err)
+	}
+	if newMeta == nil {
+		t.Fatal("PrepareRename found no pending entry")
 	}
 
 	// Phase 1 (prepared): memory unchanged, BOTH metas durable on disk.
@@ -309,8 +312,8 @@ func TestPendingIndexAbortRename(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, ok := idx.PrepareRename("/old.txt", "/new.txt"); !ok {
-		t.Fatal("PrepareRename failed")
+	if prepared, err := idx.PrepareRename("/old.txt", "/new.txt"); err != nil || prepared == nil {
+		t.Fatalf("PrepareRename: meta=%v err=%v", prepared, err)
 	}
 	idx.AbortRename("/new.txt")
 

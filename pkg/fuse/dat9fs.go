@@ -6255,9 +6255,12 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 	// Crash-safe order: persist the new-path meta BEFORE moving the shadow.
 	// If we crash between the two steps, both .meta files exist and recovery
 	// keeps whichever side still has the shadow — the data is never orphaned.
-	preparedMeta, ok := fs.pendingIndex.PrepareRename(oldP, newP)
-	if !ok {
-		return pendingRenameHandled, fmt.Errorf("prepare pending index rename %s -> %s failed", oldP, newP)
+	preparedMeta, err := fs.pendingIndex.PrepareRename(oldP, newP)
+	if err != nil {
+		return pendingRenameHandled, fmt.Errorf("prepare pending index rename %s -> %s: %w", oldP, newP, err)
+	}
+	if preparedMeta == nil {
+		return pendingRenameHandled, fmt.Errorf("prepare pending index rename %s -> %s: pending entry vanished", oldP, newP)
 	}
 	if fs.shadowStore != nil {
 		if !fs.shadowStore.Rename(oldP, newP) {
@@ -6550,8 +6553,22 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	if fs.pendingIndex != nil {
 		for _, meta := range fs.pendingIndex.ListByPrefix(prefix) {
 			newChild := newP + meta.Path[len(oldP):]
-			preparedMeta, ok := fs.pendingIndex.PrepareRename(meta.Path, newChild)
-			if !ok {
+			preparedMeta, err := fs.pendingIndex.PrepareRename(meta.Path, newChild)
+			if err != nil {
+				// Leave the entry at the stale path rather than losing it;
+				// the upload will fail visibly instead of silently dropping.
+				log.Printf("rename: prepare pending child meta %s -> %s failed: %v", meta.Path, newChild, err)
+				continue
+			}
+			if preparedMeta == nil {
+				// Entry committed or removed since ListByPrefix.
+				continue
+			}
+			// Layer mounts track metadata-only pending entries without a
+			// shadow; migrate the meta directly instead of aborting on the
+			// missing shadow (parity with renamePendingNewCommit).
+			if fs.layerEnabled() && fs.shadowStore != nil && !fs.shadowStore.Has(meta.Path) {
+				fs.pendingIndex.CommitRename(meta.Path, preparedMeta)
 				continue
 			}
 			if fs.shadowStore != nil && !fs.shadowStore.Rename(meta.Path, newChild) {
@@ -9006,17 +9023,9 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			err := fs.stageShadowForQueuedCommitLocked(fh, true)
 			fs.debugDurationf(stageStart, 0, "fsync shadowspill stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
-				if fs.commitQueue != nil {
-					phase = "interactive-shadowspill-enqueue"
-					if err := fs.enqueueStagedShadowCommitLocked(fh); err != nil {
-						log.Printf("fsync: enqueue staged ShadowSpill commit failed for %s: %v; deferring to Release", fh.Path, err)
-						fh.ShadowCommitReady = true
-						fh.ShadowCommitSeq = fh.DirtySeq
-					}
-				} else {
-					fh.ShadowCommitReady = true
-					fh.ShadowCommitSeq = fh.DirtySeq
-				}
+				// Journal before enqueue: the async commit appends a
+				// JournalCommit marker, which must get a higher Seq than
+				// this fsync frame or replay resurrects a committed path.
 				if fs.journal != nil {
 					entry := JournalEntry{
 						Op:          JournalFsync,
@@ -9028,6 +9037,17 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 					_ = fs.journal.Append(entry)
 					_ = fs.journal.Fsync()
 				}
+				if fs.commitQueue != nil {
+					phase = "interactive-shadowspill-enqueue"
+					if err := fs.enqueueStagedShadowCommitLocked(fh); err != nil {
+						log.Printf("fsync: enqueue staged ShadowSpill commit failed for %s: %v; deferring to Release", fh.Path, err)
+						fh.ShadowCommitReady = true
+						fh.ShadowCommitSeq = fh.DirtySeq
+					}
+				} else {
+					fh.ShadowCommitReady = true
+					fh.ShadowCommitSeq = fh.DirtySeq
+				}
 				return gofuse.OK
 			}
 		} else {
@@ -9036,6 +9056,19 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 			err := fs.stageShadowForQueuedCommitLocked(fh, true)
 			fs.debugDurationf(stageStart, 0, "fsync stage done path=%s err=%v", fh.Path, err)
 			if err == nil {
+				// Journal before enqueue: the async commit appends a
+				// JournalCommit marker, which must get a higher Seq than
+				// this fsync frame or replay resurrects a committed path.
+				if fs.journal != nil {
+					entry := JournalEntry{
+						Op:      JournalFsync,
+						Path:    fh.Path,
+						Length:  fh.Dirty.Size(),
+						BaseRev: fh.BaseRev,
+					}
+					_ = fs.journal.Append(entry)
+					_ = fs.journal.Fsync()
+				}
 				if fs.commitQueue != nil && fs.shadowStore != nil && fs.shadowStore.Has(fh.Path) {
 					phase = "interactive-enqueue"
 					if err := fs.enqueueStagedShadowCommitLocked(fh); err != nil {
@@ -9049,17 +9082,6 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 						log.Printf("fsync writeback snapshot failed for %s: %v", fh.Path, err)
 					}
 					fh.WriteBackSeq = fh.DirtySeq
-				}
-				// Journal fsync for local durability (when journal is available).
-				if fs.journal != nil {
-					entry := JournalEntry{
-						Op:      JournalFsync,
-						Path:    fh.Path,
-						Length:  fh.Dirty.Size(),
-						BaseRev: fh.BaseRev,
-					}
-					_ = fs.journal.Append(entry)
-					_ = fs.journal.Fsync()
 				}
 				return gofuse.OK
 			}

@@ -145,11 +145,13 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 	}
 	listStart := fs.perfStart()
 	workspaces, err := fs.client.ListGitWorkspaces(ctx)
+	if client.IsNotFound(err) {
+		// Expected on servers without git workspaces — not a remote error.
+		fs.perfRecordRemote(perfRemoteList, listStart, nil, 0)
+		return nil
+	}
 	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
 	if err != nil {
-		if client.IsNotFound(err) {
-			err = nil
-		}
 		return err
 	}
 	loaded := make([]*gitWorkspaceRuntime, 0, len(workspaces))
@@ -175,8 +177,12 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 		}
 		overlayStart := fs.perfStart()
 		overlays, err := fs.client.ListGitOverlayEntries(ctx, ws.WorkspaceID)
+		if client.IsNotFound(err) {
+			// Expected when a workspace has no overlay entries yet.
+			err = nil
+		}
 		fs.perfRecordRemote(perfRemoteList, overlayStart, err, 0)
-		if err != nil && !client.IsNotFound(err) {
+		if err != nil {
 			loadErrs = append(loadErrs, fmt.Errorf("load git overlay workspace=%s root=%s: %w", ws.WorkspaceID, ws.RootPath, err))
 			continue
 		}

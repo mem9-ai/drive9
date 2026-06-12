@@ -5,6 +5,20 @@ import (
 	"testing"
 )
 
+func mustAppend(t *testing.T, j *Journal, e JournalEntry) {
+	t.Helper()
+	if err := j.Append(e); err != nil {
+		t.Fatalf("append %+v: %v", e, err)
+	}
+}
+
+func mustFsync(t *testing.T, j *Journal) {
+	t.Helper()
+	if err := j.Fsync(); err != nil {
+		t.Fatalf("journal fsync: %v", err)
+	}
+}
+
 func TestJournalAppendReplay(t *testing.T) {
 	dir := t.TempDir()
 	jPath := filepath.Join(dir, "test.wal")
@@ -75,10 +89,10 @@ func TestJournalCompact(t *testing.T) {
 	}
 
 	// Write, commit for /a.txt; write (no commit) for /b.txt.
-	_ = j.Append(JournalEntry{Op: JournalWrite, Path: "/a.txt"})
-	_ = j.Append(JournalEntry{Op: JournalWrite, Path: "/b.txt"})
-	_ = j.Append(JournalEntry{Op: JournalCommit, Path: "/a.txt"})
-	_ = j.Fsync()
+	mustAppend(t, j, JournalEntry{Op: JournalWrite, Path: "/a.txt"})
+	mustAppend(t, j, JournalEntry{Op: JournalWrite, Path: "/b.txt"})
+	mustAppend(t, j, JournalEntry{Op: JournalCommit, Path: "/a.txt"})
+	mustFsync(t, j)
 
 	// Compact.
 	if err := j.Compact(); err != nil {
@@ -118,20 +132,20 @@ func TestReplayJournalIntoPendingHonorsCommitMarkers(t *testing.T) {
 	defer func() { _ = j.Close() }()
 
 	// /committed.txt: fsync then commit — must NOT resurrect.
-	_ = j.Append(JournalEntry{Op: JournalFsync, Path: "/committed.txt", Length: 10, BaseRev: 5})
-	_ = j.Append(JournalEntry{Op: JournalCommit, Path: "/committed.txt"})
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/committed.txt", Length: 10, BaseRev: 5})
+	mustAppend(t, j, JournalEntry{Op: JournalCommit, Path: "/committed.txt"})
 	// /pending.txt: fsync, commit, then fsync again — MUST resurrect with
 	// the latest entry's metadata.
-	_ = j.Append(JournalEntry{Op: JournalFsync, Path: "/pending.txt", Length: 10, BaseRev: 3})
-	_ = j.Append(JournalEntry{Op: JournalCommit, Path: "/pending.txt"})
-	_ = j.Append(JournalEntry{Op: JournalFsync, Path: "/pending.txt", Length: 30, BaseRev: 4})
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/pending.txt", Length: 10, BaseRev: 3})
+	mustAppend(t, j, JournalEntry{Op: JournalCommit, Path: "/pending.txt"})
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/pending.txt", Length: 30, BaseRev: 4})
 	// /new-spill.bin: ShadowSpill fsync, never committed — must resurrect
 	// in spill mode so recovery streams instead of ReadAll.
-	_ = j.Append(JournalEntry{Op: JournalFsync, Path: "/new-spill.bin", Length: 1 << 30, BaseRev: 0, ShadowSpill: true})
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/new-spill.bin", Length: 1 << 30, BaseRev: 0, ShadowSpill: true})
 	// /unlinked.txt: fsync then unlink marker — must NOT resurrect.
-	_ = j.Append(JournalEntry{Op: JournalFsync, Path: "/unlinked.txt", Length: 7, BaseRev: 2})
-	_ = j.Append(JournalEntry{Op: JournalUnlink, Path: "/unlinked.txt"})
-	_ = j.Fsync()
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/unlinked.txt", Length: 7, BaseRev: 2})
+	mustAppend(t, j, JournalEntry{Op: JournalUnlink, Path: "/unlinked.txt"})
+	mustFsync(t, j)
 
 	idx, err := NewPendingIndex(t.TempDir())
 	if err != nil {
@@ -184,8 +198,8 @@ func TestReplayJournalIntoPendingPrefersSurvivingMeta(t *testing.T) {
 	}
 	defer func() { _ = j.Close() }()
 
-	_ = j.Append(JournalEntry{Op: JournalFsync, Path: "/a.txt", Length: 10, BaseRev: 1})
-	_ = j.Fsync()
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/a.txt", Length: 10, BaseRev: 1})
+	mustFsync(t, j)
 
 	idx, err := NewPendingIndex(t.TempDir())
 	if err != nil {
@@ -218,11 +232,13 @@ func TestJournalCompactAfterReplayKeepsSeqMonotonic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = j.Append(JournalEntry{Op: JournalFsync, Path: "/done.txt", Length: 4, BaseRev: 1})
-	_ = j.Append(JournalEntry{Op: JournalCommit, Path: "/done.txt"})
-	_ = j.Append(JournalEntry{Op: JournalFsync, Path: "/live.txt", Length: 8, BaseRev: 2})
-	_ = j.Fsync()
-	_ = j.Close()
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/done.txt", Length: 4, BaseRev: 1})
+	mustAppend(t, j, JournalEntry{Op: JournalCommit, Path: "/done.txt"})
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/live.txt", Length: 8, BaseRev: 2})
+	mustFsync(t, j)
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
 
 	// "Remount": replay then compact, as mount.go does.
 	j2, err := NewJournal(jPath)
@@ -249,7 +265,7 @@ func TestJournalCompactAfterReplayKeepsSeqMonotonic(t *testing.T) {
 
 	// Frames for the committed path must be gone; new appends must replay
 	// with strictly increasing seq.
-	_ = j2.Append(JournalEntry{Op: JournalFsync, Path: "/after.txt", Length: 2, BaseRev: 3})
+	mustAppend(t, j2, JournalEntry{Op: JournalFsync, Path: "/after.txt", Length: 2, BaseRev: 3})
 	var replayed []JournalEntry
 	if err := j2.Replay(func(e JournalEntry) { replayed = append(replayed, e) }); err != nil {
 		t.Fatal(err)

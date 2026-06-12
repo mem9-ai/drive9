@@ -32,7 +32,7 @@ type JournalEntry struct {
 	Path      string    `json:"path"`
 	NewPath   string    `json:"new_path,omitempty"` // for Rename
 	Offset    int64     `json:"offset,omitempty"`   // for Write
-	Length    int64     `json:"length,omitempty"`    // for Write
+	Length    int64     `json:"length,omitempty"`   // for Write
 	BaseRev   int64     `json:"base_rev,omitempty"`
 	Timestamp int64     `json:"timestamp,omitempty"`
 	// ShadowSpill records that the fsync'd data lives in a streaming shadow
@@ -50,13 +50,15 @@ type JournalEntry struct {
 //	[N bytes: JSON payload]
 //	[4 bytes: CRC32 of payload (little-endian uint32)]
 type Journal struct {
-	mu     sync.Mutex
-	fd     *os.File
-	seq    atomic.Uint64
-	path   string
+	mu   sync.Mutex
+	fd   *os.File
+	seq  atomic.Uint64
+	path string
 }
 
-// NewJournal opens or creates a journal WAL file at the given path.
+// NewJournal opens or creates a journal WAL file at the given path. The
+// sequence counter resumes from the highest Seq already on disk so that
+// appends before any Replay never reuse sequence numbers.
 func NewJournal(path string) (*Journal, error) {
 	fd, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0o644)
 	if err != nil {
@@ -66,12 +68,54 @@ func NewJournal(path string) (*Journal, error) {
 		fd:   fd,
 		path: path,
 	}
+	if data, err := os.ReadFile(path); err == nil {
+		var maxSeq uint64
+		scanJournalFrames(data, func(entry JournalEntry, _ []byte) {
+			if entry.Seq > maxSeq {
+				maxSeq = entry.Seq
+			}
+		})
+		j.seq.Store(maxSeq)
+	}
 	return j, nil
+}
+
+// scanJournalFrames walks the wire format, skipping corrupt or truncated
+// frames, and calls fn with each decoded entry and its raw frame bytes.
+func scanJournalFrames(data []byte, fn func(entry JournalEntry, frame []byte)) {
+	pos := 0
+	for pos+8 <= len(data) { // need at least 4 (len) + 4 (crc)
+		payloadLen := binary.LittleEndian.Uint32(data[pos : pos+4])
+		frameEnd := pos + 4 + int(payloadLen) + 4
+		if frameEnd > len(data) {
+			break // truncated entry
+		}
+		payload := data[pos+4 : pos+4+int(payloadLen)]
+		storedCRC := binary.LittleEndian.Uint32(data[pos+4+int(payloadLen):])
+		if storedCRC != crc32.ChecksumIEEE(payload) {
+			// Corrupt entry — skip to next possible entry boundary.
+			pos++
+			continue
+		}
+		var entry JournalEntry
+		if err := json.Unmarshal(payload, &entry); err != nil {
+			pos = frameEnd
+			continue
+		}
+		fn(entry, data[pos:frameEnd])
+		pos = frameEnd
+	}
 }
 
 // Append writes a journal entry to the WAL. The entry is length-prefixed
 // and CRC32-checksummed for integrity.
 func (j *Journal) Append(entry JournalEntry) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+
+	// Seq must be assigned under the same lock that orders the writes:
+	// recovery and compaction treat higher Seq as "later on disk", so a
+	// frame must never be written before another frame with a lower Seq.
 	entry.Seq = j.seq.Add(1)
 
 	payload, err := json.Marshal(entry)
@@ -85,9 +129,6 @@ func (j *Journal) Append(entry JournalEntry) error {
 	copy(frame[4:4+len(payload)], payload)
 	checksum := crc32.ChecksumIEEE(payload)
 	binary.LittleEndian.PutUint32(frame[4+len(payload):], checksum)
-
-	j.mu.Lock()
-	defer j.mu.Unlock()
 
 	_, err = j.fd.Write(frame)
 	if err != nil {
@@ -110,47 +151,18 @@ func (j *Journal) Replay(fn func(JournalEntry)) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	if _, err := j.fd.Seek(0, 0); err != nil {
-		return err
-	}
-
 	data, err := os.ReadFile(j.path)
 	if err != nil {
 		return err
 	}
 
-	var maxSeq uint64
-	pos := 0
-	for pos+8 <= len(data) { // need at least 4 (len) + 4 (crc)
-		payloadLen := binary.LittleEndian.Uint32(data[pos : pos+4])
-		frameEnd := pos + 4 + int(payloadLen) + 4
-		if frameEnd > len(data) {
-			break // truncated entry
-		}
-
-		payload := data[pos+4 : pos+4+int(payloadLen)]
-		storedCRC := binary.LittleEndian.Uint32(data[pos+4+int(payloadLen):])
-		computedCRC := crc32.ChecksumIEEE(payload)
-
-		if storedCRC != computedCRC {
-			// Corrupt entry — skip to next possible entry.
-			pos++
-			continue
-		}
-
-		var entry JournalEntry
-		if err := json.Unmarshal(payload, &entry); err != nil {
-			pos = frameEnd
-			continue
-		}
-
+	maxSeq := j.seq.Load()
+	scanJournalFrames(data, func(entry JournalEntry, _ []byte) {
 		fn(entry)
 		if entry.Seq > maxSeq {
 			maxSeq = entry.Seq
 		}
-		pos = frameEnd
-	}
-
+	})
 	j.seq.Store(maxSeq)
 	return nil
 }
@@ -161,10 +173,6 @@ func (j *Journal) Compact() error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 
-	if _, err := j.fd.Seek(0, 0); err != nil {
-		return err
-	}
-
 	data, err := os.ReadFile(j.path)
 	if err != nil {
 		return err
@@ -174,31 +182,11 @@ func (j *Journal) Compact() error {
 	// Only entries with Seq <= committedUpTo[path] are safe to discard.
 	// Entries written after the commit must be preserved for recovery.
 	committedUpTo := make(map[string]uint64) // path → max committed seq
-	pos := 0
-	for pos+8 <= len(data) {
-		payloadLen := binary.LittleEndian.Uint32(data[pos : pos+4])
-		frameEnd := pos + 4 + int(payloadLen) + 4
-		if frameEnd > len(data) {
-			break
+	scanJournalFrames(data, func(entry JournalEntry, _ []byte) {
+		if entry.Op == JournalCommit && entry.Seq > committedUpTo[entry.Path] {
+			committedUpTo[entry.Path] = entry.Seq
 		}
-		payload := data[pos+4 : pos+4+int(payloadLen)]
-		storedCRC := binary.LittleEndian.Uint32(data[pos+4+int(payloadLen):])
-		if storedCRC != crc32.ChecksumIEEE(payload) {
-			pos++
-			continue
-		}
-		var entry JournalEntry
-		if err := json.Unmarshal(payload, &entry); err != nil {
-			pos = frameEnd
-			continue
-		}
-		if entry.Op == JournalCommit {
-			if entry.Seq > committedUpTo[entry.Path] {
-				committedUpTo[entry.Path] = entry.Seq
-			}
-		}
-		pos = frameEnd
-	}
+	})
 
 	if len(committedUpTo) == 0 {
 		return nil // nothing to compact
@@ -207,30 +195,12 @@ func (j *Journal) Compact() error {
 	// Second pass: keep frames that are newer than the commit boundary
 	// for their path, and all frames for paths without a commit marker.
 	var kept []byte
-	pos = 0
-	for pos+8 <= len(data) {
-		payloadLen := binary.LittleEndian.Uint32(data[pos : pos+4])
-		frameEnd := pos + 4 + int(payloadLen) + 4
-		if frameEnd > len(data) {
-			break
-		}
-		payload := data[pos+4 : pos+4+int(payloadLen)]
-		storedCRC := binary.LittleEndian.Uint32(data[pos+4+int(payloadLen):])
-		if storedCRC != crc32.ChecksumIEEE(payload) {
-			pos++
-			continue
-		}
-		var entry JournalEntry
-		if err := json.Unmarshal(payload, &entry); err != nil {
-			pos = frameEnd
-			continue
-		}
+	scanJournalFrames(data, func(entry JournalEntry, frame []byte) {
 		boundary, hasCommit := committedUpTo[entry.Path]
 		if !hasCommit || entry.Seq > boundary {
-			kept = append(kept, data[pos:frameEnd]...)
+			kept = append(kept, frame...)
 		}
-		pos = frameEnd
-	}
+	})
 
 	// Rewrite journal file.
 	tmpPath := j.path + ".compact"
@@ -272,7 +242,7 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex) error {
 		return nil
 	}
 
-	latestData := make(map[string]JournalEntry) // path → latest fsync-like entry
+	latestData := make(map[string]JournalEntry) // path → latest fsync entry
 	latestDone := make(map[string]uint64)       // path → latest commit/unlink seq
 	if err := j.Replay(func(e JournalEntry) {
 		switch e.Op {
@@ -280,7 +250,9 @@ func replayJournalIntoPending(j *Journal, idx *PendingIndex) error {
 			if e.Seq > latestDone[e.Path] {
 				latestDone[e.Path] = e.Seq
 			}
-		default:
+		case JournalFsync:
+			// Only fsync frames assert "shadow data is durable"; other ops
+			// (write/rename/mkdir/...) must not resurrect pending uploads.
 			if prev, ok := latestData[e.Path]; !ok || e.Seq > prev.Seq {
 				latestData[e.Path] = e
 			}

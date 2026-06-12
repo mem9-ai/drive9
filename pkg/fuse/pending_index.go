@@ -223,14 +223,15 @@ func (idx *PendingIndex) RenamePending(oldPath, newPath string) bool {
 // entry under newPath on disk while oldPath stays authoritative in memory and
 // on disk. With both .meta files durable, a crash leaves the data reachable
 // no matter whether the shadow file has moved yet — recovery prunes whichever
-// side has no shadow. Returns the prepared meta for CommitRename, or ok=false
-// when there is no pending entry for oldPath.
-func (idx *PendingIndex) PrepareRename(oldPath, newPath string) (*WriteBackMeta, bool) {
+// side has no shadow. Returns the prepared meta for CommitRename, nil meta
+// (with nil error) when there is no pending entry for oldPath, and a non-nil
+// error when persisting the prepared meta fails.
+func (idx *PendingIndex) PrepareRename(oldPath, newPath string) (*WriteBackMeta, error) {
 	idx.mu.RLock()
 	meta, ok := idx.items[oldPath]
 	if !ok {
 		idx.mu.RUnlock()
-		return nil, false
+		return nil, nil
 	}
 	gen := idx.nextGen.Add(1)
 	newMeta := &WriteBackMeta{
@@ -249,12 +250,12 @@ func (idx *PendingIndex) PrepareRename(oldPath, newPath string) (*WriteBackMeta,
 
 	metaBytes, err := json.Marshal(newMeta)
 	if err != nil {
-		return nil, false
+		return nil, fmt.Errorf("marshal prepared meta for %s: %w", newPath, err)
 	}
 	if err := atomicWrite(filepath.Join(idx.dir, hashPath(newPath)+".meta"), metaBytes); err != nil {
-		return nil, false
+		return nil, fmt.Errorf("persist prepared meta for %s: %w", newPath, err)
 	}
-	return newMeta, true
+	return newMeta, nil
 }
 
 // CommitRename completes a rename prepared by PrepareRename after the shadow

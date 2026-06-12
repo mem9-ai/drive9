@@ -467,10 +467,15 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	// unlinked path from earlier fsync frames, and so those frames compact.
 	// Only when local pending state existed, to avoid a WAL frame per unlink.
 	if hadLocal && cq.journal != nil {
-		_ = cq.journal.Append(JournalEntry{
+		// Best effort: a lost marker only means recovery re-checks a path
+		// whose shadow/.meta are already gone, which the pending-index
+		// prune discards. Log so persistent WAL write failures surface.
+		if err := cq.journal.Append(JournalEntry{
 			Op:   JournalCommit,
 			Path: path,
-		})
+		}); err != nil {
+			log.Printf("commit queue: journal cancel marker failed for %s: %v", path, err)
+		}
 	}
 }
 
@@ -530,10 +535,12 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 			cq.index.Remove(p)
 		}
 		if cq.journal != nil {
-			_ = cq.journal.Append(JournalEntry{
+			if err := cq.journal.Append(JournalEntry{
 				Op:   JournalCommit,
 				Path: p,
-			})
+			}); err != nil {
+				log.Printf("commit queue: journal cancel marker failed for %s: %v", p, err)
+			}
 		}
 	}
 }
@@ -1042,6 +1049,15 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 		return
 	}
 
+	// Layer mounts upload through layer endpoints; Stat/Read here would
+	// compare against the base FS namespace, so neither the idempotent
+	// check nor LWW can be trusted. Keep layer conflicts terminal.
+	if cq.layerRefSnapshot() != "" {
+		log.Printf("commit queue: auto-resolve unsupported for layer mount, terminal failure for %s", entry.Path)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+
 	// ShadowSpill large files: full-memory ReadAll + bytes.Equal would OOM
 	// for multi-GiB files, so no LWW. But the idempotent case (crash after
 	// upload completed, before the local cleanup — the common large-file
@@ -1186,6 +1202,13 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entry *CommitEntry) {
 
 	buf := make([]byte, shadowSpillCompareChunk)
 	for off := int64(0); off < localSize; off += shadowSpillCompareChunk {
+		// Chunk-boundary cancel check bounds wasted work on multi-GiB
+		// compares when the file is unlinked mid-resolve.
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled mid-compare)", entry.Path)
+			return
+		}
 		n := int64(shadowSpillCompareChunk)
 		if off+n > localSize {
 			n = localSize - off
@@ -1257,10 +1280,12 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
 		}
 	}
 	if cq.journal != nil {
-		_ = cq.journal.Append(JournalEntry{
+		if err := cq.journal.Append(JournalEntry{
 			Op:   JournalCommit, // treated as "done" so recovery won't re-enqueue
 			Path: entry.Path,
-		})
+		}); err != nil {
+			log.Printf("commit queue: journal done marker failed for %s: %v", entry.Path, err)
+		}
 	}
 
 	// Remove from queue AFTER all cleanup so WaitPath sees the entry

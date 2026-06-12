@@ -462,6 +462,7 @@ require_cmd curl
 require_cmd jq
 require_cmd python3
 require_cmd go
+require_cmd make
 
 if [ "$(uname -s)" != "Linux" ] && [ "$(uname -s)" != "Darwin" ]; then
   skip_or_fail "unsupported OS for this workload"
