@@ -24,6 +24,13 @@ GIT_OPS_HYDRATE="${GIT_OPS_HYDRATE:-off}"
 GIT_OPS_KEEP_ARTIFACTS="${GIT_OPS_KEEP_ARTIFACTS:-0}"
 GIT_OPS_TRACE_GIT="${GIT_OPS_TRACE_GIT:-0}"
 GIT_OPS_LOG_AUDIT_PATTERN="${GIT_OPS_LOG_AUDIT_PATTERN:-panic|fatal error|short read|input/output error}"
+GIT_OPS_FIXTURE_TREE_FILES="${GIT_OPS_FIXTURE_TREE_FILES:-128}"
+GIT_OPS_REFRESH_GUARD="${GIT_OPS_REFRESH_GUARD:-1}"
+GIT_OPS_REFRESH_BUDGET_BASE="${GIT_OPS_REFRESH_BUDGET_BASE:-20}"
+GIT_OPS_REFRESH_BUDGET_PER_SEC="${GIT_OPS_REFRESH_BUDGET_PER_SEC:-6}"
+GIT_OPS_FORCED_REFRESH_BUDGET_BASE="${GIT_OPS_FORCED_REFRESH_BUDGET_BASE:-10}"
+GIT_OPS_FORCED_REFRESH_BUDGET_PER_SEC="${GIT_OPS_FORCED_REFRESH_BUDGET_PER_SEC:-3}"
+GIT_OPS_STATUS_SETTLE_TIMEOUT_S="${GIT_OPS_STATUS_SETTLE_TIMEOUT_S:-60}"
 
 export GIT_ALLOW_PROTOCOL="${GIT_ALLOW_PROTOCOL:-file:https:http:ssh}"
 
@@ -419,9 +426,72 @@ EOF
 prepare_fixture() {
   FIXTURE_ROOT="$RUN_ROOT/fixture"
   local json
-  json="$(python3 "$SCRIPT_DIR/git_fixture.py" "$FIXTURE_ROOT" --force)"
+  json="$(python3 "$SCRIPT_DIR/git_fixture.py" "$FIXTURE_ROOT" --force --tree-files "$GIT_OPS_FIXTURE_TREE_FILES")"
   FIXTURE_URL="$(jq -r '.file_url' <<<"$json")"
   test -n "$FIXTURE_URL"
+}
+
+check_workspace_refresh_budget() {
+  local desc="$1"
+  local log_file="$2"
+  if [ "$GIT_OPS_REFRESH_GUARD" != "1" ]; then
+    return 0
+  fi
+  TOTAL=$((TOTAL + 1))
+  local out rc
+  set +e
+  out=$(python3 - "$log_file" \
+    "$GIT_OPS_REFRESH_BUDGET_BASE" "$GIT_OPS_REFRESH_BUDGET_PER_SEC" \
+    "$GIT_OPS_FORCED_REFRESH_BUDGET_BASE" "$GIT_OPS_FORCED_REFRESH_BUDGET_PER_SEC" <<'PY'
+import re
+import sys
+
+log_path = sys.argv[1]
+refresh_base, refresh_per_sec = int(sys.argv[2]), int(sys.argv[3])
+forced_base, forced_per_sec = int(sys.argv[4]), int(sys.argv[5])
+
+UNIT_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 1e-3, "µs": 1e-6, "us": 1e-6, "ns": 1e-9}
+
+
+def parse_duration(text):
+    total = 0.0
+    for m in re.finditer(r"([0-9.]+)(h|ms|m|s|µs|us|ns)", text):
+        total += float(m.group(1)) * UNIT_SECONDS[m.group(2)]
+    return total
+
+
+uptime = refresh = forced = None
+with open(log_path, "r", errors="replace") as handle:
+    for line in handle:
+        m = re.search(r"drive9: FUSE perf summary uptime=(\S+)", line)
+        if m:
+            uptime = parse_duration(m.group(1))
+        m = re.search(r"drive9: perf git_workspace refresh=(\d+) forced_refresh=(\d+)", line)
+        if m:
+            refresh, forced = int(m.group(1)), int(m.group(2))
+
+if uptime is None or refresh is None or forced is None:
+    print(f"perf summary not found in {log_path} (uptime={uptime} refresh={refresh} forced={forced})")
+    raise SystemExit(2)
+
+seconds = int(uptime) + 1
+refresh_budget = refresh_base + refresh_per_sec * seconds
+forced_budget = forced_base + forced_per_sec * seconds
+print(
+    f"uptime={uptime:.1f}s refresh={refresh}/{refresh_budget} forced={forced}/{forced_budget}"
+)
+raise SystemExit(0 if refresh <= refresh_budget and forced <= forced_budget else 1)
+PY
+  )
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    echo "PASS $desc ($out)"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL $desc ($out)" >&2
+    FAIL=$((FAIL + 1))
+  fi
 }
 
 configure_git_identity() {
@@ -491,6 +561,33 @@ capture_git_state() {
   cat "$repo/untracked.txt" > "$out_dir/untracked-content.txt"
 }
 
+# Blobless workspaces register real files asynchronously after checkout. Wait for
+# the restored working tree view to settle before comparing the full porcelain
+# status snapshot, otherwise CI can observe transient "deleted" entries.
+wait_restored_status_settled() {
+  local repo="$1"
+  local expected="$2"
+  local start
+  start=$(date +%s)
+  local deadline=$(( start + GIT_OPS_STATUS_SETTLE_TIMEOUT_S ))
+  local out waited=0
+  while :; do
+    out="$(git_cmd -C "$repo" status --porcelain=v1 --untracked-files=all 2>/dev/null || true)"
+    if [ "$out" = "$(cat "$expected" 2>/dev/null)" ]; then
+      if [ "$waited" = "1" ]; then
+        echo "INFO restored status settled after $(( $(date +%s) - start ))s"
+      fi
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "INFO restored status did not settle within ${GIT_OPS_STATUS_SETTLE_TIMEOUT_S}s" >&2
+      return 0
+    fi
+    waited=1
+    sleep 1
+  done
+}
+
 verify_restored_git_state() {
   local repo="$1"
   local state_dir="$2"
@@ -499,6 +596,7 @@ verify_restored_git_state() {
   mkdir -p "$actual_dir"
 
   check_cmd "restored repo ready" assert_repo_ready "$repo"
+  wait_restored_status_settled "$repo" "$state_dir/status.txt"
   if ! capture_git_state "$repo" "$actual_dir"; then
     check_cmd "restored git state capture" false
     return 0
@@ -592,9 +690,11 @@ run_case() {
 
   if [ "$use_native_pack" = "1" ]; then
     stop_mount 1 "$native_pack_archive" "repo/.git"
+    check_workspace_refresh_budget "$slug first mount workspace refresh within budget" "$log_a"
     check_cmd "$slug second mount starts" start_mount "$profile" "$mount_b" "$local_root_b" "$log_b" "$remote_root" 1 "$native_pack_archive"
   else
     stop_mount 1
+    check_workspace_refresh_budget "$slug first mount workspace refresh within budget" "$log_a"
     check_cmd "$slug second mount starts" start_mount "$profile" "$mount_b" "$local_root_b" "$log_b" "$remote_root" 1
   fi
 
@@ -602,6 +702,7 @@ run_case() {
   check_cmd "$slug post-restore commit" commit_after_restore "$repo_b" "$marker"
   check_cmd "$slug second mount log audit" audit_mount_log "$log_b"
   stop_mount 1
+  check_workspace_refresh_budget "$slug second mount workspace refresh within budget" "$log_b"
 }
 
 precheck_fuse() {

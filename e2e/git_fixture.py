@@ -51,7 +51,7 @@ def init_repo(repo: Path) -> None:
     run(repo, "config", "core.filemode", "true")
 
 
-def build_fixture(root: Path) -> dict[str, str]:
+def build_fixture(root: Path, tree_files: int = 0) -> dict[str, str]:
     source = root / "source"
     bare = root / "remote.git"
     if source.exists() or bare.exists():
@@ -67,6 +67,8 @@ def build_fixture(root: Path) -> dict[str, str]:
     write(source / "binary.bin", bytes(range(32)), "wb")
     write(source / ".gitignore", "ignored-build/\n*.tmp\nagent-bench/local-only/\n")
     os.symlink("README.md", source / "link-to-readme")
+    for idx in range(tree_files):
+        write(source / "tree" / f"dir{idx // 16:02d}" / f"file{idx:04d}.txt", f"fixture tree file {idx}\n")
     commit(source, "initial fixture tree")
     run(source, "tag", "v0.1.0")
 
@@ -85,7 +87,7 @@ def build_fixture(root: Path) -> dict[str, str]:
     commit(source, "feature rebase upstream")
 
     run(source, "checkout", "main")
-    run(None, "clone", "--bare", str(source), str(bare))
+    run(None, "clone", "--bare", "--no-local", str(source), str(bare))
     run(bare, "config", "uploadpack.allowFilter", "true")
     run(bare, "config", "uploadpack.allowAnySHA1InWant", "true")
 
@@ -95,6 +97,7 @@ def build_fixture(root: Path) -> dict[str, str]:
         "file_url": bare.resolve().as_uri(),
         "main_branch": "main",
         "tag": "v0.1.0",
+        "tree_files": str(tree_files),
     }
 
 
@@ -144,6 +147,12 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("root", help="empty directory where fixture repositories will be created")
     parser.add_argument("--force", action="store_true", help="remove the root before creating the fixture")
+    parser.add_argument(
+        "--tree-files",
+        type=int,
+        default=0,
+        help="number of extra committed files under tree/ (scales checkout-heavy workloads)",
+    )
     args = parser.parse_args(argv)
 
     root = Path(args.root).resolve()
@@ -154,7 +163,7 @@ def main(argv: list[str]) -> int:
             print(f"refusing to remove fixture root: {exc}", file=sys.stderr)
             return 2
         shutil.rmtree(root)
-    info = build_fixture(root)
+    info = build_fixture(root, tree_files=max(0, args.tree_files))
     print(json.dumps(info, sort_keys=True))
     return 0
 
