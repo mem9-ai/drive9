@@ -8003,12 +8003,31 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 			// Whole-file disk cache tier: survives ReadCache TTL/eviction
 			// so warm reads of small files are served from local disk
 			// instead of re-fetching from the remote.
+			//
+			// When TrustLocalEvents is false (default), revalidate the
+			// inode revision via HEAD before serving a disk cache hit.
+			// Without this check a stale revision from a prior session
+			// would match a persisted disk entry and serve outdated bytes
+			// after another client updates the file remotely — the same
+			// guard the range disk-cache path applies below.
 			if diskKeyOK {
 				if cached, ok := fs.diskReadCache.Get(diskKey); ok {
+					if !fs.statCacheTrustedAndVerified() && !revalidatedForRead {
+						refreshed, headErr := fs.revalidateReadCacheEntryIfUntrusted(cancel, p, entry)
+						if headErr != nil {
+							return nil, headErr
+						}
+						if refreshed.Revision != entry.Revision {
+							// Revision changed — disk entry is stale; fall
+							// through to fetch fresh data from the remote.
+							goto wholeFileDiskCacheMiss
+						}
+					}
 					fs.readCache.PutOwned(p, cached, cacheRev)
 					return cached, nil
 				}
 			}
+		wholeFileDiskCacheMiss:
 			// Use a detached context for the shared HTTP fetch so that
 			// cancellation of the owner's FUSE request does not fail
 			// piggybacking readers. Apply a fresh bounded timeout so the
