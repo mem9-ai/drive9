@@ -31,7 +31,7 @@ jobs:
       contents: read
 
     steps:
-      - name: Configure AWS credentials (ap-southeast-1)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ASSUME_ARN_PROD }}
@@ -88,13 +88,6 @@ jobs:
         run: |
           kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
-
-      - name: Configure AWS credentials (us-east-1)
-        if: inputs.region == 'all' || inputs.region == 'aws-us-east-1'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ASSUME_ARN_US }}
-          aws-region: us-east-1
 
       - name: Deploy to us-east-1
         id: deploy-us
