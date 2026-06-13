@@ -122,8 +122,8 @@ jobs:
       - name: Push image to Alibaba Cloud ACR
         if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
         run: |
-          # Install aliyun CLI
           curl -fsSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz | tar xz -C /usr/local/bin
+          aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin "${{ env.ECR_REGISTRY }}"
           docker pull "$IMAGE"
           TAG=$(echo "$IMAGE" | awk -F: '{print $NF}')
           ACR_IMAGE="${{ secrets.ALIYUN_ACR_REGISTRY }}/${{ secrets.ALIYUN_ACR_NAMESPACE }}/${{ env.ECR_REPOSITORY }}:$TAG"
@@ -149,5 +149,7 @@ jobs:
       - name: Rollback Alibaba Cloud on failure
         if: failure() && steps.deploy-alicloud.outcome == 'failure'
         run: |
-          kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
-            rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
+          if [ -f ~/.kube/alicloud-config ]; then
+            kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
+              rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
+          fi
