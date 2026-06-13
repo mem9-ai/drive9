@@ -1,9 +1,0 @@
-.local/
-cache/
-drive9-local-s3/
-local/
-mounts/
-prewarm/
-results/
-results-ec2/
-work/
