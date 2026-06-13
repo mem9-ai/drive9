@@ -143,7 +143,7 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	}()
 
 	if err := deps.replaceExecutable(tmpPath, target); err != nil {
-		return fmt.Errorf("replace %s: %w\nIf this binary is owned by another user, rerun with sufficient permissions or install drive9 into a user-writable directory.", target, err)
+		return fmt.Errorf("replace %s: %w; rerun with sufficient permissions or install drive9 into a user-writable directory", target, err)
 	}
 	installed = true
 
