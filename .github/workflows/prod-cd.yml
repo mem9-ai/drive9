@@ -117,7 +117,6 @@ jobs:
         with:
           role-to-assume: ${{ secrets.ALIYUN_ASSUME_ROLE_ARN }}
           oidc-provider-arn: ${{ secrets.ALIYUN_OIDC_PROVIDER_ARN }}
-          region: ap-southeast-1
 
       - name: Push image to alicloud-ap-southeast-1 ACR
         if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
