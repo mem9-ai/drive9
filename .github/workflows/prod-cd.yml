@@ -67,7 +67,7 @@ jobs:
           echo "Promoting image: $IMAGE"
           printf '%s=%s\n' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
 
-      - name: Deploy to ap-southeast-1
+      - name: Deploy to aws-ap-southeast-1
         id: deploy-sg
         if: inputs.region == 'all' || inputs.region == 'aws-ap-southeast-1'
         run: |
@@ -83,13 +83,13 @@ jobs:
             rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
             --timeout=180s
 
-      - name: Rollback ap-southeast-1 on failure
+      - name: Rollback aws-ap-southeast-1 on failure
         if: failure() && steps.deploy-sg.outcome == 'failure'
         run: |
           kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
 
-      - name: Deploy to us-east-1
+      - name: Deploy to aws-us-east-1
         id: deploy-us
         if: inputs.region == 'all' || inputs.region == 'aws-us-east-1'
         run: |
@@ -105,7 +105,7 @@ jobs:
             rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
             --timeout=180s
 
-      - name: Rollback us-east-1 on failure
+      - name: Rollback aws-us-east-1 on failure
         if: failure() && steps.deploy-us.outcome == 'failure'
         run: |
           kubectl --context us -n "${{ env.DEPLOY_NAMESPACE }}" \
@@ -119,7 +119,7 @@ jobs:
           oidc-provider-arn: ${{ secrets.ALIYUN_OIDC_PROVIDER_ARN }}
           region: ap-southeast-1
 
-      - name: Push image to Alibaba Cloud ACR
+      - name: Push image to alicloud-ap-southeast-1 ACR
         if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
         run: |
           curl -fsSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz | tar xz -C /usr/local/bin
@@ -133,7 +133,7 @@ jobs:
           docker push "$ACR_IMAGE"
           echo "ACR_IMAGE=$ACR_IMAGE" >> "$GITHUB_ENV"
 
-      - name: Deploy to Alibaba Cloud ACK
+      - name: Deploy to alicloud-ap-southeast-1
         id: deploy-alicloud
         if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
         run: |
@@ -146,7 +146,7 @@ jobs:
             rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
             --timeout=180s
 
-      - name: Rollback Alibaba Cloud on failure
+      - name: Rollback alicloud-ap-southeast-1 on failure
         if: failure() && steps.deploy-alicloud.outcome == 'failure'
         run: |
           if [ -f ~/.kube/alicloud-config ]; then
