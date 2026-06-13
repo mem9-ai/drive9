@@ -39,10 +39,13 @@ const updateCheckTimeout = 1 * time.Second
 // affects the version-check fetch URL; the install command shown to the user
 // is always the default public URL.
 //
-// The release workflow (.github/workflows/release-cli.yml) publishes a plain
-// text "version" file at site/releases/version. When this endpoint returns
-// a plain text body (not JSON), we treat it as a version-only response.
-var updateLatestURL = "https://drive9.ai/releases/latest.json"
+// The endpoint may return either:
+//   - A JSON object: {"version":"v0.9.0", "url":"https://..."}
+//   - Plain text: a version string like "v0.9.0\n"
+//
+// Both formats are supported. The version must be valid semver; SHA-only
+// responses are rejected (the checker cannot compare SHA→SHA).
+var updateLatestURL = "https://drive9.ai/releases/version"
 
 // ReleaseInfo holds metadata about a release fetched from the update endpoint.
 type ReleaseInfo struct {
@@ -50,12 +53,13 @@ type ReleaseInfo struct {
 	URL     string `json:"url"`
 }
 
-// updateState persists check/skip state between CLI invocations.
+// updateState persists check/prompt state between CLI invocations.
 type updateState struct {
-	LastCheckedAt  time.Time `json:"last_checked_at"`
-	LatestVersion  string    `json:"latest_version,omitempty"`
-	LatestURL      string    `json:"latest_url,omitempty"`
-	SkippedVersion string    `json:"skipped_version,omitempty"`
+	LastCheckedAt       time.Time `json:"last_checked_at"`
+	LatestVersion       string    `json:"latest_version,omitempty"`
+	LatestURL           string    `json:"latest_url,omitempty"`
+	LastPromptedAt      time.Time `json:"last_prompted_at,omitempty"`
+	LastPromptedVersion string    `json:"last_prompted_version,omitempty"`
 }
 
 // excludedCommands are commands that should never show update prompts,
@@ -115,7 +119,12 @@ func CheckForUpdate(ctx context.Context, currentVersion string) *ReleaseInfo {
 	if state != nil && time.Since(state.LastCheckedAt) < updateCheckTTL {
 		// Use cached version if available and newer.
 		if state.LatestVersion != "" && isUpdateAvailable(state.LatestVersion, currentVersion) {
-			if state.SkippedVersion != "" && state.SkippedVersion == state.LatestVersion {
+			// Throttle the banner: show at most once per TTL per version.
+			// This prevents the notice from appearing on every eligible
+			// command within the 24h window.
+			if state.LastPromptedVersion == state.LatestVersion &&
+				!state.LastPromptedAt.IsZero() &&
+				time.Since(state.LastPromptedAt) < updateCheckTTL {
 				return nil
 			}
 			return &ReleaseInfo{
@@ -135,7 +144,8 @@ func CheckForUpdate(ctx context.Context, currentVersion string) *ReleaseInfo {
 		LastCheckedAt: time.Now().UTC(),
 	}
 	if state != nil {
-		newState.SkippedVersion = state.SkippedVersion
+		newState.LastPromptedAt = state.LastPromptedAt
+		newState.LastPromptedVersion = state.LastPromptedVersion
 	}
 	if rel != nil {
 		newState.LatestVersion = rel.Version
@@ -144,11 +154,6 @@ func CheckForUpdate(ctx context.Context, currentVersion string) *ReleaseInfo {
 	writeUpdateState(stateFilePath, newState)
 
 	if rel == nil {
-		return nil
-	}
-
-	// Check if this version should be skipped.
-	if newState.SkippedVersion != "" && newState.SkippedVersion == rel.Version {
 		return nil
 	}
 
@@ -216,6 +221,23 @@ func PrintUpdateNotice(rel *ReleaseInfo, currentVersion string) {
 	}
 	fmt.Fprintln(os.Stderr, bot)
 	fmt.Fprintln(os.Stderr)
+}
+
+// MarkUpdatePrompted records that the update banner was shown for the given
+// version. This prevents the banner from repeating on every eligible command
+// within the TTL window — it will only appear once per version per TTL.
+func MarkUpdatePrompted(version string) {
+	path := updateStateFilePath()
+	if path == "" {
+		return
+	}
+	state := readUpdateState(path)
+	if state == nil {
+		state = &updateState{}
+	}
+	state.LastPromptedAt = time.Now().UTC()
+	state.LastPromptedVersion = version
+	writeUpdateState(path, state)
 }
 
 // --- Internal helpers ---
