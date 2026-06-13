@@ -138,7 +138,7 @@ jobs:
         if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
         run: |
           mkdir -p ~/.kube
-          aliyun --profile github-actions cs GET "/k8s/c4dad0ecde1e94472a36fec0498e181ed/user_config" --region ap-southeast-1 | jq -r '.config' | base64 -d > ~/.kube/alicloud-config
+          aliyun --profile github-actions cs GET "/k8s/c4dad0ecde1e94472a36fec0498e181ed/user_config" --region ap-southeast-1 | jq -r '.config' > ~/.kube/alicloud-config
           kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
             set image "deployment/${{ env.K8S_DEPLOYMENT }}" \
             "${{ env.K8S_DEPLOYMENT }}=$ACR_IMAGE"
