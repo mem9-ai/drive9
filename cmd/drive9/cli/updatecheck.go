@@ -1,26 +1,25 @@
 // Package cli provides the Drive9 CLI implementation.
 //
 // updatecheck.go implements a non-blocking CLI update checker inspired by
-// gh CLI (github.com/cli/cli). It checks for newer Drive9 releases and
-// optionally prompts the user after command execution completes.
+// gh CLI (github.com/cli/cli) and npm. It checks for newer Drive9 releases
+// and displays a non-blocking banner after command execution completes.
 //
 // Design principles:
 //   - Never block or delay the user's command.
+//   - Never prompt interactively — display a banner and let the user decide.
 //   - All output goes to stderr; never pollute stdout.
 //   - Silently skip on any failure (network, parse, file I/O).
-//   - Only prompt on interactive TTY; CI and scripts see nothing.
+//   - Only show on interactive TTY; CI and scripts see nothing.
 //   - Use semver comparison, never string comparison.
 package cli
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -169,41 +168,53 @@ func isUpdateAvailable(latest, current string) bool {
 	return isNewerVersion(latest, current)
 }
 
-// PrintUpdateNotice displays the update notice on stderr after
-// command execution. If stdin is a TTY, offers interactive choices.
+// PrintUpdateNotice displays a non-blocking update banner on stderr after
+// command execution completes. The banner shows the available version and
+// the command to run — it never prompts or waits for user input.
+//
+// Style follows the npm/gh CLI pattern: a visible box that doesn't interrupt
+// the user's workflow.
 func PrintUpdateNotice(rel *ReleaseInfo, currentVersion string) {
 	if rel == nil {
 		return
 	}
 
 	installCmd := installCommand()
+	cur := trimV(currentVersion)
+	next := trimV(rel.Version)
 
-	fmt.Fprintf(os.Stderr, "\nA new Drive9 CLI is available: %s → %s\n",
-		trimV(currentVersion), trimV(rel.Version))
-
+	// Build the banner lines.
+	lines := []string{
+		fmt.Sprintf("Update available: %s → %s", cur, next),
+		fmt.Sprintf("Run: %s", installCmd),
+	}
 	if rel.URL != "" {
-		fmt.Fprintf(os.Stderr, "Release notes: %s\n", rel.URL)
+		lines = append(lines, fmt.Sprintf("Release notes: %s", rel.URL))
 	}
 
-	// Interactive prompt only if stdin is also a TTY.
-	if isTerminal(os.Stdin) {
-		fmt.Fprintf(os.Stderr, "\n  1. Update now\n  2. Skip this version\n\nChoose [1/2]: ")
-
-		choice := readChoice(os.Stdin)
-		switch choice {
-		case "1":
-			executeUpdate(installCmd)
-		case "2":
-			skipVersion(rel.Version)
-			fmt.Fprintf(os.Stderr, "Skipped %s. You won't be reminded about this version.\n", trimV(rel.Version))
-		default:
-			// No valid choice (timeout, EOF, etc.) — just show the command.
-			fmt.Fprintf(os.Stderr, "\nTo update later: %s\n", installCmd)
+	// Calculate box width (widest line + 4 for "│  " + "  │" padding).
+	maxLen := 0
+	for _, l := range lines {
+		if len(l) > maxLen {
+			maxLen = len(l)
 		}
-	} else {
-		// Non-interactive: just print the update command.
-		fmt.Fprintf(os.Stderr, "To update: %s\n", installCmd)
 	}
+	width := maxLen + 4 // 2 chars padding on each side
+
+	// Draw the box.
+	top := "╭" + strings.Repeat("─", width) + "╮"
+	bot := "╰" + strings.Repeat("─", width) + "╯"
+
+	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(os.Stderr, top)
+	for _, l := range lines {
+		pad := width - len(l) - 2 // subtract left padding "  "
+		if pad < 0 {
+			pad = 0
+		}
+		fmt.Fprintf(os.Stderr, "│  %s%s│\n", l, strings.Repeat(" ", pad))
+	}
+	fmt.Fprintln(os.Stderr, bot)
 	fmt.Fprintln(os.Stderr)
 }
 
@@ -245,7 +256,7 @@ func isSHAVersion(v string) bool {
 		return false
 	}
 	for _, c := range v {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
@@ -367,16 +378,25 @@ func fetchLatestRelease(ctx context.Context) *ReleaseInfo {
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil
 	}
 
-	var rel ReleaseInfo
-	if err := json.NewDecoder(resp.Body).Decode(&rel); err != nil {
+	// Try JSON first; fall back to plain text version string.
+	// The release workflow publishes either a JSON object with
+	// {"version":"...", "url":"..."} or a plain text version file.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil || len(body) == 0 {
 		return nil
+	}
+
+	var rel ReleaseInfo
+	if err := json.Unmarshal(body, &rel); err != nil {
+		// Plain text fallback: treat the entire body as a version string.
+		rel.Version = strings.TrimSpace(string(body))
 	}
 
 	if rel.Version == "" {
@@ -389,56 +409,6 @@ func fetchLatestRelease(ctx context.Context) *ReleaseInfo {
 	}
 
 	return &rel
-}
-
-func readChoice(r io.Reader) string {
-	scanner := bufio.NewScanner(r)
-	if scanner.Scan() {
-		return strings.TrimSpace(scanner.Text())
-	}
-	return ""
-}
-
-func executeUpdate(installCmd string) {
-	fmt.Fprintf(os.Stderr, "\nWill run: %s\n", installCmd)
-	fmt.Fprintf(os.Stderr, "Press Enter to continue, or Ctrl+C to cancel...")
-
-	// Wait for Enter (second confirmation).
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Scan()
-
-	fmt.Fprintln(os.Stderr)
-
-	// Build the command in a platform-safe way. The install URL is a
-	// compile-time constant (installScriptURL), not user/env input,
-	// so shell injection is not a concern. We still use the platform
-	// shell to support the pipe, which is the standard install pattern.
-	var cmd *exec.Cmd
-	if isWindows() {
-		cmd = exec.Command("powershell", "-Command",
-			fmt.Sprintf("irm %s | iex", installScriptURL()))
-	} else {
-		cmd = exec.Command("sh", "-c",
-			fmt.Sprintf("curl -fsSL %s | sh", installScriptURL()))
-	}
-	cmd.Stdout = os.Stderr // Update output goes to stderr
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	if err := cmd.Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "Update failed: %v\n", err)
-		fmt.Fprintf(os.Stderr, "You can try manually: %s\n", installCmd)
-	}
-}
-
-func skipVersion(version string) {
-	path := updateStateFilePath()
-	state := readUpdateState(path)
-	if state == nil {
-		state = &updateState{}
-	}
-	state.SkippedVersion = version
-	writeUpdateState(path, state)
 }
 
 // isWindows reports whether the current platform is Windows.
