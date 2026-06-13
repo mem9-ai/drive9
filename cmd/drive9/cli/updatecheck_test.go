@@ -259,6 +259,30 @@ func TestCheckForUpdate_InvalidJSON(t *testing.T) {
 	}
 }
 
+func TestCheckForUpdate_PlainTextVersion(t *testing.T) {
+	// The release workflow may publish a plain text "version" file instead
+	// of JSON. fetchLatestRelease should fall back to treating the body as
+	// a version string.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("v0.9.0\n"))
+	}))
+	defer srv.Close()
+
+	withTempState(t)
+	old := updateLatestURL
+	updateLatestURL = srv.URL
+	defer func() { updateLatestURL = old }()
+
+	result := CheckForUpdate(context.Background(), "v0.8.1")
+	if result == nil {
+		t.Fatalf("expected non-nil result for plain text version")
+	}
+	if result.Version != "v0.9.0" {
+		t.Fatalf("got version %q, want %q", result.Version, "v0.9.0")
+	}
+}
+
 func TestCheckForUpdate_EmptyBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -566,51 +590,38 @@ func TestPrintUpdateNotice_NonInteractive(t *testing.T) {
 	rel := &ReleaseInfo{Version: "v0.9.0", URL: "https://example.com"}
 	PrintUpdateNotice(rel, "v0.8.1")
 
-	w.Close()
+	_ = w.Close()
 	buf := make([]byte, 4096)
 	n, _ := r.Read(buf)
 	output := string(buf[:n])
 
+	// Banner must show current and latest versions.
 	if !strings.Contains(output, "0.8.1") {
-		t.Fatalf("expected output to contain %q, got %q", "0.8.1", output)
+		t.Fatalf("expected output to contain current version %q, got %q", "0.8.1", output)
 	}
 	if !strings.Contains(output, "0.9.0") {
-		t.Fatalf("expected output to contain %q, got %q", "0.9.0", output)
+		t.Fatalf("expected output to contain latest version %q, got %q", "0.9.0", output)
 	}
-	if !strings.Contains(output, "To update:") {
-		t.Fatalf("expected output to contain %q, got %q", "To update:", output)
+	// Non-blocking box banner: must contain box drawing characters and
+	// the "Update available:" / "Run:" lines.
+	if !strings.Contains(output, "Update available:") {
+		t.Fatalf("expected output to contain %q, got %q", "Update available:", output)
 	}
-	// Should NOT contain interactive choices.
-	if strings.Contains(output, "Choose [1/2]") {
-		t.Fatalf("non-interactive output should not contain interactive choices, got %q", output)
+	if !strings.Contains(output, "Run:") {
+		t.Fatalf("expected output to contain %q, got %q", "Run:", output)
+	}
+	if !strings.Contains(output, "╭") || !strings.Contains(output, "╰") {
+		t.Fatalf("expected box drawing characters in output, got %q", output)
+	}
+	// Release notes URL should be included.
+	if !strings.Contains(output, "Release notes:") {
+		t.Fatalf("expected output to contain release notes URL, got %q", output)
 	}
 }
 
 func TestPrintUpdateNotice_Nil(t *testing.T) {
 	// Should not panic.
 	PrintUpdateNotice(nil, "v0.8.1")
-}
-
-func TestReadChoice(t *testing.T) {
-	tests := []struct {
-		input string
-		want  string
-	}{
-		{"1\n", "1"},
-		{"2\n", "2"},
-		{" 1 \n", "1"},
-		{"\n", ""},
-		{"", ""},
-	}
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			r := strings.NewReader(tt.input)
-			got := readChoice(r)
-			if got != tt.want {
-				t.Fatalf("readChoice(%q) = %q, want %q", tt.input, got, tt.want)
-			}
-		})
-	}
 }
 
 func TestAtomicStateWrite(t *testing.T) {
@@ -646,21 +657,6 @@ func TestAtomicStateWrite(t *testing.T) {
 		if strings.Contains(e.Name(), ".tmp") {
 			t.Fatalf("temp file %s should be cleaned up", e.Name())
 		}
-	}
-}
-
-func TestSkipVersion(t *testing.T) {
-	stateDir := withTempState(t)
-
-	skipVersion("v0.9.0")
-
-	path := filepath.Join(stateDir, "drive9", "update-check.json")
-	state := readUpdateState(path)
-	if state == nil {
-		t.Fatalf("expected non-nil state after skipVersion")
-	}
-	if state.SkippedVersion != "v0.9.0" {
-		t.Fatalf("got SkippedVersion %q, want %q", state.SkippedVersion, "v0.9.0")
 	}
 }
 
