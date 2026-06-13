@@ -111,7 +111,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	foreground := fs.Bool("foreground", false, "run in the foreground and block until unmounted")
 	cacheDir := fs.String("cache-dir", "", "write-back cache directory (default ~/.cache/drive9)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
-	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 1, "maximum single file size admitted to read cache in MB")
+	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 4, "maximum single file size admitted to read cache in MB; files at or below this size are fetched with a single whole-file request")
 	diskReadCacheSize := fs.Int64("disk-read-cache-size-mb", 1024, "disk-backed read cache size in MB")
 	diskReadCacheFreeRatio := fs.Float64("disk-read-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before disk read cache evicts")
 	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
