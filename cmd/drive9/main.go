@@ -18,6 +18,7 @@
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
 //	doctor  diagnose local drive9 runtime prerequisites
+//	update  update the drive9 CLI binary in place
 package main
 
 import (
@@ -25,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/pprof"
+	"strings"
 	"sync"
 
 	"go.uber.org/zap"
@@ -52,6 +54,7 @@ var packHandler = cli.PackCommand
 var unpackHandler = cli.UnpackCommand
 var profileHandler = cli.Profile
 var umountHandler = cli.UmountCmd
+var updateHandler = cli.Update
 
 func main() {
 	if logger.CLIEnabled() {
@@ -77,6 +80,7 @@ func main() {
 	}
 
 	dispatch(os.Args[1], os.Args[2:])
+	maybeNotifyUpdate(os.Args[1])
 }
 
 // dispatch routes a parsed (verb, args) pair to the matching command handler.
@@ -229,6 +233,13 @@ func dispatch(cmd string, args []string) {
 		if err := doctorHandler(args); err != nil {
 			fatal("doctor", err)
 		}
+	case "update":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "update"))
+		}
+		if err := updateHandler(args); err != nil {
+			fatal("update", err)
+		}
 	default:
 		if cliLogger != nil {
 			logger.Warn(context.Background(), "cli_unknown_command", zap.String("command", cmd))
@@ -332,11 +343,29 @@ func fatal(cmd string, err error) {
 		logger.Error(context.Background(), "cli_command_failed", zap.String("command", cmd), zap.Error(err))
 	}
 	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, err)
+	maybeNotifyUpdate(primaryCommand(cmd))
 	type exitCoder interface{ ExitCode() int }
 	if ec, ok := err.(exitCoder); ok && ec.ExitCode() > 0 {
 		exitWithCode(ec.ExitCode())
 	}
 	exitWithCode(1)
+}
+
+func primaryCommand(cmd string) string {
+	fields := strings.Fields(cmd)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+func maybeNotifyUpdate(cmd string) {
+	switch primaryCommand(cmd) {
+	case "", "update", "version", "--version", "-v", "help", "--help", "-help", "-h":
+		return
+	default:
+		cli.MaybeNotifyUpdate(buildinfo.Version)
+	}
 }
 
 func usage(code int) {
@@ -375,7 +404,8 @@ func usage(code int) {
 			"  mount vault [flags] <mountpoint>\n"+
 			"                         mount vault secrets read-only\n"+
 			"  umount <mountpoint>    unmount a drive9 mount\n"+
-			"  doctor fuse            diagnose local FUSE prerequisites\n\n"+
+			"  doctor fuse            diagnose local FUSE prerequisites\n"+
+			"  update [--check]       update drive9 CLI in place\n\n"+
 			"global:\n"+
 			"  -h, --help, help       show this help\n"+
 			"  -v, --version, version print version information\n",
