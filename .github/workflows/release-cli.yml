@@ -1,6 +1,9 @@
 name: Release CLI binaries
 
 on:
+  push:
+    tags:
+      - 'v[0-9]*'
   workflow_run:
     workflows: ["Deploy server to prod"]
     types:
@@ -14,7 +17,7 @@ concurrency:
 jobs:
   release:
     name: Build and publish CLI
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
@@ -36,8 +39,14 @@ jobs:
 
       - name: Determine version
         run: |
-          SOURCE_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
-          VERSION="${SOURCE_SHA::7}"
+          # Prefer semver tag (e.g. v0.9.0) when triggered by a tag push.
+          # Fall back to short SHA for workflow_run / workflow_dispatch builds.
+          if [[ "${{ github.ref_type }}" == "tag" && "${{ github.ref_name }}" =~ ^v[0-9] ]]; then
+            VERSION="${{ github.ref_name }}"
+          else
+            SOURCE_SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+            VERSION="${SOURCE_SHA::7}"
+          fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Build CLI for all platforms
