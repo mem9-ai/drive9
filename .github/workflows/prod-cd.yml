@@ -112,7 +112,7 @@ jobs:
             rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
 
       - name: Configure Alibaba Cloud credentials
-        if: inputs.region == 'all' || inputs.region == 'aws-ap-southeast-1' || inputs.region == 'alicloud-ap-southeast-1'
+        if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
         uses: aliyun/configure-aliyun-credentials-action@v1
         with:
           role-to-assume: ${{ secrets.ALIYUN_ASSUME_ROLE_ARN }}
@@ -120,7 +120,7 @@ jobs:
           region: ap-southeast-1
 
       - name: Push image to Alibaba Cloud ACR
-        if: inputs.region == 'all' || inputs.region == 'aws-ap-southeast-1' || inputs.region == 'alicloud-ap-southeast-1'
+        if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
         run: |
           # Install aliyun CLI
           curl -fsSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz | tar xz -C /usr/local/bin
@@ -135,19 +135,19 @@ jobs:
 
       - name: Deploy to Alibaba Cloud ACK
         id: deploy-alicloud
-        if: inputs.region == 'all' || inputs.region == 'aws-ap-southeast-1' || inputs.region == 'alicloud-ap-southeast-1'
+        if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
         run: |
-          # Fetch kubeconfig dynamically from ACK
-          aliyun cs GET "/k8s/${{ secrets.ALIYUN_ACK_CLUSTER_ID }}/user_config" --region ap-southeast-1 | jq -r '.config' | base64 -d > ~/.kube/config
-          kubectl -n "${{ env.DEPLOY_NAMESPACE }}" \
+          mkdir -p ~/.kube
+          aliyun cs GET "/k8s/${{ secrets.ALIYUN_ACK_CLUSTER_ID }}/user_config" --region ap-southeast-1 | jq -r '.config' | base64 -d > ~/.kube/alicloud-config
+          kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
             set image "deployment/${{ env.K8S_DEPLOYMENT }}" \
             "${{ env.K8S_DEPLOYMENT }}=$ACR_IMAGE"
-          kubectl -n "${{ env.DEPLOY_NAMESPACE }}" \
+          kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
             --timeout=180s
 
       - name: Rollback Alibaba Cloud on failure
         if: failure() && steps.deploy-alicloud.outcome == 'failure'
         run: |
-          kubectl -n "${{ env.DEPLOY_NAMESPACE }}" \
+          kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
