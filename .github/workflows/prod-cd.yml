@@ -122,12 +122,13 @@ jobs:
         if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
         run: |
           curl -fsSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz | tar xz -C /usr/local/bin
+          aliyun configure set --region ap-southeast-1 --access-key-id "$ALIBABA_CLOUD_ACCESS_KEY_ID" --access-key-secret "$ALIBABA_CLOUD_ACCESS_KEY_SECRET" --sts-token "$ALIBABA_CLOUD_SECURITY_TOKEN" --mode StsToken --profile github-actions
           aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin "${{ env.ECR_REGISTRY }}"
           docker pull "$IMAGE"
           TAG=$(echo "$IMAGE" | awk -F: '{print $NF}')
           ACR_IMAGE="${{ secrets.ALIYUN_ACR_REGISTRY }}/${{ secrets.ALIYUN_ACR_NAMESPACE }}/${{ env.ECR_REPOSITORY }}:$TAG"
           docker tag "$IMAGE" "$ACR_IMAGE"
-          AUTH=$(aliyun cr GetAuthorizationToken --InstanceId "${{ secrets.ALIYUN_ACR_INSTANCE_ID }}" --RegionId ap-southeast-1 | jq -r '.AuthorizationToken')
+          AUTH=$(aliyun --profile github-actions cr GetAuthorizationToken --InstanceId "${{ secrets.ALIYUN_ACR_INSTANCE_ID }}" --RegionId ap-southeast-1 | jq -r '.AuthorizationToken')
           echo "$AUTH" | docker login --username=cr_temp_user --password-stdin "${{ secrets.ALIYUN_ACR_REGISTRY }}"
           docker push "$ACR_IMAGE"
           echo "ACR_IMAGE=$ACR_IMAGE" >> "$GITHUB_ENV"
@@ -137,7 +138,7 @@ jobs:
         if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
         run: |
           mkdir -p ~/.kube
-          aliyun cs GET "/k8s/c4dad0ecde1e94472a36fec0498e181ed/user_config" --region ap-southeast-1 | jq -r '.config' | base64 -d > ~/.kube/alicloud-config
+          aliyun --profile github-actions cs GET "/k8s/c4dad0ecde1e94472a36fec0498e181ed/user_config" --region ap-southeast-1 | jq -r '.config' | base64 -d > ~/.kube/alicloud-config
           kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
             set image "deployment/${{ env.K8S_DEPLOYMENT }}" \
             "${{ env.K8S_DEPLOYMENT }}=$ACR_IMAGE"
