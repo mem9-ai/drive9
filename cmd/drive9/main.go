@@ -98,6 +98,7 @@ func main() {
 		case rel := <-updateResultCh:
 			if rel != nil {
 				cli.PrintUpdateNotice(rel, buildinfo.Version)
+				cli.MarkUpdatePrompted(rel.Version)
 			}
 		default:
 		}

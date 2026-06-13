@@ -434,40 +434,40 @@ func TestCheckForUpdate_TTLRespected(t *testing.T) {
 	}
 }
 
-func TestCheckForUpdate_SkippedVersion(t *testing.T) {
+func TestCheckForUpdate_PromptThrottle_SuppressesRepeat(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(ReleaseInfo{Version: "v0.9.0"})
 	}))
 	defer srv.Close()
 
-	stateDir := withTempState(t)
+	withTempState(t)
 	old := updateLatestURL
 	updateLatestURL = srv.URL
 	defer func() { updateLatestURL = old }()
 
-	// Pre-seed state with skipped version matching latest.
-	path := filepath.Join(stateDir, "drive9", "update-check.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	data, _ := json.Marshal(&updateState{
-		SkippedVersion: "v0.9.0",
-	})
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("failed to write state: %v", err)
+	// First call: should return release info.
+	r1 := CheckForUpdate(context.Background(), "v0.8.1")
+	if r1 == nil {
+		t.Fatalf("expected non-nil result on first check")
 	}
 
-	result := CheckForUpdate(context.Background(), "v0.8.1")
-	if result != nil {
-		t.Fatalf("skipped version should not be returned, got %+v", result)
+	// Simulate that the caller displayed the banner.
+	MarkUpdatePrompted(r1.Version)
+
+	// Second call within TTL: should be suppressed because we already
+	// prompted for this version.
+	r2 := CheckForUpdate(context.Background(), "v0.8.1")
+	if r2 != nil {
+		t.Fatalf("expected nil after prompt throttle, got %+v", r2)
 	}
 }
 
-func TestCheckForUpdate_SkipOldVersionStillPromptsNewer(t *testing.T) {
+func TestCheckForUpdate_PromptThrottle_NewVersionResetsThrottle(t *testing.T) {
+	version := "v0.9.0"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(ReleaseInfo{Version: "v0.9.1"})
+		_ = json.NewEncoder(w).Encode(ReleaseInfo{Version: version})
 	}))
 	defer srv.Close()
 
@@ -476,24 +476,29 @@ func TestCheckForUpdate_SkipOldVersionStillPromptsNewer(t *testing.T) {
 	updateLatestURL = srv.URL
 	defer func() { updateLatestURL = old }()
 
-	// Pre-seed state: user skipped v0.9.0, but v0.9.1 is now latest.
-	path := filepath.Join(stateDir, "drive9", "update-check.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatal(err)
+	// First check + prompt.
+	r1 := CheckForUpdate(context.Background(), "v0.8.1")
+	if r1 == nil {
+		t.Fatalf("expected non-nil result on first check")
 	}
-	data, _ := json.Marshal(&updateState{
-		SkippedVersion: "v0.9.0",
-	})
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("failed to write state: %v", err)
-	}
+	MarkUpdatePrompted(r1.Version)
 
-	result := CheckForUpdate(context.Background(), "v0.8.1")
-	if result == nil {
-		t.Fatalf("newer version beyond skipped should still prompt")
+	// Expire TTL so next call refetches.
+	path := filepath.Join(stateDir, "drive9", "update-check.json")
+	state := readUpdateState(path)
+	state.LastCheckedAt = time.Now().Add(-25 * time.Hour)
+	writeUpdateState(path, state)
+
+	// Server now returns a newer version.
+	version = "v0.9.1"
+
+	// Should return the new version even though v0.9.0 was already prompted.
+	r2 := CheckForUpdate(context.Background(), "v0.8.1")
+	if r2 == nil {
+		t.Fatalf("expected non-nil result for new version after TTL expiry")
 	}
-	if result.Version != "v0.9.1" {
-		t.Fatalf("got version %q, want %q", result.Version, "v0.9.1")
+	if r2.Version != "v0.9.1" {
+		t.Fatalf("got version %q, want %q", r2.Version, "v0.9.1")
 	}
 }
 
@@ -629,10 +634,11 @@ func TestAtomicStateWrite(t *testing.T) {
 	path := filepath.Join(dir, "drive9", "update-check.json")
 
 	state := &updateState{
-		LastCheckedAt:  time.Now().UTC(),
-		LatestVersion:  "v0.9.0",
-		LatestURL:      "https://example.com",
-		SkippedVersion: "v0.8.5",
+		LastCheckedAt:       time.Now().UTC(),
+		LatestVersion:       "v0.9.0",
+		LatestURL:           "https://example.com",
+		LastPromptedAt:      time.Now().UTC(),
+		LastPromptedVersion: "v0.8.5",
 	}
 	writeUpdateState(path, state)
 
@@ -644,8 +650,8 @@ func TestAtomicStateWrite(t *testing.T) {
 	if got.LatestVersion != "v0.9.0" {
 		t.Fatalf("got LatestVersion %q, want %q", got.LatestVersion, "v0.9.0")
 	}
-	if got.SkippedVersion != "v0.8.5" {
-		t.Fatalf("got SkippedVersion %q, want %q", got.SkippedVersion, "v0.8.5")
+	if got.LastPromptedVersion != "v0.8.5" {
+		t.Fatalf("got LastPromptedVersion %q, want %q", got.LastPromptedVersion, "v0.8.5")
 	}
 
 	// Verify no temp files left behind.
