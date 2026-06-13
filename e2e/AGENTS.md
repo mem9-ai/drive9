@@ -7,6 +7,15 @@ title: e2e - Live end-to-end scripts
 This directory contains live end-to-end tests for deployed drive9-server instances.
 These scripts are integration probes (not unit tests) and call real HTTP endpoints.
 
+## CI wiring rule
+
+Every new e2e script MUST be wired into `.github/workflows/local-e2e.yml` in the
+same PR that adds it (PR gate for fast suites, push-to-main/schedule toggles for
+heavy ones), or be documented as manual-only with a reason in `e2e/README.md`
+("CI automation tiers" section). An e2e script that no automation runs is dead
+code. The `e2e-all` workflow (manual dispatch) must keep covering every wired
+suite via `run_all_e2e=1`.
+
 ## Run
 
 Use a hosted deployment by default. For local development on this machine, use

@@ -37,7 +37,7 @@ type MountOptions struct {
 	RemoteRoot              string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
 	CacheDir                string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
 	CacheSize               int64         // ReadCache max size in bytes (default 128MB)
-	ReadCacheMaxFileBytes   int64         // largest single file admitted to ReadCache (default 1MiB)
+	ReadCacheMaxFileBytes   int64         // largest single file admitted to ReadCache and fetched whole-file in one request (default 4MiB)
 	DiskReadCacheSize       int64         // disk-backed read cache max size in bytes (default 1GiB)
 	DiskReadCacheFreeRatio  float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
 	DirTTL                  time.Duration // DirCache TTL (default 10s)
@@ -366,7 +366,7 @@ func Mount(opts *MountOptions) error {
 				cq.RecoverPending()
 				if opts.LayerRef != "" {
 					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
-						fmt.Fprintf(os.Stderr, "drive9: restore fs layer entries failed: %v\n", err)
+						return fmt.Errorf("mount: restore fs layer entries: %w", err)
 					}
 					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
 				}

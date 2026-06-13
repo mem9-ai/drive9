@@ -2585,7 +2585,7 @@ func TestShadowSpill_AutoResolveGuard(t *testing.T) {
 	}
 
 	// Should not panic, should not attempt ReadAll, should go to terminal failure.
-	cq.tryAutoResolveConflict(entry)
+	cq.tryAutoResolveConflict(context.Background(), entry)
 
 	// Verify MarkConflict was called (terminal failure path).
 	meta, ok := idx.GetMeta(path)

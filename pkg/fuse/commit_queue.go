@@ -722,7 +722,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		}
 		if errors.Is(err, client.ErrConflict) {
 			log.Printf("commit queue: conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
-			cq.tryAutoResolveConflict(entry)
+			cq.tryAutoResolveConflict(entryCtx, entry)
 			unlockPath()
 			return
 		}
@@ -748,6 +748,25 @@ func sleepWithCancel(ctx context.Context, delay time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+func (cq *CommitQueue) entryUploadContext(parent context.Context, entry *CommitEntry, timeout time.Duration) (context.Context, context.CancelFunc, bool) {
+	uploadCtx, uploadCancel := context.WithTimeout(parent, timeout)
+	cq.mu.Lock()
+	if entry.canceled {
+		cq.mu.Unlock()
+		uploadCancel()
+		return nil, nil, false
+	}
+	entry.cancelUpload = uploadCancel
+	cq.mu.Unlock()
+	cleanup := func() {
+		cq.mu.Lock()
+		entry.cancelUpload = nil
+		cq.mu.Unlock()
+		uploadCancel()
+	}
+	return uploadCtx, cleanup, true
 }
 
 // CommitNow uploads an entry synchronously through the same commit path used
@@ -1042,7 +1061,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, com
 //
 // This covers ~80% of agent conflict scenarios (whole-file overwrites) without
 // requiring 3-way merge. Max 1 retry to avoid write amplification.
-func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
+func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *CommitEntry) {
 	// Bail early if the file was deleted locally while queued.
 	if cq.isEntryCanceled(entry) {
 		cq.removeFromQueue(entry)
@@ -1064,7 +1083,7 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	// upload completed, before the local cleanup — the common large-file
 	// crash window) is resolvable with a bounded-memory chunked compare.
 	if entry.ShadowSpill {
-		cq.tryResolveShadowSpillIdempotent(entry)
+		cq.tryResolveShadowSpillIdempotent(entryCtx, entry)
 		return
 	}
 
@@ -1099,6 +1118,52 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 		cq.perf.recordRemoteOp(perfRemoteStat, err, time.Since(statStart), 0)
 	}
 	if err != nil {
+		if client.IsNotFound(err) {
+			// 409 but no committed remote file: the conflict came from
+			// upload-session state (e.g. a session orphaned by a crashed
+			// client), not content — or the file was deleted remotely, in
+			// which case LWW means the local write wins anyway. Retry once
+			// as a create; terminal only if the retry also fails.
+			if cq.isEntryCanceled(entry) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: auto-resolve skipped for %s (canceled before create retry)", entry.Path)
+				return
+			}
+			log.Printf("commit queue: conflict for %s but remote file not found, retrying upload as create", entry.Path)
+			uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(int64(len(localData))))
+			if !ok {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: auto-resolve skipped for %s (canceled before create retry upload)", entry.Path)
+				return
+			}
+			uploadStart := time.Now()
+			var committedRev int64
+			var uploadErr error
+			if len(localData) == 0 {
+				committedRev, uploadErr = cq.client.WriteCtxConditionalWithRevision(uploadCtx, apiPath, localData, 0)
+			} else {
+				uploadErr = uploadBufferedRemoteFile(uploadCtx, cq.client, apiPath, localData, 0)
+			}
+			uploadCancel()
+			if cq.perf != nil {
+				cq.perf.recordRemoteOp(perfRemoteWrite, uploadErr, time.Since(uploadStart), uint64(len(localData)))
+			}
+			if cq.isEntryCanceled(entry) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: auto-resolve skipped for %s (canceled during create retry upload)", entry.Path)
+				return
+			}
+			if uploadErr != nil {
+				log.Printf("commit queue: create retry failed for %s: %v", entry.Path, uploadErr)
+				cq.onCommitTerminalFailure(entry)
+				return
+			}
+			log.Printf("commit queue: auto-resolved conflict for %s via create retry (no remote file)", entry.Path)
+			if err := cq.onCommitSuccess(entry, 0, committedRev); err != nil {
+				cq.onCommitPostUploadFailure(entry, err)
+			}
+			return
+		}
 		log.Printf("commit queue: auto-resolve failed for %s: stat: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
 		return
@@ -1135,7 +1200,12 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 		return
 	}
 	log.Printf("commit queue: auto-resolving conflict for %s via LWW (base rev %d → server rev %d)", entry.Path, entry.BaseRev, serverRev)
-	uploadCtx, uploadCancel := context.WithTimeout(context.Background(), releaseTimeout(int64(len(localData))))
+	uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(int64(len(localData))))
+	if !ok {
+		cq.removeFromQueue(entry)
+		log.Printf("commit queue: auto-resolve aborted for %s before LWW upload (canceled)", entry.Path)
+		return
+	}
 	uploadStart := time.Now()
 	err = uploadBufferedRemoteFile(uploadCtx, cq.client, apiPath, localData, serverRev)
 	uploadCancel()
@@ -1145,6 +1215,11 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 	if err != nil {
 		log.Printf("commit queue: auto-resolve LWW re-upload failed for %s: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
+		return
+	}
+	if cq.isEntryCanceled(entry) {
+		cq.removeFromQueue(entry)
+		log.Printf("commit queue: auto-resolve skipped for %s (canceled during LWW upload)", entry.Path)
 		return
 	}
 
@@ -1163,7 +1238,7 @@ const shadowSpillCompareChunk = 8 << 20
 // shadow byte-for-byte (crash after a completed upload, before local cleanup),
 // the commit is marked successful. Any divergence is a terminal conflict —
 // LWW re-upload is intentionally not attempted for large files.
-func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entry *CommitEntry) {
+func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context, entry *CommitEntry) {
 	if cq.shadows == nil || cq.client == nil {
 		cq.onCommitTerminalFailure(entry)
 		return
@@ -1178,6 +1253,50 @@ func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entry *CommitEntry) {
 		cq.perf.recordRemoteOp(perfRemoteStat, err, time.Since(statStart), 0)
 	}
 	if err != nil {
+		if client.IsNotFound(err) {
+			// 409 but no committed remote file: the conflict came from
+			// upload-session state (e.g. a session orphaned by a crashed
+			// client mid-multipart — exactly the crash-recovery window),
+			// not content. Retry once as a create; terminal only if the
+			// retry also fails.
+			if cq.isEntryCanceled(entry) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled before create retry)", entry.Path)
+				return
+			}
+			log.Printf("commit queue: ShadowSpill conflict for %s but remote file not found, retrying upload as create", entry.Path)
+			uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(entry.Size))
+			if !ok {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled before create retry upload)", entry.Path)
+				return
+			}
+			uploadStart := time.Now()
+			committedRev, uploadErr := uploadFromShadowRemoteWithRevision(uploadCtx, cq.client, cq.shadows, entry.Path, apiPath, 0)
+			uploadCancel()
+			if cq.perf != nil {
+				var bytes uint64
+				if entry.Size > 0 {
+					bytes = uint64(entry.Size)
+				}
+				cq.perf.recordRemoteOp(perfRemoteWrite, uploadErr, time.Since(uploadStart), bytes)
+			}
+			if cq.isEntryCanceled(entry) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled during create retry upload)", entry.Path)
+				return
+			}
+			if uploadErr != nil {
+				log.Printf("commit queue: ShadowSpill create retry failed for %s: %v", entry.Path, uploadErr)
+				cq.onCommitTerminalFailure(entry)
+				return
+			}
+			log.Printf("commit queue: auto-resolved ShadowSpill conflict for %s via create retry (no remote file)", entry.Path)
+			if err := cq.onCommitSuccess(entry, 0, committedRev); err != nil {
+				cq.onCommitPostUploadFailure(entry, err)
+			}
+			return
+		}
 		log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: stat: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
 		return

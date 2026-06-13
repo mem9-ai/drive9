@@ -20,9 +20,12 @@ const (
 	// defaultReadCacheMaxFileSize is deliberately larger than the inline
 	// fallback so medium files do not miss userspace cache solely because
 	// their server inline threshold is lower. The aggregate cache cap still
-	// bounds memory use. Keeping this at 1MiB covers common benchmark and
-	// editor workloads without turning the cache into an unbounded object store.
-	defaultReadCacheMaxFileSize = 1 << 20
+	// bounds memory use. This threshold also gates the whole-file
+	// single-request read path in Read: files at or below it are fetched
+	// with one GET instead of block-split range reads + prefetch, so it is
+	// sized to cover common small-object workloads (e.g. 2MiB media chunks)
+	// without turning the cache into an unbounded object store.
+	defaultReadCacheMaxFileSize = 4 << 20
 )
 
 // cacheEntry holds a single cached file's data and metadata.
