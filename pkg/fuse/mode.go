@@ -9,15 +9,21 @@ import (
 
 const (
 	defaultRegularFileMode     uint32 = 0o644
+	posixPermissionModeMask    uint32 = 0o7777
+	remotePermissionModeMask   uint32 = 0o777
 	postUploadModeAttempts            = 5
 	postUploadModeInitialDelay        = 10 * time.Millisecond
 )
+
+func remoteChmodMode(mode uint32) uint32 {
+	return mode & remotePermissionModeMask
+}
 
 func shouldApplyRemoteMode(kind PendingKind, hasMode bool, mode uint32) bool {
 	if !hasMode {
 		return false
 	}
-	if kind == PendingNew && mode&0o777 == defaultRegularFileMode {
+	if kind == PendingNew && mode&posixPermissionModeMask == defaultRegularFileMode {
 		return false
 	}
 	return true

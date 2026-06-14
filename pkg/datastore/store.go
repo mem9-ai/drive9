@@ -46,7 +46,10 @@ const (
 	StorageS3  StorageType = "s3"
 )
 
-const fileTypeModeMask uint32 = 0o170000
+const (
+	fileTypeModeMask   uint32 = 0o170000
+	permissionModeMask uint32 = 0o7777
+)
 
 type StorageEncryptionMode string
 
@@ -234,6 +237,10 @@ func isRootFileNode(n FileNode) bool {
 	return isRootFileNodePath(n.Path)
 }
 
+func fileNodePathHash(path string) string {
+	return StorageRefHash(path)
+}
+
 func (s *Store) InsertNode(ctx context.Context, n *FileNode) error {
 	start := time.Now()
 	var opErr error
@@ -243,9 +250,10 @@ func (s *Store) InsertNode(ctx context.Context, n *FileNode) error {
 		opErr = ErrInvalidRootDentry
 		return ErrInvalidRootDentry
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())
+	_, err := s.db.ExecContext(ctx, `INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		n.NodeID, n.Path, fileNodePathHash(n.Path), n.ParentPath, fileNodePathHash(n.ParentPath),
+		n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())
 	if isUniqueViolation(err) {
 		opErr = ErrPathConflict
 		return ErrPathConflict
@@ -260,7 +268,7 @@ func (s *Store) GetNode(ctx context.Context, path string) (*FileNode, error) {
 	defer observeStoreOp(ctx, "get_node", start, &opErr)
 
 	row := s.db.QueryRowContext(ctx, `SELECT node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at
-		FROM file_nodes WHERE path = ?`, path)
+		FROM file_nodes WHERE path_hash = ? AND path = ?`, fileNodePathHash(path), path)
 	n, err := scanNode(row)
 	opErr = err
 	return n, err
@@ -271,7 +279,7 @@ func (s *Store) ListNodes(ctx context.Context, parentPath string) (out []*FileNo
 	defer observeStoreOp(ctx, "list_nodes", start, &err)
 
 	rows, err := s.db.QueryContext(ctx, `SELECT node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at
-		FROM file_nodes WHERE parent_path = ? ORDER BY name`, parentPath)
+		FROM file_nodes WHERE parent_path_hash = ? AND parent_path = ? ORDER BY name`, fileNodePathHash(parentPath), parentPath)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +306,7 @@ func (s *Store) DeleteNode(ctx context.Context, path string) (err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "delete_node", start, &err)
 
-	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ?`, path)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM file_nodes WHERE path_hash = ? AND path = ?`, fileNodePathHash(path), path)
 	if err != nil {
 		return err
 	}
@@ -327,7 +335,7 @@ func (s *Store) DeleteEmptyDir(ctx context.Context, path string) (err error) {
 	if hasChildren {
 		return fmt.Errorf("directory not empty: %s", path)
 	}
-	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path = ? AND is_directory = 1`, path)
+	res, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE path_hash = ? AND path = ? AND is_directory = 1`, fileNodePathHash(path), path)
 	if err != nil {
 		return err
 	}
@@ -359,8 +367,9 @@ func (s *Store) UpdateNodePath(ctx context.Context, oldPath, newPath, newParentP
 	if isRootFileNodePath(oldPath) || isRootFileNodePath(newPath) {
 		return ErrInvalidRootDentry
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE file_nodes SET path = ?, parent_path = ?, name = ?
-		WHERE path = ?`, newPath, newParentPath, newName, oldPath)
+	res, err := s.db.ExecContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?
+		WHERE path_hash = ? AND path = ?`,
+		newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName, fileNodePathHash(oldPath), oldPath)
 	if err != nil {
 		return err
 	}
@@ -393,8 +402,8 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 		isDir  bool
 	}
 	var old nodeRef
-	err = tx.QueryRow(`SELECT node_id, file_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, oldPath).
-		Scan(&old.nodeID, &old.fileID, &old.isDir)
+	err = tx.QueryRow(`SELECT node_id, file_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
+		fileNodePathHash(oldPath), oldPath).Scan(&old.nodeID, &old.fileID, &old.isDir)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -410,8 +419,8 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 
 	var dst nodeRef
 	hasDst := false
-	err = tx.QueryRow(`SELECT node_id, file_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, newPath).
-		Scan(&dst.nodeID, &dst.fileID, &dst.isDir)
+	err = tx.QueryRow(`SELECT node_id, file_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
+		fileNodePathHash(newPath), newPath).Scan(&dst.nodeID, &dst.fileID, &dst.isDir)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
@@ -429,8 +438,8 @@ func (s *Store) RenameFileReplacingTarget(ctx context.Context, oldPath, newPath,
 		}
 	}
 
-	res, err := tx.Exec(`UPDATE file_nodes SET path = ?, parent_path = ?, name = ? WHERE node_id = ?`,
-		newPath, newParentPath, newName, old.nodeID)
+	res, err := tx.Exec(`UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE node_id = ?`,
+		newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName, old.nodeID)
 	if isUniqueViolation(err) {
 		return nil, ErrPathConflict
 	}
@@ -501,8 +510,8 @@ func (s *Store) RenameFileNoReplace(ctx context.Context, oldPath, newPath, newPa
 		isDir  bool
 	}
 	var old nodeRef
-	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, oldPath).
-		Scan(&old.nodeID, &old.isDir)
+	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
+		fileNodePathHash(oldPath), oldPath).Scan(&old.nodeID, &old.isDir)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
@@ -517,8 +526,8 @@ func (s *Store) RenameFileNoReplace(ctx context.Context, oldPath, newPath, newPa
 	}
 
 	var dst nodeRef
-	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, newPath).
-		Scan(&dst.nodeID, &dst.isDir)
+	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
+		fileNodePathHash(newPath), newPath).Scan(&dst.nodeID, &dst.isDir)
 	if err != nil {
 		if !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -530,8 +539,8 @@ func (s *Store) RenameFileNoReplace(ctx context.Context, oldPath, newPath, newPa
 		return ErrPathConflict
 	}
 
-	res, err := tx.ExecContext(ctx, `UPDATE file_nodes SET path = ?, parent_path = ?, name = ?
-		WHERE node_id = ?`, newPath, newParentPath, newName, old.nodeID)
+	res, err := tx.ExecContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ?
+		WHERE node_id = ?`, newPath, fileNodePathHash(newPath), newParentPath, fileNodePathHash(newParentPath), newName, old.nodeID)
 	if err != nil {
 		if strings.Contains(err.Error(), "Duplicate entry") {
 			return ErrPathConflict
@@ -555,14 +564,20 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 	if oldPrefix == "/" || newPrefix == "/" {
 		return 0, ErrInvalidRootDentry
 	}
+	if oldPrefix == newPrefix {
+		return 0, nil
+	}
+	if strings.HasPrefix(newPrefix, oldPrefix) {
+		return 0, ErrPathConflict
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.Query(`SELECT node_id, path, parent_path, name FROM file_nodes
-		WHERE path = ? OR path LIKE ? ORDER BY path`, oldPrefix, oldPrefix+"%")
+	rows, err := tx.QueryContext(ctx, `SELECT node_id, path, parent_path, name FROM file_nodes
+		WHERE path = ? OR path LIKE ? ORDER BY path FOR UPDATE`, oldPrefix, oldPrefix+"%")
 	if err != nil {
 		return 0, err
 	}
@@ -587,15 +602,53 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 		updates = append(updates, update{nodeID, newPath, newParent, newName})
 	}
 	_ = rows.Close()
+	if len(updates) == 0 {
+		return 0, ErrNotFound
+	}
 
-	stmt, err := tx.Prepare(`UPDATE file_nodes SET path = ?, parent_path = ?, name = ? WHERE node_id = ?`)
+	type dstRef struct {
+		nodeID string
+		isDir  bool
+	}
+	var dst dstRef
+	err = tx.QueryRowContext(ctx, `SELECT node_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
+		fileNodePathHash(newPrefix), newPrefix).Scan(&dst.nodeID, &dst.isDir)
+	if err != nil {
+		if !errors.Is(err, sql.ErrNoRows) {
+			return 0, err
+		}
+	} else {
+		if !dst.isDir {
+			return 0, ErrPathConflict
+		}
+		childRows, err := tx.QueryContext(ctx, `SELECT node_id FROM file_nodes WHERE parent_path_hash = ? AND parent_path = ? FOR UPDATE`,
+			fileNodePathHash(newPrefix), newPrefix)
+		if err != nil {
+			return 0, err
+		}
+		hasChild := childRows.Next()
+		if closeErr := childRows.Close(); closeErr != nil {
+			return 0, closeErr
+		}
+		if hasChild {
+			return 0, ErrPathConflict
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM file_nodes WHERE node_id = ?`, dst.nodeID); err != nil {
+			return 0, err
+		}
+	}
+
+	stmt, err := tx.PrepareContext(ctx, `UPDATE file_nodes SET path = ?, path_hash = ?, parent_path = ?, parent_path_hash = ?, name = ? WHERE node_id = ?`)
 	if err != nil {
 		return 0, err
 	}
 	defer func() { _ = stmt.Close() }()
 
 	for _, u := range updates {
-		if _, err := stmt.Exec(u.newPath, u.newParent, u.newName, u.nodeID); err != nil {
+		if _, err := stmt.Exec(u.newPath, fileNodePathHash(u.newPath), u.newParent, fileNodePathHash(u.newParent), u.newName, u.nodeID); err != nil {
+			if isUniqueViolation(err) {
+				return 0, ErrPathConflict
+			}
 			return 0, err
 		}
 	}
@@ -691,8 +744,8 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath,
 	}
 	if dstParentPath != "/" {
 		var parentIsDir bool
-		err := db.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, dstParentPath).
-			Scan(&parentIsDir)
+		err := db.QueryRowContext(ctx, `SELECT is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
+			fileNodePathHash(dstParentPath), dstParentPath).Scan(&parentIsDir)
 		if err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return ErrNotFound
@@ -706,8 +759,8 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath,
 
 	var fileID, inodeID sql.NullString
 	var isDir bool
-	err := db.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory FROM file_nodes WHERE path = ? FOR UPDATE`, srcPath).
-		Scan(&fileID, &inodeID, &isDir)
+	err := db.QueryRowContext(ctx, `SELECT file_id, inode_id, is_directory FROM file_nodes WHERE path_hash = ? AND path = ? FOR UPDATE`,
+		fileNodePathHash(srcPath), srcPath).Scan(&fileID, &inodeID, &isDir)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
@@ -727,9 +780,9 @@ func (s *Store) LinkFileNodeTx(ctx context.Context, db execer, srcPath, dstPath,
 	if inodeID.Valid && inodeID.String != "" {
 		linkInodeID = inodeID.String
 	}
-	_, err = db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at)
-		VALUES (?, ?, ?, ?, 0, ?, ?, ?)`,
-		nodeID, dstPath, dstParentPath, dstName, fileID.String, linkInodeID, createdAt.UTC())
+	_, err = db.Exec(`INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+		nodeID, dstPath, fileNodePathHash(dstPath), dstParentPath, fileNodePathHash(dstParentPath), dstName, fileID.String, linkInodeID, createdAt.UTC())
 	if isUniqueViolation(err) {
 		return ErrPathConflict
 	}
@@ -1253,7 +1306,7 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 		}
 		return err
 	}
-	mode = (mode & 0o777) | (currentMode & fileTypeModeMask)
+	mode = (mode & permissionModeMask) | (currentMode & fileTypeModeMask)
 	res, err := s.db.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE inode_id = ? AND status = 'CONFIRMED'`, mode, inodeID)
 	if err != nil {
 		return err
@@ -1303,8 +1356,8 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 		// Check if the directory already exists and has an inode_id.
 		var existingInodeID sql.NullString
 		selectErr := db.QueryRowContext(ctx,
-			`SELECT inode_id FROM file_nodes WHERE path = ? AND is_directory = 1`,
-			dirPath).Scan(&existingInodeID)
+			`SELECT inode_id FROM file_nodes WHERE path_hash = ? AND path = ? AND is_directory = 1`,
+			fileNodePathHash(dirPath), dirPath).Scan(&existingInodeID)
 		if selectErr == nil && existingInodeID.Valid {
 			// Already exists and has an inode_id — nothing to do.
 			continue
@@ -1330,8 +1383,8 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 			// Directory row exists from pre-migration (inode_id was NULL).
 			// Backfill the inode_id.
 			_, err = db.ExecContext(ctx,
-				`UPDATE file_nodes SET inode_id = ? WHERE path = ? AND is_directory = 1`,
-				nodeID, dirPath)
+				`UPDATE file_nodes SET inode_id = ? WHERE path_hash = ? AND path = ? AND is_directory = 1`,
+				nodeID, fileNodePathHash(dirPath), dirPath)
 			if err != nil {
 				return fmt.Errorf("backfill parent inode_id %s: %w", dirPath, err)
 			}
@@ -1340,10 +1393,10 @@ func ensureParentDirsWithExecer(ctx context.Context, db execer, path string, gen
 
 		// Directory does not exist — insert the dentry.
 		_, err = db.ExecContext(ctx, `INSERT INTO file_nodes
-			(node_id, path, parent_path, name, is_directory, inode_id, created_at)
-			VALUES (?, ?, ?, ?, 1, ?, ?)
+			(node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, inode_id, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
 			ON DUPLICATE KEY UPDATE node_id = node_id`,
-			nodeID, dirPath, pp, name, nodeID, now)
+			nodeID, dirPath, fileNodePathHash(dirPath), pp, fileNodePathHash(pp), name, nodeID, now)
 		if err != nil && !isUniqueViolation(err) {
 			return fmt.Errorf("ensure parent %s: %w", dirPath, err)
 		}
@@ -1360,9 +1413,10 @@ func (s *Store) InsertNodeTx(db execer, n *FileNode) error {
 			return err
 		}
 	}
-	_, err := db.Exec(`INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		n.NodeID, n.Path, n.ParentPath, n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())
+	_, err := db.Exec(`INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		n.NodeID, n.Path, fileNodePathHash(n.Path), n.ParentPath, fileNodePathHash(n.ParentPath),
+		n.Name, n.IsDirectory, nullStr(n.FileID), nullStr(n.InodeID), n.CreatedAt.UTC())
 	if isUniqueViolation(err) {
 		return ErrPathConflict
 	}
@@ -1445,7 +1499,7 @@ func (s *Store) ActiveUploadReservedBytesTx(db execer) (int64, error) {
 		END
 	), 0)
 		FROM uploads u
-		LEFT JOIN file_nodes fn ON fn.path = u.target_path
+		LEFT JOIN file_nodes fn ON fn.path_hash = u.target_path_hash AND fn.path = u.target_path
 		LEFT JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id) AND i.status = 'CONFIRMED'
 		WHERE u.status IN ('INITIATED', 'UPLOADING') AND u.expires_at > ?`, time.Now().UTC()).Scan(&total)
 	if err != nil {
@@ -1461,8 +1515,8 @@ func (s *Store) ConfirmedFileSizeByPathTx(db execer, path string) (int64, error)
 	err := db.QueryRow(`SELECT i.size_bytes
 		FROM file_nodes fn
 		JOIN inodes i ON i.inode_id = COALESCE(fn.inode_id, fn.file_id)
-		WHERE fn.path = ? AND fn.is_directory = 0 AND i.status = 'CONFIRMED'
-		LIMIT 1`, path).Scan(&size)
+		WHERE fn.path_hash = ? AND fn.path = ? AND fn.is_directory = 0 AND i.status = 'CONFIRMED'
+		LIMIT 1`, fileNodePathHash(path), path).Scan(&size)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -1674,9 +1728,9 @@ func (s *Store) StatPathFallback(ctx context.Context, primaryPath, fallbackPath 
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		LEFT JOIN contents c ON i.inode_id = c.inode_id
 		LEFT JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE fn.path = ? OR fn.path = ?
+		WHERE (fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
-		LIMIT 1`, primaryPath, fallbackPath, primaryPath)
+		LIMIT 1`, fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)
 	out, err = scanNodeWithFileWithBlob(row)
 	return out, err
 }
@@ -1692,9 +1746,9 @@ func (s *Store) StatPathFallbackLite(ctx context.Context, primaryPath, fallbackP
 		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
-		WHERE fn.path = ? OR fn.path = ?
+		WHERE (fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
-		LIMIT 1`, primaryPath, fallbackPath, primaryPath)
+		LIMIT 1`, fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)
 	out, err = scanNodeWithFileLite(row)
 	return out, err
 }
@@ -1708,8 +1762,8 @@ func (s *Store) StatLite(ctx context.Context, path string) (out *NodeWithFile, e
 		i.inode_id, i.size_bytes, i.revision, i.mode, i.status, i.created_at, i.confirmed_at
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
-		WHERE fn.path = ?
-		LIMIT 1`, path)
+		WHERE fn.path_hash = ? AND fn.path = ?
+		LIMIT 1`, fileNodePathHash(path), path)
 	out, err = scanNodeWithFileLite(row)
 	return out, err
 }
@@ -1727,8 +1781,8 @@ func (s *Store) StatForRead(ctx context.Context, path string) (out *NodeWithFile
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		LEFT JOIN contents c ON i.inode_id = c.inode_id
-		WHERE fn.path = ?
-		LIMIT 1`, path)
+		WHERE fn.path_hash = ? AND fn.path = ?
+		LIMIT 1`, fileNodePathHash(path), path)
 	out, err = scanNodeWithFileForRead(row)
 	return out, err
 }
@@ -1743,9 +1797,9 @@ func (s *Store) StatPathFallbackForRead(ctx context.Context, primaryPath, fallba
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		LEFT JOIN contents c ON i.inode_id = c.inode_id
-		WHERE fn.path = ? OR fn.path = ?
+		WHERE (fn.path_hash = ? AND fn.path = ?) OR (fn.path_hash = ? AND fn.path = ?)
 		ORDER BY CASE WHEN fn.path = ? THEN 0 ELSE 1 END
-		LIMIT 1`, primaryPath, fallbackPath, primaryPath)
+		LIMIT 1`, fileNodePathHash(primaryPath), primaryPath, fileNodePathHash(fallbackPath), fallbackPath, primaryPath)
 	out, err = scanNodeWithFileForRead(row)
 	return out, err
 }
@@ -1762,9 +1816,9 @@ func (s *Store) ListDir(ctx context.Context, parentPath string) (out []*NodeWith
 		FROM file_nodes fn
 		LEFT JOIN inodes i ON COALESCE(fn.inode_id, fn.file_id) = i.inode_id AND i.status = 'CONFIRMED'
 		LEFT JOIN semantic s ON i.inode_id = s.inode_id
-		WHERE fn.parent_path = ?
+		WHERE fn.parent_path_hash = ? AND fn.parent_path = ?
 		ORDER BY fn.name`
-	rows, err := s.db.QueryContext(ctx, q, parentPath)
+	rows, err := s.db.QueryContext(ctx, q, fileNodePathHash(parentPath), parentPath)
 	if err != nil {
 		return nil, err
 	}
@@ -1845,7 +1899,7 @@ func (s *Store) DeleteFileWithRefCheck(ctx context.Context, path string) (out *F
 		return nil, ErrNotFound
 	}
 
-	if _, err := tx.Exec(`DELETE FROM file_nodes WHERE path = ?`, path); err != nil {
+	if _, err := tx.Exec(`DELETE FROM file_nodes WHERE path_hash = ? AND path = ?`, fileNodePathHash(path), path); err != nil {
 		return nil, err
 	}
 
@@ -1976,8 +2030,8 @@ func (s *Store) scanDeleteCandidateTx(ctx context.Context, tx *sql.Tx, path stri
 			f.revision, f.embedding_revision, f.status, f.source_id, f.created_at, f.confirmed_at, f.expires_at
 			FROM file_nodes fn
 			LEFT JOIN files f ON f.file_id = fn.file_id
-			WHERE fn.path = ?
-			FOR UPDATE`, path)
+			WHERE fn.path_hash = ? AND fn.path = ?
+			FOR UPDATE`, fileNodePathHash(path), path)
 		return scanLegacyDeleteCandidate(row)
 	}
 	row := tx.QueryRowContext(ctx, `SELECT fn.file_id, fn.is_directory,
@@ -1987,8 +2041,8 @@ func (s *Store) scanDeleteCandidateTx(ctx context.Context, tx *sql.Tx, path stri
 		LEFT JOIN inodes i ON i.inode_id = fn.file_id
 		LEFT JOIN contents c ON c.inode_id = fn.file_id
 		LEFT JOIN semantic s ON s.inode_id = fn.file_id
-		WHERE fn.path = ?
-		FOR UPDATE`, path)
+		WHERE fn.path_hash = ? AND fn.path = ?
+		FOR UPDATE`, fileNodePathHash(path), path)
 	return scanSplitDeleteCandidate(row)
 }
 
@@ -2264,7 +2318,7 @@ func stringsToAny(values []string) []any {
 
 func dirHasChildrenTx(ctx context.Context, tx *sql.Tx, path string) (bool, error) {
 	var one int
-	err := tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE parent_path = ? LIMIT 1 FOR UPDATE`, path).Scan(&one)
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE parent_path_hash = ? AND parent_path = ? LIMIT 1 FOR UPDATE`, fileNodePathHash(path), path).Scan(&one)
 	if err == nil {
 		return true, nil
 	}
@@ -2291,11 +2345,11 @@ func (s *Store) InsertUpload(ctx context.Context, u *Upload) (err error) {
 func (s *Store) InsertUploadTx(db execer, u *Upload) error {
 	mode := uploadStorageEncryptionModeForWrite(u.StorageEncryptionMode)
 	_, err := db.Exec(`INSERT INTO uploads
-		(upload_id, file_id, target_path, s3_upload_id, s3_key, storage_encryption_mode,
+		(upload_id, file_id, target_path, target_path_hash, s3_upload_id, s3_key, storage_encryption_mode,
 		 storage_encryption_key_id, total_size, part_size,
 		 parts_total, expected_revision, status, fingerprint_sha256, idempotency_key, description, created_at, updated_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		u.UploadID, u.FileID, u.TargetPath, u.S3UploadID, u.S3Key,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		u.UploadID, u.FileID, u.TargetPath, fileNodePathHash(u.TargetPath), u.S3UploadID, u.S3Key,
 		mode, storageEncryptionKeyIDForWrite(mode, u.StorageEncryptionKeyID),
 		u.TotalSize, u.PartSize, u.PartsTotal, nullInt64Ptr(u.ExpectedRevision), u.Status,
 		nullStr(u.FingerprintSHA), nullStr(u.IdempotencyKey), nullStr(u.Description),
@@ -2411,8 +2465,8 @@ func (s *Store) GetUploadByPath(ctx context.Context, targetPath string) (out *Up
 		storage_encryption_mode, storage_encryption_key_id,
 		total_size, part_size, parts_total, expected_revision, status, fingerprint_sha256, idempotency_key,
 		description, created_at, updated_at, expires_at
-		FROM uploads WHERE target_path = ? AND status IN ('INITIATED', 'UPLOADING') AND expires_at > ?
-		ORDER BY created_at DESC LIMIT 1`, targetPath, time.Now().UTC())
+		FROM uploads WHERE target_path_hash = ? AND target_path = ? AND status IN ('INITIATED', 'UPLOADING') AND expires_at > ?
+		ORDER BY created_at DESC LIMIT 1`, fileNodePathHash(targetPath), targetPath, time.Now().UTC())
 	out, err = scanUpload(row)
 	return out, err
 }
@@ -2498,8 +2552,8 @@ func (s *Store) ListUploadsByPath(ctx context.Context, targetPath string, status
 		storage_encryption_mode, storage_encryption_key_id,
 		total_size, part_size, parts_total, expected_revision, status, fingerprint_sha256, idempotency_key,
 		description, created_at, updated_at, expires_at
-		FROM uploads WHERE target_path = ? AND status = ?
-		ORDER BY created_at DESC`, targetPath, status)
+		FROM uploads WHERE target_path_hash = ? AND target_path = ? AND status = ?
+		ORDER BY created_at DESC`, fileNodePathHash(targetPath), targetPath, status)
 	if err != nil {
 		return nil, err
 	}

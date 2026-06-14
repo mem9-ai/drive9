@@ -27,6 +27,7 @@ const (
 	perfFuseRelease
 	perfFuseCreate
 	perfFuseMkdir
+	perfFuseMknod
 	perfFuseUnlink
 	perfFuseRmdir
 	perfFuseRename
@@ -34,6 +35,7 @@ const (
 	perfFuseReadlink
 	perfFuseSymlink
 	perfFuseLink
+	perfFuseAccess
 	perfFuseOpCount
 )
 
@@ -51,6 +53,7 @@ var perfFuseOpNames = [...]string{
 	perfFuseRelease:     "release",
 	perfFuseCreate:      "create",
 	perfFuseMkdir:       "mkdir",
+	perfFuseMknod:       "mknod",
 	perfFuseUnlink:      "unlink",
 	perfFuseRmdir:       "rmdir",
 	perfFuseRename:      "rename",
@@ -58,6 +61,7 @@ var perfFuseOpNames = [...]string{
 	perfFuseReadlink:    "readlink",
 	perfFuseSymlink:     "symlink",
 	perfFuseLink:        "link",
+	perfFuseAccess:      "access",
 }
 
 type perfRemoteOp int

@@ -204,7 +204,7 @@ func (c *WriteBackCache) PutWithBaseRevAndMode(remotePath string, data []byte, s
 		Generation: c.nextGen.Add(1),
 		Kind:       kind,
 		BaseRev:    baseRev,
-		Mode:       mode & 0o777,
+		Mode:       mode & posixPermissionModeMask,
 		HasMode:    hasMode,
 	}
 	metaBytes, err := json.Marshal(meta)
@@ -353,7 +353,7 @@ func (c *WriteBackCache) UpdateMode(remotePath string, mode uint32) error {
 		return nil
 	}
 	updated := *meta
-	updated.Mode = mode & 0o777
+	updated.Mode = mode & posixPermissionModeMask
 	updated.HasMode = true
 	updated.Generation = c.nextGen.Add(1)
 

@@ -87,7 +87,7 @@ def build_fixture(root: Path, tree_files: int = 0) -> dict[str, str]:
     commit(source, "feature rebase upstream")
 
     run(source, "checkout", "main")
-    run(None, "clone", "--bare", str(source), str(bare))
+    run(None, "clone", "--bare", "--no-local", str(source), str(bare))
     run(bare, "config", "uploadpack.allowFilter", "true")
     run(bare, "config", "uploadpack.allowAnySHA1InWant", "true")
 

@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,8 @@ type Dat9FS struct {
 	dirtyInodes         map[uint64]dirtyInodeState
 	dirtySeq            uint64
 	modeSeq             atomic.Uint64
+	specialMu           sync.RWMutex
+	specialByPath       map[string]uint64
 	uid                 uint32
 	gid                 uint32
 	opts                *MountOptions
@@ -238,6 +241,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
 		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
 		dirtyInodes:       make(map[uint64]dirtyInodeState),
+		specialByPath:     make(map[string]uint64),
 		uid:               uint32(os.Getuid()),
 		gid:               uint32(os.Getgid()),
 		opts:              opts,
@@ -411,7 +415,16 @@ func detachedSharedReadCtx(parent context.Context, timeout time.Duration) (conte
 
 // --- helpers -----------------------------------------------------------------
 
+const (
+	posixNameMax = 255
+)
+
+const maxPathTruncateInMemoryBytes int64 = 64 << 20
+
 func (fs *Dat9FS) childPath(parentIno uint64, name string) (string, gofuse.Status) {
+	if len(name) > posixNameMax {
+		return "", gofuse.Status(syscall.ENAMETOOLONG)
+	}
 	parentPath, ok := fs.inodes.GetPath(parentIno)
 	if !ok {
 		return "", gofuse.ENOENT
@@ -471,7 +484,11 @@ func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []
 		if err != nil {
 			return err
 		}
-		fs.markLayerFile(localPath)
+		if hasMode {
+			fs.markLayerFileMode(localPath, mode)
+		} else {
+			fs.markLayerFile(localPath)
+		}
 		return nil
 	}
 	req := client.FSLayerEntryRequest{
@@ -488,7 +505,11 @@ func (fs *Dat9FS) upsertLayerFile(ctx context.Context, localPath string, data []
 	if err := fs.upsertLayerEntry(ctx, req, uint64(len(data))); err != nil {
 		return err
 	}
-	fs.markLayerFile(localPath)
+	if hasMode {
+		fs.markLayerFileMode(localPath, mode)
+	} else {
+		fs.markLayerFile(localPath)
+	}
 	return nil
 }
 
@@ -1959,7 +1980,7 @@ func (fs *Dat9FS) pendingKindForHandle(fh *FileHandle) PendingKind {
 }
 
 func createInputMode(inputMode uint32) (uint32, bool) {
-	mode := inputMode & 0o777
+	mode := inputMode & posixPermissionModeMask
 	return mode, mode != defaultRegularFileMode
 }
 
@@ -1970,7 +1991,7 @@ func (fs *Dat9FS) modeForPendingHandle(fh *FileHandle) (uint32, bool) {
 		return 0, false
 	}
 	if fh.HasPendingMode {
-		return fh.PendingMode & 0o777, true
+		return fh.PendingMode & posixPermissionModeMask, true
 	}
 	return 0, false
 }
@@ -1989,7 +2010,7 @@ func (fs *Dat9FS) setPendingModeLocked(fh *FileHandle, mode uint32, gen uint64) 
 	if gen == 0 {
 		gen = fs.nextPendingModeGen()
 	}
-	fh.PendingMode = mode & 0o777
+	fh.PendingMode = mode & posixPermissionModeMask
 	fh.HasPendingMode = true
 	fh.PendingModeGen = gen
 }
@@ -2002,7 +2023,7 @@ func clearPendingModeLocked(fh *FileHandle) {
 }
 
 func pendingModeMatchesLocked(fh *FileHandle, mode uint32, gen uint64) bool {
-	return fh != nil && fh.HasPendingMode && fh.PendingModeGen == gen && fh.PendingMode&0o777 == mode&0o777
+	return fh != nil && fh.HasPendingMode && fh.PendingModeGen == gen && fh.PendingMode&posixPermissionModeMask == mode&posixPermissionModeMask
 }
 
 func (fs *Dat9FS) fileHandlesForInode(ino uint64) []*FileHandle {
@@ -2016,7 +2037,7 @@ func (fs *Dat9FS) fileHandlesForInode(ino uint64) []*FileHandle {
 }
 
 func (fs *Dat9FS) setPendingMetadataMode(path string, mode uint32) {
-	mode &= 0o777
+	mode &= posixPermissionModeMask
 	if fs.pendingIndex != nil {
 		if err := fs.pendingIndex.UpdateMode(path, mode); err != nil {
 			log.Printf("pending index mode update failed for %s: %v", path, err)
@@ -2058,20 +2079,258 @@ func (fs *Dat9FS) clearPendingModeForInodeGeneration(ino uint64, skip *FileHandl
 }
 
 func (fs *Dat9FS) applyRemoteMode(ctx context.Context, localPath string, mode uint32) error {
-	mode &= 0o777
+	localMode := mode & posixPermissionModeMask
+	remoteMode := remoteChmodMode(localMode)
 	if fs.layerEnabled() {
-		if err := fs.upsertLayerChmod(ctx, localPath, mode); err != nil {
-			return fmt.Errorf("layer chmod %s to %o: %w", localPath, mode, err)
+		if err := fs.upsertLayerChmod(ctx, localPath, remoteMode); err != nil {
+			return fmt.Errorf("layer chmod %s to %o: %w", localPath, remoteMode, err)
 		}
 		return nil
 	}
+	remotePath := fs.remotePath(localPath)
 	start := fs.perfStart()
-	err := fs.client.ChmodCtx(ctx, fs.remotePath(localPath), mode)
+	err := fs.client.ChmodCtx(ctx, remotePath, remoteMode)
 	fs.perfRecordRemote(perfRemoteMutation, start, err, 0)
+	fs.debugf("chmod remote done local=%s remote=%s local_mode=%o remote_mode=%o err=%v", localPath, remotePath, localMode, remoteMode, err)
 	if err != nil {
-		return fmt.Errorf("chmod %s to %o: %w", localPath, mode, err)
+		if fs.remoteChmodNotFoundCanStayLocal(ctx, localPath, remotePath, localMode, remoteMode, err) {
+			return nil
+		}
+		return fmt.Errorf("chmod %s to %o: %w", localPath, localMode, err)
 	}
 	return nil
+}
+
+func (fs *Dat9FS) remoteChmodNotFoundCanStayLocal(ctx context.Context, localPath, remotePath string, localMode, remoteMode uint32, chmodErr error) bool {
+	if !client.IsNotFound(chmodErr) {
+		return false
+	}
+	if fs.remoteChmodPathExists(ctx, remotePath) {
+		fs.debugf("chmod remote not found but target exists; keeping local metadata local=%s remote=%s local_mode=%o remote_mode=%o", localPath, remotePath, localMode, remoteMode)
+		return true
+	}
+	if strings.HasSuffix(remotePath, "/") {
+		withoutSlash := strings.TrimRight(remotePath, "/")
+		if withoutSlash != "" && withoutSlash != remotePath && fs.remoteChmodPathExists(ctx, withoutSlash) {
+			fs.debugf("chmod remote not found but target exists without slash; keeping local metadata local=%s remote=%s stat_remote=%s local_mode=%o remote_mode=%o", localPath, remotePath, withoutSlash, localMode, remoteMode)
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) remoteChmodPathExists(ctx context.Context, remotePath string) bool {
+	start := fs.perfStart()
+	_, err := fs.client.StatCtx(ctx, remotePath)
+	fs.perfRecordRemote(perfRemoteStat, start, err, 0)
+	if err == nil {
+		return true
+	}
+	fs.debugf("chmod remote existence check failed remote=%s err=%v", remotePath, err)
+	return false
+}
+
+func remoteDirectoryPath(p string) string {
+	if p == "/" || strings.HasSuffix(p, "/") {
+		return p
+	}
+	return p + "/"
+}
+
+func (fs *Dat9FS) applyRemoteModeForEntry(ctx context.Context, entry *InodeEntry, mode uint32) error {
+	if entry == nil {
+		return fmt.Errorf("chmod missing inode entry")
+	}
+	if entry != nil && entry.IsDir {
+		localMode := mode & posixPermissionModeMask
+		remoteMode := remoteChmodMode(localMode)
+		if fs.layerEnabled() {
+			if err := fs.upsertLayerChmod(ctx, entry.Path, remoteMode); err != nil {
+				return fmt.Errorf("layer chmod %s to %o: %w", entry.Path, remoteMode, err)
+			}
+			return nil
+		}
+		remotePath := remoteDirectoryPath(fs.remotePath(entry.Path))
+		start := fs.perfStart()
+		err := fs.client.ChmodCtx(ctx, remotePath, remoteMode)
+		fs.perfRecordRemote(perfRemoteMutation, start, err, 0)
+		fs.debugf("chmod remote done local=%s remote=%s local_mode=%o remote_mode=%o err=%v", entry.Path, remotePath, localMode, remoteMode, err)
+		if err != nil {
+			if fs.remoteChmodNotFoundCanStayLocal(ctx, entry.Path, remotePath, localMode, remoteMode, err) {
+				return nil
+			}
+			return fmt.Errorf("chmod %s to %o: %w", entry.Path, localMode, err)
+		}
+		return nil
+	}
+	return fs.applyRemoteMode(ctx, entry.Path, mode)
+}
+
+func (fs *Dat9FS) applyLayerLargeTruncate(ctx context.Context, entry *InodeEntry, newSize int64) gofuse.Status {
+	if fs.shadowStore == nil || fs.pendingIndex == nil {
+		return gofuse.EIO
+	}
+	expectedRevision := entry.Revision
+	mode := uint32(0)
+	hasMode := false
+	if entry.HasMode {
+		mode = remoteChmodMode(entry.Mode)
+		hasMode = true
+	}
+
+	if fs.shadowStore.Has(entry.Path) {
+		if err := fs.shadowStore.Truncate(entry.Path, newSize, expectedRevision); err != nil {
+			log.Printf("layer large truncate shadow truncate failed for %s: %v", entry.Path, err)
+			return gofuse.EIO
+		}
+	} else {
+		source := &remoteTruncateReaderAt{
+			ctx:          ctx,
+			client:       fs.client,
+			remotePath:   fs.remotePath(entry.Path),
+			existingSize: minInt64(entry.Size, newSize),
+			totalSize:    minInt64(entry.Size, newSize),
+		}
+		reader := io.NewSectionReader(&truncateReaderAt{
+			source:       source,
+			existingSize: minInt64(entry.Size, newSize),
+			totalSize:    newSize,
+		}, 0, newSize)
+		written, err := fs.shadowStore.WriteStream(entry.Path, reader, expectedRevision)
+		if err != nil {
+			log.Printf("layer large truncate shadow write failed for %s: %v", entry.Path, err)
+			return gofuse.EIO
+		}
+		if written != newSize {
+			log.Printf("layer large truncate shadow size mismatch for %s: wrote=%d want=%d", entry.Path, written, newSize)
+			return gofuse.EIO
+		}
+	}
+	fd, actualSize, err := fs.shadowStore.Open(entry.Path)
+	if err != nil {
+		log.Printf("layer large truncate shadow open failed for %s: %v", entry.Path, err)
+		return gofuse.EIO
+	}
+	defer func() { _ = fd.Close() }()
+	if actualSize != newSize {
+		log.Printf("layer large truncate shadow open size mismatch for %s: size=%d want=%d", entry.Path, actualSize, newSize)
+		return gofuse.EIO
+	}
+	writeStart := fs.perfStart()
+	_, err = fs.client.UploadFSLayerFile(ctx, fs.layerRef(), fs.remotePath(entry.Path), fd, actualSize, expectedRevision, mode, hasMode)
+	fs.perfRecordRemote(perfRemoteMutation, writeStart, err, uint64(newSize))
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+	if _, err := fs.pendingIndex.PutShadowSpillWithMode(entry.Path, newSize, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
+		log.Printf("layer large truncate pending index update failed for %s: %v", entry.Path, err)
+		return gofuse.EIO
+	}
+	fs.invalidateReadCacheAndTargets(entry.Path)
+	fs.cacheFileForPath(entry.Path, newSize, entry.Mtime, 0)
+	return gofuse.OK
+}
+
+func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, ino uint64, pid uint32, newSize int64) gofuse.Status {
+	if newSize < 0 {
+		return gofuse.Status(syscall.EINVAL)
+	}
+	if newSize > int64(int(^uint(0)>>1)) {
+		return gofuse.Status(syscall.EFBIG)
+	}
+
+	apiPath := fs.remotePath(entry.Path)
+	var data []byte
+	if newSize > 0 && newSize <= maxPathTruncateInMemoryBytes {
+		if entry.Size > 0 {
+			readSize := newSize
+			if entry.Size < readSize {
+				readSize = entry.Size
+			}
+			readStart := fs.perfStart()
+			var err error
+			data, err = fs.client.ReadAtCtx(ctx, apiPath, 0, readSize)
+			if err != nil {
+				fs.perfRecordRemote(perfRemoteRead, readStart, err, 0)
+				return httpToFuseStatus(err)
+			}
+			fs.perfRecordRemote(perfRemoteRead, readStart, nil, uint64(len(data)))
+		}
+		targetSize := int(newSize)
+		if int64(len(data)) > newSize {
+			data = data[:targetSize]
+		} else if int64(len(data)) < newSize {
+			resized := make([]byte, targetSize)
+			copy(resized, data)
+			data = resized
+		}
+	}
+
+	if fs.layerEnabled() {
+		if newSize > maxPathTruncateInMemoryBytes {
+			return fs.applyLayerLargeTruncate(ctx, entry, newSize)
+		}
+		expectedRevision := entry.Revision
+		mode := uint32(0)
+		hasMode := false
+		if entry.HasMode {
+			mode = remoteChmodMode(entry.Mode)
+			hasMode = true
+		}
+		if err := fs.upsertLayerFile(ctx, entry.Path, data, expectedRevision, mode, hasMode); err != nil {
+			return httpToFuseStatus(err)
+		}
+		if fs.shadowStore != nil {
+			if err := fs.shadowStore.WriteFull(entry.Path, data, expectedRevision); err != nil {
+				return gofuse.EIO
+			}
+		}
+		if fs.pendingIndex != nil {
+			if _, err := fs.pendingIndex.PutWithBaseRevAndMode(entry.Path, newSize, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
+				log.Printf("layer truncate pending index update failed for %s: %v", entry.Path, err)
+				return gofuse.EIO
+			}
+		}
+		fs.invalidateReadCacheAndTargets(entry.Path)
+		fs.cacheFileForPath(entry.Path, newSize, entry.Mtime, 0)
+		return gofuse.OK
+	}
+
+	writeStart := fs.perfStart()
+	var err error
+	if newSize > maxPathTruncateInMemoryBytes {
+		err = uploadRemoteTruncateFile(ctx, fs.client, apiPath, entry.Size, newSize, -1)
+	} else {
+		err = uploadBufferedRemoteFile(ctx, fs.client, apiPath, data, -1)
+	}
+	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(newSize))
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+
+	var refreshedRevision int64
+	var refreshedMtime time.Time
+	statStart := fs.perfStart()
+	stat, statErr := fs.client.StatCtx(ctx, apiPath)
+	fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
+	if statErr != nil {
+		log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, ino, statErr)
+	} else if stat != nil {
+		if stat.Revision > 0 {
+			refreshedRevision = stat.Revision
+			entry.Revision = stat.Revision
+			fs.inodes.UpdateRevision(ino, stat.Revision)
+			fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, pid)
+		}
+		if !stat.Mtime.IsZero() {
+			refreshedMtime = stat.Mtime
+			entry.Mtime = stat.Mtime
+			fs.inodes.UpdateMtime(ino, stat.Mtime)
+		}
+	}
+	fs.invalidateReadCacheAndTargets(entry.Path)
+	fs.cacheFileForPath(entry.Path, newSize, refreshedMtime, refreshedRevision)
+	return gofuse.OK
 }
 
 // applyPendingModeForHandleLocked applies a deferred chmod after the data
@@ -2416,7 +2675,7 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 		fh.BaseRev = rev
 	}
 	if meta.HasMode {
-		mode := meta.Mode & 0o777
+		mode := meta.Mode & posixPermissionModeMask
 		fs.setPendingModeLocked(fh, mode, 0)
 		fs.inodes.UpdateMode(fh.Ino, mode)
 	}
@@ -2448,7 +2707,7 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 		fs.inodes.UpdateRevision(fh.Ino, meta.BaseRev)
 	}
 	if meta.HasMode {
-		mode := meta.Mode & 0o777
+		mode := meta.Mode & posixPermissionModeMask
 		fs.setPendingModeLocked(fh, mode, 0)
 		fs.inodes.UpdateMode(fh.Ino, mode)
 	}
@@ -2901,29 +3160,46 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 	out.Size = uint64(size)
 	out.Blocks = (uint64(size) + 511) / 512
 	out.Uid = fs.uid
+	if entry.HasUID {
+		out.Uid = entry.Uid
+	}
 	out.Gid = fs.gid
+	if entry.HasGID {
+		out.Gid = entry.Gid
+	}
 
 	mtime := entry.Mtime
 	if mtime.IsZero() {
 		mtime = time.Now()
 	}
-	out.SetTimes(&mtime, &mtime, &mtime)
+	atime := entry.Atime
+	if atime.IsZero() {
+		atime = mtime
+	}
+	ctime := entry.Ctime
+	if ctime.IsZero() {
+		ctime = mtime
+	}
+	out.SetTimes(&atime, &mtime, &ctime)
 
 	if entry.IsDir {
 		mode := entry.Mode
 		if !entry.HasMode {
 			mode = 0755
 		}
-		out.Mode = syscall.S_IFDIR | (mode & 0o777)
-		out.Nlink = 2
+		out.Mode = syscall.S_IFDIR | (mode & posixPermissionModeMask)
+		out.Nlink = entry.Nlink
+		if out.Nlink == 0 {
+			out.Nlink = 2
+		}
 	} else if entryIsSymlink(entry) {
-		mode := entry.Mode & 0o777
+		mode := entry.Mode & posixPermissionModeMask
 		if !entry.HasMode {
 			mode = 0o777
 		}
 		out.Mode = uint32(syscall.S_IFLNK) | mode
 		out.Nlink = entry.Nlink
-		if out.Nlink == 0 {
+		if out.Nlink == 0 && !entry.Unlinked {
 			out.Nlink = 1
 		}
 	} else {
@@ -2931,9 +3207,16 @@ func (fs *Dat9FS) fillAttr(entry *InodeEntry, out *gofuse.Attr) {
 		if !entry.HasMode {
 			mode = 0644
 		}
-		out.Mode = syscall.S_IFREG | (mode & 0o777)
+		fileKind := uint32(syscall.S_IFREG)
+		if entry.HasMode {
+			if kind := mode & fileKindModeMask; kind != 0 {
+				fileKind = kind
+			}
+		}
+		out.Mode = fileKind | (mode & posixPermissionModeMask)
+		out.Rdev = entry.Rdev
 		out.Nlink = entry.Nlink
-		if out.Nlink == 0 {
+		if out.Nlink == 0 && !entry.Unlinked {
 			out.Nlink = 1
 		}
 	}
@@ -2951,16 +3234,18 @@ func dirEntryMode(isDir, hasMode bool, mode uint32) uint32 {
 	if isDir {
 		perm := uint32(0o755)
 		if hasMode {
-			perm = mode & 0o777
+			perm = mode & posixPermissionModeMask
 		}
 		return uint32(syscall.S_IFDIR) | perm
 	}
 	perm := uint32(0o644)
 	if hasMode {
-		perm = mode & 0o777
+		perm = mode & posixPermissionModeMask
 	}
-	if hasMode && isSymlinkMode(mode) {
-		return uint32(syscall.S_IFLNK) | perm
+	if hasMode {
+		if kind := mode & fileKindModeMask; kind != 0 {
+			return kind | perm
+		}
 	}
 	return uint32(syscall.S_IFREG) | perm
 }
@@ -3362,7 +3647,7 @@ func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath stri
 		size, eligible := unlinkSnapshotSizeLocked(fh, inodeSize)
 		fh.Unlock()
 
-		if !eligible || handlePath != localPath || size < 0 || size > maxPreloadSize {
+		if !eligible || handlePath != localPath || size < 0 || size > maxPathTruncateInMemoryBytes {
 			continue
 		}
 		candidates = append(candidates, candidate{fh: fh, size: size})
@@ -3396,11 +3681,11 @@ func (fs *Dat9FS) snapshotOpenHandlesForPath(ctx context.Context, localPath stri
 }
 
 func (fs *Dat9FS) readOpenHandleSnapshot(ctx context.Context, localPath string, size int64) ([]byte, error) {
-	if size < 0 || size > maxPreloadSize {
+	if size < 0 || size > maxPathTruncateInMemoryBytes {
 		return nil, fmt.Errorf("open-handle snapshot size out of range for %s: %d", localPath, size)
 	}
 	if fs.shadowStore != nil {
-		if shadowSize := fs.shadowStore.Size(localPath); shadowSize >= 0 && shadowSize <= maxPreloadSize {
+		if shadowSize := fs.shadowStore.Size(localPath); shadowSize >= 0 && shadowSize <= maxPathTruncateInMemoryBytes {
 			data, err := fs.shadowStore.ReadAll(localPath)
 			if err == nil {
 				return cloneBytes(data), nil
@@ -4054,6 +4339,10 @@ func cachedInfoFromEntry(name string, entry *InodeEntry) CachedFileInfo {
 		Revision:   entry.Revision,
 		Mode:       entry.Mode,
 		HasMode:    entry.HasMode,
+		Uid:        entry.Uid,
+		Gid:        entry.Gid,
+		HasUID:     entry.HasUID,
+		HasGID:     entry.HasGID,
 		ResourceID: entry.ResourceID,
 		Nlink:      entry.Nlink,
 	}
@@ -4119,6 +4408,37 @@ func (fs *Dat9FS) cacheEntryForPath(p string, entry *InodeEntry) {
 	}
 	parentPath, name := cacheParentName(p)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+}
+
+func (fs *Dat9FS) adjustDirectoryLinkCount(dirPath string, delta int32) {
+	if fs == nil || dirPath == "" {
+		return
+	}
+	ino, ok := fs.inodes.GetInode(dirPath)
+	if !ok {
+		return
+	}
+	if updated, ok := fs.inodes.AdjustLinkCount(ino, delta); ok {
+		fs.cacheEntryForPath(dirPath, updated)
+	}
+}
+
+func (fs *Dat9FS) touchDirectoryChangeTime(dirPath string, t time.Time) {
+	if fs == nil || dirPath == "" {
+		return
+	}
+	if t.IsZero() {
+		t = time.Now()
+	}
+	ino, ok := fs.inodes.GetInode(dirPath)
+	if !ok {
+		return
+	}
+	fs.inodes.UpdateMtime(ino, t)
+	fs.inodes.UpdateCtime(ino, t)
+	if entry, ok := fs.inodes.GetEntry(ino); ok {
+		fs.cacheEntryForPath(dirPath, entry)
+	}
 }
 
 func (fs *Dat9FS) markStatCacheUnverified() {
@@ -4194,6 +4514,14 @@ func (fs *Dat9FS) cacheNegativePath(p string) {
 	}
 	parentPath, name := cacheParentName(p)
 	fs.dirCache.MarkNegative(parentPath, name)
+}
+
+func (fs *Dat9FS) hasNegativePathCache(p string) bool {
+	if fs == nil || fs.dirCache == nil || p == "/" {
+		return false
+	}
+	parentPath, name := cacheParentName(p)
+	return fs.dirCache.Lookup(parentPath, name).kind == namespaceLookupNegative
 }
 
 // maybeListOnNegativeLookupStorm converts a burst of remote ENOENT lookups
@@ -4301,6 +4629,62 @@ func (fs *Dat9FS) remotePathStatDetached(localPath string) (*client.StatResult, 
 	stat, err := fs.client.StatCtx(retryCtx, fs.remotePath(localPath))
 	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
 	return stat, err
+}
+
+func isDirectChildPath(parentPath, childPath string) bool {
+	if parentPath == "" || childPath == "" || childPath == parentPath {
+		return false
+	}
+	var rest string
+	if parentPath == "/" {
+		if !strings.HasPrefix(childPath, "/") {
+			return false
+		}
+		rest = strings.TrimPrefix(childPath, "/")
+	} else {
+		prefix := parentPath + "/"
+		if !strings.HasPrefix(childPath, prefix) {
+			return false
+		}
+		rest = strings.TrimPrefix(childPath, prefix)
+	}
+	return rest != "" && !strings.Contains(rest, "/")
+}
+
+func (fs *Dat9FS) hasKnownLocalDirectoryChildren(dirPath string) bool {
+	if fs == nil {
+		return false
+	}
+	if fs.dirCache != nil && fs.dirCache.HasPositiveEntries(dirPath) {
+		return true
+	}
+	for _, entry := range fs.inodes.Snapshot() {
+		if entry.Unlinked {
+			continue
+		}
+		for p := range entry.Paths {
+			if isDirectChildPath(dirPath, p) {
+				return true
+			}
+		}
+		if isDirectChildPath(dirPath, entry.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string) (bool, error) {
+	listStart := fs.perfStart()
+	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
+	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
+	if err != nil {
+		return false, err
+	}
+	if fs.dirCache != nil {
+		fs.dirCache.Put(dirPath, cachedFileInfos(items))
+	}
+	return len(items) > 0, nil
 }
 
 func (fs *Dat9FS) remoteHardlinkCommittedDetached(srcP, dstP string) bool {
@@ -4645,6 +5029,13 @@ func (fs *Dat9FS) cachedAttrEntry(entry *InodeEntry) (*InodeEntry, bool) {
 	cached.Size = item.Size
 	cached.IsDir = item.IsDir
 	cached.Mtime = mtime
+	if item.HasUID || item.HasGID {
+		cached.Uid = item.Uid
+		cached.Gid = item.Gid
+		cached.HasUID = item.HasUID
+		cached.HasGID = item.HasGID
+		fs.inodes.UpdateOwner(entry.Ino, item.Uid, item.Gid, item.HasUID, item.HasGID)
+	}
 	if item.Revision > 0 {
 		cached.Revision = item.Revision
 		fs.inodes.UpdateRevision(entry.Ino, item.Revision)
@@ -4726,6 +5117,12 @@ func (fs *Dat9FS) Lookup(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	if entry, ok := fs.specialNodeEntry(childP); ok {
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.fillEntryOut(entry, out)
+		return gofuse.OK
+	}
 	if handled, status := fs.lookupLayerNamespaceEntry(header.NodeId, childP, name, out); handled {
 		return status
 	}
@@ -4901,6 +5298,9 @@ func (fs *Dat9FS) shouldPreserveForgottenInode(entry *InodeEntry) bool {
 	if entry == nil {
 		return false
 	}
+	if entryIsMetadataOnlySpecial(entry) {
+		return true
+	}
 	if fs.hasOpenHandle(entry.Ino, entry.Path) {
 		return true
 	}
@@ -4911,7 +5311,153 @@ func (fs *Dat9FS) hasOpenHandle(ino uint64, p string) bool {
 	return fs.openHandles.Has(ino, p)
 }
 
+func (fs *Dat9FS) markOpenHandlesUnlinked(ctx context.Context, p string, snapshotRemote bool) bool {
+	if fs.openHandles == nil || p == "" {
+		return false
+	}
+	handles := fs.openHandles.SnapshotPath(p)
+	if len(handles) == 0 {
+		return false
+	}
+
+	var size int64
+	var revision int64
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		if entry, ok := fs.inodes.GetEntry(ino); ok {
+			size = entry.Size
+			revision = entry.Revision
+		}
+	}
+
+	snapshotOK := false
+	var snapshot []byte
+	snapshotShadowGen := uint64(0)
+	if snapshotRemote {
+		needsSnapshot := false
+		snapshotNeedCount := 0
+		for _, fh := range handles {
+			if fh == nil {
+				continue
+			}
+			fh.Lock()
+			handleNeedsSnapshot := cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh)
+			if handleNeedsSnapshot {
+				needsSnapshot = true
+				snapshotNeedCount++
+			}
+			fh.Unlock()
+		}
+		if needsSnapshot {
+			if size == 0 {
+				snapshotOK = true
+			} else if size <= maxPathTruncateInMemoryBytes {
+				readStart := fs.perfStart()
+				data, err := fs.client.ReadAtCtx(ctx, fs.remotePath(p), 0, size)
+				if err == nil && int64(len(data)) == size {
+					snapshot = data
+					snapshotOK = true
+				} else if err == nil {
+					err = io.ErrUnexpectedEOF
+					log.Printf("open-unlink snapshot short read for %s: got=%d want=%d", p, len(data), size)
+				} else {
+					log.Printf("open-unlink snapshot failed for %s: %v", p, err)
+				}
+				fs.perfRecordRemote(perfRemoteRead, readStart, err, uint64(len(data)))
+			} else {
+				gen, err := fs.snapshotUnlinkedRemoteToShadow(ctx, p, size, revision, snapshotNeedCount)
+				if err == nil {
+					snapshotShadowGen = gen
+					snapshotOK = true
+				} else {
+					log.Printf("open-unlink large snapshot failed for %s: %v", p, err)
+				}
+			}
+		}
+	}
+
+	for _, fh := range handles {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		fh.Unlinked = true
+		if fh.Dirty != nil {
+			fh.UnlinkedSize = fh.Dirty.Size()
+		} else if snapshotOK {
+			if snapshotShadowGen != 0 && cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh) {
+				fh.UnlinkedData = nil
+				fh.UnlinkedSnapshot = true
+				fh.UnlinkedShadowGen = snapshotShadowGen
+				fh.UnlinkedSize = size
+			} else {
+				fh.UnlinkedData = append(fh.UnlinkedData[:0], snapshot...)
+				fh.UnlinkedSnapshot = true
+				fh.UnlinkedSize = int64(len(snapshot))
+			}
+		} else {
+			fh.UnlinkedSize = size
+		}
+		fh.Unlock()
+	}
+	fs.openHandles.UnlinkPath(p)
+	return true
+}
+
+func cleanRemoteHandleNeedsUnlinkedSnapshotLocked(fh *FileHandle) bool {
+	return fh != nil &&
+		fh.Dirty == nil &&
+		fh.LocalFile == nil &&
+		fh.Layer != PathLayerGitWorkspace &&
+		fh.UnlinkedData == nil &&
+		fh.UnlinkedShadowGen == 0 &&
+		!fh.UnlinkedSnapshot
+}
+
+func (fs *Dat9FS) snapshotUnlinkedRemoteToShadow(ctx context.Context, p string, size int64, revision int64, pinCount int) (uint64, error) {
+	if fs.shadowStore == nil {
+		return 0, fmt.Errorf("no shadow store")
+	}
+	if pinCount <= 0 {
+		return 0, nil
+	}
+	if size < 0 {
+		return 0, fmt.Errorf("negative snapshot size %d", size)
+	}
+	rc, err := fs.client.ReadStream(ctx, fs.remotePath(p))
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = rc.Close() }()
+
+	reader := io.LimitReader(rc, size)
+	written, err := fs.shadowStore.WriteStream(p, reader, revision)
+	if err != nil {
+		fs.shadowStore.Remove(p)
+		return 0, err
+	}
+	if written != size {
+		fs.shadowStore.Remove(p)
+		return 0, fmt.Errorf("short snapshot write %d/%d", written, size)
+	}
+	var gen uint64
+	for i := 0; i < pinCount; i++ {
+		gen = fs.shadowStore.Pin(p)
+	}
+	fs.shadowStore.Remove(p)
+	return gen, nil
+}
+
 func (fs *Dat9FS) hasPendingLocalState(p string) bool {
+	if fs.hasPendingMetadataState(p) {
+		return true
+	}
+	if fs.shadowStore != nil && fs.shadowStore.Has(p) {
+		return true
+	}
+	return false
+}
+
+func (fs *Dat9FS) hasPendingMetadataState(p string) bool {
 	if fs.pendingIndex != nil {
 		if _, ok := fs.pendingIndex.GetMeta(p); ok {
 			return true
@@ -4921,9 +5467,6 @@ func (fs *Dat9FS) hasPendingLocalState(p string) bool {
 		if _, ok := fs.writeBack.GetMeta(p); ok {
 			return true
 		}
-	}
-	if fs.shadowStore != nil && fs.shadowStore.Has(p) {
-		return true
 	}
 	return false
 }
@@ -5089,6 +5632,11 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	if entryIsMetadataOnlySpecial(entry) {
+		fs.fillAttr(entry, &out.Attr)
+		out.SetTimeout(fs.opts.AttrTTL)
+		return gofuse.OK
+	}
 	if fs.isLayerWhiteout(entry.Path) {
 		return gofuse.ENOENT
 	}
@@ -5103,6 +5651,14 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		out.SetTimeout(fs.opts.AttrTTL)
 		return gofuse.OK
 	}
+	if entry.Unlinked {
+		if size, ok := fs.dirtyHandleSize(input.NodeId); ok {
+			entry.Size = size
+		}
+		fs.fillAttr(entry, &out.Attr)
+		out.SetTimeout(fs.opts.AttrTTL)
+		return gofuse.OK
+	}
 	if target, mode, ok := fs.layerSymlink(entry.Path); ok {
 		entry.IsDir = false
 		entry.Size = int64(len(target))
@@ -5110,6 +5666,11 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 		entry.HasMode = true
 		fs.inodes.UpdateSize(input.NodeId, int64(len(target)))
 		fs.inodes.UpdateMode(input.NodeId, mode)
+		fs.fillAttr(entry, &out.Attr)
+		out.SetTimeout(fs.opts.AttrTTL)
+		return gofuse.OK
+	}
+	if entryIsSymlink(entry) {
 		fs.fillAttr(entry, &out.Attr)
 		out.SetTimeout(fs.opts.AttrTTL)
 		return gofuse.OK
@@ -5236,9 +5797,277 @@ func (fs *Dat9FS) GetAttr(cancel <-chan struct{}, input *gofuse.GetAttrIn, out *
 	return gofuse.OK
 }
 
+func (fs *Dat9FS) Access(cancel <-chan struct{}, input *gofuse.AccessIn) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseAccess, perfStart, status, 0) }()
+
+	var out gofuse.AttrOut
+	if st := fs.GetAttr(cancel, &gofuse.GetAttrIn{InHeader: input.InHeader}, &out); st != gofuse.OK {
+		return st
+	}
+	if !hasPOSIXAccess(input.Owner, gofuse.Owner{Uid: out.Uid, Gid: out.Gid}, out.Mode, input.Mask, func(gid uint32) bool {
+		return processHasSupplementaryGroup(input.Pid, gid)
+	}) {
+		return gofuse.EACCES
+	}
+	return gofuse.OK
+}
+
+func hasPOSIXAccess(caller gofuse.Owner, file gofuse.Owner, mode uint32, mask uint32, inSupplementaryGroup func(uint32) bool) bool {
+	mask &= 0o7
+	if mask == gofuse.F_OK {
+		return true
+	}
+	if caller.Uid == 0 {
+		if mask&gofuse.X_OK == 0 {
+			return true
+		}
+		return mode&0o111 != 0
+	}
+
+	perm := mode & 0o777
+	if caller.Uid == file.Uid {
+		return perm&(mask<<6) == mask<<6
+	}
+	if caller.Gid == file.Gid || (inSupplementaryGroup != nil && inSupplementaryGroup(file.Gid)) {
+		return perm&(mask<<3) == mask<<3
+	}
+	return perm&mask == mask
+}
+
+func hasPOSIXSearchAccess(caller gofuse.Owner, file gofuse.Owner, mode uint32, inSupplementaryGroup func(uint32) bool) bool {
+	if caller.Uid == 0 {
+		return true
+	}
+	return hasPOSIXAccess(caller, file, mode, gofuse.X_OK, inSupplementaryGroup)
+}
+
+const setGIDPermissionBit uint32 = 0o2000
+
+func (fs *Dat9FS) entryOwner(entry *InodeEntry) gofuse.Owner {
+	owner := gofuse.Owner{Uid: fs.uid, Gid: fs.gid}
+	if entry == nil {
+		return owner
+	}
+	if entry.HasUID {
+		owner.Uid = entry.Uid
+	}
+	if entry.HasGID {
+		owner.Gid = entry.Gid
+	}
+	return owner
+}
+
+func entryIsRegularFile(entry *InodeEntry) bool {
+	if entry == nil || entry.IsDir {
+		return false
+	}
+	if !entry.HasMode {
+		return true
+	}
+	kind := entry.Mode & fileKindModeMask
+	return kind == 0 || kind == uint32(syscall.S_IFREG)
+}
+
+func (fs *Dat9FS) checkPathSearchAccess(ctx context.Context, caller gofuse.Owner, pid uint32, p string) gofuse.Status {
+	if p == "/" {
+		return gofuse.OK
+	}
+	for dir := parentDir(p); ; dir = parentDir(dir) {
+		entry, st := fs.pathSearchEntry(ctx, dir)
+		if st == gofuse.ENOENT {
+			return gofuse.OK
+		}
+		if st != gofuse.OK {
+			return st
+		}
+		if !entry.IsDir {
+			return gofuse.Status(syscall.ENOTDIR)
+		}
+		if !hasPOSIXSearchAccess(caller, fs.entryOwner(entry), dirEntryMode(true, entry.HasMode, entry.Mode), func(gid uint32) bool {
+			return processHasSupplementaryGroup(pid, gid)
+		}) {
+			return gofuse.EACCES
+		}
+		if dir == "/" {
+			return gofuse.OK
+		}
+	}
+}
+
+func (fs *Dat9FS) pathSearchEntry(ctx context.Context, p string) (*InodeEntry, gofuse.Status) {
+	if ino, ok := fs.inodes.GetInode(p); ok {
+		if entry, ok := fs.inodes.GetEntry(ino); ok {
+			return entry, gofuse.OK
+		}
+	}
+	statStart := fs.perfStart()
+	stat, err := fs.client.StatCtx(ctx, fs.remotePath(p))
+	fs.perfRecordRemote(perfRemoteStat, statStart, err, 0)
+	if err != nil {
+		return nil, httpToFuseStatus(err)
+	}
+	if stat == nil || !stat.IsDir {
+		return nil, gofuse.Status(syscall.ENOTDIR)
+	}
+	mtime := stat.Mtime
+	if mtime.IsZero() {
+		mtime = time.Now()
+	}
+	ino := fs.inodes.EnsureInodeWithIdentity(p, stat.ResourceID, stat.Nlink, true, stat.Size, mtime)
+	if stat.Revision > 0 {
+		fs.inodes.UpdateRevision(ino, stat.Revision)
+	}
+	if stat.HasMode {
+		fs.inodes.UpdateMode(ino, stat.Mode)
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		return nil, gofuse.EIO
+	}
+	return entry, gofuse.OK
+}
+
+func openAccessMask(flags uint32) uint32 {
+	var mask uint32
+	switch flags & syscall.O_ACCMODE {
+	case syscall.O_WRONLY:
+		mask = gofuse.W_OK
+	case syscall.O_RDWR:
+		mask = gofuse.R_OK | gofuse.W_OK
+	default:
+		mask = gofuse.R_OK
+	}
+	if flags&syscall.O_TRUNC != 0 {
+		mask |= gofuse.W_OK
+	}
+	return mask
+}
+
+func (fs *Dat9FS) checkOpenAccess(ctx context.Context, input *gofuse.OpenIn, entry *InodeEntry) gofuse.Status {
+	if entry == nil {
+		return gofuse.ENOENT
+	}
+	if st := fs.checkPathSearchAccess(ctx, input.Owner, input.Pid, entry.Path); st != gofuse.OK {
+		return st
+	}
+	if !hasPOSIXAccess(input.Owner, fs.entryOwner(entry), dirEntryMode(entry.IsDir, entry.HasMode, entry.Mode), openAccessMask(input.Flags), func(gid uint32) bool {
+		return processHasSupplementaryGroup(input.Pid, gid)
+	}) {
+		return gofuse.EACCES
+	}
+	return gofuse.OK
+}
+
+func (fs *Dat9FS) setAttrModeForCaller(input *gofuse.SetAttrIn, entry *InodeEntry) (uint32, gofuse.Status) {
+	caller := setAttrCallerOwner(input)
+	owner := fs.entryOwner(entry)
+	if caller.Uid != 0 && caller.Uid != owner.Uid {
+		return 0, gofuse.EPERM
+	}
+
+	mode := input.Mode & posixPermissionModeMask
+	if caller.Uid != 0 && entryIsRegularFile(entry) && mode&setGIDPermissionBit != 0 {
+		if caller.Gid != owner.Gid && !processHasSupplementaryGroup(input.Pid, owner.Gid) {
+			mode &^= setGIDPermissionBit
+		}
+	}
+	return mode, gofuse.OK
+}
+
+func (fs *Dat9FS) checkSetAttrOwnerForCaller(input *gofuse.SetAttrIn, entry *InodeEntry, uid uint32, hasUID bool, gid uint32, hasGID bool) gofuse.Status {
+	if !hasUID && !hasGID {
+		return gofuse.OK
+	}
+	caller := setAttrCallerOwner(input)
+	current := fs.entryOwner(entry)
+	if hasUID && uid != current.Uid && caller.Uid != 0 {
+		return gofuse.EPERM
+	}
+	if hasGID && gid != current.Gid && caller.Uid != 0 {
+		if caller.Uid != current.Uid {
+			return gofuse.EPERM
+		}
+		if caller.Gid != gid && !processHasSupplementaryGroup(input.Pid, gid) {
+			return gofuse.EPERM
+		}
+	}
+	return gofuse.OK
+}
+
+func processHasSupplementaryGroup(pid, gid uint32) bool {
+	if pid == 0 {
+		return false
+	}
+	if ok, handled := processHasSupplementaryGroupProc(pid, gid); handled {
+		return ok
+	}
+	if pid == uint32(os.Getpid()) && currentProcessHasSupplementaryGroup(gid) {
+		return true
+	}
+	return false
+}
+
+func processHasSupplementaryGroupProc(pid, gid uint32) (bool, bool) {
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return false, false
+	}
+	return procStatusHasGroup(status, gid), true
+}
+
+func procStatusHasGroup(status []byte, gid uint32) bool {
+	target := strconv.FormatUint(uint64(gid), 10)
+	for _, line := range strings.Split(string(status), "\n") {
+		if !strings.HasPrefix(line, "Groups:") {
+			continue
+		}
+		for _, group := range strings.Fields(strings.TrimPrefix(line, "Groups:")) {
+			if group == target {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+func currentProcessHasSupplementaryGroup(gid uint32) bool {
+	groups, err := os.Getgroups()
+	if err != nil {
+		return false
+	}
+	for _, group := range groups {
+		if uint32(group) == gid {
+			return true
+		}
+	}
+	return false
+}
+
+func setAttrCallerOwner(input *gofuse.SetAttrIn) gofuse.Owner {
+	if input == nil {
+		return gofuse.Owner{}
+	}
+	//nolint:staticcheck // SetAttrIn also has a payload Owner; promoted input.Owner is not the caller.
+	header := input.SetAttrInCommon.InHeader
+	return gofuse.Owner{Uid: header.Uid, Gid: header.Gid}
+}
+
 func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *gofuse.AttrOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseSetAttr, perfStart, status, 0) }()
+	defer func() {
+		if status == gofuse.OK || !fs.debugEnabled() {
+			return
+		}
+		path := "<unknown>"
+		if entry, ok := fs.inodes.GetEntry(input.NodeId); ok {
+			path = entry.Path
+		}
+		caller := setAttrCallerOwner(input)
+		fs.debugf("setattr failed path=%s node=%d valid=0x%x mode=%o caller=%d:%d status=%d", path, input.NodeId, input.Valid, input.Mode, caller.Uid, caller.Gid, status)
+	}()
 	if fs.opts.ReadOnly {
 		return gofuse.EROFS
 	}
@@ -5248,6 +6077,14 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
+	if entryIsMetadataOnlySpecial(entry) {
+		return fs.setMetadataOnlySpecialAttr(input, entry, out)
+	}
+	if input.Valid&gofuse.FATTR_FH == 0 {
+		if st := fs.checkPathSearchAccess(ctx, setAttrCallerOwner(input), input.Pid, entry.Path); st != gofuse.OK {
+			return st
+		}
+	}
 	if overlay, local, st := fs.localOverlayForPath(ctx, entry.Path); local {
 		if st != gofuse.OK {
 			return st
@@ -5265,8 +6102,33 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			fs.inodes.UpdateMtime(input.NodeId, mtime)
 			metadataChanged = true
 		}
+		if atime, ok := input.GetATime(); ok {
+			entry.Atime = atime
+			fs.inodes.UpdateAtime(input.NodeId, atime)
+			metadataChanged = true
+		}
+		ownerUID, hasUID := input.GetUID()
+		ownerGID, hasGID := input.GetGID()
+		if hasUID || hasGID {
+			if st := fs.checkSetAttrOwnerForCaller(input, entry, ownerUID, hasUID, ownerGID, hasGID); st != gofuse.OK {
+				return st
+			}
+			if hasUID {
+				entry.Uid = ownerUID
+				entry.HasUID = true
+			}
+			if hasGID {
+				entry.Gid = ownerGID
+				entry.HasGID = true
+			}
+			fs.inodes.UpdateOwner(input.NodeId, ownerUID, ownerGID, hasUID, hasGID)
+			metadataChanged = true
+		}
 		if input.Valid&gofuse.FATTR_MODE != 0 {
-			mode := input.Mode & 0o777
+			mode, st := fs.setAttrModeForCaller(input, entry)
+			if st != gofuse.OK {
+				return st
+			}
 			if err := overlay.Chmod(entry.Path, mode); err != nil {
 				return localErrToFuseStatus(err)
 			}
@@ -5275,6 +6137,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				entryMode |= uint32(syscall.S_IFLNK)
 			}
 			entry.Mode = entryMode
+			entry.HasMode = true
 			fs.inodes.UpdateMode(input.NodeId, entryMode)
 			metadataChanged = true
 		}
@@ -5282,11 +6145,15 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			if entry.IsDir {
 				return gofuse.Status(syscall.EISDIR)
 			}
+			oldSize := entry.Size
 			if err := overlay.Truncate(entry.Path, int64(input.Size)); err != nil {
 				return localErrToFuseStatus(err)
 			}
 			entry.Size = int64(input.Size)
 			fs.inodes.UpdateSize(input.NodeId, int64(input.Size))
+			if entry.Size != oldSize {
+				metadataChanged = true
+			}
 		}
 		info, err := overlay.Lstat(entry.Path)
 		if err == nil {
@@ -5295,6 +6162,9 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			}
 		}
 		if metadataChanged {
+			ctime := time.Now()
+			entry.Ctime = ctime
+			fs.inodes.UpdateCtime(input.NodeId, ctime)
 			fs.cacheEntryForPath(entry.Path, entry)
 		}
 		fs.fillAttr(entry, &out.Attr)
@@ -5318,9 +6188,39 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 		metadataChanged = true
 	}
 
+	// Handle atime updates.
+	if atime, ok := input.GetATime(); ok {
+		entry.Atime = atime
+		fs.inodes.UpdateAtime(input.NodeId, atime)
+		metadataChanged = true
+	}
+
+	// Handle owner updates. Drive9 does not persist uid/gid remotely yet, but
+	// the FUSE mount should report the ownership it has acknowledged.
+	ownerUID, hasUID := input.GetUID()
+	ownerGID, hasGID := input.GetGID()
+	if hasUID || hasGID {
+		if st := fs.checkSetAttrOwnerForCaller(input, entry, ownerUID, hasUID, ownerGID, hasGID); st != gofuse.OK {
+			return st
+		}
+		if hasUID {
+			entry.Uid = ownerUID
+			entry.HasUID = true
+		}
+		if hasGID {
+			entry.Gid = ownerGID
+			entry.HasGID = true
+		}
+		fs.inodes.UpdateOwner(input.NodeId, ownerUID, ownerGID, hasUID, hasGID)
+		metadataChanged = true
+	}
+
 	// Handle mode (chmod)
 	if input.Valid&gofuse.FATTR_MODE != 0 {
-		mode := input.Mode & 0777
+		mode, st := fs.setAttrModeForCaller(input, entry)
+		if st != gofuse.OK {
+			return st
+		}
 		entryMode := mode
 		if entryIsSymlink(entry) {
 			entryMode |= uint32(syscall.S_IFLNK)
@@ -5346,24 +6246,40 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 			}
 			h.Unlock()
 		}
-		if hasDirtyHandle {
-			fs.setPendingMetadataMode(entry.Path, mode)
+		hasPendingMetadata := false
+		if !hasDirtyHandle && fs.hasQueuedCommit(entry.Path) {
+			if fs.commitQueue != nil {
+				fs.commitQueue.WaitPath(entry.Path)
+			}
 		}
 		if !hasDirtyHandle {
+			hasPendingMetadata = fs.hasPendingMetadataState(entry.Path)
+		}
+		if hasDirtyHandle || hasPendingMetadata {
+			fs.setPendingMetadataMode(entry.Path, mode)
+		}
+		if !hasDirtyHandle && (!hasPendingMetadata || fs.layerEnabled()) {
 			ctx, cf := fuseCtx(cancel)
 			defer cf()
-			if err := fs.applyRemoteMode(ctx, entry.Path, mode); err != nil {
+			if err := retryPostUploadMode(ctx, func() error {
+				return fs.applyRemoteModeForEntry(ctx, entry, mode)
+			}); err != nil {
 				return httpToFuseStatus(err)
 			}
 		}
 		entry.Mode = entryMode
+		entry.HasMode = true
 		fs.inodes.UpdateMode(input.NodeId, entryMode)
 		metadataChanged = true
 	}
 
 	// Handle truncate
 	if input.Valid&gofuse.FATTR_SIZE != 0 {
+		if input.Size > uint64(1<<63-1) {
+			return gofuse.Status(syscall.EFBIG)
+		}
 		newSize := int64(input.Size)
+		oldSize := entry.Size
 
 		if input.Valid&gofuse.FATTR_FH != 0 {
 			// ftruncate(fd, size): truncate the open write buffer.
@@ -5382,86 +6298,26 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				fh.Unlock()
 			}
 		} else {
-			// truncate(path, size): no open file handle — must persist
-			// to the server. We only support truncate-to-zero, which is
-			// the common case (e.g. shell "> file").
-			if newSize == 0 {
-				ctx, cf := fuseCtx(cancel)
-				defer cf()
-				if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, nil, newSize); err != nil {
-					return httpToFuseStatus(err)
-				}
-				if fs.layerEnabled() {
-					expectedRevision := entry.Revision
-					mode := uint32(0)
-					hasMode := false
-					if entry.HasMode {
-						mode = entry.Mode & 0o777
-						hasMode = true
-					}
-					if err := fs.upsertLayerFile(ctx, entry.Path, nil, expectedRevision, mode, hasMode); err != nil {
-						return httpToFuseStatus(err)
-					}
-					if fs.shadowStore != nil {
-						if err := fs.shadowStore.WriteFull(entry.Path, nil, expectedRevision); err != nil {
-							return gofuse.EIO
-						}
-					}
-					if fs.pendingIndex != nil {
-						if _, err := fs.pendingIndex.PutWithBaseRevAndMode(entry.Path, 0, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
-							log.Printf("layer truncate pending index update failed for %s: %v", entry.Path, err)
-							return gofuse.EIO
-						}
-					}
-					fs.invalidateReadCacheAndTargets(entry.Path)
-					fs.cacheFileForPath(entry.Path, 0, entry.Mtime, 0)
-				} else {
-					apiPath := fs.remotePath(entry.Path)
-					writeStart := fs.perfStart()
-					err := fs.client.WriteCtx(ctx, apiPath, nil)
-					fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
-					if err != nil {
-						return httpToFuseStatus(err)
-					}
-					// Refresh the inode revision after the server-side truncate so a
-					// subsequent writable open does not reuse the stale pre-truncate
-					// base revision and conflict with its own zero-byte write.
-					var refreshedRevision int64
-					var refreshedMtime time.Time
-					statStart := fs.perfStart()
-					stat, statErr := fs.client.StatCtx(ctx, apiPath)
-					fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
-					if statErr != nil {
-						log.Printf("post-truncate stat refresh failed for %s (inode=%d): %v (revision may be stale)", entry.Path, input.NodeId, statErr)
-					} else if stat != nil {
-						if stat.Revision > 0 {
-							refreshedRevision = stat.Revision
-							entry.Revision = stat.Revision
-							fs.inodes.UpdateRevision(input.NodeId, stat.Revision)
-							fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, input.Pid)
-						}
-						if !stat.Mtime.IsZero() {
-							refreshedMtime = stat.Mtime
-							entry.Mtime = stat.Mtime
-							fs.inodes.UpdateMtime(input.NodeId, stat.Mtime)
-						}
-					}
-					fs.invalidateReadCacheAndTargets(entry.Path)
-					fs.cacheFileForPath(entry.Path, 0, refreshedMtime, refreshedRevision)
-				}
-			} else if newSize != entry.Size {
-				// Arbitrary truncate without an open handle is not
-				// supported — dat9 has no server-side truncate API.
-				return gofuse.Status(syscall.ENOTSUP)
+			if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, nil, newSize); err != nil {
+				return httpToFuseStatus(err)
+			}
+			if st := fs.applyRemoteTruncate(ctx, entry, input.NodeId, input.Pid, newSize); st != gofuse.OK {
+				return st
 			}
 		}
 		entry.Size = newSize
 		fs.inodes.UpdateSize(input.NodeId, newSize)
+		if newSize != oldSize {
+			metadataChanged = true
+		}
 		// Kernel already receives updated attrs via the SetAttr reply —
 		// no need for an explicit notifyInode here.
 	}
 
 	if metadataChanged {
+		ctime := time.Now()
+		entry.Ctime = ctime
+		fs.inodes.UpdateCtime(input.NodeId, ctime)
 		fs.cacheEntryForPath(entry.Path, entry)
 	}
 	fs.fillAttr(entry, &out.Attr)
@@ -5519,6 +6375,117 @@ func (fs *Dat9FS) Readlink(cancel <-chan struct{}, header *gofuse.InHeader) (out
 
 // --- Directory operations ----------------------------------------------------
 
+func (fs *Dat9FS) Mknod(cancel <-chan struct{}, input *gofuse.MknodIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
+	perfStart := fs.perfStart()
+	defer func() { fs.perfRecordFuse(perfFuseMknod, perfStart, status, 0) }()
+	if fs.opts.ReadOnly {
+		return gofuse.EROFS
+	}
+
+	childP, st := fs.childPath(input.NodeId, name)
+	if st != gofuse.OK {
+		return st
+	}
+
+	mode := metadataNodeMode(input.Mode)
+	switch mode & fileKindModeMask {
+	case 0, syscall.S_IFREG:
+		return fs.mknodRegular(cancel, input, name, childP, mode, out)
+	}
+	if !metadataOnlySpecialMode(mode) {
+		return gofuse.Status(syscall.ENOTSUP)
+	}
+	if _, ok := fs.specialNodeEntry(childP); ok {
+		return gofuse.Status(syscall.EEXIST)
+	}
+	if fs.hasPendingLocalState(childP) || fs.hasQueuedCommit(childP) {
+		return gofuse.Status(syscall.EEXIST)
+	}
+	if exists, err := fs.remotePathExistsDetached(childP); err != nil {
+		return httpToFuseStatus(err)
+	} else if exists {
+		return gofuse.Status(syscall.EEXIST)
+	}
+
+	now := time.Now()
+	ino := fs.inodes.Lookup(childP, false, 0, now)
+	fs.inodes.UpdateMode(ino, mode)
+	fs.inodes.UpdateRdev(ino, input.Rdev)
+	fs.inodes.UpdateOwner(ino, input.Uid, input.Gid, true, true)
+	fs.inodes.UpdateAtime(ino, now)
+	fs.inodes.UpdateMtime(ino, now)
+	fs.inodes.UpdateCtime(ino, now)
+	fs.addSpecialNode(childP, ino)
+
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		return gofuse.EIO
+	}
+	parentPath, _ := fs.inodes.GetPath(input.NodeId)
+	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, now)
+	fs.fillEntryOut(entry, out)
+	return gofuse.OK
+}
+
+func (fs *Dat9FS) mknodRegular(cancel <-chan struct{}, input *gofuse.MknodIn, name, childP string, mode uint32, out *gofuse.EntryOut) gofuse.Status {
+	ctx, cf := fuseCtx(cancel)
+	defer cf()
+
+	writeStart := fs.perfStart()
+	err := fs.client.WriteCtxConditional(ctx, fs.remotePath(childP), nil, 0)
+	fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
+	if err != nil {
+		return httpToFuseStatus(err)
+	}
+
+	perm := mode & posixPermissionModeMask
+	remotePerm := remoteChmodMode(perm)
+	if remotePerm != defaultRegularFileMode {
+		chmodStart := fs.perfStart()
+		err = fs.client.ChmodCtx(ctx, fs.remotePath(childP), remotePerm)
+		fs.perfRecordRemote(perfRemoteMutation, chmodStart, err, 0)
+		if err != nil {
+			if rollbackErr := fs.deleteRemoteFileWithInterruptRecovery(ctx, childP); rollbackErr != nil && !isNotFoundErr(rollbackErr) {
+				log.Printf("mknod: rollback remote file %s after chmod failure failed: %v", childP, rollbackErr)
+			}
+			return httpToFuseStatus(err)
+		}
+	}
+
+	mtime := time.Now()
+	var revision int64
+	var resourceID string
+	var nlink uint32
+	statStart := fs.perfStart()
+	stat, statErr := fs.client.StatCtx(ctx, fs.remotePath(childP))
+	fs.perfRecordRemote(perfRemoteStat, statStart, statErr, 0)
+	if statErr == nil && stat != nil {
+		if !stat.Mtime.IsZero() {
+			mtime = stat.Mtime
+		}
+		revision = stat.Revision
+		resourceID = stat.ResourceID
+		nlink = stat.Nlink
+	}
+
+	ino := fs.inodes.LookupWithIdentity(childP, resourceID, nlink, false, 0, mtime)
+	if revision > 0 {
+		fs.inodes.UpdateRevision(ino, revision)
+	}
+	fs.inodes.UpdateMode(ino, uint32(syscall.S_IFREG)|perm)
+	fs.inodes.UpdateOwner(ino, input.Uid, input.Gid, true, true)
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		return gofuse.EIO
+	}
+	parentPath, _ := fs.inodes.GetPath(input.NodeId)
+	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
+	fs.fillEntryOut(entry, out)
+	return gofuse.OK
+}
+
 func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
 	perfStart := fs.perfStart()
 	defer func() { fs.perfRecordFuse(perfFuseMkdir, perfStart, status, 0) }()
@@ -5532,7 +6499,7 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
-	mode := input.Mode & 0o777
+	mode := input.Mode & posixPermissionModeMask
 	if overlay, local, st := fs.localOverlayForDirPath(ctx, childP); local {
 		if st != gofuse.OK {
 			return st
@@ -5553,7 +6520,9 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 			return st
 		}
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
+		fs.adjustDirectoryLinkCount(parentPath, 1)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
 	}
@@ -5563,7 +6532,9 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 			return st
 		}
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
+		fs.adjustDirectoryLinkCount(parentPath, 1)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
 	}
@@ -5574,13 +6545,16 @@ func (fs *Dat9FS) Mkdir(cancel <-chan struct{}, input *gofuse.MkdirIn, name stri
 
 	ino := fs.inodes.Lookup(childP, true, 0, time.Now())
 	fs.inodes.UpdateMode(ino, mode)
+	fs.inodes.UpdateOwner(ino, input.Uid, input.Gid, true, true)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
 	}
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
+	fs.adjustDirectoryLinkCount(parentPath, 1)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.dirCache.MarkSessionCreatedDir(childP)
 	// Kernel already receives the new entry via the Mkdir reply —
 	// no need for notifyEntry/notifyInode here.
@@ -5623,6 +6597,7 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
 	}
@@ -5633,6 +6608,7 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
 	}
@@ -5644,6 +6620,11 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 		mutationStart := fs.perfStart()
 		err = fs.client.SymlinkCtx(ctx, pointedTo, fs.remotePath(childP))
 		fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
+	}
+	if err != nil {
+		if !fs.layerEnabled() && isConflictErr(err) && fs.hasNegativePathCache(childP) {
+			err = fs.retrySymlinkAfterNegativeCacheConflict(ctx, pointedTo, childP)
+		}
 	}
 	if err != nil {
 		if !fs.layerEnabled() && isTransientLookupErr(err) {
@@ -5687,9 +6668,25 @@ func (fs *Dat9FS) Symlink(cancel <-chan struct{}, header *gofuse.InHeader, point
 	}
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(linkName, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.invalidateReadCacheAndTargets(childP)
 	fs.fillEntryOut(entry, out)
 	return gofuse.OK
+}
+
+func (fs *Dat9FS) retrySymlinkAfterNegativeCacheConflict(ctx context.Context, pointedTo, childP string) error {
+	stat, statErr := fs.remotePathStatDetached(childP)
+	if statErr != nil && !isNotFoundErr(statErr) {
+		return statErr
+	}
+	if statErr == nil && stat != nil {
+		return &client.StatusError{StatusCode: http.StatusConflict, Message: "path already exists"}
+	}
+
+	mutationStart := fs.perfStart()
+	err := fs.client.SymlinkCtx(ctx, pointedTo, fs.remotePath(childP))
+	fs.perfRecordRemote(perfRemoteMutation, mutationStart, err, 0)
+	return err
 }
 
 func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string, out *gofuse.EntryOut) (status gofuse.Status) {
@@ -5716,6 +6713,9 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	}
 	if srcP == dstP {
 		return gofuse.Status(syscall.EEXIST)
+	}
+	if entryIsMetadataOnlySpecial(srcEntry) {
+		return fs.linkMetadataOnlySpecial(input, srcEntry, dstP, name, out)
 	}
 
 	ctx, cf := fuseCtx(cancel)
@@ -5751,12 +6751,15 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 			return gofuse.EIO
 		}
 		fs.inodes.SetModeState(input.Oldnodeid, mode, hasMode)
+		linkTime := time.Now()
+		fs.inodes.UpdateCtime(input.Oldnodeid, linkTime)
 		entry, ok := fs.inodes.GetEntry(input.Oldnodeid)
 		if !ok {
 			return gofuse.EIO
 		}
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.fillEntryOut(entry, out)
 		return gofuse.OK
 	}
@@ -5842,6 +6845,8 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	if !fs.inodes.AddAlias(input.Oldnodeid, dstP, resourceID, nlink, isDir, size, mtime) {
 		return gofuse.EIO
 	}
+	linkTime := time.Now()
+	fs.inodes.UpdateCtime(input.Oldnodeid, linkTime)
 	if stat != nil {
 		if stat.Revision > 0 {
 			fs.inodes.UpdateRevision(input.Oldnodeid, stat.Revision)
@@ -5856,6 +6861,7 @@ func (fs *Dat9FS) Link(cancel <-chan struct{}, input *gofuse.LinkIn, name string
 	}
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	if srcParent := parentDir(srcP); srcParent != parentPath {
 		fs.dirCache.Invalidate(srcParent)
 	}
@@ -5874,6 +6880,15 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if st != gofuse.OK {
 		return st
 	}
+	if _, ok := fs.specialNodeEntry(childP); ok {
+		fs.removeSpecialNode(childP)
+		fs.inodes.RemoveLink(childP)
+		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.dirCache.Remove(parentPath, name)
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
+		fs.cacheNegativePath(childP)
+		return gofuse.OK
+	}
 	ctx, cf := fuseCtx(cancel)
 	defer cf()
 	if overlay, local, st := fs.localOverlayForPath(ctx, childP); local {
@@ -5891,12 +6906,18 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		if info.IsDir() {
 			return gofuse.Status(syscall.EISDIR)
 		}
+		preserveOpen := fs.markOpenHandlesUnlinked(ctx, childP, false)
 		if err := overlay.Remove(childP); err != nil {
 			return localErrToFuseStatus(err)
 		}
-		fs.inodes.RemoveLink(childP)
+		if preserveOpen {
+			fs.inodes.RemoveLinkPreserve(childP)
+		} else {
+			fs.inodes.RemoveLink(childP)
+		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.cacheNegativePath(childP)
 		fs.scheduleGitStateCheckpoint(childP)
 		fs.forgetCommittedRevision(childP)
@@ -5917,6 +6938,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
 		fs.dirCache.Remove(parentPath, name)
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		return gofuse.OK
 	}
 	start := time.Now()
@@ -5927,6 +6949,7 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}()
 
 	pendingNew := false
+	preserveOpen := false
 	if fs.debouncer != nil {
 		fs.debouncer.Cancel(childP)
 	}
@@ -5985,6 +7008,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	}
 
 	if !pendingNew {
+		ctx, cf := fuseCtx(cancel)
+		defer cf()
+		preserveOpen = fs.markOpenHandlesUnlinked(ctx, childP, true)
+
 		// File existed on server (or unknown) — issue remote DELETE.
 		// Tolerate 404 in case it was already deleted.
 		deleteStart := time.Now()
@@ -5997,14 +7024,21 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 				return status
 			}
 		}
+	} else {
+		preserveOpen = fs.markOpenHandlesUnlinked(ctx, childP, false)
 	}
 
-	fs.inodes.RemoveLink(childP)
+	if preserveOpen {
+		fs.inodes.RemoveLinkPreserve(childP)
+	} else {
+		fs.inodes.RemoveLink(childP)
+	}
 	fs.invalidateReadCacheAndTargets(childP)
 	fs.forgetCommittedRevision(childP)
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
 	fs.dirCache.Remove(parentPath, name)
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.cacheNegativePath(childP)
 	// Kernel initiated the unlink and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
@@ -6046,7 +7080,9 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		fs.dirCache.InvalidatePrefix(childP)
 		fs.forgetCommittedRevisionPrefix(childP)
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.adjustDirectoryLinkCount(parentPath, -1)
 		fs.dirCache.Remove(parentPath, name)
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.cacheNegativePath(childP)
 		fs.scheduleGitStateCheckpoint(childP)
 		return gofuse.OK
@@ -6071,7 +7107,9 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 				return st
 			}
 			parentPath, _ := fs.inodes.GetPath(header.NodeId)
+			fs.adjustDirectoryLinkCount(parentPath, -1)
 			fs.dirCache.Remove(parentPath, name)
+			fs.touchDirectoryChangeTime(parentPath, time.Now())
 			fs.dirCache.InvalidatePrefix(childP)
 			fs.forgetCommittedRevisionPrefix(childP)
 			return gofuse.OK
@@ -6081,7 +7119,9 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			return st
 		}
 		parentPath, _ := fs.inodes.GetPath(header.NodeId)
+		fs.adjustDirectoryLinkCount(parentPath, -1)
 		fs.dirCache.Remove(parentPath, name)
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		fs.dirCache.InvalidatePrefix(childP)
 		fs.forgetCommittedRevisionPrefix(childP)
 		return gofuse.OK
@@ -6094,6 +7134,10 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	}()
 
 	if fs.layerDirHasOverlayChildren(childP) {
+		status = gofuse.Status(syscall.ENOTEMPTY)
+		return status
+	}
+	if fs.hasKnownLocalDirectoryChildren(childP) {
 		status = gofuse.Status(syscall.ENOTEMPTY)
 		return status
 	}
@@ -6111,6 +7155,11 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			status = gofuse.Status(syscall.ENOTEMPTY)
 			return status
 		}
+	} else if hasChildren, err := fs.remoteDirectoryHasChildren(ctx, childP); err == nil && hasChildren {
+		status = gofuse.Status(syscall.ENOTEMPTY)
+		return status
+	} else if err != nil {
+		fs.debugf("rmdir pre-delete list failed path=%s err=%v", childP, err)
 	}
 
 	deleteStart := time.Now()
@@ -6162,7 +7211,9 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	fs.forgetCommittedRevisionPrefix(childP)
 
 	parentPath, _ := fs.inodes.GetPath(header.NodeId)
+	fs.adjustDirectoryLinkCount(parentPath, -1)
 	fs.dirCache.Remove(parentPath, name)
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.cacheNegativePath(childP)
 	// Kernel initiated the rmdir and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
@@ -6302,6 +7353,9 @@ func (fs *Dat9FS) renamePendingNewCommit(ctx context.Context, input *gofuse.Rena
 }
 
 func (fs *Dat9FS) pendingRenameTargetExists(ctx context.Context, p string) (bool, error) {
+	if _, ok := fs.specialNodeEntry(p); ok {
+		return true, nil
+	}
 	if fs.pendingIndex != nil {
 		if _, ok := fs.pendingIndex.GetMeta(p); ok {
 			return true, nil
@@ -6333,7 +7387,20 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	if oldIno, ok := fs.inodes.GetInode(oldP); ok {
 		oldEntry, oldEntryOK = fs.inodes.GetEntry(oldIno)
 	}
+	oldParent, ok := fs.inodes.GetPath(input.NodeId)
+	if !ok {
+		oldParent = parentDir(oldP)
+	}
+	newParent := oldParent
+	if input.Newdir != input.NodeId {
+		if p, ok := fs.inodes.GetPath(input.Newdir); ok {
+			newParent = p
+		} else {
+			newParent = parentDir(newP)
+		}
+	}
 	fs.inodes.Rename(oldP, newP)
+	fs.renameSpecialNodeSubtree(oldP, newP)
 	fs.invalidateReadCacheAndTargets(oldP)
 	fs.invalidateReadCacheAndTargets(newP)
 	fs.readCache.InvalidatePrefix(oldP + "/")
@@ -6343,19 +7410,23 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	fs.forgetCommittedRevisionPrefix(oldP)
 	fs.forgetCommittedRevisionPrefix(newP)
 
-	oldParent, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Remove(oldParent, path.Base(oldP))
 	fs.cacheNegativePath(oldP)
 	fs.dirCache.InvalidatePrefix(oldP)
 	fs.dirCache.InvalidatePrefix(newP)
-	newParent := oldParent
-	if input.Newdir != input.NodeId {
-		newParent, _ = fs.inodes.GetPath(input.Newdir)
+	if oldEntryOK && oldEntry.IsDir && oldParent != newParent {
+		fs.adjustDirectoryLinkCount(oldParent, -1)
+		fs.adjustDirectoryLinkCount(newParent, 1)
 	}
 	if oldEntryOK {
 		fs.dirCache.Upsert(newParent, cachedInfoFromEntry(path.Base(newP), oldEntry))
 	} else {
 		fs.dirCache.Invalidate(newParent)
+	}
+	touchTime := time.Now()
+	fs.touchDirectoryChangeTime(oldParent, touchTime)
+	if newParent != oldParent {
+		fs.touchDirectoryChangeTime(newParent, touchTime)
 	}
 	fs.retargetOpenHandlesForRename(oldP, newP)
 	fs.notifyRenameTarget(input.Newdir, path.Base(newP), newP)
@@ -6451,6 +7522,14 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		return httpToFuseStatus(err)
 	}
 
+	oldInfo, newInfo, st := fs.renamePreflight(ctx, input, oldP, newP)
+	if st != gofuse.OK {
+		return st
+	}
+	if oldInfo.special {
+		return fs.renameMetadataOnlySpecial(ctx, input, oldP, newP, newInfo)
+	}
+
 	pendingRename, err := fs.renamePendingNewCommit(ctx, input, oldP, newP)
 	if err != nil {
 		log.Printf("rename: pending-new local rename %s -> %s failed: %v", oldP, newP, err)
@@ -6521,6 +7600,9 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 	}
 
 	if err := fs.renameRemoteWithTransientRetry(ctx, oldP, newP); err != nil {
+		if handled, st := fs.renameRemoteFileToMissingTargetFallback(ctx, input, oldInfo, newInfo, err); handled {
+			return st
+		}
 		return httpToFuseStatus(err)
 	}
 	if pendingRename == pendingRenameRemoteFallbackCleanupOld {
@@ -6529,6 +7611,11 @@ func (fs *Dat9FS) Rename(cancel <-chan struct{}, input *gofuse.RenameIn, oldName
 		}
 		if fs.pendingIndex != nil {
 			fs.pendingIndex.Remove(oldP)
+		}
+	}
+	if newInfo.special {
+		if st := fs.removeRenameSpecialTarget(ctx, newInfo); st != gofuse.OK {
+			return st
 		}
 	}
 
@@ -6707,6 +7794,9 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 	hasMode := false
 	var resourceID string
 	var nlink uint32
+	var uid, gid uint32
+	hasUID := false
+	hasGID := false
 
 	if e.HasMetadata {
 		isDir = e.IsDir
@@ -6717,6 +7807,10 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 		revision = e.Revision
 		mode = e.AttrMode
 		hasMode = e.HasMode
+		uid = e.Uid
+		gid = e.Gid
+		hasUID = e.HasUID
+		hasGID = e.HasGID
 		resourceID = e.ResourceID
 		nlink = e.Nlink
 	} else if item, ok := fs.dirEntryMetadata(dirPath, childP, e.Name); ok {
@@ -6728,6 +7822,10 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 		revision = item.Revision
 		mode = item.Mode
 		hasMode = item.HasMode
+		uid = item.Uid
+		gid = item.Gid
+		hasUID = item.HasUID
+		hasGID = item.HasGID
 		resourceID = item.ResourceID
 		nlink = item.Nlink
 	}
@@ -6738,6 +7836,9 @@ func (fs *Dat9FS) recreateDirEntryInode(dirPath string, e DirEntry) uint64 {
 	}
 	if hasMode {
 		fs.inodes.UpdateMode(ino, mode)
+	}
+	if hasUID || hasGID {
+		fs.inodes.UpdateOwner(ino, uid, gid, hasUID, hasGID)
 	}
 	return ino
 }
@@ -6772,6 +7873,10 @@ func dirEntryFromCachedInfo(item CachedFileInfo, ino uint64) DirEntry {
 		Revision:    item.Revision,
 		AttrMode:    item.Mode,
 		HasMode:     item.HasMode,
+		Uid:         item.Uid,
+		Gid:         item.Gid,
+		HasUID:      item.HasUID,
+		HasGID:      item.HasGID,
 		IsDir:       item.IsDir,
 		ResourceID:  item.ResourceID,
 		Nlink:       item.Nlink,
@@ -6958,6 +8063,7 @@ func (fs *Dat9FS) mergePendingDirEntries(dirPath string, entries []DirEntry) []D
 		}
 	}
 
+	entries = append(entries, fs.specialNodeDirEntries(dirPath, existing)...)
 	return entries
 }
 
@@ -7167,6 +8273,9 @@ func (fs *Dat9FS) cachedToDirEntries(dirPath string, items []CachedFileInfo) []D
 		if item.HasMode {
 			fs.inodes.UpdateMode(ino, item.Mode)
 		}
+		if item.HasUID || item.HasGID {
+			fs.inodes.UpdateOwner(ino, item.Uid, item.Gid, item.HasUID, item.HasGID)
+		}
 
 		entries = append(entries, dirEntryFromCachedInfo(item, ino))
 	}
@@ -7240,6 +8349,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		return gofuse.OK
 	}
 	if _, rel, ok := fs.gitWorkspaceForPath(ctx, childP); ok && rel != "" {
@@ -7252,6 +8362,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		fs.fillEntryOut(entry, &out.EntryOut)
 		parentPath, _ := fs.inodes.GetPath(input.NodeId)
 		fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+		fs.touchDirectoryChangeTime(parentPath, time.Now())
 		return gofuse.OK
 	}
 	unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(childP)
@@ -7263,6 +8374,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	ino := fs.inodes.Lookup(childP, false, 0, time.Now())
 	fs.inodes.UpdateMode(ino, mode)
+	fs.inodes.UpdateOwner(ino, input.Uid, input.Gid, true, true)
 	entry, ok := fs.inodes.GetEntry(ino)
 	if !ok {
 		return gofuse.EIO
@@ -7319,6 +8431,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 
 	parentPath, _ := fs.inodes.GetPath(input.NodeId)
 	fs.dirCache.Upsert(parentPath, cachedInfoFromEntry(name, entry))
+	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	// Kernel initiated the create and receives the new entry via reply —
 	// no need for notifyEntry/notifyInode here.
 	return gofuse.OK
@@ -7348,8 +8461,14 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if entryIsSymlink(entry) {
 			return gofuse.Status(syscall.ELOOP)
 		}
+		if entryIsMetadataOnlySpecial(entry) {
+			return gofuse.Status(syscall.ENXIO)
+		}
 		fh.OrigSize = entry.Size
 		fh.BaseRev = entry.Revision
+	}
+	if st := fs.checkOpenAccess(ctx, input, entry); st != gofuse.OK {
+		return st
 	}
 
 	// Allocate write buffer for writable opens
@@ -7818,6 +8937,69 @@ func (fs *Dat9FS) Read(cancel <-chan struct{}, input *gofuse.ReadIn, buf []byte)
 		// Fall through to server read below
 	} else {
 		fh.Unlock()
+	}
+
+	fh.Lock()
+	unlinked := fh.Unlinked && fh.Dirty == nil
+	unlinkedSnapshot := fh.UnlinkedSnapshot
+	unlinkedShadowGen := fh.UnlinkedShadowGen
+	unlinkedSize := fh.UnlinkedSize
+	var unlinkedData []byte
+	if unlinkedSnapshot && unlinkedShadowGen == 0 {
+		unlinkedData = append([]byte(nil), fh.UnlinkedData...)
+	}
+	fh.Unlock()
+	if unlinked {
+		offset := int64(input.Offset)
+		if unlinkedShadowGen != 0 {
+			if fs.shadowStore == nil {
+				source = "unlinked-shadow-missing-store"
+				return nil, gofuse.EIO
+			}
+			if offset >= unlinkedSize {
+				source = "unlinked-shadow-eof"
+				bytesRead = 0
+				return gofuse.ReadResultData(nil), gofuse.OK
+			}
+			end := offset + int64(input.Size)
+			if end > unlinkedSize {
+				end = unlinkedSize
+			}
+			result := make([]byte, end-offset)
+			n, err := fs.shadowStore.ReadAtGen(unlinkedShadowGen, offset, result)
+			if err != nil && (!errors.Is(err, io.EOF) || n != len(result)) {
+				source = "unlinked-shadow-error"
+				return nil, gofuse.EIO
+			}
+			if n != len(result) {
+				source = "unlinked-shadow-short"
+				return nil, gofuse.EIO
+			}
+			source = "unlinked-shadow"
+			bytesRead = n
+			return gofuse.ReadResultData(result), gofuse.OK
+		}
+		if unlinkedSnapshot {
+			if offset >= int64(len(unlinkedData)) {
+				source = "unlinked-snapshot-eof"
+				bytesRead = 0
+				return gofuse.ReadResultData(nil), gofuse.OK
+			}
+			end := offset + int64(input.Size)
+			if end > int64(len(unlinkedData)) {
+				end = int64(len(unlinkedData))
+			}
+			source = "unlinked-snapshot"
+			bytesRead = int(end - offset)
+			return gofuse.ReadResultData(unlinkedData[offset:end]), gofuse.OK
+		}
+		if offset >= unlinkedSize {
+			source = "unlinked-eof"
+			bytesRead = 0
+			return gofuse.ReadResultData(nil), gofuse.OK
+		}
+		source = "unlinked-no-snapshot"
+		return nil, gofuse.EIO
 	}
 
 	if fh.Dirty == nil && isSQLitePersistentJournalPath(fh.Path) {
@@ -9246,7 +10428,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		}
 		if fh.HasPendingMode {
 			ino := fh.Ino
-			mode := fh.PendingMode & 0o777
+			mode := fh.PendingMode & posixPermissionModeMask
 			modeGen := fh.PendingModeGen
 			clearPendingModeLocked(fh)
 			fh.Unlock()
@@ -9309,7 +10491,7 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		defer func() {
 			fh.Lock()
 			hasPendingMode := fh.HasPendingMode
-			pendingMode := fh.PendingMode & 0o777
+			pendingMode := fh.PendingMode & posixPermissionModeMask
 			pendingModeGen := fh.PendingModeGen
 			previousMode := fh.PreviousMode
 			hasPreviousMode := fh.HasPreviousMode
@@ -9388,6 +10570,14 @@ func (fs *Dat9FS) Release(cancel <-chan struct{}, input *gofuse.ReleaseIn) {
 		// Unpin shadow if this handle pinned it, so deferred removals can proceed.
 		if fh.ShadowPinned && fs.shadowStore != nil {
 			defer fs.shadowStore.Unpin(fh.ShadowGen)
+		}
+		if fs.shadowStore != nil {
+			fh.Lock()
+			unlinkedShadowGen := fh.UnlinkedShadowGen
+			fh.Unlock()
+			if unlinkedShadowGen != 0 {
+				defer fs.shadowStore.Unpin(unlinkedShadowGen)
+			}
 		}
 
 		start := time.Now()
@@ -10372,7 +11562,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 		fs.inodes.UpdateSize(entry.Inode, entry.Size)
 		fs.refreshCommittedRevisionForOpenHandles(entry.Path, committedRev, nil)
 		if entry.HasMode {
-			fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
+			fs.inodes.UpdateMode(entry.Inode, entry.Mode&posixPermissionModeMask)
 		}
 		fs.cacheFileForPath(entry.Path, entry.Size, time.Now(), committedRev)
 		// Local async commit completion — this is not an external change.
@@ -10384,7 +11574,7 @@ func (fs *Dat9FS) onCommitQueueSuccess(entry *CommitEntry, committedRev int64) {
 			fs.inodes.UpdateSize(entry.Inode, entry.Size)
 			fs.inodes.UpdateMtime(entry.Inode, time.Now())
 			if entry.HasMode {
-				fs.inodes.UpdateMode(entry.Inode, entry.Mode&0o777)
+				fs.inodes.UpdateMode(entry.Inode, entry.Mode&posixPermissionModeMask)
 			}
 			fs.notifyInode(entry.Inode)
 		}

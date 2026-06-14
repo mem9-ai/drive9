@@ -740,6 +740,13 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		if _, err := pending.PutWithBaseRevAndMode(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
 			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
 		}
+		if fs != nil {
+			if fullEntry.Mode != 0 {
+				fs.markLayerFileMode(localPath, fullEntry.Mode)
+			} else {
+				fs.markLayerFile(localPath)
+			}
+		}
 		restoredUpserts[localPath] = struct{}{}
 	}
 	return nil
@@ -851,6 +858,9 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 	}
 	if runtime.GOOS == "linux" {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
+		if opts.AllowOther {
+			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
+		}
 	}
 	if runtime.GOOS == "darwin" {
 		// macFUSE can reject open/readdir before requests reach the daemon if
