@@ -10526,6 +10526,93 @@ func TestOpenWritableCancelsQueuedPathTruncateWithoutOTruncFlag(t *testing.T) {
 	}
 }
 
+func TestOpenWritableRefreshesInodeAfterWaitingForInFlightZeroTruncate(t *testing.T) {
+	path := "/tier-transition.bin"
+	staleData := bytes.Repeat([]byte("s"), 8*1024*1024)
+	statCh := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		statCh <- struct{}{}
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "8")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.readCache.Put(path, staleData, 7)
+	inFlight := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7}
+	fs.commitQueue = &CommitQueue{
+		queue:        nil,
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{path: inFlight},
+	}
+
+	ino := fs.inodes.Lookup(path, false, int64(len(staleData)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	openDone := make(chan gofuse.OpenOut, 1)
+	statusDone := make(chan gofuse.Status, 1)
+	go func() {
+		var out gofuse.OpenOut
+		statusDone <- fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Flags:    uint32(syscall.O_WRONLY),
+		}, &out)
+		openDone <- out
+	}()
+
+	select {
+	case st := <-statusDone:
+		t.Fatalf("Open returned before in-flight zero truncate completed: %v", st)
+	case <-time.After(75 * time.Millisecond):
+	}
+	fs.inodes.UpdateSize(ino, 0)
+	fs.inodes.UpdateRevision(ino, 8)
+	fs.commitQueue.endInFlight(inFlight)
+
+	var st gofuse.Status
+	select {
+	case st = <-statusDone:
+	case <-time.After(time.Second):
+		t.Fatal("Open did not return after in-flight zero truncate completed")
+	}
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	var out gofuse.OpenOut
+	select {
+	case out = <-openDone:
+	case <-time.After(time.Second):
+		t.Fatal("OpenOut missing")
+	}
+	select {
+	case <-statCh:
+	case <-time.After(time.Second):
+		t.Fatal("Open did not stat zero-sized remote file after wait")
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("opened handle missing")
+	}
+	if fh.OrigSize != 0 || fh.BaseRev != 8 {
+		t.Fatalf("handle orig/base = %d/%d, want 0/8", fh.OrigSize, fh.BaseRev)
+	}
+	if fh.Dirty == nil {
+		t.Fatal("dirty buffer missing")
+	}
+	if got := fh.Dirty.Size(); got != 0 {
+		t.Fatalf("dirty buffer size = %d, want 0; stale read cache was preloaded", got)
+	}
+}
+
 func TestStageShadowReadyNonSpillRewritesShadowWithDirtyBuffer(t *testing.T) {
 	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
 	opts.setDefaults()
