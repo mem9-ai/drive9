@@ -87,6 +87,7 @@ func (s *Server) handleVaultSecrets(w http.ResponseWriter, r *http.Request, sub 
 			errJSON(w, http.StatusNotImplemented, err.Error())
 			return
 		}
+		logger.Error(r.Context(), "vault_secrets_store_failed", eventFields(r.Context(), "vault_secrets_store_failed", "error", err)...)
 		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
@@ -419,6 +420,7 @@ func (s *Server) handleVaultTokens(w http.ResponseWriter, r *http.Request, sub s
 			errJSON(w, http.StatusNotImplemented, err.Error())
 			return
 		}
+		logger.Error(r.Context(), "vault_tokens_store_failed", eventFields(r.Context(), "vault_tokens_store_failed", "error", err)...)
 		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
@@ -560,6 +562,7 @@ func (s *Server) handleVaultGrants(w http.ResponseWriter, r *http.Request, sub s
 			errJSON(w, http.StatusNotImplemented, err.Error())
 			return
 		}
+		logger.Error(r.Context(), "vault_grants_store_failed", eventFields(r.Context(), "vault_grants_store_failed", "error", err)...)
 		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
@@ -737,6 +740,7 @@ func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		result = "error"
+		logger.Error(r.Context(), "vault_audit_store_failed", eventFields(r.Context(), "vault_audit_store_failed", "error", err)...)
 		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}

@@ -753,7 +753,7 @@ func ctxListCmd(args []string) error {
 				typeFilter = strings.TrimPrefix(args[i], "--type=")
 				continue
 			}
-			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx ls [-l|--json|--details] [--type <kind>|--scoped]", args[i])
+			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx ls [-l|--long] [-D|--details] [--json] [--type <kind>|--scoped]", args[i])
 		}
 	}
 	if longForm && asJSON {

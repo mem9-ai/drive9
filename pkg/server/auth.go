@@ -51,6 +51,9 @@ const (
 const statusClientClosedRequest = 499
 
 func sanitizeClientError(err error) string {
+	if err == nil {
+		return "backend unavailable"
+	}
 	msg := err.Error()
 	if strings.Contains(msg, "Error 1105") && strings.Contains(msg, "quota") {
 		return "tenant usage quota exceeded"

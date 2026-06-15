@@ -18,6 +18,7 @@ import (
 	backendpkg "github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/journal"
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
 )
 
@@ -171,12 +172,12 @@ func (s *Server) handleFSLayerCheckpointObject(w http.ResponseWriter, r *http.Re
 	}
 	checkpoint, err := store.GetFSLayerCheckpoint(r.Context(), checkpointID)
 	if err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	layer, err := store.GetFSLayer(r.Context(), checkpoint.LayerID)
 	if err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	if !authorizeFS(w, r, FSOpRead, layer.BaseRootPath) {
@@ -218,12 +219,12 @@ func (s *Server) handleFSLayerCreate(w http.ResponseWriter, r *http.Request, sto
 		ActorID:        actorID,
 	}
 	if err := store.CreateFSLayer(r.Context(), &layer); err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	created, err := store.GetFSLayer(r.Context(), layerID)
 	if err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -233,7 +234,7 @@ func (s *Server) handleFSLayerCreate(w http.ResponseWriter, r *http.Request, sto
 func (s *Server) handleFSLayerList(w http.ResponseWriter, r *http.Request, store *datastore.Store) {
 	layers, err := store.ListFSLayers(r.Context())
 	if err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	out := make([]fsLayerResponse, 0, len(layers))
@@ -295,7 +296,7 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 	}
 	layer, err := store.ResolveFSLayerRef(r.Context(), layerRef)
 	if err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	layerID := layer.LayerID
@@ -335,7 +336,7 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 			entries, err = store.ListFSLayerEntries(r.Context(), layerID)
 		}
 		if err != nil {
-			writeFSLayerStoreError(w, err)
+			writeFSLayerStoreError(w, r, err)
 			return
 		}
 		out := make([]fsLayerEntryResponse, 0, len(entries))
@@ -396,7 +397,7 @@ func (s *Server) handleFSLayerObject(w http.ResponseWriter, r *http.Request, b *
 			return
 		}
 		if err := store.RollbackFSLayer(r.Context(), layerID); err != nil {
-			writeFSLayerStoreError(w, err)
+			writeFSLayerStoreError(w, r, err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -443,7 +444,7 @@ func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request,
 		entry, err = store.GetFSLayerEntry(r.Context(), layer.LayerID, path)
 	}
 	if err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	if entry.Op != datastore.FSLayerEntryOpUpsert || entry.Kind != datastore.FSLayerEntryKindFile {
@@ -452,6 +453,7 @@ func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request,
 	}
 	rc, err := b.OpenFSLayerEntryData(r.Context(), entry)
 	if err != nil {
+		logger.Error(r.Context(), "fs_layer_object_read_failed", eventFields(r.Context(), "fs_layer_object_read_failed", "path", entry.Path, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
@@ -517,6 +519,7 @@ func (s *Server) handleFSLayerObjectUpload(w http.ResponseWriter, r *http.Reques
 	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
 	entry, err := b.PutFSLayerObject(r.Context(), layer.LayerID, prepared.Path, body, size)
 	if err != nil {
+		logger.Error(r.Context(), "fs_layer_object_upload_failed", eventFields(r.Context(), "fs_layer_object_upload_failed", "path", prepared.Path, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
@@ -528,12 +531,12 @@ func (s *Server) handleFSLayerObjectUpload(w http.ResponseWriter, r *http.Reques
 	entry.BaseRevision = prepared.BaseRevision
 	entry.BaseInodeID = prepared.BaseInodeID
 	if err := store.UpsertFSLayerEntry(r.Context(), entry); err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	stored, err := store.GetFSLayerEntry(r.Context(), layer.LayerID, entry.Path)
 	if err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -544,7 +547,7 @@ func (s *Server) handleFSLayerEvents(w http.ResponseWriter, r *http.Request, sto
 	since := parseFSLayerInt64Query(r, "since")
 	events, err := store.ListFSLayerEvents(r.Context(), layer.LayerID, since, 1000)
 	if err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -602,12 +605,12 @@ func (s *Server) handleFSLayerEntryUpsert(w http.ResponseWriter, r *http.Request
 	}
 	fillFSLayerBaseSnapshot(r.Context(), b, &entry)
 	if err := store.UpsertFSLayerEntry(r.Context(), &entry); err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	stored, err := store.GetFSLayerEntry(r.Context(), layer.LayerID, entry.Path)
 	if err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -671,7 +674,7 @@ func (s *Server) handleFSLayerEntryGet(w http.ResponseWriter, r *http.Request, s
 		entry, err = store.GetFSLayerEntry(r.Context(), layer.LayerID, path)
 	}
 	if err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -692,13 +695,13 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		return
 	}
 	if err := store.BeginFSLayerCommit(r.Context(), layer.LayerID); err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	entries, err := store.ListFSLayerEntryLog(r.Context(), layer.LayerID)
 	if err != nil {
 		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	if conflicts := validateFSLayerCommitScope(layer, entries); len(conflicts) > 0 {
@@ -727,6 +730,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	snapshots := snapshotFSLayerCommit(r.Context(), b, entries)
 	if err := validateFSLayerCommitSnapshots(snapshots); err != nil {
 		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
+		logger.Error(r.Context(), "fs_layer_commit_validate_failed", eventFields(r.Context(), "fs_layer_commit_validate_failed", "layer_id", layer.LayerID, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
@@ -782,12 +786,12 @@ func (s *Server) handleFSLayerCheckpoint(w http.ResponseWriter, r *http.Request,
 		Label:        strings.TrimSpace(req.Label),
 	}
 	if err := store.CreateFSLayerCheckpoint(r.Context(), &checkpoint); err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	stored, err := store.GetFSLayerCheckpoint(r.Context(), checkpointID)
 	if err != nil {
-		writeFSLayerStoreError(w, err)
+		writeFSLayerStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -1661,7 +1665,7 @@ func applyFSLayerEntryMode(ctx context.Context, b *backendpkg.Dat9Backend, path 
 	return nil
 }
 
-func writeFSLayerStoreError(w http.ResponseWriter, err error) {
+func writeFSLayerStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, datastore.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "not found")
 		return
@@ -1674,6 +1678,7 @@ func writeFSLayerStoreError(w http.ResponseWriter, err error) {
 		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
+	logger.Error(r.Context(), "fs_layer_store_error", eventFields(r.Context(), "fs_layer_store_error", "error", err)...)
 	errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 }
 
