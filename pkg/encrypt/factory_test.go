@@ -50,3 +50,17 @@ func TestFactoryAliyunKMSRequiresRegion(t *testing.T) {
 		t.Fatal("expected aliyun_kms region validation error")
 	}
 }
+
+func TestFactoryTencentKMSRequiresKey(t *testing.T) {
+	_, err := New(context.Background(), Config{Type: TypeTencentKMS, Region: "ap-guangzhou"})
+	if err == nil {
+		t.Fatal("expected tencent_kms key validation error")
+	}
+}
+
+func TestFactoryTencentKMSRequiresRegion(t *testing.T) {
+	_, err := New(context.Background(), Config{Type: TypeTencentKMS, Key: "test-key"})
+	if err == nil {
+		t.Fatal("expected tencent_kms region validation error")
+	}
+}

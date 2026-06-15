@@ -204,7 +204,7 @@ func main() {
 		}
 		eKey := masterHex
 		eType := encrypt.Type(encryptType)
-		if strings.EqualFold(string(eType), string(encrypt.TypeKMS)) || strings.EqualFold(string(eType), string(encrypt.TypeAliyunKMS)) {
+		if strings.EqualFold(string(eType), string(encrypt.TypeKMS)) || strings.EqualFold(string(eType), string(encrypt.TypeAliyunKMS)) || strings.EqualFold(string(eType), string(encrypt.TypeTencentKMS)) {
 			eKey = kmsKey
 		}
 		enc, err := encrypt.New(context.Background(), encrypt.Config{
@@ -406,11 +406,11 @@ environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
   DRIVE9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DRIVE9_META_DSN    control-plane MySQL DSN (required)
-  DRIVE9_ENCRYPT_TYPE local_aes|kms|aliyun_kms
+  DRIVE9_ENCRYPT_TYPE local_aes|kms|aliyun_kms|tencent_kms
   DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
-  DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms), Aliyun KMS key id (required for aliyun_kms)
+  DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms/aliyun_kms/tencent_kms)
   DRIVE9_ALIYUN_KMS_ENDPOINT custom Aliyun KMS endpoint, e.g. a VPC endpoint (no https:// prefix)
-                             note: aliyun_kms reads the Aliyun region from DRIVE9_S3_REGION
+                             note: aliyun_kms/tencent_kms reads the region from DRIVE9_S3_REGION
                              note: TLS verification is skipped automatically when this is set
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)

@@ -89,6 +89,8 @@ func applyS3Options(cfg AWSConfig) func(*s3.Options) {
 // credential chain is used:
 //   - Aliyun OSS endpoints (*.aliyuncs.com): explicit key → RRSA → ALIBABA_CLOUD env
 //     → AWS SDK default chain (if none of the above are configured)
+//   - Tencent COS endpoints (*.myqcloud.com): explicit key → TENCENTCLOUD env
+//     → AWS SDK default chain
 //   - All other endpoints: explicit key → AWS SDK default chain
 func New(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	if err := cfg.Validate(); err != nil {
@@ -96,6 +98,9 @@ func New(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	}
 	if isAliyunEndpoint(cfg.Endpoint) {
 		return newAliyun(ctx, cfg)
+	}
+	if isTencentEndpoint(cfg.Endpoint) {
+		return newTencent(ctx, cfg)
 	}
 	return newAWS(ctx, cfg)
 }
