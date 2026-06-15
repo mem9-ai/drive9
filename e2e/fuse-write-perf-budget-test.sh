@@ -144,10 +144,11 @@ start_mount() {
   {
     echo "=== drive9 write-perf mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
     echo "cache_dir=$CACHE_DIR"
+    echo "remote_root=$ROOT_REMOTE"
   } >>"$MOUNT_LOG"
   # --foreground keeps the daemon as our child so its stderr (the perf
   # summary) lands in MOUNT_LOG; plain `drive9 mount` daemonizes.
-  drive9 mount --foreground --cache-dir "$CACHE_DIR" --durability interactive --perf-counters "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+  drive9 mount --foreground --cache-dir "$CACHE_DIR" --durability interactive --perf-counters ":$ROOT_REMOTE" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
   if wait_mount_state mounted; then
     return 0
@@ -528,7 +529,9 @@ CTX_HOME="$RUN_ROOT/ctx-home"
 EXPECTED_MANIFEST="$RUN_ROOT/expected-manifest.json"
 ROOT_REL="$RUN_ID"
 ROOT_REMOTE="/$ROOT_REL"
-WORK_MOUNT="$MOUNT_POINT/$ROOT_REL/work"
+# Mount only this test's remote root so fixtures from earlier local-e2e
+# suites cannot trigger cache hydration or inflate write-path perf counters.
+WORK_MOUNT="$MOUNT_POINT/work"
 WORK_REMOTE="$ROOT_REMOTE/work"
 MOUNT_PID=""
 
