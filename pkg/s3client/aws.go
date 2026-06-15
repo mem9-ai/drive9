@@ -662,7 +662,7 @@ func (c *AWSS3Client) deleteObjectsByPrefix(ctx context.Context, fullPrefix stri
 					first := del.Errors[0]
 					return fmt.Errorf("delete object %q: %s %s", aws.ToString(first.Key), aws.ToString(first.Code), aws.ToString(first.Message))
 				}
-				out.DeletedObjects += len(objects)
+				out.DeletedObjects += int64(len(objects))
 			}
 		}
 		if !aws.ToBool(res.IsTruncated) {

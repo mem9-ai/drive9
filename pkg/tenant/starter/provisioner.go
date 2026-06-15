@@ -182,7 +182,7 @@ func (p *Provisioner) Deprovision(ctx context.Context, cluster *tenant.ClusterIn
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(strings.TrimSpace(cluster.ClusterID)))
 	resp, err := p.doDigestAuthRequest(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("delete starter cluster digest request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)

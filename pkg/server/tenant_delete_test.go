@@ -220,7 +220,7 @@ func TestTenantDeleteRejectsScopedAPIKey(t *testing.T) {
 	}
 }
 
-func TestTenantDeleteNativeRequiresBothOwnerAndCustomerCredentials(t *testing.T) {
+func TestTenantDeleteNativeSucceedsWithCredentials(t *testing.T) {
 	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudNative, meta.APIKeyScopeKindOwner)
 	resp := rt.deleteTenant(t, map[string]string{"public_key": "public-1", "private_key": "private-1"})
 	defer func() { _ = resp.Body.Close() }()
@@ -349,7 +349,7 @@ func TestTenantDeleteRemovesS3PrefixAsyncAfterClusterDelete(t *testing.T) {
 	assertTenantDeleteS3ObjectMissing(t, rt, tenantMeta.StorageNamespaceID, storageRef)
 }
 
-func TestTenantDeleteAbortsActiveMultipartUploadsBeforeClusterDelete(t *testing.T) {
+func TestTenantDeleteAsyncCleanupAbortsActiveMultipartUploads(t *testing.T) {
 	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudStarter, meta.APIKeyScopeKindOwner)
 	ctx := context.Background()
 	payload := deterministicObjectGCPayload(8*1024*1024, 0x29)

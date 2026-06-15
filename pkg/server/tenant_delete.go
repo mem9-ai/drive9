@@ -18,6 +18,7 @@ const (
 	defaultTenantDeletePollInterval = time.Minute
 	defaultTenantDeleteRetryDelay   = time.Hour
 	defaultTenantDeleteRunningTTL   = 30 * time.Minute
+	defaultTenantDeleteJobTimeout   = 25 * time.Minute
 )
 
 func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
@@ -212,6 +213,7 @@ func (s *Server) startTenantDeleteCleanup(ctx context.Context) {
 	s.startForkWorker(ctx, func(workerCtx context.Context) {
 		ticker := time.NewTicker(defaultTenantDeletePollInterval)
 		defer ticker.Stop()
+		s.processTenantDeleteJobs(workerCtx)
 		for {
 			select {
 			case <-workerCtx.Done():
@@ -224,8 +226,9 @@ func (s *Server) startTenantDeleteCleanup(ctx context.Context) {
 }
 
 func (s *Server) processTenantDeleteJobs(ctx context.Context) {
-	_, _ = s.meta.RecoverStaleTenantDeleteJobs(ctx, time.Now().UTC().Add(-defaultTenantDeleteRunningTTL))
-	jobs, err := s.meta.ListDueTenantDeleteJobs(ctx, time.Now().UTC(), 25)
+	now := time.Now().UTC()
+	_, _ = s.meta.RecoverStaleTenantDeleteJobs(ctx, now.Add(-defaultTenantDeleteRunningTTL))
+	jobs, err := s.meta.ListDueTenantDeleteJobs(ctx, now, 25)
 	if err != nil {
 		return
 	}
@@ -256,11 +259,15 @@ func (s *Server) processTenantDeleteJob(ctx context.Context, job meta.TenantDele
 	if err != nil {
 		return err
 	}
-	res, err := s3c.DeletePrefix(ctx, "")
+	jobCtx, cancel := context.WithTimeout(ctx, defaultTenantDeleteJobTimeout)
+	defer cancel()
+	// The S3 client is already scoped to job.Prefix, so an empty relative
+	// prefix deletes the whole storage namespace without opening tenant DB.
+	res, err := s3c.DeletePrefix(jobCtx, "")
 	if err != nil {
 		return err
 	}
-	if err := s.meta.MarkTenantDeleteJobDeleted(ctx, job.TenantID, int64(res.DeletedObjects), int64(res.AbortedMultipartUploads)); err != nil {
+	if err := s.meta.MarkTenantDeleteJobDeleted(ctx, job.TenantID, res.DeletedObjects, res.AbortedMultipartUploads); err != nil {
 		return err
 	}
 	if err := s.meta.UpdateStorageNamespaceState(ctx, job.NamespaceID, meta.StorageNamespaceDeleted); err != nil && !errors.Is(err, meta.ErrNotFound) {

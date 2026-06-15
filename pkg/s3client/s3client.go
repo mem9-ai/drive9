@@ -78,8 +78,8 @@ type MultipartUpload struct {
 
 // PrefixDeleteResult summarizes a best-effort prefix cleanup pass.
 type PrefixDeleteResult struct {
-	DeletedObjects          int
-	AbortedMultipartUploads int
+	DeletedObjects          int64
+	AbortedMultipartUploads int64
 }
 
 // S3Client abstracts S3-compatible object store operations.
