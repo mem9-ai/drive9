@@ -1851,6 +1851,20 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	fh.ShadowCommitSeq = 0
 }
 
+func (fs *Dat9FS) seedReadCacheFromShadowLocked(path string, size int64, revision int64) {
+	if fs == nil || fs.shadowStore == nil || fs.readCache == nil || revision <= 0 {
+		return
+	}
+	if size > fs.readCache.MaxFileSize() {
+		return
+	}
+	data, err := fs.shadowStore.ReadAll(path)
+	if err != nil {
+		return
+	}
+	fs.readCache.PutOwned(path, data, revision)
+}
+
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
 	statStart := fs.perfStart()
 	stat, err := fs.client.StatCtx(ctx, fs.remotePath(fh.Path))
@@ -8595,6 +8609,7 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 		clearReadTargetForLockedHandle(fh)
 		if committedRev > 0 {
 			fs.clearReadTargetsForPathExcept(fh.Path, fh)
+			fs.seedReadCacheFromShadowLocked(fh.Path, size, committedRev)
 			fs.markHandleRemoteCommittedLocked(fh, committedRev)
 		} else {
 			fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
@@ -8911,6 +8926,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			if committedRev > 0 {
 				clearReadTargetForLockedHandle(fh)
 				fs.clearReadTargetsForPathExcept(fh.Path, fh)
+				fs.seedReadCacheFromShadowLocked(fh.Path, size, committedRev)
 				fs.markHandleRemoteCommittedLocked(fh, committedRev)
 				fs.inodes.UpdateSize(fh.Ino, size)
 				fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
@@ -9168,6 +9184,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		if committedRev > 0 {
 			clearReadTargetForLockedHandle(fh)
 			fs.clearReadTargetsForPathExcept(fh.Path, fh)
+			fs.seedReadCacheFromShadowLocked(fh.Path, size, committedRev)
 			fs.markHandleRemoteCommittedLocked(fh, committedRev)
 			fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
 		} else {

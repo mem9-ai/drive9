@@ -2748,6 +2748,59 @@ func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 			return
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs"+filePath:
+			var req struct {
+				NewSize int64 `json:"new_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode patch request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.NewSize != int64(len(wantFinal)) {
+				t.Errorf("patch new_size = %d, want %d", req.NewSize, len(wantFinal))
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id": "patch-1",
+				"part_size": req.NewSize,
+				"upload_parts": []map[string]any{{
+					"number":   1,
+					"url":      ts.URL + "/patch/patch-1/1",
+					"size":     req.NewSize,
+					"read_url": ts.URL + "/patch-read",
+				}},
+			})
+			return
+		case r.Method == http.MethodGet && r.URL.Path == "/patch-read":
+			mu.Lock()
+			data := append([]byte(nil), remote[filePath]...)
+			mu.Unlock()
+			_, _ = w.Write(data)
+			return
+		case r.Method == http.MethodPut && r.URL.Path == "/patch/patch-1/1":
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			uploads["patch-1"] = &uploadState{path: filePath, size: int64(len(body)), body: append([]byte(nil), body...)}
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-patch")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/patch-1/complete":
+			mu.Lock()
+			state := uploads["patch-1"]
+			if state == nil || len(state.body) == 0 {
+				mu.Unlock()
+				t.Errorf("patch complete before body")
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			remote[filePath] = append([]byte(nil), state.body...)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+filePath:
 			body, _ := io.ReadAll(r.Body)
 			mu.Lock()
@@ -2794,6 +2847,7 @@ func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.
 	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncInteractive}
 	opts.setDefaults()
 	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
 	fs := NewDat9FS(c, opts)
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
@@ -3144,6 +3198,9 @@ func TestFsyncShadowSpillCommitRefreshesRevisionAndClearsPending(t *testing.T) {
 	if shadow.Has(filePath) {
 		t.Fatal("shadow should be cleared after remote-durable fsync")
 	}
+	if cached, ok := fs.readCache.Get(filePath, 1); !ok || string(cached) != "first journal frame" {
+		t.Fatalf("read cache after first fsync = %q, ok=%t; want first journal frame", cached, ok)
+	}
 
 	if _, st := fs.Write(nil, &gofuse.WriteIn{
 		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
@@ -3160,6 +3217,9 @@ func TestFsyncShadowSpillCommitRefreshesRevisionAndClearsPending(t *testing.T) {
 	}
 	if fh.BaseRev != 2 {
 		t.Fatalf("BaseRev after second fsync = %d, want 2", fh.BaseRev)
+	}
+	if cached, ok := fs.readCache.Get(filePath, 2); !ok || string(cached) != "second journal frame" {
+		t.Fatalf("read cache after second fsync = %q, ok=%t; want second journal frame", cached, ok)
 	}
 
 	mu.Lock()
@@ -3280,6 +3340,28 @@ func newShadowSpillFallbackRecorder(t *testing.T, wantPath string, chmodStatus i
 				status = http.StatusOK
 			}
 			w.WriteHeader(status)
+			return
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+rec.wantPath:
+			gotExpected, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				t.Fatalf("expected revision header: %v", err)
+			}
+			if gotExpected != 0 {
+				t.Fatalf("expected_revision = %d, want 0", gotExpected)
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read direct PUT body: %v", err)
+			}
+			if len(body) == 0 {
+				t.Fatal("direct PUT body should not be empty")
+			}
+			rec.mu.Lock()
+			rec.uploadCount++
+			rec.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 1})
 			return
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
 			var req struct {
