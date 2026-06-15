@@ -743,10 +743,12 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 			rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, filterFSLayerSnapshotsForEntries(snapshots, entries[:i]))
 			_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 			if rollbackErr != nil {
-				errJSON(w, http.StatusInternalServerError, fmt.Sprintf("apply fs layer entry %s: %v; rollback failed: %v", entries[i].Path, err, rollbackErr))
+				logger.Error(r.Context(), "fs_layer_commit_apply_failed", eventFields(r.Context(), "fs_layer_commit_apply_failed", "path", entries[i].Path, "error", err, "rollback_error", rollbackErr)...)
+				errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 				return
 			}
-			errJSON(w, http.StatusInternalServerError, fmt.Sprintf("apply fs layer entry %s: %v", entries[i].Path, err))
+			logger.Error(r.Context(), "fs_layer_commit_apply_failed", eventFields(r.Context(), "fs_layer_commit_apply_failed", "path", entries[i].Path, "error", err)...)
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 		markFSLayerEntryTouched(touchedPaths, &entries[i])
@@ -755,10 +757,12 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 		rollbackErr := rollbackFSLayerCommit(rollbackCtx, b, snapshots)
 		_ = store.SetFSLayerStateIf(rollbackCtx, layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
 		if rollbackErr != nil {
-			errJSON(w, http.StatusInternalServerError, fmt.Sprintf("finalize fs layer commit %s: %v; rollback failed: %v", layer.LayerID, err, rollbackErr))
+			logger.Error(r.Context(), "fs_layer_commit_finalize_failed", eventFields(r.Context(), "fs_layer_commit_finalize_failed", "layer_id", layer.LayerID, "error", err, "rollback_error", rollbackErr)...)
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, fmt.Sprintf("finalize fs layer commit %s: %v", layer.LayerID, err))
+		logger.Error(r.Context(), "fs_layer_commit_finalize_failed", eventFields(r.Context(), "fs_layer_commit_finalize_failed", "layer_id", layer.LayerID, "error", err)...)
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
