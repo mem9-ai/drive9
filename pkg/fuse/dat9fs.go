@@ -1471,6 +1471,35 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 	}
 }
 
+func (fs *Dat9FS) adoptSingleCallerPathTruncate(remotePath string, callerPID uint32) {
+	if fs == nil || fs.openHandles == nil || remotePath == "" || callerPID == 0 {
+		return
+	}
+
+	var matching []*FileHandle
+	for _, fh := range fs.openHandles.SnapshotPath(remotePath) {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		dirty := fh.Dirty != nil
+		fh.Unlock()
+		if dirty {
+			matching = append(matching, fh)
+		}
+	}
+
+	for _, fh := range matching {
+		fh.Lock()
+		if shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
+			if err := fs.truncateWritableHandleLocked(fh, 0); err != nil {
+				log.Printf("handle truncate stage failed for %s: %v", fh.Path, err)
+			}
+		}
+		fh.Unlock()
+	}
+}
+
 func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision int64, skip *FileHandle) {
 	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 {
 		return
@@ -2577,6 +2606,11 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 
 		src.Lock()
 		if src.Dirty == nil {
+			src.Unlock()
+			continue
+		}
+		pendingLocal := src.IsNew || src.ZeroBase || src.DirtySeq != 0 || src.WriteBackSeq != 0 || src.ShadowCommitReady || src.Dirty.HasDirtyParts()
+		if !pendingLocal {
 			src.Unlock()
 			continue
 		}
@@ -5541,6 +5575,7 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					if st != gofuse.OK {
 						return st
 					}
+					fs.adoptSingleCallerPathTruncate(entry.Path, input.Pid)
 				} else {
 					apiPath := fs.remotePath(entry.Path)
 					writeStart := fs.perfStart()
