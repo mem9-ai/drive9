@@ -87,7 +87,7 @@ func (s *Server) handleVaultSecrets(w http.ResponseWriter, r *http.Request, sub 
 			errJSON(w, http.StatusNotImplemented, err.Error())
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	scope := ScopeFromContext(r.Context())
@@ -419,7 +419,7 @@ func (s *Server) handleVaultTokens(w http.ResponseWriter, r *http.Request, sub s
 			errJSON(w, http.StatusNotImplemented, err.Error())
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	scope := ScopeFromContext(r.Context())
@@ -560,7 +560,7 @@ func (s *Server) handleVaultGrants(w http.ResponseWriter, r *http.Request, sub s
 			errJSON(w, http.StatusNotImplemented, err.Error())
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	scope := ScopeFromContext(r.Context())
@@ -737,7 +737,7 @@ func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		result = "error"
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	scope := ScopeFromContext(r.Context())

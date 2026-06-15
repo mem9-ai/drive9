@@ -832,7 +832,7 @@ func writeGitWorkspaceStoreError(w http.ResponseWriter, err error) {
 		errJSON(w, http.StatusNotFound, "not found")
 		return
 	}
-	errJSON(w, http.StatusInternalServerError, err.Error())
+	errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 }
 
 func toGitWorkspaceResponse(ws *datastore.GitWorkspace) gitWorkspaceResponse {

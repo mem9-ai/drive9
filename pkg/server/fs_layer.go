@@ -452,7 +452,7 @@ func (s *Server) handleFSLayerObjectRead(w http.ResponseWriter, r *http.Request,
 	}
 	rc, err := b.OpenFSLayerEntryData(r.Context(), entry)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	defer func() { _ = rc.Close() }()
@@ -517,7 +517,7 @@ func (s *Server) handleFSLayerObjectUpload(w http.ResponseWriter, r *http.Reques
 	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
 	entry, err := b.PutFSLayerObject(r.Context(), layer.LayerID, prepared.Path, body, size)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	entry.LayerID = layer.LayerID
@@ -727,7 +727,7 @@ func (s *Server) handleFSLayerCommit(w http.ResponseWriter, r *http.Request, b *
 	snapshots := snapshotFSLayerCommit(r.Context(), b, entries)
 	if err := validateFSLayerCommitSnapshots(snapshots); err != nil {
 		_ = store.SetFSLayerStateIf(r.Context(), layer.LayerID, []datastore.FSLayerState{datastore.FSLayerStateCommitting}, datastore.FSLayerStateConflicted)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(r.Context()), fsLayerRollbackTimeout)
@@ -1674,7 +1674,7 @@ func writeFSLayerStoreError(w http.ResponseWriter, err error) {
 		errJSON(w, http.StatusConflict, err.Error())
 		return
 	}
-	errJSON(w, http.StatusInternalServerError, err.Error())
+	errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 }
 
 func toFSLayerResponse(layer *datastore.FSLayer) fsLayerResponse {
