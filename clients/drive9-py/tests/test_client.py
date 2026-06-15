@@ -1,5 +1,7 @@
 """Tests for the Drive9 Python SDK."""
 
+import base64
+import hashlib
 import json
 from io import BytesIO
 from unittest import mock
@@ -287,6 +289,47 @@ def test_patch_file(client):
         return b"a" * part_size
 
     client.patch_file("/file.bin", 1024, [1], read_part)
+    assert "x-amz-checksum-sha256" not in responses.calls[1].request.headers
+
+
+@responses.activate
+def test_patch_file_sends_presigned_checksum(client):
+    plan = {
+        "upload_id": "puid",
+        "part_size": 8,
+        "upload_parts": [
+            {
+                "number": 1,
+                "url": "http://s3/patch1",
+                "size": 8,
+                "headers": {"x-amz-checksum-sha256": "placeholder"},
+            }
+        ],
+        "copied_parts": [],
+    }
+    responses.add(
+        responses.PATCH,
+        f"{BASE_URL}/v1/fs/file.bin",
+        json=plan,
+        status=202,
+    )
+    responses.add(
+        responses.PUT,
+        "http://s3/patch1",
+        status=200,
+    )
+    responses.add(
+        responses.POST,
+        f"{BASE_URL}/v1/uploads/puid/complete",
+        status=200,
+    )
+
+    def read_part(part_number, part_size, orig_data):
+        return b"testdata"
+
+    client.patch_file("/file.bin", 8, [1], read_part)
+    expected = base64.b64encode(hashlib.sha256(b"testdata").digest()).decode("ascii")
+    assert responses.calls[1].request.headers["x-amz-checksum-sha256"] == expected
 
 
 

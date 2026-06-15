@@ -3,6 +3,8 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -377,10 +379,12 @@ func TestPatchUploadRespectsPresignedChecksumHeader(t *testing.T) {
 				t.Fatalf("x-amz-checksum-sha256 present = %v, want %v (header value: %q)",
 					gotChecksumPresent, tt.expectChecksum, gotChecksumHeader)
 			}
-			// When checksum IS sent, verify it's a valid base64-encoded SHA-256
-			// (not the placeholder from presigned headers).
-			if tt.expectChecksum && gotChecksumHeader == "placeholder" {
-				t.Fatal("checksum header should be recomputed, not the presigned placeholder")
+			if tt.expectChecksum {
+				sum := sha256.Sum256([]byte("testdata"))
+				want := base64.StdEncoding.EncodeToString(sum[:])
+				if gotChecksumHeader != want {
+					t.Fatalf("checksum header = %q, want %q", gotChecksumHeader, want)
+				}
 			}
 		})
 	}

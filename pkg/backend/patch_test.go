@@ -9,10 +9,10 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+
 	"github.com/mem9-ai/dat9/internal/testmysql"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/s3client"
-	"github.com/stretchr/testify/require"
 )
 
 func TestPatchAndAppendRejectDBBackedFilesWithSentinel(t *testing.T) {
@@ -70,21 +70,29 @@ func (c *patchChecksumRecordingS3Client) PresignUploadPart(ctx context.Context, 
 func TestPatchUploadUsesChecksumAlgoNone(t *testing.T) {
 	// Set up backend with recording S3 client.
 	s3Dir, err := os.MkdirTemp("", "dat9-s3-patch-checksum-*")
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
 	t.Cleanup(func() { _ = os.RemoveAll(s3Dir) })
 
 	initBackendSchema(t, testDSN)
 	store, err := datastore.Open(testDSN)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("Open datastore: %v", err)
+	}
 	testmysql.ResetDB(t, store.DB())
 	t.Cleanup(func() { _ = store.Close() })
 
 	localS3, err := s3client.NewLocal(s3Dir, "http://localhost:9091/s3")
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewLocal S3: %v", err)
+	}
 	rec := &patchChecksumRecordingS3Client{S3Client: localS3}
 
 	b, err := NewWithS3ModeAndOptions(store, rec, true, Options{})
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("NewWithS3ModeAndOptions: %v", err)
+	}
 	t.Cleanup(func() { b.Close() })
 
 	ctx := context.Background()
@@ -92,12 +100,18 @@ func TestPatchUploadUsesChecksumAlgoNone(t *testing.T) {
 	// Step 1: Create an S3-backed file via v1 upload + confirm.
 	totalSize := int64(2 * s3client.PartSize) // 2 parts
 	plan, err := b.InitiateUpload(ctx, "/patch-checksum-test.bin", totalSize)
-	require.NoError(t, err)
-	require.NotEmpty(t, plan.Parts)
+	if err != nil {
+		t.Fatalf("InitiateUpload: %v", err)
+	}
+	if len(plan.Parts) == 0 {
+		t.Fatal("InitiateUpload returned no parts")
+	}
 
 	// Get S3 upload ID for direct part upload.
 	upload, err := b.GetUpload(ctx, plan.UploadID)
-	require.NoError(t, err)
+	if err != nil {
+		t.Fatalf("GetUpload: %v", err)
+	}
 
 	// Upload parts via the underlying local S3 client directly.
 	partData := make([]byte, totalSize)
@@ -111,9 +125,13 @@ func TestPatchUploadUsesChecksumAlgoNone(t *testing.T) {
 			end = totalSize
 		}
 		_, err := localS3.UploadPart(ctx, upload.S3UploadID, p.Number, bytes.NewReader(partData[start:end]))
-		require.NoError(t, err, "upload part %d", p.Number)
+		if err != nil {
+			t.Fatalf("upload part %d: %v", p.Number, err)
+		}
 	}
-	require.NoError(t, b.ConfirmUpload(ctx, plan.UploadID))
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatalf("ConfirmUpload: %v", err)
+	}
 
 	// Reset recording — we only care about the patch path calls.
 	rec.createMPUAlgos = nil
@@ -122,24 +140,33 @@ func TestPatchUploadUsesChecksumAlgoNone(t *testing.T) {
 
 	// Step 2: Initiate a patch upload marking part 1 as dirty.
 	patchPlan, err := b.InitiatePatchUploadIfRevision(ctx, "/patch-checksum-test.bin", totalSize, []int{1}, s3client.PartSize, -1)
-	require.NoError(t, err)
-	require.NotNil(t, patchPlan)
+	if err != nil {
+		t.Fatalf("InitiatePatchUploadIfRevision: %v", err)
+	}
+	if patchPlan == nil {
+		t.Fatal("InitiatePatchUploadIfRevision returned nil plan")
+	}
 
 	// Step 3: Assert CreateMultipartUpload used ChecksumAlgoNone.
-	require.Len(t, rec.createMPUAlgos, 1, "expected exactly 1 CreateMultipartUpload call from patch")
-	require.Equal(t, s3client.ChecksumAlgoNone, rec.createMPUAlgos[0],
-		"patch CreateMultipartUpload must use ChecksumAlgoNone; "+
-			"using ChecksumAlgoSHA256 forces S3 to require checksum headers "+
-			"that cannot be included in presigned URLs (issue #555)")
+	if len(rec.createMPUAlgos) != 1 {
+		t.Fatalf("CreateMultipartUpload calls = %d, want 1", len(rec.createMPUAlgos))
+	}
+	if rec.createMPUAlgos[0] != s3client.ChecksumAlgoNone {
+		t.Errorf("patch CreateMultipartUpload algo = %v, want %v", rec.createMPUAlgos[0], s3client.ChecksumAlgoNone)
+	}
 
 	// Step 4: Assert PresignUploadPart used ChecksumAlgoNone with empty checksum.
 	// Part 1 is dirty → should have a presigned upload URL.
 	// Part 2 is clean → server-side copy, no presign.
-	require.NotEmpty(t, rec.presignPartAlgos, "expected at least 1 PresignUploadPart call for dirty part")
+	if len(rec.presignPartAlgos) == 0 {
+		t.Fatal("expected at least 1 PresignUploadPart call for dirty part")
+	}
 	for i, algo := range rec.presignPartAlgos {
-		require.Equal(t, s3client.ChecksumAlgoNone, algo,
-			"patch PresignUploadPart[%d] must use ChecksumAlgoNone (issue #555)", i)
-		require.Empty(t, rec.presignPartChecksum[i],
-			"patch PresignUploadPart[%d] checksum value must be empty", i)
+		if algo != s3client.ChecksumAlgoNone {
+			t.Errorf("patch PresignUploadPart[%d] algo = %v, want %v", i, algo, s3client.ChecksumAlgoNone)
+		}
+		if rec.presignPartChecksum[i] != "" {
+			t.Errorf("patch PresignUploadPart[%d] checksum = %q, want empty", i, rec.presignPartChecksum[i])
+		}
 	}
 }
