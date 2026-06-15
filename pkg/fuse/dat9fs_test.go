@@ -10365,6 +10365,122 @@ func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
 	}
 }
 
+func TestSetAttr_WriteBackPathTruncateSkipsDefaultInheritedMode(t *testing.T) {
+	fs, shadow, pending := newWriteBackPathTruncateModeTestFS(t)
+
+	const path = "/file.bin"
+	ino := fs.inodes.Lookup(path, false, 4096, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.inodes.UpdateMode(ino, defaultRegularFileMode)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if out.Size != 0 {
+		t.Fatalf("out.Size = %d, want 0", out.Size)
+	}
+	if !shadow.Has(path) {
+		t.Fatal("shadow missing for staged truncate")
+	}
+
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending truncate metadata missing")
+	}
+	if meta.HasMode {
+		t.Fatalf("pending mode = has:%t mode:%o, want has:false for inherited default mode", meta.HasMode, meta.Mode)
+	}
+
+	commit := singleQueuedCommitForPath(t, fs.commitQueue, path)
+	if commit.HasMode {
+		t.Fatalf("queued commit mode = has:%t mode:%o, want has:false for inherited default mode", commit.HasMode, commit.Mode)
+	}
+}
+
+func TestSetAttr_WriteBackPathTruncatePreservesNonDefaultInheritedMode(t *testing.T) {
+	fs, _, pending := newWriteBackPathTruncateModeTestFS(t)
+
+	const path = "/private.bin"
+	ino := fs.inodes.Lookup(path, false, 4096, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.inodes.UpdateMode(ino, 0o600)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending truncate metadata missing")
+	}
+	if !meta.HasMode || meta.Mode&0o777 != 0o600 {
+		t.Fatalf("pending mode = has:%t mode:%o, want has:true mode:0600", meta.HasMode, meta.Mode&0o777)
+	}
+
+	commit := singleQueuedCommitForPath(t, fs.commitQueue, path)
+	if !commit.HasMode || commit.Mode&0o777 != 0o600 {
+		t.Fatalf("queued commit mode = has:%t mode:%o, want has:true mode:0600", commit.HasMode, commit.Mode&0o777)
+	}
+}
+
+func newWriteBackPathTruncateModeTestFS(t *testing.T) (*Dat9FS, *ShadowStore, *PendingIndex) {
+	t.Helper()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { shadow.Close() })
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   8,
+		queue:        []*CommitEntry{},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+		workCh:       make(chan *CommitEntry, 16),
+	}
+	return fs, shadow, pending
+}
+
+func singleQueuedCommitForPath(t *testing.T, cq *CommitQueue, path string) *CommitEntry {
+	t.Helper()
+
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if len(cq.queue) != 1 {
+		t.Fatalf("queued commits = %d, want 1", len(cq.queue))
+	}
+	commit := cq.queue[0]
+	if commit.Path != path {
+		t.Fatalf("queued commit path = %q, want %q", commit.Path, path)
+	}
+	return commit
+}
+
 func TestSetAttr_CloseSyncPathTruncateKeepsSynchronousRemoteCommit(t *testing.T) {
 	putStarted := make(chan struct{})
 	releasePut := make(chan struct{})

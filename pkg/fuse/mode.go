@@ -17,7 +17,7 @@ func shouldApplyRemoteMode(kind PendingKind, hasMode bool, mode uint32) bool {
 	if !hasMode {
 		return false
 	}
-	if (kind == PendingNew || kind == PendingOverwrite) && mode&0o777 == defaultRegularFileMode {
+	if kind == PendingNew && mode&0o777 == defaultRegularFileMode {
 		return false
 	}
 	return true

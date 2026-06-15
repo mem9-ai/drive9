@@ -2338,7 +2338,7 @@ func (fs *Dat9FS) stagePathTruncateToZeroLocked(ctx context.Context, entry *Inod
 	hasMode := false
 	if entry.HasMode {
 		mode = entry.Mode & 0o777
-		hasMode = true
+		hasMode = mode != defaultRegularFileMode
 	}
 	if err := fs.shadowStore.WriteFull(entry.Path, nil, expectedRevision); err != nil {
 		log.Printf("path truncate shadow stage failed for %s: %v", entry.Path, err)
