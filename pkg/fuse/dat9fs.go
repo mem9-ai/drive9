@@ -2366,7 +2366,7 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	fs.adoptCommittedRevisionLocked(fh)
 
 	size := fh.Dirty.Size()
-	if fh.ShadowReady {
+	if fh.ShadowReady && fh.ShadowSpill {
 		if err := fs.shadowStore.Truncate(fh.Path, size, fh.BaseRev); err != nil {
 			return err
 		}
