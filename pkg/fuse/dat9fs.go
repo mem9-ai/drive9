@@ -7602,7 +7602,6 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 					log.Printf("shadow reset failed for truncate-open %s: %v", p, err)
 				} else {
 					fh.ShadowReady = true
-					fh.ShadowSpill = true
 					// Pin shadow so commit queue cleanup doesn't delete it while
 					// this handle is reading.
 					fh.ShadowGen = fs.shadowStore.Pin(p)
