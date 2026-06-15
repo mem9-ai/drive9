@@ -2352,3 +2352,67 @@ func TestCommitQueueCancelPathJournalsCommitMarker(t *testing.T) {
 		t.Error("unlinked path resurrected from WAL — cancel marker missing")
 	}
 }
+
+func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t *testing.T) {
+	zero := &CommitEntry{Path: "/file.txt", Size: 0, Kind: PendingOverwrite}
+	nonzero := &CommitEntry{Path: "/other.txt", Size: 4, Kind: PendingOverwrite}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{zero, nonzero},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	if !cq.CancelQueuedZeroTruncatePreserveLocal("/file.txt") {
+		t.Fatal("cancel queued zero truncate returned false")
+	}
+	if !zero.canceled {
+		t.Fatal("zero truncate entry was not marked canceled")
+	}
+	if cq.HasPath("/file.txt") {
+		t.Fatal("zero truncate path still queued")
+	}
+	if !cq.HasPath("/other.txt") {
+		t.Fatal("non-zero queued entry was affected")
+	}
+
+	zero = &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite}
+	samePathNonzero := &CommitEntry{Path: "/same.txt", Size: 4, Kind: PendingOverwrite}
+	cq = &CommitQueue{
+		queue:        []*CommitEntry{zero, samePathNonzero},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/same.txt") {
+		t.Fatal("cancel returned true while non-zero same-path entry remained queued")
+	}
+	if !zero.canceled {
+		t.Fatal("zero truncate entry was not marked canceled with same-path non-zero entry")
+	}
+	if samePathNonzero.canceled {
+		t.Fatal("non-zero same-path entry was canceled")
+	}
+	if !cq.HasPath("/same.txt") {
+		t.Fatal("same-path non-zero entry disappeared")
+	}
+
+	inFlight := &CommitEntry{Path: "/busy.txt", Size: 0, Kind: PendingOverwrite}
+	cq = &CommitQueue{
+		queue:        []*CommitEntry{inFlight},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{"/busy.txt": inFlight},
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/busy.txt") {
+		t.Fatal("cancel returned true for in-flight zero truncate")
+	}
+	if inFlight.canceled {
+		t.Fatal("in-flight zero truncate was canceled")
+	}
+	if !cq.HasPath("/busy.txt") {
+		t.Fatal("in-flight path disappeared")
+	}
+}
