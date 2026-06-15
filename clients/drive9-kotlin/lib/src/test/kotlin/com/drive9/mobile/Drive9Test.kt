@@ -6,12 +6,14 @@ import com.sun.net.httpserver.HttpServer
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import java.io.ByteArrayOutputStream
+import java.security.MessageDigest
 import java.nio.file.Files
 import kotlin.io.path.deleteIfExists
 import kotlin.io.path.exists
 import kotlin.io.path.readBytes
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
+import java.util.Base64
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -467,7 +469,7 @@ class Drive9Test {
             ex.close()
         }
         route("PUT", "/patch-part") { ex ->
-            assertTrue(ex.requestHeaders.getFirst("x-amz-checksum-sha256") != null)
+            assertEquals(null, ex.requestHeaders.getFirst("x-amz-checksum-sha256"))
             patched += ex.requestBody.readBytes()
             ex.sendResponseHeaders(200, -1)
             ex.close()
@@ -483,6 +485,41 @@ class Drive9Test {
         try {
             client.patchFileParts(local.toString(), "/r", listOf(1), 6, 4)
             assertContentEquals("abcd".toByteArray(), patched.single())
+        } finally {
+            local.deleteIfExists()
+        }
+    }
+
+    @Test
+    fun patchFilePartsSendsPresignedChecksumHeader() = runBlocking {
+        val patched = mutableListOf<ByteArray>()
+        route("PATCH", "/v1/fs/r") { ex ->
+            ex.requestBody.readBytes()
+            val response = """{"upload_id":"p1","part_size":8,"upload_parts":[{"number":1,"url":"$baseUrl/patch-part-checksum","size":8,"headers":{"x-amz-checksum-sha256":"placeholder"}}],"copied_parts":[]}"""
+                .toByteArray()
+            ex.responseHeaders.add("Content-Type", "application/json")
+            ex.sendResponseHeaders(200, response.size.toLong())
+            ex.responseBody.write(response)
+            ex.close()
+        }
+        route("PUT", "/patch-part-checksum") { ex ->
+            val expected = Base64.getEncoder().encodeToString(MessageDigest.getInstance("SHA-256").digest("testdata".toByteArray()))
+            assertEquals(expected, ex.requestHeaders.getFirst("x-amz-checksum-sha256"))
+            patched += ex.requestBody.readBytes()
+            ex.sendResponseHeaders(200, -1)
+            ex.close()
+        }
+        route("POST", "/v1/uploads/p1/complete") { ex ->
+            ex.sendResponseHeaders(200, -1)
+            ex.close()
+        }
+
+        val local = Files.createTempFile("drive9-kotlin-patch-checksum", ".bin")
+        Files.write(local, "testdata".toByteArray())
+        val client = Drive9Client(baseUrl, "k")
+        try {
+            client.patchFileParts(local.toString(), "/r", listOf(1), 8, 8)
+            assertContentEquals("testdata".toByteArray(), patched.single())
         } finally {
             local.deleteIfExists()
         }

@@ -311,7 +311,7 @@ final class Drive9Tests: XCTestCase {
         }
         server.route("PUT", "/patch-part") { req in
             patched.set(req.body)
-            XCTAssertTrue(req.headers["x-amz-checksum-sha256"] != nil)
+            XCTAssertNil(req.headers["x-amz-checksum-sha256"])
             return MockResponse(status: 200, body: Data())
         }
         server.route("POST", "/v1/uploads/p1/complete") { _ in MockResponse(status: 200, body: Data()) }
@@ -328,6 +328,34 @@ final class Drive9Tests: XCTestCase {
             partSize: 4
         )
         XCTAssertEqual(patched.get(), Data("abcd".utf8))
+    }
+
+    func testPatchFilePartsSendsPresignedChecksumHeader() async throws {
+        let client = Drive9Client(baseUrl: server.baseURL, apiKey: "k")
+        let patched = ReceivedBody()
+        server.route("PATCH", "/v1/fs/r") { _ in
+            let body = #"{"upload_id":"p1","part_size":8,"upload_parts":[{"number":1,"url":"\#(self.server.baseURL)/patch-part-checksum","size":8,"headers":{"x-amz-checksum-sha256":"placeholder"}}],"copied_parts":[]}"#
+            return MockResponse(status: 200, body: Data(body.utf8), contentType: "application/json")
+        }
+        server.route("PUT", "/patch-part-checksum") { req in
+            patched.set(req.body)
+            XCTAssertEqual(req.headers["x-amz-checksum-sha256"], "gQ/y+yQqXe5CIPLLDmpRmJH7Z/L4KKbKtO+IlGM7H1A=")
+            return MockResponse(status: 200, body: Data())
+        }
+        server.route("POST", "/v1/uploads/p1/complete") { _ in MockResponse(status: 200, body: Data()) }
+
+        let local = FileManager.default.temporaryDirectory
+            .appendingPathComponent("drive9-swift-patch-checksum-\(UUID().uuidString).bin")
+        try Data("testdata".utf8).write(to: local)
+        defer { try? FileManager.default.removeItem(at: local) }
+        try await client.patchFileParts(
+            localPath: local.path,
+            remotePath: "/r",
+            dirtyParts: [1],
+            newSize: 8,
+            partSize: 8
+        )
+        XCTAssertEqual(patched.get(), Data("testdata".utf8))
     }
 
     private func assertDrive9Code<T>(

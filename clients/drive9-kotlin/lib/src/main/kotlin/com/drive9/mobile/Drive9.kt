@@ -676,7 +676,9 @@ public class Drive9Client(
 
     private fun uploadPatchPart(part: Drive9PatchPartUrl, data: ByteArray) {
         val headers = part.headers.toMutableMap()
-        headers["x-amz-checksum-sha256"] = sha256Base64(data)
+        if (headers.keys.any { it.equals("x-amz-checksum-sha256", ignoreCase = true) }) {
+            headers["x-amz-checksum-sha256"] = sha256Base64(data)
+        }
         val result = rawPut(part.url, headers, data, retryOnForbidden = false)
         if (result.status !in 200..299) throw errorFrom(result.status, result.body)
     }

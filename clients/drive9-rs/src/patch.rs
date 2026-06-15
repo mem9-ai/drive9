@@ -106,28 +106,33 @@ impl Client {
         };
 
         let data = read_part(part.number, part.size, orig_data.as_deref())?;
-        let checksum = base64::Engine::encode(
-            &base64::engine::general_purpose::STANDARD,
-            Sha256::digest(&data),
-        );
 
         let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-amz-checksum-sha256",
-            reqwest::header::HeaderValue::from_str(&checksum).unwrap(),
-        );
+        let mut should_send_checksum = false;
         if let Some(ref ph) = part.headers {
             for (k, v) in ph {
                 if k.eq_ignore_ascii_case("host") {
                     continue;
                 }
                 if let Ok(hv) = reqwest::header::HeaderValue::from_str(v.as_str().unwrap_or("")) {
-                    let name = HeaderName::from_bytes(k.as_bytes()).map_err(|_| {
-                        Drive9Error::Other(format!("invalid header name: {}", k))
-                    })?;
+                    let name = HeaderName::from_bytes(k.as_bytes())
+                        .map_err(|_| Drive9Error::Other(format!("invalid header name: {}", k)))?;
                     headers.insert(name, hv);
+                    if k.eq_ignore_ascii_case("x-amz-checksum-sha256") {
+                        should_send_checksum = true;
+                    }
                 }
             }
+        }
+        if should_send_checksum {
+            let checksum = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                Sha256::digest(&data),
+            );
+            headers.insert(
+                "x-amz-checksum-sha256",
+                reqwest::header::HeaderValue::from_str(&checksum).unwrap(),
+            );
         }
         let resp = self
             .http

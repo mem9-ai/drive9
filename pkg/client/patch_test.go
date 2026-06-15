@@ -3,6 +3,8 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -67,8 +69,10 @@ func TestPatchFileSendsExplicitPartSize(t *testing.T) {
 				http.Error(w, "missing upload token", http.StatusBadRequest)
 				return
 			}
-			if got := r.Header.Get("x-amz-checksum-sha256"); got == "" {
-				http.Error(w, "missing checksum header", http.StatusBadRequest)
+			// Server did not include x-amz-checksum-sha256 in presigned
+			// headers, so client must NOT send it (would cause S3 403).
+			if got := r.Header.Get("x-amz-checksum-sha256"); got != "" {
+				http.Error(w, "unexpected checksum header: server did not sign it", http.StatusForbidden)
 				return
 			}
 			uploaded, _ = io.ReadAll(r.Body)
@@ -292,5 +296,96 @@ func TestPatchFileSendsExpectedRevision(t *testing.T) {
 	}
 	if !completeCalled {
 		t.Fatal("complete was not called")
+	}
+}
+
+// TestPatchUploadRespectsPresignedChecksumHeader verifies that uploadPatchPart
+// only sends x-amz-checksum-sha256 when the server included it in the
+// presigned headers. This is a regression test for issue #555: when the header
+// is absent from the presigned URL signature, sending it causes S3 to return
+// 403 (HeadersNotSigned: x-amz-checksum-sha256).
+func TestPatchUploadRespectsPresignedChecksumHeader(t *testing.T) {
+	tests := []struct {
+		name           string
+		presignHeaders map[string]string
+		expectChecksum bool
+	}{
+		{
+			name:           "no checksum in presigned headers",
+			presignHeaders: map[string]string{"x-amz-content-sha256": "UNSIGNED-PAYLOAD"},
+			expectChecksum: false,
+		},
+		{
+			name:           "checksum in presigned headers",
+			presignHeaders: map[string]string{"x-amz-checksum-sha256": "placeholder"},
+			expectChecksum: true,
+		},
+		{
+			name:           "empty presigned headers",
+			presignHeaders: nil,
+			expectChecksum: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var gotChecksumHeader string
+			var gotChecksumPresent bool
+			var completeCalled bool
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs/checksum-test.bin":
+					w.WriteHeader(http.StatusAccepted)
+					_ = json.NewEncoder(w).Encode(PatchPlan{
+						UploadID: "patch-cs",
+						PartSize: 8,
+						UploadParts: []*PatchPartURL{{
+							Number:  1,
+							URL:     fmt.Sprintf("http://%s/upload/1", r.Host),
+							Size:    8,
+							Headers: tt.presignHeaders,
+						}},
+					})
+
+				case r.Method == http.MethodPut && r.URL.Path == "/upload/1":
+					gotChecksumHeader = r.Header.Get("x-amz-checksum-sha256")
+					gotChecksumPresent = gotChecksumHeader != ""
+					w.WriteHeader(http.StatusOK)
+
+				case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/patch-cs/complete":
+					completeCalled = true
+					w.WriteHeader(http.StatusOK)
+
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			c := New(srv.URL, "")
+			err := c.PatchFile(context.Background(), "/checksum-test.bin", 8, []int{1},
+				func(partNumber int, partSize int64, origData []byte) ([]byte, error) {
+					return []byte("testdata"), nil
+				},
+				nil,
+				WithPartSize(8))
+			if err != nil {
+				t.Fatalf("PatchFile: %v", err)
+			}
+			if !completeCalled {
+				t.Fatal("complete was not called")
+			}
+			if gotChecksumPresent != tt.expectChecksum {
+				t.Fatalf("x-amz-checksum-sha256 present = %v, want %v (header value: %q)",
+					gotChecksumPresent, tt.expectChecksum, gotChecksumHeader)
+			}
+			if tt.expectChecksum {
+				sum := sha256.Sum256([]byte("testdata"))
+				want := base64.StdEncoding.EncodeToString(sum[:])
+				if gotChecksumHeader != want {
+					t.Fatalf("checksum header = %q, want %q", gotChecksumHeader, want)
+				}
+			}
+		})
 	}
 }

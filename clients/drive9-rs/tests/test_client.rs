@@ -1,4 +1,7 @@
+use base64::Engine;
 use drive9::{Client, Drive9Error};
+use mockito::Matcher;
+use sha2::{Digest, Sha256};
 
 #[tokio::test]
 async fn test_write_and_read() {
@@ -68,7 +71,11 @@ async fn test_conflict_error() {
     let client = Client::new(server.url(), "test-key");
     let err = client.write("/conflict.txt", b"x").await.unwrap_err();
     match err {
-        Drive9Error::Conflict { status_code, server_revision, .. } => {
+        Drive9Error::Conflict {
+            status_code,
+            server_revision,
+            ..
+        } => {
             assert_eq!(status_code, 409);
             assert_eq!(server_revision, None);
         }
@@ -89,7 +96,11 @@ async fn test_conflict_error_with_server_revision() {
     let client = Client::new(server.url(), "test-key");
     let err = client.write("/conflict2.txt", b"x").await.unwrap_err();
     match err {
-        Drive9Error::Conflict { status_code, server_revision, .. } => {
+        Drive9Error::Conflict {
+            status_code,
+            server_revision,
+            ..
+        } => {
             assert_eq!(status_code, 409);
             assert_eq!(server_revision, Some(42));
         }
@@ -147,4 +158,59 @@ fn test_default_client_loads_config() {
         None => std::env::remove_var("HOME"),
     }
     let _ = std::fs::remove_dir_all(&temp_home);
+}
+
+#[tokio::test]
+async fn test_patch_file_respects_presigned_checksum_header() {
+    let mut server = mockito::Server::new_async().await;
+    let expected = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(b"part-2"));
+    let patch_body = format!(
+        r#"{{
+            "upload_id":"patch-rs",
+            "part_size":8,
+            "upload_parts":[
+                {{"number":1,"url":"{}/patch/1","size":8,"headers":{{}}}},
+                {{"number":2,"url":"{}/patch/2","size":8,"headers":{{"x-amz-checksum-sha256":"placeholder"}}}}
+            ],
+            "copied_parts":[]
+        }}"#,
+        server.url(),
+        server.url()
+    );
+    let _plan = server
+        .mock("PATCH", "/v1/fs/file.bin")
+        .with_status(202)
+        .with_body(patch_body)
+        .create_async()
+        .await;
+    let _part1 = server
+        .mock("PUT", "/patch/1")
+        .match_header("x-amz-checksum-sha256", Matcher::Missing)
+        .with_status(200)
+        .create_async()
+        .await;
+    let _part2 = server
+        .mock("PUT", "/patch/2")
+        .match_header("x-amz-checksum-sha256", expected.as_str())
+        .with_status(200)
+        .create_async()
+        .await;
+    let _complete = server
+        .mock("POST", "/v1/uploads/patch-rs/complete")
+        .with_status(200)
+        .create_async()
+        .await;
+
+    let client = Client::new(server.url(), "test-key");
+    client
+        .patch_file(
+            "/file.bin",
+            16,
+            &[1, 2],
+            |part, _, _| Ok(format!("part-{}", part).into_bytes()),
+            Some(8),
+            None,
+        )
+        .await
+        .unwrap();
 }
