@@ -123,6 +123,10 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 
 	status, err := s.enqueueTenantDeleteJob(r.Context(), t)
 	if err != nil {
+		// Cluster deprovision already succeeded. Keep owner keys active until
+		// cleanup is durably enqueued so the same owner can retry the delete
+		// request. This matters for tidbcloud_native because customer TiDB Cloud
+		// credentials are accepted per request and are not stored server-side.
 		errJSON(w, http.StatusInternalServerError, "failed to enqueue tenant delete cleanup")
 		return
 	}
