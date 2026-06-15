@@ -18,6 +18,8 @@ The current storage path is **TiDB + S3-compatible object storage**. db9 remains
 a provider/inspiration path in the codebase, but it is not the default storage
 backend described by the current production architecture.
 
+Recent project updates are summarized in the [weekly release notes](docs/release-notes/2026-05-18-to-2026-06-14.md).
+
 ## What It Does
 
 **One path namespace.** Files live at paths such as `:/src/main.go` or
