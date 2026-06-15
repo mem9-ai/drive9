@@ -31,6 +31,8 @@ const (
 	EnvTiDBCloudNativeDefaultDatabaseName = "DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME"
 
 	DefaultDatabaseName = "tidbcloud_fs"
+
+	upstreamErrorBodyLimit = 2048
 )
 
 var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
@@ -125,7 +127,7 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("tidbcloud native provision status %d", resp.StatusCode)
+		return nil, fmt.Errorf("tidbcloud native provision status %d: %s", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	info, err := parseClusterInfo(raw)
 	if err != nil {
@@ -134,7 +136,7 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	if info.ClusterID == "" {
 		return nil, fmt.Errorf("tidbcloud native response missing cluster id")
 	}
-	if info.State != "" && info.State != "ACTIVE" && (info.Endpoints.Public.Host == "" || info.UserPrefix == "") {
+	if info.State != "ACTIVE" || clusterConnectionIncomplete(info) {
 		info, err = p.waitForClusterActive(ctx, publicKey, privateKey, info.ClusterID)
 		if err != nil {
 			return &tenant.ClusterInfo{
@@ -209,6 +211,18 @@ func normalizeDatabaseName(name string) (string, error) {
 	}
 }
 
+func sanitizeUpstreamBody(raw []byte) string {
+	s := strings.TrimSpace(string(raw))
+	if s == "" {
+		return ""
+	}
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > upstreamErrorBodyLimit {
+		s = s[:upstreamErrorBodyLimit] + "...(truncated)"
+	}
+	return s
+}
+
 func ensureDatabase(ctx context.Context, user, password, host string, port int, dbName string) error {
 	cfg := mysql.NewConfig()
 	cfg.User = user
@@ -249,6 +263,13 @@ func parseClusterInfo(raw []byte) (*clusterInfo, error) {
 	return &out, nil
 }
 
+func clusterConnectionIncomplete(info *clusterInfo) bool {
+	if info == nil {
+		return true
+	}
+	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || (info.UserPrefix == "" && info.Username == "")
+}
+
 func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, privateKey, clusterID string) (*clusterInfo, error) {
 	deadline := time.Now().Add(10 * time.Minute)
 	for {
@@ -260,13 +281,13 @@ func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, priva
 		raw, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("tidbcloud native cluster get status %d", resp.StatusCode)
+			return nil, fmt.Errorf("tidbcloud native cluster get status %d: %s", resp.StatusCode, sanitizeUpstreamBody(raw))
 		}
 		info, err := parseClusterInfo(raw)
 		if err != nil {
 			return nil, err
 		}
-		if info.State == "ACTIVE" {
+		if info.State == "ACTIVE" && !clusterConnectionIncomplete(info) {
 			return info, nil
 		}
 		if time.Now().After(deadline) {

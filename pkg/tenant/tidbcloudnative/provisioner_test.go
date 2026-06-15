@@ -66,6 +66,7 @@ func TestNewProvisionerFromEnvRejectsInvalidDefaultDatabaseName(t *testing.T) {
 
 func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testing.T) {
 	var ensureDBCalled bool
+	var pollCount int
 	origEnsureDatabase := ensureDatabaseFunc
 	ensureDatabaseFunc = func(_ context.Context, user, password, host string, port int, dbName string) error {
 		ensureDBCalled = true
@@ -86,18 +87,36 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	}
 	var requestCount int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1beta1/clusters" {
-			t.Fatalf("unexpected path %s", r.URL.Path)
-		}
 		requestCount++
 		if requestCount == 1 {
 			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}
+		if r.URL.Path == "/v1beta1/clusters/cluster-1" {
+			pollCount++
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId":  "cluster-1",
+				"state":      "ACTIVE",
+				"userPrefix": "u1",
+				"endpoints":  map[string]any{"public": map[string]any{"host": "db.example", "port": 4000}},
+			})
+			return
+		}
+		if r.URL.Path != "/v1beta1/clusters" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
 		gotAuth = r.Header.Get("Authorization")
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Fatalf("decode request body: %v", err)
+		}
+		pollCount++
+		if pollCount == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-1",
+				"state":     "CREATING",
+			})
+			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"clusterId":  "cluster-1",
@@ -143,6 +162,9 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	}
 	if !ensureDBCalled {
 		t.Fatal("ensure database was not called")
+	}
+	if pollCount < 2 {
+		t.Fatalf("poll count = %d, want at least 2", pollCount)
 	}
 }
 
@@ -200,6 +222,40 @@ func TestProvisionWithCredentialsRejectsReservedDatabaseName(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "reserved") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestProvisionWithCredentialsIncludesUpstreamBodyOnError(t *testing.T) {
+	longBody := strings.Repeat("x", upstreamErrorBodyLimit+100)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		http.Error(w, longBody, http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		cloudProvider:       "aws",
+		region:              "us-east-1",
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	_, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err == nil {
+		t.Fatal("expected upstream error")
+	}
+	if !strings.Contains(err.Error(), "tidbcloud native provision status 400") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "(truncated)") {
+		t.Fatalf("expected truncated upstream body, got: %v", err)
 	}
 }
 

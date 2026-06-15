@@ -3580,6 +3580,9 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		metricEvent(ctx, "tenant_provision", "provider", rawProvider, "result", "error")
 		return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 	}
+	if provider == tenant.ProviderTiDBCloudNative && opts.CredentialProvisioner == nil {
+		return nil, newProvisionTenantError(http.StatusBadRequest, "public_key and private_key are required", fmt.Errorf("public_key and private_key are required"))
+	}
 	tenantID := token.NewID()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
 	setRequestMetricTenant(ctx, tenantID, "", provider, tenantRequestClass{surface: "provision", action: "post"})

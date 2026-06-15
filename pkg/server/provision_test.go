@@ -449,6 +449,54 @@ func TestProvisionTiDBCloudNativeRequiresRequestCredentials(t *testing.T) {
 	}
 }
 
+func TestProvisionTenantRejectsMissingNativeCredentialsBeforeInsert(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}
+	srv := NewWithConfig(Config{
+		Meta:        metaStore,
+		Pool:        pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
+	})
+	defer srv.Close()
+
+	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{KeyName: "default"})
+	if err == nil {
+		t.Fatal("expected missing native credentials error")
+	}
+	if got := prov.ProvisionCallCount(); got != 0 {
+		t.Fatalf("plain provision calls = %d, want 0", got)
+	}
+	var tenantCount int
+	if err := metaStore.DB().QueryRow("SELECT COUNT(*) FROM tenants").Scan(&tenantCount); err != nil {
+		t.Fatal(err)
+	}
+	if tenantCount != 0 {
+		t.Fatalf("tenant count = %d, want 0", tenantCount)
+	}
+}
+
 func TestProvisionPersistsEncryptedAutoEmbeddingProfile(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
