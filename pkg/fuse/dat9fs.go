@@ -7534,6 +7534,11 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 				unlockRemoteCommit()
 			}
 		}()
+		if refreshedEntry, ok := fs.inodes.GetEntry(input.NodeId); ok {
+			fh.OrigSize = refreshedEntry.Size
+			fh.BaseRev = refreshedEntry.Revision
+			entry = refreshedEntry
+		}
 
 		fh.Dirty = fs.newWriteBuffer(p, maxPreloadSize, 0)
 
@@ -7593,8 +7598,8 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
 			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
-				if err := fs.shadowStore.Ensure(p, 0, fh.BaseRev); err != nil {
-					log.Printf("shadow ensure failed for truncate-open %s: %v", p, err)
+				if err := fs.shadowStore.WriteFull(p, nil, fh.BaseRev); err != nil {
+					log.Printf("shadow reset failed for truncate-open %s: %v", p, err)
 				} else {
 					fh.ShadowReady = true
 					fh.ShadowSpill = true
