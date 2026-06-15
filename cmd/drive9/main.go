@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"os"
 	"runtime/pprof"
-	"strings"
 	"sync"
 
 	"go.uber.org/zap"
@@ -80,7 +79,6 @@ func main() {
 	}
 
 	dispatch(os.Args[1], os.Args[2:])
-	maybeNotifyUpdate(os.Args[1])
 }
 
 // dispatch routes a parsed (verb, args) pair to the matching command handler.
@@ -343,29 +341,11 @@ func fatal(cmd string, err error) {
 		logger.Error(context.Background(), "cli_command_failed", zap.String("command", cmd), zap.Error(err))
 	}
 	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, err)
-	maybeNotifyUpdate(primaryCommand(cmd))
 	type exitCoder interface{ ExitCode() int }
 	if ec, ok := err.(exitCoder); ok && ec.ExitCode() > 0 {
 		exitWithCode(ec.ExitCode())
 	}
 	exitWithCode(1)
-}
-
-func primaryCommand(cmd string) string {
-	fields := strings.Fields(cmd)
-	if len(fields) == 0 {
-		return ""
-	}
-	return fields[0]
-}
-
-func maybeNotifyUpdate(cmd string) {
-	switch primaryCommand(cmd) {
-	case "", "update", "version", "--version", "-v", "help", "--help", "-help", "-h":
-		return
-	default:
-		cli.MaybeNotifyUpdate(buildinfo.Version)
-	}
 }
 
 func usage(code int) {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -13,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,8 +21,6 @@ import (
 
 const (
 	defaultUpdateBaseURL = "https://drive9.ai"
-	updateCheckInterval  = 24 * time.Hour
-	autoUpdateTimeout    = 1500 * time.Millisecond
 	updateCommandTimeout = 2 * time.Minute
 	maxUpdateFileBytes   = 200 << 20
 )
@@ -32,18 +30,12 @@ type updateDeps struct {
 	currentVersion    string
 	goos              string
 	goarch            string
-	now               func() time.Time
 	executable        func() (string, error)
 	httpClient        *http.Client
 	stdout            io.Writer
 	stderr            io.Writer
+	preflightReplace  func() error
 	replaceExecutable func(string, string) error
-}
-
-type updateCache struct {
-	LastCheckedAt time.Time `json:"last_checked_at"`
-	LatestVersion string    `json:"latest_version,omitempty"`
-	LatestURL     string    `json:"latest_url,omitempty"`
 }
 
 func defaultUpdateDeps() updateDeps {
@@ -56,11 +48,11 @@ func defaultUpdateDeps() updateDeps {
 		currentVersion:    buildinfo.Version,
 		goos:              runtime.GOOS,
 		goarch:            runtime.GOARCH,
-		now:               time.Now,
 		executable:        os.Executable,
 		httpClient:        &http.Client{Timeout: updateCommandTimeout},
 		stdout:            os.Stdout,
 		stderr:            os.Stderr,
+		preflightReplace:  preflightReplaceExecutableFile,
 		replaceExecutable: replaceExecutableFile,
 	}
 }
@@ -103,23 +95,37 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	}
 	artifact := updateArtifactName(deps.goos, deps.goarch)
 	latestURL := releaseURL(deps.baseURL, artifact)
-	_ = writeUpdateCache(ctx, updateCache{
-		LastCheckedAt: deps.now().UTC(),
-		LatestVersion: latestVersion,
-		LatestURL:     latestURL,
-	})
+	relation := compareReleaseVersions(deps.currentVersion, latestVersion)
 
 	if *checkOnly {
-		if versionsDiffer(deps.currentVersion, latestVersion) {
+		switch relation {
+		case releaseNewer:
 			_, _ = fmt.Fprintf(deps.stdout, "drive9 update available: %s -> %s\n", displayVersion(deps.currentVersion), latestVersion)
-		} else {
+		case releaseSame:
 			_, _ = fmt.Fprintf(deps.stdout, "drive9 is up to date (%s)\n", displayVersion(deps.currentVersion))
+		case releaseOlder:
+			_, _ = fmt.Fprintf(deps.stdout, "drive9 latest release %s is older than current %s\n", latestVersion, displayVersion(deps.currentVersion))
+		default:
+			_, _ = fmt.Fprintf(deps.stdout, "drive9 latest release %s cannot be compared with current %s\n", latestVersion, displayVersion(deps.currentVersion))
 		}
 		return nil
 	}
-	if !*force && !versionsDiffer(deps.currentVersion, latestVersion) {
-		_, _ = fmt.Fprintf(deps.stdout, "drive9 is already up to date (%s)\n", displayVersion(deps.currentVersion))
-		return nil
+	if !*force {
+		switch relation {
+		case releaseNewer:
+		case releaseSame:
+			_, _ = fmt.Fprintf(deps.stdout, "drive9 is already up to date (%s)\n", displayVersion(deps.currentVersion))
+			return nil
+		case releaseOlder:
+			_, _ = fmt.Fprintf(deps.stdout, "drive9 latest release %s is older than current %s; use --force to install it\n", latestVersion, displayVersion(deps.currentVersion))
+			return nil
+		default:
+			_, _ = fmt.Fprintf(deps.stdout, "drive9 latest release %s cannot be compared with current %s; use --force to install it\n", latestVersion, displayVersion(deps.currentVersion))
+			return nil
+		}
+	}
+	if err := deps.preflightReplace(); err != nil {
+		return err
 	}
 
 	target, err := currentExecutablePath(deps)
@@ -159,48 +165,7 @@ func updateUsage() string {
 	return `usage: drive9 update [--check] [--force] [--base-url URL]
   --check          check for a newer release without installing
   --force          reinstall latest release even when versions match
-  --base-url URL   release base URL (default https://drive9.ai)`
-}
-
-// MaybeNotifyUpdate prints a cached update reminder, then refreshes the cache
-// when the previous check is stale. Refresh results are intentionally silent so
-// a newly discovered version is reported on the next CLI invocation.
-func MaybeNotifyUpdate(currentVersion string) {
-	maybeNotifyUpdateWithDeps(fillUpdateDeps(updateDeps{currentVersion: currentVersion}))
-}
-
-func maybeNotifyUpdateWithDeps(deps updateDeps) {
-	deps = fillUpdateDeps(deps)
-	if updateCheckDisabled() {
-		return
-	}
-	if updateCachePath() == "" {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), autoUpdateTimeout)
-	defer cancel()
-
-	cache, _ := readUpdateCache(ctx)
-	if shouldShowUpdateNotice(deps.currentVersion, cache.LatestVersion) {
-		_, _ = fmt.Fprintf(deps.stderr, "\ndrive9 update available: %s -> %s\nRun `drive9 update` to install the latest binary.\n", displayVersion(deps.currentVersion), cache.LatestVersion)
-	}
-	if !updateCheckDue(cache, deps.now()) {
-		return
-	}
-
-	latestVersion, err := fetchLatestVersion(ctx, deps)
-	if err != nil {
-		cache.LastCheckedAt = deps.now().UTC()
-		_ = writeUpdateCache(ctx, cache)
-		return
-	}
-	artifact := updateArtifactName(deps.goos, deps.goarch)
-	_ = writeUpdateCache(ctx, updateCache{
-		LastCheckedAt: deps.now().UTC(),
-		LatestVersion: latestVersion,
-		LatestURL:     releaseURL(deps.baseURL, artifact),
-	})
+  --base-url URL   release base URL (default https://drive9.ai)` + updatePlatformUsageNote()
 }
 
 func fillUpdateDeps(deps updateDeps) updateDeps {
@@ -220,9 +185,6 @@ func fillUpdateDeps(deps updateDeps) updateDeps {
 	if deps.goarch == "" {
 		deps.goarch = runtime.GOARCH
 	}
-	if deps.now == nil {
-		deps.now = time.Now
-	}
 	if deps.executable == nil {
 		deps.executable = os.Executable
 	}
@@ -235,79 +197,177 @@ func fillUpdateDeps(deps updateDeps) updateDeps {
 	if deps.stderr == nil {
 		deps.stderr = os.Stderr
 	}
+	if deps.preflightReplace == nil {
+		deps.preflightReplace = preflightReplaceExecutableFile
+	}
 	if deps.replaceExecutable == nil {
 		deps.replaceExecutable = replaceExecutableFile
 	}
 	return deps
 }
 
-func updateCheckDisabled() bool {
-	if isTruthy(os.Getenv("DRIVE9_NO_UPDATE_CHECK")) {
-		return true
-	}
-	if isFalsey(os.Getenv("DRIVE9_UPDATE_CHECK")) {
-		return true
-	}
-	return false
-}
-
-func isTruthy(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
-		return false
-	}
-}
-
-func isFalsey(value string) bool {
-	switch strings.ToLower(strings.TrimSpace(value)) {
-	case "0", "false", "no", "off":
-		return true
-	default:
-		return false
-	}
-}
-
-func updateCheckDue(cache updateCache, now time.Time) bool {
-	if cache.LastCheckedAt.IsZero() {
-		return true
-	}
-	if now.Before(cache.LastCheckedAt) {
-		return true
-	}
-	return now.Sub(cache.LastCheckedAt) >= updateCheckInterval
-}
-
-func shouldShowUpdateNotice(currentVersion, latestVersion string) bool {
-	if isDevVersion(currentVersion) {
-		return false
-	}
-	return versionsDiffer(currentVersion, latestVersion)
-}
-
-func isDevVersion(version string) bool {
-	switch normalizeVersion(version) {
-	case "", "dev", "unknown":
-		return true
-	default:
-		return false
-	}
-}
-
-func versionsDiffer(currentVersion, latestVersion string) bool {
-	current := normalizeVersion(currentVersion)
-	latest := normalizeVersion(latestVersion)
-	if current == "" || latest == "" {
-		return false
-	}
-	return current != latest
-}
-
 func normalizeVersion(version string) string {
 	version = strings.TrimSpace(version)
 	version = strings.TrimPrefix(version, "v")
 	return version
+}
+
+type releaseRelation int
+
+const (
+	releaseUnknown releaseRelation = iota
+	releaseSame
+	releaseNewer
+	releaseOlder
+)
+
+type semverVersion struct {
+	major int
+	minor int
+	patch int
+	pre   []string
+}
+
+func compareReleaseVersions(currentVersion, latestVersion string) releaseRelation {
+	current := normalizeVersion(currentVersion)
+	latest := normalizeVersion(latestVersion)
+	if current == "" || latest == "" {
+		return releaseUnknown
+	}
+	if current == latest {
+		return releaseSame
+	}
+	currentSemver, currentOK := parseSemver(current)
+	latestSemver, latestOK := parseSemver(latest)
+	if latestOK && !currentOK {
+		return releaseNewer
+	}
+	if !latestOK || !currentOK {
+		return releaseUnknown
+	}
+	switch compareSemver(latestSemver, currentSemver) {
+	case 0:
+		return releaseSame
+	case 1:
+		return releaseNewer
+	default:
+		return releaseOlder
+	}
+}
+
+func parseSemver(version string) (semverVersion, bool) {
+	version, _, _ = strings.Cut(version, "+")
+	mainPart, prePart, hasPre := strings.Cut(version, "-")
+	parts := strings.Split(mainPart, ".")
+	if len(parts) != 3 {
+		return semverVersion{}, false
+	}
+	major, ok := parseSemverNumber(parts[0])
+	if !ok {
+		return semverVersion{}, false
+	}
+	minor, ok := parseSemverNumber(parts[1])
+	if !ok {
+		return semverVersion{}, false
+	}
+	patch, ok := parseSemverNumber(parts[2])
+	if !ok {
+		return semverVersion{}, false
+	}
+	var pre []string
+	if hasPre {
+		if prePart == "" {
+			return semverVersion{}, false
+		}
+		pre = strings.Split(prePart, ".")
+		for _, id := range pre {
+			if id == "" {
+				return semverVersion{}, false
+			}
+		}
+	}
+	return semverVersion{major: major, minor: minor, patch: patch, pre: pre}, true
+}
+
+func parseSemverNumber(value string) (int, bool) {
+	if value == "" {
+		return 0, false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(value)
+	return n, err == nil
+}
+
+func compareSemver(a, b semverVersion) int {
+	for _, pair := range [][2]int{{a.major, b.major}, {a.minor, b.minor}, {a.patch, b.patch}} {
+		if pair[0] > pair[1] {
+			return 1
+		}
+		if pair[0] < pair[1] {
+			return -1
+		}
+	}
+	return compareSemverPrerelease(a.pre, b.pre)
+}
+
+func compareSemverPrerelease(a, b []string) int {
+	if len(a) == 0 && len(b) == 0 {
+		return 0
+	}
+	if len(a) == 0 {
+		return 1
+	}
+	if len(b) == 0 {
+		return -1
+	}
+	limit := len(a)
+	if len(b) < limit {
+		limit = len(b)
+	}
+	for i := 0; i < limit; i++ {
+		cmp := compareSemverIdentifier(a[i], b[i])
+		if cmp != 0 {
+			return cmp
+		}
+	}
+	if len(a) > len(b) {
+		return 1
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	return 0
+}
+
+func compareSemverIdentifier(a, b string) int {
+	aNum, aOK := parseSemverNumber(a)
+	bNum, bOK := parseSemverNumber(b)
+	switch {
+	case aOK && bOK:
+		if aNum > bNum {
+			return 1
+		}
+		if aNum < bNum {
+			return -1
+		}
+		return 0
+	case aOK:
+		return -1
+	case bOK:
+		return 1
+	default:
+		if a > b {
+			return 1
+		}
+		if a < b {
+			return -1
+		}
+		return 0
+	}
 }
 
 func displayVersion(version string) string {
@@ -482,52 +542,4 @@ func normalizeUpdateBaseURL(baseURL string) string {
 
 func releaseURL(baseURL, name string) string {
 	return normalizeUpdateBaseURL(baseURL) + "/releases/" + strings.TrimLeft(name, "/")
-}
-
-func updateCachePath() string {
-	dir := configDir()
-	if dir == "" {
-		return ""
-	}
-	return filepath.Join(dir, "update-check.json")
-}
-
-func readUpdateCache(ctx context.Context) (updateCache, error) {
-	if err := ctx.Err(); err != nil {
-		return updateCache{}, fmt.Errorf("read update cache: %w", err)
-	}
-	path := updateCachePath()
-	if path == "" {
-		return updateCache{}, errors.New("read update cache: cannot determine update cache path")
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return updateCache{}, fmt.Errorf("read update cache %s: %w", path, err)
-	}
-	var cache updateCache
-	if err := json.Unmarshal(data, &cache); err != nil {
-		return updateCache{}, fmt.Errorf("decode update cache %s: %w", path, err)
-	}
-	return cache, nil
-}
-
-func writeUpdateCache(ctx context.Context, cache updateCache) error {
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("write update cache: %w", err)
-	}
-	path := updateCachePath()
-	if path == "" {
-		return errors.New("write update cache: cannot determine update cache path")
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return fmt.Errorf("create update cache dir %s: %w", filepath.Dir(path), err)
-	}
-	data, err := json.MarshalIndent(cache, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode update cache: %w", err)
-	}
-	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
-		return fmt.Errorf("write update cache %s: %w", path, err)
-	}
-	return nil
 }
