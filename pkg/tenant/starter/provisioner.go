@@ -175,6 +175,23 @@ func (p *Provisioner) UpdateSpendingLimit(ctx context.Context, clusterID string,
 	return nil
 }
 
+func (p *Provisioner) Deprovision(ctx context.Context, cluster *tenant.ClusterInfo) error {
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return fmt.Errorf("cluster id is required")
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(strings.TrimSpace(cluster.ClusterID)))
+	resp, err := p.doDigestAuthRequest(ctx, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("starter cluster delete status %d: %s", resp.StatusCode, string(raw))
+	}
+	return nil
+}
+
 func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
 	out, err := p.CreateBranch(ctx, forkTenantID, source)
 	if err != nil {

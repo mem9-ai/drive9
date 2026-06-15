@@ -573,6 +573,105 @@ func (c *AWSS3Client) DeleteObject(ctx context.Context, key string) error {
 	return nil
 }
 
+func (c *AWSS3Client) DeletePrefix(ctx context.Context, prefix string) (PrefixDeleteResult, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("delete_prefix", result, start) }()
+
+	fullPrefix := c.fullKey(strings.TrimLeft(prefix, "/"))
+	var out PrefixDeleteResult
+	if err := c.abortMultipartUploadsByPrefix(ctx, fullPrefix, &out); err != nil {
+		result = "error"
+		return out, err
+	}
+	if err := c.deleteObjectsByPrefix(ctx, fullPrefix, &out); err != nil {
+		result = "error"
+		return out, err
+	}
+	return out, nil
+}
+
+func (c *AWSS3Client) abortMultipartUploadsByPrefix(ctx context.Context, fullPrefix string, out *PrefixDeleteResult) error {
+	var keyMarker *string
+	var uploadIDMarker *string
+	for {
+		res, err := c.client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
+			Bucket:         &c.bucket,
+			Prefix:         aws.String(fullPrefix),
+			KeyMarker:      keyMarker,
+			UploadIdMarker: uploadIDMarker,
+		})
+		if err != nil {
+			return fmt.Errorf("list multipart uploads by prefix: %w", err)
+		}
+		for _, upload := range res.Uploads {
+			key := aws.ToString(upload.Key)
+			uploadID := aws.ToString(upload.UploadId)
+			if key == "" || uploadID == "" {
+				continue
+			}
+			if _, err := c.client.AbortMultipartUpload(ctx, &s3.AbortMultipartUploadInput{
+				Bucket:   &c.bucket,
+				Key:      aws.String(key),
+				UploadId: aws.String(uploadID),
+			}); err != nil {
+				return fmt.Errorf("abort multipart upload %s/%s: %w", key, uploadID, err)
+			}
+			out.AbortedMultipartUploads++
+		}
+		if !aws.ToBool(res.IsTruncated) {
+			return nil
+		}
+		keyMarker = res.NextKeyMarker
+		uploadIDMarker = res.NextUploadIdMarker
+	}
+}
+
+func (c *AWSS3Client) deleteObjectsByPrefix(ctx context.Context, fullPrefix string, out *PrefixDeleteResult) error {
+	var continuation *string
+	for {
+		res, err := c.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            &c.bucket,
+			Prefix:            aws.String(fullPrefix),
+			ContinuationToken: continuation,
+		})
+		if err != nil {
+			return fmt.Errorf("list objects by prefix: %w", err)
+		}
+		if len(res.Contents) > 0 {
+			objects := make([]types.ObjectIdentifier, 0, len(res.Contents))
+			for _, obj := range res.Contents {
+				key := aws.ToString(obj.Key)
+				if key == "" {
+					continue
+				}
+				objects = append(objects, types.ObjectIdentifier{Key: aws.String(key)})
+			}
+			if len(objects) > 0 {
+				del, err := c.client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+					Bucket: &c.bucket,
+					Delete: &types.Delete{
+						Objects: objects,
+						Quiet:   aws.Bool(true),
+					},
+				})
+				if err != nil {
+					return fmt.Errorf("delete objects by prefix: %w", err)
+				}
+				if len(del.Errors) > 0 {
+					first := del.Errors[0]
+					return fmt.Errorf("delete object %q: %s %s", aws.ToString(first.Key), aws.ToString(first.Code), aws.ToString(first.Message))
+				}
+				out.DeletedObjects += len(objects)
+			}
+		}
+		if !aws.ToBool(res.IsTruncated) {
+			return nil
+		}
+		continuation = res.NextContinuationToken
+	}
+}
+
 func (c *AWSS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID string, partNumber int, sourceKey string, startByte, endByte int64) (string, error) {
 	start := time.Now()
 	result := "ok"

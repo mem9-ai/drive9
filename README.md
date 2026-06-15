@@ -364,10 +364,16 @@ POST   /v2/uploads/{id}/abort
 
 GET    /v1/events                 SSE change stream
 GET    /v1/status                 server status and upload limits
+DELETE /v1/tenant                 delete current tenant with owner API key
 ```
 
 Vault endpoints also exist for secret storage, scoped grants, delegated tokens,
 and read-only vault mounts.
+
+`DELETE /v1/tenant` is owner-key only. For `tidbcloud_native`, the request body
+must also include the customer's TiDB Cloud `public_key` and `private_key` so
+Drive9 can delete the customer-account Starter cluster. `tidb_zero` tenants are
+not deleted through this endpoint; they expire automatically.
 
 ## Mount Options
 

@@ -226,6 +226,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v2/uploads/", business)
 	mux.Handle("/v1/tokens", business)
 	mux.Handle("/v1/tokens/", business)
+	mux.Handle("/v1/tenant", business)
 	mux.Handle("/v1/fork", business)
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
@@ -307,6 +308,7 @@ func NewWithConfig(cfg Config) *Server {
 		s.startPendingTenantReconciler()
 		s.resumeProvisioningTenants()
 		s.resumeDeletingForkTenants()
+		s.startTenantDeleteCleanup(backgroundWithTrace(context.Background()))
 	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
 	if s.semanticWorker != nil {
@@ -576,6 +578,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleV2Uploads(w, r)
 	case r.URL.Path == "/v1/tokens" || strings.HasPrefix(r.URL.Path, "/v1/tokens/"):
 		s.handleTokens(w, r)
+	case r.URL.Path == "/v1/tenant":
+		s.handleTenantDelete(w, r)
 	case r.URL.Path == "/v1/fork":
 		s.handleFork(w, r)
 	case r.URL.Path == "/v1/sql":

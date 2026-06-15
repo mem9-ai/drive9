@@ -28,9 +28,12 @@ type fakeProvisioner struct {
 	cluster           *tenant.ClusterInfo
 	initErr           error
 	provisionErr      error
+	deprovisionErr    error
 	provisionCalls    atomic.Int32
 	credentialCalls   atomic.Int32
+	deprovisionCalls  atomic.Int32
 	lastCredentialReq tenant.CredentialProvisionRequest
+	lastDeprovision   *tenant.ClusterInfo
 }
 
 func (f *fakeProvisioner) ProviderType() string { return f.provider }
@@ -75,6 +78,25 @@ func (f *fakeProvisioner) ProvisionWithCredentials(_ context.Context, tenantID s
 	out.TenantID = tenantID
 	out.Provider = f.provider
 	return &out, nil
+}
+
+func (f *fakeProvisioner) Deprovision(_ context.Context, cluster *tenant.ClusterInfo) error {
+	f.deprovisionCalls.Add(1)
+	if cluster != nil {
+		out := *cluster
+		f.lastDeprovision = &out
+	}
+	return f.deprovisionErr
+}
+
+func (f *fakeProvisioner) DeprovisionWithCredentials(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
+	f.deprovisionCalls.Add(1)
+	f.lastCredentialReq = req
+	if cluster != nil {
+		out := *cluster
+		f.lastDeprovision = &out
+	}
+	return f.deprovisionErr
 }
 
 func (f *fakeProvisioner) ProvisionCallCount() int {

@@ -273,6 +273,45 @@ func TestProvisionWithCredentialsIncludesUpstreamBodyOnError(t *testing.T) {
 	}
 }
 
+func TestDeprovisionWithCredentialsDeletesCluster(t *testing.T) {
+	var gotAuth string
+	var deleteCalled bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodDelete || r.URL.Path != "/v1beta1/clusters/cluster-1" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		deleteCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	if err := p.DeprovisionWithCredentials(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}); err != nil {
+		t.Fatalf("DeprovisionWithCredentials: %v", err)
+	}
+	if !deleteCalled {
+		t.Fatal("delete was not called")
+	}
+	if !strings.Contains(gotAuth, `username="public-1"`) {
+		t.Fatalf("Authorization header did not use request public key: %q", gotAuth)
+	}
+	if strings.Contains(gotAuth, "private-1") {
+		t.Fatalf("Authorization header leaked private key: %q", gotAuth)
+	}
+}
+
 func TestRegionNameAcceptsFullRegionResourceName(t *testing.T) {
 	p := &Provisioner{cloudProvider: "alicloud", region: "regions/alicloud-ap-southeast-1"}
 	if got := p.regionName(); got != "regions/alicloud-ap-southeast-1" {

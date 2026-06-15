@@ -822,6 +822,7 @@ func TestMetaSchemaSpecIncludesForkStorageNamespaceColumns(t *testing.T) {
 		t.Fatal("tenants schema missing idx_tenant_parent")
 	}
 	_ = mustMetaTableSpec(t, mustMetaSpec(t), "storage_namespaces")
+	_ = mustMetaTableSpec(t, mustMetaSpec(t), "tenant_delete_jobs")
 	_ = mustMetaTableSpec(t, mustMetaSpec(t), "object_gc_candidates")
 }
 

@@ -368,6 +368,51 @@ func (p *Pool) InvalidateAndWait(ctx context.Context, tenantID string) error {
 	}
 }
 
+func (p *Pool) S3ForStorageNamespace(ctx context.Context, ns *meta.StorageNamespace) (out s3client.S3Client, err error) {
+	start := time.Now()
+	namespaceID := ""
+	if ns != nil {
+		namespaceID = ns.ID
+	}
+	defer observePool(ctx, "s3_for_storage_namespace", namespaceID, &err, start)
+	if ns == nil {
+		return nil, fmt.Errorf("storage namespace is required")
+	}
+	switch ns.Backend {
+	case "s3":
+		if p.cfg.S3Bucket == "" {
+			return nil, fmt.Errorf("s3 bucket is not configured")
+		}
+		if ns.Bucket != "" && ns.Bucket != p.cfg.S3Bucket {
+			return nil, fmt.Errorf("storage namespace bucket %q does not match configured bucket", ns.Bucket)
+		}
+		return s3client.New(ctx, s3client.AWSConfig{
+			Region:          p.cfg.S3Region,
+			Bucket:          p.cfg.S3Bucket,
+			Prefix:          ns.Prefix,
+			RoleARN:         p.cfg.S3RoleARN,
+			Endpoint:        p.cfg.S3Endpoint,
+			ForcePathStyle:  p.cfg.S3ForcePathStyle,
+			AccessKeyID:     p.cfg.S3AccessKeyID,
+			SecretAccessKey: p.cfg.S3SecretAccessKey,
+			SessionToken:    p.cfg.S3SessionToken,
+		})
+	case "local":
+		if p.cfg.S3Dir == "" {
+			return nil, fmt.Errorf("local s3 dir is not configured")
+		}
+		localPrefix := strings.Trim(ns.Prefix, "/")
+		s3Dir := strings.TrimRight(p.cfg.S3Dir, "/") + "/" + localPrefix
+		baseURL := strings.TrimRight(p.cfg.PublicURL, "/")
+		if baseURL != "" {
+			baseURL += "/s3/" + localPrefix
+		}
+		return s3client.NewLocal(s3Dir, baseURL)
+	default:
+		return nil, fmt.Errorf("unsupported storage backend %q", ns.Backend)
+	}
+}
+
 func withTenantPoolDrainTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}
