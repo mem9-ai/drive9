@@ -26,6 +26,17 @@ type Provisioner interface {
 	ProviderType() string
 }
 
+type CredentialProvisionRequest struct {
+	PublicKey    string
+	PrivateKey   string
+	DatabaseName string
+}
+
+type CredentialProvisioner interface {
+	Provisioner
+	ProvisionWithCredentials(ctx context.Context, tenantID string, req CredentialProvisionRequest) (*ClusterInfo, error)
+}
+
 type BranchProvisioner interface {
 	Provisioner
 	ProvisionBranch(ctx context.Context, forkTenantID string, source *ClusterInfo) (*ClusterInfo, error)

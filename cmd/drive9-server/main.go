@@ -32,6 +32,7 @@ import (
 	"github.com/mem9-ai/dat9/pkg/tenant/db9"
 	"github.com/mem9-ai/dat9/pkg/tenant/schema"
 	"github.com/mem9-ai/dat9/pkg/tenant/starter"
+	"github.com/mem9-ai/dat9/pkg/tenant/tidbcloudnative"
 	"github.com/mem9-ai/dat9/pkg/tenant/tidbzero"
 )
 
@@ -178,6 +179,8 @@ func main() {
 		provisioner, provisionerErr = tidbzero.NewProvisionerFromEnv()
 	case tenant.ProviderTiDBCloudStarter:
 		provisioner, provisionerErr = starter.NewProvisionerFromEnv()
+	case tenant.ProviderTiDBCloudNative:
+		provisioner, provisionerErr = tidbcloudnative.NewProvisionerFromEnv()
 	case tenant.ProviderDB9:
 		provisioner, provisionerErr = db9.NewProvisionerFromEnv()
 	}
@@ -400,7 +403,7 @@ func usage(out io.Writer, exitCode int) {
 	_, _ = fmt.Fprintf(out, `usage:
   drive9-server [listen-addr]
   drive9-server version
-  drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_starter>
+  drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_starter|tidbcloud_native>
 
 environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
@@ -430,8 +433,12 @@ environment:
                                     required by openai, cohere, jina_ai, gemini, huggingface, nvidia_nim, nvidia
   DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE provider base endpoint for models that require it
                                      optional for openai models; set it for Azure OpenAI endpoints
-  DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter (default for provisioning)
+  DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter|tidbcloud_native (default for provisioning)
   DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default Starter spendingLimit.monthly in USD cents; applied after pool takeover
+  DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Serverless API base URL for tidbcloud_native
+  DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER cloud provider for tidbcloud_native cluster creation, e.g. aws
+  DRIVE9_TIDBCLOUD_NATIVE_REGION region for tidbcloud_native cluster creation, e.g. us-east-1
+  DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidbcloud_native database name when /v1/provision omits database_name (default: tidbcloud_fs)
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
   DRIVE9_SLOCK_API_ORIGIN Slock API origin (required when DRIVE9_SLOCK_ORIGIN is set)
   DRIVE9_SLOCK_CLIENT_ID Slock connected-app client id (required when DRIVE9_SLOCK_ORIGIN is set)
