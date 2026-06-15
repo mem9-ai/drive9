@@ -10671,6 +10671,79 @@ func TestStageShadowReadyNonSpillRewritesShadowWithDirtyBuffer(t *testing.T) {
 	}
 }
 
+func TestOpenTruncateResetShadowStagesDirtyBuffer(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const baseRev int64 = 7
+	path := "/tier-transition.bin"
+	if err := shadow.WriteFull(path, bytes.Repeat([]byte{0x5a}, 64*1024), baseRev); err != nil {
+		t.Fatal(err)
+	}
+	ino := fs.inodes.Lookup(path, false, 8*1024*1024, time.Now())
+	fs.inodes.UpdateRevision(ino, baseRev)
+	fs.inodes.UpdateSize(ino, 8*1024*1024)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("opened handle missing")
+	}
+	if !fh.ShadowReady {
+		t.Fatal("truncate-open did not reset shadow")
+	}
+	if fh.ShadowSpill {
+		t.Fatal("truncate-open shadow must stay dirty-buffer backed, not ShadowSpill")
+	}
+
+	finalData := bytes.Repeat([]byte("x"), 10*1024)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, finalData); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.releaseHandleRemoteCommitPathLocked(fh)
+
+	got, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, finalData) {
+		t.Fatalf("shadow content mismatch after truncate-open staged write: got len=%d want len=%d", len(got), len(finalData))
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending metadata missing after truncate-open staged write")
+	}
+	if meta.Size != int64(len(finalData)) || meta.Kind != PendingOverwrite || meta.BaseRev != baseRev || meta.ShadowSpill {
+		t.Fatalf("pending meta = %+v, want size=%d kind=%v baseRev=%d shadowSpill=false", meta, len(finalData), PendingOverwrite, baseRev)
+	}
+}
+
 func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	var (
 		mu         sync.Mutex
