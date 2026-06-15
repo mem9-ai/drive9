@@ -2,13 +2,20 @@ package s3client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 )
+
+const camMetaBase = "http://metadata.tencentyun.com/latest/meta-data/cam/security-credentials/"
 
 func isTencentEndpoint(endpoint string) bool {
 	if len(endpoint) == 0 {
@@ -34,6 +41,72 @@ func tencentCredentials() (accessKeyID, secretAccessKey, securityToken string) {
 		os.Getenv("TENCENTCLOUD_SECURITY_TOKEN")
 }
 
+type camProvider struct {
+	mu        sync.Mutex
+	cached    aws.Credentials
+	expiresAt time.Time
+}
+
+func newCAMProvider() *camProvider { return &camProvider{} }
+
+func (p *camProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if time.Now().Before(p.expiresAt.Add(-5 * time.Minute)) {
+		return p.cached, nil
+	}
+
+	resp, err := http.Get(camMetaBase)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("cam: list roles: %w", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return aws.Credentials{}, fmt.Errorf("cam: list roles: status %d", resp.StatusCode)
+	}
+	roleName := strings.TrimSpace(string(body))
+	if roleName == "" {
+		return aws.Credentials{}, fmt.Errorf("cam: no role bound to instance")
+	}
+
+	resp, err = http.Get(camMetaBase + roleName)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("cam: get credentials for %s: %w", roleName, err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return aws.Credentials{}, fmt.Errorf("cam: get credentials: status %d", resp.StatusCode)
+	}
+
+	var creds struct {
+		TmpSecretId  string `json:"TmpSecretId"`
+		TmpSecretKey string `json:"TmpSecretKey"`
+		Token        string `json:"Token"`
+		Expiration   string `json:"Expiration"`
+	}
+	if err := json.Unmarshal(body, &creds); err != nil {
+		return aws.Credentials{}, fmt.Errorf("cam: parse credentials: %w", err)
+	}
+
+	expiry, err := time.Parse(time.RFC3339, creds.Expiration)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("cam: parse expiration %q: %w", creds.Expiration, err)
+	}
+
+	p.cached = aws.Credentials{
+		AccessKeyID:     creds.TmpSecretId,
+		SecretAccessKey: creds.TmpSecretKey,
+		SessionToken:    creds.Token,
+		Source:          "TencentCAMRole",
+		CanExpire:       true,
+		Expires:         expiry,
+	}
+	p.expiresAt = expiry
+	return p.cached, nil
+}
+
 func credentialsForTencent(cfg AWSConfig) (aws.CredentialsProvider, error) {
 	if cfg.AccessKeyID != "" {
 		return credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken), nil
@@ -45,7 +118,7 @@ func credentialsForTencent(cfg AWSConfig) (aws.CredentialsProvider, error) {
 		}
 		return credentials.NewStaticCredentialsProvider(accessKeyID, secretAccessKey, sessionToken), nil
 	}
-	return nil, nil
+	return newCAMProvider(), nil
 }
 
 func newTencent(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
