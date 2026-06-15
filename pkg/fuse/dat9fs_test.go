@@ -10526,6 +10526,64 @@ func TestOpenWritableCancelsQueuedPathTruncateWithoutOTruncFlag(t *testing.T) {
 	}
 }
 
+func TestStageShadowReadyNonSpillRewritesShadowWithDirtyBuffer(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const baseRev int64 = 7
+	path := "/tier-transition.bin"
+	if err := shadow.WriteFull(path, nil, baseRev); err != nil {
+		t.Fatal(err)
+	}
+
+	finalData := bytes.Repeat([]byte("x"), 10*1024)
+	dirty := fs.newWriteBuffer(path, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, finalData); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:         42,
+		Path:        path,
+		Dirty:       dirty,
+		BaseRev:     baseRev,
+		ShadowReady: true,
+		ShadowSpill: false,
+		WritePolicy: WritePolicyWriteBack,
+	}
+
+	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.releaseHandleRemoteCommitPathLocked(fh)
+
+	got, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, finalData) {
+		t.Fatalf("shadow content mismatch after staged rewrite: got len=%d want len=%d", len(got), len(finalData))
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending metadata missing after staged rewrite")
+	}
+	if meta.Size != int64(len(finalData)) || meta.Kind != PendingOverwrite || meta.BaseRev != baseRev {
+		t.Fatalf("pending meta = %+v, want size=%d kind=%v baseRev=%d", meta, len(finalData), PendingOverwrite, baseRev)
+	}
+}
+
 func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	var (
 		mu         sync.Mutex
