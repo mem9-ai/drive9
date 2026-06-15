@@ -50,6 +50,23 @@ const (
 
 const statusClientClosedRequest = 499
 
+func sanitizeClientError(err error) string {
+	if err == nil {
+		return "backend unavailable"
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "error 1105") && strings.Contains(msg, "quota") {
+		return "tenant usage quota exceeded"
+	}
+	if strings.Contains(msg, "ensure tidb auto-embedding schema") ||
+		strings.Contains(msg, "validate tidb auto-embedding schema") ||
+		strings.Contains(msg, "migrate split tables") ||
+		strings.Contains(msg, "detect legacy files table") {
+		return "tenant metadata error"
+	}
+	return "backend unavailable"
+}
+
 func ScopeFromContext(ctx context.Context) *TenantScope {
 	s, _ := ctx.Value(tenantScopeKey).(*TenantScope)
 	return s
@@ -305,7 +322,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "backend_load_failed", "tenant_id", resolved.Tenant.ID, "error", err)...)
 			metricEvent(r.Context(), "tenant_backend", "result", "load_failed")
-			errJSON(w, http.StatusInternalServerError, "backend unavailable")
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 		defer release()
@@ -371,6 +388,7 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 
 		b, release, err := pool.Acquire(r.Context(), tenant)
 		if err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "capability_backend_load_failed", "tenant_id", tenantID, "error", err)...)
 			errJSON(w, http.StatusInternalServerError, "backend unavailable")
 			return
 		}

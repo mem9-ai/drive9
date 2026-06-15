@@ -842,9 +842,17 @@ func TestCtxListDisplaysTenantID(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ctx ls: %v", err)
 	}
+	if strings.Contains(out, "TENANT_ID") {
+		t.Fatalf("ctx ls default output should not contain TENANT_ID, got %q", out)
+	}
+
+	out, err = captureStdoutE(t, func() error { return Ctx([]string{"ls", "--details"}) })
+	if err != nil {
+		t.Fatalf("ctx ls --details: %v", err)
+	}
 	for _, want := range []string{"TENANT_ID", "tenant-owner-1", "tenant-delegated-1"} {
 		if !strings.Contains(out, want) {
-			t.Fatalf("ctx ls output = %q, want substring %q", out, want)
+			t.Fatalf("ctx ls --details output = %q, want substring %q", out, want)
 		}
 	}
 

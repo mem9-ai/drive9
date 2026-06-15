@@ -1141,7 +1141,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "read_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_read", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 
@@ -1202,7 +1202,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "list_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "list", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	metricEvent(r.Context(), "userdb_query", "api", "list", "result", "ok")
@@ -1293,7 +1293,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 
@@ -1307,7 +1307,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	nlink, err := nodeLinkCount(r.Context(), b, nf)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_refcount_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	if nf.File != nil {
@@ -1327,7 +1327,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 		tags, err = b.Store().GetFileTags(r.Context(), nf.File.FileID)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_load_tags_failed", "path", path, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, err.Error())
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 	} else {
@@ -2139,7 +2139,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "kind", kind, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive, "kind", kind)...)
@@ -2179,7 +2179,7 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "copy_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "copy_ok", "src_path", srcPath, "dst_path", dstPath)...)
@@ -2223,7 +2223,7 @@ func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath 
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "hardlink_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "hardlink_ok", "src_path", srcPath, "dst_path", dstPath)...)
@@ -2267,7 +2267,7 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "rename_failed", "old_path", oldPath, "new_path", newPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "rename_ok", "old_path", oldPath, "new_path", newPath)...)
@@ -2301,7 +2301,7 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "mkdir_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "mkdir_ok", "path", path)...)
@@ -2343,7 +2343,7 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "chmod_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "chmod_ok", "path", path)...)
@@ -2370,7 +2370,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "create_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "create_ok", "path", path)...)
@@ -2432,7 +2432,7 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "symlink_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "symlink_ok", "path", path)...)
@@ -2484,7 +2484,7 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	metricEvent(r.Context(), "metadb_query", "api", "uploads_list", "result", "ok")
@@ -3918,14 +3918,14 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_failed", "path", path, "query_len", len(query), "limit", limit, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "grep", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	if layerRef := strings.TrimSpace(r.URL.Query().Get("layer")); layerRef != "" {
 		results, err = overlayFSLayerGrep(r.Context(), b, layerRef, query, path, limit, results)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_layer_failed", "path", path, "query_len", len(query), "limit", limit, "layer", layerRef, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, err.Error())
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 	}
@@ -4002,14 +4002,14 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "find", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	if layerRef := strings.TrimSpace(q.Get("layer")); layerRef != "" {
 		results, err = overlayFSLayerFind(r.Context(), b, layerRef, f, results)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_layer_failed", "path", path, "layer", layerRef, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, err.Error())
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 	}

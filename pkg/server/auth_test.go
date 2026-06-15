@@ -670,3 +670,64 @@ func TestTenantStatusForkProvisioningBranchShowsMigrationMessage(t *testing.T) {
 		t.Fatalf("message = %q", out.Message)
 	}
 }
+
+func TestSanitizeClientError_NilError(t *testing.T) {
+	if got := sanitizeClientError(nil); got != "backend unavailable" {
+		t.Fatalf("nil error: got %q, want %q", got, "backend unavailable")
+	}
+}
+
+func TestSanitizeClientError_QuotaExhausted(t *testing.T) {
+	err := fmt.Errorf("open db: Error 1105 (HY000): Due to the usage quota being exhausted")
+	got := sanitizeClientError(err)
+	if got != "tenant usage quota exceeded" {
+		t.Fatalf("got %q, want %q", got, "tenant usage quota exceeded")
+	}
+}
+
+func TestSanitizeClientError_QuotaExhaustedLowerCase(t *testing.T) {
+	err := fmt.Errorf("open db: error 1105 (hy000): due to the usage quota being exhausted")
+	got := sanitizeClientError(err)
+	if got != "tenant usage quota exceeded" {
+		t.Fatalf("case-insensitive: got %q, want %q", got, "tenant usage quota exceeded")
+	}
+}
+
+func TestSanitizeClientError_QuotaExhaustedWrapped(t *testing.T) {
+	err := fmt.Errorf("open datastore: open db: Error 1105 (HY000): Due to the usage quota being exhausted, access to the cluster has been restricted. Try increasing spending limits to gain full access.")
+	got := sanitizeClientError(err)
+	if got != "tenant usage quota exceeded" {
+		t.Fatalf("wrapped: got %q, want %q", got, "tenant usage quota exceeded")
+	}
+}
+
+func TestSanitizeClientError_MetadataError(t *testing.T) {
+	tests := []string{
+		"ensure tidb auto-embedding schema: Error 1060: Duplicate column name 'foo'",
+		"validate tidb auto-embedding schema: column mismatch",
+		"migrate split tables: Error 1146: Table doesn't exist",
+		"detect legacy files table: Error 1045: Access denied",
+	}
+	for _, tc := range tests {
+		err := fmt.Errorf("%s", tc)
+		got := sanitizeClientError(err)
+		if got != "tenant metadata error" {
+			t.Fatalf("input=%q: got %q, want %q", tc, got, "tenant metadata error")
+		}
+	}
+}
+
+func TestSanitizeClientError_Fallback(t *testing.T) {
+	tests := []string{
+		"dial tcp: connection refused",
+		"open db: Error 1045: Access denied for user",
+		"some random error",
+	}
+	for _, tc := range tests {
+		err := fmt.Errorf("%s", tc)
+		got := sanitizeClientError(err)
+		if got != "backend unavailable" {
+			t.Fatalf("input=%q: got %q, want %q", tc, got, "backend unavailable")
+		}
+	}
+}

@@ -353,7 +353,8 @@ func usage(code int) {
 			"                         add delegated context\n"+
 			"  ctx fork [<new>] [--from <ctx>] [--json]\n"+
 			"                         create a copy-on-write fork context\n"+
-			"  ctx ls [-l|--json]     list contexts\n"+
+			"  ctx ls [-l|--long] [-D|--details] [--json] [--type <kind>|--scoped]\n"+
+			"                         list contexts\n"+
 			"  ctx use <name>         activate context\n"+
 			"  ctx rm <name>          delete context\n"+
 			"  fs <command>           filesystem operations\n"+

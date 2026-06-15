@@ -727,6 +727,7 @@ func scopeRootSegment(scope string) string {
 func ctxListCmd(args []string) error {
 	longForm := false
 	asJSON := false
+	details := false
 	typeFilter := ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -734,6 +735,8 @@ func ctxListCmd(args []string) error {
 			longForm = true
 		case "--json":
 			asJSON = true
+		case "-D", "--details":
+			details = true
 		case "--scoped":
 			// Shorthand for --type fs_scoped. The user mental model
 			// is "show me the scoped tokens" — accept the shortcut
@@ -750,11 +753,14 @@ func ctxListCmd(args []string) error {
 				typeFilter = strings.TrimPrefix(args[i], "--type=")
 				continue
 			}
-			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx ls [-l|--json] [--type <kind>|--scoped]", args[i])
+			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx ls [-l|--long] [-D|--details] [--json] [--type <kind>|--scoped]", args[i])
 		}
 	}
 	if longForm && asJSON {
 		return fmt.Errorf("-l/--long and --json are mutually exclusive")
+	}
+	if details && asJSON {
+		return fmt.Errorf("-D/--details and --json are mutually exclusive")
 	}
 	if typeFilter != "" {
 		if !isKnownPrincipalType(typeFilter) {
@@ -765,7 +771,7 @@ func ctxListCmd(args []string) error {
 	if asJSON {
 		return writeCtxListJSON(cfg, typeFilter)
 	}
-	return writeCtxListTable(cfg, longForm, typeFilter)
+	return writeCtxListTable(cfg, longForm, details, typeFilter)
 }
 
 // isKnownPrincipalType validates a --type filter value against the set
@@ -803,7 +809,7 @@ func writeCtxListJSON(cfg *Config, typeFilter string) error {
 	})
 }
 
-func writeCtxListTable(cfg *Config, longForm bool, typeFilter string) error {
+func writeCtxListTable(cfg *Config, longForm, details bool, typeFilter string) error {
 	entries := filterCtxListEntries(buildCtxListEntries(cfg), typeFilter)
 	if len(entries) == 0 {
 		if typeFilter != "" {
@@ -816,8 +822,11 @@ func writeCtxListTable(cfg *Config, longForm bool, typeFilter string) error {
 		return nil
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	// tabwriter.Writer buffers internally; errors surface at Flush().
-	_, _ = fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tTENANT_ID\tSCOPE\tPERM\tEXPIRES_AT\tSTATUS")
+	if details {
+		_, _ = fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tTENANT_ID\tSERVER\tAGENT\tGRANT_ID\tSCOPE\tPERM\tEXPIRES_AT\tSTATUS")
+	} else {
+		_, _ = fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tSCOPE\tPERM\tEXPIRES_AT\tSTATUS")
+	}
 	for _, e := range entries {
 		cur := " "
 		if e.Current {
@@ -828,16 +837,39 @@ func writeCtxListTable(cfg *Config, longForm bool, typeFilter string) error {
 		if e.Type == string(PrincipalOwner) {
 			perm = "rw"
 		}
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			cur,
-			e.Name,
-			e.Type,
-			e.TenantID,
-			scope,
-			perm,
-			formatExpiresAt(e.ExpiresAt),
-			e.Status,
-		)
+		if details {
+			agent := e.Agent
+			if agent == "" {
+				agent = "—"
+			}
+			grantID := e.GrantID
+			if grantID == "" {
+				grantID = "—"
+			}
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				cur,
+				e.Name,
+				e.Type,
+				e.TenantID,
+				e.Server,
+				agent,
+				grantID,
+				scope,
+				perm,
+				formatExpiresAt(e.ExpiresAt),
+				e.Status,
+			)
+		} else {
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				cur,
+				e.Name,
+				e.Type,
+				scope,
+				perm,
+				formatExpiresAt(e.ExpiresAt),
+				e.Status,
+			)
+		}
 	}
 	return w.Flush()
 }
