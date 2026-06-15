@@ -579,6 +579,73 @@ func TestCommitQueueSkipsDefaultModeForPendingNew(t *testing.T) {
 	}
 }
 
+func TestCommitQueueSkipsDefaultModeForPendingOverwrite(t *testing.T) {
+	var putCalls atomic.Int32
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			if got := r.Header.Get("X-Dat9-Expected-Revision"); got != "7" {
+				t.Errorf("X-Dat9-Expected-Revision = %q, want 7", got)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			chmodCalls.Add(1)
+			http.Error(w, "unexpected chmod", http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull("/plain.txt", []byte("data"), 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode("/plain.txt", 4, PendingOverwrite, 7, defaultRegularFileMode, true); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	if err := cq.Enqueue(&CommitEntry{
+		Path:    "/plain.txt",
+		BaseRev: 7,
+		Size:    4,
+		Kind:    PendingOverwrite,
+		Mode:    defaultRegularFileMode,
+		HasMode: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("PUT calls = %d, want 1", got)
+	}
+	if got := chmodCalls.Load(); got != 0 {
+		t.Fatalf("chmod calls = %d, want 0", got)
+	}
+	if pending.HasPending("/plain.txt") {
+		t.Fatal("pending entry should be removed after successful default-mode overwrite")
+	}
+	if shadow.Has("/plain.txt") {
+		t.Fatal("shadow should be removed after successful default-mode overwrite")
+	}
+}
+
 func TestCommitQueueRetriesPostUploadChmodNotFound(t *testing.T) {
 	var putCalls atomic.Int32
 	var chmodCalls atomic.Int32
