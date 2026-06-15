@@ -145,10 +145,11 @@ type TenantStatusResponse struct {
 }
 
 const (
-	maxBatchStatPaths       = 256
-	maxBatchReadSmallPaths  = 128
-	maxBatchReadSmallBytes  = 50_000
-	defaultBatchReadMaxBody = 1 << 20
+	maxBatchStatPaths                     = 256
+	maxBatchReadSmallPaths                = 128
+	maxBatchReadSmallBytes                = 50_000
+	defaultBatchReadMaxBody               = 1 << 20
+	maxCredentialProvisionBodyBytes int64 = 1 << 20
 )
 
 func New(b *backend.Dat9Backend) *Server {
@@ -3368,7 +3369,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 	var credentialReq *tenant.CredentialProvisionRequest
 	if provider == tenant.ProviderTiDBCloudNative {
-		req, err := decodeCredentialProvisionRequest(r)
+		req, err := decodeCredentialProvisionRequest(w, r)
 		if err != nil {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
@@ -3411,17 +3412,21 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func decodeCredentialProvisionRequest(r *http.Request) (*tenant.CredentialProvisionRequest, error) {
+func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
 	var req struct {
 		PublicKey    string `json:"public_key"`
 		PrivateKey   string `json:"private_key"`
 		DatabaseName string `json:"database_name"`
 	}
 	if r.Body != nil {
-		dec := json.NewDecoder(r.Body)
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCredentialProvisionBodyBytes))
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("invalid JSON body: %w", err)
+		}
+		var extra struct{}
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("invalid JSON body: trailing data")
 		}
 	}
 	out := &tenant.CredentialProvisionRequest{

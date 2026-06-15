@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -384,6 +385,21 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 		t.Fatalf("unexpected response: %+v", out)
 	}
 
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var status string
+		if err := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", out["tenant_id"]).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == string(meta.TenantActive) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tenant did not become active in time: status=%s", status)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
 	var provider, dbName string
 	if err := metaStore.DB().QueryRow("SELECT provider, db_name FROM tenants WHERE id = ?", out["tenant_id"]).Scan(&provider, &dbName); err != nil {
 		t.Fatal(err)
@@ -446,6 +462,31 @@ func TestProvisionTiDBCloudNativeRequiresRequestCredentials(t *testing.T) {
 	}
 	if tenantCount != 0 {
 		t.Fatalf("tenant count = %d, want 0", tenantCount)
+	}
+}
+
+func TestDecodeCredentialProvisionRequestRejectsTrailingJSON(t *testing.T) {
+	body := strings.NewReader(`{"public_key":"public-1","private_key":"private-1"} {}`)
+	req, _ := http.NewRequest(http.MethodPost, "/v1/provision", body)
+	_, err := decodeCredentialProvisionRequest(httptest.NewRecorder(), req)
+	if err == nil {
+		t.Fatal("expected trailing JSON error")
+	}
+	if !strings.Contains(err.Error(), "trailing data") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestDecodeCredentialProvisionRequestRejectsOversizedBody(t *testing.T) {
+	body := strings.NewReader(`{"public_key":"` + strings.Repeat("x", int(maxCredentialProvisionBodyBytes)+1) + `","private_key":"private-1"}`)
+	req, _ := http.NewRequest(http.MethodPost, "/v1/provision", body)
+	_, err := decodeCredentialProvisionRequest(httptest.NewRecorder(), req)
+	if err == nil {
+		t.Fatal("expected oversized body error")
+	}
+	var maxErr *http.MaxBytesError
+	if !errors.As(err, &maxErr) {
+		t.Fatalf("error = %v, want MaxBytesError", err)
 	}
 }
 

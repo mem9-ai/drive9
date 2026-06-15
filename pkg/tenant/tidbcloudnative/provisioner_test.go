@@ -49,6 +49,20 @@ func TestNewProvisionerFromEnvRequiresCloudProviderAndRegion(t *testing.T) {
 	}
 }
 
+func TestNewProvisionerFromEnvRejectsNonHTTPSAPIURL(t *testing.T) {
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "http://serverless.tidbapi.com")
+	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
+	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+
+	_, err := NewProvisionerFromEnv()
+	if err == nil {
+		t.Fatal("expected invalid api URL error")
+	}
+	if !strings.Contains(err.Error(), "valid https URL") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestNewProvisionerFromEnvRejectsInvalidDefaultDatabaseName(t *testing.T) {
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")

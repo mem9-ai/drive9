@@ -59,6 +59,10 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 	if apiURL == "" || cloudProvider == "" || region == "" {
 		return nil, fmt.Errorf("%s, %s and %s are required", EnvTiDBCloudNativeAPIURL, EnvTiDBCloudNativeCloudProvider, EnvTiDBCloudNativeRegion)
 	}
+	parsedAPIURL, err := url.Parse(apiURL)
+	if err != nil || parsedAPIURL.Scheme != "https" || parsedAPIURL.Host == "" {
+		return nil, fmt.Errorf("%s must be a valid https URL", EnvTiDBCloudNativeAPIURL)
+	}
 	if _, err := normalizeDatabaseName(defaultDB); err != nil {
 		return nil, fmt.Errorf("invalid %s: %w", EnvTiDBCloudNativeDefaultDatabaseName, err)
 	}
