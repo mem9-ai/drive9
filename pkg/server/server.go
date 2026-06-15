@@ -76,6 +76,10 @@ type autoEmbeddingSchemaProvisioner interface {
 	InitSchemaForAutoEmbeddingProfile(context.Context, string, tenantschema.TiDBAutoEmbeddingProfile) error
 }
 
+type credentialProvisionRequestValidator interface {
+	ValidateCredentialProvisionRequest(tenant.CredentialProvisionRequest) error
+}
+
 type Server struct {
 	fallback            *backend.Dat9Backend
 	meta                *meta.Store
@@ -3362,9 +3366,29 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	var credentialReq *tenant.CredentialProvisionRequest
+	if provider == tenant.ProviderTiDBCloudNative {
+		req, err := decodeCredentialProvisionRequest(r)
+		if err != nil {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if validator, ok := s.provisioner.(credentialProvisionRequestValidator); ok {
+			if err := validator.ValidateCredentialProvisionRequest(*req); err != nil {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		credentialReq = req
+	}
 	res, err := s.provisionTenant(r.Context(), provisionTenantOptions{
-		KeyName:      "default",
-		TokenVersion: 1,
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: credentialReq,
 	})
 	if err != nil {
 		var pe *provisionTenantError
@@ -3387,6 +3411,30 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func decodeCredentialProvisionRequest(r *http.Request) (*tenant.CredentialProvisionRequest, error) {
+	var req struct {
+		PublicKey    string `json:"public_key"`
+		PrivateKey   string `json:"private_key"`
+		DatabaseName string `json:"database_name"`
+	}
+	if r.Body != nil {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("invalid JSON body: %w", err)
+		}
+	}
+	out := &tenant.CredentialProvisionRequest{
+		PublicKey:    strings.TrimSpace(req.PublicKey),
+		PrivateKey:   strings.TrimSpace(req.PrivateKey),
+		DatabaseName: strings.TrimSpace(req.DatabaseName),
+	}
+	if out.PublicKey == "" || out.PrivateKey == "" {
+		return nil, fmt.Errorf("public_key and private_key are required")
+	}
+	return out, nil
+}
+
 type apiKeyIssueSource struct {
 	Provider     string
 	SubjectKey   string
@@ -3394,9 +3442,10 @@ type apiKeyIssueSource struct {
 }
 
 type provisionTenantOptions struct {
-	KeyName      string
-	TokenVersion int
-	APIKeySource apiKeyIssueSource
+	KeyName               string
+	TokenVersion          int
+	APIKeySource          apiKeyIssueSource
+	CredentialProvisioner *tenant.CredentialProvisionRequest
 }
 
 type provisionTenantResult struct {
@@ -3578,7 +3627,18 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 	}
 
-	cluster, err := s.provisioner.Provision(ctx, tenantID)
+	var cluster *tenant.ClusterInfo
+	if provider == tenant.ProviderTiDBCloudNative {
+		if opts.CredentialProvisioner == nil {
+			err = fmt.Errorf("public_key and private_key are required")
+		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
+			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
+		} else {
+			err = fmt.Errorf("provisioner does not support request credentials")
+		}
+	} else {
+		cluster, err = s.provisioner.Provision(ctx, tenantID)
+	}
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
