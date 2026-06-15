@@ -397,6 +397,39 @@ func (cq *CommitQueue) CancelPathPreserveLocal(path string) {
 	cq.cancelPath(path, true)
 }
 
+// CancelQueuedZeroTruncatePreserveLocal cancels queued, not in-flight,
+// zero-byte overwrite entries for path without removing shadow/pending state.
+// It returns true only when no in-flight or other queued same-path entry remains.
+func (cq *CommitQueue) CancelQueuedZeroTruncatePreserveLocal(path string) bool {
+	if cq == nil || path == "" {
+		return true
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if cq.inFlight[path] != nil {
+		return false
+	}
+	otherQueued := false
+	remaining := cq.queue[:0]
+	for _, entry := range cq.queue {
+		if entry == nil || entry.Path != path {
+			remaining = append(remaining, entry)
+			continue
+		}
+		if isQueuedZeroTruncateEntry(entry) {
+			entry.canceled = true
+			continue
+		}
+		otherQueued = true
+		remaining = append(remaining, entry)
+	}
+	cq.queue = remaining
+	if cq.queuedByPath != nil {
+		cq.rebuildQueuedIndexLocked()
+	}
+	return !otherQueued
+}
+
 func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	var cancels []context.CancelFunc
 	seen := make(map[*CommitEntry]struct{})
@@ -581,6 +614,10 @@ func (cq *CommitQueue) worker() {
 		// Clear in-flight after all cleanup is done.
 		cq.endInFlight(entry)
 	}
+}
+
+func isQueuedZeroTruncateEntry(entry *CommitEntry) bool {
+	return entry != nil && entry.Kind == PendingOverwrite && entry.Size == 0
 }
 
 func (cq *CommitQueue) beginInFlight(entry *CommitEntry) bool {
