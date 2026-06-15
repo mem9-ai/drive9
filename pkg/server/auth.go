@@ -388,7 +388,8 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 
 		b, release, err := pool.Acquire(r.Context(), tenant)
 		if err != nil {
-			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "capability_backend_load_failed", "tenant_id", tenantID, "error", err)...)
+			errJSON(w, http.StatusInternalServerError, "backend unavailable")
 			return
 		}
 		defer release()
