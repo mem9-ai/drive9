@@ -421,6 +421,8 @@ const (
 
 const maxPathTruncateInMemoryBytes int64 = 64 << 20
 
+var readProcessStatusFile = os.ReadFile
+
 func (fs *Dat9FS) childPath(parentIno uint64, name string) (string, gofuse.Status) {
 	if len(name) > posixNameMax {
 		return "", gofuse.Status(syscall.ENAMETOOLONG)
@@ -6002,6 +6004,9 @@ func processHasSupplementaryGroup(pid, gid uint32) bool {
 	if ok, handled := processHasSupplementaryGroupProc(pid, gid); handled {
 		return ok
 	}
+	// Platforms such as macOS do not expose Linux /proc credentials. Only the
+	// current process can be checked safely via getgroups; do not fall back to
+	// account membership because it can grant groups the process has dropped.
 	if pid == uint32(os.Getpid()) && currentProcessHasSupplementaryGroup(gid) {
 		return true
 	}
@@ -6009,7 +6014,7 @@ func processHasSupplementaryGroup(pid, gid uint32) bool {
 }
 
 func processHasSupplementaryGroupProc(pid, gid uint32) (bool, bool) {
-	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	status, err := readProcessStatusFile(fmt.Sprintf("/proc/%d/status", pid))
 	if err != nil {
 		return false, false
 	}
