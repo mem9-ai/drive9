@@ -2,16 +2,8 @@
 
 package cli
 
-import "golang.org/x/sys/windows"
+import "errors"
 
 func replaceExecutableFile(newPath, targetPath string) error {
-	from, err := windows.UTF16PtrFromString(newPath)
-	if err != nil {
-		return err
-	}
-	to, err := windows.UTF16PtrFromString(targetPath)
-	if err != nil {
-		return err
-	}
-	return windows.MoveFileEx(from, to, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH)
+	return errors.New("windows self-update cannot replace the running drive9.exe; download the latest release and replace it from a separate process")
 }

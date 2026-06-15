@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"net/http"
@@ -38,7 +39,20 @@ func TestUpdateCheckReportsAvailable(t *testing.T) {
 		t.Fatalf("update --check: %v", err)
 	}
 	if !strings.Contains(stdout.String(), "drive9 update available: old123 -> new123") {
-		t.Fatalf("stdout = %q, want update-available line", stdout.String())
+		t.Errorf("stdout = %q, want update-available line", stdout.String())
+	}
+}
+
+func TestUpdateHelpFlagAfterOptionPrintsUsage(t *testing.T) {
+	var stdout bytes.Buffer
+	err := updateWithDeps([]string{"--check", "-h"}, updateDeps{
+		stdout: &stdout,
+	})
+	if err != nil {
+		t.Fatalf("update --check -h: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "usage: drive9 update") {
+		t.Errorf("stdout = %q, want update usage", stdout.String())
 	}
 }
 
@@ -79,10 +93,10 @@ func TestUpdateDownloadsVerifiesAndReplacesExecutable(t *testing.T) {
 		t.Fatalf("read target: %v", err)
 	}
 	if string(got) != string(payload) {
-		t.Fatalf("updated binary = %q, want %q", got, payload)
+		t.Errorf("updated binary = %q, want %q", got, payload)
 	}
 	if !strings.Contains(stdout.String(), "drive9 updated: old123 -> new123") {
-		t.Fatalf("stdout = %q, want update success line", stdout.String())
+		t.Errorf("stdout = %q, want update success line", stdout.String())
 	}
 }
 
@@ -111,14 +125,14 @@ func TestUpdateRejectsChecksumMismatch(t *testing.T) {
 		},
 	})
 	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
-		t.Fatalf("update error = %v, want checksum mismatch", err)
+		t.Errorf("update error = %v, want checksum mismatch", err)
 	}
 	got, err := os.ReadFile(target)
 	if err != nil {
 		t.Fatalf("read target: %v", err)
 	}
 	if string(got) != "old-drive9" {
-		t.Fatalf("target changed after checksum mismatch: %q", got)
+		t.Errorf("target changed after checksum mismatch: %q", got)
 	}
 }
 
@@ -149,25 +163,25 @@ func TestMaybeNotifyUpdateUsesCachedResultOnNextRun(t *testing.T) {
 
 	maybeNotifyUpdateWithDeps(deps)
 	if stderr.String() != "" {
-		t.Fatalf("first run stderr = %q, want no same-run update notice", stderr.String())
+		t.Errorf("first run stderr = %q, want no same-run update notice", stderr.String())
 	}
 	if versionHits != 1 {
-		t.Fatalf("version hits after first run = %d, want 1", versionHits)
+		t.Errorf("version hits after first run = %d, want 1", versionHits)
 	}
 
 	stderr.Reset()
 	maybeNotifyUpdateWithDeps(deps)
 	if !strings.Contains(stderr.String(), "drive9 update available: old123 -> new123") {
-		t.Fatalf("second run stderr = %q, want cached update notice", stderr.String())
+		t.Errorf("second run stderr = %q, want cached update notice", stderr.String())
 	}
 	if versionHits != 1 {
-		t.Fatalf("version hits after second run = %d, want stale check to be skipped", versionHits)
+		t.Errorf("version hits after second run = %d, want stale check to be skipped", versionHits)
 	}
 }
 
 func TestMaybeNotifyUpdateSkipsDevVersionNotice(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
-	if err := writeUpdateCache(updateCache{
+	if err := writeUpdateCache(context.Background(), updateCache{
 		LastCheckedAt: fixedUpdateNow().UTC(),
 		LatestVersion: "new123",
 		LatestURL:     "https://drive9.ai/releases/drive9-linux-amd64",
@@ -182,7 +196,7 @@ func TestMaybeNotifyUpdateSkipsDevVersionNotice(t *testing.T) {
 		now:            fixedUpdateNow,
 	})
 	if stderr.String() != "" {
-		t.Fatalf("stderr = %q, want no notice for dev builds", stderr.String())
+		t.Errorf("stderr = %q, want no notice for dev builds", stderr.String())
 	}
 }
 

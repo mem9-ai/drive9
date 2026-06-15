@@ -82,7 +82,11 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	checkOnly := fs.Bool("check", false, "check for the latest version without installing it")
 	force := fs.Bool("force", false, "reinstall the latest binary even when versions match")
 	baseURL := fs.String("base-url", deps.baseURL, "release base URL")
-	if err := fs.Parse(args); err != nil {
+	if err := fs.Parse(normalizeHelpFlags(args, fs)); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			_, _ = fmt.Fprintln(deps.stdout, updateUsage())
+			return nil
+		}
 		return fmt.Errorf("%w\n%s", err, updateUsage())
 	}
 	if fs.NArg() != 0 {
@@ -99,7 +103,7 @@ func updateWithDeps(args []string, deps updateDeps) error {
 	}
 	artifact := updateArtifactName(deps.goos, deps.goarch)
 	latestURL := releaseURL(deps.baseURL, artifact)
-	_ = writeUpdateCache(updateCache{
+	_ = writeUpdateCache(ctx, updateCache{
 		LastCheckedAt: deps.now().UTC(),
 		LatestVersion: latestVersion,
 		LatestURL:     latestURL,
@@ -174,7 +178,10 @@ func maybeNotifyUpdateWithDeps(deps updateDeps) {
 		return
 	}
 
-	cache, _ := readUpdateCache()
+	ctx, cancel := context.WithTimeout(context.Background(), autoUpdateTimeout)
+	defer cancel()
+
+	cache, _ := readUpdateCache(ctx)
 	if shouldShowUpdateNotice(deps.currentVersion, cache.LatestVersion) {
 		_, _ = fmt.Fprintf(deps.stderr, "\ndrive9 update available: %s -> %s\nRun `drive9 update` to install the latest binary.\n", displayVersion(deps.currentVersion), cache.LatestVersion)
 	}
@@ -182,16 +189,14 @@ func maybeNotifyUpdateWithDeps(deps updateDeps) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), autoUpdateTimeout)
-	defer cancel()
 	latestVersion, err := fetchLatestVersion(ctx, deps)
 	if err != nil {
 		cache.LastCheckedAt = deps.now().UTC()
-		_ = writeUpdateCache(cache)
+		_ = writeUpdateCache(ctx, cache)
 		return
 	}
 	artifact := updateArtifactName(deps.goos, deps.goarch)
-	_ = writeUpdateCache(updateCache{
+	_ = writeUpdateCache(ctx, updateCache{
 		LastCheckedAt: deps.now().UTC(),
 		LatestVersion: latestVersion,
 		LatestURL:     releaseURL(deps.baseURL, artifact),
@@ -487,33 +492,42 @@ func updateCachePath() string {
 	return filepath.Join(dir, "update-check.json")
 }
 
-func readUpdateCache() (updateCache, error) {
+func readUpdateCache(ctx context.Context) (updateCache, error) {
+	if err := ctx.Err(); err != nil {
+		return updateCache{}, fmt.Errorf("read update cache: %w", err)
+	}
 	path := updateCachePath()
 	if path == "" {
-		return updateCache{}, errors.New("cannot determine update cache path")
+		return updateCache{}, errors.New("read update cache: cannot determine update cache path")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return updateCache{}, err
+		return updateCache{}, fmt.Errorf("read update cache %s: %w", path, err)
 	}
 	var cache updateCache
 	if err := json.Unmarshal(data, &cache); err != nil {
-		return updateCache{}, err
+		return updateCache{}, fmt.Errorf("decode update cache %s: %w", path, err)
 	}
 	return cache, nil
 }
 
-func writeUpdateCache(cache updateCache) error {
+func writeUpdateCache(ctx context.Context, cache updateCache) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("write update cache: %w", err)
+	}
 	path := updateCachePath()
 	if path == "" {
-		return errors.New("cannot determine update cache path")
+		return errors.New("write update cache: cannot determine update cache path")
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
+		return fmt.Errorf("create update cache dir %s: %w", filepath.Dir(path), err)
 	}
 	data, err := json.MarshalIndent(cache, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("encode update cache: %w", err)
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o600)
+	if err := os.WriteFile(path, append(data, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write update cache %s: %w", path, err)
+	}
+	return nil
 }
