@@ -7686,6 +7686,57 @@ func TestOpenWritablePreloadSkipsCleanSiblingReboundToNewRevision(t *testing.T) 
 	}
 }
 
+func TestOpenWritablePreloadSkipsCleanOldRevisionShadowHandle(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	const filePath = "/tier-transition.bin"
+	stale := bytes.Repeat([]byte{0x5a}, 64*1024)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(stale)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.inodes.UpdateSize(ino, 0)
+	fs.inodes.UpdateRevision(ino, 8)
+	if err := shadow.WriteFull(filePath, stale, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	sibling := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize:    int64(len(stale)),
+		BaseRev:     7,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+	if _, err := sibling.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	sibling.Dirty.ClearDirty()
+	fs.openHandles.Add(sibling)
+
+	target := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: 0,
+		BaseRev:  8,
+	}
+	if fs.loadWritableHandleFromOpenHandleLocked(target) {
+		t.Fatal("clean old-revision sibling shadow must not be used as preload data")
+	}
+	if got := target.Dirty.Size(); got != 0 {
+		t.Fatalf("target dirty size = %d, want 0", got)
+	}
+}
+
 func TestReadCleanWritableHandleRefreshesSkippedCommittedRevision(t *testing.T) {
 	stale := []byte("sqlite db before checkpoint")
 	fresh := []byte("sqlite db after checkpoint with event rows")
@@ -10223,6 +10274,94 @@ func TestSetAttr_WriteBackInteractivePathTruncateStagesAndReturnsBeforeRemoteCom
 	}
 	if shadow.Has("/file.bin") {
 		t.Fatal("shadow still present after commit")
+	}
+}
+
+func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
+	const callerPID = 5151
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   8,
+		queue:        []*CommitEntry{},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+		workCh:       make(chan *CommitEntry, 16),
+	}
+
+	const path = "/tier-transition.bin"
+	const baseRev int64 = 7
+	ino := fs.inodes.Lookup(path, false, 8*1024*1024, time.Now())
+	fs.inodes.UpdateRevision(ino, baseRev)
+	fs.inodes.UpdateSize(ino, 8*1024*1024)
+
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        path,
+		Flags:       uint32(syscall.O_WRONLY),
+		OpenPID:     callerPID,
+		Dirty:       fs.newWriteBuffer(path, maxPreloadSize, 0),
+		OrigSize:    8 * 1024 * 1024,
+		BaseRev:     baseRev,
+		WritePolicy: WritePolicyWriteBack,
+	}
+	if err := fh.Dirty.Truncate(8 * 1024 * 1024); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fhID := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(fhID, fh)
+
+	var attrOut gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: callerPID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if !fh.ZeroBase {
+		t.Fatal("same-caller writer did not adopt zero base")
+	}
+	if got := fh.Dirty.Size(); got != 0 {
+		t.Fatalf("dirty size after staged truncate = %d, want 0", got)
+	}
+	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+		t.Fatalf("dirty truncate not marked: dirtySeq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+
+	finalData := bytes.Repeat([]byte{0x59}, 10*1024)
+	if _, err := fh.Dirty.Write(0, finalData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	if got := fh.Dirty.Size(); got != int64(len(finalData)) {
+		t.Fatalf("dirty size after write = %d, want %d", got, len(finalData))
+	}
+	if err := fs.stageShadowLocked(fh, true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, finalData) {
+		t.Fatalf("shadow content mismatch after staged truncate writer adoption: got len=%d want len=%d", len(got), len(finalData))
 	}
 }
 
