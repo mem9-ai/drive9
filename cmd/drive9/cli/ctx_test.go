@@ -31,6 +31,11 @@ func makeJWT(t *testing.T, claims map[string]any) string {
 
 func makeDrive9APIKey(t *testing.T, claims map[string]any) string {
 	t.Helper()
+	return "drive9_" + base64.RawURLEncoding.EncodeToString([]byte(makeJWT(t, claims)))
+}
+
+func makeLegacyDrive9APIKey(t *testing.T, claims map[string]any) string {
+	t.Helper()
 	return "dat9_" + base64.RawURLEncoding.EncodeToString([]byte(makeJWT(t, claims)))
 }
 
@@ -1284,6 +1289,31 @@ func TestCtxImport_ExplicitStdinDash(t *testing.T) {
 	cfgPath := filepath.Join(home, ".drive9", "config")
 	if _, err := os.Stat(cfgPath); err != nil {
 		t.Fatalf("config missing after explicit stdin import: %v", err)
+	}
+}
+
+func TestDecodeDrive9APIKeyPayloadAcceptsLegacyPrefix(t *testing.T) {
+	claims := map[string]any{
+		"tenant_id":     "legacy-tenant",
+		"token_version": 1,
+		"iat":           time.Now().Unix(),
+	}
+	legacyKey := makeLegacyDrive9APIKey(t, claims)
+	got, err := decodeDrive9APIKeyPayload(legacyKey)
+	if err != nil {
+		t.Fatalf("decodeDrive9APIKeyPayload legacy prefix: %v", err)
+	}
+	if got.TenantID != "legacy-tenant" {
+		t.Fatalf("TenantID = %q, want legacy-tenant", got.TenantID)
+	}
+
+	newKey := makeDrive9APIKey(t, claims)
+	got, err = decodeDrive9APIKeyPayload(newKey)
+	if err != nil {
+		t.Fatalf("decodeDrive9APIKeyPayload new prefix: %v", err)
+	}
+	if got.TenantID != "legacy-tenant" {
+		t.Fatalf("TenantID = %q, want legacy-tenant", got.TenantID)
 	}
 }
 

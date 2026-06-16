@@ -8,7 +8,7 @@ script.
 
 Owner and fs_scoped contexts store a drive9 API key shaped as:
 
-    dat9_<base64url(jwt)>
+    drive9_<base64url(jwt)>   (new format) or dat9_<base64url(jwt)>   (legacy format)
 
 The JWT payload contains tenant_id. This script unwraps that local encoding and
 decodes the JWT payload. Delegated contexts store a JWT directly; the script
@@ -27,7 +27,8 @@ from typing import Any
 
 
 DEFAULT_CONFIG_PATH = Path.home() / ".drive9" / "config"
-DRIVE9_API_KEY_PREFIX = "dat9_"
+DRIVE9_API_KEY_PREFIX = "drive9_"
+LEGACY_API_KEY_PREFIX = "dat9_"
 
 
 def b64url_decode(raw: str) -> bytes:
@@ -46,9 +47,14 @@ def decode_jwt_payload(raw_jwt: str) -> dict[str, Any]:
 
 def unwrap_drive9_api_key(api_key: str) -> str:
     api_key = api_key.strip()
-    if not api_key.startswith(DRIVE9_API_KEY_PREFIX):
-        raise ValueError(f"expected {DRIVE9_API_KEY_PREFIX!r} API key prefix")
-    wrapped = api_key.removeprefix(DRIVE9_API_KEY_PREFIX)
+    if api_key.startswith(DRIVE9_API_KEY_PREFIX):
+        wrapped = api_key.removeprefix(DRIVE9_API_KEY_PREFIX)
+    elif api_key.startswith(LEGACY_API_KEY_PREFIX):
+        wrapped = api_key.removeprefix(LEGACY_API_KEY_PREFIX)
+    else:
+        raise ValueError(
+            f"expected {DRIVE9_API_KEY_PREFIX!r} or {LEGACY_API_KEY_PREFIX!r} API key prefix"
+        )
     return b64url_decode(wrapped).decode("utf-8")
 
 

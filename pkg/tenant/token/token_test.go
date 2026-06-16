@@ -97,7 +97,7 @@ func TestParseAndVerifyTokenRejectsLegacyThreeSegmentJWT(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rawJWTBytes, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(tok, tokenPrefix))
+	rawJWTBytes, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(tok, TokenPrefix))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,5 +106,34 @@ func TestParseAndVerifyTokenRejectsLegacyThreeSegmentJWT(t *testing.T) {
 	_, err = ParseAndVerifyToken(secret, rawJWT)
 	if err == nil || !strings.Contains(err.Error(), "invalid token format") {
 		t.Fatalf("expected invalid token format error, got %v", err)
+	}
+}
+
+func TestParseAndVerifyTokenAcceptsLegacyDat9Prefix(t *testing.T) {
+	secret := testTokenSecret(t)
+	tok, err := IssueToken(secret, "tenant-1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwtB64 := strings.TrimPrefix(tok, TokenPrefix)
+	legacyTok := LegacyTokenPrefix + jwtB64
+
+	claims, err := ParseAndVerifyToken(secret, legacyTok)
+	if err != nil {
+		t.Fatalf("legacy dat9_ token not accepted: %v", err)
+	}
+	if claims.TenantID != "tenant-1" {
+		t.Fatalf("tenant = %q, want tenant-1", claims.TenantID)
+	}
+}
+
+func TestIssueTokenProducesDrive9Prefix(t *testing.T) {
+	secret := testTokenSecret(t)
+	tok, err := IssueToken(secret, "tenant-1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(tok, TokenPrefix) {
+		t.Fatalf("token = %q, want prefix %q", tok, TokenPrefix)
 	}
 }

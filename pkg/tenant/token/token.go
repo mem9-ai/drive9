@@ -21,7 +21,10 @@ type Claims struct {
 	JournalPermissions []string `json:"journal_permissions,omitempty"`
 }
 
-const tokenPrefix = "dat9_"
+const (
+	TokenPrefix       = "drive9_"
+	LegacyTokenPrefix = "dat9_"
+)
 
 func NewID() string { return uuid.NewString() }
 
@@ -64,7 +67,7 @@ func IssueTokenWithJournalPermissions(secret []byte, tenantID string, tokenVersi
 	mac.Write([]byte(msg))
 	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	jwt := msg + "." + sig
-	return tokenPrefix + base64.RawURLEncoding.EncodeToString([]byte(jwt)), nil
+	return TokenPrefix + base64.RawURLEncoding.EncodeToString([]byte(jwt)), nil
 }
 
 func ParseAndVerifyToken(secret []byte, raw string) (*Claims, error) {
@@ -72,10 +75,16 @@ func ParseAndVerifyToken(secret []byte, raw string) (*Claims, error) {
 }
 
 func parseAndVerifyTokenAt(secret []byte, raw string, nowUnix int64) (*Claims, error) {
-	if !strings.HasPrefix(raw, tokenPrefix) {
+	var stripped string
+	switch {
+	case strings.HasPrefix(raw, TokenPrefix):
+		stripped = strings.TrimPrefix(raw, TokenPrefix)
+	case strings.HasPrefix(raw, LegacyTokenPrefix):
+		stripped = strings.TrimPrefix(raw, LegacyTokenPrefix)
+	default:
 		return nil, fmt.Errorf("invalid token format")
 	}
-	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(raw, tokenPrefix))
+	decoded, err := base64.RawURLEncoding.DecodeString(stripped)
 	if err != nil {
 		return nil, fmt.Errorf("invalid token format")
 	}

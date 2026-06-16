@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/tenant/token"
 )
 
 // Ctx dispatches drive9 ctx subcommands per spec §13.2.
@@ -264,7 +265,7 @@ func writeCtxShowText(entry *ctxShowEntry) error {
 	return w.Flush()
 }
 
-const drive9APIKeyJWTWrapperPrefix = "dat9_"
+const drive9APIKeyJWTWrapperPrefix = "drive9_"
 
 func tenantIDFromContext(ctx *Context) string {
 	if ctx == nil {
@@ -288,10 +289,15 @@ func tenantIDFromContext(ctx *Context) string {
 
 func decodeDrive9APIKeyPayload(apiKey string) (*jwtClaims, error) {
 	apiKey = strings.TrimSpace(apiKey)
-	if !strings.HasPrefix(apiKey, drive9APIKeyJWTWrapperPrefix) {
+	var wrapped string
+	switch {
+	case strings.HasPrefix(apiKey, drive9APIKeyJWTWrapperPrefix):
+		wrapped = strings.TrimPrefix(apiKey, drive9APIKeyJWTWrapperPrefix)
+	case strings.HasPrefix(apiKey, token.LegacyTokenPrefix):
+		wrapped = strings.TrimPrefix(apiKey, token.LegacyTokenPrefix)
+	default:
 		return nil, fmt.Errorf("invalid drive9 api key format")
 	}
-	wrapped := strings.TrimPrefix(apiKey, drive9APIKeyJWTWrapperPrefix)
 	rawJWT, err := base64.RawURLEncoding.DecodeString(wrapped)
 	if err != nil {
 		return nil, fmt.Errorf("decode api key wrapper: %w", err)
@@ -304,7 +310,7 @@ func formatSecretForDisplay(secret string, reveal bool) string {
 		return secret
 	}
 
-	if strings.HasPrefix(secret, "drive9_") && len(secret) > len("drive9_")+8 {
+	if (strings.HasPrefix(secret, "drive9_") || strings.HasPrefix(secret, "dat9_")) && len(secret) > len("drive9_")+8 {
 		return secret[:len("drive9_")+4] + "..." + secret[len(secret)-4:]
 	}
 
@@ -1158,7 +1164,7 @@ func ctxRmUsage() string {
   To revoke a scoped token: drive9 token revoke <name>
 
   Removes the named context from local config (~/.drive9/config).
-  - fs_scoped: the dat9_... token remains valid on the server until TTL
+  - fs_scoped: the scoped token remains valid on the server until TTL
     expiry or explicit revoke.
   - owner: the api_key is erased from local config. The server key
     remains valid. You'll need it saved elsewhere to log back in.
