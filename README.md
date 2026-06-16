@@ -256,6 +256,7 @@ go test -race ./pkg/fuse ./pkg/backend ./pkg/server
 Focused end-to-end suites live under `e2e/`, including FUSE write/read gates,
 Git workflow gates, portable pack/unpack, and LayerFS smoke tests.
 
+Note: the public project is Drive9; the Go module path is currently `github.com/mem9-ai/dat9`.
 
 ## License
 
