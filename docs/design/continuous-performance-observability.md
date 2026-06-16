@@ -90,9 +90,10 @@ Profiles are captured either by lifecycle hooks or on demand:
 - Future: short Go traces for scheduler/network/GC interactions.
 
 FUSE v1 exposes on-demand captures through the mount pprof server when
-`--pprof-addr` is set. In the current CLI scope, `--perf-dir` also writes a
-mount-lifetime `cpu.pprof` file so the mount can produce the necessary profile
-artifacts without a separate collection command.
+`--perf-dir` is set. The listener binds to an ephemeral local address by
+default and can be pinned with `--perf-addr`. In the current CLI scope,
+`--perf-dir` also writes a mount-lifetime `cpu.pprof` file so the mount can
+produce the necessary profile artifacts without a separate collection command.
 
 ### 4. Future Support Bundle and Analyzer
 
@@ -194,7 +195,7 @@ The first implementation lands these pieces:
 
 - `drive9 mount --perf-dir` as the simple standard profiling switch.
 - advanced mount overrides:
-  `--profile-cpu --profile-heap --profile-heap-interval --pprof-addr --perf-jsonl --perf-interval --perf-max-samples`.
+  `--perf-interval --perf-max-samples --perf-cpu-duration --perf-cpu-interval --perf-heap-interval --perf-addr`.
 - segmented JSONL rotation for bounded local retention;
 - latency histogram snapshots for FUSE and remote ops;
 - redacted mount context in every sample;

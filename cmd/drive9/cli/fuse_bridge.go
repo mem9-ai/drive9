@@ -69,6 +69,8 @@ type mountFuseOptions struct {
 	Debug                   bool
 	PerfCounters            bool
 	ProfileCPU              string
+	ProfileCPUDuration      time.Duration
+	ProfileCPUInterval      time.Duration
 	ProfileHeap             string
 	ProfileDir              string
 	ProfileHeapInterval     time.Duration

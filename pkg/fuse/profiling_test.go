@@ -33,6 +33,59 @@ func TestStartProfilerRejectsIntervalWithoutDir(t *testing.T) {
 	}
 }
 
+func TestStartProfilerWritesBoundedCPUProfile(t *testing.T) {
+	cpuPath := filepath.Join(t.TempDir(), "cpu.pprof")
+	profiler, err := StartProfiler(ProfilingOptions{
+		CPUProfilePath:     cpuPath,
+		CPUProfileDuration: 20 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("StartProfiler: %v", err)
+	}
+	busyWait(80 * time.Millisecond)
+	profiler.Stop()
+
+	info, err := os.Stat(cpuPath)
+	if err != nil {
+		t.Fatalf("stat cpu profile: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatalf("cpu profile is empty: %s", cpuPath)
+	}
+}
+
+func TestStartProfilerRejectsCPUIntervalWithoutDuration(t *testing.T) {
+	_, err := StartProfiler(ProfilingOptions{
+		ProfileDir:         t.TempDir(),
+		CPUProfileInterval: time.Second,
+	})
+	if err == nil {
+		t.Fatal("StartProfiler error = nil, want CPU interval without duration error")
+	}
+}
+
+func TestStartProfilerWritesPeriodicCPUProfiles(t *testing.T) {
+	dir := t.TempDir()
+	profiler, err := StartProfiler(ProfilingOptions{
+		ProfileDir:         dir,
+		CPUProfileDuration: 10 * time.Millisecond,
+		CPUProfileInterval: 30 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("StartProfiler: %v", err)
+	}
+	busyWait(90 * time.Millisecond)
+	profiler.Stop()
+
+	matches, err := filepath.Glob(filepath.Join(dir, "cpu-*.pprof"))
+	if err != nil {
+		t.Fatalf("glob cpu profiles: %v", err)
+	}
+	if len(matches) == 0 {
+		t.Fatalf("periodic CPU profiles = %v, want at least one", matches)
+	}
+}
+
 func TestPprofMuxServesIndex(t *testing.T) {
 	profiler := &Profiler{}
 	ts := httptest.NewServer(profiler.newPprofMux())
@@ -120,5 +173,11 @@ func TestPprofMuxControlsCPUProfile(t *testing.T) {
 	}
 	if info.Size() == 0 {
 		t.Fatalf("cpu profile is empty")
+	}
+}
+
+func busyWait(duration time.Duration) {
+	deadline := time.Now().Add(duration)
+	for time.Now().Before(deadline) {
 	}
 }

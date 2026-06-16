@@ -1639,7 +1639,7 @@ func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
-		"--perf-jsonl", "/tmp/drive9-perf.jsonl",
+		"--perf-dir", "/tmp/drive9-perf",
 		"--perf-interval", "2s",
 		"--perf-max-samples", "42",
 		t.TempDir(),
@@ -1650,8 +1650,8 @@ func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
 	if got == nil {
 		t.Fatal("mountFuse was not called")
 	}
-	if got.PerfSamplesPath != "/tmp/drive9-perf.jsonl" {
-		t.Fatalf("PerfSamplesPath = %q, want /tmp/drive9-perf.jsonl", got.PerfSamplesPath)
+	if got.PerfSamplesPath != "/tmp/drive9-perf/perf.jsonl" {
+		t.Fatalf("PerfSamplesPath = %q, want /tmp/drive9-perf/perf.jsonl", got.PerfSamplesPath)
 	}
 	if got.PerfSampleInterval != 2*time.Second {
 		t.Fatalf("PerfSampleInterval = %v, want 2s", got.PerfSampleInterval)
@@ -1680,7 +1680,9 @@ func TestMountCmdPerfDirSetsDefaultProfilingOptions(t *testing.T) {
 		"--api-key", "sk-test",
 		"--perf-dir", perfDir,
 		"--perf-interval", "2s",
-		"--profile-heap-interval", "30s",
+		"--perf-cpu-duration", "5s",
+		"--perf-cpu-interval", "30s",
+		"--perf-heap-interval", "45s",
 		t.TempDir(),
 	})
 	if err != nil {
@@ -1707,12 +1709,18 @@ func TestMountCmdPerfDirSetsDefaultProfilingOptions(t *testing.T) {
 	if got.PprofAddr != defaultMountPerfPprofAddr {
 		t.Fatalf("PprofAddr = %q, want %q", got.PprofAddr, defaultMountPerfPprofAddr)
 	}
-	if got.ProfileHeapInterval != 30*time.Second {
-		t.Fatalf("ProfileHeapInterval = %v, want 30s", got.ProfileHeapInterval)
+	if got.ProfileCPUDuration != 5*time.Second {
+		t.Fatalf("ProfileCPUDuration = %v, want 5s", got.ProfileCPUDuration)
+	}
+	if got.ProfileCPUInterval != 30*time.Second {
+		t.Fatalf("ProfileCPUInterval = %v, want 30s", got.ProfileCPUInterval)
+	}
+	if got.ProfileHeapInterval != 45*time.Second {
+		t.Fatalf("ProfileHeapInterval = %v, want 45s", got.ProfileHeapInterval)
 	}
 }
 
-func TestMountCmdPerfDirKeepsAdvancedOverrides(t *testing.T) {
+func TestMountCmdPerfDirKeepsAdvancedControls(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })
 
@@ -1725,20 +1733,17 @@ func TestMountCmdPerfDirKeepsAdvancedOverrides(t *testing.T) {
 
 	base := t.TempDir()
 	perfDir := filepath.Join(base, "perf")
-	cpuPath := filepath.Join(base, "custom", "cpu.pprof")
-	heapPath := filepath.Join(base, "custom", "heap.pprof")
-	perfJSONL := filepath.Join(base, "custom", "samples.jsonl")
-	pprofAddr := "127.0.0.1:7070"
+	perfAddr := "127.0.0.1:7070"
 	err := MountCmd([]string{
 		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
 		"--perf-dir", perfDir,
-		"--profile-cpu", cpuPath,
-		"--profile-heap", heapPath,
-		"--perf-jsonl", perfJSONL,
-		"--pprof-addr", pprofAddr,
+		"--perf-addr", perfAddr,
+		"--perf-cpu-duration", "10s",
+		"--perf-cpu-interval", "1m",
+		"--perf-heap-interval", "2m",
 		t.TempDir(),
 	})
 	if err != nil {
@@ -1747,20 +1752,29 @@ func TestMountCmdPerfDirKeepsAdvancedOverrides(t *testing.T) {
 	if got == nil {
 		t.Fatal("mountFuse was not called")
 	}
-	if got.ProfileCPU != cpuPath {
-		t.Fatalf("ProfileCPU = %q, want %q", got.ProfileCPU, cpuPath)
+	if got.ProfileCPU != filepath.Join(perfDir, "cpu.pprof") {
+		t.Fatalf("ProfileCPU = %q, want perf dir default", got.ProfileCPU)
 	}
-	if got.ProfileHeap != heapPath {
-		t.Fatalf("ProfileHeap = %q, want %q", got.ProfileHeap, heapPath)
+	if got.ProfileHeap != filepath.Join(perfDir, "heap-final.pprof") {
+		t.Fatalf("ProfileHeap = %q, want perf dir default", got.ProfileHeap)
 	}
 	if got.ProfileDir != perfDir {
 		t.Fatalf("ProfileDir = %q, want %q", got.ProfileDir, perfDir)
 	}
-	if got.PerfSamplesPath != perfJSONL {
-		t.Fatalf("PerfSamplesPath = %q, want %q", got.PerfSamplesPath, perfJSONL)
+	if got.PerfSamplesPath != filepath.Join(perfDir, "perf.jsonl") {
+		t.Fatalf("PerfSamplesPath = %q, want perf dir default", got.PerfSamplesPath)
 	}
-	if got.PprofAddr != pprofAddr {
-		t.Fatalf("PprofAddr = %q, want %q", got.PprofAddr, pprofAddr)
+	if got.PprofAddr != perfAddr {
+		t.Fatalf("PprofAddr = %q, want %q", got.PprofAddr, perfAddr)
+	}
+	if got.ProfileCPUDuration != 10*time.Second {
+		t.Fatalf("ProfileCPUDuration = %v, want 10s", got.ProfileCPUDuration)
+	}
+	if got.ProfileCPUInterval != time.Minute {
+		t.Fatalf("ProfileCPUInterval = %v, want 1m", got.ProfileCPUInterval)
+	}
+	if got.ProfileHeapInterval != 2*time.Minute {
+		t.Fatalf("ProfileHeapInterval = %v, want 2m", got.ProfileHeapInterval)
 	}
 }
 
@@ -1777,20 +1791,20 @@ func TestMountCmdRejectsEmptyPerfDir(t *testing.T) {
 	}
 }
 
-func TestMountCmdRejectsProfileHeapIntervalWithoutPerfDir(t *testing.T) {
+func TestMountCmdRejectsPerfHeapIntervalWithoutPerfDir(t *testing.T) {
 	err := MountCmd([]string{
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",
-		"--profile-heap-interval", "30s",
+		"--perf-heap-interval", "30s",
 		t.TempDir(),
 	})
-	if err == nil || !strings.Contains(err.Error(), "--profile-heap-interval requires --perf-dir") {
-		t.Fatalf("MountCmd error = %v, want profile heap interval validation error", err)
+	if err == nil || !strings.Contains(err.Error(), "--perf-heap-interval requires --perf-dir") {
+		t.Fatalf("MountCmd error = %v, want perf heap interval validation error", err)
 	}
 }
 
-func TestMountCmdRejectsPerfIntervalWithoutJSONL(t *testing.T) {
+func TestMountCmdRejectsPerfIntervalWithoutPerfDir(t *testing.T) {
 	err := MountCmd([]string{
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
@@ -1798,12 +1812,12 @@ func TestMountCmdRejectsPerfIntervalWithoutJSONL(t *testing.T) {
 		"--perf-interval", "2s",
 		t.TempDir(),
 	})
-	if err == nil || !strings.Contains(err.Error(), "--perf-interval requires --perf-jsonl") {
+	if err == nil || !strings.Contains(err.Error(), "--perf-interval requires --perf-dir") {
 		t.Fatalf("MountCmd error = %v, want perf interval validation error", err)
 	}
 }
 
-func TestMountCmdRejectsPerfMaxSamplesWithoutJSONL(t *testing.T) {
+func TestMountCmdRejectsPerfMaxSamplesWithoutPerfDir(t *testing.T) {
 	err := MountCmd([]string{
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
@@ -1811,8 +1825,22 @@ func TestMountCmdRejectsPerfMaxSamplesWithoutJSONL(t *testing.T) {
 		"--perf-max-samples", "42",
 		t.TempDir(),
 	})
-	if err == nil || !strings.Contains(err.Error(), "--perf-max-samples requires --perf-jsonl") {
+	if err == nil || !strings.Contains(err.Error(), "--perf-max-samples requires --perf-dir") {
 		t.Fatalf("MountCmd error = %v, want perf max samples validation error", err)
+	}
+}
+
+func TestMountCmdRejectsPerfCPUIntervalWithoutDuration(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-dir", t.TempDir(),
+		"--perf-cpu-interval", "30s",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-cpu-interval requires --perf-cpu-duration") {
+		t.Fatalf("MountCmd error = %v, want perf cpu interval validation error", err)
 	}
 }
 

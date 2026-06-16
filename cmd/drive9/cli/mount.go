@@ -149,16 +149,13 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
-	perfCounters := fs.Bool("perf-counters", false, "print FUSE perf counter summary on unmount")
 	perfDir := fs.String("perf-dir", "", "enable standard FUSE profiling outputs in this directory")
-	perfJSONL := fs.String("perf-jsonl", "", "write continuous mount performance samples to a JSONL file")
-	perfInterval := fs.Duration("perf-interval", 0, "continuous performance sample interval (default 10s when --perf-jsonl is set)")
-	perfMaxSamples := fs.Int("perf-max-samples", 0, "maximum samples per continuous perf JSONL segment (default 7200 when --perf-jsonl is set)")
-	profileCPU := fs.String("profile-cpu", "", "write CPU profile to file for the mount lifetime")
-	profileHeap := fs.String("profile-heap", "", "write final heap profile to file on unmount")
-	var profileDir string
-	profileHeapInterval := fs.Duration("profile-heap-interval", 0, "periodically write heap profiles at this interval (requires --perf-dir)")
-	pprofAddr := fs.String("pprof-addr", "", "serve live pprof on this address, e.g. 127.0.0.1:6060")
+	perfInterval := fs.Duration("perf-interval", 0, "continuous performance sample interval (default 10s when --perf-dir is set)")
+	perfMaxSamples := fs.Int("perf-max-samples", 0, "maximum samples per continuous perf JSONL segment (default 7200 when --perf-dir is set)")
+	perfCPUDuration := fs.Duration("perf-cpu-duration", 0, "limit each CPU profile capture to this duration (default mount lifetime)")
+	perfCPUInterval := fs.Duration("perf-cpu-interval", 0, "periodically capture CPU profiles at this interval (requires --perf-cpu-duration)")
+	perfHeapInterval := fs.Duration("perf-heap-interval", 0, "periodically write heap profiles at this interval")
+	perfAddr := fs.String("perf-addr", "", "serve live pprof on this address, e.g. 127.0.0.1:6060")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] [:/remote] <mountpoint>\n\nflags:\n")
@@ -206,6 +203,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	readCacheTTLGiven := flagProvided(fs, "read-cache-ttl")
 	trustProcessLocalEventsGiven := flagProvided(fs, "trust-process-local-events")
 	perfDirGiven := flagProvided(fs, "perf-dir")
+	perfIntervalGiven := flagProvided(fs, "perf-interval")
+	perfMaxSamplesGiven := flagProvided(fs, "perf-max-samples")
+	perfCPUDurationGiven := flagProvided(fs, "perf-cpu-duration")
+	perfCPUIntervalGiven := flagProvided(fs, "perf-cpu-interval")
+	perfHeapIntervalGiven := flagProvided(fs, "perf-heap-interval")
+	perfAddrGiven := flagProvided(fs, "perf-addr")
 	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout, lookupRetryCountGiven, lookupRetryTimeoutGiven); err != nil {
 		return err
 	}
@@ -227,26 +230,14 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if perfDirGiven && strings.TrimSpace(*perfDir) == "" {
 		return fmt.Errorf("drive9 mount: --perf-dir must not be empty")
 	}
-	applyMountPerfDirDefaults(fs, *perfDir, profileCPU, profileHeap, &profileDir, perfJSONL, pprofAddr)
-	if flagProvided(fs, "perf-interval") && *perfInterval <= 0 {
-		return fmt.Errorf("drive9 mount: --perf-interval must be > 0")
+	if perfAddrGiven && strings.TrimSpace(*perfAddr) == "" {
+		return fmt.Errorf("drive9 mount: --perf-addr must not be empty")
 	}
-	if flagProvided(fs, "perf-interval") && *perfJSONL == "" {
-		return fmt.Errorf("drive9 mount: --perf-interval requires --perf-jsonl")
+	if err := validateMountPerfFlags(perfDirGiven, *perfInterval, *perfMaxSamples, *perfCPUDuration, *perfCPUInterval, *perfHeapInterval, perfIntervalGiven, perfMaxSamplesGiven, perfCPUDurationGiven, perfCPUIntervalGiven, perfHeapIntervalGiven, perfAddrGiven); err != nil {
+		return err
 	}
-	if flagProvided(fs, "perf-max-samples") && *perfMaxSamples <= 0 {
-		return fmt.Errorf("drive9 mount: --perf-max-samples must be > 0")
-	}
-	if flagProvided(fs, "perf-max-samples") && *perfJSONL == "" {
-		return fmt.Errorf("drive9 mount: --perf-max-samples requires --perf-jsonl")
-	}
-	if flagProvided(fs, "profile-heap-interval") && *profileHeapInterval <= 0 {
-		return fmt.Errorf("drive9 mount: --profile-heap-interval must be > 0")
-	}
-	if flagProvided(fs, "profile-heap-interval") && !perfDirGiven {
-		return fmt.Errorf("drive9 mount: --profile-heap-interval requires --perf-dir")
-	}
-
+	var profileCPU, profileHeap, profileDir, perfJSONL, pprofAddr string
+	applyMountPerfDirDefaults(*perfDir, *perfAddr, &profileCPU, &profileHeap, &profileDir, &perfJSONL, &pprofAddr)
 	profileGiven := flagProvided(fs, "profile")
 	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
 	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
@@ -314,9 +305,6 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	if resolved == MountModeWebDAV && perfDirGiven {
 		return fmt.Errorf("--perf-dir is only supported with --mode=fuse")
-	}
-	if resolved == MountModeWebDAV && *perfJSONL != "" {
-		return fmt.Errorf("--perf-jsonl is only supported with --mode=fuse")
 	}
 	if resolved == MountModeWebDAV && strings.TrimSpace(*layerRef) != "" {
 		return fmt.Errorf("drive9 mount: --layer is only supported with --mode=fuse")
@@ -492,13 +480,14 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		AllowOther:              *allowOther,
 		ReadOnly:                *readOnly,
 		Debug:                   *debug,
-		PerfCounters:            *perfCounters,
-		ProfileCPU:              *profileCPU,
-		ProfileHeap:             *profileHeap,
+		ProfileCPU:              profileCPU,
+		ProfileCPUDuration:      *perfCPUDuration,
+		ProfileCPUInterval:      *perfCPUInterval,
+		ProfileHeap:             profileHeap,
 		ProfileDir:              profileDir,
-		ProfileHeapInterval:     *profileHeapInterval,
-		PprofAddr:               *pprofAddr,
-		PerfSamplesPath:         *perfJSONL,
+		ProfileHeapInterval:     *perfHeapInterval,
+		PprofAddr:               pprofAddr,
+		PerfSamplesPath:         perfJSONL,
 		PerfSampleInterval:      *perfInterval,
 		PerfMaxSamples:          *perfMaxSamples,
 	}
@@ -799,23 +788,58 @@ func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int
 	return nil
 }
 
-func applyMountPerfDirDefaults(fs *flag.FlagSet, perfDir string, profileCPU, profileHeap, profileDir, perfJSONL, pprofAddr *string) {
+func validateMountPerfFlags(perfDirGiven bool, perfInterval time.Duration, perfMaxSamples int, perfCPUDuration time.Duration, perfCPUInterval time.Duration, perfHeapInterval time.Duration, perfIntervalGiven bool, perfMaxSamplesGiven bool, perfCPUDurationGiven bool, perfCPUIntervalGiven bool, perfHeapIntervalGiven bool, perfAddrGiven bool) error {
+	if perfIntervalGiven && perfInterval <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-interval must be > 0")
+	}
+	if perfMaxSamplesGiven && perfMaxSamples <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-max-samples must be > 0")
+	}
+	if perfCPUDurationGiven && perfCPUDuration <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-cpu-duration must be > 0")
+	}
+	if perfCPUIntervalGiven && perfCPUInterval <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-cpu-interval must be > 0")
+	}
+	if perfHeapIntervalGiven && perfHeapInterval <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-heap-interval must be > 0")
+	}
+	if perfCPUIntervalGiven && !perfCPUDurationGiven {
+		return fmt.Errorf("drive9 mount: --perf-cpu-interval requires --perf-cpu-duration")
+	}
+	if perfCPUIntervalGiven && perfCPUDuration >= perfCPUInterval {
+		return fmt.Errorf("drive9 mount: --perf-cpu-duration must be less than --perf-cpu-interval")
+	}
+	for _, name := range []struct {
+		flag  string
+		given bool
+	}{
+		{"--perf-interval", perfIntervalGiven},
+		{"--perf-max-samples", perfMaxSamplesGiven},
+		{"--perf-cpu-duration", perfCPUDurationGiven},
+		{"--perf-cpu-interval", perfCPUIntervalGiven},
+		{"--perf-heap-interval", perfHeapIntervalGiven},
+		{"--perf-addr", perfAddrGiven},
+	} {
+		if name.given && !perfDirGiven {
+			return fmt.Errorf("drive9 mount: %s requires --perf-dir", name.flag)
+		}
+	}
+	return nil
+}
+
+func applyMountPerfDirDefaults(perfDir string, perfAddr string, profileCPU, profileHeap, profileDir, perfJSONL, pprofAddr *string) {
 	perfDir = strings.TrimSpace(perfDir)
 	if perfDir == "" {
 		return
 	}
-	if !flagProvided(fs, "profile-cpu") {
-		*profileCPU = filepath.Join(perfDir, "cpu.pprof")
-	}
-	if !flagProvided(fs, "profile-heap") {
-		*profileHeap = filepath.Join(perfDir, "heap-final.pprof")
-	}
+	*profileCPU = filepath.Join(perfDir, "cpu.pprof")
+	*profileHeap = filepath.Join(perfDir, "heap-final.pprof")
 	*profileDir = perfDir
-	if !flagProvided(fs, "perf-jsonl") {
-		*perfJSONL = filepath.Join(perfDir, "perf.jsonl")
-	}
-	if !flagProvided(fs, "pprof-addr") {
-		*pprofAddr = defaultMountPerfPprofAddr
+	*perfJSONL = filepath.Join(perfDir, "perf.jsonl")
+	*pprofAddr = defaultMountPerfPprofAddr
+	if addr := strings.TrimSpace(perfAddr); addr != "" {
+		*pprofAddr = addr
 	}
 }
 

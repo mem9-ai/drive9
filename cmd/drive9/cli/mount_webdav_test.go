@@ -750,22 +750,6 @@ func TestFsMountCmdRejectsDurabilityForWebDAV(t *testing.T) {
 	}
 }
 
-func TestFsMountCmdRejectsContinuousPerfForWebDAV(t *testing.T) {
-	err := fsMountCmd([]string{
-		"--mode=webdav",
-		"--server=https://drive9.example",
-		"--api-key=sk-test",
-		"--perf-jsonl=/tmp/drive9-perf.jsonl",
-		t.TempDir(),
-	})
-	if err == nil {
-		t.Fatal("expected WebDAV continuous perf rejection")
-	}
-	if !strings.Contains(err.Error(), "--perf-jsonl is only supported with --mode=fuse") {
-		t.Fatalf("error = %v, want perf-jsonl WebDAV rejection", err)
-	}
-}
-
 func TestFsMountCmdRejectsPerfDirForWebDAV(t *testing.T) {
 	err := fsMountCmd([]string{
 		"--mode=webdav",

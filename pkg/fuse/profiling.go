@@ -18,6 +18,8 @@ import (
 // ProfilingOptions configures optional runtime profiling for a FUSE mount.
 type ProfilingOptions struct {
 	CPUProfilePath      string
+	CPUProfileDuration  time.Duration
+	CPUProfileInterval  time.Duration
 	HeapProfilePath     string
 	ProfileDir          string
 	HeapProfileInterval time.Duration
@@ -50,6 +52,8 @@ func StartProfiler(opts ProfilingOptions) (*Profiler, error) {
 		stopCh: make(chan struct{}),
 	}
 	if opts.CPUProfilePath == "" &&
+		opts.CPUProfileDuration <= 0 &&
+		opts.CPUProfileInterval <= 0 &&
 		opts.HeapProfilePath == "" &&
 		opts.ProfileDir == "" &&
 		opts.HeapProfileInterval <= 0 &&
@@ -60,10 +64,30 @@ func StartProfiler(opts ProfilingOptions) (*Profiler, error) {
 	if opts.HeapProfileInterval > 0 && opts.ProfileDir == "" {
 		return nil, fmt.Errorf("heap profile interval requires profile dir")
 	}
+	if opts.CPUProfileInterval > 0 && opts.CPUProfileDuration <= 0 {
+		return nil, fmt.Errorf("cpu profile interval requires cpu profile duration")
+	}
+	if opts.CPUProfileDuration > 0 && opts.CPUProfileInterval > 0 && opts.CPUProfileDuration >= opts.CPUProfileInterval {
+		return nil, fmt.Errorf("cpu profile duration must be less than cpu profile interval")
+	}
+	if opts.CPUProfileDuration > 0 && opts.CPUProfilePath == "" && opts.ProfileDir == "" {
+		return nil, fmt.Errorf("cpu profile duration requires cpu profile path or profile dir")
+	}
+	if opts.CPUProfileInterval > 0 && opts.ProfileDir == "" {
+		return nil, fmt.Errorf("cpu profile interval requires profile dir")
+	}
 	if opts.CPUProfilePath != "" {
-		if err := p.StartCPUProfile(opts.CPUProfilePath); err != nil {
-			return nil, fmt.Errorf("start cpu profile %s: %w", opts.CPUProfilePath, err)
+		if opts.CPUProfileDuration > 0 {
+			p.wg.Add(1)
+			go p.cpuLoop()
+		} else {
+			if err := p.StartCPUProfile(opts.CPUProfilePath); err != nil {
+				return nil, fmt.Errorf("start cpu profile %s: %w", opts.CPUProfilePath, err)
+			}
 		}
+	} else if opts.CPUProfileDuration > 0 {
+		p.wg.Add(1)
+		go p.cpuLoop()
 	}
 	if opts.ProfileDir != "" {
 		if err := os.MkdirAll(opts.ProfileDir, 0o755); err != nil {
@@ -189,6 +213,56 @@ func (p *Profiler) defaultCPUProfilePath() string {
 		return filepath.Join(p.opts.ProfileDir, "cpu.pprof")
 	}
 	return ""
+}
+
+func (p *Profiler) cpuLoop() {
+	defer p.wg.Done()
+	if p.opts.CPUProfileInterval <= 0 {
+		p.captureCPUProfile(p.defaultCPUProfilePath(), p.opts.CPUProfileDuration)
+		return
+	}
+
+	p.captureCPUProfile(p.periodicCPUProfilePath(time.Now().UTC()), p.opts.CPUProfileDuration)
+	ticker := time.NewTicker(p.opts.CPUProfileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case t := <-ticker.C:
+			p.captureCPUProfile(p.periodicCPUProfilePath(t.UTC()), p.opts.CPUProfileDuration)
+		}
+	}
+}
+
+func (p *Profiler) periodicCPUProfilePath(t time.Time) string {
+	if p.opts.ProfileDir != "" {
+		name := fmt.Sprintf("cpu-%s.pprof", t.Format("20060102-150405.000000000"))
+		return filepath.Join(p.opts.ProfileDir, name)
+	}
+	return p.defaultCPUProfilePath()
+}
+
+func (p *Profiler) captureCPUProfile(path string, duration time.Duration) {
+	if duration <= 0 {
+		return
+	}
+	select {
+	case <-p.stopCh:
+		return
+	default:
+	}
+	if err := p.StartCPUProfile(path); err != nil {
+		fmt.Fprintf(os.Stderr, "drive9: start cpu profile %s: %v\n", path, err)
+		return
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-p.stopCh:
+	}
+	p.stopCPUProfile()
 }
 
 func (p *Profiler) heapLoop() {

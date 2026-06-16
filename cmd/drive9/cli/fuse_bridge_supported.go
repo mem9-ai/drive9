@@ -64,6 +64,8 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		EnableGitWorkspaces:     opts.LocalRoot != "",
 		Profiling: drive9fuse.ProfilingOptions{
 			CPUProfilePath:      opts.ProfileCPU,
+			CPUProfileDuration:  opts.ProfileCPUDuration,
+			CPUProfileInterval:  opts.ProfileCPUInterval,
 			HeapProfilePath:     opts.ProfileHeap,
 			ProfileDir:          opts.ProfileDir,
 			HeapProfileInterval: opts.ProfileHeapInterval,
