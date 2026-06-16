@@ -72,6 +72,8 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 			PerfSamplesPath:     opts.PerfSamplesPath,
 			PerfSampleInterval:  opts.PerfSampleInterval,
 			PerfMaxSamples:      opts.PerfMaxSamples,
+			PerfMaxSampleFiles:  opts.PerfMaxSampleFiles,
+			PerfMaxProfileFiles: opts.PerfMaxProfileFiles,
 		},
 	})
 }

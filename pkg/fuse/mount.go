@@ -156,6 +156,9 @@ func (o *MountOptions) setDefaults() {
 	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfMaxSamples <= 0 {
 		o.Profiling.PerfMaxSamples = defaultPerfMaxSamples
 	}
+	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfMaxSampleFiles <= 0 {
+		o.Profiling.PerfMaxSampleFiles = defaultPerfMaxSampleFiles
+	}
 	if o.Profiling.ProfileDir != "" && o.Profiling.CPUProfileDuration <= 0 {
 		o.Profiling.CPUProfileDuration = defaultCPUProfileDuration
 	}
@@ -164,6 +167,9 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.Profiling.ProfileDir != "" && o.Profiling.HeapProfileInterval <= 0 {
 		o.Profiling.HeapProfileInterval = defaultHeapProfileInterval
+	}
+	if o.Profiling.ProfileDir != "" && o.Profiling.PerfMaxProfileFiles <= 0 {
+		o.Profiling.PerfMaxProfileFiles = defaultPerfMaxProfileFiles
 	}
 }
 
@@ -465,25 +471,27 @@ func Mount(opts *MountOptions) error {
 		credentialKind = mountstate.CredentialKindToken
 	}
 	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
-		PID:             os.Getpid(),
-		Component:       "drive9-fuse",
-		MountKind:       mountstate.MountKindFUSE,
-		MountPoint:      stateMountPoint,
-		RemoteRoot:      opts.RemoteRoot,
-		Profile:         opts.Profile,
-		LocalRoot:       opts.LocalRoot,
-		Server:          opts.Server,
-		PackPaths:       append([]string(nil), opts.PackPaths...),
-		CredentialKind:  credentialKind,
-		APIKey:          opts.APIKey,
-		Token:           opts.Token,
-		ProfileDir:      opts.Profiling.ProfileDir,
-		PerfSamplesPath: opts.Profiling.PerfSamplesPath,
-		PerfInterval:    opts.Profiling.PerfSampleInterval.String(),
-		PerfMaxSamples:  opts.Profiling.PerfMaxSamples,
-		PprofAddr:       opts.Profiling.PprofAddr,
-		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
-		HeapProfilePath: opts.Profiling.HeapProfilePath,
+		PID:                 os.Getpid(),
+		Component:           "drive9-fuse",
+		MountKind:           mountstate.MountKindFUSE,
+		MountPoint:          stateMountPoint,
+		RemoteRoot:          opts.RemoteRoot,
+		Profile:             opts.Profile,
+		LocalRoot:           opts.LocalRoot,
+		Server:              opts.Server,
+		PackPaths:           append([]string(nil), opts.PackPaths...),
+		CredentialKind:      credentialKind,
+		APIKey:              opts.APIKey,
+		Token:               opts.Token,
+		ProfileDir:          opts.Profiling.ProfileDir,
+		PerfSamplesPath:     opts.Profiling.PerfSamplesPath,
+		PerfInterval:        opts.Profiling.PerfSampleInterval.String(),
+		PerfMaxSamples:      opts.Profiling.PerfMaxSamples,
+		PerfMaxSampleFiles:  opts.Profiling.PerfMaxSampleFiles,
+		PerfMaxProfileFiles: opts.Profiling.PerfMaxProfileFiles,
+		PprofAddr:           opts.Profiling.PprofAddr,
+		StartedAt:           time.Now().UTC().Format(time.RFC3339Nano),
+		HeapProfilePath:     opts.Profiling.HeapProfilePath,
 	})
 	if err != nil {
 		stopWatchers()

@@ -1642,6 +1642,8 @@ func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
 		"--perf-dir", "/tmp/drive9-perf",
 		"--perf-interval", "2s",
 		"--perf-max-samples", "42",
+		"--perf-max-sample-files", "3",
+		"--perf-max-profile-files", "5",
 		t.TempDir(),
 	})
 	if err != nil {
@@ -1658,6 +1660,12 @@ func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
 	}
 	if got.PerfMaxSamples != 42 {
 		t.Fatalf("PerfMaxSamples = %d, want 42", got.PerfMaxSamples)
+	}
+	if got.PerfMaxSampleFiles != 3 {
+		t.Fatalf("PerfMaxSampleFiles = %d, want 3", got.PerfMaxSampleFiles)
+	}
+	if got.PerfMaxProfileFiles != 5 {
+		t.Fatalf("PerfMaxProfileFiles = %d, want 5", got.PerfMaxProfileFiles)
 	}
 }
 
@@ -1818,6 +1826,57 @@ func TestMountCmdRejectsPerfMaxSamplesWithoutPerfDir(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "--perf-max-samples requires --perf-dir") {
 		t.Fatalf("MountCmd error = %v, want perf max samples validation error", err)
+	}
+}
+
+func TestMountCmdRejectsPerfMaxSampleFilesWithoutPerfDir(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-max-sample-files", "3",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-max-sample-files requires --perf-dir") {
+		t.Fatalf("MountCmd error = %v, want perf max sample files validation error", err)
+	}
+}
+
+func TestMountCmdRejectsPerfMaxProfileFilesWithoutPerfDir(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-max-profile-files", "5",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-max-profile-files requires --perf-dir") {
+		t.Fatalf("MountCmd error = %v, want perf max profile files validation error", err)
+	}
+}
+
+func TestMountCmdRejectsInvalidPerfRetentionFileCounts(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		flag    string
+		message string
+	}{
+		{name: "sample files", flag: "--perf-max-sample-files", message: "--perf-max-sample-files must be > 0"},
+		{name: "profile files", flag: "--perf-max-profile-files", message: "--perf-max-profile-files must be > 0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := MountCmd([]string{
+				"--mode", "fuse",
+				"--server", "https://drive9.example",
+				"--api-key", "sk-test",
+				"--perf-dir", t.TempDir(),
+				tt.flag, "0",
+				t.TempDir(),
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.message) {
+				t.Fatalf("MountCmd error = %v, want %q", err, tt.message)
+			}
+		})
 	}
 }
 

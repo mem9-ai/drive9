@@ -106,6 +106,41 @@ func TestMountOptionsProfileDirDefaultsProfileWindows(t *testing.T) {
 	if opts.Profiling.HeapProfileInterval != defaultHeapProfileInterval {
 		t.Fatalf("HeapProfileInterval = %v, want %v", opts.Profiling.HeapProfileInterval, defaultHeapProfileInterval)
 	}
+	if opts.Profiling.PerfMaxProfileFiles != defaultPerfMaxProfileFiles {
+		t.Fatalf("PerfMaxProfileFiles = %d, want %d", opts.Profiling.PerfMaxProfileFiles, defaultPerfMaxProfileFiles)
+	}
+}
+
+func TestPruneProfileFilesKeepsNewestPerPattern(t *testing.T) {
+	dir := t.TempDir()
+	writeProfile := func(name string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("profile"), 0o644); err != nil {
+			t.Fatalf("write profile %s: %v", name, err)
+		}
+	}
+	writeProfile("cpu-20260101-000001.000000000.pprof")
+	writeProfile("cpu-20260101-000002.000000000.pprof")
+	writeProfile("cpu-20260101-000003.000000000.pprof")
+	writeProfile("heap-20260101-000001.pprof")
+	writeProfile("heap-20260101-000002.pprof")
+	writeProfile("heap-final.pprof")
+
+	if err := pruneProfileFiles(dir, "cpu-*.pprof", 2); err != nil {
+		t.Fatalf("prune CPU profiles: %v", err)
+	}
+	assertMissingFile(t, filepath.Join(dir, "cpu-20260101-000001.000000000.pprof"))
+	assertExistingFile(t, filepath.Join(dir, "cpu-20260101-000002.000000000.pprof"))
+	assertExistingFile(t, filepath.Join(dir, "cpu-20260101-000003.000000000.pprof"))
+	assertExistingFile(t, filepath.Join(dir, "heap-20260101-000001.pprof"))
+	assertExistingFile(t, filepath.Join(dir, "heap-20260101-000002.pprof"))
+
+	if err := pruneProfileFiles(dir, "heap-[0-9]*.pprof", 1); err != nil {
+		t.Fatalf("prune heap profiles: %v", err)
+	}
+	assertMissingFile(t, filepath.Join(dir, "heap-20260101-000001.pprof"))
+	assertExistingFile(t, filepath.Join(dir, "heap-20260101-000002.pprof"))
+	assertExistingFile(t, filepath.Join(dir, "heap-final.pprof"))
 }
 
 func TestPprofMuxServesIndex(t *testing.T) {
@@ -179,5 +214,19 @@ func TestPprofMuxControlsCPUProfile(t *testing.T) {
 func busyWait(duration time.Duration) {
 	deadline := time.Now().Add(duration)
 	for time.Now().Before(deadline) {
+	}
+}
+
+func assertExistingFile(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("stat existing file %s: %v", path, err)
+	}
+}
+
+func assertMissingFile(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("stat missing file %s error = %v, want not exist", path, err)
 	}
 }

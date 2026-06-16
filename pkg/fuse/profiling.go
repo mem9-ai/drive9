@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"sync"
 	"time"
 )
@@ -31,6 +32,8 @@ type ProfilingOptions struct {
 	PerfSamplesPath     string
 	PerfSampleInterval  time.Duration
 	PerfMaxSamples      int
+	PerfMaxSampleFiles  int
+	PerfMaxProfileFiles int
 }
 
 // Profiler owns the profiling resources for one mount process.
@@ -77,6 +80,10 @@ func StartProfiler(opts ProfilingOptions) (*Profiler, error) {
 	}
 	if opts.CPUProfileInterval > 0 && opts.ProfileDir == "" {
 		return nil, fmt.Errorf("cpu profile interval requires profile dir")
+	}
+	if opts.ProfileDir != "" && opts.PerfMaxProfileFiles <= 0 {
+		opts.PerfMaxProfileFiles = defaultPerfMaxProfileFiles
+		p.opts.PerfMaxProfileFiles = opts.PerfMaxProfileFiles
 	}
 	if opts.CPUProfileDuration > 0 {
 		p.wg.Add(1)
@@ -258,6 +265,7 @@ func (p *Profiler) captureCPUProfile(path string, duration time.Duration) {
 	case <-p.stopCh:
 	}
 	p.stopCPUProfile()
+	p.pruneProfileFiles("cpu-*.pprof")
 }
 
 func (p *Profiler) heapLoop() {
@@ -273,6 +281,8 @@ func (p *Profiler) heapLoop() {
 			path := filepath.Join(p.opts.ProfileDir, name)
 			if err := writeHeapProfile(path); err != nil {
 				fmt.Fprintf(os.Stderr, "drive9: write heap profile %s: %v\n", path, err)
+			} else {
+				p.pruneProfileFiles("heap-[0-9]*.pprof")
 			}
 		}
 	}
@@ -301,6 +311,32 @@ func ensureParentDir(path string) error {
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create profile parent %s: %w", dir, err)
+	}
+	return nil
+}
+
+func (p *Profiler) pruneProfileFiles(pattern string) {
+	if err := pruneProfileFiles(p.opts.ProfileDir, pattern, p.opts.PerfMaxProfileFiles); err != nil {
+		fmt.Fprintf(os.Stderr, "drive9: prune profile files %s: %v\n", pattern, err)
+	}
+}
+
+func pruneProfileFiles(dir string, pattern string, keep int) error {
+	if dir == "" || keep <= 0 {
+		return nil
+	}
+	matches, err := filepath.Glob(filepath.Join(dir, pattern))
+	if err != nil {
+		return fmt.Errorf("glob profile files %s: %w", pattern, err)
+	}
+	if len(matches) <= keep {
+		return nil
+	}
+	sort.Strings(matches)
+	for _, path := range matches[:len(matches)-keep] {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove old profile %s: %w", path, err)
+		}
 	}
 	return nil
 }
@@ -334,5 +370,6 @@ func (p *Profiler) handleStopCPUProfile(w http.ResponseWriter, _ *http.Request) 
 		http.Error(w, "cpu profile is not running", http.StatusConflict)
 		return
 	}
+	p.pruneProfileFiles("cpu-*.pprof")
 	_, _ = fmt.Fprintf(w, "stopped cpu profile: %s\n", path)
 }

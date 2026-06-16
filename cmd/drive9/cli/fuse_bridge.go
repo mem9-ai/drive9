@@ -77,6 +77,8 @@ type mountFuseOptions struct {
 	PerfSamplesPath         string
 	PerfSampleInterval      time.Duration
 	PerfMaxSamples          int
+	PerfMaxSampleFiles      int
+	PerfMaxProfileFiles     int
 }
 
 type vaultMountOptions struct {

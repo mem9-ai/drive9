@@ -120,6 +120,48 @@ func TestContinuousPerfRecorderRotatesSamples(t *testing.T) {
 	}
 }
 
+func TestContinuousPerfRecorderRetainsConfiguredSampleFiles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "samples.jsonl")
+	opts := &MountOptions{
+		CacheSize:             1 << 20,
+		ReadCacheMaxFileBytes: 1 << 20,
+		Profiling: ProfilingOptions{
+			PerfSamplesPath:    path,
+			PerfSampleInterval: time.Hour,
+			PerfMaxSamples:     1,
+			PerfMaxSampleFiles: 3,
+		},
+	}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	recorder, err := StartContinuousPerf(opts.Profiling, fs)
+	if err != nil {
+		t.Fatalf("StartContinuousPerf: %v", err)
+	}
+	for i := 0; i < 4; i++ {
+		if err := recorder.writeSample("manual"); err != nil {
+			t.Fatalf("write manual sample %d: %v", i, err)
+		}
+	}
+	recorder.Stop()
+
+	matches, err := filepath.Glob(path + "*")
+	if err != nil {
+		t.Fatalf("glob sample files: %v", err)
+	}
+	if len(matches) != 3 {
+		t.Fatalf("sample files = %v, want exactly 3", matches)
+	}
+	for _, name := range []string{path, path + ".1", path + ".2"} {
+		if _, err := os.Stat(name); err != nil {
+			t.Fatalf("stat retained sample file %s: %v", name, err)
+		}
+	}
+	if _, err := os.Stat(path + ".3"); !os.IsNotExist(err) {
+		t.Fatalf("stat sample file %s error = %v, want not exist", path+".3", err)
+	}
+}
+
 func waitForPerfLines(t *testing.T, path string, want int) {
 	t.Helper()
 	deadline := time.Now().Add(time.Second)

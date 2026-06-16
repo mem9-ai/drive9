@@ -6,13 +6,18 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/buildinfo"
 )
 
-const defaultPerfMaxSamples = 7200
+const (
+	defaultPerfMaxSamples      = 7200
+	defaultPerfMaxSampleFiles  = 2
+	defaultPerfMaxProfileFiles = 48
+)
 
 // ContinuousPerfRecorder writes low-overhead mount performance samples as JSONL.
 type ContinuousPerfRecorder struct {
@@ -54,24 +59,26 @@ type continuousPerfStats struct {
 }
 
 type continuousPerfContext struct {
-	Component      string `json:"component"`
-	Version        string `json:"version"`
-	GitHash        string `json:"git_hash"`
-	GitBranch      string `json:"git_branch"`
-	BuildTime      string `json:"build_time"`
-	GoVersion      string `json:"go_version"`
-	GOOS           string `json:"goos"`
-	GOARCH         string `json:"goarch"`
-	PID            int    `json:"pid"`
-	MountPointHash string `json:"mount_point_hash,omitempty"`
-	RemoteRootHash string `json:"remote_root_hash,omitempty"`
-	ServerHash     string `json:"server_hash,omitempty"`
-	SyncMode       string `json:"sync_mode,omitempty"`
-	WritePolicy    string `json:"write_policy,omitempty"`
-	Profile        string `json:"profile,omitempty"`
-	PprofAddr      string `json:"pprof_addr,omitempty"`
-	PerfIntervalMS int64  `json:"perf_interval_ms,omitempty"`
-	PerfMaxSamples int    `json:"perf_max_samples,omitempty"`
+	Component           string `json:"component"`
+	Version             string `json:"version"`
+	GitHash             string `json:"git_hash"`
+	GitBranch           string `json:"git_branch"`
+	BuildTime           string `json:"build_time"`
+	GoVersion           string `json:"go_version"`
+	GOOS                string `json:"goos"`
+	GOARCH              string `json:"goarch"`
+	PID                 int    `json:"pid"`
+	MountPointHash      string `json:"mount_point_hash,omitempty"`
+	RemoteRootHash      string `json:"remote_root_hash,omitempty"`
+	ServerHash          string `json:"server_hash,omitempty"`
+	SyncMode            string `json:"sync_mode,omitempty"`
+	WritePolicy         string `json:"write_policy,omitempty"`
+	Profile             string `json:"profile,omitempty"`
+	PprofAddr           string `json:"pprof_addr,omitempty"`
+	PerfIntervalMS      int64  `json:"perf_interval_ms,omitempty"`
+	PerfMaxSamples      int    `json:"perf_max_samples,omitempty"`
+	PerfMaxSampleFiles  int    `json:"perf_max_sample_files,omitempty"`
+	PerfMaxProfileFiles int    `json:"perf_max_profile_files,omitempty"`
 }
 
 type continuousPerfRuntimeStats struct {
@@ -121,6 +128,10 @@ func StartContinuousPerf(opts ProfilingOptions, fs *Dat9FS) (*ContinuousPerfReco
 	if opts.PerfMaxSamples <= 0 {
 		opts.PerfMaxSamples = defaultPerfMaxSamples
 		r.opts.PerfMaxSamples = opts.PerfMaxSamples
+	}
+	if opts.PerfMaxSampleFiles <= 0 {
+		opts.PerfMaxSampleFiles = defaultPerfMaxSampleFiles
+		r.opts.PerfMaxSampleFiles = opts.PerfMaxSampleFiles
 	}
 	if err := ensureParentDir(opts.PerfSamplesPath); err != nil {
 		close(r.doneCh)
@@ -230,12 +241,8 @@ func (r *ContinuousPerfRecorder) rotateLocked() error {
 			return fmt.Errorf("close continuous perf samples before rotate %s: %w", r.opts.PerfSamplesPath, err)
 		}
 	}
-	previous := r.opts.PerfSamplesPath + ".1"
-	if err := os.Remove(previous); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove previous continuous perf samples %s: %w", previous, err)
-	}
-	if err := os.Rename(r.opts.PerfSamplesPath, previous); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("rotate continuous perf samples %s: %w", r.opts.PerfSamplesPath, err)
+	if err := r.rotateSampleFilesLocked(); err != nil {
+		return err
 	}
 	r.file = nil
 	r.encoder = nil
@@ -243,21 +250,61 @@ func (r *ContinuousPerfRecorder) rotateLocked() error {
 	return r.openSamplesFile()
 }
 
+func (r *ContinuousPerfRecorder) rotateSampleFilesLocked() error {
+	maxFiles := r.opts.PerfMaxSampleFiles
+	if maxFiles <= 0 {
+		maxFiles = defaultPerfMaxSampleFiles
+	}
+	if maxFiles <= 1 {
+		if err := os.Remove(r.opts.PerfSamplesPath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove continuous perf samples %s: %w", r.opts.PerfSamplesPath, err)
+		}
+		return nil
+	}
+
+	historyCount := maxFiles - 1
+	oldest := r.sampleFilePath(historyCount)
+	if err := os.Remove(oldest); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove old continuous perf samples %s: %w", oldest, err)
+	}
+	for i := historyCount - 1; i >= 1; i-- {
+		src := r.sampleFilePath(i)
+		dst := r.sampleFilePath(i + 1)
+		if err := os.Rename(src, dst); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("rotate continuous perf samples %s to %s: %w", src, dst, err)
+		}
+	}
+	previous := r.sampleFilePath(1)
+	if err := os.Rename(r.opts.PerfSamplesPath, previous); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("rotate continuous perf samples %s to %s: %w", r.opts.PerfSamplesPath, previous, err)
+	}
+	return nil
+}
+
+func (r *ContinuousPerfRecorder) sampleFilePath(index int) string {
+	if index <= 0 {
+		return r.opts.PerfSamplesPath
+	}
+	return r.opts.PerfSamplesPath + "." + strconv.Itoa(index)
+}
+
 func (r *ContinuousPerfRecorder) context() continuousPerfContext {
 	info := buildinfo.Get("drive9-fuse")
 	ctx := continuousPerfContext{
-		Component:      info.Component,
-		Version:        info.Version,
-		GitHash:        info.GitHash,
-		GitBranch:      info.GitBranch,
-		BuildTime:      info.BuildTime,
-		GoVersion:      info.GoVersion,
-		GOOS:           runtime.GOOS,
-		GOARCH:         runtime.GOARCH,
-		PID:            os.Getpid(),
-		PprofAddr:      r.opts.PprofAddr,
-		PerfIntervalMS: r.opts.PerfSampleInterval.Milliseconds(),
-		PerfMaxSamples: r.opts.PerfMaxSamples,
+		Component:           info.Component,
+		Version:             info.Version,
+		GitHash:             info.GitHash,
+		GitBranch:           info.GitBranch,
+		BuildTime:           info.BuildTime,
+		GoVersion:           info.GoVersion,
+		GOOS:                runtime.GOOS,
+		GOARCH:              runtime.GOARCH,
+		PID:                 os.Getpid(),
+		PprofAddr:           r.opts.PprofAddr,
+		PerfIntervalMS:      r.opts.PerfSampleInterval.Milliseconds(),
+		PerfMaxSamples:      r.opts.PerfMaxSamples,
+		PerfMaxSampleFiles:  r.opts.PerfMaxSampleFiles,
+		PerfMaxProfileFiles: r.opts.PerfMaxProfileFiles,
 	}
 	if r.fs == nil || r.fs.opts == nil {
 		return ctx

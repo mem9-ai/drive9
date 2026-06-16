@@ -155,6 +155,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	perfDir := fs.String("perf-dir", "", "enable standard FUSE profiling outputs in this directory")
 	perfInterval := fs.Duration("perf-interval", 0, "continuous performance sample interval (default 10s when --perf-dir is set)")
 	perfMaxSamples := fs.Int("perf-max-samples", 0, "maximum samples per continuous perf JSONL segment (default 7200 when --perf-dir is set)")
+	perfMaxSampleFiles := fs.Int("perf-max-sample-files", 0, "maximum retained continuous perf sample files (default 2 when --perf-dir is set)")
+	perfMaxProfileFiles := fs.Int("perf-max-profile-files", 0, "maximum retained CPU and heap profile files per type (default 48 when --perf-dir is set)")
 	perfCPUDuration := fs.Duration("perf-cpu-duration", 0, "CPU profile capture window duration (default 30s when --perf-dir is set)")
 	perfCPUInterval := fs.Duration("perf-cpu-interval", 0, "periodically capture CPU profiles at this interval (default 10m when --perf-dir is set)")
 	perfHeapInterval := fs.Duration("perf-heap-interval", 0, "periodically write heap profiles at this interval (default 10m when --perf-dir is set)")
@@ -208,6 +210,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	perfDirGiven := flagProvided(fs, "perf-dir")
 	perfIntervalGiven := flagProvided(fs, "perf-interval")
 	perfMaxSamplesGiven := flagProvided(fs, "perf-max-samples")
+	perfMaxSampleFilesGiven := flagProvided(fs, "perf-max-sample-files")
+	perfMaxProfileFilesGiven := flagProvided(fs, "perf-max-profile-files")
 	perfCPUDurationGiven := flagProvided(fs, "perf-cpu-duration")
 	perfCPUIntervalGiven := flagProvided(fs, "perf-cpu-interval")
 	perfHeapIntervalGiven := flagProvided(fs, "perf-heap-interval")
@@ -250,7 +254,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			effectivePerfHeapInterval = defaultMountPerfHeapInterval
 		}
 	}
-	if err := validateMountPerfFlags(perfDirGiven, *perfInterval, *perfMaxSamples, effectivePerfCPUDuration, effectivePerfCPUInterval, effectivePerfHeapInterval, perfIntervalGiven, perfMaxSamplesGiven, perfCPUDurationGiven, perfCPUIntervalGiven, perfHeapIntervalGiven, perfAddrGiven); err != nil {
+	if err := validateMountPerfFlags(perfDirGiven, *perfInterval, *perfMaxSamples, *perfMaxSampleFiles, *perfMaxProfileFiles, effectivePerfCPUDuration, effectivePerfCPUInterval, effectivePerfHeapInterval, perfIntervalGiven, perfMaxSamplesGiven, perfMaxSampleFilesGiven, perfMaxProfileFilesGiven, perfCPUDurationGiven, perfCPUIntervalGiven, perfHeapIntervalGiven, perfAddrGiven); err != nil {
 		return err
 	}
 	var profileHeap, profileDir, perfJSONL, pprofAddr string
@@ -506,6 +510,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		PerfSamplesPath:         perfJSONL,
 		PerfSampleInterval:      *perfInterval,
 		PerfMaxSamples:          *perfMaxSamples,
+		PerfMaxSampleFiles:      *perfMaxSampleFiles,
+		PerfMaxProfileFiles:     *perfMaxProfileFiles,
 	}
 
 	return mountFuse(opts)
@@ -804,12 +810,18 @@ func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int
 	return nil
 }
 
-func validateMountPerfFlags(perfDirGiven bool, perfInterval time.Duration, perfMaxSamples int, perfCPUDuration time.Duration, perfCPUInterval time.Duration, perfHeapInterval time.Duration, perfIntervalGiven bool, perfMaxSamplesGiven bool, perfCPUDurationGiven bool, perfCPUIntervalGiven bool, perfHeapIntervalGiven bool, perfAddrGiven bool) error {
+func validateMountPerfFlags(perfDirGiven bool, perfInterval time.Duration, perfMaxSamples int, perfMaxSampleFiles int, perfMaxProfileFiles int, perfCPUDuration time.Duration, perfCPUInterval time.Duration, perfHeapInterval time.Duration, perfIntervalGiven bool, perfMaxSamplesGiven bool, perfMaxSampleFilesGiven bool, perfMaxProfileFilesGiven bool, perfCPUDurationGiven bool, perfCPUIntervalGiven bool, perfHeapIntervalGiven bool, perfAddrGiven bool) error {
 	if perfIntervalGiven && perfInterval <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-interval must be > 0")
 	}
 	if perfMaxSamplesGiven && perfMaxSamples <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-max-samples must be > 0")
+	}
+	if perfMaxSampleFilesGiven && perfMaxSampleFiles <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-max-sample-files must be > 0")
+	}
+	if perfMaxProfileFilesGiven && perfMaxProfileFiles <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-max-profile-files must be > 0")
 	}
 	if perfCPUDurationGiven && perfCPUDuration <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-cpu-duration must be > 0")
@@ -829,6 +841,8 @@ func validateMountPerfFlags(perfDirGiven bool, perfInterval time.Duration, perfM
 	}{
 		{"--perf-interval", perfIntervalGiven},
 		{"--perf-max-samples", perfMaxSamplesGiven},
+		{"--perf-max-sample-files", perfMaxSampleFilesGiven},
+		{"--perf-max-profile-files", perfMaxProfileFilesGiven},
 		{"--perf-cpu-duration", perfCPUDurationGiven},
 		{"--perf-cpu-interval", perfCPUIntervalGiven},
 		{"--perf-heap-interval", perfHeapIntervalGiven},
