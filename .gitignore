@@ -49,4 +49,5 @@ second_opinion*
 # E2E generated reports
 e2e/reports/
 third_party/pjdfstest/
+blackbox/cache/
 blackbox/results/
