@@ -54,6 +54,7 @@ type CommitEntry struct {
 	Mode                 uint32
 	HasMode              bool
 	CoalesceZeroTruncate bool
+	dispatched           bool
 	canceled             bool
 	cancelCommit         context.CancelFunc
 	cancelUpload         context.CancelFunc
@@ -207,6 +208,7 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 		cq.delayZeroTruncateLocked(entry)
 		return nil
 	}
+	entry.dispatched = true
 
 	// Send to workers while holding the lock. The channel buffer is always
 	// > maxPending, so this will not block as long as the backpressure
@@ -221,6 +223,13 @@ func (cq *CommitQueue) shouldDelayZeroTruncateLocked(entry *CommitEntry) bool {
 		return false
 	}
 	return cq.zeroTruncateDelay > 0
+}
+
+func (cq *CommitQueue) isDelayedLocked(entry *CommitEntry) bool {
+	if cq == nil || entry == nil || cq.delayed == nil {
+		return false
+	}
+	return cq.delayed[entry] != nil
 }
 
 func (cq *CommitQueue) delayZeroTruncateLocked(entry *CommitEntry) {
@@ -246,6 +255,7 @@ func (cq *CommitQueue) dispatchDelayed(entry *CommitEntry) {
 	if cq.stopped || entry.canceled {
 		return
 	}
+	entry.dispatched = true
 	cq.workCh <- entry
 }
 
@@ -270,6 +280,7 @@ func (cq *CommitQueue) forceDelayedPathLocked(path string) {
 		timer.Stop()
 		delete(cq.delayed, entry)
 		if !cq.stopped && !entry.canceled {
+			entry.dispatched = true
 			cq.workCh <- entry
 		}
 	}
@@ -286,6 +297,7 @@ func (cq *CommitQueue) forceDelayedPrefixLocked(prefix string) {
 		timer.Stop()
 		delete(cq.delayed, entry)
 		if !cq.stopped && !entry.canceled {
+			entry.dispatched = true
 			cq.workCh <- entry
 		}
 	}
@@ -299,6 +311,7 @@ func (cq *CommitQueue) forceAllDelayedLocked() {
 		timer.Stop()
 		delete(cq.delayed, entry)
 		if !cq.stopped && entry != nil && !entry.canceled {
+			entry.dispatched = true
 			cq.workCh <- entry
 		}
 	}
@@ -521,7 +534,7 @@ func (cq *CommitQueue) CancelQueuedZeroTruncatePreserveLocal(path string) bool {
 			remaining = append(remaining, entry)
 			continue
 		}
-		if isQueuedZeroTruncateEntry(entry) {
+		if isQueuedZeroTruncateEntry(entry) && cq.isDelayedLocked(entry) && !entry.dispatched {
 			entry.canceled = true
 			cq.stopDelayedLocked(entry)
 			continue

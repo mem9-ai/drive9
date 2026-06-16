@@ -2360,7 +2360,7 @@ func TestCommitQueueCancelPathJournalsCommitMarker(t *testing.T) {
 }
 
 func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t *testing.T) {
-	zero := &CommitEntry{Path: "/file.txt", Size: 0, Kind: PendingOverwrite}
+	zero := &CommitEntry{Path: "/file.txt", Size: 0, Kind: PendingOverwrite, CoalesceZeroTruncate: true}
 	nonzero := &CommitEntry{Path: "/other.txt", Size: 4, Kind: PendingOverwrite}
 	cq := &CommitQueue{
 		queue:        []*CommitEntry{zero, nonzero},
@@ -2368,6 +2368,7 @@ func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t 
 		inFlight:     map[string]*CommitEntry{},
 	}
 	cq.rebuildQueuedIndexLocked()
+	markCommitEntryDelayedForTest(t, cq, zero)
 
 	if !cq.CancelQueuedZeroTruncatePreserveLocal("/file.txt") {
 		t.Fatal("cancel queued zero truncate returned false")
@@ -2382,7 +2383,7 @@ func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t 
 		t.Fatal("non-zero queued entry was affected")
 	}
 
-	zero = &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite}
+	zero = &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite, CoalesceZeroTruncate: true}
 	samePathNonzero := &CommitEntry{Path: "/same.txt", Size: 4, Kind: PendingOverwrite}
 	cq = &CommitQueue{
 		queue:        []*CommitEntry{zero, samePathNonzero},
@@ -2390,6 +2391,7 @@ func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t 
 		inFlight:     map[string]*CommitEntry{},
 	}
 	cq.rebuildQueuedIndexLocked()
+	markCommitEntryDelayedForTest(t, cq, zero)
 
 	if cq.CancelQueuedZeroTruncatePreserveLocal("/same.txt") {
 		t.Fatal("cancel returned true while non-zero same-path entry remained queued")
@@ -2421,6 +2423,18 @@ func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t 
 	if !cq.HasPath("/busy.txt") {
 		t.Fatal("in-flight path disappeared")
 	}
+}
+
+func markCommitEntryDelayedForTest(t *testing.T, cq *CommitQueue, entry *CommitEntry) {
+	t.Helper()
+	if cq.delayed == nil {
+		cq.delayed = make(map[*CommitEntry]*time.Timer)
+	}
+	timer := time.NewTimer(time.Hour)
+	cq.delayed[entry] = timer
+	t.Cleanup(func() {
+		timer.Stop()
+	})
 }
 
 func TestCommitQueueDelayedZeroTruncateCancelNeverUploads(t *testing.T) {
@@ -2646,6 +2660,80 @@ func TestCommitQueueWaitPathForcesDelayedZeroTruncate(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("WaitPath did not return after forced delayed zero truncate")
+	}
+}
+
+func TestCommitQueueForcedDelayedZeroTruncateCannotBeCanceledBeforeInFlight(t *testing.T) {
+	uploadDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case uploadDone <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/force-cancel.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/force-cancel.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	lockAcquired := make(chan struct{})
+	releaseLock := make(chan struct{})
+	cq.PathLock = func(path string) func() {
+		if path == "/force-cancel.txt" {
+			close(lockAcquired)
+			<-releaseLock
+		}
+		return func() {}
+	}
+	defer cq.DrainAll()
+	entry := &CommitEntry{Path: "/force-cancel.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(entry); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		cq.WaitPath("/force-cancel.txt")
+		close(done)
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("forced delayed zero truncate did not reach worker path lock")
+	}
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/force-cancel.txt") {
+		t.Fatal("force-dispatched zero truncate was canceled before in-flight")
+	}
+	if entry.canceled {
+		t.Fatal("force-dispatched zero truncate was marked canceled")
+	}
+	close(releaseLock)
+	select {
+	case <-uploadDone:
+	case <-time.After(time.Second):
+		t.Fatal("force-dispatched zero truncate was not uploaded")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("WaitPath did not return after forced zero truncate upload")
 	}
 }
 

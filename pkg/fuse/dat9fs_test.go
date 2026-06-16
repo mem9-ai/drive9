@@ -10792,6 +10792,7 @@ func TestOpenTruncateCancelsQueuedPathTruncateWithoutCancelingInFlight(t *testin
 		inFlight:     map[string]*CommitEntry{},
 	}
 	fs.commitQueue.rebuildQueuedIndexLocked()
+	markCommitEntryDelayedForTest(t, fs.commitQueue, queued)
 
 	ino := fs.inodes.Lookup(path, false, 42, time.Now())
 	fs.inodes.UpdateRevision(ino, 7)
@@ -10872,6 +10873,7 @@ func TestOpenWritableCancelsQueuedPathTruncateWithoutOTruncFlag(t *testing.T) {
 		inFlight:     map[string]*CommitEntry{},
 	}
 	fs.commitQueue.rebuildQueuedIndexLocked()
+	markCommitEntryDelayedForTest(t, fs.commitQueue, queued)
 
 	ino := fs.inodes.Lookup(path, false, 0, time.Now())
 	fs.inodes.UpdateRevision(ino, 7)
