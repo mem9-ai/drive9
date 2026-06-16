@@ -1,0 +1,125 @@
+{
+  "groups": {
+    "functional": [
+      "ported.juicefs.*",
+      "drive9.workflow.git_fast_clone",
+      "drive9.workflow.git_blobless",
+      "drive9.workflow.git_worktree",
+      "drive9.workflow.auto_pack_profile",
+      "drive9.workflow.auto_pack_umount_path",
+      "drive9.workflow.portable_pack",
+      "drive9.workflow.pack_unpack_cli",
+      "drive9.workflow.pack_git_clone"
+    ],
+    "posix": [
+      "community.pjdfstest"
+    ],
+    "perf": [
+      "community.fio",
+      "community.mdtest",
+      "community.vdbench",
+      "git.official.perf",
+      "drive9.workflow.perf"
+    ]
+  },
+  "modules": {
+    "community.pjdfstest": {
+      "groups_by_preset": {
+        "smoke": [
+          "open",
+          "mkdir",
+          "unlink"
+        ],
+        "standard": [
+          "open",
+          "mkdir",
+          "rename",
+          "unlink",
+          "truncate",
+          "ftruncate",
+          "symlink",
+          "link",
+          "stat"
+        ],
+        "daily": "all"
+      }
+    },
+    "community.fio": {
+      "size": "128m"
+    },
+    "community.mdtest": {
+      "files": 1000
+    },
+    "community.fsx": {
+      "ops": 5000
+    },
+    "ported.juicefs.fsrand": {
+      "seed": 9,
+      "ops_by_preset": {
+        "smoke": 50,
+        "standard": 250,
+        "daily": 1000
+      }
+    },
+    "ported.juicefs.random_stress": {
+      "workers": 4,
+      "files_per_worker": 64
+    },
+    "ported.juicefs.random_rw": {
+      "size_bytes": 4194304,
+      "ops_by_preset": {
+        "smoke": 64,
+        "standard": 256,
+        "daily": 1024
+      }
+    },
+    "git.official.functional": {
+      "tests_by_preset": {
+        "smoke": [
+          "t0000-basic.sh",
+          "t0001-init.sh"
+        ],
+        "standard": [
+          "t0000-basic.sh",
+          "t0001-init.sh",
+          "t1300-config.sh",
+          "t1400-update-ref.sh",
+          "t1450-fsck.sh",
+          "t1500-rev-parse.sh",
+          "t2020-checkout-detach.sh",
+          "t3700-add.sh"
+        ],
+        "daily": [
+          "t0000-basic.sh",
+          "t0001-init.sh",
+          "t1300-config.sh",
+          "t1400-update-ref.sh",
+          "t1450-fsck.sh",
+          "t1500-rev-parse.sh",
+          "t2020-checkout-detach.sh",
+          "t3700-add.sh",
+          "t3903-stash.sh",
+          "t4013-diff-various.sh",
+          "t5601-clone.sh",
+          "t7500-commit-template-squash-signoff.sh"
+        ]
+      }
+    },
+    "git.official.perf": {
+      "tests": [
+        "p0001-rev-list.sh",
+        "p0002-read-cache.sh"
+      ]
+    },
+    "drive9.workflow.perf": {
+      "micro": {
+        "sequential_sizes_mib": [
+          1,
+          64,
+          512
+        ],
+        "sqlite_rows": 2000
+      }
+    }
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "known_xfail_groups": [],
+  "darwin_known_xfail_groups": [
+    "chflags",
+    "chmod",
+    "chown",
+    "open",
+    "truncate"
+  ],
+  "known_xfail_paths": []
+}

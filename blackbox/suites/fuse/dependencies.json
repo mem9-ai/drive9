@@ -1,0 +1,32 @@
+{
+  "community.pjdfstest": {
+    "name": "pjdfstest",
+    "source": "https://github.com/pjd/pjdfstest",
+    "license": "BSD-2-Clause",
+    "default_ref": "master"
+  },
+  "community.ltp.fs": {
+    "name": "Linux Test Project",
+    "source": "https://github.com/linux-test-project/ltp",
+    "license": "GPL-2.0-or-later",
+    "default_ref": "20240129"
+  },
+  "community.fsx": {
+    "name": "secfs.test fsx",
+    "source": "https://github.com/billziss-gh/secfs.test",
+    "license": "Apache-2.0",
+    "default_ref": "master"
+  },
+  "git.official.functional": {
+    "name": "Git upstream test suite",
+    "source": "https://github.com/git/git",
+    "license": "GPL-2.0-only",
+    "default_ref": "v2.46.2"
+  },
+  "ported.juicefs.*": {
+    "name": "JuiceFS-inspired tests",
+    "source": "https://github.com/juicedata/juicefs",
+    "license": "Apache-2.0",
+    "note": "The Drive9 blackbox modules are independent equivalent rewrites for generic filesystem behavior, not vendored JuiceFS test code."
+  }
+}

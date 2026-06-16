@@ -1,0 +1,140 @@
+name: blackbox
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/blackbox.yml"
+      - "blackbox/run.py"
+      - "blackbox/harness/**"
+      - "blackbox/suites/**"
+      - "cmd/**"
+      - "pkg/**"
+      - "internal/**"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/blackbox.yml"
+      - "blackbox/run.py"
+      - "blackbox/harness/**"
+      - "blackbox/suites/**"
+      - "cmd/**"
+      - "pkg/**"
+      - "internal/**"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+  schedule:
+    - cron: "27 20 * * *"
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: "Preset to run"
+        required: false
+        default: "daily"
+        type: choice
+        options:
+          - smoke
+          - standard
+          - daily
+      runs:
+        description: "Performance run count"
+        required: false
+        default: "3"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blackbox-${{ github.event_name == 'push' && 'main-post-merge' || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  BLACKBOX_SUITE: fuse
+  BLACKBOX_PRESET: ${{ github.event_name == 'pull_request' && 'smoke' || github.event_name == 'push' && 'standard' || github.event_name == 'schedule' && 'daily' || inputs.preset }}
+  BLACKBOX_RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '3' }}
+  BLACKBOX_STRICT: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+  PJDFSTEST_ALLOW_NONROOT: "1"
+  DRIVE9_LOCAL_EMBEDDING_MODE: none
+  DRIVE9_LOCAL_INIT_SCHEMA: "true"
+
+jobs:
+  blackbox:
+    name: blackbox (${{ env.BLACKBOX_SUITE }} / ${{ env.BLACKBOX_PRESET }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake build-essential fio fuse3 git libtool perl pkg-config python3-pip
+
+      - name: Cache blackbox dependencies
+        uses: actions/cache@v4
+        with:
+          path: blackbox/cache
+          key: blackbox-${{ env.BLACKBOX_SUITE }}-${{ runner.os }}-${{ hashFiles('blackbox/suites/**/dependencies.json') }}
+          restore-keys: |
+            blackbox-${{ env.BLACKBOX_SUITE }}-${{ runner.os }}-
+            blackbox-${{ runner.os }}-
+
+      - name: Prepare blackbox dependencies
+        if: env.BLACKBOX_PRESET != 'smoke'
+        run: make blackbox-deps BLACKBOX_SUITE="$BLACKBOX_SUITE" BLACKBOX_PRESET="$BLACKBOX_PRESET"
+
+      - name: Run blackbox preset
+        run: |
+          case "$BLACKBOX_PRESET" in
+            smoke)
+              make blackbox-smoke BLACKBOX_SUITE="$BLACKBOX_SUITE"
+              ;;
+            standard)
+              make blackbox-standard BLACKBOX_SUITE="$BLACKBOX_SUITE"
+              ;;
+            daily)
+              make blackbox-daily BLACKBOX_SUITE="$BLACKBOX_SUITE" BLACKBOX_RUNS="$BLACKBOX_RUNS"
+              ;;
+            *)
+              echo "unknown BLACKBOX_PRESET=$BLACKBOX_PRESET" >&2
+              exit 2
+              ;;
+          esac
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          latest="$(find "blackbox/results/$BLACKBOX_SUITE" -name daily-report.md -type f 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$latest" ]; then
+            cat "$latest" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No blackbox report produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload blackbox artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackbox-${{ env.BLACKBOX_SUITE }}-${{ env.BLACKBOX_PRESET }}
+          path: blackbox/results/${{ env.BLACKBOX_SUITE }}/**
+          if-no-files-found: warn
