@@ -33,7 +33,6 @@ type FileHandle struct {
 	Streamer           *StreamUploader // nil for small files / read-only; manages background part uploads
 	Prefetch           *Prefetcher     // nil for writable handles; sequential read prefetcher
 	ReadTarget         *client.ReadTarget
-	UnlinkedData       []byte      // snapshot for POSIX unlink/replace-open reads
 	WritePolicy        WritePolicy // per-handle remote durability policy chosen at open/create
 	GitWorkspaceID     string      // set for handles served by the git workspace layer
 	GitRelPath         string
@@ -46,6 +45,11 @@ type FileHandle struct {
 	PreviousMode       uint32 // mode before PendingMode was set (for rollback on flush failure)
 	HasPreviousMode    bool   // true when previous mode state was snapshotted
 	PreviousModeKnown  bool   // true when PreviousMode was authoritative
+	Unlinked           bool   // true after the directory entry was removed while this handle stayed open
+	UnlinkedSnapshot   bool   // true when UnlinkedData is an authoritative read snapshot
+	UnlinkedData       []byte // read-only snapshot for open-but-unlinked remote files
+	UnlinkedShadowGen  uint64 // generation pin for large open-unlink snapshots stored in ShadowStore
+	UnlinkedSize       int64
 	RemoteCommitUnlock func() // held same-path commit lock while local shadow state is reserved
 	mu                 sync.Mutex
 }
@@ -80,6 +84,10 @@ type DirEntry struct {
 	Revision   int64
 	AttrMode   uint32
 	HasMode    bool
+	Uid        uint32
+	Gid        uint32
+	HasUID     bool
+	HasGID     bool
 	IsDir      bool
 	ResourceID string
 	Nlink      uint32

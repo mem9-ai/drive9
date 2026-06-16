@@ -87,6 +87,42 @@ func TestInodeRemoveMappingDoesNotConsumeLink(t *testing.T) {
 	}
 }
 
+func TestInodeRenameOverwriteConsumesTargetLinkAndUpdatesCtime(t *testing.T) {
+	m := NewInodeToPath()
+	now := time.Now()
+	oldCtime := now.Add(-time.Hour)
+
+	srcIno := m.LookupWithIdentity("/src.txt", "file-src", 1, false, 10, now)
+	targetIno := m.LookupWithIdentity("/target.txt", "file-target", 2, false, 20, now)
+	aliasIno := m.LookupWithIdentity("/target-link.txt", "file-target", 2, false, 20, now)
+	if aliasIno != targetIno {
+		t.Fatalf("target aliases got different inodes: %d != %d", aliasIno, targetIno)
+	}
+	m.UpdateCtime(targetIno, oldCtime)
+
+	m.Rename("/src.txt", "/target.txt")
+
+	if _, ok := m.GetInode("/src.txt"); ok {
+		t.Fatal("source mapping survived rename")
+	}
+	if got, ok := m.GetInode("/target.txt"); !ok || got != srcIno {
+		t.Fatalf("target inode = %d/%v, want %d/true", got, ok, srcIno)
+	}
+	entry, ok := m.GetEntry(targetIno)
+	if !ok {
+		t.Fatal("replaced inode removed while alias remains")
+	}
+	if entry.Nlink != 1 {
+		t.Fatalf("replaced alias nlink = %d, want 1", entry.Nlink)
+	}
+	if !entry.Ctime.After(oldCtime) {
+		t.Fatalf("replaced alias ctime = %s, want after %s", entry.Ctime, oldCtime)
+	}
+	if _, ok := entry.Paths["/target-link.txt"]; !ok {
+		t.Fatalf("remaining alias path missing: %+v", entry.Paths)
+	}
+}
+
 func TestInodeSetIdentityLetsLaterLookupJoinExistingInode(t *testing.T) {
 	m := NewInodeToPath()
 	now := time.Now()
@@ -139,6 +175,16 @@ func TestFillAttrFileNlink(t *testing.T) {
 	fs.fillAttr(entry, &out)
 	if out.Nlink != 3 {
 		t.Fatalf("nlink = %d, want 3", out.Nlink)
+	}
+}
+
+func TestFillAttrDirNlink(t *testing.T) {
+	fs := &Dat9FS{uid: 1000, gid: 1000}
+	entry := &InodeEntry{Ino: 2, Path: "/dir", IsDir: true, Nlink: 4}
+	var out gofuse.Attr
+	fs.fillAttr(entry, &out)
+	if out.Nlink != 4 {
+		t.Fatalf("dir nlink = %d, want 4", out.Nlink)
 	}
 }
 

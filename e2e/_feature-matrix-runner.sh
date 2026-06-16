@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Internal Drive9 feature-matrix runner.
 #
-# Public entrypoints are posix-feature-matrix.sh and git-feature-matrix.sh.
+# Public entrypoints are pjdfstest-suite.sh, posix-feature-matrix.sh, and
+# git-feature-matrix.sh.
 # Keep this file shared so the two live E2E matrices use the same provisioning,
 # FUSE, CLI, and reporting machinery without exposing a combined runner.
 #
@@ -39,6 +40,7 @@ PJDFSTEST_TESTS="${PJDFSTEST_TESTS:-}"
 PJDFSTEST_BIN="${PJDFSTEST_BIN:-}"
 PJDFSTEST_TIMEOUT_S="${PJDFSTEST_TIMEOUT_S:-900}"
 PJDFSTEST_ALLOW_NONROOT="${PJDFSTEST_ALLOW_NONROOT:-0}"
+PJDFSTEST_MOUNT_ALLOW_OTHER="${PJDFSTEST_MOUNT_ALLOW_OTHER:-auto}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -50,6 +52,16 @@ REPORT_PATH=""
 CLI_BIN=""
 API_KEY=""
 MOUNT_POINTS=()
+
+if [ "$(uname -s)" = "Darwin" ] && ! command -v mount_macfuse >/dev/null 2>&1 && ! command -v mount_fusefs >/dev/null 2>&1; then
+  for macfuse_dir in "/Library/Filesystems/macfuse.fs/Contents/Resources" "/usr/local/bin" "/opt/homebrew/bin"; do
+    if [ -x "$macfuse_dir/mount_macfuse" ] || [ -x "$macfuse_dir/mount_fusefs" ]; then
+      PATH="$macfuse_dir:$PATH"
+      export PATH
+      break
+    fi
+  done
+fi
 
 sanitize_tsv_field() {
   printf '%s' "$1" | tr '\t\r\n' '   ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//' | cut -c 1-1200
@@ -430,6 +442,8 @@ order = []
 current = None
 file_start_re = re.compile(r"^(?P<path>\S+/tests/(?P<rel>[^ ]+?\.t))\s+\.*\s*$")
 plan_re = re.compile(r"^1\.\.(\d+)\s*$")
+not_ok_re = re.compile(r"^not ok\s+\d+(?:\b|\s|$)", re.IGNORECASE)
+todo_re = re.compile(r"#\s*TODO\b", re.IGNORECASE)
 failed_file_re = re.compile(r"^\S+/tests/(?P<rel>[^ ]+?\.t)\s+\(Wstat:\s*\d+\s+Tests:\s*(?P<tests>\d+)\s+Failed:\s*(?P<failed>\d+)\)")
 
 for line in text.splitlines():
@@ -457,7 +471,7 @@ for line in text.splitlines():
 
 failed_cases = sum(failed for _, failed in failed_files.values())
 if status != "PASS" and failed_cases == 0:
-    failed_cases = sum(1 for line in text.splitlines() if re.match(r"^not ok\s+\d+(?:\b|\s|$)", line))
+    failed_cases = sum(1 for line in text.splitlines() if not_ok_re.match(line) and not todo_re.search(line))
 if total_cases is None:
     total_cases = sum(plans.values())
 if status == "PASS":
@@ -466,7 +480,7 @@ passed_cases = max(total_cases - failed_cases, 0)
 
 if total_files is None:
     total_files = len(order)
-failed_file_count = len(failed_files) if status != "PASS" else 0
+failed_file_count = sum(1 for _, failed in failed_files.values() if failed > 0) if status != "PASS" else 0
 passed_file_count = max(total_files - failed_file_count, 0)
 
 summary = {
@@ -624,7 +638,7 @@ stop_mount() {
   local umount_rc=0
   set +e
   if [ -n "$mount_point" ] && is_mounted "$mount_point"; then
-    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$mount_point" >/dev/null 2>&1
+    env "DRIVE9_SERVER=$BASE" "DRIVE9_API_KEY=$API_KEY" "$CLI_BIN" umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$mount_point" >/dev/null 2>&1
     umount_rc=$?
     wait_mount_state "$mount_point" unmounted >/dev/null 2>&1 || true
     if is_mounted "$mount_point"; then
@@ -634,6 +648,25 @@ stop_mount() {
   fi
   set -e
   return "$umount_rc"
+}
+
+pjdfstest_mount_args() {
+  local mount_point="$1"
+  local allow_other="$PJDFSTEST_MOUNT_ALLOW_OTHER"
+  local args=(--mode=fuse --durability=write-sync)
+
+  if [ "$allow_other" = "auto" ]; then
+    case "$(uname -s)" in
+      Linux) allow_other=1 ;;
+      Darwin) allow_other=0 ;;
+      *) allow_other=0 ;;
+    esac
+  fi
+  if [ "$allow_other" = "1" ]; then
+    args+=(--allow-other)
+  fi
+  args+=(":/" "$mount_point")
+  printf '%s\n' "${args[@]}"
 }
 
 wait_file_content() {
@@ -1214,7 +1247,7 @@ main() {
 
   case "$FEATURE_MATRIX_SUITE" in
     posix|git) ;;
-    *) fail_fast "Prerequisites" "FEATURE_MATRIX_SUITE valid" "got ${FEATURE_MATRIX_SUITE:-<empty>}, want posix|git; use e2e/posix-feature-matrix.sh or e2e/git-feature-matrix.sh" ;;
+    *) fail_fast "Prerequisites" "FEATURE_MATRIX_SUITE valid" "got ${FEATURE_MATRIX_SUITE:-<empty>}, want posix|git; use e2e/pjdfstest-suite.sh or e2e/git-feature-matrix.sh" ;;
   esac
 
   echo "=== drive9 $FEATURE_MATRIX_SUITE feature matrix ==="
@@ -1309,6 +1342,15 @@ main() {
       return
     fi
   fi
+  if [ "$(uname -s)" = "Darwin" ]; then
+    if ! command -v mount_macfuse >/dev/null 2>&1 && ! command -v mount_fusefs >/dev/null 2>&1; then
+      record_fuse_prereq_skips "macFUSE/FUSE-T mount helper missing"
+      if [ "$FUSE_STRICT_PREREQS" = "1" ] || [ "$FEATURE_MATRIX_STRICT_ALL" = "1" ]; then
+        exit 1
+      fi
+      return
+    fi
+  fi
   record "PASS" "Prerequisites" "FUSE host prerequisites" "ok"
 
   if [ "$FEATURE_MATRIX_SUITE" != "git" ]; then
@@ -1317,7 +1359,11 @@ main() {
 
   local rw_mount="$RUN_ROOT/mount-rw"
   local rw_log="$RUN_ROOT/mount-rw.log"
-  if start_mount "$rw_mount" "$rw_log" --mode=fuse --durability=write-sync ":/" "$rw_mount"; then
+  local mount_args=()
+  while IFS= read -r arg; do
+    mount_args+=("$arg")
+  done < <(pjdfstest_mount_args "$rw_mount")
+  if start_mount "$rw_mount" "$rw_log" "${mount_args[@]}"; then
     :
   else
     record "FAIL" "pjdfstest" "pjdfstest setup mount" "rw mount failed; see $rw_log"

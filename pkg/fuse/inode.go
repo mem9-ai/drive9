@@ -16,10 +16,18 @@ type InodeEntry struct {
 	IsDir      bool
 	Nlookup    int64 // kernel lookup reference count
 	Size       int64
+	Atime      time.Time
 	Mtime      time.Time
+	Ctime      time.Time
+	Uid        uint32
+	Gid        uint32
+	HasUID     bool
+	HasGID     bool
 	Mode       uint32 // permission bits
 	HasMode    bool   // true when mode is explicitly known (including 0)
-	Revision   int64  // server-side revision for cache validation
+	Rdev       uint32
+	Revision   int64 // server-side revision for cache validation
+	Unlinked   bool  // path was removed while open handles still reference this inode
 }
 
 // InodeToPath provides a bidirectional mapping between inode numbers and
@@ -234,19 +242,12 @@ func (m *InodeToPath) GetEntry(ino uint64) (*InodeEntry, bool) {
 	if !ok {
 		return nil, false
 	}
-	cp := *entry
-	if entry.Paths != nil {
-		cp.Paths = make(map[string]struct{}, len(entry.Paths))
-		for p := range entry.Paths {
-			cp.Paths[p] = struct{}{}
-		}
-	}
-	return &cp, true
+	return copyInodeEntryLocked(entry), true
 }
 
-// Forget decrements the Nlookup count for the given inode by nlookup. If the
-// resulting Nlookup is less than or equal to zero and the inode is not the
-// root (inode 1), the entry is removed from both maps.
+// Forget decrements the Nlookup count for the given inode by nlookup. Some
+// visible mappings are retained after lookup refs drop so later lookups can
+// preserve POSIX inode identity and local owner metadata across rename.
 func (m *InodeToPath) Forget(ino uint64, nlookup uint64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -258,14 +259,25 @@ func (m *InodeToPath) Forget(ino uint64, nlookup uint64) {
 
 	entry.Nlookup -= int64(nlookup)
 	if entry.Nlookup <= 0 && ino != 1 {
-		if entry.IsDir {
-			// Preserve directory inode->path mappings after lookup refs drop.
-			// Later mkdir/rename/rmdir calls can still reference the inode.
+		if shouldKeepForgetMapping(entry) {
 			entry.Nlookup = 0
 			return
 		}
 		m.removeEntryLocked(ino, entry)
 	}
+}
+
+func shouldKeepForgetMapping(entry *InodeEntry) bool {
+	if entry == nil {
+		return false
+	}
+	if entry.IsDir || entry.ResourceID != "" {
+		return true
+	}
+	if entry.HasUID || entry.HasGID {
+		return true
+	}
+	return entryIsMetadataOnlySpecial(entry)
 }
 
 // ForgetKeepMapping decrements the kernel lookup count without removing the
@@ -314,7 +326,26 @@ func (m *InodeToPath) AddAlias(ino uint64, path, resourceID string, nlink uint32
 		return false
 	}
 	if replaced, exists := m.byPath[path]; exists && replaced != ino {
-		m.removePathLocked(path, false)
+		m.removePathLocked(path, false, false)
+	}
+	m.addPathLocked(entry, path)
+	entry.Path = path
+	entry.Nlookup++
+	m.updateEntryLocked(entry, path, resourceID, nlink, isDir, size, mtime)
+	return true
+}
+
+// AddAliasIfAbsent maps path to an existing inode only when path is still free.
+func (m *InodeToPath) AddAliasIfAbsent(ino uint64, path, resourceID string, nlink uint32, isDir bool, size int64, mtime time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.byPath[path]; exists {
+		return false
+	}
+	entry, ok := m.byInode[ino]
+	if !ok {
+		return false
 	}
 	m.addPathLocked(entry, path)
 	entry.Path = path
@@ -351,6 +382,27 @@ func (m *InodeToPath) UpdateLinkCount(ino uint64, nlink uint32) {
 	}
 }
 
+// AdjustLinkCount atomically adjusts the known link count for an inode.
+func (m *InodeToPath) AdjustLinkCount(ino uint64, delta int32) (*InodeEntry, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	entry, ok := m.byInode[ino]
+	if !ok || !entry.IsDir {
+		return nil, false
+	}
+	nlink := entry.Nlink
+	if nlink == 0 {
+		nlink = 2
+	}
+	next := int64(nlink) + int64(delta)
+	if next < 2 {
+		next = 2
+	}
+	entry.Nlink = uint32(next)
+	return copyInodeEntryLocked(entry), true
+}
+
 // UpdateSize updates the size of the entry identified by the given inode.
 func (m *InodeToPath) UpdateSize(ino uint64, size int64) {
 	m.mu.Lock()
@@ -371,6 +423,43 @@ func (m *InodeToPath) UpdateMtime(ino uint64, mtime time.Time) {
 	}
 }
 
+// UpdateAtime updates the atime of the entry identified by the given inode.
+func (m *InodeToPath) UpdateAtime(ino uint64, atime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Atime = atime
+	}
+}
+
+// UpdateCtime updates the ctime of the entry identified by the given inode.
+func (m *InodeToPath) UpdateCtime(ino uint64, ctime time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Ctime = ctime
+	}
+}
+
+// UpdateOwner updates the uid/gid of the entry identified by the given inode.
+func (m *InodeToPath) UpdateOwner(ino uint64, uid, gid uint32, hasUID, hasGID bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		if hasUID {
+			entry.Uid = uid
+			entry.HasUID = true
+		}
+		if hasGID {
+			entry.Gid = gid
+			entry.HasGID = true
+		}
+	}
+}
+
 // UpdateRevision updates the server revision of the entry identified by ino.
 func (m *InodeToPath) UpdateRevision(ino uint64, revision int64) {
 	m.mu.Lock()
@@ -384,6 +473,16 @@ func (m *InodeToPath) UpdateRevision(ino uint64, revision int64) {
 // UpdateMode updates the permission bits of the entry identified by ino.
 func (m *InodeToPath) UpdateMode(ino uint64, mode uint32) {
 	m.SetModeState(ino, mode, true)
+}
+
+// UpdateRdev updates the device number of the entry identified by ino.
+func (m *InodeToPath) UpdateRdev(ino uint64, rdev uint32) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if entry, ok := m.byInode[ino]; ok {
+		entry.Rdev = rdev
+	}
 }
 
 // SetModeState updates both permission bits and whether they are authoritative.
@@ -414,7 +513,7 @@ func (m *InodeToPath) Rename(oldPath, newPath string) {
 	// Update the entry itself.
 	delete(m.byPath, oldPath)
 	if replacedIno, ok := m.byPath[newPath]; ok && replacedIno != ino {
-		m.removePathLocked(newPath, false)
+		m.removePathLocked(newPath, true, true)
 	}
 	m.byPath[newPath] = ino
 	if entry.Paths == nil {
@@ -479,7 +578,7 @@ func (m *InodeToPath) Remove(path string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.removePathLocked(path, false)
+	m.removePathLocked(path, false, false)
 }
 
 // RemoveLink removes one path mapping for a successful unlink-like operation.
@@ -487,7 +586,16 @@ func (m *InodeToPath) RemoveLink(path string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.removePathLocked(path, true)
+	m.removePathLocked(path, true, false)
+}
+
+// RemoveLinkPreserve removes one visible path mapping while preserving the
+// inode entry if this was the last link and an open file handle still needs it.
+func (m *InodeToPath) RemoveLinkPreserve(path string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	m.removePathLocked(path, true, true)
 }
 
 func inodeResourceKey(resourceID string, isDir bool) string {
@@ -549,7 +657,7 @@ func (m *InodeToPath) removeEntryLocked(ino uint64, entry *InodeEntry) {
 	delete(m.byInode, ino)
 }
 
-func (m *InodeToPath) removePathLocked(path string, consumeLink bool) {
+func (m *InodeToPath) removePathLocked(path string, consumeLink bool, preserveIfLast bool) {
 	ino, ok := m.byPath[path]
 	if !ok {
 		return
@@ -561,8 +669,13 @@ func (m *InodeToPath) removePathLocked(path string, consumeLink bool) {
 	}
 	delete(m.byPath, path)
 	delete(entry.Paths, path)
-	if consumeLink && !entry.IsDir && entry.Nlink > 1 {
-		entry.Nlink--
+	if consumeLink && !entry.IsDir {
+		if entry.Nlink > 1 {
+			entry.Nlink--
+		} else if preserveIfLast {
+			entry.Nlink = 0
+		}
+		entry.Ctime = time.Now()
 	}
 	if entry.Path == path {
 		entry.Path = ""
@@ -572,6 +685,25 @@ func (m *InodeToPath) removePathLocked(path string, consumeLink bool) {
 		}
 	}
 	if entry.Path == "" && len(entry.Paths) == 0 {
+		if preserveIfLast && !entry.IsDir {
+			entry.Path = path
+			entry.Unlinked = true
+			entry.Nlink = 0
+			return
+		}
 		m.removeEntryLocked(ino, entry)
+		return
 	}
+	entry.Unlinked = false
+}
+
+func copyInodeEntryLocked(entry *InodeEntry) *InodeEntry {
+	cp := *entry
+	if entry.Paths != nil {
+		cp.Paths = make(map[string]struct{}, len(entry.Paths))
+		for p := range entry.Paths {
+			cp.Paths[p] = struct{}{}
+		}
+	}
+	return &cp
 }

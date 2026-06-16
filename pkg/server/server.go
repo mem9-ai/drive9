@@ -107,6 +107,7 @@ type Server struct {
 	forkWorkerWG        sync.WaitGroup
 	forkWorkerMu        sync.Mutex
 	forkWorkerClosed    bool
+	schemaInitErrors    sync.Map
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -1005,20 +1006,38 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          string(resolved.Tenant.Status),
-		Message:         tenantStatusMessage(&resolved.Tenant),
+		Message:         s.tenantStatusMessage(&resolved.Tenant),
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})
 }
 
-func tenantStatusMessage(t *meta.Tenant) string {
+func (s *Server) tenantStatusMessage(t *meta.Tenant) string {
 	if t == nil {
 		return ""
 	}
 	if t.Kind == meta.TenantKindFork && t.Status == meta.TenantProvisioning {
 		return forkProvisioningMessage(t)
 	}
+	if s != nil && (t.Status == meta.TenantProvisioning || t.Status == meta.TenantFailed) {
+		if value, ok := s.schemaInitErrors.Load(t.ID); ok {
+			if msg, ok := value.(string); ok && msg != "" {
+				return "schema init error: " + msg
+			}
+		}
+	}
 	return ""
+}
+
+func schemaInitStatusErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	if len(msg) > 500 {
+		return msg[:500] + "..."
+	}
+	return msg
 }
 
 func backendFromRequest(r *http.Request) *backend.Dat9Backend {
@@ -3837,6 +3856,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		default:
 		}
 		if err := schemaInit(ctx, tenantDSN); err == nil {
+			s.schemaInitErrors.Delete(tenantID)
 			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_ok", "tenant_id", tenantID, "provider", provider, "attempt", attempt)...)
 			if s.metrics != nil {
 				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "ok")
@@ -3852,6 +3872,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			}
 			return
 		} else {
+			s.schemaInitErrors.Store(tenantID, schemaInitStatusErrorMessage(err))
 			logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", err)...)
 			if s.metrics != nil {
 				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "error")

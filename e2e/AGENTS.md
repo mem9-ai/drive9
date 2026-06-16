@@ -435,10 +435,11 @@ developer machines or EC2-style validation rather than the default smoke path.
 These are not part of the normal E2E smoke entry points. Run them only when a
 task explicitly asks for a broad compatibility matrix or Git feature matrix.
 They use the same live endpoint conventions as the smoke scripts and mount real
-FUSE. `posix-feature-matrix.sh` uses pjdfstest as the sole POSIX compatibility
-baseline; setup/provisioning is only test harness plumbing and is not counted
-as POSIX feature coverage. `git-feature-matrix.sh` generates a local bare Git
-remote fixture for deterministic Git coverage. Reports are written to
+FUSE. `pjdfstest-suite.sh` uses pjdfstest as the sole POSIX compatibility
+baseline; `posix-feature-matrix.sh` is a compatibility alias for that suite.
+Setup/provisioning is only test harness plumbing and is not counted as POSIX
+feature coverage. `git-feature-matrix.sh` generates a local bare Git remote
+fixture for deterministic Git coverage. Reports are written to
 `$FEATURE_MATRIX_REPORT_DIR/<report-name>-<timestamp>.md`; by default that is a
 flat path such as `e2e/reports/posix-feature-report-<timestamp>.md` or
 `e2e/reports/git-feature-report-<timestamp>.md`. If
@@ -587,11 +588,12 @@ enabled.
 | `GIT_WORKSPACE_HYDRATE` | `sync` | `git-workspace-smoke-test.sh` |
 | `FEATURE_MATRIX_REPORT_DIR` | `e2e/reports` | on-demand matrix scripts |
 | `FEATURE_MATRIX_STRICT_ALL` | `0` | on-demand matrix scripts |
-| `PJDFSTEST_DIR` | - | on-demand `posix-feature-matrix.sh` |
-| `PJDFSTEST_TESTS` | - | on-demand `posix-feature-matrix.sh` |
-| `PJDFSTEST_BIN` | auto-detected from `PJDFSTEST_DIR` or `PATH` | on-demand `posix-feature-matrix.sh` |
-| `PJDFSTEST_TIMEOUT_S` | `900` | on-demand `posix-feature-matrix.sh` |
-| `PJDFSTEST_ALLOW_NONROOT` | `0` | on-demand `posix-feature-matrix.sh` |
+| `PJDFSTEST_DIR` | - | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
+| `PJDFSTEST_TESTS` | - | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
+| `PJDFSTEST_BIN` | auto-detected from `PJDFSTEST_DIR` or `PATH` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
+| `PJDFSTEST_TIMEOUT_S` | `900` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
+| `PJDFSTEST_ALLOW_NONROOT` | `0` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
+| `PJDFSTEST_MOUNT_ALLOW_OTHER` | `auto` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh`; Linux auto-adds `--allow-other`, Darwin does not |
 | `GIT_MATRIX_TIMEOUT_S` | `240` | on-demand `git-feature-matrix.sh` |
 | `GIT_MATRIX_RUN_OVERSIZED` | `1` | on-demand `git-feature-matrix.sh` |
 

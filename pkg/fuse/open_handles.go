@@ -51,6 +51,25 @@ func (idx *OpenHandleIndex) Remove(fh *FileHandle) {
 	}
 }
 
+// UnlinkPath detaches currently open handles from a removed directory entry's
+// path while preserving inode-indexed lookup for fd lifetime operations.
+func (idx *OpenHandleIndex) UnlinkPath(p string) {
+	if idx == nil || p == "" {
+		return
+	}
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	handles := idx.byPath[p]
+	if len(handles) == 0 {
+		return
+	}
+	for fh := range handles {
+		delete(idx.pathByHandle, fh)
+	}
+	delete(idx.byPath, p)
+}
+
 // Has reports whether any open handle matches ino or p.
 // When both are supplied this intentionally uses OR semantics to preserve the
 // old conservative inode/path checks from the pre-index table scan.

@@ -92,22 +92,30 @@ func (c *LocalS3Client) handleGetObject(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if startByte >= 0 {
-		// Read the full object then slice — simple and correct for local mock.
-		data, err := io.ReadAll(rc)
+		seeker, ok := rc.(io.Seeker)
+		if !ok {
+			http.Error(w, "local object is not seekable", http.StatusInternalServerError)
+			return
+		}
+		totalSize, err := seeker.Seek(0, io.SeekEnd)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if startByte >= int64(len(data)) {
+		if startByte >= totalSize {
 			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
 			return
 		}
-		if endByte >= int64(len(data)) {
-			endByte = int64(len(data)) - 1
+		if endByte >= totalSize {
+			endByte = totalSize - 1
 		}
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", startByte, endByte, len(data)))
+		if _, err := seeker.Seek(startByte, io.SeekStart); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", startByte, endByte, totalSize))
 		w.WriteHeader(http.StatusPartialContent)
-		_, _ = w.Write(data[startByte : endByte+1])
+		_, _ = io.CopyN(w, rc, endByte-startByte+1)
 		return
 	}
 

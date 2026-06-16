@@ -112,7 +112,7 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		Kind:        kind,
 		BaseRev:     baseRev,
 		ShadowSpill: shadowSpill,
-		Mode:        mode & 0o777,
+		Mode:        mode & posixPermissionModeMask,
 		HasMode:     hasMode,
 	}
 
@@ -334,7 +334,7 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 		return nil
 	}
 	updated := *meta
-	updated.Mode = mode & 0o777
+	updated.Mode = mode & posixPermissionModeMask
 	updated.HasMode = true
 	updated.Generation = idx.nextGen.Add(1)
 

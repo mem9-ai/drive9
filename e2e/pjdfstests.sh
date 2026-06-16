@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Backward-compatible POSIX-only entrypoint. Prefer pjdfstest-suite.sh when
-# explicitly running the pjdfstest POSIX compatibility suite.
+# Compatibility alias for the pjdfstest POSIX suite.
 
 set -euo pipefail
 
