@@ -10365,6 +10365,85 @@ func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
 	}
 }
 
+func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T) {
+	const callerPID = 6161
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   8,
+		queue:        []*CommitEntry{},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+		workCh:       make(chan *CommitEntry, 16),
+	}
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1, Caller: gofuse.Caller{Pid: callerPID}},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+	}, "created.bin", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created file handle missing")
+	}
+	if fh.OpenPID != callerPID {
+		t.Fatalf("created file handle OpenPID = %d, want %d", fh.OpenPID, callerPID)
+	}
+
+	oldData := bytes.Repeat([]byte{0x41}, 64*1024)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, oldData); st != gofuse.OK {
+		t.Fatalf("Write old data status = %v, want OK", st)
+	}
+
+	var attrOut gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId, Caller: gofuse.Caller{Pid: callerPID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if !fh.ZeroBase {
+		t.Fatal("created same-caller writer did not adopt zero base")
+	}
+	if got := fh.Dirty.Size(); got != 0 {
+		t.Fatalf("dirty size after staged truncate = %d, want 0", got)
+	}
+	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+		t.Fatalf("dirty truncate not marked: dirtySeq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+
+	gotShadow, err := shadow.ReadAll("/created.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotShadow) != 0 {
+		t.Fatalf("shadow content after staged truncate len=%d, want 0", len(gotShadow))
+	}
+}
+
 func TestSetAttr_WriteBackPathTruncateSkipsDefaultInheritedMode(t *testing.T) {
 	fs, shadow, pending := newWriteBackPathTruncateModeTestFS(t)
 
