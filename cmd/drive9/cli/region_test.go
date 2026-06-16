@@ -66,10 +66,10 @@ func TestRegionListTextAndJSON(t *testing.T) {
 	if len(regions) != 2 {
 		t.Fatalf("json regions len = %d, want 2\n%s", len(regions), jsonOut)
 	}
-	if regions[0].RegionCode != "ali-ap-southeast-1" || regions[0].Mode != RegionModeTiDBCloudNative || regions[0].ModeLabel != "TiDBCloud" || regions[0].ServerURL != "https://native-sg.example" {
+	if regions[0].RegionCode != "ali-ap-southeast-1" || regions[0].Mode != "TiDBCloud" || regions[0].ServerURL != "https://native-sg.example" {
 		t.Fatalf("json region[0] = %#v", regions[0])
 	}
-	if regions[1].RegionCode != "aws-us-east-1" || regions[1].Mode != RegionModeTiDBCloudStarter || regions[1].ModeLabel != "Anonymous" || regions[1].ServerURL != "https://api.drive9.ai" {
+	if regions[1].RegionCode != "aws-us-east-1" || regions[1].Mode != "Anonymous" || regions[1].ServerURL != "https://api.drive9.ai" {
 		t.Fatalf("json region[1] = %#v", regions[1])
 	}
 }
@@ -126,7 +126,7 @@ func TestRegionListJSONFallsBackWhenManifestUnavailable(t *testing.T) {
 		t.Fatalf("fallback regions len = %d, want 1", len(regions))
 	}
 	entry := regions[0]
-	if entry.RegionCode != "aws-ap-southeast-1" || entry.Mode != RegionModeTiDBCloudStarter || entry.ModeLabel != "Anonymous" || entry.ServerURL != defaultServerURL {
+	if entry.RegionCode != "aws-ap-southeast-1" || entry.Mode != "Anonymous" || entry.ServerURL != defaultServerURL {
 		t.Fatalf("fallback region = %#v", entry)
 	}
 }

@@ -61,7 +61,6 @@ type RegionManifestEntry struct {
 type regionListOutputEntry struct {
 	RegionCode    string            `json:"region_code"`
 	Mode          string            `json:"mode"`
-	ModeLabel     string            `json:"mode_label"`
 	ServerURL     string            `json:"server_url"`
 	CloudProvider string            `json:"cloud_provider,omitempty"`
 	TiDBRegion    string            `json:"tidb_region,omitempty"`
@@ -133,8 +132,7 @@ func regionListOutput(entries []RegionManifestEntry) []regionListOutputEntry {
 	for _, entry := range entries {
 		out = append(out, regionListOutputEntry{
 			RegionCode:    entry.RegionCode,
-			Mode:          entry.Mode,
-			ModeLabel:     regionModeLabel(entry.Mode),
+			Mode:          regionModeLabel(entry.Mode),
 			ServerURL:     entry.ServerURL,
 			CloudProvider: entry.CloudProvider,
 			TiDBRegion:    entry.TiDBRegion,
