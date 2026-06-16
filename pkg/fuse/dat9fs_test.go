@@ -10367,9 +10367,27 @@ func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
 
 func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T) {
 	const callerPID = 6161
+	var createCalls atomic.Int32
+	var putCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/created.bin" && r.URL.RawQuery == "create=1":
+			createCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			http.Error(w, "unexpected PUT", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
 	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
 	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -10393,6 +10411,7 @@ func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T
 	st := fs.Create(nil, &gofuse.CreateIn{
 		InHeader: gofuse.InHeader{NodeId: 1, Caller: gofuse.Caller{Pid: callerPID}},
 		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     defaultRegularFileMode,
 	}, "created.bin", &createOut)
 	if st != gofuse.OK {
 		t.Fatalf("Create status = %v, want OK", st)
@@ -10434,6 +10453,20 @@ func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T
 	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
 		t.Fatalf("dirty truncate not marked: dirtySeq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
 	}
+	if fs.commitQueue.HasPath("/created.bin") {
+		t.Fatal("created truncate queued invalid path overwrite commit")
+	}
+	if meta, ok := pending.GetMeta("/created.bin"); ok {
+		t.Fatalf("pending meta after created truncate = %+v, want no path-level overwrite", meta)
+	}
+
+	fh.Lock()
+	kind := fs.pendingKindForHandle(fh)
+	baseRev := fs.expectedRevisionForHandleLocked(fh)
+	fh.Unlock()
+	if kind != PendingNew || baseRev != 0 {
+		t.Fatalf("created truncate handle commit state = kind %v baseRev %d, want PendingNew baseRev 0", kind, baseRev)
+	}
 
 	gotShadow, err := shadow.ReadAll("/created.bin")
 	if err != nil {
@@ -10441,6 +10474,20 @@ func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T
 	}
 	if len(gotShadow) != 0 {
 		t.Fatalf("shadow content after staged truncate len=%d, want 0", len(gotShadow))
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("remote empty create calls = %d, want 1", got)
+	}
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("remote PUT calls = %d, want 0", got)
+	}
+	if pending.HasPending("/created.bin") {
+		t.Fatal("pending state remains after release")
+	}
+	if shadow.Has("/created.bin") {
+		t.Fatal("shadow remains after release")
 	}
 }
 
