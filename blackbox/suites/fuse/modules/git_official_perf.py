@@ -4,7 +4,7 @@ import os
 import shutil
 from typing import Any
 
-from ..core import Context, DependencyUnavailable, summarize
+from harness.core import Context, DependencyUnavailable, summarize
 from .base import BaseModule, module_config, timeit
 
 

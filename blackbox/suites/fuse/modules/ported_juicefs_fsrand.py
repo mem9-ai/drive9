@@ -4,7 +4,7 @@ import random
 from pathlib import Path
 from typing import Any
 
-from ..core import BlackboxError, Context, ensure_empty, sha256_file, stable_bytes
+from harness.core import BlackboxError, Context, ensure_empty, sha256_file, stable_bytes
 from .base import BaseModule, module_config
 
 

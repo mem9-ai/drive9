@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from ..core import BlackboxError, Context
+from harness.core import BlackboxError, Context
 from .base import BaseModule, module_config
 
 

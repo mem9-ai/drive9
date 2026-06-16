@@ -14,6 +14,7 @@ blackbox/
     fuse/                FUSE presets, module config, repos, allowlists
       README.md          FUSE suite usage notes
       NOTICE.md          FUSE suite notices for external test suites
+      modules/           FUSE module implementations and registry
 ```
 
 ## Commands
@@ -41,8 +42,9 @@ presets.json
 modules.json
 ```
 
-Then add or reuse modules under `blackbox/harness/modules/`, register them in
-`blackbox/harness/modules/registry.py`, and select them from the suite presets.
+Then add or reuse modules under `blackbox/suites/<suite>/modules/`, register
+them in `blackbox/suites/<suite>/modules/registry.py`, and select them from the
+suite presets.
 
 Suite-specific capability checks should live in modules or target helpers, not
 as global runner prerequisites. This keeps CLI/API modules from being blocked by

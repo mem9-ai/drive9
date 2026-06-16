@@ -6,7 +6,7 @@ import re
 import shutil
 from typing import Any
 
-from ..core import BlackboxError, Context, DependencyUnavailable, ModuleSkip, write_json
+from harness.core import BlackboxError, Context, DependencyUnavailable, ModuleSkip, write_json
 from .base import BaseModule, module_config, read_text
 
 

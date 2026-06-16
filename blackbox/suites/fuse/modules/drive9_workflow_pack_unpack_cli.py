@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core import BlackboxError, Context
+from harness.core import BlackboxError, Context
 from .drive9_workflow_base import Drive9WorkflowBase
 
 

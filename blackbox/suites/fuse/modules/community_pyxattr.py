@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core import BlackboxError, Context, ModuleSkip, ModuleXFail
+from harness.core import BlackboxError, Context, ModuleSkip, ModuleXFail
 from .base import BaseModule
 
 

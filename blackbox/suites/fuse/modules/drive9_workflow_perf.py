@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from ..core import Context, ensure_empty, env_flag, env_value, stable_bytes
+from harness.core import Context, ensure_empty, env_flag, env_value, stable_bytes
 from .base import module_config, timeit
 from .drive9_workflow_base import Drive9WorkflowBase
 

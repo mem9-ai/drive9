@@ -27,7 +27,7 @@ always Drive9 FUSE unless a module explicitly documents otherwise.
 
 ## Directory Layout
 
-Module code is intentionally split by file under `blackbox/harness/modules/`:
+Module code is intentionally split by file under `blackbox/suites/fuse/modules/`:
 
 ```text
 blackbox/
@@ -37,26 +37,26 @@ blackbox/
     target.py                       Drive9 CLI/server/FUSE mount provider
     deps.py                         external dependency resolution/cache
     capabilities.py                 platform and FUSE capability detection
-    modules/
-      registry.py                   module registry only
-      base.py                       shared module helpers
-      community_pjdfstest.py        community.pjdfstest
-      community_ltp.py              community.ltp.fs / community.ltp.syscalls
-      community_fio.py              community.fio
-      community_mdtest.py           community.mdtest
-      community_vdbench.py          community.vdbench
-      community_pyxattr.py          community.pyxattr
-      community_fsx.py              community.fsx
-      community_lock.py             community.lock
-      ported_juicefs_*.py           ported.juicefs.* modules
-      git_official_*.py             git.official.* modules
-      drive9_workflow_*.py          drive9.workflow.* modules
   suites/
     fuse/
       presets.json
       modules.json
       repos.json
       allowlists/
+      modules/
+        registry.py                 FUSE module registry only
+        base.py                     FUSE module helpers
+        community_pjdfstest.py      community.pjdfstest
+        community_ltp.py            community.ltp.fs / community.ltp.syscalls
+        community_fio.py            community.fio
+        community_mdtest.py         community.mdtest
+        community_vdbench.py        community.vdbench
+        community_pyxattr.py        community.pyxattr
+        community_fsx.py            community.fsx
+        community_lock.py           community.lock
+        ported_juicefs_*.py         ported.juicefs.* modules
+        git_official_*.py           git.official.* modules
+        drive9_workflow_*.py        drive9.workflow.* modules
 ```
 
 New modules should get their own file unless they are a tiny variant of an
@@ -253,15 +253,15 @@ Add a module when the behavior is reusable, externally meaningful, or likely to
 grow. A module can wrap an upstream suite, an equivalent rewrite of a generic FS
 stress case, or a Drive9-specific workflow.
 
-1. Add a new file under `blackbox/harness/modules/`, named after the module family
-   or module ID, for example `drive9_workflow_new_case.py`.
+1. Add a new file under `blackbox/suites/fuse/modules/`, named after the module
+   family or module ID, for example `drive9_workflow_new_case.py`.
 2. Give it a stable `id`, `category`, `description`, `labels`, and `timeout`.
 3. Implement `ensure_dependencies(ctx)` when it needs external tools.
 4. Implement `run(ctx)` and return a small metrics/details dictionary.
 5. Mount through `ctx.target.mount(...)` and always unmount in `finally`.
 6. Use `ModuleSkip`, `ModuleXFail`, `DependencyUnavailable`, or `BlackboxError`
    for clear classification.
-7. Import and register the module in `blackbox/harness/modules/registry.py`.
+7. Import and register the module in `blackbox/suites/fuse/modules/registry.py`.
 8. Add configuration in `blackbox/suites/fuse/modules.json` when the module needs tunables.
 9. Add it to a preset in `blackbox/suites/fuse/presets.json`.
 10. Update this README if the module introduces a new dependency or behavior

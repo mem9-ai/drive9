@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from ..core import BlackboxError, Context, DependencyUnavailable
+from harness.core import BlackboxError, Context, DependencyUnavailable
 from .base import BaseModule
 
 

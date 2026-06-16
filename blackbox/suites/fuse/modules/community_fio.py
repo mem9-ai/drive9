@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from ..core import BlackboxError, Context, summarize
+from harness.core import BlackboxError, Context, summarize
 from .base import BaseModule, module_config
 
 

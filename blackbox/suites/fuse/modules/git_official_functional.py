@@ -4,7 +4,7 @@ import os
 import shutil
 from typing import Any
 
-from ..core import BlackboxError, Context, DependencyUnavailable, ModuleSkip
+from harness.core import BlackboxError, Context, DependencyUnavailable, ModuleSkip
 from .base import BaseModule, module_config
 
 

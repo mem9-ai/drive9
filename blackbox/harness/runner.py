@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import platform
@@ -35,7 +36,6 @@ from .core import (
     write_json,
 )
 from .deps import DependencyManager
-from .modules import module_registry
 from .target import Drive9TargetProvider
 
 
@@ -50,7 +50,7 @@ class BlackboxRunner:
         self.result_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else RESULT_ROOT / self.suite / self.session
         self.tmp_dir = self.result_dir / "tmp"
         self.recorder = Recorder(self.result_dir)
-        self.registry = module_registry()
+        self.registry = load_module_registry(self.suite)
         self.presets = load_json("presets.json", {}, self.suite_config_dir)
         self.module_config = load_json("modules.json", {}, self.suite_config_dir)
         self.config = {
@@ -81,7 +81,7 @@ class BlackboxRunner:
         self.selected = self.select_modules()
 
     def list_modules(self) -> int:
-        return emit_module_list(self.args.format)
+        return emit_module_list(self.registry, self.args.format)
 
     def select_modules(self) -> list[str]:
         if self.args.list:
@@ -315,9 +315,26 @@ def normalize_suite_args(args: argparse.Namespace) -> str:
     return args.suite
 
 
-def emit_module_list(output_format: str) -> int:
+def load_module_registry(suite: str) -> dict[str, Any]:
+    module_name = f"suites.{suite}.modules"
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name == module_name:
+            raise BlackboxError(f"blackbox suite {suite!r} does not provide modules at {module_name}") from exc
+        raise
+    registry_factory = getattr(module, "module_registry", None)
+    if not callable(registry_factory):
+        raise BlackboxError(f"blackbox suite {suite!r} modules package must expose module_registry()")
+    registry = registry_factory()
+    if not isinstance(registry, dict):
+        raise BlackboxError(f"blackbox suite {suite!r} module_registry() must return a dict")
+    return registry
+
+
+def emit_module_list(registry: dict[str, Any], output_format: str) -> int:
     rows = []
-    for module in sorted(module_registry().values(), key=lambda item: item.id):
+    for module in sorted(registry.values(), key=lambda item: item.id):
         rows.append(
             {
                 "id": module.id,
@@ -337,8 +354,6 @@ def emit_module_list(output_format: str) -> int:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    if args.list:
-        return emit_module_list(args.format)
     try:
         runner = BlackboxRunner(args)
         return runner.run()

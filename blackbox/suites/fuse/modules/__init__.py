@@ -1,4 +1,4 @@
-"""Module implementations for the Drive9 blackbox framework."""
+"""Module implementations for the FUSE blackbox suite."""
 
 from .registry import module_registry
 

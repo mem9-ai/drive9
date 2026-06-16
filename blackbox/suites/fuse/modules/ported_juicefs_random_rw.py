@@ -4,7 +4,7 @@ import os
 import random
 from typing import Any
 
-from ..core import BlackboxError, Context, stable_bytes
+from harness.core import BlackboxError, Context, stable_bytes
 from .base import BaseModule, module_config
 
 
