@@ -105,7 +105,7 @@ The bundle contains:
 - recent perf JSONL segments;
 - generated `summary.json`;
 - CPU/heap/goroutine profiles when the mount pprof endpoint is available;
-- selected mount logs and harness metadata when available;
+- selected mount logs when available;
 - redacted manifest with OS/runtime/build/mount context.
 
 `drive9 perf summarize` produces `summary.json` from one JSONL file:
@@ -205,7 +205,7 @@ The first implementation lands these pieces:
 - live pprof endpoints and CPU profile start/stop controls;
 - `drive9 perf summarize`;
 - `drive9 perf collect`;
-- `perf/mount` harness that emits `summary.json`.
+- `drive9 perf sync`.
 
 The following remain future work:
 
@@ -243,5 +243,5 @@ dimensions are operation type, result, component, and aggregate queue/cache
 state. Mount point, remote root, and server URL are represented by short hashes.
 
 Support bundles must not include API keys, tokens, request headers, or file
-contents. Logs copied into a bundle should come from known local perf harness
-files or explicitly selected mount logs.
+contents. Logs copied into a bundle should come from explicitly selected mount
+logs.

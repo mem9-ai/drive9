@@ -14,15 +14,14 @@ commit queues, dirty handles, or cache misses increasing before the slowdown?"
 
 The product-level design lives in
 `docs/design/continuous-performance-observability.md`. This document focuses on
-the FUSE mount producer and harness details.
+the FUSE mount producer and CLI perf suite details.
 
 ## Goals
 
-- Capture CPU and heap hotspots for real FUSE workloads.
+- Capture CPU and heap hotspots for real FUSE usage.
 - Record continuous mount-local metrics that help explain pprof output.
 - Keep the default mount behavior unchanged when profiling flags are absent.
-- Make the same workload runnable by developers, CI, and customer-support
-  environments.
+- Make local and customer-support profiling collection repeatable.
 - Prefer real Linux FUSE results for performance conclusions.
 
 ## Non-Goals
@@ -80,15 +79,15 @@ When `--pprof-addr` is set, the mount exposes standard Go pprof handlers:
 /debug/pprof/trace
 ```
 
-It also exposes workload-scoped CPU profile controls:
+It also exposes CPU profile controls for manually scoped collection windows:
 
 ```text
 /debug/drive9/profile/cpu/start?path=/tmp/drive9/cpu.pprof
 /debug/drive9/profile/cpu/stop
 ```
 
-The perf harness uses these endpoints by default so CPU profiles cover only the
-workload window, not mount startup, unmount, or cleanup waits.
+These endpoints let operators capture CPU profiles for a specific repro window
+without including mount startup, unmount, or cleanup waits.
 
 ## Continuous JSONL Samples
 
@@ -182,74 +181,6 @@ Within each active segment, samples are written as line-delimited JSON so the
 file can be tailed, uploaded from customer environments, or post-processed
 without a database.
 
-## Perf Harness
-
-The reproducible harness lives under `perf/mount`.
-
-```bash
-make build-cli
-perf/mount/run.sh small-files
-perf/mount/run.sh metadata-walk
-perf/mount/run.sh large-write
-perf/mount/run.sh large-read
-```
-
-Useful environment variables:
-
-```bash
-DRIVE9_BIN=./bin/drive9
-DRIVE9_BASE=https://...
-DRIVE9_API_KEY=...
-DRIVE9_REMOTE_ROOT=/perf/mount
-DRIVE9_MOUNTPOINT=/tmp/drive9-perf-mnt
-DRIVE9_PROFILE_ROOT=/tmp/drive9-perf-profiles
-DRIVE9_CACHE_DIR=/tmp/drive9-perf-cache
-DRIVE9_DURABILITY=interactive
-DRIVE9_PROFILE_CPU_MODE=workload
-DRIVE9_PROFILE_HEAP_INTERVAL=0s
-DRIVE9_PERF_JSONL=/tmp/drive9-perf-profiles/run/perf.jsonl
-DRIVE9_PERF_INTERVAL=1s
-DRIVE9_PERF_MAX_SAMPLES=7200
-DRIVE9_PPROF_ADDR=127.0.0.1:6060
-DRIVE9_MOUNT_EXTRA_FLAGS="--dir-ttl 1s --attr-ttl 1s"
-```
-
-Each run writes:
-
-```text
-profiles/<timestamp>-<workload>/
-  cpu.pprof
-  heap-final.pprof
-  heap-*.pprof        # only when DRIVE9_PROFILE_HEAP_INTERVAL > 0
-  perf.jsonl
-  perf.jsonl.1        # only after segment rotation
-  perf-last.json
-  summary.json
-  cpu-top.txt
-  cpu-callgraph.svg
-  heap-inuse-space-top.txt
-  heap-alloc-space-top.txt
-  heap-inuse-callgraph.svg
-  heap-alloc-callgraph.svg
-  env.txt
-  mount.log
-  workload.log
-```
-
-## Workloads
-
-Initial workloads are deliberately simple shell scripts:
-
-| Workload | Purpose |
-| --- | --- |
-| `small-files` | Stress create/write/close/sync paths and small-file metadata overhead. |
-| `metadata-walk` | Stress mkdir, create, readdir, find, and stat patterns. |
-| `large-write` | Stress sequential large-file write, buffering, shadow, and upload paths. |
-| `large-read` | Stress sequential read and cache/read-through behavior. |
-
-Simple workloads make the first-order bottlenecks easier to identify. More
-realistic workloads can be added once the baseline output shape is stable.
-
 ## Runtime Requirements
 
 Preferred runtime:
@@ -258,24 +189,25 @@ Preferred runtime:
 - Built `drive9` CLI.
 - Valid drive9 server and credential, either from the active context or
   `DRIVE9_BASE` / `DRIVE9_API_KEY`.
-- `curl` for workload-scoped CPU profile control.
+- `curl` for pprof CPU profile control, when using the control endpoints
+  directly.
 - `go tool pprof` for summaries.
 - Graphviz for SVG call graphs. If Graphviz is missing, raw `.pprof` files and
   text summaries are still useful.
 
-macOS with macFUSE can run the harness for development smoke tests, but macOS
-numbers include Darwin and macFUSE behavior. Use Linux for performance claims
-about production FUSE behavior.
+macOS with macFUSE can run profiled mounts for development smoke tests, but
+macOS numbers include Darwin and macFUSE behavior. Use Linux for performance
+claims about production FUSE behavior.
 
 ## Analysis Workflow
 
 1. Build the CLI from the exact commit under test.
-2. Run one workload with a stable remote root and cache directory policy.
-3. Check `env.txt` to confirm binary version, git SHA, durability, mount flags,
-   and workload parameters.
-4. Read `summary.txt` to locate generated profiles.
-5. Inspect `cpu-top.txt` and `cpu-callgraph.svg` for hot CPU paths.
-6. Inspect heap in-use and allocation summaries separately:
+2. Start a FUSE mount with the desired profiling flags.
+3. Reproduce the slow or memory-heavy behavior.
+4. Use `drive9 perf collect` while the mount is running, or keep the raw
+   profiles and JSONL files configured on the mount.
+5. Inspect CPU profiles for hot CPU paths.
+6. Inspect heap in-use and allocation profiles separately:
    - in-use shows retained memory;
    - alloc-space shows allocation churn.
 7. Inspect `perf.jsonl` for time-series context:
@@ -284,7 +216,7 @@ about production FUSE behavior.
    - cache miss spikes;
    - remote operation latency or error increases;
    - FUSE operation count/byte distribution.
-8. Compare runs only when commit, workload size, durability, mount flags, host,
+8. Compare runs only when commit, repro steps, durability, mount flags, host,
    and remote environment are known.
 
 For a running mount, collect a support bundle with:
@@ -308,8 +240,8 @@ Each sample allocates maps for the exported snapshot and reads Go runtime memory
 stats plus process rusage. At intervals such as `1s` or `10s`, this is expected
 to be low overhead relative to FUSE I/O and remote operations.
 
-CPU profiling adds Go pprof sampling overhead while active. Workload-scoped CPU
-profiling is preferred for benchmark runs.
+CPU profiling adds Go pprof sampling overhead while active. Window-scoped CPU
+profiling is preferred for repro runs.
 
 Heap profile writing calls `runtime.GC()` and writes compressed profile data.
 Periodic heap profiles are therefore useful for leak/memory-growth analysis but
@@ -324,13 +256,10 @@ the target.
 - `pkg/fuse/continuous_perf.go`: JSONL sample recorder.
 - `pkg/fuse/perf.go`: low-overhead FUSE and remote operation counters.
 - `pkg/fuse/mount.go`: profiling lifecycle integration.
-- `perf/mount/run.sh`: reproducible mount/workload runner.
-- `perf/mount/scripts/summarize.sh`: pprof summaries and generated artifacts.
 
 ## Future Work
 
-- Add CI-oriented continuous perf jobs with fixed workload sizes.
-- Add a comparison tool for two run directories.
+- Add a comparison tool for two perf JSONL summaries.
 - Add runtime scheduler, mutex, and block profile capture for concurrency
   investigations.
 - Add JSONL post-processing to compute per-interval deltas and p95-ish latency
