@@ -23,7 +23,7 @@ type Claims struct {
 
 const (
 	tokenPrefix       = "drive9_"
-	legacyTokenPrefix = "dat9_"
+	LegacyTokenPrefix = "dat9_"
 )
 
 func NewID() string { return uuid.NewString() }
@@ -79,8 +79,8 @@ func parseAndVerifyTokenAt(secret []byte, raw string, nowUnix int64) (*Claims, e
 	switch {
 	case strings.HasPrefix(raw, tokenPrefix):
 		stripped = strings.TrimPrefix(raw, tokenPrefix)
-	case strings.HasPrefix(raw, legacyTokenPrefix):
-		stripped = strings.TrimPrefix(raw, legacyTokenPrefix)
+	case strings.HasPrefix(raw, LegacyTokenPrefix):
+		stripped = strings.TrimPrefix(raw, LegacyTokenPrefix)
 	default:
 		return nil, fmt.Errorf("invalid token format")
 	}

@@ -116,7 +116,7 @@ func TestParseAndVerifyTokenAcceptsLegacyDat9Prefix(t *testing.T) {
 		t.Fatal(err)
 	}
 	jwtB64 := strings.TrimPrefix(tok, tokenPrefix)
-	legacyTok := legacyTokenPrefix + jwtB64
+	legacyTok := LegacyTokenPrefix + jwtB64
 
 	claims, err := ParseAndVerifyToken(secret, legacyTok)
 	if err != nil {
@@ -124,5 +124,16 @@ func TestParseAndVerifyTokenAcceptsLegacyDat9Prefix(t *testing.T) {
 	}
 	if claims.TenantID != "tenant-1" {
 		t.Fatalf("tenant = %q, want tenant-1", claims.TenantID)
+	}
+}
+
+func TestIssueTokenProducesDrive9Prefix(t *testing.T) {
+	secret := testTokenSecret(t)
+	tok, err := IssueToken(secret, "tenant-1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(tok, tokenPrefix) {
+		t.Fatalf("token = %q, want prefix %q", tok, tokenPrefix)
 	}
 }

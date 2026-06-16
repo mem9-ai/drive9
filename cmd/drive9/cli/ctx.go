@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/dat9/pkg/tenant/token"
 )
 
 // Ctx dispatches drive9 ctx subcommands per spec §13.2.
@@ -264,10 +265,7 @@ func writeCtxShowText(entry *ctxShowEntry) error {
 	return w.Flush()
 }
 
-const (
-	drive9APIKeyJWTWrapperPrefix       = "drive9_"
-	legacyAPIKeyJWTWrapperPrefix       = "dat9_"
-)
+const drive9APIKeyJWTWrapperPrefix = "drive9_"
 
 func tenantIDFromContext(ctx *Context) string {
 	if ctx == nil {
@@ -295,8 +293,8 @@ func decodeDrive9APIKeyPayload(apiKey string) (*jwtClaims, error) {
 	switch {
 	case strings.HasPrefix(apiKey, drive9APIKeyJWTWrapperPrefix):
 		wrapped = strings.TrimPrefix(apiKey, drive9APIKeyJWTWrapperPrefix)
-	case strings.HasPrefix(apiKey, legacyAPIKeyJWTWrapperPrefix):
-		wrapped = strings.TrimPrefix(apiKey, legacyAPIKeyJWTWrapperPrefix)
+	case strings.HasPrefix(apiKey, token.LegacyTokenPrefix):
+		wrapped = strings.TrimPrefix(apiKey, token.LegacyTokenPrefix)
 	default:
 		return nil, fmt.Errorf("invalid drive9 api key format")
 	}
@@ -1166,7 +1164,7 @@ func ctxRmUsage() string {
   To revoke a scoped token: drive9 token revoke <name>
 
   Removes the named context from local config (~/.drive9/config).
-  - fs_scoped: the dat9_... token remains valid on the server until TTL
+  - fs_scoped: the scoped token remains valid on the server until TTL
     expiry or explicit revoke.
   - owner: the api_key is erased from local config. The server key
     remains valid. You'll need it saved elsewhere to log back in.
