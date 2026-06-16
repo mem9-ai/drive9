@@ -266,7 +266,7 @@ func (r *ContinuousPerfRecorder) context() continuousPerfContext {
 	ctx.MountPointHash = shortHash(opts.MountPoint)
 	ctx.RemoteRootHash = shortHash(opts.RemoteRoot)
 	ctx.ServerHash = shortHash(opts.Server)
-	ctx.SyncMode = opts.SyncMode.String()
+	ctx.SyncMode = r.fs.syncMode.String()
 	ctx.WritePolicy = opts.WritePolicy.String()
 	ctx.Profile = opts.Profile
 	return ctx

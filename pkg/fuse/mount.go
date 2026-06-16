@@ -55,7 +55,7 @@ type MountOptions struct {
 	LocalOnlyPatterns       []string      // additional local-only path patterns for overlay-profile mounts
 	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for overlay-profile mounts
 	PackPaths               []string      // local overlay paths auto-packed after unmount
-	UploadConcurrency       int           // number of background upload workers (default 16)
+	UploadConcurrency       int           // number of background upload workers (default 4)
 	ReadConcurrency         int           // maximum concurrent backend reads issued by FUSE (default 24)
 	ParallelReadConcurrency int           // maximum concurrent block reads for one large FUSE read (default 4)
 	ParallelReadBlockSize   int64         // block size for parallel large-file reads in bytes (default 1MiB)
@@ -254,7 +254,6 @@ func Mount(opts *MountOptions) error {
 	// Build FUSE filesystem
 	dat9fs := NewDat9FS(c, opts)
 	layerEventWatcherStop := func() {}
-	opts.Profiling.MountSync = dat9fs.SyncAll
 
 	profiler, err := StartProfiler(opts.Profiling)
 	if err != nil {
@@ -265,7 +264,6 @@ func Mount(opts *MountOptions) error {
 
 	// Resolve sync mode (auto-detect RTT if needed).
 	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
-	opts.SyncMode = resolved
 	dat9fs.syncMode = resolved
 	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", resolved)
 	perfRecorder, err := StartContinuousPerf(opts.Profiling, dat9fs)
@@ -471,7 +469,7 @@ func Mount(opts *MountOptions) error {
 		APIKey:          opts.APIKey,
 		Token:           opts.Token,
 		ProfileDir:      opts.Profiling.ProfileDir,
-		PerfJSONL:       opts.Profiling.PerfSamplesPath,
+		PerfSamplesPath: opts.Profiling.PerfSamplesPath,
 		PerfInterval:    opts.Profiling.PerfSampleInterval.String(),
 		PerfMaxSamples:  opts.Profiling.PerfMaxSamples,
 		PprofAddr:       opts.Profiling.PprofAddr,
@@ -894,9 +892,6 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
 		if opts.AllowOther {
 			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
-		}
-		if os.Geteuid() == 0 {
-			fuseOpts.DirectMountStrict = true
 		}
 	}
 	if runtime.GOOS == "darwin" {

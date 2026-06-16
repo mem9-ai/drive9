@@ -189,34 +189,6 @@ func (u *WriteBackUploader) WaitPath(localPath string) {
 	}
 }
 
-// WaitAll waits until all queued and in-flight write-back uploads complete
-// without stopping the uploader.
-func (u *WriteBackUploader) WaitAll(ctx context.Context) error {
-	if u == nil {
-		return nil
-	}
-	start := time.Now()
-	defer func() {
-		if u.perf != nil {
-			u.perf.uploaderDrainCount.add(1)
-			u.perf.uploaderDrainTotal.add(uint64(time.Since(start)))
-		}
-	}()
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		queued, inFlight := u.PendingStats()
-		if queued == 0 && inFlight == 0 {
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
-	}
-}
-
 // DrainAll closes the upload channel and waits for all inflight uploads to
 // complete. Called during graceful shutdown.
 func (u *WriteBackUploader) DrainAll() {

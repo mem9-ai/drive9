@@ -1,7 +1,6 @@
 package fuse
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -110,35 +109,6 @@ func TestStartProfilerRecordsActualPprofAddr(t *testing.T) {
 
 	if got := profiler.PprofAddr(); got == "" || got == "127.0.0.1:0" {
 		t.Fatalf("PprofAddr = %q, want actual listener address", got)
-	}
-}
-
-func TestPprofMuxMountSync(t *testing.T) {
-	called := false
-	hadDeadline := false
-	profiler := &Profiler{opts: ProfilingOptions{
-		MountSync: func(ctx context.Context) error {
-			_, hadDeadline = ctx.Deadline()
-			called = true
-			return nil
-		},
-	}}
-	ts := httptest.NewServer(profiler.newPprofMux())
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/debug/drive9/mount/sync?timeout=1s")
-	if err != nil {
-		t.Fatalf("mount sync: %v", err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("mount sync status = %d, want 200", resp.StatusCode)
-	}
-	if !called {
-		t.Fatal("MountSync was not called")
-	}
-	if !hadDeadline {
-		t.Fatal("MountSync context has no deadline")
 	}
 }
 

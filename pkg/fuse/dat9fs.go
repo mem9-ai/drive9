@@ -11630,12 +11630,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	return gofuse.OK
 }
 
-// SyncAll flushes open handles and waits for background remote uploads without
-// stopping the mount's queues.
-func (fs *Dat9FS) SyncAll(ctx context.Context) error {
-	if ctx == nil {
-		ctx = context.Background()
-	}
+// FlushAll flushes all open file handles, drains pending debounced uploads,
+// drains the write-back uploader, and waits for inflight async kernel
+// notifications to complete. Used during graceful shutdown.
+func (fs *Dat9FS) FlushAll() {
+	// Drain all pending debounced uploads first.
 	fs.debouncer.FlushAll()
 
 	// Snapshot handles outside the lock to avoid deadlocking with
@@ -11649,29 +11648,20 @@ func (fs *Dat9FS) SyncAll(ctx context.Context) error {
 		handles = append(handles, entry{fhID, fh})
 	})
 	for _, e := range handles {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
 		// Per-handle timeout scaled by file size so large uploads complete.
 		e.fh.Lock()
 		var sz int64
 		if e.fh.Dirty != nil {
 			sz = e.fh.Dirty.Size()
 		}
-		handleCtx, cf := context.WithTimeout(ctx, releaseTimeout(sz))
-		var status gofuse.Status
+		ctx, cf := context.WithTimeout(context.Background(), releaseTimeout(sz))
 		if e.fh.Layer == PathLayerGitWorkspace {
-			status = fs.flushGitHandleLocked(handleCtx, e.fh)
+			fs.flushGitHandleLocked(ctx, e.fh)
 		} else {
-			status = fs.flushHandle(handleCtx, e.fh)
+			fs.flushHandle(ctx, e.fh)
 		}
 		e.fh.Unlock()
 		cf()
-		if status != gofuse.OK {
-			return fmt.Errorf("flush open handle %s: %v", e.fh.Path, status)
-		}
 	}
 
 	// Drain git workspace overlay commits queued by interactive writeback.
@@ -11692,33 +11682,12 @@ func (fs *Dat9FS) SyncAll(ctx context.Context) error {
 	fs.drainGitStateCheckpoints()
 	fs.checkpointAllGitWorkspaces()
 
-	if fs.uploader != nil {
-		if err := fs.uploader.WaitAll(ctx); err != nil {
-			return err
-		}
-	}
-
-	if fs.commitQueue != nil {
-		if err := fs.commitQueue.WaitAll(ctx); err != nil {
-			return err
-		}
-	}
-	return ctx.Err()
-}
-
-// FlushAll flushes all open file handles, drains pending debounced uploads,
-// drains the write-back uploader, and waits for inflight async kernel
-// notifications to complete. Used during graceful shutdown.
-func (fs *Dat9FS) FlushAll() {
-	if err := fs.SyncAll(context.Background()); err != nil {
-		log.Printf("flush all sync failed: %v", err)
-	}
-
-	// Stop queues after the non-stopping sync fence has drained current work.
+	// Drain all pending write-back uploads before shutting down.
 	if fs.uploader != nil {
 		fs.uploader.DrainAll()
 	}
 
+	// Drain CommitQueue (P1).
 	if fs.commitQueue != nil {
 		fs.commitQueue.DrainAll()
 	}
