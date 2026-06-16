@@ -26,12 +26,12 @@ var fallbackRegionManifest = RegionManifest{
 	Service: "drive9",
 	Default: &RegionManifestDefault{
 		RegionCode: "aws-ap-southeast-1",
-		Mode:       RegionModeTiDBCloudStarterLegacy,
+		Mode:       RegionModeTiDBCloudStarter,
 	},
 	Regions: []RegionManifestEntry{
 		{
 			RegionCode: "aws-ap-southeast-1",
-			Mode:       RegionModeTiDBCloudStarterLegacy,
+			Mode:       RegionModeTiDBCloudStarter,
 			ServerURL:  defaultServerURL,
 		},
 	},
@@ -177,9 +177,10 @@ func validateRegionManifest(manifest *RegionManifest) error {
 		if strings.TrimSpace(entry.ServerURL) == "" {
 			return fmt.Errorf("region manifest entry %d missing server_url", i)
 		}
-		key := strings.TrimSpace(entry.RegionCode) + "\x00" + normalizeRegionMode(entry.Mode)
+		mode := strings.TrimSpace(entry.Mode)
+		key := strings.TrimSpace(entry.RegionCode) + "\x00" + mode
 		if first, ok := seen[key]; ok {
-			return fmt.Errorf("region manifest entries %d and %d duplicate region_code %q mode %q", first, i, strings.TrimSpace(entry.RegionCode), normalizeRegionMode(entry.Mode))
+			return fmt.Errorf("region manifest entries %d and %d duplicate region_code %q mode %q", first, i, strings.TrimSpace(entry.RegionCode), mode)
 		}
 		seen[key] = i
 	}
@@ -199,7 +200,7 @@ func sortRegionManifestEntries(entries []RegionManifestEntry) {
 }
 
 func regionModeLabel(mode string) string {
-	switch normalizeRegionMode(mode) {
+	switch strings.TrimSpace(mode) {
 	case RegionModeTiDBCloudStarter:
 		return "Anonymous"
 	case RegionModeTiDBCloudNative:

@@ -124,7 +124,7 @@ func Create(args []string) error {
 
 	mode := provisionModeForCredentials(publicKey, privateKey)
 	if mode == RegionModeTiDBCloudNative && (publicKey == "" || privateKey == "") {
-		return fmt.Errorf("tidbcloud_native create requires --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
+		return fmt.Errorf("tidb_cloud_native create requires --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
 	}
 	server, regionEntry, err := resolveProvisionServer(serverFlag, regionCode, mode, r.Server)
 	if err != nil {
@@ -204,9 +204,8 @@ func Create(args []string) error {
 }
 
 const (
-	RegionModeTiDBCloudNative        = "tidbcloud_native"
-	RegionModeTiDBCloudStarter       = "tidbcloud_starter"
-	RegionModeTiDBCloudStarterLegacy = "tidb_cloud_starter"
+	RegionModeTiDBCloudNative  = "tidb_cloud_native"
+	RegionModeTiDBCloudStarter = "tidb_cloud_starter"
 )
 
 type createResult struct {
@@ -242,7 +241,7 @@ func provisionRequestBody(publicKey, privateKey string) (io.Reader, error) {
 		return nil, nil
 	}
 	if publicKey == "" || privateKey == "" {
-		return nil, fmt.Errorf("tidbcloud_native create requires both public and private keys")
+		return nil, fmt.Errorf("tidb_cloud_native create requires both public and private keys")
 	}
 	body := map[string]string{
 		"public_key":  publicKey,
@@ -275,10 +274,10 @@ func resolveProvisionServer(serverFlag, regionCode, mode, fallbackServer string)
 
 func selectRegionServer(entries []RegionManifestEntry, regionCode, mode string) (*RegionManifestEntry, error) {
 	regionCode = strings.TrimSpace(regionCode)
-	mode = normalizeRegionMode(mode)
+	mode = strings.TrimSpace(mode)
 	var matches []RegionManifestEntry
 	for _, entry := range entries {
-		if strings.TrimSpace(entry.RegionCode) == regionCode && normalizeRegionMode(entry.Mode) == mode {
+		if strings.TrimSpace(entry.RegionCode) == regionCode && strings.TrimSpace(entry.Mode) == mode {
 			matches = append(matches, entry)
 		}
 	}
@@ -289,15 +288,6 @@ func selectRegionServer(entries []RegionManifestEntry, regionCode, mode string) 
 		return nil, fmt.Errorf("region %q mode %q matches multiple servers; pass --server explicitly", regionCode, mode)
 	}
 	return &matches[0], nil
-}
-
-func normalizeRegionMode(mode string) string {
-	switch strings.TrimSpace(mode) {
-	case RegionModeTiDBCloudStarterLegacy:
-		return RegionModeTiDBCloudStarter
-	default:
-		return strings.TrimSpace(mode)
-	}
 }
 
 func DeleteTenant(args []string) error {
@@ -431,7 +421,7 @@ func deprovisionRequestBody(publicKey, privateKey string) (io.Reader, error) {
 		return nil, nil
 	}
 	if publicKey == "" || privateKey == "" {
-		return nil, fmt.Errorf("tidbcloud_native delete requires both public and private keys")
+		return nil, fmt.Errorf("tidb_cloud_native delete requires both public and private keys")
 	}
 	raw, err := json.Marshal(map[string]string{
 		"public_key":  publicKey,

@@ -19,7 +19,7 @@ func TestRegionListTextAndJSON(t *testing.T) {
 		},
 		{
 			RegionCode:    "aws-us-east-1",
-			Mode:          RegionModeTiDBCloudStarterLegacy,
+			Mode:          RegionModeTiDBCloudStarter,
 			ServerURL:     "https://api.drive9.ai",
 			CloudProvider: "aws",
 			TiDBRegion:    "us-east-1",
@@ -49,7 +49,7 @@ func TestRegionListTextAndJSON(t *testing.T) {
 	if strings.Contains(textOut, "NAME") {
 		t.Fatalf("text output = %q, want no NAME column", textOut)
 	}
-	if strings.Contains(textOut, "tidbcloud_native") || strings.Contains(textOut, "tidb_cloud_starter") {
+	if strings.Contains(textOut, "tidb_cloud_native") || strings.Contains(textOut, "tidb_cloud_starter") {
 		t.Fatalf("text output = %q, want mapped mode labels", textOut)
 	}
 
@@ -80,7 +80,6 @@ func TestRegionModeLabel(t *testing.T) {
 		mode string
 		want string
 	}{
-		{mode: RegionModeTiDBCloudStarterLegacy, want: "Anonymous"},
 		{mode: RegionModeTiDBCloudStarter, want: "Anonymous"},
 		{mode: RegionModeTiDBCloudNative, want: "TiDBCloud"},
 		{mode: "custom", want: "custom"},
@@ -124,14 +123,14 @@ func TestRegionListJSONFallsBackWhenManifestUnavailable(t *testing.T) {
 	if err := json.Unmarshal([]byte(jsonOut), &manifest); err != nil {
 		t.Fatalf("decode json output: %v\n%s", err, jsonOut)
 	}
-	if manifest.Default == nil || manifest.Default.RegionCode != "aws-ap-southeast-1" || manifest.Default.Mode != RegionModeTiDBCloudStarterLegacy {
+	if manifest.Default == nil || manifest.Default.RegionCode != "aws-ap-southeast-1" || manifest.Default.Mode != RegionModeTiDBCloudStarter {
 		t.Fatalf("fallback default = %#v", manifest.Default)
 	}
 	if len(manifest.Regions) != 1 {
 		t.Fatalf("fallback regions len = %d, want 1", len(manifest.Regions))
 	}
 	entry := manifest.Regions[0]
-	if entry.RegionCode != "aws-ap-southeast-1" || entry.Mode != RegionModeTiDBCloudStarterLegacy || entry.ServerURL != defaultServerURL {
+	if entry.RegionCode != "aws-ap-southeast-1" || entry.Mode != RegionModeTiDBCloudStarter || entry.ServerURL != defaultServerURL {
 		t.Fatalf("fallback region = %#v", entry)
 	}
 }
@@ -140,7 +139,7 @@ func TestValidateRegionManifestAllowsSameRegionDifferentModes(t *testing.T) {
 	err := validateRegionManifest(&RegionManifest{
 		Service: "drive9",
 		Regions: []RegionManifestEntry{
-			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarterLegacy, ServerURL: "https://starter.example"},
+			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarter, ServerURL: "https://starter.example"},
 			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
 		},
 	})
@@ -153,7 +152,7 @@ func TestValidateRegionManifestRejectsDuplicateRegionMode(t *testing.T) {
 	err := validateRegionManifest(&RegionManifest{
 		Service: "drive9",
 		Regions: []RegionManifestEntry{
-			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarterLegacy, ServerURL: "https://starter-a.example"},
+			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarter, ServerURL: "https://starter-a.example"},
 			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarter, ServerURL: "https://starter-b.example"},
 		},
 	})
@@ -165,9 +164,9 @@ func TestValidateRegionManifestRejectsDuplicateRegionMode(t *testing.T) {
 	}
 }
 
-func TestSelectRegionServerMatchesRegionAndNormalizedMode(t *testing.T) {
+func TestSelectRegionServerMatchesRegionAndExactMode(t *testing.T) {
 	entry, err := selectRegionServer([]RegionManifestEntry{
-		{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarterLegacy, ServerURL: "https://starter.example"},
+		{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarter, ServerURL: "https://starter.example"},
 		{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
 	}, "aws-us-east-1", RegionModeTiDBCloudStarter)
 	if err != nil {
@@ -178,10 +177,23 @@ func TestSelectRegionServerMatchesRegionAndNormalizedMode(t *testing.T) {
 	}
 }
 
+func TestSelectRegionServerDoesNotAcceptLegacyNativeMode(t *testing.T) {
+	legacyNativeMode := strings.Replace(RegionModeTiDBCloudNative, "tidb_cloud", "tidbcloud", 1)
+	_, err := selectRegionServer([]RegionManifestEntry{
+		{RegionCode: "aws-us-east-1", Mode: legacyNativeMode, ServerURL: "https://legacy-native.example"},
+	}, "aws-us-east-1", RegionModeTiDBCloudNative)
+	if err == nil {
+		t.Fatal("selectRegionServer error = nil, want unsupported mode error")
+	}
+	if !strings.Contains(err.Error(), `does not support mode "tidb_cloud_native"`) {
+		t.Fatalf("selectRegionServer error = %q", err)
+	}
+}
+
 func TestRegionListRejectsInvalidManifest(t *testing.T) {
 	manifest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"service":"drive9","regions":[{"region_code":"aws-us-east-1","mode":"tidbcloud_native"}]}`))
+		_, _ = w.Write([]byte(`{"service":"drive9","regions":[{"region_code":"aws-us-east-1","mode":"tidb_cloud_native"}]}`))
 	}))
 	defer manifest.Close()
 

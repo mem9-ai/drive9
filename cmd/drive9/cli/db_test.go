@@ -197,7 +197,7 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	manifest := newRegionManifestTestServer(t, []RegionManifestEntry{
 		{
 			RegionCode: "aws-us-east-1",
-			Mode:       RegionModeTiDBCloudStarterLegacy,
+			Mode:       RegionModeTiDBCloudStarter,
 			ServerURL:  starter.URL,
 		},
 		{
@@ -275,7 +275,7 @@ func TestCreateRegionCodeSelectsStarterWithoutBody(t *testing.T) {
 		},
 		{
 			RegionCode: "aws-us-east-1",
-			Mode:       RegionModeTiDBCloudStarterLegacy,
+			Mode:       RegionModeTiDBCloudStarter,
 			ServerURL:  starter.URL,
 		},
 	})
@@ -325,7 +325,7 @@ func TestCreateRejectsHalfTiDBCloudKeyBeforeManifestFetch(t *testing.T) {
 	if err == nil {
 		t.Fatal("Create error = nil, want missing private key error")
 	}
-	if !strings.Contains(err.Error(), "tidbcloud_native create requires") {
+	if !strings.Contains(err.Error(), "tidb_cloud_native create requires") {
 		t.Fatalf("Create error = %q", err)
 	}
 	if atomic.LoadInt32(&manifestHits) != 0 {
@@ -506,7 +506,7 @@ func newRegionManifestTestServer(t *testing.T, entries []RegionManifestEntry) *h
 			Service: "drive9",
 			Default: &RegionManifestDefault{
 				RegionCode: "aws-ap-southeast-1",
-				Mode:       RegionModeTiDBCloudStarterLegacy,
+				Mode:       RegionModeTiDBCloudStarter,
 			},
 			Regions: entries,
 		})

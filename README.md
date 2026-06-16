@@ -94,7 +94,7 @@ aws-ap-southeast-1  TiDBCloud  https://native-sg.drive9.ai
 ```
 
 `Anonymous` maps to the `tidb_cloud_starter` provider mode. `TiDBCloud` maps to
-the `tidbcloud_native` provider mode. If the public region manifest cannot be
+the `tidb_cloud_native` provider mode. If the public region manifest cannot be
 reached, `drive9 region list` falls back to:
 
 ```text
@@ -145,7 +145,7 @@ Delete the current tenant with the current owner context:
 drive9 delete
 ```
 
-For `tidbcloud_native`, pass the customer's TiDB Cloud API keys again so the
+For `tidb_cloud_native`, pass the customer's TiDB Cloud API keys again so the
 server can delete the customer-account Starter cluster:
 
 ```bash
@@ -326,12 +326,12 @@ func main() {
 Current tenant providers are selected explicitly:
 
 ```text
-DRIVE9_TENANT_PROVIDER=db9 | tidb_zero | tidb_cloud_starter | tidbcloud_native
+DRIVE9_TENANT_PROVIDER=db9 | tidb_zero | tidb_cloud_starter | tidb_cloud_native
 ```
 
 - `tidb_zero`: default development/provisioning path backed by TiDB Zero.
 - `tidb_cloud_starter`: production-oriented TiDB Cloud Starter pool takeover.
-- `tidbcloud_native`: creates TiDB Cloud Serverless Starter clusters in the
+- `tidb_cloud_native`: creates TiDB Cloud Serverless Starter clusters in the
   customer's TiDB Cloud account using `public_key` / `private_key` submitted to
   `POST /v1/provision`; server config supplies the API URL, cloud provider,
   region, and default database name. The CLI does not expose a database-name
@@ -456,7 +456,7 @@ DELETE /v1/tenant                 delete current tenant with owner API key
 Vault endpoints also exist for secret storage, scoped grants, delegated tokens,
 and read-only vault mounts.
 
-`DELETE /v1/tenant` is owner-key only. For `tidbcloud_native`, the request body
+`DELETE /v1/tenant` is owner-key only. For `tidb_cloud_native`, the request body
 must also include the customer's TiDB Cloud `public_key` and `private_key` so
 Drive9 can delete the customer-account Starter cluster. `tidb_zero` tenants are
 not deleted through this endpoint; they expire automatically.
@@ -493,16 +493,16 @@ Important environment variables:
 
 ```text
 DRIVE9_META_DSN                 control-plane MySQL/TiDB DSN
-DRIVE9_TENANT_PROVIDER          db9 | tidb_zero | tidb_cloud_starter | tidbcloud_native
+DRIVE9_TENANT_PROVIDER          db9 | tidb_zero | tidb_cloud_starter | tidb_cloud_native
 DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT
                                 default TiDB Cloud spendingLimit.monthly in USD cents
-                                optional for tidb_cloud_starter; tidbcloud_native defaults to 1000 when unset
+                                optional for tidb_cloud_starter; tidb_cloud_native defaults to 1000 when unset
 DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Serverless API base URL
 DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER
-                                cloud provider for tidbcloud_native cluster creation
-DRIVE9_TIDBCLOUD_NATIVE_REGION  region for tidbcloud_native cluster creation
+                                cloud provider for tidb_cloud_native cluster creation
+DRIVE9_TIDBCLOUD_NATIVE_REGION  region for tidb_cloud_native cluster creation
 DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME
-                                server-side default database name for tidbcloud_native
+                                server-side default database name for tidb_cloud_native
                                 when unset, the server uses tidbcloud_fs
 DRIVE9_TOKEN_SIGNING_KEY        32-byte hex JWT signing key
 DRIVE9_ENCRYPT_TYPE             local_aes | kms

@@ -11,7 +11,7 @@ import (
 )
 
 func TestSchemaDumpInitSQLByProvider(t *testing.T) {
-	for _, provider := range []string{"tidb_zero", "tidb_cloud_starter", "tidbcloud_native"} {
+	for _, provider := range []string{"tidb_zero", "tidb_cloud_starter", "tidb_cloud_native"} {
 		t.Run(provider, func(t *testing.T) {
 			out := captureSchemaStdout(t, func() {
 				if err := runSchemaCommand([]string{"dump-init-sql", "--provider", provider}); err != nil {
@@ -36,7 +36,7 @@ func TestSchemaDumpInitSQLByProvider(t *testing.T) {
 }
 
 func TestSchemaDumpInitSQLByProviderIncludesVault(t *testing.T) {
-	for _, provider := range []string{"tidb_zero", "tidb_cloud_starter", "tidbcloud_native"} {
+	for _, provider := range []string{"tidb_zero", "tidb_cloud_starter", "tidb_cloud_native"} {
 		t.Run(provider, func(t *testing.T) {
 			out := captureSchemaStdout(t, func() {
 				if err := runSchemaCommand([]string{"dump-init-sql", "--provider", provider}); err != nil {

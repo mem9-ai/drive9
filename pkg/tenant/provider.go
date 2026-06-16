@@ -6,7 +6,7 @@ const (
 	ProviderDB9              = "db9"
 	ProviderTiDBZero         = "tidb_zero"
 	ProviderTiDBCloudStarter = "tidb_cloud_starter"
-	ProviderTiDBCloudNative  = "tidbcloud_native"
+	ProviderTiDBCloudNative  = "tidb_cloud_native"
 )
 
 func NormalizeProvider(provider string) (string, error) {
