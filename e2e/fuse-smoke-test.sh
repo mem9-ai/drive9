@@ -486,6 +486,57 @@ PY
   done
 }
 
+assert_remote_ls_missing_stable() {
+  local parent="$1"
+  local name="$2"
+  local stable_s="${3:-3}"
+  local interval_s="${4:-0.25}"
+  local deadline
+  local out rc
+
+  wait_remote_ls_missing_name "$parent" "$name" || return 1
+  deadline=$(python3 - "$stable_s" <<'PY'
+import sys
+import time
+print(time.time() + float(sys.argv[1]))
+PY
+)
+
+  while :; do
+    set +e
+    out=$(drive9 fs ls "$parent" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+      if python3 - "$out" "$name" <<'PY'
+import sys
+lines=[ln.strip() for ln in sys.argv[1].splitlines() if ln.strip()]
+name=sys.argv[2]
+raise SystemExit(0 if all(line != name and line != name + "/" for line in lines) else 1)
+PY
+      then
+        :
+      else
+        printf 'assert_remote_ls_missing_stable: %s reappeared under %s\n' "$name" "$parent" >&2
+        return 1
+      fi
+    elif [[ "$out" != *"not found"* && "$out" != *"Too Many Requests"* && "$out" != *"HTTP 429"* && "$out" != *"HTTP 403"* && "$out" != *"403 Forbidden"* ]]; then
+      printf '%s\n' "$out" >&2
+      return 1
+    fi
+
+    if python3 - "$deadline" <<'PY'
+import sys
+import time
+raise SystemExit(0 if time.time() >= float(sys.argv[1]) else 1)
+PY
+    then
+      return 0
+    fi
+    sleep "$interval_s"
+  done
+}
+
 wait_remote_cat_eq() {
   local path="$1"
   local want="$2"
@@ -931,7 +982,7 @@ if is_mounted "$MOUNT_POINT"; then
     check_cmd_fail "explicit path truncate rename source missing locally" test -e "$RW_PATH_TRUNC_RENAME_SRC_MOUNT"
     path_truncate_rename_size=$(wait_remote_stat_field_eq "$RW_PATH_TRUNC_RENAME_DST_REMOTE" "size" "0")
     path_truncate_rename_remote=$(wait_remote_cat_eq "$RW_PATH_TRUNC_RENAME_DST_REMOTE" "")
-    check_cmd "explicit path truncate rename source missing remotely" wait_remote_ls_missing_name "$RW_ALPHA_REMOTE" "path-truncate-rename-src.txt"
+    check_cmd "explicit path truncate rename source stays missing remotely" assert_remote_ls_missing_stable "$RW_ALPHA_REMOTE" "path-truncate-rename-src.txt"
     check_eq "explicit path truncate rename destination remote size is 0" "$path_truncate_rename_size" "0"
     check_eq "explicit path truncate rename destination remote content is empty" "$path_truncate_rename_remote" ""
   else
@@ -944,7 +995,7 @@ if is_mounted "$MOUNT_POINT"; then
   if path_truncate_zero "$RW_PATH_TRUNC_UNLINK_MOUNT" && rm -f "$RW_PATH_TRUNC_UNLINK_MOUNT"; then
     check_eq "explicit path truncate then unlink succeeds" "true" "true"
     check_cmd_fail "explicit path truncate unlink target missing locally" test -e "$RW_PATH_TRUNC_UNLINK_MOUNT"
-    check_cmd "explicit path truncate unlink target missing remotely" wait_remote_ls_missing_name "$RW_ALPHA_REMOTE" "path-truncate-unlink.txt"
+    check_cmd "explicit path truncate unlink target stays missing remotely" assert_remote_ls_missing_stable "$RW_ALPHA_REMOTE" "path-truncate-unlink.txt"
   else
     check_eq "explicit path truncate then unlink succeeds" "false" "true"
   fi
