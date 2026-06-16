@@ -25,6 +25,8 @@ import (
 
 type fakeProvisioner struct {
 	provider          string
+	cloudProvider     string
+	region            string
 	cluster           *tenant.ClusterInfo
 	initErr           error
 	provisionErr      error
@@ -37,6 +39,10 @@ type fakeProvisioner struct {
 }
 
 func (f *fakeProvisioner) ProviderType() string { return f.provider }
+
+func (f *fakeProvisioner) ProvisioningCloudProvider() string { return f.cloudProvider }
+
+func (f *fakeProvisioner) ProvisioningRegion() string { return f.region }
 
 func (f *fakeProvisioner) InitSchema(_ context.Context, dsn string) error {
 	if f.initErr != nil {
@@ -355,7 +361,7 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	if _, err := rand.Read(tokenSecret); err != nil {
 		t.Fatal(err)
 	}
-	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cluster: &tenant.ClusterInfo{
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1", cluster: &tenant.ClusterInfo{
 		ClusterID: "native-cluster-1",
 		Host:      "db.example",
 		Port:      4000,
@@ -405,6 +411,12 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	}
 	if out["tenant_id"] == "" || out["api_key"] == "" || out["status"] != string(meta.TenantProvisioning) {
 		t.Fatalf("unexpected response: %+v", out)
+	}
+	if out["cloud_provider"] != "aws" || out["region"] != "us-east-1" {
+		t.Fatalf("native cloud/region response = %+v", out)
+	}
+	if _, ok := out["mode"]; ok {
+		t.Fatalf("native provision response unexpectedly included mode: %+v", out)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)

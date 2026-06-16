@@ -51,7 +51,7 @@ func Ctx(args []string) error {
 func ctxUsage() string {
 	return `usage: drive9 ctx <show|add|import|fork|ls|use|rm>
   show [--json] [--reveal]                            show current context
-  add --api-key <key> [--name <n>] [--server <url>]   add owner context
+  add --api-key <key> [--name <n>] [--server <url>] [--mode <Anonymous|TiDBCloud>] [--cloud-provider <p>] [--region <r>]
   import --from-file <path>                           add delegated context from file (must be mode 0600)
   import --from-file -                                add delegated context from stdin explicitly
   import                                              add delegated context from stdin (default when stdin is a pipe)
@@ -62,20 +62,23 @@ func ctxUsage() string {
 }
 
 type ctxShowEntry struct {
-	Name      string     `json:"name"`
-	Type      string     `json:"type"`
-	Server    string     `json:"server,omitempty"`
-	TenantID  string     `json:"tenant_id,omitempty"`
-	APIKey    string     `json:"api_key,omitempty"`
-	Token     string     `json:"token,omitempty"`
-	Agent     string     `json:"agent,omitempty"`
-	Scope     []string   `json:"scope,omitempty"`
-	Perm      string     `json:"perm,omitempty"`
-	ExpiresAt *time.Time `json:"expires_at,omitempty"`
-	Status    string     `json:"status,omitempty"`
-	GrantID   string     `json:"grant_id,omitempty"`
-	LabelHint string     `json:"label_hint,omitempty"`
-	Source    string     `json:"source,omitempty"`
+	Name          string     `json:"name"`
+	Type          string     `json:"type"`
+	Server        string     `json:"server,omitempty"`
+	Mode          string     `json:"mode,omitempty"`
+	CloudProvider string     `json:"cloud_provider,omitempty"`
+	Region        string     `json:"region,omitempty"`
+	TenantID      string     `json:"tenant_id,omitempty"`
+	APIKey        string     `json:"api_key,omitempty"`
+	Token         string     `json:"token,omitempty"`
+	Agent         string     `json:"agent,omitempty"`
+	Scope         []string   `json:"scope,omitempty"`
+	Perm          string     `json:"perm,omitempty"`
+	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+	Status        string     `json:"status,omitempty"`
+	GrantID       string     `json:"grant_id,omitempty"`
+	LabelHint     string     `json:"label_hint,omitempty"`
+	Source        string     `json:"source,omitempty"`
 }
 
 func ctxShowCmd(args []string) error {
@@ -109,11 +112,14 @@ func buildCtxShowEntry(cfg *Config, reveal bool) *ctxShowEntry {
 	}
 
 	entry := &ctxShowEntry{
-		Name:     cfg.CurrentContext,
-		Type:     string(current.Type),
-		Server:   cfg.ResolveServer(),
-		TenantID: tenantIDFromContext(current),
-		Source:   configPath(),
+		Name:          cfg.CurrentContext,
+		Type:          string(current.Type),
+		Server:        cfg.ResolveServer(),
+		Mode:          strings.TrimSpace(current.Mode),
+		CloudProvider: strings.TrimSpace(current.CloudProvider),
+		Region:        strings.TrimSpace(current.Region),
+		TenantID:      tenantIDFromContext(current),
+		Source:        configPath(),
 	}
 
 	switch current.Type {
@@ -165,6 +171,24 @@ func writeCtxShowText(entry *ctxShowEntry) error {
 		{label: "name", value: entry.Name},
 		{label: "type", value: entry.Type},
 		{label: "server", value: entry.Server},
+	}
+	if entry.Mode != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "mode", value: entry.Mode})
+	}
+	if entry.CloudProvider != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "cloud_provider", value: entry.CloudProvider})
+	}
+	if entry.Region != "" {
+		fields = append(fields, struct {
+			label string
+			value string
+		}{label: "region", value: entry.Region})
 	}
 	if entry.TenantID != "" {
 		fields = append(fields, struct {
@@ -300,9 +324,12 @@ func formatSecretForDisplay(secret string, reveal bool) string {
 // preserved.
 func ctxAddCmd(args []string) error {
 	var (
-		apiKey string
-		name   string
-		server string
+		apiKey        string
+		name          string
+		server        string
+		mode          string
+		cloudProvider string
+		region        string
 	)
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -324,12 +351,39 @@ func ctxAddCmd(args []string) error {
 			}
 			i++
 			server = args[i]
+		case "--mode":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--mode requires a value")
+			}
+			i++
+			mode = strings.TrimSpace(args[i])
+		case "--cloud-provider":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--cloud-provider requires a value")
+			}
+			i++
+			cloudProvider = strings.TrimSpace(args[i])
+		case "--region":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--region requires a value")
+			}
+			i++
+			region = strings.TrimSpace(args[i])
 		default:
-			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx add --api-key <key> [--name <n>] [--server <url>]", args[i])
+			return fmt.Errorf("unknown flag %q\nusage: drive9 ctx add --api-key <key> [--name <n>] [--server <url>] [--mode <Anonymous|TiDBCloud>] [--cloud-provider <p>] [--region <r>]", args[i])
 		}
 	}
 	if apiKey == "" {
 		return fmt.Errorf("--api-key is required")
+	}
+	if mode != "" && !isKnownContextMode(mode) {
+		return fmt.Errorf("unknown --mode %q; valid: Anonymous, TiDBCloud", mode)
+	}
+	if (cloudProvider != "" || region != "") && mode == "" {
+		return fmt.Errorf("--cloud-provider and --region require --mode TiDBCloud")
+	}
+	if mode == regionModeLabel(RegionModeTiDBCloudStarter) && (cloudProvider != "" || region != "") {
+		return fmt.Errorf("anonymous contexts do not use --cloud-provider or --region")
 	}
 
 	cfg := loadConfig()
@@ -340,9 +394,12 @@ func ctxAddCmd(args []string) error {
 		name = randomName()
 	}
 	if _, err := ctxAdd(cfg, name, &Context{
-		Type:   PrincipalOwner,
-		Server: server,
-		APIKey: apiKey,
+		Type:          PrincipalOwner,
+		Server:        server,
+		APIKey:        apiKey,
+		Mode:          mode,
+		CloudProvider: cloudProvider,
+		Region:        region,
 	}); err != nil {
 		return err
 	}
@@ -785,18 +842,30 @@ func isKnownPrincipalType(value string) bool {
 	return false
 }
 
+func isKnownContextMode(value string) bool {
+	switch strings.TrimSpace(value) {
+	case regionModeLabel(RegionModeTiDBCloudStarter), regionModeLabel(RegionModeTiDBCloudNative):
+		return true
+	default:
+		return false
+	}
+}
+
 type ctxListEntry struct {
-	Name      string    `json:"name"`
-	Current   bool      `json:"current"`
-	Type      string    `json:"type"`
-	Server    string    `json:"server,omitempty"`
-	TenantID  string    `json:"tenant_id,omitempty"`
-	Scope     []string  `json:"scope,omitempty"`
-	Perm      string    `json:"perm,omitempty"`
-	ExpiresAt time.Time `json:"expires_at,omitempty"`
-	Status    string    `json:"status"`
-	Agent     string    `json:"agent,omitempty"`
-	GrantID   string    `json:"grant_id,omitempty"`
+	Name          string    `json:"name"`
+	Current       bool      `json:"current"`
+	Type          string    `json:"type"`
+	Server        string    `json:"server,omitempty"`
+	Mode          string    `json:"mode,omitempty"`
+	CloudProvider string    `json:"cloud_provider,omitempty"`
+	Region        string    `json:"region,omitempty"`
+	TenantID      string    `json:"tenant_id,omitempty"`
+	Scope         []string  `json:"scope,omitempty"`
+	Perm          string    `json:"perm,omitempty"`
+	ExpiresAt     time.Time `json:"expires_at,omitempty"`
+	Status        string    `json:"status"`
+	Agent         string    `json:"agent,omitempty"`
+	GrantID       string    `json:"grant_id,omitempty"`
 }
 
 func writeCtxListJSON(cfg *Config, typeFilter string) error {
@@ -823,9 +892,9 @@ func writeCtxListTable(cfg *Config, longForm, details bool, typeFilter string) e
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	if details {
-		_, _ = fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tTENANT_ID\tSERVER\tAGENT\tGRANT_ID\tSCOPE\tPERM\tEXPIRES_AT\tSTATUS")
+		_, _ = fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tMODE\tCLOUD_PROVIDER\tREGION\tTENANT_ID\tSERVER\tAGENT\tGRANT_ID\tSCOPE\tPERM\tEXPIRES_AT\tSTATUS")
 	} else {
-		_, _ = fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tSCOPE\tPERM\tEXPIRES_AT\tSTATUS")
+		_, _ = fmt.Fprintln(w, "CURRENT\tNAME\tTYPE\tMODE\tCLOUD_PROVIDER\tREGION\tSCOPE\tPERM\tEXPIRES_AT\tSTATUS")
 	}
 	for _, e := range entries {
 		cur := " "
@@ -846,10 +915,13 @@ func writeCtxListTable(cfg *Config, longForm, details bool, typeFilter string) e
 			if grantID == "" {
 				grantID = "—"
 			}
-			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				cur,
 				e.Name,
 				e.Type,
+				e.Mode,
+				e.CloudProvider,
+				e.Region,
 				e.TenantID,
 				e.Server,
 				agent,
@@ -860,10 +932,13 @@ func writeCtxListTable(cfg *Config, longForm, details bool, typeFilter string) e
 				e.Status,
 			)
 		} else {
-			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
 				cur,
 				e.Name,
 				e.Type,
+				e.Mode,
+				e.CloudProvider,
+				e.Region,
 				scope,
 				perm,
 				formatExpiresAt(e.ExpiresAt),
@@ -888,17 +963,20 @@ func buildCtxListEntries(cfg *Config) []ctxListEntry {
 			continue
 		}
 		entries = append(entries, ctxListEntry{
-			Name:      n,
-			Current:   n == cfg.CurrentContext,
-			Type:      string(c.Type),
-			Server:    c.Server,
-			TenantID:  tenantIDFromContext(c),
-			Scope:     c.Scope,
-			Perm:      string(c.Perm),
-			ExpiresAt: c.ExpiresAt,
-			Status:    ctxStatus(c, now),
-			Agent:     c.Agent,
-			GrantID:   c.GrantID,
+			Name:          n,
+			Current:       n == cfg.CurrentContext,
+			Type:          string(c.Type),
+			Server:        c.Server,
+			Mode:          strings.TrimSpace(c.Mode),
+			CloudProvider: strings.TrimSpace(c.CloudProvider),
+			Region:        strings.TrimSpace(c.Region),
+			TenantID:      tenantIDFromContext(c),
+			Scope:         c.Scope,
+			Perm:          string(c.Perm),
+			ExpiresAt:     c.ExpiresAt,
+			Status:        ctxStatus(c, now),
+			Agent:         c.Agent,
+			GrantID:       c.GrantID,
 		})
 	}
 	return entries

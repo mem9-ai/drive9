@@ -160,11 +160,17 @@ func Create(args []string) error {
 		return fmt.Errorf("decode response: %w", err)
 	}
 
-	if _, err := ctxAdd(cfg, name, &Context{
+	ctx := &Context{
 		Type:   PrincipalOwner,
 		Server: server,
 		APIKey: result.APIKey,
-	}); err != nil {
+		Mode:   regionModeLabel(mode),
+	}
+	if mode == RegionModeTiDBCloudNative {
+		ctx.CloudProvider = strings.TrimSpace(result.CloudProvider)
+		ctx.Region = strings.TrimSpace(result.Region)
+	}
+	if _, err := ctxAdd(cfg, name, ctx); err != nil {
 		return err
 	}
 	if err := saveConfig(cfg); err != nil {
@@ -173,18 +179,19 @@ func Create(args []string) error {
 
 	if asJSON {
 		out := createOutput{
-			Context:    name,
-			TenantID:   result.TenantID,
-			APIKey:     result.APIKey,
-			Status:     result.Status,
-			Server:     server,
-			RegionCode: regionCode,
-			Mode:       mode,
-			Config:     configPath(),
+			Context:       name,
+			TenantID:      result.TenantID,
+			APIKey:        result.APIKey,
+			Status:        result.Status,
+			Server:        server,
+			RegionCode:    regionCode,
+			Mode:          regionModeLabel(mode),
+			CloudProvider: ctx.CloudProvider,
+			Region:        ctx.Region,
+			Config:        configPath(),
 		}
 		if regionEntry != nil {
 			out.RegionCode = strings.TrimSpace(regionEntry.RegionCode)
-			out.Mode = strings.TrimSpace(regionEntry.Mode)
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -204,20 +211,24 @@ const (
 )
 
 type createResult struct {
-	TenantID string `json:"tenant_id"`
-	APIKey   string `json:"api_key"`
-	Status   string `json:"status"`
+	TenantID      string `json:"tenant_id"`
+	APIKey        string `json:"api_key"`
+	Status        string `json:"status"`
+	CloudProvider string `json:"cloud_provider"`
+	Region        string `json:"region"`
 }
 
 type createOutput struct {
-	Context    string `json:"context"`
-	TenantID   string `json:"tenant_id"`
-	APIKey     string `json:"api_key"`
-	Status     string `json:"status"`
-	Server     string `json:"server"`
-	RegionCode string `json:"region_code,omitempty"`
-	Mode       string `json:"mode,omitempty"`
-	Config     string `json:"config"`
+	Context       string `json:"context"`
+	TenantID      string `json:"tenant_id"`
+	APIKey        string `json:"api_key"`
+	Status        string `json:"status"`
+	Server        string `json:"server"`
+	RegionCode    string `json:"region_code,omitempty"`
+	Mode          string `json:"mode,omitempty"`
+	CloudProvider string `json:"cloud_provider,omitempty"`
+	Region        string `json:"region,omitempty"`
+	Config        string `json:"config"`
 }
 
 func createUsage() string {

@@ -112,9 +112,11 @@ func TestCreateServerOverrideSendsNativeBodyAndSkipsManifest(t *testing.T) {
 		bodyCh <- gotBody
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"tenant_id": "tenant-native",
-			"api_key":   "owner-native",
-			"status":    "provisioning",
+			"tenant_id":      "tenant-native",
+			"api_key":        "owner-native",
+			"status":         "provisioning",
+			"cloud_provider": "aws",
+			"region":         "us-east-1",
 		})
 	}))
 	defer provision.Close()
@@ -169,8 +171,16 @@ func TestCreateServerOverrideSendsNativeBodyAndSkipsManifest(t *testing.T) {
 	if _, ok := result["region_code"]; ok {
 		t.Fatalf("json output included ignored region_code: %#v", result)
 	}
-	if result["mode"] != RegionModeTiDBCloudNative {
-		t.Fatalf("json mode = %q, want %q", result["mode"], RegionModeTiDBCloudNative)
+	if result["mode"] != "TiDBCloud" {
+		t.Fatalf("json mode = %q, want TiDBCloud", result["mode"])
+	}
+	if result["cloud_provider"] != "aws" || result["region"] != "us-east-1" {
+		t.Fatalf("json cloud/region = %#v", result)
+	}
+	cfg := loadConfig()
+	gotCtx := cfg.Contexts["native"]
+	if gotCtx == nil || gotCtx.Mode != "TiDBCloud" || gotCtx.CloudProvider != "aws" || gotCtx.Region != "us-east-1" {
+		t.Fatalf("saved native context = %#v", gotCtx)
 	}
 }
 
@@ -193,9 +203,11 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 		bodyCh <- gotBody
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{
-			"tenant_id": "tenant-native",
-			"api_key":   "owner-native",
-			"status":    "active",
+			"tenant_id":      "tenant-native",
+			"api_key":        "owner-native",
+			"status":         "active",
+			"cloud_provider": "aws",
+			"region":         "us-east-1",
 		})
 	}))
 	defer native.Close()
@@ -255,12 +267,19 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	if err := json.Unmarshal([]byte(out), &result); err != nil {
 		t.Fatalf("decode json output: %v\n%s", err, out)
 	}
-	if result["region_code"] != "aws-us-east-1" || result["mode"] != RegionModeTiDBCloudNative || result["server"] != native.URL {
+	if result["region_code"] != "aws-us-east-1" || result["mode"] != "TiDBCloud" || result["server"] != native.URL {
 		t.Fatalf("json output = %#v, want trimmed native manifest values", result)
 	}
+	if result["cloud_provider"] != "aws" || result["region"] != "us-east-1" {
+		t.Fatalf("json cloud/region = %#v", result)
+	}
 	cfg := loadConfig()
-	if got := cfg.Contexts["native-region"].Server; got != native.URL {
+	saved := cfg.Contexts["native-region"]
+	if got := saved.Server; got != native.URL {
 		t.Fatalf("saved server = %q, want native %q", got, native.URL)
+	}
+	if saved.Mode != "TiDBCloud" || saved.CloudProvider != "aws" || saved.Region != "us-east-1" {
+		t.Fatalf("saved native context = %#v", saved)
 	}
 }
 

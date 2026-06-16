@@ -80,6 +80,11 @@ type credentialProvisionRequestValidator interface {
 	ValidateCredentialProvisionRequest(tenant.CredentialProvisionRequest) error
 }
 
+type provisioningRegionProvider interface {
+	ProvisioningCloudProvider() string
+	ProvisioningRegion() string
+}
+
 type Server struct {
 	fallback            *backend.Dat9Backend
 	meta                *meta.Store
@@ -3409,11 +3414,20 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(map[string]string{
+	response := map[string]string{
 		"tenant_id": res.TenantID,
 		"api_key":   res.APIKey,
 		"status":    string(res.Status),
-	})
+	}
+	if res.Provider == tenant.ProviderTiDBCloudNative {
+		if res.CloudProvider != "" {
+			response["cloud_provider"] = res.CloudProvider
+		}
+		if res.Region != "" {
+			response["region"] = res.Region
+		}
+	}
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
@@ -3464,12 +3478,14 @@ type provisionTenantOptions struct {
 }
 
 type provisionTenantResult struct {
-	TenantID  string
-	APIKey    string
-	APIKeyID  string
-	Status    meta.TenantStatus
-	Provider  string
-	TenantDSN string
+	TenantID      string
+	APIKey        string
+	APIKeyID      string
+	Status        meta.TenantStatus
+	Provider      string
+	TenantDSN     string
+	CloudProvider string
+	Region        string
 }
 
 type provisionTenantError struct {
@@ -3717,14 +3733,31 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
 	metricEvent(ctx, "tenant_provision", "provider", provider, "result", "accepted")
 
+	cloudProvider, region := "", ""
+	if provider == tenant.ProviderTiDBCloudNative {
+		cloudProvider, region = provisioningCloudRegion(s.provisioner)
+	}
 	return &provisionTenantResult{
-		TenantID:  tenantID,
-		APIKey:    apiToken,
-		APIKeyID:  apiKeyID,
-		Status:    meta.TenantProvisioning,
-		Provider:  provider,
-		TenantDSN: tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
+		TenantID:      tenantID,
+		APIKey:        apiToken,
+		APIKeyID:      apiKeyID,
+		Status:        meta.TenantProvisioning,
+		Provider:      provider,
+		TenantDSN:     tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
+		CloudProvider: cloudProvider,
+		Region:        region,
 	}, nil
+}
+
+func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {
+	if provisioner == nil {
+		return "", ""
+	}
+	regionProvider, ok := provisioner.(provisioningRegionProvider)
+	if !ok {
+		return "", ""
+	}
+	return strings.TrimSpace(regionProvider.ProvisioningCloudProvider()), strings.TrimSpace(regionProvider.ProvisioningRegion())
 }
 
 func (s *Server) persistFailedProvisionClusterInfo(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo) {

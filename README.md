@@ -140,6 +140,24 @@ DRIVE9_PRIVATE_KEY="$TIDBCLOUD_PRIVATE_KEY" \
 drive9 create --name dev-native
 ```
 
+For TiDB Cloud native tenants, `drive9 create` stores the local context with
+`mode=TiDBCloud` and records `cloud_provider` / `region` when the server returns
+them. `drive9 ctx list` shows `MODE`, `CLOUD_PROVIDER`, and `REGION` by default;
+older contexts with no mode keep those fields empty.
+
+To add an existing owner API key for a native tenant manually, include the same
+metadata explicitly:
+
+```bash
+drive9 ctx add \
+  --name dev-native \
+  --server https://native-sg.drive9.ai \
+  --api-key "$DRIVE9_API_KEY" \
+  --mode TiDBCloud \
+  --cloud-provider aws \
+  --region us-east-1
+```
+
 `--server` has the highest priority. When it is set, the CLI bypasses the region
 manifest, ignores `--region-code`, and sends the request to that server directly:
 
