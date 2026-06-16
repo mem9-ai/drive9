@@ -1680,7 +1680,6 @@ func TestMountCmdPerfDirSetsDefaultProfilingOptions(t *testing.T) {
 		"--api-key", "sk-test",
 		"--perf-dir", perfDir,
 		"--perf-interval", "2s",
-		"--perf-heap-interval", "45s",
 		t.TempDir(),
 	})
 	if err != nil {
@@ -1710,8 +1709,8 @@ func TestMountCmdPerfDirSetsDefaultProfilingOptions(t *testing.T) {
 	if got.ProfileCPUInterval != defaultMountPerfCPUInterval {
 		t.Fatalf("ProfileCPUInterval = %v, want %v", got.ProfileCPUInterval, defaultMountPerfCPUInterval)
 	}
-	if got.ProfileHeapInterval != 45*time.Second {
-		t.Fatalf("ProfileHeapInterval = %v, want 45s", got.ProfileHeapInterval)
+	if got.ProfileHeapInterval != defaultMountPerfHeapInterval {
+		t.Fatalf("ProfileHeapInterval = %v, want %v", got.ProfileHeapInterval, defaultMountPerfHeapInterval)
 	}
 }
 

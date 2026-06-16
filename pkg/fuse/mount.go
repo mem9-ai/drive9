@@ -162,6 +162,9 @@ func (o *MountOptions) setDefaults() {
 	if o.Profiling.ProfileDir != "" && o.Profiling.CPUProfileInterval <= 0 {
 		o.Profiling.CPUProfileInterval = defaultCPUProfileInterval
 	}
+	if o.Profiling.ProfileDir != "" && o.Profiling.HeapProfileInterval <= 0 {
+		o.Profiling.HeapProfileInterval = defaultHeapProfileInterval
+	}
 }
 
 // Mount creates and serves a FUSE mount. It blocks until the filesystem

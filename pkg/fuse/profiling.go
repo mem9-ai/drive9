@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	defaultCPUProfileDuration = 30 * time.Second
-	defaultCPUProfileInterval = 10 * time.Minute
+	defaultCPUProfileDuration  = 30 * time.Second
+	defaultCPUProfileInterval  = 10 * time.Minute
+	defaultHeapProfileInterval = 10 * time.Minute
 )
 
 // ProfilingOptions configures optional runtime profiling for a FUSE mount.

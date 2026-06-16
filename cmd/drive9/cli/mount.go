@@ -34,6 +34,7 @@ const (
 	defaultMountPerfPprofAddr          = "127.0.0.1:0"
 	defaultMountPerfCPUDuration        = 30 * time.Second
 	defaultMountPerfCPUInterval        = 10 * time.Minute
+	defaultMountPerfHeapInterval       = 10 * time.Minute
 )
 
 var (
@@ -156,7 +157,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	perfMaxSamples := fs.Int("perf-max-samples", 0, "maximum samples per continuous perf JSONL segment (default 7200 when --perf-dir is set)")
 	perfCPUDuration := fs.Duration("perf-cpu-duration", 0, "CPU profile capture window duration (default 30s when --perf-dir is set)")
 	perfCPUInterval := fs.Duration("perf-cpu-interval", 0, "periodically capture CPU profiles at this interval (default 10m when --perf-dir is set)")
-	perfHeapInterval := fs.Duration("perf-heap-interval", 0, "periodically write heap profiles at this interval")
+	perfHeapInterval := fs.Duration("perf-heap-interval", 0, "periodically write heap profiles at this interval (default 10m when --perf-dir is set)")
 	perfAddr := fs.String("perf-addr", "", "serve live pprof on this address, e.g. 127.0.0.1:6060")
 
 	fs.Usage = func() {
@@ -237,6 +238,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	effectivePerfCPUDuration := *perfCPUDuration
 	effectivePerfCPUInterval := *perfCPUInterval
+	effectivePerfHeapInterval := *perfHeapInterval
 	if perfDirGiven {
 		if !perfCPUDurationGiven {
 			effectivePerfCPUDuration = defaultMountPerfCPUDuration
@@ -244,8 +246,11 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		if !perfCPUIntervalGiven {
 			effectivePerfCPUInterval = defaultMountPerfCPUInterval
 		}
+		if !perfHeapIntervalGiven {
+			effectivePerfHeapInterval = defaultMountPerfHeapInterval
+		}
 	}
-	if err := validateMountPerfFlags(perfDirGiven, *perfInterval, *perfMaxSamples, effectivePerfCPUDuration, effectivePerfCPUInterval, *perfHeapInterval, perfIntervalGiven, perfMaxSamplesGiven, perfCPUDurationGiven, perfCPUIntervalGiven, perfHeapIntervalGiven, perfAddrGiven); err != nil {
+	if err := validateMountPerfFlags(perfDirGiven, *perfInterval, *perfMaxSamples, effectivePerfCPUDuration, effectivePerfCPUInterval, effectivePerfHeapInterval, perfIntervalGiven, perfMaxSamplesGiven, perfCPUDurationGiven, perfCPUIntervalGiven, perfHeapIntervalGiven, perfAddrGiven); err != nil {
 		return err
 	}
 	var profileHeap, profileDir, perfJSONL, pprofAddr string
@@ -496,7 +501,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		ProfileCPUInterval:      effectivePerfCPUInterval,
 		ProfileHeap:             profileHeap,
 		ProfileDir:              profileDir,
-		ProfileHeapInterval:     *perfHeapInterval,
+		ProfileHeapInterval:     effectivePerfHeapInterval,
 		PprofAddr:               pprofAddr,
 		PerfSamplesPath:         perfJSONL,
 		PerfSampleInterval:      *perfInterval,

@@ -92,7 +92,7 @@ func TestStartProfilerWritesPeriodicCPUProfiles(t *testing.T) {
 	}
 }
 
-func TestMountOptionsProfileDirDefaultsCPUWindow(t *testing.T) {
+func TestMountOptionsProfileDirDefaultsProfileWindows(t *testing.T) {
 	opts := &MountOptions{
 		Profiling: ProfilingOptions{ProfileDir: t.TempDir()},
 	}
@@ -102,6 +102,9 @@ func TestMountOptionsProfileDirDefaultsCPUWindow(t *testing.T) {
 	}
 	if opts.Profiling.CPUProfileInterval != defaultCPUProfileInterval {
 		t.Fatalf("CPUProfileInterval = %v, want %v", opts.Profiling.CPUProfileInterval, defaultCPUProfileInterval)
+	}
+	if opts.Profiling.HeapProfileInterval != defaultHeapProfileInterval {
+		t.Fatalf("HeapProfileInterval = %v, want %v", opts.Profiling.HeapProfileInterval, defaultHeapProfileInterval)
 	}
 }
 
