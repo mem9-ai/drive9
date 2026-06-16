@@ -15,7 +15,7 @@ class PortedJuiceFSCacheConsistency(BaseModule):
     timeout = 1200
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         h1 = ctx.target.mount("ported_juicefs_cache_consistency", remote, cache_key="writer")
         h2 = ctx.target.mount("ported_juicefs_cache_consistency", remote, cache_key="reader")

@@ -18,7 +18,7 @@ class PortedJuiceFSFsrand(BaseModule):
     def run(self, ctx: Context) -> dict[str, Any]:
         cfg = module_config(ctx, self.id)
         ops = int(cfg.get("ops_by_preset", {}).get(ctx.selected_preset or "daily", 200))
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("ported_juicefs_fsrand", remote, durability="write-sync")
         oracle = ctx.tmp_dir / "oracle" / self.id

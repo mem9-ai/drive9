@@ -19,7 +19,7 @@ class CommunityVdbench(BaseModule):
         vdbench = ctx.deps.ensure_vdbench()
         if not shutil.which("java"):
             raise DependencyUnavailable("vdbench requires java")
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_vdbench", remote, durability="interactive")
         try:

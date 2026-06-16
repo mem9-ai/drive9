@@ -23,7 +23,7 @@ class GitOfficialPerf(BaseModule):
         if not perf_run.exists():
             raise DependencyUnavailable("Git t/perf runner not found")
         tests = module_config(ctx, self.id).get("tests", ["p0001-rev-list.sh"])
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("git_official_perf", remote, durability="interactive")
         try:

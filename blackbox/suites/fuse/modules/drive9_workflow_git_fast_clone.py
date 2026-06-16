@@ -12,7 +12,7 @@ class Drive9GitFastClone(Drive9WorkflowBase):
 
     def run(self, ctx: Context) -> dict[str, Any]:
         bare = ctx.target.create_git_fixture("git-fast-clone-fixture")
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("drive9_git_fast_clone", remote, profile="coding-agent")
         try:

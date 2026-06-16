@@ -34,11 +34,15 @@ blackbox/
   run.py                           generic blackbox entrypoint
   harness/
     runner.py                       CLI, selection, lifecycle, reporting
-    target.py                       Drive9 CLI/server/FUSE mount provider
-    deps.py                         external dependency resolution/cache
-    capabilities.py                 platform and FUSE capability detection
+    suite.py                        suite provider protocol and loader
+    deps.py                         generic dependency cache helpers
+    capabilities.py                 generic host capability detection
   suites/
     fuse/
+      provider.py                   FUSE suite lifecycle and wiring
+      target.py                     Drive9 CLI/server/FUSE mount provider
+      deps.py                       pjdfstest/LTP/fio/Git/etc preparation
+      capabilities.py               macFUSE/FUSE-T/Linux FUSE detection
       presets.json
       modules.json
       repos.json

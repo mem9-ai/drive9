@@ -12,7 +12,7 @@ class Drive9AutoPackUmountPath(Drive9WorkflowBase):
     description = "drive9 umount --pack-path persists selected coding-agent local-only paths."
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         archive_path = self.default_pack_archive(remote, "coding-agent")
         archive = f":{archive_path}"

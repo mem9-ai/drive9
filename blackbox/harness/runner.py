@@ -1,23 +1,20 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import os
 import platform
+import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-from .capabilities import detect_capabilities
 from .core import (
-    CACHE_ROOT,
     FAIL,
     PASS,
     RESULT_ROOT,
     SCHEMA,
-    SKIP,
     XFAIL,
     WARN,
     BlackboxError,
@@ -35,8 +32,7 @@ from .core import (
     utc_ts,
     write_json,
 )
-from .deps import DependencyManager
-from .target import Drive9TargetProvider
+from .suite import load_suite_provider
 
 
 class BlackboxRunner:
@@ -50,20 +46,13 @@ class BlackboxRunner:
         self.result_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else RESULT_ROOT / self.suite / self.session
         self.tmp_dir = self.result_dir / "tmp"
         self.recorder = Recorder(self.result_dir)
-        self.registry = load_module_registry(self.suite)
+        self.provider = load_suite_provider(self.suite, self.suite_config_dir)
+        self.registry = self.provider.module_registry()
         self.presets = load_json("presets.json", {}, self.suite_config_dir)
-        self.module_config = load_json("modules.json", {}, self.suite_config_dir)
-        self.config = {
-            "modules": self.module_config.get("modules", {}),
-            "groups": self.module_config.get("groups", {}),
-            "allowlists": {
-                "pjdfstest": load_json("allowlists/pjdfstest.json", load_json("pjdfstests-allowlist.json", {}, self.suite_config_dir), self.suite_config_dir),
-            },
-            "repos": load_json("repos.json", load_json("cases-perf.json", {}, self.suite_config_dir).get("repos", []), self.suite_config_dir),
-        }
-        self.capabilities = detect_capabilities()
-        self.target = Drive9TargetProvider(args, self.result_dir, self.recorder)
-        self.deps = DependencyManager(CACHE_ROOT, auto_fetch=not args.offline, recorder=self.recorder)
+        self.config = self.provider.load_config()
+        self.capabilities = self.provider.detect_capabilities()
+        self.target = self.provider.create_target(args, self.result_dir, self.recorder, session=self.session)
+        self.deps = self.provider.create_deps(auto_fetch=not args.offline, recorder=self.recorder)
         self.ctx = Context(
             args=args,
             session=self.session,
@@ -140,23 +129,16 @@ class BlackboxRunner:
             "category": self.args.category,
             "modules": self.selected,
             "runs": self.ctx.runs,
-            "server_mode": self.args.server_mode,
-            "server_url": self.target.server_url,
-            "drive9_cli": str(self.target.cli),
             "platform": platform.platform(),
             "capabilities": self.capabilities,
-            "cache_root": str(CACHE_ROOT),
             "suite_config_dir": str(self.suite_config_dir),
         }
+        manifest.update(self.provider.manifest_fields(self.ctx))
         try:
-            manifest["git_sha"] = self.target.capture(["git", "rev-parse", "HEAD"], timeout=20).strip()
+            proc = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20, check=False)
+            manifest["git_sha"] = proc.stdout.strip() if proc.returncode == 0 else "unknown"
         except Exception:
             manifest["git_sha"] = "unknown"
-        try:
-            if self.target.cli.exists():
-                manifest["drive9_version"] = self.target.capture([str(self.target.cli), "--version"], timeout=20).strip()
-        except Exception as exc:
-            manifest["drive9_version_error"] = str(exc)
         write_json(self.result_dir / "manifest.json", manifest)
 
     def write_report(self) -> None:
@@ -265,17 +247,17 @@ class BlackboxRunner:
         strict = bool(self.args.strict_prereqs)
         if self.args.preset:
             strict = strict or bool(self.presets.get(self.args.preset, {}).get("strict_prereqs", False))
-        if self.suite == "fuse" and not self.capabilities.get("fuse", {}).get("ok"):
-            detail = str(self.capabilities.get("fuse", {}).get("detail", "FUSE unavailable"))
-            self.recorder.record(ModuleRecord(module="prereq.fuse", category="prereq", status=SKIP, seconds=0, classification="platform skip", detail=detail))
+        prereq_records = self.provider.check_prerequisites(self.ctx)
+        if prereq_records:
+            for record in prereq_records:
+                self.recorder.record(record)
             self.write_manifest()
             self.write_report()
             if strict:
                 return 1
             return 0
         try:
-            self.target.build_cli()
-            self.target.start_server()
+            self.provider.setup(self.ctx)
             self.write_manifest()
             for module_id in self.selected:
                 self.run_module(module_id)
@@ -284,21 +266,21 @@ class BlackboxRunner:
             return 1 if self.recorder.has_failures() else 0
         finally:
             self.write_report()
-            self.target.cleanup()
+            self.provider.cleanup(self.ctx)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    suite_default = os.environ.get("BLACKBOX_SUITE", "fuse")
+    suite_default = os.environ.get("BLACKBOX_SUITE", "")
     parser = argparse.ArgumentParser(description="Run Drive9 blackbox modules.")
-    parser.add_argument("--suite", default=suite_default, help="Blackbox suite domain, e.g. fuse, cli, or api. Defaults to BLACKBOX_SUITE or fuse.")
+    parser.add_argument("--suite", default=suite_default, help="Blackbox suite domain. Defaults to BLACKBOX_SUITE.")
     selector = parser.add_mutually_exclusive_group(required=False)
     selector.add_argument("--preset", help="Run a suite preset, e.g. smoke, standard, or daily.")
-    selector.add_argument("--category", help="Run modules whose id/category has this prefix, e.g. community or ported.juicefs")
+    selector.add_argument("--category", help="Run modules whose id/category has this prefix.")
     selector.add_argument("--module", action="append", help="Run one module id or a comma-separated list. Can be repeated.")
     selector.add_argument("--group", help="Run a named module group from the selected suite, e.g. functional, posix, or perf.")
     selector.add_argument("--list", action="store_true", help="List available modules.")
     parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --list.")
-    parser.add_argument("--deps-only", action="store_true", help="Prepare external dependencies for selected modules without starting Drive9 or FUSE.")
+    parser.add_argument("--deps-only", action="store_true", help="Prepare external dependencies for selected modules without running suite setup.")
     parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS, BLACKBOX_<SUITE>_RUNS, or 3.")
     parser.add_argument("--server-mode", choices=["auto", "existing", "local"], default=env_value("SERVER_MODE", "auto", suite_default))
     parser.add_argument("--drive9-cli", default=env_value("DRIVE9_CLI", "", suite_default))
@@ -312,24 +294,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def normalize_suite_args(args: argparse.Namespace) -> str:
-    return args.suite
-
-
-def load_module_registry(suite: str) -> dict[str, Any]:
-    module_name = f"suites.{suite}.modules"
-    try:
-        module = importlib.import_module(module_name)
-    except ModuleNotFoundError as exc:
-        if exc.name == module_name:
-            raise BlackboxError(f"blackbox suite {suite!r} does not provide modules at {module_name}") from exc
-        raise
-    registry_factory = getattr(module, "module_registry", None)
-    if not callable(registry_factory):
-        raise BlackboxError(f"blackbox suite {suite!r} modules package must expose module_registry()")
-    registry = registry_factory()
-    if not isinstance(registry, dict):
-        raise BlackboxError(f"blackbox suite {suite!r} module_registry() must return a dict")
-    return registry
+    suite = str(args.suite or "").strip()
+    if not suite:
+        raise BlackboxError("--suite or BLACKBOX_SUITE is required")
+    return suite
 
 
 def emit_module_list(registry: dict[str, Any], output_format: str) -> int:

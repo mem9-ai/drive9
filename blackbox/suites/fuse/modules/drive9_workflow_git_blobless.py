@@ -12,7 +12,7 @@ class Drive9GitBlobless(Drive9WorkflowBase):
 
     def run(self, ctx: Context) -> dict[str, Any]:
         bare = ctx.target.create_git_fixture("git-blobless-fixture")
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("drive9_git_blobless", remote, profile="coding-agent")
         try:

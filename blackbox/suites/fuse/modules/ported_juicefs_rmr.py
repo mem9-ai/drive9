@@ -15,7 +15,7 @@ class PortedJuiceFSRmr(BaseModule):
     timeout = 900
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("ported_juicefs_rmr", remote, durability="interactive")
         try:

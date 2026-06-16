@@ -28,7 +28,7 @@ class CommunityPjdfstest(BaseModule):
         tests_dir, bin_path = ctx.deps.ensure_pjdfstest()
         cfg = module_config(ctx, self.id)
         groups = cfg.get("groups_by_preset", {}).get(ctx.selected_preset or "daily", "all")
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_pjdfstest", remote, durability="write-sync")
         try:

@@ -19,7 +19,7 @@ class CommunityPyxattr(BaseModule):
         ctx.deps.ensure_pyxattr()
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_pyxattr", remote, durability="write-sync")
         try:

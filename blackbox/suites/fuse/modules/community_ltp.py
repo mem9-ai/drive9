@@ -26,7 +26,7 @@ class CommunityLTPFS(BaseModule):
         runltp = shutil.which("runltp") or str(ltp / "runltp")
         if not Path(runltp).exists():
             raise DependencyUnavailable("runltp not found")
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_ltp_fs", remote, durability="write-sync")
         try:
@@ -51,7 +51,7 @@ class CommunityLTPSyscalls(CommunityLTPFS):
         runltp = shutil.which("runltp") or str(ltp / "runltp")
         if not Path(runltp).exists():
             raise DependencyUnavailable("runltp not found")
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_ltp_syscalls", remote, durability="write-sync")
         try:

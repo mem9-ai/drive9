@@ -11,10 +11,22 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .core import BlackboxError, CommandResult, MountHandle, REPO_ROOT, ensure_empty, utc_ts
+from harness.core import BlackboxError, CommandResult, REPO_ROOT, ensure_empty, utc_ts
+
+
+@dataclass
+class MountHandle:
+    mountpoint: Path
+    remote_root: str
+    proc: Any
+    log_dir: Path
+    cache_dir: Path
+    local_root: Path
+    profile: str
 
 
 def pick_port() -> int:
@@ -51,9 +63,11 @@ def http_json(method: str, url: str, token: str = "", body: dict[str, Any] | Non
         return int(exc.code), parsed, text
 
 
-class Drive9TargetProvider:
-    def __init__(self, args: Any, result_dir: Path, recorder: Any) -> None:
+class Drive9FuseTargetProvider:
+    def __init__(self, args: Any, result_dir: Path, recorder: Any, *, suite: str, session: str) -> None:
         self.args = args
+        self.suite = suite
+        self.session = session
         self.result_dir = result_dir
         self.recorder = recorder
         self.logs_dir = result_dir / "logs"
@@ -324,6 +338,13 @@ class Drive9TargetProvider:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(body.strip() + "\n", encoding="utf-8")
         return path
+
+    def remote_root(self, module_id: str, suffix: str = "") -> str:
+        safe_id = module_id.replace(".", "-").replace("_", "-")
+        parts = [f"blackbox-{self.suite}", self.session.replace("/", "-"), safe_id]
+        if suffix:
+            parts.append(suffix.strip("/"))
+        return "/" + "/".join(part.strip("/") for part in parts if part)
 
     def mount(
         self,

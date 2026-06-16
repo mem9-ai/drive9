@@ -30,7 +30,7 @@ build
 target
 """,
         )
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         h1 = ctx.target.mount("drive9_auto_pack_profile", remote, profile=profile, cache_key="first")
         try:

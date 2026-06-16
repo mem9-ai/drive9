@@ -19,7 +19,7 @@ class CommunityFio(BaseModule):
     def run(self, ctx: Context) -> dict[str, Any]:
         fio = ctx.deps.ensure_fio()
         size = module_config(ctx, self.id).get("size", "128m")
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_fio", remote, durability="interactive")
         try:

@@ -11,7 +11,7 @@ class Drive9PortablePack(Drive9WorkflowBase):
     description = "Built-in portable profile auto-packs the entire local overlay across remounts."
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         h1 = ctx.target.mount("drive9_portable_pack", remote, profile="portable", cache_key="first")
         try:

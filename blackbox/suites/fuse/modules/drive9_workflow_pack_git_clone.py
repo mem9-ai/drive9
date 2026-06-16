@@ -12,7 +12,7 @@ class Drive9PackGitClone(Drive9WorkflowBase):
 
     def run(self, ctx: Context) -> dict[str, Any]:
         bare = ctx.target.create_git_fixture("pack-git-clone-fixture")
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         archive = f":{remote}/git-pack.tar.gz"
         h1 = ctx.target.mount("drive9_pack_git_clone", remote, profile="coding-agent", cache_key="pack")

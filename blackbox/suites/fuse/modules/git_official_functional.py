@@ -25,7 +25,7 @@ class GitOfficialFunctional(BaseModule):
         tests = cfg.get("tests_by_preset", {}).get(ctx.selected_preset or "daily", cfg.get("default_tests", []))
         if not tests:
             raise ModuleSkip("no Git functional tests configured")
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("git_official_functional", remote, durability="write-sync")
         try:

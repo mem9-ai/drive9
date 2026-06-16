@@ -72,7 +72,7 @@ def env_value(suffix: str, default: str = "", suite: str | None = None) -> str:
     generic = f"BLACKBOX_{suffix}"
     if generic in os.environ:
         return os.environ[generic]
-    suite_name = suite or os.environ.get("BLACKBOX_SUITE", "fuse")
+    suite_name = suite or os.environ.get("BLACKBOX_SUITE", "")
     if suite_name:
         suite_specific = f"BLACKBOX_{suite_name.upper()}_{suffix}"
         if suite_specific in os.environ:
@@ -130,17 +130,6 @@ class CommandResult:
 
 
 @dataclass
-class MountHandle:
-    mountpoint: Path
-    remote_root: str
-    proc: Any
-    log_dir: Path
-    cache_dir: Path
-    local_root: Path
-    profile: str
-
-
-@dataclass
 class ModuleRecord:
     module: str
     category: str
@@ -178,20 +167,13 @@ class Context:
     capabilities: dict[str, Any]
     config: dict[str, Any]
     runs: int
-    suite: str = "fuse"
+    suite: str
     selected_preset: str = ""
 
     def artifact_dir(self, module_id: str) -> Path:
         path = self.result_dir / "artifacts" / module_id
         path.mkdir(parents=True, exist_ok=True)
         return path
-
-    def remote_root(self, module_id: str, suffix: str = "") -> str:
-        safe_id = module_id.replace(".", "-").replace("_", "-")
-        parts = [f"blackbox-{self.suite}", self.session.replace("/", "-"), safe_id]
-        if suffix:
-            parts.append(suffix.strip("/"))
-        return "/" + "/".join(part.strip("/") for part in parts if part)
 
     def metric(self, name: str, value: float, unit: str, labels: dict[str, str] | None = None) -> None:
         self.recorder.metric(name, value, unit, labels or {})

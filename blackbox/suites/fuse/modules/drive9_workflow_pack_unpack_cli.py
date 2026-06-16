@@ -11,7 +11,7 @@ class Drive9PackUnpackCLI(Drive9WorkflowBase):
     description = "Explicit drive9 pack/unpack round trip for overlay content under a FUSE mount."
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         archive = f":{remote}/explicit-pack.tar.gz"
         h1 = ctx.target.mount("drive9_pack_unpack_cli", remote, profile="coding-agent", cache_key="pack")

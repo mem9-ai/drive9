@@ -21,7 +21,7 @@ class Drive9WorkflowPerf(Drive9WorkflowBase):
         selected = [part.strip() for part in env_value("REPOS", "drive9,kimi-code", ctx.suite).split(",") if part.strip()]
         repos_cfg = ctx.config.get("repos", [])
         repos = [repo for repo in repos_cfg if repo.get("id") in selected]
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("drive9_workflow_perf", remote, profile="coding-agent", durability="interactive")
         try:

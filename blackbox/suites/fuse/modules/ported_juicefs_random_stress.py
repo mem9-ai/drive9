@@ -18,7 +18,7 @@ class PortedJuiceFSRandomStress(BaseModule):
         cfg = module_config(ctx, self.id)
         workers = int(cfg.get("workers", 4))
         files = int(cfg.get("files_per_worker", 64))
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("ported_juicefs_random_stress", remote, durability="interactive")
         errors: list[str] = []

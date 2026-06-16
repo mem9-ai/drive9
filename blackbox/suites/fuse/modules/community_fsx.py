@@ -16,7 +16,7 @@ class CommunityFSX(BaseModule):
 
     def run(self, ctx: Context) -> dict[str, Any]:
         fsx = ctx.deps.ensure_fsx()
-        remote = ctx.remote_root(self.id)
+        remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_fsx", remote, durability="write-sync")
         try:
