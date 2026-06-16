@@ -46,10 +46,26 @@ Each workspace is an isolated storage scope. The initial workspace is created du
 
 ```bash
 drive9 create --name <name>     # create an additional workspace
+drive9 region list              # list available provisioning regions and modes
+drive9 create --region-code <code>
 drive9 ctx                      # show current workspace
 drive9 ctx list                 # list all workspaces
 drive9 ctx <name>               # switch workspace
+drive9 delete                   # delete the current workspace/tenant
 ```
+
+Only run `drive9 delete` when the user explicitly asks to delete the current workspace/tenant. This is destructive and requires an owner API key; delegated and `fs_scoped` contexts cannot delete tenants.
+
+`drive9 create` uses the default Drive9 server when no server, region, or TiDB Cloud keys are provided. Use `drive9 region list` to see supported provisioning routes. Modes shown as `Anonymous` use Drive9-managed starter provisioning. Modes shown as `TiDBCloud` create the starter cluster in the user's TiDB Cloud account and require TiDB Cloud API keys:
+
+```bash
+drive9 create \
+  --region-code <code> \
+  --tidbcloud-public-key <public-key> \
+  --tidbcloud-private-key <private-key>
+```
+
+The TiDB Cloud keys can also be supplied through `DRIVE9_PUBLIC_KEY` and `DRIVE9_PRIVATE_KEY`. If `--server` is provided, it has highest priority and bypasses region manifest routing.
 
 ### File operations
 

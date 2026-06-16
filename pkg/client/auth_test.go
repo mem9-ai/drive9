@@ -1,8 +1,10 @@
 package client
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -51,6 +53,47 @@ func TestNewWithTokenSendsBearerJWT(t *testing.T) {
 	}
 	if gotAuth != "Bearer jwt-aaa.bbb.ccc" {
 		t.Fatalf("Authorization = %q, want %q", gotAuth, "Bearer jwt-aaa.bbb.ccc")
+	}
+}
+
+func TestRawDeleteSendsBearerAPIKeyAndBody(t *testing.T) {
+	t.Parallel()
+
+	var gotAuth string
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			t.Fatalf("method = %s, want DELETE", r.Method)
+		}
+		if r.URL.Path != "/v1/tenant" {
+			t.Fatalf("path = %s, want /v1/tenant", r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		if got := r.Header.Get("Content-Type"); got != "application/json" {
+			t.Fatalf("Content-Type = %q, want application/json", got)
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		gotBody = string(raw)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	resp, err := New(srv.URL, "owner-api-key-xyz").RawDelete("/v1/tenant", strings.NewReader(`{"public_key":"pub"}`))
+	if err != nil {
+		t.Fatalf("RawDelete: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
+	}
+	if gotAuth != "Bearer owner-api-key-xyz" {
+		t.Fatalf("Authorization = %q, want bearer API key", gotAuth)
+	}
+	if gotBody != `{"public_key":"pub"}` {
+		t.Fatalf("body = %q", gotBody)
 	}
 }
 

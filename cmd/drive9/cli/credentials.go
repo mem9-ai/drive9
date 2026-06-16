@@ -199,6 +199,14 @@ func consumeEnv(name string) string {
 	return trimmed
 }
 
+func readTrimEnv(name string) string {
+	raw, ok := os.LookupEnv(name)
+	if !ok {
+		return ""
+	}
+	return trimASCIISpace(raw)
+}
+
 func trimASCIISpace(s string) string {
 	start := 0
 	for start < len(s) && isASCIISpace(s[start]) {
