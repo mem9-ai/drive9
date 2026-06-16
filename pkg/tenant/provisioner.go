@@ -26,6 +26,11 @@ type Provisioner interface {
 	ProviderType() string
 }
 
+type Deprovisioner interface {
+	Provisioner
+	Deprovision(ctx context.Context, cluster *ClusterInfo) error
+}
+
 type CredentialProvisionRequest struct {
 	PublicKey    string
 	PrivateKey   string
@@ -35,6 +40,11 @@ type CredentialProvisionRequest struct {
 type CredentialProvisioner interface {
 	Provisioner
 	ProvisionWithCredentials(ctx context.Context, tenantID string, req CredentialProvisionRequest) (*ClusterInfo, error)
+}
+
+type CredentialDeprovisioner interface {
+	Provisioner
+	DeprovisionWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
 }
 
 type BranchProvisioner interface {

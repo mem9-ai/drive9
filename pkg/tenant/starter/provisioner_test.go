@@ -233,6 +233,31 @@ func TestProvisionReturnsSpendingLimitUpdateError(t *testing.T) {
 	}
 }
 
+func TestDeprovisionDeletesCluster(t *testing.T) {
+	var deleteCalled bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodDelete || r.URL.Path != "/v1beta1/clusters/c1" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		deleteCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{apiURL: ts.URL, apiKey: "public-1", apiSecret: "private-1", client: ts.Client()}
+	if err := p.Deprovision(context.Background(), &tenant.ClusterInfo{ClusterID: "c1"}); err != nil {
+		t.Fatalf("Deprovision: %v", err)
+	}
+	if !deleteCalled {
+		t.Fatal("delete was not called")
+	}
+}
+
 func TestProvisionBranchCreatesBranchFromSourceBranch(t *testing.T) {
 	var gotParentID string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

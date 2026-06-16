@@ -76,6 +76,12 @@ type MultipartUpload struct {
 	Key      string
 }
 
+// PrefixDeleteResult summarizes a best-effort prefix cleanup pass.
+type PrefixDeleteResult struct {
+	DeletedObjects          int64
+	AbortedMultipartUploads int64
+}
+
 // S3Client abstracts S3-compatible object store operations.
 // Implementations: LocalS3Client (testing), AWSS3Client (production).
 type S3Client interface {
@@ -118,6 +124,11 @@ type S3Client interface {
 	// PresignGetObjectRange returns a presigned URL for reading a byte range of
 	// an object. startByte and endByte are inclusive.
 	PresignGetObjectRange(ctx context.Context, key string, startByte, endByte int64, ttl time.Duration) (string, error)
+
+	// DeletePrefix removes all objects under prefix and aborts multipart uploads
+	// under the same prefix. Prefix is relative to the client's configured base
+	// prefix.
+	DeletePrefix(ctx context.Context, prefix string) (PrefixDeleteResult, error)
 }
 
 // Default presigned URL TTLs per design doc §11.2.

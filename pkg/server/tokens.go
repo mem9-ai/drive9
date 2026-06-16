@@ -48,7 +48,7 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "token management not enabled")
 		return
 	}
-	scope, ok := ownerScopeFromRequest(w, r)
+	scope, ok := ownerScopeFromRequest(w, r, "manage tokens")
 	if !ok {
 		return
 	}
@@ -82,14 +82,17 @@ func (s *Server) handleTokens(w http.ResponseWriter, r *http.Request) {
 	s.handleScopedTokenRevoke(w, r, scope, tokenID)
 }
 
-func ownerScopeFromRequest(w http.ResponseWriter, r *http.Request) (*TenantScope, bool) {
+func ownerScopeFromRequest(w http.ResponseWriter, r *http.Request, action string) (*TenantScope, bool) {
 	scope := ScopeFromContext(r.Context())
 	if scope == nil {
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return nil, false
 	}
 	if scope.IsScoped || scope.ScopeKind == meta.APIKeyScopeKindFS {
-		errJSON(w, http.StatusForbidden, "scoped token cannot manage tokens")
+		if strings.TrimSpace(action) == "" {
+			action = "perform this operation"
+		}
+		errJSON(w, http.StatusForbidden, "scoped token cannot "+action)
 		return nil, false
 	}
 	return scope, true
