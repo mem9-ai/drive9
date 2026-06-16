@@ -1634,6 +1634,7 @@ func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
 	}
 
 	err := MountCmd([]string{
+		"--foreground",
 		"--mode", "fuse",
 		"--server", "https://drive9.example",
 		"--api-key", "sk-test",

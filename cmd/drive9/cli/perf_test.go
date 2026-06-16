@@ -120,12 +120,3 @@ func readTarGzNames(t *testing.T, path string) []string {
 	}
 	return names
 }
-
-func containsString(values []string, want string) bool {
-	for _, v := range values {
-		if v == want {
-			return true
-		}
-	}
-	return false
-}
