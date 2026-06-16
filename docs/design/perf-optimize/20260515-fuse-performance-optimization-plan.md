@@ -1,9 +1,9 @@
-# FUSE Performance Optimization Plan
+# FUSE Perf Infrastructure Phase Report
 
-This document records the first Drive9 FUSE performance optimization phase and
-the follow-up plan. The phase started from EC2 Singapore profiling data and
-focused on two low-risk improvements: better performance diagnostics and lower
-large-write allocation.
+This document records the first Drive9 FUSE performance infrastructure phase.
+The current PR focuses on diagnostics, repeatable workload capture, and support
+bundle collection. It intentionally does not implement follow-up FUSE
+optimizations.
 
 ## Context
 
@@ -20,16 +20,17 @@ not change the bottleneck shape:
 - Large writes allocated much more than the file size in the Go client path.
 
 This data does not support a Rust rewrite of the FUSE layer as the first
-optimization. The higher-value targets are remote round trips, commit queue
-throughput, metadata long tails, read prefetch behavior, and avoidable Go
-allocations.
+optimization. The higher-value future targets are remote round trips, commit
+queue throughput, metadata long tails, read prefetch behavior, and avoidable Go
+allocations, but those are out of scope for this PR.
 
 ## Phase 1 Scope
 
-This phase is split into two reviewable PRs: one for perf diagnostics and this
-report, and one companion PR for the large-allocation code changes.
+This PR covers perf diagnostics and this report. Large-write allocation
+optimizations were measured during the same investigation, but code changes for
+that work are handled outside this PR.
 
-Implemented across the phase:
+Implemented in this PR:
 
 - Make `perf/mount/run.sh` portable outside a full git checkout.
 - Add `cold-read` to the perf harness.
@@ -39,15 +40,14 @@ Implemented across the phase:
 - Add non-stopping queue wait methods used by sync control.
 - Record the actual pprof listener address when `--pprof-addr 127.0.0.1:0`
   is used.
-- Reduce large-write allocation by growing `WriteBuffer` parts geometrically.
-- Bound multipart upload buffer preallocation by actual part count.
 
-Not implemented in this phase:
+Out of scope for this PR:
 
 - Commit queue concurrency matrix.
 - Small-file batch commit protocol.
 - Metadata list/stat long-tail optimization.
 - Read prefetch allocation optimization.
+- Large-write allocation code changes.
 
 ## Test Method
 
@@ -182,17 +182,16 @@ Alloc-space pprof exposed a new read-side hotspot:
 | `fuse.(*Prefetcher).startPrefetch.func1` | 46.38 MiB cumulative |
 | `fuse.NewServer.func2` | 6.98 MiB |
 
-This means read prefetch is now a first-class optimization track. The current
-prefetch path can allocate by reading whole ranges into memory and copying
-again, and the `cold-read` run read 48 MiB remotely for a 32 MiB user read.
-The next read-path optimization should avoid `ReadAll`-style whole-buffer
-materialization where possible and bound prefetch over-read.
+This means read prefetch should be considered in a future optimization PR. The
+current prefetch path can allocate by reading whole ranges into memory and
+copying again, and the `cold-read` run read 48 MiB remotely for a 32 MiB user
+read. This PR only makes the issue observable.
 
-## Optimization Tracks
+## Infrastructure Deliverables
 
-### Track 1: Make Perf Runs More Diagnostic
+### Perf Runs Are More Diagnostic
 
-Status: implemented in phase 1.
+Status: implemented in this PR.
 
 Implemented:
 
@@ -204,11 +203,11 @@ Implemented:
 The sync control path is intentionally opt-in and does not change normal
 directory `fsync` behavior.
 
-### Track 2: Reduce Large-Write Allocation
+### Large-Write Allocation Measurement
 
-Status: implemented in phase 1, with code changes split into a companion PR.
+Status: measured during this phase; code changes are outside this PR.
 
-Implemented:
+Measured companion changes:
 
 - `WriteBuffer.Write` now grows part capacity geometrically instead of
   reallocating at exact lengths.
@@ -220,68 +219,14 @@ Measured result:
 - `large-write` heap alloc max: `130.8 MiB -> 34.9 MiB`.
 - `large-write` alloc-space pprof total: `288.47 MiB -> 107.47 MiB`.
 
-### Track 3: Small-File Remote Commit Throughput
+## Deferred Work
 
-Status: not implemented yet.
+The following optimization tracks are intentionally removed from this PR and
+should not be treated as committed next steps here:
 
-The current commit queue hides close latency but still performs one remote
-write per small file. The EC2 small-file run confirms this:
+- Small-file remote commit throughput.
+- Metadata list/stat long-tail optimization.
+- Read prefetch allocation and over-read optimization.
 
-- 50 files generated 50 remote writes.
-- remote write average was about 5.1s.
-- default upload workers were 4.
-- wall time was about 69s.
-
-Next steps:
-
-- Run a commit queue concurrency matrix with `--upload-concurrency=1,2,4,8,16`
-  on the same EC2 host.
-- Add a server-supported small-file batch commit API if higher client-side
-  concurrency stops helping or starts hurting tail latency.
-- Preserve per-file status and revision responses so failed files can fall
-  back to the existing single-file commit path.
-
-Expected impact:
-
-- Worker tuning may provide incremental wall-time improvement.
-- Batch commit is the likely order-of-magnitude improvement because it reduces
-  per-file HTTP/server transaction overhead.
-
-### Track 4: Metadata Long Tails
-
-Status: not implemented yet.
-
-Metadata scans currently depend on remote `stat` and `list`. Improvements
-should focus on:
-
-- batch stat/list APIs for directory walks,
-- better negative and positive namespace cache coverage,
-- reducing metadata scans while commit-queue self changes are still arriving,
-- recording phase timing on client and server for slow `list` calls.
-
-### Track 5: Read Prefetch Allocation and Over-Read
-
-Status: newly discovered from `cold-read`.
-
-The cold-read heap profile shows `io.ReadAll` and prefetch as dominant
-allocation sources. The read path should be optimized after Track 3 measurement
-because it is now clearly observable and independent of the write seed path.
-
-Candidate changes:
-
-- Replace `io.ReadAll` in prefetch with bounded reads into reusable buffers.
-- Avoid storing duplicate full-byte slices when a range can be streamed or
-  directly inserted into the read cache.
-- Bound prefetch distance and aggregate bytes so a 32 MiB user read does not
-  trigger materially more remote bytes than needed.
-- Add perf counters for prefetch remote bytes, cached bytes, dropped bytes, and
-  over-read ratio.
-
-## Recommended Next Phase
-
-1. Run the commit queue concurrency matrix on the Singapore EC2 host.
-2. Decide whether worker tuning is enough for the current service capacity.
-3. Design `batch-write-small` if per-file remote write latency remains dominant.
-4. Keep `cold-read` in every EC2 run so read-path regressions are visible.
-5. Implement read prefetch allocation/over-read fixes after small-file commit
-   measurements are in hand.
+They remain useful findings from the perf data, but any implementation should
+be started later as a separate scoped effort with fresh measurements.
