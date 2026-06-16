@@ -2425,6 +2425,35 @@ func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t 
 	}
 }
 
+func TestCommitQueueCancelQueuedZeroTruncateDoesNotCancelDispatchedBeforeInFlight(t *testing.T) {
+	entry := &CommitEntry{
+		Path:                 "/dispatched.txt",
+		Size:                 0,
+		Kind:                 PendingOverwrite,
+		CoalesceZeroTruncate: true,
+		dispatched:           true,
+	}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{entry},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/dispatched.txt") {
+		t.Fatal("cancel returned true for dispatched zero truncate")
+	}
+	if entry.canceled {
+		t.Fatal("dispatched zero truncate was canceled before in-flight")
+	}
+	if !cq.HasPath("/dispatched.txt") {
+		t.Fatal("dispatched zero truncate disappeared from queue")
+	}
+	if pending := cq.Pending(); pending != 1 {
+		t.Fatalf("pending after dispatched cancel attempt = %d, want 1", pending)
+	}
+}
+
 func markCommitEntryDelayedForTest(t *testing.T, cq *CommitQueue, entry *CommitEntry) {
 	t.Helper()
 	if cq.delayed == nil {
