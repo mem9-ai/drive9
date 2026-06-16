@@ -92,6 +92,27 @@ func TestStartProfilerWritesPeriodicCPUProfiles(t *testing.T) {
 	}
 }
 
+func TestStartCPUProfileConflictDoesNotCreateExtraFile(t *testing.T) {
+	dir := t.TempDir()
+	profiler := &Profiler{opts: ProfilingOptions{ProfileDir: dir}}
+	t.Cleanup(profiler.Stop)
+
+	if err := profiler.StartCPUProfile(); err != nil {
+		t.Fatalf("StartCPUProfile first: %v", err)
+	}
+	if err := profiler.StartCPUProfile(); err == nil {
+		t.Fatal("StartCPUProfile second error = nil, want conflict")
+	}
+
+	matches, err := filepath.Glob(filepath.Join(dir, "cpu-*.pprof"))
+	if err != nil {
+		t.Fatalf("glob cpu profiles: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("cpu profile matches = %v, want only active profile file", matches)
+	}
+}
+
 func TestMountOptionsProfileDirDefaultsProfileWindows(t *testing.T) {
 	opts := &MountOptions{
 		Profiling: ProfilingOptions{ProfileDir: t.TempDir()},

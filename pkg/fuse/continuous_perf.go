@@ -121,6 +121,8 @@ func StartContinuousPerf(opts ProfilingOptions, fs *Dat9FS) (*ContinuousPerfReco
 		close(r.doneCh)
 		return r, nil
 	}
+	// Re-apply defaults defensively for direct package callers that construct
+	// ProfilingOptions without going through MountOptions.setDefaults.
 	if opts.PerfSampleInterval <= 0 {
 		opts.PerfSampleInterval = 10 * time.Second
 		r.opts.PerfSampleInterval = opts.PerfSampleInterval
@@ -161,6 +163,8 @@ func (r *ContinuousPerfRecorder) Stop() {
 		}
 		close(r.stopCh)
 		<-r.doneCh
+		// Route the final sample through writeSample so it follows the same
+		// segment-size and rotation rules as interval samples.
 		if err := r.writeSample("stop"); err != nil {
 			fmt.Fprintf(os.Stderr, "drive9: write continuous perf sample: %v\n", err)
 		}

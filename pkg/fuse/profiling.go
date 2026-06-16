@@ -168,6 +168,11 @@ func (p *Profiler) startCPUProfile(path string) error {
 	if path == "" {
 		return fmt.Errorf("cpu profile path is required")
 	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cpuFile != nil {
+		return fmt.Errorf("cpu profile already running: %s", p.cpuPath)
+	}
 	if err := ensureParentDir(path); err != nil {
 		return err
 	}
@@ -176,12 +181,6 @@ func (p *Profiler) startCPUProfile(path string) error {
 		return fmt.Errorf("create cpu profile %s: %w", path, err)
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.cpuFile != nil {
-		_ = f.Close()
-		return fmt.Errorf("cpu profile already running: %s", p.cpuPath)
-	}
 	if err := pprof.StartCPUProfile(f); err != nil {
 		_ = f.Close()
 		return err
@@ -220,6 +219,8 @@ func (p *Profiler) cpuLoop() {
 		return
 	}
 
+	// Capture one startup window before the first interval tick so support
+	// bundles include the mount initialization baseline.
 	p.captureCPUProfile(p.defaultCPUProfilePath(), p.opts.CPUProfileDuration)
 	ticker := time.NewTicker(p.opts.CPUProfileInterval)
 	defer ticker.Stop()

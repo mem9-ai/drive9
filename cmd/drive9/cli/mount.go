@@ -158,7 +158,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	perfMaxSampleFiles := fs.Int("perf-max-sample-files", 0, "maximum retained continuous perf sample files (default 2 when --perf-dir is set)")
 	perfMaxProfileFiles := fs.Int("perf-max-profile-files", 0, "maximum retained CPU and heap profile files per type (default 48 when --perf-dir is set)")
 	perfCPUDuration := fs.Duration("perf-cpu-duration", 0, "CPU profile capture window duration (default 30s when --perf-dir is set)")
-	perfCPUInterval := fs.Duration("perf-cpu-interval", 0, "periodically capture CPU profiles at this interval (default 10m when --perf-dir is set)")
+	perfCPUInterval := fs.Duration("perf-cpu-interval", 0, "periodically capture CPU profiles at this interval; one capture starts immediately when profiling begins (default 10m when --perf-dir is set)")
 	perfHeapInterval := fs.Duration("perf-heap-interval", 0, "periodically write heap profiles at this interval (default 10m when --perf-dir is set)")
 	perfAddr := fs.String("perf-addr", "", "serve live pprof on this address, e.g. 127.0.0.1:6060")
 
@@ -254,7 +254,24 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 			effectivePerfHeapInterval = defaultMountPerfHeapInterval
 		}
 	}
-	if err := validateMountPerfFlags(perfDirGiven, *perfInterval, *perfMaxSamples, *perfMaxSampleFiles, *perfMaxProfileFiles, effectivePerfCPUDuration, effectivePerfCPUInterval, effectivePerfHeapInterval, perfIntervalGiven, perfMaxSamplesGiven, perfMaxSampleFilesGiven, perfMaxProfileFilesGiven, perfCPUDurationGiven, perfCPUIntervalGiven, perfHeapIntervalGiven, perfAddrGiven); err != nil {
+	if err := validateMountPerfFlags(mountPerfFlagValidation{
+		perfDirGiven:             perfDirGiven,
+		perfInterval:             *perfInterval,
+		perfMaxSamples:           *perfMaxSamples,
+		perfMaxSampleFiles:       *perfMaxSampleFiles,
+		perfMaxProfileFiles:      *perfMaxProfileFiles,
+		perfCPUDuration:          effectivePerfCPUDuration,
+		perfCPUInterval:          effectivePerfCPUInterval,
+		perfHeapInterval:         effectivePerfHeapInterval,
+		perfIntervalGiven:        perfIntervalGiven,
+		perfMaxSamplesGiven:      perfMaxSamplesGiven,
+		perfMaxSampleFilesGiven:  perfMaxSampleFilesGiven,
+		perfMaxProfileFilesGiven: perfMaxProfileFilesGiven,
+		perfCPUDurationGiven:     perfCPUDurationGiven,
+		perfCPUIntervalGiven:     perfCPUIntervalGiven,
+		perfHeapIntervalGiven:    perfHeapIntervalGiven,
+		perfAddrGiven:            perfAddrGiven,
+	}); err != nil {
 		return err
 	}
 	var profileHeap, profileDir, perfJSONL, pprofAddr string
@@ -810,45 +827,64 @@ func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int
 	return nil
 }
 
-func validateMountPerfFlags(perfDirGiven bool, perfInterval time.Duration, perfMaxSamples int, perfMaxSampleFiles int, perfMaxProfileFiles int, perfCPUDuration time.Duration, perfCPUInterval time.Duration, perfHeapInterval time.Duration, perfIntervalGiven bool, perfMaxSamplesGiven bool, perfMaxSampleFilesGiven bool, perfMaxProfileFilesGiven bool, perfCPUDurationGiven bool, perfCPUIntervalGiven bool, perfHeapIntervalGiven bool, perfAddrGiven bool) error {
-	if perfIntervalGiven && perfInterval <= 0 {
+type mountPerfFlagValidation struct {
+	perfDirGiven             bool
+	perfInterval             time.Duration
+	perfMaxSamples           int
+	perfMaxSampleFiles       int
+	perfMaxProfileFiles      int
+	perfCPUDuration          time.Duration
+	perfCPUInterval          time.Duration
+	perfHeapInterval         time.Duration
+	perfIntervalGiven        bool
+	perfMaxSamplesGiven      bool
+	perfMaxSampleFilesGiven  bool
+	perfMaxProfileFilesGiven bool
+	perfCPUDurationGiven     bool
+	perfCPUIntervalGiven     bool
+	perfHeapIntervalGiven    bool
+	perfAddrGiven            bool
+}
+
+func validateMountPerfFlags(v mountPerfFlagValidation) error {
+	if v.perfIntervalGiven && v.perfInterval <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-interval must be > 0")
 	}
-	if perfMaxSamplesGiven && perfMaxSamples <= 0 {
+	if v.perfMaxSamplesGiven && v.perfMaxSamples <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-max-samples must be > 0")
 	}
-	if perfMaxSampleFilesGiven && perfMaxSampleFiles <= 0 {
+	if v.perfMaxSampleFilesGiven && v.perfMaxSampleFiles <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-max-sample-files must be > 0")
 	}
-	if perfMaxProfileFilesGiven && perfMaxProfileFiles <= 0 {
+	if v.perfMaxProfileFilesGiven && v.perfMaxProfileFiles <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-max-profile-files must be > 0")
 	}
-	if perfCPUDurationGiven && perfCPUDuration <= 0 {
+	if v.perfCPUDurationGiven && v.perfCPUDuration <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-cpu-duration must be > 0")
 	}
-	if perfCPUIntervalGiven && perfCPUInterval <= 0 {
+	if v.perfCPUIntervalGiven && v.perfCPUInterval <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-cpu-interval must be > 0")
 	}
-	if perfHeapIntervalGiven && perfHeapInterval <= 0 {
+	if v.perfHeapIntervalGiven && v.perfHeapInterval <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-heap-interval must be > 0")
 	}
-	if perfDirGiven && perfCPUDuration >= perfCPUInterval {
+	if v.perfDirGiven && v.perfCPUDuration >= v.perfCPUInterval {
 		return fmt.Errorf("drive9 mount: --perf-cpu-duration must be less than --perf-cpu-interval")
 	}
 	for _, name := range []struct {
 		flag  string
 		given bool
 	}{
-		{"--perf-interval", perfIntervalGiven},
-		{"--perf-max-samples", perfMaxSamplesGiven},
-		{"--perf-max-sample-files", perfMaxSampleFilesGiven},
-		{"--perf-max-profile-files", perfMaxProfileFilesGiven},
-		{"--perf-cpu-duration", perfCPUDurationGiven},
-		{"--perf-cpu-interval", perfCPUIntervalGiven},
-		{"--perf-heap-interval", perfHeapIntervalGiven},
-		{"--perf-addr", perfAddrGiven},
+		{"--perf-interval", v.perfIntervalGiven},
+		{"--perf-max-samples", v.perfMaxSamplesGiven},
+		{"--perf-max-sample-files", v.perfMaxSampleFilesGiven},
+		{"--perf-max-profile-files", v.perfMaxProfileFilesGiven},
+		{"--perf-cpu-duration", v.perfCPUDurationGiven},
+		{"--perf-cpu-interval", v.perfCPUIntervalGiven},
+		{"--perf-heap-interval", v.perfHeapIntervalGiven},
+		{"--perf-addr", v.perfAddrGiven},
 	} {
-		if name.given && !perfDirGiven {
+		if name.given && !v.perfDirGiven {
 			return fmt.Errorf("drive9 mount: %s requires --perf-dir", name.flag)
 		}
 	}
