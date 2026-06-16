@@ -19,7 +19,8 @@ The framework is organized around modules, not around one-off scripts.
   performance modules.
 - `drive9.workflow.*`: Drive9 CLI workflows that are tightly coupled with FUSE,
   such as `drive9 git clone --fast`, blobless clone, worktrees, profile
-  auto-pack, `umount --pack-path`, portable profile, and explicit pack/unpack.
+  auto-pack, `umount --pack-path`, portable profile, explicit pack/unpack, and
+  coding-agent local overlay build behavior.
 
 The category names describe where the test idea or suite comes from. They do
 not imply that the tested filesystem is JuiceFS or Git. The tested filesystem is
@@ -80,7 +81,8 @@ The FUSE suite also defines named module groups:
 - `functional`: `ported.juicefs.*` plus Drive9 workflow modules.
 - `posix`: `community.pjdfstest`.
 - `perf`: performance modules such as fio, mdtest, vdbench, Git perf, and
-  Drive9 workflow perf.
+  Drive9 workflow perf. This group includes heavy repo workloads that are not
+  all part of the default `daily` preset.
 
 ## Commands
 
@@ -168,6 +170,8 @@ BLACKBOX_REPOS=drive9,kimi-code
 BLACKBOX_DRIVE9_CLI=/path/to/drive9
 BLACKBOX_OFFLINE=1
 BLACKBOX_KEEP_ARTIFACTS=1
+BLACKBOX_LOCAL_OVERLAY_PREWARM=0
+BLACKBOX_LOCAL_OVERLAY_VERIFY_REMOTE=0
 ```
 
 ## External Dependencies
@@ -289,7 +293,23 @@ Current workflow modules:
 - `drive9.workflow.pack_unpack_cli`
 - `drive9.workflow.pack_git_clone`
 - `drive9.workflow.perf`
+- `drive9.workflow.local_overlay_build`
 
-These cover the local overlay, Git workspace registration, fast clone modes,
-auto pack/unpack, explicit pack/unpack, build, grep/rg, edit, and commit paths
-that are central to Drive9 usability.
+These cover Git workspace registration, fast clone modes, auto pack/unpack,
+explicit pack/unpack, build, grep/rg, edit, and commit paths that are central
+to Drive9 usability.
+
+`drive9.workflow.local_overlay_build` is narrower than the general workflow
+performance module. It compares native checkout/build samples with FUSE samples
+mounted as `--profile=coding-agent`, using the repo-specific `local_overlay`
+configuration from `repos.json`. The FUSE sample writes probe files under
+local-only paths, checks that they land under `<local-root>/overlay`, then
+remounts the same remote root with `profile=none` to verify that those probes
+are not persisted remotely. This is the coverage for coding-agent local overlay
+semantics and local-dependency/build-output performance.
+
+Run it directly when you want this heavier matrix:
+
+```bash
+make blackbox-module BLACKBOX_MODULE=drive9.workflow.local_overlay_build
+```

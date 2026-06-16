@@ -14,6 +14,7 @@ from .drive9_workflow_auto_pack_umount_path import Drive9AutoPackUmountPath
 from .drive9_workflow_git_blobless import Drive9GitBlobless
 from .drive9_workflow_git_fast_clone import Drive9GitFastClone
 from .drive9_workflow_git_worktree import Drive9GitWorktree
+from .drive9_workflow_local_overlay_build import Drive9LocalOverlayBuild
 from .drive9_workflow_pack_git_clone import Drive9PackGitClone
 from .drive9_workflow_pack_unpack_cli import Drive9PackUnpackCLI
 from .drive9_workflow_perf import Drive9WorkflowPerf
@@ -54,5 +55,6 @@ def module_registry() -> dict[str, BaseModule]:
         Drive9PackUnpackCLI(),
         Drive9PackGitClone(),
         Drive9WorkflowPerf(),
+        Drive9LocalOverlayBuild(),
     ]
     return {module.id: module for module in modules}

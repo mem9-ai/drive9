@@ -19,7 +19,8 @@
       "community.mdtest",
       "community.vdbench",
       "git.official.perf",
-      "drive9.workflow.perf"
+      "drive9.workflow.perf",
+      "drive9.workflow.local_overlay_build"
     ]
   },
   "modules": {
@@ -120,6 +121,17 @@
         ],
         "sqlite_rows": 2000
       }
+    },
+    "drive9.workflow.local_overlay_build": {
+      "storages": [
+        "native",
+        "fuse"
+      ],
+      "prewarm": true,
+      "verify_remote_absence": true,
+      "profile": "coding-agent",
+      "durability": "interactive",
+      "allow_other": false
     }
   }
 }
