@@ -26,12 +26,13 @@ func TestUpdateCheckReportsAvailable(t *testing.T) {
 
 	var stdout bytes.Buffer
 	err := updateWithDeps([]string{"--check"}, updateDeps{
-		baseURL:        srv.URL,
-		currentVersion: "v0.1.0",
-		goos:           "linux",
-		goarch:         "amd64",
-		httpClient:     srv.Client(),
-		stdout:         &stdout,
+		baseURL:              srv.URL,
+		currentVersion:       "v0.1.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		httpClient:           srv.Client(),
+		stdout:               &stdout,
+		allowInsecureBaseURL: true,
 	})
 	if err != nil {
 		t.Fatalf("update --check: %v", err)
@@ -68,13 +69,14 @@ func TestUpdateDownloadsVerifiesAndReplacesExecutable(t *testing.T) {
 
 	var stdout bytes.Buffer
 	err := updateWithDeps(nil, updateDeps{
-		baseURL:        srv.URL,
-		currentVersion: "v0.1.0",
-		goos:           "linux",
-		goarch:         "amd64",
-		executable:     func() (string, error) { return target, nil },
-		httpClient:     srv.Client(),
-		stdout:         &stdout,
+		baseURL:              srv.URL,
+		currentVersion:       "v0.1.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		executable:           func() (string, error) { return target, nil },
+		httpClient:           srv.Client(),
+		stdout:               &stdout,
+		allowInsecureBaseURL: true,
 		replaceExecutable: func(newPath, targetPath string) error {
 			if err := os.Remove(targetPath); err != nil {
 				return err
@@ -108,13 +110,14 @@ func TestUpdateRejectsChecksumMismatch(t *testing.T) {
 	defer srv.Close()
 
 	err := updateWithDeps(nil, updateDeps{
-		baseURL:        srv.URL,
-		currentVersion: "v0.1.0",
-		goos:           "linux",
-		goarch:         "amd64",
-		executable:     func() (string, error) { return target, nil },
-		httpClient:     srv.Client(),
-		stdout:         &bytes.Buffer{},
+		baseURL:              srv.URL,
+		currentVersion:       "v0.1.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		executable:           func() (string, error) { return target, nil },
+		httpClient:           srv.Client(),
+		stdout:               &bytes.Buffer{},
+		allowInsecureBaseURL: true,
 		replaceExecutable: func(string, string) error {
 			t.Fatal("replaceExecutable must not run after checksum mismatch")
 			return nil
@@ -144,12 +147,13 @@ func TestUpdateDoesNotInstallDowngradeWithoutForce(t *testing.T) {
 
 	var stdout bytes.Buffer
 	err := updateWithDeps(nil, updateDeps{
-		baseURL:        srv.URL,
-		currentVersion: "v0.9.0",
-		goos:           "linux",
-		goarch:         "amd64",
-		httpClient:     srv.Client(),
-		stdout:         &stdout,
+		baseURL:              srv.URL,
+		currentVersion:       "v0.9.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		httpClient:           srv.Client(),
+		stdout:               &stdout,
+		allowInsecureBaseURL: true,
 		replaceExecutable: func(string, string) error {
 			t.Fatal("replaceExecutable must not run for downgrade without --force")
 			return nil
@@ -177,13 +181,14 @@ func TestUpdateForceInstallsDowngrade(t *testing.T) {
 	defer srv.Close()
 
 	err := updateWithDeps([]string{"--force"}, updateDeps{
-		baseURL:        srv.URL,
-		currentVersion: "v0.9.0",
-		goos:           "linux",
-		goarch:         "amd64",
-		executable:     func() (string, error) { return target, nil },
-		httpClient:     srv.Client(),
-		stdout:         &bytes.Buffer{},
+		baseURL:              srv.URL,
+		currentVersion:       "v0.9.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		executable:           func() (string, error) { return target, nil },
+		httpClient:           srv.Client(),
+		stdout:               &bytes.Buffer{},
+		allowInsecureBaseURL: true,
 		replaceExecutable: func(newPath, targetPath string) error {
 			if err := os.Remove(targetPath); err != nil {
 				return err
@@ -213,13 +218,14 @@ func TestUpdatePreflightReplaceRunsBeforeDownload(t *testing.T) {
 	defer srv.Close()
 
 	err := updateWithDeps(nil, updateDeps{
-		baseURL:          srv.URL,
-		currentVersion:   "v0.1.0",
-		goos:             "linux",
-		goarch:           "amd64",
-		httpClient:       srv.Client(),
-		stdout:           &bytes.Buffer{},
-		preflightReplace: func() error { return errUnsupported },
+		baseURL:              srv.URL,
+		currentVersion:       "v0.1.0",
+		goos:                 "linux",
+		goarch:               "amd64",
+		httpClient:           srv.Client(),
+		stdout:               &bytes.Buffer{},
+		allowInsecureBaseURL: true,
+		preflightReplace:     func() error { return errUnsupported },
 		replaceExecutable: func(string, string) error {
 			t.Fatal("replaceExecutable must not run after preflight failure")
 			return nil
@@ -230,6 +236,30 @@ func TestUpdatePreflightReplaceRunsBeforeDownload(t *testing.T) {
 	}
 	if got, want := strings.Join(requests, ","), "/releases/version"; got != want {
 		t.Errorf("requests = %q, want only %q", got, want)
+	}
+}
+
+func TestUpdateRejectsInsecureBaseURLByDefault(t *testing.T) {
+	var requests []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	err := updateWithDeps([]string{"--check"}, updateDeps{
+		baseURL:        srv.URL,
+		currentVersion: "v0.1.0",
+		goos:           "linux",
+		goarch:         "amd64",
+		httpClient:     srv.Client(),
+		stdout:         &bytes.Buffer{},
+	})
+	if err == nil || !strings.Contains(err.Error(), "must use https") {
+		t.Fatalf("update error = %v, want HTTPS requirement", err)
+	}
+	if len(requests) != 0 {
+		t.Fatalf("requests = %v, want none before HTTPS validation", requests)
 	}
 }
 
@@ -253,6 +283,23 @@ func TestCompareReleaseVersions(t *testing.T) {
 				t.Fatalf("compareReleaseVersions(%q, %q) = %v, want %v", tt.current, tt.latest, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseChecksumsRejectsPathQualifiedArtifactNames(t *testing.T) {
+	sum := strings.Repeat("a", sha256.Size*2)
+	_, err := parseChecksums([]byte(fmt.Sprintf("%s  releases/drive9-linux-amd64\n", sum)))
+	if err == nil || !strings.Contains(err.Error(), "must be a release artifact filename") {
+		t.Fatalf("parseChecksums error = %v, want artifact filename error", err)
+	}
+}
+
+func TestParseChecksumsRejectsDuplicateArtifactNames(t *testing.T) {
+	first := strings.Repeat("a", sha256.Size*2)
+	second := strings.Repeat("b", sha256.Size*2)
+	_, err := parseChecksums([]byte(fmt.Sprintf("%s  drive9-linux-amd64\n%s  drive9-linux-amd64\n", first, second)))
+	if err == nil || !strings.Contains(err.Error(), "duplicate checksum") {
+		t.Fatalf("parseChecksums error = %v, want duplicate checksum error", err)
 	}
 }
 

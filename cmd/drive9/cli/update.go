@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -26,35 +27,21 @@ const (
 )
 
 type updateDeps struct {
-	baseURL           string
-	currentVersion    string
-	goos              string
-	goarch            string
-	executable        func() (string, error)
-	httpClient        *http.Client
-	stdout            io.Writer
-	stderr            io.Writer
-	preflightReplace  func() error
-	replaceExecutable func(string, string) error
+	baseURL              string
+	currentVersion       string
+	goos                 string
+	goarch               string
+	executable           func() (string, error)
+	httpClient           *http.Client
+	stdout               io.Writer
+	stderr               io.Writer
+	allowInsecureBaseURL bool
+	preflightReplace     func() error
+	replaceExecutable    func(string, string) error
 }
 
 func defaultUpdateDeps() updateDeps {
-	baseURL := strings.TrimSpace(os.Getenv("DRIVE9_UPDATE_BASE_URL"))
-	if baseURL == "" {
-		baseURL = defaultUpdateBaseURL
-	}
-	return updateDeps{
-		baseURL:           baseURL,
-		currentVersion:    buildinfo.Version,
-		goos:              runtime.GOOS,
-		goarch:            runtime.GOARCH,
-		executable:        os.Executable,
-		httpClient:        &http.Client{Timeout: updateCommandTimeout},
-		stdout:            os.Stdout,
-		stderr:            os.Stderr,
-		preflightReplace:  preflightReplaceExecutableFile,
-		replaceExecutable: replaceExecutableFile,
-	}
+	return fillUpdateDeps(updateDeps{})
 }
 
 // Update updates the running drive9 CLI binary in place.
@@ -85,6 +72,9 @@ func updateWithDeps(args []string, deps updateDeps) error {
 		return fmt.Errorf("unexpected argument %q\n%s", fs.Arg(0), updateUsage())
 	}
 	deps.baseURL = normalizeUpdateBaseURL(*baseURL)
+	if err := validateUpdateBaseURL(deps.baseURL, deps.allowInsecureBaseURL); err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), updateCommandTimeout)
 	defer cancel()
@@ -446,11 +436,28 @@ func parseChecksums(data []byte) (map[string]string, error) {
 		if _, err := hex.DecodeString(sum); err != nil {
 			return nil, fmt.Errorf("invalid checksum for %s: %w", fields[1], err)
 		}
-		name := strings.TrimPrefix(fields[1], "*")
+		name, err := checksumArtifactName(fields[1])
+		if err != nil {
+			return nil, err
+		}
+		if _, exists := checksums[name]; exists {
+			return nil, fmt.Errorf("duplicate checksum for %s", name)
+		}
 		checksums[name] = sum
-		checksums[filepath.Base(name)] = sum
 	}
 	return checksums, nil
+}
+
+func checksumArtifactName(raw string) (string, error) {
+	name := strings.TrimPrefix(raw, "*")
+	if name == "" {
+		return "", errors.New("empty checksum artifact name")
+	}
+	clean := filepath.ToSlash(filepath.Clean(name))
+	if clean == "." || strings.HasPrefix(clean, "/") || strings.HasPrefix(clean, "../") || strings.Contains(clean, "/") {
+		return "", fmt.Errorf("checksum artifact %q must be a release artifact filename", raw)
+	}
+	return clean, nil
 }
 
 func downloadUpdateBinary(ctx context.Context, deps updateDeps, url, targetPath, wantSHA string) (string, error) {
@@ -538,6 +545,17 @@ func updateArtifactName(goos, goarch string) string {
 
 func normalizeUpdateBaseURL(baseURL string) string {
 	return strings.TrimRight(strings.TrimSpace(baseURL), "/")
+}
+
+func validateUpdateBaseURL(baseURL string, allowInsecure bool) error {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("invalid release base URL %q", baseURL)
+	}
+	if parsed.Scheme == "https" || allowInsecure {
+		return nil
+	}
+	return fmt.Errorf("release base URL %q must use https", baseURL)
 }
 
 func releaseURL(baseURL, name string) string {
