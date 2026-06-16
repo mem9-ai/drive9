@@ -97,7 +97,7 @@ func TestParseAndVerifyTokenRejectsLegacyThreeSegmentJWT(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rawJWTBytes, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(tok, tokenPrefix))
+	rawJWTBytes, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(tok, TokenPrefix))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +115,7 @@ func TestParseAndVerifyTokenAcceptsLegacyDat9Prefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	jwtB64 := strings.TrimPrefix(tok, tokenPrefix)
+	jwtB64 := strings.TrimPrefix(tok, TokenPrefix)
 	legacyTok := LegacyTokenPrefix + jwtB64
 
 	claims, err := ParseAndVerifyToken(secret, legacyTok)
@@ -133,7 +133,7 @@ func TestIssueTokenProducesDrive9Prefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(tok, tokenPrefix) {
-		t.Fatalf("token = %q, want prefix %q", tok, tokenPrefix)
+	if !strings.HasPrefix(tok, TokenPrefix) {
+		t.Fatalf("token = %q, want prefix %q", tok, TokenPrefix)
 	}
 }

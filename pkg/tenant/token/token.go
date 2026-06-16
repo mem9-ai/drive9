@@ -22,7 +22,7 @@ type Claims struct {
 }
 
 const (
-	tokenPrefix       = "drive9_"
+	TokenPrefix       = "drive9_"
 	LegacyTokenPrefix = "dat9_"
 )
 
@@ -67,7 +67,7 @@ func IssueTokenWithJournalPermissions(secret []byte, tenantID string, tokenVersi
 	mac.Write([]byte(msg))
 	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
 	jwt := msg + "." + sig
-	return tokenPrefix + base64.RawURLEncoding.EncodeToString([]byte(jwt)), nil
+	return TokenPrefix + base64.RawURLEncoding.EncodeToString([]byte(jwt)), nil
 }
 
 func ParseAndVerifyToken(secret []byte, raw string) (*Claims, error) {
@@ -77,8 +77,8 @@ func ParseAndVerifyToken(secret []byte, raw string) (*Claims, error) {
 func parseAndVerifyTokenAt(secret []byte, raw string, nowUnix int64) (*Claims, error) {
 	var stripped string
 	switch {
-	case strings.HasPrefix(raw, tokenPrefix):
-		stripped = strings.TrimPrefix(raw, tokenPrefix)
+	case strings.HasPrefix(raw, TokenPrefix):
+		stripped = strings.TrimPrefix(raw, TokenPrefix)
 	case strings.HasPrefix(raw, LegacyTokenPrefix):
 		stripped = strings.TrimPrefix(raw, LegacyTokenPrefix)
 	default:
