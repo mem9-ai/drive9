@@ -1491,15 +1491,28 @@ func (fs *Dat9FS) adoptSingleCallerPathTruncate(remotePath string, callerPID uin
 
 	adopted := false
 	for _, fh := range matching {
+		var abortStreamer func()
 		fh.Lock()
 		if shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
 			if err := fs.truncateWritableHandleLocked(fh, 0); err != nil {
 				log.Printf("handle truncate stage failed for %s: %v", fh.Path, err)
 			} else {
+				// Reset any in-progress stream uploader so that flushHandle
+				// does not finalize stale multipart state instead of
+				// committing the empty PendingNew file. Abort() performs
+				// network I/O, so capture and call it outside the lock.
+				if fh.Streamer != nil {
+					streamer := fh.Streamer
+					fh.Streamer = nil
+					abortStreamer = streamer.Abort
+				}
 				adopted = true
 			}
 		}
 		fh.Unlock()
+		if abortStreamer != nil {
+			abortStreamer()
+		}
 	}
 	return adopted
 }
