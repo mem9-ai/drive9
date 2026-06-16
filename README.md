@@ -22,13 +22,13 @@ working state in between.**
 
 ```bash
 # Sandbox A mounts the workspace and starts working.
-drive9 mount --mode=fuse --profile=coding-agent :/repo ./work
+drive9 mount --mode=fuse :/repo ./work
 mkdir -p ./work/notes
 printf 'fix attempt A\n' > ./work/notes/run-42.txt
 drive9 umount ./work
 
 # Sandbox A is gone. Sandbox B mounts the same workspace and continues.
-drive9 mount --mode=fuse --profile=coding-agent :/repo ./work
+drive9 mount --mode=fuse :/repo ./work
 cat ./work/notes/run-42.txt
 ```
 
@@ -59,7 +59,7 @@ shell scripts. Agents do not need a new file API.
 ```bash
 drive9 ctx add --name prod --server https://api.drive9.ai --api-key "$DRIVE9_API_KEY"
 drive9 ctx use prod
-drive9 mount --mode=fuse --profile=coding-agent :/ ~/drive9
+drive9 mount --mode=fuse :/ ~/drive9
 git clone https://github.com/mem9-ai/drive9.git ~/drive9/drive9
 ```
 
@@ -105,7 +105,7 @@ Clone repositories into a Drive9 mount with Git-aware fast clone support. Use a
 blobless local `.git` and hydrate clean tree content as needed.
 
 ```bash
-drive9 mount --mode=fuse --profile=coding-agent :/ ~/drive9
+drive9 mount --mode=fuse :/ ~/drive9
 drive9 git clone --fast --blobless --hydrate=background \
   https://github.com/mem9-ai/drive9.git ~/drive9/drive9
 ```
@@ -132,8 +132,8 @@ the base changed.
 drive9 fs layer create :/repo --name fix-auth-a --tag agent=a
 drive9 fs layer create :/repo --name fix-auth-b --tag agent=b
 
-drive9 mount --mode=fuse --profile=coding-agent --layer fix-auth-a :/repo ./attempt-a
-drive9 mount --mode=fuse --profile=coding-agent --layer fix-auth-b :/repo ./attempt-b
+drive9 mount --mode=fuse --layer fix-auth-a :/repo ./attempt-a
+drive9 mount --mode=fuse --layer fix-auth-b :/repo ./attempt-b
 
 # Each agent edits, tests, and checkpoints independently.
 drive9 fs layer checkpoint fix-auth-a --label tests-pass
@@ -216,7 +216,7 @@ Connect to a Drive9 server and mount a workspace:
 ```bash
 bin/drive9 ctx add --name dev --server https://api.drive9.ai --api-key "$DRIVE9_API_KEY"
 bin/drive9 ctx use dev
-bin/drive9 mount --mode=fuse --profile=coding-agent :/ ~/drive9
+bin/drive9 mount --mode=fuse :/ ~/drive9
 ```
 
 Simulate a sandbox handoff:
@@ -227,7 +227,7 @@ printf 'notes from run 42\n' > ~/drive9/run-42.txt
 bin/drive9 umount ~/drive9
 
 # Sandbox B
-bin/drive9 mount --mode=fuse --profile=coding-agent :/ ~/drive9
+bin/drive9 mount --mode=fuse :/ ~/drive9
 cat ~/drive9/run-42.txt
 ```
 
