@@ -434,7 +434,7 @@ environment:
   DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE provider base endpoint for models that require it
                                      optional for openai models; set it for Azure OpenAI endpoints
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter|tidbcloud_native (default for provisioning)
-  DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default Starter spendingLimit.monthly in USD cents; applied after pool takeover
+  DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default TiDB Cloud spendingLimit.monthly in USD cents; optional for Starter, native defaults to 1000 when unset
   DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Serverless API base URL for tidbcloud_native
   DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER cloud provider for tidbcloud_native cluster creation, e.g. aws
   DRIVE9_TIDBCLOUD_NATIVE_REGION region for tidbcloud_native cluster creation, e.g. us-east-1

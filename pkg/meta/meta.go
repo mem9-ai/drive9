@@ -99,8 +99,9 @@ type TenantAutoEmbeddingProfile struct {
 type StorageNamespaceState string
 
 const (
-	StorageNamespaceActive  StorageNamespaceState = "active"
-	StorageNamespaceDeleted StorageNamespaceState = "deleted"
+	StorageNamespaceActive   StorageNamespaceState = "active"
+	StorageNamespaceDeleting StorageNamespaceState = "deleting"
+	StorageNamespaceDeleted  StorageNamespaceState = "deleted"
 )
 
 type StorageNamespace struct {
@@ -131,6 +132,31 @@ const (
 	ObjectGCReasonFailedWrite ObjectGCCandidateReason = "failed_write"
 	ObjectGCReasonForkDelete  ObjectGCCandidateReason = "fork_delete"
 )
+
+type TenantDeleteJobState string
+
+const (
+	TenantDeleteJobPending TenantDeleteJobState = "pending"
+	TenantDeleteJobRunning TenantDeleteJobState = "running"
+	TenantDeleteJobDeleted TenantDeleteJobState = "deleted"
+)
+
+type TenantDeleteJob struct {
+	TenantID                string
+	NamespaceID             string
+	Backend                 string
+	Bucket                  string
+	Prefix                  string
+	State                   TenantDeleteJobState
+	Attempts                int
+	LastError               string
+	NotBefore               time.Time
+	DeletedObjects          int64
+	AbortedMultipartUploads int64
+	CreatedAt               time.Time
+	UpdatedAt               time.Time
+	CompletedAt             *time.Time
+}
 
 func (t Tenant) S3EncryptionPolicy() S3EncryptionPolicy {
 	return S3EncryptionPolicy{
@@ -415,6 +441,24 @@ func metaInitSchemaStatements() []string {
 			updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			INDEX idx_storage_namespace_owner (owner_tenant_id),
 			INDEX idx_storage_namespace_state (state)
+		)`,
+		`CREATE TABLE IF NOT EXISTS tenant_delete_jobs (
+			tenant_id                  VARCHAR(64) PRIMARY KEY,
+			namespace_id               VARCHAR(64) NOT NULL,
+			backend                    VARCHAR(16) NOT NULL,
+			bucket                     VARCHAR(255) NOT NULL DEFAULT '',
+			prefix                     VARCHAR(2048) NOT NULL,
+			state                      VARCHAR(20) NOT NULL DEFAULT 'pending',
+			attempts                   INT NOT NULL DEFAULT 0,
+			last_error                 TEXT NULL,
+			not_before                 DATETIME(3) NOT NULL,
+			deleted_objects            BIGINT NOT NULL DEFAULT 0,
+			aborted_multipart_uploads BIGINT NOT NULL DEFAULT 0,
+			created_at                 DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at                 DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			completed_at               DATETIME(3) NULL,
+			INDEX idx_tenant_delete_jobs_due (state, not_before),
+			INDEX idx_tenant_delete_jobs_namespace (namespace_id, state)
 		)`,
 		`CREATE TABLE IF NOT EXISTS object_gc_candidates (
 			namespace_id     VARCHAR(64) NOT NULL,
@@ -1759,6 +1803,27 @@ func (s *Store) GetStorageNamespace(ctx context.Context, id string) (out *Storag
 	return &ns, nil
 }
 
+func (s *Store) UpdateStorageNamespaceState(ctx context.Context, id string, state StorageNamespaceState) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_storage_namespace_state", start, &err)
+	if id == "" {
+		return fmt.Errorf("namespace id is required")
+	}
+	if state == "" {
+		return fmt.Errorf("namespace state is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE storage_namespaces SET state = ?, updated_at = ? WHERE namespace_id = ?`,
+		state, time.Now().UTC(), id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) EnsureTenantStorageNamespace(ctx context.Context, tenantID, backendName, bucket, prefix string) (out *StorageNamespace, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "ensure_tenant_storage_namespace", start, &err)
@@ -1814,6 +1879,199 @@ func (s *Store) EnsureTenantStorageNamespace(ctx context.Context, tenantID, back
 		return nil, err
 	}
 	return ns, nil
+}
+
+func (s *Store) EnqueueTenantDeleteJob(ctx context.Context, job *TenantDeleteJob) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "enqueue_tenant_delete_job", start, &err)
+	if job == nil {
+		return fmt.Errorf("tenant delete job is required")
+	}
+	if job.TenantID == "" {
+		return fmt.Errorf("tenant id is required")
+	}
+	if job.NamespaceID == "" {
+		return fmt.Errorf("namespace id is required")
+	}
+	if job.Backend == "" {
+		return fmt.Errorf("storage backend is required")
+	}
+	if job.Prefix == "" {
+		return fmt.Errorf("storage prefix is required")
+	}
+	notBefore := job.NotBefore.UTC()
+	if notBefore.IsZero() {
+		notBefore = time.Now().UTC()
+	}
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_delete_jobs
+		(tenant_id, namespace_id, backend, bucket, prefix, state, not_before, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			namespace_id = VALUES(namespace_id),
+			backend = VALUES(backend),
+			bucket = VALUES(bucket),
+			prefix = VALUES(prefix),
+			state = CASE WHEN state = 'deleted' THEN state ELSE 'pending' END,
+			not_before = LEAST(not_before, VALUES(not_before)),
+			updated_at = VALUES(updated_at)`,
+		job.TenantID, job.NamespaceID, job.Backend, job.Bucket, job.Prefix, TenantDeleteJobPending, notBefore, now, now)
+	return err
+}
+
+func (s *Store) TenantDeleteJobExists(ctx context.Context, tenantID string) (out bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "tenant_delete_job_exists", start, &err)
+	if tenantID == "" {
+		return false, fmt.Errorf("tenant id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT 1 FROM tenant_delete_jobs WHERE tenant_id = ? LIMIT 1`, tenantID)
+	var one int
+	if err := row.Scan(&one); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *Store) ListDueTenantDeleteJobs(ctx context.Context, now time.Time, limit int) (out []TenantDeleteJob, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_due_tenant_delete_jobs", start, &err)
+	if limit <= 0 {
+		limit = 25
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT tenant_id, namespace_id, backend, bucket, prefix,
+			state, attempts, COALESCE(last_error, ''), not_before, deleted_objects,
+			aborted_multipart_uploads, created_at, updated_at, completed_at
+		FROM tenant_delete_jobs
+		WHERE state = ? AND not_before <= ?
+		ORDER BY not_before ASC, created_at ASC
+		LIMIT ?`, TenantDeleteJobPending, now.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var job TenantDeleteJob
+		var completedAt sql.NullTime
+		if err := rows.Scan(&job.TenantID, &job.NamespaceID, &job.Backend, &job.Bucket, &job.Prefix,
+			&job.State, &job.Attempts, &job.LastError, &job.NotBefore, &job.DeletedObjects,
+			&job.AbortedMultipartUploads, &job.CreatedAt, &job.UpdatedAt, &completedAt); err != nil {
+			return nil, err
+		}
+		if completedAt.Valid {
+			t := completedAt.Time.UTC()
+			job.CompletedAt = &t
+		}
+		out = append(out, job)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) RecoverStaleTenantDeleteJobs(ctx context.Context, before time.Time) (n int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "recover_stale_tenant_delete_jobs", start, &err)
+	res, err := s.db.ExecContext(ctx, `UPDATE tenant_delete_jobs
+		SET state = ?, not_before = ?, last_error = ?, updated_at = ?
+		WHERE state = ? AND updated_at < ?`,
+		TenantDeleteJobPending, time.Now().UTC(), "recovered stale running delete job", time.Now().UTC(),
+		TenantDeleteJobRunning, before.UTC())
+	if err != nil {
+		return 0, err
+	}
+	n, _ = res.RowsAffected()
+	return n, nil
+}
+
+func (s *Store) MarkTenantDeleteJobRunning(ctx context.Context, tenantID string) (updated bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "mark_tenant_delete_job_running", start, &err)
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `UPDATE tenant_delete_jobs
+		SET state = ?, updated_at = ?
+		WHERE tenant_id = ? AND state = ? AND not_before <= ?`,
+		TenantDeleteJobRunning, now, tenantID, TenantDeleteJobPending, now)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+func (s *Store) RetryTenantDeleteJob(ctx context.Context, tenantID string, notBefore time.Time, lastError string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "retry_tenant_delete_job", start, &err)
+	_, err = s.db.ExecContext(ctx, `UPDATE tenant_delete_jobs
+		SET state = ?, not_before = ?, attempts = attempts + 1, last_error = ?, updated_at = ?
+		WHERE tenant_id = ? AND state = ?`,
+		TenantDeleteJobPending, notBefore.UTC(), nullStr(lastError), time.Now().UTC(), tenantID, TenantDeleteJobRunning)
+	return err
+}
+
+func (s *Store) MarkTenantDeleteJobDeleted(ctx context.Context, tenantID string, deletedObjects, abortedMultipartUploads int64) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "mark_tenant_delete_job_deleted", start, &err)
+	now := time.Now().UTC()
+	_, err = s.db.ExecContext(ctx, `UPDATE tenant_delete_jobs
+		SET state = ?, deleted_objects = ?, aborted_multipart_uploads = ?, completed_at = ?,
+			last_error = NULL, updated_at = ?
+		WHERE tenant_id = ?`,
+		TenantDeleteJobDeleted, deletedObjects, abortedMultipartUploads, now, now, tenantID)
+	return err
+}
+
+func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID string, deletedObjects, abortedMultipartUploads int64) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "finalize_tenant_delete", start, &err)
+	now := time.Now().UTC()
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenant_delete_jobs
+			SET state = ?, deleted_objects = ?, aborted_multipart_uploads = ?, completed_at = ?,
+				last_error = NULL, updated_at = ?
+			WHERE tenant_id = ? AND state = ?`,
+			TenantDeleteJobDeleted, deletedObjects, abortedMultipartUploads, now, now, tenantID, TenantDeleteJobRunning)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(res); err != nil {
+			return err
+		}
+		if namespaceID != "" {
+			res, err = tx.ExecContext(ctx, `UPDATE storage_namespaces SET state = ?, updated_at = ? WHERE namespace_id = ?`,
+				StorageNamespaceDeleted, now, namespaceID)
+			if err != nil {
+				return err
+			}
+			if err := requireAffected(res); err != nil {
+				return err
+			}
+		}
+		res, err = tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`,
+			TenantDeleted, now, tenantID)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(res); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func requireAffected(res sql.Result) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func getStorageNamespaceTx(ctx context.Context, tx *sql.Tx, id string) (*StorageNamespace, error) {

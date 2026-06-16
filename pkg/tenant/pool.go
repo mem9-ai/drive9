@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -366,6 +367,79 @@ func (p *Pool) InvalidateAndWait(ctx context.Context, tenantID string) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+func (p *Pool) S3ForStorageNamespace(ctx context.Context, ns *meta.StorageNamespace) (out s3client.S3Client, err error) {
+	start := time.Now()
+	namespaceID := ""
+	if ns != nil {
+		namespaceID = ns.ID
+	}
+	defer observePool(ctx, "s3_for_storage_namespace", namespaceID, &err, start)
+	if ns == nil {
+		return nil, fmt.Errorf("storage namespace is required")
+	}
+	switch ns.Backend {
+	case "s3":
+		if p.cfg.S3Bucket == "" {
+			return nil, fmt.Errorf("s3 bucket is not configured")
+		}
+		if ns.Bucket != "" && ns.Bucket != p.cfg.S3Bucket {
+			return nil, fmt.Errorf("storage namespace bucket %q does not match configured bucket", ns.Bucket)
+		}
+		return s3client.New(ctx, s3client.AWSConfig{
+			Region:          p.cfg.S3Region,
+			Bucket:          p.cfg.S3Bucket,
+			Prefix:          ns.Prefix,
+			RoleARN:         p.cfg.S3RoleARN,
+			Endpoint:        p.cfg.S3Endpoint,
+			ForcePathStyle:  p.cfg.S3ForcePathStyle,
+			AccessKeyID:     p.cfg.S3AccessKeyID,
+			SecretAccessKey: p.cfg.S3SecretAccessKey,
+			SessionToken:    p.cfg.S3SessionToken,
+		})
+	case "local":
+		if p.cfg.S3Dir == "" {
+			return nil, fmt.Errorf("local s3 dir is not configured")
+		}
+		localPrefix, err := cleanStorageNamespaceLocalPrefix(ns.Prefix)
+		if err != nil {
+			return nil, err
+		}
+		rootDir, err := filepath.Abs(p.cfg.S3Dir)
+		if err != nil {
+			return nil, fmt.Errorf("resolve local s3 dir: %w", err)
+		}
+		s3Dir := filepath.Join(rootDir, localPrefix)
+		if rel, err := filepath.Rel(rootDir, s3Dir); err != nil {
+			return nil, fmt.Errorf("resolve local storage namespace prefix: %w", err)
+		} else if rel == ".." || strings.HasPrefix(rel, "../") {
+			return nil, fmt.Errorf("storage namespace prefix escapes local s3 dir")
+		}
+		baseURL := strings.TrimRight(p.cfg.PublicURL, "/")
+		if baseURL != "" {
+			baseURL += "/s3/" + localPrefix
+		}
+		return s3client.NewLocal(s3Dir, baseURL)
+	default:
+		return nil, fmt.Errorf("unsupported storage backend %q", ns.Backend)
+	}
+}
+
+func cleanStorageNamespaceLocalPrefix(prefix string) (string, error) {
+	if filepath.IsAbs(prefix) {
+		return "", fmt.Errorf("storage namespace prefix must be relative")
+	}
+	localPrefix := strings.Trim(prefix, "/")
+	if localPrefix == "" {
+		return "", fmt.Errorf("storage namespace prefix is required")
+	}
+	for _, part := range strings.Split(localPrefix, "/") {
+		if part == "" || part == "." || part == ".." {
+			return "", fmt.Errorf("invalid storage namespace prefix %q", prefix)
+		}
+	}
+	return localPrefix, nil
 }
 
 func withTenantPoolDrainTimeout(ctx context.Context) (context.Context, context.CancelFunc) {

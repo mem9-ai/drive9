@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -315,6 +316,73 @@ func (c *LocalS3Client) DeleteObject(ctx context.Context, key string) error {
 		return err
 	}
 	return nil
+}
+
+func (c *LocalS3Client) DeletePrefix(ctx context.Context, prefix string) (PrefixDeleteResult, error) {
+	start := time.Now()
+	result := "ok"
+	defer func() { recordS3Operation("delete_prefix", result, start) }()
+
+	prefix = strings.TrimLeft(prefix, "/")
+	var out PrefixDeleteResult
+	objectsRoot := filepath.Join(c.rootDir, "objects")
+	targetRoot := filepath.Join(objectsRoot, filepath.FromSlash(prefix))
+	if prefix == "" {
+		targetRoot = objectsRoot
+	}
+	cleanObjectsRoot, err := filepath.Abs(objectsRoot)
+	if err != nil {
+		result = "error"
+		return out, err
+	}
+	cleanTargetRoot, err := filepath.Abs(targetRoot)
+	if err != nil {
+		result = "error"
+		return out, err
+	}
+	rel, err := filepath.Rel(cleanObjectsRoot, cleanTargetRoot)
+	if err != nil {
+		result = "error"
+		return out, err
+	}
+	if rel == ".." || strings.HasPrefix(rel, "../") || filepath.IsAbs(rel) {
+		result = "error"
+		return out, fmt.Errorf("prefix escapes local s3 root: %q", prefix)
+	}
+	if err := filepath.WalkDir(targetRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return filepath.SkipDir
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		out.DeletedObjects++
+		return nil
+	}); err != nil && !os.IsNotExist(err) {
+		result = "error"
+		return out, err
+	}
+
+	c.mu.Lock()
+	uploadIDs := make([]string, 0)
+	for uploadID, upload := range c.uploads {
+		if prefix == "" || strings.HasPrefix(upload.key, prefix) {
+			uploadIDs = append(uploadIDs, uploadID)
+			delete(c.uploads, uploadID)
+		}
+	}
+	c.mu.Unlock()
+	for _, uploadID := range uploadIDs {
+		_ = os.RemoveAll(filepath.Join(c.rootDir, "parts", uploadID))
+		out.AbortedMultipartUploads++
+	}
+	return out, nil
 }
 
 func (c *LocalS3Client) UploadPartCopy(ctx context.Context, destKey, uploadID string, partNumber int, sourceKey string, startByte, endByte int64) (string, error) {

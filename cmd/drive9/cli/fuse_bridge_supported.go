@@ -27,6 +27,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		CacheDir:                opts.CacheDir,
 		CacheSize:               opts.CacheSize,
 		ReadCacheMaxFileBytes:   opts.ReadCacheMaxFileBytes,
+		ReadCacheTTL:            opts.ReadCacheTTL,
 		DiskReadCacheSize:       opts.DiskReadCacheSize,
 		DiskReadCacheFreeRatio:  opts.DiskReadCacheFreeRatio,
 		DirTTL:                  opts.DirTTL,

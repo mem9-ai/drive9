@@ -227,6 +227,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v2/uploads/", business)
 	mux.Handle("/v1/tokens", business)
 	mux.Handle("/v1/tokens/", business)
+	mux.Handle("/v1/tenant", business)
 	mux.Handle("/v1/fork", business)
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
@@ -308,6 +309,7 @@ func NewWithConfig(cfg Config) *Server {
 		s.startPendingTenantReconciler()
 		s.resumeProvisioningTenants()
 		s.resumeDeletingForkTenants()
+		s.startTenantDeleteCleanup(backgroundWithTrace(context.Background()))
 	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
 	if s.semanticWorker != nil {
@@ -577,6 +579,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleV2Uploads(w, r)
 	case r.URL.Path == "/v1/tokens" || strings.HasPrefix(r.URL.Path, "/v1/tokens/"):
 		s.handleTokens(w, r)
+	case r.URL.Path == "/v1/tenant":
+		s.handleTenantDelete(w, r)
 	case r.URL.Path == "/v1/fork":
 		s.handleFork(w, r)
 	case r.URL.Path == "/v1/sql":
@@ -3437,10 +3441,20 @@ func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*
 		PrivateKey   string `json:"private_key"`
 		DatabaseName string `json:"database_name"`
 	}
+	return decodeCredentialRequest(w, r, &req, func() tenant.CredentialProvisionRequest {
+		return tenant.CredentialProvisionRequest{
+			PublicKey:    strings.TrimSpace(req.PublicKey),
+			PrivateKey:   strings.TrimSpace(req.PrivateKey),
+			DatabaseName: strings.TrimSpace(req.DatabaseName),
+		}
+	})
+}
+
+func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, build func() tenant.CredentialProvisionRequest) (*tenant.CredentialProvisionRequest, error) {
 	if r.Body != nil {
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCredentialProvisionBodyBytes))
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		if err := dec.Decode(raw); err != nil && !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("invalid JSON body: %w", err)
 		}
 		var extra struct{}
@@ -3448,15 +3462,11 @@ func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*
 			return nil, fmt.Errorf("invalid JSON body: trailing data")
 		}
 	}
-	out := &tenant.CredentialProvisionRequest{
-		PublicKey:    strings.TrimSpace(req.PublicKey),
-		PrivateKey:   strings.TrimSpace(req.PrivateKey),
-		DatabaseName: strings.TrimSpace(req.DatabaseName),
-	}
+	out := build()
 	if out.PublicKey == "" || out.PrivateKey == "" {
 		return nil, fmt.Errorf("public_key and private_key are required")
 	}
-	return out, nil
+	return &out, nil
 }
 
 type apiKeyIssueSource struct {

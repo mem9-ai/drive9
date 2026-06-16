@@ -237,7 +237,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		dirHandles:        NewHandleTable[*DirHandle](),
 		committedRev:      make(map[string]int64),
 		remoteCommitLocks: make(map[string]*sync.Mutex),
-		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, 0, opts.ReadCacheMaxFileBytes),
+		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, opts.ReadCacheTTL, opts.ReadCacheMaxFileBytes),
 		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
 		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
 		dirtyInodes:       make(map[uint64]dirtyInodeState),
@@ -2669,13 +2669,14 @@ func (fs *Dat9FS) stagePathTruncateToZeroLocked(ctx context.Context, entry *Inod
 	}
 
 	commit := &CommitEntry{
-		Path:    entry.Path,
-		Inode:   ino,
-		BaseRev: expectedRevision,
-		Size:    0,
-		Kind:    PendingOverwrite,
-		Mode:    mode,
-		HasMode: hasMode,
+		Path:                 entry.Path,
+		Inode:                ino,
+		BaseRev:              expectedRevision,
+		Size:                 0,
+		Kind:                 PendingOverwrite,
+		Mode:                 mode,
+		HasMode:              hasMode,
+		CoalesceZeroTruncate: true,
 	}
 	if err := fs.commitQueue.Enqueue(commit); err != nil {
 		log.Printf("path truncate async enqueue failed for %s: %v, falling back to sync commit", entry.Path, err)
@@ -5716,6 +5717,9 @@ func (fs *Dat9FS) lockHandleRemoteCommitPathLocked(fh *FileHandle) func() {
 	}
 	if fh.RemoteCommitUnlock != nil {
 		return func() {}
+	}
+	if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() == 0 {
+		_ = fs.canSupersedeQueuedPathTruncate(fh.Path)
 	}
 	fh.RemoteCommitUnlock = fs.lockWritableRemoteCommitPath(fh.Path)
 	return func() {

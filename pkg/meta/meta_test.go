@@ -615,6 +615,81 @@ func TestUpdateTenantStatus(t *testing.T) {
 	}
 }
 
+func TestFinalizeTenantDeleteUpdatesJobNamespaceAndTenant(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := s.InsertTenant(ctx, &Tenant{
+		ID:                 "delete-finalize-tenant",
+		Status:             TenantDeleting,
+		StorageNamespaceID: "delete-finalize-ns",
+		DBHost:             "127.0.0.1",
+		DBPort:             4000,
+		DBUser:             "root",
+		DBPasswordCipher:   []byte("cipher"),
+		DBName:             "tenant_delete_finalize",
+		DBTLS:              true,
+		Provider:           "tidb_cloud_starter",
+		SchemaVersion:      1,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertStorageNamespace(ctx, &StorageNamespace{
+		ID:            "delete-finalize-ns",
+		OwnerTenantID: "delete-finalize-tenant",
+		Backend:       "s3",
+		Bucket:        "bucket",
+		Prefix:        "tenant/delete-finalize-tenant",
+		State:         StorageNamespaceDeleting,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnqueueTenantDeleteJob(ctx, &TenantDeleteJob{
+		TenantID:    "delete-finalize-tenant",
+		NamespaceID: "delete-finalize-ns",
+		Backend:     "s3",
+		Bucket:      "bucket",
+		Prefix:      "tenant/delete-finalize-tenant",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.MarkTenantDeleteJobRunning(ctx, "delete-finalize-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated {
+		t.Fatal("MarkTenantDeleteJobRunning updated = false, want true")
+	}
+	if err := s.FinalizeTenantDelete(ctx, "delete-finalize-tenant", "delete-finalize-ns", 11, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	var jobState, nsState, tenantStatus string
+	var deletedObjects, abortedMultipartUploads int64
+	if err := s.DB().QueryRow(`SELECT state, deleted_objects, aborted_multipart_uploads FROM tenant_delete_jobs WHERE tenant_id = ?`, "delete-finalize-tenant").Scan(&jobState, &deletedObjects, &abortedMultipartUploads); err != nil {
+		t.Fatal(err)
+	}
+	if jobState != string(TenantDeleteJobDeleted) || deletedObjects != 11 || abortedMultipartUploads != 2 {
+		t.Fatalf("job = state %s deleted %d aborted %d, want deleted/11/2", jobState, deletedObjects, abortedMultipartUploads)
+	}
+	if err := s.DB().QueryRow(`SELECT state FROM storage_namespaces WHERE namespace_id = ?`, "delete-finalize-ns").Scan(&nsState); err != nil {
+		t.Fatal(err)
+	}
+	if nsState != string(StorageNamespaceDeleted) {
+		t.Fatalf("namespace state = %s, want %s", nsState, StorageNamespaceDeleted)
+	}
+	if err := s.DB().QueryRow(`SELECT status FROM tenants WHERE id = ?`, "delete-finalize-tenant").Scan(&tenantStatus); err != nil {
+		t.Fatal(err)
+	}
+	if tenantStatus != string(TenantDeleted) {
+		t.Fatalf("tenant status = %s, want %s", tenantStatus, TenantDeleted)
+	}
+}
+
 func TestListTenantsByStatus(t *testing.T) {
 	s := newControlStore(t)
 	now := time.Now().UTC()
@@ -822,6 +897,7 @@ func TestMetaSchemaSpecIncludesForkStorageNamespaceColumns(t *testing.T) {
 		t.Fatal("tenants schema missing idx_tenant_parent")
 	}
 	_ = mustMetaTableSpec(t, mustMetaSpec(t), "storage_namespaces")
+	_ = mustMetaTableSpec(t, mustMetaSpec(t), "tenant_delete_jobs")
 	_ = mustMetaTableSpec(t, mustMetaSpec(t), "object_gc_candidates")
 }
 
@@ -867,6 +943,91 @@ func TestMetaSchemaSpecIncludesTenantStatusCreatedIDIndex(t *testing.T) {
 	plans := plannedMetaSchemaRepairs([]metaSchemaDiff{indexDiff})
 	if len(plans) != 1 || plans[0] != wantCreateSQL {
 		t.Errorf("repair plans = %#v, want [%q]", plans, wantCreateSQL)
+	}
+}
+
+func TestFinalizeTenantDeleteRollsBackWhenTenantStatusUpdateFails(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := s.UpsertStorageNamespace(ctx, &StorageNamespace{
+		ID:            "delete-ns-rollback",
+		OwnerTenantID: "missing-delete-tenant",
+		Backend:       "s3",
+		Bucket:        "bucket",
+		Prefix:        "tenant/missing-delete-tenant",
+		State:         StorageNamespaceDeleting,
+		CreatedAt:     now,
+		UpdatedAt:     now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnqueueTenantDeleteJob(ctx, &TenantDeleteJob{
+		TenantID:    "missing-delete-tenant",
+		NamespaceID: "delete-ns-rollback",
+		Backend:     "s3",
+		Bucket:      "bucket",
+		Prefix:      "tenant/missing-delete-tenant",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.MarkTenantDeleteJobRunning(ctx, "missing-delete-tenant")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated {
+		t.Fatal("MarkTenantDeleteJobRunning updated = false, want true")
+	}
+
+	err = s.FinalizeTenantDelete(ctx, "missing-delete-tenant", "delete-ns-rollback", 7, 3)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("FinalizeTenantDelete error = %v, want ErrNotFound", err)
+	}
+
+	var jobState string
+	var deletedObjects int64
+	if err := s.DB().QueryRow(`SELECT state, deleted_objects FROM tenant_delete_jobs WHERE tenant_id = ?`, "missing-delete-tenant").Scan(&jobState, &deletedObjects); err != nil {
+		t.Fatal(err)
+	}
+	if jobState != string(TenantDeleteJobRunning) || deletedObjects != 0 {
+		t.Fatalf("tenant delete job = state %s deleted_objects %d, want running/0", jobState, deletedObjects)
+	}
+	var nsState string
+	if err := s.DB().QueryRow(`SELECT state FROM storage_namespaces WHERE namespace_id = ?`, "delete-ns-rollback").Scan(&nsState); err != nil {
+		t.Fatal(err)
+	}
+	if nsState != string(StorageNamespaceDeleting) {
+		t.Fatalf("namespace state = %s, want %s", nsState, StorageNamespaceDeleting)
+	}
+}
+
+func TestMarkTenantDeleteJobRunningHonorsNotBefore(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	future := time.Now().UTC().Add(time.Hour)
+	if err := s.EnqueueTenantDeleteJob(ctx, &TenantDeleteJob{
+		TenantID:    "delete-job-future",
+		NamespaceID: "delete-ns-future",
+		Backend:     "s3",
+		Bucket:      "bucket",
+		Prefix:      "tenant/delete-job-future",
+		NotBefore:   future,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := s.MarkTenantDeleteJobRunning(ctx, "delete-job-future")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated {
+		t.Fatal("MarkTenantDeleteJobRunning updated future job, want false")
+	}
+	var state string
+	if err := s.DB().QueryRow(`SELECT state FROM tenant_delete_jobs WHERE tenant_id = ?`, "delete-job-future").Scan(&state); err != nil {
+		t.Fatal(err)
+	}
+	if state != string(TenantDeleteJobPending) {
+		t.Fatalf("job state = %s, want %s", state, TenantDeleteJobPending)
 	}
 }
 

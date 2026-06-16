@@ -17,6 +17,7 @@ func TestNewProvisionerFromEnvReadsServerSideConfigOnly(t *testing.T) {
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
 	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
 	t.Setenv(EnvTiDBCloudNativeDefaultDatabaseName, "drive9_db")
+	t.Setenv(EnvTiDBCloudDefaultSpendingLimit, "5000")
 	t.Setenv("DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY", "must-not-be-read")
 	t.Setenv("DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY", "must-not-be-read")
 
@@ -32,6 +33,24 @@ func TestNewProvisionerFromEnvReadsServerSideConfigOnly(t *testing.T) {
 	}
 	if p.defaultDatabaseName != "drive9_db" {
 		t.Fatalf("default db = %q", p.defaultDatabaseName)
+	}
+	if p.defaultSpendLimit == nil || *p.defaultSpendLimit != 5000 {
+		t.Fatalf("default spend limit = %v, want 5000", p.defaultSpendLimit)
+	}
+}
+
+func TestNewProvisionerFromEnvUsesBuiltinDefaultSpendingLimit(t *testing.T) {
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
+	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
+	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+	t.Setenv(EnvTiDBCloudDefaultSpendingLimit, "")
+
+	p, err := NewProvisionerFromEnv()
+	if err != nil {
+		t.Fatalf("NewProvisionerFromEnv: %v", err)
+	}
+	if p.defaultSpendLimit == nil || *p.defaultSpendLimit != DefaultSpendLimit {
+		t.Fatalf("defaultSpendLimit = %v, want %d", p.defaultSpendLimit, DefaultSpendLimit)
 	}
 }
 
@@ -78,6 +97,21 @@ func TestNewProvisionerFromEnvRejectsInvalidDefaultDatabaseName(t *testing.T) {
 	}
 }
 
+func TestNewProvisionerFromEnvRejectsInvalidDefaultSpendingLimit(t *testing.T) {
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
+	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
+	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+	t.Setenv(EnvTiDBCloudDefaultSpendingLimit, "-1")
+
+	_, err := NewProvisionerFromEnv()
+	if err == nil {
+		t.Fatal("expected invalid default spending limit error")
+	}
+	if !strings.Contains(err.Error(), EnvTiDBCloudDefaultSpendingLimit) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testing.T) {
 	var ensureDBCalled bool
 	var pollCount int
@@ -98,6 +132,9 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 		Region       struct {
 			Name string `json:"name"`
 		} `json:"region"`
+		SpendingLimit struct {
+			Monthly int32 `json:"monthly"`
+		} `json:"spendingLimit"`
 	}
 	var requestCount int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -146,6 +183,7 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 		cloudProvider:       "aws",
 		region:              "us-east-1",
 		defaultDatabaseName: DefaultDatabaseName,
+		defaultSpendLimit:   int32Ptr(5000),
 		client:              ts.Client(),
 	}
 	out, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
@@ -171,6 +209,9 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	if gotBody.RootPassword == "" {
 		t.Fatal("rootPassword was empty")
 	}
+	if gotBody.SpendingLimit.Monthly != 5000 {
+		t.Fatalf("spendingLimit.monthly = %d, want 5000", gotBody.SpendingLimit.Monthly)
+	}
 	if out.ClusterID != "cluster-1" || out.Username != "u1.root" || out.DBName != "customer_db" || out.Provider != tenant.ProviderTiDBCloudNative {
 		t.Fatalf("unexpected cluster info: %#v", out)
 	}
@@ -180,6 +221,10 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	if pollCount < 2 {
 		t.Fatalf("poll count = %d, want at least 2", pollCount)
 	}
+}
+
+func int32Ptr(v int32) *int32 {
+	return &v
 }
 
 func TestProvisionWithCredentialsDefaultsDatabaseName(t *testing.T) {
@@ -270,6 +315,45 @@ func TestProvisionWithCredentialsIncludesUpstreamBodyOnError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "(truncated)") {
 		t.Fatalf("expected truncated upstream body, got: %v", err)
+	}
+}
+
+func TestDeprovisionWithCredentialsDeletesCluster(t *testing.T) {
+	var gotAuth string
+	var deleteCalled bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodDelete || r.URL.Path != "/v1beta1/clusters/cluster-1" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		deleteCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	if err := p.DeprovisionWithCredentials(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}); err != nil {
+		t.Fatalf("DeprovisionWithCredentials: %v", err)
+	}
+	if !deleteCalled {
+		t.Fatal("delete was not called")
+	}
+	if !strings.Contains(gotAuth, `username="public-1"`) {
+		t.Fatalf("Authorization header did not use request public key: %q", gotAuth)
+	}
+	if strings.Contains(gotAuth, "private-1") {
+		t.Fatalf("Authorization header leaked private key: %q", gotAuth)
 	}
 }
 
