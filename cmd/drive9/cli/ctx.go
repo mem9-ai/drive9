@@ -310,7 +310,7 @@ func formatSecretForDisplay(secret string, reveal bool) string {
 		return secret
 	}
 
-	if strings.HasPrefix(secret, "drive9_") && len(secret) > len("drive9_")+8 {
+	if (strings.HasPrefix(secret, "drive9_") || strings.HasPrefix(secret, "dat9_")) && len(secret) > len("drive9_")+8 {
 		return secret[:len("drive9_")+4] + "..." + secret[len(secret)-4:]
 	}
 
