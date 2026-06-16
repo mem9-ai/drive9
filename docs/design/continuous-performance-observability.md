@@ -90,37 +90,26 @@ Profiles are captured either by lifecycle hooks or on demand:
 - Future: short Go traces for scheduler/network/GC interactions.
 
 FUSE v1 exposes on-demand captures through the mount pprof server when
-`--pprof-addr` is set. `--perf-dir` enables that pprof server by default but
-does not start mount-lifetime CPU profiling; this keeps `drive9 perf collect`
-able to capture workload-window CPU profiles.
+`--pprof-addr` is set. In the current CLI scope, `--perf-dir` also writes a
+mount-lifetime `cpu.pprof` file so the mount can produce the necessary profile
+artifacts without a separate collection command.
 
-### 4. Support Bundle and Analyzer
+### 4. Future Support Bundle and Analyzer
 
-`drive9 perf collect` creates a local bundle for customer or developer analysis:
+The first CLI scope does not add a top-level perf command. A future support
+command can package the files produced by `--perf-dir`.
 
-```bash
-drive9 perf collect \
-  --mountpoint /mnt/drive9 \
-  --duration 60s \
-  --out drive9-perf.tar.gz
-```
-
-The bundle contains:
+That future bundle would contain:
 
 - recent perf JSONL segments;
 - generated `summary.json`;
-- CPU/heap/goroutine profiles when the mount pprof endpoint is available;
+- CPU/heap/goroutine profiles when available;
 - selected mount logs when available;
 - redacted manifest with OS/runtime/build/mount context.
 
-`drive9 perf summarize` produces `summary.json` from one JSONL file:
-
-```bash
-drive9 perf summarize --input perf.jsonl --out summary.json
-```
-
-The analyzer is intentionally local and file-based so it can run in CI,
-developer laptops, and customer environments without a metrics backend.
+A future analyzer can produce `summary.json` from one JSONL file. The analyzer
+should stay local and file-based so it can run in CI, developer laptops, and
+customer environments without a metrics backend.
 
 ## Sample Envelope
 
@@ -210,12 +199,10 @@ The first implementation lands these pieces:
 - latency histogram snapshots for FUSE and remote ops;
 - redacted mount context in every sample;
 - live pprof endpoints and CPU profile start/stop controls;
-- `drive9 perf summarize`;
-- `drive9 perf collect`;
-- `drive9 perf sync`.
 
 The following remain future work:
 
+- support bundle and JSONL analyzer commands, with names to be decided later;
 - server-side phase timing and distributed correlation;
 - block/mutex profile toggles;
 - Go trace capture;
@@ -229,19 +216,18 @@ The following remain future work:
 For local profiling:
 
 1. Run the same workload on Linux FUSE when drawing production conclusions.
-2. Compare `summary.json` before opening flame graphs.
+2. Inspect `perf.jsonl` before opening flame graphs.
 3. Use CPU profiles for CPU-bound runs.
 4. Use heap in-use for retained memory and alloc-space for churn.
 5. Use JSONL queue/cache/remote counters to explain profile hot spots.
 
 For customer support:
 
-1. Ask for `drive9 perf collect --mountpoint <mnt> --duration 60s`.
-2. Inspect `manifest.json` first to confirm version, host, and collection
-   completeness.
-3. Inspect `summary.json` for queue growth, cache misses, CPU, RSS, and remote
+1. Ask the customer to mount with `--perf-dir <dir>` and reproduce the issue.
+2. Ask them to archive the generated perf directory.
+3. Inspect `perf.jsonl` for queue growth, cache misses, CPU, RSS, and remote
    latency.
-4. Open pprof files only after identifying the likely class of problem.
+4. Open pprof files after identifying the likely class of problem.
 
 ## Privacy and Cardinality
 

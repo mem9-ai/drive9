@@ -17,7 +17,6 @@
 //	git     git-aware drive9 workflows
 //	region list provisioning regions
 //	profile show mount profile configuration
-//	perf    collect and summarize local performance diagnostics
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
 //	doctor  diagnose local drive9 runtime prerequisites
@@ -59,7 +58,6 @@ var unpackHandler = cli.UnpackCommand
 var profileHandler = cli.Profile
 var umountHandler = cli.UmountCmd
 var updateHandler = cli.Update
-var perfHandler = cli.Perf
 
 func main() {
 	if logger.CLIEnabled() {
@@ -233,21 +231,6 @@ func dispatch(cmd string, args []string) {
 		}
 		if err := profileHandler(args); err != nil {
 			fatal("profile", err)
-		}
-	case "perf":
-		if cliLogger != nil {
-			sub := ""
-			if len(args) > 0 {
-				sub = args[0]
-			}
-			logger.Info(context.Background(), "cli_command", zap.String("command", "perf"), zap.String("subcommand", sub))
-		}
-		if err := perfHandler(args); err != nil {
-			sub := ""
-			if len(args) > 0 {
-				sub = " " + args[0]
-			}
-			fatal("perf"+sub, err)
 		}
 	case "mount":
 		if cliLogger != nil {
@@ -428,8 +411,6 @@ func usage(code int) {
 			"                         restore a drive9 pack archive to a local overlay\n"+
 			"  profile show [profile]\n"+
 			"                         print mount profile configuration\n"+
-			"  perf <collect|summarize>\n"+
-			"                         collect and summarize local performance diagnostics\n"+
 			"  mount [flags] [:/remote] <mountpoint>\n"+
 			"                         mount drive9 filesystem\n"+
 			"  mount vault [flags] <mountpoint>\n"+

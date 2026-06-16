@@ -46,18 +46,18 @@ drive9 mount \
 `--perf-dir` enables the standard profiling suite and writes its default outputs
 under that directory:
 
+- `/tmp/drive9-perf/cpu.pprof`: CPU profile for the mount lifetime.
 - `/tmp/drive9-perf/heap-final.pprof`: final heap profile on unmount.
 - `/tmp/drive9-perf/perf.jsonl`: continuous low-overhead performance samples.
 - `/tmp/drive9-perf/`: default directory for periodic profiles and pprof
   control endpoint outputs.
 - `127.0.0.1:0`: live pprof listener on an ephemeral local port. The actual
-  address is recorded in mount state for `drive9 perf collect` and
-  `drive9 perf sync`.
+  address is recorded in mount state for manual pprof inspection.
 
-CPU profiles are collected as short windows through `drive9 perf collect` or the
-pprof control endpoint. This keeps the default profiled mount compatible with
-workload-window flame graphs. Operators that specifically need a mount-lifetime
-CPU profile can add `--profile-cpu /tmp/drive9-perf/cpu.pprof`.
+CPU profiling is mount-lifetime by default when `--perf-dir` is set, because the
+current scope does not add a top-level perf collection command. For
+short workload windows, start and stop the mount around the workload, or use the
+advanced `--pprof-addr` control endpoint manually.
 
 Advanced flags can override individual outputs or retention knobs:
 
@@ -234,8 +234,7 @@ claims about production FUSE behavior.
 1. Build the CLI from the exact commit under test.
 2. Start a FUSE mount with the desired profiling flags.
 3. Reproduce the slow or memory-heavy behavior.
-4. Use `drive9 perf collect` while the mount is running, or keep the raw
-   profiles and JSONL files configured on the mount.
+4. Keep the raw profiles and JSONL files configured on the mount.
 5. Inspect CPU profiles for hot CPU paths.
 6. Inspect heap in-use and allocation profiles separately:
    - in-use shows retained memory;
@@ -249,17 +248,10 @@ claims about production FUSE behavior.
 8. Compare runs only when commit, repro steps, durability, mount flags, host,
    and remote environment are known.
 
-For a running mount, collect a support bundle with:
-
-```bash
-drive9 perf collect --mountpoint /mnt/drive9 --duration 60s --out drive9-perf.tar.gz
-```
-
-For an existing JSONL file, generate a machine-readable summary with:
-
-```bash
-drive9 perf summarize --input perf.jsonl --out summary.json
-```
+For CPU summaries, use `go tool pprof` directly against `cpu.pprof`. For heap
+summaries, use `go tool pprof` against `heap-final.pprof` or periodic heap
+profiles. For JSONL samples, inspect `perf.jsonl` and `perf.jsonl.1` with local
+JSON tooling.
 
 ## Overhead Model
 
@@ -290,6 +282,8 @@ the target.
 
 ## Future Work
 
+- Add optional support bundle and JSONL analyzer commands if the CLI needs
+  first-class support bundles later.
 - Add a comparison tool for two perf JSONL summaries.
 - Add runtime scheduler, mutex, and block profile capture for concurrency
   investigations.
