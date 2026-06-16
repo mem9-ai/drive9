@@ -30,9 +30,13 @@ type fakeProvisioner struct {
 	cluster           *tenant.ClusterInfo
 	initErr           error
 	provisionErr      error
+	systemUserErr     error
+	systemUsername    string
+	systemPassword    string
 	deprovisionErr    error
 	provisionCalls    atomic.Int32
 	credentialCalls   atomic.Int32
+	systemUserCalls   atomic.Int32
 	deprovisionCalls  atomic.Int32
 	lastCredentialReq tenant.CredentialProvisionRequest
 	lastDeprovision   *tenant.ClusterInfo
@@ -49,6 +53,22 @@ func (f *fakeProvisioner) InitSchema(_ context.Context, dsn string) error {
 		return f.initErr
 	}
 	return nil
+}
+
+func (f *fakeProvisioner) EnsureSystemUser(_ context.Context, _ string, _ string) (string, string, error) {
+	f.systemUserCalls.Add(1)
+	if f.systemUserErr != nil {
+		return "", "", f.systemUserErr
+	}
+	username := f.systemUsername
+	if username == "" {
+		username = "u1.tidbcloud_fs_system"
+	}
+	password := f.systemPassword
+	if password == "" {
+		password = "system-pass"
+	}
+	return username, password, nil
 }
 
 func (f *fakeProvisioner) Provision(_ context.Context, tenantID string) (*tenant.ClusterInfo, error) {
@@ -434,12 +454,27 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	var provider, dbName string
-	if err := metaStore.DB().QueryRow("SELECT provider, db_name FROM tenants WHERE id = ?", out["tenant_id"]).Scan(&provider, &dbName); err != nil {
+	if got := prov.systemUserCalls.Load(); got == 0 {
+		t.Fatal("native system user setup was not called")
+	}
+
+	var provider, dbName, dbUser string
+	var passCipher []byte
+	if err := metaStore.DB().QueryRow("SELECT provider, db_name, db_user, db_password FROM tenants WHERE id = ?", out["tenant_id"]).Scan(&provider, &dbName, &dbUser, &passCipher); err != nil {
 		t.Fatal(err)
 	}
 	if provider != tenant.ProviderTiDBCloudNative || dbName != "customer_db" {
 		t.Fatalf("tenant provider/db = %s/%s", provider, dbName)
+	}
+	if dbUser != "u1.tidbcloud_fs_system" {
+		t.Fatalf("tenant db_user = %q, want system user", dbUser)
+	}
+	plain, err := pool.Decrypt(context.Background(), passCipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(plain) != "system-pass" {
+		t.Fatalf("tenant db password = %q, want system password", plain)
 	}
 }
 

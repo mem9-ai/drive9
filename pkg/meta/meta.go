@@ -1656,6 +1656,18 @@ func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *
 	return nil
 }
 
+func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, dbUser string, dbPasswordCipher []byte) (updated bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_db_credential_if", start, &err)
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET db_user = ?, db_password = ?, updated_at = ? WHERE id = ? AND db_user = ?`,
+		dbUser, dbPasswordCipher, time.Now().UTC(), id, fromDBUser)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 func (s *Store) UpdateTenantBranch(ctx context.Context, id string, cluster *Tenant) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_branch", start, &err)
