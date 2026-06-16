@@ -330,10 +330,11 @@ func indexOfForbiddenEnvByte(value string) int {
 	return -1
 }
 
-// scrubDrive9CredEnv implements the F14 scrub from spec §9 L209. Exactly
-// three variables are dropped from the child's base env:
+// scrubDrive9CredEnv implements the F14 scrub from spec §9 L209. Credential
+// variables are dropped from the child's base env:
 //
-//	DRIVE9_API_KEY, DRIVE9_VAULT_TOKEN, DRIVE9_SERVER
+//	DRIVE9_API_KEY, DRIVE9_VAULT_TOKEN, DRIVE9_SERVER,
+//	DRIVE9_PUBLIC_KEY, DRIVE9_PRIVATE_KEY
 //
 // Any other DRIVE9_* (e.g. DRIVE9_PROF_CPU_PROFILE, DRIVE9_CLI_LOG_*) is
 // preserved — profiling and logging controls are developer-side knobs that
@@ -349,7 +350,7 @@ func scrubDrive9CredEnv(base []string) []string {
 			continue
 		}
 		switch key {
-		case EnvAPIKey, EnvVaultToken, EnvServer:
+		case EnvAPIKey, EnvVaultToken, EnvServer, EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey:
 			continue
 		}
 		out = append(out, entry)

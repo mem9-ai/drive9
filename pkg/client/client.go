@@ -287,6 +287,17 @@ func (c *Client) RawPost(endpoint string, body io.Reader) (*http.Response, error
 	return c.do(req)
 }
 
+func (c *Client) RawDelete(endpoint string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodDelete, c.baseURL+endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return c.do(req)
+}
+
 // SetActor sets the X-Dat9-Actor header value for all subsequent requests.
 // Used by FUSE mounts to identify the per-mount actor for SSE self-filtering.
 func (c *Client) SetActor(actor string) {

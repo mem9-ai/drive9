@@ -1001,6 +1001,8 @@ func TestMountBackgroundEnvSnapshotsCredentials(t *testing.T) {
 		EnvServer + "=https://old.example",
 		EnvAPIKey + "=old-key",
 		EnvVaultToken + "=old-token",
+		EnvTiDBCloudPublicKey + "=tidb-public",
+		EnvTiDBCloudPrivateKey + "=tidb-private",
 	}, mountBackgroundRequest{
 		Server: "https://drive9.example",
 		Token:  "jwt-token",

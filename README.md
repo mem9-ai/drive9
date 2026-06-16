@@ -77,6 +77,121 @@ drive9 create --name dev --server https://api.drive9.ai
 drive9 ctx use dev
 ```
 
+### Provision Tenants
+
+List Drive9 provisioning regions:
+
+```bash
+drive9 region list
+```
+
+The text output uses user-facing mode names:
+
+```text
+REGION              MODE       SERVER
+aws-ap-southeast-1  Anonymous  https://api.drive9.ai
+aws-ap-southeast-1  TiDBCloud  https://native-sg.drive9.ai
+```
+
+`Anonymous` maps to the `tidb_cloud_starter` provider mode. `TiDBCloud` maps to
+the `tidb_cloud_native` provider mode. If the public region manifest cannot be
+reached, `drive9 region list` falls back to:
+
+```text
+REGION              MODE       SERVER
+aws-ap-southeast-1  Anonymous  https://api.drive9.ai
+```
+
+`drive9 region list --json` returns the same region list as a JSON array:
+
+```json
+[
+  {
+    "region_code": "aws-ap-southeast-1",
+    "mode": "Anonymous",
+    "server_url": "https://api.drive9.ai"
+  }
+]
+```
+
+Create an anonymous Starter tenant by region code:
+
+```bash
+drive9 create --region-code aws-ap-southeast-1 --name dev
+```
+
+Create a TiDB Cloud native tenant in the customer's TiDB Cloud account by
+passing the customer's TiDB Cloud API keys:
+
+```bash
+drive9 create \
+  --region-code aws-ap-southeast-1 \
+  --tidbcloud-public-key "$TIDBCLOUD_PUBLIC_KEY" \
+  --tidbcloud-private-key "$TIDBCLOUD_PRIVATE_KEY" \
+  --name dev-native
+```
+
+The same values can come from environment variables:
+
+```bash
+DRIVE9_REGION_CODE=aws-ap-southeast-1 \
+DRIVE9_PUBLIC_KEY="$TIDBCLOUD_PUBLIC_KEY" \
+DRIVE9_PRIVATE_KEY="$TIDBCLOUD_PRIVATE_KEY" \
+drive9 create --name dev-native
+```
+
+For TiDB Cloud native tenants, `drive9 create` stores the local context with
+`mode=TiDBCloud` and records `cloud_provider` / `region` when the server returns
+them. `drive9 ctx list` shows `MODE`, `CLOUD_PROVIDER`, and `REGION` by default;
+older contexts with no mode keep those fields empty.
+
+To add an existing owner API key for a native tenant manually, include the same
+metadata explicitly:
+
+```bash
+drive9 ctx add \
+  --name dev-native \
+  --server https://native-sg.drive9.ai \
+  --api-key "$DRIVE9_API_KEY" \
+  --mode TiDBCloud \
+  --cloud-provider aws \
+  --region us-east-1
+```
+
+`--server` has the highest priority. When it is set, the CLI bypasses the region
+manifest, ignores `--region-code`, and sends the request to that server directly:
+
+```bash
+drive9 create \
+  --server https://api.drive9.ai \
+  --tidbcloud-public-key "$TIDBCLOUD_PUBLIC_KEY" \
+  --tidbcloud-private-key "$TIDBCLOUD_PRIVATE_KEY" \
+  --name dev-native
+```
+
+Delete the current tenant with the current owner context:
+
+```bash
+drive9 delete
+```
+
+For `tidb_cloud_native`, pass the customer's TiDB Cloud API keys again so the
+server can delete the customer-account Starter cluster:
+
+```bash
+drive9 delete \
+  --tidbcloud-public-key "$TIDBCLOUD_PUBLIC_KEY" \
+  --tidbcloud-private-key "$TIDBCLOUD_PRIVATE_KEY"
+```
+
+`drive9 delete` only uses owner API keys from local context automatically.
+Delegated and `fs_scoped` contexts are rejected for tenant deletion. Use
+`--api-key` to pass an owner key explicitly:
+
+```bash
+drive9 delete --server https://api.drive9.ai --api-key "$DRIVE9_API_KEY"
+```
+
 ### Filesystem Commands
 
 ```bash
@@ -241,15 +356,16 @@ func main() {
 Current tenant providers are selected explicitly:
 
 ```text
-DRIVE9_TENANT_PROVIDER=db9 | tidb_zero | tidb_cloud_starter | tidbcloud_native
+DRIVE9_TENANT_PROVIDER=db9 | tidb_zero | tidb_cloud_starter | tidb_cloud_native
 ```
 
 - `tidb_zero`: default development/provisioning path backed by TiDB Zero.
 - `tidb_cloud_starter`: production-oriented TiDB Cloud Starter pool takeover.
-- `tidbcloud_native`: creates TiDB Cloud Serverless Starter clusters in the
+- `tidb_cloud_native`: creates TiDB Cloud Serverless Starter clusters in the
   customer's TiDB Cloud account using `public_key` / `private_key` submitted to
   `POST /v1/provision`; server config supplies the API URL, cloud provider,
-  region, and optional default database name.
+  region, and default database name. The CLI does not expose a database-name
+  option for customers.
 - `db9`: supported provider path with its own schema, but not the default
   architecture used in this README.
 
@@ -370,7 +486,7 @@ DELETE /v1/tenant                 delete current tenant with owner API key
 Vault endpoints also exist for secret storage, scoped grants, delegated tokens,
 and read-only vault mounts.
 
-`DELETE /v1/tenant` is owner-key only. For `tidbcloud_native`, the request body
+`DELETE /v1/tenant` is owner-key only. For `tidb_cloud_native`, the request body
 must also include the customer's TiDB Cloud `public_key` and `private_key` so
 Drive9 can delete the customer-account Starter cluster. `tidb_zero` tenants are
 not deleted through this endpoint; they expire automatically.
@@ -407,16 +523,17 @@ Important environment variables:
 
 ```text
 DRIVE9_META_DSN                 control-plane MySQL/TiDB DSN
-DRIVE9_TENANT_PROVIDER          db9 | tidb_zero | tidb_cloud_starter | tidbcloud_native
+DRIVE9_TENANT_PROVIDER          db9 | tidb_zero | tidb_cloud_starter | tidb_cloud_native
 DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT
                                 default TiDB Cloud spendingLimit.monthly in USD cents
-                                optional for tidb_cloud_starter; tidbcloud_native defaults to 1000 when unset
+                                optional for tidb_cloud_starter; tidb_cloud_native defaults to 1000 when unset
 DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Serverless API base URL
 DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER
-                                cloud provider for tidbcloud_native cluster creation
-DRIVE9_TIDBCLOUD_NATIVE_REGION  region for tidbcloud_native cluster creation
+                                cloud provider for tidb_cloud_native cluster creation
+DRIVE9_TIDBCLOUD_NATIVE_REGION  region for tidb_cloud_native cluster creation
 DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME
-                                optional default database_name for tidbcloud_native
+                                server-side default database name for tidb_cloud_native
+                                when unset, the server uses tidbcloud_fs
 DRIVE9_TOKEN_SIGNING_KEY        32-byte hex JWT signing key
 DRIVE9_ENCRYPT_TYPE             local_aes | kms
 DRIVE9_MASTER_KEY               local AES key

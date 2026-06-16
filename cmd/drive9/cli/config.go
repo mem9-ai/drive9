@@ -31,7 +31,7 @@ const (
 // Context is a single entry in ~/.drive9/config. Field presence depends on
 // Type per spec §13.1:
 //
-//   - owner:     APIKey, Server
+//   - owner:     APIKey, Server, optional Mode/CloudProvider/Region
 //   - fs_scoped: APIKey, Server, Scope[], ExpiresAt
 //   - delegated: Token, Server (from iss), Agent, Scope[], Perm, ExpiresAt,
 //     GrantID, optional LabelHint
@@ -40,16 +40,19 @@ const (
 // `ctx import` time. This is UX-only — authorization remains server-side
 // (Invariant #7).
 type Context struct {
-	Type      PrincipalType `json:"type"`
-	Server    string        `json:"server,omitempty"`
-	APIKey    string        `json:"api_key,omitempty"`
-	Token     string        `json:"token,omitempty"`
-	Agent     string        `json:"agent,omitempty"`
-	Scope     []string      `json:"scope,omitempty"`
-	Perm      Perm          `json:"perm,omitempty"`
-	ExpiresAt time.Time     `json:"expires_at,omitempty"`
-	GrantID   string        `json:"grant_id,omitempty"`
-	LabelHint string        `json:"label_hint,omitempty"`
+	Type          PrincipalType `json:"type"`
+	Server        string        `json:"server,omitempty"`
+	APIKey        string        `json:"api_key,omitempty"`
+	Token         string        `json:"token,omitempty"`
+	Mode          string        `json:"mode,omitempty"`
+	CloudProvider string        `json:"cloud_provider,omitempty"`
+	Region        string        `json:"region,omitempty"`
+	Agent         string        `json:"agent,omitempty"`
+	Scope         []string      `json:"scope,omitempty"`
+	Perm          Perm          `json:"perm,omitempty"`
+	ExpiresAt     time.Time     `json:"expires_at,omitempty"`
+	GrantID       string        `json:"grant_id,omitempty"`
+	LabelHint     string        `json:"label_hint,omitempty"`
 }
 
 type Config struct {

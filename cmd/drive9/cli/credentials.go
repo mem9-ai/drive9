@@ -4,16 +4,17 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 )
 
-// Environment variable names recognised by the credential resolver. See spec
+// Environment variable names for credential-bearing CLI inputs. See spec
 // §14.1. The dual-principal separation is locked — there is no single combined
 // variable; DRIVE9_VAULT_TOKEN and DRIVE9_API_KEY remain distinct knobs.
 //
-// This exact set of three names is also the F14 scrub whitelist for
+// This exact set of credential-bearing names is also the F14 scrub whitelist for
 // `drive9 vault with` (spec §9 L209): the child process MUST NOT inherit
-// any of these three from the parent, even when they are unset, absent, or
+// any of these from the parent, even when they are unset, absent, or
 // identical to the current mount's credential. Other DRIVE9_* vars
 // (profiling, log level, etc.) are outside the scrub — they do not grant
 // authority — and flow through untouched. `scrubDrive9CredEnv` in
@@ -21,9 +22,11 @@ import (
 // env var here requires a matching update there (and a new V2c-style
 // review gate). The exactness of this list IS the contract.
 const (
-	EnvVaultToken = "DRIVE9_VAULT_TOKEN"
-	EnvAPIKey     = "DRIVE9_API_KEY"
-	EnvServer     = "DRIVE9_SERVER"
+	EnvVaultToken          = "DRIVE9_VAULT_TOKEN"
+	EnvAPIKey              = "DRIVE9_API_KEY"
+	EnvServer              = "DRIVE9_SERVER"
+	EnvTiDBCloudPublicKey  = "DRIVE9_PUBLIC_KEY"
+	EnvTiDBCloudPrivateKey = "DRIVE9_PRIVATE_KEY"
 )
 
 // CredentialKind classifies which principal the resolved credential
@@ -199,6 +202,14 @@ func consumeEnv(name string) string {
 	return trimmed
 }
 
+func readTrimEnv(name string) string {
+	raw, ok := os.LookupEnv(name)
+	if !ok {
+		return ""
+	}
+	return trimASCIISpace(raw)
+}
+
 func trimASCIISpace(s string) string {
 	start := 0
 	for start < len(s) && isASCIISpace(s[start]) {
@@ -228,7 +239,7 @@ const defaultServerURL = "https://api.drive9.ai"
 //
 // Call this on each credential flag after flag.Parse.
 func rejectEmptyFlag(flagName, value string, provided bool) error {
-	if provided && value == "" {
+	if provided && strings.TrimSpace(value) == "" {
 		return fmt.Errorf("--%s was given an empty value; pass a non-empty credential or omit the flag", flagName)
 	}
 	return nil

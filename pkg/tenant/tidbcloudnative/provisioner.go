@@ -86,6 +86,10 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 
 func (p *Provisioner) ProviderType() string { return tenant.ProviderTiDBCloudNative }
 
+func (p *Provisioner) ProvisioningCloudProvider() string { return p.cloudProvider }
+
+func (p *Provisioner) ProvisioningRegion() string { return p.region }
+
 func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
 	return schema.EnsureTiDBSchemaForModeDSN(ctx, dsn, schema.TiDBEmbeddingModeAuto)
 }

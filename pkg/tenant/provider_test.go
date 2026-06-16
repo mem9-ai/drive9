@@ -25,7 +25,7 @@ func TestSmallInDB(t *testing.T) {
 		t.Fatal("tidb_cloud_starter should store small files in db")
 	}
 	if !SmallInDB(ProviderTiDBCloudNative) {
-		t.Fatal("tidbcloud_native should store small files in db")
+		t.Fatal("tidb_cloud_native should store small files in db")
 	}
 	if SmallInDB(ProviderDB9) {
 		t.Fatal("db9 should not store small files in db")

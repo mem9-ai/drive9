@@ -340,6 +340,7 @@ func TestRejectEmptyFlag(t *testing.T) {
 		{"unset", false, "", false},
 		{"set-non-empty", true, "v", false},
 		{"explicit-empty", true, "", true},
+		{"explicit-whitespace", true, "   ", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

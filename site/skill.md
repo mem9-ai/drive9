@@ -46,10 +46,28 @@ Each workspace is an isolated storage scope. The initial workspace is created du
 
 ```bash
 drive9 create --name <name>     # create an additional workspace
+drive9 region list              # list available provisioning regions and modes
+drive9 create --region-code <code>
 drive9 ctx                      # show current workspace
 drive9 ctx list                 # list all workspaces
 drive9 ctx <name>               # switch workspace
+drive9 delete                   # delete the current workspace/tenant
 ```
+
+Only run `drive9 delete` when the user explicitly asks to delete the current workspace/tenant. This is destructive and requires an owner API key. The CLI will use the active context only when it is an owner context; if the active context is delegated or `fs_scoped`, pass an owner key explicitly with `--api-key`.
+
+`drive9 create` uses the default Drive9 server when no server, region, or TiDB Cloud keys are provided. Use `drive9 region list` to see supported provisioning routes. Modes shown as `Anonymous` use Drive9-managed starter provisioning. Modes shown as `TiDBCloud` create the starter cluster in the user's TiDB Cloud account and require TiDB Cloud API keys:
+
+```bash
+drive9 create \
+  --region-code <code> \
+  --tidbcloud-public-key <public-key> \
+  --tidbcloud-private-key <private-key>
+```
+
+The TiDB Cloud keys can also be supplied through `DRIVE9_PUBLIC_KEY` and `DRIVE9_PRIVATE_KEY`. If `--server` is provided, it has highest priority, bypasses region manifest routing, and ignores `--region-code`.
+
+Native contexts created by `drive9 create` are stored locally with `mode=TiDBCloud` and any `cloud_provider` / `region` returned by the server. `drive9 ctx list` shows `MODE`, `CLOUD_PROVIDER`, and `REGION` by default; empty mode fields stay empty. When adding an existing native owner key manually, use `drive9 ctx add --api-key <key> --mode TiDBCloud --cloud-provider <provider> --region <region>`.
 
 ### File operations
 
