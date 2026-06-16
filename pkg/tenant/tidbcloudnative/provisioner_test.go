@@ -200,7 +200,7 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	if strings.Contains(gotAuth, "private-1") {
 		t.Fatalf("Authorization header leaked private key: %q", gotAuth)
 	}
-	if gotBody.DisplayName != "drive9-tenant-1" {
+	if gotBody.DisplayName != "tidbcloud-fs-tenant-1" {
 		t.Fatalf("displayName = %q", gotBody.DisplayName)
 	}
 	if gotBody.Region.Name != "regions/aws-us-east-1" {
@@ -369,11 +369,64 @@ func TestClusterDisplayNameMatchesSwaggerContract(t *testing.T) {
 	if len(got) < 4 || len(got) > 64 {
 		t.Fatalf("display name length = %d for %q", len(got), got)
 	}
+	if !strings.HasPrefix(got, "tidbcloud-fs-") {
+		t.Fatalf("display name = %q, want tidbcloud-fs prefix", got)
+	}
 	matched, err := regexp.MatchString(`^[A-Za-z0-9][-A-Za-z0-9]{2,62}[A-Za-z0-9]$`, got)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !matched {
 		t.Fatalf("display name %q does not match swagger pattern", got)
+	}
+}
+
+func TestSystemUsernameForCurrent(t *testing.T) {
+	got, needsSetup, err := systemUsernameForCurrent("22ipQWBXXq2wN2S.root")
+	if err != nil {
+		t.Fatalf("systemUsernameForCurrent: %v", err)
+	}
+	if !needsSetup || got != "22ipQWBXXq2wN2S.tidbcloud_fs_system" {
+		t.Fatalf("system username = %q setup=%v", got, needsSetup)
+	}
+	got, needsSetup, err = systemUsernameForCurrent("22ipQWBXXq2wN2S.tidbcloud_fs_system")
+	if err != nil {
+		t.Fatalf("systemUsernameForCurrent existing: %v", err)
+	}
+	if needsSetup || got != "22ipQWBXXq2wN2S.tidbcloud_fs_system" {
+		t.Fatalf("existing system username = %q setup=%v", got, needsSetup)
+	}
+	if _, _, err := systemUsernameForCurrent(""); err == nil {
+		t.Fatal("expected empty username error")
+	}
+}
+
+func TestSystemUserStatements(t *testing.T) {
+	got := systemUserStatements("tidbcloud_fs", "22ipQWBXXq2wN2S.tidbcloud_fs_system", "pass123")
+	want := []string{
+		"CREATE DATABASE IF NOT EXISTS `tidbcloud_fs`",
+		"CREATE ROLE IF NOT EXISTS 'tidbcloud_fs_admin'",
+		"GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON `tidbcloud_fs`.* TO 'tidbcloud_fs_admin'",
+		"CREATE USER IF NOT EXISTS '22ipQWBXXq2wN2S.tidbcloud_fs_system' IDENTIFIED BY 'pass123'",
+		"ALTER USER '22ipQWBXXq2wN2S.tidbcloud_fs_system' IDENTIFIED BY 'pass123'",
+		"GRANT 'tidbcloud_fs_admin' TO '22ipQWBXXq2wN2S.tidbcloud_fs_system'",
+		"SET DEFAULT ROLE 'tidbcloud_fs_admin' TO '22ipQWBXXq2wN2S.tidbcloud_fs_system'",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("statement count = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("statement %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSQLQuoting(t *testing.T) {
+	if got := quoteIdent("db`name"); got != "`db``name`" {
+		t.Fatalf("quoteIdent = %q", got)
+	}
+	if got := quoteString("u'ser"); got != "'u''ser'" {
+		t.Fatalf("quoteString = %q", got)
 	}
 }

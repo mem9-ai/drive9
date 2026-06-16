@@ -98,6 +98,37 @@ func (p *Provisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, dsn
 	return schema.EnsureTiDBSchemaForAutoEmbeddingProfileDSN(ctx, dsn, profile)
 }
 
+func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, _ string) (string, string, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "", "", err
+	}
+	username, needsSetup, err := systemUsernameForCurrent(cfg.User)
+	if err != nil {
+		return "", "", err
+	}
+	if !needsSetup {
+		return cfg.User, cfg.Passwd, nil
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return "", "", err
+	}
+	defer func() { _ = db.Close() }()
+	dbName, err := normalizeDatabaseName(cfg.DBName)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve native system user database: %w", err)
+	}
+	password, err := generateRandomPassword(24)
+	if err != nil {
+		return "", "", err
+	}
+	if err := ensureSystemUser(ctx, db, dbName, username, password); err != nil {
+		return "", "", err
+	}
+	return username, password, nil
+}
+
 func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
 	return nil, fmt.Errorf("tidbcloud native requires request credentials")
 }
@@ -225,7 +256,7 @@ func (p *Provisioner) regionName() string {
 
 func clusterDisplayName(tenantID string) string {
 	const maxDisplayNameLen = 64
-	name := displayNameCharPattern.ReplaceAllString("drive9-"+tenantID, "-")
+	name := displayNameCharPattern.ReplaceAllString("tidbcloud-fs-"+tenantID, "-")
 	if len(name) <= maxDisplayNameLen {
 		return name
 	}
@@ -239,6 +270,48 @@ func (p *Provisioner) resolveDatabaseName(raw string) (string, error) {
 		name = p.defaultDatabaseName
 	}
 	return normalizeDatabaseName(name)
+}
+
+func ensureSystemUser(ctx context.Context, db *sql.DB, dbName, username, password string) error {
+	for _, stmt := range systemUserStatements(dbName, username, password) {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("execute native system user statement: %w", err)
+		}
+	}
+	return nil
+}
+
+func systemUserStatements(dbName, username, password string) []string {
+	const roleName = "tidbcloud_fs_admin"
+	return []string{
+		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdent(dbName)),
+		fmt.Sprintf("CREATE ROLE IF NOT EXISTS %s", quoteString(roleName)),
+		fmt.Sprintf("GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON %s.* TO %s", quoteIdent(dbName), quoteString(roleName)),
+		fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
+		fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
+		fmt.Sprintf("GRANT %s TO %s", quoteString(roleName), quoteString(username)),
+		fmt.Sprintf("SET DEFAULT ROLE %s TO %s", quoteString(roleName), quoteString(username)),
+	}
+}
+
+func systemUsernameForCurrent(currentUsername string) (string, bool, error) {
+	currentUsername = strings.TrimSpace(currentUsername)
+	if currentUsername == "" {
+		return "", false, fmt.Errorf("native database username is empty")
+	}
+	prefix, ok := strings.CutSuffix(currentUsername, ".root")
+	if !ok || prefix == "" {
+		return currentUsername, false, nil
+	}
+	return prefix + ".tidbcloud_fs_system", true, nil
+}
+
+func quoteIdent(value string) string {
+	return "`" + strings.ReplaceAll(value, "`", "``") + "`"
+}
+
+func quoteString(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
 }
 
 func parseDefaultSpendLimit(raw string) (*int32, error) {

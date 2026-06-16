@@ -85,6 +85,10 @@ type provisioningRegionProvider interface {
 	ProvisioningRegion() string
 }
 
+type nativeSystemUserProvisioner interface {
+	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, err error)
+}
+
 type Server struct {
 	fallback            *backend.Dat9Backend
 	meta                *meta.Store
@@ -3888,7 +3892,11 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			return
 		default:
 		}
-		if err := schemaInit(ctx, tenantDSN); err == nil {
+		err := schemaInit(ctx, tenantDSN)
+		if err == nil {
+			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+		}
+		if err == nil {
 			s.schemaInitErrors.Delete(tenantID)
 			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_ok", "tenant_id", tenantID, "provider", provider, "attempt", attempt)...)
 			if s.metrics != nil {
@@ -3956,6 +3964,34 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		backoff *= 2
 		attempt++
 	}
+}
+
+func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) error {
+	if provider != tenant.ProviderTiDBCloudNative {
+		return nil
+	}
+	if s.provisioner == nil {
+		return fmt.Errorf("native system user provisioner unavailable")
+	}
+	systemUserProvisioner, ok := s.provisioner.(nativeSystemUserProvisioner)
+	if !ok {
+		return fmt.Errorf("native provisioner does not support system user setup")
+	}
+	username, password, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
+	if err != nil {
+		return fmt.Errorf("ensure native system user: %w", err)
+	}
+	if username == "" || password == "" {
+		return fmt.Errorf("native system user setup returned empty credential")
+	}
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(password))
+	if err != nil {
+		return fmt.Errorf("encrypt native system user password: %w", err)
+	}
+	if err := s.meta.UpdateTenantDBCredential(ctx, tenantID, username, cipherPass); err != nil {
+		return fmt.Errorf("persist native system user credential: %w", err)
+	}
+	return nil
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {
