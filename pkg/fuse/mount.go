@@ -38,6 +38,7 @@ type MountOptions struct {
 	CacheDir                string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
 	CacheSize               int64         // ReadCache max size in bytes (default 128MB)
 	ReadCacheMaxFileBytes   int64         // largest single file admitted to ReadCache and fetched whole-file in one request (default 4MiB)
+	ReadCacheTTL            time.Duration // ReadCache TTL (default 30s; negative disables time-based expiry)
 	DiskReadCacheSize       int64         // disk-backed read cache max size in bytes (default 1GiB)
 	DiskReadCacheFreeRatio  float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
 	DirTTL                  time.Duration // DirCache TTL (default 10s)
@@ -88,6 +89,9 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.ReadCacheMaxFileBytes <= 0 {
 		o.ReadCacheMaxFileBytes = defaultReadCacheMaxFileSize
+	}
+	if o.ReadCacheTTL == 0 {
+		o.ReadCacheTTL = defaultReadCacheTTL
 	}
 	if o.DiskReadCacheSize <= 0 {
 		o.DiskReadCacheSize = defaultDiskReadCacheMaxSize

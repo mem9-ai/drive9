@@ -10,6 +10,7 @@ import (
 const (
 	defaultReadCacheMaxSize = 128 << 20        // 128MB
 	defaultReadCacheTTL     = 30 * time.Second // 30s
+	readCacheNoExpiryTTL    = -1
 	// defaultPositiveKernelCacheTTL keeps positive path metadata hot across
 	// repeated scans while SSE/self-invalidation still handles namespace changes.
 	defaultPositiveKernelCacheTTL = 60 * time.Second
@@ -40,7 +41,7 @@ type cacheEntry struct {
 // ReadCache is a thread-safe LRU + TTL read cache for small and medium files.
 // It only caches files whose size does not exceed the per-cache maxFile limit.
 // Entries are evicted when the total cached size exceeds maxSize or when
-// their TTL expires.
+// their TTL expires. A negative TTL disables time-based expiry.
 type ReadCache struct {
 	mu      sync.Mutex
 	items   map[string]*cacheEntry
@@ -53,7 +54,8 @@ type ReadCache struct {
 
 // NewReadCache creates a ReadCache with the given capacity and TTL.
 // If maxSize <= 0, defaultReadCacheMaxSize (128MB) is used.
-// If ttl <= 0, defaultReadCacheTTL (30s) is used.
+// If ttl == 0, defaultReadCacheTTL (30s) is used.
+// If ttl < 0, entries do not expire by time.
 func NewReadCache(maxSize int64, ttl time.Duration) *ReadCache {
 	return NewReadCacheWithMaxFileSize(maxSize, ttl, 0)
 }
@@ -64,7 +66,7 @@ func NewReadCacheWithMaxFileSize(maxSize int64, ttl time.Duration, maxFileSize i
 	if maxSize <= 0 {
 		maxSize = defaultReadCacheMaxSize
 	}
-	if ttl <= 0 {
+	if ttl == 0 {
 		ttl = defaultReadCacheTTL
 	}
 	if maxFileSize <= 0 {
@@ -101,8 +103,8 @@ func (rc *ReadCache) Get(path string, currentRevision int64) ([]byte, bool) {
 		return nil, false
 	}
 
-	// Check TTL expiration.
-	if time.Now().After(entry.expires) {
+	// Check TTL expiration. A negative TTL means no time-based expiry.
+	if rc.ttl > 0 && time.Now().After(entry.expires) {
 		rc.evict(entry)
 		return nil, false
 	}

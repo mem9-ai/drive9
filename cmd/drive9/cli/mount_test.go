@@ -1238,6 +1238,122 @@ func TestMountCmdPassesReadCacheMaxFileOption(t *testing.T) {
 	}
 }
 
+func TestMountCmdLeavesReadCacheTTLUnsetByDefault(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ReadCacheTTL != 0 {
+		t.Fatalf("ReadCacheTTL = %v, want unset zero value", got.ReadCacheTTL)
+	}
+}
+
+func TestMountCmdPassesReadCacheTTLOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--read-cache-ttl", "5m",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ReadCacheTTL != 5*time.Minute {
+		t.Fatalf("ReadCacheTTL = %v, want 5m", got.ReadCacheTTL)
+	}
+}
+
+func TestMountCmdReadCacheTTLZeroDisablesTimeExpiry(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--read-cache-ttl", "0",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ReadCacheTTL >= 0 {
+		t.Fatalf("ReadCacheTTL = %v, want negative no-expiry sentinel", got.ReadCacheTTL)
+	}
+}
+
+func TestMountCmdRejectsNegativeReadCacheTTL(t *testing.T) {
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--read-cache-ttl", "-1s",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--read-cache-ttl") {
+		t.Fatalf("MountCmd error = %v, want read-cache-ttl validation error", err)
+	}
+}
+
+func TestMountCmdRejectsReadCacheTTLWithWebDAV(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "webdav",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--read-cache-ttl", "5m",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--read-cache-ttl") {
+		t.Fatalf("MountCmd error = %v, want read-cache-ttl validation error", err)
+	}
+}
+
 func TestMountCmdRejectsZeroDiskReadCacheFreeRatio(t *testing.T) {
 	err := MountCmd([]string{
 		"--foreground",

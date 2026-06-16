@@ -34,6 +34,7 @@ type mountFuseOptions struct {
 	CacheDir                string
 	CacheSize               int64
 	ReadCacheMaxFileBytes   int64
+	ReadCacheTTL            time.Duration
 	DiskReadCacheSize       int64
 	DiskReadCacheFreeRatio  float64
 	DirTTL                  time.Duration
