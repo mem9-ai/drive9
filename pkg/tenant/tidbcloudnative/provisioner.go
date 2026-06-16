@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +30,7 @@ const (
 	EnvTiDBCloudNativeCloudProvider       = "DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER"
 	EnvTiDBCloudNativeRegion              = "DRIVE9_TIDBCLOUD_NATIVE_REGION"
 	EnvTiDBCloudNativeDefaultDatabaseName = "DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME"
+	EnvTiDBCloudDefaultSpendingLimit      = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
 
 	DefaultDatabaseName = "tidbcloud_fs"
 
@@ -45,6 +47,7 @@ type Provisioner struct {
 	cloudProvider       string
 	region              string
 	defaultDatabaseName string
+	defaultSpendLimit   *int32
 	client              *http.Client
 }
 
@@ -53,6 +56,10 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 	cloudProvider := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeCloudProvider))
 	region := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeRegion))
 	defaultDB := strings.TrimSpace(os.Getenv(EnvTiDBCloudNativeDefaultDatabaseName))
+	defaultSpendLimit, err := parseDefaultSpendLimit(os.Getenv(EnvTiDBCloudDefaultSpendingLimit))
+	if err != nil {
+		return nil, err
+	}
 	if defaultDB == "" {
 		defaultDB = DefaultDatabaseName
 	}
@@ -71,6 +78,7 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 		cloudProvider:       cloudProvider,
 		region:              region,
 		defaultDatabaseName: defaultDB,
+		defaultSpendLimit:   defaultSpendLimit,
 		client:              &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
@@ -113,13 +121,17 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	if err != nil {
 		return nil, err
 	}
-	body, err := json.Marshal(map[string]any{
+	reqBody := map[string]any{
 		"displayName":  clusterDisplayName(tenantID),
 		"rootPassword": password,
 		"region": map[string]string{
 			"name": p.regionName(),
 		},
-	})
+	}
+	if p.defaultSpendLimit != nil {
+		reqBody["spendingLimit"] = map[string]int32{"monthly": *p.defaultSpendLimit}
+	}
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, err
 	}
@@ -222,6 +234,19 @@ func (p *Provisioner) resolveDatabaseName(raw string) (string, error) {
 		name = p.defaultDatabaseName
 	}
 	return normalizeDatabaseName(name)
+}
+
+func parseDefaultSpendLimit(raw string) (*int32, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	trimmed := strings.TrimSpace(raw)
+	monthly, err := strconv.ParseInt(trimmed, 10, 32)
+	if err != nil || monthly < 0 {
+		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer in USD cents", EnvTiDBCloudDefaultSpendingLimit, raw)
+	}
+	out := int32(monthly)
+	return &out, nil
 }
 
 func normalizeDatabaseName(name string) (string, error) {

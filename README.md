@@ -409,7 +409,7 @@ Important environment variables:
 DRIVE9_META_DSN                 control-plane MySQL/TiDB DSN
 DRIVE9_TENANT_PROVIDER          db9 | tidb_zero | tidb_cloud_starter | tidbcloud_native
 DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT
-                                default TiDB Cloud Starter spendingLimit.monthly in USD cents
+                                default TiDB Cloud Starter/native spendingLimit.monthly in USD cents
 DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Serverless API base URL
 DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER
                                 cloud provider for tidbcloud_native cluster creation
