@@ -33,6 +33,7 @@ const (
 	EnvTiDBCloudDefaultSpendingLimit      = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
 
 	DefaultDatabaseName = "tidbcloud_fs"
+	DefaultSpendLimit   = int32(1000)
 
 	upstreamErrorBodyLimit = 2048
 )
@@ -237,10 +238,11 @@ func (p *Provisioner) resolveDatabaseName(raw string) (string, error) {
 }
 
 func parseDefaultSpendLimit(raw string) (*int32, error) {
-	if raw == "" {
-		return nil, nil
-	}
 	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		out := DefaultSpendLimit
+		return &out, nil
+	}
 	monthly, err := strconv.ParseInt(trimmed, 10, 32)
 	if err != nil || monthly < 0 {
 		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer in USD cents", EnvTiDBCloudDefaultSpendingLimit, raw)

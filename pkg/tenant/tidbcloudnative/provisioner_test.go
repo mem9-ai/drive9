@@ -39,6 +39,21 @@ func TestNewProvisionerFromEnvReadsServerSideConfigOnly(t *testing.T) {
 	}
 }
 
+func TestNewProvisionerFromEnvUsesBuiltinDefaultSpendingLimit(t *testing.T) {
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
+	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
+	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+	t.Setenv(EnvTiDBCloudDefaultSpendingLimit, "")
+
+	p, err := NewProvisionerFromEnv()
+	if err != nil {
+		t.Fatalf("NewProvisionerFromEnv: %v", err)
+	}
+	if p.defaultSpendLimit == nil || *p.defaultSpendLimit != DefaultSpendLimit {
+		t.Fatalf("defaultSpendLimit = %v, want %d", p.defaultSpendLimit, DefaultSpendLimit)
+	}
+}
+
 func TestNewProvisionerFromEnvRequiresCloudProviderAndRegion(t *testing.T) {
 	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
 	t.Setenv(EnvTiDBCloudNativeCloudProvider, "")
