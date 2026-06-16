@@ -6143,6 +6143,30 @@ func TestDefaultTTLIs60Seconds(t *testing.T) {
 	}
 }
 
+func TestMountOptionsReadCacheTTLDefaults(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	if opts.ReadCacheTTL != defaultReadCacheTTL {
+		t.Fatalf("default ReadCacheTTL = %v, want %v", opts.ReadCacheTTL, defaultReadCacheTTL)
+	}
+}
+
+func TestMountOptionsReadCacheTTLKeepsNoExpiry(t *testing.T) {
+	opts := &MountOptions{ReadCacheTTL: readCacheNoExpiryTTL}
+	opts.setDefaults()
+	if opts.ReadCacheTTL != readCacheNoExpiryTTL {
+		t.Fatalf("ReadCacheTTL = %v, want no-expiry sentinel", opts.ReadCacheTTL)
+	}
+}
+
+func TestNewDat9FSUsesReadCacheTTL(t *testing.T) {
+	opts := &MountOptions{ReadCacheTTL: readCacheNoExpiryTTL}
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	if fs.readCache.ttl != readCacheNoExpiryTTL {
+		t.Fatalf("read cache ttl = %v, want no-expiry sentinel", fs.readCache.ttl)
+	}
+}
+
 func TestInteractiveProfileAppliesTTLDefaults(t *testing.T) {
 	opts := &MountOptions{Profile: "interactive"}
 	opts.setDefaults()

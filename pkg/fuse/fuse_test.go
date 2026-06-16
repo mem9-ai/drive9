@@ -295,6 +295,27 @@ func TestReadCache_TTLExpiry(t *testing.T) {
 	}
 }
 
+func TestReadCache_NoTTLExpiry(t *testing.T) {
+	rc := NewReadCache(1<<20, readCacheNoExpiryTTL)
+	rc.Put("/f", []byte("x"), 1)
+	time.Sleep(5 * time.Millisecond)
+	got, ok := rc.Get("/f", 1)
+	if !ok {
+		t.Fatal("expected cache hit when time-based expiry is disabled")
+	}
+	if string(got) != "x" {
+		t.Fatalf("got %q, want x", got)
+	}
+}
+
+func TestReadCache_NoTTLExpiryStillChecksRevision(t *testing.T) {
+	rc := NewReadCache(1<<20, readCacheNoExpiryTTL)
+	rc.Put("/f", []byte("x"), 1)
+	if _, ok := rc.Get("/f", 2); ok {
+		t.Fatal("expected cache miss on revision mismatch")
+	}
+}
+
 func TestReadCache_SkipLargeFiles(t *testing.T) {
 	rc := NewReadCache(1<<20, 10*time.Second)
 	bigData := make([]byte, defaultReadCacheMaxFileSize+1)

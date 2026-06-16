@@ -112,6 +112,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	cacheDir := fs.String("cache-dir", "", "write-back cache directory (default ~/.cache/drive9)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 4, "maximum single file size admitted to read cache in MB; files at or below this size are fetched with a single whole-file request")
+	readCacheTTL := fs.Duration("read-cache-ttl", 30*time.Second, "read cache TTL; 0 disables time-based expiry")
 	diskReadCacheSize := fs.Int64("disk-read-cache-size-mb", 1024, "disk-backed read cache size in MB")
 	diskReadCacheFreeRatio := fs.Float64("disk-read-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before disk read cache evicts")
 	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
@@ -192,6 +193,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 
 	lookupRetryCountGiven := flagProvided(fs, "lookup-retry-count")
 	lookupRetryTimeoutGiven := flagProvided(fs, "lookup-retry-timeout")
+	readCacheTTLGiven := flagProvided(fs, "read-cache-ttl")
 	trustProcessLocalEventsGiven := flagProvided(fs, "trust-process-local-events")
 	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout, lookupRetryCountGiven, lookupRetryTimeoutGiven); err != nil {
 		return err
@@ -237,6 +239,10 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if *readCacheMaxFile <= 0 {
 		return fmt.Errorf("drive9 mount: --read-cache-max-file-mb must be > 0")
 	}
+	normalizedReadCacheTTL, err := readCacheTTLFlagValue(readCacheTTLGiven, *readCacheTTL)
+	if err != nil {
+		return err
+	}
 	if *diskReadCacheSize <= 0 {
 		return fmt.Errorf("drive9 mount: --disk-read-cache-size-mb must be > 0")
 	}
@@ -266,6 +272,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	if resolved == MountModeWebDAV && trustProcessLocalEventsGiven {
 		return fmt.Errorf("drive9 mount: --trust-process-local-events is only supported with --mode=fuse")
+	}
+	if resolved == MountModeWebDAV && readCacheTTLGiven {
+		return fmt.Errorf("drive9 mount: --read-cache-ttl is only supported with --mode=fuse")
 	}
 	if resolved == MountModeWebDAV && *durability != string(fuseDurabilityAuto) {
 		return fmt.Errorf("--durability is only supported with --mode=fuse; WebDAV mounts always use their native write behavior")
@@ -411,6 +420,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		CacheDir:                *cacheDir,
 		CacheSize:               int64(*cacheSize) << 20,
 		ReadCacheMaxFileBytes:   *readCacheMaxFile << 20,
+		ReadCacheTTL:            normalizedReadCacheTTL,
 		DiskReadCacheSize:       *diskReadCacheSize << 20,
 		DiskReadCacheFreeRatio:  *diskReadCacheFreeRatio,
 		DirTTL:                  normalizedDirTTL,
@@ -855,6 +865,19 @@ func durationFlagValue(fs *flag.FlagSet, name string, value time.Duration) time.
 		return value
 	}
 	return 0
+}
+
+func readCacheTTLFlagValue(given bool, value time.Duration) (time.Duration, error) {
+	if !given {
+		return 0, nil
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("drive9 mount: --read-cache-ttl must be >= 0")
+	}
+	if value == 0 {
+		return -time.Nanosecond, nil
+	}
+	return value, nil
 }
 
 func lookupRetryCountFlagValue(given bool, count int) int {
