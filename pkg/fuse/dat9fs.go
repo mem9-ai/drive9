@@ -5155,7 +5155,9 @@ func (fs *Dat9FS) lockHandleRemoteCommitPathLocked(fh *FileHandle) func() {
 	if fh.RemoteCommitUnlock != nil {
 		return func() {}
 	}
-	_ = fs.canSupersedeQueuedPathTruncate(fh.Path)
+	if fh.ZeroBase && fh.Dirty != nil && fh.Dirty.Size() == 0 {
+		_ = fs.canSupersedeQueuedPathTruncate(fh.Path)
+	}
 	fh.RemoteCommitUnlock = fs.lockWritableRemoteCommitPath(fh.Path)
 	return func() {
 		fs.releaseHandleRemoteCommitPathLocked(fh)
