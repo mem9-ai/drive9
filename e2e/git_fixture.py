@@ -87,6 +87,9 @@ def build_fixture(root: Path, tree_files: int = 0) -> dict[str, str]:
     commit(source, "feature rebase upstream")
 
     run(source, "checkout", "main")
+    # Avoid Git's local clone object hardlink/copy optimization here. On CI this
+    # path has occasionally failed while copying pack index files, leaving a
+    # broken bare fixture and cascading clone failures through the smoke test.
     run(None, "clone", "--bare", "--no-local", str(source), str(bare))
     run(bare, "config", "uploadpack.allowFilter", "true")
     run(bare, "config", "uploadpack.allowAnySHA1InWant", "true")
