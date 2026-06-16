@@ -15,6 +15,7 @@ from .core import (
     PASS,
     RESULT_ROOT,
     SCHEMA,
+    SKIP,
     XFAIL,
     WARN,
     BlackboxError,
