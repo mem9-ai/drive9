@@ -524,7 +524,9 @@ func mountBackgroundEnv(environ []string, req mountBackgroundRequest) []string {
 	for _, kv := range environ {
 		if strings.HasPrefix(kv, EnvServer+"=") ||
 			strings.HasPrefix(kv, EnvAPIKey+"=") ||
-			strings.HasPrefix(kv, EnvVaultToken+"=") {
+			strings.HasPrefix(kv, EnvVaultToken+"=") ||
+			strings.HasPrefix(kv, EnvTiDBCloudPublicKey+"=") ||
+			strings.HasPrefix(kv, EnvTiDBCloudPrivateKey+"=") {
 			continue
 		}
 		out = append(out, kv)

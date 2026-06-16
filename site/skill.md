@@ -65,7 +65,7 @@ drive9 create \
   --tidbcloud-private-key <private-key>
 ```
 
-The TiDB Cloud keys can also be supplied through `DRIVE9_PUBLIC_KEY` and `DRIVE9_PRIVATE_KEY`. If `--server` is provided, it has highest priority and bypasses region manifest routing.
+The TiDB Cloud keys can also be supplied through `DRIVE9_PUBLIC_KEY` and `DRIVE9_PRIVATE_KEY`. If `--server` is provided, it has highest priority, bypasses region manifest routing, and ignores `--region-code`.
 
 ### File operations
 

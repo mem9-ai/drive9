@@ -13,11 +13,6 @@ import (
 	"github.com/mem9-ai/dat9/pkg/client"
 )
 
-const (
-	EnvTiDBCloudPublicKey  = "DRIVE9_PUBLIC_KEY"
-	EnvTiDBCloudPrivateKey = "DRIVE9_PRIVATE_KEY"
-)
-
 // Create provisions a new tenant and registers the returned API key as a
 // local owner context. Both steps are performed from a single Go code path:
 // Create calls ctxAdd(name, &Context{...}) after provisioning, which is the

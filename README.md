@@ -102,6 +102,9 @@ REGION              MODE       SERVER
 aws-ap-southeast-1  Anonymous  https://api.drive9.ai
 ```
 
+`drive9 region list --json` uses canonical mode IDs (`tidb_cloud_starter`,
+`tidb_cloud_native`) instead of the display labels shown in text output.
+
 Create an anonymous Starter tenant by region code:
 
 ```bash
@@ -129,7 +132,7 @@ drive9 create --name dev-native
 ```
 
 `--server` has the highest priority. When it is set, the CLI bypasses the region
-manifest and sends the request to that server directly:
+manifest, ignores `--region-code`, and sends the request to that server directly:
 
 ```bash
 drive9 create \
