@@ -58,6 +58,17 @@ type RegionManifestEntry struct {
 	Metadata      map[string]string `json:"metadata,omitempty"`
 }
 
+type regionListOutputEntry struct {
+	RegionCode    string            `json:"region_code"`
+	Mode          string            `json:"mode"`
+	ModeLabel     string            `json:"mode_label"`
+	ServerURL     string            `json:"server_url"`
+	CloudProvider string            `json:"cloud_provider,omitempty"`
+	TiDBRegion    string            `json:"tidb_region,omitempty"`
+	Tags          []string          `json:"tags,omitempty"`
+	Metadata      map[string]string `json:"metadata,omitempty"`
+}
+
 func Region(args []string) error {
 	if len(args) == 0 || IsHelpArg(args[0]) {
 		_, _ = fmt.Fprintln(os.Stdout, regionUsage())
@@ -107,7 +118,7 @@ func regionListCmd(args []string) error {
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(manifest)
+		return enc.Encode(regionListOutput(manifest.Regions))
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	_, _ = fmt.Fprintln(w, "REGION\tMODE\tSERVER")
@@ -115,6 +126,23 @@ func regionListCmd(args []string) error {
 		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\n", entry.RegionCode, regionModeLabel(entry.Mode), entry.ServerURL)
 	}
 	return w.Flush()
+}
+
+func regionListOutput(entries []RegionManifestEntry) []regionListOutputEntry {
+	out := make([]regionListOutputEntry, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, regionListOutputEntry{
+			RegionCode:    entry.RegionCode,
+			Mode:          entry.Mode,
+			ModeLabel:     regionModeLabel(entry.Mode),
+			ServerURL:     entry.ServerURL,
+			CloudProvider: entry.CloudProvider,
+			TiDBRegion:    entry.TiDBRegion,
+			Tags:          entry.Tags,
+			Metadata:      entry.Metadata,
+		})
+	}
+	return out
 }
 
 func fallbackRegionManifestCopy() *RegionManifest {

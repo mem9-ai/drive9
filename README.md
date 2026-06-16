@@ -102,8 +102,20 @@ REGION              MODE       SERVER
 aws-ap-southeast-1  Anonymous  https://api.drive9.ai
 ```
 
-`drive9 region list --json` uses canonical mode IDs (`tidb_cloud_starter`,
-`tidb_cloud_native`) instead of the display labels shown in text output.
+`drive9 region list --json` returns the same region list as a JSON array. The
+`mode` field uses canonical IDs (`tidb_cloud_starter`, `tidb_cloud_native`), and
+`mode_label` contains the text display label:
+
+```json
+[
+  {
+    "region_code": "aws-ap-southeast-1",
+    "mode": "tidb_cloud_starter",
+    "mode_label": "Anonymous",
+    "server_url": "https://api.drive9.ai"
+  }
+]
+```
 
 Create an anonymous Starter tenant by region code:
 

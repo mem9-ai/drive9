@@ -59,19 +59,18 @@ func TestRegionListTextAndJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("region list --json: %v", err)
 	}
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(jsonOut), &raw); err != nil {
+	var regions []regionListOutputEntry
+	if err := json.Unmarshal([]byte(jsonOut), &regions); err != nil {
 		t.Fatalf("decode json output: %v\n%s", err, jsonOut)
 	}
-	if _, ok := raw["schema"]; ok {
-		t.Fatalf("json output unexpectedly contains schema: %#v", raw)
+	if len(regions) != 2 {
+		t.Fatalf("json regions len = %d, want 2\n%s", len(regions), jsonOut)
 	}
-	if raw["service"] != "drive9" {
-		t.Fatalf("service = %#v, want drive9", raw["service"])
+	if regions[0].RegionCode != "ali-ap-southeast-1" || regions[0].Mode != RegionModeTiDBCloudNative || regions[0].ModeLabel != "TiDBCloud" || regions[0].ServerURL != "https://native-sg.example" {
+		t.Fatalf("json region[0] = %#v", regions[0])
 	}
-	regions, ok := raw["regions"].([]any)
-	if !ok || len(regions) != 2 {
-		t.Fatalf("regions = %#v, want 2 entries", raw["regions"])
+	if regions[1].RegionCode != "aws-us-east-1" || regions[1].Mode != RegionModeTiDBCloudStarter || regions[1].ModeLabel != "Anonymous" || regions[1].ServerURL != "https://api.drive9.ai" {
+		t.Fatalf("json region[1] = %#v", regions[1])
 	}
 }
 
@@ -119,18 +118,15 @@ func TestRegionListJSONFallsBackWhenManifestUnavailable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("region list --json fallback: %v", err)
 	}
-	var manifest RegionManifest
-	if err := json.Unmarshal([]byte(jsonOut), &manifest); err != nil {
+	var regions []regionListOutputEntry
+	if err := json.Unmarshal([]byte(jsonOut), &regions); err != nil {
 		t.Fatalf("decode json output: %v\n%s", err, jsonOut)
 	}
-	if manifest.Default == nil || manifest.Default.RegionCode != "aws-ap-southeast-1" || manifest.Default.Mode != RegionModeTiDBCloudStarter {
-		t.Fatalf("fallback default = %#v", manifest.Default)
+	if len(regions) != 1 {
+		t.Fatalf("fallback regions len = %d, want 1", len(regions))
 	}
-	if len(manifest.Regions) != 1 {
-		t.Fatalf("fallback regions len = %d, want 1", len(manifest.Regions))
-	}
-	entry := manifest.Regions[0]
-	if entry.RegionCode != "aws-ap-southeast-1" || entry.Mode != RegionModeTiDBCloudStarter || entry.ServerURL != defaultServerURL {
+	entry := regions[0]
+	if entry.RegionCode != "aws-ap-southeast-1" || entry.Mode != RegionModeTiDBCloudStarter || entry.ModeLabel != "Anonymous" || entry.ServerURL != defaultServerURL {
 		t.Fatalf("fallback region = %#v", entry)
 	}
 }
