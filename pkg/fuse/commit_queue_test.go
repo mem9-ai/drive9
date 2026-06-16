@@ -2475,6 +2475,81 @@ func TestCommitQueueDelayedZeroTruncateCancelNeverUploads(t *testing.T) {
 	}
 }
 
+func TestCommitQueueCancelDelayedZeroTruncateDoesNotLeaveBackpressureZombie(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	cq := NewCommitQueue(newTestClient(ts.URL), nil, nil, nil, 1, 2)
+	cq.zeroTruncateDelay = time.Hour
+	for i := 0; i < 10; i++ {
+		entry := &CommitEntry{
+			Path:                 "/loop.txt",
+			Size:                 0,
+			Kind:                 PendingOverwrite,
+			BaseRev:              7,
+			CoalesceZeroTruncate: true,
+		}
+		if err := cq.Enqueue(entry); err != nil {
+			t.Fatalf("enqueue iteration %d: %v", i, err)
+		}
+		if !cq.CancelQueuedZeroTruncatePreserveLocal("/loop.txt") {
+			t.Fatalf("cancel iteration %d returned false", i)
+		}
+		if pending := cq.Pending(); pending != 0 {
+			t.Fatalf("pending after cancel iteration %d = %d, want 0", i, pending)
+		}
+		if cq.HasPath("/loop.txt") {
+			t.Fatalf("path remains queued after cancel iteration %d", i)
+		}
+	}
+	cq.DrainAll()
+	if got := uploads.Load(); got != 0 {
+		t.Fatalf("uploads after repeated cancel = %d, want 0", got)
+	}
+}
+
+func TestCommitQueueCancelQueuedZeroTruncateCancelsAllDelayedSamePath(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	cq := NewCommitQueue(newTestClient(ts.URL), nil, nil, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	first := &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	second := &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(second); err != nil {
+		t.Fatal(err)
+	}
+	if !cq.CancelQueuedZeroTruncatePreserveLocal("/same.txt") {
+		t.Fatal("cancel delayed same-path zero truncates returned false")
+	}
+	if !first.canceled || !second.canceled {
+		t.Fatalf("same-path delayed entries canceled = %t/%t, want true/true", first.canceled, second.canceled)
+	}
+	if pending := cq.Pending(); pending != 0 {
+		t.Fatalf("pending after same-path delayed cancel = %d, want 0", pending)
+	}
+	if cq.HasPath("/same.txt") {
+		t.Fatal("same-path delayed entries still visible after cancel")
+	}
+	cq.DrainAll()
+	if got := uploads.Load(); got != 0 {
+		t.Fatalf("uploads after same-path delayed cancel = %d, want 0", got)
+	}
+}
+
 func TestCommitQueueDelayedZeroTruncateTimerDispatches(t *testing.T) {
 	uploadDone := make(chan struct{}, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
