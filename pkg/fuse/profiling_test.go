@@ -33,9 +33,9 @@ func TestStartProfilerRejectsIntervalWithoutDir(t *testing.T) {
 }
 
 func TestStartProfilerWritesBoundedCPUProfile(t *testing.T) {
-	cpuPath := filepath.Join(t.TempDir(), "cpu.pprof")
+	dir := t.TempDir()
 	profiler, err := StartProfiler(ProfilingOptions{
-		CPUProfilePath:     cpuPath,
+		ProfileDir:         dir,
 		CPUProfileDuration: 20 * time.Millisecond,
 	})
 	if err != nil {
@@ -44,12 +44,19 @@ func TestStartProfilerWritesBoundedCPUProfile(t *testing.T) {
 	busyWait(80 * time.Millisecond)
 	profiler.Stop()
 
-	info, err := os.Stat(cpuPath)
+	matches, err := filepath.Glob(filepath.Join(dir, "cpu-*.pprof"))
+	if err != nil {
+		t.Fatalf("glob cpu profiles: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("bounded CPU profiles = %v, want one timestamped profile", matches)
+	}
+	info, err := os.Stat(matches[0])
 	if err != nil {
 		t.Fatalf("stat cpu profile: %v", err)
 	}
 	if info.Size() == 0 {
-		t.Fatalf("cpu profile is empty: %s", cpuPath)
+		t.Fatalf("cpu profile is empty: %s", matches[0])
 	}
 }
 
@@ -82,6 +89,19 @@ func TestStartProfilerWritesPeriodicCPUProfiles(t *testing.T) {
 	}
 	if len(matches) == 0 {
 		t.Fatalf("periodic CPU profiles = %v, want at least one", matches)
+	}
+}
+
+func TestMountOptionsProfileDirDefaultsCPUWindow(t *testing.T) {
+	opts := &MountOptions{
+		Profiling: ProfilingOptions{ProfileDir: t.TempDir()},
+	}
+	opts.setDefaults()
+	if opts.Profiling.CPUProfileDuration != defaultCPUProfileDuration {
+		t.Fatalf("CPUProfileDuration = %v, want %v", opts.Profiling.CPUProfileDuration, defaultCPUProfileDuration)
+	}
+	if opts.Profiling.CPUProfileInterval != defaultCPUProfileInterval {
+		t.Fatalf("CPUProfileInterval = %v, want %v", opts.Profiling.CPUProfileInterval, defaultCPUProfileInterval)
 	}
 }
 
@@ -137,12 +157,19 @@ func TestPprofMuxControlsCPUProfile(t *testing.T) {
 		t.Fatalf("stop cpu profile status = %d, want 200", resp.StatusCode)
 	}
 
-	info, err := os.Stat(filepath.Join(dir, "cpu.pprof"))
+	matches, err := filepath.Glob(filepath.Join(dir, "cpu-*.pprof"))
+	if err != nil {
+		t.Fatalf("glob cpu profile: %v", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("cpu profile matches = %v, want one timestamped profile", matches)
+	}
+	info, err := os.Stat(matches[0])
 	if err != nil {
 		t.Fatalf("stat cpu profile: %v", err)
 	}
 	if info.Size() == 0 {
-		t.Fatalf("cpu profile is empty")
+		t.Fatalf("cpu profile is empty: %s", matches[0])
 	}
 }
 

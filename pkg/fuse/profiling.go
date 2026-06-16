@@ -14,9 +14,13 @@ import (
 	"time"
 )
 
+const (
+	defaultCPUProfileDuration = 30 * time.Second
+	defaultCPUProfileInterval = 10 * time.Minute
+)
+
 // ProfilingOptions configures optional runtime profiling for a FUSE mount.
 type ProfilingOptions struct {
-	CPUProfilePath      string
 	CPUProfileDuration  time.Duration
 	CPUProfileInterval  time.Duration
 	HeapProfilePath     string
@@ -49,8 +53,7 @@ func StartProfiler(opts ProfilingOptions) (*Profiler, error) {
 		opts:   opts,
 		stopCh: make(chan struct{}),
 	}
-	if opts.CPUProfilePath == "" &&
-		opts.CPUProfileDuration <= 0 &&
+	if opts.CPUProfileDuration <= 0 &&
 		opts.CPUProfileInterval <= 0 &&
 		opts.HeapProfilePath == "" &&
 		opts.ProfileDir == "" &&
@@ -68,22 +71,13 @@ func StartProfiler(opts ProfilingOptions) (*Profiler, error) {
 	if opts.CPUProfileDuration > 0 && opts.CPUProfileInterval > 0 && opts.CPUProfileDuration >= opts.CPUProfileInterval {
 		return nil, fmt.Errorf("cpu profile duration must be less than cpu profile interval")
 	}
-	if opts.CPUProfileDuration > 0 && opts.CPUProfilePath == "" && opts.ProfileDir == "" {
-		return nil, fmt.Errorf("cpu profile duration requires cpu profile path or profile dir")
+	if opts.CPUProfileDuration > 0 && opts.ProfileDir == "" {
+		return nil, fmt.Errorf("cpu profile duration requires profile dir")
 	}
 	if opts.CPUProfileInterval > 0 && opts.ProfileDir == "" {
 		return nil, fmt.Errorf("cpu profile interval requires profile dir")
 	}
-	if opts.CPUProfilePath != "" {
-		if opts.CPUProfileDuration > 0 {
-			p.wg.Add(1)
-			go p.cpuLoop()
-		} else {
-			if err := p.StartCPUProfile(opts.CPUProfilePath); err != nil {
-				return nil, fmt.Errorf("start cpu profile %s: %w", opts.CPUProfilePath, err)
-			}
-		}
-	} else if opts.CPUProfileDuration > 0 {
+	if opts.CPUProfileDuration > 0 {
 		p.wg.Add(1)
 		go p.cpuLoop()
 	}
@@ -153,14 +147,15 @@ func (p *Profiler) Stop() {
 	})
 }
 
-// StartCPUProfile starts CPU profiling into path. It is safe to call through
+// StartCPUProfile starts CPU profiling into a timestamped path. It is safe to call through
 // the control endpoint while the mount is running.
-func (p *Profiler) StartCPUProfile(path string) error {
+func (p *Profiler) StartCPUProfile() error {
+	return p.startCPUProfile(p.defaultCPUProfilePath())
+}
+
+func (p *Profiler) startCPUProfile(path string) error {
 	if p == nil {
 		return fmt.Errorf("profiler is nil")
-	}
-	if path == "" {
-		path = p.defaultCPUProfilePath()
 	}
 	if path == "" {
 		return fmt.Errorf("cpu profile path is required")
@@ -204,11 +199,8 @@ func (p *Profiler) stopCPUProfile() string {
 }
 
 func (p *Profiler) defaultCPUProfilePath() string {
-	if p.opts.CPUProfilePath != "" {
-		return p.opts.CPUProfilePath
-	}
 	if p.opts.ProfileDir != "" {
-		return filepath.Join(p.opts.ProfileDir, "cpu.pprof")
+		return p.timestampedCPUProfilePath(time.Now().UTC())
 	}
 	return ""
 }
@@ -220,7 +212,7 @@ func (p *Profiler) cpuLoop() {
 		return
 	}
 
-	p.captureCPUProfile(p.periodicCPUProfilePath(time.Now().UTC()), p.opts.CPUProfileDuration)
+	p.captureCPUProfile(p.defaultCPUProfilePath(), p.opts.CPUProfileDuration)
 	ticker := time.NewTicker(p.opts.CPUProfileInterval)
 	defer ticker.Stop()
 	for {
@@ -228,17 +220,21 @@ func (p *Profiler) cpuLoop() {
 		case <-p.stopCh:
 			return
 		case t := <-ticker.C:
-			p.captureCPUProfile(p.periodicCPUProfilePath(t.UTC()), p.opts.CPUProfileDuration)
+			p.captureCPUProfile(p.cpuProfilePath(t.UTC()), p.opts.CPUProfileDuration)
 		}
 	}
 }
 
-func (p *Profiler) periodicCPUProfilePath(t time.Time) string {
+func (p *Profiler) cpuProfilePath(t time.Time) string {
 	if p.opts.ProfileDir != "" {
-		name := fmt.Sprintf("cpu-%s.pprof", t.Format("20060102-150405.000000000"))
-		return filepath.Join(p.opts.ProfileDir, name)
+		return p.timestampedCPUProfilePath(t)
 	}
-	return p.defaultCPUProfilePath()
+	return ""
+}
+
+func (p *Profiler) timestampedCPUProfilePath(t time.Time) string {
+	name := fmt.Sprintf("cpu-%s.pprof", t.Format("20060102-150405.000000000"))
+	return filepath.Join(p.opts.ProfileDir, name)
 }
 
 func (p *Profiler) captureCPUProfile(path string, duration time.Duration) {
@@ -250,7 +246,7 @@ func (p *Profiler) captureCPUProfile(path string, duration time.Duration) {
 		return
 	default:
 	}
-	if err := p.StartCPUProfile(path); err != nil {
+	if err := p.startCPUProfile(path); err != nil {
 		fmt.Fprintf(os.Stderr, "drive9: start cpu profile %s: %v\n", path, err)
 		return
 	}
@@ -320,15 +316,14 @@ func (p *Profiler) newPprofMux() *http.ServeMux {
 	return mux
 }
 
-func (p *Profiler) handleStartCPUProfile(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if err := p.StartCPUProfile(path); err != nil {
+func (p *Profiler) handleStartCPUProfile(w http.ResponseWriter, _ *http.Request) {
+	if err := p.StartCPUProfile(); err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-	if path == "" {
-		path = p.defaultCPUProfilePath()
-	}
+	p.mu.Lock()
+	path := p.cpuPath
+	p.mu.Unlock()
 	_, _ = fmt.Fprintf(w, "started cpu profile: %s\n", path)
 }
 

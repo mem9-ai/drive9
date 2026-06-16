@@ -63,7 +63,6 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		PerfCounters:            opts.PerfCounters,
 		EnableGitWorkspaces:     opts.LocalRoot != "",
 		Profiling: drive9fuse.ProfilingOptions{
-			CPUProfilePath:      opts.ProfileCPU,
 			CPUProfileDuration:  opts.ProfileCPUDuration,
 			CPUProfileInterval:  opts.ProfileCPUInterval,
 			HeapProfilePath:     opts.ProfileHeap,

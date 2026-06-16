@@ -32,7 +32,6 @@ type ProcessState struct {
 	PerfMaxSamples  int      `json:"perf_max_samples,omitempty"`
 	PprofAddr       string   `json:"pprof_addr,omitempty"`
 	StartedAt       string   `json:"started_at,omitempty"`
-	CPUProfilePath  string   `json:"cpu_profile_path,omitempty"`
 	HeapProfilePath string   `json:"heap_profile_path,omitempty"`
 }
 

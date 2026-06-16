@@ -156,6 +156,12 @@ func (o *MountOptions) setDefaults() {
 	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfMaxSamples <= 0 {
 		o.Profiling.PerfMaxSamples = defaultPerfMaxSamples
 	}
+	if o.Profiling.ProfileDir != "" && o.Profiling.CPUProfileDuration <= 0 {
+		o.Profiling.CPUProfileDuration = defaultCPUProfileDuration
+	}
+	if o.Profiling.ProfileDir != "" && o.Profiling.CPUProfileInterval <= 0 {
+		o.Profiling.CPUProfileInterval = defaultCPUProfileInterval
+	}
 }
 
 // Mount creates and serves a FUSE mount. It blocks until the filesystem
@@ -474,7 +480,6 @@ func Mount(opts *MountOptions) error {
 		PerfMaxSamples:  opts.Profiling.PerfMaxSamples,
 		PprofAddr:       opts.Profiling.PprofAddr,
 		StartedAt:       time.Now().UTC().Format(time.RFC3339Nano),
-		CPUProfilePath:  opts.Profiling.CPUProfilePath,
 		HeapProfilePath: opts.Profiling.HeapProfilePath,
 	})
 	if err != nil {
