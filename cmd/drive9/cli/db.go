@@ -83,16 +83,16 @@ func Create(args []string) error {
 		}
 	}
 
-	if err := rejectEmptyFlag("server", serverFlag, serverFlagGiven); err != nil {
+	if err := rejectEmptyFlag("server", strings.TrimSpace(serverFlag), serverFlagGiven); err != nil {
 		return err
 	}
-	if err := rejectEmptyFlag("region-code", regionCodeFlag, regionCodeGiven); err != nil {
+	if err := rejectEmptyFlag("region-code", strings.TrimSpace(regionCodeFlag), regionCodeGiven); err != nil {
 		return err
 	}
-	if err := rejectEmptyFlag("tidbcloud-public-key", publicKeyFlag, publicKeyGiven); err != nil {
+	if err := rejectEmptyFlag("tidbcloud-public-key", strings.TrimSpace(publicKeyFlag), publicKeyGiven); err != nil {
 		return err
 	}
-	if err := rejectEmptyFlag("tidbcloud-private-key", privateKeyFlag, privateKeyGiven); err != nil {
+	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
 		return err
 	}
 
@@ -188,8 +188,8 @@ func Create(args []string) error {
 			Config:     configPath(),
 		}
 		if regionEntry != nil {
-			out.RegionCode = regionEntry.RegionCode
-			out.Mode = regionEntry.Mode
+			out.RegionCode = strings.TrimSpace(regionEntry.RegionCode)
+			out.Mode = strings.TrimSpace(regionEntry.Mode)
 		}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -269,7 +269,7 @@ func resolveProvisionServer(serverFlag, regionCode, mode, fallbackServer string)
 	if err != nil {
 		return "", nil, err
 	}
-	return entry.ServerURL, entry, nil
+	return strings.TrimSpace(entry.ServerURL), entry, nil
 }
 
 func selectRegionServer(entries []RegionManifestEntry, regionCode, mode string) (*RegionManifestEntry, error) {
@@ -341,16 +341,16 @@ func DeleteTenant(args []string) error {
 		}
 	}
 
-	if err := rejectEmptyFlag("server", serverFlag, serverFlagGiven); err != nil {
+	if err := rejectEmptyFlag("server", strings.TrimSpace(serverFlag), serverFlagGiven); err != nil {
 		return err
 	}
-	if err := rejectEmptyFlag("api-key", apiKeyFlag, apiKeyGiven); err != nil {
+	if err := rejectEmptyFlag("api-key", strings.TrimSpace(apiKeyFlag), apiKeyGiven); err != nil {
 		return err
 	}
-	if err := rejectEmptyFlag("tidbcloud-public-key", publicKeyFlag, publicKeyGiven); err != nil {
+	if err := rejectEmptyFlag("tidbcloud-public-key", strings.TrimSpace(publicKeyFlag), publicKeyGiven); err != nil {
 		return err
 	}
-	if err := rejectEmptyFlag("tidbcloud-private-key", privateKeyFlag, privateKeyGiven); err != nil {
+	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
 		return err
 	}
 

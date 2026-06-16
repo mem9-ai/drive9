@@ -211,9 +211,9 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 			ServerURL:  starter.URL,
 		},
 		{
-			RegionCode: "aws-us-east-1",
-			Mode:       RegionModeTiDBCloudNative,
-			ServerURL:  native.URL,
+			RegionCode: " aws-us-east-1 ",
+			Mode:       " " + RegionModeTiDBCloudNative + " ",
+			ServerURL:  " " + native.URL + " ",
 		},
 	})
 	defer manifest.Close()
@@ -221,14 +221,16 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	t.Setenv(EnvRegionManifestURL, manifest.URL)
 	resetCredentialCacheForTest()
 
-	if _, err := captureStdoutE(t, func() error {
+	out, err := captureStdoutE(t, func() error {
 		return Create([]string{
 			"--name", "native-region",
 			"--region-code", "aws-us-east-1",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
+			"--json",
 		})
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
 	if atomic.LoadInt32(&nativeHits) != 1 {
@@ -248,6 +250,13 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	}
 	if _, ok := gotBody["database_name"]; ok {
 		t.Fatalf("native body unexpectedly included database_name: %#v", gotBody)
+	}
+	var result map[string]string
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("decode json output: %v\n%s", err, out)
+	}
+	if result["region_code"] != "aws-us-east-1" || result["mode"] != RegionModeTiDBCloudNative || result["server"] != native.URL {
+		t.Fatalf("json output = %#v, want trimmed native manifest values", result)
 	}
 	cfg := loadConfig()
 	if got := cfg.Contexts["native-region"].Server; got != native.URL {
