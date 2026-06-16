@@ -78,9 +78,9 @@ sample file defaults to `~/.cache/drive9/perf/mount/perf.jsonl`. With a
 one-second interval and `7200` samples, the active plus previous segment retain
 roughly four hours of recent samples.
 
-### 3. On-Demand Profiles
+### 3. Profile Capture
 
-Profiles are only captured on demand or for a workload window:
+Profiles are captured either by lifecycle hooks or on demand:
 
 - CPU profile: 30s or 60s window.
 - Heap profile: final, periodic, or explicit collect-time capture.
@@ -89,7 +89,10 @@ Profiles are only captured on demand or for a workload window:
 - Future: block/mutex profiles for lock contention.
 - Future: short Go traces for scheduler/network/GC interactions.
 
-FUSE v1 exposes these through the mount pprof server when `--pprof-addr` is set.
+FUSE v1 exposes on-demand captures through the mount pprof server when
+`--pprof-addr` is set. `--perf-dir` enables that pprof server by default but
+does not start mount-lifetime CPU profiling; this keeps `drive9 perf collect`
+able to capture workload-window CPU profiles.
 
 ### 4. Support Bundle and Analyzer
 

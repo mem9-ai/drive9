@@ -46,7 +46,6 @@ drive9 mount \
 `--perf-dir` enables the standard profiling suite and writes its default outputs
 under that directory:
 
-- `/tmp/drive9-perf/cpu.pprof`: CPU profile for the mount lifetime.
 - `/tmp/drive9-perf/heap-final.pprof`: final heap profile on unmount.
 - `/tmp/drive9-perf/perf.jsonl`: continuous low-overhead performance samples.
 - `/tmp/drive9-perf/`: default directory for periodic profiles and pprof
@@ -54,6 +53,11 @@ under that directory:
 - `127.0.0.1:0`: live pprof listener on an ephemeral local port. The actual
   address is recorded in mount state for `drive9 perf collect` and
   `drive9 perf sync`.
+
+CPU profiles are collected as short windows through `drive9 perf collect` or the
+pprof control endpoint. This keeps the default profiled mount compatible with
+workload-window flame graphs. Operators that specifically need a mount-lifetime
+CPU profile can add `--profile-cpu /tmp/drive9-perf/cpu.pprof`.
 
 Advanced flags can override individual outputs or retention knobs:
 
@@ -214,7 +218,7 @@ Preferred runtime:
 - Linux host or VM with working FUSE/fusermount.
 - Built `drive9` CLI.
 - Valid drive9 server and credential, either from the active context or
-  `DRIVE9_BASE` / `DRIVE9_API_KEY`.
+  `DRIVE9_SERVER` / `DRIVE9_API_KEY`.
 - `curl` for pprof CPU profile control, when using the control endpoints
   directly.
 - `go tool pprof` for summaries.
@@ -276,7 +280,8 @@ the target.
 
 ## Implementation Map
 
-- `cmd/drive9/cli/mount.go`: CLI flags and FUSE-only validation.
+- `cmd/drive9/cli/mount.go`: CLI flags, `--perf-dir` defaults, and FUSE-only
+  validation.
 - `cmd/drive9/cli/fuse_bridge*.go`: CLI-to-FUSE option bridge.
 - `pkg/fuse/profiling.go`: CPU, heap, live pprof, and CPU control endpoints.
 - `pkg/fuse/continuous_perf.go`: JSONL sample recorder.
@@ -290,5 +295,4 @@ the target.
   investigations.
 - Add JSONL post-processing to compute per-interval deltas and p95-ish latency
   estimates from cumulative counters.
-- Add customer bundle packaging that redacts credentials but preserves profiles,
-  logs, environment metadata, and JSONL samples.
+- Add optional customer upload workflow for already-redacted support bundles.

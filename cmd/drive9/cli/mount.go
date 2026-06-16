@@ -227,7 +227,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if perfDirGiven && strings.TrimSpace(*perfDir) == "" {
 		return fmt.Errorf("drive9 mount: --perf-dir must not be empty")
 	}
-	applyMountPerfDirDefaults(fs, *perfDir, profileCPU, profileHeap, profileDir, perfJSONL, pprofAddr)
+	applyMountPerfDirDefaults(fs, *perfDir, profileHeap, profileDir, perfJSONL, pprofAddr)
 	if flagProvided(fs, "perf-interval") && *perfInterval <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-interval must be > 0")
 	}
@@ -793,13 +793,10 @@ func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int
 	return nil
 }
 
-func applyMountPerfDirDefaults(fs *flag.FlagSet, perfDir string, profileCPU, profileHeap, profileDir, perfJSONL, pprofAddr *string) {
+func applyMountPerfDirDefaults(fs *flag.FlagSet, perfDir string, profileHeap, profileDir, perfJSONL, pprofAddr *string) {
 	perfDir = strings.TrimSpace(perfDir)
 	if perfDir == "" {
 		return
-	}
-	if !flagProvided(fs, "profile-cpu") {
-		*profileCPU = filepath.Join(perfDir, "cpu.pprof")
 	}
 	if !flagProvided(fs, "profile-heap") {
 		*profileHeap = filepath.Join(perfDir, "heap-final.pprof")

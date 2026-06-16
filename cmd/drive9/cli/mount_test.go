@@ -1688,8 +1688,8 @@ func TestMountCmdPerfDirSetsDefaultProfilingOptions(t *testing.T) {
 	if got == nil {
 		t.Fatal("mountFuse was not called")
 	}
-	if got.ProfileCPU != filepath.Join(perfDir, "cpu.pprof") {
-		t.Fatalf("ProfileCPU = %q, want perf dir default", got.ProfileCPU)
+	if got.ProfileCPU != "" {
+		t.Fatalf("ProfileCPU = %q, want empty so collect can capture window-scoped CPU profiles", got.ProfileCPU)
 	}
 	if got.ProfileHeap != filepath.Join(perfDir, "heap-final.pprof") {
 		t.Fatalf("ProfileHeap = %q, want perf dir default", got.ProfileHeap)
