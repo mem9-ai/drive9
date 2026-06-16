@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -199,26 +198,16 @@ func decodeCredentialDeprovisionRequest(w http.ResponseWriter, r *http.Request) 
 		PublicKey  string `json:"public_key"`
 		PrivateKey string `json:"private_key"`
 	}
-	if r.Body == nil {
-		return tenant.CredentialProvisionRequest{}, fmt.Errorf("public_key and private_key are required")
+	req, err := decodeCredentialRequest(w, r, &raw, func() tenant.CredentialProvisionRequest {
+		return tenant.CredentialProvisionRequest{
+			PublicKey:  strings.TrimSpace(raw.PublicKey),
+			PrivateKey: strings.TrimSpace(raw.PrivateKey),
+		}
+	})
+	if err != nil {
+		return tenant.CredentialProvisionRequest{}, err
 	}
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCredentialProvisionBodyBytes))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&raw); err != nil && !errors.Is(err, io.EOF) {
-		return tenant.CredentialProvisionRequest{}, fmt.Errorf("invalid JSON body: %w", err)
-	}
-	var extra struct{}
-	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
-		return tenant.CredentialProvisionRequest{}, fmt.Errorf("invalid JSON body: trailing data")
-	}
-	req := tenant.CredentialProvisionRequest{
-		PublicKey:  strings.TrimSpace(raw.PublicKey),
-		PrivateKey: strings.TrimSpace(raw.PrivateKey),
-	}
-	if req.PublicKey == "" || req.PrivateKey == "" {
-		return tenant.CredentialProvisionRequest{}, fmt.Errorf("public_key and private_key are required")
-	}
-	return req, nil
+	return *req, nil
 }
 
 func (s *Server) startTenantDeleteCleanup(ctx context.Context) {

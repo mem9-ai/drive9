@@ -3422,10 +3422,20 @@ func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*
 		PrivateKey   string `json:"private_key"`
 		DatabaseName string `json:"database_name"`
 	}
+	return decodeCredentialRequest(w, r, &req, func() tenant.CredentialProvisionRequest {
+		return tenant.CredentialProvisionRequest{
+			PublicKey:    strings.TrimSpace(req.PublicKey),
+			PrivateKey:   strings.TrimSpace(req.PrivateKey),
+			DatabaseName: strings.TrimSpace(req.DatabaseName),
+		}
+	})
+}
+
+func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, build func() tenant.CredentialProvisionRequest) (*tenant.CredentialProvisionRequest, error) {
 	if r.Body != nil {
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCredentialProvisionBodyBytes))
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		if err := dec.Decode(raw); err != nil && !errors.Is(err, io.EOF) {
 			return nil, fmt.Errorf("invalid JSON body: %w", err)
 		}
 		var extra struct{}
@@ -3433,15 +3443,11 @@ func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*
 			return nil, fmt.Errorf("invalid JSON body: trailing data")
 		}
 	}
-	out := &tenant.CredentialProvisionRequest{
-		PublicKey:    strings.TrimSpace(req.PublicKey),
-		PrivateKey:   strings.TrimSpace(req.PrivateKey),
-		DatabaseName: strings.TrimSpace(req.DatabaseName),
-	}
+	out := build()
 	if out.PublicKey == "" || out.PrivateKey == "" {
 		return nil, fmt.Errorf("public_key and private_key are required")
 	}
-	return out, nil
+	return &out, nil
 }
 
 type apiKeyIssueSource struct {
