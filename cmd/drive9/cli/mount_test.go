@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -1657,6 +1658,120 @@ func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
 	}
 	if got.PerfMaxSamples != 42 {
 		t.Fatalf("PerfMaxSamples = %d, want 42", got.PerfMaxSamples)
+	}
+}
+
+func TestMountCmdPerfDirSetsDefaultProfilingOptions(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	perfDir := filepath.Join(t.TempDir(), "perf")
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-dir", perfDir,
+		"--perf-interval", "2s",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ProfileCPU != filepath.Join(perfDir, "cpu.pprof") {
+		t.Fatalf("ProfileCPU = %q, want perf dir default", got.ProfileCPU)
+	}
+	if got.ProfileHeap != filepath.Join(perfDir, "heap-final.pprof") {
+		t.Fatalf("ProfileHeap = %q, want perf dir default", got.ProfileHeap)
+	}
+	if got.ProfileDir != perfDir {
+		t.Fatalf("ProfileDir = %q, want %q", got.ProfileDir, perfDir)
+	}
+	if got.PerfSamplesPath != filepath.Join(perfDir, "perf.jsonl") {
+		t.Fatalf("PerfSamplesPath = %q, want perf dir default", got.PerfSamplesPath)
+	}
+	if got.PerfSampleInterval != 2*time.Second {
+		t.Fatalf("PerfSampleInterval = %v, want 2s", got.PerfSampleInterval)
+	}
+	if got.PprofAddr != defaultMountPerfPprofAddr {
+		t.Fatalf("PprofAddr = %q, want %q", got.PprofAddr, defaultMountPerfPprofAddr)
+	}
+}
+
+func TestMountCmdPerfDirKeepsAdvancedOverrides(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	base := t.TempDir()
+	perfDir := filepath.Join(base, "perf")
+	cpuPath := filepath.Join(base, "custom", "cpu.pprof")
+	heapPath := filepath.Join(base, "custom", "heap.pprof")
+	profileDir := filepath.Join(base, "custom", "profiles")
+	perfJSONL := filepath.Join(base, "custom", "samples.jsonl")
+	pprofAddr := "127.0.0.1:7070"
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-dir", perfDir,
+		"--profile-cpu", cpuPath,
+		"--profile-heap", heapPath,
+		"--profile-dir", profileDir,
+		"--perf-jsonl", perfJSONL,
+		"--pprof-addr", pprofAddr,
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ProfileCPU != cpuPath {
+		t.Fatalf("ProfileCPU = %q, want %q", got.ProfileCPU, cpuPath)
+	}
+	if got.ProfileHeap != heapPath {
+		t.Fatalf("ProfileHeap = %q, want %q", got.ProfileHeap, heapPath)
+	}
+	if got.ProfileDir != profileDir {
+		t.Fatalf("ProfileDir = %q, want %q", got.ProfileDir, profileDir)
+	}
+	if got.PerfSamplesPath != perfJSONL {
+		t.Fatalf("PerfSamplesPath = %q, want %q", got.PerfSamplesPath, perfJSONL)
+	}
+	if got.PprofAddr != pprofAddr {
+		t.Fatalf("PprofAddr = %q, want %q", got.PprofAddr, pprofAddr)
+	}
+}
+
+func TestMountCmdRejectsEmptyPerfDir(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-dir", "",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-dir must not be empty") {
+		t.Fatalf("MountCmd error = %v, want perf dir validation error", err)
 	}
 }
 

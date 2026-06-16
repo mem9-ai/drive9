@@ -766,6 +766,22 @@ func TestFsMountCmdRejectsContinuousPerfForWebDAV(t *testing.T) {
 	}
 }
 
+func TestFsMountCmdRejectsPerfDirForWebDAV(t *testing.T) {
+	err := fsMountCmd([]string{
+		"--mode=webdav",
+		"--server=https://drive9.example",
+		"--api-key=sk-test",
+		"--perf-dir=/tmp/drive9-perf",
+		t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected WebDAV perf-dir rejection")
+	}
+	if !strings.Contains(err.Error(), "--perf-dir is only supported with --mode=fuse") {
+		t.Fatalf("error = %v, want perf-dir WebDAV rejection", err)
+	}
+}
+
 // isolateMountCredentialsForTest keeps parsing-only mount tests from reading
 // the developer machine's DRIVE9_* env vars or active drive9 context. Without
 // this, a test that expects credential resolution to fail can reach the real

@@ -31,6 +31,7 @@ const (
 	defaultFuseParallelReadConcurrency = 4
 	defaultFuseParallelReadBlockSizeMB = 1
 	defaultMountBackgroundReadyTimeout = 30 * time.Second
+	defaultMountPerfPprofAddr          = "127.0.0.1:0"
 )
 
 var (
@@ -149,6 +150,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
 	perfCounters := fs.Bool("perf-counters", false, "print FUSE perf counter summary on unmount")
+	perfDir := fs.String("perf-dir", "", "enable standard FUSE profiling outputs in this directory")
 	perfJSONL := fs.String("perf-jsonl", "", "write continuous mount performance samples to a JSONL file")
 	perfInterval := fs.Duration("perf-interval", 0, "continuous performance sample interval (default 10s when --perf-jsonl is set)")
 	perfMaxSamples := fs.Int("perf-max-samples", 0, "maximum samples per continuous perf JSONL segment (default 7200 when --perf-jsonl is set)")
@@ -203,6 +205,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	lookupRetryTimeoutGiven := flagProvided(fs, "lookup-retry-timeout")
 	readCacheTTLGiven := flagProvided(fs, "read-cache-ttl")
 	trustProcessLocalEventsGiven := flagProvided(fs, "trust-process-local-events")
+	perfDirGiven := flagProvided(fs, "perf-dir")
 	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout, lookupRetryCountGiven, lookupRetryTimeoutGiven); err != nil {
 		return err
 	}
@@ -221,6 +224,10 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
 	}
+	if perfDirGiven && strings.TrimSpace(*perfDir) == "" {
+		return fmt.Errorf("drive9 mount: --perf-dir must not be empty")
+	}
+	applyMountPerfDirDefaults(fs, *perfDir, profileCPU, profileHeap, profileDir, perfJSONL, pprofAddr)
 	if flagProvided(fs, "perf-interval") && *perfInterval <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-interval must be > 0")
 	}
@@ -298,6 +305,9 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	if resolved == MountModeWebDAV && *durability != string(fuseDurabilityAuto) {
 		return fmt.Errorf("--durability is only supported with --mode=fuse; WebDAV mounts always use their native write behavior")
+	}
+	if resolved == MountModeWebDAV && perfDirGiven {
+		return fmt.Errorf("--perf-dir is only supported with --mode=fuse")
 	}
 	if resolved == MountModeWebDAV && *perfJSONL != "" {
 		return fmt.Errorf("--perf-jsonl is only supported with --mode=fuse")
@@ -781,6 +791,28 @@ func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int
 		return fmt.Errorf("drive9 mount: --readdir-prefetch-timeout must be > 0")
 	}
 	return nil
+}
+
+func applyMountPerfDirDefaults(fs *flag.FlagSet, perfDir string, profileCPU, profileHeap, profileDir, perfJSONL, pprofAddr *string) {
+	perfDir = strings.TrimSpace(perfDir)
+	if perfDir == "" {
+		return
+	}
+	if !flagProvided(fs, "profile-cpu") {
+		*profileCPU = filepath.Join(perfDir, "cpu.pprof")
+	}
+	if !flagProvided(fs, "profile-heap") {
+		*profileHeap = filepath.Join(perfDir, "heap-final.pprof")
+	}
+	if !flagProvided(fs, "profile-dir") {
+		*profileDir = perfDir
+	}
+	if !flagProvided(fs, "perf-jsonl") {
+		*perfJSONL = filepath.Join(perfDir, "perf.jsonl")
+	}
+	if !flagProvided(fs, "pprof-addr") {
+		*pprofAddr = defaultMountPerfPprofAddr
+	}
 }
 
 func validateMountProfileFlags(profile string, localRoot string, localOnlyPatterns []string, remoteOnlyPatterns []string, packPaths []string) error {

@@ -34,11 +34,33 @@ the FUSE mount producer and CLI perf suite details.
 
 ## CLI Surface
 
-The FUSE mount accepts these profiling flags:
+The default operator-facing entry point is one directory flag:
 
 ```bash
 drive9 mount \
   --mode=fuse \
+  --perf-dir /tmp/drive9-perf \
+  :/ /mnt/drive9
+```
+
+`--perf-dir` enables the standard profiling suite and writes its default outputs
+under that directory:
+
+- `/tmp/drive9-perf/cpu.pprof`: CPU profile for the mount lifetime.
+- `/tmp/drive9-perf/heap-final.pprof`: final heap profile on unmount.
+- `/tmp/drive9-perf/perf.jsonl`: continuous low-overhead performance samples.
+- `/tmp/drive9-perf/`: default directory for periodic profiles and pprof
+  control endpoint outputs.
+- `127.0.0.1:0`: live pprof listener on an ephemeral local port. The actual
+  address is recorded in mount state for `drive9 perf collect` and
+  `drive9 perf sync`.
+
+Advanced flags can override individual outputs or retention knobs:
+
+```bash
+drive9 mount \
+  --mode=fuse \
+  --perf-dir /tmp/drive9-perf \
   --profile-cpu /tmp/drive9/cpu.pprof \
   --profile-heap /tmp/drive9/heap-final.pprof \
   --profile-dir /tmp/drive9/profiles \
@@ -54,6 +76,7 @@ Flag behavior:
 
 | Flag | Behavior |
 | --- | --- |
+| `--perf-dir` | Enable the standard profiling suite and place default outputs in this directory. |
 | `--profile-cpu` | Start Go CPU profiling at mount startup and stop it on unmount. |
 | `--profile-heap` | Write one final heap profile on unmount. |
 | `--profile-dir` | Directory used by periodic heap profiles and default pprof control output. |
@@ -63,9 +86,12 @@ Flag behavior:
 | `--perf-interval` | Sampling interval for `--perf-jsonl`; default is `10s` when omitted. |
 | `--perf-max-samples` | Maximum samples per active JSONL segment; default is `7200` when omitted. |
 
-Profiling flags are FUSE-only. If mount resolution selects WebDAV, `--perf-jsonl`
-is rejected instead of ignored. WebDAV has a different runtime path and would
-produce misleading FUSE conclusions.
+Profiling flags are FUSE-only. If mount resolution selects WebDAV, `--perf-dir`
+and `--perf-jsonl` are rejected instead of ignored. WebDAV has a different
+runtime path and would produce misleading FUSE conclusions.
+
+`--perf-dir` is explicit opt-in. The default mount behavior is unchanged when no
+profiling flags are present.
 
 ## pprof Control
 

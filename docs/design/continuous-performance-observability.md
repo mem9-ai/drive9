@@ -67,14 +67,16 @@ For FUSE v1:
 
 ```bash
 drive9 mount \
-  --perf-jsonl ~/.cache/drive9/perf/mount.jsonl \
+  --perf-dir ~/.cache/drive9/perf/mount \
   --perf-interval 1s \
   --perf-max-samples 7200 \
   :/ /mnt/drive9
 ```
 
-With a one-second interval and `7200` samples, the active plus previous segment
-retain roughly four hours of recent samples.
+This enables the standard mount profiling suite in one directory. The JSONL
+sample file defaults to `~/.cache/drive9/perf/mount/perf.jsonl`. With a
+one-second interval and `7200` samples, the active plus previous segment retain
+roughly four hours of recent samples.
 
 ### 3. On-Demand Profiles
 
@@ -198,7 +200,9 @@ The summary format is allowed to grow additively.
 
 The first implementation lands these pieces:
 
-- `drive9 mount --perf-jsonl --perf-interval --perf-max-samples`.
+- `drive9 mount --perf-dir` as the simple standard profiling switch.
+- advanced mount overrides:
+  `--profile-cpu --profile-heap --profile-dir --pprof-addr --perf-jsonl --perf-interval --perf-max-samples`.
 - segmented JSONL rotation for bounded local retention;
 - latency histogram snapshots for FUSE and remote ops;
 - redacted mount context in every sample;
