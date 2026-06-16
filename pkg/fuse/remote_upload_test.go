@@ -51,7 +51,34 @@ func newMultipartUploadRecorder(t *testing.T, wantPath string, wantSize int64, w
 		switch {
 		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
 			rec.directFilePuts.Add(1)
+			gotPath := strings.TrimPrefix(r.URL.Path, "/v1/fs")
+			if gotPath != rec.wantPath {
+				t.Fatalf("direct PUT path = %q, want %q", gotPath, rec.wantPath)
+			}
+			gotExpected, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				t.Fatalf("direct PUT expected revision header: %v", err)
+			}
+			if rec.wantExpected == nil {
+				if gotExpected != -1 {
+					t.Fatalf("direct PUT expected revision = %d, want -1", gotExpected)
+				}
+			} else if gotExpected != *rec.wantExpected {
+				t.Fatalf("direct PUT expected revision = %d, want %d", gotExpected, *rec.wantExpected)
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read direct PUT body: %v", err)
+			}
+			if int64(len(body)) != rec.wantSize {
+				t.Fatalf("direct PUT body size = %d, want %d", len(body), rec.wantSize)
+			}
+			rec.mu.Lock()
+			rec.gotUploadedBytes = int64(len(body))
+			rec.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": rec.committedRev})
 			return
 
 		case r.Method == http.MethodHead && strings.HasPrefix(r.URL.Path, "/v1/fs/"):
@@ -214,7 +241,7 @@ func TestTruncateReaderAtPreservesPrefixAndZeroFillsExtension(t *testing.T) {
 	}
 }
 
-func TestUploadFromShadowRemoteWithRevisionStreamsSmallSpill(t *testing.T) {
+func TestUploadFromShadowRemoteWithRevisionDirectPutsSmallSpill(t *testing.T) {
 	const remotePath = "/sqlite/workload.db-journal"
 	data := []byte("small sqlite journal frame")
 	expectedRevision := int64(3)
@@ -222,6 +249,49 @@ func TestUploadFromShadowRemoteWithRevisionStreamsSmallSpill(t *testing.T) {
 
 	c := rec.client()
 	c.SetSmallFileThresholdForTests(50_000)
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(remotePath, data, expectedRevision); err != nil {
+		t.Fatal(err)
+	}
+
+	committedRev, err := uploadFromShadowRemoteWithRevision(context.Background(), c, shadow, remotePath, remotePath, expectedRevision)
+	if err != nil {
+		t.Fatalf("uploadFromShadowRemoteWithRevision: %v", err)
+	}
+	if committedRev != rec.committedRev {
+		t.Fatalf("committed revision = %d, want %d", committedRev, rec.committedRev)
+	}
+	if rec.directFilePuts.Load() != 1 {
+		t.Fatalf("direct PUT count = %d, want 1", rec.directFilePuts.Load())
+	}
+	if rec.initiateCalls.Load() != 0 || rec.presignCalls.Load() != 0 || rec.completeCalls.Load() != 0 || rec.s3PutCalls.Load() != 0 {
+		t.Fatalf("multipart flow calls = initiate:%d presign:%d complete:%d s3put:%d, want 0 each",
+			rec.initiateCalls.Load(), rec.presignCalls.Load(), rec.completeCalls.Load(), rec.s3PutCalls.Load())
+	}
+	if rec.statCalls.Load() != 0 {
+		t.Fatalf("stat calls = %d, want 0", rec.statCalls.Load())
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.gotUploadedBytes != int64(len(data)) {
+		t.Fatalf("uploaded bytes = %d, want %d", rec.gotUploadedBytes, len(data))
+	}
+}
+
+func TestUploadFromShadowRemoteWithRevisionUsesMultipartAtThreshold(t *testing.T) {
+	const remotePath = "/threshold.bin"
+	data := []byte("exact threshold data")
+	expectedRevision := int64(9)
+	rec := newMultipartUploadRecorder(t, remotePath, int64(len(data)), &expectedRevision)
+
+	c := rec.client()
+	c.SetSmallFileThresholdForTests(int64(len(data)))
 
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
@@ -246,14 +316,38 @@ func TestUploadFromShadowRemoteWithRevisionStreamsSmallSpill(t *testing.T) {
 		t.Fatalf("multipart flow calls = initiate:%d presign:%d complete:%d s3put:%d, want 1 each",
 			rec.initiateCalls.Load(), rec.presignCalls.Load(), rec.completeCalls.Load(), rec.s3PutCalls.Load())
 	}
-	if rec.statCalls.Load() != 0 {
-		t.Fatalf("stat calls = %d, want 0", rec.statCalls.Load())
+}
+
+func TestUploadFromShadowRemoteWithRevisionUsesMultipartWhenThresholdUnknown(t *testing.T) {
+	const remotePath = "/unknown-threshold.bin"
+	data := []byte("small but threshold is unknown")
+	expectedRevision := int64(11)
+	rec := newMultipartUploadRecorder(t, remotePath, int64(len(data)), &expectedRevision)
+
+	c := client.New(rec.server.URL, "")
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull(remotePath, data, expectedRevision); err != nil {
+		t.Fatal(err)
 	}
 
-	rec.mu.Lock()
-	defer rec.mu.Unlock()
-	if rec.gotUploadedBytes != int64(len(data)) {
-		t.Fatalf("uploaded bytes = %d, want %d", rec.gotUploadedBytes, len(data))
+	committedRev, err := uploadFromShadowRemoteWithRevision(context.Background(), c, shadow, remotePath, remotePath, expectedRevision)
+	if err != nil {
+		t.Fatalf("uploadFromShadowRemoteWithRevision: %v", err)
+	}
+	if committedRev != 0 {
+		t.Fatalf("committed revision = %d, want 0 for multipart stream", committedRev)
+	}
+	if rec.directFilePuts.Load() != 0 {
+		t.Fatalf("direct PUT count = %d, want 0", rec.directFilePuts.Load())
+	}
+	if rec.initiateCalls.Load() != 1 || rec.presignCalls.Load() != 1 || rec.completeCalls.Load() != 1 || rec.s3PutCalls.Load() != 1 {
+		t.Fatalf("multipart flow calls = initiate:%d presign:%d complete:%d s3put:%d, want 1 each",
+			rec.initiateCalls.Load(), rec.presignCalls.Load(), rec.completeCalls.Load(), rec.s3PutCalls.Load())
 	}
 }
 

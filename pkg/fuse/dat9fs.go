@@ -1331,6 +1331,13 @@ func (fs *Dat9FS) writePolicyForOpen(flags uint32) WritePolicy {
 	return policy
 }
 
+func (fs *Dat9FS) mountWritePolicy() WritePolicy {
+	if fs == nil || fs.opts == nil || fs.opts.WritePolicy == "" {
+		return WritePolicyWriteBack
+	}
+	return fs.opts.WritePolicy
+}
+
 func isGitLooseObjectFinalPath(p string) bool {
 	const marker = "/.git/objects/"
 
@@ -1439,7 +1446,7 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) er
 	return nil
 }
 
-func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64, callerPID uint32) {
+func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64, callerPID uint32, truncateSize int64) {
 	if revision <= 0 {
 		return
 	}
@@ -1460,7 +1467,7 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 	for _, fh := range matching {
 		fh.Lock()
 		if shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
-			if err := fs.truncateWritableHandleLocked(fh, 0); err != nil {
+			if err := fs.truncateWritableHandleLocked(fh, truncateSize); err != nil {
 				log.Printf("handle truncate sync failed for %s: %v", fh.Path, err)
 				fh.Unlock()
 				continue
@@ -1481,6 +1488,35 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 			}
 			if err := fs.shadowStore.Ensure(fh.Path, size, revision); err != nil {
 				log.Printf("shadow base revision refresh failed for %s: %v", fh.Path, err)
+			}
+		}
+		fh.Unlock()
+	}
+}
+
+func (fs *Dat9FS) adoptSingleCallerPathTruncate(remotePath string, callerPID uint32) {
+	if fs == nil || fs.openHandles == nil || remotePath == "" || callerPID == 0 {
+		return
+	}
+
+	var matching []*FileHandle
+	for _, fh := range fs.openHandles.SnapshotPath(remotePath) {
+		if fh == nil {
+			continue
+		}
+		fh.Lock()
+		dirty := fh.Dirty != nil
+		fh.Unlock()
+		if dirty {
+			matching = append(matching, fh)
+		}
+	}
+
+	for _, fh := range matching {
+		fh.Lock()
+		if shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
+			if err := fs.truncateWritableHandleLocked(fh, 0); err != nil {
+				log.Printf("handle truncate stage failed for %s: %v", fh.Path, err)
 			}
 		}
 		fh.Unlock()
@@ -1872,6 +1908,20 @@ func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64
 	fh.ShadowSpill = false
 	fh.ShadowCommitReady = false
 	fh.ShadowCommitSeq = 0
+}
+
+func (fs *Dat9FS) seedReadCacheFromShadowLocked(path string, size int64, revision int64) {
+	if fs == nil || fs.shadowStore == nil || fs.readCache == nil || revision <= 0 {
+		return
+	}
+	if size > fs.readCache.MaxFileSize() {
+		return
+	}
+	data, err := fs.shadowStore.ReadAll(path)
+	if err != nil {
+		return
+	}
+	fs.readCache.PutOwned(path, data, revision)
 }
 
 func (fs *Dat9FS) preloadWritableHandle(ctx context.Context, fh *FileHandle) gofuse.Status {
@@ -2297,6 +2347,14 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 		fs.cacheFileForPath(entry.Path, newSize, entry.Mtime, 0)
 		return gofuse.OK
 	}
+	if newSize == 0 && fs.canStagePathTruncateToZero(entry) {
+		st := fs.stagePathTruncateToZeroLocked(ctx, entry, ino)
+		if st != gofuse.OK {
+			return st
+		}
+		fs.adoptSingleCallerPathTruncate(entry.Path, pid)
+		return gofuse.OK
+	}
 
 	writeStart := fs.perfStart()
 	var err error
@@ -2322,7 +2380,7 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 			refreshedRevision = stat.Revision
 			entry.Revision = stat.Revision
 			fs.inodes.UpdateRevision(ino, stat.Revision)
-			fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, pid)
+			fs.updateOpenHandleBaseRevision(entry.Path, stat.Revision, pid, newSize)
 		}
 		if !stat.Mtime.IsZero() {
 			refreshedMtime = stat.Mtime
@@ -2527,6 +2585,68 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 	}
 }
 
+func (fs *Dat9FS) canStagePathTruncateToZero(entry *InodeEntry) bool {
+	if fs == nil || entry == nil || entry.IsDir || entryIsSymlink(entry) {
+		return false
+	}
+	if fs.layerEnabled() || isSQLitePersistentJournalPath(entry.Path) {
+		return false
+	}
+	if fs.mountWritePolicy() != WritePolicyWriteBack {
+		return false
+	}
+	return fs.shadowStore != nil && fs.pendingIndex != nil && fs.commitQueue != nil
+}
+
+func (fs *Dat9FS) stagePathTruncateToZeroLocked(ctx context.Context, entry *InodeEntry, ino uint64) gofuse.Status {
+	if !fs.canStagePathTruncateToZero(entry) {
+		return gofuse.Status(syscall.ENOTSUP)
+	}
+	expectedRevision := entry.Revision
+	mode := uint32(0)
+	hasMode := false
+	if entry.HasMode {
+		mode = entry.Mode & 0o777
+		hasMode = mode != defaultRegularFileMode
+	}
+	if err := fs.shadowStore.WriteFull(entry.Path, nil, expectedRevision); err != nil {
+		log.Printf("path truncate shadow stage failed for %s: %v", entry.Path, err)
+		return gofuse.EIO
+	}
+	if err := fs.shadowStore.Sync(entry.Path); err != nil {
+		fs.shadowStore.Remove(entry.Path)
+		log.Printf("path truncate shadow sync failed for %s: %v", entry.Path, err)
+		return gofuse.EIO
+	}
+	if _, err := fs.pendingIndex.PutWithBaseRevAndMode(entry.Path, 0, PendingOverwrite, expectedRevision, mode, hasMode); err != nil {
+		fs.shadowStore.Remove(entry.Path)
+		log.Printf("path truncate pending index update failed for %s: %v", entry.Path, err)
+		return gofuse.EIO
+	}
+
+	commit := &CommitEntry{
+		Path:    entry.Path,
+		Inode:   ino,
+		BaseRev: expectedRevision,
+		Size:    0,
+		Kind:    PendingOverwrite,
+		Mode:    mode,
+		HasMode: hasMode,
+	}
+	if err := fs.commitQueue.Enqueue(commit); err != nil {
+		log.Printf("path truncate async enqueue failed for %s: %v, falling back to sync commit", entry.Path, err)
+		if commitErr := fs.commitQueue.commitNowPathLocked(ctx, commit); commitErr != nil {
+			fs.pendingIndex.Remove(entry.Path)
+			fs.shadowStore.Remove(entry.Path)
+			log.Printf("path truncate sync fallback failed for %s: %v", entry.Path, commitErr)
+			return httpToFuseStatus(commitErr)
+		}
+	}
+	fs.invalidateReadCacheAndTargets(entry.Path)
+	fs.cacheFileForPath(entry.Path, 0, entry.Mtime, 0)
+	return gofuse.OK
+}
+
 func (fs *Dat9FS) canStageShadowFastLocked(fh *FileHandle) bool {
 	if fs.shadowStore == nil || fs.pendingIndex == nil || fh == nil || fh.Dirty == nil {
 		return false
@@ -2544,7 +2664,7 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	fs.adoptCommittedRevisionLocked(fh)
 
 	size := fh.Dirty.Size()
-	if fh.ShadowReady {
+	if fh.ShadowReady && fh.ShadowSpill {
 		if err := fs.shadowStore.Truncate(fh.Path, size, fh.BaseRev); err != nil {
 			return err
 		}
@@ -2656,6 +2776,7 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 	if err != nil {
 		return err
 	}
+	zeroOverwrite := meta.Kind == PendingOverwrite && meta.Size == 0 && len(data) == 0
 
 	wb := fs.newWriteBuffer(fh.Path, maxPreloadSize, 0)
 	if len(data) > 0 {
@@ -2663,6 +2784,10 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 			return err
 		}
 		wb.ClearDirty()
+	} else if zeroOverwrite {
+		if err := wb.Truncate(0); err != nil {
+			return err
+		}
 	} else {
 		wb.totalSize = meta.Size
 	}
@@ -2670,11 +2795,15 @@ func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *Write
 	fh.Dirty = wb
 	fh.ShadowReady = true
 	fh.IsNew = meta.Kind == PendingNew
+	fh.ZeroBase = zeroOverwrite
 	fh.OrigSize = meta.Size
 	if meta.BaseRev > 0 {
 		fh.BaseRev = meta.BaseRev
 	} else if rev := fs.shadowStore.BaseRev(fh.Path); rev > 0 {
 		fh.BaseRev = rev
+	}
+	if zeroOverwrite {
+		fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 	}
 	if meta.HasMode {
 		mode := meta.Mode & posixPermissionModeMask
@@ -2746,6 +2875,11 @@ func (fs *Dat9FS) loadWritableHandleFromOpenHandleLocked(fh *FileHandle) bool {
 
 		src.Lock()
 		if src.Dirty == nil {
+			src.Unlock()
+			continue
+		}
+		pendingLocal := src.IsNew || src.ZeroBase || src.DirtySeq != 0 || src.WriteBackSeq != 0 || src.ShadowCommitReady || src.Dirty.HasDirtyParts()
+		if !pendingLocal {
 			src.Unlock()
 			continue
 		}
@@ -5482,6 +5616,35 @@ func (fs *Dat9FS) waitQueuedRemoteCommitBeforeWrite(p string) func() {
 		return func() {}
 	}
 	return fs.lockWritableRemoteCommitPath(p)
+}
+
+func (fs *Dat9FS) lockWritableRemoteCommitPathForWritableOpen(p string) func() {
+	if fs == nil || p == "" {
+		return func() {}
+	}
+	if !fs.canSupersedeQueuedPathTruncate(p) {
+		return fs.lockWritableRemoteCommitPath(p)
+	}
+	unlockRemoteCommit := fs.lockRemoteCommitPath(p)
+	if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
+		unlockRemoteCommit()
+		return fs.lockWritableRemoteCommitPath(p)
+	}
+	return unlockRemoteCommit
+}
+
+func (fs *Dat9FS) canSupersedeQueuedPathTruncate(p string) bool {
+	if fs == nil || p == "" || fs.mountWritePolicy() != WritePolicyWriteBack {
+		return false
+	}
+	if fs.commitQueue == nil || fs.shadowStore == nil || fs.pendingIndex == nil {
+		return false
+	}
+	meta, ok := fs.pendingIndex.GetMeta(p)
+	if !ok || meta.Kind != PendingOverwrite || meta.Size != 0 || !fs.shadowStore.Has(p) {
+		return false
+	}
+	return fs.commitQueue.CancelQueuedZeroTruncatePreserveLocal(p)
 }
 
 func (fs *Dat9FS) lockWritableRemoteCommitPath(p string) func() {
@@ -8393,6 +8556,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		Ino:         ino,
 		Path:        childP,
 		Flags:       input.Flags,
+		OpenPID:     input.Pid,
 		Dirty:       wb,
 		IsNew:       true,
 		ShadowReady: false,
@@ -8526,12 +8690,17 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 		if fs.opts.ReadOnly {
 			return gofuse.EROFS
 		}
-		unlockRemoteCommit := fs.waitQueuedRemoteCommitBeforeWrite(p)
+		unlockRemoteCommit := fs.lockWritableRemoteCommitPathForWritableOpen(p)
 		defer func() {
 			if unlockRemoteCommit != nil {
 				unlockRemoteCommit()
 			}
 		}()
+		if refreshedEntry, ok := fs.inodes.GetEntry(input.NodeId); ok {
+			fh.OrigSize = refreshedEntry.Size
+			fh.BaseRev = refreshedEntry.Revision
+			entry = refreshedEntry
+		}
 
 		fh.Dirty = fs.newWriteBuffer(p, maxPreloadSize, 0)
 
@@ -8591,11 +8760,10 @@ func (fs *Dat9FS) Open(cancel <-chan struct{}, input *gofuse.OpenIn, out *gofuse
 			fh.DirtySeq = fs.markDirtySize(fh.Ino, 0)
 			fs.inodes.UpdateSize(fh.Ino, 0)
 			if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
-				if err := fs.shadowStore.Ensure(p, 0, fh.BaseRev); err != nil {
-					log.Printf("shadow ensure failed for truncate-open %s: %v", p, err)
+				if err := fs.shadowStore.WriteFull(p, nil, fh.BaseRev); err != nil {
+					log.Printf("shadow reset failed for truncate-open %s: %v", p, err)
 				} else {
 					fh.ShadowReady = true
-					fh.ShadowSpill = true
 					// Pin shadow so commit queue cleanup doesn't delete it while
 					// this handle is reading.
 					fh.ShadowGen = fs.shadowStore.Pin(p)
@@ -9782,6 +9950,7 @@ func (fs *Dat9FS) syncHandleToRemoteLocked(ctx context.Context, fh *FileHandle) 
 		clearReadTargetForLockedHandle(fh)
 		if committedRev > 0 {
 			fs.clearReadTargetsForPathExcept(fh.Path, fh)
+			fs.seedReadCacheFromShadowLocked(fh.Path, size, committedRev)
 			fs.markHandleRemoteCommittedLocked(fh, committedRev)
 		} else {
 			fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
@@ -10098,6 +10267,7 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			if committedRev > 0 {
 				clearReadTargetForLockedHandle(fh)
 				fs.clearReadTargetsForPathExcept(fh.Path, fh)
+				fs.seedReadCacheFromShadowLocked(fh.Path, size, committedRev)
 				fs.markHandleRemoteCommittedLocked(fh, committedRev)
 				fs.inodes.UpdateSize(fh.Ino, size)
 				fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
@@ -10355,6 +10525,7 @@ func (fs *Dat9FS) Fsync(cancel <-chan struct{}, input *gofuse.FsyncIn) (status g
 		if committedRev > 0 {
 			clearReadTargetForLockedHandle(fh)
 			fs.clearReadTargetsForPathExcept(fh.Path, fh)
+			fs.seedReadCacheFromShadowLocked(fh.Path, size, committedRev)
 			fs.markHandleRemoteCommittedLocked(fh, committedRev)
 			fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
 		} else {

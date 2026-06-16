@@ -18,6 +18,8 @@ The current storage path is **TiDB + S3-compatible object storage**. db9 remains
 a provider/inspiration path in the codebase, but it is not the default storage
 backend described by the current production architecture.
 
+Recent project updates are summarized in the [weekly release notes](docs/release-notes/2026-05-18-to-2026-06-14.md).
+
 ## What It Does
 
 **One path namespace.** Files live at paths such as `:/src/main.go` or
@@ -239,11 +241,15 @@ func main() {
 Current tenant providers are selected explicitly:
 
 ```text
-DRIVE9_TENANT_PROVIDER=db9 | tidb_zero | tidb_cloud_starter
+DRIVE9_TENANT_PROVIDER=db9 | tidb_zero | tidb_cloud_starter | tidbcloud_native
 ```
 
 - `tidb_zero`: default development/provisioning path backed by TiDB Zero.
 - `tidb_cloud_starter`: production-oriented TiDB Cloud Starter pool takeover.
+- `tidbcloud_native`: creates TiDB Cloud Serverless Starter clusters in the
+  customer's TiDB Cloud account using `public_key` / `private_key` submitted to
+  `POST /v1/provision`; server config supplies the API URL, cloud provider,
+  region, and optional default database name.
 - `db9`: supported provider path with its own schema, but not the default
   architecture used in this README.
 
@@ -395,9 +401,15 @@ Important environment variables:
 
 ```text
 DRIVE9_META_DSN                 control-plane MySQL/TiDB DSN
-DRIVE9_TENANT_PROVIDER          db9 | tidb_zero | tidb_cloud_starter
+DRIVE9_TENANT_PROVIDER          db9 | tidb_zero | tidb_cloud_starter | tidbcloud_native
 DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT
                                 default TiDB Cloud Starter spendingLimit.monthly in USD cents
+DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Serverless API base URL
+DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER
+                                cloud provider for tidbcloud_native cluster creation
+DRIVE9_TIDBCLOUD_NATIVE_REGION  region for tidbcloud_native cluster creation
+DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME
+                                optional default database_name for tidbcloud_native
 DRIVE9_TOKEN_SIGNING_KEY        32-byte hex JWT signing key
 DRIVE9_ENCRYPT_TYPE             local_aes | kms
 DRIVE9_MASTER_KEY               local AES key

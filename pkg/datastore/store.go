@@ -237,6 +237,10 @@ func isRootFileNode(n FileNode) bool {
 	return isRootFileNodePath(n.Path)
 }
 
+// fileNodePathHash is the lowercase 64-character SHA-256 hex hash used as the
+// short indexed discriminator for file_nodes paths. Callers must keep the full
+// path predicate alongside the hash predicate so a hash collision cannot alias
+// two distinct paths.
 func fileNodePathHash(path string) string {
 	return StorageRefHash(path)
 }

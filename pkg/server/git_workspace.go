@@ -13,6 +13,7 @@ import (
 
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/gitcache"
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/pathutil"
 	"github.com/mem9-ai/dat9/pkg/tenant/token"
 )
@@ -240,7 +241,7 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 				errJSON(w, http.StatusBadRequest, "common_workspace_id does not reference an active workspace")
 				return
 			}
-			writeGitWorkspaceStoreError(w, err)
+			writeGitWorkspaceStoreError(w, r, err)
 			return
 		}
 		if common.Status != datastore.GitWorkspaceStatusLive || common.Kind == datastore.GitWorkspaceKindLinked {
@@ -262,7 +263,7 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 		}
 		workspaceID = existing.WorkspaceID
 	} else if !errors.Is(err, datastore.ErrNotFound) {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	ws := datastore.GitWorkspace{
@@ -287,12 +288,12 @@ func (s *Server) handleGitWorkspaceUpsert(w http.ResponseWriter, r *http.Request
 		ws.Mode = datastore.GitWorkspaceModeFast
 	}
 	if err := store.UpsertGitWorkspace(r.Context(), ws); err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	out, err := store.GetGitWorkspaceByRoot(r.Context(), root)
 	if err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -312,7 +313,7 @@ func (s *Server) handleGitWorkspaceGetByRoot(w http.ResponseWriter, r *http.Requ
 	}
 	ws, err := store.GetGitWorkspaceByRoot(r.Context(), root)
 	if err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -322,7 +323,7 @@ func (s *Server) handleGitWorkspaceGetByRoot(w http.ResponseWriter, r *http.Requ
 func (s *Server) handleGitWorkspaceList(w http.ResponseWriter, r *http.Request, store *datastore.Store) {
 	workspaces, err := store.ListGitWorkspaces(r.Context())
 	if err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	out := make([]gitWorkspaceResponse, 0, len(workspaces))
@@ -335,7 +336,7 @@ func (s *Server) handleGitWorkspaceList(w http.ResponseWriter, r *http.Request, 
 
 func (s *Server) handleGitWorkspaceDelete(w http.ResponseWriter, r *http.Request, store *datastore.Store, workspaceID string) {
 	if err := store.DeleteGitWorkspace(r.Context(), workspaceID); err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -366,7 +367,7 @@ func (s *Server) handleGitWorkspaceObject(w http.ResponseWriter, r *http.Request
 		}
 		ws, err := store.GetGitWorkspace(r.Context(), workspaceID)
 		if err != nil {
-			writeGitWorkspaceStoreError(w, err)
+			writeGitWorkspaceStoreError(w, r, err)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -394,7 +395,7 @@ func (s *Server) handleGitWorkspaceObject(w http.ResponseWriter, r *http.Request
 		case http.MethodGet:
 			packs, err := store.ListGitObjectPacks(r.Context(), workspaceID)
 			if err != nil {
-				writeGitWorkspaceStoreError(w, err)
+				writeGitWorkspaceStoreError(w, r, err)
 				return
 			}
 			out := make([]gitObjectPackResponse, 0, len(packs))
@@ -428,7 +429,7 @@ func (s *Server) handleGitWorkspaceObject(w http.ResponseWriter, r *http.Request
 			}
 			entries, err := store.ListGitOverlayEntries(r.Context(), workspaceID)
 			if err != nil {
-				writeGitWorkspaceStoreError(w, err)
+				writeGitWorkspaceStoreError(w, r, err)
 				return
 			}
 			out := make([]gitOverlayEntryResponse, 0, len(entries))
@@ -472,12 +473,12 @@ func (s *Server) handleGitObjectPackUpsert(w http.ResponseWriter, r *http.Reques
 		ContentBlob:    req.Content,
 	}
 	if err := store.UpsertGitObjectPack(r.Context(), pack); err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	stored, err := store.GetGitObjectPack(r.Context(), workspaceID, packID)
 	if err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -498,7 +499,7 @@ func (s *Server) handleGitObjectPackGet(w http.ResponseWriter, r *http.Request, 
 	}
 	pack, err := store.GetGitObjectPack(r.Context(), workspaceID, strings.ToLower(packID))
 	if err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -522,7 +523,7 @@ func (s *Server) handleGitTreeReplace(w http.ResponseWriter, r *http.Request, st
 		return
 	}
 	if err := store.ReplaceGitTreeNodes(r.Context(), workspaceID, req.CommitSHA, nodes); err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -537,7 +538,7 @@ func (s *Server) handleGitTreeList(w http.ResponseWriter, r *http.Request, store
 	}
 	nodes, err := store.ListGitTreeNodes(r.Context(), workspaceID, commitSHA)
 	if err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	out := make([]gitTreeNodeResponse, 0, len(nodes))
@@ -573,12 +574,12 @@ func (s *Server) handleGitStateUpsert(w http.ResponseWriter, r *http.Request, st
 		SizeBytes:        req.SizeBytes,
 		ContentBlob:      req.Content,
 	}); err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	state, err := store.GetGitState(r.Context(), workspaceID)
 	if err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -635,12 +636,12 @@ func (s *Server) handleGitOverlayUpsert(w http.ResponseWriter, r *http.Request, 
 		entry.SizeBytes = int64(len(entry.ContentBlob))
 	}
 	if err := store.UpsertGitOverlayEntry(r.Context(), entry); err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	stored, err := store.GetGitOverlayEntry(r.Context(), workspaceID, relPath)
 	if err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -655,7 +656,7 @@ func (s *Server) handleGitOverlayGet(w http.ResponseWriter, r *http.Request, sto
 	}
 	entry, err := store.GetGitOverlayEntry(r.Context(), workspaceID, relPath)
 	if err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -665,7 +666,7 @@ func (s *Server) handleGitOverlayGet(w http.ResponseWriter, r *http.Request, sto
 func (s *Server) handleGitStateGet(w http.ResponseWriter, r *http.Request, store *datastore.Store, workspaceID string) {
 	state, err := store.GetGitState(r.Context(), workspaceID)
 	if err != nil {
-		writeGitWorkspaceStoreError(w, err)
+		writeGitWorkspaceStoreError(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -827,12 +828,13 @@ func validateGitMetadataRelativePath(raw string) error {
 	return nil
 }
 
-func writeGitWorkspaceStoreError(w http.ResponseWriter, err error) {
+func writeGitWorkspaceStoreError(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, datastore.ErrNotFound) {
 		errJSON(w, http.StatusNotFound, "not found")
 		return
 	}
-	errJSON(w, http.StatusInternalServerError, err.Error())
+	logger.Error(r.Context(), "git_workspace_store_error", eventFields(r.Context(), "git_workspace_store_error", "error", err)...)
+	errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 }
 
 func toGitWorkspaceResponse(ws *datastore.GitWorkspace) gitWorkspaceResponse {

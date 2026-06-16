@@ -9043,6 +9043,57 @@ func TestOpenWritablePreloadSkipsCleanSiblingReboundToNewRevision(t *testing.T) 
 	}
 }
 
+func TestOpenWritablePreloadSkipsCleanOldRevisionShadowHandle(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	const filePath = "/tier-transition.bin"
+	stale := bytes.Repeat([]byte{0x5a}, 64*1024)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(stale)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.inodes.UpdateSize(ino, 0)
+	fs.inodes.UpdateRevision(ino, 8)
+	if err := shadow.WriteFull(filePath, stale, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	sibling := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize:    int64(len(stale)),
+		BaseRev:     7,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+	if _, err := sibling.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	sibling.Dirty.ClearDirty()
+	fs.openHandles.Add(sibling)
+
+	target := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: 0,
+		BaseRev:  8,
+	}
+	if fs.loadWritableHandleFromOpenHandleLocked(target) {
+		t.Fatal("clean old-revision sibling shadow must not be used as preload data")
+	}
+	if got := target.Dirty.Size(); got != 0 {
+		t.Fatalf("target dirty size = %d, want 0", got)
+	}
+}
+
 func TestReadCleanWritableHandleRefreshesSkippedCommittedRevision(t *testing.T) {
 	stale := []byte("sqlite db before checkpoint")
 	fresh := []byte("sqlite db after checkpoint with event rows")
@@ -11807,6 +11858,916 @@ func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 	}
 	if fh.BaseRev != 2 {
 		t.Fatalf("open base revision = %d, want 2", fh.BaseRev)
+	}
+}
+
+func TestSetAttr_WriteBackInteractivePathTruncateStagesAndReturnsBeforeRemoteCommit(t *testing.T) {
+	putStarted := make(chan struct{})
+	releasePut := make(chan struct{})
+	var putOnce sync.Once
+	var putBody []byte
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			putBody = append([]byte(nil), body...)
+			putOnce.Do(func() { close(putStarted) })
+			<-releasePut
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 2})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	fs.syncMode = SyncInteractive
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.PathLock = fs.lockRemoteCommitPath
+	cq.OnSuccess = fs.onCommitQueueSuccess
+	cq.OnCleanup = fs.onCommitQueueCleanup
+	fs.commitQueue = cq
+	defer cq.DrainAll()
+
+	ino := fs.inodes.Lookup("/file.bin", false, 42, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		var out gofuse.AttrOut
+		done <- fs.SetAttr(nil, &gofuse.SetAttrIn{
+			SetAttrInCommon: gofuse.SetAttrInCommon{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Valid:    gofuse.FATTR_SIZE,
+				Size:     0,
+			},
+		}, &out)
+	}()
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("SetAttr status = %v, want OK", st)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SetAttr blocked on remote zero-byte commit")
+	}
+
+	meta, ok := pending.GetMeta("/file.bin")
+	if !ok {
+		t.Fatal("pending truncate metadata missing")
+	}
+	if meta.Size != 0 || meta.Kind != PendingOverwrite || meta.BaseRev != 1 {
+		t.Fatalf("pending meta = %+v, want zero-byte overwrite at base rev 1", meta)
+	}
+	if !shadow.Has("/file.bin") {
+		t.Fatal("shadow missing for staged truncate")
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	if entry.Size != 0 {
+		t.Fatalf("inode size = %d, want 0", entry.Size)
+	}
+
+	select {
+	case <-putStarted:
+	case <-time.After(time.Second):
+		t.Fatal("async zero-byte commit did not start")
+	}
+	close(releasePut)
+	cq.DrainAll()
+	if len(putBody) != 0 {
+		t.Fatalf("remote truncate body = %q, want empty", string(putBody))
+	}
+	if pending.HasPending("/file.bin") {
+		t.Fatal("pending truncate still present after commit")
+	}
+	if shadow.Has("/file.bin") {
+		t.Fatal("shadow still present after commit")
+	}
+}
+
+func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
+	const callerPID = 5151
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   8,
+		queue:        []*CommitEntry{},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+		workCh:       make(chan *CommitEntry, 16),
+	}
+
+	const path = "/tier-transition.bin"
+	const baseRev int64 = 7
+	ino := fs.inodes.Lookup(path, false, 8*1024*1024, time.Now())
+	fs.inodes.UpdateRevision(ino, baseRev)
+	fs.inodes.UpdateSize(ino, 8*1024*1024)
+
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        path,
+		Flags:       uint32(syscall.O_WRONLY),
+		OpenPID:     callerPID,
+		Dirty:       fs.newWriteBuffer(path, maxPreloadSize, 0),
+		OrigSize:    8 * 1024 * 1024,
+		BaseRev:     baseRev,
+		WritePolicy: WritePolicyWriteBack,
+	}
+	if err := fh.Dirty.Truncate(8 * 1024 * 1024); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fhID := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(fhID, fh)
+
+	var attrOut gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: callerPID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if !fh.ZeroBase {
+		t.Fatal("same-caller writer did not adopt zero base")
+	}
+	if got := fh.Dirty.Size(); got != 0 {
+		t.Fatalf("dirty size after staged truncate = %d, want 0", got)
+	}
+	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+		t.Fatalf("dirty truncate not marked: dirtySeq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+
+	finalData := bytes.Repeat([]byte{0x59}, 10*1024)
+	if _, err := fh.Dirty.Write(0, finalData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	if got := fh.Dirty.Size(); got != int64(len(finalData)) {
+		t.Fatalf("dirty size after write = %d, want %d", got, len(finalData))
+	}
+	if err := fs.stageShadowLocked(fh, true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, finalData) {
+		t.Fatalf("shadow content mismatch after staged truncate writer adoption: got len=%d want len=%d", len(got), len(finalData))
+	}
+}
+
+func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T) {
+	const callerPID = 6161
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   8,
+		queue:        []*CommitEntry{},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+		workCh:       make(chan *CommitEntry, 16),
+	}
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1, Caller: gofuse.Caller{Pid: callerPID}},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+	}, "created.bin", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created file handle missing")
+	}
+	if fh.OpenPID != callerPID {
+		t.Fatalf("created file handle OpenPID = %d, want %d", fh.OpenPID, callerPID)
+	}
+
+	oldData := bytes.Repeat([]byte{0x41}, 64*1024)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, oldData); st != gofuse.OK {
+		t.Fatalf("Write old data status = %v, want OK", st)
+	}
+
+	var attrOut gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId, Caller: gofuse.Caller{Pid: callerPID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if !fh.ZeroBase {
+		t.Fatal("created same-caller writer did not adopt zero base")
+	}
+	if got := fh.Dirty.Size(); got != 0 {
+		t.Fatalf("dirty size after staged truncate = %d, want 0", got)
+	}
+	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+		t.Fatalf("dirty truncate not marked: dirtySeq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+
+	gotShadow, err := shadow.ReadAll("/created.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotShadow) != 0 {
+		t.Fatalf("shadow content after staged truncate len=%d, want 0", len(gotShadow))
+	}
+}
+
+func TestSetAttr_WriteBackPathTruncateSkipsDefaultInheritedMode(t *testing.T) {
+	fs, shadow, pending := newWriteBackPathTruncateModeTestFS(t)
+
+	const path = "/file.bin"
+	ino := fs.inodes.Lookup(path, false, 4096, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.inodes.UpdateMode(ino, defaultRegularFileMode)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if out.Size != 0 {
+		t.Fatalf("out.Size = %d, want 0", out.Size)
+	}
+	if !shadow.Has(path) {
+		t.Fatal("shadow missing for staged truncate")
+	}
+
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending truncate metadata missing")
+	}
+	if meta.HasMode {
+		t.Fatalf("pending mode = has:%t mode:%o, want has:false for inherited default mode", meta.HasMode, meta.Mode)
+	}
+
+	commit := singleQueuedCommitForPath(t, fs.commitQueue, path)
+	if commit.HasMode {
+		t.Fatalf("queued commit mode = has:%t mode:%o, want has:false for inherited default mode", commit.HasMode, commit.Mode)
+	}
+}
+
+func TestSetAttr_WriteBackPathTruncatePreservesNonDefaultInheritedMode(t *testing.T) {
+	fs, _, pending := newWriteBackPathTruncateModeTestFS(t)
+
+	const path = "/private.bin"
+	ino := fs.inodes.Lookup(path, false, 4096, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.inodes.UpdateMode(ino, 0o600)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending truncate metadata missing")
+	}
+	if !meta.HasMode || meta.Mode&0o777 != 0o600 {
+		t.Fatalf("pending mode = has:%t mode:%o, want has:true mode:0600", meta.HasMode, meta.Mode&0o777)
+	}
+
+	commit := singleQueuedCommitForPath(t, fs.commitQueue, path)
+	if !commit.HasMode || commit.Mode&0o777 != 0o600 {
+		t.Fatalf("queued commit mode = has:%t mode:%o, want has:true mode:0600", commit.HasMode, commit.Mode&0o777)
+	}
+}
+
+func newWriteBackPathTruncateModeTestFS(t *testing.T) (*Dat9FS, *ShadowStore, *PendingIndex) {
+	t.Helper()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { shadow.Close() })
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   8,
+		queue:        []*CommitEntry{},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+		workCh:       make(chan *CommitEntry, 16),
+	}
+	return fs, shadow, pending
+}
+
+func singleQueuedCommitForPath(t *testing.T, cq *CommitQueue, path string) *CommitEntry {
+	t.Helper()
+
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if len(cq.queue) != 1 {
+		t.Fatalf("queued commits = %d, want 1", len(cq.queue))
+	}
+	commit := cq.queue[0]
+	if commit.Path != path {
+		t.Fatalf("queued commit path = %q, want %q", commit.Path, path)
+	}
+	return commit
+}
+
+func TestSetAttr_CloseSyncPathTruncateKeepsSynchronousRemoteCommit(t *testing.T) {
+	putStarted := make(chan struct{})
+	releasePut := make(chan struct{})
+	var putOnce sync.Once
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putOnce.Do(func() { close(putStarted) })
+			<-releasePut
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	defer fs.commitQueue.DrainAll()
+
+	ino := fs.inodes.Lookup("/file.bin", false, 42, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		var out gofuse.AttrOut
+		done <- fs.SetAttr(nil, &gofuse.SetAttrIn{
+			SetAttrInCommon: gofuse.SetAttrInCommon{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Valid:    gofuse.FATTR_SIZE,
+				Size:     0,
+			},
+		}, &out)
+	}()
+
+	select {
+	case <-putStarted:
+	case <-time.After(time.Second):
+		t.Fatal("close-sync SetAttr did not start remote truncate")
+	}
+	select {
+	case st := <-done:
+		t.Fatalf("close-sync SetAttr returned before remote truncate completed: %v", st)
+	default:
+	}
+	close(releasePut)
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("SetAttr status = %v, want OK", st)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close-sync SetAttr did not return after remote truncate completed")
+	}
+}
+
+func TestSetAttr_WriteBackStrictPathTruncateStagesAndReturnsBeforeRemoteCommit(t *testing.T) {
+	putStarted := make(chan struct{})
+	releasePut := make(chan struct{})
+	var putOnce sync.Once
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putOnce.Do(func() { close(putStarted) })
+			<-releasePut
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 2})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncStrict, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.PathLock = fs.lockRemoteCommitPath
+	cq.OnSuccess = fs.onCommitQueueSuccess
+	cq.OnCleanup = fs.onCommitQueueCleanup
+	fs.commitQueue = cq
+	defer cq.DrainAll()
+
+	ino := fs.inodes.Lookup("/file.bin", false, 42, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		var out gofuse.AttrOut
+		done <- fs.SetAttr(nil, &gofuse.SetAttrIn{
+			SetAttrInCommon: gofuse.SetAttrInCommon{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Valid:    gofuse.FATTR_SIZE,
+				Size:     0,
+			},
+		}, &out)
+	}()
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("SetAttr status = %v, want OK", st)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("writeback strict SetAttr blocked on remote zero-byte commit")
+	}
+	if !pending.HasPending("/file.bin") {
+		t.Fatal("pending truncate metadata missing")
+	}
+	select {
+	case <-putStarted:
+	case <-time.After(time.Second):
+		t.Fatal("async zero-byte commit did not start")
+	}
+	close(releasePut)
+	cq.DrainAll()
+}
+
+func TestOpenTruncateCancelsQueuedPathTruncateWithoutCancelingInFlight(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs.syncMode = SyncInteractive
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/file.bin"
+	if err := shadow.WriteFull(path, nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(path, 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	queued := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7}
+	fs.commitQueue = &CommitQueue{
+		queue:        []*CommitEntry{queued},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	fs.commitQueue.rebuildQueuedIndexLocked()
+
+	ino := fs.inodes.Lookup(path, false, 42, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if !queued.canceled {
+		t.Fatal("queued zero truncate was not canceled")
+	}
+	if fs.commitQueue.HasPath(path) {
+		t.Fatal("queued zero truncate still blocks path")
+	}
+	if !pending.HasPending(path) {
+		t.Fatal("pending local truncate metadata was removed")
+	}
+	if !shadow.Has(path) {
+		t.Fatal("pending local truncate shadow was removed")
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("opened handle missing")
+	}
+	if fh.BaseRev != 7 {
+		t.Fatalf("handle base revision = %d, want 7", fh.BaseRev)
+	}
+	if !fh.ZeroBase || fh.Dirty == nil || fh.Dirty.Size() != 0 {
+		t.Fatalf("handle did not adopt zero-base dirty buffer: zero=%t dirty=%v", fh.ZeroBase, fh.Dirty)
+	}
+
+	inFlight := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7}
+	fs.commitQueue = &CommitQueue{
+		queue:        []*CommitEntry{inFlight},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{path: inFlight},
+	}
+	fs.commitQueue.rebuildQueuedIndexLocked()
+	if fs.canSupersedeQueuedPathTruncate(path) {
+		t.Fatal("in-flight zero truncate was incorrectly superseded")
+	}
+	if inFlight.canceled {
+		t.Fatal("in-flight zero truncate was canceled")
+	}
+}
+
+func TestOpenWritableCancelsQueuedPathTruncateWithoutOTruncFlag(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs.syncMode = SyncInteractive
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/file.bin"
+	if err := shadow.WriteFull(path, nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(path, 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	queued := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7}
+	fs.commitQueue = &CommitQueue{
+		queue:        []*CommitEntry{queued},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	fs.commitQueue.rebuildQueuedIndexLocked()
+
+	ino := fs.inodes.Lookup(path, false, 0, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if !queued.canceled {
+		t.Fatal("queued zero truncate was not canceled")
+	}
+	if fs.commitQueue.HasPath(path) {
+		t.Fatal("queued zero truncate still blocks path")
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("opened handle missing")
+	}
+	if fh.BaseRev != 7 {
+		t.Fatalf("handle base revision = %d, want 7", fh.BaseRev)
+	}
+	if !fh.ZeroBase {
+		t.Fatal("handle did not preserve zero-base truncate state")
+	}
+	if fh.Dirty == nil {
+		t.Fatal("handle dirty buffer missing")
+	}
+	if !fh.Dirty.HasDirtyParts() || fh.Dirty.Size() != 0 {
+		t.Fatalf("handle dirty state = dirty:%v size:%d", fh.Dirty.HasDirtyParts(), fh.Dirty.Size())
+	}
+	if fh.DirtySeq == 0 {
+		t.Fatal("handle dirty sequence was not marked")
+	}
+}
+
+func TestOpenWritableRefreshesInodeAfterWaitingForInFlightZeroTruncate(t *testing.T) {
+	path := "/tier-transition.bin"
+	staleData := bytes.Repeat([]byte("s"), 8*1024*1024)
+	statCh := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		statCh <- struct{}{}
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "8")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.readCache.Put(path, staleData, 7)
+	inFlight := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7}
+	fs.commitQueue = &CommitQueue{
+		queue:        nil,
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{path: inFlight},
+	}
+
+	ino := fs.inodes.Lookup(path, false, int64(len(staleData)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	openDone := make(chan gofuse.OpenOut, 1)
+	statusDone := make(chan gofuse.Status, 1)
+	go func() {
+		var out gofuse.OpenOut
+		statusDone <- fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Flags:    uint32(syscall.O_WRONLY),
+		}, &out)
+		openDone <- out
+	}()
+
+	select {
+	case st := <-statusDone:
+		t.Fatalf("Open returned before in-flight zero truncate completed: %v", st)
+	case <-time.After(75 * time.Millisecond):
+	}
+	fs.inodes.UpdateSize(ino, 0)
+	fs.inodes.UpdateRevision(ino, 8)
+	fs.commitQueue.endInFlight(inFlight)
+
+	var st gofuse.Status
+	select {
+	case st = <-statusDone:
+	case <-time.After(time.Second):
+		t.Fatal("Open did not return after in-flight zero truncate completed")
+	}
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	var out gofuse.OpenOut
+	select {
+	case out = <-openDone:
+	case <-time.After(time.Second):
+		t.Fatal("OpenOut missing")
+	}
+	select {
+	case <-statCh:
+	case <-time.After(time.Second):
+		t.Fatal("Open did not stat zero-sized remote file after wait")
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("opened handle missing")
+	}
+	if fh.OrigSize != 0 || fh.BaseRev != 8 {
+		t.Fatalf("handle orig/base = %d/%d, want 0/8", fh.OrigSize, fh.BaseRev)
+	}
+	if fh.Dirty == nil {
+		t.Fatal("dirty buffer missing")
+	}
+	if got := fh.Dirty.Size(); got != 0 {
+		t.Fatalf("dirty buffer size = %d, want 0; stale read cache was preloaded", got)
+	}
+}
+
+func TestStageShadowReadyNonSpillRewritesShadowWithDirtyBuffer(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const baseRev int64 = 7
+	path := "/tier-transition.bin"
+	if err := shadow.WriteFull(path, nil, baseRev); err != nil {
+		t.Fatal(err)
+	}
+
+	finalData := bytes.Repeat([]byte("x"), 10*1024)
+	dirty := fs.newWriteBuffer(path, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, finalData); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:         42,
+		Path:        path,
+		Dirty:       dirty,
+		BaseRev:     baseRev,
+		ShadowReady: true,
+		ShadowSpill: false,
+		WritePolicy: WritePolicyWriteBack,
+	}
+
+	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.releaseHandleRemoteCommitPathLocked(fh)
+
+	got, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, finalData) {
+		t.Fatalf("shadow content mismatch after staged rewrite: got len=%d want len=%d", len(got), len(finalData))
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending metadata missing after staged rewrite")
+	}
+	if meta.Size != int64(len(finalData)) || meta.Kind != PendingOverwrite || meta.BaseRev != baseRev {
+		t.Fatalf("pending meta = %+v, want size=%d kind=%v baseRev=%d", meta, len(finalData), PendingOverwrite, baseRev)
+	}
+}
+
+func TestOpenTruncateResetShadowStagesDirtyBuffer(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const baseRev int64 = 7
+	path := "/tier-transition.bin"
+	if err := shadow.WriteFull(path, bytes.Repeat([]byte{0x5a}, 64*1024), baseRev); err != nil {
+		t.Fatal(err)
+	}
+	ino := fs.inodes.Lookup(path, false, 8*1024*1024, time.Now())
+	fs.inodes.UpdateRevision(ino, baseRev)
+	fs.inodes.UpdateSize(ino, 8*1024*1024)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("opened handle missing")
+	}
+	if !fh.ShadowReady {
+		t.Fatal("truncate-open did not reset shadow")
+	}
+	if fh.ShadowSpill {
+		t.Fatal("truncate-open shadow must stay dirty-buffer backed, not ShadowSpill")
+	}
+
+	finalData := bytes.Repeat([]byte("x"), 10*1024)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, finalData); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.releaseHandleRemoteCommitPathLocked(fh)
+
+	got, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, finalData) {
+		t.Fatalf("shadow content mismatch after truncate-open staged write: got len=%d want len=%d", len(got), len(finalData))
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending metadata missing after truncate-open staged write")
+	}
+	if meta.Size != int64(len(finalData)) || meta.Kind != PendingOverwrite || meta.BaseRev != baseRev || meta.ShadowSpill {
+		t.Fatalf("pending meta = %+v, want size=%d kind=%v baseRev=%d shadowSpill=false", meta, len(finalData), PendingOverwrite, baseRev)
 	}
 }
 

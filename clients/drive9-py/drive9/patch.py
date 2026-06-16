@@ -125,14 +125,20 @@ class PatchMixin:
             orig_data = resp.content
 
         data = read_part(part.number, part.size, orig_data)
-        checksum = base64.b64encode(hashlib.sha256(data).digest()).decode("ascii")
 
-        headers = {"x-amz-checksum-sha256": checksum}
+        headers = {}
+        should_send_checksum = False
         if part.headers:
             for k, v in part.headers.items():
                 if k.lower() == "host":
                     continue
                 headers[k] = v
+                if k.lower() == "x-amz-checksum-sha256":
+                    should_send_checksum = True
+        if should_send_checksum:
+            headers["x-amz-checksum-sha256"] = base64.b64encode(
+                hashlib.sha256(data).digest()
+            ).decode("ascii")
 
         resp = self.session.put(part.url, data=data, headers=headers)
         if resp.status_code >= 300:

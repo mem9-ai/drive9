@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { Client } from "../src/index.js";
 import { setupServer } from "msw/node";
 import { http, HttpResponse } from "msw";
+import { createHash } from "node:crypto";
 
 const server = setupServer();
 server.listen({ onUnhandledRequest: "error" });
@@ -71,5 +72,49 @@ describe("Transfer", () => {
       offset += c.length;
     }
     expect(new TextDecoder().decode(all)).toBe("world");
+  });
+
+  it("patchFile only sends checksum when it is presigned", async () => {
+    let firstChecksum: string | null = null;
+    let secondChecksum: string | null = null;
+    server.use(
+      http.patch("http://localhost:9009/v1/fs/file.bin", () => {
+        return HttpResponse.json(
+          {
+            upload_id: "patch-js",
+            part_size: 8,
+            upload_parts: [
+              { number: 1, url: "http://localhost:9009/patch/1", size: 8, headers: {} },
+              {
+                number: 2,
+                url: "http://localhost:9009/patch/2",
+                size: 8,
+                headers: { "x-amz-checksum-sha256": "placeholder" },
+              },
+            ],
+            copied_parts: [],
+          },
+          { status: 202 }
+        );
+      }),
+      http.put("http://localhost:9009/patch/1", ({ request }) => {
+        firstChecksum = request.headers.get("x-amz-checksum-sha256");
+        return HttpResponse.text("ok");
+      }),
+      http.put("http://localhost:9009/patch/2", ({ request }) => {
+        secondChecksum = request.headers.get("x-amz-checksum-sha256");
+        return HttpResponse.text("ok");
+      }),
+      http.post("http://localhost:9009/v1/uploads/patch-js/complete", () => {
+        return HttpResponse.text("ok");
+      })
+    );
+
+    const client = new Client("http://localhost:9009", "test-key");
+    await client.patchFile("/file.bin", 16, [1, 2], (part) => new TextEncoder().encode(`part-${part}`), undefined, 8);
+
+    const expectedSecond = createHash("sha256").update("part-2").digest("base64");
+    expect(firstChecksum).toBeNull();
+    expect(secondChecksum).toBe(expectedSecond);
   });
 });

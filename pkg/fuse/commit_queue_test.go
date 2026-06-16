@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -575,6 +576,12 @@ func TestCommitQueueSkipsDefaultModeForPendingNew(t *testing.T) {
 	}
 	if shadow.Has("/plain.txt") {
 		t.Fatal("shadow should be removed after successful default-mode commit")
+	}
+}
+
+func TestShouldApplyRemoteModePreservesExplicitDefaultOverwrite(t *testing.T) {
+	if !shouldApplyRemoteMode(PendingOverwrite, true, defaultRegularFileMode) {
+		t.Fatal("PendingOverwrite with explicit 0644 mode must still apply remote chmod")
 	}
 }
 
@@ -1433,9 +1440,9 @@ func TestCommitQueueRecoverPendingSkipsLegacyOverwriteWithoutBaseRev(t *testing.
 
 // --- ShadowSpill tests ---
 
-// TestCommitQueueShadowSpillUpload verifies that ShadowSpill entries are
-// uploaded via streaming (uploadFromShadow) rather than ReadAll, and that
-// the server receives the correct data and expected revision.
+// TestCommitQueueShadowSpillUpload verifies that ShadowSpill entries at or
+// above the cached inline threshold are uploaded via streaming multipart and
+// that the server receives the correct data and expected revision.
 func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	data := bytes.Repeat([]byte("shadowspill-data-"), 100) // ~1700 bytes
 	var gotExpected int64
@@ -1514,7 +1521,9 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
 		if entry.Path != "/big.bin" {
 			t.Fatalf("OnSuccess path = %q, want /big.bin", entry.Path)
@@ -1549,6 +1558,92 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	}
 	if shadow.Has("/big.bin") {
 		t.Fatal("shadow should be removed after successful ShadowSpill commit")
+	}
+}
+
+func TestCommitQueueShadowSpillSmallFileDirectPUTCleansState(t *testing.T) {
+	data := []byte("small shadow spill content")
+	const path = "/small-spill.bin"
+	var gotExpected int64 = -1
+	var gotBody []byte
+	var multipartCalls atomic.Int32
+	var successRev int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/small-spill.bin":
+			var err error
+			gotBody, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read direct PUT body: %v", err)
+			}
+			gotExpected, err = strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				t.Fatalf("expected revision header: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 13})
+		case strings.HasPrefix(r.URL.Path, "/v2/uploads/"):
+			multipartCalls.Add(1)
+			t.Fatalf("small ShadowSpill should not use multipart: %s %s", r.Method, r.URL.String())
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(path, data, 12); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutShadowSpill(path, int64(len(data)), PendingOverwrite, 12); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		if entry.Path != path {
+			t.Fatalf("OnSuccess path = %q, want %q", entry.Path, path)
+		}
+		successRev = committedRev
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:        path,
+		BaseRev:     12,
+		Size:        int64(len(data)),
+		Kind:        PendingOverwrite,
+		ShadowSpill: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if gotExpected != 12 {
+		t.Fatalf("expected revision = %d, want 12", gotExpected)
+	}
+	if !bytes.Equal(gotBody, data) {
+		t.Fatalf("direct PUT body = %q, want %q", gotBody, data)
+	}
+	if multipartCalls.Load() != 0 {
+		t.Fatalf("multipart calls = %d, want 0", multipartCalls.Load())
+	}
+	if successRev != 13 {
+		t.Fatalf("OnSuccess committedRev = %d, want 13", successRev)
+	}
+	if pending.HasPending(path) {
+		t.Fatal("pending entry should be removed after successful direct PUT ShadowSpill commit")
+	}
+	if shadow.Has(path) {
+		t.Fatal("shadow should be removed after successful direct PUT ShadowSpill commit")
 	}
 }
 
@@ -1612,7 +1707,9 @@ func TestCommitQueueMultipartCreateInfersRevisionForOpenHandle(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	fs := NewDat9FS(c, opts)
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -1624,7 +1721,7 @@ func TestCommitQueueMultipartCreateInfersRevisionForOpenHandle(t *testing.T) {
 	}
 	fs.shadowStore = shadow
 	fs.pendingIndex = pending
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	cq.PathLock = fs.lockRemoteCommitPath
 	cq.OnSuccess = fs.onCommitQueueSuccess
 	cq.OnCleanup = fs.onCommitQueueCleanup
@@ -1721,7 +1818,9 @@ func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	if err := cq.Enqueue(&CommitEntry{
 		Path:        "/big-conflict.bin",
 		BaseRev:     5,
@@ -1971,7 +2070,9 @@ func TestCommitQueueShadowSpillConflictNotFoundRetriesAsCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
 		successRev = committedRev
 	}
@@ -2119,7 +2220,9 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 
 	// RecoverPending should reconstruct CommitEntry with ShadowSpill=true,
 	// causing uploadEntry to use streaming (uploadFromShadow) not ReadAll.
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow2, pending2, nil, 1, 8)
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	cq := NewCommitQueue(c, shadow2, pending2, nil, 1, 8)
 	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
 		if entry.Path != "/recover.bin" {
 			t.Fatalf("OnSuccess path = %q, want /recover.bin", entry.Path)
@@ -2253,5 +2356,69 @@ func TestCommitQueueCancelPathJournalsCommitMarker(t *testing.T) {
 	}
 	if recovered.HasPending("/gone.txt") {
 		t.Error("unlinked path resurrected from WAL — cancel marker missing")
+	}
+}
+
+func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t *testing.T) {
+	zero := &CommitEntry{Path: "/file.txt", Size: 0, Kind: PendingOverwrite}
+	nonzero := &CommitEntry{Path: "/other.txt", Size: 4, Kind: PendingOverwrite}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{zero, nonzero},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	if !cq.CancelQueuedZeroTruncatePreserveLocal("/file.txt") {
+		t.Fatal("cancel queued zero truncate returned false")
+	}
+	if !zero.canceled {
+		t.Fatal("zero truncate entry was not marked canceled")
+	}
+	if cq.HasPath("/file.txt") {
+		t.Fatal("zero truncate path still queued")
+	}
+	if !cq.HasPath("/other.txt") {
+		t.Fatal("non-zero queued entry was affected")
+	}
+
+	zero = &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite}
+	samePathNonzero := &CommitEntry{Path: "/same.txt", Size: 4, Kind: PendingOverwrite}
+	cq = &CommitQueue{
+		queue:        []*CommitEntry{zero, samePathNonzero},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/same.txt") {
+		t.Fatal("cancel returned true while non-zero same-path entry remained queued")
+	}
+	if !zero.canceled {
+		t.Fatal("zero truncate entry was not marked canceled with same-path non-zero entry")
+	}
+	if samePathNonzero.canceled {
+		t.Fatal("non-zero same-path entry was canceled")
+	}
+	if !cq.HasPath("/same.txt") {
+		t.Fatal("same-path non-zero entry disappeared")
+	}
+
+	inFlight := &CommitEntry{Path: "/busy.txt", Size: 0, Kind: PendingOverwrite}
+	cq = &CommitQueue{
+		queue:        []*CommitEntry{inFlight},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{"/busy.txt": inFlight},
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/busy.txt") {
+		t.Fatal("cancel returned true for in-flight zero truncate")
+	}
+	if inFlight.canceled {
+		t.Fatal("in-flight zero truncate was canceled")
+	}
+	if !cq.HasPath("/busy.txt") {
+		t.Fatal("in-flight path disappeared")
 	}
 }
