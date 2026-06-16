@@ -10,8 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/meta"
 	"github.com/mem9-ai/dat9/pkg/tenant"
+	"go.uber.org/zap"
 )
 
 const (
@@ -110,6 +112,13 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if err := s.pool.InvalidateAndWait(r.Context(), t.ID); err != nil {
+		if t.Status != meta.TenantDeleting {
+			_, _ = s.meta.UpdateTenantStatusIf(r.Context(), t.ID, meta.TenantDeleting, t.Status)
+		}
+		errJSON(w, http.StatusInternalServerError, "failed to drain tenant backend")
+		return
+	}
 	if err := s.deprovisionTenantCluster(r.Context(), t, req); err != nil {
 		if t.Status != meta.TenantDeleting {
 			_, _ = s.meta.UpdateTenantStatusIf(r.Context(), t.ID, meta.TenantDeleting, t.Status)
@@ -118,7 +127,6 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.pool.Invalidate(t.ID)
 	_ = s.meta.AbortActiveUploadReservations(r.Context(), t.ID)
 
 	status, err := s.enqueueTenantDeleteJob(r.Context(), t)
@@ -231,9 +239,13 @@ func (s *Server) startTenantDeleteCleanup(ctx context.Context) {
 
 func (s *Server) processTenantDeleteJobs(ctx context.Context) {
 	now := time.Now().UTC()
-	_, _ = s.meta.RecoverStaleTenantDeleteJobs(ctx, now.Add(-defaultTenantDeleteRunningTTL))
+	if _, err := s.meta.RecoverStaleTenantDeleteJobs(ctx, now.Add(-defaultTenantDeleteRunningTTL)); err != nil {
+		logger.Error(ctx, "tenant_delete_recover_stale_failed", zap.Error(err))
+		return
+	}
 	jobs, err := s.meta.ListDueTenantDeleteJobs(ctx, now, 25)
 	if err != nil {
+		logger.Error(ctx, "tenant_delete_list_due_failed", zap.Error(err))
 		return
 	}
 	for _, job := range jobs {
@@ -271,11 +283,5 @@ func (s *Server) processTenantDeleteJob(ctx context.Context, job meta.TenantDele
 	if err != nil {
 		return err
 	}
-	if err := s.meta.MarkTenantDeleteJobDeleted(ctx, job.TenantID, res.DeletedObjects, res.AbortedMultipartUploads); err != nil {
-		return err
-	}
-	if err := s.meta.UpdateStorageNamespaceState(ctx, job.NamespaceID, meta.StorageNamespaceDeleted); err != nil && !errors.Is(err, meta.ErrNotFound) {
-		return err
-	}
-	return s.meta.UpdateTenantStatus(ctx, job.TenantID, meta.TenantDeleted)
+	return s.meta.FinalizeTenantDelete(ctx, job.TenantID, job.NamespaceID, res.DeletedObjects, res.AbortedMultipartUploads)
 }

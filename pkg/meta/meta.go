@@ -1991,10 +1991,11 @@ func (s *Store) RecoverStaleTenantDeleteJobs(ctx context.Context, before time.Ti
 func (s *Store) MarkTenantDeleteJobRunning(ctx context.Context, tenantID string) (updated bool, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "mark_tenant_delete_job_running", start, &err)
+	now := time.Now().UTC()
 	res, err := s.db.ExecContext(ctx, `UPDATE tenant_delete_jobs
 		SET state = ?, updated_at = ?
-		WHERE tenant_id = ? AND state = ?`,
-		TenantDeleteJobRunning, time.Now().UTC(), tenantID, TenantDeleteJobPending)
+		WHERE tenant_id = ? AND state = ? AND not_before <= ?`,
+		TenantDeleteJobRunning, now, tenantID, TenantDeleteJobPending, now)
 	if err != nil {
 		return false, err
 	}
@@ -2022,6 +2023,55 @@ func (s *Store) MarkTenantDeleteJobDeleted(ctx context.Context, tenantID string,
 		WHERE tenant_id = ?`,
 		TenantDeleteJobDeleted, deletedObjects, abortedMultipartUploads, now, now, tenantID)
 	return err
+}
+
+func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID string, deletedObjects, abortedMultipartUploads int64) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "finalize_tenant_delete", start, &err)
+	now := time.Now().UTC()
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenant_delete_jobs
+			SET state = ?, deleted_objects = ?, aborted_multipart_uploads = ?, completed_at = ?,
+				last_error = NULL, updated_at = ?
+			WHERE tenant_id = ? AND state = ?`,
+			TenantDeleteJobDeleted, deletedObjects, abortedMultipartUploads, now, now, tenantID, TenantDeleteJobRunning)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(res); err != nil {
+			return err
+		}
+		if namespaceID != "" {
+			res, err = tx.ExecContext(ctx, `UPDATE storage_namespaces SET state = ?, updated_at = ? WHERE namespace_id = ?`,
+				StorageNamespaceDeleted, now, namespaceID)
+			if err != nil {
+				return err
+			}
+			if err := requireAffected(res); err != nil {
+				return err
+			}
+		}
+		res, err = tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`,
+			TenantDeleted, now, tenantID)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(res); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func requireAffected(res sql.Result) error {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func getStorageNamespaceTx(ctx context.Context, tx *sql.Tx, id string) (*StorageNamespace, error) {

@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -255,6 +256,48 @@ func TestTenantDeleteStarterUsesServerCredentials(t *testing.T) {
 	assertTenantDeletedAndKeysRevoked(t, rt)
 }
 
+func TestTenantDeleteWaitsForBorrowedBackendBeforeClusterDelete(t *testing.T) {
+	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudStarter, meta.APIKeyScopeKindOwner)
+	ctx := context.Background()
+	tenantMeta, err := rt.meta.GetTenant(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, release, err := rt.pool.Acquire(ctx, tenantMeta)
+	if err != nil {
+		t.Fatalf("acquire tenant backend: %v", err)
+	}
+	defer release()
+
+	respCh := make(chan *http.Response, 1)
+	go func() {
+		respCh <- rt.deleteTenant(t, nil)
+	}()
+	waitTenantDeleteStatus(t, rt, meta.TenantDeleting)
+	if got := rt.prov.deprovisionCalls.Load(); got != 0 {
+		t.Fatalf("deprovision calls before backend release = %d, want 0", got)
+	}
+	select {
+	case resp := <-respCh:
+		defer func() { _ = resp.Body.Close() }()
+		t.Fatalf("delete response returned before backend release: status %d", resp.StatusCode)
+	default:
+	}
+
+	release()
+	resp := receiveTenantDeleteResponse(t, respCh)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
+	}
+	if got := rt.prov.deprovisionCalls.Load(); got != 1 {
+		t.Fatalf("deprovision calls after backend release = %d, want 1", got)
+	}
+	assertTenantDeletingAndKeysRevoked(t, rt)
+	rt.server.processTenantDeleteJobs(ctx)
+	assertTenantDeletedAndKeysRevoked(t, rt)
+}
+
 func TestTenantDeleteRejectsNonDeletedFork(t *testing.T) {
 	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudStarter, meta.APIKeyScopeKindOwner)
 	ctx := context.Background()
@@ -329,7 +372,13 @@ func TestTenantDeleteRemovesS3PrefixAsyncAfterClusterDelete(t *testing.T) {
 		t.Fatalf("write s3 file: %v", err)
 	}
 	storageRef := objectGCFileStorageRef(t, backendFS, "/large.bin")
-	assertObjectGCS3ObjectBytes(t, backendFS, storageRef, payload)
+	tenantMeta, err = rt.meta.GetTenant(ctx, rt.tenantID)
+	if err != nil {
+		release()
+		t.Fatal(err)
+	}
+	namespaceID := tenantMeta.StorageNamespaceID
+	assertTenantDeleteS3ObjectBytes(t, rt, namespaceID, storageRef, payload)
 	release()
 
 	resp := rt.deleteTenant(t, nil)
@@ -341,12 +390,12 @@ func TestTenantDeleteRemovesS3PrefixAsyncAfterClusterDelete(t *testing.T) {
 		t.Fatalf("deprovision calls = %d, want 1", got)
 	}
 	assertTenantDeletingAndKeysRevoked(t, rt)
-	assertObjectGCS3ObjectBytes(t, backendFS, storageRef, payload)
+	assertTenantDeleteS3ObjectBytes(t, rt, namespaceID, storageRef, payload)
 
 	rt.server.processTenantDeleteJobs(ctx)
 	assertTenantDeletedAndKeysRevoked(t, rt)
 
-	assertTenantDeleteS3ObjectMissing(t, rt, tenantMeta.StorageNamespaceID, storageRef)
+	assertTenantDeleteS3ObjectMissing(t, rt, namespaceID, storageRef)
 }
 
 func TestTenantDeleteAsyncCleanupAbortsActiveMultipartUploads(t *testing.T) {
@@ -380,6 +429,12 @@ func TestTenantDeleteAsyncCleanupAbortsActiveMultipartUploads(t *testing.T) {
 		release()
 		t.Fatalf("upload part: %v", err)
 	}
+	tenantMeta, err = rt.meta.GetTenant(ctx, rt.tenantID)
+	if err != nil {
+		release()
+		t.Fatal(err)
+	}
+	namespaceID := tenantMeta.StorageNamespaceID
 	release()
 
 	resp := rt.deleteTenant(t, nil)
@@ -395,7 +450,7 @@ func TestTenantDeleteAsyncCleanupAbortsActiveMultipartUploads(t *testing.T) {
 	rt.server.processTenantDeleteJobs(ctx)
 	assertTenantDeletedAndKeysRevoked(t, rt)
 
-	s3c := tenantDeleteS3ForNamespace(t, rt, tenantMeta.StorageNamespaceID)
+	s3c := tenantDeleteS3ForNamespace(t, rt, namespaceID)
 	parts, err := s3c.ListParts(ctx, uploadBeforeDelete.S3Key, uploadBeforeDelete.S3UploadID)
 	if err == nil {
 		if len(parts) != 0 {
@@ -419,6 +474,22 @@ func tenantDeleteS3ForNamespace(t *testing.T, rt *tenantDeleteRuntime, namespace
 		t.Fatalf("s3 for storage namespace: %v", err)
 	}
 	return s3c
+}
+
+func assertTenantDeleteS3ObjectBytes(t *testing.T, rt *tenantDeleteRuntime, namespaceID, storageRef string, want []byte) {
+	t.Helper()
+	reader, err := tenantDeleteS3ForNamespace(t, rt, namespaceID).GetObject(context.Background(), storageRef)
+	if err != nil {
+		t.Fatalf("get s3 object %q: %v", storageRef, err)
+	}
+	defer func() { _ = reader.Close() }()
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read s3 object %q: %v", storageRef, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("s3 object %q bytes mismatch: got %d bytes want %d bytes", storageRef, len(got), len(want))
+	}
 }
 
 func assertTenantDeleteS3ObjectMissing(t *testing.T, rt *tenantDeleteRuntime, namespaceID, storageRef string) {
@@ -464,6 +535,35 @@ func assertTenantDeletedAndKeysRevoked(t *testing.T, rt *tenantDeleteRuntime) {
 	}
 	if revokedKeys != 1 {
 		t.Fatalf("revoked api keys = %d, want 1", revokedKeys)
+	}
+}
+
+func waitTenantDeleteStatus(t *testing.T, rt *tenantDeleteRuntime, want meta.TenantStatus) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var status string
+		if err := rt.meta.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", rt.tenantID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == string(want) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tenant status did not become %s, last status %s", want, status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func receiveTenantDeleteResponse(t *testing.T, ch <-chan *http.Response) *http.Response {
+	t.Helper()
+	select {
+	case resp := <-ch:
+		return resp
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for delete response")
+		return nil
 	}
 }
 
