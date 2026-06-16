@@ -40,13 +40,15 @@ LINT_TIMEOUT ?= 10m
 TEST_P ?=
 TEST_RUN ?=
 TEST_PKGS ?= ./...
+BLACKBOX_FUSE_RUNS ?= 3
+BLACKBOX_FUSE_TIER ?= daily
 
 BUILDINFO_LDFLAGS = -X github.com/mem9-ai/dat9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitHash=$(GIT_HASH) \
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local e2e-local docker-build
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local e2e-local blackbox-fuse-smoke blackbox-fuse-standard blackbox-fuse-daily blackbox-fuse-suite docker-build
 
 mod:
 	$(GO) mod tidy
@@ -118,6 +120,19 @@ run-server-local: build-server-local
 
 e2e-local:
 	bash e2e/local-smoke.sh
+
+blackbox-fuse-smoke:
+	python3 blackbox/fuse/run.py --preset smoke
+
+blackbox-fuse-standard:
+	python3 blackbox/fuse/run.py --preset standard
+
+blackbox-fuse-daily:
+	python3 blackbox/fuse/run.py --preset daily --runs $(BLACKBOX_FUSE_RUNS)
+
+blackbox-fuse-suite:
+	@test -n "$(SUITE)" || { echo "set SUITE=functional|posix|perf" >&2; exit 2; }
+	python3 blackbox/fuse/run.py --suite "$(SUITE)" --tier "$(BLACKBOX_FUSE_TIER)" --runs $(BLACKBOX_FUSE_RUNS)
 
 build-cli:
 	mkdir -p $(BIN_DIR)

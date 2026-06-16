@@ -1,0 +1,29 @@
+{
+  "smoke": {
+    "description": "Fast FUSE viability check plus the smallest functional subset.",
+    "suites": [
+      {"name": "functional", "tier": "smoke"}
+    ],
+    "strict_prereqs": false,
+    "report_daily": false
+  },
+  "standard": {
+    "description": "Mainline FUSE regression coverage: full functional plus core POSIX groups.",
+    "suites": [
+      {"name": "functional", "tier": "standard"},
+      {"name": "posix", "tier": "standard"}
+    ],
+    "strict_prereqs": true,
+    "report_daily": false
+  },
+  "daily": {
+    "description": "Daily FUSE stability and performance run.",
+    "suites": [
+      {"name": "functional", "tier": "daily"},
+      {"name": "posix", "tier": "daily"},
+      {"name": "perf", "tier": "daily"}
+    ],
+    "strict_prereqs": true,
+    "report_daily": true
+  }
+}

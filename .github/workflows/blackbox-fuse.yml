@@ -1,0 +1,128 @@
+name: blackbox-fuse
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/blackbox-fuse.yml"
+      - "blackbox/fuse/**"
+      - "cmd/**"
+      - "pkg/**"
+      - "internal/**"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/blackbox-fuse.yml"
+      - "blackbox/fuse/**"
+      - "cmd/**"
+      - "pkg/**"
+      - "internal/**"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+  schedule:
+    - cron: "27 20 * * *"
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: "Preset to run"
+        required: false
+        default: "daily"
+        type: choice
+        options:
+          - smoke
+          - standard
+          - daily
+      runs:
+        description: "Performance run count"
+        required: false
+        default: "3"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blackbox-fuse-${{ github.event_name == 'push' && 'main-post-merge' || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  BLACKBOX_FUSE_PRESET: ${{ github.event_name == 'pull_request' && 'smoke' || github.event_name == 'push' && 'standard' || github.event_name == 'schedule' && 'daily' || inputs.preset }}
+  BLACKBOX_FUSE_RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '3' }}
+  BLACKBOX_FUSE_STRICT: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+  DRIVE9_LOCAL_EMBEDDING_MODE: none
+  DRIVE9_LOCAL_INIT_SCHEMA: "true"
+
+jobs:
+  blackbox-fuse:
+    name: FUSE blackbox (${{ env.BLACKBOX_FUSE_PRESET }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fuse3 git perl
+
+      - name: Install pjdfstest
+        if: env.BLACKBOX_FUSE_PRESET != 'smoke'
+        run: |
+          git clone --depth 1 https://github.com/pjd/pjdfstest.git /tmp/pjdfstest
+          make -C /tmp/pjdfstest
+          echo "PJDFSTEST_DIR=/tmp/pjdfstest" >> "$GITHUB_ENV"
+
+      - name: Run blackbox FUSE preset
+        run: |
+          case "$BLACKBOX_FUSE_PRESET" in
+            smoke)
+              make blackbox-fuse-smoke
+              ;;
+            standard)
+              make blackbox-fuse-standard
+              ;;
+            daily)
+              make blackbox-fuse-daily BLACKBOX_FUSE_RUNS="$BLACKBOX_FUSE_RUNS"
+              ;;
+            *)
+              echo "unknown BLACKBOX_FUSE_PRESET=$BLACKBOX_FUSE_PRESET" >&2
+              exit 2
+              ;;
+          esac
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          latest="$(find blackbox/results/fuse -name daily-report.md -type f 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$latest" ]; then
+            cat "$latest" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No blackbox FUSE report produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload blackbox artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackbox-fuse-${{ env.BLACKBOX_FUSE_PRESET }}
+          path: blackbox/results/fuse/**
+          if-no-files-found: warn

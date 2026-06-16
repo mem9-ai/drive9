@@ -1,0 +1,38 @@
+{
+  "functional": {
+    "description": "FUSE functional correctness.",
+    "tiers": {
+      "smoke": [
+        "mount_rw_basic",
+        "cross_channel_visibility",
+        "file_semantics",
+        "metadata_ops"
+      ],
+      "standard": "all",
+      "daily": "all"
+    }
+  },
+  "posix": {
+    "description": "pjdfstests POSIX compatibility on a Drive9 FUSE mount.",
+    "tiers": {
+      "standard": [
+        "open",
+        "mkdir",
+        "rename",
+        "unlink",
+        "truncate",
+        "ftruncate",
+        "symlink",
+        "link",
+        "stat"
+      ],
+      "daily": "all"
+    }
+  },
+  "perf": {
+    "description": "FUSE micro and agent-like performance workloads.",
+    "tiers": {
+      "daily": "all"
+    }
+  }
+}
