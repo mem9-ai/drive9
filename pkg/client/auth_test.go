@@ -61,21 +61,17 @@ func TestRawDeleteSendsBearerAPIKeyAndBody(t *testing.T) {
 
 	var gotAuth string
 	var gotBody string
+	var gotMethod string
+	var gotPath string
+	var gotContentType string
+	var gotBodyErr error
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodDelete {
-			t.Fatalf("method = %s, want DELETE", r.Method)
-		}
-		if r.URL.Path != "/v1/tenant" {
-			t.Fatalf("path = %s, want /v1/tenant", r.URL.Path)
-		}
+		gotMethod = r.Method
+		gotPath = r.URL.Path
 		gotAuth = r.Header.Get("Authorization")
-		if got := r.Header.Get("Content-Type"); got != "application/json" {
-			t.Fatalf("Content-Type = %q, want application/json", got)
-		}
+		gotContentType = r.Header.Get("Content-Type")
 		raw, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read body: %v", err)
-		}
+		gotBodyErr = err
 		gotBody = string(raw)
 		w.WriteHeader(http.StatusAccepted)
 	}))
@@ -89,8 +85,20 @@ func TestRawDeleteSendsBearerAPIKeyAndBody(t *testing.T) {
 	if resp.StatusCode != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d", resp.StatusCode, http.StatusAccepted)
 	}
+	if gotMethod != http.MethodDelete {
+		t.Fatalf("method = %s, want DELETE", gotMethod)
+	}
+	if gotPath != "/v1/tenant" {
+		t.Fatalf("path = %s, want /v1/tenant", gotPath)
+	}
+	if gotBodyErr != nil {
+		t.Fatalf("read body: %v", gotBodyErr)
+	}
 	if gotAuth != "Bearer owner-api-key-xyz" {
 		t.Fatalf("Authorization = %q, want bearer API key", gotAuth)
+	}
+	if gotContentType != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", gotContentType)
 	}
 	if gotBody != `{"public_key":"pub"}` {
 		t.Fatalf("body = %q", gotBody)

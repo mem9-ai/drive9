@@ -73,7 +73,7 @@ func Region(args []string) error {
 
 func regionUsage() string {
 	return `usage: drive9 region <list|ls>
-  list [--json] [--manifest-url <url>]   list create regions from the drive9 manifest`
+  list [--json] [--manifest-url <url>]   list provisioning regions from the drive9 manifest`
 }
 
 func regionListCmd(args []string) error {
@@ -167,22 +167,39 @@ func validateRegionManifest(manifest *RegionManifest) error {
 		return fmt.Errorf("region manifest has no regions")
 	}
 	seen := map[string]int{}
-	for i, entry := range manifest.Regions {
-		if strings.TrimSpace(entry.RegionCode) == "" {
+	for i := range manifest.Regions {
+		entry := &manifest.Regions[i]
+		entry.RegionCode = strings.TrimSpace(entry.RegionCode)
+		entry.Mode = strings.TrimSpace(entry.Mode)
+		entry.ServerURL = strings.TrimSpace(entry.ServerURL)
+		if entry.RegionCode == "" {
 			return fmt.Errorf("region manifest entry %d missing region_code", i)
 		}
-		if strings.TrimSpace(entry.Mode) == "" {
+		if entry.Mode == "" {
 			return fmt.Errorf("region manifest entry %d missing mode", i)
 		}
-		if strings.TrimSpace(entry.ServerURL) == "" {
+		if entry.ServerURL == "" {
 			return fmt.Errorf("region manifest entry %d missing server_url", i)
 		}
-		mode := strings.TrimSpace(entry.Mode)
-		key := strings.TrimSpace(entry.RegionCode) + "\x00" + mode
+		key := entry.RegionCode + "\x00" + entry.Mode
 		if first, ok := seen[key]; ok {
-			return fmt.Errorf("region manifest entries %d and %d duplicate region_code %q mode %q", first, i, strings.TrimSpace(entry.RegionCode), mode)
+			return fmt.Errorf("region manifest entries %d and %d duplicate region_code %q mode %q", first, i, entry.RegionCode, entry.Mode)
 		}
 		seen[key] = i
+	}
+	if manifest.Default != nil {
+		manifest.Default.RegionCode = strings.TrimSpace(manifest.Default.RegionCode)
+		manifest.Default.Mode = strings.TrimSpace(manifest.Default.Mode)
+		if manifest.Default.RegionCode == "" {
+			return fmt.Errorf("region manifest default missing region_code")
+		}
+		if manifest.Default.Mode == "" {
+			return fmt.Errorf("region manifest default missing mode")
+		}
+		defaultKey := manifest.Default.RegionCode + "\x00" + manifest.Default.Mode
+		if _, ok := seen[defaultKey]; !ok {
+			return fmt.Errorf("region manifest default %q/%q not found in regions", manifest.Default.RegionCode, manifest.Default.Mode)
+		}
 	}
 	return nil
 }

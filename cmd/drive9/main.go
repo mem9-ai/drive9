@@ -15,7 +15,7 @@
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	journal append-only agent/workflow journal operations
 //	git     git-aware drive9 workflows
-//	region list drive9 create regions
+//	region list provisioning regions
 //	profile show mount profile configuration
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
@@ -404,7 +404,7 @@ func usage(code int) {
 			"                         append-only agent/workflow journal operations\n"+
 			"  git clone --fast <repo-url> <mounted-path>\n"+
 			"                         git-aware fast clone workflow\n"+
-			"  region list [--json]   list create regions\n"+
+			"  region list [--json]   list provisioning regions\n"+
 			"  pack [flags] [archive] [path...]\n"+
 			"                         archive coding-agent local overlay paths to drive9/S3\n"+
 			"  unpack [flags] [archive]\n"+

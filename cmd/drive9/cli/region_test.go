@@ -138,6 +138,10 @@ func TestRegionListJSONFallsBackWhenManifestUnavailable(t *testing.T) {
 func TestValidateRegionManifestAllowsSameRegionDifferentModes(t *testing.T) {
 	err := validateRegionManifest(&RegionManifest{
 		Service: "drive9",
+		Default: &RegionManifestDefault{
+			RegionCode: "aws-us-east-1",
+			Mode:       RegionModeTiDBCloudStarter,
+		},
 		Regions: []RegionManifestEntry{
 			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarter, ServerURL: "https://starter.example"},
 			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
@@ -145,6 +149,25 @@ func TestValidateRegionManifestAllowsSameRegionDifferentModes(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("validateRegionManifest: %v", err)
+	}
+}
+
+func TestValidateRegionManifestRejectsMissingDefaultEntry(t *testing.T) {
+	err := validateRegionManifest(&RegionManifest{
+		Service: "drive9",
+		Default: &RegionManifestDefault{
+			RegionCode: "aws-us-east-1",
+			Mode:       RegionModeTiDBCloudNative,
+		},
+		Regions: []RegionManifestEntry{
+			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudStarter, ServerURL: "https://starter.example"},
+		},
+	})
+	if err == nil {
+		t.Fatal("validateRegionManifest error = nil, want missing default entry error")
+	}
+	if !strings.Contains(err.Error(), "region manifest default") {
+		t.Fatalf("validateRegionManifest error = %q", err)
 	}
 }
 

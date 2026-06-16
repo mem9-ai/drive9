@@ -54,7 +54,7 @@ drive9 ctx <name>               # switch workspace
 drive9 delete                   # delete the current workspace/tenant
 ```
 
-Only run `drive9 delete` when the user explicitly asks to delete the current workspace/tenant. This is destructive and requires an owner API key; delegated and `fs_scoped` contexts cannot delete tenants.
+Only run `drive9 delete` when the user explicitly asks to delete the current workspace/tenant. This is destructive and requires an owner API key. The CLI will use the active context only when it is an owner context; if the active context is delegated or `fs_scoped`, pass an owner key explicitly with `--api-key`.
 
 `drive9 create` uses the default Drive9 server when no server, region, or TiDB Cloud keys are provided. Use `drive9 region list` to see supported provisioning routes. Modes shown as `Anonymous` use Drive9-managed starter provisioning. Modes shown as `TiDBCloud` create the starter cluster in the user's TiDB Cloud account and require TiDB Cloud API keys:
 

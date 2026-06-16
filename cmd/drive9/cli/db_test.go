@@ -33,10 +33,8 @@ func TestCreateUsesResolvedServerWithoutNativeBody(t *testing.T) {
 	withIsolatedHome(t)
 	clearProvisionEnv(t)
 
-	var called bool
-	var requestBody string
+	requestBodyCh := make(chan string, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/provision" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -47,7 +45,7 @@ func TestCreateUsesResolvedServerWithoutNativeBody(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read body: %v", err)
 		}
-		requestBody = string(raw)
+		requestBodyCh <- string(raw)
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"tenant_id": "tenant-1",
@@ -67,11 +65,13 @@ func TestCreateUsesResolvedServerWithoutNativeBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
-	if !called {
+	select {
+	case requestBody := <-requestBodyCh:
+		if requestBody != "" {
+			t.Fatalf("request body = %q, want empty starter body", requestBody)
+		}
+	default:
 		t.Fatal("provision server was not called")
-	}
-	if requestBody != "" {
-		t.Fatalf("request body = %q, want empty starter body", requestBody)
 	}
 	if !strings.Contains(out, `created "starter"`) {
 		t.Fatalf("output = %q, want created message", out)
@@ -97,7 +97,7 @@ func TestCreateServerOverrideSendsNativeBodyAndSkipsManifest(t *testing.T) {
 	}))
 	defer manifest.Close()
 
-	var gotBody map[string]string
+	bodyCh := make(chan map[string]string, 1)
 	provision := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/provision" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -105,9 +105,11 @@ func TestCreateServerOverrideSendsNativeBodyAndSkipsManifest(t *testing.T) {
 		if got := r.Header.Get("Content-Type"); got != "application/json" {
 			t.Fatalf("Content-Type = %q, want application/json", got)
 		}
+		var gotBody map[string]string
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Fatalf("decode request body: %v", err)
 		}
+		bodyCh <- gotBody
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"tenant_id": "tenant-native",
@@ -138,6 +140,12 @@ func TestCreateServerOverrideSendsNativeBodyAndSkipsManifest(t *testing.T) {
 	}
 	if atomic.LoadInt32(&manifestHits) != 0 {
 		t.Fatalf("manifest hits = %d, want 0 when --server is set", manifestHits)
+	}
+	var gotBody map[string]string
+	select {
+	case gotBody = <-bodyCh:
+	default:
+		t.Fatal("provision server was not called")
 	}
 	if gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
 		t.Fatalf("request body = %#v", gotBody)
@@ -172,15 +180,17 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 
 	var nativeHits int32
 	var starterHits int32
-	var gotBody map[string]string
+	bodyCh := make(chan map[string]string, 1)
 	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&nativeHits, 1)
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/provision" {
 			t.Fatalf("unexpected native request %s %s", r.Method, r.URL.Path)
 		}
+		var gotBody map[string]string
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Fatalf("decode native body: %v", err)
 		}
+		bodyCh <- gotBody
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"tenant_id": "tenant-native",
@@ -227,6 +237,12 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	if atomic.LoadInt32(&starterHits) != 0 {
 		t.Fatalf("starter hits = %d, want 0", starterHits)
 	}
+	var gotBody map[string]string
+	select {
+	case gotBody = <-bodyCh:
+	default:
+		t.Fatal("native server was not called")
+	}
 	if gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
 		t.Fatalf("native body = %#v", gotBody)
 	}
@@ -244,7 +260,7 @@ func TestCreateRegionCodeSelectsStarterWithoutBody(t *testing.T) {
 	clearProvisionEnv(t)
 
 	var starterHits int32
-	var requestBody string
+	requestBodyCh := make(chan string, 1)
 	starter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&starterHits, 1)
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/provision" {
@@ -254,7 +270,7 @@ func TestCreateRegionCodeSelectsStarterWithoutBody(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read starter body: %v", err)
 		}
-		requestBody = string(raw)
+		requestBodyCh <- string(raw)
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"tenant_id": "tenant-starter",
@@ -293,8 +309,13 @@ func TestCreateRegionCodeSelectsStarterWithoutBody(t *testing.T) {
 	if atomic.LoadInt32(&starterHits) != 1 {
 		t.Fatalf("starter hits = %d, want 1", starterHits)
 	}
-	if requestBody != "" {
-		t.Fatalf("starter body = %q, want empty", requestBody)
+	select {
+	case requestBody := <-requestBodyCh:
+		if requestBody != "" {
+			t.Fatalf("starter body = %q, want empty", requestBody)
+		}
+	default:
+		t.Fatal("starter server was not called")
 	}
 	if got := readTrimEnv(EnvRegionCode); got != "aws-us-east-1" {
 		t.Fatalf("%s = %q, want preserved region code", EnvRegionCode, got)
@@ -351,14 +372,25 @@ func TestCreateRejectsDatabaseNameFlag(t *testing.T) {
 	}
 }
 
+func TestCreateRejectsWhitespaceServerFlag(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+
+	err := Create([]string{"--server", "   "})
+	if err == nil {
+		t.Fatal("Create error = nil, want whitespace flag error")
+	}
+	if !strings.Contains(err.Error(), "--server was given an empty value") {
+		t.Fatalf("Create error = %q", err)
+	}
+}
+
 func TestDeleteTenantUsesOwnerContext(t *testing.T) {
 	withIsolatedHome(t)
 	clearProvisionEnv(t)
 
-	var called bool
-	var requestBody string
+	requestBodyCh := make(chan string, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		called = true
 		if r.Method != http.MethodDelete || r.URL.Path != "/v1/tenant" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -372,7 +404,7 @@ func TestDeleteTenantUsesOwnerContext(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read body: %v", err)
 		}
-		requestBody = string(raw)
+		requestBodyCh <- string(raw)
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "delete_queued"})
 	}))
@@ -393,11 +425,13 @@ func TestDeleteTenantUsesOwnerContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteTenant: %v", err)
 	}
-	if !called {
+	select {
+	case requestBody := <-requestBodyCh:
+		if requestBody != "" {
+			t.Fatalf("delete body = %q, want empty", requestBody)
+		}
+	default:
 		t.Fatal("delete server was not called")
-	}
-	if requestBody != "" {
-		t.Fatalf("delete body = %q, want empty", requestBody)
 	}
 	if !strings.Contains(out, "delete accepted (status: delete_queued)") {
 		t.Fatalf("output = %q", out)
@@ -408,7 +442,7 @@ func TestDeleteTenantServerOverrideSendsNativeBody(t *testing.T) {
 	withIsolatedHome(t)
 	clearProvisionEnv(t)
 
-	var gotBody map[string]string
+	bodyCh := make(chan map[string]string, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodDelete || r.URL.Path != "/v1/tenant" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -419,9 +453,11 @@ func TestDeleteTenantServerOverrideSendsNativeBody(t *testing.T) {
 		if got := r.Header.Get("Content-Type"); got != "application/json" {
 			t.Fatalf("Content-Type = %q, want application/json", got)
 		}
+		var gotBody map[string]string
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Fatalf("decode body: %v", err)
 		}
+		bodyCh <- gotBody
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleting"})
 	}))
@@ -439,6 +475,12 @@ func TestDeleteTenantServerOverrideSendsNativeBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteTenant: %v", err)
 	}
+	var gotBody map[string]string
+	select {
+	case gotBody = <-bodyCh:
+	default:
+		t.Fatal("delete server was not called")
+	}
 	if gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
 		t.Fatalf("delete body = %#v", gotBody)
 	}
@@ -448,6 +490,38 @@ func TestDeleteTenantServerOverrideSendsNativeBody(t *testing.T) {
 	}
 	if result["status"] != "deleting" || result["server"] != ts.URL {
 		t.Fatalf("delete json = %#v", result)
+	}
+}
+
+func TestDeleteTenantFallsBackToRawErrorBody(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = w.Write([]byte("upstream unavailable"))
+	}))
+	defer ts.Close()
+
+	err := DeleteTenant([]string{"--server", ts.URL, "--api-key", "owner-key"})
+	if err == nil {
+		t.Fatal("DeleteTenant error = nil, want HTTP error")
+	}
+	if !strings.Contains(err.Error(), "upstream unavailable") {
+		t.Fatalf("DeleteTenant error = %q", err)
+	}
+}
+
+func TestDeleteTenantRejectsWhitespaceAPIKeyFlag(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+
+	err := DeleteTenant([]string{"--api-key", "   "})
+	if err == nil {
+		t.Fatal("DeleteTenant error = nil, want whitespace flag error")
+	}
+	if !strings.Contains(err.Error(), "--api-key was given an empty value") {
+		t.Fatalf("DeleteTenant error = %q", err)
 	}
 }
 
@@ -502,12 +576,16 @@ func newRegionManifestTestServer(t *testing.T, entries []RegionManifestEntry) *h
 			t.Fatalf("manifest method = %s, want GET", r.Method)
 		}
 		w.Header().Set("Content-Type", "application/json")
+		var defaultEntry *RegionManifestDefault
+		if len(entries) > 0 {
+			defaultEntry = &RegionManifestDefault{
+				RegionCode: entries[0].RegionCode,
+				Mode:       entries[0].Mode,
+			}
+		}
 		_ = json.NewEncoder(w).Encode(RegionManifest{
 			Service: "drive9",
-			Default: &RegionManifestDefault{
-				RegionCode: "aws-ap-southeast-1",
-				Mode:       RegionModeTiDBCloudStarter,
-			},
+			Default: defaultEntry,
 			Regions: entries,
 		})
 	}))

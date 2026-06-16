@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 )
 
@@ -236,7 +237,7 @@ const defaultServerURL = "https://api.drive9.ai"
 //
 // Call this on each credential flag after flag.Parse.
 func rejectEmptyFlag(flagName, value string, provided bool) error {
-	if provided && value == "" {
+	if provided && strings.TrimSpace(value) == "" {
 		return fmt.Errorf("--%s was given an empty value; pass a non-empty credential or omit the flag", flagName)
 	}
 	return nil

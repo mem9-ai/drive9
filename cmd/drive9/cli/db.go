@@ -389,13 +389,24 @@ func DeleteTenant(args []string) error {
 		return fmt.Errorf("delete tenant failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	rawResp, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read delete tenant response: %w", err)
+	}
 	var result struct {
 		Status string `json:"status"`
 		Error  string `json:"error"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&result)
+	_ = json.Unmarshal(rawResp, &result)
 	if resp.StatusCode != http.StatusAccepted {
-		return fmt.Errorf("delete tenant failed (HTTP %d): %s", resp.StatusCode, result.Error)
+		msg := strings.TrimSpace(result.Error)
+		if msg == "" {
+			msg = strings.TrimSpace(string(rawResp))
+		}
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return fmt.Errorf("delete tenant failed (HTTP %d): %s", resp.StatusCode, msg)
 	}
 	if result.Status == "" {
 		result.Status = "deleting"
