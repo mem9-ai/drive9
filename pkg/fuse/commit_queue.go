@@ -17,7 +17,10 @@ import (
 
 var errCommitPostUpload = errors.New("commit post-upload step failed")
 
-const maxInlineLayerEntryBytes = 96 << 20
+const (
+	maxInlineLayerEntryBytes     = 96 << 20
+	zeroTruncateCommitQueueDelay = 50 * time.Millisecond
+)
 
 // directPutThreshold returns the size limit below which commit queue workers
 // use direct PUT (WriteCtxConditionalWithRevision) instead of multipart
@@ -42,17 +45,18 @@ func (cq *CommitQueue) directPutThreshold() int64 {
 
 // CommitEntry represents a pending remote commit.
 type CommitEntry struct {
-	Path         string
-	Inode        uint64
-	BaseRev      int64 // revision when we started editing
-	Size         int64
-	Kind         PendingKind
-	ShadowSpill  bool // true when data is only in shadow file (auto-resolve would OOM)
-	Mode         uint32
-	HasMode      bool
-	canceled     bool
-	cancelCommit context.CancelFunc
-	cancelUpload context.CancelFunc
+	Path                 string
+	Inode                uint64
+	BaseRev              int64 // revision when we started editing
+	Size                 int64
+	Kind                 PendingKind
+	ShadowSpill          bool // true when data is only in shadow file (auto-resolve would OOM)
+	Mode                 uint32
+	HasMode              bool
+	CoalesceZeroTruncate bool
+	canceled             bool
+	cancelCommit         context.CancelFunc
+	cancelUpload         context.CancelFunc
 }
 
 // CommitSuccessFunc is called after a commit queue entry is successfully
@@ -71,6 +75,7 @@ type CommitQueue struct {
 	queue        []*CommitEntry
 	queuedByPath map[string]map[*CommitEntry]struct{}
 	inFlight     map[string]*CommitEntry // paths currently being processed by workers
+	delayed      map[*CommitEntry]*time.Timer
 	maxPending   int
 	client       *client.Client
 	remoteRoot   string
@@ -96,6 +101,8 @@ type CommitQueue struct {
 	// larger than maxPending so Enqueue never blocks.
 	workCh chan *CommitEntry
 
+	zeroTruncateDelay time.Duration
+
 	perf *fusePerfCounters
 }
 
@@ -117,15 +124,17 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 		bufSize = 256
 	}
 	cq := &CommitQueue{
-		maxPending:   maxPending,
-		client:       c,
-		remoteRoot:   root,
-		shadows:      shadows,
-		index:        index,
-		journal:      journal,
-		inFlight:     make(map[string]*CommitEntry),
-		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
-		workCh:       make(chan *CommitEntry, bufSize),
+		maxPending:        maxPending,
+		client:            c,
+		remoteRoot:        root,
+		shadows:           shadows,
+		index:             index,
+		journal:           journal,
+		inFlight:          make(map[string]*CommitEntry),
+		queuedByPath:      make(map[string]map[*CommitEntry]struct{}),
+		delayed:           make(map[*CommitEntry]*time.Timer),
+		workCh:            make(chan *CommitEntry, bufSize),
+		zeroTruncateDelay: zeroTruncateCommitQueueDelay,
 	}
 	for i := 0; i < numWorkers; i++ {
 		cq.wg.Add(1)
@@ -194,12 +203,105 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 		cq.perf.commitEnqueue.add(1)
 	}
 
+	if cq.shouldDelayZeroTruncateLocked(entry) {
+		cq.delayZeroTruncateLocked(entry)
+		return nil
+	}
+
 	// Send to workers while holding the lock. The channel buffer is always
 	// > maxPending, so this will not block as long as the backpressure
 	// check above holds. Holding the lock prevents DrainAll from closing
 	// workCh between our check and the send.
 	cq.workCh <- entry
 	return nil
+}
+
+func (cq *CommitQueue) shouldDelayZeroTruncateLocked(entry *CommitEntry) bool {
+	if cq == nil || entry == nil || entry.canceled || !entry.CoalesceZeroTruncate || !isQueuedZeroTruncateEntry(entry) {
+		return false
+	}
+	return cq.zeroTruncateDelay > 0
+}
+
+func (cq *CommitQueue) delayZeroTruncateLocked(entry *CommitEntry) {
+	if cq.delayed == nil {
+		cq.delayed = make(map[*CommitEntry]*time.Timer)
+	}
+	delay := cq.zeroTruncateDelay
+	cq.delayed[entry] = time.AfterFunc(delay, func() {
+		cq.dispatchDelayed(entry)
+	})
+}
+
+func (cq *CommitQueue) dispatchDelayed(entry *CommitEntry) {
+	if cq == nil || entry == nil {
+		return
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if cq.delayed == nil || cq.delayed[entry] == nil {
+		return
+	}
+	delete(cq.delayed, entry)
+	if cq.stopped || entry.canceled {
+		return
+	}
+	cq.workCh <- entry
+}
+
+func (cq *CommitQueue) stopDelayedLocked(entry *CommitEntry) {
+	if cq == nil || entry == nil || cq.delayed == nil {
+		return
+	}
+	if timer := cq.delayed[entry]; timer != nil {
+		timer.Stop()
+		delete(cq.delayed, entry)
+	}
+}
+
+func (cq *CommitQueue) forceDelayedPathLocked(path string) {
+	if cq == nil || path == "" || len(cq.delayed) == 0 {
+		return
+	}
+	for entry, timer := range cq.delayed {
+		if entry == nil || entry.Path != path {
+			continue
+		}
+		timer.Stop()
+		delete(cq.delayed, entry)
+		if !cq.stopped && !entry.canceled {
+			cq.workCh <- entry
+		}
+	}
+}
+
+func (cq *CommitQueue) forceDelayedPrefixLocked(prefix string) {
+	if cq == nil || prefix == "" || len(cq.delayed) == 0 {
+		return
+	}
+	for entry, timer := range cq.delayed {
+		if entry == nil || !strings.HasPrefix(entry.Path, prefix) {
+			continue
+		}
+		timer.Stop()
+		delete(cq.delayed, entry)
+		if !cq.stopped && !entry.canceled {
+			cq.workCh <- entry
+		}
+	}
+}
+
+func (cq *CommitQueue) forceAllDelayedLocked() {
+	if cq == nil || len(cq.delayed) == 0 {
+		return
+	}
+	for entry, timer := range cq.delayed {
+		timer.Stop()
+		delete(cq.delayed, entry)
+		if !cq.stopped && entry != nil && !entry.canceled {
+			cq.workCh <- entry
+		}
+	}
 }
 
 // Pending returns the number of pending commits.
@@ -267,6 +369,7 @@ func (cq *CommitQueue) DrainAll() {
 		cq.wg.Wait()
 		return
 	}
+	cq.forceAllDelayedLocked()
 	cq.stopped = true
 	// Close workCh under the lock so no concurrent Enqueue can send after close.
 	close(cq.workCh)
@@ -330,6 +433,7 @@ func (cq *CommitQueue) RecoverPending() {
 func (cq *CommitQueue) WaitPath(path string) {
 	for {
 		cq.mu.Lock()
+		cq.forceDelayedPathLocked(path)
 		_, inflight := cq.inFlight[path]
 		queued := cq.hasQueuedPathLocked(path)
 		cq.mu.Unlock()
@@ -358,6 +462,7 @@ func (cq *CommitQueue) HasPath(path string) bool {
 func (cq *CommitQueue) WaitPrefix(prefix string) {
 	for {
 		cq.mu.Lock()
+		cq.forceDelayedPrefixLocked(prefix)
 		found := false
 		for p := range cq.inFlight {
 			if strings.HasPrefix(p, prefix) {
@@ -418,6 +523,7 @@ func (cq *CommitQueue) CancelQueuedZeroTruncatePreserveLocal(path string) bool {
 		}
 		if isQueuedZeroTruncateEntry(entry) {
 			entry.canceled = true
+			cq.stopDelayedLocked(entry)
 			continue
 		}
 		otherQueued = true
@@ -438,6 +544,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 			return
 		}
 		e.canceled = true
+		cq.stopDelayedLocked(e)
 		if _, ok := seen[e]; ok {
 			return
 		}
@@ -526,6 +633,7 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 			return
 		}
 		e.canceled = true
+		cq.stopDelayedLocked(e)
 		if _, ok := seen[e]; ok {
 			return
 		}
@@ -959,6 +1067,7 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
+	cq.stopDelayedLocked(entry)
 	for i, e := range cq.queue {
 		if e == entry {
 			cq.queue = append(cq.queue[:i], cq.queue[i+1:]...)
