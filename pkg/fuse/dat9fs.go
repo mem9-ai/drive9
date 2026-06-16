@@ -7437,6 +7437,7 @@ func (fs *Dat9FS) Create(cancel <-chan struct{}, input *gofuse.CreateIn, name st
 		Ino:         ino,
 		Path:        childP,
 		Flags:       input.Flags,
+		OpenPID:     input.Pid,
 		Dirty:       wb,
 		IsNew:       true,
 		ShadowReady: false,
