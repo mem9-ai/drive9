@@ -1419,12 +1419,12 @@ func shouldAdoptSingleHandlePathTruncate(fh *FileHandle, callerPID uint32, match
 	return fh.OpenPID == callerPID
 }
 
-func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) error {
+func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) (func(), error) {
 	if fh == nil || fh.Dirty == nil {
-		return nil
+		return nil, nil
 	}
 	if err := fh.Dirty.Truncate(newSize); err != nil {
-		return err
+		return nil, err
 	}
 	if fh.WritePolicy != WritePolicyWriteSync && fs.shadowStore != nil && fs.pendingIndex != nil {
 		if fh.ShadowReady || fh.IsNew || newSize == 0 {
@@ -1441,9 +1441,24 @@ func (fs *Dat9FS) truncateWritableHandleLocked(fh *FileHandle, newSize int64) er
 	// subsequent writes starting at the new size are not
 	// misdetected as back-writes (appendCursor may be stale).
 	fh.Dirty.ResetSequentialState(newSize)
+	var abortStreamer func()
+	if newSize == 0 {
+		fh.Dirty.ResetStreamingState()
+		if fh.ShadowSpill {
+			wb := fh.Dirty
+			wb.OnPartFull = func(partIdx int, data []byte) {
+				wb.EvictPart(partIdx)
+			}
+		}
+		if fh.Streamer != nil {
+			streamer := fh.Streamer
+			fh.Streamer = nil
+			abortStreamer = streamer.Abort
+		}
+	}
 	fh.ZeroBase = newSize == 0
 	fh.DirtySeq = fs.markDirtySize(fh.Ino, fh.Dirty.Size())
-	return nil
+	return abortStreamer, nil
 }
 
 func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64, callerPID uint32, truncateSize int64) {
@@ -1465,9 +1480,12 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 	}
 
 	for _, fh := range matching {
+		var abortStreamer func()
 		fh.Lock()
 		if shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
-			if err := fs.truncateWritableHandleLocked(fh, truncateSize); err != nil {
+			var err error
+			abortStreamer, err = fs.truncateWritableHandleLocked(fh, truncateSize)
+			if err != nil {
 				log.Printf("handle truncate sync failed for %s: %v", fh.Path, err)
 				fh.Unlock()
 				continue
@@ -1491,12 +1509,15 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 			}
 		}
 		fh.Unlock()
+		if abortStreamer != nil {
+			abortStreamer()
+		}
 	}
 }
 
-func (fs *Dat9FS) adoptSingleCallerPathTruncate(remotePath string, callerPID uint32) {
+func (fs *Dat9FS) adoptSingleCallerPathTruncate(remotePath string, callerPID uint32) bool {
 	if fs == nil || fs.openHandles == nil || remotePath == "" || callerPID == 0 {
-		return
+		return false
 	}
 
 	var matching []*FileHandle
@@ -1512,15 +1533,25 @@ func (fs *Dat9FS) adoptSingleCallerPathTruncate(remotePath string, callerPID uin
 		}
 	}
 
+	adopted := false
 	for _, fh := range matching {
+		var abortStreamer func()
 		fh.Lock()
 		if shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
-			if err := fs.truncateWritableHandleLocked(fh, 0); err != nil {
+			var err error
+			abortStreamer, err = fs.truncateWritableHandleLocked(fh, 0)
+			if err != nil {
 				log.Printf("handle truncate stage failed for %s: %v", fh.Path, err)
+			} else {
+				adopted = true
 			}
 		}
 		fh.Unlock()
+		if abortStreamer != nil {
+			abortStreamer()
+		}
 	}
+	return adopted
 }
 
 func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision int64, skip *FileHandle) {
@@ -2347,13 +2378,23 @@ func (fs *Dat9FS) applyRemoteTruncate(ctx context.Context, entry *InodeEntry, in
 		fs.cacheFileForPath(entry.Path, newSize, entry.Mtime, 0)
 		return gofuse.OK
 	}
-	if newSize == 0 && fs.canStagePathTruncateToZero(entry) {
-		st := fs.stagePathTruncateToZeroLocked(ctx, entry, ino)
-		if st != gofuse.OK {
-			return st
+	if newSize == 0 {
+		if entry.Revision <= 0 && fs.adoptSingleCallerPathTruncate(entry.Path, pid) {
+			// A newly-created, uncommitted file has no remote base revision for
+			// an overwrite CAS. Let the open handle keep ownership and commit it
+			// later as PendingNew instead of queuing an invalid PendingOverwrite.
+			fs.invalidateReadCacheAndTargets(entry.Path)
+			fs.cacheFileForPath(entry.Path, 0, entry.Mtime, 0)
+			return gofuse.OK
 		}
-		fs.adoptSingleCallerPathTruncate(entry.Path, pid)
-		return gofuse.OK
+		if fs.canStagePathTruncateToZero(entry) {
+			st := fs.stagePathTruncateToZeroLocked(ctx, entry, ino)
+			if st != gofuse.OK {
+				return st
+			}
+			_ = fs.adoptSingleCallerPathTruncate(entry.Path, pid)
+			return gofuse.OK
+		}
 	}
 
 	writeStart := fs.perfStart()
@@ -2587,6 +2628,9 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 
 func (fs *Dat9FS) canStagePathTruncateToZero(entry *InodeEntry) bool {
 	if fs == nil || entry == nil || entry.IsDir || entryIsSymlink(entry) {
+		return false
+	}
+	if entry.Revision <= 0 {
 		return false
 	}
 	if fs.layerEnabled() || isSQLitePersistentJournalPath(entry.Path) {
@@ -6458,12 +6502,18 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 				}
 			}
 			if ok && fh.Dirty != nil {
+				var abortStreamer func()
 				fh.Lock()
-				if err := fs.truncateWritableHandleLocked(fh, newSize); err != nil {
+				var err error
+				abortStreamer, err = fs.truncateWritableHandleLocked(fh, newSize)
+				if err != nil {
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
 				fh.Unlock()
+				if abortStreamer != nil {
+					abortStreamer()
+				}
 			}
 		} else {
 			if err := fs.snapshotOpenSQLiteSidecarBeforeTruncate(ctx, entry.Path, nil, newSize); err != nil {

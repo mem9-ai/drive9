@@ -395,12 +395,16 @@ func TestFlushHandlePatchAfterLazyTruncatePreservesRemotePrefix(t *testing.T) {
 	fh.Unlock()
 
 	fh.Lock()
-	if err := fs.truncateWritableHandleLocked(fh, newSize); err != nil {
+	abortStreamer, err := fs.truncateWritableHandleLocked(fh, newSize)
+	if err != nil {
 		fh.Unlock()
 		t.Fatalf("truncateWritableHandleLocked: %v", err)
 	}
 	st := fs.flushHandle(context.Background(), fh)
 	fh.Unlock()
+	if abortStreamer != nil {
+		abortStreamer()
+	}
 	if st != gofuse.OK {
 		t.Fatalf("flushHandle status = %v, want OK", st)
 	}
@@ -12060,9 +12064,27 @@ func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
 
 func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T) {
 	const callerPID = 6161
+	var createCalls atomic.Int32
+	var putCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/created.bin" && r.URL.RawQuery == "create=1":
+			createCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			http.Error(w, "unexpected PUT", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
 	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
 	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -12086,6 +12108,7 @@ func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T
 	st := fs.Create(nil, &gofuse.CreateIn{
 		InHeader: gofuse.InHeader{NodeId: 1, Caller: gofuse.Caller{Pid: callerPID}},
 		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     defaultRegularFileMode,
 	}, "created.bin", &createOut)
 	if st != gofuse.OK {
 		t.Fatalf("Create status = %v, want OK", st)
@@ -12127,6 +12150,20 @@ func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T
 	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
 		t.Fatalf("dirty truncate not marked: dirtySeq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
 	}
+	if fs.commitQueue.HasPath("/created.bin") {
+		t.Fatal("created truncate queued invalid path overwrite commit")
+	}
+	if meta, ok := pending.GetMeta("/created.bin"); ok {
+		t.Fatalf("pending meta after created truncate = %+v, want no path-level overwrite", meta)
+	}
+
+	fh.Lock()
+	kind := fs.pendingKindForHandle(fh)
+	baseRev := fs.expectedRevisionForHandleLocked(fh)
+	fh.Unlock()
+	if kind != PendingNew || baseRev != 0 {
+		t.Fatalf("created truncate handle commit state = kind %v baseRev %d, want PendingNew baseRev 0", kind, baseRev)
+	}
 
 	gotShadow, err := shadow.ReadAll("/created.bin")
 	if err != nil {
@@ -12134,6 +12171,20 @@ func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T
 	}
 	if len(gotShadow) != 0 {
 		t.Fatalf("shadow content after staged truncate len=%d, want 0", len(gotShadow))
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("remote empty create calls = %d, want 1", got)
+	}
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("remote PUT calls = %d, want 0", got)
+	}
+	if pending.HasPending("/created.bin") {
+		t.Fatal("pending state remains after release")
+	}
+	if shadow.Has("/created.bin") {
+		t.Fatal("shadow remains after release")
 	}
 }
 
@@ -12944,6 +12995,207 @@ func TestFlushHandle_RefreshesStartedStreamerRevision(t *testing.T) {
 	}
 }
 
+func TestTruncateWritableHandleLockedZeroResetsStreamingStateBeforeContinuedWrite(t *testing.T) {
+	const filePath = "/stream-reset.bin"
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+
+	wb := NewWriteBuffer(filePath, streamingWriteMaxSize, 0)
+	wb.uploadedParts = map[int]bool{0: true}
+	var staleCallbackCalls atomic.Int32
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		staleCallbackCalls.Add(1)
+	}
+	streamer := NewStreamUploader(nil, filePath, 0)
+	streamer.started = true
+	streamer.streamedParts[1] = true
+	streamer.pendingParts[1] = []byte("stale")
+
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    wb,
+		Streamer: streamer,
+	}
+
+	fh.Lock()
+	abortStreamer, err := fs.truncateWritableHandleLocked(fh, 0)
+	fh.Unlock()
+	if err != nil {
+		t.Fatalf("truncateWritableHandleLocked: %v", err)
+	}
+	if abortStreamer == nil {
+		t.Fatal("abortStreamer is nil, want old streamer cleanup")
+	}
+	abortStreamer()
+
+	if fh.Streamer != nil {
+		t.Fatal("fh.Streamer should be cleared after zero truncate")
+	}
+	if wb.OnPartFull != nil {
+		t.Fatal("OnPartFull should be cleared after non-shadow zero truncate")
+	}
+	if len(wb.uploadedParts) != 0 {
+		t.Fatalf("uploadedParts len = %d, want 0", len(wb.uploadedParts))
+	}
+	if len(streamer.pendingParts) != 0 {
+		t.Fatalf("old streamer pendingParts len = %d, want 0 after abort", len(streamer.pendingParts))
+	}
+
+	fullPart := bytes.Repeat([]byte("n"), int(wb.PartSize()))
+	if _, err := wb.Write(0, fullPart); err != nil {
+		t.Fatalf("continued write after truncate: %v", err)
+	}
+	if got := staleCallbackCalls.Load(); got != 0 {
+		t.Fatalf("stale OnPartFull calls = %d, want 0", got)
+	}
+	if len(wb.uploadedParts) != 0 {
+		t.Fatalf("uploadedParts len after continued write = %d, want 0", len(wb.uploadedParts))
+	}
+	if !wb.IsPartLoaded(0) {
+		t.Fatal("continued write should retain part in memory when streaming is disabled")
+	}
+}
+
+func TestTruncateWritableHandleLockedZeroRebindsShadowSpillEviction(t *testing.T) {
+	const filePath = "/shadow-reset.bin"
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+
+	wb := NewWriteBuffer(filePath, streamingWriteMaxSize, 0)
+	wb.uploadedParts = map[int]bool{1: true}
+	var staleCallbackCalls atomic.Int32
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		staleCallbackCalls.Add(1)
+	}
+	streamer := NewStreamUploader(nil, filePath, 0)
+	streamer.started = true
+	streamer.streamedParts[1] = true
+	streamer.pendingParts[1] = []byte("stale")
+
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       wb,
+		Streamer:    streamer,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+
+	fh.Lock()
+	abortStreamer, err := fs.truncateWritableHandleLocked(fh, 0)
+	fh.Unlock()
+	if err != nil {
+		t.Fatalf("truncateWritableHandleLocked: %v", err)
+	}
+	if abortStreamer == nil {
+		t.Fatal("abortStreamer is nil, want old streamer cleanup")
+	}
+	abortStreamer()
+
+	if fh.Streamer != nil {
+		t.Fatal("fh.Streamer should be cleared after zero truncate")
+	}
+	if wb.OnPartFull == nil {
+		t.Fatal("OnPartFull should be rebound for ShadowSpill eviction")
+	}
+	if len(wb.uploadedParts) != 0 {
+		t.Fatalf("uploadedParts len = %d, want 0", len(wb.uploadedParts))
+	}
+
+	fullPart := bytes.Repeat([]byte("s"), int(wb.PartSize()))
+	if _, err := wb.Write(0, fullPart); err != nil {
+		t.Fatalf("continued shadow write after truncate: %v", err)
+	}
+	if got := staleCallbackCalls.Load(); got != 0 {
+		t.Fatalf("stale OnPartFull calls = %d, want 0", got)
+	}
+	if !wb.uploadedParts[0] {
+		t.Fatal("ShadowSpill OnPartFull should evict and mark new part 0")
+	}
+	if wb.IsPartLoaded(0) {
+		t.Fatal("ShadowSpill continued write should evict full part from memory")
+	}
+}
+
+func TestAdoptPathTruncateZeroResetsStartedStreamerBeforeFlush(t *testing.T) {
+	const (
+		filePath  = "/created-stream.bin"
+		callerPID = 4242
+	)
+	var (
+		createCalls atomic.Int32
+		otherCalls  atomic.Int32
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+filePath && r.URL.Query().Get("create") == "1" {
+			createCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
+			return
+		}
+		otherCalls.Add(1)
+		http.Error(w, "unexpected request", http.StatusTeapot)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+
+	wb := NewWriteBuffer(filePath, streamingWriteMaxSize, 0)
+	if _, err := wb.Write(0, []byte("stale streamed bytes")); err != nil {
+		t.Fatal(err)
+	}
+	wb.uploadedParts = map[int]bool{0: true}
+	streamer := NewStreamUploader(fs.client, filePath, 0)
+	streamer.started = true
+	streamer.streamedParts[1] = true
+	streamer.pendingParts[1] = []byte("stale")
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    filePath,
+		Dirty:   wb,
+		OpenPID: callerPID,
+		IsNew:   true,
+		BaseRev: 0,
+		// Started streamer state must not survive path truncate adoption;
+		// otherwise flushHandle chooses FinishStreaming instead of empty create.
+		Streamer: streamer,
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, wb.Size())
+	fs.openHandles.Add(fh)
+	defer fs.openHandles.Remove(fh)
+
+	if !fs.adoptSingleCallerPathTruncate(filePath, callerPID) {
+		t.Fatal("path truncate was not adopted by same-caller handle")
+	}
+	if fh.Streamer != nil {
+		t.Fatal("fh.Streamer should be cleared after adopted path truncate")
+	}
+	if len(wb.uploadedParts) != 0 {
+		t.Fatalf("uploadedParts len = %d, want 0", len(wb.uploadedParts))
+	}
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("empty create calls = %d, want 1", got)
+	}
+	if got := otherCalls.Load(); got != 0 {
+		t.Fatalf("unexpected non-create calls = %d, want 0", got)
+	}
+}
+
 func TestFlushHandle_SerializesSamePathRemoteCommits(t *testing.T) {
 	var (
 		mu         sync.Mutex
@@ -13452,14 +13704,14 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	if fh.BaseRev != 2 {
 		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
 	}
-	if fh.Streamer == nil {
-		t.Fatal("expected stream uploader on O_TRUNC handle")
+	if fh.Streamer != nil {
+		t.Fatal("stream uploader should be reset after adopted zero truncate")
 	}
-	fh.Streamer.mu.Lock()
-	streamerRevision := fh.Streamer.expectedRevision
-	fh.Streamer.mu.Unlock()
-	if streamerRevision != 2 {
-		t.Fatalf("streamer expected revision after path truncate = %d, want 2", streamerRevision)
+	if fh.Dirty.OnPartFull != nil {
+		t.Fatal("streaming callback should be reset after adopted zero truncate")
+	}
+	if len(fh.Dirty.uploadedParts) != 0 {
+		t.Fatalf("uploadedParts len after path truncate = %d, want 0", len(fh.Dirty.uploadedParts))
 	}
 
 	if _, st = fs.Write(nil, &gofuse.WriteIn{

@@ -886,6 +886,13 @@ func (wb *WriteBuffer) ResetSequentialState(newSize int64) {
 	wb.sequential = true
 }
 
+// ResetStreamingState clears streaming-upload bookkeeping after a truncate
+// invalidates all previously streamed parts.
+func (wb *WriteBuffer) ResetStreamingState() {
+	wb.uploadedParts = make(map[int]bool)
+	wb.OnPartFull = nil
+}
+
 // EvictPart releases the memory for a 0-based part index after it has been
 // uploaded via streaming. The part is recorded in uploadedParts so that
 // subsequent reads/writes know it was already handled.
