@@ -2542,7 +2542,7 @@ func TestShadowSpill_AutoResolveGuard(t *testing.T) {
 	}
 
 	// Should not panic, should not attempt ReadAll, should go to terminal failure.
-	cq.tryAutoResolveConflict(entry)
+	cq.tryAutoResolveConflict(context.Background(), entry)
 
 	// Verify MarkConflict was called (terminal failure path).
 	meta, ok := idx.GetMeta(path)
@@ -2936,7 +2936,10 @@ func TestDiskReadCacheClosePreventsFutureAsyncPuts(t *testing.T) {
 
 func TestDiskReadCacheStartupRecoveryAndTempCleanup(t *testing.T) {
 	dir := t.TempDir()
-	cache, err := NewDiskReadCache(DiskReadCacheOptions{Dir: dir, MaxSize: 1 << 20, FreeRatio: 0})
+	// FreeRatio -1 disables the free-disk eviction: 0 maps to the 10% default,
+	// which evicts the recovered entry at startup on hosts with a nearly full
+	// disk and makes this test environment-dependent.
+	cache, err := NewDiskReadCache(DiskReadCacheOptions{Dir: dir, MaxSize: 1 << 20, FreeRatio: -1})
 	if err != nil {
 		t.Fatalf("NewDiskReadCache: %v", err)
 	}
@@ -2946,7 +2949,7 @@ func TestDiskReadCacheStartupRecoveryAndTempCleanup(t *testing.T) {
 		t.Fatalf("write temp entry: %v", err)
 	}
 
-	recovered, err := NewDiskReadCache(DiskReadCacheOptions{Dir: dir, MaxSize: 1 << 20, FreeRatio: 0})
+	recovered, err := NewDiskReadCache(DiskReadCacheOptions{Dir: dir, MaxSize: 1 << 20, FreeRatio: -1})
 	if err != nil {
 		t.Fatalf("recover DiskReadCache: %v", err)
 	}

@@ -3,6 +3,7 @@ package fuse
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -644,5 +645,56 @@ func TestShadowStoreCheckDiskSpaceThrottled(t *testing.T) {
 	// Verify initial diskOK state matches the real check.
 	if r1 != ss.CheckDiskSpace() {
 		t.Fatal("throttled result does not match real check")
+	}
+}
+
+// TestNewShadowStoreSweepsRetiredFiles verifies that retired shadows leaked
+// by a crashed process (pinned readers never unpinned) are removed at store
+// construction, while live .shadow files are preserved.
+func TestNewShadowStoreSweepsRetiredFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	ss, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.WriteFull("/keep.txt", []byte("keep"), 1); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a crash while a pinned reader held a retired shadow.
+	gen := ss.Pin("/keep.txt")
+	if gen == 0 {
+		t.Fatal("pin failed")
+	}
+	ss.Remove("/keep.txt") // pinned → retired on disk
+	if err := ss.WriteFull("/live.txt", []byte("live"), 1); err != nil {
+		t.Fatal(err)
+	}
+	ss.Close() // crash: Unpin never runs
+
+	leftover, err := filepath.Glob(filepath.Join(dir, "*.retired.*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftover) != 1 {
+		t.Fatalf("test setup: expected 1 leaked retired file, got %d", len(leftover))
+	}
+
+	// "Remount": construction sweeps the leak, keeps live shadows.
+	ss2, err := NewShadowStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss2.Close()
+
+	leftover, err = filepath.Glob(filepath.Join(dir, "*.retired.*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftover) != 0 {
+		t.Errorf("retired files not swept: %v", leftover)
+	}
+	if !ss2.Has("/live.txt") {
+		t.Error("live shadow was swept")
 	}
 }

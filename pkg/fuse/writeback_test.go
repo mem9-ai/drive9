@@ -2494,6 +2494,145 @@ func TestFsyncInteractiveStageEnqueuesBeforeReleasingPath(t *testing.T) {
 	}
 }
 
+// TestFsyncInteractiveWALFrameDurableBeforeEnqueue pins the crash-recovery
+// ordering invariant: the JournalFsync frame must be durable BEFORE the staged
+// commit becomes visible to the commit queue. If the order is reversed, a fast
+// worker can upload and append its JournalCommit marker first, the fsync frame
+// then gets a higher Seq, and replay resurrects a path whose upload already
+// completed.
+//
+// The test simulates a slow WAL device by holding the journal mutex: while the
+// append cannot complete, the entry must not appear in the queue. Both
+// interactive branches (ShadowSpill and regular staged) are covered.
+func TestFsyncInteractiveWALFrameDurableBeforeEnqueue(t *testing.T) {
+	t.Run("shadowspill", func(t *testing.T) { testFsyncWALFrameDurableBeforeEnqueue(t, true) })
+	t.Run("regular", func(t *testing.T) { testFsyncWALFrameDurableBeforeEnqueue(t, false) })
+}
+
+func testFsyncWALFrameDurableBeforeEnqueue(t *testing.T, spill bool) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no remote traffic expected", http.StatusInternalServerError)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncInteractive}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	journal, err := NewJournal(filepath.Join(t.TempDir(), "order.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = journal.Close() }()
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.journal = journal
+	fs.commitQueue = &CommitQueue{
+		maxPending:   4,
+		shadows:      shadow,
+		index:        pending,
+		journal:      journal,
+		inFlight:     make(map[string]*CommitEntry),
+		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
+		workCh:       make(chan *CommitEntry, 8),
+	}
+
+	const remotePath = "/wal-order.bin"
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_RDWR | syscall.O_CREAT),
+	}, "wal-order.bin", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create: %v", st)
+	}
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+	}, []byte("ordering invariant bytes")); st != gofuse.OK {
+		t.Fatalf("Write: %v", st)
+	}
+	if !spill {
+		// Freshly created handles default to ShadowSpill; force the
+		// regular staged branch (small dirty buffer materialized to the
+		// shadow at fsync time).
+		fh, ok := fs.fileHandles.Get(createOut.Fh)
+		if !ok {
+			t.Fatal("created handle missing")
+		}
+		fh.Lock()
+		fh.ShadowSpill = false
+		fh.Unlock()
+	}
+
+	// Block the WAL append; Fsync must not hand the commit to the queue
+	// until the frame is on disk.
+	journal.mu.Lock()
+	fsyncDone := make(chan gofuse.Status, 1)
+	go func() {
+		fsyncDone <- fs.Fsync(nil, &gofuse.FsyncIn{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+			Fh:       createOut.Fh,
+		})
+	}()
+	start := time.Now()
+	for time.Since(start) < 300*time.Millisecond {
+		if fs.commitQueue.HasPath(remotePath) {
+			journal.mu.Unlock()
+			t.Fatal("staged commit visible to the queue before its JournalFsync frame was durable")
+		}
+		select {
+		case st := <-fsyncDone:
+			journal.mu.Unlock()
+			t.Fatalf("Fsync returned %v while the WAL append was blocked", st)
+		default:
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	journal.mu.Unlock()
+
+	if st := <-fsyncDone; st != gofuse.OK {
+		t.Fatalf("Fsync: %v", st)
+	}
+	if !fs.commitQueue.HasPath(remotePath) {
+		t.Fatal("staged commit not enqueued after the WAL append completed")
+	}
+	var fsyncSeq uint64
+	if err := journal.Replay(func(e JournalEntry) {
+		if e.Op == JournalFsync && e.Path == remotePath {
+			fsyncSeq = e.Seq
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if fsyncSeq == 0 {
+		t.Fatal("JournalFsync frame missing after Fsync returned")
+	}
+
+	// The async commit marker (what onCommitSuccess appends) now necessarily
+	// gets a higher Seq, so replay must NOT resurrect the committed path.
+	mustAppend(t, journal, JournalEntry{Op: JournalCommit, Path: remotePath})
+	mustFsync(t, journal)
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(journal, idx); err != nil {
+		t.Fatal(err)
+	}
+	if idx.HasPending(remotePath) {
+		t.Fatal("replay resurrected a committed path: commit marker did not supersede the fsync frame")
+	}
+}
+
 func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.T) {
 	const filePath = "/fsync-rewrite.bin"
 	first := []byte("first")
@@ -2609,6 +2748,59 @@ func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.
 			w.WriteHeader(http.StatusOK)
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
 			return
+		case r.Method == http.MethodPatch && r.URL.Path == "/v1/fs"+filePath:
+			var req struct {
+				NewSize int64 `json:"new_size"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode patch request: %v", err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if req.NewSize != int64(len(wantFinal)) {
+				t.Errorf("patch new_size = %d, want %d", req.NewSize, len(wantFinal))
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id": "patch-1",
+				"part_size": req.NewSize,
+				"upload_parts": []map[string]any{{
+					"number":   1,
+					"url":      ts.URL + "/patch/patch-1/1",
+					"size":     req.NewSize,
+					"read_url": ts.URL + "/patch-read",
+				}},
+			})
+			return
+		case r.Method == http.MethodGet && r.URL.Path == "/patch-read":
+			mu.Lock()
+			data := append([]byte(nil), remote[filePath]...)
+			mu.Unlock()
+			_, _ = w.Write(data)
+			return
+		case r.Method == http.MethodPut && r.URL.Path == "/patch/patch-1/1":
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			uploads["patch-1"] = &uploadState{path: filePath, size: int64(len(body)), body: append([]byte(nil), body...)}
+			mu.Unlock()
+			w.Header().Set("ETag", "etag-patch")
+			w.WriteHeader(http.StatusOK)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/uploads/patch-1/complete":
+			mu.Lock()
+			state := uploads["patch-1"]
+			if state == nil || len(state.body) == 0 {
+				mu.Unlock()
+				t.Errorf("patch complete before body")
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			remote[filePath] = append([]byte(nil), state.body...)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			return
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+filePath:
 			body, _ := io.ReadAll(r.Body)
 			mu.Lock()
@@ -2655,6 +2847,7 @@ func TestFsyncQueuedCommitSameOpenHandleWritePreservesCommittedBytes(t *testing.
 	opts := &MountOptions{FlushDebounce: 0, SyncMode: SyncInteractive}
 	opts.setDefaults()
 	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
 	fs := NewDat9FS(c, opts)
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
@@ -3005,6 +3198,9 @@ func TestFsyncShadowSpillCommitRefreshesRevisionAndClearsPending(t *testing.T) {
 	if shadow.Has(filePath) {
 		t.Fatal("shadow should be cleared after remote-durable fsync")
 	}
+	if cached, ok := fs.readCache.Get(filePath, 1); !ok || string(cached) != "first journal frame" {
+		t.Fatalf("read cache after first fsync = %q, ok=%t; want first journal frame", cached, ok)
+	}
 
 	if _, st := fs.Write(nil, &gofuse.WriteIn{
 		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
@@ -3021,6 +3217,9 @@ func TestFsyncShadowSpillCommitRefreshesRevisionAndClearsPending(t *testing.T) {
 	}
 	if fh.BaseRev != 2 {
 		t.Fatalf("BaseRev after second fsync = %d, want 2", fh.BaseRev)
+	}
+	if cached, ok := fs.readCache.Get(filePath, 2); !ok || string(cached) != "second journal frame" {
+		t.Fatalf("read cache after second fsync = %q, ok=%t; want second journal frame", cached, ok)
 	}
 
 	mu.Lock()
@@ -3141,6 +3340,28 @@ func newShadowSpillFallbackRecorder(t *testing.T, wantPath string, chmodStatus i
 				status = http.StatusOK
 			}
 			w.WriteHeader(status)
+			return
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs"+rec.wantPath:
+			gotExpected, err := strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				t.Fatalf("expected revision header: %v", err)
+			}
+			if gotExpected != 0 {
+				t.Fatalf("expected_revision = %d, want 0", gotExpected)
+			}
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read direct PUT body: %v", err)
+			}
+			if len(body) == 0 {
+				t.Fatal("direct PUT body should not be empty")
+			}
+			rec.mu.Lock()
+			rec.uploadCount++
+			rec.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 1})
 			return
 		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
 			var req struct {

@@ -8,8 +8,9 @@ on:
         type: choice
         options:
           - all
-          - ap-southeast-1
-          - us-east-1
+          - aws-ap-southeast-1
+          - aws-us-east-1
+          - alicloud-ap-southeast-1
       image_tag:
         description: "Image tag override (default: resolve from dev deployment)"
         required: false
@@ -30,7 +31,7 @@ jobs:
       contents: read
 
     steps:
-      - name: Configure AWS credentials (ap-southeast-1)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ASSUME_ARN_PROD }}
@@ -66,9 +67,9 @@ jobs:
           echo "Promoting image: $IMAGE"
           printf '%s=%s\n' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
 
-      - name: Deploy to ap-southeast-1
+      - name: Deploy to aws-ap-southeast-1
         id: deploy-sg
-        if: inputs.region == 'all' || inputs.region == 'ap-southeast-1'
+        if: inputs.region == 'all' || inputs.region == 'aws-ap-southeast-1'
         run: |
           echo "sg-deploy=1" >> "$GITHUB_ENV"
           aws eks update-kubeconfig \
@@ -82,22 +83,15 @@ jobs:
             rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
             --timeout=180s
 
-      - name: Rollback ap-southeast-1 on failure
+      - name: Rollback aws-ap-southeast-1 on failure
         if: failure() && steps.deploy-sg.outcome == 'failure'
         run: |
           kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
 
-      - name: Configure AWS credentials (us-east-1)
-        if: inputs.region == 'all' || inputs.region == 'us-east-1'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ASSUME_ARN_US }}
-          aws-region: us-east-1
-
-      - name: Deploy to us-east-1
+      - name: Deploy to aws-us-east-1
         id: deploy-us
-        if: inputs.region == 'all' || inputs.region == 'us-east-1'
+        if: inputs.region == 'all' || inputs.region == 'aws-us-east-1'
         run: |
           echo "us-deploy=1" >> "$GITHUB_ENV"
           aws eks update-kubeconfig \
@@ -111,8 +105,51 @@ jobs:
             rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
             --timeout=180s
 
-      - name: Rollback us-east-1 on failure
+      - name: Rollback aws-us-east-1 on failure
         if: failure() && steps.deploy-us.outcome == 'failure'
         run: |
           kubectl --context us -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
+
+      - name: Configure Alibaba Cloud credentials
+        if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
+        uses: aliyun/configure-aliyun-credentials-action@v1
+        with:
+          role-to-assume: ${{ secrets.ALIYUN_ASSUME_ROLE_ARN }}
+          oidc-provider-arn: ${{ secrets.ALIYUN_OIDC_PROVIDER_ARN }}
+
+      - name: Push image to alicloud-ap-southeast-1 ACR
+        if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
+        run: |
+          curl -fsSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz | tar xz -C /usr/local/bin
+          aliyun configure set --region ap-southeast-1 --access-key-id "$ALIBABA_CLOUD_ACCESS_KEY_ID" --access-key-secret "$ALIBABA_CLOUD_ACCESS_KEY_SECRET" --sts-token "$ALIBABA_CLOUD_SECURITY_TOKEN" --mode StsToken --profile github-actions
+          aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin "${{ env.ECR_REGISTRY }}"
+          docker pull "$IMAGE"
+          TAG=$(echo "$IMAGE" | awk -F: '{print $NF}')
+          ACR_IMAGE="${{ secrets.ALIYUN_ACR_REGISTRY }}/${{ secrets.ALIYUN_ACR_NAMESPACE }}/${{ env.ECR_REPOSITORY }}:$TAG"
+          docker tag "$IMAGE" "$ACR_IMAGE"
+          AUTH=$(aliyun --profile github-actions cr GetAuthorizationToken --InstanceId "${{ secrets.ALIYUN_ACR_INSTANCE_ID }}" --RegionId ap-southeast-1 | jq -r '.AuthorizationToken')
+          echo "$AUTH" | docker login --username=cr_temp_user --password-stdin "${{ secrets.ALIYUN_ACR_REGISTRY }}"
+          docker push "$ACR_IMAGE"
+          echo "ACR_IMAGE=$ACR_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy to alicloud-ap-southeast-1
+        id: deploy-alicloud
+        if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
+        run: |
+          mkdir -p ~/.kube
+          aliyun --profile github-actions cs GET "/k8s/c4dad0ecde1e94472a36fec0498e181ed/user_config" --region ap-southeast-1 | jq -r '.config' > ~/.kube/alicloud-config
+          kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
+            set image "deployment/${{ env.K8S_DEPLOYMENT }}" \
+            "${{ env.K8S_DEPLOYMENT }}=$ACR_IMAGE"
+          kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
+            rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
+            --timeout=180s
+
+      - name: Rollback alicloud-ap-southeast-1 on failure
+        if: failure() && steps.deploy-alicloud.outcome == 'failure'
+        run: |
+          if [ -f ~/.kube/alicloud-config ]; then
+            kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
+              rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
+          fi

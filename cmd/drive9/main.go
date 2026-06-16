@@ -18,6 +18,7 @@
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
 //	doctor  diagnose local drive9 runtime prerequisites
+//	update  update the drive9 CLI binary in place
 package main
 
 import (
@@ -52,6 +53,7 @@ var packHandler = cli.PackCommand
 var unpackHandler = cli.UnpackCommand
 var profileHandler = cli.Profile
 var umountHandler = cli.UmountCmd
+var updateHandler = cli.Update
 
 func main() {
 	if logger.CLIEnabled() {
@@ -229,6 +231,13 @@ func dispatch(cmd string, args []string) {
 		if err := doctorHandler(args); err != nil {
 			fatal("doctor", err)
 		}
+	case "update":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "update"))
+		}
+		if err := updateHandler(args); err != nil {
+			fatal("update", err)
+		}
 	default:
 		if cliLogger != nil {
 			logger.Warn(context.Background(), "cli_unknown_command", zap.String("command", cmd))
@@ -353,7 +362,8 @@ func usage(code int) {
 			"                         add delegated context\n"+
 			"  ctx fork [<new>] [--from <ctx>] [--json]\n"+
 			"                         create a copy-on-write fork context\n"+
-			"  ctx ls [-l|--json]     list contexts\n"+
+			"  ctx ls [-l|--long] [-D|--details] [--json] [--type <kind>|--scoped]\n"+
+			"                         list contexts\n"+
 			"  ctx use <name>         activate context\n"+
 			"  ctx rm <name>          delete context\n"+
 			"  fs <command>           filesystem operations\n"+
@@ -375,7 +385,8 @@ func usage(code int) {
 			"  mount vault [flags] <mountpoint>\n"+
 			"                         mount vault secrets read-only\n"+
 			"  umount <mountpoint>    unmount a drive9 mount\n"+
-			"  doctor fuse            diagnose local FUSE prerequisites\n\n"+
+			"  doctor fuse            diagnose local FUSE prerequisites\n"+
+			"  update [--check]       update drive9 CLI in place\n\n"+
 			"global:\n"+
 			"  -h, --help, help       show this help\n"+
 			"  -v, --version, version print version information\n",

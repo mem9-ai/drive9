@@ -52,6 +52,40 @@ func TestPoolAcquireInvalidateDefersCloseUntilRelease(t *testing.T) {
 	release2()
 }
 
+func TestCleanStorageNamespaceLocalPrefixRejectsUnsafeSegments(t *testing.T) {
+	tests := []struct {
+		name    string
+		prefix  string
+		want    string
+		wantErr bool
+	}{
+		{name: "normal", prefix: "tenant/abc", want: "tenant/abc"},
+		{name: "trim", prefix: "tenant/abc/", want: "tenant/abc"},
+		{name: "empty", prefix: "", wantErr: true},
+		{name: "absolute", prefix: "/tmp/tenant", wantErr: true},
+		{name: "parent", prefix: "tenant/../other", wantErr: true},
+		{name: "dot", prefix: "tenant/./other", wantErr: true},
+		{name: "empty segment", prefix: "tenant//other", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := cleanStorageNamespaceLocalPrefix(tc.prefix)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("cleanStorageNamespaceLocalPrefix(%q) error = nil, want error", tc.prefix)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("cleanStorageNamespaceLocalPrefix(%q): %v", tc.prefix, err)
+			}
+			if got != tc.want {
+				t.Fatalf("cleanStorageNamespaceLocalPrefix(%q) = %q, want %q", tc.prefix, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPoolAcquireEvictionRetiresPinnedEntry(t *testing.T) {
 	pool, tenantA := newTestPoolAndTenant(t, 1, "tenant-a")
 	ctx := context.Background()

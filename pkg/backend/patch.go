@@ -188,17 +188,6 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	sourceKey := nf.File.StorageRef
 	origSize := nf.File.SizeBytes
 
-	// Enforce one active upload per path
-	existing, err := b.activeUploadByPath(ctx, path)
-	if err != nil {
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
-		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
-	}
-	if existing != nil {
-		metrics.RecordOperation("backend", "patch_upload", "conflict", time.Since(start))
-		return nil, datastore.ErrUploadConflict
-	}
-
 	// Use client-provided part size if valid (>= MinPartSize); otherwise
 	// fall back to fixed 8 MiB for backward compatibility with old clients
 	// that compute dirty_parts at fixed 8 MiB boundaries.
@@ -221,7 +210,11 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	newS3Key := "blobs/" + fileID
 	encOpts, encMode, encKeyID := b.s3WriteEncryption(newS3Key)
 
-	mpu, err := b.s3.CreateMultipartUpload(ctx, newS3Key, s3client.ChecksumAlgoSHA256, encOpts)
+	// Use ChecksumAlgoNone: patch parts are assembled client-side after
+	// presigning, so the checksum is not known at presign time.  Declaring
+	// SHA-256 here would force every UploadPart to carry the header, but
+	// the presigned URL does not sign it — causing S3 403/400.  See #555.
+	mpu, err := b.s3.CreateMultipartUpload(ctx, newS3Key, s3client.ChecksumAlgoNone, encOpts)
 	if err != nil {
 		logger.Error(ctx, "backend_patch_upload_create_mpu_failed", zap.String("path", path), zap.Error(err))
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
@@ -266,7 +259,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			plan.CopiedParts = append(plan.CopiedParts, p.Number)
 		} else {
 			// Dirty part or new part beyond original → client must upload
-			u, err := b.s3.PresignUploadPart(ctx, newS3Key, mpu.UploadID, p.Number, p.Size, s3client.ChecksumAlgoSHA256, "", s3client.UploadTTL)
+			u, err := b.s3.PresignUploadPart(ctx, newS3Key, mpu.UploadID, p.Number, p.Size, s3client.ChecksumAlgoNone, "", s3client.UploadTTL)
 			if err != nil {
 				_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
 				logger.Error(ctx, "backend_patch_upload_presign_failed", zap.String("path", path), zap.Int("part", p.Number), zap.Error(err))
@@ -319,6 +312,30 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
 		metrics.RecordOperation("backend", "patch_upload", "quota_exceeded", time.Since(start))
 		return nil, err
+	}
+
+	// One active upload per path: supersede rather than 409 so dead sessions
+	// can't block the path (see supersedeActiveUpload). Do this only after
+	// part-size validation and S3 copy/presign setup have succeeded, so a
+	// malformed replacement request does not tear down a healthy session.
+	existing, err := b.activeUploadByPath(ctx, path)
+	if err != nil {
+		if reserved {
+			b.abortUploadReservation(ctx, uploadID, newSize)
+		}
+		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
+		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
+	}
+	if existing != nil {
+		if err := b.supersedeActiveUpload(ctx, "patch_upload", existing); err != nil {
+			if reserved {
+				b.abortUploadReservation(ctx, uploadID, newSize)
+			}
+			_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
+			metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
+		}
 	}
 
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {

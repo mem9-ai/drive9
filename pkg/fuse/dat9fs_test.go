@@ -392,12 +392,16 @@ func TestFlushHandlePatchAfterLazyTruncatePreservesRemotePrefix(t *testing.T) {
 	fh.Unlock()
 
 	fh.Lock()
-	if err := fs.truncateWritableHandleLocked(fh, newSize); err != nil {
+	abortStreamer, err := fs.truncateWritableHandleLocked(fh, newSize)
+	if err != nil {
 		fh.Unlock()
 		t.Fatalf("truncateWritableHandleLocked: %v", err)
 	}
 	st := fs.flushHandle(context.Background(), fh)
 	fh.Unlock()
+	if abortStreamer != nil {
+		abortStreamer()
+	}
 	if st != gofuse.OK {
 		t.Fatalf("flushHandle status = %v, want OK", st)
 	}
@@ -962,6 +966,127 @@ func TestReadCacheCachesMediumSmallFileAfterFirstRead(t *testing.T) {
 	}
 	if got := getCalls.Load(); got != 1 {
 		t.Fatalf("GET calls = %d, want 1", got)
+	}
+}
+
+// A 2MiB file sits above the old 1MiB whole-file threshold and below the
+// current default: its cold read must be one whole-file GET (no Range
+// header, no prefetcher) instead of block-split range reads.
+func TestReadTwoMiBFileUsesSingleWholeFileRequest(t *testing.T) {
+	data := bytes.Repeat([]byte("y"), 2<<20)
+	var getCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			getCalls.Add(1)
+			if got := r.Header.Get("Range"); got != "" {
+				http.Error(w, "unexpected range request: "+got, http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+			_, _ = w.Write(data)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(client.New(ts.URL, ""), opts)
+
+	const rev = 11
+	ino := fs.inodes.Lookup("/bench.bin", false, int64(len(data)), time.Now())
+	fs.inodes.UpdateRevision(ino, rev)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_RDONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("file handle not found")
+	}
+	if fh.Prefetch != nil {
+		t.Fatal("expected no Prefetcher for a file within the whole-file read threshold")
+	}
+
+	got, st, err := readDat9FSTestRange(fs, ino, out.Fh, 0, 128<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[:128<<10]) {
+		t.Fatalf("first read status = %v, len = %d; want OK with 128KiB prefix", st, len(got))
+	}
+	got, st, err = readDat9FSTestRange(fs, ino, out.Fh, int64(len(data))-(128<<10), 128<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[len(data)-(128<<10):]) {
+		t.Fatalf("second read status = %v, len = %d; want OK with 128KiB suffix", st, len(got))
+	}
+	if calls := getCalls.Load(); calls != 1 {
+		t.Fatalf("GET calls = %d, want 1 whole-file request", calls)
+	}
+}
+
+// Whole-file reads must persist into the disk read cache so warm reads
+// after ReadCache TTL expiry or eviction are served from local disk
+// instead of re-fetching from the remote.
+func TestReadWholeFilePopulatesDiskReadCacheTier(t *testing.T) {
+	const (
+		path = "/file.bin"
+		rev  = int64(7)
+	)
+	data := bytes.Repeat([]byte("z"), 2<<20)
+	var objectReads atomic.Int32
+
+	fs, ino, cleanup := newTestDat9FSWithRangeObject(t, int64(len(data)), func(w http.ResponseWriter, r *http.Request) {
+		objectReads.Add(1)
+		if got := r.Header.Get("Range"); got != "" {
+			http.Error(w, "unexpected range request: "+got, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		_, _ = w.Write(data)
+	})
+	defer cleanup()
+	fs.diskReadCache = newTestDiskReadCache(t, 8<<20)
+	fs.inodes.UpdateRevision(ino, rev)
+	fh := openDat9FSTestHandle(t, fs, ino, path)
+	defer fs.fileHandles.Delete(fh)
+	key, ok := fs.diskReadCacheKey(path, mustGetInodeEntry(t, fs, ino), 0, int64(len(data)))
+	if !ok {
+		t.Fatal("disk read cache key unavailable")
+	}
+
+	got, st, err := readDat9FSTestRange(fs, ino, fh, 0, 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[:64<<10]) {
+		t.Fatalf("first read status = %v, len = %d; want OK", st, len(got))
+	}
+	waitForDiskReadCacheEntry(t, fs.diskReadCache, key)
+
+	// Simulate ReadCache TTL expiry/eviction: the next read must be served
+	// from the disk tier without another remote fetch.
+	fs.readCache.InvalidateAll()
+
+	got, st, err = readDat9FSTestRange(fs, ino, fh, int64(len(data))-(64<<10), 64<<10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != gofuse.OK || !bytes.Equal(got, data[len(data)-(64<<10):]) {
+		t.Fatalf("disk-tier read status = %v, len = %d; want OK", st, len(got))
+	}
+	if calls := objectReads.Load(); calls != 1 {
+		t.Fatalf("object reads = %d, want 1 (second read must come from disk tier)", calls)
 	}
 }
 
@@ -5781,7 +5906,7 @@ func TestIsTransientLookupErr_Treats499AsTransient(t *testing.T) {
 }
 
 func TestOpenReadOnlyLargeFileGetsPrefetcher(t *testing.T) {
-	size := int64(2 * 1024 * 1024) // above default read-cache admission limit
+	size := int64(defaultReadCacheMaxFileSize + 1024) // above default read-cache admission limit
 	data := make([]byte, size)
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -7559,6 +7684,57 @@ func TestOpenWritablePreloadSkipsCleanSiblingReboundToNewRevision(t *testing.T) 
 	}
 	if fs.loadWritableHandleFromOpenHandleLocked(target) {
 		t.Fatal("clean sibling rebound to a newer revision must not be used as preload data")
+	}
+	if got := target.Dirty.Size(); got != 0 {
+		t.Fatalf("target dirty size = %d, want 0", got)
+	}
+}
+
+func TestOpenWritablePreloadSkipsCleanOldRevisionShadowHandle(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	fs.shadowStore = shadow
+
+	const filePath = "/tier-transition.bin"
+	stale := bytes.Repeat([]byte{0x5a}, 64*1024)
+	ino := fs.inodes.Lookup(filePath, false, int64(len(stale)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.inodes.UpdateSize(ino, 0)
+	fs.inodes.UpdateRevision(ino, 8)
+	if err := shadow.WriteFull(filePath, stale, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	sibling := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize:    int64(len(stale)),
+		BaseRev:     7,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+	if _, err := sibling.Dirty.Write(0, stale); err != nil {
+		t.Fatal(err)
+	}
+	sibling.Dirty.ClearDirty()
+	fs.openHandles.Add(sibling)
+
+	target := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    fs.newWriteBuffer(filePath, maxPreloadSize, 0),
+		OrigSize: 0,
+		BaseRev:  8,
+	}
+	if fs.loadWritableHandleFromOpenHandleLocked(target) {
+		t.Fatal("clean old-revision sibling shadow must not be used as preload data")
 	}
 	if got := target.Dirty.Size(); got != 0 {
 		t.Fatalf("target dirty size = %d, want 0", got)
@@ -9996,6 +10172,1201 @@ func TestSetAttr_TruncateWithoutHandleRefreshesRevision(t *testing.T) {
 	}
 }
 
+func TestSetAttr_WriteBackInteractivePathTruncateStagesAndReturnsBeforeRemoteCommit(t *testing.T) {
+	putStarted := make(chan struct{})
+	releasePut := make(chan struct{})
+	var putOnce sync.Once
+	var putBody []byte
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			putBody = append([]byte(nil), body...)
+			putOnce.Do(func() { close(putStarted) })
+			<-releasePut
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 2})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	fs.syncMode = SyncInteractive
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.PathLock = fs.lockRemoteCommitPath
+	cq.OnSuccess = fs.onCommitQueueSuccess
+	cq.OnCleanup = fs.onCommitQueueCleanup
+	fs.commitQueue = cq
+	defer cq.DrainAll()
+
+	ino := fs.inodes.Lookup("/file.bin", false, 42, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		var out gofuse.AttrOut
+		done <- fs.SetAttr(nil, &gofuse.SetAttrIn{
+			SetAttrInCommon: gofuse.SetAttrInCommon{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Valid:    gofuse.FATTR_SIZE,
+				Size:     0,
+			},
+		}, &out)
+	}()
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("SetAttr status = %v, want OK", st)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("SetAttr blocked on remote zero-byte commit")
+	}
+
+	meta, ok := pending.GetMeta("/file.bin")
+	if !ok {
+		t.Fatal("pending truncate metadata missing")
+	}
+	if meta.Size != 0 || meta.Kind != PendingOverwrite || meta.BaseRev != 1 {
+		t.Fatalf("pending meta = %+v, want zero-byte overwrite at base rev 1", meta)
+	}
+	if !shadow.Has("/file.bin") {
+		t.Fatal("shadow missing for staged truncate")
+	}
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry missing")
+	}
+	if entry.Size != 0 {
+		t.Fatalf("inode size = %d, want 0", entry.Size)
+	}
+
+	select {
+	case <-putStarted:
+	case <-time.After(time.Second):
+		t.Fatal("async zero-byte commit did not start")
+	}
+	close(releasePut)
+	cq.DrainAll()
+	if len(putBody) != 0 {
+		t.Fatalf("remote truncate body = %q, want empty", string(putBody))
+	}
+	if pending.HasPending("/file.bin") {
+		t.Fatal("pending truncate still present after commit")
+	}
+	if shadow.Has("/file.bin") {
+		t.Fatal("shadow still present after commit")
+	}
+}
+
+func TestSetAttr_WriteBackPathTruncateAdoptsSingleCallerWriter(t *testing.T) {
+	const callerPID = 5151
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   8,
+		queue:        []*CommitEntry{},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+		workCh:       make(chan *CommitEntry, 16),
+	}
+
+	const path = "/tier-transition.bin"
+	const baseRev int64 = 7
+	ino := fs.inodes.Lookup(path, false, 8*1024*1024, time.Now())
+	fs.inodes.UpdateRevision(ino, baseRev)
+	fs.inodes.UpdateSize(ino, 8*1024*1024)
+
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        path,
+		Flags:       uint32(syscall.O_WRONLY),
+		OpenPID:     callerPID,
+		Dirty:       fs.newWriteBuffer(path, maxPreloadSize, 0),
+		OrigSize:    8 * 1024 * 1024,
+		BaseRev:     baseRev,
+		WritePolicy: WritePolicyWriteBack,
+	}
+	if err := fh.Dirty.Truncate(8 * 1024 * 1024); err != nil {
+		t.Fatal(err)
+	}
+	fh.Dirty.ClearDirty()
+	fhID := fs.allocateFileHandle(fh)
+	defer fs.deleteFileHandle(fhID, fh)
+
+	var attrOut gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino, Caller: gofuse.Caller{Pid: callerPID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if !fh.ZeroBase {
+		t.Fatal("same-caller writer did not adopt zero base")
+	}
+	if got := fh.Dirty.Size(); got != 0 {
+		t.Fatalf("dirty size after staged truncate = %d, want 0", got)
+	}
+	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+		t.Fatalf("dirty truncate not marked: dirtySeq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+
+	finalData := bytes.Repeat([]byte{0x59}, 10*1024)
+	if _, err := fh.Dirty.Write(0, finalData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	if got := fh.Dirty.Size(); got != int64(len(finalData)) {
+		t.Fatalf("dirty size after write = %d, want %d", got, len(finalData))
+	}
+	if err := fs.stageShadowLocked(fh, true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, finalData) {
+		t.Fatalf("shadow content mismatch after staged truncate writer adoption: got len=%d want len=%d", len(got), len(finalData))
+	}
+}
+
+func TestSetAttr_WriteBackPathTruncateAdoptsCreatedSameCallerWriter(t *testing.T) {
+	const callerPID = 6161
+	var createCalls atomic.Int32
+	var putCalls atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/fs/created.bin" && r.URL.RawQuery == "create=1":
+			createCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 1})
+		case r.Method == http.MethodPut:
+			putCalls.Add(1)
+			http.Error(w, "unexpected PUT", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   8,
+		queue:        []*CommitEntry{},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+		workCh:       make(chan *CommitEntry, 16),
+	}
+
+	var createOut gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1, Caller: gofuse.Caller{Pid: callerPID}},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     defaultRegularFileMode,
+	}, "created.bin", &createOut)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	fh, ok := fs.fileHandles.Get(createOut.Fh)
+	if !ok {
+		t.Fatal("created file handle missing")
+	}
+	if fh.OpenPID != callerPID {
+		t.Fatalf("created file handle OpenPID = %d, want %d", fh.OpenPID, callerPID)
+	}
+
+	oldData := bytes.Repeat([]byte{0x41}, 64*1024)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: createOut.NodeId},
+		Fh:       createOut.Fh,
+		Offset:   0,
+	}, oldData); st != gofuse.OK {
+		t.Fatalf("Write old data status = %v, want OK", st)
+	}
+
+	var attrOut gofuse.AttrOut
+	st = fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: createOut.NodeId, Caller: gofuse.Caller{Pid: callerPID}},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &attrOut)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if !fh.ZeroBase {
+		t.Fatal("created same-caller writer did not adopt zero base")
+	}
+	if got := fh.Dirty.Size(); got != 0 {
+		t.Fatalf("dirty size after staged truncate = %d, want 0", got)
+	}
+	if fh.DirtySeq == 0 || !fh.Dirty.HasDirtyParts() {
+		t.Fatalf("dirty truncate not marked: dirtySeq=%d dirty=%t", fh.DirtySeq, fh.Dirty.HasDirtyParts())
+	}
+	if fs.commitQueue.HasPath("/created.bin") {
+		t.Fatal("created truncate queued invalid path overwrite commit")
+	}
+	if meta, ok := pending.GetMeta("/created.bin"); ok {
+		t.Fatalf("pending meta after created truncate = %+v, want no path-level overwrite", meta)
+	}
+
+	fh.Lock()
+	kind := fs.pendingKindForHandle(fh)
+	baseRev := fs.expectedRevisionForHandleLocked(fh)
+	fh.Unlock()
+	if kind != PendingNew || baseRev != 0 {
+		t.Fatalf("created truncate handle commit state = kind %v baseRev %d, want PendingNew baseRev 0", kind, baseRev)
+	}
+
+	gotShadow, err := shadow.ReadAll("/created.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotShadow) != 0 {
+		t.Fatalf("shadow content after staged truncate len=%d, want 0", len(gotShadow))
+	}
+
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: createOut.Fh})
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("remote empty create calls = %d, want 1", got)
+	}
+	if got := putCalls.Load(); got != 0 {
+		t.Fatalf("remote PUT calls = %d, want 0", got)
+	}
+	if pending.HasPending("/created.bin") {
+		t.Fatal("pending state remains after release")
+	}
+	if shadow.Has("/created.bin") {
+		t.Fatal("shadow remains after release")
+	}
+}
+
+func TestSetAttr_WriteBackPathTruncateSkipsDefaultInheritedMode(t *testing.T) {
+	fs, shadow, pending := newWriteBackPathTruncateModeTestFS(t)
+
+	const path = "/file.bin"
+	ino := fs.inodes.Lookup(path, false, 4096, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.inodes.UpdateMode(ino, defaultRegularFileMode)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+	if out.Size != 0 {
+		t.Fatalf("out.Size = %d, want 0", out.Size)
+	}
+	if !shadow.Has(path) {
+		t.Fatal("shadow missing for staged truncate")
+	}
+
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending truncate metadata missing")
+	}
+	if meta.HasMode {
+		t.Fatalf("pending mode = has:%t mode:%o, want has:false for inherited default mode", meta.HasMode, meta.Mode)
+	}
+
+	commit := singleQueuedCommitForPath(t, fs.commitQueue, path)
+	if commit.HasMode {
+		t.Fatalf("queued commit mode = has:%t mode:%o, want has:false for inherited default mode", commit.HasMode, commit.Mode)
+	}
+}
+
+func TestSetAttr_WriteBackPathTruncatePreservesNonDefaultInheritedMode(t *testing.T) {
+	fs, _, pending := newWriteBackPathTruncateModeTestFS(t)
+
+	const path = "/private.bin"
+	ino := fs.inodes.Lookup(path, false, 4096, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fs.inodes.UpdateMode(ino, 0o600)
+
+	var out gofuse.AttrOut
+	st := fs.SetAttr(nil, &gofuse.SetAttrIn{
+		SetAttrInCommon: gofuse.SetAttrInCommon{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Valid:    gofuse.FATTR_SIZE,
+			Size:     0,
+		},
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("SetAttr status = %v, want OK", st)
+	}
+
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending truncate metadata missing")
+	}
+	if !meta.HasMode || meta.Mode&0o777 != 0o600 {
+		t.Fatalf("pending mode = has:%t mode:%o, want has:true mode:0600", meta.HasMode, meta.Mode&0o777)
+	}
+
+	commit := singleQueuedCommitForPath(t, fs.commitQueue, path)
+	if !commit.HasMode || commit.Mode&0o777 != 0o600 {
+		t.Fatalf("queued commit mode = has:%t mode:%o, want has:true mode:0600", commit.HasMode, commit.Mode&0o777)
+	}
+}
+
+func newWriteBackPathTruncateModeTestFS(t *testing.T) (*Dat9FS, *ShadowStore, *PendingIndex) {
+	t.Helper()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { shadow.Close() })
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = &CommitQueue{
+		maxPending:   8,
+		queue:        []*CommitEntry{},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+		workCh:       make(chan *CommitEntry, 16),
+	}
+	return fs, shadow, pending
+}
+
+func singleQueuedCommitForPath(t *testing.T, cq *CommitQueue, path string) *CommitEntry {
+	t.Helper()
+
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if len(cq.queue) != 1 {
+		t.Fatalf("queued commits = %d, want 1", len(cq.queue))
+	}
+	commit := cq.queue[0]
+	if commit.Path != path {
+		t.Fatalf("queued commit path = %q, want %q", commit.Path, path)
+	}
+	return commit
+}
+
+func TestSetAttr_CloseSyncPathTruncateKeepsSynchronousRemoteCommit(t *testing.T) {
+	putStarted := make(chan struct{})
+	releasePut := make(chan struct{})
+	var putOnce sync.Once
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putOnce.Do(func() { close(putStarted) })
+			<-releasePut
+			w.WriteHeader(http.StatusOK)
+		case http.MethodHead:
+			w.Header().Set("Content-Length", "0")
+			w.Header().Set("X-Dat9-IsDir", "false")
+			w.Header().Set("X-Dat9-Revision", "2")
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyCloseSync}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	fs.commitQueue = NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	defer fs.commitQueue.DrainAll()
+
+	ino := fs.inodes.Lookup("/file.bin", false, 42, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		var out gofuse.AttrOut
+		done <- fs.SetAttr(nil, &gofuse.SetAttrIn{
+			SetAttrInCommon: gofuse.SetAttrInCommon{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Valid:    gofuse.FATTR_SIZE,
+				Size:     0,
+			},
+		}, &out)
+	}()
+
+	select {
+	case <-putStarted:
+	case <-time.After(time.Second):
+		t.Fatal("close-sync SetAttr did not start remote truncate")
+	}
+	select {
+	case st := <-done:
+		t.Fatalf("close-sync SetAttr returned before remote truncate completed: %v", st)
+	default:
+	}
+	close(releasePut)
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("SetAttr status = %v, want OK", st)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("close-sync SetAttr did not return after remote truncate completed")
+	}
+}
+
+func TestSetAttr_WriteBackStrictPathTruncateStagesAndReturnsBeforeRemoteCommit(t *testing.T) {
+	putStarted := make(chan struct{})
+	releasePut := make(chan struct{})
+	var putOnce sync.Once
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putOnce.Do(func() { close(putStarted) })
+			<-releasePut
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]int64{"revision": 2})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncStrict, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1024)
+	fs := NewDat9FS(c, opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.PathLock = fs.lockRemoteCommitPath
+	cq.OnSuccess = fs.onCommitQueueSuccess
+	cq.OnCleanup = fs.onCommitQueueCleanup
+	fs.commitQueue = cq
+	defer cq.DrainAll()
+
+	ino := fs.inodes.Lookup("/file.bin", false, 42, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	done := make(chan gofuse.Status, 1)
+	go func() {
+		var out gofuse.AttrOut
+		done <- fs.SetAttr(nil, &gofuse.SetAttrIn{
+			SetAttrInCommon: gofuse.SetAttrInCommon{
+				InHeader: gofuse.InHeader{NodeId: ino},
+				Valid:    gofuse.FATTR_SIZE,
+				Size:     0,
+			},
+		}, &out)
+	}()
+
+	select {
+	case st := <-done:
+		if st != gofuse.OK {
+			t.Fatalf("SetAttr status = %v, want OK", st)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("writeback strict SetAttr blocked on remote zero-byte commit")
+	}
+	if !pending.HasPending("/file.bin") {
+		t.Fatal("pending truncate metadata missing")
+	}
+	select {
+	case <-putStarted:
+	case <-time.After(time.Second):
+		t.Fatal("async zero-byte commit did not start")
+	}
+	close(releasePut)
+	cq.DrainAll()
+}
+
+func TestOpenTruncateCancelsQueuedPathTruncateWithoutCancelingInFlight(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs.syncMode = SyncInteractive
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/file.bin"
+	if err := shadow.WriteFull(path, nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(path, 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	queued := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	fs.commitQueue = &CommitQueue{
+		queue:        []*CommitEntry{queued},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	fs.commitQueue.rebuildQueuedIndexLocked()
+	markCommitEntryDelayedForTest(t, fs.commitQueue, queued)
+
+	ino := fs.inodes.Lookup(path, false, 42, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if !queued.canceled {
+		t.Fatal("queued zero truncate was not canceled")
+	}
+	if fs.commitQueue.HasPath(path) {
+		t.Fatal("queued zero truncate still blocks path")
+	}
+	if !pending.HasPending(path) {
+		t.Fatal("pending local truncate metadata was removed")
+	}
+	if !shadow.Has(path) {
+		t.Fatal("pending local truncate shadow was removed")
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("opened handle missing")
+	}
+	if fh.BaseRev != 7 {
+		t.Fatalf("handle base revision = %d, want 7", fh.BaseRev)
+	}
+	if !fh.ZeroBase || fh.Dirty == nil || fh.Dirty.Size() != 0 {
+		t.Fatalf("handle did not adopt zero-base dirty buffer: zero=%t dirty=%v", fh.ZeroBase, fh.Dirty)
+	}
+
+	inFlight := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	fs.commitQueue = &CommitQueue{
+		queue:        []*CommitEntry{inFlight},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{path: inFlight},
+	}
+	fs.commitQueue.rebuildQueuedIndexLocked()
+	if fs.canSupersedeQueuedPathTruncate(path) {
+		t.Fatal("in-flight zero truncate was incorrectly superseded")
+	}
+	if inFlight.canceled {
+		t.Fatal("in-flight zero truncate was canceled")
+	}
+}
+
+func TestOpenWritableCancelsQueuedPathTruncateWithoutOTruncFlag(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs.syncMode = SyncInteractive
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/file.bin"
+	if err := shadow.WriteFull(path, nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(path, 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	queued := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	fs.commitQueue = &CommitQueue{
+		queue:        []*CommitEntry{queued},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	fs.commitQueue.rebuildQueuedIndexLocked()
+	markCommitEntryDelayedForTest(t, fs.commitQueue, queued)
+
+	ino := fs.inodes.Lookup(path, false, 0, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	if !queued.canceled {
+		t.Fatal("queued zero truncate was not canceled")
+	}
+	if fs.commitQueue.HasPath(path) {
+		t.Fatal("queued zero truncate still blocks path")
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("opened handle missing")
+	}
+	if fh.BaseRev != 7 {
+		t.Fatalf("handle base revision = %d, want 7", fh.BaseRev)
+	}
+	if !fh.ZeroBase {
+		t.Fatal("handle did not preserve zero-base truncate state")
+	}
+	if fh.Dirty == nil {
+		t.Fatal("handle dirty buffer missing")
+	}
+	if !fh.Dirty.HasDirtyParts() || fh.Dirty.Size() != 0 {
+		t.Fatalf("handle dirty state = dirty:%v size:%d", fh.Dirty.HasDirtyParts(), fh.Dirty.Size())
+	}
+	if fh.DirtySeq == 0 {
+		t.Fatal("handle dirty sequence was not marked")
+	}
+}
+
+func TestWriteCancelsDelayedQueuedPathTruncateBeforeRemoteWait(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.syncMode = SyncInteractive
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/file.bin"
+	if err := shadow.WriteFull(path, nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(path, 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	fs.commitQueue = cq
+	defer cq.DrainAll()
+	queued := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(queued); err != nil {
+		t.Fatal(err)
+	}
+	if !cq.HasPath(path) {
+		t.Fatal("delayed zero truncate should be visible before Write")
+	}
+
+	ino := fs.inodes.Lookup(path, false, 0, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        path,
+		BaseRev:     7,
+		Dirty:       fs.newWriteBuffer(path, 0, 0),
+		ZeroBase:    true,
+		WritePolicy: WritePolicyWriteBack,
+	}
+	fhID := fs.allocateFileHandle(fh)
+	written, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       fhID,
+		Offset:   0,
+	}, []byte("new"))
+	if st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	if written != 3 {
+		t.Fatalf("Write bytes = %d, want 3", written)
+	}
+	if !queued.canceled {
+		t.Fatal("Write did not cancel delayed zero truncate")
+	}
+	if cq.HasPath(path) {
+		t.Fatal("delayed zero truncate still blocks path after Write")
+	}
+	if got := uploads.Load(); got != 0 {
+		t.Fatalf("uploads before drain = %d, want 0", got)
+	}
+	if !pending.HasPending(path) || !shadow.Has(path) {
+		t.Fatal("Write supersede should preserve local pending/shadow state")
+	}
+}
+
+func TestWriteDoesNotCancelDelayedPathTruncateForOldHandle(t *testing.T) {
+	var uploads atomic.Int32
+	allowUpload := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		<-allowUpload
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.syncMode = SyncInteractive
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/file.bin"
+	if err := shadow.WriteFull(path, nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(path, 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	fs.commitQueue = cq
+	defer cq.DrainAll()
+	queued := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(queued); err != nil {
+		t.Fatal(err)
+	}
+
+	ino := fs.inodes.Lookup(path, false, 8, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        path,
+		BaseRev:     7,
+		Dirty:       fs.newWriteBuffer(path, 8, 0),
+		WritePolicy: WritePolicyWriteBack,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("old-tail")); err != nil {
+		t.Fatal(err)
+	}
+	fhID := fs.allocateFileHandle(fh)
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+		}, []byte("x"))
+		writeDone <- st
+	}()
+
+	select {
+	case st := <-writeDone:
+		t.Fatalf("Write returned after canceling zero truncate for old handle: %v", st)
+	case <-time.After(75 * time.Millisecond):
+	}
+	if queued.canceled {
+		t.Fatal("old handle write canceled delayed zero truncate")
+	}
+	if !cq.HasPath(path) {
+		t.Fatal("delayed zero truncate disappeared before force")
+	}
+	close(allowUpload)
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not return after delayed zero truncate was forced")
+	}
+	if got := uploads.Load(); got != 1 {
+		t.Fatalf("zero truncate uploads = %d, want 1", got)
+	}
+}
+
+func TestWriteWaitsForInFlightPathTruncate(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	fs.syncMode = SyncInteractive
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/file.bin"
+	if err := shadow.WriteFull(path, nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev(path, 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+	inFlight := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	fs.commitQueue = &CommitQueue{
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{path: inFlight},
+	}
+
+	ino := fs.inodes.Lookup(path, false, 0, time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        path,
+		BaseRev:     7,
+		WritePolicy: WritePolicyWriteBack,
+	}
+	fhID := fs.allocateFileHandle(fh)
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+		}, []byte("new"))
+		writeDone <- st
+	}()
+
+	select {
+	case st := <-writeDone:
+		t.Fatalf("Write returned while zero truncate was in-flight: %v", st)
+	case <-time.After(75 * time.Millisecond):
+	}
+	if inFlight.canceled {
+		t.Fatal("in-flight zero truncate was canceled")
+	}
+	fs.commitQueue.endInFlight(inFlight)
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Write did not return after in-flight zero truncate completed")
+	}
+}
+
+func TestOpenWritableRefreshesInodeAfterWaitingForInFlightZeroTruncate(t *testing.T) {
+	path := "/tier-transition.bin"
+	staleData := bytes.Repeat([]byte("s"), 8*1024*1024)
+	statCh := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		statCh <- struct{}{}
+		w.Header().Set("Content-Length", "0")
+		w.Header().Set("X-Dat9-IsDir", "false")
+		w.Header().Set("X-Dat9-Revision", "8")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	fs.readCache.Put(path, staleData, 7)
+	inFlight := &CommitEntry{Path: path, Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	fs.commitQueue = &CommitQueue{
+		queue:        nil,
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{path: inFlight},
+	}
+
+	ino := fs.inodes.Lookup(path, false, int64(len(staleData)), time.Now())
+	fs.inodes.UpdateRevision(ino, 7)
+
+	openDone := make(chan gofuse.OpenOut, 1)
+	statusDone := make(chan gofuse.Status, 1)
+	go func() {
+		var out gofuse.OpenOut
+		statusDone <- fs.Open(nil, &gofuse.OpenIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Flags:    uint32(syscall.O_WRONLY),
+		}, &out)
+		openDone <- out
+	}()
+
+	select {
+	case st := <-statusDone:
+		t.Fatalf("Open returned before in-flight zero truncate completed: %v", st)
+	case <-time.After(75 * time.Millisecond):
+	}
+	fs.inodes.UpdateSize(ino, 0)
+	fs.inodes.UpdateRevision(ino, 8)
+	fs.commitQueue.endInFlight(inFlight)
+
+	var st gofuse.Status
+	select {
+	case st = <-statusDone:
+	case <-time.After(time.Second):
+		t.Fatal("Open did not return after in-flight zero truncate completed")
+	}
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	var out gofuse.OpenOut
+	select {
+	case out = <-openDone:
+	case <-time.After(time.Second):
+		t.Fatal("OpenOut missing")
+	}
+	select {
+	case <-statCh:
+	case <-time.After(time.Second):
+		t.Fatal("Open did not stat zero-sized remote file after wait")
+	}
+
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("opened handle missing")
+	}
+	if fh.OrigSize != 0 || fh.BaseRev != 8 {
+		t.Fatalf("handle orig/base = %d/%d, want 0/8", fh.OrigSize, fh.BaseRev)
+	}
+	if fh.Dirty == nil {
+		t.Fatal("dirty buffer missing")
+	}
+	if got := fh.Dirty.Size(); got != 0 {
+		t.Fatalf("dirty buffer size = %d, want 0; stale read cache was preloaded", got)
+	}
+}
+
+func TestStageShadowReadyNonSpillRewritesShadowWithDirtyBuffer(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const baseRev int64 = 7
+	path := "/tier-transition.bin"
+	if err := shadow.WriteFull(path, nil, baseRev); err != nil {
+		t.Fatal(err)
+	}
+
+	finalData := bytes.Repeat([]byte("x"), 10*1024)
+	dirty := fs.newWriteBuffer(path, maxPreloadSize, 0)
+	if _, err := dirty.Write(0, finalData); err != nil {
+		t.Fatal(err)
+	}
+	fh := &FileHandle{
+		Ino:         42,
+		Path:        path,
+		Dirty:       dirty,
+		BaseRev:     baseRev,
+		ShadowReady: true,
+		ShadowSpill: false,
+		WritePolicy: WritePolicyWriteBack,
+	}
+
+	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.releaseHandleRemoteCommitPathLocked(fh)
+
+	got, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, finalData) {
+		t.Fatalf("shadow content mismatch after staged rewrite: got len=%d want len=%d", len(got), len(finalData))
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending metadata missing after staged rewrite")
+	}
+	if meta.Size != int64(len(finalData)) || meta.Kind != PendingOverwrite || meta.BaseRev != baseRev {
+		t.Fatalf("pending meta = %+v, want size=%d kind=%v baseRev=%d", meta, len(finalData), PendingOverwrite, baseRev)
+	}
+}
+
+func TestOpenTruncateResetShadowStagesDirtyBuffer(t *testing.T) {
+	opts := &MountOptions{SyncMode: SyncInteractive, WritePolicy: WritePolicyWriteBack}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://127.0.0.1"), opts)
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.shadowStore = shadow
+	fs.pendingIndex = pending
+
+	const baseRev int64 = 7
+	path := "/tier-transition.bin"
+	if err := shadow.WriteFull(path, bytes.Repeat([]byte{0x5a}, 64*1024), baseRev); err != nil {
+		t.Fatal(err)
+	}
+	ino := fs.inodes.Lookup(path, false, 8*1024*1024, time.Now())
+	fs.inodes.UpdateRevision(ino, baseRev)
+	fs.inodes.UpdateSize(ino, 8*1024*1024)
+
+	var out gofuse.OpenOut
+	st := fs.Open(nil, &gofuse.OpenIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_TRUNC),
+	}, &out)
+	if st != gofuse.OK {
+		t.Fatalf("Open status = %v, want OK", st)
+	}
+	fh, ok := fs.fileHandles.Get(out.Fh)
+	if !ok {
+		t.Fatal("opened handle missing")
+	}
+	if !fh.ShadowReady {
+		t.Fatal("truncate-open did not reset shadow")
+	}
+	if fh.ShadowSpill {
+		t.Fatal("truncate-open shadow must stay dirty-buffer backed, not ShadowSpill")
+	}
+
+	finalData := bytes.Repeat([]byte("x"), 10*1024)
+	if _, st := fs.Write(nil, &gofuse.WriteIn{
+		InHeader: gofuse.InHeader{NodeId: ino},
+		Fh:       out.Fh,
+		Offset:   0,
+	}, finalData); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	if err := fs.stageShadowForQueuedCommitLocked(fh, true); err != nil {
+		t.Fatal(err)
+	}
+	defer fs.releaseHandleRemoteCommitPathLocked(fh)
+
+	got, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, finalData) {
+		t.Fatalf("shadow content mismatch after truncate-open staged write: got len=%d want len=%d", len(got), len(finalData))
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending metadata missing after truncate-open staged write")
+	}
+	if meta.Size != int64(len(finalData)) || meta.Kind != PendingOverwrite || meta.BaseRev != baseRev || meta.ShadowSpill {
+		t.Fatalf("pending meta = %+v, want size=%d kind=%v baseRev=%d shadowSpill=false", meta, len(finalData), PendingOverwrite, baseRev)
+	}
+}
+
 func TestFlushHandle_UsesCommittedRevisionWithoutPostFlushStat(t *testing.T) {
 	var (
 		mu         sync.Mutex
@@ -10166,6 +11537,207 @@ func TestFlushHandle_RefreshesStartedStreamerRevision(t *testing.T) {
 	}
 	if fh.BaseRev != expectedRevision+1 {
 		t.Fatalf("fh.BaseRev = %d, want %d", fh.BaseRev, expectedRevision+1)
+	}
+}
+
+func TestTruncateWritableHandleLockedZeroResetsStreamingStateBeforeContinuedWrite(t *testing.T) {
+	const filePath = "/stream-reset.bin"
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+
+	wb := NewWriteBuffer(filePath, streamingWriteMaxSize, 0)
+	wb.uploadedParts = map[int]bool{0: true}
+	var staleCallbackCalls atomic.Int32
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		staleCallbackCalls.Add(1)
+	}
+	streamer := NewStreamUploader(nil, filePath, 0)
+	streamer.started = true
+	streamer.streamedParts[1] = true
+	streamer.pendingParts[1] = []byte("stale")
+
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     filePath,
+		Dirty:    wb,
+		Streamer: streamer,
+	}
+
+	fh.Lock()
+	abortStreamer, err := fs.truncateWritableHandleLocked(fh, 0)
+	fh.Unlock()
+	if err != nil {
+		t.Fatalf("truncateWritableHandleLocked: %v", err)
+	}
+	if abortStreamer == nil {
+		t.Fatal("abortStreamer is nil, want old streamer cleanup")
+	}
+	abortStreamer()
+
+	if fh.Streamer != nil {
+		t.Fatal("fh.Streamer should be cleared after zero truncate")
+	}
+	if wb.OnPartFull != nil {
+		t.Fatal("OnPartFull should be cleared after non-shadow zero truncate")
+	}
+	if len(wb.uploadedParts) != 0 {
+		t.Fatalf("uploadedParts len = %d, want 0", len(wb.uploadedParts))
+	}
+	if len(streamer.pendingParts) != 0 {
+		t.Fatalf("old streamer pendingParts len = %d, want 0 after abort", len(streamer.pendingParts))
+	}
+
+	fullPart := bytes.Repeat([]byte("n"), int(wb.PartSize()))
+	if _, err := wb.Write(0, fullPart); err != nil {
+		t.Fatalf("continued write after truncate: %v", err)
+	}
+	if got := staleCallbackCalls.Load(); got != 0 {
+		t.Fatalf("stale OnPartFull calls = %d, want 0", got)
+	}
+	if len(wb.uploadedParts) != 0 {
+		t.Fatalf("uploadedParts len after continued write = %d, want 0", len(wb.uploadedParts))
+	}
+	if !wb.IsPartLoaded(0) {
+		t.Fatal("continued write should retain part in memory when streaming is disabled")
+	}
+}
+
+func TestTruncateWritableHandleLockedZeroRebindsShadowSpillEviction(t *testing.T) {
+	const filePath = "/shadow-reset.bin"
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+
+	wb := NewWriteBuffer(filePath, streamingWriteMaxSize, 0)
+	wb.uploadedParts = map[int]bool{1: true}
+	var staleCallbackCalls atomic.Int32
+	wb.OnPartFull = func(partIdx int, data []byte) {
+		staleCallbackCalls.Add(1)
+	}
+	streamer := NewStreamUploader(nil, filePath, 0)
+	streamer.started = true
+	streamer.streamedParts[1] = true
+	streamer.pendingParts[1] = []byte("stale")
+
+	fh := &FileHandle{
+		Ino:         ino,
+		Path:        filePath,
+		Dirty:       wb,
+		Streamer:    streamer,
+		ShadowReady: true,
+		ShadowSpill: true,
+	}
+
+	fh.Lock()
+	abortStreamer, err := fs.truncateWritableHandleLocked(fh, 0)
+	fh.Unlock()
+	if err != nil {
+		t.Fatalf("truncateWritableHandleLocked: %v", err)
+	}
+	if abortStreamer == nil {
+		t.Fatal("abortStreamer is nil, want old streamer cleanup")
+	}
+	abortStreamer()
+
+	if fh.Streamer != nil {
+		t.Fatal("fh.Streamer should be cleared after zero truncate")
+	}
+	if wb.OnPartFull == nil {
+		t.Fatal("OnPartFull should be rebound for ShadowSpill eviction")
+	}
+	if len(wb.uploadedParts) != 0 {
+		t.Fatalf("uploadedParts len = %d, want 0", len(wb.uploadedParts))
+	}
+
+	fullPart := bytes.Repeat([]byte("s"), int(wb.PartSize()))
+	if _, err := wb.Write(0, fullPart); err != nil {
+		t.Fatalf("continued shadow write after truncate: %v", err)
+	}
+	if got := staleCallbackCalls.Load(); got != 0 {
+		t.Fatalf("stale OnPartFull calls = %d, want 0", got)
+	}
+	if !wb.uploadedParts[0] {
+		t.Fatal("ShadowSpill OnPartFull should evict and mark new part 0")
+	}
+	if wb.IsPartLoaded(0) {
+		t.Fatal("ShadowSpill continued write should evict full part from memory")
+	}
+}
+
+func TestAdoptPathTruncateZeroResetsStartedStreamerBeforeFlush(t *testing.T) {
+	const (
+		filePath  = "/created-stream.bin"
+		callerPID = 4242
+	)
+	var (
+		createCalls atomic.Int32
+		otherCalls  atomic.Int32
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/fs"+filePath && r.URL.Query().Get("create") == "1" {
+			createCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
+			return
+		}
+		otherCalls.Add(1)
+		http.Error(w, "unexpected request", http.StatusTeapot)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	ino := fs.inodes.Lookup(filePath, false, 0, time.Now())
+
+	wb := NewWriteBuffer(filePath, streamingWriteMaxSize, 0)
+	if _, err := wb.Write(0, []byte("stale streamed bytes")); err != nil {
+		t.Fatal(err)
+	}
+	wb.uploadedParts = map[int]bool{0: true}
+	streamer := NewStreamUploader(fs.client, filePath, 0)
+	streamer.started = true
+	streamer.streamedParts[1] = true
+	streamer.pendingParts[1] = []byte("stale")
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    filePath,
+		Dirty:   wb,
+		OpenPID: callerPID,
+		IsNew:   true,
+		BaseRev: 0,
+		// Started streamer state must not survive path truncate adoption;
+		// otherwise flushHandle chooses FinishStreaming instead of empty create.
+		Streamer: streamer,
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, wb.Size())
+	fs.openHandles.Add(fh)
+	defer fs.openHandles.Remove(fh)
+
+	if !fs.adoptSingleCallerPathTruncate(filePath, callerPID) {
+		t.Fatal("path truncate was not adopted by same-caller handle")
+	}
+	if fh.Streamer != nil {
+		t.Fatal("fh.Streamer should be cleared after adopted path truncate")
+	}
+	if len(wb.uploadedParts) != 0 {
+		t.Fatalf("uploadedParts len = %d, want 0", len(wb.uploadedParts))
+	}
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("empty create calls = %d, want 1", got)
+	}
+	if got := otherCalls.Load(); got != 0 {
+		t.Fatalf("unexpected non-create calls = %d, want 0", got)
 	}
 }
 
@@ -10675,14 +12247,14 @@ func TestSetAttr_PathTruncateRefreshesOpenHandleBaseRevision(t *testing.T) {
 	if fh.BaseRev != 2 {
 		t.Fatalf("open handle base revision after path truncate = %d, want 2", fh.BaseRev)
 	}
-	if fh.Streamer == nil {
-		t.Fatal("expected stream uploader on O_TRUNC handle")
+	if fh.Streamer != nil {
+		t.Fatal("stream uploader should be reset after adopted zero truncate")
 	}
-	fh.Streamer.mu.Lock()
-	streamerRevision := fh.Streamer.expectedRevision
-	fh.Streamer.mu.Unlock()
-	if streamerRevision != 2 {
-		t.Fatalf("streamer expected revision after path truncate = %d, want 2", streamerRevision)
+	if fh.Dirty.OnPartFull != nil {
+		t.Fatal("streaming callback should be reset after adopted zero truncate")
+	}
+	if len(fh.Dirty.uploadedParts) != 0 {
+		t.Fatalf("uploadedParts len after path truncate = %d, want 0", len(fh.Dirty.uploadedParts))
 	}
 
 	if _, st = fs.Write(nil, &gofuse.WriteIn{
@@ -14328,7 +15900,7 @@ func TestDoRangeReadBodyTruncationReturnsError(t *testing.T) {
 // TestReadPrefetchNotTriggeredOnFailure verifies that Prefetch.OnRead is NOT
 // called when the remote read fails after a prefetch cache miss.
 func TestReadPrefetchNotTriggeredOnFailure(t *testing.T) {
-	fileSize := int64(2 << 20) // above default read-cache admission limit
+	fileSize := int64(defaultReadCacheMaxFileSize + 1024) // above default read-cache admission limit
 	var getCalls atomic.Int32
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

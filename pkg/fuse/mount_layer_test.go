@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -143,6 +144,93 @@ func TestRestoreLayerEntriesHonorsCheckpointSeq(t *testing.T) {
 	}
 	if pending.HasPending("/b.txt") || shadow.Has("/b.txt") {
 		t.Fatal("b.txt should not be restored past checkpoint seq")
+	}
+}
+
+func TestRestoreLayerEntriesRejectsCheckpointLayerMismatch(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layer-checkpoints/cp-mismatch":
+			_ = json.NewEncoder(w).Encode(client.FSLayerCheckpoint{
+				CheckpointID: "cp-mismatch",
+				LayerID:      "layer-2",
+				DurableSeq:   7,
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = restoreLayerEntries(context.Background(), client.New(ts.URL, ""), &MountOptions{
+		LayerRef:      "layer-1",
+		CheckpointRef: "cp-mismatch",
+		RemoteRoot:    "/repo",
+	}, shadow, pending, nil)
+	if err == nil {
+		t.Fatal("restoreLayerEntries error = nil, want checkpoint layer mismatch")
+	}
+	if !strings.Contains(err.Error(), "checkpoint cp-mismatch belongs to layer layer-2, want layer-1") {
+		t.Fatalf("restoreLayerEntries error = %v", err)
+	}
+}
+
+func TestMountRejectsCheckpointLayerMismatchBeforeFuseServer(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodHead && r.URL.Path == "/":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodHead && r.URL.Path == "/v1/fs/repo":
+			w.Header().Set("X-Dat9-IsDir", "true")
+			w.Header().Set("X-Dat9-Revision", "1")
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layers/fix-auth-bug":
+			_ = json.NewEncoder(w).Encode(client.FSLayer{
+				LayerID:        "lyr_abc",
+				BaseRootPath:   "/repo",
+				Name:           "fix-auth-bug",
+				State:          "active",
+				DurabilityMode: "restore-safe",
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/layer-checkpoints/cp_before_refactor":
+			_ = json.NewEncoder(w).Encode(client.FSLayerCheckpoint{
+				CheckpointID: "cp_before_refactor",
+				LayerID:      "lyr_other",
+				DurableSeq:   3,
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	err := Mount(&MountOptions{
+		Server:        ts.URL,
+		APIKey:        "sk-test",
+		MountPoint:    t.TempDir(),
+		RemoteRoot:    "/repo",
+		CacheDir:      t.TempDir(),
+		LayerRef:      "fix-auth-bug",
+		CheckpointRef: "cp_before_refactor",
+	})
+	if err == nil {
+		t.Fatal("Mount error = nil, want checkpoint layer mismatch")
+	}
+	want := "mount: restore fs layer entries: checkpoint cp_before_refactor belongs to layer lyr_other, want lyr_abc"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("Mount error = %v, want to contain %q", err, want)
 	}
 }
 

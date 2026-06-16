@@ -78,6 +78,10 @@ type autoEmbeddingSchemaProvisioner interface {
 	InitSchemaForAutoEmbeddingProfile(context.Context, string, tenantschema.TiDBAutoEmbeddingProfile) error
 }
 
+type credentialProvisionRequestValidator interface {
+	ValidateCredentialProvisionRequest(tenant.CredentialProvisionRequest) error
+}
+
 type Server struct {
 	fallback             *backend.Dat9Backend
 	meta                 *meta.Store
@@ -146,10 +150,11 @@ type TenantStatusResponse struct {
 }
 
 const (
-	maxBatchStatPaths       = 256
-	maxBatchReadSmallPaths  = 128
-	maxBatchReadSmallBytes  = 50_000
-	defaultBatchReadMaxBody = 1 << 20
+	maxBatchStatPaths                     = 256
+	maxBatchReadSmallPaths                = 128
+	maxBatchReadSmallBytes                = 50_000
+	defaultBatchReadMaxBody               = 1 << 20
+	maxCredentialProvisionBodyBytes int64 = 1 << 20
 )
 
 func New(b *backend.Dat9Backend) *Server {
@@ -236,6 +241,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v2/uploads/", business)
 	mux.Handle("/v1/tokens", business)
 	mux.Handle("/v1/tokens/", business)
+	mux.Handle("/v1/tenant", business)
 	mux.Handle("/v1/fork", business)
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
@@ -317,6 +323,7 @@ func NewWithConfig(cfg Config) *Server {
 		s.startPendingTenantReconciler()
 		s.resumeProvisioningTenants()
 		s.resumeDeletingForkTenants()
+		s.startTenantDeleteCleanup(backgroundWithTrace(context.Background()))
 	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
 	if s.semanticWorker != nil {
@@ -599,6 +606,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleV2Uploads(w, r)
 	case r.URL.Path == "/v1/tokens" || strings.HasPrefix(r.URL.Path, "/v1/tokens/"):
 		s.handleTokens(w, r)
+	case r.URL.Path == "/v1/tenant":
+		s.handleTenantDelete(w, r)
 	case r.URL.Path == "/v1/fork":
 		s.handleFork(w, r)
 	case r.URL.Path == "/v1/sql":
@@ -1169,7 +1178,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "read_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_read", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 
@@ -1230,7 +1239,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "list_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "list", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	metricEvent(r.Context(), "userdb_query", "api", "list", "result", "ok")
@@ -1321,7 +1330,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 
@@ -1335,7 +1344,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	nlink, err := nodeLinkCount(r.Context(), b, nf)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_refcount_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	if nf.File != nil {
@@ -1355,7 +1364,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 		tags, err = b.Store().GetFileTags(r.Context(), nf.File.FileID)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_load_tags_failed", "path", path, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, err.Error())
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 	} else {
@@ -2169,7 +2178,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "kind", kind, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive, "kind", kind)...)
@@ -2210,7 +2219,7 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "copy_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "copy_ok", "src_path", srcPath, "dst_path", dstPath)...)
@@ -2255,7 +2264,7 @@ func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath 
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "hardlink_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "hardlink_ok", "src_path", srcPath, "dst_path", dstPath)...)
@@ -2299,7 +2308,7 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "rename_failed", "old_path", oldPath, "new_path", newPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "rename_ok", "old_path", oldPath, "new_path", newPath)...)
@@ -2334,7 +2343,7 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "mkdir_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "mkdir_ok", "path", path)...)
@@ -2377,7 +2386,7 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "chmod_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "chmod_ok", "path", path)...)
@@ -2406,7 +2415,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "create_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "create_ok", "path", path)...)
@@ -2469,7 +2478,7 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "symlink_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "symlink_ok", "path", path)...)
@@ -2521,7 +2530,7 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	metricEvent(r.Context(), "metadb_query", "api", "uploads_list", "result", "ok")
@@ -3401,9 +3410,29 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	var credentialReq *tenant.CredentialProvisionRequest
+	if provider == tenant.ProviderTiDBCloudNative {
+		req, err := decodeCredentialProvisionRequest(w, r)
+		if err != nil {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if validator, ok := s.provisioner.(credentialProvisionRequestValidator); ok {
+			if err := validator.ValidateCredentialProvisionRequest(*req); err != nil {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		credentialReq = req
+	}
 	res, err := s.provisionTenant(r.Context(), provisionTenantOptions{
-		KeyName:      "default",
-		TokenVersion: 1,
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: credentialReq,
 	})
 	if err != nil {
 		var pe *provisionTenantError
@@ -3426,6 +3455,40 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
+	var req struct {
+		PublicKey    string `json:"public_key"`
+		PrivateKey   string `json:"private_key"`
+		DatabaseName string `json:"database_name"`
+	}
+	return decodeCredentialRequest(w, r, &req, func() tenant.CredentialProvisionRequest {
+		return tenant.CredentialProvisionRequest{
+			PublicKey:    strings.TrimSpace(req.PublicKey),
+			PrivateKey:   strings.TrimSpace(req.PrivateKey),
+			DatabaseName: strings.TrimSpace(req.DatabaseName),
+		}
+	})
+}
+
+func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, build func() tenant.CredentialProvisionRequest) (*tenant.CredentialProvisionRequest, error) {
+	if r.Body != nil {
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCredentialProvisionBodyBytes))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(raw); err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("invalid JSON body: %w", err)
+		}
+		var extra struct{}
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("invalid JSON body: trailing data")
+		}
+	}
+	out := build()
+	if out.PublicKey == "" || out.PrivateKey == "" {
+		return nil, fmt.Errorf("public_key and private_key are required")
+	}
+	return &out, nil
+}
+
 type apiKeyIssueSource struct {
 	Provider     string
 	SubjectKey   string
@@ -3433,9 +3496,10 @@ type apiKeyIssueSource struct {
 }
 
 type provisionTenantOptions struct {
-	KeyName      string
-	TokenVersion int
-	APIKeySource apiKeyIssueSource
+	KeyName               string
+	TokenVersion          int
+	APIKeySource          apiKeyIssueSource
+	CredentialProvisioner *tenant.CredentialProvisionRequest
 }
 
 type provisionTenantResult struct {
@@ -3570,6 +3634,9 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		metricEvent(ctx, "tenant_provision", "provider", rawProvider, "result", "error")
 		return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 	}
+	if provider == tenant.ProviderTiDBCloudNative && opts.CredentialProvisioner == nil {
+		return nil, newProvisionTenantError(http.StatusBadRequest, "public_key and private_key are required", fmt.Errorf("public_key and private_key are required"))
+	}
 	tenantID := token.NewID()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
 	setRequestMetricTenant(ctx, tenantID, "", provider, tenantRequestClass{surface: "provision", action: "post"})
@@ -3617,7 +3684,18 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 	}
 
-	cluster, err := s.provisioner.Provision(ctx, tenantID)
+	var cluster *tenant.ClusterInfo
+	if provider == tenant.ProviderTiDBCloudNative {
+		if opts.CredentialProvisioner == nil {
+			err = fmt.Errorf("public_key and private_key are required")
+		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
+			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
+		} else {
+			err = fmt.Errorf("provisioner does not support request credentials")
+		}
+	} else {
+		cluster, err = s.provisioner.Provision(ctx, tenantID)
+	}
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
@@ -3957,14 +4035,14 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_failed", "path", path, "query_len", len(query), "limit", limit, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "grep", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	if layerRef := strings.TrimSpace(r.URL.Query().Get("layer")); layerRef != "" {
 		results, err = overlayFSLayerGrep(r.Context(), b, layerRef, query, path, limit, results)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_layer_failed", "path", path, "query_len", len(query), "limit", limit, "layer", layerRef, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, err.Error())
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 	}
@@ -4041,14 +4119,14 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "find", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	if layerRef := strings.TrimSpace(q.Get("layer")); layerRef != "" {
 		results, err = overlayFSLayerFind(r.Context(), b, layerRef, f, results)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_layer_failed", "path", path, "layer", layerRef, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, err.Error())
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 	}

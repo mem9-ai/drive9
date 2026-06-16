@@ -137,11 +137,21 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 	}
 	fs.git.mu.Unlock()
 
-	workspaces, err := fs.client.ListGitWorkspaces(ctx)
-	if err != nil {
-		if client.IsNotFound(err) {
-			err = nil
+	if fs.perfEnabled() {
+		fs.perf.gitWorkspaceRefresh.add(1)
+		if force {
+			fs.perf.gitWorkspaceForcedRefresh.add(1)
 		}
+	}
+	listStart := fs.perfStart()
+	workspaces, err := fs.client.ListGitWorkspaces(ctx)
+	if client.IsNotFound(err) {
+		// Expected on servers without git workspaces — not a remote error.
+		fs.perfRecordRemote(perfRemoteList, listStart, nil, 0)
+		return nil
+	}
+	fs.perfRecordRemote(perfRemoteList, listStart, err, 0)
+	if err != nil {
 		return err
 	}
 	loaded := make([]*gitWorkspaceRuntime, 0, len(workspaces))
@@ -158,13 +168,21 @@ func (fs *Dat9FS) ensureGitWorkspacesWithRefresh(ctx context.Context, force bool
 		if localRoot != "/" {
 			localRoot = strings.TrimSuffix(localRoot, "/")
 		}
+		treeStart := fs.perfStart()
 		nodes, err := fs.client.ListGitTree(ctx, ws.WorkspaceID, ws.HeadCommit)
+		fs.perfRecordRemote(perfRemoteList, treeStart, err, 0)
 		if err != nil {
 			loadErrs = append(loadErrs, fmt.Errorf("load git tree workspace=%s root=%s: %w", ws.WorkspaceID, ws.RootPath, err))
 			continue
 		}
+		overlayStart := fs.perfStart()
 		overlays, err := fs.client.ListGitOverlayEntries(ctx, ws.WorkspaceID)
-		if err != nil && !client.IsNotFound(err) {
+		if client.IsNotFound(err) {
+			// Expected when a workspace has no overlay entries yet.
+			err = nil
+		}
+		fs.perfRecordRemote(perfRemoteList, overlayStart, err, 0)
+		if err != nil {
 			loadErrs = append(loadErrs, fmt.Errorf("load git overlay workspace=%s root=%s: %w", ws.WorkspaceID, ws.RootPath, err))
 			continue
 		}
@@ -4200,12 +4218,18 @@ func (fs *Dat9FS) setGitAttr(ctx context.Context, input *gofuse.SetAttrIn, entry
 		}
 		if input.Valid&gofuse.FATTR_FH != 0 {
 			if fh, ok := fs.fileHandles.Get(input.Fh); ok && fh.Layer == PathLayerGitWorkspace && fh.Dirty != nil {
+				var abortStreamer func()
 				fh.Lock()
-				if err := fs.truncateWritableHandleLocked(fh, newSize); err != nil {
+				var err error
+				abortStreamer, err = fs.truncateWritableHandleLocked(fh, newSize)
+				if err != nil {
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
 				fh.Unlock()
+				if abortStreamer != nil {
+					abortStreamer()
+				}
 			}
 		} else if newSize != entry.Size {
 			readSize := entry.Size

@@ -396,6 +396,64 @@ start_layer_mount() {
   wait_mount_log_ready "$MOUNT_LOG"
 }
 
+expect_layer_mount_fail() {
+  local layer_ref="$1"
+  local checkpoint_ref="$2"
+  local remote_root="$3"
+  local mount_point="$4"
+  local local_root="$5"
+  local mount_log="$6"
+  mkdir -p "$mount_point" "$local_root"
+  {
+    echo "=== drive9 layer mount expected failure time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
+    echo "layer_ref=$layer_ref"
+    echo "checkpoint_ref=$checkpoint_ref"
+    echo "remote_root=$remote_root"
+    echo "mount_point=$mount_point"
+    echo "local_root=$local_root"
+  } >>"$mount_log"
+
+  local args=(mount --foreground --mode=fuse --profile=coding-agent --local-root "$local_root" --durability=write-sync --flush-debounce=0 --layer "$layer_ref" --checkpoint "$checkpoint_ref" ":$remote_root" "$mount_point")
+  set +e
+  drive9 "${args[@]}" >>"$mount_log" 2>&1 &
+  local pid="$!"
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    if is_mounted_path "$mount_point"; then
+      drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$mount_point" >/dev/null 2>&1
+      wait "$pid" >/dev/null 2>&1
+      set -e
+      echo "layer mount unexpectedly succeeded for mismatched checkpoint" >&2
+      return 1
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      kill "$pid" >/dev/null 2>&1
+      wait "$pid" >/dev/null 2>&1
+      set -e
+      echo "layer mount did not fail within ${MOUNT_READY_TIMEOUT_S}s" >&2
+      return 1
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
+  wait "$pid"
+  local rc="$?"
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    echo "layer mount exited successfully, want checkpoint mismatch failure" >&2
+    return 1
+  fi
+  if is_mounted_path "$mount_point"; then
+    drive9 umount --timeout "$FUSE_UMOUNT_TIMEOUT" "$mount_point" >/dev/null 2>&1
+    echo "layer mount left a mounted path after checkpoint mismatch" >&2
+    return 1
+  fi
+  if ! grep -F "checkpoint $checkpoint_ref belongs to layer" "$mount_log" >/dev/null; then
+    echo "layer mount mismatch log did not mention checkpoint ownership" >&2
+    return 1
+  fi
+  return 0
+}
+
 unmount_layer_mount() {
   if [ -z "${MOUNT_POINT:-}" ]; then
     return 0
@@ -804,7 +862,9 @@ if require_layer_fuse_prereqs; then
   echo "[fuse] layer mount restore coverage"
   fuse_root="/layer-fuse-${ts}"
   fuse_layer_name="layer-fuse-${ts}"
+  fuse_other_layer_name="layer-fuse-other-${ts}"
   fuse_ckpt_id="ckpt_fuse_${ts}"
+  fuse_other_ckpt_id="ckpt_fuse_other_${ts}"
   fuse_base_local="/tmp/drive9-layer-fuse-base-${ts}.txt"
   fuse_delete_local="/tmp/drive9-layer-fuse-delete-${ts}.txt"
   fuse_move_local="/tmp/drive9-layer-fuse-move-${ts}.txt"
@@ -825,6 +885,16 @@ if require_layer_fuse_prereqs; then
     ":$fuse_root")
   fuse_layer_id=$(printf '%s' "$fuse_layer_json" | jq -r '.layer_id // empty')
   check_cmd "fuse layer create returns id" test -n "$fuse_layer_id"
+  fuse_other_layer_json=$(drive9_retry fs layer create \
+    --name "$fuse_other_layer_name" \
+    --tag "fuse_other_run=$ts" \
+    --durability restore-safe \
+    --json \
+    ":$fuse_root")
+  fuse_other_layer_id=$(printf '%s' "$fuse_other_layer_json" | jq -r '.layer_id // empty')
+  check_cmd "fuse other layer create returns id" test -n "$fuse_other_layer_id"
+  fuse_other_checkpoint_json=$(drive9_retry fs layer checkpoint --id "$fuse_other_ckpt_id" --label fuse-other --json "$fuse_other_layer_name")
+  check_eq "fuse other checkpoint resolves other layer id" "$(printf '%s' "$fuse_other_checkpoint_json" | jq -r '.layer_id')" "$fuse_other_layer_id"
 
   mount_a="${FUSE_MOUNT_ROOT%/}/drive9-layer-a-${ts}"
   local_a="/tmp/drive9-layer-local-a-${ts}"
@@ -863,6 +933,11 @@ if require_layer_fuse_prereqs; then
     "${fuse_root}/after.txt" "upsert")" "9"
   check_cmd "unmount first layer mount" unmount_layer_mount
   check_cmd "first layer mount log clean" audit_mount_log "$log_a"
+
+  mount_mismatch="${FUSE_MOUNT_ROOT%/}/drive9-layer-mismatch-${ts}"
+  local_mismatch="/tmp/drive9-layer-local-mismatch-${ts}"
+  log_mismatch="/tmp/drive9-layer-mismatch-${ts}.log"
+  check_cmd "layer mount rejects checkpoint from another layer" expect_layer_mount_fail "$fuse_layer_name" "$fuse_other_ckpt_id" "$fuse_root" "$mount_mismatch" "$local_mismatch" "$log_mismatch"
 
   mount_b="${FUSE_MOUNT_ROOT%/}/drive9-layer-b-${ts}"
   local_b="/tmp/drive9-layer-local-b-${ts}"

@@ -5,6 +5,20 @@ import (
 	"testing"
 )
 
+func mustAppend(t *testing.T, j *Journal, e JournalEntry) {
+	t.Helper()
+	if err := j.Append(e); err != nil {
+		t.Fatalf("append %+v: %v", e, err)
+	}
+}
+
+func mustFsync(t *testing.T, j *Journal) {
+	t.Helper()
+	if err := j.Fsync(); err != nil {
+		t.Fatalf("journal fsync: %v", err)
+	}
+}
+
 func TestJournalAppendReplay(t *testing.T) {
 	dir := t.TempDir()
 	jPath := filepath.Join(dir, "test.wal")
@@ -75,10 +89,10 @@ func TestJournalCompact(t *testing.T) {
 	}
 
 	// Write, commit for /a.txt; write (no commit) for /b.txt.
-	_ = j.Append(JournalEntry{Op: JournalWrite, Path: "/a.txt"})
-	_ = j.Append(JournalEntry{Op: JournalWrite, Path: "/b.txt"})
-	_ = j.Append(JournalEntry{Op: JournalCommit, Path: "/a.txt"})
-	_ = j.Fsync()
+	mustAppend(t, j, JournalEntry{Op: JournalWrite, Path: "/a.txt"})
+	mustAppend(t, j, JournalEntry{Op: JournalWrite, Path: "/b.txt"})
+	mustAppend(t, j, JournalEntry{Op: JournalCommit, Path: "/a.txt"})
+	mustFsync(t, j)
 
 	// Compact.
 	if err := j.Compact(); err != nil {
@@ -102,6 +116,168 @@ func TestJournalCompact(t *testing.T) {
 	}
 	if err := j.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestReplayJournalIntoPendingHonorsCommitMarkers verifies that crash
+// recovery does not resurrect paths whose latest fsync was followed by a
+// commit marker (the path was uploaded or unlinked before the crash), while
+// still resurrecting paths fsync'd again after their last commit.
+func TestReplayJournalIntoPendingHonorsCommitMarkers(t *testing.T) {
+	dir := t.TempDir()
+	j, err := NewJournal(filepath.Join(dir, "replay.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j.Close() }()
+
+	// /committed.txt: fsync then commit — must NOT resurrect.
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/committed.txt", Length: 10, BaseRev: 5})
+	mustAppend(t, j, JournalEntry{Op: JournalCommit, Path: "/committed.txt"})
+	// /pending.txt: fsync, commit, then fsync again — MUST resurrect with
+	// the latest entry's metadata.
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/pending.txt", Length: 10, BaseRev: 3})
+	mustAppend(t, j, JournalEntry{Op: JournalCommit, Path: "/pending.txt"})
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/pending.txt", Length: 30, BaseRev: 4})
+	// /new-spill.bin: ShadowSpill fsync, never committed — must resurrect
+	// in spill mode so recovery streams instead of ReadAll.
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/new-spill.bin", Length: 1 << 30, BaseRev: 0, ShadowSpill: true})
+	// /unlinked.txt: fsync then unlink marker — must NOT resurrect.
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/unlinked.txt", Length: 7, BaseRev: 2})
+	mustAppend(t, j, JournalEntry{Op: JournalUnlink, Path: "/unlinked.txt"})
+	mustFsync(t, j)
+
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(j, idx); err != nil {
+		t.Fatal(err)
+	}
+
+	if idx.HasPending("/committed.txt") {
+		t.Error("committed path was resurrected")
+	}
+	if idx.HasPending("/unlinked.txt") {
+		t.Error("unlinked path was resurrected")
+	}
+
+	meta, ok := idx.GetMeta("/pending.txt")
+	if !ok {
+		t.Fatal("re-fsync'd path was not resurrected")
+	}
+	if meta.Size != 30 || meta.BaseRev != 4 {
+		t.Errorf("resurrected meta = size %d baseRev %d, want 30/4 (latest fsync)", meta.Size, meta.BaseRev)
+	}
+	if meta.Kind != PendingOverwrite {
+		t.Errorf("resurrected kind = %v, want PendingOverwrite", meta.Kind)
+	}
+
+	spill, ok := idx.GetMeta("/new-spill.bin")
+	if !ok {
+		t.Fatal("ShadowSpill path was not resurrected")
+	}
+	if !spill.ShadowSpill {
+		t.Error("resurrected entry lost ShadowSpill flag — recovery would ReadAll a huge file")
+	}
+	if spill.Kind != PendingNew {
+		t.Errorf("resurrected kind = %v, want PendingNew (BaseRev 0)", spill.Kind)
+	}
+	if spill.Size != 1<<30 {
+		t.Errorf("resurrected size = %d, want %d", spill.Size, int64(1<<30))
+	}
+}
+
+// TestReplayJournalIntoPendingPrefersSurvivingMeta verifies that a .meta file
+// that survived the crash stays authoritative over older WAL frames.
+func TestReplayJournalIntoPendingPrefersSurvivingMeta(t *testing.T) {
+	dir := t.TempDir()
+	j, err := NewJournal(filepath.Join(dir, "replay.wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j.Close() }()
+
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/a.txt", Length: 10, BaseRev: 1})
+	mustFsync(t, j)
+
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := idx.PutWithBaseRev("/a.txt", 99, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(j, idx); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, ok := idx.GetMeta("/a.txt")
+	if !ok {
+		t.Fatal("pending entry missing")
+	}
+	if meta.Size != 99 || meta.BaseRev != 7 {
+		t.Errorf("surviving meta was overwritten by WAL frame: size %d baseRev %d, want 99/7", meta.Size, meta.BaseRev)
+	}
+}
+
+// TestJournalCompactAfterReplayKeepsSeqMonotonic simulates the mount-time
+// replay+compact cycle and verifies appends after Compact stay monotonic and
+// replayable.
+func TestJournalCompactAfterReplayKeepsSeqMonotonic(t *testing.T) {
+	dir := t.TempDir()
+	jPath := filepath.Join(dir, "cycle.wal")
+
+	j, err := NewJournal(jPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/done.txt", Length: 4, BaseRev: 1})
+	mustAppend(t, j, JournalEntry{Op: JournalCommit, Path: "/done.txt"})
+	mustAppend(t, j, JournalEntry{Op: JournalFsync, Path: "/live.txt", Length: 8, BaseRev: 2})
+	mustFsync(t, j)
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// "Remount": replay then compact, as mount.go does.
+	j2, err := NewJournal(jPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = j2.Close() }()
+	idx, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(j2, idx); err != nil {
+		t.Fatal(err)
+	}
+	if err := j2.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if idx.HasPending("/done.txt") {
+		t.Error("committed path resurrected")
+	}
+	if !idx.HasPending("/live.txt") {
+		t.Error("uncommitted path not resurrected")
+	}
+
+	// Frames for the committed path must be gone; new appends must replay
+	// with strictly increasing seq.
+	mustAppend(t, j2, JournalEntry{Op: JournalFsync, Path: "/after.txt", Length: 2, BaseRev: 3})
+	var replayed []JournalEntry
+	if err := j2.Replay(func(e JournalEntry) { replayed = append(replayed, e) }); err != nil {
+		t.Fatal(err)
+	}
+	if len(replayed) != 2 {
+		t.Fatalf("after compact+append: replayed %d entries, want 2", len(replayed))
+	}
+	if replayed[0].Path != "/live.txt" || replayed[1].Path != "/after.txt" {
+		t.Errorf("unexpected frames: %q, %q", replayed[0].Path, replayed[1].Path)
+	}
+	if replayed[1].Seq <= replayed[0].Seq {
+		t.Errorf("seq not monotonic after compact: %d then %d", replayed[0].Seq, replayed[1].Seq)
 	}
 }
 

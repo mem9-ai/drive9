@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -574,6 +576,12 @@ func TestCommitQueueSkipsDefaultModeForPendingNew(t *testing.T) {
 	}
 	if shadow.Has("/plain.txt") {
 		t.Fatal("shadow should be removed after successful default-mode commit")
+	}
+}
+
+func TestShouldApplyRemoteModePreservesExplicitDefaultOverwrite(t *testing.T) {
+	if !shouldApplyRemoteMode(PendingOverwrite, true, defaultRegularFileMode) {
+		t.Fatal("PendingOverwrite with explicit 0644 mode must still apply remote chmod")
 	}
 }
 
@@ -1432,9 +1440,9 @@ func TestCommitQueueRecoverPendingSkipsLegacyOverwriteWithoutBaseRev(t *testing.
 
 // --- ShadowSpill tests ---
 
-// TestCommitQueueShadowSpillUpload verifies that ShadowSpill entries are
-// uploaded via streaming (uploadFromShadow) rather than ReadAll, and that
-// the server receives the correct data and expected revision.
+// TestCommitQueueShadowSpillUpload verifies that ShadowSpill entries at or
+// above the cached inline threshold are uploaded via streaming multipart and
+// that the server receives the correct data and expected revision.
 func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	data := bytes.Repeat([]byte("shadowspill-data-"), 100) // ~1700 bytes
 	var gotExpected int64
@@ -1513,7 +1521,9 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
 		if entry.Path != "/big.bin" {
 			t.Fatalf("OnSuccess path = %q, want /big.bin", entry.Path)
@@ -1548,6 +1558,92 @@ func TestCommitQueueShadowSpillUpload(t *testing.T) {
 	}
 	if shadow.Has("/big.bin") {
 		t.Fatal("shadow should be removed after successful ShadowSpill commit")
+	}
+}
+
+func TestCommitQueueShadowSpillSmallFileDirectPUTCleansState(t *testing.T) {
+	data := []byte("small shadow spill content")
+	const path = "/small-spill.bin"
+	var gotExpected int64 = -1
+	var gotBody []byte
+	var multipartCalls atomic.Int32
+	var successRev int64
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/v1/fs/small-spill.bin":
+			var err error
+			gotBody, err = io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read direct PUT body: %v", err)
+			}
+			gotExpected, err = strconv.ParseInt(r.Header.Get("X-Dat9-Expected-Revision"), 10, 64)
+			if err != nil {
+				t.Fatalf("expected revision header: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": 13})
+		case strings.HasPrefix(r.URL.Path, "/v2/uploads/"):
+			multipartCalls.Add(1)
+			t.Fatalf("small ShadowSpill should not use multipart: %s %s", r.Method, r.URL.String())
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shadow.WriteFull(path, data, 12); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutShadowSpill(path, int64(len(data)), PendingOverwrite, 12); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		if entry.Path != path {
+			t.Fatalf("OnSuccess path = %q, want %q", entry.Path, path)
+		}
+		successRev = committedRev
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:        path,
+		BaseRev:     12,
+		Size:        int64(len(data)),
+		Kind:        PendingOverwrite,
+		ShadowSpill: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if gotExpected != 12 {
+		t.Fatalf("expected revision = %d, want 12", gotExpected)
+	}
+	if !bytes.Equal(gotBody, data) {
+		t.Fatalf("direct PUT body = %q, want %q", gotBody, data)
+	}
+	if multipartCalls.Load() != 0 {
+		t.Fatalf("multipart calls = %d, want 0", multipartCalls.Load())
+	}
+	if successRev != 13 {
+		t.Fatalf("OnSuccess committedRev = %d, want 13", successRev)
+	}
+	if pending.HasPending(path) {
+		t.Fatal("pending entry should be removed after successful direct PUT ShadowSpill commit")
+	}
+	if shadow.Has(path) {
+		t.Fatal("shadow should be removed after successful direct PUT ShadowSpill commit")
 	}
 }
 
@@ -1611,7 +1707,9 @@ func TestCommitQueueMultipartCreateInfersRevisionForOpenHandle(t *testing.T) {
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	fs := NewDat9FS(newTestClient(ts.URL), opts)
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	fs := NewDat9FS(c, opts)
 	shadow, err := NewShadowStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -1623,7 +1721,7 @@ func TestCommitQueueMultipartCreateInfersRevisionForOpenHandle(t *testing.T) {
 	}
 	fs.shadowStore = shadow
 	fs.pendingIndex = pending
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	cq.PathLock = fs.lockRemoteCommitPath
 	cq.OnSuccess = fs.onCommitQueueSuccess
 	cq.OnCleanup = fs.onCommitQueueCleanup
@@ -1679,13 +1777,27 @@ func TestCommitQueueMultipartCreateInfersRevisionForOpenHandle(t *testing.T) {
 	}
 }
 
-// TestCommitQueueShadowSpillConflictTerminal verifies that ShadowSpill entries
-// skip auto-resolve (which would OOM) and go straight to terminal failure.
+// TestCommitQueueShadowSpillConflictTerminal verifies that for ShadowSpill
+// entries a genuine conflict (server size differs from local shadow) goes to
+// terminal failure after a single HEAD probe — no content download, no LWW
+// re-upload, no full-memory ReadAll.
 func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
-	var calls int
+	var putCalls, headCalls, getCalls int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+		switch r.Method {
+		case http.MethodHead:
+			headCalls++
+			// Server size differs from local 4 bytes → genuine conflict.
+			w.Header().Set("X-Dat9-Revision", "9")
+			w.Header().Set("Content-Length", "999")
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			getCalls++
+			http.Error(w, `{"error":"unexpected read"}`, http.StatusInternalServerError)
+		default:
+			putCalls++
+			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+		}
 	}))
 	defer ts.Close()
 
@@ -1706,7 +1818,9 @@ func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
 	if err := cq.Enqueue(&CommitEntry{
 		Path:        "/big-conflict.bin",
 		BaseRev:     5,
@@ -1718,10 +1832,11 @@ func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
 	}
 	cq.DrainAll()
 
-	// ShadowSpill: 409 → skip auto-resolve → terminal failure immediately.
-	// Only 1 call: the initial upload (no Stat/Read for auto-resolve).
-	if calls != 1 {
-		t.Fatalf("expected 1 call (upload only, no auto-resolve), got %d", calls)
+	if headCalls != 1 {
+		t.Fatalf("expected 1 HEAD probe for size check, got %d", headCalls)
+	}
+	if getCalls != 0 {
+		t.Fatalf("expected no content reads when sizes differ, got %d", getCalls)
 	}
 	if !pending.HasPending("/big-conflict.bin") {
 		t.Fatal("pending entry should be preserved after ShadowSpill terminal conflict")
@@ -1732,6 +1847,266 @@ func TestCommitQueueShadowSpillConflictTerminal(t *testing.T) {
 	}
 	if !shadow.Has("/big-conflict.bin") {
 		t.Fatal("shadow should be preserved after ShadowSpill terminal conflict")
+	}
+}
+
+// TestCommitQueueShadowSpillConflictIdempotent verifies that when the server
+// content already equals the local shadow (crash after a completed upload,
+// before local cleanup), a ShadowSpill 409 resolves as idempotent success via
+// chunked compare instead of a phantom terminal conflict.
+func TestCommitQueueShadowSpillConflictIdempotent(t *testing.T) {
+	data := bytes.Repeat([]byte("spill-ok"), 512) // 4096 bytes
+	var putCalls int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			w.Header().Set("X-Dat9-Revision", "7")
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+			w.WriteHeader(http.StatusOK)
+		case http.MethodGet:
+			http.ServeContent(w, r, "big.bin", time.Time{}, bytes.NewReader(data))
+		default:
+			putCalls++
+			http.Error(w, `{"error":"revision conflict"}`, http.StatusConflict)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := shadow.WriteFull("/big.bin", data, 5); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutShadowSpill("/big.bin", int64(len(data)), PendingOverwrite, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	if err := cq.Enqueue(&CommitEntry{
+		Path:        "/big.bin",
+		BaseRev:     5,
+		Size:        int64(len(data)),
+		Kind:        PendingOverwrite,
+		ShadowSpill: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if putCalls != 1 {
+		t.Fatalf("expected exactly 1 upload attempt (no LWW re-upload), got %d", putCalls)
+	}
+	if pending.HasPending("/big.bin") {
+		t.Fatal("pending entry should be removed after idempotent resolve")
+	}
+	if shadow.Has("/big.bin") {
+		t.Fatal("shadow should be removed after idempotent resolve")
+	}
+}
+
+// TestCommitQueueAutoResolveNotFoundRetriesAsCreate verifies that a 409 whose
+// auto-resolve stat finds no remote file (e.g. the server 409ed on an upload
+// session orphaned by a crashed client, not on content) retries the upload as
+// a create instead of terminal-failing and abandoning the data.
+func TestCommitQueueAutoResolveNotFoundRetriesAsCreate(t *testing.T) {
+	var uploadCalls, statCalls int
+	var successRev int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodHead:
+			statCalls++
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		case http.MethodGet:
+			t.Errorf("unexpected GET %s", r.URL.String())
+			http.Error(w, `{"error":"unexpected read"}`, http.StatusInternalServerError)
+		default:
+			uploadCalls++
+			if r.Header.Get("X-Dat9-Expected-Revision") != "0" {
+				http.Error(w, `{"error":"unexpected revision"}`, http.StatusBadRequest)
+				return
+			}
+			if uploadCalls == 1 {
+				// Dangling upload session left by a crashed client.
+				http.Error(w, `{"error":"active upload already exists for this path"}`, http.StatusConflict)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := shadow.WriteFull("/recovered.txt", []byte("recovered-data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/recovered.txt", 14, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		successRev = committedRev
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:    "/recovered.txt",
+		BaseRev: 0,
+		Size:    14,
+		Kind:    PendingNew,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if uploadCalls != 2 {
+		t.Fatalf("upload calls = %d, want 2 (initial 409 + create retry)", uploadCalls)
+	}
+	if statCalls != 1 {
+		t.Fatalf("stat calls = %d, want 1", statCalls)
+	}
+	if successRev != 1 {
+		t.Fatalf("OnSuccess committedRev = %d, want 1 for a resolved create", successRev)
+	}
+	if pending.HasPending("/recovered.txt") {
+		t.Fatal("pending entry should be removed after create retry succeeds")
+	}
+	if shadow.Has("/recovered.txt") {
+		t.Fatal("shadow should be removed after create retry succeeds")
+	}
+}
+
+// TestCommitQueueShadowSpillConflictNotFoundRetriesAsCreate reproduces the
+// crash-recovery e2e failure: a SIGKILLed mount leaves a dangling server-side
+// upload session, so the recovery commit's initiate 409s even though the file
+// was never committed (stat 404). The resolve must re-upload as a create
+// rather than parking the recovered data as a terminal conflict.
+func TestCommitQueueShadowSpillConflictNotFoundRetriesAsCreate(t *testing.T) {
+	data := bytes.Repeat([]byte("recovered-spill-"), 256)
+	var initiateCalls, statCalls int
+	var gotBody []byte
+	retryExpectedRev := int64(-1)
+	var successRev int64
+	var ts *httptest.Server
+	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodHead:
+			statCalls++
+			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/initiate":
+			initiateCalls++
+			if initiateCalls == 1 {
+				// Dangling upload session left by the crashed client.
+				http.Error(w, `{"error":"active upload already exists for this path"}`, http.StatusConflict)
+				return
+			}
+			var req struct {
+				ExpectedRevision *int64 `json:"expected_revision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode initiate request: %v", err)
+			}
+			if req.ExpectedRevision != nil {
+				retryExpectedRev = *req.ExpectedRevision
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"upload_id":   "u-retry",
+				"key":         "object-key",
+				"part_size":   int64(len(data)),
+				"total_parts": 1,
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u-retry/presign-batch":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"parts": []map[string]any{{
+					"number": 1,
+					"url":    ts.URL + "/s3/u-retry/1",
+					"size":   int64(len(data)),
+				}},
+			})
+		case r.Method == http.MethodPut && r.URL.Path == "/s3/u-retry/1":
+			body, _ := io.ReadAll(r.Body)
+			gotBody = body
+			w.Header().Set("ETag", "etag-1")
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/v2/uploads/u-retry/complete":
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
+			http.Error(w, `{"error":"unexpected request"}`, http.StatusInternalServerError)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := shadow.WriteFull("/recovered-spill.bin", data, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutShadowSpill("/recovered-spill.bin", int64(len(data)), PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	cq := NewCommitQueue(c, shadow, pending, nil, 1, 8)
+	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
+		successRev = committedRev
+	}
+	if err := cq.Enqueue(&CommitEntry{
+		Path:        "/recovered-spill.bin",
+		BaseRev:     0,
+		Size:        int64(len(data)),
+		Kind:        PendingNew,
+		ShadowSpill: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+
+	if initiateCalls != 2 {
+		t.Fatalf("initiate calls = %d, want 2 (initial 409 + create retry)", initiateCalls)
+	}
+	if statCalls != 1 {
+		t.Fatalf("stat calls = %d, want 1", statCalls)
+	}
+	if retryExpectedRev != 0 {
+		t.Fatalf("retry expected_revision = %d, want 0 (create)", retryExpectedRev)
+	}
+	if !bytes.Equal(gotBody, data) {
+		t.Fatalf("server received %d bytes, want %d", len(gotBody), len(data))
+	}
+	if successRev != 1 {
+		t.Fatalf("OnSuccess committedRev = %d, want 1 for a resolved create", successRev)
+	}
+	if pending.HasPending("/recovered-spill.bin") {
+		t.Fatal("pending entry should be removed after create retry succeeds")
+	}
+	if shadow.Has("/recovered-spill.bin") {
+		t.Fatal("shadow should be removed after create retry succeeds")
 	}
 }
 
@@ -1845,7 +2220,9 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 
 	// RecoverPending should reconstruct CommitEntry with ShadowSpill=true,
 	// causing uploadEntry to use streaming (uploadFromShadow) not ReadAll.
-	cq := NewCommitQueue(newTestClient(ts.URL), shadow2, pending2, nil, 1, 8)
+	c := newTestClient(ts.URL)
+	c.SetSmallFileThresholdForTests(1)
+	cq := NewCommitQueue(c, shadow2, pending2, nil, 1, 8)
 	cq.OnSuccess = func(entry *CommitEntry, committedRev int64) {
 		if entry.Path != "/recover.bin" {
 			t.Fatalf("OnSuccess path = %q, want /recover.bin", entry.Path)
@@ -1870,5 +2247,655 @@ func TestCommitQueueRecoverPendingShadowSpill(t *testing.T) {
 	}
 	if shadow2.Has("/recover.bin") {
 		t.Fatal("shadow should be removed after successful recovery upload")
+	}
+}
+
+// TestCommitQueueRecoverPendingUsesShadowSize verifies that recovery routes
+// the upload by the actual shadow file size, not stale pending metadata. A
+// WAL-resurrected meta can carry an old size; routing on it would direct-PUT
+// a file the server requires to be multipart (or vice versa).
+func TestCommitQueueRecoverPendingUsesShadowSize(t *testing.T) {
+	data := []byte("0123456789abcdef") // 16 bytes, well under the 50KB threshold
+	var putBody []byte
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			putBody, _ = io.ReadAll(r.Body)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/uploads/"):
+			t.Errorf("multipart initiate used for a %d-byte file — stale meta size routed the upload", len(data))
+			http.Error(w, `{"error":"unexpected multipart"}`, http.StatusBadRequest)
+		default:
+			http.Error(w, `{"error":"unexpected"}`, http.StatusBadRequest)
+		}
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := shadow.WriteFull("/stale.bin", data, 5); err != nil {
+		t.Fatal(err)
+	}
+	// Stale meta: claims 60000 bytes (> 50KB threshold → would multipart).
+	if _, err := pending.PutWithBaseRev("/stale.bin", 60000, PendingOverwrite, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.RecoverPending()
+	cq.DrainAll()
+
+	if !bytes.Equal(putBody, data) {
+		t.Fatalf("direct PUT body = %d bytes, want %d", len(putBody), len(data))
+	}
+	if pending.HasPending("/stale.bin") {
+		t.Error("pending entry not cleaned up after recovered commit")
+	}
+}
+
+// TestCommitQueueCancelPathJournalsCommitMarker verifies that unlinking a
+// path with pending local state writes a WAL "done" marker, so a later crash
+// recovery does not resurrect the deleted file from older fsync frames.
+func TestCommitQueueCancelPathJournalsCommitMarker(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"unexpected"}`, http.StatusBadRequest)
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	journal, err := NewJournal(dir + "/journal.wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = journal.Close() }()
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the Fsync flow: shadow + meta + WAL fsync frame.
+	if err := shadow.WriteFull("/gone.txt", []byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/gone.txt", 4, PendingNew, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := journal.Append(JournalEntry{Op: JournalFsync, Path: "/gone.txt", Length: 4}); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, journal, 1, 8)
+	cq.CancelPath("/gone.txt") // Unlink flow
+	cq.DrainAll()
+
+	if shadow.Has("/gone.txt") || pending.HasPending("/gone.txt") {
+		t.Fatal("cancel did not clean local state")
+	}
+
+	// Crash recovery must not resurrect the unlinked path.
+	recovered, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replayJournalIntoPending(journal, recovered); err != nil {
+		t.Fatal(err)
+	}
+	if recovered.HasPending("/gone.txt") {
+		t.Error("unlinked path resurrected from WAL — cancel marker missing")
+	}
+}
+
+func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t *testing.T) {
+	zero := &CommitEntry{Path: "/file.txt", Size: 0, Kind: PendingOverwrite, CoalesceZeroTruncate: true}
+	nonzero := &CommitEntry{Path: "/other.txt", Size: 4, Kind: PendingOverwrite}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{zero, nonzero},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	cq.rebuildQueuedIndexLocked()
+	markCommitEntryDelayedForTest(t, cq, zero)
+
+	if !cq.CancelQueuedZeroTruncatePreserveLocal("/file.txt") {
+		t.Fatal("cancel queued zero truncate returned false")
+	}
+	if !zero.canceled {
+		t.Fatal("zero truncate entry was not marked canceled")
+	}
+	if cq.HasPath("/file.txt") {
+		t.Fatal("zero truncate path still queued")
+	}
+	if !cq.HasPath("/other.txt") {
+		t.Fatal("non-zero queued entry was affected")
+	}
+
+	zero = &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite, CoalesceZeroTruncate: true}
+	samePathNonzero := &CommitEntry{Path: "/same.txt", Size: 4, Kind: PendingOverwrite}
+	cq = &CommitQueue{
+		queue:        []*CommitEntry{zero, samePathNonzero},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	cq.rebuildQueuedIndexLocked()
+	markCommitEntryDelayedForTest(t, cq, zero)
+
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/same.txt") {
+		t.Fatal("cancel returned true while non-zero same-path entry remained queued")
+	}
+	if !zero.canceled {
+		t.Fatal("zero truncate entry was not marked canceled with same-path non-zero entry")
+	}
+	if samePathNonzero.canceled {
+		t.Fatal("non-zero same-path entry was canceled")
+	}
+	if !cq.HasPath("/same.txt") {
+		t.Fatal("same-path non-zero entry disappeared")
+	}
+
+	inFlight := &CommitEntry{Path: "/busy.txt", Size: 0, Kind: PendingOverwrite}
+	cq = &CommitQueue{
+		queue:        []*CommitEntry{inFlight},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{"/busy.txt": inFlight},
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/busy.txt") {
+		t.Fatal("cancel returned true for in-flight zero truncate")
+	}
+	if inFlight.canceled {
+		t.Fatal("in-flight zero truncate was canceled")
+	}
+	if !cq.HasPath("/busy.txt") {
+		t.Fatal("in-flight path disappeared")
+	}
+}
+
+func TestCommitQueueCancelQueuedZeroTruncateDoesNotCancelDispatchedBeforeInFlight(t *testing.T) {
+	entry := &CommitEntry{
+		Path:                 "/dispatched.txt",
+		Size:                 0,
+		Kind:                 PendingOverwrite,
+		CoalesceZeroTruncate: true,
+		dispatched:           true,
+	}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{entry},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/dispatched.txt") {
+		t.Fatal("cancel returned true for dispatched zero truncate")
+	}
+	if entry.canceled {
+		t.Fatal("dispatched zero truncate was canceled before in-flight")
+	}
+	if !cq.HasPath("/dispatched.txt") {
+		t.Fatal("dispatched zero truncate disappeared from queue")
+	}
+	if pending := cq.Pending(); pending != 1 {
+		t.Fatalf("pending after dispatched cancel attempt = %d, want 1", pending)
+	}
+}
+
+func markCommitEntryDelayedForTest(t *testing.T, cq *CommitQueue, entry *CommitEntry) {
+	t.Helper()
+	if cq.delayed == nil {
+		cq.delayed = make(map[*CommitEntry]*time.Timer)
+	}
+	timer := time.NewTimer(time.Hour)
+	cq.delayed[entry] = timer
+	t.Cleanup(func() {
+		timer.Stop()
+	})
+}
+
+func TestCommitQueueDelayedZeroTruncateCancelNeverUploads(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/file.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/file.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	entry := &CommitEntry{Path: "/file.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(entry); err != nil {
+		t.Fatal(err)
+	}
+	if !cq.HasPath("/file.txt") {
+		t.Fatal("delayed zero truncate should remain visible as queued")
+	}
+	if !cq.CancelQueuedZeroTruncatePreserveLocal("/file.txt") {
+		t.Fatal("cancel delayed zero truncate returned false")
+	}
+	if !entry.canceled {
+		t.Fatal("delayed zero truncate was not marked canceled")
+	}
+	if cq.HasPath("/file.txt") {
+		t.Fatal("delayed zero truncate still blocks path after cancel")
+	}
+	cq.DrainAll()
+	if got := uploads.Load(); got != 0 {
+		t.Fatalf("uploads after cancel = %d, want 0", got)
+	}
+	if !shadow.Has("/file.txt") || !pending.HasPending("/file.txt") {
+		t.Fatal("cancel queued zero truncate should preserve local shadow/pending")
+	}
+}
+
+func TestCommitQueueCancelDelayedZeroTruncateDoesNotLeaveBackpressureZombie(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	cq := NewCommitQueue(newTestClient(ts.URL), nil, nil, nil, 1, 2)
+	cq.zeroTruncateDelay = time.Hour
+	for i := 0; i < 10; i++ {
+		entry := &CommitEntry{
+			Path:                 "/loop.txt",
+			Size:                 0,
+			Kind:                 PendingOverwrite,
+			BaseRev:              7,
+			CoalesceZeroTruncate: true,
+		}
+		if err := cq.Enqueue(entry); err != nil {
+			t.Fatalf("enqueue iteration %d: %v", i, err)
+		}
+		if !cq.CancelQueuedZeroTruncatePreserveLocal("/loop.txt") {
+			t.Fatalf("cancel iteration %d returned false", i)
+		}
+		if pending := cq.Pending(); pending != 0 {
+			t.Fatalf("pending after cancel iteration %d = %d, want 0", i, pending)
+		}
+		if cq.HasPath("/loop.txt") {
+			t.Fatalf("path remains queued after cancel iteration %d", i)
+		}
+	}
+	cq.DrainAll()
+	if got := uploads.Load(); got != 0 {
+		t.Fatalf("uploads after repeated cancel = %d, want 0", got)
+	}
+}
+
+func TestCommitQueueCancelQueuedZeroTruncateCancelsAllDelayedSamePath(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	cq := NewCommitQueue(newTestClient(ts.URL), nil, nil, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	first := &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	second := &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(second); err != nil {
+		t.Fatal(err)
+	}
+	if !cq.CancelQueuedZeroTruncatePreserveLocal("/same.txt") {
+		t.Fatal("cancel delayed same-path zero truncates returned false")
+	}
+	if !first.canceled || !second.canceled {
+		t.Fatalf("same-path delayed entries canceled = %t/%t, want true/true", first.canceled, second.canceled)
+	}
+	if pending := cq.Pending(); pending != 0 {
+		t.Fatalf("pending after same-path delayed cancel = %d, want 0", pending)
+	}
+	if cq.HasPath("/same.txt") {
+		t.Fatal("same-path delayed entries still visible after cancel")
+	}
+	cq.DrainAll()
+	if got := uploads.Load(); got != 0 {
+		t.Fatalf("uploads after same-path delayed cancel = %d, want 0", got)
+	}
+}
+
+func TestCommitQueueDelayedZeroTruncateTimerDispatches(t *testing.T) {
+	uploadDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Dat9-Expected-Revision") != "7" {
+			t.Errorf("X-Dat9-Expected-Revision = %q, want 7", r.Header.Get("X-Dat9-Expected-Revision"))
+		}
+		select {
+		case uploadDone <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/standalone.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/standalone.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = 20 * time.Millisecond
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{Path: "/standalone.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-uploadDone:
+	case <-time.After(time.Second):
+		t.Fatal("delayed zero truncate was not dispatched after delay")
+	}
+	cq.WaitPath("/standalone.txt")
+	if shadow.Has("/standalone.txt") || pending.HasPending("/standalone.txt") {
+		t.Fatal("successful delayed zero truncate should clean local shadow/pending")
+	}
+}
+
+func TestCommitQueueWaitPathForcesDelayedZeroTruncate(t *testing.T) {
+	uploadDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case uploadDone <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/force.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/force.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{Path: "/force.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		cq.WaitPath("/force.txt")
+		close(done)
+	}()
+	select {
+	case <-uploadDone:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("WaitPath did not force delayed zero truncate dispatch")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("WaitPath did not return after forced delayed zero truncate")
+	}
+}
+
+func TestCommitQueueForcedDelayedZeroTruncateCannotBeCanceledBeforeInFlight(t *testing.T) {
+	uploadDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case uploadDone <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/force-cancel.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/force-cancel.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	lockAcquired := make(chan struct{})
+	releaseLock := make(chan struct{})
+	cq.PathLock = func(path string) func() {
+		if path == "/force-cancel.txt" {
+			close(lockAcquired)
+			<-releaseLock
+		}
+		return func() {}
+	}
+	defer cq.DrainAll()
+	entry := &CommitEntry{Path: "/force-cancel.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(entry); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		cq.WaitPath("/force-cancel.txt")
+		close(done)
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("forced delayed zero truncate did not reach worker path lock")
+	}
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/force-cancel.txt") {
+		t.Fatal("force-dispatched zero truncate was canceled before in-flight")
+	}
+	if entry.canceled {
+		t.Fatal("force-dispatched zero truncate was marked canceled")
+	}
+	close(releaseLock)
+	select {
+	case <-uploadDone:
+	case <-time.After(time.Second):
+		t.Fatal("force-dispatched zero truncate was not uploaded")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("WaitPath did not return after forced zero truncate upload")
+	}
+}
+
+func TestCommitQueueWaitPrefixForcesDelayedZeroTruncate(t *testing.T) {
+	uploadDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case uploadDone <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/dir/file.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/dir/file.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{Path: "/dir/file.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		cq.WaitPrefix("/dir/")
+		close(done)
+	}()
+	select {
+	case <-uploadDone:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("WaitPrefix did not force delayed zero truncate dispatch")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("WaitPrefix did not return after forced delayed zero truncate")
+	}
+}
+
+func TestCommitQueueDrainAllForcesDelayedZeroTruncate(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/drain.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/drain.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	if err := cq.Enqueue(&CommitEntry{Path: "/drain.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+	if got := uploads.Load(); got != 1 {
+		t.Fatalf("uploads after DrainAll = %d, want 1", got)
+	}
+	if shadow.Has("/drain.txt") || pending.HasPending("/drain.txt") {
+		t.Fatal("DrainAll forced delayed zero truncate should clean local shadow/pending")
+	}
+}
+
+func TestCommitQueueCancelPathStopsDelayedZeroTruncateAndCleansLocal(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/unlink.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/unlink.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	entry := &CommitEntry{Path: "/unlink.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(entry); err != nil {
+		t.Fatal(err)
+	}
+	cq.CancelPath("/unlink.txt")
+	cq.DrainAll()
+	if !entry.canceled {
+		t.Fatal("CancelPath did not mark delayed zero truncate canceled")
+	}
+	if got := uploads.Load(); got != 0 {
+		t.Fatalf("uploads after CancelPath = %d, want 0", got)
+	}
+	if shadow.Has("/unlink.txt") || pending.HasPending("/unlink.txt") {
+		t.Fatal("CancelPath should clean local shadow/pending")
 	}
 }

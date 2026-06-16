@@ -17,7 +17,10 @@ import (
 
 var errCommitPostUpload = errors.New("commit post-upload step failed")
 
-const maxInlineLayerEntryBytes = 96 << 20
+const (
+	maxInlineLayerEntryBytes     = 96 << 20
+	zeroTruncateCommitQueueDelay = 50 * time.Millisecond
+)
 
 // directPutThreshold returns the size limit below which commit queue workers
 // use direct PUT (WriteCtxConditionalWithRevision) instead of multipart
@@ -42,17 +45,19 @@ func (cq *CommitQueue) directPutThreshold() int64 {
 
 // CommitEntry represents a pending remote commit.
 type CommitEntry struct {
-	Path         string
-	Inode        uint64
-	BaseRev      int64 // revision when we started editing
-	Size         int64
-	Kind         PendingKind
-	ShadowSpill  bool // true when data is only in shadow file (auto-resolve would OOM)
-	Mode         uint32
-	HasMode      bool
-	canceled     bool
-	cancelCommit context.CancelFunc
-	cancelUpload context.CancelFunc
+	Path                 string
+	Inode                uint64
+	BaseRev              int64 // revision when we started editing
+	Size                 int64
+	Kind                 PendingKind
+	ShadowSpill          bool // true when data is only in shadow file (auto-resolve would OOM)
+	Mode                 uint32
+	HasMode              bool
+	CoalesceZeroTruncate bool
+	dispatched           bool
+	canceled             bool
+	cancelCommit         context.CancelFunc
+	cancelUpload         context.CancelFunc
 }
 
 // CommitSuccessFunc is called after a commit queue entry is successfully
@@ -71,6 +76,7 @@ type CommitQueue struct {
 	queue        []*CommitEntry
 	queuedByPath map[string]map[*CommitEntry]struct{}
 	inFlight     map[string]*CommitEntry // paths currently being processed by workers
+	delayed      map[*CommitEntry]*time.Timer
 	maxPending   int
 	client       *client.Client
 	remoteRoot   string
@@ -96,6 +102,8 @@ type CommitQueue struct {
 	// larger than maxPending so Enqueue never blocks.
 	workCh chan *CommitEntry
 
+	zeroTruncateDelay time.Duration
+
 	perf *fusePerfCounters
 }
 
@@ -117,15 +125,17 @@ func NewCommitQueue(c *client.Client, shadows *ShadowStore, index *PendingIndex,
 		bufSize = 256
 	}
 	cq := &CommitQueue{
-		maxPending:   maxPending,
-		client:       c,
-		remoteRoot:   root,
-		shadows:      shadows,
-		index:        index,
-		journal:      journal,
-		inFlight:     make(map[string]*CommitEntry),
-		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
-		workCh:       make(chan *CommitEntry, bufSize),
+		maxPending:        maxPending,
+		client:            c,
+		remoteRoot:        root,
+		shadows:           shadows,
+		index:             index,
+		journal:           journal,
+		inFlight:          make(map[string]*CommitEntry),
+		queuedByPath:      make(map[string]map[*CommitEntry]struct{}),
+		delayed:           make(map[*CommitEntry]*time.Timer),
+		workCh:            make(chan *CommitEntry, bufSize),
+		zeroTruncateDelay: zeroTruncateCommitQueueDelay,
 	}
 	for i := 0; i < numWorkers; i++ {
 		cq.wg.Add(1)
@@ -194,12 +204,117 @@ func (cq *CommitQueue) Enqueue(entry *CommitEntry) error {
 		cq.perf.commitEnqueue.add(1)
 	}
 
+	if cq.shouldDelayZeroTruncateLocked(entry) {
+		cq.delayZeroTruncateLocked(entry)
+		return nil
+	}
+	entry.dispatched = true
+
 	// Send to workers while holding the lock. The channel buffer is always
 	// > maxPending, so this will not block as long as the backpressure
 	// check above holds. Holding the lock prevents DrainAll from closing
 	// workCh between our check and the send.
 	cq.workCh <- entry
 	return nil
+}
+
+func (cq *CommitQueue) shouldDelayZeroTruncateLocked(entry *CommitEntry) bool {
+	if cq == nil || entry == nil || entry.canceled || !entry.CoalesceZeroTruncate || !isQueuedZeroTruncateEntry(entry) {
+		return false
+	}
+	return cq.zeroTruncateDelay > 0
+}
+
+func (cq *CommitQueue) isDelayedLocked(entry *CommitEntry) bool {
+	if cq == nil || entry == nil || cq.delayed == nil {
+		return false
+	}
+	return cq.delayed[entry] != nil
+}
+
+func (cq *CommitQueue) delayZeroTruncateLocked(entry *CommitEntry) {
+	if cq.delayed == nil {
+		cq.delayed = make(map[*CommitEntry]*time.Timer)
+	}
+	delay := cq.zeroTruncateDelay
+	cq.delayed[entry] = time.AfterFunc(delay, func() {
+		cq.dispatchDelayed(entry)
+	})
+}
+
+func (cq *CommitQueue) dispatchDelayed(entry *CommitEntry) {
+	if cq == nil || entry == nil {
+		return
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if cq.delayed == nil || cq.delayed[entry] == nil {
+		return
+	}
+	delete(cq.delayed, entry)
+	if cq.stopped || entry.canceled {
+		return
+	}
+	entry.dispatched = true
+	cq.workCh <- entry
+}
+
+func (cq *CommitQueue) stopDelayedLocked(entry *CommitEntry) {
+	if cq == nil || entry == nil || cq.delayed == nil {
+		return
+	}
+	if timer := cq.delayed[entry]; timer != nil {
+		timer.Stop()
+		delete(cq.delayed, entry)
+	}
+}
+
+func (cq *CommitQueue) forceDelayedPathLocked(path string) {
+	if cq == nil || path == "" || len(cq.delayed) == 0 {
+		return
+	}
+	for entry, timer := range cq.delayed {
+		if entry == nil || entry.Path != path {
+			continue
+		}
+		timer.Stop()
+		delete(cq.delayed, entry)
+		if !cq.stopped && !entry.canceled {
+			entry.dispatched = true
+			cq.workCh <- entry
+		}
+	}
+}
+
+func (cq *CommitQueue) forceDelayedPrefixLocked(prefix string) {
+	if cq == nil || prefix == "" || len(cq.delayed) == 0 {
+		return
+	}
+	for entry, timer := range cq.delayed {
+		if entry == nil || !strings.HasPrefix(entry.Path, prefix) {
+			continue
+		}
+		timer.Stop()
+		delete(cq.delayed, entry)
+		if !cq.stopped && !entry.canceled {
+			entry.dispatched = true
+			cq.workCh <- entry
+		}
+	}
+}
+
+func (cq *CommitQueue) forceAllDelayedLocked() {
+	if cq == nil || len(cq.delayed) == 0 {
+		return
+	}
+	for entry, timer := range cq.delayed {
+		timer.Stop()
+		delete(cq.delayed, entry)
+		if !cq.stopped && entry != nil && !entry.canceled {
+			entry.dispatched = true
+			cq.workCh <- entry
+		}
+	}
 }
 
 // Pending returns the number of pending commits.
@@ -267,6 +382,7 @@ func (cq *CommitQueue) DrainAll() {
 		cq.wg.Wait()
 		return
 	}
+	cq.forceAllDelayedLocked()
 	cq.stopped = true
 	// Close workCh under the lock so no concurrent Enqueue can send after close.
 	close(cq.workCh)
@@ -299,10 +415,20 @@ func (cq *CommitQueue) RecoverPending() {
 			log.Printf("commit queue: skip legacy pending overwrite without base revision for %s", path)
 			continue
 		}
+		// The shadow file is the data actually uploaded; its size is
+		// authoritative. Meta size can be stale (memory-only updates, or a
+		// WAL-resurrected entry from an older fsync) and would mis-route the
+		// direct-PUT vs multipart decision in uploadEntry.
+		size := meta.Size
+		if cq.shadows != nil {
+			if shadowSize := cq.shadows.Size(path); shadowSize >= 0 {
+				size = shadowSize
+			}
+		}
 		entry := &CommitEntry{
 			Path:        path,
 			BaseRev:     meta.BaseRev,
-			Size:        meta.Size,
+			Size:        size,
 			Kind:        meta.Kind,
 			ShadowSpill: meta.ShadowSpill,
 			Mode:        meta.Mode,
@@ -320,6 +446,7 @@ func (cq *CommitQueue) RecoverPending() {
 func (cq *CommitQueue) WaitPath(path string) {
 	for {
 		cq.mu.Lock()
+		cq.forceDelayedPathLocked(path)
 		_, inflight := cq.inFlight[path]
 		queued := cq.hasQueuedPathLocked(path)
 		cq.mu.Unlock()
@@ -348,6 +475,7 @@ func (cq *CommitQueue) HasPath(path string) bool {
 func (cq *CommitQueue) WaitPrefix(prefix string) {
 	for {
 		cq.mu.Lock()
+		cq.forceDelayedPrefixLocked(prefix)
 		found := false
 		for p := range cq.inFlight {
 			if strings.HasPrefix(p, prefix) {
@@ -387,6 +515,40 @@ func (cq *CommitQueue) CancelPathPreserveLocal(path string) {
 	cq.cancelPath(path, true)
 }
 
+// CancelQueuedZeroTruncatePreserveLocal cancels queued, not in-flight,
+// zero-byte overwrite entries for path without removing shadow/pending state.
+// It returns true only when no in-flight or other queued same-path entry remains.
+func (cq *CommitQueue) CancelQueuedZeroTruncatePreserveLocal(path string) bool {
+	if cq == nil || path == "" {
+		return true
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	if cq.inFlight[path] != nil {
+		return false
+	}
+	otherQueued := false
+	remaining := cq.queue[:0]
+	for _, entry := range cq.queue {
+		if entry == nil || entry.Path != path {
+			remaining = append(remaining, entry)
+			continue
+		}
+		if isQueuedZeroTruncateEntry(entry) && cq.isDelayedLocked(entry) && !entry.dispatched {
+			entry.canceled = true
+			cq.stopDelayedLocked(entry)
+			continue
+		}
+		otherQueued = true
+		remaining = append(remaining, entry)
+	}
+	cq.queue = remaining
+	if cq.queuedByPath != nil {
+		cq.rebuildQueuedIndexLocked()
+	}
+	return !otherQueued
+}
+
 func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	var cancels []context.CancelFunc
 	seen := make(map[*CommitEntry]struct{})
@@ -395,6 +557,7 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 			return
 		}
 		e.canceled = true
+		cq.stopDelayedLocked(e)
 		if _, ok := seen[e]; ok {
 			return
 		}
@@ -444,11 +607,28 @@ func (cq *CommitQueue) cancelPath(path string, preserveLocal bool) {
 	if preserveLocal {
 		return
 	}
-	if cq.shadows != nil {
+	hadLocal := false
+	if cq.shadows != nil && cq.shadows.Has(path) {
+		hadLocal = true
 		cq.shadows.Remove(path)
 	}
-	if cq.index != nil {
+	if cq.index != nil && cq.index.HasPending(path) {
+		hadLocal = true
 		cq.index.Remove(path)
+	}
+	// Journal a "done" marker so crash recovery does not resurrect the
+	// unlinked path from earlier fsync frames, and so those frames compact.
+	// Only when local pending state existed, to avoid a WAL frame per unlink.
+	if hadLocal && cq.journal != nil {
+		// Best effort: a lost marker only means recovery re-checks a path
+		// whose shadow/.meta are already gone, which the pending-index
+		// prune discards. Log so persistent WAL write failures surface.
+		if err := cq.journal.Append(JournalEntry{
+			Op:   JournalCommit,
+			Path: path,
+		}); err != nil {
+			log.Printf("commit queue: journal cancel marker failed for %s: %v", path, err)
+		}
 	}
 }
 
@@ -466,6 +646,7 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 			return
 		}
 		e.canceled = true
+		cq.stopDelayedLocked(e)
 		if _, ok := seen[e]; ok {
 			return
 		}
@@ -507,6 +688,14 @@ func (cq *CommitQueue) CancelPrefix(prefix string) {
 		if cq.index != nil {
 			cq.index.Remove(p)
 		}
+		if cq.journal != nil {
+			if err := cq.journal.Append(JournalEntry{
+				Op:   JournalCommit,
+				Path: p,
+			}); err != nil {
+				log.Printf("commit queue: journal cancel marker failed for %s: %v", p, err)
+			}
+		}
 	}
 }
 
@@ -546,6 +735,10 @@ func (cq *CommitQueue) worker() {
 		// Clear in-flight after all cleanup is done.
 		cq.endInFlight(entry)
 	}
+}
+
+func isQueuedZeroTruncateEntry(entry *CommitEntry) bool {
+	return entry != nil && entry.Kind == PendingOverwrite && entry.Size == 0
 }
 
 func (cq *CommitQueue) beginInFlight(entry *CommitEntry) bool {
@@ -687,7 +880,7 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		}
 		if errors.Is(err, client.ErrConflict) {
 			log.Printf("commit queue: conflict committing %s at base revision %d, attempting auto-resolve", entry.Path, entry.BaseRev)
-			cq.tryAutoResolveConflict(entry)
+			cq.tryAutoResolveConflict(entryCtx, entry)
 			unlockPath()
 			return
 		}
@@ -713,6 +906,25 @@ func sleepWithCancel(ctx context.Context, delay time.Duration) bool {
 	case <-ctx.Done():
 		return false
 	}
+}
+
+func (cq *CommitQueue) entryUploadContext(parent context.Context, entry *CommitEntry, timeout time.Duration) (context.Context, context.CancelFunc, bool) {
+	uploadCtx, uploadCancel := context.WithTimeout(parent, timeout)
+	cq.mu.Lock()
+	if entry.canceled {
+		cq.mu.Unlock()
+		uploadCancel()
+		return nil, nil, false
+	}
+	entry.cancelUpload = uploadCancel
+	cq.mu.Unlock()
+	cleanup := func() {
+		cq.mu.Lock()
+		entry.cancelUpload = nil
+		cq.mu.Unlock()
+		uploadCancel()
+	}
+	return uploadCtx, cleanup, true
 }
 
 // CommitNow uploads an entry synchronously through the same commit path used
@@ -868,6 +1080,7 @@ func (cq *CommitQueue) uploadLayerEntry(ctx context.Context, layerRef string, en
 func (cq *CommitQueue) removeFromQueue(entry *CommitEntry) {
 	cq.mu.Lock()
 	defer cq.mu.Unlock()
+	cq.stopDelayedLocked(entry)
 	for i, e := range cq.queue {
 		if e == entry {
 			cq.queue = append(cq.queue[:i], cq.queue[i+1:]...)
@@ -1006,7 +1219,7 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, com
 //
 // This covers ~80% of agent conflict scenarios (whole-file overwrites) without
 // requiring 3-way merge. Max 1 retry to avoid write amplification.
-func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
+func (cq *CommitQueue) tryAutoResolveConflict(entryCtx context.Context, entry *CommitEntry) {
 	// Bail early if the file was deleted locally while queued.
 	if cq.isEntryCanceled(entry) {
 		cq.removeFromQueue(entry)
@@ -1014,11 +1227,21 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 		return
 	}
 
-	// ShadowSpill large files: auto-resolve requires full-memory ReadAll +
-	// bytes.Equal which would OOM for multi-GiB files. Terminal failure instead.
-	if entry.ShadowSpill {
-		log.Printf("commit queue: auto-resolve skipped for ShadowSpill %s (would OOM), terminal failure", entry.Path)
+	// Layer mounts upload through layer endpoints; Stat/Read here would
+	// compare against the base FS namespace, so neither the idempotent
+	// check nor LWW can be trusted. Keep layer conflicts terminal.
+	if cq.layerRefSnapshot() != "" {
+		log.Printf("commit queue: auto-resolve unsupported for layer mount, terminal failure for %s", entry.Path)
 		cq.onCommitTerminalFailure(entry)
+		return
+	}
+
+	// ShadowSpill large files: full-memory ReadAll + bytes.Equal would OOM
+	// for multi-GiB files, so no LWW. But the idempotent case (crash after
+	// upload completed, before the local cleanup — the common large-file
+	// crash window) is resolvable with a bounded-memory chunked compare.
+	if entry.ShadowSpill {
+		cq.tryResolveShadowSpillIdempotent(entryCtx, entry)
 		return
 	}
 
@@ -1053,6 +1276,52 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 		cq.perf.recordRemoteOp(perfRemoteStat, err, time.Since(statStart), 0)
 	}
 	if err != nil {
+		if client.IsNotFound(err) {
+			// 409 but no committed remote file: the conflict came from
+			// upload-session state (e.g. a session orphaned by a crashed
+			// client), not content — or the file was deleted remotely, in
+			// which case LWW means the local write wins anyway. Retry once
+			// as a create; terminal only if the retry also fails.
+			if cq.isEntryCanceled(entry) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: auto-resolve skipped for %s (canceled before create retry)", entry.Path)
+				return
+			}
+			log.Printf("commit queue: conflict for %s but remote file not found, retrying upload as create", entry.Path)
+			uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(int64(len(localData))))
+			if !ok {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: auto-resolve skipped for %s (canceled before create retry upload)", entry.Path)
+				return
+			}
+			uploadStart := time.Now()
+			var committedRev int64
+			var uploadErr error
+			if len(localData) == 0 {
+				committedRev, uploadErr = cq.client.WriteCtxConditionalWithRevision(uploadCtx, apiPath, localData, 0)
+			} else {
+				uploadErr = uploadBufferedRemoteFile(uploadCtx, cq.client, apiPath, localData, 0)
+			}
+			uploadCancel()
+			if cq.perf != nil {
+				cq.perf.recordRemoteOp(perfRemoteWrite, uploadErr, time.Since(uploadStart), uint64(len(localData)))
+			}
+			if cq.isEntryCanceled(entry) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: auto-resolve skipped for %s (canceled during create retry upload)", entry.Path)
+				return
+			}
+			if uploadErr != nil {
+				log.Printf("commit queue: create retry failed for %s: %v", entry.Path, uploadErr)
+				cq.onCommitTerminalFailure(entry)
+				return
+			}
+			log.Printf("commit queue: auto-resolved conflict for %s via create retry (no remote file)", entry.Path)
+			if err := cq.onCommitSuccess(entry, 0, committedRev); err != nil {
+				cq.onCommitPostUploadFailure(entry, err)
+			}
+			return
+		}
 		log.Printf("commit queue: auto-resolve failed for %s: stat: %v", entry.Path, err)
 		cq.onCommitTerminalFailure(entry)
 		return
@@ -1089,7 +1358,12 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 		return
 	}
 	log.Printf("commit queue: auto-resolving conflict for %s via LWW (base rev %d → server rev %d)", entry.Path, entry.BaseRev, serverRev)
-	uploadCtx, uploadCancel := context.WithTimeout(context.Background(), releaseTimeout(int64(len(localData))))
+	uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(int64(len(localData))))
+	if !ok {
+		cq.removeFromQueue(entry)
+		log.Printf("commit queue: auto-resolve aborted for %s before LWW upload (canceled)", entry.Path)
+		return
+	}
 	uploadStart := time.Now()
 	err = uploadBufferedRemoteFile(uploadCtx, cq.client, apiPath, localData, serverRev)
 	uploadCancel()
@@ -1101,9 +1375,154 @@ func (cq *CommitQueue) tryAutoResolveConflict(entry *CommitEntry) {
 		cq.onCommitTerminalFailure(entry)
 		return
 	}
+	if cq.isEntryCanceled(entry) {
+		cq.removeFromQueue(entry)
+		log.Printf("commit queue: auto-resolve skipped for %s (canceled during LWW upload)", entry.Path)
+		return
+	}
 
 	log.Printf("commit queue: auto-resolved conflict for %s via LWW (overwrote rev %d → new upload based on rev %d)", entry.Path, entry.BaseRev, serverRev)
 	if err := cq.onCommitSuccess(entry, serverRev, 0); err != nil {
+		cq.onCommitPostUploadFailure(entry, err)
+	}
+}
+
+// shadowSpillCompareChunk bounds memory during the streaming idempotency
+// comparison of large ShadowSpill files in conflict auto-resolve.
+const shadowSpillCompareChunk = 8 << 20
+
+// tryResolveShadowSpillIdempotent resolves a 409 for a ShadowSpill entry only
+// in the idempotent direction: if the server content already equals the local
+// shadow byte-for-byte (crash after a completed upload, before local cleanup),
+// the commit is marked successful. Any divergence is a terminal conflict —
+// LWW re-upload is intentionally not attempted for large files.
+func (cq *CommitQueue) tryResolveShadowSpillIdempotent(entryCtx context.Context, entry *CommitEntry) {
+	if cq.shadows == nil || cq.client == nil {
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+	apiPath := cq.remotePath(entry.Path)
+
+	statCtx, statCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	statStart := time.Now()
+	stat, err := cq.client.StatCtx(statCtx, apiPath)
+	statCancel()
+	if cq.perf != nil {
+		cq.perf.recordRemoteOp(perfRemoteStat, err, time.Since(statStart), 0)
+	}
+	if err != nil {
+		if client.IsNotFound(err) {
+			// 409 but no committed remote file: the conflict came from
+			// upload-session state (e.g. a session orphaned by a crashed
+			// client mid-multipart — exactly the crash-recovery window),
+			// not content. Retry once as a create; terminal only if the
+			// retry also fails.
+			if cq.isEntryCanceled(entry) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled before create retry)", entry.Path)
+				return
+			}
+			log.Printf("commit queue: ShadowSpill conflict for %s but remote file not found, retrying upload as create", entry.Path)
+			uploadCtx, uploadCancel, ok := cq.entryUploadContext(entryCtx, entry, releaseTimeout(entry.Size))
+			if !ok {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled before create retry upload)", entry.Path)
+				return
+			}
+			uploadStart := time.Now()
+			committedRev, uploadErr := uploadFromShadowRemoteWithRevision(uploadCtx, cq.client, cq.shadows, entry.Path, apiPath, 0)
+			uploadCancel()
+			if cq.perf != nil {
+				var bytes uint64
+				if entry.Size > 0 {
+					bytes = uint64(entry.Size)
+				}
+				cq.perf.recordRemoteOp(perfRemoteWrite, uploadErr, time.Since(uploadStart), bytes)
+			}
+			if cq.isEntryCanceled(entry) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled during create retry upload)", entry.Path)
+				return
+			}
+			if uploadErr != nil {
+				log.Printf("commit queue: ShadowSpill create retry failed for %s: %v", entry.Path, uploadErr)
+				cq.onCommitTerminalFailure(entry)
+				return
+			}
+			log.Printf("commit queue: auto-resolved ShadowSpill conflict for %s via create retry (no remote file)", entry.Path)
+			if err := cq.onCommitSuccess(entry, 0, committedRev); err != nil {
+				cq.onCommitPostUploadFailure(entry, err)
+			}
+			return
+		}
+		log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: stat: %v", entry.Path, err)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+
+	localSize := cq.shadows.Size(entry.Path)
+	if localSize < 0 {
+		// Shadow gone — likely canceled by a concurrent Unlink/Rmdir.
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled)", entry.Path)
+			return
+		}
+		log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: shadow missing", entry.Path)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+	if stat.Size != localSize {
+		log.Printf("commit queue: ShadowSpill conflict for %s is genuine (local %d bytes vs server %d bytes), terminal failure", entry.Path, localSize, stat.Size)
+		cq.onCommitTerminalFailure(entry)
+		return
+	}
+
+	buf := make([]byte, shadowSpillCompareChunk)
+	for off := int64(0); off < localSize; off += shadowSpillCompareChunk {
+		// Chunk-boundary cancel check bounds wasted work on multi-GiB
+		// compares when the file is unlinked mid-resolve.
+		if cq.isEntryCanceled(entry) {
+			cq.removeFromQueue(entry)
+			log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled mid-compare)", entry.Path)
+			return
+		}
+		n := int64(shadowSpillCompareChunk)
+		if off+n > localSize {
+			n = localSize - off
+		}
+		readCtx, readCancel := context.WithTimeout(context.Background(), uploadTimeout)
+		readStart := time.Now()
+		serverChunk, err := cq.client.ReadAtCtx(readCtx, apiPath, off, n)
+		readCancel()
+		if cq.perf != nil {
+			cq.perf.recordRemoteOp(perfRemoteRead, err, time.Since(readStart), uint64(len(serverChunk)))
+		}
+		if err != nil {
+			log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: read server @%d: %v", entry.Path, off, err)
+			cq.onCommitTerminalFailure(entry)
+			return
+		}
+		ln, err := cq.shadows.ReadAt(entry.Path, off, buf[:n])
+		if err != nil || int64(ln) != n {
+			if cq.isEntryCanceled(entry) {
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: ShadowSpill auto-resolve skipped for %s (canceled mid-read)", entry.Path)
+				return
+			}
+			log.Printf("commit queue: ShadowSpill auto-resolve failed for %s: read shadow @%d: n=%d err=%v", entry.Path, off, ln, err)
+			cq.onCommitTerminalFailure(entry)
+			return
+		}
+		if int64(len(serverChunk)) != n || !bytes.Equal(serverChunk, buf[:n]) {
+			log.Printf("commit queue: ShadowSpill conflict for %s is genuine (content differs @%d), terminal failure", entry.Path, off)
+			cq.onCommitTerminalFailure(entry)
+			return
+		}
+	}
+
+	log.Printf("commit queue: auto-resolved ShadowSpill conflict for %s (idempotent, %d bytes match server rev %d)", entry.Path, localSize, stat.Revision)
+	if err := cq.onCommitSuccess(entry, stat.Revision, stat.Revision); err != nil {
 		cq.onCommitPostUploadFailure(entry, err)
 	}
 }
@@ -1139,10 +1558,12 @@ func (cq *CommitQueue) onCommitTerminalFailure(entry *CommitEntry) {
 		}
 	}
 	if cq.journal != nil {
-		_ = cq.journal.Append(JournalEntry{
+		if err := cq.journal.Append(JournalEntry{
 			Op:   JournalCommit, // treated as "done" so recovery won't re-enqueue
 			Path: entry.Path,
-		})
+		}); err != nil {
+			log.Printf("commit queue: journal done marker failed for %s: %v", entry.Path, err)
+		}
 	}
 
 	// Remove from queue AFTER all cleanup so WaitPath sees the entry

@@ -37,7 +37,7 @@ type MountOptions struct {
 	RemoteRoot              string        // remote subtree root (default "/"); set via "drive9 mount :/path /local"
 	CacheDir                string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
 	CacheSize               int64         // ReadCache max size in bytes (default 128MB)
-	ReadCacheMaxFileBytes   int64         // largest single file admitted to ReadCache (default 1MiB)
+	ReadCacheMaxFileBytes   int64         // largest single file admitted to ReadCache and fetched whole-file in one request (default 4MiB)
 	DiskReadCacheSize       int64         // disk-backed read cache max size in bytes (default 1GiB)
 	DiskReadCacheFreeRatio  float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
 	DirTTL                  time.Duration // DirCache TTL (default 10s)
@@ -324,17 +324,15 @@ func Mount(opts *MountOptions) error {
 				dat9fs.journal = journal
 				// Replay journal for crash recovery. Preserve the original kind
 				// and base revision so CommitQueue.RecoverPending can re-enqueue.
-				_ = journal.Replay(func(e JournalEntry) {
-					if pendingIdx != nil && e.Op != JournalCommit && e.Op != JournalUnlink {
-						if !pendingIdx.HasPending(e.Path) {
-							kind := PendingOverwrite
-							if e.BaseRev == 0 {
-								kind = PendingNew
-							}
-							_, _ = pendingIdx.PutWithBaseRev(e.Path, e.Length, kind, e.BaseRev)
-						}
-					}
-				})
+				if err := replayJournalIntoPending(journal, pendingIdx); err != nil {
+					fmt.Fprintf(os.Stderr, "drive9: journal replay: %v\n", err)
+				}
+				// Drop frames already covered by commit markers so the WAL does
+				// not grow unboundedly across mounts. Safe here: mount init is
+				// single-threaded, no concurrent Append yet.
+				if err := journal.Compact(); err != nil {
+					fmt.Fprintf(os.Stderr, "drive9: journal compact: %v\n", err)
+				}
 			}
 
 			// Initialize WriteBackCache before CommitQueue so that legacy
@@ -368,7 +366,7 @@ func Mount(opts *MountOptions) error {
 				cq.RecoverPending()
 				if opts.LayerRef != "" {
 					if err := restoreLayerEntries(context.Background(), c, opts, shadowStore, pendingIdx, dat9fs); err != nil {
-						fmt.Fprintf(os.Stderr, "drive9: restore fs layer entries failed: %v\n", err)
+						return fmt.Errorf("mount: restore fs layer entries: %w", err)
 					}
 					layerEventWatcherStop = StartLayerEventWatcher(dat9fs, c, opts, shadowStore, pendingIdx)
 				}
