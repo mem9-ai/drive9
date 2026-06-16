@@ -194,7 +194,7 @@ The first implementation lands these pieces:
 
 - `drive9 mount --perf-dir` as the simple standard profiling switch.
 - advanced mount overrides:
-  `--profile-cpu --profile-heap --profile-dir --pprof-addr --perf-jsonl --perf-interval --perf-max-samples`.
+  `--profile-cpu --profile-heap --profile-heap-interval --pprof-addr --perf-jsonl --perf-interval --perf-max-samples`.
 - segmented JSONL rotation for bounded local retention;
 - latency histogram snapshots for FUSE and remote ops;
 - redacted mount context in every sample;

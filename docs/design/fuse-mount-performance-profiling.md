@@ -49,8 +49,8 @@ under that directory:
 - `/tmp/drive9-perf/cpu.pprof`: CPU profile for the mount lifetime.
 - `/tmp/drive9-perf/heap-final.pprof`: final heap profile on unmount.
 - `/tmp/drive9-perf/perf.jsonl`: continuous low-overhead performance samples.
-- `/tmp/drive9-perf/`: default directory for periodic profiles and pprof
-  control endpoint outputs.
+- `/tmp/drive9-perf/`: directory for periodic heap profiles and pprof control
+  endpoint outputs.
 - `127.0.0.1:0`: live pprof listener on an ephemeral local port. The actual
   address is recorded in mount state for manual pprof inspection.
 
@@ -67,7 +67,6 @@ drive9 mount \
   --perf-dir /tmp/drive9-perf \
   --profile-cpu /tmp/drive9/cpu.pprof \
   --profile-heap /tmp/drive9/heap-final.pprof \
-  --profile-dir /tmp/drive9/profiles \
   --profile-heap-interval 30s \
   --pprof-addr 127.0.0.1:6060 \
   --perf-jsonl /tmp/drive9/perf.jsonl \
@@ -83,8 +82,7 @@ Flag behavior:
 | `--perf-dir` | Enable the standard profiling suite and place default outputs in this directory. |
 | `--profile-cpu` | Start Go CPU profiling at mount startup and stop it on unmount. |
 | `--profile-heap` | Write one final heap profile on unmount. |
-| `--profile-dir` | Directory used by periodic heap profiles and default pprof control output. |
-| `--profile-heap-interval` | Periodically write heap profiles; requires `--profile-dir`. |
+| `--profile-heap-interval` | Periodically write heap profiles into `--perf-dir`; requires `--perf-dir`. |
 | `--pprof-addr` | Serve live Go pprof and drive9 CPU profile control endpoints. |
 | `--perf-jsonl` | Write continuous mount performance samples as JSONL. |
 | `--perf-interval` | Sampling interval for `--perf-jsonl`; default is `10s` when omitted. |

@@ -1680,6 +1680,7 @@ func TestMountCmdPerfDirSetsDefaultProfilingOptions(t *testing.T) {
 		"--api-key", "sk-test",
 		"--perf-dir", perfDir,
 		"--perf-interval", "2s",
+		"--profile-heap-interval", "30s",
 		t.TempDir(),
 	})
 	if err != nil {
@@ -1706,6 +1707,9 @@ func TestMountCmdPerfDirSetsDefaultProfilingOptions(t *testing.T) {
 	if got.PprofAddr != defaultMountPerfPprofAddr {
 		t.Fatalf("PprofAddr = %q, want %q", got.PprofAddr, defaultMountPerfPprofAddr)
 	}
+	if got.ProfileHeapInterval != 30*time.Second {
+		t.Fatalf("ProfileHeapInterval = %v, want 30s", got.ProfileHeapInterval)
+	}
 }
 
 func TestMountCmdPerfDirKeepsAdvancedOverrides(t *testing.T) {
@@ -1723,7 +1727,6 @@ func TestMountCmdPerfDirKeepsAdvancedOverrides(t *testing.T) {
 	perfDir := filepath.Join(base, "perf")
 	cpuPath := filepath.Join(base, "custom", "cpu.pprof")
 	heapPath := filepath.Join(base, "custom", "heap.pprof")
-	profileDir := filepath.Join(base, "custom", "profiles")
 	perfJSONL := filepath.Join(base, "custom", "samples.jsonl")
 	pprofAddr := "127.0.0.1:7070"
 	err := MountCmd([]string{
@@ -1734,7 +1737,6 @@ func TestMountCmdPerfDirKeepsAdvancedOverrides(t *testing.T) {
 		"--perf-dir", perfDir,
 		"--profile-cpu", cpuPath,
 		"--profile-heap", heapPath,
-		"--profile-dir", profileDir,
 		"--perf-jsonl", perfJSONL,
 		"--pprof-addr", pprofAddr,
 		t.TempDir(),
@@ -1751,8 +1753,8 @@ func TestMountCmdPerfDirKeepsAdvancedOverrides(t *testing.T) {
 	if got.ProfileHeap != heapPath {
 		t.Fatalf("ProfileHeap = %q, want %q", got.ProfileHeap, heapPath)
 	}
-	if got.ProfileDir != profileDir {
-		t.Fatalf("ProfileDir = %q, want %q", got.ProfileDir, profileDir)
+	if got.ProfileDir != perfDir {
+		t.Fatalf("ProfileDir = %q, want %q", got.ProfileDir, perfDir)
 	}
 	if got.PerfSamplesPath != perfJSONL {
 		t.Fatalf("PerfSamplesPath = %q, want %q", got.PerfSamplesPath, perfJSONL)
@@ -1772,6 +1774,19 @@ func TestMountCmdRejectsEmptyPerfDir(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "--perf-dir must not be empty") {
 		t.Fatalf("MountCmd error = %v, want perf dir validation error", err)
+	}
+}
+
+func TestMountCmdRejectsProfileHeapIntervalWithoutPerfDir(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--profile-heap-interval", "30s",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--profile-heap-interval requires --perf-dir") {
+		t.Fatalf("MountCmd error = %v, want profile heap interval validation error", err)
 	}
 }
 

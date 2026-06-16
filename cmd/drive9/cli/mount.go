@@ -156,8 +156,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	perfMaxSamples := fs.Int("perf-max-samples", 0, "maximum samples per continuous perf JSONL segment (default 7200 when --perf-jsonl is set)")
 	profileCPU := fs.String("profile-cpu", "", "write CPU profile to file for the mount lifetime")
 	profileHeap := fs.String("profile-heap", "", "write final heap profile to file on unmount")
-	profileDir := fs.String("profile-dir", "", "directory for periodic mount profiles")
-	profileHeapInterval := fs.Duration("profile-heap-interval", 0, "periodically write heap profiles at this interval (requires --profile-dir)")
+	var profileDir string
+	profileHeapInterval := fs.Duration("profile-heap-interval", 0, "periodically write heap profiles at this interval (requires --perf-dir)")
 	pprofAddr := fs.String("pprof-addr", "", "serve live pprof on this address, e.g. 127.0.0.1:6060")
 
 	fs.Usage = func() {
@@ -227,7 +227,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if perfDirGiven && strings.TrimSpace(*perfDir) == "" {
 		return fmt.Errorf("drive9 mount: --perf-dir must not be empty")
 	}
-	applyMountPerfDirDefaults(fs, *perfDir, profileCPU, profileHeap, profileDir, perfJSONL, pprofAddr)
+	applyMountPerfDirDefaults(fs, *perfDir, profileCPU, profileHeap, &profileDir, perfJSONL, pprofAddr)
 	if flagProvided(fs, "perf-interval") && *perfInterval <= 0 {
 		return fmt.Errorf("drive9 mount: --perf-interval must be > 0")
 	}
@@ -239,6 +239,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	if flagProvided(fs, "perf-max-samples") && *perfJSONL == "" {
 		return fmt.Errorf("drive9 mount: --perf-max-samples requires --perf-jsonl")
+	}
+	if flagProvided(fs, "profile-heap-interval") && *profileHeapInterval <= 0 {
+		return fmt.Errorf("drive9 mount: --profile-heap-interval must be > 0")
+	}
+	if flagProvided(fs, "profile-heap-interval") && !perfDirGiven {
+		return fmt.Errorf("drive9 mount: --profile-heap-interval requires --perf-dir")
 	}
 
 	profileGiven := flagProvided(fs, "profile")
@@ -489,7 +495,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		PerfCounters:            *perfCounters,
 		ProfileCPU:              *profileCPU,
 		ProfileHeap:             *profileHeap,
-		ProfileDir:              *profileDir,
+		ProfileDir:              profileDir,
 		ProfileHeapInterval:     *profileHeapInterval,
 		PprofAddr:               *pprofAddr,
 		PerfSamplesPath:         *perfJSONL,
@@ -804,9 +810,7 @@ func applyMountPerfDirDefaults(fs *flag.FlagSet, perfDir string, profileCPU, pro
 	if !flagProvided(fs, "profile-heap") {
 		*profileHeap = filepath.Join(perfDir, "heap-final.pprof")
 	}
-	if !flagProvided(fs, "profile-dir") {
-		*profileDir = perfDir
-	}
+	*profileDir = perfDir
 	if !flagProvided(fs, "perf-jsonl") {
 		*perfJSONL = filepath.Join(perfDir, "perf.jsonl")
 	}
