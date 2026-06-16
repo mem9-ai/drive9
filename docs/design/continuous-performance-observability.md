@@ -27,7 +27,8 @@ bundle are intentionally not FUSE-only.
 - Produce machine-readable summaries that can be compared across workloads,
   commits, hosts, and customer reports.
 - Avoid high-cardinality labels and raw customer paths by default.
-- Make optimization decisions data-driven before considering rewrites.
+- Make performance diagnosis data-driven before considering implementation
+  changes.
 
 ## Non-Goals
 
@@ -181,7 +182,7 @@ operation dimensions.
 
 ## Summary JSON
 
-`summary.json` is derived from JSONL and optimized for comparison:
+`summary.json` is derived from JSONL and structured for comparison:
 
 - sample count and time range;
 - peak runtime memory and goroutine counts;
@@ -218,7 +219,7 @@ The following remain future work:
 
 ## Operational Guidance
 
-For local optimization:
+For local profiling:
 
 1. Run the same workload on Linux FUSE when drawing production conclusions.
 2. Compare `summary.json` before opening flame graphs.
