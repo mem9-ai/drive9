@@ -2360,7 +2360,7 @@ func TestCommitQueueCancelPathJournalsCommitMarker(t *testing.T) {
 }
 
 func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t *testing.T) {
-	zero := &CommitEntry{Path: "/file.txt", Size: 0, Kind: PendingOverwrite}
+	zero := &CommitEntry{Path: "/file.txt", Size: 0, Kind: PendingOverwrite, CoalesceZeroTruncate: true}
 	nonzero := &CommitEntry{Path: "/other.txt", Size: 4, Kind: PendingOverwrite}
 	cq := &CommitQueue{
 		queue:        []*CommitEntry{zero, nonzero},
@@ -2368,6 +2368,7 @@ func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t 
 		inFlight:     map[string]*CommitEntry{},
 	}
 	cq.rebuildQueuedIndexLocked()
+	markCommitEntryDelayedForTest(t, cq, zero)
 
 	if !cq.CancelQueuedZeroTruncatePreserveLocal("/file.txt") {
 		t.Fatal("cancel queued zero truncate returned false")
@@ -2382,7 +2383,7 @@ func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t 
 		t.Fatal("non-zero queued entry was affected")
 	}
 
-	zero = &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite}
+	zero = &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite, CoalesceZeroTruncate: true}
 	samePathNonzero := &CommitEntry{Path: "/same.txt", Size: 4, Kind: PendingOverwrite}
 	cq = &CommitQueue{
 		queue:        []*CommitEntry{zero, samePathNonzero},
@@ -2390,6 +2391,7 @@ func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t 
 		inFlight:     map[string]*CommitEntry{},
 	}
 	cq.rebuildQueuedIndexLocked()
+	markCommitEntryDelayedForTest(t, cq, zero)
 
 	if cq.CancelQueuedZeroTruncatePreserveLocal("/same.txt") {
 		t.Fatal("cancel returned true while non-zero same-path entry remained queued")
@@ -2420,5 +2422,480 @@ func TestCommitQueueCancelQueuedZeroTruncatePreservesLocalOnlyWhenNotInFlight(t 
 	}
 	if !cq.HasPath("/busy.txt") {
 		t.Fatal("in-flight path disappeared")
+	}
+}
+
+func TestCommitQueueCancelQueuedZeroTruncateDoesNotCancelDispatchedBeforeInFlight(t *testing.T) {
+	entry := &CommitEntry{
+		Path:                 "/dispatched.txt",
+		Size:                 0,
+		Kind:                 PendingOverwrite,
+		CoalesceZeroTruncate: true,
+		dispatched:           true,
+	}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{entry},
+		queuedByPath: map[string]map[*CommitEntry]struct{}{},
+		inFlight:     map[string]*CommitEntry{},
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/dispatched.txt") {
+		t.Fatal("cancel returned true for dispatched zero truncate")
+	}
+	if entry.canceled {
+		t.Fatal("dispatched zero truncate was canceled before in-flight")
+	}
+	if !cq.HasPath("/dispatched.txt") {
+		t.Fatal("dispatched zero truncate disappeared from queue")
+	}
+	if pending := cq.Pending(); pending != 1 {
+		t.Fatalf("pending after dispatched cancel attempt = %d, want 1", pending)
+	}
+}
+
+func markCommitEntryDelayedForTest(t *testing.T, cq *CommitQueue, entry *CommitEntry) {
+	t.Helper()
+	if cq.delayed == nil {
+		cq.delayed = make(map[*CommitEntry]*time.Timer)
+	}
+	timer := time.NewTimer(time.Hour)
+	cq.delayed[entry] = timer
+	t.Cleanup(func() {
+		timer.Stop()
+	})
+}
+
+func TestCommitQueueDelayedZeroTruncateCancelNeverUploads(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/file.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/file.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	entry := &CommitEntry{Path: "/file.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(entry); err != nil {
+		t.Fatal(err)
+	}
+	if !cq.HasPath("/file.txt") {
+		t.Fatal("delayed zero truncate should remain visible as queued")
+	}
+	if !cq.CancelQueuedZeroTruncatePreserveLocal("/file.txt") {
+		t.Fatal("cancel delayed zero truncate returned false")
+	}
+	if !entry.canceled {
+		t.Fatal("delayed zero truncate was not marked canceled")
+	}
+	if cq.HasPath("/file.txt") {
+		t.Fatal("delayed zero truncate still blocks path after cancel")
+	}
+	cq.DrainAll()
+	if got := uploads.Load(); got != 0 {
+		t.Fatalf("uploads after cancel = %d, want 0", got)
+	}
+	if !shadow.Has("/file.txt") || !pending.HasPending("/file.txt") {
+		t.Fatal("cancel queued zero truncate should preserve local shadow/pending")
+	}
+}
+
+func TestCommitQueueCancelDelayedZeroTruncateDoesNotLeaveBackpressureZombie(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	cq := NewCommitQueue(newTestClient(ts.URL), nil, nil, nil, 1, 2)
+	cq.zeroTruncateDelay = time.Hour
+	for i := 0; i < 10; i++ {
+		entry := &CommitEntry{
+			Path:                 "/loop.txt",
+			Size:                 0,
+			Kind:                 PendingOverwrite,
+			BaseRev:              7,
+			CoalesceZeroTruncate: true,
+		}
+		if err := cq.Enqueue(entry); err != nil {
+			t.Fatalf("enqueue iteration %d: %v", i, err)
+		}
+		if !cq.CancelQueuedZeroTruncatePreserveLocal("/loop.txt") {
+			t.Fatalf("cancel iteration %d returned false", i)
+		}
+		if pending := cq.Pending(); pending != 0 {
+			t.Fatalf("pending after cancel iteration %d = %d, want 0", i, pending)
+		}
+		if cq.HasPath("/loop.txt") {
+			t.Fatalf("path remains queued after cancel iteration %d", i)
+		}
+	}
+	cq.DrainAll()
+	if got := uploads.Load(); got != 0 {
+		t.Fatalf("uploads after repeated cancel = %d, want 0", got)
+	}
+}
+
+func TestCommitQueueCancelQueuedZeroTruncateCancelsAllDelayedSamePath(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	cq := NewCommitQueue(newTestClient(ts.URL), nil, nil, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	first := &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	second := &CommitEntry{Path: "/same.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(first); err != nil {
+		t.Fatal(err)
+	}
+	if err := cq.Enqueue(second); err != nil {
+		t.Fatal(err)
+	}
+	if !cq.CancelQueuedZeroTruncatePreserveLocal("/same.txt") {
+		t.Fatal("cancel delayed same-path zero truncates returned false")
+	}
+	if !first.canceled || !second.canceled {
+		t.Fatalf("same-path delayed entries canceled = %t/%t, want true/true", first.canceled, second.canceled)
+	}
+	if pending := cq.Pending(); pending != 0 {
+		t.Fatalf("pending after same-path delayed cancel = %d, want 0", pending)
+	}
+	if cq.HasPath("/same.txt") {
+		t.Fatal("same-path delayed entries still visible after cancel")
+	}
+	cq.DrainAll()
+	if got := uploads.Load(); got != 0 {
+		t.Fatalf("uploads after same-path delayed cancel = %d, want 0", got)
+	}
+}
+
+func TestCommitQueueDelayedZeroTruncateTimerDispatches(t *testing.T) {
+	uploadDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Dat9-Expected-Revision") != "7" {
+			t.Errorf("X-Dat9-Expected-Revision = %q, want 7", r.Header.Get("X-Dat9-Expected-Revision"))
+		}
+		select {
+		case uploadDone <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/standalone.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/standalone.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = 20 * time.Millisecond
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{Path: "/standalone.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-uploadDone:
+	case <-time.After(time.Second):
+		t.Fatal("delayed zero truncate was not dispatched after delay")
+	}
+	cq.WaitPath("/standalone.txt")
+	if shadow.Has("/standalone.txt") || pending.HasPending("/standalone.txt") {
+		t.Fatal("successful delayed zero truncate should clean local shadow/pending")
+	}
+}
+
+func TestCommitQueueWaitPathForcesDelayedZeroTruncate(t *testing.T) {
+	uploadDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case uploadDone <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/force.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/force.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{Path: "/force.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		cq.WaitPath("/force.txt")
+		close(done)
+	}()
+	select {
+	case <-uploadDone:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("WaitPath did not force delayed zero truncate dispatch")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("WaitPath did not return after forced delayed zero truncate")
+	}
+}
+
+func TestCommitQueueForcedDelayedZeroTruncateCannotBeCanceledBeforeInFlight(t *testing.T) {
+	uploadDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case uploadDone <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/force-cancel.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/force-cancel.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	lockAcquired := make(chan struct{})
+	releaseLock := make(chan struct{})
+	cq.PathLock = func(path string) func() {
+		if path == "/force-cancel.txt" {
+			close(lockAcquired)
+			<-releaseLock
+		}
+		return func() {}
+	}
+	defer cq.DrainAll()
+	entry := &CommitEntry{Path: "/force-cancel.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(entry); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		cq.WaitPath("/force-cancel.txt")
+		close(done)
+	}()
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		t.Fatal("forced delayed zero truncate did not reach worker path lock")
+	}
+	if cq.CancelQueuedZeroTruncatePreserveLocal("/force-cancel.txt") {
+		t.Fatal("force-dispatched zero truncate was canceled before in-flight")
+	}
+	if entry.canceled {
+		t.Fatal("force-dispatched zero truncate was marked canceled")
+	}
+	close(releaseLock)
+	select {
+	case <-uploadDone:
+	case <-time.After(time.Second):
+		t.Fatal("force-dispatched zero truncate was not uploaded")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("WaitPath did not return after forced zero truncate upload")
+	}
+}
+
+func TestCommitQueueWaitPrefixForcesDelayedZeroTruncate(t *testing.T) {
+	uploadDone := make(chan struct{}, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case uploadDone <- struct{}{}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/dir/file.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/dir/file.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	defer cq.DrainAll()
+	if err := cq.Enqueue(&CommitEntry{Path: "/dir/file.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		cq.WaitPrefix("/dir/")
+		close(done)
+	}()
+	select {
+	case <-uploadDone:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("WaitPrefix did not force delayed zero truncate dispatch")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("WaitPrefix did not return after forced delayed zero truncate")
+	}
+}
+
+func TestCommitQueueDrainAllForcesDelayedZeroTruncate(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/drain.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/drain.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	if err := cq.Enqueue(&CommitEntry{Path: "/drain.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}); err != nil {
+		t.Fatal(err)
+	}
+	cq.DrainAll()
+	if got := uploads.Load(); got != 1 {
+		t.Fatalf("uploads after DrainAll = %d, want 1", got)
+	}
+	if shadow.Has("/drain.txt") || pending.HasPending("/drain.txt") {
+		t.Fatal("DrainAll forced delayed zero truncate should clean local shadow/pending")
+	}
+}
+
+func TestCommitQueueCancelPathStopsDelayedZeroTruncateAndCleansLocal(t *testing.T) {
+	var uploads atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploads.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":8}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	if err := shadow.WriteFull("/unlink.txt", nil, 7); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRev("/unlink.txt", 0, PendingOverwrite, 7); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	cq.zeroTruncateDelay = time.Hour
+	entry := &CommitEntry{Path: "/unlink.txt", Size: 0, Kind: PendingOverwrite, BaseRev: 7, CoalesceZeroTruncate: true}
+	if err := cq.Enqueue(entry); err != nil {
+		t.Fatal(err)
+	}
+	cq.CancelPath("/unlink.txt")
+	cq.DrainAll()
+	if !entry.canceled {
+		t.Fatal("CancelPath did not mark delayed zero truncate canceled")
+	}
+	if got := uploads.Load(); got != 0 {
+		t.Fatalf("uploads after CancelPath = %d, want 0", got)
+	}
+	if shadow.Has("/unlink.txt") || pending.HasPending("/unlink.txt") {
+		t.Fatal("CancelPath should clean local shadow/pending")
 	}
 }
