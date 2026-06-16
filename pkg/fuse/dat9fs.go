@@ -1471,9 +1471,9 @@ func (fs *Dat9FS) updateOpenHandleBaseRevision(remotePath string, revision int64
 	}
 }
 
-func (fs *Dat9FS) adoptSingleCallerPathTruncate(remotePath string, callerPID uint32) {
+func (fs *Dat9FS) adoptSingleCallerPathTruncate(remotePath string, callerPID uint32) bool {
 	if fs == nil || fs.openHandles == nil || remotePath == "" || callerPID == 0 {
-		return
+		return false
 	}
 
 	var matching []*FileHandle
@@ -1489,15 +1489,19 @@ func (fs *Dat9FS) adoptSingleCallerPathTruncate(remotePath string, callerPID uin
 		}
 	}
 
+	adopted := false
 	for _, fh := range matching {
 		fh.Lock()
 		if shouldAdoptSingleHandlePathTruncate(fh, callerPID, len(matching)) {
 			if err := fs.truncateWritableHandleLocked(fh, 0); err != nil {
 				log.Printf("handle truncate stage failed for %s: %v", fh.Path, err)
+			} else {
+				adopted = true
 			}
 		}
 		fh.Unlock()
 	}
+	return adopted
 }
 
 func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision int64, skip *FileHandle) {
@@ -2318,6 +2322,9 @@ func (fs *Dat9FS) finalizeHandleFlushLocked(fh *FileHandle, expectedRevision int
 
 func (fs *Dat9FS) canStagePathTruncateToZero(entry *InodeEntry) bool {
 	if fs == nil || entry == nil || entry.IsDir || entryIsSymlink(entry) {
+		return false
+	}
+	if entry.Revision <= 0 {
 		return false
 	}
 	if fs.layerEnabled() || isSQLitePersistentJournalPath(entry.Path) {
@@ -5570,12 +5577,18 @@ func (fs *Dat9FS) SetAttr(cancel <-chan struct{}, input *gofuse.SetAttrIn, out *
 					}
 					fs.invalidateReadCacheAndTargets(entry.Path)
 					fs.cacheFileForPath(entry.Path, 0, entry.Mtime, 0)
+				} else if entry.Revision <= 0 && fs.adoptSingleCallerPathTruncate(entry.Path, input.Pid) {
+					// A newly-created, uncommitted file has no remote base revision for
+					// an overwrite CAS. Let the open handle keep ownership and commit it
+					// later as PendingNew instead of queuing an invalid PendingOverwrite.
+					fs.invalidateReadCacheAndTargets(entry.Path)
+					fs.cacheFileForPath(entry.Path, 0, entry.Mtime, 0)
 				} else if fs.canStagePathTruncateToZero(entry) {
 					st := fs.stagePathTruncateToZeroLocked(ctx, entry, input.NodeId)
 					if st != gofuse.OK {
 						return st
 					}
-					fs.adoptSingleCallerPathTruncate(entry.Path, input.Pid)
+					_ = fs.adoptSingleCallerPathTruncate(entry.Path, input.Pid)
 				} else {
 					apiPath := fs.remotePath(entry.Path)
 					writeStart := fs.perfStart()
