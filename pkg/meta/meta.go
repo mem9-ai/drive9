@@ -1658,7 +1658,7 @@ func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *
 
 func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, dbUser string, dbPasswordCipher []byte) (updated bool, err error) {
 	start := time.Now()
-	defer observeMeta(ctx, "update_tenant_db_credential", start, &err)
+	defer observeMeta(ctx, "update_tenant_db_credential_if", start, &err)
 	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET db_user = ?, db_password = ?, updated_at = ? WHERE id = ? AND db_user = ?`,
 		dbUser, dbPasswordCipher, time.Now().UTC(), id, fromDBUser)
 	if err != nil {

@@ -87,6 +87,7 @@ type provisioningRegionProvider interface {
 }
 
 type nativeSystemUserProvisioner interface {
+	// tenantID is reserved for audit/log naming; current native setup derives SQL principals from the DSN user.
 	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, err error)
 }
 
@@ -3972,7 +3973,7 @@ func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantD
 		return nil
 	}
 	if s.provisioner == nil {
-		return fmt.Errorf("native system user provisioner unavailable")
+		return fmt.Errorf("server misconfigured: native tenant provider is missing")
 	}
 	systemUserProvisioner, ok := s.provisioner.(nativeSystemUserProvisioner)
 	if !ok {
