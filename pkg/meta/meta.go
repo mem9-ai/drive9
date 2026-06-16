@@ -1656,19 +1656,16 @@ func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *
 	return nil
 }
 
-func (s *Store) UpdateTenantDBCredential(ctx context.Context, id, dbUser string, dbPasswordCipher []byte) (err error) {
+func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, dbUser string, dbPasswordCipher []byte) (updated bool, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "update_tenant_db_credential", start, &err)
-	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET db_user = ?, db_password = ?, updated_at = ? WHERE id = ?`,
-		dbUser, dbPasswordCipher, time.Now().UTC(), id)
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET db_user = ?, db_password = ?, updated_at = ? WHERE id = ? AND db_user = ?`,
+		dbUser, dbPasswordCipher, time.Now().UTC(), id, fromDBUser)
 	if err != nil {
-		return err
+		return false, err
 	}
 	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return n > 0, nil
 }
 
 func (s *Store) UpdateTenantBranch(ctx context.Context, id string, cluster *Tenant) (err error) {

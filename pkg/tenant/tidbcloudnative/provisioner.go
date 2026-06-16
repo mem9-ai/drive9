@@ -101,30 +101,30 @@ func (p *Provisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, dsn
 func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, _ string) (string, string, error) {
 	cfg, err := mysql.ParseDSN(dsn)
 	if err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("parse native tenant DSN: %w", err)
 	}
 	username, needsSetup, err := systemUsernameForCurrent(cfg.User)
 	if err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("resolve native system username: %w", err)
+	}
+	if cfg.Passwd == "" {
+		return "", "", fmt.Errorf("native tenant DSN password is empty")
 	}
 	if !needsSetup {
 		return cfg.User, cfg.Passwd, nil
 	}
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("open native tenant database: %w", err)
 	}
 	defer func() { _ = db.Close() }()
 	dbName, err := normalizeDatabaseName(cfg.DBName)
 	if err != nil {
 		return "", "", fmt.Errorf("resolve native system user database: %w", err)
 	}
-	password, err := generateRandomPassword(24)
-	if err != nil {
-		return "", "", err
-	}
+	password := cfg.Passwd
 	if err := ensureSystemUser(ctx, db, dbName, username, password); err != nil {
-		return "", "", err
+		return "", "", fmt.Errorf("ensure native system user: %w", err)
 	}
 	return username, password, nil
 }
@@ -273,9 +273,9 @@ func (p *Provisioner) resolveDatabaseName(raw string) (string, error) {
 }
 
 func ensureSystemUser(ctx context.Context, db *sql.DB, dbName, username, password string) error {
-	for _, stmt := range systemUserStatements(dbName, username, password) {
+	for i, stmt := range systemUserStatements(dbName, username, password) {
 		if _, err := db.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("execute native system user statement: %w", err)
+			return fmt.Errorf("execute native system user statement %d: %w", i+1, err)
 		}
 	}
 	return nil
@@ -300,10 +300,16 @@ func systemUsernameForCurrent(currentUsername string) (string, bool, error) {
 		return "", false, fmt.Errorf("native database username is empty")
 	}
 	prefix, ok := strings.CutSuffix(currentUsername, ".root")
-	if !ok || prefix == "" {
+	if ok {
+		if prefix == "" {
+			return "", false, fmt.Errorf("native root username %q missing user prefix", currentUsername)
+		}
+		return prefix + ".tidbcloud_fs_system", true, nil
+	}
+	if prefix, ok := strings.CutSuffix(currentUsername, ".tidbcloud_fs_system"); ok && prefix != "" {
 		return currentUsername, false, nil
 	}
-	return prefix + ".tidbcloud_fs_system", true, nil
+	return "", false, fmt.Errorf("native database username %q is not a root or tidbcloud_fs_system account", currentUsername)
 }
 
 func quoteIdent(value string) string {
@@ -311,7 +317,9 @@ func quoteIdent(value string) string {
 }
 
 func quoteString(value string) string {
-	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, "'", "''")
+	return "'" + value + "'"
 }
 
 func parseDefaultSpendLimit(raw string) (*int32, error) {

@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/embedding"
@@ -3977,6 +3978,14 @@ func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantD
 	if !ok {
 		return fmt.Errorf("native provisioner does not support system user setup")
 	}
+	cfg, err := mysql.ParseDSN(tenantDSN)
+	if err != nil {
+		return fmt.Errorf("parse native tenant DSN for credential finalization: %w", err)
+	}
+	fromDBUser := strings.TrimSpace(cfg.User)
+	if fromDBUser == "" {
+		return fmt.Errorf("native tenant DSN has empty username")
+	}
 	username, password, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
 	if err != nil {
 		return fmt.Errorf("ensure native system user: %w", err)
@@ -3988,8 +3997,15 @@ func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantD
 	if err != nil {
 		return fmt.Errorf("encrypt native system user password: %w", err)
 	}
-	if err := s.meta.UpdateTenantDBCredential(ctx, tenantID, username, cipherPass); err != nil {
+	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, fromDBUser, username, cipherPass)
+	if err != nil {
 		return fmt.Errorf("persist native system user credential: %w", err)
+	}
+	if !updated {
+		logger.Info(ctx, "native_system_user_credential_update_skipped",
+			zap.String("tenant_id", tenantID),
+			zap.String("from_db_user", fromDBUser),
+			zap.String("db_user", username))
 	}
 	return nil
 }

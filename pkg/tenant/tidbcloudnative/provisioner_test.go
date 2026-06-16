@@ -399,6 +399,11 @@ func TestSystemUsernameForCurrent(t *testing.T) {
 	if _, _, err := systemUsernameForCurrent(""); err == nil {
 		t.Fatal("expected empty username error")
 	}
+	for _, username := range []string{"root", "u1.admin"} {
+		if _, _, err := systemUsernameForCurrent(username); err == nil {
+			t.Fatalf("expected unexpected username %q to be rejected", username)
+		}
+	}
 }
 
 func TestSystemUserStatements(t *testing.T) {
@@ -426,7 +431,7 @@ func TestSQLQuoting(t *testing.T) {
 	if got := quoteIdent("db`name"); got != "`db``name`" {
 		t.Fatalf("quoteIdent = %q", got)
 	}
-	if got := quoteString("u'ser"); got != "'u''ser'" {
+	if got := quoteString(`u'ser\name`); got != `'u''ser\\name'` {
 		t.Fatalf("quoteString = %q", got)
 	}
 }
