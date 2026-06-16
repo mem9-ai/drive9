@@ -108,3 +108,21 @@ func TestParseAndVerifyTokenRejectsLegacyThreeSegmentJWT(t *testing.T) {
 		t.Fatalf("expected invalid token format error, got %v", err)
 	}
 }
+
+func TestParseAndVerifyTokenAcceptsLegacyDat9Prefix(t *testing.T) {
+	secret := testTokenSecret(t)
+	tok, err := IssueToken(secret, "tenant-1", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jwtB64 := strings.TrimPrefix(tok, tokenPrefix)
+	legacyTok := legacyTokenPrefix + jwtB64
+
+	claims, err := ParseAndVerifyToken(secret, legacyTok)
+	if err != nil {
+		t.Fatalf("legacy dat9_ token not accepted: %v", err)
+	}
+	if claims.TenantID != "tenant-1" {
+		t.Fatalf("tenant = %q, want tenant-1", claims.TenantID)
+	}
+}

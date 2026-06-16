@@ -21,7 +21,10 @@ type Claims struct {
 	JournalPermissions []string `json:"journal_permissions,omitempty"`
 }
 
-const tokenPrefix = "dat9_"
+const (
+	tokenPrefix       = "drive9_"
+	legacyTokenPrefix = "dat9_"
+)
 
 func NewID() string { return uuid.NewString() }
 
@@ -72,10 +75,16 @@ func ParseAndVerifyToken(secret []byte, raw string) (*Claims, error) {
 }
 
 func parseAndVerifyTokenAt(secret []byte, raw string, nowUnix int64) (*Claims, error) {
-	if !strings.HasPrefix(raw, tokenPrefix) {
+	var stripped string
+	switch {
+	case strings.HasPrefix(raw, tokenPrefix):
+		stripped = strings.TrimPrefix(raw, tokenPrefix)
+	case strings.HasPrefix(raw, legacyTokenPrefix):
+		stripped = strings.TrimPrefix(raw, legacyTokenPrefix)
+	default:
 		return nil, fmt.Errorf("invalid token format")
 	}
-	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimPrefix(raw, tokenPrefix))
+	decoded, err := base64.RawURLEncoding.DecodeString(stripped)
 	if err != nil {
 		return nil, fmt.Errorf("invalid token format")
 	}

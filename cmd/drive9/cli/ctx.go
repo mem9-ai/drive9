@@ -264,7 +264,10 @@ func writeCtxShowText(entry *ctxShowEntry) error {
 	return w.Flush()
 }
 
-const drive9APIKeyJWTWrapperPrefix = "dat9_"
+const (
+	drive9APIKeyJWTWrapperPrefix       = "drive9_"
+	legacyAPIKeyJWTWrapperPrefix       = "dat9_"
+)
 
 func tenantIDFromContext(ctx *Context) string {
 	if ctx == nil {
@@ -288,10 +291,15 @@ func tenantIDFromContext(ctx *Context) string {
 
 func decodeDrive9APIKeyPayload(apiKey string) (*jwtClaims, error) {
 	apiKey = strings.TrimSpace(apiKey)
-	if !strings.HasPrefix(apiKey, drive9APIKeyJWTWrapperPrefix) {
+	var wrapped string
+	switch {
+	case strings.HasPrefix(apiKey, drive9APIKeyJWTWrapperPrefix):
+		wrapped = strings.TrimPrefix(apiKey, drive9APIKeyJWTWrapperPrefix)
+	case strings.HasPrefix(apiKey, legacyAPIKeyJWTWrapperPrefix):
+		wrapped = strings.TrimPrefix(apiKey, legacyAPIKeyJWTWrapperPrefix)
+	default:
 		return nil, fmt.Errorf("invalid drive9 api key format")
 	}
-	wrapped := strings.TrimPrefix(apiKey, drive9APIKeyJWTWrapperPrefix)
 	rawJWT, err := base64.RawURLEncoding.DecodeString(wrapped)
 	if err != nil {
 		return nil, fmt.Errorf("decode api key wrapper: %w", err)
