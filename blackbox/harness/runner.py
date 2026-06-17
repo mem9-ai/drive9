@@ -42,7 +42,7 @@ class BlackboxRunner:
         self.suite_config_dir = SUITES_DIR / self.suite
         if not self.suite_config_dir.is_dir():
             raise BlackboxError(f"blackbox suite {self.suite!r} not found at {self.suite_config_dir}")
-        self.session = args.session or f"{self.suite}-{file_ts()}"
+        self.session = args.session or file_ts()
         self.result_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else RESULT_ROOT / self.suite / self.session
         self.tmp_dir = self.result_dir / "tmp"
         self.recorder = Recorder(self.result_dir)
