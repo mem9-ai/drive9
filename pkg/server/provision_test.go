@@ -62,7 +62,7 @@ func (f *fakeProvisioner) EnsureSystemUser(_ context.Context, _ string, _ string
 	}
 	username := f.systemUsername
 	if username == "" {
-		username = "u1.tidbcloud_fs_system"
+		username = "u1.tdc_fs_sys"
 	}
 	password := f.systemPassword
 	if password == "" {
@@ -466,7 +466,7 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	if provider != tenant.ProviderTiDBCloudNative || dbName != "customer_db" {
 		t.Fatalf("tenant provider/db = %s/%s", provider, dbName)
 	}
-	if dbUser != "u1.tidbcloud_fs_system" {
+	if dbUser != "u1.tdc_fs_sys" {
 		t.Fatalf("tenant db_user = %q, want system user", dbUser)
 	}
 	plain, err := pool.Decrypt(context.Background(), passCipher)
