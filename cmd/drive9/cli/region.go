@@ -124,7 +124,7 @@ func regionListCmd(args []string) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	_, _ = fmt.Fprintln(w, "REGION CODE\tCLOUD PROVIDER\tREGION\tMODE\tSERVER")
 	for _, entry := range manifest.Regions {
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", entry.RegionCode, entry.CloudProvider, entry.TiDBRegion, regionModeLabel(entry.Mode), entry.	ServerURL)
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", entry.RegionCode, entry.CloudProvider, entry.TiDBRegion, regionModeLabel(entry.Mode), entry.ServerURL)
 	}
 	_ = w.Flush()
 	for _, entry := range manifest.Regions {
@@ -142,7 +142,7 @@ func regionListOutput(entries []RegionManifestEntry) []regionListOutputEntry {
 		out = append(out, regionListOutputEntry{
 			RegionCode:    entry.RegionCode,
 			Mode:          regionModeLabel(entry.Mode),
-				ServerURL:     entry.	ServerURL,
+				ServerURL:     entry.ServerURL,
 			CloudProvider: entry.CloudProvider,
 			TiDBRegion:    entry.TiDBRegion,
 			Tags:          entry.Tags,
@@ -206,14 +206,14 @@ func validateRegionManifest(manifest *RegionManifest) error {
 		entry := &manifest.Regions[i]
 		entry.RegionCode = strings.TrimSpace(entry.RegionCode)
 		entry.Mode = strings.TrimSpace(entry.Mode)
-		entry.	ServerURL = strings.TrimSpace(entry.	ServerURL)
+		entry.ServerURL = strings.TrimSpace(entry.ServerURL)
 		if entry.RegionCode == "" {
 			return fmt.Errorf("region manifest entry %d missing region_code", i)
 		}
 		if entry.Mode == "" {
 			return fmt.Errorf("region manifest entry %d missing mode", i)
 		}
-		if entry.	ServerURL == "" {
+		if entry.ServerURL == "" {
 			return fmt.Errorf("region manifest entry %d missing server_url", i)
 		}
 		key := entry.RegionCode + "\x00" + entry.Mode
@@ -247,7 +247,7 @@ func sortRegionManifestEntries(entries []RegionManifestEntry) {
 		if entries[i].Mode != entries[j].Mode {
 			return entries[i].Mode < entries[j].Mode
 		}
-		return entries[i].	ServerURL < entries[j].	ServerURL
+		return entries[i].ServerURL < entries[j].ServerURL
 	})
 }
 
