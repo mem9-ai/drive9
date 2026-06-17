@@ -62,6 +62,12 @@ func TestFusePerfCountersSummary(t *testing.T) {
 	if got := snap.RemoteOps["read"].bytes; got != 128 {
 		t.Fatalf("remote read bytes = %d, want 128", got)
 	}
+	if got := snap.FuseOps["read"].maxNS; got != uint64(20*time.Millisecond) {
+		t.Fatalf("read maxNS = %d, want %d", got, uint64(20*time.Millisecond))
+	}
+	if got := snap.FuseOps["lookup"].p95NS; got == 0 {
+		t.Fatal("lookup p95NS should be populated")
+	}
 	if got := snap.Counters["read_cache_hit"]; got != 2 {
 		t.Fatalf("read cache hits = %d, want 2", got)
 	}

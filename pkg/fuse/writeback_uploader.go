@@ -53,6 +53,7 @@ type WriteBackUploader struct {
 	wg         sync.WaitGroup
 	stopOnce   sync.Once
 	stopped    atomic.Bool
+	active     atomic.Int64
 	stopCh     chan struct{}
 
 	// Per-path in-flight tracking.
@@ -118,6 +119,21 @@ func (u *WriteBackUploader) applyMode(ctx context.Context, meta *WriteBackMeta) 
 
 func (u *WriteBackUploader) SetPerfCounters(perf *fusePerfCounters) {
 	u.perf = perf
+}
+
+// PendingStats returns queued and in-flight upload counts for observability.
+func (u *WriteBackUploader) PendingStats() (queued int, inFlight int) {
+	if u == nil {
+		return 0, 0
+	}
+	queued = len(u.uploadCh)
+	u.inflightMu.Lock()
+	inFlight = len(u.inflight)
+	u.inflightMu.Unlock()
+	if active := int(u.active.Load()); active > inFlight {
+		inFlight = active
+	}
+	return queued, inFlight
 }
 
 // Submit enqueues a local namespace path for background upload. Blocks up to 5s if the
@@ -228,7 +244,11 @@ func expectedRevisionForWriteBack(meta *WriteBackMeta) (int64, error) {
 func (u *WriteBackUploader) worker() {
 	defer u.wg.Done()
 	for localPath := range u.uploadCh {
-		u.uploadOne(localPath)
+		u.active.Add(1)
+		func() {
+			defer u.active.Add(-1)
+			u.uploadOne(localPath)
+		}()
 	}
 }
 

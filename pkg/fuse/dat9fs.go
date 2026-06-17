@@ -247,7 +247,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		opts:              opts,
 		syncMode:          opts.SyncMode,
 		debouncer:         newFlushDebouncer(opts.FlushDebounce),
-		perf:              newFusePerfCounters(opts.PerfCounters),
+		perf:              newFusePerfCounters(opts.PerfCounters || opts.Profiling.PerfSamplesPath != ""),
 		localPolicy:       NewLocalPolicy(opts.Profile, opts.LocalOnlyPatterns, opts.RemoteOnlyPatterns),
 		localOverlay:      NewLocalOverlay(opts.LocalRoot),
 		git:               newGitWorkspaceLayer(),

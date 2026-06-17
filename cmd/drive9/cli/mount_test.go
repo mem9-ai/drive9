@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"strings"
@@ -1619,6 +1620,346 @@ func TestMountCmdMapsDurabilityOption(t *testing.T) {
 				t.Fatalf("durability mapped to sync=%q policy=%q, want sync=%q policy=%q", got.SyncMode, got.WritePolicy, tt.wantSync, tt.wantPolicy)
 			}
 		})
+	}
+}
+
+func TestMountCmdPassesContinuousPerfOptions(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-dir", "/tmp/drive9-perf",
+		"--perf-interval", "2s",
+		"--perf-max-samples", "42",
+		"--perf-max-sample-files", "3",
+		"--perf-max-profile-files", "5",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.PerfSamplesPath != "/tmp/drive9-perf/perf.jsonl" {
+		t.Fatalf("PerfSamplesPath = %q, want /tmp/drive9-perf/perf.jsonl", got.PerfSamplesPath)
+	}
+	if got.PerfSampleInterval != 2*time.Second {
+		t.Fatalf("PerfSampleInterval = %v, want 2s", got.PerfSampleInterval)
+	}
+	if got.PerfMaxSamples != 42 {
+		t.Fatalf("PerfMaxSamples = %d, want 42", got.PerfMaxSamples)
+	}
+	if got.PerfMaxSampleFiles != 3 {
+		t.Fatalf("PerfMaxSampleFiles = %d, want 3", got.PerfMaxSampleFiles)
+	}
+	if got.PerfMaxProfileFiles != 5 {
+		t.Fatalf("PerfMaxProfileFiles = %d, want 5", got.PerfMaxProfileFiles)
+	}
+}
+
+func TestMountCmdPerfDirSetsDefaultProfilingOptions(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	perfDir := filepath.Join(t.TempDir(), "perf")
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-dir", perfDir,
+		"--perf-interval", "2s",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ProfileHeap != filepath.Join(perfDir, "heap-final.pprof") {
+		t.Fatalf("ProfileHeap = %q, want perf dir default", got.ProfileHeap)
+	}
+	if got.ProfileDir != perfDir {
+		t.Fatalf("ProfileDir = %q, want %q", got.ProfileDir, perfDir)
+	}
+	if got.PerfSamplesPath != filepath.Join(perfDir, "perf.jsonl") {
+		t.Fatalf("PerfSamplesPath = %q, want perf dir default", got.PerfSamplesPath)
+	}
+	if got.PerfSampleInterval != 2*time.Second {
+		t.Fatalf("PerfSampleInterval = %v, want 2s", got.PerfSampleInterval)
+	}
+	if got.PprofAddr != defaultMountPerfPprofAddr {
+		t.Fatalf("PprofAddr = %q, want %q", got.PprofAddr, defaultMountPerfPprofAddr)
+	}
+	if got.ProfileCPUDuration != defaultMountPerfCPUDuration {
+		t.Fatalf("ProfileCPUDuration = %v, want %v", got.ProfileCPUDuration, defaultMountPerfCPUDuration)
+	}
+	if got.ProfileCPUInterval != defaultMountPerfCPUInterval {
+		t.Fatalf("ProfileCPUInterval = %v, want %v", got.ProfileCPUInterval, defaultMountPerfCPUInterval)
+	}
+	if got.ProfileHeapInterval != defaultMountPerfHeapInterval {
+		t.Fatalf("ProfileHeapInterval = %v, want %v", got.ProfileHeapInterval, defaultMountPerfHeapInterval)
+	}
+}
+
+func TestMountCmdPerfDirKeepsAdvancedControls(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	base := t.TempDir()
+	perfDir := filepath.Join(base, "perf")
+	perfAddr := "127.0.0.1:7070"
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-dir", perfDir,
+		"--perf-addr", perfAddr,
+		"--perf-cpu-duration", "10s",
+		"--perf-cpu-interval", "1m",
+		"--perf-heap-interval", "2m",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ProfileHeap != filepath.Join(perfDir, "heap-final.pprof") {
+		t.Fatalf("ProfileHeap = %q, want perf dir default", got.ProfileHeap)
+	}
+	if got.ProfileDir != perfDir {
+		t.Fatalf("ProfileDir = %q, want %q", got.ProfileDir, perfDir)
+	}
+	if got.PerfSamplesPath != filepath.Join(perfDir, "perf.jsonl") {
+		t.Fatalf("PerfSamplesPath = %q, want perf dir default", got.PerfSamplesPath)
+	}
+	if got.PprofAddr != perfAddr {
+		t.Fatalf("PprofAddr = %q, want %q", got.PprofAddr, perfAddr)
+	}
+	if got.ProfileCPUDuration != 10*time.Second {
+		t.Fatalf("ProfileCPUDuration = %v, want 10s", got.ProfileCPUDuration)
+	}
+	if got.ProfileCPUInterval != time.Minute {
+		t.Fatalf("ProfileCPUInterval = %v, want 1m", got.ProfileCPUInterval)
+	}
+	if got.ProfileHeapInterval != 2*time.Minute {
+		t.Fatalf("ProfileHeapInterval = %v, want 2m", got.ProfileHeapInterval)
+	}
+}
+
+func TestMountCmdRejectsEmptyPerfDir(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-dir", "",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-dir must not be empty") {
+		t.Fatalf("MountCmd error = %v, want perf dir validation error", err)
+	}
+}
+
+func TestMountCmdRejectsPerfHeapIntervalWithoutPerfDir(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-heap-interval", "30s",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-heap-interval requires --perf-dir") {
+		t.Fatalf("MountCmd error = %v, want perf heap interval validation error", err)
+	}
+}
+
+func TestMountCmdRejectsPerfIntervalWithoutPerfDir(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-interval", "2s",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-interval requires --perf-dir") {
+		t.Fatalf("MountCmd error = %v, want perf interval validation error", err)
+	}
+}
+
+func TestMountCmdRejectsPerfMaxSamplesWithoutPerfDir(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-max-samples", "42",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-max-samples requires --perf-dir") {
+		t.Fatalf("MountCmd error = %v, want perf max samples validation error", err)
+	}
+}
+
+func TestMountCmdRejectsPerfMaxSampleFilesWithoutPerfDir(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-max-sample-files", "3",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-max-sample-files requires --perf-dir") {
+		t.Fatalf("MountCmd error = %v, want perf max sample files validation error", err)
+	}
+}
+
+func TestMountCmdRejectsPerfMaxProfileFilesWithoutPerfDir(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-max-profile-files", "5",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-max-profile-files requires --perf-dir") {
+		t.Fatalf("MountCmd error = %v, want perf max profile files validation error", err)
+	}
+}
+
+func TestMountCmdRejectsInvalidPerfRetentionFileCounts(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		flag    string
+		message string
+	}{
+		{name: "sample files", flag: "--perf-max-sample-files", message: "--perf-max-sample-files must be > 0"},
+		{name: "profile files", flag: "--perf-max-profile-files", message: "--perf-max-profile-files must be > 0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := MountCmd([]string{
+				"--mode", "fuse",
+				"--server", "https://drive9.example",
+				"--api-key", "sk-test",
+				"--perf-dir", t.TempDir(),
+				tt.flag, "0",
+				t.TempDir(),
+			})
+			if err == nil || !strings.Contains(err.Error(), tt.message) {
+				t.Fatalf("MountCmd error = %v, want %q", err, tt.message)
+			}
+		})
+	}
+}
+
+func TestMountCmdPerfCPUIntervalUsesDefaultDuration(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-dir", t.TempDir(),
+		"--perf-cpu-interval", "2m",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ProfileCPUDuration != defaultMountPerfCPUDuration {
+		t.Fatalf("ProfileCPUDuration = %v, want %v", got.ProfileCPUDuration, defaultMountPerfCPUDuration)
+	}
+	if got.ProfileCPUInterval != 2*time.Minute {
+		t.Fatalf("ProfileCPUInterval = %v, want 2m", got.ProfileCPUInterval)
+	}
+}
+
+func TestMountCmdPerfCPUDurationUsesDefaultInterval(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		copied := *opts
+		got = &copied
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-dir", t.TempDir(),
+		"--perf-cpu-duration", "45s",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.ProfileCPUDuration != 45*time.Second {
+		t.Fatalf("ProfileCPUDuration = %v, want 45s", got.ProfileCPUDuration)
+	}
+	if got.ProfileCPUInterval != defaultMountPerfCPUInterval {
+		t.Fatalf("ProfileCPUInterval = %v, want %v", got.ProfileCPUInterval, defaultMountPerfCPUInterval)
+	}
+}
+
+func TestMountCmdRejectsPerfCPUDurationNotLessThanInterval(t *testing.T) {
+	err := MountCmd([]string{
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--perf-dir", t.TempDir(),
+		"--perf-cpu-duration", "30s",
+		"--perf-cpu-interval", "30s",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--perf-cpu-duration must be less than --perf-cpu-interval") {
+		t.Fatalf("MountCmd error = %v, want perf cpu duration/interval validation error", err)
 	}
 }
 
