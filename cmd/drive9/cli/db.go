@@ -119,11 +119,18 @@ func Create(args []string) error {
 
 	mode := provisionModeForCredentials(publicKey, privateKey)
 	if mode == RegionModeTiDBCloudNative && (publicKey == "" || privateKey == "") {
-		return fmt.Errorf("tidb_cloud_native create requires --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
+		return fmt.Errorf("TiDBCloud mode requires --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
+	}
+	if mode == RegionModeTiDBCloudNative && strings.TrimSpace(serverFlag) == "" && strings.TrimSpace(regionCode) == "" {
+		return fmt.Errorf("TiDBCloud mode requires --region-code or --server; use drive9 region list to see available regions")
 	}
 	server, regionEntry, err := resolveProvisionServer(serverFlag, regionCode, mode, r.Server)
 	if err != nil {
 		return err
+	}
+
+	if mode == RegionModeTiDBCloudStarter {
+		fmt.Fprintf(os.Stderr, "Note: Anonymous mode in drive9 transfers data management rights to PingCAP.\n")
 	}
 
 	cfg := loadConfig()
@@ -208,6 +215,9 @@ func Create(args []string) error {
 const (
 	RegionModeTiDBCloudNative  = "tidb_cloud_native"
 	RegionModeTiDBCloudStarter = "tidb_cloud_starter"
+
+	ModeLabelAnonymous = "Anonymous"
+	ModeLabelTiDBCloud = "TiDBCloud"
 )
 
 type createResult struct {
@@ -232,7 +242,34 @@ type createOutput struct {
 }
 
 func createUsage() string {
-	return "usage: drive9 create [--name NAME] [--region-code CODE] [--server URL] [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY] [--json]"
+	return `usage: drive9 create [flags]
+
+provision a new tenant and register the returned API key as a local owner context.
+
+flags:
+  --name NAME                     context name (default: auto-generated 7-char name)
+  --region-code CODE              provisioning region code; use "drive9 region list" to see available regions
+  --server URL                    override the server URL (bypasses region manifest lookup)
+  --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud mode)
+  --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud mode)
+  --json                          output result as JSON
+
+examples:
+  # provision an Anonymous tenant using the default region
+  drive9 create
+
+  # provision a TiDBCloud tenant in ap-southeast-1
+  drive9 create --region-code aws-ap-southeast-1 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  # provision directly against a known server
+  drive9 create --server http://127.0.0.1:9009
+
+  # list available regions
+  drive9 region list
+
+note: Anonymous mode in drive9 transfers data management rights to PingCAP.`
 }
 
 func provisionModeForCredentials(publicKey, privateKey string) string {
@@ -247,7 +284,7 @@ func provisionRequestBody(publicKey, privateKey string) (io.Reader, error) {
 		return nil, nil
 	}
 	if publicKey == "" || privateKey == "" {
-		return nil, fmt.Errorf("tidb_cloud_native create requires both public and private keys")
+		return nil, fmt.Errorf("TiDBCloud mode requires both public and private keys")
 	}
 	body := map[string]string{
 		"public_key":  publicKey,
@@ -275,7 +312,7 @@ func resolveProvisionServer(serverFlag, regionCode, mode, fallbackServer string)
 	if err != nil {
 		return "", nil, err
 	}
-	return strings.TrimSpace(entry.ServerURL), entry, nil
+	return strings.TrimSpace(entry.Endpoint), entry, nil
 }
 
 func selectRegionServer(entries []RegionManifestEntry, regionCode, mode string) (*RegionManifestEntry, error) {
@@ -455,7 +492,27 @@ func cleanupMatchingOwnerContexts(server, apiKey string) {
 }
 
 func deleteUsage() string {
-	return "usage: drive9 delete [--server URL] [--api-key KEY] [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY] [--json]"
+	return `usage: drive9 delete [flags]
+
+delete the current tenant. The tenant's TiDB Cloud cluster, database, and API
+keys are removed. For TiDBCloud mode, TiDB Cloud credentials must be provided.
+
+flags:
+  --server URL                    server URL (default: active context server)
+  --api-key KEY                   owner API key (default: active context API key)
+  --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud mode)
+  --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud mode)
+  --json                          output result as JSON
+
+examples:
+  # delete the active context's tenant
+  drive9 delete
+
+  # delete a TiDBCloud tenant using explicit credentials
+  drive9 delete --server https://api.drive9.ai \
+    --api-key drive9_xxx \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>`
 }
 
 func deprovisionRequestBody(publicKey, privateKey string) (io.Reader, error) {
@@ -463,7 +520,7 @@ func deprovisionRequestBody(publicKey, privateKey string) (io.Reader, error) {
 		return nil, nil
 	}
 	if publicKey == "" || privateKey == "" {
-		return nil, fmt.Errorf("tidb_cloud_native delete requires both public and private keys")
+		return nil, fmt.Errorf("TiDBCloud mode requires both public and private keys for delete")
 	}
 	raw, err := json.Marshal(map[string]string{
 		"public_key":  publicKey,

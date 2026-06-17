@@ -30,9 +30,11 @@ var fallbackRegionManifest = RegionManifest{
 	},
 	Regions: []RegionManifestEntry{
 		{
-			RegionCode: "aws-ap-southeast-1",
-			Mode:       RegionModeTiDBCloudStarter,
-			ServerURL:  defaultServerURL,
+			RegionCode:    "aws-ap-southeast-1",
+			Mode:          RegionModeTiDBCloudStarter,
+			Endpoint:      defaultServerURL,
+			CloudProvider: "aws",
+			TiDBRegion:    "ap-southeast-1",
 		},
 	},
 }
@@ -51,7 +53,7 @@ type RegionManifestDefault struct {
 type RegionManifestEntry struct {
 	RegionCode    string            `json:"region_code"`
 	Mode          string            `json:"mode"`
-	ServerURL     string            `json:"server_url"`
+	Endpoint      string            `json:"endpoint"`
 	CloudProvider string            `json:"cloud_provider,omitempty"`
 	TiDBRegion    string            `json:"tidb_region,omitempty"`
 	Tags          []string          `json:"tags,omitempty"`
@@ -61,7 +63,7 @@ type RegionManifestEntry struct {
 type regionListOutputEntry struct {
 	RegionCode    string            `json:"region_code"`
 	Mode          string            `json:"mode"`
-	ServerURL     string            `json:"server_url"`
+	Endpoint      string            `json:"endpoint"`
 	CloudProvider string            `json:"cloud_provider,omitempty"`
 	TiDBRegion    string            `json:"tidb_region,omitempty"`
 	Tags          []string          `json:"tags,omitempty"`
@@ -120,11 +122,18 @@ func regionListCmd(args []string) error {
 		return enc.Encode(regionListOutput(manifest.Regions))
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "REGION\tMODE\tSERVER")
+	_, _ = fmt.Fprintln(w, "REGION CODE\tCLOUD PROVIDER\tREGION\tMODE\tENDPOINT")
 	for _, entry := range manifest.Regions {
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\n", entry.RegionCode, regionModeLabel(entry.Mode), entry.ServerURL)
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", entry.RegionCode, entry.CloudProvider, entry.TiDBRegion, regionModeLabel(entry.Mode), entry.Endpoint)
 	}
-	return w.Flush()
+	_ = w.Flush()
+	for _, entry := range manifest.Regions {
+		if regionModeLabel(entry.Mode) == ModeLabelAnonymous {
+			fmt.Fprintln(os.Stderr, "Note: Anonymous mode in drive9 transfers data management rights to PingCAP.")
+			break
+		}
+	}
+	return nil
 }
 
 func regionListOutput(entries []RegionManifestEntry) []regionListOutputEntry {
@@ -133,7 +142,7 @@ func regionListOutput(entries []RegionManifestEntry) []regionListOutputEntry {
 		out = append(out, regionListOutputEntry{
 			RegionCode:    entry.RegionCode,
 			Mode:          regionModeLabel(entry.Mode),
-			ServerURL:     entry.ServerURL,
+			Endpoint:     entry.Endpoint,
 			CloudProvider: entry.CloudProvider,
 			TiDBRegion:    entry.TiDBRegion,
 			Tags:          entry.Tags,
@@ -197,15 +206,15 @@ func validateRegionManifest(manifest *RegionManifest) error {
 		entry := &manifest.Regions[i]
 		entry.RegionCode = strings.TrimSpace(entry.RegionCode)
 		entry.Mode = strings.TrimSpace(entry.Mode)
-		entry.ServerURL = strings.TrimSpace(entry.ServerURL)
+		entry.Endpoint = strings.TrimSpace(entry.Endpoint)
 		if entry.RegionCode == "" {
 			return fmt.Errorf("region manifest entry %d missing region_code", i)
 		}
 		if entry.Mode == "" {
 			return fmt.Errorf("region manifest entry %d missing mode", i)
 		}
-		if entry.ServerURL == "" {
-			return fmt.Errorf("region manifest entry %d missing server_url", i)
+		if entry.Endpoint == "" {
+			return fmt.Errorf("region manifest entry %d missing endpoint", i)
 		}
 		key := entry.RegionCode + "\x00" + entry.Mode
 		if first, ok := seen[key]; ok {
@@ -238,17 +247,40 @@ func sortRegionManifestEntries(entries []RegionManifestEntry) {
 		if entries[i].Mode != entries[j].Mode {
 			return entries[i].Mode < entries[j].Mode
 		}
-		return entries[i].ServerURL < entries[j].ServerURL
+		return entries[i].Endpoint < entries[j].Endpoint
 	})
 }
 
 func regionModeLabel(mode string) string {
 	switch strings.TrimSpace(mode) {
 	case RegionModeTiDBCloudStarter:
-		return "Anonymous"
+		return ModeLabelAnonymous
 	case RegionModeTiDBCloudNative:
-		return "TiDBCloud"
+		return ModeLabelTiDBCloud
 	default:
 		return strings.TrimSpace(mode)
 	}
+}
+
+func quotaExceededMessage(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case "", ModeLabelAnonymous:
+		return "tenant usage quota exceeded. Switch to TiDBCloud mode with drive9 create --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>. Use drive9 region list to see available regions"
+	case ModeLabelTiDBCloud:
+		return "tenant usage quota exceeded. Go to your TiDB Cloud cluster settings page and set a monthly Spending Limit"
+	default:
+		return ""
+	}
+}
+
+// QuotaExceededMessageForCurrentContext returns the quota exceeded guidance
+// message for the active owner context, or a generic message if none is active.
+func QuotaExceededMessageForCurrentContext() string {
+	cfg := loadConfig()
+	ctx := cfg.currentContextEntry()
+	mode := ""
+	if ctx != nil {
+		mode = ctx.Mode
+	}
+	return quotaExceededMessage(mode)
 }

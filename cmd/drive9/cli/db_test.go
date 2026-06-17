@@ -220,12 +220,12 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 		{
 			RegionCode: "aws-us-east-1",
 			Mode:       RegionModeTiDBCloudStarter,
-			ServerURL:  starter.URL,
+			Endpoint:  starter.URL,
 		},
 		{
 			RegionCode: " aws-us-east-1 ",
 			Mode:       " " + RegionModeTiDBCloudNative + " ",
-			ServerURL:  " " + native.URL + " ",
+			Endpoint:  " " + native.URL + " ",
 		},
 	})
 	defer manifest.Close()
@@ -315,12 +315,12 @@ func TestCreateRegionCodeSelectsStarterWithoutBody(t *testing.T) {
 		{
 			RegionCode: "aws-us-east-1",
 			Mode:       RegionModeTiDBCloudNative,
-			ServerURL:  native.URL,
+			Endpoint:  native.URL,
 		},
 		{
 			RegionCode: "aws-us-east-1",
 			Mode:       RegionModeTiDBCloudStarter,
-			ServerURL:  starter.URL,
+			Endpoint:  starter.URL,
 		},
 	})
 	defer manifest.Close()
@@ -358,7 +358,7 @@ func TestCreateRejectsHalfTiDBCloudKeyBeforeManifestFetch(t *testing.T) {
 	manifest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&manifestHits, 1)
 		_ = json.NewEncoder(w).Encode(RegionManifest{Service: "drive9", Regions: []RegionManifestEntry{
-			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, ServerURL: "https://native.example"},
+			{RegionCode: "aws-us-east-1", Mode: RegionModeTiDBCloudNative, Endpoint: "https://native.example"},
 		}})
 	}))
 	defer manifest.Close()
