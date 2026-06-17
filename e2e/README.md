@@ -31,6 +31,8 @@ including local single-tenant validation via `drive9-server-local`.
 | `fuse-write-perf-budget-test.sh` | FUSE write-path perf budgets: fsync-heavy workload with deterministic op-count budgets (remote writes/stats/lists/mutations, commit retries/failures) plus an fsync latency ceiling, asserted from mount perf counters |
 | `git-workspace-smoke-test.sh` | Git workspace fast-blobless clone with coding-agent local overlay, batched tracked-file edits, ignored local-only paths, `git add`/`commit`, `git apply`, and remount restore |
 | `posix-permission-smoke-test.sh` | POSIX permission coverage: API mkdir/chmod mode propagation, CLI `fs chmod`, FUSE `chmod`/`mkdir -m` with remote and local stat parity |
+| `native-smoke-test.sh` | TiDB Cloud Native tenant lifecycle: CLI provision with credentials, status poll, basic fs ops (mkdir/cp/cat/ls/rm), delete + verification, trap cleanup on failure |
+| `pjdfstest-suite.sh` | On-demand Linux/macOS pjdfstest POSIX compatibility suite over a real Drive9 FUSE mount; `pjdfstests.sh` and `posix-feature-matrix.sh` are aliases |
 | `smoke-all.sh` | Runs API + CLI + journal + layer FS + FUSE + POSIX permission smoke scripts in sequence with aggregated pass/fail; set `RUN_FUSE_SMOKE=0` to skip FUSE symlink/hardlink coverage, `RUN_GIT_OPS_SMOKE=1` to include lightweight Git coverage, `RUN_GIT_WORKSPACE_SMOKE=1` to include heavier Git workspace coverage, and `RUN_PORTABLE_PACK_E2E=1` to include portable pack/unpack coverage |
 | `local-smoke.sh` | Starts `drive9-server-local` with a disposable local DB by default, then runs `smoke-all.sh` with semantic checks disabled and FUSE smoke skipped unless `RUN_FUSE_SMOKE=1` |
 
@@ -45,8 +47,8 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | PR gate | `pull_request` to `main` (local-e2e) | api, existing-key, cli, layer-fs, fuse-release-gate (smoke + correctness + sqlite rollback), git-ops, portable pack/unpack, fuse-crash-recovery, fuse-write-perf-budget |
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, full `smoke-all.sh` (journal, posix-permission, git-workspace), git feature matrix |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
-| Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above + POSIX feature matrix (pjdfstest, best-effort) via `run_all_e2e=1` |
-| Manual only | not wired, run by hand | `layer-fs-smoke-test-realdev.sh` (shared dev endpoint), `verify-description-e2e.sh` (Docker + Ollama), `verify-description-tidb-zero-e2e.sh` (TiDB Cloud Zero), `local-smoke.sh` (`make e2e-local` wrapper) |
+| Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above + pjdfstest POSIX suite (best-effort) via `run_all_e2e=1` |
+| Manual only | not wired, run by hand | `layer-fs-smoke-test-realdev.sh` (shared dev endpoint), `verify-description-e2e.sh` (Docker + Ollama), `verify-description-tidb-zero-e2e.sh` (TiDB Cloud Zero), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `local-smoke.sh` (`make e2e-local` wrapper) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
@@ -63,6 +65,9 @@ Use a hosted deployment by default. For local development on this machine, use
 ```bash
 # Dev
 export DRIVE9_BASE="http://k8s-dat9-dat9serv-d5e02e7d07-1645488597.ap-southeast-1.elb.amazonaws.com"
+
+# Dev (tidbcloud-native)
+export DRIVE9_BASE="http://k8s-drive9ti-drive9se-b6bbe5ba6e-cee81207452d1185.elb.ap-southeast-1.amazonaws.com"
 
 # Prod
 export DRIVE9_BASE="https://api.drive9.ai"
@@ -155,20 +160,32 @@ CLI_SOURCE=official bash e2e/posix-permission-smoke-test.sh
 
 bash e2e/posix-permission-smoke-test.sh
 
+# TiDB Cloud Native tenant lifecycle smoke (requires credentials, manual-only).
+DRIVE9_TIDBCLOUD_PUBLIC_KEY=xxx DRIVE9_TIDBCLOUD_PRIVATE_KEY=xxx bash e2e/native-smoke-test.sh
+
 bash e2e/smoke-all.sh
 
 # Include portable profile pack/unpack coverage in smoke-all.
 RUN_PORTABLE_PACK_E2E=1 bash e2e/smoke-all.sh
 ```
 
-#### On-demand POSIX compatibility matrix
+#### On-demand pjdfstest POSIX compatibility suite
 
-`posix-feature-matrix.sh` is not part of the normal E2E smoke entry points.
-Run it only when you explicitly need a pjdfstest-based POSIX compatibility
-report:
+`pjdfstest-suite.sh` is not part of the normal E2E smoke entry points. Run it
+only when you explicitly need a pjdfstest-based POSIX compatibility report.
+The older `posix-feature-matrix.sh` entrypoint remains as a compatibility
+alias.
 
 ```bash
-PJDFSTEST_DIR=/path/to/pjdfstest bash e2e/posix-feature-matrix.sh
+# Linux, full privileged run.
+sudo PJDFSTEST_DIR=/path/to/pjdfstest DRIVE9_BASE=http://127.0.0.1:9009 \
+  bash e2e/pjdfstest-suite.sh
+
+# macOS/macFUSE local debug run. The script auto-adds the standard macFUSE
+# helper path when needed; non-root runs may not cover privileged pjdfstest
+# cases with the same semantics as Linux.
+PJDFSTEST_ALLOW_NONROOT=1 PJDFSTEST_DIR=/path/to/pjdfstest \
+  bash e2e/pjdfstest-suite.sh
 ```
 
 By default it writes directly under `e2e/reports/`, for example
@@ -178,10 +195,14 @@ directory, the same report filename is written inside that directory instead.
 
 - Knobs: `FEATURE_MATRIX_REPORT_DIR`, `FEATURE_MATRIX_STRICT_ALL`,
   `PJDFSTEST_DIR`, `PJDFSTEST_TESTS`, `PJDFSTEST_BIN`,
-  `PJDFSTEST_TIMEOUT_S`, and `PJDFSTEST_ALLOW_NONROOT`.
+  `PJDFSTEST_TIMEOUT_S`, `PJDFSTEST_ALLOW_NONROOT`, and
+  `PJDFSTEST_MOUNT_ALLOW_OTHER`.
 - Build pjdfstest before running so either `$PJDFSTEST_DIR/pjdfstest` exists
   or `pjdfstest` is on `PATH`. The runner adds the pjdfstest binary directory
   to `PATH` while invoking `prove`.
+- `PJDFSTEST_MOUNT_ALLOW_OTHER=auto` keeps Linux behavior compatible with the
+  existing POSIX matrix by passing `--allow-other`, but avoids that flag on
+  macOS where macFUSE often rejects it unless the host is explicitly configured.
 - Matrix reports use `- [x]` only for passed pjdfstest `.t` files. Failed or
   skipped entries remain unchecked with observed output summaries.
 
@@ -368,7 +389,7 @@ CLI_SOURCE=official bash e2e/git-workspace-smoke-test.sh
 - `local-e2e.yml` runs the lightweight portable pack/unpack e2e on ordinary PR triggers. It does not run the performance baseline or heavy FUSE/Git detectors on ordinary PR triggers. Use manual `workflow_dispatch` inputs `run_fuse_concurrency_stress=1`, `run_fuse_posix_fsx=1`, `run_fuse_sqlite_wal=1`, `run_fuse_sqlite_churn=1`, `run_fuse_sqlite_concurrency=1`, `run_fuse_performance_baseline=1`, `compare_fuse_performance_metrics=1`, `run_e2e_smoke_all=1`, and `run_git_feature_matrix=1` to enable them on demand. The scheduled daily run enables all of these flags; concurrency stress, POSIX/fsx, full smoke-all, and Git feature matrix run as separate hard-fail steps after the release gate and metrics archive, and all are attempted so one failure does not hide another workload's result. `run_e2e_smoke_all=1` also enables Git workspace smoke coverage.
 - Set `archive_fuse_performance_metrics=1` on manual `local-e2e` runs, or use the daily scheduled run, to copy `performance-metrics-*.json`, `performance-compare-*.json`, `performance-compare-*.md`, mount logs, and an archive manifest to the Drive9 CI workspace under `/benchmarks/fuse-performance/<YYYY>/<MM>/<DD>/<branch>/<sha>/<run_id>-<attempt>/`. The same files are still uploaded as the GitHub artifact `fuse-performance-baseline`.
 - Set `compare_fuse_performance_metrics=1` on manual `local-e2e` runs, or use the daily scheduled run, to compare current metrics against the latest Drive9 archive before archiving the current run. By default, `FUSE_PERF_COMPARE_FAIL_ON_REGRESSION=1` makes any metric below `1 - FUSE_PERF_COMPARE_WARN_RATIO` fail the compare step after writing JSON/Markdown reports. Missing historical baselines, parameter mismatches, and legacy baselines missing newly added workloads still produce non-failing warnings; invalid current metrics, broken Drive9 compare configuration, malformed archived manifests, and structurally invalid baseline metrics fail closed.
-- The daily local-e2e gate intentionally covers the local CI-safe SQLite/Git/FUSE scripts. `verify-description-e2e.sh`, `verify-description-tidb-zero-e2e.sh`, and the full `posix-feature-matrix.sh`/pjdfstest flow remain explicit environment-specific runs because they require separate Docker/Ollama, TiDB Cloud Zero, or root/pjdfstest prerequisites.
+- The daily local-e2e gate intentionally covers the local CI-safe SQLite/Git/FUSE scripts. `verify-description-e2e.sh`, `verify-description-tidb-zero-e2e.sh`, and the full `pjdfstest-suite.sh` flow remain explicit environment-specific runs because they require separate Docker/Ollama, TiDB Cloud Zero, or root/pjdfstest prerequisites.
 - FUSE release-gate knobs are `FUSE_STRICT_PREREQS`, `RUN_FUSE_GIT_CLONE`, `FUSE_GIT_CLONE_URL`, `FUSE_GIT_CLONE_TIMEOUT_S`, `RUN_FUSE_UMOUNT_DURABLE`, `FUSE_UMOUNT_TIMEOUT`, `RUN_FUSE_LOG_AUDIT`, `RUN_FUSE_ALL_WORKLOADS`, `RUN_FUSE_SQLITE_CORRECTNESS`, `RUN_FUSE_CONCURRENCY_STRESS`, `RUN_FUSE_POSIX_FSX`, `RUN_FUSE_PERFORMANCE_BASELINE`, and the FUSE correctness/SQLite/concurrency/POSIX/fsx/performance workload knobs. Set `RUN_FUSE_ALL_WORKLOADS=1` to default concurrency stress, POSIX/fsx, and performance baseline to enabled in one release-gate command; explicit per-workload env vars still take precedence. `local-e2e.yml` intentionally overrides `RUN_FUSE_CONCURRENCY_STRESS=0` and `RUN_FUSE_POSIX_FSX=0` for its release-gate step, then runs `fuse-concurrency-stress.sh` and `fuse-posix-fsx-gate.sh` separately after metrics artifact/archive steps.
 - Git workspace smoke defaults to `drive9`, `kimi-cli`, and `kimi-code`. Override with `GIT_WORKSPACE_REPOS='slug=https://example/repo.git,...'`.
 - Git workspace scenarios default to `agent_edit_add_commit,agent_patch_apply,sandbox_restore`; tune with `GIT_WORKSPACE_SCENARIOS`.

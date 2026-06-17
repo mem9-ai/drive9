@@ -582,7 +582,9 @@ public final class Drive9Client: @unchecked Sendable {
 
     private func uploadPatchPart(_ part: Drive9PatchPartURL, data: Data) async throws {
         var headers = part.headers
-        headers["x-amz-checksum-sha256"] = sha256Base64(data)
+        if headers.keys.contains(where: { $0.caseInsensitiveCompare("x-amz-checksum-sha256") == .orderedSame }) {
+            headers["x-amz-checksum-sha256"] = sha256Base64(data)
+        }
         let response = try await rawPut(url: part.url, headers: headers, data: data)
         guard (200...299).contains(response.status) else { throw errorFrom(data: response.body, status: response.status) }
     }

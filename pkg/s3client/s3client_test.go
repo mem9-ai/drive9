@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -228,6 +230,46 @@ func TestPresignURLsGenerated(t *testing.T) {
 	}
 	if getURL == "" {
 		t.Error("expected non-empty presigned GET URL")
+	}
+}
+
+func TestLocalHandlerRangeReadSparseLargeObject(t *testing.T) {
+	c := newTestClient(t)
+
+	key := "blobs/sparse-large"
+	path := c.objectPath(key)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const offset = int64(2*1024*1024*1024 + 1)
+	if err := f.Truncate(offset + 1); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("a"), offset); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/objects/"+key+"?range=2147483649-2147483649", nil)
+	rec := httptest.NewRecorder()
+	c.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status = %d, want %d; body=%q", rec.Code, http.StatusPartialContent, rec.Body.String())
+	}
+	if got := rec.Body.String(); got != "a" {
+		t.Fatalf("body = %q, want %q", got, "a")
+	}
+	if got, want := rec.Header().Get("Content-Range"), "bytes 2147483649-2147483649/2147483650"; got != want {
+		t.Fatalf("Content-Range = %q, want %q", got, want)
 	}
 }
 

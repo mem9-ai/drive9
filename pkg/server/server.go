@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/base64"
@@ -18,6 +19,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/dat9/pkg/backend"
 	"github.com/mem9-ai/dat9/pkg/datastore"
 	"github.com/mem9-ai/dat9/pkg/embedding"
@@ -76,6 +78,20 @@ type autoEmbeddingSchemaProvisioner interface {
 	InitSchemaForAutoEmbeddingProfile(context.Context, string, tenantschema.TiDBAutoEmbeddingProfile) error
 }
 
+type credentialProvisionRequestValidator interface {
+	ValidateCredentialProvisionRequest(tenant.CredentialProvisionRequest) error
+}
+
+type provisioningRegionProvider interface {
+	ProvisioningCloudProvider() string
+	ProvisioningRegion() string
+}
+
+type nativeSystemUserProvisioner interface {
+	// tenantID is reserved for audit/log naming; current native setup derives SQL principals from the DSN user.
+	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, err error)
+}
+
 type Server struct {
 	fallback            *backend.Dat9Backend
 	meta                *meta.Store
@@ -103,6 +119,7 @@ type Server struct {
 	forkWorkerWG        sync.WaitGroup
 	forkWorkerMu        sync.Mutex
 	forkWorkerClosed    bool
+	schemaInitErrors    sync.Map
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -141,10 +158,11 @@ type TenantStatusResponse struct {
 }
 
 const (
-	maxBatchStatPaths       = 256
-	maxBatchReadSmallPaths  = 128
-	maxBatchReadSmallBytes  = 50_000
-	defaultBatchReadMaxBody = 1 << 20
+	maxBatchStatPaths                     = 256
+	maxBatchReadSmallPaths                = 128
+	maxBatchReadSmallBytes                = 50_000
+	defaultBatchReadMaxBody               = 1 << 20
+	maxCredentialProvisionBodyBytes int64 = 1 << 20
 )
 
 func New(b *backend.Dat9Backend) *Server {
@@ -221,6 +239,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.Handle("/v2/uploads/", business)
 	mux.Handle("/v1/tokens", business)
 	mux.Handle("/v1/tokens/", business)
+	mux.Handle("/v1/tenant", business)
 	mux.Handle("/v1/fork", business)
 	mux.Handle("/v1/sql", business)
 	mux.Handle("/v1/events", business)
@@ -302,6 +321,7 @@ func NewWithConfig(cfg Config) *Server {
 		s.startPendingTenantReconciler()
 		s.resumeProvisioningTenants()
 		s.resumeDeletingForkTenants()
+		s.startTenantDeleteCleanup(backgroundWithTrace(context.Background()))
 	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
 	if s.semanticWorker != nil {
@@ -571,6 +591,8 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleV2Uploads(w, r)
 	case r.URL.Path == "/v1/tokens" || strings.HasPrefix(r.URL.Path, "/v1/tokens/"):
 		s.handleTokens(w, r)
+	case r.URL.Path == "/v1/tenant":
+		s.handleTenantDelete(w, r)
 	case r.URL.Path == "/v1/fork":
 		s.handleFork(w, r)
 	case r.URL.Path == "/v1/sql":
@@ -996,20 +1018,38 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          string(resolved.Tenant.Status),
-		Message:         tenantStatusMessage(&resolved.Tenant),
+		Message:         s.tenantStatusMessage(&resolved.Tenant),
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})
 }
 
-func tenantStatusMessage(t *meta.Tenant) string {
+func (s *Server) tenantStatusMessage(t *meta.Tenant) string {
 	if t == nil {
 		return ""
 	}
 	if t.Kind == meta.TenantKindFork && t.Status == meta.TenantProvisioning {
 		return forkProvisioningMessage(t)
 	}
+	if s != nil && (t.Status == meta.TenantProvisioning || t.Status == meta.TenantFailed) {
+		if value, ok := s.schemaInitErrors.Load(t.ID); ok {
+			if msg, ok := value.(string); ok && msg != "" {
+				return "schema init error: " + msg
+			}
+		}
+	}
 	return ""
+}
+
+func schemaInitStatusErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	if len(msg) > 500 {
+		return msg[:500] + "..."
+	}
+	return msg
 }
 
 func backendFromRequest(r *http.Request) *backend.Dat9Backend {
@@ -1141,7 +1181,7 @@ func (s *Server) handleRead(w http.ResponseWriter, r *http.Request, path string)
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "read_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "fs_read", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 
@@ -1202,7 +1242,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "list_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "list", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	metricEvent(r.Context(), "userdb_query", "api", "list", "result", "ok")
@@ -1293,7 +1333,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 
@@ -1307,7 +1347,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 	nlink, err := nodeLinkCount(r.Context(), b, nf)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_refcount_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	if nf.File != nil {
@@ -1327,7 +1367,7 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 		tags, err = b.Store().GetFileTags(r.Context(), nf.File.FileID)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "stat_metadata_load_tags_failed", "path", path, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, err.Error())
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 	} else {
@@ -2139,7 +2179,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "delete_failed", "path", path, "recursive", recursive, "kind", kind, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive, "kind", kind)...)
@@ -2179,7 +2219,7 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "copy_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "copy_ok", "src_path", srcPath, "dst_path", dstPath)...)
@@ -2223,7 +2263,7 @@ func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath 
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "hardlink_failed", "src_path", srcPath, "dst_path", dstPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "hardlink_ok", "src_path", srcPath, "dst_path", dstPath)...)
@@ -2267,7 +2307,7 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "rename_failed", "old_path", oldPath, "new_path", newPath, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "rename_ok", "old_path", oldPath, "new_path", newPath)...)
@@ -2301,7 +2341,7 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "mkdir_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "mkdir_ok", "path", path)...)
@@ -2343,7 +2383,7 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "chmod_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "chmod_ok", "path", path)...)
@@ -2370,7 +2410,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "create_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "create_ok", "path", path)...)
@@ -2432,7 +2472,7 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 			return
 		}
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "symlink_failed", "path", path, "error", err)...)
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "symlink_ok", "path", path)...)
@@ -2484,7 +2524,7 @@ func (s *Server) handleUploads(w http.ResponseWriter, r *http.Request) {
 		if errJSONInvalidRootDentry(w, err) {
 			return
 		}
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	metricEvent(r.Context(), "metadb_query", "api", "uploads_list", "result", "ok")
@@ -3362,9 +3402,36 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	var credentialReq *tenant.CredentialProvisionRequest
+	if provider == tenant.ProviderTiDBCloudNative {
+		req, err := decodeCredentialProvisionRequest(w, r)
+		if err != nil {
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if validator, ok := s.provisioner.(credentialProvisionRequestValidator); ok {
+			if err := validator.ValidateCredentialProvisionRequest(*req); err != nil {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
+		credentialReq = req
+	} else {
+		if err := rejectCredentialProvisionBody(r); err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider, "error", err)...)
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
 	res, err := s.provisionTenant(r.Context(), provisionTenantOptions{
-		KeyName:      "default",
-		TokenVersion: 1,
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: credentialReq,
 	})
 	if err != nil {
 		var pe *provisionTenantError
@@ -3380,11 +3447,85 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	_ = json.NewEncoder(w).Encode(map[string]string{
+	response := map[string]string{
 		"tenant_id": res.TenantID,
 		"api_key":   res.APIKey,
 		"status":    string(res.Status),
+	}
+	if res.Provider == tenant.ProviderTiDBCloudNative {
+		if res.CloudProvider != "" {
+			response["cloud_provider"] = res.CloudProvider
+		}
+		if res.Region != "" {
+			response["region"] = res.Region
+		}
+	}
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
+	var req struct {
+		PublicKey    string `json:"public_key"`
+		PrivateKey   string `json:"private_key"`
+		DatabaseName string `json:"database_name"`
+	}
+	return decodeCredentialRequest(w, r, &req, func() tenant.CredentialProvisionRequest {
+		return tenant.CredentialProvisionRequest{
+			PublicKey:    strings.TrimSpace(req.PublicKey),
+			PrivateKey:   strings.TrimSpace(req.PrivateKey),
+			DatabaseName: strings.TrimSpace(req.DatabaseName),
+		}
 	})
+}
+
+func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, build func() tenant.CredentialProvisionRequest) (*tenant.CredentialProvisionRequest, error) {
+	if r.Body != nil {
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCredentialProvisionBodyBytes))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(raw); err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("invalid JSON body: %w", err)
+		}
+		var extra struct{}
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("invalid JSON body: trailing data")
+		}
+	}
+	out := build()
+	if out.PublicKey == "" || out.PrivateKey == "" {
+		return nil, fmt.Errorf("public_key and private_key are required")
+	}
+	return &out, nil
+}
+
+func rejectCredentialProvisionBody(r *http.Request) error {
+	if r.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxCredentialProvisionBodyBytes))
+	if err != nil {
+		return nil
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if len(body) == 0 {
+		return nil
+	}
+	if int64(len(body)) >= maxCredentialProvisionBodyBytes {
+		return fmt.Errorf("request body too large")
+	}
+	var raw struct {
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	if strings.TrimSpace(raw.PublicKey) != "" {
+		return fmt.Errorf("tidbcloud public key is not supported for this provider (only tidb_cloud_native)")
+	}
+	if strings.TrimSpace(raw.PrivateKey) != "" {
+		return fmt.Errorf("tidbcloud private key is not supported for this provider (only tidb_cloud_native)")
+	}
+	return nil
 }
 
 type apiKeyIssueSource struct {
@@ -3394,18 +3535,21 @@ type apiKeyIssueSource struct {
 }
 
 type provisionTenantOptions struct {
-	KeyName      string
-	TokenVersion int
-	APIKeySource apiKeyIssueSource
+	KeyName               string
+	TokenVersion          int
+	APIKeySource          apiKeyIssueSource
+	CredentialProvisioner *tenant.CredentialProvisionRequest
 }
 
 type provisionTenantResult struct {
-	TenantID  string
-	APIKey    string
-	APIKeyID  string
-	Status    meta.TenantStatus
-	Provider  string
-	TenantDSN string
+	TenantID      string
+	APIKey        string
+	APIKeyID      string
+	Status        meta.TenantStatus
+	Provider      string
+	TenantDSN     string
+	CloudProvider string
+	Region        string
 }
 
 type provisionTenantError struct {
@@ -3531,6 +3675,9 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		metricEvent(ctx, "tenant_provision", "provider", rawProvider, "result", "error")
 		return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 	}
+	if provider == tenant.ProviderTiDBCloudNative && opts.CredentialProvisioner == nil {
+		return nil, newProvisionTenantError(http.StatusBadRequest, "public_key and private_key are required", fmt.Errorf("public_key and private_key are required"))
+	}
 	tenantID := token.NewID()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
 	setRequestMetricTenant(ctx, tenantID, "", provider, tenantRequestClass{surface: "provision", action: "post"})
@@ -3578,7 +3725,18 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 	}
 
-	cluster, err := s.provisioner.Provision(ctx, tenantID)
+	var cluster *tenant.ClusterInfo
+	if provider == tenant.ProviderTiDBCloudNative {
+		if opts.CredentialProvisioner == nil {
+			err = fmt.Errorf("public_key and private_key are required")
+		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
+			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
+		} else {
+			err = fmt.Errorf("provisioner does not support request credentials")
+		}
+	} else {
+		cluster, err = s.provisioner.Provision(ctx, tenantID)
+	}
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "cluster_error")
@@ -3586,7 +3744,15 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
 		}
-		return nil, newProvisionTenantError(http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err), err)
+		msg := fmt.Sprintf("provision tenant cluster failed: %v", err)
+		if strings.Contains(strings.ToLower(err.Error()), "free cluster") {
+			msg = "TiDB Cloud free cluster limit reached. Set a monthly Spending Limit to continue. See https://www.pingcap.com/tidb-cloud-starter-pricing-details/#cost-and-limitations"
+		} else if strings.Contains(strings.ToLower(err.Error()), "credits") || strings.Contains(strings.ToLower(err.Error()), "payment") {
+			msg = "TiDB Cloud payment required. Add a payment method at https://tidbcloud.com/org-settings/billing/payments"
+		} else if strings.Contains(strings.ToLower(err.Error()), "instance capacity limit") || strings.Contains(strings.ToLower(err.Error()), "capacity limit") {
+			msg = "TiDB Cloud cluster limit reached (100 clusters per organization). Contact PingCAP support for assistance."
+		}
+		return nil, newProvisionTenantError(http.StatusBadGateway, msg, err)
 	}
 	cluster.Provider = provider
 
@@ -3639,14 +3805,31 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
 	metricEvent(ctx, "tenant_provision", "provider", provider, "result", "accepted")
 
+	cloudProvider, region := "", ""
+	if provider == tenant.ProviderTiDBCloudNative {
+		cloudProvider, region = provisioningCloudRegion(s.provisioner)
+	}
 	return &provisionTenantResult{
-		TenantID:  tenantID,
-		APIKey:    apiToken,
-		APIKeyID:  apiKeyID,
-		Status:    meta.TenantProvisioning,
-		Provider:  provider,
-		TenantDSN: tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
+		TenantID:      tenantID,
+		APIKey:        apiToken,
+		APIKeyID:      apiKeyID,
+		Status:        meta.TenantProvisioning,
+		Provider:      provider,
+		TenantDSN:     tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
+		CloudProvider: cloudProvider,
+		Region:        region,
 	}, nil
+}
+
+func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {
+	if provisioner == nil {
+		return "", ""
+	}
+	regionProvider, ok := provisioner.(provisioningRegionProvider)
+	if !ok {
+		return "", ""
+	}
+	return strings.TrimSpace(regionProvider.ProvisioningCloudProvider()), strings.TrimSpace(regionProvider.ProvisioningRegion())
 }
 
 func (s *Server) persistFailedProvisionClusterInfo(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo) {
@@ -3758,7 +3941,12 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			return
 		default:
 		}
-		if err := schemaInit(ctx, tenantDSN); err == nil {
+		err := schemaInit(ctx, tenantDSN)
+		if err == nil {
+			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+		}
+		if err == nil {
+			s.schemaInitErrors.Delete(tenantID)
 			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_ok", "tenant_id", tenantID, "provider", provider, "attempt", attempt)...)
 			if s.metrics != nil {
 				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "ok")
@@ -3774,6 +3962,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			}
 			return
 		} else {
+			s.schemaInitErrors.Store(tenantID, schemaInitStatusErrorMessage(err))
 			logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", err)...)
 			if s.metrics != nil {
 				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "error")
@@ -3824,6 +4013,49 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		backoff *= 2
 		attempt++
 	}
+}
+
+func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) error {
+	if provider != tenant.ProviderTiDBCloudNative {
+		return nil
+	}
+	if s.provisioner == nil {
+		return fmt.Errorf("server misconfigured: native tenant provider is missing")
+	}
+	systemUserProvisioner, ok := s.provisioner.(nativeSystemUserProvisioner)
+	if !ok {
+		return fmt.Errorf("native provisioner does not support system user setup")
+	}
+	cfg, err := mysql.ParseDSN(tenantDSN)
+	if err != nil {
+		return fmt.Errorf("parse native tenant DSN for credential finalization: %w", err)
+	}
+	fromDBUser := strings.TrimSpace(cfg.User)
+	if fromDBUser == "" {
+		return fmt.Errorf("native tenant DSN has empty username")
+	}
+	username, password, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
+	if err != nil {
+		return fmt.Errorf("ensure native system user: %w", err)
+	}
+	if username == "" || password == "" {
+		return fmt.Errorf("native system user setup returned empty credential")
+	}
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(password))
+	if err != nil {
+		return fmt.Errorf("encrypt native system user password: %w", err)
+	}
+	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, fromDBUser, username, cipherPass)
+	if err != nil {
+		return fmt.Errorf("persist native system user credential: %w", err)
+	}
+	if !updated {
+		logger.Info(ctx, "native_system_user_credential_update_skipped",
+			zap.String("tenant_id", tenantID),
+			zap.String("from_db_user", fromDBUser),
+			zap.String("db_user", username))
+	}
+	return nil
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {
@@ -3918,14 +4150,14 @@ func (s *Server) handleGrep(w http.ResponseWriter, r *http.Request, path string)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_failed", "path", path, "query_len", len(query), "limit", limit, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "grep", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	if layerRef := strings.TrimSpace(r.URL.Query().Get("layer")); layerRef != "" {
 		results, err = overlayFSLayerGrep(r.Context(), b, layerRef, query, path, limit, results)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "grep_layer_failed", "path", path, "query_len", len(query), "limit", limit, "layer", layerRef, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, err.Error())
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 	}
@@ -4002,14 +4234,14 @@ func (s *Server) handleFind(w http.ResponseWriter, r *http.Request, path string)
 	if err != nil {
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_failed", "path", path, "error", err)...)
 		metricEvent(r.Context(), "userdb_query", "api", "find", "result", "error")
-		errJSON(w, http.StatusInternalServerError, err.Error())
+		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
 	if layerRef := strings.TrimSpace(q.Get("layer")); layerRef != "" {
 		results, err = overlayFSLayerFind(r.Context(), b, layerRef, f, results)
 		if err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "find_layer_failed", "path", path, "layer", layerRef, "error", err)...)
-			errJSON(w, http.StatusInternalServerError, err.Error())
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 	}

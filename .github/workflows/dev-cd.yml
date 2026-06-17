@@ -81,7 +81,7 @@ jobs:
             --name ${{ env.EKS_CLUSTER }} \
             --region ${{ env.AWS_REGION }}
 
-      - name: Deploy
+      - name: Deploy to dat9
         run: |
           kubectl set image deployment/${{ env.K8S_DEPLOYMENT }} \
             ${{ env.K8S_DEPLOYMENT }}=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} \
@@ -90,8 +90,23 @@ jobs:
             -n ${{ env.DEPLOY_NAMESPACE }} \
             --timeout=180s
 
-      - name: Rollback on failed deploy
+      - name: Deploy to drive9-tidbcloud
+        run: |
+          kubectl set image deployment/drive9-server \
+            drive9-server=${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} \
+            -n drive9-tidbcloud
+          kubectl rollout status deployment/drive9-server \
+            -n drive9-tidbcloud \
+            --timeout=180s
+
+      - name: Rollback dat9 on failed deploy
         if: failure()
         run: |
           kubectl rollout undo deployment/${{ env.K8S_DEPLOYMENT }} \
             -n ${{ env.DEPLOY_NAMESPACE }}
+
+      - name: Rollback drive9-tidbcloud on failed deploy
+        if: failure()
+        run: |
+          kubectl rollout undo deployment/drive9-server \
+            -n drive9-tidbcloud

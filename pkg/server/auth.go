@@ -50,6 +50,23 @@ const (
 
 const statusClientClosedRequest = 499
 
+func sanitizeClientError(err error) string {
+	if err == nil {
+		return "backend unavailable"
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "error 1105") && strings.Contains(msg, "quota") {
+		return "tenant usage quota exceeded"
+	}
+	if strings.Contains(msg, "ensure tidb auto-embedding schema") ||
+		strings.Contains(msg, "validate tidb auto-embedding schema") ||
+		strings.Contains(msg, "migrate split tables") ||
+		strings.Contains(msg, "detect legacy files table") {
+		return "tenant metadata error"
+	}
+	return "backend unavailable"
+}
+
 func ScopeFromContext(ctx context.Context) *TenantScope {
 	s, _ := ctx.Value(tenantScopeKey).(*TenantScope)
 	return s
@@ -228,6 +245,11 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			return
 		}
 
+		if isTenantDeleteRequest(r) {
+			handleTenantDeleteAuth(w, r, pool, next, resolved, claims)
+			return
+		}
+
 		switch resolved.Tenant.Status {
 		case meta.TenantActive:
 		case meta.TenantPending:
@@ -305,7 +327,7 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			}
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "backend_load_failed", "tenant_id", resolved.Tenant.ID, "error", err)...)
 			metricEvent(r.Context(), "tenant_backend", "result", "load_failed")
-			errJSON(w, http.StatusInternalServerError, "backend unavailable")
+			errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 			return
 		}
 		defer release()
@@ -336,6 +358,65 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 		setRequestMetricScope(r.Context(), scope, classifyTenantRequest(r))
 		next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 	})
+}
+
+func isTenantDeleteRequest(r *http.Request) bool {
+	return r.Method == http.MethodDelete && r.URL.Path == "/v1/tenant"
+}
+
+func handleTenantDeleteAuth(w http.ResponseWriter, r *http.Request, pool *tenant.Pool, next http.Handler, resolved *meta.TenantWithAPIKey, claims *token.Claims) {
+	switch resolved.Tenant.Status {
+	case meta.TenantActive, meta.TenantFailed, meta.TenantDeleting, meta.TenantDeleted:
+	case meta.TenantPending:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_pending", "tenant_id", resolved.Tenant.ID)...)
+		metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantPending))
+		errJSON(w, http.StatusServiceUnavailable, "tenant provisioning is pending")
+		return
+	case meta.TenantProvisioning:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_provisioning", "tenant_id", resolved.Tenant.ID)...)
+		metricEvent(r.Context(), "tenant_status", "status", string(meta.TenantProvisioning))
+		errJSON(w, http.StatusServiceUnavailable, "tenant is provisioning")
+		return
+	case meta.TenantSuspended:
+		pool.Invalidate(resolved.Tenant.ID)
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_blocked", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
+		metricEvent(r.Context(), "tenant_status", "status", string(resolved.Tenant.Status))
+		errJSON(w, http.StatusForbidden, "tenant is unavailable")
+		return
+	default:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_unavailable", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
+		metricEvent(r.Context(), "tenant_status", "status", string(resolved.Tenant.Status))
+		errJSON(w, http.StatusForbidden, "tenant is unavailable")
+		return
+	}
+
+	scopeKind := resolved.APIKey.ScopeKind
+	if scopeKind == "" {
+		scopeKind = meta.APIKeyScopeKindOwner
+	}
+	isScoped := false
+	switch scopeKind {
+	case meta.APIKeyScopeKindOwner:
+	case meta.APIKeyScopeKindFS:
+		isScoped = true
+	default:
+		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "auth_scope_kind_unsupported", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "scope_kind", scopeKind)...)
+		metricEvent(r.Context(), "auth", "result", "scope_kind_unsupported")
+		errJSON(w, http.StatusForbidden, "unsupported API key scope kind")
+		return
+	}
+
+	scope := &TenantScope{
+		TenantID:           resolved.Tenant.ID,
+		APIKeyID:           resolved.APIKey.ID,
+		TokenVersion:       resolved.APIKey.TokenVersion,
+		Provider:           resolved.Tenant.Provider,
+		JournalPermissions: journalPermissionsFromClaims(claims),
+		ScopeKind:          scopeKind,
+		IsScoped:           isScoped,
+	}
+	setRequestMetricScope(r.Context(), scope, classifyTenantRequest(r))
+	next.ServeHTTP(w, r.WithContext(withScope(r.Context(), scope)))
 }
 
 // capabilityAuthMiddleware returns a handler that resolves the tenant backend
@@ -371,6 +452,7 @@ func (s *Server) capabilityAuthMiddleware(metaStore *meta.Store, pool *tenant.Po
 
 		b, release, err := pool.Acquire(r.Context(), tenant)
 		if err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "capability_backend_load_failed", "tenant_id", tenantID, "error", err)...)
 			errJSON(w, http.StatusInternalServerError, "backend unavailable")
 			return
 		}

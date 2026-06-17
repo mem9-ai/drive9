@@ -34,6 +34,7 @@ type mountFuseOptions struct {
 	CacheDir                string
 	CacheSize               int64
 	ReadCacheMaxFileBytes   int64
+	ReadCacheTTL            time.Duration
 	DiskReadCacheSize       int64
 	DiskReadCacheFreeRatio  float64
 	DirTTL                  time.Duration
@@ -67,6 +68,17 @@ type mountFuseOptions struct {
 	ReadOnly                bool
 	Debug                   bool
 	PerfCounters            bool
+	ProfileCPUDuration      time.Duration
+	ProfileCPUInterval      time.Duration
+	ProfileHeap             string
+	ProfileDir              string
+	ProfileHeapInterval     time.Duration
+	PprofAddr               string
+	PerfSamplesPath         string
+	PerfSampleInterval      time.Duration
+	PerfMaxSamples          int
+	PerfMaxSampleFiles      int
+	PerfMaxProfileFiles     int
 }
 
 type vaultMountOptions struct {

@@ -4218,12 +4218,18 @@ func (fs *Dat9FS) setGitAttr(ctx context.Context, input *gofuse.SetAttrIn, entry
 		}
 		if input.Valid&gofuse.FATTR_FH != 0 {
 			if fh, ok := fs.fileHandles.Get(input.Fh); ok && fh.Layer == PathLayerGitWorkspace && fh.Dirty != nil {
+				var abortStreamer func()
 				fh.Lock()
-				if err := fs.truncateWritableHandleLocked(fh, newSize); err != nil {
+				var err error
+				abortStreamer, err = fs.truncateWritableHandleLocked(fh, newSize)
+				if err != nil {
 					fh.Unlock()
 					return gofuse.Status(syscall.EFBIG)
 				}
 				fh.Unlock()
+				if abortStreamer != nil {
+					abortStreamer()
+				}
 			}
 		} else if newSize != entry.Size {
 			readSize := entry.Size

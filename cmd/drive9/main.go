@@ -7,6 +7,7 @@
 // Commands:
 //
 //	create  provision a new database and owner context
+//	delete  delete the current tenant
 //	ctx     manage contexts (show, add, import, fork, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, mkdir, chmod,
 //	        symlink, hardlink, sh, grep, find, layer)
@@ -14,10 +15,12 @@
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	journal append-only agent/workflow journal operations
 //	git     git-aware drive9 workflows
+//	region list provisioning regions
 //	profile show mount profile configuration
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
 //	doctor  diagnose local drive9 runtime prerequisites
+//	update  update the drive9 CLI binary in place
 package main
 
 import (
@@ -25,6 +28,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/pprof"
+	"strings"
 	"sync"
 
 	"go.uber.org/zap"
@@ -44,14 +48,17 @@ var exitFunc = os.Exit
 // "handler not reached". Production callers see no change: the default value
 // is the real cli.Secret and nothing else reassigns it outside tests.
 var vaultHandler = cli.Secret
+var deleteHandler = cli.DeleteTenant
 var tokenHandler = cli.Token
 var doctorHandler = cli.Doctor
 var journalHandler = cli.Journal
 var gitHandler = cli.Git
+var regionHandler = cli.Region
 var packHandler = cli.PackCommand
 var unpackHandler = cli.UnpackCommand
 var profileHandler = cli.Profile
 var umountHandler = cli.UmountCmd
+var updateHandler = cli.Update
 
 func main() {
 	if logger.CLIEnabled() {
@@ -102,6 +109,13 @@ func dispatch(cmd string, args []string) {
 		}
 		if err := cli.Create(args); err != nil {
 			fatal("create", err)
+		}
+	case "delete":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "delete"))
+		}
+		if err := deleteHandler(args); err != nil {
+			fatal("delete", err)
 		}
 	case "ctx":
 		if cliLogger != nil {
@@ -179,6 +193,21 @@ func dispatch(cmd string, args []string) {
 			}
 			fatal("git"+sub, err)
 		}
+	case "region":
+		if cliLogger != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = args[0]
+			}
+			logger.Info(context.Background(), "cli_command", zap.String("command", "region"), zap.String("subcommand", sub))
+		}
+		if err := regionHandler(args); err != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = " " + args[0]
+			}
+			fatal("region"+sub, err)
+		}
 	case "pack":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "pack"))
@@ -228,6 +257,13 @@ func dispatch(cmd string, args []string) {
 		}
 		if err := doctorHandler(args); err != nil {
 			fatal("doctor", err)
+		}
+	case "update":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "update"))
+		}
+		if err := updateHandler(args); err != nil {
+			fatal("update", err)
 		}
 	default:
 		if cliLogger != nil {
@@ -331,7 +367,13 @@ func fatal(cmd string, err error) {
 	if cliLogger != nil {
 		logger.Error(context.Background(), "cli_command_failed", zap.String("command", cmd), zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, err)
+	msg := err.Error()
+	if strings.Contains(strings.ToLower(msg), "usage quota") {
+		if m := cli.QuotaExceededMessageForCurrentContext(); m != "" {
+			msg = m
+		}
+	}
+	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, msg)
 	type exitCoder interface{ ExitCode() int }
 	if ec, ok := err.(exitCoder); ok && ec.ExitCode() > 0 {
 		exitWithCode(ec.ExitCode())
@@ -343,8 +385,12 @@ func usage(code int) {
 	fmt.Fprint(os.Stderr,
 		"usage: drive9 <command> [arguments]\n\n"+
 			"commands:\n"+
-			"  create [--name NAME] [--server URL]\n"+
+			"  create [--name NAME] [--region-code CODE] [--server URL] [--json]\n"+
+			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
 			"                         provision a new database and owner context\n"+
+			"  delete [--server URL] [--api-key KEY] [--json]\n"+
+			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
+			"                         delete current tenant with owner API key\n"+
 			"  ctx show [--json] [--reveal]\n"+
 			"                         show current context\n"+
 			"  ctx add --api-key <key> [--name NAME] [--server URL]\n"+
@@ -353,7 +399,8 @@ func usage(code int) {
 			"                         add delegated context\n"+
 			"  ctx fork [<new>] [--from <ctx>] [--json]\n"+
 			"                         create a copy-on-write fork context\n"+
-			"  ctx ls [-l|--json]     list contexts\n"+
+			"  ctx ls [-l|--long] [-D|--details] [--json] [--type <kind>|--scoped]\n"+
+			"                         list contexts\n"+
 			"  ctx use <name>         activate context\n"+
 			"  ctx rm <name>          delete context\n"+
 			"  fs <command>           filesystem operations\n"+
@@ -364,6 +411,7 @@ func usage(code int) {
 			"                         append-only agent/workflow journal operations\n"+
 			"  git clone --fast <repo-url> <mounted-path>\n"+
 			"                         git-aware fast clone workflow\n"+
+			"  region list [--json]   list provisioning regions\n"+
 			"  pack [flags] [archive] [path...]\n"+
 			"                         archive coding-agent local overlay paths to drive9/S3\n"+
 			"  unpack [flags] [archive]\n"+
@@ -375,7 +423,8 @@ func usage(code int) {
 			"  mount vault [flags] <mountpoint>\n"+
 			"                         mount vault secrets read-only\n"+
 			"  umount <mountpoint>    unmount a drive9 mount\n"+
-			"  doctor fuse            diagnose local FUSE prerequisites\n\n"+
+			"  doctor fuse            diagnose local FUSE prerequisites\n"+
+			"  update [--check]       update drive9 CLI in place\n\n"+
 			"global:\n"+
 			"  -h, --help, help       show this help\n"+
 			"  -v, --version, version print version information\n",

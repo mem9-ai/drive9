@@ -31,6 +31,10 @@ const (
 	defaultFuseParallelReadConcurrency = 4
 	defaultFuseParallelReadBlockSizeMB = 1
 	defaultMountBackgroundReadyTimeout = 30 * time.Second
+	defaultMountPerfPprofAddr          = "127.0.0.1:0"
+	defaultMountPerfCPUDuration        = 30 * time.Second
+	defaultMountPerfCPUInterval        = 10 * time.Minute
+	defaultMountPerfHeapInterval       = 10 * time.Minute
 )
 
 var (
@@ -112,6 +116,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	cacheDir := fs.String("cache-dir", "", "write-back cache directory (default ~/.cache/drive9)")
 	cacheSize := fs.Int("cache-size", 128, "read cache size in MB")
 	readCacheMaxFile := fs.Int64("read-cache-max-file-mb", 4, "maximum single file size admitted to read cache in MB; files at or below this size are fetched with a single whole-file request")
+	readCacheTTL := fs.Duration("read-cache-ttl", 30*time.Second, "read cache TTL; 0 disables time-based expiry")
 	diskReadCacheSize := fs.Int64("disk-read-cache-size-mb", 1024, "disk-backed read cache size in MB")
 	diskReadCacheFreeRatio := fs.Float64("disk-read-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before disk read cache evicts")
 	dirTTL := fs.Duration("dir-ttl", 10*time.Second, "directory cache TTL")
@@ -147,7 +152,15 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
-	perfCounters := fs.Bool("perf-counters", false, "print FUSE perf counter summary on unmount")
+	perfDir := fs.String("perf-dir", "", "enable standard FUSE profiling outputs in this directory")
+	perfInterval := fs.Duration("perf-interval", 0, "continuous performance sample interval (default 10s when --perf-dir is set)")
+	perfMaxSamples := fs.Int("perf-max-samples", 0, "maximum samples per continuous perf JSONL segment (default 7200 when --perf-dir is set)")
+	perfMaxSampleFiles := fs.Int("perf-max-sample-files", 0, "maximum retained continuous perf sample files (default 2 when --perf-dir is set)")
+	perfMaxProfileFiles := fs.Int("perf-max-profile-files", 0, "maximum retained CPU and heap profile files per type (default 48 when --perf-dir is set)")
+	perfCPUDuration := fs.Duration("perf-cpu-duration", 0, "CPU profile capture window duration (default 30s when --perf-dir is set)")
+	perfCPUInterval := fs.Duration("perf-cpu-interval", 0, "periodically capture CPU profiles at this interval; one capture starts immediately when profiling begins (default 10m when --perf-dir is set)")
+	perfHeapInterval := fs.Duration("perf-heap-interval", 0, "periodically write heap profiles at this interval (default 10m when --perf-dir is set)")
+	perfAddr := fs.String("perf-addr", "", "serve live pprof on this address, e.g. 127.0.0.1:6060")
 
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: drive9 mount [flags] [:/remote] <mountpoint>\n\nflags:\n")
@@ -192,7 +205,17 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 
 	lookupRetryCountGiven := flagProvided(fs, "lookup-retry-count")
 	lookupRetryTimeoutGiven := flagProvided(fs, "lookup-retry-timeout")
+	readCacheTTLGiven := flagProvided(fs, "read-cache-ttl")
 	trustProcessLocalEventsGiven := flagProvided(fs, "trust-process-local-events")
+	perfDirGiven := flagProvided(fs, "perf-dir")
+	perfIntervalGiven := flagProvided(fs, "perf-interval")
+	perfMaxSamplesGiven := flagProvided(fs, "perf-max-samples")
+	perfMaxSampleFilesGiven := flagProvided(fs, "perf-max-sample-files")
+	perfMaxProfileFilesGiven := flagProvided(fs, "perf-max-profile-files")
+	perfCPUDurationGiven := flagProvided(fs, "perf-cpu-duration")
+	perfCPUIntervalGiven := flagProvided(fs, "perf-cpu-interval")
+	perfHeapIntervalGiven := flagProvided(fs, "perf-heap-interval")
+	perfAddrGiven := flagProvided(fs, "perf-addr")
 	if err := validateLookupRetryFlags(*lookupRetryCount, *lookupRetryTimeout, lookupRetryCountGiven, lookupRetryTimeoutGiven); err != nil {
 		return err
 	}
@@ -211,7 +234,48 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
 	}
-
+	if perfDirGiven && strings.TrimSpace(*perfDir) == "" {
+		return fmt.Errorf("drive9 mount: --perf-dir must not be empty")
+	}
+	if perfAddrGiven && strings.TrimSpace(*perfAddr) == "" {
+		return fmt.Errorf("drive9 mount: --perf-addr must not be empty")
+	}
+	effectivePerfCPUDuration := *perfCPUDuration
+	effectivePerfCPUInterval := *perfCPUInterval
+	effectivePerfHeapInterval := *perfHeapInterval
+	if perfDirGiven {
+		if !perfCPUDurationGiven {
+			effectivePerfCPUDuration = defaultMountPerfCPUDuration
+		}
+		if !perfCPUIntervalGiven {
+			effectivePerfCPUInterval = defaultMountPerfCPUInterval
+		}
+		if !perfHeapIntervalGiven {
+			effectivePerfHeapInterval = defaultMountPerfHeapInterval
+		}
+	}
+	if err := validateMountPerfFlags(mountPerfFlagValidation{
+		perfDirGiven:             perfDirGiven,
+		perfInterval:             *perfInterval,
+		perfMaxSamples:           *perfMaxSamples,
+		perfMaxSampleFiles:       *perfMaxSampleFiles,
+		perfMaxProfileFiles:      *perfMaxProfileFiles,
+		perfCPUDuration:          effectivePerfCPUDuration,
+		perfCPUInterval:          effectivePerfCPUInterval,
+		perfHeapInterval:         effectivePerfHeapInterval,
+		perfIntervalGiven:        perfIntervalGiven,
+		perfMaxSamplesGiven:      perfMaxSamplesGiven,
+		perfMaxSampleFilesGiven:  perfMaxSampleFilesGiven,
+		perfMaxProfileFilesGiven: perfMaxProfileFilesGiven,
+		perfCPUDurationGiven:     perfCPUDurationGiven,
+		perfCPUIntervalGiven:     perfCPUIntervalGiven,
+		perfHeapIntervalGiven:    perfHeapIntervalGiven,
+		perfAddrGiven:            perfAddrGiven,
+	}); err != nil {
+		return err
+	}
+	var profileHeap, profileDir, perfJSONL, pprofAddr string
+	applyMountPerfDirDefaults(*perfDir, *perfAddr, &profileHeap, &profileDir, &perfJSONL, &pprofAddr)
 	profileGiven := flagProvided(fs, "profile")
 	resolved := ResolveMountMode(mountMode, runtime.GOOS, exec.LookPath)
 	fmt.Fprintf(os.Stderr, "drive9: mount mode: %s\n", resolved)
@@ -236,6 +300,10 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	if *readCacheMaxFile <= 0 {
 		return fmt.Errorf("drive9 mount: --read-cache-max-file-mb must be > 0")
+	}
+	normalizedReadCacheTTL, err := readCacheTTLFlagValue(readCacheTTLGiven, *readCacheTTL)
+	if err != nil {
+		return err
 	}
 	if *diskReadCacheSize <= 0 {
 		return fmt.Errorf("drive9 mount: --disk-read-cache-size-mb must be > 0")
@@ -267,8 +335,14 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if resolved == MountModeWebDAV && trustProcessLocalEventsGiven {
 		return fmt.Errorf("drive9 mount: --trust-process-local-events is only supported with --mode=fuse")
 	}
+	if resolved == MountModeWebDAV && readCacheTTLGiven {
+		return fmt.Errorf("drive9 mount: --read-cache-ttl is only supported with --mode=fuse")
+	}
 	if resolved == MountModeWebDAV && *durability != string(fuseDurabilityAuto) {
 		return fmt.Errorf("--durability is only supported with --mode=fuse; WebDAV mounts always use their native write behavior")
+	}
+	if resolved == MountModeWebDAV && perfDirGiven {
+		return fmt.Errorf("--perf-dir is only supported with --mode=fuse")
 	}
 	if resolved == MountModeWebDAV && strings.TrimSpace(*layerRef) != "" {
 		return fmt.Errorf("drive9 mount: --layer is only supported with --mode=fuse")
@@ -411,6 +485,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		CacheDir:                *cacheDir,
 		CacheSize:               int64(*cacheSize) << 20,
 		ReadCacheMaxFileBytes:   *readCacheMaxFile << 20,
+		ReadCacheTTL:            normalizedReadCacheTTL,
 		DiskReadCacheSize:       *diskReadCacheSize << 20,
 		DiskReadCacheFreeRatio:  *diskReadCacheFreeRatio,
 		DirTTL:                  normalizedDirTTL,
@@ -443,7 +518,17 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		AllowOther:              *allowOther,
 		ReadOnly:                *readOnly,
 		Debug:                   *debug,
-		PerfCounters:            *perfCounters,
+		ProfileCPUDuration:      effectivePerfCPUDuration,
+		ProfileCPUInterval:      effectivePerfCPUInterval,
+		ProfileHeap:             profileHeap,
+		ProfileDir:              profileDir,
+		ProfileHeapInterval:     effectivePerfHeapInterval,
+		PprofAddr:               pprofAddr,
+		PerfSamplesPath:         perfJSONL,
+		PerfSampleInterval:      *perfInterval,
+		PerfMaxSamples:          *perfMaxSamples,
+		PerfMaxSampleFiles:      *perfMaxSampleFiles,
+		PerfMaxProfileFiles:     *perfMaxProfileFiles,
 	}
 
 	return mountFuse(opts)
@@ -524,7 +609,9 @@ func mountBackgroundEnv(environ []string, req mountBackgroundRequest) []string {
 	for _, kv := range environ {
 		if strings.HasPrefix(kv, EnvServer+"=") ||
 			strings.HasPrefix(kv, EnvAPIKey+"=") ||
-			strings.HasPrefix(kv, EnvVaultToken+"=") {
+			strings.HasPrefix(kv, EnvVaultToken+"=") ||
+			strings.HasPrefix(kv, EnvTiDBCloudPublicKey+"=") ||
+			strings.HasPrefix(kv, EnvTiDBCloudPrivateKey+"=") {
 			continue
 		}
 		out = append(out, kv)
@@ -740,6 +827,84 @@ func validateReadDirPrefetchFlags(maxFiles int, maxFileBytes int64, maxBytes int
 	return nil
 }
 
+type mountPerfFlagValidation struct {
+	perfDirGiven             bool
+	perfInterval             time.Duration
+	perfMaxSamples           int
+	perfMaxSampleFiles       int
+	perfMaxProfileFiles      int
+	perfCPUDuration          time.Duration
+	perfCPUInterval          time.Duration
+	perfHeapInterval         time.Duration
+	perfIntervalGiven        bool
+	perfMaxSamplesGiven      bool
+	perfMaxSampleFilesGiven  bool
+	perfMaxProfileFilesGiven bool
+	perfCPUDurationGiven     bool
+	perfCPUIntervalGiven     bool
+	perfHeapIntervalGiven    bool
+	perfAddrGiven            bool
+}
+
+func validateMountPerfFlags(v mountPerfFlagValidation) error {
+	if v.perfIntervalGiven && v.perfInterval <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-interval must be > 0")
+	}
+	if v.perfMaxSamplesGiven && v.perfMaxSamples <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-max-samples must be > 0")
+	}
+	if v.perfMaxSampleFilesGiven && v.perfMaxSampleFiles <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-max-sample-files must be > 0")
+	}
+	if v.perfMaxProfileFilesGiven && v.perfMaxProfileFiles <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-max-profile-files must be > 0")
+	}
+	if v.perfCPUDurationGiven && v.perfCPUDuration <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-cpu-duration must be > 0")
+	}
+	if v.perfCPUIntervalGiven && v.perfCPUInterval <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-cpu-interval must be > 0")
+	}
+	if v.perfHeapIntervalGiven && v.perfHeapInterval <= 0 {
+		return fmt.Errorf("drive9 mount: --perf-heap-interval must be > 0")
+	}
+	if v.perfDirGiven && v.perfCPUDuration >= v.perfCPUInterval {
+		return fmt.Errorf("drive9 mount: --perf-cpu-duration must be less than --perf-cpu-interval")
+	}
+	for _, name := range []struct {
+		flag  string
+		given bool
+	}{
+		{"--perf-interval", v.perfIntervalGiven},
+		{"--perf-max-samples", v.perfMaxSamplesGiven},
+		{"--perf-max-sample-files", v.perfMaxSampleFilesGiven},
+		{"--perf-max-profile-files", v.perfMaxProfileFilesGiven},
+		{"--perf-cpu-duration", v.perfCPUDurationGiven},
+		{"--perf-cpu-interval", v.perfCPUIntervalGiven},
+		{"--perf-heap-interval", v.perfHeapIntervalGiven},
+		{"--perf-addr", v.perfAddrGiven},
+	} {
+		if name.given && !v.perfDirGiven {
+			return fmt.Errorf("drive9 mount: %s requires --perf-dir", name.flag)
+		}
+	}
+	return nil
+}
+
+func applyMountPerfDirDefaults(perfDir string, perfAddr string, profileHeap, profileDir, perfJSONL, pprofAddr *string) {
+	perfDir = strings.TrimSpace(perfDir)
+	if perfDir == "" {
+		return
+	}
+	*profileHeap = filepath.Join(perfDir, "heap-final.pprof")
+	*profileDir = perfDir
+	*perfJSONL = filepath.Join(perfDir, "perf.jsonl")
+	*pprofAddr = defaultMountPerfPprofAddr
+	if addr := strings.TrimSpace(perfAddr); addr != "" {
+		*pprofAddr = addr
+	}
+}
+
 func validateMountProfileFlags(profile string, localRoot string, localOnlyPatterns []string, remoteOnlyPatterns []string, packPaths []string) error {
 	if err := validateProfileName(profile); err != nil {
 		return err
@@ -855,6 +1020,19 @@ func durationFlagValue(fs *flag.FlagSet, name string, value time.Duration) time.
 		return value
 	}
 	return 0
+}
+
+func readCacheTTLFlagValue(given bool, value time.Duration) (time.Duration, error) {
+	if !given {
+		return 0, nil
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("drive9 mount: --read-cache-ttl must be >= 0")
+	}
+	if value == 0 {
+		return -time.Nanosecond, nil
+	}
+	return value, nil
 }
 
 func lookupRetryCountFlagValue(given bool, count int) int {
