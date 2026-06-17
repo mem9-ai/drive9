@@ -101,7 +101,7 @@ drive9_retry() {
     if out="$(drive9 "$@" 2>&1)"; then
       printf '%s' "$out"; return 0
     fi
-    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"not found"* ]]; then
+    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 502"* || "$out" == *"not found"* || "$out" == *"unexpected EOF"* || "$out" == *"connection reset"* ]]; then
       echo "retry $attempt/$CLI_MAX_RETRIES for drive9 $* " >&2
       sleep "$CLI_RETRY_SLEEP_S"; attempt=$((attempt+1)); continue
     fi
