@@ -2775,7 +2775,11 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 				return err
 			}
 		}
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if isFulltextOrVectorIndexRepairSQL(stmt) && !strings.Contains(normalizeSQLFragment(stmt), " add columnar replica on demand") {
+		stmt += " ADD_COLUMNAR_REPLICA_ON_DEMAND"
+		snippet = schemaStatementSnippet(stmt)
+	}
+	if _, err := db.ExecContext(ctx, stmt); err != nil {
 			if isIgnorableTiDBSchemaError(err) {
 				logger.Info(ctx, "tenant_tidb_schema_repair_statement_skipped_existing",
 					zap.Int("statement_index", i+1),

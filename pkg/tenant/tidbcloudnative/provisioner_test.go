@@ -386,14 +386,14 @@ func TestSystemUsernameForCurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("systemUsernameForCurrent: %v", err)
 	}
-	if !needsSetup || got != "22ipQWBXXq2wN2S.tidbcloud_fs_system" {
+	if !needsSetup || got != "22ipQWBXXq2wN2S.tdc_fs_sys" {
 		t.Fatalf("system username = %q setup=%v", got, needsSetup)
 	}
-	got, needsSetup, err = systemUsernameForCurrent("22ipQWBXXq2wN2S.tidbcloud_fs_system")
+	got, needsSetup, err = systemUsernameForCurrent("22ipQWBXXq2wN2S.tdc_fs_sys")
 	if err != nil {
 		t.Fatalf("systemUsernameForCurrent existing: %v", err)
 	}
-	if needsSetup || got != "22ipQWBXXq2wN2S.tidbcloud_fs_system" {
+	if needsSetup || got != "22ipQWBXXq2wN2S.tdc_fs_sys" {
 		t.Fatalf("existing system username = %q setup=%v", got, needsSetup)
 	}
 	if _, _, err := systemUsernameForCurrent(""); err == nil {
@@ -407,15 +407,15 @@ func TestSystemUsernameForCurrent(t *testing.T) {
 }
 
 func TestSystemUserStatements(t *testing.T) {
-	got := systemUserStatements("tidbcloud_fs", "22ipQWBXXq2wN2S.tidbcloud_fs_system", "pass123")
+	got := systemUserStatements("tidbcloud_fs", "22ipQWBXXq2wN2S.tdc_fs_sys", "pass123")
 	want := []string{
 		"CREATE DATABASE IF NOT EXISTS `tidbcloud_fs`",
-		"CREATE ROLE IF NOT EXISTS 'tidbcloud_fs_admin'",
-		"GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON `tidbcloud_fs`.* TO 'tidbcloud_fs_admin'",
-		"CREATE USER IF NOT EXISTS '22ipQWBXXq2wN2S.tidbcloud_fs_system' IDENTIFIED BY 'pass123'",
-		"ALTER USER '22ipQWBXXq2wN2S.tidbcloud_fs_system' IDENTIFIED BY 'pass123'",
-		"GRANT 'tidbcloud_fs_admin' TO '22ipQWBXXq2wN2S.tidbcloud_fs_system'",
-		"SET DEFAULT ROLE 'tidbcloud_fs_admin' TO '22ipQWBXXq2wN2S.tidbcloud_fs_system'",
+		"CREATE ROLE IF NOT EXISTS 'tdc_fs_admin'",
+		"GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON `tidbcloud_fs`.* TO 'tdc_fs_admin'",
+		"CREATE USER IF NOT EXISTS '22ipQWBXXq2wN2S.tdc_fs_sys' IDENTIFIED BY 'pass123'",
+		"ALTER USER '22ipQWBXXq2wN2S.tdc_fs_sys' IDENTIFIED BY 'pass123'",
+		"GRANT 'tdc_fs_admin' TO '22ipQWBXXq2wN2S.tdc_fs_sys'",
+		"SET DEFAULT ROLE 'tdc_fs_admin' TO '22ipQWBXXq2wN2S.tdc_fs_sys'",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("statement count = %d, want %d: %#v", len(got), len(want), got)

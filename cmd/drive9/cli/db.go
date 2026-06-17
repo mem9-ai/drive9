@@ -417,6 +417,8 @@ func DeleteTenant(args []string) error {
 	if result.Status == "" {
 		result.Status = "deleting"
 	}
+	cleanupMatchingOwnerContexts(server, apiKey)
+
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -427,6 +429,26 @@ func DeleteTenant(args []string) error {
 	}
 	fmt.Printf("delete accepted (status: %s)\n", result.Status)
 	return nil
+}
+
+func cleanupMatchingOwnerContexts(server, apiKey string) {
+	cfg := loadConfig()
+	removed := false
+	for name, ctx := range cfg.Contexts {
+		if ctx.Type == PrincipalOwner && ctx.Server == server && ctx.APIKey == apiKey {
+			delete(cfg.Contexts, name)
+			if cfg.CurrentContext == name {
+				cfg.CurrentContext = ""
+			}
+			removed = true
+		}
+	}
+	if !removed {
+		return
+	}
+	if err := saveConfig(cfg); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "warning: failed to save config after context cleanup: %v\n", err)
+	}
 }
 
 func deleteUsage() string {

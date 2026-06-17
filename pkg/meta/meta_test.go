@@ -77,7 +77,7 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	updated, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "other.root", "u1.tidbcloud_fs_system", []byte("system-cipher"))
+	updated, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "other.root", "u1.tdc_fs_sys", []byte("system-cipher"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 		t.Fatalf("tenant credential changed after failed CAS: user=%q pass=%q", dbUser, passCipher)
 	}
 
-	updated, err = s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "u1.root", "u1.tidbcloud_fs_system", []byte("system-cipher"))
+	updated, err = s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "u1.root", "u1.tdc_fs_sys", []byte("system-cipher"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,7 +103,7 @@ func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
 	if err := s.DB().QueryRow("SELECT db_user, db_password FROM tenants WHERE id = ?", "credential-cas-tenant").Scan(&dbUser, &passCipher); err != nil {
 		t.Fatal(err)
 	}
-	if dbUser != "u1.tidbcloud_fs_system" || string(passCipher) != "system-cipher" {
+	if dbUser != "u1.tdc_fs_sys" || string(passCipher) != "system-cipher" {
 		t.Fatalf("tenant credential = %q/%q, want system credential", dbUser, passCipher)
 	}
 }

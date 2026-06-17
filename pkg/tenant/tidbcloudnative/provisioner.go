@@ -91,11 +91,11 @@ func (p *Provisioner) ProvisioningCloudProvider() string { return p.cloudProvide
 func (p *Provisioner) ProvisioningRegion() string { return p.region }
 
 func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
-	return schema.EnsureTiDBSchemaForModeDSN(ctx, dsn, schema.TiDBEmbeddingModeAuto)
+	return schema.InitTiDBTenantSchemaForModeWithOptionsContext(ctx, dsn, schema.TiDBEmbeddingModeAuto, schema.InitTiDBTenantSchemaOptions{})
 }
 
 func (p *Provisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, dsn string, profile schema.TiDBAutoEmbeddingProfile) error {
-	return schema.EnsureTiDBSchemaForAutoEmbeddingProfileDSN(ctx, dsn, profile)
+	return schema.InitTiDBTenantSchemaForAutoEmbeddingProfileContext(ctx, dsn, profile)
 }
 
 func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, _ string) (string, string, error) {
@@ -282,7 +282,7 @@ func ensureSystemUser(ctx context.Context, db *sql.DB, dbName, username, passwor
 }
 
 func systemUserStatements(dbName, username, password string) []string {
-	const roleName = "tidbcloud_fs_admin"
+	const roleName = "tdc_fs_admin"
 	return []string{
 		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdent(dbName)),
 		fmt.Sprintf("CREATE ROLE IF NOT EXISTS %s", quoteString(roleName)),
@@ -304,12 +304,12 @@ func systemUsernameForCurrent(currentUsername string) (string, bool, error) {
 		if prefix == "" {
 			return "", false, fmt.Errorf("native root username %q missing user prefix", currentUsername)
 		}
-		return prefix + ".tidbcloud_fs_system", true, nil
+		return prefix + ".tdc_fs_sys", true, nil
 	}
-	if prefix, ok := strings.CutSuffix(currentUsername, ".tidbcloud_fs_system"); ok && prefix != "" {
+	if prefix, ok := strings.CutSuffix(currentUsername, ".tdc_fs_sys"); ok && prefix != "" {
 		return currentUsername, false, nil
 	}
-	return "", false, fmt.Errorf("native database username %q is not a root or tidbcloud_fs_system account", currentUsername)
+	return "", false, fmt.Errorf("native database username %q is not a root or tdc_fs_sys account", currentUsername)
 }
 
 func quoteIdent(value string) string {
