@@ -312,7 +312,7 @@ func resolveProvisionServer(serverFlag, regionCode, mode, fallbackServer string)
 	if err != nil {
 		return "", nil, err
 	}
-	return strings.TrimSpace(entry.Endpoint), entry, nil
+	return strings.TrimSpace(entry.ServerURL), entry, nil
 }
 
 func selectRegionServer(entries []RegionManifestEntry, regionCode, mode string) (*RegionManifestEntry, error) {
