@@ -47,7 +47,7 @@ without adding it to `.github/workflows/local-e2e.yml`.
 | Post-merge | `push` to `main` (local-e2e, coalesced via concurrency group) | PR gate + concurrency stress, POSIX/fsx, sqlite WAL/churn/concurrency, full `smoke-all.sh` (journal, posix-permission, git-workspace), git feature matrix |
 | Nightly | cron 20:17 UTC (local-e2e) | Post-merge set + FUSE performance baseline/archive/compare (compare is report-only; hosted-runner noise) |
 | Manual all | `e2e-all` workflow (`Run workflow` button) | Everything above + pjdfstest POSIX suite (best-effort) via `run_all_e2e=1` |
-| Manual only | not wired, run by hand | `layer-fs-smoke-test-realdev.sh` (shared dev endpoint), `verify-description-e2e.sh` (Docker + Ollama), `verify-description-tidb-zero-e2e.sh` (TiDB Cloud Zero), `local-smoke.sh` (`make e2e-local` wrapper) |
+| Manual only | not wired, run by hand | `layer-fs-smoke-test-realdev.sh` (shared dev endpoint), `verify-description-e2e.sh` (Docker + Ollama), `verify-description-tidb-zero-e2e.sh` (TiDB Cloud Zero), `native-smoke-test.sh` (TiDB Cloud Native — requires credentials), `local-smoke.sh` (`make e2e-local` wrapper) |
 
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
