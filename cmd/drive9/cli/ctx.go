@@ -383,7 +383,7 @@ func ctxAddCmd(args []string) error {
 		return fmt.Errorf("--api-key is required")
 	}
 	if mode != "" && !isKnownContextMode(mode) {
-		return fmt.Errorf("unknown --mode %q; valid: Anonymous, TiDBCloud", mode)
+		return fmt.Errorf("unknown --mode %q; valid: %s, %s", mode, ModeLabelAnonymous, ModeLabelTiDBCloud)
 	}
 	if (cloudProvider != "" || region != "") && mode == "" {
 		return fmt.Errorf("--cloud-provider and --region require --mode TiDBCloud")

@@ -3744,7 +3744,15 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
 		}
-		return nil, newProvisionTenantError(http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err), err)
+		msg := fmt.Sprintf("provision tenant cluster failed: %v", err)
+		if strings.Contains(strings.ToLower(err.Error()), "free cluster") {
+			msg = "TiDB Cloud free cluster limit reached. Set a monthly Spending Limit to continue. See https://www.pingcap.com/tidb-cloud-starter-pricing-details/#cost-and-limitations"
+		} else if strings.Contains(strings.ToLower(err.Error()), "credits") || strings.Contains(strings.ToLower(err.Error()), "payment") {
+			msg = "TiDB Cloud payment required. Add a payment method at https://tidbcloud.com/org-settings/billing/payments"
+		} else if strings.Contains(strings.ToLower(err.Error()), "instance capacity limit") || strings.Contains(strings.ToLower(err.Error()), "capacity limit") {
+			msg = "TiDB Cloud cluster limit reached (100 clusters per organization). Contact PingCAP support for assistance."
+		}
+		return nil, newProvisionTenantError(http.StatusBadGateway, msg, err)
 	}
 	cluster.Provider = provider
 

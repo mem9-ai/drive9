@@ -89,6 +89,22 @@ jobs:
           kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
 
+      - name: Deploy drive9-tidbcloud to aws-ap-southeast-1
+        id: deploy-sg-native
+        if: inputs.region == 'all' || inputs.region == 'aws-ap-southeast-1'
+        run: |
+          kubectl --context prod -n drive9-tidbcloud \
+            set image deployment/drive9-server \
+            drive9-server=$IMAGE
+          kubectl --context prod -n drive9-tidbcloud \
+            rollout status deployment/drive9-server --timeout=180s
+
+      - name: Rollback drive9-tidbcloud on failure
+        if: failure() && steps.deploy-sg-native.outcome == 'failure'
+        run: |
+          kubectl --context prod -n drive9-tidbcloud \
+            rollout undo deployment/drive9-server
+
       - name: Deploy to aws-us-east-1
         id: deploy-us
         if: inputs.region == 'all' || inputs.region == 'aws-us-east-1'
