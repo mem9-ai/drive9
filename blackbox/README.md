@@ -11,7 +11,7 @@ blackbox/
   run.py                 generic entrypoint
   harness/               shared runner, provider protocol, generic cache logic
   suites/
-    fuse/                FUSE presets, module config, repos, allowlists
+    fuse/                FUSE module config, repos, allowlists
       README.md          FUSE suite usage notes
       NOTICE.md          FUSE suite notices for external test suites
       provider.py        FUSE lifecycle, prereqs, target/dependency wiring
@@ -24,34 +24,41 @@ blackbox/
 ## Commands
 
 ```bash
-python3 blackbox/run.py --suite fuse --preset smoke
+python3 blackbox/run.py --suite fuse --all
 python3 blackbox/run.py --suite fuse --group posix
 python3 blackbox/run.py --suite fuse --module drive9.workflow.git_fast_clone
+python3 blackbox/run.py --suite fuse --category drive9.workflow
 ```
 
 Makefile targets are suite-agnostic. `BLACKBOX_SUITE` defaults to `fuse`:
 
 ```bash
-make blackbox-smoke
-make blackbox-daily
-make blackbox-module BLACKBOX_MODULE=drive9.workflow.git_fast_clone
+make blackbox
+make blackbox BLACKBOX_SELECTOR=group:posix
+make blackbox BLACKBOX_SELECTOR=category:drive9.workflow
+make blackbox BLACKBOX_SELECTOR=module:drive9.workflow.git_fast_clone
 ```
+
+`blackbox` intentionally has no scheduling or profile policy. It only knows how
+to run every module in a suite or a caller-selected subset. Scheduling,
+frequency, and report publication belong to the caller, for example a GitHub
+Actions workflow, cron job, or release gate.
 
 ## Adding A Suite
 
 Add a new suite directory under `blackbox/suites/<suite>/` with at least:
 
 ```text
-presets.json
 modules.json
 provider.py
 ```
 
 Then add or reuse modules under `blackbox/suites/<suite>/modules/`, register
-them in `blackbox/suites/<suite>/modules/registry.py`, and select them from the
-suite presets. `provider.py` must expose `create_provider()` or `SuiteProvider`
-and is responsible for suite config loading, capability checks, dependency
-manager creation, target creation, setup, cleanup, and manifest fields.
+them in `blackbox/suites/<suite>/modules/registry.py`, and expose stable module
+IDs/categories/groups through `modules.json`. `provider.py` must expose
+`create_provider()` or `SuiteProvider` and is responsible for suite config
+loading, capability checks, dependency manager creation, target creation,
+setup, cleanup, and manifest fields.
 
 Suite-specific capability checks should live in modules or target helpers, not
 as global runner prerequisites. This keeps CLI/API modules from being blocked by

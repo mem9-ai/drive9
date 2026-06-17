@@ -18,7 +18,7 @@ class PortedJuiceFSRandomRW(BaseModule):
     def run(self, ctx: Context) -> dict[str, Any]:
         cfg = module_config(ctx, self.id)
         size = int(cfg.get("size_bytes", 4 * 1024 * 1024))
-        ops = int(cfg.get("ops_by_preset", {}).get(ctx.selected_preset or "daily", 256))
+        ops = int(cfg.get("ops", 1024))
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("ported_juicefs_random_rw", remote, durability="write-sync")

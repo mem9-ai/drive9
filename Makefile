@@ -42,17 +42,14 @@ TEST_RUN ?=
 TEST_PKGS ?= ./...
 BLACKBOX_SUITE ?= fuse
 BLACKBOX_RUNS ?= 3
-BLACKBOX_PRESET ?= daily
-BLACKBOX_GROUP ?=
-BLACKBOX_MODULE ?=
-BLACKBOX_CATEGORY ?=
+BLACKBOX_SELECTOR ?= all
 
 BUILDINFO_LDFLAGS = -X github.com/mem9-ai/dat9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitHash=$(GIT_HASH) \
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local e2e-local blackbox-smoke blackbox-standard blackbox-functional blackbox-posix blackbox-perf blackbox-daily blackbox-group blackbox-list blackbox-module blackbox-category blackbox-deps docker-build
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local e2e-local blackbox blackbox-list blackbox-deps docker-build
 
 mod:
 	$(GO) mod tidy
@@ -125,41 +122,32 @@ run-server-local: build-server-local
 e2e-local:
 	bash e2e/local-smoke.sh
 
-blackbox-smoke:
-	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --preset smoke
-
-blackbox-standard:
-	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --preset standard
-
-blackbox-functional:
-	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --group functional --runs $(BLACKBOX_RUNS)
-
-blackbox-posix:
-	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --group posix --runs $(BLACKBOX_RUNS)
-
-blackbox-perf:
-	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --group perf --runs $(BLACKBOX_RUNS)
-
-blackbox-daily:
-	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --preset daily --runs $(BLACKBOX_RUNS)
-
-blackbox-group:
-	@test -n "$(BLACKBOX_GROUP)" || { echo "set BLACKBOX_GROUP=<group-name>" >&2; exit 2; }
-	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --group "$(BLACKBOX_GROUP)" --runs $(BLACKBOX_RUNS)
+blackbox:
+	@set -euo pipefail; \
+	selector="$(BLACKBOX_SELECTOR)"; \
+	case "$$selector" in \
+		""|all) args=(--all);; \
+		group:*) args=(--group "$${selector#group:}");; \
+		category:*) args=(--category "$${selector#category:}");; \
+		module:*) args=(--module "$${selector#module:}");; \
+		*) args=(--module "$$selector");; \
+	esac; \
+	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --runs "$(BLACKBOX_RUNS)"
 
 blackbox-list:
 	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --list
 
-blackbox-module:
-	@test -n "$(BLACKBOX_MODULE)" || { echo "set BLACKBOX_MODULE=<module-id>[,<module-id>...]" >&2; exit 2; }
-	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --module "$(BLACKBOX_MODULE)" --runs $(BLACKBOX_RUNS)
-
-blackbox-category:
-	@test -n "$(BLACKBOX_CATEGORY)" || { echo "set BLACKBOX_CATEGORY=<category-prefix>" >&2; exit 2; }
-	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --category "$(BLACKBOX_CATEGORY)" --runs $(BLACKBOX_RUNS)
-
 blackbox-deps:
-	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --preset $(BLACKBOX_PRESET) --deps-only
+	@set -euo pipefail; \
+	selector="$(BLACKBOX_SELECTOR)"; \
+	case "$$selector" in \
+		""|all) args=(--all);; \
+		group:*) args=(--group "$${selector#group:}");; \
+		category:*) args=(--category "$${selector#category:}");; \
+		module:*) args=(--module "$${selector#module:}");; \
+		*) args=(--module "$$selector");; \
+	esac; \
+	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --deps-only
 
 build-cli:
 	mkdir -p $(BIN_DIR)

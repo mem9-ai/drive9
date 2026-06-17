@@ -29,7 +29,6 @@ from .core import (
     env_flag,
     env_value,
     file_ts,
-    load_json,
     utc_ts,
     write_json,
 )
@@ -49,7 +48,6 @@ class BlackboxRunner:
         self.recorder = Recorder(self.result_dir)
         self.provider = load_suite_provider(self.suite, self.suite_config_dir)
         self.registry = self.provider.module_registry()
-        self.presets = load_json("presets.json", {}, self.suite_config_dir)
         self.config = self.provider.load_config()
         self.capabilities = self.provider.detect_capabilities()
         self.target = self.provider.create_target(args, self.result_dir, self.recorder, session=self.session)
@@ -66,7 +64,6 @@ class BlackboxRunner:
             config=self.config,
             runs=args.runs or int(env_value("RUNS", "3", self.suite)),
             suite=self.suite,
-            selected_preset=args.preset or "",
         )
         self.selected = self.select_modules()
 
@@ -80,6 +77,8 @@ class BlackboxRunner:
         if self.args.module:
             for raw in self.args.module:
                 selected.extend(part.strip() for part in raw.split(",") if part.strip())
+        elif self.args.all:
+            selected = self.expand_module_list("all")
         elif self.args.category:
             selected = [module.id for module in self.registry.values() if module.id.startswith(self.args.category) or module.category.startswith(self.args.category)]
         elif self.args.group:
@@ -87,13 +86,8 @@ class BlackboxRunner:
             if group is None:
                 raise BlackboxError(f"unknown group {self.args.group!r} for suite {self.suite!r}")
             selected = self.expand_module_list(group)
-        elif self.args.preset:
-            preset = self.presets.get(self.args.preset)
-            if not preset:
-                raise BlackboxError(f"unknown preset: {self.args.preset}")
-            selected = self.expand_module_list(preset.get("modules", []))
         else:
-            raise BlackboxError("one of --preset, --category, --module, --group, or --list is required")
+            raise BlackboxError("one of --all, --category, --module, --group, or --list is required")
         missing = [module_id for module_id in selected if module_id not in self.registry]
         if missing:
             raise BlackboxError(f"unknown module(s): {', '.join(missing)}")
@@ -126,7 +120,12 @@ class BlackboxRunner:
             "session": self.session,
             "timestamp": utc_ts(),
             "result_dir": str(self.result_dir),
-            "preset": self.args.preset,
+            "selector": {
+                "all": bool(self.args.all),
+                "category": self.args.category,
+                "group": self.args.group,
+                "module": self.args.module,
+            },
             "category": self.args.category,
             "modules": self.selected,
             "runs": self.ctx.runs,
@@ -150,7 +149,6 @@ class BlackboxRunner:
             f"- Suite: `{self.suite}`",
             f"- Session: `{self.session}`",
             f"- Timestamp: `{utc_ts()}`",
-            f"- Preset: `{self.args.preset or ''}`",
             f"- Selected modules: `{len(self.selected)}`",
             f"- Platform: `{platform.platform()}`",
             f"- Result dir: `{self.result_dir}`",
@@ -178,7 +176,7 @@ class BlackboxRunner:
                     lines.append(
                         f"| `{name}` | {summary_item.get('unit', '')} | {float(summary_item.get('mean', 0)):.3f} | {float(summary_item.get('median', 0)):.3f} | {len(values)} |"
                     )
-        (self.result_dir / "daily-report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        (self.result_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def deps_only(self) -> int:
         for module_id in self.selected:
@@ -246,8 +244,6 @@ class BlackboxRunner:
         if self.args.deps_only:
             return self.deps_only()
         strict = bool(self.args.strict_prereqs)
-        if self.args.preset:
-            strict = strict or bool(self.presets.get(self.args.preset, {}).get("strict_prereqs", False))
         prereq_records = self.provider.check_prerequisites(self.ctx)
         if prereq_records:
             for record in prereq_records:
@@ -275,7 +271,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Drive9 blackbox modules.")
     parser.add_argument("--suite", default=suite_default, help="Blackbox suite domain. Defaults to BLACKBOX_SUITE.")
     selector = parser.add_mutually_exclusive_group(required=False)
-    selector.add_argument("--preset", help="Run a suite preset, e.g. smoke, standard, or daily.")
+    selector.add_argument("--all", action="store_true", help="Run every module in the selected suite.")
     selector.add_argument("--category", help="Run modules whose id/category has this prefix.")
     selector.add_argument("--module", action="append", help="Run one module id or a comma-separated list. Can be repeated.")
     selector.add_argument("--group", help="Run a named module group from the selected suite, e.g. functional, posix, or perf.")

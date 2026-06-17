@@ -33,15 +33,11 @@ on:
     - cron: "27 20 * * *"
   workflow_dispatch:
     inputs:
-      preset:
-        description: "Preset to run"
+      selector:
+        description: "Selection to run: all, group:<name>, category:<prefix>, module:<id[,id...]>, or a bare module id"
         required: false
-        default: "daily"
-        type: choice
-        options:
-          - smoke
-          - standard
-          - daily
+        default: "all"
+        type: string
       runs:
         description: "Performance run count"
         required: false
@@ -57,7 +53,7 @@ concurrency:
 
 env:
   BLACKBOX_SUITE: fuse
-  BLACKBOX_PRESET: ${{ github.event_name == 'pull_request' && 'smoke' || github.event_name == 'push' && 'standard' || github.event_name == 'schedule' && 'daily' || inputs.preset }}
+  BLACKBOX_SELECTOR: ${{ github.event_name == 'workflow_dispatch' && inputs.selector || 'all' }}
   BLACKBOX_RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '3' }}
   BLACKBOX_STRICT: ${{ github.event_name == 'pull_request' && '0' || '1' }}
   PJDFSTEST_ALLOW_NONROOT: "1"
@@ -66,7 +62,7 @@ env:
 
 jobs:
   blackbox:
-    name: blackbox (${{ env.BLACKBOX_SUITE }} / ${{ env.BLACKBOX_PRESET }})
+    name: blackbox (${{ env.BLACKBOX_SUITE }} / ${{ env.BLACKBOX_SELECTOR }})
     runs-on: ubuntu-latest
     timeout-minutes: 240
 
@@ -100,31 +96,15 @@ jobs:
             blackbox-${{ runner.os }}-
 
       - name: Prepare blackbox dependencies
-        if: env.BLACKBOX_PRESET != 'smoke'
-        run: make blackbox-deps BLACKBOX_SUITE="$BLACKBOX_SUITE" BLACKBOX_PRESET="$BLACKBOX_PRESET"
+        run: make blackbox-deps BLACKBOX_SUITE="$BLACKBOX_SUITE" BLACKBOX_SELECTOR="$BLACKBOX_SELECTOR"
 
-      - name: Run blackbox preset
-        run: |
-          case "$BLACKBOX_PRESET" in
-            smoke)
-              make blackbox-smoke BLACKBOX_SUITE="$BLACKBOX_SUITE"
-              ;;
-            standard)
-              make blackbox-standard BLACKBOX_SUITE="$BLACKBOX_SUITE"
-              ;;
-            daily)
-              make blackbox-daily BLACKBOX_SUITE="$BLACKBOX_SUITE" BLACKBOX_RUNS="$BLACKBOX_RUNS"
-              ;;
-            *)
-              echo "unknown BLACKBOX_PRESET=$BLACKBOX_PRESET" >&2
-              exit 2
-              ;;
-          esac
+      - name: Run blackbox
+        run: make blackbox BLACKBOX_SUITE="$BLACKBOX_SUITE" BLACKBOX_SELECTOR="$BLACKBOX_SELECTOR" BLACKBOX_RUNS="$BLACKBOX_RUNS"
 
       - name: Publish job summary
         if: always()
         run: |
-          latest="$(find "blackbox/results/$BLACKBOX_SUITE" -name daily-report.md -type f 2>/dev/null | sort | tail -n 1 || true)"
+          latest="$(find "blackbox/results/$BLACKBOX_SUITE" -name report.md -type f 2>/dev/null | sort | tail -n 1 || true)"
           if [ -n "$latest" ]; then
             cat "$latest" >> "$GITHUB_STEP_SUMMARY"
           else
@@ -135,6 +115,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: blackbox-${{ env.BLACKBOX_SUITE }}-${{ env.BLACKBOX_PRESET }}
+          name: blackbox-${{ env.BLACKBOX_SUITE }}
           path: blackbox/results/${{ env.BLACKBOX_SUITE }}/**
           if-no-files-found: warn

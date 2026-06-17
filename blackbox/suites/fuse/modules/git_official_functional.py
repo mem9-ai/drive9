@@ -22,7 +22,7 @@ class GitOfficialFunctional(BaseModule):
             raise DependencyUnavailable("git is required")
         source = ctx.deps.ensure_git_source()
         cfg = module_config(ctx, self.id)
-        tests = cfg.get("tests_by_preset", {}).get(ctx.selected_preset or "daily", cfg.get("default_tests", []))
+        tests = cfg.get("tests", [])
         if not tests:
             raise ModuleSkip("no Git functional tests configured")
         remote = ctx.target.remote_root(self.id)

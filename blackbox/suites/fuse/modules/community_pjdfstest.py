@@ -27,7 +27,7 @@ class CommunityPjdfstest(BaseModule):
     def run(self, ctx: Context) -> dict[str, Any]:
         tests_dir, bin_path = ctx.deps.ensure_pjdfstest()
         cfg = module_config(ctx, self.id)
-        groups = cfg.get("groups_by_preset", {}).get(ctx.selected_preset or "daily", "all")
+        groups = cfg.get("groups", "all")
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_pjdfstest", remote, durability="write-sync")
@@ -39,7 +39,7 @@ class CommunityPjdfstest(BaseModule):
             else:
                 test_args = [str(tests_dir / group) for group in groups if (tests_dir / group).exists()]
                 if not test_args:
-                    raise ModuleSkip(f"no pjdfstest groups found for preset {ctx.selected_preset}")
+                    raise ModuleSkip("no configured pjdfstest groups found")
             env = ctx.target.base_env()
             env["PATH"] = f"{bin_path.parent}:{tests_dir.parent}:{env.get('PATH', '')}"
             result = ctx.target.run_cmd(

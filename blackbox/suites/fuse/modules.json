@@ -25,25 +25,7 @@
   },
   "modules": {
     "community.pjdfstest": {
-      "groups_by_preset": {
-        "smoke": [
-          "open",
-          "mkdir",
-          "unlink"
-        ],
-        "standard": [
-          "open",
-          "mkdir",
-          "rename",
-          "unlink",
-          "truncate",
-          "ftruncate",
-          "symlink",
-          "link",
-          "stat"
-        ],
-        "daily": "all"
-      }
+      "groups": "all"
     },
     "community.fio": {
       "size": "128m"
@@ -56,11 +38,7 @@
     },
     "ported.juicefs.fsrand": {
       "seed": 9,
-      "ops_by_preset": {
-        "smoke": 50,
-        "standard": 250,
-        "daily": 1000
-      }
+      "ops": 1000
     },
     "ported.juicefs.random_stress": {
       "workers": 4,
@@ -68,43 +46,23 @@
     },
     "ported.juicefs.random_rw": {
       "size_bytes": 4194304,
-      "ops_by_preset": {
-        "smoke": 64,
-        "standard": 256,
-        "daily": 1024
-      }
+      "ops": 1024
     },
     "git.official.functional": {
-      "tests_by_preset": {
-        "smoke": [
-          "t0000-basic.sh",
-          "t0001-init.sh"
-        ],
-        "standard": [
-          "t0000-basic.sh",
-          "t0001-init.sh",
-          "t1300-config.sh",
-          "t1400-update-ref.sh",
-          "t1450-fsck.sh",
-          "t1500-rev-parse.sh",
-          "t2020-checkout-detach.sh",
-          "t3700-add.sh"
-        ],
-        "daily": [
-          "t0000-basic.sh",
-          "t0001-init.sh",
-          "t1300-config.sh",
-          "t1400-update-ref.sh",
-          "t1450-fsck.sh",
-          "t1500-rev-parse.sh",
-          "t2020-checkout-detach.sh",
-          "t3700-add.sh",
-          "t3903-stash.sh",
-          "t4013-diff-various.sh",
-          "t5601-clone.sh",
-          "t7500-commit-template-squash-signoff.sh"
-        ]
-      }
+      "tests": [
+        "t0000-basic.sh",
+        "t0001-init.sh",
+        "t1300-config.sh",
+        "t1400-update-ref.sh",
+        "t1450-fsck.sh",
+        "t1500-rev-parse.sh",
+        "t2020-checkout-detach.sh",
+        "t3700-add.sh",
+        "t3903-stash.sh",
+        "t4013-diff-various.sh",
+        "t5601-clone.sh",
+        "t7500-commit-template-squash-signoff.sh"
+      ]
     },
     "git.official.perf": {
       "tests": [

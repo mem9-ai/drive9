@@ -168,7 +168,6 @@ class Context:
     config: dict[str, Any]
     runs: int
     suite: str
-    selected_preset: str = ""
 
     def artifact_dir(self, module_id: str) -> Path:
         path = self.result_dir / "artifacts" / module_id

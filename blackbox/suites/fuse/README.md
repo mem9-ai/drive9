@@ -44,7 +44,6 @@ blackbox/
       target.py                     Drive9 CLI/server/FUSE mount provider
       deps.py                       pjdfstest/LTP/fio/Git/etc preparation
       capabilities.py               macFUSE/FUSE-T/Linux FUSE detection
-      presets.json
       modules.json
       repos.json
       allowlists/
@@ -67,50 +66,40 @@ blackbox/
 New modules should get their own file unless they are a tiny variant of an
 existing module family, such as the two LTP modules in `community_ltp.py`.
 
-## Presets And Selectors
+## Selection Model
 
-Presets are run plans. Categories and modules are selectors.
-
-- `smoke`: fast viability checks with small deterministic FUSE workloads.
-- `standard`: mainline compatibility and Drive9 workflow regression coverage.
-- `daily`: broad stability, POSIX, Git, and performance run intended for a
-  scheduled job and daily report.
+The suite exposes modules and selectors. It does not define run-profile policy.
+Callers decide when to run blackbox and which selector to use.
 
 The FUSE suite also defines named module groups:
 
 - `functional`: `ported.juicefs.*` plus Drive9 workflow modules.
 - `posix`: `community.pjdfstest`.
 - `perf`: performance modules such as fio, mdtest, vdbench, Git perf, and
-  Drive9 workflow perf. This group includes heavy repo workloads that are not
-  all part of the default `daily` preset.
+  Drive9 workflow perf.
 
 ## Commands
 
 Common entry points:
 
 ```bash
-make blackbox-smoke
-make blackbox-functional
-make blackbox-posix
-make blackbox-perf
-make blackbox-daily
+make blackbox
 ```
 
 Module-oriented entry points:
 
 ```bash
 make blackbox-list
-make blackbox-module BLACKBOX_MODULE=community.pjdfstest
-make blackbox-category BLACKBOX_CATEGORY=ported.juicefs
-make blackbox-deps BLACKBOX_PRESET=standard
+make blackbox BLACKBOX_SELECTOR=group:posix
+make blackbox BLACKBOX_SELECTOR=category:drive9.workflow
+make blackbox BLACKBOX_SELECTOR=module:community.pjdfstest
+make blackbox-deps BLACKBOX_SELECTOR=group:perf
 ```
 
 Direct runner usage:
 
 ```bash
-python3 blackbox/run.py --suite fuse --preset smoke
-python3 blackbox/run.py --suite fuse --preset standard
-python3 blackbox/run.py --suite fuse --preset daily --runs 3
+python3 blackbox/run.py --suite fuse --all --runs 3
 python3 blackbox/run.py --suite fuse --group posix
 python3 blackbox/run.py --suite fuse --category drive9.workflow
 python3 blackbox/run.py --suite fuse --module drive9.workflow.git_blobless
@@ -121,7 +110,8 @@ python3 blackbox/run.py --suite fuse --list --format json
 Drive9 or mounting FUSE:
 
 ```bash
-python3 blackbox/run.py --suite fuse --preset standard --deps-only
+python3 blackbox/run.py --suite fuse --all --deps-only
+python3 blackbox/run.py --suite fuse --group perf --deps-only
 ```
 
 ## Runtime Model
@@ -130,7 +120,7 @@ The runner does the following:
 
 1. Detects host capabilities: OS, FUSE helper, root/non-root, xattr, locking,
    and common tools.
-2. Resolves the selected modules from `--preset`, `--category`, `--module`, or
+2. Resolves the selected modules from `--all`, `--category`, `--module`, or
    suite-local `--group`.
 3. Prepares module dependencies from environment variables, PATH, or
    `blackbox/cache`.
@@ -230,30 +220,26 @@ blackbox/results/fuse/<session>/
   results.jsonl
   metrics.json
   events.jsonl
-  daily-report.md
+  report.md
   artifacts/
   logs/
   mount-logs/
 ```
 
-`daily-report.md` is designed for GitHub Actions summaries and daily reports.
-`results.json` is the stable machine-readable result file. `metrics.json`
-stores raw metric rows and aggregate summaries. Performance modules use three
-runs by default and report mean, median, min, max, and standard deviation.
+`report.md` is the human-readable run summary. `results.json` is the stable
+machine-readable result file. `metrics.json` stores raw metric rows and
+aggregate summaries. Performance modules use three runs by default and report
+mean, median, min, max, and standard deviation.
 
 ## GitHub Actions
 
-`.github/workflows/blackbox.yml` runs:
-
-- PR: `smoke`
-- push to `main`: `standard`
-- schedule: `daily`
-- manual dispatch: chosen preset
+`.github/workflows/blackbox.yml` is one possible caller. It runs the selector
+provided by workflow inputs, or `all` by default. Any recurring or release-gate
+schedule belongs to the workflow configuration, not to the blackbox harness.
 
 The workflow caches `blackbox/cache` and uploads
-`blackbox/results/fuse/**` as artifacts. For non-smoke presets it runs
-`make blackbox-deps BLACKBOX_PRESET=<preset>` first so dependency
-setup is separated from the actual test run.
+`blackbox/results/fuse/**` as artifacts. It runs `make blackbox-deps` first so
+dependency setup is separated from the actual test run.
 
 ## Adding A Module
 
@@ -271,7 +257,8 @@ stress case, or a Drive9-specific workflow.
    for clear classification.
 7. Import and register the module in `blackbox/suites/fuse/modules/registry.py`.
 8. Add configuration in `blackbox/suites/fuse/modules.json` when the module needs tunables.
-9. Add it to a preset in `blackbox/suites/fuse/presets.json`.
+9. Add it to a named group in `blackbox/suites/fuse/modules.json` only when a
+   stable group selector should include it.
 10. Update this README if the module introduces a new dependency or behavior
     class.
 
@@ -311,5 +298,5 @@ semantics and local-dependency/build-output performance.
 Run it directly when you want this heavier matrix:
 
 ```bash
-make blackbox-module BLACKBOX_MODULE=drive9.workflow.local_overlay_build
+make blackbox BLACKBOX_SELECTOR=module:drive9.workflow.local_overlay_build
 ```
