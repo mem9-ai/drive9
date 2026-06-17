@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"os"
 	"runtime/pprof"
+	"strings"
 	"sync"
 
 	"go.uber.org/zap"
@@ -373,7 +374,13 @@ func fatal(cmd string, err error) {
 	if cliLogger != nil {
 		logger.Error(context.Background(), "cli_command_failed", zap.String("command", cmd), zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, err)
+	msg := err.Error()
+	if strings.Contains(strings.ToLower(msg), "usage quota") {
+		if m := cli.QuotaExceededMessageForCurrentContext(); m != "" {
+			msg = m
+		}
+	}
+	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, msg)
 	type exitCoder interface{ ExitCode() int }
 	if ec, ok := err.(exitCoder); ok && ec.ExitCode() > 0 {
 		exitWithCode(ec.ExitCode())

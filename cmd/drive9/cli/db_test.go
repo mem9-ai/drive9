@@ -374,7 +374,7 @@ func TestCreateRejectsHalfTiDBCloudKeyBeforeManifestFetch(t *testing.T) {
 	if err == nil {
 		t.Fatal("Create error = nil, want missing private key error")
 	}
-	if !strings.Contains(err.Error(), "tidb_cloud_native create requires") {
+	if !strings.Contains(err.Error(), "TiDBCloud mode requires") {
 		t.Fatalf("Create error = %q", err)
 	}
 	if atomic.LoadInt32(&manifestHits) != 0 {

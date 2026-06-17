@@ -30,9 +30,11 @@ var fallbackRegionManifest = RegionManifest{
 	},
 	Regions: []RegionManifestEntry{
 		{
-			RegionCode: "aws-ap-southeast-1",
-			Mode:       RegionModeTiDBCloudStarter,
-			ServerURL:  defaultServerURL,
+			RegionCode:    "aws-ap-southeast-1",
+			Mode:          RegionModeTiDBCloudStarter,
+			ServerURL:     defaultServerURL,
+			CloudProvider: "aws",
+			TiDBRegion:    "ap-southeast-1",
 		},
 	},
 }
@@ -120,11 +122,20 @@ func regionListCmd(args []string) error {
 		return enc.Encode(regionListOutput(manifest.Regions))
 	}
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "REGION\tMODE\tSERVER")
+	_, _ = fmt.Fprintln(w, "REGION CODE\tCLOUD PROVIDER\tREGION\tMODE\tSERVER")
 	for _, entry := range manifest.Regions {
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\n", entry.RegionCode, regionModeLabel(entry.Mode), entry.ServerURL)
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", entry.RegionCode, entry.CloudProvider, entry.TiDBRegion, regionModeLabel(entry.Mode), entry.ServerURL)
 	}
-	return w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	for _, entry := range manifest.Regions {
+		if regionModeLabel(entry.Mode) == ModeLabelAnonymous {
+			fmt.Fprintln(os.Stderr, "Note: Anonymous mode in drive9 transfers data management rights to PingCAP.")
+			break
+		}
+	}
+	return nil
 }
 
 func regionListOutput(entries []RegionManifestEntry) []regionListOutputEntry {
@@ -245,10 +256,33 @@ func sortRegionManifestEntries(entries []RegionManifestEntry) {
 func regionModeLabel(mode string) string {
 	switch strings.TrimSpace(mode) {
 	case RegionModeTiDBCloudStarter:
-		return "Anonymous"
+		return ModeLabelAnonymous
 	case RegionModeTiDBCloudNative:
-		return "TiDBCloud"
+		return ModeLabelTiDBCloud
 	default:
 		return strings.TrimSpace(mode)
 	}
+}
+
+func quotaExceededMessage(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case "", ModeLabelAnonymous, RegionModeTiDBCloudStarter:
+		return "tenant usage quota exceeded. Switch to TiDBCloud mode with drive9 create --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>. Use drive9 region list to see available regions"
+	case ModeLabelTiDBCloud, RegionModeTiDBCloudNative:
+		return "tenant usage quota exceeded. Go to your TiDB Cloud cluster settings page and set a monthly Spending Limit"
+	default:
+		return ""
+	}
+}
+
+// QuotaExceededMessageForCurrentContext returns the quota exceeded guidance
+// message for the active owner context, or a generic message if none is active.
+func QuotaExceededMessageForCurrentContext() string {
+	cfg := loadConfig()
+	ctx := cfg.currentContextEntry()
+	mode := ""
+	if ctx != nil {
+		mode = ctx.Mode
+	}
+	return quotaExceededMessage(mode)
 }
