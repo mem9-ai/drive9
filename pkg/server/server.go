@@ -3501,7 +3501,7 @@ func rejectCredentialProvisionBody(r *http.Request) error {
 	if r.Body == nil {
 		return nil
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxCredentialProvisionBodyBytes+1))
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxCredentialProvisionBodyBytes))
 	if err != nil {
 		return nil
 	}

@@ -111,7 +111,7 @@ drive9_retry() {
 }
 
 cleanup() {
-  if [ "$CREATED" -eq 1 ] && [ "$SKIP_CLEANUP" != "1" ]; then
+  if [ "$CREATED" -eq 1 ] && [ "$SKIP_CLEANUP" != "1" ] && [ -n "${TENANT_ID:-}" ]; then
     echo "[cleanup] deleting tenant $TENANT_ID"
     drive9_ctx delete \
       --server "$BASE" \
@@ -166,15 +166,12 @@ check_eq "tenant becomes active" "$LAST_STATUS" "active"
 
 # ── [3] basic fs operations ─────────────────────────────────────────────────
 
-echo "[3] basic fs operations"
+echo "[3] small file ops"
 
 DIR="/$TEST_DIR"
 
 drive9_retry fs mkdir "$DIR" >/dev/null
-check_cmd "mkdir $DIR" true
-
 drive9_retry fs cp "$TMP_FILE" ":$DIR/hello.txt" >/dev/null
-check_cmd "cp file to $DIR/hello.txt" true
 
 ls_out="$(drive9_retry fs ls "$DIR")"
 check_cmd "ls $DIR lists file" bash -c "echo \"\$1\" | grep -q hello.txt" _ "$ls_out"
@@ -182,22 +179,68 @@ check_cmd "ls $DIR lists file" bash -c "echo \"\$1\" | grep -q hello.txt" _ "$ls
 cat_out="$(drive9_retry fs cat "$DIR/hello.txt")"
 check_cmd "cat $DIR/hello.txt returns content" bash -c "echo \"\$1\" | grep -q 'hello native smoke test'" _ "$cat_out"
 
-drive9_retry fs rm "$DIR/hello.txt" >/dev/null
-check_cmd "rm $DIR/hello.txt" true
+mv_dst="$DIR/world.txt"
+drive9_retry fs mv "$DIR/hello.txt" "$mv_dst" >/dev/null
 
-ls_after="$(drive9_retry fs ls "$DIR" 2>&1 || true)"
-if printf '%s' "$ls_after" | grep -q "hello.txt"; then
-  check_eq "rm $DIR/hello.txt removes file" "fail" "pass"
-else
-  check_cmd "rm $DIR/hello.txt removes file" true
-fi
+mv_ls="$(drive9_retry fs ls "$DIR")"
+check_cmd "ls after mv shows world.txt" bash -c "echo \"\$1\" | grep -q world.txt" _ "$mv_ls"
 
+drive9_retry fs rm "$mv_dst" >/dev/null
 drive9_retry fs rm "$DIR" >/dev/null
-check_cmd "rmdir $DIR" true
 
-# ── [4] delete tenant ───────────────────────────────────────────────────────
+echo "[4] batch small file ops"
 
-echo "[4] delete tenant"
+BATCH_DIR="/native-batch-${TS}"
+BATCH_COUNT=5
+drive9_retry fs mkdir "$BATCH_DIR" >/dev/null
+for i in $(seq 1 "$BATCH_COUNT"); do
+  lp="$(mktemp)"
+  printf "native-batch-%s-%s" "$TS" "$i" > "$lp"
+  drive9_retry fs cp "$lp" ":$BATCH_DIR/file-${i}.txt" >/dev/null
+  rm -f "$lp"
+done
+
+batch_ls="$(drive9_retry fs ls "$BATCH_DIR")"
+batch_count=$(printf '%s' "$batch_ls" | grep -c 'file-' || true)
+check_eq "batch dir has $BATCH_COUNT files" "$batch_count" "$BATCH_COUNT"
+
+for i in 1 "$BATCH_COUNT"; do
+  got="$(drive9_retry fs cat "$BATCH_DIR/file-${i}.txt")"
+  want="native-batch-$TS-$i"
+  check_eq "$BATCH_DIR/file-${i}.txt content" "$got" "$want"
+done
+
+drive9_retry fs rm -r "$BATCH_DIR" >/dev/null
+check_cmd "rm -r batch dir" true
+
+echo "[5] large file upload/download"
+
+LARGE_MB="${CLI_LARGE_FILE_MB:-10}"
+LARGE_LOCAL="$(mktemp)"
+LARGE_REMOTE="$BATCH_DIR/large-${TS}.bin"
+LARGE_DOWNLOADED="$(mktemp)"
+
+dd if=/dev/zero of="$LARGE_LOCAL" bs=1M count="$LARGE_MB" status=none
+LARGE_BYTES=$((LARGE_MB * 1048576))
+
+drive9_retry fs mkdir "$BATCH_DIR" >/dev/null
+drive9_retry fs cp "$LARGE_LOCAL" ":$LARGE_REMOTE" >/dev/null
+
+stat_out="$(drive9_retry fs stat "$LARGE_REMOTE")"
+remote_size=$(printf '%s' "$stat_out" | python3 -c "import sys; [print(l.split(':',1)[1].strip()) for l in sys.stdin.read().splitlines() if l.strip().startswith('size:')]" 2>/dev/null || echo "0")
+check_eq "large remote size matches" "$remote_size" "$LARGE_BYTES"
+
+drive9_retry fs cp ":$LARGE_REMOTE" "$LARGE_DOWNLOADED" >/dev/null
+
+sum_src=$(sha256sum "$LARGE_LOCAL" | cut -d' ' -f1)
+sum_dst=$(sha256sum "$LARGE_DOWNLOADED" | cut -d' ' -f1)
+check_eq "downloaded sha256 matches" "$sum_dst" "$sum_src"
+
+drive9_retry fs rm "$LARGE_REMOTE" >/dev/null
+drive9_retry fs rm "$BATCH_DIR" >/dev/null
+rm -f "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
+
+echo "[6] delete tenant"
 delete_out="$(drive9_ctx delete \
   --server "$BASE" \
   --api-key "$API_KEY" \
@@ -213,7 +256,7 @@ CREATED=0
 
 # ── [5] verify tenant gone ──────────────────────────────────────────────────
 
-echo "[5] verify tenant removed"
+echo "[7] verify tenant removed"
 vfile="$(mktemp)"
 vcode=$(curl -sS -o "$vfile" -w "%{http_code}" -H "Authorization: Bearer $API_KEY" "$BASE/v1/status")
 rm -f "$vfile"
