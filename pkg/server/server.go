@@ -3422,7 +3422,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		credentialReq = req
 	} else {
 		if err := rejectCredentialProvisionBody(r); err != nil {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider, "error", err)...)
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider, "error", err)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
