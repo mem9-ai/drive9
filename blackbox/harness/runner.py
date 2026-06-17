@@ -162,25 +162,78 @@ class BlackboxRunner:
         ]
         for status in (PASS, FAIL, SKIP, XFAIL, WARN):
             lines.append(f"| {status} | {summary.get(status, 0)} |")
-        lines.extend(["", "## Modules", "", "| Module | Category | Status | Seconds | Classification | Detail |", "|---|---|---:|---:|---|---|"])
+        lines.extend(["", "## Correctness", "", "| Module | Category | Status | Seconds | Classification | Detail |", "|---|---|---:|---:|---|---|"])
         for record in self.recorder.records:
-            detail = record.detail.replace("|", "\\|")[:240]
-            lines.append(f"| `{record.module}` | `{record.category}` | {record.status} | {record.seconds:.3f} | {record.classification} | {detail} |")
-        metrics_path = self.result_dir / "metrics.json"
-        if metrics_path.exists():
-            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-            summaries = metrics.get("summaries", {})
-            if summaries:
-                lines.extend(["", "## Metrics", "", "| Metric | Unit | Mean | Median | Runs |", "|---|---|---:|---:|---:|"])
-                for name, item in sorted(summaries.items()):
-                    summary_item = item.get("summary", {})
-                    values = summary_item.get("values", [])
-                    lines.append(
-                        f"| `{name}` | {summary_item.get('unit', '')} | {float(summary_item.get('mean', 0)):.3f} | {float(summary_item.get('median', 0)):.3f} | {len(values)} |"
-                    )
+            detail = self.md_cell(record.detail, limit=240)
+            lines.append(f"| `{record.module}` | `{record.category}` | {record.status} | {record.seconds:.3f} | {self.md_cell(record.classification)} | {detail} |")
+        self.append_metric_sections(lines)
         report_path = self.result_dir / "report.md"
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return report_path
+
+    def append_metric_sections(self, lines: list[str]) -> None:
+        metrics_path = self.result_dir / "metrics.json"
+        if not metrics_path.exists():
+            return
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        summaries = metrics.get("summaries", {})
+        if summaries:
+            lines.extend(
+                [
+                    "",
+                    "## Benchmark Summary",
+                    "",
+                    "| Module | Metric | Unit | Mean | Median | Min | Max | Stddev | Runs |",
+                    "|---|---|---|---:|---:|---:|---:|---:|---:|",
+                ]
+            )
+            for name, item in sorted(summaries.items()):
+                summary_item = item.get("summary", {})
+                values = summary_item.get("values", [])
+                lines.append(
+                    "| "
+                    f"`{self.metric_module(name)}` | "
+                    f"`{self.md_cell(name)}` | "
+                    f"{self.md_cell(summary_item.get('unit', ''))} | "
+                    f"{self.format_number(summary_item.get('mean', 0))} | "
+                    f"{self.format_number(summary_item.get('median', 0))} | "
+                    f"{self.format_number(summary_item.get('min', 0))} | "
+                    f"{self.format_number(summary_item.get('max', 0))} | "
+                    f"{self.format_number(summary_item.get('stdev', 0))} | "
+                    f"{len(values)} |"
+                )
+        rows = metrics.get("rows", [])
+        if rows:
+            lines.extend(["", "## Measurements", "", "| Module | Metric | Value | Unit | Labels |", "|---|---|---:|---|---|"])
+            for row in rows:
+                name = str(row.get("name", ""))
+                labels = row.get("labels", {})
+                lines.append(
+                    "| "
+                    f"`{self.metric_module(name)}` | "
+                    f"`{self.md_cell(name)}` | "
+                    f"{self.format_number(row.get('value', 0))} | "
+                    f"{self.md_cell(row.get('unit', ''))} | "
+                    f"{self.md_cell(json.dumps(labels, sort_keys=True), limit=240)} |"
+                )
+
+    def metric_module(self, metric_name: str) -> str:
+        for module_id in sorted(self.registry.keys(), key=len, reverse=True):
+            if metric_name == module_id or metric_name.startswith(module_id + "."):
+                return module_id
+        return "unknown"
+
+    @staticmethod
+    def md_cell(value: Any, *, limit: int = 1000) -> str:
+        text = str(value).replace("|", "\\|").replace("\n", " ")
+        return text[:limit]
+
+    @staticmethod
+    def format_number(value: Any) -> str:
+        try:
+            return f"{float(value):.3f}"
+        except (TypeError, ValueError):
+            return ""
 
     def finish_report(self) -> None:
         report_path = self.write_report()
