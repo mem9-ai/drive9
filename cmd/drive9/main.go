@@ -97,11 +97,18 @@ func dispatch(cmd string, args []string) {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "version"))
 		}
 		fmt.Print(versionString())
-	case "-h", "-help", "--help", "help":
+	case "-h", "-help", "--help":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "help"))
 		}
 		usage(0)
+	case "help":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "help"))
+		}
+		if err := runHelp(args); err != nil {
+			fatal("help", err)
+		}
 	case "create":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "create"))
@@ -417,9 +424,11 @@ func usage(code int) {
 			"                         mount vault secrets read-only\n"+
 			"  umount <mountpoint>    unmount a drive9 mount\n"+
 			"  doctor fuse            diagnose local FUSE prerequisites\n"+
-			"  update [--check]       update drive9 CLI in place\n\n"+
+			"  update [--check]       update drive9 CLI in place\n"+
+			"  help [--tree|-t] [--no-pager] [--color=auto|always|never]\n"+
+			"                         show visual tree help\n\n"+
 			"global:\n"+
-			"  -h, --help, help       show this help\n"+
+			"  -h, -help, --help      show this classic usage\n"+
 			"  -v, --version, version print version information\n",
 	)
 	exitWithCode(code)
