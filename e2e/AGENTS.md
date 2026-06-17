@@ -91,7 +91,34 @@ RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
 
 # Include portable profile pack/unpack coverage in smoke-all when desired.
 RUN_PORTABLE_PACK_E2E=1 bash e2e/smoke-all.sh
+
+# TiDB Cloud Native tenant lifecycle smoke (manual-only, requires credentials)
+DRIVE9_BASE="${DRIVE9_BASE:-http://k8s-drive9ti-drive9se-b6bbe5ba6e-cee81207452d1185.elb.ap-southeast-1.amazonaws.com}" \
+DRIVE9_TIDBCLOUD_PUBLIC_KEY="${DRIVE9_TIDBCLOUD_PUBLIC_KEY}" \
+DRIVE9_TIDBCLOUD_PRIVATE_KEY="${DRIVE9_TIDBCLOUD_PRIVATE_KEY}" \
+bash e2e/native-smoke-test.sh
 ```
+
+### TiDB Cloud Native smoke prerequisites
+
+`native-smoke-test.sh` provisions a tenant via the `tidb_cloud_native` provider
+and is manual-only because it requires TiDB Cloud API credentials.
+
+Required environment variables:
+
+| Variable | Purpose |
+|----------|---------|
+| `DRIVE9_BASE` | Server base URL (default: native dev LB) |
+| `DRIVE9_TIDBCLOUD_PUBLIC_KEY` | TiDB Cloud public key for digest auth |
+| `DRIVE9_TIDBCLOUD_PRIVATE_KEY` | TiDB Cloud private key for digest auth |
+
+Optional:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DRIVE9_REGION_CODE` | `aws-ap-southeast-1` | Provisioning region |
+| `POLL_TIMEOUT_S` | `600` | Max seconds to wait for tenant active |
+| `SKIP_CLEANUP` | `0` | Set to 1 to leave tenant on failure |
 
 ### Local via `drive9-server-local`
 
