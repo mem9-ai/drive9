@@ -368,7 +368,7 @@ func fatal(cmd string, err error) {
 		logger.Error(context.Background(), "cli_command_failed", zap.String("command", cmd), zap.Error(err))
 	}
 	msg := err.Error()
-	if strings.Contains(strings.ToLower(msg), "tenant storage quota exceeded") || strings.Contains(strings.ToLower(msg), "tenant usage quota exceeded") {
+	if strings.Contains(strings.ToLower(msg), "usage quota") {
 		if m := cli.QuotaExceededMessageForCurrentContext(); m != "" {
 			msg = m
 		}
