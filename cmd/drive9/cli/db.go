@@ -435,6 +435,9 @@ func cleanupMatchingOwnerContexts(server, apiKey string) {
 	cfg := loadConfig()
 	removed := false
 	for name, ctx := range cfg.Contexts {
+		if ctx == nil {
+			continue
+		}
 		if ctx.Type == PrincipalOwner && ctx.Server == server && ctx.APIKey == apiKey {
 			delete(cfg.Contexts, name)
 			if cfg.CurrentContext == name {
