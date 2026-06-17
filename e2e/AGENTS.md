@@ -31,6 +31,9 @@ Current shared dev deployment:
 # Dev
 export DRIVE9_BASE="http://k8s-dat9-dat9serv-d5e02e7d07-1645488597.ap-southeast-1.elb.amazonaws.com"
 
+# Dev (tidbcloud-native)
+export DRIVE9_BASE="http://k8s-drive9ti-drive9se-b6bbe5ba6e-cee81207452d1185.elb.ap-southeast-1.amazonaws.com"
+
 # Prod
 export DRIVE9_BASE="https://api.drive9.ai"
 ```
@@ -91,6 +94,14 @@ RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
 
 # Include portable profile pack/unpack coverage in smoke-all when desired.
 RUN_PORTABLE_PACK_E2E=1 bash e2e/smoke-all.sh
+
+# TiDB Cloud Native (tidbcloud-native) tenant lifecycle smoke
+# Requires credentials, not wired into CI. Set DRIVE9_BASE from Deployment
+# endpoints above, or export manually. Credentials are stored in repo secrets
+# (DRIVE9_TIDBCLOUD_PUBLIC_KEY, DRIVE9_TIDBCLOUD_PRIVATE_KEY).
+DRIVE9_TIDBCLOUD_PUBLIC_KEY="$DRIVE9_TIDBCLOUD_PUBLIC_KEY" \
+DRIVE9_TIDBCLOUD_PRIVATE_KEY="$DRIVE9_TIDBCLOUD_PRIVATE_KEY" \
+bash e2e/native-smoke-test.sh
 ```
 
 ### Local via `drive9-server-local`
@@ -494,6 +505,16 @@ enabled.
 5. Runs `portable-pack-unpack-e2e.sh` when `RUN_PORTABLE_PACK_E2E=1`
 6. Aggregates pass/fail at script level for quick regression checks
 
+### `native-smoke-test.sh`
+
+Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
+
+1. Provision tenant via `drive9 create` with `--tidbcloud-public-key` / `--tidbcloud-private-key`
+2. Poll `GET /v1/status` until active
+3. Basic CLI fs operations (`mkdir`, `cp`, `cat`, `ls`, `rm`)
+4. Delete tenant via `drive9 delete` and verify removal (401/403/404 on `GET /v1/status`)
+5. Trap-based cleanup: attempts `drive9 delete` on script failure unless `SKIP_CLEANUP=1`
+
 ## Environment variables
 
 | Variable | Default | Used by |
@@ -596,6 +617,9 @@ enabled.
 | `PJDFSTEST_MOUNT_ALLOW_OTHER` | `auto` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh`; Linux auto-adds `--allow-other`, Darwin does not |
 | `GIT_MATRIX_TIMEOUT_S` | `240` | on-demand `git-feature-matrix.sh` |
 | `GIT_MATRIX_RUN_OVERSIZED` | `1` | on-demand `git-feature-matrix.sh` |
+| `DRIVE9_TIDBCLOUD_PUBLIC_KEY` | *(required)* | `native-smoke-test.sh` |
+| `DRIVE9_TIDBCLOUD_PRIVATE_KEY` | *(required)* | `native-smoke-test.sh` |
+| `SKIP_CLEANUP` | `0` | `native-smoke-test.sh` |
 
 ## Conventions
 
