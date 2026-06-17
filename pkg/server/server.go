@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"encoding/base64"
@@ -3419,6 +3420,13 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		credentialReq = req
+	} else {
+		if err := rejectCredentialProvisionBody(r); err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider, "error", err)...)
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+			errJSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	res, err := s.provisionTenant(r.Context(), provisionTenantOptions{
 		KeyName:               "default",
@@ -3487,6 +3495,37 @@ func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, bu
 		return nil, fmt.Errorf("public_key and private_key are required")
 	}
 	return &out, nil
+}
+
+func rejectCredentialProvisionBody(r *http.Request) error {
+	if r.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxCredentialProvisionBodyBytes))
+	if err != nil {
+		return nil
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if len(body) == 0 {
+		return nil
+	}
+	if int64(len(body)) >= maxCredentialProvisionBodyBytes {
+		return fmt.Errorf("request body too large")
+	}
+	var raw struct {
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	if strings.TrimSpace(raw.PublicKey) != "" {
+		return fmt.Errorf("tidbcloud public key is not supported for this provider (only tidb_cloud_native)")
+	}
+	if strings.TrimSpace(raw.PrivateKey) != "" {
+		return fmt.Errorf("tidbcloud private key is not supported for this provider (only tidb_cloud_native)")
+	}
+	return nil
 }
 
 type apiKeyIssueSource struct {

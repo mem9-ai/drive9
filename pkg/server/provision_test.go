@@ -607,6 +607,56 @@ func TestProvisionTenantRejectsMissingNativeCredentialsBeforeInsert(t *testing.T
 	}
 }
 
+func TestProvisionRejectsCredentialsForNonNativeProvider(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, provider := range []string{tenant.ProviderTiDBZero, tenant.ProviderTiDBCloudStarter, tenant.ProviderDB9} {
+		prov := &fakeProvisioner{provider: provider}
+		srv := NewWithConfig(Config{
+			Meta:        metaStore,
+			Pool:        pool,
+			Provisioner: prov,
+			TokenSecret: tokenSecret,
+		})
+
+		ts := httptest.NewServer(srv)
+		body, _ := json.Marshal(map[string]string{"public_key": "test", "private_key": "test"})
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			ts.Close()
+			t.Fatalf("%s: request failed: %v", provider, err)
+		}
+		_ = resp.Body.Close()
+		ts.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status=%d, want 400", provider, resp.StatusCode)
+		}
+	}
+}
+
 func TestProvisionPersistsEncryptedAutoEmbeddingProfile(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
