@@ -456,7 +456,6 @@ class Drive9FuseTargetProvider:
             profile,
             "--durability",
             durability,
-            "--perf-counters",
             "--cache-dir",
             str(cache_dir),
         ]
@@ -478,7 +477,11 @@ class Drive9FuseTargetProvider:
         next_wait_log = time.monotonic() + 10
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                raise BlackboxError(f"mount exited early for {case}; see {log_dir / 'mount.err'}")
+                tail = log_tail(log_dir / "mount.err")
+                detail = f"mount exited early for {case}; see {log_dir / 'mount.err'}"
+                if tail:
+                    detail += f"\nlast mount stderr:\n{tail}"
+                raise BlackboxError(detail)
             if self.is_mounted(mountpoint):
                 handle = MountHandle(mountpoint=mountpoint, remote_root=remote_root, proc=proc, log_dir=log_dir, cache_dir=cache_dir, local_root=local_root, profile=profile)
                 self.mounts.append(handle)
@@ -489,7 +492,11 @@ class Drive9FuseTargetProvider:
                 next_wait_log = time.monotonic() + 10
             time.sleep(0.25)
         self.kill_process_group(proc)
-        raise BlackboxError(f"mount did not become ready for {case}; see {log_dir / 'mount.err'}")
+        tail = log_tail(log_dir / "mount.err")
+        detail = f"mount did not become ready for {case}; see {log_dir / 'mount.err'}"
+        if tail:
+            detail += f"\nlast mount stderr:\n{tail}"
+        raise BlackboxError(detail)
 
     def is_mounted(self, mountpoint: Path) -> bool:
         if shutil.which("mountpoint"):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shlex
 import statistics
 import time
 from pathlib import Path
@@ -20,6 +21,9 @@ class Drive9LocalOverlayBuild(Drive9WorkflowBase):
     def ensure_dependencies(self, ctx: Context) -> None:
         super().ensure_dependencies(ctx)
         ctx.deps.require_tool("bash")
+        for repo in self.selected_repos(ctx):
+            for tool in self.repo_command_tools(repo):
+                ctx.deps.require_tool(tool)
 
     def run(self, ctx: Context) -> dict[str, Any]:
         cfg = module_config(ctx, self.id)
@@ -159,6 +163,31 @@ class Drive9LocalOverlayBuild(Drive9WorkflowBase):
     def local_overlay_config(self, repo: dict[str, Any]) -> dict[str, Any]:
         value = repo.get("local_overlay", {})
         return value if isinstance(value, dict) else {}
+
+    def repo_command_tools(self, repo: dict[str, Any]) -> list[str]:
+        overlay_cfg = self.local_overlay_config(repo)
+        commands = [
+            *list(overlay_cfg.get("prewarm", repo.get("prewarm", []))),
+            *list(overlay_cfg.get("build", repo.get("build", []))),
+        ]
+        tools: list[str] = []
+        seen: set[str] = set()
+        for raw in commands:
+            try:
+                parts = shlex.split(str(raw))
+            except ValueError:
+                parts = str(raw).split()
+            while parts and "=" in parts[0] and not parts[0].startswith(("/", "./", "../")):
+                parts = parts[1:]
+            if not parts:
+                continue
+            tool = parts[0]
+            if "/" in tool:
+                continue
+            if tool not in seen:
+                tools.append(tool)
+                seen.add(tool)
+        return tools
 
     def prewarm_repo(self, ctx: Context, repo: dict[str, Any], commit: str, env: dict[str, str]) -> None:
         overlay_cfg = self.local_overlay_config(repo)
