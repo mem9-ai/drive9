@@ -101,8 +101,8 @@ drive9_retry() {
     if out="$(drive9 "$@" 2>&1)"; then
       printf '%s' "$out"; return 0
     fi
-    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* ]]; then
-      echo "retry $attempt/$CLI_MAX_RETRIES for drive9 $* (throttled)" >&2
+    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"not found"* ]]; then
+      echo "retry $attempt/$CLI_MAX_RETRIES for drive9 $* " >&2
       sleep "$CLI_RETRY_SLEEP_S"; attempt=$((attempt+1)); continue
     fi
     printf '%s' "$out" >&2; return 1
@@ -177,16 +177,16 @@ drive9_retry fs cp "$TMP_FILE" ":$DIR/hello.txt" >/dev/null
 check_cmd "cp file to $DIR/hello.txt" true
 
 ls_out="$(drive9_retry fs ls "$DIR")"
-check_cmd "ls $DIR lists file" echo "$ls_out" | grep -q "hello.txt"
+check_cmd "ls $DIR lists file" bash -c "echo \"\$1\" | grep -q hello.txt" _ "$ls_out"
 
 cat_out="$(drive9_retry fs cat "$DIR/hello.txt")"
-check_cmd "cat $DIR/hello.txt returns content" echo "$cat_out" | grep -q "hello native smoke test"
+check_cmd "cat $DIR/hello.txt returns content" bash -c "echo \"\$1\" | grep -q 'hello native smoke test'" _ "$cat_out"
 
 drive9_retry fs rm "$DIR/hello.txt" >/dev/null
 check_cmd "rm $DIR/hello.txt" true
 
 ls_after="$(drive9_retry fs ls "$DIR" 2>&1 || true)"
-if echo "$ls_after" | grep -q "hello.txt"; then
+if printf '%s' "$ls_after" | grep -q "hello.txt"; then
   check_eq "rm $DIR/hello.txt removes file" "fail" "pass"
 else
   check_cmd "rm $DIR/hello.txt removes file" true
@@ -208,7 +208,7 @@ delete_code=$?
 check_eq "drive9 delete exit code" "$delete_code" "0"
 
 DELETE_STATUS="$(printf '%s' "$delete_out" | jq -r '.status // empty')"
-check_cmd "delete status is deleted or deleting" echo "$DELETE_STATUS" | grep -qE 'deleted|deleting'
+check_cmd "delete status is deleted or deleting" bash -c "echo \"\$1\" | grep -qE 'deleted|deleting'" _ "$DELETE_STATUS"
 CREATED=0
 
 # ── [5] verify tenant gone ──────────────────────────────────────────────────
