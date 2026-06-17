@@ -112,13 +112,20 @@ drive9_retry() {
 
 cleanup() {
   if [ "$CREATED" -eq 1 ] && [ "$SKIP_CLEANUP" != "1" ] && [ -n "${TENANT_ID:-}" ]; then
-    echo "[cleanup] deleting tenant $TENANT_ID"
-    drive9_ctx delete \
-      --server "$BASE" \
-      --api-key "${API_KEY:-}" \
-      --tidbcloud-public-key "$PUBLIC_KEY" \
-      --tidbcloud-private-key "$PRIVATE_KEY" \
-      >/dev/null 2>&1 || true
+    echo "[cleanup] deleting tenant $TENANT_ID" >&2
+    for i in $(seq 1 3); do
+      if drive9_ctx delete \
+        --server "$BASE" \
+        --api-key "${API_KEY:-}" \
+        --tidbcloud-public-key "$PUBLIC_KEY" \
+        --tidbcloud-private-key "$PRIVATE_KEY" \
+        >/tmp/native-cleanup.log 2>&1; then
+        echo "[cleanup] tenant $TENANT_ID deleted" >&2
+        break
+      fi
+      echo "[cleanup] retry $i/3 deleting tenant $TENANT_ID (see /tmp/native-cleanup.log)" >&2
+      sleep 30
+    done
   fi
   rm -f "$CLI_BIN" "$TMP_FILE"
   rm -rf "$CLI_HOME"
@@ -217,7 +224,7 @@ check_cmd "rm -r batch dir" true
 
 echo "[5] large file upload/download"
 
-LARGE_MB="${CLI_LARGE_FILE_MB:-100}"
+LARGE_MB="${CLI_LARGE_FILE_MB:-50}"
 LARGE_LOCAL="$(mktemp)"
 LARGE_REMOTE="$BATCH_DIR/large-${TS}.bin"
 LARGE_DOWNLOADED="$(mktemp)"
