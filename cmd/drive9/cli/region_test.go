@@ -36,7 +36,7 @@ func TestRegionListTextAndJSON(t *testing.T) {
 	for _, want := range []string{
 		"REGION",
 		"MODE",
-		"SERVER",
+		"ENDPOINT",
 		"ali-ap-southeast-1",
 		"TiDBCloud",
 		"Anonymous",
@@ -100,7 +100,7 @@ func TestRegionListFallsBackWhenManifestUnavailable(t *testing.T) {
 	for _, want := range []string{
 		"REGION",
 		"MODE",
-		"SERVER",
+		"ENDPOINT",
 		"aws-ap-southeast-1",
 		"Anonymous",
 		"https://api.drive9.ai",
