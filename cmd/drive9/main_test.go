@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -86,19 +87,271 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"ctx use <name>",
 		"token <issue|revoke>",
 		"journal <new|append|cat|find|verify>",
-		"region list [--json]",
+		"region list [--json] [--manifest-url URL]",
 		"profile show [profile]",
 		"mount [flags] [:/remote] <mountpoint>",
 		"mount vault [flags] <mountpoint>",
 		"umount <mountpoint>",
 		"doctor fuse",
 		"update [--check]",
-		"-h, --help, help",
+		"-h, -help, --help",
 	} {
 		if !strings.Contains(stderr, want) {
 			t.Fatalf("stderr = %q, want it to contain %q", stderr, want)
 		}
 	}
+}
+
+func TestDispatchHelpCommandShowsVisualTreeHelp(t *testing.T) {
+	origExit := exitFunc
+	origStdout := os.Stdout
+	origStderr := os.Stderr
+	origStop := cpuProfileStop
+	t.Cleanup(func() {
+		exitFunc = origExit
+		os.Stdout = origStdout
+		os.Stderr = origStderr
+		cpuProfileStop = origStop
+	})
+	cpuProfileStop = func() {}
+
+	var exitCodes []int
+	exitFunc = func(code int) { exitCodes = append(exitCodes, code) }
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	os.Stdout = stdoutW
+	os.Stderr = stderrW
+
+	stdoutDone := make(chan string, 1)
+	stderrDone := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, stdoutR)
+		stdoutDone <- buf.String()
+	}()
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, stderrR)
+		stderrDone <- buf.String()
+	}()
+
+	dispatch("help", []string{"--no-pager", "--color=never"})
+
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	stdout := <-stdoutDone
+	stderr := <-stderrDone
+
+	if len(exitCodes) != 1 || exitCodes[0] != 0 {
+		t.Fatalf("exit codes = %v, want [0]", exitCodes)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty stderr", stderr)
+	}
+	for _, want := range []string{
+		"drive9 <command> [args] [flags]",
+		"drive9 fs <command> [arguments]",
+		"drive9 git <clone|worktree|hydrate>",
+		"Anonymous mode transfers data management rights to PingCAP",
+		"--tidbcloud-public-key KEY",
+		"--tidbcloud-private-key KEY",
+		"drive9 region list [--json] [--manifest-url URL]",
+		"REGION CODE, CLOUD PROVIDER, REGION, MODE, SERVER",
+		"--manifest-url URL",
+		"Connection:",
+		"--read-cache-max-file-mb MB",
+		"--parallel-read-concurrency N",
+		"--local-only PATTERN",
+		"--checkpoint REF",
+		"--perf-cpu-interval DURATION",
+		"drive9 mount vault [flags] <mountpoint>",
+		"--pack-path PATH",
+		"drive9 update [--check] [--force] [--base-url URL]",
+		"less -R -S",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout = %q, want it to contain %q", stdout, want)
+		}
+	}
+	if strings.Contains(stdout, "\x1b[") {
+		t.Fatalf("stdout contains ANSI escapes despite --color=never: %q", stdout)
+	}
+}
+
+func TestDispatchHelpCommandUsage(t *testing.T) {
+	origExit := exitFunc
+	origStdout := os.Stdout
+	origStderr := os.Stderr
+	origStop := cpuProfileStop
+	t.Cleanup(func() {
+		exitFunc = origExit
+		os.Stdout = origStdout
+		os.Stderr = origStderr
+		cpuProfileStop = origStop
+	})
+	cpuProfileStop = func() {}
+
+	var exitCodes []int
+	exitFunc = func(code int) { exitCodes = append(exitCodes, code) }
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	os.Stdout = stdoutW
+	os.Stderr = stderrW
+
+	stdoutDone := make(chan string, 1)
+	stderrDone := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, stdoutR)
+		stdoutDone <- buf.String()
+	}()
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, stderrR)
+		stderrDone <- buf.String()
+	}()
+
+	dispatch("help", []string{"--help"})
+
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	stdout := <-stdoutDone
+	stderr := <-stderrDone
+
+	if len(exitCodes) != 1 || exitCodes[0] != 0 {
+		t.Fatalf("exit codes = %v, want [0]", exitCodes)
+	}
+	if !strings.HasPrefix(stdout, "usage: drive9 help") {
+		t.Fatalf("stdout = %q, want help usage", stdout)
+	}
+	if stderr != "" {
+		t.Fatalf("stderr = %q, want empty stderr", stderr)
+	}
+}
+
+func TestDispatchHelpCommandPlainShowsClassicUsage(t *testing.T) {
+	stdout, stderr, exitCodes := captureDispatchOutput(t, "help", []string{"--plain"})
+
+	if len(exitCodes) != 1 || exitCodes[0] != 0 {
+		t.Fatalf("exit codes = %v, want [0]", exitCodes)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty stdout", stdout)
+	}
+	for _, want := range []string{
+		"usage: drive9 <command> [arguments]",
+		"help [--plain] [--no-pager] [--color=auto|always|never]",
+		"-h, -help, --help",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("stderr = %q, want it to contain %q", stderr, want)
+		}
+	}
+}
+
+func TestDispatchHelpCommandUnknownOptionFails(t *testing.T) {
+	stdout, stderr, exitCodes := captureDispatchOutput(t, "help", []string{"--bogus"})
+
+	if len(exitCodes) != 1 || exitCodes[0] != 1 {
+		t.Fatalf("exit codes = %v, want [1]", exitCodes)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty stdout", stdout)
+	}
+	for _, want := range []string{
+		`help: unknown help option "--bogus"`,
+		"usage: drive9 help [--plain] [--no-pager] [--color=auto|always|never]",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("stderr = %q, want it to contain %q", stderr, want)
+		}
+	}
+}
+
+func TestRenderDrive9VisualHelpColor(t *testing.T) {
+	out := renderDrive9VisualHelp(true)
+	if !strings.Contains(out, "\x1b[") {
+		t.Fatalf("renderDrive9VisualHelp(true) missing ANSI color escapes")
+	}
+	for _, want := range []string{"drive9", "create", "fs", "git", "less", "-R", "-S"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("rendered help missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestIsPagerClosedPipe(t *testing.T) {
+	for _, err := range []error{
+		io.ErrClosedPipe,
+		&os.PathError{Op: "write", Path: "less", Err: syscall.EPIPE},
+	} {
+		if !isPagerClosedPipe(err) {
+			t.Fatalf("isPagerClosedPipe(%v) = false, want true", err)
+		}
+	}
+}
+
+func captureDispatchOutput(t *testing.T, cmd string, args []string) (string, string, []int) {
+	t.Helper()
+
+	origExit := exitFunc
+	origStdout := os.Stdout
+	origStderr := os.Stderr
+	origStop := cpuProfileStop
+	t.Cleanup(func() {
+		exitFunc = origExit
+		os.Stdout = origStdout
+		os.Stderr = origStderr
+		cpuProfileStop = origStop
+	})
+	cpuProfileStop = func() {}
+
+	var exitCodes []int
+	exitFunc = func(code int) { exitCodes = append(exitCodes, code) }
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	os.Stdout = stdoutW
+	os.Stderr = stderrW
+
+	stdoutDone := make(chan string, 1)
+	stderrDone := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, stdoutR)
+		stdoutDone <- buf.String()
+	}()
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, stderrR)
+		stderrDone <- buf.String()
+	}()
+
+	dispatch(cmd, args)
+
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	return <-stdoutDone, <-stderrDone, exitCodes
 }
 
 func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {

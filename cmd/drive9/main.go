@@ -98,11 +98,18 @@ func dispatch(cmd string, args []string) {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "version"))
 		}
 		fmt.Print(versionString())
-	case "-h", "-help", "--help", "help":
+	case "-h", "-help", "--help":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "help"))
 		}
 		usage(0)
+	case "help":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "help"))
+		}
+		if err := runHelp(args); err != nil {
+			fatal("help", err)
+		}
 	case "create":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "create"))
@@ -387,7 +394,7 @@ func usage(code int) {
 			"commands:\n"+
 			"  create [--name NAME] [--region-code CODE] [--server URL] [--json]\n"+
 			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
-			"                         provision a new database and owner context\n"+
+			"                         provision a new tenant and owner context\n"+
 			"  delete [--server URL] [--api-key KEY] [--json]\n"+
 			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
 			"                         delete current tenant with owner API key\n"+
@@ -411,7 +418,8 @@ func usage(code int) {
 			"                         append-only agent/workflow journal operations\n"+
 			"  git clone --fast <repo-url> <mounted-path>\n"+
 			"                         git-aware fast clone workflow\n"+
-			"  region list [--json]   list provisioning regions\n"+
+			"  region list [--json] [--manifest-url URL]\n"+
+			"                         list provisioning regions from the drive9 manifest\n"+
 			"  pack [flags] [archive] [path...]\n"+
 			"                         archive coding-agent local overlay paths to drive9/S3\n"+
 			"  unpack [flags] [archive]\n"+
@@ -424,9 +432,11 @@ func usage(code int) {
 			"                         mount vault secrets read-only\n"+
 			"  umount <mountpoint>    unmount a drive9 mount\n"+
 			"  doctor fuse            diagnose local FUSE prerequisites\n"+
-			"  update [--check]       update drive9 CLI in place\n\n"+
+			"  update [--check]       update drive9 CLI in place\n"+
+			"  help [--plain] [--no-pager] [--color=auto|always|never]\n"+
+			"                         show visual tree help\n\n"+
 			"global:\n"+
-			"  -h, --help, help       show this help\n"+
+			"  -h, -help, --help      show this classic usage\n"+
 			"  -v, --version, version print version information\n",
 	)
 	exitWithCode(code)
