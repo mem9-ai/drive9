@@ -32,7 +32,7 @@ var fallbackRegionManifest = RegionManifest{
 		{
 			RegionCode:    "aws-ap-southeast-1",
 			Mode:          RegionModeTiDBCloudStarter,
-				ServerURL:      defaultServerURL,
+			ServerURL:     defaultServerURL,
 			CloudProvider: "aws",
 			TiDBRegion:    "ap-southeast-1",
 		},
@@ -126,7 +126,9 @@ func regionListCmd(args []string) error {
 	for _, entry := range manifest.Regions {
 		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", entry.RegionCode, entry.CloudProvider, entry.TiDBRegion, regionModeLabel(entry.Mode), entry.ServerURL)
 	}
-	_ = w.Flush()
+	if err := w.Flush(); err != nil {
+		return err
+	}
 	for _, entry := range manifest.Regions {
 		if regionModeLabel(entry.Mode) == ModeLabelAnonymous {
 			fmt.Fprintln(os.Stderr, "Note: Anonymous mode in drive9 transfers data management rights to PingCAP.")
@@ -142,7 +144,7 @@ func regionListOutput(entries []RegionManifestEntry) []regionListOutputEntry {
 		out = append(out, regionListOutputEntry{
 			RegionCode:    entry.RegionCode,
 			Mode:          regionModeLabel(entry.Mode),
-				ServerURL:     entry.ServerURL,
+			ServerURL:     entry.ServerURL,
 			CloudProvider: entry.CloudProvider,
 			TiDBRegion:    entry.TiDBRegion,
 			Tags:          entry.Tags,
