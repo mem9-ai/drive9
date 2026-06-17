@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from harness.core import BlackboxError, CommandResult, REPO_ROOT, ensure_empty, utc_ts
+from harness.core import BlackboxError, CommandResult, REPO_ROOT, ensure_empty, progress, utc_ts
 
 
 @dataclass
@@ -151,6 +151,7 @@ class Drive9FuseTargetProvider:
         stderr = log_dir / "stderr.log"
         display = cmd if isinstance(cmd, str) else " ".join(cmd)
         start = time.monotonic()
+        progress(f"command start: {safe_name} (timeout={timeout}s, logs={log_dir})")
         with stdout.open("ab") as out, stderr.open("ab") as err:
             out.write(f"\n# {utc_ts()} $ {display}\n".encode())
             out.flush()
@@ -172,6 +173,8 @@ class Drive9FuseTargetProvider:
                 self.kill_process_group(proc)
                 code = 124
         seconds = time.monotonic() - start
+        status = "done" if code in ok_codes else "failed"
+        progress(f"command {status}: {safe_name} exit={code} in {seconds:.1f}s")
         return CommandResult(code=code, seconds=seconds, stdout=stdout, stderr=stderr, ok=code in ok_codes)
 
     def capture(self, cmd: list[str], *, cwd: Path | None = None, timeout: int = 120, env: dict[str, str] | None = None) -> str:
@@ -210,19 +213,24 @@ class Drive9FuseTargetProvider:
         if self.args.drive9_cli:
             if not self.cli.exists():
                 raise BlackboxError(f"drive9 CLI not found: {self.cli}")
+            progress(f"setup: using drive9 CLI {self.cli}")
             return
+        progress("setup: building drive9 CLI")
         env = dict(os.environ)
         env["CGO_ENABLED"] = "0"
         result = self.run_cmd("build-cli", ["go", "build", "-o", str(self.cli), "./cmd/drive9"], timeout=600, env=env)
         if not result.ok:
             raise BlackboxError(f"build drive9 CLI failed; see {result.stderr}")
+        progress(f"setup: drive9 CLI ready at {self.cli}")
 
     def build_server_local(self) -> None:
+        progress("setup: building drive9-server-local")
         env = dict(os.environ)
         env["CGO_ENABLED"] = "0"
         result = self.run_cmd("build-server-local", ["go", "build", "-o", str(self.server_bin), "./cmd/drive9-server-local"], timeout=600, env=env)
         if not result.ok:
             raise BlackboxError(f"build drive9-server-local failed; see {result.stderr}")
+        progress(f"setup: drive9-server-local ready at {self.server_bin}")
 
     def detect_runtime(self) -> str:
         runtime = os.environ.get("DRIVE9_LOCAL_E2E_DB_RUNTIME", "")
@@ -239,6 +247,7 @@ class Drive9FuseTargetProvider:
     def start_mysql_if_needed(self) -> str:
         dsn = os.environ.get("DRIVE9_LOCAL_DSN", "")
         if dsn:
+            progress("setup: using DRIVE9_LOCAL_DSN for local datastore")
             return dsn
         runtime = self.detect_runtime()
         self.db_runtime = runtime
@@ -246,6 +255,7 @@ class Drive9FuseTargetProvider:
         password = os.environ.get("DRIVE9_LOCAL_E2E_DB_PASSWORD", "drive9pass")
         db_name = os.environ.get("DRIVE9_LOCAL_E2E_DB_NAME", "drive9_local")
         self.db_container = f"drive9-blackbox-{int(time.time())}-{os.getpid()}"
+        progress(f"setup: starting MySQL container {self.db_container} with {runtime} image={image}")
         result = self.run_cmd(
             "mysql-container-run",
             [
@@ -267,6 +277,8 @@ class Drive9FuseTargetProvider:
         if not result.ok:
             raise BlackboxError(f"start MySQL container failed; see {result.stderr}")
         deadline = time.monotonic() + 120
+        progress(f"setup: waiting for MySQL container {self.db_container} readiness")
+        next_wait_log = time.monotonic() + 10
         while time.monotonic() < deadline:
             port = ""
             try:
@@ -282,17 +294,26 @@ class Drive9FuseTargetProvider:
                     check=False,
                 )
                 if ping.returncode == 0:
+                    progress(f"setup: MySQL container ping ok on host port {port}; waiting for host TCP handshake")
                     host_ready_deadline = time.monotonic() + int(os.environ.get("DRIVE9_LOCAL_E2E_DB_HOST_READY_TIMEOUT_S", "60"))
                     stable = 0
+                    next_host_wait_log = time.monotonic() + 10
                     while time.monotonic() < host_ready_deadline:
                         if mysql_tcp_handshake_ready("127.0.0.1", int(port)):
                             stable += 1
                             if stable >= 2:
                                 time.sleep(float(os.environ.get("DRIVE9_LOCAL_E2E_DB_READY_GRACE_S", "1")))
+                                progress(f"setup: MySQL ready at 127.0.0.1:{port}")
                                 return f"root:{password}@tcp(127.0.0.1:{port})/{db_name}?parseTime=true"
                         else:
                             stable = 0
+                        if time.monotonic() >= next_host_wait_log:
+                            progress(f"setup: still waiting for MySQL host TCP handshake on 127.0.0.1:{port}")
+                            next_host_wait_log = time.monotonic() + 10
                         time.sleep(0.5)
+            if time.monotonic() >= next_wait_log:
+                progress(f"setup: still waiting for MySQL container {self.db_container}")
+                next_wait_log = time.monotonic() + 10
             time.sleep(1)
         raise BlackboxError("timed out waiting for MySQL container readiness")
 
@@ -303,6 +324,7 @@ class Drive9FuseTargetProvider:
         if mode == "existing":
             if not self.server_url:
                 raise BlackboxError("DRIVE9_BASE is required for --server-mode existing")
+            progress(f"setup: using existing drive9 server {self.server_url}")
             if not self.api_key:
                 self.provision_existing_server()
             return
@@ -314,6 +336,7 @@ class Drive9FuseTargetProvider:
         self.server_url = f"http://{listen_addr}"
         self.api_key = self.local_api_key
         log = self.logs_dir / "drive9-server-local.log"
+        progress(f"setup: starting drive9-server-local at {self.server_url}")
         env = dict(os.environ)
         env.update(
             {
@@ -331,6 +354,8 @@ class Drive9FuseTargetProvider:
             handle.write(f"# {utc_ts()} starting drive9-server-local at {self.server_url}\n".encode())
             self.server_proc = subprocess.Popen([str(self.server_bin)], cwd=str(REPO_ROOT), env=env, stdout=handle, stderr=handle, start_new_session=True)
         deadline = time.monotonic() + 120
+        progress(f"setup: waiting for drive9-server-local healthz at {self.server_url}/healthz")
+        next_wait_log = time.monotonic() + 10
         while time.monotonic() < deadline:
             if self.server_proc.poll() is not None:
                 tail = log_tail(log)
@@ -342,9 +367,13 @@ class Drive9FuseTargetProvider:
                 code, parsed, _ = http_json("GET", f"{self.server_url}/healthz", timeout=5)
                 if code == 200:
                     self.recorder.event({"type": "server", "mode": "local", "url": self.server_url, "health": parsed})
+                    progress(f"setup: drive9-server-local healthy at {self.server_url}")
                     return
             except Exception:
                 pass
+            if time.monotonic() >= next_wait_log:
+                progress(f"setup: still waiting for drive9-server-local healthz at {self.server_url}")
+                next_wait_log = time.monotonic() + 10
             time.sleep(1)
         tail = log_tail(log)
         detail = f"timed out waiting for drive9-server-local; see {log}"
@@ -353,6 +382,7 @@ class Drive9FuseTargetProvider:
         raise BlackboxError(detail)
 
     def provision_existing_server(self) -> None:
+        progress(f"setup: provisioning tenant on existing server {self.server_url}")
         code, parsed, raw = http_json("POST", f"{self.server_url}/v1/provision", timeout=60)
         if code not in (200, 202) or not isinstance(parsed, dict):
             raise BlackboxError(f"provision failed: code={code} body={raw}")
@@ -361,10 +391,16 @@ class Drive9FuseTargetProvider:
             raise BlackboxError(f"provision response missing api_key: {raw}")
         self.api_key = key
         deadline = time.monotonic() + int(os.environ.get("POLL_TIMEOUT_S", "120"))
+        progress("setup: waiting for provisioned tenant to become active")
+        next_wait_log = time.monotonic() + 10
         while time.monotonic() < deadline:
             status_code, status_body, _ = http_json("GET", f"{self.server_url}/v1/status", token=self.api_key, timeout=20)
             if status_code == 200 and isinstance(status_body, dict) and status_body.get("status") == "active":
+                progress("setup: provisioned tenant is active")
                 return
+            if time.monotonic() >= next_wait_log:
+                progress("setup: still waiting for provisioned tenant")
+                next_wait_log = time.monotonic() + 10
             time.sleep(float(os.environ.get("POLL_INTERVAL_S", "2")))
         raise BlackboxError("provisioned tenant did not become active")
 
@@ -436,15 +472,21 @@ class Drive9FuseTargetProvider:
         err = (log_dir / "mount.err").open("ab")
         out.write(f"\n# {utc_ts()} $ {' '.join(command)}\n".encode())
         out.flush()
+        progress(f"mount start: {case}/{cache_key} remote={remote_root} mountpoint={mountpoint} profile={profile}")
         proc = subprocess.Popen(command, cwd=str(REPO_ROOT), env=env, stdout=out, stderr=err, start_new_session=True)
         deadline = time.monotonic() + int(os.environ.get("MOUNT_READY_TIMEOUT_S", "30"))
+        next_wait_log = time.monotonic() + 10
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 raise BlackboxError(f"mount exited early for {case}; see {log_dir / 'mount.err'}")
             if self.is_mounted(mountpoint):
                 handle = MountHandle(mountpoint=mountpoint, remote_root=remote_root, proc=proc, log_dir=log_dir, cache_dir=cache_dir, local_root=local_root, profile=profile)
                 self.mounts.append(handle)
+                progress(f"mount ready: {case}/{cache_key} -> {mountpoint}")
                 return handle
+            if time.monotonic() >= next_wait_log:
+                progress(f"mount waiting: {case}/{cache_key} -> {mountpoint}")
+                next_wait_log = time.monotonic() + 10
             time.sleep(0.25)
         self.kill_process_group(proc)
         raise BlackboxError(f"mount did not become ready for {case}; see {log_dir / 'mount.err'}")
@@ -471,6 +513,7 @@ class Drive9FuseTargetProvider:
         no_auto_pack: bool = False,
     ) -> None:
         if self.is_mounted(handle.mountpoint):
+            progress(f"unmount start: {handle.mountpoint}")
             args = ["umount", "--timeout", os.environ.get("FUSE_UMOUNT_TIMEOUT", "60s")]
             if no_auto_pack:
                 args.append("--no-auto-pack")
@@ -483,9 +526,14 @@ class Drive9FuseTargetProvider:
             if result.code != 0 and (pack_paths or pack_archives):
                 raise BlackboxError(f"drive9 umount with pack arguments failed; see {result.stderr}")
         deadline = time.monotonic() + 20
+        next_wait_log = time.monotonic() + 10
         while time.monotonic() < deadline and self.is_mounted(handle.mountpoint):
+            if time.monotonic() >= next_wait_log:
+                progress(f"unmount waiting: {handle.mountpoint}")
+                next_wait_log = time.monotonic() + 10
             time.sleep(0.25)
         if force and self.is_mounted(handle.mountpoint):
+            progress(f"unmount force: {handle.mountpoint}")
             if platform.system() == "Linux":
                 for cmd in (["fusermount3", "-uz", str(handle.mountpoint)], ["fusermount", "-uz", str(handle.mountpoint)], ["umount", "-l", str(handle.mountpoint)]):
                     if shutil.which(cmd[0]):
@@ -495,8 +543,10 @@ class Drive9FuseTargetProvider:
             elif platform.system() == "Darwin":
                 subprocess.run(["umount", "-f", str(handle.mountpoint)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         self.kill_process_group(handle.proc)
+        progress(f"unmount done: {handle.mountpoint}")
 
     def cleanup(self) -> None:
+        progress("cleanup start")
         for handle in reversed(self.mounts):
             try:
                 self.unmount(handle, force=True, no_auto_pack=True)
@@ -504,11 +554,15 @@ class Drive9FuseTargetProvider:
                 pass
         self.mounts.clear()
         if self.server_proc is not None:
+            progress("cleanup: stopping drive9-server-local")
             self.kill_process_group(self.server_proc)
         if self.db_container and self.db_runtime and os.environ.get("DRIVE9_LOCAL_E2E_KEEP_DB", "0") != "1":
+            progress(f"cleanup: removing MySQL container {self.db_container}")
             subprocess.run([self.db_runtime, "rm", "-f", self.db_container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         if not self.args.keep_artifacts and not self.recorder.has_failures():
+            progress(f"cleanup: removing tmp artifacts {self.tmp_dir}")
             shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        progress("cleanup complete")
 
     def create_git_fixture(self, name: str = "git-fixture") -> Path:
         fixture = self.tmp_dir / name

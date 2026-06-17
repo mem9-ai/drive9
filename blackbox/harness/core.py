@@ -87,6 +87,12 @@ def env_flag(suffix: str, default: bool = False, suite: str | None = None) -> bo
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def progress(message: str) -> None:
+    if env_flag("QUIET", False):
+        return
+    print(f"blackbox: {message}", flush=True)
+
+
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:

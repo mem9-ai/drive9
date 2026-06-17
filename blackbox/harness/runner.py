@@ -29,6 +29,7 @@ from .core import (
     env_flag,
     env_value,
     file_ts,
+    progress,
     utc_ts,
     write_json,
 )
@@ -192,63 +193,79 @@ class BlackboxRunner:
         self.summary_printed = True
 
     def deps_only(self) -> int:
-        for module_id in self.selected:
+        progress(f"result dir: {self.result_dir}")
+        progress(f"preparing dependencies for {len(self.selected)} module(s)")
+        total = len(self.selected)
+        for idx, module_id in enumerate(self.selected, start=1):
             module = self.registry[module_id]
             start = time.monotonic()
+            progress(f"deps {idx}/{total} start: {module.id} ({module.category})")
             try:
                 module.ensure_dependencies(self.ctx)
-                self.recorder.record(ModuleRecord(module=module.id, category=module.category, status=PASS, seconds=time.monotonic() - start, classification="dependency prepared"))
+                record = ModuleRecord(module=module.id, category=module.category, status=PASS, seconds=time.monotonic() - start, classification="dependency prepared")
             except DependencyUnavailable as exc:
-                self.recorder.record(ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc)))
+                record = ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
             except ModuleSkip as exc:
-                self.recorder.record(ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc)))
+                record = ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
             except Exception as exc:
-                self.recorder.record(ModuleRecord(module=module.id, category=module.category, status=FAIL, seconds=time.monotonic() - start, classification="dependency failure", detail=f"{type(exc).__name__}: {exc}"))
+                record = ModuleRecord(module=module.id, category=module.category, status=FAIL, seconds=time.monotonic() - start, classification="dependency failure", detail=f"{type(exc).__name__}: {exc}")
+                self.recorder.record(record)
+                progress(f"deps {idx}/{total} {record.status}: {module.id} in {record.seconds:.1f}s ({record.classification})")
                 if self.args.fail_fast:
                     raise
+                continue
+            self.recorder.record(record)
+            progress(f"deps {idx}/{total} {record.status}: {module.id} in {record.seconds:.1f}s ({record.classification})")
         self.write_manifest()
         self.finish_report()
         return 1 if self.recorder.has_failures() else 0
 
-    def run_module(self, module_id: str) -> None:
+    def run_module(self, module_id: str, *, index: int, total: int) -> None:
         module = self.registry[module_id]
         start = time.monotonic()
+        progress(f"module {index}/{total} start: {module.id} ({module.category})")
         try:
+            progress(f"module {index}/{total} deps: {module.id}")
             module.ensure_dependencies(self.ctx)
+            progress(f"module {index}/{total} run: {module.id}")
             metrics = module.run(self.ctx) or {}
-            self.recorder.record(
-                ModuleRecord(
-                    module=module.id,
-                    category=module.category,
-                    status=PASS,
-                    seconds=time.monotonic() - start,
-                    classification="passed",
-                    metrics=metrics,
-                )
+            record = ModuleRecord(
+                module=module.id,
+                category=module.category,
+                status=PASS,
+                seconds=time.monotonic() - start,
+                classification="passed",
+                metrics=metrics,
             )
         except DependencyUnavailable as exc:
-            self.recorder.record(ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc)))
+            record = ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
         except ModuleSkip as exc:
-            self.recorder.record(ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc)))
+            record = ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
         except ModuleXFail as exc:
-            self.recorder.record(ModuleRecord(module=module.id, category=module.category, status=XFAIL, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc)))
+            record = ModuleRecord(module=module.id, category=module.category, status=XFAIL, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
         except BlackboxError as exc:
-            self.recorder.record(ModuleRecord(module=module.id, category=module.category, status=FAIL, seconds=time.monotonic() - start, classification="product regression", detail=str(exc)))
+            record = ModuleRecord(module=module.id, category=module.category, status=FAIL, seconds=time.monotonic() - start, classification="product regression", detail=str(exc))
+            self.recorder.record(record)
+            progress(f"module {index}/{total} {record.status}: {module.id} in {record.seconds:.1f}s ({record.classification})")
             if self.args.fail_fast:
                 raise
+            return
         except Exception as exc:
-            self.recorder.record(
-                ModuleRecord(
-                    module=module.id,
-                    category=module.category,
-                    status=FAIL,
-                    seconds=time.monotonic() - start,
-                    classification="infra failure",
-                    detail=f"{type(exc).__name__}: {exc}",
-                )
+            record = ModuleRecord(
+                module=module.id,
+                category=module.category,
+                status=FAIL,
+                seconds=time.monotonic() - start,
+                classification="infra failure",
+                detail=f"{type(exc).__name__}: {exc}",
             )
+            self.recorder.record(record)
+            progress(f"module {index}/{total} {record.status}: {module.id} in {record.seconds:.1f}s ({record.classification})")
             if self.args.fail_fast:
                 raise
+            return
+        self.recorder.record(record)
+        progress(f"module {index}/{total} {record.status}: {module.id} in {record.seconds:.1f}s ({record.classification})")
 
     def run(self) -> int:
         self.result_dir.mkdir(parents=True, exist_ok=True)
@@ -256,11 +273,15 @@ class BlackboxRunner:
             return self.list_modules()
         if self.args.deps_only:
             return self.deps_only()
+        progress(f"result dir: {self.result_dir}")
+        progress(f"selected modules: {len(self.selected)}")
+        progress("checking prerequisites")
         strict = bool(self.args.strict_prereqs)
         prereq_records = self.provider.check_prerequisites(self.ctx)
         if prereq_records:
             for record in prereq_records:
                 self.recorder.record(record)
+                progress(f"prerequisite {record.status}: {record.module} ({record.detail})")
             self.write_manifest()
             self.finish_report()
             if strict:
@@ -269,6 +290,7 @@ class BlackboxRunner:
         try:
             setup_start = time.monotonic()
             try:
+                progress("setup start")
                 self.provider.setup(self.ctx)
             except BlackboxError as exc:
                 detail = str(exc)
@@ -286,12 +308,17 @@ class BlackboxRunner:
                 print(f"blackbox setup failed: {detail}", file=sys.stderr, flush=True)
                 self.finish_report()
                 return 1
+            progress(f"setup complete in {time.monotonic() - setup_start:.1f}s")
             self.write_manifest()
-            for module_id in self.selected:
-                self.run_module(module_id)
+            total = len(self.selected)
+            for idx, module_id in enumerate(self.selected, start=1):
+                self.run_module(module_id, index=idx, total=total)
             self.write_manifest()
             self.finish_report()
             return 1 if self.recorder.has_failures() else 0
+        except KeyboardInterrupt:
+            progress("interrupted; cleaning up")
+            raise
         finally:
             self.finish_report()
             self.provider.cleanup(self.ctx)

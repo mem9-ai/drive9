@@ -44,6 +44,10 @@ to run every module in a suite or a caller-selected subset. Scheduling,
 frequency, and report publication belong to the caller, for example a GitHub
 Actions workflow, cron job, or release gate.
 
+Runs print setup, dependency, module, command, mount, wait, and cleanup progress
+to stdout by default. Set `BLACKBOX_QUIET=1` to suppress progress chatter while
+keeping the final summary and report path.
+
 ## Adding A Suite
 
 Add a new suite directory under `blackbox/suites/<suite>/` with at least:
