@@ -32,8 +32,11 @@ class GitOfficialFunctional(BaseModule):
             trash_root = handle.mountpoint / "git-test-trash"
             trash_root.mkdir()
             env = ctx.target.base_env()
-            env["GIT_TEST_INSTALLED"] = shutil.which("git") or "git"
+            env["GIT_TEST_INSTALLED"] = str(source / "bin-wrappers")
             env["GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME"] = "main"
+            output_dir = ctx.artifact_dir(self.id) / "test-output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            env["TEST_OUTPUT_DIRECTORY"] = str(output_dir)
             test_paths = [str(source / "t" / test) for test in tests]
             result = ctx.target.run_cmd(
                 "git-official-functional",

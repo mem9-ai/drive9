@@ -57,14 +57,23 @@ class FuseDependencyManager(DependencyManager):
         if os.environ.get("GIT_TEST_SOURCE_DIR"):
             path = Path(os.environ["GIT_TEST_SOURCE_DIR"]).expanduser().resolve()
             if (path / "t").is_dir():
+                self.ensure_git_test_build(path)
                 return path
         ref = env_value("GIT_TEST_REF", "v2.46.2")
         root_dir = self.ensure_git_clone("git", "https://github.com/git/git.git", ref)
+        self.ensure_git_test_build(root_dir)
         write_json(
             root_dir / ".drive9-blackbox-dependency.json",
             {"name": "git", "source": "https://github.com/git/git", "ref": ref, "license": "GPL-2.0-only"},
         )
         return root_dir
+
+    def ensure_git_test_build(self, root_dir: Path) -> None:
+        if (root_dir / "GIT-BUILD-OPTIONS").exists() and (root_dir / "bin-wrappers" / "git").exists() and (root_dir / "t" / "helper" / "test-tool").exists():
+            return
+        if not self.auto_fetch:
+            raise DependencyUnavailable("Git source is not built and auto-fetch is disabled")
+        self.run("git-build", ["make", "-j2"], cwd=root_dir, timeout=int(os.environ.get("GIT_TEST_BUILD_TIMEOUT_S", "1800")))
 
     def ensure_ltp(self) -> Path:
         if os.environ.get("LTP_ROOT"):

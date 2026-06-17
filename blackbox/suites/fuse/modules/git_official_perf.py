@@ -29,13 +29,19 @@ class GitOfficialPerf(BaseModule):
         try:
             root = handle.mountpoint / "git-perf"
             root.mkdir()
-            env = ctx.target.base_env()
-            env["GIT_TEST_INSTALLED"] = shutil.which("git") or "git"
             values: list[float] = []
             for run in range(ctx.runs):
+                run_root = root / f"run-{run}"
+                run_root.mkdir()
+                env = ctx.target.base_env()
+                env["GIT_TEST_INSTALLED"] = str(source / "bin-wrappers")
+                env["GIT_TEST_OPTS"] = " ".join(part for part in [env.get("GIT_TEST_OPTS", ""), f"--root={run_root}"] if part)
+                output_dir = ctx.artifact_dir(self.id) / f"run-{run}"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                env["TEST_OUTPUT_DIRECTORY"] = str(output_dir)
                 seconds = timeit(
                     lambda: ctx.target.capture(
-                        [str(perf_run), f"--root={root / ('run-' + str(run))}", *tests],
+                        [str(perf_run), *tests],
                         cwd=source / "t" / "perf",
                         timeout=int(os.environ.get("GIT_PERF_TIMEOUT_S", str(self.timeout))),
                         env=env,

@@ -114,11 +114,11 @@ class Drive9WorkflowPerf(Drive9WorkflowBase):
             blobless_values.append(timeit(lambda: ctx.target.drive9_capture(["git", "clone", "--fast", "--blobless", "--hydrate=sync", repo["url"], str(blobless_target)], timeout=timeout)))
             if shutil.which("rg"):
                 rg_values.append(timeit(lambda: ctx.target.capture(["rg", repo.get("rg_pattern", "TODO|FIXME"), str(blobless_target)], timeout=300, env=env)))
-            edit_values.append(timeit(lambda: self.edit_commit(ctx, blobless_target, env)))
             build_cmds = repo.get("build", [])
             if build_cmds and env_flag("ENABLE_REPO_BUILD", True, ctx.suite):
                 build_dir = blobless_target / repo.get("build_dir", ".")
                 build_values.append(timeit(lambda: [ctx.target.capture(["bash", "-lc", cmd], cwd=build_dir, timeout=timeout, env=env) for cmd in build_cmds]))
+            edit_values.append(timeit(lambda: self.edit_commit(ctx, blobless_target, env)))
 
         ctx.perf_values(f"drive9.workflow.perf.repo.{repo_id}.native_git_clone", native_values, "seconds")
         ctx.perf_values(f"drive9.workflow.perf.repo.{repo_id}.fuse_git_clone", fuse_values, "seconds")
