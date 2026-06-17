@@ -267,7 +267,25 @@ class BlackboxRunner:
                 return 1
             return 0
         try:
-            self.provider.setup(self.ctx)
+            setup_start = time.monotonic()
+            try:
+                self.provider.setup(self.ctx)
+            except BlackboxError as exc:
+                detail = str(exc)
+                self.recorder.record(
+                    ModuleRecord(
+                        module="suite.setup",
+                        category="setup",
+                        status=FAIL,
+                        seconds=time.monotonic() - setup_start,
+                        classification="infra failure",
+                        detail=" ".join(detail.split()),
+                    )
+                )
+                self.write_manifest()
+                print(f"blackbox setup failed: {detail}", file=sys.stderr, flush=True)
+                self.finish_report()
+                return 1
             self.write_manifest()
             for module_id in self.selected:
                 self.run_module(module_id)

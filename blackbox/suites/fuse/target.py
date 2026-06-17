@@ -63,6 +63,35 @@ def http_json(method: str, url: str, token: str = "", body: dict[str, Any] | Non
         return int(exc.code), parsed, text
 
 
+def mysql_tcp_handshake_ready(host: str, port: int, timeout: float = 3.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            header = sock.recv(4)
+            if len(header) != 4:
+                return False
+            payload_len = header[0] | (header[1] << 8) | (header[2] << 16)
+            if payload_len <= 0:
+                return False
+            payload = b""
+            wanted = min(payload_len, 128)
+            while len(payload) < wanted:
+                chunk = sock.recv(wanted - len(payload))
+                if not chunk:
+                    break
+                payload += chunk
+            return bool(payload and payload[0] == 10)
+    except OSError:
+        return False
+
+
+def log_tail(path: Path, *, max_chars: int = 1600) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()[-max_chars:]
+    except OSError:
+        return ""
+
+
 class Drive9FuseTargetProvider:
     def __init__(self, args: Any, result_dir: Path, recorder: Any, *, suite: str, session: str) -> None:
         self.args = args
@@ -253,7 +282,17 @@ class Drive9FuseTargetProvider:
                     check=False,
                 )
                 if ping.returncode == 0:
-                    return f"root:{password}@tcp(127.0.0.1:{port})/{db_name}?parseTime=true"
+                    host_ready_deadline = time.monotonic() + int(os.environ.get("DRIVE9_LOCAL_E2E_DB_HOST_READY_TIMEOUT_S", "60"))
+                    stable = 0
+                    while time.monotonic() < host_ready_deadline:
+                        if mysql_tcp_handshake_ready("127.0.0.1", int(port)):
+                            stable += 1
+                            if stable >= 2:
+                                time.sleep(float(os.environ.get("DRIVE9_LOCAL_E2E_DB_READY_GRACE_S", "1")))
+                                return f"root:{password}@tcp(127.0.0.1:{port})/{db_name}?parseTime=true"
+                        else:
+                            stable = 0
+                        time.sleep(0.5)
             time.sleep(1)
         raise BlackboxError("timed out waiting for MySQL container readiness")
 
@@ -294,7 +333,11 @@ class Drive9FuseTargetProvider:
         deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             if self.server_proc.poll() is not None:
-                raise BlackboxError(f"drive9-server-local exited early; see {log}")
+                tail = log_tail(log)
+                detail = f"drive9-server-local exited early; see {log}"
+                if tail:
+                    detail += f"\nlast log lines:\n{tail}"
+                raise BlackboxError(detail)
             try:
                 code, parsed, _ = http_json("GET", f"{self.server_url}/healthz", timeout=5)
                 if code == 200:
@@ -303,7 +346,11 @@ class Drive9FuseTargetProvider:
             except Exception:
                 pass
             time.sleep(1)
-        raise BlackboxError(f"timed out waiting for drive9-server-local; see {log}")
+        tail = log_tail(log)
+        detail = f"timed out waiting for drive9-server-local; see {log}"
+        if tail:
+            detail += f"\nlast log lines:\n{tail}"
+        raise BlackboxError(detail)
 
     def provision_existing_server(self) -> None:
         code, parsed, raw = http_json("POST", f"{self.server_url}/v1/provision", timeout=60)
