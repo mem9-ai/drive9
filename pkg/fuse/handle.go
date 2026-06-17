@@ -146,6 +146,13 @@ func (ht *HandleTable[T]) Delete(fh uint64) {
 	delete(ht.table, fh)
 }
 
+// Len returns the number of currently allocated handles.
+func (ht *HandleTable[T]) Len() int {
+	ht.mu.RLock()
+	defer ht.mu.RUnlock()
+	return len(ht.table)
+}
+
 // ForEach iterates over every handle in the table, calling fn for each one.
 // The callback is invoked while the table lock is held, so fn must not call
 // back into the HandleTable (doing so would deadlock).

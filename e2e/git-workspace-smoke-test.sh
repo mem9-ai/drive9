@@ -266,7 +266,18 @@ start_mount() {
     echo "local_root=$local_root"
   } >>"$MOUNT_LOG"
 
-  local args=(mount --foreground --mode=fuse --profile=coding-agent --local-root "$local_root" --durability=interactive --perf-counters)
+  local perf_dir="${mount_log%.log}.perf"
+  local args=(
+    mount --foreground --mode=fuse --profile=coding-agent --local-root "$local_root"
+    --durability=interactive
+    --perf-dir "$perf_dir"
+    --perf-interval 1h
+    --perf-cpu-duration 1ms
+    --perf-cpu-interval 1h
+    --perf-heap-interval 1h
+    --perf-max-sample-files 1
+    --perf-max-profile-files 1
+  )
   if [ "$GIT_WORKSPACE_ALLOW_OTHER" = "1" ]; then
     args+=(--allow-other)
   fi

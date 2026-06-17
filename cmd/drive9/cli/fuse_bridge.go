@@ -68,6 +68,17 @@ type mountFuseOptions struct {
 	ReadOnly                bool
 	Debug                   bool
 	PerfCounters            bool
+	ProfileCPUDuration      time.Duration
+	ProfileCPUInterval      time.Duration
+	ProfileHeap             string
+	ProfileDir              string
+	ProfileHeapInterval     time.Duration
+	PprofAddr               string
+	PerfSamplesPath         string
+	PerfSampleInterval      time.Duration
+	PerfMaxSamples          int
+	PerfMaxSampleFiles      int
+	PerfMaxProfileFiles     int
 }
 
 type vaultMountOptions struct {
