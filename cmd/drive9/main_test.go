@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -242,6 +243,45 @@ func TestDispatchHelpCommandUsage(t *testing.T) {
 	}
 }
 
+func TestDispatchHelpCommandPlainShowsClassicUsage(t *testing.T) {
+	stdout, stderr, exitCodes := captureDispatchOutput(t, "help", []string{"--plain"})
+
+	if len(exitCodes) != 1 || exitCodes[0] != 0 {
+		t.Fatalf("exit codes = %v, want [0]", exitCodes)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty stdout", stdout)
+	}
+	for _, want := range []string{
+		"usage: drive9 <command> [arguments]",
+		"help [--plain] [--no-pager] [--color=auto|always|never]",
+		"-h, -help, --help",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("stderr = %q, want it to contain %q", stderr, want)
+		}
+	}
+}
+
+func TestDispatchHelpCommandUnknownOptionFails(t *testing.T) {
+	stdout, stderr, exitCodes := captureDispatchOutput(t, "help", []string{"--bogus"})
+
+	if len(exitCodes) != 1 || exitCodes[0] != 1 {
+		t.Fatalf("exit codes = %v, want [1]", exitCodes)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty stdout", stdout)
+	}
+	for _, want := range []string{
+		`help: unknown help option "--bogus"`,
+		"usage: drive9 help [--plain] [--no-pager] [--color=auto|always|never]",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("stderr = %q, want it to contain %q", stderr, want)
+		}
+	}
+}
+
 func TestRenderDrive9VisualHelpColor(t *testing.T) {
 	out := renderDrive9VisualHelp(true)
 	if !strings.Contains(out, "\x1b[") {
@@ -252,6 +292,66 @@ func TestRenderDrive9VisualHelpColor(t *testing.T) {
 			t.Fatalf("rendered help missing %q:\n%s", want, out)
 		}
 	}
+}
+
+func TestIsPagerClosedPipe(t *testing.T) {
+	for _, err := range []error{
+		io.ErrClosedPipe,
+		&os.PathError{Op: "write", Path: "less", Err: syscall.EPIPE},
+	} {
+		if !isPagerClosedPipe(err) {
+			t.Fatalf("isPagerClosedPipe(%v) = false, want true", err)
+		}
+	}
+}
+
+func captureDispatchOutput(t *testing.T, cmd string, args []string) (string, string, []int) {
+	t.Helper()
+
+	origExit := exitFunc
+	origStdout := os.Stdout
+	origStderr := os.Stderr
+	origStop := cpuProfileStop
+	t.Cleanup(func() {
+		exitFunc = origExit
+		os.Stdout = origStdout
+		os.Stderr = origStderr
+		cpuProfileStop = origStop
+	})
+	cpuProfileStop = func() {}
+
+	var exitCodes []int
+	exitFunc = func(code int) { exitCodes = append(exitCodes, code) }
+
+	stdoutR, stdoutW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	os.Stdout = stdoutW
+	os.Stderr = stderrW
+
+	stdoutDone := make(chan string, 1)
+	stderrDone := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, stdoutR)
+		stdoutDone <- buf.String()
+	}()
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, stderrR)
+		stderrDone <- buf.String()
+	}()
+
+	dispatch(cmd, args)
+
+	_ = stdoutW.Close()
+	_ = stderrW.Close()
+	return <-stdoutDone, <-stderrDone, exitCodes
 }
 
 func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {

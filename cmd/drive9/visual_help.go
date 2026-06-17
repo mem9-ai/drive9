@@ -1,11 +1,13 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"unicode/utf8"
 
 	"golang.org/x/term"
@@ -122,10 +124,9 @@ func parseVisualHelpOptions(args []string) (visualHelpOptions, error) {
 }
 
 func visualHelpUsage() string {
-	return `usage: drive9 help [--tree|-t] [--plain] [--no-pager] [--color=auto|always|never]
+	return `usage: drive9 help [--plain] [--no-pager] [--color=auto|always|never]
 
 flags:
-  --tree, -t       show the visual tree help (default)
   --plain          show the classic plain usage block
   --no-pager       print directly instead of opening less
   --color MODE     color mode: auto, always, or never`
@@ -157,7 +158,7 @@ func shouldPageVisualHelp(rendered string, isTerminal bool) bool {
 	}
 	width, height, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil || width <= 0 || height <= 0 {
-		return true
+		return false
 	}
 	lines := strings.Split(strings.TrimSuffix(rendered, "\n"), "\n")
 	if len(lines) > height-1 {
@@ -186,13 +187,17 @@ func pageVisualHelp(rendered string) error {
 	_, writeErr := io.WriteString(in, rendered)
 	closeErr := in.Close()
 	waitErr := cmd.Wait()
-	if writeErr != nil {
+	if writeErr != nil && !isPagerClosedPipe(writeErr) {
 		return writeErr
 	}
-	if closeErr != nil {
+	if closeErr != nil && !isPagerClosedPipe(closeErr) {
 		return closeErr
 	}
 	return waitErr
+}
+
+func isPagerClosedPipe(err error) bool {
+	return errors.Is(err, io.ErrClosedPipe) || errors.Is(err, syscall.EPIPE)
 }
 
 func printableLen(s string) int {

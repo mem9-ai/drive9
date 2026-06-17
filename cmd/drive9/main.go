@@ -433,7 +433,7 @@ func usage(code int) {
 			"  umount <mountpoint>    unmount a drive9 mount\n"+
 			"  doctor fuse            diagnose local FUSE prerequisites\n"+
 			"  update [--check]       update drive9 CLI in place\n"+
-			"  help [--tree|-t] [--no-pager] [--color=auto|always|never]\n"+
+			"  help [--plain] [--no-pager] [--color=auto|always|never]\n"+
 			"                         show visual tree help\n\n"+
 			"global:\n"+
 			"  -h, -help, --help      show this classic usage\n"+
