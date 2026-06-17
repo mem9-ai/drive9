@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import platform
 import shutil
 from pathlib import Path
@@ -19,6 +20,11 @@ FUSE_TOOLS = (
     "vdbench",
 )
 
+DARWIN_FUSE_HELPERS = (
+    ("mount_macfuse", Path("/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"), "macFUSE"),
+    ("mount_fusefs", Path("/Library/Filesystems/fuse-t.fs/Contents/Resources/mount_fusefs"), "FUSE-T"),
+)
+
 
 def detect_capabilities() -> dict[str, Any]:
     caps = detect_host_capabilities(extra_tools=FUSE_TOOLS)
@@ -34,9 +40,11 @@ def detect_fuse(system: str) -> dict[str, str | bool]:
             return {"ok": False, "detail": "fusermount3/fusermount is missing"}
         return {"ok": True, "detail": "Linux FUSE prerequisites are present"}
     if system == "Darwin":
-        if shutil.which("mount_macfuse"):
-            return {"ok": True, "detail": "macFUSE mount helper is present"}
-        if shutil.which("mount_fusefs"):
-            return {"ok": True, "detail": "FUSE-T mount helper is present"}
+        for name, fallback, label in DARWIN_FUSE_HELPERS:
+            helper = shutil.which(name)
+            if helper:
+                return {"ok": True, "detail": f"{label} mount helper is present: {helper}"}
+            if fallback.exists() and os.access(fallback, os.X_OK):
+                return {"ok": True, "detail": f"{label} mount helper is present: {fallback}"}
         return {"ok": False, "detail": "macFUSE/FUSE-T mount helper is missing"}
     return {"ok": False, "detail": f"unsupported OS for FUSE suite: {system}"}
