@@ -11506,8 +11506,25 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 
 	// Path 2: No streaming uploader or small file — materialize all data for upload.
+	//
+	// Snapshot the dirty buffer into an immutable copy before releasing fh.mu.
+	// bytesView() may return a mutable slice backed by the WriteBuffer's
+	// internal smallFileData; concurrent Write() calls while the lock is
+	// released would corrupt the upload payload. Path 1a/1b already follow
+	// this pattern (copy + unlock before network).
 	data := fh.Dirty.bytesView()
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	data = nil // prevent accidental use of mutable view after this point
+
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
+	remotePath := fs.remotePath(fh.Path)
+	handlePath := fh.Path
+	handleIsNew := fh.IsNew
+	handleIno := fh.Ino
+	handleDirtySeq := fh.DirtySeq
+	handleOrigSize := fh.OrigSize
+	handleDirtyPartSize := fh.Dirty.PartSize()
 	var committedRev int64
 
 	// Use the negotiated server threshold (not the heuristic-only inline
@@ -11519,32 +11536,14 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// rejects total_size=0.
 	threshold := fs.negotiatedInlineThreshold()
 	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
-	if useDirectPUT {
-		if size == 0 && fh.IsNew {
-			phase = "empty-create"
-			writeStart := time.Now()
-			fs.debugf("flushHandle empty create start path=%s expected_rev=%d", fh.Path, expectedRevision)
-			committedRev, err = fs.client.CreateFileCtx(ctx, fs.remotePath(fh.Path))
-			if isCreateActionUnsupportedErr(err) {
-				fs.debugf("flushHandle empty create unsupported path=%s fallback=small-write err=%v", fh.Path, err)
-				committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
-			}
-			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
-			fs.debugDurationf(writeStart, 0, "flushHandle empty create done path=%s committed_rev=%d err=%v", fh.Path, committedRev, err)
-		} else {
-			// Small file: direct PUT with revision return for freshness seeding.
-			phase = "small-write"
-			writeStart := time.Now()
-			fs.debugf("flushHandle small write start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
-			committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
-			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
-			fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
-		}
-	} else if threshold > 0 && fh.OrigSize >= threshold {
-		phase = "patch-file"
-		dirtyParts := fh.Dirty.DirtyPartNumbers()
+
+	// Prepare patch snapshots while we still hold the lock.
+	var dirtyParts []int
+	var partSnapshots map[int][]byte
+	if !useDirectPUT && threshold > 0 && handleOrigSize >= threshold {
+		dirtyParts = fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {
-			partSnapshots := make(map[int][]byte, len(dirtyParts))
+			partSnapshots = make(map[int][]byte, len(dirtyParts))
 			for _, pn := range dirtyParts {
 				src := fh.Dirty.PartData(pn)
 				if src != nil {
@@ -11553,11 +11552,47 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 					partSnapshots[pn] = cp
 				}
 			}
+		}
+	}
+
+	// Release fh.mu before network calls — same deadlock avoidance as
+	// Path 1a/1b. Without this unlock, concurrent FUSE Read() on the same
+	// handle blocks for the entire HTTP upload duration, causing kernel
+	// read timeouts (especially with FOPEN_DIRECT_IO where every pread is
+	// a FUSE round-trip, e.g. SQLite WAL workloads — see issue #579).
+	uploadStart := time.Now()
+	fs.debugf("flushHandle path2 unlock before upload path=%s size=%d phase_hint=%s expected_rev=%d", handlePath, size, phase, expectedRevision)
+	fh.Unlock()
+
+	if useDirectPUT {
+		if size == 0 && handleIsNew {
+			phase = "empty-create"
+			writeStart := time.Now()
+			fs.debugf("flushHandle empty create start path=%s expected_rev=%d", handlePath, expectedRevision)
+			committedRev, err = fs.client.CreateFileCtx(ctx, remotePath)
+			if isCreateActionUnsupportedErr(err) {
+				fs.debugf("flushHandle empty create unsupported path=%s fallback=small-write err=%v", handlePath, err)
+				committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, remotePath, dataCopy, expectedRevision)
+			}
+			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
+			fs.debugDurationf(writeStart, 0, "flushHandle empty create done path=%s committed_rev=%d err=%v", handlePath, committedRev, err)
+		} else {
+			// Small file: direct PUT with revision return for freshness seeding.
+			phase = "small-write"
+			writeStart := time.Now()
+			fs.debugf("flushHandle small write start path=%s size=%d expected_rev=%d", handlePath, size, expectedRevision)
+			committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, remotePath, dataCopy, expectedRevision)
+			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(dataCopy)))
+			fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", handlePath, size, committedRev, err)
+		}
+	} else if threshold > 0 && handleOrigSize >= threshold {
+		phase = "patch-file"
+		if len(dirtyParts) > 0 {
 			patchStart := time.Now()
-			fs.debugf("flushHandle patch start path=%s size=%d dirty_parts=%d expected_rev=%d", fh.Path, size, len(dirtyParts), expectedRevision)
+			fs.debugf("flushHandle patch start path=%s size=%d dirty_parts=%d expected_rev=%d", handlePath, size, len(dirtyParts), expectedRevision)
 			err = fs.client.PatchFile(
 				ctx,
-				fs.remotePath(fh.Path),
+				remotePath,
 				size,
 				dirtyParts,
 				func(partNumber int, partSize int64, origData []byte) ([]byte, error) {
@@ -11567,7 +11602,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 					return origData, nil
 				},
 				nil,
-				client.WithPartSize(fh.Dirty.PartSize()),
+				client.WithPartSize(handleDirtyPartSize),
 				client.WithExpectedRevision(expectedRevision),
 			)
 			var patchBytes uint64
@@ -11575,55 +11610,63 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 				patchBytes = uint64(size)
 			}
 			fs.perfRecordRemote(perfRemoteWrite, patchStart, err, patchBytes)
-			fs.debugDurationf(patchStart, 0, "flushHandle patch done path=%s size=%d dirty_parts=%d err=%v", fh.Path, size, len(dirtyParts), err)
+			fs.debugDurationf(patchStart, 0, "flushHandle patch done path=%s size=%d dirty_parts=%d err=%v", handlePath, size, len(dirtyParts), err)
 		}
 		// If no dirty parts, nothing changed — skip upload.
 	} else {
 		// New large file or small-to-large growth: full upload via multipart.
 		phase = "write-stream"
 		writeStart := time.Now()
-		fs.debugf("flushHandle write stream start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
+		fs.debugf("flushHandle write stream start path=%s size=%d expected_rev=%d", handlePath, size, expectedRevision)
 		err = fs.client.WriteStreamConditional(
 			ctx,
-			fs.remotePath(fh.Path),
-			bytes.NewReader(data),
+			remotePath,
+			bytes.NewReader(dataCopy),
 			size,
 			nil,
 			expectedRevision,
 		)
-		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
-		fs.debugDurationf(writeStart, 0, "flushHandle write stream done path=%s size=%d err=%v", fh.Path, size, err)
+		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(dataCopy)))
+		fs.debugDurationf(writeStart, 0, "flushHandle write stream done path=%s size=%d err=%v", handlePath, size, err)
 	}
+
+	// Re-acquire fh.mu after network call completes.
+	fh.Lock()
+	fs.debugDurationf(uploadStart, 0, "flushHandle path2 relock after upload path=%s size=%d err=%v", handlePath, size, err)
+
 	if err != nil {
-		log.Printf("flush upload failed for %s: %v", fh.Path, err)
+		log.Printf("flush upload failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)
 	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-		log.Printf("flush pending chmod failed for %s: %v", fh.Path, err)
+		log.Printf("flush pending chmod failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)
 	}
 
 	sidecarRevision := sqliteCommittedRevision(committedRev, expectedRevision)
 	sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
 	fh.Dirty.ClearDirty()
-	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
+	fs.clearDirtySize(fh.Ino, handleDirtySeq)
 	fh.DirtySeq = 0
 	if committedRev > 0 {
 		clearReadTargetForLockedHandle(fh)
-		fs.clearReadTargetsForPathExcept(fh.Path, fh)
-		fs.readCache.Put(fh.Path, data, committedRev)
+		fs.clearReadTargetsForPathExcept(handlePath, fh)
+		// Use dataCopy (immutable snapshot) for read cache seeding —
+		// the WriteBuffer may have been mutated by concurrent writes
+		// while the lock was released.
+		fs.readCache.Put(handlePath, dataCopy, committedRev)
 		fs.markHandleRemoteCommittedLocked(fh, committedRev)
 	} else if sidecarCached {
 		clearReadTargetForLockedHandle(fh)
-		fs.clearReadTargetsForPathExcept(fh.Path, fh)
+		fs.clearReadTargetsForPathExcept(handlePath, fh)
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 	} else {
 		clearReadTargetForLockedHandle(fh)
-		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		fs.invalidateReadCacheAndTargetsExcept(handlePath, fh)
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 	}
-	fs.inodes.UpdateSize(fh.Ino, size)
-	fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
+	fs.inodes.UpdateSize(handleIno, size)
+	fs.cacheFileForPath(handlePath, size, time.Now(), committedRev)
 	// Local flush — kernel receives the Flush reply with status.
 	// No notifyInode/notifyEntry needed; userspace caches are updated
 	// above and kernel will refresh attrs on next getattr/lookup.

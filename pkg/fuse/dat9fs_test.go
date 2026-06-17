@@ -13795,6 +13795,116 @@ func TestFlushHandle_SmallFile_SeedsReadCache(t *testing.T) {
 	}
 }
 
+// TestFlushHandle_Path2_SnapshotIsolation verifies that Path 2 of flushHandle
+// creates an immutable snapshot of dirty data before releasing fh.mu, so that
+// concurrent writes to the same handle during the HTTP upload do not pollute
+// the already-committed upload payload.
+//
+// Regression test for issue #579: without the snapshot+unlock fix, bytesView()
+// returned a mutable slice into WriteBuffer.smallFileData and the lock was
+// held for the entire HTTP round-trip, blocking FUSE Read() on the same handle.
+func TestFlushHandle_Path2_SnapshotIsolation(t *testing.T) {
+	original := []byte("ORIGINAL-PAYLOAD-BEFORE-FLUSH")
+
+	// uploadStarted signals the test goroutine that the HTTP handler has
+	// received the upload body — the lock has been released and a concurrent
+	// write can proceed.
+	uploadStarted := make(chan struct{})
+	// uploadResume lets the test control when the HTTP handler returns,
+	// keeping the upload in-flight while the concurrent write happens.
+	uploadResume := make(chan struct{})
+
+	var uploadedBody atomic.Value // stores []byte
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read PUT body: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			uploadedBody.Store(body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 10})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/snapshot-test.txt", false, int64(len(original)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.inodes.UpdateSize(ino, int64(len(original)))
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/snapshot-test.txt",
+		Dirty:   NewWriteBuffer("/snapshot-test.txt", maxPreloadSize, 0),
+		BaseRev: 1,
+	}
+	if _, err := fh.Dirty.Write(0, original); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+
+	// Start flush in a goroutine — it will release fh.mu during upload.
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	// Wait for the HTTP handler to receive the upload (lock released).
+	<-uploadStarted
+
+	// Mutate the WriteBuffer while upload is in-flight. If the fix is
+	// correct, the upload uses the pre-unlock snapshot and this write
+	// does not affect the committed data.
+	mutated := []byte("MUTATED-WHILE-UPLOAD-INFLIGHT!")
+	fh.Lock()
+	if _, err := fh.Dirty.Write(0, mutated); err != nil {
+		t.Fatal(err)
+	}
+	fh.Unlock()
+
+	// Let the upload complete.
+	close(uploadResume)
+
+	st := <-flushDone
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+
+	// Verify the uploaded body matches the ORIGINAL snapshot, not the
+	// mutated data written while the upload was in-flight.
+	got, ok := uploadedBody.Load().([]byte)
+	if !ok {
+		t.Fatal("no upload body recorded")
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("uploaded body = %q, want %q (concurrent write leaked into upload)", got, original)
+	}
+
+	// Verify read cache was seeded with the snapshot, not the mutated buffer.
+	cached, ok := fs.readCache.Get("/snapshot-test.txt", 10)
+	if !ok {
+		t.Fatal("readCache miss after flush")
+	}
+	if !bytes.Equal(cached, original) {
+		t.Fatalf("readCache content = %q, want %q", cached, original)
+	}
+}
+
 func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
