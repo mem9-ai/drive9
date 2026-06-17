@@ -13867,14 +13867,18 @@ func TestFlushHandle_Path2_SnapshotIsolation(t *testing.T) {
 	// Wait for the HTTP handler to receive the upload (lock released).
 	<-uploadStarted
 
-	// Mutate the WriteBuffer while upload is in-flight. If the fix is
-	// correct, the upload uses the pre-unlock snapshot and this write
-	// does not affect the committed data.
+	// Mutate the WriteBuffer while upload is in-flight, simulating what
+	// a real fs.Write() would do: write data + advance DirtySeq. If the
+	// fix is correct, the upload uses the pre-unlock snapshot and this
+	// write does not affect the committed data. The generation guard must
+	// also preserve the dirty state so the new data is flushed next time.
 	mutated := []byte("MUTATED-WHILE-UPLOAD-INFLIGHT!")
 	fh.Lock()
 	if _, err := fh.Dirty.Write(0, mutated); err != nil {
 		t.Fatal(err)
 	}
+	// Advance DirtySeq like fs.Write() does via markDirtySize.
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
 	fh.Unlock()
 
 	// Let the upload complete.
@@ -13902,6 +13906,20 @@ func TestFlushHandle_Path2_SnapshotIsolation(t *testing.T) {
 	}
 	if !bytes.Equal(cached, original) {
 		t.Fatalf("readCache content = %q, want %q", cached, original)
+	}
+
+	// Verify the concurrent write kept the handle dirty (generation guard).
+	// If ClearDirty ran unconditionally, DirtySeq would be 0 and the new
+	// data would be silently lost on the next flush.
+	fh.Lock()
+	dirtySeqAfter := fh.DirtySeq
+	hasDirty := fh.Dirty.HasDirtyParts()
+	fh.Unlock()
+	if dirtySeqAfter == 0 {
+		t.Fatal("DirtySeq = 0 after flush with concurrent write — new write data would be lost")
+	}
+	if !hasDirty {
+		t.Fatal("Dirty.HasDirtyParts() = false after flush with concurrent write — new write not preserved")
 	}
 }
 

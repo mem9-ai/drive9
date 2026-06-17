@@ -11645,9 +11645,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 
 	sidecarRevision := sqliteCommittedRevision(committedRev, expectedRevision)
 	sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
-	fh.Dirty.ClearDirty()
-	fs.clearDirtySize(fh.Ino, handleDirtySeq)
-	fh.DirtySeq = 0
+	// Only clear dirty state if no concurrent writes happened while the
+	// lock was released. If DirtySeq changed, a new write arrived and the
+	// buffer must stay dirty so the next flush picks it up. This mirrors
+	// the generation guard in flushHandleDebounced (line ~11243).
+	if fh.DirtySeq == handleDirtySeq {
+		fh.Dirty.ClearDirty()
+		fs.clearDirtySize(handleIno, handleDirtySeq)
+		fh.DirtySeq = 0
+	}
 	if committedRev > 0 {
 		clearReadTargetForLockedHandle(fh)
 		fs.clearReadTargetsForPathExcept(handlePath, fh)
