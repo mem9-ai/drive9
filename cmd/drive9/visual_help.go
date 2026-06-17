@@ -423,30 +423,44 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 		{
 			Name:    "create",
 			Args:    "[flags]",
-			Summary: "provision a new database and save an owner context",
+			Summary: "provision a new tenant and save an owner context",
+			Details: []string{
+				"no TiDB Cloud keys -> Anonymous mode; TiDB Cloud keys -> TiDBCloud mode",
+				"Anonymous mode transfers data management rights to PingCAP",
+			},
 			Flags: []visualHelpFlag{
-				{Name: "--name NAME", Desc: "context/database display name"},
-				{Name: "--region-code CODE", Desc: "provisioning region"},
-				{Name: "--server URL", Desc: "drive9 server endpoint"},
-				{Name: "--json", Desc: "machine-readable output"},
+				{Name: "--name NAME", Desc: "context name; defaults to an auto-generated 7-character name"},
+				{Name: "--region-code CODE", Desc: "provisioning region code; use drive9 region list to see available regions"},
+				{Name: "--server URL", Desc: "override server URL and bypass region manifest lookup"},
+				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key; required for TiDBCloud mode"},
+				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key; required for TiDBCloud mode"},
+				{Name: "--json", Desc: "output result as JSON"},
 			},
 			Examples: []visualHelpExample{
-				{Command: "drive9 create --name team-dev", Desc: "create a named context"},
-				{Command: "drive9 create --region-code aws-us-east-1 --json", Desc: "scriptable provisioning"},
+				{Command: "drive9 create", Desc: "provision an Anonymous tenant using the default region"},
+				{Command: "drive9 create --region-code aws-ap-southeast-1 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "provision a TiDBCloud tenant"},
+				{Command: "drive9 create --server http://127.0.0.1:9009", Desc: "provision directly against a known server"},
+				{Command: "drive9 region list", Desc: "list available regions"},
 			},
 		},
 		{
 			Name:    "delete",
 			Args:    "[flags]",
-			Summary: "delete the current tenant with an owner API key",
+			Summary: "delete the current tenant, cluster, database, and API keys",
 			Badge:   "DANGER",
+			Details: []string{
+				"TiDBCloud mode requires TiDB Cloud credentials for tenant deletion",
+			},
 			Flags: []visualHelpFlag{
-				{Name: "--server URL", Desc: "drive9 server endpoint"},
-				{Name: "--api-key KEY", Desc: "owner API key"},
-				{Name: "--json", Desc: "machine-readable output"},
+				{Name: "--server URL", Desc: "server URL; defaults to active context server"},
+				{Name: "--api-key KEY", Desc: "owner API key; defaults to active context API key"},
+				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key; required for TiDBCloud mode"},
+				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key; required for TiDBCloud mode"},
+				{Name: "--json", Desc: "output result as JSON"},
 			},
 			Examples: []visualHelpExample{
-				{Command: "drive9 delete --json", Desc: "delete active tenant and emit JSON"},
+				{Command: "drive9 delete", Desc: "delete the active context's tenant"},
+				{Command: "drive9 delete --server https://api.drive9.ai --api-key drive9_xxx --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "delete a TiDBCloud tenant with explicit credentials"},
 			},
 		},
 		{
@@ -592,11 +606,20 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 		},
 		{
 			Name:    "region",
-			Args:    "list [--json]",
-			Summary: "list provisioning regions",
+			Args:    "list [--json] [--manifest-url URL]",
+			Summary: "list provisioning regions from the drive9 manifest",
+			Flags: []visualHelpFlag{
+				{Name: "--json", Desc: "output region manifest entries as JSON"},
+				{Name: "--manifest-url URL", Desc: "override the region manifest URL"},
+			},
+			Details: []string{
+				"text output columns: REGION CODE, CLOUD PROVIDER, REGION, MODE, SERVER",
+				"Anonymous regions print a data-management rights note on stderr",
+			},
 			Examples: []visualHelpExample{
 				{Command: "drive9 region list", Desc: "human-readable regions"},
 				{Command: "drive9 region list --json", Desc: "scriptable regions"},
+				{Command: "drive9 region list --manifest-url http://127.0.0.1:9009/regions.json", Desc: "use a custom manifest during local testing"},
 			},
 		},
 		{

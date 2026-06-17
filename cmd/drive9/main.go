@@ -394,7 +394,7 @@ func usage(code int) {
 			"commands:\n"+
 			"  create [--name NAME] [--region-code CODE] [--server URL] [--json]\n"+
 			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
-			"                         provision a new database and owner context\n"+
+			"                         provision a new tenant and owner context\n"+
 			"  delete [--server URL] [--api-key KEY] [--json]\n"+
 			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
 			"                         delete current tenant with owner API key\n"+
@@ -418,7 +418,8 @@ func usage(code int) {
 			"                         append-only agent/workflow journal operations\n"+
 			"  git clone --fast <repo-url> <mounted-path>\n"+
 			"                         git-aware fast clone workflow\n"+
-			"  region list [--json]   list provisioning regions\n"+
+			"  region list [--json] [--manifest-url URL]\n"+
+			"                         list provisioning regions from the drive9 manifest\n"+
 			"  pack [flags] [archive] [path...]\n"+
 			"                         archive coding-agent local overlay paths to drive9/S3\n"+
 			"  unpack [flags] [archive]\n"+
