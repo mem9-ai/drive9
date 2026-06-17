@@ -215,7 +215,7 @@ check_cmd "rm -r batch dir" true
 
 echo "[5] large file upload/download"
 
-LARGE_MB="${CLI_LARGE_FILE_MB:-10}"
+LARGE_MB="${CLI_LARGE_FILE_MB:-100}"
 LARGE_LOCAL="$(mktemp)"
 LARGE_REMOTE="$BATCH_DIR/large-${TS}.bin"
 LARGE_DOWNLOADED="$(mktemp)"
