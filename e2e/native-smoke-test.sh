@@ -131,12 +131,14 @@ echo "hello native smoke test $TS" > "$TMP_FILE"
 # ── [1] provision tenant ────────────────────────────────────────────────────
 
 echo "[1] provision tenant"
+set +e
 create_out="$(drive9_ctx create \
   --server "$BASE" \
   --tidbcloud-public-key "$PUBLIC_KEY" \
   --tidbcloud-private-key "$PRIVATE_KEY" \
   --json 2>&1)"
 create_code=$?
+set -e
 check_eq "drive9 create exit code" "$create_code" "0"
 
 API_KEY="$(printf '%s' "$create_out" | jq -r '.api_key // empty')"
@@ -241,6 +243,7 @@ drive9_retry fs rm "$BATCH_DIR" >/dev/null
 rm -f "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
 
 echo "[6] delete tenant"
+set +e
 delete_out="$(drive9_ctx delete \
   --server "$BASE" \
   --api-key "$API_KEY" \
@@ -248,6 +251,7 @@ delete_out="$(drive9_ctx delete \
   --tidbcloud-private-key "$PRIVATE_KEY" \
   --json 2>&1)"
 delete_code=$?
+set -e
 check_eq "drive9 delete exit code" "$delete_code" "0"
 
 DELETE_STATUS="$(printf '%s' "$delete_out" | jq -r '.status // empty')"

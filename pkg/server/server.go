@@ -3422,7 +3422,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		credentialReq = req
 	} else {
 		if err := rejectCredentialProvisionBody(r); err != nil {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider)...)
+			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider, "error", err)...)
 			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
@@ -3509,12 +3509,15 @@ func rejectCredentialProvisionBody(r *http.Request) error {
 	if len(body) == 0 {
 		return nil
 	}
+	if int64(len(body)) >= maxCredentialProvisionBodyBytes {
+		return fmt.Errorf("request body too large")
+	}
 	var raw struct {
 		PublicKey  string `json:"public_key"`
 		PrivateKey string `json:"private_key"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
-		return nil
+		return fmt.Errorf("invalid JSON body: %w", err)
 	}
 	if strings.TrimSpace(raw.PublicKey) != "" {
 		return fmt.Errorf("tidbcloud public key is not supported for this provider (only tidb_cloud_native)")
