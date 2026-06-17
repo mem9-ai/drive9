@@ -65,6 +65,9 @@ Use a hosted deployment by default. For local development on this machine, use
 # Dev
 export DRIVE9_BASE="http://k8s-dat9-dat9serv-d5e02e7d07-1645488597.ap-southeast-1.elb.amazonaws.com"
 
+# Dev (native)
+export DRIVE9_BASE="http://k8s-drive9ti-drive9se-b6bbe5ba6e-cee81207452d1185.elb.ap-southeast-1.amazonaws.com"
+
 # Prod
 export DRIVE9_BASE="https://api.drive9.ai"
 ```
