@@ -11512,10 +11512,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// internal smallFileData; concurrent Write() calls while the lock is
 	// released would corrupt the upload payload. Path 1a/1b already follow
 	// this pattern (copy + unlock before network).
-	data := fh.Dirty.bytesView()
-	dataCopy := make([]byte, len(data))
-	copy(dataCopy, data)
-	data = nil // prevent accidental use of mutable view after this point
+	dataCopy := make([]byte, fh.Dirty.Size())
+	copy(dataCopy, fh.Dirty.bytesView())
 
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	remotePath := fs.remotePath(fh.Path)
