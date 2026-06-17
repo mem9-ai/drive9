@@ -27,6 +27,7 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		CacheDir:                opts.CacheDir,
 		CacheSize:               opts.CacheSize,
 		ReadCacheMaxFileBytes:   opts.ReadCacheMaxFileBytes,
+		ReadCacheTTL:            opts.ReadCacheTTL,
 		DiskReadCacheSize:       opts.DiskReadCacheSize,
 		DiskReadCacheFreeRatio:  opts.DiskReadCacheFreeRatio,
 		DirTTL:                  opts.DirTTL,
@@ -61,6 +62,19 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		Debug:                   opts.Debug,
 		PerfCounters:            opts.PerfCounters,
 		EnableGitWorkspaces:     opts.LocalRoot != "",
+		Profiling: drive9fuse.ProfilingOptions{
+			CPUProfileDuration:  opts.ProfileCPUDuration,
+			CPUProfileInterval:  opts.ProfileCPUInterval,
+			HeapProfilePath:     opts.ProfileHeap,
+			ProfileDir:          opts.ProfileDir,
+			HeapProfileInterval: opts.ProfileHeapInterval,
+			PprofAddr:           opts.PprofAddr,
+			PerfSamplesPath:     opts.PerfSamplesPath,
+			PerfSampleInterval:  opts.PerfSampleInterval,
+			PerfMaxSamples:      opts.PerfMaxSamples,
+			PerfMaxSampleFiles:  opts.PerfMaxSampleFiles,
+			PerfMaxProfileFiles: opts.PerfMaxProfileFiles,
+		},
 	})
 }
 

@@ -53,6 +53,7 @@ type WriteBackUploader struct {
 	wg         sync.WaitGroup
 	stopOnce   sync.Once
 	stopped    atomic.Bool
+	active     atomic.Int64
 	stopCh     chan struct{}
 
 	// Per-path in-flight tracking.
@@ -100,10 +101,11 @@ func (u *WriteBackUploader) applyMode(ctx context.Context, meta *WriteBackMeta) 
 	if meta == nil || !shouldApplyRemoteMode(meta.Kind, meta.HasMode, meta.Mode) {
 		return nil
 	}
-	mode := meta.Mode & 0o777
+	mode := meta.Mode & posixPermissionModeMask
+	remoteMode := remoteChmodMode(mode)
 	err := retryPostUploadMode(ctx, func() error {
 		start := time.Now()
-		applyErr := u.client.ChmodCtx(ctx, u.remotePath(meta.Path), mode)
+		applyErr := u.client.ChmodCtx(ctx, u.remotePath(meta.Path), remoteMode)
 		if u.perf != nil {
 			u.perf.recordRemoteOp(perfRemoteMutation, applyErr, time.Since(start), 0)
 		}
@@ -117,6 +119,21 @@ func (u *WriteBackUploader) applyMode(ctx context.Context, meta *WriteBackMeta) 
 
 func (u *WriteBackUploader) SetPerfCounters(perf *fusePerfCounters) {
 	u.perf = perf
+}
+
+// PendingStats returns queued and in-flight upload counts for observability.
+func (u *WriteBackUploader) PendingStats() (queued int, inFlight int) {
+	if u == nil {
+		return 0, 0
+	}
+	queued = len(u.uploadCh)
+	u.inflightMu.Lock()
+	inFlight = len(u.inflight)
+	u.inflightMu.Unlock()
+	if active := int(u.active.Load()); active > inFlight {
+		inFlight = active
+	}
+	return queued, inFlight
 }
 
 // Submit enqueues a local namespace path for background upload. Blocks up to 5s if the
@@ -227,7 +244,11 @@ func expectedRevisionForWriteBack(meta *WriteBackMeta) (int64, error) {
 func (u *WriteBackUploader) worker() {
 	defer u.wg.Done()
 	for localPath := range u.uploadCh {
-		u.uploadOne(localPath)
+		u.active.Add(1)
+		func() {
+			defer u.active.Add(-1)
+			u.uploadOne(localPath)
+		}()
 	}
 }
 

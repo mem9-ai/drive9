@@ -9,7 +9,7 @@ import (
 	tenantschema "github.com/mem9-ai/dat9/pkg/tenant/schema"
 )
 
-const usage = "usage: drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_starter>"
+const usage = "usage: drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_starter|tidb_cloud_native>"
 
 // ResolveProvider normalizes a schema dump provider selection.
 func ResolveProvider(provider string) (string, error) {
@@ -28,7 +28,7 @@ func Statements(provider string) ([]string, error) {
 	switch provider {
 	case tenant.ProviderDB9:
 		return tenantschema.CloneStatements(tenantdb9.InitSchemaStatements()), nil
-	case tenant.ProviderTiDBZero, tenant.ProviderTiDBCloudStarter:
+	case tenant.ProviderTiDBZero, tenant.ProviderTiDBCloudStarter, tenant.ProviderTiDBCloudNative:
 		return tenantschema.InitTiDBTenantSchemaStatementsForMode(tenantschema.TiDBEmbeddingModeAuto)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", provider)

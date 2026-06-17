@@ -80,10 +80,13 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 	}
 	for _, want := range []string{
 		"usage: drive9 <command> [arguments]",
+		"create [--name NAME] [--region-code CODE] [--server URL] [--json]",
+		"delete [--server URL] [--api-key KEY] [--json]",
 		"ctx show [--json] [--reveal]",
 		"ctx use <name>",
 		"token <issue|revoke>",
 		"journal <new|append|cat|find|verify>",
+		"region list [--json]",
 		"profile show [profile]",
 		"mount [flags] [:/remote] <mountpoint>",
 		"mount vault [flags] <mountpoint>",
@@ -128,6 +131,12 @@ func TestDispatchSubcommandHelpShowsUsageWithoutFatalPrefix(t *testing.T) {
 			cmd:       "vault",
 			args:      []string{"--help"},
 			firstLine: "usage drive9 vault <set|get|put|with|ls|rm|grant|revoke|audit>",
+		},
+		{
+			name:      "region",
+			cmd:       "region",
+			args:      []string{"--help"},
+			firstLine: "usage: drive9 region <list|ls>",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -251,6 +260,72 @@ func TestDispatchTokenVerbReachesHandler(t *testing.T) {
 		t.Fatal("token handler was not invoked for `drive9 token ...`")
 	}
 	want := []string{"issue", "--subject", "vm0"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
+		}
+	}
+}
+
+func TestDispatchDeleteVerbReachesHandler(t *testing.T) {
+	origHandler := deleteHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		deleteHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	deleteHandler = func(args []string) error {
+		called = true
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("delete", []string{"--json"})
+
+	if !called {
+		t.Fatal("delete handler was not invoked for `drive9 delete ...`")
+	}
+	want := []string{"--json"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
+		}
+	}
+}
+
+func TestDispatchRegionVerbReachesHandler(t *testing.T) {
+	origHandler := regionHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		regionHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	regionHandler = func(args []string) error {
+		called = true
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("region", []string{"list", "--json"})
+
+	if !called {
+		t.Fatal("region handler was not invoked for `drive9 region ...`")
+	}
+	want := []string{"list", "--json"}
 	if len(gotArgs) != len(want) {
 		t.Fatalf("args = %v, want %v", gotArgs, want)
 	}

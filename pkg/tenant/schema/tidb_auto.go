@@ -647,6 +647,7 @@ const (
 	tidbSchemaDiffMissingColumn tidbSchemaDiffKind = "missing_column"
 	tidbSchemaDiffMissingIndex  tidbSchemaDiffKind = "missing_index"
 	tidbSchemaDiffColumnType    tidbSchemaDiffKind = "column_type_mismatch"
+	tidbSchemaDiffExtraColumn   tidbSchemaDiffKind = "extra_column"
 	tidbSchemaDiffTableContract tidbSchemaDiffKind = "table_contract_mismatch"
 )
 
@@ -674,6 +675,7 @@ type tidbTableSpec struct {
 type tidbColumnSpec struct {
 	columnType string
 	addSQL     string
+	modifySQL  string
 }
 
 type tidbIndexSpec struct {
@@ -723,16 +725,18 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
-			path         VARCHAR(512) NOT NULL,
-			parent_path  VARCHAR(512) NOT NULL,
+			path         TEXT NOT NULL,
+			path_hash    VARCHAR(64) NOT NULL DEFAULT '',
+			parent_path  TEXT NOT NULL,
+			parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 			name         VARCHAR(255) NOT NULL,
 			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
 			file_id      VARCHAR(64),
 			inode_id     VARCHAR(64),
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 		)`,
-		`CREATE UNIQUE INDEX idx_path ON file_nodes(path)`,
-		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
+		`CREATE UNIQUE INDEX idx_path ON file_nodes(path_hash)`,
+		`CREATE INDEX idx_parent ON file_nodes(parent_path_hash, name)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
 		`CREATE INDEX idx_inode_id ON file_nodes(inode_id)`,
 
@@ -804,7 +808,8 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 			upload_id          VARCHAR(64) PRIMARY KEY,
 			file_id            VARCHAR(64) NOT NULL,
 			inode_id           VARCHAR(64),
-			target_path        VARCHAR(512) NOT NULL,
+			target_path        TEXT NOT NULL,
+			target_path_hash   VARCHAR(64) NOT NULL DEFAULT '',
 			s3_upload_id       VARCHAR(255) NOT NULL,
 			s3_key             VARCHAR(2048) NOT NULL,
 			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'none',
@@ -820,12 +825,12 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			expires_at         DATETIME(3) NOT NULL,
-			active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED
+			active_target_path_hash VARCHAR(64) AS (CASE WHEN status = 'UPLOADING' THEN target_path_hash ELSE NULL END) VIRTUAL
 		)`,
 		`ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL`,
-		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
+		`CREATE INDEX idx_upload_path ON uploads(target_path_hash, status)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
-		`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path)`,
+		`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path_hash)`,
 		`CREATE TABLE IF NOT EXISTS semantic_tasks (
 			task_id           VARCHAR(64) PRIMARY KEY,
 			task_type         VARCHAR(32) NOT NULL,
@@ -1051,7 +1056,10 @@ func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiD
 	if err := validateTiDBSchemaMode(mode); err != nil {
 		return err
 	}
-	const maxRepairPasses = 3
+	// Path-hash migrations from the legacy schema can need separate passes for
+	// adding hash columns, adding the active-upload generated hash column,
+	// rebuilding old same-name indexes, and finally widening path columns.
+	const maxRepairPasses = 6
 	for i := 0; i < maxRepairPasses; i++ {
 		attemptedPasses = i + 1
 		passStart := time.Now()
@@ -1066,6 +1074,9 @@ func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiD
 			zap.Int("diff_count", len(diffs)),
 			zap.Strings("diffs", summarizeTiDBSchemaDiffs(diffs)),
 			zap.Float64("duration_ms", float64(time.Since(passStart).Microseconds())/1000.0))
+		if err := BackfillPathHashes(ctx, db); err != nil {
+			return fmt.Errorf("backfill path hashes before repair: %w", err)
+		}
 		if len(diffs) == 0 {
 			if err := BackfillStorageRefHashes(ctx, db); err != nil {
 				return fmt.Errorf("backfill storage_ref_hash: %w", err)
@@ -1093,12 +1104,18 @@ func ensureTiDBSchemaForModeWithConfig(ctx context.Context, db *sql.DB, mode TiD
 		if err := applyTiDBSchemaRepairs(ctx, db, repairs); err != nil {
 			return err
 		}
+		if err := BackfillPathHashes(ctx, db); err != nil {
+			return fmt.Errorf("backfill path hashes after repair: %w", err)
+		}
 	}
 	if err := validateTiDBSchemaForModeWithConfig(ctx, db, mode, cfg); err != nil {
 		return err
 	}
 	if err := BackfillStorageRefHashes(ctx, db); err != nil {
 		return fmt.Errorf("backfill storage_ref_hash: %w", err)
+	}
+	if err := BackfillPathHashes(ctx, db); err != nil {
+		return fmt.Errorf("backfill path hashes: %w", err)
 	}
 	logger.Info(ctx, "tenant_tidb_schema_ensure_finished",
 		zap.String("mode", string(mode)),
@@ -1130,6 +1147,33 @@ func BackfillStorageRefHashes(ctx context.Context, db *sql.DB) error {
 	return err
 }
 
+// BackfillPathHashes populates path hash columns used to index POSIX-length
+// paths without relying on oversized VARCHAR indexes.
+func BackfillPathHashes(ctx context.Context, db *sql.DB) error {
+	if _, err := db.ExecContext(ctx, `UPDATE file_nodes
+		SET path_hash = LOWER(SHA2(path, 256))
+		WHERE path_hash = '' AND path <> ''`); err != nil {
+		if !isMissingTableError(err) && !isMissingColumnError(err) {
+			return err
+		}
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE file_nodes
+		SET parent_path_hash = LOWER(SHA2(parent_path, 256))
+		WHERE parent_path_hash = '' AND parent_path <> ''`); err != nil {
+		if !isMissingTableError(err) && !isMissingColumnError(err) {
+			return err
+		}
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE uploads
+		SET target_path_hash = LOWER(SHA2(target_path, 256))
+		WHERE target_path_hash = '' AND target_path <> ''`); err != nil {
+		if !isMissingTableError(err) && !isMissingColumnError(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 func initTiDBAutoEmbeddingSchema(ctx context.Context, dsn string) error {
 	return initTiDBAutoEmbeddingSchemaWithConfig(ctx, dsn, CurrentTiDBAutoEmbeddingConfig())
 }
@@ -1158,10 +1202,13 @@ func initTiDBAutoEmbeddingSchemaWithProfile(ctx context.Context, dsn string, pro
 	if !IsTiDBCluster(ctx, db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
+	if err := repairMySQLPathHashSchema(ctx, db); err != nil {
+		return err
+	}
 	if err := ExecSchemaStatementsContext(ctx, db, tidbAutoEmbeddingSchemaStatementsForConfig(render)); err != nil {
 		return err
 	}
-	if err := ValidateTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile); err != nil {
+	if err := EnsureTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile); err != nil {
 		return err
 	}
 	logger.Info(ctx, "tenant_tidb_schema_init_finished",
@@ -1307,7 +1354,10 @@ func validateTiDBUploadsTableBase(meta tidbTableMeta) error {
 	if err := meta.requireColumnType("upload_id", "varchar(64)"); err != nil {
 		return err
 	}
-	if err := meta.requireColumnType("target_path", "varchar(512)"); err != nil {
+	if err := meta.requireColumnType("target_path", "text"); err != nil {
+		return err
+	}
+	if err := meta.requireColumnType("target_path_hash", "varchar(64)"); err != nil {
 		return err
 	}
 	if err := meta.requireColumnType("status", "varchar(32)"); err != nil {
@@ -1997,6 +2047,7 @@ func parseColumnDefinition(tableName, def string) (string, tidbColumnSpec, bool)
 	return strings.ToLower(name), tidbColumnSpec{
 		columnType: strings.ToLower(strings.TrimSpace(colType)),
 		addSQL:     fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
+		modifySQL:  fmt.Sprintf("ALTER TABLE %s MODIFY COLUMN %s %s", tableName, name, strings.TrimSpace(rest)),
 	}, true
 }
 
@@ -2136,6 +2187,7 @@ func diffTiDBTableMeta(table tidbTableSpec, meta tidbTableMeta, createStmt strin
 
 func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMeta, createStmt string, observedIndexes map[string]struct{}, indexesObserved bool) []tidbSchemaDiff {
 	var diffs []tidbSchemaDiff
+	observedIndexColumns, observedIndexColumnsOK := parseObservedTiDBIndexColumns(createStmt)
 	for _, name := range sortedColumnNames(table.columns) {
 		spec := table.columns[name]
 		col, err := meta.requireColumn(name)
@@ -2155,6 +2207,7 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 				tableName:  table.name,
 				columnName: name,
 				detail:     fmt.Sprintf("%s schema contract: %s column type = %q, want %s", table.name, name, col.columnType, spec.columnType),
+				repairSQL:  spec.modifySQL,
 			})
 		}
 	}
@@ -2192,13 +2245,43 @@ func diffTiDBTableMetaWithObservedIndexes(table tidbTableSpec, meta tidbTableMet
 					detail:    fmt.Sprintf("%s schema contract: missing %s index", table.name, name),
 					repairSQL: spec.createSQL,
 				})
+				continue
+			}
+			if observedIndexColumnsOK && isPathHashIndexName(table.name, name) {
+				observedColumns := observedIndexColumns[strings.ToLower(name)]
+				expectedColumns := expectedPathHashIndexColumns(table.name, name)
+				if len(expectedColumns) > 0 && len(observedColumns) > 0 && !equalStringSlices(observedColumns, expectedColumns) {
+					diffs = append(diffs, tidbSchemaDiff{
+						kind:      tidbSchemaDiffMissingIndex,
+						tableName: table.name,
+						detail:    fmt.Sprintf("%s schema contract: %s index columns = (%s), want (%s)", table.name, name, strings.Join(observedColumns, ", "), strings.Join(expectedColumns, ", ")),
+						repairSQL: dropPathHashIndexSQL(table.name, name),
+					})
+				}
 			}
 		}
 	}
 	if table.validate != nil {
 		diffs = append(diffs, table.validate(meta)...)
 	}
+	diffs = append(diffs, legacyUploadActiveTargetPathDiffs(table, meta)...)
 	return diffs
+}
+
+func legacyUploadActiveTargetPathDiffs(table tidbTableSpec, meta tidbTableMeta) []tidbSchemaDiff {
+	if table.name != "uploads" {
+		return nil
+	}
+	if _, ok := meta.columns["active_target_path"]; !ok {
+		return nil
+	}
+	return []tidbSchemaDiff{{
+		kind:       tidbSchemaDiffExtraColumn,
+		tableName:  "uploads",
+		columnName: "active_target_path",
+		detail:     "uploads schema contract: legacy active_target_path generated column must be dropped",
+		repairSQL:  "ALTER TABLE uploads DROP COLUMN active_target_path",
+	}}
 }
 
 func hasObservedTiDBIndex(observedIndexes map[string]struct{}, indexName string) bool {
@@ -2207,6 +2290,100 @@ func hasObservedTiDBIndex(observedIndexes map[string]struct{}, indexName string)
 	}
 	_, ok := observedIndexes[strings.ToLower(indexName)]
 	return ok
+}
+
+func parseObservedTiDBIndexColumns(createStmt string) (map[string][]string, bool) {
+	_, defs, ok, err := parseCreateTableStatement(createStmt)
+	if err != nil || !ok {
+		return nil, false
+	}
+	observed := make(map[string][]string)
+	for _, def := range splitTopLevelComma(defs) {
+		def = strings.TrimSpace(def)
+		if def == "" {
+			continue
+		}
+		normalized := normalizeSQLFragment(def)
+		var name string
+		var columns string
+		switch {
+		case strings.HasPrefix(normalized, "constraint "):
+			var ok bool
+			name, columns, ok = parseConstraintUniqueIndexDefinition(def)
+			if !ok {
+				continue
+			}
+		case strings.HasPrefix(normalized, "unique key "):
+			name, columns = parseIndexNameAndColumns(def, "UNIQUE KEY")
+		case strings.HasPrefix(normalized, "unique index "):
+			name, columns = parseIndexNameAndColumns(def, "UNIQUE INDEX")
+		case strings.HasPrefix(normalized, "fulltext index "):
+			name, columns = parseIndexNameAndColumns(def, "FULLTEXT INDEX")
+		case strings.HasPrefix(normalized, "fulltext key "):
+			name, columns = parseIndexNameAndColumns(def, "FULLTEXT KEY")
+		case strings.HasPrefix(normalized, "vector index "):
+			name, columns = parseIndexNameAndColumns(def, "VECTOR INDEX")
+		case strings.HasPrefix(normalized, "spatial index "):
+			name, columns = parseIndexNameAndColumns(def, "SPATIAL INDEX")
+		case strings.HasPrefix(normalized, "spatial key "):
+			name, columns = parseIndexNameAndColumns(def, "SPATIAL KEY")
+		case strings.HasPrefix(normalized, "index "):
+			name, columns = parseIndexNameAndColumns(def, "INDEX")
+		case strings.HasPrefix(normalized, "key "):
+			name, columns = parseIndexNameAndColumns(def, "KEY")
+		}
+		if name == "" || columns == "" {
+			continue
+		}
+		parsedColumns := parseIndexColumnList(columns)
+		if len(parsedColumns) == 0 {
+			continue
+		}
+		observed[strings.ToLower(name)] = parsedColumns
+	}
+	return observed, true
+}
+
+func isPathHashIndexName(tableName, indexName string) bool {
+	switch tableName + "." + strings.ToLower(indexName) {
+	case "file_nodes.idx_path",
+		"file_nodes.idx_parent",
+		"uploads.idx_upload_path",
+		"uploads.idx_uploads_active":
+		return true
+	default:
+		return false
+	}
+}
+
+func expectedPathHashIndexColumns(tableName, indexName string) []string {
+	switch tableName + "." + strings.ToLower(indexName) {
+	case "file_nodes.idx_path":
+		return []string{"path_hash"}
+	case "file_nodes.idx_parent":
+		return []string{"parent_path_hash", "name"}
+	case "uploads.idx_upload_path":
+		return []string{"target_path_hash", "status"}
+	case "uploads.idx_uploads_active":
+		return []string{"active_target_path_hash"}
+	default:
+		return nil
+	}
+}
+
+func dropPathHashIndexSQL(tableName, indexName string) string {
+	switch tableName + "." + strings.ToLower(indexName) {
+	case "file_nodes.idx_path":
+		return "ALTER TABLE file_nodes DROP INDEX idx_path"
+	case "file_nodes.idx_parent":
+		return "ALTER TABLE file_nodes DROP INDEX idx_parent"
+	case "uploads.idx_upload_path":
+		return "ALTER TABLE uploads DROP INDEX idx_upload_path"
+	case "uploads.idx_uploads_active":
+		return "ALTER TABLE uploads DROP INDEX idx_uploads_active"
+	default:
+		return ""
+	}
 }
 
 func parseObservedTiDBIndexes(createStmt string) (map[string]struct{}, bool) {
@@ -2368,8 +2545,25 @@ func missingTableAndIndexDiffs(table tidbTableSpec) []tidbSchemaDiff {
 func plannedTiDBSchemaRepairs(diffs []tidbSchemaDiff) []string {
 	seen := make(map[string]struct{})
 	plans := make([]string, 0, len(diffs))
+	deferHashIndexes := hasMissingPathHashColumnDiff(diffs)
+	deferPathColumnWidening := deferHashIndexes ||
+		hasPathHashIndexColumnMismatchDiff(diffs) ||
+		hasLegacyUploadActiveTargetPathDiff(diffs)
+	deferActiveUploadHashColumn := hasMissingColumnDiff(diffs, "uploads", "target_path_hash")
 	for _, diff := range diffs {
 		if diff.repairSQL == "" {
+			continue
+		}
+		if deferPathColumnWidening && isPathColumnWideningRepair(diff) {
+			continue
+		}
+		if deferActiveUploadHashColumn &&
+			diff.kind == tidbSchemaDiffMissingColumn &&
+			diff.tableName == "uploads" &&
+			diff.columnName == "active_target_path_hash" {
+			continue
+		}
+		if deferHashIndexes && isPathHashIndexRepair(diff) {
 			continue
 		}
 		if !isSafeTiDBRepairDiff(diff) {
@@ -2384,6 +2578,74 @@ func plannedTiDBSchemaRepairs(diffs []tidbSchemaDiff) []string {
 	return plans
 }
 
+func hasPathHashIndexColumnMismatchDiff(diffs []tidbSchemaDiff) bool {
+	for _, diff := range diffs {
+		if diff.kind == tidbSchemaDiffMissingIndex &&
+			isPathHashIndexRepair(diff) &&
+			strings.Contains(diff.detail, "index columns") {
+			return true
+		}
+	}
+	return false
+}
+
+func isPathColumnWideningRepair(diff tidbSchemaDiff) bool {
+	if diff.kind != tidbSchemaDiffColumnType {
+		return false
+	}
+	switch diff.tableName + "." + diff.columnName {
+	case "file_nodes.path",
+		"file_nodes.parent_path",
+		"uploads.target_path":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasMissingColumnDiff(diffs []tidbSchemaDiff, tableName, columnName string) bool {
+	for _, diff := range diffs {
+		if diff.kind == tidbSchemaDiffMissingColumn &&
+			diff.tableName == tableName &&
+			diff.columnName == columnName {
+			return true
+		}
+	}
+	return false
+}
+
+func hasMissingPathHashColumnDiff(diffs []tidbSchemaDiff) bool {
+	for _, diff := range diffs {
+		if diff.kind != tidbSchemaDiffMissingColumn {
+			continue
+		}
+		switch diff.tableName + "." + diff.columnName {
+		case "file_nodes.path_hash",
+			"file_nodes.parent_path_hash",
+			"uploads.target_path_hash",
+			"uploads.active_target_path_hash":
+			return true
+		}
+	}
+	return false
+}
+
+func isPathHashIndexRepair(diff tidbSchemaDiff) bool {
+	if diff.kind != tidbSchemaDiffMissingIndex {
+		return false
+	}
+	switch diff.tableName {
+	case "file_nodes":
+		return strings.Contains(diff.repairSQL, "idx_path") ||
+			strings.Contains(diff.repairSQL, "idx_parent")
+	case "uploads":
+		return strings.Contains(diff.repairSQL, "idx_upload_path") ||
+			strings.Contains(diff.repairSQL, "idx_uploads_active")
+	default:
+		return false
+	}
+}
+
 func isSafeTiDBRepairDiff(diff tidbSchemaDiff) bool {
 	switch diff.kind {
 	case tidbSchemaDiffMissingTable:
@@ -2391,7 +2653,11 @@ func isSafeTiDBRepairDiff(diff tidbSchemaDiff) bool {
 	case tidbSchemaDiffMissingColumn:
 		return isSafeAddColumnRepairSQL(diff.repairSQL)
 	case tidbSchemaDiffMissingIndex:
-		return isSafeAddIndexRepairSQL(diff.repairSQL)
+		return isSafeAddIndexRepairSQL(diff.repairSQL) || isSafeDropPathHashIndexRepairSQL(diff.repairSQL)
+	case tidbSchemaDiffColumnType:
+		return isSafeModifyColumnRepairSQL(diff)
+	case tidbSchemaDiffExtraColumn:
+		return isSafeDropLegacyUploadActiveTargetPathRepairSQL(diff)
 	default:
 		return false
 	}
@@ -2412,7 +2678,42 @@ func isSafeAddColumnRepairSQL(sqlText string) bool {
 		strings.Contains(normalized, "embed_text(") {
 		return true
 	}
+	if normalized == "alter table uploads add column active_target_path_hash varchar(64) as (case when status = 'uploading' then target_path_hash else null end) virtual" {
+		return true
+	}
 	return schemaspec.IsSafeAddColumnRepairSQL(sqlText)
+}
+
+func isSafeModifyColumnRepairSQL(diff tidbSchemaDiff) bool {
+	n := strings.TrimSuffix(normalizeSQLFragment(diff.repairSQL), ";")
+	switch diff.tableName + "." + diff.columnName {
+	case "file_nodes.path":
+		return n == "alter table file_nodes modify column path text not null"
+	case "file_nodes.parent_path":
+		return n == "alter table file_nodes modify column parent_path text not null"
+	case "uploads.target_path":
+		return n == "alter table uploads modify column target_path text not null"
+	default:
+		return false
+	}
+}
+
+func hasLegacyUploadActiveTargetPathDiff(diffs []tidbSchemaDiff) bool {
+	for _, diff := range diffs {
+		if diff.kind == tidbSchemaDiffExtraColumn &&
+			diff.tableName == "uploads" &&
+			diff.columnName == "active_target_path" {
+			return true
+		}
+	}
+	return false
+}
+
+func isSafeDropLegacyUploadActiveTargetPathRepairSQL(diff tidbSchemaDiff) bool {
+	if diff.tableName != "uploads" || diff.columnName != "active_target_path" {
+		return false
+	}
+	return normalizeSQLFragment(diff.repairSQL) == "alter table uploads drop column active_target_path"
 }
 
 func isSafeAddIndexRepairSQL(sqlText string) bool {
@@ -2442,6 +2743,18 @@ func isSafeAddIndexRepairSQL(sqlText string) bool {
 	return false
 }
 
+func isSafeDropPathHashIndexRepairSQL(sqlText string) bool {
+	switch normalizeSQLFragment(sqlText) {
+	case "alter table file_nodes drop index idx_path",
+		"alter table file_nodes drop index idx_parent",
+		"alter table uploads drop index idx_upload_path",
+		"alter table uploads drop index idx_uploads_active":
+		return true
+	default:
+		return false
+	}
+}
+
 func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string) error {
 	if len(statements) == 0 {
 		return nil
@@ -2462,7 +2775,11 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 				return err
 			}
 		}
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			if isFulltextOrVectorIndexRepairSQL(stmt) && !strings.Contains(normalizeSQLFragment(stmt), "add_columnar_replica_on_demand") {
+			stmt += " ADD_COLUMNAR_REPLICA_ON_DEMAND"
+			snippet = schemaStatementSnippet(stmt)
+		}
+	if _, err := db.ExecContext(ctx, stmt); err != nil {
 			if isIgnorableTiDBSchemaError(err) {
 				logger.Info(ctx, "tenant_tidb_schema_repair_statement_skipped_existing",
 					zap.Int("statement_index", i+1),
@@ -2570,12 +2887,13 @@ func parseAlterTableAddUniqueIndexRepairStatement(stmt string) (tableName, index
 		return "", "", nil, false
 	}
 	remainder = strings.TrimSpace(remainder)
-	upperRemainder := strings.ToUpper(remainder)
-	for _, marker := range []string{"ADD UNIQUE INDEX ", "ADD UNIQUE KEY "} {
-		if !strings.HasPrefix(upperRemainder, marker) {
+	normalizedRemainder := normalizeSQLFragment(remainder)
+	for _, marker := range []string{"add unique index ", "add unique key "} {
+		pos := strings.Index(normalizedRemainder, marker)
+		if pos < 0 {
 			continue
 		}
-		afterMarker := strings.TrimSpace(remainder[len(marker):])
+		afterMarker := strings.TrimSpace(normalizedRemainder[pos+len(marker):])
 		name, columnRemainder := splitIdentifierAndSuffix(afterMarker)
 		if name == "" || columnRemainder == "" {
 			return "", "", nil, false
@@ -2807,4 +3125,18 @@ func isMissingTableError(err error) bool {
 	return strings.Contains(msg, "error 1146") ||
 		(strings.Contains(msg, "table") && strings.Contains(msg, "doesn't exist")) ||
 		(strings.Contains(msg, "relation") && strings.Contains(msg, "does not exist"))
+}
+
+func isMissingColumnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		return mysqlErr.Number == 1054
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "error 1054") ||
+		strings.Contains(msg, "unknown column") ||
+		(strings.Contains(msg, "column") && strings.Contains(msg, "does not exist"))
 }

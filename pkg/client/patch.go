@@ -195,10 +195,9 @@ func (c *Client) uploadPatchPart(ctx context.Context, part *PatchPartURL, readPa
 		return fmt.Errorf("readPart callback: %w", err)
 	}
 
-	// Upload to presigned URL
-	h := sha256.Sum256(data)
-	checksum := base64.StdEncoding.EncodeToString(h[:])
-
+	// Upload to presigned URL.
+	// Only send x-amz-checksum-sha256 if the server included it in the
+	// presigned headers — otherwise S3 rejects the unsigned header with 403.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, part.URL, bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -210,7 +209,12 @@ func (c *Client) uploadPatchPart(ctx context.Context, part *PatchPartURL, readPa
 		req.Header.Set(k, v)
 	}
 	req.ContentLength = int64(len(data))
-	req.Header.Set("x-amz-checksum-sha256", checksum)
+	if _, ok := part.Headers["x-amz-checksum-sha256"]; ok {
+		// Server presigned this header — recompute and set the actual value.
+		h := sha256.Sum256(data)
+		checksum := base64.StdEncoding.EncodeToString(h[:])
+		req.Header.Set("x-amz-checksum-sha256", checksum)
+	}
 
 	resp, err := c.httpClient.Do(req) // Direct to S3, no auth
 	if err != nil {

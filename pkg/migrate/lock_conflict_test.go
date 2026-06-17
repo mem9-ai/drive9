@@ -56,16 +56,16 @@ func TestSplitTablesMigratorConcurrentRuns(t *testing.T) {
 			nodeVals.WriteString(",")
 		}
 		fmt.Fprintf(&fileVals, "('f%04d', 'db9', 'ref%04d', %d, 1, 'CONFIRMED')", i, i, i)
-		fmt.Fprintf(&nodeVals, "('n%04d', '/dir/f%04d.txt', '/dir', 'f%04d.txt', 0, 'f%04d', NULL)", i, i, i, i)
+		fmt.Fprintf(&nodeVals, "('n%04d', '/dir/f%04d.txt', LOWER(SHA2('/dir/f%04d.txt', 256)), '/dir', LOWER(SHA2('/dir', 256)), 'f%04d.txt', 0, 'f%04d', NULL)", i, i, i, i, i)
 	}
 	db := s.DB()
 	if _, err := db.Exec("INSERT INTO files (file_id, storage_type, storage_ref, size_bytes, revision, status) VALUES " + fileVals.String()); err != nil {
 		t.Fatalf("seed files: %v", err)
 	}
-	if _, err := db.Exec("INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id) VALUES " + nodeVals.String()); err != nil {
+	if _, err := db.Exec("INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id) VALUES " + nodeVals.String()); err != nil {
 		t.Fatalf("seed file_nodes: %v", err)
 	}
-	if _, err := db.Exec("INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, file_id, inode_id) VALUES ('d0001', '/dir', '/', 'dir', 1, NULL, NULL)"); err != nil {
+	if _, err := db.Exec("INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, file_id, inode_id) VALUES ('d0001', '/dir', LOWER(SHA2('/dir', 256)), '/', LOWER(SHA2('/', 256)), 'dir', 1, NULL, NULL)"); err != nil {
 		t.Fatalf("seed dir node: %v", err)
 	}
 

@@ -1,57 +1,209 @@
-# drive9
+<div align="center">
 
-drive9 is a network drive for agent sandboxes and human workflows. Mount it,
-use normal filesystem tools, and keep the backing storage, upload protocol,
-cache invalidation, and semantic indexing behind one path namespace.
+# Drive9
+
+### Server-side workspace kernel for AI agents
+
+**Sandboxes are disposable. Workspaces should not be.**
+
+[![CI](https://img.shields.io/github/actions/workflow/status/mem9-ai/drive9/code-ci.yml?branch=main&label=ci&labelColor=0C0C0C&color=0C0C0C)](https://github.com/mem9-ai/drive9/actions/workflows/code-ci.yml)
+[![Go](https://img.shields.io/badge/go-1.25+-0C0C0C?labelColor=FAFAFA&logo=go&logoColor=0C0C0C)](go.mod)
+[![License](https://img.shields.io/badge/license-Apache--2.0-0C0C0C?labelColor=FAFAFA)](#license)
+[![Docs](https://img.shields.io/badge/docs-design%20notes-0C0C0C?labelColor=FAFAFA)](docs/)
+
+</div>
+
+Drive9 gives AI agents a durable workspace that can be mounted from any
+sandbox, forked for parallel attempts, checkpointed, rolled back, and committed
+with server-side conflict detection.
+
+Local disks run the process. Git stores the final result. **Drive9 keeps the
+working state in between.**
 
 ```bash
-drive9 mount :/ ~/drive9
-git clone https://github.com/mem9-ai/drive9.git ~/drive9/drive9
-mkdir -p ~/drive9/notes
-cp notes.md ~/drive9/notes/
-drive9 fs grep "pricing" :/notes
+# Sandbox A mounts the workspace and starts working.
+drive9 mount --mode=fuse :/repo ./work
+mkdir -p ./work/notes
+printf 'fix attempt A\n' > ./work/notes/run-42.txt
+drive9 umount ./work
+
+# Sandbox A is gone. Sandbox B mounts the same workspace and continues.
+drive9 mount --mode=fuse :/repo ./work
+cat ./work/notes/run-42.txt
 ```
 
-The main implementation is a Go HTTP server plus CLI, SDK, FUSE mount, WebDAV
-adapter, tenant provisioning, object storage integration, and semantic workers.
-The current storage path is **TiDB + S3-compatible object storage**. db9 remains
-a provider/inspiration path in the codebase, but it is not the default storage
-backend described by the current production architecture.
+## Why Drive9
 
-## What It Does
+Agents now clone repositories, edit files, install dependencies, run tests,
+produce logs, create artifacts, and try multiple approaches. The sandbox may
+last minutes; the work often needs to last longer.
 
-**One path namespace.** Files live at paths such as `:/src/main.go` or
-`:/datasets/run.bin`. The same API is exposed through CLI commands, the Go SDK,
-FUSE mounts, and HTTP endpoints.
+Most stacks treat workspace state as an after-the-fact handoff: sync a folder,
+commit to Git, dump files into object storage, or serialize session state into a
+database. Drive9 moves those runtime questions into the workspace layer:
 
-**TiDB metadata and small-file storage.** Tenant databases store the inode-style
-path tree, file metadata, tags, uploads, semantic task state, inline small-file
-bytes, full-text indexes, and vector indexes. TiDB tenants use the MySQL
-protocol.
+- Which files, logs, and artifacts survive sandbox replacement?
+- Where do parallel attempts stay isolated, commit, or roll back?
+- Who decides whether an agent can write this path right now?
+- What happens when two attempts started from the same base both want to commit?
 
-**Object storage for large bytes.** Files at or above 50,000 bytes use
-S3-compatible object storage through presigned multipart uploads. The drive9
-server coordinates metadata and upload state; it does not proxy large object
-bytes.
+Drive9 is runtime-managed workspace state, not just a network folder.
 
-**FUSE for agent workspaces.** `drive9 mount` provides a local filesystem with
-read caching, adaptive range prefetch, writeback through ShadowStore + Journal +
-CommitQueue, SSE-driven invalidation, and Git lockfile/rename semantics needed
-by real `git clone` workflows.
+## What It Gives Agents
 
-**Semantic retrieval.** drive9 stores searchable `content_text` and
-`description` fields. TiDB auto-embedding tenants derive vector columns in the
-database from that text. Optional image/audio extraction workers can produce
-text for media files; app-managed embedding remains available for non-auto
-embedding paths.
+### Ordinary Filesystem Tools
 
-**Zero-copy namespace operations.** File copies inside drive9 can be metadata
-links. Rename updates path metadata. Object bytes are garbage-collected after
-the last path reference is removed.
+Mount a server-side workspace and keep using Git, npm, grep, test runners, and
+shell scripts. Agents do not need a new file API.
+
+```bash
+drive9 ctx add --name prod --server https://api.drive9.ai --api-key "$DRIVE9_API_KEY"
+drive9 ctx use prod
+drive9 mount --mode=fuse :/ ~/drive9
+git clone https://github.com/mem9-ai/drive9.git ~/drive9/drive9
+```
+
+### Two-Tier Workspace State
+
+Source files and work products are durable workspace state. `.git`, dependencies,
+build outputs, and tool caches can stay in the local execution layer and be
+restored with pack/unpack when a replacement sandbox needs a warm workspace.
+
+```bash
+drive9 mount --mode=fuse --profile=portable :/workspace /mnt/workspace
+# work with normal tools; local overlay paths stay local for tool performance
+drive9 pack --mount /mnt/workspace
+
+drive9 unpack --local-root /tmp/new-local --remote-root /workspace --profile portable
+drive9 mount --mode=fuse --profile=portable :/workspace /mnt/workspace
+```
+
+### Scoped Workspace Access
+
+Issue short-lived filesystem credentials scoped by path, operation, and time.
+Agents get the workspace surface they need, not a full workspace key.
+
+```bash
+drive9 token issue agent-17 \
+  --ttl 1h \
+  --allow /repo/src:read,list,search,write \
+  --allow /repo/tests:read,list,search
+```
+
+Expected behavior under that token:
+
+```bash
+cat /repo/src/main.go          # allowed
+cat /repo/tests/auth_test.go   # allowed
+echo x > /repo/tests/new.log   # denied: write not granted
+cat /repo/secrets/token.txt    # denied: path outside scope
+```
+
+### Fast Git Workspaces
+
+Clone repositories into a Drive9 mount with Git-aware fast clone support. Use a
+blobless local `.git` and hydrate clean tree content as needed.
+
+```bash
+drive9 mount --mode=fuse :/ ~/drive9
+drive9 git clone --fast --blobless --hydrate=background \
+  https://github.com/mem9-ai/drive9.git ~/drive9/drive9
+```
+
+### Server-Side Context Forks
+
+Create a copy-on-write workspace context for heavier exploration. A fork can be
+mounted from another sandbox without copying the whole workspace up front.
+
+```bash
+drive9 ctx fork experiment-auth --from prod
+drive9 ctx use experiment-auth
+drive9 mount --mode=fuse :/ ./work
+```
+
+### LayerFS Attempts
+
+Run writable attempts over a read-only base. Failed attempts roll back without
+polluting the base; successful attempts commit back after Drive9 checks whether
+the base changed.
+
+```bash
+# Two agents start from the same base workspace.
+drive9 fs layer create :/repo --name fix-auth-a --tag agent=a
+drive9 fs layer create :/repo --name fix-auth-b --tag agent=b
+
+drive9 mount --mode=fuse --layer fix-auth-a :/repo ./attempt-a
+drive9 mount --mode=fuse --layer fix-auth-b :/repo ./attempt-b
+
+# Each agent edits, tests, and checkpoints independently.
+drive9 fs layer checkpoint fix-auth-a --label tests-pass
+drive9 fs layer checkpoint fix-auth-b --label alternative-pass
+
+# The first commit updates the base. The second is preserved if it conflicts.
+drive9 fs layer commit fix-auth-a
+drive9 fs layer commit fix-auth-b   # becomes conflicted if the base moved
+```
+
+A conflicted layer is not silently overwritten or discarded. It stays available
+for review, diff, rollback, or manual resolution.
+
+### Vault and Journal Surfaces
+
+Workspace state often depends on credentials and audit trails. Drive9 includes a
+vault namespace for scoped secrets and an append-only journal for agent/workflow
+events.
+
+```bash
+drive9 mount vault /n/vault
+drive9 vault grant /n/vault/prod-db/DB_URL --agent alice --perm read --ttl 1h
+
+drive9 journal new -id run-42 -title "run 42"
+echo '{"type":"tool.call.completed","summary":{"tool":"pytest"}}' \
+  | drive9 journal append run-42
+drive9 journal verify run-42
+```
+
+## Architecture
+
+```mermaid
+flowchart TB
+    A[AI agents<br/>sandboxes<br/>humans] --> B[FUSE mount<br/>CLI<br/>Go SDK<br/>HTTP API]
+    B --> C[Drive9 server]
+
+    C --> D[Workspace state<br/>paths, revisions, layers,<br/>checkpoints, scoped tokens]
+    C --> E[Local execution layer<br/>.git, deps, build cache,<br/>tool state, packs]
+    C --> F[Vault + journal<br/>secrets, grants,<br/>agent/workflow audit]
+
+    D --> G[(TiDB / MySQL-compatible<br/>metadata store)]
+    F --> G
+    D --> H[(S3-compatible<br/>object storage)]
+    E --> H
+```
+
+Small files and metadata live in the metadata store. Large content, LayerFS
+objects, and local-state packs use S3-compatible object storage. Drive9 owns
+mount, fork, attempt, checkpoint, rollback, commit, conflict handling, scoped
+access, and audit/search metadata.
+
+## Runtime-Managed, Not After-the-Fact
+
+| Approach | Where state mainly lives | Best at | Limit |
+| --- | --- | --- | --- |
+| Local sandbox disk | One sandbox or VM | Fast execution | Dies with the sandbox |
+| Git | Repository history | Final review and merge | Weak for logs, caches, failed attempts, and work-in-progress state |
+| Object storage + database | Application code | Custom persistence | Every framework rebuilds branching, recovery, permissions, and conflicts |
+| ArtifactFS-style FUSE + Git systems | Local overlay plus Git handoff | Repo cold start and Git-native workflow | Workspace state is mostly handed off after work happens |
+| AgentFS-style session systems | Portable session database | Queryable agent/session state | Workspace files are not a live server-side runtime object |
+| **Drive9** | Server-side workspace state | Runtime workspace lifecycle | Requires a Drive9 server and explicit workspace model |
+
+Use ArtifactFS-style systems when the main problem is opening repositories
+quickly. Use AgentFS-style systems when the main problem is carrying a portable
+session database. Use Drive9 when the main problem is managing the worksite while
+agents are still working.
 
 ## Quick Start
 
-### Build
+Build the binaries:
 
 ```bash
 go build -o bin/drive9 ./cmd/drive9
@@ -59,464 +211,53 @@ go build -o bin/drive9-server ./cmd/drive9-server
 go build -o bin/drive9-server-local ./cmd/drive9-server-local
 ```
 
-### Configure A Client
-
-Use an existing server:
+Connect to a Drive9 server and mount a workspace:
 
 ```bash
-drive9 ctx add --name prod --server https://api.drive9.ai --api-key "$DRIVE9_API_KEY"
-drive9 ctx use prod
+bin/drive9 ctx add --name dev --server https://api.drive9.ai --api-key "$DRIVE9_API_KEY"
+bin/drive9 ctx use dev
+bin/drive9 mount --mode=fuse :/ ~/drive9
 ```
 
-Or provision a tenant when the server is configured for tenant creation:
+Simulate a sandbox handoff:
 
 ```bash
-drive9 create --name dev --server https://api.drive9.ai
-drive9 ctx use dev
+# Sandbox A
+printf 'notes from run 42\n' > ~/drive9/run-42.txt
+bin/drive9 umount ~/drive9
+
+# Sandbox B
+bin/drive9 mount --mode=fuse :/ ~/drive9
+cat ~/drive9/run-42.txt
 ```
 
-### Filesystem Commands
+## Boundaries
+
+- Drive9 keeps workspace state; another system still runs the sandbox process.
+- It does not preserve live processes, sockets, terminals, or in-memory model context.
+- It is not a Git replacement; Git remains the final review and history layer.
+- It targets agent workspace workloads, not full general-purpose POSIX compatibility.
+- Search and semantic metadata exist, but Drive9 is not a vector-memory product.
+
+## Documentation
+
+- [LayerFS V1 design](docs/design/layered-filesystem-v1-design.md)
+- [Pack/unpack profile spec](docs/design/pack-unpack-profile-spec.md)
+- [Git fast clone workspace design](docs/design/git-fast-clone-workspace.md)
+- [Vault quickstart](docs/guides/vault-quickstart.md)
+
+## Development
 
 ```bash
-drive9 fs cp ./data.tar :/data/data.tar
-drive9 fs cp --append ./tail.log :/logs/app.log
-drive9 fs cp --tag topic=pricing --tag owner=agent ./plan.md :/notes/plan.md
-drive9 fs cp --description "deployment notes" ./runbook.md :/docs/runbook.md
-
-drive9 fs cat :/docs/runbook.md
-drive9 fs ls -l :/docs/
-drive9 fs stat -o json :/docs/runbook.md
-
-drive9 fs grep "pricing" :/
-drive9 fs find :/notes -tag topic=pricing
-drive9 fs find :/notes -tag owner
-
-drive9 fs cp :/a.bin :/b.bin
-drive9 fs mv :/old.bin :/new.bin
-drive9 fs mkdir :/new-dir
-drive9 fs rm :/old.bin
-drive9 fs rm -r :/old-dir
+go test ./...
+go test -race ./pkg/fuse ./pkg/backend ./pkg/server
 ```
 
-### Mount
+Focused end-to-end suites live under `e2e/`, including FUSE write/read gates,
+Git workflow gates, portable pack/unpack, and LayerFS smoke tests.
 
-```bash
-mkdir -p ~/drive9
-drive9 mount --debug :/ ~/drive9
-
-git clone https://github.com/mem9-ai/drive9.git ~/drive9/drive9
-
-drive9 umount ~/drive9
-```
-
-`drive9 mount` starts in the background by default. Use `--foreground` to keep
-the mount process attached to the current terminal until it is unmounted.
-
-The mount command accepts an optional remote root:
-
-```bash
-drive9 mount :/projects/my-agent ./work
-```
-
-Windows note: `drive9 mount` uses the built-in WebDAV redirector and maps to a
-drive letter, not a directory mountpoint:
-
-```powershell
-drive9 mount :/ X:
-drive9 umount X:
-```
-
-This requires the Windows WebClient service. `drive9 mount vault` still requires
-Linux or macOS because the vault mount is FUSE-only. On Windows, use the
-`drive9 vault ...` commands or the vault API instead of `drive9 mount vault`.
-
-### Tag Filter Semantics
-
-`drive9 fs find -tag` uses exact matching:
-
-- `-tag key=value` matches files where both tag key and tag value are equal.
-- `-tag key` matches files that contain that tag key.
-- Prefix, contains, and regex matching are not supported for `-tag`.
-
-## FUSE Prerequisites
-
-Windows is not supported for drive9 FUSE mounts.
-
-**macOS**: install macFUSE.
-
-```bash
-brew install --cask macfuse
-```
-
-On Apple Silicon, approve the system extension in System Settings and reboot if
-macOS asks for it.
-
-**Linux**: install FUSE 3.
-
-```bash
-sudo apt-get install fuse3
-# or: sudo dnf install fuse3
-# or: sudo pacman -S fuse3
-```
-
-## Go SDK
-
-The Go module path is currently `github.com/mem9-ai/dat9`.
-
-```go
-package main
-
-import (
-	"log"
-
-	"github.com/mem9-ai/dat9/pkg/client"
-)
-
-func main() {
-	c := client.New("https://api.drive9.ai", "your-api-key")
-
-	if err := c.Write("/data/file.txt", []byte("hello")); err != nil {
-		log.Fatal(err)
-	}
-
-	data, err := c.Read("/data/file.txt")
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("read %d bytes", len(data))
-
-	entries, err := c.List("/data/")
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Printf("entries: %d", len(entries))
-
-	if err := c.Copy("/data/file.txt", "/data/file-copy.txt"); err != nil {
-		log.Fatal(err)
-	}
-	if err := c.Rename("/data/file-copy.txt", "/data/file-renamed.txt"); err != nil {
-		log.Fatal(err)
-	}
-	if err := c.Delete("/data/file-renamed.txt"); err != nil {
-		log.Fatal(err)
-	}
-}
-```
-
-## Architecture
-
-```text
-             +--------------------------------------+
-             |             path namespace           |
-             |   :/src/main.go   :/data/run.bin     |
-             +------------------+-------------------+
-                                |
-          +---------------------+----------------------+
-          |                    |                       |
-   +------v------+     +-------v------+        +-------v------+
-   |     CLI     |     |     FUSE     |        |    Go SDK    |
-   | drive9 fs   |     | drive9 mount |        | pkg/client   |
-   +------+------+     +-------+------+        +-------+------+
-          |                    |                       |
-          +--------------------+-----------------------+
-                               |
-                    drive9 HTTP server
-                    /v1/fs, /v2/uploads, /v1/events
-                               |
-          +--------------------+----------------------+
-          |                                           |
-   < 50KB |                                    >= 50KB |
-          v                                           v
-   +-------------------+                      +-------------------+
-   | TiDB tenant DB    |                      | S3-compatible     |
-   | metadata, inline  |                      | object storage    |
-   | bytes, FTS, vec   |                      | presigned upload  |
-   +-------------------+                      +-------------------+
-```
-
-### Tenant Databases
-
-Current tenant providers are selected explicitly:
-
-```text
-DRIVE9_TENANT_PROVIDER=db9 | tidb_zero | tidb_cloud_starter
-```
-
-- `tidb_zero`: default development/provisioning path backed by TiDB Zero.
-- `tidb_cloud_starter`: production-oriented TiDB Cloud Starter pool takeover.
-- `db9`: supported provider path with its own schema, but not the default
-  architecture used in this README.
-
-The server also requires a control-plane metadata database:
-
-```text
-DRIVE9_META_DSN=<mysql-compatible-dsn>
-```
-
-### Storage Model
-
-drive9 separates paths from file entities, like a Unix dentry/inode model:
-
-- `file_nodes`: path tree entries, parent/name, directory flag, file reference
-- `files`: file entity, storage location, size, checksum, revision, search text
-- `file_tags`: key-value tags
-- `uploads`: multipart upload state
-- `semantic_tasks`: durable async work for extraction / semantic processing
-- `llm_usage`: usage accounting for semantic workers
-
-TiDB auto-embedding tenants use generated vector columns from `content_text` and
-`description`. App-managed embedding paths keep revision-aware vector state in
-application-managed columns.
-
-### Upload Protocol
-
-Small files use direct `PUT /v1/fs/{path}` and may be stored inline in the tenant
-database. Large files use object storage:
-
-- **v1 uploads**: initiate upload, presign all parts, upload parts, complete.
-- **v2 uploads**: initiate upload, presign parts on demand or in batches, upload
-  parts, complete. The FUSE streaming write path uses this mode.
-
-Object storage can be AWS S3 or the local S3-compatible mock used by
-`drive9-server-local`. S3 server-side encryption is configurable with
-`none`, `sse-s3`, `sse-kms`, or `dsse-kms`.
-
-### FUSE Write Path
-
-The FUSE layer classifies writes at runtime:
-
-| Mode | Condition | Memory | Upload |
-|---|---|---|---|
-| Small file | `< 50,000` bytes | O(size) | direct commit after close/debounce |
-| Sequential append | new append-only file | bounded by part buffers | streaming multipart during `write()` |
-| Non-sequential new file | back-write detected | shadow/spill backed | upload at flush/release |
-| Existing file edit | opened without truncate | dirty parts only | patch/overwrite at flush/release |
-
-Local durability uses `ShadowStore`, `PendingIndex`, and a journal-backed
-`CommitQueue`. This lets the mount recover queued data after process restarts
-instead of relying only on in-memory write state.
-
-### FUSE Read Path
-
-- Small files: in-memory LRU read cache.
-- Large sequential reads: adaptive prefetch, growing from 256KB up to 16MB.
-- Large random reads: HTTP range reads.
-- Dirty handles: reads are served from the local write buffer / shadow first.
-
-SSE events from `/v1/events` invalidate caches for foreign changes. Local
-same-mount mutations update userspace caches directly and avoid redundant kernel
-notify storms.
-
-Revision-bound `GetAttr` hits from the directory cache are disabled by default
-because the current SSE event stream is process-local. Enable
-`drive9 mount --trust-process-local-events` only when tenant mutations and
-`/v1/events` are guaranteed to use the same server process through
-single-server/sticky routing, or when the deployment provides a cluster-wide
-durable event stream. Without that explicit trust boundary, regular-file
-`GetAttr` falls back to remote HEAD revalidation.
-
-## HTTP API
-
-Authenticate HTTP API calls with `Authorization: Bearer $DRIVE9_API_KEY`.
-`X-API-Key: $DRIVE9_API_KEY` is accepted for compatibility. Query modifiers are
-presence-based, so `?list` and `?list=1` are equivalent.
-
-Core filesystem endpoints:
-
-```text
-PUT    /v1/fs/{path}              write small file
-GET    /v1/fs/{path}              read file
-HEAD   /v1/fs/{path}              lightweight stat
-GET    /v1/fs/{path}?stat         JSON metadata stat
-GET    /v1/fs/{path}?list         list directory
-GET    /v1/fs/{path}?grep         search file contents
-GET    /v1/fs/{path}?find         find files by attributes
-PATCH  /v1/fs/{path}              patch large file parts
-DELETE /v1/fs/{path}              delete
-DELETE /v1/fs/{path}?recursive    recursive delete
-POST   /v1/fs/{path}?append       append
-POST   /v1/fs/{path}?copy         copy (X-Dat9-Copy-Source)
-POST   /v1/fs/{path}?hardlink     hard link (X-Dat9-Hardlink-Source)
-POST   /v1/fs/{path}?rename       rename (X-Dat9-Rename-Source)
-POST   /v1/fs/{path}?mkdir        mkdir
-```
-
-Upload and event endpoints:
-
-```text
-POST   /v1/uploads/initiate
-GET    /v1/uploads?path={path}
-POST   /v1/uploads/{id}/resume
-POST   /v1/uploads/{id}/complete
-DELETE /v1/uploads/{id}
-
-POST   /v2/uploads/initiate
-POST   /v2/uploads/{id}/presign
-POST   /v2/uploads/{id}/presign-batch
-POST   /v2/uploads/{id}/complete
-POST   /v2/uploads/{id}/abort
-
-GET    /v1/events                 SSE change stream
-GET    /v1/status                 server status and upload limits
-```
-
-Vault endpoints also exist for secret storage, scoped grants, delegated tokens,
-and read-only vault mounts.
-
-## Mount Options
-
-```text
-drive9 mount [flags] [:/remote] <mountpoint>
-
-  -server string                 server URL
-  -api-key string                owner API key
-  -mode auto|fuse|webdav          mount mode (default: auto)
-  -durability auto|interactive|fsync|close-sync|write-sync (default: auto)
-  -profile string                mount profile
-  -cache-dir string              write-back cache dir (default: ~/.cache/drive9)
-  -cache-size int                read cache size in MB (default: 128)
-  -dir-ttl duration              directory cache TTL (default: 10s)
-  -attr-ttl duration             kernel attr cache TTL (default: 10s)
-  -entry-ttl duration            kernel entry cache TTL (default: 10s)
-  -flush-debounce duration       small-file flush debounce (default: 2s)
-  -lookup-retry-count int        detached stat retries after transient lookup errors
-  -lookup-retry-timeout duration timeout per detached lookup retry
-  -read-concurrency int          concurrent backend reads issued by FUSE (default: 24)
-  -fuse-sync-read                disable kernel async read dispatch per file handle
-  -allow-other                   allow other users to access mount
-  -read-only                     mount read-only
-  -debug                         enable FUSE debug logging
-  -perf-counters                 print FUSE perf counter summary on unmount
-```
-
-## Server Configuration
-
-Important environment variables:
-
-```text
-DRIVE9_META_DSN                 control-plane MySQL/TiDB DSN
-DRIVE9_TENANT_PROVIDER          db9 | tidb_zero | tidb_cloud_starter
-DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT
-                                default TiDB Cloud Starter spendingLimit.monthly in USD cents
-DRIVE9_TOKEN_SIGNING_KEY        32-byte hex JWT signing key
-DRIVE9_ENCRYPT_TYPE             local_aes | kms
-DRIVE9_MASTER_KEY               local AES key
-DRIVE9_ENCRYPT_KEY              KMS key id or alias
-DRIVE9_MAX_UPLOAD_BYTES         max upload size
-
-DRIVE9_S3_BUCKET                enable AWS/S3-compatible object storage
-DRIVE9_S3_REGION
-DRIVE9_S3_PREFIX
-DRIVE9_S3_ENDPOINT              custom endpoint for MinIO/S3-compatible stores
-DRIVE9_S3_FORCE_PATH_STYLE
-DRIVE9_S3_ACCESS_KEY_ID
-DRIVE9_S3_SECRET_ACCESS_KEY
-DRIVE9_S3_ROLE_ARN
-DRIVE9_S3_ENCRYPTION_MODE       none | sse-s3 | sse-kms | dsse-kms
-DRIVE9_S3_KMS_KEY_ID
-
-DRIVE9_QUERY_EMBED_*            app-side query embedding provider
-DRIVE9_EMBED_*                  app-managed background embedding provider
-DRIVE9_IMAGE_EXTRACT_*          async image-to-text extraction
-DRIVE9_AUDIO_EXTRACT_*          async audio-to-text extraction
-```
-
-`drive9-server-local` is the preferred local single-tenant validation server.
-It uses `DRIVE9_LOCAL_DSN` for the tenant database and can use a local object
-store directory when no S3 bucket is configured.
-
-## Testing
-
-```bash
-make test
-make test TEST_RUN='TestInsertAndGetNode' TEST_PKGS='./pkg/datastore/...'
-```
-
-Tests use `DRIVE9_TEST_MYSQL_DSN` when set; otherwise the test harness starts a
-MySQL/TiDB-compatible container through testcontainers and the Podman-aware
-scripts.
-
-### Failpoint Tests
-
-drive9 has failpoint-based tests for high-value concurrency and failure paths,
-including semantic task lease expiry, renew boundaries, lease loss, and panic
-cleanup.
-
-```bash
-make test-failpoint
-# or
-python3 scripts/run_failpoint_tests.py
-```
-
-Failpoint tests temporarily rewrite instrumented source files and restore them
-after the run. Do not run them in parallel with ordinary `go test` commands.
-
-### FUSE / E2E Tests
-
-FUSE behavior depends on OS support and `/dev/fuse`, so real mount validation
-lives in e2e scripts and local Ubuntu/macOS runs. Pull requests run
-`local-e2e`, which includes the strict FUSE release gate with real mount smoke,
-read/write correctness, Git clone/config lockfile coverage, remount checks, and
-rollback-journal SQLite correctness. Heavier FUSE gates are opt-in for manual
-`workflow_dispatch` runs and enabled by the daily scheduled run: ordinary FUSE
-concurrency stress, POSIX/fsx-style random write-truncate-rename coverage,
-SQLite WAL/churn/readers-writer correctness, and the FUSE performance baseline.
-
-The performance baseline emits JSON metrics for small-file I/O, large-file
-I/O, rollback-journal SQLite transactions, WAL SQLite transactions, and WAL
-checkpoint/truncate latency. SQLite benchmark metrics are still correctness
-checked: row payload bytes are read back and SHA-256 verified, `PRAGMA
-integrity_check` must return `ok`, and WAL checkpoint must report no busy
-readers. Metrics are uploaded as GitHub artifacts and can be archived to the
-Drive9 CI workspace by setting `ARCHIVE_FUSE_PERFORMANCE_METRICS=1`.
-
-For reference, mature FUSE projects such as JuiceFS also run much broader
-periodic suites (`pjdfstest`, LTP fs/fsx/fcntl, random-op stress, xattr, and
-vdbench/fio-style benchmarks). Drive9 now includes a lightweight fsx-style
-scheduled/manual gate; full external POSIX/fault suites remain good candidates
-for separate jobs if broader filesystem compatibility becomes the gate.
-
-The simplest manual sanity check is a real mount plus Git workflow:
-
-```bash
-drive9 mount :/ ./work --debug
-git clone https://github.com/mem9-ai/drive9.git ./work/drive9
-git -C ./work/drive9 status
-```
-
-## Project Layout
-
-```text
-cmd/drive9/              CLI
-cmd/drive9-server/       multi-tenant HTTP server
-cmd/drive9-server-local/ single-tenant local validation server
-
-pkg/backend/             filesystem backend, upload, semantic task integration
-pkg/client/              Go HTTP client and transfer engine
-pkg/datastore/           TiDB/MySQL metadata and file state store
-pkg/fuse/                go-fuse filesystem, caching, writeback, SSE invalidation
-pkg/server/              HTTP API, SSE, auth, metrics, semantic worker
-pkg/s3client/            AWS S3 and local S3-compatible storage
-pkg/tenant/              tenant provisioning, pooling, provider selection
-pkg/tenant/schema/       TiDB schema and auto-embedding validation
-pkg/tenant/db9/          db9 provider path
-pkg/vault/               secret vault, grants, delegated token primitives
-pkg/embedding/           OpenAI-compatible embedding client
-pkg/encrypt/             local AES and KMS encryption wrappers
-pkg/meta/                control-plane metadata store
-pkg/webdav/              WebDAV adapter
-```
-
-## References
-
-- [TiDB](https://www.pingcap.com/tidb/) — current primary tenant database path.
-- [db9](https://db9.ai/) — related provider path and original design
-  inspiration; not the default backend in the current README architecture.
-- [AGFS](https://github.com/c4pt0r/agfs) — Plan 9-inspired filesystem
-  interfaces used by the backend.
-- [go-fuse](https://github.com/hanwen/go-fuse) — FUSE library used by the mount.
-- [Plan 9](https://plan9.io/plan9/) — names and files as the interface.
+Note: the public project is Drive9; the Go module path is currently `github.com/mem9-ai/dat9`.
 
 ## License
 
-Apache 2.0
+Apache 2.0.

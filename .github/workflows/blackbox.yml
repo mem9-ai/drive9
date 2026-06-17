@@ -1,36 +1,6 @@
 name: blackbox
 
 on:
-  pull_request:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/blackbox.yml"
-      - "blackbox/run.py"
-      - "blackbox/harness/**"
-      - "blackbox/suites/**"
-      - "cmd/**"
-      - "pkg/**"
-      - "internal/**"
-      - "go.mod"
-      - "go.sum"
-      - "Makefile"
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/blackbox.yml"
-      - "blackbox/run.py"
-      - "blackbox/harness/**"
-      - "blackbox/suites/**"
-      - "cmd/**"
-      - "pkg/**"
-      - "internal/**"
-      - "go.mod"
-      - "go.sum"
-      - "Makefile"
-  schedule:
-    - cron: "27 20 * * *"
   workflow_dispatch:
     inputs:
       selector:
@@ -48,14 +18,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: blackbox-${{ github.event_name == 'push' && 'main-post-merge' || github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'push' }}
+  group: blackbox-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   BLACKBOX_SUITE: fuse
-  BLACKBOX_SELECTOR: ${{ github.event_name == 'workflow_dispatch' && inputs.selector || 'all' }}
-  BLACKBOX_RUNS: ${{ github.event_name == 'workflow_dispatch' && inputs.runs || '3' }}
-  BLACKBOX_STRICT: ${{ github.event_name == 'pull_request' && '0' || '1' }}
+  BLACKBOX_SELECTOR: ${{ inputs.selector || 'all' }}
+  BLACKBOX_RUNS: ${{ inputs.runs || '3' }}
+  BLACKBOX_STRICT: "1"
   PJDFSTEST_ALLOW_NONROOT: "1"
   DRIVE9_LOCAL_EMBEDDING_MODE: none
   DRIVE9_LOCAL_INIT_SCHEMA: "true"

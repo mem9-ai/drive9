@@ -422,15 +422,15 @@ jobs:
           ./configure
           make pjdfstest
 
-      - name: Run POSIX feature matrix
-        id: posix-feature-matrix
+      - name: Run pjdfstest POSIX suite
+        id: pjdfstest-suite
         if: always() && env.RUN_POSIX_FEATURE_MATRIX == '1'
         continue-on-error: true
         env:
           PJDFSTEST_DIR: /tmp/pjdfstest
           PJDFSTEST_ALLOW_NONROOT: "1"
           FUSE_STRICT_PREREQS: "1"
-        run: bash e2e/posix-feature-matrix.sh
+        run: bash e2e/pjdfstest-suite.sh
 
       - name: Upload feature matrix artifacts
         if: always() && (env.RUN_GIT_FEATURE_MATRIX == '1' || env.RUN_POSIX_FEATURE_MATRIX == '1')
@@ -462,7 +462,7 @@ jobs:
             echo "| FUSE POSIX/fsx gate | ${{ steps.fuse-posix-fsx.outcome || 'skipped' }} |"
             echo "| Full smoke-all suite | ${{ steps.smoke-all.outcome || 'skipped' }} |"
             echo "| Git feature matrix | ${{ steps.git-feature-matrix.outcome || 'skipped' }} |"
-            echo "| POSIX feature matrix | ${{ steps.posix-feature-matrix.outcome || 'skipped' }} |"
+            echo "| pjdfstest POSIX suite | ${{ steps.pjdfstest-suite.outcome || 'skipped' }} |"
             echo
             echo "FUSE concurrency stress: \`RUN_FUSE_CONCURRENCY_STRESS=${RUN_FUSE_CONCURRENCY_STRESS}\`"
             echo "FUSE concurrency stress required: \`FUSE_CONCURRENCY_STRESS_REQUIRED=${FUSE_CONCURRENCY_STRESS_REQUIRED}\`"
@@ -475,7 +475,7 @@ jobs:
             echo "Compare FUSE performance metrics: \`COMPARE_FUSE_PERFORMANCE_METRICS=${COMPARE_FUSE_PERFORMANCE_METRICS}\`"
             echo "Full smoke-all suite: \`RUN_E2E_SMOKE_ALL=${RUN_E2E_SMOKE_ALL}\`"
             echo "Git feature matrix: \`RUN_GIT_FEATURE_MATRIX=${RUN_GIT_FEATURE_MATRIX}\`"
-            echo "POSIX feature matrix: \`RUN_POSIX_FEATURE_MATRIX=${RUN_POSIX_FEATURE_MATRIX}\`"
+            echo "pjdfstest POSIX suite: \`RUN_POSIX_FEATURE_MATRIX=${RUN_POSIX_FEATURE_MATRIX}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Dump TiDB playground logs

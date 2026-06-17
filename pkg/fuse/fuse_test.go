@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -89,6 +90,28 @@ func TestInodeToPath_ForgetDirectoryKeepsMapping(t *testing.T) {
 	}
 }
 
+func TestInodeToPath_ForgetOwnerMetadataKeepsMapping(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/tmp", false, 0, time.Now())
+	m.UpdateOwner(ino, 65534, 65534, true, true)
+	m.Forget(ino, 1)
+	p, ok := m.GetPath(ino)
+	if !ok || p != "/tmp" {
+		t.Fatalf("owner-tracked inode mapping should be preserved, got %q, %v", p, ok)
+	}
+}
+
+func TestInodeToPath_ForgetMetadataOnlySpecialKeepsMapping(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/pipe", false, 0, time.Now())
+	m.SetModeState(ino, uint32(syscall.S_IFIFO)|0o644, true)
+	m.Forget(ino, 1)
+	p, ok := m.GetPath(ino)
+	if !ok || p != "/pipe" {
+		t.Fatalf("metadata-only special inode mapping should be preserved, got %q, %v", p, ok)
+	}
+}
+
 func TestInodeToPath_ForgetRoot(t *testing.T) {
 	m := NewInodeToPath()
 	m.Forget(1, 1)
@@ -127,8 +150,28 @@ func TestInodeToPath_RenameReplacesDestination(t *testing.T) {
 	if p, ok := m.GetPath(srcIno); !ok || p != "/config" {
 		t.Fatalf("source path = %q, %v; want /config, true", p, ok)
 	}
-	if p, ok := m.GetPath(dstIno); ok {
-		t.Fatalf("replaced destination inode still mapped to %q", p)
+	if gotIno, ok := m.GetInode("/config"); !ok || gotIno == dstIno {
+		t.Fatalf("destination path still resolves to replaced inode %d, %v", gotIno, ok)
+	}
+}
+
+func TestInodeToPath_RenameReplacesDestinationPreservesUnlinkedInode(t *testing.T) {
+	m := NewInodeToPath()
+	srcIno := m.Lookup("/config.lock", false, 10, time.Now())
+	dstIno := m.Lookup("/config", false, 5, time.Now())
+
+	m.Rename("/config.lock", "/config")
+
+	gotIno, ok := m.GetInode("/config")
+	if !ok || gotIno != srcIno {
+		t.Fatalf("GetInode(/config) = %d, %v; want %d, true", gotIno, ok, srcIno)
+	}
+	dstEntry, ok := m.GetEntry(dstIno)
+	if !ok {
+		t.Fatal("replaced destination inode should be preserved for open handles")
+	}
+	if !dstEntry.Unlinked || dstEntry.Nlink != 0 || dstEntry.Path != "/config" {
+		t.Fatalf("destination entry = %+v; want unlinked nlink=0 at old path", dstEntry)
 	}
 }
 
@@ -292,6 +335,27 @@ func TestReadCache_TTLExpiry(t *testing.T) {
 	_, ok := rc.Get("/f", 1)
 	if ok {
 		t.Fatal("expected cache miss after TTL expiry")
+	}
+}
+
+func TestReadCache_NoTTLExpiry(t *testing.T) {
+	rc := NewReadCache(1<<20, readCacheNoExpiryTTL)
+	rc.Put("/f", []byte("x"), 1)
+	time.Sleep(5 * time.Millisecond)
+	got, ok := rc.Get("/f", 1)
+	if !ok {
+		t.Fatal("expected cache hit when time-based expiry is disabled")
+	}
+	if string(got) != "x" {
+		t.Fatalf("got %q, want x", got)
+	}
+}
+
+func TestReadCache_NoTTLExpiryStillChecksRevision(t *testing.T) {
+	rc := NewReadCache(1<<20, readCacheNoExpiryTTL)
+	rc.Put("/f", []byte("x"), 1)
+	if _, ok := rc.Get("/f", 2); ok {
+		t.Fatal("expected cache miss on revision mismatch")
 	}
 }
 

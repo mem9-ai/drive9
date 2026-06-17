@@ -63,14 +63,20 @@ async function uploadPatchPart(client: Client, part: PatchPartURL, readPart: Rea
     origData = new Uint8Array(await resp.arrayBuffer());
   }
   const data = readPart(part.number, part.size, origData);
-  const checksum = await sha256Base64(data);
-  const headers: Record<string, string> = { "x-amz-checksum-sha256": checksum };
+  const headers: Record<string, string> = {};
+  let shouldSendChecksum = false;
   if (part.headers) {
     for (const [k, v] of Object.entries(part.headers)) {
       if (typeof v === "string" && k.toLowerCase() !== "host") {
         headers[k] = v;
+        if (k.toLowerCase() === "x-amz-checksum-sha256") {
+          shouldSendChecksum = true;
+        }
       }
     }
+  }
+  if (shouldSendChecksum) {
+    headers["x-amz-checksum-sha256"] = await sha256Base64(data);
   }
   const resp = await fetch(part.url, { method: "PUT", headers, body: bodyInit(data) });
   await checkError(resp);
@@ -85,4 +91,3 @@ async function sha256Base64(data: Uint8Array): Promise<string> {
   const hash = await crypto.subtle.digest("SHA-256", bufferSource(data));
   return bytesToBase64(new Uint8Array(hash));
 }
-
