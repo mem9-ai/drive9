@@ -13921,6 +13921,18 @@ func TestFlushHandle_Path2_SnapshotIsolation(t *testing.T) {
 	if !hasDirty {
 		t.Fatal("Dirty.HasDirtyParts() = false after flush with concurrent write — new write not preserved")
 	}
+
+	// Verify inode size reflects the concurrent write, not the old snapshot.
+	// Without this guard, UpdateSize(ino, size) would roll back to the
+	// uploaded snapshot size, making getattr report a stale file length.
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found after flush")
+	}
+	if entry.Size != int64(len(mutated)) {
+		t.Fatalf("inode size = %d, want %d (concurrent write size); stale snapshot size would be %d",
+			entry.Size, len(mutated), len(original))
+	}
 }
 
 func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {

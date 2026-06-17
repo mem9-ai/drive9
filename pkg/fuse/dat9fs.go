@@ -11671,8 +11671,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.invalidateReadCacheAndTargetsExcept(handlePath, fh)
 		fs.finalizeHandleFlushLocked(fh, expectedRevision)
 	}
-	fs.inodes.UpdateSize(handleIno, size)
-	fs.cacheFileForPath(handlePath, size, time.Now(), committedRev)
+	// When concurrent writes happened (DirtySeq changed), the buffer may
+	// have a different size than the uploaded snapshot. Use the current
+	// dirty buffer size so inode attrs and dir cache reflect reality.
+	publishSize := size
+	if fh.DirtySeq != 0 && fh.Dirty != nil {
+		publishSize = fh.Dirty.Size()
+	}
+	fs.inodes.UpdateSize(handleIno, publishSize)
+	fs.cacheFileForPath(handlePath, publishSize, time.Now(), committedRev)
 	// Local flush — kernel receives the Flush reply with status.
 	// No notifyInode/notifyEntry needed; userspace caches are updated
 	// above and kernel will refresh attrs on next getattr/lookup.
