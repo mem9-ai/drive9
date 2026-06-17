@@ -132,6 +132,7 @@ blackbox:
 		module:*) args=(--module "$${selector#module:}");; \
 		*) args=(--module "$$selector");; \
 	esac; \
+	echo "blackbox: suite=$(BLACKBOX_SUITE) selector=$$selector runs=$(BLACKBOX_RUNS)"; \
 	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --runs "$(BLACKBOX_RUNS)"
 
 blackbox-list:
@@ -147,6 +148,7 @@ blackbox-deps:
 		module:*) args=(--module "$${selector#module:}");; \
 		*) args=(--module "$$selector");; \
 	esac; \
+	echo "blackbox deps: suite=$(BLACKBOX_SUITE) selector=$$selector"; \
 	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --deps-only
 
 build-cli:

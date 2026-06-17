@@ -52,6 +52,7 @@ class BlackboxRunner:
         self.capabilities = self.provider.detect_capabilities()
         self.target = self.provider.create_target(args, self.result_dir, self.recorder, session=self.session)
         self.deps = self.provider.create_deps(auto_fetch=not args.offline, recorder=self.recorder)
+        self.summary_printed = False
         self.ctx = Context(
             args=args,
             session=self.session,
@@ -141,7 +142,7 @@ class BlackboxRunner:
             manifest["git_sha"] = "unknown"
         write_json(self.result_dir / "manifest.json", manifest)
 
-    def write_report(self) -> None:
+    def write_report(self) -> Path:
         summary = self.recorder.summary()
         lines = [
             f"# Drive9 {self.suite.upper()} Blackbox Report",
@@ -176,7 +177,19 @@ class BlackboxRunner:
                     lines.append(
                         f"| `{name}` | {summary_item.get('unit', '')} | {float(summary_item.get('mean', 0)):.3f} | {float(summary_item.get('median', 0)):.3f} | {len(values)} |"
                     )
-        (self.result_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        report_path = self.result_dir / "report.md"
+        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return report_path
+
+    def finish_report(self) -> None:
+        report_path = self.write_report()
+        if self.summary_printed:
+            return
+        summary = self.recorder.summary()
+        counts = " ".join(f"{status}={summary.get(status, 0)}" for status in (PASS, FAIL, SKIP, XFAIL, WARN))
+        print(f"blackbox summary: {counts}", flush=True)
+        print(f"blackbox report: {report_path}", flush=True)
+        self.summary_printed = True
 
     def deps_only(self) -> int:
         for module_id in self.selected:
@@ -194,7 +207,7 @@ class BlackboxRunner:
                 if self.args.fail_fast:
                     raise
         self.write_manifest()
-        self.write_report()
+        self.finish_report()
         return 1 if self.recorder.has_failures() else 0
 
     def run_module(self, module_id: str) -> None:
@@ -249,7 +262,7 @@ class BlackboxRunner:
             for record in prereq_records:
                 self.recorder.record(record)
             self.write_manifest()
-            self.write_report()
+            self.finish_report()
             if strict:
                 return 1
             return 0
@@ -259,10 +272,10 @@ class BlackboxRunner:
             for module_id in self.selected:
                 self.run_module(module_id)
             self.write_manifest()
-            self.write_report()
+            self.finish_report()
             return 1 if self.recorder.has_failures() else 0
         finally:
-            self.write_report()
+            self.finish_report()
             self.provider.cleanup(self.ctx)
 
 
