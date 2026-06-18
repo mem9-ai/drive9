@@ -430,19 +430,20 @@ func DeleteTenant(args []string) error {
 	}
 
 	if !skipConfirm {
-		if isTerminal(os.Stdin) {
-			fmt.Fprintf(os.Stderr, "WARNING: this will permanently delete the current tenant,\n")
-			fmt.Fprintf(os.Stderr, "including its TiDB cluster, database, API keys, and all stored files.\n")
-			fmt.Fprint(os.Stderr, "Continue? [y/N]: ")
-			var answer string
-			if _, err := fmt.Fscanln(os.Stdin, &answer); err != nil {
-				return fmt.Errorf("delete cancelled")
-			}
-			switch strings.ToLower(strings.TrimSpace(answer)) {
-			case "y", "yes":
-			default:
-				return fmt.Errorf("delete cancelled")
-			}
+		if !isTerminal(os.Stdin) {
+			return fmt.Errorf("refusing to delete without confirmation in non-interactive mode; pass -y to confirm")
+		}
+		fmt.Fprintf(os.Stderr, "WARNING: this will permanently delete the current tenant,\n")
+		fmt.Fprintf(os.Stderr, "including its TiDB cluster, database, API keys, and all stored files.\n")
+		fmt.Fprint(os.Stderr, "Continue? [y/N]: ")
+		var answer string
+		if _, err := fmt.Fscanln(os.Stdin, &answer); err != nil {
+			return fmt.Errorf("delete cancelled")
+		}
+		switch strings.ToLower(strings.TrimSpace(answer)) {
+		case "y", "yes":
+		default:
+			return fmt.Errorf("delete cancelled")
 		}
 	}
 
