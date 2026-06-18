@@ -58,6 +58,7 @@ func ctxUsage() string {
   import                                              add delegated context from stdin (default when stdin is a pipe)
   fork [<new>] [--from <ctx>] [--json] [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]
                                                         create a copy-on-write fork context
+                                                        prefer DRIVE9_PUBLIC_KEY/DRIVE9_PRIVATE_KEY over private-key flags in shared shells
   ls [-l|--json] [--type <kind>|--scoped]             list contexts (filter by type: owner|delegated|fs_scoped)
   use <name>                                          activate a context
   rm <name>                                           remove a local context name (does NOT revoke server-side credential)`

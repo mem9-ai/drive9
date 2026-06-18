@@ -332,8 +332,9 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 		if err := fillBranchEndpoint(out, branch); err != nil {
 			return out, err
 		}
+		return out, nil
 	}
-	return out, nil
+	return out, fmt.Errorf("tidbcloud native branch response missing state and endpoint")
 }
 
 func (p *Provisioner) WaitForBranchActive(ctx context.Context, branch *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {

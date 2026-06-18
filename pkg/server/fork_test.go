@@ -18,6 +18,7 @@ import (
 type fakeBranchProvisioner struct {
 	cluster      *tenant.ClusterInfo
 	provisionErr error
+	initErr      error
 	deleteErr    error
 	provider     string
 
@@ -34,7 +35,7 @@ func (f *fakeBranchProvisioner) ProviderType() string {
 	return tenant.ProviderTiDBCloudStarter
 }
 
-func (f *fakeBranchProvisioner) InitSchema(context.Context, string) error { return nil }
+func (f *fakeBranchProvisioner) InitSchema(context.Context, string) error { return f.initErr }
 
 func (f *fakeBranchProvisioner) Provision(context.Context, string) (*tenant.ClusterInfo, error) {
 	return nil, fmt.Errorf("not implemented")
@@ -392,6 +393,40 @@ func TestCreateForkTenantNativeUsesCredentialsAndDeletesBranchOnFailure(t *testi
 	}
 	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-created" {
 		t.Fatalf("deleted branches = %#v", deleted)
+	}
+}
+
+func TestCreateForkTenantNativeDeletesBranchOnSchemaInitFailure(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Host:      rt.dbHost,
+		Port:      rt.dbPort,
+		Username:  rt.dbUser,
+		DBName:    rt.dbName,
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+	rt.prov.initErr = errors.New("schema init failed")
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+
+	_, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err == nil || !strings.Contains(err.Error(), "schema init failed") {
+		t.Fatalf("createForkTenant error = %v, want schema init failure", err)
+	}
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-created" {
+		t.Fatalf("deleted branches = %#v", deleted)
+	}
+	failed, err := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(failed) != 0 {
+		t.Fatalf("failed tenants = %+v, want branch-deleted fork to be marked deleted", failed)
 	}
 }
 

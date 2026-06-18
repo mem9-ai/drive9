@@ -651,6 +651,9 @@ func generateForkDBPassword(length int) (string, error) {
 	return string(b), nil
 }
 
+// deleteForkBranchOrPersist returns true when no branch exists or branch
+// deletion succeeds. On delete failure it persists branch metadata for a later
+// credentialed retry and returns false.
 func (s *Server) deleteForkBranchOrPersist(ctx context.Context, forkID string, credentialReq *tenant.CredentialProvisionRequest, cluster *tenant.ClusterInfo) bool {
 	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
 		return true
@@ -803,7 +806,7 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 	if t.Status == meta.TenantDeleting {
 		if t.Provider == tenant.ProviderTiDBCloudNative {
 			if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
-				errJSON(w, http.StatusBadGateway, fmt.Sprintf("delete fork branch failed: %v", err))
+				errJSON(w, http.StatusBadGateway, fmt.Sprintf("fork delete cleanup failed: %v", err))
 				return
 			}
 			_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
@@ -827,7 +830,7 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if t.Provider == tenant.ProviderTiDBCloudNative {
 		if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("delete fork branch failed: %v", err))
+			errJSON(w, http.StatusBadGateway, fmt.Sprintf("fork delete cleanup failed: %v", err))
 			return
 		}
 		_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
@@ -856,6 +859,9 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 	if t.Kind != meta.TenantKindFork {
 		return nil
 	}
+	if t.Provider == tenant.ProviderTiDBCloudNative && credentialReq == nil && resolveDefaultCredentials(s.provisioner) == nil {
+		return tenant.ErrCredentialsRequired
+	}
 	if err := s.pool.InvalidateAndWait(ctx, tenantID); err != nil {
 		return fmt.Errorf("drain fork backend: %w", err)
 	}
@@ -877,6 +883,8 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 		return fmt.Errorf("open fork store: %w", err)
 	}
 	defer func() { _ = store.Close() }()
+	// Object GC candidates are keyed by namespace/ref hash, so retrying a
+	// native fork delete safely re-enqueues refs before branch deletion.
 	if err := s.enqueueForkConfirmedRefs(ctx, t, store); err != nil {
 		return fmt.Errorf("enqueue fork refs: %w", err)
 	}

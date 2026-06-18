@@ -482,7 +482,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "--reveal", Desc: "show sensitive fields on ctx show"},
 				{Name: "--type <kind>|--scoped", Desc: "filter ctx ls results"},
 				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key for ctx fork in TiDBCloud mode"},
-				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key for ctx fork in TiDBCloud mode"},
+				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key; prefer DRIVE9_PRIVATE_KEY in shared shells"},
 			},
 			Examples: []visualHelpExample{
 				{Command: "drive9 ctx show", Desc: "show active context"},

@@ -377,6 +377,31 @@ func TestBranchWithCredentialsUsesRequestCredentials(t *testing.T) {
 	}
 }
 
+func TestCreateBranchWithCredentialsRejectsMissingStateAndEndpoint(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"branchId": "branch-1"})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	_, err := p.CreateBranchWithCredentials(context.Background(), "fork-tenant", &tenant.ClusterInfo{
+		ClusterID: "cluster-1",
+		DBName:    "tenant_db",
+	}, tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
+	if err == nil || !strings.Contains(err.Error(), "missing state and endpoint") {
+		t.Fatalf("CreateBranchWithCredentials error = %v, want missing state and endpoint", err)
+	}
+}
+
 func TestDeprovisionWithCredentialsDeletesCluster(t *testing.T) {
 	var gotAuth string
 	var deleteCalled bool
