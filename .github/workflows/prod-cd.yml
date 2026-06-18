@@ -193,6 +193,7 @@ jobs:
           docker tag "$IMAGE" "$TCR_IMAGE"
            TCR_LOG=/tmp/tcr-token.log
            TCR_ERR=/tmp/tcr-token.err
+           tccli configure set secretId "$TENCENTCLOUD_SECRET_ID" secretKey "$TENCENTCLOUD_SECRET_KEY" region "$TENCENTCLOUD_REGION" token "$TENCENTCLOUD_SECURITY_TOKEN" 2>/dev/null || true
            tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm >"$TCR_LOG" 2>"$TCR_ERR"
            TCR_USER=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Response'].get('Username','100049824031'))" < "$TCR_LOG" 2>/dev/null) || true
            TCR_TOKEN=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Response']['Token'])" < "$TCR_LOG" 2>/dev/null) || true
