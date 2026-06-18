@@ -1,7 +1,9 @@
 package s3client
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -82,7 +84,32 @@ func applyS3Options(cfg AWSConfig) func(*s3.Options) {
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
 		}
 		o.UsePathStyle = cfg.ForcePathStyle
+		if isTencentEndpoint(cfg.Endpoint) {
+			o.HTTPClient = &http.Client{
+				Transport: &contentMD5Transport{base: http.DefaultTransport},
+			}
+		}
 	}
+}
+
+type contentMD5Transport struct {
+	base http.RoundTripper
+}
+
+func (t *contentMD5Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.RawQuery, "delete") && req.Body != nil {
+		bodyBytes, err := io.ReadAll(req.Body)
+		if err == nil {
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			hash := md5.Sum(bodyBytes)
+			req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(hash[:]))
+			req.ContentLength = int64(len(bodyBytes))
+		}
+	}
+	if t.base != nil {
+		return t.base.RoundTrip(req)
+	}
+	return http.DefaultTransport.RoundTrip(req)
 }
 
 // New creates an S3-compatible client. The endpoint in cfg determines which
