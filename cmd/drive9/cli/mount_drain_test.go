@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -54,6 +55,40 @@ func TestRunMountDrainJSON(t *testing.T) {
 	}
 	if got.Pending.CommitQueuePending != 1 || got.Pending.CommitQueueBytes != 42 {
 		t.Fatalf("pending = %#v", got.Pending)
+	}
+}
+
+func TestRunMountDrainJSONReturnsErrorForNonOKResponse(t *testing.T) {
+	start := time.Now().UTC()
+	deps := mountDrainDeps{
+		readProcessState: func(string) (mountstate.ProcessState, string, error) {
+			return mountstate.ProcessState{
+				PID:           123,
+				MountKind:     mountstate.MountKindFUSE,
+				ControlSocket: "/tmp/drive9.sock",
+			}, "", nil
+		},
+		requestDrain: func(context.Context, string, time.Duration) (*mountcontrol.DrainResponse, error) {
+			resp := mountcontrol.NewDrainResponse("/mnt/drive9", start)
+			resp.Pending.UploaderCached = 1
+			resp.Fail("pending_work_remaining", "", errors.New("pending work remains after drain"))
+			resp.Finish(start.Add(10 * time.Millisecond))
+			return &resp, nil
+		},
+	}
+
+	out, err := captureStdoutE(t, func() error {
+		return runMountDrain([]string{"--json", "/mnt/drive9"}, deps)
+	})
+	if err == nil || !strings.Contains(err.Error(), "pending work remains after drain") {
+		t.Fatalf("runMountDrain error = %v", err)
+	}
+	var got mountcontrol.DrainResponse
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("unmarshal output: %v\n%s", err, out)
+	}
+	if got.OK || got.Pending.UploaderCached != 1 {
+		t.Fatalf("drain response = %#v", got)
 	}
 }
 

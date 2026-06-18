@@ -137,13 +137,17 @@ func printMountDrainResponse(resp *mountcontrol.DrainResponse) (int, error) {
 	}
 	p := resp.Pending
 	n, err = fmt.Fprintf(os.Stdout,
-		"pending: open_handles=%d dirty_handles=%d commit_queue=%d commit_bytes=%d uploader_queued=%d uploader_in_flight=%d\n",
+		"pending: open_handles=%d dirty_handles=%d commit_queue=%d commit_bytes=%d commit_in_flight=%d commit_delayed=%d commit_conflicts=%d uploader_queued=%d uploader_in_flight=%d uploader_cached=%d\n",
 		p.OpenHandles,
 		p.DirtyHandles,
 		p.CommitQueuePending,
 		p.CommitQueueBytes,
+		p.CommitQueueInFlight,
+		p.CommitQueueDelayed,
+		p.CommitQueueConflicts,
 		p.UploaderQueued,
 		p.UploaderInFlight,
+		p.UploaderCached,
 	)
 	total += n
 	if err != nil {

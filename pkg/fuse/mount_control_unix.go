@@ -9,8 +9,12 @@ import (
 	"errors"
 	"net"
 	"os"
+	"path/filepath"
 	"time"
 
+	"go.uber.org/zap"
+
+	"github.com/mem9-ai/dat9/pkg/logger"
 	"github.com/mem9-ai/dat9/pkg/mountcontrol"
 	"github.com/mem9-ai/dat9/pkg/mountstate"
 )
@@ -24,6 +28,11 @@ type mountControlServer struct {
 
 func startMountControlServer(mountPoint string, fs *Dat9FS) (*mountControlServer, error) {
 	socketPath := mountstate.ControlSocketPath(mountPoint)
+	socketDir := filepath.Dir(socketPath)
+	if err := os.MkdirAll(socketDir, 0o700); err != nil {
+		return nil, err
+	}
+	_ = os.Chmod(socketDir, 0o700)
 	_ = os.Remove(socketPath)
 	ln, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -66,6 +75,7 @@ func (s *mountControlServer) serve() {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
+			logger.Warn(context.Background(), "mount_control_accept_failed", zap.Error(err))
 			continue
 		}
 		go s.handleConn(conn)

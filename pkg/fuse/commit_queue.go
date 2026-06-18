@@ -361,11 +361,13 @@ func (cq *CommitQueue) PendingStats() (count int, bytes int64) {
 }
 
 type CommitQueueSnapshot struct {
-	Pending   int
-	Bytes     int64
-	InFlight  int
-	Delayed   int
-	FirstPath string
+	Pending       int
+	Bytes         int64
+	InFlight      int
+	Delayed       int
+	Conflicts     int
+	ConflictBytes int64
+	FirstPath     string
 }
 
 func (cq *CommitQueue) Snapshot() CommitQueueSnapshot {
@@ -415,6 +417,13 @@ func (cq *CommitQueue) snapshotLocked() CommitQueueSnapshot {
 	}
 	snap.InFlight = len(cq.inFlight)
 	snap.Delayed = len(cq.delayed)
+	if cq.index != nil {
+		var firstConflictPath string
+		snap.Conflicts, snap.ConflictBytes, firstConflictPath = cq.index.ConflictSummary()
+		if snap.FirstPath == "" {
+			snap.FirstPath = firstConflictPath
+		}
+	}
 	return snap
 }
 

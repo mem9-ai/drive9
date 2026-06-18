@@ -9,6 +9,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
+
 	"github.com/mem9-ai/dat9/pkg/mountcontrol"
 )
 
@@ -19,6 +20,7 @@ type drainError struct {
 }
 
 const fuseSyncFSProtocolMinor = 34
+const drainPendingWorkKind = "pending_work_remaining"
 
 func (e *drainError) Error() string {
 	if e == nil || e.err == nil {
@@ -57,6 +59,9 @@ func newDrainStatusError(path string, status gofuse.Status) *drainError {
 }
 
 func (fs *Dat9FS) Drain(ctx context.Context) mountcontrol.DrainResponse {
+	fs.drainMu.Lock()
+	defer fs.drainMu.Unlock()
+
 	startedAt := time.Now().UTC()
 	resp := mountcontrol.NewDrainResponse(fs.mountPointForDrain(), startedAt)
 	fs.populateNativeSyncFSSupport(&resp)
@@ -159,6 +164,9 @@ func (fs *Dat9FS) Drain(ctx context.Context) mountcontrol.DrainResponse {
 	}
 
 	resp.Pending = fs.snapshotDrainPending()
+	if err := drainPendingWorkError(resp.Pending); err != nil {
+		resp.Fail(drainPendingWorkKind, "", err)
+	}
 	resp.Finish(time.Now().UTC())
 	return resp
 }
@@ -194,6 +202,9 @@ func drainContextKind(err error) string {
 }
 
 func (fs *Dat9FS) drainOpenHandles(ctx context.Context) error {
+	if fs == nil || fs.fileHandles == nil {
+		return nil
+	}
 	handles := fs.fileHandles.Snapshot()
 	for _, fh := range handles {
 		if err := ctx.Err(); err != nil {
@@ -268,14 +279,16 @@ func (fs *Dat9FS) snapshotDrainPending() mountcontrol.DrainPending {
 	if fs == nil {
 		return pending
 	}
-	handles := fs.fileHandles.Snapshot()
-	pending.OpenHandles = len(handles)
-	for _, fh := range handles {
-		fh.Lock()
-		if drainHandleHasDirtyStateLocked(fh) {
-			pending.DirtyHandles++
+	if fs.fileHandles != nil {
+		handles := fs.fileHandles.Snapshot()
+		pending.OpenHandles = len(handles)
+		for _, fh := range handles {
+			fh.Lock()
+			if drainHandleHasDirtyStateLocked(fh) {
+				pending.DirtyHandles++
+			}
+			fh.Unlock()
 		}
-		fh.Unlock()
 	}
 	if fs.commitQueue != nil {
 		snap := fs.commitQueue.Snapshot()
@@ -283,13 +296,44 @@ func (fs *Dat9FS) snapshotDrainPending() mountcontrol.DrainPending {
 		pending.CommitQueueBytes = snap.Bytes
 		pending.CommitQueueInFlight = snap.InFlight
 		pending.CommitQueueDelayed = snap.Delayed
+		pending.CommitQueueConflicts = snap.Conflicts
 	}
 	if fs.uploader != nil {
 		snap := fs.uploader.Snapshot()
 		pending.UploaderQueued = snap.Queued
 		pending.UploaderInFlight = snap.InFlight
+		pending.UploaderCached = snap.Cached
+		pending.UploaderCachedBytes = snap.CachedBytes
 	}
 	return pending
+}
+
+func drainPendingWorkError(p mountcontrol.DrainPending) error {
+	if !drainPendingHasUndrainedWork(p) {
+		return nil
+	}
+	return fmt.Errorf(
+		"pending work remains after drain: dirty_handles=%d commit_queue_pending=%d commit_queue_in_flight=%d commit_queue_delayed=%d commit_queue_conflicts=%d uploader_queued=%d uploader_in_flight=%d uploader_cached=%d",
+		p.DirtyHandles,
+		p.CommitQueuePending,
+		p.CommitQueueInFlight,
+		p.CommitQueueDelayed,
+		p.CommitQueueConflicts,
+		p.UploaderQueued,
+		p.UploaderInFlight,
+		p.UploaderCached,
+	)
+}
+
+func drainPendingHasUndrainedWork(p mountcontrol.DrainPending) bool {
+	return p.DirtyHandles != 0 ||
+		p.CommitQueuePending != 0 ||
+		p.CommitQueueInFlight != 0 ||
+		p.CommitQueueDelayed != 0 ||
+		p.CommitQueueConflicts != 0 ||
+		p.UploaderQueued != 0 ||
+		p.UploaderInFlight != 0 ||
+		p.UploaderCached != 0
 }
 
 func drainHandleHasDirtyStateLocked(fh *FileHandle) bool {
@@ -321,6 +365,8 @@ func drainResponseStatus(resp mountcontrol.DrainResponse) gofuse.Status {
 	switch resp.ErrorKind {
 	case "timeout":
 		return gofuse.Status(syscall.ETIMEDOUT)
+	case "remote_timeout_or_retryable":
+		return gofuse.Status(syscall.EAGAIN)
 	case "canceled":
 		return gofuse.Status(syscall.EINTR)
 	default:

@@ -137,9 +137,11 @@ func (u *WriteBackUploader) PendingStats() (queued int, inFlight int) {
 }
 
 type WriteBackUploaderSnapshot struct {
-	Queued    int
-	InFlight  int
-	FirstPath string
+	Queued      int
+	InFlight    int
+	Cached      int
+	CachedBytes int64
+	FirstPath   string
 }
 
 func (u *WriteBackUploader) Snapshot() WriteBackUploaderSnapshot {
@@ -156,6 +158,13 @@ func (u *WriteBackUploader) Snapshot() WriteBackUploaderSnapshot {
 	u.inflightMu.Unlock()
 	if active := int(u.active.Load()); active > snap.InFlight {
 		snap.InFlight = active
+	}
+	if u.cache != nil {
+		var firstCachedPath string
+		snap.Cached, snap.CachedBytes, firstCachedPath = u.cache.PendingSummary()
+		if snap.FirstPath == "" {
+			snap.FirstPath = firstCachedPath
+		}
 	}
 	return snap
 }

@@ -1,3 +1,5 @@
+// Package mountcontrol defines the JSON protocol used by drive9 mount
+// control sockets.
 package mountcontrol
 
 import (
@@ -39,14 +41,17 @@ type DrainResponse struct {
 }
 
 type DrainPending struct {
-	OpenHandles         int   `json:"open_handles"`
-	DirtyHandles        int   `json:"dirty_handles"`
-	CommitQueuePending  int   `json:"commit_queue_pending"`
-	CommitQueueBytes    int64 `json:"commit_queue_bytes"`
-	CommitQueueInFlight int   `json:"commit_queue_in_flight"`
-	CommitQueueDelayed  int   `json:"commit_queue_delayed"`
-	UploaderQueued      int   `json:"uploader_queued"`
-	UploaderInFlight    int   `json:"uploader_in_flight"`
+	OpenHandles          int   `json:"open_handles"`
+	DirtyHandles         int   `json:"dirty_handles"`
+	CommitQueuePending   int   `json:"commit_queue_pending"`
+	CommitQueueBytes     int64 `json:"commit_queue_bytes"`
+	CommitQueueInFlight  int   `json:"commit_queue_in_flight"`
+	CommitQueueDelayed   int   `json:"commit_queue_delayed"`
+	CommitQueueConflicts int   `json:"commit_queue_conflicts"`
+	UploaderQueued       int   `json:"uploader_queued"`
+	UploaderInFlight     int   `json:"uploader_in_flight"`
+	UploaderCached       int   `json:"uploader_cached"`
+	UploaderCachedBytes  int64 `json:"uploader_cached_bytes"`
 }
 
 type DrainPhase struct {

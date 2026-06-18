@@ -55,8 +55,24 @@ func PIDFilePath(mountPoint string) string {
 
 func ControlSocketPath(mountPoint string) string {
 	canonical := canonicalMountPoint(mountPoint)
-	sum := sha256.Sum256([]byte(canonical))
-	return filepath.Join(os.TempDir(), "drive9-mount-"+hex.EncodeToString(sum[:8])+".sock")
+	uid := currentUID()
+	sum := sha256.Sum256([]byte(uid + "\x00" + canonical))
+	return filepath.Join(controlSocketDir(uid), "drive9-mount-"+hex.EncodeToString(sum[:8])+".sock")
+}
+
+func currentUID() string {
+	uid := os.Getuid()
+	if uid < 0 {
+		return "unknown"
+	}
+	return strconv.Itoa(uid)
+}
+
+func controlSocketDir(uid string) string {
+	if runtimeDir := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR")); runtimeDir != "" && filepath.IsAbs(runtimeDir) {
+		return runtimeDir
+	}
+	return filepath.Join(os.TempDir(), "drive9-"+uid)
 }
 
 func canonicalMountPoint(mountPoint string) string {
