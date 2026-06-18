@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -547,9 +548,12 @@ func ctxForkCmd(args []string) error {
 		reqBody["public_key"] = publicKey
 		reqBody["private_key"] = privateKey
 	}
-	body, _ := json.Marshal(reqBody)
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("encode fork request: %w", err)
+	}
 	c := client.New(server, source.APIKey)
-	resp, err := c.RawPost("/v1/fork", strings.NewReader(string(body)))
+	resp, err := c.RawPost("/v1/fork", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("ctx fork failed: %w", err)
 	}

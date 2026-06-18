@@ -98,12 +98,10 @@ func (s *Server) handleForkCreate(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	var req forkRequest
-	if r.Body != nil {
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-			errJSON(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
-			return
-		}
+	req, err := decodeForkRequest(w, r)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	if strings.TrimSpace(req.Name) == "" {
 		req.Name = "fork"
@@ -141,6 +139,23 @@ func (e *forkStatusError) Error() string { return e.msg }
 
 func forkErr(code int, msg string) error {
 	return &forkStatusError{code: code, msg: msg}
+}
+
+func decodeForkRequest(w http.ResponseWriter, r *http.Request) (forkRequest, error) {
+	var req forkRequest
+	if r.Body == nil {
+		return req, nil
+	}
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		return req, fmt.Errorf("invalid JSON body: %w", err)
+	}
+	var extra struct{}
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return req, fmt.Errorf("invalid JSON body: trailing data")
+	}
+	return req, nil
 }
 
 func forkProvisioningMessage(t *meta.Tenant) string {
@@ -335,7 +350,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	}
 	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
 		s.markForkFailed(ctx, forkID)
-		return nil, forkErr(http.StatusBadGateway, "starter branch response missing required metadata")
+		return nil, forkErr(http.StatusBadGateway, "branch response missing required metadata")
 	}
 	forkRoot.ClusterID = cluster.ClusterID
 	forkRoot.BranchID = cluster.BranchID
@@ -772,12 +787,10 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	var req forkRequest
-	if r.Body != nil {
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
-			errJSON(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
-			return
-		}
+	req, err := decodeForkRequest(w, r)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
 	}
 	credentialReq, err := forkCredentialRequest(req)
 	if err != nil {
