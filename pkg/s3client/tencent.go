@@ -53,9 +53,14 @@ type camProvider struct {
 	mu        sync.Mutex
 	cached    aws.Credentials
 	expiresAt time.Time
+	client    *http.Client
 }
 
-func newCAMProvider() *camProvider { return &camProvider{} }
+func newCAMProvider() *camProvider {
+	return &camProvider{
+		client: &http.Client{Timeout: 5 * time.Second},
+	}
+}
 
 func (p *camProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 	p.mu.Lock()
@@ -64,12 +69,19 @@ func (p *camProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 		return p.cached, nil
 	}
 
-	resp, err := http.Get(camMetaBase)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, camMetaBase, nil)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("cam: create list roles request: %w", err)
+	}
+	resp, err := p.client.Do(req)
 	if err != nil {
 		return aws.Credentials{}, fmt.Errorf("cam: list roles: %w", err)
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("cam: read list roles response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return aws.Credentials{}, fmt.Errorf("cam: list roles: status %d", resp.StatusCode)
 	}
@@ -78,12 +90,19 @@ func (p *camProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 		return aws.Credentials{}, fmt.Errorf("cam: no role bound to instance")
 	}
 
-	resp, err = http.Get(camMetaBase + roleName)
+	req, err = http.NewRequestWithContext(ctx, http.MethodGet, camMetaBase+roleName, nil)
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("cam: create get credentials request: %w", err)
+	}
+	resp, err = p.client.Do(req)
 	if err != nil {
 		return aws.Credentials{}, fmt.Errorf("cam: get credentials for %s: %w", roleName, err)
 	}
-	body, _ = io.ReadAll(resp.Body)
+	body, err = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("cam: read get credentials response: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return aws.Credentials{}, fmt.Errorf("cam: get credentials: status %d", resp.StatusCode)
 	}
