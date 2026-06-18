@@ -36,6 +36,9 @@ func NewTencentKMSEncryptor(region, keyID string) (*TencentKMSEncryptor, error) 
 	if secretID == "" {
 		return nil, fmt.Errorf("tencent kms: TENCENTCLOUD_SECRET_ID is not set")
 	}
+	if secretKey == "" {
+		return nil, fmt.Errorf("tencent kms: TENCENTCLOUD_SECRET_KEY is not set")
+	}
 
 	var credential common.CredentialIface
 	if token := os.Getenv("TENCENTCLOUD_SECURITY_TOKEN"); token != "" {
