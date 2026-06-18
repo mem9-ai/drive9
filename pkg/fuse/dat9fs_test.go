@@ -13945,10 +13945,12 @@ func TestFlushHandle_Path2_SnapshotIsolation(t *testing.T) {
 // upload, remoteCommitLock is released BEFORE re-acquiring fh.mu — so flush
 // never holds remoteCommitLock while waiting for fh.mu. Concurrent Write()
 // acquires fh.mu then blocks on remoteCommitLock until upload finishes —
-// linear wait, no deadlock. This test verifies:
-// 1. fh.mu is released during upload (Read can proceed)
-// 2. After upload completes, Write() succeeds (no circular wait)
-// 3. The write's dirty state is preserved for the next flush
+// linear wait, no deadlock. This test exercises the actual B3 scenario:
+//
+// 1. Flush starts, upload blocks (remoteCommitLock held, fh.mu released)
+// 2. Write() starts DURING upload — acquires fh.mu, blocks on remoteCommitLock
+// 3. Upload resumes → remoteCommitLock released → Write() completes
+// 4. Both flush and Write succeed, dirty state preserved
 func TestFlushHandle_Path2_NoDeadlockWithConcurrentWrite(t *testing.T) {
 	uploadStarted := make(chan struct{})
 	uploadResume := make(chan struct{})
@@ -14001,50 +14003,54 @@ func TestFlushHandle_Path2_NoDeadlockWithConcurrentWrite(t *testing.T) {
 		t.Fatal("upload did not start within timeout — fh.mu not released during Path 2 upload")
 	}
 
-	// Verify fh.mu IS released during upload by acquiring it briefly.
-	// This is the critical check: before the fix, this would block
-	// because flushHandle held fh.mu during the entire upload.
-	fhMuAcquired := make(chan struct{})
+	// Issue Write() DURING upload — this is the B3 deadlock scenario.
+	// Write() acquires fh.mu (released by flush), then blocks on
+	// remoteCommitLock (held by flush for upload serialization).
+	// Before the fix: flush held remoteCommitLock and waited for fh.mu
+	// to relock → circular wait → deadlock.
+	// After the fix: flush releases remoteCommitLock before fh.Lock(),
+	// so Write() completes after upload finishes → no deadlock.
+	writeDone := make(chan gofuse.Status, 1)
 	go func() {
-		fh.Lock()
-		close(fhMuAcquired)
-		fh.Unlock()
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+			Size:     uint32(len("WORLD")),
+		}, []byte("WORLD"))
+		writeDone <- st
 	}()
-	select {
-	case <-fhMuAcquired:
-		// Good — fh.mu is released during upload.
-	case <-time.After(2 * time.Second):
-		t.Fatal("fh.mu not released during Path 2 upload — Read() would block")
-	}
 
-	// Let the upload finish, then issue Write() after flush completes.
-	// Write() will succeed because there's no lock inversion.
+	// Give Write() a moment to acquire fh.mu and block on remoteCommitLock.
+	// If this were the old code, both goroutines would be stuck forever.
+	time.Sleep(50 * time.Millisecond)
+
+	// Resume upload — this releases remoteCommitLock, unblocking Write().
 	close(uploadResume)
+
+	// Both flush and Write must complete without deadlock.
 	select {
 	case st := <-flushDone:
 		if st != gofuse.OK {
 			t.Fatalf("flushHandle status = %v, want OK", st)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("flushHandle did not complete after upload resumed")
+		t.Fatal("flushHandle did not complete — deadlock?")
+	}
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("concurrent Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write did not complete after upload released remoteCommitLock — deadlock?")
 	}
 
-	// Write after flush completes — must succeed and mark dirty.
-	_, st := fs.Write(nil, &gofuse.WriteIn{
-		InHeader: gofuse.InHeader{NodeId: ino},
-		Fh:       fhID,
-		Offset:   0,
-		Size:     uint32(len("WORLD")),
-	}, []byte("WORLD"))
-	if st != gofuse.OK {
-		t.Fatalf("Write after flush status = %v, want OK", st)
-	}
-
-	// The write must have kept the handle dirty.
+	// The concurrent write must have kept the handle dirty for next flush.
 	fh.Lock()
 	if fh.DirtySeq == 0 {
 		fh.Unlock()
-		t.Fatal("DirtySeq = 0 after Write — data loss")
+		t.Fatal("DirtySeq = 0 after concurrent Write — data loss")
 	}
 	fh.Unlock()
 
