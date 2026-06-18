@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -3406,10 +3407,20 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	if provider == tenant.ProviderTiDBCloudNative {
 		req, err := decodeCredentialProvisionRequest(w, r)
 		if err != nil {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
-			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-			errJSON(w, http.StatusBadRequest, err.Error())
-			return
+			if !errors.Is(err, tenant.ErrCredentialsRequired) {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			req, err = resolveDefaultCredentials(w, s.provisioner)
+			if err != nil {
+				return
+			}
+			if req == nil {
+				errJSON(w, http.StatusBadRequest, tenant.ErrCredentialsRequired.Error())
+				return
+			}
 		}
 		if validator, ok := s.provisioner.(credentialProvisionRequestValidator); ok {
 			if err := validator.ValidateCredentialProvisionRequest(*req); err != nil {
@@ -3463,6 +3474,18 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+func resolveDefaultCredentials(w http.ResponseWriter, p tenant.Provisioner) (*tenant.CredentialProvisionRequest, error) {
+	type defaultCredentialProvider interface {
+		DefaultCredentials() (tenant.CredentialProvisionRequest, bool)
+	}
+	if dp, ok := p.(defaultCredentialProvider); ok {
+		if req, ok := dp.DefaultCredentials(); ok {
+			return &req, nil
+		}
+	}
+	return nil, nil
+}
+
 func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
 	var req struct {
 		PublicKey    string `json:"public_key"`
@@ -3492,7 +3515,7 @@ func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, bu
 	}
 	out := build()
 	if out.PublicKey == "" || out.PrivateKey == "" {
-		return nil, fmt.Errorf("public_key and private_key are required")
+		return nil, tenant.ErrCredentialsRequired
 	}
 	return &out, nil
 }
@@ -3635,6 +3658,33 @@ func (s *Server) copyAutoEmbeddingProfileForFork(ctx context.Context, sourceTena
 	})
 }
 
+func (s *Server) applyAutoEmbeddingProviderConfig(ctx context.Context, tenantID, tenantDSN string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
+	if s.meta == nil || s.pool == nil {
+		return nil
+	}
+	metaProfile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("load auto-embedding profile: %w", err)
+	}
+	if len(metaProfile.APIKeyCipher) == 0 {
+		return nil
+	}
+	apiKey, err := s.pool.Decrypt(ctx, metaProfile.APIKeyCipher)
+	if err != nil {
+		return fmt.Errorf("decrypt auto-embedding api key: %w", err)
+	}
+	db, err := sql.Open("mysql", tenantDSN)
+	if err != nil {
+		return fmt.Errorf("open tenant database for embedding provider config: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	return tenantschema.ApplyTiDBAutoEmbeddingProviderConfig(ctx, db, tenantschema.TiDBAutoEmbeddingProviderConfig{
+		Model:   profile.Model,
+		APIKey:  string(apiKey),
+		APIBase: metaProfile.APIBase,
+	})
+}
+
 func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID string) (tenantschema.TiDBAutoEmbeddingProfile, error) {
 	if s.meta == nil {
 		return tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
@@ -3662,6 +3712,14 @@ func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(co
 		profile, err := s.autoEmbeddingProfileForTenant(ctx, tenantID)
 		if err != nil {
 			return fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
+		}
+		if !s.disableDBAutoEmbed {
+			if err := s.applyAutoEmbeddingProviderConfig(ctx, tenantID, dsn, profile); err != nil {
+				logger.Warn(ctx, "schema_init_embedding_provider_config_failed",
+					zap.String("tenant_id", tenantID),
+					zap.String("provider", provider),
+					zap.Error(err))
+			}
 		}
 		return profileAware.InitSchemaForAutoEmbeddingProfile(ctx, dsn, profile)
 	}

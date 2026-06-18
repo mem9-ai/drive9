@@ -94,8 +94,19 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 	if t.Provider == tenant.ProviderTiDBCloudNative {
 		req, err = decodeCredentialDeprovisionRequest(w, r)
 		if err != nil {
-			errJSON(w, http.StatusBadRequest, err.Error())
-			return
+			if !errors.Is(err, tenant.ErrCredentialsRequired) {
+				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			defaultReq, resolveErr := resolveDefaultCredentials(w, s.provisioner)
+			if resolveErr != nil {
+				return
+			}
+			if defaultReq == nil {
+				errJSON(w, http.StatusBadRequest, tenant.ErrCredentialsRequired.Error())
+				return
+			}
+			req = *defaultReq
 		}
 	}
 

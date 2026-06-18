@@ -31,6 +31,8 @@ const (
 	EnvTiDBCloudNativeRegion              = "DRIVE9_TIDBCLOUD_NATIVE_REGION"
 	EnvTiDBCloudNativeDefaultDatabaseName = "DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME"
 	EnvTiDBCloudDefaultSpendingLimit      = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
+	EnvTiDBCloudNativePublicKey           = "DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY"
+	EnvTiDBCloudNativePrivateKey          = "DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY"
 
 	DefaultDatabaseName = "tidbcloud_fs"
 	DefaultSpendLimit   = int32(1000)
@@ -49,6 +51,8 @@ type Provisioner struct {
 	region              string
 	defaultDatabaseName string
 	defaultSpendLimit   *int32
+	defaultPublicKey    string
+	defaultPrivateKey   string
 	client              *http.Client
 }
 
@@ -80,6 +84,8 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 		region:              region,
 		defaultDatabaseName: defaultDB,
 		defaultSpendLimit:   defaultSpendLimit,
+		defaultPublicKey:    strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePublicKey)),
+		defaultPrivateKey:   strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePrivateKey)),
 		client:              &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
@@ -87,6 +93,21 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 func (p *Provisioner) ProviderType() string { return tenant.ProviderTiDBCloudNative }
 
 func (p *Provisioner) ProvisioningCloudProvider() string { return p.cloudProvider }
+
+func (p *Provisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, bool) {
+	if p.defaultPublicKey == "" || p.defaultPrivateKey == "" {
+		return tenant.CredentialProvisionRequest{}, false
+	}
+	return tenant.CredentialProvisionRequest{
+		PublicKey:  p.defaultPublicKey,
+		PrivateKey: p.defaultPrivateKey,
+	}, true
+}
+
+func (p *Provisioner) HasDefaultCredentials() bool {
+	_, ok := p.DefaultCredentials()
+	return ok
+}
 
 func (p *Provisioner) ProvisioningRegion() string { return p.region }
 

@@ -2,9 +2,12 @@ package tenant
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
+
+var ErrCredentialsRequired = errors.New("public_key and private_key are required")
 
 type ClusterInfo struct {
 	TenantID       string
