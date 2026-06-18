@@ -51,6 +51,9 @@ func (e *TencentKMSEncryptor) Encrypt(_ context.Context, plaintext []byte) ([]by
 	if err != nil {
 		return nil, fmt.Errorf("tencent kms encrypt: %w", err)
 	}
+	if resp == nil || resp.Response == nil || resp.Response.CiphertextBlob == nil {
+		return nil, fmt.Errorf("tencent kms encrypt: empty ciphertext in response")
+	}
 	ciphertext, err := base64.StdEncoding.DecodeString(*resp.Response.CiphertextBlob)
 	if err != nil {
 		return nil, fmt.Errorf("tencent kms encrypt: decode ciphertext: %w", err)
@@ -66,6 +69,9 @@ func (e *TencentKMSEncryptor) Decrypt(_ context.Context, ciphertext []byte) ([]b
 	resp, err := e.client.Decrypt(req)
 	if err != nil {
 		return nil, fmt.Errorf("tencent kms decrypt: %w", err)
+	}
+	if resp == nil || resp.Response == nil || resp.Response.Plaintext == nil {
+		return nil, fmt.Errorf("tencent kms decrypt: empty plaintext in response")
 	}
 	plaintext, err := base64.StdEncoding.DecodeString(*resp.Response.Plaintext)
 	if err != nil {

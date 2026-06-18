@@ -780,16 +780,10 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 				description,
 				` + optionsLiteral + `
 			)) STORED,
-			description_embedding_revision     BIGINT
+			description_embedding_revision     BIGINT,
+			FULLTEXT INDEX idx_semantic_fts_content(content_text) WITH PARSER MULTILINGUAL,
+			FULLTEXT INDEX idx_semantic_fts_description(description) WITH PARSER MULTILINGUAL
 		)`,
-		`ALTER TABLE semantic
-			ADD FULLTEXT INDEX idx_semantic_fts_content(content_text)
-			WITH PARSER MULTILINGUAL
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE semantic
-			ADD FULLTEXT INDEX idx_semantic_fts_description(description)
-			WITH PARSER MULTILINGUAL
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`ALTER TABLE semantic
 			ADD VECTOR INDEX idx_semantic_cosine((VEC_COSINE_DISTANCE(embedding)))
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,

@@ -91,6 +91,7 @@ func applyS3Options(cfg AWSConfig) func(*s3.Options) {
 //     → AWS SDK default chain (if none of the above are configured)
 //   - Tencent COS endpoints (*.myqcloud.com): explicit key → TENCENTCLOUD env
 //     → AWS SDK default chain
+//   - Tencent COS endpoints (*.myqcloud.com): explicit key → TENCENTCLOUD env → CAM role
 //   - All other endpoints: explicit key → AWS SDK default chain
 func New(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	if err := cfg.Validate(); err != nil {

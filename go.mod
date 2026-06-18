@@ -101,8 +101,8 @@ require (
 	github.com/shirou/gopsutil/v4 v4.26.2 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
-	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.3.87 // indirect
-	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/kms v1.3.87 // indirect
+	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/common v1.3.87
+	github.com/tencentcloud/tencentcloud-sdk-go/tencentcloud/kms v1.3.87
 	github.com/testcontainers/testcontainers-go v0.41.0 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
