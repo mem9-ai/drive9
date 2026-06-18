@@ -33,7 +33,12 @@ func NewTencentKMSEncryptor(region, keyID string) (*TencentKMSEncryptor, error) 
 		secretKey = os.Getenv("TENCENTCLOUD_SECRETKEY")
 	}
 
-	credential := common.NewCredential(secretID, secretKey)
+	var credential common.CredentialIface
+	if token := os.Getenv("TENCENTCLOUD_SECURITY_TOKEN"); token != "" {
+		credential = common.NewTokenCredential(secretID, secretKey, token)
+	} else {
+		credential = common.NewCredential(secretID, secretKey)
+	}
 	cpf := profile.NewClientProfile()
 	cpf.HttpProfile.Scheme = "HTTPS"
 

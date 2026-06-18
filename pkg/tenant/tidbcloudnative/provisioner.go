@@ -155,7 +155,7 @@ func (p *Provisioner) ValidateCredentialProvisionRequest(req tenant.CredentialPr
 	if publicKey == "" || privateKey == "" {
 		return fmt.Errorf("public_key and private_key are required")
 	}
-	_, err := p.resolveDatabaseName(req.DatabaseName)
+	_, err := p.resolveDatabaseName("")
 	return err
 }
 
@@ -165,7 +165,7 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	if publicKey == "" || privateKey == "" {
 		return nil, fmt.Errorf("public_key and private_key are required")
 	}
-	dbName, err := p.resolveDatabaseName(req.DatabaseName)
+	dbName, err := p.resolveDatabaseName("")
 	if err != nil {
 		return nil, err
 	}

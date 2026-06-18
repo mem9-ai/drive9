@@ -37,8 +37,16 @@ func tencentCredentials() (accessKeyID, secretAccessKey, securityToken string) {
 		accessKeyID = os.Getenv("TENCENTCLOUD_SECRETID")
 	}
 	return accessKeyID,
-		os.Getenv("TENCENTCLOUD_SECRET_KEY"),
+		tencentSecretKey(),
 		os.Getenv("TENCENTCLOUD_SECURITY_TOKEN")
+}
+
+func tencentSecretKey() string {
+	key := os.Getenv("TENCENTCLOUD_SECRET_KEY")
+	if key == "" {
+		key = os.Getenv("TENCENTCLOUD_SECRETKEY")
+	}
+	return key
 }
 
 type camProvider struct {

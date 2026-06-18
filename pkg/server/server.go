@@ -3485,15 +3485,13 @@ func resolveDefaultCredentials(p tenant.Provisioner) *tenant.CredentialProvision
 
 func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
 	var req struct {
-		PublicKey    string `json:"public_key"`
-		PrivateKey   string `json:"private_key"`
-		DatabaseName string `json:"database_name"`
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
 	}
 	return decodeCredentialRequest(w, r, &req, func() tenant.CredentialProvisionRequest {
 		return tenant.CredentialProvisionRequest{
-			PublicKey:    strings.TrimSpace(req.PublicKey),
-			PrivateKey:   strings.TrimSpace(req.PrivateKey),
-			DatabaseName: strings.TrimSpace(req.DatabaseName),
+			PublicKey:  strings.TrimSpace(req.PublicKey),
+			PrivateKey: strings.TrimSpace(req.PrivateKey),
 		}
 	})
 }
@@ -3511,8 +3509,11 @@ func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, bu
 		}
 	}
 	out := build()
-	if out.PublicKey == "" || out.PrivateKey == "" {
+	if out.PublicKey == "" && out.PrivateKey == "" {
 		return nil, tenant.ErrCredentialsRequired
+	}
+	if out.PublicKey == "" || out.PrivateKey == "" {
+		return nil, tenant.ErrPartialCredentials
 	}
 	return &out, nil
 }
@@ -3712,10 +3713,7 @@ func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(co
 		}
 		if !s.disableDBAutoEmbed {
 			if err := s.applyAutoEmbeddingProviderConfig(ctx, tenantID, dsn, profile); err != nil {
-				logger.Warn(ctx, "schema_init_embedding_provider_config_failed",
-					zap.String("tenant_id", tenantID),
-					zap.String("provider", provider),
-					zap.Error(err))
+				return fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
 			}
 		}
 		return profileAware.InitSchemaForAutoEmbeddingProfile(ctx, dsn, profile)
