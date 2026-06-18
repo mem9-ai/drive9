@@ -14406,6 +14406,131 @@ func TestFlushHandle_Path2_ConcurrentWriteDoesNotCorruptOrigSize(t *testing.T) {
 	_ = fhID
 }
 
+// TestFlushHandle_Path2_NoCommittedRevConcurrentWriteOrigSize verifies
+// that when a Path 2 flush succeeds without the server returning a
+// committed revision (e.g. PatchFile / WriteStreamConditional), and a
+// concurrent Write() grows the file during the unlock window, OrigSize
+// is set to the uploaded snapshot size (not the live dirty buffer size).
+// This is the N1 regression test: without the DirtySeq guard in the
+// non-committedRev finalization paths, finalizeHandleFlushLocked would
+// derive a synthetic revision from expectedRevision and read
+// fh.Dirty.Size() for OrigSize, associating the wrong size.
+func TestFlushHandle_Path2_NoCommittedRevConcurrentWriteOrigSize(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			// Server returns OK but WITHOUT a revision field —
+			// simulates PatchFile/WriteStreamConditional behavior.
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/n1-origsize-test.txt", false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	// Start with a small file (5 bytes).
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/n1-origsize-test.txt",
+		Dirty:   NewWriteBuffer("/n1-origsize-test.txt", maxPreloadSize, 0),
+		BaseRev: 1,
+	}
+	smallData := []byte("hello")
+	if _, err := fh.Dirty.Write(0, smallData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fhID := fs.fileHandles.Allocate(fh)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Concurrent Write during upload — grow file significantly.
+	largeData := make([]byte, 64*1024)
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+			Size:     uint32(len(largeData)),
+		}, largeData)
+		writeDone <- st
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(uploadResume)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write timed out")
+	}
+
+	// N1 assertion: OrigSize must NOT be the large post-write size.
+	// The uploaded snapshot was 5 bytes; the server did NOT return a
+	// revision, so the finalization uses a synthetic revision. OrigSize
+	// should reflect the snapshot, not the concurrent write.
+	fh.Lock()
+	origSize := fh.OrigSize
+	dirtySize := fh.Dirty.Size()
+	dirtySeq := fh.DirtySeq
+	fh.Unlock()
+
+	// Dirty must still be pending (DirtySeq != 0) because concurrent write
+	// changed it during upload.
+	if dirtySeq == 0 {
+		t.Fatal("DirtySeq = 0 after concurrent Write — dirty data lost")
+	}
+	// OrigSize must equal the uploaded snapshot size (5 bytes), not the
+	// large dirty buffer size from the concurrent write.
+	snapshotSize := int64(len(smallData))
+	if origSize != snapshotSize {
+		t.Fatalf("OrigSize = %d, want %d (uploaded snapshot size); dirty buffer size = %d — N1: non-committedRev path must set OrigSize from snapshot",
+			origSize, snapshotSize, dirtySize)
+	}
+
+	_ = fhID
+}
+
 // TestFlushHandle_Path2_LargeBaseSmallSnapshotOrigSize verifies the
 // old-large-base → small snapshot → concurrent write scenario. OrigSize
 // must be set to the uploaded snapshot size (small), not the stale large
