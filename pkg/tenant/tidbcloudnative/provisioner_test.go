@@ -187,9 +187,8 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 		client:              ts.Client(),
 	}
 	out, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
-		PublicKey:    "public-1",
-		PrivateKey:   "private-1",
-		DatabaseName: "customer_db",
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
 	})
 	if err != nil {
 		t.Fatalf("ProvisionWithCredentials: %v", err)
@@ -266,21 +265,6 @@ func TestProvisionWithCredentialsDefaultsDatabaseName(t *testing.T) {
 	}
 	if ensuredDB != DefaultDatabaseName {
 		t.Fatalf("ensured database = %q, want %q", ensuredDB, DefaultDatabaseName)
-	}
-}
-
-func TestProvisionWithCredentialsRejectsReservedDatabaseName(t *testing.T) {
-	p := &Provisioner{defaultDatabaseName: DefaultDatabaseName}
-	_, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
-		PublicKey:    "public-1",
-		PrivateKey:   "private-1",
-		DatabaseName: "test",
-	})
-	if err == nil {
-		t.Fatal("expected reserved database_name error")
-	}
-	if !strings.Contains(err.Error(), "reserved") {
-		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
