@@ -13940,10 +13940,12 @@ func TestFlushHandle_Path2_SnapshotIsolation(t *testing.T) {
 // fix, flushHandle held remoteCommitLock while waiting to reacquire fh.mu,
 // while Write() held fh.mu waiting for remoteCommitLock → deadlock.
 //
-// After the fix, flush releases fh.mu FIRST (unblocking Read), then acquires
-// remoteCommitLock for the upload. Write() can acquire fh.mu immediately but
-// may wait on remoteCommitLock until the upload finishes — that's correct
-// serialization, not a deadlock. This test verifies:
+// After the fix, flush releases fh.mu before uploading (unblocking Read)
+// while keeping remoteCommitLock held for same-path serialization. After the
+// upload, remoteCommitLock is released BEFORE re-acquiring fh.mu — so flush
+// never holds remoteCommitLock while waiting for fh.mu. Concurrent Write()
+// acquires fh.mu then blocks on remoteCommitLock until upload finishes —
+// linear wait, no deadlock. This test verifies:
 // 1. fh.mu is released during upload (Read can proceed)
 // 2. After upload completes, Write() succeeds (no circular wait)
 // 3. The write's dirty state is preserved for the next flush
@@ -14127,6 +14129,16 @@ func TestFlushHandle_Path2_RenameRetargetDuringUpload(t *testing.T) {
 		fh.Unlock()
 		t.Fatal("markHandleRemoteCommittedLocked ran on retargeted handle — committed old-path upload data to new path")
 	}
+	// Verify the handle was actually retargeted to the new path.
+	if fh.Path != newPath {
+		fh.Unlock()
+		t.Fatalf("fh.Path = %q after retarget, want %q", fh.Path, newPath)
+	}
+	// B4 dirty-preservation: if the DirtySeq was cleared but the handle
+	// was retargeted, subsequent writes to the new path still need a flush.
+	// Write new data to the handle and verify it becomes dirty — proving
+	// the retarget did not corrupt the write buffer or lose dirty tracking.
+	dirtyBuf := fh.Dirty
 	fh.Unlock()
 
 	// Verify the old path got cached with the upload data.
@@ -14137,6 +14149,24 @@ func TestFlushHandle_Path2_RenameRetargetDuringUpload(t *testing.T) {
 	if !bytes.Equal(cached, []byte("data")) {
 		t.Fatalf("readCache for old path = %q, want %q", cached, "data")
 	}
+
+	// The new path should NOT have cached data from the old-path upload.
+	if _, ok := fs.readCache.Get(newPath, 20); ok {
+		t.Fatal("readCache hit for new path — old-path upload data leaked to new path")
+	}
+
+	// Dirty-preservation gate: the write buffer must still be functional
+	// after retarget. Write new data to prove no corruption.
+	if _, err := dirtyBuf.Write(0, []byte("new-data")); err != nil {
+		t.Fatalf("Write to dirty buffer after retarget failed: %v", err)
+	}
+	fh.Lock()
+	fh.DirtySeq = fs.markDirtySize(ino, dirtyBuf.Size())
+	if fh.DirtySeq == 0 {
+		fh.Unlock()
+		t.Fatal("markDirtySize returned 0 after retarget — dirty tracking broken")
+	}
+	fh.Unlock()
 }
 
 func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {

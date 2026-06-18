@@ -11558,30 +11558,21 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 	}
 
-	// Lock ordering fix (B3): Release fh.mu FIRST, then acquire the
-	// per-path remote commit lock for the upload. Write() acquires
-	// fh.mu → remoteCommitLock; if we held remoteCommitLock while
-	// waiting to reacquire fh.mu, a concurrent Write() would deadlock.
+	// Lock ordering fix (B3): Release fh.mu but keep remoteCommitLock
+	// held throughout the upload for same-path serialization.
 	//
-	// By releasing fh.mu before acquiring remoteCommitLock:
-	// - Concurrent Read() can proceed (fh.mu not held) — fixes #579
-	// - Concurrent Write() can acquire fh.mu, then block on
-	//   remoteCommitLock until the upload finishes — no deadlock
-	// - Same-path uploads remain serialized via remoteCommitLock
+	// Write() acquires fh.mu → remoteCommitLock. To avoid deadlock,
+	// flush must NOT hold remoteCommitLock while waiting for fh.mu.
+	// We achieve this by:
+	//   1. Releasing fh.mu here (concurrent Read/Write can proceed)
+	//   2. Uploading while holding remoteCommitLock (serialization)
+	//   3. Releasing remoteCommitLock AFTER upload, BEFORE fh.Lock()
 	//
-	// Release the top-level remoteCommitLock first (we'll acquire a
-	// fresh one after fh.Unlock for the upload window only).
-	unlockRemoteCommit()
-	remoteCommitReleased = true
-
+	// Concurrent Write() acquires fh.mu, then blocks on remoteCommitLock
+	// until upload finishes — linear wait, no cycle.
 	uploadStart := time.Now()
 	fs.debugf("flushHandle path2 unlock before upload path=%s size=%d phase_hint=%s expected_rev=%d", handlePath, size, phase, expectedRevision)
 	fh.Unlock()
-
-	// Acquire the remote commit lock for upload serialization AFTER
-	// releasing fh.mu — correct lock order (never hold remoteCommitLock
-	// while waiting for fh.mu).
-	uploadPathLock := fs.lockWritableRemoteCommitPath(handlePath)
 
 	if useDirectPUT {
 		if size == 0 && handleIsNew {
@@ -11649,9 +11640,25 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.debugDurationf(writeStart, 0, "flushHandle write stream done path=%s size=%d err=%v", handlePath, size, err)
 	}
 
-	// Release the upload path lock BEFORE re-acquiring fh.mu to maintain
-	// correct lock ordering (fh.mu → remoteCommitLock, never the reverse).
-	uploadPathLock()
+	// Record the committed revision to global state WHILE still holding
+	// remoteCommitLock, so any subsequent flush that acquires the lock
+	// will see the updated revision via adoptCommittedRevisionLocked.
+	// This must happen before releasing remoteCommitLock to prevent a
+	// same-path flush from snapshotting a stale expectedRevision.
+	if err == nil && committedRev > 0 {
+		if handleIsNew {
+			fs.replaceCommittedRevision(handlePath, committedRev)
+		} else {
+			fs.recordCommittedRevision(handlePath, committedRev)
+		}
+	}
+
+	// Release remoteCommitLock AFTER upload + revision recording but
+	// BEFORE re-acquiring fh.mu. This preserves same-path serialization
+	// (lock held during upload) while avoiding B3 deadlock (never hold
+	// remoteCommitLock while waiting for fh.mu).
+	unlockRemoteCommit()
+	remoteCommitReleased = true
 
 	// Re-acquire fh.mu after network call completes.
 	fh.Lock()
