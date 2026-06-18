@@ -43,7 +43,10 @@ const (
 var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 var displayNameCharPattern = regexp.MustCompile(`[^A-Za-z0-9-]`)
 
-var ensureDatabaseFunc = ensureDatabase
+var (
+	ensureDatabaseFunc          = ensureDatabase
+	tidbCloudNativePollInterval = 5 * time.Second
+)
 
 type Provisioner struct {
 	apiURL              string
@@ -328,13 +331,16 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 	if branch.State != "" && branch.State != "ACTIVE" {
 		return out, nil
 	}
-	if branch.State == "ACTIVE" || branch.Endpoints.Public.Host != "" || branch.UserPrefix != "" || branch.Username != "" {
-		if err := fillBranchEndpoint(out, branch); err != nil {
-			return out, err
+	if branchConnectionIncomplete(branch) {
+		if branch.State == "ACTIVE" {
+			return out, nil
 		}
-		return out, nil
+		return out, fmt.Errorf("tidbcloud native branch response missing state and endpoint")
 	}
-	return out, fmt.Errorf("tidbcloud native branch response missing state and endpoint")
+	if err := fillBranchEndpoint(out, branch); err != nil {
+		return out, err
+	}
+	return out, nil
 }
 
 func (p *Provisioner) WaitForBranchActive(ctx context.Context, branch *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
@@ -619,6 +625,13 @@ func clusterConnectionIncomplete(info *clusterInfo) bool {
 	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || (info.UserPrefix == "" && info.Username == "")
 }
 
+func branchConnectionIncomplete(info *branchInfo) bool {
+	if info == nil {
+		return true
+	}
+	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || (info.UserPrefix == "" && info.Username == "")
+}
+
 func fillBranchEndpoint(out *tenant.ClusterInfo, branch *branchInfo) error {
 	if branch.Endpoints.Public.Host == "" || branch.Endpoints.Public.Port == 0 {
 		return fmt.Errorf("tidbcloud native branch response missing endpoint")
@@ -662,7 +675,7 @@ func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, priva
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(tidbCloudNativePollInterval):
 		}
 	}
 }
@@ -684,7 +697,7 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privat
 		if err != nil {
 			return nil, err
 		}
-		if info.State == "ACTIVE" {
+		if info.State == "ACTIVE" && !branchConnectionIncomplete(info) {
 			return info, nil
 		}
 		if time.Now().After(deadline) {
@@ -693,7 +706,7 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privat
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(tidbCloudNativePollInterval):
 		}
 	}
 }

@@ -526,6 +526,9 @@ func (s *Server) provisionForkTenantOnceWithCredentials(ctx context.Context, for
 	if err := s.schemaInitForTenant(forkID, forkTenant.Provider, s.provisioner.InitSchema)(ctx, dsn); err != nil {
 		return err
 	}
+	if err := s.finalizeTenantSchemaInit(ctx, forkID, dsn, forkTenant.Provider); err != nil {
+		return err
+	}
 	store, err := datastore.Open(dsn)
 	if err != nil {
 		return err
@@ -816,6 +819,16 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 		}
 		w.WriteHeader(http.StatusAccepted)
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleting)})
+		return
+	}
+	if t.Provider == tenant.ProviderTiDBCloudNative && t.Status == meta.TenantFailed {
+		if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
+			errJSON(w, http.StatusBadGateway, fmt.Sprintf("fork delete cleanup failed: %v", err))
+			return
+		}
+		_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleted)})
 		return
 	}
 	updated, err := s.meta.UpdateTenantStatusIf(r.Context(), t.ID, t.Status, meta.TenantDeleting)

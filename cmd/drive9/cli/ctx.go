@@ -496,19 +496,8 @@ func ctxForkCmd(args []string) error {
 	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
 		return err
 	}
-	envPublicKey := consumeEnv(EnvTiDBCloudPublicKey)
-	envPrivateKey := consumeEnv(EnvTiDBCloudPrivateKey)
 	publicKey := strings.TrimSpace(publicKeyFlag)
-	if publicKey == "" {
-		publicKey = strings.TrimSpace(envPublicKey)
-	}
 	privateKey := strings.TrimSpace(privateKeyFlag)
-	if privateKey == "" {
-		privateKey = strings.TrimSpace(envPrivateKey)
-	}
-	if (publicKey == "") != (privateKey == "") {
-		return fmt.Errorf("TiDBCloud fork requires both --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
-	}
 	cfg := loadConfig()
 	if cfg.Contexts == nil {
 		cfg.Contexts = map[string]*Context{}
@@ -531,6 +520,19 @@ func ctxForkCmd(args []string) error {
 	}
 	if source.Type != PrincipalOwner || source.APIKey == "" {
 		return fmt.Errorf("ctx fork requires an owner context; %q is %q", fromName, source.Type)
+	}
+	if (publicKey == "" || privateKey == "") && (publicKeyGiven || privateKeyGiven || ctxForkUsesTiDBCloudCredentials(source)) {
+		envPublicKey := consumeEnv(EnvTiDBCloudPublicKey)
+		envPrivateKey := consumeEnv(EnvTiDBCloudPrivateKey)
+		if publicKey == "" {
+			publicKey = strings.TrimSpace(envPublicKey)
+		}
+		if privateKey == "" {
+			privateKey = strings.TrimSpace(envPrivateKey)
+		}
+	}
+	if (publicKey == "") != (privateKey == "") {
+		return fmt.Errorf("TiDBCloud fork requires both --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
 	}
 	server := source.Server
 	if server == "" {
@@ -592,6 +594,17 @@ func ctxForkCmd(args []string) error {
 		fmt.Println("The fork is still provisioning. Wait a moment, then retry a command like `drive9 fs ls /`; `fs` commands may fail until the tenant becomes active.")
 	}
 	return nil
+}
+
+func ctxForkUsesTiDBCloudCredentials(ctx *Context) bool {
+	if ctx == nil {
+		return false
+	}
+	mode := strings.TrimSpace(ctx.Mode)
+	return strings.EqualFold(mode, ModeLabelTiDBCloud) ||
+		strings.EqualFold(mode, RegionModeTiDBCloudNative) ||
+		strings.TrimSpace(ctx.CloudProvider) != "" ||
+		strings.TrimSpace(ctx.Region) != ""
 }
 
 type forkCtxResult struct {

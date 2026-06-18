@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/dat9/pkg/tenant"
 )
@@ -399,6 +400,57 @@ func TestCreateBranchWithCredentialsRejectsMissingStateAndEndpoint(t *testing.T)
 	}, tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
 	if err == nil || !strings.Contains(err.Error(), "missing state and endpoint") {
 		t.Fatalf("CreateBranchWithCredentials error = %v, want missing state and endpoint", err)
+	}
+}
+
+func TestWaitForBranchActiveRequiresConnectionInfo(t *testing.T) {
+	origPollInterval := tidbCloudNativePollInterval
+	tidbCloudNativePollInterval = time.Millisecond
+	t.Cleanup(func() { tidbCloudNativePollInterval = origPollInterval })
+
+	var getCount int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/v1beta1/clusters/cluster-1/branches/branch-1" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		getCount++
+		if getCount == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"branchId": "branch-1",
+				"state":    "ACTIVE",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"branchId":   "branch-1",
+			"state":      "ACTIVE",
+			"userPrefix": "u2",
+			"endpoints":  map[string]any{"public": map[string]any{"host": "branch.example", "port": 4000}},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	out, err := p.WaitForBranchActiveWithCredentials(context.Background(), &tenant.ClusterInfo{
+		ClusterID: "cluster-1",
+		BranchID:  "branch-1",
+	}, tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
+	if err != nil {
+		t.Fatalf("WaitForBranchActiveWithCredentials: %v", err)
+	}
+	if getCount != 2 {
+		t.Fatalf("get count = %d, want 2", getCount)
+	}
+	if out.Host != "branch.example" || out.Username != "u2.root" {
+		t.Fatalf("branch connection = %#v", out)
 	}
 }
 
