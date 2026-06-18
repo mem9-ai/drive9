@@ -183,6 +183,8 @@ BLACKBOX_LOCAL_OVERLAY_VERIFY_REMOTE=0
   QPS plus p50/p95/p99/max;
 - close, `fsync`, and `fdatasync` write latency, including separate reader
   mount/cache visibility checks;
+- three measurement rounds by default, controlled by `BLACKBOX_RUNS` or
+  `BLACKBOX_KIMI_PERF_RUNS`;
 - unmount/remount persistence checks for the "next sandbox sees previous data"
   requirement;
 - same-host multi-mount validation for a configured set of mount counts.
@@ -202,6 +204,7 @@ explicit selection:
 
 ```bash
 BLACKBOX_KIMI_PERF_ENABLE=1 \
+BLACKBOX_RUNS=3 \
 BLACKBOX_KIMI_PERF_SCALES=S,M,L \
 BLACKBOX_KIMI_PERF_SMALL_OPS=10000 \
 BLACKBOX_KIMI_PERF_FLUSH_OPS=10000 \
@@ -218,6 +221,7 @@ Useful tunables:
 BLACKBOX_KIMI_PERF_LAYOUTS=single,tree
 BLACKBOX_KIMI_PERF_PROFILE=coding-agent
 BLACKBOX_KIMI_PERF_DURABILITY=auto
+BLACKBOX_KIMI_PERF_RUNS=3
 BLACKBOX_KIMI_PERF_STAT_SAMPLES=1000
 BLACKBOX_KIMI_PERF_SMALL_SIZES=1024,4096,20480,102400,1048576
 BLACKBOX_KIMI_PERF_SMALL_CONCURRENCY=1,4,16,64

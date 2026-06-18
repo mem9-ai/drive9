@@ -90,6 +90,7 @@ class Drive9KimiPerf(BaseModule):
             "scales": scales,
             "selected_scales": selected_scales,
             "layouts": layouts,
+            "runs": max(1, int(env_value("KIMI_PERF_RUNS", str(cfg.get("runs", ctx.runs)), ctx.suite))),
             "profile": env_value("KIMI_PERF_PROFILE", str(cfg.get("profile", "coding-agent")), ctx.suite),
             "durability": env_value("KIMI_PERF_DURABILITY", str(cfg.get("durability", "auto")), ctx.suite),
             "namespace_stat_samples": int(env_value("KIMI_PERF_STAT_SAMPLES", str(cfg.get("namespace_stat_samples", 1000)), ctx.suite)),
@@ -227,17 +228,35 @@ class Drive9KimiPerf(BaseModule):
                 "find_pattern": f"find {shlex.quote(str(data_dir))} -name '*.bin' >/dev/null",
             }
             for name, command in commands.items():
-                result = ctx.target.run_cmd(f"kimi-namespace-{scale_id}-{layout}-{name}", command, timeout=7200, shell=True)
-                if result.ok:
-                    rows.append(self.summary_row("namespace", scale_id, layout, name, result.seconds, 1, 0, "seconds", {}))
-                    ctx.metric(f"{self.id}.namespace.{scale_id}.{layout}.{name}", result.seconds, "seconds")
-                else:
-                    failures.append(f"namespace {scale_id}/{layout}/{name} failed; see {result.stderr}")
-                    rows.append(self.summary_row("namespace", scale_id, layout, name, result.seconds, 0, 1, "seconds", {}))
-            stat_values = self.measure_stat_samples(data_dir, int(cfg["namespace_stat_samples"]), raw_dir / f"stat-{scale_id}-{layout}.jsonl")
+                values: list[float] = []
+                errors = 0
+                for run_idx in range(int(cfg["runs"])):
+                    result = ctx.target.run_cmd(f"kimi-namespace-{scale_id}-{layout}-{name}-run-{run_idx}", command, timeout=7200, shell=True)
+                    if result.ok:
+                        values.append(result.seconds)
+                    else:
+                        errors += 1
+                        failures.append(f"namespace {scale_id}/{layout}/{name}/run-{run_idx} failed; see {result.stderr}")
+                rows.append(
+                    {
+                        "section": "namespace",
+                        "scale": scale_id,
+                        "layout": layout,
+                        "op": name,
+                        "unit": "seconds",
+                        "errors": errors,
+                        "error_rate": errors / int(cfg["runs"]),
+                        "runs": int(cfg["runs"]),
+                        **self.latency_summary(values),
+                    }
+                )
+                ctx.perf_values(f"{self.id}.namespace.{scale_id}.{layout}.{name}", values, "seconds")
+            stat_values: list[float] = []
+            for run_idx in range(int(cfg["runs"])):
+                stat_values.extend(self.measure_stat_samples(data_dir, int(cfg["namespace_stat_samples"]), raw_dir / f"stat-{scale_id}-{layout}-run-{run_idx}.jsonl"))
             if stat_values:
                 summary = self.latency_summary(stat_values)
-                rows.append({"section": "namespace", "scale": scale_id, "layout": layout, "op": "stat", "unit": "ms", **summary})
+                rows.append({"section": "namespace", "scale": scale_id, "layout": layout, "op": "stat", "unit": "ms", "errors": 0, "error_rate": 0.0, "runs": int(cfg["runs"]), **summary})
                 ctx.perf_values(f"{self.id}.namespace.{scale_id}.{layout}.stat", stat_values, "ms")
         finally:
             ctx.target.unmount(handle)
@@ -288,22 +307,29 @@ class Drive9KimiPerf(BaseModule):
         append_payload = stable_bytes(min(1024, size), seed=size + 1)
         edit_payload = stable_bytes(min(128, size), seed=size + 2)
         for op in ("create", "overwrite", "append", "partial_edit", "read", "stat_after_write"):
-            op_root = root / f"{op}-{size}-{concurrency}"
-            if op_root.exists():
-                shutil.rmtree(op_root)
-            op_root.mkdir(parents=True)
-            if op in {"overwrite", "append", "partial_edit", "read"}:
-                for idx in range(ops):
-                    (op_root / f"f-{idx:08d}.bin").write_bytes(payload)
-            raw_path = raw_dir / f"small-{op}-{size}-{concurrency}.jsonl"
-            values, errors, wall_seconds = self.run_latency_workload(
-                raw_path,
-                ops,
-                concurrency,
-                lambda idx, op=op, op_root=op_root: self.small_file_op(op, op_root, idx, payload, append_payload, edit_payload),
-                cfg["raw_results"],
-                {"section": "small_file", "op": op, "size": size, "concurrency": concurrency},
-            )
+            values: list[float] = []
+            errors = 0
+            wall_seconds = 0.0
+            for run_idx in range(int(cfg["runs"])):
+                op_root = root / f"{op}-{size}-{concurrency}-run-{run_idx}"
+                if op_root.exists():
+                    shutil.rmtree(op_root)
+                op_root.mkdir(parents=True)
+                if op in {"overwrite", "append", "partial_edit", "read"}:
+                    for idx in range(ops):
+                        (op_root / f"f-{idx:08d}.bin").write_bytes(payload)
+                raw_path = raw_dir / f"small-{op}-{size}-{concurrency}-run-{run_idx}.jsonl"
+                run_values, run_errors, run_wall_seconds = self.run_latency_workload(
+                    raw_path,
+                    ops,
+                    concurrency,
+                    lambda idx, op=op, op_root=op_root: self.small_file_op(op, op_root, idx, payload, append_payload, edit_payload),
+                    cfg["raw_results"],
+                    {"section": "small_file", "op": op, "size": size, "concurrency": concurrency, "run": run_idx},
+                )
+                values.extend(run_values)
+                errors += run_errors
+                wall_seconds += run_wall_seconds
             summary = self.latency_summary(values)
             qps = len(values) / wall_seconds if wall_seconds > 0 else 0.0
             row = {
@@ -316,7 +342,8 @@ class Drive9KimiPerf(BaseModule):
                 "unit": "ms",
                 "qps": qps,
                 "errors": errors,
-                "error_rate": errors / ops,
+                "error_rate": errors / (ops * int(cfg["runs"])),
+                "runs": int(cfg["runs"]),
                 **summary,
             }
             rows.append(row)
@@ -385,52 +412,65 @@ class Drive9KimiPerf(BaseModule):
         failures: list[str],
     ) -> list[dict[str, Any]]:
         ops = max(1, int(cfg["flush_ops"]))
-        op_root = root / f"{mode}-{size}-{concurrency}"
-        reader_op_root = reader_root / f"{mode}-{size}-{concurrency}"
-        if op_root.exists():
-            shutil.rmtree(op_root)
-        op_root.mkdir(parents=True)
         payload = stable_bytes(size, seed=size + concurrency)
-        raw_path = raw_dir / f"flush-{mode}-{size}-{concurrency}.jsonl"
         visibility_limit = min(ops, int(cfg["visibility_samples"]))
+        values: list[float] = []
+        sync_values: list[float] = []
+        close_values: list[float] = []
+        visible_values: list[float] = []
+        errors = 0
+        wall_seconds = 0.0
+        for run_idx in range(int(cfg["runs"])):
+            op_root = root / f"{mode}-{size}-{concurrency}-run-{run_idx}"
+            reader_op_root = reader_root / f"{mode}-{size}-{concurrency}-run-{run_idx}"
+            if op_root.exists():
+                shutil.rmtree(op_root)
+            op_root.mkdir(parents=True)
+            raw_path = raw_dir / f"flush-{mode}-{size}-{concurrency}-run-{run_idx}.jsonl"
 
-        def body(idx: int) -> dict[str, float]:
-            path = op_root / f"f-{idx:08d}.bin"
-            rel = path.relative_to(root)
-            digest = hashlib.sha256(payload).hexdigest()
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-            close_ms = 0.0
-            sync_ms = 0.0
-            try:
-                start_write = time.perf_counter()
-                self.write_fd(fd, payload)
-                write_ms = (time.perf_counter() - start_write) * 1000
-                if mode == "fsync":
-                    start_sync = time.perf_counter()
-                    os.fsync(fd)
-                    sync_ms = (time.perf_counter() - start_sync) * 1000
-                elif mode == "fdatasync":
-                    start_sync = time.perf_counter()
-                    if hasattr(os, "fdatasync"):
-                        os.fdatasync(fd)
-                    else:
+            def body(idx: int, op_root: Path = op_root, reader_op_root: Path = reader_op_root) -> dict[str, float]:
+                path = op_root / f"f-{idx:08d}.bin"
+                rel = path.relative_to(root)
+                digest = hashlib.sha256(payload).hexdigest()
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                close_ms = 0.0
+                sync_ms = 0.0
+                try:
+                    start_write = time.perf_counter()
+                    self.write_fd(fd, payload)
+                    write_ms = (time.perf_counter() - start_write) * 1000
+                    if mode == "fsync":
+                        start_sync = time.perf_counter()
                         os.fsync(fd)
-                    sync_ms = (time.perf_counter() - start_sync) * 1000
-                start_close = time.perf_counter()
-                os.close(fd)
-                fd = -1
-                close_ms = (time.perf_counter() - start_close) * 1000
-            finally:
-                if fd >= 0:
+                        sync_ms = (time.perf_counter() - start_sync) * 1000
+                    elif mode == "fdatasync":
+                        start_sync = time.perf_counter()
+                        if hasattr(os, "fdatasync"):
+                            os.fdatasync(fd)
+                        else:
+                            os.fsync(fd)
+                        sync_ms = (time.perf_counter() - start_sync) * 1000
+                    start_close = time.perf_counter()
                     os.close(fd)
-            visible_ms = 0.0
-            if idx < visibility_limit:
-                visible_ms = self.wait_visible(reader_op_root / rel.name, digest, float(cfg["visibility_timeout_s"]))
-                if visible_ms < 0:
-                    raise BlackboxError(f"visibility timeout for {rel}")
-            return {"write_ms": write_ms, "sync_ms": sync_ms, "close_ms": close_ms, "visible_ms": visible_ms}
+                    fd = -1
+                    close_ms = (time.perf_counter() - start_close) * 1000
+                finally:
+                    if fd >= 0:
+                        os.close(fd)
+                visible_ms = 0.0
+                if idx < visibility_limit:
+                    visible_ms = self.wait_visible(reader_op_root / rel.name, digest, float(cfg["visibility_timeout_s"]))
+                    if visible_ms < 0:
+                        raise BlackboxError(f"visibility timeout for {rel}")
+                return {"write_ms": write_ms, "sync_ms": sync_ms, "close_ms": close_ms, "visible_ms": visible_ms}
 
-        values, errors, sync_values, close_values, visible_values, wall_seconds = self.run_flush_workload(raw_path, ops, concurrency, body, cfg["raw_results"], {"mode": mode, "size": size, "concurrency": concurrency})
+            run_values, run_errors, run_sync_values, run_close_values, run_visible_values, run_wall_seconds = self.run_flush_workload(raw_path, ops, concurrency, body, cfg["raw_results"], {"mode": mode, "size": size, "concurrency": concurrency, "run": run_idx})
+            values.extend(run_values)
+            sync_values.extend(run_sync_values)
+            close_values.extend(run_close_values)
+            visible_values.extend(run_visible_values)
+            errors += run_errors
+            wall_seconds += run_wall_seconds
         rows: list[dict[str, Any]] = []
         qps = len(values) / wall_seconds if wall_seconds > 0 else 0.0
         for metric, metric_values in (("total", values), ("sync", sync_values), ("close", close_values), ("visible", visible_values)):
@@ -446,7 +486,8 @@ class Drive9KimiPerf(BaseModule):
                 "unit": "ms",
                 "qps": qps if metric == "total" else "",
                 "errors": errors,
-                "error_rate": errors / ops,
+                "error_rate": errors / (ops * int(cfg["runs"])),
+                "runs": int(cfg["runs"]),
                 **self.latency_summary(metric_values),
             }
             rows.append(row)
@@ -491,70 +532,71 @@ class Drive9KimiPerf(BaseModule):
     ) -> list[dict[str, Any]]:
         payload = stable_bytes(size, seed=size + samples)
         digest = hashlib.sha256(payload).hexdigest()
-        writer = ctx.target.mount("kimi_persistence", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"{mode}-{size}-writer")
         write_values: list[float] = []
         rows: list[dict[str, Any]] = []
-        raw_path = raw_dir / f"persistence-{mode}-{size}.jsonl"
-        raw_handle = raw_path.open("w", encoding="utf-8") if cfg["raw_results"] else None
-        try:
-            root = writer.mountpoint / f"{mode}-{size}"
-            if root.exists():
-                shutil.rmtree(root)
-            root.mkdir(parents=True)
-            for idx in range(samples):
-                path = root / f"f-{idx:08d}.bin"
-                start = time.perf_counter()
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-                try:
-                    self.write_fd(fd, payload)
-                    if mode == "fsync":
-                        os.fsync(fd)
-                finally:
-                    os.close(fd)
-                latency = (time.perf_counter() - start) * 1000
-                write_values.append(latency)
-                if raw_handle is not None:
-                    raw_handle.write(json.dumps({"section": "persistence", "phase": "write", "mode": mode, "size": size, "idx": idx, "latency_ms": latency, "status": "ok"}, sort_keys=True) + "\n")
-        finally:
-            if raw_handle is not None:
-                raw_handle.close()
-            ctx.target.unmount(writer)
-
-        reader = ctx.target.mount("kimi_persistence", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"{mode}-{size}-reader")
         read_values: list[float] = []
         errors = 0
-        raw_handle = raw_path.open("a", encoding="utf-8") if cfg["raw_results"] else None
-        try:
-            root = reader.mountpoint / f"{mode}-{size}"
-            for idx in range(samples):
-                path = root / f"f-{idx:08d}.bin"
-                start = time.perf_counter()
-                status = "ok"
-                err = ""
-                latency = 0.0
-                try:
-                    data = path.read_bytes()
+        for run_idx in range(int(cfg["runs"])):
+            writer = ctx.target.mount("kimi_persistence", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"{mode}-{size}-writer-run-{run_idx}")
+            raw_path = raw_dir / f"persistence-{mode}-{size}-run-{run_idx}.jsonl"
+            raw_handle = raw_path.open("w", encoding="utf-8") if cfg["raw_results"] else None
+            try:
+                root = writer.mountpoint / f"{mode}-{size}-run-{run_idx}"
+                if root.exists():
+                    shutil.rmtree(root)
+                root.mkdir(parents=True)
+                for idx in range(samples):
+                    path = root / f"f-{idx:08d}.bin"
+                    start = time.perf_counter()
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                    try:
+                        self.write_fd(fd, payload)
+                        if mode == "fsync":
+                            os.fsync(fd)
+                    finally:
+                        os.close(fd)
                     latency = (time.perf_counter() - start) * 1000
-                    if hashlib.sha256(data).hexdigest() != digest:
+                    write_values.append(latency)
+                    if raw_handle is not None:
+                        raw_handle.write(json.dumps({"section": "persistence", "phase": "write", "mode": mode, "size": size, "idx": idx, "run": run_idx, "latency_ms": latency, "status": "ok"}, sort_keys=True) + "\n")
+            finally:
+                if raw_handle is not None:
+                    raw_handle.close()
+                ctx.target.unmount(writer)
+
+            reader = ctx.target.mount("kimi_persistence", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"{mode}-{size}-reader-run-{run_idx}")
+            raw_handle = raw_path.open("a", encoding="utf-8") if cfg["raw_results"] else None
+            try:
+                root = reader.mountpoint / f"{mode}-{size}-run-{run_idx}"
+                for idx in range(samples):
+                    path = root / f"f-{idx:08d}.bin"
+                    start = time.perf_counter()
+                    status = "ok"
+                    err = ""
+                    latency = 0.0
+                    try:
+                        data = path.read_bytes()
+                        latency = (time.perf_counter() - start) * 1000
+                        if hashlib.sha256(data).hexdigest() != digest:
+                            errors += 1
+                            status = "error"
+                            err = "checksum mismatch"
+                        else:
+                            read_values.append(latency)
+                    except OSError as exc:
+                        latency = (time.perf_counter() - start) * 1000
                         errors += 1
                         status = "error"
-                        err = "checksum mismatch"
-                    else:
-                        read_values.append(latency)
-                except OSError as exc:
-                    latency = (time.perf_counter() - start) * 1000
-                    errors += 1
-                    status = "error"
-                    err = str(exc)
+                        err = str(exc)
+                    if raw_handle is not None:
+                        raw_handle.write(json.dumps({"section": "persistence", "phase": "remount_read", "mode": mode, "size": size, "idx": idx, "run": run_idx, "latency_ms": latency, "status": status, "error": err}, sort_keys=True) + "\n")
+            finally:
                 if raw_handle is not None:
-                    raw_handle.write(json.dumps({"section": "persistence", "phase": "remount_read", "mode": mode, "size": size, "idx": idx, "latency_ms": latency, "status": status, "error": err}, sort_keys=True) + "\n")
-        finally:
-            if raw_handle is not None:
-                raw_handle.close()
-            ctx.target.unmount(reader)
+                    raw_handle.close()
+                ctx.target.unmount(reader)
 
-        rows.append({"section": "persistence", "scale": "", "layout": "", "op": f"{mode}_write_before_remount", "file_size": size, "unit": "ms", "errors": 0, "error_rate": 0.0, **self.latency_summary(write_values)})
-        rows.append({"section": "persistence", "scale": "", "layout": "", "op": f"{mode}_remount_read", "file_size": size, "unit": "ms", "errors": errors, "error_rate": errors / samples, **self.latency_summary(read_values)})
+        rows.append({"section": "persistence", "scale": "", "layout": "", "op": f"{mode}_write_before_remount", "file_size": size, "unit": "ms", "errors": 0, "error_rate": 0.0, "runs": int(cfg["runs"]), **self.latency_summary(write_values)})
+        rows.append({"section": "persistence", "scale": "", "layout": "", "op": f"{mode}_remount_read", "file_size": size, "unit": "ms", "errors": errors, "error_rate": errors / (samples * int(cfg["runs"])), "runs": int(cfg["runs"]), **self.latency_summary(read_values)})
         ctx.perf_values(f"{self.id}.persistence.{mode}.write.{size}b", write_values, "ms")
         ctx.perf_values(f"{self.id}.persistence.{mode}.remount_read.{size}b", read_values, "ms")
         if errors:
@@ -566,26 +608,27 @@ class Drive9KimiPerf(BaseModule):
         remote = f"{remote_base}/same-host-mount"
         ctx.target.mkdir_remote(remote)
         for count in cfg["same_host_mount_counts"]:
-            handles = []
             values: list[float] = []
             errors = 0
-            try:
-                for idx in range(int(count)):
-                    start = time.perf_counter()
-                    try:
-                        handles.append(ctx.target.mount("kimi_same_host_mount", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"mount-{count}-{idx}"))
-                        values.append((time.perf_counter() - start) * 1000)
-                    except Exception:
-                        errors += 1
-                for idx, handle in enumerate(handles):
-                    probe = handle.mountpoint / f"probe-{count}-{idx}.txt"
-                    probe.write_text(f"{count}-{idx}\n", encoding="utf-8")
-                    if probe.read_text(encoding="utf-8") != f"{count}-{idx}\n":
-                        errors += 1
-            finally:
-                for handle in reversed(handles):
-                    ctx.target.unmount(handle)
-            row = {"section": "same_host_multi_mount", "scale": "", "layout": "", "op": "mount", "concurrency": int(count), "unit": "ms", "errors": errors, "error_rate": errors / max(1, int(count)), **self.latency_summary(values)}
+            for run_idx in range(int(cfg["runs"])):
+                handles = []
+                try:
+                    for idx in range(int(count)):
+                        start = time.perf_counter()
+                        try:
+                            handles.append(ctx.target.mount("kimi_same_host_mount", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"mount-{count}-{idx}-run-{run_idx}"))
+                            values.append((time.perf_counter() - start) * 1000)
+                        except Exception:
+                            errors += 1
+                    for idx, handle in enumerate(handles):
+                        probe = handle.mountpoint / f"probe-{count}-{idx}-run-{run_idx}.txt"
+                        probe.write_text(f"{count}-{idx}-{run_idx}\n", encoding="utf-8")
+                        if probe.read_text(encoding="utf-8") != f"{count}-{idx}-{run_idx}\n":
+                            errors += 1
+                finally:
+                    for handle in reversed(handles):
+                        ctx.target.unmount(handle)
+            row = {"section": "same_host_multi_mount", "scale": "", "layout": "", "op": "mount", "concurrency": int(count), "unit": "ms", "errors": errors, "error_rate": errors / max(1, int(count) * int(cfg["runs"])), "runs": int(cfg["runs"]), **self.latency_summary(values)}
             rows.append(row)
             ctx.perf_values(f"{self.id}.same_host_multi_mount.c{count}.mount", values, "ms")
             if errors:
