@@ -14170,6 +14170,106 @@ func TestFlushHandle_Path2_RenameRetargetDuringUpload(t *testing.T) {
 	}
 }
 
+// TestFlushHandle_Path2_SidecarCacheUsesSnapshotOnRetarget verifies that the
+// SQLite persistent journal sidecar cache uses snapshot path+data (handlePath,
+// dataCopy) after the unlock window, not live fh.Path/fh.Dirty which may be
+// retargeted or mutated by concurrent writes.
+//
+// Uses a -wal path to trigger the isSQLitePersistentJournalPath branch.
+// During upload: rename retarget changes fh.Path to a new -wal path.
+// After flush: asserts sidecar cache contains old path + snapshot data,
+// NOT the retargeted new path.
+func TestFlushHandle_Path2_SidecarCacheUsesSnapshotOnRetarget(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			// Return revision 0 so committedRev == 0, forcing the
+			// sidecar cache branch (sidecarCached) instead of the
+			// committedRev > 0 branch.
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 0})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	oldPath := "/workload.db-wal"
+	newPath := "/renamed.db-wal"
+	ino := fs.inodes.Lookup(oldPath, false, 8, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    oldPath,
+		Dirty:   NewWriteBuffer(oldPath, maxPreloadSize, 0),
+		BaseRev: 3,
+	}
+	walData := []byte("wal-snapshot-data")
+	if _, err := fh.Dirty.Write(0, walData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fs.openHandles.Add(fh)
+
+	// Start flush in background.
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	// Wait for upload to start.
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Rename retarget during upload — fh.Path changes from old to new.
+	fs.retargetOpenHandlesForRename(oldPath, newPath)
+
+	// Let the upload complete.
+	close(uploadResume)
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle did not complete")
+	}
+
+	// The sidecar cache MUST have been seeded under the old path
+	// (handlePath snapshot) with the snapshot data (dataCopy), NOT
+	// under the retargeted new path.
+	// expectedRevision for BaseRev=3 is 3 (expectedRevisionForHandle).
+	sidecarRev := int64(4) // sqliteCommittedRevision(0, 3) = 3+1 = 4
+	cached, ok := fs.readCache.Get(oldPath, sidecarRev)
+	if !ok {
+		t.Fatal("readCache miss for old -wal path — sidecar cache did not use snapshot handlePath")
+	}
+	if !bytes.Equal(cached, walData) {
+		t.Fatalf("readCache for old path = %q, want %q — sidecar cache did not use dataCopy", cached, walData)
+	}
+
+	// The new path must NOT have sidecar cache from the old-path upload.
+	if _, ok := fs.readCache.Get(newPath, sidecarRev); ok {
+		t.Fatal("readCache hit for new -wal path — sidecar cache leaked to retargeted path")
+	}
+}
+
 func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
