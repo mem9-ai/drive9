@@ -190,13 +190,14 @@ jobs:
           TCR_IMAGE="drive9.tencentcloudcr.com/drive9/dat9-server:$TAG"
           TCR_LOG=/tmp/tcr-token.log
           tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm >"$TCR_LOG" 2>&1
+          TCR_USER=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Username','100049824031'))" < "$TCR_LOG" 2>/dev/null) || true
           TCR_TOKEN=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Token'])" < "$TCR_LOG" 2>/dev/null) || true
           if [ -z "$TCR_TOKEN" ]; then
             echo "create TCR token failed; tccli output:" >&2
             cat "$TCR_LOG" >&2
             exit 1
           fi
-          echo "$TCR_TOKEN" | docker login drive9.tencentcloudcr.com --username 100049824031 --password-stdin
+          echo "$TCR_TOKEN" | docker login drive9.tencentcloudcr.com --username "$TCR_USER" --password-stdin
           docker pull "$IMAGE"
           docker tag "$IMAGE" "$TCR_IMAGE"
           docker push "$TCR_IMAGE"
