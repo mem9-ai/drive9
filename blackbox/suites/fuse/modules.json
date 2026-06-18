@@ -21,6 +21,9 @@
       "git.official.perf",
       "drive9.workflow.perf",
       "drive9.workflow.local_overlay_build"
+    ],
+    "customer": [
+      "drive9.customer.tencent_perf"
     ]
   },
   "modules": {
@@ -90,6 +93,82 @@
       "profile": "coding-agent",
       "durability": "interactive",
       "allow_other": false
+    },
+    "drive9.customer.tencent_perf": {
+      "selected_scales": [
+        "S"
+      ],
+      "layouts": [
+        "single",
+        "tree"
+      ],
+      "profile": "coding-agent",
+      "durability": "auto",
+      "namespace_stat_samples": 1000,
+      "small_file_sizes": [
+        1024,
+        4096,
+        20480,
+        102400,
+        1048576
+      ],
+      "small_file_concurrency": [
+        1,
+        4,
+        16,
+        64
+      ],
+      "small_file_ops": 1000,
+      "flush_file_sizes": [
+        1024,
+        4096,
+        20480,
+        102400,
+        1048576
+      ],
+      "flush_concurrency": [
+        1,
+        4,
+        16,
+        64
+      ],
+      "flush_ops": 1000,
+      "visibility_samples": 100,
+      "visibility_timeout_s": 30,
+      "same_host_mount_counts": [
+        1,
+        2,
+        5,
+        10
+      ],
+      "soak_minutes": 0,
+      "raw_results": true,
+      "reuse_datasets": true,
+      "sections": {
+        "namespace": true,
+        "small_file": true,
+        "flush": true,
+        "persistence": true,
+        "multi_mount": true,
+        "soak": false
+      },
+      "scales": {
+        "S": {
+          "bytes": 104857600,
+          "files": 1000,
+          "mount_repeats": 5
+        },
+        "M": {
+          "bytes": 1073741824,
+          "files": 10000,
+          "mount_repeats": 5
+        },
+        "L": {
+          "bytes": 10737418240,
+          "files": 100000,
+          "mount_repeats": 3
+        }
+      }
     }
   }
 }

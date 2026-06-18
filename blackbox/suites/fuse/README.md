@@ -21,6 +21,8 @@ The framework is organized around modules, not around one-off scripts.
   such as `drive9 git clone --fast`, blobless clone, worktrees, profile
   auto-pack, `umount --pack-path`, portable profile, explicit pack/unpack, and
   coding-agent local overlay build behavior.
+- `drive9.customer.*`: reproducible customer-scenario benchmarks. These are
+  opt-in modules because they can create large datasets and long-running load.
 
 The category names describe where the test idea or suite comes from. They do
 not imply that the tested filesystem is JuiceFS or Git. The tested filesystem is
@@ -61,6 +63,7 @@ blackbox/
         ported_juicefs_*.py         ported.juicefs.* modules
         git_official_*.py           git.official.* modules
         drive9_workflow_*.py        drive9.workflow.* modules
+        drive9_customer_*.py        customer-scenario benchmark modules
 ```
 
 New modules should get their own file unless they are a tiny variant of an
@@ -77,6 +80,9 @@ The FUSE suite also defines named module groups:
 - `posix`: `community.pjdfstest`.
 - `perf`: performance modules such as fio, mdtest, vdbench, Git perf, and
   Drive9 workflow perf.
+- `customer`: opt-in customer-scenario modules. These are intentionally not
+  part of `perf` because callers must explicitly choose the dataset scale and
+  target environment.
 
 ## Commands
 
@@ -93,6 +99,7 @@ make blackbox-list
 make blackbox BLACKBOX_SELECTOR=group:posix
 make blackbox BLACKBOX_SELECTOR=category:drive9.workflow
 make blackbox BLACKBOX_SELECTOR=module:community.pjdfstest
+make blackbox BLACKBOX_SELECTOR=group:customer
 make blackbox-deps BLACKBOX_SELECTOR=group:perf
 ```
 
@@ -164,6 +171,100 @@ BLACKBOX_QUIET=1
 BLACKBOX_LOCAL_OVERLAY_PREWARM=0
 BLACKBOX_LOCAL_OVERLAY_VERIFY_REMOTE=0
 ```
+
+## Tencent Customer Performance Module
+
+`drive9.customer.tencent_perf` codifies the Tencent customer sandbox workload:
+
+- namespace scale at 100MB/1k files, 1GB/10k files, and 10GB/100k files;
+- single-directory and sharded-tree layouts;
+- mount, `ls`, `ls -l`, `find`, name-pattern `find`, and sampled `stat` latency;
+- small-file create, overwrite, append, partial edit, read, and stat-after-write
+  QPS plus p50/p95/p99/max;
+- close, `fsync`, and `fdatasync` write latency, including separate reader
+  mount/cache visibility checks;
+- unmount/remount persistence checks for the "next sandbox sees previous data"
+  requirement;
+- same-host multi-mount validation for a configured set of mount counts.
+
+This module is never executed accidentally. It is registered in the `customer`
+group, but `ensure_dependencies` skips it unless explicitly enabled:
+
+```bash
+BLACKBOX_TENCENT_PERF_ENABLE=1 \
+BLACKBOX_SERVER_MODE=existing \
+DRIVE9_BASE=http://drive9.pingkai.cn \
+make blackbox BLACKBOX_SELECTOR=module:drive9.customer.tencent_perf
+```
+
+The default configuration runs only the S scale. Full customer scale requires
+explicit selection:
+
+```bash
+BLACKBOX_TENCENT_PERF_ENABLE=1 \
+BLACKBOX_TENCENT_PERF_SCALES=S,M,L \
+BLACKBOX_TENCENT_PERF_SMALL_OPS=10000 \
+BLACKBOX_TENCENT_PERF_FLUSH_OPS=10000 \
+BLACKBOX_TENCENT_PERF_SOAK=1 \
+BLACKBOX_TENCENT_PERF_SOAK_MINUTES=30 \
+BLACKBOX_SERVER_MODE=existing \
+DRIVE9_BASE=http://drive9.pingkai.cn \
+make blackbox BLACKBOX_SELECTOR=module:drive9.customer.tencent_perf
+```
+
+Useful tunables:
+
+```bash
+BLACKBOX_TENCENT_PERF_LAYOUTS=single,tree
+BLACKBOX_TENCENT_PERF_PROFILE=coding-agent
+BLACKBOX_TENCENT_PERF_DURABILITY=auto
+BLACKBOX_TENCENT_PERF_STAT_SAMPLES=1000
+BLACKBOX_TENCENT_PERF_SMALL_SIZES=1024,4096,20480,102400,1048576
+BLACKBOX_TENCENT_PERF_SMALL_CONCURRENCY=1,4,16,64
+BLACKBOX_TENCENT_PERF_FLUSH_SIZES=1024,4096,20480,102400,1048576
+BLACKBOX_TENCENT_PERF_FLUSH_CONCURRENCY=1,4,16,64
+BLACKBOX_TENCENT_PERF_VISIBILITY_SAMPLES=100
+BLACKBOX_TENCENT_PERF_MOUNT_COUNTS=1,2,5,10
+BLACKBOX_TENCENT_PERF_REMOTE_ROOT=/some/reusable/remote/root
+BLACKBOX_TENCENT_PERF_REUSE_DATASETS=1
+BLACKBOX_TENCENT_PERF_RAW=1
+```
+
+Per-section switches are also available:
+
+```bash
+BLACKBOX_TENCENT_PERF_NAMESPACE=1
+BLACKBOX_TENCENT_PERF_SMALL_FILE=1
+BLACKBOX_TENCENT_PERF_FLUSH=1
+BLACKBOX_TENCENT_PERF_PERSISTENCE=1
+BLACKBOX_TENCENT_PERF_MULTI_MOUNT=1
+BLACKBOX_TENCENT_PERF_SOAK=0
+```
+
+Outputs are written under the normal run directory:
+
+```text
+blackbox/results/fuse/<session>/artifacts/drive9.customer.tencent_perf/
+  environment.json
+  manifest.json
+  raw_results/*.jsonl
+  summary/summary.csv
+  summary/summary.json
+  report.md
+```
+
+`report.md` is the customer-facing summary table. `summary.csv` is meant for
+spreadsheets and trend dashboards. `raw_results/*.jsonl` contains per-operation
+latency records for deeper p95/p99/debug analysis.
+
+Important scope notes:
+
+- Same-host multi-mount results are reported as "validated on this host" only.
+  They are not a true multi-VM or multi-sandbox upper bound.
+- Cold namespace mount measurements use unique cache directories per mount.
+- Cross-mount visibility uses separate writer and reader cache directories.
+- True same-zone cloud measurement should run on a Tencent CVM in the same zone
+  as the Drive9 Tencent deployment, using `BLACKBOX_SERVER_MODE=existing`.
 
 ## External Dependencies
 
