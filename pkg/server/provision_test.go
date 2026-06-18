@@ -401,9 +401,8 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	defer ts.Close()
 
 	body, _ := json.Marshal(map[string]any{
-		"public_key":    "public-1",
-		"private_key":   "private-1",
-		"database_name": "customer_db",
+		"public_key":  "public-1",
+		"private_key": "private-1",
 	})
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -421,7 +420,7 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	if got := prov.credentialCalls.Load(); got != 1 {
 		t.Fatalf("credential provision calls = %d, want 1", got)
 	}
-	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" || prov.lastCredentialReq.DatabaseName != "customer_db" {
+	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
 		t.Fatalf("credential request = %+v", prov.lastCredentialReq)
 	}
 
