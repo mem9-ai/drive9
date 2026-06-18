@@ -11807,13 +11807,41 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		clearReadTargetForLockedHandle(fh)
 		fs.clearReadTargetsForPathExcept(handlePath, fh)
 		if !pathRetargeted {
-			fs.finalizeHandleFlushLocked(fh, expectedRevision)
+			if fh.DirtySeq == handleDirtySeq {
+				// No concurrent writes — safe to finalize from live handle.
+				fs.finalizeHandleFlushLocked(fh, expectedRevision)
+			} else {
+				// N1: concurrent writes mutated fh.Dirty during the unlock
+				// window. finalizeHandleFlushLocked would read fh.Dirty.Size()
+				// for OrigSize, associating the uploaded snapshot's synthetic
+				// revision with the post-write buffer size. Use the snapshot
+				// size instead.
+				if syntheticRev, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+					fs.markHandleRevisionOnlyLocked(fh, syntheticRev, size)
+				} else {
+					fs.finalizeHandleFlushLocked(fh, expectedRevision)
+				}
+			}
 		}
 	} else {
 		clearReadTargetForLockedHandle(fh)
 		fs.invalidateReadCacheAndTargetsExcept(handlePath, fh)
 		if !pathRetargeted {
-			fs.finalizeHandleFlushLocked(fh, expectedRevision)
+			if fh.DirtySeq == handleDirtySeq {
+				// No concurrent writes — safe to finalize from live handle.
+				fs.finalizeHandleFlushLocked(fh, expectedRevision)
+			} else {
+				// N1: concurrent writes mutated fh.Dirty during the unlock
+				// window. finalizeHandleFlushLocked would read fh.Dirty.Size()
+				// for OrigSize, associating the uploaded snapshot's synthetic
+				// revision with the post-write buffer size. Use the snapshot
+				// size instead.
+				if syntheticRev, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+					fs.markHandleRevisionOnlyLocked(fh, syntheticRev, size)
+				} else {
+					fs.finalizeHandleFlushLocked(fh, expectedRevision)
+				}
+			}
 		}
 	}
 	// When concurrent writes happened (DirtySeq changed), the buffer may
