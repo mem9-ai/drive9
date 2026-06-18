@@ -3781,11 +3781,19 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	var cluster *tenant.ClusterInfo
 	if provider == tenant.ProviderTiDBCloudNative {
 		if opts.CredentialProvisioner == nil {
-			err = fmt.Errorf("public_key and private_key are required")
-		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
-			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
-		} else {
-			err = fmt.Errorf("provisioner does not support request credentials")
+			defaultReq := resolveDefaultCredentials(s.provisioner)
+			if defaultReq == nil {
+				err = fmt.Errorf("public_key and private_key are required")
+			} else {
+				opts.CredentialProvisioner = defaultReq
+			}
+		}
+		if err == nil && opts.CredentialProvisioner != nil {
+			if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
+				cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
+			} else {
+				err = fmt.Errorf("provisioner does not support request credentials")
+			}
 		}
 	} else {
 		cluster, err = s.provisioner.Provision(ctx, tenantID)
