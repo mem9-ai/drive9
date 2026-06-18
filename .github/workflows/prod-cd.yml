@@ -181,12 +181,6 @@ jobs:
           audience: https://github.com/mem9-ai/drive9
           region: ap-beijing
 
-      - name: Debug OIDC sub claim
-        if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
-        run: |
-          ID_TOKEN=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https://github.com/mem9-ai/drive9" | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
-          echo "sub: $(echo "$ID_TOKEN" | python3 -c "import sys,json,base64; t=sys.stdin.read().split('.')[1]; t+='='*(4-len(t)%4); print(json.loads(base64.urlsafe_b64decode(t))['sub'])")"
-
       - name: Push image to tencentcloud-ap-beijing TCR
         if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
         run: |
