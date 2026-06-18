@@ -430,7 +430,8 @@ func DeleteTenant(args []string) error {
 	}
 
 	if !skipConfirm {
-		fmt.Fprint(os.Stderr, "This will delete your tenant and all data permanently.\n")
+		fmt.Fprintf(os.Stderr, "WARNING: this will permanently delete the current tenant,\n")
+		fmt.Fprintf(os.Stderr, "including its TiDB cluster, database, API keys, and all stored files.\n")
 		fmt.Fprint(os.Stderr, "Continue? [y/N]: ")
 		var answer string
 		if _, err := fmt.Fscanln(os.Stdin, &answer); err != nil {
