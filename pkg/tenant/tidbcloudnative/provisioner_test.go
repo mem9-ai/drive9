@@ -118,7 +118,7 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	origEnsureDatabase := ensureDatabaseFunc
 	ensureDatabaseFunc = func(_ context.Context, user, password, host string, port int, dbName string) error {
 		ensureDBCalled = true
-		if user != "u1.root" || password == "" || host != "db.example" || port != 4000 || dbName != "customer_db" {
+		if user != "u1.root" || password == "" || host != "db.example" || port != 4000 || dbName != DefaultDatabaseName {
 			t.Fatalf("ensure database args = %s/%s %s:%d %s", user, password, host, port, dbName)
 		}
 		return nil
