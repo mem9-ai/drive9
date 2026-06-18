@@ -97,14 +97,15 @@ type contentMD5Transport struct {
 }
 
 func (t *contentMD5Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if strings.Contains(req.URL.RawQuery, "delete") && req.Body != nil {
+	if req.URL.Query().Has("delete") && req.Body != nil {
 		bodyBytes, err := io.ReadAll(req.Body)
-		if err == nil {
-			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			hash := md5.Sum(bodyBytes)
-			req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(hash[:]))
-			req.ContentLength = int64(len(bodyBytes))
+		if err != nil {
+			return nil, fmt.Errorf("contentMD5Transport: read body: %w", err)
 		}
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		hash := md5.Sum(bodyBytes)
+		req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(hash[:]))
+		req.ContentLength = int64(len(bodyBytes))
 	}
 	if t.base != nil {
 		return t.base.RoundTrip(req)
