@@ -191,15 +191,18 @@ jobs:
           TAG=$(echo "$IMAGE" | awk -F: '{print $NF}')
           TCR_IMAGE="drive9.tencentcloudcr.com/drive9/dat9-server:$TAG"
           docker tag "$IMAGE" "$TCR_IMAGE"
-          TCR_LOG=/tmp/tcr-token.log
-          tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm >"$TCR_LOG"
-          TCR_USER=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Response'].get('Username','100049824031'))" < "$TCR_LOG" 2>/dev/null) || true
-          TCR_TOKEN=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Response']['Token'])" < "$TCR_LOG" 2>/dev/null) || true
-          if [ -z "$TCR_TOKEN" ]; then
-            echo "create TCR token failed" >&2
-            python3 -c "import sys,json; d=json.load(sys.stdin); print('RequestId:', d.get('Response',{}).get('RequestId','N/A'))" < "$TCR_LOG" 2>/dev/null >&2 || true
-            exit 1
-          fi
+           TCR_LOG=/tmp/tcr-token.log
+           TCR_ERR=/tmp/tcr-token.err
+           tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm >"$TCR_LOG" 2>"$TCR_ERR"
+           TCR_USER=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Response'].get('Username','100049824031'))" < "$TCR_LOG" 2>/dev/null) || true
+           TCR_TOKEN=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Response']['Token'])" < "$TCR_LOG" 2>/dev/null) || true
+           if [ -z "$TCR_TOKEN" ]; then
+             echo "create TCR token failed; stderr:" >&2
+             cat "$TCR_ERR" >&2
+             echo "stdout:" >&2
+             cat "$TCR_LOG" >&2
+             exit 1
+           fi
           echo "::add-mask::$TCR_TOKEN"
           echo "$TCR_TOKEN" | docker login drive9.tencentcloudcr.com --username "$TCR_USER" --password-stdin
           docker push "$TCR_IMAGE"
