@@ -136,6 +136,49 @@ func (u *WriteBackUploader) PendingStats() (queued int, inFlight int) {
 	return queued, inFlight
 }
 
+type WriteBackUploaderSnapshot struct {
+	Queued    int
+	InFlight  int
+	FirstPath string
+}
+
+func (u *WriteBackUploader) Snapshot() WriteBackUploaderSnapshot {
+	if u == nil {
+		return WriteBackUploaderSnapshot{}
+	}
+	snap := WriteBackUploaderSnapshot{Queued: len(u.uploadCh)}
+	u.inflightMu.Lock()
+	snap.InFlight = len(u.inflight)
+	for path := range u.inflight {
+		snap.FirstPath = path
+		break
+	}
+	u.inflightMu.Unlock()
+	if active := int(u.active.Load()); active > snap.InFlight {
+		snap.InFlight = active
+	}
+	return snap
+}
+
+func (u *WriteBackUploader) WaitIdle(ctx context.Context) error {
+	if u == nil {
+		return nil
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		snap := u.Snapshot()
+		if snap.Queued == 0 && snap.InFlight == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
 // Submit enqueues a local namespace path for background upload. Blocks up to 5s if the
 // channel is full; on timeout, falls back to synchronous upload in the current
 // goroutine so data is never silently dropped.

@@ -286,10 +286,11 @@ script is not a supported Windows validation path.
 7. Rename semantics (file + directory rename consistency)
 8. Attribute semantics (`size`, `mtime` monotonicity, remote stat parity)
 9. Cross-channel consistency (CLI write visible in mount; mount write visible via CLI)
-10. Mounted large file boundary check (8MB write + remote checksum parity) and tier-transition parity (10KiB → 8MiB → 10KiB size/checksum/remount)
-11. Read-only mount behavior (`--read-only` blocks writes/deletes, allows reads)
-12. Error semantics (missing path reads/deletes and duplicate mkdir failures)
-13. Linux prerequisite guardrails (`fusermount`, `/dev/fuse`) with skip behavior when unavailable
+10. Drain semantics (`drive9 mount drain --json` and native `sync -f`, including open-handle flush and post-drain writability)
+11. Mounted large file boundary check (8MB write + remote checksum parity) and tier-transition parity (10KiB → 8MiB → 10KiB size/checksum/remount)
+12. Read-only mount behavior (`--read-only` blocks writes/deletes, allows reads)
+13. Error semantics (missing path reads/deletes and duplicate mkdir failures)
+14. Linux prerequisite guardrails (`fusermount`, `/dev/fuse`) with skip behavior when unavailable
 
 Notes:
 - The script prechecks root `ls /` reachability before mount behavior checks.

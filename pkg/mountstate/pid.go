@@ -35,6 +35,7 @@ type ProcessState struct {
 	PprofAddr           string   `json:"pprof_addr,omitempty"`
 	StartedAt           string   `json:"started_at,omitempty"`
 	HeapProfilePath     string   `json:"heap_profile_path,omitempty"`
+	ControlSocket       string   `json:"control_socket,omitempty"`
 }
 
 const (
@@ -50,6 +51,12 @@ func PIDFilePath(mountPoint string) string {
 	canonical := canonicalMountPoint(mountPoint)
 	sum := sha256.Sum256([]byte(canonical))
 	return filepath.Join(os.TempDir(), "drive9-mount-"+hex.EncodeToString(sum[:8])+".pid")
+}
+
+func ControlSocketPath(mountPoint string) string {
+	canonical := canonicalMountPoint(mountPoint)
+	sum := sha256.Sum256([]byte(canonical))
+	return filepath.Join(os.TempDir(), "drive9-mount-"+hex.EncodeToString(sum[:8])+".sock")
 }
 
 func canonicalMountPoint(mountPoint string) string {

@@ -580,6 +580,121 @@ PY
   done
 }
 
+start_open_handle_writer() {
+  local file_path="$1"
+  local content="$2"
+  local ready_path="$3"
+  local done_path="$4"
+  rm -f "$ready_path" "$done_path"
+
+  python3 - "$file_path" "$content" "$ready_path" "$done_path" <<'PY' &
+import os
+import sys
+import time
+
+path, content, ready_path, done_path = sys.argv[1:]
+fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+try:
+    data = content.encode("utf-8")
+    offset = 0
+    while offset < len(data):
+        written = os.write(fd, data[offset:])
+        if written <= 0:
+            raise RuntimeError("short write")
+        offset += written
+    with open(ready_path, "w", encoding="utf-8") as marker:
+        marker.write("ready\n")
+    while not os.path.exists(done_path):
+        time.sleep(0.05)
+finally:
+    os.close(fd)
+PY
+  local writer_pid=$!
+  DRAIN_WRITER_PIDS+=("$writer_pid")
+  DRAIN_WRITER_DONE_FILES+=("$done_path")
+
+  local deadline=$(( $(date +%s) + MOUNT_READY_TIMEOUT_S ))
+  while :; do
+    if [ -f "$ready_path" ]; then
+      return 0
+    fi
+    if ! kill -0 "$writer_pid" >/dev/null 2>&1; then
+      wait "$writer_pid" >/dev/null 2>&1 || true
+      return 1
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep "$MOUNT_READY_INTERVAL_S"
+  done
+}
+
+finish_open_handle_writers() {
+  local done_path
+  local writer_pid
+  if [ "${#DRAIN_WRITER_DONE_FILES[@]}" -gt 0 ]; then
+    for done_path in "${DRAIN_WRITER_DONE_FILES[@]}"; do
+      : >"$done_path"
+    done
+  fi
+  if [ "${#DRAIN_WRITER_PIDS[@]}" -gt 0 ]; then
+    for writer_pid in "${DRAIN_WRITER_PIDS[@]}"; do
+      if kill -0 "$writer_pid" >/dev/null 2>&1; then
+        wait "$writer_pid" >/dev/null 2>&1 || true
+      fi
+    done
+  fi
+  DRAIN_WRITER_PIDS=()
+  DRAIN_WRITER_DONE_FILES=()
+}
+
+run_mount_drain_json() {
+  local json_path="$1"
+  local err_path="$2"
+  set +e
+  drive9 mount drain --timeout 30s --json "$MOUNT_POINT" >"$json_path" 2>"$err_path"
+  local rc=$?
+  set -e
+  if [ "$rc" -ne 0 ] && [ -s "$err_path" ]; then
+    cat "$err_path" >&2
+  fi
+  return "$rc"
+}
+
+validate_mount_drain_json() {
+  local json_path="$1"
+  jq -e --arg mp "$MOUNT_POINT" '
+    .ok == true
+    and .mount_point == $mp
+    and (.duration_ms | type == "number")
+    and (.native_syncfs_supported | type == "boolean")
+    and (.pending.dirty_handles == 0)
+    and (.pending.commit_queue_pending == 0)
+    and (.pending.commit_queue_in_flight == 0)
+    and (.pending.commit_queue_delayed == 0)
+    and (.pending.uploader_queued == 0)
+    and (.pending.uploader_in_flight == 0)
+    and ((.phases // []) | map(.name) | index("flush_open_handles") != null)
+    and ((.phases // []) | map(.name) | index("writeback_uploader") != null)
+    and ((.phases // []) | map(.name) | index("commit_queue") != null)
+  ' "$json_path" >/dev/null
+}
+
+mount_drain_native_syncfs_supported() {
+  local json_path="$1"
+  jq -r '.native_syncfs_supported == true' "$json_path"
+}
+
+native_sync_f_available() {
+  if ! command -v sync >/dev/null 2>&1; then
+    return 1
+  fi
+  if [ "$(uname -s)" = "Linux" ]; then
+    return 0
+  fi
+  sync -f "$MOUNT_POINT" >/dev/null 2>&1
+}
+
 start_mount() {
   local mode="$1"
   {
@@ -834,15 +949,33 @@ RO_SEED_REL="${ROOT_REL}/ro-seed.txt"
 RO_SEED_REMOTE="/${RO_SEED_REL}"
 RO_SEED_MOUNT="$MOUNT_POINT/$RO_SEED_REL"
 RO_WRITE_MOUNT="$MOUNT_POINT/${ROOT_REL}/ro-write.txt"
+DRAIN_DIR_REL="${ROOT_REL}/drain"
+DRAIN_DIR_MOUNT="$MOUNT_POINT/$DRAIN_DIR_REL"
+DRAIN_CLI_OPEN_REL="${DRAIN_DIR_REL}/cli-open.txt"
+DRAIN_CLI_OPEN_REMOTE="/${DRAIN_CLI_OPEN_REL}"
+DRAIN_CLI_OPEN_MOUNT="$MOUNT_POINT/$DRAIN_CLI_OPEN_REL"
+DRAIN_AFTER_REL="${DRAIN_DIR_REL}/after-cli-drain.txt"
+DRAIN_AFTER_REMOTE="/${DRAIN_AFTER_REL}"
+DRAIN_AFTER_MOUNT="$MOUNT_POINT/$DRAIN_AFTER_REL"
+DRAIN_SYNC_AFTER_REL="${DRAIN_DIR_REL}/after-syncfs.txt"
+DRAIN_SYNC_AFTER_MOUNT="$MOUNT_POINT/$DRAIN_SYNC_AFTER_REL"
+DRAIN_CLI_JSON="$FUSE_MOUNT_ROOT/drive9-fuse-drain-cli-${TS}.json"
+DRAIN_CLI_ERR="$FUSE_MOUNT_ROOT/drive9-fuse-drain-cli-${TS}.err"
+DRAIN_CLI_READY="$FUSE_MOUNT_ROOT/drive9-fuse-drain-cli-ready-${TS}"
+DRAIN_CLI_DONE="$FUSE_MOUNT_ROOT/drive9-fuse-drain-cli-done-${TS}"
 
 mkdir -p "$MOUNT_POINT"
 : >"$MOUNT_LOG"
 printf "seed-%s" "$TS" > "$SEED_LOCAL"
 
 MOUNT_PID=""
+DRAIN_WRITER_PIDS=()
+DRAIN_WRITER_DONE_FILES=()
 cleanup() {
+  finish_open_handle_writers
   stop_mount
-  rm -f "$SEED_LOCAL" "$LARGE_DOWNLOADED" "$TIER_DOWNLOADED" "$CLI_BIN"
+  rm -f "$SEED_LOCAL" "$LARGE_DOWNLOADED" "$TIER_DOWNLOADED" "$CLI_BIN" \
+    "$DRAIN_CLI_JSON" "$DRAIN_CLI_ERR" "$DRAIN_CLI_READY" "$DRAIN_CLI_DONE"
   rm -rf "${MOUNT_POINT:?}" || true
 }
 on_exit() {
@@ -1154,6 +1287,64 @@ PY
     check_eq "remote reads mount-written content" "$mount_to_cli_content" "from-mount-${TS}"
   else
     echo "SKIP cross-channel consistency after mount directory rename failure (tracked in issue #248)"
+  fi
+
+  echo "[9.1] drain semantics"
+  drain_dir_ready=false
+  if mkdir -p "$DRAIN_DIR_MOUNT" && wait_path_exists "$DRAIN_DIR_MOUNT"; then
+    check_eq "drain directory visible in mount" "true" "true"
+    drain_dir_ready=true
+  else
+    check_eq "drain directory visible in mount" "false" "true"
+  fi
+  if [ "$drain_dir_ready" = "true" ]; then
+    cli_drain_content="cli-drain-open-${TS}"
+    if start_open_handle_writer "$DRAIN_CLI_OPEN_MOUNT" "$cli_drain_content" "$DRAIN_CLI_READY" "$DRAIN_CLI_DONE"; then
+      check_eq "open handle writer ready for drive9 mount drain" "true" "true"
+      check_cmd "drive9 mount drain --json succeeds" run_mount_drain_json "$DRAIN_CLI_JSON" "$DRAIN_CLI_ERR"
+      check_cmd "drive9 mount drain JSON reports idle queues" validate_mount_drain_json "$DRAIN_CLI_JSON"
+      if cli_drain_remote=$(wait_remote_cat_eq "$DRAIN_CLI_OPEN_REMOTE" "$cli_drain_content"); then
+        :
+      else
+        cli_drain_remote=""
+      fi
+      check_eq "drive9 mount drain flushes open handle to remote" "$cli_drain_remote" "$cli_drain_content"
+    else
+      check_eq "open handle writer ready for drive9 mount drain" "false" "true"
+    fi
+    finish_open_handle_writers
+
+    printf "after-cli-drain-%s" "$TS" > "$DRAIN_AFTER_MOUNT"
+    drain_after_local=$(cat "$DRAIN_AFTER_MOUNT")
+    if drain_after_remote=$(wait_remote_cat_eq "$DRAIN_AFTER_REMOTE" "after-cli-drain-${TS}"); then
+      :
+    else
+      drain_after_remote=""
+    fi
+    check_eq "mount remains writable after drive9 mount drain" "$drain_after_local" "after-cli-drain-${TS}"
+    check_eq "post-drain write visible remotely" "$drain_after_remote" "after-cli-drain-${TS}"
+
+    native_syncfs_supported=false
+    if [ -s "$DRAIN_CLI_JSON" ]; then
+      native_syncfs_supported=$(mount_drain_native_syncfs_supported "$DRAIN_CLI_JSON" 2>/dev/null || printf false)
+    fi
+    if native_sync_f_available; then
+      if [ "$native_syncfs_supported" = "true" ]; then
+        check_cmd "native sync -f drains mounted filesystem" sync -f "$MOUNT_POINT"
+        echo "INFO native sync -f is supported; open-handle remote visibility is covered by drive9 mount drain"
+      else
+        check_cmd "native sync -f returns success without FUSE_SYNCFS support" sync -f "$MOUNT_POINT"
+        echo "SKIP native sync -f open-handle flush requires negotiated FUSE protocol >= 7.34"
+      fi
+
+      printf "after-syncfs-%s" "$TS" > "$DRAIN_SYNC_AFTER_MOUNT"
+      sync_after_local=$(cat "$DRAIN_SYNC_AFTER_MOUNT")
+      check_eq "mount remains writable after native sync -f" "$sync_after_local" "after-syncfs-${TS}"
+    else
+      echo "SKIP native sync -f unsupported on this host"
+    fi
+  else
+    echo "SKIP drain semantics because the drain directory is unavailable"
   fi
 
   echo "[10] large-file boundary"

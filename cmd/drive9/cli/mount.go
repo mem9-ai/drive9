@@ -57,8 +57,9 @@ var startMountBackground = startMountBackgroundImpl
 // Dispatch fork (Row A, V2e): the first positional argument selects the
 // mount flavour.
 //
-//   - `drive9 mount vault <path>`   -> read-only vault FUSE filesystem
-//   - `drive9 mount [flags] <path>` -> legacy writable fs mount (no
+//   - `drive9 mount vault <path>`       -> read-only vault FUSE filesystem
+//   - `drive9 mount drain <mountpoint>` -> drain pending writes for a live FUSE mount
+//   - `drive9 mount [flags] <path>`     -> legacy writable fs mount (no
 //     subcommand keyword; first positional is the mount point)
 //
 // We MUST peek at the first arg before flag.Parse because the vault flag
@@ -66,16 +67,19 @@ var startMountBackground = startMountBackgroundImpl
 // set would quietly accept write-path flags for a vault mount - that
 // would violate Row C (read-only) in a subtle, mount-time-visible way.
 //
-// Only the CURRENT supported backend keyword ("vault") is reserved here.
-// Every other first positional falls through to the legacy parser, which
-// enforces "exactly one mountpoint" so `drive9 mount kv /mnt/x` fails as
-// a positional-arity error rather than by pre-reserving backend-shaped
-// words that do not exist yet.
+// Only the CURRENT supported subcommand/backend keywords ("vault", "drain") are
+// reserved here. Every other first positional falls through to the legacy parser,
+// which enforces "exactly one mountpoint" so `drive9 mount kv /mnt/x` fails as a
+// positional-arity error rather than by pre-reserving backend-shaped words that do
+// not exist yet.
 func MountCmd(args []string) error {
 	fmt.Fprint(os.Stderr, buildinfo.String("drive9 mount"))
 	if len(args) > 0 {
 		if args[0] == "vault" {
 			return vaultMountCmd(args[1:], true)
+		}
+		if args[0] == "drain" {
+			return MountDrainCmd(args[1:])
 		}
 	}
 	return fsMountCmdWithBackground(args, true)
