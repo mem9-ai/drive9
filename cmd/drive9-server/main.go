@@ -123,6 +123,11 @@ func main() {
 	if err != nil {
 		die(fmt.Errorf("open control-plane store: %w", err))
 	}
+	if raw := os.Getenv("DRIVE9_DEFAULT_STORAGE_QUOTA_BYTES"); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
+			meta.SetDefaultMaxStorageBytes(v)
+		}
+	}
 	defer func() { _ = store.Close() }()
 
 	if s3cfg.Bucket == "" {
@@ -418,6 +423,7 @@ environment:
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
+  DRIVE9_DEFAULT_STORAGE_QUOTA_BYTES fallback per-tenant total storage limit when no explicit quota is configured (default: %d)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
@@ -514,7 +520,7 @@ environment:
 schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
   such as tidb_cloud_starter can stay in sync with drive9's schema source of truth.
-`, server.DefaultMaxUploadBytes)
+`, server.DefaultMaxUploadBytes, meta.DefaultMaxStorageBytes())
 	os.Exit(exitCode)
 }
 

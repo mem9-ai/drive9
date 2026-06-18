@@ -284,7 +284,17 @@ func (s *Store) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reser
 }
 
 // defaultMaxStorageBytes is the fallback limit when no per-tenant config row exists.
-const defaultMaxStorageBytes = int64(50 * (1 << 30)) // 50 GiB
+var defaultMaxStorageBytes = int64(50 * (1 << 30)) // 50 GiB
+
+// SetDefaultMaxStorageBytes overrides the per-tenant fallback storage quota.
+func SetDefaultMaxStorageBytes(bytes int64) {
+	if bytes > 0 {
+		defaultMaxStorageBytes = bytes
+	}
+}
+
+// DefaultMaxStorageBytes returns the configured per-tenant fallback storage quota.
+func DefaultMaxStorageBytes() int64 { return defaultMaxStorageBytes }
 
 // AtomicReserveAndInsertUpload claims reserved_bytes and inserts the reservation
 // tracking row inside a single server DB transaction. This is the correct API
