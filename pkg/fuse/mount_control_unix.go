@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -24,6 +25,7 @@ type mountControlServer struct {
 	listener   net.Listener
 	socketPath string
 	done       chan struct{}
+	drainMu    sync.Mutex
 }
 
 func startMountControlServer(mountPoint string, fs *Dat9FS) (*mountControlServer, error) {
@@ -97,7 +99,9 @@ func (s *mountControlServer) handleConn(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(timeout + 5*time.Second))
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	s.drainMu.Lock()
 	resp := s.fs.Drain(ctx)
+	s.drainMu.Unlock()
 	if resp.MountPoint == "" {
 		resp.MountPoint = s.mountPoint()
 	}
