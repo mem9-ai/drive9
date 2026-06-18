@@ -1905,6 +1905,39 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 	}
 }
 
+// markHandleRevisionOnlyLocked updates the handle's committed revision,
+// IsNew flag, and propagates the revision to other open handles, but does
+// NOT read from fh.Dirty for OrigSize/inode size. This is used when a
+// concurrent write mutated the dirty buffer during the Path 2 unlock
+// window, so the live dirty state reflects uncommitted post-upload data.
+func (fs *Dat9FS) markHandleRevisionOnlyLocked(fh *FileHandle, revision int64) {
+	if fs == nil || fh == nil || revision <= 0 {
+		return
+	}
+	if fh.IsNew {
+		fs.replaceCommittedRevision(fh.Path, revision)
+	} else {
+		fs.recordCommittedRevision(fh.Path, revision)
+	}
+	fh.IsNew = false
+	fh.BaseRev = revision
+	fs.inodes.UpdateRevision(fh.Ino, revision)
+	fs.refreshCommittedRevisionForOpenHandles(fh.Path, revision, fh)
+	if fs.writeBack != nil {
+		fs.writeBack.Remove(fh.Path)
+	}
+	if fs.shadowStore != nil {
+		fs.shadowStore.Remove(fh.Path)
+	}
+	if fs.pendingIndex != nil {
+		fs.pendingIndex.Remove(fh.Path)
+	}
+	fh.ShadowReady = false
+	fh.ShadowSpill = false
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
+}
+
 func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64) {
 	if fs == nil || fh == nil || revision <= 0 {
 		return
@@ -11722,7 +11755,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			// the WriteBuffer may have been mutated by concurrent writes
 			// while the lock was released.
 			fs.readCache.Put(handlePath, dataCopy, committedRev)
-			fs.markHandleRemoteCommittedLocked(fh, committedRev)
+			if fh.DirtySeq == handleDirtySeq {
+				// No concurrent writes — safe to finalize from live handle.
+				fs.markHandleRemoteCommittedLocked(fh, committedRev)
+			} else {
+				// B7: concurrent writes mutated fh.Dirty during the unlock
+				// window. markHandleRemoteCommittedLocked reads fh.Dirty.Size()
+				// for OrigSize, which would associate the uploaded snapshot's
+				// revision with the post-write buffer size. Only update the
+				// committed revision and flags without consuming live dirty state.
+				fs.markHandleRevisionOnlyLocked(fh, committedRev)
+			}
 		}
 	} else if sidecarCached {
 		clearReadTargetForLockedHandle(fh)
@@ -11745,7 +11788,13 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		publishSize = fh.Dirty.Size()
 	}
 	fs.inodes.UpdateSize(handleIno, publishSize)
-	fs.cacheFileForPath(handlePath, publishSize, time.Now(), committedRev)
+	// B8: skip dir cache update for retargeted handles. finishLocalRename
+	// has already removed/negatively cached the old path (handlePath), and
+	// re-adding it here with the upload's size/revision would resurrect a
+	// stale entry. The new path (fh.Path) will be cached on its own flush.
+	if !pathRetargeted {
+		fs.cacheFileForPath(handlePath, publishSize, time.Now(), committedRev)
+	}
 	// Local flush — kernel receives the Flush reply with status.
 	// No notifyInode/notifyEntry needed; userspace caches are updated
 	// above and kernel will refresh attrs on next getattr/lookup.

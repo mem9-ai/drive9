@@ -14288,6 +14288,209 @@ func TestFlushHandle_Path2_SidecarCacheUsesSnapshotOnRetarget(t *testing.T) {
 	}
 }
 
+// TestFlushHandle_Path2_ConcurrentWriteDoesNotCorruptOrigSize verifies that
+// when a concurrent Write() grows the file during the Path 2 unlock window,
+// markHandleRemoteCommittedLocked does NOT derive OrigSize from the live
+// dirty buffer. The uploaded snapshot was small, so OrigSize must reflect
+// the snapshot size, not the post-write buffer size. (B7 regression test)
+func TestFlushHandle_Path2_ConcurrentWriteDoesNotCorruptOrigSize(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 10})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/origsize-test.txt", false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	// Start with a small file (5 bytes).
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/origsize-test.txt",
+		Dirty:   NewWriteBuffer("/origsize-test.txt", maxPreloadSize, 0),
+		BaseRev: 1,
+	}
+	smallData := []byte("hello")
+	if _, err := fh.Dirty.Write(0, smallData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fhID := fs.fileHandles.Allocate(fh)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Concurrent Write during upload — grow file significantly.
+	largeData := make([]byte, 64*1024)
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+			Size:     uint32(len(largeData)),
+		}, largeData)
+		writeDone <- st
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(uploadResume)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write timed out")
+	}
+
+	// B7 assertion: OrigSize must NOT be the large post-write size.
+	// The uploaded snapshot was 5 bytes, so the committed revision's
+	// OrigSize should reflect the snapshot, not the concurrent write.
+	fh.Lock()
+	origSize := fh.OrigSize
+	dirtySize := fh.Dirty.Size()
+	dirtySeq := fh.DirtySeq
+	fh.Unlock()
+
+	// Dirty must still be pending (DirtySeq != 0) because concurrent write
+	// changed it during upload.
+	if dirtySeq == 0 {
+		t.Fatal("DirtySeq = 0 after concurrent Write — dirty data lost")
+	}
+	// OrigSize must not equal the large dirty buffer size.
+	if origSize == dirtySize && dirtySize > int64(len(smallData)) {
+		t.Fatalf("OrigSize = %d equals dirty buffer size %d — markHandleRemoteCommittedLocked read live dirty state (B7 bug)",
+			origSize, dirtySize)
+	}
+
+	_ = fhID
+}
+
+// TestFlushHandle_Path2_RetargetSkipsDirCacheForOldPath verifies that when
+// a handle is retargeted by rename during the Path 2 unlock window,
+// cacheFileForPath is NOT called for the old handlePath. Otherwise it
+// would re-add the pre-rename path to the directory cache after
+// finishLocalRename already removed it. (B8 regression test)
+func TestFlushHandle_Path2_RetargetSkipsDirCacheForOldPath(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 20})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	oldPath := "/rename-dircache-old.txt"
+	newPath := "/rename-dircache-new.txt"
+	ino := fs.inodes.Lookup(oldPath, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    oldPath,
+		Dirty:   NewWriteBuffer(oldPath, maxPreloadSize, 0),
+		BaseRev: 3,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("data1")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Retarget handle during upload (simulates rename).
+	fh.Lock()
+	fh.Path = newPath
+	fh.Unlock()
+
+	// Negative-cache the old path (simulates finishLocalRename).
+	fs.cacheNegativePath(oldPath)
+
+	close(uploadResume)
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+
+	// B8 assertion: the old path must NOT have been re-added to dir cache
+	// as a positive entry. After rename, finishLocalRename negatively cached
+	// oldPath. If cacheFileForPath ran for the retargeted handle, it would
+	// resurrect oldPath with a positive entry (size/revision from upload).
+	parentPath, name := cacheParentName(oldPath)
+	result := fs.dirCache.Lookup(parentPath, name)
+	if result.kind == namespaceLookupPositive {
+		t.Fatalf("dir cache has positive entry for old path %q after retarget — B8 bug: cacheFileForPath should be skipped for retargeted handles (size=%d)",
+			oldPath, result.item.Size)
+	}
+}
+
 func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
