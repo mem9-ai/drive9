@@ -99,7 +99,7 @@ type contentMD5Transport struct {
 func (t *contentMD5Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Query().Has("delete") && req.Body != nil {
 		bodyBytes, err := io.ReadAll(req.Body)
-		req.Body.Close()
+		_ = req.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("contentMD5Transport: read body: %w", err)
 		}
