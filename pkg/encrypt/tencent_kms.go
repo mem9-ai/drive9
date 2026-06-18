@@ -33,6 +33,10 @@ func NewTencentKMSEncryptor(region, keyID string) (*TencentKMSEncryptor, error) 
 		secretKey = os.Getenv("TENCENTCLOUD_SECRETKEY")
 	}
 
+	if secretID == "" {
+		return nil, fmt.Errorf("tencent kms: TENCENTCLOUD_SECRET_ID is not set")
+	}
+
 	var credential common.CredentialIface
 	if token := os.Getenv("TENCENTCLOUD_SECURITY_TOKEN"); token != "" {
 		credential = common.NewTokenCredential(secretID, secretKey, token)

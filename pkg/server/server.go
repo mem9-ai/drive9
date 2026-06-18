@@ -3729,7 +3729,11 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 	}
 	if provider == tenant.ProviderTiDBCloudNative && opts.CredentialProvisioner == nil {
-		return nil, newProvisionTenantError(http.StatusBadRequest, "public_key and private_key are required", fmt.Errorf("public_key and private_key are required"))
+		if defaultReq := resolveDefaultCredentials(s.provisioner); defaultReq == nil {
+			return nil, newProvisionTenantError(http.StatusBadRequest, "public_key and private_key are required", fmt.Errorf("public_key and private_key are required"))
+		} else {
+			opts.CredentialProvisioner = defaultReq
+		}
 	}
 	tenantID := token.NewID()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
@@ -3780,20 +3784,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 
 	var cluster *tenant.ClusterInfo
 	if provider == tenant.ProviderTiDBCloudNative {
-		if opts.CredentialProvisioner == nil {
-			defaultReq := resolveDefaultCredentials(s.provisioner)
-			if defaultReq == nil {
-				err = fmt.Errorf("public_key and private_key are required")
-			} else {
-				opts.CredentialProvisioner = defaultReq
-			}
-		}
-		if err == nil && opts.CredentialProvisioner != nil {
-			if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
-				cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
-			} else {
-				err = fmt.Errorf("provisioner does not support request credentials")
-			}
+		if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
+			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
+		} else {
+			err = fmt.Errorf("provisioner does not support request credentials")
 		}
 	} else {
 		cluster, err = s.provisioner.Provision(ctx, tenantID)
@@ -3814,7 +3808,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			msg = "TiDB Cloud cluster capacity limit reached"
 		} else if strings.Contains(strings.ToLower(err.Error()), "status 401") || strings.Contains(strings.ToLower(err.Error()), "invalid tidb cloud") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") {
 			msg = "invalid TiDB Cloud API key"
-		} else if strings.Contains(strings.ToLower(err.Error()), "cluster limit") || strings.Contains(strings.ToLower(err.Error()), "exceeded") {
+		} else if strings.Contains(strings.ToLower(err.Error()), "cluster limit") {
 			msg = "TiDB Cloud cluster limit reached (100 clusters per organization). Contact PingCAP support for assistance."
 		}
 		return nil, newProvisionTenantError(http.StatusBadGateway, msg, err)
