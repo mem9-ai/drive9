@@ -211,7 +211,7 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	if gotBody.SpendingLimit.Monthly != 5000 {
 		t.Fatalf("spendingLimit.monthly = %d, want 5000", gotBody.SpendingLimit.Monthly)
 	}
-	if out.ClusterID != "cluster-1" || out.Username != "u1.root" || out.DBName != "customer_db" || out.Provider != tenant.ProviderTiDBCloudNative {
+	if out.ClusterID != "cluster-1" || out.Username != "u1.root" || out.DBName != DefaultDatabaseName || out.Provider != tenant.ProviderTiDBCloudNative {
 		t.Fatalf("unexpected cluster info: %#v", out)
 	}
 	if !ensureDBCalled {
