@@ -185,7 +185,7 @@ jobs:
           pip3 install tccli -q
           TAG=$(echo "$IMAGE" | awk -F: '{print $NF}')
           TCR_IMAGE="drive9.tencentcloudcr.com/drive9/dat9-server:$TAG"
-          TCR_TOKEN=$(tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Token'])")
+          TCR_TOKEN=$(tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Token'])")
           echo "$TCR_TOKEN" | docker login drive9.tencentcloudcr.com --username 100049824031 --password-stdin
           docker pull "$IMAGE"
           docker tag "$IMAGE" "$TCR_IMAGE"
@@ -197,15 +197,17 @@ jobs:
         if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
         run: |
           mkdir -p ~/.kube
-          tccli tke DescribeClusterKubeconfig --ClusterId cls-6dpiw235 --IsExtranet true --region ap-beijing | python3 -c "import sys,json; print(json.load(sys.stdin)['Kubeconfig'])" > ~/.kube/config
-          kubectl -n drive9-tidbcloud \
+          tccli tke DescribeClusterKubeconfig --ClusterId cls-6dpiw235 --IsExtranet true --region ap-beijing | python3 -c "import sys,json; print(json.load(sys.stdin)['Kubeconfig'])" > ~/.kube/tencent-config
+          kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
             set image deployment/drive9-server \
             drive9-server=$TCR_IMAGE
-          kubectl -n drive9-tidbcloud \
+          kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
             rollout status deployment/drive9-server --timeout=180s
 
       - name: Rollback tencentcloud-ap-beijing on failure
         if: failure() && steps.deploy-tencent.outcome == 'failure'
         run: |
-          kubectl -n drive9-tidbcloud \
-            rollout undo deployment/drive9-server
+          if [ -f ~/.kube/tencent-config ]; then
+            kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
+              rollout undo deployment/drive9-server
+          fi

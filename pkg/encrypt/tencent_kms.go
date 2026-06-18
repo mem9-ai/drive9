@@ -29,6 +29,9 @@ func NewTencentKMSEncryptor(region, keyID string) (*TencentKMSEncryptor, error) 
 	if secretID == "" {
 		secretID = os.Getenv("TENCENTCLOUD_SECRETID")
 	}
+	if secretKey == "" {
+		secretKey = os.Getenv("TENCENTCLOUD_SECRETKEY")
+	}
 
 	credential := common.NewCredential(secretID, secretKey)
 	cpf := profile.NewClientProfile()
