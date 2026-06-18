@@ -14176,9 +14176,12 @@ func TestFlushHandle_Path2_RenameRetargetDuringUpload(t *testing.T) {
 // retargeted or mutated by concurrent writes.
 //
 // Uses a -wal path to trigger the isSQLitePersistentJournalPath branch.
-// During upload: rename retarget changes fh.Path to a new -wal path.
-// After flush: asserts sidecar cache contains old path + snapshot data,
-// NOT the retargeted new path.
+// During upload:
+//   - rename retarget changes fh.Path to a new -wal path
+//   - concurrent write mutates fh.Dirty with different data
+//
+// After flush: asserts sidecar cache contains old path + original snapshot
+// data, NOT the retargeted new path or the mutated dirty buffer.
 func TestFlushHandle_Path2_SidecarCacheUsesSnapshotOnRetarget(t *testing.T) {
 	uploadStarted := make(chan struct{})
 	uploadResume := make(chan struct{})
@@ -14240,6 +14243,17 @@ func TestFlushHandle_Path2_SidecarCacheUsesSnapshotOnRetarget(t *testing.T) {
 	// Rename retarget during upload — fh.Path changes from old to new.
 	fs.retargetOpenHandlesForRename(oldPath, newPath)
 
+	// Mutate fh.Dirty during upload — simulates concurrent Write() while
+	// fh.mu is released. The sidecar cache must still use dataCopy
+	// (snapshot before upload), not live fh.Dirty.bytesView().
+	fh.Lock()
+	mutatedData := []byte("MUTATED-WAL-DATA!")
+	if _, err := fh.Dirty.Write(0, mutatedData); err != nil {
+		fh.Unlock()
+		t.Fatal(err)
+	}
+	fh.Unlock()
+
 	// Let the upload complete.
 	close(uploadResume)
 	select {
@@ -14262,6 +14276,10 @@ func TestFlushHandle_Path2_SidecarCacheUsesSnapshotOnRetarget(t *testing.T) {
 	}
 	if !bytes.Equal(cached, walData) {
 		t.Fatalf("readCache for old path = %q, want %q — sidecar cache did not use dataCopy", cached, walData)
+	}
+	// Explicitly verify the cached data is NOT the mutated dirty buffer.
+	if bytes.Equal(cached, mutatedData) {
+		t.Fatal("readCache contains mutated dirty bytes — sidecar cache used live fh.Dirty.bytesView() instead of dataCopy")
 	}
 
 	// The new path must NOT have sidecar cache from the old-path upload.
