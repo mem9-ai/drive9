@@ -173,7 +173,7 @@ jobs:
           fi
 
       - name: Configure Tencent Cloud credentials
-        if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
+        if: (inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing') && github.ref_name == 'feat/tencent-cloud'
         uses: everpcpc/tencentcloud-oidc-auth@v1
         with:
           role-arn: ${{ secrets.TENCENTCLOUD_ROLE_ARN }}
@@ -182,7 +182,7 @@ jobs:
           region: ap-beijing
 
       - name: Push image to tencentcloud-ap-beijing TCR
-        if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
+        if: (inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing') && github.ref_name == 'feat/tencent-cloud'
         run: |
           pip3 install tccli -q
           if ! command -v tccli >/dev/null 2>&1; then
@@ -206,7 +206,7 @@ jobs:
 
       - name: Deploy to tencentcloud-ap-beijing
         id: deploy-tencent
-        if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
+        if: (inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing') && github.ref_name == 'feat/tencent-cloud'
         run: |
           mkdir -p ~/.kube
           tccli tke DescribeClusterKubeconfig --ClusterId cls-6dpiw235 --IsExtranet true --region ap-beijing | python3 -c "import sys,json; print(json.load(sys.stdin)['Kubeconfig'])" > ~/.kube/tencent-config
@@ -217,7 +217,7 @@ jobs:
             rollout status deployment/drive9-server --timeout=180s
 
       - name: Rollback tencentcloud-ap-beijing on failure
-        if: failure() && steps.deploy-tencent.outcome == 'failure'
+        if: failure() && steps.deploy-tencent.outcome == 'failure' && github.ref_name == 'feat/tencent-cloud'
         run: |
           if [ -f ~/.kube/tencent-config ]; then
             kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
