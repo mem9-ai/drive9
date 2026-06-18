@@ -3808,6 +3808,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		} else if strings.Contains(strings.ToLower(err.Error()), "credits") || strings.Contains(strings.ToLower(err.Error()), "payment") {
 			msg = "TiDB Cloud payment required. Add a payment method at https://tidbcloud.com/org-settings/billing/payments"
 		} else if strings.Contains(strings.ToLower(err.Error()), "instance capacity limit") || strings.Contains(strings.ToLower(err.Error()), "capacity limit") {
+			msg = "TiDB Cloud cluster capacity limit reached"
+		} else if strings.Contains(strings.ToLower(err.Error()), "401") || strings.Contains(strings.ToLower(err.Error()), "invalid") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") {
+			msg = "invalid TiDB Cloud API key"
+		} else if strings.Contains(strings.ToLower(err.Error()), "cluster limit") || strings.Contains(strings.ToLower(err.Error()), "exceeded") {
 			msg = "TiDB Cloud cluster limit reached (100 clusters per organization). Contact PingCAP support for assistance."
 		}
 		return nil, newProvisionTenantError(http.StatusBadGateway, msg, err)
