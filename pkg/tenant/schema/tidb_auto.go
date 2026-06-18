@@ -2078,7 +2078,9 @@ func isConstraintDefinition(def string) bool {
 	normalized := normalizeSQLFragment(def)
 	return strings.HasPrefix(normalized, "primary key") ||
 		strings.HasPrefix(normalized, "constraint ") ||
-		strings.HasPrefix(normalized, "unique key ")
+		strings.HasPrefix(normalized, "unique key ") ||
+		strings.HasPrefix(normalized, "fulltext ") ||
+		strings.HasPrefix(normalized, "vector index ")
 }
 
 func parseCreateIndexStatement(stmt string) (tableName, indexName, createSQL string, ok bool) {
