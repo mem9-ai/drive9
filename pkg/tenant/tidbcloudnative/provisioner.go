@@ -9,7 +9,6 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -105,11 +104,6 @@ func (p *Provisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, b
 	}, true
 }
 
-func (p *Provisioner) HasDefaultCredentials() bool {
-	_, ok := p.DefaultCredentials()
-	return ok
-}
-
 func (p *Provisioner) ProvisioningRegion() string { return p.region }
 
 func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
@@ -201,7 +195,7 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, errors.New(statusError("provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
+		return nil, fmt.Errorf("%s", statusError("provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 	info, err := parseClusterInfo(raw)
 	if err != nil {

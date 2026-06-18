@@ -3413,10 +3413,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			req, err = resolveDefaultCredentials(w, s.provisioner)
-			if err != nil {
-				return
-			}
+			req = resolveDefaultCredentials(s.provisioner)
 			if req == nil {
 				errJSON(w, http.StatusBadRequest, tenant.ErrCredentialsRequired.Error())
 				return
@@ -3474,16 +3471,16 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
-func resolveDefaultCredentials(w http.ResponseWriter, p tenant.Provisioner) (*tenant.CredentialProvisionRequest, error) {
+func resolveDefaultCredentials(p tenant.Provisioner) *tenant.CredentialProvisionRequest {
 	type defaultCredentialProvider interface {
 		DefaultCredentials() (tenant.CredentialProvisionRequest, bool)
 	}
 	if dp, ok := p.(defaultCredentialProvider); ok {
 		if req, ok := dp.DefaultCredentials(); ok {
-			return &req, nil
+			return &req
 		}
 	}
-	return nil, nil
+	return nil
 }
 
 func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
