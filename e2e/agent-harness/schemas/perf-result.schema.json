@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Drive9 Agent Harness Perf Result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "case_id",
+    "operation_id",
+    "operation",
+    "status",
+    "started_at",
+    "ended_at",
+    "duration_ms",
+    "bytes",
+    "request_units",
+    "error_class",
+    "artifact_refs"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "perf-result.v1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "case_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "scenario_id": {
+      "type": "string"
+    },
+    "operation_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "operation": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "failed",
+        "timeout",
+        "skipped"
+      ]
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "ended_at": {
+      "type": "string"
+    },
+    "duration_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "request_units": {
+      "type": "number",
+      "minimum": 0
+    },
+    "local_path": {
+      "type": "string"
+    },
+    "remote_path": {
+      "type": "string"
+    },
+    "error_class": {
+      "enum": [
+        "",
+        "product",
+        "harness",
+        "environment",
+        "infrastructure",
+        "inconclusive"
+      ]
+    },
+    "error": {
+      "type": "string"
+    },
+    "artifact_refs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

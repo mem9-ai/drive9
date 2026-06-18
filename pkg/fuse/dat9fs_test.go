@@ -7002,7 +7002,7 @@ func TestLookupRetriesTransientCanceledStat(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	opts := &MountOptions{PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
@@ -7065,7 +7065,7 @@ func TestLookupReturnsENOENTAfterTransientCanceledStat(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	opts := &MountOptions{PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
@@ -7119,7 +7119,7 @@ func TestLookupTransientRetryExhaustedReturnsEAGAIN(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	opts := &MountOptions{}
+	opts := &MountOptions{PerfCounters: true}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 
