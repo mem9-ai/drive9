@@ -11675,23 +11675,25 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 
 	sidecarRevision := sqliteCommittedRevision(committedRev, expectedRevision)
 	sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
+
+	// B4 guard: check retarget BEFORE dirty cleanup. If fh.Path was
+	// changed by retargetOpenHandlesForRename while the lock was released,
+	// the upload went to the old path (handlePath) but fh.Path now points
+	// to the new path. The dirty buffer now belongs to the new path and
+	// must NOT be cleared — the old-path upload success does not satisfy
+	// the new path's flush obligation.
+	pathRetargeted := fh.Path != handlePath
+
 	// Only clear dirty state if no concurrent writes happened while the
-	// lock was released. If DirtySeq changed, a new write arrived and the
-	// buffer must stay dirty so the next flush picks it up. This mirrors
-	// the generation guard in flushHandleDebounced (line ~11243).
-	if fh.DirtySeq == handleDirtySeq {
+	// lock was released AND the handle was not retargeted. If DirtySeq
+	// changed, a new write arrived and the buffer must stay dirty so the
+	// next flush picks it up. If retargeted, the dirty data belongs to
+	// the new path and must be preserved for a subsequent flush.
+	if !pathRetargeted && fh.DirtySeq == handleDirtySeq {
 		fh.Dirty.ClearDirty()
 		fs.clearDirtySize(handleIno, handleDirtySeq)
 		fh.DirtySeq = 0
 	}
-	// B4 guard: if fh.Path was changed by retargetOpenHandlesForRename
-	// while the lock was released, the upload went to the old path
-	// (handlePath/remotePath) but fh.Path now points to the new path.
-	// Do NOT record the committed revision on the renamed path — that
-	// would attribute an old-path upload to the new path. Instead, use
-	// handlePath for cache operations and skip markHandleRemoteCommittedLocked
-	// which would pollute the renamed path's revision/shadow/pending state.
-	pathRetargeted := fh.Path != handlePath
 
 	if committedRev > 0 {
 		clearReadTargetForLockedHandle(fh)

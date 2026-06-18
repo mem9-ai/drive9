@@ -14134,11 +14134,19 @@ func TestFlushHandle_Path2_RenameRetargetDuringUpload(t *testing.T) {
 		fh.Unlock()
 		t.Fatalf("fh.Path = %q after retarget, want %q", fh.Path, newPath)
 	}
-	// B4 dirty-preservation: if the DirtySeq was cleared but the handle
-	// was retargeted, subsequent writes to the new path still need a flush.
-	// Write new data to the handle and verify it becomes dirty — proving
-	// the retarget did not corrupt the write buffer or lose dirty tracking.
-	dirtyBuf := fh.Dirty
+	// B4 dirty-preservation: the upload went to old path, but the handle
+	// is now retargeted to new path. The dirty data in the buffer belongs
+	// to the new path and must NOT have been cleared by the old-path
+	// upload's success. DirtySeq must still be non-zero so the next flush
+	// picks up this data for the new path.
+	if fh.DirtySeq == 0 {
+		fh.Unlock()
+		t.Fatal("DirtySeq cleared after retargeted upload — new path data is no longer scheduled for flush")
+	}
+	if fh.Dirty.Size() == 0 {
+		fh.Unlock()
+		t.Fatal("Dirty buffer cleared after retargeted upload — new path data lost")
+	}
 	fh.Unlock()
 
 	// Verify the old path got cached with the upload data.
@@ -14154,19 +14162,6 @@ func TestFlushHandle_Path2_RenameRetargetDuringUpload(t *testing.T) {
 	if _, ok := fs.readCache.Get(newPath, 20); ok {
 		t.Fatal("readCache hit for new path — old-path upload data leaked to new path")
 	}
-
-	// Dirty-preservation gate: the write buffer must still be functional
-	// after retarget. Write new data to prove no corruption.
-	if _, err := dirtyBuf.Write(0, []byte("new-data")); err != nil {
-		t.Fatalf("Write to dirty buffer after retarget failed: %v", err)
-	}
-	fh.Lock()
-	fh.DirtySeq = fs.markDirtySize(ino, dirtyBuf.Size())
-	if fh.DirtySeq == 0 {
-		fh.Unlock()
-		t.Fatal("markDirtySize returned 0 after retarget — dirty tracking broken")
-	}
-	fh.Unlock()
 }
 
 func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {
