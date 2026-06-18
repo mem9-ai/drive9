@@ -1586,6 +1586,39 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision i
 	}
 }
 
+// refreshCommittedRevisionForOpenHandlesWithSize is like
+// refreshCommittedRevisionForOpenHandles but uses an explicit committed
+// size instead of reading from the inode table. This is needed in the
+// Path 2 concurrent-write case where the inode size has already been
+// updated by the concurrent Write() but the committed revision
+// corresponds to the pre-write snapshot.
+func (fs *Dat9FS) refreshCommittedRevisionForOpenHandlesWithSize(path string, revision int64, skip *FileHandle, committedSize int64) {
+	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 {
+		return
+	}
+
+	for _, fh := range fs.openHandles.SnapshotPath(path) {
+		if fh == nil || fh == skip {
+			continue
+		}
+		if !fh.TryLock() {
+			continue
+		}
+		if fh.Dirty != nil {
+			cleanBuffer := fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts()
+			fh.IsNew = false
+			fh.BaseRev = revision
+			if fh.Streamer != nil {
+				fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+			}
+			if cleanBuffer {
+				fs.rebindCleanWriteBufferToRemoteLocked(fh, committedSize)
+			}
+		}
+		fh.Unlock()
+	}
+}
+
 func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) bool {
 	if fs == nil || fh == nil || fh.Dirty == nil || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
 		return false
@@ -1925,7 +1958,7 @@ func (fs *Dat9FS) markHandleRevisionOnlyLocked(fh *FileHandle, revision int64, s
 	fh.BaseRev = revision
 	fh.OrigSize = snapshotSize
 	fs.inodes.UpdateRevision(fh.Ino, revision)
-	fs.refreshCommittedRevisionForOpenHandles(fh.Path, revision, fh)
+	fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, revision, fh, snapshotSize)
 	if fs.writeBack != nil {
 		fs.writeBack.Remove(fh.Path)
 	}

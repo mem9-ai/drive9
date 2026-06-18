@@ -14518,6 +14518,147 @@ func TestFlushHandle_Path2_LargeBaseSmallSnapshotOrigSize(t *testing.T) {
 	_ = fhID
 }
 
+// TestFlushHandle_Path2_CleanSiblingOrigSizeFromSnapshot verifies that a
+// clean sibling handle refreshed by markHandleRevisionOnlyLocked gets
+// OrigSize from the uploaded snapshot size, not from the post-concurrent-write
+// inode size. Without this fix, committedHandleSizeLocked would read the
+// inode entry (already updated by the concurrent Write) and rebind the
+// sibling with the wrong OrigSize. (B7 sibling regression test)
+func TestFlushHandle_Path2_CleanSiblingOrigSizeFromSnapshot(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 30})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/sibling-test.txt", false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	// Primary handle: small file (5 bytes), dirty.
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/sibling-test.txt",
+		Dirty:   NewWriteBuffer("/sibling-test.txt", maxPreloadSize, 0),
+		BaseRev: 1,
+	}
+	smallData := []byte("hello")
+	if _, err := fh.Dirty.Write(0, smallData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fhID := fs.fileHandles.Allocate(fh)
+
+	// Clean sibling handle: same path, no dirty parts, DirtySeq == 0.
+	sibling := &FileHandle{
+		Ino:      ino,
+		Path:     "/sibling-test.txt",
+		Dirty:    NewWriteBuffer("/sibling-test.txt", maxPreloadSize, 0),
+		BaseRev:  1,
+		OrigSize: 5,
+	}
+	// Set totalSize/remoteSize to match a clean read buffer.
+	sibling.Dirty.totalSize = 5
+	sibling.Dirty.remoteSize = 5
+	siblingID := fs.fileHandles.Allocate(sibling)
+	// Register both handles so refreshCommittedRevisionForOpenHandlesWithSize finds the sibling.
+	if fs.openHandles == nil {
+		fs.openHandles = NewOpenHandleIndex()
+	}
+	fs.openHandles.Add(fh)
+	fs.openHandles.Add(sibling)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Concurrent Write on the primary handle during upload.
+	largeData := make([]byte, 64*1024)
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+			Size:     uint32(len(largeData)),
+		}, largeData)
+		writeDone <- st
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(uploadResume)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write timed out")
+	}
+
+	snapshotSize := int64(len(smallData))
+
+	// Primary handle: OrigSize must equal snapshot size.
+	fh.Lock()
+	primaryOrigSize := fh.OrigSize
+	fh.Unlock()
+	if primaryOrigSize != snapshotSize {
+		t.Fatalf("primary OrigSize = %d, want %d", primaryOrigSize, snapshotSize)
+	}
+
+	// Sibling handle: OrigSize must also equal snapshot size, NOT the
+	// post-concurrent-write dirty size (64KB).
+	sibling.Lock()
+	siblingOrigSize := sibling.OrigSize
+	siblingBaseRev := sibling.BaseRev
+	sibling.Unlock()
+	if siblingBaseRev != 30 {
+		t.Fatalf("sibling BaseRev = %d, want 30", siblingBaseRev)
+	}
+	if siblingOrigSize != snapshotSize {
+		t.Fatalf("sibling OrigSize = %d, want %d (snapshot size) — clean sibling rebound from post-write inode size",
+			siblingOrigSize, snapshotSize)
+	}
+
+	_ = fhID
+	_ = siblingID
+}
+
 // TestFlushHandle_Path2_RetargetSkipsDirCacheForOldPath verifies that when
 // a handle is retargeted by rename during the Path 2 unlock window,
 // cacheFileForPath is NOT called for the old handlePath. Otherwise it
