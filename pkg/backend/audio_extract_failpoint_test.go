@@ -10,7 +10,7 @@ import (
 	"github.com/pingcap/failpoint"
 )
 
-const audioExtractWritebackUpdateFileSearchTextErrorFailpoint = "github.com/mem9-ai/dat9/pkg/backend/audioExtractWritebackUpdateFileSearchTextError"
+const audioExtractWritebackUpdateFileSearchTextErrorFailpoint = "github.com/mem9-ai/drive9/pkg/backend/audioExtractWritebackUpdateFileSearchTextError"
 
 func TestProcessAudioExtractTaskWritebackUpdateFailsWithFailpoint(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{

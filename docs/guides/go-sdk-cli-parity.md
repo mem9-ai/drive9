@@ -6,11 +6,10 @@ large amount of local workflow orchestration around those calls: config files,
 mount lifecycle, local filesystem traversal, process execution, output
 formatting, and safety checks.
 
-The public project name is drive9. The current Go module path is still
-`github.com/mem9-ai/dat9`, so SDK imports use:
+The Go module path is `github.com/mem9-ai/drive9`, so SDK imports use:
 
 ```go
-import drive9 "github.com/mem9-ai/dat9/pkg/client"
+import drive9 "github.com/mem9-ai/drive9/pkg/client"
 ```
 
 ## Current SDK coverage

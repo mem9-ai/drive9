@@ -18,7 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
 // UploadPlan is the server's 202 response for large file uploads.

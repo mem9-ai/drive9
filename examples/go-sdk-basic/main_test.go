@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 func TestRunUsesDrive9GoSDK(t *testing.T) {

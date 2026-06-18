@@ -12,7 +12,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
-	"github.com/mem9-ai/dat9/pkg/pathutil"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 // LocalOverlay stores local-only subtrees under a mount-scoped root. It is a

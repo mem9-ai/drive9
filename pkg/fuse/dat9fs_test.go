@@ -24,8 +24,8 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
 type testErrorRecorder struct {

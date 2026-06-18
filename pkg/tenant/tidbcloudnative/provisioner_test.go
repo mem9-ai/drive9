@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
 func TestNewProvisionerFromEnvReadsServerSideConfigOnly(t *testing.T) {

@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/mem9-ai/dat9/pkg/parser"
+	"github.com/mem9-ai/drive9/pkg/parser"
 )
 
 // RelationsFileName is the advisory sidecar name reserved by the design doc.

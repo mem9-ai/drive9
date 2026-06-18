@@ -12,9 +12,9 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
-	"github.com/mem9-ai/dat9/pkg/datastore"
-	"github.com/mem9-ai/dat9/pkg/logger"
-	"github.com/mem9-ai/dat9/pkg/pathutil"
+	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"go.uber.org/zap"
 )
 

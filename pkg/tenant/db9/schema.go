@@ -6,7 +6,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/mem9-ai/dat9/pkg/tenant/schema"
+	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
 // InitSchemaStatements returns the exact DDL statements used by db9 tenant

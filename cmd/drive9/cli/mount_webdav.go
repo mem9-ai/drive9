@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 // MountMode selects the filesystem mount backend.

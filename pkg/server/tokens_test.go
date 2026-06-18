@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/meta"
-	"github.com/mem9-ai/dat9/pkg/tenant/token"
+	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
 
 func TestScopedTokenIssueCreatesFSScopeKey(t *testing.T) {

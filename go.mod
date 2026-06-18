@@ -1,4 +1,4 @@
-module github.com/mem9-ai/dat9
+module github.com/mem9-ai/drive9
 
 go 1.25.1
 

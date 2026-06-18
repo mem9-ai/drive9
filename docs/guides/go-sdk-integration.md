@@ -7,9 +7,8 @@ filesystem workflows.
 For CLI parity analysis, see
 [`docs/guides/go-sdk-cli-parity.md`](go-sdk-cli-parity.md).
 
-The public project name is drive9. The current Go module path is still
-`github.com/mem9-ai/dat9`, so Go imports must use `github.com/mem9-ai/dat9/pkg/client`
-until the module path changes.
+The Go module path is `github.com/mem9-ai/drive9`, so Go imports use
+`github.com/mem9-ai/drive9/pkg/client`.
 
 ## Prerequisites
 
@@ -26,13 +25,13 @@ until the module path changes.
 In an external Go module:
 
 ```bash
-go get github.com/mem9-ai/dat9
+go get github.com/mem9-ai/drive9
 ```
 
 Import the SDK package with an alias that matches the product name:
 
 ```go
-import drive9 "github.com/mem9-ai/dat9/pkg/client"
+import drive9 "github.com/mem9-ai/drive9/pkg/client"
 ```
 
 ## Create a client
@@ -47,7 +46,7 @@ import (
 	"os"
 	"time"
 
-	drive9 "github.com/mem9-ai/dat9/pkg/client"
+	drive9 "github.com/mem9-ai/drive9/pkg/client"
 )
 
 func main() {

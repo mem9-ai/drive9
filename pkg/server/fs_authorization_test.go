@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/meta"
 )
 
 // newScopedRequest constructs a synthetic *http.Request suitable for unit-
