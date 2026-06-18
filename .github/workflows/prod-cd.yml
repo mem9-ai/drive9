@@ -66,9 +66,7 @@ jobs:
             exit 1
           fi
           echo "Promoting image: $IMAGE"
-          printf '%s=%s
-' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
-
+          printf '%s=%s\n' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
       - name: Deploy to aws-ap-southeast-1
         id: deploy-sg
         if: inputs.region == 'all' || inputs.region == 'aws-ap-southeast-1'
