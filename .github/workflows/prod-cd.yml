@@ -192,16 +192,12 @@ jobs:
           TCR_IMAGE="drive9.tencentcloudcr.com/drive9/dat9-server:$TAG"
           docker tag "$IMAGE" "$TCR_IMAGE"
            TCR_LOG=/tmp/tcr-token.log
-           TCR_ERR=/tmp/tcr-token.err
            tccli configure set secretId "$TENCENTCLOUD_SECRET_ID" secretKey "$TENCENTCLOUD_SECRET_KEY" region "$TENCENTCLOUD_REGION" token "$TENCENTCLOUD_SECURITY_TOKEN" 2>/dev/null || true
-           tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm >"$TCR_LOG" 2>"$TCR_ERR"
-           TCR_USER=$(python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('Response',d); print(r.get('Username','100049824031'))" < "$TCR_LOG" 2>/dev/null) || true
-           TCR_TOKEN=$(python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('Response',d); print(r['Token'])" < "$TCR_LOG" 2>/dev/null) || true
+           tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm >"$TCR_LOG"
+           TCR_USER=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Username','100049824031'))" < "$TCR_LOG" 2>/dev/null) || true
+           TCR_TOKEN=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Token'])" < "$TCR_LOG" 2>/dev/null) || true
            if [ -z "$TCR_TOKEN" ]; then
-             echo "create TCR token failed; stderr:" >&2
-             cat "$TCR_ERR" >&2
-             echo "stdout:" >&2
-             cat "$TCR_LOG" >&2
+             echo "create TCR token failed" >&2
              exit 1
            fi
           echo "::add-mask::$TCR_TOKEN"
@@ -214,7 +210,7 @@ jobs:
         if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
         run: |
           mkdir -p ~/.kube
-          tccli tke DescribeClusterKubeconfig --ClusterId cls-6dpiw235 --IsExtranet true --region ap-beijing | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('Response',d); print(r['Kubeconfig'])" > ~/.kube/tencent-config
+          tccli tke DescribeClusterKubeconfig --ClusterId cls-6dpiw235 --IsExtranet true --region ap-beijing | python3 -c "import sys,json; print(json.load(sys.stdin)['Kubeconfig'])" > ~/.kube/tencent-config
           kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
             set image deployment/drive9-server \
             drive9-server=$TCR_IMAGE
