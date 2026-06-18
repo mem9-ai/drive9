@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -200,7 +201,7 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("tidbcloud native provision status %d: %s", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return nil, errors.New(statusError("provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 	info, err := parseClusterInfo(raw)
 	if err != nil {
@@ -263,7 +264,7 @@ func (p *Provisioner) DeprovisionWithCredentials(ctx context.Context, cluster *t
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("tidbcloud native cluster delete status %d: %s", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return fmt.Errorf("%s", statusError("cluster delete", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 	return nil
 }
@@ -382,6 +383,23 @@ func sanitizeUpstreamBody(raw []byte) string {
 	return s
 }
 
+func statusError(operation string, code int, upstreamBody string) string {
+	msg := fmt.Sprintf("tidbcloud native %s status %d", operation, code)
+	if upstreamBody != "" {
+		msg += ": " + upstreamBody
+	} else {
+		switch code {
+		case http.StatusUnauthorized:
+			msg += ": invalid TiDB Cloud API key"
+		case http.StatusForbidden:
+			msg += ": access denied"
+		default:
+			msg += ": upstream error"
+		}
+	}
+	return msg
+}
+
 func ensureDatabase(ctx context.Context, user, password, host string, port int, dbName string) error {
 	cfg := mysql.NewConfig()
 	cfg.User = user
@@ -440,7 +458,7 @@ func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, priva
 		raw, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("tidbcloud native cluster get status %d: %s", resp.StatusCode, sanitizeUpstreamBody(raw))
+			return nil, fmt.Errorf("%s", statusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw)))
 		}
 		info, err := parseClusterInfo(raw)
 		if err != nil {
