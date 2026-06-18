@@ -97,6 +97,49 @@ func TestCtxForkCreatesOwnerContextWithoutSwitching(t *testing.T) {
 	}
 }
 
+func TestCtxForkSendsTiDBCloudCredentials(t *testing.T) {
+	withIsolatedHome(t)
+	var gotBody struct {
+		Name       string `json:"name"`
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/fork" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"tenant_id":        "fork-tenant",
+			"api_key":          "fork-key",
+			"status":           "active",
+			"parent_tenant_id": "source-tenant",
+			"storage":          "shared",
+		})
+	}))
+	defer ts.Close()
+
+	cfg := loadConfig()
+	if _, err := ctxAdd(cfg, "prod", &Context{Type: PrincipalOwner, APIKey: "source-key", Server: ts.URL}); err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	if _, err := captureStdoutE(t, func() error {
+		return Ctx([]string{"fork", "exp", "--tidbcloud-public-key", "public-1", "--tidbcloud-private-key", "private-1"})
+	}); err != nil {
+		t.Fatalf("ctx fork: %v", err)
+	}
+	if gotBody.Name != "exp" || gotBody.PublicKey != "public-1" || gotBody.PrivateKey != "private-1" {
+		t.Fatalf("fork request body = %+v", gotBody)
+	}
+}
+
 func TestCtxForkGeneratesNameWhenOmitted(t *testing.T) {
 	withIsolatedHome(t)
 	var sawName string

@@ -302,6 +302,81 @@ func TestProvisionWithCredentialsIncludesUpstreamBodyOnError(t *testing.T) {
 	}
 }
 
+func TestBranchWithCredentialsUsesRequestCredentials(t *testing.T) {
+	var gotAuth []string
+	var gotCreateBody struct {
+		DisplayName  string `json:"displayName"`
+		ParentID     string `json:"parentId"`
+		RootPassword string `json:"rootPassword"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta1/clusters/cluster-1/branches":
+			if err := json.NewDecoder(r.Body).Decode(&gotCreateBody); err != nil {
+				t.Fatalf("decode create branch body: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"branchId": "branch-1",
+				"state":    "CREATING",
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters/cluster-1/branches/branch-1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"branchId":   "branch-1",
+				"state":      "ACTIVE",
+				"userPrefix": "u2",
+				"endpoints":  map[string]any{"public": map[string]any{"host": "branch.example", "port": 4000}},
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1beta1/clusters/cluster-1/branches/branch-1":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	req := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	out, err := p.ProvisionBranchWithCredentials(context.Background(), "fork-tenant", &tenant.ClusterInfo{
+		ClusterID: "cluster-1",
+		BranchID:  "source-branch",
+		Password:  "branch-pass",
+		DBName:    "tenant_db",
+	}, req)
+	if err != nil {
+		t.Fatalf("ProvisionBranchWithCredentials: %v", err)
+	}
+	if out.ClusterID != "cluster-1" || out.BranchID != "branch-1" || out.Host != "branch.example" || out.Port != 4000 || out.Username != "u2.root" {
+		t.Fatalf("branch info = %#v", out)
+	}
+	if gotCreateBody.ParentID != "source-branch" || gotCreateBody.RootPassword != "branch-pass" {
+		t.Fatalf("create branch body = %+v", gotCreateBody)
+	}
+	if err := p.DeleteBranchWithCredentials(context.Background(), "cluster-1", "branch-1", req); err != nil {
+		t.Fatalf("DeleteBranchWithCredentials: %v", err)
+	}
+	if len(gotAuth) != 3 {
+		t.Fatalf("authorized request count = %d, want 3", len(gotAuth))
+	}
+	for _, auth := range gotAuth {
+		if !strings.Contains(auth, `username="public-1"`) {
+			t.Fatalf("Authorization header did not use request public key: %q", auth)
+		}
+		if strings.Contains(auth, "private-1") {
+			t.Fatalf("Authorization header leaked private key: %q", auth)
+		}
+	}
+}
+
 func TestDeprovisionWithCredentialsDeletesCluster(t *testing.T) {
 	var gotAuth string
 	var deleteCalled bool

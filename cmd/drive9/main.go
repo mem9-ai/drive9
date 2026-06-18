@@ -405,6 +405,7 @@ func usage(code int) {
 			"  ctx import [--from-file <path|->] [--name NAME]\n"+
 			"                         add delegated context\n"+
 			"  ctx fork [<new>] [--from <ctx>] [--json]\n"+
+			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
 			"                         create a copy-on-write fork context\n"+
 			"  ctx ls [-l|--long] [-D|--details] [--json] [--type <kind>|--scoped]\n"+
 			"                         list contexts\n"+
