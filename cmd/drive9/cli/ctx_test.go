@@ -140,7 +140,7 @@ func TestCtxForkSendsTiDBCloudCredentials(t *testing.T) {
 	}
 }
 
-func TestCtxForkDoesNotSendTiDBCloudEnvForUnlabelledContext(t *testing.T) {
+func TestCtxForkDoesNotSendTiDBCloudEnvForNonTiDBMetadataContext(t *testing.T) {
 	withIsolatedHome(t)
 	t.Setenv(EnvTiDBCloudPublicKey, "env-public")
 	t.Setenv(EnvTiDBCloudPrivateKey, "env-private")
@@ -165,7 +165,13 @@ func TestCtxForkDoesNotSendTiDBCloudEnvForUnlabelledContext(t *testing.T) {
 	defer ts.Close()
 
 	cfg := loadConfig()
-	if _, err := ctxAdd(cfg, "prod", &Context{Type: PrincipalOwner, APIKey: "source-key", Server: ts.URL}); err != nil {
+	if _, err := ctxAdd(cfg, "prod", &Context{
+		Type:          PrincipalOwner,
+		APIKey:        "source-key",
+		Server:        ts.URL,
+		CloudProvider: "aws",
+		Region:        "us-west-2",
+	}); err != nil {
 		t.Fatalf("ctxAdd: %v", err)
 	}
 	if err := saveConfig(cfg); err != nil {

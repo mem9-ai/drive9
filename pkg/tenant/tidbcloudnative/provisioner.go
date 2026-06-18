@@ -36,6 +36,7 @@ const (
 
 	DefaultDatabaseName = "tidbcloud_fs"
 	DefaultSpendLimit   = int32(1000)
+	stateActive         = "ACTIVE"
 
 	upstreamErrorBodyLimit = 2048
 )
@@ -207,7 +208,7 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	if info.ClusterID == "" {
 		return nil, fmt.Errorf("tidbcloud native response missing cluster id")
 	}
-	if info.State != "ACTIVE" || clusterConnectionIncomplete(info) {
+	if info.State != stateActive || clusterConnectionIncomplete(info) {
 		info, err = p.waitForClusterActive(ctx, publicKey, privateKey, info.ClusterID)
 		if err != nil {
 			return &tenant.ClusterInfo{
@@ -296,12 +297,12 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("marshal branch provision request: %w", err)
 	}
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches", p.apiURL, url.PathEscape(source.ClusterID))
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPost, endpoint, body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create branch request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
@@ -311,7 +312,7 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 
 	branch, err := parseBranchInfo(raw)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("parse branch provision response: %w", err)
 	}
 	if branch.BranchID == "" {
 		return nil, fmt.Errorf("tidbcloud native branch response missing branch id")
@@ -328,11 +329,11 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 		DBName:    dbName,
 		Provider:  tenant.ProviderTiDBCloudNative,
 	}
-	if branch.State != "" && branch.State != "ACTIVE" {
+	if branch.State != "" && branch.State != stateActive {
 		return out, nil
 	}
 	if branchConnectionIncomplete(branch) {
-		if branch.State == "ACTIVE" {
+		if branch.State == stateActive {
 			return out, nil
 		}
 		return out, fmt.Errorf("tidbcloud native branch response missing state and endpoint")
@@ -366,7 +367,7 @@ func (p *Provisioner) WaitForBranchActiveWithCredentials(ctx context.Context, br
 	out := *branch
 	info, err := p.waitForBranchActive(ctx, publicKey, privateKey, branch.ClusterID, branch.BranchID)
 	if err != nil {
-		return &out, err
+		return &out, fmt.Errorf("wait for branch active: %w", err)
 	}
 	if err := fillBranchEndpoint(&out, info); err != nil {
 		return &out, err
@@ -394,7 +395,7 @@ func (p *Provisioner) DeleteBranchWithCredentials(ctx context.Context, clusterID
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s", p.apiURL, url.PathEscape(clusterID), url.PathEscape(branchID))
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodDelete, endpoint, nil)
 	if err != nil {
-		return err
+		return fmt.Errorf("delete branch request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
@@ -666,7 +667,7 @@ func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, priva
 		if err != nil {
 			return nil, err
 		}
-		if info.State == "ACTIVE" && !clusterConnectionIncomplete(info) {
+		if info.State == stateActive && !clusterConnectionIncomplete(info) {
 			return info, nil
 		}
 		if time.Now().After(deadline) {
@@ -697,7 +698,7 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privat
 		if err != nil {
 			return nil, err
 		}
-		if info.State == "ACTIVE" && !branchConnectionIncomplete(info) {
+		if info.State == stateActive && !branchConnectionIncomplete(info) {
 			return info, nil
 		}
 		if time.Now().After(deadline) {

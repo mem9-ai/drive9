@@ -602,9 +602,7 @@ func ctxForkUsesTiDBCloudCredentials(ctx *Context) bool {
 	}
 	mode := strings.TrimSpace(ctx.Mode)
 	return strings.EqualFold(mode, ModeLabelTiDBCloud) ||
-		strings.EqualFold(mode, RegionModeTiDBCloudNative) ||
-		strings.TrimSpace(ctx.CloudProvider) != "" ||
-		strings.TrimSpace(ctx.Region) != ""
+		strings.EqualFold(mode, RegionModeTiDBCloudNative)
 }
 
 type forkCtxResult struct {

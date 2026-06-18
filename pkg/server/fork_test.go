@@ -667,6 +667,27 @@ func TestCleanupFailedForkWithoutBranchIDMarksDeleted(t *testing.T) {
 	}
 }
 
+func TestCleanupNativeFailedForkWithoutBranchIDDoesNotRequireCredentials(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertTenantWithProvider(t, "fork-native-missing-branch", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "", tenant.ProviderTiDBCloudNative)
+
+	if err := rt.server.cleanupForkTenantOnce(context.Background(), "fork-native-missing-branch", nil); err != nil {
+		t.Fatalf("cleanupForkTenantOnce: %v", err)
+	}
+
+	got, err := rt.meta.GetTenant(context.Background(), "fork-native-missing-branch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantDeleted {
+		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleted)
+	}
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 0 {
+		t.Fatalf("deleted branches = %#v, want none", deleted)
+	}
+}
+
 func TestCleanupBranchBackedForkWithoutProvisionerDoesNotMarkDeleted(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.server.provisioner = nonBranchOnlyProvisioner{}

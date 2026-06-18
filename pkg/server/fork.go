@@ -872,9 +872,6 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 	if t.Kind != meta.TenantKindFork {
 		return nil
 	}
-	if t.Provider == tenant.ProviderTiDBCloudNative && credentialReq == nil && resolveDefaultCredentials(s.provisioner) == nil {
-		return tenant.ErrCredentialsRequired
-	}
 	if err := s.pool.InvalidateAndWait(ctx, tenantID); err != nil {
 		return fmt.Errorf("drain fork backend: %w", err)
 	}
@@ -887,6 +884,9 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 			}
 		}
 		return nil
+	}
+	if t.Provider == tenant.ProviderTiDBCloudNative && credentialReq == nil && resolveDefaultCredentials(s.provisioner) == nil {
+		return tenant.ErrCredentialsRequired
 	}
 	if t.Status != meta.TenantDeleting {
 		return s.cleanupFailedForkBranch(ctx, t, credentialReq)
