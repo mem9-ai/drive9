@@ -94,14 +94,19 @@ func run(ctx context.Context, c *client.Client, root string, out io.Writer) erro
 		return fmt.Errorf("grep %s: %w", root, err)
 	}
 
-	fmt.Fprintf(out, "root: %s\n", root)
-	fmt.Fprintf(out, "file: %s\n", remoteFile)
-	fmt.Fprintf(out, "upload_mode: %s\n", summary.Mode)
-	fmt.Fprintf(out, "revision: %d\n", meta.Revision)
-	fmt.Fprintf(out, "size: %d\n", meta.Size)
-	fmt.Fprintf(out, "entries: %d\n", len(entries))
-	fmt.Fprintf(out, "batch_status: %d\n", batch[0].Status)
-	fmt.Fprintf(out, "search_results: %d\n", len(results))
+	if _, err := io.WriteString(out, fmt.Sprintf(
+		"root: %s\nfile: %s\nupload_mode: %s\nrevision: %d\nsize: %d\nentries: %d\nbatch_status: %d\nsearch_results: %d\n",
+		root,
+		remoteFile,
+		summary.Mode,
+		meta.Revision,
+		meta.Size,
+		len(entries),
+		batch[0].Status,
+		len(results),
+	)); err != nil {
+		return fmt.Errorf("write summary: %w", err)
+	}
 	return nil
 }
 
