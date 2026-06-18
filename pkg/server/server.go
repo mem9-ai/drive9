@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -3406,10 +3407,17 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	if provider == tenant.ProviderTiDBCloudNative {
 		req, err := decodeCredentialProvisionRequest(w, r)
 		if err != nil {
-			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
-			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
-			errJSON(w, http.StatusBadRequest, err.Error())
-			return
+			if !errors.Is(err, tenant.ErrCredentialsRequired) {
+				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			req = resolveDefaultCredentials(s.provisioner)
+			if req == nil {
+				errJSON(w, http.StatusBadRequest, tenant.ErrCredentialsRequired.Error())
+				return
+			}
 		}
 		if validator, ok := s.provisioner.(credentialProvisionRequestValidator); ok {
 			if err := validator.ValidateCredentialProvisionRequest(*req); err != nil {
@@ -3463,17 +3471,27 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+func resolveDefaultCredentials(p tenant.Provisioner) *tenant.CredentialProvisionRequest {
+	type defaultCredentialProvider interface {
+		DefaultCredentials() (tenant.CredentialProvisionRequest, bool)
+	}
+	if dp, ok := p.(defaultCredentialProvider); ok {
+		if req, ok := dp.DefaultCredentials(); ok {
+			return &req
+		}
+	}
+	return nil
+}
+
 func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
 	var req struct {
-		PublicKey    string `json:"public_key"`
-		PrivateKey   string `json:"private_key"`
-		DatabaseName string `json:"database_name"`
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
 	}
 	return decodeCredentialRequest(w, r, &req, func() tenant.CredentialProvisionRequest {
 		return tenant.CredentialProvisionRequest{
-			PublicKey:    strings.TrimSpace(req.PublicKey),
-			PrivateKey:   strings.TrimSpace(req.PrivateKey),
-			DatabaseName: strings.TrimSpace(req.DatabaseName),
+			PublicKey:  strings.TrimSpace(req.PublicKey),
+			PrivateKey: strings.TrimSpace(req.PrivateKey),
 		}
 	})
 }
@@ -3491,8 +3509,11 @@ func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, bu
 		}
 	}
 	out := build()
+	if out.PublicKey == "" && out.PrivateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
 	if out.PublicKey == "" || out.PrivateKey == "" {
-		return nil, fmt.Errorf("public_key and private_key are required")
+		return nil, tenant.ErrPartialCredentials
 	}
 	return &out, nil
 }
@@ -3635,6 +3656,33 @@ func (s *Server) copyAutoEmbeddingProfileForFork(ctx context.Context, sourceTena
 	})
 }
 
+func (s *Server) applyAutoEmbeddingProviderConfig(ctx context.Context, tenantID, tenantDSN string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
+	if s.meta == nil || s.pool == nil {
+		return nil
+	}
+	metaProfile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("load auto-embedding profile: %w", err)
+	}
+	if len(metaProfile.APIKeyCipher) == 0 {
+		return nil
+	}
+	apiKey, err := s.pool.Decrypt(ctx, metaProfile.APIKeyCipher)
+	if err != nil {
+		return fmt.Errorf("decrypt auto-embedding api key: %w", err)
+	}
+	db, err := sql.Open("mysql", tenantDSN)
+	if err != nil {
+		return fmt.Errorf("open tenant database for embedding provider config: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	return tenantschema.ApplyTiDBAutoEmbeddingProviderConfig(ctx, db, tenantschema.TiDBAutoEmbeddingProviderConfig{
+		Model:   profile.Model,
+		APIKey:  string(apiKey),
+		APIBase: metaProfile.APIBase,
+	})
+}
+
 func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID string) (tenantschema.TiDBAutoEmbeddingProfile, error) {
 	if s.meta == nil {
 		return tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
@@ -3663,6 +3711,11 @@ func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(co
 		if err != nil {
 			return fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
 		}
+		if !s.disableDBAutoEmbed {
+			if err := s.applyAutoEmbeddingProviderConfig(ctx, tenantID, dsn, profile); err != nil {
+				return fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
+			}
+		}
 		return profileAware.InitSchemaForAutoEmbeddingProfile(ctx, dsn, profile)
 	}
 }
@@ -3676,7 +3729,11 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 	}
 	if provider == tenant.ProviderTiDBCloudNative && opts.CredentialProvisioner == nil {
-		return nil, newProvisionTenantError(http.StatusBadRequest, "public_key and private_key are required", fmt.Errorf("public_key and private_key are required"))
+		if defaultReq := resolveDefaultCredentials(s.provisioner); defaultReq == nil {
+			return nil, newProvisionTenantError(http.StatusBadRequest, "public_key and private_key are required", fmt.Errorf("public_key and private_key are required"))
+		} else {
+			opts.CredentialProvisioner = defaultReq
+		}
 	}
 	tenantID := token.NewID()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
@@ -3727,9 +3784,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 
 	var cluster *tenant.ClusterInfo
 	if provider == tenant.ProviderTiDBCloudNative {
-		if opts.CredentialProvisioner == nil {
-			err = fmt.Errorf("public_key and private_key are required")
-		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
+		if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
 			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
 		} else {
 			err = fmt.Errorf("provisioner does not support request credentials")
@@ -3750,11 +3805,22 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		} else if strings.Contains(strings.ToLower(err.Error()), "credits") || strings.Contains(strings.ToLower(err.Error()), "payment") {
 			msg = "TiDB Cloud payment required. Add a payment method at https://tidbcloud.com/org-settings/billing/payments"
 		} else if strings.Contains(strings.ToLower(err.Error()), "instance capacity limit") || strings.Contains(strings.ToLower(err.Error()), "capacity limit") {
+			msg = "TiDB Cloud cluster capacity limit reached"
+		} else if strings.Contains(strings.ToLower(err.Error()), "status 401") || strings.Contains(strings.ToLower(err.Error()), "invalid tidb cloud") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") {
+			msg = "invalid TiDB Cloud API key"
+		} else if strings.Contains(strings.ToLower(err.Error()), "cluster limit") {
 			msg = "TiDB Cloud cluster limit reached (100 clusters per organization). Contact PingCAP support for assistance."
 		}
 		return nil, newProvisionTenantError(http.StatusBadGateway, msg, err)
 	}
 	cluster.Provider = provider
+
+	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
+		ClusterID: cluster.ClusterID,
+		Provider:  provider,
+	}); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_persist_cluster_id_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+	}
 
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {

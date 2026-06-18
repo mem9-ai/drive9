@@ -123,6 +123,11 @@ func main() {
 	if err != nil {
 		die(fmt.Errorf("open control-plane store: %w", err))
 	}
+	if raw := os.Getenv("DRIVE9_DEFAULT_STORAGE_QUOTA_BYTES"); raw != "" {
+		if v, err := strconv.ParseInt(raw, 10, 64); err == nil && v > 0 {
+			meta.SetDefaultMaxStorageBytes(v)
+		}
+	}
 	defer func() { _ = store.Close() }()
 
 	if s3cfg.Bucket == "" {
@@ -207,7 +212,7 @@ func main() {
 		}
 		eKey := masterHex
 		eType := encrypt.Type(encryptType)
-		if strings.EqualFold(string(eType), string(encrypt.TypeKMS)) || strings.EqualFold(string(eType), string(encrypt.TypeAliyunKMS)) {
+		if strings.EqualFold(string(eType), string(encrypt.TypeKMS)) || strings.EqualFold(string(eType), string(encrypt.TypeAliyunKMS)) || strings.EqualFold(string(eType), string(encrypt.TypeTencentKMS)) {
 			eKey = kmsKey
 		}
 		enc, err := encrypt.New(context.Background(), encrypt.Config{
@@ -409,15 +414,16 @@ environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
   DRIVE9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DRIVE9_META_DSN    control-plane MySQL DSN (required)
-  DRIVE9_ENCRYPT_TYPE local_aes|kms|aliyun_kms
+  DRIVE9_ENCRYPT_TYPE local_aes|kms|aliyun_kms|tencent_kms
   DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
-  DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms), Aliyun KMS key id (required for aliyun_kms)
+  DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms/aliyun_kms/tencent_kms)
   DRIVE9_ALIYUN_KMS_ENDPOINT custom Aliyun KMS endpoint, e.g. a VPC endpoint (no https:// prefix)
-                             note: aliyun_kms reads the Aliyun region from DRIVE9_S3_REGION
+                             note: aliyun_kms/tencent_kms reads the region from DRIVE9_S3_REGION
                              note: TLS verification is skipped automatically when this is set
   DRIVE9_TOKEN_SIGNING_KEY  32-byte hex key for JWT API key signing
   DRIVE9_VAULT_MASTER_KEY   32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_MAX_UPLOAD_BYTES maximum allowed upload size in bytes (default: %d, minimum: 1048576)
+  DRIVE9_DEFAULT_STORAGE_QUOTA_BYTES fallback per-tenant total storage limit when no explicit quota is configured (default: %d)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
@@ -438,7 +444,9 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Serverless API base URL for tidb_cloud_native
   DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER cloud provider for tidb_cloud_native cluster creation, e.g. aws
   DRIVE9_TIDBCLOUD_NATIVE_REGION region for tidb_cloud_native cluster creation, e.g. us-east-1
-  DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name when /v1/provision omits database_name (default: tidbcloud_fs)
+  DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name (default: tidbcloud_fs)
+  DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY optional default TiDB Cloud API public key for tidb_cloud_native create/delete when caller omits it
+  DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY optional default TiDB Cloud API private key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
   DRIVE9_SLOCK_API_ORIGIN Slock API origin (required when DRIVE9_SLOCK_ORIGIN is set)
   DRIVE9_SLOCK_CLIENT_ID Slock connected-app client id (required when DRIVE9_SLOCK_ORIGIN is set)
@@ -512,7 +520,7 @@ environment:
 schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
   such as tidb_cloud_starter can stay in sync with drive9's schema source of truth.
-`, server.DefaultMaxUploadBytes)
+`, server.DefaultMaxUploadBytes, meta.DefaultMaxStorageBytes())
 	os.Exit(exitCode)
 }
 

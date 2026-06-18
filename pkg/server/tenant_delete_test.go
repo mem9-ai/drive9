@@ -221,9 +221,9 @@ func TestTenantDeleteRejectsScopedAPIKey(t *testing.T) {
 	}
 }
 
-func TestTenantDeleteNativeRejectsDatabaseNameCredentialField(t *testing.T) {
+func TestTenantDeleteNativeRejectsUnknownCredentialFields(t *testing.T) {
 	rt := newTenantDeleteRuntime(t, tenant.ProviderTiDBCloudNative, meta.APIKeyScopeKindOwner)
-	req := httptest.NewRequest(http.MethodDelete, "/v1/tenant", strings.NewReader(`{"public_key":"public-1","private_key":"private-1","database_name":"ignored"}`))
+	req := httptest.NewRequest(http.MethodDelete, "/v1/tenant", strings.NewReader(`{"public_key":"public-1","private_key":"private-1","unknown_field":"x"}`))
 	req.Header.Set("Authorization", "Bearer "+rt.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

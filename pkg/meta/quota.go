@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 )
 
@@ -284,7 +285,21 @@ func (s *Store) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reser
 }
 
 // defaultMaxStorageBytes is the fallback limit when no per-tenant config row exists.
-const defaultMaxStorageBytes = int64(50 * (1 << 30)) // 50 GiB
+var defaultMaxStorageBytes atomic.Int64
+
+func init() {
+	defaultMaxStorageBytes.Store(int64(50 * (1 << 30))) // 50 GiB
+}
+
+// SetDefaultMaxStorageBytes overrides the per-tenant fallback storage quota.
+func SetDefaultMaxStorageBytes(bytes int64) {
+	if bytes > 0 {
+		defaultMaxStorageBytes.Store(bytes)
+	}
+}
+
+// DefaultMaxStorageBytes returns the configured per-tenant fallback storage quota.
+func DefaultMaxStorageBytes() int64 { return defaultMaxStorageBytes.Load() }
 
 // AtomicReserveAndInsertUpload claims reserved_bytes and inserts the reservation
 // tracking row inside a single server DB transaction. This is the correct API
@@ -310,7 +325,7 @@ func (s *Store) AtomicReserveAndInsertUpload(ctx context.Context, r *UploadReser
 			 WHERE tenant_id = ?
 			   AND storage_bytes + reserved_bytes + ? <=
 			       COALESCE((SELECT max_storage_bytes FROM tenant_quota_config WHERE tenant_id = ?), ?)`,
-			r.ReservedBytes, r.TenantID, r.ReservedBytes, r.TenantID, defaultMaxStorageBytes)
+			r.ReservedBytes, r.TenantID, r.ReservedBytes, r.TenantID, DefaultMaxStorageBytes())
 		if execErr != nil {
 			return execErr
 		}

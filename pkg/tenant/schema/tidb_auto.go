@@ -780,16 +780,10 @@ func tidbAutoEmbeddingSchemaStatementsForConfig(cfg tidbAutoEmbeddingRenderConfi
 				description,
 				` + optionsLiteral + `
 			)) STORED,
-			description_embedding_revision     BIGINT
+			description_embedding_revision     BIGINT,
+			FULLTEXT INDEX idx_semantic_fts_content (content_text) WITH PARSER MULTILINGUAL,
+			FULLTEXT INDEX idx_semantic_fts_description (description) WITH PARSER MULTILINGUAL
 		)`,
-		`ALTER TABLE semantic
-			ADD FULLTEXT INDEX idx_semantic_fts_content(content_text)
-			WITH PARSER MULTILINGUAL
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
-		`ALTER TABLE semantic
-			ADD FULLTEXT INDEX idx_semantic_fts_description(description)
-			WITH PARSER MULTILINGUAL
-			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
 		`ALTER TABLE semantic
 			ADD VECTOR INDEX idx_semantic_cosine((VEC_COSINE_DISTANCE(embedding)))
 			ADD_COLUMNAR_REPLICA_ON_DEMAND`,
@@ -2084,7 +2078,9 @@ func isConstraintDefinition(def string) bool {
 	normalized := normalizeSQLFragment(def)
 	return strings.HasPrefix(normalized, "primary key") ||
 		strings.HasPrefix(normalized, "constraint ") ||
-		strings.HasPrefix(normalized, "unique key ")
+		strings.HasPrefix(normalized, "unique key ") ||
+		strings.HasPrefix(normalized, "fulltext ") ||
+		strings.HasPrefix(normalized, "vector index ")
 }
 
 func parseCreateIndexStatement(stmt string) (tableName, indexName, createSQL string, ok bool) {
@@ -2775,11 +2771,11 @@ func applyTiDBSchemaRepairs(ctx context.Context, db *sql.DB, statements []string
 				return err
 			}
 		}
-			if isFulltextOrVectorIndexRepairSQL(stmt) && !strings.Contains(normalizeSQLFragment(stmt), "add_columnar_replica_on_demand") {
+		if isFulltextOrVectorIndexRepairSQL(stmt) && !strings.Contains(normalizeSQLFragment(stmt), "add_columnar_replica_on_demand") {
 			stmt += " ADD_COLUMNAR_REPLICA_ON_DEMAND"
 			snippet = schemaStatementSnippet(stmt)
 		}
-	if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			if isIgnorableTiDBSchemaError(err) {
 				logger.Info(ctx, "tenant_tidb_schema_repair_statement_skipped_existing",
 					zap.Int("statement_index", i+1),
