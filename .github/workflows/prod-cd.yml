@@ -11,6 +11,7 @@ on:
           - aws-ap-southeast-1
           - aws-us-east-1
           - alicloud-ap-southeast-1
+          - tencentcloud-ap-beijing
       image_tag:
         description: "Image tag override (default: resolve from dev deployment)"
         required: false
@@ -65,7 +66,8 @@ jobs:
             exit 1
           fi
           echo "Promoting image: $IMAGE"
-          printf '%s=%s\n' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
+          printf '%s=%s
+' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
 
       - name: Deploy to aws-ap-southeast-1
         id: deploy-sg
@@ -169,3 +171,40 @@ jobs:
             kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
               rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
           fi
+
+      - name: Configure Tencent Cloud credentials
+        if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
+        uses: everpcpc/tencentcloud-oidc-auth@v1
+        with:
+          role-arn: ${{ secrets.TENCENTCLOUD_ROLE_ARN }}
+
+      - name: Push image to tencentcloud-ap-beijing TCR
+        if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
+        run: |
+          pip3 install tccli -q
+          TAG=$(echo "$IMAGE" | awk -F: '{print $NF}')
+          TCR_IMAGE="drive9.tencentcloudcr.com/drive9/dat9-server:$TAG"
+          TCR_TOKEN=$(tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm 2>&1 | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Token'])")
+          echo "$TCR_TOKEN" | docker login drive9.tencentcloudcr.com --username 100049824031 --password-stdin
+          docker pull "$IMAGE"
+          docker tag "$IMAGE" "$TCR_IMAGE"
+          docker push "$TCR_IMAGE"
+          echo "TCR_IMAGE=$TCR_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy to tencentcloud-ap-beijing
+        id: deploy-tencent
+        if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
+        run: |
+          mkdir -p ~/.kube
+          tccli tke DescribeClusterKubeconfig --ClusterId cls-6dpiw235 --IsExtranet true --region ap-beijing | python3 -c "import sys,json; print(json.load(sys.stdin)['Kubeconfig'])" > ~/.kube/config
+          kubectl -n drive9-tidbcloud \
+            set image deployment/drive9-server \
+            drive9-server=$TCR_IMAGE
+          kubectl -n drive9-tidbcloud \
+            rollout status deployment/drive9-server --timeout=180s
+
+      - name: Rollback tencentcloud-ap-beijing on failure
+        if: failure() && steps.deploy-tencent.outcome == 'failure'
+        run: |
+          kubectl -n drive9-tidbcloud \
+            rollout undo deployment/drive9-server
