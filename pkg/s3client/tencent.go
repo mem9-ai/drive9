@@ -117,6 +117,9 @@ func (p *camProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
 
 func credentialsForTencent(cfg AWSConfig) (aws.CredentialsProvider, error) {
 	if cfg.AccessKeyID != "" {
+		if cfg.SecretAccessKey == "" {
+			return nil, fmt.Errorf("s3: AccessKeyID is set but SecretAccessKey is empty")
+		}
 		return credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, cfg.SessionToken), nil
 	}
 	accessKeyID, secretAccessKey, sessionToken := tencentCredentials()
