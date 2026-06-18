@@ -11351,7 +11351,12 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 
 	unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
-	defer unlockRemoteCommit()
+	remoteCommitReleased := false
+	defer func() {
+		if !remoteCommitReleased {
+			unlockRemoteCommit()
+		}
+	}()
 
 	var err error
 	// Path 1a: Streaming mode — parts were submitted during Write() and are
@@ -11553,14 +11558,30 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		}
 	}
 
-	// Release fh.mu before network calls — same deadlock avoidance as
-	// Path 1a/1b. Without this unlock, concurrent FUSE Read() on the same
-	// handle blocks for the entire HTTP upload duration, causing kernel
-	// read timeouts (especially with FOPEN_DIRECT_IO where every pread is
-	// a FUSE round-trip, e.g. SQLite WAL workloads — see issue #579).
+	// Lock ordering fix (B3): Release fh.mu FIRST, then acquire the
+	// per-path remote commit lock for the upload. Write() acquires
+	// fh.mu → remoteCommitLock; if we held remoteCommitLock while
+	// waiting to reacquire fh.mu, a concurrent Write() would deadlock.
+	//
+	// By releasing fh.mu before acquiring remoteCommitLock:
+	// - Concurrent Read() can proceed (fh.mu not held) — fixes #579
+	// - Concurrent Write() can acquire fh.mu, then block on
+	//   remoteCommitLock until the upload finishes — no deadlock
+	// - Same-path uploads remain serialized via remoteCommitLock
+	//
+	// Release the top-level remoteCommitLock first (we'll acquire a
+	// fresh one after fh.Unlock for the upload window only).
+	unlockRemoteCommit()
+	remoteCommitReleased = true
+
 	uploadStart := time.Now()
 	fs.debugf("flushHandle path2 unlock before upload path=%s size=%d phase_hint=%s expected_rev=%d", handlePath, size, phase, expectedRevision)
 	fh.Unlock()
+
+	// Acquire the remote commit lock for upload serialization AFTER
+	// releasing fh.mu — correct lock order (never hold remoteCommitLock
+	// while waiting for fh.mu).
+	uploadPathLock := fs.lockWritableRemoteCommitPath(handlePath)
 
 	if useDirectPUT {
 		if size == 0 && handleIsNew {
@@ -11628,6 +11649,10 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.debugDurationf(writeStart, 0, "flushHandle write stream done path=%s size=%d err=%v", handlePath, size, err)
 	}
 
+	// Release the upload path lock BEFORE re-acquiring fh.mu to maintain
+	// correct lock ordering (fh.mu → remoteCommitLock, never the reverse).
+	uploadPathLock()
+
 	// Re-acquire fh.mu after network call completes.
 	fh.Lock()
 	fs.debugDurationf(uploadStart, 0, "flushHandle path2 relock after upload path=%s size=%d err=%v", handlePath, size, err)
@@ -11652,22 +11677,45 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		fs.clearDirtySize(handleIno, handleDirtySeq)
 		fh.DirtySeq = 0
 	}
+	// B4 guard: if fh.Path was changed by retargetOpenHandlesForRename
+	// while the lock was released, the upload went to the old path
+	// (handlePath/remotePath) but fh.Path now points to the new path.
+	// Do NOT record the committed revision on the renamed path — that
+	// would attribute an old-path upload to the new path. Instead, use
+	// handlePath for cache operations and skip markHandleRemoteCommittedLocked
+	// which would pollute the renamed path's revision/shadow/pending state.
+	pathRetargeted := fh.Path != handlePath
+
 	if committedRev > 0 {
 		clearReadTargetForLockedHandle(fh)
-		fs.clearReadTargetsForPathExcept(handlePath, fh)
-		// Use dataCopy (immutable snapshot) for read cache seeding —
-		// the WriteBuffer may have been mutated by concurrent writes
-		// while the lock was released.
-		fs.readCache.Put(handlePath, dataCopy, committedRev)
-		fs.markHandleRemoteCommittedLocked(fh, committedRev)
+		if pathRetargeted {
+			// Upload went to handlePath; fh.Path is now different.
+			// Seed read cache and clear targets for the OLD path only.
+			// The handle's committed state should NOT be updated because
+			// the rename already changed the remote identity.
+			fs.clearReadTargetsForPathExcept(handlePath, nil)
+			fs.readCache.Put(handlePath, dataCopy, committedRev)
+			fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		} else {
+			fs.clearReadTargetsForPathExcept(handlePath, fh)
+			// Use dataCopy (immutable snapshot) for read cache seeding —
+			// the WriteBuffer may have been mutated by concurrent writes
+			// while the lock was released.
+			fs.readCache.Put(handlePath, dataCopy, committedRev)
+			fs.markHandleRemoteCommittedLocked(fh, committedRev)
+		}
 	} else if sidecarCached {
 		clearReadTargetForLockedHandle(fh)
 		fs.clearReadTargetsForPathExcept(handlePath, fh)
-		fs.finalizeHandleFlushLocked(fh, expectedRevision)
+		if !pathRetargeted {
+			fs.finalizeHandleFlushLocked(fh, expectedRevision)
+		}
 	} else {
 		clearReadTargetForLockedHandle(fh)
 		fs.invalidateReadCacheAndTargetsExcept(handlePath, fh)
-		fs.finalizeHandleFlushLocked(fh, expectedRevision)
+		if !pathRetargeted {
+			fs.finalizeHandleFlushLocked(fh, expectedRevision)
+		}
 	}
 	// When concurrent writes happened (DirtySeq changed), the buffer may
 	// have a different size than the uploaded snapshot. Use the current
