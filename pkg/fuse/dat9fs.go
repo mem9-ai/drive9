@@ -1906,11 +1906,13 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 }
 
 // markHandleRevisionOnlyLocked updates the handle's committed revision,
-// IsNew flag, and propagates the revision to other open handles, but does
-// NOT read from fh.Dirty for OrigSize/inode size. This is used when a
-// concurrent write mutated the dirty buffer during the Path 2 unlock
-// window, so the live dirty state reflects uncommitted post-upload data.
-func (fs *Dat9FS) markHandleRevisionOnlyLocked(fh *FileHandle, revision int64) {
+// IsNew flag, OrigSize, and propagates the revision to other open handles,
+// but does NOT read from fh.Dirty for size information. snapshotSize is
+// the size of the data that was actually uploaded (captured before the
+// unlock window). This is used when a concurrent write mutated the dirty
+// buffer during the Path 2 unlock window, so the live dirty state reflects
+// uncommitted post-upload data.
+func (fs *Dat9FS) markHandleRevisionOnlyLocked(fh *FileHandle, revision int64, snapshotSize int64) {
 	if fs == nil || fh == nil || revision <= 0 {
 		return
 	}
@@ -1921,6 +1923,7 @@ func (fs *Dat9FS) markHandleRevisionOnlyLocked(fh *FileHandle, revision int64) {
 	}
 	fh.IsNew = false
 	fh.BaseRev = revision
+	fh.OrigSize = snapshotSize
 	fs.inodes.UpdateRevision(fh.Ino, revision)
 	fs.refreshCommittedRevisionForOpenHandles(fh.Path, revision, fh)
 	if fs.writeBack != nil {
@@ -11764,7 +11767,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 				// for OrigSize, which would associate the uploaded snapshot's
 				// revision with the post-write buffer size. Only update the
 				// committed revision and flags without consuming live dirty state.
-				fs.markHandleRevisionOnlyLocked(fh, committedRev)
+				fs.markHandleRevisionOnlyLocked(fh, committedRev, size)
 			}
 		}
 	} else if sidecarCached {

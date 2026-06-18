@@ -14290,9 +14290,9 @@ func TestFlushHandle_Path2_SidecarCacheUsesSnapshotOnRetarget(t *testing.T) {
 
 // TestFlushHandle_Path2_ConcurrentWriteDoesNotCorruptOrigSize verifies that
 // when a concurrent Write() grows the file during the Path 2 unlock window,
-// markHandleRemoteCommittedLocked does NOT derive OrigSize from the live
-// dirty buffer. The uploaded snapshot was small, so OrigSize must reflect
-// the snapshot size, not the post-write buffer size. (B7 regression test)
+// OrigSize is set to the uploaded snapshot size, not the live dirty buffer
+// size. This ensures the next flush selects the correct upload path (direct
+// PUT vs patch) based on the actual committed base size. (B7 regression test)
 func TestFlushHandle_Path2_ConcurrentWriteDoesNotCorruptOrigSize(t *testing.T) {
 	uploadStarted := make(chan struct{})
 	uploadResume := make(chan struct{})
@@ -14395,10 +14395,124 @@ func TestFlushHandle_Path2_ConcurrentWriteDoesNotCorruptOrigSize(t *testing.T) {
 	if dirtySeq == 0 {
 		t.Fatal("DirtySeq = 0 after concurrent Write — dirty data lost")
 	}
-	// OrigSize must not equal the large dirty buffer size.
-	if origSize == dirtySize && dirtySize > int64(len(smallData)) {
-		t.Fatalf("OrigSize = %d equals dirty buffer size %d — markHandleRemoteCommittedLocked read live dirty state (B7 bug)",
-			origSize, dirtySize)
+	// OrigSize must equal the uploaded snapshot size (5 bytes), not the
+	// large dirty buffer size from the concurrent write.
+	snapshotSize := int64(len(smallData))
+	if origSize != snapshotSize {
+		t.Fatalf("OrigSize = %d, want %d (uploaded snapshot size); dirty buffer size = %d — B7: revision-only path must set OrigSize from snapshot",
+			origSize, snapshotSize, dirtySize)
+	}
+
+	_ = fhID
+}
+
+// TestFlushHandle_Path2_LargeBaseSmallSnapshotOrigSize verifies the
+// old-large-base → small snapshot → concurrent write scenario. OrigSize
+// must be set to the uploaded snapshot size (small), not the stale large
+// base size. Otherwise the next flush would incorrectly select patch path
+// against a small remote object. (B7 regression test, adversary scenario)
+func TestFlushHandle_Path2_LargeBaseSmallSnapshotOrigSize(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 20})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/large-base-test.txt", false, 100*1024, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	// Start with a large OrigSize (simulating a previously-large file that
+	// was truncated and rewritten to a small size before this flush).
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     "/large-base-test.txt",
+		Dirty:    NewWriteBuffer("/large-base-test.txt", maxPreloadSize, 0),
+		BaseRev:  5,
+		OrigSize: 100 * 1024, // old large base
+	}
+	// Write small data (simulating truncate + small rewrite).
+	smallData := []byte("tiny")
+	if _, err := fh.Dirty.Write(0, smallData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fhID := fs.fileHandles.Allocate(fh)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Concurrent Write during upload — grow file to 64KB.
+	largeData := make([]byte, 64*1024)
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+			Size:     uint32(len(largeData)),
+		}, largeData)
+		writeDone <- st
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(uploadResume)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write timed out")
+	}
+
+	fh.Lock()
+	origSize := fh.OrigSize
+	dirtySize := fh.Dirty.Size()
+	fh.Unlock()
+
+	// OrigSize must equal the uploaded snapshot size (4 bytes = "tiny"),
+	// NOT the old large base (100KB) and NOT the post-write dirty size (64KB).
+	snapshotSize := int64(len(smallData))
+	if origSize != snapshotSize {
+		t.Fatalf("OrigSize = %d, want %d (uploaded snapshot size); old base = %d, dirty = %d — B7: stale large OrigSize not corrected",
+			origSize, snapshotSize, 100*1024, dirtySize)
 	}
 
 	_ = fhID
