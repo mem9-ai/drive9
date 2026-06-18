@@ -67,6 +67,8 @@ jobs:
           fi
           echo "Promoting image: $IMAGE"
           printf '%s=%s\n' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
+          aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin "${IMAGE%%/*}"
+          docker pull "$IMAGE"
       - name: Deploy to aws-ap-southeast-1
         id: deploy-sg
         if: inputs.region == 'all' || inputs.region == 'aws-ap-southeast-1'
@@ -188,8 +190,6 @@ jobs:
           fi
           TAG=$(echo "$IMAGE" | awk -F: '{print $NF}')
           TCR_IMAGE="drive9.tencentcloudcr.com/drive9/dat9-server:$TAG"
-          aws ecr get-login-password --region "${AWS_REGION:-ap-southeast-1}" | docker login --username AWS --password-stdin "${IMAGE%%/*}"
-          docker pull "$IMAGE"
           docker tag "$IMAGE" "$TCR_IMAGE"
           TCR_LOG=/tmp/tcr-token.log
           tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm >"$TCR_LOG" 2>&1
