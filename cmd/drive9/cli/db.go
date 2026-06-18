@@ -343,6 +343,7 @@ func DeleteTenant(args []string) error {
 	privateKeyFlag := ""
 	privateKeyGiven := false
 	asJSON := false
+	skipConfirm := false
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -379,6 +380,8 @@ func DeleteTenant(args []string) error {
 			privateKeyGiven = true
 		case "--json":
 			asJSON = true
+		case "-y", "--yes":
+			skipConfirm = true
 		default:
 			return fmt.Errorf("unknown flag %q\n%s", args[i], deleteUsage())
 		}
@@ -424,6 +427,20 @@ func DeleteTenant(args []string) error {
 	body, err := deprovisionRequestBody(publicKey, privateKey)
 	if err != nil {
 		return err
+	}
+
+	if !skipConfirm {
+		fmt.Fprint(os.Stderr, "This will delete your tenant and all data permanently.\n")
+		fmt.Fprint(os.Stderr, "Continue? [y/N]: ")
+		var answer string
+		if _, err := fmt.Fscanln(os.Stdin, &answer); err != nil {
+			return fmt.Errorf("delete cancelled")
+		}
+		switch strings.ToLower(strings.TrimSpace(answer)) {
+		case "y", "yes":
+		default:
+			return fmt.Errorf("delete cancelled")
+		}
 	}
 
 	c := client.New(server, apiKey)
@@ -503,6 +520,7 @@ flags:
   --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud mode)
   --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud mode)
   --json                          output result as JSON
+  -y, --yes                       skip confirmation prompt
 
 examples:
   # delete the active context's tenant
