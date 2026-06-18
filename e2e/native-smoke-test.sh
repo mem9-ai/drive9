@@ -119,7 +119,7 @@ cleanup() {
         --api-key "${API_KEY:-}" \
         --tidbcloud-public-key "$PUBLIC_KEY" \
         --tidbcloud-private-key "$PRIVATE_KEY" \
-        -y \        
+        -y \
         >/tmp/native-cleanup.log 2>&1; then
         echo "[cleanup] tenant $TENANT_ID deleted" >&2
         break

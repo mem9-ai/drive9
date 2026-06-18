@@ -448,7 +448,7 @@ func TestDeleteTenantUsesOwnerContext(t *testing.T) {
 	resetCredentialCacheForTest()
 
 	out, err := captureStdoutE(t, func() error {
-		return DeleteTenant(nil)
+		return DeleteTenant([]string{"-y"})
 	})
 	if err != nil {
 		t.Fatalf("DeleteTenant: %v", err)
@@ -493,6 +493,7 @@ func TestDeleteTenantServerOverrideSendsNativeBody(t *testing.T) {
 
 	out, err := captureStdoutE(t, func() error {
 		return DeleteTenant([]string{
+			"-y",
 			"--server", ts.URL,
 			"--api-key", "owner-override",
 			"--tidbcloud-public-key", "public-1",
@@ -531,7 +532,7 @@ func TestDeleteTenantFallsBackToRawErrorBody(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	err := DeleteTenant([]string{"--server", ts.URL, "--api-key", "owner-key"})
+	err := DeleteTenant([]string{"-y", "--server", ts.URL, "--api-key", "owner-key"})
 	if err == nil {
 		t.Fatal("DeleteTenant error = nil, want HTTP error")
 	}

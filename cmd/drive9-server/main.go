@@ -438,7 +438,7 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Serverless API base URL for tidb_cloud_native
   DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER cloud provider for tidb_cloud_native cluster creation, e.g. aws
   DRIVE9_TIDBCLOUD_NATIVE_REGION region for tidb_cloud_native cluster creation, e.g. us-east-1
-  DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name when /v1/provision omits database_name (default: tidbcloud_fs)
+  DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name (default: tidbcloud_fs)
   DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY optional default TiDB Cloud API public key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY optional default TiDB Cloud API private key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
