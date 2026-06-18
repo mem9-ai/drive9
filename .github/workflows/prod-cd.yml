@@ -183,9 +183,19 @@ jobs:
         if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
         run: |
           pip3 install tccli -q
+          if ! command -v tccli >/dev/null 2>&1; then
+            echo "tccli install failed" >&2; exit 1
+          fi
           TAG=$(echo "$IMAGE" | awk -F: '{print $NF}')
           TCR_IMAGE="drive9.tencentcloudcr.com/drive9/dat9-server:$TAG"
-          TCR_TOKEN=$(tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Token'])")
+          TCR_TOKEN=$(tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType temporary 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Token'])")
+          if [ -z "$TCR_TOKEN" ]; then
+            echo "failed to create TCR token; retrying with longterm" >&2
+            TCR_TOKEN=$(tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm --Description "cd-${GITHUB_RUN_ID}" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Token'])")
+          fi
+          if [ -z "$TCR_TOKEN" ]; then
+            echo "create TCR token failed" >&2; exit 1
+          fi
           echo "$TCR_TOKEN" | docker login drive9.tencentcloudcr.com --username 100049824031 --password-stdin
           docker pull "$IMAGE"
           docker tag "$IMAGE" "$TCR_IMAGE"
