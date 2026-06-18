@@ -11528,6 +11528,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	handleDirtySeq := fh.DirtySeq
 	handleOrigSize := fh.OrigSize
 	handleDirtyPartSize := fh.Dirty.PartSize()
+	handleFullRangeLoaded := writeBufferHasLoadedFullRange(fh.Dirty)
 	var committedRev int64
 
 	// Use the negotiated server threshold (not the heuristic-only inline
@@ -11674,7 +11675,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 
 	sidecarRevision := sqliteCommittedRevision(committedRev, expectedRevision)
-	sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
+	// Use snapshot path (handlePath), immutable data (dataCopy), and
+	// snapshot full-range flag for the SQLite sidecar cache. After the
+	// unlock window, live fh.Path may be retargeted and fh.Dirty may
+	// contain concurrent Write() data — using them would cache
+	// uncommitted bytes or cache under the wrong path.
+	var sidecarCached bool
+	if fs.readCache != nil && sidecarRevision > 0 && isSQLitePersistentJournalPath(handlePath) &&
+		size <= fs.readCache.MaxFileSize() && handleFullRangeLoaded {
+		fs.readCache.Put(handlePath, dataCopy, sidecarRevision)
+		sidecarCached = true
+	}
 
 	// B4 guard: check retarget BEFORE dirty cleanup. If fh.Path was
 	// changed by retargetOpenHandlesForRename while the lock was released,
