@@ -23,7 +23,7 @@
       "drive9.workflow.local_overlay_build"
     ],
     "customer": [
-      "drive9.customer.tencent_perf"
+      "drive9.customer.kimi_perf"
     ]
   },
   "modules": {
@@ -94,7 +94,7 @@
       "durability": "interactive",
       "allow_other": false
     },
-    "drive9.customer.tencent_perf": {
+    "drive9.customer.kimi_perf": {
       "selected_scales": [
         "S"
       ],

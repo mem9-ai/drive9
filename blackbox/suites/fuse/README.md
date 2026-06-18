@@ -172,9 +172,9 @@ BLACKBOX_LOCAL_OVERLAY_PREWARM=0
 BLACKBOX_LOCAL_OVERLAY_VERIFY_REMOTE=0
 ```
 
-## Tencent Customer Performance Module
+## Kimi Performance Module
 
-`drive9.customer.tencent_perf` codifies the Tencent customer sandbox workload:
+`drive9.customer.kimi_perf` codifies the Kimi sandbox workload:
 
 - namespace scale at 100MB/1k files, 1GB/10k files, and 10GB/100k files;
 - single-directory and sharded-tree layouts;
@@ -191,60 +191,60 @@ This module is never executed accidentally. It is registered in the `customer`
 group, but `ensure_dependencies` skips it unless explicitly enabled:
 
 ```bash
-BLACKBOX_TENCENT_PERF_ENABLE=1 \
+BLACKBOX_KIMI_PERF_ENABLE=1 \
 BLACKBOX_SERVER_MODE=existing \
 DRIVE9_BASE=http://drive9.pingkai.cn \
-make blackbox BLACKBOX_SELECTOR=module:drive9.customer.tencent_perf
+make blackbox BLACKBOX_SELECTOR=module:drive9.customer.kimi_perf
 ```
 
 The default configuration runs only the S scale. Full customer scale requires
 explicit selection:
 
 ```bash
-BLACKBOX_TENCENT_PERF_ENABLE=1 \
-BLACKBOX_TENCENT_PERF_SCALES=S,M,L \
-BLACKBOX_TENCENT_PERF_SMALL_OPS=10000 \
-BLACKBOX_TENCENT_PERF_FLUSH_OPS=10000 \
-BLACKBOX_TENCENT_PERF_SOAK=1 \
-BLACKBOX_TENCENT_PERF_SOAK_MINUTES=30 \
+BLACKBOX_KIMI_PERF_ENABLE=1 \
+BLACKBOX_KIMI_PERF_SCALES=S,M,L \
+BLACKBOX_KIMI_PERF_SMALL_OPS=10000 \
+BLACKBOX_KIMI_PERF_FLUSH_OPS=10000 \
+BLACKBOX_KIMI_PERF_SOAK=1 \
+BLACKBOX_KIMI_PERF_SOAK_MINUTES=30 \
 BLACKBOX_SERVER_MODE=existing \
 DRIVE9_BASE=http://drive9.pingkai.cn \
-make blackbox BLACKBOX_SELECTOR=module:drive9.customer.tencent_perf
+make blackbox BLACKBOX_SELECTOR=module:drive9.customer.kimi_perf
 ```
 
 Useful tunables:
 
 ```bash
-BLACKBOX_TENCENT_PERF_LAYOUTS=single,tree
-BLACKBOX_TENCENT_PERF_PROFILE=coding-agent
-BLACKBOX_TENCENT_PERF_DURABILITY=auto
-BLACKBOX_TENCENT_PERF_STAT_SAMPLES=1000
-BLACKBOX_TENCENT_PERF_SMALL_SIZES=1024,4096,20480,102400,1048576
-BLACKBOX_TENCENT_PERF_SMALL_CONCURRENCY=1,4,16,64
-BLACKBOX_TENCENT_PERF_FLUSH_SIZES=1024,4096,20480,102400,1048576
-BLACKBOX_TENCENT_PERF_FLUSH_CONCURRENCY=1,4,16,64
-BLACKBOX_TENCENT_PERF_VISIBILITY_SAMPLES=100
-BLACKBOX_TENCENT_PERF_MOUNT_COUNTS=1,2,5,10
-BLACKBOX_TENCENT_PERF_REMOTE_ROOT=/some/reusable/remote/root
-BLACKBOX_TENCENT_PERF_REUSE_DATASETS=1
-BLACKBOX_TENCENT_PERF_RAW=1
+BLACKBOX_KIMI_PERF_LAYOUTS=single,tree
+BLACKBOX_KIMI_PERF_PROFILE=coding-agent
+BLACKBOX_KIMI_PERF_DURABILITY=auto
+BLACKBOX_KIMI_PERF_STAT_SAMPLES=1000
+BLACKBOX_KIMI_PERF_SMALL_SIZES=1024,4096,20480,102400,1048576
+BLACKBOX_KIMI_PERF_SMALL_CONCURRENCY=1,4,16,64
+BLACKBOX_KIMI_PERF_FLUSH_SIZES=1024,4096,20480,102400,1048576
+BLACKBOX_KIMI_PERF_FLUSH_CONCURRENCY=1,4,16,64
+BLACKBOX_KIMI_PERF_VISIBILITY_SAMPLES=100
+BLACKBOX_KIMI_PERF_MOUNT_COUNTS=1,2,5,10
+BLACKBOX_KIMI_PERF_REMOTE_ROOT=/some/reusable/remote/root
+BLACKBOX_KIMI_PERF_REUSE_DATASETS=1
+BLACKBOX_KIMI_PERF_RAW=1
 ```
 
 Per-section switches are also available:
 
 ```bash
-BLACKBOX_TENCENT_PERF_NAMESPACE=1
-BLACKBOX_TENCENT_PERF_SMALL_FILE=1
-BLACKBOX_TENCENT_PERF_FLUSH=1
-BLACKBOX_TENCENT_PERF_PERSISTENCE=1
-BLACKBOX_TENCENT_PERF_MULTI_MOUNT=1
-BLACKBOX_TENCENT_PERF_SOAK=0
+BLACKBOX_KIMI_PERF_NAMESPACE=1
+BLACKBOX_KIMI_PERF_SMALL_FILE=1
+BLACKBOX_KIMI_PERF_FLUSH=1
+BLACKBOX_KIMI_PERF_PERSISTENCE=1
+BLACKBOX_KIMI_PERF_MULTI_MOUNT=1
+BLACKBOX_KIMI_PERF_SOAK=0
 ```
 
 Outputs are written under the normal run directory:
 
 ```text
-blackbox/results/fuse/<session>/artifacts/drive9.customer.tencent_perf/
+blackbox/results/fuse/<session>/artifacts/drive9.customer.kimi_perf/
   environment.json
   manifest.json
   raw_results/*.jsonl
@@ -263,8 +263,9 @@ Important scope notes:
   They are not a true multi-VM or multi-sandbox upper bound.
 - Cold namespace mount measurements use unique cache directories per mount.
 - Cross-mount visibility uses separate writer and reader cache directories.
-- True same-zone cloud measurement should run on a Tencent CVM in the same zone
-  as the Drive9 Tencent deployment, using `BLACKBOX_SERVER_MODE=existing`.
+- True same-zone cloud measurement should run on a VM or compute instance in
+  the same zone as the target Drive9 deployment, using
+  `BLACKBOX_SERVER_MODE=existing`.
 
 ## External Dependencies
 

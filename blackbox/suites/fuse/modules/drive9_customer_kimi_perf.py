@@ -22,16 +22,16 @@ from harness.core import BlackboxError, Context, ModuleSkip, env_flag, env_value
 from .base import BaseModule, module_config
 
 
-class Drive9TencentCustomerPerf(BaseModule):
-    id = "drive9.customer.tencent_perf"
+class Drive9KimiPerf(BaseModule):
+    id = "drive9.customer.kimi_perf"
     category = "drive9.customer.performance"
-    description = "Tencent customer sandbox workspace benchmark: namespace scale, small files, fsync, visibility, and same-host mounts."
-    labels = ("drive9", "customer", "tencent", "performance", "fuse")
+    description = "Kimi sandbox workspace benchmark: namespace scale, small files, fsync, visibility, and same-host mounts."
+    labels = ("drive9", "customer", "kimi", "performance", "fuse")
     timeout = 86400
 
     def ensure_dependencies(self, ctx: Context) -> None:
-        if not env_flag("TENCENT_PERF_ENABLE", False, ctx.suite):
-            raise ModuleSkip("set BLACKBOX_TENCENT_PERF_ENABLE=1 to run Tencent customer performance tests", "explicit opt-in")
+        if not env_flag("KIMI_PERF_ENABLE", False, ctx.suite):
+            raise ModuleSkip("set BLACKBOX_KIMI_PERF_ENABLE=1 to run Kimi performance tests", "explicit opt-in")
         for tool in ("bash", "find"):
             ctx.deps.require_tool(tool)
 
@@ -43,7 +43,7 @@ class Drive9TencentCustomerPerf(BaseModule):
         for path in (raw_dir, summary_dir):
             path.mkdir(parents=True, exist_ok=True)
 
-        remote_base = env_value("TENCENT_PERF_REMOTE_ROOT", ctx.target.remote_root(self.id), ctx.suite).rstrip("/")
+        remote_base = env_value("KIMI_PERF_REMOTE_ROOT", ctx.target.remote_root(self.id), ctx.suite).rstrip("/")
         ctx.target.mkdir_remote(remote_base)
         self.capture_environment(ctx, artifact)
         write_json(artifact / "manifest.json", {"remote_base": remote_base, "config": cfg, "session": ctx.session})
@@ -66,7 +66,7 @@ class Drive9TencentCustomerPerf(BaseModule):
 
         self.write_summary_outputs(ctx, artifact, summary_dir, rows, failures)
         if failures:
-            raise BlackboxError(f"Tencent customer perf failures={len(failures)}; see {artifact / 'report.md'}")
+            raise BlackboxError(f"Kimi perf failures={len(failures)}; see {artifact / 'report.md'}")
         return {"remote_base": remote_base, "summary_rows": len(rows), "artifact": str(artifact)}
 
     def config(self, ctx: Context) -> dict[str, Any]:
@@ -79,39 +79,39 @@ class Drive9TencentCustomerPerf(BaseModule):
                 "L": {"bytes": 10 * 1024 * 1024 * 1024, "files": 100000, "mount_repeats": 3},
             },
         )
-        selected_scales = self.csv_env(ctx, "TENCENT_PERF_SCALES", cfg.get("selected_scales", ["S"]))
-        layouts = self.csv_env(ctx, "TENCENT_PERF_LAYOUTS", cfg.get("layouts", ["single", "tree"]))
-        small_sizes = self.int_csv_env(ctx, "TENCENT_PERF_SMALL_SIZES", cfg.get("small_file_sizes", [1024, 4096, 20 * 1024, 100 * 1024, 1024 * 1024]))
-        small_concurrency = self.int_csv_env(ctx, "TENCENT_PERF_SMALL_CONCURRENCY", cfg.get("small_file_concurrency", [1, 4, 16, 64]))
-        flush_sizes = self.int_csv_env(ctx, "TENCENT_PERF_FLUSH_SIZES", cfg.get("flush_file_sizes", [1024, 4096, 20 * 1024, 100 * 1024, 1024 * 1024]))
-        flush_concurrency = self.int_csv_env(ctx, "TENCENT_PERF_FLUSH_CONCURRENCY", cfg.get("flush_concurrency", [1, 4, 16, 64]))
+        selected_scales = self.csv_env(ctx, "KIMI_PERF_SCALES", cfg.get("selected_scales", ["S"]))
+        layouts = self.csv_env(ctx, "KIMI_PERF_LAYOUTS", cfg.get("layouts", ["single", "tree"]))
+        small_sizes = self.int_csv_env(ctx, "KIMI_PERF_SMALL_SIZES", cfg.get("small_file_sizes", [1024, 4096, 20 * 1024, 100 * 1024, 1024 * 1024]))
+        small_concurrency = self.int_csv_env(ctx, "KIMI_PERF_SMALL_CONCURRENCY", cfg.get("small_file_concurrency", [1, 4, 16, 64]))
+        flush_sizes = self.int_csv_env(ctx, "KIMI_PERF_FLUSH_SIZES", cfg.get("flush_file_sizes", [1024, 4096, 20 * 1024, 100 * 1024, 1024 * 1024]))
+        flush_concurrency = self.int_csv_env(ctx, "KIMI_PERF_FLUSH_CONCURRENCY", cfg.get("flush_concurrency", [1, 4, 16, 64]))
         sections_default = cfg.get("sections", {})
         return {
             "scales": scales,
             "selected_scales": selected_scales,
             "layouts": layouts,
-            "profile": env_value("TENCENT_PERF_PROFILE", str(cfg.get("profile", "coding-agent")), ctx.suite),
-            "durability": env_value("TENCENT_PERF_DURABILITY", str(cfg.get("durability", "auto")), ctx.suite),
-            "namespace_stat_samples": int(env_value("TENCENT_PERF_STAT_SAMPLES", str(cfg.get("namespace_stat_samples", 1000)), ctx.suite)),
+            "profile": env_value("KIMI_PERF_PROFILE", str(cfg.get("profile", "coding-agent")), ctx.suite),
+            "durability": env_value("KIMI_PERF_DURABILITY", str(cfg.get("durability", "auto")), ctx.suite),
+            "namespace_stat_samples": int(env_value("KIMI_PERF_STAT_SAMPLES", str(cfg.get("namespace_stat_samples", 1000)), ctx.suite)),
             "small_file_sizes": small_sizes,
             "small_file_concurrency": small_concurrency,
-            "small_file_ops": int(env_value("TENCENT_PERF_SMALL_OPS", str(cfg.get("small_file_ops", 1000)), ctx.suite)),
+            "small_file_ops": int(env_value("KIMI_PERF_SMALL_OPS", str(cfg.get("small_file_ops", 1000)), ctx.suite)),
             "flush_file_sizes": flush_sizes,
             "flush_concurrency": flush_concurrency,
-            "flush_ops": int(env_value("TENCENT_PERF_FLUSH_OPS", str(cfg.get("flush_ops", 1000)), ctx.suite)),
-            "visibility_samples": int(env_value("TENCENT_PERF_VISIBILITY_SAMPLES", str(cfg.get("visibility_samples", 100)), ctx.suite)),
-            "visibility_timeout_s": float(env_value("TENCENT_PERF_VISIBILITY_TIMEOUT_S", str(cfg.get("visibility_timeout_s", 30)), ctx.suite)),
-            "same_host_mount_counts": self.int_csv_env(ctx, "TENCENT_PERF_MOUNT_COUNTS", cfg.get("same_host_mount_counts", [1, 2, 5])),
-            "soak_minutes": float(env_value("TENCENT_PERF_SOAK_MINUTES", str(cfg.get("soak_minutes", 0)), ctx.suite)),
-            "raw_results": env_flag("TENCENT_PERF_RAW", bool(cfg.get("raw_results", True)), ctx.suite),
-            "reuse_datasets": env_flag("TENCENT_PERF_REUSE_DATASETS", bool(cfg.get("reuse_datasets", True)), ctx.suite),
+            "flush_ops": int(env_value("KIMI_PERF_FLUSH_OPS", str(cfg.get("flush_ops", 1000)), ctx.suite)),
+            "visibility_samples": int(env_value("KIMI_PERF_VISIBILITY_SAMPLES", str(cfg.get("visibility_samples", 100)), ctx.suite)),
+            "visibility_timeout_s": float(env_value("KIMI_PERF_VISIBILITY_TIMEOUT_S", str(cfg.get("visibility_timeout_s", 30)), ctx.suite)),
+            "same_host_mount_counts": self.int_csv_env(ctx, "KIMI_PERF_MOUNT_COUNTS", cfg.get("same_host_mount_counts", [1, 2, 5])),
+            "soak_minutes": float(env_value("KIMI_PERF_SOAK_MINUTES", str(cfg.get("soak_minutes", 0)), ctx.suite)),
+            "raw_results": env_flag("KIMI_PERF_RAW", bool(cfg.get("raw_results", True)), ctx.suite),
+            "reuse_datasets": env_flag("KIMI_PERF_REUSE_DATASETS", bool(cfg.get("reuse_datasets", True)), ctx.suite),
             "sections": {
-                "namespace": env_flag("TENCENT_PERF_NAMESPACE", bool(sections_default.get("namespace", True)), ctx.suite),
-                "small_file": env_flag("TENCENT_PERF_SMALL_FILE", bool(sections_default.get("small_file", True)), ctx.suite),
-                "flush": env_flag("TENCENT_PERF_FLUSH", bool(sections_default.get("flush", True)), ctx.suite),
-                "persistence": env_flag("TENCENT_PERF_PERSISTENCE", bool(sections_default.get("persistence", True)), ctx.suite),
-                "multi_mount": env_flag("TENCENT_PERF_MULTI_MOUNT", bool(sections_default.get("multi_mount", True)), ctx.suite),
-                "soak": env_flag("TENCENT_PERF_SOAK", bool(sections_default.get("soak", False)), ctx.suite),
+                "namespace": env_flag("KIMI_PERF_NAMESPACE", bool(sections_default.get("namespace", True)), ctx.suite),
+                "small_file": env_flag("KIMI_PERF_SMALL_FILE", bool(sections_default.get("small_file", True)), ctx.suite),
+                "flush": env_flag("KIMI_PERF_FLUSH", bool(sections_default.get("flush", True)), ctx.suite),
+                "persistence": env_flag("KIMI_PERF_PERSISTENCE", bool(sections_default.get("persistence", True)), ctx.suite),
+                "multi_mount": env_flag("KIMI_PERF_MULTI_MOUNT", bool(sections_default.get("multi_mount", True)), ctx.suite),
+                "soak": env_flag("KIMI_PERF_SOAK", bool(sections_default.get("soak", False)), ctx.suite),
             },
         }
 
@@ -119,11 +119,11 @@ class Drive9TencentCustomerPerf(BaseModule):
         rows: list[dict[str, Any]] = []
         for scale_id in cfg["selected_scales"]:
             if scale_id not in cfg["scales"]:
-                raise ModuleSkip(f"unknown BLACKBOX_TENCENT_PERF_SCALES value: {scale_id}", "configuration skip")
+                raise ModuleSkip(f"unknown BLACKBOX_KIMI_PERF_SCALES value: {scale_id}", "configuration skip")
             scale = cfg["scales"][scale_id]
             for layout in cfg["layouts"]:
                 if layout not in {"single", "tree"}:
-                    raise ModuleSkip(f"unknown Tencent perf layout: {layout}", "configuration skip")
+                    raise ModuleSkip(f"unknown Kimi perf layout: {layout}", "configuration skip")
                 remote = f"{remote_base}/datasets/{scale_id}-{layout}"
                 ctx.target.mkdir_remote(remote)
                 self.prepare_dataset(ctx, cfg, remote, scale_id, layout, scale)
@@ -133,14 +133,14 @@ class Drive9TencentCustomerPerf(BaseModule):
 
     def prepare_dataset(self, ctx: Context, cfg: dict[str, Any], remote: str, scale_id: str, layout: str, scale: dict[str, Any]) -> None:
         handle = ctx.target.mount(
-            "tencent_dataset_prepare",
+            "kimi_dataset_prepare",
             remote,
             profile=cfg["profile"],
             durability=cfg["durability"],
             cache_key=f"{scale_id}-{layout}-prepare",
         )
         try:
-            manifest = handle.mountpoint / ".drive9-tencent-dataset.json"
+            manifest = handle.mountpoint / ".drive9-kimi-dataset.json"
             expected = {"scale": scale_id, "layout": layout, "bytes": int(scale["bytes"]), "files": int(scale["files"])}
             if cfg["reuse_datasets"] and manifest.exists():
                 try:
@@ -148,9 +148,9 @@ class Drive9TencentCustomerPerf(BaseModule):
                 except json.JSONDecodeError:
                     current = {}
                 if all(current.get(key) == value for key, value in expected.items()):
-                    progress(f"tencent dataset cached: {scale_id}-{layout}")
+                    progress(f"kimi dataset cached: {scale_id}-{layout}")
                     return
-            progress(f"tencent dataset generate: {scale_id}-{layout} bytes={scale['bytes']} files={scale['files']}")
+            progress(f"kimi dataset generate: {scale_id}-{layout} bytes={scale['bytes']} files={scale['files']}")
             data_dir = handle.mountpoint / "data"
             if data_dir.exists():
                 shutil.rmtree(data_dir)
@@ -178,7 +178,7 @@ class Drive9TencentCustomerPerf(BaseModule):
             path = parent / f"file-{idx:08d}.bin"
             self.write_payload(path, payload, size)
             if idx + 1 in checkpoints:
-                progress(f"tencent dataset progress: {idx + 1}/{file_count}")
+                progress(f"kimi dataset progress: {idx + 1}/{file_count}")
 
     @staticmethod
     def write_payload(path: Path, payload: bytes, size: int) -> None:
@@ -196,7 +196,7 @@ class Drive9TencentCustomerPerf(BaseModule):
         for idx in range(repeats):
             start = time.perf_counter()
             handle = ctx.target.mount(
-                "tencent_mount_latency",
+                "kimi_mount_latency",
                 remote,
                 profile=cfg["profile"],
                 durability=cfg["durability"],
@@ -212,7 +212,7 @@ class Drive9TencentCustomerPerf(BaseModule):
     def measure_namespace(self, ctx: Context, cfg: dict[str, Any], remote: str, scale_id: str, layout: str, raw_dir: Path, failures: list[str]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         handle = ctx.target.mount(
-            "tencent_namespace",
+            "kimi_namespace",
             remote,
             profile=cfg["profile"],
             durability=cfg["durability"],
@@ -227,7 +227,7 @@ class Drive9TencentCustomerPerf(BaseModule):
                 "find_pattern": f"find {shlex.quote(str(data_dir))} -name '*.bin' >/dev/null",
             }
             for name, command in commands.items():
-                result = ctx.target.run_cmd(f"tencent-namespace-{scale_id}-{layout}-{name}", command, timeout=7200, shell=True)
+                result = ctx.target.run_cmd(f"kimi-namespace-{scale_id}-{layout}-{name}", command, timeout=7200, shell=True)
                 if result.ok:
                     rows.append(self.summary_row("namespace", scale_id, layout, name, result.seconds, 1, 0, "seconds", {}))
                     ctx.metric(f"{self.id}.namespace.{scale_id}.{layout}.{name}", result.seconds, "seconds")
@@ -270,7 +270,7 @@ class Drive9TencentCustomerPerf(BaseModule):
         rows: list[dict[str, Any]] = []
         remote = f"{remote_base}/small-file"
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("tencent_small_file", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key="small-file-writer")
+        handle = ctx.target.mount("kimi_small_file", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key="small-file-writer")
         try:
             root = handle.mountpoint / "small-file"
             root.mkdir(exist_ok=True)
@@ -357,8 +357,8 @@ class Drive9TencentCustomerPerf(BaseModule):
         rows: list[dict[str, Any]] = []
         remote = f"{remote_base}/flush"
         ctx.target.mkdir_remote(remote)
-        writer = ctx.target.mount("tencent_flush", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key="flush-writer")
-        reader = ctx.target.mount("tencent_flush", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key="flush-reader")
+        writer = ctx.target.mount("kimi_flush", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key="flush-writer")
+        reader = ctx.target.mount("kimi_flush", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key="flush-reader")
         try:
             root = writer.mountpoint / "flush"
             root.mkdir(exist_ok=True)
@@ -491,7 +491,7 @@ class Drive9TencentCustomerPerf(BaseModule):
     ) -> list[dict[str, Any]]:
         payload = stable_bytes(size, seed=size + samples)
         digest = hashlib.sha256(payload).hexdigest()
-        writer = ctx.target.mount("tencent_persistence", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"{mode}-{size}-writer")
+        writer = ctx.target.mount("kimi_persistence", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"{mode}-{size}-writer")
         write_values: list[float] = []
         rows: list[dict[str, Any]] = []
         raw_path = raw_dir / f"persistence-{mode}-{size}.jsonl"
@@ -520,7 +520,7 @@ class Drive9TencentCustomerPerf(BaseModule):
                 raw_handle.close()
             ctx.target.unmount(writer)
 
-        reader = ctx.target.mount("tencent_persistence", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"{mode}-{size}-reader")
+        reader = ctx.target.mount("kimi_persistence", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"{mode}-{size}-reader")
         read_values: list[float] = []
         errors = 0
         raw_handle = raw_path.open("a", encoding="utf-8") if cfg["raw_results"] else None
@@ -573,7 +573,7 @@ class Drive9TencentCustomerPerf(BaseModule):
                 for idx in range(int(count)):
                     start = time.perf_counter()
                     try:
-                        handles.append(ctx.target.mount("tencent_same_host_mount", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"mount-{count}-{idx}"))
+                        handles.append(ctx.target.mount("kimi_same_host_mount", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"mount-{count}-{idx}"))
                         values.append((time.perf_counter() - start) * 1000)
                     except Exception:
                         errors += 1
@@ -598,7 +598,7 @@ class Drive9TencentCustomerPerf(BaseModule):
             return []
         remote = f"{remote_base}/soak"
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("tencent_soak", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key="soak")
+        handle = ctx.target.mount("kimi_soak", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key="soak")
         rows: list[dict[str, Any]] = []
         raw_path = raw_dir / "soak.jsonl"
         end = time.perf_counter() + minutes * 60
@@ -749,7 +749,7 @@ class Drive9TencentCustomerPerf(BaseModule):
                 writer.writerow(row)
         write_json(summary_dir / "summary.json", {"rows": rows, "failures": failures})
         lines = [
-            "# Drive9 Tencent Customer Performance Report",
+            "# Drive9 Kimi Performance Report",
             "",
             f"- Session: `{ctx.session}`",
             f"- Result dir: `{ctx.result_dir}`",
@@ -826,7 +826,7 @@ class Drive9TencentCustomerPerf(BaseModule):
             health = {"status": "ok", "latency_ms": (time.perf_counter() - start) * 1000, "body": body}
         except Exception as exc:
             health = {"status": "error", "latency_ms": (time.perf_counter() - start) * 1000, "error": str(exc)}
-        return {"host": host, "port": port, "tcp_connect_ms": Drive9TencentCustomerPerf.latency_summary(tcp_values), "tcp_errors": errors, "healthz": health}
+        return {"host": host, "port": port, "tcp_connect_ms": Drive9KimiPerf.latency_summary(tcp_values), "tcp_errors": errors, "healthz": health}
 
     @staticmethod
     def latency_summary(values: list[float]) -> dict[str, float]:
