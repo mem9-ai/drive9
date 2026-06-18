@@ -175,6 +175,7 @@ jobs:
         uses: everpcpc/tencentcloud-oidc-auth@v1
         with:
           role-arn: ${{ secrets.TENCENTCLOUD_ROLE_ARN }}
+          oidc-provider-id: github-actions
 
       - name: Push image to tencentcloud-ap-beijing TCR
         if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
