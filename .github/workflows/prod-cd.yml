@@ -192,7 +192,7 @@ jobs:
           TCR_IMAGE="drive9.tencentcloudcr.com/drive9/dat9-server:$TAG"
           docker tag "$IMAGE" "$TCR_IMAGE"
            TCR_LOG=/tmp/tcr-token.log
-           tccli configure set secretId "$TENCENTCLOUD_SECRET_ID" secretKey "$TENCENTCLOUD_SECRET_KEY" region "$TENCENTCLOUD_REGION" token "$TENCENTCLOUD_SECURITY_TOKEN" 2>/dev/null || true
+           tccli configure set secretId "$TENCENTCLOUD_SECRET_ID" secretKey "$TENCENTCLOUD_SECRET_KEY" region "$TENCENTCLOUD_REGION" 2>/dev/null || true
            tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm >"$TCR_LOG"
            TCR_USER=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Username','100049824031'))" < "$TCR_LOG" 2>/dev/null) || true
            TCR_TOKEN=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Token'])" < "$TCR_LOG" 2>/dev/null) || true
@@ -200,7 +200,8 @@ jobs:
              echo "create TCR token failed" >&2
              exit 1
            fi
-          echo "::add-mask::$TCR_TOKEN"
+           rm -f "$TCR_LOG"
+           echo "::add-mask::$TCR_TOKEN"
           echo "$TCR_TOKEN" | docker login drive9.tencentcloudcr.com --username "$TCR_USER" --password-stdin
           docker push "$TCR_IMAGE"
           echo "TCR_IMAGE=$TCR_IMAGE" >> "$GITHUB_ENV"
