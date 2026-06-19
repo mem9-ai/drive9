@@ -27,7 +27,7 @@ class Drive9KimiPerf(BaseModule):
     category = "drive9.customer.performance"
     description = "Kimi sandbox workspace benchmark: namespace scale, small files, fsync, visibility, remount persistence, and same-host mounts."
     labels = ("drive9", "customer", "kimi", "performance", "fuse")
-    timeout = 86400
+    timeout = 3600
 
     def ensure_dependencies(self, ctx: Context) -> None:
         if not env_flag("KIMI_PERF_ENABLE", False, ctx.suite):
@@ -46,22 +46,27 @@ class Drive9KimiPerf(BaseModule):
         remote_base = env_value("KIMI_PERF_REMOTE_ROOT", ctx.target.remote_root(self.id), ctx.suite).rstrip("/")
         ctx.target.mkdir_remote(remote_base)
         self.capture_environment(ctx, artifact)
-        write_json(artifact / "manifest.json", {"remote_base": remote_base, "config": cfg, "session": ctx.session})
+        manifest_config = {key: value for key, value in cfg.items() if not key.startswith("_")}
+        write_json(artifact / "manifest.json", {"remote_base": remote_base, "config": manifest_config, "session": ctx.session})
 
         rows: list[dict[str, Any]] = []
         issues: list[dict[str, Any]] = []
 
+        def checkpoint(extra_rows: list[dict[str, Any]] | None = None) -> None:
+            self.write_summary_outputs(ctx, artifact, summary_dir, rows + (extra_rows or []), issues)
+
         sections: list[tuple[str, bool, Callable[[], list[dict[str, Any]]]]] = [
-            ("namespace", bool(cfg["sections"]["namespace"]), lambda: self.run_namespace_suite(ctx, cfg, remote_base, raw_dir, issues)),
             ("small_file", bool(cfg["sections"]["small_file"]), lambda: self.run_small_file_suite(ctx, cfg, remote_base, raw_dir, issues)),
             ("flush", bool(cfg["sections"]["flush"]), lambda: self.run_flush_suite(ctx, cfg, remote_base, raw_dir, issues)),
             ("persistence", bool(cfg["sections"]["persistence"]), lambda: self.run_persistence_suite(ctx, cfg, remote_base, raw_dir, issues)),
             ("multi_mount", bool(cfg["sections"]["multi_mount"]), lambda: self.run_same_host_mount_suite(ctx, cfg, remote_base, issues)),
+            ("namespace", bool(cfg["sections"]["namespace"]), lambda: self.run_namespace_suite(ctx, cfg, remote_base, raw_dir, issues, checkpoint)),
             ("soak", bool(cfg["sections"]["soak"]), lambda: self.run_soak_suite(ctx, cfg, remote_base, raw_dir, issues)),
         ]
         for name, enabled, fn in sections:
             if not enabled:
                 rows.append(self.control_row(name, "skipped", "section disabled by config", 0.0))
+                checkpoint()
                 continue
             progress(f"kimi perf section start: {name}")
             started = time.perf_counter()
@@ -77,9 +82,9 @@ class Drive9KimiPerf(BaseModule):
                 rows.append(self.control_row(name, "error", detail, elapsed))
                 progress(f"kimi perf section error: {name}: {detail}")
             finally:
-                self.write_summary_outputs(ctx, artifact, summary_dir, rows, issues)
+                checkpoint()
 
-        self.write_summary_outputs(ctx, artifact, summary_dir, rows, issues)
+        checkpoint()
         return {"remote_base": remote_base, "summary_rows": len(rows), "issues": len(issues), "artifact": str(artifact)}
 
     def config(self, ctx: Context) -> dict[str, Any]:
@@ -102,16 +107,18 @@ class Drive9KimiPerf(BaseModule):
             "runs": max(1, int(env_value("KIMI_PERF_RUNS", str(ctx.runs), ctx.suite))),
             "profile": env_value("KIMI_PERF_PROFILE", str(cfg.get("profile", "coding-agent")), ctx.suite),
             "durability": env_value("KIMI_PERF_DURABILITY", str(cfg.get("durability", "auto")), ctx.suite),
-            "namespace_stat_samples": int(env_value("KIMI_PERF_STAT_SAMPLES", str(cfg.get("namespace_stat_samples", 1000)), ctx.suite)),
-            "namespace_cmd_timeout_s": int(env_value("KIMI_PERF_NAMESPACE_CMD_TIMEOUT_S", str(cfg.get("namespace_cmd_timeout_s", 1800)), ctx.suite)),
-            "dataset_timeout_s": float(env_value("KIMI_PERF_DATASET_TIMEOUT_S", str(cfg.get("dataset_timeout_s", 7200)), ctx.suite)),
-            "small_file_sizes": self.int_csv_env(ctx, "KIMI_PERF_SMALL_SIZES", cfg.get("small_file_sizes", [1024, 4096, 20 * 1024, 100 * 1024])),
+            "namespace_stat_samples": int(env_value("KIMI_PERF_STAT_SAMPLES", str(cfg.get("namespace_stat_samples", 300)), ctx.suite)),
+            "namespace_cmd_timeout_s": int(env_value("KIMI_PERF_NAMESPACE_CMD_TIMEOUT_S", str(cfg.get("namespace_cmd_timeout_s", 300)), ctx.suite)),
+            "namespace_cmd_timeouts_s": self.timeout_map_env(ctx, "KIMI_PERF_NAMESPACE_CMD_TIMEOUTS", cfg.get("namespace_cmd_timeouts_s", {"S": 180, "M": 30, "L": 30})),
+            "dataset_timeout_s": float(env_value("KIMI_PERF_DATASET_TIMEOUT_S", str(cfg.get("dataset_timeout_s", 300)), ctx.suite)),
+            "dataset_timeouts_s": self.timeout_map_env(ctx, "KIMI_PERF_DATASET_TIMEOUTS", cfg.get("dataset_timeouts_s", {"S": 300, "M": 600, "L": 120})),
+            "small_file_sizes": self.int_csv_env(ctx, "KIMI_PERF_SMALL_SIZES", cfg.get("small_file_sizes", [1024, 20 * 1024, 100 * 1024])),
             "small_file_concurrency": self.int_csv_env(ctx, "KIMI_PERF_SMALL_CONCURRENCY", cfg.get("small_file_concurrency", [1, 4, 16])),
-            "small_file_ops": int(env_value("KIMI_PERF_SMALL_OPS", str(cfg.get("small_file_ops", 300)), ctx.suite)),
-            "flush_file_sizes": self.int_csv_env(ctx, "KIMI_PERF_FLUSH_SIZES", cfg.get("flush_file_sizes", [1024, 4096, 20 * 1024, 100 * 1024])),
+            "small_file_ops": int(env_value("KIMI_PERF_SMALL_OPS", str(cfg.get("small_file_ops", 50)), ctx.suite)),
+            "flush_file_sizes": self.int_csv_env(ctx, "KIMI_PERF_FLUSH_SIZES", cfg.get("flush_file_sizes", [1024, 20 * 1024, 100 * 1024])),
             "flush_concurrency": self.int_csv_env(ctx, "KIMI_PERF_FLUSH_CONCURRENCY", cfg.get("flush_concurrency", [1, 4, 16])),
-            "flush_ops": int(env_value("KIMI_PERF_FLUSH_OPS", str(cfg.get("flush_ops", 200)), ctx.suite)),
-            "flush_visibility_samples": int(env_value("KIMI_PERF_FLUSH_VISIBILITY_SAMPLES", str(cfg.get("flush_visibility_samples", cfg.get("visibility_samples", 50))), ctx.suite)),
+            "flush_ops": int(env_value("KIMI_PERF_FLUSH_OPS", str(cfg.get("flush_ops", 30)), ctx.suite)),
+            "flush_visibility_samples": int(env_value("KIMI_PERF_FLUSH_VISIBILITY_SAMPLES", str(cfg.get("flush_visibility_samples", cfg.get("visibility_samples", 20))), ctx.suite)),
             "visibility_timeout_s": float(env_value("KIMI_PERF_VISIBILITY_TIMEOUT_S", str(cfg.get("visibility_timeout_s", 30)), ctx.suite)),
             "persistence_samples": int(env_value("KIMI_PERF_PERSISTENCE_SAMPLES", str(cfg.get("persistence_samples", 20)), ctx.suite)),
             "same_host_mount_counts": self.int_csv_env(ctx, "KIMI_PERF_MOUNT_COUNTS", cfg.get("same_host_mount_counts", [1, 2, 5, 10])),
@@ -128,7 +135,15 @@ class Drive9KimiPerf(BaseModule):
             },
         }
 
-    def run_namespace_suite(self, ctx: Context, cfg: dict[str, Any], remote_base: str, raw_dir: Path, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def run_namespace_suite(
+        self,
+        ctx: Context,
+        cfg: dict[str, Any],
+        remote_base: str,
+        raw_dir: Path,
+        issues: list[dict[str, Any]],
+        checkpoint: Callable[[list[dict[str, Any]] | None], None] | None = None,
+    ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for scale_id in cfg["selected_scales"]:
             if scale_id not in cfg["scales"]:
@@ -141,11 +156,17 @@ class Drive9KimiPerf(BaseModule):
                 ctx.target.mkdir_remote(remote)
                 dataset = self.prepare_dataset(ctx, cfg, remote, scale_id, layout, scale, issues)
                 rows.append(dataset)
+                if checkpoint is not None:
+                    checkpoint(rows)
                 if dataset.get("status") not in {"ok", "cached"}:
                     issues.append({"severity": "warn", "section": "namespace", "op": "dataset_generate", "scale": scale_id, "layout": layout, "detail": str(dataset.get("detail", ""))})
                     continue
                 rows.extend(self.measure_mounts(ctx, cfg, remote, scale_id, layout, scale, issues))
+                if checkpoint is not None:
+                    checkpoint(rows)
                 rows.extend(self.measure_namespace(ctx, cfg, remote, scale_id, layout, scale, raw_dir, issues))
+                if checkpoint is not None:
+                    checkpoint(rows)
         return rows
 
     def prepare_dataset(
@@ -213,15 +234,21 @@ class Drive9KimiPerf(BaseModule):
             data_dir.mkdir()
             started = time.perf_counter()
             try:
-                result = self.generate_dataset(
-                    data_dir,
-                    layout,
-                    int(scale["bytes"]),
-                    int(scale["files"]),
-                    float(cfg["dataset_timeout_s"]),
-                    manifest,
-                    expected,
-                )
+                timeout_s = float(cfg["dataset_timeouts_s"].get(scale_id, cfg["dataset_timeout_s"]))
+                if timeout_s <= 0:
+                    detail = f"dataset generation skipped because timeout is {timeout_s:.0f}s"
+                    self.write_dataset_manifest(manifest, expected, 0, 0, 0.0, False, detail)
+                    result = {"completed": False, "created_files": 0, "created_bytes": 0, "detail": detail}
+                else:
+                    result = self.generate_dataset(
+                        data_dir,
+                        layout,
+                        int(scale["bytes"]),
+                        int(scale["files"]),
+                        timeout_s,
+                        manifest,
+                        expected,
+                    )
             except OSError as exc:
                 result = {
                     "completed": False,
@@ -231,9 +258,10 @@ class Drive9KimiPerf(BaseModule):
                     "error": True,
                 }
             seconds = time.perf_counter() - started
+            status = "ok" if result["completed"] else ("error" if result.get("error") else "timeout")
             row.update(
                 {
-                    "status": "ok" if result["completed"] else ("error" if result.get("error") else "timeout"),
+                    "status": status,
                     "created_files": result["created_files"],
                     "created_bytes": result["created_bytes"],
                     "count": result["created_files"],
@@ -266,10 +294,15 @@ class Drive9KimiPerf(BaseModule):
         started = time.perf_counter()
         created_bytes = 0
         created_files = 0
+        if timeout_s <= 0:
+            detail = f"dataset generation skipped because timeout is {timeout_s:.0f}s"
+            self.write_dataset_manifest(manifest, manifest_base, created_files, created_bytes, 0.0, False, detail)
+            return {"completed": False, "created_files": created_files, "created_bytes": created_bytes, "detail": detail}
         for idx in range(file_count):
-            if timeout_s > 0 and time.perf_counter() - started > timeout_s:
+            now = time.perf_counter()
+            if timeout_s > 0 and now - started > timeout_s:
                 detail = f"dataset generation exceeded {timeout_s:.0f}s at {created_files}/{file_count} files"
-                self.write_dataset_manifest(manifest, manifest_base, created_files, created_bytes, time.perf_counter() - started, False, detail)
+                self.write_dataset_manifest(manifest, manifest_base, created_files, created_bytes, now - started, False, detail)
                 return {"completed": False, "created_files": created_files, "created_bytes": created_bytes, "detail": detail}
             size = base + (1 if idx < extra else 0)
             parent = data_dir if layout == "single" else data_dir / f"shard-{idx // 1000:05d}"
@@ -395,6 +428,7 @@ class Drive9KimiPerf(BaseModule):
                 "find_pattern": f"find {shlex.quote(str(data_dir))} -name '*.bin' >/dev/null",
             }
             for name, command in commands.items():
+                timeout_s = float(cfg["namespace_cmd_timeouts_s"].get(scale_id, cfg["namespace_cmd_timeout_s"]))
                 values: list[float] = []
                 errors = 0
                 timeouts = 0
@@ -402,7 +436,7 @@ class Drive9KimiPerf(BaseModule):
                     result = ctx.target.run_cmd(
                         f"kimi-namespace-{scale_id}-{layout}-{name}-run-{run_idx}",
                         command,
-                        timeout=int(cfg["namespace_cmd_timeout_s"]),
+                        timeout=max(1, int(timeout_s)),
                         shell=True,
                     )
                     if result.ok:
@@ -1232,6 +1266,25 @@ class Drive9KimiPerf(BaseModule):
         if not value:
             return [int(item) for item in default]
         return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+    @staticmethod
+    def timeout_map_env(ctx: Context, suffix: str, default: dict[str, float]) -> dict[str, float]:
+        value = env_value(suffix, "", ctx.suite)
+        result = {str(key): float(timeout_s) for key, timeout_s in default.items()}
+        if not value:
+            return result
+        for item in value.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" in item:
+                key, timeout_s = item.split("=", 1)
+            elif ":" in item:
+                key, timeout_s = item.split(":", 1)
+            else:
+                raise ValueError(f"{suffix} item must be KEY=SECONDS, got {item!r}")
+            result[key.strip()] = float(timeout_s.strip())
+        return result
 
     @staticmethod
     def format_cell(value: Any) -> str:

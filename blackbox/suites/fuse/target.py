@@ -547,7 +547,8 @@ class Drive9FuseTargetProvider:
             exit_code = result.code
             if result.code != 0 and (pack_paths or pack_archives):
                 raise BlackboxError(f"drive9 umount with pack arguments failed; see {result.stderr}")
-        deadline = time.monotonic() + 20
+        post_umount_wait_s = float(os.environ.get("FUSE_POST_UMOUNT_WAIT_S", "20"))
+        deadline = time.monotonic() + max(0.0, post_umount_wait_s)
         next_wait_log = time.monotonic() + 10
         while time.monotonic() < deadline and self.is_mounted(handle.mountpoint):
             if time.monotonic() >= next_wait_log:
