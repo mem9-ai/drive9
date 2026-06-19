@@ -573,9 +573,12 @@ func ctxForkCmd(args []string) error {
 		return fmt.Errorf("ctx fork response missing api_key")
 	}
 	if _, err := ctxAdd(cfg, newName, &Context{
-		Type:   PrincipalOwner,
-		Server: server,
-		APIKey: result.APIKey,
+		Type:          PrincipalOwner,
+		Server:        server,
+		APIKey:        result.APIKey,
+		Mode:          source.Mode,
+		CloudProvider: source.CloudProvider,
+		Region:        source.Region,
 	}); err != nil {
 		return err
 	}
