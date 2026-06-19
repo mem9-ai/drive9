@@ -29,6 +29,15 @@ class MountHandle:
     profile: str
 
 
+@dataclass
+class UnmountResult:
+    attempted: bool
+    exit_code: int | None
+    mounted_after: bool
+    forced: bool
+    seconds: float
+
+
 def pick_port() -> int:
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
@@ -518,8 +527,13 @@ class Drive9FuseTargetProvider:
         pack_paths: list[str] | None = None,
         pack_archives: list[str] | None = None,
         no_auto_pack: bool = False,
-    ) -> None:
+    ) -> UnmountResult:
+        started = time.monotonic()
+        attempted = False
+        exit_code: int | None = None
+        forced = False
         if self.is_mounted(handle.mountpoint):
+            attempted = True
             progress(f"unmount start: {handle.mountpoint}")
             args = ["umount", "--timeout", os.environ.get("FUSE_UMOUNT_TIMEOUT", "60s")]
             if no_auto_pack:
@@ -530,6 +544,7 @@ class Drive9FuseTargetProvider:
                 args.extend(["--pack-path", path])
             args.append(str(handle.mountpoint))
             result = self.drive9(f"umount-{handle.mountpoint.name}", args, timeout=120, ok_codes=(0, 1))
+            exit_code = result.code
             if result.code != 0 and (pack_paths or pack_archives):
                 raise BlackboxError(f"drive9 umount with pack arguments failed; see {result.stderr}")
         deadline = time.monotonic() + 20
@@ -540,6 +555,7 @@ class Drive9FuseTargetProvider:
                 next_wait_log = time.monotonic() + 10
             time.sleep(0.25)
         if force and self.is_mounted(handle.mountpoint):
+            forced = True
             progress(f"unmount force: {handle.mountpoint}")
             if platform.system() == "Linux":
                 for cmd in (["fusermount3", "-uz", str(handle.mountpoint)], ["fusermount", "-uz", str(handle.mountpoint)], ["umount", "-l", str(handle.mountpoint)]):
@@ -549,8 +565,10 @@ class Drive9FuseTargetProvider:
                             break
             elif platform.system() == "Darwin":
                 subprocess.run(["umount", "-f", str(handle.mountpoint)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        mounted_after = self.is_mounted(handle.mountpoint)
         self.kill_process_group(handle.proc)
         progress(f"unmount done: {handle.mountpoint}")
+        return UnmountResult(attempted=attempted, exit_code=exit_code, mounted_after=mounted_after, forced=forced, seconds=time.monotonic() - started)
 
     def cleanup(self) -> None:
         progress("cleanup start")

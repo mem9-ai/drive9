@@ -246,9 +246,7 @@ class Drive9KimiPerf(BaseModule):
                 issues.append({"severity": "warn", "section": "namespace", "op": "dataset_generate", "scale": scale_id, "layout": layout, "detail": result["detail"]})
             return row
         finally:
-            unmount_started = time.perf_counter()
-            ctx.target.unmount(handle)
-            unmount_ms = (time.perf_counter() - unmount_started) * 1000
+            unmount_ms, _ = self.record_unmount(ctx, handle, issues, section="namespace", op="dataset_generate", row=row, labels={"scale": scale_id, "layout": layout})
             row["unmount_ms"] = unmount_ms
 
     def generate_dataset(
@@ -316,11 +314,41 @@ class Drive9KimiPerf(BaseModule):
                 handle.write(chunk)
                 remaining -= len(chunk)
 
+    def record_unmount(
+        self,
+        ctx: Context,
+        handle: Any,
+        issues: list[dict[str, Any]],
+        *,
+        section: str,
+        op: str,
+        row: dict[str, Any] | None = None,
+        labels: dict[str, Any] | None = None,
+    ) -> tuple[float, bool]:
+        started = time.perf_counter()
+        outcome = ctx.target.unmount(handle)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        exit_code = outcome.exit_code
+        failed = (exit_code not in (None, 0)) or bool(outcome.mounted_after)
+        if row is not None:
+            row["unmount_ms"] = elapsed_ms
+            row["unmount_exit_code"] = "" if exit_code is None else exit_code
+            row["unmount_mounted_after"] = bool(outcome.mounted_after)
+            row["unmount_forced"] = bool(outcome.forced)
+        if failed:
+            detail = f"exit={exit_code} mounted_after={outcome.mounted_after} forced={outcome.forced} seconds={outcome.seconds:.3f} mountpoint={handle.mountpoint}"
+            issue = {"severity": "error" if outcome.mounted_after else "warn", "section": section, "op": f"{op}_unmount", "detail": detail}
+            if labels:
+                issue.update(labels)
+            issues.append(issue)
+        return elapsed_ms, failed
+
     def measure_mounts(self, ctx: Context, cfg: dict[str, Any], remote: str, scale_id: str, layout: str, scale: dict[str, Any], issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         mount_values: list[float] = []
         unmount_values: list[float] = []
-        errors = 0
+        mount_errors = 0
+        unmount_errors = 0
         repeats = int(scale.get("mount_repeats", 3))
         for idx in range(repeats):
             handle = None
@@ -335,15 +363,16 @@ class Drive9KimiPerf(BaseModule):
                 )
                 mount_values.append((time.perf_counter() - start) * 1000)
             except Exception as exc:
-                errors += 1
+                mount_errors += 1
                 issues.append({"severity": "error", "section": "namespace", "op": "mount", "scale": scale_id, "layout": layout, "detail": str(exc)})
             finally:
                 if handle is not None:
-                    start_unmount = time.perf_counter()
-                    ctx.target.unmount(handle)
-                    unmount_values.append((time.perf_counter() - start_unmount) * 1000)
-        rows.append(self.matrix_row("namespace", "mount", scale_id, layout, "", "", "ms", mount_values, errors, repeats, repeats, status="ok" if errors == 0 else "error"))
-        rows.append(self.matrix_row("namespace", "unmount", scale_id, layout, "", "", "ms", unmount_values, errors, repeats, repeats, status="ok" if errors == 0 else "error"))
+                    elapsed_ms, failed = self.record_unmount(ctx, handle, issues, section="namespace", op="mount_latency", labels={"scale": scale_id, "layout": layout})
+                    unmount_values.append(elapsed_ms)
+                    if failed:
+                        unmount_errors += 1
+        rows.append(self.matrix_row("namespace", "mount", scale_id, layout, "", "", "ms", mount_values, mount_errors, repeats, repeats, status="ok" if mount_errors == 0 else "error"))
+        rows.append(self.matrix_row("namespace", "unmount", scale_id, layout, "", "", "ms", unmount_values, unmount_errors, repeats, repeats, status="ok" if unmount_errors == 0 else "error"))
         ctx.perf_values(f"{self.id}.namespace.{scale_id}.{layout}.mount", mount_values, "ms")
         ctx.perf_values(f"{self.id}.namespace.{scale_id}.{layout}.unmount", unmount_values, "ms")
         return rows
@@ -396,7 +425,7 @@ class Drive9KimiPerf(BaseModule):
             rows.append(self.matrix_row("namespace", "stat", scale_id, layout, "", "", "ms", stat_values, stat_errors, min(int(cfg["namespace_stat_samples"]), int(scale["files"])), 1, status="ok" if stat_errors == 0 else "error"))
             ctx.perf_values(f"{self.id}.namespace.{scale_id}.{layout}.stat", stat_values, "ms")
         finally:
-            ctx.target.unmount(handle)
+            self.record_unmount(ctx, handle, issues, section="namespace", op="namespace_scan", labels={"scale": scale_id, "layout": layout})
         return rows
 
     def measure_stat_samples(self, data_dir: Path, layout: str, file_count: int, samples: int, raw_path: Path) -> tuple[list[float], int]:
@@ -441,7 +470,7 @@ class Drive9KimiPerf(BaseModule):
                 for concurrency in cfg["small_file_concurrency"]:
                     rows.extend(self.small_file_matrix(ctx, cfg, root, raw_dir, int(size), int(concurrency), issues))
         finally:
-            ctx.target.unmount(handle)
+            self.record_unmount(ctx, handle, issues, section="small_file", op="suite")
         return rows
 
     def small_file_matrix(self, ctx: Context, cfg: dict[str, Any], root: Path, raw_dir: Path, size: int, concurrency: int, issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -527,8 +556,8 @@ class Drive9KimiPerf(BaseModule):
                     for mode in ("close", "fsync", "fdatasync"):
                         rows.extend(self.flush_matrix(ctx, cfg, root, reader_root, raw_dir, int(size), int(concurrency), mode, issues))
         finally:
-            ctx.target.unmount(reader)
-            ctx.target.unmount(writer)
+            self.record_unmount(ctx, reader, issues, section="flush", op="reader")
+            self.record_unmount(ctx, writer, issues, section="flush", op="writer")
         return rows
 
     def flush_matrix(
@@ -666,6 +695,8 @@ class Drive9KimiPerf(BaseModule):
         write_unmount_values: list[float] = []
         read_unmount_values: list[float] = []
         errors = 0
+        write_unmount_errors = 0
+        read_unmount_errors = 0
         runs = int(cfg["runs"])
         for run_idx in range(runs):
             writer = ctx.target.mount("kimi_persistence", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"{mode}-{size}-writer-run-{run_idx}")
@@ -692,9 +723,10 @@ class Drive9KimiPerf(BaseModule):
             finally:
                 if raw_handle is not None:
                     raw_handle.close()
-                start_unmount = time.perf_counter()
-                ctx.target.unmount(writer)
-                write_unmount_values.append((time.perf_counter() - start_unmount) * 1000)
+                elapsed_ms, failed = self.record_unmount(ctx, writer, issues, section="persistence", op=f"{mode}_writer", labels={"file_size": size, "run": run_idx})
+                write_unmount_values.append(elapsed_ms)
+                if failed:
+                    write_unmount_errors += 1
 
             reader = ctx.target.mount("kimi_persistence", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"{mode}-{size}-reader-run-{run_idx}")
             raw_handle = raw_path.open("a", encoding="utf-8") if cfg["raw_results"] else None
@@ -724,16 +756,17 @@ class Drive9KimiPerf(BaseModule):
             finally:
                 if raw_handle is not None:
                     raw_handle.close()
-                start_unmount = time.perf_counter()
-                ctx.target.unmount(reader)
-                read_unmount_values.append((time.perf_counter() - start_unmount) * 1000)
+                elapsed_ms, failed = self.record_unmount(ctx, reader, issues, section="persistence", op=f"{mode}_reader", labels={"file_size": size, "run": run_idx})
+                read_unmount_values.append(elapsed_ms)
+                if failed:
+                    read_unmount_errors += 1
 
         total = samples * runs
         rows = [
             self.matrix_row("persistence", f"{mode}_write_before_remount", "", "", size, "", "ms", write_values, 0, total, runs, status="ok"),
             self.matrix_row("persistence", f"{mode}_remount_read", "", "", size, "", "ms", read_values, errors, total, runs, status="ok" if errors == 0 else "error"),
-            self.matrix_row("persistence", f"{mode}_writer_unmount", "", "", size, "", "ms", write_unmount_values, 0, runs, runs, status="ok"),
-            self.matrix_row("persistence", f"{mode}_reader_unmount", "", "", size, "", "ms", read_unmount_values, 0, runs, runs, status="ok"),
+            self.matrix_row("persistence", f"{mode}_writer_unmount", "", "", size, "", "ms", write_unmount_values, write_unmount_errors, runs, runs, status="ok" if write_unmount_errors == 0 else "error"),
+            self.matrix_row("persistence", f"{mode}_reader_unmount", "", "", size, "", "ms", read_unmount_values, read_unmount_errors, runs, runs, status="ok" if read_unmount_errors == 0 else "error"),
         ]
         ctx.perf_values(f"{self.id}.persistence.{mode}.write.{size}b", write_values, "ms")
         ctx.perf_values(f"{self.id}.persistence.{mode}.remount_read.{size}b", read_values, "ms")
@@ -749,7 +782,9 @@ class Drive9KimiPerf(BaseModule):
             progress(f"kimi same_host_multi_mount: count={count}")
             values: list[float] = []
             unmount_values: list[float] = []
-            errors = 0
+            mount_errors = 0
+            cross_read_errors = 0
+            unmount_errors = 0
             cross_read_values: list[float] = []
             for run_idx in range(int(cfg["runs"])):
                 handles = []
@@ -760,7 +795,7 @@ class Drive9KimiPerf(BaseModule):
                             handles.append(ctx.target.mount("kimi_same_host_mount", remote, profile=cfg["profile"], durability=cfg["durability"], cache_key=f"mount-{count}-{idx}-run-{run_idx}"))
                             values.append((time.perf_counter() - start) * 1000)
                         except Exception as exc:
-                            errors += 1
+                            mount_errors += 1
                             issues.append({"severity": "error", "section": "same_host_multi_mount", "op": "mount", "concurrency": count, "detail": str(exc)})
                     if handles:
                         content = f"{count}-{run_idx}-{time.time()}\n"
@@ -770,20 +805,21 @@ class Drive9KimiPerf(BaseModule):
                             start = time.perf_counter()
                             try:
                                 if (handle.mountpoint / probe.name).read_text(encoding="utf-8") != content:
-                                    errors += 1
+                                    cross_read_errors += 1
                                 else:
                                     cross_read_values.append((time.perf_counter() - start) * 1000)
                             except OSError as exc:
-                                errors += 1
+                                cross_read_errors += 1
                                 issues.append({"severity": "error", "section": "same_host_multi_mount", "op": "cross_mount_read", "concurrency": count, "detail": str(exc)})
                 finally:
                     for handle in reversed(handles):
-                        start_unmount = time.perf_counter()
-                        ctx.target.unmount(handle)
-                        unmount_values.append((time.perf_counter() - start_unmount) * 1000)
-            rows.append(self.matrix_row("same_host_multi_mount", "mount", "", "", "", int(count), "ms", values, errors, max(1, int(count) * int(cfg["runs"])), int(cfg["runs"]), status="ok" if errors == 0 else "error"))
-            rows.append(self.matrix_row("same_host_multi_mount", "cross_mount_read", "", "", "", int(count), "ms", cross_read_values, errors, max(1, int(count) * int(cfg["runs"])), int(cfg["runs"]), status="ok" if errors == 0 else "error"))
-            rows.append(self.matrix_row("same_host_multi_mount", "unmount", "", "", "", int(count), "ms", unmount_values, errors, max(1, int(count) * int(cfg["runs"])), int(cfg["runs"]), status="ok" if errors == 0 else "error"))
+                        elapsed_ms, failed = self.record_unmount(ctx, handle, issues, section="same_host_multi_mount", op="mount", labels={"concurrency": count, "run": run_idx})
+                        unmount_values.append(elapsed_ms)
+                        if failed:
+                            unmount_errors += 1
+            rows.append(self.matrix_row("same_host_multi_mount", "mount", "", "", "", int(count), "ms", values, mount_errors, max(1, int(count) * int(cfg["runs"])), int(cfg["runs"]), status="ok" if mount_errors == 0 else "error"))
+            rows.append(self.matrix_row("same_host_multi_mount", "cross_mount_read", "", "", "", int(count), "ms", cross_read_values, cross_read_errors, max(1, int(count) * int(cfg["runs"])), int(cfg["runs"]), status="ok" if cross_read_errors == 0 else "error"))
+            rows.append(self.matrix_row("same_host_multi_mount", "unmount", "", "", "", int(count), "ms", unmount_values, unmount_errors, max(1, int(count) * int(cfg["runs"])), int(cfg["runs"]), status="ok" if unmount_errors == 0 else "error"))
             ctx.perf_values(f"{self.id}.same_host_multi_mount.c{count}.mount", values, "ms")
             ctx.perf_values(f"{self.id}.same_host_multi_mount.c{count}.cross_mount_read", cross_read_values, "ms")
             ctx.perf_values(f"{self.id}.same_host_multi_mount.c{count}.unmount", unmount_values, "ms")
@@ -824,7 +860,9 @@ class Drive9KimiPerf(BaseModule):
                     idx += 1
                     time.sleep(1)
         finally:
-            ctx.target.unmount(handle)
+            _, failed = self.record_unmount(ctx, handle, issues, section="soak", op="suite")
+            if failed:
+                errors += 1
         rows.append(self.matrix_row("soak", "write_read", "", "", "", "", "ms", values, errors, max(1, idx), 1, status="ok" if errors == 0 else "error"))
         ctx.perf_values(f"{self.id}.soak.write_read", values, "ms")
         if errors:
@@ -984,6 +1022,7 @@ class Drive9KimiPerf(BaseModule):
             f"| 100MB/1GB/10GB, 1k/10k/100k mount/ls/stat/find | namespace rows={len(namespace_rows)} | {self.coverage_status(namespace_rows)} |",
             f"| single workspace and single-directory scale | dataset_generate rows for selected scales/layouts | {self.dataset_coverage(rows)} |",
             f"| simultaneous sandbox mounts | same_host_multi_mount rows={len(mount_rows)} | {self.coverage_status(mount_rows)} |",
+            f"| sandbox lifecycle and unmount stability | unmount rows/issues are captured | {self.lifecycle_status(rows, issues)} |",
             f"| small-file create/overwrite/append/partial edit QPS p95/p99 | small_file rows={len(small_rows)} | {self.coverage_status(small_rows)} |",
             f"| close/fsync/fdatasync p50/p95/p99 and visibility | flush rows={len(flush_rows)} | {self.coverage_status(flush_rows)} |",
             f"| remount persistence and checksum visibility | persistence rows={len(persistence_rows)} | {self.coverage_status(persistence_rows)} |",
@@ -998,7 +1037,7 @@ class Drive9KimiPerf(BaseModule):
         else:
             lines.append("- None")
         lines.extend(["", "## Namespace Scale", ""])
-        self.append_table(lines, namespace_rows, ["op", "scale", "layout", "status", "target_files", "created_files", "p50", "p95", "p99", "max", "qps", "errors", "timeouts", "unit"])
+        self.append_table(lines, namespace_rows, ["op", "scale", "layout", "status", "target_files", "created_files", "mount_ms", "unmount_ms", "unmount_exit_code", "unmount_mounted_after", "p50", "p95", "p99", "max", "qps", "errors", "timeouts", "unit"])
         lines.extend(["", "## Small File Workload", ""])
         self.append_table(lines, small_rows, ["op", "file_size", "concurrency", "status", "count", "p50", "p95", "p99", "max", "qps", "errors", "unit"])
         lines.extend(["", "## Flush / Fsync / Visibility", ""])
@@ -1043,6 +1082,18 @@ class Drive9KimiPerf(BaseModule):
         if any(row.get("created_files", 0) for row in dataset_rows):
             return "PARTIAL"
         return "FAILED"
+
+    @staticmethod
+    def lifecycle_status(rows: list[dict[str, Any]], issues: list[dict[str, Any]]) -> str:
+        unmount_rows = [row for row in rows if str(row.get("op", "")).endswith("unmount") or "unmount_ms" in row]
+        unmount_issues = [item for item in issues if str(item.get("op", "")).endswith("_unmount")]
+        if not unmount_rows and not unmount_issues:
+            return "NOT RUN"
+        if any(item.get("severity") == "error" for item in unmount_issues):
+            return "FAILED"
+        if unmount_issues or any(row.get("status") not in {"ok", "cached", "completed"} for row in unmount_rows):
+            return "PARTIAL"
+        return "COMPLETE"
 
     def append_table(self, lines: list[str], rows: list[dict[str, Any]], columns: list[str]) -> None:
         if not rows:
