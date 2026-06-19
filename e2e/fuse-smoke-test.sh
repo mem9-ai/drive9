@@ -961,10 +961,15 @@ DRAIN_AFTER_REMOTE="/${DRAIN_AFTER_REL}"
 DRAIN_AFTER_MOUNT="$MOUNT_POINT/$DRAIN_AFTER_REL"
 DRAIN_SYNC_AFTER_REL="${DRAIN_DIR_REL}/after-syncfs.txt"
 DRAIN_SYNC_AFTER_MOUNT="$MOUNT_POINT/$DRAIN_SYNC_AFTER_REL"
+DRAIN_SYNC_OPEN_REL="${DRAIN_DIR_REL}/syncfs-open.txt"
+DRAIN_SYNC_OPEN_REMOTE="/${DRAIN_SYNC_OPEN_REL}"
+DRAIN_SYNC_OPEN_MOUNT="$MOUNT_POINT/$DRAIN_SYNC_OPEN_REL"
 DRAIN_CLI_JSON="$FUSE_MOUNT_ROOT/drive9-fuse-drain-cli-${TS}.json"
 DRAIN_CLI_ERR="$FUSE_MOUNT_ROOT/drive9-fuse-drain-cli-${TS}.err"
 DRAIN_CLI_READY="$FUSE_MOUNT_ROOT/drive9-fuse-drain-cli-ready-${TS}"
 DRAIN_CLI_DONE="$FUSE_MOUNT_ROOT/drive9-fuse-drain-cli-done-${TS}"
+DRAIN_SYNC_READY="$FUSE_MOUNT_ROOT/drive9-fuse-drain-syncfs-ready-${TS}"
+DRAIN_SYNC_DONE="$FUSE_MOUNT_ROOT/drive9-fuse-drain-syncfs-done-${TS}"
 
 mkdir -p "$MOUNT_POINT"
 : >"$MOUNT_LOG"
@@ -977,7 +982,8 @@ cleanup() {
   finish_open_handle_writers
   stop_mount
   rm -f "$SEED_LOCAL" "$LARGE_DOWNLOADED" "$TIER_DOWNLOADED" "$CLI_BIN" \
-    "$DRAIN_CLI_JSON" "$DRAIN_CLI_ERR" "$DRAIN_CLI_READY" "$DRAIN_CLI_DONE"
+    "$DRAIN_CLI_JSON" "$DRAIN_CLI_ERR" "$DRAIN_CLI_READY" "$DRAIN_CLI_DONE" \
+    "$DRAIN_SYNC_READY" "$DRAIN_SYNC_DONE"
   rm -rf "${MOUNT_POINT:?}" || true
 }
 on_exit() {
@@ -1332,11 +1338,27 @@ PY
     fi
     if native_sync_f_available; then
       if [ "$native_syncfs_supported" = "true" ]; then
+        syncfs_content="syncfs-open-${TS}"
+        if start_open_handle_writer "$DRAIN_SYNC_OPEN_MOUNT" "$syncfs_content" "$DRAIN_SYNC_READY" "$DRAIN_SYNC_DONE"; then
+          check_eq "open handle writer ready for native sync -f" "true" "true"
+          syncfs_before=$(drive9_retry fs cat "$DRAIN_SYNC_OPEN_REMOTE" 2>/dev/null || true)
+          check_eq "native sync -f open handle starts remote-invisible" "$syncfs_before" ""
+          check_cmd "native sync -f drains mounted filesystem" sync -f "$MOUNT_POINT"
+          if syncfs_remote=$(wait_remote_cat_eq "$DRAIN_SYNC_OPEN_REMOTE" "$syncfs_content"); then
+            :
+          else
+            syncfs_remote=""
+          fi
+          check_eq "native sync -f flushes open handle to remote" "$syncfs_remote" "$syncfs_content"
+          finish_open_handle_writers
+        else
+          check_eq "open handle writer ready for native sync -f" "false" "true"
+        fi
         check_cmd "native sync -f drains mounted filesystem" sync -f "$MOUNT_POINT"
         echo "INFO native sync -f is supported; open-handle remote visibility is covered by drive9 mount drain"
       else
-        check_cmd "native sync -f returns success without FUSE_SYNCFS support" sync -f "$MOUNT_POINT"
-        echo "SKIP native sync -f open-handle flush requires negotiated FUSE protocol >= 7.34"
+        check_cmd "native sync -f returns success without observed FUSE_SYNCFS dispatch" sync -f "$MOUNT_POINT"
+        echo "SKIP native sync -f open-handle flush: this mount has not observed FUSE_SYNCFS dispatch"
       fi
 
       printf "after-syncfs-%s" "$TS" > "$DRAIN_SYNC_AFTER_MOUNT"

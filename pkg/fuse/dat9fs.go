@@ -105,6 +105,10 @@ type Dat9FS struct {
 	// drainMu serializes explicit mount drain and SyncFs requests so they
 	// cannot flush the same dirty handle concurrently.
 	drainMu sync.Mutex
+	// nativeSyncFSSeen is set after the daemon receives a real FUSE SYNCFS
+	// request. Protocol minor >= 7.34 alone is not enough: some Linux FUSE
+	// mounts negotiate that version but never dispatch syncfs(2) to userspace.
+	nativeSyncFSSeen atomic.Bool
 
 	// lookupStatRetry* counters track only the Lookup->Stat retry path so
 	// operators can distinguish absorbed interrupt noise from exhausted retries
