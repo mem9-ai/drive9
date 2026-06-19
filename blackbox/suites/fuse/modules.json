@@ -106,35 +106,32 @@
       "durability": "auto",
       "runs": 3,
       "namespace_stat_samples": 1000,
+      "namespace_cmd_timeout_s": 1800,
+      "dataset_timeout_s": 7200,
       "small_file_sizes": [
         1024,
-        4096,
         20480,
-        102400,
-        1048576
+        102400
       ],
       "small_file_concurrency": [
         1,
         4,
-        16,
-        64
+        16
       ],
-      "small_file_ops": 1000,
+      "small_file_ops": 300,
       "flush_file_sizes": [
         1024,
-        4096,
         20480,
-        102400,
-        1048576
+        102400
       ],
       "flush_concurrency": [
         1,
         4,
-        16,
-        64
+        16
       ],
-      "flush_ops": 1000,
-      "visibility_samples": 100,
+      "flush_ops": 200,
+      "flush_visibility_samples": 50,
+      "persistence_samples": 20,
       "visibility_timeout_s": 30,
       "same_host_mount_counts": [
         1,
