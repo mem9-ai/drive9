@@ -11605,7 +11605,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// Determine whether we take the patch path (existing large file with
 	// dirty parts). Patch mode only needs per-part snapshots, NOT a full
 	// buffer copy — avoiding 2x memory for small edits to large files.
-	usePatch := !useDirectPUT && threshold > 0 && handleOrigSize >= threshold
+	// B11: must also check size <= handleOrigSize — if the file grew beyond
+	// OrigSize, new parts have no server-side original data and the patch
+	// callback cannot construct correct content. Consistent with write-sync
+	// path's canPatchExisting guard (line ~9912).
+	usePatch := !useDirectPUT && threshold > 0 && handleOrigSize >= threshold && size <= handleOrigSize
 
 	// Prepare patch snapshots while we still hold the lock.
 	var dirtyParts []int

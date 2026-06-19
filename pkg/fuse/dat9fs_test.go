@@ -14963,6 +14963,96 @@ func TestFlushHandle_Path2_PatchPathNoFullBufferCopy(t *testing.T) {
 	}
 }
 
+// TestFlushHandle_Path2_GrowthBypassesPatch verifies that when a large
+// existing file grows beyond OrigSize, Path 2 uses WriteStreamConditional
+// (full upload) instead of PatchFile. Without the B11 guard
+// (size <= handleOrigSize), PatchFile would be selected for a grown file,
+// but new parts beyond the original size have no server-side data, and the
+// patch callback cannot construct correct content for them.
+func TestFlushHandle_Path2_GrowthBypassesPatch(t *testing.T) {
+	var patchReceived atomic.Bool
+	var writeStreamReceived atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			patchReceived.Store(true)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"upload_id":    "test-upload-b11",
+				"upload_parts": []interface{}{},
+				"copied_parts": []interface{}{},
+			})
+			return
+		}
+		if r.Method == http.MethodPost {
+			// Multipart initiate or complete.
+			if strings.Contains(r.URL.Path, "/complete") {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+				return
+			}
+			// Initiate — WriteStreamConditional starts with POST.
+			writeStreamReceived.Store(true)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			writeStreamReceived.Store(true)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	path := "/b11-growth-no-patch.dat"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	// Existing large file (OrigSize=200), but write grows it to 400.
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev:  5,
+		OrigSize: 200, // above threshold
+	}
+
+	// Write 400 bytes — grows beyond OrigSize.
+	data := make([]byte, 400)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	fh.Lock()
+	_ = fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	// B11 assertion: growth must NOT use PatchFile. It should use
+	// WriteStreamConditional (full upload) because new parts beyond
+	// OrigSize have no server-side original data.
+	if patchReceived.Load() {
+		t.Fatal("received PATCH for grown file — B11: growth beyond OrigSize must bypass patch path and use full upload")
+	}
+}
+
 // TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock verifies that when
 // a Path 2 flush succeeds without the server returning a committed revision
 // (e.g. PatchFile / WriteStreamConditional), the synthetic revision
