@@ -15,8 +15,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 func TestParseGitLsTree(t *testing.T) {

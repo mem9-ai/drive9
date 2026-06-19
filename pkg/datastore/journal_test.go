@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/dat9/internal/testmysql"
-	"github.com/mem9-ai/dat9/pkg/journal"
+	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/journal"
 )
 
 func newJournalStore(t *testing.T) *Store {

@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/mem9-ai/dat9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testmysql"
 )
 
 var testDSN string

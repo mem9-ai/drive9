@@ -20,10 +20,10 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/mountpath"
-	"github.com/mem9-ai/dat9/pkg/pathutil"
-	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountpath"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE

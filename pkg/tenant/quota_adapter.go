@@ -6,8 +6,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/backend"
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/backend"
+	"github.com/mem9-ai/drive9/pkg/meta"
 )
 
 // metaQuotaAdapter wraps *meta.Store to satisfy backend.MetaQuotaStore.

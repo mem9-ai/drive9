@@ -1,8 +1,8 @@
 package backend
 
 import (
-	"github.com/mem9-ai/dat9/pkg/datastore"
-	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
 func (b *Dat9Backend) s3WriteEncryption(objectKey string) (s3client.EncryptionOpts, datastore.StorageEncryptionMode, string) {

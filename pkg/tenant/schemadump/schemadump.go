@@ -4,9 +4,9 @@ package schemadump
 import (
 	"fmt"
 
-	"github.com/mem9-ai/dat9/pkg/tenant"
-	tenantdb9 "github.com/mem9-ai/dat9/pkg/tenant/db9"
-	tenantschema "github.com/mem9-ai/dat9/pkg/tenant/schema"
+	"github.com/mem9-ai/drive9/pkg/tenant"
+	tenantdb9 "github.com/mem9-ai/drive9/pkg/tenant/db9"
+	tenantschema "github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
 const usage = "usage: drive9-server schema dump-init-sql --provider <db9|tidb_zero|tidb_cloud_starter|tidb_cloud_native>"

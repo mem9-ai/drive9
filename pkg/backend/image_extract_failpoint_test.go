@@ -10,8 +10,8 @@ import (
 	"github.com/pingcap/failpoint"
 )
 
-const imageExtractWritebackUpdateFileSearchTextErrorFailpoint = "github.com/mem9-ai/dat9/pkg/backend/imageExtractWritebackUpdateFileSearchTextError"
-const imageExtractWritebackQueueEmbedTaskErrorFailpoint = "github.com/mem9-ai/dat9/pkg/backend/imageExtractWritebackQueueEmbedTaskError"
+const imageExtractWritebackUpdateFileSearchTextErrorFailpoint = "github.com/mem9-ai/drive9/pkg/backend/imageExtractWritebackUpdateFileSearchTextError"
+const imageExtractWritebackQueueEmbedTaskErrorFailpoint = "github.com/mem9-ai/drive9/pkg/backend/imageExtractWritebackQueueEmbedTaskError"
 
 func TestProcessImageExtractTaskWritebackUpdateFailsWithFailpoint(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{

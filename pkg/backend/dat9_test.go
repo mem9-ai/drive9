@@ -10,10 +10,10 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
-	"github.com/mem9-ai/dat9/internal/testmysql"
-	"github.com/mem9-ai/dat9/pkg/datastore"
-	"github.com/mem9-ai/dat9/pkg/s3client"
-	"github.com/mem9-ai/dat9/pkg/semantic"
+	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/semantic"
 )
 
 func newTestBackend(t *testing.T) *Dat9Backend {

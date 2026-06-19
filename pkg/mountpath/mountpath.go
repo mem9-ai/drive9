@@ -8,7 +8,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/mem9-ai/dat9/pkg/pathutil"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 )
 
 // NormalizeRoot canonicalizes a remote root path. It must be an absolute

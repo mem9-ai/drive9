@@ -15,12 +15,12 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/go-sql-driver/mysql"
-	"github.com/mem9-ai/dat9/internal/testmysql"
-	"github.com/mem9-ai/dat9/pkg/encrypt"
-	"github.com/mem9-ai/dat9/pkg/meta"
-	"github.com/mem9-ai/dat9/pkg/s3client"
-	"github.com/mem9-ai/dat9/pkg/tenant"
-	"github.com/mem9-ai/dat9/pkg/tenant/token"
+	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/encrypt"
+	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
 
 type tenantDeleteRuntime struct {

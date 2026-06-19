@@ -8,7 +8,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
-	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 type perfFuseOp int

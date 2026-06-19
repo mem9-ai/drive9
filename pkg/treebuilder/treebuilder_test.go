@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/mem9-ai/dat9/pkg/parser"
+	"github.com/mem9-ai/drive9/pkg/parser"
 )
 
 func TestEncodeRelations(t *testing.T) {

@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/dat9/internal/testmysql"
-	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 func newControlStore(t *testing.T) *Store {

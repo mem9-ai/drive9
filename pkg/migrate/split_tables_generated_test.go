@@ -4,7 +4,7 @@ import (
 	"database/sql"
 	"testing"
 
-	"github.com/mem9-ai/dat9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testmysql"
 )
 
 // TestSplitTablesMigratorSkipGeneratedColumns verifies that when the semantic

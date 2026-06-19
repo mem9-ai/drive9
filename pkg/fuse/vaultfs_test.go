@@ -11,7 +11,7 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // fakeVaultServer is the test double for /v1/vault/read[/<name>].
@@ -486,9 +486,9 @@ func TestVaultMountReadOffsetOverflowSafe(t *testing.T) {
 	fh := openOut.Fh
 
 	for _, offset := range []uint64{
-		^uint64(0),               // math.MaxUint64
-		^uint64(0) - 10,          // near-max; offset + len(buf) wraps
-		uint64(1) << 63,          // math.MaxInt64+1 (first offset that overflows int64)
+		^uint64(0),      // math.MaxUint64
+		^uint64(0) - 10, // near-max; offset + len(buf) wraps
+		uint64(1) << 63, // math.MaxInt64+1 (first offset that overflows int64)
 	} {
 		buf := make([]byte, 64)
 		readIn := &gofuse.ReadIn{InHeader: gofuse.InHeader{NodeId: keyIno}, Fh: fh, Offset: offset, Size: uint32(len(buf))}

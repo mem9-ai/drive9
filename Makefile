@@ -41,10 +41,10 @@ TEST_P ?=
 TEST_RUN ?=
 TEST_PKGS ?= ./...
 
-BUILDINFO_LDFLAGS = -X github.com/mem9-ai/dat9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
-	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitHash=$(GIT_HASH) \
-	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
-	-X github.com/mem9-ai/dat9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
+BUILDINFO_LDFLAGS = -X github.com/mem9-ai/drive9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
+	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitHash=$(GIT_HASH) \
+	-X github.com/mem9-ai/drive9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
+	-X github.com/mem9-ai/drive9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
 .PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local e2e-local docker-build
 

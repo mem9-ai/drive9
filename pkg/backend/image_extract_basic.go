@@ -10,9 +10,9 @@ import (
 	_ "image/png"
 	"strings"
 
-	"github.com/mem9-ai/dat9/pkg/logger"
-	"github.com/mem9-ai/dat9/pkg/metrics"
-	"github.com/mem9-ai/dat9/pkg/pathutil"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"go.uber.org/zap"
 )
 

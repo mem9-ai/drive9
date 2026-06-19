@@ -10,10 +10,10 @@ import (
 
 	"github.com/pingcap/failpoint"
 
-	"github.com/mem9-ai/dat9/pkg/semantic"
+	"github.com/mem9-ai/drive9/pkg/semantic"
 )
 
-const semanticTaskLeaseNowFailpoint = "github.com/mem9-ai/dat9/pkg/datastore/semanticTaskLeaseNow"
+const semanticTaskLeaseNowFailpoint = "github.com/mem9-ai/drive9/pkg/datastore/semanticTaskLeaseNow"
 
 func enableSemanticTaskLeaseNowFailpoint(t *testing.T, now time.Time) {
 	t.Helper()

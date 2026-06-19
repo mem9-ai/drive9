@@ -3,7 +3,7 @@ package schema
 import (
 	"testing"
 
-	"github.com/mem9-ai/dat9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testmysql"
 )
 
 func TestGitWorkspaceTiDBSchemaStatementsExecuteInMySQL(t *testing.T) {

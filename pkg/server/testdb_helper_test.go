@@ -7,9 +7,9 @@ import (
 	"testing"
 
 	"github.com/go-sql-driver/mysql"
-	"github.com/mem9-ai/dat9/pkg/encrypt"
-	"github.com/mem9-ai/dat9/pkg/meta"
-	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/encrypt"
+	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
 // testDBInfo holds parsed connection parameters from testDSN for tests that

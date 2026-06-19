@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mem9-ai/dat9/pkg/backend"
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/backend"
+	"github.com/mem9-ai/drive9/pkg/meta"
 )
 
 func TestVersionTextUsesDrive9ServerComponent(t *testing.T) {

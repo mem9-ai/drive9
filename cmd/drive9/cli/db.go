@@ -10,7 +10,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // Create provisions a new tenant and registers the returned API key as a

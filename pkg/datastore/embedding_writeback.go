@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/embedding"
+	"github.com/mem9-ai/drive9/pkg/embedding"
 )
 
 // UpdateFileEmbedding conditionally writes an embedding for the current file revision.
