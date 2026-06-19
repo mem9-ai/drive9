@@ -258,7 +258,11 @@ go test -race ./pkg/fuse ./pkg/backend ./pkg/server
 Focused end-to-end suites live under `e2e/`, including FUSE write/read gates,
 Git workflow gates, portable pack/unpack, and LayerFS smoke tests.
 
-The Go module path is `github.com/mem9-ai/drive9`.
+The Go module path is `github.com/mem9-ai/drive9`. The old
+`github.com/mem9-ai/dat9` path is intentionally unsupported after this module
+rename; update Go imports and `go get` commands to the Drive9 path. This PR does
+not rename legacy `X-Dat9-*` wire headers or internal `Dat9` implementation
+identifiers.
 
 ## License
 

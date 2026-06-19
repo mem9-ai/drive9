@@ -10,6 +10,21 @@ For CLI parity analysis, see
 The Go module path is `github.com/mem9-ai/drive9`, so Go imports use
 `github.com/mem9-ai/drive9/pkg/client`.
 
+## Module path compatibility
+
+This repository now declares `module github.com/mem9-ai/drive9`. The previous
+`github.com/mem9-ai/dat9` module path is intentionally unsupported after this
+change; Go consumers must update imports and `go get` commands to
+`github.com/mem9-ai/drive9`. This is an accepted breaking change for the module
+path cleanup because there were no known existing consumers importing the old
+`github.com/mem9-ai/dat9` path before this rename.
+
+This module-path cleanup does not rename the wire protocol or historical
+implementation identifiers. Legacy HTTP headers such as `X-Dat9-*`, token
+compatibility names such as `dat9_*`, and internal code identifiers such as
+`Dat9Backend` are outside the scope of this PR and remain unchanged for protocol
+compatibility.
+
 ## Prerequisites
 
 - Go 1.25.1 or newer.
@@ -573,8 +588,8 @@ catching up or the embedding backend is disabled.
   ambiguity.
 - Keep API keys out of logs and command arguments. Prefer environment variables
   or a secret manager.
-- The SDK sends credentials as `Authorization: Bearer <token>`.
-- Cross-host redirects strip `Authorization` and `X-Dat9-Actor` before following
-  the redirect.
+- The SDK sends credentials in the standard HTTP `Authorization` header.
+- Cross-host redirects strip credentials and legacy actor metadata before
+  following the redirect.
 - `StatusError.Message` is server-provided when the server returns a structured
   error body.
