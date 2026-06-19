@@ -212,19 +212,28 @@ class Drive9KimiPerf(BaseModule):
                 shutil.rmtree(data_dir)
             data_dir.mkdir()
             started = time.perf_counter()
-            result = self.generate_dataset(
-                data_dir,
-                layout,
-                int(scale["bytes"]),
-                int(scale["files"]),
-                float(cfg["dataset_timeout_s"]),
-                manifest,
-                expected,
-            )
+            try:
+                result = self.generate_dataset(
+                    data_dir,
+                    layout,
+                    int(scale["bytes"]),
+                    int(scale["files"]),
+                    float(cfg["dataset_timeout_s"]),
+                    manifest,
+                    expected,
+                )
+            except OSError as exc:
+                result = {
+                    "completed": False,
+                    "created_files": 0,
+                    "created_bytes": 0,
+                    "detail": f"I/O error during dataset generation: {exc}",
+                    "error": True,
+                }
             seconds = time.perf_counter() - started
             row.update(
                 {
-                    "status": "ok" if result["completed"] else "timeout",
+                    "status": "ok" if result["completed"] else ("error" if result.get("error") else "timeout"),
                     "created_files": result["created_files"],
                     "created_bytes": result["created_bytes"],
                     "count": result["created_files"],
@@ -267,18 +276,22 @@ class Drive9KimiPerf(BaseModule):
             size = base + (1 if idx < extra else 0)
             parent = data_dir if layout == "single" else data_dir / f"shard-{idx // 1000:05d}"
             parent.mkdir(parents=True, exist_ok=True)
-            self.write_payload(parent / f"file-{idx:08d}.bin", payload, size)
+            try:
+                self.write_payload(parent / f"file-{idx:08d}.bin", payload, size)
+            except OSError as exc:
+                detail = f"I/O error after {created_files}/{file_count} files: {exc}"
+                self.write_dataset_manifest(manifest, manifest_base, created_files, created_bytes, time.perf_counter() - started, False, detail)
+                return {"completed": False, "created_files": created_files, "created_bytes": created_bytes, "detail": detail, "error": True}
             created_files += 1
             created_bytes += size
             if created_files in checkpoints:
                 progress(f"kimi dataset progress: {created_files}/{file_count}")
-                self.write_dataset_manifest(manifest, manifest_base, created_files, created_bytes, time.perf_counter() - started, False, "in progress")
         detail = "completed"
         self.write_dataset_manifest(manifest, manifest_base, created_files, created_bytes, time.perf_counter() - started, True, detail)
         return {"completed": True, "created_files": created_files, "created_bytes": created_bytes, "detail": detail}
 
     @staticmethod
-    def write_dataset_manifest(manifest: Path, base: dict[str, Any], files: int, bytes_written: int, seconds: float, completed: bool, detail: str) -> None:
+    def write_dataset_manifest(manifest: Path, base: dict[str, Any], files: int, bytes_written: int, seconds: float, completed: bool, detail: str) -> bool:
         value = {
             **base,
             "created_files": files,
@@ -288,7 +301,11 @@ class Drive9KimiPerf(BaseModule):
             "detail": detail,
             "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
-        manifest.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        try:
+            manifest.write_text(json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            return True
+        except OSError:
+            return False
 
     @staticmethod
     def write_payload(path: Path, payload: bytes, size: int) -> None:
