@@ -147,7 +147,6 @@ func decodeForkRequest(w http.ResponseWriter, r *http.Request) (forkRequest, err
 		return req, nil
 	}
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
 		return req, fmt.Errorf("invalid JSON body: %w", err)
 	}
@@ -817,20 +816,7 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 
 	if t.Status == meta.TenantDeleting {
 		if t.Provider == tenant.ProviderTiDBCloudNative {
-			if t.BranchID != "" {
-				credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
-				if err != nil {
-					errJSON(w, http.StatusBadRequest, err.Error())
-					return
-				}
-			}
-			if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
-				errJSON(w, http.StatusBadGateway, fmt.Sprintf("fork delete cleanup failed: %v", err))
-				return
-			}
-			_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
-			w.WriteHeader(http.StatusAccepted)
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleted)})
+			s.cleanupNativeFork(w, r, t, credentialReq)
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
@@ -838,20 +824,7 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if t.Provider == tenant.ProviderTiDBCloudNative && t.Status == meta.TenantFailed {
-		if t.BranchID != "" {
-			credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
-			if err != nil {
-				errJSON(w, http.StatusBadRequest, err.Error())
-				return
-			}
-		}
-		if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("fork delete cleanup failed: %v", err))
-			return
-		}
-		_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
-		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleted)})
+		s.cleanupNativeFork(w, r, t, credentialReq)
 		return
 	}
 	updated, err := s.meta.UpdateTenantStatusIf(r.Context(), t.ID, t.Status, meta.TenantDeleting)
@@ -865,26 +838,36 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if t.Provider == tenant.ProviderTiDBCloudNative {
-		if t.BranchID != "" {
-			credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
-			if err != nil {
-				errJSON(w, http.StatusBadRequest, err.Error())
-				return
-			}
-		}
-		if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("fork delete cleanup failed: %v", err))
-			return
-		}
-		_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
-		w.WriteHeader(http.StatusAccepted)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleted)})
+		s.cleanupNativeFork(w, r, t, credentialReq)
 		return
 	}
 	_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
 	s.startForkCleanup(r.Context(), t.ID)
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleting)})
+}
+
+func (s *Server) cleanupNativeFork(w http.ResponseWriter, r *http.Request, t *meta.Tenant, credentialReq *tenant.CredentialProvisionRequest) {
+	if t.BranchID != "" {
+		if credentialReq == nil {
+			errJSON(w, http.StatusBadRequest, "TiDB Cloud credentials are required to delete the fork branch")
+			return
+		}
+		var err error
+		credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
+		if err != nil {
+			errJSON(w, http.StatusBadRequest, "invalid or missing TiDB Cloud credentials")
+			return
+		}
+	}
+	if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
+		logger.Error(r.Context(), "native_fork_cleanup_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+		errJSON(w, http.StatusBadGateway, "fork delete cleanup failed")
+		return
+	}
+	_ = s.meta.RevokeTenantAPIKeys(r.Context(), t.ID)
+	w.WriteHeader(http.StatusAccepted)
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleted)})
 }
 
 func (s *Server) cleanupForkTenant(ctx context.Context, tenantID string) {

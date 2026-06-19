@@ -304,20 +304,24 @@ func waitForCondition(t *testing.T, fn func() bool) {
 	t.Fatal("condition did not become true")
 }
 
-func TestDecodeForkRequestRejectsUnknownFieldsAndTrailingData(t *testing.T) {
+func TestDecodeForkRequestIgnoresUnknownFieldsAndRejectsTrailingData(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		body string
-		want string
+		name    string
+		body    string
+		reject  bool
+		wantMsg string
 	}{
-		{name: "unknown field", body: `{"name":"fork","publicKey":"typo"}`, want: "unknown field"},
-		{name: "trailing data", body: `{"name":"fork"} {"name":"other"}`, want: "trailing data"},
+		{name: "unknown field", body: `{"name":"fork","publicKey":"typo"}`, reject: false},
+		{name: "trailing data", body: `{"name":"fork"} {"name":"other"}`, reject: true, wantMsg: "trailing data"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodPost, "/v1/fork", strings.NewReader(tc.body))
 			_, err := decodeForkRequest(httptest.NewRecorder(), req)
-			if err == nil || !strings.Contains(err.Error(), tc.want) {
-				t.Fatalf("decodeForkRequest error = %v, want %q", err, tc.want)
+			if tc.reject && (err == nil || !strings.Contains(err.Error(), tc.wantMsg)) {
+				t.Fatalf("decodeForkRequest error = %v, want %q", err, tc.wantMsg)
+			}
+			if !tc.reject && err != nil {
+				t.Fatalf("decodeForkRequest error = %v, want nil", err)
 			}
 		})
 	}
