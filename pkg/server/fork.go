@@ -380,20 +380,12 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 
 	apiToken, err := token.IssueToken(s.tokenSecret, forkID, 1)
 	if err != nil {
-		if source.Provider == tenant.ProviderTiDBCloudNative {
-			s.markForkDeletedOrFailedAfterBranchDelete(ctx, forkID, credentialReq, cluster)
-		} else {
-			s.markForkFailedAndCleanup(ctx, forkID)
-		}
+		s.cleanupForkCreateFailure(ctx, forkID, source.Provider, credentialReq, cluster)
 		return nil, err
 	}
 	cipherToken, err := s.pool.Encrypt(ctx, []byte(apiToken))
 	if err != nil {
-		if source.Provider == tenant.ProviderTiDBCloudNative {
-			s.markForkDeletedOrFailedAfterBranchDelete(ctx, forkID, credentialReq, cluster)
-		} else {
-			s.markForkFailedAndCleanup(ctx, forkID)
-		}
+		s.cleanupForkCreateFailure(ctx, forkID, source.Provider, credentialReq, cluster)
 		return nil, err
 	}
 	if err := s.meta.InsertAPIKey(ctx, &meta.APIKey{
@@ -408,11 +400,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		CreatedAt:     time.Now().UTC(),
 		UpdatedAt:     time.Now().UTC(),
 	}); err != nil {
-		if source.Provider == tenant.ProviderTiDBCloudNative {
-			s.markForkDeletedOrFailedAfterBranchDelete(ctx, forkID, credentialReq, cluster)
-		} else {
-			s.markForkFailedAndCleanup(ctx, forkID)
-		}
+		s.cleanupForkCreateFailure(ctx, forkID, source.Provider, credentialReq, cluster)
 		return nil, err
 	}
 
@@ -692,6 +680,14 @@ func (s *Server) deleteForkBranchOrPersist(ctx context.Context, forkID string, c
 			zap.Error(perr))
 	}
 	return false
+}
+
+func (s *Server) cleanupForkCreateFailure(ctx context.Context, forkID string, provider string, credentialReq *tenant.CredentialProvisionRequest, cluster *tenant.ClusterInfo) {
+	if provider == tenant.ProviderTiDBCloudNative {
+		s.markForkDeletedOrFailedAfterBranchDelete(ctx, forkID, credentialReq, cluster)
+	} else {
+		s.markForkFailedAndCleanup(ctx, forkID)
+	}
 }
 
 func (s *Server) markForkDeletedOrFailedAfterBranchDelete(ctx context.Context, forkID string, credentialReq *tenant.CredentialProvisionRequest, cluster *tenant.ClusterInfo) {
