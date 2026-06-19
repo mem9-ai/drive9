@@ -15272,16 +15272,18 @@ func TestFlushHandle_Path2_DebounceCancelledBeforeUnlock(t *testing.T) {
 
 // TestFlushHandle_Path2_DebounceAlreadyFiredSkipsUpload verifies that when a
 // debounced callback has already fired and is blocked waiting on handle.Lock(),
-// it re-checks expectedRevision after acquiring the lock and skips the upload
-// if a forced flush (Path 2) already uploaded successfully.
+// it acquires remoteCommitLock and re-checks expectedRevision, skipping the
+// upload if a forced flush (Path 2) already uploaded successfully.
 //
 // Interleaving under test:
 //
-//	1. Schedule debounce (short delay)
-//	2. Hold handle.Lock() — callback fires but blocks on Lock()
-//	3. Forced flush (flushHandle) uploads and records committed revision
-//	4. Release handle.Lock() — callback acquires it
-//	5. Callback sees revised expectedRevision → skip (no double upload)
+//	1. Hold fh.Lock() → schedule debounce (short delay) → keep lock held
+//	2. Timer fires → callback blocks on handle.Lock() (we hold it)
+//	3. Call flushHandle (Path 2) while holding lock — Path 2 internally
+//	   releases fh.mu, uploads, records committed revision, releases
+//	   remoteCommitLock, reacquires fh.mu, returns
+//	4. fh.Unlock() → callback acquires handle.Lock() → acquires
+//	   remoteCommitLock → re-checks expectedRevision → skip (no double PUT)
 func TestFlushHandle_Path2_DebounceAlreadyFiredSkipsUpload(t *testing.T) {
 	var uploadCount atomic.Int32
 
@@ -15319,37 +15321,39 @@ func TestFlushHandle_Path2_DebounceAlreadyFiredSkipsUpload(t *testing.T) {
 	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
 	_ = fs.fileHandles.Allocate(fh)
 
-	// Step 1: Schedule debounce while holding lock.
+	// Step 1: Hold lock, schedule debounce, keep lock held.
 	fh.Lock()
 	_ = fs.flushHandleDebounced(context.Background(), fh, false)
-	fh.Unlock()
+	// Do NOT unlock — we keep fh.mu held so the callback blocks.
 
-	// Step 2: Wait for the debounce timer to fire. The callback will try
-	// handle.Lock(). We re-acquire the lock first so the callback blocks.
-	//
-	// Give timer plenty of time to fire and block on Lock().
+	// Step 2: Wait for the debounce timer to fire. The callback removes
+	// itself from the pending map and then blocks on handle.Lock().
 	time.Sleep(50 * time.Millisecond)
-	fh.Lock()
-	// At this point the debounced callback has fired (timer expired) and
-	// is blocked on handle.Lock(). Cancel() will NOT stop it because the
-	// callback already removed itself from the pending map.
+	// At this point: callback has fired, removed from pending map,
+	// blocked on handle.Lock(). Cancel() would be a no-op.
 
-	// Step 3: Force flush (Path 2) — uploads and records committed revision.
+	// Step 3: Force flush (Path 2) while holding fh.mu.
+	// flushHandle internally: acquires remoteCommitLock → releases fh.mu →
+	// uploads → records committed revision → releases remoteCommitLock →
+	// reacquires fh.mu → returns.
+	//
+	// During the fh.Unlock() window inside flushHandle, the debounced
+	// callback acquires handle.Lock() but then blocks on remoteCommitLock
+	// (which Path 2 still holds). After Path 2 finishes, callback acquires
+	// remoteCommitLock, re-checks expectedRevision, sees it changed, skips.
 	st := fs.flushHandle(context.Background(), fh)
 	fh.Unlock()
-	// Step 4: fh.Unlock() lets the debounced callback acquire handle.Lock().
-	// It should see the updated expectedRevision and skip the upload.
 
 	if st != gofuse.OK {
 		t.Fatalf("flushHandle status = %v, want OK", st)
 	}
 
-	// Step 5: Wait for debounced callback to finish.
+	// Step 4: Wait for debounced callback to finish (it should skip).
 	time.Sleep(100 * time.Millisecond)
 
 	count := uploadCount.Load()
 	if count != 1 {
-		t.Fatalf("upload count = %d, want 1 — B13: already-fired debounced callback should skip upload when expectedRevision advanced", count)
+		t.Fatalf("upload count = %d, want 1 — B13: already-fired debounced callback should be serialized by remoteCommitLock and skip when expectedRevision advanced", count)
 	}
 }
 

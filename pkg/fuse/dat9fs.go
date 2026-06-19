@@ -11275,16 +11275,22 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 			return
 		}
 
-		// B13: Re-check the expected revision after acquiring handle.Lock().
-		// A forced flush (Path 2) may have uploaded while this callback was
-		// blocked waiting for handle.Lock(). Path 2 records the committed
-		// revision to global state before releasing remoteCommitLock, and
-		// releases fh.mu before the callback can acquire it. So by the time
-		// we get here, adoptCommittedRevisionLocked will see the updated
-		// revision. If expectedRevision changed, the forced flush already
-		// uploaded — skip to avoid a double PUT with a stale CAS revision.
+		// B13: Acquire remoteCommitLock to serialize with any concurrent
+		// forced flush (Path 2). Lock ordering is handle.Lock() →
+		// remoteCommitLock — same as Write()'s fh.mu → remoteCommitLock,
+		// so no deadlock. Path 2 holds remoteCommitLock and releases fh.mu
+		// before uploading, so the callback blocks here until Path 2
+		// finishes and releases remoteCommitLock.
+		unlockRemoteCommit := fs.lockRemoteCommitPath(filePath)
+
+		// Re-check the expected revision after acquiring both locks.
+		// Path 2 records committed revision while holding remoteCommitLock,
+		// so by the time we acquire it, adoptCommittedRevisionLocked will
+		// see the updated revision. If expectedRevision changed, the
+		// forced flush already uploaded — skip to avoid double PUT.
 		currentExpectedRevision := fs.expectedRevisionForHandleLocked(handle)
 		if currentExpectedRevision != expectedRevision {
+			unlockRemoteCommit()
 			handle.Unlock()
 			return
 		}
@@ -11295,6 +11301,7 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		dCf()
 		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
 		if err != nil {
+			unlockRemoteCommit()
 			handle.Unlock()
 			log.Printf("debounced flush failed for %s: %v", filePath, err)
 			return
@@ -11303,12 +11310,13 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		modeErr := fs.applyPendingModeForHandleLocked(modeCtx, handle)
 		modeCancel()
 		if modeErr != nil {
+			unlockRemoteCommit()
 			handle.Unlock()
 			log.Printf("debounced flush pending chmod failed for %s: %v", filePath, modeErr)
 			return
 		}
-		// The handle stays locked across upload + finalize so concurrent writes
-		// cannot advance live state for data outside this committed snapshot.
+		// Record committed revision while holding remoteCommitLock, consistent
+		// with Path 2's approach (lines 11754-11770).
 		if committedRev > 0 {
 			fs.recordCommittedRevision(filePath, committedRev)
 			handle.IsNew = false
@@ -11323,6 +11331,10 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		} else {
 			fs.finalizeHandleFlushLocked(handle, expectedRevision)
 		}
+		// Release remoteCommitLock after recording revision, before
+		// releasing handle lock — same pattern as Path 2.
+		unlockRemoteCommit()
+
 		if handle.Dirty != nil && handle.DirtySeq == snapshotSeq {
 			handle.Dirty.ClearDirty()
 		}
