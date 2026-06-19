@@ -39,6 +39,34 @@ func TestPIDFilePathCanonicalizesMountPoint(t *testing.T) {
 	}
 }
 
+func TestControlSocketPathUsesUserRuntimeNamespace(t *testing.T) {
+	runtimeDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+	mountPoint := filepath.Join(t.TempDir(), "mnt")
+
+	path := ControlSocketPath(mountPoint)
+	if !strings.HasPrefix(path, runtimeDir+string(os.PathSeparator)) {
+		t.Fatalf("ControlSocketPath = %q, want under runtime dir %q", path, runtimeDir)
+	}
+	if filepath.Ext(path) != ".sock" {
+		t.Fatalf("ControlSocketPath = %q, want .sock suffix", path)
+	}
+	if got := ControlSocketPath(mountPoint); got != path {
+		t.Fatalf("ControlSocketPath unstable: first %q second %q", path, got)
+	}
+}
+
+func TestControlSocketPathFallbackIsUIDScoped(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	mountPoint := filepath.Join(t.TempDir(), "mnt")
+
+	path := ControlSocketPath(mountPoint)
+	wantDir := filepath.Join(os.TempDir(), "drive9-"+currentUID())
+	if filepath.Dir(path) != wantDir {
+		t.Fatalf("ControlSocketPath dir = %q, want %q", filepath.Dir(path), wantDir)
+	}
+}
+
 func TestWriteReadPID(t *testing.T) {
 	mountPoint := filepath.Join(t.TempDir(), "mnt")
 	pid := 12345

@@ -428,6 +428,8 @@ func usage(code int) {
 			"                         print mount profile configuration\n"+
 			"  mount [flags] [:/remote] <mountpoint>\n"+
 			"                         mount drive9 filesystem\n"+
+			"  mount drain [--timeout duration] [--json] <mountpoint>\n"+
+			"                         drain pending writes for a live FUSE mount\n"+
 			"  mount vault [flags] <mountpoint>\n"+
 			"                         mount vault secrets read-only\n"+
 			"  umount <mountpoint>    unmount a drive9 mount\n"+

@@ -24,6 +24,7 @@ const (
 	perfFuseWrite
 	perfFuseFlush
 	perfFuseFsync
+	perfFuseSyncFs
 	perfFuseRelease
 	perfFuseCreate
 	perfFuseMkdir
@@ -50,6 +51,7 @@ var perfFuseOpNames = [...]string{
 	perfFuseWrite:       "write",
 	perfFuseFlush:       "flush",
 	perfFuseFsync:       "fsync",
+	perfFuseSyncFs:      "syncfs",
 	perfFuseRelease:     "release",
 	perfFuseCreate:      "create",
 	perfFuseMkdir:       "mkdir",

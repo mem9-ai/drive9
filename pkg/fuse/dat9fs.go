@@ -102,6 +102,10 @@ type Dat9FS struct {
 	// for observability and testing. Incremented even when fs.server is nil.
 	notifyCount atomic.Int64
 
+	// drainMu serializes explicit mount drain and SyncFs requests so they
+	// cannot flush the same dirty handle concurrently.
+	drainMu sync.Mutex
+
 	// lookupStatRetry* counters track only the Lookup->Stat retry path so
 	// operators can distinguish absorbed interrupt noise from exhausted retries
 	// on the primary probe route. GetAttr and list-fallback retries intentionally

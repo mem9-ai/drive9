@@ -298,6 +298,27 @@ func (idx *PendingIndex) ListPendingPaths() map[string]struct{} {
 	return result
 }
 
+// ConflictSummary reports pending entries preserved for manual recovery after
+// terminal commit failure.
+func (idx *PendingIndex) ConflictSummary() (count int, bytes int64, firstPath string) {
+	if idx == nil {
+		return 0, 0, ""
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	for path, meta := range idx.items {
+		if meta == nil || meta.Kind != PendingConflict {
+			continue
+		}
+		if firstPath == "" {
+			firstPath = path
+		}
+		count++
+		bytes += meta.Size
+	}
+	return count, bytes, firstPath
+}
+
 // ListByPrefix returns metadata for all paths with the given prefix.
 func (idx *PendingIndex) ListByPrefix(prefix string) []*WriteBackMeta {
 	idx.mu.RLock()
