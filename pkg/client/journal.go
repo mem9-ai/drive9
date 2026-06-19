@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/mem9-ai/dat9/pkg/journal"
+	"github.com/mem9-ai/drive9/pkg/journal"
 )
 
 func (c *Client) CreateJournal(ctx context.Context, req journal.CreateRequest) (*journal.Journal, error) {

@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/datastore"
-	"github.com/mem9-ai/dat9/pkg/journal"
+	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/journal"
 )
 
 func TestJournalHTTPCreateAppendSearchVerify(t *testing.T) {

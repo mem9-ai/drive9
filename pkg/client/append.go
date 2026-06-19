@@ -11,7 +11,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
 // AppendPlan mirrors the server's response for an append-initiate request.

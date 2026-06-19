@@ -20,10 +20,10 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/mountpath"
-	"github.com/mem9-ai/dat9/pkg/pathutil"
-	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountpath"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
 // Dat9FS implements the go-fuse RawFileSystem interface, bridging FUSE
@@ -101,6 +101,10 @@ type Dat9FS struct {
 	// notifyCount tracks total kernel notify calls (EntryNotify + InodeNotify)
 	// for observability and testing. Incremented even when fs.server is nil.
 	notifyCount atomic.Int64
+
+	// drainMu serializes explicit mount drain and SyncFs requests so they
+	// cannot flush the same dirty handle concurrently.
+	drainMu sync.Mutex
 
 	// lookupStatRetry* counters track only the Lookup->Stat retry path so
 	// operators can distinguish absorbed interrupt noise from exhausted retries

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/mem9-ai/dat9/pkg/tenant/schemadump"
+	"github.com/mem9-ai/drive9/pkg/tenant/schemadump"
 )
 
 func runSchemaCommand(args []string) error {

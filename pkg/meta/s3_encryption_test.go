@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
 func TestResolveS3EncryptionPolicyInheritGlobalSSEKMS(t *testing.T) {

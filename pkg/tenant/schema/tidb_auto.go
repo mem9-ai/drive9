@@ -14,9 +14,9 @@ import (
 
 	mysql "github.com/go-sql-driver/mysql"
 
-	"github.com/mem9-ai/dat9/internal/schemaspec"
-	"github.com/mem9-ai/dat9/pkg/logger"
-	"github.com/mem9-ai/dat9/pkg/mysqlutil"
+	"github.com/mem9-ai/drive9/internal/schemaspec"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/mysqlutil"
 	"go.uber.org/zap"
 )
 

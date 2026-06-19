@@ -33,10 +33,10 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/mem9-ai/dat9/cmd/drive9/cli"
-	"github.com/mem9-ai/dat9/pkg/buildinfo"
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/drive9/cmd/drive9/cli"
+	"github.com/mem9-ai/drive9/pkg/buildinfo"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/logger"
 )
 
 var cliLogger *zap.Logger
@@ -429,6 +429,8 @@ func usage(code int) {
 			"                         print mount profile configuration\n"+
 			"  mount [flags] [:/remote] <mountpoint>\n"+
 			"                         mount drive9 filesystem\n"+
+			"  mount drain [--timeout duration] [--json] <mountpoint>\n"+
+			"                         drain pending writes for a live FUSE mount\n"+
 			"  mount vault [flags] <mountpoint>\n"+
 			"                         mount vault secrets read-only\n"+
 			"  umount <mountpoint>    unmount a drive9 mount\n"+

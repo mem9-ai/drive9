@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // FileHandle represents an open file in the FUSE filesystem.

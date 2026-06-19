@@ -16,9 +16,9 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/mountpath"
-	"github.com/mem9-ai/dat9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountpath"
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 // MountOptions configures the FUSE mount.
@@ -459,6 +459,16 @@ func Mount(opts *MountOptions) error {
 		stopWatchers()
 		return fmt.Errorf("fuse wait mount: %w", err)
 	}
+	controlServer, err := startMountControlServer(opts.MountPoint, dat9fs)
+	if err != nil {
+		stopWatchers()
+		dat9fs.FlushAll()
+		_ = server.Unmount()
+		return fmt.Errorf("start mount control socket: %w", err)
+	}
+	if controlServer != nil {
+		defer controlServer.Close()
+	}
 	stateMountPoint := opts.MountPoint
 	if absMountPoint, absErr := filepath.Abs(stateMountPoint); absErr == nil {
 		stateMountPoint = absMountPoint
@@ -492,6 +502,7 @@ func Mount(opts *MountOptions) error {
 		PprofAddr:           opts.Profiling.PprofAddr,
 		StartedAt:           time.Now().UTC().Format(time.RFC3339Nano),
 		HeapProfilePath:     opts.Profiling.HeapProfilePath,
+		ControlSocket:       controlServer.SocketPath(),
 	})
 	if err != nil {
 		stopWatchers()
@@ -593,6 +604,9 @@ func Mount(opts *MountOptions) error {
 				fmt.Fprintf(os.Stderr, "drive9: force-quit\n")
 			}
 			forceUnmount(opts.MountPoint)
+			if controlServer != nil {
+				controlServer.Close()
+			}
 			if pidFile != "" {
 				_ = os.Remove(pidFile)
 			}

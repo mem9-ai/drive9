@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/mountpath"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountpath"
 )
 
 // Exponential backoff constants for upload retries.
@@ -134,6 +134,58 @@ func (u *WriteBackUploader) PendingStats() (queued int, inFlight int) {
 		inFlight = active
 	}
 	return queued, inFlight
+}
+
+type WriteBackUploaderSnapshot struct {
+	Queued      int
+	InFlight    int
+	Cached      int
+	CachedBytes int64
+	FirstPath   string
+}
+
+func (u *WriteBackUploader) Snapshot() WriteBackUploaderSnapshot {
+	if u == nil {
+		return WriteBackUploaderSnapshot{}
+	}
+	snap := WriteBackUploaderSnapshot{Queued: len(u.uploadCh)}
+	u.inflightMu.Lock()
+	snap.InFlight = len(u.inflight)
+	for path := range u.inflight {
+		snap.FirstPath = path
+		break
+	}
+	u.inflightMu.Unlock()
+	if active := int(u.active.Load()); active > snap.InFlight {
+		snap.InFlight = active
+	}
+	if u.cache != nil {
+		var firstCachedPath string
+		snap.Cached, snap.CachedBytes, firstCachedPath = u.cache.PendingSummary()
+		if snap.FirstPath == "" {
+			snap.FirstPath = firstCachedPath
+		}
+	}
+	return snap
+}
+
+func (u *WriteBackUploader) WaitIdle(ctx context.Context) error {
+	if u == nil {
+		return nil
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		snap := u.Snapshot()
+		if snap.Queued == 0 && snap.InFlight == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // Submit enqueues a local namespace path for background upload. Blocks up to 5s if the

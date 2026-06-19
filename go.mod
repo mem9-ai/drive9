@@ -1,4 +1,4 @@
-module github.com/mem9-ai/dat9
+module github.com/mem9-ai/drive9
 
 go 1.25.1
 
@@ -121,3 +121,5 @@ require (
 	gopkg.in/ini.v1 v1.67.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/hanwen/go-fuse/v2 => github.com/mornyx/go-fuse/v2 v2.9.1-0.20260618082229-99faf5aab394

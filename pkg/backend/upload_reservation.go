@@ -7,8 +7,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/logger"
-	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"go.uber.org/zap"
 )
 
@@ -230,15 +230,15 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 //   - settled=false: no active reservation row found. This covers THREE
 //     sub-cases that are indistinguishable from the apply tx's POV and must
 //     all land on the same code path:
-//       (1) fail-open initiate — reserveUploadOnServer returned (false, nil)
-//           because the server DB was unreachable; no reserved_bytes were
-//           ever claimed and no reservation row was written.
-//       (2) already-settled terminal row — a concurrent actor (another
-//           replay attempt, CLI backfill) completed or aborted the row
-//           before we got here.
-//       (3) apply-time expiry sweep race — the row existed at initiate time
-//           but ExpireActiveReservations released it (and backed out the
-//           reserved_bytes) between initiate and this apply tx.
+//     (1) fail-open initiate — reserveUploadOnServer returned (false, nil)
+//     because the server DB was unreachable; no reserved_bytes were
+//     ever claimed and no reservation row was written.
+//     (2) already-settled terminal row — a concurrent actor (another
+//     replay attempt, CLI backfill) completed or aborted the row
+//     before we got here.
+//     (3) apply-time expiry sweep race — the row existed at initiate time
+//     but ExpireActiveReservations released it (and backed out the
+//     reserved_bytes) between initiate and this apply tx.
 //
 //     In all three sub-cases reserved_bytes is either untouched (case 1) or
 //     already balanced (cases 2, 3), so we skip the reserved→storage

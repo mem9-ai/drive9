@@ -15,16 +15,16 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
-	"github.com/mem9-ai/dat9/pkg/backend"
-	"github.com/mem9-ai/dat9/pkg/datastore"
-	"github.com/mem9-ai/dat9/pkg/logger"
-	"github.com/mem9-ai/dat9/pkg/semantic"
+	"github.com/mem9-ai/drive9/pkg/backend"
+	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/semantic"
 )
 
-const semanticWorkerBeforeFinalizeFailpoint = "github.com/mem9-ai/dat9/pkg/server/semanticWorkerBeforeFinalize"
-const semanticWorkerBeforeRenewFailpoint = "github.com/mem9-ai/dat9/pkg/server/semanticWorkerBeforeRenew"
-const semanticWorkerAfterRenewFailpoint = "github.com/mem9-ai/dat9/pkg/server/semanticWorkerAfterRenew"
-const semanticWorkerOnLeaseLostFailpoint = "github.com/mem9-ai/dat9/pkg/server/semanticWorkerOnLeaseLost"
+const semanticWorkerBeforeFinalizeFailpoint = "github.com/mem9-ai/drive9/pkg/server/semanticWorkerBeforeFinalize"
+const semanticWorkerBeforeRenewFailpoint = "github.com/mem9-ai/drive9/pkg/server/semanticWorkerBeforeRenew"
+const semanticWorkerAfterRenewFailpoint = "github.com/mem9-ai/drive9/pkg/server/semanticWorkerAfterRenew"
+const semanticWorkerOnLeaseLostFailpoint = "github.com/mem9-ai/drive9/pkg/server/semanticWorkerOnLeaseLost"
 
 type gatedServerImageExtractor struct {
 	text string

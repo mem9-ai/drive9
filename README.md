@@ -244,6 +244,8 @@ cat ~/drive9/run-42.txt
 - [LayerFS V1 design](docs/design/layered-filesystem-v1-design.md)
 - [Pack/unpack profile spec](docs/design/pack-unpack-profile-spec.md)
 - [Git fast clone workspace design](docs/design/git-fast-clone-workspace.md)
+- [Go SDK integration guide](docs/guides/go-sdk-integration.md)
+- [Go SDK vs CLI parity notes](docs/guides/go-sdk-cli-parity.md)
 - [Vault quickstart](docs/guides/vault-quickstart.md)
 
 ## Development
@@ -256,7 +258,11 @@ go test -race ./pkg/fuse ./pkg/backend ./pkg/server
 Focused end-to-end suites live under `e2e/`, including FUSE write/read gates,
 Git workflow gates, portable pack/unpack, and LayerFS smoke tests.
 
-Note: the public project is Drive9; the Go module path is currently `github.com/mem9-ai/dat9`.
+The Go module path is `github.com/mem9-ai/drive9`. The old
+`github.com/mem9-ai/dat9` path is intentionally unsupported after this module
+rename; update Go imports and `go get` commands to the Drive9 path. This PR does
+not rename legacy `X-Dat9-*` wire headers or internal `Dat9` implementation
+identifiers.
 
 ## License
 

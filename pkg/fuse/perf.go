@@ -8,7 +8,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
-	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 type perfFuseOp int
@@ -24,6 +24,7 @@ const (
 	perfFuseWrite
 	perfFuseFlush
 	perfFuseFsync
+	perfFuseSyncFs
 	perfFuseRelease
 	perfFuseCreate
 	perfFuseMkdir
@@ -50,6 +51,7 @@ var perfFuseOpNames = [...]string{
 	perfFuseWrite:       "write",
 	perfFuseFlush:       "flush",
 	perfFuseFsync:       "fsync",
+	perfFuseSyncFs:      "syncfs",
 	perfFuseRelease:     "release",
 	perfFuseCreate:      "create",
 	perfFuseMkdir:       "mkdir",

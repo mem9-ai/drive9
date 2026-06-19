@@ -749,6 +749,19 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			},
 		},
 		{
+			Name:    "mount drain",
+			Args:    "[--timeout duration] [--json] <mountpoint>",
+			Summary: "drain pending writes for a live FUSE mount",
+			Flags: []visualHelpFlag{
+				{Name: "--timeout DURATION", Desc: "maximum time to wait for pending writes to drain; default 30s"},
+				{Name: "--json", Desc: "print structured drain result with phase timings and pending queue depths"},
+			},
+			Examples: []visualHelpExample{
+				{Command: "drive9 mount drain ./mnt --timeout=30s", Desc: "wait until a mounted filesystem is pause-ready"},
+				{Command: "drive9 mount drain ./mnt --json", Desc: "inspect queue depth, failed path, and phase timings"},
+			},
+		},
+		{
 			Name:    "mount vault",
 			Args:    "[flags] <mountpoint>",
 			Summary: "mount vault secrets read-only",

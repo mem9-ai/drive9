@@ -6,7 +6,7 @@ import (
 	"errors"
 	"io"
 
-	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // uploadBufferedRemoteFile keeps FUSE background uploads aligned with the

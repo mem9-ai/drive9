@@ -5,7 +5,7 @@ package cli
 import (
 	"fmt"
 
-	drive9fuse "github.com/mem9-ai/dat9/pkg/fuse"
+	drive9fuse "github.com/mem9-ai/drive9/pkg/fuse"
 )
 
 func mountFuseImpl(opts *mountFuseOptions) error {
