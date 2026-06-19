@@ -817,10 +817,12 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 
 	if t.Status == meta.TenantDeleting {
 		if t.Provider == tenant.ProviderTiDBCloudNative {
-			credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
-			if err != nil {
-				errJSON(w, http.StatusBadRequest, err.Error())
-				return
+			if t.BranchID != "" {
+				credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
+				if err != nil {
+					errJSON(w, http.StatusBadRequest, err.Error())
+					return
+				}
 			}
 			if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
 				errJSON(w, http.StatusBadGateway, fmt.Sprintf("fork delete cleanup failed: %v", err))
@@ -836,10 +838,12 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if t.Provider == tenant.ProviderTiDBCloudNative && t.Status == meta.TenantFailed {
-		credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
-		if err != nil {
-			errJSON(w, http.StatusBadRequest, err.Error())
-			return
+		if t.BranchID != "" {
+			credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
+			if err != nil {
+				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
 			errJSON(w, http.StatusBadGateway, fmt.Sprintf("fork delete cleanup failed: %v", err))
@@ -861,10 +865,12 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if t.Provider == tenant.ProviderTiDBCloudNative {
-		credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
-		if err != nil {
-			errJSON(w, http.StatusBadRequest, err.Error())
-			return
+		if t.BranchID != "" {
+			credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
+			if err != nil {
+				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
 			errJSON(w, http.StatusBadGateway, fmt.Sprintf("fork delete cleanup failed: %v", err))
