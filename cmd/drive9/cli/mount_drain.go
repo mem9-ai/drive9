@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/mountcontrol"
-	"github.com/mem9-ai/dat9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 type mountDrainDeps struct {

@@ -7,7 +7,7 @@ import (
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
 
-	"github.com/mem9-ai/dat9/pkg/mountcontrol"
+	"github.com/mem9-ai/drive9/pkg/mountcontrol"
 )
 
 func newTestDrainFS() *Dat9FS {
