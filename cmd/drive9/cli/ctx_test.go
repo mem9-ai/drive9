@@ -1484,7 +1484,7 @@ func TestCtxForkPreservesModeMetadataForSubsequentEnvCredentialFork(t *testing.T
 		PrivateKey string `json:"private_key"`
 	}{}
 	if _, err := captureStdoutE(t, func() error {
-		return Ctx([]string{"fork", "child"})
+		return Ctx([]string{"fork", "child", "--from", "exp"})
 	}); err != nil {
 		t.Fatalf("ctx fork child: %v", err)
 	}
