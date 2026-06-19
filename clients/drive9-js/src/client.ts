@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { bodyInit } from "./compat.js";
 import { checkError, ConflictError, Drive9Error, StatusError } from "./error.js";
-import type { FileInfo, SearchResult, StatResult } from "./models.js";
+import type { FileInfo, SearchResult, StatMetadataResult, StatResult } from "./models.js";
 import { patchFileImpl, type ProgressFn, type ReadPartFn } from "./patch.js";
 import { StreamWriter } from "./stream.js";
 import { readStreamImpl, readStreamRangeImpl, resumeUploadImpl, writeStreamImpl } from "./transfer.js";
@@ -139,6 +139,31 @@ export class Client {
       isDir: resp.headers.get("x-dat9-isdir") === "true",
       revision,
       mtime,
+    };
+  }
+
+  async statMetadata(path: string): Promise<StatMetadataResult> {
+    const resp = await fetch(`${this.fsUrl(path)}?stat=1`, { headers: this.authHeaders() });
+    await checkError(resp);
+    const body = (await resp.json()) as {
+      size?: number;
+      isdir?: boolean;
+      resource_id?: string;
+      revision?: number;
+      mtime?: number;
+      content_type?: string;
+      semantic_text?: string;
+      tags?: Record<string, string>;
+    };
+    return {
+      size: body.size ?? 0,
+      isDir: body.isdir ?? false,
+      resourceId: body.resource_id ?? "",
+      revision: body.revision ?? 0,
+      mtime: body.mtime != null ? new Date(body.mtime * 1000) : undefined,
+      contentType: body.content_type ?? "",
+      semanticText: body.semantic_text ?? "",
+      tags: body.tags ?? {},
     };
   }
 

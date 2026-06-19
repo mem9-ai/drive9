@@ -77,6 +77,7 @@ Environment variables `DRIVE9_SERVER` and `DRIVE9_API_KEY` override values from 
 | Read file | `client.read(path).await` |
 | List directory | `client.list(path).await` |
 | Stat | `client.stat(path).await` |
+| Enriched stat | `client.stat_metadata(path).await` |
 | Delete | `client.delete(path).await` |
 | Copy | `client.copy(src, dst).await` |
 | Rename | `client.rename(old, new).await` |
@@ -84,6 +85,10 @@ Environment variables `DRIVE9_SERVER` and `DRIVE9_API_KEY` override values from 
 | SQL query | `client.sql(query).await` |
 | Grep | `client.grep(query, prefix, limit).await` |
 | Find | `client.find(prefix, params).await` |
+
+`stat_metadata` returns enriched file metadata - size, is_dir, resource_id,
+revision, mtime, content_type, semantic_text, and tags - by calling
+`GET /v1/fs/{path}?stat=1`.
 
 ### Streaming & multipart
 

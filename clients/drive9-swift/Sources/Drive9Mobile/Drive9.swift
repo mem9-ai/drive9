@@ -94,6 +94,23 @@ public final class Drive9Client: @unchecked Sendable {
         )
     }
 
+    public func statMetadata(path: String) async throws -> Drive9StatMetadataResult {
+        var components = URLComponents(url: fsUrl(path), resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "stat", value: "1")]
+        let response = try await send(makeRequest(method: "GET", url: components.url!))
+        let obj = try parseJson(response.data) as? [String: Any] ?? [:]
+        return Drive9StatMetadataResult(
+            size: int64(obj["size"]) ?? 0,
+            isDir: obj["isdir"] as? Bool ?? false,
+            resourceId: obj["resource_id"] as? String ?? "",
+            revision: int64(obj["revision"]) ?? 0,
+            mtimeUnix: int64(obj["mtime"]),
+            contentType: obj["content_type"] as? String ?? "",
+            semanticText: obj["semantic_text"] as? String ?? "",
+            tags: stringMap(obj["tags"])
+        )
+    }
+
     public func delete(path: String) async throws {
         _ = try await send(makeRequest(method: "DELETE", url: fsUrl(path)))
     }
@@ -991,6 +1008,28 @@ public struct Drive9StatResult: Equatable, Hashable, Sendable {
         self.isDir = isDir
         self.revision = revision
         self.mtimeUnix = mtimeUnix
+    }
+}
+
+public struct Drive9StatMetadataResult: Equatable, Hashable, Sendable {
+    public var size: Int64
+    public var isDir: Bool
+    public var resourceId: String
+    public var revision: Int64
+    public var mtimeUnix: Int64?
+    public var contentType: String
+    public var semanticText: String
+    public var tags: [String: String]
+
+    public init(size: Int64, isDir: Bool, resourceId: String, revision: Int64, mtimeUnix: Int64?, contentType: String, semanticText: String, tags: [String: String]) {
+        self.size = size
+        self.isDir = isDir
+        self.resourceId = resourceId
+        self.revision = revision
+        self.mtimeUnix = mtimeUnix
+        self.contentType = contentType
+        self.semanticText = semanticText
+        self.tags = tags
     }
 }
 

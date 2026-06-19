@@ -13,6 +13,17 @@ export interface StatResult {
   mtime?: Date;
 }
 
+export interface StatMetadataResult {
+  size: number;
+  isDir: boolean;
+  resourceId: string;
+  revision: number;
+  mtime?: Date;
+  contentType: string;
+  semanticText: string;
+  tags: Record<string, string>;
+}
+
 export interface SearchResult {
   path: string;
   name: string;

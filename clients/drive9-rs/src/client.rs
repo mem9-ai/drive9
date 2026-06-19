@@ -1,5 +1,5 @@
 use crate::error::{check_error, Drive9Error};
-use crate::models::{FileInfo, SearchResult, StatResult};
+use crate::models::{FileInfo, SearchResult, StatMetadataResult, StatResult};
 use crate::stream::StreamWriter;
 
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
@@ -226,6 +226,17 @@ impl Client {
             revision,
             mtime,
         })
+    }
+
+    pub async fn stat_metadata(&self, path: &str) -> Result<StatMetadataResult, Drive9Error> {
+        let resp = self
+            .http
+            .get(format!("{}?stat=1", self.fs_url(path)))
+            .headers(self.auth_headers())
+            .send()
+            .await?;
+        let resp = check_error(resp).await?;
+        Ok(resp.json().await?)
     }
 
     pub async fn delete(&self, path: &str) -> Result<(), Drive9Error> {

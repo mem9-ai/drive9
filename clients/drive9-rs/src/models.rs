@@ -19,6 +19,19 @@ pub struct StatResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct StatMetadataResult {
+    pub size: i64,
+    #[serde(rename = "isdir")]
+    pub is_dir: bool,
+    pub resource_id: String,
+    pub revision: i64,
+    pub mtime: Option<i64>,
+    pub content_type: String,
+    pub semantic_text: String,
+    pub tags: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct SearchResult {
     pub path: String,
     pub name: String,
