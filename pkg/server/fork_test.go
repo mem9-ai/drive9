@@ -765,3 +765,78 @@ func TestHandleForkDeleteNativeFailedBranchIDEmptyNoCredentialsDeletesLocally(t 
 		t.Fatalf("deleted branches = %#v, want none", deleted)
 	}
 }
+
+type defaultCredentialsProvisioner struct {
+	*fakeBranchProvisioner
+	creds tenant.CredentialProvisionRequest
+}
+
+func (d *defaultCredentialsProvisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, bool) {
+	return d.creds, true
+}
+
+func TestHandleForkDeleteNativeUsesDefaultCredentialsWhenRequestLacksKey(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertTenantWithProvider(t, "fork-native-def", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
+	if _, err := rt.meta.DB().ExecContext(context.Background(),
+		`UPDATE tenants SET db_host = '', db_port = 0, db_user = '' WHERE id = ?`, "fork-native-def"); err != nil {
+		t.Fatal(err)
+	}
+
+	defaultCreds := tenant.CredentialProvisionRequest{PublicKey: "default-pk", PrivateKey: "default-sk"}
+	rt.server.provisioner = &defaultCredentialsProvisioner{fakeBranchProvisioner: rt.prov, creds: defaultCreds}
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/fork", strings.NewReader(`{}`))
+	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "fork-native-def"}))
+	rr := httptest.NewRecorder()
+	rt.server.handleForkDelete(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := rt.meta.GetTenant(context.Background(), "fork-native-def")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantDeleted {
+		t.Fatalf("status = %s, want %s", got.Status, meta.TenantDeleted)
+	}
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-a" {
+		t.Fatalf("deleted branches = %#v", deleted)
+	}
+	creds := rt.prov.credentialRequests()
+	if len(creds) == 0 {
+		t.Fatal("DeleteBranchWithCredentials was not called")
+	}
+	last := creds[len(creds)-1]
+	if last.PublicKey != "default-pk" || last.PrivateKey != "default-sk" {
+		t.Fatalf("credential request = %+v", last)
+	}
+}
+
+func TestHandleForkDeleteNativeRejectsWhenNoCredentialsAvailable(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertTenantWithProvider(t, "fork-native-noc", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
+	if _, err := rt.meta.DB().ExecContext(context.Background(),
+		`UPDATE tenants SET db_host = '', db_port = 0, db_user = '' WHERE id = ?`, "fork-native-noc"); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/fork", strings.NewReader(`{}`))
+	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "fork-native-noc"}))
+	rr := httptest.NewRecorder()
+	rt.server.handleForkDelete(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, "private") || strings.Contains(body, "default") {
+		t.Fatalf("response body = %s", body)
+	}
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 0 {
+		t.Fatalf("deleted branches = %#v", deleted)
+	}
+}
