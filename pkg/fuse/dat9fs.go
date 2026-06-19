@@ -11579,15 +11579,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		return gofuse.OK
 	}
 
-	// Path 2: No streaming uploader or small file — materialize all data for upload.
-	//
-	// Snapshot the dirty buffer into an immutable copy before releasing fh.mu.
-	// bytesView() may return a mutable slice backed by the WriteBuffer's
-	// internal smallFileData; concurrent Write() calls while the lock is
-	// released would corrupt the upload payload. Path 1a/1b already follow
-	// this pattern (copy + unlock before network).
-	dataCopy := make([]byte, fh.Dirty.Size())
-	copy(dataCopy, fh.Dirty.bytesView())
+	// Path 2: No streaming uploader or small file — materialize data for upload.
 
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
 	remotePath := fs.remotePath(fh.Path)
@@ -11610,10 +11602,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	threshold := fs.negotiatedInlineThreshold()
 	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
 
+	// Determine whether we take the patch path (existing large file with
+	// dirty parts). Patch mode only needs per-part snapshots, NOT a full
+	// buffer copy — avoiding 2x memory for small edits to large files.
+	usePatch := !useDirectPUT && threshold > 0 && handleOrigSize >= threshold
+
 	// Prepare patch snapshots while we still hold the lock.
 	var dirtyParts []int
 	var partSnapshots map[int][]byte
-	if !useDirectPUT && threshold > 0 && handleOrigSize >= threshold {
+	if usePatch {
 		dirtyParts = fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {
 			partSnapshots = make(map[int][]byte, len(dirtyParts))
@@ -11626,6 +11623,22 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 				}
 			}
 		}
+	}
+
+	// Snapshot the dirty buffer into an immutable copy before releasing fh.mu.
+	// bytesView() may return a mutable slice backed by the WriteBuffer's
+	// internal smallFileData; concurrent Write() calls while the lock is
+	// released would corrupt the upload payload.
+	//
+	// B9: Only build dataCopy for paths that actually need the full buffer
+	// (direct PUT, WriteStreamConditional, sidecar/read cache seeding).
+	// Patch mode uses per-part snapshots above and never reads dataCopy
+	// for the upload itself. Post-upload cache seeding for patch mode
+	// (committedRev == 0) does not seed the read cache with full data.
+	var dataCopy []byte
+	if !usePatch {
+		dataCopy = make([]byte, fh.Dirty.Size())
+		copy(dataCopy, fh.Dirty.bytesView())
 	}
 
 	// Lock ordering fix (B3): Release fh.mu but keep remoteCommitLock
@@ -11665,7 +11678,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(dataCopy)))
 			fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", handlePath, size, committedRev, err)
 		}
-	} else if threshold > 0 && handleOrigSize >= threshold {
+	} else if usePatch {
 		phase = "patch-file"
 		if len(dirtyParts) > 0 {
 			patchStart := time.Now()
@@ -11722,6 +11735,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			fs.recordCommittedRevision(handlePath, committedRev)
 		}
 	}
+	// B10: For successful uploads that don't return a server revision
+	// (PatchFile, WriteStreamConditional), derive a synthetic revision
+	// from expectedRevision and record it before releasing the commit
+	// lock. Without this, a same-path flush can acquire the lock in the
+	// gap between unlockRemoteCommit() and fh.Lock(), snapshot a stale
+	// expectedRevision, and issue a conditional upload that conflicts.
+	if err == nil && committedRev == 0 {
+		if syntheticRev, ok := committedRevisionFromExpectedRevision(expectedRevision); ok && syntheticRev > 0 {
+			fs.recordCommittedRevision(handlePath, syntheticRev)
+		}
+	}
 
 	// Release remoteCommitLock AFTER upload + revision recording but
 	// BEFORE re-acquiring fh.mu. This preserves same-path serialization
@@ -11750,7 +11774,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// contain concurrent Write() data — using them would cache
 	// uncommitted bytes or cache under the wrong path.
 	var sidecarCached bool
-	if fs.readCache != nil && sidecarRevision > 0 && isSQLitePersistentJournalPath(handlePath) &&
+	if fs.readCache != nil && dataCopy != nil && sidecarRevision > 0 && isSQLitePersistentJournalPath(handlePath) &&
 		size <= fs.readCache.MaxFileSize() && handleFullRangeLoaded {
 		fs.readCache.Put(handlePath, dataCopy, sidecarRevision)
 		sidecarCached = true

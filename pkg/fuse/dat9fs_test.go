@@ -14871,6 +14871,183 @@ func TestFlushHandle_Path2_RetargetSkipsDirCacheForOldPath(t *testing.T) {
 	}
 }
 
+// TestFlushHandle_Path2_PatchPathNoFullBufferCopy verifies that the patch
+// path (existing large file with dirty parts) does NOT build a full-buffer
+// dataCopy. Before the B9 fix, dataCopy was unconditionally allocated for
+// all Path 2 flushes, causing 2x memory use for small edits to large files.
+// This test verifies the patch path works correctly without dataCopy by
+// confirming it uses PATCH (not PUT) and completes successfully.
+func TestFlushHandle_Path2_PatchPathNoFullBufferCopy(t *testing.T) {
+	var patchReceived atomic.Bool
+	var putReceived atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			patchReceived.Store(true)
+			_, _ = io.ReadAll(r.Body)
+			// Return a patch plan with no parts to upload (all clean).
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"upload_id":    "test-upload-b9",
+				"upload_parts": []interface{}{},
+				"copied_parts": []interface{}{},
+			})
+			return
+		}
+		if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/complete") {
+			// Complete upload endpoint.
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		if r.Method == http.MethodPut {
+			putReceived.Store(true)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 10})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	// Set inline threshold low so the file is treated as "large".
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	path := "/b9-patch-no-full-copy.dat"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	// Create a handle with OrigSize above threshold (existing large file).
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev:  5,
+		OrigSize: 200, // above threshold → patch path
+	}
+
+	// Write some data to make it dirty.
+	data := make([]byte, 200)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+
+	// B9 assertion: The flush should have used PATCH (not PUT) for this
+	// existing large file, confirming the patch path was taken. The patch
+	// path uses partSnapshots (per-dirty-part copies) instead of a full
+	// dataCopy, avoiding 2x memory for large files with small edits.
+	if !patchReceived.Load() {
+		t.Fatal("expected PATCH request for existing large file above threshold — patch path not taken")
+	}
+	if putReceived.Load() {
+		t.Fatal("received PUT for existing large file — should use patch path, not direct PUT")
+	}
+}
+
+// TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock verifies that when
+// a Path 2 flush succeeds without the server returning a committed revision
+// (e.g. PatchFile / WriteStreamConditional), the synthetic revision
+// (expectedRevision + 1) is recorded to committedRev BEFORE releasing
+// the per-path remote commit lock. Without this (B10), a same-path flush
+// could acquire the lock, snapshot a stale expectedRevision, and issue a
+// conditional upload that conflicts with the just-completed one.
+func TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			// Return OK WITHOUT a revision — simulates WriteStreamConditional.
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	path := "/b10-synthetic-rev.txt"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    path,
+		Dirty:   NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev: 5,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	close(uploadResume)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+
+	// B10 assertion: The synthetic revision (expectedRevision + 1 = 6)
+	// must be recorded in committedRev. Without the B10 fix, committedRev
+	// was only recorded for server-returned revisions (committedRev > 0),
+	// leaving a window where a same-path flush could snapshot stale state.
+	fs.committedMu.Lock()
+	recordedRev := fs.committedRev[path]
+	fs.committedMu.Unlock()
+
+	expectedSyntheticRev := int64(6) // BaseRev(5) + 1
+	if recordedRev != expectedSyntheticRev {
+		t.Fatalf("committedRev[%q] = %d, want %d — B10: synthetic revision must be recorded before releasing remote commit lock",
+			path, recordedRev, expectedSyntheticRev)
+	}
+}
+
 func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
