@@ -11275,6 +11275,20 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 			return
 		}
 
+		// B13: Re-check the expected revision after acquiring handle.Lock().
+		// A forced flush (Path 2) may have uploaded while this callback was
+		// blocked waiting for handle.Lock(). Path 2 records the committed
+		// revision to global state before releasing remoteCommitLock, and
+		// releases fh.mu before the callback can acquire it. So by the time
+		// we get here, adoptCommittedRevisionLocked will see the updated
+		// revision. If expectedRevision changed, the forced flush already
+		// uploaded — skip to avoid a double PUT with a stale CAS revision.
+		currentExpectedRevision := fs.expectedRevisionForHandleLocked(handle)
+		if currentExpectedRevision != expectedRevision {
+			handle.Unlock()
+			return
+		}
+
 		dCtx, dCf := context.WithTimeout(context.Background(), fuseTimeout)
 		writeStart := fs.perfStart()
 		committedRev, err := fs.client.WriteCtxConditionalWithRevision(dCtx, fs.remotePath(filePath), data, expectedRevision)
@@ -11672,6 +11686,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// remoteCommitLock serialization. If a debounced upload fires while
 	// fh.mu is released (steps 1-3 below), both uploads race with the same
 	// expectedRevision — whichever conditional PUT loses gets a CAS error.
+	//
+	// Cancel stops pending timers. For already-fired callbacks that are
+	// blocked waiting for handle.Lock(), the callback itself re-checks
+	// expectedRevision after acquiring the lock and skips the upload if
+	// the revision advanced (see flushHandleDebounced callback).
 	if fs.debouncer != nil {
 		fs.debouncer.Cancel(handlePath)
 	}

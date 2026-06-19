@@ -15270,6 +15270,89 @@ func TestFlushHandle_Path2_DebounceCancelledBeforeUnlock(t *testing.T) {
 	}
 }
 
+// TestFlushHandle_Path2_DebounceAlreadyFiredSkipsUpload verifies that when a
+// debounced callback has already fired and is blocked waiting on handle.Lock(),
+// it re-checks expectedRevision after acquiring the lock and skips the upload
+// if a forced flush (Path 2) already uploaded successfully.
+//
+// Interleaving under test:
+//
+//	1. Schedule debounce (short delay)
+//	2. Hold handle.Lock() — callback fires but blocks on Lock()
+//	3. Forced flush (flushHandle) uploads and records committed revision
+//	4. Release handle.Lock() — callback acquires it
+//	5. Callback sees revised expectedRevision → skip (no double upload)
+func TestFlushHandle_Path2_DebounceAlreadyFiredSkipsUpload(t *testing.T) {
+	var uploadCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			uploadCount.Add(1)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 10})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	// Very short debounce so the timer fires while we hold the lock.
+	opts.FlushDebounce = 5 * time.Millisecond
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	path := "/b13-already-fired.txt"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    path,
+		Dirty:   NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev: 5,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	// Step 1: Schedule debounce while holding lock.
+	fh.Lock()
+	_ = fs.flushHandleDebounced(context.Background(), fh, false)
+	fh.Unlock()
+
+	// Step 2: Wait for the debounce timer to fire. The callback will try
+	// handle.Lock(). We re-acquire the lock first so the callback blocks.
+	//
+	// Give timer plenty of time to fire and block on Lock().
+	time.Sleep(50 * time.Millisecond)
+	fh.Lock()
+	// At this point the debounced callback has fired (timer expired) and
+	// is blocked on handle.Lock(). Cancel() will NOT stop it because the
+	// callback already removed itself from the pending map.
+
+	// Step 3: Force flush (Path 2) — uploads and records committed revision.
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+	// Step 4: fh.Unlock() lets the debounced callback acquire handle.Lock().
+	// It should see the updated expectedRevision and skip the upload.
+
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+
+	// Step 5: Wait for debounced callback to finish.
+	time.Sleep(100 * time.Millisecond)
+
+	count := uploadCount.Load()
+	if count != 1 {
+		t.Fatalf("upload count = %d, want 1 — B13: already-fired debounced callback should skip upload when expectedRevision advanced", count)
+	}
+}
+
 func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
