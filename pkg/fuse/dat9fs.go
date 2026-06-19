@@ -11641,6 +11641,15 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// (committedRev == 0) does not seed the read cache with full data.
 	var dataCopy []byte
 	if !usePatch {
+		// B12: For the WriteStreamConditional path (grown large file), check
+		// that all parts are loaded before materializing. Lazy-loaded existing
+		// files may have unloaded remote-backed parts; bytesView() would fill
+		// them with zeroes, overwriting remote data. Consistent with write-sync
+		// path's CanMaterializeFull() guard (line ~9971).
+		if !useDirectPUT && !fh.Dirty.CanMaterializeFull() {
+			log.Printf("flushHandle cannot materialize full file for %s (path2 growth)", fh.Path)
+			return gofuse.EIO
+		}
 		dataCopy = make([]byte, fh.Dirty.Size())
 		copy(dataCopy, fh.Dirty.bytesView())
 	}
@@ -11657,6 +11666,16 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	//
 	// Concurrent Write() acquires fh.mu, then blocks on remoteCommitLock
 	// until upload finishes — linear wait, no cycle.
+	// B13: Cancel any pending debounced upload for this path before releasing
+	// fh.mu. The debouncer callback acquires handle.Lock() and calls
+	// WriteCtxConditionalWithRevision directly, without participating in
+	// remoteCommitLock serialization. If a debounced upload fires while
+	// fh.mu is released (steps 1-3 below), both uploads race with the same
+	// expectedRevision — whichever conditional PUT loses gets a CAS error.
+	if fs.debouncer != nil {
+		fs.debouncer.Cancel(handlePath)
+	}
+
 	uploadStart := time.Now()
 	fs.debugf("flushHandle path2 unlock before upload path=%s size=%d phase_hint=%s expected_rev=%d", handlePath, size, phase, expectedRevision)
 	fh.Unlock()

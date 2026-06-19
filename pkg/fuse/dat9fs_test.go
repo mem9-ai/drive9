@@ -15138,6 +15138,138 @@ func TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock(t *testing.T) {
 	}
 }
 
+// TestFlushHandle_Path2_LazyLoadedGrowthReturnsEIO verifies that when a
+// lazy-loaded existing large file grows beyond OrigSize and enters the
+// WriteStreamConditional path, flushHandle returns EIO if the buffer
+// cannot materialize all parts. Without the B12 fix, bytesView() would
+// zero-fill unloaded remote-backed parts, overwriting remote data.
+func TestFlushHandle_Path2_LazyLoadedGrowthReturnsEIO(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("should not reach server — flush should return EIO before upload")
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	path := "/b12-lazy-growth.dat"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	// Create a part-mode WriteBuffer with remoteSize > 0 (simulating
+	// a lazy-loaded existing large file where some parts are NOT loaded).
+	wb := NewWriteBuffer(path, maxPreloadSize, 256)
+	wb.remoteSize = 512 // remote has 512 bytes that are NOT loaded locally
+	wb.totalSize = 512
+
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    wb,
+		BaseRev:  5,
+		OrigSize: 200, // above threshold
+	}
+
+	// Write ONLY at offset 512 (append), growing file to 600.
+	// Parts 0 and 1 (covering bytes 0-511) are NOT loaded.
+	appendData := make([]byte, 88)
+	for i := range appendData {
+		appendData[i] = byte(i + 1)
+	}
+	if _, err := fh.Dirty.Write(512, appendData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	// Verify CanMaterializeFull is false (parts 0,1 not loaded).
+	if fh.Dirty.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull() = false for lazy-loaded buffer")
+	}
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	// B12 assertion: must return EIO, not attempt upload with zero-filled data.
+	if st == gofuse.OK {
+		t.Fatal("expected EIO for lazy-loaded growth path — B12: must not materialize unloaded remote parts as zeroes")
+	}
+	if st != gofuse.EIO {
+		t.Fatalf("expected EIO, got %v", st)
+	}
+}
+
+// TestFlushHandle_Path2_DebounceCancelledBeforeUnlock verifies that the
+// debouncer is cancelled for the flush path before releasing fh.mu.
+// Without the B13 fix, a debounced upload could fire while fh.mu is
+// released, racing with the forced flush upload using the same
+// expectedRevision and causing a CAS conflict.
+func TestFlushHandle_Path2_DebounceCancelledBeforeUnlock(t *testing.T) {
+	var uploadCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			uploadCount.Add(1)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 10})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.FlushDebounce = 50 * time.Millisecond
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	path := "/b13-debounce-cancel.txt"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    path,
+		Dirty:   NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev: 5,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	// Schedule a debounced flush first.
+	fh.Lock()
+	_ = fs.flushHandleDebounced(context.Background(), fh, false)
+	fh.Unlock()
+
+	// Now do a forced flush (flushHandle directly). This should cancel
+	// the pending debounce before releasing fh.mu.
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+
+	// Wait for debounce timer to expire. If the debounce was properly
+	// cancelled, only the forced flush upload should have occurred.
+	time.Sleep(200 * time.Millisecond)
+
+	count := uploadCount.Load()
+	if count != 1 {
+		t.Fatalf("upload count = %d, want 1 — B13: debounced upload should be cancelled before forced flush", count)
+	}
+}
+
 func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
