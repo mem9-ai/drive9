@@ -849,10 +849,6 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) cleanupNativeFork(w http.ResponseWriter, r *http.Request, t *meta.Tenant, credentialReq *tenant.CredentialProvisionRequest) {
 	if t.BranchID != "" {
-		if credentialReq == nil {
-			errJSON(w, http.StatusBadRequest, "TiDB Cloud credentials are required to delete the fork branch")
-			return
-		}
 		var err error
 		credentialReq, err = s.resolveForkCredentialRequest(t.Provider, credentialReq)
 		if err != nil {
