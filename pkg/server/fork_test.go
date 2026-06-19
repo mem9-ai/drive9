@@ -735,3 +735,29 @@ func isTableNotFoundForCleanup(err error) bool {
 	return strings.Contains(msg, "error 1146") ||
 		strings.Contains(msg, "table") && strings.Contains(msg, "doesn't exist")
 }
+
+func TestHandleForkDeleteNativeFailedBranchIDEmptyNoCredentialsDeletesLocally(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertTenantWithProvider(t, "fork-native-failed-empty-branch", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "", tenant.ProviderTiDBCloudNative)
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/fork", strings.NewReader("{}"))
+	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "fork-native-failed-empty-branch"}))
+	rr := httptest.NewRecorder()
+
+	rt.server.handleForkDelete(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status code = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := rt.meta.GetTenant(context.Background(), "fork-native-failed-empty-branch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantDeleted {
+		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleted)
+	}
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 0 {
+		t.Fatalf("deleted branches = %#v, want none", deleted)
+	}
+}

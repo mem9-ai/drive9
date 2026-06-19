@@ -1429,3 +1429,66 @@ func TestCtxAddIsSingleConfigWriter(t *testing.T) {
 		t.Errorf("expected collision error from ctxAdd")
 	}
 }
+
+func TestCtxForkPreservesModeMetadataForSubsequentEnvCredentialFork(t *testing.T) {
+	withIsolatedHome(t)
+	t.Setenv(EnvTiDBCloudPublicKey, "env-public")
+	t.Setenv(EnvTiDBCloudPrivateKey, "env-private")
+
+	var gotBody struct {
+		Name       string `json:"name"`
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"tenant_id":        "fork-tenant",
+			"api_key":          "fork-key",
+			"status":           "active",
+			"parent_tenant_id": "source-tenant",
+			"storage":          "shared",
+		})
+	}))
+	defer ts.Close()
+
+	cfg := loadConfig()
+	source := &Context{
+		Type:          PrincipalOwner,
+		APIKey:        "source-key",
+		Server:        ts.URL,
+		Mode:          "tidb_cloud_native",
+		CloudProvider: "tidbcloud",
+		Region:        "us-east1",
+	}
+	if _, err := ctxAdd(cfg, "prod", source); err != nil {
+		t.Fatalf("ctxAdd source: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	if _, err := captureStdoutE(t, func() error {
+		return Ctx([]string{"fork", "exp", "--tidbcloud-public-key", "public-1", "--tidbcloud-private-key", "private-1"})
+	}); err != nil {
+		t.Fatalf("ctx fork: %v", err)
+	}
+	if gotBody.PublicKey != "public-1" || gotBody.PrivateKey != "private-1" {
+		t.Fatalf("first fork request body = %+v", gotBody)
+	}
+
+	gotBody = struct {
+		Name       string `json:"name"`
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
+	}{}
+	if _, err := captureStdoutE(t, func() error {
+		return Ctx([]string{"fork", "child"})
+	}); err != nil {
+		t.Fatalf("ctx fork child: %v", err)
+	}
+	if gotBody.PublicKey != "env-public" || gotBody.PrivateKey != "env-private" {
+		t.Fatalf("child fork request body = %+v, want env creds", gotBody)
+	}
+}
