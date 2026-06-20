@@ -123,8 +123,10 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 // mutationMu and worker queue. Two pods can apply mutations for the same
 // tenant in different log_id order. This is a pre-existing condition — the
 // old synchronous applyLoggedQuotaMutation also had no cross-pod ordering.
-// UpsertFileMetaTx is last-writer-wins; the nightly reconciliation sweep
-// converges file_meta to the authoritative tenant DB state.
+// UpsertFileMetaTx is last-writer-wins; MutationReplayWorker replays
+// pending (unapplied) entries in (tenant_id, id) order, which handles
+// crash recovery. For cross-pod last-writer divergence on file_meta,
+// the backfill-quota tool can be run manually to reconcile.
 func (b *Dat9Backend) logAndEnqueueMutation(ctx context.Context, mutationType string, payload any, apply func(tx *sql.Tx) error) {
 	start := time.Now()
 
