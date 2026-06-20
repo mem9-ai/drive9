@@ -358,6 +358,44 @@ func TestProcessImageExtractTaskWritesContentTextAndQueuesEmbedTask(t *testing.T
 	}
 }
 
+func TestProcessImageExtractTaskDisabledSemanticWritesTextButSkipsEmbedTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		// AppSemanticTasksEnabled intentionally false — simulates deployment
+		// without DRIVE9_EMBED_* worker configured.
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: &staticImageExtractor{text: "cat on sofa screenshot invoice"},
+		},
+	})
+
+	fileID := insertImageFileForExtractTest(t, b, "/img/disabled-embed.png", "image/png", []byte("fake-png"))
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/disabled-embed.png",
+		ContentType: "image/png",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
+	}
+
+	nf, err := b.Store().Stat(context.Background(), "/img/disabled-embed.png")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /img/disabled-embed.png: %v", err)
+	}
+	if !strings.Contains(nf.File.ContentText, "cat on sofa") {
+		t.Fatalf("content_text should be written even with disabled semantic tasks, got %q", nf.File.ContentText)
+	}
+	if tasks := loadSemanticTasksForFile(t, b, fileID); len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0 when AppSemanticTasksEnabled=false", len(tasks))
+	}
+}
+
 func TestProcessImageExtractTaskStructuredJSONWritesCanonicalTextAndDrive9Tags(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		AsyncImageExtract: AsyncImageExtractOptions{
