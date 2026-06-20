@@ -548,7 +548,7 @@ func TestWriteOverwriteDoesNotDeleteInlineMarkerObject(t *testing.T) {
 }
 
 func TestConfirmUploadSkipsEmbedTaskWithoutTextSource(t *testing.T) {
-	b := newTestBackendWithS3(t)
+	b := newTestBackendWithS3AndOptions(t, Options{AppSemanticTasksEnabled: true})
 	ctx := context.Background()
 	totalSize := int64(2 << 20)
 	plan, err := b.InitiateUpload(ctx, "/bigfile.txt", totalSize)
@@ -578,7 +578,7 @@ func TestConfirmUploadSkipsEmbedTaskWithoutTextSource(t *testing.T) {
 }
 
 func TestConfirmUploadOverwriteSkipsEmbedTaskWithoutTextSourceAndRebindsUpload(t *testing.T) {
-	b := newTestBackendWithS3(t)
+	b := newTestBackendWithS3AndOptions(t, Options{AppSemanticTasksEnabled: true})
 	ctx := context.Background()
 	if _, err := b.Write("/report.txt", []byte("old body"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
@@ -1173,7 +1173,7 @@ func TestShouldEnqueueEmbedForRevisionWithAsyncImageSource(t *testing.T) {
 }
 
 func TestShouldEnqueueEmbedForRevisionWithoutTextSource(t *testing.T) {
-	b := newTestBackend(t)
+	b := newTestBackendWithOptions(t, Options{AppSemanticTasksEnabled: true})
 	if b.shouldEnqueueEmbedForRevision("/bin/a.bin", "application/octet-stream", "", "") {
 		t.Fatal("generic binary object should not enqueue embed work without text source")
 	}
