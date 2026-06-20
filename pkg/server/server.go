@@ -1403,6 +1403,14 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
+	timingEnabled := logger.BenchTimingLogEnabled()
+	var timingStart time.Time
+	var bodyReadDuration time.Duration
+	var backendWriteDuration time.Duration
+	var responseDuration time.Duration
+	if timingEnabled {
+		timingStart = time.Now()
+	}
 	if !authorizeFS(w, r, FSOpWrite, path) {
 		return
 	}
@@ -1523,8 +1531,18 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+	bodyReadStart := time.Time{}
+	if timingEnabled {
+		bodyReadStart = time.Now()
+	}
 	data, err := io.ReadAll(body)
+	if timingEnabled {
+		bodyReadDuration = time.Since(bodyReadStart)
+	}
 	if err != nil {
+		if timingEnabled {
+			logServerWriteTiming(r.Context(), path, 0, expectedRevision, 0, "body_read_error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), err)
+		}
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_too_large", "path", path, "max", s.maxUploadBytes)...)
@@ -1539,11 +1557,24 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 	description := r.Header.Get("X-Dat9-Description")
 	if utf8.RuneCountInString(description) > backend.MaxDescriptionLen {
+		if timingEnabled {
+			logServerWriteTiming(r.Context(), path, len(data), expectedRevision, 0, "validation_error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), nil)
+		}
 		errJSON(w, http.StatusBadRequest, fmt.Sprintf("description exceeds %d characters", backend.MaxDescriptionLen))
 		return
 	}
+	backendWriteStart := time.Time{}
+	if timingEnabled {
+		backendWriteStart = time.Now()
+	}
 	_, committedRevision, err := b.WriteCtxIfRevisionWithTagsResult(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags, description)
+	if timingEnabled {
+		backendWriteDuration = time.Since(backendWriteStart)
+	}
 	if err != nil {
+		if timingEnabled {
+			logServerWriteTiming(r.Context(), path, len(data), expectedRevision, 0, "error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), err)
+		}
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large_backend", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
@@ -1574,8 +1605,38 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_ok", "path", path, "bytes", len(data))...)
 	metricEvent(r.Context(), "fs_write", "result", "ok")
 	recordTenantFileBytes(r.Context(), "fs", "write", "write", int64(len(data)))
+	responseStart := time.Time{}
+	if timingEnabled {
+		responseStart = time.Now()
+	}
 	s.publishEvent(r, path, "write")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": committedRevision})
+	if timingEnabled {
+		responseDuration = time.Since(responseStart)
+		logServerWriteTiming(r.Context(), path, len(data), expectedRevision, committedRevision, "ok", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), nil)
+	}
+}
+
+func logServerWriteTiming(ctx context.Context, path string, bytes int, expectedRevision, committedRevision int64, result string, bodyReadDuration, backendWriteDuration, responseDuration, totalDuration time.Duration, err error) {
+	fields := []zap.Field{
+		zap.String("path", path),
+		zap.String("result", result),
+		zap.Int("bytes", bytes),
+		zap.Int64("expected_revision", expectedRevision),
+		zap.Int64("committed_revision", committedRevision),
+		zap.Float64("body_read_ms", serverDurationMs(bodyReadDuration)),
+		zap.Float64("backend_write_ms", serverDurationMs(backendWriteDuration)),
+		zap.Float64("response_ms", serverDurationMs(responseDuration)),
+		zap.Float64("total_ms", serverDurationMs(totalDuration)),
+	}
+	if err != nil {
+		fields = append(fields, zap.Error(err))
+	}
+	logger.InfoBenchTiming(ctx, "server_write_timing", fields...)
+}
+
+func serverDurationMs(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000.0
 }
 
 func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string) {
