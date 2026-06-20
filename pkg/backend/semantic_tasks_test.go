@@ -1151,7 +1151,7 @@ func TestCopyFileDoesNotCreateAdditionalSemanticTasks(t *testing.T) {
 }
 
 func TestShouldEnqueueEmbedForRevisionWithSynchronousText(t *testing.T) {
-	b := newTestBackend(t)
+	b := newTestBackendWithOptions(t, Options{AppSemanticTasksEnabled: true})
 	if !b.shouldEnqueueEmbedForRevision("/docs/a.txt", "text/plain", "hello world", "") {
 		t.Fatal("expected synchronous text content to enqueue embed work")
 	}
@@ -1159,6 +1159,7 @@ func TestShouldEnqueueEmbedForRevisionWithSynchronousText(t *testing.T) {
 
 func TestShouldEnqueueEmbedForRevisionWithAsyncImageSource(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
+		AppSemanticTasksEnabled: true,
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
 			Workers:   1,
@@ -1200,8 +1201,36 @@ func TestNewImgExtractTaskCarriesPayloadHints(t *testing.T) {
 }
 
 func TestShouldEnqueueEmbedForRevisionWithDescriptionOnly(t *testing.T) {
-	b := newTestBackend(t)
+	b := newTestBackendWithOptions(t, Options{AppSemanticTasksEnabled: true})
 	if !b.shouldEnqueueEmbedForRevision("/bin/a.bin", "application/octet-stream", "", "some description") {
 		t.Fatal("expected non-empty description to enqueue embed work")
+	}
+}
+
+func TestShouldEnqueueEmbedForRevision_DisabledSkipsTextContent(t *testing.T) {
+	b := newTestBackend(t) // AppSemanticTasksEnabled defaults to false
+	if b.shouldEnqueueEmbedForRevision("/docs/a.txt", "text/plain", "hello world", "") {
+		t.Fatal("should not enqueue embed task when app semantic tasks disabled")
+	}
+}
+
+func TestShouldEnqueueEmbedForRevision_DisabledSkipsDescription(t *testing.T) {
+	b := newTestBackend(t)
+	if b.shouldEnqueueEmbedForRevision("/bin/a.bin", "application/octet-stream", "", "some description") {
+		t.Fatal("should not enqueue embed task for description when app semantic tasks disabled")
+	}
+}
+
+func TestShouldEnqueueEmbedForRevision_DisabledSkipsImage(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: &staticImageExtractor{text: "caption"},
+		},
+	})
+	if b.shouldEnqueueEmbedForRevision("/img/a.png", "image/png", "", "") {
+		t.Fatal("should not enqueue embed task for image when app semantic tasks disabled")
 	}
 }

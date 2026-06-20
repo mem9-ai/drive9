@@ -79,6 +79,10 @@ type Dat9Backend struct {
 	// database-managed embedding path instead of the app-managed one for write,
 	// upload, image extraction, and grep behavior.
 	databaseAutoEmbedding bool
+	// appSemanticTasksEnabled gates whether the app-managed embed worker path
+	// may enqueue semantic_tasks. False when no DRIVE9_EMBED_* worker is
+	// configured, preventing orphaned task rows.
+	appSemanticTasksEnabled bool
 	maxUploadBytes        int64
 	maxTenantStorageBytes int64
 	maxMediaLLMFiles      int64
