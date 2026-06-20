@@ -95,6 +95,15 @@ type Dat9Backend struct {
 	storageNamespaceID string
 	metaStore          MetaQuotaStore // nil when central quota is not wired (tests, fallback)
 	quotaSource        QuotaSource    // "tenant" (default) or "server"
+	qCache             *quotaCache    // nil when central quota is not wired
+
+	// mutationQueue decouples central quota mutations (syncCentralFileCreate,
+	// syncCentralFileOverwrite) from the fsync critical path. Mutations are
+	// enqueued here and drained by a background worker. The mutation log
+	// provides crash recovery via the existing MutationReplayWorker.
+	mutationQueue chan func()
+	mutationWG    sync.WaitGroup
+	mutationStop  context.CancelFunc
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 

@@ -145,6 +145,14 @@ func (b *Dat9Backend) applyLoggedQuotaMutation(ctx context.Context, mutationType
 }
 
 func (b *Dat9Backend) syncCentralFileCreate(ctx context.Context, fileID string, sizeBytes int64, contentType string) {
+	// Detach from the request context so the mutation survives handler return.
+	bgCtx := context.Background()
+	b.enqueueMutation(func() {
+		b.syncCentralFileCreateInline(bgCtx, fileID, sizeBytes, contentType)
+	})
+}
+
+func (b *Dat9Backend) syncCentralFileCreateInline(ctx context.Context, fileID string, sizeBytes int64, contentType string) {
 	isMedia := isQuotaMediaContentType(contentType)
 	b.applyLoggedQuotaMutation(ctx, "file_create", fileCreateMutationData{
 		FileID:    fileID,
@@ -174,6 +182,14 @@ func (b *Dat9Backend) syncCentralFileCreate(ctx context.Context, fileID string, 
 }
 
 func (b *Dat9Backend) syncCentralFileOverwrite(ctx context.Context, fileID string, oldSize int64, oldContentType string, newSize int64, newContentType string) {
+	// Detach from the request context so the mutation survives handler return.
+	bgCtx := context.Background()
+	b.enqueueMutation(func() {
+		b.syncCentralFileOverwriteInline(bgCtx, fileID, oldSize, oldContentType, newSize, newContentType)
+	})
+}
+
+func (b *Dat9Backend) syncCentralFileOverwriteInline(ctx context.Context, fileID string, oldSize int64, oldContentType string, newSize int64, newContentType string) {
 	oldIsMedia := isQuotaMediaContentType(oldContentType)
 	newIsMedia := isQuotaMediaContentType(newContentType)
 	storageDelta := newSize - oldSize
@@ -214,23 +230,26 @@ func (b *Dat9Backend) syncCentralFileOverwrite(ctx context.Context, fileID strin
 }
 
 func (b *Dat9Backend) syncCentralLLMCostRecord(ctx context.Context, taskType, taskID string, costMillicents, rawUnits int64, rawUnitType string) {
-	b.applyLoggedQuotaMutation(ctx, "llm_cost_record", llmCostMutationData{
-		TaskType:       taskType,
-		TaskID:         taskID,
-		CostMillicents: costMillicents,
-		RawUnits:       rawUnits,
-		RawUnitType:    rawUnitType,
-	}, func(tx *sql.Tx) error {
-		if err := b.metaStore.InsertCentralLLMUsageTx(tx, &LLMUsageView{
-			TenantID:       b.tenantID,
+	bgCtx := context.Background()
+	b.enqueueMutation(func() {
+		b.applyLoggedQuotaMutation(bgCtx, "llm_cost_record", llmCostMutationData{
 			TaskType:       taskType,
 			TaskID:         taskID,
 			CostMillicents: costMillicents,
 			RawUnits:       rawUnits,
 			RawUnitType:    rawUnitType,
-		}); err != nil {
-			return err
-		}
-		return b.metaStore.IncrMonthlyLLMCostTx(tx, b.tenantID, costMillicents)
+		}, func(tx *sql.Tx) error {
+			if err := b.metaStore.InsertCentralLLMUsageTx(tx, &LLMUsageView{
+				TenantID:       b.tenantID,
+				TaskType:       taskType,
+				TaskID:         taskID,
+				CostMillicents: costMillicents,
+				RawUnits:       rawUnits,
+				RawUnitType:    rawUnitType,
+			}); err != nil {
+				return err
+			}
+			return b.metaStore.IncrMonthlyLLMCostTx(tx, b.tenantID, costMillicents)
+		})
 	})
 }
