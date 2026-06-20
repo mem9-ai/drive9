@@ -46,17 +46,6 @@ func isQuotaMediaContentType(contentType string) bool {
 	return strings.HasPrefix(contentType, "image/") || strings.HasPrefix(contentType, "audio/")
 }
 
-// applyLoggedQuotaMutation is the original all-in-one path: marshal → insert
-// mutation log → apply + mark applied. Used by code paths that do not need
-// async apply (e.g. upload completion, tests).
-func (b *Dat9Backend) applyLoggedQuotaMutation(ctx context.Context, mutationType string, payload any, apply func(tx *sql.Tx) error) {
-	logID, ok := b.logQuotaMutation(ctx, mutationType, payload)
-	if !ok {
-		return
-	}
-	b.applyQuotaMutation(ctx, mutationType, logID, apply)
-}
-
 // logQuotaMutation durably records a mutation in the central quota_mutation_log.
 // Returns the log ID and true on success, or (0, false) if the mutation could
 // not be logged (caller should treat as fail-open). This is the synchronous
@@ -122,7 +111,7 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 // Cross-instance ordering: in a multi-pod deployment, each pod has its own
 // mutationMu and worker queue. Two pods can apply mutations for the same
 // tenant in different log_id order. This is a pre-existing condition — the
-// old synchronous applyLoggedQuotaMutation also had no cross-pod ordering.
+// the old synchronous log+apply path also had no cross-pod ordering.
 // UpsertFileMetaTx is last-writer-wins; MutationReplayWorker replays
 // pending (unapplied) entries in (tenant_id, id) order, which handles
 // crash recovery. For cross-pod last-writer divergence on file_meta,
