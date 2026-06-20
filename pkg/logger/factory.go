@@ -141,3 +141,10 @@ func envBool(key string, fallback bool) bool {
 func resetBenchTimingLogEnabledForTest() {
 	benchTimingLogState.Store(benchTimingLogUnknown)
 }
+
+// ResetBenchTimingLogEnabledForTest clears the cached benchmark timing flag.
+// It is intended for tests in packages outside logger that need to toggle
+// DRIVE9_BENCH_TIMING_LOG_ENABLED deterministically.
+func ResetBenchTimingLogEnabledForTest() {
+	resetBenchTimingLogEnabledForTest()
+}

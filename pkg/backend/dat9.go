@@ -566,11 +566,54 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path strin
 // returns the committed revision of the file after a successful write.
 func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (n int64, committedRevision int64, err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, "write", err, start) }()
+	timingEnabled := logger.BenchTimingLogEnabled()
+	rawPath := path
+	canonicalPath := path
+	operation := "unknown"
+	result := "ok"
+	var canonicalizeDuration time.Duration
+	var statDuration time.Duration
+	var implementationDuration time.Duration
+	defer func() {
+		observeBackend(ctx, "write", err, start)
+		if !timingEnabled {
+			return
+		}
+		if err != nil {
+			result = backendWriteResult(err)
+		}
+		fields := []zap.Field{
+			zap.String("path", rawPath),
+			zap.String("canonical_path", canonicalPath),
+			zap.String("operation", operation),
+			zap.String("result", result),
+			zap.Int("bytes", len(data)),
+			zap.Int64("offset", offset),
+			zap.Int64("expected_revision", expectedRevision),
+			zap.Int64("committed_revision", committedRevision),
+			zap.Int("flags", int(flags)),
+			zap.Float64("canonicalize_ms", backendDurationMs(canonicalizeDuration)),
+			zap.Float64("stat_ms", backendDurationMs(statDuration)),
+			zap.Float64("implementation_ms", backendDurationMs(implementationDuration)),
+			zap.Float64("total_ms", backendDurationMs(time.Since(start))),
+		}
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+		}
+		logger.InfoBenchTiming(ctx, "backend_write_timing", fields...)
+	}()
 
 	tags = cloneFileTags(tags)
 
+	canonicalizeStart := time.Time{}
+	if timingEnabled {
+		canonicalizeStart = time.Now()
+	}
 	path, err = pathutil.Canonicalize(path)
+	canonicalPath = path
+	if timingEnabled {
+		canonicalizeDuration = time.Since(canonicalizeStart)
+	}
 	if err != nil {
 		return 0, 0, err
 	}
@@ -578,8 +621,16 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		return 0, 0, err
 	}
 
+	statStart := time.Time{}
+	if timingEnabled {
+		statStart = time.Now()
+	}
 	existing, err := b.store.Stat(ctx, path)
+	if timingEnabled {
+		statDuration = time.Since(statStart)
+	}
 	if err == datastore.ErrNotFound {
+		operation = "create"
 		if expectedRevision > 0 {
 			return 0, 0, datastore.ErrRevisionConflict
 		}
@@ -589,7 +640,14 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 			}
 			return 0, 0, datastore.ErrNotFound
 		}
+		implementationStart := time.Time{}
+		if timingEnabled {
+			implementationStart = time.Now()
+		}
 		n, err := b.createAndWriteCtx(ctx, path, data, tags, description)
+		if timingEnabled {
+			implementationDuration = time.Since(implementationStart)
+		}
 		if expectedRevision == 0 && errors.Is(err, datastore.ErrPathConflict) {
 			return 0, 0, datastore.ErrRevisionConflict
 		}
@@ -613,8 +671,37 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 	if expectedRevision > 0 && (existing.File == nil || existing.File.Revision != expectedRevision) {
 		return 0, 0, datastore.ErrRevisionConflict
 	}
+	operation = "overwrite"
+	implementationStart := time.Time{}
+	if timingEnabled {
+		implementationStart = time.Now()
+	}
 	n, rev, err := b.overwriteFileCtxWithRev(ctx, existing, data, offset, flags, expectedRevision, tags, description)
+	if timingEnabled {
+		implementationDuration = time.Since(implementationStart)
+	}
 	return n, rev, err
+}
+
+func backendWriteResult(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, datastore.ErrNotFound):
+		return "not_found"
+	case errors.Is(err, datastore.ErrRevisionConflict), errors.Is(err, datastore.ErrPathConflict), errors.Is(err, datastore.ErrUploadConflict):
+		return "conflict"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	default:
+		return "error"
+	}
+}
+
+func backendDurationMs(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000.0
 }
 
 func cloneFileTags(tags map[string]string) map[string]string {
@@ -628,18 +715,59 @@ func cloneFileTags(tags map[string]string) map[string]string {
 	return out
 }
 
-func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string) (int64, error) {
+func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string) (written int64, err error) {
+	timingEnabled := logger.BenchTimingLogEnabled()
+	start := time.Time{}
+	if timingEnabled {
+		start = time.Now()
+	}
+	storageType := datastore.StorageDB9
+	contentType := ""
+	var prepareDuration time.Duration
+	var s3PutDuration time.Duration
+	var tenantTxDuration time.Duration
+	var centralQuotaDuration time.Duration
+	var imageEnqueueDuration time.Duration
+	defer func() {
+		if !timingEnabled {
+			return
+		}
+		fields := []zap.Field{
+			zap.String("path", path),
+			zap.String("result", backendWriteResult(err)),
+			zap.Int("bytes", len(data)),
+			zap.Int64("written", written),
+			zap.String("storage_type", string(storageType)),
+			zap.String("content_type", contentType),
+			zap.Float64("prepare_ms", backendDurationMs(prepareDuration)),
+			zap.Float64("s3_put_ms", backendDurationMs(s3PutDuration)),
+			zap.Float64("tenant_tx_ms", backendDurationMs(tenantTxDuration)),
+			zap.Float64("central_quota_ms", backendDurationMs(centralQuotaDuration)),
+			zap.Float64("image_enqueue_ms", backendDurationMs(imageEnqueueDuration)),
+			zap.Float64("total_ms", backendDurationMs(time.Since(start))),
+		}
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+		}
+		logger.InfoBenchTiming(ctx, "backend_write_create_timing", fields...)
+	}()
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
 		return 0, err
 	}
 	fileID := b.genID()
 	now := time.Now()
 
-	contentType := detectContentType(path, data)
+	prepareStart := time.Time{}
+	if timingEnabled {
+		prepareStart = time.Now()
+	}
+	contentType = detectContentType(path, data)
 	checksum := sha256sum(data)
 	contentText := extractText(data, contentType, b.textExtractMaxBytes)
+	if timingEnabled {
+		prepareDuration = time.Since(prepareStart)
+	}
 
-	storageType := datastore.StorageDB9
 	storageRef := "inline"
 	storageEncryptionMode := datastore.StorageEncryptionNone
 	storageEncryptionKeyID := ""
@@ -655,13 +783,27 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		encOpts, encMode, encKeyID := b.s3WriteEncryption(storageRef)
 		storageEncryptionMode = encMode
 		storageEncryptionKeyID = encKeyID
+		s3PutStart := time.Time{}
+		if timingEnabled {
+			s3PutStart = time.Now()
+		}
 		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(data), int64(len(data)), encOpts); err != nil {
+			if timingEnabled {
+				s3PutDuration = time.Since(s3PutStart)
+			}
 			logger.Error(ctx, "backend_create_and_write_put_object_failed", zap.String("path", path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(data)), zap.Error(err))
 			return 0, fmt.Errorf("put object: %w", err)
+		}
+		if timingEnabled {
+			s3PutDuration = time.Since(s3PutStart)
 		}
 	}
 
 	var semanticTaskEnqueued bool
+	txStart := time.Time{}
+	if timingEnabled {
+		txStart = time.Now()
+	}
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
 		if err := b.ensureStorageQuota(ctx, tx, path, int64(len(data))); err != nil {
@@ -709,32 +851,110 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 		return nil
 	}); err != nil {
+		if timingEnabled {
+			tenantTxDuration = time.Since(txStart)
+		}
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
 		}
 		return 0, err
 	}
+	if timingEnabled {
+		tenantTxDuration = time.Since(txStart)
+	}
 	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
 	// Temporary compatibility: app embedding still relies on the legacy
 	// backend-owned image queue until its image task flow also moves to
 	// semantic_tasks.
-	if b.UsesDatabaseAutoEmbedding() {
-		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
-		return int64(len(data)), nil
+	centralQuotaStart := time.Time{}
+	if timingEnabled {
+		centralQuotaStart = time.Now()
 	}
 	b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
+	if timingEnabled {
+		centralQuotaDuration = time.Since(centralQuotaStart)
+	}
+	if b.UsesDatabaseAutoEmbedding() {
+		return int64(len(data)), nil
+	}
+	imageEnqueueStart := time.Time{}
+	if timingEnabled {
+		imageEnqueueStart = time.Now()
+	}
 	b.enqueueImageExtract(fileID, path, contentType, 1)
+	if timingEnabled {
+		imageEnqueueDuration = time.Since(imageEnqueueStart)
+	}
 	return int64(len(data)), nil
 }
 
-func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (int64, int64, error) {
+func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (written int64, newRevision int64, err error) {
+	timingEnabled := logger.BenchTimingLogEnabled()
+	start := time.Time{}
+	if timingEnabled {
+		start = time.Now()
+	}
+	path := ""
+	fileID := ""
+	oldSize := int64(0)
+	storageType := datastore.StorageDB9
+	contentType := ""
+	finalSize := int64(0)
+	var readExistingDuration time.Duration
+	var prepareDuration time.Duration
+	var s3PutDuration time.Duration
+	var tenantTxDuration time.Duration
+	var centralQuotaDuration time.Duration
+	var oldBlobCleanupDuration time.Duration
+	var imageEnqueueDuration time.Duration
+	defer func() {
+		if !timingEnabled {
+			return
+		}
+		fields := []zap.Field{
+			zap.String("path", path),
+			zap.String("file_id", fileID),
+			zap.String("result", backendWriteResult(err)),
+			zap.Int("input_bytes", len(data)),
+			zap.Int64("final_size", finalSize),
+			zap.Int64("old_size", oldSize),
+			zap.Int64("written", written),
+			zap.Int64("expected_revision", expectedRevision),
+			zap.Int64("committed_revision", newRevision),
+			zap.Int("flags", int(flags)),
+			zap.String("storage_type", string(storageType)),
+			zap.String("content_type", contentType),
+			zap.Float64("read_existing_ms", backendDurationMs(readExistingDuration)),
+			zap.Float64("prepare_ms", backendDurationMs(prepareDuration)),
+			zap.Float64("s3_put_ms", backendDurationMs(s3PutDuration)),
+			zap.Float64("tenant_tx_ms", backendDurationMs(tenantTxDuration)),
+			zap.Float64("central_quota_ms", backendDurationMs(centralQuotaDuration)),
+			zap.Float64("old_blob_cleanup_ms", backendDurationMs(oldBlobCleanupDuration)),
+			zap.Float64("image_enqueue_ms", backendDurationMs(imageEnqueueDuration)),
+			zap.Float64("total_ms", backendDurationMs(time.Since(start))),
+		}
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+		}
+		logger.InfoBenchTiming(ctx, "backend_write_overwrite_timing", fields...)
+	}()
 	if nf.File == nil {
 		return 0, 0, fmt.Errorf("no file entity")
 	}
+	path = nf.Node.Path
+	fileID = nf.File.FileID
+	oldSize = nf.File.SizeBytes
 
 	var finalData []byte
 	if flags&filesystem.WriteFlagAppend != 0 {
+		readExistingStart := time.Time{}
+		if timingEnabled {
+			readExistingStart = time.Now()
+		}
 		existing, err := b.readFileDataCtx(ctx, nf.File)
+		if timingEnabled {
+			readExistingDuration = time.Since(readExistingStart)
+		}
 		if err != nil {
 			return 0, 0, fmt.Errorf("read existing data for append: %w", err)
 		}
@@ -742,7 +962,14 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	} else if flags&filesystem.WriteFlagTruncate != 0 || offset <= 0 {
 		finalData = data
 	} else {
+		readExistingStart := time.Time{}
+		if timingEnabled {
+			readExistingStart = time.Now()
+		}
 		existing, err := b.readFileDataCtx(ctx, nf.File)
+		if timingEnabled {
+			readExistingDuration = time.Since(readExistingStart)
+		}
 		if err != nil {
 			return 0, 0, fmt.Errorf("read existing data for offset write: %w", err)
 		}
@@ -759,10 +986,17 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	if err := b.ensureUploadSizeAllowed(int64(len(finalData))); err != nil {
 		return 0, 0, err
 	}
-	contentType := detectContentType(nf.Node.Path, finalData)
+	finalSize = int64(len(finalData))
+	prepareStart := time.Time{}
+	if timingEnabled {
+		prepareStart = time.Now()
+	}
+	contentType = detectContentType(nf.Node.Path, finalData)
 	checksum := sha256sum(finalData)
 	contentText := extractText(finalData, contentType, b.textExtractMaxBytes)
-	storageType := datastore.StorageDB9
+	if timingEnabled {
+		prepareDuration = time.Since(prepareStart)
+	}
 	storageRef := "inline"
 	storageEncryptionMode := datastore.StorageEncryptionNone
 	storageEncryptionKeyID := ""
@@ -778,15 +1012,28 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		encOpts, encMode, encKeyID := b.s3WriteEncryption(storageRef)
 		storageEncryptionMode = encMode
 		storageEncryptionKeyID = encKeyID
+		s3PutStart := time.Time{}
+		if timingEnabled {
+			s3PutStart = time.Now()
+		}
 		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(finalData), int64(len(finalData)), encOpts); err != nil {
+			if timingEnabled {
+				s3PutDuration = time.Since(s3PutStart)
+			}
 			logger.Error(ctx, "backend_overwrite_put_object_failed", zap.String("path", nf.Node.Path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(finalData)), zap.Error(err))
 			return 0, 0, fmt.Errorf("put object: %w", err)
 		}
+		if timingEnabled {
+			s3PutDuration = time.Since(s3PutStart)
+		}
 	}
 
-	var newRev int64
 	var semanticTaskEnqueued bool
-	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+	txStart := time.Time{}
+	if timingEnabled {
+		txStart = time.Now()
+	}
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
 		if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
 			return err
@@ -794,24 +1041,24 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		var txErr error
 		if b.UsesDatabaseAutoEmbedding() {
 			if expectedRevision > 0 {
-				newRev, txErr = b.store.UpdateFileContentAutoEmbeddingIfRevisionTx(tx,
+				newRevision, txErr = b.store.UpdateFileContentAutoEmbeddingIfRevisionTx(tx,
 					nf.File.FileID, expectedRevision, storageType, storageRef,
 					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
 			} else {
-				newRev, txErr = b.store.UpdateFileContentAutoEmbeddingTx(tx,
+				newRevision, txErr = b.store.UpdateFileContentAutoEmbeddingTx(tx,
 					nf.File.FileID, storageType, storageRef,
 					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
 			}
 		} else {
 			if expectedRevision > 0 {
-				newRev, txErr = b.store.UpdateFileContentIfRevisionTx(tx,
+				newRevision, txErr = b.store.UpdateFileContentIfRevisionTx(tx,
 					nf.File.FileID, expectedRevision, storageType, storageRef,
 					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
 			} else {
-				newRev, txErr = b.store.UpdateFileContentTx(tx,
+				newRevision, txErr = b.store.UpdateFileContentTx(tx,
 					nf.File.FileID, storageType, storageRef,
 					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
@@ -829,17 +1076,20 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 			}
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
+			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType)
 			semanticTaskEnqueued = created
 			return err
 		}
 		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText, description) {
-			created, err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
+			created, err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRevision)
 			semanticTaskEnqueued = created
 			return err
 		}
 		return nil
 	})
+	if timingEnabled {
+		tenantTxDuration = time.Since(txStart)
+	}
 	if err != nil {
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
@@ -847,18 +1097,39 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		return 0, 0, err
 	}
 	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
+	centralQuotaStart := time.Time{}
+	if timingEnabled {
+		centralQuotaStart = time.Now()
+	}
 	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
+	if timingEnabled {
+		centralQuotaDuration = time.Since(centralQuotaStart)
+	}
 	// Overwrite cleanup is object-level: file_gc_tasks track deleted file
 	// identities, not old blob refs for a still-live file_id.
+	oldBlobCleanupStart := time.Time{}
+	if timingEnabled {
+		oldBlobCleanupStart = time.Now()
+	}
 	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
+	if timingEnabled {
+		oldBlobCleanupDuration = time.Since(oldBlobCleanupStart)
+	}
 	// Temporary compatibility: app embedding still relies on the legacy
 	// backend-owned image queue until its image task flow also moves to
 	// semantic_tasks.
 	if b.UsesDatabaseAutoEmbedding() {
-		return int64(len(data)), newRev, nil
+		return int64(len(data)), newRevision, nil
 	}
-	b.enqueueImageExtract(nf.File.FileID, nf.Node.Path, contentType, newRev)
-	return int64(len(data)), newRev, nil
+	imageEnqueueStart := time.Time{}
+	if timingEnabled {
+		imageEnqueueStart = time.Now()
+	}
+	b.enqueueImageExtract(nf.File.FileID, nf.Node.Path, contentType, newRevision)
+	if timingEnabled {
+		imageEnqueueDuration = time.Since(imageEnqueueStart)
+	}
+	return int64(len(data)), newRevision, nil
 }
 
 func (b *Dat9Backend) ReadDir(path string) ([]filesystem.FileInfo, error) {

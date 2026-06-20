@@ -47,23 +47,67 @@ func isQuotaMediaContentType(contentType string) bool {
 }
 
 func (b *Dat9Backend) applyLoggedQuotaMutation(ctx context.Context, mutationType string, payload any, apply func(tx *sql.Tx) error) {
+	timingEnabled := logger.BenchTimingLogEnabled()
+	start := time.Time{}
+	if timingEnabled {
+		start = time.Now()
+	}
+	var marshalDuration time.Duration
+	var insertLogDuration time.Duration
+	var applyTxDuration time.Duration
+	logTiming := func(result string, logID int64, err error) {
+		if !timingEnabled {
+			return
+		}
+		fields := []zap.Field{
+			zap.String("tenant_id", b.tenantID),
+			zap.String("mutation_type", mutationType),
+			zap.String("result", result),
+			zap.Int64("log_id", logID),
+			zap.Float64("marshal_ms", backendDurationMs(marshalDuration)),
+			zap.Float64("insert_log_ms", backendDurationMs(insertLogDuration)),
+			zap.Float64("apply_tx_ms", backendDurationMs(applyTxDuration)),
+			zap.Float64("total_ms", backendDurationMs(time.Since(start))),
+		}
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+		}
+		logger.InfoBenchTiming(ctx, "central_quota_mutation_timing", fields...)
+	}
 	if b.metaStore == nil || b.tenantID == "" {
+		logTiming("skipped", 0, nil)
 		return
 	}
+	marshalStart := time.Time{}
+	if timingEnabled {
+		marshalStart = time.Now()
+	}
 	data, err := json.Marshal(payload)
+	if timingEnabled {
+		marshalDuration = time.Since(marshalStart)
+	}
 	if err != nil {
+		logTiming("marshal_error", 0, err)
 		logger.Warn(ctx, "central_quota_mutation_marshal_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", mutationType),
 			zap.Error(err))
 		return
 	}
+	insertLogStart := time.Time{}
+	if timingEnabled {
+		insertLogStart = time.Now()
+	}
 	logID, err := b.metaStore.InsertMutationLog(ctx, &MutationLogView{
 		TenantID:     b.tenantID,
 		MutationType: mutationType,
 		MutationData: data,
 	})
+	if timingEnabled {
+		insertLogDuration = time.Since(insertLogStart)
+	}
 	if err != nil {
+		logTiming("insert_log_error", 0, err)
 		logger.Warn(ctx, "central_quota_mutation_log_insert_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", mutationType),
@@ -71,12 +115,20 @@ func (b *Dat9Backend) applyLoggedQuotaMutation(ctx context.Context, mutationType
 		metrics.RecordOperation("central_quota", mutationType, "fail_open", time.Duration(0))
 		return
 	}
+	applyTxStart := time.Time{}
+	if timingEnabled {
+		applyTxStart = time.Now()
+	}
 	if err := b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
 		if err := apply(tx); err != nil {
 			return err
 		}
 		return b.metaStore.MarkMutationAppliedTx(tx, logID)
 	}); err != nil {
+		if timingEnabled {
+			applyTxDuration = time.Since(applyTxStart)
+		}
+		logTiming("apply_error", logID, err)
 		logger.Warn(ctx, "central_quota_mutation_apply_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", mutationType),
@@ -85,6 +137,10 @@ func (b *Dat9Backend) applyLoggedQuotaMutation(ctx context.Context, mutationType
 		metrics.RecordOperation("central_quota", mutationType, "pending", time.Duration(0))
 		return
 	}
+	if timingEnabled {
+		applyTxDuration = time.Since(applyTxStart)
+	}
+	logTiming("ok", logID, nil)
 	metrics.RecordOperation("central_quota", mutationType, "ok", time.Duration(0))
 }
 

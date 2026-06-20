@@ -215,6 +215,55 @@ func TestWriteReturnsCommittedRevision(t *testing.T) {
 	}
 }
 
+func TestWriteEmitsBenchPhaseTiming(t *testing.T) {
+	logger.ResetBenchTimingLogEnabledForTest()
+	t.Cleanup(logger.ResetBenchTimingLogEnabledForTest)
+	t.Setenv("DRIVE9_BENCH_TIMING_LOG_ENABLED", "true")
+
+	core, recorded := observer.New(zap.InfoLevel)
+	restoreLogger := logger.L()
+	logger.Set(zap.New(core))
+	t.Cleanup(func() { logger.Set(restoreLogger) })
+
+	s := newTestServer(t)
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/timing.txt", strings.NewReader("timing body"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write status = %d, body %s", resp.StatusCode, body)
+	}
+
+	assertObservedTimingFields(t, recorded, "server_write_timing",
+		"path", "result", "bytes", "body_read_ms", "backend_write_ms", "response_ms", "total_ms")
+	assertObservedTimingFields(t, recorded, "backend_write_timing",
+		"path", "canonical_path", "operation", "stat_ms", "implementation_ms", "total_ms")
+	assertObservedTimingFields(t, recorded, "backend_write_create_timing",
+		"path", "result", "prepare_ms", "tenant_tx_ms", "central_quota_ms", "total_ms")
+	assertObservedTimingFields(t, recorded, "central_quota_mutation_timing",
+		"mutation_type", "result", "insert_log_ms", "apply_tx_ms", "total_ms")
+}
+
+func assertObservedTimingFields(t *testing.T, recorded *observer.ObservedLogs, message string, fields ...string) {
+	t.Helper()
+	entries := recorded.FilterMessage(message).AllUntimed()
+	if len(entries) == 0 {
+		t.Fatalf("missing log message %q", message)
+	}
+	ctx := entries[0].ContextMap()
+	for _, field := range fields {
+		if _, ok := ctx[field]; !ok {
+			t.Fatalf("%s missing field %q; got fields %#v", message, field, ctx)
+		}
+	}
+}
+
 func TestReadInlineNoRedirect(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
