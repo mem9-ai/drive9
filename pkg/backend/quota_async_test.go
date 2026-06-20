@@ -20,7 +20,6 @@ func TestEnqueueMutation_Async(t *testing.T) {
 		})
 	}
 
-	// Wait for all mutations to drain.
 	require.Eventually(t, func() bool {
 		return executed.Load() == 10
 	}, 2*time.Second, 10*time.Millisecond)
@@ -36,20 +35,34 @@ func TestEnqueueMutation_InlineFallback(t *testing.T) {
 	require.Equal(t, int64(1), executed.Load())
 }
 
-func TestEnqueueMutation_QueueFull_InlineFallback(t *testing.T) {
+func TestEnqueueMutation_FIFO_SingleWorker(t *testing.T) {
 	b := &Dat9Backend{}
-	// Create a tiny queue and don't start workers so it fills up.
-	b.mutationQueue = make(chan func(), 1)
+	b.startMutationWorker()
+	defer b.stopMutationWorker()
 
-	var executed atomic.Int64
+	// Verify FIFO: record execution order.
+	var order []int
+	done := make(chan struct{})
+	const n = 20
+	for i := 0; i < n; i++ {
+		i := i
+		b.enqueueMutation(func() {
+			order = append(order, i)
+			if len(order) == n {
+				close(done)
+			}
+		})
+	}
 
-	// First enqueue goes into the channel.
-	b.enqueueMutation(func() { executed.Add(1) })
-	// Second enqueue finds channel full → runs inline.
-	b.enqueueMutation(func() { executed.Add(1) })
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for mutations")
+	}
 
-	// The inline one should have executed immediately.
-	require.Equal(t, int64(1), executed.Load())
+	for i := 0; i < n; i++ {
+		require.Equal(t, i, order[i], "mutation %d executed out of order", i)
+	}
 }
 
 func TestStopMutationWorker_DrainsPending(t *testing.T) {

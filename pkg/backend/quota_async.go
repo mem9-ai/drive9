@@ -2,21 +2,21 @@ package backend
 
 import (
 	"context"
-
-	"github.com/mem9-ai/drive9/pkg/logger"
-	"go.uber.org/zap"
 )
 
 const (
 	// mutationQueueSize is the buffer size for the async mutation channel.
-	// Sized to absorb short bursts without blocking. If the buffer is full,
-	// the mutation is applied inline (same as before) so no mutation is lost.
+	// Sized to absorb short bursts without blocking the write path. A single
+	// worker drains the channel to preserve per-tenant FIFO ordering
+	// (UpsertFileMetaTx is not commutative across create/overwrite).
 	mutationQueueSize = 256
-	// mutationWorkers is the number of goroutines draining the mutation queue.
-	mutationWorkers = 2
 )
 
-// startMutationWorker initializes the async mutation queue and workers.
+// startMutationWorker initializes the async mutation queue and a single
+// sequencing worker. A single worker guarantees per-tenant mutation ordering
+// matches the log insertion order (which is serialized by the caller's
+// synchronous logQuotaMutation call).
+//
 // Called once from SetMetaQuotaStore when server quota is active.
 func (b *Dat9Backend) startMutationWorker() {
 	if b.mutationQueue != nil {
@@ -25,10 +25,8 @@ func (b *Dat9Backend) startMutationWorker() {
 	ctx, cancel := context.WithCancel(context.Background())
 	b.mutationStop = cancel
 	b.mutationQueue = make(chan func(), mutationQueueSize)
-	for i := 0; i < mutationWorkers; i++ {
-		b.mutationWG.Add(1)
-		go b.drainMutations(ctx)
-	}
+	b.mutationWG.Add(1)
+	go b.drainMutations(ctx)
 }
 
 func (b *Dat9Backend) drainMutations(ctx context.Context) {
@@ -51,24 +49,21 @@ func (b *Dat9Backend) drainMutations(ctx context.Context) {
 	}
 }
 
-// enqueueMutation submits a mutation function to the async queue.
-// If the queue is full, the mutation is executed inline to ensure it is
-// never dropped. The mutation log + replay worker provides crash recovery.
+// enqueueMutation submits a mutation apply function to the async queue.
+// The mutation log entry has already been durably written by the caller
+// (logQuotaMutation), so if this enqueue blocks or the process crashes
+// before the worker runs, MutationReplayWorker recovers the pending entry.
+//
+// If the queue is not wired (tests), the function runs inline.
+// The channel send blocks if the buffer is full, preserving FIFO ordering;
+// the 256-slot buffer makes blocking extremely unlikely in practice.
 func (b *Dat9Backend) enqueueMutation(fn func()) {
 	if b.mutationQueue == nil {
 		// No async queue — run inline (test/fallback path).
 		fn()
 		return
 	}
-	select {
-	case b.mutationQueue <- fn:
-		// Enqueued for async execution.
-	default:
-		// Queue full — apply inline to avoid dropping.
-		logger.Warn(context.Background(), "mutation_queue_full_inline_fallback",
-			zap.String("tenant_id", b.tenantID))
-		fn()
-	}
+	b.mutationQueue <- fn
 }
 
 // stopMutationWorker shuts down the async mutation queue and waits for

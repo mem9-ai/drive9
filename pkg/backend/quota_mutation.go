@@ -46,89 +46,61 @@ func isQuotaMediaContentType(contentType string) bool {
 	return strings.HasPrefix(contentType, "image/") || strings.HasPrefix(contentType, "audio/")
 }
 
+// applyLoggedQuotaMutation is the original all-in-one path: marshal → insert
+// mutation log → apply + mark applied. Used by code paths that do not need
+// async apply (e.g. upload completion, tests).
 func (b *Dat9Backend) applyLoggedQuotaMutation(ctx context.Context, mutationType string, payload any, apply func(tx *sql.Tx) error) {
-	timingEnabled := logger.BenchTimingLogEnabled()
-	start := time.Time{}
-	if timingEnabled {
-		start = time.Now()
-	}
-	var marshalDuration time.Duration
-	var insertLogDuration time.Duration
-	var applyTxDuration time.Duration
-	logTiming := func(result string, logID int64, err error) {
-		if !timingEnabled {
-			return
-		}
-		fields := []zap.Field{
-			zap.String("tenant_id", b.tenantID),
-			zap.String("mutation_type", mutationType),
-			zap.String("result", result),
-			zap.Int64("log_id", logID),
-			zap.Float64("marshal_ms", backendDurationMs(marshalDuration)),
-			zap.Float64("insert_log_ms", backendDurationMs(insertLogDuration)),
-			zap.Float64("apply_tx_ms", backendDurationMs(applyTxDuration)),
-			zap.Float64("total_ms", backendDurationMs(time.Since(start))),
-		}
-		if err != nil {
-			fields = append(fields, zap.Error(err))
-		}
-		logger.InfoBenchTiming(ctx, "central_quota_mutation_timing", fields...)
-	}
-	if b.metaStore == nil || b.tenantID == "" {
-		logTiming("skipped", 0, nil)
+	logID, ok := b.logQuotaMutation(ctx, mutationType, payload)
+	if !ok {
 		return
 	}
-	marshalStart := time.Time{}
-	if timingEnabled {
-		marshalStart = time.Now()
+	b.applyQuotaMutation(ctx, mutationType, logID, apply)
+}
+
+// logQuotaMutation durably records a mutation in the central quota_mutation_log.
+// Returns the log ID and true on success, or (0, false) if the mutation could
+// not be logged (caller should treat as fail-open). This is the synchronous
+// half of the split mutation path — it MUST complete before the write/fsync
+// returns success so that MutationReplayWorker can recover the mutation after
+// a crash.
+func (b *Dat9Backend) logQuotaMutation(ctx context.Context, mutationType string, payload any) (int64, bool) {
+	if b.metaStore == nil || b.tenantID == "" {
+		return 0, false
 	}
 	data, err := json.Marshal(payload)
-	if timingEnabled {
-		marshalDuration = time.Since(marshalStart)
-	}
 	if err != nil {
-		logTiming("marshal_error", 0, err)
 		logger.Warn(ctx, "central_quota_mutation_marshal_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", mutationType),
 			zap.Error(err))
-		return
-	}
-	insertLogStart := time.Time{}
-	if timingEnabled {
-		insertLogStart = time.Now()
+		return 0, false
 	}
 	logID, err := b.metaStore.InsertMutationLog(ctx, &MutationLogView{
 		TenantID:     b.tenantID,
 		MutationType: mutationType,
 		MutationData: data,
 	})
-	if timingEnabled {
-		insertLogDuration = time.Since(insertLogStart)
-	}
 	if err != nil {
-		logTiming("insert_log_error", 0, err)
 		logger.Warn(ctx, "central_quota_mutation_log_insert_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", mutationType),
 			zap.Error(err))
 		metrics.RecordOperation("central_quota", mutationType, "fail_open", time.Duration(0))
-		return
+		return 0, false
 	}
-	applyTxStart := time.Time{}
-	if timingEnabled {
-		applyTxStart = time.Now()
-	}
+	return logID, true
+}
+
+// applyQuotaMutation applies a previously-logged mutation and marks it as
+// applied. This is the async-safe half of the split mutation path — if it
+// fails or never runs, MutationReplayWorker picks up the pending log entry.
+func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType string, logID int64, apply func(tx *sql.Tx) error) {
 	if err := b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
 		if err := apply(tx); err != nil {
 			return err
 		}
 		return b.metaStore.MarkMutationAppliedTx(tx, logID)
 	}); err != nil {
-		if timingEnabled {
-			applyTxDuration = time.Since(applyTxStart)
-		}
-		logTiming("apply_error", logID, err)
 		logger.Warn(ctx, "central_quota_mutation_apply_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", mutationType),
@@ -137,59 +109,49 @@ func (b *Dat9Backend) applyLoggedQuotaMutation(ctx context.Context, mutationType
 		metrics.RecordOperation("central_quota", mutationType, "pending", time.Duration(0))
 		return
 	}
-	if timingEnabled {
-		applyTxDuration = time.Since(applyTxStart)
-	}
-	logTiming("ok", logID, nil)
 	metrics.RecordOperation("central_quota", mutationType, "ok", time.Duration(0))
 }
 
 func (b *Dat9Backend) syncCentralFileCreate(ctx context.Context, fileID string, sizeBytes int64, contentType string) {
-	// Detach from the request context so the mutation survives handler return.
-	bgCtx := context.Background()
-	b.enqueueMutation(func() {
-		b.syncCentralFileCreateInline(bgCtx, fileID, sizeBytes, contentType)
-	})
-}
-
-func (b *Dat9Backend) syncCentralFileCreateInline(ctx context.Context, fileID string, sizeBytes int64, contentType string) {
 	isMedia := isQuotaMediaContentType(contentType)
-	b.applyLoggedQuotaMutation(ctx, "file_create", fileCreateMutationData{
+	payload := fileCreateMutationData{
 		FileID:    fileID,
 		SizeBytes: sizeBytes,
 		IsMedia:   isMedia,
-	}, func(tx *sql.Tx) error {
-		if err := b.metaStore.UpsertFileMetaTx(tx, &FileMetaView{
-			TenantID:  b.tenantID,
-			FileID:    fileID,
-			SizeBytes: sizeBytes,
-			IsMedia:   isMedia,
-		}); err != nil {
-			return err
-		}
-		if sizeBytes != 0 {
-			if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, sizeBytes); err != nil {
+	}
+	// Phase 1 (synchronous): durably log the mutation before returning to the
+	// caller, so MutationReplayWorker can recover it after a crash.
+	logID, ok := b.logQuotaMutation(ctx, "file_create", payload)
+	if !ok {
+		return
+	}
+	// Phase 2 (async): apply the mutation + mark applied in the background.
+	b.enqueueMutation(func() {
+		b.applyQuotaMutation(context.Background(), "file_create", logID, func(tx *sql.Tx) error {
+			if err := b.metaStore.UpsertFileMetaTx(tx, &FileMetaView{
+				TenantID:  b.tenantID,
+				FileID:    fileID,
+				SizeBytes: sizeBytes,
+				IsMedia:   isMedia,
+			}); err != nil {
 				return err
 			}
-		}
-		if isMedia {
-			if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, 1); err != nil {
-				return err
+			if sizeBytes != 0 {
+				if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, sizeBytes); err != nil {
+					return err
+				}
 			}
-		}
-		return nil
+			if isMedia {
+				if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, 1); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 	})
 }
 
 func (b *Dat9Backend) syncCentralFileOverwrite(ctx context.Context, fileID string, oldSize int64, oldContentType string, newSize int64, newContentType string) {
-	// Detach from the request context so the mutation survives handler return.
-	bgCtx := context.Background()
-	b.enqueueMutation(func() {
-		b.syncCentralFileOverwriteInline(bgCtx, fileID, oldSize, oldContentType, newSize, newContentType)
-	})
-}
-
-func (b *Dat9Backend) syncCentralFileOverwriteInline(ctx context.Context, fileID string, oldSize int64, oldContentType string, newSize int64, newContentType string) {
 	oldIsMedia := isQuotaMediaContentType(oldContentType)
 	newIsMedia := isQuotaMediaContentType(newContentType)
 	storageDelta := newSize - oldSize
@@ -200,45 +162,60 @@ func (b *Dat9Backend) syncCentralFileOverwriteInline(ctx context.Context, fileID
 	case oldIsMedia && !newIsMedia:
 		mediaDelta = -1
 	}
-	b.applyLoggedQuotaMutation(ctx, "file_overwrite", fileOverwriteMutationData{
+	payload := fileOverwriteMutationData{
 		FileID:       fileID,
 		OldSizeBytes: oldSize,
 		OldIsMedia:   oldIsMedia,
 		NewSizeBytes: newSize,
 		NewIsMedia:   newIsMedia,
-	}, func(tx *sql.Tx) error {
-		if err := b.metaStore.UpsertFileMetaTx(tx, &FileMetaView{
-			TenantID:  b.tenantID,
-			FileID:    fileID,
-			SizeBytes: newSize,
-			IsMedia:   newIsMedia,
-		}); err != nil {
-			return err
-		}
-		if storageDelta != 0 {
-			if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, storageDelta); err != nil {
+	}
+	// Phase 1 (synchronous): durably log the mutation.
+	logID, ok := b.logQuotaMutation(ctx, "file_overwrite", payload)
+	if !ok {
+		return
+	}
+	// Phase 2 (async): apply + mark applied.
+	b.enqueueMutation(func() {
+		b.applyQuotaMutation(context.Background(), "file_overwrite", logID, func(tx *sql.Tx) error {
+			if err := b.metaStore.UpsertFileMetaTx(tx, &FileMetaView{
+				TenantID:  b.tenantID,
+				FileID:    fileID,
+				SizeBytes: newSize,
+				IsMedia:   newIsMedia,
+			}); err != nil {
 				return err
 			}
-		}
-		if mediaDelta != 0 {
-			if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, mediaDelta); err != nil {
-				return err
+			if storageDelta != 0 {
+				if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, storageDelta); err != nil {
+					return err
+				}
 			}
-		}
-		return nil
+			if mediaDelta != 0 {
+				if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, mediaDelta); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 	})
 }
 
 func (b *Dat9Backend) syncCentralLLMCostRecord(ctx context.Context, taskType, taskID string, costMillicents, rawUnits int64, rawUnitType string) {
-	bgCtx := context.Background()
+	payload := llmCostMutationData{
+		TaskType:       taskType,
+		TaskID:         taskID,
+		CostMillicents: costMillicents,
+		RawUnits:       rawUnits,
+		RawUnitType:    rawUnitType,
+	}
+	// Phase 1 (synchronous): durably log.
+	logID, ok := b.logQuotaMutation(ctx, "llm_cost_record", payload)
+	if !ok {
+		return
+	}
+	// Phase 2 (async): apply + mark applied.
 	b.enqueueMutation(func() {
-		b.applyLoggedQuotaMutation(bgCtx, "llm_cost_record", llmCostMutationData{
-			TaskType:       taskType,
-			TaskID:         taskID,
-			CostMillicents: costMillicents,
-			RawUnits:       rawUnits,
-			RawUnitType:    rawUnitType,
-		}, func(tx *sql.Tx) error {
+		b.applyQuotaMutation(context.Background(), "llm_cost_record", logID, func(tx *sql.Tx) error {
 			if err := b.metaStore.InsertCentralLLMUsageTx(tx, &LLMUsageView{
 				TenantID:       b.tenantID,
 				TaskType:       taskType,
