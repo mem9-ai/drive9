@@ -112,42 +112,58 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 	metrics.RecordOperation("central_quota", mutationType, "ok", time.Duration(0))
 }
 
+// logAndEnqueueMutation atomically logs a mutation and enqueues its apply
+// function under mutationMu. This ensures that durable log_id order and
+// channel enqueue order are identical, preventing reordering between
+// concurrent same-tenant writes. The mutex scope is kept minimal: just the
+// log insert (~1ms) + channel send (non-blocking into 256-slot buffer).
+func (b *Dat9Backend) logAndEnqueueMutation(ctx context.Context, mutationType string, payload any, apply func(tx *sql.Tx) error) {
+	start := time.Now()
+
+	b.mutationMu.Lock()
+	logID, ok := b.logQuotaMutation(ctx, mutationType, payload)
+	if !ok {
+		b.mutationMu.Unlock()
+		return
+	}
+	b.enqueueMutation(func() {
+		b.applyQuotaMutation(context.Background(), mutationType, logID, apply)
+	})
+	b.mutationMu.Unlock()
+
+	logger.InfoBenchTiming(ctx, "central_quota_mutation_sync_timing",
+		zap.String("tenant_id", b.tenantID),
+		zap.String("mutation_type", mutationType),
+		zap.Int64("log_id", logID),
+		zap.Float64("total_ms", backendDurationMs(time.Since(start))))
+}
+
 func (b *Dat9Backend) syncCentralFileCreate(ctx context.Context, fileID string, sizeBytes int64, contentType string) {
 	isMedia := isQuotaMediaContentType(contentType)
-	payload := fileCreateMutationData{
+	b.logAndEnqueueMutation(ctx, "file_create", fileCreateMutationData{
 		FileID:    fileID,
 		SizeBytes: sizeBytes,
 		IsMedia:   isMedia,
-	}
-	// Phase 1 (synchronous): durably log the mutation before returning to the
-	// caller, so MutationReplayWorker can recover it after a crash.
-	logID, ok := b.logQuotaMutation(ctx, "file_create", payload)
-	if !ok {
-		return
-	}
-	// Phase 2 (async): apply the mutation + mark applied in the background.
-	b.enqueueMutation(func() {
-		b.applyQuotaMutation(context.Background(), "file_create", logID, func(tx *sql.Tx) error {
-			if err := b.metaStore.UpsertFileMetaTx(tx, &FileMetaView{
-				TenantID:  b.tenantID,
-				FileID:    fileID,
-				SizeBytes: sizeBytes,
-				IsMedia:   isMedia,
-			}); err != nil {
+	}, func(tx *sql.Tx) error {
+		if err := b.metaStore.UpsertFileMetaTx(tx, &FileMetaView{
+			TenantID:  b.tenantID,
+			FileID:    fileID,
+			SizeBytes: sizeBytes,
+			IsMedia:   isMedia,
+		}); err != nil {
+			return err
+		}
+		if sizeBytes != 0 {
+			if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, sizeBytes); err != nil {
 				return err
 			}
-			if sizeBytes != 0 {
-				if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, sizeBytes); err != nil {
-					return err
-				}
+		}
+		if isMedia {
+			if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, 1); err != nil {
+				return err
 			}
-			if isMedia {
-				if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, 1); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
+		}
+		return nil
 	})
 }
 
@@ -162,71 +178,53 @@ func (b *Dat9Backend) syncCentralFileOverwrite(ctx context.Context, fileID strin
 	case oldIsMedia && !newIsMedia:
 		mediaDelta = -1
 	}
-	payload := fileOverwriteMutationData{
+	b.logAndEnqueueMutation(ctx, "file_overwrite", fileOverwriteMutationData{
 		FileID:       fileID,
 		OldSizeBytes: oldSize,
 		OldIsMedia:   oldIsMedia,
 		NewSizeBytes: newSize,
 		NewIsMedia:   newIsMedia,
-	}
-	// Phase 1 (synchronous): durably log the mutation.
-	logID, ok := b.logQuotaMutation(ctx, "file_overwrite", payload)
-	if !ok {
-		return
-	}
-	// Phase 2 (async): apply + mark applied.
-	b.enqueueMutation(func() {
-		b.applyQuotaMutation(context.Background(), "file_overwrite", logID, func(tx *sql.Tx) error {
-			if err := b.metaStore.UpsertFileMetaTx(tx, &FileMetaView{
-				TenantID:  b.tenantID,
-				FileID:    fileID,
-				SizeBytes: newSize,
-				IsMedia:   newIsMedia,
-			}); err != nil {
+	}, func(tx *sql.Tx) error {
+		if err := b.metaStore.UpsertFileMetaTx(tx, &FileMetaView{
+			TenantID:  b.tenantID,
+			FileID:    fileID,
+			SizeBytes: newSize,
+			IsMedia:   newIsMedia,
+		}); err != nil {
+			return err
+		}
+		if storageDelta != 0 {
+			if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, storageDelta); err != nil {
 				return err
 			}
-			if storageDelta != 0 {
-				if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, storageDelta); err != nil {
-					return err
-				}
+		}
+		if mediaDelta != 0 {
+			if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, mediaDelta); err != nil {
+				return err
 			}
-			if mediaDelta != 0 {
-				if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, mediaDelta); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
+		}
+		return nil
 	})
 }
 
 func (b *Dat9Backend) syncCentralLLMCostRecord(ctx context.Context, taskType, taskID string, costMillicents, rawUnits int64, rawUnitType string) {
-	payload := llmCostMutationData{
+	b.logAndEnqueueMutation(ctx, "llm_cost_record", llmCostMutationData{
 		TaskType:       taskType,
 		TaskID:         taskID,
 		CostMillicents: costMillicents,
 		RawUnits:       rawUnits,
 		RawUnitType:    rawUnitType,
-	}
-	// Phase 1 (synchronous): durably log.
-	logID, ok := b.logQuotaMutation(ctx, "llm_cost_record", payload)
-	if !ok {
-		return
-	}
-	// Phase 2 (async): apply + mark applied.
-	b.enqueueMutation(func() {
-		b.applyQuotaMutation(context.Background(), "llm_cost_record", logID, func(tx *sql.Tx) error {
-			if err := b.metaStore.InsertCentralLLMUsageTx(tx, &LLMUsageView{
-				TenantID:       b.tenantID,
-				TaskType:       taskType,
-				TaskID:         taskID,
-				CostMillicents: costMillicents,
-				RawUnits:       rawUnits,
-				RawUnitType:    rawUnitType,
-			}); err != nil {
-				return err
-			}
-			return b.metaStore.IncrMonthlyLLMCostTx(tx, b.tenantID, costMillicents)
-		})
+	}, func(tx *sql.Tx) error {
+		if err := b.metaStore.InsertCentralLLMUsageTx(tx, &LLMUsageView{
+			TenantID:       b.tenantID,
+			TaskType:       taskType,
+			TaskID:         taskID,
+			CostMillicents: costMillicents,
+			RawUnits:       rawUnits,
+			RawUnitType:    rawUnitType,
+		}); err != nil {
+			return err
+		}
+		return b.metaStore.IncrMonthlyLLMCostTx(tx, b.tenantID, costMillicents)
 	})
 }

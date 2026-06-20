@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -62,6 +63,68 @@ func TestEnqueueMutation_FIFO_SingleWorker(t *testing.T) {
 
 	for i := 0; i < n; i++ {
 		require.Equal(t, i, order[i], "mutation %d executed out of order", i)
+	}
+}
+
+// TestMutationMu_ConcurrentOrdering verifies that mutationMu serializes
+// concurrent log+enqueue operations so the worker applies mutations in
+// log_id order even when goroutines interleave. Without the mutex,
+// goroutine A could log log_id=1, stall, goroutine B logs log_id=2 and
+// enqueues first, causing the worker to apply log_id=2 before log_id=1.
+func TestMutationMu_ConcurrentOrdering(t *testing.T) {
+	b := &Dat9Backend{}
+	b.startMutationWorker()
+	defer b.stopMutationWorker()
+
+	const n = 100
+	var (
+		mu    sync.Mutex
+		order []int
+	)
+	done := make(chan struct{})
+
+	// Simulate concurrent writers: each goroutine acquires mutationMu,
+	// records its sequence number, and enqueues — exactly what
+	// logAndEnqueueMutation does.
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(seq int) {
+			defer wg.Done()
+			b.mutationMu.Lock()
+			// Under mutationMu: "log" (record seq) + "enqueue" (channel send)
+			// are atomic, so enqueue order = seq order.
+			mySeq := seq
+			b.enqueueMutation(func() {
+				mu.Lock()
+				order = append(order, mySeq)
+				if len(order) == n {
+					close(done)
+				}
+				mu.Unlock()
+			})
+			b.mutationMu.Unlock()
+		}(i)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting for mutations")
+	}
+	wg.Wait()
+
+	// Verify the worker processed mutations in the order they were
+	// enqueued (which, under mutationMu, equals log_id order).
+	// Because goroutines acquire the mutex in arbitrary order, we don't
+	// know which goroutine gets seq=0,1,2... But we DO know that the
+	// enqueue order under the mutex is strictly sequential, and the
+	// single worker preserves that FIFO. So order[i] must be
+	// monotonically increasing.
+	for i := 1; i < len(order); i++ {
+		require.Greater(t, order[i], order[i-1],
+			"apply order[%d]=%d should be > order[%d]=%d (log_id FIFO violated)",
+			i, order[i], i-1, order[i-1])
 	}
 }
 

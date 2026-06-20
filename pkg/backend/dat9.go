@@ -101,6 +101,11 @@ type Dat9Backend struct {
 	// syncCentralFileOverwrite) from the fsync critical path. Mutations are
 	// enqueued here and drained by a background worker. The mutation log
 	// provides crash recovery via the existing MutationReplayWorker.
+	//
+	// mutationMu serializes logQuotaMutation + enqueueMutation so that
+	// durable log_id order and channel enqueue order cannot diverge under
+	// concurrent same-tenant writes.
+	mutationMu    sync.Mutex
 	mutationQueue chan func()
 	mutationWG    sync.WaitGroup
 	mutationStop  context.CancelFunc
