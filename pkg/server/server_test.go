@@ -27,6 +27,10 @@ import (
 )
 
 func newTestServer(t *testing.T) *Server {
+	return newTestServerWithLogger(t, nil)
+}
+
+func newTestServerWithLogger(t *testing.T, log *zap.Logger) *Server {
 	t.Helper()
 
 	s3Dir, err := os.MkdirTemp("", "dat9-srv-s3-*")
@@ -51,7 +55,7 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(b)
+	return NewWithConfig(Config{Backend: b, Logger: log})
 }
 
 func insertTestS3File(t *testing.T, s *Server, p string, size int64) {
@@ -221,11 +225,7 @@ func TestWriteEmitsBenchPhaseTiming(t *testing.T) {
 	t.Setenv("DRIVE9_BENCH_TIMING_LOG_ENABLED", "true")
 
 	core, recorded := observer.New(zap.InfoLevel)
-	restoreLogger := logger.L()
-	logger.Set(zap.New(core))
-	t.Cleanup(func() { logger.Set(restoreLogger) })
-
-	s := newTestServer(t)
+	s := newTestServerWithLogger(t, zap.New(core))
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 
