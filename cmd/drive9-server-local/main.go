@@ -176,6 +176,7 @@ func main() {
 	if semanticEmbedder != nil && backendOpts.QueryEmbedding.Client == nil {
 		backendOpts.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
+	backendOpts.AppSemanticTasksEnabled = semanticEmbedder != nil
 
 	var (
 		s3c     s3client.S3Client

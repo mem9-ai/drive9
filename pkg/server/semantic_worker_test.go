@@ -89,7 +89,7 @@ func (e staticServerAudioExtractor) ExtractAudioText(_ context.Context, _ backen
 }
 
 func newTestTenantPool(t *testing.T) *tenant.Pool {
-	return newTestTenantPoolWithBackendOptions(t, backend.Options{})
+	return newTestTenantPoolWithBackendOptions(t, backend.Options{AppSemanticTasksEnabled: true})
 }
 
 func newTestTenantPoolWithBackendOptions(t *testing.T, opts backend.Options) *tenant.Pool {
@@ -136,7 +136,7 @@ func newTestBackendForSemanticWorkerWithOptions(t *testing.T, opts backend.Optio
 }
 
 func newTestBackendForSemanticWorker(t *testing.T) *backend.Dat9Backend {
-	return newTestBackendForSemanticWorkerWithOptions(t, backend.Options{})
+	return newTestBackendForSemanticWorkerWithOptions(t, backend.Options{AppSemanticTasksEnabled: true})
 }
 
 func newTestServerWithSemanticWorker(t *testing.T, embedder staticSemanticEmbedder, workerOpts SemanticWorkerOptions) (*Server, *backend.Dat9Backend) {
@@ -1197,6 +1197,7 @@ func TestSemanticWorkerHTTPMultiTenantImageOnlySkipsAppTenantEmbedTasks(t *testi
 	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
 
 	pool := newTestTenantPoolWithBackendOptions(t, backend.Options{
+		AppSemanticTasksEnabled: true,
 		AsyncImageExtract: backend.AsyncImageExtractOptions{
 			Enabled:   true,
 			Workers:   1,

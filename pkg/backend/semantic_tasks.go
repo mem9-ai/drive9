@@ -142,6 +142,9 @@ func newAudioExtractTask(taskID, fileID string, revision int64, path, contentTyp
 }
 
 func (b *Dat9Backend) shouldEnqueueEmbedForRevision(path, contentType, contentText, description string) bool {
+	if !b.appSemanticTasksEnabled {
+		return false
+	}
 	if strings.TrimSpace(contentText) != "" {
 		return true
 	}

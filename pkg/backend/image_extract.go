@@ -303,7 +303,7 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 		if txErr = b.store.ReplaceFileTagsByPrefixTx(tx, task.FileID, imageExtractTagPrefix, writeback.tags); txErr != nil {
 			return txErr
 		}
-		if b.UsesDatabaseAutoEmbedding() {
+		if b.UsesDatabaseAutoEmbedding() || !b.appSemanticTasksEnabled {
 			return nil
 		}
 		if err := injectedImageExtractWritebackError("imageExtractWritebackQueueEmbedTaskError"); err != nil {

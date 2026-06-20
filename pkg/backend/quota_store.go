@@ -118,6 +118,10 @@ type MutationLogView struct {
 func (b *Dat9Backend) SetMetaQuotaStore(tenantID string, mqs MetaQuotaStore) {
 	b.tenantID = tenantID
 	b.metaStore = mqs
+	if mqs != nil && b.quotaSource == QuotaSourceServer {
+		b.qCache = newQuotaCache(tenantID, mqs)
+		b.startMutationWorker()
+	}
 }
 
 // TenantID returns the tenant identifier for this backend instance.

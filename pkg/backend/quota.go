@@ -126,25 +126,20 @@ func (b *Dat9Backend) ensureUploadSizeAllowed(size int64) error {
 // atomic reserve+insert transaction — see upload_reservation.go). Reviewers
 // @adversary / @adversary-1 accepted this tradeoff in thread #pr251:000001d1
 // rather than paying the latency of a server-side reserve for every small
-// write. Hard quota convergence is restored by the mutation replay worker
-// and the nightly reconciliation sweep.
+// write. Hard quota convergence is restored by MutationReplayWorker
+// and the backfill-quota CLI tool.
 func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, deltaBytes int64) error {
 	if b.metaStore == nil || deltaBytes <= 0 {
 		return nil // fail-open or no-op
 	}
-	usage, err := b.metaStore.GetQuotaUsage(ctx, b.tenantID)
-	if err != nil {
-		logger.Warn(ctx, "server_storage_quota_check_fail_open",
-			zap.String("tenant_id", b.tenantID), zap.Error(err))
+
+	// Fast path: use cached quota snapshot when available.
+	// Falls back to synchronous DB query when cache is not wired (tests)
+	// or not yet populated (startup race).
+	usage, cfg := b.cachedQuotaSnapshot(ctx)
+	if usage == nil || cfg == nil {
 		metrics.RecordOperation("server_quota", "storage_check", "fail_open", 0)
-		return nil // fail-open
-	}
-	cfg, err := b.metaStore.GetQuotaConfig(ctx, b.tenantID)
-	if err != nil {
-		logger.Warn(ctx, "server_storage_quota_config_fail_open",
-			zap.String("tenant_id", b.tenantID), zap.Error(err))
-		metrics.RecordOperation("server_quota", "storage_check", "fail_open", 0)
-		return nil // fail-open
+		return nil // fail-open: cache miss
 	}
 	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
 	if cfg.MaxStorageBytes <= 0 {
@@ -160,6 +155,31 @@ func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, deltaBytes i
 	return nil
 }
 
+// cachedQuotaSnapshot returns the cached quota state, falling back to a
+// synchronous DB query when the cache is not available.
+func (b *Dat9Backend) cachedQuotaSnapshot(ctx context.Context) (*QuotaUsageView, *QuotaConfigView) {
+	if b.qCache != nil {
+		usage, cfg := b.qCache.get()
+		if usage != nil && cfg != nil {
+			return usage, cfg
+		}
+	}
+	// Fallback: synchronous query (tests, startup before first refresh).
+	usage, err := b.metaStore.GetQuotaUsage(ctx, b.tenantID)
+	if err != nil {
+		logger.Warn(ctx, "server_storage_quota_check_fail_open",
+			zap.String("tenant_id", b.tenantID), zap.Error(err))
+		return nil, nil
+	}
+	cfg, err := b.metaStore.GetQuotaConfig(ctx, b.tenantID)
+	if err != nil {
+		logger.Warn(ctx, "server_storage_quota_config_fail_open",
+			zap.String("tenant_id", b.tenantID), zap.Error(err))
+		return nil, nil
+	}
+	return usage, cfg
+}
+
 // --- Server-side media file count (Rev 4 migration) ---
 
 // mediaLLMQuotaExceededServer checks the server DB counter for media file quota.
@@ -168,17 +188,8 @@ func (b *Dat9Backend) mediaLLMQuotaExceededServer(ctx context.Context) bool {
 	if b.metaStore == nil {
 		return b.mediaLLMQuotaExceeded() // fallback to tenant DB
 	}
-	usage, err := b.metaStore.GetQuotaUsage(ctx, b.tenantID)
-	if err != nil {
-		logger.Warn(ctx, "server_media_quota_check_fail_open",
-			zap.String("tenant_id", b.tenantID), zap.Error(err))
-		metrics.RecordOperation("server_quota", "media_check", "fail_open", 0)
-		return false // fail-open
-	}
-	cfg, err := b.metaStore.GetQuotaConfig(ctx, b.tenantID)
-	if err != nil {
-		logger.Warn(ctx, "server_media_quota_config_fail_open",
-			zap.String("tenant_id", b.tenantID), zap.Error(err))
+	usage, cfg := b.cachedQuotaSnapshot(ctx)
+	if usage == nil || cfg == nil {
 		metrics.RecordOperation("server_quota", "media_check", "fail_open", 0)
 		return false // fail-open
 	}
