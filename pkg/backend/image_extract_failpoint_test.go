@@ -58,6 +58,7 @@ func TestProcessImageExtractTaskWritebackUpdateFailsWithFailpoint(t *testing.T) 
 
 func TestProcessImageExtractTaskWritebackQueueEmbedFailsWithFailpoint(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
+		AppSemanticTasksEnabled: true,
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
 			Workers:   1,

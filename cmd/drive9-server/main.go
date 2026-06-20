@@ -118,6 +118,7 @@ func main() {
 	if semanticEmbedder != nil && backendOptions.QueryEmbedding.Client == nil {
 		backendOptions.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
+	backendOptions.AppSemanticTasksEnabled = semanticEmbedder != nil
 
 	store, err := meta.Open(metaDSN)
 	if err != nil {

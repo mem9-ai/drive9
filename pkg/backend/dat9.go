@@ -79,6 +79,10 @@ type Dat9Backend struct {
 	// database-managed embedding path instead of the app-managed one for write,
 	// upload, image extraction, and grep behavior.
 	databaseAutoEmbedding bool
+	// appSemanticTasksEnabled gates whether the app-managed embed worker path
+	// may enqueue semantic_tasks. False when no DRIVE9_EMBED_* worker is
+	// configured, preventing orphaned task rows.
+	appSemanticTasksEnabled bool
 	maxUploadBytes        int64
 	maxTenantStorageBytes int64
 	maxMediaLLMFiles      int64
@@ -95,6 +99,20 @@ type Dat9Backend struct {
 	storageNamespaceID string
 	metaStore          MetaQuotaStore // nil when central quota is not wired (tests, fallback)
 	quotaSource        QuotaSource    // "tenant" (default) or "server"
+	qCache             *quotaCache    // nil when central quota is not wired
+
+	// mutationQueue decouples central quota mutations (syncCentralFileCreate,
+	// syncCentralFileOverwrite) from the fsync critical path. Mutations are
+	// enqueued here and drained by a background worker. The mutation log
+	// provides crash recovery via the existing MutationReplayWorker.
+	//
+	// mutationMu serializes logQuotaMutation + enqueueMutation so that
+	// durable log_id order and channel enqueue order cannot diverge under
+	// concurrent same-tenant writes.
+	mutationMu    sync.Mutex
+	mutationQueue chan func()
+	mutationWG    sync.WaitGroup
+	mutationStop  context.CancelFunc
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 

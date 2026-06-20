@@ -246,8 +246,9 @@ func TestWriteEmitsBenchPhaseTiming(t *testing.T) {
 		"path", "canonical_path", "operation", "stat_ms", "implementation_ms", "total_ms")
 	assertObservedTimingFields(t, recorded, "backend_write_create_timing",
 		"path", "result", "prepare_ms", "tenant_tx_ms", "central_quota_ms", "total_ms")
-	assertObservedTimingFields(t, recorded, "central_quota_mutation_timing",
-		"mutation_type", "result", "insert_log_ms", "apply_tx_ms", "total_ms")
+	// central_quota_mutation_sync_timing is only emitted when metaStore is
+	// non-nil (server quota mode). This test backend has no metaStore, so the
+	// async mutation path short-circuits in logQuotaMutation.
 }
 
 func assertObservedTimingFields(t *testing.T, recorded *observer.ObservedLogs, message string, fields ...string) {

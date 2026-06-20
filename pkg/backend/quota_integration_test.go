@@ -27,21 +27,31 @@ func newServerQuotaBackend(t *testing.T, opts Options) (*Dat9Backend, *fakeMetaQ
 }
 
 func TestServerQuotaFeatureFlagRejectsOverLimitWrite(t *testing.T) {
-	b, fake := newServerQuotaBackend(t, Options{})
-	ctx := context.Background()
-
-	fake.mu.Lock()
-	fake.config["tenant-a"].MaxStorageBytes = 10
-	fake.mu.Unlock()
-
-	if _, err := b.Write("/alpha.txt", []byte("12345678"), 0, filesystem.WriteFlagCreate); err != nil {
-		t.Fatalf("create within central quota: %v", err)
+	opts := Options{}
+	opts.QuotaSource = QuotaSourceServer
+	b := newTestBackendWithOptions(t, opts)
+	fake := newFakeMetaQuotaStore()
+	fake.config["tenant-a"] = &QuotaConfigView{
+		TenantID:         "tenant-a",
+		MaxStorageBytes:  10,
+		MaxMediaLLMFiles: 1000,
+		MaxMonthlyCostMC: 1 << 30,
 	}
+	// Pre-seed usage near the limit so the cache snapshot (loaded
+	// synchronously in SetMetaQuotaStore) already reflects near-full state.
+	// This avoids depending on async mutation timing from a prior write.
+	fake.usage["tenant-a"] = &QuotaUsageView{
+		TenantID:     "tenant-a",
+		StorageBytes: 8,
+	}
+	b.SetMetaQuotaStore("tenant-a", fake)
+
 	if _, err := b.Write("/beta.txt", []byte("xyz"), 0, filesystem.WriteFlagCreate); !errors.Is(err, ErrStorageQuotaExceeded) {
 		t.Fatalf("expected ErrStorageQuotaExceeded from server quota path, got %v", err)
 	}
 
-	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	// Verify usage unchanged after rejected write.
+	usage, err := fake.GetQuotaUsage(context.Background(), "tenant-a")
 	if err != nil {
 		t.Fatalf("get central usage: %v", err)
 	}
