@@ -27,12 +27,18 @@ func newServerQuotaBackend(t *testing.T, opts Options) (*Dat9Backend, *fakeMetaQ
 }
 
 func TestServerQuotaFeatureFlagRejectsOverLimitWrite(t *testing.T) {
-	b, fake := newServerQuotaBackend(t, Options{})
+	opts := Options{}
+	opts.QuotaSource = QuotaSourceServer
+	b := newTestBackendWithOptions(t, opts)
+	fake := newFakeMetaQuotaStore()
+	fake.config["tenant-a"] = &QuotaConfigView{
+		TenantID:         "tenant-a",
+		MaxStorageBytes:  10,
+		MaxMediaLLMFiles: 1000,
+		MaxMonthlyCostMC: 1 << 30,
+	}
+	b.SetMetaQuotaStore("tenant-a", fake)
 	ctx := context.Background()
-
-	fake.mu.Lock()
-	fake.config["tenant-a"].MaxStorageBytes = 10
-	fake.mu.Unlock()
 
 	if _, err := b.Write("/alpha.txt", []byte("12345678"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatalf("create within central quota: %v", err)

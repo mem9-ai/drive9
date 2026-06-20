@@ -126,8 +126,8 @@ func (b *Dat9Backend) ensureUploadSizeAllowed(size int64) error {
 // atomic reserve+insert transaction — see upload_reservation.go). Reviewers
 // @adversary / @adversary-1 accepted this tradeoff in thread #pr251:000001d1
 // rather than paying the latency of a server-side reserve for every small
-// write. Hard quota convergence is restored by the mutation replay worker
-// and the nightly reconciliation sweep.
+// write. Hard quota convergence is restored by MutationReplayWorker
+// and the backfill-quota CLI tool.
 func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, deltaBytes int64) error {
 	if b.metaStore == nil || deltaBytes <= 0 {
 		return nil // fail-open or no-op

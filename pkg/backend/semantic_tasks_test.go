@@ -109,7 +109,7 @@ func mustFileForPath(t *testing.T, b *Dat9Backend, path string) (string, int64, 
 }
 
 func TestWriteCreateEnqueuesEmbedTask(t *testing.T) {
-	b := newTestBackend(t)
+	b := newTestBackendWithOptions(t, Options{AppSemanticTasksEnabled: true})
 	if _, err := b.Write("/data/file.txt", []byte("hello world"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
@@ -131,7 +131,7 @@ func TestWriteCreateEnqueuesEmbedTask(t *testing.T) {
 }
 
 func TestWriteCreateSkipsEmbedTaskWithoutTextSource(t *testing.T) {
-	b := newTestBackend(t)
+	b := newTestBackendWithOptions(t, Options{AppSemanticTasksEnabled: true})
 	if _, err := b.Write("/data/blob.bin", []byte{0, 1, 2, 3}, 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +393,7 @@ func TestWriteCreateAutoEmbeddingSkipsAudioForNonAudioFile(t *testing.T) {
 }
 
 func TestWriteOverwriteEnqueuesNextRevisionAndClearsEmbeddingState(t *testing.T) {
-	b := newTestBackend(t)
+	b := newTestBackendWithOptions(t, Options{AppSemanticTasksEnabled: true})
 	if _, err := b.Write("/f.txt", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
@@ -421,7 +421,7 @@ func TestWriteOverwriteEnqueuesNextRevisionAndClearsEmbeddingState(t *testing.T)
 }
 
 func TestWriteOverwriteSkipsEmbedTaskWithoutTextSource(t *testing.T) {
-	b := newTestBackend(t)
+	b := newTestBackendWithOptions(t, Options{AppSemanticTasksEnabled: true})
 	if _, err := b.Write("/f", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
@@ -1111,7 +1111,7 @@ func TestConfirmUploadOverwriteAutoEmbeddingImageEnqueuesImgExtractTaskWithoutLe
 }
 
 func TestRenameDoesNotCreateAdditionalSemanticTasks(t *testing.T) {
-	b := newTestBackend(t)
+	b := newTestBackendWithOptions(t, Options{AppSemanticTasksEnabled: true})
 	if _, err := b.Write("/old.txt", []byte("data"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
@@ -1131,7 +1131,7 @@ func TestRenameDoesNotCreateAdditionalSemanticTasks(t *testing.T) {
 }
 
 func TestCopyFileDoesNotCreateAdditionalSemanticTasks(t *testing.T) {
-	b := newTestBackend(t)
+	b := newTestBackendWithOptions(t, Options{AppSemanticTasksEnabled: true})
 	if _, err := b.Write("/src.txt", []byte("shared"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}

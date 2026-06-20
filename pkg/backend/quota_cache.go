@@ -29,7 +29,7 @@ type quotaSnapshot struct {
 // Safety: the quota check is already fail-open (see ensureStorageQuotaServer).
 // A stale cache only widens the accepted-race window that was already accepted
 // in the PR #251 review (thread #pr251:000001d1). Hard quota convergence is
-// restored by the mutation replay worker and the nightly reconciliation sweep.
+// restored by MutationReplayWorker and the backfill-quota CLI tool.
 type quotaCache struct {
 	tenantID string
 	store    MetaQuotaStore

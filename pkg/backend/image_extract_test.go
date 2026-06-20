@@ -214,6 +214,7 @@ func TestAsyncImageExtractRequeuesSucceededEmbedTask(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	b := newTestBackendWithOptions(t, Options{
+		AppSemanticTasksEnabled: true,
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
 			Workers:   1,
@@ -264,6 +265,7 @@ func TestAsyncImageExtractStaleResultDoesNotRequeueOldRevision(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	b := newTestBackendWithOptions(t, Options{
+		AppSemanticTasksEnabled: true,
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
 			Workers:   1,
