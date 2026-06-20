@@ -113,10 +113,18 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 }
 
 // logAndEnqueueMutation atomically logs a mutation and enqueues its apply
-// function under mutationMu. This ensures that durable log_id order and
-// channel enqueue order are identical, preventing reordering between
-// concurrent same-tenant writes. The mutex scope is kept minimal: just the
-// log insert (~1ms) + channel send (non-blocking into 256-slot buffer).
+// function under mutationMu. This ensures that within a single backend
+// instance, durable log_id order and channel enqueue order are identical,
+// preventing reordering between concurrent same-tenant writes on this
+// process. The mutex scope is kept minimal: just the log insert (~1ms) +
+// channel send (non-blocking into 256-slot buffer).
+//
+// Cross-instance ordering: in a multi-pod deployment, each pod has its own
+// mutationMu and worker queue. Two pods can apply mutations for the same
+// tenant in different log_id order. This is a pre-existing condition — the
+// old synchronous applyLoggedQuotaMutation also had no cross-pod ordering.
+// UpsertFileMetaTx is last-writer-wins; the nightly reconciliation sweep
+// converges file_meta to the authoritative tenant DB state.
 func (b *Dat9Backend) logAndEnqueueMutation(ctx context.Context, mutationType string, payload any, apply func(tx *sql.Tx) error) {
 	start := time.Now()
 

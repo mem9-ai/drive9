@@ -78,33 +78,35 @@ func TestMutationMu_ConcurrentOrdering(t *testing.T) {
 
 	const n = 100
 	var (
-		mu    sync.Mutex
-		order []int
+		resultMu sync.Mutex
+		applied  []int // log_ids in worker apply order
+		nextID   int   // simulates auto-increment log_id
 	)
 	done := make(chan struct{})
 
 	// Simulate concurrent writers: each goroutine acquires mutationMu,
-	// records its sequence number, and enqueues — exactly what
-	// logAndEnqueueMutation does.
+	// assigns a log_id (simulating InsertMutationLog's auto-increment),
+	// and enqueues — exactly what logAndEnqueueMutation does.
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
 		wg.Add(1)
-		go func(seq int) {
+		go func() {
 			defer wg.Done()
 			b.mutationMu.Lock()
-			// Under mutationMu: "log" (record seq) + "enqueue" (channel send)
-			// are atomic, so enqueue order = seq order.
-			mySeq := seq
+			// Under mutationMu: assign log_id + enqueue are atomic.
+			// This models InsertMutationLog returning sequential IDs.
+			logID := nextID
+			nextID++
 			b.enqueueMutation(func() {
-				mu.Lock()
-				order = append(order, mySeq)
-				if len(order) == n {
+				resultMu.Lock()
+				applied = append(applied, logID)
+				if len(applied) == n {
 					close(done)
 				}
-				mu.Unlock()
+				resultMu.Unlock()
 			})
 			b.mutationMu.Unlock()
-		}(i)
+		}()
 	}
 
 	select {
@@ -114,17 +116,15 @@ func TestMutationMu_ConcurrentOrdering(t *testing.T) {
 	}
 	wg.Wait()
 
-	// Verify the worker processed mutations in the order they were
-	// enqueued (which, under mutationMu, equals log_id order).
-	// Because goroutines acquire the mutex in arbitrary order, we don't
-	// know which goroutine gets seq=0,1,2... But we DO know that the
-	// enqueue order under the mutex is strictly sequential, and the
-	// single worker preserves that FIFO. So order[i] must be
-	// monotonically increasing.
-	for i := 1; i < len(order); i++ {
-		require.Greater(t, order[i], order[i-1],
-			"apply order[%d]=%d should be > order[%d]=%d (log_id FIFO violated)",
-			i, order[i], i-1, order[i-1])
+	// Verify: worker applied mutations in strict log_id order.
+	// Because log_id is assigned inside mutationMu and enqueue happens
+	// before unlock, channel order = log_id order. Single worker
+	// preserves FIFO, so applied[i] must equal i.
+	require.Len(t, applied, n)
+	for i := 0; i < n; i++ {
+		require.Equal(t, i, applied[i],
+			"apply order[%d]=%d, want %d (log_id FIFO violated)",
+			i, applied[i], i)
 	}
 }
 

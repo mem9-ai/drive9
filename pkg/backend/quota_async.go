@@ -13,9 +13,10 @@ const (
 )
 
 // startMutationWorker initializes the async mutation queue and a single
-// sequencing worker. A single worker guarantees per-tenant mutation ordering
-// matches the log insertion order (which is serialized by the caller's
-// synchronous logQuotaMutation call).
+// sequencing worker. A single worker guarantees that within this backend
+// instance, per-tenant mutation apply order matches the log insertion order
+// (which is serialized by the caller's mutationMu + logQuotaMutation).
+// Cross-instance ordering is not guaranteed; see logAndEnqueueMutation.
 //
 // Called once from SetMetaQuotaStore when server quota is active.
 func (b *Dat9Backend) startMutationWorker() {
