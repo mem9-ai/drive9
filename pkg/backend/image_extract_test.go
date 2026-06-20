@@ -319,6 +319,7 @@ func TestAsyncImageExtractStaleResultDoesNotRequeueOldRevision(t *testing.T) {
 
 func TestProcessImageExtractTaskWritesContentTextAndQueuesEmbedTask(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
+		AppSemanticTasksEnabled: true,
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
 			Workers:   1,
