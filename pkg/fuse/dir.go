@@ -9,7 +9,7 @@ import (
 
 const (
 	defaultDirCacheTTL              = 10 * time.Second
-	defaultNamespaceCacheMaxEntries = 2000
+	defaultNamespaceCacheMaxEntries = 100000
 
 	// escalateMissThreshold/escalateMissWindow detect negative-lookup storms:
 	// once this many remote ENOENT stats hit the same directory within the

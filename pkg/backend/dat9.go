@@ -1216,6 +1216,9 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 			info.Size = e.File.SizeBytes
 			info.ModTime = fileMtime(e.File)
 			meta["resource_id"] = e.File.FileID
+			if e.File.Revision > 0 {
+				meta["revision"] = strconv.FormatInt(e.File.Revision, 10)
+			}
 			count := refCounts[e.File.FileID]
 			if count <= 0 {
 				count = 1
