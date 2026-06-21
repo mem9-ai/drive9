@@ -220,10 +220,14 @@ type Store struct {
 }
 
 func Open(dsn string) (*Store, error) {
+	return OpenContext(context.Background(), dsn)
+}
+
+func OpenContext(ctx context.Context, dsn string) (*Store, error) {
 	if strings.Contains(dsn, "multiStatements=true") {
 		return nil, fmt.Errorf("multiStatements=true is not allowed in production DSN")
 	}
-	db, err := mysqlutil.OpenInstrumented(context.Background(), dsn, mysqlutil.RoleMeta)
+	db, err := mysqlutil.OpenInstrumented(ctx, dsn, mysqlutil.RoleMeta)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
