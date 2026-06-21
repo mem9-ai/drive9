@@ -1053,6 +1053,48 @@ func TestNamespaceCache_InvalidatePrefix(t *testing.T) {
 	}
 }
 
+func TestNamespaceCache_LargeDirCachesCompleteWithHighMaxEntries(t *testing.T) {
+	// With a high maxEntries (like the new default 100000), a 10k-entry
+	// directory should be cached as complete and returned by Get().
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 100000)
+	items := make([]CachedFileInfo, 10000)
+	for i := range items {
+		items[i] = CachedFileInfo{
+			Name:     fmt.Sprintf("file_%05d.txt", i),
+			Size:     1024,
+			Revision: int64(i + 1),
+		}
+	}
+	dc.Put("/bigdir", items)
+
+	got, ok := dc.Get("/bigdir")
+	if !ok {
+		t.Fatal("10k-entry dir should be cached as complete with maxEntries=100000")
+	}
+	if len(got) != 10000 {
+		t.Fatalf("got %d cached entries, want 10000", len(got))
+	}
+	// Verify revision is preserved
+	if got[0].Revision <= 0 {
+		t.Fatal("revision should be preserved in cached entries")
+	}
+}
+
+func TestNamespaceCache_OldDefault2000DoesNotCacheLargeDir(t *testing.T) {
+	// Demonstrates the old behavior: maxEntries=2000 prevents 10k dirs
+	// from being cached as complete.
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 2000)
+	items := make([]CachedFileInfo, 10000)
+	for i := range items {
+		items[i] = CachedFileInfo{Name: fmt.Sprintf("file_%05d.txt", i)}
+	}
+	dc.Put("/bigdir", items)
+
+	if _, ok := dc.Get("/bigdir"); ok {
+		t.Fatal("10k-entry dir should NOT be cached as complete with maxEntries=2000")
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Sparse WriteBuffer with LoadPart (lazy loading) tests
 // ---------------------------------------------------------------------------

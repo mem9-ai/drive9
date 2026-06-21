@@ -242,7 +242,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		committedRev:      make(map[string]int64),
 		remoteCommitLocks: make(map[string]*sync.Mutex),
 		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, opts.ReadCacheTTL, opts.ReadCacheMaxFileBytes),
-		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
+		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, dirCacheMaxEntriesOrDefault(opts.DirCacheMaxEntries)),
 		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
 		dirtyInodes:       make(map[uint64]dirtyInodeState),
 		specialByPath:     make(map[string]uint64),
@@ -332,6 +332,13 @@ const (
 func readConcurrencyOrDefault(n int) int {
 	if n <= 0 {
 		return defaultRemoteReadConcurrency
+	}
+	return n
+}
+
+func dirCacheMaxEntriesOrDefault(n int) int {
+	if n <= 0 {
+		return defaultNamespaceCacheMaxEntries
 	}
 	return n
 }
@@ -4455,6 +4462,7 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 			Size:       item.Size,
 			IsDir:      item.IsDir,
 			Mtime:      mtime,
+			Revision:   item.Revision,
 			Mode:       item.Mode,
 			HasMode:    item.HasMode,
 			ResourceID: item.ResourceID,
@@ -8168,25 +8176,42 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 	if len(items) == 0 {
 		return
 	}
-	for start := 0; start < len(items); start += client.MaxBatchStatPaths {
-		end := start + client.MaxBatchStatPaths
-		if end > len(items) {
-			end = len(items)
+
+	// Collect indices of items that need a BatchStat (revision unknown).
+	// When the server list response includes revision (revision > 0), the
+	// item already has full metadata and no per-file stat is needed.
+	// This is backward-compatible: old servers that omit revision leave it
+	// at 0, so those entries still go through BatchStat.
+	var needStat []int
+	for i := range items {
+		if items[i].Revision <= 0 && !items[i].IsDir {
+			needStat = append(needStat, i)
 		}
-		paths := make([]string, end-start)
-		for i := start; i < end; i++ {
-			paths[i-start] = fs.remotePath(dirEntryChildPath(dirPath, items[i].Name))
+	}
+	if len(needStat) == 0 {
+		return
+	}
+
+	for batchStart := 0; batchStart < len(needStat); batchStart += client.MaxBatchStatPaths {
+		batchEnd := batchStart + client.MaxBatchStatPaths
+		if batchEnd > len(needStat) {
+			batchEnd = len(needStat)
+		}
+		batch := needStat[batchStart:batchEnd]
+		paths := make([]string, len(batch))
+		for j, idx := range batch {
+			paths[j] = fs.remotePath(dirEntryChildPath(dirPath, items[idx].Name))
 		}
 		results, err := fs.client.BatchStatCtx(ctx, paths)
 		if err != nil {
-			log.Printf("batch stat failed for %s entries %d-%d: %v", dirPath, start, end, err)
+			log.Printf("batch stat failed for %s entries %d-%d: %v", dirPath, batchStart, batchEnd, err)
 			return
 		}
-		for i, result := range results {
+		for j, result := range results {
 			if !result.OK() {
 				continue
 			}
-			item := &items[start+i]
+			item := &items[batch[j]]
 			item.Size = result.Size
 			item.IsDir = result.IsDir
 			if result.Mtime > 0 {

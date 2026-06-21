@@ -419,6 +419,7 @@ func TestListDir(t *testing.T) {
 		Entries []struct {
 			Name       string `json:"name"`
 			IsDir      bool   `json:"isDir"`
+			Revision   int64  `json:"revision"`
 			ResourceID string `json:"resource_id"`
 			Nlink      uint32 `json:"nlink"`
 		} `json:"entries"`
@@ -434,6 +435,9 @@ func TestListDir(t *testing.T) {
 	}
 	if result.Entries[0].Nlink != 1 {
 		t.Fatalf("list entry nlink = %d, want 1", result.Entries[0].Nlink)
+	}
+	if result.Entries[0].Revision <= 0 {
+		t.Fatalf("list entry revision = %d, want > 0", result.Entries[0].Revision)
 	}
 }
 
