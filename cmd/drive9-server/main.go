@@ -120,7 +120,7 @@ func main() {
 	}
 	backendOptions.AppSemanticTasksEnabled = semanticEmbedder != nil
 
-	store, err := meta.Open(metaDSN)
+	store, err := openControlPlaneStoreWithRetry(context.Background(), metaDSN, defaultStartupRetryOptions())
 	if err != nil {
 		die(fmt.Errorf("open control-plane store: %w", err))
 	}
@@ -226,7 +226,7 @@ func main() {
 			die(fmt.Errorf("create encryptor: %w", err))
 		}
 
-		if err := store.DB().Ping(); err != nil {
+		if err := pingControlPlaneDBWithRetry(context.Background(), store, defaultStartupRetryOptions()); err != nil {
 			die(fmt.Errorf("control-plane db unavailable: %w", err))
 		}
 
