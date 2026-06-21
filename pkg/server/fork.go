@@ -115,6 +115,21 @@ func (s *Server) handleForkCreate(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := s.createForkTenant(r.Context(), scope.TenantID, req.Name, credentialReq)
 	if err != nil {
+		var provisionErr *forkProvisionFailedError
+		if errors.As(err, &provisionErr) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"tenant_id":        provisionErr.TenantID,
+				"name":             provisionErr.Name,
+				"api_key":          provisionErr.APIKey,
+				"status":           string(meta.TenantFailed),
+				"message":          "Fork provisioning failed. Use this API key to access and delete the fork, then retry creation.",
+				"parent_tenant_id": scope.TenantID,
+				"storage":          "shared",
+			})
+			return
+		}
 		code := http.StatusInternalServerError
 		var statusErr *forkStatusError
 		if errors.As(err, &statusErr) {
@@ -371,13 +386,6 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, err
 	}
 
-	if source.Provider == tenant.ProviderTiDBCloudNative {
-		if err := s.provisionForkTenantOnceWithCredentials(ctx, forkID, credentialReq); err != nil {
-			s.markForkDeletedOrFailedAfterBranchDelete(ctx, forkID, credentialReq, cluster)
-			return nil, err
-		}
-	}
-
 	apiToken, err := token.IssueToken(s.tokenSecret, forkID, 1)
 	if err != nil {
 		s.cleanupForkCreateFailure(ctx, forkID, source.Provider, credentialReq, cluster)
@@ -404,6 +412,13 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, err
 	}
 
+	if source.Provider == tenant.ProviderTiDBCloudNative {
+		if err := s.provisionForkTenantOnceWithCredentials(ctx, forkID, credentialReq); err != nil {
+			s.markForkDeletedOrFailedAfterBranchDelete(ctx, forkID, credentialReq, cluster)
+			return nil, &forkProvisionFailedError{APIKey: apiToken, TenantID: forkID, Name: displayName, Err: err}
+		}
+	}
+
 	if source.Provider != tenant.ProviderTiDBCloudNative {
 		s.startForkProvision(ctx, forkID)
 	}
@@ -417,6 +432,21 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		ParentTenantID: source.ID,
 		Storage:        "shared",
 	}, nil
+}
+
+type forkProvisionFailedError struct {
+	APIKey   string
+	TenantID string
+	Name     string
+	Err      error
+}
+
+func (e *forkProvisionFailedError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *forkProvisionFailedError) Unwrap() error {
+	return e.Err
 }
 
 func (s *Server) provisionForkTenantAsync(ctx context.Context, forkID string) {
