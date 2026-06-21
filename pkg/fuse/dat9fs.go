@@ -8182,9 +8182,17 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 	// item already has full metadata and no per-file stat is needed.
 	// This is backward-compatible: old servers that omit revision leave it
 	// at 0, so those entries still go through BatchStat.
+	//
+	// Directories are always skipped: they have no file revision, and the
+	// list API already returns their full metadata (name, isDir, mtime,
+	// mode, resourceID, nlink). BatchStat added no new information for
+	// directories.
 	var needStat []int
 	for i := range items {
-		if items[i].Revision <= 0 && !items[i].IsDir {
+		if items[i].IsDir {
+			continue
+		}
+		if items[i].Revision <= 0 {
 			needStat = append(needStat, i)
 		}
 	}
@@ -8204,7 +8212,7 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 		}
 		results, err := fs.client.BatchStatCtx(ctx, paths)
 		if err != nil {
-			log.Printf("batch stat failed for %s entries %d-%d: %v", dirPath, batchStart, batchEnd, err)
+			log.Printf("batch stat failed for %s (needStat batch %d-%d of %d): %v", dirPath, batchStart, batchEnd, len(needStat), err)
 			return
 		}
 		for j, result := range results {
