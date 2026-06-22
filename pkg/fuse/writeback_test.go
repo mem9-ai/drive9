@@ -3596,6 +3596,189 @@ func TestSamePathConsecutiveSaves(t *testing.T) {
 	}
 }
 
+// TestWriteBackCache_ConcurrentPutSamePath verifies that concurrent Puts to
+// the same path under the per-path lock produce a consistent final state.
+func TestWriteBackCache_ConcurrentPutSamePath(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 8
+	const iterations = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				data := []byte(fmt.Sprintf("g%d-i%d", g, i))
+				_ = cache.Put("/concurrent.txt", data, int64(len(data)), PendingNew)
+			}
+		}()
+	}
+	wg.Wait()
+
+	// After all Puts, exactly one entry should exist with valid data.
+	meta, ok := cache.GetMeta("/concurrent.txt")
+	if !ok {
+		t.Fatal("meta should exist after concurrent Puts")
+	}
+	data, ok := cache.Get("/concurrent.txt")
+	if !ok {
+		t.Fatal("data should exist after concurrent Puts")
+	}
+	if int64(len(data)) != meta.Size {
+		t.Fatalf("data len %d != meta size %d", len(data), meta.Size)
+	}
+}
+
+// TestWriteBackCache_ConcurrentPutAndRemove verifies that concurrent Put and
+// Remove on the same path don't corrupt state or leave orphan files.
+func TestWriteBackCache_ConcurrentPutAndRemove(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 4
+	const iterations = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 2)
+	for g := 0; g < goroutines; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				data := []byte(fmt.Sprintf("put-g%d-i%d", g, i))
+				_ = cache.Put("/put-rm.txt", data, int64(len(data)), PendingNew)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				cache.Remove("/put-rm.txt")
+			}
+		}()
+	}
+	wg.Wait()
+
+	// After the storm, state must be consistent: either present with valid
+	// meta+data, or fully absent.
+	meta, metaOK := cache.GetMeta("/put-rm.txt")
+	data, dataOK := cache.Get("/put-rm.txt")
+	if metaOK != dataOK {
+		t.Fatalf("inconsistent: metaOK=%v dataOK=%v", metaOK, dataOK)
+	}
+	if metaOK && int64(len(data)) != meta.Size {
+		t.Fatalf("data len %d != meta size %d", len(data), meta.Size)
+	}
+}
+
+// TestWriteBackCache_ConcurrentPutAndRename verifies that concurrent Put and
+// RenamePending on the same path don't produce orphan files or inconsistent state.
+func TestWriteBackCache_ConcurrentPutAndRename(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Seed initial entry so RenamePending has something to work with.
+	_ = cache.Put("/rename-src.txt", []byte("seed"), 4, PendingNew)
+
+	const goroutines = 4
+	const iterations = 15
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 2)
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				data := []byte(fmt.Sprintf("data-%d", i))
+				_ = cache.Put("/rename-src.txt", data, int64(len(data)), PendingNew)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				cache.RenamePending("/rename-src.txt", "/rename-dst.txt")
+				// Rename back so the next iteration has a source.
+				cache.RenamePending("/rename-dst.txt", "/rename-src.txt")
+			}
+		}()
+	}
+	wg.Wait()
+
+	// After the storm, one of src or dst should hold valid data (or both absent).
+	srcMeta, srcOK := cache.GetMeta("/rename-src.txt")
+	dstMeta, dstOK := cache.GetMeta("/rename-dst.txt")
+	if srcOK {
+		data, ok := cache.Get("/rename-src.txt")
+		if !ok {
+			t.Fatal("src meta present but data absent")
+		}
+		if int64(len(data)) != srcMeta.Size {
+			t.Fatalf("src data len %d != meta size %d", len(data), srcMeta.Size)
+		}
+	}
+	if dstOK {
+		data, ok := cache.Get("/rename-dst.txt")
+		if !ok {
+			t.Fatal("dst meta present but data absent")
+		}
+		if int64(len(data)) != dstMeta.Size {
+			t.Fatalf("dst data len %d != meta size %d", len(data), dstMeta.Size)
+		}
+	}
+}
+
+// TestWriteBackCache_RemoveIfGeneration verifies the atomic generation-checked remove.
+func TestWriteBackCache_RemoveIfGeneration(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = cache.Put("/gen-rm.txt", []byte("v1"), 2, PendingNew)
+	meta1, _ := cache.GetMeta("/gen-rm.txt")
+	gen1 := meta1.Generation
+
+	// Overwrite with v2 → new generation.
+	_ = cache.Put("/gen-rm.txt", []byte("v2"), 2, PendingNew)
+	meta2, _ := cache.GetMeta("/gen-rm.txt")
+	gen2 := meta2.Generation
+
+	if gen2 <= gen1 {
+		t.Fatalf("gen2 %d should be > gen1 %d", gen2, gen1)
+	}
+
+	// RemoveIfGeneration with stale gen should NOT remove.
+	if cache.RemoveIfGeneration("/gen-rm.txt", gen1) {
+		t.Fatal("RemoveIfGeneration should return false for stale generation")
+	}
+	if _, ok := cache.GetMeta("/gen-rm.txt"); !ok {
+		t.Fatal("entry should still exist after stale RemoveIfGeneration")
+	}
+
+	// RemoveIfGeneration with current gen should remove.
+	if !cache.RemoveIfGeneration("/gen-rm.txt", gen2) {
+		t.Fatal("RemoveIfGeneration should return true for matching generation")
+	}
+	if _, ok := cache.GetMeta("/gen-rm.txt"); ok {
+		t.Fatal("entry should be removed after matching RemoveIfGeneration")
+	}
+
+	// RemoveIfGeneration on nonexistent path should return false.
+	if cache.RemoveIfGeneration("/nonexistent.txt", 999) {
+		t.Fatal("RemoveIfGeneration should return false for nonexistent path")
+	}
+}
+
 // TestLookupFindsPendingWriteBack verifies that Lookup returns metadata
 // for files that only exist in the write-back cache (pending upload).
 func TestLookupFindsPendingWriteBack(t *testing.T) {
