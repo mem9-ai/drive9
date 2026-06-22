@@ -1260,6 +1260,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		Size       int64  `json:"size"`
 		IsDir      bool   `json:"isDir"`
 		Mtime      int64  `json:"mtime,omitempty"`
+		Revision   int64  `json:"revision,omitempty"`
 		Mode       uint32 `json:"mode,omitempty"`
 		HasMode    bool   `json:"hasMode"`
 		ResourceID string `json:"resource_id,omitempty"`
@@ -1270,6 +1271,12 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		var mtime int64
 		if !e.ModTime.IsZero() {
 			mtime = e.ModTime.Unix()
+		}
+		var revision int64
+		if raw := e.Meta.Content["revision"]; raw != "" {
+			if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil {
+				revision = parsed
+			}
 		}
 		hasMode := e.Meta.Content["hasMode"] == "true"
 		var nlink uint32
@@ -1283,6 +1290,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 			Size:       e.Size,
 			IsDir:      e.IsDir,
 			Mtime:      mtime,
+			Revision:   revision,
 			Mode:       e.Mode,
 			HasMode:    hasMode,
 			ResourceID: e.Meta.Content["resource_id"],

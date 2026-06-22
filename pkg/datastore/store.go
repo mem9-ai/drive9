@@ -607,7 +607,7 @@ func (s *Store) RenameDir(ctx context.Context, oldPrefix, newPrefix string) (cou
 	}
 	_ = rows.Close()
 	if len(updates) == 0 {
-		return 0, ErrNotFound
+		return 0, nil
 	}
 
 	type dstRef struct {
