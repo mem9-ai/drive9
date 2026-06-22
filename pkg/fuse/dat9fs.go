@@ -2812,15 +2812,24 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 		return syscall.ENOTSUP
 	}
 	mode, hasMode := fs.modeForPendingHandle(fh)
-	return fs.writeBack.PutWithBaseRevAndMode(
+
+	bvStart := time.Now()
+	data := fh.Dirty.bytesView()
+	bvDur := time.Since(bvStart)
+
+	timings, err := fs.writeBack.PutWithBaseRevAndModeTimings(
 		fh.Path,
-		fh.Dirty.bytesView(),
+		data,
 		fh.Dirty.Size(),
 		fs.pendingKindForHandle(fh),
 		fh.BaseRev,
 		mode,
 		hasMode,
 	)
+	if fs.perf != nil {
+		fs.perf.recordSnapshotWBSubPhases(bvDur, timings)
+	}
+	return err
 }
 
 func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *WriteBackMeta) error {

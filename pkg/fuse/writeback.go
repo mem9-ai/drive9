@@ -183,17 +183,38 @@ func (c *WriteBackCache) PutWithBaseRev(remotePath string, data []byte, size int
 	return c.PutWithBaseRevAndMode(remotePath, data, size, kind, baseRev, 0, false)
 }
 
+// WriteBackPutTimings captures sub-phase durations inside PutWithBaseRevAndMode
+// for diagnostic instrumentation. All fields are zero when not instrumented.
+type WriteBackPutTimings struct {
+	LockWait  time.Duration // time spent waiting for WriteBackCache.mu
+	DatWrite  time.Duration // atomicWrite of the .dat file (data + fsync + rename)
+	MetaWrite time.Duration // atomicWrite of the .meta file (meta + fsync + rename)
+}
+
 // PutWithBaseRevAndMode is like PutWithBaseRev, but also persists the file
 // permission bits that should be applied once the pending data is remote.
 func (c *WriteBackCache) PutWithBaseRevAndMode(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) error {
+	_, err := c.PutWithBaseRevAndModeTimings(remotePath, data, size, kind, baseRev, mode, hasMode)
+	return err
+}
+
+// PutWithBaseRevAndModeTimings is like PutWithBaseRevAndMode but also returns
+// sub-phase timings for diagnostic instrumentation.
+func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (WriteBackPutTimings, error) {
+	var t WriteBackPutTimings
+
+	lockStart := time.Now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	t.LockWait = time.Since(lockStart)
 
 	// Write .dat via temp + fsync + rename (atomic).
 	datPath := c.datFile(remotePath)
+	datStart := time.Now()
 	if err := atomicWrite(datPath, data); err != nil {
-		return fmt.Errorf("writeback put data: %w", err)
+		return t, fmt.Errorf("writeback put data: %w", err)
 	}
+	t.DatWrite = time.Since(datStart)
 
 	// Write .meta via temp + rename.
 	meta := WriteBackMeta{
@@ -209,18 +230,21 @@ func (c *WriteBackCache) PutWithBaseRevAndMode(remotePath string, data []byte, s
 	}
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
-		return fmt.Errorf("writeback marshal meta: %w", err)
+		return t, fmt.Errorf("writeback marshal meta: %w", err)
 	}
 	metaPath := c.metaFile(remotePath)
+	metaStart := time.Now()
 	if err := atomicWrite(metaPath, metaBytes); err != nil {
 		// Best-effort cleanup of the .dat file if meta write fails.
 		_ = os.Remove(datPath)
-		return fmt.Errorf("writeback put meta: %w", err)
+		return t, fmt.Errorf("writeback put meta: %w", err)
 	}
+	t.MetaWrite = time.Since(metaStart)
+
 	cp := meta
 	c.metas[remotePath] = &cp
 	c.cacheDataLocked(remotePath, data, size)
-	return nil
+	return t, nil
 }
 
 // Get reads the cached data for remotePath. Returns nil, false if not cached.

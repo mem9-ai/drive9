@@ -148,6 +148,16 @@ type fusePerfCounters struct {
 	flushSnapshotWBTotalNS  atomicUint64
 	flushSnapshotWBMaxNS    atomicUint64
 
+	// snapshotWriteBackLocked sub-phase counters
+	snapshotWBBytesViewTotalNS atomicUint64
+	snapshotWBBytesViewMaxNS   atomicUint64
+	snapshotWBLockWaitTotalNS  atomicUint64
+	snapshotWBLockWaitMaxNS    atomicUint64
+	snapshotWBDatWriteTotalNS  atomicUint64
+	snapshotWBDatWriteMaxNS    atomicUint64
+	snapshotWBMetaWriteTotalNS atomicUint64
+	snapshotWBMetaWriteMaxNS   atomicUint64
+
 	sseChange       atomicUint64
 	sseReset        atomicUint64
 	sseSelfFiltered atomicUint64
@@ -298,6 +308,27 @@ func (p *fusePerfCounters) recordFlushSnapshotWB(dur time.Duration) {
 	p.flushSnapshotWBMaxNS.max(ns)
 }
 
+func (p *fusePerfCounters) recordSnapshotWBSubPhases(bytesViewDur time.Duration, wbTimings WriteBackPutTimings) {
+	if !p.isEnabled() {
+		return
+	}
+	bv := uint64(bytesViewDur)
+	p.snapshotWBBytesViewTotalNS.add(bv)
+	p.snapshotWBBytesViewMaxNS.max(bv)
+
+	lw := uint64(wbTimings.LockWait)
+	p.snapshotWBLockWaitTotalNS.add(lw)
+	p.snapshotWBLockWaitMaxNS.max(lw)
+
+	dw := uint64(wbTimings.DatWrite)
+	p.snapshotWBDatWriteTotalNS.add(dw)
+	p.snapshotWBDatWriteMaxNS.max(dw)
+
+	mw := uint64(wbTimings.MetaWrite)
+	p.snapshotWBMetaWriteTotalNS.add(mw)
+	p.snapshotWBMetaWriteMaxNS.max(mw)
+}
+
 func (p *fusePerfCounters) recordLocalPolicy(source policyMatchSource) {
 	if !p.isEnabled() {
 		return
@@ -434,6 +465,14 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	snap.Counters["flush_snapshot_wb_count"] = p.flushSnapshotWBCount.load()
 	snap.Counters["flush_snapshot_wb_total_ns"] = p.flushSnapshotWBTotalNS.load()
 	snap.Counters["flush_snapshot_wb_max_ns"] = p.flushSnapshotWBMaxNS.load()
+	snap.Counters["snapshot_wb_bytes_view_total_ns"] = p.snapshotWBBytesViewTotalNS.load()
+	snap.Counters["snapshot_wb_bytes_view_max_ns"] = p.snapshotWBBytesViewMaxNS.load()
+	snap.Counters["snapshot_wb_lock_wait_total_ns"] = p.snapshotWBLockWaitTotalNS.load()
+	snap.Counters["snapshot_wb_lock_wait_max_ns"] = p.snapshotWBLockWaitMaxNS.load()
+	snap.Counters["snapshot_wb_dat_write_total_ns"] = p.snapshotWBDatWriteTotalNS.load()
+	snap.Counters["snapshot_wb_dat_write_max_ns"] = p.snapshotWBDatWriteMaxNS.load()
+	snap.Counters["snapshot_wb_meta_write_total_ns"] = p.snapshotWBMetaWriteTotalNS.load()
+	snap.Counters["snapshot_wb_meta_write_max_ns"] = p.snapshotWBMetaWriteMaxNS.load()
 	snap.Counters["sse_change"] = p.sseChange.load()
 	snap.Counters["sse_reset"] = p.sseReset.load()
 	snap.Counters["sse_self_filtered"] = p.sseSelfFiltered.load()
@@ -500,6 +539,16 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 		snap.Counters["flush_snapshot_wb_count"],
 		avgDuration(snap.Counters["flush_snapshot_wb_total_ns"], snap.Counters["flush_snapshot_wb_count"]).Truncate(time.Microsecond),
 		time.Duration(snap.Counters["flush_snapshot_wb_max_ns"]).Truncate(time.Microsecond))
+	wbCount := snap.Counters["flush_snapshot_wb_count"]
+	writePerfLine(w, "drive9: perf snapshot_wb_detail bytes_view_avg=%s bytes_view_max=%s lock_wait_avg=%s lock_wait_max=%s dat_write_avg=%s dat_write_max=%s meta_write_avg=%s meta_write_max=%s\n",
+		avgDuration(snap.Counters["snapshot_wb_bytes_view_total_ns"], wbCount).Truncate(time.Microsecond),
+		time.Duration(snap.Counters["snapshot_wb_bytes_view_max_ns"]).Truncate(time.Microsecond),
+		avgDuration(snap.Counters["snapshot_wb_lock_wait_total_ns"], wbCount).Truncate(time.Microsecond),
+		time.Duration(snap.Counters["snapshot_wb_lock_wait_max_ns"]).Truncate(time.Microsecond),
+		avgDuration(snap.Counters["snapshot_wb_dat_write_total_ns"], wbCount).Truncate(time.Microsecond),
+		time.Duration(snap.Counters["snapshot_wb_dat_write_max_ns"]).Truncate(time.Microsecond),
+		avgDuration(snap.Counters["snapshot_wb_meta_write_total_ns"], wbCount).Truncate(time.Microsecond),
+		time.Duration(snap.Counters["snapshot_wb_meta_write_max_ns"]).Truncate(time.Microsecond))
 	writePerfLine(w, "drive9: perf uploader submit=%d sync_fallback=%d success=%d failure=%d drain_count=%d drain_total=%s\n",
 		snap.Counters["uploader_submit"], snap.Counters["uploader_sync_fallback"],
 		snap.Counters["uploader_success"], snap.Counters["uploader_failure"],
