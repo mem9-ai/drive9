@@ -46,12 +46,6 @@ export function computeCrc32c(data: Uint8Array): string {
   );
 }
 
-async function sha256Base64(data: Uint8Array): Promise<string> {
-  const input = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
-  const hash = await crypto.subtle.digest("SHA-256", input);
-  return bytesToBase64(new Uint8Array(hash));
-}
-
 async function streamToUint8Array(stream: ReadableStream<Uint8Array>, size: number): Promise<Uint8Array> {
   const result = new Uint8Array(size);
   let offset = 0;

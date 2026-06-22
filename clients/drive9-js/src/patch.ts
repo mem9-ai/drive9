@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
+
 import { Client } from "./client.js";
-import { bodyInit, bufferSource } from "./compat.js";
+import { bodyInit } from "./compat.js";
 import { checkError, Drive9Error } from "./error.js";
 import type { PatchPartURL, PatchPlan } from "./models.js";
 import { Semaphore } from "./utils.js";
@@ -87,12 +89,6 @@ async function uploadPatchPart(client: Client, part: PatchPartURL, readPart: Rea
   await checkError(resp);
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  const binString = Array.from(bytes, (b) => String.fromCharCode(b)).join("");
-  return (globalThis as any).btoa(binString);
-}
-
 async function sha256Base64(data: Uint8Array): Promise<string> {
-  const hash = await crypto.subtle.digest("SHA-256", bufferSource(data));
-  return bytesToBase64(new Uint8Array(hash));
+  return createHash("sha256").update(data).digest("base64");
 }
