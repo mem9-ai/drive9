@@ -601,7 +601,8 @@ func ctxForkCmd(args []string) error {
 		fmt.Println("The fork is still provisioning. Wait a moment, then retry a command like `drive9 fs ls /`; `fs` commands may fail until the tenant becomes active.")
 	}
 	if result.Status == "failed" {
-		fmt.Println("Fork provisioning failed. The fork context has been saved with this API key so you can inspect and delete it. Run `drive9 ctx delete " + newName + "` to clean up, then retry creation.")
+		fmt.Printf("Fork provisioning failed. The fork context %q has been saved with its API key.\n", newName)
+		fmt.Printf("To clean up the failed fork, switch to it with `drive9 ctx use %s` and run `drive9 delete`.\n", newName)
 	}
 	return nil
 }
