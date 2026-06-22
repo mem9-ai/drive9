@@ -4054,6 +4054,72 @@ func TestWriteBackCache_GetMetaBlocksDuringInflightPut(t *testing.T) {
 	}
 }
 
+// TestWriteBackCache_ListByPrefixWaitsInflightPut verifies that ListByPrefix
+// waits for in-flight per-path operations under the prefix before scanning,
+// so rmdir/rename mutation paths don't miss entries being written.
+// Regression test for mornyx review comment about ListByPrefix visibility gap.
+func TestWriteBackCache_ListByPrefixWaitsInflightPut(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const prefix = "/mydir/"
+	const childPath = "/mydir/child.txt"
+
+	// Seed a child entry.
+	_ = cache.Put(childPath, []byte("data"), 4, PendingNew)
+
+	// Simulate an in-flight Put on a second child by holding its pathLock.
+	const inflightPath = "/mydir/inflight.txt"
+	pl := cache.acquirePathLock(inflightPath)
+
+	// ListByPrefix should block waiting for the in-flight pathLock.
+	done := make(chan []*WriteBackMeta)
+	go func() {
+		result := cache.ListByPrefix(prefix)
+		done <- result
+	}()
+
+	// Give the goroutine time to start and block.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("ListByPrefix should block while pathLock under prefix is held")
+	default:
+		// Expected: ListByPrefix is blocked.
+	}
+
+	// Simulate Phase 3 publish: add the entry to c.metas, then release pathLock.
+	cache.mu.Lock()
+	cache.metas[inflightPath] = &WriteBackMeta{
+		Path:       inflightPath,
+		Size:       5,
+		Kind:       PendingNew,
+		Generation: cache.nextGen.Add(1),
+	}
+	cache.mu.Unlock()
+	cache.releasePathLock(inflightPath, pl)
+
+	// ListByPrefix should now return both entries.
+	select {
+	case result := <-done:
+		if len(result) != 2 {
+			t.Fatalf("ListByPrefix returned %d entries, want 2", len(result))
+		}
+		paths := map[string]bool{}
+		for _, m := range result {
+			paths[m.Path] = true
+		}
+		if !paths[childPath] || !paths[inflightPath] {
+			t.Fatalf("ListByPrefix missing expected paths: got %v", paths)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListByPrefix did not unblock after pathLock release")
+	}
+}
+
 // TestLookupFindsPendingWriteBack verifies that Lookup returns metadata
 // for files that only exist in the write-back cache (pending upload).
 func TestLookupFindsPendingWriteBack(t *testing.T) {

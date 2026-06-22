@@ -679,7 +679,29 @@ func (c *WriteBackCache) PendingSummary() (count int, bytes int64, firstPath str
 }
 
 // ListByPrefix returns metadata for pending entries under prefix.
+// It first waits for any in-flight per-path operations (Put, Remove, etc.)
+// under the prefix to complete, so callers in mutation paths (rmdir, rename)
+// see a consistent snapshot that includes entries currently being written.
 func (c *WriteBackCache) ListByPrefix(prefix string) []*WriteBackMeta {
+	// Collect paths with in-flight operations under prefix.
+	c.mu.Lock()
+	var inflightPaths []string
+	for p := range c.pathLocks {
+		if strings.HasPrefix(p, prefix) {
+			inflightPaths = append(inflightPaths, p)
+		}
+	}
+	c.mu.Unlock()
+
+	// Wait for each in-flight operation to finish by acquiring and immediately
+	// releasing its per-path lock. This guarantees the operation has completed
+	// and published its results to c.metas before we scan.
+	for _, p := range inflightPaths {
+		pl := c.acquirePathLock(p)
+		c.releasePathLock(p, pl)
+	}
+
+	// Now scan metadata — all in-flight operations under prefix have completed.
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
