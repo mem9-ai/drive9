@@ -386,12 +386,6 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, err
 	}
 
-	if source.Provider == tenant.ProviderTiDBCloudNative && cluster.Host == "" && resolveDefaultCredentials(s.provisioner) == nil {
-		s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster)
-		s.markForkFailed(ctx, forkID)
-		return nil, forkErr(http.StatusBadRequest, "branch response missing endpoint; server default TiDB Cloud credential is required to provision this fork")
-	}
-
 	apiToken, err := token.IssueToken(s.tokenSecret, forkID, 1)
 	if err != nil {
 		s.cleanupForkCreateFailure(ctx, forkID, source.Provider, credentialReq, cluster)
@@ -416,6 +410,23 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	}); err != nil {
 		s.cleanupForkCreateFailure(ctx, forkID, source.Provider, credentialReq, cluster)
 		return nil, err
+	}
+
+	if source.Provider == tenant.ProviderTiDBCloudNative && cluster.Host == "" && resolveDefaultCredentials(s.provisioner) == nil {
+		if s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster) {
+			if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantDeleted); err != nil {
+				logger.Error(ctx, "fork_credential_gate_mark_deleted_failed",
+					zap.String("tenant_id", forkID), zap.Error(err))
+			}
+		} else {
+			s.markForkFailed(ctx, forkID)
+		}
+		return nil, &forkProvisionFailedError{
+			APIKey:   apiToken,
+			TenantID: forkID,
+			Name:     displayName,
+			Err:      forkErr(http.StatusBadRequest, "branch response missing endpoint; server default TiDB Cloud credential is required to provision this fork"),
+		}
 	}
 
 	if source.Provider == tenant.ProviderTiDBCloudNative {
