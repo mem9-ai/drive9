@@ -1,6 +1,13 @@
 import { Client } from "./client.js";
 import { checkError, Drive9Error } from "./error.js";
-import type { VaultAuditEvent, VaultSecret, VaultTokenIssueResponse } from "./models.js";
+import type {
+  VaultAuditEvent,
+  VaultGrantIssueRequest,
+  VaultGrantIssueResponse,
+  VaultGrantRevokeRequest,
+  VaultSecret,
+  VaultTokenIssueResponse,
+} from "./models.js";
 
 export async function createVaultSecret(
   client: Client,
@@ -73,6 +80,35 @@ export async function revokeVaultToken(client: Client, tokenId: string): Promise
   await checkError(resp);
 }
 
+export async function issueVaultGrant(
+  client: Client,
+  req: VaultGrantIssueRequest
+): Promise<VaultGrantIssueResponse> {
+  const resp = await fetch(client.vaultUrl("/grants"), {
+    method: "POST",
+    headers: client["authHeaders"]({ "Content-Type": "application/json" }),
+    body: JSON.stringify(req),
+  });
+  await checkError(resp);
+  return (await resp.json()) as VaultGrantIssueResponse;
+}
+
+export async function revokeVaultGrant(
+  client: Client,
+  grantId: string,
+  req: VaultGrantRevokeRequest = {}
+): Promise<void> {
+  const resp = await fetch(client.vaultUrl(`/grants/${encodeURIComponent(grantId)}`), {
+    method: "DELETE",
+    headers: client["authHeaders"]({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      revoked_by: req.revoked_by || "",
+      reason: req.reason || "",
+    }),
+  });
+  await checkError(resp);
+}
+
 export async function queryVaultAudit(
   client: Client,
   secretName?: string,
@@ -110,6 +146,26 @@ export async function readVaultSecret(
 export async function readVaultSecretField(client: Client, name: string, field: string): Promise<string> {
   const resp = await fetch(
     client.vaultUrl(`/read/${encodeURIComponent(name)}/${encodeURIComponent(field)}`),
+    { headers: client["authHeaders"]() }
+  );
+  await checkError(resp);
+  return await resp.text();
+}
+
+export async function readVaultSecretAsOwner(
+  client: Client,
+  name: string
+): Promise<Record<string, unknown>> {
+  const resp = await fetch(client.vaultUrl(`/secrets/${encodeURIComponent(name)}/value`), {
+    headers: client["authHeaders"](),
+  });
+  await checkError(resp);
+  return (await resp.json()) as Record<string, unknown>;
+}
+
+export async function readVaultSecretFieldAsOwner(client: Client, name: string, field: string): Promise<string> {
+  const resp = await fetch(
+    client.vaultUrl(`/secrets/${encodeURIComponent(name)}/value/${encodeURIComponent(field)}`),
     { headers: client["authHeaders"]() }
   );
   await checkError(resp);

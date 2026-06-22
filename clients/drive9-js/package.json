@@ -1,6 +1,6 @@
 {
   "name": "drive9",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TypeScript SDK for drive9 — an agent-native filesystem with semantic search",
   "type": "module",
   "main": "./dist/index.cjs",

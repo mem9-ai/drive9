@@ -84,6 +84,30 @@ describe("Client basic ops", () => {
     );
   });
 
+  it("preserves repeated tag headers as separate header tuples", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ revision: 1 }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+    try {
+      const client = new Client("http://localhost:9009", "test-key");
+      await client.writeWithRevision("/tags.txt", new TextEncoder().encode("x"), {
+        tags: { kind: "note", owner: "agent" },
+      });
+      const init = fetchSpy.mock.calls[0][1] as RequestInit;
+      expect(Array.isArray(init.headers)).toBe(true);
+      const headers = init.headers as [string, string][];
+      expect(headers.filter(([k]) => k.toLowerCase() === "x-dat9-tag").map(([, v]) => v)).toEqual([
+        "kind=note",
+        "owner=agent",
+      ]);
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
   it("copies and renames", async () => {
     server.use(
       http.post("http://localhost:9009/v1/fs/dst.txt", ({ request }) => {
