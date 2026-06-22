@@ -16,9 +16,9 @@ import (
 	"time"
 
 	gofuse "github.com/hanwen/go-fuse/v2/fuse"
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/mountpath"
-	"github.com/mem9-ai/dat9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountpath"
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 // MountOptions configures the FUSE mount.
@@ -38,6 +38,7 @@ type MountOptions struct {
 	CacheDir                string        // write-back cache directory (default ~/.cache/drive9); empty string uses default
 	CacheSize               int64         // ReadCache max size in bytes (default 128MB)
 	ReadCacheMaxFileBytes   int64         // largest single file admitted to ReadCache and fetched whole-file in one request (default 4MiB)
+	ReadCacheTTL            time.Duration // ReadCache TTL (default 30s; negative disables time-based expiry)
 	DiskReadCacheSize       int64         // disk-backed read cache max size in bytes (default 1GiB)
 	DiskReadCacheFreeRatio  float64       // minimum filesystem free-space ratio before disk read cache evicts (default 0.10)
 	DirTTL                  time.Duration // DirCache TTL (default 10s)
@@ -67,12 +68,14 @@ type MountOptions struct {
 	PrefetchMaxFileBytes    int64         // maximum individual file size prefetched (default 50KB)
 	PrefetchMaxBytes        int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
 	PrefetchTimeout         time.Duration // timeout for one readdir prefetch batch (default 1s)
+	DirCacheMaxEntries      int           // maximum entries per directory in DirCache (default 100000); directories exceeding this limit are not cached as complete
 	TrustLocalEvents        bool          // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
 	AllowOther              bool          // allow other users to access mount
 	ReadOnly                bool          // mount as read-only
 	Debug                   bool          // enable FUSE debug logging
 	PerfCounters            bool          // print low-overhead FUSE perf counter summary on shutdown
 	EnableGitWorkspaces     bool          // enable fast-clone git workspace overlay discovery
+	Profiling               ProfilingOptions
 }
 
 const defaultUploadConcurrency = 16
@@ -88,6 +91,9 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.ReadCacheMaxFileBytes <= 0 {
 		o.ReadCacheMaxFileBytes = defaultReadCacheMaxFileSize
+	}
+	if o.ReadCacheTTL == 0 {
+		o.ReadCacheTTL = defaultReadCacheTTL
 	}
 	if o.DiskReadCacheSize <= 0 {
 		o.DiskReadCacheSize = defaultDiskReadCacheMaxSize
@@ -144,6 +150,27 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.PrefetchTimeout <= 0 {
 		o.PrefetchTimeout = defaultReadDirPrefetchTimeout
+	}
+	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfSampleInterval <= 0 {
+		o.Profiling.PerfSampleInterval = 10 * time.Second
+	}
+	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfMaxSamples <= 0 {
+		o.Profiling.PerfMaxSamples = defaultPerfMaxSamples
+	}
+	if o.Profiling.PerfSamplesPath != "" && o.Profiling.PerfMaxSampleFiles <= 0 {
+		o.Profiling.PerfMaxSampleFiles = defaultPerfMaxSampleFiles
+	}
+	if o.Profiling.ProfileDir != "" && o.Profiling.CPUProfileDuration <= 0 {
+		o.Profiling.CPUProfileDuration = defaultCPUProfileDuration
+	}
+	if o.Profiling.ProfileDir != "" && o.Profiling.CPUProfileInterval <= 0 {
+		o.Profiling.CPUProfileInterval = defaultCPUProfileInterval
+	}
+	if o.Profiling.ProfileDir != "" && o.Profiling.HeapProfileInterval <= 0 {
+		o.Profiling.HeapProfileInterval = defaultHeapProfileInterval
+	}
+	if o.Profiling.ProfileDir != "" && o.Profiling.PerfMaxProfileFiles <= 0 {
+		o.Profiling.PerfMaxProfileFiles = defaultPerfMaxProfileFiles
 	}
 }
 
@@ -244,10 +271,22 @@ func Mount(opts *MountOptions) error {
 	dat9fs := NewDat9FS(c, opts)
 	layerEventWatcherStop := func() {}
 
+	profiler, err := StartProfiler(opts.Profiling)
+	if err != nil {
+		return fmt.Errorf("start profiler: %w", err)
+	}
+	opts.Profiling.PprofAddr = profiler.PprofAddr()
+	defer profiler.Stop()
+
 	// Resolve sync mode (auto-detect RTT if needed).
 	resolved := ResolveMode(context.Background(), opts.SyncMode, opts.Server)
 	dat9fs.syncMode = resolved
 	fmt.Fprintf(os.Stderr, "drive9: sync mode: %s\n", resolved)
+	perfRecorder, err := StartContinuousPerf(opts.Profiling, dat9fs)
+	if err != nil {
+		return fmt.Errorf("start continuous perf: %w", err)
+	}
+	defer perfRecorder.Stop()
 
 	cacheBase := opts.CacheDir
 	if cacheBase == "" {
@@ -421,6 +460,16 @@ func Mount(opts *MountOptions) error {
 		stopWatchers()
 		return fmt.Errorf("fuse wait mount: %w", err)
 	}
+	controlServer, err := startMountControlServer(opts.MountPoint, dat9fs)
+	if err != nil {
+		stopWatchers()
+		dat9fs.FlushAll()
+		_ = server.Unmount()
+		return fmt.Errorf("start mount control socket: %w", err)
+	}
+	if controlServer != nil {
+		defer controlServer.Close()
+	}
 	stateMountPoint := opts.MountPoint
 	if absMountPoint, absErr := filepath.Abs(stateMountPoint); absErr == nil {
 		stateMountPoint = absMountPoint
@@ -433,17 +482,28 @@ func Mount(opts *MountOptions) error {
 		credentialKind = mountstate.CredentialKindToken
 	}
 	pidFile, err := mountstate.WriteProcessState(opts.MountPoint, mountstate.ProcessState{
-		PID:            os.Getpid(),
-		MountKind:      mountstate.MountKindFUSE,
-		MountPoint:     stateMountPoint,
-		RemoteRoot:     opts.RemoteRoot,
-		Profile:        opts.Profile,
-		LocalRoot:      opts.LocalRoot,
-		Server:         opts.Server,
-		PackPaths:      append([]string(nil), opts.PackPaths...),
-		CredentialKind: credentialKind,
-		APIKey:         opts.APIKey,
-		Token:          opts.Token,
+		PID:                 os.Getpid(),
+		Component:           "drive9-fuse",
+		MountKind:           mountstate.MountKindFUSE,
+		MountPoint:          stateMountPoint,
+		RemoteRoot:          opts.RemoteRoot,
+		Profile:             opts.Profile,
+		LocalRoot:           opts.LocalRoot,
+		Server:              opts.Server,
+		PackPaths:           append([]string(nil), opts.PackPaths...),
+		CredentialKind:      credentialKind,
+		APIKey:              opts.APIKey,
+		Token:               opts.Token,
+		ProfileDir:          opts.Profiling.ProfileDir,
+		PerfSamplesPath:     opts.Profiling.PerfSamplesPath,
+		PerfInterval:        opts.Profiling.PerfSampleInterval.String(),
+		PerfMaxSamples:      opts.Profiling.PerfMaxSamples,
+		PerfMaxSampleFiles:  opts.Profiling.PerfMaxSampleFiles,
+		PerfMaxProfileFiles: opts.Profiling.PerfMaxProfileFiles,
+		PprofAddr:           opts.Profiling.PprofAddr,
+		StartedAt:           time.Now().UTC().Format(time.RFC3339Nano),
+		HeapProfilePath:     opts.Profiling.HeapProfilePath,
+		ControlSocket:       controlServer.SocketPath(),
 	})
 	if err != nil {
 		stopWatchers()
@@ -545,6 +605,9 @@ func Mount(opts *MountOptions) error {
 				fmt.Fprintf(os.Stderr, "drive9: force-quit\n")
 			}
 			forceUnmount(opts.MountPoint)
+			if controlServer != nil {
+				controlServer.Close()
+			}
 			if pidFile != "" {
 				_ = os.Remove(pidFile)
 			}
@@ -740,6 +803,13 @@ func restoreLayerEntries(ctx context.Context, c *client.Client, opts *MountOptio
 		if _, err := pending.PutWithBaseRevAndMode(localPath, sizeBytes, PendingOverwrite, fullEntry.BaseRevision, fullEntry.Mode, fullEntry.Mode != 0); err != nil {
 			return fmt.Errorf("restore fs layer pending %s: %w", localPath, err)
 		}
+		if fs != nil {
+			if fullEntry.Mode != 0 {
+				fs.markLayerFileMode(localPath, fullEntry.Mode)
+			} else {
+				fs.markLayerFile(localPath)
+			}
+		}
 		restoredUpserts[localPath] = struct{}{}
 	}
 	return nil
@@ -851,6 +921,9 @@ func newGoFuseMountOptions(opts *MountOptions) *gofuse.MountOptions {
 	}
 	if runtime.GOOS == "linux" {
 		fuseOpts.MaxWrite = 1024 * 1024 // 1MiB — Linux FUSE supports this natively
+		if opts.AllowOther {
+			fuseOpts.Options = append(fuseOpts.Options, "default_permissions")
+		}
 	}
 	if runtime.GOOS == "darwin" {
 		// macFUSE can reject open/readdir before requests reach the daemon if

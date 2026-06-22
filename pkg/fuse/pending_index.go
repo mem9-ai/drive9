@@ -112,7 +112,7 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		Kind:        kind,
 		BaseRev:     baseRev,
 		ShadowSpill: shadowSpill,
-		Mode:        mode & 0o777,
+		Mode:        mode & posixPermissionModeMask,
 		HasMode:     hasMode,
 	}
 
@@ -298,6 +298,27 @@ func (idx *PendingIndex) ListPendingPaths() map[string]struct{} {
 	return result
 }
 
+// ConflictSummary reports pending entries preserved for manual recovery after
+// terminal commit failure.
+func (idx *PendingIndex) ConflictSummary() (count int, bytes int64, firstPath string) {
+	if idx == nil {
+		return 0, 0, ""
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	for path, meta := range idx.items {
+		if meta == nil || meta.Kind != PendingConflict {
+			continue
+		}
+		if firstPath == "" {
+			firstPath = path
+		}
+		count++
+		bytes += meta.Size
+	}
+	return count, bytes, firstPath
+}
+
 // ListByPrefix returns metadata for all paths with the given prefix.
 func (idx *PendingIndex) ListByPrefix(prefix string) []*WriteBackMeta {
 	idx.mu.RLock()
@@ -334,7 +355,7 @@ func (idx *PendingIndex) UpdateMode(remotePath string, mode uint32) error {
 		return nil
 	}
 	updated := *meta
-	updated.Mode = mode & 0o777
+	updated.Mode = mode & posixPermissionModeMask
 	updated.HasMode = true
 	updated.Generation = idx.nextGen.Add(1)
 

@@ -204,7 +204,7 @@ func (c *WriteBackCache) PutWithBaseRevAndMode(remotePath string, data []byte, s
 		Generation: c.nextGen.Add(1),
 		Kind:       kind,
 		BaseRev:    baseRev,
-		Mode:       mode & 0o777,
+		Mode:       mode & posixPermissionModeMask,
 		HasMode:    hasMode,
 	}
 	metaBytes, err := json.Marshal(meta)
@@ -353,7 +353,7 @@ func (c *WriteBackCache) UpdateMode(remotePath string, mode uint32) error {
 		return nil
 	}
 	updated := *meta
-	updated.Mode = mode & 0o777
+	updated.Mode = mode & posixPermissionModeMask
 	updated.HasMode = true
 	updated.Generation = c.nextGen.Add(1)
 
@@ -473,6 +473,27 @@ func (c *WriteBackCache) ListPendingPaths() map[string]struct{} {
 		result[k] = struct{}{}
 	}
 	return result
+}
+
+// PendingSummary reports all cached write-back entries that still require
+// upload, chmod retry, or local recovery.
+func (c *WriteBackCache) PendingSummary() (count int, bytes int64, firstPath string) {
+	if c == nil {
+		return 0, 0, ""
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for path, meta := range c.metas {
+		if meta == nil {
+			continue
+		}
+		if firstPath == "" {
+			firstPath = path
+		}
+		count++
+		bytes += meta.Size
+	}
+	return count, bytes, firstPath
 }
 
 // ListByPrefix returns metadata for pending entries under prefix.

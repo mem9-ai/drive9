@@ -10,7 +10,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
 
 // Token manages workspace-zone scoped filesystem tokens.
@@ -301,7 +302,7 @@ func TokenRevoke(args []string) error {
 		if target == "" {
 			return fmt.Errorf("token name is required")
 		}
-		if strings.HasPrefix(target, "dat9_") {
+		if strings.HasPrefix(target, token.TokenPrefix) || strings.HasPrefix(target, token.LegacyTokenPrefix) {
 			return fmt.Errorf("refusing token secret in argv; pipe it with: drive9 token revoke -")
 		}
 		cfg := loadConfig()

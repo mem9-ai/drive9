@@ -2,9 +2,13 @@ package tenant
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
+
+var ErrCredentialsRequired = errors.New("public_key and private_key are required")
+var ErrPartialCredentials = errors.New("both public_key and private_key must be provided together")
 
 type ClusterInfo struct {
 	TenantID       string
@@ -32,9 +36,8 @@ type Deprovisioner interface {
 }
 
 type CredentialProvisionRequest struct {
-	PublicKey    string
-	PrivateKey   string
-	DatabaseName string
+	PublicKey  string
+	PrivateKey string
 }
 
 type CredentialProvisioner interface {

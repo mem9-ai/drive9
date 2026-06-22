@@ -317,7 +317,7 @@ resp=$(curl_body_code GET "$BASE/v1/fs/$BATCH_DIR?list" "$API_KEY")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "GET /v1/fs/$BATCH_DIR?list returns 200" "$code" "200"
-batch_count=$(printf '%s' "$body" | jq -r '.entries | length')
+batch_count=$(printf '%s' "$body" | jq -r '(.entries // []) | length')
 check_eq "batch dir entry count matches" "$batch_count" "$BATCH_SMALL_FILE_COUNT"
 
 for i in 1 "$BATCH_SMALL_FILE_COUNT"; do
@@ -335,18 +335,18 @@ resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?grep=smoke-$TS&limit=20" "$API_
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "GET ?grep returns 200" "$code" "200"
-grep_count=$(printf '%s' "$body" | jq -r 'length')
+grep_count=$(printf '%s' "$body" | jq -r '(. // []) | length')
 check_cmd "grep returns at least 2 results" test "$grep_count" -ge 2
-grep_has_root=$(printf '%s' "$body" | jq -r --arg root "$ROOT_DIR" 'any(.[]; (.path // "") | contains($root))')
+grep_has_root=$(printf '%s' "$body" | jq -r --arg root "$ROOT_DIR" '(. // []) | any(.[]; (.path // "") | contains($root))')
 check_eq "grep includes files under test root" "$grep_has_root" "true"
 
 resp=$(curl_body_code GET "$BASE/v1/fs/$ROOT_DIR?find=&name=*.yaml" "$API_KEY")
 code=$(http_code "$resp")
 body=$(json_body "$resp")
 check_eq "GET ?find returns 200" "$code" "200"
-find_has_yaml=$(printf '%s' "$body" | jq -r --arg p "$BACKEND_DIR/config.yaml" 'any(.[]; .path==$p)')
+find_has_yaml=$(printf '%s' "$body" | jq -r --arg p "$BACKEND_DIR/config.yaml" '(. // []) | any(.[]; .path==$p)')
 if [ "$find_has_yaml" != "true" ]; then
-  find_has_yaml=$(printf '%s' "$body" | jq -r 'any(.[]; (.path // "") | endswith("config.yaml"))')
+   find_has_yaml=$(printf '%s' "$body" | jq -r '(. // []) | any(.[]; (.path // "") | endswith("config.yaml"))')
 fi
 
 check_eq "find by name returns yaml file" "$find_has_yaml" "true"

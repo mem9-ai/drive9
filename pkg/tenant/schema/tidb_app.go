@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strconv"
 
-	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"go.uber.org/zap"
 )
 
@@ -26,16 +26,18 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS file_nodes (
 			node_id      VARCHAR(64) PRIMARY KEY,
-			path         VARCHAR(512) NOT NULL,
-			parent_path  VARCHAR(512) NOT NULL,
+			path         TEXT NOT NULL,
+			path_hash    VARCHAR(64) NOT NULL DEFAULT '',
+			parent_path  TEXT NOT NULL,
+			parent_path_hash VARCHAR(64) NOT NULL DEFAULT '',
 			name         VARCHAR(255) NOT NULL,
 			is_directory BOOLEAN NOT NULL DEFAULT FALSE,
 			file_id      VARCHAR(64),
 			inode_id     VARCHAR(64),
 			created_at   DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 		)`,
-		`CREATE UNIQUE INDEX idx_path ON file_nodes(path)`,
-		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
+		`CREATE UNIQUE INDEX idx_path ON file_nodes(path_hash)`,
+		`CREATE INDEX idx_parent ON file_nodes(parent_path_hash, name)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
 		`CREATE INDEX idx_inode_id ON file_nodes(inode_id)`,
 
@@ -85,7 +87,8 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			upload_id          VARCHAR(64) PRIMARY KEY,
 			file_id            VARCHAR(64) NOT NULL,
 			inode_id           VARCHAR(64),
-			target_path        VARCHAR(512) NOT NULL,
+			target_path        TEXT NOT NULL,
+			target_path_hash   VARCHAR(64) NOT NULL DEFAULT '',
 			s3_upload_id       VARCHAR(255) NOT NULL,
 			s3_key             VARCHAR(2048) NOT NULL,
 			storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'none',
@@ -101,12 +104,12 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 			created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			expires_at         DATETIME(3) NOT NULL,
-			active_target_path VARCHAR(512) AS (CASE WHEN status = 'UPLOADING' THEN target_path ELSE NULL END) STORED
+			active_target_path_hash VARCHAR(64) AS (CASE WHEN status = 'UPLOADING' THEN target_path_hash ELSE NULL END) VIRTUAL
 		)`,
 		`ALTER TABLE uploads ADD COLUMN expected_revision BIGINT NULL`,
-		`CREATE INDEX idx_upload_path ON uploads(target_path, status)`,
+		`CREATE INDEX idx_upload_path ON uploads(target_path_hash, status)`,
 		`CREATE UNIQUE INDEX idx_idempotency ON uploads(idempotency_key)`,
-		`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path)`,
+		`CREATE UNIQUE INDEX idx_uploads_active ON uploads(active_target_path_hash)`,
 		`CREATE TABLE IF NOT EXISTS semantic_tasks (
 			task_id           VARCHAR(64) PRIMARY KEY,
 			task_type         VARCHAR(32) NOT NULL,
@@ -211,6 +214,9 @@ func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTe
 	if !IsTiDBCluster(ctx, db) {
 		return fmt.Errorf("provider requires TiDB capabilities (FTS/VECTOR)")
 	}
+	if err := repairMySQLPathHashSchema(ctx, db); err != nil {
+		return err
+	}
 	if err := ExecSchemaStatementsContext(ctx, db, tidbAppEmbeddingBaseSchemaStatements()); err != nil {
 		return err
 	}
@@ -229,5 +235,5 @@ func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTe
 	} else if err := ExecSchemaStatementsContext(ctx, db, tidbAppEmbeddingOptionalSchemaStatements()); err != nil {
 		return err
 	}
-	return ValidateTiDBSchemaForMode(ctx, db, TiDBEmbeddingModeApp)
+	return EnsureTiDBSchemaForMode(ctx, db, TiDBEmbeddingModeApp)
 }

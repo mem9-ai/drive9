@@ -13,18 +13,29 @@ import (
 )
 
 type ProcessState struct {
-	PID            int      `json:"pid"`
-	CreationTime   uint64   `json:"creation_time,omitempty"`
-	MountKind      string   `json:"mount_kind,omitempty"`
-	MountPoint     string   `json:"mount_point,omitempty"`
-	RemoteRoot     string   `json:"remote_root,omitempty"`
-	Profile        string   `json:"profile,omitempty"`
-	LocalRoot      string   `json:"local_root,omitempty"`
-	Server         string   `json:"server,omitempty"`
-	PackPaths      []string `json:"pack_paths,omitempty"`
-	CredentialKind string   `json:"credential_kind,omitempty"`
-	APIKey         string   `json:"api_key,omitempty"`
-	Token          string   `json:"token,omitempty"`
+	PID                 int      `json:"pid"`
+	CreationTime        uint64   `json:"creation_time,omitempty"`
+	Component           string   `json:"component,omitempty"`
+	MountKind           string   `json:"mount_kind,omitempty"`
+	MountPoint          string   `json:"mount_point,omitempty"`
+	RemoteRoot          string   `json:"remote_root,omitempty"`
+	Profile             string   `json:"profile,omitempty"`
+	LocalRoot           string   `json:"local_root,omitempty"`
+	Server              string   `json:"server,omitempty"`
+	PackPaths           []string `json:"pack_paths,omitempty"`
+	CredentialKind      string   `json:"credential_kind,omitempty"`
+	APIKey              string   `json:"api_key,omitempty"`
+	Token               string   `json:"token,omitempty"`
+	ProfileDir          string   `json:"profile_dir,omitempty"`
+	PerfSamplesPath     string   `json:"perf_samples_path,omitempty"`
+	PerfInterval        string   `json:"perf_interval,omitempty"`
+	PerfMaxSamples      int      `json:"perf_max_samples,omitempty"`
+	PerfMaxSampleFiles  int      `json:"perf_max_sample_files,omitempty"`
+	PerfMaxProfileFiles int      `json:"perf_max_profile_files,omitempty"`
+	PprofAddr           string   `json:"pprof_addr,omitempty"`
+	StartedAt           string   `json:"started_at,omitempty"`
+	HeapProfilePath     string   `json:"heap_profile_path,omitempty"`
+	ControlSocket       string   `json:"control_socket,omitempty"`
 }
 
 const (
@@ -40,6 +51,28 @@ func PIDFilePath(mountPoint string) string {
 	canonical := canonicalMountPoint(mountPoint)
 	sum := sha256.Sum256([]byte(canonical))
 	return filepath.Join(os.TempDir(), "drive9-mount-"+hex.EncodeToString(sum[:8])+".pid")
+}
+
+func ControlSocketPath(mountPoint string) string {
+	canonical := canonicalMountPoint(mountPoint)
+	uid := currentUID()
+	sum := sha256.Sum256([]byte(uid + "\x00" + canonical))
+	return filepath.Join(controlSocketDir(uid), "drive9-mount-"+hex.EncodeToString(sum[:8])+".sock")
+}
+
+func currentUID() string {
+	uid := os.Getuid()
+	if uid < 0 {
+		return "unknown"
+	}
+	return strconv.Itoa(uid)
+}
+
+func controlSocketDir(uid string) string {
+	if runtimeDir := strings.TrimSpace(os.Getenv("XDG_RUNTIME_DIR")); runtimeDir != "" && filepath.IsAbs(runtimeDir) {
+		return runtimeDir
+	}
+	return filepath.Join(os.TempDir(), "drive9-"+uid)
 }
 
 func canonicalMountPoint(mountPoint string) string {

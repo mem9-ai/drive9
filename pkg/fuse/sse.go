@@ -7,7 +7,7 @@ import (
 	"path"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // SSEWatcher connects to the dat9 server SSE endpoint and invalidates

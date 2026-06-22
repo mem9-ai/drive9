@@ -15,34 +15,72 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
-	"github.com/mem9-ai/dat9/internal/testmysql"
-	"github.com/mem9-ai/dat9/pkg/encrypt"
-	"github.com/mem9-ai/dat9/pkg/meta"
-	"github.com/mem9-ai/dat9/pkg/tenant"
-	tenantschema "github.com/mem9-ai/dat9/pkg/tenant/schema"
-	"github.com/mem9-ai/dat9/pkg/tenant/token"
+	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/encrypt"
+	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/tenant"
+	tenantschema "github.com/mem9-ai/drive9/pkg/tenant/schema"
+	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
 
 type fakeProvisioner struct {
 	provider          string
+	cloudProvider     string
+	region            string
 	cluster           *tenant.ClusterInfo
 	initErr           error
 	provisionErr      error
+	systemUserErr     error
+	systemUsername    string
+	systemPassword    string
 	deprovisionErr    error
 	provisionCalls    atomic.Int32
 	credentialCalls   atomic.Int32
+	systemUserCalls   atomic.Int32
 	deprovisionCalls  atomic.Int32
 	lastCredentialReq tenant.CredentialProvisionRequest
 	lastDeprovision   *tenant.ClusterInfo
+	defaultPublicKey  string
+	defaultPrivateKey string
+}
+
+func (f *fakeProvisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, bool) {
+	if f.defaultPublicKey == "" || f.defaultPrivateKey == "" {
+		return tenant.CredentialProvisionRequest{}, false
+	}
+	return tenant.CredentialProvisionRequest{
+		PublicKey:  f.defaultPublicKey,
+		PrivateKey: f.defaultPrivateKey,
+	}, true
 }
 
 func (f *fakeProvisioner) ProviderType() string { return f.provider }
+
+func (f *fakeProvisioner) ProvisioningCloudProvider() string { return f.cloudProvider }
+
+func (f *fakeProvisioner) ProvisioningRegion() string { return f.region }
 
 func (f *fakeProvisioner) InitSchema(_ context.Context, dsn string) error {
 	if f.initErr != nil {
 		return f.initErr
 	}
 	return nil
+}
+
+func (f *fakeProvisioner) EnsureSystemUser(_ context.Context, _ string, _ string) (string, string, error) {
+	f.systemUserCalls.Add(1)
+	if f.systemUserErr != nil {
+		return "", "", f.systemUserErr
+	}
+	username := f.systemUsername
+	if username == "" {
+		username = "u1.tdc_fs_sys"
+	}
+	password := f.systemPassword
+	if password == "" {
+		password = "system-pass"
+	}
+	return username, password, nil
 }
 
 func (f *fakeProvisioner) Provision(_ context.Context, tenantID string) (*tenant.ClusterInfo, error) {
@@ -355,7 +393,7 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	if _, err := rand.Read(tokenSecret); err != nil {
 		t.Fatal(err)
 	}
-	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cluster: &tenant.ClusterInfo{
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1", cluster: &tenant.ClusterInfo{
 		ClusterID: "native-cluster-1",
 		Host:      "db.example",
 		Port:      4000,
@@ -375,9 +413,8 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	defer ts.Close()
 
 	body, _ := json.Marshal(map[string]any{
-		"public_key":    "public-1",
-		"private_key":   "private-1",
-		"database_name": "customer_db",
+		"public_key":  "public-1",
+		"private_key": "private-1",
 	})
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -395,7 +432,7 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	if got := prov.credentialCalls.Load(); got != 1 {
 		t.Fatalf("credential provision calls = %d, want 1", got)
 	}
-	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" || prov.lastCredentialReq.DatabaseName != "customer_db" {
+	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
 		t.Fatalf("credential request = %+v", prov.lastCredentialReq)
 	}
 
@@ -405,6 +442,12 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	}
 	if out["tenant_id"] == "" || out["api_key"] == "" || out["status"] != string(meta.TenantProvisioning) {
 		t.Fatalf("unexpected response: %+v", out)
+	}
+	if out["cloud_provider"] != "aws" || out["region"] != "us-east-1" {
+		t.Fatalf("native cloud/region response = %+v", out)
+	}
+	if _, ok := out["mode"]; ok {
+		t.Fatalf("native provision response unexpectedly included mode: %+v", out)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -422,12 +465,27 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	var provider, dbName string
-	if err := metaStore.DB().QueryRow("SELECT provider, db_name FROM tenants WHERE id = ?", out["tenant_id"]).Scan(&provider, &dbName); err != nil {
+	if got := prov.systemUserCalls.Load(); got == 0 {
+		t.Fatal("native system user setup was not called")
+	}
+
+	var provider, dbName, dbUser string
+	var passCipher []byte
+	if err := metaStore.DB().QueryRow("SELECT provider, db_name, db_user, db_password FROM tenants WHERE id = ?", out["tenant_id"]).Scan(&provider, &dbName, &dbUser, &passCipher); err != nil {
 		t.Fatal(err)
 	}
 	if provider != tenant.ProviderTiDBCloudNative || dbName != "customer_db" {
 		t.Fatalf("tenant provider/db = %s/%s", provider, dbName)
+	}
+	if dbUser != "u1.tdc_fs_sys" {
+		t.Fatalf("tenant db_user = %q, want system user", dbUser)
+	}
+	plain, err := pool.Decrypt(context.Background(), passCipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(plain) != "system-pass" {
+		t.Fatalf("tenant db password = %q, want system password", plain)
 	}
 }
 
@@ -557,6 +615,56 @@ func TestProvisionTenantRejectsMissingNativeCredentialsBeforeInsert(t *testing.T
 	}
 	if tenantCount != 0 {
 		t.Fatalf("tenant count = %d, want 0", tenantCount)
+	}
+}
+
+func TestProvisionRejectsCredentialsForNonNativeProvider(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, provider := range []string{tenant.ProviderTiDBZero, tenant.ProviderTiDBCloudStarter, tenant.ProviderDB9} {
+		prov := &fakeProvisioner{provider: provider}
+		srv := NewWithConfig(Config{
+			Meta:        metaStore,
+			Pool:        pool,
+			Provisioner: prov,
+			TokenSecret: tokenSecret,
+		})
+
+		ts := httptest.NewServer(srv)
+		body, _ := json.Marshal(map[string]string{"public_key": "test", "private_key": "test"})
+		req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			ts.Close()
+			t.Fatalf("%s: request failed: %v", provider, err)
+		}
+		_ = resp.Body.Close()
+		ts.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status=%d, want 400", provider, resp.StatusCode)
+		}
 	}
 }
 
@@ -1230,5 +1338,111 @@ func TestServerCloseCancelsSchemaInitRetryWorker(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("Server.Close did not cancel schema init retry worker promptly")
+	}
+}
+
+func TestProvisionTiDBCloudNativeRejectsPartialCredentials(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cluster: &tenant.ClusterInfo{}}
+	srv := NewWithConfig(Config{
+		Meta:        metaStore,
+		Pool:        pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	body, _ := json.Marshal(map[string]string{"public_key": "only-pk"})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestProvisionTiDBCloudNativeUsesDefaultCredentialsWhenOmitted(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider:          tenant.ProviderTiDBCloudNative,
+		cluster:           &tenant.ClusterInfo{},
+		defaultPublicKey:  "default-pk",
+		defaultPrivateKey: "default-sk",
+	}
+	srv := NewWithConfig(Config{
+		Meta:        metaStore,
+		Pool:        pool,
+		Provisioner: prov,
+		TokenSecret: tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	body, _ := json.Marshal(map[string]string{})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	if prov.lastCredentialReq.PublicKey != "default-pk" || prov.lastCredentialReq.PrivateKey != "default-sk" {
+		t.Fatalf("credentials = %s/%s, want default-pk/default-sk", prov.lastCredentialReq.PublicKey, prov.lastCredentialReq.PrivateKey)
 	}
 }

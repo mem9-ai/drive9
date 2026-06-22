@@ -13,7 +13,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
 func TestPatchFileSendsExplicitPartSize(t *testing.T) {

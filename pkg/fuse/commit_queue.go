@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/mountpath"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountpath"
 )
 
 var errCommitPostUpload = errors.New("commit post-upload step failed")
@@ -358,6 +358,95 @@ func (cq *CommitQueue) PendingStats() (count int, bytes int64) {
 		bytes += e.Size
 	}
 	return
+}
+
+type CommitQueueSnapshot struct {
+	Pending       int
+	Bytes         int64
+	InFlight      int
+	Delayed       int
+	Conflicts     int
+	ConflictBytes int64
+	FirstPath     string
+}
+
+func (cq *CommitQueue) Snapshot() CommitQueueSnapshot {
+	if cq == nil {
+		return CommitQueueSnapshot{}
+	}
+	cq.mu.Lock()
+	defer cq.mu.Unlock()
+	return cq.snapshotLocked()
+}
+
+func (cq *CommitQueue) snapshotLocked() CommitQueueSnapshot {
+	var snap CommitQueueSnapshot
+	seen := make(map[*CommitEntry]struct{}, len(cq.queue))
+	for _, e := range cq.queue {
+		if e == nil {
+			continue
+		}
+		if snap.FirstPath == "" {
+			snap.FirstPath = e.Path
+		}
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		snap.Pending++
+		snap.Bytes += e.Size
+	}
+	for _, e := range cq.inFlight {
+		if e == nil {
+			continue
+		}
+		if snap.FirstPath == "" {
+			snap.FirstPath = e.Path
+		}
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		snap.Pending++
+		snap.Bytes += e.Size
+	}
+	for e := range cq.delayed {
+		if e != nil && snap.FirstPath == "" {
+			snap.FirstPath = e.Path
+		}
+	}
+	snap.InFlight = len(cq.inFlight)
+	snap.Delayed = len(cq.delayed)
+	if cq.index != nil {
+		var firstConflictPath string
+		snap.Conflicts, snap.ConflictBytes, firstConflictPath = cq.index.ConflictSummary()
+		if snap.FirstPath == "" {
+			snap.FirstPath = firstConflictPath
+		}
+	}
+	return snap
+}
+
+func (cq *CommitQueue) WaitIdle(ctx context.Context) error {
+	if cq == nil {
+		return nil
+	}
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		cq.mu.Lock()
+		cq.forceAllDelayedLocked()
+		snap := cq.snapshotLocked()
+		cq.mu.Unlock()
+		if snap.Pending == 0 && snap.InFlight == 0 && snap.Delayed == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // IsFull reports whether the queue has reached its backpressure limit.
@@ -1147,10 +1236,11 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, com
 	if layerRef == "" && shouldApplyRemoteMode(entry.Kind, entry.HasMode, entry.Mode) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		var err error
-		mode := entry.Mode & 0o777
+		mode := entry.Mode & posixPermissionModeMask
+		remoteMode := remoteChmodMode(mode)
 		err = retryPostUploadMode(ctx, func() error {
 			start := time.Now()
-			applyErr := cq.client.ChmodCtx(ctx, cq.remotePath(entry.Path), mode)
+			applyErr := cq.client.ChmodCtx(ctx, cq.remotePath(entry.Path), remoteMode)
 			if cq.perf != nil {
 				cq.perf.recordRemoteOp(perfRemoteMutation, applyErr, time.Since(start), 0)
 			}

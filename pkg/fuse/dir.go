@@ -9,7 +9,7 @@ import (
 
 const (
 	defaultDirCacheTTL              = 10 * time.Second
-	defaultNamespaceCacheMaxEntries = 2000
+	defaultNamespaceCacheMaxEntries = 100000
 
 	// escalateMissThreshold/escalateMissWindow detect negative-lookup storms:
 	// once this many remote ENOENT stats hit the same directory within the
@@ -28,6 +28,10 @@ type CachedFileInfo struct {
 	Revision   int64
 	Mode       uint32 // permission bits
 	HasMode    bool   // true when Mode is explicitly known (including 0)
+	Uid        uint32
+	Gid        uint32
+	HasUID     bool
+	HasGID     bool
 	ResourceID string
 	Nlink      uint32
 }
@@ -131,6 +135,10 @@ func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
 	defer dc.mu.Unlock()
 
 	now := time.Now()
+	oldEntry := dc.entries[dirPath]
+	if oldEntry != nil {
+		oldEntry.prune(now)
+	}
 	entry := newDirCacheEntry()
 	entry.expires = now.Add(dc.ttl)
 	limit := len(items)
@@ -138,7 +146,13 @@ func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
 		limit = dc.maxEntries
 	}
 	for i := 0; i < limit; i++ {
-		entry.upsert(items[i], dc.maxEntries)
+		item := items[i]
+		if oldEntry != nil {
+			if oldItem, ok := oldEntry.items[item.Name]; ok {
+				item = mergeCachedOwner(item, oldItem)
+			}
+		}
+		entry.upsert(item, dc.maxEntries)
 	}
 	if len(items) <= dc.maxEntries {
 		entry.complete = true
@@ -204,6 +218,18 @@ func (dc *DirCache) Remove(parentPath, name string) {
 	if !entry.hasState() {
 		delete(dc.entries, parentPath)
 	}
+}
+
+func (dc *DirCache) HasPositiveEntries(dirPath string) bool {
+	dc.mu.Lock()
+	defer dc.mu.Unlock()
+
+	now := time.Now()
+	entry, ok := dc.getEntryLocked(dirPath, now)
+	if !ok || !entry.positiveValid(now) {
+		return false
+	}
+	return len(entry.items) > 0
 }
 
 // MarkNegative records a short-lived ENOENT marker for parent/name.
@@ -377,6 +403,9 @@ func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) {
 	if e.items == nil {
 		e.items = make(map[string]CachedFileInfo)
 	}
+	if existing, ok := e.items[item.Name]; ok {
+		item = mergeCachedOwner(item, existing)
+	}
 	if _, exists := e.items[item.Name]; !exists {
 		if maxEntries > 0 && len(e.items) >= maxEntries {
 			if len(e.order) == 0 {
@@ -393,6 +422,18 @@ func (e *dirCacheEntry) upsert(item CachedFileInfo, maxEntries int) {
 		e.order = append(e.order, item.Name)
 	}
 	e.items[item.Name] = item
+}
+
+func mergeCachedOwner(item, existing CachedFileInfo) CachedFileInfo {
+	if !item.HasUID && existing.HasUID {
+		item.Uid = existing.Uid
+		item.HasUID = true
+	}
+	if !item.HasGID && existing.HasGID {
+		item.Gid = existing.Gid
+		item.HasGID = true
+	}
+	return item
 }
 
 func (e *dirCacheEntry) remove(name string) {

@@ -1,7 +1,9 @@
 package s3client
 
 import (
+	"bytes"
 	"context"
+	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -82,13 +84,41 @@ func applyS3Options(cfg AWSConfig) func(*s3.Options) {
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
 		}
 		o.UsePathStyle = cfg.ForcePathStyle
+		if isTencentEndpoint(cfg.Endpoint) {
+			o.HTTPClient = &http.Client{
+				Transport: &contentMD5Transport{base: http.DefaultTransport},
+			}
+		}
 	}
+}
+
+type contentMD5Transport struct {
+	base http.RoundTripper
+}
+
+func (t *contentMD5Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodPost && req.URL.Query().Has("delete") && req.Body != nil {
+		bodyBytes, err := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("contentMD5Transport: read body: %w", err)
+		}
+		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		hash := md5.Sum(bodyBytes)
+		req.Header.Set("Content-MD5", base64.StdEncoding.EncodeToString(hash[:]))
+		req.ContentLength = int64(len(bodyBytes))
+	}
+	if t.base != nil {
+		return t.base.RoundTrip(req)
+	}
+	return http.DefaultTransport.RoundTrip(req)
 }
 
 // New creates an S3-compatible client. The endpoint in cfg determines which
 // credential chain is used:
 //   - Aliyun OSS endpoints (*.aliyuncs.com): explicit key → RRSA → ALIBABA_CLOUD env
 //     → AWS SDK default chain (if none of the above are configured)
+//   - Tencent COS endpoints (*.myqcloud.com): explicit key → TENCENTCLOUD env → CAM role
 //   - All other endpoints: explicit key → AWS SDK default chain
 func New(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	if err := cfg.Validate(); err != nil {
@@ -96,6 +126,9 @@ func New(ctx context.Context, cfg AWSConfig) (*AWSS3Client, error) {
 	}
 	if isAliyunEndpoint(cfg.Endpoint) {
 		return newAliyun(ctx, cfg)
+	}
+	if isTencentEndpoint(cfg.Endpoint) {
+		return newTencent(ctx, cfg)
 	}
 	return newAWS(ctx, cfg)
 }

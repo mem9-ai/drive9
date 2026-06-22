@@ -8,7 +8,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 const metricsComponent = "s3client"

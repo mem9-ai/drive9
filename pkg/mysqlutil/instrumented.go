@@ -10,7 +10,7 @@ import (
 
 	mysql "github.com/go-sql-driver/mysql"
 
-	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 const (

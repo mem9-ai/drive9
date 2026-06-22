@@ -31,6 +31,9 @@ Current shared dev deployment:
 # Dev
 export DRIVE9_BASE="http://k8s-dat9-dat9serv-d5e02e7d07-1645488597.ap-southeast-1.elb.amazonaws.com"
 
+# Dev (tidbcloud-native)
+export DRIVE9_BASE="http://k8s-drive9ti-drive9se-b6bbe5ba6e-cee81207452d1185.elb.ap-southeast-1.amazonaws.com"
+
 # Prod
 export DRIVE9_BASE="https://api.drive9.ai"
 ```
@@ -91,6 +94,14 @@ RUN_GIT_OPS_SMOKE=1 RUN_GIT_WORKSPACE_SMOKE=1 bash e2e/smoke-all.sh
 
 # Include portable profile pack/unpack coverage in smoke-all when desired.
 RUN_PORTABLE_PACK_E2E=1 bash e2e/smoke-all.sh
+
+# TiDB Cloud Native (tidbcloud-native) tenant lifecycle smoke
+# Requires credentials, not wired into CI. Set DRIVE9_BASE from Deployment
+# endpoints above, or export manually. Credentials are stored in repo secrets
+# (DRIVE9_TIDBCLOUD_PUBLIC_KEY, DRIVE9_TIDBCLOUD_PRIVATE_KEY).
+DRIVE9_TIDBCLOUD_PUBLIC_KEY="$DRIVE9_TIDBCLOUD_PUBLIC_KEY" \
+DRIVE9_TIDBCLOUD_PRIVATE_KEY="$DRIVE9_TIDBCLOUD_PRIVATE_KEY" \
+bash e2e/native-smoke-test.sh
 ```
 
 ### Local via `drive9-server-local`
@@ -275,10 +286,11 @@ script is not a supported Windows validation path.
 7. Rename semantics (file + directory rename consistency)
 8. Attribute semantics (`size`, `mtime` monotonicity, remote stat parity)
 9. Cross-channel consistency (CLI write visible in mount; mount write visible via CLI)
-10. Mounted large file boundary check (8MB write + remote checksum parity) and tier-transition parity (10KiB → 8MiB → 10KiB size/checksum/remount)
-11. Read-only mount behavior (`--read-only` blocks writes/deletes, allows reads)
-12. Error semantics (missing path reads/deletes and duplicate mkdir failures)
-13. Linux prerequisite guardrails (`fusermount`, `/dev/fuse`) with skip behavior when unavailable
+10. Drain semantics (`drive9 mount drain --json` and native `sync -f`, including open-handle flush and post-drain writability)
+11. Mounted large file boundary check (8MB write + remote checksum parity) and tier-transition parity (10KiB → 8MiB → 10KiB size/checksum/remount)
+12. Read-only mount behavior (`--read-only` blocks writes/deletes, allows reads)
+13. Error semantics (missing path reads/deletes and duplicate mkdir failures)
+14. Linux prerequisite guardrails (`fusermount`, `/dev/fuse`) with skip behavior when unavailable
 
 Notes:
 - The script prechecks root `ls /` reachability before mount behavior checks.
@@ -435,10 +447,11 @@ developer machines or EC2-style validation rather than the default smoke path.
 These are not part of the normal E2E smoke entry points. Run them only when a
 task explicitly asks for a broad compatibility matrix or Git feature matrix.
 They use the same live endpoint conventions as the smoke scripts and mount real
-FUSE. `posix-feature-matrix.sh` uses pjdfstest as the sole POSIX compatibility
-baseline; setup/provisioning is only test harness plumbing and is not counted
-as POSIX feature coverage. `git-feature-matrix.sh` generates a local bare Git
-remote fixture for deterministic Git coverage. Reports are written to
+FUSE. `pjdfstest-suite.sh` uses pjdfstest as the sole POSIX compatibility
+baseline; `posix-feature-matrix.sh` is a compatibility alias for that suite.
+Setup/provisioning is only test harness plumbing and is not counted as POSIX
+feature coverage. `git-feature-matrix.sh` generates a local bare Git remote
+fixture for deterministic Git coverage. Reports are written to
 `$FEATURE_MATRIX_REPORT_DIR/<report-name>-<timestamp>.md`; by default that is a
 flat path such as `e2e/reports/posix-feature-report-<timestamp>.md` or
 `e2e/reports/git-feature-report-<timestamp>.md`. If
@@ -492,6 +505,16 @@ enabled.
 4. Runs `fuse-smoke-test.sh`
 5. Runs `portable-pack-unpack-e2e.sh` when `RUN_PORTABLE_PACK_E2E=1`
 6. Aggregates pass/fail at script level for quick regression checks
+
+### `native-smoke-test.sh`
+
+Manual-only: requires TiDB Cloud API credentials. Not wired into CI.
+
+1. Provision tenant via `drive9 create` with `--tidbcloud-public-key` / `--tidbcloud-private-key`
+2. Poll `GET /v1/status` until active
+3. Basic CLI fs operations (`mkdir`, `cp`, `cat`, `ls`, `rm`)
+4. Delete tenant via `drive9 delete` and verify removal (401/403/404 on `GET /v1/status`)
+5. Trap-based cleanup: attempts `drive9 delete` on script failure unless `SKIP_CLEANUP=1`
 
 ## Environment variables
 
@@ -587,13 +610,17 @@ enabled.
 | `GIT_WORKSPACE_HYDRATE` | `sync` | `git-workspace-smoke-test.sh` |
 | `FEATURE_MATRIX_REPORT_DIR` | `e2e/reports` | on-demand matrix scripts |
 | `FEATURE_MATRIX_STRICT_ALL` | `0` | on-demand matrix scripts |
-| `PJDFSTEST_DIR` | - | on-demand `posix-feature-matrix.sh` |
-| `PJDFSTEST_TESTS` | - | on-demand `posix-feature-matrix.sh` |
-| `PJDFSTEST_BIN` | auto-detected from `PJDFSTEST_DIR` or `PATH` | on-demand `posix-feature-matrix.sh` |
-| `PJDFSTEST_TIMEOUT_S` | `900` | on-demand `posix-feature-matrix.sh` |
-| `PJDFSTEST_ALLOW_NONROOT` | `0` | on-demand `posix-feature-matrix.sh` |
+| `PJDFSTEST_DIR` | - | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
+| `PJDFSTEST_TESTS` | - | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
+| `PJDFSTEST_BIN` | auto-detected from `PJDFSTEST_DIR` or `PATH` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
+| `PJDFSTEST_TIMEOUT_S` | `900` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
+| `PJDFSTEST_ALLOW_NONROOT` | `0` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh` |
+| `PJDFSTEST_MOUNT_ALLOW_OTHER` | `auto` | on-demand `pjdfstest-suite.sh` / `posix-feature-matrix.sh`; Linux auto-adds `--allow-other`, Darwin does not |
 | `GIT_MATRIX_TIMEOUT_S` | `240` | on-demand `git-feature-matrix.sh` |
 | `GIT_MATRIX_RUN_OVERSIZED` | `1` | on-demand `git-feature-matrix.sh` |
+| `DRIVE9_TIDBCLOUD_PUBLIC_KEY` | *(required)* | `native-smoke-test.sh` |
+| `DRIVE9_TIDBCLOUD_PRIVATE_KEY` | *(required)* | `native-smoke-test.sh` |
+| `SKIP_CLEANUP` | `0` | `native-smoke-test.sh` |
 
 ## Conventions
 

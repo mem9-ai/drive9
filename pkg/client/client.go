@@ -1,4 +1,4 @@
-// Package client provides the dat9 Go SDK.
+// Package client provides the drive9 Go SDK.
 // Strictly references agfs-sdk/go/client design patterns.
 package client
 
@@ -19,10 +19,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/tagutil"
+	"github.com/mem9-ai/drive9/pkg/tagutil"
 )
 
-// Client is the dat9 HTTP client.
+// Client is the drive9 HTTP client.
 type Client struct {
 	baseURL            string
 	apiKey             string
@@ -79,7 +79,7 @@ func IsNotFound(err error) bool {
 	return errors.As(err, &se) && se.StatusCode == http.StatusNotFound
 }
 
-// New creates a new dat9 client authenticated with an owner API key.
+// New creates a new drive9 client authenticated with an owner API key.
 //
 // Owner credentials reach the tenant management plane (CreateVaultSecret,
 // IssueVaultGrant, audit, etc.) as well as the data plane. Use NewWithToken
@@ -90,7 +90,7 @@ func New(baseURL, apiKey string) *Client {
 	return newClient(baseURL, apiKey)
 }
 
-// NewWithToken creates a new dat9 client authenticated with a delegated
+// NewWithToken creates a new drive9 client authenticated with a delegated
 // capability token (JWT). Delegated callers can only reach read-path vault
 // endpoints and the FUSE data-plane routes that capabilityAuthMiddleware
 // resolves; admin-plane endpoints will 401 server-side. Choosing the
@@ -188,7 +188,8 @@ type FileInfo struct {
 	Name       string `json:"name"`
 	Size       int64  `json:"size"`
 	IsDir      bool   `json:"isDir"`
-	Mtime      int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+	Mtime      int64  `json:"mtime,omitempty"`      // Unix seconds, 0 means unknown
+	Revision   int64  `json:"revision,omitempty"`    // file revision from server; 0 means unknown (old server)
 	Mode       uint32 `json:"mode,omitempty"`
 	HasMode    bool   `json:"hasMode"`
 	ResourceID string `json:"resource_id,omitempty"`
@@ -284,6 +285,17 @@ func (c *Client) RawPost(endpoint string, body io.Reader) (*http.Response, error
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	return c.do(req)
+}
+
+func (c *Client) RawDelete(endpoint string, body io.Reader) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodDelete, c.baseURL+endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	return c.do(req)
 }
 

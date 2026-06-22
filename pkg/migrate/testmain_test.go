@@ -9,7 +9,7 @@ import (
 	"testing"
 
 	_ "github.com/go-sql-driver/mysql"
-	"github.com/mem9-ai/dat9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testmysql"
 )
 
 var testDSN string
@@ -38,9 +38,9 @@ func initMigrateSchema(dsn string) {
 	defer func() { _ = db.Close() }()
 
 	stmts := []string{
-		`CREATE TABLE IF NOT EXISTS file_nodes (node_id VARCHAR(64) PRIMARY KEY, path VARCHAR(512) NOT NULL, parent_path VARCHAR(512) NOT NULL, name VARCHAR(255) NOT NULL, is_directory BOOLEAN NOT NULL DEFAULT FALSE, file_id VARCHAR(64), inode_id VARCHAR(64), created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3))`,
-		`CREATE UNIQUE INDEX idx_path ON file_nodes(path)`,
-		`CREATE INDEX idx_parent ON file_nodes(parent_path)`,
+		`CREATE TABLE IF NOT EXISTS file_nodes (node_id VARCHAR(64) PRIMARY KEY, path VARCHAR(512) NOT NULL, path_hash VARCHAR(64) NOT NULL DEFAULT '', parent_path VARCHAR(512) NOT NULL, parent_path_hash VARCHAR(64) NOT NULL DEFAULT '', name VARCHAR(255) NOT NULL, is_directory BOOLEAN NOT NULL DEFAULT FALSE, file_id VARCHAR(64), inode_id VARCHAR(64), created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3))`,
+		`CREATE UNIQUE INDEX idx_path ON file_nodes(path_hash)`,
+		`CREATE INDEX idx_parent ON file_nodes(parent_path_hash, name)`,
 		`CREATE INDEX idx_file_id ON file_nodes(file_id)`,
 		`CREATE INDEX idx_inode_id ON file_nodes(inode_id)`,
 		`CREATE TABLE IF NOT EXISTS files (file_id VARCHAR(64) PRIMARY KEY, storage_type VARCHAR(32) NOT NULL, storage_ref TEXT NOT NULL, storage_ref_hash VARCHAR(64) NOT NULL DEFAULT '', storage_encryption_mode VARCHAR(16) NOT NULL DEFAULT 'legacy', storage_encryption_key_id VARCHAR(256) NOT NULL DEFAULT '', content_blob LONGBLOB, content_type VARCHAR(255), size_bytes BIGINT NOT NULL DEFAULT 0, checksum_sha256 VARCHAR(128), revision BIGINT NOT NULL DEFAULT 1, status VARCHAR(32) NOT NULL DEFAULT 'PENDING', source_id VARCHAR(255), content_text LONGTEXT, description LONGTEXT, embedding LONGTEXT, embedding_revision BIGINT, description_embedding LONGTEXT, description_embedding_revision BIGINT, created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3), confirmed_at DATETIME(3), expires_at DATETIME(3))`,

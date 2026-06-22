@@ -102,6 +102,8 @@ func TestScrubDrive9CredEnv(t *testing.T) {
 		"DRIVE9_API_KEY=owner-key",
 		"DRIVE9_VAULT_TOKEN=cap-token",
 		"DRIVE9_SERVER=https://api.example",
+		EnvTiDBCloudPublicKey + "=tidb-public",
+		EnvTiDBCloudPrivateKey + "=tidb-private",
 		"DRIVE9_PROF_CPU_PROFILE=/tmp/cpu.pprof", // preserved (profiling knob)
 		"DRIVE9_CLI_LOG_LEVEL=debug",             // preserved (log knob)
 		"HOME=/home/drive9",
@@ -118,6 +120,8 @@ func TestScrubDrive9CredEnv(t *testing.T) {
 		"DRIVE9_API_KEY=owner-key",
 		"DRIVE9_VAULT_TOKEN=cap-token",
 		"DRIVE9_SERVER=https://api.example",
+		EnvTiDBCloudPublicKey + "=tidb-public",
+		EnvTiDBCloudPrivateKey + "=tidb-private",
 	}
 	for _, want := range mustHave {
 		if !containsEntry(got, want) {

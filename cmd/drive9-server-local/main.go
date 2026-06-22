@@ -17,17 +17,17 @@ import (
 
 	"go.uber.org/zap"
 
-	"github.com/mem9-ai/dat9/internal/srvenv"
-	"github.com/mem9-ai/dat9/pkg/backend"
-	"github.com/mem9-ai/dat9/pkg/buildinfo"
-	"github.com/mem9-ai/dat9/pkg/datastore"
-	"github.com/mem9-ai/dat9/pkg/embedding"
-	"github.com/mem9-ai/dat9/pkg/logger"
-	"github.com/mem9-ai/dat9/pkg/meta"
-	"github.com/mem9-ai/dat9/pkg/s3client"
-	"github.com/mem9-ai/dat9/pkg/server"
-	"github.com/mem9-ai/dat9/pkg/tenant"
-	"github.com/mem9-ai/dat9/pkg/tenant/schema"
+	"github.com/mem9-ai/drive9/internal/srvenv"
+	"github.com/mem9-ai/drive9/pkg/backend"
+	"github.com/mem9-ai/drive9/pkg/buildinfo"
+	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/embedding"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/server"
+	"github.com/mem9-ai/drive9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
 const (

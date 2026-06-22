@@ -12,7 +12,7 @@ import (
 	"sync"
 	"syscall"
 
-	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // cp_recursive.go implements `drive9 fs cp -r <src> <dst>` (P0 task #58

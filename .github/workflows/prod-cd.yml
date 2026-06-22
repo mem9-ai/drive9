@@ -11,6 +11,7 @@ on:
           - aws-ap-southeast-1
           - aws-us-east-1
           - alicloud-ap-southeast-1
+          - tencentcloud-ap-beijing
       image_tag:
         description: "Image tag override (default: resolve from dev deployment)"
         required: false
@@ -66,7 +67,8 @@ jobs:
           fi
           echo "Promoting image: $IMAGE"
           printf '%s=%s\n' "IMAGE" "$IMAGE" >> "$GITHUB_ENV"
-
+          aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin "${IMAGE%%/*}"
+          docker pull "$IMAGE"
       - name: Deploy to aws-ap-southeast-1
         id: deploy-sg
         if: inputs.region == 'all' || inputs.region == 'aws-ap-southeast-1'
@@ -88,6 +90,22 @@ jobs:
         run: |
           kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
+
+      - name: Deploy drive9-tidbcloud to aws-ap-southeast-1
+        id: deploy-sg-native
+        if: inputs.region == 'all' || inputs.region == 'aws-ap-southeast-1'
+        run: |
+          kubectl --context prod -n drive9-tidbcloud \
+            set image deployment/drive9-server \
+            drive9-server=$IMAGE
+          kubectl --context prod -n drive9-tidbcloud \
+            rollout status deployment/drive9-server --timeout=180s
+
+      - name: Rollback drive9-tidbcloud on failure
+        if: failure() && steps.deploy-sg-native.outcome == 'failure'
+        run: |
+          kubectl --context prod -n drive9-tidbcloud \
+            rollout undo deployment/drive9-server
 
       - name: Deploy to aws-us-east-1
         id: deploy-us
@@ -152,4 +170,58 @@ jobs:
           if [ -f ~/.kube/alicloud-config ]; then
             kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
               rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
+          fi
+
+      - name: Configure Tencent Cloud credentials
+        if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
+        uses: everpcpc/tencentcloud-oidc-auth@v1
+        with:
+          role-arn: ${{ secrets.TENCENTCLOUD_ROLE_ARN }}
+          oidc-provider-id: github-actions
+          audience: https://github.com/mem9-ai/drive9
+          region: ap-beijing
+
+      - name: Push image to tencentcloud-ap-beijing TCR
+        if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
+        run: |
+          pip3 install tccli -q
+          if ! command -v tccli >/dev/null 2>&1; then
+            echo "tccli install failed" >&2; exit 1
+          fi
+          TAG=$(echo "$IMAGE" | awk -F: '{print $NF}')
+          TCR_IMAGE="drive9.tencentcloudcr.com/drive9/dat9-server:$TAG"
+          docker tag "$IMAGE" "$TCR_IMAGE"
+           TCR_LOG=/tmp/tcr-token.log
+           tccli configure set secretId "$TENCENTCLOUD_SECRET_ID" secretKey "$TENCENTCLOUD_SECRET_KEY" region "$TENCENTCLOUD_REGION" 2>/dev/null || true
+           tccli tcr CreateInstanceToken --region ap-beijing --RegistryId tcr-jkzfg64e --TokenType longterm >"$TCR_LOG"
+           TCR_USER=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Username','100049824031'))" < "$TCR_LOG" 2>/dev/null) || true
+           TCR_TOKEN=$(python3 -c "import sys,json; d=json.load(sys.stdin); print(d['Token'])" < "$TCR_LOG" 2>/dev/null) || true
+           if [ -z "$TCR_TOKEN" ]; then
+             echo "create TCR token failed" >&2
+             exit 1
+           fi
+           rm -f "$TCR_LOG"
+           echo "::add-mask::$TCR_TOKEN"
+          echo "$TCR_TOKEN" | docker login drive9.tencentcloudcr.com --username "$TCR_USER" --password-stdin
+          docker push "$TCR_IMAGE"
+          echo "TCR_IMAGE=$TCR_IMAGE" >> "$GITHUB_ENV"
+
+      - name: Deploy to tencentcloud-ap-beijing
+        id: deploy-tencent
+        if: inputs.region == 'all' || inputs.region == 'tencentcloud-ap-beijing'
+        run: |
+          mkdir -p ~/.kube
+          tccli tke DescribeClusterKubeconfig --ClusterId cls-6dpiw235 --IsExtranet true --region ap-beijing | python3 -c "import sys,json; print(json.load(sys.stdin)['Kubeconfig'])" > ~/.kube/tencent-config
+          kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
+            set image deployment/drive9-server \
+            drive9-server=$TCR_IMAGE
+          kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
+            rollout status deployment/drive9-server --timeout=180s
+
+      - name: Rollback tencentcloud-ap-beijing on failure
+        if: failure() && steps.deploy-tencent.outcome == 'failure'
+        run: |
+          if [ -f ~/.kube/tencent-config ]; then
+            kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
+              rollout undo deployment/drive9-server
           fi

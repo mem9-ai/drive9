@@ -12,12 +12,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/datastore"
-	"github.com/mem9-ai/dat9/pkg/logger"
-	"github.com/mem9-ai/dat9/pkg/meta"
-	"github.com/mem9-ai/dat9/pkg/tenant"
-	"github.com/mem9-ai/dat9/pkg/tenant/schema"
-	"github.com/mem9-ai/dat9/pkg/tenant/token"
+	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/tenant/schema"
+	"github.com/mem9-ai/drive9/pkg/tenant/token"
 	"go.uber.org/zap"
 )
 
@@ -161,7 +161,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, forkErr(http.StatusConflict, "source tenant is not active")
 	}
 	if source.Provider != tenant.ProviderTiDBCloudStarter {
-		return nil, forkErr(http.StatusConflict, "fork requires TiDB Cloud Starter provider")
+		return nil, forkErr(http.StatusConflict, "fork is not supported in this TiDBCloud mode")
 	}
 	if source.StorageNamespaceID == "" {
 		return nil, forkErr(http.StatusConflict, "source tenant storage namespace is not initialized")
@@ -371,7 +371,7 @@ func (s *Server) provisionForkTenantOnce(ctx context.Context, forkID string) err
 		return forkErr(http.StatusConflict, "source tenant is not active")
 	}
 	if source.Provider != tenant.ProviderTiDBCloudStarter {
-		return &forkFatalProvisionError{err: forkErr(http.StatusConflict, "fork requires TiDB Cloud Starter provider")}
+		return &forkFatalProvisionError{err: forkErr(http.StatusConflict, "fork is not supported in this TiDBCloud mode")}
 	}
 	branchProvisioner, ok := s.provisioner.(tenant.AsyncBranchProvisioner)
 	if !ok {

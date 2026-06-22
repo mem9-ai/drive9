@@ -1,6 +1,6 @@
 package fuse
 
-import "github.com/mem9-ai/dat9/pkg/client"
+import "github.com/mem9-ai/drive9/pkg/client"
 
 // newTestClient is the standard test-only client constructor for fuse
 // tests. It pins the small-file threshold to the historical 50KB so

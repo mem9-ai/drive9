@@ -345,7 +345,18 @@ start_mount() {
     echo "unpack_archive=$unpack_archive"
   } >>"$MOUNT_LOG"
 
-  local args=(mount --foreground --mode=fuse --profile "$profile" --local-root "$local_root" --durability=interactive --perf-counters)
+  local perf_dir="${mount_log%.log}.perf"
+  local args=(
+    mount --foreground --mode=fuse --profile "$profile" --local-root "$local_root"
+    --durability=interactive
+    --perf-dir "$perf_dir"
+    --perf-interval 1h
+    --perf-cpu-duration 1ms
+    --perf-cpu-interval 1h
+    --perf-heap-interval 1h
+    --perf-max-sample-files 1
+    --perf-max-profile-files 1
+  )
   if [ "$no_auto_unpack" = "1" ]; then
     args+=(--no-auto-unpack)
   fi

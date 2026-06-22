@@ -3,7 +3,7 @@ package vault
 import (
 	"database/sql"
 
-	"github.com/mem9-ai/dat9/pkg/tenant/schema"
+	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
 // SchemaStatements returns the vault DDL statements (TiDB/MySQL-compatible).

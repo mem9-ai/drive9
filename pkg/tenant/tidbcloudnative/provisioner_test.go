@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/mem9-ai/dat9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/tenant"
 )
 
 func TestNewProvisionerFromEnvReadsServerSideConfigOnly(t *testing.T) {
@@ -118,7 +118,7 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	origEnsureDatabase := ensureDatabaseFunc
 	ensureDatabaseFunc = func(_ context.Context, user, password, host string, port int, dbName string) error {
 		ensureDBCalled = true
-		if user != "u1.root" || password == "" || host != "db.example" || port != 4000 || dbName != "customer_db" {
+		if user != "u1.root" || password == "" || host != "db.example" || port != 4000 || dbName != DefaultDatabaseName {
 			t.Fatalf("ensure database args = %s/%s %s:%d %s", user, password, host, port, dbName)
 		}
 		return nil
@@ -187,9 +187,8 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 		client:              ts.Client(),
 	}
 	out, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
-		PublicKey:    "public-1",
-		PrivateKey:   "private-1",
-		DatabaseName: "customer_db",
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
 	})
 	if err != nil {
 		t.Fatalf("ProvisionWithCredentials: %v", err)
@@ -200,7 +199,7 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	if strings.Contains(gotAuth, "private-1") {
 		t.Fatalf("Authorization header leaked private key: %q", gotAuth)
 	}
-	if gotBody.DisplayName != "drive9-tenant-1" {
+	if gotBody.DisplayName != "tidbcloud-fs-tenant-1" {
 		t.Fatalf("displayName = %q", gotBody.DisplayName)
 	}
 	if gotBody.Region.Name != "regions/aws-us-east-1" {
@@ -212,7 +211,7 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	if gotBody.SpendingLimit.Monthly != 5000 {
 		t.Fatalf("spendingLimit.monthly = %d, want 5000", gotBody.SpendingLimit.Monthly)
 	}
-	if out.ClusterID != "cluster-1" || out.Username != "u1.root" || out.DBName != "customer_db" || out.Provider != tenant.ProviderTiDBCloudNative {
+	if out.ClusterID != "cluster-1" || out.Username != "u1.root" || out.DBName != DefaultDatabaseName || out.Provider != tenant.ProviderTiDBCloudNative {
 		t.Fatalf("unexpected cluster info: %#v", out)
 	}
 	if !ensureDBCalled {
@@ -266,21 +265,6 @@ func TestProvisionWithCredentialsDefaultsDatabaseName(t *testing.T) {
 	}
 	if ensuredDB != DefaultDatabaseName {
 		t.Fatalf("ensured database = %q, want %q", ensuredDB, DefaultDatabaseName)
-	}
-}
-
-func TestProvisionWithCredentialsRejectsReservedDatabaseName(t *testing.T) {
-	p := &Provisioner{defaultDatabaseName: DefaultDatabaseName}
-	_, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
-		PublicKey:    "public-1",
-		PrivateKey:   "private-1",
-		DatabaseName: "test",
-	})
-	if err == nil {
-		t.Fatal("expected reserved database_name error")
-	}
-	if !strings.Contains(err.Error(), "reserved") {
-		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -369,11 +353,69 @@ func TestClusterDisplayNameMatchesSwaggerContract(t *testing.T) {
 	if len(got) < 4 || len(got) > 64 {
 		t.Fatalf("display name length = %d for %q", len(got), got)
 	}
+	if !strings.HasPrefix(got, "tidbcloud-fs-") {
+		t.Fatalf("display name = %q, want tidbcloud-fs prefix", got)
+	}
 	matched, err := regexp.MatchString(`^[A-Za-z0-9][-A-Za-z0-9]{2,62}[A-Za-z0-9]$`, got)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !matched {
 		t.Fatalf("display name %q does not match swagger pattern", got)
+	}
+}
+
+func TestSystemUsernameForCurrent(t *testing.T) {
+	got, needsSetup, err := systemUsernameForCurrent("22ipQWBXXq2wN2S.root")
+	if err != nil {
+		t.Fatalf("systemUsernameForCurrent: %v", err)
+	}
+	if !needsSetup || got != "22ipQWBXXq2wN2S.tdc_fs_sys" {
+		t.Fatalf("system username = %q setup=%v", got, needsSetup)
+	}
+	got, needsSetup, err = systemUsernameForCurrent("22ipQWBXXq2wN2S.tdc_fs_sys")
+	if err != nil {
+		t.Fatalf("systemUsernameForCurrent existing: %v", err)
+	}
+	if needsSetup || got != "22ipQWBXXq2wN2S.tdc_fs_sys" {
+		t.Fatalf("existing system username = %q setup=%v", got, needsSetup)
+	}
+	if _, _, err := systemUsernameForCurrent(""); err == nil {
+		t.Fatal("expected empty username error")
+	}
+	for _, username := range []string{"root", "u1.admin"} {
+		if _, _, err := systemUsernameForCurrent(username); err == nil {
+			t.Fatalf("expected unexpected username %q to be rejected", username)
+		}
+	}
+}
+
+func TestSystemUserStatements(t *testing.T) {
+	got := systemUserStatements("tidbcloud_fs", "22ipQWBXXq2wN2S.tdc_fs_sys", "pass123")
+	want := []string{
+		"CREATE DATABASE IF NOT EXISTS `tidbcloud_fs`",
+		"CREATE ROLE IF NOT EXISTS 'tdc_fs_admin'",
+		"GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON `tidbcloud_fs`.* TO 'tdc_fs_admin'",
+		"CREATE USER IF NOT EXISTS '22ipQWBXXq2wN2S.tdc_fs_sys' IDENTIFIED BY 'pass123'",
+		"ALTER USER '22ipQWBXXq2wN2S.tdc_fs_sys' IDENTIFIED BY 'pass123'",
+		"GRANT 'tdc_fs_admin' TO '22ipQWBXXq2wN2S.tdc_fs_sys'",
+		"SET DEFAULT ROLE 'tdc_fs_admin' TO '22ipQWBXXq2wN2S.tdc_fs_sys'",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("statement count = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("statement %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSQLQuoting(t *testing.T) {
+	if got := quoteIdent("db`name"); got != "`db``name`" {
+		t.Fatalf("quoteIdent = %q", got)
+	}
+	if got := quoteString(`u'ser\name`); got != `'u''ser\\name'` {
+		t.Fatalf("quoteString = %q", got)
 	}
 }

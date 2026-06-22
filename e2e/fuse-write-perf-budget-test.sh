@@ -3,8 +3,8 @@
 #
 # Runs a deterministic fsync-heavy write workload (creates + overwrites +
 # renames + one medium file) through an interactive-durability mount with
-# --perf-counters, waits for remote convergence, then asserts remote-op
-# budgets from the perf summary printed at clean unmount:
+# --perf-dir, waits for remote convergence, then asserts remote-op budgets from
+# the perf summary printed at clean unmount:
 #   - remote write ops scale with committed files, not with write()/fsync()
 #     syscalls (catches upload amplification)
 #   - remote stat/list ops stay bounded (catches per-write metadata storms)
@@ -144,10 +144,20 @@ start_mount() {
   {
     echo "=== drive9 write-perf mount start time=$(date -u '+%Y-%m-%dT%H:%M:%SZ') ==="
     echo "cache_dir=$CACHE_DIR"
+    echo "remote_root=$ROOT_REMOTE"
   } >>"$MOUNT_LOG"
   # --foreground keeps the daemon as our child so its stderr (the perf
   # summary) lands in MOUNT_LOG; plain `drive9 mount` daemonizes.
-  drive9 mount --foreground --cache-dir "$CACHE_DIR" --durability interactive --perf-counters "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
+  local perf_dir="$RUN_ROOT/perf"
+  drive9 mount --foreground --cache-dir "$CACHE_DIR" --durability interactive \
+    --perf-dir "$perf_dir" \
+    --perf-interval 1h \
+    --perf-cpu-duration 1ms \
+    --perf-cpu-interval 1h \
+    --perf-heap-interval 1h \
+    --perf-max-sample-files 1 \
+    --perf-max-profile-files 1 \
+    ":$ROOT_REMOTE" "$MOUNT_POINT" >>"$MOUNT_LOG" 2>&1 &
   MOUNT_PID="$!"
   if wait_mount_state mounted; then
     return 0
@@ -343,7 +353,7 @@ PY
   done
 }
 
-# check_write_perf_budgets parses the perf summary that --perf-counters prints
+# check_write_perf_budgets parses the perf summary that --perf-dir enables
 # at clean unmount and enforces op-count budgets. Ops absent from the summary
 # have count 0 (printSummary skips zero-count ops).
 check_write_perf_budgets() {
@@ -528,7 +538,9 @@ CTX_HOME="$RUN_ROOT/ctx-home"
 EXPECTED_MANIFEST="$RUN_ROOT/expected-manifest.json"
 ROOT_REL="$RUN_ID"
 ROOT_REMOTE="/$ROOT_REL"
-WORK_MOUNT="$MOUNT_POINT/$ROOT_REL/work"
+# Mount only this test's remote root so fixtures from earlier local-e2e
+# suites cannot trigger cache hydration or inflate write-path perf counters.
+WORK_MOUNT="$MOUNT_POINT/work"
 WORK_REMOTE="$ROOT_REMOTE/work"
 MOUNT_PID=""
 
@@ -557,7 +569,7 @@ drive9 fs mkdir "$ROOT_REMOTE" >/dev/null
 drive9 fs mkdir "$WORK_REMOTE" >/dev/null
 check_eq "remote write-perf root" "$ROOT_REMOTE" "$ROOT_REMOTE"
 
-echo "[5] mount (interactive durability, perf counters)"
+echo "[5] mount (interactive durability, perf dir)"
 if start_mount; then
   check_eq "mount is mounted" "true" "true"
 else

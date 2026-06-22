@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/semantic"
+	"github.com/mem9-ai/drive9/pkg/semantic"
 )
 
 func TestInsertFileTx(t *testing.T) {

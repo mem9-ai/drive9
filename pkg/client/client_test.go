@@ -14,11 +14,11 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/mem9-ai/dat9/internal/testmysql"
-	"github.com/mem9-ai/dat9/pkg/backend"
-	"github.com/mem9-ai/dat9/pkg/datastore"
-	"github.com/mem9-ai/dat9/pkg/s3client"
-	"github.com/mem9-ai/dat9/pkg/server"
+	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/backend"
+	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/server"
 )
 
 func newTestClient(t *testing.T) (*Client, func()) {
@@ -99,6 +99,12 @@ func TestListDir(t *testing.T) {
 	}
 	if len(entries) != 2 {
 		t.Fatalf("expected 2, got %d", len(entries))
+	}
+	// Server now returns revision in list response; verify it is populated.
+	for _, e := range entries {
+		if e.Revision <= 0 {
+			t.Fatalf("list entry %q: revision = %d, want > 0", e.Name, e.Revision)
+		}
 	}
 }
 

@@ -12,11 +12,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mem9-ai/dat9/internal/schemaspec"
-	"github.com/mem9-ai/dat9/pkg/logger"
-	"github.com/mem9-ai/dat9/pkg/metrics"
-	"github.com/mem9-ai/dat9/pkg/mysqlutil"
-	"github.com/mem9-ai/dat9/pkg/pathutil"
+	"github.com/mem9-ai/drive9/internal/schemaspec"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/mysqlutil"
+	"github.com/mem9-ai/drive9/pkg/pathutil"
 	"go.uber.org/zap"
 )
 
@@ -220,10 +220,14 @@ type Store struct {
 }
 
 func Open(dsn string) (*Store, error) {
+	return OpenContext(context.Background(), dsn)
+}
+
+func OpenContext(ctx context.Context, dsn string) (*Store, error) {
 	if strings.Contains(dsn, "multiStatements=true") {
 		return nil, fmt.Errorf("multiStatements=true is not allowed in production DSN")
 	}
-	db, err := mysqlutil.OpenInstrumented(context.Background(), dsn, mysqlutil.RoleMeta)
+	db, err := mysqlutil.OpenInstrumented(ctx, dsn, mysqlutil.RoleMeta)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
@@ -1654,6 +1658,18 @@ func (s *Store) UpdateTenantConnection(ctx context.Context, id string, cluster *
 		return ErrNotFound
 	}
 	return nil
+}
+
+func (s *Store) UpdateTenantDBCredentialIf(ctx context.Context, id, fromDBUser, dbUser string, dbPasswordCipher []byte) (updated bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tenant_db_credential_if", start, &err)
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET db_user = ?, db_password = ?, updated_at = ? WHERE id = ? AND db_user = ?`,
+		dbUser, dbPasswordCipher, time.Now().UTC(), id, fromDBUser)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func (s *Store) UpdateTenantBranch(ctx context.Context, id string, cluster *Tenant) (err error) {

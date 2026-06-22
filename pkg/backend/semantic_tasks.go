@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/metrics"
-	"github.com/mem9-ai/dat9/pkg/semantic"
+	"github.com/mem9-ai/drive9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/semantic"
 )
 
 // The enqueue helpers report whether a task row was actually created (the
@@ -142,6 +142,9 @@ func newAudioExtractTask(taskID, fileID string, revision int64, path, contentTyp
 }
 
 func (b *Dat9Backend) shouldEnqueueEmbedForRevision(path, contentType, contentText, description string) bool {
+	if !b.appSemanticTasksEnabled {
+		return false
+	}
 	if strings.TrimSpace(contentText) != "" {
 		return true
 	}

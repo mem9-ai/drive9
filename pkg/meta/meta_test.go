@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/dat9/internal/testmysql"
-	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 func newControlStore(t *testing.T) *Store {
@@ -54,6 +54,57 @@ func TestMetaDBMetrics(t *testing.T) {
 	}
 	if !strings.Contains(text, `drive9_db_pool_registered{role="meta"}`) {
 		t.Fatalf("expected meta db pool metric in response: %s", text)
+	}
+}
+
+func TestUpdateTenantDBCredentialIfComparesPreviousUser(t *testing.T) {
+	s := newControlStore(t)
+	now := time.Now().UTC()
+	if err := s.InsertTenant(context.Background(), &Tenant{
+		ID:               "credential-cas-tenant",
+		Status:           TenantProvisioning,
+		DBHost:           "127.0.0.1",
+		DBPort:           4000,
+		DBUser:           "u1.root",
+		DBPasswordCipher: []byte("root-cipher"),
+		DBName:           "tenant_db",
+		DBTLS:            true,
+		Provider:         "tidb_cloud_native",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "other.root", "u1.tdc_fs_sys", []byte("system-cipher"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated {
+		t.Fatal("credential update succeeded with mismatched previous user")
+	}
+	var dbUser string
+	var passCipher []byte
+	if err := s.DB().QueryRow("SELECT db_user, db_password FROM tenants WHERE id = ?", "credential-cas-tenant").Scan(&dbUser, &passCipher); err != nil {
+		t.Fatal(err)
+	}
+	if dbUser != "u1.root" || string(passCipher) != "root-cipher" {
+		t.Fatalf("tenant credential changed after failed CAS: user=%q pass=%q", dbUser, passCipher)
+	}
+
+	updated, err = s.UpdateTenantDBCredentialIf(context.Background(), "credential-cas-tenant", "u1.root", "u1.tdc_fs_sys", []byte("system-cipher"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated {
+		t.Fatal("credential update did not match previous user")
+	}
+	if err := s.DB().QueryRow("SELECT db_user, db_password FROM tenants WHERE id = ?", "credential-cas-tenant").Scan(&dbUser, &passCipher); err != nil {
+		t.Fatal(err)
+	}
+	if dbUser != "u1.tdc_fs_sys" || string(passCipher) != "system-cipher" {
+		t.Fatalf("tenant credential = %q/%q, want system credential", dbUser, passCipher)
 	}
 }
 

@@ -31,6 +31,11 @@ func makeJWT(t *testing.T, claims map[string]any) string {
 
 func makeDrive9APIKey(t *testing.T, claims map[string]any) string {
 	t.Helper()
+	return "drive9_" + base64.RawURLEncoding.EncodeToString([]byte(makeJWT(t, claims)))
+}
+
+func makeLegacyDrive9APIKey(t *testing.T, claims map[string]any) string {
+	t.Helper()
 	return "dat9_" + base64.RawURLEncoding.EncodeToString([]byte(makeJWT(t, claims)))
 }
 
@@ -375,6 +380,40 @@ func TestCtxShowOwnerMaskedText(t *testing.T) {
 	}
 }
 
+func TestCtxShowOmitsEmptyModeFields(t *testing.T) {
+	_ = withIsolatedHome(t)
+	cfg := loadConfig()
+	_, err := ctxAdd(cfg, "prod", &Context{
+		Type:   PrincipalOwner,
+		APIKey: "drive9_abcdxxxxxxxxwxyz",
+		Server: "https://api.drive9.ai",
+	})
+	if err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("saveConfig: %v", err)
+	}
+
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"show", "--json"}) })
+	if err != nil {
+		t.Fatalf("ctx show --json: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("json.Unmarshal: %v\nout=%q", err, out)
+	}
+	if _, ok := got["mode"]; ok {
+		t.Fatalf("mode should be omitted when empty: %#v", got)
+	}
+	if _, ok := got["cloud_provider"]; ok {
+		t.Fatalf("cloud_provider should be omitted when empty: %#v", got)
+	}
+	if _, ok := got["region"]; ok {
+		t.Fatalf("region should be omitted when empty: %#v", got)
+	}
+}
+
 func TestCtxShowOwnerRevealJSON(t *testing.T) {
 	home := withIsolatedHome(t)
 	cfg := loadConfig()
@@ -418,6 +457,110 @@ func TestCtxShowOwnerRevealJSON(t *testing.T) {
 	}
 	if got["source"] != filepath.Join(home, ".drive9", "config") {
 		t.Fatalf("source = %v, want config path", got["source"])
+	}
+}
+
+func TestCtxAddNativeMetadataAndListDefaultColumns(t *testing.T) {
+	_ = withIsolatedHome(t)
+
+	out, err := captureStdoutE(t, func() error {
+		return Ctx([]string{
+			"add",
+			"--api-key", "drive9_abcdxxxxxxxxwxyz",
+			"--name", "native",
+			"--server", "https://native.drive9.example",
+			"--mode", "TiDBCloud",
+			"--cloud-provider", "aws",
+			"--region", "us-east-1",
+		})
+	})
+	if err != nil {
+		t.Fatalf("ctx add: %v", err)
+	}
+	if !strings.Contains(out, `added context "native"`) {
+		t.Fatalf("ctx add output = %q", out)
+	}
+
+	cfg := loadConfig()
+	got := cfg.Contexts["native"]
+	if got == nil || got.Mode != "TiDBCloud" || got.CloudProvider != "aws" || got.Region != "us-east-1" {
+		t.Fatalf("saved native context = %#v", got)
+	}
+
+	out, err = captureStdoutE(t, func() error { return Ctx([]string{"list"}) })
+	if err != nil {
+		t.Fatalf("ctx list: %v", err)
+	}
+	for _, want := range []string{"MODE", "CLOUD_PROVIDER", "REGION", "TiDBCloud", "aws", "us-east-1"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("ctx list output = %q, want %q", out, want)
+		}
+	}
+
+	out, err = captureStdoutE(t, func() error { return Ctx([]string{"show", "--json", "--reveal"}) })
+	if err != nil {
+		t.Fatalf("ctx show --json --reveal: %v", err)
+	}
+	var shown struct {
+		Mode          string `json:"mode"`
+		CloudProvider string `json:"cloud_provider"`
+		Region        string `json:"region"`
+	}
+	if err := json.Unmarshal([]byte(out), &shown); err != nil {
+		t.Fatalf("json.Unmarshal: %v\nout=%q", err, out)
+	}
+	if shown.Mode != "TiDBCloud" || shown.CloudProvider != "aws" || shown.Region != "us-east-1" {
+		t.Fatalf("ctx show native metadata = %#v", shown)
+	}
+
+	out, err = captureStdoutE(t, func() error { return Ctx([]string{"list", "--json"}) })
+	if err != nil {
+		t.Fatalf("ctx list --json: %v", err)
+	}
+	var listed struct {
+		Contexts []struct {
+			Name          string `json:"name"`
+			Mode          string `json:"mode"`
+			CloudProvider string `json:"cloud_provider"`
+			Region        string `json:"region"`
+		} `json:"contexts"`
+	}
+	if err := json.Unmarshal([]byte(out), &listed); err != nil {
+		t.Fatalf("json.Unmarshal list: %v\nout=%q", err, out)
+	}
+	if len(listed.Contexts) != 1 || listed.Contexts[0].Name != "native" || listed.Contexts[0].Mode != "TiDBCloud" || listed.Contexts[0].CloudProvider != "aws" || listed.Contexts[0].Region != "us-east-1" {
+		t.Fatalf("ctx list json native metadata = %#v", listed.Contexts)
+	}
+}
+
+func TestCtxAddRejectsAmbiguousRegionMetadata(t *testing.T) {
+	_ = withIsolatedHome(t)
+
+	err := Ctx([]string{
+		"add",
+		"--api-key", "drive9_abcdxxxxxxxxwxyz",
+		"--name", "bad",
+		"--cloud-provider", "aws",
+	})
+	if err == nil {
+		t.Fatal("ctx add error = nil, want cloud-provider requires mode error")
+	}
+	if !strings.Contains(err.Error(), "require --mode TiDBCloud") {
+		t.Fatalf("ctx add error = %q", err)
+	}
+
+	err = Ctx([]string{
+		"add",
+		"--api-key", "drive9_abcdxxxxxxxxwxyz",
+		"--name", "bad-anon",
+		"--mode", "Anonymous",
+		"--region", "us-east-1",
+	})
+	if err == nil {
+		t.Fatal("ctx add error = nil, want Anonymous region error")
+	}
+	if !strings.Contains(err.Error(), "anonymous contexts do not use") {
+		t.Fatalf("ctx add error = %q", err)
 	}
 }
 
@@ -1146,6 +1289,31 @@ func TestCtxImport_ExplicitStdinDash(t *testing.T) {
 	cfgPath := filepath.Join(home, ".drive9", "config")
 	if _, err := os.Stat(cfgPath); err != nil {
 		t.Fatalf("config missing after explicit stdin import: %v", err)
+	}
+}
+
+func TestDecodeDrive9APIKeyPayloadAcceptsLegacyPrefix(t *testing.T) {
+	claims := map[string]any{
+		"tenant_id":     "legacy-tenant",
+		"token_version": 1,
+		"iat":           time.Now().Unix(),
+	}
+	legacyKey := makeLegacyDrive9APIKey(t, claims)
+	got, err := decodeDrive9APIKeyPayload(legacyKey)
+	if err != nil {
+		t.Fatalf("decodeDrive9APIKeyPayload legacy prefix: %v", err)
+	}
+	if got.TenantID != "legacy-tenant" {
+		t.Fatalf("TenantID = %q, want legacy-tenant", got.TenantID)
+	}
+
+	newKey := makeDrive9APIKey(t, claims)
+	got, err = decodeDrive9APIKeyPayload(newKey)
+	if err != nil {
+		t.Fatalf("decodeDrive9APIKeyPayload new prefix: %v", err)
+	}
+	if got.TenantID != "legacy-tenant" {
+		t.Fatalf("TenantID = %q, want legacy-tenant", got.TenantID)
 	}
 }
 

@@ -12,8 +12,8 @@ import (
 
 	"github.com/pingcap/failpoint"
 
-	"github.com/mem9-ai/dat9/pkg/datastore"
-	"github.com/mem9-ai/dat9/pkg/metrics"
+	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // AudioExtractRequest is the input to a pluggable audio->text extractor.

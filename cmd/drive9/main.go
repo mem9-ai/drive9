@@ -7,6 +7,7 @@
 // Commands:
 //
 //	create  provision a new database and owner context
+//	delete  delete the current tenant
 //	ctx     manage contexts (show, add, import, fork, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, mkdir, chmod,
 //	        symlink, hardlink, sh, grep, find, layer)
@@ -14,6 +15,7 @@
 //	vault   vault operations (set, get, put, with, ls, rm, grant, revoke, audit)
 //	journal append-only agent/workflow journal operations
 //	git     git-aware drive9 workflows
+//	region list provisioning regions
 //	profile show mount profile configuration
 //	mount   mount drive9 as a local filesystem, or mount vault secrets
 //	umount  unmount a drive9 local mount
@@ -26,14 +28,15 @@ import (
 	"fmt"
 	"os"
 	"runtime/pprof"
+	"strings"
 	"sync"
 
 	"go.uber.org/zap"
 
-	"github.com/mem9-ai/dat9/cmd/drive9/cli"
-	"github.com/mem9-ai/dat9/pkg/buildinfo"
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/logger"
+	"github.com/mem9-ai/drive9/cmd/drive9/cli"
+	"github.com/mem9-ai/drive9/pkg/buildinfo"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/logger"
 )
 
 var cliLogger *zap.Logger
@@ -45,10 +48,12 @@ var exitFunc = os.Exit
 // "handler not reached". Production callers see no change: the default value
 // is the real cli.Secret and nothing else reassigns it outside tests.
 var vaultHandler = cli.Secret
+var deleteHandler = cli.DeleteTenant
 var tokenHandler = cli.Token
 var doctorHandler = cli.Doctor
 var journalHandler = cli.Journal
 var gitHandler = cli.Git
+var regionHandler = cli.Region
 var packHandler = cli.PackCommand
 var unpackHandler = cli.UnpackCommand
 var profileHandler = cli.Profile
@@ -93,17 +98,31 @@ func dispatch(cmd string, args []string) {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "version"))
 		}
 		fmt.Print(versionString())
-	case "-h", "-help", "--help", "help":
+	case "-h", "-help", "--help":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "help"))
 		}
 		usage(0)
+	case "help":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "help"))
+		}
+		if err := runHelp(args); err != nil {
+			fatal("help", err)
+		}
 	case "create":
 		if cliLogger != nil {
 			logger.Info(context.Background(), "cli_command", zap.String("command", "create"))
 		}
 		if err := cli.Create(args); err != nil {
 			fatal("create", err)
+		}
+	case "delete":
+		if cliLogger != nil {
+			logger.Info(context.Background(), "cli_command", zap.String("command", "delete"))
+		}
+		if err := deleteHandler(args); err != nil {
+			fatal("delete", err)
 		}
 	case "ctx":
 		if cliLogger != nil {
@@ -180,6 +199,21 @@ func dispatch(cmd string, args []string) {
 				sub = " " + args[0]
 			}
 			fatal("git"+sub, err)
+		}
+	case "region":
+		if cliLogger != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = args[0]
+			}
+			logger.Info(context.Background(), "cli_command", zap.String("command", "region"), zap.String("subcommand", sub))
+		}
+		if err := regionHandler(args); err != nil {
+			sub := ""
+			if len(args) > 0 {
+				sub = " " + args[0]
+			}
+			fatal("region"+sub, err)
 		}
 	case "pack":
 		if cliLogger != nil {
@@ -340,7 +374,13 @@ func fatal(cmd string, err error) {
 	if cliLogger != nil {
 		logger.Error(context.Background(), "cli_command_failed", zap.String("command", cmd), zap.Error(err))
 	}
-	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, err)
+	msg := err.Error()
+	if strings.Contains(strings.ToLower(msg), "usage quota") {
+		if m := cli.QuotaExceededMessageForCurrentContext(); m != "" {
+			msg = m
+		}
+	}
+	fmt.Fprintf(os.Stderr, "%s: %v\n", cmd, msg)
 	type exitCoder interface{ ExitCode() int }
 	if ec, ok := err.(exitCoder); ok && ec.ExitCode() > 0 {
 		exitWithCode(ec.ExitCode())
@@ -352,8 +392,12 @@ func usage(code int) {
 	fmt.Fprint(os.Stderr,
 		"usage: drive9 <command> [arguments]\n\n"+
 			"commands:\n"+
-			"  create [--name NAME] [--server URL]\n"+
-			"                         provision a new database and owner context\n"+
+			"  create [--name NAME] [--region-code CODE] [--server URL] [--json]\n"+
+			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
+			"                         provision a new tenant and owner context\n"+
+			"  delete [--server URL] [--api-key KEY] [--json]\n"+
+			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
+			"                         delete current tenant with owner API key\n"+
 			"  ctx show [--json] [--reveal]\n"+
 			"                         show current context\n"+
 			"  ctx add --api-key <key> [--name NAME] [--server URL]\n"+
@@ -374,6 +418,8 @@ func usage(code int) {
 			"                         append-only agent/workflow journal operations\n"+
 			"  git clone --fast <repo-url> <mounted-path>\n"+
 			"                         git-aware fast clone workflow\n"+
+			"  region list [--json] [--manifest-url URL]\n"+
+			"                         list provisioning regions from the drive9 manifest\n"+
 			"  pack [flags] [archive] [path...]\n"+
 			"                         archive coding-agent local overlay paths to drive9/S3\n"+
 			"  unpack [flags] [archive]\n"+
@@ -382,13 +428,17 @@ func usage(code int) {
 			"                         print mount profile configuration\n"+
 			"  mount [flags] [:/remote] <mountpoint>\n"+
 			"                         mount drive9 filesystem\n"+
+			"  mount drain [--timeout duration] [--json] <mountpoint>\n"+
+			"                         drain pending writes for a live FUSE mount\n"+
 			"  mount vault [flags] <mountpoint>\n"+
 			"                         mount vault secrets read-only\n"+
 			"  umount <mountpoint>    unmount a drive9 mount\n"+
 			"  doctor fuse            diagnose local FUSE prerequisites\n"+
-			"  update [--check]       update drive9 CLI in place\n\n"+
+			"  update [--check]       update drive9 CLI in place\n"+
+			"  help [--plain] [--no-pager] [--color=auto|always|never]\n"+
+			"                         show visual tree help\n\n"+
 			"global:\n"+
-			"  -h, --help, help       show this help\n"+
+			"  -h, -help, --help      show this classic usage\n"+
 			"  -v, --version, version print version information\n",
 	)
 	exitWithCode(code)

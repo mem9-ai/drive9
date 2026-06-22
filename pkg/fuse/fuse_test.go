@@ -10,10 +10,11 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 var (
@@ -89,6 +90,28 @@ func TestInodeToPath_ForgetDirectoryKeepsMapping(t *testing.T) {
 	}
 }
 
+func TestInodeToPath_ForgetOwnerMetadataKeepsMapping(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/tmp", false, 0, time.Now())
+	m.UpdateOwner(ino, 65534, 65534, true, true)
+	m.Forget(ino, 1)
+	p, ok := m.GetPath(ino)
+	if !ok || p != "/tmp" {
+		t.Fatalf("owner-tracked inode mapping should be preserved, got %q, %v", p, ok)
+	}
+}
+
+func TestInodeToPath_ForgetMetadataOnlySpecialKeepsMapping(t *testing.T) {
+	m := NewInodeToPath()
+	ino := m.Lookup("/pipe", false, 0, time.Now())
+	m.SetModeState(ino, uint32(syscall.S_IFIFO)|0o644, true)
+	m.Forget(ino, 1)
+	p, ok := m.GetPath(ino)
+	if !ok || p != "/pipe" {
+		t.Fatalf("metadata-only special inode mapping should be preserved, got %q, %v", p, ok)
+	}
+}
+
 func TestInodeToPath_ForgetRoot(t *testing.T) {
 	m := NewInodeToPath()
 	m.Forget(1, 1)
@@ -127,8 +150,28 @@ func TestInodeToPath_RenameReplacesDestination(t *testing.T) {
 	if p, ok := m.GetPath(srcIno); !ok || p != "/config" {
 		t.Fatalf("source path = %q, %v; want /config, true", p, ok)
 	}
-	if p, ok := m.GetPath(dstIno); ok {
-		t.Fatalf("replaced destination inode still mapped to %q", p)
+	if gotIno, ok := m.GetInode("/config"); !ok || gotIno == dstIno {
+		t.Fatalf("destination path still resolves to replaced inode %d, %v", gotIno, ok)
+	}
+}
+
+func TestInodeToPath_RenameReplacesDestinationPreservesUnlinkedInode(t *testing.T) {
+	m := NewInodeToPath()
+	srcIno := m.Lookup("/config.lock", false, 10, time.Now())
+	dstIno := m.Lookup("/config", false, 5, time.Now())
+
+	m.Rename("/config.lock", "/config")
+
+	gotIno, ok := m.GetInode("/config")
+	if !ok || gotIno != srcIno {
+		t.Fatalf("GetInode(/config) = %d, %v; want %d, true", gotIno, ok, srcIno)
+	}
+	dstEntry, ok := m.GetEntry(dstIno)
+	if !ok {
+		t.Fatal("replaced destination inode should be preserved for open handles")
+	}
+	if !dstEntry.Unlinked || dstEntry.Nlink != 0 || dstEntry.Path != "/config" {
+		t.Fatalf("destination entry = %+v; want unlinked nlink=0 at old path", dstEntry)
 	}
 }
 
@@ -292,6 +335,27 @@ func TestReadCache_TTLExpiry(t *testing.T) {
 	_, ok := rc.Get("/f", 1)
 	if ok {
 		t.Fatal("expected cache miss after TTL expiry")
+	}
+}
+
+func TestReadCache_NoTTLExpiry(t *testing.T) {
+	rc := NewReadCache(1<<20, readCacheNoExpiryTTL)
+	rc.Put("/f", []byte("x"), 1)
+	time.Sleep(5 * time.Millisecond)
+	got, ok := rc.Get("/f", 1)
+	if !ok {
+		t.Fatal("expected cache hit when time-based expiry is disabled")
+	}
+	if string(got) != "x" {
+		t.Fatalf("got %q, want x", got)
+	}
+}
+
+func TestReadCache_NoTTLExpiryStillChecksRevision(t *testing.T) {
+	rc := NewReadCache(1<<20, readCacheNoExpiryTTL)
+	rc.Put("/f", []byte("x"), 1)
+	if _, ok := rc.Get("/f", 2); ok {
+		t.Fatal("expected cache miss on revision mismatch")
 	}
 }
 
@@ -986,6 +1050,48 @@ func TestNamespaceCache_InvalidatePrefix(t *testing.T) {
 	}
 	if _, ok := dc.Get("/repo2"); !ok {
 		t.Fatal("/repo2 should be preserved")
+	}
+}
+
+func TestNamespaceCache_LargeDirCachesCompleteWithHighMaxEntries(t *testing.T) {
+	// With a high maxEntries (like the new default 100000), a 10k-entry
+	// directory should be cached as complete and returned by Get().
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 100000)
+	items := make([]CachedFileInfo, 10000)
+	for i := range items {
+		items[i] = CachedFileInfo{
+			Name:     fmt.Sprintf("file_%05d.txt", i),
+			Size:     1024,
+			Revision: int64(i + 1),
+		}
+	}
+	dc.Put("/bigdir", items)
+
+	got, ok := dc.Get("/bigdir")
+	if !ok {
+		t.Fatal("10k-entry dir should be cached as complete with maxEntries=100000")
+	}
+	if len(got) != 10000 {
+		t.Fatalf("got %d cached entries, want 10000", len(got))
+	}
+	// Verify revision is preserved
+	if got[0].Revision <= 0 {
+		t.Fatal("revision should be preserved in cached entries")
+	}
+}
+
+func TestNamespaceCache_OldDefault2000DoesNotCacheLargeDir(t *testing.T) {
+	// Demonstrates the old behavior: maxEntries=2000 prevents 10k dirs
+	// from being cached as complete.
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 2000)
+	items := make([]CachedFileInfo, 10000)
+	for i := range items {
+		items[i] = CachedFileInfo{Name: fmt.Sprintf("file_%05d.txt", i)}
+	}
+	dc.Put("/bigdir", items)
+
+	if _, ok := dc.Get("/bigdir"); ok {
+		t.Fatal("10k-entry dir should NOT be cached as complete with maxEntries=2000")
 	}
 }
 

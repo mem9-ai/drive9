@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -12,8 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/s3client"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
 type multipartUploadRecorder struct {
@@ -203,6 +204,41 @@ func newMultipartUploadRecorder(t *testing.T, wantPath string, wantSize int64, w
 
 func (rec *multipartUploadRecorder) client() *client.Client {
 	return newTestClient(rec.server.URL)
+}
+
+func TestTruncateReaderAtPreservesPrefixAndZeroFillsExtension(t *testing.T) {
+	reader := &truncateReaderAt{
+		source:       strings.NewReader("abcdef"),
+		existingSize: 6,
+		totalSize:    10,
+	}
+	buf := make([]byte, 10)
+	n, err := reader.ReadAt(buf, 0)
+	if err != nil {
+		t.Fatalf("ReadAt: %v", err)
+	}
+	if n != len(buf) {
+		t.Fatalf("ReadAt n = %d, want %d", n, len(buf))
+	}
+	if want := []byte{'a', 'b', 'c', 'd', 'e', 'f', 0, 0, 0, 0}; !bytes.Equal(buf, want) {
+		t.Fatalf("ReadAt bytes = %v, want %v", buf, want)
+	}
+
+	zeroOnly := make([]byte, 3)
+	n, err = reader.ReadAt(zeroOnly, 7)
+	if err != nil {
+		t.Fatalf("ReadAt zero extension: %v", err)
+	}
+	if n != len(zeroOnly) {
+		t.Fatalf("ReadAt zero extension n = %d, want %d", n, len(zeroOnly))
+	}
+	if !bytes.Equal(zeroOnly, []byte{0, 0, 0}) {
+		t.Fatalf("ReadAt zero extension bytes = %v, want zeros", zeroOnly)
+	}
+
+	if n, err := reader.ReadAt(make([]byte, 1), 10); n != 0 || err != io.EOF {
+		t.Fatalf("ReadAt at EOF = %d, %v; want 0, EOF", n, err)
+	}
 }
 
 func TestUploadFromShadowRemoteWithRevisionDirectPutsSmallSpill(t *testing.T) {

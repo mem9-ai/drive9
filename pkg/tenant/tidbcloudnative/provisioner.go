@@ -21,8 +21,8 @@ import (
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
-	"github.com/mem9-ai/dat9/pkg/tenant"
-	"github.com/mem9-ai/dat9/pkg/tenant/schema"
+	"github.com/mem9-ai/drive9/pkg/tenant"
+	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
 const (
@@ -31,6 +31,8 @@ const (
 	EnvTiDBCloudNativeRegion              = "DRIVE9_TIDBCLOUD_NATIVE_REGION"
 	EnvTiDBCloudNativeDefaultDatabaseName = "DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME"
 	EnvTiDBCloudDefaultSpendingLimit      = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
+	EnvTiDBCloudNativePublicKey           = "DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY"
+	EnvTiDBCloudNativePrivateKey          = "DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY"
 
 	DefaultDatabaseName = "tidbcloud_fs"
 	DefaultSpendLimit   = int32(1000)
@@ -49,6 +51,8 @@ type Provisioner struct {
 	region              string
 	defaultDatabaseName string
 	defaultSpendLimit   *int32
+	defaultPublicKey    string
+	defaultPrivateKey   string
 	client              *http.Client
 }
 
@@ -80,18 +84,65 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 		region:              region,
 		defaultDatabaseName: defaultDB,
 		defaultSpendLimit:   defaultSpendLimit,
+		defaultPublicKey:    strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePublicKey)),
+		defaultPrivateKey:   strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePrivateKey)),
 		client:              &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
 
 func (p *Provisioner) ProviderType() string { return tenant.ProviderTiDBCloudNative }
 
+func (p *Provisioner) ProvisioningCloudProvider() string { return p.cloudProvider }
+
+func (p *Provisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, bool) {
+	if p.defaultPublicKey == "" || p.defaultPrivateKey == "" {
+		return tenant.CredentialProvisionRequest{}, false
+	}
+	return tenant.CredentialProvisionRequest{
+		PublicKey:  p.defaultPublicKey,
+		PrivateKey: p.defaultPrivateKey,
+	}, true
+}
+
+func (p *Provisioner) ProvisioningRegion() string { return p.region }
+
 func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
-	return schema.EnsureTiDBSchemaForModeDSN(ctx, dsn, schema.TiDBEmbeddingModeAuto)
+	return schema.InitTiDBTenantSchemaForModeWithOptionsContext(ctx, dsn, schema.TiDBEmbeddingModeAuto, schema.InitTiDBTenantSchemaOptions{})
 }
 
 func (p *Provisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, dsn string, profile schema.TiDBAutoEmbeddingProfile) error {
-	return schema.EnsureTiDBSchemaForAutoEmbeddingProfileDSN(ctx, dsn, profile)
+	return schema.InitTiDBTenantSchemaForAutoEmbeddingProfileContext(ctx, dsn, profile)
+}
+
+func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, _ string) (string, string, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		return "", "", fmt.Errorf("parse native tenant DSN: %w", err)
+	}
+	username, needsSetup, err := systemUsernameForCurrent(cfg.User)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve native system username: %w", err)
+	}
+	if cfg.Passwd == "" {
+		return "", "", fmt.Errorf("native tenant DSN password is empty")
+	}
+	if !needsSetup {
+		return cfg.User, cfg.Passwd, nil
+	}
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return "", "", fmt.Errorf("open native tenant database: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	dbName, err := normalizeDatabaseName(cfg.DBName)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve native system user database: %w", err)
+	}
+	password := cfg.Passwd
+	if err := ensureSystemUser(ctx, db, dbName, username, password); err != nil {
+		return "", "", fmt.Errorf("ensure native system user: %w", err)
+	}
+	return username, password, nil
 }
 
 func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {
@@ -104,7 +155,7 @@ func (p *Provisioner) ValidateCredentialProvisionRequest(req tenant.CredentialPr
 	if publicKey == "" || privateKey == "" {
 		return fmt.Errorf("public_key and private_key are required")
 	}
-	_, err := p.resolveDatabaseName(req.DatabaseName)
+	_, err := p.resolveDatabaseName("")
 	return err
 }
 
@@ -114,7 +165,7 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	if publicKey == "" || privateKey == "" {
 		return nil, fmt.Errorf("public_key and private_key are required")
 	}
-	dbName, err := p.resolveDatabaseName(req.DatabaseName)
+	dbName, err := p.resolveDatabaseName("")
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +195,7 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("tidbcloud native provision status %d: %s", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return nil, fmt.Errorf("%s", statusError("provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 	info, err := parseClusterInfo(raw)
 	if err != nil {
@@ -207,7 +258,7 @@ func (p *Provisioner) DeprovisionWithCredentials(ctx context.Context, cluster *t
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-		return fmt.Errorf("tidbcloud native cluster delete status %d: %s", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return fmt.Errorf("%s", statusError("cluster delete", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 	return nil
 }
@@ -221,7 +272,7 @@ func (p *Provisioner) regionName() string {
 
 func clusterDisplayName(tenantID string) string {
 	const maxDisplayNameLen = 64
-	name := displayNameCharPattern.ReplaceAllString("drive9-"+tenantID, "-")
+	name := displayNameCharPattern.ReplaceAllString("tidbcloud-fs-"+tenantID, "-")
 	if len(name) <= maxDisplayNameLen {
 		return name
 	}
@@ -235,6 +286,56 @@ func (p *Provisioner) resolveDatabaseName(raw string) (string, error) {
 		name = p.defaultDatabaseName
 	}
 	return normalizeDatabaseName(name)
+}
+
+func ensureSystemUser(ctx context.Context, db *sql.DB, dbName, username, password string) error {
+	for i, stmt := range systemUserStatements(dbName, username, password) {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("execute native system user statement %d: %w", i+1, err)
+		}
+	}
+	return nil
+}
+
+func systemUserStatements(dbName, username, password string) []string {
+	const roleName = "tdc_fs_admin"
+	return []string{
+		fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s", quoteIdent(dbName)),
+		fmt.Sprintf("CREATE ROLE IF NOT EXISTS %s", quoteString(roleName)),
+		fmt.Sprintf("GRANT CREATE, ALTER, DROP, INDEX, SELECT, INSERT, UPDATE, DELETE ON %s.* TO %s", quoteIdent(dbName), quoteString(roleName)),
+		fmt.Sprintf("CREATE USER IF NOT EXISTS %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
+		fmt.Sprintf("ALTER USER %s IDENTIFIED BY %s", quoteString(username), quoteString(password)),
+		fmt.Sprintf("GRANT %s TO %s", quoteString(roleName), quoteString(username)),
+		fmt.Sprintf("SET DEFAULT ROLE %s TO %s", quoteString(roleName), quoteString(username)),
+	}
+}
+
+func systemUsernameForCurrent(currentUsername string) (string, bool, error) {
+	currentUsername = strings.TrimSpace(currentUsername)
+	if currentUsername == "" {
+		return "", false, fmt.Errorf("native database username is empty")
+	}
+	prefix, ok := strings.CutSuffix(currentUsername, ".root")
+	if ok {
+		if prefix == "" {
+			return "", false, fmt.Errorf("native root username %q missing user prefix", currentUsername)
+		}
+		return prefix + ".tdc_fs_sys", true, nil
+	}
+	if prefix, ok := strings.CutSuffix(currentUsername, ".tdc_fs_sys"); ok && prefix != "" {
+		return currentUsername, false, nil
+	}
+	return "", false, fmt.Errorf("native database username %q is not a root or tdc_fs_sys account", currentUsername)
+}
+
+func quoteIdent(value string) string {
+	return "`" + strings.ReplaceAll(value, "`", "``") + "`"
+}
+
+func quoteString(value string) string {
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, "'", "''")
+	return "'" + value + "'"
 }
 
 func parseDefaultSpendLimit(raw string) (*int32, error) {
@@ -274,6 +375,23 @@ func sanitizeUpstreamBody(raw []byte) string {
 		s = s[:upstreamErrorBodyLimit] + "...(truncated)"
 	}
 	return s
+}
+
+func statusError(operation string, code int, upstreamBody string) string {
+	msg := fmt.Sprintf("tidbcloud native %s status %d", operation, code)
+	if upstreamBody != "" {
+		msg += ": " + upstreamBody
+	} else {
+		switch code {
+		case http.StatusUnauthorized:
+			msg += ": invalid TiDB Cloud API key"
+		case http.StatusForbidden:
+			msg += ": access denied"
+		default:
+			msg += ": upstream error"
+		}
+	}
+	return msg
 }
 
 func ensureDatabase(ctx context.Context, user, password, host string, port int, dbName string) error {
@@ -334,7 +452,7 @@ func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, priva
 		raw, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("tidbcloud native cluster get status %d: %s", resp.StatusCode, sanitizeUpstreamBody(raw))
+			return nil, fmt.Errorf("%s", statusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw)))
 		}
 		info, err := parseClusterInfo(raw)
 		if err != nil {

@@ -13,9 +13,10 @@ import (
 type Type string
 
 const (
-	TypeLocalAES   Type = "local_aes"
-	TypeKMS        Type = "kms"
-	TypeAliyunKMS  Type = "aliyun_kms"
+	TypeLocalAES    Type = "local_aes"
+	TypeKMS         Type = "kms"
+	TypeAliyunKMS   Type = "aliyun_kms"
+	TypeTencentKMS  Type = "tencent_kms"
 )
 
 type Config struct {
@@ -57,6 +58,14 @@ func New(ctx context.Context, cfg Config) (Encryptor, error) {
 			return nil, fmt.Errorf("aliyun_kms requires region")
 		}
 		return NewAliyunKMSEncryptor(cfg.Region, cfg.Key, cfg.AliyunKMSEndpoint)
+	case string(TypeTencentKMS):
+		if cfg.Key == "" {
+			return nil, fmt.Errorf("tencent_kms requires key id")
+		}
+		if cfg.Region == "" {
+			return nil, fmt.Errorf("tencent_kms requires region")
+		}
+		return NewTencentKMSEncryptor(cfg.Region, cfg.Key)
 	default:
 		return nil, fmt.Errorf("unsupported encrypt type: %s", cfg.Type)
 	}

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# POSIX-only entrypoint for the Drive9 feature matrix E2E.
+# Backward-compatible POSIX-only entrypoint. Prefer pjdfstest-suite.sh when
+# explicitly running the pjdfstest POSIX compatibility suite.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-FEATURE_MATRIX_SUITE=posix exec "$SCRIPT_DIR/_feature-matrix-runner.sh" "$@"
+exec "$SCRIPT_DIR/pjdfstest-suite.sh" "$@"

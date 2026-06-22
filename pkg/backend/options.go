@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/embedding"
-	"github.com/mem9-ai/dat9/pkg/logger"
-	"github.com/mem9-ai/dat9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/embedding"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/meta"
 	"go.uber.org/zap"
 )
 
@@ -70,6 +70,13 @@ type Options struct {
 	// database itself rather than by the app-managed embed worker. When enabled,
 	// runtime write/query paths rely on database-side embedding behavior.
 	DatabaseAutoEmbedding bool
+	// AppSemanticTasksEnabled controls whether the app-managed embed worker
+	// path may enqueue semantic_tasks for text and description embedding.
+	// When false, shouldEnqueueEmbedForRevision short-circuits to false,
+	// preventing orphaned task rows when no DRIVE9_EMBED_* worker is
+	// configured. This does not affect the DatabaseAutoEmbedding (TiDB
+	// auto) path or image/audio extract tasks.
+	AppSemanticTasksEnabled bool
 	// MaxMediaLLMFiles caps the number of confirmed image+audio files per tenant
 	// that trigger LLM extraction tasks (img_extract_text, audio_extract_text).
 	// Files beyond this limit are still stored but their LLM tasks are not enqueued.
@@ -176,6 +183,7 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		b.storageNamespaceID = opts.StorageNamespaceID
 	}
 	b.databaseAutoEmbedding = opts.DatabaseAutoEmbedding
+	b.appSemanticTasksEnabled = opts.AppSemanticTasksEnabled
 	b.s3EncryptionPolicy = opts.S3EncryptionPolicy
 	if b.s3EncryptionPolicy.Mode == "" {
 		resolved, err := meta.ResolveS3EncryptionPolicy(meta.DefaultS3EncryptionPolicy(), meta.S3EncryptionPolicy{Mode: meta.S3EncryptionModeInherit})
@@ -320,5 +328,10 @@ func (b *Dat9Backend) Close() {
 	if b.audioExtractEnabled {
 		globalBackendRuntimeMetrics.deactivateAudio(b.runtimeMetricsID)
 		b.audioExtractEnabled = false
+	}
+	b.stopMutationWorker()
+	if b.qCache != nil {
+		b.qCache.stop()
+		b.qCache = nil
 	}
 }

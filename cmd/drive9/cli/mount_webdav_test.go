@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/dat9/pkg/client"
-	"github.com/mem9-ai/dat9/pkg/mountstate"
+	"github.com/mem9-ai/drive9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/mountstate"
 )
 
 func TestParseMountMode(t *testing.T) {
@@ -747,6 +747,22 @@ func TestFsMountCmdRejectsDurabilityForWebDAV(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "--durability is only supported with --mode=fuse") {
 		t.Fatalf("error = %v, want durability WebDAV rejection", err)
+	}
+}
+
+func TestFsMountCmdRejectsPerfDirForWebDAV(t *testing.T) {
+	err := fsMountCmd([]string{
+		"--mode=webdav",
+		"--server=https://drive9.example",
+		"--api-key=sk-test",
+		"--perf-dir=/tmp/drive9-perf",
+		t.TempDir(),
+	})
+	if err == nil {
+		t.Fatal("expected WebDAV perf-dir rejection")
+	}
+	if !strings.Contains(err.Error(), "--perf-dir is only supported with --mode=fuse") {
+		t.Fatalf("error = %v, want perf-dir WebDAV rejection", err)
 	}
 }
 

@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/mem9-ai/dat9/pkg/client"
+	"github.com/mem9-ai/drive9/pkg/client"
 )
 
 // Mv renames or moves a remote file/directory. Metadata-only, zero S3 cost.

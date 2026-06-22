@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mem9-ai/dat9/internal/testmysql"
+	"github.com/mem9-ai/drive9/internal/testmysql"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -353,9 +353,9 @@ func TestListDirSkipsHistoricalRootDentry(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
 	if _, err := s.DB().Exec(`
-		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, created_at)
-		VALUES (?, ?, ?, ?, 1, ?)`,
-		"root-self", "/", "/", "root-alias", now); err != nil {
+		INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+		"root-self", "/", fileNodePathHash("/"), "/", fileNodePathHash("/"), "root-alias", now); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.InsertNode(context.Background(), &FileNode{
@@ -414,9 +414,9 @@ func TestListNodesSkipsHistoricalRootDentry(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
 	if _, err := s.DB().Exec(`
-		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, created_at)
-		VALUES (?, ?, ?, ?, 1, ?)`,
-		"root-self", "/", "/", "root-alias", now); err != nil {
+		INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?)`,
+		"root-self", "/", fileNodePathHash("/"), "/", fileNodePathHash("/"), "root-alias", now); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.InsertNode(context.Background(), &FileNode{
@@ -1297,6 +1297,65 @@ func TestRenameDir(t *testing.T) {
 	}
 }
 
+func TestRenameDirReplacesEmptyTargetAtomically(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "src", Path: "/src/", ParentPath: "/", Name: "src", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "child", Path: "/src/a.txt", ParentPath: "/src/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "dst", Path: "/dst/", ParentPath: "/", Name: "dst", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	count, err := s.RenameDir(context.Background(), "/src/", "/dst/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("count = %d, want 2", count)
+	}
+	if _, err := s.GetNode(context.Background(), "/src/"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("/src/ error = %v, want ErrNotFound", err)
+	}
+	got, err := s.GetNode(context.Background(), "/dst/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.NodeID != "src" {
+		t.Fatalf("/dst/ node id = %q, want src", got.NodeID)
+	}
+	if _, err := s.GetNode(context.Background(), "/dst/a.txt"); err != nil {
+		t.Fatalf("/dst/a.txt missing: %v", err)
+	}
+}
+
+func TestRenameDirRejectsNonEmptyTargetWithoutDeleting(t *testing.T) {
+	s := newTestStore(t)
+	now := time.Now()
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "src", Path: "/src/", ParentPath: "/", Name: "src", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "dst", Path: "/dst/", ParentPath: "/", Name: "dst", IsDirectory: true, CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(context.Background(), &FileNode{NodeID: "dstchild", Path: "/dst/b.txt", ParentPath: "/dst/", Name: "b.txt", FileID: "f2", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.RenameDir(context.Background(), "/src/", "/dst/")
+	if !errors.Is(err, ErrPathConflict) {
+		t.Fatalf("RenameDir error = %v, want ErrPathConflict", err)
+	}
+	for _, p := range []string{"/src/", "/dst/", "/dst/b.txt"} {
+		if _, err := s.GetNode(context.Background(), p); err != nil {
+			t.Fatalf("%s should remain after failed rename: %v", p, err)
+		}
+	}
+}
+
 func TestUpdateFileContent(t *testing.T) {
 	s := newTestStore(t)
 	now := time.Now()
@@ -1410,9 +1469,9 @@ func TestChmodRejectsHistoricalRootDentry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := s.DB().ExecContext(ctx, `
-		INSERT INTO file_nodes (node_id, path, parent_path, name, is_directory, inode_id, created_at)
-		VALUES (?, ?, ?, ?, 1, ?, ?)`,
-		"root-node", "/", "/", "root-alias", inodeID, now); err != nil {
+		INSERT INTO file_nodes (node_id, path, path_hash, parent_path, parent_path_hash, name, is_directory, inode_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		"root-node", "/", fileNodePathHash("/"), "/", fileNodePathHash("/"), "root-alias", inodeID, now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1461,6 +1520,41 @@ func TestChmodPreservesFileTypeBits(t *testing.T) {
 	}
 	if got.Mode != 0o120600 {
 		t.Errorf("mode=%o, want 0o120600", got.Mode)
+	}
+}
+
+func TestChmodPreservesSpecialPermissionBits(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if err := s.InsertFile(ctx, &File{
+		FileID:      "f1",
+		StorageType: StorageDB9,
+		StorageRef:  "/blobs/f1",
+		SizeBytes:   6,
+		Revision:    1,
+		Mode:        0o100644,
+		Status:      StatusConfirmed,
+		CreatedAt:   now,
+		ConfirmedAt: &now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/special", ParentPath: "/", Name: "special", FileID: "f1", CreatedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.Chmod(ctx, "/special", 0o6755); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := s.GetFile(ctx, "f1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Mode != 0o106755 {
+		t.Errorf("mode=%o, want 0o106755", got.Mode)
 	}
 }
 

@@ -11,7 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/pingcap/failpoint"
 
-	"github.com/mem9-ai/dat9/pkg/semantic"
+	"github.com/mem9-ai/drive9/pkg/semantic"
 )
 
 const defaultSemanticMaxAttempts = 5
