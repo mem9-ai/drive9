@@ -897,7 +897,7 @@ func TestHandleForkCreateNativeNoEndpointNoDefaultCredentialReturnsFailedWithAPI
 	rr := httptest.NewRecorder()
 	rt.server.handleForkCreate(rr, req)
 
-	if rr.Code != http.StatusOK {
+	if rr.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()

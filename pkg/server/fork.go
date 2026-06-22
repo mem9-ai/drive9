@@ -124,7 +124,7 @@ func (s *Server) handleForkCreate(w http.ResponseWriter, r *http.Request) {
 		var provisionErr *forkProvisionFailedError
 		if errors.As(err, &provisionErr) {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
+			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"tenant_id":        provisionErr.TenantID,
 				"name":             provisionErr.Name,
