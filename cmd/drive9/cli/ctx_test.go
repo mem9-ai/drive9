@@ -244,6 +244,48 @@ func TestCtxForkGeneratesNameWhenOmitted(t *testing.T) {
 	}
 }
 
+func TestCtxForkAcceptsFailedResponseAndSavesAPIKey(t *testing.T) {
+	withIsolatedHome(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"tenant_id":        "fork-failed",
+			"api_key":          "failed-key",
+			"status":           "failed",
+			"name":             "test-fork",
+			"parent_tenant_id": "source-tenant",
+			"storage":          "shared",
+		})
+	}))
+	defer ts.Close()
+
+	cfg := loadConfig()
+	if _, err := ctxAdd(cfg, "prod", &Context{Type: PrincipalOwner, APIKey: "source-key", Server: ts.URL}); err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+
+	out, err := captureStdoutE(t, func() error { return Ctx([]string{"fork", "test-fork"}) })
+	if err != nil {
+		t.Fatalf("ctx fork: %v", err)
+	}
+	if !strings.Contains(out, "Status: failed") {
+		t.Errorf("missing status failed in output: %q", out)
+	}
+	if !strings.Contains(out, "Fork provisioning failed") {
+		t.Errorf("missing failed warning in output: %q", out)
+	}
+	if !strings.Contains(out, "drive9 ctx delete test-fork") {
+		t.Errorf("missing cleanup hint in output: %q", out)
+	}
+	got := loadConfig()
+	if got.Contexts["test-fork"] == nil || got.Contexts["test-fork"].APIKey != "failed-key" || got.Contexts["test-fork"].Server != ts.URL {
+		t.Errorf("failed fork context not persisted: %#v", got.Contexts["test-fork"])
+	}
+}
+
 func TestCtxForkRejectsDelegatedSource(t *testing.T) {
 	withIsolatedHome(t)
 	cfg := loadConfig()
