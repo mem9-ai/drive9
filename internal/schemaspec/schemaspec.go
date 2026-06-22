@@ -319,7 +319,7 @@ func IsIgnorableMySQLError(err error) bool {
 	var me *mysql.MySQLError
 	if errors.As(err, &me) {
 		switch me.Number {
-		case 1050, 1060, 1061, 1072:
+		case 1050, 1060, 1061:
 			return true
 		}
 		return isIgnorableDDLMessage(me.Message)
