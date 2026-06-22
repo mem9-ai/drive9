@@ -1007,7 +1007,9 @@ func TestNamespaceCache_CompleteMissExpiresWithTTL(t *testing.T) {
 	// completeExpires uses the main ttl (not negativeTTL), so a complete
 	// listing stays valid for the full cache TTL. After ttl expires both
 	// the positive list and the complete miss state expire together.
-	dc := NewNamespaceCache(5*time.Millisecond, time.Millisecond, 10)
+	// Use wide timing gaps (100ms ttl, 10ms negativeTTL) to avoid flakiness
+	// on loaded CI hosts.
+	dc := NewNamespaceCache(100*time.Millisecond, 10*time.Millisecond, 10)
 	dc.Put("/repo", []CachedFileInfo{{Name: "known.txt"}})
 
 	// Immediately after Put, complete miss is valid.
@@ -1015,14 +1017,14 @@ func TestNamespaceCache_CompleteMissExpiresWithTTL(t *testing.T) {
 		t.Fatalf("lookup kind immediately = %v, want complete miss", got.kind)
 	}
 
-	// After negativeTTL (1ms) but before ttl (5ms), complete miss still valid.
-	time.Sleep(2 * time.Millisecond)
+	// After negativeTTL (10ms) but before ttl (100ms), complete miss still valid.
+	time.Sleep(20 * time.Millisecond)
 	if got := dc.Lookup("/repo", "missing.txt"); got.kind != namespaceLookupCompleteMiss {
 		t.Fatalf("lookup kind after negative TTL = %v, want complete miss (should survive until ttl)", got.kind)
 	}
 
 	// After ttl expires, both positive and complete state expire.
-	time.Sleep(5 * time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	if got := dc.Lookup("/repo", "missing.txt"); got.kind != namespaceLookupNone {
 		t.Fatalf("lookup kind after ttl = %v, want none", got.kind)
 	}
