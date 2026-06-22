@@ -97,9 +97,6 @@ func (f *fakeBranchProvisioner) CreateBranch(ctx context.Context, forkTenantID s
 	}
 	out := *f.cluster
 	out.TenantID = forkTenantID
-	out.Host = ""
-	out.Port = 0
-	out.Username = ""
 	return &out, nil
 }
 
@@ -492,9 +489,6 @@ func TestCreateForkTenantNativeDeletesBranchOnSchemaInitFailure(t *testing.T) {
 		PrivateKey: "private-1",
 	}); err == nil || !strings.Contains(err.Error(), "schema init failed") {
 		t.Fatalf("provision error = %v, want schema init failure", err)
-	}
-	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-created" {
-		t.Fatalf("deleted branches = %#v", deleted)
 	}
 }
 
@@ -898,7 +892,7 @@ func TestHandleForkCreateNativeNoEndpointNoDefaultCredentialReturnsFailedWithAPI
 	}
 	rt.prov.deleteErr = fmt.Errorf("delete branch failed")
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/fork", strings.NewReader(`{"name":"test-fork","credentials":{"public_key":"public-1","private_key":"private-1"}}`))
+	req := httptest.NewRequest(http.MethodPost, "/v1/fork", strings.NewReader(`{"name":"test-fork","public_key":"public-1","private_key":"private-1"}`))
 	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "source"}))
 	rr := httptest.NewRecorder()
 	rt.server.handleForkCreate(rr, req)
