@@ -34,6 +34,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 	"github.com/mem9-ai/drive9/pkg/traceid"
 	"github.com/mem9-ai/drive9/pkg/vault"
+	mysql "github.com/go-sql-driver/mysql"
 	"go.uber.org/zap"
 )
 
@@ -81,6 +82,10 @@ type autoEmbeddingSchemaProvisioner interface {
 
 type credentialProvisionRequestValidator interface {
 	ValidateCredentialProvisionRequest(tenant.CredentialProvisionRequest) error
+}
+
+type nativeSystemUserProvisioner interface {
+	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, err error)
 }
 
 type Server struct {
@@ -3505,9 +3510,16 @@ func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, bu
 		}
 	}
 	out := build()
-	if out.PublicKey == "" || out.PrivateKey == "" {
-		return nil, fmt.Errorf("public_key and private_key are required")
+	pk := strings.TrimSpace(out.PublicKey)
+	sk := strings.TrimSpace(out.PrivateKey)
+	if pk == "" && sk == "" {
+		return nil, tenant.ErrCredentialsRequired
 	}
+	if pk == "" || sk == "" {
+		return nil, tenant.ErrPartialCredentials
+	}
+	out.PublicKey = pk
+	out.PrivateKey = sk
 	return &out, nil
 }
 
@@ -3906,6 +3918,10 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		default:
 		}
 		if err := schemaInit(ctx, tenantDSN); err == nil {
+			if ferr := s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider); ferr != nil {
+				logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_finalize_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", ferr)...)
+				continue
+			}
 			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_ok", "tenant_id", tenantID, "provider", provider, "attempt", attempt)...)
 			if s.metrics != nil {
 				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "ok")
@@ -3971,6 +3987,49 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		backoff *= 2
 		attempt++
 	}
+}
+
+func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) error {
+	if provider != tenant.ProviderTiDBCloudNative {
+		return nil
+	}
+	if s.provisioner == nil {
+		return fmt.Errorf("server misconfigured: native tenant provider is missing")
+	}
+	systemUserProvisioner, ok := s.provisioner.(nativeSystemUserProvisioner)
+	if !ok {
+		return fmt.Errorf("native provisioner does not support system user setup")
+	}
+	cfg, err := mysql.ParseDSN(tenantDSN)
+	if err != nil {
+		return fmt.Errorf("parse native tenant DSN for credential finalization: %w", err)
+	}
+	fromDBUser := strings.TrimSpace(cfg.User)
+	if fromDBUser == "" {
+		return fmt.Errorf("native tenant DSN has empty username")
+	}
+	username, password, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
+	if err != nil {
+		return fmt.Errorf("ensure native system user: %w", err)
+	}
+	if username == "" || password == "" {
+		return fmt.Errorf("native system user setup returned empty credential")
+	}
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(password))
+	if err != nil {
+		return fmt.Errorf("encrypt native system user password: %w", err)
+	}
+	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, fromDBUser, username, cipherPass)
+	if err != nil {
+		return fmt.Errorf("persist native system user credential: %w", err)
+	}
+	if !updated {
+		logger.Info(ctx, "native_system_user_credential_update_skipped",
+			zap.String("tenant_id", tenantID),
+			zap.String("from_db_user", fromDBUser),
+			zap.String("db_user", username))
+	}
+	return nil
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {
