@@ -623,6 +623,109 @@ func TestWriteBackUploader_ChmodFailureRetryDoesNotReuploadData(t *testing.T) {
 	}
 }
 
+// TestWriteBackUploader_PendingChmodWithMissingDat verifies that a PendingChmod
+// entry whose .dat file has been removed (data already uploaded) is still
+// processed correctly: chmod is called and the entry is cleaned up.
+// Regression test for: GetMetaAndView would prune the entry when .dat is missing,
+// silently dropping the pending chmod.
+func TestWriteBackUploader_PendingChmodWithMissingDat(t *testing.T) {
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			chmodCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := newTestClient(ts.URL)
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	// Step 1: Put a file with mode, then mark as PendingChmod (simulating
+	// data upload succeeded but chmod failed).
+	_ = cache.PutWithBaseRevAndMode("/chmod-no-dat.txt", []byte("data"), 4, PendingNew, 0, 0o755, true)
+	gen := cache.metas["/chmod-no-dat.txt"].Generation
+	updated, err := cache.MarkChmodPending("/chmod-no-dat.txt", gen)
+	if err != nil || !updated {
+		t.Fatalf("MarkChmodPending: updated=%v err=%v", updated, err)
+	}
+
+	// Step 2: Remove the .dat file to simulate the scenario where data was
+	// already uploaded and the .dat is gone.
+	datPath := cache.datFile("/chmod-no-dat.txt")
+	os.Remove(datPath)
+
+	// Also evict in-memory data cache so getViewLocked must hit disk.
+	cache.mu.Lock()
+	delete(cache.data, "/chmod-no-dat.txt")
+	cache.mu.Unlock()
+
+	// Step 3: Submit for upload — should call chmod and clean up.
+	uploader.Submit("/chmod-no-dat.txt")
+	uploader.DrainAll()
+
+	if got := chmodCalls.Load(); got != 1 {
+		t.Fatalf("chmod calls = %d, want 1", got)
+	}
+	if _, ok := cache.GetMeta("/chmod-no-dat.txt"); ok {
+		t.Fatal("cache metadata should be removed after PendingChmod succeeds")
+	}
+}
+
+// TestWriteBackUploader_UploadSyncPendingChmodWithMissingDat is the same
+// regression test but for the UploadSync (fsync/rename) path.
+func TestWriteBackUploader_UploadSyncPendingChmodWithMissingDat(t *testing.T) {
+	var chmodCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut:
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
+			chmodCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	dir := t.TempDir()
+	cache, _ := NewWriteBackCache(dir)
+	c := newTestClient(ts.URL)
+	uploader := NewWriteBackUploader(c, cache, 1)
+
+	_ = cache.PutWithBaseRevAndMode("/sync-chmod-no-dat.txt", []byte("data"), 4, PendingNew, 0, 0o755, true)
+	gen := cache.metas["/sync-chmod-no-dat.txt"].Generation
+	updated, err := cache.MarkChmodPending("/sync-chmod-no-dat.txt", gen)
+	if err != nil || !updated {
+		t.Fatalf("MarkChmodPending: updated=%v err=%v", updated, err)
+	}
+
+	datPath := cache.datFile("/sync-chmod-no-dat.txt")
+	os.Remove(datPath)
+	cache.mu.Lock()
+	delete(cache.data, "/sync-chmod-no-dat.txt")
+	cache.mu.Unlock()
+
+	err = uploader.UploadSync(context.Background(), "/sync-chmod-no-dat.txt")
+	if err != nil {
+		t.Fatalf("UploadSync returned error: %v", err)
+	}
+	if got := chmodCalls.Load(); got != 1 {
+		t.Fatalf("chmod calls = %d, want 1", got)
+	}
+	if _, ok := cache.GetMeta("/sync-chmod-no-dat.txt"); ok {
+		t.Fatal("cache metadata should be removed after PendingChmod succeeds")
+	}
+}
+
 func TestWriteBackUploaderSkipsDefaultModeForPendingNew(t *testing.T) {
 	var putCalls atomic.Int32
 	var chmodCalls atomic.Int32

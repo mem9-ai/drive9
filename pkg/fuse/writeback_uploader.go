@@ -337,6 +337,18 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	release := u.acquirePath(localPath)
 	defer release()
 
+	// PendingChmod entries have no .dat file (data already uploaded, only
+	// chmod remains). Read meta first so we can handle chmod without loading
+	// data — GetMetaAndView would prune the entry when the .dat is missing.
+	chmodMeta, chmodOK := u.cache.GetMeta(localPath)
+	if !chmodOK {
+		return // Already uploaded or removed.
+	}
+	if chmodMeta.Kind == PendingChmod {
+		_ = u.applyPendingChmod(context.Background(), localPath, chmodMeta, chmodMeta.Generation, false)
+		return
+	}
+
 	// Atomically read meta + data under one path lock so they are guaranteed
 	// to be from the same generation. Without this, a concurrent Put could
 	// replace the data between GetMeta and getView, causing the uploader to
@@ -346,11 +358,6 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		return // Already uploaded or removed.
 	}
 	gen := meta.Generation
-
-	if meta.Kind == PendingChmod {
-		_ = u.applyPendingChmod(context.Background(), localPath, meta, gen, false)
-		return
-	}
 
 	expectedRevision, err := expectedRevisionForWriteBack(meta)
 	if err != nil {
@@ -448,17 +455,24 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	// Wait for any in-flight background upload to complete first.
 	u.WaitPath(localPath)
 
+	// PendingChmod entries have no .dat file (data already uploaded, only
+	// chmod remains). Read meta first so we can handle chmod without loading
+	// data — GetMetaAndView would prune the entry when the .dat is missing.
+	chmodMeta, chmodOK := u.cache.GetMeta(localPath)
+	if !chmodOK {
+		return 0, nil // not in cache (may have been uploaded by the background worker we just waited for)
+	}
+	if chmodMeta.Kind == PendingChmod {
+		return 0, u.applyPendingChmod(ctx, localPath, chmodMeta, chmodMeta.Generation, true)
+	}
+
 	// Atomically read meta + data under one path lock so they are guaranteed
 	// to be from the same generation.
 	meta, data, ok := u.cache.GetMetaAndView(localPath)
 	if !ok {
-		return 0, nil // not in cache (may have been uploaded by the background worker we just waited for)
+		return 0, nil // not in cache (removed between GetMeta and GetMetaAndView)
 	}
 	gen := meta.Generation
-
-	if meta.Kind == PendingChmod {
-		return 0, u.applyPendingChmod(ctx, localPath, meta, gen, true)
-	}
 
 	expectedRevision, err := expectedRevisionForWriteBack(meta)
 	if err != nil {
