@@ -337,8 +337,11 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	release := u.acquirePath(localPath)
 	defer release()
 
-	// Read data and remember the generation so we can detect concurrent overwrites.
-	meta, ok := u.cache.GetMeta(localPath)
+	// Atomically read meta + data under one path lock so they are guaranteed
+	// to be from the same generation. Without this, a concurrent Put could
+	// replace the data between GetMeta and getView, causing the uploader to
+	// upload new data with old baseRev/generation.
+	meta, data, ok := u.cache.GetMetaAndView(localPath)
 	if !ok {
 		return // Already uploaded or removed.
 	}
@@ -346,11 +349,6 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 
 	if meta.Kind == PendingChmod {
 		_ = u.applyPendingChmod(context.Background(), localPath, meta, gen, false)
-		return
-	}
-
-	data, ok := u.cache.getView(localPath)
-	if !ok {
 		return
 	}
 
@@ -450,7 +448,9 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	// Wait for any in-flight background upload to complete first.
 	u.WaitPath(localPath)
 
-	meta, ok := u.cache.GetMeta(localPath)
+	// Atomically read meta + data under one path lock so they are guaranteed
+	// to be from the same generation.
+	meta, data, ok := u.cache.GetMetaAndView(localPath)
 	if !ok {
 		return 0, nil // not in cache (may have been uploaded by the background worker we just waited for)
 	}
@@ -458,11 +458,6 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 
 	if meta.Kind == PendingChmod {
 		return 0, u.applyPendingChmod(ctx, localPath, meta, gen, true)
-	}
-
-	data, ok := u.cache.getView(localPath)
-	if !ok {
-		return 0, nil
 	}
 
 	expectedRevision, err := expectedRevisionForWriteBack(meta)

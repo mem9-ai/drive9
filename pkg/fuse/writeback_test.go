@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -3820,7 +3821,8 @@ func TestWriteBackCache_ConcurrentPutAndRemoveIfGeneration(t *testing.T) {
 					continue
 				}
 				capturedGen := meta.Generation
-				// Deliberate yield to allow concurrent Puts to bump gen.
+				// Yield to force interleaving with concurrent Puts.
+				runtime.Gosched()
 				if cache.RemoveIfGeneration("/rig.txt", capturedGen) {
 					// Record the removed generation.
 					for {

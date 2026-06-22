@@ -429,6 +429,36 @@ func (c *WriteBackCache) GetMeta(remotePath string) (*WriteBackMeta, bool) {
 	return &cp, true
 }
 
+// GetMetaAndView atomically reads both metadata and data for remotePath under
+// the same per-path lock, guaranteeing that meta and data are from the same
+// generation. This prevents an interleaving where a concurrent Put replaces
+// the .dat file between a separate GetMeta and getView call, causing the
+// uploader to upload new data with old meta (wrong baseRev/generation).
+func (c *WriteBackCache) GetMetaAndView(remotePath string) (*WriteBackMeta, []byte, bool) {
+	pl := c.acquirePathLock(remotePath)
+	c.mu.Lock()
+
+	meta, ok := c.metas[remotePath]
+	if !ok {
+		c.mu.Unlock()
+		c.releasePathLock(remotePath, pl)
+		return nil, nil, false
+	}
+	cp := *meta
+
+	data, dataOK := c.getViewLocked(remotePath)
+	c.mu.Unlock()
+	c.releasePathLock(remotePath, pl)
+
+	if !dataOK {
+		return nil, nil, false
+	}
+	// Return a copy so callers can use it after locks are released.
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	return &cp, dataCopy, true
+}
+
 // Remove deletes the cached data and metadata for remotePath.
 func (c *WriteBackCache) Remove(remotePath string) {
 	pl := c.acquirePathLock(remotePath)
