@@ -854,3 +854,35 @@ func TestHandleForkDeleteNativeRejectsWhenNoCredentialsAvailable(t *testing.T) {
 		t.Fatalf("deleted branches = %#v", deleted)
 	}
 }
+
+func TestCreateForkTenantNativeNoEndpointNoDefaultCredentialFailsWithAPIKey(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err == nil {
+		t.Fatal("createForkTenant error = nil, want forkProvisionFailedError")
+	}
+	var provisionErr *forkProvisionFailedError
+	if !errors.As(err, &provisionErr) {
+		t.Fatalf("createForkTenant error type = %T, want forkProvisionFailedError", err)
+	}
+	if provisionErr.APIKey == "" {
+		t.Fatal("forkProvisionFailedError.APIKey is empty")
+	}
+	if provisionErr.TenantID == "" {
+		t.Fatal("forkProvisionFailedError.TenantID is empty")
+	}
+	if resp != nil {
+		t.Fatalf("createForkTenant response = %+v, want nil on error", resp)
+	}
+}
