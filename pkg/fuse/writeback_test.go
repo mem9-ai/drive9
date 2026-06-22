@@ -3779,6 +3779,110 @@ func TestWriteBackCache_RemoveIfGeneration(t *testing.T) {
 	}
 }
 
+// TestWriteBackCache_ConcurrentPutAndRemoveIfGeneration exercises the exact
+// race that broke TestSamePathConsecutiveSaves: concurrent Put bumps generation
+// while RemoveIfGeneration holds a stale captured gen.
+func TestWriteBackCache_ConcurrentPutAndRemoveIfGeneration(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const goroutines = 4
+	const iterations = 20
+
+	// Track the highest generation successfully removed.
+	var maxRemovedGen atomic.Uint64
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines * 2)
+
+	// Writer goroutines: continuously Put new versions.
+	for g := 0; g < goroutines; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				data := []byte(fmt.Sprintf("w%d-i%d", g, i))
+				_ = cache.Put("/rig.txt", data, int64(len(data)), PendingNew)
+			}
+		}()
+	}
+
+	// Remover goroutines: capture gen, then RemoveIfGeneration with stale gen.
+	for g := 0; g < goroutines; g++ {
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iterations; i++ {
+				meta, ok := cache.GetMeta("/rig.txt")
+				if !ok {
+					continue
+				}
+				capturedGen := meta.Generation
+				// Deliberate yield to allow concurrent Puts to bump gen.
+				if cache.RemoveIfGeneration("/rig.txt", capturedGen) {
+					// Record the removed generation.
+					for {
+						old := maxRemovedGen.Load()
+						if capturedGen <= old || maxRemovedGen.CompareAndSwap(old, capturedGen) {
+							break
+						}
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	// Invariant: if an entry still exists, its generation must be strictly
+	// greater than the highest successfully removed generation (a stale
+	// RemoveIfGeneration must not have deleted a newer entry).
+	meta, ok := cache.GetMeta("/rig.txt")
+	if ok {
+		removed := maxRemovedGen.Load()
+		if removed > 0 && meta.Generation <= removed {
+			t.Fatalf("entry gen %d <= max removed gen %d (stale remove deleted newer entry)", meta.Generation, removed)
+		}
+		// Data must be consistent with meta.
+		data, dataOK := cache.Get("/rig.txt")
+		if !dataOK {
+			t.Fatal("meta present but data absent")
+		}
+		if int64(len(data)) != meta.Size {
+			t.Fatalf("data len %d != meta size %d", len(data), meta.Size)
+		}
+	}
+}
+
+// TestWriteBackCache_RenamePendingSamePath verifies that renaming a path to
+// itself does not deadlock and is a no-op.
+func TestWriteBackCache_RenamePendingSamePath(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = cache.Put("/self.txt", []byte("data"), 4, PendingNew)
+	metaBefore, _ := cache.GetMeta("/self.txt")
+
+	// This must not deadlock and should return false (no-op).
+	result := cache.RenamePending("/self.txt", "/self.txt")
+	if result {
+		t.Fatal("RenamePending same path should return false")
+	}
+
+	// Entry should be unchanged.
+	metaAfter, ok := cache.GetMeta("/self.txt")
+	if !ok {
+		t.Fatal("entry should still exist after same-path rename")
+	}
+	if metaAfter.Generation != metaBefore.Generation {
+		t.Fatalf("generation changed from %d to %d after no-op rename", metaBefore.Generation, metaAfter.Generation)
+	}
+}
+
 // TestLookupFindsPendingWriteBack verifies that Lookup returns metadata
 // for files that only exist in the write-back cache (pending upload).
 func TestLookupFindsPendingWriteBack(t *testing.T) {

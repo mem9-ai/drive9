@@ -309,16 +309,21 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 }
 
 // Get reads the cached data for remotePath. Returns nil, false if not cached.
+// Acquires per-path lock to prevent reading a .dat file that is being
+// overwritten by a concurrent Put (which writes .dat outside c.mu).
 func (c *WriteBackCache) Get(remotePath string) ([]byte, bool) {
+	pl := c.acquirePathLock(remotePath)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	data, ok := c.getViewLocked(remotePath)
 	if !ok {
+		c.mu.Unlock()
+		c.releasePathLock(remotePath, pl)
 		return nil, false
 	}
 	copyData := make([]byte, len(data))
 	copy(copyData, data)
+	c.mu.Unlock()
+	c.releasePathLock(remotePath, pl)
 	return copyData, true
 }
 
@@ -358,11 +363,15 @@ func (c *WriteBackCache) getViewLocked(remotePath string) ([]byte, bool) {
 
 // getView returns a read-only payload view for remotePath.
 // Callers must not mutate the returned slice.
+// Acquires per-path lock to prevent reading a .dat file that is being
+// overwritten by a concurrent Put (which writes .dat outside c.mu).
 func (c *WriteBackCache) getView(remotePath string) ([]byte, bool) {
+	pl := c.acquirePathLock(remotePath)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	return c.getViewLocked(remotePath)
+	data, ok := c.getViewLocked(remotePath)
+	c.mu.Unlock()
+	c.releasePathLock(remotePath, pl)
+	return data, ok
 }
 
 func (c *WriteBackCache) cacheDataLocked(remotePath string, data []byte, size int64) {
@@ -449,56 +458,72 @@ func (c *WriteBackCache) RemoveIfGeneration(remotePath string, expectedGen uint6
 }
 
 // UpdateMode updates the pending mode metadata for an existing cache entry.
+// Acquires per-path lock to serialize .meta writes with concurrent Put.
 func (c *WriteBackCache) UpdateMode(remotePath string, mode uint32) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	pl := c.acquirePathLock(remotePath)
+	defer c.releasePathLock(remotePath, pl)
 
+	c.mu.Lock()
 	meta, ok := c.metas[remotePath]
 	if !ok {
+		c.mu.Unlock()
 		return nil
 	}
 	updated := *meta
 	updated.Mode = mode & posixPermissionModeMask
 	updated.HasMode = true
 	updated.Generation = c.nextGen.Add(1)
+	metaPath := c.metaFile(remotePath)
+	c.mu.Unlock()
 
 	metaBytes, err := json.Marshal(updated)
 	if err != nil {
 		return fmt.Errorf("writeback marshal mode meta: %w", err)
 	}
-	if err := atomicWrite(c.metaFile(remotePath), metaBytes); err != nil {
+	if err := atomicWrite(metaPath, metaBytes); err != nil {
 		return fmt.Errorf("writeback update mode meta: %w", err)
 	}
+
+	c.mu.Lock()
 	cp := updated
 	c.metas[remotePath] = &cp
+	c.mu.Unlock()
 	return nil
 }
 
 // MarkChmodPending records that data has reached the remote server and only
 // the chmod step remains. The generation guard prevents an old upload from
 // overwriting metadata for a newer local write.
+// Acquires per-path lock to serialize .meta writes with concurrent Put.
 func (c *WriteBackCache) MarkChmodPending(remotePath string, generation uint64) (bool, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	pl := c.acquirePathLock(remotePath)
+	defer c.releasePathLock(remotePath, pl)
 
+	c.mu.Lock()
 	meta, ok := c.metas[remotePath]
 	if !ok || meta.Generation != generation {
+		c.mu.Unlock()
 		return false, nil
 	}
 	updated := *meta
 	updated.Kind = PendingChmod
 	updated.BaseRev = 0
 	updated.Generation = c.nextGen.Add(1)
+	metaPath := c.metaFile(remotePath)
+	c.mu.Unlock()
 
 	metaBytes, err := json.Marshal(updated)
 	if err != nil {
 		return false, fmt.Errorf("writeback marshal chmod-pending meta: %w", err)
 	}
-	if err := atomicWrite(c.metaFile(remotePath), metaBytes); err != nil {
+	if err := atomicWrite(metaPath, metaBytes); err != nil {
 		return false, fmt.Errorf("writeback update chmod-pending meta: %w", err)
 	}
+
+	c.mu.Lock()
 	cp := updated
 	c.metas[remotePath] = &cp
+	c.mu.Unlock()
 	return true, nil
 }
 
@@ -507,6 +532,9 @@ func (c *WriteBackCache) MarkChmodPending(remotePath string, generation uint64) 
 // rewritten with the new path and a fresh generation.
 // Returns true if there was a pending entry to rename.
 func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
+	if oldPath == newPath {
+		return false // no-op rename
+	}
 	// Acquire path locks in sorted order to avoid deadlock.
 	first, second := oldPath, newPath
 	if second < first {
