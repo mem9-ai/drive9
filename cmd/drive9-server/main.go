@@ -129,7 +129,7 @@ func main() {
 		backendOptions.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
 
-	store, err := meta.Open(metaDSN)
+	store, err := retryMetaOpen(metaDSN)
 	if err != nil {
 		die(fmt.Errorf("open control-plane store: %w", err))
 	}
@@ -230,7 +230,7 @@ func main() {
 			die(fmt.Errorf("create encryptor: %w", err))
 		}
 
-		if err := store.DB().Ping(); err != nil {
+		if err := retryPingStore(store); err != nil {
 			die(fmt.Errorf("control-plane db unavailable: %w", err))
 		}
 
@@ -832,4 +832,46 @@ func envInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	return v
+}
+
+func retryMetaOpen(dsn string) (*meta.Store, error) {
+	var lastErr error
+	deadline := time.Now().Add(2 * time.Minute)
+	backoff := time.Second
+	for {
+		store, err := meta.Open(dsn)
+		if err == nil {
+			return store, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("control-plane store unavailable after retries: %w", lastErr)
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > 15*time.Second {
+			backoff = 15 * time.Second
+		}
+	}
+}
+
+func retryPingStore(store *meta.Store) error {
+	var lastErr error
+	deadline := time.Now().Add(2 * time.Minute)
+	backoff := time.Second
+	for {
+		err := store.DB().Ping()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			return fmt.Errorf("control-plane DB ping failed after retries: %w", lastErr)
+		}
+		time.Sleep(backoff)
+		backoff *= 2
+		if backoff > 15*time.Second {
+			backoff = 15 * time.Second
+		}
+	}
 }
