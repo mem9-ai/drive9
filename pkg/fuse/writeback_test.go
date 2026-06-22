@@ -3992,6 +3992,68 @@ func TestWriteBackCache_RenamePendingSamePath(t *testing.T) {
 	}
 }
 
+// TestWriteBackCache_GetMetaBlocksDuringInflightPut verifies that GetMeta
+// serializes with the per-path lock so it blocks while a same-path Put is
+// in progress (Phase 2 disk I/O). Without pathLock in GetMeta, metadata-only
+// readers would see stale/missing state during the Put.
+// Regression test for mornyx review comment.
+func TestWriteBackCache_GetMetaBlocksDuringInflightPut(t *testing.T) {
+	dir := t.TempDir()
+	cache, err := NewWriteBackCache(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const path = "/inflight.txt"
+
+	// Seed an initial entry so GetMeta has something to read.
+	_ = cache.Put(path, []byte("v1"), 2, PendingNew)
+	metaV1, ok := cache.GetMeta(path)
+	if !ok {
+		t.Fatal("initial entry should exist")
+	}
+
+	// Simulate an in-flight Put by holding the path lock externally.
+	pl := cache.acquirePathLock(path)
+
+	// GetMeta should block while the path lock is held.
+	done := make(chan struct{})
+	var metaResult *WriteBackMeta
+	var metaOK bool
+	go func() {
+		metaResult, metaOK = cache.GetMeta(path)
+		close(done)
+	}()
+
+	// Give the goroutine time to start and block.
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-done:
+		t.Fatal("GetMeta should block while pathLock is held, but it returned immediately")
+	default:
+		// Expected: GetMeta is blocked.
+	}
+
+	// Now do a Put under the path lock (simulating Phase 2 completion + Phase 3 publish).
+	// We need to release the path lock first, do a real Put, then verify.
+	// Actually, let's just release and verify GetMeta unblocks with the current state.
+	cache.releasePathLock(path, pl)
+
+	select {
+	case <-done:
+		// GetMeta unblocked.
+	case <-time.After(5 * time.Second):
+		t.Fatal("GetMeta did not unblock after pathLock release")
+	}
+
+	if !metaOK {
+		t.Fatal("GetMeta should return true after pathLock release")
+	}
+	if metaResult.Generation != metaV1.Generation {
+		t.Fatalf("GetMeta returned generation %d, want %d", metaResult.Generation, metaV1.Generation)
+	}
+}
+
 // TestLookupFindsPendingWriteBack verifies that Lookup returns metadata
 // for files that only exist in the write-back cache (pending upload).
 func TestLookupFindsPendingWriteBack(t *testing.T) {
