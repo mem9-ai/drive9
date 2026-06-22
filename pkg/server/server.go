@@ -3457,15 +3457,13 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 
 func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
 	var req struct {
-		PublicKey    string `json:"public_key"`
-		PrivateKey   string `json:"private_key"`
-		DatabaseName string `json:"database_name"`
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
 	}
 	return decodeCredentialRequest(w, r, &req, func() tenant.CredentialProvisionRequest {
 		return tenant.CredentialProvisionRequest{
-			PublicKey:    strings.TrimSpace(req.PublicKey),
-			PrivateKey:   strings.TrimSpace(req.PrivateKey),
-			DatabaseName: strings.TrimSpace(req.DatabaseName),
+			PublicKey:  strings.TrimSpace(req.PublicKey),
+			PrivateKey: strings.TrimSpace(req.PrivateKey),
 		}
 	})
 }
@@ -4380,4 +4378,15 @@ func fsLayerFindEntryMatches(entry *datastore.FSLayerEntry, filter *datastore.Fi
 		}
 	}
 	return true
+}
+func resolveDefaultCredentials(p tenant.Provisioner) *tenant.CredentialProvisionRequest {
+	type defaultCredentialProvider interface {
+		DefaultCredentials() (tenant.CredentialProvisionRequest, bool)
+	}
+	if dp, ok := p.(defaultCredentialProvider); ok {
+		if req, ok := dp.DefaultCredentials(); ok {
+			return &req
+		}
+	}
+	return nil
 }
