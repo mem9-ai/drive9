@@ -470,6 +470,9 @@ func DeleteTenant(args []string) error {
 		if msg == "" {
 			msg = http.StatusText(resp.StatusCode)
 		}
+		if resp.StatusCode == http.StatusConflict && strings.Contains(msg, "only live tenants can be deleted") {
+			return deleteForkAfterLiveRejection(server, apiKey, body, asJSON)
+		}
 		return fmt.Errorf("delete tenant failed (HTTP %d): %s", resp.StatusCode, msg)
 	}
 	if result.Status == "" {
@@ -560,4 +563,46 @@ func isTerminal(f *os.File) bool {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+func deleteForkAfterLiveRejection(server, apiKey string, body io.Reader, asJSON bool) error {
+	c := client.New(server, apiKey)
+	resp, err := c.RawDelete("/v1/fork", body)
+	if err != nil {
+		return fmt.Errorf("fork delete failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	rawResp, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read fork delete response: %w", err)
+	}
+	var result struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	_ = json.Unmarshal(rawResp, &result)
+	if resp.StatusCode != http.StatusAccepted {
+		msg := strings.TrimSpace(result.Error)
+		if msg == "" {
+			msg = strings.TrimSpace(string(rawResp))
+		}
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return fmt.Errorf("fork delete failed (HTTP %d): %s", resp.StatusCode, msg)
+	}
+	if result.Status == "" {
+		result.Status = "deleting"
+	}
+	cleanupMatchingOwnerContexts(server, apiKey)
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]string{
+			"status": result.Status,
+			"server": server,
+		})
+	}
+	fmt.Printf("fork delete accepted (status: %s)\n", result.Status)
+	return nil
 }

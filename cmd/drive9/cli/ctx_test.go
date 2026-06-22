@@ -277,8 +277,11 @@ func TestCtxForkAcceptsFailedResponseAndSavesAPIKey(t *testing.T) {
 	if !strings.Contains(out, "Fork provisioning failed") {
 		t.Errorf("missing failed warning in output: %q", out)
 	}
-	if !strings.Contains(out, "cleaned up automatically") {
-		t.Errorf("missing cleanup message in output: %q", out)
+	if !strings.Contains(out, "drive9 ctx use test-fork") {
+		t.Errorf("missing ctx use guidance in output: %q", out)
+	}
+	if !strings.Contains(out, "drive9 delete") {
+		t.Errorf("missing delete guidance in output: %q", out)
 	}
 	got := loadConfig()
 	if got.Contexts["test-fork"] == nil || got.Contexts["test-fork"].APIKey != "failed-key" || got.Contexts["test-fork"].Server != ts.URL {

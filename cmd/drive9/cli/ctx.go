@@ -601,8 +601,9 @@ func ctxForkCmd(args []string) error {
 		fmt.Println("The fork is still provisioning. Wait a moment, then retry a command like `drive9 fs ls /`; `fs` commands may fail until the tenant becomes active.")
 	}
 	if result.Status == "failed" {
-		fmt.Printf("Fork provisioning failed. The fork context %q has been saved for reference.\n", newName)
-		fmt.Println("The failed fork will be cleaned up automatically in the background.")
+		fmt.Printf("Fork provisioning failed. The fork context %q has been saved with its API key.\n", newName)
+		fmt.Printf("To clean up the failed fork, switch to it with `drive9 ctx use %s` and run `drive9 delete`.\n", newName)
+		fmt.Println("For TiDB Cloud Native forks, pass --tidbcloud-public-key/--tidbcloud-private-key or set DRIVE9_TIDBCLOUD_PUBLIC_KEY/DRIVE9_TIDBCLOUD_PRIVATE_KEY if the server has no default credential.")
 	}
 	return nil
 }

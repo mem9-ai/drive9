@@ -619,3 +619,78 @@ func newRegionManifestTestServer(t *testing.T, entries []RegionManifestEntry) *h
 		})
 	}))
 }
+
+func TestDeleteTenantDeletesLiveTenantOnly(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/v1/tenant" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleting"})
+	}))
+	defer ts.Close()
+
+	cfg := loadConfig()
+	if _, err := ctxAdd(cfg, "owner", &Context{Type: PrincipalOwner, APIKey: "owner-key", Server: ts.URL}); err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	resetCredentialCacheForTest()
+
+	out, err := captureStdoutE(t, func() error {
+		return DeleteTenant([]string{"-y"})
+	})
+	if err != nil {
+		t.Fatalf("DeleteTenant: %v", err)
+	}
+	if !strings.Contains(out, "delete accepted") {
+		t.Fatalf("output = %q", out)
+	}
+}
+
+func TestDeleteTenantFallsBackToForkDeleteForForkContext(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+
+	tenantCalled := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/tenant":
+			tenantCalled = true
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "only live tenants can be deleted"})
+		case "/v1/fork":
+			if !tenantCalled {
+				t.Fatal("/v1/fork called before /v1/tenant rejection")
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleting"})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	cfg := loadConfig()
+	if _, err := ctxAdd(cfg, "owner", &Context{Type: PrincipalOwner, APIKey: "owner-key", Server: ts.URL}); err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	resetCredentialCacheForTest()
+
+	out, err := captureStdoutE(t, func() error {
+		return DeleteTenant([]string{"-y"})
+	})
+	if err != nil {
+		t.Fatalf("DeleteTenant: %v", err)
+	}
+	if !strings.Contains(out, "fork delete accepted") {
+		t.Fatalf("output = %q", out)
+	}
+}
