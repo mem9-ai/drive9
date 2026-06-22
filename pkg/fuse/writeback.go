@@ -75,6 +75,11 @@ type WriteBackMeta struct {
 // (JSON metadata). Writes are atomic: data is written to a temp file and
 // renamed into place. The .dat file is fsync'd before rename to survive
 // power loss.
+//
+// Locking strategy: mu protects in-memory state (metas, data, LRU). File I/O
+// (.dat/.meta atomicWrite) in PutWithBaseRevAndModeTimings runs outside mu,
+// serialized per-path by pathLocks. This allows different files to write
+// concurrently while keeping same-path operations safe.
 type WriteBackCache struct {
 	dir     string // e.g. ~/.cache/drive9/{mount-hash}/pending
 	mu      sync.Mutex
@@ -92,6 +97,45 @@ type WriteBackCache struct {
 	dataBytes int64
 	// dataMaxBytes is the aggregate memory budget for data.
 	dataMaxBytes int64
+
+	// pathLocks serializes file I/O for the same remotePath. Each entry
+	// tracks a mutex and the number of goroutines waiting to use it.
+	// Protected by mu; entries are created on demand and removed when the
+	// last user releases.
+	pathLocks map[string]*pathLockEntry
+}
+
+type pathLockEntry struct {
+	mu      sync.Mutex
+	waiters int32 // number of goroutines that have acquired or are waiting
+}
+
+// acquirePathLock returns a per-path mutex for serializing file I/O on the
+// same remotePath. The caller must call releasePathLock when done.
+func (c *WriteBackCache) acquirePathLock(remotePath string) *pathLockEntry {
+	c.mu.Lock()
+	pl, ok := c.pathLocks[remotePath]
+	if !ok {
+		pl = &pathLockEntry{}
+		c.pathLocks[remotePath] = pl
+	}
+	pl.waiters++
+	c.mu.Unlock()
+
+	pl.mu.Lock()
+	return pl
+}
+
+// releasePathLock releases the per-path mutex and removes it from the map
+// when no other goroutine is waiting.
+func (c *WriteBackCache) releasePathLock(remotePath string, pl *pathLockEntry) {
+	c.mu.Lock()
+	pl.waiters--
+	if pl.waiters == 0 {
+		delete(c.pathLocks, remotePath)
+	}
+	c.mu.Unlock()
+	pl.mu.Unlock()
 }
 
 func (c *WriteBackCache) pruneScannedEntry(scannedMetaName string) {
@@ -121,6 +165,7 @@ func NewWriteBackCache(dir string) (*WriteBackCache, error) {
 		dataOrder:    list.New(),
 		dataElems:    make(map[string]*list.Element),
 		dataMaxBytes: defaultWriteBackDataCacheMaxSize,
+		pathLocks:    make(map[string]*pathLockEntry),
 	}
 	// Populate in-memory index from disk (crash recovery).
 	entries, _ := os.ReadDir(dir)
@@ -200,29 +245,39 @@ func (c *WriteBackCache) PutWithBaseRevAndMode(remotePath string, data []byte, s
 
 // PutWithBaseRevAndModeTimings is like PutWithBaseRevAndMode but also returns
 // sub-phase timings for diagnostic instrumentation.
+//
+// File I/O (.dat/.meta atomicWrite) runs outside the global WriteBackCache.mu,
+// serialized per-path by a per-path lock. The global lock is only held briefly
+// to allocate the generation, compute file paths, and publish in-memory state.
 func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []byte, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (WriteBackPutTimings, error) {
 	var t WriteBackPutTimings
 
+	// Phase 1: acquire per-path lock (serializes same-path Put/Remove/etc.)
 	lockStart := time.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	pl := c.acquirePathLock(remotePath)
 	t.LockWait = time.Since(lockStart)
 
-	// Write .dat via temp + fsync + rename (atomic).
+	// Compute file paths and allocate generation (no global lock needed;
+	// datFile/metaFile are pure functions of dir+remotePath, nextGen is atomic).
 	datPath := c.datFile(remotePath)
+	metaPath := c.metaFile(remotePath)
+	gen := c.nextGen.Add(1)
+
+	// Phase 2: file I/O outside global lock (only per-path serialized).
 	datStart := time.Now()
 	if err := atomicWrite(datPath, data); err != nil {
+		c.releasePathLock(remotePath, pl)
 		return t, fmt.Errorf("writeback put data: %w", err)
 	}
 	t.DatWrite = time.Since(datStart)
 
-	// Write .meta via temp + rename.
+	now := time.Now()
 	meta := WriteBackMeta{
 		Path:       remotePath,
 		Size:       size,
-		Mtime:      time.Now(),
-		CreatedAt:  time.Now(),
-		Generation: c.nextGen.Add(1),
+		Mtime:      now,
+		CreatedAt:  now,
+		Generation: gen,
 		Kind:       kind,
 		BaseRev:    baseRev,
 		Mode:       mode & posixPermissionModeMask,
@@ -230,20 +285,26 @@ func (c *WriteBackCache) PutWithBaseRevAndModeTimings(remotePath string, data []
 	}
 	metaBytes, err := json.Marshal(meta)
 	if err != nil {
+		c.releasePathLock(remotePath, pl)
 		return t, fmt.Errorf("writeback marshal meta: %w", err)
 	}
-	metaPath := c.metaFile(remotePath)
 	metaStart := time.Now()
 	if err := atomicWrite(metaPath, metaBytes); err != nil {
 		// Best-effort cleanup of the .dat file if meta write fails.
 		_ = os.Remove(datPath)
+		c.releasePathLock(remotePath, pl)
 		return t, fmt.Errorf("writeback put meta: %w", err)
 	}
 	t.MetaWrite = time.Since(metaStart)
 
+	// Phase 3: publish in-memory state under global lock (fast, no I/O).
+	c.mu.Lock()
 	cp := meta
 	c.metas[remotePath] = &cp
 	c.cacheDataLocked(remotePath, data, size)
+	c.mu.Unlock()
+
+	c.releasePathLock(remotePath, pl)
 	return t, nil
 }
 
@@ -361,10 +422,30 @@ func (c *WriteBackCache) GetMeta(remotePath string) (*WriteBackMeta, bool) {
 
 // Remove deletes the cached data and metadata for remotePath.
 func (c *WriteBackCache) Remove(remotePath string) {
+	pl := c.acquirePathLock(remotePath)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	c.pruneEntryLocked(remotePath, true)
+	c.mu.Unlock()
+	c.releasePathLock(remotePath, pl)
+}
+
+// RemoveIfGeneration atomically checks that the current generation matches
+// expectedGen before removing the entry. Returns true if the entry was removed.
+// This prevents a stale upload from accidentally removing a fresher cache entry
+// that was written between the generation check and the remove call.
+func (c *WriteBackCache) RemoveIfGeneration(remotePath string, expectedGen uint64) bool {
+	pl := c.acquirePathLock(remotePath)
+	c.mu.Lock()
+	meta, ok := c.metas[remotePath]
+	if ok && meta.Generation == expectedGen {
+		c.pruneEntryLocked(remotePath, true)
+		c.mu.Unlock()
+		c.releasePathLock(remotePath, pl)
+		return true
+	}
+	c.mu.Unlock()
+	c.releasePathLock(remotePath, pl)
+	return false
 }
 
 // UpdateMode updates the pending mode metadata for an existing cache entry.
@@ -426,6 +507,18 @@ func (c *WriteBackCache) MarkChmodPending(remotePath string, generation uint64) 
 // rewritten with the new path and a fresh generation.
 // Returns true if there was a pending entry to rename.
 func (c *WriteBackCache) RenamePending(oldPath, newPath string) bool {
+	// Acquire path locks in sorted order to avoid deadlock.
+	first, second := oldPath, newPath
+	if second < first {
+		first, second = second, first
+	}
+	pl1 := c.acquirePathLock(first)
+	pl2 := c.acquirePathLock(second)
+	defer func() {
+		c.releasePathLock(second, pl2)
+		c.releasePathLock(first, pl1)
+	}()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

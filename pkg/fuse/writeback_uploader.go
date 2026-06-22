@@ -424,13 +424,11 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		return
 	}
 
-	// Only remove from cache if the generation hasn't changed. If a newer
-	// Put() happened while we were uploading, the cache now holds fresher
-	// data that must not be discarded.
-	curMeta, ok := u.cache.GetMeta(localPath)
-	if ok && curMeta.Generation == gen {
-		u.cache.Remove(localPath)
-	}
+	// Atomically remove from cache only if the generation hasn't changed.
+	// If a newer Put() happened while we were uploading, the cache now holds
+	// fresher data that must not be discarded. RemoveIfGeneration ensures the
+	// check and delete are under the same lock acquisition.
+	u.cache.RemoveIfGeneration(localPath, gen)
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
 	}
@@ -512,11 +510,9 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 		return 0, err
 	}
 
-	// Only remove if generation matches — a concurrent Put() may have written newer data.
-	curMeta, ok := u.cache.GetMeta(localPath)
-	if ok && curMeta.Generation == gen {
-		u.cache.Remove(localPath)
-	}
+	// Atomically remove only if generation matches — a concurrent Put() may
+	// have written newer data between our read and this point.
+	u.cache.RemoveIfGeneration(localPath, gen)
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
 	}
@@ -538,10 +534,7 @@ func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath str
 		return nil
 	}
 
-	curMeta, ok := u.cache.GetMeta(localPath)
-	if ok && curMeta.Generation == gen {
-		u.cache.Remove(localPath)
-	}
+	u.cache.RemoveIfGeneration(localPath, gen)
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
 	}
