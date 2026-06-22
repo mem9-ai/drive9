@@ -55,6 +55,7 @@ type MountOptions struct {
 	LocalOnlyPatterns       []string      // additional local-only path patterns for overlay-profile mounts
 	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for overlay-profile mounts
 	PackPaths               []string      // local overlay paths auto-packed after unmount
+	CommitQueueMaxPending   int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
 	UploadConcurrency       int           // number of background upload workers (default 4)
 	ReadConcurrency         int           // maximum concurrent backend reads issued by FUSE (default 24)
 	ParallelReadConcurrency int           // maximum concurrent block reads for one large FUSE read (default 4)
@@ -396,7 +397,11 @@ func Mount(opts *MountOptions) error {
 
 			// Initialize CommitQueue for background remote commits.
 			if shadowStore != nil && pendingIdx != nil {
-				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending, opts.RemoteRoot)
+				cqMaxPending := maxCommitQueuePending
+				if opts.CommitQueueMaxPending > 0 {
+					cqMaxPending = opts.CommitQueueMaxPending
+				}
+				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, cqMaxPending, opts.RemoteRoot)
 				cq.SetLayerRef(opts.LayerRef)
 				cq.SetPerfCounters(dat9fs.perf)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess

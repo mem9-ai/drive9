@@ -192,3 +192,33 @@ func TestCommitQueuePerfCounters(t *testing.T) {
 		t.Fatalf("commit drain count = %d, want 1", got)
 	}
 }
+
+func TestFlushPerfTimingCounters(t *testing.T) {
+	perf := newFusePerfCounters(true)
+
+	// Record a few flush sub-phase timings.
+	perf.recordFlushStageShadow(50 * time.Millisecond)
+	perf.recordFlushStageShadow(100 * time.Millisecond)
+	perf.recordFlushSnapshotWB(10 * time.Millisecond)
+	perf.recordFlushSnapshotWB(20 * time.Millisecond)
+	perf.recordFlushSnapshotWB(30 * time.Millisecond)
+
+	snap := perf.snapshot()
+	if got := snap.Counters["flush_stage_shadow_count"]; got != 2 {
+		t.Fatalf("flush_stage_shadow_count = %d, want 2", got)
+	}
+	if got := snap.Counters["flush_stage_shadow_max_ns"]; got != uint64(100*time.Millisecond) {
+		t.Fatalf("flush_stage_shadow_max_ns = %d, want %d", got, uint64(100*time.Millisecond))
+	}
+	if got := snap.Counters["flush_snapshot_wb_count"]; got != 3 {
+		t.Fatalf("flush_snapshot_wb_count = %d, want 3", got)
+	}
+	if got := snap.Counters["flush_snapshot_wb_max_ns"]; got != uint64(30*time.Millisecond) {
+		t.Fatalf("flush_snapshot_wb_max_ns = %d, want %d", got, uint64(30*time.Millisecond))
+	}
+
+	// Disabled perf should not panic.
+	var nilPerf *fusePerfCounters
+	nilPerf.recordFlushStageShadow(time.Millisecond)
+	nilPerf.recordFlushSnapshotWB(time.Millisecond)
+}

@@ -7612,6 +7612,37 @@ func TestMountOptionsUploadConcurrencyDefaults(t *testing.T) {
 	}
 }
 
+func TestDirCacheMaxEntriesOrDefault(t *testing.T) {
+	// Zero uses default.
+	if got := dirCacheMaxEntriesOrDefault(0); got != defaultNamespaceCacheMaxEntries {
+		t.Fatalf("dirCacheMaxEntriesOrDefault(0) = %d, want %d", got, defaultNamespaceCacheMaxEntries)
+	}
+	// Negative uses default.
+	if got := dirCacheMaxEntriesOrDefault(-1); got != defaultNamespaceCacheMaxEntries {
+		t.Fatalf("dirCacheMaxEntriesOrDefault(-1) = %d, want %d", got, defaultNamespaceCacheMaxEntries)
+	}
+	// Explicit positive value is used.
+	if got := dirCacheMaxEntriesOrDefault(200000); got != 200000 {
+		t.Fatalf("dirCacheMaxEntriesOrDefault(200000) = %d, want 200000", got)
+	}
+}
+
+func TestMountOptionsCommitQueueMaxPendingDefaults(t *testing.T) {
+	// Zero uses default (handled in mount.go, not setDefaults).
+	opts := &MountOptions{}
+	opts.setDefaults()
+	if opts.CommitQueueMaxPending != 0 {
+		t.Fatalf("default CommitQueueMaxPending = %d, want 0 (means use internal default)", opts.CommitQueueMaxPending)
+	}
+
+	// Explicit positive value is preserved.
+	explicit := &MountOptions{CommitQueueMaxPending: 500}
+	explicit.setDefaults()
+	if explicit.CommitQueueMaxPending != 500 {
+		t.Fatalf("explicit CommitQueueMaxPending = %d, want 500", explicit.CommitQueueMaxPending)
+	}
+}
+
 func TestMountOptionsCodingAgentPolicyValidation(t *testing.T) {
 	codingAgent := &MountOptions{
 		Profile:   MountProfileCodingAgent,

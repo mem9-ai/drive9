@@ -141,6 +141,13 @@ type fusePerfCounters struct {
 	uploaderDrainCount atomicUint64
 	uploaderDrainTotal atomicUint64
 
+	flushStageShadowCount   atomicUint64
+	flushStageShadowTotalNS atomicUint64
+	flushStageShadowMaxNS   atomicUint64
+	flushSnapshotWBCount    atomicUint64
+	flushSnapshotWBTotalNS  atomicUint64
+	flushSnapshotWBMaxNS    atomicUint64
+
 	sseChange       atomicUint64
 	sseReset        atomicUint64
 	sseSelfFiltered atomicUint64
@@ -269,6 +276,26 @@ func (p *fusePerfCounters) recordRemoteOp(op perfRemoteOp, err error, dur time.D
 		return
 	}
 	p.remoteOps[op].record(err != nil, dur, bytes)
+}
+
+func (p *fusePerfCounters) recordFlushStageShadow(dur time.Duration) {
+	if !p.isEnabled() {
+		return
+	}
+	ns := uint64(dur)
+	p.flushStageShadowCount.add(1)
+	p.flushStageShadowTotalNS.add(ns)
+	p.flushStageShadowMaxNS.max(ns)
+}
+
+func (p *fusePerfCounters) recordFlushSnapshotWB(dur time.Duration) {
+	if !p.isEnabled() {
+		return
+	}
+	ns := uint64(dur)
+	p.flushSnapshotWBCount.add(1)
+	p.flushSnapshotWBTotalNS.add(ns)
+	p.flushSnapshotWBMaxNS.max(ns)
 }
 
 func (p *fusePerfCounters) recordLocalPolicy(source policyMatchSource) {
@@ -401,6 +428,12 @@ func (p *fusePerfCounters) snapshot() fusePerfSnapshot {
 	snap.Counters["commit_drain_total_ns"] = p.commitDrainTotalNS.load()
 	snap.Counters["uploader_drain_count"] = p.uploaderDrainCount.load()
 	snap.Counters["uploader_drain_total_ns"] = p.uploaderDrainTotal.load()
+	snap.Counters["flush_stage_shadow_count"] = p.flushStageShadowCount.load()
+	snap.Counters["flush_stage_shadow_total_ns"] = p.flushStageShadowTotalNS.load()
+	snap.Counters["flush_stage_shadow_max_ns"] = p.flushStageShadowMaxNS.load()
+	snap.Counters["flush_snapshot_wb_count"] = p.flushSnapshotWBCount.load()
+	snap.Counters["flush_snapshot_wb_total_ns"] = p.flushSnapshotWBTotalNS.load()
+	snap.Counters["flush_snapshot_wb_max_ns"] = p.flushSnapshotWBMaxNS.load()
 	snap.Counters["sse_change"] = p.sseChange.load()
 	snap.Counters["sse_reset"] = p.sseReset.load()
 	snap.Counters["sse_self_filtered"] = p.sseSelfFiltered.load()
@@ -460,6 +493,13 @@ func (p *fusePerfCounters) printSummary(w io.Writer) {
 		snap.Counters["commit_enqueue"], snap.Counters["commit_enqueue_error"], snap.Counters["commit_retry"],
 		snap.Counters["commit_success"], snap.Counters["commit_failure"],
 		snap.Counters["commit_drain_count"], time.Duration(snap.Counters["commit_drain_total_ns"]).Truncate(time.Millisecond))
+	writePerfLine(w, "drive9: perf flush_detail stage_shadow_count=%d stage_shadow_avg=%s stage_shadow_max=%s snapshot_wb_count=%d snapshot_wb_avg=%s snapshot_wb_max=%s\n",
+		snap.Counters["flush_stage_shadow_count"],
+		avgDuration(snap.Counters["flush_stage_shadow_total_ns"], snap.Counters["flush_stage_shadow_count"]).Truncate(time.Microsecond),
+		time.Duration(snap.Counters["flush_stage_shadow_max_ns"]).Truncate(time.Microsecond),
+		snap.Counters["flush_snapshot_wb_count"],
+		avgDuration(snap.Counters["flush_snapshot_wb_total_ns"], snap.Counters["flush_snapshot_wb_count"]).Truncate(time.Microsecond),
+		time.Duration(snap.Counters["flush_snapshot_wb_max_ns"]).Truncate(time.Microsecond))
 	writePerfLine(w, "drive9: perf uploader submit=%d sync_fallback=%d success=%d failure=%d drain_count=%d drain_total=%s\n",
 		snap.Counters["uploader_submit"], snap.Counters["uploader_sync_fallback"],
 		snap.Counters["uploader_success"], snap.Counters["uploader_failure"],

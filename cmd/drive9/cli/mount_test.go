@@ -1521,6 +1521,92 @@ func TestMountCmdRejectsInvalidUploadConcurrency(t *testing.T) {
 	}
 }
 
+func TestMountCmdPassesDirCacheMaxEntriesOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		got = opts
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--dir-cache-max-entries", "200000",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.DirCacheMaxEntries != 200000 {
+		t.Fatalf("DirCacheMaxEntries = %d, want 200000", got.DirCacheMaxEntries)
+	}
+}
+
+func TestMountCmdPassesCommitQueueMaxPendingOption(t *testing.T) {
+	oldMountFuse := mountFuse
+	t.Cleanup(func() { mountFuse = oldMountFuse })
+
+	var got *mountFuseOptions
+	mountFuse = func(opts *mountFuseOptions) error {
+		got = opts
+		return nil
+	}
+
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--commit-queue-max-pending", "500",
+		t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("MountCmd: %v", err)
+	}
+	if got == nil {
+		t.Fatal("mountFuse was not called")
+	}
+	if got.CommitQueueMaxPending != 500 {
+		t.Fatalf("CommitQueueMaxPending = %d, want 500", got.CommitQueueMaxPending)
+	}
+}
+
+func TestMountCmdRejectsInvalidDirCacheMaxEntries(t *testing.T) {
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--dir-cache-max-entries", "-1",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--dir-cache-max-entries") {
+		t.Fatalf("MountCmd error = %v, want dir-cache-max-entries validation error", err)
+	}
+}
+
+func TestMountCmdRejectsInvalidCommitQueueMaxPending(t *testing.T) {
+	err := MountCmd([]string{
+		"--foreground",
+		"--mode", "fuse",
+		"--server", "https://drive9.example",
+		"--api-key", "sk-test",
+		"--commit-queue-max-pending", "-1",
+		t.TempDir(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "--commit-queue-max-pending") {
+		t.Fatalf("MountCmd error = %v, want commit-queue-max-pending validation error", err)
+	}
+}
+
 func TestMountCmdPassesFuseSyncReadOption(t *testing.T) {
 	oldMountFuse := mountFuse
 	t.Cleanup(func() { mountFuse = oldMountFuse })

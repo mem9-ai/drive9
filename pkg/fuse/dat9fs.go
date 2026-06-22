@@ -10249,23 +10249,30 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					stageStart := time.Now()
 					fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
 					err := fs.stageShadowForQueuedCommitLocked(fh, true)
+					stageDur := time.Since(stageStart)
 					fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
+					fs.perf.recordFlushStageShadow(stageDur)
 					if err != nil {
 						log.Printf("shadow stage failed for %s: %v, falling through", fh.Path, err)
 					} else {
 						phase = "small-snapshot-writeback"
+						snapWBStart := time.Now()
 						if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
 							log.Printf("writeback snapshot failed for %s: %v", fh.Path, err)
 						}
+						fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart))
 						fh.WriteBackSeq = fh.DirtySeq
 						return gofuse.OK
 					}
 				}
 
 				phase = "small-snapshot-writeback"
+				snapWBStart2 := time.Now()
 				if err := fs.snapshotWriteBackLocked(fh); err != nil {
+					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
 					log.Printf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
 				} else {
+					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
 					if fs.pendingIndex != nil {
 						_, _ = fs.pendingIndex.PutWithBaseRev(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev)
 					}
@@ -10304,7 +10311,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			stageStart := time.Now()
 			fs.debugf("flush shadowspill stage start path=%s size=%d durable=true", fh.Path, size)
 			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			largeStageDur := time.Since(stageStart)
 			fs.debugDurationf(stageStart, 0, "flush shadowspill stage done path=%s size=%d err=%v", fh.Path, size, err)
+			fs.perf.recordFlushStageShadow(largeStageDur)
 			if err != nil {
 				log.Printf("flush: shadow stage failed for ShadowSpill %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
 			} else {
