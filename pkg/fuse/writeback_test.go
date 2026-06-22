@@ -660,7 +660,9 @@ func TestWriteBackUploader_PendingChmodWithMissingDat(t *testing.T) {
 	// Step 2: Remove the .dat file to simulate the scenario where data was
 	// already uploaded and the .dat is gone.
 	datPath := cache.datFile("/chmod-no-dat.txt")
-	os.Remove(datPath)
+	if err := os.Remove(datPath); err != nil {
+		t.Fatalf("remove .dat: %v", err)
+	}
 
 	// Also evict in-memory data cache so getViewLocked must hit disk.
 	cache.mu.Lock()
@@ -709,7 +711,9 @@ func TestWriteBackUploader_UploadSyncPendingChmodWithMissingDat(t *testing.T) {
 	}
 
 	datPath := cache.datFile("/sync-chmod-no-dat.txt")
-	os.Remove(datPath)
+	if err := os.Remove(datPath); err != nil {
+		t.Fatalf("remove .dat: %v", err)
+	}
 	cache.mu.Lock()
 	delete(cache.data, "/sync-chmod-no-dat.txt")
 	cache.mu.Unlock()
