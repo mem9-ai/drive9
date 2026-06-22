@@ -1995,16 +1995,18 @@ func TestSemanticWorkerNextTargetSkipsFailingTenantWithinPage(t *testing.T) {
 	// 1 - 0.75^30 ≈ 99.98%.
 	for i := range 30 {
 		target, err := m.nextTarget(context.Background())
-		if err != nil {
-			t.Fatalf("nextTarget error at iteration %d: %v", i, err)
-		}
-		if target == nil {
-			t.Fatalf("nextTarget returned nil at iteration %d; failing tenant absorbed the page walk", i)
-		}
-		tenantID := target.tenantID
-		target.release()
-		if tenantID != healthyTenantID {
-			t.Fatalf("nextTarget picked tenant %q at iteration %d, want healthy tenant %q", tenantID, i, healthyTenantID)
+		if err != nil || target == nil {
+			if err != nil {
+				t.Fatalf("nextTarget error at iteration %d: %v", i, err)
+			} else {
+				t.Fatalf("nextTarget returned nil at iteration %d; failing tenant absorbed the page walk", i)
+			}
+		} else {
+			tenantID := target.tenantID
+			target.release()
+			if tenantID != healthyTenantID {
+				t.Fatalf("nextTarget picked tenant %q at iteration %d, want healthy tenant %q", tenantID, i, healthyTenantID)
+			}
 		}
 	}
 }
@@ -2013,6 +2015,7 @@ func TestSemanticWorkerKickDedupAndOverflow(t *testing.T) {
 	m := newSemanticWorkerManager(newTestBackendForSemanticWorker(t), nil, nil, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
 	if m == nil {
 		t.Fatal("expected semantic worker manager")
+		return
 	}
 
 	var nilManager *semanticWorkerManager

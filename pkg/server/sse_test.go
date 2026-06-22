@@ -435,6 +435,7 @@ func TestSSECatchupCoalescesConnectionsPerTenantDB(t *testing.T) {
 	})
 	if manager == nil {
 		t.Fatal("expected catchup manager")
+		return
 	}
 	defer manager.Stop()
 
