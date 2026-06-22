@@ -329,17 +329,14 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 		DBName:    dbName,
 		Provider:  tenant.ProviderTiDBCloudNative,
 	}
-	if branch.State != "" && branch.State != stateActive {
+	if !branchConnectionIncomplete(branch) {
+		if err := fillBranchEndpoint(out, branch); err != nil {
+			return out, err
+		}
 		return out, nil
 	}
-	if branchConnectionIncomplete(branch) {
-		if branch.State == stateActive {
-			return out, nil
-		}
+	if branch.State == "" {
 		return out, fmt.Errorf("tidbcloud native branch response missing state and endpoint")
-	}
-	if err := fillBranchEndpoint(out, branch); err != nil {
-		return out, err
 	}
 	return out, nil
 }
