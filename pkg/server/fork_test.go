@@ -420,7 +420,15 @@ func TestCreateForkTenantNativeUsesCredentialsAndDeletesBranchOnFailure(t *testi
 	rt := newForkCleanupTestRuntime(t)
 	rt.prov.provider = tenant.ProviderTiDBCloudNative
 	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
-	rt.prov.cluster = &tenant.ClusterInfo{ClusterID: "cluster-a", BranchID: "branch-created", Provider: tenant.ProviderTiDBCloudNative}
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Host:      rt.dbHost,
+		Port:      rt.dbPort,
+		Username:  rt.dbUser,
+		DBName:    rt.dbName,
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
 	rt.prov.provisionErr = context.Canceled
 
 	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{

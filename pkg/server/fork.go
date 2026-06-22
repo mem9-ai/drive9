@@ -386,6 +386,12 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, err
 	}
 
+	if source.Provider == tenant.ProviderTiDBCloudNative && cluster.Host == "" && resolveDefaultCredentials(s.provisioner) == nil {
+		s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster)
+		s.markForkFailed(ctx, forkID)
+		return nil, forkErr(http.StatusBadRequest, "branch response missing endpoint; server default TiDB Cloud credential is required to provision this fork")
+	}
+
 	apiToken, err := token.IssueToken(s.tokenSecret, forkID, 1)
 	if err != nil {
 		s.cleanupForkCreateFailure(ctx, forkID, source.Provider, credentialReq, cluster)
