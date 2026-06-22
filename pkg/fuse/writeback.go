@@ -417,15 +417,22 @@ func (c *WriteBackCache) deleteDataLocked(remotePath string) {
 }
 
 // GetMeta reads the metadata for remotePath. Returns nil, false if not cached.
+// GetMeta returns a copy of the metadata for remotePath.
+// Acquires per-path lock to serialize with concurrent Put, ensuring callers
+// always see either the pre-Put or post-Put state, never a mid-write gap
+// where new data is on disk but metadata hasn't been published yet.
 func (c *WriteBackCache) GetMeta(remotePath string) (*WriteBackMeta, bool) {
+	pl := c.acquirePathLock(remotePath)
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	meta, ok := c.metas[remotePath]
 	if !ok {
+		c.mu.Unlock()
+		c.releasePathLock(remotePath, pl)
 		return nil, false
 	}
 	cp := *meta
+	c.mu.Unlock()
+	c.releasePathLock(remotePath, pl)
 	return &cp, true
 }
 
