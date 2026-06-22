@@ -1,5 +1,6 @@
 export { Client } from "./client.js";
 export { Drive9Error, StatusError, ConflictError, checkError } from "./error.js";
+export { FSLayerCommitConflictError } from "./layer.js";
 export { StreamWriter } from "./stream.js";
 export { MaxBatchReadSmallPaths, MaxBatchStatPaths } from "./models.js";
 export type {

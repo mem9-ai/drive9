@@ -93,6 +93,10 @@ Environment variables `DRIVE9_SERVER` or `DRIVE9_BASE` and `DRIVE9_API_KEY` take
 | Stream writer | `client.newStreamWriter(path, totalSize, options?)` |
 | Append | `client.append(path, data)` |
 
+`append` uses the native server append flow for existing S3-backed files. When
+native append is unavailable, the SDK only uses a bounded small-file rewrite and
+rejects large read/merge/write rewrites.
+
 ### Patch (partial update)
 
 ```typescript

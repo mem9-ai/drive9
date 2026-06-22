@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { setupServer } from "msw/node";
 import { http, HttpResponse } from "msw";
 
-import { Client, MaxBatchReadSmallPaths, MaxBatchStatPaths } from "../src/index.js";
+import { Client, FSLayerCommitConflictError, MaxBatchReadSmallPaths, MaxBatchStatPaths } from "../src/index.js";
 
 const server = setupServer();
 
@@ -16,7 +16,50 @@ afterAll(() => server.close());
 const text = new TextEncoder();
 
 describe("TypeScript SDK parity surface", () => {
-  it("loads owner or fs_scoped credentials from DRIVE9_CONFIG and lets env override individual fields", () => {
+  it("loads the current context from DRIVE9_CONFIG and treats missing type as owner", () => {
+    const dir = mkdtempSync(join(tmpdir(), "drive9-js-config-"));
+    const configPath = join(dir, "config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        server: "https://fallback.example",
+        current_context: "default",
+        contexts: {
+          default: { api_key: "owner-key" },
+          usable: { type: "fs_scoped", api_key: "scoped-key" },
+        },
+      })
+    );
+
+    const prev = {
+      config: process.env.DRIVE9_CONFIG,
+      server: process.env.DRIVE9_SERVER,
+      base: process.env.DRIVE9_BASE,
+      key: process.env.DRIVE9_API_KEY,
+    };
+    process.env.DRIVE9_CONFIG = configPath;
+    delete process.env.DRIVE9_SERVER;
+    delete process.env.DRIVE9_BASE;
+    delete process.env.DRIVE9_API_KEY;
+    try {
+      const fromConfig = Client.defaultClient();
+      expect(fromConfig.baseUrl).toBe("https://fallback.example");
+      expect(fromConfig.apiKey).toBe("owner-key");
+
+      process.env.DRIVE9_BASE = "https://env.example";
+      process.env.DRIVE9_API_KEY = "env-key";
+      const fromEnv = Client.defaultClient();
+      expect(fromEnv.baseUrl).toBe("https://env.example");
+      expect(fromEnv.apiKey).toBe("env-key");
+    } finally {
+      restoreEnv("DRIVE9_CONFIG", prev.config);
+      restoreEnv("DRIVE9_SERVER", prev.server);
+      restoreEnv("DRIVE9_BASE", prev.base);
+      restoreEnv("DRIVE9_API_KEY", prev.key);
+    }
+  });
+
+  it("does not fall back to a different context when current_context is unusable", () => {
     const dir = mkdtempSync(join(tmpdir(), "drive9-js-config-"));
     const configPath = join(dir, "config.json");
     writeFileSync(
@@ -42,15 +85,9 @@ describe("TypeScript SDK parity surface", () => {
     delete process.env.DRIVE9_BASE;
     delete process.env.DRIVE9_API_KEY;
     try {
-      const fromConfig = Client.defaultClient();
-      expect(fromConfig.baseUrl).toBe("https://fallback.example");
-      expect(fromConfig.apiKey).toBe("scoped-key");
-
-      process.env.DRIVE9_BASE = "https://env.example";
-      process.env.DRIVE9_API_KEY = "env-key";
-      const fromEnv = Client.defaultClient();
-      expect(fromEnv.baseUrl).toBe("https://env.example");
-      expect(fromEnv.apiKey).toBe("env-key");
+      const client = Client.defaultClient();
+      expect(client.baseUrl).toBe("https://fallback.example");
+      expect(client.apiKey).toBeUndefined();
     } finally {
       restoreEnv("DRIVE9_CONFIG", prev.config);
       restoreEnv("DRIVE9_SERVER", prev.server);
@@ -81,9 +118,100 @@ describe("TypeScript SDK parity surface", () => {
     expect(revision).toBe(4);
   });
 
-  it("append rewrites with the current revision as a CAS guard", async () => {
+  it("append uses the native append plan for existing files", async () => {
+    let fullReadCalled = false;
+    let rewritePutCalled = false;
+    let uploaded = "";
+    let completeCalled = false;
     server.use(
       http.head("http://localhost:9009/v1/fs/log.txt", () =>
+        new HttpResponse(null, {
+          headers: {
+            "Content-Length": "10",
+            "X-Dat9-IsDir": "false",
+            "X-Dat9-Revision": "8",
+          },
+        })
+      ),
+      http.post("http://localhost:9009/v1/fs/log.txt", async ({ request }) => {
+        expect(new URL(request.url).searchParams.has("append")).toBe(true);
+        expect(await request.json()).toMatchObject({
+          append_size: 6,
+          part_size: 8 * 1024 * 1024,
+          expected_revision: 8,
+        });
+        return HttpResponse.json(
+          {
+            base_size: 10,
+            upload_id: "append-123",
+            part_size: 8,
+            upload_parts: [
+              {
+                number: 2,
+                url: "http://localhost:9009/s3/append/2",
+                size: 8,
+                headers: { "X-Upload-Token": "append" },
+                read_url: "http://localhost:9009/s3/read/2",
+                read_headers: { Range: "bytes=8-9" },
+              },
+            ],
+            copied_parts: [1],
+          },
+          { status: 202 }
+        );
+      }),
+      http.get("http://localhost:9009/s3/read/2", ({ request }) => {
+        expect(request.headers.get("range")).toBe("bytes=8-9");
+        return HttpResponse.arrayBuffer(text.encode("ij"));
+      }),
+      http.put("http://localhost:9009/s3/append/2", async ({ request }) => {
+        expect(request.headers.get("x-upload-token")).toBe("append");
+        uploaded = new TextDecoder().decode(await request.arrayBuffer());
+        return HttpResponse.text("ok");
+      }),
+      http.post("http://localhost:9009/v1/uploads/append-123/complete", () => {
+        completeCalled = true;
+        return HttpResponse.json({ status: "ok" });
+      }),
+      http.get("http://localhost:9009/v1/fs/log.txt", () => {
+        fullReadCalled = true;
+        return HttpResponse.text("unexpected full read", { status: 500 });
+      }),
+      http.put("http://localhost:9009/v1/fs/log.txt", async ({ request }) => {
+        rewritePutCalled = true;
+        return HttpResponse.text("unexpected rewrite", { status: 500 });
+      })
+    );
+
+    const client = new Client("http://localhost:9009", "test-key");
+    await client.append("/log.txt", text.encode("KLMNOP"));
+    expect(uploaded).toBe("ijKLMNOP");
+    expect(completeCalled).toBe(true);
+    expect(fullReadCalled).toBe(false);
+    expect(rewritePutCalled).toBe(false);
+  });
+
+  it("append creates missing paths with create-only revision semantics", async () => {
+    server.use(
+      http.get("http://localhost:9009/v1/status", () => HttpResponse.json({ inline_threshold: 50000 })),
+      http.head("http://localhost:9009/v1/fs/new-log.txt", () => new HttpResponse(null, { status: 404 })),
+      http.post("http://localhost:9009/v1/fs/new-log.txt", () => HttpResponse.text("unexpected append initiate", { status: 500 })),
+      http.put("http://localhost:9009/v1/fs/new-log.txt", async ({ request }) => {
+        expect(request.headers.get("x-dat9-expected-revision")).toBe("0");
+        expect(await request.text()).toBe("hello");
+        return HttpResponse.json({ revision: 1 });
+      })
+    );
+
+    const client = new Client("http://localhost:9009", "test-key");
+    await client.warm();
+    await client.append("/new-log.txt", text.encode("hello"));
+  });
+
+  it("append falls back to a bounded rewrite for small non-S3 files", async () => {
+    server.use(
+      http.get("http://localhost:9009/v1/status", () => HttpResponse.json({ inline_threshold: 50000 })),
+      http.head("http://localhost:9009/v1/fs/small-log.txt", () =>
         new HttpResponse(null, {
           headers: {
             "Content-Length": "5",
@@ -92,8 +220,11 @@ describe("TypeScript SDK parity surface", () => {
           },
         })
       ),
-      http.get("http://localhost:9009/v1/fs/log.txt", () => HttpResponse.arrayBuffer(text.encode("hello"))),
-      http.put("http://localhost:9009/v1/fs/log.txt", async ({ request }) => {
+      http.post("http://localhost:9009/v1/fs/small-log.txt", () =>
+        HttpResponse.json({ error: "file is not S3-stored: /small-log.txt" }, { status: 400 })
+      ),
+      http.get("http://localhost:9009/v1/fs/small-log.txt", () => HttpResponse.arrayBuffer(text.encode("hello"))),
+      http.put("http://localhost:9009/v1/fs/small-log.txt", async ({ request }) => {
         expect(request.headers.get("x-dat9-expected-revision")).toBe("8");
         expect(await request.text()).toBe("hello world");
         return HttpResponse.json({ revision: 9 });
@@ -101,7 +232,40 @@ describe("TypeScript SDK parity surface", () => {
     );
 
     const client = new Client("http://localhost:9009", "test-key");
-    await client.append("/log.txt", text.encode(" world"));
+    await client.warm();
+    await client.append("/small-log.txt", text.encode(" world"));
+  });
+
+  it("append rejects large rewrites when the native append API is unavailable", async () => {
+    let fullReadCalled = false;
+    let rewritePutCalled = false;
+    server.use(
+      http.head("http://localhost:9009/v1/fs/large-db9.txt", () =>
+        new HttpResponse(null, {
+          headers: {
+            "Content-Length": String(9 * 1024 * 1024),
+            "X-Dat9-IsDir": "false",
+            "X-Dat9-Revision": "8",
+          },
+        })
+      ),
+      http.post("http://localhost:9009/v1/fs/large-db9.txt", () =>
+        HttpResponse.json({ error: "file is not S3-stored: /large-db9.txt" }, { status: 400 })
+      ),
+      http.get("http://localhost:9009/v1/fs/large-db9.txt", () => {
+        fullReadCalled = true;
+        return HttpResponse.text("unexpected full read", { status: 500 });
+      }),
+      http.put("http://localhost:9009/v1/fs/large-db9.txt", () => {
+        rewritePutCalled = true;
+        return HttpResponse.text("unexpected rewrite", { status: 500 });
+      })
+    );
+
+    const client = new Client("http://localhost:9009", "test-key");
+    await expect(client.append("/large-db9.txt", text.encode("x"))).rejects.toThrow(/refusing read-modify-write append/);
+    expect(fullReadCalled).toBe(false);
+    expect(rewritePutCalled).toBe(false);
   });
 
   it("covers batch stat, batch read-small, enriched stat, and compat fallback", async () => {
@@ -232,6 +396,32 @@ describe("TypeScript SDK parity surface", () => {
     expect((await client.replayFSLayer("layer_1")).length).toBe(1);
     expect((await client.upsertFSLayerEntry("layer_1", { path: "/a.txt", content: text.encode("x") })).path).toBe("/a.txt");
     expect((await client.commitFSLayer("layer_1")).applied).toBe(1);
+  });
+
+  it("preserves LayerFS commit conflict details on 409", async () => {
+    server.use(
+      http.post("http://localhost:9009/v1/layers/layer_1/commit", () =>
+        HttpResponse.json(
+          {
+            status: "conflicted",
+            layer_id: "layer_1",
+            conflicts: [{ path: "/a.txt", reason: "revision mismatch", base_revision: 1, want_revision: 2 }],
+          },
+          { status: 409 }
+        )
+      )
+    );
+
+    const client = new Client("http://localhost:9009", "key");
+    try {
+      await client.commitFSLayer("layer_1");
+      throw new Error("commit should have failed");
+    } catch (err) {
+      expect(err).toBeInstanceOf(FSLayerCommitConflictError);
+      const conflict = err as FSLayerCommitConflictError;
+      expect(conflict.commit.status).toBe("conflicted");
+      expect(conflict.commit.conflicts?.[0].path).toBe("/a.txt");
+    }
   });
 
   it("covers git workspace API endpoint shapes", async () => {

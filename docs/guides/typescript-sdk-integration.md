@@ -285,15 +285,18 @@ Tag matching semantics:
 
 ## Append
 
-Use `append` or `appendStream` for small to moderate log-like writes:
+Use `append` or `appendStream` for log-like writes:
 
 ```typescript
 await client.append("/agents/run-42/events.log", new TextEncoder().encode("step completed\n"));
 ```
 
-The TypeScript SDK implements append as a revision-guarded read/merge/write
-rewrite. This gives a safe SDK-level API, but it is not the optimized large-file
-append path used by the Go SDK and CLI.
+For existing files, the TypeScript SDK uses the native append endpoint
+(`POST /v1/fs/<path>?append`) so large S3-backed files are patched by uploading
+only the changed tail parts. If the server cannot provide native append for a
+small file, the SDK falls back to a revision-guarded rewrite with a bounded size
+guard. It rejects large read/merge/write rewrites instead of reading and
+re-uploading the whole file.
 
 ## Error handling
 

@@ -1,6 +1,7 @@
 import * as fs from "fs";
 import * as path from "path";
 
+import { appendStreamImpl } from "./append.js";
 import { bodyInit } from "./compat.js";
 import { checkError, Drive9Error, StatusError } from "./error.js";
 import {
@@ -141,7 +142,8 @@ function defaultConfigPath(): string {
 
 function credentialsFromContext(cfg: Drive9Config, name: string): { server: string; apiKey: string } | undefined {
   const entry = cfg.contexts?.[name];
-  if (!entry || (entry.type !== "owner" && entry.type !== "fs_scoped")) return undefined;
+  const kind = entry?.type?.trim() || "owner";
+  if (!entry || (kind !== "owner" && kind !== "fs_scoped")) return undefined;
   const apiKey = entry.api_key?.trim();
   if (!apiKey) return undefined;
   const server = entry.server?.trim() || cfg.server?.trim();
@@ -157,11 +159,6 @@ function loadConfigFile(): { server?: string; apiKey?: string } | undefined {
     if (cfg.current_context) {
       const current = credentialsFromContext(cfg, cfg.current_context);
       if (current) return current;
-    }
-    const names = Object.keys(cfg.contexts || {}).sort();
-    for (const name of names) {
-      const creds = credentialsFromContext(cfg, name);
-      if (creds) return creds;
     }
     return { server: cfg.server?.trim() || undefined };
   } catch (err) {
@@ -190,10 +187,13 @@ function normalizeWriteOptions(options?: number | WriteOptions): Required<Pick<W
   return { expectedRevision: options?.expectedRevision ?? -1, tags: options?.tags, description: options?.description };
 }
 
-function setTagHeaders(headers: Headers, tags?: Record<string, string>): void {
-  if (!tags) return;
-  for (const [key, value] of Object.entries(tags)) {
-    headers.append("X-Dat9-Tag", `${key}=${value}`);
+function headerEntries(init?: Record<string, string>): [string, string][] {
+  return Object.entries(init || {});
+}
+
+function appendTagHeaderEntries(headers: [string, string][], tags?: Record<string, string>): void {
+  for (const [key, value] of Object.entries(tags || {})) {
+    headers.push(["X-Dat9-Tag", `${key}=${value}`]);
   }
 }
 
@@ -318,14 +318,14 @@ export class Client {
 
   async writeWithRevision(path: string, data: Uint8Array, options?: number | WriteOptions): Promise<number> {
     const opts = normalizeWriteOptions(options);
-    const headers = new Headers(this.authHeaders({ "Content-Type": "application/octet-stream" }));
+    const headers = headerEntries(this.authHeaders({ "Content-Type": "application/octet-stream" }));
     if (opts.expectedRevision >= 0) {
-      headers.set("X-Dat9-Expected-Revision", String(opts.expectedRevision));
+      headers.push(["X-Dat9-Expected-Revision", String(opts.expectedRevision)]);
     }
     if (opts.description) {
-      headers.set("X-Dat9-Description", opts.description);
+      headers.push(["X-Dat9-Description", opts.description]);
     }
-    setTagHeaders(headers, opts.tags);
+    appendTagHeaderEntries(headers, opts.tags);
     const resp = await fetch(this.fsUrl(path), { method: "PUT", headers, body: bodyInit(data) });
     await checkError(resp);
     const body = (await resp.json().catch(() => undefined)) as { revision?: number } | undefined;
@@ -367,29 +367,11 @@ export class Client {
   }
 
   async append(path: string, data: Uint8Array, options?: WriteOptions): Promise<void> {
-    let existing: Uint8Array<ArrayBufferLike> = new Uint8Array();
-    let expectedRevision = 0;
-    try {
-      const stat = await this.stat(path);
-      existing = await this.read(path);
-      expectedRevision = stat.revision;
-    } catch (err) {
-      if (!(err instanceof Error) || !err.message.includes("not found")) {
-        throw err;
-      }
-    }
-    const merged = new Uint8Array(existing.length + data.length);
-    merged.set(existing);
-    merged.set(data, existing.length);
-    await this.write(path, merged, { ...options, expectedRevision: options?.expectedRevision ?? expectedRevision });
+    await appendStreamImpl(this, path, data, data.length, options);
   }
 
   async appendStream(path: string, stream: ReadableStream<Uint8Array> | Uint8Array, size: number, options?: WriteOptions): Promise<void> {
-    const data = stream instanceof Uint8Array ? stream : await streamToBytes(stream);
-    if (data.length !== size) {
-      throw new Drive9Error(`appendStream size mismatch: got ${data.length}, want ${size}`);
-    }
-    await this.append(path, data, options);
+    await appendStreamImpl(this, path, stream, size, options);
   }
 
   async list(path: string): Promise<FileInfo[]> {

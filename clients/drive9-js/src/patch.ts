@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { Client } from "./client.js";
+import type { Client } from "./client.js";
 import { bodyInit } from "./compat.js";
 import { checkError, Drive9Error } from "./error.js";
 import type { PatchPartURL, PatchPlan } from "./models.js";
@@ -56,7 +56,7 @@ export async function patchFileImpl(
   await checkError(complete);
 }
 
-async function uploadPatchPart(client: Client, part: PatchPartURL, readPart: ReadPartFn): Promise<void> {
+export async function uploadPatchPart(client: Client, part: PatchPartURL, readPart: ReadPartFn): Promise<void> {
   let origData: Uint8Array | undefined;
   if (part.read_url) {
     const headers: Record<string, string> = {};

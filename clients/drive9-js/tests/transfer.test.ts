@@ -11,15 +11,53 @@ describe("Transfer", () => {
   it("writeStream falls back to PUT for small files", async () => {
     let putCalled = false;
     server.use(
+      http.get("http://localhost:9009/v1/status", () => HttpResponse.json({ inline_threshold: 50000 })),
       http.put("http://localhost:9009/v1/fs/small.bin", () => {
         putCalled = true;
         return HttpResponse.text("ok");
       })
     );
     const client = new Client("http://localhost:9009", "test-key");
+    await client.warm();
     const data = new TextEncoder().encode("tiny");
     await client.writeStream("/small.bin", data, data.length);
     expect(putCalled).toBe(true);
+  });
+
+  it("writeStream uses multipart for non-empty uploads before status warmup", async () => {
+    let putCalled = false;
+    let initiateCalled = false;
+    let uploaded = "";
+    server.use(
+      http.put("http://localhost:9009/v1/fs/cold-small.bin", () => {
+        putCalled = true;
+        return HttpResponse.text("unexpected direct PUT", { status: 500 });
+      }),
+      http.post("http://localhost:9009/v2/uploads/initiate", async ({ request }) => {
+        initiateCalled = true;
+        expect(await request.json()).toMatchObject({ path: "/cold-small.bin", total_size: 4 });
+        return HttpResponse.json({ upload_id: "cold-v2", key: "k", part_size: 8, total_parts: 1 });
+      }),
+      http.post("http://localhost:9009/v2/uploads/cold-v2/presign", async ({ request }) => {
+        expect(await request.json()).toEqual({ part_number: 1 });
+        return HttpResponse.json({ number: 1, url: "http://localhost:9009/s3/cold-v2/1", headers: {} });
+      }),
+      http.put("http://localhost:9009/s3/cold-v2/1", async ({ request }) => {
+        uploaded = new TextDecoder().decode(await request.arrayBuffer());
+        return new HttpResponse(null, { headers: { etag: "\"part-1\"" } });
+      }),
+      http.post("http://localhost:9009/v2/uploads/cold-v2/complete", async ({ request }) => {
+        expect(await request.json()).toMatchObject({ parts: [{ number: 1, etag: "\"part-1\"" }] });
+        return HttpResponse.text("ok");
+      })
+    );
+
+    const client = new Client("http://localhost:9009", "test-key");
+    const summary = await client.writeStreamWithSummary("/cold-small.bin", new TextEncoder().encode("tiny"), 4);
+    expect(summary.mode).toBe("multipart_v2");
+    expect(initiateCalled).toBe(true);
+    expect(putCalled).toBe(false);
+    expect(uploaded).toBe("tiny");
   });
 
   it("readStream handles 302 redirect", async () => {

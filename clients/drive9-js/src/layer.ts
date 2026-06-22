@@ -12,6 +12,16 @@ import type {
   FSLayerCreateRequest,
 } from "./models.js";
 
+export class FSLayerCommitConflictError extends StatusError {
+  readonly commit: FSLayerCommit;
+
+  constructor(commit: FSLayerCommit) {
+    super("fs layer commit conflict", 409);
+    this.name = "FSLayerCommitConflictError";
+    this.commit = commit;
+  }
+}
+
 function layerURL(client: Client, layerId: string, suffix = ""): string {
   return `${client.baseUrl}/v1/layers/${encodeURIComponent(layerId)}${suffix}`;
 }
@@ -173,7 +183,7 @@ export async function commitFSLayer(client: Client, layerId: string): Promise<FS
   if (resp.status === 409) {
     const body = (await resp.json().catch(() => undefined)) as FSLayerCommit | undefined;
     if (body) {
-      throw new StatusError("fs layer commit conflict", 409);
+      throw new FSLayerCommitConflictError(body);
     }
   }
   return decodeJSON<FSLayerCommit>(resp);
