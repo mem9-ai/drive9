@@ -177,7 +177,7 @@ export async function writeStreamWithSummaryImpl(
 ): Promise<UploadSummary> {
   const opts = normalizeWriteOptions(options);
   const started = new Date();
-  const threshold = client["statusCache"] ? client["smallFileThreshold"] : 0;
+  const threshold = client["smallFileThreshold"];
   let data: Uint8Array;
   if (stream instanceof Uint8Array) {
     data = stream;
