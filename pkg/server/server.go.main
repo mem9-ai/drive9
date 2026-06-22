@@ -1,9 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
-	"bytes"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	mysql "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/embedding"
@@ -53,13 +55,11 @@ type Config struct {
 	// InlineThreshold is the server-wide DB-inline vs S3 cutoff surfaced to
 	// clients via /v1/status. When 0, the value is inferred from
 	// cfg.Backend.InlineThreshold() (or omitted in responses if no backend).
-	InlineThreshold      int64
-	Logger               *zap.Logger
-	SemanticEmbedder     embedding.Client
-	SemanticWorkers      SemanticWorkerOptions
-	SSEHeartbeatInterval time.Duration
-	SSECatchup           SSECatchupOptions
-	SlockOAuth           SlockOAuthClient
+	InlineThreshold  int64
+	Logger           *zap.Logger
+	SemanticEmbedder embedding.Client
+	SemanticWorkers  SemanticWorkerOptions
+	SlockOAuth       SlockOAuthClient
 
 	TiDBAutoEmbeddingConfig  tenantschema.TiDBAutoEmbeddingConfig
 	TiDBAutoEmbeddingAPIKey  string
@@ -83,36 +83,44 @@ type credentialProvisionRequestValidator interface {
 	ValidateCredentialProvisionRequest(tenant.CredentialProvisionRequest) error
 }
 
+type provisioningRegionProvider interface {
+	ProvisioningCloudProvider() string
+	ProvisioningRegion() string
+}
+
+type nativeSystemUserProvisioner interface {
+	// tenantID is reserved for audit/log naming; current native setup derives SQL principals from the DSN user.
+	EnsureSystemUser(ctx context.Context, dsn, tenantID string) (username, password string, err error)
+}
+
 type Server struct {
-	fallback             *backend.Dat9Backend
-	meta                 *meta.Store
-	pool                 *tenant.Pool
-	provisioner          tenant.Provisioner
-	tokenSecret          []byte
-	localTenantAPIKey    string
-	vaultMK              *vault.MasterKey
-	vaultIssuerURL       string
-	publicURL            string
-	maxUploadBytes       int64
-	inlineThreshold      int64
-	metrics              *serverMetrics
-	logger               *zap.Logger
-	mux                  *http.ServeMux
-	events               *eventBuses
-	sseHeartbeatInterval time.Duration
-	sseRetention         *sseRetentionSweeper
-	sseCatchup           *sseCatchupManager
-	semanticWorker       *semanticWorkerManager
-	journalCursorSecret  []byte
-	objectGCWorker       *objectGCWorker
-	slockOAuth           SlockOAuthClient
-	tidbAutoEmbedding    tenantAutoEmbeddingDefault
-	disableDBAutoEmbed   bool
-	forkWorkerCtx        context.Context
-	forkWorkerCancel     context.CancelFunc
-	forkWorkerWG         sync.WaitGroup
-	forkWorkerMu         sync.Mutex
-	forkWorkerClosed     bool
+	fallback            *backend.Dat9Backend
+	meta                *meta.Store
+	pool                *tenant.Pool
+	provisioner         tenant.Provisioner
+	tokenSecret         []byte
+	localTenantAPIKey   string
+	vaultMK             *vault.MasterKey
+	vaultIssuerURL      string
+	publicURL           string
+	maxUploadBytes      int64
+	inlineThreshold     int64
+	metrics             *serverMetrics
+	logger              *zap.Logger
+	mux                 *http.ServeMux
+	events              *eventBuses
+	semanticWorker      *semanticWorkerManager
+	journalCursorSecret []byte
+	objectGCWorker      *objectGCWorker
+	slockOAuth          SlockOAuthClient
+	tidbAutoEmbedding   tenantAutoEmbeddingDefault
+	disableDBAutoEmbed  bool
+	forkWorkerCtx       context.Context
+	forkWorkerCancel    context.CancelFunc
+	forkWorkerWG        sync.WaitGroup
+	forkWorkerMu        sync.Mutex
+	forkWorkerClosed    bool
+	schemaInitErrors    sync.Map
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -189,31 +197,23 @@ func NewWithConfig(cfg Config) *Server {
 	if inlineThreshold <= 0 {
 		inlineThreshold = backend.DefaultInlineThreshold
 	}
-	sseHeartbeatInterval := cfg.SSEHeartbeatInterval
-	if sseHeartbeatInterval <= 0 {
-		sseHeartbeatInterval = defaultSSEHeartbeatInterval
-	}
-	sseCatchupOptions := normalizeSSECatchupOptions(cfg.SSECatchup)
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
-		fallback:             cfg.Backend,
-		meta:                 cfg.Meta,
-		pool:                 cfg.Pool,
-		tokenSecret:          cfg.TokenSecret,
-		localTenantAPIKey:    strings.TrimSpace(cfg.LocalTenantAPIKey),
-		vaultMK:              vaultMK,
-		vaultIssuerURL:       strings.TrimSpace(cfg.VaultIssuerURL),
-		publicURL:            strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
-		provisioner:          cfg.Provisioner,
-		maxUploadBytes:       maxUpload,
-		inlineThreshold:      inlineThreshold,
-		metrics:              newServerMetrics(),
-		logger:               logger,
-		events:               newEventBuses(),
-		sseHeartbeatInterval: sseHeartbeatInterval,
-		sseRetention:         newSSERetentionSweeper(),
-		sseCatchup:           newSSECatchupManager(cfg.Backend, cfg.Meta, cfg.Pool, sseCatchupOptions),
-		slockOAuth:           cfg.SlockOAuth,
+		fallback:          cfg.Backend,
+		meta:              cfg.Meta,
+		pool:              cfg.Pool,
+		tokenSecret:       cfg.TokenSecret,
+		localTenantAPIKey: strings.TrimSpace(cfg.LocalTenantAPIKey),
+		vaultMK:           vaultMK,
+		vaultIssuerURL:    strings.TrimSpace(cfg.VaultIssuerURL),
+		publicURL:         strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
+		provisioner:       cfg.Provisioner,
+		maxUploadBytes:    maxUpload,
+		inlineThreshold:   inlineThreshold,
+		metrics:           newServerMetrics(),
+		logger:            logger,
+		events:            newEventBuses(),
+		slockOAuth:        cfg.SlockOAuth,
 		tidbAutoEmbedding: tenantAutoEmbeddingDefault{
 			config:  defaultTiDBAutoEmbeddingConfig(cfg.TiDBAutoEmbeddingConfig),
 			apiKey:  strings.TrimSpace(cfg.TiDBAutoEmbeddingAPIKey),
@@ -224,8 +224,6 @@ func NewWithConfig(cfg Config) *Server {
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
 	}
-	metrics.RecordGauge("sse", "heartbeat_interval_seconds", sseHeartbeatInterval.Seconds())
-	recordSSECatchupGauges(sseCatchupOptions, 0, 0)
 	mux := http.NewServeMux()
 
 	var business http.Handler = http.HandlerFunc(s.handleBusiness)
@@ -382,16 +380,6 @@ func NewWithConfig(cfg Config) *Server {
 	} else {
 		logger.Info("server_object_gc_worker_disabled")
 	}
-	if s.sseCatchup != nil {
-		logger.Info("server_sse_catchup_enabled",
-			zap.Duration("poll_interval", s.sseCatchup.opts.PollInterval),
-			zap.Duration("idle_max_interval", s.sseCatchup.opts.IdleMaxInterval),
-			zap.Int("batch_size", s.sseCatchup.opts.BatchSize),
-			zap.Int("max_concurrent_tenant_dbs", s.sseCatchup.opts.MaxConcurrentTenants))
-		s.sseCatchup.Start()
-	} else {
-		logger.Info("server_sse_catchup_disabled")
-	}
 	return s
 }
 
@@ -410,9 +398,6 @@ func (s *Server) Close() {
 	}
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Stop()
-	}
-	if s.sseCatchup != nil {
-		s.sseCatchup.Stop()
 	}
 }
 
@@ -1034,20 +1019,38 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          string(resolved.Tenant.Status),
-		Message:         tenantStatusMessage(&resolved.Tenant),
+		Message:         s.tenantStatusMessage(&resolved.Tenant),
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})
 }
 
-func tenantStatusMessage(t *meta.Tenant) string {
+func (s *Server) tenantStatusMessage(t *meta.Tenant) string {
 	if t == nil {
 		return ""
 	}
 	if t.Kind == meta.TenantKindFork && t.Status == meta.TenantProvisioning {
 		return forkProvisioningMessage(t)
 	}
+	if s != nil && (t.Status == meta.TenantProvisioning || t.Status == meta.TenantFailed) {
+		if value, ok := s.schemaInitErrors.Load(t.ID); ok {
+			if msg, ok := value.(string); ok && msg != "" {
+				return "schema init error: " + msg
+			}
+		}
+	}
 	return ""
+}
+
+func schemaInitStatusErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := strings.TrimSpace(err.Error())
+	if len(msg) > 500 {
+		return msg[:500] + "..."
+	}
+	return msg
 }
 
 func backendFromRequest(r *http.Request) *backend.Dat9Backend {
@@ -1255,6 +1258,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		Size       int64  `json:"size"`
 		IsDir      bool   `json:"isDir"`
 		Mtime      int64  `json:"mtime,omitempty"`
+		Revision   int64  `json:"revision,omitempty"`
 		Mode       uint32 `json:"mode,omitempty"`
 		HasMode    bool   `json:"hasMode"`
 		ResourceID string `json:"resource_id,omitempty"`
@@ -1273,11 +1277,18 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 				nlink = uint32(parsed)
 			}
 		}
+		var revision int64
+		if raw := e.Meta.Content["revision"]; raw != "" {
+			if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil {
+				revision = parsed
+			}
+		}
 		out = append(out, entry{
 			Name:       e.Name,
 			Size:       e.Size,
 			IsDir:      e.IsDir,
 			Mtime:      mtime,
+			Revision:   revision,
 			Mode:       e.Mode,
 			HasMode:    hasMode,
 			ResourceID: e.Meta.Content["resource_id"],
@@ -1400,6 +1411,14 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
+	timingEnabled := logger.BenchTimingLogEnabled()
+	var timingStart time.Time
+	var bodyReadDuration time.Duration
+	var backendWriteDuration time.Duration
+	var responseDuration time.Duration
+	if timingEnabled {
+		timingStart = time.Now()
+	}
 	if !authorizeFS(w, r, FSOpWrite, path) {
 		return
 	}
@@ -1520,8 +1539,18 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+	bodyReadStart := time.Time{}
+	if timingEnabled {
+		bodyReadStart = time.Now()
+	}
 	data, err := io.ReadAll(body)
+	if timingEnabled {
+		bodyReadDuration = time.Since(bodyReadStart)
+	}
 	if err != nil {
+		if timingEnabled {
+			logServerWriteTiming(r.Context(), path, 0, expectedRevision, 0, "body_read_error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), err)
+		}
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_too_large", "path", path, "max", s.maxUploadBytes)...)
@@ -1536,12 +1565,24 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 	description := r.Header.Get("X-Dat9-Description")
 	if utf8.RuneCountInString(description) > backend.MaxDescriptionLen {
+		if timingEnabled {
+			logServerWriteTiming(r.Context(), path, len(data), expectedRevision, 0, "validation_error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), nil)
+		}
 		errJSON(w, http.StatusBadRequest, fmt.Sprintf("description exceeds %d characters", backend.MaxDescriptionLen))
 		return
 	}
-	mutationCtx, fsEvents := eventMutationContext(r)
-	_, committedRevision, err := b.WriteCtxIfRevisionWithTagsResult(mutationCtx, path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags, description)
+	backendWriteStart := time.Time{}
+	if timingEnabled {
+		backendWriteStart = time.Now()
+	}
+	_, committedRevision, err := b.WriteCtxIfRevisionWithTagsResult(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags, description)
+	if timingEnabled {
+		backendWriteDuration = time.Since(backendWriteStart)
+	}
 	if err != nil {
+		if timingEnabled {
+			logServerWriteTiming(r.Context(), path, len(data), expectedRevision, 0, "error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), err)
+		}
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large_backend", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
@@ -1572,8 +1613,38 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_ok", "path", path, "bytes", len(data))...)
 	metricEvent(r.Context(), "fs_write", "result", "ok")
 	recordTenantFileBytes(r.Context(), "fs", "write", "write", int64(len(data)))
-	s.publishCollectedEvents(r, fsEvents)
+	responseStart := time.Time{}
+	if timingEnabled {
+		responseStart = time.Now()
+	}
+	s.publishEvent(r, path, "write")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": committedRevision})
+	if timingEnabled {
+		responseDuration = time.Since(responseStart)
+		logServerWriteTiming(r.Context(), path, len(data), expectedRevision, committedRevision, "ok", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), nil)
+	}
+}
+
+func logServerWriteTiming(ctx context.Context, path string, bytes int, expectedRevision, committedRevision int64, result string, bodyReadDuration, backendWriteDuration, responseDuration, totalDuration time.Duration, err error) {
+	fields := []zap.Field{
+		zap.String("path", path),
+		zap.String("result", result),
+		zap.Int("bytes", bytes),
+		zap.Int64("expected_revision", expectedRevision),
+		zap.Int64("committed_revision", committedRevision),
+		zap.Float64("body_read_ms", serverDurationMs(bodyReadDuration)),
+		zap.Float64("backend_write_ms", serverDurationMs(backendWriteDuration)),
+		zap.Float64("response_ms", serverDurationMs(responseDuration)),
+		zap.Float64("total_ms", serverDurationMs(totalDuration)),
+	}
+	if err != nil {
+		fields = append(fields, zap.Error(err))
+	}
+	logger.InfoBenchTiming(ctx, "server_write_timing", fields...)
+}
+
+func serverDurationMs(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000.0
 }
 
 func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string) {
@@ -2152,18 +2223,17 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 	}
 	recursive := r.URL.Query().Has("recursive")
 	kind := r.URL.Query().Get("kind")
-	mutationCtx, fsEvents := eventMutationContext(r)
 	var err error
 	if recursive {
-		err = b.RemoveAllCtx(mutationCtx, path)
+		err = b.RemoveAllCtx(r.Context(), path)
 	} else {
 		switch kind {
 		case "":
-			err = b.RemoveCtx(mutationCtx, path)
+			err = b.RemoveCtx(r.Context(), path)
 		case "file":
-			err = b.RemoveFileCtx(mutationCtx, path)
+			err = b.RemoveFileCtx(r.Context(), path)
 		case "dir":
-			err = b.RemoveDirCtx(mutationCtx, path)
+			err = b.RemoveDirCtx(r.Context(), path)
 		default:
 			errJSON(w, http.StatusBadRequest, "invalid delete kind")
 			return
@@ -2183,7 +2253,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request, path strin
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "delete_ok", "path", path, "recursive", recursive, "kind", kind)...)
-	s.publishCollectedEvents(r, fsEvents)
+	s.publishEvent(r, path, "delete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -2209,8 +2279,7 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	mutationCtx, fsEvents := eventMutationContext(r)
-	if err := b.CopyFileCtx(mutationCtx, srcPath, dstPath); err != nil {
+	if err := b.CopyFileCtx(r.Context(), srcPath, dstPath); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "copy_not_found", "src_path", srcPath, "dst_path", dstPath)...)
 			errJSON(w, http.StatusNotFound, err.Error())
@@ -2224,7 +2293,7 @@ func (s *Server) handleCopy(w http.ResponseWriter, r *http.Request, dstPath stri
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "copy_ok", "src_path", srcPath, "dst_path", dstPath)...)
-	s.publishCollectedEvents(r, fsEvents)
+	s.publishEvent(r, dstPath, "copy")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -2244,8 +2313,7 @@ func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath 
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	mutationCtx, fsEvents := eventMutationContext(r)
-	if err := b.HardlinkFileCtx(mutationCtx, srcPath, dstPath); err != nil {
+	if err := b.HardlinkFileCtx(r.Context(), srcPath, dstPath); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "hardlink_not_found", "src_path", srcPath, "dst_path", dstPath)...)
 			errJSON(w, http.StatusNotFound, err.Error())
@@ -2269,7 +2337,8 @@ func (s *Server) handleHardlink(w http.ResponseWriter, r *http.Request, dstPath 
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "hardlink_ok", "src_path", srcPath, "dst_path", dstPath)...)
-	s.publishCollectedEvents(r, fsEvents)
+	s.publishEvent(r, srcPath, "hardlink")
+	s.publishEvent(r, dstPath, "hardlink")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -2293,8 +2362,7 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	mutationCtx, fsEvents := eventMutationContext(r)
-	if err := b.RenameCtx(mutationCtx, oldPath, newPath); err != nil {
+	if err := b.RenameCtx(r.Context(), oldPath, newPath); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "rename_not_found", "old_path", oldPath, "new_path", newPath)...)
 			errJSON(w, http.StatusNotFound, err.Error())
@@ -2313,7 +2381,7 @@ func (s *Server) handleRename(w http.ResponseWriter, r *http.Request, newPath st
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "rename_ok", "old_path", oldPath, "new_path", newPath)...)
-	s.publishCollectedEvents(r, fsEvents)
+	s.publishEvent(r, newPath, "rename")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -2333,8 +2401,7 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 			mode = uint32(m)
 		}
 	}
-	mutationCtx, fsEvents := eventMutationContext(r)
-	if err := b.MkdirCtx(mutationCtx, path, mode); err != nil {
+	if err := b.MkdirCtx(r.Context(), path, mode); err != nil {
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "mkdir_conflict", "path", path, "error", err)...)
 			errJSON(w, http.StatusConflict, err.Error())
@@ -2348,7 +2415,7 @@ func (s *Server) handleMkdir(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "mkdir_ok", "path", path)...)
-	s.publishCollectedEvents(r, fsEvents)
+	s.publishEvent(r, path, "mkdir")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -2377,8 +2444,7 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 
-	mutationCtx, fsEvents := eventMutationContext(r)
-	if err := b.ChmodCtx(mutationCtx, path, req.Mode); err != nil {
+	if err := b.ChmodCtx(r.Context(), path, req.Mode); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "not found")
 			return
@@ -2391,7 +2457,6 @@ func (s *Server) handleChmod(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "chmod_ok", "path", path)...)
-	s.publishCollectedEvents(r, fsEvents)
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -2405,8 +2470,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 		errJSON(w, http.StatusUnauthorized, "missing tenant scope")
 		return
 	}
-	mutationCtx, fsEvents := eventMutationContext(r)
-	if err := b.CreateCtx(mutationCtx, path); err != nil {
+	if err := b.CreateCtx(r.Context(), path); err != nil {
 		if errors.Is(err, datastore.ErrPathConflict) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "create_conflict", "path", path, "error", err)...)
 			errJSON(w, http.StatusConflict, err.Error())
@@ -2420,7 +2484,7 @@ func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request, path strin
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "create_ok", "path", path)...)
-	s.publishCollectedEvents(r, fsEvents)
+	s.publishEvent(r, path, "create")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
 }
@@ -2453,8 +2517,7 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 		errJSON(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	mutationCtx, fsEvents := eventMutationContext(r)
-	if err := b.CreateSymlinkCtx(mutationCtx, path, req.Target); err != nil {
+	if err := b.CreateSymlinkCtx(r.Context(), path, req.Target); err != nil {
 		if errors.Is(err, backend.ErrInvalidSymlinkTarget) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_invalid_target", "path", path, "error", err)...)
 			errJSON(w, http.StatusBadRequest, err.Error())
@@ -2483,7 +2546,7 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 		return
 	}
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "symlink_ok", "path", path)...)
-	s.publishCollectedEvents(r, fsEvents)
+	s.publishEvent(r, path, "symlink")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "revision": int64(1)})
 }
@@ -2748,8 +2811,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	mutationCtx, fsEvents := eventMutationContext(r)
-	if err := b.ConfirmUploadWithTags(mutationCtx, uploadID, tags); err != nil {
+	if err := b.ConfirmUploadWithTags(r.Context(), uploadID, tags); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_not_found", "upload_id", uploadID)...)
 			metricEvent(r.Context(), "upload_complete", "result", "error")
@@ -2786,7 +2848,7 @@ func (s *Server) handleUploadComplete(w http.ResponseWriter, r *http.Request, up
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "upload_complete_ok", "upload_id", uploadID)...)
 	metricEvent(r.Context(), "upload_complete", "result", "ok")
 	recordTenantFileBytes(r.Context(), "upload", "complete", "write", upload.TotalSize)
-	s.publishCollectedEvents(r, fsEvents)
+	s.publishEvent(r, upload.TargetPath, "upload_complete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
@@ -3307,8 +3369,7 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 		errJSONInternalStorage(w)
 		return
 	}
-	mutationCtx, fsEvents := eventMutationContext(r)
-	if err := b.ConfirmUploadV2WithTags(mutationCtx, uploadID, req.Parts, req.Tags); err != nil {
+	if err := b.ConfirmUploadV2WithTags(r.Context(), uploadID, req.Parts, req.Tags); err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "upload not found")
 			return
@@ -3352,7 +3413,7 @@ func (s *Server) handleV2UploadComplete(w http.ResponseWriter, r *http.Request, 
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_complete_ok", "upload_id", uploadID)...)
 	metricEvent(r.Context(), "v2_upload_complete", "result", "ok")
 	recordTenantFileBytes(r.Context(), "upload", "complete", "write", upload.TotalSize)
-	s.publishCollectedEvents(r, fsEvents)
+	s.publishEvent(r, upload.TargetPath, "upload_complete")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "completed"})
 }
 
@@ -3479,6 +3540,18 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(response)
 }
 
+func resolveDefaultCredentials(p tenant.Provisioner) *tenant.CredentialProvisionRequest {
+	type defaultCredentialProvider interface {
+		DefaultCredentials() (tenant.CredentialProvisionRequest, bool)
+	}
+	if dp, ok := p.(defaultCredentialProvider); ok {
+		if req, ok := dp.DefaultCredentials(); ok {
+			return &req
+		}
+	}
+	return nil
+}
+
 func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
 	var req struct {
 		PublicKey  string `json:"public_key"`
@@ -3505,10 +3578,44 @@ func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, bu
 		}
 	}
 	out := build()
+	if out.PublicKey == "" && out.PrivateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
 	if out.PublicKey == "" || out.PrivateKey == "" {
-		return nil, fmt.Errorf("public_key and private_key are required")
+		return nil, tenant.ErrPartialCredentials
 	}
 	return &out, nil
+}
+
+func rejectCredentialProvisionBody(r *http.Request) error {
+	if r.Body == nil {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxCredentialProvisionBodyBytes))
+	if err != nil {
+		return nil
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if len(body) == 0 {
+		return nil
+	}
+	if int64(len(body)) >= maxCredentialProvisionBodyBytes {
+		return fmt.Errorf("request body too large")
+	}
+	var raw struct {
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	if strings.TrimSpace(raw.PublicKey) != "" {
+		return fmt.Errorf("tidbcloud public key is not supported for this provider (only tidb_cloud_native)")
+	}
+	if strings.TrimSpace(raw.PrivateKey) != "" {
+		return fmt.Errorf("tidbcloud private key is not supported for this provider (only tidb_cloud_native)")
+	}
+	return nil
 }
 
 type apiKeyIssueSource struct {
@@ -3618,6 +3725,33 @@ func (s *Server) copyAutoEmbeddingProfileForFork(ctx context.Context, sourceTena
 	})
 }
 
+func (s *Server) applyAutoEmbeddingProviderConfig(ctx context.Context, tenantID, tenantDSN string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
+	if s.meta == nil || s.pool == nil {
+		return nil
+	}
+	metaProfile, err := s.meta.EnsureTenantAutoEmbeddingProfile(ctx, tenantID)
+	if err != nil {
+		return fmt.Errorf("load auto-embedding profile: %w", err)
+	}
+	if len(metaProfile.APIKeyCipher) == 0 {
+		return nil
+	}
+	apiKey, err := s.pool.Decrypt(ctx, metaProfile.APIKeyCipher)
+	if err != nil {
+		return fmt.Errorf("decrypt auto-embedding api key: %w", err)
+	}
+	db, err := sql.Open("mysql", tenantDSN)
+	if err != nil {
+		return fmt.Errorf("open tenant database for embedding provider config: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	return tenantschema.ApplyTiDBAutoEmbeddingProviderConfig(ctx, db, tenantschema.TiDBAutoEmbeddingProviderConfig{
+		Model:   profile.Model,
+		APIKey:  string(apiKey),
+		APIBase: metaProfile.APIBase,
+	})
+}
+
 func (s *Server) autoEmbeddingProfileForTenant(ctx context.Context, tenantID string) (tenantschema.TiDBAutoEmbeddingProfile, error) {
 	if s.meta == nil {
 		return tenantschema.TiDBAutoEmbeddingProfileFromConfig(s.tidbAutoEmbedding.config)
@@ -3646,6 +3780,11 @@ func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(co
 		if err != nil {
 			return fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
 		}
+		if !s.disableDBAutoEmbed {
+			if err := s.applyAutoEmbeddingProviderConfig(ctx, tenantID, dsn, profile); err != nil {
+				return fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
+			}
+		}
 		return profileAware.InitSchemaForAutoEmbeddingProfile(ctx, dsn, profile)
 	}
 }
@@ -3659,7 +3798,11 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
 	}
 	if provider == tenant.ProviderTiDBCloudNative && opts.CredentialProvisioner == nil {
-		return nil, newProvisionTenantError(http.StatusBadRequest, "public_key and private_key are required", fmt.Errorf("public_key and private_key are required"))
+		if defaultReq := resolveDefaultCredentials(s.provisioner); defaultReq == nil {
+			return nil, newProvisionTenantError(http.StatusBadRequest, "public_key and private_key are required", fmt.Errorf("public_key and private_key are required"))
+		} else {
+			opts.CredentialProvisioner = defaultReq
+		}
 	}
 	tenantID := token.NewID()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
@@ -3710,9 +3853,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 
 	var cluster *tenant.ClusterInfo
 	if provider == tenant.ProviderTiDBCloudNative {
-		if opts.CredentialProvisioner == nil {
-			err = fmt.Errorf("public_key and private_key are required")
-		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
+		if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
 			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
 		} else {
 			err = fmt.Errorf("provisioner does not support request credentials")
@@ -3727,9 +3868,28 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
 		}
-		return nil, newProvisionTenantError(http.StatusBadGateway, fmt.Sprintf("provision tenant cluster failed: %v", err), err)
+		msg := fmt.Sprintf("provision tenant cluster failed: %v", err)
+		if strings.Contains(strings.ToLower(err.Error()), "free cluster") {
+			msg = "TiDB Cloud free cluster limit reached. Set a monthly Spending Limit to continue. See https://www.pingcap.com/tidb-cloud-starter-pricing-details/#cost-and-limitations"
+		} else if strings.Contains(strings.ToLower(err.Error()), "credits") || strings.Contains(strings.ToLower(err.Error()), "payment") {
+			msg = "TiDB Cloud payment required. Add a payment method at https://tidbcloud.com/org-settings/billing/payments"
+		} else if strings.Contains(strings.ToLower(err.Error()), "instance capacity limit") || strings.Contains(strings.ToLower(err.Error()), "capacity limit") {
+			msg = "TiDB Cloud cluster capacity limit reached"
+		} else if strings.Contains(strings.ToLower(err.Error()), "status 401") || strings.Contains(strings.ToLower(err.Error()), "invalid tidb cloud") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") {
+			msg = "invalid TiDB Cloud API key"
+		} else if strings.Contains(strings.ToLower(err.Error()), "cluster limit") {
+			msg = "TiDB Cloud cluster limit reached (100 clusters per organization). Contact PingCAP support for assistance."
+		}
+		return nil, newProvisionTenantError(http.StatusBadGateway, msg, err)
 	}
 	cluster.Provider = provider
+
+	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
+		ClusterID: cluster.ClusterID,
+		Provider:  provider,
+	}); err != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_persist_cluster_id_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+	}
 
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {
@@ -3794,6 +3954,17 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		CloudProvider: cloudProvider,
 		Region:        region,
 	}, nil
+}
+
+func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {
+	if provisioner == nil {
+		return "", ""
+	}
+	regionProvider, ok := provisioner.(provisioningRegionProvider)
+	if !ok {
+		return "", ""
+	}
+	return strings.TrimSpace(regionProvider.ProvisioningCloudProvider()), strings.TrimSpace(regionProvider.ProvisioningRegion())
 }
 
 func (s *Server) persistFailedProvisionClusterInfo(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo) {
@@ -3905,7 +4076,12 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			return
 		default:
 		}
-		if err := schemaInit(ctx, tenantDSN); err == nil {
+		err := schemaInit(ctx, tenantDSN)
+		if err == nil {
+			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
+		}
+		if err == nil {
+			s.schemaInitErrors.Delete(tenantID)
 			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_ok", "tenant_id", tenantID, "provider", provider, "attempt", attempt)...)
 			if s.metrics != nil {
 				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "ok")
@@ -3921,6 +4097,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			}
 			return
 		} else {
+			s.schemaInitErrors.Store(tenantID, schemaInitStatusErrorMessage(err))
 			logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", err)...)
 			if s.metrics != nil {
 				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "error")
@@ -3971,6 +4148,49 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		backoff *= 2
 		attempt++
 	}
+}
+
+func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) error {
+	if provider != tenant.ProviderTiDBCloudNative {
+		return nil
+	}
+	if s.provisioner == nil {
+		return fmt.Errorf("server misconfigured: native tenant provider is missing")
+	}
+	systemUserProvisioner, ok := s.provisioner.(nativeSystemUserProvisioner)
+	if !ok {
+		return fmt.Errorf("native provisioner does not support system user setup")
+	}
+	cfg, err := mysql.ParseDSN(tenantDSN)
+	if err != nil {
+		return fmt.Errorf("parse native tenant DSN for credential finalization: %w", err)
+	}
+	fromDBUser := strings.TrimSpace(cfg.User)
+	if fromDBUser == "" {
+		return fmt.Errorf("native tenant DSN has empty username")
+	}
+	username, password, err := systemUserProvisioner.EnsureSystemUser(ctx, tenantDSN, tenantID)
+	if err != nil {
+		return fmt.Errorf("ensure native system user: %w", err)
+	}
+	if username == "" || password == "" {
+		return fmt.Errorf("native system user setup returned empty credential")
+	}
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(password))
+	if err != nil {
+		return fmt.Errorf("encrypt native system user password: %w", err)
+	}
+	updated, err := s.meta.UpdateTenantDBCredentialIf(ctx, tenantID, fromDBUser, username, cipherPass)
+	if err != nil {
+		return fmt.Errorf("persist native system user credential: %w", err)
+	}
+	if !updated {
+		logger.Info(ctx, "native_system_user_credential_update_skipped",
+			zap.String("tenant_id", tenantID),
+			zap.String("from_db_user", fromDBUser),
+			zap.String("db_user", username))
+	}
+	return nil
 }
 
 func errJSON(w http.ResponseWriter, code int, msg string) {
@@ -4410,62 +4630,4 @@ func fsLayerFindEntryMatches(entry *datastore.FSLayerEntry, filter *datastore.Fi
 		}
 	}
 	return true
-}
-func resolveDefaultCredentials(p tenant.Provisioner) *tenant.CredentialProvisionRequest {
-	type defaultCredentialProvider interface {
-		DefaultCredentials() (tenant.CredentialProvisionRequest, bool)
-	}
-	if dp, ok := p.(defaultCredentialProvider); ok {
-		if req, ok := dp.DefaultCredentials(); ok {
-			return &req
-		}
-	}
-	return nil
-}
-
-type provisioningRegionProvider interface {
-	ProvisioningCloudProvider() string
-	ProvisioningRegion() string
-}
-
-func rejectCredentialProvisionBody(r *http.Request) error {
-	if r.Body == nil {
-		return nil
-	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxCredentialProvisionBodyBytes))
-	if err != nil {
-		return nil
-	}
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	if len(body) == 0 {
-		return nil
-	}
-	if int64(len(body)) >= maxCredentialProvisionBodyBytes {
-		return fmt.Errorf("request body too large")
-	}
-	var raw struct {
-		PublicKey  string `json:"public_key"`
-		PrivateKey string `json:"private_key"`
-	}
-	if err := json.Unmarshal(body, &raw); err != nil {
-		return fmt.Errorf("invalid JSON body: %w", err)
-	}
-	if strings.TrimSpace(raw.PublicKey) != "" {
-		return fmt.Errorf("tidbcloud public key is not supported for this provider (only tidb_cloud_native)")
-	}
-	if strings.TrimSpace(raw.PrivateKey) != "" {
-		return fmt.Errorf("tidbcloud private key is not supported for this provider (only tidb_cloud_native)")
-	}
-	return nil
-}
-
-func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {
-	if provisioner == nil {
-		return "", ""
-	}
-	regionProvider, ok := provisioner.(provisioningRegionProvider)
-	if !ok {
-		return "", ""
-	}
-	return strings.TrimSpace(regionProvider.ProvisioningCloudProvider()), strings.TrimSpace(regionProvider.ProvisioningRegion())
 }
