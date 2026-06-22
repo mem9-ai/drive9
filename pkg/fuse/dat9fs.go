@@ -2883,11 +2883,10 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 		return false
 	}
 
-	meta, ok := fs.writeBack.GetMeta(fh.Path)
-	if !ok {
-		return false
-	}
-	data, ok := fs.writeBack.getView(fh.Path)
+	// Atomically read meta + data under one pathLock to guarantee they are
+	// from the same generation. A concurrent Put could otherwise replace the
+	// .dat between GetMeta and getView, giving us old BaseRev with new data.
+	meta, data, ok := fs.writeBack.GetMetaAndView(fh.Path)
 	if !ok {
 		return false
 	}
