@@ -2738,11 +2738,23 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	}
 	mode, hasMode := fs.modeForPendingHandle(fh)
 	if fh.ShadowSpill {
-		if _, err := fs.pendingIndex.PutShadowSpillWithMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode); err != nil {
+		var err error
+		if durable {
+			_, err = fs.pendingIndex.PutShadowSpillWithMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode)
+		} else {
+			_, err = fs.pendingIndex.PutVolatileShadowSpillWithMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode)
+		}
+		if err != nil {
 			log.Printf("pending index put failed for %s: %v", fh.Path, err)
 		}
 	} else {
-		if _, err := fs.pendingIndex.PutWithBaseRevAndMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode); err != nil {
+		var err error
+		if durable {
+			_, err = fs.pendingIndex.PutWithBaseRevAndMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode)
+		} else {
+			_, err = fs.pendingIndex.PutVolatileWithBaseRevAndMode(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev, mode, hasMode)
+		}
+		if err != nil {
 			log.Printf("pending index put failed for %s: %v", fh.Path, err)
 		}
 	}
@@ -10219,9 +10231,12 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 
 	requiresRemoteSync := isSQLitePersistentJournalPath(fh.Path)
 
-	// Write-back path: small dirty files are persisted to local disk
-	// and return immediately. The actual HTTP upload happens in Release
-	// (async). This reduces Flush latency from ~100-300ms to ~1-5ms.
+	// Write-back path: dirty data is staged locally and returned to the
+	// caller before the remote upload completes. When the CommitQueue is
+	// available, this intentionally keeps pending metadata in memory and skips
+	// local fsync/writeback-cache durability. Same-mount namespace consistency
+	// is still preserved; crash recovery before the queued commit reaches the
+	// remote is a close-sync/write-sync concern.
 	//
 	// IMPORTANT: We do NOT ClearDirty here. The buffer stays dirty as a
 	// safety net — if the user writes more data between Flush and Release,
@@ -10244,6 +10259,19 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			// current file contents. Otherwise a background full-file PUT would
 			// silently zero untouched remote-backed ranges.
 			if fs.canStageShadowFastLocked(fh) || fh.Dirty.CanMaterializeFull() {
+				if fs.commitQueue != nil && fs.shadowStore != nil {
+					phase = "small-stage-shadow-nondurable"
+					stageStart := time.Now()
+					fs.debugf("flush stage nondurable shadow start path=%s size=%d", fh.Path, size)
+					err := fs.stageShadowForQueuedCommitLocked(fh, false)
+					fs.debugDurationf(stageStart, 0, "flush stage nondurable shadow done path=%s size=%d err=%v", fh.Path, size, err)
+					if err != nil {
+						log.Printf("nondurable shadow stage failed for %s: %v, falling through", fh.Path, err)
+					} else {
+						fh.WriteBackSeq = fh.DirtySeq
+						return gofuse.OK
+					}
+				}
 				if fs.shadowStore != nil && fs.pendingIndex != nil {
 					phase = "small-stage-shadow"
 					stageStart := time.Now()
@@ -10386,6 +10414,23 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			if fs.canStageShadowFastLocked(fh) || fh.Dirty.CanMaterializeFull() {
 				phase = "large-stage-shadow"
 				size := fh.Dirty.Size()
+				if fs.commitQueue != nil {
+					phase = "large-stage-shadow-nondurable"
+					stageStart := time.Now()
+					fs.debugf("flush stage nondurable shadow start path=%s size=%d", fh.Path, size)
+					err := fs.stageShadowForQueuedCommitLocked(fh, false)
+					fs.debugDurationf(stageStart, 0, "flush stage nondurable shadow done path=%s size=%d err=%v", fh.Path, size, err)
+					if err != nil {
+						log.Printf("flush: nondurable shadow stage failed for %s (size=%d): %v, falling through", fh.Path, fh.Dirty.Size(), err)
+					} else {
+						fh.WriteBackSeq = fh.DirtySeq
+						if fh.Streamer != nil && fh.Streamer.Started() {
+							fh.Streamer.Abort()
+							fh.Streamer = nil
+						}
+						return gofuse.OK
+					}
+				}
 				stageStart := time.Now()
 				fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
 				err := fs.stageShadowForQueuedCommitLocked(fh, true)

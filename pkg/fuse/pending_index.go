@@ -85,7 +85,15 @@ func (idx *PendingIndex) PutWithBaseRev(remotePath string, size int64, kind Pend
 // PutWithBaseRevAndMode stores metadata for the given path together with the
 // file mode that must be applied after the pending data commits remotely.
 func (idx *PendingIndex) PutWithBaseRevAndMode(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode)
+	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode, true)
+}
+
+// PutVolatileWithBaseRevAndMode stores pending metadata in memory only.
+// It preserves same-mount namespace visibility without paying the local
+// metadata fsync cost. Crash recovery before the queued commit reaches the
+// remote is intentionally not guaranteed for this path.
+func (idx *PendingIndex) PutVolatileWithBaseRevAndMode(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
+	return idx.putInternal(remotePath, size, kind, baseRev, false, mode, hasMode, false)
 }
 
 // PutShadowSpill is like PutWithBaseRev but marks the entry as ShadowSpill
@@ -98,10 +106,16 @@ func (idx *PendingIndex) PutShadowSpill(remotePath string, size int64, kind Pend
 // PutShadowSpillWithMode is like PutShadowSpill, but also persists file mode
 // metadata for the eventual remote chmod.
 func (idx *PendingIndex) PutShadowSpillWithMode(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
-	return idx.putInternal(remotePath, size, kind, baseRev, true, mode, hasMode)
+	return idx.putInternal(remotePath, size, kind, baseRev, true, mode, hasMode, true)
 }
 
-func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool, mode uint32, hasMode bool) (uint64, error) {
+// PutVolatileShadowSpillWithMode is the in-memory-only variant of
+// PutShadowSpillWithMode.
+func (idx *PendingIndex) PutVolatileShadowSpillWithMode(remotePath string, size int64, kind PendingKind, baseRev int64, mode uint32, hasMode bool) (uint64, error) {
+	return idx.putInternal(remotePath, size, kind, baseRev, true, mode, hasMode, false)
+}
+
+func (idx *PendingIndex) putInternal(remotePath string, size int64, kind PendingKind, baseRev int64, shadowSpill bool, mode uint32, hasMode bool, durable bool) (uint64, error) {
 	gen := idx.nextGen.Add(1)
 	meta := &WriteBackMeta{
 		Path:        remotePath,
@@ -116,14 +130,16 @@ func (idx *PendingIndex) putInternal(remotePath string, size int64, kind Pending
 		HasMode:     hasMode,
 	}
 
-	// Write to disk first for durability.
-	metaBytes, err := json.Marshal(meta)
-	if err != nil {
-		return 0, fmt.Errorf("pending index marshal: %w", err)
-	}
-	metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
-	if err := atomicWrite(metaPath, metaBytes); err != nil {
-		return 0, fmt.Errorf("pending index put meta: %w", err)
+	if durable {
+		// Write to disk first for durability.
+		metaBytes, err := json.Marshal(meta)
+		if err != nil {
+			return 0, fmt.Errorf("pending index marshal: %w", err)
+		}
+		metaPath := filepath.Join(idx.dir, hashPath(remotePath)+".meta")
+		if err := atomicWrite(metaPath, metaBytes); err != nil {
+			return 0, fmt.Errorf("pending index put meta: %w", err)
+		}
 	}
 
 	idx.mu.Lock()
