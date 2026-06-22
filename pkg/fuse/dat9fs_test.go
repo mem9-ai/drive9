@@ -7627,19 +7627,27 @@ func TestDirCacheMaxEntriesOrDefault(t *testing.T) {
 	}
 }
 
-func TestMountOptionsCommitQueueMaxPendingDefaults(t *testing.T) {
-	// Zero uses default (handled in mount.go, not setDefaults).
-	opts := &MountOptions{}
-	opts.setDefaults()
-	if opts.CommitQueueMaxPending != 0 {
-		t.Fatalf("default CommitQueueMaxPending = %d, want 0 (means use internal default)", opts.CommitQueueMaxPending)
+func TestCommitQueueMaxPendingResolution(t *testing.T) {
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	// Explicit positive value is preserved.
-	explicit := &MountOptions{CommitQueueMaxPending: 500}
-	explicit.setDefaults()
-	if explicit.CommitQueueMaxPending != 500 {
-		t.Fatalf("explicit CommitQueueMaxPending = %d, want 500", explicit.CommitQueueMaxPending)
+	// Zero maxPending → NewCommitQueue uses internal default (maxCommitQueuePending=100).
+	cq0 := NewCommitQueue(nil, shadow, pending, nil, 1, 0)
+	if cq0.maxPending != maxCommitQueuePending {
+		t.Fatalf("NewCommitQueue(maxPending=0).maxPending = %d, want %d", cq0.maxPending, maxCommitQueuePending)
+	}
+
+	// Explicit positive value is honored.
+	cq500 := NewCommitQueue(nil, shadow, pending, nil, 1, 500)
+	if cq500.maxPending != 500 {
+		t.Fatalf("NewCommitQueue(maxPending=500).maxPending = %d, want 500", cq500.maxPending)
 	}
 }
 
