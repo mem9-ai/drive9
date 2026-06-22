@@ -12,6 +12,7 @@ class BaseModule:
     category = ""
     description = ""
     labels: tuple[str, ...] = ()
+    manual = False
     timeout = 600
 
     def ensure_dependencies(self, ctx: Context) -> None:

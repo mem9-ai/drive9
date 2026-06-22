@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 import os
-import shutil
 from typing import Any
 
-from harness.core import BlackboxError, Context, DependencyUnavailable, ModuleSkip
+from harness.core import BlackboxError, Context, ModuleSkip
 from .base import BaseModule, module_config
 
 
@@ -16,10 +15,8 @@ class GitOfficialFunctional(BaseModule):
     timeout = 7200
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        if not shutil.which("prove"):
-            raise DependencyUnavailable("prove is required for Git official tests")
-        if not shutil.which("git"):
-            raise DependencyUnavailable("git is required")
+        ctx.deps.ensure_prove()
+        ctx.deps.ensure_git_tool()
         source = ctx.deps.ensure_git_source()
         cfg = module_config(ctx, self.id)
         tests = cfg.get("tests", [])

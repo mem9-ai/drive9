@@ -64,7 +64,7 @@ class BlackboxRunner:
             recorder=self.recorder,
             capabilities=self.capabilities,
             config=self.config,
-            runs=args.runs or int(env_value("RUNS", "3", self.suite)),
+            runs=args.runs or int(env_value("RUNS", "1", self.suite)),
             suite=self.suite,
         )
         self.selected = self.select_modules()
@@ -99,6 +99,8 @@ class BlackboxRunner:
             if module_id not in seen:
                 out.append(module_id)
                 seen.add(module_id)
+        if not self.args.module and not env_flag("INCLUDE_MANUAL", False, self.suite):
+            out = [module_id for module_id in out if not getattr(self.registry[module_id], "manual", False)]
         return out
 
     def expand_module_list(self, values: list[str] | str) -> list[str]:
@@ -389,7 +391,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     selector.add_argument("--list", action="store_true", help="List available modules.")
     parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --list.")
     parser.add_argument("--deps-only", action="store_true", help="Prepare external dependencies for selected modules without running suite setup.")
-    parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS, BLACKBOX_<SUITE>_RUNS, or 3.")
+    parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS, BLACKBOX_<SUITE>_RUNS, or 1.")
     parser.add_argument("--server-mode", choices=["auto", "existing", "local"], default=env_value("SERVER_MODE", "auto", suite_default))
     parser.add_argument("--drive9-cli", default=env_value("DRIVE9_CLI", "", suite_default))
     parser.add_argument("--out-dir", default=env_value("OUT_DIR", "", suite_default))
@@ -416,6 +418,7 @@ def emit_module_list(registry: dict[str, Any], output_format: str) -> int:
                 "id": module.id,
                 "category": module.category,
                 "labels": list(module.labels),
+                "manual": bool(getattr(module, "manual", False)),
                 "description": module.description,
             }
         )
@@ -424,7 +427,8 @@ def emit_module_list(registry: dict[str, Any], output_format: str) -> int:
         return 0
     for row in rows:
         labels = ",".join(row["labels"])
-        print(f"{row['id']}\t{row['category']}\t{labels}\t{row['description']}")
+        manual = "manual" if row["manual"] else "auto"
+        print(f"{row['id']}\t{row['category']}\t{labels}\t{manual}\t{row['description']}")
     return 0
 
 

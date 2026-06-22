@@ -37,6 +37,8 @@ dist/
 build/
 tmp/
 .codex-gocache/
+.codex-golangci-cache/
+.codex-gomodcache/
 /dat9
 /drive9
 /drive9-server

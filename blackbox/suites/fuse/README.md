@@ -78,8 +78,9 @@ The FUSE suite also defines named module groups:
 
 - `functional`: `ported.juicefs.*` plus Drive9 workflow modules.
 - `posix`: `community.pjdfstest`.
-- `perf`: performance modules such as fio, mdtest, vdbench, Git perf, and
-  Drive9 workflow perf.
+- `perf`: performance modules such as fio, mdtest, Git perf, and Drive9
+  workflow perf. Modules with manual-only dependencies, such as vdbench, are
+  excluded unless selected explicitly or `BLACKBOX_INCLUDE_MANUAL=1` is set.
 - `customer`: opt-in customer-scenario modules. These are intentionally not
   part of `perf` because callers must explicitly choose the dataset scale and
   target environment.
@@ -106,12 +107,17 @@ make blackbox-deps BLACKBOX_SELECTOR=group:perf
 Direct runner usage:
 
 ```bash
-python3 blackbox/run.py --suite fuse --all --runs 3
+python3 blackbox/run.py --suite fuse --all
 python3 blackbox/run.py --suite fuse --group posix
 python3 blackbox/run.py --suite fuse --category drive9.workflow
 python3 blackbox/run.py --suite fuse --module drive9.workflow.git_blobless
 python3 blackbox/run.py --suite fuse --list --format json
 ```
+
+Modules marked `manual` are not selected by `make blackbox`,
+`BLACKBOX_SELECTOR=category:...`, or `BLACKBOX_SELECTOR=group:...` unless
+`BLACKBOX_INCLUDE_MANUAL=1` is set. They can always be run explicitly with
+`BLACKBOX_SELECTOR=module:<id>`.
 
 `--deps-only` prepares external test-suite dependencies without starting
 Drive9 or mounting FUSE:
@@ -162,7 +168,7 @@ DRIVE9_LOCAL_DSN='root:pass@tcp(127.0.0.1:3306)/drive9_local?parseTime=true'
 BLACKBOX_SUITE=fuse
 BLACKBOX_SERVER_MODE=existing
 BLACKBOX_STRICT=1
-BLACKBOX_RUNS=3
+BLACKBOX_RUNS=1
 BLACKBOX_REPOS=drive9,kimi-code
 BLACKBOX_DRIVE9_CLI=/path/to/drive9
 BLACKBOX_OFFLINE=1
@@ -183,8 +189,9 @@ BLACKBOX_LOCAL_OVERLAY_VERIFY_REMOTE=0
   QPS plus p50/p95/p99/max;
 - close, `fsync`, and `fdatasync` write latency, including separate reader
   mount/cache visibility checks;
-- three measurement rounds by default, controlled by `BLACKBOX_RUNS` or
-  `BLACKBOX_KIMI_PERF_RUNS`;
+- one measurement round by default, controlled by `BLACKBOX_RUNS` or
+  `BLACKBOX_KIMI_PERF_RUNS`; set it to `3` when a three-round average is
+  required;
 - unmount/remount persistence checks for the "next sandbox sees previous data"
   requirement;
 - same-host multi-mount validation for a configured set of mount counts.
@@ -288,6 +295,11 @@ then cached auto-fetch under:
 blackbox/cache/
 ```
 
+On Linux hosts with `apt-get` and passwordless `sudo`, blackbox can also
+bootstrap the system packages needed to build open source test suites, such as
+build-essential, autotools, Perl/prove, Git build libraries, MPICH, and Python
+headers. Disable that behavior with `BLACKBOX_AUTO_INSTALL_SYSTEM_DEPS=0`.
+
 Important dependency overrides:
 
 ```bash
@@ -298,11 +310,57 @@ PJDFSTEST_ALLOW_NONROOT=1
 GIT_TEST_SOURCE_DIR=/path/to/git
 BLACKBOX_GIT_TEST_REF=v2.46.2
 LTP_ROOT=/path/to/ltp
+BLACKBOX_LTP_REF=20240129
+BLACKBOX_LTP_INSTALL_ROOT=/path/to/ltp-install
+BLACKBOX_LTP_FS_CASES="fs_inod01 openfile01 ftest01 ..."
+LTP_FS_SCENARIO=drive9-fs-smoke
+BLACKBOX_LTP_SYSCALL_DIRS="access chmod chown close ..."
+BLACKBOX_LTP_SYSCALL_CASES="access01 chmod01 open01 write01 ..."
+LTP_SYSCALLS_SCENARIO=drive9-syscalls-fs
 FIO_BIN=/path/to/fio
+BLACKBOX_FIO_REF=fio-3.42
 MDTEST_BIN=/path/to/mdtest
+BLACKBOX_IOR_REF=4.0.0
+MPICC=/path/to/mpicc
+BLACKBOX_AUTO_INSTALL_SYSTEM_DEPS=1
 VDBENCH_BIN=/path/to/vdbench
 FSX_BIN=/path/to/fsx
 ```
+
+`LTP_ROOT` must point to an installed LTP tree containing `runltp`,
+`bin/ltp-pan`, `runtest/`, and `testcases/bin/`. When LTP is auto-fetched, the
+source checkout is kept under `blackbox/cache/tools/ltp/<ref>` and the runnable
+install tree is created under `blackbox/cache/tools/ltp-install/<ref>`.
+
+The auto-fetched LTP build intentionally does not build the full upstream LTP
+tree. It prepares the required runtime tools, a bounded filesystem smoke
+scenario, and a filesystem-oriented syscall subset. `community.ltp.fs` runs the
+generated `drive9-fs-smoke` scenario by default; set
+`BLACKBOX_LTP_FS_CASES` to choose a different bounded set, or set
+`LTP_FS_SCENARIO=fs` when the full upstream filesystem scenario is explicitly
+desired. `community.ltp.syscalls` runs the generated `drive9-syscalls-fs`
+scenario by default. The generated syscall scenario is an explicit bounded tag
+set, not every case in each built syscall directory; set
+`BLACKBOX_LTP_SYSCALL_CASES` or `BLACKBOX_LTP_SYSCALL_DIRS` to widen it. Set
+`LTP_SYSCALLS_SCENARIO=syscalls` only when `LTP_ROOT` points to a full LTP
+installation and full syscall coverage is desired.
+
+`community.fio` auto-fetches and builds fio when `fio` is not already
+available. `community.mdtest` auto-fetches and builds IOR/mdtest when `mdtest`
+is not already available. IOR requires an MPI compiler; on Linux systems with
+`apt-get` and passwordless `sudo`, blackbox attempts to install
+`mpich libmpich-dev` when `mpicc` is missing. Set
+`BLACKBOX_AUTO_INSTALL_SYSTEM_DEPS=0` to disable that system-package bootstrap.
+The IOR source checkout is patched in-cache for newer compiler compatibility
+before building mdtest.
+`community.fsx` uses the LTP-provided `fsx-linux` binary from the auto-fetched
+LTP install tree before falling back to `secfs.test`.
+
+`community.vdbench` is a manual dependency module because vdbench is distributed
+through Oracle's download page rather than a normal open source repository.
+Set `VDBENCH_BIN` or put `vdbench` on `PATH`, then run it explicitly with
+`BLACKBOX_SELECTOR=module:community.vdbench` or opt manual modules into broader
+selectors with `BLACKBOX_INCLUDE_MANUAL=1`.
 
 Dependency metadata lives in `blackbox/suites/fuse/dependencies.json`.
 Generated dependency metadata is written next to cached dependencies when a
@@ -343,8 +401,9 @@ blackbox/results/fuse/<session>/
 
 `report.md` is the human-readable run summary. `results.json` is the stable
 machine-readable result file. `metrics.json` stores raw metric rows and
-aggregate summaries. Performance modules use three runs by default and report
-mean, median, min, max, and standard deviation.
+aggregate summaries. Performance modules use one run by default; set
+`BLACKBOX_RUNS=3` when mean, median, min, max, and standard deviation across
+three samples are needed.
 
 ## GitHub Actions
 

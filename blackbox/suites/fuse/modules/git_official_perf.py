@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 from typing import Any
 
 from harness.core import Context, DependencyUnavailable, summarize
@@ -16,8 +15,7 @@ class GitOfficialPerf(BaseModule):
     timeout = 7200
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        if not shutil.which("git"):
-            raise DependencyUnavailable("git is required")
+        ctx.deps.ensure_git_tool()
         source = ctx.deps.ensure_git_source()
         perf_run = source / "t" / "perf" / "run"
         if not perf_run.exists():

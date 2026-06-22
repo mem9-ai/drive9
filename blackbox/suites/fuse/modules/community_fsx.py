@@ -21,7 +21,10 @@ class CommunityFSX(BaseModule):
         handle = ctx.target.mount("community_fsx", remote, durability="write-sync")
         try:
             ops = str(module_config(ctx, self.id).get("ops", 5000))
-            result = ctx.target.run_cmd("community-fsx", [fsx, "-N", ops, str(handle.mountpoint / "fsx.bin")], timeout=int(os.environ.get("FSX_TIMEOUT_S", str(self.timeout))))
+            args = [fsx, "-N", ops]
+            if "fsx-linux" not in os.path.basename(fsx):
+                args.append(str(handle.mountpoint / "fsx.bin"))
+            result = ctx.target.run_cmd("community-fsx", args, cwd=handle.mountpoint, timeout=int(os.environ.get("FSX_TIMEOUT_S", str(self.timeout))))
             if not result.ok:
                 raise BlackboxError(f"fsx failed; see {result.stderr}")
             return {"ops": int(ops)}

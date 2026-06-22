@@ -5,19 +5,41 @@
     "license": "BSD-2-Clause",
     "default_ref": "master"
   },
-  "community.ltp.fs": {
+  "community.ltp.*": {
     "name": "Linux Test Project",
     "source": "https://github.com/linux-test-project/ltp",
     "license": "GPL-2.0-or-later",
     "default_ref": "20240129"
   },
-  "community.fsx": {
-    "name": "secfs.test fsx",
-    "source": "https://github.com/billziss-gh/secfs.test",
-    "license": "Apache-2.0",
-    "default_ref": "master"
+  "community.fio": {
+    "name": "fio",
+    "source": "https://github.com/axboe/fio",
+    "license": "GPL-2.0-only",
+    "default_ref": "fio-3.42"
   },
-  "git.official.functional": {
+  "community.mdtest": {
+    "name": "IOR/mdtest",
+    "source": "https://github.com/hpc/ior",
+    "license": "GPL-2.0-only",
+    "default_ref": "4.0.0",
+    "patches": [
+      "gcc15-option-callback-signature"
+    ]
+  },
+  "community.fsx": {
+    "name": "LTP fsx-linux",
+    "source": "https://github.com/linux-test-project/ltp",
+    "license": "GPL-2.0-or-later",
+    "default_ref": "20240129",
+    "fallback_source": "https://github.com/billziss-gh/secfs.test"
+  },
+  "community.vdbench": {
+    "name": "vdbench",
+    "source": "https://www.oracle.com/downloads/server-storage/vdbench-downloads.html",
+    "license": "Oracle manual download",
+    "note": "Manual dependency: blackbox does not auto-download vdbench. Run explicitly with VDBENCH_BIN or put vdbench on PATH."
+  },
+  "git.official.*": {
     "name": "Git upstream test suite",
     "source": "https://github.com/git/git",
     "license": "GPL-2.0-only",

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
-import shutil
 from pathlib import Path
 from typing import Any
 
 from harness.core import BlackboxError, Context, DependencyUnavailable, ModuleSkip
+from ..deps import DEFAULT_LTP_FS_SCENARIO, DEFAULT_LTP_SYSCALL_SCENARIO
 from .base import BaseModule
 
 
@@ -23,19 +23,29 @@ class CommunityLTPFS(BaseModule):
 
     def run(self, ctx: Context) -> dict[str, Any]:
         ltp = ctx.deps.ensure_ltp()
-        runltp = shutil.which("runltp") or str(ltp / "runltp")
+        runltp = str(ltp / "runltp")
         if not Path(runltp).exists():
             raise DependencyUnavailable("runltp not found")
+        env = ctx.target.base_env()
+        env["LTPROOT"] = str(ltp)
+        scenario = os.environ.get("LTP_FS_SCENARIO", DEFAULT_LTP_FS_SCENARIO)
+        if scenario == DEFAULT_LTP_FS_SCENARIO and not (ltp / "runtest" / scenario).exists():
+            scenario = "fs"
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_ltp_fs", remote, durability="write-sync")
         try:
             work = handle.mountpoint / "ltp-work"
             work.mkdir()
-            result = ctx.target.run_cmd("community-ltp-fs", [runltp, "-f", "fs", "-d", str(work)], timeout=int(os.environ.get("LTP_FS_TIMEOUT_S", str(self.timeout))))
+            result = ctx.target.run_cmd(
+                "community-ltp-fs",
+                [runltp, "-Q", "-f", scenario, "-d", str(work)],
+                timeout=int(os.environ.get("LTP_FS_TIMEOUT_S", str(self.timeout))),
+                env=env,
+            )
             if not result.ok:
                 raise BlackboxError(f"LTP fs failed; see {result.stderr}")
-            return {"ltp_root": str(ltp)}
+            return {"ltp_root": str(ltp), "ltp_scenario": scenario}
         finally:
             ctx.target.unmount(handle)
 
@@ -48,18 +58,28 @@ class CommunityLTPSyscalls(CommunityLTPFS):
 
     def run(self, ctx: Context) -> dict[str, Any]:
         ltp = ctx.deps.ensure_ltp()
-        runltp = shutil.which("runltp") or str(ltp / "runltp")
+        runltp = str(ltp / "runltp")
         if not Path(runltp).exists():
             raise DependencyUnavailable("runltp not found")
+        env = ctx.target.base_env()
+        env["LTPROOT"] = str(ltp)
+        scenario = os.environ.get("LTP_SYSCALLS_SCENARIO", DEFAULT_LTP_SYSCALL_SCENARIO)
+        if scenario == DEFAULT_LTP_SYSCALL_SCENARIO and not (ltp / "runtest" / scenario).exists():
+            scenario = "syscalls"
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_ltp_syscalls", remote, durability="write-sync")
         try:
             work = handle.mountpoint / "ltp-work"
             work.mkdir()
-            result = ctx.target.run_cmd("community-ltp-syscalls", [runltp, "-f", "syscalls", "-d", str(work)], timeout=int(os.environ.get("LTP_SYSCALLS_TIMEOUT_S", str(self.timeout))))
+            result = ctx.target.run_cmd(
+                "community-ltp-syscalls",
+                [runltp, "-Q", "-f", scenario, "-d", str(work)],
+                timeout=int(os.environ.get("LTP_SYSCALLS_TIMEOUT_S", str(self.timeout))),
+                env=env,
+            )
             if not result.ok:
                 raise BlackboxError(f"LTP syscalls failed; see {result.stderr}")
-            return {"ltp_root": str(ltp)}
+            return {"ltp_root": str(ltp), "ltp_scenario": scenario}
         finally:
             ctx.target.unmount(handle)

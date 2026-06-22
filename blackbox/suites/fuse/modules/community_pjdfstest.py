@@ -3,10 +3,9 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
-import shutil
 from typing import Any
 
-from harness.core import BlackboxError, Context, DependencyUnavailable, ModuleSkip, write_json
+from harness.core import BlackboxError, Context, ModuleSkip, write_json
 from .base import BaseModule, module_config, read_text
 
 
@@ -20,8 +19,7 @@ class CommunityPjdfstest(BaseModule):
     def ensure_dependencies(self, ctx: Context) -> None:
         if not ctx.capabilities.get("is_root") and os.environ.get("PJDFSTEST_ALLOW_NONROOT", "0") != "1":
             raise ModuleSkip("pjdfstest normally requires root; set PJDFSTEST_ALLOW_NONROOT=1 to run anyway", "platform skip")
-        if not shutil.which("prove"):
-            raise DependencyUnavailable("prove is required for pjdfstest")
+        ctx.deps.ensure_prove()
         ctx.deps.ensure_pjdfstest()
 
     def run(self, ctx: Context) -> dict[str, Any]:

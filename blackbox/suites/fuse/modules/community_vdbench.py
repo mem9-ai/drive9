@@ -12,7 +12,8 @@ class CommunityVdbench(BaseModule):
     id = "community.vdbench"
     category = "community.performance"
     description = "Run vdbench file workload on Drive9 FUSE when vdbench is installed."
-    labels = ("performance", "community")
+    labels = ("performance", "community", "manual-dependency")
+    manual = True
     timeout = 7200
 
     def run(self, ctx: Context) -> dict[str, Any]:

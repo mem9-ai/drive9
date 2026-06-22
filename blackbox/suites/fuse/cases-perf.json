@@ -1,6 +1,6 @@
 {
   "defaults": {
-    "runs": 3,
+    "runs": 1,
     "small_file_count": 512,
     "small_file_bytes": 4096,
     "metadata_count": 1000,

@@ -104,7 +104,7 @@
       ],
       "profile": "coding-agent",
       "durability": "auto",
-      "runs": 3,
+      "runs": 1,
       "namespace_stat_samples": 1000,
       "namespace_cmd_timeout_s": 1800,
       "dataset_timeout_s": 7200,

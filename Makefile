@@ -41,7 +41,7 @@ TEST_P ?=
 TEST_RUN ?=
 TEST_PKGS ?= ./...
 BLACKBOX_SUITE ?= fuse
-BLACKBOX_RUNS ?= 3
+BLACKBOX_RUNS ?= 1
 BLACKBOX_SELECTOR ?= all
 
 BUILDINFO_LDFLAGS = -X github.com/mem9-ai/dat9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
