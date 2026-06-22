@@ -178,7 +178,7 @@ func MySQLNoEmbeddingTenantSchemaStatements() []string {
 		`CREATE INDEX idx_file_gc_claim ON file_gc_tasks(status, available_at, lease_until, created_at)`,
 		`CREATE TABLE IF NOT EXISTS llm_usage (
 			id              BIGINT AUTO_INCREMENT PRIMARY KEY,
-			tenant_id       VARCHAR(64) NOT NULL,
+			tenant_id       VARCHAR(64) NOT NULL DEFAULT '',
 			task_type       VARCHAR(64) NOT NULL,
 			task_id         VARCHAR(255) NOT NULL,
 			cost_millicents BIGINT NOT NULL,
