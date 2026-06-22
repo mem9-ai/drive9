@@ -412,14 +412,17 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, err
 	}
 
-	if source.Provider == tenant.ProviderTiDBCloudNative && cluster.Host == "" && resolveDefaultCredentials(s.provisioner) == nil {
+	// Defensive: native branch created without endpoint and server has no default
+	// TiDB Cloud credential. Normally POST create-branch returns endpoint immediately,
+	// so this path should not trigger. Fail fast and clean up or return api_key for recovery.
+	if source.Provider == tenant.ProviderTiDBCloudNative && (cluster.Host == "" || cluster.Port == 0 || cluster.Username == "") && resolveDefaultCredentials(s.provisioner) == nil {
 		if s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster) {
 			if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantDeleted); err != nil {
 				logger.Error(ctx, "fork_credential_gate_mark_deleted_failed",
 					zap.String("tenant_id", forkID), zap.Error(err))
 			}
 		} else {
-			s.markForkFailed(ctx, forkID)
+			s.markForkFailedAndCleanup(ctx, forkID)
 		}
 		return nil, &forkProvisionFailedError{
 			APIKey:   apiToken,
