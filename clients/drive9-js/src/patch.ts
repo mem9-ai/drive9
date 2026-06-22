@@ -47,6 +47,11 @@ export async function patchFileImpl(
     );
   }
   await Promise.all(tasks);
+  const complete = await fetch(`${client.baseUrl}/v1/uploads/${plan.upload_id}/complete`, {
+    method: "POST",
+    headers: client["authHeaders"](),
+  });
+  await checkError(complete);
 }
 
 async function uploadPatchPart(client: Client, part: PatchPartURL, readPart: ReadPartFn): Promise<void> {

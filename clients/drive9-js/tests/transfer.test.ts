@@ -77,6 +77,7 @@ describe("Transfer", () => {
   it("patchFile only sends checksum when it is presigned", async () => {
     let firstChecksum: string | null = null;
     let secondChecksum: string | null = null;
+    let completeCalled = false;
     server.use(
       http.patch("http://localhost:9009/v1/fs/file.bin", () => {
         return HttpResponse.json(
@@ -106,6 +107,7 @@ describe("Transfer", () => {
         return HttpResponse.text("ok");
       }),
       http.post("http://localhost:9009/v1/uploads/patch-js/complete", () => {
+        completeCalled = true;
         return HttpResponse.text("ok");
       })
     );
@@ -116,5 +118,49 @@ describe("Transfer", () => {
     const expectedSecond = createHash("sha256").update("part-2").digest("base64");
     expect(firstChecksum).toBeNull();
     expect(secondChecksum).toBe(expectedSecond);
+    expect(completeCalled).toBe(true);
+  });
+
+  it("resumeUpload slices missing parts with the server part size", async () => {
+    let uploaded = "";
+    let completeCalled = false;
+    server.use(
+      http.get("http://localhost:9009/v1/uploads", ({ request }) => {
+        const url = new URL(request.url);
+        expect(url.searchParams.get("path")).toBe("/resume.bin");
+        expect(url.searchParams.get("status")).toBe("UPLOADING");
+        return HttpResponse.json({
+          uploads: [
+            {
+              upload_id: "resume-js",
+              parts_total: 2,
+              status: "UPLOADING",
+              expires_at: new Date(Date.now() + 60000).toISOString(),
+            },
+          ],
+        });
+      }),
+      http.post("http://localhost:9009/v1/uploads/resume-js/resume", () => {
+        return HttpResponse.json({
+          upload_id: "resume-js",
+          part_size: 8,
+          parts: [{ number: 2, url: "http://localhost:9009/resume/2", size: 7, headers: {} }],
+        });
+      }),
+      http.put("http://localhost:9009/resume/2", async ({ request }) => {
+        uploaded = new TextDecoder().decode(await request.arrayBuffer());
+        return HttpResponse.text("ok");
+      }),
+      http.post("http://localhost:9009/v1/uploads/resume-js/complete", () => {
+        completeCalled = true;
+        return HttpResponse.text("ok");
+      })
+    );
+
+    const client = new Client("http://localhost:9009", "test-key");
+    await client.resumeUpload("/resume.bin", new TextEncoder().encode("abcdefghijklmno"));
+
+    expect(uploaded).toBe("ijklmno");
+    expect(completeCalled).toBe(true);
   });
 });
