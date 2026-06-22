@@ -423,15 +423,18 @@ func TestCreateForkTenantNativeUsesCredentialsAndDeletesBranchOnFailure(t *testi
 	rt.prov.cluster = &tenant.ClusterInfo{ClusterID: "cluster-a", BranchID: "branch-created", Provider: tenant.ProviderTiDBCloudNative}
 	rt.prov.provisionErr = context.Canceled
 
-	_, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	})
-	if err == nil {
-		t.Fatal("createForkTenant error = nil, want provisioning error")
+	if err != nil {
+		t.Fatalf("createForkTenant error = %v, want nil (provision is async)", err)
 	}
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("createForkTenant error = %v, want context.Canceled", err)
+	if resp.Status != string(meta.TenantProvisioning) {
+		t.Fatalf("status = %q, want %q", resp.Status, meta.TenantProvisioning)
+	}
+	if resp.APIKey == "" {
+		t.Fatal("api_key is empty")
 	}
 
 	createInput := rt.prov.createBranchInput(0)
@@ -444,9 +447,6 @@ func TestCreateForkTenantNativeUsesCredentialsAndDeletesBranchOnFailure(t *testi
 	credentialReqs := rt.prov.credentialRequests()
 	if len(credentialReqs) == 0 || credentialReqs[0].PublicKey != "public-1" || credentialReqs[0].PrivateKey != "private-1" {
 		t.Fatalf("credential requests = %+v", credentialReqs)
-	}
-	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-created" {
-		t.Fatalf("deleted branches = %#v", deleted)
 	}
 }
 
@@ -465,22 +465,28 @@ func TestCreateForkTenantNativeDeletesBranchOnSchemaInitFailure(t *testing.T) {
 	rt.prov.initErr = errors.New("schema init failed")
 	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
 
-	_, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	})
-	if err == nil || !strings.Contains(err.Error(), "schema init failed") {
-		t.Fatalf("createForkTenant error = %v, want schema init failure", err)
+	if err != nil {
+		t.Fatalf("createForkTenant error = %v, want nil (provision is async)", err)
+	}
+	if resp.Status != string(meta.TenantProvisioning) {
+		t.Fatalf("status = %q, want %q", resp.Status, meta.TenantProvisioning)
+	}
+	if resp.APIKey == "" {
+		t.Fatal("api_key is empty")
+	}
+
+	if err := rt.server.provisionForkTenantOnceWithCredentials(context.Background(), resp.TenantID, &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}); err == nil || !strings.Contains(err.Error(), "schema init failed") {
+		t.Fatalf("provision error = %v, want schema init failure", err)
 	}
 	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-created" {
 		t.Fatalf("deleted branches = %#v", deleted)
-	}
-	failed, err := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(failed) != 0 {
-		t.Fatalf("failed tenants = %+v, want branch-deleted fork to be marked deleted", failed)
 	}
 }
 

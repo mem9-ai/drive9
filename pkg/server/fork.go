@@ -50,6 +50,12 @@ func (s *Server) startForkProvision(ctx context.Context, forkID string) {
 	})
 }
 
+func (s *Server) startForkProvisionWithCredentials(ctx context.Context, forkID string, credentialReq *tenant.CredentialProvisionRequest) {
+	s.startForkWorker(ctx, func(workerCtx context.Context) {
+		s.provisionForkTenantAsyncWithCredentials(workerCtx, forkID, credentialReq)
+	})
+}
+
 func (s *Server) startForkCleanup(ctx context.Context, forkID string) {
 	s.startForkWorker(ctx, func(workerCtx context.Context) {
 		s.cleanupForkTenant(workerCtx, forkID)
@@ -202,16 +208,10 @@ func forkCredentialRequest(req forkRequest) (*tenant.CredentialProvisionRequest,
 }
 
 func forkResponseStatus(provider string) string {
-	if provider == tenant.ProviderTiDBCloudNative {
-		return string(meta.TenantActive)
-	}
 	return string(meta.TenantProvisioning)
 }
 
 func forkResponseMessage(provider string, t *meta.Tenant) string {
-	if provider == tenant.ProviderTiDBCloudNative {
-		return ""
-	}
 	return forkProvisioningMessage(t)
 }
 
@@ -413,13 +413,8 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	}
 
 	if source.Provider == tenant.ProviderTiDBCloudNative {
-		if err := s.provisionForkTenantOnceWithCredentials(ctx, forkID, credentialReq); err != nil {
-			s.markForkDeletedOrFailedAfterBranchDelete(ctx, forkID, credentialReq, cluster)
-			return nil, &forkProvisionFailedError{APIKey: apiToken, TenantID: forkID, Name: displayName, Err: err}
-		}
-	}
-
-	if source.Provider != tenant.ProviderTiDBCloudNative {
+		s.startForkProvisionWithCredentials(ctx, forkID, credentialReq)
+	} else {
 		s.startForkProvision(ctx, forkID)
 	}
 
@@ -450,6 +445,18 @@ func (e *forkProvisionFailedError) Unwrap() error {
 }
 
 func (s *Server) provisionForkTenantAsync(ctx context.Context, forkID string) {
+	s.provisionForkTenantAsyncWithProvision(ctx, forkID, func() error {
+		return s.provisionForkTenantOnce(ctx, forkID)
+	})
+}
+
+func (s *Server) provisionForkTenantAsyncWithCredentials(ctx context.Context, forkID string, credentialReq *tenant.CredentialProvisionRequest) {
+	s.provisionForkTenantAsyncWithProvision(ctx, forkID, func() error {
+		return s.provisionForkTenantOnceWithCredentials(ctx, forkID, credentialReq)
+	})
+}
+
+func (s *Server) provisionForkTenantAsyncWithProvision(ctx context.Context, forkID string, provision func() error) {
 	ctx = ensureTrace(ctx)
 	logger.Info(ctx, "fork_provision_started", zap.String("tenant_id", forkID))
 	deadline := time.Now().Add(forkProvisionRetryWindow)
