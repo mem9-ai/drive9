@@ -1303,20 +1303,38 @@ func (s *Store) Chmod(ctx context.Context, path string, mode uint32) (err error)
 		return ErrNotFound
 	}
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+			return
+		}
+		err = tx.Commit()
+	}()
+
 	var currentMode uint32
-	if err := s.db.QueryRowContext(ctx, `SELECT mode FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED'`, inodeID).Scan(&currentMode); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT mode FROM inodes WHERE inode_id = ? AND status = 'CONFIRMED'`, inodeID).Scan(&currentMode); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}
 		return err
 	}
 	mode = (mode & permissionModeMask) | (currentMode & fileTypeModeMask)
-	res, err := s.db.ExecContext(ctx, `UPDATE inodes SET mode = ? WHERE inode_id = ? AND status = 'CONFIRMED'`, mode, inodeID)
+	now := time.Now().UTC()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE inodes SET mode = ?, mtime = ?, confirmed_at = COALESCE(confirmed_at, ?), revision = revision + 1 WHERE inode_id = ? AND status = 'CONFIRMED'`,
+		mode, now, now, inodeID)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return ErrNotFound
+	}
+	if _, err := s.AppendFSEventTx(ctx, tx, path, "chmod", ""); err != nil {
+		return err
 	}
 	return nil
 }

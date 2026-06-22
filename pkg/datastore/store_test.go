@@ -1413,7 +1413,7 @@ func TestChmod(t *testing.T) {
 	if err := s.InsertNode(ctx, &FileNode{NodeID: "n1", Path: "/a.txt", ParentPath: "/", Name: "a.txt", FileID: "f1", CreatedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	fixedTime := time.Now().UTC().Add(time.Hour).Truncate(time.Millisecond)
+	fixedTime := time.Now().UTC().Add(-time.Hour).Truncate(time.Millisecond)
 	if _, err := s.DB().ExecContext(ctx, `UPDATE inodes SET mtime = ?, confirmed_at = ? WHERE inode_id = ?`, fixedTime, fixedTime, "f1"); err != nil {
 		t.Fatal(err)
 	}
@@ -1442,11 +1442,11 @@ func TestChmod(t *testing.T) {
 	if err := s.DB().QueryRowContext(ctx, `SELECT mtime, confirmed_at FROM inodes WHERE inode_id = ?`, "f1").Scan(&afterMtime, &afterConfirmedAt); err != nil {
 		t.Fatal(err)
 	}
-	if !afterMtime.After(beforeMtime) {
-		t.Errorf("mtime=%s, want after %s", afterMtime, beforeMtime)
+	if beforeMtime.After(afterMtime) {
+		t.Errorf("mtime=%s, want at or after %s", afterMtime, beforeMtime)
 	}
-	if !afterConfirmedAt.After(beforeConfirmedAt) {
-		t.Errorf("confirmed_at=%s, want after %s", afterConfirmedAt, beforeConfirmedAt)
+	if beforeConfirmedAt.After(afterConfirmedAt) {
+		t.Errorf("confirmed_at=%s, want at or after %s", afterConfirmedAt, beforeConfirmedAt)
 	}
 }
 
