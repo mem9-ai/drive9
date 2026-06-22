@@ -90,6 +90,7 @@ func TestFusePerfCountersSummary(t *testing.T) {
 		"hydrate_start=1 hydrate_success=1 hydrate_failure=0 hydrate_bytes=1024 hydrate_total=2s",
 		"hydrate_objects=4 hydrate_object_bytes=512 hydrate_object_skipped=1 hydrate_object_mismatch=2 hydrate_object_fallbacks=1",
 		"perf git_overlay enqueue=2 sync=1 success=3 failure=1 drain_count=1 drain_total=150ms",
+		"perf snapshot_wb_detail bytes_view_avg=",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("summary missing %q:\n%s", want, text)
@@ -191,4 +192,66 @@ func TestCommitQueuePerfCounters(t *testing.T) {
 	if got := snap.Counters["commit_drain_count"]; got != 1 {
 		t.Fatalf("commit drain count = %d, want 1", got)
 	}
+}
+
+func TestFlushPerfTimingCounters(t *testing.T) {
+	perf := newFusePerfCounters(true)
+
+	// Record a few flush sub-phase timings.
+	perf.recordFlushStageShadow(50 * time.Millisecond)
+	perf.recordFlushStageShadow(100 * time.Millisecond)
+	perf.recordFlushSnapshotWB(10 * time.Millisecond)
+	perf.recordFlushSnapshotWB(20 * time.Millisecond)
+	perf.recordFlushSnapshotWB(30 * time.Millisecond)
+
+	snap := perf.snapshot()
+	if got := snap.Counters["flush_stage_shadow_count"]; got != 2 {
+		t.Fatalf("flush_stage_shadow_count = %d, want 2", got)
+	}
+	if got := snap.Counters["flush_stage_shadow_max_ns"]; got != uint64(100*time.Millisecond) {
+		t.Fatalf("flush_stage_shadow_max_ns = %d, want %d", got, uint64(100*time.Millisecond))
+	}
+	if got := snap.Counters["flush_snapshot_wb_count"]; got != 3 {
+		t.Fatalf("flush_snapshot_wb_count = %d, want 3", got)
+	}
+	if got := snap.Counters["flush_snapshot_wb_max_ns"]; got != uint64(30*time.Millisecond) {
+		t.Fatalf("flush_snapshot_wb_max_ns = %d, want %d", got, uint64(30*time.Millisecond))
+	}
+
+	// Record snapshot_wb sub-phase timings.
+	perf.recordSnapshotWBSubPhases(5*time.Millisecond, WriteBackPutTimings{
+		LockWait:  2 * time.Millisecond,
+		DatWrite:  80 * time.Millisecond,
+		MetaWrite: 40 * time.Millisecond,
+	})
+	perf.recordSnapshotWBSubPhases(3*time.Millisecond, WriteBackPutTimings{
+		LockWait:  1 * time.Millisecond,
+		DatWrite:  90 * time.Millisecond,
+		MetaWrite: 30 * time.Millisecond,
+	})
+
+	snap = perf.snapshot()
+	if got := snap.Counters["snapshot_wb_bytes_view_max_ns"]; got != uint64(5*time.Millisecond) {
+		t.Fatalf("snapshot_wb_bytes_view_max_ns = %d, want %d", got, uint64(5*time.Millisecond))
+	}
+	if got := snap.Counters["snapshot_wb_dat_write_max_ns"]; got != uint64(90*time.Millisecond) {
+		t.Fatalf("snapshot_wb_dat_write_max_ns = %d, want %d", got, uint64(90*time.Millisecond))
+	}
+	if got := snap.Counters["snapshot_wb_lock_wait_max_ns"]; got != uint64(2*time.Millisecond) {
+		t.Fatalf("snapshot_wb_lock_wait_max_ns = %d, want %d", got, uint64(2*time.Millisecond))
+	}
+	if got := snap.Counters["snapshot_wb_meta_write_max_ns"]; got != uint64(40*time.Millisecond) {
+		t.Fatalf("snapshot_wb_meta_write_max_ns = %d, want %d", got, uint64(40*time.Millisecond))
+	}
+	// Verify totals accumulate across calls.
+	wantBVTotal := uint64(5*time.Millisecond) + uint64(3*time.Millisecond)
+	if got := snap.Counters["snapshot_wb_bytes_view_total_ns"]; got != wantBVTotal {
+		t.Fatalf("snapshot_wb_bytes_view_total_ns = %d, want %d", got, wantBVTotal)
+	}
+
+	// Disabled perf should not panic.
+	var nilPerf *fusePerfCounters
+	nilPerf.recordFlushStageShadow(time.Millisecond)
+	nilPerf.recordFlushSnapshotWB(time.Millisecond)
+	nilPerf.recordSnapshotWBSubPhases(time.Millisecond, WriteBackPutTimings{})
 }

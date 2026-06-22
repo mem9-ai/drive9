@@ -337,22 +337,27 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 	release := u.acquirePath(localPath)
 	defer release()
 
-	// Read data and remember the generation so we can detect concurrent overwrites.
-	meta, ok := u.cache.GetMeta(localPath)
+	// PendingChmod entries have no .dat file (data already uploaded, only
+	// chmod remains). Read meta first so we can handle chmod without loading
+	// data — GetMetaAndView would prune the entry when the .dat is missing.
+	chmodMeta, chmodOK := u.cache.GetMeta(localPath)
+	if !chmodOK {
+		return // Already uploaded or removed.
+	}
+	if chmodMeta.Kind == PendingChmod {
+		_ = u.applyPendingChmod(context.Background(), localPath, chmodMeta, chmodMeta.Generation, false)
+		return
+	}
+
+	// Atomically read meta + data under one path lock so they are guaranteed
+	// to be from the same generation. Without this, a concurrent Put could
+	// replace the data between GetMeta and getView, causing the uploader to
+	// upload new data with old baseRev/generation.
+	meta, data, ok := u.cache.GetMetaAndView(localPath)
 	if !ok {
 		return // Already uploaded or removed.
 	}
 	gen := meta.Generation
-
-	if meta.Kind == PendingChmod {
-		_ = u.applyPendingChmod(context.Background(), localPath, meta, gen, false)
-		return
-	}
-
-	data, ok := u.cache.getView(localPath)
-	if !ok {
-		return
-	}
 
 	expectedRevision, err := expectedRevisionForWriteBack(meta)
 	if err != nil {
@@ -424,13 +429,11 @@ func (u *WriteBackUploader) uploadOne(localPath string) {
 		return
 	}
 
-	// Only remove from cache if the generation hasn't changed. If a newer
-	// Put() happened while we were uploading, the cache now holds fresher
-	// data that must not be discarded.
-	curMeta, ok := u.cache.GetMeta(localPath)
-	if ok && curMeta.Generation == gen {
-		u.cache.Remove(localPath)
-	}
+	// Atomically remove from cache only if the generation hasn't changed.
+	// If a newer Put() happened while we were uploading, the cache now holds
+	// fresher data that must not be discarded. RemoveIfGeneration ensures the
+	// check and delete are under the same lock acquisition.
+	u.cache.RemoveIfGeneration(localPath, gen)
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
 	}
@@ -452,20 +455,24 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	// Wait for any in-flight background upload to complete first.
 	u.WaitPath(localPath)
 
-	meta, ok := u.cache.GetMeta(localPath)
-	if !ok {
+	// PendingChmod entries have no .dat file (data already uploaded, only
+	// chmod remains). Read meta first so we can handle chmod without loading
+	// data — GetMetaAndView would prune the entry when the .dat is missing.
+	chmodMeta, chmodOK := u.cache.GetMeta(localPath)
+	if !chmodOK {
 		return 0, nil // not in cache (may have been uploaded by the background worker we just waited for)
 	}
-	gen := meta.Generation
-
-	if meta.Kind == PendingChmod {
-		return 0, u.applyPendingChmod(ctx, localPath, meta, gen, true)
+	if chmodMeta.Kind == PendingChmod {
+		return 0, u.applyPendingChmod(ctx, localPath, chmodMeta, chmodMeta.Generation, true)
 	}
 
-	data, ok := u.cache.getView(localPath)
+	// Atomically read meta + data under one path lock so they are guaranteed
+	// to be from the same generation.
+	meta, data, ok := u.cache.GetMetaAndView(localPath)
 	if !ok {
-		return 0, nil
+		return 0, nil // not in cache (removed between GetMeta and GetMetaAndView)
 	}
+	gen := meta.Generation
 
 	expectedRevision, err := expectedRevisionForWriteBack(meta)
 	if err != nil {
@@ -512,11 +519,9 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 		return 0, err
 	}
 
-	// Only remove if generation matches — a concurrent Put() may have written newer data.
-	curMeta, ok := u.cache.GetMeta(localPath)
-	if ok && curMeta.Generation == gen {
-		u.cache.Remove(localPath)
-	}
+	// Atomically remove only if generation matches — a concurrent Put() may
+	// have written newer data between our read and this point.
+	u.cache.RemoveIfGeneration(localPath, gen)
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
 	}
@@ -538,10 +543,7 @@ func (u *WriteBackUploader) applyPendingChmod(ctx context.Context, localPath str
 		return nil
 	}
 
-	curMeta, ok := u.cache.GetMeta(localPath)
-	if ok && curMeta.Generation == gen {
-		u.cache.Remove(localPath)
-	}
+	u.cache.RemoveIfGeneration(localPath, gen)
 	if u.perf != nil {
 		u.perf.uploaderSuccess.add(1)
 	}

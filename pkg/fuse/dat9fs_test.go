@@ -7612,6 +7612,45 @@ func TestMountOptionsUploadConcurrencyDefaults(t *testing.T) {
 	}
 }
 
+func TestDirCacheMaxEntriesOrDefault(t *testing.T) {
+	// Zero uses default.
+	if got := dirCacheMaxEntriesOrDefault(0); got != defaultNamespaceCacheMaxEntries {
+		t.Fatalf("dirCacheMaxEntriesOrDefault(0) = %d, want %d", got, defaultNamespaceCacheMaxEntries)
+	}
+	// Negative uses default.
+	if got := dirCacheMaxEntriesOrDefault(-1); got != defaultNamespaceCacheMaxEntries {
+		t.Fatalf("dirCacheMaxEntriesOrDefault(-1) = %d, want %d", got, defaultNamespaceCacheMaxEntries)
+	}
+	// Explicit positive value is used.
+	if got := dirCacheMaxEntriesOrDefault(200000); got != 200000 {
+		t.Fatalf("dirCacheMaxEntriesOrDefault(200000) = %d, want 200000", got)
+	}
+}
+
+func TestCommitQueueMaxPendingResolution(t *testing.T) {
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero maxPending → NewCommitQueue uses internal default (maxCommitQueuePending=100).
+	cq0 := NewCommitQueue(nil, shadow, pending, nil, 1, 0)
+	if cq0.maxPending != maxCommitQueuePending {
+		t.Fatalf("NewCommitQueue(maxPending=0).maxPending = %d, want %d", cq0.maxPending, maxCommitQueuePending)
+	}
+
+	// Explicit positive value is honored.
+	cq500 := NewCommitQueue(nil, shadow, pending, nil, 1, 500)
+	if cq500.maxPending != 500 {
+		t.Fatalf("NewCommitQueue(maxPending=500).maxPending = %d, want 500", cq500.maxPending)
+	}
+}
+
 func TestMountOptionsCodingAgentPolicyValidation(t *testing.T) {
 	codingAgent := &MountOptions{
 		Profile:   MountProfileCodingAgent,

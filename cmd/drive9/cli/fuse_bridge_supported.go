@@ -53,6 +53,8 @@ func mountFuseImpl(opts *mountFuseOptions) error {
 		RemoteOnlyPatterns:      opts.RemoteOnlyPatterns,
 		PackPaths:               opts.PackPaths,
 		UploadConcurrency:       opts.UploadConcurrency,
+		DirCacheMaxEntries:      opts.DirCacheMaxEntries,
+		CommitQueueMaxPending:   opts.CommitQueueMaxPending,
 		ReadConcurrency:         opts.ReadConcurrency,
 		ParallelReadConcurrency: opts.ParallelReadConcurrency,
 		ParallelReadBlockSize:   opts.ParallelReadBlockSize,
