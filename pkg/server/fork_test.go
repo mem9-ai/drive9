@@ -886,3 +886,37 @@ func TestCreateForkTenantNativeNoEndpointNoDefaultCredentialFailsWithAPIKey(t *t
 		t.Fatalf("createForkTenant response = %+v, want nil on error", resp)
 	}
 }
+
+func TestHandleForkCreateNativeNoEndpointNoDefaultCredentialReturnsFailedWithAPIKey(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+	rt.prov.deleteErr = fmt.Errorf("delete branch failed")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/fork", strings.NewReader(`{"name":"test-fork","credentials":{"public_key":"public-1","private_key":"private-1"}}`))
+	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "source"}))
+	rr := httptest.NewRecorder()
+	rt.server.handleForkCreate(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"status":"failed"`) {
+		t.Fatalf("body missing status failed: %s", body)
+	}
+	if !strings.Contains(body, `"api_key"`) {
+		t.Fatalf("body missing api_key: %s", body)
+	}
+	if !strings.Contains(body, `"tenant_id"`) {
+		t.Fatalf("body missing tenant_id: %s", body)
+	}
+	if strings.Contains(body, `"status":"provisioning"`) {
+		t.Fatalf("body should not contain provisioning status: %s", body)
+	}
+}
