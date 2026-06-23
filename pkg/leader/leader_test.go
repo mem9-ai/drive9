@@ -35,13 +35,18 @@ func TestLeaderNilDBIsDisabled(t *testing.T) {
 	}
 }
 
+func newTestDB(t *testing.T) *sql.DB {
+	t.Helper()
+	db := testmysql.OpenDB(t, testDSN)
+	// Leader election is connection-scoped (GET_LOCK/IS_USED_LOCK/RELEASE_LOCK)
+	// and does not touch any tables, but reset keeps the package consistent with
+	// the repo's shared-MySQL convention.
+	testmysql.ResetDB(t, db)
+	return db
+}
+
 func TestLeaderAcquireAndLose(t *testing.T) {
-	inst, err := testmysql.Start(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = inst.Close(context.Background()) })
-	db := testmysql.OpenDB(t, inst.DSN)
+	db := newTestDB(t)
 
 	var mu sync.Mutex
 	leadCount := 0
@@ -108,12 +113,7 @@ func TestLeaderAcquireAndLose(t *testing.T) {
 }
 
 func TestLeaderExclusive(t *testing.T) {
-	inst, err := testmysql.Start(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = inst.Close(context.Background()) })
-	db := testmysql.OpenDB(t, inst.DSN)
+	db := newTestDB(t)
 
 	m1 := NewManager(db,
 		WithLockName("drive9:test:exclusive"),
@@ -154,12 +154,7 @@ func TestLeaderCheckerInterface(t *testing.T) {
 
 func TestLeaderDirectDBCheck(t *testing.T) {
 	// Verify the GET_LOCK / RELEASE_LOCK primitives work as expected.
-	inst, err := testmysql.Start(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = inst.Close(context.Background()) })
-	db := testmysql.OpenDB(t, inst.DSN)
+	db := newTestDB(t)
 
 	ctx := context.Background()
 	conn1, err := db.Conn(ctx)
@@ -174,6 +169,19 @@ func TestLeaderDirectDBCheck(t *testing.T) {
 	}
 	if !got.Valid || got.Int64 != 1 {
 		t.Fatalf("GET_LOCK should return 1, got %+v", got)
+	}
+
+	// The owning connection ID should match what IS_USED_LOCK reports.
+	var connID int64
+	if err := conn1.QueryRowContext(ctx, connectionIDSQL).Scan(&connID); err != nil {
+		t.Fatal(err)
+	}
+	var ownerID sql.NullInt64
+	if err := conn1.QueryRowContext(ctx, isUsedLockSQL, "drive9:test:primitive").Scan(&ownerID); err != nil {
+		t.Fatal(err)
+	}
+	if !ownerID.Valid || ownerID.Int64 != connID {
+		t.Fatalf("IS_USED_LOCK owner %d should match CONNECTION_ID() %d", ownerID.Int64, connID)
 	}
 
 	// A second connection should fail to acquire the same lock.
@@ -191,15 +199,6 @@ func TestLeaderDirectDBCheck(t *testing.T) {
 		t.Fatal("second GET_LOCK should not acquire an already-held lock")
 	}
 
-	// IS_USED_LOCK should return a non-zero connection ID.
-	var ownerID sql.NullInt64
-	if err := conn1.QueryRowContext(ctx, isUsedLockSQL, "drive9:test:primitive").Scan(&ownerID); err != nil {
-		t.Fatal(err)
-	}
-	if !ownerID.Valid || ownerID.Int64 == 0 {
-		t.Fatal("IS_USED_LOCK should return the holding connection ID")
-	}
-
 	// Release.
 	var released sql.NullInt64
 	if err := conn1.QueryRowContext(ctx, releaseLockSQL, "drive9:test:primitive").Scan(&released); err != nil {
@@ -207,5 +206,47 @@ func TestLeaderDirectDBCheck(t *testing.T) {
 	}
 	if !released.Valid || released.Int64 != 1 {
 		t.Fatalf("RELEASE_LOCK should return 1, got %+v", released)
+	}
+}
+
+// TestLeaderCtxCancellation verifies that cancelling the parent context passed
+// to Start stops the election loop (the loop now derives workerCtx from ctx
+// rather than context.Background()).
+func TestLeaderCtxCancellation(t *testing.T) {
+	db := newTestDB(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m := NewManager(db,
+		WithLockName("drive9:test:ctx-cancel"),
+		WithHeartbeatInterval(100*time.Millisecond),
+	)
+	m.Start(ctx)
+	t.Cleanup(func() { m.Stop() })
+
+	// Wait for m to become leader.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if m.IsLeader() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !m.IsLeader() {
+		t.Fatal("m should become leader")
+	}
+
+	// Cancel the parent context; the election loop should exit and the manager
+	// should stop being leader once holdLeadership returns.
+	cancel()
+
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if !m.IsLeader() {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if m.IsLeader() {
+		t.Fatal("m should lose leadership after parent context cancellation")
 	}
 }

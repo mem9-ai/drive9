@@ -32,6 +32,10 @@ const (
 	isUsedLockSQL = "SELECT IS_USED_LOCK(?)"
 	// releaseLockSQL releases the named session lock.
 	releaseLockSQL = "SELECT RELEASE_LOCK(?)"
+	// connectionIDSQL returns the connection ID of the current session. Used to
+	// capture the owning connection ID right after GET_LOCK so holdLeadership can
+	// verify ownership via IS_USED_LOCK (split-brain defense).
+	connectionIDSQL = "SELECT CONNECTION_ID()"
 )
 
 // LeaderChecker is a minimal interface for callers that only need to query
@@ -50,10 +54,11 @@ type Manager struct {
 	interval time.Duration
 	disabled bool
 
-	mu       sync.Mutex
-	isLeader bool
-	onLead   func()
-	onLose   func()
+	mu        sync.Mutex
+	isLeader  bool
+	ownConnID int64 // connection ID of the pinned lock-holding conn; 0 if not held
+	onLead    func()
+	onLose    func()
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -91,6 +96,12 @@ func WithDisabled() Option {
 // WithCallbacks sets the leadership-change callbacks. OnLead is called when
 // this pod gains leadership; OnLose is called when it loses leadership.
 // Callbacks are invoked from the heartbeat goroutine and must be non-blocking.
+//
+// WithCallbacks and SetCallbacks are the same mechanism, differing only by when
+// they are applied (construction time vs post-construction). The last callback
+// pair registered before Start wins; callers that need to compose multiple
+// concerns should own a single callback pair (e.g. the server owns all
+// leader-gated worker start/stop) rather than registering competing pairs.
 func WithCallbacks(onLead, onLose func()) Option {
 	return func(m *Manager) {
 		m.onLead = onLead
@@ -101,7 +112,10 @@ func WithCallbacks(onLead, onLose func()) Option {
 // SetCallbacks sets the leadership-change callbacks. OnLead is called when
 // this pod gains leadership; OnLose is called when it loses leadership.
 // Callbacks are invoked from the heartbeat goroutine and must be non-blocking.
-// Must be called before Start.
+// Must be called before Start. Overwrites any callbacks registered via
+// WithCallbacks or a prior SetCallbacks — only one callback pair is active at
+// a time, so callers that need to compose multiple concerns should register a
+// single pair that fans out internally (see the comment on WithCallbacks).
 func (m *Manager) SetCallbacks(onLead, onLose func()) {
 	if m == nil {
 		return
@@ -159,11 +173,11 @@ func (m *Manager) Start(ctx context.Context) {
 		return
 	}
 
-	workerCtx, cancel := context.WithCancel(context.Background())
+	workerCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
 	m.done = make(chan struct{})
 
-	go m.run(workerCtx, ctx)
+	go m.run(workerCtx)
 }
 
 // Stop releases leadership (if held) and stops the heartbeat goroutine.
@@ -189,7 +203,7 @@ func (m *Manager) Stop() {
 	}
 }
 
-func (m *Manager) run(workerCtx context.Context, parentCtx context.Context) {
+func (m *Manager) run(workerCtx context.Context) {
 	defer close(m.done)
 
 	for {
@@ -232,6 +246,10 @@ func (m *Manager) run(workerCtx context.Context, parentCtx context.Context) {
 // tryAcquire attempts a non-blocking GET_LOCK. Returns (true, conn) if the
 // lock was acquired, (false, conn) if someone else holds it. The conn is
 // always returned (even on failure) and must be released by the caller.
+// When acquired, the owning connection ID is captured (via CONNECTION_ID())
+// on the same pinned conn so holdLeadership can verify ownership against
+// IS_USED_LOCK — a split-brain defense in case another session somehow
+// acquired the lock (session reuse, failover, etc.).
 func (m *Manager) tryAcquire(ctx context.Context) (bool, *sql.Conn, error) {
 	conn, err := m.db.Conn(ctx)
 	if err != nil {
@@ -245,13 +263,31 @@ func (m *Manager) tryAcquire(ctx context.Context) (bool, *sql.Conn, error) {
 	if !got.Valid || got.Int64 != 1 {
 		return false, conn, nil
 	}
+	// Capture the owning connection ID on the same pinned conn.
+	var connID int64
+	if err := conn.QueryRowContext(ctx, connectionIDSQL).Scan(&connID); err != nil {
+		_ = conn.Close()
+		return false, nil, err
+	}
+	m.mu.Lock()
+	m.ownConnID = connID
+	m.mu.Unlock()
 	return true, conn, nil
 }
 
 // holdLeadership periodically verifies that we still hold the named lock by
 // checking IS_USED_LOCK and keeping the connection alive. Returns when the
 // lock is lost or the context is cancelled.
+//
+// Ownership check: IS_USED_LOCK returns the connection ID of the current lock
+// holder. We compare it against ownConnID (captured in tryAcquire on the same
+// pinned conn). If they differ, another session now holds the lock (split-brain)
+// and we release leadership. NULL/0 is treated as lost as before.
 func (m *Manager) holdLeadership(ctx context.Context, conn *sql.Conn) {
+	m.mu.Lock()
+	ownConnID := m.ownConnID
+	m.mu.Unlock()
+
 	ticker := time.NewTicker(m.interval)
 	defer ticker.Stop()
 
@@ -272,6 +308,14 @@ func (m *Manager) holdLeadership(ctx context.Context, conn *sql.Conn) {
 				logger.Info(ctx, "leader_lock_lost",
 					zap.String("lock", m.lockName),
 					zap.String("reason", "is_used_lock_returned_null_or_zero"))
+				return
+			}
+			if ownConnID != 0 && ownerID.Int64 != ownConnID {
+				logger.Info(ctx, "leader_lock_lost",
+					zap.String("lock", m.lockName),
+					zap.String("reason", "lock_not_owned_by_this_connection"),
+					zap.Int64("owner_conn_id", ownerID.Int64),
+					zap.Int64("expected_conn_id", ownConnID))
 				return
 			}
 			// Keep the connection alive to prevent wait_timeout from closing it.
@@ -313,6 +357,7 @@ func (m *Manager) loseLeadership() {
 	m.mu.Lock()
 	wasLeader := m.isLeader
 	m.isLeader = false
+	m.ownConnID = 0
 	cb := m.onLose
 	m.mu.Unlock()
 	if wasLeader && cb != nil {
@@ -328,6 +373,7 @@ func (m *Manager) releaseLeadership() {
 	m.mu.Lock()
 	wasLeader := m.isLeader
 	m.isLeader = false
+	m.ownConnID = 0
 	cb := m.onLose
 	m.mu.Unlock()
 	if wasLeader && cb != nil {

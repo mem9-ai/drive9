@@ -55,6 +55,12 @@ type PoolConfig struct {
 
 	// LeaderChecker, when set, gates per-tenant FileGCWorker to run only on
 	// the leader pod. When nil, FileGCWorker starts unconditionally (single-pod).
+	//
+	// FileGC reacts to leadership transitions: the server calls StartAllFileGC
+	// on leadership gain and StopAllFileGC on loss, so cached backends created
+	// while this pod was a standby get FileGC once it becomes leader, and backends
+	// created while leader stop FileGC on loss. The shouldStartFileGC check at
+	// backend creation only handles the case where this pod is already leader.
 	LeaderChecker LeaderChecker
 }
 
@@ -68,6 +74,46 @@ type LeaderChecker interface {
 // this pod. When no leader checker is configured, FileGC starts unconditionally.
 func (p *Pool) shouldStartFileGC() bool {
 	return p.cfg.LeaderChecker == nil || p.cfg.LeaderChecker.IsLeader()
+}
+
+// StartAllFileGC starts the per-tenant FileGCWorker on every cached backend.
+// Called by the server's onLead callback so FileGC reacts to leadership gains
+// for backends created while this pod was a standby (which skipped FileGC at
+// creation time). Backends created after leadership is gained already start
+// FileGC in createBackend, so this only fills the gap for already-cached ones.
+func (p *Pool) StartAllFileGC() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	backends := make([]*backend.Dat9Backend, 0, len(p.items))
+	for _, e := range p.items {
+		backends = append(backends, e.backend)
+	}
+	p.mu.Unlock()
+	for _, b := range backends {
+		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+	}
+}
+
+// StopAllFileGC stops the per-tenant FileGCWorker on every cached backend.
+// Called by the server's onLose callback so FileGC reacts to leadership loss
+// for backends created while this pod was the leader (which started FileGC at
+// creation time). Stopping the worker cancels its context; a later leadership
+// regain re-starts it via StartAllFileGC.
+func (p *Pool) StopAllFileGC() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	backends := make([]*backend.Dat9Backend, 0, len(p.items))
+	for _, e := range p.items {
+		backends = append(backends, e.backend)
+	}
+	p.mu.Unlock()
+	for _, b := range backends {
+		b.StopFileGCWorker()
+	}
 }
 
 type Pool struct {

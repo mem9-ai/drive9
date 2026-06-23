@@ -244,6 +244,11 @@ func main() {
 			if v := envOr("DRIVE9_LEADER_HEARTBEAT_INTERVAL", ""); v != "" {
 				if d, err := time.ParseDuration(v); err == nil {
 					leaderOpts = append(leaderOpts, leader.WithHeartbeatInterval(d))
+				} else {
+					logger.Warn(context.Background(), "leader_heartbeat_interval_invalid_falling_back_to_default",
+						zap.String("env", "DRIVE9_LEADER_HEARTBEAT_INTERVAL"),
+						zap.String("value", v),
+						zap.Error(err))
 				}
 			}
 			leaderManager = leader.NewManager(store.DB(), leaderOpts...)
@@ -271,33 +276,12 @@ func main() {
 
 		pool.SetMetaStore(store)
 
-		// Gate mutation replay and expiry sweep workers behind leadership.
-		var replayWorker *backend.MutationReplayWorker
-		var expirySweepWorker *backend.ExpirySweepWorker
-		leaderManager.SetCallbacks(
-			func() {
-				replayWorker = backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(store))
-				expirySweepWorker = backend.StartExpirySweepWorker(store)
-			},
-			func() {
-				if replayWorker != nil {
-					replayWorker.Stop()
-					replayWorker = nil
-				}
-				if expirySweepWorker != nil {
-					expirySweepWorker.Stop()
-					expirySweepWorker = nil
-				}
-			},
-		)
-		defer func() {
-			if replayWorker != nil {
-				replayWorker.Stop()
-			}
-			if expirySweepWorker != nil {
-				expirySweepWorker.Stop()
-			}
-		}()
+		// The mutation replay and expiry sweep workers are owned by the server
+		// (started/stopped in its leader-gated startLeaderWorkers/stopLeaderWorkers),
+		// so they follow leadership transitions alongside the other leader-gated
+		// schedulers. main.go no longer registers a competing SetCallbacks pair
+		// (that earlier pair was clobbered by the server's own SetCallbacks and
+		// never fired).
 
 		// TODO: Run ValidateDurableAsyncExtractRequiresSemanticWorker only when this process
 		// can serve tenants that enqueue durable audio_extract_text / img_extract_text

@@ -69,9 +69,10 @@ type Config struct {
 	// TiDB EMBED_TEXT, but TiDB tenants still use the normal auto schema.
 	DisableDatabaseAutoEmbedding bool
 	// Leader, when set, gates background schedulers (semantic worker, object GC,
-	// tenant delete cleanup, pending tenant reconciler, and one-time resume tasks)
-	// to run only on the leader pod. When nil or disabled, all workers start
-	// unconditionally (single-pod mode).
+	// tenant delete cleanup, pending tenant reconciler, one-time resume tasks,
+	// central-quota mutation replay, upload-reservation expiry sweep, and
+	// per-tenant FileGC) to run only on the leader pod. When nil or disabled, all
+	// workers start unconditionally (single-pod mode).
 	Leader *leader.Manager
 }
 
@@ -132,10 +133,17 @@ type Server struct {
 	// changes, this context is cancelled and recreated. Workers that use it
 	// (pending tenant reconciler, tenant delete cleanup, one-time resume tasks)
 	// stop automatically on cancellation.
-	leaderWorkerCtx    context.Context
-	leaderWorkerCancel context.CancelFunc
-	leaderWorkerWG     sync.WaitGroup
-	leaderWorkerMu     sync.Mutex
+	leaderWorkerCtx      context.Context
+	leaderWorkerCancel   context.CancelFunc
+	leaderWorkerWG       sync.WaitGroup
+	leaderWorkerMu       sync.Mutex
+	leaderWorkersStarted bool
+	// replayWorker and expirySweepWorker are leader-gated central quota
+	// workers owned by the server (single callback owner). Started in
+	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
+	// leadership transitions rather than being wired separately in main.go.
+	replayWorker      *backend.MutationReplayWorker
+	expirySweepWorker *backend.ExpirySweepWorker
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -413,17 +421,21 @@ func (s *Server) Close() {
 
 // startLeaderWorkers launches the background schedulers that should run only
 // on the leader pod: the fork-worker group (pending tenant reconciler, tenant
-// delete cleanup, one-time resume tasks) plus the semantic and object GC
-// workers. Safe to call multiple times — each worker checks its own start guard.
+// delete cleanup, one-time resume tasks), the semantic and object GC workers,
+// and the central-quota mutation replay + expiry sweep workers. Safe to call
+// concurrently — the whole start sequence is serialized under leaderWorkerMu
+// and guarded by leaderWorkersStarted, so onLead racing with Close() cannot
+// double-start any worker.
 func (s *Server) startLeaderWorkers() {
+	s.leaderWorkerMu.Lock()
+	if s.leaderWorkersStarted {
+		s.leaderWorkerMu.Unlock()
+		return
+	}
+	s.leaderWorkersStarted = true
 	// Create a fresh leaderWorkerCtx for the fork-worker group and one-time
 	// resume tasks. These use leaderWorkerCtx (not forkWorkerCtx, which is
 	// reserved for API-triggered fork operations that must run on any pod).
-	s.leaderWorkerMu.Lock()
-	if s.leaderWorkerCancel != nil {
-		s.leaderWorkerMu.Unlock()
-		return // already started
-	}
 	leaderCtx, cancel := context.WithCancel(context.Background())
 	s.leaderWorkerCtx = leaderCtx
 	s.leaderWorkerCancel = cancel
@@ -470,6 +482,19 @@ func (s *Server) startLeaderWorkers() {
 			})
 		}
 	}
+	// Central-quota workers: the server owns these as the single leader-callback
+	// owner so they start/stop with leadership transitions (previously they were
+	// wired in main.go via a second SetCallbacks call that was clobbered by the
+	// server's own SetCallbacks).
+	if s.meta != nil {
+		s.replayWorker = backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(s.meta))
+		s.expirySweepWorker = backend.StartExpirySweepWorker(s.meta)
+	}
+	// Per-tenant FileGC: start on every cached backend so FileGC reacts to a
+	// leadership gain for backends created while this pod was a standby.
+	if s.pool != nil {
+		s.pool.StartAllFileGC()
+	}
 	if s.semanticWorker != nil {
 		s.semanticWorker.Start(backgroundWithTrace(leaderCtx))
 	}
@@ -479,16 +504,43 @@ func (s *Server) startLeaderWorkers() {
 }
 
 // stopLeaderWorkers stops the background schedulers started by startLeaderWorkers.
-// Called when the pod loses leadership or the server shuts down.
+// Called when the pod loses leadership or the server shuts down. The whole stop
+// sequence is serialized under leaderWorkerMu and guarded by leaderWorkersStarted,
+// so onLose (heartbeat goroutine) and Close() (main goroutine) cannot concurrently
+// double-stop a worker or race on the worker managers' own cancel fields.
 func (s *Server) stopLeaderWorkers() {
 	s.leaderWorkerMu.Lock()
+	if !s.leaderWorkersStarted {
+		s.leaderWorkerMu.Unlock()
+		return
+	}
+	s.leaderWorkersStarted = false
 	cancel := s.leaderWorkerCancel
 	s.leaderWorkerCancel = nil
+	replayWorker := s.replayWorker
+	s.replayWorker = nil
+	expirySweepWorker := s.expirySweepWorker
+	s.expirySweepWorker = nil
 	s.leaderWorkerMu.Unlock()
+
 	if cancel != nil {
 		cancel()
 	}
 	s.leaderWorkerWG.Wait()
+	// Stop the central-quota workers under the same serialized critical section
+	// (the worker managers' own cancel fields are not mutex-guarded, so we rely on
+	// leaderWorkersStarted to ensure Stop is called exactly once).
+	if replayWorker != nil {
+		replayWorker.Stop()
+	}
+	if expirySweepWorker != nil {
+		expirySweepWorker.Stop()
+	}
+	// Per-tenant FileGC: stop on every cached backend so FileGC reacts to a
+	// leadership loss for backends created while this pod was the leader.
+	if s.pool != nil {
+		s.pool.StopAllFileGC()
+	}
 	if s.semanticWorker != nil {
 		s.semanticWorker.Stop()
 	}
