@@ -651,6 +651,9 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 			if err != nil {
 				return "", err
 			}
+			if username == "" {
+				return "", fmt.Errorf("branch user prefix not yet available")
+			}
 			host := forkTenant.DBHost
 			port := forkTenant.DBPort
 			if host == "" {
