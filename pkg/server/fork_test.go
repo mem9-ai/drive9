@@ -341,7 +341,7 @@ func TestResumeProvisioningForkActivatesBranchBackedTenant(t *testing.T) {
 	rt.insertLiveTenant(t, "parent")
 	rt.insertForkTenant(t, "fork-provisioning", meta.TenantProvisioning, "branch-a")
 
-	rt.server.resumeProvisioningTenants()
+	rt.server.resumeProvisioningTenantsWithCtx(context.Background())
 
 	waitForCondition(t, func() bool {
 		got, err := rt.meta.GetTenant(context.Background(), "fork-provisioning")

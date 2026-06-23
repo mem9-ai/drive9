@@ -24,6 +24,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/embedding"
+	"github.com/mem9-ai/drive9/pkg/leader"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
@@ -67,6 +68,11 @@ type Config struct {
 	// DisableDatabaseAutoEmbedding suppresses runtime writes that would trigger
 	// TiDB EMBED_TEXT, but TiDB tenants still use the normal auto schema.
 	DisableDatabaseAutoEmbedding bool
+	// Leader, when set, gates background schedulers (semantic worker, object GC,
+	// tenant delete cleanup, pending tenant reconciler, and one-time resume tasks)
+	// to run only on the leader pod. When nil or disabled, all workers start
+	// unconditionally (single-pod mode).
+	Leader *leader.Manager
 }
 
 type SlockOAuthClient interface {
@@ -121,6 +127,15 @@ type Server struct {
 	forkWorkerMu        sync.Mutex
 	forkWorkerClosed    bool
 	schemaInitErrors    sync.Map
+	leader              *leader.Manager
+	// leaderWorkerCtx gates leader-only background schedulers. When leadership
+	// changes, this context is cancelled and recreated. Workers that use it
+	// (pending tenant reconciler, tenant delete cleanup, one-time resume tasks)
+	// stop automatically on cancellation.
+	leaderWorkerCtx    context.Context
+	leaderWorkerCancel context.CancelFunc
+	leaderWorkerWG     sync.WaitGroup
+	leaderWorkerMu     sync.Mutex
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -223,6 +238,7 @@ func NewWithConfig(cfg Config) *Server {
 		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
+		leader:              cfg.Leader,
 	}
 	mux := http.NewServeMux()
 
@@ -317,13 +333,6 @@ func NewWithConfig(cfg Config) *Server {
 	}
 
 	s.mux = mux
-	if s.meta != nil && s.pool != nil && s.provisioner != nil {
-		s.resumePendingTenants()
-		s.startPendingTenantReconciler()
-		s.resumeProvisioningTenants()
-		s.resumeDeletingForkTenants()
-		s.startTenantDeleteCleanup(backgroundWithTrace(context.Background()))
-	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
 	if s.semanticWorker != nil {
 		// Wire upload/write-commit kicks so freshly enqueued semantic tasks are
@@ -338,6 +347,8 @@ func NewWithConfig(cfg Config) *Server {
 			})
 		}
 	}
+	s.objectGCWorker = newObjectGCWorker(cfg.Meta, cfg.Pool)
+
 	appManagedTaskTypes := semanticWorkerLogTaskTypesFromTypes(appManagedSemanticTaskTypes(cfg.SemanticEmbedder))
 	var fallbackTaskTypes, poolAutoTaskTypes []string
 	if cfg.Backend != nil {
@@ -346,39 +357,27 @@ func NewWithConfig(cfg Config) *Server {
 	if cfg.Pool != nil {
 		poolAutoTaskTypes = semanticWorkerLogTaskTypesFromTypes(cfg.Pool.AutoSemanticTaskTypes())
 	}
-	if s.semanticWorker != nil {
-		fields := []zap.Field{
-			zap.Int("workers", s.semanticWorker.opts.Workers),
-			zap.Duration("poll_interval", s.semanticWorker.opts.PollInterval),
-			zap.Duration("lease_duration", s.semanticWorker.opts.LeaseDuration),
-			zap.Duration("recover_interval", s.semanticWorker.opts.RecoverInterval),
-			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
-			zap.Strings("app_managed_task_types", appManagedTaskTypes),
-			zap.Strings("fallback_task_types", fallbackTaskTypes),
-			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
-			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
-			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()),
+
+	// Gate background schedulers behind the leader manager when configured. When
+	// the leader is nil or disabled (single-pod mode), workers start immediately.
+	if s.leader != nil {
+		s.leader.SetCallbacks(s.onLead, s.onLose)
+		s.leader.Start(backgroundWithTrace(context.Background()))
+		// In disabled mode, Start calls onLead synchronously, which starts workers.
+		// In active mode, if this pod is already leader, onLead fires from the
+		// heartbeat goroutine. If not yet leader, workers stay stopped until
+		// leadership is gained.
+		if !s.leader.IsLeader() {
+			logger.Info("server_leader_standby",
+				zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
+				zap.Strings("app_managed_task_types", appManagedTaskTypes),
+				zap.Strings("fallback_task_types", fallbackTaskTypes),
+				zap.Strings("pool_auto_task_types", poolAutoTaskTypes))
 		}
-		fields = append(fields, s.semanticWorker.tenantScanLogFields()...)
-		logger.Info("server_semantic_workers_enabled", fields...)
-		s.semanticWorker.Start(backgroundWithTrace(context.Background()))
 	} else {
-		logger.Info("server_semantic_workers_disabled",
-			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
-			zap.Strings("app_managed_task_types", appManagedTaskTypes),
-			zap.Strings("fallback_task_types", fallbackTaskTypes),
-			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
-			zap.Bool("fallback_present", cfg.Backend != nil),
-			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
-			zap.Bool("pool_present", cfg.Pool != nil),
-			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
-	}
-	s.objectGCWorker = newObjectGCWorker(cfg.Meta, cfg.Pool)
-	if s.objectGCWorker != nil {
-		logger.Info("server_object_gc_worker_enabled")
-		s.objectGCWorker.Start(backgroundWithTrace(context.Background()))
-	} else {
-		logger.Info("server_object_gc_worker_disabled")
+		// No leader manager: single-pod mode, start workers immediately.
+		s.startLeaderWorkers()
+		s.logSemanticWorkerStatus(cfg, appManagedTaskTypes, fallbackTaskTypes, poolAutoTaskTypes)
 	}
 	return s
 }
@@ -399,10 +398,130 @@ func (s *Server) Close() {
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Stop()
 	}
+	s.stopLeaderWorkers()
+	s.leaderWorkerMu.Lock()
+	if s.leaderWorkerCancel != nil {
+		s.leaderWorkerCancel()
+	}
+	s.leaderWorkerMu.Unlock()
+	s.leaderWorkerWG.Wait()
+	if s.leader != nil {
+		s.leader.Stop()
+	}
 }
 
-func (s *Server) resumeProvisioningTenants() {
-	ctx := backgroundWithTrace(context.Background())
+// startLeaderWorkers launches the background schedulers that should run only
+// on the leader pod: the fork-worker group (pending tenant reconciler, tenant
+// delete cleanup, one-time resume tasks) plus the semantic and object GC
+// workers. Safe to call multiple times — each worker checks its own start guard.
+func (s *Server) startLeaderWorkers() {
+	// Create a fresh leaderWorkerCtx for the fork-worker group and one-time
+	// resume tasks. These use leaderWorkerCtx (not forkWorkerCtx, which is
+	// reserved for API-triggered fork operations that must run on any pod).
+	s.leaderWorkerMu.Lock()
+	if s.leaderWorkerCancel != nil {
+		s.leaderWorkerMu.Unlock()
+		return // already started
+	}
+	leaderCtx, cancel := context.WithCancel(context.Background())
+	s.leaderWorkerCtx = leaderCtx
+	s.leaderWorkerCancel = cancel
+	s.leaderWorkerMu.Unlock()
+
+	if s.meta != nil && s.pool != nil && s.provisioner != nil {
+		// One-time resume tasks (run in leader-gated goroutines).
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			s.resumePendingTenantsWithCtx(workerCtx)
+		})
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			s.resumeProvisioningTenantsWithCtx(workerCtx)
+		})
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			s.resumeDeletingForkTenantsWithCtx(workerCtx)
+		})
+		// Periodic tenant delete cleanup.
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(defaultTenantDeletePollInterval)
+			defer ticker.Stop()
+			s.processTenantDeleteJobs(workerCtx)
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.processTenantDeleteJobs(workerCtx)
+				}
+			}
+		})
+		// Periodic pending tenant reconciler.
+		if pendingTenantSweepEvery > 0 {
+			s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+				ticker := time.NewTicker(pendingTenantSweepEvery)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-workerCtx.Done():
+						return
+					case <-ticker.C:
+						s.resumePendingTenantsWithCtx(workerCtx)
+					}
+				}
+			})
+		}
+	}
+	if s.semanticWorker != nil {
+		s.semanticWorker.Start(backgroundWithTrace(leaderCtx))
+	}
+	if s.objectGCWorker != nil {
+		s.objectGCWorker.Start(backgroundWithTrace(leaderCtx))
+	}
+}
+
+// stopLeaderWorkers stops the background schedulers started by startLeaderWorkers.
+// Called when the pod loses leadership or the server shuts down.
+func (s *Server) stopLeaderWorkers() {
+	s.leaderWorkerMu.Lock()
+	cancel := s.leaderWorkerCancel
+	s.leaderWorkerCancel = nil
+	s.leaderWorkerMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	s.leaderWorkerWG.Wait()
+	if s.semanticWorker != nil {
+		s.semanticWorker.Stop()
+	}
+	if s.objectGCWorker != nil {
+		s.objectGCWorker.Stop()
+	}
+}
+
+// startLeaderGoroutine launches a goroutine that runs fn under the leader
+// worker context. The goroutine is tracked by leaderWorkerWG and stops when
+// leadership is lost (leaderWorkerCtx is cancelled).
+func (s *Server) startLeaderGoroutine(ctx context.Context, fn func(context.Context)) {
+	s.leaderWorkerWG.Add(1)
+	go func() {
+		defer s.leaderWorkerWG.Done()
+		fn(ctx)
+	}()
+}
+
+// resumePendingTenantsWithCtx lists pending tenants and reconciles stale ones.
+func (s *Server) resumePendingTenantsWithCtx(ctx context.Context) {
+	tenants, err := s.meta.ListTenantsByStatus(ctx, meta.TenantPending, 1000)
+	if err != nil {
+		logger.Error(ctx, "resume_pending_list_failed", zap.Error(err))
+		return
+	}
+	for i := range tenants {
+		s.reconcilePendingTenant(ctx, tenants[i])
+	}
+}
+
+// resumeProvisioningTenantsWithCtx resumes provisioning tenants that were
+// interrupted by a previous restart.
+func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 	tenants, err := s.meta.ListTenantsByStatus(ctx, meta.TenantProvisioning, 1000)
 	if err != nil {
 		logger.Error(ctx, "resume_provisioning_list_failed", zap.Error(err))
@@ -421,15 +540,64 @@ func (s *Server) resumeProvisioningTenants() {
 	}
 }
 
-func (s *Server) resumePendingTenants() {
-	ctx := backgroundWithTrace(context.Background())
-	tenants, err := s.meta.ListTenantsByStatus(ctx, meta.TenantPending, 1000)
-	if err != nil {
-		logger.Error(ctx, "resume_pending_list_failed", zap.Error(err))
-		return
+// resumeDeletingForkTenantsWithCtx resumes cleanup for deleting/failed fork tenants.
+func (s *Server) resumeDeletingForkTenantsWithCtx(ctx context.Context) {
+	for _, status := range []meta.TenantStatus{meta.TenantDeleting, meta.TenantFailed} {
+		tenants, err := s.meta.ListTenantsByStatus(ctx, status, 1000)
+		if err != nil {
+			logger.Error(ctx, "resume_fork_cleanup_list_failed", zap.String("status", string(status)), zap.Error(err))
+			continue
+		}
+		s.resumeForkCleanup(ctx, tenants)
 	}
-	for i := range tenants {
-		s.reconcilePendingTenant(ctx, tenants[i])
+}
+
+// onLead is the leader manager callback invoked when this pod gains leadership.
+func (s *Server) onLead() {
+	s.startLeaderWorkers()
+}
+
+// onLose is the leader manager callback invoked when this pod loses leadership.
+func (s *Server) onLose() {
+	s.stopLeaderWorkers()
+}
+
+// logSemanticWorkerStatus logs whether the semantic worker is enabled or disabled.
+// Called in single-pod mode (no leader manager) for backward-compatible logging.
+func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallbackTaskTypes, poolAutoTaskTypes []string) {
+	ctx := backgroundWithTrace(context.Background())
+	if s.semanticWorker != nil {
+		fields := []zap.Field{
+			zap.Int("workers", s.semanticWorker.opts.Workers),
+			zap.Duration("poll_interval", s.semanticWorker.opts.PollInterval),
+			zap.Duration("lease_duration", s.semanticWorker.opts.LeaseDuration),
+			zap.Duration("recover_interval", s.semanticWorker.opts.RecoverInterval),
+			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
+			zap.Strings("app_managed_task_types", appManagedTaskTypes),
+			zap.Strings("fallback_task_types", fallbackTaskTypes),
+			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
+			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
+			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()),
+		}
+		fields = append(fields, s.semanticWorker.tenantScanLogFields()...)
+		logger.Info(ctx, "server_semantic_workers_enabled", fields...)
+		s.semanticWorker.Start(ctx)
+	} else {
+		logger.Info(ctx, "server_semantic_workers_disabled",
+			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
+			zap.Strings("app_managed_task_types", appManagedTaskTypes),
+			zap.Strings("fallback_task_types", fallbackTaskTypes),
+			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
+			zap.Bool("fallback_present", cfg.Backend != nil),
+			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
+			zap.Bool("pool_present", cfg.Pool != nil),
+			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
+	}
+	if s.objectGCWorker != nil {
+		logger.Info(ctx, "server_object_gc_worker_enabled")
+		s.objectGCWorker.Start(ctx)
+	} else {
+		logger.Info(ctx, "server_object_gc_worker_disabled")
 	}
 }
 
@@ -443,26 +611,6 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
 		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.schemaInitForTenant(t.ID, t.Provider, s.provisioner.InitSchema))
 	})
-}
-
-func (s *Server) startPendingTenantReconciler() {
-	if s.forkWorkerCtx == nil || pendingTenantSweepEvery <= 0 {
-		return
-	}
-	s.forkWorkerWG.Add(1)
-	go func() {
-		defer s.forkWorkerWG.Done()
-		ticker := time.NewTicker(pendingTenantSweepEvery)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.forkWorkerCtx.Done():
-				return
-			case <-ticker.C:
-				s.resumePendingTenants()
-			}
-		}
-	}()
 }
 
 func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
