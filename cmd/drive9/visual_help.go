@@ -469,6 +469,29 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			},
 		},
 		{
+			Name:    "quota",
+			Args:    "<get|set> [flags]",
+			Summary: "query or set tenant quota",
+			Details: []string{
+				"get requires --tenant-id and TiDB Cloud keys; Drive9 API keys are not accepted",
+				"only TiDBCloud mode supports set; Drive9 API keys cannot authorize quota updates",
+			},
+			Flags: []visualHelpFlag{
+				{Name: "--server URL", Desc: "server URL; defaults to active context server"},
+				{Name: "--region-code CODE", Desc: "TiDBCloud mode region code; ignored when --server is set"},
+				{Name: "--tenant-id ID", Desc: "drive9 tenant id for quota query or set"},
+				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key"},
+				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key"},
+				{Name: "--max-storage-size Mi", Desc: "quota set: max confirmed+reserved storage size in Mi"},
+				{Name: "--tidbcloud-spending-limit N", Desc: "quota set: TiDB Cloud Cluster Spending Limit"},
+				{Name: "--json", Desc: "output result as JSON"},
+			},
+			Examples: []visualHelpExample{
+				{Command: "drive9 quota get --region-code aws-ap-southeast-1 --tenant-id tnt_xxx --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "query TiDBCloud mode tenant quota"},
+				{Command: "drive9 quota set --region-code aws-ap-southeast-1 --tenant-id tnt_xxx --max-storage-size 102400 --tidbcloud-spending-limit 10000 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "set TiDBCloud mode tenant quota"},
+			},
+		},
+		{
 			Name:    "ctx",
 			Args:    "<show|add|import|fork|ls|use|rm>",
 			Summary: "manage local drive9 contexts",

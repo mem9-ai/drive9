@@ -196,6 +196,7 @@ func MySQLNoEmbeddingTenantSchemaStatements() []string {
 		)`,
 		`CREATE INDEX idx_fs_events_created ON fs_events(created_at)`,
 	}
+	stmts = append(stmts, QuotaOutboxTiDBSchemaStatements()...)
 	stmts = append(stmts, GitWorkspaceTiDBSchemaStatements()...)
 	stmts = append(stmts, FSLayerTiDBSchemaStatements()...)
 	stmts = append(stmts, JournalTiDBSchemaStatements()...)
@@ -248,15 +249,17 @@ func ValidateMySQLNoEmbeddingTenantSchema(ctx context.Context, db *sql.DB) error
 		"fs_layer_checkpoints",
 		"journals",
 		"fs_events",
+		"quota_admission_locks",
+		"quota_outbox",
 	}
 	var count int
 	if err := db.QueryRowContext(ctx, `SELECT COUNT(*)
 			FROM information_schema.tables
 			WHERE table_schema = DATABASE()
-				AND table_name IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				AND table_name IN (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		required[0], required[1], required[2], required[3], required[4],
 		required[5], required[6], required[7], required[8], required[9],
-		required[10], required[11],
+		required[10], required[11], required[12], required[13],
 	).Scan(&count); err != nil {
 		return fmt.Errorf("validate local no-embedding schema: %w", err)
 	}

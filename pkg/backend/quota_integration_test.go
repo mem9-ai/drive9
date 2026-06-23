@@ -26,6 +26,25 @@ func newServerQuotaBackend(t *testing.T, opts Options) (*Dat9Backend, *fakeMetaQ
 	return b, fake
 }
 
+func waitForFakeCentralLLMUsage(t *testing.T, fake *fakeMetaQuotaStore, tenantID string, wantMonthly int64, wantUsageLen int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fake.mu.Lock()
+		gotMonthly := fake.monthly[tenantID]
+		gotUsageLen := len(fake.llmUsage)
+		fake.mu.Unlock()
+		if gotMonthly == wantMonthly && gotUsageLen == wantUsageLen {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("central llm usage monthly=%d len=%d, want monthly=%d len=%d",
+				gotMonthly, gotUsageLen, wantMonthly, wantUsageLen)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestServerQuotaFeatureFlagRejectsOverLimitWrite(t *testing.T) {
 	opts := Options{}
 	opts.QuotaSource = QuotaSourceServer
@@ -73,6 +92,7 @@ func TestServerModeBudgetGateWritesCentralOnly(t *testing.T) {
 	fake.mu.Lock()
 	fake.config["tenant-a"].MaxMonthlyCostMC = 100
 	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(context.Background())
 
 	b.recordImageExtractUsage("task-server-budget", ImageExtractUsage{
 		PromptTokens:     120,
@@ -87,16 +107,7 @@ func TestServerModeBudgetGateWritesCentralOnly(t *testing.T) {
 		t.Fatalf("tenant monthly llm cost = %d, want 0 in server mode", total)
 	}
 
-	fake.mu.Lock()
-	gotMonthly := fake.monthly["tenant-a"]
-	gotUsageLen := len(fake.llmUsage)
-	fake.mu.Unlock()
-	if gotMonthly != 200 {
-		t.Fatalf("central monthly llm cost = %d, want 200", gotMonthly)
-	}
-	if gotUsageLen != 1 {
-		t.Fatalf("central llm usage len = %d, want 1", gotUsageLen)
-	}
+	waitForFakeCentralLLMUsage(t, fake, "tenant-a", 200, 1)
 	if !b.monthlyLLMCostExceededCheck(context.Background()) {
 		t.Fatal("expected central monthly budget check to trip in server mode")
 	}

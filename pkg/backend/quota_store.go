@@ -5,6 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/mem9-ai/drive9/pkg/logger"
 )
 
 // MetaQuotaStore defines the interface for central quota operations on the
@@ -13,6 +17,7 @@ import (
 type MetaQuotaStore interface {
 	// Config
 	GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConfigView, error)
+	GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error)
 
 	// Counters
 	GetQuotaUsage(ctx context.Context, tenantID string) (*QuotaUsageView, error)
@@ -30,6 +35,7 @@ type MetaQuotaStore interface {
 	// File meta (server-authored shadow state)
 	UpsertFileMeta(ctx context.Context, fm *FileMetaView) error
 	GetFileMeta(ctx context.Context, tenantID, fileID string) (*FileMetaView, error)
+	GetFileMetaForUpdateTx(tx *sql.Tx, tenantID, fileID string) (*FileMetaView, error)
 	DeleteFileMeta(ctx context.Context, tenantID, fileID string) error
 	UpsertFileMetaTx(tx *sql.Tx, fm *FileMetaView) error
 	DeleteFileMetaTx(tx *sql.Tx, tenantID, fileID string) error
@@ -119,8 +125,14 @@ func (b *Dat9Backend) SetMetaQuotaStore(tenantID string, mqs MetaQuotaStore) {
 	b.tenantID = tenantID
 	b.metaStore = mqs
 	if mqs != nil && b.quotaSource == QuotaSourceServer {
-		b.qCache = newQuotaCache(tenantID, mqs)
+		if err := mqs.EnsureQuotaUsageRow(context.Background(), tenantID); err != nil {
+			logger.Warn(context.Background(), "ensure_quota_usage_row_failed",
+				zap.String("tenant_id", tenantID),
+				zap.Error(err))
+		}
+		b.quotaConfigCache = newQuotaConfigCache(tenantID, mqs)
 		b.startMutationWorker()
+		b.startQuotaOutboxWorker()
 	}
 }
 

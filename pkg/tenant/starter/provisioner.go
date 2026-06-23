@@ -140,7 +140,7 @@ func parseDefaultSpendLimit(raw string) (*int32, error) {
 	trimmed := strings.TrimSpace(raw)
 	monthly, err := strconv.ParseInt(trimmed, 10, 32)
 	if err != nil || monthly < 0 {
-		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer in USD cents", envTiDBSpendLimit, raw)
+		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer", envTiDBSpendLimit, raw)
 	}
 	out := int32(monthly)
 	return &out, nil

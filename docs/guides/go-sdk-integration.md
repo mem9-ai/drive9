@@ -6,6 +6,8 @@ filesystem workflows.
 
 For CLI parity analysis, see
 [`docs/guides/go-sdk-cli-parity.md`](go-sdk-cli-parity.md).
+For quota CLI and HTTP API usage, see
+[`docs/guides/quota.md`](quota.md).
 
 The Go module path is `github.com/mem9-ai/drive9`, so Go imports use
 `github.com/mem9-ai/drive9/pkg/client`.
@@ -79,6 +81,51 @@ func main() {
 Use `client.NewWithToken` only when you intentionally hold a delegated
 capability token, such as a vault JWT. Filesystem commands normally use
 `client.New`.
+
+## Quota API
+
+The SDK exposes typed quota helpers in `pkg/client`; with this guide's import
+alias they return `*drive9.QuotaResponse`. See
+[`docs/guides/quota.md`](quota.md) for the full CLI and HTTP reference.
+
+Query a `tidb_cloud_native` tenant:
+
+```go
+quota, err := drive9.New(serverURL, "").GetQuota(ctx, drive9.QuotaRequest{
+	TenantID:   "tnt_abc123",
+	PublicKey:  tidbCloudPublicKey,
+	PrivateKey: tidbCloudPrivateKey,
+})
+if err != nil {
+	return err
+}
+_ = quota.Config.MaxStorageSize
+_ = quota.Config.TiDBCloudSpendingLimit
+```
+
+Set quota for a `tidb_cloud_native` tenant with TiDB Cloud credentials.
+`MaxStorageSize` is in Mi. `TiDBCloudSpendingLimit` updates the TiDB Cloud
+Cluster Spending Limit.
+
+```go
+storageSize := int64(102400)
+spendingLimit := int64(10000)
+
+quota, err := drive9.New(serverURL, "").SetQuota(ctx, drive9.QuotaSetRequest{
+	TenantID:               "tnt_abc123",
+	PublicKey:              tidbCloudPublicKey,
+	PrivateKey:             tidbCloudPrivateKey,
+	MaxStorageSize:         &storageSize,
+	TiDBCloudSpendingLimit: &spendingLimit,
+})
+if err != nil {
+	return err
+}
+_ = quota
+```
+
+Quota query and update require TiDB Cloud API keys and a Drive9 tenant id. A
+Drive9 tenant API key cannot authorize quota operations for its own tenant.
 
 ## Run the included smoke test
 

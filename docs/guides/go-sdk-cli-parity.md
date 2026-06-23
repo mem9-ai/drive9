@@ -33,8 +33,9 @@ The Go SDK has typed coverage for these server-side surfaces:
 - Git workspace API: workspace metadata, tree, git state, object packs, overlay
   entries.
 - Journal API: create, append entries, read entries, search, verify.
-- Escape hatch: `RawGet`, `RawPost`, and `RawDelete` for endpoints that do not yet have a
-  typed SDK method.
+- Quota API: TiDB Cloud quota query and update.
+- Escape hatch: `RawGet`, `RawPost`, and `RawDelete` for endpoints that do not
+  yet have a typed SDK method, including provisioning endpoints.
 
 The compile-tested examples under `examples/go-sdk-cookbook` cover every
 exported `*client.Client` method and every exported `StreamWriter` method.
@@ -59,6 +60,7 @@ exported `*client.Client` method and every exported `StreamWriter` method.
 | `pack` / `unpack` | local archive creation/extraction, profile-aware include/exclude rules, mounted-path discovery | SDK only reads/writes archive objects | No SDK pack/unpack workflow or profile parser. |
 | `profile` | built-in and user profile loading/formatting | CLI-only | No SDK profile API. |
 | `token issue/revoke` | `--allow prefix:ops` grammar, TTL parsing, local context save, rollback revoke if save fails, stdin/file revoke | SDK has issue/revoke API methods | No SDK helper for CLI grammar or local context persistence. |
+| `quota get/set` | TiDB Cloud quota query and TiDB Cloud-only quota update, human/JSON output, local credential resolution | SDK has typed quota request/response helpers | No CLI-style formatter, region-code server selection helper, or local context/env credential resolver in the SDK. |
 | `vault set/get/put/with/ls/rm/grant/revoke/audit` | path grammar, field parsing (`field=value`, `@file`, stdin), dotenv/JSON output, `put --from`, secure env injection into child process | SDK has raw vault API methods | No SDK helper for CLI UX, batch directory import, or `vault with` process execution. |
 | `journal new/append/cat/find/verify` | flag parsing, JSONL/stdin parsing, idempotency-key defaults, human/JSON output | SDK has journal API methods | No SDK helper for CLI input/output formats. |
 | `git clone --fast` | local `git` orchestration, worktree setup, GitHub tree-size enrichment, local `.git` archiving, hydration | SDK has server-side git workspace/tree/state/object/overlay APIs | No SDK one-shot fast-clone workflow. |

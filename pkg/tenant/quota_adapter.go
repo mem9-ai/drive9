@@ -38,6 +38,10 @@ func (a *metaQuotaAdapter) GetQuotaConfig(ctx context.Context, tenantID string) 
 	}, nil
 }
 
+func (a *metaQuotaAdapter) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
+	return a.s.GetQuotaConfigVersion(ctx, tenantID)
+}
+
 func (a *metaQuotaAdapter) GetQuotaUsage(ctx context.Context, tenantID string) (*backend.QuotaUsageView, error) {
 	u, err := a.s.GetQuotaUsage(ctx, tenantID)
 	if err != nil {
@@ -48,6 +52,19 @@ func (a *metaQuotaAdapter) GetQuotaUsage(ctx context.Context, tenantID string) (
 		StorageBytes:   u.StorageBytes,
 		ReservedBytes:  u.ReservedBytes,
 		MediaFileCount: u.MediaFileCount,
+	}, nil
+}
+
+func (a *metaQuotaAdapter) GetFileMetaForUpdateTx(tx *sql.Tx, tenantID, fileID string) (*backend.FileMetaView, error) {
+	fm, err := a.s.GetFileMetaForUpdateTx(tx, tenantID, fileID)
+	if err != nil {
+		return nil, err
+	}
+	return &backend.FileMetaView{
+		TenantID:  fm.TenantID,
+		FileID:    fm.FileID,
+		SizeBytes: fm.SizeBytes,
+		IsMedia:   fm.IsMedia,
 	}, nil
 }
 

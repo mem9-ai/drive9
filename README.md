@@ -244,6 +244,7 @@ cat ~/drive9/run-42.txt
 - [LayerFS V1 design](docs/design/layered-filesystem-v1-design.md)
 - [Pack/unpack profile spec](docs/design/pack-unpack-profile-spec.md)
 - [Git fast clone workspace design](docs/design/git-fast-clone-workspace.md)
+- [Quota CLI and API guide](docs/guides/quota.md)
 - [Go SDK integration guide](docs/guides/go-sdk-integration.md)
 - [Go SDK vs CLI parity notes](docs/guides/go-sdk-cli-parity.md)
 - [Vault quickstart](docs/guides/vault-quickstart.md)

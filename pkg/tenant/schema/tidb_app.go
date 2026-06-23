@@ -165,6 +165,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 		)`,
 		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
 	}
+	stmts = append(stmts, QuotaOutboxTiDBSchemaStatements()...)
 	stmts = append(stmts, GitWorkspaceTiDBSchemaStatements()...)
 	stmts = append(stmts, FSLayerTiDBSchemaStatements()...)
 	stmts = append(stmts, JournalTiDBSchemaStatements()...)

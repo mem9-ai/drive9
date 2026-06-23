@@ -188,8 +188,8 @@ type FileInfo struct {
 	Name       string `json:"name"`
 	Size       int64  `json:"size"`
 	IsDir      bool   `json:"isDir"`
-	Mtime      int64  `json:"mtime,omitempty"`      // Unix seconds, 0 means unknown
-	Revision   int64  `json:"revision,omitempty"`    // file revision from server; 0 means unknown (old server)
+	Mtime      int64  `json:"mtime,omitempty"`    // Unix seconds, 0 means unknown
+	Revision   int64  `json:"revision,omitempty"` // file revision from server; 0 means unknown (old server)
 	Mode       uint32 `json:"mode,omitempty"`
 	HasMode    bool   `json:"hasMode"`
 	ResourceID string `json:"resource_id,omitempty"`
