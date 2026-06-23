@@ -179,9 +179,7 @@ func quotaSet(args []string) error {
 	publicKeyGiven := false
 	privateKeyFlag := ""
 	privateKeyGiven := false
-	var maxStorageBytes *int64
-	var maxMediaLLMFiles *int64
-	var maxMonthlyCostMC *int64
+	var maxStorageSize *int64
 	asJSON := false
 
 	for i := 0; i < len(args); i++ {
@@ -224,36 +222,22 @@ func quotaSet(args []string) error {
 			i++
 			privateKeyFlag = args[i]
 			privateKeyGiven = true
+		case "--max-storage-size":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--max-storage-size requires an argument")
+			}
+			i++
+			v, err := parseQuotaInt64Flag("--max-storage-size", args[i])
+			if err != nil {
+				return err
+			}
+			maxStorageSize = &v
 		case "--max-storage-bytes":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--max-storage-bytes requires an argument")
-			}
-			i++
-			v, err := parseQuotaInt64Flag("--max-storage-bytes", args[i])
-			if err != nil {
-				return err
-			}
-			maxStorageBytes = &v
+			return fmt.Errorf("--max-storage-bytes is no longer supported; use --max-storage-size with a Mi value")
 		case "--max-media-llm-files":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--max-media-llm-files requires an argument")
-			}
-			i++
-			v, err := parseQuotaInt64Flag("--max-media-llm-files", args[i])
-			if err != nil {
-				return err
-			}
-			maxMediaLLMFiles = &v
+			return fmt.Errorf("--max-media-llm-files is not supported by quota set")
 		case "--max-monthly-cost-mc":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--max-monthly-cost-mc requires an argument")
-			}
-			i++
-			v, err := parseQuotaInt64Flag("--max-monthly-cost-mc", args[i])
-			if err != nil {
-				return err
-			}
-			maxMonthlyCostMC = &v
+			return fmt.Errorf("--max-monthly-cost-mc is not supported by quota set")
 		case "--json":
 			asJSON = true
 		default:
@@ -275,8 +259,8 @@ func quotaSet(args []string) error {
 	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
 		return err
 	}
-	if maxStorageBytes == nil && maxMediaLLMFiles == nil && maxMonthlyCostMC == nil {
-		return fmt.Errorf("quota set requires at least one quota flag")
+	if maxStorageSize == nil {
+		return fmt.Errorf("quota set requires --max-storage-size")
 	}
 
 	r := ResolveCredentials()
@@ -299,12 +283,10 @@ func quotaSet(args []string) error {
 		return err
 	}
 	out, err := client.New(server, "").SetQuotaWithCredentials(context.Background(), client.QuotaSetRequest{
-		TenantID:         cred.TenantID,
-		PublicKey:        cred.PublicKey,
-		PrivateKey:       cred.PrivateKey,
-		MaxStorageBytes:  maxStorageBytes,
-		MaxMediaLLMFiles: maxMediaLLMFiles,
-		MaxMonthlyCostMC: maxMonthlyCostMC,
+		TenantID:       cred.TenantID,
+		PublicKey:      cred.PublicKey,
+		PrivateKey:     cred.PrivateKey,
+		MaxStorageSize: maxStorageSize,
 	})
 	if err != nil {
 		return quotaAPIError("set quota", err)
@@ -377,8 +359,7 @@ func printQuotaCLIResponse(out *client.QuotaResponse, asJSON bool) error {
 	fmt.Printf("provider: %s\n", out.Provider)
 	fmt.Printf("status: %s\n", out.Status)
 	fmt.Printf("supports_update: %t\n", out.SupportsUpdate)
-	fmt.Printf("config: max_storage_bytes=%d max_media_llm_files=%d max_monthly_cost_mc=%d\n",
-		out.Config.MaxStorageBytes, out.Config.MaxMediaLLMFiles, out.Config.MaxMonthlyCostMC)
+	fmt.Printf("config: max_storage_size=%dMi\n", out.Config.MaxStorageSize)
 	fmt.Printf("usage: storage_bytes=%d reserved_bytes=%d media_file_count=%d monthly_cost_mc=%d\n",
 		out.Usage.StorageBytes, out.Usage.ReservedBytes, out.Usage.MediaFileCount, out.Usage.MonthlyCostMC)
 	return nil
@@ -423,8 +404,6 @@ flags:
   --tenant-id ID                  drive9 tenant id
   --tidbcloud-public-key KEY      TiDB Cloud public key
   --tidbcloud-private-key KEY     TiDB Cloud private key
-  --max-storage-bytes BYTES       max confirmed+reserved storage bytes
-  --max-media-llm-files N         max media files eligible for LLM processing
-  --max-monthly-cost-mc N         max monthly LLM cost in millicents; 0 disables
+  --max-storage-size Mi           max confirmed+reserved storage size in Mi
   --json                          output result as JSON`
 }

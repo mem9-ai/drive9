@@ -482,14 +482,12 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "--tenant-id ID", Desc: "drive9 tenant id for TiDB Cloud credential query or set"},
 				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key"},
 				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key"},
-				{Name: "--max-storage-bytes BYTES", Desc: "quota set: max confirmed+reserved storage bytes"},
-				{Name: "--max-media-llm-files N", Desc: "quota set: max media files eligible for LLM processing"},
-				{Name: "--max-monthly-cost-mc N", Desc: "quota set: max monthly LLM cost in millicents"},
+				{Name: "--max-storage-size Mi", Desc: "quota set: max confirmed+reserved storage size in Mi"},
 				{Name: "--json", Desc: "output result as JSON"},
 			},
 			Examples: []visualHelpExample{
 				{Command: "drive9 quota get", Desc: "query the active tenant quota"},
-				{Command: "drive9 quota set --region-code aws-ap-southeast-1 --tenant-id tnt_xxx --max-storage-bytes 107374182400 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "set TiDBCloud mode tenant storage quota"},
+				{Command: "drive9 quota set --region-code aws-ap-southeast-1 --tenant-id tnt_xxx --max-storage-size 102400 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "set TiDBCloud mode tenant storage quota"},
 			},
 		},
 		{

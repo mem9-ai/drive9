@@ -112,20 +112,17 @@ if err != nil {
 _ = quota
 ```
 
-Set quota for a `tidb_cloud_native` tenant with TiDB Cloud credentials:
+Set storage quota for a `tidb_cloud_native` tenant with TiDB Cloud credentials.
+`MaxStorageSize` is in Mi.
 
 ```go
-storageBytes := int64(107374182400)
-mediaFiles := int64(500)
-monthlyCost := int64(0) // disables the monthly LLM budget
+storageSize := int64(102400)
 
 quota, err := drive9.New(serverURL, "").SetQuotaWithCredentials(ctx, drive9.QuotaSetRequest{
-	TenantID:            "tnt_abc123",
-	PublicKey:           tidbCloudPublicKey,
-	PrivateKey:          tidbCloudPrivateKey,
-	MaxStorageBytes:     &storageBytes,
-	MaxMediaLLMFiles:    &mediaFiles,
-	MaxMonthlyCostMC:    &monthlyCost,
+	TenantID:       "tnt_abc123",
+	PublicKey:      tidbCloudPublicKey,
+	PrivateKey:     tidbCloudPrivateKey,
+	MaxStorageSize: &storageSize,
 })
 if err != nil {
 	return err

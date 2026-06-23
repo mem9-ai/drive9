@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -134,7 +135,7 @@ func TestQuotaOwnerGetReturnsConfigAndUsage(t *testing.T) {
 	ctx := context.Background()
 	if err := rt.meta.SetQuotaConfig(ctx, &meta.QuotaConfig{
 		TenantID:         rt.tenantID,
-		MaxStorageBytes:  1234,
+		MaxStorageBytes:  123 * quotaStorageSizeBytes,
 		MaxMediaLLMFiles: 56,
 		MaxMonthlyCostMC: 789,
 	}); err != nil {
@@ -165,18 +166,36 @@ func TestQuotaOwnerGetReturnsConfigAndUsage(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var out quotaResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.Unmarshal(raw, &out); err != nil {
 		t.Fatal(err)
 	}
 	if out.TenantID != rt.tenantID || !out.SupportsUpdate {
 		t.Fatalf("response tenant/update = %#v", out)
 	}
-	if out.Config.MaxStorageBytes != 1234 || out.Config.MaxMediaLLMFiles != 56 || out.Config.MaxMonthlyCostMC != 789 {
+	if out.Config.MaxStorageSize != 123 {
 		t.Fatalf("config = %#v", out.Config)
 	}
 	if out.Usage.StorageBytes != 321 || out.Usage.ReservedBytes != 11 || out.Usage.MediaFileCount != 7 || out.Usage.MonthlyCostMC != 99 {
 		t.Fatalf("usage = %#v", out.Usage)
+	}
+	var rawOut map[string]any
+	if err := json.Unmarshal(raw, &rawOut); err != nil {
+		t.Fatal(err)
+	}
+	config, ok := rawOut["config"].(map[string]any)
+	if !ok {
+		t.Fatalf("raw config = %#v", rawOut["config"])
+	}
+	if _, ok := config["max_media_llm_files"]; ok {
+		t.Fatalf("config unexpectedly exposed max_media_llm_files: %#v", config)
+	}
+	if _, ok := config["max_monthly_cost_mc"]; ok {
+		t.Fatalf("config unexpectedly exposed max_monthly_cost_mc: %#v", config)
 	}
 }
 
@@ -224,11 +243,10 @@ func TestQuotaSetCloudNativeUpdatesCredentialLabelBeforeConfig(t *testing.T) {
 	defer ts.Close()
 
 	resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
-		"tenant_id":           rt.tenantID,
-		"public_key":          "public-1",
-		"private_key":         "private-1",
-		"max_storage_bytes":   int64(1000),
-		"max_monthly_cost_mc": int64(0),
+		"tenant_id":        rt.tenantID,
+		"public_key":       "public-1",
+		"private_key":      "private-1",
+		"max_storage_size": int64(1000),
 	}, "")
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
@@ -241,7 +259,7 @@ func TestQuotaSetCloudNativeUpdatesCredentialLabelBeforeConfig(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MaxStorageBytes != 1000 || cfg.MaxMediaLLMFiles != 200 || cfg.MaxMonthlyCostMC != 0 {
+	if cfg.MaxStorageBytes != 1000*quotaStorageSizeBytes || cfg.MaxMediaLLMFiles != 200 || cfg.MaxMonthlyCostMC != 300 {
 		t.Fatalf("cfg = %#v", cfg)
 	}
 }
@@ -252,8 +270,8 @@ func TestQuotaSetRejectsDrive9KeyWithoutTiDBCloudCredentials(t *testing.T) {
 	defer ts.Close()
 
 	resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
-		"tenant_id":         rt.tenantID,
-		"max_storage_bytes": int64(1000),
+		"tenant_id":        rt.tenantID,
+		"max_storage_size": int64(1000),
 	}, rt.apiKey)
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusBadRequest {
@@ -277,10 +295,10 @@ func TestQuotaSetRejectsNonCloudNativeTenant(t *testing.T) {
 	defer ts.Close()
 
 	resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
-		"tenant_id":         rt.tenantID,
-		"public_key":        "public-1",
-		"private_key":       "private-1",
-		"max_storage_bytes": int64(1000),
+		"tenant_id":        rt.tenantID,
+		"public_key":       "public-1",
+		"private_key":      "private-1",
+		"max_storage_size": int64(1000),
 	}, "")
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusConflict {
@@ -307,10 +325,10 @@ func TestQuotaSetMapsTiDBCloudCredentialErrorsWithoutWritingConfig(t *testing.T)
 			defer ts.Close()
 
 			resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
-				"tenant_id":         rt.tenantID,
-				"public_key":        "public-1",
-				"private_key":       "private-1",
-				"max_storage_bytes": int64(1000),
+				"tenant_id":        rt.tenantID,
+				"public_key":       "public-1",
+				"private_key":      "private-1",
+				"max_storage_size": int64(1000),
 			}, "")
 			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode != tc.wantStatus {

@@ -10,9 +10,7 @@ import (
 
 // QuotaConfig is the tenant quota configuration returned by the quota API.
 type QuotaConfig struct {
-	MaxStorageBytes  int64 `json:"max_storage_bytes"`
-	MaxMediaLLMFiles int64 `json:"max_media_llm_files"`
-	MaxMonthlyCostMC int64 `json:"max_monthly_cost_mc"`
+	MaxStorageSize int64 `json:"max_storage_size"`
 }
 
 // QuotaUsage is the tenant's current quota usage counters.
@@ -42,14 +40,12 @@ type QuotaCredentialRequest struct {
 }
 
 // QuotaSetRequest updates cloud-native tenant quota with TiDB Cloud API
-// credentials. Nil quota fields are omitted and left unchanged by the server.
+// credentials. MaxStorageSize is expressed in Mi.
 type QuotaSetRequest struct {
-	TenantID         string `json:"tenant_id"`
-	PublicKey        string `json:"public_key"`
-	PrivateKey       string `json:"private_key"`
-	MaxStorageBytes  *int64 `json:"max_storage_bytes,omitempty"`
-	MaxMediaLLMFiles *int64 `json:"max_media_llm_files,omitempty"`
-	MaxMonthlyCostMC *int64 `json:"max_monthly_cost_mc,omitempty"`
+	TenantID       string `json:"tenant_id"`
+	PublicKey      string `json:"public_key"`
+	PrivateKey     string `json:"private_key"`
+	MaxStorageSize *int64 `json:"max_storage_size,omitempty"`
 }
 
 // GetQuota queries quota for the tenant represented by the client's owner API

@@ -231,7 +231,7 @@ func ExampleClient_quota() {
 	owner := drive9.New(serverURL, "owner-api-key")
 	quota, err := owner.GetQuota(ctx)
 	if err == nil {
-		_ = quota.Config.MaxStorageBytes
+		_ = quota.Config.MaxStorageSize
 	}
 
 	tidbCloudPublicKey := "tidbcloud-public-key"
@@ -245,14 +245,12 @@ func ExampleClient_quota() {
 		PrivateKey: tidbCloudPrivateKey,
 	})
 
-	storageBytes := int64(100 << 30)
-	monthlyCost := int64(0)
+	storageSize := int64(100 * 1024) // Mi
 	_, _ = credentialClient.SetQuotaWithCredentials(ctx, drive9.QuotaSetRequest{
-		TenantID:         tenantID,
-		PublicKey:        tidbCloudPublicKey,
-		PrivateKey:       tidbCloudPrivateKey,
-		MaxStorageBytes:  &storageBytes,
-		MaxMonthlyCostMC: &monthlyCost,
+		TenantID:       tenantID,
+		PublicKey:      tidbCloudPublicKey,
+		PrivateKey:     tidbCloudPrivateKey,
+		MaxStorageSize: &storageSize,
 	})
 }
 

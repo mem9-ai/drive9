@@ -14,12 +14,10 @@ import (
 )
 
 type quotaRequest struct {
-	TenantID         string `json:"tenant_id"`
-	PublicKey        string `json:"public_key"`
-	PrivateKey       string `json:"private_key"`
-	MaxStorageBytes  *int64 `json:"max_storage_bytes,omitempty"`
-	MaxMediaLLMFiles *int64 `json:"max_media_llm_files,omitempty"`
-	MaxMonthlyCostMC *int64 `json:"max_monthly_cost_mc,omitempty"`
+	TenantID       string `json:"tenant_id"`
+	PublicKey      string `json:"public_key"`
+	PrivateKey     string `json:"private_key"`
+	MaxStorageSize *int64 `json:"max_storage_size,omitempty"`
 }
 
 type quotaResponse struct {
@@ -32,9 +30,7 @@ type quotaResponse struct {
 }
 
 type quotaConfigResponse struct {
-	MaxStorageBytes  int64 `json:"max_storage_bytes"`
-	MaxMediaLLMFiles int64 `json:"max_media_llm_files"`
-	MaxMonthlyCostMC int64 `json:"max_monthly_cost_mc"`
+	MaxStorageSize int64 `json:"max_storage_size"`
 }
 
 type quotaUsageResponse struct {
@@ -158,11 +154,14 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		writeQuotaCredentialError(w, err, "update")
 		return
 	}
+	maxStorageBytes, err := quotaStorageSizeToBytes(*req.MaxStorageSize)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	if err := s.meta.PatchQuotaConfig(r.Context(), &meta.QuotaConfigPatch{
-		TenantID:         t.ID,
-		MaxStorageBytes:  req.MaxStorageBytes,
-		MaxMediaLLMFiles: req.MaxMediaLLMFiles,
-		MaxMonthlyCostMC: req.MaxMonthlyCostMC,
+		TenantID:        t.ID,
+		MaxStorageBytes: &maxStorageBytes,
 	}); err != nil {
 		errJSON(w, http.StatusInternalServerError, "quota config update failed")
 		return
@@ -206,17 +205,14 @@ func quotaCredentials(req quotaRequest) (tenant.CredentialProvisionRequest, erro
 }
 
 func validateQuotaSetRequest(req quotaRequest) error {
-	if req.MaxStorageBytes == nil && req.MaxMediaLLMFiles == nil && req.MaxMonthlyCostMC == nil {
-		return fmt.Errorf("at least one quota field is required")
+	if req.MaxStorageSize == nil {
+		return fmt.Errorf("max_storage_size is required")
 	}
-	if req.MaxStorageBytes != nil && *req.MaxStorageBytes <= 0 {
-		return fmt.Errorf("max_storage_bytes must be positive")
+	if *req.MaxStorageSize <= 0 {
+		return fmt.Errorf("max_storage_size must be positive")
 	}
-	if req.MaxMediaLLMFiles != nil && *req.MaxMediaLLMFiles < 0 {
-		return fmt.Errorf("max_media_llm_files must be non-negative")
-	}
-	if req.MaxMonthlyCostMC != nil && *req.MaxMonthlyCostMC < 0 {
-		return fmt.Errorf("max_monthly_cost_mc must be non-negative")
+	if _, err := quotaStorageSizeToBytes(*req.MaxStorageSize); err != nil {
+		return err
 	}
 	return nil
 }
@@ -266,9 +262,7 @@ func (s *Server) writeQuotaResponse(w http.ResponseWriter, r *http.Request, t *m
 		Status:         string(t.Status),
 		SupportsUpdate: t.Provider == tenant.ProviderTiDBCloudNative,
 		Config: quotaConfigResponse{
-			MaxStorageBytes:  cfg.MaxStorageBytes,
-			MaxMediaLLMFiles: cfg.MaxMediaLLMFiles,
-			MaxMonthlyCostMC: cfg.MaxMonthlyCostMC,
+			MaxStorageSize: quotaStorageBytesToSize(cfg.MaxStorageBytes),
 		},
 		Usage: quotaUsageResponse{
 			StorageBytes:   usage.StorageBytes,
@@ -277,6 +271,23 @@ func (s *Server) writeQuotaResponse(w http.ResponseWriter, r *http.Request, t *m
 			MonthlyCostMC:  monthlyCost,
 		},
 	})
+}
+
+const quotaStorageSizeBytes int64 = 1024 * 1024
+
+func quotaStorageSizeToBytes(sizeMi int64) (int64, error) {
+	const maxInt64 = int64(1<<63 - 1)
+	if sizeMi > maxInt64/quotaStorageSizeBytes {
+		return 0, fmt.Errorf("max_storage_size is too large")
+	}
+	return sizeMi * quotaStorageSizeBytes, nil
+}
+
+func quotaStorageBytesToSize(sizeBytes int64) int64 {
+	if sizeBytes <= 0 {
+		return 0
+	}
+	return (sizeBytes + quotaStorageSizeBytes - 1) / quotaStorageSizeBytes
 }
 
 const quotaBackendNotFoundMessage = "backend service exception; please check TiDB Cloud starter/native cluster status"

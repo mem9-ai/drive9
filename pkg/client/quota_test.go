@@ -36,7 +36,7 @@ func TestGetQuotaSendsOwnerBearerAndDecodesResponse(t *testing.T) {
 	if resp.TenantID != "tenant-1" || !resp.SupportsUpdate {
 		t.Fatalf("response = %+v", resp)
 	}
-	if resp.Config.MaxStorageBytes != 1000 || resp.Usage.ReservedBytes != 2 {
+	if resp.Config.MaxStorageSize != 1000 || resp.Usage.ReservedBytes != 2 {
 		t.Fatalf("quota response = %+v", resp)
 	}
 }
@@ -86,8 +86,7 @@ func TestQueryQuotaWithCredentialsPostsBody(t *testing.T) {
 func TestSetQuotaWithCredentialsPostsPartialFieldsAndDecodesResponse(t *testing.T) {
 	t.Parallel()
 
-	storageBytes := int64(1000)
-	monthlyCost := int64(0)
+	storageSize := int64(1000)
 	var gotAuth string
 	var gotBody map[string]any
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -106,11 +105,10 @@ func TestSetQuotaWithCredentialsPostsPartialFieldsAndDecodesResponse(t *testing.
 	defer srv.Close()
 
 	resp, err := New(srv.URL, "").SetQuotaWithCredentials(context.Background(), QuotaSetRequest{
-		TenantID:         "tenant-1",
-		PublicKey:        "public-1",
-		PrivateKey:       "private-1",
-		MaxStorageBytes:  &storageBytes,
-		MaxMonthlyCostMC: &monthlyCost,
+		TenantID:       "tenant-1",
+		PublicKey:      "public-1",
+		PrivateKey:     "private-1",
+		MaxStorageSize: &storageSize,
 	})
 	if err != nil {
 		t.Fatalf("SetQuotaWithCredentials: %v", err)
@@ -118,11 +116,14 @@ func TestSetQuotaWithCredentialsPostsPartialFieldsAndDecodesResponse(t *testing.
 	if gotAuth != "" {
 		t.Fatalf("Authorization = %q, want empty", gotAuth)
 	}
-	if gotBody["max_storage_bytes"] != float64(1000) || gotBody["max_monthly_cost_mc"] != float64(0) {
+	if gotBody["max_storage_size"] != float64(1000) {
 		t.Fatalf("request body = %#v", gotBody)
 	}
 	if _, ok := gotBody["max_media_llm_files"]; ok {
 		t.Fatalf("request body unexpectedly included max_media_llm_files: %#v", gotBody)
+	}
+	if _, ok := gotBody["max_monthly_cost_mc"]; ok {
+		t.Fatalf("request body unexpectedly included max_monthly_cost_mc: %#v", gotBody)
 	}
 	if resp.Usage.MonthlyCostMC != 4 {
 		t.Fatalf("monthly cost = %d, want 4", resp.Usage.MonthlyCostMC)
@@ -158,9 +159,7 @@ func quotaClientTestResponse(tenantID string) map[string]any {
 		"status":          "active",
 		"supports_update": true,
 		"config": map[string]any{
-			"max_storage_bytes":   1000,
-			"max_media_llm_files": 50,
-			"max_monthly_cost_mc": 0,
+			"max_storage_size": 1000,
 		},
 		"usage": map[string]any{
 			"storage_bytes":    1,

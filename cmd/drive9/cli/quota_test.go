@@ -166,9 +166,7 @@ func TestQuotaSetSendsTiDBCloudCredentialBody(t *testing.T) {
 			"--tenant-id", "tenant-1",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
-			"--max-storage-bytes", "1000",
-			"--max-media-llm-files", "50",
-			"--max-monthly-cost-mc", "0",
+			"--max-storage-size", "1000",
 		})
 	}); err != nil {
 		t.Fatalf("Quota set: %v", err)
@@ -179,7 +177,7 @@ func TestQuotaSetSendsTiDBCloudCredentialBody(t *testing.T) {
 	if gotBody["tenant_id"] != "tenant-1" || gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
 		t.Fatalf("body credentials = %#v", gotBody)
 	}
-	if gotBody["max_storage_bytes"] != float64(1000) || gotBody["max_media_llm_files"] != float64(50) || gotBody["max_monthly_cost_mc"] != float64(0) {
+	if gotBody["max_storage_size"] != float64(1000) {
 		t.Fatalf("body quota = %#v", gotBody)
 	}
 }
@@ -231,7 +229,7 @@ func TestQuotaSetRegionCodeSelectsTiDBCloudServer(t *testing.T) {
 			"--tenant-id", "tenant-1",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
-			"--max-storage-bytes", "1000",
+			"--max-storage-size", "1000",
 		})
 	}); err != nil {
 		t.Fatalf("Quota set: %v", err)
@@ -245,7 +243,7 @@ func TestQuotaSetRegionCodeSelectsTiDBCloudServer(t *testing.T) {
 	if gotBody["tenant_id"] != "tenant-1" || gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
 		t.Fatalf("body credentials = %#v", gotBody)
 	}
-	if gotBody["max_storage_bytes"] != float64(1000) {
+	if gotBody["max_storage_size"] != float64(1000) {
 		t.Fatalf("body quota = %#v", gotBody)
 	}
 }
@@ -257,7 +255,7 @@ func TestQuotaSetRejectsMissingTiDBCloudCredentials(t *testing.T) {
 	err := Quota([]string{
 		"set",
 		"--tenant-id", "tenant-1",
-		"--max-storage-bytes", "1000",
+		"--max-storage-size", "1000",
 	})
 	if err == nil {
 		t.Fatal("Quota set error = nil, want missing credential error")
@@ -297,9 +295,7 @@ func quotaTestResponse(tenantID string) map[string]any {
 		"status":          "active",
 		"supports_update": true,
 		"config": map[string]any{
-			"max_storage_bytes":   1000,
-			"max_media_llm_files": 50,
-			"max_monthly_cost_mc": 0,
+			"max_storage_size": 1000,
 		},
 		"usage": map[string]any{
 			"storage_bytes":    1,

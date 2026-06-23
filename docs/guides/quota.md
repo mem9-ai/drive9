@@ -7,13 +7,11 @@ HTTP API.
 
 ## What quota tracks
 
-Drive9 exposes three tenant quota settings:
+Drive9 exposes one user-settable tenant quota setting:
 
 | Field | Meaning |
 | --- | --- |
-| `max_storage_bytes` | Maximum confirmed plus reserved file storage bytes. |
-| `max_media_llm_files` | Maximum image/audio files eligible for LLM extraction. `0` disables this file-count limit. |
-| `max_monthly_cost_mc` | Maximum monthly LLM cost in millicents. `0` disables the monthly LLM budget. |
+| `max_storage_size` | Maximum confirmed plus reserved file storage size, in Mi. |
 
 Quota responses also include usage counters:
 
@@ -63,7 +61,7 @@ tenant_id: tnt_abc123
 provider: tidb_cloud_native
 status: active
 supports_update: true
-config: max_storage_bytes=107374182400 max_media_llm_files=500 max_monthly_cost_mc=0
+config: max_storage_size=102400Mi
 usage: storage_bytes=1048576 reserved_bytes=0 media_file_count=12 monthly_cost_mc=350
 ```
 
@@ -98,7 +96,7 @@ Environment TiDB Cloud keys do not change plain `drive9 quota get` behavior.
 Credential-based quota query is selected only when `--tenant-id` is present.
 
 Set quota with `drive9 quota set`. Only TiDBCloud mode supports quota set.
-Pass at least one quota field.
+Pass `--max-storage-size` in Mi.
 
 ```bash
 drive9 quota set \
@@ -106,20 +104,7 @@ drive9 quota set \
   --tenant-id tnt_abc123 \
   --tidbcloud-public-key <tidbcloud-public-key> \
   --tidbcloud-private-key <tidbcloud-private-key> \
-  --max-storage-bytes 107374182400 \
-  --max-media-llm-files 500 \
-  --max-monthly-cost-mc 0
-```
-
-Partial updates preserve unspecified fields atomically.
-
-```bash
-drive9 quota set \
-  --region-code aws-ap-southeast-1 \
-  --tenant-id tnt_abc123 \
-  --tidbcloud-public-key <tidbcloud-public-key> \
-  --tidbcloud-private-key <tidbcloud-private-key> \
-  --max-storage-bytes 214748364800
+  --max-storage-size 102400
 ```
 
 Use `--server` instead of `--region-code` when targeting a known Drive9 server
@@ -127,10 +112,7 @@ URL directly. If both are present, `--server` wins.
 
 Validation rules:
 
-- `--max-storage-bytes` must be positive.
-- `--max-media-llm-files` must be non-negative.
-- `--max-monthly-cost-mc` must be non-negative. Use `0` to disable the monthly
-  LLM budget.
+- `--max-storage-size` must be positive.
 
 ## HTTP API
 
@@ -143,9 +125,7 @@ All quota endpoints return the same response shape:
   "status": "active",
   "supports_update": true,
   "config": {
-    "max_storage_bytes": 107374182400,
-    "max_media_llm_files": 500,
-    "max_monthly_cost_mc": 0
+    "max_storage_size": 102400
   },
   "usage": {
     "storage_bytes": 1048576,
@@ -199,14 +179,11 @@ curl -sS \
     "tenant_id": "tnt_abc123",
     "public_key": "<tidbcloud-public-key>",
     "private_key": "<tidbcloud-private-key>",
-    "max_storage_bytes": 107374182400,
-    "max_media_llm_files": 500,
-    "max_monthly_cost_mc": 0
+    "max_storage_size": 102400
   }'
 ```
 
-All quota fields are optional, but at least one must be present. Unspecified
-fields keep their current values.
+`max_storage_size` is required and must be a positive Mi value.
 
 ## Error responses
 
@@ -214,7 +191,7 @@ The quota API returns JSON errors through the standard server error shape.
 
 | Status | When it happens |
 | --- | --- |
-| `400 Bad Request` | Invalid JSON, missing `tenant_id`, missing or partial TiDB Cloud credentials, no quota field in a set request, or an invalid quota value. |
+| `400 Bad Request` | Invalid JSON, missing `tenant_id`, missing or partial TiDB Cloud credentials, missing `max_storage_size` in a set request, or an invalid quota value. |
 | `401 Unauthorized` | `GET /v1/quota` is missing a valid Drive9 owner API key. |
 | `403 Forbidden` | TiDB Cloud returns unauthorized or forbidden for the supplied API key. The message is `no permission to query quota with TiDB Cloud API key` or `no permission to update quota with TiDB Cloud API key`. |
 | `404 Not Found` | The Drive9 tenant does not exist, quota is not enabled on this server, or TiDB Cloud cannot find the backend cluster. For the backend-cluster case, check the TiDB Cloud starter/native cluster status. |
