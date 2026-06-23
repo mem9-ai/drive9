@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -573,7 +574,7 @@ func TestDeprovisionWithCredentialsDeletesCluster(t *testing.T) {
 	}
 }
 
-func TestUpdateQuotaMergesDrive9Labels(t *testing.T) {
+func TestMarkQuotaUpdatedMergesDrive9Labels(t *testing.T) {
 	var patchCalled bool
 	var gotAuth string
 	var gotPatch struct {
@@ -592,26 +593,14 @@ func TestUpdateQuotaMergesDrive9Labels(t *testing.T) {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
 		gotAuth = r.Header.Get("Authorization")
-		switch r.Method {
-		case http.MethodGet:
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"clusterId": "cluster-1",
-				"labels": map[string]string{
-					"environment":         "prod",
-					Drive9ManagedLabel:    "old",
-					Drive9TenantIDLabel:   "old-tenant",
-					"drive9.ai/unrelated": "keep",
-				},
-			})
-		case http.MethodPatch:
-			patchCalled = true
-			if err := json.NewDecoder(r.Body).Decode(&gotPatch); err != nil {
-				t.Fatalf("decode patch: %v", err)
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"clusterId": "cluster-1"})
-		default:
+		if r.Method != http.MethodPatch {
 			t.Fatalf("unexpected method %s", r.Method)
 		}
+		patchCalled = true
+		if err := json.NewDecoder(r.Body).Decode(&gotPatch); err != nil {
+			t.Fatalf("decode patch: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"clusterId": "cluster-1"})
 	}))
 	defer ts.Close()
 
@@ -619,18 +608,22 @@ func TestUpdateQuotaMergesDrive9Labels(t *testing.T) {
 		apiURL: ts.URL,
 		client: ts.Client(),
 	}
-	cfg, err := p.UpdateQuota(context.Background(), &tenant.ClusterInfo{
+	err := p.MarkQuotaUpdated(context.Background(), &tenant.ClusterInfo{
 		TenantID:  "tenant-1",
 		ClusterID: "cluster-1",
 	}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
-	}, tenant.QuotaUpdateOptions{})
+	}, &tenant.QuotaCloudConfig{
+		Labels: map[string]string{
+			"environment":         "prod",
+			Drive9ManagedLabel:    "old",
+			Drive9TenantIDLabel:   "old-tenant",
+			"drive9.ai/unrelated": "keep",
+		},
+	})
 	if err != nil {
-		t.Fatalf("UpdateQuota: %v", err)
-	}
-	if cfg == nil {
-		t.Fatal("quota cloud config is nil")
+		t.Fatalf("MarkQuotaUpdated: %v", err)
 	}
 	if !patchCalled {
 		t.Fatal("PATCH was not called")
@@ -653,15 +646,9 @@ func TestUpdateQuotaMergesDrive9Labels(t *testing.T) {
 	}
 }
 
-func TestUpdateQuotaPatchesSpendingLimitAfterLabels(t *testing.T) {
-	monthly := int64(20000)
+func TestUpdateQuotaPatchesSpendingLimitWithoutLabels(t *testing.T) {
+	monthly := int64(0)
 	var order []string
-	var gotLabelPatch struct {
-		Cluster struct {
-			Labels map[string]string `json:"labels"`
-		} `json:"cluster"`
-		UpdateMask string `json:"updateMask"`
-	}
 	var gotSpendingPatch struct {
 		Cluster struct {
 			SpendingLimit struct {
@@ -690,23 +677,17 @@ func TestUpdateQuotaPatchesSpendingLimitAfterLabels(t *testing.T) {
 				},
 			})
 		case http.MethodPatch:
-			var probe struct {
-				UpdateMask string `json:"updateMask"`
+			raw, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read patch body: %v", err)
 			}
-			dec := json.NewDecoder(r.Body)
-			switch {
-			case len(order) == 1:
-				if err := dec.Decode(&gotLabelPatch); err != nil {
-					t.Fatalf("decode label patch: %v", err)
-				}
-				probe.UpdateMask = gotLabelPatch.UpdateMask
-			default:
-				if err := dec.Decode(&gotSpendingPatch); err != nil {
-					t.Fatalf("decode spending patch: %v", err)
-				}
-				probe.UpdateMask = gotSpendingPatch.UpdateMask
+			if err := json.Unmarshal(raw, &gotSpendingPatch); err != nil {
+				t.Fatalf("decode spending patch: %v", err)
 			}
-			order = append(order, "PATCH "+probe.UpdateMask)
+			if gotSpendingPatch.UpdateMask != "spendingLimit.monthly" {
+				t.Fatalf("unexpected update mask %q", gotSpendingPatch.UpdateMask)
+			}
+			order = append(order, "PATCH "+gotSpendingPatch.UpdateMask)
 			_ = json.NewEncoder(w).Encode(map[string]any{"clusterId": "cluster-1"})
 		default:
 			t.Fatalf("unexpected method %s", r.Method)
@@ -730,11 +711,8 @@ func TestUpdateQuotaPatchesSpendingLimitAfterLabels(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UpdateQuota: %v", err)
 	}
-	if len(order) != 3 || order[0] != "GET" || order[1] != "PATCH labels" || order[2] != "PATCH spendingLimit.monthly" {
+	if len(order) != 2 || order[0] != "GET" || order[1] != "PATCH spendingLimit.monthly" {
 		t.Errorf("order = %#v", order)
-	}
-	if gotLabelPatch.Cluster.Labels[Drive9ManagedLabel] != "true" || gotLabelPatch.Cluster.Labels[Drive9TenantIDLabel] != "tenant-1" {
-		t.Errorf("label patch = %#v", gotLabelPatch)
 	}
 	if gotSpendingPatch.UpdateMask != "spendingLimit.monthly" || gotSpendingPatch.Cluster.SpendingLimit.Monthly != int32(monthly) {
 		t.Errorf("spending patch = %#v", gotSpendingPatch)
@@ -742,14 +720,74 @@ func TestUpdateQuotaPatchesSpendingLimitAfterLabels(t *testing.T) {
 	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly == nil || *cfg.TiDBCloudSpendingLimitMonthly != monthly {
 		t.Errorf("cloud config = %#v, want spending limit %d", cfg, monthly)
 	}
+	if cfg.Labels["environment"] != "prod" {
+		t.Errorf("cloud config labels = %#v", cfg.Labels)
+	}
 }
 
-func TestUpdateQuotaRejectsNonPositiveSpendingLimitBeforeRequest(t *testing.T) {
+func TestUpdateQuotaSkipsLabelPatchWhenSpendingLimitPatchFails(t *testing.T) {
+	monthly := int64(0)
+	var order []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/v1beta1/clusters/cluster-1" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		switch r.Method {
+		case http.MethodGet:
+			order = append(order, "GET")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-1",
+				"labels":    map[string]string{"environment": "prod"},
+			})
+		case http.MethodPatch:
+			var probe struct {
+				UpdateMask string `json:"updateMask"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&probe); err != nil {
+				t.Fatalf("decode patch probe: %v", err)
+			}
+			order = append(order, "PATCH "+probe.UpdateMask)
+			if probe.UpdateMask == "labels" {
+				t.Fatalf("label patch should not run after spending limit failure")
+			}
+			http.Error(w, "invalid spending limit", http.StatusBadRequest)
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	_, err := p.UpdateQuota(context.Background(), &tenant.ClusterInfo{
+		TenantID:  "tenant-1",
+		ClusterID: "cluster-1",
+	}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{
+		TiDBCloudSpendingLimitMonthly: &monthly,
+	})
+	if err == nil {
+		t.Fatal("UpdateQuota error = nil, want spending limit patch error")
+	}
+	if len(order) != 2 || order[0] != "GET" || order[1] != "PATCH spendingLimit.monthly" {
+		t.Fatalf("order = %#v", order)
+	}
+}
+
+func TestUpdateQuotaRejectsInvalidSpendingLimitBeforeRequest(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		monthly int64
 	}{
-		{name: "zero", monthly: 0},
 		{name: "negative", monthly: -1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -774,9 +812,9 @@ func TestUpdateQuotaRejectsNonPositiveSpendingLimitBeforeRequest(t *testing.T) {
 				TiDBCloudSpendingLimitMonthly: &tc.monthly,
 			})
 			if err == nil {
-				t.Fatal("UpdateQuota error = nil, want positive spending limit error")
+				t.Fatal("UpdateQuota error = nil, want spending limit validation error")
 			}
-			if !strings.Contains(err.Error(), "tidbcloud_spending_limit must be positive") {
+			if !strings.Contains(err.Error(), "tidbcloud_spending_limit must be non-negative") {
 				t.Fatalf("error = %q", err)
 			}
 			if hit {

@@ -178,6 +178,10 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if err := updater.MarkQuotaUpdated(r.Context(), clusterInfoFromTenant(t), cred, cloudCfg); err != nil {
+		writeQuotaCredentialError(w, r.Context(), err, "update")
+		return
+	}
 	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, classifyTenantRequest(r))
 	s.writeQuotaResponse(w, r, t, cloudCfg)
 }
@@ -224,8 +228,8 @@ func validateQuotaSetRequest(req quotaRequest) error {
 			return err
 		}
 	}
-	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit <= 0 {
-		return fmt.Errorf("tidbcloud_spending_limit must be positive")
+	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit < 0 {
+		return fmt.Errorf("tidbcloud_spending_limit must be non-negative")
 	}
 	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit > maxInt32 {
 		return fmt.Errorf("tidbcloud_spending_limit is too large")

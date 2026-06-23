@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -157,6 +158,7 @@ func TestQuotaSetAllowsSpendingLimitOnly(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)
 
+	spendingLimit := int64(0)
 	var gotBody map[string]any
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/quota" {
@@ -182,7 +184,7 @@ func TestQuotaSetAllowsSpendingLimitOnly(t *testing.T) {
 			"--tenant-id", "tenant-1",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
-			"--tidbcloud-spending-limit", "20000",
+			"--tidbcloud-spending-limit", strconv.FormatInt(spendingLimit, 10),
 		})
 	}); err != nil {
 		t.Fatalf("Quota set: %v", err)
@@ -190,7 +192,7 @@ func TestQuotaSetAllowsSpendingLimitOnly(t *testing.T) {
 	if _, ok := gotBody["max_storage_size"]; ok {
 		t.Fatalf("body should not contain max_storage_size: %#v", gotBody)
 	}
-	if gotBody["tidbcloud_spending_limit"] != float64(20000) {
+	if gotBody["tidbcloud_spending_limit"] != float64(spendingLimit) {
 		t.Fatalf("body spending limit = %#v", gotBody)
 	}
 }
@@ -338,7 +340,7 @@ func TestQuotaSetRejectsMissingQuotaKnob(t *testing.T) {
 	}
 }
 
-func TestQuotaSetRejectsNonPositiveQuotaValues(t *testing.T) {
+func TestQuotaSetRejectsInvalidQuotaValues(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		flag    string
@@ -347,8 +349,7 @@ func TestQuotaSetRejectsNonPositiveQuotaValues(t *testing.T) {
 	}{
 		{name: "zero_storage_size", flag: "--max-storage-size", value: "0", wantErr: "--max-storage-size must be positive"},
 		{name: "negative_storage_size", flag: "--max-storage-size", value: "-1", wantErr: "--max-storage-size must be positive"},
-		{name: "zero_spending_limit", flag: "--tidbcloud-spending-limit", value: "0", wantErr: "--tidbcloud-spending-limit must be positive"},
-		{name: "negative_spending_limit", flag: "--tidbcloud-spending-limit", value: "-1", wantErr: "--tidbcloud-spending-limit must be positive"},
+		{name: "negative_spending_limit", flag: "--tidbcloud-spending-limit", value: "-1", wantErr: "--tidbcloud-spending-limit must be non-negative"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("HOME", t.TempDir())

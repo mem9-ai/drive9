@@ -36,9 +36,11 @@ Only `tidb_cloud_native` tenants support quota update through this API. Other
 tenant providers use their configured defaults.
 
 When a quota update succeeds, Drive9 verifies the TiDB Cloud credentials by
-updating TiDB Cloud cluster labels. It then writes `max_storage_size` to the
-Drive9 meta store when that field is present, and patches the TiDB Cloud
-cluster Spending Limit when `tidbcloud_spending_limit` is present.
+reading the TiDB Cloud cluster. If `tidbcloud_spending_limit` is present, it
+patches the TiDB Cloud cluster Spending Limit next. If `max_storage_size` is
+present, Drive9 then writes it to the Drive9 meta store. After those updates
+succeed, Drive9 updates TiDB Cloud cluster labels to record the successful quota
+update.
 
 ## CLI
 
@@ -92,7 +94,8 @@ URL directly. If both are present, `--server` wins.
 Validation rules:
 
 - `--max-storage-size` must be positive.
-- `--tidbcloud-spending-limit` must be a positive 32-bit integer.
+- `--tidbcloud-spending-limit` must be a non-negative 32-bit integer. Drive9
+  passes `0` through to TiDB Cloud; TiDB Cloud may reject it.
 
 ## HTTP API
 
@@ -149,7 +152,9 @@ curl -sS \
 ```
 
 At least one of `max_storage_size` or `tidbcloud_spending_limit` is required;
-provided values must be positive.
+`max_storage_size` must be positive, and `tidbcloud_spending_limit` must be
+non-negative. Drive9 passes `tidbcloud_spending_limit: 0` through to TiDB
+Cloud; TiDB Cloud may reject it.
 
 ## Error responses
 

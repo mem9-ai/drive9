@@ -40,7 +40,7 @@ type QuotaRequest struct {
 	PrivateKey string `json:"private_key"`
 }
 
-// QuotaSetRequest updates cloud-native tenant quota with TiDB Cloud API
+// QuotaSetRequest updates TiDBCloud mode tenant quota with TiDB Cloud API
 // credentials. MaxStorageSize is expressed in Mi. TiDBCloudSpendingLimit is
 // the TiDB Cloud Cluster Spending Limit value passed through to TiDB Cloud.
 type QuotaSetRequest struct {

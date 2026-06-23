@@ -44,6 +44,7 @@ type CredentialProvisionRequest struct {
 
 type QuotaCloudConfig struct {
 	TiDBCloudSpendingLimitMonthly *int64
+	Labels                        map[string]string
 }
 
 type CredentialProvisioner interface {
@@ -59,6 +60,7 @@ type CredentialDeprovisioner interface {
 type QuotaUpdater interface {
 	Provisioner
 	UpdateQuota(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest, opts QuotaUpdateOptions) (*QuotaCloudConfig, error)
+	MarkQuotaUpdated(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest, cloudCfg *QuotaCloudConfig) error
 }
 
 type QuotaGetter interface {

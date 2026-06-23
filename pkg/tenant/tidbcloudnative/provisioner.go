@@ -472,15 +472,48 @@ func (p *Provisioner) UpdateQuota(ctx context.Context, cluster *tenant.ClusterIn
 	if err != nil {
 		return nil, fmt.Errorf("load cluster quota info: %w", err)
 	}
-	if labels == nil {
-		labels = make(map[string]string)
+	if cloudCfg == nil {
+		cloudCfg = &tenant.QuotaCloudConfig{}
+	}
+	cloudCfg.Labels = labels
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		monthly := *opts.TiDBCloudSpendingLimitMonthly
+		if err := p.updateSpendingLimitWithCredentials(ctx, publicKey, privateKey, clusterID, monthly); err != nil {
+			return nil, fmt.Errorf("update cluster spending limit: %w", err)
+		}
+		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(monthly)
+	}
+	return cloudCfg, nil
+}
+
+func (p *Provisioner) MarkQuotaUpdated(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, cloudCfg *tenant.QuotaCloudConfig) error {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return fmt.Errorf("cluster id is required")
+	}
+	clusterID := strings.TrimSpace(cluster.ClusterID)
+	labels := make(map[string]string)
+	if cloudCfg != nil {
+		for k, v := range cloudCfg.Labels {
+			labels[k] = v
+		}
 	}
 	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
 		labels[Drive9TenantIDLabel] = tenantID
 	}
 	labels[Drive9QuotaUpdateAtLabel] = time.Now().UTC().Format(time.RFC3339Nano)
+	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
+		return fmt.Errorf("update cluster quota labels: %w", err)
+	}
+	return nil
+}
 
+func (p *Provisioner) updateQuotaLabelsWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string, labels map[string]string) error {
 	body, err := json.Marshal(map[string]any{
 		"cluster": map[string]any{
 			"labels": labels,
@@ -488,32 +521,22 @@ func (p *Provisioner) UpdateQuota(ctx context.Context, cluster *tenant.ClusterIn
 		"updateMask": "labels",
 	})
 	if err != nil {
-		return nil, fmt.Errorf("marshal cluster label patch: %w", err)
+		return fmt.Errorf("marshal cluster label patch: %w", err)
 	}
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPatch, endpoint, body)
 	if err != nil {
-		return nil, fmt.Errorf("patch cluster labels: %w", err)
+		return fmt.Errorf("patch cluster labels: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
-			return nil, fmt.Errorf("read cluster label update error body: %w", readErr)
+			return fmt.Errorf("read cluster label update error body: %w", readErr)
 		}
-		return nil, quotaStatusError("cluster label update", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return quotaStatusError("cluster label update", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
-	if opts.TiDBCloudSpendingLimitMonthly != nil {
-		monthly := *opts.TiDBCloudSpendingLimitMonthly
-		if err := p.updateSpendingLimitWithCredentials(ctx, publicKey, privateKey, clusterID, monthly); err != nil {
-			return nil, fmt.Errorf("update cluster spending limit: %w", err)
-		}
-		if cloudCfg == nil {
-			cloudCfg = &tenant.QuotaCloudConfig{}
-		}
-		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(monthly)
-	}
-	return cloudCfg, nil
+	return nil
 }
 
 func (p *Provisioner) GetQuota(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.QuotaCloudConfig, error) {
@@ -596,8 +619,8 @@ func (p *Provisioner) updateSpendingLimitWithCredentials(ctx context.Context, pu
 
 func validateTiDBCloudSpendingLimit(monthly int64) error {
 	const maxInt32 = int64(1<<31 - 1)
-	if monthly <= 0 {
-		return fmt.Errorf("tidbcloud_spending_limit must be positive")
+	if monthly < 0 {
+		return fmt.Errorf("tidbcloud_spending_limit must be non-negative")
 	}
 	if monthly > maxInt32 {
 		return fmt.Errorf("tidbcloud_spending_limit is too large")
