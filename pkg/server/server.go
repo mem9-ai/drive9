@@ -599,7 +599,7 @@ func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 					zap.String("provider", t.Provider),
 					zap.String("cluster_id", t.ClusterID),
 					zap.String("branch_id", t.BranchID))
-				s.markForkFailedAndCleanup(ctx, t.ID)
+				s.markForkFailed(ctx, t.ID)
 				continue
 			}
 			s.startForkProvision(ctx, t.ID)

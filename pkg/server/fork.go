@@ -347,18 +347,18 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, err
 	}
 	if err := s.copyAutoEmbeddingProfileForFork(ctx, source.ID, forkID, source.Provider, now); err != nil {
-		s.markForkFailedAndCleanup(ctx, forkID)
+		s.markForkFailed(ctx, forkID)
 		return nil, err
 	}
 
 	apiToken, err := token.IssueToken(s.tokenSecret, forkID, 1)
 	if err != nil {
-		s.markForkFailedAndCleanup(ctx, forkID)
+		s.markForkFailed(ctx, forkID)
 		return nil, err
 	}
 	cipherToken, err := s.pool.Encrypt(ctx, []byte(apiToken))
 	if err != nil {
-		s.markForkFailedAndCleanup(ctx, forkID)
+		s.markForkFailed(ctx, forkID)
 		return nil, err
 	}
 	if err := s.meta.InsertAPIKey(ctx, &meta.APIKey{
@@ -373,7 +373,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		CreatedAt:     time.Now().UTC(),
 		UpdatedAt:     time.Now().UTC(),
 	}); err != nil {
-		s.markForkFailedAndCleanup(ctx, forkID)
+		s.markForkFailed(ctx, forkID)
 		return nil, err
 	}
 
@@ -399,7 +399,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 			zap.String("cluster_id", sourceCluster.ClusterID),
 			zap.Error(err))
 		s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster)
-		s.markForkFailedAndCleanup(ctx, forkID)
+		s.markForkFailed(ctx, forkID)
 		return nil, makeProvisionFailedErr(err)
 	}
 	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
@@ -414,7 +414,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 			zap.String("fork_id", forkID),
 			zap.String("response_cluster_id", cid),
 			zap.String("response_branch_id", bid))
-		s.markForkFailedAndCleanup(ctx, forkID)
+		s.markForkFailed(ctx, forkID)
 		return nil, makeProvisionFailedErr(forkErr(http.StatusBadGateway, "branch response missing required metadata"))
 	}
 	forkRoot.ClusterID = cluster.ClusterID
@@ -443,7 +443,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 			zap.String("fork_id", forkID),
 			zap.Error(err))
 		s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster)
-		s.markForkFailedAndCleanup(ctx, forkID)
+		s.markForkFailed(ctx, forkID)
 		return nil, makeProvisionFailedErr(err)
 	}
 
@@ -518,7 +518,7 @@ func (s *Server) provisionForkTenantAsyncWithProvision(ctx context.Context, fork
 					zap.String("tenant_id", forkID),
 					zap.Int("attempt", attempt),
 					zap.Error(err))
-				s.markForkFailedAndCleanup(ctx, forkID)
+				s.markForkFailed(ctx, forkID)
 				return
 			}
 			logger.Warn(ctx, "fork_provision_retry",
@@ -786,11 +786,6 @@ func (s *Server) markForkFailed(ctx context.Context, forkID string) {
 	if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantFailed); err != nil {
 		logger.Error(ctx, "fork_mark_failed_failed", zap.String("tenant_id", forkID), zap.Error(err))
 	}
-}
-
-func (s *Server) markForkFailedAndCleanup(ctx context.Context, forkID string) {
-	s.markForkFailed(ctx, forkID)
-	s.startForkCleanup(ctx, forkID)
 }
 
 func clusterInfoFromTenant(t *meta.Tenant) *tenant.ClusterInfo {
