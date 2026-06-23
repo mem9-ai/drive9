@@ -37,7 +37,7 @@ const (
 	// this constant; operators who want to disable it globally pass a
 	// negative MaxMonthlyMillicents in Options.LLMCostBudget. Per-tenant
 	// overrides via meta.QuotaConfig.MaxMonthlyCostMC continue to win.
-	defaultMaxMonthlyLLMCostMillicents = int64(1_000_000) // $10.00
+	defaultMaxMonthlyLLMCostMillicents = meta.DefaultMaxMonthlyCostMC // $10.00
 )
 
 // QuotaSource controls where quota checks read authoritative state from.

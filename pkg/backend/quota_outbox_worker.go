@@ -124,23 +124,60 @@ func (b *Dat9Backend) ProcessOneQuotaOutbox(ctx context.Context) (processed bool
 		return false, nil
 	}
 
-	err = b.applyQuotaOutboxEntry(ctx, entry)
+	var applyErr error
+	var ackErr error
+	var retryErr error
+	err = b.withQuotaAdmissionLock(ctx, func(tx *sql.Tx) error {
+		applyErr = b.applyQuotaOutboxEntry(ctx, entry)
+		if applyErr == nil {
+			if tx != nil {
+				ackErr = b.store.AckQuotaOutboxTx(ctx, tx, entry.ID, entry.Receipt)
+			} else {
+				ackErr = b.store.AckQuotaOutbox(ctx, entry.ID, entry.Receipt)
+			}
+			return ackErr
+		}
+		retryAt := time.Now().UTC().Add(quotaOutboxRetryDelay(entry.AttemptCount, quotaOutboxRetryBaseDelay, quotaOutboxRetryMaxDelay))
+		if tx != nil {
+			retryErr = b.store.RetryQuotaOutboxTx(ctx, tx, entry.ID, entry.Receipt, retryAt, applyErr.Error())
+		} else {
+			retryErr = b.store.RetryQuotaOutbox(ctx, entry.ID, entry.Receipt, retryAt, applyErr.Error())
+		}
+		if retryErr != nil {
+			return fmt.Errorf("process quota outbox %d: %w; update retry: %v", entry.ID, applyErr, retryErr)
+		}
+		return nil
+	})
 	if err == nil {
-		if ackErr := b.store.AckQuotaOutbox(ctx, entry.ID, entry.Receipt); ackErr != nil {
-			metrics.RecordOperation("quota_outbox", "ack", "error", time.Since(start))
-			return true, ackErr
+		if applyErr != nil {
+			metrics.RecordOperation("quota_outbox", entry.MutationType, "error", time.Since(start))
+			return true, applyErr
 		}
 		metrics.RecordOperation("quota_outbox", entry.MutationType, "ok", time.Since(start))
 		return true, nil
 	}
-
-	retryAt := time.Now().UTC().Add(quotaOutboxRetryDelay(entry.AttemptCount, quotaOutboxRetryBaseDelay, quotaOutboxRetryMaxDelay))
-	if retryErr := b.store.RetryQuotaOutbox(ctx, entry.ID, entry.Receipt, retryAt, err.Error()); retryErr != nil {
+	if ackErr != nil {
+		metrics.RecordOperation("quota_outbox", "ack", "error", time.Since(start))
+		return true, ackErr
+	}
+	if retryErr != nil {
 		metrics.RecordOperation("quota_outbox", "retry", "error", time.Since(start))
-		return true, fmt.Errorf("process quota outbox %d: %w; update retry: %v", entry.ID, err, retryErr)
+		return true, err
 	}
 	metrics.RecordOperation("quota_outbox", entry.MutationType, "error", time.Since(start))
 	return true, err
+}
+
+func (b *Dat9Backend) withQuotaAdmissionLock(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	if !b.UseServerQuota() || b.store == nil {
+		return fn(nil)
+	}
+	return b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.lockQuotaAdmissionTx(ctx, tx); err != nil {
+			return err
+		}
+		return fn(tx)
+	})
 }
 
 func (b *Dat9Backend) applyQuotaOutboxEntry(ctx context.Context, entry *datastore.QuotaOutboxEntry) error {

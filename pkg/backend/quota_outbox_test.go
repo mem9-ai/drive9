@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/drive9/pkg/datastore"
@@ -59,6 +60,94 @@ func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
 	}
 	if usage.StorageBytes != int64(len("png-data")) || usage.MediaFileCount != 1 {
 		t.Fatalf("central usage after outbox drain = %+v", usage)
+	}
+}
+
+func TestQuotaOutboxWorkerHoldsAdmissionLockAcrossApplyAndAck(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	if _, err := b.WriteCtx(ctx, "/locked-outbox.txt", []byte("payload"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	lockAttempted := make(chan struct{})
+	lockResult := make(chan error, 1)
+	fake.inTxHook = func(hookCtx context.Context) error {
+		go func() {
+			close(lockAttempted)
+			lockResult <- b.store.InTx(hookCtx, func(tx *sql.Tx) error {
+				return b.store.LockQuotaAdmissionTx(tx)
+			})
+		}()
+		<-lockAttempted
+		select {
+		case err := <-lockResult:
+			if err != nil {
+				return err
+			}
+			return errors.New("quota admission lock was available while outbox apply was in progress")
+		case <-time.After(150 * time.Millisecond):
+			return nil
+		}
+	}
+
+	processed, err := b.ProcessOneQuotaOutbox(ctx)
+	if err != nil {
+		t.Fatalf("process quota outbox: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected one quota outbox row to be processed")
+	}
+	select {
+	case err := <-lockResult:
+		if err != nil {
+			t.Fatalf("lock waiter: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("quota admission lock waiter did not finish after outbox processing")
+	}
+}
+
+func TestQuotaOutboxWorkerCommitsRetryAfterApplyError(t *testing.T) {
+	b, _ := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	id, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
+		FileID:       "bad-json",
+		MutationType: quotaMutationTypeFileCreate,
+		MutationData: json.RawMessage(`{"file_id":"bad-json","size_bytes":"bad","is_media":false}`),
+		StorageDelta: 1,
+	})
+	if err != nil {
+		t.Fatalf("enqueue quota outbox: %v", err)
+	}
+
+	processed, err := b.ProcessOneQuotaOutbox(ctx)
+	if err == nil {
+		t.Fatal("process quota outbox error = nil, want apply error")
+	}
+	if !processed {
+		t.Fatal("expected one quota outbox row to be processed")
+	}
+
+	var status datastore.QuotaOutboxStatus
+	var attemptCount int
+	var lastError sql.NullString
+	if err := b.store.DB().QueryRowContext(ctx, `SELECT status, attempt_count, last_error FROM quota_outbox WHERE id = ?`, id).
+		Scan(&status, &attemptCount, &lastError); err != nil {
+		t.Fatalf("load quota outbox row: %v", err)
+	}
+	if status != datastore.QuotaOutboxQueued {
+		t.Fatalf("status = %q, want queued retry", status)
+	}
+	if attemptCount != 1 {
+		t.Fatalf("attempt_count = %d, want 1", attemptCount)
+	}
+	if !lastError.Valid || lastError.String == "" {
+		t.Fatalf("last_error = %q valid=%v, want recorded apply error", lastError.String, lastError.Valid)
 	}
 }
 

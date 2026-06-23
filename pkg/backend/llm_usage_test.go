@@ -136,6 +136,27 @@ func TestMonthlyLLMCostExceeded_ServerQuotaExplicitZeroDisablesDefault(t *testin
 	}
 }
 
+func TestMonthlyLLMCostExceeded_ServerQuotaInheritUsesGlobalDefault(t *testing.T) {
+	mock := &mockQuotaStore{
+		monthlyCost: 5000,
+		quotaConfig: &QuotaConfigView{
+			TenantID:                "tenant-1",
+			MaxMonthlyCostMC:        0,
+			InheritMaxMonthlyCostMC: true,
+			Explicit:                true,
+		},
+	}
+	b := &Dat9Backend{
+		metaStore:                   mock,
+		tenantID:                    "tenant-1",
+		quotaSource:                 QuotaSourceServer,
+		maxMonthlyLLMCostMillicents: 4000,
+	}
+	if !b.monthlyLLMCostExceeded() {
+		t.Fatal("expected inherited monthly budget to use the global default")
+	}
+}
+
 func TestMonthlyLLMCostExceeded_ServerQuota_FailOpen(t *testing.T) {
 	mock := &mockQuotaStore{monthlyCostErr: errors.New("meta db down")}
 	b := &Dat9Backend{

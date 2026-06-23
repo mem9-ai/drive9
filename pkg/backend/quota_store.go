@@ -68,11 +68,12 @@ type MetaQuotaStore interface {
 
 // QuotaConfigView is the backend-side view of per-tenant quota configuration.
 type QuotaConfigView struct {
-	TenantID         string
-	MaxStorageBytes  int64
-	MaxMediaLLMFiles int64
-	MaxMonthlyCostMC int64
-	Explicit         bool
+	TenantID                string
+	MaxStorageBytes         int64
+	MaxMediaLLMFiles        int64
+	MaxMonthlyCostMC        int64
+	InheritMaxMonthlyCostMC bool
+	Explicit                bool
 }
 
 // QuotaUsageView is the backend-side view of pre-aggregated quota counters.

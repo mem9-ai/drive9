@@ -540,7 +540,7 @@ func metaInitSchemaStatements() []string {
 			tenant_id             VARCHAR(64) PRIMARY KEY,
 			max_storage_bytes     BIGINT NOT NULL DEFAULT 53687091200,
 			max_media_llm_files   BIGINT NOT NULL DEFAULT 500,
-			max_monthly_cost_mc   BIGINT NOT NULL DEFAULT 0,
+			max_monthly_cost_mc   BIGINT NOT NULL DEFAULT -1,
 			created_at            DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at            DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,

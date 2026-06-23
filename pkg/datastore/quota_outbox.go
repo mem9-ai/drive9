@@ -159,8 +159,24 @@ func (s *Store) AckQuotaOutbox(ctx context.Context, id int64, receipt string) (e
 	start := time.Now()
 	defer observeStoreOp(ctx, "ack_quota_outbox", start, &err)
 
+	return s.ackQuotaOutbox(ctx, s.db, id, receipt)
+}
+
+// AckQuotaOutboxTx marks a leased quota outbox row as successfully applied
+// inside a caller-owned transaction.
+func (s *Store) AckQuotaOutboxTx(ctx context.Context, tx *sql.Tx, id int64, receipt string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "ack_quota_outbox_tx", start, &err)
+
+	if tx == nil {
+		return fmt.Errorf("quota outbox ack transaction is required")
+	}
+	return s.ackQuotaOutbox(ctx, tx, id, receipt)
+}
+
+func (s *Store) ackQuotaOutbox(ctx context.Context, db execer, id int64, receipt string) error {
 	now := time.Now().UTC()
-	res, err := s.db.ExecContext(ctx, `UPDATE quota_outbox SET status = ?, receipt = NULL,
+	res, err := db.ExecContext(ctx, `UPDATE quota_outbox SET status = ?, receipt = NULL,
 		leased_at = NULL, lease_until = NULL, completed_at = ?, updated_at = ?
 		WHERE id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
 		QuotaOutboxSucceeded, now, now, id, QuotaOutboxProcessing, receipt, now)
@@ -174,7 +190,7 @@ func (s *Store) AckQuotaOutbox(ctx context.Context, id int64, receipt string) (e
 	if rowsAffected > 0 {
 		return nil
 	}
-	return s.quotaOutboxLeaseError(ctx, id)
+	return s.quotaOutboxLeaseError(ctx, db, id)
 }
 
 // RetryQuotaOutbox requeues or dead-letters a leased quota outbox row.
@@ -182,18 +198,37 @@ func (s *Store) RetryQuotaOutbox(ctx context.Context, id int64, receipt string, 
 	start := time.Now()
 	defer observeStoreOp(ctx, "retry_quota_outbox", start, &err)
 
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.retryQuotaOutboxTx(ctx, tx, id, receipt, retryAt, lastErr); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// RetryQuotaOutboxTx requeues or dead-letters a leased quota outbox row inside
+// a caller-owned transaction.
+func (s *Store) RetryQuotaOutboxTx(ctx context.Context, tx *sql.Tx, id int64, receipt string, retryAt time.Time, lastErr string) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "retry_quota_outbox_tx", start, &err)
+
+	if tx == nil {
+		return fmt.Errorf("quota outbox retry transaction is required")
+	}
+	return s.retryQuotaOutboxTx(ctx, tx, id, receipt, retryAt, lastErr)
+}
+
+func (s *Store) retryQuotaOutboxTx(ctx context.Context, tx *sql.Tx, id int64, receipt string, retryAt time.Time, lastErr string) error {
 	now := time.Now().UTC()
 	if retryAt.IsZero() {
 		retryAt = now
 	} else {
 		retryAt = retryAt.UTC()
 	}
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
 
 	row := tx.QueryRowContext(ctx, quotaOutboxSelectSQL+` FROM quota_outbox WHERE id = ? FOR UPDATE`, id)
 	entry, err := scanQuotaOutbox(row)
@@ -217,7 +252,7 @@ func (s *Store) RetryQuotaOutbox(ctx context.Context, id int64, receipt string, 
 	if err != nil {
 		return err
 	}
-	return tx.Commit()
+	return nil
 }
 
 // RecoverExpiredQuotaOutbox requeues processing outbox rows whose lease expired.
@@ -381,9 +416,9 @@ func (s *Store) enqueueQuotaOutbox(db execer, entry *QuotaOutboxEntry) (int64, e
 	return id, nil
 }
 
-func (s *Store) quotaOutboxLeaseError(ctx context.Context, id int64) error {
+func (s *Store) quotaOutboxLeaseError(ctx context.Context, db execer, id int64) error {
 	var count int
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox WHERE id = ?`, id).Scan(&count)
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox WHERE id = ?`, id).Scan(&count)
 	if err != nil {
 		return err
 	}

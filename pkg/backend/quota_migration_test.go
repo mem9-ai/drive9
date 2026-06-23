@@ -41,6 +41,7 @@ type fakeMetaQuotaStore struct {
 	objectGCCandidateErr error
 	insertReservationErr error // injected into AtomicReserveAndInsertUpload to simulate INSERT failure inside the tx
 	getReservationErr    error // injected into GetUploadReservation to simulate transient DB error
+	inTxHook             func(context.Context) error
 }
 
 func (f *fakeMetaQuotaStore) EnqueueObjectGCCandidate(_ context.Context, c *meta.ObjectGCCandidateInput) error {
@@ -90,9 +91,11 @@ func (f *fakeMetaQuotaStore) GetQuotaConfig(ctx context.Context, tenantID string
 		return &cp, nil
 	}
 	return &QuotaConfigView{
-		TenantID:         tenantID,
-		MaxStorageBytes:  meta.DefaultMaxStorageBytes(),
-		MaxMediaLLMFiles: 500,
+		TenantID:                tenantID,
+		MaxStorageBytes:         meta.DefaultMaxStorageBytes(),
+		MaxMediaLLMFiles:        500,
+		MaxMonthlyCostMC:        meta.DefaultMaxMonthlyCostMC,
+		InheritMaxMonthlyCostMC: true,
 	}, nil
 }
 
@@ -100,7 +103,7 @@ func (f *fakeMetaQuotaStore) GetQuotaConfigVersion(ctx context.Context, tenantID
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if cfg, ok := f.config[tenantID]; ok {
-		return fmt.Sprintf("%d:%d:%d", cfg.MaxStorageBytes, cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC), nil
+		return fmt.Sprintf("%d:%d:%d:%t", cfg.MaxStorageBytes, cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC, cfg.InheritMaxMonthlyCostMC), nil
 	}
 	return "", nil
 }
@@ -453,6 +456,11 @@ func (f *fakeMetaQuotaStore) IncrMutationRetry(ctx context.Context, id int64, ma
 }
 
 func (f *fakeMetaQuotaStore) InTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	if f.inTxHook != nil {
+		if err := f.inTxHook(ctx); err != nil {
+			return err
+		}
+	}
 	return fn(nil)
 }
 
