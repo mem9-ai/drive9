@@ -1234,3 +1234,104 @@ func TestShouldEnqueueEmbedForRevision_DisabledSkipsImage(t *testing.T) {
 		t.Fatal("should not enqueue embed task for image when app semantic tasks disabled")
 	}
 }
+
+// App-embedding mode image write paths now enqueue durable img_extract_text
+// tasks in the same transaction (same as auto-embedding mode), instead of the
+// legacy in-process channel. The following tests verify the three write paths.
+
+func TestWriteCreateAppEmbeddingImageEnqueuesImgExtractTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		AppSemanticTasksEnabled: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Extractor: &staticImageExtractor{text: "cat on sofa"},
+		},
+	})
+	if _, err := b.Write("/img/create-app.png", []byte("fake-png"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatal(err)
+	}
+	fileID, revision, _, _ := mustFileForPath(t, b, "/img/create-app.png")
+	if revision != 1 {
+		t.Fatalf("revision=%d, want 1", revision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	// Expect one img_extract_text task (and optionally one embed task).
+	var imgTasks, embedTasks int
+	for _, task := range tasks {
+		switch task.TaskType {
+		case string(semantic.TaskTypeImgExtractText):
+			imgTasks++
+		case string(semantic.TaskTypeEmbed):
+			embedTasks++
+		}
+	}
+	if imgTasks != 1 {
+		t.Fatalf("img_extract_text task count=%d, want 1 (all tasks: %+v)", imgTasks, tasks)
+	}
+	// App mode also enqueues an embed task for image revisions (it no-ops until
+	// content_text is written by the extract worker, which then bridges a fresh
+	// embed task). This is existing behavior, not changed by this PR.
+	_ = embedTasks
+}
+
+func TestWriteOverwriteAppEmbeddingImageEnqueuesImgExtractTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		AppSemanticTasksEnabled: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Extractor: &staticImageExtractor{text: "updated caption"},
+		},
+	})
+	fileID := insertImageFileForExtractTest(t, b, "/img/overwrite-app.png", "image/png", []byte("old-image"))
+
+	if _, err := b.Write("/img/overwrite-app.png", []byte("new-image"), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatal(err)
+	}
+	_, revision, _, _ := mustFileForPath(t, b, "/img/overwrite-app.png")
+	if revision != 2 {
+		t.Fatalf("revision=%d, want 2", revision)
+	}
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var imgTasks int
+	for _, task := range tasks {
+		if task.TaskType == string(semantic.TaskTypeImgExtractText) {
+			if task.ResourceVersion == revision {
+				imgTasks++
+			}
+		}
+	}
+	if imgTasks != 1 {
+		t.Fatalf("img_extract_text task count for revision %d =%d, want 1", revision, imgTasks)
+	}
+}
+
+func TestConfirmUploadAppEmbeddingImageEnqueuesImgExtractTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		AppSemanticTasksEnabled: true,
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Extractor: &staticImageExtractor{text: "uploaded image caption"},
+		},
+	})
+	ctx := context.Background()
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/img/upload-app.png", totalSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uploadAllPartsForPlan(t, b, plan, plan.UploadID, totalSize)
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatal(err)
+	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/img/upload-app.png")
+	tasks := loadSemanticTasksForFile(t, b, fileID)
+	var imgTasks int
+	for _, task := range tasks {
+		if task.TaskType == string(semantic.TaskTypeImgExtractText) {
+			imgTasks++
+		}
+	}
+	if imgTasks != 1 {
+		t.Fatalf("img_extract_text task count=%d, want 1 (all tasks: %+v)", imgTasks, tasks)
+	}
+}

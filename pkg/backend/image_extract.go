@@ -13,9 +13,7 @@ import (
 	"github.com/pingcap/failpoint"
 
 	"github.com/mem9-ai/drive9/pkg/datastore"
-	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/metrics"
-	"go.uber.org/zap"
 )
 
 // ImageExtractRequest is the input to a pluggable image->text extractor.
@@ -85,144 +83,6 @@ func contentTypeFromPath(path string) string {
 // runtime dependencies needed to extract image text.
 func (b *Dat9Backend) SupportsAsyncImageExtract() bool {
 	return b.imageExtractEnabled && b.imageExtractor != nil
-}
-
-func (b *Dat9Backend) enqueueImageExtract(fileID, path, contentType string, revision int64) {
-	if !b.SupportsAsyncImageExtract() {
-		return
-	}
-	if !isImageContentType(contentType) {
-		contentType = contentTypeFromPath(path)
-		if !isImageContentType(contentType) {
-			return
-		}
-	}
-	if b.mediaLLMQuotaExceededCheck(backgroundWithTrace()) {
-		metrics.RecordOperation("media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
-		return
-	}
-	task := ImageExtractTaskSpec{
-		FileID:      fileID,
-		Path:        path,
-		ContentType: contentType,
-		Revision:    revision,
-	}
-	select {
-	case b.imageExtractQueue <- task:
-		metrics.RecordOperation("image_extract", "enqueue", "ok", 0)
-		globalBackendRuntimeMetrics.setImageQueueDepth(b.runtimeMetricsID, len(b.imageExtractQueue))
-	default:
-		metrics.RecordOperation("image_extract", "enqueue", "queue_full", 0)
-		globalBackendRuntimeMetrics.setImageQueueDepth(b.runtimeMetricsID, len(b.imageExtractQueue))
-		logger.Warn(backgroundWithTrace(), "backend_image_extract_queue_full_drop",
-			zap.String("file_id", fileID),
-			zap.String("path", path),
-			zap.Int("queue_size", cap(b.imageExtractQueue)))
-	}
-}
-
-func (b *Dat9Backend) enqueueImageExtractForUpload(ctx context.Context, upload *datastore.Upload, isOverwrite bool) {
-	if !b.SupportsAsyncImageExtract() {
-		return
-	}
-	fileID := upload.FileID
-	if isOverwrite {
-		nf, err := b.store.Stat(ctx, upload.TargetPath)
-		if err != nil || nf.File == nil {
-			logger.Warn(ctx, "backend_image_extract_upload_enqueue_stat_failed",
-				zap.String("upload_id", upload.UploadID),
-				zap.String("path", upload.TargetPath),
-				zap.Error(err))
-			return
-		}
-		fileID = nf.File.FileID
-	}
-	f, err := b.store.GetFile(ctx, fileID)
-	if err != nil {
-		logger.Warn(ctx, "backend_image_extract_upload_enqueue_get_file_failed",
-			zap.String("upload_id", upload.UploadID),
-			zap.String("file_id", fileID),
-			zap.String("path", upload.TargetPath),
-			zap.Error(err))
-		return
-	}
-	ct := f.ContentType
-	if ct == "" {
-		ct = contentTypeFromPath(upload.TargetPath)
-		if ct == "" {
-			logger.Warn(ctx, "backend_image_extract_upload_enqueue_skipped_unknown_content_type",
-				zap.String("upload_id", upload.UploadID),
-				zap.String("file_id", fileID),
-				zap.String("path", upload.TargetPath),
-				zap.String("reason", "content_type_missing_and_extension_unknown"))
-			return
-		}
-	}
-	b.enqueueImageExtract(fileID, upload.TargetPath, ct, f.Revision)
-}
-
-func (b *Dat9Backend) runImageExtractWorker(ctx context.Context, workerID int) {
-	defer b.imageExtractWG.Done()
-	logger.Info(ctx, "backend_image_extract_worker_started", zap.Int("worker_id", workerID))
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info(ctx, "backend_image_extract_worker_stopped", zap.Int("worker_id", workerID), zap.String("reason", "context_canceled"))
-			return
-		case task := <-b.imageExtractQueue:
-			globalBackendRuntimeMetrics.setImageQueueDepth(b.runtimeMetricsID, len(b.imageExtractQueue))
-			b.processQueuedImageExtractTask(ctx, task)
-		}
-	}
-}
-
-func (b *Dat9Backend) processQueuedImageExtractTask(ctx context.Context, task ImageExtractTaskSpec) {
-	start := time.Now()
-	result, err := b.ProcessImageExtractTask(ctx, task)
-	metricResult := legacyImageExtractMetricResult(result)
-	if err != nil {
-		switch result {
-		case ImageExtractResultGetFileError:
-			logger.Warn(ctx, "backend_image_extract_get_file_failed",
-				zap.String("file_id", task.FileID), zap.Error(err))
-		case ImageExtractResultLoadError:
-			logger.Warn(ctx, "backend_image_extract_load_bytes_failed",
-				zap.String("file_id", task.FileID), zap.Error(err))
-		case ImageExtractResultExtractError:
-			logger.Warn(ctx, "backend_image_extract_failed",
-				zap.String("file_id", task.FileID), zap.String("path", task.Path), zap.Error(err))
-		case ImageExtractResultUpdateError:
-			logger.Warn(ctx, "backend_image_extract_update_file_failed",
-				zap.String("file_id", task.FileID), zap.Error(err))
-		default:
-			logger.Warn(ctx, "backend_image_extract_failed_unexpected",
-				zap.String("file_id", task.FileID), zap.String("path", task.Path), zap.Error(err))
-		}
-		metrics.RecordOperation("image_extract", "process", metricResult, time.Since(start))
-		return
-	}
-
-	switch result {
-	case ImageExtractResultFileNotFound, ImageExtractResultNotConfirmed, ImageExtractResultNotImage:
-		metrics.RecordOperation("image_extract", "process", metricResult, time.Since(start))
-		return
-	case ImageExtractResultStale:
-		logger.Info(ctx, "backend_image_extract_skipped_stale",
-			zap.String("file_id", task.FileID), zap.String("path", task.Path))
-	case ImageExtractResultTooLarge:
-		logger.Warn(ctx, "backend_image_extract_skipped_too_large_or_empty",
-			zap.String("file_id", task.FileID),
-			zap.String("path", task.Path),
-			zap.Int64("max_bytes", b.imageExtractMaxSize))
-	case ImageExtractResultEmptyText:
-		logger.Warn(ctx, "backend_image_extract_empty_text",
-			zap.String("file_id", task.FileID),
-			zap.String("path", task.Path))
-	case ImageExtractResultWritten:
-		logger.Info(ctx, "backend_image_extract_ok",
-			zap.String("file_id", task.FileID), zap.String("path", task.Path))
-	}
-	metrics.RecordOperation("image_extract", "process", metricResult, time.Since(start))
 }
 
 // ProcessImageExtractTask runs the backend-owned image extraction logic for one
@@ -334,19 +194,6 @@ func injectedImageExtractWritebackError(name string) error {
 		}
 	})
 	return injected
-}
-
-func legacyImageExtractMetricResult(result ImageExtractResult) string {
-	switch result {
-	case ImageExtractResultFileNotFound, ImageExtractResultGetFileError:
-		return "get_file_error"
-	case ImageExtractResultTooLarge:
-		return "skip_too_large"
-	case ImageExtractResultWritten:
-		return "ok"
-	default:
-		return string(result)
-	}
 }
 
 func (b *Dat9Backend) loadImageBytesForExtract(ctx context.Context, f *datastore.File) ([]byte, error) {

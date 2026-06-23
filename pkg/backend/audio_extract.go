@@ -367,6 +367,19 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 		}
 		var txErr error
 		updated, txErr = b.store.UpdateFileSearchTextTx(tx, task.FileID, expectedRevision, text)
+		if txErr != nil {
+			return txErr
+		}
+		if !updated {
+			return nil
+		}
+		// Bridge an embed task in app-embedding mode so the transcribed text
+		// gets embedded for semantic search. In auto-embedding mode the DB
+		// generates the vector automatically, so no bridge is needed.
+		if b.UsesDatabaseAutoEmbedding() || !b.appSemanticTasksEnabled {
+			return nil
+		}
+		_, txErr = b.store.EnsureSemanticTaskQueuedTx(tx, newEmbedTask(b.genID(), task.FileID, expectedRevision, time.Now().UTC()))
 		return txErr
 	})
 	if err != nil {

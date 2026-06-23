@@ -67,20 +67,6 @@ func (m *backendRuntimeMetrics) activateImage(id uint64, queueCapacity, workers 
 	publishImageRuntimeSummary(summary)
 }
 
-func (m *backendRuntimeMetrics) setImageQueueDepth(id uint64, queueDepth int) {
-	m.mu.Lock()
-	state, ok := m.image[id]
-	if !ok {
-		m.mu.Unlock()
-		return
-	}
-	state.queueDepth = queueDepth
-	m.image[id] = state
-	summary := m.imageSummaryLocked()
-	m.mu.Unlock()
-	publishImageRuntimeSummary(summary)
-}
-
 func (m *backendRuntimeMetrics) deactivateImage(id uint64) {
 	m.mu.Lock()
 	delete(m.image, id)
