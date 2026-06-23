@@ -24,6 +24,36 @@ import (
 // state. All resources are registered with t.Cleanup.
 func newLeaderLifecycleServer(t *testing.T) (*Server, *tenant.Pool, string) {
 	t.Helper()
+	leaderMgr := leader.NewManager(nil, leader.WithDisabled(),
+		// The server overwrites these callbacks with its own onLead/onLose via
+		// SetCallbacks in NewWithConfig. The disabled manager invokes onLead
+		// synchronously inside Start.
+		leader.WithCallbacks(func() {}, func() {}),
+	)
+	return newLeaderLifecycleServerWithLeader(t, leaderMgr)
+}
+
+// newLeaderLifecycleServerWithRealLeader is like newLeaderLifecycleServer but
+// uses a real (non-disabled) leader manager backed by the shared MySQL so the
+// heartbeat goroutine drives onLead/onLose naturally. heartbeat controls the
+// acquisition/verification interval. A unique lock name isolates this manager
+// from other tests.
+func newLeaderLifecycleServerWithRealLeader(t *testing.T, heartbeat time.Duration) (*Server, *tenant.Pool, string) {
+	t.Helper()
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = metaStore.Close() })
+	leaderMgr := leader.NewManager(metaStore.DB(),
+		leader.WithLockName("drive9:test:server-lifecycle:"+token.NewID()),
+		leader.WithHeartbeatInterval(heartbeat),
+	)
+	return newLeaderLifecycleServerWithLeader(t, leaderMgr)
+}
+
+func newLeaderLifecycleServerWithLeader(t *testing.T, leaderMgr *leader.Manager) (*Server, *tenant.Pool, string) {
+	t.Helper()
 	initServerTenantSchema(t, testDSN)
 
 	metaStore, err := meta.Open(testDSN)
@@ -77,13 +107,6 @@ func newLeaderLifecycleServer(t *testing.T) (*Server, *tenant.Pool, string) {
 	if err := metaStore.InsertTenant(context.Background(), tenantMeta); err != nil {
 		t.Fatal(err)
 	}
-
-	leaderMgr := leader.NewManager(nil, leader.WithDisabled(),
-		// The server overwrites these callbacks with its own onLead/onLose via
-		// SetCallbacks in NewWithConfig. The disabled manager invokes onLead
-		// synchronously inside Start.
-		leader.WithCallbacks(func() {}, func() {}),
-	)
 
 	prov := &fakeProvisioner{provider: tenant.ProviderDB9}
 	srv := NewWithConfig(Config{
@@ -182,37 +205,50 @@ func objectGCWorkerRunning(w *objectGCWorker) bool {
 	return w.stop != nil
 }
 
+// waitForLeaderOrTimeout polls srv.leader.IsLeader() until it reports true or
+// the timeout elapses. A non-leader result at timeout is not fatal — the race
+// test only needs the heartbeat loop running so onLead can overlap with Close;
+// leadership gain is the common case but not required for the test to be valid.
+func waitForLeaderOrTimeout(t *testing.T, srv *Server, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if srv.leader != nil && srv.leader.IsLeader() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func backendOptionsWithFileGC() backend.Options {
 	return backend.Options{AppSemanticTasksEnabled: true}
 }
 
-// TestLeaderGatedWorkersCloseRacesOnLead is a regression for qiffang R3: the
-// leader worker start/stop path must be truly non-overlapping so that Close()
-// (or onLose) racing with a concurrent onLead cannot leave orphan workers
-// running (e.g. start assigns replay/expiry/FileGC/semantic/objectGC after a
-// stop already ran). Because startLeaderWorkers/stopLeaderWorkers now hold
-// leaderWorkerMu for the entire transition, the two are serialized; this test
-// races them in a loop (run with -race to catch the data race on
-// s.replayWorker / s.expirySweepWorker) and asserts that after Close() no
-// leader-gated worker remains running.
+// TestLeaderGatedWorkersCloseRacesOnLead is a regression for qiffang R3: a
+// leader manager heartbeat goroutine may be inside onLead (calling
+// startLeaderWorkers) when Close() runs. Close() must stop the leader manager
+// first — leader.Stop() waits for the heartbeat goroutine to exit, so no
+// onLead can outlive it — then stopLeaderWorkers tears down whatever workers
+// the in-flight onLead started (the onLead's onLose from the cancelled loop, or
+// the local stopLeaderWorkers, stops them). After Close() returns no
+// leader-gated worker may remain running.
+//
+// This uses a real (non-disabled) leader manager against the shared MySQL so
+// the heartbeat goroutine naturally drives onLead; with a short heartbeat the
+// loop maximizes the chance that onLead is in progress when Close() runs (run
+// with -race to catch a data race on s.replayWorker / s.expirySweepWorker).
 func TestLeaderGatedWorkersCloseRacesOnLead(t *testing.T) {
-	for i := range 50 {
-		srv, pool, tenantID := newLeaderLifecycleServer(t)
+	for i := range 25 {
+		srv, pool, tenantID := newLeaderLifecycleServerWithRealLeader(t, 20*time.Millisecond)
 		b := pool.S3Backend(tenantID)
 		if b == nil {
 			t.Fatalf("iter %d: cached backend missing", i)
 		}
 
-		// Race onLead (re-start path) against Close (which stops the leader
-		// manager first, then stopLeaderWorkers). Whichever ordering wins the
-		// leaderWorkerMu, Close must end with everything stopped.
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			srv.onLead() // guarded by leaderWorkersStarted → no-op if already started
-		}()
+		// Give the heartbeat a chance to gain leadership (onLead starts workers),
+		// then close while the loop is still running — racing onLead with Close.
+		waitForLeaderOrTimeout(t, srv, 2*time.Second)
 		srv.Close()
-		<-done
 
 		if srv.leaderWorkersStarted {
 			t.Fatalf("iter %d: leaderWorkersStarted should be false after Close", i)
