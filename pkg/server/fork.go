@@ -220,10 +220,7 @@ func (s *Server) resolveForkCredentialRequest(provider string, req *tenant.Crede
 		return nil, nil
 	}
 	if req == nil {
-		req = resolveDefaultCredentials(s.provisioner)
-		if req == nil {
-			return nil, tenant.ErrCredentialsRequired
-		}
+		return nil, tenant.ErrCredentialsRequired
 	}
 	if validator, ok := s.provisioner.(credentialProvisionRequestValidator); ok {
 		if err := validator.ValidateCredentialProvisionRequest(*req); err != nil {
@@ -448,24 +445,6 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster)
 		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, makeProvisionFailedErr(err)
-	}
-
-	// When the branch endpoint is not yet available (branch still CREATING)
-	// and we have per-request credentials, defer to async provisioning instead
-	// of failing. The async provisioner will wait for the branch to become active.
-	if source.Provider == tenant.ProviderTiDBCloudNative && cluster.Username == "" && credentialReq == nil && resolveDefaultCredentials(s.provisioner) == nil {
-		logger.Error(ctx, "fork_missing_endpoint_no_credentials",
-			zap.String("source_tenant_id", source.ID),
-			zap.String("fork_id", forkID))
-		if s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster) {
-			if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantDeleted); err != nil {
-				logger.Error(ctx, "fork_credential_gate_mark_deleted_failed",
-					zap.String("tenant_id", forkID), zap.Error(err))
-			}
-		} else {
-			s.markForkFailedAndCleanup(ctx, forkID)
-		}
-		return nil, makeProvisionFailedErr(forkErr(http.StatusBadRequest, "branch response missing endpoint; server default TiDB Cloud credential is required to provision this fork"))
 	}
 
 	if source.Provider == tenant.ProviderTiDBCloudNative {
@@ -992,8 +971,11 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 		}
 		return nil
 	}
-	if t.Provider == tenant.ProviderTiDBCloudNative && credentialReq == nil && resolveDefaultCredentials(s.provisioner) == nil {
-		return tenant.ErrCredentialsRequired
+	if t.Provider == tenant.ProviderTiDBCloudNative && credentialReq == nil {
+		if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
+			return fmt.Errorf("mark fork deleted: %w", err)
+		}
+		return nil
 	}
 	if t.Status != meta.TenantDeleting {
 		return s.cleanupFailedForkBranch(ctx, t, credentialReq)
