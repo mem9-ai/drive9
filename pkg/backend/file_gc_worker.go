@@ -228,6 +228,15 @@ func (b *Dat9Backend) deleteCentralFileMetaForGCTask(ctx context.Context, task *
 }
 
 func (b *Dat9Backend) checkNoPendingCentralFileMutation(ctx context.Context, fileID string) error {
+	if b.UseServerQuota() {
+		pending, err := b.store.HasPendingQuotaOutboxFileMutation(ctx, fileID)
+		if err != nil {
+			return err
+		}
+		if pending {
+			return fmt.Errorf("tenant quota outbox pending for file %s", fileID)
+		}
+	}
 	pending, err := b.metaStore.HasPendingFileMutation(ctx, b.tenantID, fileID)
 	if err != nil {
 		return err

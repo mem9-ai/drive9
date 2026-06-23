@@ -11,9 +11,11 @@ import (
 // cacheTestStore wraps fakeMetaQuotaStore with error injection for cache tests.
 type cacheTestStore struct {
 	*fakeMetaQuotaStore
-	callCount atomic.Int64
-	usageErr  error
-	configErr error
+	configCalls  atomic.Int64
+	versionCalls atomic.Int64
+	usageCalls   atomic.Int64
+	versionErr   error
+	configErr    error
 }
 
 func newCacheTestStore() *cacheTestStore {
@@ -21,66 +23,78 @@ func newCacheTestStore() *cacheTestStore {
 }
 
 func (m *cacheTestStore) GetQuotaUsage(ctx context.Context, tenantID string) (*QuotaUsageView, error) {
-	m.callCount.Add(1)
-	if m.usageErr != nil {
-		return nil, m.usageErr
-	}
+	m.usageCalls.Add(1)
 	return m.fakeMetaQuotaStore.GetQuotaUsage(ctx, tenantID)
 }
 
 func (m *cacheTestStore) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConfigView, error) {
-	m.callCount.Add(1)
+	m.configCalls.Add(1)
 	if m.configErr != nil {
 		return nil, m.configErr
 	}
 	return m.fakeMetaQuotaStore.GetQuotaConfig(ctx, tenantID)
 }
 
-func TestQuotaCache_InitialLoad(t *testing.T) {
+func (m *cacheTestStore) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
+	m.versionCalls.Add(1)
+	if m.versionErr != nil {
+		return "", m.versionErr
+	}
+	return m.fakeMetaQuotaStore.GetQuotaConfigVersion(ctx, tenantID)
+}
+
+func TestQuotaConfigCacheInitialLoad(t *testing.T) {
 	store := newCacheTestStore()
-	store.usage["t1"] = &QuotaUsageView{StorageBytes: 100, ReservedBytes: 50}
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
-	c := newQuotaCache("t1", store)
+	c := newQuotaConfigCache("t1", store)
 	defer c.stop()
 
-	usage, cfg := c.get()
-	require.NotNil(t, usage)
+	cfg := c.get()
 	require.NotNil(t, cfg)
-	require.Equal(t, int64(100), usage.StorageBytes)
 	require.Equal(t, int64(1000), cfg.MaxStorageBytes)
+	require.Equal(t, int64(1), store.versionCalls.Load())
+	require.Equal(t, int64(1), store.configCalls.Load())
+	require.Equal(t, int64(0), store.usageCalls.Load())
 }
 
-func TestQuotaCache_FailOpen_OnError(t *testing.T) {
+func TestQuotaConfigCacheFailOpenOnVersionError(t *testing.T) {
 	store := newCacheTestStore()
-	store.usageErr = context.DeadlineExceeded
-	c := newQuotaCache("t1", store)
+	store.versionErr = context.DeadlineExceeded
+	c := newQuotaConfigCache("t1", store)
 	defer c.stop()
 
-	usage, cfg := c.get()
-	require.Nil(t, usage)
-	require.Nil(t, cfg)
+	require.Nil(t, c.get())
+	require.Equal(t, int64(1), store.versionCalls.Load())
+	require.Equal(t, int64(0), store.configCalls.Load())
+	require.Equal(t, int64(0), store.usageCalls.Load())
 }
 
-func TestQuotaCache_Refresh(t *testing.T) {
+func TestQuotaConfigCacheRefreshOnlyLoadsConfigWhenVersionChanges(t *testing.T) {
 	store := newCacheTestStore()
-	store.usage["t1"] = &QuotaUsageView{StorageBytes: 100}
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
-	c := newQuotaCache("t1", store)
+	c := newQuotaConfigCache("t1", store)
 	defer c.stop()
 
-	// Update the underlying store and trigger refresh.
+	c.refresh(context.Background())
+	require.Equal(t, int64(2), store.versionCalls.Load())
+	require.Equal(t, int64(1), store.configCalls.Load())
+
 	store.mu.Lock()
-	store.usage["t1"] = &QuotaUsageView{StorageBytes: 200}
+	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 2000}
 	store.mu.Unlock()
 	c.refresh(context.Background())
 
-	usage, _ := c.get()
-	require.Equal(t, int64(200), usage.StorageBytes)
+	cfg := c.get()
+	require.NotNil(t, cfg)
+	require.Equal(t, int64(2000), cfg.MaxStorageBytes)
+	require.Equal(t, int64(3), store.versionCalls.Load())
+	require.Equal(t, int64(2), store.configCalls.Load())
+	require.Equal(t, int64(0), store.usageCalls.Load())
 }
 
-func TestQuotaCache_Stop(t *testing.T) {
+func TestQuotaConfigCacheStop(t *testing.T) {
 	store := newCacheTestStore()
-	c := newQuotaCache("t1", store)
+	c := newQuotaConfigCache("t1", store)
 	c.stop()
 	// Should not panic or block.
 }

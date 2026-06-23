@@ -330,8 +330,9 @@ func (b *Dat9Backend) Close() {
 		b.audioExtractEnabled = false
 	}
 	b.stopMutationWorker()
-	if b.qCache != nil {
-		b.qCache.stop()
-		b.qCache = nil
+	b.stopQuotaOutboxWorker()
+	if b.quotaConfigCache != nil {
+		b.quotaConfigCache.stop()
+		b.quotaConfigCache = nil
 	}
 }

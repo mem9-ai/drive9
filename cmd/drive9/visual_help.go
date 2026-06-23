@@ -469,6 +469,29 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			},
 		},
 		{
+			Name:    "quota",
+			Args:    "<get|set> [flags]",
+			Summary: "query or set tenant quota",
+			Details: []string{
+				"get uses the active owner API key unless --tenant-id and TiDB Cloud keys are provided",
+				"set is TiDBCloud-only and requires TiDB Cloud keys; Drive9 API keys cannot authorize quota updates",
+			},
+			Flags: []visualHelpFlag{
+				{Name: "--server URL", Desc: "server URL; defaults to active context server"},
+				{Name: "--tenant-id ID", Desc: "drive9 tenant id for TiDB Cloud credential query or set"},
+				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key"},
+				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key"},
+				{Name: "--max-storage-bytes BYTES", Desc: "quota set: max confirmed+reserved storage bytes"},
+				{Name: "--max-media-llm-files N", Desc: "quota set: max media files eligible for LLM processing"},
+				{Name: "--max-monthly-cost-mc N", Desc: "quota set: max monthly LLM cost in millicents"},
+				{Name: "--json", Desc: "output result as JSON"},
+			},
+			Examples: []visualHelpExample{
+				{Command: "drive9 quota get", Desc: "query the active tenant quota"},
+				{Command: "drive9 quota set --tenant-id tnt_xxx --max-storage-bytes 107374182400 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "set TiDBCloud tenant storage quota"},
+			},
+		},
+		{
 			Name:    "ctx",
 			Args:    "<show|add|import|fork|ls|use|rm>",
 			Summary: "manage local drive9 contexts",

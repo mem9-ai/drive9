@@ -93,7 +93,7 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 	).Scan(&cfg.MaxStorageBytes, &cfg.MaxMediaLLMFiles, &cfg.MaxMonthlyCostMC, &cfg.CreatedAt, &cfg.UpdatedAt)
 	if err == sql.ErrNoRows {
 		// Return defaults when no per-tenant config exists.
-		cfg.MaxStorageBytes = 53687091200 // 50 GiB
+		cfg.MaxStorageBytes = DefaultMaxStorageBytes()
 		cfg.MaxMediaLLMFiles = 500
 		cfg.MaxMonthlyCostMC = 0
 		return cfg, nil
@@ -102,6 +102,27 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// GetQuotaConfigVersion returns a lightweight version token for a tenant's
+// explicit quota config. An empty token means no row exists and callers should
+// use GetQuotaConfig's default config.
+func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
+	start := time.Now()
+	var err error
+	defer observeMeta(ctx, "get_quota_config_version", start, &err)
+
+	var updatedAt time.Time
+	err = s.db.QueryRowContext(ctx,
+		`SELECT updated_at FROM tenant_quota_config WHERE tenant_id = ?`, tenantID,
+	).Scan(&updatedAt)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return updatedAt.UTC().Format(time.RFC3339Nano), nil
 }
 
 // SetQuotaConfig upserts per-tenant quota configuration.
@@ -319,6 +340,11 @@ func (s *Store) AtomicReserveAndInsertUpload(ctx context.Context, r *UploadReser
 	defer observeMeta(ctx, "atomic_reserve_and_insert_upload", start, &err)
 
 	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		if _, execErr := tx.ExecContext(ctx,
+			`INSERT IGNORE INTO tenant_quota_usage (tenant_id) VALUES (?)`,
+			r.TenantID); execErr != nil {
+			return execErr
+		}
 		res, execErr := tx.ExecContext(ctx,
 			`UPDATE tenant_quota_usage
 			 SET reserved_bytes = reserved_bytes + ?
@@ -384,13 +410,29 @@ func (s *Store) GetFileMeta(ctx context.Context, tenantID, fileID string) (*File
 	var err error
 	defer observeMeta(ctx, "get_file_meta", start, &err)
 
-	fm := &FileMeta{TenantID: tenantID, FileID: fileID}
-	var isMedia int
-	err = s.db.QueryRowContext(ctx,
+	return scanFileMeta(s.db.QueryRowContext(ctx,
 		`SELECT size_bytes, is_media, created_at, updated_at
 		 FROM tenant_file_meta WHERE tenant_id = ? AND file_id = ?`,
 		tenantID, fileID,
-	).Scan(&fm.SizeBytes, &isMedia, &fm.CreatedAt, &fm.UpdatedAt)
+	), tenantID, fileID)
+}
+
+// GetFileMetaForUpdateTx returns quota-relevant file metadata and locks the row
+// for the caller's central quota transaction.
+func (s *Store) GetFileMetaForUpdateTx(tx *sql.Tx, tenantID, fileID string) (*FileMeta, error) {
+	return scanFileMeta(tx.QueryRow(
+		`SELECT size_bytes, is_media, created_at, updated_at
+		 FROM tenant_file_meta WHERE tenant_id = ? AND file_id = ? FOR UPDATE`,
+		tenantID, fileID,
+	), tenantID, fileID)
+}
+
+func scanFileMeta(row interface {
+	Scan(dest ...any) error
+}, tenantID, fileID string) (*FileMeta, error) {
+	fm := &FileMeta{TenantID: tenantID, FileID: fileID}
+	var isMedia int
+	err := row.Scan(&fm.SizeBytes, &isMedia, &fm.CreatedAt, &fm.UpdatedAt)
 	if err == sql.ErrNoRows {
 		err = ErrNotFound
 		return nil, err

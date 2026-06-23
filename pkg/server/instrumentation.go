@@ -296,6 +296,10 @@ func requestRoute(path string) string {
 		return "/healthz"
 	case path == "/v1/provision":
 		return "/v1/provision"
+	case path == "/v1/quota":
+		return "/v1/quota"
+	case path == "/v1/quota/query":
+		return "/v1/quota/query"
 	case path == "/v1/status":
 		return "/v1/status"
 	case path == "/v1/tenant":
@@ -383,6 +387,10 @@ func classifyTenantRequest(r *http.Request) tenantRequestClass {
 		return tenantRequestClass{surface: "status", action: strings.ToLower(r.Method)}
 	case path == "/v1/provision":
 		return tenantRequestClass{surface: "provision", action: strings.ToLower(r.Method)}
+	case path == "/v1/quota":
+		return tenantRequestClass{surface: "quota", action: strings.ToLower(r.Method)}
+	case path == "/v1/quota/query":
+		return tenantRequestClass{surface: "quota", action: "query"}
 	case path == "/v1/tenant":
 		return tenantRequestClass{surface: "tenant", action: strings.ToLower(r.Method)}
 	default:

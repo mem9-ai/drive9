@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"go.uber.org/zap"
 )
@@ -137,72 +139,79 @@ func (b *Dat9Backend) logAndEnqueueMutation(ctx context.Context, mutationType st
 		zap.Float64("total_ms", backendDurationMs(time.Since(start))))
 }
 
-func (b *Dat9Backend) syncCentralFileCreate(ctx context.Context, fileID string, sizeBytes int64, contentType string) {
-	isMedia := isQuotaMediaContentType(contentType)
-	b.logAndEnqueueMutation(ctx, "file_create", fileCreateMutationData{
+func applyCentralFileStateTx(store MetaQuotaStore, tx *sql.Tx, tenantID, fileID string, sizeBytes int64, isMedia bool) error {
+	oldSize := int64(0)
+	oldIsMedia := false
+	old, err := store.GetFileMetaForUpdateTx(tx, tenantID, fileID)
+	if err != nil {
+		if !errors.Is(err, meta.ErrNotFound) {
+			return err
+		}
+	} else if old != nil {
+		oldSize = old.SizeBytes
+		oldIsMedia = old.IsMedia
+	}
+	if err := store.UpsertFileMetaTx(tx, &FileMetaView{
+		TenantID:  tenantID,
 		FileID:    fileID,
 		SizeBytes: sizeBytes,
 		IsMedia:   isMedia,
-	}, func(tx *sql.Tx) error {
-		if err := b.metaStore.UpsertFileMetaTx(tx, &FileMetaView{
-			TenantID:  b.tenantID,
-			FileID:    fileID,
-			SizeBytes: sizeBytes,
-			IsMedia:   isMedia,
-		}); err != nil {
+	}); err != nil {
+		return err
+	}
+	storageDelta := sizeBytes - oldSize
+	if storageDelta != 0 {
+		if err := store.IncrStorageBytesTx(tx, tenantID, storageDelta); err != nil {
 			return err
 		}
-		if sizeBytes != 0 {
-			if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, sizeBytes); err != nil {
-				return err
-			}
+	}
+	mediaDelta := int64(0)
+	switch {
+	case !oldIsMedia && isMedia:
+		mediaDelta = 1
+	case oldIsMedia && !isMedia:
+		mediaDelta = -1
+	}
+	if mediaDelta != 0 {
+		if err := store.IncrMediaFileCountTx(tx, tenantID, mediaDelta); err != nil {
+			return err
 		}
-		if isMedia {
-			if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, 1); err != nil {
-				return err
-			}
-		}
-		return nil
+	}
+	return nil
+}
+
+func applyCentralFileCreateTx(store MetaQuotaStore, tx *sql.Tx, tenantID string, data fileCreateMutationData) error {
+	return applyCentralFileStateTx(store, tx, tenantID, data.FileID, data.SizeBytes, data.IsMedia)
+}
+
+func applyCentralFileOverwriteTx(store MetaQuotaStore, tx *sql.Tx, tenantID string, data fileOverwriteMutationData) error {
+	return applyCentralFileStateTx(store, tx, tenantID, data.FileID, data.NewSizeBytes, data.NewIsMedia)
+}
+
+func (b *Dat9Backend) syncCentralFileCreate(ctx context.Context, fileID string, sizeBytes int64, contentType string) {
+	isMedia := isQuotaMediaContentType(contentType)
+	data := fileCreateMutationData{
+		FileID:    fileID,
+		SizeBytes: sizeBytes,
+		IsMedia:   isMedia,
+	}
+	b.logAndEnqueueMutation(ctx, "file_create", data, func(tx *sql.Tx) error {
+		return applyCentralFileCreateTx(b.metaStore, tx, b.tenantID, data)
 	})
 }
 
 func (b *Dat9Backend) syncCentralFileOverwrite(ctx context.Context, fileID string, oldSize int64, oldContentType string, newSize int64, newContentType string) {
 	oldIsMedia := isQuotaMediaContentType(oldContentType)
 	newIsMedia := isQuotaMediaContentType(newContentType)
-	storageDelta := newSize - oldSize
-	mediaDelta := int64(0)
-	switch {
-	case !oldIsMedia && newIsMedia:
-		mediaDelta = 1
-	case oldIsMedia && !newIsMedia:
-		mediaDelta = -1
-	}
-	b.logAndEnqueueMutation(ctx, "file_overwrite", fileOverwriteMutationData{
+	data := fileOverwriteMutationData{
 		FileID:       fileID,
 		OldSizeBytes: oldSize,
 		OldIsMedia:   oldIsMedia,
 		NewSizeBytes: newSize,
 		NewIsMedia:   newIsMedia,
-	}, func(tx *sql.Tx) error {
-		if err := b.metaStore.UpsertFileMetaTx(tx, &FileMetaView{
-			TenantID:  b.tenantID,
-			FileID:    fileID,
-			SizeBytes: newSize,
-			IsMedia:   newIsMedia,
-		}); err != nil {
-			return err
-		}
-		if storageDelta != 0 {
-			if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, storageDelta); err != nil {
-				return err
-			}
-		}
-		if mediaDelta != 0 {
-			if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, mediaDelta); err != nil {
-				return err
-			}
-		}
-		return nil
+	}
+	b.logAndEnqueueMutation(ctx, "file_overwrite", data, func(tx *sql.Tx) error {
+		return applyCentralFileOverwriteTx(b.metaStore, tx, b.tenantID, data)
 	})
 }
 

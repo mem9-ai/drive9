@@ -88,7 +88,20 @@ func (f *fakeMetaQuotaStore) GetQuotaConfig(ctx context.Context, tenantID string
 		cp := *cfg
 		return &cp, nil
 	}
-	return &QuotaConfigView{TenantID: tenantID}, nil
+	return &QuotaConfigView{
+		TenantID:         tenantID,
+		MaxStorageBytes:  meta.DefaultMaxStorageBytes(),
+		MaxMediaLLMFiles: 500,
+	}, nil
+}
+
+func (f *fakeMetaQuotaStore) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cfg, ok := f.config[tenantID]; ok {
+		return fmt.Sprintf("%d:%d:%d", cfg.MaxStorageBytes, cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC), nil
+	}
+	return "", nil
 }
 
 func (f *fakeMetaQuotaStore) GetQuotaUsage(ctx context.Context, tenantID string) (*QuotaUsageView, error) {
@@ -160,7 +173,11 @@ func (f *fakeMetaQuotaStore) AtomicReserveAndInsertUpload(ctx context.Context, r
 	defer f.mu.Unlock()
 	cfg, ok := f.config[r.TenantID]
 	if !ok {
-		cfg = &QuotaConfigView{TenantID: r.TenantID}
+		cfg = &QuotaConfigView{
+			TenantID:         r.TenantID,
+			MaxStorageBytes:  meta.DefaultMaxStorageBytes(),
+			MaxMediaLLMFiles: 500,
+		}
 	}
 	u := f.ensureUsageLocked(r.TenantID)
 	if cfg.MaxStorageBytes > 0 && u.StorageBytes+u.ReservedBytes+r.ReservedBytes > cfg.MaxStorageBytes {
@@ -201,6 +218,10 @@ func (f *fakeMetaQuotaStore) GetFileMeta(ctx context.Context, tenantID, fileID s
 	}
 	cp := *fm
 	return &cp, nil
+}
+
+func (f *fakeMetaQuotaStore) GetFileMetaForUpdateTx(tx *sql.Tx, tenantID, fileID string) (*FileMetaView, error) {
+	return f.GetFileMeta(context.Background(), tenantID, fileID)
 }
 
 func (f *fakeMetaQuotaStore) DeleteFileMeta(ctx context.Context, tenantID, fileID string) error {

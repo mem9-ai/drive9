@@ -73,6 +73,7 @@ func TestServerModeBudgetGateWritesCentralOnly(t *testing.T) {
 	fake.mu.Lock()
 	fake.config["tenant-a"].MaxMonthlyCostMC = 100
 	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(context.Background())
 
 	b.recordImageExtractUsage("task-server-budget", ImageExtractUsage{
 		PromptTokens:     120,

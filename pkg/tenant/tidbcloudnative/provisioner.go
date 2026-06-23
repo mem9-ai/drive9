@@ -38,6 +38,10 @@ const (
 	DefaultSpendLimit   = int32(1000)
 	stateActive         = "ACTIVE"
 
+	Drive9ManagedLabel       = "drive9.ai/managed"
+	Drive9TenantIDLabel      = "drive9.ai/tenant_id"
+	Drive9QuotaUpdateAtLabel = "drive9.ai/update_quota_at"
+
 	upstreamErrorBodyLimit = 2048
 )
 
@@ -182,6 +186,10 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 		"rootPassword": password,
 		"region": map[string]string{
 			"name": p.regionName(),
+		},
+		"labels": map[string]string{
+			Drive9ManagedLabel:  "true",
+			Drive9TenantIDLabel: tenantID,
 		},
 	}
 	if p.defaultSpendLimit != nil {
@@ -424,6 +432,85 @@ func (p *Provisioner) DeprovisionWithCredentials(ctx context.Context, cluster *t
 	return nil
 }
 
+func (p *Provisioner) UpdateQuotaWithCredentials(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return fmt.Errorf("cluster id is required")
+	}
+	labels, err := p.clusterLabels(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
+	if err != nil {
+		return err
+	}
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+	labels[Drive9ManagedLabel] = "true"
+	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
+		labels[Drive9TenantIDLabel] = tenantID
+	}
+	labels[Drive9QuotaUpdateAtLabel] = time.Now().UTC().Format(time.RFC3339Nano)
+
+	body, err := json.Marshal(map[string]any{
+		"cluster": map[string]any{
+			"labels": labels,
+		},
+		"updateMask": "labels",
+	})
+	if err != nil {
+		return err
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(strings.TrimSpace(cluster.ClusterID)))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPatch, endpoint, body)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return quotaStatusError("cluster label update", resp.StatusCode, sanitizeUpstreamBody(raw))
+	}
+	return nil
+}
+
+func (p *Provisioner) AuthorizeQuotaWithCredentials(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return fmt.Errorf("cluster id is required")
+	}
+	_, err := p.clusterLabels(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
+	return err
+}
+
+func (p *Provisioner) clusterLabels(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, error) {
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, quotaStatusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
+	}
+	info, err := parseClusterInfo(raw)
+	if err != nil {
+		return nil, err
+	}
+	labels := make(map[string]string, len(info.Labels)+3)
+	for k, v := range info.Labels {
+		labels[k] = v
+	}
+	return labels, nil
+}
+
 func (p *Provisioner) regionName() string {
 	if strings.HasPrefix(p.region, "regions/") {
 		return p.region
@@ -555,6 +642,18 @@ func statusError(operation string, code int, upstreamBody string) string {
 	return msg
 }
 
+func quotaStatusError(operation string, code int, upstreamBody string) error {
+	msg := statusError(operation, code, upstreamBody)
+	switch code {
+	case http.StatusForbidden:
+		return fmt.Errorf("%w: %s", tenant.ErrQuotaPermissionDenied, msg)
+	case http.StatusNotFound:
+		return fmt.Errorf("%w: %s", tenant.ErrQuotaBackendNotFound, msg)
+	default:
+		return fmt.Errorf("%s", msg)
+	}
+}
+
 func ensureDatabase(ctx context.Context, user, password, host string, port int, dbName string) error {
 	cfg := mysql.NewConfig()
 	cfg.User = user
@@ -575,8 +674,9 @@ func ensureDatabase(ctx context.Context, user, password, host string, port int, 
 }
 
 type clusterInfo struct {
-	ClusterID string `json:"clusterId"`
-	State     string `json:"state"`
+	ClusterID string            `json:"clusterId"`
+	State     string            `json:"state"`
+	Labels    map[string]string `json:"labels"`
 	Endpoints struct {
 		Public struct {
 			Host string `json:"host"`

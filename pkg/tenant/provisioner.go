@@ -9,6 +9,8 @@ import (
 
 var ErrCredentialsRequired = errors.New("public_key and private_key are required")
 var ErrPartialCredentials = errors.New("both public_key and private_key must be provided together")
+var ErrQuotaPermissionDenied = errors.New("tidbcloud quota update permission denied")
+var ErrQuotaBackendNotFound = errors.New("tidbcloud quota backend not found")
 
 type ClusterInfo struct {
 	TenantID       string
@@ -48,6 +50,16 @@ type CredentialProvisioner interface {
 type CredentialDeprovisioner interface {
 	Provisioner
 	DeprovisionWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
+}
+
+type CredentialQuotaUpdater interface {
+	Provisioner
+	UpdateQuotaWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
+}
+
+type CredentialQuotaAuthorizer interface {
+	Provisioner
+	AuthorizeQuotaWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
 }
 
 type BranchProvisioner interface {

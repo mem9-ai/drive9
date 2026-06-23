@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -37,6 +38,11 @@ func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targe
 		return false, nil
 	}
 	start := time.Now()
+
+	if err := b.ensureUploadReserveFitsPendingQuota(ctx, totalSize); err != nil {
+		metrics.RecordOperation("central_quota", "reserve_upload", "quota_exceeded", time.Since(start))
+		return false, err
+	}
 
 	err := b.metaStore.AtomicReserveAndInsertUpload(ctx, &UploadReservationView{
 		TenantID:      b.tenantID,
@@ -71,6 +77,35 @@ func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targe
 		// Fail-open: allow the upload to proceed when the server DB is down.
 		return false, nil
 	}
+}
+
+func (b *Dat9Backend) ensureUploadReserveFitsPendingQuota(ctx context.Context, totalSize int64) error {
+	if !b.UseServerQuota() || totalSize <= 0 {
+		return nil
+	}
+	cfg := b.cachedQuotaConfig(ctx)
+	if cfg == nil {
+		metrics.RecordOperation("server_quota", "upload_reserve_pending_check", "fail_open", 0)
+		return nil
+	}
+	if cfg.MaxStorageBytes <= 0 {
+		return nil
+	}
+	usage := b.loadQuotaUsage(ctx)
+	if usage == nil {
+		metrics.RecordOperation("server_quota", "upload_reserve_pending_check", "fail_open", 0)
+		return nil
+	}
+	pendingStorageDelta, _, pendingOK := b.pendingQuotaOutboxDeltas(ctx)
+	if !pendingOK {
+		metrics.RecordOperation("server_quota", "upload_reserve_pending_check", "fail_open", 0)
+	}
+	projected := usage.StorageBytes + usage.ReservedBytes + pendingStorageDelta + totalSize
+	if projected > cfg.MaxStorageBytes {
+		return fmt.Errorf("%w: server limit=%d used=%d reserved=%d pending=%d delta=%d",
+			ErrStorageQuotaExceeded, cfg.MaxStorageBytes, usage.StorageBytes, usage.ReservedBytes, pendingStorageDelta, totalSize)
+	}
+	return nil
 }
 
 // --- Upload abort: release reservation ---

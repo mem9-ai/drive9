@@ -276,6 +276,8 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
+	mux.Handle("/v1/quota", s.quotaRootHandler(cfg))
+	mux.HandleFunc("/v1/quota/query", s.handleQuotaCredentialQuery)
 	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)

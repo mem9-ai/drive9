@@ -3,6 +3,7 @@ package tidbcloudnative
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -133,6 +134,7 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 		Region       struct {
 			Name string `json:"name"`
 		} `json:"region"`
+		Labels        map[string]string `json:"labels"`
 		SpendingLimit struct {
 			Monthly int32 `json:"monthly"`
 		} `json:"spendingLimit"`
@@ -208,6 +210,9 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	}
 	if gotBody.RootPassword == "" {
 		t.Fatal("rootPassword was empty")
+	}
+	if gotBody.Labels[Drive9ManagedLabel] != "true" || gotBody.Labels[Drive9TenantIDLabel] != "tenant-1" {
+		t.Fatalf("labels = %#v", gotBody.Labels)
 	}
 	if gotBody.SpendingLimit.Monthly != 5000 {
 		t.Fatalf("spendingLimit.monthly = %d, want 5000", gotBody.SpendingLimit.Monthly)
@@ -565,6 +570,161 @@ func TestDeprovisionWithCredentialsDeletesCluster(t *testing.T) {
 	}
 	if strings.Contains(gotAuth, "private-1") {
 		t.Fatalf("Authorization header leaked private key: %q", gotAuth)
+	}
+}
+
+func TestUpdateQuotaWithCredentialsMergesDrive9Labels(t *testing.T) {
+	var patchCalled bool
+	var gotAuth string
+	var gotPatch struct {
+		Cluster struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"cluster"`
+		UpdateMask string `json:"updateMask"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/v1beta1/clusters/cluster-1" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		switch r.Method {
+		case http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-1",
+				"labels": map[string]string{
+					"environment":         "prod",
+					Drive9ManagedLabel:    "old",
+					Drive9TenantIDLabel:   "old-tenant",
+					"drive9.ai/unrelated": "keep",
+				},
+			})
+		case http.MethodPatch:
+			patchCalled = true
+			if err := json.NewDecoder(r.Body).Decode(&gotPatch); err != nil {
+				t.Fatalf("decode patch: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"clusterId": "cluster-1"})
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	err := p.UpdateQuotaWithCredentials(context.Background(), &tenant.ClusterInfo{
+		TenantID:  "tenant-1",
+		ClusterID: "cluster-1",
+	}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err != nil {
+		t.Fatalf("UpdateQuotaWithCredentials: %v", err)
+	}
+	if !patchCalled {
+		t.Fatal("PATCH was not called")
+	}
+	if !strings.Contains(gotAuth, `username="public-1"`) {
+		t.Fatalf("Authorization header did not use request public key: %q", gotAuth)
+	}
+	if gotPatch.UpdateMask != "labels" {
+		t.Fatalf("updateMask = %q, want labels", gotPatch.UpdateMask)
+	}
+	labels := gotPatch.Cluster.Labels
+	if labels["environment"] != "prod" || labels["drive9.ai/unrelated"] != "keep" {
+		t.Fatalf("existing labels were not preserved: %#v", labels)
+	}
+	if labels[Drive9ManagedLabel] != "true" || labels[Drive9TenantIDLabel] != "tenant-1" {
+		t.Fatalf("drive9 labels = %#v", labels)
+	}
+	if labels[Drive9QuotaUpdateAtLabel] == "" {
+		t.Fatalf("%s label was empty: %#v", Drive9QuotaUpdateAtLabel, labels)
+	}
+}
+
+func TestAuthorizeQuotaWithCredentialsOnlyGetsCluster(t *testing.T) {
+	var patchCalled bool
+	var getCalled bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			getCalled = true
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-1",
+				"labels":    map[string]string{Drive9ManagedLabel: "true"},
+			})
+		case http.MethodPatch:
+			patchCalled = true
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	err := p.AuthorizeQuotaWithCredentials(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err != nil {
+		t.Fatalf("AuthorizeQuotaWithCredentials: %v", err)
+	}
+	if !getCalled {
+		t.Fatal("GET was not called")
+	}
+	if patchCalled {
+		t.Fatal("PATCH should not be called for read-only quota authorization")
+	}
+}
+
+func TestQuotaCredentialErrorsMapForbiddenAndNotFound(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		target     error
+	}{
+		{name: "forbidden", statusCode: http.StatusForbidden, target: tenant.ErrQuotaPermissionDenied},
+		{name: "not_found", statusCode: http.StatusNotFound, target: tenant.ErrQuotaBackendNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "" {
+					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				http.Error(w, "upstream says no", tc.statusCode)
+			}))
+			defer ts.Close()
+
+			p := &Provisioner{
+				apiURL: ts.URL,
+				client: ts.Client(),
+			}
+			err := p.AuthorizeQuotaWithCredentials(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
+				PublicKey:  "public-1",
+				PrivateKey: "private-1",
+			})
+			if !errors.Is(err, tc.target) {
+				t.Fatalf("err = %v, want errors.Is(%v)", err, tc.target)
+			}
+		})
 	}
 }
 
