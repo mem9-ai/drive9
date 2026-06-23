@@ -37,6 +37,7 @@ IMAGE_REPO ?= drive9-server
 IMAGE_TAG ?= latest
 IMAGE ?= $(IMAGE_REPO):$(IMAGE_TAG)
 LINT_TIMEOUT ?= 10m
+TEST_TIMEOUT ?= 15m
 TEST_P ?=
 TEST_RUN ?=
 TEST_PKGS ?= ./...
@@ -77,7 +78,7 @@ test:
 			echo "make test: Podman testcontainers setup unavailable, falling back to default runtime" >&2; \
 		fi; \
 	fi; \
-	$(GO) test $$test_p_flag $$test_run_flag -v $(TEST_PKGS)
+	$(GO) test $$test_p_flag $$test_run_flag -v -timeout $(TEST_TIMEOUT) $(TEST_PKGS)
 
 # Run only failpoint-tagged tests through repository-wide instrumentation.
 # Do not run this concurrently with the normal test target because failpoint-ctl
