@@ -470,7 +470,7 @@ func (p *Provisioner) UpdateQuota(ctx context.Context, cluster *tenant.ClusterIn
 	clusterID := strings.TrimSpace(cluster.ClusterID)
 	labels, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load cluster quota info: %w", err)
 	}
 	if labels == nil {
 		labels = make(map[string]string)
@@ -488,25 +488,25 @@ func (p *Provisioner) UpdateQuota(ctx context.Context, cluster *tenant.ClusterIn
 		"updateMask": "labels",
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("marshal cluster label patch: %w", err)
 	}
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPatch, endpoint, body)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("patch cluster labels: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
-			return nil, readErr
+			return nil, fmt.Errorf("read cluster label update error body: %w", readErr)
 		}
 		return nil, quotaStatusError("cluster label update", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	if opts.TiDBCloudSpendingLimitMonthly != nil {
 		monthly := *opts.TiDBCloudSpendingLimitMonthly
 		if err := p.updateSpendingLimitWithCredentials(ctx, publicKey, privateKey, clusterID, monthly); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("update cluster spending limit: %w", err)
 		}
 		if cloudCfg == nil {
 			cloudCfg = &tenant.QuotaCloudConfig{}
@@ -526,30 +526,33 @@ func (p *Provisioner) GetQuota(ctx context.Context, cluster *tenant.ClusterInfo,
 		return nil, fmt.Errorf("cluster id is required")
 	}
 	_, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
-	return cloudCfg, err
+	if err != nil {
+		return nil, fmt.Errorf("load cluster quota info: %w", err)
+	}
+	return cloudCfg, nil
 }
 
 func (p *Provisioner) clusterQuotaInfo(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, *tenant.QuotaCloudConfig, error) {
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("get cluster quota info: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
-			return nil, nil, readErr
+			return nil, nil, fmt.Errorf("read cluster get error body: %w", readErr)
 		}
 		return nil, nil, quotaStatusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
-		return nil, nil, readErr
+		return nil, nil, fmt.Errorf("read cluster body: %w", readErr)
 	}
 	info, err := parseClusterInfo(raw)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("parse cluster quota info: %w", err)
 	}
 	labels := make(map[string]string, len(info.Labels)+3)
 	for k, v := range info.Labels {
@@ -573,18 +576,18 @@ func (p *Provisioner) updateSpendingLimitWithCredentials(ctx context.Context, pu
 		},
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal cluster spending limit patch: %w", err)
 	}
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPatch, endpoint, body)
 	if err != nil {
-		return err
+		return fmt.Errorf("patch cluster spending limit: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
-			return readErr
+			return fmt.Errorf("read cluster spending limit update error body: %w", readErr)
 		}
 		return quotaStatusError("cluster spending limit update", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}

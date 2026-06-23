@@ -104,25 +104,28 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 	return cfg, nil
 }
 
-// GetQuotaConfigVersion returns a lightweight version token for a tenant's
+// GetQuotaConfigVersion returns a lightweight content token for a tenant's
 // explicit quota config. An empty token means no row exists and callers should
-// use GetQuotaConfig's default config.
+// use GetQuotaConfig's default config. The token is derived from the effective
+// config values instead of updated_at so updates inside the same timestamp tick
+// cannot hide a real config change from cache invalidation.
 func (s *Store) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
 	start := time.Now()
 	var err error
 	defer observeMeta(ctx, "get_quota_config_version", start, &err)
 
-	var updatedAt time.Time
+	var maxStorageBytes, maxMediaLLMFiles, maxMonthlyCostMC int64
 	err = s.db.QueryRowContext(ctx,
-		`SELECT updated_at FROM tenant_quota_config WHERE tenant_id = ?`, tenantID,
-	).Scan(&updatedAt)
+		`SELECT max_storage_bytes, max_media_llm_files, max_monthly_cost_mc
+		 FROM tenant_quota_config WHERE tenant_id = ?`, tenantID,
+	).Scan(&maxStorageBytes, &maxMediaLLMFiles, &maxMonthlyCostMC)
 	if err == sql.ErrNoRows {
 		return "", nil
 	}
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("get quota config version for tenant %q: %w", tenantID, err)
 	}
-	return updatedAt.UTC().Format(time.RFC3339Nano), nil
+	return fmt.Sprintf("v1:%d:%d:%d", maxStorageBytes, maxMediaLLMFiles, maxMonthlyCostMC), nil
 }
 
 // SetQuotaConfig upserts per-tenant quota configuration.
@@ -156,7 +159,10 @@ func (s *Store) SetQuotaStorageBytes(ctx context.Context, tenantID string, maxSt
 		 ON DUPLICATE KEY UPDATE
 		   max_storage_bytes = VALUES(max_storage_bytes)`,
 		tenantID, maxStorageBytes)
-	return err
+	if err != nil {
+		return fmt.Errorf("set quota storage bytes for tenant %q: %w", tenantID, err)
+	}
+	return nil
 }
 
 func (s *Store) CopyQuotaConfig(ctx context.Context, sourceTenantID, destTenantID string) error {

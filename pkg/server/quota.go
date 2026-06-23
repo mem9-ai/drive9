@@ -9,6 +9,9 @@ import (
 	"net/http"
 	"strings"
 
+	"go.uber.org/zap"
+
+	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
@@ -92,7 +95,7 @@ func (s *Server) handleQuotaGet(w http.ResponseWriter, r *http.Request) {
 	}
 	cloudCfg, err := getter.GetQuota(r.Context(), clusterInfoFromTenant(t), cred)
 	if err != nil {
-		writeQuotaCredentialError(w, err, "query")
+		writeQuotaCredentialError(w, r.Context(), err, "query")
 		return
 	}
 	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, classifyTenantRequest(r))
@@ -157,7 +160,7 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		TiDBCloudSpendingLimitMonthly: req.TiDBCloudSpendingLimit,
 	})
 	if err != nil {
-		writeQuotaCredentialError(w, err, "update")
+		writeQuotaCredentialError(w, r.Context(), err, "update")
 		return
 	}
 	if req.MaxStorageSize != nil {
@@ -312,13 +315,14 @@ func quotaStorageBytesToSize(sizeBytes int64) int64 {
 
 const quotaBackendNotFoundMessage = "backend service exception; please check TiDB Cloud starter/native cluster status"
 
-func writeQuotaCredentialError(w http.ResponseWriter, err error, action string) {
+func writeQuotaCredentialError(w http.ResponseWriter, ctx context.Context, err error, action string) {
 	switch {
 	case errors.Is(err, tenant.ErrQuotaPermissionDenied):
 		errJSON(w, http.StatusForbidden, "no permission to "+action+" quota with TiDB Cloud API key")
 	case errors.Is(err, tenant.ErrQuotaBackendNotFound):
 		errJSON(w, http.StatusNotFound, quotaBackendNotFoundMessage)
 	default:
-		errJSON(w, http.StatusBadGateway, fmt.Sprintf("tidbcloud quota %s failed: %v", action, err))
+		logger.Warn(ctx, "tidbcloud_quota_failed", zap.String("action", action), zap.Error(err))
+		errJSON(w, http.StatusBadGateway, "tidbcloud quota "+action+" failed")
 	}
 }

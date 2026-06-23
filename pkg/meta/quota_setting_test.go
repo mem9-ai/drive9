@@ -44,13 +44,13 @@ func TestGetQuotaConfigUsesConfiguredDefaultStorageBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.MaxStorageBytes != 12345 {
-		t.Fatalf("MaxStorageBytes = %d, want configured default 12345", cfg.MaxStorageBytes)
+		t.Errorf("MaxStorageBytes = %d, want configured default 12345", cfg.MaxStorageBytes)
 	}
 	if cfg.MaxMediaLLMFiles != 500 {
-		t.Fatalf("MaxMediaLLMFiles = %d, want default 500", cfg.MaxMediaLLMFiles)
+		t.Errorf("MaxMediaLLMFiles = %d, want default 500", cfg.MaxMediaLLMFiles)
 	}
 	if cfg.MaxMonthlyCostMC != 0 {
-		t.Fatalf("MaxMonthlyCostMC = %d, want default 0", cfg.MaxMonthlyCostMC)
+		t.Errorf("MaxMonthlyCostMC = %d, want default 0", cfg.MaxMonthlyCostMC)
 	}
 }
 
@@ -81,6 +81,16 @@ func TestGetQuotaConfigVersion(t *testing.T) {
 	if version == "" {
 		t.Fatal("version for explicit config is empty")
 	}
+	if err := s.SetQuotaStorageBytes(ctx, "tenant-with-config", 321); err != nil {
+		t.Fatal(err)
+	}
+	nextVersion, err := s.GetQuotaConfigVersion(ctx, "tenant-with-config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nextVersion == version {
+		t.Fatalf("version after config value change = %q, want different from %q", nextVersion, version)
+	}
 }
 
 func TestSetQuotaStorageBytesUpdatesStorageOnly(t *testing.T) {
@@ -103,7 +113,7 @@ func TestSetQuotaStorageBytesUpdatesStorageOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.MaxStorageBytes != 999 || cfg.MaxMediaLLMFiles != 200 || cfg.MaxMonthlyCostMC != 300 {
-		t.Fatalf("cfg = %+v, want storage=999 media=200 monthly=300", cfg)
+		t.Errorf("cfg = %+v, want storage=999 media=200 monthly=300", cfg)
 	}
 }
 
@@ -119,7 +129,7 @@ func TestSetQuotaStorageBytesInsertsInternalDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.MaxStorageBytes != 12345 || cfg.MaxMediaLLMFiles != 500 || cfg.MaxMonthlyCostMC != 0 {
-		t.Fatalf("cfg = %+v, want storage patch with internal defaults", cfg)
+		t.Errorf("cfg = %+v, want storage patch with internal defaults", cfg)
 	}
 }
 

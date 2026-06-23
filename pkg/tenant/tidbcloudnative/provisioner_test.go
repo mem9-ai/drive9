@@ -731,16 +731,16 @@ func TestUpdateQuotaPatchesSpendingLimitAfterLabels(t *testing.T) {
 		t.Fatalf("UpdateQuota: %v", err)
 	}
 	if len(order) != 3 || order[0] != "GET" || order[1] != "PATCH labels" || order[2] != "PATCH spendingLimit.monthly" {
-		t.Fatalf("order = %#v", order)
+		t.Errorf("order = %#v", order)
 	}
 	if gotLabelPatch.Cluster.Labels[Drive9ManagedLabel] != "true" || gotLabelPatch.Cluster.Labels[Drive9TenantIDLabel] != "tenant-1" {
-		t.Fatalf("label patch = %#v", gotLabelPatch)
+		t.Errorf("label patch = %#v", gotLabelPatch)
 	}
 	if gotSpendingPatch.UpdateMask != "spendingLimit.monthly" || gotSpendingPatch.Cluster.SpendingLimit.Monthly != int32(monthly) {
-		t.Fatalf("spending patch = %#v", gotSpendingPatch)
+		t.Errorf("spending patch = %#v", gotSpendingPatch)
 	}
 	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly == nil || *cfg.TiDBCloudSpendingLimitMonthly != monthly {
-		t.Fatalf("cloud config = %#v, want spending limit %d", cfg, monthly)
+		t.Errorf("cloud config = %#v, want spending limit %d", cfg, monthly)
 	}
 }
 

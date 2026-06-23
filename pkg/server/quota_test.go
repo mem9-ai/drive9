@@ -488,6 +488,34 @@ func TestQuotaSetMapsTiDBCloudCredentialErrorsWithoutWritingConfig(t *testing.T)
 	}
 }
 
+func TestQuotaSetHidesGenericTiDBCloudQuotaError(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.updateErr = errors.New("upstream leaked detail")
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
+		"tenant_id":        rt.tenantID,
+		"public_key":       "public-1",
+		"private_key":      "private-1",
+		"max_storage_size": int64(1000),
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "tidbcloud quota update failed") {
+		t.Fatalf("body = %q, want stable quota failure message", raw)
+	}
+	if strings.Contains(string(raw), "upstream leaked detail") {
+		t.Fatalf("body leaked upstream detail: %q", raw)
+	}
+}
+
 func postJSON(t *testing.T, url string, body map[string]any, apiKey string) *http.Response {
 	t.Helper()
 	raw, err := json.Marshal(body)
