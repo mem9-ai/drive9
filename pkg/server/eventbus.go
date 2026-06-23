@@ -5,6 +5,8 @@ import (
 	"sync"
 
 	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 // ChangeEvent represents a single filesystem mutation event.
@@ -109,7 +111,11 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 		// that would cause continuous full-cache invalidation. Instead, return
 		// ok=true with empty events (caught up). The FUSE client's TTL/HEAD
 		// revalidation provides correctness without SSE. Only since=0 (initial
-		// connection) sends a reset.
+		// connection) sends a reset. Log the error so operators can detect
+		// persistent table-missing or DB connectivity issues.
+		logger.Warn(ctx, "event_bus_query_failed",
+			zap.Uint64("since", since),
+			zap.Error(err))
 		headSeq = since // keep the client's cursor unchanged
 		return nil, headSeq, true
 	}
@@ -123,7 +129,14 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 			Ts:    r.Ts,
 		})
 	}
-	headSeq = eb.Seq(ctx)
+	// Derive headSeq from the query results: if we got rows, headSeq is the
+	// last row's seq; if no rows, headSeq stays at since (caught up). This
+	// avoids a separate SELECT MAX(seq) round-trip on every poll.
+	if len(events) > 0 {
+		headSeq = events[len(events)-1].Seq
+	} else {
+		headSeq = since
+	}
 	// If no new events but the table is empty (all events pruned) and since > 0,
 	// the client's cursor is stale → send reset (like the old ring buffer's
 	// "since > newestSeq" case). If the table has events but none after since,

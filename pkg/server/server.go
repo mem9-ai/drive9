@@ -591,16 +591,6 @@ func (s *Server) stopLeaderWorkers() {
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Stop()
 	}
-	s.stopLeaderWorkers()
-	s.leaderWorkerMu.Lock()
-	if s.leaderWorkerCancel != nil {
-		s.leaderWorkerCancel()
-	}
-	s.leaderWorkerMu.Unlock()
-	s.leaderWorkerWG.Wait()
-	if s.leader != nil {
-		s.leader.Stop()
-	}
 }
 
 // startLeaderGoroutine launches a goroutine that runs fn under the leader

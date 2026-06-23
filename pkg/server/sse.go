@@ -161,6 +161,9 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 	bus := s.tenantEventBus(r)
 	// Best-effort durable insert: if it fails, local SSE clients still get the
 	// event via the notify signal; cross-pod clients get a reset on reconnect.
+	// For existing tenants without the fs_events table (pre-migration), the
+	// INSERT will fail until EnsureTiDBSchemaForAutoEmbeddingProfile creates
+	// the table (triggered automatically by the CRC32 schema version bump).
 	if bus.store != nil {
 		if _, err := bus.store.InsertFSEvent(r.Context(), path, op, actor, time.Now().UnixMilli()); err != nil {
 			logger.Warn(r.Context(), "sse_publish_fs_event_insert_failed",
