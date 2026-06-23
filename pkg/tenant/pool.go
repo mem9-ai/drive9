@@ -47,10 +47,10 @@ type PoolConfig struct {
 	// against plain MySQL but need a TiDB-class provider for vault.
 	SkipTiDBSchemaCheck bool
 
-	// DisableDatabaseAutoEmbedding forces DatabaseAutoEmbedding=false for all
-	// tenants, even when the provider normally enables it (tidb_zero,
-	// tidb_cloud_starter). Use when the TiDB Cloud cluster does not have a
-	// supported auto-embedding provider configured.
+	// DisableDatabaseAutoEmbedding forces runtime DatabaseAutoEmbedding=false
+	// for all tenants, even when the provider normally enables it (tidb_zero,
+	// tidb_cloud_starter). It suppresses writes that would trigger DB-side
+	// EMBED_TEXT, but TiDB tenants still use the normal auto schema repair.
 	DisableDatabaseAutoEmbedding bool
 }
 
@@ -584,15 +584,17 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
 	migrateDurationMs := 0.0
-	if opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter || t.Provider == ProviderTiDBCloudNative) {
+	if UsesTiDBAutoEmbedding(t.Provider) {
 		autoEmbeddingProfile, err := p.autoEmbeddingProfileForTenant(ctx, t)
 		if err != nil {
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
 		}
-		if err := applyTiDBAutoEmbeddingProviderConfig(ctx, store.DB(), autoEmbeddingProfile.provider); err != nil {
-			_ = store.Close()
-			return nil, nil, fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
+		if !p.cfg.DisableDatabaseAutoEmbedding {
+			if err := applyTiDBAutoEmbeddingProviderConfig(ctx, store.DB(), autoEmbeddingProfile.provider); err != nil {
+				_ = store.Close()
+				return nil, nil, fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
+			}
 		}
 		if !p.cfg.SkipTiDBSchemaCheck {
 			targetSchemaVersion, err := schema.TiDBTenantSchemaVersionForAutoEmbeddingProfile(autoEmbeddingProfile.schemaProfile)
@@ -606,7 +608,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 					_ = store.Close()
 					return nil, nil, fmt.Errorf("ensure tidb auto-embedding schema: %w", err)
 				}
-				ensureSchemaDurationMs = float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
+				ensureSchemaDurationMs += float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
 				if p.metaStore != nil {
 					// Record the tenant-profile-specific version only after the
 					// schema has been confirmed to match that tenant's profile.
@@ -624,7 +626,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 					_ = store.Close()
 					return nil, nil, fmt.Errorf("validate tidb auto-embedding schema: %w", err)
 				}
-				ensureSchemaDurationMs = float64(time.Since(validateSchemaStart).Microseconds()) / 1000.0
+				ensureSchemaDurationMs += float64(time.Since(validateSchemaStart).Microseconds()) / 1000.0
 			}
 		}
 	}
