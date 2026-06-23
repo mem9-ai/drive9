@@ -22,18 +22,30 @@ import (
 )
 
 type quotaTestProvisioner struct {
-	provider        string
-	updateErr       error
-	getErr          error
-	cloudCfg        *tenant.QuotaCloudConfig
-	updateCalls     atomic.Int32
-	getCalls        atomic.Int32
-	lastCluster     *tenant.ClusterInfo
-	lastCredentials tenant.CredentialProvisionRequest
-	lastOptions     tenant.QuotaUpdateOptions
+	provider          string
+	updateErr         error
+	getErr            error
+	cloudCfg          *tenant.QuotaCloudConfig
+	defaultPublicKey  string
+	defaultPrivateKey string
+	updateCalls       atomic.Int32
+	getCalls          atomic.Int32
+	lastCluster       *tenant.ClusterInfo
+	lastCredentials   tenant.CredentialProvisionRequest
+	lastOptions       tenant.QuotaUpdateOptions
 }
 
 func (p *quotaTestProvisioner) ProviderType() string { return p.provider }
+
+func (p *quotaTestProvisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, bool) {
+	if p.defaultPublicKey == "" || p.defaultPrivateKey == "" {
+		return tenant.CredentialProvisionRequest{}, false
+	}
+	return tenant.CredentialProvisionRequest{
+		PublicKey:  p.defaultPublicKey,
+		PrivateKey: p.defaultPrivateKey,
+	}, true
+}
 
 func (p *quotaTestProvisioner) Provision(context.Context, string) (*tenant.ClusterInfo, error) {
 	return nil, errors.New("not implemented")
@@ -161,6 +173,53 @@ func TestQuotaGetRejectsDrive9Key(t *testing.T) {
 	}
 	if got := rt.prov.updateCalls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
+	}
+}
+
+func TestQuotaGetDoesNotFallbackToDefaultTiDBCloudCredentials(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.defaultPublicKey = "default-pk"
+	rt.prov.defaultPrivateKey = "default-sk"
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := getQuota(t, ts.URL, rt.tenantID, "", "", "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), tenant.ErrCredentialsRequired.Error()) {
+		t.Fatalf("body = %q, want missing credential error", raw)
+	}
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("get calls = %d, want 0", got)
+	}
+	if rt.prov.lastCredentials.PublicKey == "default-pk" || rt.prov.lastCredentials.PrivateKey == "default-sk" {
+		t.Fatalf("quota get used default credentials: %#v", rt.prov.lastCredentials)
+	}
+}
+
+func TestQuotaGetAllowsExplicitDefaultTiDBCloudCredentials(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.defaultPublicKey = "default-pk"
+	rt.prov.defaultPrivateKey = "default-sk"
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := getQuota(t, ts.URL, rt.tenantID, "default-pk", "default-sk", "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := rt.prov.getCalls.Load(); got != 1 {
+		t.Fatalf("get calls = %d, want 1", got)
+	}
+	if rt.prov.lastCredentials.PublicKey != "default-pk" || rt.prov.lastCredentials.PrivateKey != "default-sk" {
+		t.Fatalf("last credentials = %#v", rt.prov.lastCredentials)
 	}
 }
 
@@ -341,6 +400,61 @@ func TestQuotaSetRejectsDrive9KeyWithoutTiDBCloudCredentials(t *testing.T) {
 	}
 	if version != "" {
 		t.Fatalf("quota config version = %q, want empty", version)
+	}
+}
+
+func TestQuotaSetDoesNotFallbackToDefaultTiDBCloudCredentials(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.defaultPublicKey = "default-pk"
+	rt.prov.defaultPrivateKey = "default-sk"
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
+		"tenant_id":        rt.tenantID,
+		"max_storage_size": int64(1000),
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), tenant.ErrCredentialsRequired.Error()) {
+		t.Fatalf("body = %q, want missing credential error", raw)
+	}
+	if got := rt.prov.updateCalls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0", got)
+	}
+	if rt.prov.lastCredentials.PublicKey == "default-pk" || rt.prov.lastCredentials.PrivateKey == "default-sk" {
+		t.Fatalf("quota set used default credentials: %#v", rt.prov.lastCredentials)
+	}
+}
+
+func TestQuotaSetAllowsExplicitDefaultTiDBCloudCredentials(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.defaultPublicKey = "default-pk"
+	rt.prov.defaultPrivateKey = "default-sk"
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
+		"tenant_id":        rt.tenantID,
+		"public_key":       "default-pk",
+		"private_key":      "default-sk",
+		"max_storage_size": int64(1000),
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got := rt.prov.updateCalls.Load(); got != 1 {
+		t.Fatalf("update calls = %d, want 1", got)
+	}
+	if rt.prov.lastCredentials.PublicKey != "default-pk" || rt.prov.lastCredentials.PrivateKey != "default-sk" {
+		t.Fatalf("last credentials = %#v", rt.prov.lastCredentials)
 	}
 }
 

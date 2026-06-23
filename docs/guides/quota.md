@@ -27,6 +27,10 @@ Quota responses also include usage counters:
 
 Quota query and update both require TiDB Cloud API keys plus a Drive9 tenant id.
 A Drive9 tenant API key is not accepted for quota query or update.
+Server-side default TiDB Cloud credentials configured for tenant provision or
+deprovision are not used as a fallback by quota query or update. Callers must
+supply TiDB Cloud credentials on each quota request; those credentials may be
+the same keys as the server defaults when passed explicitly.
 
 Only `tidb_cloud_native` tenants support quota update through this API. Other
 tenant providers use their configured defaults.
