@@ -283,6 +283,9 @@ func TestCtxForkAcceptsFailedResponseAndSavesAPIKey(t *testing.T) {
 	if !strings.Contains(out, "drive9 delete") {
 		t.Errorf("missing delete guidance in output: %q", out)
 	}
+	if !strings.Contains(out, "DRIVE9_PUBLIC_KEY") || !strings.Contains(out, "DRIVE9_PRIVATE_KEY") {
+		t.Errorf("missing correct TiDB Cloud env var names in output: %q", out)
+	}
 	got := loadConfig()
 	if got.Contexts["test-fork"] == nil || got.Contexts["test-fork"].APIKey != "failed-key" || got.Contexts["test-fork"].Server != ts.URL {
 		t.Errorf("failed fork context not persisted: %#v", got.Contexts["test-fork"])

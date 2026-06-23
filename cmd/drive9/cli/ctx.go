@@ -603,7 +603,7 @@ func ctxForkCmd(args []string) error {
 	if result.Status == "failed" {
 		fmt.Printf("Fork provisioning failed. The fork context %q has been saved with its API key.\n", newName)
 		fmt.Printf("To clean up the failed fork, switch to it with `drive9 ctx use %s` and run `drive9 delete`.\n", newName)
-		fmt.Println("For TiDB Cloud Native forks, pass --tidbcloud-public-key/--tidbcloud-private-key or set DRIVE9_TIDBCLOUD_PUBLIC_KEY/DRIVE9_TIDBCLOUD_PRIVATE_KEY if the server has no default credential.")
+		fmt.Printf("For TiDB Cloud Native forks, pass --tidbcloud-public-key/--tidbcloud-private-key or set %s/%s if the server has no default credential.\n", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
 	}
 	return nil
 }
