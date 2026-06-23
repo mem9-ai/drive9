@@ -486,9 +486,6 @@ func DeleteTenant(args []string) error {
 		if msg == "" {
 			msg = http.StatusText(resp.StatusCode)
 		}
-		if resp.StatusCode == http.StatusConflict && strings.Contains(msg, "only live tenants can be deleted") {
-			return deleteForkAfterLiveRejection(server, apiKey, bodyBytes, asJSON)
-		}
 		return fmt.Errorf("delete tenant failed (HTTP %d): %s", resp.StatusCode, msg)
 	}
 	if result.Status == "" {
