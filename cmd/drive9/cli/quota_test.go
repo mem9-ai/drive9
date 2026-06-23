@@ -10,56 +10,36 @@ import (
 	"testing"
 )
 
-func TestQuotaGetUsesOwnerAPIKey(t *testing.T) {
+func TestQuotaGetRequiresTenantIDAndTiDBCloudCredentials(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+	resetCredentialCacheForTest()
+
+	err := Quota([]string{"get", "--json"})
+	if err == nil {
+		t.Fatal("Quota get error = nil, want tenant-id error")
+	}
+	if !strings.Contains(err.Error(), "--tenant-id is required") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestQuotaGetUsesTenantIDAndTiDBCloudHeaders(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)
 
 	var gotAuth string
+	var gotPublicKey string
+	var gotPrivateKey string
+	var gotTenantID string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v1/quota" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
 		gotAuth = r.Header.Get("Authorization")
-		_ = json.NewEncoder(w).Encode(quotaTestResponse("tenant-1"))
-	}))
-	defer ts.Close()
-
-	t.Setenv(EnvServer, ts.URL)
-	t.Setenv(EnvAPIKey, "owner-key")
-	resetCredentialCacheForTest()
-
-	out, err := captureStdoutE(t, func() error {
-		return Quota([]string{"get", "--json"})
-	})
-	if err != nil {
-		t.Fatalf("Quota get: %v", err)
-	}
-	if gotAuth != "Bearer owner-key" {
-		t.Fatalf("Authorization = %q", gotAuth)
-	}
-	if !strings.Contains(out, `"tenant_id": "tenant-1"`) {
-		t.Fatalf("output = %q", out)
-	}
-}
-
-func TestQuotaGetWithTenantIDUsesCredentialQuery(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	clearProvisionEnv(t)
-
-	var gotBody map[string]any
-	var gotAuth string
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/v1/quota/query" {
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
-		}
-		gotAuth = r.Header.Get("Authorization")
-		raw, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := json.Unmarshal(raw, &gotBody); err != nil {
-			t.Fatal(err)
-		}
+		gotPublicKey = r.Header.Get("X-TiDBCloud-Public-Key")
+		gotPrivateKey = r.Header.Get("X-TiDBCloud-Private-Key")
+		gotTenantID = r.URL.Query().Get("tenant_id")
 		_ = json.NewEncoder(w).Encode(quotaTestResponse("tenant-1"))
 	}))
 	defer ts.Close()
@@ -75,48 +55,35 @@ func TestQuotaGetWithTenantIDUsesCredentialQuery(t *testing.T) {
 			"--tidbcloud-private-key", "private-1",
 		})
 	}); err != nil {
-		t.Fatalf("Quota get credential query: %v", err)
+		t.Fatalf("Quota get: %v", err)
 	}
 	if gotAuth != "" {
 		t.Fatalf("Authorization = %q, want empty", gotAuth)
 	}
-	if gotBody["tenant_id"] != "tenant-1" || gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
-		t.Fatalf("body = %#v", gotBody)
+	if gotTenantID != "tenant-1" || gotPublicKey != "public-1" || gotPrivateKey != "private-1" {
+		t.Fatalf("request credentials tenant=%q public=%q private=%q", gotTenantID, gotPublicKey, gotPrivateKey)
 	}
 }
 
-func TestQuotaGetIgnoresEnvTiDBCloudCredentialsWithoutTenantID(t *testing.T) {
+func TestQuotaGetRejectsEnvTiDBCloudCredentialsWithoutTenantID(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)
 
-	var gotPath string
-	var gotAuth string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotAuth = r.Header.Get("Authorization")
-		if r.Method != http.MethodGet || r.URL.Path != "/v1/quota" {
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
-		}
-		_ = json.NewEncoder(w).Encode(quotaTestResponse("tenant-1"))
+		t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 	}))
 	defer ts.Close()
 
 	t.Setenv(EnvServer, ts.URL)
-	t.Setenv(EnvAPIKey, "owner-key")
+	t.Setenv(EnvAPIKey, "drive9-key-should-not-be-used")
 	t.Setenv(EnvTiDBCloudPublicKey, "env-public")
 	t.Setenv(EnvTiDBCloudPrivateKey, "env-private")
 	resetCredentialCacheForTest()
 
 	if _, err := captureStdoutE(t, func() error {
 		return Quota([]string{"get", "--json"})
-	}); err != nil {
-		t.Fatalf("Quota get: %v", err)
-	}
-	if gotPath != "/v1/quota" {
-		t.Fatalf("path = %q, want /v1/quota", gotPath)
-	}
-	if gotAuth != "Bearer owner-key" {
-		t.Fatalf("Authorization = %q", gotAuth)
+	}); err == nil || !strings.Contains(err.Error(), "--tenant-id is required") {
+		t.Fatalf("Quota get error = %v, want tenant-id error", err)
 	}
 }
 
@@ -157,7 +124,98 @@ func TestQuotaSetSendsTiDBCloudCredentialBody(t *testing.T) {
 	defer ts.Close()
 
 	t.Setenv(EnvServer, ts.URL)
-	t.Setenv(EnvAPIKey, "owner-key-should-not-be-used")
+	t.Setenv(EnvAPIKey, "drive9-key-should-not-be-used")
+	resetCredentialCacheForTest()
+
+	if _, err := captureStdoutE(t, func() error {
+		return Quota([]string{
+			"set",
+			"--tenant-id", "tenant-1",
+			"--tidbcloud-public-key", "public-1",
+			"--tidbcloud-private-key", "private-1",
+			"--max-storage-size", "1000",
+			"--tidbcloud-spending-limit", "20000",
+		})
+	}); err != nil {
+		t.Fatalf("Quota set: %v", err)
+	}
+	if gotAuth != "" {
+		t.Fatalf("Authorization = %q, want empty", gotAuth)
+	}
+	if gotBody["tenant_id"] != "tenant-1" || gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
+		t.Fatalf("body credentials = %#v", gotBody)
+	}
+	if gotBody["max_storage_size"] != float64(1000) {
+		t.Fatalf("body quota = %#v", gotBody)
+	}
+	if gotBody["tidbcloud_spending_limit"] != float64(20000) {
+		t.Fatalf("body spending limit = %#v", gotBody)
+	}
+}
+
+func TestQuotaSetAllowsSpendingLimitOnly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/quota" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(quotaTestResponse("tenant-1"))
+	}))
+	defer ts.Close()
+
+	t.Setenv(EnvServer, ts.URL)
+	resetCredentialCacheForTest()
+
+	if _, err := captureStdoutE(t, func() error {
+		return Quota([]string{
+			"set",
+			"--tenant-id", "tenant-1",
+			"--tidbcloud-public-key", "public-1",
+			"--tidbcloud-private-key", "private-1",
+			"--tidbcloud-spending-limit", "20000",
+		})
+	}); err != nil {
+		t.Fatalf("Quota set: %v", err)
+	}
+	if _, ok := gotBody["max_storage_size"]; ok {
+		t.Fatalf("body should not contain max_storage_size: %#v", gotBody)
+	}
+	if gotBody["tidbcloud_spending_limit"] != float64(20000) {
+		t.Fatalf("body spending limit = %#v", gotBody)
+	}
+}
+
+func TestQuotaSetAllowsStorageSizeOnly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/quota" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := json.Unmarshal(raw, &gotBody); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(quotaTestResponse("tenant-1"))
+	}))
+	defer ts.Close()
+
+	t.Setenv(EnvServer, ts.URL)
 	resetCredentialCacheForTest()
 
 	if _, err := captureStdoutE(t, func() error {
@@ -171,14 +229,11 @@ func TestQuotaSetSendsTiDBCloudCredentialBody(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Quota set: %v", err)
 	}
-	if gotAuth != "" {
-		t.Fatalf("Authorization = %q, want empty", gotAuth)
-	}
-	if gotBody["tenant_id"] != "tenant-1" || gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
-		t.Fatalf("body credentials = %#v", gotBody)
-	}
 	if gotBody["max_storage_size"] != float64(1000) {
 		t.Fatalf("body quota = %#v", gotBody)
+	}
+	if _, ok := gotBody["tidbcloud_spending_limit"]; ok {
+		t.Fatalf("body should not contain tidbcloud_spending_limit: %#v", gotBody)
 	}
 }
 
@@ -265,6 +320,24 @@ func TestQuotaSetRejectsMissingTiDBCloudCredentials(t *testing.T) {
 	}
 }
 
+func TestQuotaSetRejectsMissingQuotaKnob(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+
+	err := Quota([]string{
+		"set",
+		"--tenant-id", "tenant-1",
+		"--tidbcloud-public-key", "public-1",
+		"--tidbcloud-private-key", "private-1",
+	})
+	if err == nil {
+		t.Fatal("Quota set error = nil, want missing quota knob error")
+	}
+	if !strings.Contains(err.Error(), "--max-storage-size or --tidbcloud-spending-limit") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
 func TestQuotaGetStatusErrorIncludesHTTPCode(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)
@@ -276,10 +349,14 @@ func TestQuotaGetStatusErrorIncludesHTTPCode(t *testing.T) {
 	defer ts.Close()
 
 	t.Setenv(EnvServer, ts.URL)
-	t.Setenv(EnvAPIKey, "owner-key")
 	resetCredentialCacheForTest()
 
-	err := Quota([]string{"get"})
+	err := Quota([]string{
+		"get",
+		"--tenant-id", "tenant-1",
+		"--tidbcloud-public-key", "public-1",
+		"--tidbcloud-private-key", "private-1",
+	})
 	if err == nil {
 		t.Fatal("Quota get error = nil, want status error")
 	}
@@ -295,7 +372,8 @@ func quotaTestResponse(tenantID string) map[string]any {
 		"status":          "active",
 		"supports_update": true,
 		"config": map[string]any{
-			"max_storage_size": 1000,
+			"max_storage_size":         1000,
+			"tidbcloud_spending_limit": 10000,
 		},
 		"usage": map[string]any{
 			"storage_bytes":    1,

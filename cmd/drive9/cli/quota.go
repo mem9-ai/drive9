@@ -36,8 +36,6 @@ func quotaGet(args []string) error {
 	serverGiven := false
 	regionCodeFlag := ""
 	regionCodeGiven := false
-	apiKeyFlag := ""
-	apiKeyGiven := false
 	tenantID := ""
 	tenantIDGiven := false
 	publicKeyFlag := ""
@@ -65,13 +63,6 @@ func quotaGet(args []string) error {
 			i++
 			regionCodeFlag = args[i]
 			regionCodeGiven = true
-		case "--api-key":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--api-key requires an argument")
-			}
-			i++
-			apiKeyFlag = args[i]
-			apiKeyGiven = true
 		case "--tenant-id":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--tenant-id requires an argument")
@@ -105,9 +96,6 @@ func quotaGet(args []string) error {
 	if err := rejectEmptyFlag("region-code", strings.TrimSpace(regionCodeFlag), regionCodeGiven); err != nil {
 		return err
 	}
-	if err := rejectEmptyFlag("api-key", strings.TrimSpace(apiKeyFlag), apiKeyGiven); err != nil {
-		return err
-	}
 	if err := rejectEmptyFlag("tenant-id", strings.TrimSpace(tenantID), tenantIDGiven); err != nil {
 		return err
 	}
@@ -131,39 +119,17 @@ func quotaGet(args []string) error {
 	}
 	tenantID = strings.TrimSpace(tenantID)
 
-	var out *client.QuotaResponse
-	if tenantIDGiven {
-		server, err := quotaServer(serverFlag, regionCodeFlag, r.Server, true)
-		if err != nil {
-			return err
-		}
-		req, err := quotaCredentialRequest(tenantID, publicKey, privateKey)
-		if err != nil {
-			return err
-		}
-		out, err = client.New(server, "").QueryQuotaWithCredentials(context.Background(), req)
-		if err != nil {
-			return quotaAPIError("query quota", err)
-		}
-	} else {
-		if publicKeyGiven || privateKeyGiven {
-			return fmt.Errorf("--tenant-id is required when using TiDB Cloud credentials")
-		}
-		server, err := quotaServer(serverFlag, regionCodeFlag, r.Server, false)
-		if err != nil {
-			return err
-		}
-		apiKey := strings.TrimSpace(apiKeyFlag)
-		if apiKey == "" && r.Kind == CredentialOwner {
-			apiKey = r.APIKey
-		}
-		if apiKey == "" {
-			return fmt.Errorf("quota get requires an owner API key, or --tenant-id with TiDB Cloud credentials")
-		}
-		out, err = client.New(server, apiKey).GetQuota(context.Background())
-		if err != nil {
-			return quotaAPIError("query quota", err)
-		}
+	server, err := quotaServer(serverFlag, regionCodeFlag, r.Server, true)
+	if err != nil {
+		return err
+	}
+	req, err := quotaRequest(tenantID, publicKey, privateKey)
+	if err != nil {
+		return err
+	}
+	out, err := client.New(server, "").GetQuota(context.Background(), req)
+	if err != nil {
+		return quotaAPIError("query quota", err)
 	}
 	return printQuotaCLIResponse(out, asJSON)
 }
@@ -180,6 +146,7 @@ func quotaSet(args []string) error {
 	privateKeyFlag := ""
 	privateKeyGiven := false
 	var maxStorageSize *int64
+	var tidbCloudSpendingLimit *int64
 	asJSON := false
 
 	for i := 0; i < len(args); i++ {
@@ -232,6 +199,16 @@ func quotaSet(args []string) error {
 				return err
 			}
 			maxStorageSize = &v
+		case "--tidbcloud-spending-limit":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--tidbcloud-spending-limit requires an argument")
+			}
+			i++
+			v, err := parseQuotaInt64Flag("--tidbcloud-spending-limit", args[i])
+			if err != nil {
+				return err
+			}
+			tidbCloudSpendingLimit = &v
 		case "--json":
 			asJSON = true
 		default:
@@ -253,8 +230,8 @@ func quotaSet(args []string) error {
 	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
 		return err
 	}
-	if maxStorageSize == nil {
-		return fmt.Errorf("quota set requires --max-storage-size")
+	if maxStorageSize == nil && tidbCloudSpendingLimit == nil {
+		return fmt.Errorf("quota set requires --max-storage-size or --tidbcloud-spending-limit")
 	}
 
 	r := ResolveCredentials()
@@ -272,15 +249,16 @@ func quotaSet(args []string) error {
 	if privateKey == "" {
 		privateKey = envPrivateKey
 	}
-	cred, err := quotaCredentialRequest(strings.TrimSpace(tenantID), publicKey, privateKey)
+	cred, err := quotaRequest(strings.TrimSpace(tenantID), publicKey, privateKey)
 	if err != nil {
 		return err
 	}
-	out, err := client.New(server, "").SetQuotaWithCredentials(context.Background(), client.QuotaSetRequest{
-		TenantID:       cred.TenantID,
-		PublicKey:      cred.PublicKey,
-		PrivateKey:     cred.PrivateKey,
-		MaxStorageSize: maxStorageSize,
+	out, err := client.New(server, "").SetQuota(context.Background(), client.QuotaSetRequest{
+		TenantID:               cred.TenantID,
+		PublicKey:              cred.PublicKey,
+		PrivateKey:             cred.PrivateKey,
+		MaxStorageSize:         maxStorageSize,
+		TiDBCloudSpendingLimit: tidbCloudSpendingLimit,
 	})
 	if err != nil {
 		return quotaAPIError("set quota", err)
@@ -315,17 +293,17 @@ func quotaAPIError(action string, err error) error {
 	return fmt.Errorf("%s failed: %w", action, err)
 }
 
-func quotaCredentialRequest(tenantID, publicKey, privateKey string) (client.QuotaCredentialRequest, error) {
+func quotaRequest(tenantID, publicKey, privateKey string) (client.QuotaRequest, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	publicKey = strings.TrimSpace(publicKey)
 	privateKey = strings.TrimSpace(privateKey)
 	if tenantID == "" {
-		return client.QuotaCredentialRequest{}, fmt.Errorf("--tenant-id is required")
+		return client.QuotaRequest{}, fmt.Errorf("--tenant-id is required")
 	}
 	if publicKey == "" || privateKey == "" {
-		return client.QuotaCredentialRequest{}, fmt.Errorf("TiDB Cloud credentials are required; pass --tidbcloud-public-key and --tidbcloud-private-key or set %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
+		return client.QuotaRequest{}, fmt.Errorf("TiDB Cloud credentials are required; pass --tidbcloud-public-key and --tidbcloud-private-key or set %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
 	}
-	return client.QuotaCredentialRequest{
+	return client.QuotaRequest{
 		TenantID:   tenantID,
 		PublicKey:  publicKey,
 		PrivateKey: privateKey,
@@ -353,7 +331,11 @@ func printQuotaCLIResponse(out *client.QuotaResponse, asJSON bool) error {
 	fmt.Printf("provider: %s\n", out.Provider)
 	fmt.Printf("status: %s\n", out.Status)
 	fmt.Printf("supports_update: %t\n", out.SupportsUpdate)
-	fmt.Printf("config: max_storage_size=%dMi\n", out.Config.MaxStorageSize)
+	configParts := []string{fmt.Sprintf("max_storage_size=%dMi", out.Config.MaxStorageSize)}
+	if out.Config.TiDBCloudSpendingLimit != nil {
+		configParts = append(configParts, fmt.Sprintf("tidbcloud_spending_limit=%d", *out.Config.TiDBCloudSpendingLimit))
+	}
+	fmt.Printf("config: %s\n", strings.Join(configParts, " "))
 	fmt.Printf("usage: storage_bytes=%d reserved_bytes=%d media_file_count=%d monthly_cost_mc=%d\n",
 		out.Usage.StorageBytes, out.Usage.ReservedBytes, out.Usage.MediaFileCount, out.Usage.MonthlyCostMC)
 	return nil
@@ -365,21 +347,20 @@ func quotaUsage() string {
 query or set tenant quota.
 
 commands:
-  get    query quota with an owner API key, or with TiDB Cloud credentials and tenant id
+  get    query TiDBCloud mode quota with TiDB Cloud credentials and tenant id
   set    set TiDBCloud mode quota with TiDB Cloud credentials and tenant id`
 }
 
 func quotaGetUsage() string {
 	return `usage: drive9 quota get [flags]
 
-query quota. Without --tenant-id, uses the active owner API key. With
---tenant-id, uses TiDB Cloud credentials and does not require a Drive9 API key.
+query TiDBCloud mode quota with TiDB Cloud credentials and a drive9 tenant id.
+Drive9 tenant API keys are not accepted for quota reads.
 
 flags:
   --server URL                    server URL (default: active context server)
   --region-code CODE              TiDBCloud mode region code; ignored when --server is set
-  --api-key KEY                   owner API key for current-tenant query
-  --tenant-id ID                  drive9 tenant id for TiDB Cloud credential query
+  --tenant-id ID                  drive9 tenant id for quota query
   --tidbcloud-public-key KEY      TiDB Cloud public key
   --tidbcloud-private-key KEY     TiDB Cloud private key
   --json                          output result as JSON`
@@ -399,5 +380,6 @@ flags:
   --tidbcloud-public-key KEY      TiDB Cloud public key
   --tidbcloud-private-key KEY     TiDB Cloud private key
   --max-storage-size Mi           max confirmed+reserved storage size in Mi
+  --tidbcloud-spending-limit N    TiDB Cloud Cluster Spending Limit; see https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit
   --json                          output result as JSON`
 }

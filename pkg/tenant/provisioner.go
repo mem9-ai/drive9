@@ -42,6 +42,10 @@ type CredentialProvisionRequest struct {
 	PrivateKey string
 }
 
+type QuotaCloudConfig struct {
+	TiDBCloudSpendingLimitMonthly *int64
+}
+
 type CredentialProvisioner interface {
 	Provisioner
 	ProvisionWithCredentials(ctx context.Context, tenantID string, req CredentialProvisionRequest) (*ClusterInfo, error)
@@ -52,14 +56,18 @@ type CredentialDeprovisioner interface {
 	DeprovisionWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
 }
 
-type CredentialQuotaUpdater interface {
+type QuotaUpdater interface {
 	Provisioner
-	UpdateQuotaWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
+	UpdateQuota(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest, opts QuotaUpdateOptions) (*QuotaCloudConfig, error)
 }
 
-type CredentialQuotaAuthorizer interface {
+type QuotaGetter interface {
 	Provisioner
-	AuthorizeQuotaWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
+	GetQuota(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) (*QuotaCloudConfig, error)
+}
+
+type QuotaUpdateOptions struct {
+	TiDBCloudSpendingLimitMonthly *int64
 }
 
 type BranchProvisioner interface {

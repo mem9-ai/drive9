@@ -573,7 +573,7 @@ func TestDeprovisionWithCredentialsDeletesCluster(t *testing.T) {
 	}
 }
 
-func TestUpdateQuotaWithCredentialsMergesDrive9Labels(t *testing.T) {
+func TestUpdateQuotaMergesDrive9Labels(t *testing.T) {
 	var patchCalled bool
 	var gotAuth string
 	var gotPatch struct {
@@ -619,15 +619,18 @@ func TestUpdateQuotaWithCredentialsMergesDrive9Labels(t *testing.T) {
 		apiURL: ts.URL,
 		client: ts.Client(),
 	}
-	err := p.UpdateQuotaWithCredentials(context.Background(), &tenant.ClusterInfo{
+	cfg, err := p.UpdateQuota(context.Background(), &tenant.ClusterInfo{
 		TenantID:  "tenant-1",
 		ClusterID: "cluster-1",
 	}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
-	})
+	}, tenant.QuotaUpdateOptions{})
 	if err != nil {
-		t.Fatalf("UpdateQuotaWithCredentials: %v", err)
+		t.Fatalf("UpdateQuota: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("quota cloud config is nil")
 	}
 	if !patchCalled {
 		t.Fatal("PATCH was not called")
@@ -650,7 +653,98 @@ func TestUpdateQuotaWithCredentialsMergesDrive9Labels(t *testing.T) {
 	}
 }
 
-func TestAuthorizeQuotaWithCredentialsOnlyGetsCluster(t *testing.T) {
+func TestUpdateQuotaPatchesSpendingLimitAfterLabels(t *testing.T) {
+	monthly := int64(20000)
+	var order []string
+	var gotLabelPatch struct {
+		Cluster struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"cluster"`
+		UpdateMask string `json:"updateMask"`
+	}
+	var gotSpendingPatch struct {
+		Cluster struct {
+			SpendingLimit struct {
+				Monthly int32 `json:"monthly"`
+			} `json:"spendingLimit"`
+		} `json:"cluster"`
+		UpdateMask string `json:"updateMask"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/v1beta1/clusters/cluster-1" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		switch r.Method {
+		case http.MethodGet:
+			order = append(order, "GET")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-1",
+				"labels":    map[string]string{"environment": "prod"},
+				"spendingLimit": map[string]int32{
+					"monthly": 10000,
+				},
+			})
+		case http.MethodPatch:
+			var probe struct {
+				UpdateMask string `json:"updateMask"`
+			}
+			dec := json.NewDecoder(r.Body)
+			switch {
+			case len(order) == 1:
+				if err := dec.Decode(&gotLabelPatch); err != nil {
+					t.Fatalf("decode label patch: %v", err)
+				}
+				probe.UpdateMask = gotLabelPatch.UpdateMask
+			default:
+				if err := dec.Decode(&gotSpendingPatch); err != nil {
+					t.Fatalf("decode spending patch: %v", err)
+				}
+				probe.UpdateMask = gotSpendingPatch.UpdateMask
+			}
+			order = append(order, "PATCH "+probe.UpdateMask)
+			_ = json.NewEncoder(w).Encode(map[string]any{"clusterId": "cluster-1"})
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	cfg, err := p.UpdateQuota(context.Background(), &tenant.ClusterInfo{
+		TenantID:  "tenant-1",
+		ClusterID: "cluster-1",
+	}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{
+		TiDBCloudSpendingLimitMonthly: &monthly,
+	})
+	if err != nil {
+		t.Fatalf("UpdateQuota: %v", err)
+	}
+	if len(order) != 3 || order[0] != "GET" || order[1] != "PATCH labels" || order[2] != "PATCH spendingLimit.monthly" {
+		t.Fatalf("order = %#v", order)
+	}
+	if gotLabelPatch.Cluster.Labels[Drive9ManagedLabel] != "true" || gotLabelPatch.Cluster.Labels[Drive9TenantIDLabel] != "tenant-1" {
+		t.Fatalf("label patch = %#v", gotLabelPatch)
+	}
+	if gotSpendingPatch.UpdateMask != "spendingLimit.monthly" || gotSpendingPatch.Cluster.SpendingLimit.Monthly != int32(monthly) {
+		t.Fatalf("spending patch = %#v", gotSpendingPatch)
+	}
+	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly == nil || *cfg.TiDBCloudSpendingLimitMonthly != monthly {
+		t.Fatalf("cloud config = %#v, want spending limit %d", cfg, monthly)
+	}
+}
+
+func TestGetQuotaOnlyGetsCluster(t *testing.T) {
 	var patchCalled bool
 	var getCalled bool
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -678,18 +772,62 @@ func TestAuthorizeQuotaWithCredentialsOnlyGetsCluster(t *testing.T) {
 		apiURL: ts.URL,
 		client: ts.Client(),
 	}
-	err := p.AuthorizeQuotaWithCredentials(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
+	_, err := p.GetQuota(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	})
 	if err != nil {
-		t.Fatalf("AuthorizeQuotaWithCredentials: %v", err)
+		t.Fatalf("GetQuota: %v", err)
 	}
 	if !getCalled {
 		t.Fatal("GET was not called")
 	}
 	if patchCalled {
 		t.Fatal("PATCH should not be called for read-only quota authorization")
+	}
+}
+
+func TestGetQuotaReadsSpendingLimit(t *testing.T) {
+	var patchCalled bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-1",
+				"labels":    map[string]string{Drive9ManagedLabel: "true"},
+				"spendingLimit": map[string]int32{
+					"monthly": 15000,
+				},
+			})
+		case http.MethodPatch:
+			patchCalled = true
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	cfg, err := p.GetQuota(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err != nil {
+		t.Fatalf("GetQuota: %v", err)
+	}
+	if patchCalled {
+		t.Fatal("PATCH should not be called for quota query")
+	}
+	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly == nil || *cfg.TiDBCloudSpendingLimitMonthly != 15000 {
+		t.Fatalf("quota cloud config = %#v, want spending limit 15000", cfg)
 	}
 }
 
@@ -718,7 +856,7 @@ func TestQuotaCredentialErrorsMapForbiddenAndNotFound(t *testing.T) {
 				apiURL: ts.URL,
 				client: ts.Client(),
 			}
-			err := p.AuthorizeQuotaWithCredentials(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
+			_, err := p.GetQuota(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
 				PublicKey:  "public-1",
 				PrivateKey: "private-1",
 			})

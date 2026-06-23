@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 )
 
 // QuotaConfig is the tenant quota configuration returned by the quota API.
 type QuotaConfig struct {
-	MaxStorageSize int64 `json:"max_storage_size"`
+	MaxStorageSize         int64  `json:"max_storage_size"`
+	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
 }
 
 // QuotaUsage is the tenant's current quota usage counters.
@@ -31,30 +33,33 @@ type QuotaResponse struct {
 	Usage          QuotaUsage  `json:"usage"`
 }
 
-// QuotaCredentialRequest identifies a cloud-native tenant with TiDB Cloud API
-// credentials for credential-based quota lookup.
-type QuotaCredentialRequest struct {
+// QuotaRequest identifies a tidb_cloud_native tenant for quota lookup.
+type QuotaRequest struct {
 	TenantID   string `json:"tenant_id"`
 	PublicKey  string `json:"public_key"`
 	PrivateKey string `json:"private_key"`
 }
 
 // QuotaSetRequest updates cloud-native tenant quota with TiDB Cloud API
-// credentials. MaxStorageSize is expressed in Mi.
+// credentials. MaxStorageSize is expressed in Mi. TiDBCloudSpendingLimit is
+// the TiDB Cloud Cluster Spending Limit value passed through to TiDB Cloud.
 type QuotaSetRequest struct {
-	TenantID       string `json:"tenant_id"`
-	PublicKey      string `json:"public_key"`
-	PrivateKey     string `json:"private_key"`
-	MaxStorageSize *int64 `json:"max_storage_size,omitempty"`
+	TenantID               string `json:"tenant_id"`
+	PublicKey              string `json:"public_key"`
+	PrivateKey             string `json:"private_key"`
+	MaxStorageSize         *int64 `json:"max_storage_size,omitempty"`
+	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
 }
 
-// GetQuota queries quota for the tenant represented by the client's owner API
-// key. Filesystem-scoped keys and delegated tokens are rejected server-side.
-func (c *Client) GetQuota(ctx context.Context) (*QuotaResponse, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/quota", nil)
+// GetQuota queries quota for a tidb_cloud_native tenant.
+func (c *Client) GetQuota(ctx context.Context, query QuotaRequest) (*QuotaResponse, error) {
+	values := url.Values{}
+	values.Set("tenant_id", query.TenantID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/quota?"+values.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
+	setQuotaHeaders(req, query.PublicKey, query.PrivateKey)
 	resp, err := c.do(req)
 	if err != nil {
 		return nil, err
@@ -62,17 +67,15 @@ func (c *Client) GetQuota(ctx context.Context) (*QuotaResponse, error) {
 	return decodeQuotaResponse(resp, "quota get")
 }
 
-// QueryQuotaWithCredentials queries quota for a tidb_cloud_native tenant using
-// TiDB Cloud API credentials and a Drive9 tenant id.
-func (c *Client) QueryQuotaWithCredentials(ctx context.Context, req QuotaCredentialRequest) (*QuotaResponse, error) {
-	return c.postQuota(ctx, "/v1/quota/query", req, "quota query")
+// SetQuota updates quota for a tidb_cloud_native tenant. Drive9 tenant API keys
+// cannot authorize quota updates for their own tenant.
+func (c *Client) SetQuota(ctx context.Context, req QuotaSetRequest) (*QuotaResponse, error) {
+	return c.postQuota(ctx, "/v1/quota", req, "quota set")
 }
 
-// SetQuotaWithCredentials updates quota for a tidb_cloud_native tenant using
-// TiDB Cloud API credentials and a Drive9 tenant id. Drive9 tenant API keys
-// cannot authorize quota updates for their own tenant.
-func (c *Client) SetQuotaWithCredentials(ctx context.Context, req QuotaSetRequest) (*QuotaResponse, error) {
-	return c.postQuota(ctx, "/v1/quota", req, "quota set")
+func setQuotaHeaders(req *http.Request, publicKey, privateKey string) {
+	req.Header.Set("X-TiDBCloud-Public-Key", publicKey)
+	req.Header.Set("X-TiDBCloud-Private-Key", privateKey)
 }
 
 func (c *Client) postQuota(ctx context.Context, path string, body any, action string) (*QuotaResponse, error) {

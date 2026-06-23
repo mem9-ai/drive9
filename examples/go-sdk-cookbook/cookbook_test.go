@@ -228,29 +228,29 @@ func ExampleClient_quota() {
 	ctx := context.Background()
 	serverURL := "https://drive9.example.com"
 
-	owner := drive9.New(serverURL, "owner-api-key")
-	quota, err := owner.GetQuota(ctx)
-	if err == nil {
-		_ = quota.Config.MaxStorageSize
-	}
-
 	tidbCloudPublicKey := "tidbcloud-public-key"
 	tidbCloudPrivateKey := "tidbcloud-private-key"
 	tenantID := "tnt_abc123"
 	credentialClient := drive9.New(serverURL, "")
 
-	_, _ = credentialClient.QueryQuotaWithCredentials(ctx, drive9.QuotaCredentialRequest{
+	quota, err := credentialClient.GetQuota(ctx, drive9.QuotaRequest{
 		TenantID:   tenantID,
 		PublicKey:  tidbCloudPublicKey,
 		PrivateKey: tidbCloudPrivateKey,
 	})
+	if err == nil {
+		_ = quota.Config.MaxStorageSize
+		_ = quota.Config.TiDBCloudSpendingLimit
+	}
 
 	storageSize := int64(100 * 1024) // Mi
-	_, _ = credentialClient.SetQuotaWithCredentials(ctx, drive9.QuotaSetRequest{
-		TenantID:       tenantID,
-		PublicKey:      tidbCloudPublicKey,
-		PrivateKey:     tidbCloudPrivateKey,
-		MaxStorageSize: &storageSize,
+	spendingLimit := int64(10000)
+	_, _ = credentialClient.SetQuota(ctx, drive9.QuotaSetRequest{
+		TenantID:               tenantID,
+		PublicKey:              tidbCloudPublicKey,
+		PrivateKey:             tidbCloudPrivateKey,
+		MaxStorageSize:         &storageSize,
+		TiDBCloudSpendingLimit: &spendingLimit,
 	})
 }
 
@@ -472,7 +472,6 @@ var coveredClientMethods = map[string]bool{
 	"PatchFile":                            true,
 	"PutGitObjectPack":                     true,
 	"PutGitOverlayEntry":                   true,
-	"QueryQuotaWithCredentials":            true,
 	"QueryVaultAudit":                      true,
 	"RawDelete":                            true,
 	"RawGet":                               true,
@@ -511,7 +510,7 @@ var coveredClientMethods = map[string]bool{
 	"SQL":                                  true,
 	"SearchJournal":                        true,
 	"SetActor":                             true,
-	"SetQuotaWithCredentials":              true,
+	"SetQuota":                             true,
 	"SetSmallFileThresholdForTests":        true,
 	"SmallFileThreshold":                   true,
 	"Stat":                                 true,

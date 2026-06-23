@@ -453,18 +453,19 @@ func (p *Provisioner) DeprovisionWithCredentials(ctx context.Context, cluster *t
 	return nil
 }
 
-func (p *Provisioner) UpdateQuotaWithCredentials(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
+func (p *Provisioner) UpdateQuota(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
 	publicKey := strings.TrimSpace(req.PublicKey)
 	privateKey := strings.TrimSpace(req.PrivateKey)
 	if publicKey == "" || privateKey == "" {
-		return fmt.Errorf("public_key and private_key are required")
+		return nil, fmt.Errorf("public_key and private_key are required")
 	}
 	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
-		return fmt.Errorf("cluster id is required")
+		return nil, fmt.Errorf("cluster id is required")
 	}
-	labels, err := p.clusterLabels(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
+	clusterID := strings.TrimSpace(cluster.ClusterID)
+	labels, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if labels == nil {
 		labels = make(map[string]string)
@@ -482,9 +483,95 @@ func (p *Provisioner) UpdateQuotaWithCredentials(ctx context.Context, cluster *t
 		"updateMask": "labels",
 	})
 	if err != nil {
+		return nil, err
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPatch, endpoint, body)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, readErr
+		}
+		return nil, quotaStatusError("cluster label update", resp.StatusCode, sanitizeUpstreamBody(raw))
+	}
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		monthly := *opts.TiDBCloudSpendingLimitMonthly
+		if err := p.updateSpendingLimitWithCredentials(ctx, publicKey, privateKey, clusterID, monthly); err != nil {
+			return nil, err
+		}
+		if cloudCfg == nil {
+			cloudCfg = &tenant.QuotaCloudConfig{}
+		}
+		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(monthly)
+	}
+	return cloudCfg, nil
+}
+
+func (p *Provisioner) GetQuota(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.QuotaCloudConfig, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return nil, fmt.Errorf("cluster id is required")
+	}
+	_, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
+	return cloudCfg, err
+}
+
+func (p *Provisioner) clusterQuotaInfo(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, *tenant.QuotaCloudConfig, error) {
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, nil, readErr
+		}
+		return nil, nil, quotaStatusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
+	}
+	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if readErr != nil {
+		return nil, nil, readErr
+	}
+	info, err := parseClusterInfo(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	labels := make(map[string]string, len(info.Labels)+3)
+	for k, v := range info.Labels {
+		labels[k] = v
+	}
+	cloudCfg := &tenant.QuotaCloudConfig{}
+	if info.SpendingLimit != nil {
+		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(int64(info.SpendingLimit.Monthly))
+	}
+	return labels, cloudCfg, nil
+}
+
+func (p *Provisioner) updateSpendingLimitWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string, monthly int64) error {
+	const maxInt32 = int64(1<<31 - 1)
+	if monthly < 0 || monthly > maxInt32 {
+		return fmt.Errorf("tidbcloud_spending_limit must be a non-negative 32-bit integer")
+	}
+	body, err := json.Marshal(map[string]any{
+		"updateMask": "spendingLimit.monthly",
+		"cluster": map[string]any{
+			"spendingLimit": map[string]int32{"monthly": int32(monthly)},
+		},
+	})
+	if err != nil {
 		return err
 	}
-	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(strings.TrimSpace(cluster.ClusterID)))
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPatch, endpoint, body)
 	if err != nil {
 		return err
@@ -495,51 +582,13 @@ func (p *Provisioner) UpdateQuotaWithCredentials(ctx context.Context, cluster *t
 		if readErr != nil {
 			return readErr
 		}
-		return quotaStatusError("cluster label update", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return quotaStatusError("cluster spending limit update", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	return nil
 }
 
-func (p *Provisioner) AuthorizeQuotaWithCredentials(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
-	publicKey := strings.TrimSpace(req.PublicKey)
-	privateKey := strings.TrimSpace(req.PrivateKey)
-	if publicKey == "" || privateKey == "" {
-		return fmt.Errorf("public_key and private_key are required")
-	}
-	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
-		return fmt.Errorf("cluster id is required")
-	}
-	_, err := p.clusterLabels(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
-	return err
-}
-
-func (p *Provisioner) clusterLabels(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, error) {
-	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
-	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
-		if readErr != nil {
-			return nil, readErr
-		}
-		return nil, quotaStatusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
-	}
-	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
-	if readErr != nil {
-		return nil, readErr
-	}
-	info, err := parseClusterInfo(raw)
-	if err != nil {
-		return nil, err
-	}
-	labels := make(map[string]string, len(info.Labels)+3)
-	for k, v := range info.Labels {
-		labels[k] = v
-	}
-	return labels, nil
+func ptrInt64(v int64) *int64 {
+	return &v
 }
 
 func (p *Provisioner) regionName() string {
@@ -625,7 +674,7 @@ func parseDefaultSpendLimit(raw string) (*int32, error) {
 	}
 	monthly, err := strconv.ParseInt(trimmed, 10, 32)
 	if err != nil || monthly < 0 {
-		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer in USD cents", EnvTiDBCloudDefaultSpendingLimit, raw)
+		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer", EnvTiDBCloudDefaultSpendingLimit, raw)
 	}
 	out := int32(monthly)
 	return &out, nil
@@ -721,9 +770,12 @@ func ensureDatabase(ctx context.Context, user, password, host string, port int, 
 }
 
 type clusterInfo struct {
-	ClusterID string            `json:"clusterId"`
-	State     string            `json:"state"`
-	Labels    map[string]string `json:"labels"`
+	ClusterID     string            `json:"clusterId"`
+	State         string            `json:"state"`
+	Labels        map[string]string `json:"labels"`
+	SpendingLimit *struct {
+		Monthly int32 `json:"monthly"`
+	} `json:"spendingLimit"`
 	Endpoints struct {
 		Public struct {
 			Host string `json:"host"`

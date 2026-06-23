@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -22,11 +23,13 @@ import (
 type quotaTestProvisioner struct {
 	provider        string
 	updateErr       error
-	authorizeErr    error
+	getErr          error
+	cloudCfg        *tenant.QuotaCloudConfig
 	updateCalls     atomic.Int32
-	authorizeCalls  atomic.Int32
+	getCalls        atomic.Int32
 	lastCluster     *tenant.ClusterInfo
 	lastCredentials tenant.CredentialProvisionRequest
+	lastOptions     tenant.QuotaUpdateOptions
 }
 
 func (p *quotaTestProvisioner) ProviderType() string { return p.provider }
@@ -37,24 +40,31 @@ func (p *quotaTestProvisioner) Provision(context.Context, string) (*tenant.Clust
 
 func (p *quotaTestProvisioner) InitSchema(context.Context, string) error { return nil }
 
-func (p *quotaTestProvisioner) UpdateQuotaWithCredentials(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
+func (p *quotaTestProvisioner) UpdateQuota(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
 	p.updateCalls.Add(1)
 	p.lastCredentials = req
+	p.lastOptions = opts
 	if cluster != nil {
 		out := *cluster
 		p.lastCluster = &out
 	}
-	return p.updateErr
+	if p.updateErr != nil {
+		return nil, p.updateErr
+	}
+	return p.cloudCfg, nil
 }
 
-func (p *quotaTestProvisioner) AuthorizeQuotaWithCredentials(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
-	p.authorizeCalls.Add(1)
+func (p *quotaTestProvisioner) GetQuota(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.QuotaCloudConfig, error) {
+	p.getCalls.Add(1)
 	p.lastCredentials = req
 	if cluster != nil {
 		out := *cluster
 		p.lastCluster = &out
 	}
-	return p.authorizeErr
+	if p.getErr != nil {
+		return nil, p.getErr
+	}
+	return p.cloudCfg, nil
 }
 
 type quotaRuntime struct {
@@ -124,14 +134,39 @@ func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	prov := &quotaTestProvisioner{provider: tenant.ProviderTiDBCloudNative}
+	prov := &quotaTestProvisioner{provider: provider}
 	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: prov, TokenSecret: tokenSecret})
 	t.Cleanup(server.Close)
 	return &quotaRuntime{meta: db.Meta, tenantID: tenantID, apiKey: apiKey, prov: prov, server: server}
 }
 
-func TestQuotaOwnerGetReturnsConfigAndUsage(t *testing.T) {
+func TestQuotaGetRejectsDrive9Key(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/quota", nil)
+	req.Header.Set("Authorization", "Bearer "+rt.apiKey)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if got := rt.prov.getCalls.Load(); got != 0 {
+		t.Fatalf("get calls = %d, want 0", got)
+	}
+	if got := rt.prov.updateCalls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0", got)
+	}
+}
+
+func TestQuotaGetReturnsConfigUsageAndSpendingLimit(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	spendingLimit := int64(10000)
+	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &spendingLimit}
 	ctx := context.Background()
 	if err := rt.meta.SetQuotaConfig(ctx, &meta.QuotaConfig{
 		TenantID:         rt.tenantID,
@@ -156,12 +191,8 @@ func TestQuotaOwnerGetReturnsConfigAndUsage(t *testing.T) {
 
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/v1/quota", nil)
-	req.Header.Set("Authorization", "Bearer "+rt.apiKey)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+
+	resp := getQuota(t, ts.URL, rt.tenantID, "public-1", "private-1", "")
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
@@ -177,42 +208,26 @@ func TestQuotaOwnerGetReturnsConfigAndUsage(t *testing.T) {
 	if out.TenantID != rt.tenantID || !out.SupportsUpdate {
 		t.Fatalf("response tenant/update = %#v", out)
 	}
-	if out.Config.MaxStorageSize != 123 {
+	if out.Config.MaxStorageSize != 123 || out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != spendingLimit {
 		t.Fatalf("config = %#v", out.Config)
 	}
 	if out.Usage.StorageBytes != 321 || out.Usage.ReservedBytes != 11 || out.Usage.MediaFileCount != 7 || out.Usage.MonthlyCostMC != 99 {
 		t.Fatalf("usage = %#v", out.Usage)
 	}
-	var rawOut map[string]any
-	if err := json.Unmarshal(raw, &rawOut); err != nil {
-		t.Fatal(err)
-	}
-	config, ok := rawOut["config"].(map[string]any)
-	if !ok {
-		t.Fatalf("raw config = %#v", rawOut["config"])
-	}
-	if len(config) != 1 || config["max_storage_size"] != float64(123) {
-		t.Fatalf("raw config = %#v, want only max_storage_size", config)
-	}
 }
 
-func TestQuotaCredentialQueryUsesTiDBCloudAuthorization(t *testing.T) {
+func TestQuotaGetUsesTiDBCloudAuthorization(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ts := httptest.NewServer(rt.server)
 	defer ts.Close()
 
-	body := map[string]any{
-		"tenant_id":   rt.tenantID,
-		"public_key":  "public-1",
-		"private_key": "private-1",
-	}
-	resp := postJSON(t, ts.URL+"/v1/quota/query", body, "")
+	resp := getQuota(t, ts.URL, rt.tenantID, "public-1", "private-1", "")
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	if got := rt.prov.authorizeCalls.Load(); got != 1 {
-		t.Fatalf("authorize calls = %d, want 1", got)
+	if got := rt.prov.getCalls.Load(); got != 1 {
+		t.Fatalf("get calls = %d, want 1", got)
 	}
 	if got := rt.prov.updateCalls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
@@ -252,12 +267,54 @@ func TestQuotaSetCloudNativeUpdatesCredentialLabelBeforeConfig(t *testing.T) {
 	if got := rt.prov.updateCalls.Load(); got != 1 {
 		t.Fatalf("update calls = %d, want 1", got)
 	}
+	if rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly != nil {
+		t.Fatalf("spending limit option = %v, want nil", *rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly)
+	}
 	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.MaxStorageBytes != 1000*quotaStorageSizeBytes || cfg.MaxMediaLLMFiles != 200 || cfg.MaxMonthlyCostMC != 300 {
 		t.Fatalf("cfg = %#v", cfg)
+	}
+}
+
+func TestQuotaSetSpendingLimitOnlyDoesNotWriteStorageConfig(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	spendingLimit := int64(20000)
+	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &spendingLimit}
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
+		"tenant_id":                rt.tenantID,
+		"public_key":               "public-1",
+		"private_key":              "private-1",
+		"tidbcloud_spending_limit": spendingLimit,
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if got := rt.prov.updateCalls.Load(); got != 1 {
+		t.Fatalf("update calls = %d, want 1", got)
+	}
+	if rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly == nil || *rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly != spendingLimit {
+		t.Fatalf("spending limit option = %#v, want %d", rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
+	}
+	version, err := rt.meta.GetQuotaConfigVersion(context.Background(), rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != "" {
+		t.Fatalf("quota config version = %q, want empty", version)
+	}
+	var out quotaResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != spendingLimit {
+		t.Fatalf("config = %#v", out.Config)
 	}
 }
 
@@ -286,6 +343,25 @@ func TestQuotaSetRejectsDrive9KeyWithoutTiDBCloudCredentials(t *testing.T) {
 	}
 }
 
+func TestQuotaSetRejectsMissingQuotaKnobs(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
+		"tenant_id":   rt.tenantID,
+		"public_key":  "public-1",
+		"private_key": "private-1",
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	if got := rt.prov.updateCalls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0", got)
+	}
+}
+
 func TestQuotaSetRejectsNonCloudNativeTenant(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudStarter)
 	ts := httptest.NewServer(rt.server)
@@ -303,6 +379,33 @@ func TestQuotaSetRejectsNonCloudNativeTenant(t *testing.T) {
 	}
 	if got := rt.prov.updateCalls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
+	}
+}
+
+func TestQuotaGetMapsTiDBCloudCredentialErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+	}{
+		{name: "forbidden", err: tenant.ErrQuotaPermissionDenied, wantStatus: http.StatusForbidden},
+		{name: "not_found", err: tenant.ErrQuotaBackendNotFound, wantStatus: http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+			rt.prov.getErr = tc.err
+			ts := httptest.NewServer(rt.server)
+			defer ts.Close()
+
+			resp := getQuota(t, ts.URL, rt.tenantID, "public-1", "private-1", "")
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+			if got := rt.prov.getCalls.Load(); got != 1 {
+				t.Fatalf("get calls = %d, want 1", got)
+			}
+		})
 	}
 }
 
@@ -353,6 +456,24 @@ func postJSON(t *testing.T, url string, body map[string]any, apiKey string) *htt
 		t.Fatal(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func getQuota(t *testing.T, baseURL, tenantID, publicKey, privateKey, apiKey string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/v1/quota?tenant_id="+neturl.QueryEscape(tenantID), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(quotaPublicKeyHeader, publicKey)
+	req.Header.Set(quotaPrivateKeyHeader, privateKey)
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}

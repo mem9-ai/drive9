@@ -88,20 +88,10 @@ The SDK exposes typed quota helpers in `pkg/client`; with this guide's import
 alias they return `*drive9.QuotaResponse`. See
 [`docs/guides/quota.md`](quota.md) for the full CLI and HTTP reference.
 
-Query quota for the tenant represented by an owner API key:
+Query a `tidb_cloud_native` tenant:
 
 ```go
-quota, err := drive9.New(serverURL, ownerAPIKey).GetQuota(ctx)
-if err != nil {
-	return err
-}
-_ = quota
-```
-
-Query a `tidb_cloud_native` tenant with TiDB Cloud credentials:
-
-```go
-quota, err := drive9.New(serverURL, "").QueryQuotaWithCredentials(ctx, drive9.QuotaCredentialRequest{
+quota, err := drive9.New(serverURL, "").GetQuota(ctx, drive9.QuotaRequest{
 	TenantID:   "tnt_abc123",
 	PublicKey:  tidbCloudPublicKey,
 	PrivateKey: tidbCloudPrivateKey,
@@ -109,20 +99,24 @@ quota, err := drive9.New(serverURL, "").QueryQuotaWithCredentials(ctx, drive9.Qu
 if err != nil {
 	return err
 }
-_ = quota
+_ = quota.Config.MaxStorageSize
+_ = quota.Config.TiDBCloudSpendingLimit
 ```
 
-Set storage quota for a `tidb_cloud_native` tenant with TiDB Cloud credentials.
-`MaxStorageSize` is in Mi.
+Set quota for a `tidb_cloud_native` tenant with TiDB Cloud credentials.
+`MaxStorageSize` is in Mi. `TiDBCloudSpendingLimit` updates the TiDB Cloud
+Cluster Spending Limit.
 
 ```go
 storageSize := int64(102400)
+spendingLimit := int64(10000)
 
-quota, err := drive9.New(serverURL, "").SetQuotaWithCredentials(ctx, drive9.QuotaSetRequest{
-	TenantID:       "tnt_abc123",
-	PublicKey:      tidbCloudPublicKey,
-	PrivateKey:     tidbCloudPrivateKey,
-	MaxStorageSize: &storageSize,
+quota, err := drive9.New(serverURL, "").SetQuota(ctx, drive9.QuotaSetRequest{
+	TenantID:               "tnt_abc123",
+	PublicKey:              tidbCloudPublicKey,
+	PrivateKey:             tidbCloudPrivateKey,
+	MaxStorageSize:         &storageSize,
+	TiDBCloudSpendingLimit: &spendingLimit,
 })
 if err != nil {
 	return err
@@ -130,8 +124,8 @@ if err != nil {
 _ = quota
 ```
 
-Quota updates require TiDB Cloud API keys and a Drive9 tenant id. A Drive9
-tenant API key cannot authorize quota updates for its own tenant.
+Quota query and update require TiDB Cloud API keys and a Drive9 tenant id. A
+Drive9 tenant API key cannot authorize quota operations for its own tenant.
 
 ## Run the included smoke test
 
