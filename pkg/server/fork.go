@@ -1054,18 +1054,6 @@ func (s *Server) enqueueForkConfirmedRefs(ctx context.Context, t *meta.Tenant, s
 	}
 }
 
-func (s *Server) resumeDeletingForkTenants() {
-	ctx := backgroundWithTrace(context.Background())
-	for _, status := range []meta.TenantStatus{meta.TenantDeleting, meta.TenantFailed} {
-		tenants, err := s.meta.ListTenantsByStatus(ctx, status, 1000)
-		if err != nil {
-			logger.Error(ctx, "resume_fork_cleanup_list_failed", zap.String("status", string(status)), zap.Error(err))
-			continue
-		}
-		s.resumeForkCleanup(ctx, tenants)
-	}
-}
-
 func (s *Server) resumeForkCleanup(ctx context.Context, tenants []meta.Tenant) {
 	const maxConcurrentForkCleanup = 4
 	sem := make(chan struct{}, maxConcurrentForkCleanup)

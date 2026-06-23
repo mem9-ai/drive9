@@ -52,6 +52,22 @@ type PoolConfig struct {
 	// tidb_cloud_starter). Use when the TiDB Cloud cluster does not have a
 	// supported auto-embedding provider configured.
 	DisableDatabaseAutoEmbedding bool
+
+	// LeaderChecker, when set, gates per-tenant FileGCWorker to run only on
+	// the leader pod. When nil, FileGCWorker starts unconditionally (single-pod).
+	LeaderChecker LeaderChecker
+}
+
+// LeaderChecker reports whether the current process is the leader. Used by
+// the tenant pool to gate per-tenant background workers (e.g. FileGCWorker).
+type LeaderChecker interface {
+	IsLeader() bool
+}
+
+// shouldStartFileGC reports whether per-tenant FileGCWorker should start on
+// this pod. When no leader checker is configured, FileGC starts unconditionally.
+func (p *Pool) shouldStartFileGC() bool {
+	return p.cfg.LeaderChecker == nil || p.cfg.LeaderChecker.IsLeader()
 }
 
 type Pool struct {
@@ -684,7 +700,9 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(b, t.ID)
 		p.wireSemanticTaskNotifier(b, t.ID)
-		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+		if p.shouldStartFileGC() {
+			b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+		}
 		return b, store, nil
 	}
 	if p.cfg.S3Dir != "" {
@@ -725,7 +743,9 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(b, t.ID)
 		p.wireSemanticTaskNotifier(b, t.ID)
-		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+		if p.shouldStartFileGC() {
+			b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+		}
 		return b, store, nil
 	}
 	backendCreateStart := time.Now()
@@ -748,7 +768,9 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	p.wireQuotaStore(b, t.ID)
 	p.wireSemanticTaskNotifier(b, t.ID)
-	b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+	if p.shouldStartFileGC() {
+		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+	}
 	return b, store, nil
 }
 
