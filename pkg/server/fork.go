@@ -972,14 +972,7 @@ func (s *Server) cleanupForkTenantOnce(ctx context.Context, tenantID string, cre
 		return nil
 	}
 	if t.Provider == tenant.ProviderTiDBCloudNative && credentialReq == nil {
-		logger.Warn(ctx, "fork_cleanup_no_credentials_branch_orphaned",
-			zap.String("tenant_id", tenantID),
-			zap.String("cluster_id", t.ClusterID),
-			zap.String("branch_id", t.BranchID))
-		if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantDeleted); err != nil {
-			return fmt.Errorf("mark fork deleted: %w", err)
-		}
-		return nil
+		return tenant.ErrCredentialsRequired
 	}
 	if t.Status != meta.TenantDeleting {
 		return s.cleanupFailedForkBranch(ctx, t, credentialReq)
