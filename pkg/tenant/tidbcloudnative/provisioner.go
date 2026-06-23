@@ -38,7 +38,12 @@ const (
 	DefaultSpendLimit   = int32(1000)
 	stateActive         = "ACTIVE"
 
-	upstreamErrorBodyLimit = 2048
+	Drive9ManagedLabel       = "drive9.ai/managed"
+	Drive9TenantIDLabel      = "drive9.ai/tenant_id"
+	Drive9QuotaUpdateAtLabel = "drive9.ai/update_quota_at"
+
+	upstreamErrorBodyLimit   = 2048
+	upstreamClusterBodyLimit = 1 << 20
 )
 
 var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
@@ -183,6 +188,10 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 		"region": map[string]string{
 			"name": p.regionName(),
 		},
+		"labels": map[string]string{
+			Drive9ManagedLabel:  "true",
+			Drive9TenantIDLabel: tenantID,
+		},
 	}
 	if p.defaultSpendLimit != nil {
 		reqBody["spendingLimit"] = map[string]int32{"monthly": *p.defaultSpendLimit}
@@ -197,9 +206,16 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, readErr
+		}
 		return nil, fmt.Errorf("%s", statusError("provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
+	}
+	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if readErr != nil {
+		return nil, readErr
 	}
 	info, err := parseClusterInfo(raw)
 	if err != nil {
@@ -305,11 +321,18 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 		return nil, fmt.Errorf("create branch request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, readErr
+		}
 		return nil, fmt.Errorf("%s", statusError("branch provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 
+	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if readErr != nil {
+		return nil, readErr
+	}
 	branch, err := parseBranchInfo(raw)
 	if err != nil {
 		return nil, fmt.Errorf("parse branch provision response: %w", err)
@@ -395,8 +418,11 @@ func (p *Provisioner) DeleteBranchWithCredentials(ctx context.Context, clusterID
 		return fmt.Errorf("delete branch request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return readErr
+		}
 		return fmt.Errorf("%s", statusError("branch delete", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 	return nil
@@ -417,11 +443,193 @@ func (p *Provisioner) DeprovisionWithCredentials(ctx context.Context, cluster *t
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return readErr
+		}
 		return fmt.Errorf("%s", statusError("cluster delete", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 	return nil
+}
+
+func (p *Provisioner) UpdateQuota(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return nil, fmt.Errorf("cluster id is required")
+	}
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		if err := validateTiDBCloudSpendingLimit(*opts.TiDBCloudSpendingLimitMonthly); err != nil {
+			return nil, err
+		}
+	}
+	clusterID := strings.TrimSpace(cluster.ClusterID)
+	labels, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
+	if err != nil {
+		return nil, fmt.Errorf("load cluster quota info: %w", err)
+	}
+	if cloudCfg == nil {
+		cloudCfg = &tenant.QuotaCloudConfig{}
+	}
+	cloudCfg.Labels = labels
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		monthly := *opts.TiDBCloudSpendingLimitMonthly
+		if err := p.updateSpendingLimitWithCredentials(ctx, publicKey, privateKey, clusterID, monthly); err != nil {
+			return nil, fmt.Errorf("update cluster spending limit: %w", err)
+		}
+		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(monthly)
+	}
+	return cloudCfg, nil
+}
+
+func (p *Provisioner) MarkQuotaUpdated(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, cloudCfg *tenant.QuotaCloudConfig) error {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return fmt.Errorf("cluster id is required")
+	}
+	clusterID := strings.TrimSpace(cluster.ClusterID)
+	labels := make(map[string]string)
+	if cloudCfg != nil {
+		for k, v := range cloudCfg.Labels {
+			labels[k] = v
+		}
+	}
+	labels[Drive9ManagedLabel] = "true"
+	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
+		labels[Drive9TenantIDLabel] = tenantID
+	}
+	labels[Drive9QuotaUpdateAtLabel] = time.Now().UTC().Format(time.RFC3339Nano)
+	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
+		return fmt.Errorf("update cluster quota labels: %w", err)
+	}
+	return nil
+}
+
+func (p *Provisioner) updateQuotaLabelsWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string, labels map[string]string) error {
+	body, err := json.Marshal(map[string]any{
+		"cluster": map[string]any{
+			"labels": labels,
+		},
+		"updateMask": "labels",
+	})
+	if err != nil {
+		return fmt.Errorf("marshal cluster label patch: %w", err)
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPatch, endpoint, body)
+	if err != nil {
+		return fmt.Errorf("patch cluster labels: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return fmt.Errorf("read cluster label update error body: %w", readErr)
+		}
+		return quotaStatusError("cluster label update", resp.StatusCode, sanitizeUpstreamBody(raw))
+	}
+	return nil
+}
+
+func (p *Provisioner) GetQuota(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.QuotaCloudConfig, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return nil, fmt.Errorf("cluster id is required")
+	}
+	_, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
+	if err != nil {
+		return nil, fmt.Errorf("load cluster quota info: %w", err)
+	}
+	return cloudCfg, nil
+}
+
+func (p *Provisioner) clusterQuotaInfo(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, *tenant.QuotaCloudConfig, error) {
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get cluster quota info: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, nil, fmt.Errorf("read cluster get error body: %w", readErr)
+		}
+		return nil, nil, quotaStatusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
+	}
+	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if readErr != nil {
+		return nil, nil, fmt.Errorf("read cluster body: %w", readErr)
+	}
+	info, err := parseClusterInfo(raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse cluster quota info: %w", err)
+	}
+	labels := make(map[string]string, len(info.Labels)+3)
+	for k, v := range info.Labels {
+		labels[k] = v
+	}
+	cloudCfg := &tenant.QuotaCloudConfig{}
+	if info.SpendingLimit != nil {
+		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(int64(info.SpendingLimit.Monthly))
+	}
+	return labels, cloudCfg, nil
+}
+
+func (p *Provisioner) updateSpendingLimitWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string, monthly int64) error {
+	if err := validateTiDBCloudSpendingLimit(monthly); err != nil {
+		return err
+	}
+	body, err := json.Marshal(map[string]any{
+		"updateMask": "spendingLimit.monthly",
+		"cluster": map[string]any{
+			"spendingLimit": map[string]int32{"monthly": int32(monthly)},
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("marshal cluster spending limit patch: %w", err)
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPatch, endpoint, body)
+	if err != nil {
+		return fmt.Errorf("patch cluster spending limit: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return fmt.Errorf("read cluster spending limit update error body: %w", readErr)
+		}
+		return quotaStatusError("cluster spending limit update", resp.StatusCode, sanitizeUpstreamBody(raw))
+	}
+	return nil
+}
+
+func validateTiDBCloudSpendingLimit(monthly int64) error {
+	const maxInt32 = int64(1<<31 - 1)
+	if monthly < 0 {
+		return fmt.Errorf("tidbcloud_spending_limit must be non-negative")
+	}
+	if monthly > maxInt32 {
+		return fmt.Errorf("tidbcloud_spending_limit is too large")
+	}
+	return nil
+}
+
+func ptrInt64(v int64) *int64 {
+	return &v
 }
 
 func (p *Provisioner) regionName() string {
@@ -507,7 +715,7 @@ func parseDefaultSpendLimit(raw string) (*int32, error) {
 	}
 	monthly, err := strconv.ParseInt(trimmed, 10, 32)
 	if err != nil || monthly < 0 {
-		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer in USD cents", EnvTiDBCloudDefaultSpendingLimit, raw)
+		return nil, fmt.Errorf("invalid %s value %q: must be a non-negative integer", EnvTiDBCloudDefaultSpendingLimit, raw)
 	}
 	out := int32(monthly)
 	return &out, nil
@@ -538,6 +746,20 @@ func sanitizeUpstreamBody(raw []byte) string {
 	return s
 }
 
+func readUpstreamBody(r io.Reader, limit int64) ([]byte, error) {
+	if r == nil {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = upstreamErrorBodyLimit + 1
+	}
+	raw, err := io.ReadAll(io.LimitReader(r, limit))
+	if err != nil {
+		return nil, fmt.Errorf("read upstream response body: %w", err)
+	}
+	return raw, nil
+}
+
 func statusError(operation string, code int, upstreamBody string) string {
 	msg := fmt.Sprintf("tidbcloud native %s status %d", operation, code)
 	if upstreamBody != "" {
@@ -553,6 +775,20 @@ func statusError(operation string, code int, upstreamBody string) string {
 		}
 	}
 	return msg
+}
+
+func quotaStatusError(operation string, code int, upstreamBody string) error {
+	msg := statusError(operation, code, upstreamBody)
+	switch code {
+	case http.StatusUnauthorized:
+		return fmt.Errorf("%w: %s", tenant.ErrQuotaPermissionDenied, msg)
+	case http.StatusForbidden:
+		return fmt.Errorf("%w: %s", tenant.ErrQuotaPermissionDenied, msg)
+	case http.StatusNotFound:
+		return fmt.Errorf("%w: %s", tenant.ErrQuotaBackendNotFound, msg)
+	default:
+		return fmt.Errorf("%s", msg)
+	}
 }
 
 func ensureDatabase(ctx context.Context, user, password, host string, port int, dbName string) error {
@@ -575,8 +811,12 @@ func ensureDatabase(ctx context.Context, user, password, host string, port int, 
 }
 
 type clusterInfo struct {
-	ClusterID string `json:"clusterId"`
-	State     string `json:"state"`
+	ClusterID     string            `json:"clusterId"`
+	State         string            `json:"state"`
+	Labels        map[string]string `json:"labels"`
+	SpendingLimit *struct {
+		Monthly int32 `json:"monthly"`
+	} `json:"spendingLimit"`
 	Endpoints struct {
 		Public struct {
 			Host string `json:"host"`
@@ -655,8 +895,15 @@ func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, priva
 		if err != nil {
 			return nil, err
 		}
-		raw, _ := io.ReadAll(resp.Body)
+		limit := int64(upstreamClusterBodyLimit)
+		if resp.StatusCode != http.StatusOK {
+			limit = upstreamErrorBodyLimit + 1
+		}
+		raw, readErr := readUpstreamBody(resp.Body, limit)
 		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("%s", statusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw)))
 		}
@@ -686,8 +933,15 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privat
 		if err != nil {
 			return nil, err
 		}
-		raw, _ := io.ReadAll(resp.Body)
+		limit := int64(upstreamClusterBodyLimit)
+		if resp.StatusCode != http.StatusOK {
+			limit = upstreamErrorBodyLimit + 1
+		}
+		raw, readErr := readUpstreamBody(resp.Body, limit)
 		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("%s", statusError("branch get", resp.StatusCode, sanitizeUpstreamBody(raw)))
 		}

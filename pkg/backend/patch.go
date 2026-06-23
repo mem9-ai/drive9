@@ -339,8 +339,10 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	}
 
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
-		if err := b.ensureStorageQuota(ctx, tx, path, newSize); err != nil {
-			return err
+		if !b.UseServerQuota() {
+			if err := b.ensureTenantStorageQuotaTx(tx, path, newSize); err != nil {
+				return err
+			}
 		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
 			FileID:                 fileID,

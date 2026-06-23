@@ -1089,7 +1089,8 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			}
 			if b.UsesDatabaseAutoEmbedding() {
 				stepStart = time.Now()
-				created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+				created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+					quotaMediaDelta(oldIsMedia, newIsMedia))
 				semanticTaskEnqueued = created
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 				return err
@@ -1097,7 +1098,8 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			// App-embedding mode: image/audio extract tasks are durable and
 			// independent of EMBED_TEXT, so register them in the same transaction.
 			stepStart = time.Now()
-			extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+			extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+				quotaMediaDelta(oldIsMedia, newIsMedia))
 			if extractErr != nil {
 				return extractErr
 			}
@@ -1159,7 +1161,8 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		}
 		if b.UsesDatabaseAutoEmbedding() {
 			stepStart = time.Now()
-			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+				quotaMediaDelta(false, newIsMedia))
 			semanticTaskEnqueued = created
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return err
@@ -1167,7 +1170,8 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		// App-embedding mode: image/audio extract tasks are durable and
 		// independent of EMBED_TEXT, so register them in the same transaction.
 		stepStart = time.Now()
-		extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+		extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+			quotaMediaDelta(false, newIsMedia))
 		if extractErr != nil {
 			return extractErr
 		}

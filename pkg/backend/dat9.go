@@ -83,9 +83,9 @@ type Dat9Backend struct {
 	// may enqueue semantic_tasks. False when no DRIVE9_EMBED_* worker is
 	// configured, preventing orphaned task rows.
 	appSemanticTasksEnabled bool
-	maxUploadBytes        int64
-	maxTenantStorageBytes int64
-	maxMediaLLMFiles      int64
+	maxUploadBytes          int64
+	maxTenantStorageBytes   int64
+	maxMediaLLMFiles        int64
 	// inlineThreshold controls the DB-inline vs S3 storage cutoff and (when
 	// surfaced to clients) the simple-PUT vs multipart upload boundary.
 	inlineThreshold int64
@@ -99,7 +99,7 @@ type Dat9Backend struct {
 	storageNamespaceID string
 	metaStore          MetaQuotaStore // nil when central quota is not wired (tests, fallback)
 	quotaSource        QuotaSource    // "tenant" (default) or "server"
-	qCache             *quotaCache    // nil when central quota is not wired
+	quotaConfigCache   *quotaConfigCache
 
 	// mutationQueue decouples central quota mutations (syncCentralFileCreate,
 	// syncCentralFileOverwrite) from the fsync critical path. Mutations are
@@ -113,6 +113,10 @@ type Dat9Backend struct {
 	mutationQueue chan func()
 	mutationWG    sync.WaitGroup
 	mutationStop  context.CancelFunc
+
+	quotaOutboxNotify chan struct{}
+	quotaOutboxWG     sync.WaitGroup
+	quotaOutboxStop   context.CancelFunc
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 
@@ -271,6 +275,7 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}
 	}
 
+	var quotaOutboxEnqueued bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		if err := b.store.InsertFileTx(tx, &datastore.File{
 			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
@@ -285,10 +290,18 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {
 			return err
 		}
-		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
 			Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
-		})
+		}); err != nil {
+			return err
+		}
+		created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, 0, "")
+		if err != nil {
+			return err
+		}
+		quotaOutboxEnqueued = created
+		return nil
 	})
 	if err != nil {
 		if storageType == datastore.StorageS3 {
@@ -296,7 +309,11 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}
 		return err
 	}
-	b.syncCentralFileCreate(ctx, fileID, 0, "")
+	if quotaOutboxEnqueued {
+		b.notifyQuotaOutbox(true)
+	} else {
+		b.syncCentralFileCreate(ctx, fileID, 0, "")
+	}
 	return nil
 }
 
@@ -325,6 +342,7 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 	now := time.Now()
 	checksum := sha256sum(data)
 
+	var quotaOutboxEnqueued bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		if err := b.ensureStorageQuota(ctx, tx, linkPath, int64(len(data))); err != nil {
 			return err
@@ -349,15 +367,27 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 		if err := b.store.EnsureParentDirsTx(tx, linkPath, b.genID); err != nil {
 			return err
 		}
-		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID: b.genID(), Path: linkPath, ParentPath: pathutil.ParentPath(linkPath),
 			Name: pathutil.BaseName(linkPath), FileID: fileID, CreatedAt: now,
-		})
+		}); err != nil {
+			return err
+		}
+		created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, int64(len(data)), symlinkContentType)
+		if err != nil {
+			return err
+		}
+		quotaOutboxEnqueued = created
+		return nil
 	})
 	if err != nil {
 		return err
 	}
-	b.syncCentralFileCreate(ctx, fileID, int64(len(data)), symlinkContentType)
+	if quotaOutboxEnqueued {
+		b.notifyQuotaOutbox(true)
+	} else {
+		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), symlinkContentType)
+	}
 	return nil
 }
 
@@ -817,12 +847,14 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	}
 
 	var semanticTaskEnqueued bool
+	var quotaOutboxEnqueued bool
 	txStart := time.Time{}
 	if timingEnabled {
 		txStart = time.Now()
 	}
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
+		quotaOutboxEnqueued = false
 		if err := b.ensureStorageQuota(ctx, tx, path, int64(len(data))); err != nil {
 			return err
 		}
@@ -856,24 +888,36 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 				return err
 			}
 		}
+		currentMediaDelta := quotaMediaDelta(false, isQuotaMediaContentType(contentType))
 		if b.UsesDatabaseAutoEmbedding() {
-			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType, currentMediaDelta)
 			semanticTaskEnqueued = created
+			if err != nil {
+				return err
+			}
+		} else {
+			// App-embedding mode: image/audio extract tasks are durable and independent
+			// of EMBED_TEXT, so register them in the same transaction. The embed task
+			// (if any) is enqueued separately below.
+			extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType, currentMediaDelta)
+			if extractErr != nil {
+				return extractErr
+			}
+			if b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
+				created, err := b.enqueueEmbedTaskTx(tx, fileID, 1)
+				semanticTaskEnqueued = created || extractCreated
+				if err != nil {
+					return err
+				}
+			} else {
+				semanticTaskEnqueued = extractCreated
+			}
+		}
+		created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, int64(len(data)), contentType)
+		if err != nil {
 			return err
 		}
-		// App-embedding mode: image/audio extract tasks are durable and independent
-		// of EMBED_TEXT, so register them in the same transaction. The embed task
-		// (if any) is enqueued separately below.
-		extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
-		if extractErr != nil {
-			return extractErr
-		}
-		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
-			created, err := b.enqueueEmbedTaskTx(tx, fileID, 1)
-			semanticTaskEnqueued = created || extractCreated
-			return err
-		}
-		semanticTaskEnqueued = extractCreated
+		quotaOutboxEnqueued = created
 		return nil
 	}); err != nil {
 		if timingEnabled {
@@ -892,7 +936,11 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	if timingEnabled {
 		centralQuotaStart = time.Now()
 	}
-	b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
+	if quotaOutboxEnqueued {
+		b.notifyQuotaOutbox(true)
+	} else {
+		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
+	}
 	if timingEnabled {
 		centralQuotaDuration = time.Since(centralQuotaStart)
 	}
@@ -1040,13 +1088,32 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	}
 
 	var semanticTaskEnqueued bool
+	var quotaOutboxEnqueued bool
 	txStart := time.Time{}
 	if timingEnabled {
 		txStart = time.Now()
 	}
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
-		if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
+		quotaOutboxEnqueued = false
+		var oldSizeBytes int64
+		var oldContentTypeForQuota string
+		currentMeta, err := b.store.GetFileStorageMetaForUpdateTx(tx, nf.File.FileID)
+		if err != nil {
+			return err
+		}
+		oldSizeBytes = currentMeta.SizeBytes
+		oldContentTypeForQuota = currentMeta.ContentType
+		if expectedRevision > 0 && currentMeta.Revision != expectedRevision {
+			return datastore.ErrRevisionConflict
+		}
+		if b.UseServerQuota() {
+			if deltaBytes := int64(len(finalData)) - currentMeta.SizeBytes; deltaBytes > 0 {
+				if err := b.ensureStorageQuotaServer(ctx, tx, deltaBytes); err != nil {
+					return err
+				}
+			}
+		} else if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
 			return err
 		}
 		var txErr error
@@ -1086,24 +1153,40 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 				return err
 			}
 		}
+		currentMediaDelta := quotaMediaDelta(isQuotaMediaContentType(oldContentTypeForQuota), isQuotaMediaContentType(contentType))
 		if b.UsesDatabaseAutoEmbedding() {
-			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType)
+			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType, currentMediaDelta)
 			semanticTaskEnqueued = created
+			if err != nil {
+				return err
+			}
+		} else {
+			// App-embedding mode: image/audio extract tasks are durable and independent
+			// of EMBED_TEXT, so register them in the same transaction. The embed task
+			// (if any) is enqueued separately below.
+			extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType, currentMediaDelta)
+			if extractErr != nil {
+				return extractErr
+			}
+			if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText, description) {
+				created, err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRevision)
+				semanticTaskEnqueued = created || extractCreated
+				if err != nil {
+					return err
+				}
+			} else {
+				semanticTaskEnqueued = extractCreated
+			}
+		}
+		created, err := b.enqueueQuotaFileOverwriteOutboxTx(tx, nf.File.FileID, oldSizeBytes, oldContentTypeForQuota, int64(len(finalData)), contentType)
+		if err != nil {
 			return err
 		}
-		// App-embedding mode: image/audio extract tasks are durable and independent
-		// of EMBED_TEXT, so register them in the same transaction. The embed task
-		// (if any) is enqueued separately below.
-		extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType)
-		if extractErr != nil {
-			return extractErr
-		}
-		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText, description) {
-			created, err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRevision)
-			semanticTaskEnqueued = created || extractCreated
-			return err
-		}
-		semanticTaskEnqueued = extractCreated
+		quotaOutboxEnqueued = created
+		nf.File.StorageType = currentMeta.StorageType
+		nf.File.StorageRef = currentMeta.StorageRef
+		nf.File.SizeBytes = oldSizeBytes
+		nf.File.ContentType = oldContentTypeForQuota
 		return nil
 	})
 	if timingEnabled {
@@ -1120,7 +1203,11 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	if timingEnabled {
 		centralQuotaStart = time.Now()
 	}
-	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
+	if quotaOutboxEnqueued {
+		b.notifyQuotaOutbox(true)
+	} else {
+		b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
+	}
 	if timingEnabled {
 		centralQuotaDuration = time.Since(centralQuotaStart)
 	}

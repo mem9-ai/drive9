@@ -41,6 +41,7 @@ type fakeMetaQuotaStore struct {
 	objectGCCandidateErr error
 	insertReservationErr error // injected into AtomicReserveAndInsertUpload to simulate INSERT failure inside the tx
 	getReservationErr    error // injected into GetUploadReservation to simulate transient DB error
+	inTxHook             func(context.Context) error
 }
 
 func (f *fakeMetaQuotaStore) EnqueueObjectGCCandidate(_ context.Context, c *meta.ObjectGCCandidateInput) error {
@@ -88,7 +89,21 @@ func (f *fakeMetaQuotaStore) GetQuotaConfig(ctx context.Context, tenantID string
 		cp := *cfg
 		return &cp, nil
 	}
-	return &QuotaConfigView{TenantID: tenantID}, nil
+	return &QuotaConfigView{
+		TenantID:         tenantID,
+		MaxStorageBytes:  meta.DefaultMaxStorageBytes(),
+		MaxMediaLLMFiles: 500,
+		MaxMonthlyCostMC: 0,
+	}, nil
+}
+
+func (f *fakeMetaQuotaStore) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if cfg, ok := f.config[tenantID]; ok {
+		return fmt.Sprintf("%d:%d:%d", cfg.MaxStorageBytes, cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC), nil
+	}
+	return "", nil
 }
 
 func (f *fakeMetaQuotaStore) GetQuotaUsage(ctx context.Context, tenantID string) (*QuotaUsageView, error) {
@@ -160,7 +175,11 @@ func (f *fakeMetaQuotaStore) AtomicReserveAndInsertUpload(ctx context.Context, r
 	defer f.mu.Unlock()
 	cfg, ok := f.config[r.TenantID]
 	if !ok {
-		cfg = &QuotaConfigView{TenantID: r.TenantID}
+		cfg = &QuotaConfigView{
+			TenantID:         r.TenantID,
+			MaxStorageBytes:  meta.DefaultMaxStorageBytes(),
+			MaxMediaLLMFiles: 500,
+		}
 	}
 	u := f.ensureUsageLocked(r.TenantID)
 	if cfg.MaxStorageBytes > 0 && u.StorageBytes+u.ReservedBytes+r.ReservedBytes > cfg.MaxStorageBytes {
@@ -201,6 +220,10 @@ func (f *fakeMetaQuotaStore) GetFileMeta(ctx context.Context, tenantID, fileID s
 	}
 	cp := *fm
 	return &cp, nil
+}
+
+func (f *fakeMetaQuotaStore) GetFileMetaForUpdateTx(tx *sql.Tx, tenantID, fileID string) (*FileMetaView, error) {
+	return f.GetFileMeta(context.Background(), tenantID, fileID)
 }
 
 func (f *fakeMetaQuotaStore) DeleteFileMeta(ctx context.Context, tenantID, fileID string) error {
@@ -431,6 +454,11 @@ func (f *fakeMetaQuotaStore) IncrMutationRetry(ctx context.Context, id int64, ma
 }
 
 func (f *fakeMetaQuotaStore) InTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
+	if f.inTxHook != nil {
+		if err := f.inTxHook(ctx); err != nil {
+			return err
+		}
+	}
 	return fn(nil)
 }
 
@@ -586,6 +614,7 @@ func TestMonthlyLLMCostExceededUsesCentralCounter(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
 	b.quotaSource = QuotaSourceServer // enable server-side cost check
 	b.maxMonthlyLLMCostMillicents = 100
+	fake.config["tenant-a"].MaxMonthlyCostMC = 100
 	fake.monthly["tenant-a"] = 101
 	if !b.monthlyLLMCostExceeded() {
 		t.Fatal("expected central monthly budget to be exceeded")

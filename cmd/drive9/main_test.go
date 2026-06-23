@@ -83,6 +83,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"usage: drive9 <command> [arguments]",
 		"create [--name NAME] [--region-code CODE] [--server URL] [--json]",
 		"delete [--server URL] [--api-key KEY] [--json]",
+		"quota <get|set> [flags]",
 		"ctx show [--json] [--reveal]",
 		"ctx use <name>",
 		"token <issue|revoke>",
@@ -549,6 +550,39 @@ func TestDispatchDeleteVerbReachesHandler(t *testing.T) {
 		t.Fatal("delete handler was not invoked for `drive9 delete ...`")
 	}
 	want := []string{"--json"}
+	if len(gotArgs) != len(want) {
+		t.Fatalf("args = %v, want %v", gotArgs, want)
+	}
+	for i := range want {
+		if gotArgs[i] != want[i] {
+			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
+		}
+	}
+}
+
+func TestDispatchQuotaVerbReachesHandler(t *testing.T) {
+	origHandler := quotaHandler
+	origExit := exitFunc
+	t.Cleanup(func() {
+		quotaHandler = origHandler
+		exitFunc = origExit
+	})
+	exitFunc = func(int) {}
+
+	var gotArgs []string
+	called := false
+	quotaHandler = func(args []string) error {
+		called = true
+		gotArgs = args
+		return nil
+	}
+
+	dispatch("quota", []string{"get", "--json"})
+
+	if !called {
+		t.Fatal("quota handler was not invoked for `drive9 quota ...`")
+	}
+	want := []string{"get", "--json"}
 	if len(gotArgs) != len(want) {
 		t.Fatalf("args = %v, want %v", gotArgs, want)
 	}

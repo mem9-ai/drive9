@@ -224,6 +224,36 @@ func ExampleClient_tokensAndVault() {
 	_ = owner.DeleteVaultSecret(ctx, "prod-db")
 }
 
+func ExampleClient_quota() {
+	ctx := context.Background()
+	serverURL := "https://drive9.example.com"
+
+	tidbCloudPublicKey := "tidbcloud-public-key"
+	tidbCloudPrivateKey := "tidbcloud-private-key"
+	tenantID := "tnt_abc123"
+	credentialClient := drive9.New(serverURL, "")
+
+	quota, err := credentialClient.GetQuota(ctx, drive9.QuotaRequest{
+		TenantID:   tenantID,
+		PublicKey:  tidbCloudPublicKey,
+		PrivateKey: tidbCloudPrivateKey,
+	})
+	if err == nil {
+		_ = quota.Config.MaxStorageSize
+		_ = quota.Config.TiDBCloudSpendingLimit
+	}
+
+	storageSize := int64(100 * 1024) // Mi
+	spendingLimit := int64(10000)
+	_, _ = credentialClient.SetQuota(ctx, drive9.QuotaSetRequest{
+		TenantID:               tenantID,
+		PublicKey:              tidbCloudPublicKey,
+		PrivateKey:             tidbCloudPrivateKey,
+		MaxStorageSize:         &storageSize,
+		TiDBCloudSpendingLimit: &spendingLimit,
+	})
+}
+
 func ExampleClient_eventsLayersGitAndJournal() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -415,6 +445,7 @@ var coveredClientMethods = map[string]bool{
 	"GetGitState":                          true,
 	"GetGitWorkspace":                      true,
 	"GetGitWorkspaceByRoot":                true,
+	"GetQuota":                             true,
 	"Grep":                                 true,
 	"GrepWithLayer":                        true,
 	"Hardlink":                             true,
@@ -479,6 +510,7 @@ var coveredClientMethods = map[string]bool{
 	"SQL":                                  true,
 	"SearchJournal":                        true,
 	"SetActor":                             true,
+	"SetQuota":                             true,
 	"SetSmallFileThresholdForTests":        true,
 	"SmallFileThreshold":                   true,
 	"Stat":                                 true,

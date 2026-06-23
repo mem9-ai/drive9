@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -38,14 +39,63 @@ func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targe
 	}
 	start := time.Now()
 
-	err := b.metaStore.AtomicReserveAndInsertUpload(ctx, &UploadReservationView{
+	if _, err := b.metaStore.GetUploadReservation(ctx, b.tenantID, uploadID); err == nil {
+		logger.Info(ctx, "central_quota_reserve_upload_duplicate",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("upload_id", uploadID))
+		metrics.RecordOperation("central_quota", "reserve_upload", "duplicate", time.Since(start))
+		return true, nil
+	} else if err != nil && !errors.Is(err, ErrReservationNotFound) {
+		logger.Warn(ctx, "central_quota_reserve_upload_duplicate_lookup_failed",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("upload_id", uploadID),
+			zap.Error(err))
+	}
+
+	reservation := &UploadReservationView{
 		TenantID:      b.tenantID,
 		UploadID:      uploadID,
 		ReservedBytes: totalSize,
 		TargetPath:    targetPath,
 		Status:        "active",
 		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	}
+	duplicate := false
+	centralReserved := false
+	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.lockQuotaAdmissionTx(ctx, tx); err != nil {
+			return err
+		}
+		if _, err := b.metaStore.GetUploadReservation(ctx, b.tenantID, uploadID); err == nil {
+			duplicate = true
+			return nil
+		} else if err != nil && !errors.Is(err, ErrReservationNotFound) {
+			return err
+		}
+		if err := b.ensureUploadReserveFitsPendingQuotaTx(ctx, tx, totalSize); err != nil {
+			return err
+		}
+		if err := b.metaStore.AtomicReserveAndInsertUpload(ctx, reservation); err != nil {
+			return err
+		}
+		centralReserved = true
+		return nil
 	})
+	if duplicate {
+		logger.Info(ctx, "central_quota_reserve_upload_duplicate",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("upload_id", uploadID))
+		metrics.RecordOperation("central_quota", "reserve_upload", "duplicate", time.Since(start))
+		return true, nil
+	}
+	if err != nil && centralReserved {
+		logger.Warn(ctx, "central_quota_reserve_upload_tenant_lock_commit_failed",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("upload_id", uploadID),
+			zap.Error(err))
+		metrics.RecordOperation("central_quota", "reserve_upload", "ok_lock_commit_failed", time.Since(start))
+		return true, nil
+	}
 	switch {
 	case err == nil:
 		metrics.RecordOperation("central_quota", "reserve_upload", "ok", time.Since(start))
@@ -71,6 +121,35 @@ func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targe
 		// Fail-open: allow the upload to proceed when the server DB is down.
 		return false, nil
 	}
+}
+
+func (b *Dat9Backend) ensureUploadReserveFitsPendingQuotaTx(ctx context.Context, tx *sql.Tx, totalSize int64) error {
+	if !b.UseServerQuota() || totalSize <= 0 {
+		return nil
+	}
+	cfg := b.cachedQuotaConfig(ctx)
+	if cfg == nil {
+		metrics.RecordOperation("server_quota", "upload_reserve_pending_check", "fail_open", 0)
+		return nil
+	}
+	if cfg.MaxStorageBytes <= 0 {
+		return nil
+	}
+	usage := b.loadQuotaUsage(ctx)
+	if usage == nil {
+		metrics.RecordOperation("server_quota", "upload_reserve_pending_check", "fail_open", 0)
+		return nil
+	}
+	pendingStorageDelta, _, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
+	if !pendingOK {
+		metrics.RecordOperation("server_quota", "upload_reserve_pending_check", "fail_open", 0)
+	}
+	projected := usage.StorageBytes + usage.ReservedBytes + pendingStorageDelta + totalSize
+	if projected > cfg.MaxStorageBytes {
+		return fmt.Errorf("%w: server limit=%d used=%d reserved=%d pending=%d delta=%d",
+			ErrStorageQuotaExceeded, cfg.MaxStorageBytes, usage.StorageBytes, usage.ReservedBytes, pendingStorageDelta, totalSize)
+	}
+	return nil
 }
 
 // --- Upload abort: release reservation ---
