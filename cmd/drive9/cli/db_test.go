@@ -419,6 +419,10 @@ func TestDeleteTenantUsesOwnerContext(t *testing.T) {
 
 	requestBodyCh := make(chan string, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/status" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"kind": "live", "status": "active"})
+			return
+		}
 		if r.Method != http.MethodDelete || r.URL.Path != "/v1/tenant" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -472,6 +476,10 @@ func TestDeleteTenantServerOverrideSendsNativeBody(t *testing.T) {
 
 	bodyCh := make(chan map[string]string, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/status" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"kind": "live", "status": "active"})
+			return
+		}
 		if r.Method != http.MethodDelete || r.URL.Path != "/v1/tenant" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -624,6 +632,10 @@ func TestDeleteTenantDeletesLiveTenantOnly(t *testing.T) {
 	withIsolatedHome(t)
 	clearProvisionEnv(t)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.URL.Path == "/v1/status" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"kind": "live", "status": "active"})
+			return
+		}
 		if r.Method != http.MethodDelete || r.URL.Path != "/v1/tenant" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
 		}
@@ -656,17 +668,13 @@ func TestDeleteTenantFallsBackToForkDeleteForForkContext(t *testing.T) {
 	withIsolatedHome(t)
 	clearProvisionEnv(t)
 
-	tenantCalled := false
+	forkDeleteCalled := false
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/tenant":
-			tenantCalled = true
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "only live tenants can be deleted"})
+		case "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]string{"kind": "fork", "status": "active"})
 		case "/v1/fork":
-			if !tenantCalled {
-				t.Fatal("/v1/fork called before /v1/tenant rejection")
-			}
+			forkDeleteCalled = true
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleting"})
 		default:
@@ -690,6 +698,9 @@ func TestDeleteTenantFallsBackToForkDeleteForForkContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DeleteTenant: %v", err)
 	}
+	if !forkDeleteCalled {
+		t.Fatal("/v1/fork was not called")
+	}
 	if !strings.Contains(out, "fork delete accepted") {
 		t.Fatalf("output = %q", out)
 	}
@@ -701,18 +712,12 @@ func TestDeleteTenantForkFallbackSendsTiDBCloudCredentials(t *testing.T) {
 	t.Setenv(EnvTiDBCloudPublicKey, "fallback-pk")
 	t.Setenv(EnvTiDBCloudPrivateKey, "fallback-sk")
 
-	tenantCalled := false
 	var forkBody string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/tenant":
-			tenantCalled = true
-			w.WriteHeader(http.StatusConflict)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "only live tenants can be deleted"})
+		case "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]string{"kind": "fork", "status": "active"})
 		case "/v1/fork":
-			if !tenantCalled {
-				t.Fatal("/v1/fork called before /v1/tenant rejection")
-			}
 			raw, _ := io.ReadAll(r.Body)
 			forkBody = string(raw)
 			w.WriteHeader(http.StatusAccepted)
@@ -741,5 +746,46 @@ func TestDeleteTenantForkFallbackSendsTiDBCloudCredentials(t *testing.T) {
 	if !strings.Contains(forkBody, `"public_key":"fallback-pk"`) ||
 		!strings.Contains(forkBody, `"private_key":"fallback-sk"`) {
 		t.Fatalf("fork delete body = %q, want TiDB Cloud credentials", forkBody)
+	}
+}
+
+func TestDeleteTenantLiveTenantDoesNotCallForkDelete(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+
+	forkCalled := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/status":
+			_ = json.NewEncoder(w).Encode(map[string]string{"kind": "live", "status": "active"})
+		case "/v1/tenant":
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleting"})
+		case "/v1/fork":
+			forkCalled = true
+			w.WriteHeader(http.StatusAccepted)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	cfg := loadConfig()
+	if _, err := ctxAdd(cfg, "owner", &Context{Type: PrincipalOwner, APIKey: "owner-key", Server: ts.URL}); err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	resetCredentialCacheForTest()
+
+	_, err := captureStdoutE(t, func() error {
+		return DeleteTenant([]string{"-y"})
+	})
+	if err != nil {
+		t.Fatalf("DeleteTenant: %v", err)
+	}
+	if forkCalled {
+		t.Fatal("/v1/fork was called for live tenant")
 	}
 }
