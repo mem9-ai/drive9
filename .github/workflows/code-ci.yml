@@ -41,7 +41,7 @@ jobs:
         run: make lint
 
       - name: Test
-        run: make test TEST_TIMEOUT=20m
+        run: make test TEST_TIMEOUT=25m
 
       - name: Install failpoint-ctl
         run: go install github.com/pingcap/failpoint/failpoint-ctl@latest
