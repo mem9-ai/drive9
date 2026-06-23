@@ -28,18 +28,13 @@ func TestEnqueueMutationEntry_Async(t *testing.T) {
 	defer b.stopMutationWorker()
 
 	// Without metaStore, processOneMutation short-circuits (no-op).
-	// Verify the entry is dequeued and processed (even if it's a no-op).
-	var enqueued atomic.Int64
+	// Verify the entry is dequeued (queue drains).
 	for i := 0; i < 10; i++ {
-		entry := mutationEntry{
+		b.mutationQueue <- mutationEntry{
 			mutationType: "test",
 			payload:      fileCreateMutationData{FileID: "f1"},
-			apply: func(tx *sql.Tx) error {
-				enqueued.Add(1)
-				return nil
-			},
+			apply:        func(tx *sql.Tx) error { return nil },
 		}
-		b.mutationQueue <- entry
 	}
 
 	require.Eventually(t, func() bool {
@@ -48,10 +43,13 @@ func TestEnqueueMutationEntry_Async(t *testing.T) {
 }
 
 func TestEnqueueMutationEntry_NonBlocking_DropOnFull(t *testing.T) {
-	b := &Dat9Backend{}
-	// Create a tiny queue to easily fill it.
+	fake := newFakeMetaQuotaStore()
+	b := &Dat9Backend{
+		tenantID:  "tenant-drop",
+		metaStore: fake,
+	}
+	// Create a tiny queue and don't start worker — entries stay in queue.
 	b.mutationQueue = make(chan mutationEntry, 2)
-	// Don't start worker — entries stay in queue.
 
 	var counter atomic.Int64
 	// Fill the queue.
@@ -59,10 +57,24 @@ func TestEnqueueMutationEntry_NonBlocking_DropOnFull(t *testing.T) {
 	b.mutationQueue <- noopMutationEntry(&counter)
 
 	// Third entry should be dropped (non-blocking).
-	b.enqueueMutationEntry(t.Context(), noopMutationEntry(&counter))
+	droppedEntry := mutationEntry{
+		mutationType: "file_create",
+		payload:      fileCreateMutationData{FileID: "dropped-file", SizeBytes: 999},
+		apply: func(tx *sql.Tx) error {
+			return b.metaStore.IncrStorageBytesTx(tx, b.tenantID, 999)
+		},
+	}
+	b.enqueueMutationEntry(t.Context(), droppedEntry)
 
 	// Queue should still have exactly 2 entries.
 	require.Equal(t, 2, len(b.mutationQueue))
+
+	// Verify the dropped entry was NOT logged or applied.
+	require.Len(t, fake.mutations, 0, "dropped entry must not be logged")
+	usage := fake.usage["tenant-drop"]
+	if usage != nil {
+		require.Equal(t, int64(0), usage.StorageBytes, "dropped entry must not be applied")
+	}
 }
 
 func TestEnqueueMutationEntry_InlineFallback(t *testing.T) {
@@ -78,7 +90,6 @@ func TestStopMutationWorker_DrainsPending(t *testing.T) {
 	b := &Dat9Backend{}
 	b.startMutationWorker()
 
-	// Push entries directly to channel — they will be processed on drain.
 	for i := 0; i < 50; i++ {
 		b.mutationQueue <- mutationEntry{
 			mutationType: "test",
@@ -88,7 +99,6 @@ func TestStopMutationWorker_DrainsPending(t *testing.T) {
 	}
 
 	b.stopMutationWorker()
-	// After stop, queue should be nil (drained + cleaned up).
 	require.Nil(t, b.mutationQueue)
 }
 
@@ -128,14 +138,16 @@ func TestProcessOneMutation_LogApplyMark(t *testing.T) {
 	require.True(t, applyCalled.Load(), "apply function should be called")
 
 	// Verify mutation log was inserted and marked applied.
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
+	// Note: mutationStatus locks fake.mu internally, so we must NOT hold
+	// fake.mu when calling it.
 	require.Len(t, fake.mutations, 1, "one mutation log entry expected")
 	require.Equal(t, "file_create", fake.mutations[0].typ)
 	require.Equal(t, "applied", fake.mutationStatus(fake.mutations[0].id))
 
 	// Verify storage bytes were incremented.
+	fake.mu.Lock()
 	usage := fake.usage["tenant-test"]
+	fake.mu.Unlock()
 	require.NotNil(t, usage)
 	require.Equal(t, int64(1024), usage.StorageBytes)
 }
@@ -166,13 +178,46 @@ func TestProcessOneMutation_WorkerDrain(t *testing.T) {
 
 	b.stopMutationWorker()
 
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
 	require.Len(t, fake.mutations, n, "all mutations should be logged")
 	for _, entry := range fake.mutations {
 		require.Equal(t, "applied", fake.mutationStatus(entry.id))
 	}
+	fake.mu.Lock()
 	require.Equal(t, int64(n*100), fake.usage["tenant-test"].StorageBytes)
+	fake.mu.Unlock()
+}
+
+// TestSyncCentralFileCreate_AsyncPath verifies the full production path:
+// syncCentralFileCreate enqueues to the async channel, and the background
+// worker processes it through InsertMutationLog → apply → MarkMutationApplied.
+func TestSyncCentralFileCreate_AsyncPath(t *testing.T) {
+	fake := newFakeMetaQuotaStore()
+	b := &Dat9Backend{
+		tenantID:    "tenant-test",
+		metaStore:   fake,
+		quotaSource: QuotaSourceServer,
+	}
+	b.startMutationWorker()
+
+	b.syncCentralFileCreate(context.Background(), "file-abc", 2048, "image/png")
+
+	b.stopMutationWorker()
+
+	require.Len(t, fake.mutations, 1)
+	require.Equal(t, "file_create", fake.mutations[0].typ)
+	require.Equal(t, "applied", fake.mutationStatus(fake.mutations[0].id))
+
+	fake.mu.Lock()
+	usage := fake.usage["tenant-test"]
+	fm := fake.fileMeta[metaKey("tenant-test", "file-abc")]
+	fake.mu.Unlock()
+
+	require.NotNil(t, usage)
+	require.Equal(t, int64(2048), usage.StorageBytes)
+	require.Equal(t, int64(1), usage.MediaFileCount)
+	require.NotNil(t, fm)
+	require.Equal(t, int64(2048), fm.SizeBytes)
+	require.True(t, fm.IsMedia)
 }
 
 // TestSyncCentralLLMCostRecord_Synchronous verifies that LLM cost records
@@ -193,8 +238,6 @@ func TestSyncCentralLLMCostRecord_Synchronous(t *testing.T) {
 	require.Equal(t, 0, len(b.mutationQueue), "LLM cost should not use async queue")
 
 	// Verify it was logged and applied.
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
 	require.Len(t, fake.mutations, 1)
 	require.Equal(t, "llm_cost_record", fake.mutations[0].typ)
 	require.Equal(t, "applied", fake.mutationStatus(fake.mutations[0].id))
