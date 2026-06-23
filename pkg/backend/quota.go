@@ -94,7 +94,7 @@ func (b *Dat9Backend) monthlyLLMCostExceededServer(ctx context.Context) bool {
 	}
 	// Use per-tenant config if available, otherwise fall back to global default.
 	limit := b.maxMonthlyLLMCostMillicents
-	if cfg := b.cachedQuotaConfig(ctx); cfg != nil && cfg.Explicit && !cfg.InheritMaxMonthlyCostMC {
+	if cfg := b.cachedQuotaConfig(ctx); cfg != nil && cfg.MaxMonthlyCostMC > 0 {
 		limit = cfg.MaxMonthlyCostMC
 	}
 	if limit <= 0 {

@@ -116,34 +116,12 @@ func TestMonthlyLLMCostExceeded_ServerQuota_NotExceeded(t *testing.T) {
 	}
 }
 
-func TestMonthlyLLMCostExceeded_ServerQuotaExplicitZeroDisablesDefault(t *testing.T) {
+func TestMonthlyLLMCostExceeded_ServerQuotaZeroUsesDefault(t *testing.T) {
 	mock := &mockQuotaStore{
 		monthlyCost: 5000,
 		quotaConfig: &QuotaConfigView{
 			TenantID:         "tenant-1",
 			MaxMonthlyCostMC: 0,
-			Explicit:         true,
-		},
-	}
-	b := &Dat9Backend{
-		metaStore:                   mock,
-		tenantID:                    "tenant-1",
-		quotaSource:                 QuotaSourceServer,
-		maxMonthlyLLMCostMillicents: 4000,
-	}
-	if b.monthlyLLMCostExceeded() {
-		t.Fatal("expected explicit zero monthly budget to disable the server quota check")
-	}
-}
-
-func TestMonthlyLLMCostExceeded_ServerQuotaInheritUsesGlobalDefault(t *testing.T) {
-	mock := &mockQuotaStore{
-		monthlyCost: 5000,
-		quotaConfig: &QuotaConfigView{
-			TenantID:                "tenant-1",
-			MaxMonthlyCostMC:        0,
-			InheritMaxMonthlyCostMC: true,
-			Explicit:                true,
 		},
 	}
 	b := &Dat9Backend{
@@ -153,7 +131,7 @@ func TestMonthlyLLMCostExceeded_ServerQuotaInheritUsesGlobalDefault(t *testing.T
 		maxMonthlyLLMCostMillicents: 4000,
 	}
 	if !b.monthlyLLMCostExceeded() {
-		t.Fatal("expected inherited monthly budget to use the global default")
+		t.Fatal("expected zero monthly config to use the global default")
 	}
 }
 

@@ -31,12 +31,10 @@ func (a *metaQuotaAdapter) GetQuotaConfig(ctx context.Context, tenantID string) 
 		return nil, err
 	}
 	return &backend.QuotaConfigView{
-		TenantID:                cfg.TenantID,
-		MaxStorageBytes:         cfg.MaxStorageBytes,
-		MaxMediaLLMFiles:        cfg.MaxMediaLLMFiles,
-		MaxMonthlyCostMC:        cfg.MaxMonthlyCostMC,
-		InheritMaxMonthlyCostMC: cfg.InheritMaxMonthlyCostMC,
-		Explicit:                cfg.Explicit,
+		TenantID:         cfg.TenantID,
+		MaxStorageBytes:  cfg.MaxStorageBytes,
+		MaxMediaLLMFiles: cfg.MaxMediaLLMFiles,
+		MaxMonthlyCostMC: cfg.MaxMonthlyCostMC,
 	}, nil
 }
 

@@ -191,11 +191,8 @@ func TestQuotaOwnerGetReturnsConfigAndUsage(t *testing.T) {
 	if !ok {
 		t.Fatalf("raw config = %#v", rawOut["config"])
 	}
-	if _, ok := config["max_media_llm_files"]; ok {
-		t.Fatalf("config unexpectedly exposed max_media_llm_files: %#v", config)
-	}
-	if _, ok := config["max_monthly_cost_mc"]; ok {
-		t.Fatalf("config unexpectedly exposed max_monthly_cost_mc: %#v", config)
+	if len(config) != 1 || config["max_storage_size"] != float64(123) {
+		t.Fatalf("raw config = %#v, want only max_storage_size", config)
 	}
 }
 

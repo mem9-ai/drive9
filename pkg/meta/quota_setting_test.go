@@ -49,14 +49,8 @@ func TestGetQuotaConfigUsesConfiguredDefaultStorageBytes(t *testing.T) {
 	if cfg.MaxMediaLLMFiles != 500 {
 		t.Fatalf("MaxMediaLLMFiles = %d, want default 500", cfg.MaxMediaLLMFiles)
 	}
-	if cfg.MaxMonthlyCostMC != DefaultMaxMonthlyCostMC {
-		t.Fatalf("MaxMonthlyCostMC = %d, want default %d", cfg.MaxMonthlyCostMC, DefaultMaxMonthlyCostMC)
-	}
-	if !cfg.InheritMaxMonthlyCostMC {
-		t.Fatal("InheritMaxMonthlyCostMC = false, want true for default config")
-	}
-	if cfg.Explicit {
-		t.Fatal("Explicit = true, want false for default config")
+	if cfg.MaxMonthlyCostMC != 0 {
+		t.Fatalf("MaxMonthlyCostMC = %d, want default 0", cfg.MaxMonthlyCostMC)
 	}
 }
 
@@ -87,16 +81,9 @@ func TestGetQuotaConfigVersion(t *testing.T) {
 	if version == "" {
 		t.Fatal("version for explicit config is empty")
 	}
-	cfg, err := s.GetQuotaConfig(ctx, "tenant-with-config")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !cfg.Explicit {
-		t.Fatal("Explicit = false, want true for configured tenant")
-	}
 }
 
-func TestPatchQuotaConfigPreservesUnspecifiedFields(t *testing.T) {
+func TestSetQuotaStorageBytesUpdatesStorageOnly(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 
@@ -108,76 +95,31 @@ func TestPatchQuotaConfigPreservesUnspecifiedFields(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	storage := int64(999)
-	monthly := int64(0)
-	if err := s.PatchQuotaConfig(ctx, &QuotaConfigPatch{
-		TenantID:         "tenant-patch",
-		MaxStorageBytes:  &storage,
-		MaxMonthlyCostMC: &monthly,
-	}); err != nil {
+	if err := s.SetQuotaStorageBytes(ctx, "tenant-patch", 999); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := s.GetQuotaConfig(ctx, "tenant-patch")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MaxStorageBytes != 999 || cfg.MaxMediaLLMFiles != 200 || cfg.MaxMonthlyCostMC != 0 {
-		t.Fatalf("cfg = %+v, want storage=999 media=200 monthly=0", cfg)
+	if cfg.MaxStorageBytes != 999 || cfg.MaxMediaLLMFiles != 200 || cfg.MaxMonthlyCostMC != 300 {
+		t.Fatalf("cfg = %+v, want storage=999 media=200 monthly=300", cfg)
 	}
 }
 
-func TestPatchQuotaConfigInsertsDefaultsForUnspecifiedFields(t *testing.T) {
-	orig := DefaultMaxStorageBytes()
-	defer func() { SetDefaultMaxStorageBytes(orig) }()
-	SetDefaultMaxStorageBytes(12345)
-
+func TestSetQuotaStorageBytesInsertsInternalDefaults(t *testing.T) {
 	s := newControlStore(t)
 	ctx := context.Background()
 
-	media := int64(7)
-	if err := s.PatchQuotaConfig(ctx, &QuotaConfigPatch{
-		TenantID:         "tenant-patch-insert",
-		MaxMediaLLMFiles: &media,
-	}); err != nil {
+	if err := s.SetQuotaStorageBytes(ctx, "tenant-patch-insert", 12345); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := s.GetQuotaConfig(ctx, "tenant-patch-insert")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MaxStorageBytes != 12345 || cfg.MaxMediaLLMFiles != 7 || cfg.MaxMonthlyCostMC != DefaultMaxMonthlyCostMC || !cfg.InheritMaxMonthlyCostMC || !cfg.Explicit {
-		t.Fatalf("cfg = %+v, want defaults plus media patch", cfg)
-	}
-	var rawMonthly int64
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT max_monthly_cost_mc FROM tenant_quota_config WHERE tenant_id = ?`,
-		"tenant-patch-insert").Scan(&rawMonthly); err != nil {
-		t.Fatal(err)
-	}
-	if rawMonthly != InheritMaxMonthlyCostMC {
-		t.Fatalf("raw max_monthly_cost_mc = %d, want inherit sentinel %d", rawMonthly, InheritMaxMonthlyCostMC)
-	}
-}
-
-func TestPatchQuotaConfigCanExplicitlyDisableMonthlyCostOnInsert(t *testing.T) {
-	s := newControlStore(t)
-	ctx := context.Background()
-
-	storage := int64(12345)
-	monthly := int64(0)
-	if err := s.PatchQuotaConfig(ctx, &QuotaConfigPatch{
-		TenantID:         "tenant-patch-explicit-monthly-zero",
-		MaxStorageBytes:  &storage,
-		MaxMonthlyCostMC: &monthly,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := s.GetQuotaConfig(ctx, "tenant-patch-explicit-monthly-zero")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.MaxStorageBytes != 12345 || cfg.MaxMonthlyCostMC != 0 || cfg.InheritMaxMonthlyCostMC || !cfg.Explicit {
-		t.Fatalf("cfg = %+v, want storage patch with explicit monthly zero", cfg)
+	if cfg.MaxStorageBytes != 12345 || cfg.MaxMediaLLMFiles != 500 || cfg.MaxMonthlyCostMC != 0 {
+		t.Fatalf("cfg = %+v, want storage patch with internal defaults", cfg)
 	}
 }
 

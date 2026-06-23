@@ -87,15 +87,13 @@ func (f *fakeMetaQuotaStore) GetQuotaConfig(ctx context.Context, tenantID string
 	defer f.mu.Unlock()
 	if cfg, ok := f.config[tenantID]; ok {
 		cp := *cfg
-		cp.Explicit = true
 		return &cp, nil
 	}
 	return &QuotaConfigView{
-		TenantID:                tenantID,
-		MaxStorageBytes:         meta.DefaultMaxStorageBytes(),
-		MaxMediaLLMFiles:        500,
-		MaxMonthlyCostMC:        meta.DefaultMaxMonthlyCostMC,
-		InheritMaxMonthlyCostMC: true,
+		TenantID:         tenantID,
+		MaxStorageBytes:  meta.DefaultMaxStorageBytes(),
+		MaxMediaLLMFiles: 500,
+		MaxMonthlyCostMC: 0,
 	}, nil
 }
 
@@ -103,7 +101,7 @@ func (f *fakeMetaQuotaStore) GetQuotaConfigVersion(ctx context.Context, tenantID
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if cfg, ok := f.config[tenantID]; ok {
-		return fmt.Sprintf("%d:%d:%d:%t", cfg.MaxStorageBytes, cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC, cfg.InheritMaxMonthlyCostMC), nil
+		return fmt.Sprintf("%d:%d:%d", cfg.MaxStorageBytes, cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC), nil
 	}
 	return "", nil
 }

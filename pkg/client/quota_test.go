@@ -119,11 +119,8 @@ func TestSetQuotaWithCredentialsPostsPartialFieldsAndDecodesResponse(t *testing.
 	if gotBody["max_storage_size"] != float64(1000) {
 		t.Fatalf("request body = %#v", gotBody)
 	}
-	if _, ok := gotBody["max_media_llm_files"]; ok {
-		t.Fatalf("request body unexpectedly included max_media_llm_files: %#v", gotBody)
-	}
-	if _, ok := gotBody["max_monthly_cost_mc"]; ok {
-		t.Fatalf("request body unexpectedly included max_monthly_cost_mc: %#v", gotBody)
+	if len(gotBody) != 4 {
+		t.Fatalf("request body = %#v, want only tenant_id, public_key, private_key, and max_storage_size", gotBody)
 	}
 	if resp.Usage.MonthlyCostMC != 4 {
 		t.Fatalf("monthly cost = %d, want 4", resp.Usage.MonthlyCostMC)

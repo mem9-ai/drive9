@@ -12,22 +12,12 @@ import (
 
 // QuotaConfig holds per-tenant quota limits stored in the central server DB.
 type QuotaConfig struct {
-	TenantID                string
-	MaxStorageBytes         int64
-	MaxMediaLLMFiles        int64
-	MaxMonthlyCostMC        int64 // millicents; 0 = disabled
-	InheritMaxMonthlyCostMC bool  // true when the DB row inherits the backend default
-	Explicit                bool  // true when tenant_quota_config has a row
-	CreatedAt               time.Time
-	UpdatedAt               time.Time
-}
-
-// QuotaConfigPatch updates only the quota fields whose pointers are non-nil.
-type QuotaConfigPatch struct {
 	TenantID         string
-	MaxStorageBytes  *int64
-	MaxMediaLLMFiles *int64
-	MaxMonthlyCostMC *int64
+	MaxStorageBytes  int64
+	MaxMediaLLMFiles int64
+	MaxMonthlyCostMC int64 // millicents; 0 = disabled
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 // QuotaUsage holds pre-aggregated quota counters for a tenant.
@@ -104,19 +94,13 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 	if err == sql.ErrNoRows {
 		// Return defaults when no per-tenant config exists.
 		cfg.MaxStorageBytes = DefaultMaxStorageBytes()
-		cfg.MaxMediaLLMFiles = DefaultMaxMediaLLMFiles
-		cfg.MaxMonthlyCostMC = DefaultMaxMonthlyCostMC
-		cfg.InheritMaxMonthlyCostMC = true
+		cfg.MaxMediaLLMFiles = 500
+		cfg.MaxMonthlyCostMC = 0
 		return cfg, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	if cfg.MaxMonthlyCostMC == InheritMaxMonthlyCostMC {
-		cfg.MaxMonthlyCostMC = DefaultMaxMonthlyCostMC
-		cfg.InheritMaxMonthlyCostMC = true
-	}
-	cfg.Explicit = true
 	return cfg, nil
 }
 
@@ -147,10 +131,6 @@ func (s *Store) SetQuotaConfig(ctx context.Context, cfg *QuotaConfig) error {
 	var err error
 	defer observeMeta(ctx, "set_quota_config", start, &err)
 
-	monthly := cfg.MaxMonthlyCostMC
-	if cfg.InheritMaxMonthlyCostMC {
-		monthly = InheritMaxMonthlyCostMC
-	}
 	_, err = s.db.ExecContext(ctx,
 		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes, max_media_llm_files, max_monthly_cost_mc)
 		 VALUES (?, ?, ?, ?)
@@ -158,56 +138,24 @@ func (s *Store) SetQuotaConfig(ctx context.Context, cfg *QuotaConfig) error {
 		   max_storage_bytes = VALUES(max_storage_bytes),
 		   max_media_llm_files = VALUES(max_media_llm_files),
 		   max_monthly_cost_mc = VALUES(max_monthly_cost_mc)`,
-		cfg.TenantID, cfg.MaxStorageBytes, cfg.MaxMediaLLMFiles, monthly)
+		cfg.TenantID, cfg.MaxStorageBytes, cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC)
 	return err
 }
 
-// PatchQuotaConfig atomically updates only the provided quota fields, preserving
-// unspecified fields in the database when a config row already exists.
-func (s *Store) PatchQuotaConfig(ctx context.Context, patch *QuotaConfigPatch) error {
+// SetQuotaStorageBytes atomically updates the storage quota, preserving internal
+// media/monthly limits when a config row already exists. New rows inherit the
+// database defaults for fields that are not externally writable.
+func (s *Store) SetQuotaStorageBytes(ctx context.Context, tenantID string, maxStorageBytes int64) error {
 	start := time.Now()
 	var err error
-	defer observeMeta(ctx, "patch_quota_config", start, &err)
-
-	if patch == nil {
-		return fmt.Errorf("quota config patch is required")
-	}
-	storage := DefaultMaxStorageBytes()
-	media := DefaultMaxMediaLLMFiles
-	monthly := InheritMaxMonthlyCostMC
-	storageSet := patch.MaxStorageBytes != nil
-	mediaSet := patch.MaxMediaLLMFiles != nil
-	monthlySet := patch.MaxMonthlyCostMC != nil
-	if storageSet {
-		storage = *patch.MaxStorageBytes
-	}
-	if mediaSet {
-		media = *patch.MaxMediaLLMFiles
-	}
-	if monthlySet {
-		monthly = *patch.MaxMonthlyCostMC
-	}
-	storageFlag := int64(0)
-	if storageSet {
-		storageFlag = 1
-	}
-	mediaFlag := int64(0)
-	if mediaSet {
-		mediaFlag = 1
-	}
-	monthlyFlag := int64(0)
-	if monthlySet {
-		monthlyFlag = 1
-	}
+	defer observeMeta(ctx, "set_quota_storage_bytes", start, &err)
 
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes, max_media_llm_files, max_monthly_cost_mc)
-		 VALUES (?, ?, ?, ?)
+		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes)
+		 VALUES (?, ?)
 		 ON DUPLICATE KEY UPDATE
-		   max_storage_bytes = CASE WHEN ? = 1 THEN VALUES(max_storage_bytes) ELSE max_storage_bytes END,
-		   max_media_llm_files = CASE WHEN ? = 1 THEN VALUES(max_media_llm_files) ELSE max_media_llm_files END,
-		   max_monthly_cost_mc = CASE WHEN ? = 1 THEN VALUES(max_monthly_cost_mc) ELSE max_monthly_cost_mc END`,
-		patch.TenantID, storage, media, monthly, storageFlag, mediaFlag, monthlyFlag)
+		   max_storage_bytes = VALUES(max_storage_bytes)`,
+		tenantID, maxStorageBytes)
 	return err
 }
 
@@ -373,20 +321,6 @@ func (s *Store) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reser
 	}
 	return ensureRowsAffected(res, tenantID)
 }
-
-// DefaultMaxMediaLLMFiles is the fallback media LLM file limit when no
-// per-tenant config row exists.
-const DefaultMaxMediaLLMFiles int64 = 500
-
-// InheritMaxMonthlyCostMC is the internal tenant_quota_config sentinel for
-// inheriting the backend default monthly LLM spend cap.
-const InheritMaxMonthlyCostMC int64 = -1
-
-// DefaultMaxMonthlyCostMC is the fallback monthly LLM spend cap in millicents
-// returned by metadata queries when no per-tenant config row exists or the row
-// inherits the backend default. A stored value of 0 still means an explicit
-// per-tenant opt-out.
-const DefaultMaxMonthlyCostMC int64 = 1_000_000 // $10.00
 
 // defaultMaxStorageBytes is the fallback limit when no per-tenant config row exists.
 var defaultMaxStorageBytes atomic.Int64

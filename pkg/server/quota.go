@@ -159,10 +159,7 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.meta.PatchQuotaConfig(r.Context(), &meta.QuotaConfigPatch{
-		TenantID:        t.ID,
-		MaxStorageBytes: &maxStorageBytes,
-	}); err != nil {
+	if err := s.meta.SetQuotaStorageBytes(r.Context(), t.ID, maxStorageBytes); err != nil {
 		errJSON(w, http.StatusInternalServerError, "quota config update failed")
 		return
 	}

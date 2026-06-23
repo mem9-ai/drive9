@@ -232,12 +232,6 @@ func quotaSet(args []string) error {
 				return err
 			}
 			maxStorageSize = &v
-		case "--max-storage-bytes":
-			return fmt.Errorf("--max-storage-bytes is no longer supported; use --max-storage-size with a Mi value")
-		case "--max-media-llm-files":
-			return fmt.Errorf("--max-media-llm-files is not supported by quota set")
-		case "--max-monthly-cost-mc":
-			return fmt.Errorf("--max-monthly-cost-mc is not supported by quota set")
 		case "--json":
 			asJSON = true
 		default:
