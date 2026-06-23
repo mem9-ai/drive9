@@ -428,6 +428,13 @@ func DeleteTenant(args []string) error {
 	if err != nil {
 		return err
 	}
+	var bodyBytes []byte
+	if body != nil {
+		bodyBytes, err = io.ReadAll(body)
+		if err != nil {
+			return fmt.Errorf("read request body: %w", err)
+		}
+	}
 
 	if !skipConfirm {
 		if !isTerminal(os.Stdin) {
@@ -447,8 +454,12 @@ func DeleteTenant(args []string) error {
 		}
 	}
 
+	var bodyReader io.Reader
+	if bodyBytes != nil {
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
 	c := client.New(server, apiKey)
-	resp, err := c.RawDelete("/v1/tenant", body)
+	resp, err := c.RawDelete("/v1/tenant", bodyReader)
 	if err != nil {
 		return fmt.Errorf("delete tenant failed: %w", err)
 	}
@@ -471,7 +482,7 @@ func DeleteTenant(args []string) error {
 			msg = http.StatusText(resp.StatusCode)
 		}
 		if resp.StatusCode == http.StatusConflict && strings.Contains(msg, "only live tenants can be deleted") {
-			return deleteForkAfterLiveRejection(server, apiKey, body, asJSON)
+			return deleteForkAfterLiveRejection(server, apiKey, bodyBytes, asJSON)
 		}
 		return fmt.Errorf("delete tenant failed (HTTP %d): %s", resp.StatusCode, msg)
 	}
@@ -565,9 +576,13 @@ func isTerminal(f *os.File) bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-func deleteForkAfterLiveRejection(server, apiKey string, body io.Reader, asJSON bool) error {
+func deleteForkAfterLiveRejection(server, apiKey string, bodyBytes []byte, asJSON bool) error {
+	var bodyReader io.Reader
+	if bodyBytes != nil {
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
 	c := client.New(server, apiKey)
-	resp, err := c.RawDelete("/v1/fork", body)
+	resp, err := c.RawDelete("/v1/fork", bodyReader)
 	if err != nil {
 		return fmt.Errorf("fork delete failed: %w", err)
 	}

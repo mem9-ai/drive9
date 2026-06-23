@@ -351,6 +351,41 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, err
 	}
 
+	apiToken, err := token.IssueToken(s.tokenSecret, forkID, 1)
+	if err != nil {
+		s.markForkFailedAndCleanup(ctx, forkID)
+		return nil, err
+	}
+	cipherToken, err := s.pool.Encrypt(ctx, []byte(apiToken))
+	if err != nil {
+		s.markForkFailedAndCleanup(ctx, forkID)
+		return nil, err
+	}
+	if err := s.meta.InsertAPIKey(ctx, &meta.APIKey{
+		ID:            token.NewID(),
+		TenantID:      forkID,
+		KeyName:       "default",
+		JWTCiphertext: cipherToken,
+		JWTHash:       token.HashToken(apiToken),
+		TokenVersion:  1,
+		Status:        meta.APIKeyActive,
+		IssuedAt:      time.Now().UTC(),
+		CreatedAt:     time.Now().UTC(),
+		UpdatedAt:     time.Now().UTC(),
+	}); err != nil {
+		s.markForkFailedAndCleanup(ctx, forkID)
+		return nil, err
+	}
+
+	makeProvisionFailedErr := func(err error) error {
+		return &forkProvisionFailedError{
+			APIKey:   apiToken,
+			TenantID: forkID,
+			Name:     displayName,
+			Err:      err,
+		}
+	}
+
 	sourceCluster := clusterInfoFromTenant(source)
 	sourceCluster.Password = forkPassword
 	cluster, err := s.createForkBranch(ctx, forkID, sourceCluster, credentialReq)
@@ -359,12 +394,12 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	}
 	if err != nil {
 		s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster)
-		s.markForkFailed(ctx, forkID)
-		return nil, err
+		s.markForkFailedAndCleanup(ctx, forkID)
+		return nil, makeProvisionFailedErr(err)
 	}
 	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
-		s.markForkFailed(ctx, forkID)
-		return nil, forkErr(http.StatusBadGateway, "branch response missing required metadata")
+		s.markForkFailedAndCleanup(ctx, forkID)
+		return nil, makeProvisionFailedErr(forkErr(http.StatusBadGateway, "branch response missing required metadata"))
 	}
 	forkRoot.ClusterID = cluster.ClusterID
 	forkRoot.BranchID = cluster.BranchID
@@ -382,34 +417,8 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		ClaimExpiresAt:   cluster.ClaimExpiresAt,
 	}); err != nil {
 		s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster)
-		s.markForkFailed(ctx, forkID)
-		return nil, err
-	}
-
-	apiToken, err := token.IssueToken(s.tokenSecret, forkID, 1)
-	if err != nil {
-		s.cleanupForkCreateFailure(ctx, forkID, source.Provider, credentialReq, cluster)
-		return nil, err
-	}
-	cipherToken, err := s.pool.Encrypt(ctx, []byte(apiToken))
-	if err != nil {
-		s.cleanupForkCreateFailure(ctx, forkID, source.Provider, credentialReq, cluster)
-		return nil, err
-	}
-	if err := s.meta.InsertAPIKey(ctx, &meta.APIKey{
-		ID:            token.NewID(),
-		TenantID:      forkID,
-		KeyName:       "default",
-		JWTCiphertext: cipherToken,
-		JWTHash:       token.HashToken(apiToken),
-		TokenVersion:  1,
-		Status:        meta.APIKeyActive,
-		IssuedAt:      time.Now().UTC(),
-		CreatedAt:     time.Now().UTC(),
-		UpdatedAt:     time.Now().UTC(),
-	}); err != nil {
-		s.cleanupForkCreateFailure(ctx, forkID, source.Provider, credentialReq, cluster)
-		return nil, err
+		s.markForkFailedAndCleanup(ctx, forkID)
+		return nil, makeProvisionFailedErr(err)
 	}
 
 	// Defensive: native branch created without endpoint and server has no default
@@ -424,12 +433,7 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		} else {
 			s.markForkFailedAndCleanup(ctx, forkID)
 		}
-		return nil, &forkProvisionFailedError{
-			APIKey:   apiToken,
-			TenantID: forkID,
-			Name:     displayName,
-			Err:      forkErr(http.StatusBadRequest, "branch response missing endpoint; server default TiDB Cloud credential is required to provision this fork"),
-		}
+		return nil, makeProvisionFailedErr(forkErr(http.StatusBadRequest, "branch response missing endpoint; server default TiDB Cloud credential is required to provision this fork"))
 	}
 
 	if source.Provider == tenant.ProviderTiDBCloudNative {
@@ -489,7 +493,7 @@ func (s *Server) provisionForkTenantAsyncWithProvision(ctx context.Context, fork
 			return
 		default:
 		}
-		if err := s.provisionForkTenantOnce(ctx, forkID); err == nil {
+		if err := provision(); err == nil {
 			logger.Info(ctx, "fork_provision_ok", zap.String("tenant_id", forkID), zap.Int("attempt", attempt))
 			return
 		} else {
@@ -737,25 +741,6 @@ func (s *Server) deleteForkBranchOrPersist(ctx context.Context, forkID string, c
 			zap.Error(perr))
 	}
 	return false
-}
-
-func (s *Server) cleanupForkCreateFailure(ctx context.Context, forkID string, provider string, credentialReq *tenant.CredentialProvisionRequest, cluster *tenant.ClusterInfo) {
-	if provider == tenant.ProviderTiDBCloudNative {
-		s.markForkDeletedOrFailedAfterBranchDelete(ctx, forkID, credentialReq, cluster)
-	} else {
-		s.markForkFailedAndCleanup(ctx, forkID)
-	}
-}
-
-func (s *Server) markForkDeletedOrFailedAfterBranchDelete(ctx context.Context, forkID string, credentialReq *tenant.CredentialProvisionRequest, cluster *tenant.ClusterInfo) {
-	cleanupCtx := backgroundWithTrace(ctx)
-	if s.deleteForkBranchOrPersist(cleanupCtx, forkID, credentialReq, cluster) {
-		if err := s.meta.UpdateTenantStatus(cleanupCtx, forkID, meta.TenantDeleted); err != nil {
-			logger.Error(ctx, "fork_mark_deleted_failed", zap.String("tenant_id", forkID), zap.Error(err))
-		}
-		return
-	}
-	s.markForkFailed(cleanupCtx, forkID)
 }
 
 func (s *Server) markForkFailed(ctx context.Context, forkID string) {
