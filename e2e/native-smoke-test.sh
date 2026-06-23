@@ -110,6 +110,22 @@ drive9_retry() {
   return 1
 }
 
+drive9_ctx_retry() {
+  local attempt=1
+  while [ "$attempt" -le "$CLI_MAX_RETRIES" ]; do
+    local out
+    if out="$(drive9_ctx "$@" 2>&1)"; then
+      printf '%s' "$out"; return 0
+    fi
+    if [ "$attempt" -lt "$CLI_MAX_RETRIES" ] && [[ "$out" == *"Too Many Requests"* || "$out" == *"HTTP 429"* || "$out" == *"HTTP 502"* || "$out" == *"not found"* || "$out" == *"unexpected EOF"* || "$out" == *"connection reset"* ]]; then
+      echo "retry $attempt/$CLI_MAX_RETRIES for drive9 ctx $* " >&2
+      sleep "$CLI_RETRY_SLEEP_S"; attempt=$((attempt+1)); continue
+    fi
+    printf '%s' "$out" >&2; return 1
+  done
+  return 1
+}
+
 cleanup() {
   if [ "$CREATED" -eq 1 ] && [ "$SKIP_CLEANUP" != "1" ] && [ -n "${TENANT_ID:-}" ]; then
     echo "[cleanup] deleting tenant $TENANT_ID" >&2
@@ -249,6 +265,52 @@ check_eq "downloaded sha256 matches" "$sum_dst" "$sum_src"
 drive9_retry fs rm "$LARGE_REMOTE" >/dev/null
 drive9_retry fs rm "$BATCH_DIR" >/dev/null
 rm -f "$LARGE_LOCAL" "$LARGE_DOWNLOADED"
+
+# ── [5.5] fork smoke ──────────────────────────────────────────────────────
+
+echo "[5.5] fork smoke"
+FORK_CTX_NAME="native-fork"
+FORK_REMOTE="/native-fork-test.txt"
+FORK_LOCAL="$(mktemp)"
+
+drive9_ctx ctx add --name owner --server "$BASE" --api-key "$API_KEY" --mode TiDBCloud >/dev/null
+
+fork_json="$(drive9_ctx ctx fork "$FORK_CTX_NAME" --from owner --tidbcloud-public-key "$PUBLIC_KEY" --tidbcloud-private-key "$PRIVATE_KEY" --json)"
+fork_api_key="$(jq -r '.api_key // empty' <<<"$fork_json")"
+fork_tenant_id="$(jq -r '.tenant_id // empty' <<<"$fork_json")"
+fork_status="$(jq -r '.status // empty' <<<"$fork_json")"
+check_cmd "fork returns api_key" test -n "$fork_api_key"
+check_cmd "fork returns tenant_id" test -n "$fork_tenant_id"
+check_eq "fork initial status is provisioning" "$fork_status" "provisioning"
+
+fork_deadline=$(( $(date +%s) + POLL_TIMEOUT_S ))
+fork_state=""
+while :; do
+  fork_status_file="$(mktemp)"
+  fork_status_code=$(curl -sS -o "$fork_status_file" -w "%{http_code}" -H "Authorization: Bearer $fork_api_key" "$BASE/v1/status")
+  fork_state=$(jq -r '.status // empty' "$fork_status_file")
+  rm -f "$fork_status_file"
+  echo "fork-status=${fork_status_code}:${fork_state}"
+  if [ "$fork_status_code" = "200" ] && [ "$fork_state" = "active" ]; then break; fi
+  if [ "$(date +%s)" -ge "$fork_deadline" ]; then break; fi
+  sleep "$POLL_INTERVAL_S"
+done
+check_eq "fork tenant becomes active" "$fork_state" "active"
+
+printf "native-fork-%s" "$TS" > "$FORK_LOCAL"
+drive9_ctx ctx use "$FORK_CTX_NAME" >/dev/null
+drive9_ctx_retry fs cp "$FORK_LOCAL" ":$FORK_REMOTE" >/dev/null
+fork_cat="$(drive9_ctx_retry fs cat "$FORK_REMOTE")"
+check_eq "fork context can read written file" "$fork_cat" "native-fork-${TS}"
+
+fork_delete_body="$(mktemp)"
+fork_delete_code=$(curl -sS -o "$fork_delete_body" -w "%{http_code}" -X DELETE \
+  -H "Authorization: Bearer $fork_api_key" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n --arg pk "$PUBLIC_KEY" --arg sk "$PRIVATE_KEY" '{public_key: $pk, private_key: $sk}')" \
+  "$BASE/v1/fork")
+check_eq "DELETE /v1/fork returns 202" "$fork_delete_code" "202"
+rm -f "$fork_delete_body"
 
 echo "[6] delete tenant"
 set +e

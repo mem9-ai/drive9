@@ -312,6 +312,9 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, forkErr(http.StatusConflict, "fork requires branch-capable provisioner")
 	}
 	if hasReservations, err := s.sourceHasActiveUploadReservations(ctx, source.ID); err != nil {
+		logger.Error(ctx, "fork_check_upload_reservations_failed",
+			zap.String("source_tenant_id", source.ID),
+			zap.Error(err))
 		return nil, err
 	} else if hasReservations {
 		return nil, forkErr(http.StatusConflict, "source tenant has active upload reservations")
@@ -393,11 +396,20 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		cluster.Provider = source.Provider
 	}
 	if err != nil {
+		logger.Error(ctx, "fork_create_branch_failed",
+			zap.String("source_tenant_id", source.ID),
+			zap.String("fork_id", forkID),
+			zap.String("cluster_id", sourceCluster.ClusterID),
+			zap.Error(err))
 		s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster)
 		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, makeProvisionFailedErr(err)
 	}
 	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
+		logger.Error(ctx, "fork_branch_response_missing_metadata",
+			zap.String("source_tenant_id", source.ID),
+			zap.String("fork_id", forkID),
+			zap.Any("cluster", cluster))
 		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, makeProvisionFailedErr(forkErr(http.StatusBadGateway, "branch response missing required metadata"))
 	}
@@ -416,6 +428,10 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		ClaimURL:         cluster.ClaimURL,
 		ClaimExpiresAt:   cluster.ClaimExpiresAt,
 	}); err != nil {
+		logger.Error(ctx, "fork_update_tenant_connection_failed",
+			zap.String("source_tenant_id", source.ID),
+			zap.String("fork_id", forkID),
+			zap.Error(err))
 		s.deleteForkBranchOrPersist(backgroundWithTrace(ctx), forkID, credentialReq, cluster)
 		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, makeProvisionFailedErr(err)
