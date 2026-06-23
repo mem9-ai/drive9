@@ -33,8 +33,8 @@ The Go SDK has typed coverage for these server-side surfaces:
 - Git workspace API: workspace metadata, tree, git state, object packs, overlay
   entries.
 - Journal API: create, append entries, read entries, search, verify.
-- Escape hatch: `RawGet`, `RawPost`, and `RawDelete` for endpoints that do not yet have a
-  typed SDK method.
+- Escape hatch: `RawGet`, `RawPost`, and `RawDelete` for endpoints that do not
+  yet have a typed SDK method, including quota and provisioning endpoints.
 
 The compile-tested examples under `examples/go-sdk-cookbook` cover every
 exported `*client.Client` method and every exported `StreamWriter` method.
@@ -59,6 +59,7 @@ exported `*client.Client` method and every exported `StreamWriter` method.
 | `pack` / `unpack` | local archive creation/extraction, profile-aware include/exclude rules, mounted-path discovery | SDK only reads/writes archive objects | No SDK pack/unpack workflow or profile parser. |
 | `profile` | built-in and user profile loading/formatting | CLI-only | No SDK profile API. |
 | `token issue/revoke` | `--allow prefix:ops` grammar, TTL parsing, local context save, rollback revoke if save fails, stdin/file revoke | SDK has issue/revoke API methods | No SDK helper for CLI grammar or local context persistence. |
+| `quota get/set` | owner-key quota query, TiDB Cloud credential query, TiDB Cloud-only quota update, human/JSON output, local credential resolution | Possible via `RawGet("/v1/quota")` and `RawPost("/v1/quota/query" or "/v1/quota")` | No typed quota request/response helpers in the SDK; SDK callers must build JSON bodies and decode responses themselves. |
 | `vault set/get/put/with/ls/rm/grant/revoke/audit` | path grammar, field parsing (`field=value`, `@file`, stdin), dotenv/JSON output, `put --from`, secure env injection into child process | SDK has raw vault API methods | No SDK helper for CLI UX, batch directory import, or `vault with` process execution. |
 | `journal new/append/cat/find/verify` | flag parsing, JSONL/stdin parsing, idempotency-key defaults, human/JSON output | SDK has journal API methods | No SDK helper for CLI input/output formats. |
 | `git clone --fast` | local `git` orchestration, worktree setup, GitHub tree-size enrichment, local `.git` archiving, hydration | SDK has server-side git workspace/tree/state/object/overlay APIs | No SDK one-shot fast-clone workflow. |
@@ -82,11 +83,12 @@ exported `*client.Client` method and every exported `StreamWriter` method.
 1. Add a small config/credentials package outside `cmd/drive9/cli`:
    `LoadConfig`, `ResolveCredentials`, `NewFromEnv`, and `NewFromContext(name)`.
 2. Add typed provision/deprovision helpers for `/v1/provision` and `/v1/tenant`.
-3. Add context-aware variants for `SQL`, `Grep`, `GrepWithLayer`, and `Find`.
-4. Add high-level recursive copy helpers that mirror the CLI's local/remote
+3. Add typed quota helpers for `/v1/quota` and `/v1/quota/query`.
+4. Add context-aware variants for `SQL`, `Grep`, `GrepWithLayer`, and `Find`.
+5. Add high-level recursive copy helpers that mirror the CLI's local/remote
    matrix without pulling in command-line output behavior.
-5. Add a vault convenience layer for `put --from` and `field=@file` parsing,
+6. Add a vault convenience layer for `put --from` and `field=@file` parsing,
    but keep `vault with` process execution CLI-only unless there is a clear
    embedding use case.
-6. Add a Git fast-clone workflow package only if Go callers need the local git
+7. Add a Git fast-clone workflow package only if Go callers need the local git
    orchestration; the current SDK already covers the server-side records.

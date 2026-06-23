@@ -6,6 +6,8 @@ filesystem workflows.
 
 For CLI parity analysis, see
 [`docs/guides/go-sdk-cli-parity.md`](go-sdk-cli-parity.md).
+For quota CLI and HTTP API usage, see
+[`docs/guides/quota.md`](quota.md).
 
 The Go module path is `github.com/mem9-ai/drive9`, so Go imports use
 `github.com/mem9-ai/drive9/pkg/client`.
@@ -79,6 +81,117 @@ func main() {
 Use `client.NewWithToken` only when you intentionally hold a delegated
 capability token, such as a vault JWT. Filesystem commands normally use
 `client.New`.
+
+## Quota API
+
+The SDK does not yet expose typed quota helpers. Use `RawGet` and `RawPost`
+for the quota endpoints, or use the `drive9 quota` CLI. See
+[`docs/guides/quota.md`](quota.md) for the full CLI and HTTP reference.
+
+All quota endpoints return the same response shape:
+
+```go
+type quotaConfig struct {
+	MaxStorageBytes  int64 `json:"max_storage_bytes"`
+	MaxMediaLLMFiles int64 `json:"max_media_llm_files"`
+	MaxMonthlyCostMC int64 `json:"max_monthly_cost_mc"`
+}
+
+type quotaUsage struct {
+	StorageBytes   int64 `json:"storage_bytes"`
+	ReservedBytes  int64 `json:"reserved_bytes"`
+	MediaFileCount int64 `json:"media_file_count"`
+	MonthlyCostMC  int64 `json:"monthly_cost_mc"`
+}
+
+type quotaResponse struct {
+	TenantID       string      `json:"tenant_id"`
+	Provider       string      `json:"provider"`
+	Status         string      `json:"status"`
+	SupportsUpdate bool        `json:"supports_update"`
+	Config         quotaConfig `json:"config"`
+	Usage          quotaUsage  `json:"usage"`
+}
+
+func decodeQuotaResponse(resp *http.Response, action string) (*quotaResponse, error) {
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s status %d: %s", action, resp.StatusCode, body)
+	}
+	var out quotaResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+```
+
+Query quota for the tenant represented by an owner API key:
+
+```go
+resp, err := drive9.New(serverURL, ownerAPIKey).RawGet("/v1/quota")
+if err != nil {
+	return err
+}
+quota, err := decodeQuotaResponse(resp, "quota get")
+if err != nil {
+	return err
+}
+_ = quota
+```
+
+Query a `tidb_cloud_native` tenant with TiDB Cloud credentials:
+
+```go
+body, err := json.Marshal(map[string]string{
+	"tenant_id":   "tnt_abc123",
+	"public_key":  tidbCloudPublicKey,
+	"private_key": tidbCloudPrivateKey,
+})
+if err != nil {
+	return err
+}
+
+resp, err := drive9.New(serverURL, "").RawPost("/v1/quota/query", bytes.NewReader(body))
+if err != nil {
+	return err
+}
+quota, err := decodeQuotaResponse(resp, "quota query")
+if err != nil {
+	return err
+}
+_ = quota
+```
+
+Set quota for a `tidb_cloud_native` tenant with TiDB Cloud credentials:
+
+```go
+body, err := json.Marshal(map[string]any{
+	"tenant_id":            "tnt_abc123",
+	"public_key":           tidbCloudPublicKey,
+	"private_key":          tidbCloudPrivateKey,
+	"max_storage_bytes":    int64(107374182400),
+	"max_media_llm_files":  int64(500),
+	"max_monthly_cost_mc":  int64(0), // disables the monthly LLM budget
+})
+if err != nil {
+	return err
+}
+
+resp, err := drive9.New(serverURL, "").RawPost("/v1/quota", bytes.NewReader(body))
+if err != nil {
+	return err
+}
+quota, err := decodeQuotaResponse(resp, "quota set")
+if err != nil {
+	return err
+}
+_ = quota
+```
+
+Quota updates require TiDB Cloud API keys and a Drive9 tenant id. A Drive9
+tenant API key cannot authorize quota updates for its own tenant.
 
 ## Run the included smoke test
 
