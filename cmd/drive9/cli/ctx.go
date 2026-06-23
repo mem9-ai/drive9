@@ -59,7 +59,6 @@ func ctxUsage() string {
   import                                              add delegated context from stdin (default when stdin is a pipe)
   fork [<new>] [--from <ctx>] [--json] [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]
                                                         create a copy-on-write fork context
-                                                        flags take precedence; use env vars to avoid shell history
   ls [-l|--json] [--type <kind>|--scoped]             list contexts (filter by type: owner|delegated|fs_scoped)
   use <name>                                          activate a context
   rm <name>                                           remove a local context name (does NOT revoke server-side credential)`
@@ -461,9 +460,6 @@ func ctxForkCmd(args []string) error {
   --json                          output fork result as JSON
   --tidbcloud-public-key KEY      TiDB Cloud public key
   --tidbcloud-private-key KEY     TiDB Cloud private key
-
-  Flags take precedence; use DRIVE9_PUBLIC_KEY / DRIVE9_PRIVATE_KEY env
-  vars to avoid exposing keys in shell history.
 
   The fork tenant provisions asynchronously. Use "drive9 fs ls /" to poll.`)
 		return nil
