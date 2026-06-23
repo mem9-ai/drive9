@@ -88,6 +88,7 @@ type CredentialBranchProvisioner interface {
 	Provisioner
 	CreateBranchWithCredentials(ctx context.Context, forkTenantID string, source *ClusterInfo, req CredentialProvisionRequest) (*ClusterInfo, error)
 	WaitForBranchActiveWithCredentials(ctx context.Context, branch *ClusterInfo, req CredentialProvisionRequest) (*ClusterInfo, error)
+	WaitForBranchUserWithCredentials(ctx context.Context, clusterID, branchID string, req CredentialProvisionRequest) (string, error)
 	DeleteBranchWithCredentials(ctx context.Context, clusterID, branchID string, req CredentialProvisionRequest) error
 }
 

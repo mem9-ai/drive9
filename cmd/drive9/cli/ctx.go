@@ -450,6 +450,24 @@ func ctxAdd(cfg *Config, name string, ctx *Context) (*Context, error) {
 }
 
 func ctxForkCmd(args []string) error {
+	if len(args) == 1 && IsHelpArg(args[0]) {
+		_, _ = fmt.Fprintln(os.Stdout, `usage: drive9 ctx fork [<new>] [--from <ctx>] [--json] [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]
+
+  create a copy-on-write fork context from a TiDB Cloud Native tenant.
+  The fork shares the parent's storage namespace and uses a lightweight
+  TiDB Cloud branch for its database.
+
+  --from <ctx>                    source context name (default: current context)
+  --json                          output fork result as JSON
+  --tidbcloud-public-key KEY      TiDB Cloud public key
+  --tidbcloud-private-key KEY     TiDB Cloud private key
+
+  Prefer DRIVE9_PUBLIC_KEY / DRIVE9_PRIVATE_KEY over private-key flags in
+  shared shells.
+
+  The fork tenant provisions asynchronously. Use "drive9 fs ls /" to poll.`)
+		return nil
+	}
 	newName := ""
 	fromName := ""
 	publicKeyFlag := ""
