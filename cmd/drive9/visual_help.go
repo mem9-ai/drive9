@@ -498,7 +498,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Details: []string{
 				"show -> inspect active context; ls -> scan saved contexts",
 				"add/import -> save owner or delegated keys",
-				"fork -> create a copy-on-write context from a TiDB Cloud tenant; rm -> remove local credentials",
+				"fork -> create a copy-on-write context; rm -> remove local credentials",
 			},
 			Flags: []visualHelpFlag{
 				{Name: "--json", Desc: "available on show, fork, and ls"},

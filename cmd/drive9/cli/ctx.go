@@ -452,8 +452,7 @@ func ctxForkCmd(args []string) error {
 	if len(args) == 1 && IsHelpArg(args[0]) {
 		_, _ = fmt.Fprintln(os.Stdout, `usage: drive9 ctx fork [<new>] [--from <ctx>] [--json] [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]
 
-  create a copy-on-write fork context from a TiDB Cloud tenant.
-  The fork shares the parent's storage namespace and uses a lightweight
+  create a copy-on-write fork context. The fork shares the parent's storage namespace and uses a lightweight
   TiDB Cloud branch for its database.
 
   --from <ctx>                    source context name (default: current context)
