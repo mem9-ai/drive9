@@ -36,6 +36,7 @@ const (
 
 	DefaultDatabaseName = "tidbcloud_fs"
 	DefaultSpendLimit   = int32(1000)
+	stateActive         = "ACTIVE"
 
 	upstreamErrorBodyLimit = 2048
 )
@@ -43,7 +44,10 @@ const (
 var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 var displayNameCharPattern = regexp.MustCompile(`[^A-Za-z0-9-]`)
 
-var ensureDatabaseFunc = ensureDatabase
+var (
+	ensureDatabaseFunc          = ensureDatabase
+	tidbCloudNativePollInterval = 5 * time.Second
+)
 
 type Provisioner struct {
 	apiURL              string
@@ -204,7 +208,7 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	if info.ClusterID == "" {
 		return nil, fmt.Errorf("tidbcloud native response missing cluster id")
 	}
-	if info.State != "ACTIVE" || clusterConnectionIncomplete(info) {
+	if info.State != stateActive || clusterConnectionIncomplete(info) {
 		info, err = p.waitForClusterActive(ctx, publicKey, privateKey, info.ClusterID)
 		if err != nil {
 			return &tenant.ClusterInfo{
@@ -239,6 +243,163 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 		return out, fmt.Errorf("ensure tidbcloud native database: %w", err)
 	}
 	return out, nil
+}
+
+func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	req, ok := p.DefaultCredentials()
+	if !ok {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	return p.ProvisionBranchWithCredentials(ctx, forkTenantID, source, req)
+}
+
+func (p *Provisioner) ProvisionBranchWithCredentials(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	out, err := p.CreateBranchWithCredentials(ctx, forkTenantID, source, req)
+	if err != nil {
+		return out, err
+	}
+	if out.Host != "" && out.Port != 0 && out.Username != "" {
+		return out, nil
+	}
+	return p.WaitForBranchActiveWithCredentials(ctx, out, req)
+}
+
+func (p *Provisioner) CreateBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	req, ok := p.DefaultCredentials()
+	if !ok {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	return p.CreateBranchWithCredentials(ctx, forkTenantID, source, req)
+}
+
+func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	if source == nil {
+		return nil, fmt.Errorf("source cluster info is required")
+	}
+	parentID := source.BranchID
+	if parentID == "" {
+		parentID = source.ClusterID
+	}
+	if source.ClusterID == "" || parentID == "" {
+		return nil, fmt.Errorf("source cluster id is required")
+	}
+	reqBody := map[string]string{
+		"displayName": clusterDisplayName(forkTenantID),
+		"parentId":    parentID,
+	}
+	if source.Password != "" {
+		reqBody["rootPassword"] = source.Password
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal branch provision request: %w", err)
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches", p.apiURL, url.PathEscape(source.ClusterID))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPost, endpoint, body)
+	if err != nil {
+		return nil, fmt.Errorf("create branch request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return nil, fmt.Errorf("%s", statusError("branch provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
+	}
+
+	branch, err := parseBranchInfo(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse branch provision response: %w", err)
+	}
+	if branch.BranchID == "" {
+		return nil, fmt.Errorf("tidbcloud native branch response missing branch id")
+	}
+	dbName := source.DBName
+	if dbName == "" {
+		dbName = p.defaultDatabaseName
+	}
+	out := &tenant.ClusterInfo{
+		TenantID:  forkTenantID,
+		ClusterID: source.ClusterID,
+		BranchID:  branch.BranchID,
+		Password:  source.Password,
+		DBName:    dbName,
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+	if !branchConnectionIncomplete(branch) {
+		if err := fillBranchEndpoint(out, branch); err != nil {
+			return out, err
+		}
+		return out, nil
+	}
+	if branch.State == "" {
+		return out, fmt.Errorf("tidbcloud native branch response missing state and endpoint")
+	}
+	return out, nil
+}
+
+func (p *Provisioner) WaitForBranchActive(ctx context.Context, branch *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
+	req, ok := p.DefaultCredentials()
+	if !ok {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	return p.WaitForBranchActiveWithCredentials(ctx, branch, req)
+}
+
+func (p *Provisioner) WaitForBranchActiveWithCredentials(ctx context.Context, branch *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, tenant.ErrCredentialsRequired
+	}
+	if branch == nil {
+		return nil, fmt.Errorf("branch cluster info is required")
+	}
+	if branch.ClusterID == "" || branch.BranchID == "" {
+		return nil, fmt.Errorf("cluster id and branch id are required")
+	}
+	out := *branch
+	info, err := p.waitForBranchActive(ctx, publicKey, privateKey, branch.ClusterID, branch.BranchID)
+	if err != nil {
+		return &out, fmt.Errorf("wait for branch active: %w", err)
+	}
+	if err := fillBranchEndpoint(&out, info); err != nil {
+		return &out, err
+	}
+	return &out, nil
+}
+
+func (p *Provisioner) DeleteBranch(ctx context.Context, clusterID, branchID string) error {
+	req, ok := p.DefaultCredentials()
+	if !ok {
+		return tenant.ErrCredentialsRequired
+	}
+	return p.DeleteBranchWithCredentials(ctx, clusterID, branchID, req)
+}
+
+func (p *Provisioner) DeleteBranchWithCredentials(ctx context.Context, clusterID, branchID string, req tenant.CredentialProvisionRequest) error {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return tenant.ErrCredentialsRequired
+	}
+	if clusterID == "" || branchID == "" {
+		return fmt.Errorf("cluster id and branch id are required")
+	}
+	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s", p.apiURL, url.PathEscape(clusterID), url.PathEscape(branchID))
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodDelete, endpoint, nil)
+	if err != nil {
+		return fmt.Errorf("delete branch request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("%s", statusError("branch delete", resp.StatusCode, sanitizeUpstreamBody(raw)))
+	}
+	return nil
 }
 
 func (p *Provisioner) DeprovisionWithCredentials(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
@@ -426,8 +587,29 @@ type clusterInfo struct {
 	Username   string `json:"username"`
 }
 
+type branchInfo struct {
+	BranchID  string `json:"branchId"`
+	State     string `json:"state"`
+	Endpoints struct {
+		Public struct {
+			Host string `json:"host"`
+			Port int    `json:"port"`
+		} `json:"public"`
+	} `json:"endpoints"`
+	UserPrefix string `json:"userPrefix"`
+	Username   string `json:"username"`
+}
+
 func parseClusterInfo(raw []byte) (*clusterInfo, error) {
 	var out clusterInfo
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func parseBranchInfo(raw []byte) (*branchInfo, error) {
+	var out branchInfo
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, err
 	}
@@ -439,6 +621,30 @@ func clusterConnectionIncomplete(info *clusterInfo) bool {
 		return true
 	}
 	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || (info.UserPrefix == "" && info.Username == "")
+}
+
+func branchConnectionIncomplete(info *branchInfo) bool {
+	if info == nil {
+		return true
+	}
+	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || (info.UserPrefix == "" && info.Username == "")
+}
+
+func fillBranchEndpoint(out *tenant.ClusterInfo, branch *branchInfo) error {
+	if branch.Endpoints.Public.Host == "" || branch.Endpoints.Public.Port == 0 {
+		return fmt.Errorf("tidbcloud native branch response missing endpoint")
+	}
+	if branch.Username != "" {
+		out.Username = branch.Username
+	} else if branch.UserPrefix != "" {
+		out.Username = branch.UserPrefix + ".root"
+	}
+	if out.Username == "" {
+		return fmt.Errorf("tidbcloud native branch response missing username")
+	}
+	out.Host = branch.Endpoints.Public.Host
+	out.Port = branch.Endpoints.Public.Port
+	return nil
 }
 
 func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, privateKey, clusterID string) (*clusterInfo, error) {
@@ -458,7 +664,7 @@ func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, priva
 		if err != nil {
 			return nil, err
 		}
-		if info.State == "ACTIVE" && !clusterConnectionIncomplete(info) {
+		if info.State == stateActive && !clusterConnectionIncomplete(info) {
 			return info, nil
 		}
 		if time.Now().After(deadline) {
@@ -467,7 +673,38 @@ func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, priva
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(5 * time.Second):
+		case <-time.After(tidbCloudNativePollInterval):
+		}
+	}
+}
+
+func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privateKey, clusterID, branchID string) (*branchInfo, error) {
+	deadline := time.Now().Add(10 * time.Minute)
+	for {
+		endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s?view=BASIC", p.apiURL, url.PathEscape(clusterID), url.PathEscape(branchID))
+		resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("%s", statusError("branch get", resp.StatusCode, sanitizeUpstreamBody(raw)))
+		}
+		info, err := parseBranchInfo(raw)
+		if err != nil {
+			return nil, err
+		}
+		if info.State == stateActive && !branchConnectionIncomplete(info) {
+			return info, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("tidbcloud native branch %s not active before timeout: %s", branchID, info.State)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(tidbCloudNativePollInterval):
 		}
 	}
 }

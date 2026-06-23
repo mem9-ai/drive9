@@ -43,6 +43,10 @@ func ExampleClient_constructionStatusAndRawRequests() {
 	if err == nil {
 		_ = resp.Body.Close()
 	}
+	resp, err = c.RawGet("/v1/status")
+	if err == nil {
+		_ = resp.Body.Close()
+	}
 }
 
 func ExampleClient_filesystemCRUDAndMetadata() {
@@ -439,6 +443,7 @@ var coveredClientMethods = map[string]bool{
 	"PutGitOverlayEntry":                   true,
 	"QueryVaultAudit":                      true,
 	"RawDelete":                            true,
+	"RawGet":                               true,
 	"RawPost":                              true,
 	"Read":                                 true,
 	"ReadAt":                               true,

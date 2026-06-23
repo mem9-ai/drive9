@@ -279,6 +279,14 @@ func (c *Client) url(path string) string {
 	return c.baseURL + "/v1/fs" + path
 }
 
+func (c *Client) RawGet(endpoint string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.do(req)
+}
+
 func (c *Client) RawPost(endpoint string, body io.Reader) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodPost, c.baseURL+endpoint, body)
 	if err != nil {

@@ -428,6 +428,13 @@ func DeleteTenant(args []string) error {
 	if err != nil {
 		return err
 	}
+	var bodyBytes []byte
+	if body != nil {
+		bodyBytes, err = io.ReadAll(body)
+		if err != nil {
+			return fmt.Errorf("read request body: %w", err)
+		}
+	}
 
 	if !skipConfirm {
 		if !isTerminal(os.Stdin) {
@@ -447,8 +454,25 @@ func DeleteTenant(args []string) error {
 		}
 	}
 
+	var bodyReader io.Reader
+	if bodyBytes != nil {
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
 	c := client.New(server, apiKey)
-	resp, err := c.RawDelete("/v1/tenant", body)
+
+	kind, err := tenantKind(c)
+	if err != nil {
+		return fmt.Errorf("cannot determine tenant kind: %w", err)
+	}
+	switch kind {
+	case "fork":
+		return deleteForkAfterLiveRejection(server, apiKey, bodyBytes, asJSON)
+	case "live":
+	default:
+		return fmt.Errorf("unknown tenant kind %q; expected \"fork\" or \"live\"", kind)
+	}
+
+	resp, err := c.RawDelete("/v1/tenant", bodyReader)
 	if err != nil {
 		return fmt.Errorf("delete tenant failed: %w", err)
 	}
@@ -560,4 +584,73 @@ func isTerminal(f *os.File) bool {
 		return false
 	}
 	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+func tenantKind(c *client.Client) (string, error) {
+	resp, err := c.RawGet("/v1/status")
+	if err != nil {
+		return "", fmt.Errorf("status API request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read status response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("status API returned HTTP %d", resp.StatusCode)
+	}
+	var status struct {
+		Kind string `json:"kind"`
+	}
+	_ = json.Unmarshal(raw, &status)
+	if status.Kind == "" {
+		return "", fmt.Errorf("server does not report tenant kind; upgrade server or contact administrator")
+	}
+	return status.Kind, nil
+}
+
+func deleteForkAfterLiveRejection(server, apiKey string, bodyBytes []byte, asJSON bool) error {
+	var bodyReader io.Reader
+	if bodyBytes != nil {
+		bodyReader = bytes.NewReader(bodyBytes)
+	}
+	c := client.New(server, apiKey)
+	resp, err := c.RawDelete("/v1/fork", bodyReader)
+	if err != nil {
+		return fmt.Errorf("fork delete failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	rawResp, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read fork delete response: %w", err)
+	}
+	var result struct {
+		Status string `json:"status"`
+		Error  string `json:"error"`
+	}
+	_ = json.Unmarshal(rawResp, &result)
+	if resp.StatusCode != http.StatusAccepted {
+		msg := strings.TrimSpace(result.Error)
+		if msg == "" {
+			msg = strings.TrimSpace(string(rawResp))
+		}
+		if msg == "" {
+			msg = http.StatusText(resp.StatusCode)
+		}
+		return fmt.Errorf("fork delete failed (HTTP %d): %s", resp.StatusCode, msg)
+	}
+	if result.Status == "" {
+		result.Status = "deleting"
+	}
+	cleanupMatchingOwnerContexts(server, apiKey)
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(map[string]string{
+			"status": result.Status,
+			"server": server,
+		})
+	}
+	fmt.Printf("fork delete accepted (status: %s)\n", result.Status)
+	return nil
 }

@@ -178,14 +178,14 @@ func MySQLNoEmbeddingTenantSchemaStatements() []string {
 		`CREATE INDEX idx_file_gc_claim ON file_gc_tasks(status, available_at, lease_until, created_at)`,
 		`CREATE TABLE IF NOT EXISTS llm_usage (
 			id              BIGINT AUTO_INCREMENT PRIMARY KEY,
-			task_type       VARCHAR(32) NOT NULL,
-			task_id         VARCHAR(64) NOT NULL,
-			cost_millicents BIGINT NOT NULL DEFAULT 0,
+			task_type       VARCHAR(64) NOT NULL,
+			task_id         VARCHAR(255) NOT NULL,
+			cost_millicents BIGINT NOT NULL,
 			raw_units       BIGINT NOT NULL DEFAULT 0,
-			raw_unit_type   VARCHAR(16) NOT NULL,
-			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+			raw_unit_type   VARCHAR(32) NOT NULL DEFAULT '',
+			created_at      DATETIME(3) NOT NULL,
+			INDEX idx_llm_usage_created (created_at)
 		)`,
-		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
 		`CREATE TABLE IF NOT EXISTS fs_events (
 			seq        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
 			path       VARCHAR(512) NOT NULL,
