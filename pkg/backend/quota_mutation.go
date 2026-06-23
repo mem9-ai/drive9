@@ -13,9 +13,9 @@ import (
 )
 
 // mutationEntry is the unit of work enqueued to the async mutation channel.
-// It carries enough information for the background worker to perform both the
-// durable log INSERT and the quota-state apply in a single transaction,
-// entirely off the write hot path.
+// Used for storage quota mutations (file create/overwrite) that can tolerate
+// eventual consistency. LLM cost records use processOneMutation directly
+// (synchronous) because they are billable and must not be dropped.
 type mutationEntry struct {
 	mutationType string
 	payload      any            // JSON-serializable mutation data
@@ -71,10 +71,12 @@ func (b *Dat9Backend) enqueueMutationEntry(ctx context.Context, entry mutationEn
 	case b.mutationQueue <- entry:
 		// Enqueued successfully.
 	default:
-		// Queue full — drop. MutationReplayWorker will NOT recover this
-		// entry because it was never logged, but backfill-quota reconciles
-		// from the source-of-truth tenant DB file table. This is acceptable
-		// per @qiffang: "quota没必要非常精准，还是要保证性能最重要".
+		// Queue full — drop. The entry was never logged, so neither
+		// MutationReplayWorker nor automatic reconciliation will recover it.
+		// Quota counters will remain inaccurate until a manual run of the
+		// backfill-quota CLI, which reconciles from the source-of-truth
+		// tenant DB file table. Acceptable for storage quota per product
+		// decision (performance > precision).
 		logger.Warn(ctx, "central_quota_mutation_dropped",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", entry.mutationType))
@@ -83,8 +85,15 @@ func (b *Dat9Backend) enqueueMutationEntry(ctx context.Context, entry mutationEn
 }
 
 // processOneMutation durably logs a mutation and applies its quota-state
-// changes in a single transaction. Called by the background worker (or
-// inline when no worker is wired).
+// changes. Called by the background worker (or inline when no worker is
+// wired).
+//
+// Two-phase approach:
+//  1. INSERT into quota_mutation_log (auto-commit, separate connection).
+//  2. InTx: apply quota state + MarkMutationAppliedTx.
+//
+// If phase 2 fails or crashes, the log entry stays pending and
+// MutationReplayWorker picks it up on its next poll (30s interval).
 func (b *Dat9Backend) processOneMutation(ctx context.Context, entry mutationEntry) {
 	if b.metaStore == nil || b.tenantID == "" {
 		return
@@ -100,42 +109,37 @@ func (b *Dat9Backend) processOneMutation(ctx context.Context, entry mutationEntr
 		return
 	}
 
-	// Single transaction: INSERT log + apply quota state + mark applied.
+	// Phase 1: durable log INSERT (auto-commit, own connection).
+	logID, err := b.metaStore.InsertMutationLog(ctx, &MutationLogView{
+		TenantID:     b.tenantID,
+		MutationType: entry.mutationType,
+		MutationData: data,
+	})
+	if err != nil {
+		logger.Warn(ctx, "central_quota_mutation_log_insert_failed",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("mutation_type", entry.mutationType),
+			zap.Error(err))
+		metrics.RecordOperation("central_quota", entry.mutationType, "log_failed", time.Since(start))
+		return
+	}
+
+	// Phase 2: apply quota state + mark applied in one transaction.
 	if err := b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
-		logID, insErr := insertMutationLogTx(tx, b.metaStore, b.tenantID, entry.mutationType, data)
-		if insErr != nil {
-			return insErr
-		}
 		if err := entry.apply(tx); err != nil {
 			return err
 		}
 		return b.metaStore.MarkMutationAppliedTx(tx, logID)
 	}); err != nil {
-		logger.Warn(ctx, "central_quota_mutation_process_failed",
+		logger.Warn(ctx, "central_quota_mutation_apply_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", entry.mutationType),
+			zap.Int64("log_id", logID),
 			zap.Error(err))
-		metrics.RecordOperation("central_quota", entry.mutationType, "error", time.Since(start))
+		metrics.RecordOperation("central_quota", entry.mutationType, "pending", time.Since(start))
 		return
 	}
 	metrics.RecordOperation("central_quota", entry.mutationType, "ok", time.Since(start))
-}
-
-// insertMutationLogTx inserts a mutation log entry within an existing
-// transaction. This is used by processOneMutation to combine log + apply +
-// mark-applied in a single tx round-trip.
-func insertMutationLogTx(tx *sql.Tx, store MetaQuotaStore, tenantID, mutationType string, data json.RawMessage) (int64, error) {
-	// InsertMutationLog uses its own connection; we need a Tx variant.
-	// For now, call the non-Tx version — it auto-commits the INSERT which
-	// is safe because MarkMutationAppliedTx in the same outer tx will mark
-	// it applied. If the outer tx rolls back, the log entry stays pending
-	// and MutationReplayWorker picks it up — this is the correct recovery
-	// behavior.
-	return store.InsertMutationLog(context.Background(), &MutationLogView{
-		TenantID:     tenantID,
-		MutationType: mutationType,
-		MutationData: data,
-	})
 }
 
 func (b *Dat9Backend) syncCentralFileCreate(ctx context.Context, fileID string, sizeBytes int64, contentType string) {
@@ -215,8 +219,13 @@ func (b *Dat9Backend) syncCentralFileOverwrite(ctx context.Context, fileID strin
 	})
 }
 
+// syncCentralLLMCostRecord logs and applies an LLM cost mutation
+// synchronously. Unlike file create/overwrite, LLM cost records are
+// billable and must not be silently dropped. This is not in the file
+// write hot path (called from image/audio extract workers), so the
+// synchronous overhead is acceptable.
 func (b *Dat9Backend) syncCentralLLMCostRecord(ctx context.Context, taskType, taskID string, costMillicents, rawUnits int64, rawUnitType string) {
-	b.enqueueMutationEntry(ctx, mutationEntry{
+	b.processOneMutation(ctx, mutationEntry{
 		mutationType: "llm_cost_record",
 		payload: llmCostMutationData{
 			TaskType:       taskType,
