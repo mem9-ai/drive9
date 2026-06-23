@@ -105,9 +105,13 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 	}
 	rows, err := eb.store.ListFSEventsSince(ctx, int64(since), 1000)
 	if err != nil {
-		// Table missing or query failed: send reset.
-		headSeq = eb.Seq(ctx)
-		return nil, headSeq, false
+		// Table missing or query failed: don't send reset on every poll —
+		// that would cause continuous full-cache invalidation. Instead, return
+		// ok=true with empty events (caught up). The FUSE client's TTL/HEAD
+		// revalidation provides correctness without SSE. Only since=0 (initial
+		// connection) sends a reset.
+		headSeq = since // keep the client's cursor unchanged
+		return nil, headSeq, true
 	}
 	events = make([]ChangeEvent, 0, len(rows))
 	for _, r := range rows {
