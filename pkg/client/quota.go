@@ -15,12 +15,10 @@ type QuotaConfig struct {
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
 }
 
-// QuotaUsage is the tenant's current quota usage counters.
+// QuotaUsage is the tenant's current storage quota usage counters.
 type QuotaUsage struct {
-	StorageBytes   int64 `json:"storage_bytes"`
-	ReservedBytes  int64 `json:"reserved_bytes"`
-	MediaFileCount int64 `json:"media_file_count"`
-	MonthlyCostMC  int64 `json:"monthly_cost_mc"`
+	StorageBytes  int64 `json:"storage_bytes"`
+	ReservedBytes int64 `json:"reserved_bytes"`
 }
 
 // QuotaResponse is returned by all quota query and update APIs.

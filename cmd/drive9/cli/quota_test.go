@@ -48,15 +48,22 @@ func TestQuotaGetUsesTenantIDAndTiDBCloudHeaders(t *testing.T) {
 	t.Setenv(EnvServer, ts.URL)
 	resetCredentialCacheForTest()
 
-	if _, err := captureStdoutE(t, func() error {
+	stdout, err := captureStdoutE(t, func() error {
 		return Quota([]string{
 			"get",
 			"--tenant-id", "tenant-1",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
 		})
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("Quota get: %v", err)
+	}
+	if !strings.Contains(stdout, "usage: storage_bytes=1 reserved_bytes=2") {
+		t.Fatalf("stdout should include storage usage counters: %s", stdout)
+	}
+	if strings.Contains(stdout, "media_file_count") || strings.Contains(stdout, "monthly_cost_mc") {
+		t.Fatalf("stdout should not include media or cost counters: %s", stdout)
 	}
 	if gotAuth != "" {
 		t.Fatalf("Authorization = %q, want empty", gotAuth)
@@ -422,10 +429,8 @@ func quotaTestResponse(tenantID string) map[string]any {
 			"tidbcloud_spending_limit": 10000,
 		},
 		"usage": map[string]any{
-			"storage_bytes":    1,
-			"reserved_bytes":   2,
-			"media_file_count": 3,
-			"monthly_cost_mc":  4,
+			"storage_bytes":  1,
+			"reserved_bytes": 2,
 		},
 	}
 }

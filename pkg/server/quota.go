@@ -39,10 +39,8 @@ type quotaConfigResponse struct {
 }
 
 type quotaUsageResponse struct {
-	StorageBytes   int64 `json:"storage_bytes"`
-	ReservedBytes  int64 `json:"reserved_bytes"`
-	MediaFileCount int64 `json:"media_file_count"`
-	MonthlyCostMC  int64 `json:"monthly_cost_mc"`
+	StorageBytes  int64 `json:"storage_bytes"`
+	ReservedBytes int64 `json:"reserved_bytes"`
 }
 
 const (
@@ -272,11 +270,6 @@ func (s *Server) writeQuotaResponse(w http.ResponseWriter, r *http.Request, t *m
 		errJSON(w, http.StatusInternalServerError, "quota usage lookup failed")
 		return
 	}
-	monthlyCost, err := s.meta.MonthlyLLMCostMillicents(r.Context(), t.ID)
-	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "quota usage lookup failed")
-		return
-	}
 	var spendingLimit *int64
 	if cloudCfg != nil {
 		spendingLimit = cloudCfg.TiDBCloudSpendingLimitMonthly
@@ -292,10 +285,8 @@ func (s *Server) writeQuotaResponse(w http.ResponseWriter, r *http.Request, t *m
 			TiDBCloudSpendingLimit: spendingLimit,
 		},
 		Usage: quotaUsageResponse{
-			StorageBytes:   usage.StorageBytes,
-			ReservedBytes:  usage.ReservedBytes,
-			MediaFileCount: usage.MediaFileCount,
-			MonthlyCostMC:  monthlyCost,
+			StorageBytes:  usage.StorageBytes,
+			ReservedBytes: usage.ReservedBytes,
 		},
 	})
 }

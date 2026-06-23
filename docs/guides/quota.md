@@ -14,14 +14,12 @@ Drive9 exposes these user-settable quota settings:
 | `max_storage_size` | Maximum confirmed plus reserved file storage size, in Mi. Stored in Drive9. |
 | `tidbcloud_spending_limit` | TiDB Cloud Cluster Spending Limit. The value is passed through to TiDB Cloud, read from and written to the TiDB Cloud cluster, and not stored in Drive9. See the [TiDB Cloud Spending Limit guide](https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit). |
 
-Quota responses also include usage counters:
+Quota responses include these storage usage counters:
 
 | Field | Meaning |
 | --- | --- |
 | `storage_bytes` | Confirmed file storage bytes. |
 | `reserved_bytes` | Bytes reserved by active uploads. |
-| `media_file_count` | Confirmed image/audio file count. |
-| `monthly_cost_mc` | Current monthly LLM cost in millicents. |
 
 ## Permissions and supported modes
 
@@ -72,7 +70,7 @@ provider: tidb_cloud_native
 status: active
 supports_update: true
 config: max_storage_size=102400Mi tidbcloud_spending_limit=10000
-usage: storage_bytes=1048576 reserved_bytes=0 media_file_count=12 monthly_cost_mc=350
+usage: storage_bytes=1048576 reserved_bytes=0
 ```
 
 Set quota with `drive9 quota set`. Only TiDBCloud mode supports quota set. Pass
@@ -113,9 +111,7 @@ All quota endpoints return the same response shape:
   },
   "usage": {
     "storage_bytes": 1048576,
-    "reserved_bytes": 0,
-    "media_file_count": 12,
-    "monthly_cost_mc": 350
+    "reserved_bytes": 0
   }
 }
 ```
@@ -170,8 +166,9 @@ The quota API returns JSON errors through the standard server error shape.
 
 ## Notes for operators
 
-- Server-side quota reads high-churn usage counters from the central meta store.
-  Low-churn quota config is cached per tenant and refreshed by version polling.
+- Server-side quota admission reads high-churn usage counters from the central
+  meta store. Low-churn quota config is cached per tenant and refreshed by
+  version polling.
 - In cloud-native mode, small write quota mutations are recorded in a
   tenant-local quota outbox and applied asynchronously to central quota state.
 - Small-write quota admission includes pending outbox deltas to reduce

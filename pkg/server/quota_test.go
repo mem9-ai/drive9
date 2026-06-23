@@ -250,7 +250,7 @@ func TestQuotaGetAllowsExplicitDefaultTiDBCloudCredentials(t *testing.T) {
 	}
 }
 
-func TestQuotaGetReturnsConfigUsageAndSpendingLimit(t *testing.T) {
+func TestQuotaGetReturnsConfigStorageUsageAndSpendingLimit(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	spendingLimit := int64(10000)
 	rt.prov.cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: &spendingLimit}
@@ -270,9 +270,6 @@ func TestQuotaGetReturnsConfigUsageAndSpendingLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := rt.meta.IncrReservedBytes(ctx, rt.tenantID, 11); err != nil {
-		t.Fatal(err)
-	}
-	if err := rt.meta.IncrMonthlyLLMCost(ctx, rt.tenantID, 99); err != nil {
 		t.Fatal(err)
 	}
 
@@ -298,8 +295,11 @@ func TestQuotaGetReturnsConfigUsageAndSpendingLimit(t *testing.T) {
 	if out.Config.MaxStorageSize != 123 || out.Config.TiDBCloudSpendingLimit == nil || *out.Config.TiDBCloudSpendingLimit != spendingLimit {
 		t.Fatalf("config = %#v", out.Config)
 	}
-	if out.Usage.StorageBytes != 321 || out.Usage.ReservedBytes != 11 || out.Usage.MediaFileCount != 7 || out.Usage.MonthlyCostMC != 99 {
+	if out.Usage.StorageBytes != 321 || out.Usage.ReservedBytes != 11 {
 		t.Fatalf("usage = %#v", out.Usage)
+	}
+	if strings.Contains(string(raw), "media_file_count") || strings.Contains(string(raw), "monthly_cost_mc") {
+		t.Fatalf("response should not expose media or cost counters: %s", raw)
 	}
 }
 

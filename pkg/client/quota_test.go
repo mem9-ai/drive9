@@ -51,6 +51,9 @@ func TestGetQuotaSendsHeadersAndDecodesResponse(t *testing.T) {
 	if resp.Config.TiDBCloudSpendingLimit == nil || *resp.Config.TiDBCloudSpendingLimit != 10000 {
 		t.Fatalf("spending limit = %#v, want 10000", resp.Config.TiDBCloudSpendingLimit)
 	}
+	if resp.Usage.StorageBytes != 1 || resp.Usage.ReservedBytes != 2 {
+		t.Fatalf("usage = %#v", resp.Usage)
+	}
 }
 
 func TestSetQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
@@ -92,8 +95,11 @@ func TestSetQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
 	if len(gotBody) != 4 {
 		t.Fatalf("request body = %#v, want only tenant_id, public_key, private_key, and max_storage_size", gotBody)
 	}
-	if resp.Usage.MonthlyCostMC != 4 {
-		t.Fatalf("monthly cost = %d, want 4", resp.Usage.MonthlyCostMC)
+	if resp.Config.MaxStorageSize != 1000 {
+		t.Fatalf("max storage size = %d, want 1000", resp.Config.MaxStorageSize)
+	}
+	if resp.Usage.StorageBytes != 1 || resp.Usage.ReservedBytes != 2 {
+		t.Fatalf("usage = %#v", resp.Usage)
 	}
 }
 
@@ -172,10 +178,8 @@ func quotaClientTestResponse(tenantID string) map[string]any {
 			"tidbcloud_spending_limit": 10000,
 		},
 		"usage": map[string]any{
-			"storage_bytes":    1,
-			"reserved_bytes":   2,
-			"media_file_count": 3,
-			"monthly_cost_mc":  4,
+			"storage_bytes":  1,
+			"reserved_bytes": 2,
 		},
 	}
 }

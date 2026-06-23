@@ -358,8 +358,7 @@ func printQuotaCLIResponse(out *client.QuotaResponse, asJSON bool) error {
 		configParts = append(configParts, fmt.Sprintf("tidbcloud_spending_limit=%d", *out.Config.TiDBCloudSpendingLimit))
 	}
 	fmt.Printf("config: %s\n", strings.Join(configParts, " "))
-	fmt.Printf("usage: storage_bytes=%d reserved_bytes=%d media_file_count=%d monthly_cost_mc=%d\n",
-		out.Usage.StorageBytes, out.Usage.ReservedBytes, out.Usage.MediaFileCount, out.Usage.MonthlyCostMC)
+	fmt.Printf("usage: storage_bytes=%d reserved_bytes=%d\n", out.Usage.StorageBytes, out.Usage.ReservedBytes)
 	return nil
 }
 
