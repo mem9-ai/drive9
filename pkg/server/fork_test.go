@@ -949,3 +949,39 @@ func TestCreateForkTenantNativeBranchCreateErrorReturnsAPIKey(t *testing.T) {
 		t.Fatal("forkProvisionFailedError.TenantID is empty")
 	}
 }
+
+func TestProvisionForkTenantWithCredentialsUsesRequestKeyForWait(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-a",
+		Host:      rt.dbHost,
+		Port:      rt.dbPort,
+		Username:  rt.dbUser,
+		DBName:    rt.dbName,
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+	rt.insertTenantWithProvider(t, "fork-nc", meta.TenantProvisioning, meta.TenantKindFork, "source", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
+	if _, err := rt.meta.DB().ExecContext(context.Background(),
+		`UPDATE tenants SET db_host = '', db_port = 0, db_user = '' WHERE id = ?`, "fork-nc"); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = rt.server.provisionForkTenantOnceWithCredentials(context.Background(), "fork-nc", &tenant.CredentialProvisionRequest{
+		PublicKey:  "creds-pk",
+		PrivateKey: "creds-sk",
+	})
+	reqs := rt.prov.credentialRequests()
+	found := false
+	for _, r := range reqs {
+		if r.PublicKey == "creds-pk" && r.PrivateKey == "creds-sk" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("credential requests = %+v, want creds-pk/creds-sk", reqs)
+	}
+}
