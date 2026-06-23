@@ -62,6 +62,13 @@ type AsyncBranchProvisioner interface {
 	WaitForBranchActive(ctx context.Context, branch *ClusterInfo) (*ClusterInfo, error)
 }
 
+type CredentialBranchProvisioner interface {
+	Provisioner
+	CreateBranchWithCredentials(ctx context.Context, forkTenantID string, source *ClusterInfo, req CredentialProvisionRequest) (*ClusterInfo, error)
+	WaitForBranchActiveWithCredentials(ctx context.Context, branch *ClusterInfo, req CredentialProvisionRequest) (*ClusterInfo, error)
+	DeleteBranchWithCredentials(ctx context.Context, clusterID, branchID string, req CredentialProvisionRequest) error
+}
+
 func RequireProvisioner(provider string, provisioners map[string]Provisioner) (Provisioner, error) {
 	p, ok := provisioners[provider]
 	if !ok || p == nil {

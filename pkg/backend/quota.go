@@ -51,14 +51,6 @@ func (b *Dat9Backend) ensureStorageQuota(ctx context.Context, tx *sql.Tx, path s
 	return b.ensureTenantStorageQuotaTx(tx, path, newSize)
 }
 
-// mediaLLMQuotaExceededCheck dispatches the media LLM quota check based on quotaSource.
-func (b *Dat9Backend) mediaLLMQuotaExceededCheck(ctx context.Context) bool {
-	if b.UseServerQuota() {
-		return b.mediaLLMQuotaExceededServer(ctx)
-	}
-	return b.mediaLLMQuotaExceeded()
-}
-
 // mediaLLMQuotaExceededCheckTx dispatches the media LLM quota check (transactional variant).
 func (b *Dat9Backend) mediaLLMQuotaExceededCheckTx(ctx context.Context, tx *sql.Tx) bool {
 	if b.UseServerQuota() {

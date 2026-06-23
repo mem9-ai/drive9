@@ -1,7 +1,6 @@
 package backend
 
 import (
-	"context"
 	"fmt"
 	"time"
 
@@ -12,8 +11,6 @@ import (
 )
 
 const (
-	defaultImageExtractQueueSize = 128
-	defaultImageExtractWorkers   = 1
 	defaultImageExtractMaxSize   = int64(8 << 20) // 8 MiB
 	defaultImageExtractTimeout   = 20 * time.Second
 	// DefaultImageExtractMaxTextBytes is the default stored semantic text cap
@@ -134,9 +131,13 @@ type LLMCostBudgetOptions struct {
 	FallbackAudioCostMillicents int64
 }
 
-// AsyncImageExtractOptions controls async image->text extraction.
+// AsyncImageExtractOptions controls async image->text extraction. Delivery is
+// fully durable via semantic_tasks; the semantic worker claims and processes
+// img_extract_text tasks using this backend's extractor and S3 client.
 type AsyncImageExtractOptions struct {
-	Enabled             bool
+	Enabled bool
+	// QueueSize and Workers are deprecated: image extraction no longer uses an
+	// in-process channel. They remain for config compatibility but are ignored.
 	QueueSize           int
 	Workers             int
 	MaxImageBytes       int64
@@ -245,12 +246,6 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 
 	cfg := opts.AsyncImageExtract
 	if cfg.Enabled {
-		if cfg.QueueSize <= 0 {
-			cfg.QueueSize = defaultImageExtractQueueSize
-		}
-		if cfg.Workers <= 0 {
-			cfg.Workers = defaultImageExtractWorkers
-		}
 		if cfg.MaxImageBytes <= 0 {
 			cfg.MaxImageBytes = defaultImageExtractMaxSize
 		}
@@ -269,18 +264,9 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 		b.imageExtractTimeout = cfg.TaskTimeout
 		b.imageExtractMaxSize = cfg.MaxImageBytes
 		b.maxExtractTextBytes = cfg.MaxExtractTextBytes
-		b.imageExtractQueue = make(chan ImageExtractTaskSpec, cfg.QueueSize)
-		globalBackendRuntimeMetrics.activateImage(b.runtimeMetricsID, cfg.QueueSize, cfg.Workers)
+		globalBackendRuntimeMetrics.activateImage(b.runtimeMetricsID, 0, 0)
 
-		ctx, cancel := context.WithCancel(backgroundWithTrace())
-		b.imageExtractCancel = cancel
-		for i := 0; i < cfg.Workers; i++ {
-			b.imageExtractWG.Add(1)
-			go b.runImageExtractWorker(ctx, i+1)
-		}
-		logger.Info(ctx, "backend_image_extract_workers_started",
-			zap.Int("workers", cfg.Workers),
-			zap.Int("queue_size", cfg.QueueSize),
+		logger.Info(backgroundWithTrace(), "backend_image_extract_runtime_configured",
 			zap.Duration("task_timeout", cfg.TaskTimeout),
 			zap.Int64("max_image_bytes", cfg.MaxImageBytes),
 			zap.Int("max_extract_text_bytes", cfg.MaxExtractTextBytes),
@@ -314,16 +300,10 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 
 // Close stops background workers owned by this backend instance.
 func (b *Dat9Backend) Close() {
-	b.stopFileGCWorker()
-	if b.imageExtractCancel != nil {
-		b.imageExtractCancel()
-		b.imageExtractWG.Wait()
-		b.imageExtractCancel = nil
+	b.StopFileGCWorker()
+	if b.imageExtractEnabled {
 		globalBackendRuntimeMetrics.deactivateImage(b.runtimeMetricsID)
 		b.imageExtractEnabled = false
-		logger.Info(backgroundWithTrace(), "backend_image_extract_workers_stopped",
-			zap.Int("queue_depth", len(b.imageExtractQueue)),
-			zap.Int("queue_size", cap(b.imageExtractQueue)))
 	}
 	if b.audioExtractEnabled {
 		globalBackendRuntimeMetrics.deactivateAudio(b.runtimeMetricsID)

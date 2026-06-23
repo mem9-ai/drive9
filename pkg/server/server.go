@@ -69,9 +69,10 @@ type Config struct {
 	// TiDB EMBED_TEXT, but TiDB tenants still use the normal auto schema.
 	DisableDatabaseAutoEmbedding bool
 	// Leader, when set, gates background schedulers (semantic worker, object GC,
-	// tenant delete cleanup, pending tenant reconciler, and one-time resume tasks)
-	// to run only on the leader pod. When nil or disabled, all workers start
-	// unconditionally (single-pod mode).
+	// tenant delete cleanup, pending tenant reconciler, one-time resume tasks,
+	// central-quota mutation replay, upload-reservation expiry sweep, and
+	// per-tenant FileGC) to run only on the leader pod. When nil or disabled, all
+	// workers start unconditionally (single-pod mode).
 	Leader *leader.Manager
 }
 
@@ -132,10 +133,17 @@ type Server struct {
 	// changes, this context is cancelled and recreated. Workers that use it
 	// (pending tenant reconciler, tenant delete cleanup, one-time resume tasks)
 	// stop automatically on cancellation.
-	leaderWorkerCtx    context.Context
-	leaderWorkerCancel context.CancelFunc
-	leaderWorkerWG     sync.WaitGroup
-	leaderWorkerMu     sync.Mutex
+	leaderWorkerCtx      context.Context
+	leaderWorkerCancel   context.CancelFunc
+	leaderWorkerWG       sync.WaitGroup
+	leaderWorkerMu       sync.Mutex
+	leaderWorkersStarted bool
+	// replayWorker and expirySweepWorker are leader-gated central quota
+	// workers owned by the server (single callback owner). Started in
+	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
+	// leadership transitions rather than being wired separately in main.go.
+	replayWorker      *backend.MutationReplayWorker
+	expirySweepWorker *backend.ExpirySweepWorker
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -163,6 +171,7 @@ const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 // protocol change.
 type TenantStatusResponse struct {
 	Status  string `json:"status"`
+	Kind    string `json:"kind,omitempty"`
 	Message string `json:"message,omitempty"`
 
 	MaxUploadBytes int64 `json:"max_upload_bytes"`
@@ -392,41 +401,51 @@ func (s *Server) Close() {
 	}
 	s.forkWorkerMu.Unlock()
 	s.forkWorkerWG.Wait()
-	if s.semanticWorker != nil {
-		s.semanticWorker.Stop()
-	}
-	if s.objectGCWorker != nil {
-		s.objectGCWorker.Stop()
-	}
-	s.stopLeaderWorkers()
-	s.leaderWorkerMu.Lock()
-	if s.leaderWorkerCancel != nil {
-		s.leaderWorkerCancel()
-	}
-	s.leaderWorkerMu.Unlock()
-	s.leaderWorkerWG.Wait()
+	// Stop the leader manager first so any in-flight onLead/onLose callbacks
+	// finish before we tear down local workers. leader.Stop() waits for the
+	// heartbeat goroutine to exit, so no further callback can fire after it
+	// returns. If this pod currently holds leadership, Stop() invokes onLose,
+	// which runs stopLeaderWorkers and stops the leader-gated workers; the
+	// stopLeaderWorkers call below is then a no-op. If this pod is a standby,
+	// onLose does not fire, and stopLeaderWorkers is a no-op (workers were
+	// never started). This ordering prevents the race where Close() stops
+	// workers while onLead is still starting them (the callbacks and the local
+	// teardown are serialized on leaderWorkerMu, and no callback can outlive
+	// leader.Stop()).
 	if s.leader != nil {
 		s.leader.Stop()
 	}
+	// In single-pod (no-leader) mode, leader-gated workers were started
+	// unconditionally in NewWithConfig; stop them now. In leader mode this is a
+	// no-op (already stopped via onLose above) guarded by leaderWorkersStarted.
+	// stopLeaderWorkers also stops the semantic and object GC workers in both
+	// modes (they are started by startLeaderWorkers), so no separate Stop calls
+	// are needed here.
+	s.stopLeaderWorkers()
 }
 
 // startLeaderWorkers launches the background schedulers that should run only
 // on the leader pod: the fork-worker group (pending tenant reconciler, tenant
-// delete cleanup, one-time resume tasks) plus the semantic and object GC
-// workers. Safe to call multiple times — each worker checks its own start guard.
+// delete cleanup, one-time resume tasks), the semantic and object GC workers,
+// and the central-quota mutation replay + expiry sweep workers. The whole start
+// (including the worker assignments and Start calls) is serialized under
+// leaderWorkerMu and guarded by leaderWorkersStarted, so onLead racing with
+// Close()/onLose cannot interleave a start with a stop and leave orphan workers
+// running. The mutex is held for the entire transition so that a concurrent
+// stopLeaderWorkers observes the fully-started worker set (not a partial one).
 func (s *Server) startLeaderWorkers() {
+	s.leaderWorkerMu.Lock()
+	defer s.leaderWorkerMu.Unlock()
+	if s.leaderWorkersStarted {
+		return
+	}
+	s.leaderWorkersStarted = true
 	// Create a fresh leaderWorkerCtx for the fork-worker group and one-time
 	// resume tasks. These use leaderWorkerCtx (not forkWorkerCtx, which is
 	// reserved for API-triggered fork operations that must run on any pod).
-	s.leaderWorkerMu.Lock()
-	if s.leaderWorkerCancel != nil {
-		s.leaderWorkerMu.Unlock()
-		return // already started
-	}
 	leaderCtx, cancel := context.WithCancel(context.Background())
 	s.leaderWorkerCtx = leaderCtx
 	s.leaderWorkerCancel = cancel
-	s.leaderWorkerMu.Unlock()
 
 	if s.meta != nil && s.pool != nil && s.provisioner != nil {
 		// One-time resume tasks (run in leader-gated goroutines).
@@ -468,6 +487,19 @@ func (s *Server) startLeaderWorkers() {
 				}
 			})
 		}
+	}
+	// Central-quota workers: the server owns these as the single leader-callback
+	// owner so they start/stop with leadership transitions (previously they were
+	// wired in main.go via a second SetCallbacks call that was clobbered by the
+	// server's own SetCallbacks).
+	if s.meta != nil {
+		s.replayWorker = backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(s.meta))
+		s.expirySweepWorker = backend.StartExpirySweepWorker(s.meta)
+	}
+	// Per-tenant FileGC: start on every cached backend so FileGC reacts to a
+	// leadership gain for backends created while this pod was a standby.
+	if s.pool != nil {
+		s.pool.StartAllFileGC()
 	}
 	if s.semanticWorker != nil {
 		s.semanticWorker.Start(backgroundWithTrace(leaderCtx))
@@ -516,21 +548,58 @@ func (s *Server) cleanupFSEvents(ctx context.Context) {
 }
 
 // stopLeaderWorkers stops the background schedulers started by startLeaderWorkers.
-// Called when the pod loses leadership or the server shuts down.
+// Called when the pod loses leadership or the server shuts down. The whole stop
+// (including the worker Stop/wait calls and clearing the worker fields) is
+// serialized under leaderWorkerMu and guarded by leaderWorkersStarted, so
+// onLose (heartbeat goroutine), Close() (main goroutine), and a concurrent
+// startLeaderWorkers cannot interleave. Holding the mutex for the entire
+// transition guarantees a concurrent startLeaderWorkers observes the
+// fully-stopped state (leaderWorkersStarted == false) and does not leave
+// orphan workers that a stop already ran past.
 func (s *Server) stopLeaderWorkers() {
 	s.leaderWorkerMu.Lock()
+	defer s.leaderWorkerMu.Unlock()
+	if !s.leaderWorkersStarted {
+		return
+	}
+	s.leaderWorkersStarted = false
 	cancel := s.leaderWorkerCancel
 	s.leaderWorkerCancel = nil
-	s.leaderWorkerMu.Unlock()
+	replayWorker := s.replayWorker
+	s.replayWorker = nil
+	expirySweepWorker := s.expirySweepWorker
+	s.expirySweepWorker = nil
+
 	if cancel != nil {
 		cancel()
 	}
 	s.leaderWorkerWG.Wait()
+	if replayWorker != nil {
+		replayWorker.Stop()
+	}
+	if expirySweepWorker != nil {
+		expirySweepWorker.Stop()
+	}
+	// Per-tenant FileGC: stop on every cached backend so FileGC reacts to a
+	// leadership loss for backends created while this pod was the leader.
+	if s.pool != nil {
+		s.pool.StopAllFileGC()
+	}
 	if s.semanticWorker != nil {
 		s.semanticWorker.Stop()
 	}
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Stop()
+	}
+	s.stopLeaderWorkers()
+	s.leaderWorkerMu.Lock()
+	if s.leaderWorkerCancel != nil {
+		s.leaderWorkerCancel()
+	}
+	s.leaderWorkerMu.Unlock()
+	s.leaderWorkerWG.Wait()
+	if s.leader != nil {
+		s.leader.Stop()
 	}
 }
 
@@ -602,6 +671,9 @@ func (s *Server) onLose() {
 
 // logSemanticWorkerStatus logs whether the semantic worker is enabled or disabled.
 // Called in single-pod mode (no leader manager) for backward-compatible logging.
+// Log-only: the workers are started by startLeaderWorkers (called just before
+// this in the no-leader path), so this must NOT call Start again (that would be
+// a redundant double-start and previously silently over-started them).
 func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallbackTaskTypes, poolAutoTaskTypes []string) {
 	ctx := backgroundWithTrace(context.Background())
 	if s.semanticWorker != nil {
@@ -619,7 +691,6 @@ func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallba
 		}
 		fields = append(fields, s.semanticWorker.tenantScanLogFields()...)
 		logger.Info(ctx, "server_semantic_workers_enabled", fields...)
-		s.semanticWorker.Start(ctx)
 	} else {
 		logger.Info(ctx, "server_semantic_workers_disabled",
 			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
@@ -633,7 +704,6 @@ func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallba
 	}
 	if s.objectGCWorker != nil {
 		logger.Info(ctx, "server_object_gc_worker_enabled")
-		s.objectGCWorker.Start(ctx)
 	} else {
 		logger.Info(ctx, "server_object_gc_worker_disabled")
 	}
@@ -1205,6 +1275,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          string(resolved.Tenant.Status),
+		Kind:            string(resolved.Tenant.Kind),
 		Message:         s.tenantStatusMessage(&resolved.Tenant),
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
@@ -1271,6 +1342,7 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          "active",
+		Kind:            "live",
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})

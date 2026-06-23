@@ -116,12 +116,11 @@ type Dat9Backend struct {
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 
-	// Async image -> text extraction worker (in-memory queue for P0).
+	// Async image -> text extraction runtime (durable semantic_tasks delivery;
+	// no in-process queue). The semantic worker claims img_extract_text tasks
+	// and calls ProcessImageExtractTask via this backend's extractor/S3 client.
 	imageExtractEnabled bool
 	imageExtractor      ImageTextExtractor
-	imageExtractQueue   chan ImageExtractTaskSpec
-	imageExtractWG      sync.WaitGroup
-	imageExtractCancel  context.CancelFunc
 	imageExtractTimeout time.Duration
 	imageExtractMaxSize int64
 	maxExtractTextBytes int
@@ -858,15 +857,23 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			}
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
 			semanticTaskEnqueued = created
 			return err
+		}
+		// App-embedding mode: image/audio extract tasks are durable and independent
+		// of EMBED_TEXT, so register them in the same transaction. The embed task
+		// (if any) is enqueued separately below.
+		extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+		if extractErr != nil {
+			return extractErr
 		}
 		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
 			created, err := b.enqueueEmbedTaskTx(tx, fileID, 1)
-			semanticTaskEnqueued = created
+			semanticTaskEnqueued = created || extractCreated
 			return err
 		}
+		semanticTaskEnqueued = extractCreated
 		return nil
 	}); err != nil {
 		if timingEnabled {
@@ -881,9 +888,6 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		tenantTxDuration = time.Since(txStart)
 	}
 	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
-	// Temporary compatibility: app embedding still relies on the legacy
-	// backend-owned image queue until its image task flow also moves to
-	// semantic_tasks.
 	centralQuotaStart := time.Time{}
 	if timingEnabled {
 		centralQuotaStart = time.Now()
@@ -891,17 +895,6 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
 	if timingEnabled {
 		centralQuotaDuration = time.Since(centralQuotaStart)
-	}
-	if b.UsesDatabaseAutoEmbedding() {
-		return int64(len(data)), nil
-	}
-	imageEnqueueStart := time.Time{}
-	if timingEnabled {
-		imageEnqueueStart = time.Now()
-	}
-	b.enqueueImageExtract(fileID, path, contentType, 1)
-	if timingEnabled {
-		imageEnqueueDuration = time.Since(imageEnqueueStart)
 	}
 	return int64(len(data)), nil
 }
@@ -1094,15 +1087,23 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 			}
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType)
+			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType)
 			semanticTaskEnqueued = created
 			return err
+		}
+		// App-embedding mode: image/audio extract tasks are durable and independent
+		// of EMBED_TEXT, so register them in the same transaction. The embed task
+		// (if any) is enqueued separately below.
+		extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType)
+		if extractErr != nil {
+			return extractErr
 		}
 		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText, description) {
 			created, err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRevision)
-			semanticTaskEnqueued = created
+			semanticTaskEnqueued = created || extractCreated
 			return err
 		}
+		semanticTaskEnqueued = extractCreated
 		return nil
 	})
 	if timingEnabled {
@@ -1132,20 +1133,6 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
 	if timingEnabled {
 		oldBlobCleanupDuration = time.Since(oldBlobCleanupStart)
-	}
-	// Temporary compatibility: app embedding still relies on the legacy
-	// backend-owned image queue until its image task flow also moves to
-	// semantic_tasks.
-	if b.UsesDatabaseAutoEmbedding() {
-		return int64(len(data)), newRevision, nil
-	}
-	imageEnqueueStart := time.Time{}
-	if timingEnabled {
-		imageEnqueueStart = time.Now()
-	}
-	b.enqueueImageExtract(nf.File.FileID, nf.Node.Path, contentType, newRevision)
-	if timingEnabled {
-		imageEnqueueDuration = time.Since(imageEnqueueStart)
 	}
 	return int64(len(data)), newRevision, nil
 }

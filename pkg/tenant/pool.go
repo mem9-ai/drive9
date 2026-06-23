@@ -55,6 +55,14 @@ type PoolConfig struct {
 
 	// LeaderChecker, when set, gates per-tenant FileGCWorker to run only on
 	// the leader pod. When nil, FileGCWorker starts unconditionally (single-pod).
+	//
+	// FileGC reacts to leadership transitions and races safely with concurrent
+	// backend creation: the server calls StartAllFileGC on leadership gain and
+	// StopAllFileGC on loss. These set a pool-owned fileGCEnabled flag under p.mu,
+	// and Get/Acquire start FileGC on a newly inserted backend according to that
+	// flag (read under p.mu), so a backend created concurrently with a transition
+	// resolves to the post-transition state instead of a moment-in-time
+	// IsLeader() snapshot.
 	LeaderChecker LeaderChecker
 }
 
@@ -64,10 +72,46 @@ type LeaderChecker interface {
 	IsLeader() bool
 }
 
-// shouldStartFileGC reports whether per-tenant FileGCWorker should start on
-// this pod. When no leader checker is configured, FileGC starts unconditionally.
-func (p *Pool) shouldStartFileGC() bool {
-	return p.cfg.LeaderChecker == nil || p.cfg.LeaderChecker.IsLeader()
+// StartAllFileGC starts the per-tenant FileGCWorker on every cached backend
+// and marks FileGC as enabled so backends created afterwards also start FileGC.
+// Called by the server's onLead callback. All state changes happen under p.mu,
+// so a backend being created concurrently will observe a consistent
+// fileGCEnabled value when it is inserted (see Get/Acquire).
+func (p *Pool) StartAllFileGC() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.fileGCEnabled = true
+	backends := make([]*backend.Dat9Backend, 0, len(p.items))
+	for _, e := range p.items {
+		backends = append(backends, e.backend)
+	}
+	p.mu.Unlock()
+	for _, b := range backends {
+		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+	}
+}
+
+// StopAllFileGC stops the per-tenant FileGCWorker on every cached backend and
+// marks FileGC as disabled so backends created afterwards do not start FileGC.
+// Called by the server's onLose callback. All state changes happen under p.mu,
+// so a backend being created concurrently will observe a consistent
+// fileGCEnabled value when it is inserted (see Get/Acquire).
+func (p *Pool) StopAllFileGC() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.fileGCEnabled = false
+	backends := make([]*backend.Dat9Backend, 0, len(p.items))
+	for _, e := range p.items {
+		backends = append(backends, e.backend)
+	}
+	p.mu.Unlock()
+	for _, b := range backends {
+		b.StopFileGCWorker()
+	}
 }
 
 type Pool struct {
@@ -80,6 +124,14 @@ type Pool struct {
 	maxSize                   int
 	tidbSchemaValidationOpens atomic.Uint64
 	semanticTaskNotifier      atomic.Pointer[func(tenantID string)]
+	// fileGCEnabled tracks whether per-tenant FileGCWorker should be running on
+	// this pod. It is set under p.mu by StartAllFileGC (leader gain) /
+	// StopAllFileGC (leader loss), and read under p.mu when a newly created
+	// backend is inserted, so backend creation racing with a leadership
+	// transition resolves correctly instead of using a moment-in-time
+	// IsLeader() check taken outside the pool lock. When no LeaderChecker is
+	// configured (single-pod) it is always true.
+	fileGCEnabled bool
 }
 
 type tenantAutoEmbeddingProfile struct {
@@ -114,7 +166,15 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 	if max <= 0 {
 		max = 128
 	}
-	return &Pool{cfg: cfg, enc: enc, items: map[string]*entry{}, order: list.New(), maxSize: max}
+	return &Pool{
+		cfg:           cfg,
+		enc:           enc,
+		items:         map[string]*entry{},
+		order:         list.New(),
+		maxSize:       max,
+		// No LeaderChecker means single-pod mode: FileGC runs unconditionally.
+		fileGCEnabled: cfg.LeaderChecker == nil,
+	}
 }
 
 // SetMetaStore sets the central server DB store for quota operations.
@@ -211,7 +271,14 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 			}
 		}
 	}
+	// Read the pool-owned FileGC leader state under p.mu so a backend created
+	// concurrently with a leadership transition resolves to the post-transition
+	// state rather than a moment-in-time IsLeader() check taken outside the lock.
+	startFileGC := p.fileGCEnabled
 	p.mu.Unlock()
+	if startFileGC {
+		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+	}
 	for _, retired := range toClose {
 		closeEntry(retired)
 	}
@@ -297,7 +364,14 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			}
 		}
 	}
+	// Read the pool-owned FileGC leader state under p.mu so a backend created
+	// concurrently with a leadership transition resolves to the post-transition
+	// state rather than a moment-in-time IsLeader() check taken outside the lock.
+	startFileGC := p.fileGCEnabled
 	p.mu.Unlock()
+	if startFileGC {
+		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+	}
 	for _, retired := range toClose {
 		closeEntry(retired)
 	}
@@ -700,9 +774,6 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(b, t.ID)
 		p.wireSemanticTaskNotifier(b, t.ID)
-		if p.shouldStartFileGC() {
-			b.StartFileGCWorker(backend.FileGCWorkerOptions{})
-		}
 		return b, store, nil
 	}
 	if p.cfg.S3Dir != "" {
@@ -743,9 +814,6 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(b, t.ID)
 		p.wireSemanticTaskNotifier(b, t.ID)
-		if p.shouldStartFileGC() {
-			b.StartFileGCWorker(backend.FileGCWorkerOptions{})
-		}
 		return b, store, nil
 	}
 	backendCreateStart := time.Now()
@@ -768,9 +836,6 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	p.wireQuotaStore(b, t.ID)
 	p.wireSemanticTaskNotifier(b, t.ID)
-	if p.shouldStartFileGC() {
-		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
-	}
 	return b, store, nil
 }
 

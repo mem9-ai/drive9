@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -18,16 +20,48 @@ import (
 type fakeBranchProvisioner struct {
 	cluster      *tenant.ClusterInfo
 	provisionErr error
+	initErr      error
 	deleteErr    error
+	createErr    error
+	provider     string
 
 	mu                 sync.Mutex
 	deleted            []string
 	createBranchInputs []*tenant.ClusterInfo
+	credentialReqs     []tenant.CredentialProvisionRequest
+	systemUsername     string
+	systemPassword     string
+	systemUserErr      error
+	systemUserCalls    int
 }
 
-func (f *fakeBranchProvisioner) ProviderType() string { return tenant.ProviderTiDBCloudStarter }
+func (f *fakeBranchProvisioner) ProviderType() string {
+	if f.provider != "" {
+		return f.provider
+	}
+	return tenant.ProviderTiDBCloudStarter
+}
 
-func (f *fakeBranchProvisioner) InitSchema(context.Context, string) error { return nil }
+func (f *fakeBranchProvisioner) InitSchema(context.Context, string) error { return f.initErr }
+
+func (f *fakeBranchProvisioner) EnsureSystemUser(context.Context, string, string) (string, string, error) {
+	f.mu.Lock()
+	f.systemUserCalls++
+	username := f.systemUsername
+	password := f.systemPassword
+	err := f.systemUserErr
+	f.mu.Unlock()
+	if err != nil {
+		return "", "", err
+	}
+	if username == "" {
+		username = "u1.tdc_fs_sys"
+	}
+	if password == "" {
+		password = "system-pass"
+	}
+	return username, password, nil
+}
 
 func (f *fakeBranchProvisioner) Provision(context.Context, string) (*tenant.ClusterInfo, error) {
 	return nil, fmt.Errorf("not implemented")
@@ -35,6 +69,14 @@ func (f *fakeBranchProvisioner) Provision(context.Context, string) (*tenant.Clus
 
 func (f *fakeBranchProvisioner) ProvisionBranch(ctx context.Context, forkTenantID string, _ *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
 	return f.CreateBranch(ctx, forkTenantID, nil)
+}
+
+func (f *fakeBranchProvisioner) ProvisionBranchWithCredentials(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	out, err := f.CreateBranchWithCredentials(ctx, forkTenantID, source, req)
+	if err != nil {
+		return out, err
+	}
+	return f.WaitForBranchActiveWithCredentials(ctx, out, req)
 }
 
 func (f *fakeBranchProvisioner) CreateBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
@@ -56,10 +98,17 @@ func (f *fakeBranchProvisioner) CreateBranch(ctx context.Context, forkTenantID s
 	}
 	out := *f.cluster
 	out.TenantID = forkTenantID
-	out.Host = ""
-	out.Port = 0
-	out.Username = ""
+	if f.createErr != nil {
+		return &out, f.createErr
+	}
 	return &out, nil
+}
+
+func (f *fakeBranchProvisioner) CreateBranchWithCredentials(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	f.mu.Lock()
+	f.credentialReqs = append(f.credentialReqs, req)
+	f.mu.Unlock()
+	return f.CreateBranch(ctx, forkTenantID, source)
 }
 
 func (f *fakeBranchProvisioner) WaitForBranchActive(ctx context.Context, branch *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
@@ -83,11 +132,25 @@ func (f *fakeBranchProvisioner) WaitForBranchActive(ctx context.Context, branch 
 	return &out, nil
 }
 
+func (f *fakeBranchProvisioner) WaitForBranchActiveWithCredentials(ctx context.Context, branch *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	f.mu.Lock()
+	f.credentialReqs = append(f.credentialReqs, req)
+	f.mu.Unlock()
+	return f.WaitForBranchActive(ctx, branch)
+}
+
 func (f *fakeBranchProvisioner) DeleteBranch(_ context.Context, clusterID, branchID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deleted = append(f.deleted, clusterID+"/"+branchID)
 	return f.deleteErr
+}
+
+func (f *fakeBranchProvisioner) DeleteBranchWithCredentials(ctx context.Context, clusterID, branchID string, req tenant.CredentialProvisionRequest) error {
+	f.mu.Lock()
+	f.credentialReqs = append(f.credentialReqs, req)
+	f.mu.Unlock()
+	return f.DeleteBranch(ctx, clusterID, branchID)
 }
 
 func (f *fakeBranchProvisioner) deletedBranches() []string {
@@ -104,6 +167,18 @@ func (f *fakeBranchProvisioner) createBranchInput(i int) *tenant.ClusterInfo {
 	}
 	out := *f.createBranchInputs[i]
 	return &out
+}
+
+func (f *fakeBranchProvisioner) credentialRequests() []tenant.CredentialProvisionRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]tenant.CredentialProvisionRequest(nil), f.credentialReqs...)
+}
+
+func (f *fakeBranchProvisioner) systemUserCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.systemUserCalls
 }
 
 type nonBranchOnlyProvisioner struct{}
@@ -171,10 +246,20 @@ func (rt *forkCleanupTestRuntime) insertForkTenant(t *testing.T, id string, stat
 
 func (rt *forkCleanupTestRuntime) insertLiveTenant(t *testing.T, id string) {
 	t.Helper()
-	rt.insertTenant(t, id, meta.TenantActive, meta.TenantKindLive, "", "ns-parent", "source-branch")
+	rt.insertLiveTenantWithProvider(t, id, tenant.ProviderTiDBCloudStarter)
+}
+
+func (rt *forkCleanupTestRuntime) insertLiveTenantWithProvider(t *testing.T, id, provider string) {
+	t.Helper()
+	rt.insertTenantWithProvider(t, id, meta.TenantActive, meta.TenantKindLive, "", "ns-parent", "source-branch", provider)
 }
 
 func (rt *forkCleanupTestRuntime) insertTenant(t *testing.T, id string, status meta.TenantStatus, kind meta.TenantKind, parentID, namespaceID, branchID string) {
+	t.Helper()
+	rt.insertTenantWithProvider(t, id, status, kind, parentID, namespaceID, branchID, tenant.ProviderTiDBCloudStarter)
+}
+
+func (rt *forkCleanupTestRuntime) insertTenantWithProvider(t *testing.T, id string, status meta.TenantStatus, kind meta.TenantKind, parentID, namespaceID, branchID, provider string) {
 	t.Helper()
 	ctx := context.Background()
 	passCipher, err := rt.pool.Encrypt(ctx, []byte(rt.dbPass))
@@ -197,7 +282,7 @@ func (rt *forkCleanupTestRuntime) insertTenant(t *testing.T, id string, status m
 		DBPasswordCipher:   passCipher,
 		DBName:             rt.dbName,
 		DBTLS:              false,
-		Provider:           tenant.ProviderTiDBCloudStarter,
+		Provider:           provider,
 		ClusterID:          "cluster-a",
 		BranchID:           branchID,
 		SchemaVersion:      1,
@@ -220,6 +305,29 @@ func waitForCondition(t *testing.T, fn func() bool) {
 	t.Fatal("condition did not become true")
 }
 
+func TestDecodeForkRequestIgnoresUnknownFieldsAndRejectsTrailingData(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		reject  bool
+		wantMsg string
+	}{
+		{name: "unknown field", body: `{"name":"fork","publicKey":"typo"}`, reject: false},
+		{name: "trailing data", body: `{"name":"fork"} {"name":"other"}`, reject: true, wantMsg: "trailing data"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/fork", strings.NewReader(tc.body))
+			_, err := decodeForkRequest(httptest.NewRecorder(), req)
+			if tc.reject && (err == nil || !strings.Contains(err.Error(), tc.wantMsg)) {
+				t.Fatalf("decodeForkRequest error = %v, want %q", err, tc.wantMsg)
+			}
+			if !tc.reject && err != nil {
+				t.Fatalf("decodeForkRequest error = %v, want nil", err)
+			}
+		})
+	}
+}
+
 func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *testing.T) {
 	origWindow, origInitialBackoff, origMaxBackoff := forkProvisionRetryWindow, forkProvisionInitialBackoff, forkProvisionMaxBackoff
 	forkProvisionRetryWindow = 500 * time.Millisecond
@@ -237,7 +345,7 @@ func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *test
 	rt.prov.provisionErr = errors.New("starter branch not active before timeout")
 	rt.prov.deleteErr = errors.New("delete branch failed")
 
-	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork")
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork", nil)
 	if err != nil {
 		t.Fatalf("createForkTenant: %v", err)
 	}
@@ -276,7 +384,7 @@ func TestCreateForkTenantPersistsGeneratedBranchPassword(t *testing.T) {
 	rt.prov.cluster = &tenant.ClusterInfo{ClusterID: "cluster-a", BranchID: "branch-created"}
 	rt.prov.provisionErr = context.Canceled
 
-	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork")
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork", nil)
 	if err != nil {
 		t.Fatalf("createForkTenant: %v", err)
 	}
@@ -306,6 +414,122 @@ func TestCreateForkTenantPersistsGeneratedBranchPassword(t *testing.T) {
 	}
 	if createInput.Password != string(gotPassword) {
 		t.Fatalf("CreateBranch password = %q, want persisted fork password", createInput.Password)
+	}
+}
+
+func TestCreateForkTenantNativeUsesCredentialsAndDeletesBranchOnFailure(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Host:      rt.dbHost,
+		Port:      rt.dbPort,
+		Username:  rt.dbUser,
+		DBName:    rt.dbName,
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+	rt.prov.provisionErr = context.Canceled
+
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err != nil {
+		t.Fatalf("createForkTenant error = %v, want nil (provision is async)", err)
+	}
+	if resp.Status != string(meta.TenantProvisioning) {
+		t.Fatalf("status = %q, want %q", resp.Status, meta.TenantProvisioning)
+	}
+	if resp.APIKey == "" {
+		t.Fatal("api_key is empty")
+	}
+
+	createInput := rt.prov.createBranchInput(0)
+	if createInput == nil {
+		t.Fatal("CreateBranch was not called with source cluster info")
+	}
+	if createInput.Provider != tenant.ProviderTiDBCloudNative {
+		t.Fatalf("CreateBranch source provider = %q, want %q", createInput.Provider, tenant.ProviderTiDBCloudNative)
+	}
+	credentialReqs := rt.prov.credentialRequests()
+	if len(credentialReqs) == 0 || credentialReqs[0].PublicKey != "public-1" || credentialReqs[0].PrivateKey != "private-1" {
+		t.Fatalf("credential requests = %+v", credentialReqs)
+	}
+}
+
+func TestCreateForkTenantNativeDeletesBranchOnSchemaInitFailure(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Host:      rt.dbHost,
+		Port:      rt.dbPort,
+		Username:  rt.dbUser,
+		DBName:    rt.dbName,
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+	rt.prov.initErr = errors.New("schema init failed")
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err != nil {
+		t.Fatalf("createForkTenant error = %v, want nil (provision is async)", err)
+	}
+	if resp.Status != string(meta.TenantProvisioning) {
+		t.Fatalf("status = %q, want %q", resp.Status, meta.TenantProvisioning)
+	}
+	if resp.APIKey == "" {
+		t.Fatal("api_key is empty")
+	}
+
+	if err := rt.server.provisionForkTenantOnceWithCredentials(context.Background(), resp.TenantID, &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}); err == nil || !strings.Contains(err.Error(), "schema init failed") {
+		t.Fatalf("provision error = %v, want schema init failure", err)
+	}
+}
+
+func TestProvisionForkTenantNativeFinalizesSystemUserCredential(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.prov.systemUsername = "u1.tdc_fs_sys"
+	rt.prov.systemPassword = "system-pass"
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.insertTenantWithProvider(t, "fork-provisioning", meta.TenantProvisioning, meta.TenantKindFork, "source", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
+
+	if err := rt.server.provisionForkTenantOnceWithCredentials(context.Background(), "fork-provisioning", &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}); err != nil {
+		t.Fatalf("provisionForkTenantOnceWithCredentials: %v", err)
+	}
+
+	got, err := rt.meta.GetTenant(context.Background(), "fork-provisioning")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantActive {
+		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantActive)
+	}
+	if got.DBUser != "u1.tdc_fs_sys" {
+		t.Fatalf("tenant DB user = %q, want system user", got.DBUser)
+	}
+	plain, err := rt.pool.Decrypt(context.Background(), got.DBPasswordCipher)
+	if err != nil {
+		t.Fatalf("decrypt system password: %v", err)
+	}
+	if string(plain) != "system-pass" {
+		t.Fatalf("tenant DB password = %q, want system password", plain)
+	}
+	if calls := rt.prov.systemUserCallCount(); calls != 1 {
+		t.Fatalf("EnsureSystemUser calls = %d, want 1", calls)
 	}
 }
 
@@ -391,6 +615,75 @@ func TestCleanupDeletingForkEnqueuesFileGCTaskRefsBeforeSanitize(t *testing.T) {
 	}
 }
 
+func TestCleanupDeletingNativeForkUsesCredentialsAfterEnqueueRefs(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertTenantWithProvider(t, "fork-deleting", meta.TenantDeleting, meta.TenantKindFork, "parent", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
+
+	if err := rt.server.cleanupForkTenantOnce(context.Background(), "fork-deleting", &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}); err != nil {
+		t.Fatalf("cleanupForkTenantOnce: %v", err)
+	}
+
+	got, err := rt.meta.GetTenant(context.Background(), "fork-deleting")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantDeleted {
+		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleted)
+	}
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-a" {
+		t.Fatalf("deleted branches = %#v", deleted)
+	}
+	credentialReqs := rt.prov.credentialRequests()
+	if len(credentialReqs) == 0 {
+		t.Fatal("DeleteBranchWithCredentials was not called")
+	}
+	last := credentialReqs[len(credentialReqs)-1]
+	if last.PublicKey != "public-1" || last.PrivateKey != "private-1" {
+		t.Fatalf("last credential request = %+v", last)
+	}
+}
+
+func TestHandleForkDeleteNativeFailedCleansBranchBeforeDeletingStatus(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertTenantWithProvider(t, "fork-failed", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
+	if _, err := rt.meta.DB().ExecContext(context.Background(), `UPDATE tenants SET db_host = '', db_port = 0, db_user = '' WHERE id = ?`, "fork-failed"); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/fork", strings.NewReader(`{"public_key":"public-1","private_key":"private-1"}`))
+	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "fork-failed"}))
+	rr := httptest.NewRecorder()
+
+	rt.server.handleForkDelete(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status code = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := rt.meta.GetTenant(context.Background(), "fork-failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantDeleted {
+		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleted)
+	}
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-a" {
+		t.Fatalf("deleted branches = %#v", deleted)
+	}
+	credentialReqs := rt.prov.credentialRequests()
+	if len(credentialReqs) == 0 {
+		t.Fatal("DeleteBranchWithCredentials was not called")
+	}
+	last := credentialReqs[len(credentialReqs)-1]
+	if last.PublicKey != "public-1" || last.PrivateKey != "private-1" {
+		t.Fatalf("last credential request = %+v", last)
+	}
+}
+
 func TestCleanupFailedForkWithoutBranchIDMarksDeleted(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.insertForkTenant(t, "fork-missing-branch", meta.TenantFailed, "")
@@ -398,6 +691,27 @@ func TestCleanupFailedForkWithoutBranchIDMarksDeleted(t *testing.T) {
 	rt.server.cleanupForkTenant(context.Background(), "fork-missing-branch")
 
 	got, err := rt.meta.GetTenant(context.Background(), "fork-missing-branch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantDeleted {
+		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleted)
+	}
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 0 {
+		t.Fatalf("deleted branches = %#v, want none", deleted)
+	}
+}
+
+func TestCleanupNativeFailedForkWithoutBranchIDDoesNotRequireCredentials(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertTenantWithProvider(t, "fork-native-missing-branch", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "", tenant.ProviderTiDBCloudNative)
+
+	if err := rt.server.cleanupForkTenantOnce(context.Background(), "fork-native-missing-branch", nil); err != nil {
+		t.Fatalf("cleanupForkTenantOnce: %v", err)
+	}
+
+	got, err := rt.meta.GetTenant(context.Background(), "fork-native-missing-branch")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,4 +750,261 @@ func isTableNotFoundForCleanup(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "error 1146") ||
 		strings.Contains(msg, "table") && strings.Contains(msg, "doesn't exist")
+}
+
+func TestHandleForkDeleteNativeFailedBranchIDEmptyNoCredentialsDeletesLocally(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertTenantWithProvider(t, "fork-native-failed-empty-branch", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "", tenant.ProviderTiDBCloudNative)
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/fork", strings.NewReader("{}"))
+	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "fork-native-failed-empty-branch"}))
+	rr := httptest.NewRecorder()
+
+	rt.server.handleForkDelete(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status code = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := rt.meta.GetTenant(context.Background(), "fork-native-failed-empty-branch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantDeleted {
+		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleted)
+	}
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 0 {
+		t.Fatalf("deleted branches = %#v, want none", deleted)
+	}
+}
+
+type defaultCredentialsProvisioner struct {
+	*fakeBranchProvisioner
+	creds tenant.CredentialProvisionRequest
+}
+
+func (d *defaultCredentialsProvisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, bool) {
+	return d.creds, true
+}
+
+func TestHandleForkDeleteNativeUsesDefaultCredentialsWhenRequestLacksKey(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertTenantWithProvider(t, "fork-native-def", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
+	if _, err := rt.meta.DB().ExecContext(context.Background(),
+		`UPDATE tenants SET db_host = '', db_port = 0, db_user = '' WHERE id = ?`, "fork-native-def"); err != nil {
+		t.Fatal(err)
+	}
+
+	defaultCreds := tenant.CredentialProvisionRequest{PublicKey: "default-pk", PrivateKey: "default-sk"}
+	rt.server.provisioner = &defaultCredentialsProvisioner{fakeBranchProvisioner: rt.prov, creds: defaultCreds}
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/fork", strings.NewReader(`{}`))
+	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "fork-native-def"}))
+	rr := httptest.NewRecorder()
+	rt.server.handleForkDelete(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	got, err := rt.meta.GetTenant(context.Background(), "fork-native-def")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantDeleted {
+		t.Fatalf("status = %s, want %s", got.Status, meta.TenantDeleted)
+	}
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-a" {
+		t.Fatalf("deleted branches = %#v", deleted)
+	}
+	creds := rt.prov.credentialRequests()
+	if len(creds) == 0 {
+		t.Fatal("DeleteBranchWithCredentials was not called")
+	}
+	last := creds[len(creds)-1]
+	if last.PublicKey != "default-pk" || last.PrivateKey != "default-sk" {
+		t.Fatalf("credential request = %+v", last)
+	}
+}
+
+func TestHandleForkDeleteNativeRejectsWhenNoCredentialsAvailable(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertTenantWithProvider(t, "fork-native-noc", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
+	if _, err := rt.meta.DB().ExecContext(context.Background(),
+		`UPDATE tenants SET db_host = '', db_port = 0, db_user = '' WHERE id = ?`, "fork-native-noc"); err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/fork", strings.NewReader(`{}`))
+	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "fork-native-noc"}))
+	rr := httptest.NewRecorder()
+	rt.server.handleForkDelete(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if strings.Contains(body, "private") || strings.Contains(body, "default") {
+		t.Fatalf("response body = %s", body)
+	}
+	if deleted := rt.prov.deletedBranches(); len(deleted) != 0 {
+		t.Fatalf("deleted branches = %#v", deleted)
+	}
+}
+
+func TestCreateForkTenantNativeNoEndpointNoDefaultCredentialFailsWithAPIKey(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err == nil {
+		t.Fatal("createForkTenant error = nil, want forkProvisionFailedError")
+	}
+	var provisionErr *forkProvisionFailedError
+	if !errors.As(err, &provisionErr) {
+		t.Fatalf("createForkTenant error type = %T, want forkProvisionFailedError", err)
+	}
+	if provisionErr.APIKey == "" {
+		t.Fatal("forkProvisionFailedError.APIKey is empty")
+	}
+	if provisionErr.TenantID == "" {
+		t.Fatal("forkProvisionFailedError.TenantID is empty")
+	}
+	if resp != nil {
+		t.Fatalf("createForkTenant response = %+v, want nil on error", resp)
+	}
+}
+
+func TestHandleForkCreateNativeNoEndpointNoDefaultCredentialReturnsFailedWithAPIKey(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+	rt.prov.deleteErr = fmt.Errorf("delete branch failed")
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/fork", strings.NewReader(`{"name":"test-fork","public_key":"public-1","private_key":"private-1"}`))
+	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "source"}))
+	rr := httptest.NewRecorder()
+	rt.server.handleForkCreate(rr, req)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	body := rr.Body.String()
+	if !strings.Contains(body, `"status":"failed"`) {
+		t.Fatalf("body missing status failed: %s", body)
+	}
+	if !strings.Contains(body, `"api_key"`) {
+		t.Fatalf("body missing api_key: %s", body)
+	}
+	if !strings.Contains(body, `"tenant_id"`) {
+		t.Fatalf("body missing tenant_id: %s", body)
+	}
+	if strings.Contains(body, `"status":"provisioning"`) {
+		t.Fatalf("body should not contain provisioning status: %s", body)
+	}
+}
+
+func TestCreateForkTenantNativeBranchCreateErrorReturnsAPIKey(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+	rt.prov.createErr = fmt.Errorf("branch connection wait failed")
+	rt.prov.deleteErr = fmt.Errorf("delete branch failed")
+
+	_, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err == nil {
+		t.Fatal("createForkTenant error = nil, want forkProvisionFailedError")
+	}
+	var provisionErr *forkProvisionFailedError
+	if !errors.As(err, &provisionErr) {
+		t.Fatalf("error type = %T, want forkProvisionFailedError", err)
+	}
+	if provisionErr.APIKey == "" {
+		t.Fatal("forkProvisionFailedError.APIKey is empty")
+	}
+	if provisionErr.TenantID == "" {
+		t.Fatal("forkProvisionFailedError.TenantID is empty")
+	}
+}
+
+func TestProvisionForkTenantWithCredentialsUsesRequestKeyForWait(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-a",
+		Host:      rt.dbHost,
+		Port:      rt.dbPort,
+		Username:  rt.dbUser,
+		DBName:    rt.dbName,
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+	rt.insertTenantWithProvider(t, "fork-nc", meta.TenantProvisioning, meta.TenantKindFork, "source", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
+	if _, err := rt.meta.DB().ExecContext(context.Background(),
+		`UPDATE tenants SET db_host = '', db_port = 0, db_user = '' WHERE id = ?`, "fork-nc"); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = rt.server.provisionForkTenantOnceWithCredentials(context.Background(), "fork-nc", &tenant.CredentialProvisionRequest{
+		PublicKey:  "creds-pk",
+		PrivateKey: "creds-sk",
+	})
+	reqs := rt.prov.credentialRequests()
+	found := false
+	for _, r := range reqs {
+		if r.PublicKey == "creds-pk" && r.PrivateKey == "creds-sk" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("credential requests = %+v, want creds-pk/creds-sk", reqs)
+	}
+}
+
+func TestProvisionForkTenantAsyncWithProvisionCallsProvisionClosure(t *testing.T) {
+	var called bool
+	rt := newForkCleanupTestRuntime(t)
+
+	wdCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	done := make(chan struct{})
+	rt.server.provisionForkTenantAsyncWithProvision(wdCtx, "test-fork", func() error {
+		called = true
+		close(done)
+		return context.Canceled
+	})
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("provision closure was not called")
+	}
+	if !called {
+		t.Fatal("provision closure was not invoked")
+	}
 }

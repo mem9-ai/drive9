@@ -10,8 +10,6 @@ func TestBackendRuntimeMetricsAggregateAcrossBackends(t *testing.T) {
 	b1 := newTestBackendWithOptions(t, Options{
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
-			Workers:   2,
-			QueueSize: 5,
 			Extractor: &staticImageExtractor{text: "one"},
 		},
 		AsyncAudioExtract: AsyncAudioExtractOptions{
@@ -25,8 +23,6 @@ func TestBackendRuntimeMetricsAggregateAcrossBackends(t *testing.T) {
 	b2 := newTestBackendWithOptions(t, Options{
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
-			Workers:   1,
-			QueueSize: 3,
 			Extractor: &staticImageExtractor{text: "two"},
 		},
 		AsyncAudioExtract: AsyncAudioExtractOptions{
@@ -42,10 +38,12 @@ func TestBackendRuntimeMetricsAggregateAcrossBackends(t *testing.T) {
 	if !strings.Contains(metricsText, "drive9_module_up{module=\"image_extract\"} 1") {
 		t.Fatalf("metrics missing aggregated image_extract availability: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\"} 8") {
+	// Image extract delivery is now durable (semantic_tasks), so queue capacity
+	// and workers are always 0 — the semantic worker handles processing.
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\"} 0") {
 		t.Fatalf("metrics missing aggregated image queue capacity: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"workers\"} 3") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"workers\"} 0") {
 		t.Fatalf("metrics missing aggregated image workers: %s", metricsText)
 	}
 	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\"} 4096") {
@@ -61,11 +59,11 @@ func TestBackendRuntimeMetricsAggregateAcrossBackends(t *testing.T) {
 	if !strings.Contains(metricsText, "drive9_module_up{module=\"image_extract\"} 1") {
 		t.Fatalf("metrics should keep image_extract available while one backend remains: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\"} 3") {
-		t.Fatalf("metrics should retain remaining image queue capacity: %s", metricsText)
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\"} 0") {
+		t.Fatalf("metrics should keep image queue capacity at 0 after one backend closes: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"workers\"} 1") {
-		t.Fatalf("metrics should retain remaining image workers: %s", metricsText)
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"workers\"} 0") {
+		t.Fatalf("metrics should keep image workers at 0 after one backend closes: %s", metricsText)
 	}
 	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\"} 2048") {
 		t.Fatalf("metrics should retain remaining audio max bytes: %s", metricsText)

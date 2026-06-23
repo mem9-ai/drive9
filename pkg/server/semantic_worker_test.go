@@ -249,6 +249,55 @@ func TestSemanticWorkerProcessesImgExtractTaskWithoutEmbedder(t *testing.T) {
 	}
 }
 
+// TestSemanticWorkerStartsForAppModeImageExtractWithoutEmbedder verifies that
+// the semantic worker starts and processes img_extract_text tasks in app-embedding
+// mode (not database auto-embedding) even when no embedder is configured. Image
+// extraction does not depend on EMBED_TEXT.
+func TestSemanticWorkerStartsForAppModeImageExtractWithoutEmbedder(t *testing.T) {
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		AppSemanticTasksEnabled: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled:   true,
+			Extractor: staticServerImageExtractor{text: "cat on sofa screenshot invoice"},
+		},
+	})
+	fileID := insertServerImageFileForExtractTest(t, b, "/img/app-no-embedder.png", "image/png", []byte("fake-png"))
+	payload, err := json.Marshal(semantic.ImgExtractTaskPayload{Path: "/img/app-no-embedder.png", ContentType: "image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(context.Background(), &semantic.Task{
+		TaskID:          "app-img-task-1",
+		TaskType:        semantic.TaskTypeImgExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     now,
+		PayloadJSON:     payload,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No embedder configured — the worker must still start for image extract.
+	s := NewWithConfig(Config{Backend: b, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+	if s.semanticWorker == nil {
+		t.Fatal("expected semantic worker to start for app-mode image tasks without embedder")
+	}
+
+	waitForContentTextOnServer(t, b, "/img/app-no-embedder.png", "cat on sofa", 3*time.Second)
+	waitForNamedTaskStatus(t, b, "app-img-task-1", string(semantic.TaskSucceeded), 3*time.Second)
+}
+
 func TestSemanticWorkerProcessesAudioExtractTaskWithoutEmbedder(t *testing.T) {
 	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
 		DatabaseAutoEmbedding: true,
@@ -1017,11 +1066,12 @@ func TestSemanticWorkerListTenantRefsImageOnlyIncludesAutoProviders(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(refs) != 1 {
-		t.Fatalf("tenant ref count=%d, want 1", len(refs))
-	}
-	if refs[0].id != autoTenantID {
-		t.Fatalf("tenant ref id=%q, want %q", refs[0].id, autoTenantID)
+	// Both the TiDB-auto tenant and the DB9 tenant are included: the pool
+	// configures async image extract, and extract task types are independent
+	// of EMBED_TEXT. taskTypesForTarget filters at the per-backend level, so
+	// only backends that actually support extract will claim tasks.
+	if len(refs) != 2 {
+		t.Fatalf("tenant ref count=%d, want 2 (auto + db9)", len(refs))
 	}
 }
 
@@ -1095,10 +1145,13 @@ func TestSemanticWorkerListTenantRefsRotatesAcrossActiveTenantPages(t *testing.T
 		}
 	}
 
-	assertRefs()
+	// All three tenants are scanned: db9 is included because the pool configures
+	// async image extract, and extract task types are independent of EMBED_TEXT.
+	// With TenantScanLimit=1, each scan page returns one tenant in created-at order.
+	assertRefs("tenant-db9")
 	assertRefs("tenant-auto-1")
 	assertRefs("tenant-auto-2")
-	assertRefs()
+	assertRefs("tenant-db9")
 	assertRefs("tenant-auto-1")
 
 	scan := m.tenantScanSnapshot()
