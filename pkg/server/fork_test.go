@@ -985,3 +985,26 @@ func TestProvisionForkTenantWithCredentialsUsesRequestKeyForWait(t *testing.T) {
 		t.Fatalf("credential requests = %+v, want creds-pk/creds-sk", reqs)
 	}
 }
+
+func TestProvisionForkTenantAsyncWithProvisionCallsProvisionClosure(t *testing.T) {
+	var called bool
+	rt := newForkCleanupTestRuntime(t)
+
+	wdCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	done := make(chan struct{})
+	rt.server.provisionForkTenantAsyncWithProvision(wdCtx, "test-fork", func() error {
+		called = true
+		close(done)
+		return context.Canceled
+	})
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("provision closure was not called")
+	}
+	if !called {
+		t.Fatal("provision closure was not invoked")
+	}
+}
