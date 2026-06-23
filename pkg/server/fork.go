@@ -690,8 +690,6 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 				Provider:         forkTenant.Provider,
 				ClusterID:        forkTenant.ClusterID,
 				BranchID:         forkTenant.BranchID,
-				ClaimURL:         forkTenant.ClaimURL,
-				ClaimExpiresAt:   forkTenant.ClaimExpiresAt,
 			}); err != nil {
 				return "", err
 			}
