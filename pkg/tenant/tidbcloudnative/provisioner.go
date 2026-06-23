@@ -963,6 +963,49 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privat
 	}
 }
 
+func (p *Provisioner) WaitForBranchUserWithCredentials(ctx context.Context, clusterID, branchID string, req tenant.CredentialProvisionRequest) (string, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return "", tenant.ErrCredentialsRequired
+	}
+	deadline := time.Now().Add(10 * time.Minute)
+	for {
+		endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s/branches/%s?view=BASIC", p.apiURL, url.PathEscape(clusterID), url.PathEscape(branchID))
+		resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return "", err
+		}
+		limit := int64(upstreamClusterBodyLimit)
+		if resp.StatusCode != http.StatusOK {
+			limit = upstreamErrorBodyLimit + 1
+		}
+		raw, readErr := readUpstreamBody(resp.Body, limit)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return "", readErr
+		}
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("%s", statusError("branch get", resp.StatusCode, sanitizeUpstreamBody(raw)))
+		}
+		info, err := parseBranchInfo(raw)
+		if err != nil {
+			return "", err
+		}
+		if info.UserPrefix != "" {
+			return info.UserPrefix + ".root", nil
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("tidbcloud native branch %s user prefix not available before timeout", branchID)
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(tidbCloudNativePollInterval):
+		}
+	}
+}
+
 func (p *Provisioner) doDigestAuthRequest(ctx context.Context, publicKey, privateKey, method, uri string, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, uri, bytes.NewReader(body))
 	if err != nil {

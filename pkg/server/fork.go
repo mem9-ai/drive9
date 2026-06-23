@@ -661,6 +661,34 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		if forkTenant.DBHost != "" && forkTenant.DBPort != 0 && forkTenant.DBUser != "" {
 			return tenantDSN(forkTenant.DBUser, string(plain), forkTenant.DBHost, forkTenant.DBPort, forkTenant.DBName, forkTenant.DBTLS), nil
 		}
+		if branchProv, ok := s.provisioner.(tenant.CredentialBranchProvisioner); ok {
+			username, err := branchProv.WaitForBranchUserWithCredentials(ctx, forkTenant.ClusterID, forkTenant.BranchID, *credentialReq)
+			if err != nil {
+				return "", err
+			}
+			host := forkTenant.DBHost
+			port := forkTenant.DBPort
+			if host == "" {
+				host = source.DBHost
+			}
+			if port == 0 {
+				port = source.DBPort
+			}
+			if err := s.meta.UpdateTenantConnection(ctx, forkTenant.ID, &meta.Tenant{
+				DBHost:           host,
+				DBPort:           port,
+				DBUser:           username,
+				DBPasswordCipher: forkTenant.DBPasswordCipher,
+				DBName:           forkTenant.DBName,
+				DBTLS:            true,
+				Provider:         forkTenant.Provider,
+				ClusterID:        forkTenant.ClusterID,
+				BranchID:         forkTenant.BranchID,
+			}); err != nil {
+				return "", err
+			}
+			return tenantDSN(username, string(plain), host, port, forkTenant.DBName, true), nil
+		}
 		cluster, err := s.waitForForkBranchActive(ctx, &tenant.ClusterInfo{
 			TenantID:  forkTenant.ID,
 			ClusterID: forkTenant.ClusterID,
