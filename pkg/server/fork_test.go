@@ -22,6 +22,7 @@ type fakeBranchProvisioner struct {
 	provisionErr error
 	initErr      error
 	deleteErr    error
+	createErr    error
 	provider     string
 
 	mu                 sync.Mutex
@@ -97,6 +98,9 @@ func (f *fakeBranchProvisioner) CreateBranch(ctx context.Context, forkTenantID s
 	}
 	out := *f.cluster
 	out.TenantID = forkTenantID
+	if f.createErr != nil {
+		return &out, f.createErr
+	}
 	return &out, nil
 }
 
@@ -912,5 +916,36 @@ func TestHandleForkCreateNativeNoEndpointNoDefaultCredentialReturnsFailedWithAPI
 	}
 	if strings.Contains(body, `"status":"provisioning"`) {
 		t.Fatalf("body should not contain provisioning status: %s", body)
+	}
+}
+
+func TestCreateForkTenantNativeBranchCreateErrorReturnsAPIKey(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+	rt.prov.createErr = fmt.Errorf("branch connection wait failed")
+	rt.prov.deleteErr = fmt.Errorf("delete branch failed")
+
+	_, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err == nil {
+		t.Fatal("createForkTenant error = nil, want forkProvisionFailedError")
+	}
+	var provisionErr *forkProvisionFailedError
+	if !errors.As(err, &provisionErr) {
+		t.Fatalf("error type = %T, want forkProvisionFailedError", err)
+	}
+	if provisionErr.APIKey == "" {
+		t.Fatal("forkProvisionFailedError.APIKey is empty")
+	}
+	if provisionErr.TenantID == "" {
+		t.Fatal("forkProvisionFailedError.TenantID is empty")
 	}
 }

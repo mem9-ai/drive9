@@ -694,3 +694,52 @@ func TestDeleteTenantFallsBackToForkDeleteForForkContext(t *testing.T) {
 		t.Fatalf("output = %q", out)
 	}
 }
+
+func TestDeleteTenantForkFallbackSendsTiDBCloudCredentials(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+	t.Setenv(EnvTiDBCloudPublicKey, "fallback-pk")
+	t.Setenv(EnvTiDBCloudPrivateKey, "fallback-sk")
+
+	tenantCalled := false
+	var forkBody string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/tenant":
+			tenantCalled = true
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "only live tenants can be deleted"})
+		case "/v1/fork":
+			if !tenantCalled {
+				t.Fatal("/v1/fork called before /v1/tenant rejection")
+			}
+			raw, _ := io.ReadAll(r.Body)
+			forkBody = string(raw)
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "deleting"})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	cfg := loadConfig()
+	if _, err := ctxAdd(cfg, "owner", &Context{Type: PrincipalOwner, APIKey: "owner-key", Server: ts.URL}); err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	resetCredentialCacheForTest()
+
+	_, err := captureStdoutE(t, func() error {
+		return DeleteTenant([]string{"-y"})
+	})
+	if err != nil {
+		t.Fatalf("DeleteTenant: %v", err)
+	}
+	if !strings.Contains(forkBody, `"public_key":"fallback-pk"`) ||
+		!strings.Contains(forkBody, `"private_key":"fallback-sk"`) {
+		t.Fatalf("fork delete body = %q, want TiDB Cloud credentials", forkBody)
+	}
+}
