@@ -422,9 +422,15 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 	}
 	forkRoot.ClusterID = cluster.ClusterID
 	forkRoot.BranchID = cluster.BranchID
+	dbHost := cluster.Host
+	dbPort := cluster.Port
+	if source.Provider == tenant.ProviderTiDBCloudNative {
+		dbHost = source.DBHost
+		dbPort = source.DBPort
+	}
 	if err := s.meta.UpdateTenantConnection(ctx, forkID, &meta.Tenant{
-		DBHost:           source.DBHost,
-		DBPort:           source.DBPort,
+		DBHost:           dbHost,
+		DBPort:           dbPort,
 		DBUser:           cluster.Username,
 		DBPasswordCipher: forkRoot.DBPasswordCipher,
 		DBName:           cluster.DBName,
@@ -684,6 +690,8 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 				Provider:         forkTenant.Provider,
 				ClusterID:        forkTenant.ClusterID,
 				BranchID:         forkTenant.BranchID,
+				ClaimURL:         forkTenant.ClaimURL,
+				ClaimExpiresAt:   forkTenant.ClaimExpiresAt,
 			}); err != nil {
 				return "", err
 			}

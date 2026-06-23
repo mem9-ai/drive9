@@ -139,6 +139,13 @@ func (f *fakeBranchProvisioner) WaitForBranchActiveWithCredentials(ctx context.C
 	return f.WaitForBranchActive(ctx, branch)
 }
 
+func (f *fakeBranchProvisioner) WaitForBranchUserWithCredentials(_ context.Context, clusterID, branchID string, req tenant.CredentialProvisionRequest) (string, error) {
+	f.mu.Lock()
+	f.credentialReqs = append(f.credentialReqs, req)
+	f.mu.Unlock()
+	return f.systemUsername, nil
+}
+
 func (f *fakeBranchProvisioner) DeleteBranch(_ context.Context, clusterID, branchID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
