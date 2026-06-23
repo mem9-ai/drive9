@@ -21,6 +21,16 @@ var (
 	ErrReservationAlreadyExists = errors.New("upload reservation already exists")
 )
 
+type storageQuotaCheckResult struct {
+	checked       bool
+	limitBytes    int64
+	storageBytes  int64
+	reservedBytes int64
+	pendingBytes  int64
+	deltaBytes    int64
+	projected     int64
+}
+
 // UseServerQuota reports whether this backend reads authoritative quota state
 // from the central server DB rather than the per-tenant DB.
 func (b *Dat9Backend) UseServerQuota() bool {
@@ -107,62 +117,63 @@ func (b *Dat9Backend) ensureUploadSizeAllowed(size int64) error {
 
 // --- Server-side storage quota (Rev 4 migration) ---
 
-// ensureStorageQuotaServer performs an optimistic storage quota check against
-// the server DB. Used for small writes (create, overwrite, patch) where the
-// server-reserve-first protocol would add unnecessary latency.
-// Falls back to the tenant-DB check when metaStore is not wired.
+// ensureStorageQuotaServer performs a soft optimistic storage quota check
+// against the server DB. Used for small writes (create, overwrite, patch) where
+// a server-reserve-first protocol or tenant-wide admission lock would add
+// latency to the single-tenant write hot path.
 //
-// Accepted race (Rev 4 / PR #251 review): this check is optimistic and can
-// undercount when concurrent small overwrites on the same file race between
-// read (GetQuotaUsage) and the paired mutation log entry that adjusts
-// storage_bytes. The window is bounded by the small-write path (not
-// multipart uploads, which use the server-reserve-first saga with a single
-// atomic reserve+insert transaction — see upload_reservation.go). Reviewers
-// @adversary / @adversary-1 accepted this tradeoff in thread #pr251:000001d1
-// rather than paying the latency of a server-side reserve for every small
-// write. Hard quota convergence is restored by MutationReplayWorker
-// and the backfill-quota CLI tool.
+// The check includes central confirmed/reserved usage plus tenant-local
+// quota_outbox pending deltas, but intentionally does not lock
+// quota_admission_locks. In multi-server deployments, concurrent small writes
+// may briefly over-admit before their outbox rows become visible to each other.
+// Successful writes still durably enqueue quota mutations in the tenant
+// transaction, and the outbox worker/backfill path restores counter
+// convergence. Multipart uploads keep the stricter reserve-first path in
+// upload_reservation.go.
 func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, tx *sql.Tx, deltaBytes int64) error {
-	if b.metaStore == nil || deltaBytes <= 0 {
-		return nil // fail-open or no-op
+	result, ok := b.checkStorageQuotaServerTx(ctx, tx, deltaBytes)
+	if !ok {
+		return nil
 	}
-	if err := b.lockQuotaAdmissionTx(ctx, tx); err != nil {
-		return err
+	if result.exceeded() {
+		metrics.RecordOperation("server_quota", "storage_check", "exceeded", 0)
+		return result.quotaExceededError()
 	}
-	return b.ensureStorageQuotaServerLocked(ctx, tx, deltaBytes)
+	metrics.RecordOperation("server_quota", "storage_check", "ok", 0)
+	return nil
 }
 
-func (b *Dat9Backend) ensureStorageQuotaServerLocked(ctx context.Context, tx *sql.Tx, deltaBytes int64) error {
+func (b *Dat9Backend) checkStorageQuotaServerTx(ctx context.Context, tx *sql.Tx, deltaBytes int64) (storageQuotaCheckResult, bool) {
+	result := storageQuotaCheckResult{deltaBytes: deltaBytes}
 	if b.metaStore == nil || deltaBytes <= 0 {
-		return nil
+		return result, false
 	}
 
 	cfg := b.cachedQuotaConfig(ctx)
 	if cfg == nil {
 		metrics.RecordOperation("server_quota", "storage_check", "fail_open", 0)
-		return nil // fail-open: config unavailable
+		return result, false // fail-open: config unavailable
 	}
 	if cfg.MaxStorageBytes <= 0 {
-		return nil // quota not configured
+		return result, false // quota not configured
 	}
 	usage := b.loadQuotaUsage(ctx)
 	if usage == nil {
 		metrics.RecordOperation("server_quota", "storage_check", "fail_open", 0)
-		return nil // fail-open: usage unavailable
+		return result, false // fail-open: usage unavailable
 	}
 	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
 	pendingStorageDelta, _, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
 	if !pendingOK {
 		metrics.RecordOperation("server_quota", "storage_check_pending_delta", "fail_open", 0)
 	}
-	projected := usage.StorageBytes + usage.ReservedBytes + pendingStorageDelta + deltaBytes
-	if projected > cfg.MaxStorageBytes {
-		metrics.RecordOperation("server_quota", "storage_check", "exceeded", 0)
-		return fmt.Errorf("%w: server limit=%d used=%d reserved=%d pending=%d delta=%d",
-			ErrStorageQuotaExceeded, cfg.MaxStorageBytes, usage.StorageBytes, usage.ReservedBytes, pendingStorageDelta, deltaBytes)
-	}
-	metrics.RecordOperation("server_quota", "storage_check", "ok", 0)
-	return nil
+	result.checked = true
+	result.limitBytes = cfg.MaxStorageBytes
+	result.storageBytes = usage.StorageBytes
+	result.reservedBytes = usage.ReservedBytes
+	result.pendingBytes = pendingStorageDelta
+	result.projected = usage.StorageBytes + usage.ReservedBytes + pendingStorageDelta + deltaBytes
+	return result, true
 }
 
 func (b *Dat9Backend) lockQuotaAdmissionTx(ctx context.Context, tx *sql.Tx) error {
@@ -241,14 +252,11 @@ func quotaMediaDelta(oldIsMedia, newIsMedia bool) int64 {
 }
 
 // mediaLLMQuotaExceededServerTx checks the server DB counter for media file
-// quota inside a transactional context. Falls back to tenant-DB when metaStore
-// is not wired.
+// quota inside a transactional context. Like storage quota for small writes,
+// this is a soft check and does not take the tenant-wide quota admission lock.
 func (b *Dat9Backend) mediaLLMQuotaExceededServerTx(ctx context.Context, tx *sql.Tx, currentMediaDelta int64) bool {
 	if b.metaStore == nil {
 		return b.mediaLLMQuotaExceededTx(tx) // fallback to tenant DB
-	}
-	if err := b.lockQuotaAdmissionTx(ctx, tx); err != nil {
-		return false
 	}
 	cfg := b.cachedQuotaConfig(ctx)
 	if cfg == nil {
@@ -282,6 +290,15 @@ func (b *Dat9Backend) pendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx
 		return 0, 0, false
 	}
 	return storageDelta, mediaDelta, true
+}
+
+func (r storageQuotaCheckResult) exceeded() bool {
+	return r.checked && r.projected > r.limitBytes
+}
+
+func (r storageQuotaCheckResult) quotaExceededError() error {
+	return fmt.Errorf("%w: server limit=%d used=%d reserved=%d pending=%d delta=%d",
+		ErrStorageQuotaExceeded, r.limitBytes, r.storageBytes, r.reservedBytes, r.pendingBytes, r.deltaBytes)
 }
 
 // --- Tenant-DB quota checks (legacy fallback) ---

@@ -1098,11 +1098,6 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		quotaOutboxEnqueued = false
 		var oldSizeBytes int64
 		var oldContentTypeForQuota string
-		if b.UseServerQuota() {
-			if err := b.lockQuotaAdmissionTx(ctx, tx); err != nil {
-				return err
-			}
-		}
 		currentMeta, err := b.store.GetFileStorageMetaForUpdateTx(tx, nf.File.FileID)
 		if err != nil {
 			return err
@@ -1114,7 +1109,7 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		}
 		if b.UseServerQuota() {
 			if deltaBytes := int64(len(finalData)) - currentMeta.SizeBytes; deltaBytes > 0 {
-				if err := b.ensureStorageQuotaServerLocked(ctx, tx, deltaBytes); err != nil {
+				if err := b.ensureStorageQuotaServer(ctx, tx, deltaBytes); err != nil {
 					return err
 				}
 			}

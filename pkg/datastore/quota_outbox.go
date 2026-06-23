@@ -61,9 +61,9 @@ func (s *Store) EnqueueQuotaOutboxTx(db execer, entry *QuotaOutboxEntry) (int64,
 	return s.enqueueQuotaOutbox(db, entry)
 }
 
-// LockQuotaAdmissionTx serializes quota admission checks and quota_outbox
-// enqueue in a tenant-local transaction. This protects multi-server deployments
-// from concurrent writers reading the same pending-delta snapshot.
+// LockQuotaAdmissionTx serializes strict quota admission with quota_outbox
+// apply/ack in a tenant-local transaction. Small writes intentionally do not
+// take this lock; they use soft quota admission and durable outbox convergence.
 func (s *Store) LockQuotaAdmissionTx(db execer) error {
 	now := time.Now().UTC()
 	if _, err := db.Exec(`INSERT INTO quota_admission_locks (name, updated_at)
