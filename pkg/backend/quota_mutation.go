@@ -58,7 +58,8 @@ func isQuotaMediaContentType(contentType string) bool {
 
 // enqueueMutationEntry performs a non-blocking send of a mutation entry to the
 // async queue. If the queue is full the entry is dropped and a metric is
-// emitted — the MutationReplayWorker + backfill-quota CLI handle convergence.
+// emitted. Dropped entries are never logged, so MutationReplayWorker cannot
+// recover them — only a manual backfill-quota CLI run reconciles counters.
 // If the queue is not wired (tests without StartMutationWorker), the mutation
 // is executed inline (log + apply).
 func (b *Dat9Backend) enqueueMutationEntry(ctx context.Context, entry mutationEntry) {
