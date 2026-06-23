@@ -142,7 +142,7 @@ func quotaGet(args []string) error {
 	tenantID = strings.TrimSpace(tenantID)
 
 	var out quotaCLIResponse
-	if tenantID != "" || publicKey != "" || privateKey != "" {
+	if tenantIDGiven {
 		body, err := quotaCredentialBody(tenantID, publicKey, privateKey, nil)
 		if err != nil {
 			return err
@@ -156,6 +156,9 @@ func quotaGet(args []string) error {
 			return err
 		}
 	} else {
+		if publicKeyGiven || privateKeyGiven {
+			return fmt.Errorf("--tenant-id is required when using TiDB Cloud credentials")
+		}
 		apiKey := strings.TrimSpace(apiKeyFlag)
 		if apiKey == "" && r.Kind == CredentialOwner {
 			apiKey = r.APIKey

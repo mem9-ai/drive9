@@ -105,17 +105,11 @@ func (b *Dat9Backend) audioDurationCostMillicents(durationSeconds float64) int64
 // (with optional dual-read summing costs from both stores during transition).
 // Returns true when the total settled cost exceeds the limit.
 func (b *Dat9Backend) monthlyLLMCostExceeded() bool {
+	if b.UseServerQuota() && b.metaStore != nil && b.tenantID != "" {
+		return b.monthlyLLMCostExceededServer(backgroundWithTrace())
+	}
 	if b.maxMonthlyLLMCostMillicents <= 0 {
 		return false
-	}
-	if b.UseServerQuota() && b.metaStore != nil && b.tenantID != "" {
-		total, err := b.metaStore.MonthlyLLMCostMillicents(backgroundWithTrace(), b.tenantID)
-		if err != nil {
-			logger.Warn(backgroundWithTrace(), "llm_cost_budget_check_fail_open", zap.Error(err))
-			metrics.RecordOperation("llm_cost_budget", "quota_check", "fail_open", 0)
-			return false
-		}
-		return total > b.maxMonthlyLLMCostMillicents
 	}
 	total, err := b.store.MonthlyLLMCostMillicents()
 	if err != nil {

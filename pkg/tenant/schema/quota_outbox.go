@@ -1,9 +1,13 @@
 package schema
 
-// QuotaOutboxTiDBSchemaStatements returns the tenant-local quota mutation
-// outbox schema for MySQL/TiDB-backed tenants.
+// QuotaOutboxTiDBSchemaStatements returns the tenant-local quota admission and
+// mutation outbox schema for MySQL/TiDB-backed tenants.
 func QuotaOutboxTiDBSchemaStatements() []string {
 	return []string{
+		`CREATE TABLE IF NOT EXISTS quota_admission_locks (
+			name       VARCHAR(64) PRIMARY KEY,
+			updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+		)`,
 		`CREATE TABLE IF NOT EXISTS quota_outbox (
 			id             BIGINT AUTO_INCREMENT PRIMARY KEY,
 			file_id        VARCHAR(64) NULL,
@@ -29,10 +33,14 @@ func QuotaOutboxTiDBSchemaStatements() []string {
 	}
 }
 
-// QuotaOutboxDB9SchemaStatements returns the tenant-local quota mutation
-// outbox schema for db9/PostgreSQL-backed tenants.
+// QuotaOutboxDB9SchemaStatements returns the tenant-local quota admission and
+// mutation outbox schema for db9/PostgreSQL-backed tenants.
 func QuotaOutboxDB9SchemaStatements() []string {
 	return []string{
+		`CREATE TABLE IF NOT EXISTS quota_admission_locks (
+			name       VARCHAR(64) PRIMARY KEY,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
 		`CREATE TABLE IF NOT EXISTS quota_outbox (
 			id             BIGSERIAL PRIMARY KEY,
 			file_id        VARCHAR(64),

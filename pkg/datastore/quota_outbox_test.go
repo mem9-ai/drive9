@@ -107,3 +107,72 @@ func TestQuotaOutboxRecoverExpired(t *testing.T) {
 		t.Fatalf("reclaimed row = %+v found=%v, want id %d", reclaimed, found, claimed.ID)
 	}
 }
+
+func TestQuotaOutboxClaimWaitsForDelayedOlderRetry(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+
+	firstID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		AvailableAt:  now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		MutationType: "file_overwrite",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		AvailableAt:  now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, found, err := s.ClaimQuotaOutbox(ctx, now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || claimed.ID != firstID {
+		t.Fatalf("claimed = %+v found=%v, want first id %d", claimed, found, firstID)
+	}
+
+	retryAt := now.Add(time.Hour)
+	if err := s.RetryQuotaOutbox(ctx, claimed.ID, claimed.Receipt, retryAt, "temporary"); err != nil {
+		t.Fatal(err)
+	}
+	if claimed, found, err = s.ClaimQuotaOutbox(ctx, now.Add(time.Minute), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if found {
+		t.Fatalf("claimed row while older retry delayed: %+v", claimed)
+	}
+	claimed, found, err = s.ClaimQuotaOutbox(ctx, retryAt, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || claimed.ID != firstID {
+		t.Fatalf("claimed after retry = %+v found=%v, want first id %d", claimed, found, firstID)
+	}
+}
+
+func TestQuotaAdmissionLockCreatesStableLockRow(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if err := s.InTx(ctx, func(tx *sql.Tx) error {
+			return s.LockQuotaAdmissionTx(tx)
+		}); err != nil {
+			t.Fatalf("lock quota admission iteration %d: %v", i, err)
+		}
+	}
+
+	var count int
+	if err := s.DB().QueryRow(`SELECT COUNT(*) FROM quota_admission_locks WHERE name = ?`, quotaAdmissionLockName).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("quota admission lock rows = %d, want 1", count)
+	}
+}

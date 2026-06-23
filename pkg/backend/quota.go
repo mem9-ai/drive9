@@ -59,10 +59,13 @@ func (b *Dat9Backend) mediaLLMQuotaExceededCheck(ctx context.Context) bool {
 	return b.mediaLLMQuotaExceeded()
 }
 
-// mediaLLMQuotaExceededCheckTx dispatches the media LLM quota check (transactional variant).
-func (b *Dat9Backend) mediaLLMQuotaExceededCheckTx(ctx context.Context, tx *sql.Tx) bool {
+// mediaLLMQuotaExceededCheckTx dispatches the media LLM quota check
+// (transactional variant). currentMediaDelta is only applied to server quota,
+// where the current write may not be visible in central usage or pending outbox
+// deltas yet.
+func (b *Dat9Backend) mediaLLMQuotaExceededCheckTx(ctx context.Context, tx *sql.Tx, currentMediaDelta int64) bool {
 	if b.UseServerQuota() {
-		return b.mediaLLMQuotaExceededServerTx(ctx, tx)
+		return b.mediaLLMQuotaExceededServerTx(ctx, tx, currentMediaDelta)
 	}
 	return b.mediaLLMQuotaExceededTx(tx)
 }
@@ -92,7 +95,7 @@ func (b *Dat9Backend) monthlyLLMCostExceededServer(ctx context.Context) bool {
 	// Use per-tenant config if available, otherwise fall back to global default.
 	limit := b.maxMonthlyLLMCostMillicents
 	cfg := b.cachedQuotaConfig(ctx)
-	if cfg != nil && cfg.MaxMonthlyCostMC > 0 {
+	if cfg != nil && cfg.Explicit {
 		limit = cfg.MaxMonthlyCostMC
 	}
 	if limit <= 0 {
@@ -132,6 +135,16 @@ func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, tx *sql.Tx, 
 	if b.metaStore == nil || deltaBytes <= 0 {
 		return nil // fail-open or no-op
 	}
+	if err := b.lockQuotaAdmissionTx(ctx, tx); err != nil {
+		return err
+	}
+	return b.ensureStorageQuotaServerLocked(ctx, tx, deltaBytes)
+}
+
+func (b *Dat9Backend) ensureStorageQuotaServerLocked(ctx context.Context, tx *sql.Tx, deltaBytes int64) error {
+	if b.metaStore == nil || deltaBytes <= 0 {
+		return nil
+	}
 
 	cfg := b.cachedQuotaConfig(ctx)
 	if cfg == nil {
@@ -158,6 +171,20 @@ func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, tx *sql.Tx, 
 			ErrStorageQuotaExceeded, cfg.MaxStorageBytes, usage.StorageBytes, usage.ReservedBytes, pendingStorageDelta, deltaBytes)
 	}
 	metrics.RecordOperation("server_quota", "storage_check", "ok", 0)
+	return nil
+}
+
+func (b *Dat9Backend) lockQuotaAdmissionTx(ctx context.Context, tx *sql.Tx) error {
+	if !b.UseServerQuota() || b.store == nil || tx == nil {
+		return nil
+	}
+	if err := b.store.LockQuotaAdmissionTx(tx); err != nil {
+		logger.Warn(ctx, "server_quota_admission_lock_failed",
+			zap.String("tenant_id", b.tenantID), zap.Error(err))
+		metrics.RecordOperation("server_quota", "admission_lock", "error", 0)
+		return fmt.Errorf("lock quota admission: %w", err)
+	}
+	metrics.RecordOperation("server_quota", "admission_lock", "ok", 0)
 	return nil
 }
 
@@ -238,12 +265,26 @@ func recordTenantQuotaSnapshot(tenantID string, usage *QuotaUsageView, cfg *Quot
 	}
 }
 
+func quotaMediaDelta(oldIsMedia, newIsMedia bool) int64 {
+	switch {
+	case !oldIsMedia && newIsMedia:
+		return 1
+	case oldIsMedia && !newIsMedia:
+		return -1
+	default:
+		return 0
+	}
+}
+
 // mediaLLMQuotaExceededServerTx checks the server DB counter for media file
 // quota inside a transactional context. Falls back to tenant-DB when metaStore
 // is not wired.
-func (b *Dat9Backend) mediaLLMQuotaExceededServerTx(ctx context.Context, tx *sql.Tx) bool {
+func (b *Dat9Backend) mediaLLMQuotaExceededServerTx(ctx context.Context, tx *sql.Tx, currentMediaDelta int64) bool {
 	if b.metaStore == nil {
 		return b.mediaLLMQuotaExceededTx(tx) // fallback to tenant DB
+	}
+	if err := b.lockQuotaAdmissionTx(ctx, tx); err != nil {
+		return false
 	}
 	cfg := b.cachedQuotaConfig(ctx)
 	if cfg == nil {
@@ -263,7 +304,7 @@ func (b *Dat9Backend) mediaLLMQuotaExceededServerTx(ctx context.Context, tx *sql
 	if !pendingOK {
 		metrics.RecordOperation("server_quota", "media_check_pending_delta", "fail_open", 0)
 	}
-	return usage.MediaFileCount+pendingMediaDelta > cfg.MaxMediaLLMFiles
+	return usage.MediaFileCount+pendingMediaDelta+currentMediaDelta > cfg.MaxMediaLLMFiles
 }
 
 func (b *Dat9Backend) pendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx) (storageDelta, mediaDelta int64, ok bool) {

@@ -1089,7 +1089,8 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			}
 			if b.UsesDatabaseAutoEmbedding() {
 				stepStart = time.Now()
-				created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+				created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+					quotaMediaDelta(oldIsMedia, newIsMedia))
 				semanticTaskEnqueued = created
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 				return err
@@ -1151,7 +1152,8 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		}
 		if b.UsesDatabaseAutoEmbedding() {
 			stepStart = time.Now()
-			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+				quotaMediaDelta(false, newIsMedia))
 			semanticTaskEnqueued = created
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return err

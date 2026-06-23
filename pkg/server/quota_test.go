@@ -68,10 +68,8 @@ func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {
 	t.Helper()
 	db := newTenantDeleteDBInfo(t)
 	testmysql.ResetMetaDB(t, db.Meta.DB())
-	testmysql.ResetDB(t, db.Meta.DB())
 	t.Cleanup(func() {
 		testmysql.ResetMetaDB(t, db.Meta.DB())
-		testmysql.ResetDB(t, db.Meta.DB())
 	})
 
 	tenantID := token.NewID()

@@ -4,8 +4,6 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
-
-	"github.com/stretchr/testify/require"
 )
 
 // cacheTestStore wraps fakeMetaQuotaStore with error injection for cache tests.
@@ -50,11 +48,21 @@ func TestQuotaConfigCacheInitialLoad(t *testing.T) {
 	defer c.stop()
 
 	cfg := c.get()
-	require.NotNil(t, cfg)
-	require.Equal(t, int64(1000), cfg.MaxStorageBytes)
-	require.Equal(t, int64(1), store.versionCalls.Load())
-	require.Equal(t, int64(1), store.configCalls.Load())
-	require.Equal(t, int64(0), store.usageCalls.Load())
+	if cfg == nil {
+		t.Fatal("config is nil")
+	}
+	if cfg.MaxStorageBytes != 1000 {
+		t.Fatalf("MaxStorageBytes = %d, want 1000", cfg.MaxStorageBytes)
+	}
+	if got := store.versionCalls.Load(); got != 1 {
+		t.Fatalf("versionCalls = %d, want 1", got)
+	}
+	if got := store.configCalls.Load(); got != 1 {
+		t.Fatalf("configCalls = %d, want 1", got)
+	}
+	if got := store.usageCalls.Load(); got != 0 {
+		t.Fatalf("usageCalls = %d, want 0", got)
+	}
 }
 
 func TestQuotaConfigCacheFailOpenOnVersionError(t *testing.T) {
@@ -63,10 +71,18 @@ func TestQuotaConfigCacheFailOpenOnVersionError(t *testing.T) {
 	c := newQuotaConfigCache("t1", store)
 	defer c.stop()
 
-	require.Nil(t, c.get())
-	require.Equal(t, int64(1), store.versionCalls.Load())
-	require.Equal(t, int64(0), store.configCalls.Load())
-	require.Equal(t, int64(0), store.usageCalls.Load())
+	if cfg := c.get(); cfg != nil {
+		t.Fatalf("config = %+v, want nil", cfg)
+	}
+	if got := store.versionCalls.Load(); got != 1 {
+		t.Fatalf("versionCalls = %d, want 1", got)
+	}
+	if got := store.configCalls.Load(); got != 0 {
+		t.Fatalf("configCalls = %d, want 0", got)
+	}
+	if got := store.usageCalls.Load(); got != 0 {
+		t.Fatalf("usageCalls = %d, want 0", got)
+	}
 }
 
 func TestQuotaConfigCacheRefreshOnlyLoadsConfigWhenVersionChanges(t *testing.T) {
@@ -76,8 +92,12 @@ func TestQuotaConfigCacheRefreshOnlyLoadsConfigWhenVersionChanges(t *testing.T) 
 	defer c.stop()
 
 	c.refresh(context.Background())
-	require.Equal(t, int64(2), store.versionCalls.Load())
-	require.Equal(t, int64(1), store.configCalls.Load())
+	if got := store.versionCalls.Load(); got != 2 {
+		t.Fatalf("versionCalls = %d, want 2", got)
+	}
+	if got := store.configCalls.Load(); got != 1 {
+		t.Fatalf("configCalls = %d, want 1", got)
+	}
 
 	store.mu.Lock()
 	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 2000}
@@ -85,11 +105,21 @@ func TestQuotaConfigCacheRefreshOnlyLoadsConfigWhenVersionChanges(t *testing.T) 
 	c.refresh(context.Background())
 
 	cfg := c.get()
-	require.NotNil(t, cfg)
-	require.Equal(t, int64(2000), cfg.MaxStorageBytes)
-	require.Equal(t, int64(3), store.versionCalls.Load())
-	require.Equal(t, int64(2), store.configCalls.Load())
-	require.Equal(t, int64(0), store.usageCalls.Load())
+	if cfg == nil {
+		t.Fatal("config is nil")
+	}
+	if cfg.MaxStorageBytes != 2000 {
+		t.Fatalf("MaxStorageBytes = %d, want 2000", cfg.MaxStorageBytes)
+	}
+	if got := store.versionCalls.Load(); got != 3 {
+		t.Fatalf("versionCalls = %d, want 3", got)
+	}
+	if got := store.configCalls.Load(); got != 2 {
+		t.Fatalf("configCalls = %d, want 2", got)
+	}
+	if got := store.usageCalls.Load(); got != 0 {
+		t.Fatalf("usageCalls = %d, want 0", got)
+	}
 }
 
 func TestQuotaConfigCacheStop(t *testing.T) {

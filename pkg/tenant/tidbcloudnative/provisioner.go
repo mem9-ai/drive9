@@ -42,7 +42,8 @@ const (
 	Drive9TenantIDLabel      = "drive9.ai/tenant_id"
 	Drive9QuotaUpdateAtLabel = "drive9.ai/update_quota_at"
 
-	upstreamErrorBodyLimit = 2048
+	upstreamErrorBodyLimit   = 2048
+	upstreamClusterBodyLimit = 1 << 20
 )
 
 var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
@@ -205,9 +206,16 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, readErr
+		}
 		return nil, fmt.Errorf("%s", statusError("provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
+	}
+	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if readErr != nil {
+		return nil, readErr
 	}
 	info, err := parseClusterInfo(raw)
 	if err != nil {
@@ -313,11 +321,18 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 		return nil, fmt.Errorf("create branch request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, readErr
+		}
 		return nil, fmt.Errorf("%s", statusError("branch provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 
+	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if readErr != nil {
+		return nil, readErr
+	}
 	branch, err := parseBranchInfo(raw)
 	if err != nil {
 		return nil, fmt.Errorf("parse branch provision response: %w", err)
@@ -403,8 +418,11 @@ func (p *Provisioner) DeleteBranchWithCredentials(ctx context.Context, clusterID
 		return fmt.Errorf("delete branch request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return readErr
+		}
 		return fmt.Errorf("%s", statusError("branch delete", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 	return nil
@@ -425,8 +443,11 @@ func (p *Provisioner) DeprovisionWithCredentials(ctx context.Context, cluster *t
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return readErr
+		}
 		return fmt.Errorf("%s", statusError("cluster delete", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 	return nil
@@ -469,8 +490,11 @@ func (p *Provisioner) UpdateQuotaWithCredentials(ctx context.Context, cluster *t
 		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return readErr
+		}
 		return quotaStatusError("cluster label update", resp.StatusCode, sanitizeUpstreamBody(raw))
 	}
 	return nil
@@ -496,9 +520,16 @@ func (p *Provisioner) clusterLabels(ctx context.Context, publicKey, privateKey, 
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, readErr
+		}
 		return nil, quotaStatusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw))
+	}
+	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if readErr != nil {
+		return nil, readErr
 	}
 	info, err := parseClusterInfo(raw)
 	if err != nil {
@@ -625,6 +656,20 @@ func sanitizeUpstreamBody(raw []byte) string {
 	return s
 }
 
+func readUpstreamBody(r io.Reader, limit int64) ([]byte, error) {
+	if r == nil {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = upstreamErrorBodyLimit + 1
+	}
+	raw, err := io.ReadAll(io.LimitReader(r, limit))
+	if err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
 func statusError(operation string, code int, upstreamBody string) string {
 	msg := fmt.Sprintf("tidbcloud native %s status %d", operation, code)
 	if upstreamBody != "" {
@@ -645,6 +690,8 @@ func statusError(operation string, code int, upstreamBody string) string {
 func quotaStatusError(operation string, code int, upstreamBody string) error {
 	msg := statusError(operation, code, upstreamBody)
 	switch code {
+	case http.StatusUnauthorized:
+		return fmt.Errorf("%w: %s", tenant.ErrQuotaPermissionDenied, msg)
 	case http.StatusForbidden:
 		return fmt.Errorf("%w: %s", tenant.ErrQuotaPermissionDenied, msg)
 	case http.StatusNotFound:
@@ -755,8 +802,15 @@ func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, priva
 		if err != nil {
 			return nil, err
 		}
-		raw, _ := io.ReadAll(resp.Body)
+		limit := int64(upstreamClusterBodyLimit)
+		if resp.StatusCode != http.StatusOK {
+			limit = upstreamErrorBodyLimit + 1
+		}
+		raw, readErr := readUpstreamBody(resp.Body, limit)
 		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("%s", statusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw)))
 		}
@@ -786,8 +840,15 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privat
 		if err != nil {
 			return nil, err
 		}
-		raw, _ := io.ReadAll(resp.Body)
+		limit := int64(upstreamClusterBodyLimit)
+		if resp.StatusCode != http.StatusOK {
+			limit = upstreamErrorBodyLimit + 1
+		}
+		raw, readErr := readUpstreamBody(resp.Body, limit)
 		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
 		if resp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("%s", statusError("branch get", resp.StatusCode, sanitizeUpstreamBody(raw)))
 		}

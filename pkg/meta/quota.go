@@ -16,8 +16,17 @@ type QuotaConfig struct {
 	MaxStorageBytes  int64
 	MaxMediaLLMFiles int64
 	MaxMonthlyCostMC int64 // millicents; 0 = disabled
+	Explicit         bool  // true when tenant_quota_config has a row
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
+}
+
+// QuotaConfigPatch updates only the quota fields whose pointers are non-nil.
+type QuotaConfigPatch struct {
+	TenantID         string
+	MaxStorageBytes  *int64
+	MaxMediaLLMFiles *int64
+	MaxMonthlyCostMC *int64
 }
 
 // QuotaUsage holds pre-aggregated quota counters for a tenant.
@@ -94,13 +103,14 @@ func (s *Store) GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConf
 	if err == sql.ErrNoRows {
 		// Return defaults when no per-tenant config exists.
 		cfg.MaxStorageBytes = DefaultMaxStorageBytes()
-		cfg.MaxMediaLLMFiles = 500
+		cfg.MaxMediaLLMFiles = DefaultMaxMediaLLMFiles
 		cfg.MaxMonthlyCostMC = 0
 		return cfg, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	cfg.Explicit = true
 	return cfg, nil
 }
 
@@ -139,6 +149,55 @@ func (s *Store) SetQuotaConfig(ctx context.Context, cfg *QuotaConfig) error {
 		   max_media_llm_files = VALUES(max_media_llm_files),
 		   max_monthly_cost_mc = VALUES(max_monthly_cost_mc)`,
 		cfg.TenantID, cfg.MaxStorageBytes, cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC)
+	return err
+}
+
+// PatchQuotaConfig atomically updates only the provided quota fields, preserving
+// unspecified fields in the database when a config row already exists.
+func (s *Store) PatchQuotaConfig(ctx context.Context, patch *QuotaConfigPatch) error {
+	start := time.Now()
+	var err error
+	defer observeMeta(ctx, "patch_quota_config", start, &err)
+
+	if patch == nil {
+		return fmt.Errorf("quota config patch is required")
+	}
+	storage := DefaultMaxStorageBytes()
+	media := DefaultMaxMediaLLMFiles
+	monthly := int64(0)
+	storageSet := patch.MaxStorageBytes != nil
+	mediaSet := patch.MaxMediaLLMFiles != nil
+	monthlySet := patch.MaxMonthlyCostMC != nil
+	if storageSet {
+		storage = *patch.MaxStorageBytes
+	}
+	if mediaSet {
+		media = *patch.MaxMediaLLMFiles
+	}
+	if monthlySet {
+		monthly = *patch.MaxMonthlyCostMC
+	}
+	storageFlag := int64(0)
+	if storageSet {
+		storageFlag = 1
+	}
+	mediaFlag := int64(0)
+	if mediaSet {
+		mediaFlag = 1
+	}
+	monthlyFlag := int64(0)
+	if monthlySet {
+		monthlyFlag = 1
+	}
+
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO tenant_quota_config (tenant_id, max_storage_bytes, max_media_llm_files, max_monthly_cost_mc)
+		 VALUES (?, ?, ?, ?)
+		 ON DUPLICATE KEY UPDATE
+		   max_storage_bytes = CASE WHEN ? = 1 THEN VALUES(max_storage_bytes) ELSE max_storage_bytes END,
+		   max_media_llm_files = CASE WHEN ? = 1 THEN VALUES(max_media_llm_files) ELSE max_media_llm_files END,
+		   max_monthly_cost_mc = CASE WHEN ? = 1 THEN VALUES(max_monthly_cost_mc) ELSE max_monthly_cost_mc END`,
+		patch.TenantID, storage, media, monthly, storageFlag, mediaFlag, monthlyFlag)
 	return err
 }
 
@@ -304,6 +363,10 @@ func (s *Store) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reser
 	}
 	return ensureRowsAffected(res, tenantID)
 }
+
+// DefaultMaxMediaLLMFiles is the fallback media LLM file limit when no
+// per-tenant config row exists.
+const DefaultMaxMediaLLMFiles int64 = 500
 
 // defaultMaxStorageBytes is the fallback limit when no per-tenant config row exists.
 var defaultMaxStorageBytes atomic.Int64

@@ -84,6 +84,55 @@ func TestQuotaGetWithTenantIDUsesCredentialQuery(t *testing.T) {
 	}
 }
 
+func TestQuotaGetIgnoresEnvTiDBCloudCredentialsWithoutTenantID(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+
+	var gotPath string
+	var gotAuth string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotAuth = r.Header.Get("Authorization")
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/quota" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		_ = json.NewEncoder(w).Encode(quotaTestResponse("tenant-1"))
+	}))
+	defer ts.Close()
+
+	t.Setenv(EnvServer, ts.URL)
+	t.Setenv(EnvAPIKey, "owner-key")
+	t.Setenv(EnvTiDBCloudPublicKey, "env-public")
+	t.Setenv(EnvTiDBCloudPrivateKey, "env-private")
+	resetCredentialCacheForTest()
+
+	if _, err := captureStdoutE(t, func() error {
+		return Quota([]string{"get", "--json"})
+	}); err != nil {
+		t.Fatalf("Quota get: %v", err)
+	}
+	if gotPath != "/v1/quota" {
+		t.Fatalf("path = %q, want /v1/quota", gotPath)
+	}
+	if gotAuth != "Bearer owner-key" {
+		t.Fatalf("Authorization = %q", gotAuth)
+	}
+}
+
+func TestQuotaGetRejectsTiDBCloudCredentialFlagsWithoutTenantID(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+	resetCredentialCacheForTest()
+
+	err := Quota([]string{"get", "--tidbcloud-public-key", "public-1", "--tidbcloud-private-key", "private-1"})
+	if err == nil {
+		t.Fatal("Quota get error = nil, want tenant-id error")
+	}
+	if !strings.Contains(err.Error(), "--tenant-id is required") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
 func TestQuotaSetSendsTiDBCloudCredentialBody(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)

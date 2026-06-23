@@ -13,6 +13,7 @@ type mockQuotaStore struct {
 	MetaQuotaStore // embed interface; unimplemented methods will nil-panic if called
 	monthlyCost    int64
 	monthlyCostErr error
+	quotaConfig    *QuotaConfigView
 }
 
 func (m *mockQuotaStore) MonthlyLLMCostMillicents(_ context.Context, _ string) (int64, error) {
@@ -20,6 +21,10 @@ func (m *mockQuotaStore) MonthlyLLMCostMillicents(_ context.Context, _ string) (
 }
 
 func (m *mockQuotaStore) GetQuotaConfig(_ context.Context, _ string) (*QuotaConfigView, error) {
+	if m.quotaConfig != nil {
+		cfg := *m.quotaConfig
+		return &cfg, nil
+	}
 	return &QuotaConfigView{}, nil
 }
 
@@ -108,6 +113,26 @@ func TestMonthlyLLMCostExceeded_ServerQuota_NotExceeded(t *testing.T) {
 	}
 	if b.monthlyLLMCostExceeded() {
 		t.Fatal("expected not exceeded, got true")
+	}
+}
+
+func TestMonthlyLLMCostExceeded_ServerQuotaExplicitZeroDisablesDefault(t *testing.T) {
+	mock := &mockQuotaStore{
+		monthlyCost: 5000,
+		quotaConfig: &QuotaConfigView{
+			TenantID:         "tenant-1",
+			MaxMonthlyCostMC: 0,
+			Explicit:         true,
+		},
+	}
+	b := &Dat9Backend{
+		metaStore:                   mock,
+		tenantID:                    "tenant-1",
+		quotaSource:                 QuotaSourceServer,
+		maxMonthlyLLMCostMillicents: 4000,
+	}
+	if b.monthlyLLMCostExceeded() {
+		t.Fatal("expected explicit zero monthly budget to disable the server quota check")
 	}
 }
 

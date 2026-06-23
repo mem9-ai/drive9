@@ -1667,6 +1667,7 @@ func (s *Store) SanitizeForkRuntimeState(ctx context.Context) error {
 		for _, stmt := range []string{
 			`DELETE FROM uploads`,
 			`DELETE FROM quota_outbox`,
+			`DELETE FROM quota_admission_locks`,
 			`DELETE FROM file_gc_tasks`,
 			`DELETE FROM semantic_tasks`,
 			`DELETE FROM llm_usage`,

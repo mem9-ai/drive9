@@ -149,26 +149,6 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, quotaBackendNotFoundMessage)
 		return
 	}
-	current, err := s.meta.GetQuotaConfig(r.Context(), t.ID)
-	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "quota config lookup failed")
-		return
-	}
-	next := &meta.QuotaConfig{
-		TenantID:         t.ID,
-		MaxStorageBytes:  current.MaxStorageBytes,
-		MaxMediaLLMFiles: current.MaxMediaLLMFiles,
-		MaxMonthlyCostMC: current.MaxMonthlyCostMC,
-	}
-	if req.MaxStorageBytes != nil {
-		next.MaxStorageBytes = *req.MaxStorageBytes
-	}
-	if req.MaxMediaLLMFiles != nil {
-		next.MaxMediaLLMFiles = *req.MaxMediaLLMFiles
-	}
-	if req.MaxMonthlyCostMC != nil {
-		next.MaxMonthlyCostMC = *req.MaxMonthlyCostMC
-	}
 	updater, ok := s.provisioner.(tenant.CredentialQuotaUpdater)
 	if !ok {
 		errJSON(w, http.StatusNotFound, "quota setting not enabled")
@@ -178,7 +158,12 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		writeQuotaCredentialError(w, err, "update")
 		return
 	}
-	if err := s.meta.SetQuotaConfig(r.Context(), next); err != nil {
+	if err := s.meta.PatchQuotaConfig(r.Context(), &meta.QuotaConfigPatch{
+		TenantID:         t.ID,
+		MaxStorageBytes:  req.MaxStorageBytes,
+		MaxMediaLLMFiles: req.MaxMediaLLMFiles,
+		MaxMonthlyCostMC: req.MaxMonthlyCostMC,
+	}); err != nil {
 		errJSON(w, http.StatusInternalServerError, "quota config update failed")
 		return
 	}

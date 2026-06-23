@@ -133,6 +133,97 @@ func TestServerQuotaPendingOutboxDeltaRejectsUploadReserve(t *testing.T) {
 	}
 }
 
+func TestServerQuotaReserveUploadRetrySkipsPendingPrecheck(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	fake.mu.Lock()
+	fake.config["tenant-a"].MaxStorageBytes = 8
+	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(ctx)
+
+	reserved, err := b.reserveUploadOnServer(ctx, "upload-retry", "/upload.bin", 8)
+	if err != nil {
+		t.Fatalf("first reserve: %v", err)
+	}
+	if !reserved {
+		t.Fatal("first reserve returned false, want true")
+	}
+	reserved, err = b.reserveUploadOnServer(ctx, "upload-retry", "/upload.bin", 8)
+	if err != nil {
+		t.Fatalf("retry reserve: %v", err)
+	}
+	if !reserved {
+		t.Fatal("retry reserve returned false, want true")
+	}
+	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("get usage: %v", err)
+	}
+	if usage.ReservedBytes != 8 {
+		t.Fatalf("reserved bytes = %d, want 8", usage.ReservedBytes)
+	}
+}
+
+func TestServerQuotaOverwriteOutboxUsesLockedCurrentMeta(t *testing.T) {
+	b, _ := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	if _, err := b.WriteCtx(ctx, "/stale.txt", []byte("1234567890"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("initial write: %v", err)
+	}
+	stale, err := b.Store().Stat(ctx, "/stale.txt")
+	if err != nil {
+		t.Fatalf("stat stale file: %v", err)
+	}
+	if _, err := b.WriteCtx(ctx, "/stale.txt", []byte("12345678901234567890"), 0, filesystem.WriteFlagTruncate); err != nil {
+		t.Fatalf("fresh overwrite: %v", err)
+	}
+	if _, _, err := b.overwriteFileCtxWithRev(ctx, stale, []byte("12345"), 0, filesystem.WriteFlagTruncate, 0, nil, ""); err != nil {
+		t.Fatalf("stale overwrite: %v", err)
+	}
+
+	delta := latestQuotaOutboxStorageDeltaByFile(t, b, stale.File.FileID)
+	if delta != -15 {
+		t.Fatalf("latest outbox storage_delta = %d, want -15", delta)
+	}
+}
+
+func TestServerQuotaMediaCheckIncludesCurrentWrite(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{
+		DatabaseAutoEmbedding: true,
+		AsyncAudioExtract: AsyncAudioExtractOptions{
+			Enabled:   true,
+			Extractor: &staticAudioExtractor{text: "transcript"},
+		},
+	})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	fake.mu.Lock()
+	fake.config["tenant-a"].MaxMediaLLMFiles = 1
+	fake.usage["tenant-a"] = &QuotaUsageView{
+		TenantID:       "tenant-a",
+		MediaFileCount: 1,
+	}
+	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(ctx)
+
+	if _, err := b.WriteCtx(ctx, "/over-limit.mp3", []byte("audio-data"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	nf, err := b.Store().Stat(ctx, "/over-limit.mp3")
+	if err != nil {
+		t.Fatalf("stat written file: %v", err)
+	}
+	tasks := loadSemanticTasksForFile(t, b, nf.File.FileID)
+	if len(tasks) != 0 {
+		t.Fatalf("semantic task count = %d, want 0", len(tasks))
+	}
+}
+
 func TestApplyCentralFileMutationIsIdempotent(t *testing.T) {
 	fake := newFakeMetaQuotaStore()
 	if err := fake.EnsureQuotaUsageRow(context.Background(), "tenant-a"); err != nil {
@@ -170,4 +261,15 @@ func countQuotaOutboxRowsByFile(t *testing.T, b *Dat9Backend, fileID string, sta
 		t.Fatal(err)
 	}
 	return count
+}
+
+func latestQuotaOutboxStorageDeltaByFile(t *testing.T, b *Dat9Backend, fileID string) int64 {
+	t.Helper()
+	var delta int64
+	if err := b.Store().DB().QueryRow(`SELECT storage_delta FROM quota_outbox
+		WHERE file_id = ? AND mutation_type = ?
+		ORDER BY id DESC LIMIT 1`, fileID, quotaMutationTypeOverwrite).Scan(&delta); err != nil {
+		t.Fatal(err)
+	}
+	return delta
 }

@@ -13,6 +13,7 @@ import (
 )
 
 const defaultQuotaOutboxMaxAttempts = 0
+const quotaAdmissionLockName = "default"
 
 type QuotaOutboxStatus string
 
@@ -56,6 +57,24 @@ func (s *Store) EnqueueQuotaOutboxTx(db execer, entry *QuotaOutboxEntry) (int64,
 	return s.enqueueQuotaOutbox(db, entry)
 }
 
+// LockQuotaAdmissionTx serializes quota admission checks and quota_outbox
+// enqueue in a tenant-local transaction. This protects multi-server deployments
+// from concurrent writers reading the same pending-delta snapshot.
+func (s *Store) LockQuotaAdmissionTx(db execer) error {
+	now := time.Now().UTC()
+	if _, err := db.Exec(`INSERT INTO quota_admission_locks (name, updated_at)
+		VALUES (?, ?) ON DUPLICATE KEY UPDATE updated_at = VALUES(updated_at)`,
+		quotaAdmissionLockName, now); err != nil {
+		return err
+	}
+	var name string
+	if err := db.QueryRow(`SELECT name FROM quota_admission_locks WHERE name = ? FOR UPDATE`,
+		quotaAdmissionLockName).Scan(&name); err != nil {
+		return err
+	}
+	return nil
+}
+
 // ClaimQuotaOutbox claims the oldest queued quota mutation for this tenant
 // store. Only one row is allowed to be processing at a time, preserving
 // per-tenant apply order even when multiple server instances poll the same
@@ -80,15 +99,20 @@ func (s *Store) ClaimQuotaOutbox(ctx context.Context, now time.Time, leaseDurati
 	defer func() { _ = tx.Rollback() }()
 
 	row := tx.QueryRowContext(ctx, quotaOutboxSelectSQL+`
-		FROM quota_outbox
-		WHERE status = ? AND available_at <= ?
+		FROM quota_outbox q
+		WHERE q.status = ? AND q.available_at <= ?
 		  AND NOT EXISTS (
-		    SELECT 1 FROM quota_outbox
-		     WHERE status = ? AND lease_until IS NOT NULL AND lease_until > ?
+		    SELECT 1 FROM quota_outbox older
+		     WHERE older.id < q.id AND older.status IN (?, ?)
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1 FROM quota_outbox active
+		     WHERE active.status = ? AND active.lease_until IS NOT NULL AND active.lease_until > ?
 		  )
 		ORDER BY id
 		LIMIT 1
-		FOR UPDATE`, QuotaOutboxQueued, now, QuotaOutboxProcessing, now)
+		FOR UPDATE SKIP LOCKED`, QuotaOutboxQueued, now,
+		QuotaOutboxQueued, QuotaOutboxProcessing, QuotaOutboxProcessing, now)
 	entry, err := scanQuotaOutbox(row)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
@@ -221,7 +245,7 @@ func (s *Store) RecoverExpiredQuotaOutbox(ctx context.Context, now time.Time, li
 		query += ` LIMIT ?`
 		args = append(args, limit)
 	}
-	query += ` FOR UPDATE`
+	query += ` FOR UPDATE SKIP LOCKED`
 	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return 0, err

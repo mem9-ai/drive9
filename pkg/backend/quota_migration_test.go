@@ -86,6 +86,7 @@ func (f *fakeMetaQuotaStore) GetQuotaConfig(ctx context.Context, tenantID string
 	defer f.mu.Unlock()
 	if cfg, ok := f.config[tenantID]; ok {
 		cp := *cfg
+		cp.Explicit = true
 		return &cp, nil
 	}
 	return &QuotaConfigView{
@@ -607,6 +608,7 @@ func TestMonthlyLLMCostExceededUsesCentralCounter(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
 	b.quotaSource = QuotaSourceServer // enable server-side cost check
 	b.maxMonthlyLLMCostMillicents = 100
+	fake.config["tenant-a"].MaxMonthlyCostMC = 100
 	fake.monthly["tenant-a"] = 101
 	if !b.monthlyLLMCostExceeded() {
 		t.Fatal("expected central monthly budget to be exceeded")

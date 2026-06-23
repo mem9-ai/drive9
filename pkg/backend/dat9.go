@@ -890,7 +890,8 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			}
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType,
+				quotaMediaDelta(false, isQuotaMediaContentType(contentType)))
 			semanticTaskEnqueued = created
 			if err != nil {
 				return err
@@ -1099,7 +1100,29 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
 		quotaOutboxEnqueued = false
-		if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
+		var oldSizeBytes int64
+		var oldContentTypeForQuota string
+		if b.UseServerQuota() {
+			if err := b.lockQuotaAdmissionTx(ctx, tx); err != nil {
+				return err
+			}
+		}
+		currentMeta, err := b.store.GetFileStorageMetaForUpdateTx(tx, nf.File.FileID)
+		if err != nil {
+			return err
+		}
+		oldSizeBytes = currentMeta.SizeBytes
+		oldContentTypeForQuota = currentMeta.ContentType
+		if expectedRevision > 0 && currentMeta.Revision != expectedRevision {
+			return datastore.ErrRevisionConflict
+		}
+		if b.UseServerQuota() {
+			if deltaBytes := int64(len(finalData)) - currentMeta.SizeBytes; deltaBytes > 0 {
+				if err := b.ensureStorageQuotaServerLocked(ctx, tx, deltaBytes); err != nil {
+					return err
+				}
+			}
+		} else if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
 			return err
 		}
 		var txErr error
@@ -1140,7 +1163,8 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 			}
 		}
 		if b.UsesDatabaseAutoEmbedding() {
-			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType)
+			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType,
+				quotaMediaDelta(isQuotaMediaContentType(oldContentTypeForQuota), isQuotaMediaContentType(contentType)))
 			semanticTaskEnqueued = created
 			if err != nil {
 				return err
@@ -1152,11 +1176,15 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 				return err
 			}
 		}
-		created, err := b.enqueueQuotaFileOverwriteOutboxTx(tx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
+		created, err := b.enqueueQuotaFileOverwriteOutboxTx(tx, nf.File.FileID, oldSizeBytes, oldContentTypeForQuota, int64(len(finalData)), contentType)
 		if err != nil {
 			return err
 		}
 		quotaOutboxEnqueued = created
+		nf.File.StorageType = currentMeta.StorageType
+		nf.File.StorageRef = currentMeta.StorageRef
+		nf.File.SizeBytes = oldSizeBytes
+		nf.File.ContentType = oldContentTypeForQuota
 		return nil
 	})
 	if timingEnabled {

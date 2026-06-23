@@ -191,7 +191,29 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 	var newRev int64
 	var quotaOutboxEnqueued bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
-		if err := b.ensureStorageQuota(ctx, tx, canonical, entry.SizeBytes); err != nil {
+		if b.UseServerQuota() {
+			if err := b.lockQuotaAdmissionTx(ctx, tx); err != nil {
+				return err
+			}
+		}
+		currentMeta, err := b.store.GetFileStorageMetaForUpdateTx(tx, nf.File.FileID)
+		if err != nil {
+			return err
+		}
+		oldStorageType = currentMeta.StorageType
+		oldStorageRef = currentMeta.StorageRef
+		oldSize = currentMeta.SizeBytes
+		oldContentType = currentMeta.ContentType
+		if entry.BaseRevision > 0 && currentMeta.Revision != entry.BaseRevision {
+			return datastore.ErrRevisionConflict
+		}
+		if b.UseServerQuota() {
+			if deltaBytes := entry.SizeBytes - currentMeta.SizeBytes; deltaBytes > 0 {
+				if err := b.ensureStorageQuotaServerLocked(ctx, tx, deltaBytes); err != nil {
+					return err
+				}
+			}
+		} else if err := b.ensureStorageQuota(ctx, tx, canonical, entry.SizeBytes); err != nil {
 			return err
 		}
 		var txErr error

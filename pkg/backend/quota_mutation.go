@@ -165,13 +165,7 @@ func applyCentralFileStateTx(store MetaQuotaStore, tx *sql.Tx, tenantID, fileID 
 			return err
 		}
 	}
-	mediaDelta := int64(0)
-	switch {
-	case !oldIsMedia && isMedia:
-		mediaDelta = 1
-	case oldIsMedia && !isMedia:
-		mediaDelta = -1
-	}
+	mediaDelta := quotaMediaDelta(oldIsMedia, isMedia)
 	if mediaDelta != 0 {
 		if err := store.IncrMediaFileCountTx(tx, tenantID, mediaDelta); err != nil {
 			return err

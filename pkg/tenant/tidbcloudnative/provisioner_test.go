@@ -699,6 +699,7 @@ func TestQuotaCredentialErrorsMapForbiddenAndNotFound(t *testing.T) {
 		statusCode int
 		target     error
 	}{
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, target: tenant.ErrQuotaPermissionDenied},
 		{name: "forbidden", statusCode: http.StatusForbidden, target: tenant.ErrQuotaPermissionDenied},
 		{name: "not_found", statusCode: http.StatusNotFound, target: tenant.ErrQuotaBackendNotFound},
 	} {

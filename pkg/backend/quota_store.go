@@ -72,6 +72,7 @@ type QuotaConfigView struct {
 	MaxStorageBytes  int64
 	MaxMediaLLMFiles int64
 	MaxMonthlyCostMC int64
+	Explicit         bool
 }
 
 // QuotaUsageView is the backend-side view of pre-aggregated quota counters.

@@ -223,13 +223,7 @@ func (b *Dat9Backend) enqueueQuotaFileOverwriteOutboxTx(tx *sql.Tx, fileID strin
 	if err != nil {
 		return false, err
 	}
-	mediaDelta := int64(0)
-	switch {
-	case !oldIsMedia && newIsMedia:
-		mediaDelta = 1
-	case oldIsMedia && !newIsMedia:
-		mediaDelta = -1
-	}
+	mediaDelta := quotaMediaDelta(oldIsMedia, newIsMedia)
 	_, err = b.store.EnqueueQuotaOutboxTx(tx, &datastore.QuotaOutboxEntry{
 		FileID:       fileID,
 		MutationType: quotaMutationTypeOverwrite,

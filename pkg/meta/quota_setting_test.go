@@ -49,6 +49,9 @@ func TestGetQuotaConfigUsesConfiguredDefaultStorageBytes(t *testing.T) {
 	if cfg.MaxMediaLLMFiles != 500 {
 		t.Fatalf("MaxMediaLLMFiles = %d, want default 500", cfg.MaxMediaLLMFiles)
 	}
+	if cfg.Explicit {
+		t.Fatal("Explicit = true, want false for default config")
+	}
 }
 
 func TestGetQuotaConfigVersion(t *testing.T) {
@@ -77,6 +80,67 @@ func TestGetQuotaConfigVersion(t *testing.T) {
 	}
 	if version == "" {
 		t.Fatal("version for explicit config is empty")
+	}
+	cfg, err := s.GetQuotaConfig(ctx, "tenant-with-config")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Explicit {
+		t.Fatal("Explicit = false, want true for configured tenant")
+	}
+}
+
+func TestPatchQuotaConfigPreservesUnspecifiedFields(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	if err := s.SetQuotaConfig(ctx, &QuotaConfig{
+		TenantID:         "tenant-patch",
+		MaxStorageBytes:  100,
+		MaxMediaLLMFiles: 200,
+		MaxMonthlyCostMC: 300,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	storage := int64(999)
+	monthly := int64(0)
+	if err := s.PatchQuotaConfig(ctx, &QuotaConfigPatch{
+		TenantID:         "tenant-patch",
+		MaxStorageBytes:  &storage,
+		MaxMonthlyCostMC: &monthly,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := s.GetQuotaConfig(ctx, "tenant-patch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxStorageBytes != 999 || cfg.MaxMediaLLMFiles != 200 || cfg.MaxMonthlyCostMC != 0 {
+		t.Fatalf("cfg = %+v, want storage=999 media=200 monthly=0", cfg)
+	}
+}
+
+func TestPatchQuotaConfigInsertsDefaultsForUnspecifiedFields(t *testing.T) {
+	orig := DefaultMaxStorageBytes()
+	defer func() { SetDefaultMaxStorageBytes(orig) }()
+	SetDefaultMaxStorageBytes(12345)
+
+	s := newControlStore(t)
+	ctx := context.Background()
+
+	media := int64(7)
+	if err := s.PatchQuotaConfig(ctx, &QuotaConfigPatch{
+		TenantID:         "tenant-patch-insert",
+		MaxMediaLLMFiles: &media,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := s.GetQuotaConfig(ctx, "tenant-patch-insert")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxStorageBytes != 12345 || cfg.MaxMediaLLMFiles != 7 || cfg.MaxMonthlyCostMC != 0 || !cfg.Explicit {
+		t.Fatalf("cfg = %+v, want defaults plus media patch", cfg)
 	}
 }
 
