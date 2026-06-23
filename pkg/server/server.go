@@ -82,6 +82,12 @@ type SlockOAuthClient interface {
 	Userinfo(ctx context.Context, accessToken string) (slockoauth.UserInfo, error)
 }
 
+func isBackendQuotaExceeded(err error) bool {
+	return errors.Is(err, backend.ErrStorageQuotaExceeded) ||
+		errors.Is(err, backend.ErrFileSizeQuotaExceeded) ||
+		errors.Is(err, backend.ErrFileCountQuotaExceeded)
+}
+
 type autoEmbeddingSchemaProvisioner interface {
 	InitSchemaForAutoEmbeddingProfile(context.Context, string, tenantschema.TiDBAutoEmbeddingProfile) error
 }
@@ -1709,7 +1715,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 				errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 				return
 			}
-			if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			if isBackendQuotaExceeded(err) {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_storage_quota_exceeded", "path", path, "error", err)...)
 				metricEvent(r.Context(), "fs_write", "result", "error")
 				errJSON(w, http.StatusInsufficientStorage, err.Error())
@@ -1800,7 +1806,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_storage_quota_exceeded", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusInsufficientStorage, err.Error())
@@ -1913,7 +1919,7 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_storage_quota_exceeded", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_patch", "result", "error")
 			errJSON(w, http.StatusInsufficientStorage, err.Error())
@@ -2011,7 +2017,7 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_storage_quota_exceeded", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_append", "result", "error")
 			errJSON(w, http.StatusInsufficientStorage, err.Error())
@@ -2739,7 +2745,7 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_storage_quota_exceeded", "path", path, "error", err)...)
 			errJSON(w, http.StatusInsufficientStorage, err.Error())
 			return
@@ -2908,7 +2914,7 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_storage_quota_exceeded", "path", req.Path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusInsufficientStorage, err.Error())
@@ -3380,7 +3386,7 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_storage_quota_exceeded", "path", req.Path, "error", err)...)
 			metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
 			errJSON(w, http.StatusInsufficientStorage, err.Error())

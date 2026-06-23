@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/mem9-ai/drive9/pkg/meta"
 )
 
 func newServerQuotaBackend(t *testing.T, opts Options) (*Dat9Backend, *fakeMetaQuotaStore) {
@@ -19,6 +20,8 @@ func newServerQuotaBackend(t *testing.T, opts Options) (*Dat9Backend, *fakeMetaQ
 	fake.config["tenant-a"] = &QuotaConfigView{
 		TenantID:         "tenant-a",
 		MaxStorageBytes:  1 << 30,
+		MaxFileSizeBytes: meta.DefaultMaxFileSizeBytes(),
+		MaxFileCount:     0,
 		MaxMediaLLMFiles: 1000,
 		MaxMonthlyCostMC: 1 << 30,
 	}
@@ -79,6 +82,52 @@ func TestServerQuotaFeatureFlagRejectsOverLimitWrite(t *testing.T) {
 	}
 }
 
+func TestServerQuotaRejectsOverFileSizeLimit(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	ctx := context.Background()
+
+	fake.mu.Lock()
+	fake.config["tenant-a"].MaxFileSizeBytes = 4
+	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(ctx)
+
+	if _, err := b.WriteCtx(ctx, "/too-large.txt", []byte("12345"), 0, filesystem.WriteFlagCreate); !errors.Is(err, ErrFileSizeQuotaExceeded) {
+		t.Fatalf("write error = %v, want ErrFileSizeQuotaExceeded", err)
+	}
+	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.StorageBytes != 0 || usage.FileCount != 0 {
+		t.Fatalf("usage after rejected write = %+v, want zero", usage)
+	}
+}
+
+func TestServerQuotaPendingOutboxFileDeltaRejectsOverFileCount(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	fake.mu.Lock()
+	fake.config["tenant-a"].MaxFileCount = 1
+	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(ctx)
+
+	if _, err := b.WriteCtx(ctx, "/first.txt", []byte("a"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.FileCount != 0 {
+		t.Fatalf("central file count before outbox drain = %d, want 0", usage.FileCount)
+	}
+	if _, err := b.WriteCtx(ctx, "/second.txt", []byte("b"), 0, filesystem.WriteFlagCreate); !errors.Is(err, ErrFileCountQuotaExceeded) {
+		t.Fatalf("second write error = %v, want ErrFileCountQuotaExceeded", err)
+	}
+}
+
 func TestServerModeBudgetGateWritesCentralOnly(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{
 		LLMCostBudget: LLMCostBudgetOptions{
@@ -136,7 +185,7 @@ func TestServerQuotaUploadOverwriteDeltaIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get central usage: %v", err)
 	}
-	if usage.StorageBytes != totalSize || usage.ReservedBytes != 0 || usage.MediaFileCount != 1 {
+	if usage.StorageBytes != totalSize || usage.ReservedBytes != 0 || usage.FileCount != 1 || usage.MediaFileCount != 1 {
 		t.Fatalf("usage after overwrite upload = %+v", usage)
 	}
 
@@ -232,6 +281,7 @@ func TestMutationReplayWorkerAppliesPendingUploadComplete(t *testing.T) {
 		TenantID:       "tenant-a",
 		StorageBytes:   7,
 		ReservedBytes:  32,
+		FileCount:      1,
 		MediaFileCount: 1,
 	}
 	fake.fileMeta[metaKey("tenant-a", "file-1")] = &FileMetaView{

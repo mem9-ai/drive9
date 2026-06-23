@@ -142,6 +142,7 @@ func main() {
 		}
 	}
 	backendOpts.MaxUploadBytes = maxUploadBytes
+	meta.SetDefaultMaxFileSizeBytes(maxUploadBytes)
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_backend_options")
 
 	stepStart = time.Now()

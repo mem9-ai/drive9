@@ -277,6 +277,9 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 
 	var quotaOutboxEnqueued bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
+			return err
+		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
 			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
 			StorageEncryptionMode:  storageEncryptionMode,
@@ -338,6 +341,9 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
 		return err
 	}
+	if err := b.ensureFileSizeQuota(ctx, int64(len(data))); err != nil {
+		return err
+	}
 	fileID := b.genID()
 	now := time.Now()
 	checksum := sha256sum(data)
@@ -345,6 +351,9 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 	var quotaOutboxEnqueued bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		if err := b.ensureStorageQuota(ctx, tx, linkPath, int64(len(data))); err != nil {
+			return err
+		}
+		if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
 			return err
 		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
@@ -801,6 +810,9 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
 		return 0, err
 	}
+	if err := b.ensureFileSizeQuota(ctx, int64(len(data))); err != nil {
+		return 0, err
+	}
 	fileID := b.genID()
 	now := time.Now()
 
@@ -856,6 +868,9 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		semanticTaskEnqueued = false
 		quotaOutboxEnqueued = false
 		if err := b.ensureStorageQuota(ctx, tx, path, int64(len(data))); err != nil {
+			return err
+		}
+		if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
 			return err
 		}
 		fileRev := int64(1)
@@ -1043,6 +1058,9 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	}
 
 	if err := b.ensureUploadSizeAllowed(int64(len(finalData))); err != nil {
+		return 0, 0, err
+	}
+	if err := b.ensureFileSizeQuota(ctx, int64(len(finalData))); err != nil {
 		return 0, 0, err
 	}
 	finalSize = int64(len(finalData))

@@ -173,6 +173,9 @@ func applyCentralQuotaMutationTx(store MetaQuotaStore, tx *sql.Tx, tenantID, mut
 				return err
 			}
 		}
+		if err := store.IncrFileCountTx(tx, tenantID, -1); err != nil {
+			return err
+		}
 		if data.IsMedia {
 			if err := store.IncrMediaFileCountTx(tx, tenantID, -1); err != nil {
 				return err

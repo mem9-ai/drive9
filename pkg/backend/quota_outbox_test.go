@@ -40,7 +40,7 @@ func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get usage: %v", err)
 	}
-	if usage.StorageBytes != 0 || usage.MediaFileCount != 0 {
+	if usage.StorageBytes != 0 || usage.FileCount != 0 || usage.MediaFileCount != 0 {
 		t.Fatalf("central usage before outbox drain = %+v, want zero", usage)
 	}
 
@@ -58,7 +58,7 @@ func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get usage after drain: %v", err)
 	}
-	if usage.StorageBytes != int64(len("png-data")) || usage.MediaFileCount != 1 {
+	if usage.StorageBytes != int64(len("png-data")) || usage.FileCount != 1 || usage.MediaFileCount != 1 {
 		t.Fatalf("central usage after outbox drain = %+v", usage)
 	}
 }
@@ -239,7 +239,7 @@ func TestServerQuotaPendingOutboxDeltaRejectsUploadReserve(t *testing.T) {
 		t.Fatalf("central usage before outbox drain = %+v, want zero", usage)
 	}
 
-	reserved, err := b.reserveUploadOnServer(ctx, "upload-pending", "/upload.bin", 3)
+	reserved, err := b.reserveUploadOnServer(ctx, "upload-pending", "/upload.bin", 3, 0)
 	if !errors.Is(err, ErrStorageQuotaExceeded) {
 		t.Fatalf("reserve error = %v, want ErrStorageQuotaExceeded", err)
 	}
@@ -265,14 +265,14 @@ func TestServerQuotaReserveUploadRetrySkipsPendingPrecheck(t *testing.T) {
 	fake.mu.Unlock()
 	b.quotaConfigCache.refresh(ctx)
 
-	reserved, err := b.reserveUploadOnServer(ctx, "upload-retry", "/upload.bin", 8)
+	reserved, err := b.reserveUploadOnServer(ctx, "upload-retry", "/upload.bin", 8, 0)
 	if err != nil {
 		t.Fatalf("first reserve: %v", err)
 	}
 	if !reserved {
 		t.Fatal("first reserve returned false, want true")
 	}
-	reserved, err = b.reserveUploadOnServer(ctx, "upload-retry", "/upload.bin", 8)
+	reserved, err = b.reserveUploadOnServer(ctx, "upload-retry", "/upload.bin", 8, 0)
 	if err != nil {
 		t.Fatalf("retry reserve: %v", err)
 	}
@@ -371,8 +371,8 @@ func TestApplyCentralFileMutationIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get usage: %v", err)
 	}
-	if usage.StorageBytes != 9 || usage.MediaFileCount != 1 {
-		t.Fatalf("usage after duplicate apply = %+v, want storage=9 media=1", usage)
+	if usage.StorageBytes != 9 || usage.FileCount != 1 || usage.MediaFileCount != 1 {
+		t.Fatalf("usage after duplicate apply = %+v, want storage=9 files=1 media=1", usage)
 	}
 }
 

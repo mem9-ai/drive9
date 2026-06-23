@@ -142,12 +142,14 @@ func (b *Dat9Backend) logAndEnqueueMutation(ctx context.Context, mutationType st
 func applyCentralFileStateTx(store MetaQuotaStore, tx *sql.Tx, tenantID, fileID string, sizeBytes int64, isMedia bool) error {
 	oldSize := int64(0)
 	oldIsMedia := false
+	oldExists := false
 	old, err := store.GetFileMetaForUpdateTx(tx, tenantID, fileID)
 	if err != nil {
 		if !errors.Is(err, meta.ErrNotFound) {
 			return err
 		}
 	} else if old != nil {
+		oldExists = true
 		oldSize = old.SizeBytes
 		oldIsMedia = old.IsMedia
 	}
@@ -162,6 +164,11 @@ func applyCentralFileStateTx(store MetaQuotaStore, tx *sql.Tx, tenantID, fileID 
 	storageDelta := sizeBytes - oldSize
 	if storageDelta != 0 {
 		if err := store.IncrStorageBytesTx(tx, tenantID, storageDelta); err != nil {
+			return err
+		}
+	}
+	if !oldExists {
+		if err := store.IncrFileCountTx(tx, tenantID, 1); err != nil {
 			return err
 		}
 	}

@@ -208,7 +208,10 @@ func newForkCleanupTestRuntime(t *testing.T) *forkCleanupTestRuntime {
 	db := newTestDBInfo(t)
 	cleanupForkTestTables(t, db.Meta)
 	prov := &fakeBranchProvisioner{}
-	server := NewWithConfig(Config{Meta: db.Meta, Pool: db.Pool, Provisioner: prov, TokenSecret: []byte("ctx-fork-test-secret")})
+	server := NewWithConfig(Config{TokenSecret: []byte("ctx-fork-test-secret")})
+	server.meta = db.Meta
+	server.pool = db.Pool
+	server.provisioner = prov
 	t.Cleanup(server.Close)
 	return &forkCleanupTestRuntime{server: server, meta: db.Meta, pool: db.Pool, prov: prov, dbHost: db.DBHost, dbPort: db.DBPort, dbUser: db.DBUser, dbPass: db.DBPass, dbName: db.DBName}
 }

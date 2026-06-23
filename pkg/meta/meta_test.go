@@ -1143,6 +1143,8 @@ func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
 		columns: map[string]metaColumnMeta{
 			"tenant_id":           {columnType: "varchar(64)"},
 			"max_storage_bytes":   {columnType: "bigint"},
+			"max_file_size_bytes": {columnType: "bigint"},
+			"max_file_count":      {columnType: "bigint"},
 			"max_media_llm_files": {columnType: "bigint"},
 			"max_monthly_cost_mc": {columnType: "bigint"},
 			"created_at":          {columnType: "datetime(3)"},
@@ -1152,6 +1154,8 @@ func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
 	createStmt := `CREATE TABLE tenant_quota_config (
 		tenant_id VARCHAR(64) NOT NULL,
 		max_storage_bytes BIGINT NOT NULL,
+		max_file_size_bytes BIGINT NOT NULL,
+		max_file_count BIGINT NOT NULL,
 		max_media_llm_files BIGINT NOT NULL,
 		max_monthly_cost_mc BIGINT NOT NULL,
 		created_at DATETIME(3) NOT NULL,

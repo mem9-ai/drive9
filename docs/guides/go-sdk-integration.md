@@ -100,15 +100,22 @@ if err != nil {
 	return err
 }
 _ = quota.Config.MaxStorageSize
+_ = quota.Config.MaxFileSize
+_ = quota.Config.MaxFileCount
 _ = quota.Config.TiDBCloudSpendingLimit
+_ = quota.Usage.FileCount
 ```
 
 Set quota for a `tidb_cloud_native` tenant with TiDB Cloud credentials.
-`MaxStorageSize` is in Mi. `TiDBCloudSpendingLimit` updates the TiDB Cloud
-Cluster Spending Limit.
+`MaxStorageSize` and `MaxFileSize` are in Mi. `MaxFileSize` must be no larger
+than the server `DRIVE9_MAX_UPLOAD_BYTES` limit. `MaxFileCount` uses `0` for
+unlimited. `TiDBCloudSpendingLimit` updates the TiDB Cloud Cluster Spending
+Limit.
 
 ```go
 storageSize := int64(102400)
+fileSize := int64(1024)
+fileCount := int64(100000)
 spendingLimit := int64(10000)
 
 quota, err := drive9.New(serverURL, "").SetQuota(ctx, drive9.QuotaSetRequest{
@@ -116,6 +123,8 @@ quota, err := drive9.New(serverURL, "").SetQuota(ctx, drive9.QuotaSetRequest{
 	PublicKey:              tidbCloudPublicKey,
 	PrivateKey:             tidbCloudPrivateKey,
 	MaxStorageSize:         &storageSize,
+	MaxFileSize:            &fileSize,
+	MaxFileCount:           &fileCount,
 	TiDBCloudSpendingLimit: &spendingLimit,
 })
 if err != nil {
