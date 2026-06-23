@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -183,6 +184,72 @@ func TestQuotaSetSendsTiDBCloudCredentialBody(t *testing.T) {
 	}
 }
 
+func TestQuotaSetRegionCodeSelectsTiDBCloudServer(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+
+	var nativeHits int32
+	var starterHits int32
+	var gotBody map[string]any
+	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&nativeHits, 1)
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/quota" {
+			t.Fatalf("unexpected native request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(quotaTestResponse("tenant-1"))
+	}))
+	defer native.Close()
+	starter := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&starterHits, 1)
+		http.Error(w, "starter server should not be used", http.StatusInternalServerError)
+	}))
+	defer starter.Close()
+	manifest := newRegionManifestTestServer(t, []RegionManifestEntry{
+		{
+			RegionCode: "aws-us-east-1",
+			Mode:       RegionModeTiDBCloudStarter,
+			ServerURL:  starter.URL,
+		},
+		{
+			RegionCode: "aws-us-east-1",
+			Mode:       RegionModeTiDBCloudNative,
+			ServerURL:  native.URL,
+		},
+	})
+	defer manifest.Close()
+
+	t.Setenv(EnvRegionManifestURL, manifest.URL)
+	resetCredentialCacheForTest()
+
+	if _, err := captureStdoutE(t, func() error {
+		return Quota([]string{
+			"set",
+			"--region-code", "aws-us-east-1",
+			"--tenant-id", "tenant-1",
+			"--tidbcloud-public-key", "public-1",
+			"--tidbcloud-private-key", "private-1",
+			"--max-storage-bytes", "1000",
+		})
+	}); err != nil {
+		t.Fatalf("Quota set: %v", err)
+	}
+	if atomic.LoadInt32(&nativeHits) != 1 {
+		t.Fatalf("native hits = %d, want 1", nativeHits)
+	}
+	if atomic.LoadInt32(&starterHits) != 0 {
+		t.Fatalf("starter hits = %d, want 0", starterHits)
+	}
+	if gotBody["tenant_id"] != "tenant-1" || gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
+		t.Fatalf("body credentials = %#v", gotBody)
+	}
+	if gotBody["max_storage_bytes"] != float64(1000) {
+		t.Fatalf("body quota = %#v", gotBody)
+	}
+}
+
 func TestQuotaSetRejectsMissingTiDBCloudCredentials(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)
@@ -196,6 +263,29 @@ func TestQuotaSetRejectsMissingTiDBCloudCredentials(t *testing.T) {
 		t.Fatal("Quota set error = nil, want missing credential error")
 	}
 	if !strings.Contains(err.Error(), "TiDB Cloud credentials are required") {
+		t.Fatalf("error = %q", err)
+	}
+}
+
+func TestQuotaGetStatusErrorIncludesHTTPCode(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"no permission to query quota with TiDB Cloud API key"}`))
+	}))
+	defer ts.Close()
+
+	t.Setenv(EnvServer, ts.URL)
+	t.Setenv(EnvAPIKey, "owner-key")
+	resetCredentialCacheForTest()
+
+	err := Quota([]string{"get"})
+	if err == nil {
+		t.Fatal("Quota get error = nil, want status error")
+	}
+	if !strings.Contains(err.Error(), "query quota failed (HTTP 403): no permission to query quota with TiDB Cloud API key") {
 		t.Fatalf("error = %q", err)
 	}
 }

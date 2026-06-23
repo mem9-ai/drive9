@@ -84,57 +84,14 @@ capability token, such as a vault JWT. Filesystem commands normally use
 
 ## Quota API
 
-The SDK does not yet expose typed quota helpers. Use `RawGet` and `RawPost`
-for the quota endpoints, or use the `drive9 quota` CLI. See
+The SDK exposes typed quota helpers in `pkg/client`; with this guide's import
+alias they return `*drive9.QuotaResponse`. See
 [`docs/guides/quota.md`](quota.md) for the full CLI and HTTP reference.
-
-All quota endpoints return the same response shape:
-
-```go
-type quotaConfig struct {
-	MaxStorageBytes  int64 `json:"max_storage_bytes"`
-	MaxMediaLLMFiles int64 `json:"max_media_llm_files"`
-	MaxMonthlyCostMC int64 `json:"max_monthly_cost_mc"`
-}
-
-type quotaUsage struct {
-	StorageBytes   int64 `json:"storage_bytes"`
-	ReservedBytes  int64 `json:"reserved_bytes"`
-	MediaFileCount int64 `json:"media_file_count"`
-	MonthlyCostMC  int64 `json:"monthly_cost_mc"`
-}
-
-type quotaResponse struct {
-	TenantID       string      `json:"tenant_id"`
-	Provider       string      `json:"provider"`
-	Status         string      `json:"status"`
-	SupportsUpdate bool        `json:"supports_update"`
-	Config         quotaConfig `json:"config"`
-	Usage          quotaUsage  `json:"usage"`
-}
-
-func decodeQuotaResponse(resp *http.Response, action string) (*quotaResponse, error) {
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("%s status %d: %s", action, resp.StatusCode, body)
-	}
-	var out quotaResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	return &out, nil
-}
-```
 
 Query quota for the tenant represented by an owner API key:
 
 ```go
-resp, err := drive9.New(serverURL, ownerAPIKey).RawGet("/v1/quota")
-if err != nil {
-	return err
-}
-quota, err := decodeQuotaResponse(resp, "quota get")
+quota, err := drive9.New(serverURL, ownerAPIKey).GetQuota(ctx)
 if err != nil {
 	return err
 }
@@ -144,20 +101,11 @@ _ = quota
 Query a `tidb_cloud_native` tenant with TiDB Cloud credentials:
 
 ```go
-body, err := json.Marshal(map[string]string{
-	"tenant_id":   "tnt_abc123",
-	"public_key":  tidbCloudPublicKey,
-	"private_key": tidbCloudPrivateKey,
+quota, err := drive9.New(serverURL, "").QueryQuotaWithCredentials(ctx, drive9.QuotaCredentialRequest{
+	TenantID:   "tnt_abc123",
+	PublicKey:  tidbCloudPublicKey,
+	PrivateKey: tidbCloudPrivateKey,
 })
-if err != nil {
-	return err
-}
-
-resp, err := drive9.New(serverURL, "").RawPost("/v1/quota/query", bytes.NewReader(body))
-if err != nil {
-	return err
-}
-quota, err := decodeQuotaResponse(resp, "quota query")
 if err != nil {
 	return err
 }
@@ -167,23 +115,18 @@ _ = quota
 Set quota for a `tidb_cloud_native` tenant with TiDB Cloud credentials:
 
 ```go
-body, err := json.Marshal(map[string]any{
-	"tenant_id":            "tnt_abc123",
-	"public_key":           tidbCloudPublicKey,
-	"private_key":          tidbCloudPrivateKey,
-	"max_storage_bytes":    int64(107374182400),
-	"max_media_llm_files":  int64(500),
-	"max_monthly_cost_mc":  int64(0), // disables the monthly LLM budget
-})
-if err != nil {
-	return err
-}
+storageBytes := int64(107374182400)
+mediaFiles := int64(500)
+monthlyCost := int64(0) // disables the monthly LLM budget
 
-resp, err := drive9.New(serverURL, "").RawPost("/v1/quota", bytes.NewReader(body))
-if err != nil {
-	return err
-}
-quota, err := decodeQuotaResponse(resp, "quota set")
+quota, err := drive9.New(serverURL, "").SetQuotaWithCredentials(ctx, drive9.QuotaSetRequest{
+	TenantID:            "tnt_abc123",
+	PublicKey:           tidbCloudPublicKey,
+	PrivateKey:          tidbCloudPrivateKey,
+	MaxStorageBytes:     &storageBytes,
+	MaxMediaLLMFiles:    &mediaFiles,
+	MaxMonthlyCostMC:    &monthlyCost,
+})
 if err != nil {
 	return err
 }

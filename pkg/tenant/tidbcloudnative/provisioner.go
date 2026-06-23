@@ -665,7 +665,7 @@ func readUpstreamBody(r io.Reader, limit int64) ([]byte, error) {
 	}
 	raw, err := io.ReadAll(io.LimitReader(r, limit))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read upstream response body: %w", err)
 	}
 	return raw, nil
 }

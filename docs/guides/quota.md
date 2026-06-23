@@ -74,11 +74,11 @@ drive9 quota get --json
 ```
 
 Use TiDB Cloud credentials and `--tenant-id` when you need to query a
-cloud-native tenant without a Drive9 owner API key.
+TiDBCloud mode tenant without a Drive9 owner API key.
 
 ```bash
 drive9 quota get \
-  --server https://drive9.example.com \
+  --region-code aws-ap-southeast-1 \
   --tenant-id tnt_abc123 \
   --tidbcloud-public-key <tidbcloud-public-key> \
   --tidbcloud-private-key <tidbcloud-private-key> \
@@ -91,17 +91,18 @@ You may provide TiDB Cloud keys through environment variables:
 export DRIVE9_PUBLIC_KEY=<tidbcloud-public-key>
 export DRIVE9_PRIVATE_KEY=<tidbcloud-private-key>
 
-drive9 quota get --server https://drive9.example.com --tenant-id tnt_abc123
+drive9 quota get --region-code aws-ap-southeast-1 --tenant-id tnt_abc123
 ```
 
 Environment TiDB Cloud keys do not change plain `drive9 quota get` behavior.
 Credential-based quota query is selected only when `--tenant-id` is present.
 
-Set quota with `drive9 quota set`. Pass at least one quota field.
+Set quota with `drive9 quota set`. Only TiDBCloud mode supports quota set.
+Pass at least one quota field.
 
 ```bash
 drive9 quota set \
-  --server https://drive9.example.com \
+  --region-code aws-ap-southeast-1 \
   --tenant-id tnt_abc123 \
   --tidbcloud-public-key <tidbcloud-public-key> \
   --tidbcloud-private-key <tidbcloud-private-key> \
@@ -114,12 +115,15 @@ Partial updates preserve unspecified fields atomically.
 
 ```bash
 drive9 quota set \
-  --server https://drive9.example.com \
+  --region-code aws-ap-southeast-1 \
   --tenant-id tnt_abc123 \
   --tidbcloud-public-key <tidbcloud-public-key> \
   --tidbcloud-private-key <tidbcloud-private-key> \
   --max-storage-bytes 214748364800
 ```
+
+Use `--server` instead of `--region-code` when targeting a known Drive9 server
+URL directly. If both are present, `--server` wins.
 
 Validation rules:
 

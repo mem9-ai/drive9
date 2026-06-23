@@ -32,7 +32,7 @@ func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
 		t.Fatalf("central mutation log writes = %d, want 0", mutationCount)
 	}
 
-	if got := countQuotaOutboxRowsByFile(t, b, fileID, datastore.QuotaOutboxQueued); got != 1 {
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, fileID, datastore.QuotaOutboxQueued); got != 1 {
 		t.Fatalf("queued quota outbox rows = %d, want 1", got)
 	}
 	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
@@ -50,7 +50,7 @@ func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
 	if !processed {
 		t.Fatal("expected one quota outbox row to be processed")
 	}
-	if got := countQuotaOutboxRowsByFile(t, b, fileID, datastore.QuotaOutboxSucceeded); got != 1 {
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, fileID, datastore.QuotaOutboxSucceeded); got != 1 {
 		t.Fatalf("succeeded quota outbox rows = %d, want 1", got)
 	}
 	usage, err = fake.GetQuotaUsage(ctx, "tenant-a")
@@ -91,7 +91,7 @@ func TestServerQuotaPendingOutboxDeltaRejectsOverLimitWrite(t *testing.T) {
 	if !errors.Is(err, ErrStorageQuotaExceeded) {
 		t.Fatalf("second write error = %v, want ErrStorageQuotaExceeded", err)
 	}
-	if got := countQuotaOutboxRowsByFile(t, b, first.File.FileID, datastore.QuotaOutboxQueued); got != 1 {
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, first.File.FileID, datastore.QuotaOutboxQueued); got != 1 {
 		t.Fatalf("queued quota outbox rows after rejected write = %d, want 1", got)
 	}
 }
@@ -185,7 +185,7 @@ func TestServerQuotaOverwriteOutboxUsesLockedCurrentMeta(t *testing.T) {
 		t.Fatalf("stale overwrite: %v", err)
 	}
 
-	delta := latestQuotaOutboxStorageDeltaByFile(t, b, stale.File.FileID)
+	delta := latestQuotaOutboxStorageDeltaByFile(t, ctx, b, stale.File.FileID)
 	if delta != -15 {
 		t.Fatalf("latest outbox storage_delta = %d, want -15", delta)
 	}
@@ -254,19 +254,19 @@ func TestApplyCentralFileMutationIsIdempotent(t *testing.T) {
 	}
 }
 
-func countQuotaOutboxRowsByFile(t *testing.T, b *Dat9Backend, fileID string, status datastore.QuotaOutboxStatus) int {
+func countQuotaOutboxRowsByFile(t *testing.T, ctx context.Context, b *Dat9Backend, fileID string, status datastore.QuotaOutboxStatus) int {
 	t.Helper()
 	var count int
-	if err := b.Store().DB().QueryRow(`SELECT COUNT(*) FROM quota_outbox WHERE file_id = ? AND status = ?`, fileID, status).Scan(&count); err != nil {
+	if err := b.Store().DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox WHERE file_id = ? AND status = ?`, fileID, status).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	return count
 }
 
-func latestQuotaOutboxStorageDeltaByFile(t *testing.T, b *Dat9Backend, fileID string) int64 {
+func latestQuotaOutboxStorageDeltaByFile(t *testing.T, ctx context.Context, b *Dat9Backend, fileID string) int64 {
 	t.Helper()
 	var delta int64
-	if err := b.Store().DB().QueryRow(`SELECT storage_delta FROM quota_outbox
+	if err := b.Store().DB().QueryRowContext(ctx, `SELECT storage_delta FROM quota_outbox
 		WHERE file_id = ? AND mutation_type = ?
 		ORDER BY id DESC LIMIT 1`, fileID, quotaMutationTypeOverwrite).Scan(&delta); err != nil {
 		t.Fatal(err)

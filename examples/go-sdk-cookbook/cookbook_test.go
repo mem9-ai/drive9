@@ -224,6 +224,38 @@ func ExampleClient_tokensAndVault() {
 	_ = owner.DeleteVaultSecret(ctx, "prod-db")
 }
 
+func ExampleClient_quota() {
+	ctx := context.Background()
+	serverURL := "https://drive9.example.com"
+
+	owner := drive9.New(serverURL, "owner-api-key")
+	quota, err := owner.GetQuota(ctx)
+	if err == nil {
+		_ = quota.Config.MaxStorageBytes
+	}
+
+	tidbCloudPublicKey := "tidbcloud-public-key"
+	tidbCloudPrivateKey := "tidbcloud-private-key"
+	tenantID := "tnt_abc123"
+	credentialClient := drive9.New(serverURL, "")
+
+	_, _ = credentialClient.QueryQuotaWithCredentials(ctx, drive9.QuotaCredentialRequest{
+		TenantID:   tenantID,
+		PublicKey:  tidbCloudPublicKey,
+		PrivateKey: tidbCloudPrivateKey,
+	})
+
+	storageBytes := int64(100 << 30)
+	monthlyCost := int64(0)
+	_, _ = credentialClient.SetQuotaWithCredentials(ctx, drive9.QuotaSetRequest{
+		TenantID:         tenantID,
+		PublicKey:        tidbCloudPublicKey,
+		PrivateKey:       tidbCloudPrivateKey,
+		MaxStorageBytes:  &storageBytes,
+		MaxMonthlyCostMC: &monthlyCost,
+	})
+}
+
 func ExampleClient_eventsLayersGitAndJournal() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -415,6 +447,7 @@ var coveredClientMethods = map[string]bool{
 	"GetGitState":                          true,
 	"GetGitWorkspace":                      true,
 	"GetGitWorkspaceByRoot":                true,
+	"GetQuota":                             true,
 	"Grep":                                 true,
 	"GrepWithLayer":                        true,
 	"Hardlink":                             true,
@@ -441,6 +474,7 @@ var coveredClientMethods = map[string]bool{
 	"PatchFile":                            true,
 	"PutGitObjectPack":                     true,
 	"PutGitOverlayEntry":                   true,
+	"QueryQuotaWithCredentials":            true,
 	"QueryVaultAudit":                      true,
 	"RawDelete":                            true,
 	"RawGet":                               true,
@@ -479,6 +513,7 @@ var coveredClientMethods = map[string]bool{
 	"SQL":                                  true,
 	"SearchJournal":                        true,
 	"SetActor":                             true,
+	"SetQuotaWithCredentials":              true,
 	"SetSmallFileThresholdForTests":        true,
 	"SmallFileThreshold":                   true,
 	"Stat":                                 true,

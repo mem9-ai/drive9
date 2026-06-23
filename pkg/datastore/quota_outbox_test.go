@@ -111,12 +111,13 @@ func TestQuotaOutboxRecoverExpired(t *testing.T) {
 func TestQuotaOutboxClaimWaitsForDelayedOlderRetry(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := time.Now().UTC()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	availableNow := now.Add(-time.Second)
 
 	firstID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
 		MutationType: "file_create",
 		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
-		AvailableAt:  now,
+		AvailableAt:  availableNow,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -124,7 +125,7 @@ func TestQuotaOutboxClaimWaitsForDelayedOlderRetry(t *testing.T) {
 	if _, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
 		MutationType: "file_overwrite",
 		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
-		AvailableAt:  now,
+		AvailableAt:  availableNow,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +148,7 @@ func TestQuotaOutboxClaimWaitsForDelayedOlderRetry(t *testing.T) {
 	if found {
 		t.Fatalf("claimed row while older retry delayed: %+v", claimed)
 	}
-	claimed, found, err = s.ClaimQuotaOutbox(ctx, retryAt, time.Minute)
+	claimed, found, err = s.ClaimQuotaOutbox(ctx, retryAt.Add(time.Second), time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}

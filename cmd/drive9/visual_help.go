@@ -474,10 +474,11 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Summary: "query or set tenant quota",
 			Details: []string{
 				"get uses the active owner API key unless --tenant-id and TiDB Cloud keys are provided",
-				"set is TiDBCloud-only and requires TiDB Cloud keys; Drive9 API keys cannot authorize quota updates",
+				"only TiDBCloud mode supports set; Drive9 API keys cannot authorize quota updates",
 			},
 			Flags: []visualHelpFlag{
 				{Name: "--server URL", Desc: "server URL; defaults to active context server"},
+				{Name: "--region-code CODE", Desc: "TiDBCloud mode region code; ignored when --server is set"},
 				{Name: "--tenant-id ID", Desc: "drive9 tenant id for TiDB Cloud credential query or set"},
 				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key"},
 				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key"},
@@ -488,7 +489,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			},
 			Examples: []visualHelpExample{
 				{Command: "drive9 quota get", Desc: "query the active tenant quota"},
-				{Command: "drive9 quota set --tenant-id tnt_xxx --max-storage-bytes 107374182400 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "set TiDBCloud tenant storage quota"},
+				{Command: "drive9 quota set --region-code aws-ap-southeast-1 --tenant-id tnt_xxx --max-storage-bytes 107374182400 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "set TiDBCloud mode tenant storage quota"},
 			},
 		},
 		{

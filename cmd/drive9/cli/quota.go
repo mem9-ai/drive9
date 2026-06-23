@@ -1,10 +1,10 @@
 package cli
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -12,24 +12,6 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
-
-type quotaCLIResponse struct {
-	TenantID       string `json:"tenant_id"`
-	Provider       string `json:"provider"`
-	Status         string `json:"status"`
-	SupportsUpdate bool   `json:"supports_update"`
-	Config         struct {
-		MaxStorageBytes  int64 `json:"max_storage_bytes"`
-		MaxMediaLLMFiles int64 `json:"max_media_llm_files"`
-		MaxMonthlyCostMC int64 `json:"max_monthly_cost_mc"`
-	} `json:"config"`
-	Usage struct {
-		StorageBytes   int64 `json:"storage_bytes"`
-		ReservedBytes  int64 `json:"reserved_bytes"`
-		MediaFileCount int64 `json:"media_file_count"`
-		MonthlyCostMC  int64 `json:"monthly_cost_mc"`
-	} `json:"usage"`
-}
 
 // Quota queries or updates tenant quota configuration.
 func Quota(args []string) error {
@@ -52,6 +34,8 @@ func Quota(args []string) error {
 func quotaGet(args []string) error {
 	serverFlag := ""
 	serverGiven := false
+	regionCodeFlag := ""
+	regionCodeGiven := false
 	apiKeyFlag := ""
 	apiKeyGiven := false
 	tenantID := ""
@@ -74,6 +58,13 @@ func quotaGet(args []string) error {
 			i++
 			serverFlag = args[i]
 			serverGiven = true
+		case "--region-code":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--region-code requires an argument")
+			}
+			i++
+			regionCodeFlag = args[i]
+			regionCodeGiven = true
 		case "--api-key":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--api-key requires an argument")
@@ -111,6 +102,9 @@ func quotaGet(args []string) error {
 	if err := rejectEmptyFlag("server", strings.TrimSpace(serverFlag), serverGiven); err != nil {
 		return err
 	}
+	if err := rejectEmptyFlag("region-code", strings.TrimSpace(regionCodeFlag), regionCodeGiven); err != nil {
+		return err
+	}
 	if err := rejectEmptyFlag("api-key", strings.TrimSpace(apiKeyFlag), apiKeyGiven); err != nil {
 		return err
 	}
@@ -127,10 +121,6 @@ func quotaGet(args []string) error {
 	r := ResolveCredentials()
 	envPublicKey := consumeEnv(EnvTiDBCloudPublicKey)
 	envPrivateKey := consumeEnv(EnvTiDBCloudPrivateKey)
-	server := strings.TrimSpace(serverFlag)
-	if server == "" {
-		server = r.Server
-	}
 	publicKey := strings.TrimSpace(publicKeyFlag)
 	if publicKey == "" {
 		publicKey = envPublicKey
@@ -141,23 +131,27 @@ func quotaGet(args []string) error {
 	}
 	tenantID = strings.TrimSpace(tenantID)
 
-	var out quotaCLIResponse
+	var out *client.QuotaResponse
 	if tenantIDGiven {
-		body, err := quotaCredentialBody(tenantID, publicKey, privateKey, nil)
+		server, err := quotaServer(serverFlag, regionCodeFlag, r.Server, true)
 		if err != nil {
 			return err
 		}
-		resp, err := client.New(server, "").RawPost("/v1/quota/query", body)
+		req, err := quotaCredentialRequest(tenantID, publicKey, privateKey)
 		if err != nil {
-			return fmt.Errorf("query quota failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if err := decodeQuotaCLIResponse(resp, "query quota", &out); err != nil {
 			return err
+		}
+		out, err = client.New(server, "").QueryQuotaWithCredentials(context.Background(), req)
+		if err != nil {
+			return quotaAPIError("query quota", err)
 		}
 	} else {
 		if publicKeyGiven || privateKeyGiven {
 			return fmt.Errorf("--tenant-id is required when using TiDB Cloud credentials")
+		}
+		server, err := quotaServer(serverFlag, regionCodeFlag, r.Server, false)
+		if err != nil {
+			return err
 		}
 		apiKey := strings.TrimSpace(apiKeyFlag)
 		if apiKey == "" && r.Kind == CredentialOwner {
@@ -166,13 +160,9 @@ func quotaGet(args []string) error {
 		if apiKey == "" {
 			return fmt.Errorf("quota get requires an owner API key, or --tenant-id with TiDB Cloud credentials")
 		}
-		resp, err := client.New(server, apiKey).RawGet("/v1/quota")
+		out, err = client.New(server, apiKey).GetQuota(context.Background())
 		if err != nil {
-			return fmt.Errorf("query quota failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-		if err := decodeQuotaCLIResponse(resp, "query quota", &out); err != nil {
-			return err
+			return quotaAPIError("query quota", err)
 		}
 	}
 	return printQuotaCLIResponse(out, asJSON)
@@ -181,6 +171,8 @@ func quotaGet(args []string) error {
 func quotaSet(args []string) error {
 	serverFlag := ""
 	serverGiven := false
+	regionCodeFlag := ""
+	regionCodeGiven := false
 	tenantID := ""
 	tenantIDGiven := false
 	publicKeyFlag := ""
@@ -204,6 +196,13 @@ func quotaSet(args []string) error {
 			i++
 			serverFlag = args[i]
 			serverGiven = true
+		case "--region-code":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--region-code requires an argument")
+			}
+			i++
+			regionCodeFlag = args[i]
+			regionCodeGiven = true
 		case "--tenant-id":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--tenant-id requires an argument")
@@ -264,6 +263,9 @@ func quotaSet(args []string) error {
 	if err := rejectEmptyFlag("server", strings.TrimSpace(serverFlag), serverGiven); err != nil {
 		return err
 	}
+	if err := rejectEmptyFlag("region-code", strings.TrimSpace(regionCodeFlag), regionCodeGiven); err != nil {
+		return err
+	}
 	if err := rejectEmptyFlag("tenant-id", strings.TrimSpace(tenantID), tenantIDGiven); err != nil {
 		return err
 	}
@@ -280,9 +282,9 @@ func quotaSet(args []string) error {
 	r := ResolveCredentials()
 	envPublicKey := consumeEnv(EnvTiDBCloudPublicKey)
 	envPrivateKey := consumeEnv(EnvTiDBCloudPrivateKey)
-	server := strings.TrimSpace(serverFlag)
-	if server == "" {
-		server = r.Server
+	server, err := quotaServer(serverFlag, regionCodeFlag, r.Server, true)
+	if err != nil {
+		return err
 	}
 	publicKey := strings.TrimSpace(publicKeyFlag)
 	if publicKey == "" {
@@ -292,51 +294,66 @@ func quotaSet(args []string) error {
 	if privateKey == "" {
 		privateKey = envPrivateKey
 	}
-	body, err := quotaCredentialBody(strings.TrimSpace(tenantID), publicKey, privateKey, map[string]*int64{
-		"max_storage_bytes":   maxStorageBytes,
-		"max_media_llm_files": maxMediaLLMFiles,
-		"max_monthly_cost_mc": maxMonthlyCostMC,
+	cred, err := quotaCredentialRequest(strings.TrimSpace(tenantID), publicKey, privateKey)
+	if err != nil {
+		return err
+	}
+	out, err := client.New(server, "").SetQuotaWithCredentials(context.Background(), client.QuotaSetRequest{
+		TenantID:         cred.TenantID,
+		PublicKey:        cred.PublicKey,
+		PrivateKey:       cred.PrivateKey,
+		MaxStorageBytes:  maxStorageBytes,
+		MaxMediaLLMFiles: maxMediaLLMFiles,
+		MaxMonthlyCostMC: maxMonthlyCostMC,
 	})
 	if err != nil {
-		return err
-	}
-	resp, err := client.New(server, "").RawPost("/v1/quota", body)
-	if err != nil {
-		return fmt.Errorf("set quota failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	var out quotaCLIResponse
-	if err := decodeQuotaCLIResponse(resp, "set quota", &out); err != nil {
-		return err
+		return quotaAPIError("set quota", err)
 	}
 	return printQuotaCLIResponse(out, asJSON)
 }
 
-func quotaCredentialBody(tenantID, publicKey, privateKey string, quotaFields map[string]*int64) (io.Reader, error) {
+func quotaServer(serverFlag, regionCodeFlag, fallbackServer string, includeEnvRegion bool) (string, error) {
+	regionCode := strings.TrimSpace(regionCodeFlag)
+	if strings.TrimSpace(serverFlag) == "" && regionCode == "" && includeEnvRegion {
+		regionCode = readTrimEnv(EnvRegionCode)
+	}
+	server, _, err := resolveProvisionServer(serverFlag, regionCode, RegionModeTiDBCloudNative, fallbackServer)
+	if err != nil {
+		return "", err
+	}
+	return server, nil
+}
+
+func quotaAPIError(action string, err error) error {
+	var statusErr *client.StatusError
+	if errors.As(err, &statusErr) {
+		msg := strings.TrimSpace(statusErr.Message)
+		if msg == "" {
+			msg = http.StatusText(statusErr.StatusCode)
+		}
+		if msg == "" {
+			msg = fmt.Sprintf("HTTP %d", statusErr.StatusCode)
+		}
+		return fmt.Errorf("%s failed (HTTP %d): %s", action, statusErr.StatusCode, msg)
+	}
+	return fmt.Errorf("%s failed: %w", action, err)
+}
+
+func quotaCredentialRequest(tenantID, publicKey, privateKey string) (client.QuotaCredentialRequest, error) {
 	tenantID = strings.TrimSpace(tenantID)
 	publicKey = strings.TrimSpace(publicKey)
 	privateKey = strings.TrimSpace(privateKey)
 	if tenantID == "" {
-		return nil, fmt.Errorf("--tenant-id is required")
+		return client.QuotaCredentialRequest{}, fmt.Errorf("--tenant-id is required")
 	}
 	if publicKey == "" || privateKey == "" {
-		return nil, fmt.Errorf("TiDB Cloud credentials are required; pass --tidbcloud-public-key and --tidbcloud-private-key or set %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
+		return client.QuotaCredentialRequest{}, fmt.Errorf("TiDB Cloud credentials are required; pass --tidbcloud-public-key and --tidbcloud-private-key or set %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
 	}
-	body := map[string]any{
-		"tenant_id":   tenantID,
-		"public_key":  publicKey,
-		"private_key": privateKey,
-	}
-	for key, value := range quotaFields {
-		if value != nil {
-			body[key] = *value
-		}
-	}
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	return bytes.NewReader(raw), nil
+	return client.QuotaCredentialRequest{
+		TenantID:   tenantID,
+		PublicKey:  publicKey,
+		PrivateKey: privateKey,
+	}, nil
 }
 
 func parseQuotaInt64Flag(name, raw string) (int64, error) {
@@ -347,32 +364,10 @@ func parseQuotaInt64Flag(name, raw string) (int64, error) {
 	return value, nil
 }
 
-func decodeQuotaCLIResponse(resp *http.Response, action string, out *quotaCLIResponse) error {
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read %s response: %w", action, err)
+func printQuotaCLIResponse(out *client.QuotaResponse, asJSON bool) error {
+	if out == nil {
+		return fmt.Errorf("quota response is empty")
 	}
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		_ = json.Unmarshal(raw, &errResp)
-		msg := strings.TrimSpace(errResp.Error)
-		if msg == "" {
-			msg = strings.TrimSpace(string(raw))
-		}
-		if msg == "" {
-			msg = http.StatusText(resp.StatusCode)
-		}
-		return fmt.Errorf("%s failed (HTTP %d): %s", action, resp.StatusCode, msg)
-	}
-	if err := json.Unmarshal(raw, out); err != nil {
-		return fmt.Errorf("decode %s response: %w", action, err)
-	}
-	return nil
-}
-
-func printQuotaCLIResponse(out quotaCLIResponse, asJSON bool) error {
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
@@ -396,7 +391,7 @@ query or set tenant quota.
 
 commands:
   get    query quota with an owner API key, or with TiDB Cloud credentials and tenant id
-  set    set cloud native quota with TiDB Cloud credentials and tenant id`
+  set    set TiDBCloud mode quota with TiDB Cloud credentials and tenant id`
 }
 
 func quotaGetUsage() string {
@@ -407,6 +402,7 @@ query quota. Without --tenant-id, uses the active owner API key. With
 
 flags:
   --server URL                    server URL (default: active context server)
+  --region-code CODE              TiDBCloud mode region code; ignored when --server is set
   --api-key KEY                   owner API key for current-tenant query
   --tenant-id ID                  drive9 tenant id for TiDB Cloud credential query
   --tidbcloud-public-key KEY      TiDB Cloud public key
@@ -417,11 +413,13 @@ flags:
 func quotaSetUsage() string {
 	return `usage: drive9 quota set [flags]
 
-set cloud native quota. This requires TiDB Cloud credentials and a drive9 tenant
-id. Drive9 tenant API keys are not accepted as authorization for quota updates.
+set quota for TiDBCloud mode tenants only. This requires TiDB Cloud credentials
+and a drive9 tenant id. Drive9 tenant API keys are not accepted as
+authorization for quota updates.
 
 flags:
   --server URL                    server URL (default: active context server)
+  --region-code CODE              TiDBCloud mode region code; ignored when --server is set
   --tenant-id ID                  drive9 tenant id
   --tidbcloud-public-key KEY      TiDB Cloud public key
   --tidbcloud-private-key KEY     TiDB Cloud private key
