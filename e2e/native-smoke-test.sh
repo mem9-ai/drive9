@@ -299,8 +299,17 @@ check_eq "fork tenant becomes active" "$fork_state" "active"
 
 printf "native-fork-%s" "$TS" > "$FORK_LOCAL"
 drive9_ctx ctx use "$FORK_CTX_NAME" >/dev/null
+
+# Ensure fork deletion is still attempted even if write/read checks fail.
+set +e
 drive9_ctx_retry fs cp "$FORK_LOCAL" ":$FORK_REMOTE" >/dev/null
+cp_code=$?
 fork_cat="$(drive9_ctx_retry fs cat "$FORK_REMOTE")"
+cat_code=$?
+set -e
+
+check_eq "fork context can write file" "$cp_code" "0"
+check_eq "fork context can read written file (exit code)" "$cat_code" "0"
 check_eq "fork context can read written file" "$fork_cat" "native-fork-${TS}"
 
 fork_delete_body="$(mktemp)"
