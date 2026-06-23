@@ -544,7 +544,7 @@ func TestDeleteTenantFallsBackToRawErrorBody(t *testing.T) {
 	if err == nil {
 		t.Fatal("DeleteTenant error = nil, want HTTP error")
 	}
-	if !strings.Contains(err.Error(), "upstream unavailable") {
+	if !strings.Contains(err.Error(), "status API returned HTTP 502") {
 		t.Fatalf("DeleteTenant error = %q", err)
 	}
 }
@@ -787,5 +787,37 @@ func TestDeleteTenantLiveTenantDoesNotCallForkDelete(t *testing.T) {
 	}
 	if forkCalled {
 		t.Fatal("/v1/fork was called for live tenant")
+	}
+}
+
+func TestDeleteTenantStatusMissingKindReturnsError(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/status" {
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "active"})
+			return
+		}
+		t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+	}))
+	defer ts.Close()
+
+	cfg := loadConfig()
+	if _, err := ctxAdd(cfg, "owner", &Context{Type: PrincipalOwner, APIKey: "owner-key", Server: ts.URL}); err != nil {
+		t.Fatalf("ctxAdd: %v", err)
+	}
+	if err := saveConfig(cfg); err != nil {
+		t.Fatalf("save config: %v", err)
+	}
+	resetCredentialCacheForTest()
+
+	_, err := captureStdoutE(t, func() error {
+		return DeleteTenant([]string{"-y"})
+	})
+	if err == nil {
+		t.Fatal("DeleteTenant error = nil, want kind error")
+	}
+	if !strings.Contains(err.Error(), "does not report tenant kind") {
+		t.Fatalf("error = %v, want kind error", err)
 	}
 }

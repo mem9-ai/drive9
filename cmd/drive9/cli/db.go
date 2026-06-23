@@ -460,8 +460,16 @@ func DeleteTenant(args []string) error {
 	}
 	c := client.New(server, apiKey)
 
-	if isFork, err := isCurrentTenantFork(c); err == nil && isFork {
+	kind, err := tenantKind(c)
+	if err != nil {
+		return fmt.Errorf("cannot determine tenant kind: %w", err)
+	}
+	switch kind {
+	case "fork":
 		return deleteForkAfterLiveRejection(server, apiKey, bodyBytes, asJSON)
+	case "live":
+	default:
+		return fmt.Errorf("unknown tenant kind %q; expected \"fork\" or \"live\"", kind)
 	}
 
 	resp, err := c.RawDelete("/v1/tenant", bodyReader)
@@ -578,24 +586,27 @@ func isTerminal(f *os.File) bool {
 	return (fi.Mode() & os.ModeCharDevice) != 0
 }
 
-func isCurrentTenantFork(c *client.Client) (bool, error) {
+func tenantKind(c *client.Client) (string, error) {
 	resp, err := c.RawGet("/v1/status")
 	if err != nil {
-		return false, err
+		return "", fmt.Errorf("status API request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return false, err
+		return "", fmt.Errorf("read status response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return false, fmt.Errorf("status API returned %d", resp.StatusCode)
+		return "", fmt.Errorf("status API returned HTTP %d", resp.StatusCode)
 	}
 	var status struct {
 		Kind string `json:"kind"`
 	}
 	_ = json.Unmarshal(raw, &status)
-	return status.Kind == "fork", nil
+	if status.Kind == "" {
+		return "", fmt.Errorf("server does not report tenant kind; upgrade server or contact administrator")
+	}
+	return status.Kind, nil
 }
 
 func deleteForkAfterLiveRejection(server, apiKey string, bodyBytes []byte, asJSON bool) error {
