@@ -120,7 +120,12 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 		})
 	}
 	headSeq = eb.Seq(ctx)
-	// If no new events, ok=true with empty slice (client is caught up).
-	// If we hit the limit, the client will poll again and get more.
+	// If no new events but the table is empty (all events pruned) and since > 0,
+	// the client's cursor is stale → send reset (like the old ring buffer's
+	// "since > newestSeq" case). If the table has events but none after since,
+	// the client is caught up → ok=true with empty slice.
+	if len(events) == 0 && headSeq == 0 && since > 0 {
+		return nil, headSeq, false
+	}
 	return events, headSeq, true
 }
