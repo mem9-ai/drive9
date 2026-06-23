@@ -17,8 +17,6 @@ import (
 	"go.uber.org/zap"
 )
 
-var leaderLifecycleMetaStoreDSN = testDSN
-
 // newLeaderLifecycleServer builds a fully-wired server with a disabled leader
 // manager (so onLead fires synchronously in NewWithConfig), an active tenant
 // backend cached in the pool, and the metaStore reset to a clean state. It
@@ -26,9 +24,9 @@ var leaderLifecycleMetaStoreDSN = testDSN
 // state. All resources are registered with t.Cleanup.
 func newLeaderLifecycleServer(t *testing.T) (*Server, *tenant.Pool, string) {
 	t.Helper()
-	initServerTenantSchema(t, leaderLifecycleMetaStoreDSN)
+	initServerTenantSchema(t, testDSN)
 
-	metaStore, err := meta.Open(leaderLifecycleMetaStoreDSN)
+	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +38,7 @@ func newLeaderLifecycleServer(t *testing.T) (*Server, *tenant.Pool, string) {
 	pool.SetMetaStore(metaStore)
 	t.Cleanup(func() { pool.Close() })
 
-	parsed, err := mysql.ParseDSN(leaderLifecycleMetaStoreDSN)
+	parsed, err := mysql.ParseDSN(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
