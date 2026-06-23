@@ -63,6 +63,39 @@ func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
 	}
 }
 
+func TestServerQuotaSmallWriteDoesNotWaitForAdmissionLock(t *testing.T) {
+	b, _ := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	lockTx, err := b.store.DB().BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin lock tx: %v", err)
+	}
+	if err := b.store.LockQuotaAdmissionTx(lockTx); err != nil {
+		_ = lockTx.Rollback()
+		t.Fatalf("lock quota admission: %v", err)
+	}
+	t.Cleanup(func() { _ = lockTx.Rollback() })
+
+	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, err := b.WriteCtx(writeCtx, "/lock-free-small.txt", []byte("payload"), 0, filesystem.WriteFlagCreate)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("small write while admission lock is held: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("small write waited on quota admission lock")
+	}
+}
+
 func TestQuotaOutboxWorkerHoldsAdmissionLockAcrossApplyAndAck(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
 	b.stopQuotaOutboxWorker()
