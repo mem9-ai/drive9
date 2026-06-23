@@ -13,12 +13,7 @@ import (
 
 func newTestStoreForEventBus(t *testing.T) *datastore.Store {
 	t.Helper()
-	inst, err := testmysql.Start(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = inst.Close(context.Background()) })
-	store, err := datastore.Open(inst.DSN)
+	store, err := datastore.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
