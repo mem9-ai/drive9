@@ -504,8 +504,8 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "--json", Desc: "available on show, fork, and ls"},
 				{Name: "--reveal", Desc: "show sensitive fields on ctx show"},
 				{Name: "--type <kind>|--scoped", Desc: "filter ctx ls results"},
-				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key for ctx fork"},
-				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key for ctx fork"},
+				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key for ctx fork in TiDBCloud mode"},
+				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key for ctx fork in TiDBCloud mode"},
 			},
 			Examples: []visualHelpExample{
 				{Command: "drive9 ctx show", Desc: "show active context"},
