@@ -81,7 +81,12 @@ func (w *objectGCWorker) loop(ctx context.Context) {
 	ticker := time.NewTicker(w.pollInterval)
 	defer ticker.Stop()
 	for {
-		w.processOnce(ctx)
+		if w.processOnce(ctx) {
+			// Fatal error (e.g. database closed) — stop the loop to avoid
+			// an infinite error-retry cycle that blocks test completion.
+			logger.Info(ctx, "object_gc_worker_stopped_fatal")
+			return
+		}
 		select {
 		case <-ctx.Done():
 			logger.Info(ctx, "object_gc_worker_stopped")
@@ -91,11 +96,17 @@ func (w *objectGCWorker) loop(ctx context.Context) {
 	}
 }
 
-func (w *objectGCWorker) processOnce(ctx context.Context) {
+// processOnce runs one GC poll cycle. Returns true if a fatal error occurred
+// (e.g. database closed) and the loop should stop; false to continue polling.
+func (w *objectGCWorker) processOnce(ctx context.Context) (fatal bool) {
 	candidates, err := w.meta.ListDueObjectGCCandidates(ctx, time.Now().UTC(), w.batchSize)
 	if err != nil {
+		if strings.Contains(err.Error(), "database is closed") || strings.Contains(err.Error(), "connection refused") {
+			logger.Info(ctx, "object_gc_worker_db_closed")
+			return true
+		}
 		logger.Warn(ctx, "object_gc_list_due_failed", zap.Error(err))
-		return
+		return false
 	}
 	for _, candidate := range candidates {
 		if err := w.processCandidate(ctx, candidate); err != nil {
@@ -106,6 +117,7 @@ func (w *objectGCWorker) processOnce(ctx context.Context) {
 			_ = w.meta.RetryObjectGCCandidate(ctx, candidate, time.Now().UTC().Add(defaultObjectGCRetryDelay), err.Error())
 		}
 	}
+	return false
 }
 
 func (w *objectGCWorker) processCandidate(ctx context.Context, candidate meta.ObjectGCCandidate) error {
