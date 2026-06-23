@@ -165,6 +165,7 @@ func main() {
 		}
 	}
 	backendOptions.MaxUploadBytes = maxUploadBytes
+	meta.SetDefaultMaxFileSizeBytes(maxUploadBytes)
 	providerType, err = tenant.NormalizeProvider(providerType)
 	if err != nil {
 		die(err)

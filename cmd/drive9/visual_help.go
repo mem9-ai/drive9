@@ -483,6 +483,8 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key"},
 				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key"},
 				{Name: "--max-storage-size Mi", Desc: "quota set: max confirmed+reserved storage size in Mi"},
+				{Name: "--max-file-size Mi", Desc: "quota set: max single file size in Mi"},
+				{Name: "--max-file-count N", Desc: "quota set: max confirmed file count; 0 means unlimited"},
 				{Name: "--tidbcloud-spending-limit N", Desc: "quota set: TiDB Cloud Cluster Spending Limit"},
 				{Name: "--json", Desc: "output result as JSON"},
 			},

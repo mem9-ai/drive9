@@ -21,6 +21,8 @@ type quotaRequest struct {
 	PublicKey              string `json:"public_key"`
 	PrivateKey             string `json:"private_key"`
 	MaxStorageSize         *int64 `json:"max_storage_size,omitempty"`
+	MaxFileSize            *int64 `json:"max_file_size,omitempty"`
+	MaxFileCount           *int64 `json:"max_file_count,omitempty"`
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
 }
 
@@ -35,12 +37,15 @@ type quotaResponse struct {
 
 type quotaConfigResponse struct {
 	MaxStorageSize         int64  `json:"max_storage_size"`
+	MaxFileSize            int64  `json:"max_file_size"`
+	MaxFileCount           int64  `json:"max_file_count"`
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
 }
 
 type quotaUsageResponse struct {
 	StorageBytes  int64 `json:"storage_bytes"`
 	ReservedBytes int64 `json:"reserved_bytes"`
+	FileCount     int64 `json:"file_count"`
 }
 
 const (
@@ -133,7 +138,7 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := validateQuotaSetRequest(req); err != nil {
+	if err := s.validateQuotaSetRequest(req); err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -154,20 +159,32 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusNotFound, "quota setting not enabled")
 		return
 	}
-	cloudCfg, err := updater.UpdateQuota(r.Context(), clusterInfoFromTenant(t), cred, tenant.QuotaUpdateOptions{
-		TiDBCloudSpendingLimitMonthly: req.TiDBCloudSpendingLimit,
-	})
+	cloudCfg, err := updater.MarkQuotaUpdateStarted(r.Context(), clusterInfoFromTenant(t), cred)
 	if err != nil {
 		writeQuotaCredentialError(w, r.Context(), err, "update")
 		return
 	}
-	if req.MaxStorageSize != nil {
-		maxStorageBytes, err := quotaStorageSizeToBytes(*req.MaxStorageSize)
+	if req.TiDBCloudSpendingLimit != nil {
+		updatedCloudCfg, err := updater.UpdateQuota(r.Context(), clusterInfoFromTenant(t), cred, tenant.QuotaUpdateOptions{
+			TiDBCloudSpendingLimitMonthly: req.TiDBCloudSpendingLimit,
+		})
 		if err != nil {
-			errJSON(w, http.StatusBadRequest, err.Error())
+			writeQuotaCredentialError(w, r.Context(), err, "update")
 			return
 		}
-		if err := s.meta.SetQuotaStorageBytes(r.Context(), t.ID, maxStorageBytes); err != nil {
+		if cloudCfg == nil {
+			cloudCfg = updatedCloudCfg
+		} else if updatedCloudCfg != nil && updatedCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
+			cloudCfg.TiDBCloudSpendingLimitMonthly = updatedCloudCfg.TiDBCloudSpendingLimitMonthly
+		}
+	}
+	quotaPatch, err := quotaConfigPatchFromRequest(req)
+	if err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if quotaPatch.MaxStorageBytes != nil || quotaPatch.MaxFileSizeBytes != nil || quotaPatch.MaxFileCount != nil {
+		if err := s.meta.SetQuotaConfigPatch(r.Context(), t.ID, quotaPatch); err != nil {
 			errJSON(w, http.StatusInternalServerError, "quota config update failed")
 			return
 		}
@@ -175,10 +192,6 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusInternalServerError, "quota usage initialization failed")
 			return
 		}
-	}
-	if err := updater.MarkQuotaUpdated(r.Context(), clusterInfoFromTenant(t), cred, cloudCfg); err != nil {
-		writeQuotaCredentialError(w, r.Context(), err, "update")
-		return
 	}
 	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, classifyTenantRequest(r))
 	s.writeQuotaResponse(w, r, t, cloudCfg)
@@ -214,9 +227,9 @@ func quotaCredentials(req quotaRequest) (tenant.CredentialProvisionRequest, erro
 	return tenant.CredentialProvisionRequest{PublicKey: req.PublicKey, PrivateKey: req.PrivateKey}, nil
 }
 
-func validateQuotaSetRequest(req quotaRequest) error {
-	if req.MaxStorageSize == nil && req.TiDBCloudSpendingLimit == nil {
-		return fmt.Errorf("at least one of max_storage_size or tidbcloud_spending_limit is required")
+func (s *Server) validateQuotaSetRequest(req quotaRequest) error {
+	if req.MaxStorageSize == nil && req.MaxFileSize == nil && req.MaxFileCount == nil && req.TiDBCloudSpendingLimit == nil {
+		return fmt.Errorf("at least one of max_storage_size, max_file_size, max_file_count, or tidbcloud_spending_limit is required")
 	}
 	if req.MaxStorageSize != nil && *req.MaxStorageSize <= 0 {
 		return fmt.Errorf("max_storage_size must be positive")
@@ -225,6 +238,21 @@ func validateQuotaSetRequest(req quotaRequest) error {
 		if _, err := quotaStorageSizeToBytes(*req.MaxStorageSize); err != nil {
 			return err
 		}
+	}
+	if req.MaxFileSize != nil && *req.MaxFileSize <= 0 {
+		return fmt.Errorf("max_file_size must be positive")
+	}
+	if req.MaxFileSize != nil {
+		maxFileSizeBytes, err := quotaFileSizeToBytes(*req.MaxFileSize)
+		if err != nil {
+			return err
+		}
+		if s.maxUploadBytes > 0 && maxFileSizeBytes > s.maxUploadBytes {
+			return fmt.Errorf("max_file_size must be less than or equal to server max upload size (%dMi)", s.maxUploadBytes/quotaStorageSizeBytes)
+		}
+	}
+	if req.MaxFileCount != nil && *req.MaxFileCount < 0 {
+		return fmt.Errorf("max_file_count must be non-negative")
 	}
 	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit < 0 {
 		return fmt.Errorf("tidbcloud_spending_limit must be non-negative")
@@ -236,6 +264,28 @@ func validateQuotaSetRequest(req quotaRequest) error {
 }
 
 const maxInt32 = int64(1<<31 - 1)
+
+func quotaConfigPatchFromRequest(req quotaRequest) (meta.QuotaConfigPatch, error) {
+	var patch meta.QuotaConfigPatch
+	if req.MaxStorageSize != nil {
+		maxStorageBytes, err := quotaStorageSizeToBytes(*req.MaxStorageSize)
+		if err != nil {
+			return patch, err
+		}
+		patch.MaxStorageBytes = &maxStorageBytes
+	}
+	if req.MaxFileSize != nil {
+		maxFileSizeBytes, err := quotaFileSizeToBytes(*req.MaxFileSize)
+		if err != nil {
+			return patch, err
+		}
+		patch.MaxFileSizeBytes = &maxFileSizeBytes
+	}
+	if req.MaxFileCount != nil {
+		patch.MaxFileCount = req.MaxFileCount
+	}
+	return patch, nil
+}
 
 func (s *Server) quotaTenant(w http.ResponseWriter, ctx context.Context, tenantID string) (*meta.Tenant, bool) {
 	tenantID = strings.TrimSpace(tenantID)
@@ -282,11 +332,14 @@ func (s *Server) writeQuotaResponse(w http.ResponseWriter, r *http.Request, t *m
 		SupportsUpdate: t.Provider == tenant.ProviderTiDBCloudNative,
 		Config: quotaConfigResponse{
 			MaxStorageSize:         quotaStorageBytesToSize(cfg.MaxStorageBytes),
+			MaxFileSize:            quotaStorageBytesToSize(cfg.MaxFileSizeBytes),
+			MaxFileCount:           cfg.MaxFileCount,
 			TiDBCloudSpendingLimit: spendingLimit,
 		},
 		Usage: quotaUsageResponse{
 			StorageBytes:  usage.StorageBytes,
 			ReservedBytes: usage.ReservedBytes,
+			FileCount:     usage.FileCount,
 		},
 	})
 }
@@ -294,9 +347,17 @@ func (s *Server) writeQuotaResponse(w http.ResponseWriter, r *http.Request, t *m
 const quotaStorageSizeBytes int64 = 1024 * 1024
 
 func quotaStorageSizeToBytes(sizeMi int64) (int64, error) {
+	return quotaSizeToBytes("max_storage_size", sizeMi)
+}
+
+func quotaFileSizeToBytes(sizeMi int64) (int64, error) {
+	return quotaSizeToBytes("max_file_size", sizeMi)
+}
+
+func quotaSizeToBytes(field string, sizeMi int64) (int64, error) {
 	const maxInt64 = int64(1<<63 - 1)
 	if sizeMi > maxInt64/quotaStorageSizeBytes {
-		return 0, fmt.Errorf("max_storage_size is too large")
+		return 0, fmt.Errorf("%s is too large", field)
 	}
 	return sizeMi * quotaStorageSizeBytes, nil
 }

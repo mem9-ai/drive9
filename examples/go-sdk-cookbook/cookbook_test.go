@@ -240,16 +240,23 @@ func ExampleClient_quota() {
 	})
 	if err == nil {
 		_ = quota.Config.MaxStorageSize
+		_ = quota.Config.MaxFileSize
+		_ = quota.Config.MaxFileCount
 		_ = quota.Config.TiDBCloudSpendingLimit
+		_ = quota.Usage.FileCount
 	}
 
 	storageSize := int64(100 * 1024) // Mi
+	fileSize := int64(1024)          // Mi
+	fileCount := int64(100000)
 	spendingLimit := int64(10000)
 	_, _ = credentialClient.SetQuota(ctx, drive9.QuotaSetRequest{
 		TenantID:               tenantID,
 		PublicKey:              tidbCloudPublicKey,
 		PrivateKey:             tidbCloudPrivateKey,
 		MaxStorageSize:         &storageSize,
+		MaxFileSize:            &fileSize,
+		MaxFileCount:           &fileCount,
 		TiDBCloudSpendingLimit: &spendingLimit,
 	})
 }

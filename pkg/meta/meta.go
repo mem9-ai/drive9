@@ -24,6 +24,7 @@ var (
 	ErrNotFound                 = errors.New("not found")
 	ErrDuplicate                = errors.New("duplicate entry")
 	ErrStorageQuotaExceeded     = errors.New("tenant storage quota exceeded")
+	ErrFileCountQuotaExceeded   = errors.New("tenant file count quota exceeded")
 	ErrReservationAlreadyExists = errors.New("upload reservation already exists")
 )
 
@@ -539,6 +540,8 @@ func metaInitSchemaStatements() []string {
 		`CREATE TABLE IF NOT EXISTS tenant_quota_config (
 			tenant_id             VARCHAR(64) PRIMARY KEY,
 			max_storage_bytes     BIGINT NOT NULL DEFAULT 53687091200,
+			max_file_size_bytes   BIGINT NOT NULL DEFAULT 0,
+			max_file_count        BIGINT NOT NULL DEFAULT 0,
 			max_media_llm_files   BIGINT NOT NULL DEFAULT 500,
 			max_monthly_cost_mc   BIGINT NOT NULL DEFAULT 0,
 			created_at            DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
@@ -548,6 +551,7 @@ func metaInitSchemaStatements() []string {
 			tenant_id          VARCHAR(64) PRIMARY KEY,
 			storage_bytes      BIGINT NOT NULL DEFAULT 0,
 			reserved_bytes     BIGINT NOT NULL DEFAULT 0,
+			file_count         BIGINT NOT NULL DEFAULT 0,
 			media_file_count   BIGINT NOT NULL DEFAULT 0,
 			updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 		)`,
@@ -564,6 +568,7 @@ func metaInitSchemaStatements() []string {
 			tenant_id      VARCHAR(64) NOT NULL,
 			upload_id      VARCHAR(64) NOT NULL,
 			reserved_bytes BIGINT NOT NULL,
+			file_count_delta BIGINT NOT NULL DEFAULT 0,
 			target_path    VARCHAR(4096) NOT NULL,
 			status         VARCHAR(20) NOT NULL DEFAULT 'active',
 			expires_at     DATETIME(3) NOT NULL,

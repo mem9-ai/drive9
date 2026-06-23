@@ -177,27 +177,34 @@ func (b *Dat9Backend) supersedeActiveUpload(ctx context.Context, op string, exis
 	return err
 }
 
-func (b *Dat9Backend) validateUploadTargetRevision(ctx context.Context, path string, expectedRevision int64) error {
+func (b *Dat9Backend) validateUploadTargetRevision(ctx context.Context, path string, expectedRevision int64) (bool, error) {
 	nf, err := b.store.Stat(ctx, path)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			if expectedRevision > 0 {
-				return datastore.ErrRevisionConflict
+				return false, datastore.ErrRevisionConflict
 			}
-			return nil
+			return false, nil
 		}
-		return err
+		return false, err
 	}
 	if nf.Node.IsDirectory {
-		return fmt.Errorf("is a directory: %s", path)
+		return false, fmt.Errorf("is a directory: %s", path)
 	}
 	if expectedRevision == 0 {
-		return datastore.ErrRevisionConflict
+		return true, datastore.ErrRevisionConflict
 	}
 	if expectedRevision > 0 && (nf.File == nil || nf.File.Status != datastore.StatusConfirmed || nf.File.Revision != expectedRevision) {
-		return datastore.ErrRevisionConflict
+		return true, datastore.ErrRevisionConflict
 	}
-	return nil
+	return true, nil
+}
+
+func uploadFileCountDelta(targetExists bool) int64 {
+	if targetExists {
+		return 0
+	}
+	return 1
 }
 
 func (b *Dat9Backend) cleanupFailedFinalizeUpload(ctx context.Context, upload *datastore.Upload) {
@@ -246,6 +253,10 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
 	}
+	if err := b.ensureFileSizeQuota(ctx, totalSize); err != nil {
+		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+		return nil, err
+	}
 
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
@@ -263,7 +274,8 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
 	}
-	if err := b.validateUploadTargetRevision(ctx, path, expectedRevision); err != nil {
+	targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
+	if err != nil {
 		if errors.Is(err, datastore.ErrRevisionConflict) {
 			metrics.RecordOperation("backend", "initiate_upload", "conflict", time.Since(start))
 		} else {
@@ -314,7 +326,7 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 
 	// Server-reserve-first saga: claim reserved_bytes on server DB before
 	// touching the tenant DB. Fail-open on server DB errors.
-	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize)
+	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize, uploadFileCountDelta(targetExists))
 	if err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		metrics.RecordOperation("backend", "initiate_upload", "quota_exceeded", time.Since(start))
@@ -422,6 +434,10 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
 	}
+	if err := b.ensureFileSizeQuota(ctx, totalSize); err != nil {
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, err
+	}
 
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
@@ -439,7 +455,8 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
 	}
-	if err := b.validateUploadTargetRevision(ctx, path, expectedRevision); err != nil {
+	targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
+	if err != nil {
 		if errors.Is(err, datastore.ErrRevisionConflict) {
 			metrics.RecordOperation("backend", "initiate_upload_v2", "conflict", time.Since(start))
 		} else {
@@ -482,7 +499,7 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 
 	// Server-reserve-first saga: claim reserved_bytes on server DB before
 	// touching the tenant DB. Fail-open on server DB errors.
-	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize)
+	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize, uploadFileCountDelta(targetExists))
 	if err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		metrics.RecordOperation("backend", "initiate_upload_v2", "quota_exceeded", time.Since(start))

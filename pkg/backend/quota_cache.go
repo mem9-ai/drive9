@@ -25,10 +25,10 @@ type quotaConfigSnapshot struct {
 // quotaConfigCache is a per-tenant cache for low-frequency quota config.
 //
 // It intentionally does not cache usage counters. In multi-server deployments,
-// storage_bytes/reserved_bytes/media_file_count are high-churn shared state, so
-// quota checks read those counters from the central DB directly. This cache only
-// removes repeated config reads and uses version polling so config changes
-// converge without a cross-server invalidation channel.
+// storage_bytes/reserved_bytes/file_count/media_file_count are high-churn shared
+// state, so quota checks read those counters from the central DB directly. This
+// cache only removes repeated config reads and uses version polling so config
+// changes converge without a cross-server invalidation channel.
 type quotaConfigCache struct {
 	tenantID string
 	store    MetaQuotaStore

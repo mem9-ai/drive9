@@ -60,7 +60,7 @@ type CredentialDeprovisioner interface {
 type QuotaUpdater interface {
 	Provisioner
 	UpdateQuota(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest, opts QuotaUpdateOptions) (*QuotaCloudConfig, error)
-	MarkQuotaUpdated(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest, cloudCfg *QuotaCloudConfig) error
+	MarkQuotaUpdateStarted(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) (*QuotaCloudConfig, error)
 }
 
 type QuotaGetter interface {

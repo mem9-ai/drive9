@@ -12,6 +12,8 @@ import (
 // QuotaConfig is the tenant quota configuration returned by the quota API.
 type QuotaConfig struct {
 	MaxStorageSize         int64  `json:"max_storage_size"`
+	MaxFileSize            int64  `json:"max_file_size"`
+	MaxFileCount           int64  `json:"max_file_count"`
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
 }
 
@@ -19,6 +21,7 @@ type QuotaConfig struct {
 type QuotaUsage struct {
 	StorageBytes  int64 `json:"storage_bytes"`
 	ReservedBytes int64 `json:"reserved_bytes"`
+	FileCount     int64 `json:"file_count"`
 }
 
 // QuotaResponse is returned by all quota query and update APIs.
@@ -39,13 +42,16 @@ type QuotaRequest struct {
 }
 
 // QuotaSetRequest updates TiDBCloud mode tenant quota with TiDB Cloud API
-// credentials. MaxStorageSize is expressed in Mi. TiDBCloudSpendingLimit is
-// the TiDB Cloud Cluster Spending Limit value passed through to TiDB Cloud.
+// credentials. MaxStorageSize and MaxFileSize are expressed in Mi.
+// TiDBCloudSpendingLimit is the TiDB Cloud Cluster Spending Limit value passed
+// through to TiDB Cloud.
 type QuotaSetRequest struct {
 	TenantID               string `json:"tenant_id"`
 	PublicKey              string `json:"public_key"`
 	PrivateKey             string `json:"private_key"`
 	MaxStorageSize         *int64 `json:"max_storage_size,omitempty"`
+	MaxFileSize            *int64 `json:"max_file_size,omitempty"`
+	MaxFileCount           *int64 `json:"max_file_count,omitempty"`
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
 }
 

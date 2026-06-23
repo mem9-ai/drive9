@@ -133,7 +133,7 @@ func TestRoundA_Fix1_ReserveUploadOnServer_NoLeakOnInsertFailure(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
 	fake.insertReservationErr = errors.New("sim: INSERT failed mid-tx")
 
-	reserved, err := b.reserveUploadOnServer(context.Background(), "u1", "/a", 100)
+	reserved, err := b.reserveUploadOnServer(context.Background(), "u1", "/a", 100, 0)
 	// Non-quota errors are fail-open: (false, nil).
 	if reserved || err != nil {
 		t.Fatalf("fail-open path: reserved=%v err=%v, want (false, nil)", reserved, err)
@@ -147,7 +147,7 @@ func TestRoundA_Fix1_ReserveUploadOnServer_NoLeakOnInsertFailure(t *testing.T) {
 func TestRoundA_Fix1_ReserveUploadOnServer_DuplicateIsIdempotent(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
 
-	if _, err := b.reserveUploadOnServer(context.Background(), "u1", "/a", 100); err != nil {
+	if _, err := b.reserveUploadOnServer(context.Background(), "u1", "/a", 100, 0); err != nil {
 		t.Fatalf("first reserve: %v", err)
 	}
 	fake.mu.Lock()
@@ -156,7 +156,7 @@ func TestRoundA_Fix1_ReserveUploadOnServer_DuplicateIsIdempotent(t *testing.T) {
 	fake.mu.Unlock()
 	before, _ := fake.GetQuotaUsage(context.Background(), "tenant-a")
 
-	reserved, err := b.reserveUploadOnServer(context.Background(), "u1", "/a", 100)
+	reserved, err := b.reserveUploadOnServer(context.Background(), "u1", "/a", 100, 0)
 	if !reserved || err != nil {
 		t.Fatalf("duplicate retry: reserved=%v err=%v, want (true, nil)", reserved, err)
 	}
@@ -389,15 +389,15 @@ func TestRoundA_Fix3_ReplayWorker_PerTenantBarrierClearsNextBatch(t *testing.T) 
 func TestRoundA_Fix4_CompleteUpload_WritesMutationEvenOnTransientPath(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
 	// Seed a prior reservation claim for realism.
-	_, _ = b.reserveUploadOnServer(context.Background(), "u1", "/clip.wav", 50)
+	_, _ = b.reserveUploadOnServer(context.Background(), "u1", "/clip.wav", 50, 0)
 	// Also inject a transient error on any future GetUploadReservation call
 	// to prove the apply path does NOT depend on pre-lookup anymore.
 	fake.getReservationErr = errors.New("sim: transient DB error")
 
 	b.completeUploadReservation(context.Background(),
-		"u1", /*reservedBytes*/ 50, "file-1",
-		/*oldSize*/ 0, /*oldMedia*/ false,
-		/*newSize*/ 50, /*newMedia*/ true)
+		"u1" /*reservedBytes*/, 50, "file-1",
+		/*oldSize*/ 0 /*oldMedia*/, false,
+		/*newSize*/ 50 /*newMedia*/, true)
 
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
@@ -427,9 +427,9 @@ func TestRoundA_Fix4_CompleteUpload_FailOpenInitiateStillAppliesStorage(t *testi
 	b, fake := newCentralQuotaBackend(t)
 	// No prior reserve → no reservation row. Simulate fail-open initiate.
 	b.completeUploadReservation(context.Background(),
-		"u1", /*reservedBytes*/ 0, "file-1",
-		/*oldSize*/ 0, /*oldMedia*/ false,
-		/*newSize*/ 40, /*newMedia*/ false)
+		"u1" /*reservedBytes*/, 0, "file-1",
+		/*oldSize*/ 0 /*oldMedia*/, false,
+		/*newSize*/ 40 /*newMedia*/, false)
 
 	u, _ := fake.GetQuotaUsage(context.Background(), "tenant-a")
 	if u.StorageBytes != 40 {
@@ -456,7 +456,7 @@ func TestRoundA_Fix4_CompleteUpload_ApplyAfterReservationSwept(t *testing.T) {
 	ctx := context.Background()
 
 	// 1. Successfully reserve on the server (normal initiate).
-	reserved, err := b.reserveUploadOnServer(ctx, "u1", "/clip.wav", 50)
+	reserved, err := b.reserveUploadOnServer(ctx, "u1", "/clip.wav", 50, 0)
 	if err != nil || !reserved {
 		t.Fatalf("reserve setup: reserved=%v err=%v", reserved, err)
 	}
@@ -482,9 +482,9 @@ func TestRoundA_Fix4_CompleteUpload_ApplyAfterReservationSwept(t *testing.T) {
 	// the sweep) but still advance storage_bytes + file_meta for the
 	// confirmed bytes.
 	b.completeUploadReservation(ctx,
-		"u1", /*reservedBytes*/ 50, "file-1",
-		/*oldSize*/ 0, /*oldMedia*/ false,
-		/*newSize*/ 50, /*newMedia*/ true)
+		"u1" /*reservedBytes*/, 50, "file-1",
+		/*oldSize*/ 0 /*oldMedia*/, false,
+		/*newSize*/ 50 /*newMedia*/, true)
 
 	after, _ := fake.GetQuotaUsage(ctx, "tenant-a")
 	if after.ReservedBytes != 0 {
@@ -534,9 +534,9 @@ func TestRoundA_Fix4_CompleteUpload_MarkAppliedCalledExactlyOnce(t *testing.T) {
 	t.Run("inline_path", func(t *testing.T) {
 		b, fake := newCentralQuotaBackend(t)
 		b.completeUploadReservation(context.Background(),
-			"u1", /*reservedBytes*/ 0, "file-1",
-			/*oldSize*/ 0, /*oldMedia*/ false,
-			/*newSize*/ 40, /*newMedia*/ false)
+			"u1" /*reservedBytes*/, 0, "file-1",
+			/*oldSize*/ 0 /*oldMedia*/, false,
+			/*newSize*/ 40 /*newMedia*/, false)
 		if fake.markAppliedCalls != 1 {
 			t.Fatalf("inline path markAppliedCalls = %d, want exactly 1", fake.markAppliedCalls)
 		}

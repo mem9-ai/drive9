@@ -146,6 +146,8 @@ func quotaSet(args []string) error {
 	privateKeyFlag := ""
 	privateKeyGiven := false
 	var maxStorageSize *int64
+	var maxFileSize *int64
+	var maxFileCount *int64
 	var tidbCloudSpendingLimit *int64
 	asJSON := false
 
@@ -199,6 +201,26 @@ func quotaSet(args []string) error {
 				return err
 			}
 			maxStorageSize = &v
+		case "--max-file-size":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--max-file-size requires an argument")
+			}
+			i++
+			v, err := parsePositiveQuotaInt64Flag("--max-file-size", args[i])
+			if err != nil {
+				return err
+			}
+			maxFileSize = &v
+		case "--max-file-count":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--max-file-count requires an argument")
+			}
+			i++
+			v, err := parseNonNegativeQuotaInt64Flag("--max-file-count", args[i])
+			if err != nil {
+				return err
+			}
+			maxFileCount = &v
 		case "--tidbcloud-spending-limit":
 			if i+1 >= len(args) {
 				return fmt.Errorf("--tidbcloud-spending-limit requires an argument")
@@ -230,8 +252,8 @@ func quotaSet(args []string) error {
 	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
 		return err
 	}
-	if maxStorageSize == nil && tidbCloudSpendingLimit == nil {
-		return fmt.Errorf("quota set requires --max-storage-size or --tidbcloud-spending-limit")
+	if maxStorageSize == nil && maxFileSize == nil && maxFileCount == nil && tidbCloudSpendingLimit == nil {
+		return fmt.Errorf("quota set requires --max-storage-size, --max-file-size, --max-file-count, or --tidbcloud-spending-limit")
 	}
 
 	r := ResolveCredentials()
@@ -258,6 +280,8 @@ func quotaSet(args []string) error {
 		PublicKey:              cred.PublicKey,
 		PrivateKey:             cred.PrivateKey,
 		MaxStorageSize:         maxStorageSize,
+		MaxFileSize:            maxFileSize,
+		MaxFileCount:           maxFileCount,
 		TiDBCloudSpendingLimit: tidbCloudSpendingLimit,
 	})
 	if err != nil {
@@ -353,12 +377,16 @@ func printQuotaCLIResponse(out *client.QuotaResponse, asJSON bool) error {
 	fmt.Printf("provider: %s\n", out.Provider)
 	fmt.Printf("status: %s\n", out.Status)
 	fmt.Printf("supports_update: %t\n", out.SupportsUpdate)
-	configParts := []string{fmt.Sprintf("max_storage_size=%dMi", out.Config.MaxStorageSize)}
+	configParts := []string{
+		fmt.Sprintf("max_storage_size=%dMi", out.Config.MaxStorageSize),
+		fmt.Sprintf("max_file_size=%dMi", out.Config.MaxFileSize),
+		fmt.Sprintf("max_file_count=%d", out.Config.MaxFileCount),
+	}
 	if out.Config.TiDBCloudSpendingLimit != nil {
 		configParts = append(configParts, fmt.Sprintf("tidbcloud_spending_limit=%d", *out.Config.TiDBCloudSpendingLimit))
 	}
 	fmt.Printf("config: %s\n", strings.Join(configParts, " "))
-	fmt.Printf("usage: storage_bytes=%d reserved_bytes=%d\n", out.Usage.StorageBytes, out.Usage.ReservedBytes)
+	fmt.Printf("usage: storage_bytes=%d reserved_bytes=%d file_count=%d\n", out.Usage.StorageBytes, out.Usage.ReservedBytes, out.Usage.FileCount)
 	return nil
 }
 
@@ -401,6 +429,8 @@ flags:
   --tidbcloud-public-key KEY      TiDB Cloud public key
   --tidbcloud-private-key KEY     TiDB Cloud private key
   --max-storage-size Mi           max confirmed+reserved storage size in Mi
+  --max-file-size Mi              max single file size in Mi; must not exceed server DRIVE9_MAX_UPLOAD_BYTES
+  --max-file-count N              max confirmed file count; 0 means unlimited
   --tidbcloud-spending-limit N    TiDB Cloud Cluster Spending Limit; must be non-negative; see https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit
   --json                          output result as JSON`
 }

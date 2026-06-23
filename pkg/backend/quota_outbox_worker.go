@@ -235,6 +235,7 @@ func (b *Dat9Backend) enqueueQuotaFileCreateOutboxTx(tx *sql.Tx, fileID string, 
 		MutationType: quotaMutationTypeFileCreate,
 		MutationData: raw,
 		StorageDelta: sizeBytes,
+		FileDelta:    1,
 		MediaDelta:   mediaDelta,
 	})
 	if err != nil {
@@ -266,6 +267,7 @@ func (b *Dat9Backend) enqueueQuotaFileOverwriteOutboxTx(tx *sql.Tx, fileID strin
 		MutationType: quotaMutationTypeOverwrite,
 		MutationData: raw,
 		StorageDelta: newSize - oldSize,
+		FileDelta:    0,
 		MediaDelta:   mediaDelta,
 	})
 	if err != nil {

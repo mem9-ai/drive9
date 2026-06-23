@@ -37,6 +37,7 @@ type QuotaOutboxEntry struct {
 	MutationType string
 	MutationData json.RawMessage
 	StorageDelta int64
+	FileDelta    int64
 	MediaDelta   int64
 	Status       QuotaOutboxStatus
 	AttemptCount int
@@ -326,9 +327,10 @@ func (s *Store) RecoverExpiredQuotaOutbox(ctx context.Context, now time.Time, li
 
 // PendingQuotaOutboxDeltasTx returns the queued/processing quota deltas that
 // have not necessarily converged to the central quota tables yet.
-func (s *Store) PendingQuotaOutboxDeltasTx(tx *sql.Tx) (storageDelta, mediaDelta int64, err error) {
+func (s *Store) PendingQuotaOutboxDeltasTx(tx *sql.Tx) (storageDelta, fileDelta, mediaDelta int64, err error) {
 	return scanQuotaOutboxPendingDeltas(tx.QueryRow(`SELECT
 		COALESCE(SUM(storage_delta), 0),
+		COALESCE(SUM(file_delta), 0),
 		COALESCE(SUM(media_delta), 0)
 		FROM quota_outbox WHERE status IN (?, ?)`,
 		QuotaOutboxQueued, QuotaOutboxProcessing))
@@ -336,11 +338,12 @@ func (s *Store) PendingQuotaOutboxDeltasTx(tx *sql.Tx) (storageDelta, mediaDelta
 
 // PendingQuotaOutboxDeltas returns queued/processing quota deltas outside a
 // caller-owned transaction.
-func (s *Store) PendingQuotaOutboxDeltas(ctx context.Context) (storageDelta, mediaDelta int64, err error) {
+func (s *Store) PendingQuotaOutboxDeltas(ctx context.Context) (storageDelta, fileDelta, mediaDelta int64, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "pending_quota_outbox_deltas", start, &err)
 	return scanQuotaOutboxPendingDeltas(s.db.QueryRowContext(ctx, `SELECT
 		COALESCE(SUM(storage_delta), 0),
+		COALESCE(SUM(file_delta), 0),
 		COALESCE(SUM(media_delta), 0)
 		FROM quota_outbox WHERE status IN (?, ?)`,
 		QuotaOutboxQueued, QuotaOutboxProcessing))
@@ -364,11 +367,11 @@ func (s *Store) HasPendingQuotaOutboxFileMutation(ctx context.Context, fileID st
 	return count > 0, nil
 }
 
-func scanQuotaOutboxPendingDeltas(row scanner) (storageDelta, mediaDelta int64, err error) {
-	if err := row.Scan(&storageDelta, &mediaDelta); err != nil {
-		return 0, 0, err
+func scanQuotaOutboxPendingDeltas(row scanner) (storageDelta, fileDelta, mediaDelta int64, err error) {
+	if err := row.Scan(&storageDelta, &fileDelta, &mediaDelta); err != nil {
+		return 0, 0, 0, err
 	}
-	return storageDelta, mediaDelta, nil
+	return storageDelta, fileDelta, mediaDelta, nil
 }
 
 func (s *Store) enqueueQuotaOutbox(db execer, entry *QuotaOutboxEntry) (int64, error) {
@@ -404,12 +407,12 @@ func (s *Store) enqueueQuotaOutbox(db execer, entry *QuotaOutboxEntry) (int64, e
 	}
 
 	res, err := db.Exec(`INSERT INTO quota_outbox
-		(file_id, mutation_type, mutation_data, storage_delta, media_delta,
+		(file_id, mutation_type, mutation_data, storage_delta, file_delta, media_delta,
 		 status, attempt_count, max_attempts, receipt, leased_at, lease_until,
 		 available_at, last_error, created_at, updated_at, completed_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		nullStr(entry.FileID), entry.MutationType, []byte(entry.MutationData),
-		entry.StorageDelta, entry.MediaDelta, status, entry.AttemptCount, maxAttempts,
+		entry.StorageDelta, entry.FileDelta, entry.MediaDelta, status, entry.AttemptCount, maxAttempts,
 		nullStr(entry.Receipt), nilTime(entry.LeasedAt), nilTime(entry.LeaseUntil),
 		availableAt.UTC(), nullStr(entry.LastError), createdAt.UTC(),
 		updatedAt.UTC(), nilTime(entry.CompletedAt))
@@ -433,7 +436,7 @@ func (s *Store) quotaOutboxLeaseError(ctx context.Context, db execer, id int64) 
 }
 
 const quotaOutboxSelectSQL = `SELECT id, file_id, mutation_type, mutation_data,
-	storage_delta, media_delta, status, attempt_count, max_attempts, receipt,
+	storage_delta, file_delta, media_delta, status, attempt_count, max_attempts, receipt,
 	leased_at, lease_until, available_at, last_error, created_at, updated_at,
 	completed_at`
 
@@ -443,7 +446,7 @@ func scanQuotaOutbox(s scanner) (*QuotaOutboxEntry, error) {
 	var mutationData []byte
 	var leasedAt, leaseUntil, completedAt sql.NullTime
 	err := s.Scan(&entry.ID, &fileID, &entry.MutationType, &mutationData,
-		&entry.StorageDelta, &entry.MediaDelta, &entry.Status, &entry.AttemptCount,
+		&entry.StorageDelta, &entry.FileDelta, &entry.MediaDelta, &entry.Status, &entry.AttemptCount,
 		&entry.MaxAttempts, &receipt, &leasedAt, &leaseUntil, &entry.AvailableAt,
 		&lastError, &entry.CreatedAt, &entry.UpdatedAt, &completedAt)
 	if err != nil {

@@ -804,6 +804,7 @@ func (s *Server) sourceHasActiveUploadReservations(ctx context.Context, tenantID
 func (s *Server) backfillForkQuota(ctx context.Context, tenantID string, store *datastore.Store) error {
 	var storageBytes int64
 	var mediaCount int64
+	var fileCount int64
 	cursor := ""
 	for {
 		files, next, err := store.ListConfirmedFileSummaries(ctx, cursor, 500)
@@ -820,6 +821,7 @@ func (s *Server) backfillForkQuota(ctx context.Context, tenantID string, store *
 			}); err != nil {
 				return err
 			}
+			fileCount++
 			storageBytes += f.SizeBytes
 			if isMedia {
 				mediaCount++
@@ -830,7 +832,7 @@ func (s *Server) backfillForkQuota(ctx context.Context, tenantID string, store *
 		}
 		cursor = next
 	}
-	return s.meta.SetQuotaCounters(ctx, tenantID, storageBytes, mediaCount)
+	return s.meta.SetQuotaCounters(ctx, tenantID, storageBytes, mediaCount, fileCount)
 }
 
 func forkQuotaMediaContentType(contentType string) bool {

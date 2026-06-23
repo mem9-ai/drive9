@@ -29,6 +29,9 @@ func (b *Dat9Backend) PutFSLayerObject(ctx context.Context, layerID, path string
 	if err := b.ensureUploadSizeAllowed(size); err != nil {
 		return nil, err
 	}
+	if err := b.ensureFileSizeQuota(ctx, size); err != nil {
+		return nil, err
+	}
 	canonical, err := pathutil.Canonicalize(path)
 	if err != nil {
 		return nil, err
@@ -112,6 +115,9 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 	if err := b.ensureUploadSizeAllowed(entry.SizeBytes); err != nil {
 		return 0, err
 	}
+	if err := b.ensureFileSizeQuota(ctx, entry.SizeBytes); err != nil {
+		return 0, err
+	}
 	storageEncryptionMode := entry.StorageEncryptionMode
 	if storageEncryptionMode == "" {
 		storageEncryptionMode = datastore.StorageEncryptionNone
@@ -126,6 +132,9 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 		var quotaOutboxEnqueued bool
 		err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 			if err := b.ensureStorageQuota(ctx, tx, canonical, entry.SizeBytes); err != nil {
+				return err
+			}
+			if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
 				return err
 			}
 			if err := b.store.InsertFileTx(tx, &datastore.File{

@@ -267,6 +267,9 @@ func (b *Dat9Backend) applyCentralFileDeleteCountersTx(tx *sql.Tx, sizeBytes int
 			return err
 		}
 	}
+	if err := b.metaStore.IncrFileCountTx(tx, b.tenantID, -1); err != nil {
+		return err
+	}
 	if isMedia {
 		if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, -1); err != nil {
 			return err

@@ -468,14 +468,7 @@ func (p *Provisioner) UpdateQuota(ctx context.Context, cluster *tenant.ClusterIn
 		}
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
-	if err != nil {
-		return nil, fmt.Errorf("load cluster quota info: %w", err)
-	}
-	if cloudCfg == nil {
-		cloudCfg = &tenant.QuotaCloudConfig{}
-	}
-	cloudCfg.Labels = labels
+	cloudCfg := &tenant.QuotaCloudConfig{}
 	if opts.TiDBCloudSpendingLimitMonthly != nil {
 		monthly := *opts.TiDBCloudSpendingLimitMonthly
 		if err := p.updateSpendingLimitWithCredentials(ctx, publicKey, privateKey, clusterID, monthly); err != nil {
@@ -486,21 +479,22 @@ func (p *Provisioner) UpdateQuota(ctx context.Context, cluster *tenant.ClusterIn
 	return cloudCfg, nil
 }
 
-func (p *Provisioner) MarkQuotaUpdated(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, cloudCfg *tenant.QuotaCloudConfig) error {
+func (p *Provisioner) MarkQuotaUpdateStarted(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.QuotaCloudConfig, error) {
 	publicKey := strings.TrimSpace(req.PublicKey)
 	privateKey := strings.TrimSpace(req.PrivateKey)
 	if publicKey == "" || privateKey == "" {
-		return fmt.Errorf("public_key and private_key are required")
+		return nil, fmt.Errorf("public_key and private_key are required")
 	}
 	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
-		return fmt.Errorf("cluster id is required")
+		return nil, fmt.Errorf("cluster id is required")
 	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
-	labels := make(map[string]string)
-	if cloudCfg != nil {
-		for k, v := range cloudCfg.Labels {
-			labels[k] = v
-		}
+	labels, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
+	if err != nil {
+		return nil, fmt.Errorf("load cluster quota info: %w", err)
+	}
+	if cloudCfg == nil {
+		cloudCfg = &tenant.QuotaCloudConfig{}
 	}
 	labels[Drive9ManagedLabel] = "true"
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
@@ -508,9 +502,10 @@ func (p *Provisioner) MarkQuotaUpdated(ctx context.Context, cluster *tenant.Clus
 	}
 	labels[Drive9QuotaUpdateAtLabel] = time.Now().UTC().Format(time.RFC3339Nano)
 	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
-		return fmt.Errorf("update cluster quota labels: %w", err)
+		return nil, fmt.Errorf("update cluster quota labels: %w", err)
 	}
-	return nil
+	cloudCfg.Labels = labels
+	return cloudCfg, nil
 }
 
 func (p *Provisioner) updateQuotaLabelsWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string, labels map[string]string) error {

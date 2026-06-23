@@ -24,6 +24,7 @@ func TestQuotaOutboxLifecycle(t *testing.T) {
 			MutationType: "file_create",
 			MutationData: payload,
 			StorageDelta: 7,
+			FileDelta:    1,
 			MediaDelta:   1,
 		})
 		return err
@@ -34,12 +35,12 @@ func TestQuotaOutboxLifecycle(t *testing.T) {
 		t.Fatal("expected non-zero quota outbox id")
 	}
 
-	storageDelta, mediaDelta, err := s.PendingQuotaOutboxDeltas(ctx)
+	storageDelta, fileDelta, mediaDelta, err := s.PendingQuotaOutboxDeltas(ctx)
 	if err != nil {
 		t.Fatalf("pending deltas: %v", err)
 	}
-	if storageDelta != 7 || mediaDelta != 1 {
-		t.Fatalf("pending deltas = %d/%d, want 7/1", storageDelta, mediaDelta)
+	if storageDelta != 7 || fileDelta != 1 || mediaDelta != 1 {
+		t.Fatalf("pending deltas = %d/%d/%d, want 7/1/1", storageDelta, fileDelta, mediaDelta)
 	}
 
 	claimed, found, err := s.ClaimQuotaOutbox(ctx, time.Now().UTC(), time.Minute)
@@ -59,12 +60,12 @@ func TestQuotaOutboxLifecycle(t *testing.T) {
 	if err := s.AckQuotaOutbox(ctx, claimed.ID, claimed.Receipt); err != nil {
 		t.Fatalf("ack quota outbox: %v", err)
 	}
-	storageDelta, mediaDelta, err = s.PendingQuotaOutboxDeltas(ctx)
+	storageDelta, fileDelta, mediaDelta, err = s.PendingQuotaOutboxDeltas(ctx)
 	if err != nil {
 		t.Fatalf("pending deltas after ack: %v", err)
 	}
-	if storageDelta != 0 || mediaDelta != 0 {
-		t.Fatalf("pending deltas after ack = %d/%d, want 0/0", storageDelta, mediaDelta)
+	if storageDelta != 0 || fileDelta != 0 || mediaDelta != 0 {
+		t.Fatalf("pending deltas after ack = %d/%d/%d, want 0/0/0", storageDelta, fileDelta, mediaDelta)
 	}
 }
 
@@ -204,12 +205,12 @@ func TestQuotaOutboxDeadLetteredOlderRowUnblocksLaterClaim(t *testing.T) {
 	if status != QuotaOutboxDeadLettered {
 		t.Fatalf("first status = %q, want dead_lettered", status)
 	}
-	storageDelta, mediaDelta, err := s.PendingQuotaOutboxDeltas(ctx)
+	storageDelta, fileDelta, mediaDelta, err := s.PendingQuotaOutboxDeltas(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if storageDelta != 3 || mediaDelta != 0 {
-		t.Fatalf("pending deltas = %d/%d, want only later row 3/0", storageDelta, mediaDelta)
+	if storageDelta != 3 || fileDelta != 0 || mediaDelta != 0 {
+		t.Fatalf("pending deltas = %d/%d/%d, want only later row 3/0/0", storageDelta, fileDelta, mediaDelta)
 	}
 
 	claimed, found, err = s.ClaimQuotaOutbox(ctx, now.Add(time.Minute), time.Minute)

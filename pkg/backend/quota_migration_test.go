@@ -92,6 +92,8 @@ func (f *fakeMetaQuotaStore) GetQuotaConfig(ctx context.Context, tenantID string
 	return &QuotaConfigView{
 		TenantID:         tenantID,
 		MaxStorageBytes:  meta.DefaultMaxStorageBytes(),
+		MaxFileSizeBytes: meta.DefaultMaxFileSizeBytes(),
+		MaxFileCount:     0,
 		MaxMediaLLMFiles: 500,
 		MaxMonthlyCostMC: 0,
 	}, nil
@@ -101,7 +103,7 @@ func (f *fakeMetaQuotaStore) GetQuotaConfigVersion(ctx context.Context, tenantID
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if cfg, ok := f.config[tenantID]; ok {
-		return fmt.Sprintf("%d:%d:%d", cfg.MaxStorageBytes, cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC), nil
+		return fmt.Sprintf("%d:%d:%d:%d:%d", cfg.MaxStorageBytes, cfg.MaxFileSizeBytes, cfg.MaxFileCount, cfg.MaxMediaLLMFiles, cfg.MaxMonthlyCostMC), nil
 	}
 	return "", nil
 }
@@ -142,6 +144,17 @@ func (f *fakeMetaQuotaStore) IncrReservedBytesTx(tx *sql.Tx, tenantID string, de
 	return f.IncrReservedBytes(context.Background(), tenantID, delta)
 }
 
+func (f *fakeMetaQuotaStore) IncrFileCount(ctx context.Context, tenantID string, delta int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ensureUsageLocked(tenantID).FileCount += delta
+	return nil
+}
+
+func (f *fakeMetaQuotaStore) IncrFileCountTx(tx *sql.Tx, tenantID string, delta int64) error {
+	return f.IncrFileCount(context.Background(), tenantID, delta)
+}
+
 func (f *fakeMetaQuotaStore) IncrMediaFileCount(ctx context.Context, tenantID string, delta int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -178,12 +191,16 @@ func (f *fakeMetaQuotaStore) AtomicReserveAndInsertUpload(ctx context.Context, r
 		cfg = &QuotaConfigView{
 			TenantID:         r.TenantID,
 			MaxStorageBytes:  meta.DefaultMaxStorageBytes(),
+			MaxFileSizeBytes: meta.DefaultMaxFileSizeBytes(),
 			MaxMediaLLMFiles: 500,
 		}
 	}
 	u := f.ensureUsageLocked(r.TenantID)
 	if cfg.MaxStorageBytes > 0 && u.StorageBytes+u.ReservedBytes+r.ReservedBytes > cfg.MaxStorageBytes {
 		return ErrStorageQuotaExceeded
+	}
+	if r.FileCountDelta > 0 && cfg.MaxFileCount > 0 && u.FileCount+r.FileCountDelta > cfg.MaxFileCount {
+		return ErrFileCountQuotaExceeded
 	}
 	if _, exists := f.reservations[metaKey(r.TenantID, r.UploadID)]; exists {
 		// Duplicate primary key; real tx would roll back here.
@@ -194,6 +211,7 @@ func (f *fakeMetaQuotaStore) AtomicReserveAndInsertUpload(ctx context.Context, r
 		return f.insertReservationErr
 	}
 	u.ReservedBytes += r.ReservedBytes
+	u.FileCount += r.FileCountDelta
 	cp := *r
 	f.reservations[metaKey(r.TenantID, r.UploadID)] = &cp
 	return nil
@@ -272,15 +290,15 @@ func (f *fakeMetaQuotaStore) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantI
 // SettleActiveReservationTx models the atomic "active → status" transition
 // and reports whether an active row was actually settled. Mirrors the real
 // Store contract used by Round A / fix 4.
-func (f *fakeMetaQuotaStore) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (bool, error) {
+func (f *fakeMetaQuotaStore) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (bool, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	r, ok := f.reservations[metaKey(tenantID, uploadID)]
 	if !ok || r.Status != "active" {
-		return false, nil
+		return false, 0, nil
 	}
 	r.Status = status
-	return true, nil
+	return true, r.FileCountDelta, nil
 }
 
 func (f *fakeMetaQuotaStore) GetUploadReservation(ctx context.Context, tenantID, uploadID string) (*UploadReservationView, error) {
@@ -472,7 +490,9 @@ func (f *fakeMetaQuotaStore) ExpireActiveReservations(ctx context.Context) (int6
 			continue
 		}
 		r.Status = "aborted"
-		f.ensureUsageLocked(r.TenantID).ReservedBytes -= r.ReservedBytes
+		u := f.ensureUsageLocked(r.TenantID)
+		u.ReservedBytes -= r.ReservedBytes
+		u.FileCount -= r.FileCountDelta
 		released += r.ReservedBytes
 	}
 	return released, nil
@@ -485,6 +505,8 @@ func newCentralQuotaBackend(t *testing.T) (*Dat9Backend, *fakeMetaQuotaStore) {
 	fake.config["tenant-a"] = &QuotaConfigView{
 		TenantID:         "tenant-a",
 		MaxStorageBytes:  1 << 30,
+		MaxFileSizeBytes: meta.DefaultMaxFileSizeBytes(),
+		MaxFileCount:     0,
 		MaxMediaLLMFiles: 1000,
 		MaxMonthlyCostMC: 1 << 30,
 	}
@@ -510,7 +532,7 @@ func TestCentralQuotaFileMutationLifecycle(t *testing.T) {
 		t.Fatalf("file meta after create = %+v", fm)
 	}
 	usage, _ := fake.GetQuotaUsage(context.Background(), "tenant-a")
-	if usage.StorageBytes != int64(len("png-data")) || usage.MediaFileCount != 1 {
+	if usage.StorageBytes != int64(len("png-data")) || usage.FileCount != 1 || usage.MediaFileCount != 1 {
 		t.Fatalf("usage after create = %+v", usage)
 	}
 
@@ -518,7 +540,7 @@ func TestCentralQuotaFileMutationLifecycle(t *testing.T) {
 		t.Fatalf("overwrite image: %v", err)
 	}
 	usage, _ = fake.GetQuotaUsage(context.Background(), "tenant-a")
-	if usage.StorageBytes != int64(len("much-longer-png-data")) || usage.MediaFileCount != 1 {
+	if usage.StorageBytes != int64(len("much-longer-png-data")) || usage.FileCount != 1 || usage.MediaFileCount != 1 {
 		t.Fatalf("usage after overwrite = %+v", usage)
 	}
 	current, err := b.Store().Stat(context.Background(), "/img.png")
@@ -530,7 +552,7 @@ func TestCentralQuotaFileMutationLifecycle(t *testing.T) {
 		t.Fatalf("remove image: %v", err)
 	}
 	usage, _ = fake.GetQuotaUsage(context.Background(), "tenant-a")
-	if usage.StorageBytes != int64(len("much-longer-png-data")) || usage.MediaFileCount != 1 {
+	if usage.StorageBytes != int64(len("much-longer-png-data")) || usage.FileCount != 1 || usage.MediaFileCount != 1 {
 		t.Fatalf("usage before gc = %+v", usage)
 	}
 	task, err := b.Store().GetFileGCTaskByFileID(context.Background(), current.File.FileID)
@@ -548,7 +570,7 @@ func TestCentralQuotaFileMutationLifecycle(t *testing.T) {
 		t.Fatal("expected one file gc task to be processed")
 	}
 	usage, _ = fake.GetQuotaUsage(context.Background(), "tenant-a")
-	if usage.StorageBytes != 0 || usage.MediaFileCount != 0 {
+	if usage.StorageBytes != 0 || usage.FileCount != 0 || usage.MediaFileCount != 0 {
 		t.Fatalf("usage after gc = %+v", usage)
 	}
 	if _, err := fake.GetFileMeta(context.Background(), "tenant-a", current.File.FileID); err == nil {
@@ -587,7 +609,7 @@ func TestCentralQuotaUploadCompleteUpdatesShadowState(t *testing.T) {
 		t.Fatalf("stat uploaded file: %v", err)
 	}
 	usage, _ = fake.GetQuotaUsage(ctx, "tenant-a")
-	if usage.StorageBytes != totalSize || usage.ReservedBytes != 0 || usage.MediaFileCount != 1 {
+	if usage.StorageBytes != totalSize || usage.ReservedBytes != 0 || usage.FileCount != 1 || usage.MediaFileCount != 1 {
 		t.Fatalf("usage after confirm = %+v", usage)
 	}
 	fm, err := fake.GetFileMeta(ctx, "tenant-a", nf.File.FileID)

@@ -15,6 +15,8 @@ import (
 
 var (
 	ErrUploadTooLarge           = errors.New("upload too large")
+	ErrFileSizeQuotaExceeded    = errors.New("tenant file size quota exceeded")
+	ErrFileCountQuotaExceeded   = errors.New("tenant file count quota exceeded")
 	ErrStorageQuotaExceeded     = errors.New("tenant storage quota exceeded")
 	ErrMediaLLMQuotaExceeded    = errors.New("tenant media LLM file quota exceeded")
 	ErrReservationNotFound      = errors.New("upload reservation not found")
@@ -115,6 +117,26 @@ func (b *Dat9Backend) ensureUploadSizeAllowed(size int64) error {
 	return nil
 }
 
+func (b *Dat9Backend) ensureFileSizeQuota(ctx context.Context, size int64) error {
+	if size <= 0 || !b.UseServerQuota() {
+		return nil
+	}
+	cfg := b.cachedQuotaConfig(ctx)
+	if cfg == nil {
+		metrics.RecordOperation("server_quota", "file_size_check", "fail_open", 0)
+		return nil
+	}
+	if cfg.MaxFileSizeBytes <= 0 {
+		return nil
+	}
+	if size > cfg.MaxFileSizeBytes {
+		metrics.RecordOperation("server_quota", "file_size_check", "exceeded", 0)
+		return fmt.Errorf("%w: server limit=%d requested=%d", ErrFileSizeQuotaExceeded, cfg.MaxFileSizeBytes, size)
+	}
+	metrics.RecordOperation("server_quota", "file_size_check", "ok", 0)
+	return nil
+}
+
 // --- Server-side storage quota (Rev 4 migration) ---
 
 // ensureStorageQuotaServer performs a soft optimistic storage quota check
@@ -143,6 +165,38 @@ func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, tx *sql.Tx, 
 	return nil
 }
 
+func (b *Dat9Backend) ensureFileCountQuotaServer(ctx context.Context, tx *sql.Tx, currentFileDelta int64) error {
+	if !b.UseServerQuota() || currentFileDelta <= 0 {
+		return nil
+	}
+	cfg := b.cachedQuotaConfig(ctx)
+	if cfg == nil {
+		metrics.RecordOperation("server_quota", "file_count_check", "fail_open", 0)
+		return nil
+	}
+	if cfg.MaxFileCount <= 0 {
+		return nil
+	}
+	usage := b.loadQuotaUsage(ctx)
+	if usage == nil {
+		metrics.RecordOperation("server_quota", "file_count_check", "fail_open", 0)
+		return nil
+	}
+	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
+	_, pendingFileDelta, _, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
+	if !pendingOK {
+		metrics.RecordOperation("server_quota", "file_count_check_pending_delta", "fail_open", 0)
+	}
+	projected := usage.FileCount + pendingFileDelta + currentFileDelta
+	if projected > cfg.MaxFileCount {
+		metrics.RecordOperation("server_quota", "file_count_check", "exceeded", 0)
+		return fmt.Errorf("%w: server limit=%d used=%d pending=%d delta=%d",
+			ErrFileCountQuotaExceeded, cfg.MaxFileCount, usage.FileCount, pendingFileDelta, currentFileDelta)
+	}
+	metrics.RecordOperation("server_quota", "file_count_check", "ok", 0)
+	return nil
+}
+
 func (b *Dat9Backend) checkStorageQuotaServerTx(ctx context.Context, tx *sql.Tx, deltaBytes int64) (storageQuotaCheckResult, bool) {
 	result := storageQuotaCheckResult{deltaBytes: deltaBytes}
 	if b.metaStore == nil || deltaBytes <= 0 {
@@ -163,7 +217,7 @@ func (b *Dat9Backend) checkStorageQuotaServerTx(ctx context.Context, tx *sql.Tx,
 		return result, false // fail-open: usage unavailable
 	}
 	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
-	pendingStorageDelta, _, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
+	pendingStorageDelta, _, _, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
 	if !pendingOK {
 		metrics.RecordOperation("server_quota", "storage_check_pending_delta", "fail_open", 0)
 	}
@@ -272,24 +326,24 @@ func (b *Dat9Backend) mediaLLMQuotaExceededServerTx(ctx context.Context, tx *sql
 		return false
 	}
 	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
-	_, pendingMediaDelta, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
+	_, _, pendingMediaDelta, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
 	if !pendingOK {
 		metrics.RecordOperation("server_quota", "media_check_pending_delta", "fail_open", 0)
 	}
 	return usage.MediaFileCount+pendingMediaDelta+currentMediaDelta > cfg.MaxMediaLLMFiles
 }
 
-func (b *Dat9Backend) pendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx) (storageDelta, mediaDelta int64, ok bool) {
+func (b *Dat9Backend) pendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx) (storageDelta, fileDelta, mediaDelta int64, ok bool) {
 	if b.store == nil || tx == nil {
-		return 0, 0, true
+		return 0, 0, 0, true
 	}
-	storageDelta, mediaDelta, err := b.store.PendingQuotaOutboxDeltasTx(tx)
+	storageDelta, fileDelta, mediaDelta, err := b.store.PendingQuotaOutboxDeltasTx(tx)
 	if err != nil {
 		logger.Warn(ctx, "server_quota_pending_outbox_delta_fail_open",
 			zap.String("tenant_id", b.tenantID), zap.Error(err))
-		return 0, 0, false
+		return 0, 0, 0, false
 	}
-	return storageDelta, mediaDelta, true
+	return storageDelta, fileDelta, mediaDelta, true
 }
 
 func (r storageQuotaCheckResult) exceeded() bool {
