@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
 	"strconv"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 
 	mysql "github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/drive9/pkg/backend"
+	"github.com/mem9-ai/drive9/pkg/encrypt"
 	"github.com/mem9-ai/drive9/pkg/leader"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/tenant"
@@ -64,7 +66,7 @@ func newLeaderLifecycleServerWithLeader(t *testing.T, leaderMgr *leader.Manager)
 	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
 	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
 
-	pool := newTestTenantPoolWithBackendOptions(t, backendOptionsWithFileGC())
+	pool := newTestTenantPoolWithLeaderChecker(t, backendOptionsWithFileGC(), leaderMgr)
 	pool.SetMetaStore(metaStore)
 	t.Cleanup(func() { pool.Close() })
 
@@ -222,6 +224,29 @@ func waitForLeaderOrTimeout(t *testing.T, srv *Server, timeout time.Duration) {
 
 func backendOptionsWithFileGC() backend.Options {
 	return backend.Options{AppSemanticTasksEnabled: true}
+}
+
+// newTestTenantPoolWithLeaderChecker builds a tenant pool whose per-tenant
+// FileGCWorker is gated by checker, so the leader lifecycle tests exercise the
+// real fileGCEnabled path (StartAllFileGC/StopAllFileGC + insertion-time read).
+func newTestTenantPoolWithLeaderChecker(t *testing.T, opts backend.Options, checker tenant.LeaderChecker) *tenant.Pool {
+	t.Helper()
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{
+		S3Dir:          mustTempDir(t),
+		PublicURL:      "http://localhost",
+		BackendOptions: opts,
+		LeaderChecker:  checker,
+	}, enc)
+	t.Cleanup(func() { pool.Close() })
+	return pool
 }
 
 // TestLeaderGatedWorkersCloseRacesOnLead is a regression for qiffang R3: a
