@@ -59,6 +59,12 @@ func TestBackendRuntimeMetricsAggregateAcrossBackends(t *testing.T) {
 	if !strings.Contains(metricsText, "drive9_module_up{module=\"image_extract\"} 1") {
 		t.Fatalf("metrics should keep image_extract available while one backend remains: %s", metricsText)
 	}
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"queue_capacity\"} 0") {
+		t.Fatalf("metrics should keep image queue capacity at 0 after one backend closes: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"image_extract\",name=\"workers\"} 0") {
+		t.Fatalf("metrics should keep image workers at 0 after one backend closes: %s", metricsText)
+	}
 	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\"} 2048") {
 		t.Fatalf("metrics should retain remaining audio max bytes: %s", metricsText)
 	}

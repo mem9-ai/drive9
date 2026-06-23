@@ -1454,27 +1454,27 @@ func (m *semanticWorkerManager) taskTypesForProvider(provider string) []semantic
 		if m.pool == nil {
 			return nil
 		}
-		if types := m.pool.AutoSemanticTaskTypes(); types != nil {
+		types := m.pool.AutoSemanticTaskTypes()
+		// When auto-embedding is explicitly disabled, route TiDB tenants through
+		// app-managed embed types alongside any pool-configured extract types.
+		// Without this, embed tasks would never be claimed when extract types
+		// are present but auto-embedding is off.
+		if m.pool.IsAutoEmbeddingDisabled() {
+			return unionTaskTypes(m.appManagedTaskTypes(), types)
+		}
+		if types != nil {
 			return types
 		}
-		// Pool returned nil. If auto-embedding is explicitly disabled, route
-		// TiDB tenants through app-managed task types so they can be processed
-		// by an external embedder. Otherwise (pool has no image/audio extract
-		// configured) fall through to nil — TiDB tenant is skipped entirely.
-		if m.pool.IsAutoEmbeddingDisabled() {
-			return m.appManagedTaskTypes()
-		}
+		// Pool returned nil and auto-embedding is not disabled: no extract or
+		// embed tasks configured — skip this TiDB tenant entirely.
 		return nil
 	}
 	// Non-auto-embedding provider: image/audio extract tasks are independent of
 	// EMBED_TEXT, so include pool-configured extract types alongside app-managed
 	// embed types. Without this, img_extract_text tasks enqueued for app-mode
 	// tenants would never be scanned or claimed when no embedder is configured.
-	// However, db9 (PostgreSQL) providers do not support the TiDB-class async
-	// extract runtimes, so they are excluded from extract task scanning.
-	if provider == tenant.ProviderDB9 {
-		return m.appManagedTaskTypes()
-	}
+	// taskTypesForTarget filters at the per-backend level, so only backends that
+	// actually support extract (imageExtractEnabled etc.) will claim these tasks.
 	return unionTaskTypes(m.appManagedTaskTypes(), m.poolExtractTaskTypes())
 }
 
