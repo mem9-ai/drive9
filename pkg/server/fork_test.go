@@ -779,15 +779,6 @@ func TestHandleForkDeleteNativeFailedBranchIDEmptyNoCredentialsDeletesLocally(t 
 	}
 }
 
-type defaultCredentialsProvisioner struct {
-	*fakeBranchProvisioner
-	creds tenant.CredentialProvisionRequest
-}
-
-func (d *defaultCredentialsProvisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, bool) {
-	return d.creds, true
-}
-
 func TestHandleForkDeleteNativeRejectedWhenRequestLacksKey(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.prov.provider = tenant.ProviderTiDBCloudNative
