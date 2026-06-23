@@ -310,7 +310,7 @@ fork_delete_code=$(curl -sS -o "$fork_delete_body" -w "%{http_code}" -X DELETE \
   -d "$(jq -n --arg pk "$PUBLIC_KEY" --arg sk "$PRIVATE_KEY" '{public_key: $pk, private_key: $sk}')" \
   "$BASE/v1/fork")
 check_eq "DELETE /v1/fork returns 202" "$fork_delete_code" "202"
-rm -f "$fork_delete_body"
+rm -f "$fork_delete_body" "$FORK_LOCAL"
 
 echo "[6] delete tenant"
 set +e

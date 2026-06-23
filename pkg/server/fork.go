@@ -406,10 +406,17 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, makeProvisionFailedErr(err)
 	}
 	if cluster == nil || cluster.ClusterID == "" || cluster.BranchID == "" {
+		cid := ""
+		bid := ""
+		if cluster != nil {
+			cid = cluster.ClusterID
+			bid = cluster.BranchID
+		}
 		logger.Error(ctx, "fork_branch_response_missing_metadata",
 			zap.String("source_tenant_id", source.ID),
 			zap.String("fork_id", forkID),
-			zap.Any("cluster", cluster))
+			zap.String("response_cluster_id", cid),
+			zap.String("response_branch_id", bid))
 		s.markForkFailedAndCleanup(ctx, forkID)
 		return nil, makeProvisionFailedErr(forkErr(http.StatusBadGateway, "branch response missing required metadata"))
 	}
