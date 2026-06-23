@@ -33,7 +33,7 @@ The Go SDK has typed coverage for these server-side surfaces:
 - Git workspace API: workspace metadata, tree, git state, object packs, overlay
   entries.
 - Journal API: create, append entries, read entries, search, verify.
-- Escape hatch: `RawPost` and `RawDelete` for endpoints that do not yet have a
+- Escape hatch: `RawGet`, `RawPost`, and `RawDelete` for endpoints that do not yet have a
   typed SDK method.
 
 The compile-tested examples under `examples/go-sdk-cookbook` cover every
@@ -71,7 +71,7 @@ exported `*client.Client` method and every exported `StreamWriter` method.
 - There is no typed `Status` method that returns `/v1/status`; callers can
   access cached threshold values through `Warm`, `MaxUploadBytes`, and
   `SmallFileThreshold`.
-- `RawPost` and `RawDelete` exist, but there is no `RawGet`, `RawPut`, or
+- `RawGet`, `RawPost`, and `RawDelete` exist, but there is no `RawPut` or
   context-aware raw helper family.
 - The SDK has no public config package for sharing CLI contexts with embedded
   Go programs. This is deliberate today, but it is the largest integration gap
