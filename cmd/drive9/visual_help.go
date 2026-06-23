@@ -498,14 +498,14 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			Details: []string{
 				"show -> inspect active context; ls -> scan saved contexts",
 				"add/import -> save owner or delegated keys",
-				"fork -> create a copy-on-write context; rm -> remove local credentials",
+				"fork -> create a copy-on-write context from a TiDB Cloud tenant; rm -> remove local credentials",
 			},
 			Flags: []visualHelpFlag{
 				{Name: "--json", Desc: "available on show, fork, and ls"},
 				{Name: "--reveal", Desc: "show sensitive fields on ctx show"},
 				{Name: "--type <kind>|--scoped", Desc: "filter ctx ls results"},
-				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key for ctx fork in TiDBCloud mode"},
-				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key; prefer DRIVE9_PRIVATE_KEY in shared shells"},
+				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key for ctx fork"},
+				{Name: "--tidbcloud-private-key KEY", Desc: "flags take precedence; use DRIVE9_PRIVATE_KEY env var to avoid shell history"},
 			},
 			Examples: []visualHelpExample{
 				{Command: "drive9 ctx show", Desc: "show active context"},
