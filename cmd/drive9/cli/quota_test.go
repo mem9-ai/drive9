@@ -338,6 +338,51 @@ func TestQuotaSetRejectsMissingQuotaKnob(t *testing.T) {
 	}
 }
 
+func TestQuotaSetRejectsNonPositiveQuotaValues(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		flag    string
+		value   string
+		wantErr string
+	}{
+		{name: "zero_storage_size", flag: "--max-storage-size", value: "0", wantErr: "--max-storage-size must be positive"},
+		{name: "negative_storage_size", flag: "--max-storage-size", value: "-1", wantErr: "--max-storage-size must be positive"},
+		{name: "zero_spending_limit", flag: "--tidbcloud-spending-limit", value: "0", wantErr: "--tidbcloud-spending-limit must be positive"},
+		{name: "negative_spending_limit", flag: "--tidbcloud-spending-limit", value: "-1", wantErr: "--tidbcloud-spending-limit must be positive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			clearProvisionEnv(t)
+			resetCredentialCacheForTest()
+
+			var hit bool
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hit = true
+				http.Error(w, "unexpected request", http.StatusInternalServerError)
+			}))
+			defer ts.Close()
+			t.Setenv(EnvServer, ts.URL)
+
+			err := Quota([]string{
+				"set",
+				"--tenant-id", "tenant-1",
+				"--tidbcloud-public-key", "public-1",
+				"--tidbcloud-private-key", "private-1",
+				tc.flag, tc.value,
+			})
+			if err == nil {
+				t.Fatal("Quota set error = nil, want positive quota value error")
+			}
+			if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %q", err)
+			}
+			if hit {
+				t.Fatal("quota set dispatched request after local validation failed")
+			}
+		})
+	}
+}
+
 func TestQuotaGetStatusErrorIncludesHTTPCode(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)

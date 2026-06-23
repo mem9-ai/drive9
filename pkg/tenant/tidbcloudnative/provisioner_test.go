@@ -744,6 +744,48 @@ func TestUpdateQuotaPatchesSpendingLimitAfterLabels(t *testing.T) {
 	}
 }
 
+func TestUpdateQuotaRejectsNonPositiveSpendingLimitBeforeRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		monthly int64
+	}{
+		{name: "zero", monthly: 0},
+		{name: "negative", monthly: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hit bool
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hit = true
+				http.Error(w, "unexpected request", http.StatusInternalServerError)
+			}))
+			defer ts.Close()
+
+			p := &Provisioner{
+				apiURL: ts.URL,
+				client: ts.Client(),
+			}
+			_, err := p.UpdateQuota(context.Background(), &tenant.ClusterInfo{
+				TenantID:  "tenant-1",
+				ClusterID: "cluster-1",
+			}, tenant.CredentialProvisionRequest{
+				PublicKey:  "public-1",
+				PrivateKey: "private-1",
+			}, tenant.QuotaUpdateOptions{
+				TiDBCloudSpendingLimitMonthly: &tc.monthly,
+			})
+			if err == nil {
+				t.Fatal("UpdateQuota error = nil, want positive spending limit error")
+			}
+			if !strings.Contains(err.Error(), "tidbcloud_spending_limit must be positive") {
+				t.Fatalf("error = %q", err)
+			}
+			if hit {
+				t.Fatal("UpdateQuota dispatched request after local validation failed")
+			}
+		})
+	}
+}
+
 func TestGetQuotaOnlyGetsCluster(t *testing.T) {
 	var patchCalled bool
 	var getCalled bool

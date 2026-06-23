@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -359,6 +360,48 @@ func TestQuotaSetRejectsMissingQuotaKnobs(t *testing.T) {
 	}
 	if got := rt.prov.updateCalls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
+	}
+}
+
+func TestQuotaSetRejectsNonPositiveQuotaValues(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		field   string
+		value   int64
+		wantErr string
+	}{
+		{name: "zero_storage_size", field: "max_storage_size", value: 0, wantErr: "max_storage_size must be positive"},
+		{name: "negative_storage_size", field: "max_storage_size", value: -1, wantErr: "max_storage_size must be positive"},
+		{name: "zero_spending_limit", field: "tidbcloud_spending_limit", value: 0, wantErr: "tidbcloud_spending_limit must be positive"},
+		{name: "negative_spending_limit", field: "tidbcloud_spending_limit", value: -1, wantErr: "tidbcloud_spending_limit must be positive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+			ts := httptest.NewServer(rt.server)
+			defer ts.Close()
+
+			body := map[string]any{
+				"tenant_id":   rt.tenantID,
+				"public_key":  "public-1",
+				"private_key": "private-1",
+				tc.field:      tc.value,
+			}
+			resp := postJSON(t, ts.URL+"/v1/quota", body, "")
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400", resp.StatusCode)
+			}
+			raw, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(raw), tc.wantErr) {
+				t.Fatalf("body = %q, want %q", raw, tc.wantErr)
+			}
+			if got := rt.prov.updateCalls.Load(); got != 0 {
+				t.Fatalf("update calls = %d, want 0", got)
+			}
+		})
 	}
 }
 

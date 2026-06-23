@@ -88,7 +88,7 @@ URL directly. If both are present, `--server` wins.
 Validation rules:
 
 - `--max-storage-size` must be positive.
-- `--tidbcloud-spending-limit` must be a non-negative 32-bit integer.
+- `--tidbcloud-spending-limit` must be a positive 32-bit integer.
 
 ## HTTP API
 
@@ -144,7 +144,8 @@ curl -sS \
   }'
 ```
 
-At least one of `max_storage_size` or `tidbcloud_spending_limit` is required.
+At least one of `max_storage_size` or `tidbcloud_spending_limit` is required;
+provided values must be positive.
 
 ## Error responses
 

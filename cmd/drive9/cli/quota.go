@@ -194,7 +194,7 @@ func quotaSet(args []string) error {
 				return fmt.Errorf("--max-storage-size requires an argument")
 			}
 			i++
-			v, err := parseQuotaInt64Flag("--max-storage-size", args[i])
+			v, err := parsePositiveQuotaInt64Flag("--max-storage-size", args[i])
 			if err != nil {
 				return err
 			}
@@ -204,7 +204,7 @@ func quotaSet(args []string) error {
 				return fmt.Errorf("--tidbcloud-spending-limit requires an argument")
 			}
 			i++
-			v, err := parseQuotaInt64Flag("--tidbcloud-spending-limit", args[i])
+			v, err := parsePositiveQuotaInt64Flag("--tidbcloud-spending-limit", args[i])
 			if err != nil {
 				return err
 			}
@@ -318,6 +318,17 @@ func parseQuotaInt64Flag(name, raw string) (int64, error) {
 	return value, nil
 }
 
+func parsePositiveQuotaInt64Flag(name, raw string) (int64, error) {
+	value, err := parseQuotaInt64Flag(name, raw)
+	if err != nil {
+		return 0, err
+	}
+	if value <= 0 {
+		return 0, fmt.Errorf("%s must be positive", name)
+	}
+	return value, nil
+}
+
 func printQuotaCLIResponse(out *client.QuotaResponse, asJSON bool) error {
 	if out == nil {
 		return fmt.Errorf("quota response is empty")
@@ -380,6 +391,6 @@ flags:
   --tidbcloud-public-key KEY      TiDB Cloud public key
   --tidbcloud-private-key KEY     TiDB Cloud private key
   --max-storage-size Mi           max confirmed+reserved storage size in Mi
-  --tidbcloud-spending-limit N    TiDB Cloud Cluster Spending Limit; see https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit
+  --tidbcloud-spending-limit N    TiDB Cloud Cluster Spending Limit; must be positive; see https://docs.pingcap.com/tidbcloud/manage-serverless-spend-limit
   --json                          output result as JSON`
 }

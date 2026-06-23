@@ -221,8 +221,8 @@ func validateQuotaSetRequest(req quotaRequest) error {
 			return err
 		}
 	}
-	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit < 0 {
-		return fmt.Errorf("tidbcloud_spending_limit must be non-negative")
+	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit <= 0 {
+		return fmt.Errorf("tidbcloud_spending_limit must be positive")
 	}
 	if req.TiDBCloudSpendingLimit != nil && *req.TiDBCloudSpendingLimit > maxInt32 {
 		return fmt.Errorf("tidbcloud_spending_limit is too large")

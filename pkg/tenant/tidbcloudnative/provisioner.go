@@ -462,6 +462,11 @@ func (p *Provisioner) UpdateQuota(ctx context.Context, cluster *tenant.ClusterIn
 	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
 		return nil, fmt.Errorf("cluster id is required")
 	}
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		if err := validateTiDBCloudSpendingLimit(*opts.TiDBCloudSpendingLimitMonthly); err != nil {
+			return nil, err
+		}
+	}
 	clusterID := strings.TrimSpace(cluster.ClusterID)
 	labels, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
 	if err != nil {
@@ -558,9 +563,8 @@ func (p *Provisioner) clusterQuotaInfo(ctx context.Context, publicKey, privateKe
 }
 
 func (p *Provisioner) updateSpendingLimitWithCredentials(ctx context.Context, publicKey, privateKey, clusterID string, monthly int64) error {
-	const maxInt32 = int64(1<<31 - 1)
-	if monthly < 0 || monthly > maxInt32 {
-		return fmt.Errorf("tidbcloud_spending_limit must be a non-negative 32-bit integer")
+	if err := validateTiDBCloudSpendingLimit(monthly); err != nil {
+		return err
 	}
 	body, err := json.Marshal(map[string]any{
 		"updateMask": "spendingLimit.monthly",
@@ -583,6 +587,17 @@ func (p *Provisioner) updateSpendingLimitWithCredentials(ctx context.Context, pu
 			return readErr
 		}
 		return quotaStatusError("cluster spending limit update", resp.StatusCode, sanitizeUpstreamBody(raw))
+	}
+	return nil
+}
+
+func validateTiDBCloudSpendingLimit(monthly int64) error {
+	const maxInt32 = int64(1<<31 - 1)
+	if monthly <= 0 {
+		return fmt.Errorf("tidbcloud_spending_limit must be positive")
+	}
+	if monthly > maxInt32 {
+		return fmt.Errorf("tidbcloud_spending_limit is too large")
 	}
 	return nil
 }
