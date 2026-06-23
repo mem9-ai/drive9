@@ -1470,6 +1470,11 @@ func (m *semanticWorkerManager) taskTypesForProvider(provider string) []semantic
 	// EMBED_TEXT, so include pool-configured extract types alongside app-managed
 	// embed types. Without this, img_extract_text tasks enqueued for app-mode
 	// tenants would never be scanned or claimed when no embedder is configured.
+	// However, db9 (PostgreSQL) providers do not support the TiDB-class async
+	// extract runtimes, so they are excluded from extract task scanning.
+	if provider == tenant.ProviderDB9 {
+		return m.appManagedTaskTypes()
+	}
 	return unionTaskTypes(m.appManagedTaskTypes(), m.poolExtractTaskTypes())
 }
 
