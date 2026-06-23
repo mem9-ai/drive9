@@ -249,6 +249,55 @@ func TestSemanticWorkerProcessesImgExtractTaskWithoutEmbedder(t *testing.T) {
 	}
 }
 
+// TestSemanticWorkerStartsForAppModeImageExtractWithoutEmbedder verifies that
+// the semantic worker starts and processes img_extract_text tasks in app-embedding
+// mode (not database auto-embedding) even when no embedder is configured. Image
+// extraction does not depend on EMBED_TEXT.
+func TestSemanticWorkerStartsForAppModeImageExtractWithoutEmbedder(t *testing.T) {
+	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
+		AppSemanticTasksEnabled: true,
+		AsyncImageExtract: backend.AsyncImageExtractOptions{
+			Enabled:   true,
+			Extractor: staticServerImageExtractor{text: "cat on sofa screenshot invoice"},
+		},
+	})
+	fileID := insertServerImageFileForExtractTest(t, b, "/img/app-no-embedder.png", "image/png", []byte("fake-png"))
+	payload, err := json.Marshal(semantic.ImgExtractTaskPayload{Path: "/img/app-no-embedder.png", ContentType: "image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	if _, err := b.Store().EnqueueSemanticTask(context.Background(), &semantic.Task{
+		TaskID:          "app-img-task-1",
+		TaskType:        semantic.TaskTypeImgExtractText,
+		ResourceID:      fileID,
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     now,
+		PayloadJSON:     payload,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No embedder configured — the worker must still start for image extract.
+	s := NewWithConfig(Config{Backend: b, SemanticWorkers: SemanticWorkerOptions{
+		Workers:         1,
+		PollInterval:    10 * time.Millisecond,
+		RecoverInterval: 50 * time.Millisecond,
+		LeaseDuration:   200 * time.Millisecond,
+	}})
+	t.Cleanup(func() { s.Close() })
+	if s.semanticWorker == nil {
+		t.Fatal("expected semantic worker to start for app-mode image tasks without embedder")
+	}
+
+	waitForContentTextOnServer(t, b, "/img/app-no-embedder.png", "cat on sofa", 3*time.Second)
+	waitForNamedTaskStatus(t, b, "app-img-task-1", string(semantic.TaskSucceeded), 3*time.Second)
+}
+
 func TestSemanticWorkerProcessesAudioExtractTaskWithoutEmbedder(t *testing.T) {
 	b := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
 		DatabaseAutoEmbedding: true,
