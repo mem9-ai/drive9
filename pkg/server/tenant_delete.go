@@ -218,22 +218,6 @@ func decodeCredentialDeprovisionRequest(w http.ResponseWriter, r *http.Request) 
 	return *req, nil
 }
 
-func (s *Server) startTenantDeleteCleanup(ctx context.Context) {
-	s.startForkWorker(ctx, func(workerCtx context.Context) {
-		ticker := time.NewTicker(defaultTenantDeletePollInterval)
-		defer ticker.Stop()
-		s.processTenantDeleteJobs(workerCtx)
-		for {
-			select {
-			case <-workerCtx.Done():
-				return
-			case <-ticker.C:
-				s.processTenantDeleteJobs(workerCtx)
-			}
-		}
-	})
-}
-
 func (s *Server) processTenantDeleteJobs(ctx context.Context) {
 	now := time.Now().UTC()
 	if _, err := s.meta.RecoverStaleTenantDeleteJobs(ctx, now.Add(-defaultTenantDeleteRunningTTL)); err != nil {

@@ -65,7 +65,21 @@ func (b *Dat9Backend) StartFileGCWorker(opts FileGCWorkerOptions) *FileGCWorker 
 	return w
 }
 
-func (b *Dat9Backend) stopFileGCWorker() {
+// FileGCWorkerRunning reports whether the per-tenant file GC worker is currently
+// active. Intended for leadership-lifecycle tests and diagnostics.
+func (b *Dat9Backend) FileGCWorkerRunning() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.fileGCWorker != nil
+}
+
+// StopFileGCWorker stops the per-tenant file GC worker if it is running. Safe
+// to call when no worker is active. Used by the tenant pool's StopAllFileGC
+// (leader-loss path) and the backend's own Close.
+func (b *Dat9Backend) StopFileGCWorker() {
 	b.mu.Lock()
 	w := b.fileGCWorker
 	b.fileGCWorker = nil
