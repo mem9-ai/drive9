@@ -860,9 +860,10 @@ func TestHandleForkDeleteNativeRejectsWhenNoCredentialsAvailable(t *testing.T) {
 	}
 }
 
-func TestCreateForkTenantNativeNoEndpointNoDefaultCredentialFailsWithAPIKey(t *testing.T) {
+func TestCreateForkTenantNativeProvisionsWhenCredentialsPresent(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.prov.systemUsername = "u1.root"
 	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
 	rt.prov.cluster = &tenant.ClusterInfo{
 		ClusterID: "cluster-a",
@@ -874,25 +875,21 @@ func TestCreateForkTenantNativeNoEndpointNoDefaultCredentialFailsWithAPIKey(t *t
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	})
-	if err == nil {
-		t.Fatal("createForkTenant error = nil, want forkProvisionFailedError")
+	if err != nil {
+		t.Fatalf("createForkTenant error = %v, want nil", err)
 	}
-	var provisionErr *forkProvisionFailedError
-	if !errors.As(err, &provisionErr) {
-		t.Fatalf("createForkTenant error type = %T, want forkProvisionFailedError", err)
+	if resp == nil {
+		t.Fatal("createForkTenant response is nil")
 	}
-	if provisionErr.APIKey == "" {
-		t.Fatal("forkProvisionFailedError.APIKey is empty")
+	if resp.Status != string(meta.TenantProvisioning) {
+		t.Fatalf("createForkTenant status = %s, want %s", resp.Status, meta.TenantProvisioning)
 	}
-	if provisionErr.TenantID == "" {
-		t.Fatal("forkProvisionFailedError.TenantID is empty")
-	}
-	if resp != nil {
-		t.Fatalf("createForkTenant response = %+v, want nil on error", resp)
+	if resp.APIKey == "" {
+		t.Fatal("createForkTenant response missing api_key")
 	}
 }
 
-func TestHandleForkCreateNativeNoEndpointNoDefaultCredentialReturnsFailedWithAPIKey(t *testing.T) {
+func TestCreateForkTenantNativeNoDefaultCredentialReturnsError(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.prov.provider = tenant.ProviderTiDBCloudNative
 	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
@@ -901,7 +898,26 @@ func TestHandleForkCreateNativeNoEndpointNoDefaultCredentialReturnsFailedWithAPI
 		BranchID:  "branch-created",
 		Provider:  tenant.ProviderTiDBCloudNative,
 	}
-	rt.prov.deleteErr = fmt.Errorf("delete branch failed")
+
+	_, err := rt.server.createForkTenant(context.Background(), "source", "fork", nil)
+	if err == nil {
+		t.Fatal("createForkTenant error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), tenant.ErrCredentialsRequired.Error()) {
+		t.Fatalf("createForkTenant error = %v, want ErrCredentialsRequired", err)
+	}
+}
+
+func TestHandleForkCreateNativeReturnsProvisioningWhenCredentialsPresent(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.prov.systemUsername = "u1.root"
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/fork", strings.NewReader(`{"name":"test-fork","public_key":"public-1","private_key":"private-1"}`))
 	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "source"}))
@@ -912,17 +928,14 @@ func TestHandleForkCreateNativeNoEndpointNoDefaultCredentialReturnsFailedWithAPI
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
-	if !strings.Contains(body, `"status":"failed"`) {
-		t.Fatalf("body missing status failed: %s", body)
+	if !strings.Contains(body, `"status":"provisioning"`) {
+		t.Fatalf("body missing status provisioning: %s", body)
 	}
 	if !strings.Contains(body, `"api_key"`) {
 		t.Fatalf("body missing api_key: %s", body)
 	}
-	if !strings.Contains(body, `"tenant_id"`) {
-		t.Fatalf("body missing tenant_id: %s", body)
-	}
-	if strings.Contains(body, `"status":"provisioning"`) {
-		t.Fatalf("body should not contain provisioning status: %s", body)
+	if strings.Contains(body, `"status":"failed"`) {
+		t.Fatalf("body should not contain failed status: %s", body)
 	}
 }
 
