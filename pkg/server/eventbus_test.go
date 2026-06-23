@@ -1,191 +1,193 @@
 package server
 
 import (
+	"context"
+	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/datastore"
 )
 
-func TestEventBusPublishAndSeq(t *testing.T) {
-	bus := NewEventBus()
-	if bus.Seq() != 0 {
-		t.Fatalf("initial seq=%d, want 0", bus.Seq())
+func newTestStoreForEventBus(t *testing.T) *datastore.Store {
+	t.Helper()
+	inst, err := testmysql.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = inst.Close(context.Background()) })
+	store, err := datastore.Open(inst.DSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	testmysql.ResetDB(t, store.DB())
+	// Ensure fs_events table exists.
+	if _, err := store.DB().Exec(`CREATE TABLE IF NOT EXISTS fs_events (
+		seq        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+		path       VARCHAR(512) NOT NULL,
+		op         VARCHAR(64) NOT NULL,
+		actor      VARCHAR(255),
+		ts         BIGINT NOT NULL,
+		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	// Create index, ignoring "duplicate key" error for idempotency (MySQL has no IF NOT EXISTS for indexes).
+	if _, err := store.DB().Exec(`CREATE INDEX idx_fs_events_created ON fs_events(created_at)`); err != nil && !strings.Contains(err.Error(), "Duplicate key") {
+		t.Fatal(err)
+	}
+	return store
+}
+
+func TestEventBusSubscribeAndNotify(t *testing.T) {
+	store := newTestStoreForEventBus(t)
+	bus := NewEventBus(store)
+
+	subID, notify := bus.Subscribe()
+	defer bus.Unsubscribe(subID)
+
+	// No signal yet.
+	select {
+	case <-notify:
+		t.Fatal("unexpected signal before publish")
+	case <-time.After(50 * time.Millisecond):
 	}
 
-	bus.Publish("/a.txt", "write", "actor1")
-	if bus.Seq() != 1 {
-		t.Fatalf("seq after 1 publish=%d, want 1", bus.Seq())
+	// Insert an event and signal.
+	if _, err := store.InsertFSEvent(context.Background(), "/a.txt", "write", "actor1", time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
 	}
+	bus.Publish()
 
-	bus.Publish("/b.txt", "delete", "actor2")
-	if bus.Seq() != 2 {
-		t.Fatalf("seq after 2 publishes=%d, want 2", bus.Seq())
+	// Should receive a signal.
+	select {
+	case _, open := <-notify:
+		if !open {
+			t.Fatal("channel closed unexpectedly")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for signal")
 	}
 }
 
-func TestEventBusSince0ReturnsNotOK(t *testing.T) {
-	bus := NewEventBus()
-	bus.Publish("/a.txt", "write", "")
+func TestEventBusEventsSinceZeroReturnsReset(t *testing.T) {
+	store := newTestStoreForEventBus(t)
+	bus := NewEventBus(store)
 
-	events, headSeq, ok := bus.EventsSince(0)
+	if _, err := store.InsertFSEvent(context.Background(), "/a.txt", "write", "", time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+
+	events, headSeq, ok := bus.EventsSince(context.Background(), 0)
 	if ok {
-		t.Fatal("EventsSince(0) should return ok=false (initial sync → reset)")
+		t.Fatalf("EventsSince(0) should return ok=false for initial sync, got ok=true with %d events", len(events))
 	}
-	if events != nil {
-		t.Fatalf("expected nil events, got %d", len(events))
-	}
-	if headSeq != 1 {
-		t.Fatalf("headSeq=%d, want 1", headSeq)
+	if headSeq == 0 {
+		t.Fatal("headSeq should be > 0 after insert")
 	}
 }
 
-func TestEventBusReplay(t *testing.T) {
-	bus := NewEventBus()
-	bus.Publish("/a.txt", "write", "")
-	bus.Publish("/b.txt", "write", "")
-	bus.Publish("/c.txt", "delete", "")
+func TestEventBusEventsSinceReplays(t *testing.T) {
+	store := newTestStoreForEventBus(t)
+	bus := NewEventBus(store)
 
-	events, _, ok := bus.EventsSince(1) // since seq=1, want seq=2,3
+	// Insert two events.
+	seq1, err := store.InsertFSEvent(context.Background(), "/a.txt", "write", "actor1", time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	seq2, err := store.InsertFSEvent(context.Background(), "/b.txt", "delete", "actor2", time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Query events since seq1 (should get event 2).
+	events, headSeq, ok := bus.EventsSince(context.Background(), uint64(seq1))
 	if !ok {
-		t.Fatal("EventsSince(1) returned not ok")
-	}
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events, got %d", len(events))
-	}
-	if events[0].Seq != 2 || events[0].Path != "/b.txt" {
-		t.Errorf("event[0] = %+v", events[0])
-	}
-	if events[1].Seq != 3 || events[1].Path != "/c.txt" {
-		t.Errorf("event[1] = %+v", events[1])
-	}
-}
-
-func TestEventBusCaughtUp(t *testing.T) {
-	bus := NewEventBus()
-	bus.Publish("/a.txt", "write", "")
-
-	events, _, ok := bus.EventsSince(1)
-	if !ok {
-		t.Fatal("expected ok=true when caught up")
-	}
-	if len(events) != 0 {
-		t.Fatalf("expected 0 events when caught up, got %d", len(events))
-	}
-}
-
-func TestEventBusRingOverflow(t *testing.T) {
-	bus := NewEventBus()
-	// Fill ring + 2 to trigger wrap; ring holds seqs [3..ringSize+2],
-	// so seq 1 is truly evicted (since+1=2 < oldestSeq=3 → reset).
-	for i := 0; i < eventBusRingSize+2; i++ {
-		bus.Publish("/file.txt", "write", "")
-	}
-
-	// Seq 1 is evicted: client needs seq 2, but oldest in ring is 3.
-	_, _, ok := bus.EventsSince(1)
-	if ok {
-		t.Fatal("expected ok=false for seq that's been overwritten")
-	}
-
-	// since=2 is the boundary: client needs seq 3 = oldestSeq, all present.
-	events, _, ok := bus.EventsSince(2)
-	if !ok {
-		t.Fatal("expected ok=true for since=oldestSeq-1 (boundary)")
-	}
-	if len(events) != eventBusRingSize {
-		t.Fatalf("expected %d events, got %d", eventBusRingSize, len(events))
-	}
-
-	// Most recent seq should still be reachable.
-	events, _, ok = bus.EventsSince(uint64(eventBusRingSize + 1))
-	if !ok {
-		t.Fatal("expected ok=true for recent seq")
+		t.Fatal("EventsSince should succeed")
 	}
 	if len(events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(events))
 	}
-}
-
-func TestEventBusFutureSeq(t *testing.T) {
-	bus := NewEventBus()
-	bus.Publish("/a.txt", "write", "")
-
-	// Client has seq=999 but server only has seq=1 (e.g. server restarted).
-	_, _, ok := bus.EventsSince(999)
-	if ok {
-		t.Fatal("expected ok=false for future seq (server restart)")
+	if events[0].Path != "/b.txt" || events[0].Op != "delete" {
+		t.Fatalf("unexpected event: %+v", events[0])
+	}
+	if headSeq < uint64(seq2) {
+		t.Fatalf("headSeq=%d, want >= %d", headSeq, seq2)
 	}
 }
 
-func TestEventBusSubscribeNotify(t *testing.T) {
-	bus := NewEventBus()
-	id, ch := bus.Subscribe()
-	defer bus.Unsubscribe(id)
+func TestEventBusSeq(t *testing.T) {
+	store := newTestStoreForEventBus(t)
+	bus := NewEventBus(store)
 
-	bus.Publish("/a.txt", "write", "")
+	// Reset AUTO_INCREMENT so seq starts at 1.
+	if _, err := store.DB().Exec(`ALTER TABLE fs_events AUTO_INCREMENT = 1`); err != nil {
+		t.Fatal(err)
+	}
 
+	if bus.Seq(context.Background()) != 0 {
+		t.Fatal("initial seq should be 0")
+	}
+
+	seq, err := store.InsertFSEvent(context.Background(), "/a.txt", "write", "", time.Now().UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seq != 1 {
+		t.Fatalf("insert returned seq=%d, want 1", seq)
+	}
+	if bus.Seq(context.Background()) != 1 {
+		t.Fatalf("seq after 1 insert = %d, want 1", bus.Seq(context.Background()))
+	}
+}
+
+func TestEventBusSubscribeUnsubscribe(t *testing.T) {
+	store := newTestStoreForEventBus(t)
+	bus := NewEventBus(store)
+
+	subID, _ := bus.Subscribe()
+	bus.Unsubscribe(subID)
+
+	// After unsubscribe, a new subscribe should work.
+	subID2, notify := bus.Subscribe()
+	defer bus.Unsubscribe(subID2)
+
+	bus.Publish()
 	select {
-	case <-ch:
-		// OK — received signal.
-	default:
-		t.Fatal("expected signal on subscriber channel after publish")
+	case _, open := <-notify:
+		if !open {
+			t.Fatal("channel closed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for signal")
 	}
 }
 
-func TestEventBusUnsubscribeCloses(t *testing.T) {
-	bus := NewEventBus()
-	id, ch := bus.Subscribe()
-	bus.Unsubscribe(id)
+func TestEventBusMultipleSubscribers(t *testing.T) {
+	store := newTestStoreForEventBus(t)
+	bus := NewEventBus(store)
 
-	_, open := <-ch
-	if open {
-		t.Fatal("expected channel to be closed after unsubscribe")
-	}
-}
-
-func TestEventBusConcurrentPublish(t *testing.T) {
-	bus := NewEventBus()
 	var wg sync.WaitGroup
-	n := 100
-	wg.Add(n)
+	const n = 5
 	for i := 0; i < n; i++ {
-		go func() {
+		wg.Add(1)
+		subID, notify := bus.Subscribe()
+		go func(id uint64, ch chan struct{}) {
 			defer wg.Done()
-			bus.Publish("/file.txt", "write", "")
-		}()
+			select {
+			case _, open := <-ch:
+				if open {
+					bus.Unsubscribe(id)
+				}
+			case <-time.After(2 * time.Second):
+			}
+		}(subID, notify)
 	}
+
+	bus.Publish()
 	wg.Wait()
-
-	if bus.Seq() != uint64(n) {
-		t.Fatalf("seq=%d, want %d", bus.Seq(), n)
-	}
-}
-
-func TestEventBusSinceBoundaryNoFalseReset(t *testing.T) {
-	bus := NewEventBus()
-	// Fill ring so oldestSeq > 1: publish eventBusRingSize+2 events
-	// so ring contains seqs [3, 4, ..., ringSize+2] with oldestSeq=3.
-	for i := 0; i < eventBusRingSize+2; i++ {
-		bus.Publish("/file.txt", "write", "")
-	}
-	// since=2 means client needs seq 3+, which is exactly oldestSeq.
-	// This should NOT trigger a reset — all needed events are in the ring.
-	events, _, ok := bus.EventsSince(2)
-	if !ok {
-		t.Fatal("expected ok=true for since=oldestSeq-1 (all needed events are in the ring)")
-	}
-	if len(events) != eventBusRingSize {
-		t.Fatalf("expected %d events, got %d", eventBusRingSize, len(events))
-	}
-	if events[0].Seq != 3 {
-		t.Fatalf("first event seq=%d, want 3", events[0].Seq)
-	}
-}
-
-func TestEventBusEmptyRingSincePositive(t *testing.T) {
-	bus := NewEventBus()
-	// No events published; client has since=5 (stale from previous server life).
-	_, _, ok := bus.EventsSince(5)
-	if ok {
-		t.Fatal("expected ok=false when ring is empty and since > 0")
-	}
 }

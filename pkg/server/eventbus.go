@@ -1,13 +1,15 @@
 package server
 
 import (
+	"context"
 	"sync"
-	"time"
+
+	"github.com/mem9-ai/drive9/pkg/datastore"
 )
 
 // ChangeEvent represents a single filesystem mutation event.
 type ChangeEvent struct {
-	Seq   uint64 `json:"seq"`              // monotonic per-bus sequence number
+	Seq   uint64 `json:"seq"`              // monotonic per-tenant seq (fs_events.seq AUTO_INCREMENT)
 	Path  string `json:"path"`             // affected path
 	Op    string `json:"op"`               // "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
 	Actor string `json:"actor,omitempty"`  // X-Dat9-Actor header value (per-mount ID)
@@ -15,47 +17,34 @@ type ChangeEvent struct {
 }
 
 const (
-	eventBusRingSize         = 10000
 	eventBusListenerChanSize = 1 // signal-only channel
 )
 
-// EventBus is a per-tenant in-memory event hub backed by a fixed-size ring buffer.
-// Single-instance only — does not survive restarts or replicate across processes.
+// EventBus is a per-tenant event hub backed by the durable fs_events table.
+// Events are stored in the shared tenant database so that they propagate across
+// all pods. The local notify channel provides instant push to same-pod SSE clients;
+// cross-pod events are discovered via periodic polling of the fs_events table.
 type EventBus struct {
+	store     *datastore.Store
 	mu        sync.Mutex
-	seq       uint64 // monotonic counter, protected by mu
-	ring      [eventBusRingSize]ChangeEvent
-	head      int // next write position
-	count     int // entries currently stored (max eventBusRingSize)
 	listeners map[uint64]chan struct{}
 	nextID    uint64
 }
 
-// NewEventBus creates a new EventBus.
-func NewEventBus() *EventBus {
+// NewEventBus creates a new EventBus backed by the given tenant store.
+func NewEventBus(store *datastore.Store) *EventBus {
 	return &EventBus{
+		store:     store,
 		listeners: make(map[uint64]chan struct{}),
 	}
 }
 
-// Publish appends a new event to the ring buffer and wakes all subscribers.
-func (eb *EventBus) Publish(path, op, actor string) {
+// Publish signals all local subscribers that a new event is available.
+// The actual event row is inserted into fs_events by the caller (publishEvent)
+// before calling Publish; this method only wakes same-pod SSE clients for instant
+// delivery. Cross-pod clients discover new rows via periodic polling.
+func (eb *EventBus) Publish() {
 	eb.mu.Lock()
-	eb.seq++
-	ev := ChangeEvent{
-		Seq:   eb.seq,
-		Path:  path,
-		Op:    op,
-		Actor: actor,
-		Ts:    time.Now().UnixMilli(),
-	}
-	eb.ring[eb.head] = ev
-	eb.head = (eb.head + 1) % eventBusRingSize
-	if eb.count < eventBusRingSize {
-		eb.count++
-	}
-
-	// Wake all listeners (non-blocking send on signal channel).
 	for _, ch := range eb.listeners {
 		select {
 		case ch <- struct{}{}:
@@ -66,7 +55,7 @@ func (eb *EventBus) Publish(path, op, actor string) {
 }
 
 // Subscribe registers a new listener. Returns a unique ID and a signal channel.
-// The channel receives a signal whenever new events are published.
+// The channel receives a signal whenever new events are published locally.
 // Call Unsubscribe with the returned ID to clean up.
 func (eb *EventBus) Subscribe() (uint64, chan struct{}) {
 	eb.mu.Lock()
@@ -90,62 +79,48 @@ func (eb *EventBus) Unsubscribe(id uint64) {
 	}
 }
 
-// Seq returns the current sequence number (0 if no events published).
-func (eb *EventBus) Seq() uint64 {
-	eb.mu.Lock()
-	defer eb.mu.Unlock()
-	return eb.seq
+// Seq returns the current maximum fs_events seq, or 0 if no events exist.
+func (eb *EventBus) Seq(ctx context.Context) uint64 {
+	if eb.store == nil {
+		return 0
+	}
+	seq, err := eb.store.LatestFSEventSeq(ctx)
+	if err != nil {
+		return 0
+	}
+	return uint64(seq)
 }
 
 // EventsSince returns all events with seq > since and the current head seq.
-// If since is too old (ring wrapped), from the future, or zero, ok is false
-// and the caller should send a reset using the returned headSeq.
-//
-// headSeq is always returned from the same lock acquisition as the event
-// scan, guaranteeing a consistent snapshot for reset cursor positioning.
-func (eb *EventBus) EventsSince(since uint64) (events []ChangeEvent, headSeq uint64, ok bool) {
-	eb.mu.Lock()
-	defer eb.mu.Unlock()
-
-	headSeq = eb.seq
-
+// If since is 0 (initial sync) or the query fails, ok is false and the caller
+// should send a reset using the returned headSeq.
+func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []ChangeEvent, headSeq uint64, ok bool) {
+	if eb.store == nil {
+		return nil, 0, false
+	}
 	if since == 0 {
+		// Initial sync: send reset so client starts fresh.
+		headSeq = eb.Seq(ctx)
 		return nil, headSeq, false
 	}
-
-	if eb.count == 0 {
-		// No events ever published. since > 0 means stale client.
+	rows, err := eb.store.ListFSEventsSince(ctx, int64(since), 1000)
+	if err != nil {
+		// Table missing or query failed: send reset.
+		headSeq = eb.Seq(ctx)
 		return nil, headSeq, false
 	}
-
-	// Find the oldest seq in the ring.
-	oldestIdx := (eb.head - eb.count + eventBusRingSize) % eventBusRingSize
-	oldestSeq := eb.ring[oldestIdx].Seq
-	newestSeq := eb.ring[(eb.head-1+eventBusRingSize)%eventBusRingSize].Seq
-
-	if since+1 < oldestSeq {
-		// Ring has wrapped past the client's position.
-		// since+1 is the first seq the client needs; if it's older than
-		// the oldest retained event, we can't replay.
-		return nil, headSeq, false
+	events = make([]ChangeEvent, 0, len(rows))
+	for _, r := range rows {
+		events = append(events, ChangeEvent{
+			Seq:   r.Seq,
+			Path:  r.Path,
+			Op:    r.Op,
+			Actor: r.Actor,
+			Ts:    r.Ts,
+		})
 	}
-	if since > newestSeq {
-		// Client is ahead of us (e.g. server restarted). Send reset.
-		return nil, headSeq, false
-	}
-	if since == newestSeq {
-		// Client is caught up, no new events.
-		return nil, headSeq, true
-	}
-
-	// Walk the ring from oldest to newest, collecting events with seq > since.
-	result := make([]ChangeEvent, 0, 64)
-	for i := 0; i < eb.count; i++ {
-		idx := (oldestIdx + i) % eventBusRingSize
-		ev := eb.ring[idx]
-		if ev.Seq > since {
-			result = append(result, ev)
-		}
-	}
-	return result, headSeq, true
+	headSeq = eb.Seq(ctx)
+	// If no new events, ok=true with empty slice (client is caught up).
+	// If we hit the limit, the client will poll again and get more.
+	return events, headSeq, true
 }

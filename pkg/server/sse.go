@@ -10,13 +10,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"go.uber.org/zap"
 )
 
 const (
 	sseHeartbeatInterval = 30 * time.Second
 	sseFlushBatchSize    = 10
 	sseFlushMaxDelay     = 1 * time.Millisecond
+	// ssePollInterval is how often the live stream polls the fs_events table
+	// for cross-pod events. Matches the fs_layer_events poll interval.
+	ssePollInterval = 1 * time.Second
 )
 
 // stopTimer drains a timer's channel after stopping it to prevent spurious
@@ -119,7 +124,7 @@ func newEventBuses() *eventBuses {
 	}
 }
 
-func (ebs *eventBuses) get(tenantID string) *EventBus {
+func (ebs *eventBuses) get(tenantID string, store *datastore.Store) *EventBus {
 	ebs.mu.RLock()
 	bus, ok := ebs.buses[tenantID]
 	ebs.mu.RUnlock()
@@ -133,24 +138,38 @@ func (ebs *eventBuses) get(tenantID string) *EventBus {
 	if bus, ok = ebs.buses[tenantID]; ok {
 		return bus
 	}
-	bus = NewEventBus()
+	bus = NewEventBus(store)
 	ebs.buses[tenantID] = bus
 	return bus
 }
 
 func (s *Server) tenantEventBus(r *http.Request) *EventBus {
 	scope := ScopeFromContext(r.Context())
-	if scope != nil {
-		return s.events.get(scope.TenantID)
+	if scope != nil && scope.Backend != nil {
+		return s.events.get(scope.TenantID, scope.Backend.Store())
 	}
 	// Single-tenant / fallback mode.
-	return s.events.get("")
+	var store *datastore.Store
+	if s.fallback != nil {
+		store = s.fallback.Store()
+	}
+	return s.events.get("", store)
 }
 
 func (s *Server) publishEvent(r *http.Request, path, op string) {
 	actor := r.Header.Get("X-Dat9-Actor")
 	bus := s.tenantEventBus(r)
-	bus.Publish(path, op, actor)
+	// Best-effort durable insert: if it fails, local SSE clients still get the
+	// event via the notify signal; cross-pod clients get a reset on reconnect.
+	if bus.store != nil {
+		if _, err := bus.store.InsertFSEvent(r.Context(), path, op, actor, time.Now().UnixMilli()); err != nil {
+			logger.Warn(r.Context(), "sse_publish_fs_event_insert_failed",
+				zap.String("path", path),
+				zap.String("op", op),
+				zap.Error(err))
+		}
+	}
+	bus.Publish()
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
@@ -190,9 +209,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
 	// Phase 1: Replay or Reset.
-	// EventsSince returns headSeq from the same lock acquisition as the
-	// ring scan, so reset cursor and ring state are a consistent snapshot.
-	events, headSeq, ok := bus.EventsSince(since)
+	// EventsSince reads from the durable fs_events table, so events written
+	// by other pods are visible here (cross-pod propagation).
+	events, headSeq, ok := bus.EventsSince(ctx, since)
 	lastSeen := since
 
 	bw := newSSEBufferedWriter(w, flusher)
@@ -225,10 +244,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Phase 2: Live stream with micro-batching.
-	// Instead of flushing after every single event, we accumulate events
-	// and flush at heartbeat boundaries or when the batch size is reached.
+	// The notify channel catches same-pod events instantly. A 1s poll ticker
+	// catches cross-pod events (writes on other pods that inserted into the
+	// shared fs_events table). This matches the fs_layer_events poll interval.
 	heartbeat := time.NewTicker(sseHeartbeatInterval)
 	defer heartbeat.Stop()
+	poll := time.NewTicker(ssePollInterval)
+	defer poll.Stop()
 
 	// Use a nil timer that we allocate on first need. Starting with
 	// time.NewTimer(0) and immediately stopping can leave a stale tick
@@ -241,6 +263,49 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			flushC = nil
 		}
 	}()
+
+	// pollAndSend queries fs_events for new rows since lastSeen and streams them.
+	// Returns false if the stream should terminate (write error or reset sent).
+	pollAndSend := func() bool {
+		liveEvents, liveHead, liveOK := bus.EventsSince(ctx, lastSeen)
+		if !liveOK {
+			sendSSEReset(bw, liveHead, "seq_too_old")
+			lastSeen = liveHead
+			if err := bw.Flush(); err != nil {
+				return false
+			}
+			if flushTimer != nil {
+				stopTimer(flushTimer)
+				flushC = nil
+			}
+			return true
+		}
+		for _, ev := range liveEvents {
+			sendSSEEvent(bw, ev)
+			lastSeen = ev.Seq
+		}
+		if bw.count > 0 {
+			if bw.shouldFlush() {
+				if err := bw.Flush(); err != nil {
+					return false
+				}
+				if flushTimer != nil {
+					stopTimer(flushTimer)
+					flushC = nil
+				}
+			} else if flushC == nil {
+				if flushTimer == nil {
+					flushTimer = time.NewTimer(sseFlushMaxDelay)
+				} else {
+					stopTimer(flushTimer)
+					flushTimer.Reset(sseFlushMaxDelay)
+				}
+				flushC = flushTimer.C
+			}
+		}
+		return true
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -254,6 +319,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 				stopTimer(flushTimer)
 				flushC = nil
 			}
+		case <-poll.C:
+			if !pollAndSend() {
+				return
+			}
 		case <-flushC:
 			if bw.count > 0 {
 				if err := bw.Flush(); err != nil {
@@ -265,47 +334,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if !open {
 				return
 			}
-			liveEvents, liveHead, liveOK := bus.EventsSince(lastSeen)
-			if !liveOK {
-				// Reset must be sent immediately; buffering it would stall
-				// the client until the next heartbeat or unrelated event.
-				sendSSEReset(bw, liveHead, "seq_too_old")
-				lastSeen = liveHead
-				if err := bw.Flush(); err != nil {
-					return
-				}
-				if flushTimer != nil {
-					stopTimer(flushTimer)
-					flushC = nil
-				}
-			} else {
-				for _, ev := range liveEvents {
-					sendSSEEvent(bw, ev)
-					lastSeen = ev.Seq
-				}
-				if bw.count > 0 {
-					if bw.shouldFlush() {
-						if err := bw.Flush(); err != nil {
-							return
-						}
-						if flushTimer != nil {
-							stopTimer(flushTimer)
-							flushC = nil
-						}
-					} else if flushC == nil {
-						// Arm the max-delay timer for the first
-						// buffered event since the last flush. Use
-						// flushC (not bw.count) so coalesced bursts
-						// of N>1 still arm the timer.
-						if flushTimer == nil {
-							flushTimer = time.NewTimer(sseFlushMaxDelay)
-						} else {
-							stopTimer(flushTimer)
-							flushTimer.Reset(sseFlushMaxDelay)
-						}
-						flushC = flushTimer.C
-					}
-				}
+			if !pollAndSend() {
+				return
 			}
 		}
 	}

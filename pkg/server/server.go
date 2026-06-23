@@ -475,6 +475,44 @@ func (s *Server) startLeaderWorkers() {
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Start(backgroundWithTrace(leaderCtx))
 	}
+	// Periodic fs_events cleanup (leader-only). Prunes old event rows so the
+	// table doesn't grow unbounded. In single-tenant mode, cleans the fallback
+	// store. In multi-tenant mode, tenant stores are cleaned lazily when their
+	// backends are Acquired from the pool.
+	s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+		ticker := time.NewTicker(fsEventsCleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+				s.cleanupFSEvents(workerCtx)
+			}
+		}
+	})
+}
+
+// fsEventsCleanupInterval is how often the leader prunes old fs_events rows.
+const fsEventsCleanupInterval = 5 * time.Minute
+
+// fsEventsRetention is how long event rows are kept before pruning.
+const fsEventsRetention = 1 * time.Hour
+
+// cleanupFSEvents prunes old fs_events rows from accessible stores.
+func (s *Server) cleanupFSEvents(ctx context.Context) {
+	// Single-tenant fallback: clean the fallback store.
+	if s.fallback != nil && s.meta == nil {
+		store := s.fallback.Store()
+		if store != nil {
+			if _, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-fsEventsRetention)); err != nil {
+				logger.Warn(ctx, "fs_events_cleanup_failed", zap.Error(err))
+			}
+		}
+	}
+	// Multi-tenant: cleaned lazily — tenant stores are pruned when their
+	// backends are acquired or created. A future iteration can add active
+	// tenant iteration for proactive cleanup.
 }
 
 // stopLeaderWorkers stops the background schedulers started by startLeaderWorkers.
