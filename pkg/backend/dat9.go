@@ -102,15 +102,12 @@ type Dat9Backend struct {
 	qCache             *quotaCache    // nil when central quota is not wired
 
 	// mutationQueue decouples central quota mutations (syncCentralFileCreate,
-	// syncCentralFileOverwrite) from the fsync critical path. Mutations are
-	// enqueued here and drained by a background worker. The mutation log
-	// provides crash recovery via the existing MutationReplayWorker.
-	//
-	// mutationMu serializes logQuotaMutation + enqueueMutation so that
-	// durable log_id order and channel enqueue order cannot diverge under
-	// concurrent same-tenant writes.
-	mutationMu    sync.Mutex
-	mutationQueue chan func()
+	// syncCentralFileOverwrite) from the fsync critical path. The write hot
+	// path performs a non-blocking channel send of a mutationEntry struct;
+	// the background worker does both the durable log INSERT and the
+	// quota-state apply. If the channel is full the entry is dropped —
+	// backfill-quota reconciles from the source-of-truth tenant DB.
+	mutationQueue chan mutationEntry
 	mutationWG    sync.WaitGroup
 	mutationStop  context.CancelFunc
 
