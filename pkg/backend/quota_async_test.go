@@ -193,11 +193,11 @@ func TestProcessOneMutation_WorkerDrain(t *testing.T) {
 func TestSyncCentralFileCreate_AsyncPath(t *testing.T) {
 	fake := newFakeMetaQuotaStore()
 	b := &Dat9Backend{
-		tenantID:    "tenant-test",
-		metaStore:   fake,
 		quotaSource: QuotaSourceServer,
 	}
-	b.startMutationWorker()
+	// Use the production wiring path to start the worker.
+	b.SetMetaQuotaStore("tenant-test", fake)
+	require.NotNil(t, b.mutationQueue, "SetMetaQuotaStore should start mutation worker")
 
 	b.syncCentralFileCreate(context.Background(), "file-abc", 2048, "image/png")
 
