@@ -667,7 +667,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		if forkTenant.DBHost != "" && forkTenant.DBPort != 0 && forkTenant.DBUser != "" {
 			return tenantDSN(forkTenant.DBUser, string(plain), forkTenant.DBHost, forkTenant.DBPort, forkTenant.DBName, forkTenant.DBTLS), nil
 		}
-		if branchProv, ok := s.provisioner.(tenant.CredentialBranchProvisioner); ok {
+		if branchProv, ok := s.provisioner.(tenant.CredentialBranchProvisioner); ok && credentialReq != nil {
 			username, err := branchProv.WaitForBranchUserWithCredentials(ctx, forkTenant.ClusterID, forkTenant.BranchID, *credentialReq)
 			if err != nil {
 				return "", err
