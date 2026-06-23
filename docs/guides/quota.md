@@ -165,5 +165,9 @@ The quota API returns JSON errors through the standard server error shape.
   Low-churn quota config is cached per tenant and refreshed by version polling.
 - In cloud-native mode, small write quota mutations are recorded in a
   tenant-local quota outbox and applied asynchronously to central quota state.
-- The write path includes pending outbox deltas in quota admission so
-  multi-server deployments do not over-admit against stale central usage.
+- Small-write quota admission includes pending outbox deltas to reduce
+  stale-central-usage undercounting, but concurrent writes on multiple servers
+  may briefly over-admit. Durable outbox processing and backfill restore
+  convergence.
+- Multipart uploads use a stricter reserve-first path before writing tenant
+  upload state.
