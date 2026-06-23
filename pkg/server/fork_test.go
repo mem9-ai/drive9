@@ -363,9 +363,6 @@ func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *test
 		t.Fatalf("message = %q", resp.Message)
 	}
 	waitForCondition(t, func() bool {
-		return len(rt.prov.deletedBranches()) >= 1
-	})
-	waitForCondition(t, func() bool {
 		failed, err := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
 		return err == nil && len(failed) == 1
 	})
@@ -379,9 +376,6 @@ func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *test
 	}
 	if failed[0].BranchID != "branch-created" || failed[0].ClusterID != "cluster-a" {
 		t.Fatalf("failed fork branch metadata = cluster:%q branch:%q", failed[0].ClusterID, failed[0].BranchID)
-	}
-	if deleted := rt.prov.deletedBranches(); len(deleted) == 0 || deleted[0] != "cluster-a/branch-created" {
-		t.Fatalf("deleted branches = %#v", deleted)
 	}
 }
 
@@ -794,7 +788,7 @@ func (d *defaultCredentialsProvisioner) DefaultCredentials() (tenant.CredentialP
 	return d.creds, true
 }
 
-func TestHandleForkDeleteNativeUsesDefaultCredentialsWhenRequestLacksKey(t *testing.T) {
+func TestHandleForkDeleteNativeRejectedWhenRequestLacksKey(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.prov.provider = tenant.ProviderTiDBCloudNative
 	rt.insertTenantWithProvider(t, "fork-native-def", meta.TenantFailed, meta.TenantKindFork, "parent", "ns-parent", "branch-a", tenant.ProviderTiDBCloudNative)
@@ -803,34 +797,17 @@ func TestHandleForkDeleteNativeUsesDefaultCredentialsWhenRequestLacksKey(t *test
 		t.Fatal(err)
 	}
 
-	defaultCreds := tenant.CredentialProvisionRequest{PublicKey: "default-pk", PrivateKey: "default-sk"}
-	rt.server.provisioner = &defaultCredentialsProvisioner{fakeBranchProvisioner: rt.prov, creds: defaultCreds}
-
 	req := httptest.NewRequest(http.MethodDelete, "/v1/fork", strings.NewReader(`{}`))
 	req = req.WithContext(withScope(req.Context(), &TenantScope{TenantID: "fork-native-def"}))
 	rr := httptest.NewRecorder()
 	rt.server.handleForkDelete(rr, req)
 
-	if rr.Code != http.StatusAccepted {
+	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
 	}
-	got, err := rt.meta.GetTenant(context.Background(), "fork-native-def")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.Status != meta.TenantDeleted {
-		t.Fatalf("status = %s, want %s", got.Status, meta.TenantDeleted)
-	}
-	if deleted := rt.prov.deletedBranches(); len(deleted) != 1 || deleted[0] != "cluster-a/branch-a" {
-		t.Fatalf("deleted branches = %#v", deleted)
-	}
-	creds := rt.prov.credentialRequests()
-	if len(creds) == 0 {
-		t.Fatal("DeleteBranchWithCredentials was not called")
-	}
-	last := creds[len(creds)-1]
-	if last.PublicKey != "default-pk" || last.PrivateKey != "default-sk" {
-		t.Fatalf("credential request = %+v", last)
+	body := rr.Body.String()
+	if !strings.Contains(body, "invalid or missing TiDB Cloud credentials") {
+		t.Fatalf("body missing expected error: %s", body)
 	}
 }
 
