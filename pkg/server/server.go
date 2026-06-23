@@ -401,35 +401,42 @@ func (s *Server) Close() {
 	}
 	s.forkWorkerMu.Unlock()
 	s.forkWorkerWG.Wait()
-	if s.semanticWorker != nil {
-		s.semanticWorker.Stop()
-	}
-	if s.objectGCWorker != nil {
-		s.objectGCWorker.Stop()
-	}
-	s.stopLeaderWorkers()
-	s.leaderWorkerMu.Lock()
-	if s.leaderWorkerCancel != nil {
-		s.leaderWorkerCancel()
-	}
-	s.leaderWorkerMu.Unlock()
-	s.leaderWorkerWG.Wait()
+	// Stop the leader manager first so any in-flight onLead/onLose callbacks
+	// finish before we tear down local workers. leader.Stop() waits for the
+	// heartbeat goroutine to exit, so no further callback can fire after it
+	// returns. If this pod currently holds leadership, Stop() invokes onLose,
+	// which runs stopLeaderWorkers and stops the leader-gated workers; the
+	// stopLeaderWorkers call below is then a no-op. If this pod is a standby,
+	// onLose does not fire, and stopLeaderWorkers is a no-op (workers were
+	// never started). This ordering prevents the race where Close() stops
+	// workers while onLead is still starting them (the callbacks and the local
+	// teardown are serialized on leaderWorkerMu, and no callback can outlive
+	// leader.Stop()).
 	if s.leader != nil {
 		s.leader.Stop()
 	}
+	// In single-pod (no-leader) mode, leader-gated workers were started
+	// unconditionally in NewWithConfig; stop them now. In leader mode this is a
+	// no-op (already stopped via onLose above) guarded by leaderWorkersStarted.
+	// stopLeaderWorkers also stops the semantic and object GC workers in both
+	// modes (they are started by startLeaderWorkers), so no separate Stop calls
+	// are needed here.
+	s.stopLeaderWorkers()
 }
 
 // startLeaderWorkers launches the background schedulers that should run only
 // on the leader pod: the fork-worker group (pending tenant reconciler, tenant
 // delete cleanup, one-time resume tasks), the semantic and object GC workers,
-// and the central-quota mutation replay + expiry sweep workers. Safe to call
-// concurrently — the whole start sequence is serialized under leaderWorkerMu
-// and guarded by leaderWorkersStarted, so onLead racing with Close() cannot
-// double-start any worker.
+// and the central-quota mutation replay + expiry sweep workers. The whole start
+// (including the worker assignments and Start calls) is serialized under
+// leaderWorkerMu and guarded by leaderWorkersStarted, so onLead racing with
+// Close()/onLose cannot interleave a start with a stop and leave orphan workers
+// running. The mutex is held for the entire transition so that a concurrent
+// stopLeaderWorkers observes the fully-started worker set (not a partial one).
 func (s *Server) startLeaderWorkers() {
 	s.leaderWorkerMu.Lock()
+	defer s.leaderWorkerMu.Unlock()
 	if s.leaderWorkersStarted {
-		s.leaderWorkerMu.Unlock()
 		return
 	}
 	s.leaderWorkersStarted = true
@@ -439,7 +446,6 @@ func (s *Server) startLeaderWorkers() {
 	leaderCtx, cancel := context.WithCancel(context.Background())
 	s.leaderWorkerCtx = leaderCtx
 	s.leaderWorkerCancel = cancel
-	s.leaderWorkerMu.Unlock()
 
 	if s.meta != nil && s.pool != nil && s.provisioner != nil {
 		// One-time resume tasks (run in leader-gated goroutines).
@@ -505,13 +511,17 @@ func (s *Server) startLeaderWorkers() {
 
 // stopLeaderWorkers stops the background schedulers started by startLeaderWorkers.
 // Called when the pod loses leadership or the server shuts down. The whole stop
-// sequence is serialized under leaderWorkerMu and guarded by leaderWorkersStarted,
-// so onLose (heartbeat goroutine) and Close() (main goroutine) cannot concurrently
-// double-stop a worker or race on the worker managers' own cancel fields.
+// (including the worker Stop/wait calls and clearing the worker fields) is
+// serialized under leaderWorkerMu and guarded by leaderWorkersStarted, so
+// onLose (heartbeat goroutine), Close() (main goroutine), and a concurrent
+// startLeaderWorkers cannot interleave. Holding the mutex for the entire
+// transition guarantees a concurrent startLeaderWorkers observes the
+// fully-stopped state (leaderWorkersStarted == false) and does not leave
+// orphan workers that a stop already ran past.
 func (s *Server) stopLeaderWorkers() {
 	s.leaderWorkerMu.Lock()
+	defer s.leaderWorkerMu.Unlock()
 	if !s.leaderWorkersStarted {
-		s.leaderWorkerMu.Unlock()
 		return
 	}
 	s.leaderWorkersStarted = false
@@ -521,15 +531,11 @@ func (s *Server) stopLeaderWorkers() {
 	s.replayWorker = nil
 	expirySweepWorker := s.expirySweepWorker
 	s.expirySweepWorker = nil
-	s.leaderWorkerMu.Unlock()
 
 	if cancel != nil {
 		cancel()
 	}
 	s.leaderWorkerWG.Wait()
-	// Stop the central-quota workers under the same serialized critical section
-	// (the worker managers' own cancel fields are not mutex-guarded, so we rely on
-	// leaderWorkersStarted to ensure Stop is called exactly once).
 	if replayWorker != nil {
 		replayWorker.Stop()
 	}
@@ -617,6 +623,9 @@ func (s *Server) onLose() {
 
 // logSemanticWorkerStatus logs whether the semantic worker is enabled or disabled.
 // Called in single-pod mode (no leader manager) for backward-compatible logging.
+// Log-only: the workers are started by startLeaderWorkers (called just before
+// this in the no-leader path), so this must NOT call Start again (that would be
+// a redundant double-start and previously silently over-started them).
 func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallbackTaskTypes, poolAutoTaskTypes []string) {
 	ctx := backgroundWithTrace(context.Background())
 	if s.semanticWorker != nil {
@@ -634,7 +643,6 @@ func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallba
 		}
 		fields = append(fields, s.semanticWorker.tenantScanLogFields()...)
 		logger.Info(ctx, "server_semantic_workers_enabled", fields...)
-		s.semanticWorker.Start(ctx)
 	} else {
 		logger.Info(ctx, "server_semantic_workers_disabled",
 			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
@@ -648,7 +656,6 @@ func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallba
 	}
 	if s.objectGCWorker != nil {
 		logger.Info(ctx, "server_object_gc_worker_enabled")
-		s.objectGCWorker.Start(ctx)
 	} else {
 		logger.Info(ctx, "server_object_gc_worker_disabled")
 	}
