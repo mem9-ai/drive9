@@ -959,7 +959,7 @@ func (b *Dat9Backend) ConfirmUploadWithTags(ctx context.Context, uploadID string
 // Both ConfirmUpload (v1) and ConfirmUploadV2 call this with already-validated parts.
 //
 // For TiDB auto-embedding tenants, durable img_extract_text / audio_extract_text
-// tasks are registered in the same transaction via enqueueTiDBAutoSemanticTasksTx,
+// tasks are registered in the same transaction via enqueueExtractSemanticTasksTx,
 // matching create/overwrite semantics (MP3/WAV closed set, runtime gates, payloads).
 func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Upload, parts []s3client.Part, tags map[string]string) error {
 	start := time.Now()
@@ -1089,19 +1089,28 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			}
 			if b.UsesDatabaseAutoEmbedding() {
 				stepStart = time.Now()
-				created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+				created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
 					quotaMediaDelta(oldIsMedia, newIsMedia))
 				semanticTaskEnqueued = created
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 				return err
 			}
+			// App-embedding mode: image/audio extract tasks are durable and
+			// independent of EMBED_TEXT, so register them in the same transaction.
+			stepStart = time.Now()
+			extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+				quotaMediaDelta(oldIsMedia, newIsMedia))
+			if extractErr != nil {
+				return extractErr
+			}
 			if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "", upload.Description) {
-				stepStart = time.Now()
 				created, err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
-				semanticTaskEnqueued = created
+				semanticTaskEnqueued = created || extractCreated
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 				return err
 			}
+			semanticTaskEnqueued = extractCreated
+			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return nil
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -1152,19 +1161,28 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		}
 		if b.UsesDatabaseAutoEmbedding() {
 			stepStart = time.Now()
-			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
 				quotaMediaDelta(false, newIsMedia))
 			semanticTaskEnqueued = created
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return err
 		}
+		// App-embedding mode: image/audio extract tasks are durable and
+		// independent of EMBED_TEXT, so register them in the same transaction.
+		stepStart = time.Now()
+		extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+			quotaMediaDelta(false, newIsMedia))
+		if extractErr != nil {
+			return extractErr
+		}
 		if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "", upload.Description) {
-			stepStart = time.Now()
 			created, err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
-			semanticTaskEnqueued = created
+			semanticTaskEnqueued = created || extractCreated
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return err
 		}
+		semanticTaskEnqueued = extractCreated
+		semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 		return nil
 	}); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
@@ -1201,12 +1219,6 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		zap.Float64("tx_ms", txDurationMs),
 		zap.Float64("total_ms", uploadPhaseMs(start)),
 	)
-	if b.UsesDatabaseAutoEmbedding() {
-		metrics.RecordOperation("backend", "finalize_upload", "ok", time.Since(start))
-		return nil
-	}
-	b.enqueueImageExtractForUpload(ctx, upload, isOverwrite)
-
 	metrics.RecordOperation("backend", "finalize_upload", "ok", time.Since(start))
 	return nil
 }

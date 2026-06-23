@@ -51,14 +51,6 @@ func (b *Dat9Backend) ensureStorageQuota(ctx context.Context, tx *sql.Tx, path s
 	return b.ensureTenantStorageQuotaTx(tx, path, newSize)
 }
 
-// mediaLLMQuotaExceededCheck dispatches the media LLM quota check based on quotaSource.
-func (b *Dat9Backend) mediaLLMQuotaExceededCheck(ctx context.Context) bool {
-	if b.UseServerQuota() {
-		return b.mediaLLMQuotaExceededServer(ctx)
-	}
-	return b.mediaLLMQuotaExceeded()
-}
-
 // mediaLLMQuotaExceededCheckTx dispatches the media LLM quota check
 // (transactional variant). currentMediaDelta is only applied to server quota,
 // where the current write may not be visible in central usage or pending outbox
@@ -219,33 +211,6 @@ func (b *Dat9Backend) loadQuotaUsage(ctx context.Context) *QuotaUsageView {
 
 // --- Server-side media file count (Rev 4 migration) ---
 
-// mediaLLMQuotaExceededServer checks the server DB counter for media file quota.
-// Falls back to tenant-DB check when metaStore is not wired.
-func (b *Dat9Backend) mediaLLMQuotaExceededServer(ctx context.Context) bool {
-	if b.metaStore == nil {
-		return b.mediaLLMQuotaExceeded() // fallback to tenant DB
-	}
-	cfg := b.cachedQuotaConfig(ctx)
-	if cfg == nil {
-		metrics.RecordOperation("server_quota", "media_check", "fail_open", 0)
-		return false // fail-open: config unavailable
-	}
-	if cfg.MaxMediaLLMFiles <= 0 {
-		return false
-	}
-	usage := b.loadQuotaUsage(ctx)
-	if usage == nil {
-		metrics.RecordOperation("server_quota", "media_check", "fail_open", 0)
-		return false // fail-open: usage unavailable
-	}
-	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
-	_, pendingMediaDelta, pendingOK := b.pendingQuotaOutboxDeltas(ctx)
-	if !pendingOK {
-		metrics.RecordOperation("server_quota", "media_check_pending_delta", "fail_open", 0)
-	}
-	return usage.MediaFileCount+pendingMediaDelta > cfg.MaxMediaLLMFiles
-}
-
 func recordTenantQuotaSnapshot(tenantID string, usage *QuotaUsageView, cfg *QuotaConfigView) {
 	if tenantID == "" || usage == nil {
 		return
@@ -319,19 +284,6 @@ func (b *Dat9Backend) pendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx
 	return storageDelta, mediaDelta, true
 }
 
-func (b *Dat9Backend) pendingQuotaOutboxDeltas(ctx context.Context) (storageDelta, mediaDelta int64, ok bool) {
-	if b.store == nil {
-		return 0, 0, true
-	}
-	storageDelta, mediaDelta, err := b.store.PendingQuotaOutboxDeltas(ctx)
-	if err != nil {
-		logger.Warn(ctx, "server_quota_pending_outbox_delta_fail_open",
-			zap.String("tenant_id", b.tenantID), zap.Error(err))
-		return 0, 0, false
-	}
-	return storageDelta, mediaDelta, true
-}
-
 // --- Tenant-DB quota checks (legacy fallback) ---
 
 // mediaLLMQuotaExceededTx checks whether the tenant has exceeded its media LLM
@@ -345,22 +297,6 @@ func (b *Dat9Backend) mediaLLMQuotaExceededTx(tx *sql.Tx) bool {
 		return false
 	}
 	count, err := b.store.ConfirmedMediaFileCountTx(tx)
-	if err != nil {
-		logger.Warn(backgroundWithTrace(), "media_llm_quota_check_fail_open", zap.Error(err))
-		metrics.RecordOperation("media_llm_budget", "quota_check", "fail_open", 0)
-		return false
-	}
-	return count > b.maxMediaLLMFiles
-}
-
-// mediaLLMQuotaExceeded is the non-transactional variant for code paths that
-// enqueue LLM tasks outside a database transaction (e.g. the legacy in-memory
-// image extract queue).
-func (b *Dat9Backend) mediaLLMQuotaExceeded() bool {
-	if b.maxMediaLLMFiles <= 0 {
-		return false
-	}
-	count, err := b.store.ConfirmedMediaFileCountTx(b.store.DB())
 	if err != nil {
 		logger.Warn(backgroundWithTrace(), "media_llm_quota_check_fail_open", zap.Error(err))
 		metrics.RecordOperation("media_llm_budget", "quota_check", "fail_open", 0)
