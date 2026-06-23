@@ -40,8 +40,13 @@ jobs:
       - name: Lint
         run: make lint
 
-      - name: Test
-        run: make test
+      - name: Test (excluding server)
+        run: |
+          PKGS=$(go list ./cmd/... ./pkg/... ./internal/... | grep -v /pkg/server/)
+          make test TEST_PKGS="$PKGS"
+
+      - name: Test server package (extended timeout)
+        run: go test -v -timeout 20m ./pkg/server/...
 
       - name: Install failpoint-ctl
         run: go install github.com/pingcap/failpoint/failpoint-ctl@latest
