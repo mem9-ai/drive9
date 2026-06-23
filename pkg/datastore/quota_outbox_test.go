@@ -52,6 +52,9 @@ func TestQuotaOutboxLifecycle(t *testing.T) {
 	if claimed.ID != id || claimed.Status != QuotaOutboxProcessing || claimed.Receipt == "" {
 		t.Fatalf("claimed row = %+v", claimed)
 	}
+	if claimed.MaxAttempts != defaultQuotaOutboxMaxAttempts {
+		t.Fatalf("claimed max_attempts = %d, want default %d", claimed.MaxAttempts, defaultQuotaOutboxMaxAttempts)
+	}
 
 	if err := s.AckQuotaOutbox(ctx, claimed.ID, claimed.Receipt); err != nil {
 		t.Fatalf("ack quota outbox: %v", err)
@@ -154,6 +157,67 @@ func TestQuotaOutboxClaimWaitsForDelayedOlderRetry(t *testing.T) {
 	}
 	if !found || claimed.ID != firstID {
 		t.Fatalf("claimed after retry = %+v found=%v, want first id %d", claimed, found, firstID)
+	}
+}
+
+func TestQuotaOutboxDeadLetteredOlderRowUnblocksLaterClaim(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	availableNow := now.Add(-time.Second)
+
+	firstID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		StorageDelta: 10,
+		MaxAttempts:  1,
+		AvailableAt:  availableNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		MutationType: "file_overwrite",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		StorageDelta: 3,
+		AvailableAt:  availableNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, found, err := s.ClaimQuotaOutbox(ctx, now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || claimed.ID != firstID {
+		t.Fatalf("claimed = %+v found=%v, want first id %d", claimed, found, firstID)
+	}
+
+	if err := s.RetryQuotaOutbox(ctx, claimed.ID, claimed.Receipt, now.Add(time.Hour), "poison"); err != nil {
+		t.Fatal(err)
+	}
+	var status QuotaOutboxStatus
+	if err := s.DB().QueryRowContext(ctx, `SELECT status FROM quota_outbox WHERE id = ?`, firstID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != QuotaOutboxDeadLettered {
+		t.Fatalf("first status = %q, want dead_lettered", status)
+	}
+	storageDelta, mediaDelta, err := s.PendingQuotaOutboxDeltas(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storageDelta != 3 || mediaDelta != 0 {
+		t.Fatalf("pending deltas = %d/%d, want only later row 3/0", storageDelta, mediaDelta)
+	}
+
+	claimed, found, err = s.ClaimQuotaOutbox(ctx, now.Add(time.Minute), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || claimed.ID != secondID {
+		t.Fatalf("claimed after dead-letter = %+v found=%v, want second id %d", claimed, found, secondID)
 	}
 }
 

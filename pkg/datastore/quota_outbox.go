@@ -12,7 +12,11 @@ import (
 	"github.com/google/uuid"
 )
 
-const defaultQuotaOutboxMaxAttempts = 0
+// defaultQuotaOutboxMaxAttempts bounds how long a poisoned quota mutation can
+// block later tenant-local mutations behind the ordering barrier. With the
+// current capped exponential backoff this is roughly tens of minutes, while
+// still allowing normal transient central-store failures to recover.
+const defaultQuotaOutboxMaxAttempts = 100
 const quotaAdmissionLockName = "default"
 
 type QuotaOutboxStatus string
