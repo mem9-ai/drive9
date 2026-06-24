@@ -373,21 +373,42 @@ func printQuotaCLIResponse(out *client.QuotaResponse, asJSON bool) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(out)
 	}
-	fmt.Printf("tenant: %s\n", out.TenantID)
-	fmt.Printf("provider: %s\n", out.Provider)
-	fmt.Printf("status: %s\n", out.Status)
-	fmt.Printf("supports_update: %t\n", out.SupportsUpdate)
-	configParts := []string{
-		fmt.Sprintf("max_storage_size=%dMi", out.Config.MaxStorageSize),
-		fmt.Sprintf("max_file_size=%dMi", out.Config.MaxFileSize),
-		fmt.Sprintf("max_file_count=%d", out.Config.MaxFileCount),
+	fmt.Printf("%-20s %s\n", "TenantID:", out.TenantID)
+	fmt.Printf("%-20s %d Mi\n", "MaxStorage:", out.Config.MaxStorageSize)
+	fmt.Printf("%-20s %d Mi\n", "MaxFileSize:", out.Config.MaxFileSize)
+	if out.Config.MaxFileCount == 0 {
+		fmt.Printf("%-20s %s\n", "MaxFileCount:", "unlimited")
+	} else {
+		fmt.Printf("%-20s %d\n", "MaxFileCount:", out.Config.MaxFileCount)
 	}
 	if out.Config.TiDBCloudSpendingLimit != nil {
-		configParts = append(configParts, fmt.Sprintf("tidbcloud_spending_limit=%d", *out.Config.TiDBCloudSpendingLimit))
+		fmt.Printf("%-20s %.2f\n", "SpendingLimit:", float64(*out.Config.TiDBCloudSpendingLimit)/100)
 	}
-	fmt.Printf("config: %s\n", strings.Join(configParts, " "))
-	fmt.Printf("usage: storage_bytes=%d reserved_bytes=%d file_count=%d\n", out.Usage.StorageBytes, out.Usage.ReservedBytes, out.Usage.FileCount)
+	fmt.Printf("%-20s %s\n", "StorageUsed:", formatBytes(out.Usage.StorageBytes))
+	fmt.Printf("%-20s %s\n", "Reserved:", formatBytes(out.Usage.ReservedBytes))
+	if out.Usage.FileCount == 0 {
+		fmt.Printf("%-20s %s\n", "FileCount:", "0")
+	} else {
+		fmt.Printf("%-20s %d\n", "FileCount:", out.Usage.FileCount)
+	}
 	return nil
+}
+
+func formatBytes(n int64) string {
+	if n < 0 {
+		return "0 B"
+	}
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	units := []string{"KiB", "MiB", "GiB", "TiB", "PiB"}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit && exp < len(units)-1; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %s", float64(n)/float64(div), units[exp])
 }
 
 func quotaUsage() string {

@@ -46,6 +46,13 @@ const (
 	upstreamClusterBodyLimit = 1 << 20
 )
 
+var (
+	immutableLabelKeys = []string{
+		"tidb.cloud/project",
+		"tidb.cloud/organization",
+	}
+)
+
 var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 var displayNameCharPattern = regexp.MustCompile(`[^A-Za-z0-9-]`)
 
@@ -500,7 +507,10 @@ func (p *Provisioner) MarkQuotaUpdateStarted(ctx context.Context, cluster *tenan
 	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
 		labels[Drive9TenantIDLabel] = tenantID
 	}
-	labels[Drive9QuotaUpdateAtLabel] = time.Now().UTC().Format(time.RFC3339Nano)
+	labels[Drive9QuotaUpdateAtLabel] = strconv.FormatInt(time.Now().UTC().Unix(), 10)
+	for _, k := range immutableLabelKeys {
+		delete(labels, k)
+	}
 	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
 		return nil, fmt.Errorf("update cluster quota labels: %w", err)
 	}
