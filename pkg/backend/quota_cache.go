@@ -239,6 +239,15 @@ func (c *quotaUsageCache) cached(now time.Time) *QuotaUsageView {
 	return nil
 }
 
+func (c *quotaUsageCache) invalidate() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.snapshot = nil
+	c.mu.Unlock()
+}
+
 func cloneQuotaUsageView(usage *QuotaUsageView) *QuotaUsageView {
 	if usage == nil {
 		return nil
@@ -267,8 +276,10 @@ type quotaPendingDeltasCache struct {
 	load quotaPendingDeltasLoader
 	ttl  time.Duration
 
-	mu       sync.Mutex
-	snapshot *quotaPendingDeltasSnapshot
+	mu         sync.RWMutex
+	snapshot   *quotaPendingDeltasSnapshot
+	generation uint64
+	loadMu     sync.Mutex
 }
 
 func newQuotaPendingDeltasCache(load quotaPendingDeltasLoader, ttl time.Duration) *quotaPendingDeltasCache {
@@ -283,11 +294,20 @@ func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, 
 		return quotaPendingDeltas{}, false
 	}
 	now := time.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.snapshot != nil && now.Before(c.snapshot.expiresAt) {
-		return c.snapshot.deltas, true
+	if deltas, ok := c.cached(now); ok {
+		return deltas, true
 	}
+
+	c.loadMu.Lock()
+	defer c.loadMu.Unlock()
+	now = time.Now()
+	if deltas, ok := c.cached(now); ok {
+		return deltas, true
+	}
+
+	c.mu.RLock()
+	generation := c.generation
+	c.mu.RUnlock()
 
 	start := time.Now()
 	storageDelta, fileDelta, mediaDelta, err := c.load(ctx)
@@ -301,12 +321,32 @@ func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, 
 		fileDelta:    fileDelta,
 		mediaDelta:   mediaDelta,
 	}
+	expiresAt := time.Now().Add(c.ttl)
+	c.mu.Lock()
+	if c.generation != generation {
+		c.mu.Unlock()
+		// A local enqueue or ack raced this DB load. Do not merge blindly:
+		// the SELECT may or may not have observed that row. Let the caller
+		// fall back to a live tenant-DB read for this check.
+		metrics.RecordOperation("server_quota", "pending_delta_cache", "raced_local_delta", time.Since(start))
+		return quotaPendingDeltas{}, false
+	}
 	c.snapshot = &quotaPendingDeltasSnapshot{
 		deltas:    deltas,
-		expiresAt: now.Add(c.ttl),
+		expiresAt: expiresAt,
 	}
+	c.mu.Unlock()
 	metrics.RecordOperation("server_quota", "pending_delta_cache", "load_ok", time.Since(start))
 	return deltas, true
+}
+
+func (c *quotaPendingDeltasCache) cached(now time.Time) (quotaPendingDeltas, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.snapshot != nil && now.Before(c.snapshot.expiresAt) {
+		return c.snapshot.deltas, true
+	}
+	return quotaPendingDeltas{}, false
 }
 
 func (c *quotaPendingDeltasCache) add(storageDelta, fileDelta, mediaDelta int64) {
@@ -315,9 +355,11 @@ func (c *quotaPendingDeltasCache) add(storageDelta, fileDelta, mediaDelta int64)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	// If the snapshot is missing or expired, leave it cold. The next soft
-	// admission check reloads from quota_outbox and sees this backend's queued
-	// row along with rows from other servers.
+	c.generation++
+	// If the snapshot is missing or expired, leave it cold. The generation bump
+	// prevents any concurrent loader from publishing a pre-delta snapshot; the
+	// next soft admission check reloads from quota_outbox and sees this
+	// backend's queued row along with rows from other servers.
 	if c.snapshot == nil || time.Now().After(c.snapshot.expiresAt) {
 		return
 	}

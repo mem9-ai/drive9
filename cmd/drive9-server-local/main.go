@@ -252,7 +252,7 @@ func main() {
 		defer func() { _ = metaStore.Close() }()
 
 		adapter := tenant.NewMetaQuotaAdapter(metaStore)
-		b.SetMetaQuotaStore("local-tenant", adapter)
+		b.SetMetaQuotaStore(context.Background(), "local-tenant", adapter)
 
 		if err := metaStore.EnsureQuotaUsageRow(context.Background(), "local-tenant"); err != nil {
 			logger.Warn(startupCtx, "ensure_quota_usage_row_failed",

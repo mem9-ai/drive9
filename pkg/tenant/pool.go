@@ -774,7 +774,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
-		p.wireQuotaStore(b, t.ID)
+		p.wireQuotaStore(ctx, b, t.ID)
 		p.wireSemanticTaskNotifier(b, t.ID)
 		return b, store, nil
 	}
@@ -814,7 +814,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
-		p.wireQuotaStore(b, t.ID)
+		p.wireQuotaStore(ctx, b, t.ID)
 		p.wireSemanticTaskNotifier(b, t.ID)
 		return b, store, nil
 	}
@@ -836,7 +836,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("create_s3_client_ms", 0),
 		zap.Float64("create_backend_ms", backendCreateDurationMs),
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
-	p.wireQuotaStore(b, t.ID)
+	p.wireQuotaStore(ctx, b, t.ID)
 	p.wireSemanticTaskNotifier(b, t.ID)
 	return b, store, nil
 }
@@ -952,12 +952,12 @@ func (p *Pool) defaultStorageNamespacePrefix(tenantID, backendName string) strin
 
 // wireQuotaStore sets the central quota store on a newly created backend.
 // No-op when the pool's metaStore is nil (tests, non-multi-tenant mode).
-func (p *Pool) wireQuotaStore(b *backend.Dat9Backend, tenantID string) {
+func (p *Pool) wireQuotaStore(ctx context.Context, b *backend.Dat9Backend, tenantID string) {
 	if p.metaStore == nil {
 		return
 	}
 	adapter := NewMetaQuotaAdapter(p.metaStore)
-	b.SetMetaQuotaStore(tenantID, adapter)
+	b.SetMetaQuotaStore(ctx, tenantID, adapter)
 }
 
 func (p *Pool) removeLocked(elem *list.Element) *entry {

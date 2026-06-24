@@ -127,12 +127,12 @@ type MutationLogView struct {
 
 // SetMetaQuotaStore sets the central quota store on the backend.
 // Called by tenant.Pool after backend creation.
-func (b *Dat9Backend) SetMetaQuotaStore(tenantID string, mqs MetaQuotaStore) {
+func (b *Dat9Backend) SetMetaQuotaStore(ctx context.Context, tenantID string, mqs MetaQuotaStore) {
 	b.tenantID = tenantID
 	b.metaStore = mqs
 	if mqs != nil {
-		if err := mqs.EnsureQuotaUsageRow(context.Background(), tenantID); err != nil {
-			logger.Warn(context.Background(), "ensure_quota_usage_row_failed",
+		if err := mqs.EnsureQuotaUsageRow(ctx, tenantID); err != nil {
+			logger.Warn(ctx, "ensure_quota_usage_row_failed",
 				zap.String("tenant_id", tenantID),
 				zap.Error(err))
 		}

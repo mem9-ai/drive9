@@ -255,6 +255,32 @@ func TestQuotaUsageCacheCoalescesConcurrentMisses(t *testing.T) {
 	}
 }
 
+func TestQuotaUsageCacheInvalidateForcesReload(t *testing.T) {
+	store := newCacheTestStore()
+	store.usage["t1"] = &QuotaUsageView{TenantID: "t1", StorageBytes: 10}
+	c := newQuotaUsageCache("t1", store, time.Hour)
+
+	first := c.get(context.Background())
+	if first == nil || first.StorageBytes != 10 {
+		t.Fatalf("first usage = %+v, want storage 10", first)
+	}
+	store.mu.Lock()
+	store.usage["t1"].StorageBytes = 20
+	store.mu.Unlock()
+	if cached := c.get(context.Background()); cached == nil || cached.StorageBytes != 10 {
+		t.Fatalf("cached usage = %+v, want storage 10", cached)
+	}
+
+	c.invalidate()
+	reloaded := c.get(context.Background())
+	if reloaded == nil || reloaded.StorageBytes != 20 {
+		t.Fatalf("reloaded usage = %+v, want storage 20", reloaded)
+	}
+	if got := store.usageCalls.Load(); got != 2 {
+		t.Fatalf("usageCalls = %d, want 2", got)
+	}
+}
+
 func TestQuotaPendingDeltasCacheUsesTTLAndLocalAdjustments(t *testing.T) {
 	var calls atomic.Int64
 	storage := int64(10)
@@ -285,6 +311,50 @@ func TestQuotaPendingDeltasCacheUsesTTLAndLocalAdjustments(t *testing.T) {
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("loader calls = %d, want 1", got)
+	}
+}
+
+func TestQuotaPendingDeltasCacheDoesNotPublishSnapshotWhenLocalDeltaRacesLoad(t *testing.T) {
+	var calls atomic.Int64
+	storage := int64(10)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	c := newQuotaPendingDeltasCache(func(context.Context) (int64, int64, int64, error) {
+		calls.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		return storage, 1, 0, nil
+	}, time.Hour)
+
+	type result struct {
+		deltas quotaPendingDeltas
+		ok     bool
+	}
+	done := make(chan result, 1)
+	go func() {
+		deltas, ok := c.get(context.Background())
+		done <- result{deltas: deltas, ok: ok}
+	}()
+
+	<-started
+	c.add(5, 1, 0)
+	storage = 15
+	close(release)
+
+	got := <-done
+	if got.ok {
+		t.Fatalf("racing get ok=true deltas=%+v, want fallback", got.deltas)
+	}
+	next, ok := c.get(context.Background())
+	if !ok {
+		t.Fatal("second get failed")
+	}
+	if next.storageDelta != 15 || next.fileDelta != 1 || next.mediaDelta != 0 {
+		t.Fatalf("second deltas = %+v, want 15/1/0", next)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("loader calls = %d, want 2", got)
 	}
 }
 
