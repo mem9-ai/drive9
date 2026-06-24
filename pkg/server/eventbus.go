@@ -131,18 +131,22 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 	}
 	// Derive headSeq from the query results: if we got rows, headSeq is the
 	// last row's seq; if no rows, headSeq stays at since (caught up). This
-	// avoids a separate SELECT MAX(seq) round-trip on every poll.
+	// avoids a separate SELECT MAX(seq) round-trip when there are new events.
 	if len(events) > 0 {
 		headSeq = events[len(events)-1].Seq
-	} else {
-		headSeq = since
+		return events, headSeq, true
 	}
-	// If no new events but the table is empty (all events pruned) and since > 0,
-	// the client's cursor is stale → send reset (like the old ring buffer's
-	// "since > newestSeq" case). If the table has events but none after since,
-	// the client is caught up → ok=true with empty slice.
-	if len(events) == 0 && headSeq == 0 && since > 0 {
-		return nil, headSeq, false
+	// No new events after since. If since > 0, check whether the table is
+	// empty (all events pruned by cleanup) — if so, the client's cursor is
+	// stale and we should send a reset. This only does a DB round-trip on the
+	// empty-result path, not on every poll with new events.
+	if since > 0 {
+		headSeq = eb.Seq(ctx)
+		if headSeq == 0 {
+			return nil, headSeq, false // table empty → reset
+		}
+		return nil, headSeq, true // table has events, client is caught up
 	}
+	headSeq = since
 	return events, headSeq, true
 }
