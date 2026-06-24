@@ -19,7 +19,6 @@ type drainError struct {
 	err  error
 }
 
-const fuseSyncFSProtocolMinor = 34
 const drainPendingWorkKind = "pending_work_remaining"
 
 func (e *drainError) Error() string {
