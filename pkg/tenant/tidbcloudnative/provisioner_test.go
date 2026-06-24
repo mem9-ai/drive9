@@ -600,10 +600,12 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"clusterId": "cluster-1",
 				"labels": map[string]string{
-					"environment":         "prod",
-					Drive9ManagedLabel:    "old",
-					Drive9TenantIDLabel:   "old-tenant",
-					"drive9.ai/unrelated": "keep",
+					"environment":             "prod",
+					Drive9ManagedLabel:        "old",
+					Drive9TenantIDLabel:       "old-tenant",
+					"drive9.ai/unrelated":     "keep",
+					"tidb.cloud/project":      "123",
+					"tidb.cloud/organization": "456",
 				},
 				"spendingLimit": map[string]int32{
 					"monthly": 15000,
@@ -652,6 +654,12 @@ func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
 	labels := gotPatch.Cluster.Labels
 	if labels["environment"] != "prod" || labels["drive9.ai/unrelated"] != "keep" {
 		t.Fatalf("existing labels were not preserved: %#v", labels)
+	}
+	if _, ok := labels["tidb.cloud/project"]; ok {
+		t.Fatalf("immutable label tidb.cloud/project was not stripped: %#v", labels)
+	}
+	if _, ok := labels["tidb.cloud/organization"]; ok {
+		t.Fatalf("immutable label tidb.cloud/organization was not stripped: %#v", labels)
 	}
 	if labels[Drive9ManagedLabel] != "true" || labels[Drive9TenantIDLabel] != "tenant-1" {
 		t.Fatalf("drive9 labels = %#v", labels)

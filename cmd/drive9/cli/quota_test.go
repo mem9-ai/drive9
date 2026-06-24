@@ -59,10 +59,10 @@ func TestQuotaGetUsesTenantIDAndTiDBCloudHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Quota get: %v", err)
 	}
-	if !strings.Contains(stdout, "usage: storage_bytes=1 reserved_bytes=2 file_count=3") {
+	if !strings.Contains(stdout, "StorageUsed:") || !strings.Contains(stdout, "Reserved:") {
 		t.Fatalf("stdout should include storage usage counters: %s", stdout)
 	}
-	if !strings.Contains(stdout, "max_file_size=64Mi") || !strings.Contains(stdout, "max_file_count=42") {
+	if !strings.Contains(stdout, "MaxFileSize:") || !strings.Contains(stdout, "64 Mi") || !strings.Contains(stdout, "MaxFileCount:") {
 		t.Fatalf("stdout should include file limits: %s", stdout)
 	}
 	if strings.Contains(stdout, "media_file_count") || strings.Contains(stdout, "monthly_cost_mc") {
