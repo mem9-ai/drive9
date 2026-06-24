@@ -28,11 +28,12 @@ class CommunityPyxattr(BaseModule):
             script = (
                 "import os, sys\n"
                 "p = sys.argv[1]\n"
-                "name = b'user.drive9.blackbox'\n"
-                "os.setxattr(p, name, b'value')\n"
-                "assert os.getxattr(p, name) == b'value'\n"
+                "name = 'user.drive9.blackbox'\n"
+                "bname = name.encode()\n"
+                "os.setxattr(p, bname, b'value')\n"
+                "assert os.getxattr(p, bname) == b'value'\n"
                 "assert name in os.listxattr(p)\n"
-                "os.removexattr(p, name)\n"
+                "os.removexattr(p, bname)\n"
             )
             result = ctx.target.run_cmd("community-pyxattr", ["python3", "-c", script, str(p)], timeout=self.timeout)
             if not result.ok:
