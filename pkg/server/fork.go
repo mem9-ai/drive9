@@ -910,10 +910,6 @@ func (s *Server) handleForkDelete(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": string(meta.TenantDeleting)})
 		return
 	}
-	if t.Provider == tenant.ProviderTiDBCloudNative && t.Status == meta.TenantFailed {
-		s.cleanupNativeFork(w, r, t, credentialReq)
-		return
-	}
 	if t.Provider == tenant.ProviderTiDBCloudNative {
 		s.cleanupNativeFork(w, r, t, credentialReq)
 		return
