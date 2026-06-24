@@ -28,7 +28,7 @@ class CommunityPjdfstest(BaseModule):
         groups = cfg.get("groups", "all")
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_pjdfstest", remote, extra=["--allow-other"])
+        handle = ctx.target.mount("community_pjdfstest", remote, profile="none", extra=["--allow-other"])
         try:
             work_dir = handle.mountpoint / "work"
             work_dir.mkdir(exist_ok=True)

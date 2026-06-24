@@ -18,7 +18,7 @@ class CommunityMdtest(BaseModule):
         mdtest = ctx.deps.ensure_mdtest()
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_mdtest", remote)
+        handle = ctx.target.mount("community_mdtest", remote, profile="none")
         try:
             files = str(module_config(ctx, self.id).get("files", 1000))
             result = ctx.target.run_cmd("community-mdtest", [mdtest, "-d", str(handle.mountpoint / "mdtest"), "-n", files, "-u", "-L", "-F"], timeout=int(os.environ.get("MDTEST_TIMEOUT_S", str(self.timeout))))

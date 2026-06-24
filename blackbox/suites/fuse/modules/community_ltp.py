@@ -33,7 +33,7 @@ class CommunityLTPFS(BaseModule):
             scenario = "fs"
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_ltp_fs", remote, extra=["--allow-other"])
+        handle = ctx.target.mount("community_ltp_fs", remote, profile="none", extra=["--allow-other"])
         try:
             work = handle.mountpoint / "ltp-work"
             work.mkdir()
@@ -68,7 +68,7 @@ class CommunityLTPSyscalls(CommunityLTPFS):
             scenario = "syscalls"
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_ltp_syscalls", remote, extra=["--allow-other"])
+        handle = ctx.target.mount("community_ltp_syscalls", remote, profile="none", extra=["--allow-other"])
         try:
             work = handle.mountpoint / "ltp-work"
             work.mkdir()
