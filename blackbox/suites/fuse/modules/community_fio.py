@@ -21,7 +21,7 @@ class CommunityFio(BaseModule):
         size = module_config(ctx, self.id).get("size", "128m")
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_fio", remote, durability="interactive")
+        handle = ctx.target.mount("community_fio", remote)
         try:
             work = handle.mountpoint / "fio"
             work.mkdir()

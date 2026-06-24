@@ -18,7 +18,7 @@ class CommunityFSX(BaseModule):
         fsx = ctx.deps.ensure_fsx()
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_fsx", remote, durability="write-sync")
+        handle = ctx.target.mount("community_fsx", remote)
         try:
             ops = str(module_config(ctx, self.id).get("ops", 5000))
             args = [fsx, "-N", ops]

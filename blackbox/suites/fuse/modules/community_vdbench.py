@@ -22,7 +22,7 @@ class CommunityVdbench(BaseModule):
             raise DependencyUnavailable("vdbench requires java")
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_vdbench", remote, durability="interactive")
+        handle = ctx.target.mount("community_vdbench", remote)
         try:
             artifact = ctx.artifact_dir(self.id)
             cfg_path = artifact / "vdbench.conf"

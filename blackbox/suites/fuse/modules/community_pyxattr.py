@@ -21,7 +21,7 @@ class CommunityPyxattr(BaseModule):
     def run(self, ctx: Context) -> dict[str, Any]:
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_pyxattr", remote, durability="write-sync")
+        handle = ctx.target.mount("community_pyxattr", remote)
         try:
             p = handle.mountpoint / "xattr.txt"
             p.write_text("xattr\n", encoding="utf-8")

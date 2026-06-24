@@ -18,7 +18,7 @@ class CommunityLock(BaseModule):
             raise ModuleSkip("fcntl locks are not supported on this platform", "platform skip")
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("community_lock", remote, durability="write-sync")
+        handle = ctx.target.mount("community_lock", remote)
         try:
             p = handle.mountpoint / "lock.txt"
             p.write_text("lock\n", encoding="utf-8")
