@@ -245,8 +245,8 @@ func tenantAuthMiddlewareWithFSScopeLoader(metaStore *meta.Store, pool *tenant.P
 			return
 		}
 
-		if isTenantDeleteRequest(r) {
-			handleTenantDeleteAuth(w, r, pool, next, resolved, claims)
+		if isTenantDeleteRequest(r) || isForkDeleteRequest(r) {
+			handleDeleteNoAcquireAuth(w, r, pool, next, resolved, claims)
 			return
 		}
 
@@ -364,7 +364,11 @@ func isTenantDeleteRequest(r *http.Request) bool {
 	return r.Method == http.MethodDelete && r.URL.Path == "/v1/tenant"
 }
 
-func handleTenantDeleteAuth(w http.ResponseWriter, r *http.Request, pool *tenant.Pool, next http.Handler, resolved *meta.TenantWithAPIKey, claims *token.Claims) {
+func isForkDeleteRequest(r *http.Request) bool {
+	return r.Method == http.MethodDelete && r.URL.Path == "/v1/fork"
+}
+
+func handleDeleteNoAcquireAuth(w http.ResponseWriter, r *http.Request, pool *tenant.Pool, next http.Handler, resolved *meta.TenantWithAPIKey, claims *token.Claims) {
 	switch resolved.Tenant.Status {
 	case meta.TenantActive, meta.TenantFailed, meta.TenantDeleting, meta.TenantDeleted:
 	case meta.TenantPending:

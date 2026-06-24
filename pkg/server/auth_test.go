@@ -731,3 +731,33 @@ func TestSanitizeClientError_Fallback(t *testing.T) {
 		}
 	}
 }
+
+func TestAuthForkDeleteSkipsPoolAcquire(t *testing.T) {
+	rt, cleanup := newAuthRuntime(t)
+	defer cleanup()
+
+	h := tenantAuthMiddleware(rt.meta, rt.pool, rt.tokenSecret, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scope := ScopeFromContext(r.Context())
+		if scope == nil {
+			t.Fatal("expected tenant scope")
+		}
+		if scope.Backend != nil {
+			t.Fatal("fork delete should not acquire backend")
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodDelete, ts.URL+"/v1/fork", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("status=%d", resp.StatusCode)
+	}
+}
