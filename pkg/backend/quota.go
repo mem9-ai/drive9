@@ -387,6 +387,12 @@ func (b *Dat9Backend) addLocalQuotaPendingDeltas(storageDelta, fileDelta, mediaD
 	}
 }
 
+func (b *Dat9Backend) addLocalQuotaUsageDeltas(storageDelta, fileDelta, mediaDelta int64) {
+	if b.quotaUsageCache != nil {
+		b.quotaUsageCache.add(storageDelta, fileDelta, mediaDelta)
+	}
+}
+
 func (r storageQuotaCheckResult) exceeded() bool {
 	return r.checked && r.projected > r.limitBytes
 }

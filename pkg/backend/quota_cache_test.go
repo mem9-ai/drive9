@@ -255,29 +255,26 @@ func TestQuotaUsageCacheCoalescesConcurrentMisses(t *testing.T) {
 	}
 }
 
-func TestQuotaUsageCacheInvalidateForcesReload(t *testing.T) {
+func TestQuotaUsageCacheAddUpdatesFreshSnapshot(t *testing.T) {
 	store := newCacheTestStore()
-	store.usage["t1"] = &QuotaUsageView{TenantID: "t1", StorageBytes: 10}
+	store.usage["t1"] = &QuotaUsageView{TenantID: "t1", StorageBytes: 10, FileCount: 1}
 	c := newQuotaUsageCache("t1", store, time.Hour)
 
 	first := c.get(context.Background())
-	if first == nil || first.StorageBytes != 10 {
-		t.Fatalf("first usage = %+v, want storage 10", first)
+	if first == nil || first.StorageBytes != 10 || first.FileCount != 1 {
+		t.Fatalf("first usage = %+v, want storage 10 file_count 1", first)
 	}
 	store.mu.Lock()
-	store.usage["t1"].StorageBytes = 20
+	store.usage["t1"].StorageBytes = 99
+	store.usage["t1"].FileCount = 99
 	store.mu.Unlock()
-	if cached := c.get(context.Background()); cached == nil || cached.StorageBytes != 10 {
-		t.Fatalf("cached usage = %+v, want storage 10", cached)
+	c.add(5, 2, 1)
+	updated := c.get(context.Background())
+	if updated == nil || updated.StorageBytes != 15 || updated.FileCount != 3 || updated.MediaFileCount != 1 {
+		t.Fatalf("updated usage = %+v, want storage 15 file_count 3 media_count 1", updated)
 	}
-
-	c.invalidate()
-	reloaded := c.get(context.Background())
-	if reloaded == nil || reloaded.StorageBytes != 20 {
-		t.Fatalf("reloaded usage = %+v, want storage 20", reloaded)
-	}
-	if got := store.usageCalls.Load(); got != 2 {
-		t.Fatalf("usageCalls = %d, want 2", got)
+	if got := store.usageCalls.Load(); got != 1 {
+		t.Fatalf("usageCalls = %d, want 1", got)
 	}
 }
 

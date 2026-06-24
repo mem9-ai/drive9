@@ -239,13 +239,22 @@ func (c *quotaUsageCache) cached(now time.Time) *QuotaUsageView {
 	return nil
 }
 
-func (c *quotaUsageCache) invalidate() {
+func (c *quotaUsageCache) add(storageDelta, fileDelta, mediaDelta int64) {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
-	c.snapshot = nil
-	c.mu.Unlock()
+	defer c.mu.Unlock()
+	// If the snapshot is missing or expired, leave it cold. The next soft
+	// admission check reloads the central usage row. When the snapshot is
+	// fresh, a successfully applied quota outbox row can be reflected locally
+	// without forcing the next small write to hit the central DB again.
+	if c.snapshot == nil || c.snapshot.usage == nil || time.Now().After(c.snapshot.expiresAt) {
+		return
+	}
+	c.snapshot.usage.StorageBytes += storageDelta
+	c.snapshot.usage.FileCount += fileDelta
+	c.snapshot.usage.MediaFileCount += mediaDelta
 }
 
 func cloneQuotaUsageView(usage *QuotaUsageView) *QuotaUsageView {

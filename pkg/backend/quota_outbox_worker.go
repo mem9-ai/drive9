@@ -249,9 +249,7 @@ func (b *Dat9Backend) ProcessOneQuotaOutbox(ctx context.Context) (processed bool
 			metrics.RecordOperation("quota_outbox", entry.MutationType, "error", time.Since(start))
 			return true, applyErr
 		}
-		if b.quotaUsageCache != nil {
-			b.quotaUsageCache.invalidate()
-		}
+		b.addLocalQuotaUsageDeltas(entry.StorageDelta, entry.FileDelta, entry.MediaDelta)
 		b.addLocalQuotaPendingDeltas(-entry.StorageDelta, -entry.FileDelta, -entry.MediaDelta)
 		metrics.RecordOperation("quota_outbox", entry.MutationType, "ok", time.Since(start))
 		return true, nil
