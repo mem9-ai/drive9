@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -12,11 +13,11 @@ import (
 
 // ChangeEvent represents a single filesystem mutation event.
 type ChangeEvent struct {
-	Seq   uint64 `json:"seq"`              // monotonic per-tenant seq (fs_events.seq AUTO_INCREMENT)
-	Path  string `json:"path"`             // affected path
-	Op    string `json:"op"`               // "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
-	Actor string `json:"actor,omitempty"`  // X-Dat9-Actor header value (per-mount ID)
-	Ts    int64  `json:"ts"`               // unix milliseconds
+	Seq   uint64 `json:"seq"`             // monotonic per-tenant seq (fs_events.seq AUTO_INCREMENT)
+	Path  string `json:"path"`            // affected path
+	Op    string `json:"op"`             // "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
+	Actor string `json:"actor,omitempty"` // X-Dat9-Actor header value (per-mount ID)
+	Ts    int64  `json:"ts"`             // unix milliseconds
 }
 
 const (
@@ -27,10 +28,10 @@ const (
 // Events are stored in the shared tenant database so that they propagate across
 // all pods. The local notify channel provides instant push to same-pod SSE clients;
 // cross-pod events are discovered via periodic polling of the fs_events table.
-// The store field is refreshed on every tenantEventBus call to handle pool
-// invalidation (old store closed, new store opened).
+// The store field is an atomic pointer so it can be safely refreshed by
+// eventBuses.get (when the pool recreates a backend) while SSE handlers read it.
 type EventBus struct {
-	store     *datastore.Store
+	store     atomic.Pointer[datastore.Store]
 	mu        sync.Mutex
 	listeners map[uint64]chan struct{}
 	nextID    uint64
@@ -38,10 +39,18 @@ type EventBus struct {
 
 // NewEventBus creates a new EventBus backed by the given tenant store.
 func NewEventBus(store *datastore.Store) *EventBus {
-	return &EventBus{
-		store:     store,
+	eb := &EventBus{
 		listeners: make(map[uint64]chan struct{}),
 	}
+	eb.store.Store(store)
+	return eb
+}
+
+// SetStore atomically updates the backing store. Called by eventBuses.get
+// when the pool invalidates and recreates a backend (closing the old store
+// and opening a new one).
+func (eb *EventBus) SetStore(store *datastore.Store) {
+	eb.store.Store(store)
 }
 
 // Publish signals all local subscribers that a new event is available.
@@ -86,11 +95,15 @@ func (eb *EventBus) Unsubscribe(id uint64) {
 
 // Seq returns the current maximum fs_events seq, or 0 if no events exist.
 func (eb *EventBus) Seq(ctx context.Context) uint64 {
-	if eb.store == nil {
+	store := eb.store.Load()
+	if store == nil {
 		return 0
 	}
-	seq, err := eb.store.LatestFSEventSeq(ctx)
+	seq, err := store.LatestFSEventSeq(ctx)
 	if err != nil {
+		return 0
+	}
+	if seq < 0 {
 		return 0
 	}
 	return uint64(seq)
@@ -103,15 +116,16 @@ func (eb *EventBus) Seq(ctx context.Context) uint64 {
 //   - since < oldestSeq: events pruned between client cursor and retained window
 //   - since > headSeq: server_restart (client cursor ahead of head)
 func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []ChangeEvent, headSeq uint64, ok bool) {
-	if eb.store == nil {
+	store := eb.store.Load()
+	if store == nil {
 		return nil, 0, false
 	}
 	if since == 0 {
 		// Initial sync: send reset so client starts fresh.
-		headSeq = uint64(maxInt64(eb.latestSeqSafe(ctx)))
+		headSeq = uint64(clampNonNegative(latestSeqSafe(ctx, store)))
 		return nil, headSeq, false
 	}
-	rows, err := eb.store.ListFSEventsSince(ctx, int64(since), 1000)
+	rows, err := store.ListFSEventsSince(ctx, int64(since), 1000)
 	if err != nil {
 		// Table missing or query failed: don't send reset on every poll —
 		// that would cause continuous full-cache invalidation. Instead, return
@@ -151,8 +165,8 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 	}
 	// No rows after since. Check the actual table state to determine whether
 	// the client's cursor is stale (events pruned) or simply caught up.
-	latest := eb.latestSeqSafe(ctx)
-	oldest := eb.oldestSeqSafe(ctx)
+	latest := latestSeqSafe(ctx, store)
+	oldest := oldestSeqSafe(ctx, store)
 	if latest == 0 {
 		// Table is empty (all events pruned): cursor is stale → reset.
 		return nil, 0, false
@@ -173,8 +187,11 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 }
 
 // latestSeqSafe returns LatestFSEventSeq, or 0 on error.
-func (eb *EventBus) latestSeqSafe(ctx context.Context) int64 {
-	seq, err := eb.store.LatestFSEventSeq(ctx)
+func latestSeqSafe(ctx context.Context, store *datastore.Store) int64 {
+	if store == nil {
+		return 0
+	}
+	seq, err := store.LatestFSEventSeq(ctx)
 	if err != nil {
 		return 0
 	}
@@ -182,15 +199,19 @@ func (eb *EventBus) latestSeqSafe(ctx context.Context) int64 {
 }
 
 // oldestSeqSafe returns OldestFSEventSeq, or 0 on error.
-func (eb *EventBus) oldestSeqSafe(ctx context.Context) int64 {
-	seq, err := eb.store.OldestFSEventSeq(ctx)
+func oldestSeqSafe(ctx context.Context, store *datastore.Store) int64 {
+	if store == nil {
+		return 0
+	}
+	seq, err := store.OldestFSEventSeq(ctx)
 	if err != nil {
 		return 0
 	}
 	return seq
 }
 
-func maxInt64(v int64) int64 {
+// clampNonNegative returns v if v >= 0, else 0.
+func clampNonNegative(v int64) int64 {
 	if v < 0 {
 		return 0
 	}

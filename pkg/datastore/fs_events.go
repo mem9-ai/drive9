@@ -17,24 +17,18 @@ type FSEventRow struct {
 }
 
 // InsertFSEvent inserts a filesystem change event row and returns the assigned seq.
+// Uses a direct ExecContext (no transaction) since this is a single autonomous
+// INSERT — wrapping it in BEGIN/COMMIT adds 2 unnecessary RTTs per event.
 func (s *Store) InsertFSEvent(ctx context.Context, path, op, actor string, ts int64) (int64, error) {
-	var seq int64
-	err := s.InTx(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx,
-			`INSERT INTO fs_events (path, op, actor, ts) VALUES (?, ?, ?, ?)`,
-			path, op, actor, ts)
-		if err != nil {
-			return err
-		}
-		la, err := res.LastInsertId()
-		if err != nil {
-			return err
-		}
-		seq = la
-		return nil
-	})
+	res, err := s.db.ExecContext(ctx,
+		`INSERT INTO fs_events (path, op, actor, ts) VALUES (?, ?, ?, ?)`,
+		path, op, actor, ts)
 	if err != nil {
 		return 0, fmt.Errorf("insert fs_event: %w", err)
+	}
+	seq, err := res.LastInsertId()
+	if err != nil {
+		return 0, fmt.Errorf("insert fs_event last insert id: %w", err)
 	}
 	return seq, nil
 }
@@ -54,9 +48,11 @@ func (s *Store) ListFSEventsSince(ctx context.Context, since int64, limit int) (
 	var events []FSEventRow
 	for rows.Next() {
 		var ev FSEventRow
-		if err := rows.Scan(&ev.Seq, &ev.Path, &ev.Op, &ev.Actor, &ev.Ts); err != nil {
+		var actor sql.NullString
+		if err := rows.Scan(&ev.Seq, &ev.Path, &ev.Op, &actor, &ev.Ts); err != nil {
 			return nil, fmt.Errorf("scan fs_event: %w", err)
 		}
+		ev.Actor = actor.String
 		events = append(events, ev)
 	}
 	return events, rows.Err()

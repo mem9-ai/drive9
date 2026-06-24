@@ -12,6 +12,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"go.uber.org/zap"
 )
 
@@ -135,7 +136,7 @@ func (ebs *eventBuses) get(tenantID string, store *datastore.Store) *EventBus {
 		// valid store (e.g. when tenantEventBus can't resolve a backend but the
 		// bus was previously initialized with one).
 		if store != nil {
-			bus.store = store
+			bus.SetStore(store)
 		}
 		return bus
 	}
@@ -160,17 +161,24 @@ func (s *Server) tenantEventBus(r *http.Request) *EventBus {
 func (s *Server) publishEvent(r *http.Request, path, op string) {
 	actor := r.Header.Get("X-Dat9-Actor")
 	bus := s.tenantEventBus(r)
-	// Best-effort durable insert: if it fails, local SSE clients still get the
-	// event via the notify signal; cross-pod clients get a reset on reconnect.
+	// Best-effort durable insert. If the INSERT fails (network blip, table
+	// missing pre-migration, conn pool exhaustion), the event is lost for
+	// cross-pod SSE clients — they won't see it via the 1s poll since there's
+	// no DB row. However, local SSE clients still get instant delivery via
+	// the notify channel below (their poll will find no new rows but the
+	// notify signal wakes them to re-check, which returns empty = caught up).
+	// FUSE correctness is maintained by HEAD revalidation regardless.
 	// For existing tenants without the fs_events table (pre-migration), the
 	// INSERT will fail until EnsureTiDBSchemaForAutoEmbeddingProfile creates
 	// the table (triggered automatically by the CRC32 schema version bump).
-	if bus.store != nil {
-		if _, err := bus.store.InsertFSEvent(r.Context(), path, op, actor, time.Now().UnixMilli()); err != nil {
+	store := bus.store.Load()
+	if store != nil {
+		if _, err := store.InsertFSEvent(r.Context(), path, op, actor, time.Now().UnixMilli()); err != nil {
 			logger.Warn(r.Context(), "sse_publish_fs_event_insert_failed",
 				zap.String("path", path),
 				zap.String("op", op),
 				zap.Error(err))
+			metrics.RecordOperation("event_bus", "publish", "error", 0)
 		}
 	}
 	bus.Publish()

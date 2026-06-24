@@ -187,6 +187,30 @@ func TestEventBusMultipleSubscribers(t *testing.T) {
 	wg.Wait()
 }
 
+// TestEventBusStoreRefreshNoRace exercises concurrent SetStore + EventsSince
+// to catch data races on the store field. Run with -race to detect violations.
+func TestEventBusStoreRefreshNoRace(t *testing.T) {
+	store := newTestStoreForEventBus(t)
+	bus := NewEventBus(store)
+
+	done := make(chan struct{})
+
+	// Writer goroutine: repeatedly refresh the store.
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			bus.SetStore(store)
+		}
+	}()
+
+	// Reader goroutine: repeatedly call EventsSince.
+	for i := 0; i < 100; i++ {
+		bus.EventsSince(context.Background(), 0)
+	}
+
+	<-done
+}
+
 // TestEventBusEventsSinceQueryErrorReturnsCaughtUp verifies that when the
 // store query fails (e.g. DB closed, table missing), EventsSince returns
 // ok=true with empty events (caught up) instead of a reset — preventing
