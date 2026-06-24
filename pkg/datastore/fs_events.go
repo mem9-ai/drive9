@@ -86,7 +86,13 @@ func (s *Store) OldestFSEventSeq(ctx context.Context) (int64, error) {
 	return seq.Int64, nil
 }
 
-// DeleteFSEventsBefore deletes fs_events rows older than the given created_at threshold.
+// DeleteFSEventsBefore deletes fs_events rows older than the given threshold.
+// Retention is gated on created_at (DB server's clock at INSERT time), not on
+// the ts field (publisher's clock at event emission). This means the retention
+// guarantee is relative to DB insert time, not event time. If a future feature
+// lets clients reason about retention by ts, a separate index on ts and a
+// ts-based deletion path would be needed. For now, created_at is indexed and
+// sufficient because the SSE protocol uses seq (not ts) for cursor management.
 func (s *Store) DeleteFSEventsBefore(ctx context.Context, before time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM fs_events WHERE created_at < ?`, before)
 	if err != nil {

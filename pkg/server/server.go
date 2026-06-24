@@ -540,11 +540,22 @@ const fsEventsRetention = 1 * time.Hour
 // event write rate; a separate task should add per-tenant cleanup via pool
 // iteration or on Acquire. See issue #599 P1-2.
 func (s *Server) cleanupFSEvents(ctx context.Context) {
+	if ctx.Err() != nil {
+		// Context already cancelled (shutdown in progress): skip cleanup to
+		// avoid a partial DELETE that will roll back. Log so operators can see
+		// that a cleanup cycle was interrupted by shutdown.
+		logger.Warn(ctx, "fs_events_cleanup_skipped_shutdown", zap.Error(ctx.Err()))
+		return
+	}
 	if s.fallback != nil && s.meta == nil {
 		store := s.fallback.Store()
 		if store != nil {
 			if _, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-fsEventsRetention)); err != nil {
-				logger.Warn(ctx, "fs_events_cleanup_failed", zap.Error(err))
+				if ctx.Err() != nil {
+					logger.Warn(ctx, "fs_events_cleanup_interrupted_by_shutdown", zap.Error(err))
+				} else {
+					logger.Warn(ctx, "fs_events_cleanup_failed", zap.Error(err))
+				}
 			}
 		}
 	}

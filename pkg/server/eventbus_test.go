@@ -186,3 +186,34 @@ func TestEventBusMultipleSubscribers(t *testing.T) {
 	bus.Publish()
 	wg.Wait()
 }
+
+// TestEventBusEventsSinceQueryErrorReturnsCaughtUp verifies that when the
+// store query fails (e.g. DB closed, table missing), EventsSince returns
+// ok=true with empty events (caught up) instead of a reset — preventing
+// continuous full-cache invalidation on every poll. This is the silent-
+// failure branch flagged in D1.
+func TestEventBusEventsSinceQueryErrorReturnsCaughtUp(t *testing.T) {
+	store := newTestStoreForEventBus(t)
+	bus := NewEventBus(store)
+
+	// Insert one event so since=1 is valid.
+	if _, err := store.InsertFSEvent(context.Background(), "/a.txt", "write", "", time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close the store's DB to simulate query failure.
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	events, headSeq, ok := bus.EventsSince(context.Background(), 1)
+	if !ok {
+		t.Fatal("EventsSince should return ok=true on query error (caught up), not reset")
+	}
+	if len(events) != 0 {
+		t.Fatalf("expected 0 events on query error, got %d", len(events))
+	}
+	if headSeq != 1 {
+		t.Fatalf("headSeq should be unchanged (=since) on query error, got %d", headSeq)
+	}
+}

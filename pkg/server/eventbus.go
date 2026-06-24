@@ -6,6 +6,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"go.uber.org/zap"
 )
 
@@ -116,11 +117,13 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 		// that would cause continuous full-cache invalidation. Instead, return
 		// ok=true with empty events (caught up). The FUSE client's TTL/HEAD
 		// revalidation provides correctness without SSE. Only since=0 (initial
-		// connection) sends a reset. Log the error so operators can detect
-		// persistent table-missing or DB connectivity issues.
+		// connection) sends a reset. Log the error and emit a metric counter so
+		// operators can detect and alert on persistent table-missing or DB
+		// connectivity issues.
 		logger.Warn(ctx, "event_bus_query_failed",
 			zap.Uint64("since", since),
 			zap.Error(err))
+		metrics.RecordOperation("event_bus", "query", "error", 0)
 		headSeq = since // keep the client's cursor unchanged
 		return nil, headSeq, true
 	}
