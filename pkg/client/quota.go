@@ -111,7 +111,11 @@ type AdminTenantDeleteResponse struct {
 	Status   string `json:"status"`
 }
 
-// GetQuota queries quota through the compatibility quota endpoint.
+// GetQuota queries quota through the deprecated compatibility /v1/quota
+// endpoint.
+//
+// Deprecated: use AdminGetTenant or AdminListTenants with IncludeQuota to read
+// quota. The /v1/quota endpoint remains only for compatibility.
 func (c *Client) GetQuota(ctx context.Context, query QuotaRequest) (*QuotaResponse, error) {
 	values := url.Values{}
 	values.Set("tenant_id", query.TenantID)
