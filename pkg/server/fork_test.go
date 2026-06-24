@@ -379,6 +379,38 @@ func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *test
 	}
 }
 
+func TestCreateForkTenantPreAPIKeyFailureMarksDeleted(t *testing.T) {
+	rt := newForkCleanupTestRuntime(t)
+	rt.prov.provider = tenant.ProviderTiDBCloudNative
+	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
+	rt.prov.cluster = &tenant.ClusterInfo{
+		ClusterID: "cluster-a",
+		BranchID:  "branch-created",
+		Provider:  tenant.ProviderTiDBCloudNative,
+	}
+	rt.prov.initErr = errors.New("init failed")
+	rt.prov.systemUsername = "u1.root"
+
+	_, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err == nil {
+		t.Fatal("createForkTenant error = nil, want error")
+	}
+
+	// Before this PR, pre-API-key failures left tenant as "failed".
+	// Now they should be marked "deleted" since caller has no API key.
+	failed, _ := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
+	if len(failed) != 0 {
+		t.Fatalf("failed tenants = %d, want 0 (pre-API-key failure should mark deleted)", len(failed))
+	}
+	deleted, _ := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantDeleted, 10)
+	if len(deleted) == 0 {
+		t.Fatal("deleted tenants = 0, want at least 1 (pre-API-key failure should mark deleted)")
+	}
+}
+
 func TestCreateForkTenantPersistsGeneratedBranchPassword(t *testing.T) {
 	rt := newForkCleanupTestRuntime(t)
 	rt.insertLiveTenant(t, "source")

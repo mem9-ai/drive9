@@ -1025,3 +1025,77 @@ func TestSQLQuoting(t *testing.T) {
 		t.Fatalf("quoteString = %q", got)
 	}
 }
+
+func TestWaitForBranchUserWithCredentialsPollsUserPrefix(t *testing.T) {
+	polls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		polls++
+		if polls < 3 {
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"branchId": "branch-1",
+				"state":    "CREATING",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"branchId":   "branch-1",
+			"state":      "ACTIVE",
+			"userPrefix": "u3",
+			"endpoints":  map[string]any{"public": map[string]any{"host": "branch.example", "port": 4000}},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	username, err := p.WaitForBranchUserWithCredentials(context.Background(), "cluster-1", "branch-1", tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
+	if err != nil {
+		t.Fatalf("WaitForBranchUserWithCredentials: %v", err)
+	}
+	if username != "u3.root" {
+		t.Fatalf("username = %q, want u3.root", username)
+	}
+	if polls != 3 {
+		t.Fatalf("polls = %d, want 3", polls)
+	}
+}
+
+func TestWaitForBranchUserWithCredentialsPrefersUsername(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"branchId": "branch-1",
+			"state":    "ACTIVE",
+			"username": "direct-user",
+			"endpoints": map[string]any{
+				"public": map[string]any{"host": "branch.example", "port": 4000},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	username, err := p.WaitForBranchUserWithCredentials(context.Background(), "cluster-1", "branch-1", tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
+	if err != nil {
+		t.Fatalf("WaitForBranchUserWithCredentials: %v", err)
+	}
+	if username != "direct-user" {
+		t.Fatalf("username = %q, want direct-user", username)
+	}
+}
