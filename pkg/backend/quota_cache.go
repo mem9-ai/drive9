@@ -31,6 +31,14 @@ type quotaConfigSnapshot struct {
 	version string
 }
 
+func cloneQuotaConfigView(cfg *QuotaConfigView) *QuotaConfigView {
+	if cfg == nil {
+		return nil
+	}
+	cp := *cfg
+	return &cp
+}
+
 // quotaConfigCache is a per-tenant cache for low-frequency quota config. It
 // only removes repeated config reads and uses version polling so config changes
 // converge without a cross-server invalidation channel.
@@ -70,8 +78,7 @@ func (c *quotaConfigCache) get() *QuotaConfigView {
 	if c.snapshot == nil || c.snapshot.config == nil {
 		return nil
 	}
-	cfg := *c.snapshot.config
-	return &cfg
+	return cloneQuotaConfigView(c.snapshot.config)
 }
 
 func (c *quotaConfigCache) load(ctx context.Context) *QuotaConfigView {
@@ -98,15 +105,15 @@ func (c *quotaConfigCache) load(ctx context.Context) *QuotaConfigView {
 	}
 	c.mu.Lock()
 	if c.snapshot != nil && c.snapshot.config != nil {
-		existing := *c.snapshot.config
+		existing := cloneQuotaConfigView(c.snapshot.config)
 		c.mu.Unlock()
 		metrics.RecordOperation("quota_config_cache", "load", "raced_refresh", time.Since(start))
-		return &existing
+		return existing
 	}
-	c.snapshot = &quotaConfigSnapshot{config: cfg, version: ""}
+	c.snapshot = &quotaConfigSnapshot{config: cloneQuotaConfigView(cfg), version: ""}
 	c.mu.Unlock()
 	metrics.RecordOperation("quota_config_cache", "load", "ok", time.Since(start))
-	return cfg
+	return cloneQuotaConfigView(cfg)
 }
 
 func (c *quotaConfigCache) stop() {
@@ -155,7 +162,7 @@ func (c *quotaConfigCache) refresh(ctx context.Context) {
 		return
 	}
 	c.mu.Lock()
-	c.snapshot = &quotaConfigSnapshot{config: cfg, version: version}
+	c.snapshot = &quotaConfigSnapshot{config: cloneQuotaConfigView(cfg), version: version}
 	c.mu.Unlock()
 	metrics.RecordOperation("quota_config_cache", "refresh", "ok", time.Since(start))
 }

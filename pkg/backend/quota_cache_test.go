@@ -175,6 +175,27 @@ func TestQuotaConfigCacheLazyLoadDoesNotOverwriteRefreshedSnapshot(t *testing.T)
 	}
 }
 
+func TestQuotaConfigCacheLazyLoadReturnsDefensiveCopy(t *testing.T) {
+	store := newCacheTestStore()
+	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
+	c := newQuotaConfigCache("t1", store)
+	defer c.stop()
+
+	cfg := c.load(context.Background())
+	if cfg == nil {
+		t.Fatal("config is nil")
+	}
+	cfg.MaxStorageBytes = 2000
+
+	cached := c.get()
+	if cached == nil {
+		t.Fatal("cached config is nil")
+	}
+	if cached.MaxStorageBytes != 1000 {
+		t.Fatalf("cached MaxStorageBytes = %d, want 1000", cached.MaxStorageBytes)
+	}
+}
+
 func TestQuotaUsageCacheUsesTTL(t *testing.T) {
 	store := newCacheTestStore()
 	store.usage["t1"] = &QuotaUsageView{TenantID: "t1", StorageBytes: 10}

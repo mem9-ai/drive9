@@ -1086,7 +1086,7 @@ func TestNamespaceCache_InvalidatePrefix(t *testing.T) {
 func TestNamespaceCache_LargeDirCachesCompleteWithHighMaxEntries(t *testing.T) {
 	// With a high maxEntries (like the default), a 10k-entry
 	// directory should be cached as complete and returned by Get().
-	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 100000)
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, defaultNamespaceCacheMaxEntries)
 	items := make([]CachedFileInfo, 10000)
 	for i := range items {
 		items[i] = CachedFileInfo{
