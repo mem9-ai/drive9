@@ -38,7 +38,7 @@ func TestFileGCTaskEnqueuesOriginalStorageRefAfterPathRecreate(t *testing.T) {
 	rec := &deleteRecordingS3Client{S3Client: b.s3}
 	b.s3 = rec
 	fake := newFakeMetaQuotaStore()
-	b.SetMetaQuotaStore("tenant-a", fake)
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
 	b.storageNamespaceID = "ns-a"
 
 	ctx := context.Background()
@@ -132,7 +132,7 @@ func TestFileGCTaskEnqueuesObjectCandidateWhenNamespaceWired(t *testing.T) {
 	rec := &deleteRecordingS3Client{S3Client: b.s3}
 	b.s3 = rec
 	fake := newFakeMetaQuotaStore()
-	b.SetMetaQuotaStore("tenant-a", fake)
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
 	b.storageNamespaceID = "ns-a"
 
 	ctx := context.Background()
@@ -312,7 +312,7 @@ func TestFileGCTaskRetriesWhenObjectCandidateEnqueueFails(t *testing.T) {
 	fake := newFakeMetaQuotaStore()
 	enqueueErr := errors.New("meta unavailable")
 	fake.objectGCCandidateErr = enqueueErr
-	b.SetMetaQuotaStore("tenant-a", fake)
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
 	b.storageNamespaceID = "ns-a"
 
 	ctx := context.Background()

@@ -165,6 +165,10 @@ func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, tx *sql.Tx, 
 	return nil
 }
 
+// ensureFileCountQuotaServer is a soft optimistic file-count check for small
+// create-like writes. Like storage soft admission, concurrent servers may
+// briefly over-admit within the quota usage/pending-delta cache TTL; strict
+// upload reservations keep using live counters under the admission lock.
 func (b *Dat9Backend) ensureFileCountQuotaServer(ctx context.Context, tx *sql.Tx, currentFileDelta int64) error {
 	if !b.UseServerQuota() || currentFileDelta <= 0 {
 		return nil
@@ -177,13 +181,13 @@ func (b *Dat9Backend) ensureFileCountQuotaServer(ctx context.Context, tx *sql.Tx
 	if cfg.MaxFileCount <= 0 {
 		return nil
 	}
-	usage := b.loadQuotaUsage(ctx)
+	usage := b.cachedQuotaUsage(ctx)
 	if usage == nil {
 		metrics.RecordOperation("server_quota", "file_count_check", "fail_open", 0)
 		return nil
 	}
 	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
-	_, pendingFileDelta, _, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
+	_, pendingFileDelta, _, pendingOK := b.cachedPendingQuotaOutboxDeltasTx(ctx, tx)
 	if !pendingOK {
 		metrics.RecordOperation("server_quota", "file_count_check_pending_delta", "fail_open", 0)
 	}
@@ -211,13 +215,13 @@ func (b *Dat9Backend) checkStorageQuotaServerTx(ctx context.Context, tx *sql.Tx,
 	if cfg.MaxStorageBytes <= 0 {
 		return result, false // quota not configured
 	}
-	usage := b.loadQuotaUsage(ctx)
+	usage := b.cachedQuotaUsage(ctx)
 	if usage == nil {
 		metrics.RecordOperation("server_quota", "storage_check", "fail_open", 0)
 		return result, false // fail-open: usage unavailable
 	}
 	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
-	pendingStorageDelta, _, _, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
+	pendingStorageDelta, _, _, pendingOK := b.cachedPendingQuotaOutboxDeltasTx(ctx, tx)
 	if !pendingOK {
 		metrics.RecordOperation("server_quota", "storage_check_pending_delta", "fail_open", 0)
 	}
@@ -251,6 +255,10 @@ func (b *Dat9Backend) cachedQuotaConfig(ctx context.Context) *QuotaConfigView {
 		if cfg := b.quotaConfigCache.get(); cfg != nil {
 			return cfg
 		}
+		return b.quotaConfigCache.load(ctx)
+	}
+	if b.metaStore == nil {
+		return nil
 	}
 	cfg, err := b.metaStore.GetQuotaConfig(ctx, b.tenantID)
 	if err != nil {
@@ -261,9 +269,9 @@ func (b *Dat9Backend) cachedQuotaConfig(ctx context.Context) *QuotaConfigView {
 	return cfg
 }
 
-// loadQuotaUsage reads high-churn quota counters directly from the central DB.
-// Usage is not served from a per-process cache because multi-server deployments
-// would otherwise widen the stale window for quota checks.
+// loadQuotaUsage reads quota counters directly from the central DB. Use this
+// for strict quota paths such as upload reservations; small-write soft checks
+// use cachedQuotaUsage to avoid a central read on every write.
 func (b *Dat9Backend) loadQuotaUsage(ctx context.Context) *QuotaUsageView {
 	usage, err := b.metaStore.GetQuotaUsage(ctx, b.tenantID)
 	if err != nil {
@@ -272,6 +280,16 @@ func (b *Dat9Backend) loadQuotaUsage(ctx context.Context) *QuotaUsageView {
 		return nil
 	}
 	return usage
+}
+
+// cachedQuotaUsage reads central usage through a short TTL cache. It is only
+// used by soft small-write checks; strict upload reservation paths call
+// loadQuotaUsage directly.
+func (b *Dat9Backend) cachedQuotaUsage(ctx context.Context) *QuotaUsageView {
+	if b.quotaUsageCache != nil {
+		return b.quotaUsageCache.get(ctx)
+	}
+	return b.loadQuotaUsage(ctx)
 }
 
 // --- Server-side media file count (Rev 4 migration) ---
@@ -320,20 +338,37 @@ func (b *Dat9Backend) mediaLLMQuotaExceededServerTx(ctx context.Context, tx *sql
 	if cfg.MaxMediaLLMFiles <= 0 {
 		return false
 	}
-	usage := b.loadQuotaUsage(ctx)
+	usage := b.cachedQuotaUsage(ctx)
 	if usage == nil {
 		metrics.RecordOperation("server_quota", "media_check", "fail_open", 0)
 		return false
 	}
 	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
-	_, _, pendingMediaDelta, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
+	_, _, pendingMediaDelta, pendingOK := b.cachedPendingQuotaOutboxDeltasTx(ctx, tx)
 	if !pendingOK {
 		metrics.RecordOperation("server_quota", "media_check_pending_delta", "fail_open", 0)
 	}
 	return usage.MediaFileCount+pendingMediaDelta+currentMediaDelta > cfg.MaxMediaLLMFiles
 }
 
-func (b *Dat9Backend) pendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx) (storageDelta, fileDelta, mediaDelta int64, ok bool) {
+// cachedPendingQuotaOutboxDeltasTx returns tenant-local pending quota deltas
+// for soft small-write checks. The short TTL cache avoids a SUM over
+// quota_outbox on every tiny write; strict upload reservations must call
+// livePendingQuotaOutboxDeltasTx under the admission lock instead.
+func (b *Dat9Backend) cachedPendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx) (storageDelta, fileDelta, mediaDelta int64, ok bool) {
+	if b.store == nil || tx == nil {
+		return 0, 0, 0, true
+	}
+	if b.quotaPendingCache != nil {
+		deltas, ok := b.quotaPendingCache.get(ctx)
+		if ok {
+			return deltas.storageDelta, deltas.fileDelta, deltas.mediaDelta, true
+		}
+	}
+	return b.livePendingQuotaOutboxDeltasTx(ctx, tx)
+}
+
+func (b *Dat9Backend) livePendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx) (storageDelta, fileDelta, mediaDelta int64, ok bool) {
 	if b.store == nil || tx == nil {
 		return 0, 0, 0, true
 	}
@@ -344,6 +379,12 @@ func (b *Dat9Backend) pendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx
 		return 0, 0, 0, false
 	}
 	return storageDelta, fileDelta, mediaDelta, true
+}
+
+func (b *Dat9Backend) addLocalQuotaPendingDeltas(storageDelta, fileDelta, mediaDelta int64) {
+	if b.quotaPendingCache != nil {
+		b.quotaPendingCache.add(storageDelta, fileDelta, mediaDelta)
+	}
 }
 
 func (r storageQuotaCheckResult) exceeded() bool {

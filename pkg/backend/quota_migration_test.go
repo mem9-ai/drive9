@@ -510,7 +510,7 @@ func newCentralQuotaBackend(t *testing.T) (*Dat9Backend, *fakeMetaQuotaStore) {
 		MaxMediaLLMFiles: 1000,
 		MaxMonthlyCostMC: 1 << 30,
 	}
-	b.SetMetaQuotaStore("tenant-a", fake)
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
 	return b, fake
 }
 

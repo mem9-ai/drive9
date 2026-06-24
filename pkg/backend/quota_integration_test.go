@@ -25,7 +25,7 @@ func newServerQuotaBackend(t *testing.T, opts Options) (*Dat9Backend, *fakeMetaQ
 		MaxMediaLLMFiles: 1000,
 		MaxMonthlyCostMC: 1 << 30,
 	}
-	b.SetMetaQuotaStore("tenant-a", fake)
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
 	return b, fake
 }
 
@@ -66,7 +66,7 @@ func TestServerQuotaFeatureFlagRejectsOverLimitWrite(t *testing.T) {
 		TenantID:     "tenant-a",
 		StorageBytes: 8,
 	}
-	b.SetMetaQuotaStore("tenant-a", fake)
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
 
 	if _, err := b.Write("/beta.txt", []byte("xyz"), 0, filesystem.WriteFlagCreate); !errors.Is(err, ErrStorageQuotaExceeded) {
 		t.Fatalf("expected ErrStorageQuotaExceeded from server quota path, got %v", err)
