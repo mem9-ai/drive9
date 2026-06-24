@@ -15,6 +15,10 @@ const (
 	// quotaConfigCacheRefreshInterval is how often the background goroutine
 	// polls the tenant quota config version from the central DB.
 	quotaConfigCacheRefreshInterval = 30 * time.Second
+	// quotaUsageCacheTTL bounds how long soft small-write quota checks may
+	// reuse central usage counters. Strict upload reservations still read
+	// central usage directly.
+	quotaUsageCacheTTL = 100 * time.Millisecond
 )
 
 type quotaConfigSnapshot struct {
@@ -35,14 +39,16 @@ type quotaConfigCache struct {
 
 	mu       sync.RWMutex
 	snapshot *quotaConfigSnapshot
+	loadMu   sync.Mutex
 
 	cancel context.CancelFunc
 	done   chan struct{}
 }
 
 // newQuotaConfigCache creates and starts a background-refreshing config cache.
-// Performs one best-effort synchronous initial load so the first quota check
-// usually has config available. If the initial load fails, callers fail open.
+// Backend construction must stay cheap for read-only operations such as ls, so
+// the initial load is lazy: the first quota check loads config on demand and
+// the background refresher keeps it current after that.
 func newQuotaConfigCache(tenantID string, store MetaQuotaStore) *quotaConfigCache {
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &quotaConfigCache{
@@ -51,7 +57,6 @@ func newQuotaConfigCache(tenantID string, store MetaQuotaStore) *quotaConfigCach
 		cancel:   cancel,
 		done:     make(chan struct{}),
 	}
-	c.refresh(ctx)
 	go c.run(ctx)
 	return c
 }
@@ -66,6 +71,39 @@ func (c *quotaConfigCache) get() *QuotaConfigView {
 	}
 	cfg := *c.snapshot.config
 	return &cfg
+}
+
+func (c *quotaConfigCache) load(ctx context.Context) *QuotaConfigView {
+	if cfg := c.get(); cfg != nil {
+		return cfg
+	}
+	c.loadMu.Lock()
+	defer c.loadMu.Unlock()
+	if cfg := c.get(); cfg != nil {
+		return cfg
+	}
+
+	start := time.Now()
+	cfg, err := c.store.GetQuotaConfig(ctx, c.tenantID)
+	if err != nil {
+		logger.Warn(ctx, "quota_config_cache_config_failed",
+			zap.String("tenant_id", c.tenantID), zap.Error(err))
+		metrics.RecordOperation("quota_config_cache", "load", "config_error", time.Since(start))
+		return nil
+	}
+	if cfg == nil {
+		metrics.RecordOperation("quota_config_cache", "load", "config_empty", time.Since(start))
+		return nil
+	}
+	c.mu.Lock()
+	version := ""
+	if c.snapshot != nil {
+		version = c.snapshot.version
+	}
+	c.snapshot = &quotaConfigSnapshot{config: cfg, version: version}
+	c.mu.Unlock()
+	metrics.RecordOperation("quota_config_cache", "load", "ok", time.Since(start))
+	return cfg
 }
 
 func (c *quotaConfigCache) stop() {
@@ -117,4 +155,57 @@ func (c *quotaConfigCache) refresh(ctx context.Context) {
 	c.snapshot = &quotaConfigSnapshot{config: cfg, version: version}
 	c.mu.Unlock()
 	metrics.RecordOperation("quota_config_cache", "refresh", "ok", time.Since(start))
+}
+
+type quotaUsageSnapshot struct {
+	usage     *QuotaUsageView
+	expiresAt time.Time
+}
+
+// quotaUsageCache is used only by soft small-write admission checks. It avoids
+// one central DB read per 1KB write while keeping the stale window short.
+type quotaUsageCache struct {
+	tenantID string
+	store    MetaQuotaStore
+	ttl      time.Duration
+
+	mu       sync.Mutex
+	snapshot *quotaUsageSnapshot
+}
+
+func newQuotaUsageCache(tenantID string, store MetaQuotaStore, ttl time.Duration) *quotaUsageCache {
+	if ttl <= 0 {
+		ttl = quotaUsageCacheTTL
+	}
+	return &quotaUsageCache{tenantID: tenantID, store: store, ttl: ttl}
+}
+
+func (c *quotaUsageCache) get(ctx context.Context) *QuotaUsageView {
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.snapshot != nil && c.snapshot.usage != nil && now.Before(c.snapshot.expiresAt) {
+		usage := *c.snapshot.usage
+		return &usage
+	}
+
+	start := time.Now()
+	usage, err := c.store.GetQuotaUsage(ctx, c.tenantID)
+	if err != nil {
+		logger.Warn(ctx, "server_quota_usage_fail_open",
+			zap.String("tenant_id", c.tenantID), zap.Error(err))
+		metrics.RecordOperation("server_quota", "usage_cache", "load_error", time.Since(start))
+		return nil
+	}
+	if usage == nil {
+		metrics.RecordOperation("server_quota", "usage_cache", "load_empty", time.Since(start))
+		return nil
+	}
+	c.snapshot = &quotaUsageSnapshot{
+		usage:     usage,
+		expiresAt: now.Add(c.ttl),
+	}
+	copied := *usage
+	metrics.RecordOperation("server_quota", "usage_cache", "load_ok", time.Since(start))
+	return &copied
 }

@@ -167,11 +167,11 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 		max = 128
 	}
 	return &Pool{
-		cfg:           cfg,
-		enc:           enc,
-		items:         map[string]*entry{},
-		order:         list.New(),
-		maxSize:       max,
+		cfg:     cfg,
+		enc:     enc,
+		items:   map[string]*entry{},
+		order:   list.New(),
+		maxSize: max,
 		// No LeaderChecker means single-pod mode: FileGC runs unconditionally.
 		fileGCEnabled: cfg.LeaderChecker == nil,
 	}
@@ -952,20 +952,12 @@ func (p *Pool) defaultStorageNamespacePrefix(tenantID, backendName string) strin
 
 // wireQuotaStore sets the central quota store on a newly created backend.
 // No-op when the pool's metaStore is nil (tests, non-multi-tenant mode).
-// Also ensures a tenant_quota_usage row exists so that counter UPDATEs
-// do not fail for newly provisioned tenants.
 func (p *Pool) wireQuotaStore(b *backend.Dat9Backend, tenantID string) {
 	if p.metaStore == nil {
 		return
 	}
 	adapter := NewMetaQuotaAdapter(p.metaStore)
 	b.SetMetaQuotaStore(tenantID, adapter)
-	// Bootstrap quota usage row (INSERT IGNORE — idempotent, cheap).
-	if err := p.metaStore.EnsureQuotaUsageRow(context.Background(), tenantID); err != nil {
-		logger.Warn(context.Background(), "wire_quota_store_ensure_usage_row_failed",
-			zap.String("tenant_id", tenantID),
-			zap.Error(err))
-	}
 }
 
 func (p *Pool) removeLocked(elem *list.Element) *entry {

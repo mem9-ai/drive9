@@ -15,10 +15,12 @@ import (
 
 const (
 	quotaOutboxNotifySize       = 1
+	quotaOutboxNotifyDelay      = 50 * time.Millisecond
 	quotaOutboxPollInterval     = 1 * time.Second
 	quotaOutboxLeaseDuration    = 5 * time.Minute
 	quotaOutboxBatchSize        = 100
 	quotaOutboxRecoverLimit     = 100
+	quotaOutboxUploadDrainLimit = 1000
 	quotaOutboxRetryBaseDelay   = 200 * time.Millisecond
 	quotaOutboxRetryMaxDelay    = 30 * time.Second
 	quotaMutationTypeFileCreate = "file_create"
@@ -67,9 +69,36 @@ func (b *Dat9Backend) runQuotaOutboxWorker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-b.quotaOutboxNotify:
+			if !b.waitQuotaOutboxNotifyQuiet(ctx) {
+				return
+			}
 			b.processQuotaOutboxAvailable(ctx)
 		case <-ticker.C:
 			b.processQuotaOutboxAvailable(ctx)
+		}
+	}
+}
+
+func (b *Dat9Backend) waitQuotaOutboxNotifyQuiet(ctx context.Context) bool {
+	if quotaOutboxNotifyDelay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(quotaOutboxNotifyDelay)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+			return true
+		case <-b.quotaOutboxNotify:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(quotaOutboxNotifyDelay)
 		}
 	}
 }
@@ -105,6 +134,46 @@ func (b *Dat9Backend) processQuotaOutboxAvailable(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (b *Dat9Backend) drainQuotaOutboxForUploadTarget(ctx context.Context, path string, targetExists bool) error {
+	if !targetExists || !b.UseServerQuota() || b.store == nil {
+		return nil
+	}
+	nf, err := b.store.Stat(ctx, path)
+	if err != nil {
+		return err
+	}
+	if nf.File == nil || nf.File.FileID == "" {
+		return nil
+	}
+	return b.drainQuotaOutboxForFile(ctx, nf.File.FileID, quotaOutboxUploadDrainLimit)
+}
+
+func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string, limit int) error {
+	if fileID == "" || b.store == nil {
+		return nil
+	}
+	if limit <= 0 {
+		limit = quotaOutboxUploadDrainLimit
+	}
+	for i := 0; i < limit; i++ {
+		pending, err := b.store.HasPendingQuotaOutboxFileMutation(ctx, fileID)
+		if err != nil {
+			return fmt.Errorf("check pending quota outbox for file: %w", err)
+		}
+		if !pending {
+			return nil
+		}
+		processed, err := b.ProcessOneQuotaOutbox(ctx)
+		if err != nil {
+			return fmt.Errorf("drain quota outbox for file: %w", err)
+		}
+		if !processed {
+			return nil
+		}
+	}
+	return fmt.Errorf("quota outbox for file %s still pending after %d entries", fileID, limit)
 }
 
 // ProcessOneQuotaOutbox applies at most one tenant-local quota outbox row. It is

@@ -137,6 +137,7 @@ func (b *Dat9Backend) SetMetaQuotaStore(tenantID string, mqs MetaQuotaStore) {
 				zap.Error(err))
 		}
 		b.quotaConfigCache = newQuotaConfigCache(tenantID, mqs)
+		b.quotaUsageCache = newQuotaUsageCache(tenantID, mqs, quotaUsageCacheTTL)
 		b.startMutationWorker()
 		b.startQuotaOutboxWorker()
 	}

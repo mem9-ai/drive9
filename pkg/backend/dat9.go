@@ -100,6 +100,7 @@ type Dat9Backend struct {
 	metaStore          MetaQuotaStore // nil when central quota is not wired (tests, fallback)
 	quotaSource        QuotaSource    // "tenant" (default) or "server"
 	quotaConfigCache   *quotaConfigCache
+	quotaUsageCache    *quotaUsageCache
 
 	// mutationQueue decouples central quota mutations (syncCentralFileCreate,
 	// syncCentralFileOverwrite) from the fsync critical path. Mutations are

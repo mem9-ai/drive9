@@ -283,6 +283,10 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		}
 		return nil, err
 	}
+	if err := b.drainQuotaOutboxForUploadTarget(ctx, path, targetExists); err != nil {
+		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+		return nil, err
+	}
 
 	fileID := b.genID()
 	s3Key := "blobs/" + fileID
@@ -462,6 +466,10 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		} else {
 			metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		}
+		return nil, err
+	}
+	if err := b.drainQuotaOutboxForUploadTarget(ctx, path, targetExists); err != nil {
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
 	}
 	validateDurationMs := uploadPhaseMs(validateStart)
