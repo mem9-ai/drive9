@@ -379,35 +379,53 @@ func TestCreateForkPartialBranchProvisionErrorPersistsBranchAndKeepsRoot(t *test
 	}
 }
 
-func TestCreateForkTenantPreAPIKeyFailureMarksDeleted(t *testing.T) {
+func TestCreateForkTenantPostAPIKeyFailureMarksFailed(t *testing.T) {
+	origWindow, origInitialBackoff, origMaxBackoff := forkProvisionRetryWindow, forkProvisionInitialBackoff, forkProvisionMaxBackoff
+	forkProvisionRetryWindow = 500 * time.Millisecond
+	forkProvisionInitialBackoff = 5 * time.Millisecond
+	forkProvisionMaxBackoff = 5 * time.Millisecond
+	t.Cleanup(func() {
+		forkProvisionRetryWindow = origWindow
+		forkProvisionInitialBackoff = origInitialBackoff
+		forkProvisionMaxBackoff = origMaxBackoff
+	})
+
 	rt := newForkCleanupTestRuntime(t)
 	rt.prov.provider = tenant.ProviderTiDBCloudNative
 	rt.insertLiveTenantWithProvider(t, "source", tenant.ProviderTiDBCloudNative)
 	rt.prov.cluster = &tenant.ClusterInfo{
 		ClusterID: "cluster-a",
 		BranchID:  "branch-created",
+		Host:      rt.dbHost,
+		Port:      rt.dbPort,
+		Username:  rt.dbUser,
+		DBName:    rt.dbName,
 		Provider:  tenant.ProviderTiDBCloudNative,
 	}
 	rt.prov.initErr = errors.New("init failed")
-	rt.prov.systemUsername = "u1.root"
 
-	_, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
+	resp, err := rt.server.createForkTenant(context.Background(), "source", "fork", &tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	})
-	if err == nil {
-		t.Fatal("createForkTenant error = nil, want error")
+	if err != nil {
+		t.Fatalf("createForkTenant error = %v, want nil (provision is async)", err)
+	}
+	if resp.Status != string(meta.TenantProvisioning) || resp.APIKey == "" {
+		t.Fatalf("unexpected fork response: %+v", resp)
 	}
 
-	// Before this PR, pre-API-key failures left tenant as "failed".
-	// Now they should be marked "deleted" since caller has no API key.
-	failed, _ := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
-	if len(failed) != 0 {
-		t.Fatalf("failed tenants = %d, want 0 (pre-API-key failure should mark deleted)", len(failed))
+	waitForCondition(t, func() bool {
+		failed, err := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
+		return err == nil && len(failed) == 1
+	})
+
+	failed, err := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantFailed, 10)
+	if err != nil {
+		t.Fatal(err)
 	}
-	deleted, _ := rt.meta.ListTenantsByStatus(context.Background(), meta.TenantDeleted, 10)
-	if len(deleted) == 0 {
-		t.Fatal("deleted tenants = 0, want at least 1 (pre-API-key failure should mark deleted)")
+	if len(failed) != 1 {
+		t.Fatalf("failed tenants = %d, want 1 (post-API-key failure should mark failed, not deleted)", len(failed))
 	}
 }
 
