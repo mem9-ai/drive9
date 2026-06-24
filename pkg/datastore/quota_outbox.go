@@ -80,14 +80,35 @@ func (s *Store) LockQuotaAdmissionTx(db execer) error {
 	return nil
 }
 
-// ClaimQuotaOutbox claims the oldest queued quota mutation for this tenant
-// store. Only one row is allowed to be processing at a time, preserving
-// per-tenant apply order even when multiple server instances poll the same
-// tenant DB.
+// ClaimQuotaOutbox claims one queued quota mutation for this tenant store.
 func (s *Store) ClaimQuotaOutbox(ctx context.Context, now time.Time, leaseDuration time.Duration) (out *QuotaOutboxEntry, found bool, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "claim_quota_outbox", start, &err)
 
+	entries, err := s.claimQuotaOutboxBatch(ctx, now, leaseDuration, 1)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(entries) == 0 {
+		return nil, false, nil
+	}
+	return &entries[0], true, nil
+}
+
+// ClaimQuotaOutboxBatch claims up to limit queued quota mutations. It preserves
+// ordering per file_id while allowing unrelated files to be processed in the
+// same batch.
+func (s *Store) ClaimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) (entries []QuotaOutboxEntry, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "claim_quota_outbox_batch", start, &err)
+
+	return s.claimQuotaOutboxBatch(ctx, now, leaseDuration, limit)
+}
+
+func (s *Store) claimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) ([]QuotaOutboxEntry, error) {
+	if limit <= 0 {
+		limit = 1
+	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	} else {
@@ -99,64 +120,85 @@ func (s *Store) ClaimQuotaOutbox(ctx context.Context, now time.Time, leaseDurati
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	row := tx.QueryRowContext(ctx, quotaOutboxSelectSQL+`
+	rows, err := tx.QueryContext(ctx, quotaOutboxSelectSQL+`
 		FROM quota_outbox q
 		WHERE q.status = ? AND q.available_at <= ?
 		  AND NOT EXISTS (
 		    SELECT 1 FROM quota_outbox older
-		     WHERE older.id < q.id AND older.status IN (?, ?)
-		  )
-		  AND NOT EXISTS (
-		    SELECT 1 FROM quota_outbox active
-		     WHERE active.status = ? AND active.lease_until IS NOT NULL AND active.lease_until > ?
+		     WHERE older.id < q.id
+		       AND older.status IN (?, ?)
+		       AND (older.file_id = q.file_id OR (older.file_id IS NULL AND q.file_id IS NULL))
 		  )
 		ORDER BY id
-		LIMIT 1
+		LIMIT ?
 		FOR UPDATE SKIP LOCKED`, QuotaOutboxQueued, now,
-		QuotaOutboxQueued, QuotaOutboxProcessing, QuotaOutboxProcessing, now)
-	entry, err := scanQuotaOutbox(row)
+		QuotaOutboxQueued, QuotaOutboxProcessing, limit)
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			return nil, false, nil
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	entries := make([]QuotaOutboxEntry, 0, limit)
+	for rows.Next() {
+		entry, err := scanQuotaOutbox(rows)
+		if err != nil {
+			return nil, err
 		}
-		return nil, false, err
+		entries = append(entries, *entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, nil
 	}
 
 	receipt := uuid.NewString()
 	leasedAt := now
 	leaseUntil := now.Add(leaseDuration)
-	res, err := tx.ExecContext(ctx, `UPDATE quota_outbox SET status = ?,
+	ids := make([]any, 0, len(entries))
+	for i := range entries {
+		ids = append(ids, entries[i].ID)
+	}
+	args := append([]any{
+		QuotaOutboxProcessing, receipt, leasedAt, leaseUntil, now,
+		QuotaOutboxQueued, now,
+	}, ids...)
+	res, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE quota_outbox SET status = ?,
 		attempt_count = attempt_count + 1, receipt = ?, leased_at = ?,
 		lease_until = ?, updated_at = ?
-		WHERE id = ? AND status = ? AND available_at <= ?`,
-		QuotaOutboxProcessing, receipt, leasedAt, leaseUntil, now,
-		entry.ID, QuotaOutboxQueued, now)
+		WHERE status = ? AND available_at <= ? AND id IN (%s)`, sqlPlaceholders(len(entries))), args...)
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	rowsAffected, err := res.RowsAffected()
 	if err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	if rowsAffected == 0 {
-		return nil, false, nil
+	if rowsAffected != int64(len(entries)) {
+		return nil, ErrQuotaOutboxLeaseMismatch
 	}
 
-	entry.Status = QuotaOutboxProcessing
-	entry.AttemptCount++
-	entry.Receipt = receipt
-	entry.LeasedAt = &leasedAt
-	entry.LeaseUntil = &leaseUntil
-	entry.UpdatedAt = now
+	for i := range entries {
+		entries[i].Status = QuotaOutboxProcessing
+		entries[i].AttemptCount++
+		entries[i].Receipt = receipt
+		entries[i].LeasedAt = &leasedAt
+		entries[i].LeaseUntil = &leaseUntil
+		entries[i].UpdatedAt = now
+	}
 
 	if err := tx.Commit(); err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	return entry, true, nil
+	return entries, nil
 }
 
 // AckQuotaOutbox marks a leased quota outbox row as successfully applied.
@@ -179,6 +221,42 @@ func (s *Store) AckQuotaOutboxTx(ctx context.Context, tx *sql.Tx, id int64, rece
 	return s.ackQuotaOutbox(ctx, tx, id, receipt)
 }
 
+// AckQuotaOutboxBatchTx marks leased quota outbox rows as successfully applied
+// inside a caller-owned transaction.
+func (s *Store) AckQuotaOutboxBatchTx(ctx context.Context, tx *sql.Tx, entries []QuotaOutboxEntry) (err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "ack_quota_outbox_batch_tx", start, &err)
+
+	if tx == nil {
+		return fmt.Errorf("quota outbox ack transaction is required")
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	now := time.Now().UTC()
+	conds := make([]string, 0, len(entries))
+	args := []any{QuotaOutboxSucceeded, now, now, QuotaOutboxProcessing, now}
+	for i := range entries {
+		conds = append(conds, `(id = ? AND receipt = ?)`)
+		args = append(args, entries[i].ID, entries[i].Receipt)
+	}
+	res, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE quota_outbox SET status = ?, receipt = NULL,
+		leased_at = NULL, lease_until = NULL, completed_at = ?, updated_at = ?
+		WHERE status = ? AND lease_until IS NOT NULL AND lease_until > ?
+		  AND (%s)`, strings.Join(conds, " OR ")), args...)
+	if err != nil {
+		return err
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected != int64(len(entries)) {
+		return ErrQuotaOutboxLeaseMismatch
+	}
+	return nil
+}
+
 func (s *Store) ackQuotaOutbox(ctx context.Context, db execer, id int64, receipt string) error {
 	now := time.Now().UTC()
 	res, err := db.ExecContext(ctx, `UPDATE quota_outbox SET status = ?, receipt = NULL,
@@ -196,6 +274,16 @@ func (s *Store) ackQuotaOutbox(ctx context.Context, db execer, id int64, receipt
 		return nil
 	}
 	return s.quotaOutboxLeaseError(ctx, db, id)
+}
+
+func sqlPlaceholders(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if n == 1 {
+		return "?"
+	}
+	return "?" + strings.Repeat(",?", n-1)
 }
 
 // RetryQuotaOutbox requeues or dead-letters a leased quota outbox row.

@@ -161,6 +161,65 @@ func TestQuotaOutboxClaimWaitsForDelayedOlderRetry(t *testing.T) {
 	}
 }
 
+func TestQuotaOutboxBatchClaimPreservesPerFileOrder(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	availableNow := now.Add(-time.Second)
+
+	file1CreateID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       "file-1",
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		AvailableAt:  availableNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file2CreateID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       "file-2",
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"file-2"}`),
+		AvailableAt:  availableNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	file1OverwriteID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       "file-1",
+		MutationType: "file_overwrite",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		AvailableAt:  availableNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := s.ClaimQuotaOutboxBatch(ctx, now, time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed rows = %d, want 2", len(claimed))
+	}
+	if claimed[0].ID != file1CreateID || claimed[1].ID != file2CreateID {
+		t.Fatalf("claimed ids = %d,%d want %d,%d", claimed[0].ID, claimed[1].ID, file1CreateID, file2CreateID)
+	}
+
+	if err := s.InTx(ctx, func(tx *sql.Tx) error {
+		return s.AckQuotaOutboxBatchTx(ctx, tx, claimed)
+	}); err != nil {
+		t.Fatalf("ack claimed batch: %v", err)
+	}
+	claimed, err = s.ClaimQuotaOutboxBatch(ctx, now.Add(time.Second), time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != file1OverwriteID {
+		t.Fatalf("claimed after ack = %+v, want file-1 overwrite id %d", claimed, file1OverwriteID)
+	}
+}
+
 func TestQuotaOutboxDeadLetteredOlderRowUnblocksLaterClaim(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

@@ -127,22 +127,17 @@ func (b *Dat9Backend) processQuotaOutboxAvailable(ctx context.Context) {
 			zap.Error(err))
 		metrics.RecordOperation("quota_outbox", "recover_expired", "error", 0)
 	}
-	for i := 0; i < quotaOutboxBatchSize; i++ {
-		if ctx.Err() != nil {
+	processed, err := b.ProcessQuotaOutboxBatch(ctx, quotaOutboxBatchSize)
+	if err != nil {
+		if isContextDone(err) {
 			return
 		}
-		processed, err := b.ProcessOneQuotaOutbox(ctx)
-		if err != nil {
-			if isContextDone(err) {
-				return
-			}
-			logger.Warn(ctx, "quota_outbox_process_failed",
-				zap.String("tenant_id", b.tenantID),
-				zap.Error(err))
-		}
-		if !processed {
-			return
-		}
+		logger.Warn(ctx, "quota_outbox_process_failed",
+			zap.String("tenant_id", b.tenantID),
+			zap.Error(err))
+	}
+	if processed == quotaOutboxBatchSize {
+		b.notifyQuotaOutbox(true)
 	}
 }
 
@@ -165,7 +160,7 @@ func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string
 	}
 	start := time.Now()
 	processedCount := 0
-	for i := 0; i < limit; i++ {
+	for processedCount < limit {
 		if quotaOutboxUploadDrainMaxWait > 0 && time.Since(start) > quotaOutboxUploadDrainMaxWait {
 			return fmt.Errorf("quota outbox for file %s still pending after %s", fileID, quotaOutboxUploadDrainMaxWait)
 		}
@@ -182,11 +177,19 @@ func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string
 			}
 			return nil
 		}
-		processed, err := b.ProcessOneQuotaOutbox(ctx)
+		batchLimit := quotaOutboxBatchSize
+		if remaining := limit - processedCount; remaining < batchLimit {
+			batchLimit = remaining
+		}
+		processed, err := b.ProcessQuotaOutboxBatch(ctx, batchLimit)
 		if err != nil {
+			pendingAfterErr, pendingErr := b.store.HasPendingQuotaOutboxFileMutation(ctx, fileID)
+			if pendingErr == nil && !pendingAfterErr {
+				return nil
+			}
 			return fmt.Errorf("drain quota outbox for file: %w", err)
 		}
-		if !processed {
+		if processed == 0 {
 			timer := time.NewTimer(quotaOutboxUploadDrainWait)
 			select {
 			case <-ctx.Done():
@@ -198,7 +201,7 @@ func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string
 			}
 			continue
 		}
-		processedCount++
+		processedCount += processed
 	}
 	return fmt.Errorf("quota outbox for file %s still pending after %d entries", fileID, limit)
 }
@@ -206,66 +209,102 @@ func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string
 // ProcessOneQuotaOutbox applies at most one tenant-local quota outbox row. It is
 // exported for deterministic tests and admin drain hooks.
 func (b *Dat9Backend) ProcessOneQuotaOutbox(ctx context.Context) (processed bool, err error) {
+	n, err := b.ProcessQuotaOutboxBatch(ctx, 1)
+	return n > 0, err
+}
+
+// ProcessQuotaOutboxBatch applies up to limit tenant-local quota outbox rows.
+// Rows are claimed with per-file ordering, so unrelated file mutations can
+// converge in one tenant admission-lock window.
+func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (processed int, err error) {
 	start := time.Now()
 	if b.store == nil || b.metaStore == nil || b.tenantID == "" {
-		return false, nil
+		return 0, nil
 	}
-	entry, found, err := b.store.ClaimQuotaOutbox(ctx, time.Now().UTC(), quotaOutboxLeaseDuration)
+	if limit <= 0 {
+		limit = 1
+	}
+	entries, err := b.store.ClaimQuotaOutboxBatch(ctx, time.Now().UTC(), quotaOutboxLeaseDuration, limit)
 	if err != nil {
 		metrics.RecordOperation("quota_outbox", "claim", "error", time.Since(start))
-		return false, err
+		return 0, err
 	}
-	if !found {
+	if len(entries) == 0 {
 		metrics.RecordOperation("quota_outbox", "claim", "empty", time.Since(start))
-		return false, nil
+		return 0, nil
 	}
 
-	var applyErr error
-	var ackErr error
-	var retryErr error
+	var batchErr error
+	appliedEntries := make([]datastore.QuotaOutboxEntry, 0, len(entries))
 	err = b.withQuotaAdmissionLock(ctx, func(tx *sql.Tx) error {
-		applyErr = b.applyQuotaOutboxEntry(ctx, entry)
-		if applyErr == nil {
-			if tx != nil {
-				ackErr = b.store.AckQuotaOutboxTx(ctx, tx, entry.ID, entry.Receipt)
+		if tx != nil && len(entries) > 1 {
+			if applyErr := b.applyQuotaOutboxEntries(ctx, entries); applyErr == nil {
+				if ackErr := b.store.AckQuotaOutboxBatchTx(ctx, tx, entries); ackErr != nil {
+					return ackErr
+				}
+				processed = len(entries)
+				appliedEntries = append(appliedEntries, entries...)
+				return nil
 			} else {
-				ackErr = b.store.AckQuotaOutbox(ctx, entry.ID, entry.Receipt)
+				logger.Warn(ctx, "quota_outbox_batch_apply_failed_falling_back",
+					zap.String("tenant_id", b.tenantID),
+					zap.Int("entries", len(entries)),
+					zap.Error(applyErr))
 			}
-			return ackErr
 		}
-		retryAt := time.Now().UTC().Add(quotaOutboxRetryDelay(entry.AttemptCount, quotaOutboxRetryBaseDelay, quotaOutboxRetryMaxDelay))
-		if tx != nil {
-			retryErr = b.store.RetryQuotaOutboxTx(ctx, tx, entry.ID, entry.Receipt, retryAt, applyErr.Error())
-		} else {
-			retryErr = b.store.RetryQuotaOutbox(ctx, entry.ID, entry.Receipt, retryAt, applyErr.Error())
-		}
-		if retryErr != nil {
-			return fmt.Errorf("process quota outbox %d: %w; update retry: %v", entry.ID, applyErr, retryErr)
+
+		for i := range entries {
+			entry := &entries[i]
+			applyErr := b.applyQuotaOutboxEntry(ctx, entry)
+			if applyErr == nil {
+				var ackErr error
+				if tx != nil {
+					ackErr = b.store.AckQuotaOutboxTx(ctx, tx, entry.ID, entry.Receipt)
+				} else {
+					ackErr = b.store.AckQuotaOutbox(ctx, entry.ID, entry.Receipt)
+				}
+				if ackErr != nil {
+					return ackErr
+				}
+				processed++
+				appliedEntries = append(appliedEntries, *entry)
+				continue
+			}
+
+			retryAt := time.Now().UTC().Add(quotaOutboxRetryDelay(entry.AttemptCount, quotaOutboxRetryBaseDelay, quotaOutboxRetryMaxDelay))
+			var retryErr error
+			if tx != nil {
+				retryErr = b.store.RetryQuotaOutboxTx(ctx, tx, entry.ID, entry.Receipt, retryAt, applyErr.Error())
+			} else {
+				retryErr = b.store.RetryQuotaOutbox(ctx, entry.ID, entry.Receipt, retryAt, applyErr.Error())
+			}
+			if retryErr != nil {
+				return fmt.Errorf("process quota outbox %d: %w; update retry: %v", entry.ID, applyErr, retryErr)
+			}
+			metrics.RecordOperation("quota_outbox", entry.MutationType, "error", time.Since(start))
+			if batchErr == nil {
+				batchErr = applyErr
+			}
 		}
 		return nil
 	})
 	if err == nil {
-		if applyErr != nil {
-			metrics.RecordOperation("quota_outbox", entry.MutationType, "error", time.Since(start))
-			return true, applyErr
+		if len(appliedEntries) > 0 {
+			if b.quotaUsageCache != nil {
+				b.quotaUsageCache.invalidate()
+			}
+			for _, entry := range appliedEntries {
+				b.addLocalQuotaPendingDeltas(-entry.StorageDelta, -entry.FileDelta, -entry.MediaDelta)
+				metrics.RecordOperation("quota_outbox", entry.MutationType, "ok", time.Since(start))
+			}
 		}
-		if b.quotaUsageCache != nil {
-			b.quotaUsageCache.invalidate()
+		if batchErr != nil {
+			return len(entries), batchErr
 		}
-		b.addLocalQuotaPendingDeltas(-entry.StorageDelta, -entry.FileDelta, -entry.MediaDelta)
-		metrics.RecordOperation("quota_outbox", entry.MutationType, "ok", time.Since(start))
-		return true, nil
+		return processed, nil
 	}
-	if ackErr != nil {
-		metrics.RecordOperation("quota_outbox", "ack", "error", time.Since(start))
-		return true, ackErr
-	}
-	if retryErr != nil {
-		metrics.RecordOperation("quota_outbox", "retry", "error", time.Since(start))
-		return true, err
-	}
-	metrics.RecordOperation("quota_outbox", entry.MutationType, "error", time.Since(start))
-	return true, err
+	metrics.RecordOperation("quota_outbox", "process", "error", time.Since(start))
+	return processed, err
 }
 
 func (b *Dat9Backend) withQuotaAdmissionLock(ctx context.Context, fn func(tx *sql.Tx) error) error {
@@ -285,8 +324,26 @@ func (b *Dat9Backend) applyQuotaOutboxEntry(ctx context.Context, entry *datastor
 		return fmt.Errorf("quota outbox entry is required")
 	}
 	return b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
-		return applyCentralQuotaMutationTx(b.metaStore, tx, b.tenantID, entry.MutationType, entry.MutationData, entry.ID)
+		return b.applyQuotaOutboxEntryTx(tx, entry)
 	})
+}
+
+func (b *Dat9Backend) applyQuotaOutboxEntries(ctx context.Context, entries []datastore.QuotaOutboxEntry) error {
+	return b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
+		for i := range entries {
+			if err := b.applyQuotaOutboxEntryTx(tx, &entries[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (b *Dat9Backend) applyQuotaOutboxEntryTx(tx *sql.Tx, entry *datastore.QuotaOutboxEntry) error {
+	if entry == nil {
+		return fmt.Errorf("quota outbox entry is required")
+	}
+	return applyCentralQuotaMutationTx(b.metaStore, tx, b.tenantID, entry.MutationType, entry.MutationData, entry.ID)
 }
 
 func quotaOutboxRetryDelay(attempt int, base, max time.Duration) time.Duration {

@@ -63,6 +63,48 @@ func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
 	}
 }
 
+func TestServerQuotaOutboxBatchProcessesDifferentFiles(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	if _, err := b.WriteCtx(ctx, "/batch-a.txt", []byte("aaaa"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	a, err := b.Store().Stat(ctx, "/batch-a.txt")
+	if err != nil {
+		t.Fatalf("stat a: %v", err)
+	}
+	if _, err := b.WriteCtx(ctx, "/batch-b.png", []byte("bb"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	bb, err := b.Store().Stat(ctx, "/batch-b.png")
+	if err != nil {
+		t.Fatalf("stat b: %v", err)
+	}
+
+	processed, err := b.ProcessQuotaOutboxBatch(ctx, 100)
+	if err != nil {
+		t.Fatalf("process quota outbox batch: %v", err)
+	}
+	if processed != 2 {
+		t.Fatalf("processed rows = %d, want 2", processed)
+	}
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, a.File.FileID, datastore.QuotaOutboxSucceeded); got != 1 {
+		t.Fatalf("a succeeded rows = %d, want 1", got)
+	}
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, bb.File.FileID, datastore.QuotaOutboxSucceeded); got != 1 {
+		t.Fatalf("b succeeded rows = %d, want 1", got)
+	}
+	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("get usage: %v", err)
+	}
+	if usage.StorageBytes != int64(len("aaaa")+len("bb")) || usage.FileCount != 2 || usage.MediaFileCount != 1 {
+		t.Fatalf("central usage after batch = %+v", usage)
+	}
+}
+
 func TestServerQuotaSmallWriteDoesNotWaitForAdmissionLock(t *testing.T) {
 	b, _ := newServerQuotaBackend(t, Options{})
 	b.stopQuotaOutboxWorker()
@@ -262,7 +304,7 @@ func TestDrainQuotaOutboxForFileErrorsWhenPendingRowIsNotClaimable(t *testing.T)
 	}
 }
 
-func TestDrainQuotaOutboxForUploadTargetProcessesOlderTenantRows(t *testing.T) {
+func TestDrainQuotaOutboxForUploadTargetProcessesClaimableBatch(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
 	b.stopQuotaOutboxWorker()
 	ctx := context.Background()

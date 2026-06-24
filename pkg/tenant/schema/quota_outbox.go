@@ -30,6 +30,7 @@ func QuotaOutboxTiDBSchemaStatements() []string {
 		)`,
 		`CREATE INDEX idx_quota_outbox_claim ON quota_outbox(status, available_at, id)`,
 		`CREATE INDEX idx_quota_outbox_processing ON quota_outbox(status, lease_until)`,
+		`CREATE INDEX idx_quota_outbox_file_order ON quota_outbox(file_id, status, id)`,
 		`CREATE INDEX idx_quota_outbox_file_pending ON quota_outbox(file_id, status, mutation_type)`,
 	}
 }
@@ -64,6 +65,7 @@ func QuotaOutboxDB9SchemaStatements() []string {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_quota_outbox_claim ON quota_outbox(status, available_at, id)`,
 		`CREATE INDEX IF NOT EXISTS idx_quota_outbox_processing ON quota_outbox(status, lease_until)`,
+		`CREATE INDEX IF NOT EXISTS idx_quota_outbox_file_order ON quota_outbox(file_id, status, id)`,
 		`CREATE INDEX IF NOT EXISTS idx_quota_outbox_file_pending ON quota_outbox(file_id, status, mutation_type)`,
 	}
 }
