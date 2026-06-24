@@ -24,7 +24,7 @@ type ChangeEvent struct {
 const (
 	eventBusListenerChanSize = 1 // signal-only channel
 	// eventBusPollInterval is how often the per-bus poll goroutine queries
-	// fs_events for cross-pod events. Override via ssePollInterval in sse.go.
+	// fs_events for cross-pod events. Matches the fs_layer_events poll interval.
 	eventBusPollInterval = 1 * time.Second
 )
 
@@ -100,7 +100,10 @@ func (eb *EventBus) Subscribe() (uint64, chan struct{}) {
 	if eb.pollCancel == nil {
 		// Initialize pollLast synchronously to the current head seq so the
 		// poll goroutine doesn't miss events inserted between Subscribe
-		// returning and pollLoop starting.
+		// returning and pollLoop starting. Events written while no subscriber
+		// existed are not signaled by the poll loop (no listeners to signal);
+		// a fresh Subscribe's Phase-1 EventsSince replay from the client's
+		// since cursor is the authoritative delivery path for those.
 		store := eb.store.Load()
 		if store != nil {
 			if seq, err := store.LatestFSEventSeq(context.Background()); err == nil && seq > 0 {
@@ -119,6 +122,12 @@ func (eb *EventBus) Subscribe() (uint64, chan struct{}) {
 // Unsubscribe removes a listener and closes its channel.
 // On the last Unsubscribe, the poll goroutine is stopped and the caller waits
 // for it to exit. Non-last Unsubscribers return immediately without waiting.
+//
+// Concurrency note: if a new Subscribe arrives between Unsubscribe releasing
+// the lock and waiting on doneCh, the new Subscribe starts a fresh poll
+// goroutine while the old one is still draining. Both goroutines briefly
+// coexist — this is safe (idempotent wakeups, each reads pollLast under the
+// lock) and the old goroutine exits within one tick interval.
 func (eb *EventBus) Unsubscribe(id uint64) {
 	eb.mu.Lock()
 	if ch, ok := eb.listeners[id]; ok {
