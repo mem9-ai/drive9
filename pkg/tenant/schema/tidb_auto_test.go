@@ -352,10 +352,16 @@ func TestPlannedTiDBSchemaRepairsAllowsPathColumnWidening(t *testing.T) {
 			columnName: "target_path",
 			repairSQL:  "ALTER TABLE uploads MODIFY COLUMN target_path TEXT NOT NULL",
 		},
+		{
+			kind:       tidbSchemaDiffColumnType,
+			tableName:  "fs_events",
+			columnName: "path",
+			repairSQL:  "ALTER TABLE fs_events MODIFY COLUMN path TEXT NOT NULL",
+		},
 	}
 
 	got := plannedTiDBSchemaRepairs(diffs)
-	if len(got) != 2 {
+	if len(got) != 3 {
 		t.Fatalf("expected path widening repairs, got %#v", got)
 	}
 }

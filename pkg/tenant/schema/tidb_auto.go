@@ -2699,6 +2699,8 @@ func isSafeModifyColumnRepairSQL(diff tidbSchemaDiff) bool {
 		return n == "alter table file_nodes modify column parent_path text not null"
 	case "uploads.target_path":
 		return n == "alter table uploads modify column target_path text not null"
+	case "fs_events.path":
+		return n == "alter table fs_events modify column path text not null"
 	default:
 		return false
 	}
