@@ -11,7 +11,7 @@ class CommunityPyxattr(BaseModule):
     category = "community.xattr"
     description = "Run pyxattr-backed extended attribute checks on Drive9 FUSE."
     labels = ("compatibility", "xattr", "community")
-    timeout = 600
+    timeout = 120
 
     def ensure_dependencies(self, ctx: Context) -> None:
         if not ctx.capabilities.get("features", {}).get("xattr"):

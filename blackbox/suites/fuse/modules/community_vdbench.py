@@ -14,7 +14,7 @@ class CommunityVdbench(BaseModule):
     description = "Run vdbench file workload on Drive9 FUSE when vdbench is installed."
     labels = ("performance", "community", "manual-dependency")
     manual = True
-    timeout = 7200
+    timeout = 1800
 
     def run(self, ctx: Context) -> dict[str, Any]:
         vdbench = ctx.deps.ensure_vdbench()

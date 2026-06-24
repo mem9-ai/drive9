@@ -14,7 +14,7 @@ class CommunityFio(BaseModule):
     category = "community.performance"
     description = "Run fio sequential and random I/O workloads on Drive9 FUSE."
     labels = ("performance", "community")
-    timeout = 3600
+    timeout = 600
 
     def run(self, ctx: Context) -> dict[str, Any]:
         fio = ctx.deps.ensure_fio()

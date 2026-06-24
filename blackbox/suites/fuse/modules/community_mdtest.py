@@ -12,7 +12,7 @@ class CommunityMdtest(BaseModule):
     category = "community.performance"
     description = "Run mdtest metadata create/stat/remove workload on Drive9 FUSE."
     labels = ("performance", "metadata", "community")
-    timeout = 3600
+    timeout = 1200
 
     def run(self, ctx: Context) -> dict[str, Any]:
         mdtest = ctx.deps.ensure_mdtest()

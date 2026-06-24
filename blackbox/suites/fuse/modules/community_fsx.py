@@ -12,7 +12,7 @@ class CommunityFSX(BaseModule):
     category = "community.stress"
     description = "Run fsx randomized file operation stress on Drive9 FUSE."
     labels = ("stress", "community")
-    timeout = 1800
+    timeout = 600
 
     def run(self, ctx: Context) -> dict[str, Any]:
         fsx = ctx.deps.ensure_fsx()

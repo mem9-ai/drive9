@@ -11,7 +11,7 @@ class CommunityLock(BaseModule):
     category = "community.locking"
     description = "Run POSIX advisory lock checks on Drive9 FUSE."
     labels = ("compatibility", "locking")
-    timeout = 600
+    timeout = 120
 
     def run(self, ctx: Context) -> dict[str, Any]:
         if not ctx.capabilities.get("features", {}).get("fcntl_lock"):

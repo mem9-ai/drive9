@@ -14,7 +14,7 @@ class CommunityPjdfstest(BaseModule):
     category = "community.posix"
     description = "Run pjdfstest on a Drive9 FUSE mount and report raw/effective POSIX pass rate."
     labels = ("compatibility", "posix", "community")
-    timeout = 3600
+    timeout = 1800
 
     def ensure_dependencies(self, ctx: Context) -> None:
         if not ctx.capabilities.get("is_root") and os.environ.get("PJDFSTEST_ALLOW_NONROOT", "0") != "1":

@@ -14,7 +14,7 @@ class CommunityLTPFS(BaseModule):
     category = "community.fs"
     description = "Run Linux Test Project filesystem tests with their work directory on Drive9 FUSE."
     labels = ("compatibility", "linux", "community")
-    timeout = 7200
+    timeout = 600
 
     def ensure_dependencies(self, ctx: Context) -> None:
         if ctx.capabilities.get("os") != "Linux":
