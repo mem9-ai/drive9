@@ -184,6 +184,104 @@ func TestQuotaOutboxWorkerCommitsRetryAfterApplyError(t *testing.T) {
 	}
 }
 
+func TestQuotaOutboxNotifyQuietHasMaxWait(t *testing.T) {
+	b := &Dat9Backend{quotaOutboxNotify: make(chan struct{}, quotaOutboxNotifySize)}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				select {
+				case b.quotaOutboxNotify <- struct{}{}:
+				default:
+				}
+			}
+		}
+	}()
+
+	start := time.Now()
+	if !b.waitQuotaOutboxNotifyQuiet(ctx) {
+		t.Fatal("waitQuotaOutboxNotifyQuiet returned false")
+	}
+	if dur := time.Since(start); dur > 500*time.Millisecond {
+		t.Fatalf("waitQuotaOutboxNotifyQuiet duration = %s, want bounded by max delay", dur)
+	}
+}
+
+func TestDrainQuotaOutboxForFileErrorsWhenPendingRowIsNotClaimable(t *testing.T) {
+	b, _ := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	if _, err := b.WriteCtx(ctx, "/leased.txt", []byte("payload"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	nf, err := b.Store().Stat(ctx, "/leased.txt")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	claimed, found, err := b.store.ClaimQuotaOutbox(ctx, time.Now().UTC(), time.Minute)
+	if err != nil {
+		t.Fatalf("claim quota outbox: %v", err)
+	}
+	if !found || claimed.FileID != nf.File.FileID {
+		t.Fatalf("claimed = %+v found=%t, want leased row for target", claimed, found)
+	}
+
+	drainCtx, cancel := context.WithTimeout(ctx, 75*time.Millisecond)
+	defer cancel()
+	err = b.drainQuotaOutboxForFile(drainCtx, nf.File.FileID, quotaOutboxUploadDrainLimit)
+	if err == nil {
+		t.Fatal("drain error = nil, want pending-not-claimable error")
+	}
+}
+
+func TestDrainQuotaOutboxForUploadTargetProcessesOlderTenantRows(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	if _, err := b.WriteCtx(ctx, "/older.txt", []byte("older"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("write older: %v", err)
+	}
+	older, err := b.Store().Stat(ctx, "/older.txt")
+	if err != nil {
+		t.Fatalf("stat older: %v", err)
+	}
+	if _, err := b.WriteCtx(ctx, "/target.txt", []byte("target"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	target, err := b.Store().Stat(ctx, "/target.txt")
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+
+	if err := b.drainQuotaOutboxForUploadTarget(ctx, target, true); err != nil {
+		t.Fatalf("drain target: %v", err)
+	}
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, older.File.FileID, datastore.QuotaOutboxSucceeded); got != 1 {
+		t.Fatalf("older succeeded rows = %d, want 1", got)
+	}
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, target.File.FileID, datastore.QuotaOutboxSucceeded); got != 1 {
+		t.Fatalf("target succeeded rows = %d, want 1", got)
+	}
+	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("get usage: %v", err)
+	}
+	if usage.StorageBytes != int64(len("older")+len("target")) || usage.FileCount != 2 {
+		t.Fatalf("central usage after drain = %+v, want both files applied", usage)
+	}
+}
+
 func TestServerQuotaPendingOutboxDeltaRejectsOverLimitWrite(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
 	b.stopQuotaOutboxWorker()

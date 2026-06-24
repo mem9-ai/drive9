@@ -14,17 +14,20 @@ import (
 )
 
 const (
-	quotaOutboxNotifySize       = 1
-	quotaOutboxNotifyDelay      = 50 * time.Millisecond
-	quotaOutboxPollInterval     = 1 * time.Second
-	quotaOutboxLeaseDuration    = 5 * time.Minute
-	quotaOutboxBatchSize        = 100
-	quotaOutboxRecoverLimit     = 100
-	quotaOutboxUploadDrainLimit = 1000
-	quotaOutboxRetryBaseDelay   = 200 * time.Millisecond
-	quotaOutboxRetryMaxDelay    = 30 * time.Second
-	quotaMutationTypeFileCreate = "file_create"
-	quotaMutationTypeOverwrite  = "file_overwrite"
+	quotaOutboxNotifySize               = 1
+	quotaOutboxNotifyDelay              = 50 * time.Millisecond
+	quotaOutboxNotifyMaxDelay           = 200 * time.Millisecond
+	quotaOutboxPollInterval             = 1 * time.Second
+	quotaOutboxLeaseDuration            = 5 * time.Minute
+	quotaOutboxBatchSize                = 100
+	quotaOutboxRecoverLimit             = 100
+	quotaOutboxUploadDrainLimit         = 1000
+	quotaOutboxUploadDrainWait          = 25 * time.Millisecond
+	quotaOutboxUploadDrainWarnThreshold = 10
+	quotaOutboxRetryBaseDelay           = 200 * time.Millisecond
+	quotaOutboxRetryMaxDelay            = 30 * time.Second
+	quotaMutationTypeFileCreate         = "file_create"
+	quotaMutationTypeOverwrite          = "file_overwrite"
 )
 
 func (b *Dat9Backend) startQuotaOutboxWorker() {
@@ -85,11 +88,15 @@ func (b *Dat9Backend) waitQuotaOutboxNotifyQuiet(ctx context.Context) bool {
 	}
 	timer := time.NewTimer(quotaOutboxNotifyDelay)
 	defer timer.Stop()
+	maxTimer := time.NewTimer(quotaOutboxNotifyMaxDelay)
+	defer maxTimer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return false
 		case <-timer.C:
+			return true
+		case <-maxTimer.C:
 			return true
 		case <-b.quotaOutboxNotify:
 			if !timer.Stop() {
@@ -136,18 +143,14 @@ func (b *Dat9Backend) processQuotaOutboxAvailable(ctx context.Context) {
 	}
 }
 
-func (b *Dat9Backend) drainQuotaOutboxForUploadTarget(ctx context.Context, path string, targetExists bool) error {
+func (b *Dat9Backend) drainQuotaOutboxForUploadTarget(ctx context.Context, target *datastore.NodeWithFile, targetExists bool) error {
 	if !targetExists || !b.UseServerQuota() || b.store == nil {
 		return nil
 	}
-	nf, err := b.store.Stat(ctx, path)
-	if err != nil {
-		return err
-	}
-	if nf.File == nil || nf.File.FileID == "" {
+	if target == nil || target.File == nil || target.File.FileID == "" {
 		return nil
 	}
-	return b.drainQuotaOutboxForFile(ctx, nf.File.FileID, quotaOutboxUploadDrainLimit)
+	return b.drainQuotaOutboxForFile(ctx, target.File.FileID, quotaOutboxUploadDrainLimit)
 }
 
 func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string, limit int) error {
@@ -157,12 +160,19 @@ func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string
 	if limit <= 0 {
 		limit = quotaOutboxUploadDrainLimit
 	}
+	processedCount := 0
 	for i := 0; i < limit; i++ {
 		pending, err := b.store.HasPendingQuotaOutboxFileMutation(ctx, fileID)
 		if err != nil {
 			return fmt.Errorf("check pending quota outbox for file: %w", err)
 		}
 		if !pending {
+			if processedCount > quotaOutboxUploadDrainWarnThreshold {
+				logger.Warn(ctx, "quota_outbox_upload_target_deep_drain",
+					zap.String("tenant_id", b.tenantID),
+					zap.String("file_id", fileID),
+					zap.Int("processed", processedCount))
+			}
 			return nil
 		}
 		processed, err := b.ProcessOneQuotaOutbox(ctx)
@@ -170,8 +180,18 @@ func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string
 			return fmt.Errorf("drain quota outbox for file: %w", err)
 		}
 		if !processed {
-			return nil
+			timer := time.NewTimer(quotaOutboxUploadDrainWait)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return fmt.Errorf("quota outbox for file %s still pending but not claimable: %w", fileID, ctx.Err())
+			case <-timer.C:
+			}
+			continue
 		}
+		processedCount++
 	}
 	return fmt.Errorf("quota outbox for file %s still pending after %d entries", fileID, limit)
 }

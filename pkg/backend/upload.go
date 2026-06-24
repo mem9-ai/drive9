@@ -177,27 +177,27 @@ func (b *Dat9Backend) supersedeActiveUpload(ctx context.Context, op string, exis
 	return err
 }
 
-func (b *Dat9Backend) validateUploadTargetRevision(ctx context.Context, path string, expectedRevision int64) (bool, error) {
+func (b *Dat9Backend) validateUploadTargetRevision(ctx context.Context, path string, expectedRevision int64) (*datastore.NodeWithFile, bool, error) {
 	nf, err := b.store.Stat(ctx, path)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			if expectedRevision > 0 {
-				return false, datastore.ErrRevisionConflict
+				return nil, false, datastore.ErrRevisionConflict
 			}
-			return false, nil
+			return nil, false, nil
 		}
-		return false, err
+		return nil, false, err
 	}
 	if nf.Node.IsDirectory {
-		return false, fmt.Errorf("is a directory: %s", path)
+		return nil, false, fmt.Errorf("is a directory: %s", path)
 	}
 	if expectedRevision == 0 {
-		return true, datastore.ErrRevisionConflict
+		return nf, true, datastore.ErrRevisionConflict
 	}
 	if expectedRevision > 0 && (nf.File == nil || nf.File.Status != datastore.StatusConfirmed || nf.File.Revision != expectedRevision) {
-		return true, datastore.ErrRevisionConflict
+		return nf, true, datastore.ErrRevisionConflict
 	}
-	return true, nil
+	return nf, true, nil
 }
 
 func uploadFileCountDelta(targetExists bool) int64 {
@@ -274,7 +274,7 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
 	}
-	targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
+	target, targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
 	if err != nil {
 		if errors.Is(err, datastore.ErrRevisionConflict) {
 			metrics.RecordOperation("backend", "initiate_upload", "conflict", time.Since(start))
@@ -283,7 +283,7 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		}
 		return nil, err
 	}
-	if err := b.drainQuotaOutboxForUploadTarget(ctx, path, targetExists); err != nil {
+	if err := b.drainQuotaOutboxForUploadTarget(ctx, target, targetExists); err != nil {
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
 	}
@@ -459,7 +459,7 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
 	}
-	targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
+	target, targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
 	if err != nil {
 		if errors.Is(err, datastore.ErrRevisionConflict) {
 			metrics.RecordOperation("backend", "initiate_upload_v2", "conflict", time.Since(start))
@@ -468,7 +468,7 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		}
 		return nil, err
 	}
-	if err := b.drainQuotaOutboxForUploadTarget(ctx, path, targetExists); err != nil {
+	if err := b.drainQuotaOutboxForUploadTarget(ctx, target, targetExists); err != nil {
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
 	}
