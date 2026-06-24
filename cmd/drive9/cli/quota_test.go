@@ -59,11 +59,29 @@ func TestQuotaGetUsesTenantIDAndTiDBCloudHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Quota get: %v", err)
 	}
-	if !strings.Contains(stdout, "StorageUsed:") || !strings.Contains(stdout, "Reserved:") {
-		t.Fatalf("stdout should include storage usage counters: %s", stdout)
+	if !strings.Contains(stdout, "TenantID:") || !strings.Contains(stdout, "tenant-1") {
+		t.Fatalf("stdout should include tenant ID: %s", stdout)
 	}
-	if !strings.Contains(stdout, "MaxFileSize:") || !strings.Contains(stdout, "64 Mi") || !strings.Contains(stdout, "MaxFileCount:") {
-		t.Fatalf("stdout should include file limits: %s", stdout)
+	if !strings.Contains(stdout, "MaxStorage:") || !strings.Contains(stdout, "1000 Mi") {
+		t.Fatalf("stdout should include max storage: %s", stdout)
+	}
+	if !strings.Contains(stdout, "MaxFileSize:") || !strings.Contains(stdout, "64 Mi") {
+		t.Fatalf("stdout should include max file size: %s", stdout)
+	}
+	if !strings.Contains(stdout, "MaxFileCount:") || !strings.Contains(stdout, "42") {
+		t.Fatalf("stdout should include max file count: %s", stdout)
+	}
+	if !strings.Contains(stdout, "SpendingLimit:") || !strings.Contains(stdout, "$100.00") {
+		t.Fatalf("stdout should include spending limit: %s", stdout)
+	}
+	if !strings.Contains(stdout, "StorageUsed:") || !strings.Contains(stdout, "1 B") {
+		t.Fatalf("stdout should include storage used: %s", stdout)
+	}
+	if !strings.Contains(stdout, "Reserved:") || !strings.Contains(stdout, "2 B") {
+		t.Fatalf("stdout should include reserved: %s", stdout)
+	}
+	if !strings.Contains(stdout, "FileCount:") || !strings.Contains(stdout, "3") {
+		t.Fatalf("stdout should include file count: %s", stdout)
 	}
 	if strings.Contains(stdout, "media_file_count") || strings.Contains(stdout, "monthly_cost_mc") {
 		t.Fatalf("stdout should not include media or cost counters: %s", stdout)
