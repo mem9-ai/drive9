@@ -20,29 +20,10 @@ func Admin(args []string) error {
 	case "-h", "-help", "--help", "help":
 		_, _ = fmt.Fprintln(os.Stdout, adminUsage())
 		return nil
-	case "quota":
-		return adminQuota(args[1:])
 	case "tenant", "tenants":
 		return adminTenant(args[1:])
 	default:
 		return fmt.Errorf("unknown admin command %q\n%s", args[0], adminUsage())
-	}
-}
-
-func adminQuota(args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("%s", adminQuotaUsage())
-	}
-	switch args[0] {
-	case "-h", "-help", "--help", "help":
-		_, _ = fmt.Fprintln(os.Stdout, adminQuotaUsage())
-		return nil
-	case "set":
-		return quotaSet(args[1:])
-	case "list":
-		return adminTenantList(args[1:], true)
-	default:
-		return fmt.Errorf("unknown admin quota command %q\n%s", args[0], adminQuotaUsage())
 	}
 }
 
@@ -54,15 +35,153 @@ func adminTenant(args []string) error {
 	case "-h", "-help", "--help", "help":
 		_, _ = fmt.Fprintln(os.Stdout, adminTenantUsage())
 		return nil
+	case "create":
+		return adminTenantCreate(args[1:])
 	case "list":
 		return adminTenantList(args[1:], false)
 	case "get":
 		return adminTenantGet(args[1:])
 	case "delete":
 		return adminTenantDelete(args[1:])
+	case "set-quota":
+		return quotaSet(args[1:])
 	default:
 		return fmt.Errorf("unknown admin tenant command %q\n%s", args[0], adminTenantUsage())
 	}
+}
+
+func adminTenantCreate(args []string) error {
+	serverFlag := ""
+	serverGiven := false
+	regionCodeFlag := ""
+	regionCodeGiven := false
+	publicKeyFlag := ""
+	publicKeyGiven := false
+	privateKeyFlag := ""
+	privateKeyGiven := false
+	var maxStorageSize *int64
+	var maxFileSize *int64
+	var maxFileCount *int64
+	var tidbCloudSpendingLimit *int64
+	asJSON := false
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-h", "-help", "--help", "help":
+			_, _ = fmt.Fprintln(os.Stdout, adminTenantCreateUsage())
+			return nil
+		case "--server":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--server requires an argument")
+			}
+			i++
+			serverFlag = args[i]
+			serverGiven = true
+		case "--region-code":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--region-code requires an argument")
+			}
+			i++
+			regionCodeFlag = args[i]
+			regionCodeGiven = true
+		case "--tidbcloud-public-key":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--tidbcloud-public-key requires an argument")
+			}
+			i++
+			publicKeyFlag = args[i]
+			publicKeyGiven = true
+		case "--tidbcloud-private-key":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--tidbcloud-private-key requires an argument")
+			}
+			i++
+			privateKeyFlag = args[i]
+			privateKeyGiven = true
+		case "--max-storage-size":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--max-storage-size requires an argument")
+			}
+			i++
+			v, err := parsePositiveQuotaInt64Flag("--max-storage-size", args[i])
+			if err != nil {
+				return err
+			}
+			maxStorageSize = &v
+		case "--max-file-size":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--max-file-size requires an argument")
+			}
+			i++
+			v, err := parsePositiveQuotaInt64Flag("--max-file-size", args[i])
+			if err != nil {
+				return err
+			}
+			maxFileSize = &v
+		case "--max-file-count":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--max-file-count requires an argument")
+			}
+			i++
+			v, err := parseNonNegativeQuotaInt64Flag("--max-file-count", args[i])
+			if err != nil {
+				return err
+			}
+			maxFileCount = &v
+		case "--tidbcloud-spending-limit":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--tidbcloud-spending-limit requires an argument")
+			}
+			i++
+			v, err := parseNonNegativeQuotaInt64Flag("--tidbcloud-spending-limit", args[i])
+			if err != nil {
+				return err
+			}
+			tidbCloudSpendingLimit = &v
+		case "--json":
+			asJSON = true
+		default:
+			return fmt.Errorf("unknown flag %q\n%s", args[i], adminTenantCreateUsage())
+		}
+	}
+	if err := rejectEmptyFlag("server", strings.TrimSpace(serverFlag), serverGiven); err != nil {
+		return err
+	}
+	if err := rejectEmptyFlag("region-code", strings.TrimSpace(regionCodeFlag), regionCodeGiven); err != nil {
+		return err
+	}
+	if err := rejectEmptyFlag("tidbcloud-public-key", strings.TrimSpace(publicKeyFlag), publicKeyGiven); err != nil {
+		return err
+	}
+	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
+		return err
+	}
+	r := ResolveCredentials()
+	publicKey, privateKey := adminTiDBCloudKeys(publicKeyFlag, privateKeyFlag)
+	server, err := quotaServer(serverFlag, regionCodeFlag, r.Server, true)
+	if err != nil {
+		return err
+	}
+	if _, err := quotaRequest("admin", publicKey, privateKey); err != nil {
+		return err
+	}
+	out, err := client.New(server, "").AdminCreateTenant(context.Background(), client.AdminTenantCreateRequest{
+		PublicKey:              publicKey,
+		PrivateKey:             privateKey,
+		MaxStorageSize:         maxStorageSize,
+		MaxFileSize:            maxFileSize,
+		MaxFileCount:           maxFileCount,
+		TiDBCloudSpendingLimit: tidbCloudSpendingLimit,
+	})
+	if err != nil {
+		return quotaAPIError("create admin tenant", err)
+	}
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+	return printAdminTenantCreateResponse(out)
 }
 
 func adminTenantList(args []string, includeQuotaDefault bool) error {
@@ -318,8 +437,7 @@ func adminTenantDelete(args []string) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(out)
 	}
-	fmt.Printf("tenant %s delete status: %s\n", out.TenantID, out.Status)
-	return nil
+	return printAdminTenantDeleteResponse(out)
 }
 
 func parseAdminTenantIDCommand(args []string, usage string) (tenantID, server, publicKey, privateKey string, asJSON bool, err error) {
@@ -425,35 +543,195 @@ type errHelpRequested struct{}
 func (errHelpRequested) Error() string { return "help requested" }
 
 func adminUsage() string {
-	return `usage: drive9 admin <tenant|quota> <command> [flags]`
-}
+	return `usage: drive9 admin tenant <command> [arguments]
 
-func adminQuotaUsage() string {
-	return `usage: drive9 admin quota <list|set> [flags]`
+commands:
+  tenant create [flags]            create a TiDBCloud Mode tenant
+  tenant list [flags]              list TiDBCloud Mode tenants
+  tenant get --tenant-id ID        show one tenant and quota
+  tenant delete --tenant-id ID     delete one tenant
+  tenant set-quota --tenant-id ID  set quota for one tenant
+
+global admin flags:
+  --server URL                     server URL (default: active context server)
+  --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
+  --tidbcloud-public-key KEY       TiDB Cloud public key
+  --tidbcloud-private-key KEY      TiDB Cloud private key
+  --json                           output result as JSON when supported
+
+examples:
+  drive9 admin tenant list --region-code aws-ap-southeast-1 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin tenant get --tenant-id tnt_xxx \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin tenant set-quota --tenant-id tnt_xxx --max-storage-size 102400 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>`
 }
 
 func adminTenantUsage() string {
-	return `usage: drive9 admin tenant <list|get|delete> [flags]`
+	return `usage: drive9 admin tenant <command> [arguments]
+
+commands:
+  create [flags]                   create a TiDBCloud Mode tenant
+  list [flags]                     list TiDBCloud Mode tenants
+  get --tenant-id ID               show one tenant and quota
+  delete --tenant-id ID            delete one tenant
+  set-quota --tenant-id ID         set quota for one tenant
+
+flags:
+  --server URL                     server URL (default: active context server)
+  --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
+  --tenant-id ID                   drive9 tenant id for get/delete/set-quota
+  --tidbcloud-public-key KEY       TiDB Cloud public key
+  --tidbcloud-private-key KEY      TiDB Cloud private key
+  --max-storage-size Mi            set-quota: max confirmed+reserved storage size in Mi
+  --max-file-size Mi               set-quota: max single file size in Mi
+  --max-file-count N               set-quota: max confirmed file count; 0 means unlimited
+  --tidbcloud-spending-limit N     set-quota: TiDB Cloud Cluster Spending Limit
+  --json                           output result as JSON when supported
+
+examples:
+  drive9 admin tenant create --region-code aws-ap-southeast-1 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin tenant list --page-size 20 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin tenant delete --tenant-id tnt_xxx \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin tenant set-quota --tenant-id tnt_xxx --max-storage-size 102400 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>`
+}
+
+func adminTenantCreateUsage() string {
+	return `usage: drive9 admin tenant create [flags]
+
+create a TiDBCloud Mode tenant using TiDB Cloud credentials. Optional quota
+flags use the same units and validation as "drive9 admin tenant set-quota".
+
+flags:
+  --server URL                     server URL (default: active context server)
+  --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
+  --tidbcloud-public-key KEY       TiDB Cloud public key
+  --tidbcloud-private-key KEY      TiDB Cloud private key
+  --max-storage-size Mi            max confirmed+reserved storage size in Mi
+  --max-file-size Mi               max single file size in Mi; must not exceed server DRIVE9_MAX_UPLOAD_BYTES
+  --max-file-count N               max confirmed file count; 0 means unlimited
+  --tidbcloud-spending-limit N     TiDB Cloud Cluster Spending Limit; must be non-negative
+  --json                           output result as JSON
+
+examples:
+  drive9 admin tenant create --region-code aws-ap-southeast-1 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin tenant create --max-storage-size 102400 --max-file-size 1024 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>`
 }
 
 func adminTenantListUsage() string {
 	return `usage: drive9 admin tenant list [flags]
 
 flags:
-  --server URL                    server URL
-  --region-code CODE              TiDBCloud mode region code; ignored when --server is set
-  --tidbcloud-public-key KEY      TiDB Cloud public key
-  --tidbcloud-private-key KEY     TiDB Cloud private key
-  --page-size N                   page size; default 10
-  --page N                        page number; default 1
-  --include-quota                 include quota in tenant list
-  --json                          output result as JSON`
+  --server URL                     server URL (default: active context server)
+  --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
+  --tidbcloud-public-key KEY       TiDB Cloud public key
+  --tidbcloud-private-key KEY      TiDB Cloud private key
+  --page-size N                    page size; default 10, max 100
+  --page N                         page number; default 1
+  --include-quota                  include quota in JSON output; text output includes quota columns
+  --json                           output result as JSON
+
+examples:
+  drive9 admin tenant list --page-size 20 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin tenant list --json --include-quota \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>`
 }
 
 func adminTenantGetUsage() string {
-	return `usage: drive9 admin tenant get --tenant-id ID [flags]`
+	return `usage: drive9 admin tenant get --tenant-id ID [flags]
+
+show one TiDBCloud Mode tenant. The text output includes quota columns.
+
+flags:
+  --server URL                     server URL (default: active context server)
+  --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
+  --tenant-id ID                   drive9 tenant id
+  --tidbcloud-public-key KEY       TiDB Cloud public key
+  --tidbcloud-private-key KEY      TiDB Cloud private key
+  --json                           output result as JSON
+
+example:
+  drive9 admin tenant get --tenant-id tnt_xxx \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>`
 }
 
 func adminTenantDeleteUsage() string {
-	return `usage: drive9 admin tenant delete --tenant-id ID [flags]`
+	return `usage: drive9 admin tenant delete --tenant-id ID [flags]
+
+delete one TiDBCloud Mode tenant. This requires TiDB Cloud credentials with
+cluster label patch permission.
+
+flags:
+  --server URL                     server URL (default: active context server)
+  --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
+  --tenant-id ID                   drive9 tenant id
+  --tidbcloud-public-key KEY       TiDB Cloud public key
+  --tidbcloud-private-key KEY      TiDB Cloud private key
+  --json                           output result as JSON
+
+example:
+  drive9 admin tenant delete --tenant-id tnt_xxx \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>`
+}
+
+func printAdminTenantCreateResponse(out *client.AdminTenantCreateResponse) error {
+	if out == nil {
+		return fmt.Errorf("admin tenant create response is empty")
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(w, "TENANT_ID\tSTATUS\tCLOUD_PROVIDER\tREGION\tAPI_KEY")
+	_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+		out.TenantID,
+		out.Status,
+		emptyAsDash(out.CloudProvider),
+		emptyAsDash(out.Region),
+		out.APIKey,
+	)
+	return w.Flush()
+}
+
+func printAdminTenantDeleteResponse(out *client.AdminTenantDeleteResponse) error {
+	if out == nil {
+		return fmt.Errorf("admin tenant delete response is empty")
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(w, "TENANT_ID\tSTATUS")
+	_, _ = fmt.Fprintf(w, "%s\t%s\n", out.TenantID, out.Status)
+	return w.Flush()
+}
+
+func emptyAsDash(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "-"
+	}
+	return value
 }

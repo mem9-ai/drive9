@@ -133,7 +133,7 @@ func quotaSet(args []string) error {
 		return err
 	}
 	if maxStorageSize == nil && maxFileSize == nil && maxFileCount == nil && tidbCloudSpendingLimit == nil {
-		return fmt.Errorf("quota set requires --max-storage-size, --max-file-size, --max-file-count, or --tidbcloud-spending-limit")
+		return fmt.Errorf("tenant set-quota requires --max-storage-size, --max-file-size, --max-file-count, or --tidbcloud-spending-limit")
 	}
 
 	r := ResolveCredentials()
@@ -288,15 +288,15 @@ func formatBytes(n int64) string {
 }
 
 func quotaSetUsage() string {
-	return `usage: drive9 admin quota set [flags]
+	return `usage: drive9 admin tenant set-quota --tenant-id ID [flags]
 
-set quota for TiDBCloud mode tenants only. This requires TiDB Cloud credentials
+set quota for TiDBCloud Mode tenants only. This requires TiDB Cloud credentials
 and a drive9 tenant id. Drive9 tenant API keys are not accepted as
 authorization for quota updates.
 
 flags:
   --server URL                    server URL (default: active context server)
-  --region-code CODE              TiDBCloud mode region code; ignored when --server is set
+  --region-code CODE              TiDBCloud Mode region code; ignored when --server is set
   --tenant-id ID                  drive9 tenant id
   --tidbcloud-public-key KEY      TiDB Cloud public key
   --tidbcloud-private-key KEY     TiDB Cloud private key

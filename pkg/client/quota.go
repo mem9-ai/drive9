@@ -41,7 +41,7 @@ type QuotaRequest struct {
 	PrivateKey string `json:"private_key"`
 }
 
-// QuotaSetRequest updates TiDBCloud mode tenant quota with TiDB Cloud API
+// QuotaSetRequest updates TiDBCloud Mode tenant quota with TiDB Cloud API
 // credentials. MaxStorageSize and MaxFileSize are expressed in Mi.
 // TiDBCloudSpendingLimit is the TiDB Cloud Cluster Spending Limit value passed
 // through to TiDB Cloud.
@@ -75,9 +75,9 @@ func (c *Client) GetQuota(ctx context.Context, query QuotaRequest) (*QuotaRespon
 	return decodeQuotaResponse(resp, "quota get")
 }
 
-// SetQuota updates quota for a tidb_cloud_native tenant through the admin quota
-// endpoint. Drive9 tenant API keys cannot authorize quota updates for their own
-// tenant.
+// SetQuota updates quota for a tidb_cloud_native tenant through the admin tenant
+// quota endpoint. Drive9 tenant API keys cannot authorize quota updates for
+// their own tenant.
 //
 // Deprecated: use AdminSetTenantQuota.
 func (c *Client) SetQuota(ctx context.Context, req QuotaSetRequest) (*QuotaResponse, error) {

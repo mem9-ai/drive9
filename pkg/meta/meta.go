@@ -527,14 +527,14 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_external_binding_tenant (tenant_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_tidbcloud_org_bindings (
-			tenant_id       VARCHAR(64) PRIMARY KEY,
-			organization_id VARCHAR(64) NOT NULL,
-			cluster_id      VARCHAR(255) NOT NULL,
-			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
-			updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-			UNIQUE INDEX uk_tidbcloud_org_cluster (cluster_id),
-			INDEX idx_tidbcloud_org_created (organization_id, created_at, tenant_id)
-		)`,
+				tenant_id       VARCHAR(64) PRIMARY KEY,
+				organization_id VARCHAR(64) NOT NULL,
+				cluster_id      VARCHAR(255) NOT NULL,
+				created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+				updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+				INDEX idx_tidbcloud_org_cluster (organization_id, cluster_id, created_at, tenant_id),
+				INDEX idx_tidbcloud_org_created (organization_id, created_at, tenant_id)
+			)`,
 		`CREATE TABLE IF NOT EXISTS tenant_api_key_fs_scopes (
 			tenant_id   VARCHAR(64) NOT NULL,
 			api_key_id  VARCHAR(64) NOT NULL,
@@ -1341,6 +1341,47 @@ func (s *Store) ListTenantsByTiDBCloudOrganizations(ctx context.Context, organiz
 	return scanTenantBindingRows(rows)
 }
 
+func (s *Store) ListTenantsByTiDBCloudOrgClusterBindings(ctx context.Context, bindings []TenantTiDBCloudOrgBinding, offset, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_tenants_by_tidbcloud_org_clusters", start, &err)
+	bindings = compactTiDBCloudOrgClusterBindings(bindings)
+	if len(bindings) == 0 {
+		return []TenantWithTiDBCloudOrgBinding{}, nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	placeholders := make([]string, 0, len(bindings))
+	args := make([]any, 0, len(bindings)*2+2)
+	for _, binding := range bindings {
+		placeholders = append(placeholders, "(?, ?)")
+		args = append(args, binding.OrganizationID, binding.ClusterID)
+	}
+	args = append(args, limit, offset)
+	query := `SELECT
+			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
+			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
+			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
+			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
+			b.tenant_id, b.organization_id, b.cluster_id, b.created_at, b.updated_at
+		FROM tenant_tidbcloud_org_bindings b
+		JOIN tenants t ON t.id = b.tenant_id
+		WHERE (b.organization_id, b.cluster_id) IN (` + strings.Join(placeholders, ",") + `)
+			AND t.provider = 'tidb_cloud_native'
+			AND t.status <> 'deleted'
+		ORDER BY t.created_at DESC, t.id DESC
+		LIMIT ? OFFSET ?`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanTenantBindingRows(rows)
+}
+
 func compactStrings(values []string) []string {
 	out := make([]string, 0, len(values))
 	seen := make(map[string]bool, len(values))
@@ -1353,6 +1394,31 @@ func compactStrings(values []string) []string {
 		out = append(out, value)
 	}
 	sort.Strings(out)
+	return out
+}
+
+func compactTiDBCloudOrgClusterBindings(bindings []TenantTiDBCloudOrgBinding) []TenantTiDBCloudOrgBinding {
+	out := make([]TenantTiDBCloudOrgBinding, 0, len(bindings))
+	seen := make(map[string]bool, len(bindings))
+	for _, binding := range bindings {
+		orgID := strings.TrimSpace(binding.OrganizationID)
+		clusterID := strings.TrimSpace(binding.ClusterID)
+		if orgID == "" || clusterID == "" {
+			continue
+		}
+		key := orgID + "\x00" + clusterID
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, TenantTiDBCloudOrgBinding{OrganizationID: orgID, ClusterID: clusterID})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].OrganizationID != out[j].OrganizationID {
+			return out[i].OrganizationID < out[j].OrganizationID
+		}
+		return out[i].ClusterID < out[j].ClusterID
+	})
 	return out
 }
 

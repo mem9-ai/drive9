@@ -394,12 +394,13 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1", cluster: &tenant.ClusterInfo{
-		ClusterID: "native-cluster-1",
-		Host:      "db.example",
-		Port:      4000,
-		Username:  "u1.root",
-		Password:  "db-pass",
-		DBName:    "customer_db",
+		ClusterID:      "native-cluster-1",
+		OrganizationID: "org-1",
+		Host:           "db.example",
+		Port:           4000,
+		Username:       "u1.root",
+		Password:       "db-pass",
+		DBName:         "customer_db",
 	}}
 
 	srv := NewWithConfig(Config{
@@ -467,6 +468,13 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 
 	if got := prov.systemUserCalls.Load(); got == 0 {
 		t.Fatal("native system user setup was not called")
+	}
+	binding, err := metaStore.GetTenantTiDBCloudOrgBinding(context.Background(), out["tenant_id"])
+	if err != nil {
+		t.Fatalf("get tidbcloud org binding: %v", err)
+	}
+	if binding.OrganizationID != "org-1" || binding.ClusterID != "native-cluster-1" {
+		t.Fatalf("binding = %#v", binding)
 	}
 
 	var provider, dbName, dbUser string
@@ -1366,10 +1374,10 @@ func TestProvisionTiDBCloudNativeRejectsPartialCredentials(t *testing.T) {
 	}
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cluster: &tenant.ClusterInfo{}}
 	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        pool,
-		Provisioner: prov,
-		TokenSecret: tokenSecret,
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -1415,15 +1423,15 @@ func TestProvisionTiDBCloudNativeUsesDefaultCredentialsWhenOmitted(t *testing.T)
 	}
 	prov := &fakeProvisioner{
 		provider:          tenant.ProviderTiDBCloudNative,
-		cluster:           &tenant.ClusterInfo{},
+		cluster:           &tenant.ClusterInfo{ClusterID: "native-cluster-default", OrganizationID: "org-default"},
 		defaultPublicKey:  "default-pk",
 		defaultPrivateKey: "default-sk",
 	}
 	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        pool,
-		Provisioner: prov,
-		TokenSecret: tokenSecret,
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -1444,5 +1452,16 @@ func TestProvisionTiDBCloudNativeUsesDefaultCredentialsWhenOmitted(t *testing.T)
 	}
 	if prov.lastCredentialReq.PublicKey != "default-pk" || prov.lastCredentialReq.PrivateKey != "default-sk" {
 		t.Fatalf("credentials = %s/%s, want default-pk/default-sk", prov.lastCredentialReq.PublicKey, prov.lastCredentialReq.PrivateKey)
+	}
+	var out map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := metaStore.GetTenantTiDBCloudOrgBinding(context.Background(), out["tenant_id"])
+	if err != nil {
+		t.Fatalf("get tidbcloud org binding: %v", err)
+	}
+	if binding.OrganizationID != "org-default" || binding.ClusterID != "native-cluster-default" {
+		t.Fatalf("binding = %#v", binding)
 	}
 }

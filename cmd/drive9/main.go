@@ -8,7 +8,7 @@
 //
 //	create  provision a new database and owner context
 //	delete  delete the current tenant
-//	admin   TiDB Cloud Native admin operations
+//	admin   TiDBCloud Mode admin operations
 //	ctx     manage contexts (show, add, import, fork, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, mkdir, chmod,
 //	        symlink, hardlink, sh, grep, find, layer)
@@ -415,8 +415,8 @@ func usage(code int) {
 			"  delete [--server URL] [--api-key KEY] [--json]\n"+
 			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
 			"                         delete current tenant with owner API key\n"+
-			"  admin <tenant|quota> <command> [flags]\n"+
-			"                         TiDB Cloud Native admin operations\n"+
+			"  admin tenant <command> [arguments]\n"+
+			"                         TiDBCloud Mode admin operations\n"+
 			"  ctx show [--json] [--reveal]\n"+
 			"                         show current context\n"+
 			"  ctx add --api-key <key> [--name NAME] [--server URL]\n"+

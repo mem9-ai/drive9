@@ -3,7 +3,7 @@
 Last verified: 2026-06-24.
 
 This guide shows how to read and update Drive9 tenant quota from the CLI and
-HTTP API in TiDB Cloud Native mode.
+HTTP API in TiDBCloud Mode.
 
 ## What quota tracks
 
@@ -47,7 +47,7 @@ then writes any Drive9-stored quota fields.
 
 ## CLI
 
-Use TiDB Cloud credentials to list TiDB Cloud Native tenants with quota:
+Use TiDB Cloud credentials to list TiDBCloud Mode tenants with quota:
 
 ```bash
 drive9 admin tenant list \
@@ -73,12 +73,12 @@ TENANT_ID   STATUS  KIND  MAX_STORAGE  MAX_FILE_SIZE  MAX_FILE_COUNT  SPENDING_L
 tnt_abc123  active  live  102400 Mi    1024 Mi        100000          10000           1.0 MiB       0 B       12
 ```
 
-Set quota with `drive9 admin quota set`. Only TiDB Cloud Native mode supports
+Set quota with `drive9 admin tenant set-quota`. Only TiDBCloud Mode supports
 quota set. Pass at least one of `--max-storage-size`, `--max-file-size`,
 `--max-file-count`, or `--tidbcloud-spending-limit`.
 
 ```bash
-drive9 admin quota set \
+drive9 admin tenant set-quota \
   --region-code aws-ap-southeast-1 \
   --tenant-id tnt_abc123 \
   --tidbcloud-public-key <tidbcloud-public-key> \
@@ -128,7 +128,7 @@ Tenant get returns tenant information with quota:
 
 ### GET /v1/admin/tenants
 
-List authorized TiDB Cloud Native tenants. Add `include_quota=true` when the
+List authorized TiDBCloud Mode tenants. Add `include_quota=true` when the
 response should include quota for each tenant.
 
 ```bash
@@ -140,7 +140,7 @@ curl -sS \
 
 ### GET /v1/admin/tenants/{tenant-id}
 
-Get a single authorized TiDB Cloud Native tenant. The response includes quota.
+Get a single authorized TiDBCloud Mode tenant. The response includes quota.
 
 ```bash
 curl -sS \
@@ -151,7 +151,7 @@ curl -sS \
 
 ### POST /v1/admin/tenants/{tenant-id}/quota
 
-Set quota for a TiDB Cloud Native tenant using TiDB Cloud credentials.
+Set quota for a TiDBCloud Mode tenant using TiDB Cloud credentials.
 
 ```bash
 curl -sS \

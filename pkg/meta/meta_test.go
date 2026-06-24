@@ -1143,9 +1143,35 @@ func TestMetaSchemaSpecIncludesTiDBCloudOrgBindings(t *testing.T) {
 			t.Fatalf("tenant_tidbcloud_org_bindings schema missing %s", column)
 		}
 	}
-	for _, index := range []string{"primary", "uk_tidbcloud_org_cluster", "idx_tidbcloud_org_created"} {
+	for _, index := range []string{"primary", "idx_tidbcloud_org_cluster", "idx_tidbcloud_org_created"} {
 		if _, ok := table.indexes[index]; !ok {
 			t.Fatalf("tenant_tidbcloud_org_bindings schema missing index %s", index)
+		}
+	}
+}
+
+func TestUpsertTenantTiDBCloudOrgBindingAllowsSharedCluster(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for _, tenantID := range []string{"binding-live-tenant", "binding-fork-tenant"} {
+		if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+			TenantID:       tenantID,
+			OrganizationID: "org-1",
+			ClusterID:      "cluster-shared",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}); err != nil {
+			t.Fatalf("upsert binding for %s: %v", tenantID, err)
+		}
+	}
+	for _, tenantID := range []string{"binding-live-tenant", "binding-fork-tenant"} {
+		binding, err := s.GetTenantTiDBCloudOrgBinding(ctx, tenantID)
+		if err != nil {
+			t.Fatalf("get binding for %s: %v", tenantID, err)
+		}
+		if binding.ClusterID != "cluster-shared" || binding.OrganizationID != "org-1" {
+			t.Fatalf("binding for %s = %#v", tenantID, binding)
 		}
 	}
 }

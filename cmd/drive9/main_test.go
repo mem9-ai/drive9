@@ -83,7 +83,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"usage: drive9 <command> [arguments]",
 		"create [--name NAME] [--region-code CODE] [--server URL] [--json]",
 		"delete [--server URL] [--api-key KEY] [--json]",
-		"admin <tenant|quota> <command> [flags]",
+		"admin tenant <command> [arguments]",
 		"ctx show [--json] [--reveal]",
 		"ctx use <name>",
 		"token <issue|revoke>",
@@ -577,12 +577,12 @@ func TestDispatchAdminVerbReachesHandler(t *testing.T) {
 		return nil
 	}
 
-	dispatch("admin", []string{"quota", "get", "--json"})
+	dispatch("admin", []string{"tenant", "set-quota", "--json"})
 
 	if !called {
 		t.Fatal("admin handler was not invoked for `drive9 admin ...`")
 	}
-	want := []string{"quota", "get", "--json"}
+	want := []string{"tenant", "set-quota", "--json"}
 	if len(gotArgs) != len(want) {
 		t.Fatalf("args = %v, want %v", gotArgs, want)
 	}

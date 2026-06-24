@@ -119,10 +119,10 @@ func Create(args []string) error {
 
 	mode := provisionModeForCredentials(publicKey, privateKey)
 	if mode == RegionModeTiDBCloudNative && (publicKey == "" || privateKey == "") {
-		return fmt.Errorf("TiDBCloud mode requires --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
+		return fmt.Errorf("TiDBCloud Mode requires --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
 	}
 	if mode == RegionModeTiDBCloudNative && strings.TrimSpace(serverFlag) == "" && strings.TrimSpace(regionCode) == "" {
-		return fmt.Errorf("TiDBCloud mode requires --region-code or --server; use drive9 region list to see available regions")
+		return fmt.Errorf("TiDBCloud Mode requires --region-code or --server; use drive9 region list to see available regions")
 	}
 	server, regionEntry, err := resolveProvisionServer(serverFlag, regionCode, mode, r.Server)
 	if err != nil {
@@ -250,8 +250,8 @@ flags:
   --name NAME                     context name (default: auto-generated 7-char name)
   --region-code CODE              provisioning region code; use "drive9 region list" to see available regions
   --server URL                    override the server URL (bypasses region manifest lookup)
-  --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud mode)
-  --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud mode)
+  --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud Mode)
+  --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud Mode)
   --json                          output result as JSON
 
 examples:
@@ -284,7 +284,7 @@ func provisionRequestBody(publicKey, privateKey string) (io.Reader, error) {
 		return nil, nil
 	}
 	if publicKey == "" || privateKey == "" {
-		return nil, fmt.Errorf("TiDBCloud mode requires both public and private keys")
+		return nil, fmt.Errorf("TiDBCloud Mode requires both public and private keys")
 	}
 	body := map[string]string{
 		"public_key":  publicKey,
@@ -540,13 +540,13 @@ func deleteUsage() string {
 	return `usage: drive9 delete [flags]
 
 delete the current tenant. The tenant's TiDB Cloud cluster, database, and API
-keys are removed. For TiDBCloud mode, TiDB Cloud credentials must be provided.
+keys are removed. For TiDBCloud Mode, TiDB Cloud credentials must be provided.
 
 flags:
   --server URL                    server URL (default: active context server)
   --api-key KEY                   owner API key (default: active context API key)
-  --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud mode)
-  --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud mode)
+  --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud Mode)
+  --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud Mode)
   --json                          output result as JSON
   -y, --yes                       skip confirmation prompt
 
@@ -566,7 +566,7 @@ func deprovisionRequestBody(publicKey, privateKey string) (io.Reader, error) {
 		return nil, nil
 	}
 	if publicKey == "" || privateKey == "" {
-		return nil, fmt.Errorf("TiDBCloud mode requires both public and private keys for delete")
+		return nil, fmt.Errorf("TiDBCloud Mode requires both public and private keys for delete")
 	}
 	raw, err := json.Marshal(map[string]string{
 		"public_key":  publicKey,

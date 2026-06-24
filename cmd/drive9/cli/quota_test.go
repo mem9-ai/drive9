@@ -38,8 +38,8 @@ func TestQuotaSetSendsTiDBCloudCredentialBody(t *testing.T) {
 	resetCredentialCacheForTest()
 
 	if _, err := captureStdoutE(t, func() error {
-		return Admin([]string{"quota",
-			"set",
+		return Admin([]string{"tenant",
+			"set-quota",
 			"--tenant-id", "tenant-1",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
@@ -88,8 +88,8 @@ func TestQuotaSetAllowsSpendingLimitOnly(t *testing.T) {
 	resetCredentialCacheForTest()
 
 	if _, err := captureStdoutE(t, func() error {
-		return Admin([]string{"quota",
-			"set",
+		return Admin([]string{"tenant",
+			"set-quota",
 			"--tenant-id", "tenant-1",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
@@ -130,8 +130,8 @@ func TestQuotaSetAllowsStorageSizeOnly(t *testing.T) {
 	resetCredentialCacheForTest()
 
 	if _, err := captureStdoutE(t, func() error {
-		return Admin([]string{"quota",
-			"set",
+		return Admin([]string{"tenant",
+			"set-quota",
 			"--tenant-id", "tenant-1",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
@@ -172,8 +172,8 @@ func TestQuotaSetAllowsFileLimitsOnly(t *testing.T) {
 	resetCredentialCacheForTest()
 
 	if _, err := captureStdoutE(t, func() error {
-		return Admin([]string{"quota",
-			"set",
+		return Admin([]string{"tenant",
+			"set-quota",
 			"--tenant-id", "tenant-1",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
@@ -208,8 +208,8 @@ func TestQuotaSetAllowsZeroFileCount(t *testing.T) {
 	resetCredentialCacheForTest()
 
 	if _, err := captureStdoutE(t, func() error {
-		return Admin([]string{"quota",
-			"set",
+		return Admin([]string{"tenant",
+			"set-quota",
 			"--tenant-id", "tenant-1",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
@@ -264,8 +264,8 @@ func TestQuotaSetRegionCodeSelectsTiDBCloudServer(t *testing.T) {
 	resetCredentialCacheForTest()
 
 	if _, err := captureStdoutE(t, func() error {
-		return Admin([]string{"quota",
-			"set",
+		return Admin([]string{"tenant",
+			"set-quota",
 			"--region-code", "aws-us-east-1",
 			"--tenant-id", "tenant-1",
 			"--tidbcloud-public-key", "public-1",
@@ -293,8 +293,8 @@ func TestQuotaSetRejectsMissingTiDBCloudCredentials(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)
 
-	err := Admin([]string{"quota",
-		"set",
+	err := Admin([]string{"tenant",
+		"set-quota",
 		"--tenant-id", "tenant-1",
 		"--max-storage-size", "1000",
 	})
@@ -310,8 +310,8 @@ func TestQuotaSetRejectsMissingQuotaKnob(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)
 
-	err := Admin([]string{"quota",
-		"set",
+	err := Admin([]string{"tenant",
+		"set-quota",
 		"--tenant-id", "tenant-1",
 		"--tidbcloud-public-key", "public-1",
 		"--tidbcloud-private-key", "private-1",
@@ -351,8 +351,8 @@ func TestQuotaSetRejectsInvalidQuotaValues(t *testing.T) {
 			defer ts.Close()
 			t.Setenv(EnvServer, ts.URL)
 
-			err := Admin([]string{"quota",
-				"set",
+			err := Admin([]string{"tenant",
+				"set-quota",
 				"--tenant-id", "tenant-1",
 				"--tidbcloud-public-key", "public-1",
 				"--tidbcloud-private-key", "private-1",

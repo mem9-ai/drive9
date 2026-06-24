@@ -143,7 +143,11 @@ func (s *Server) adminTenantAPIEnabled() bool {
 		return false
 	}
 	provider, err := tenant.NormalizeProvider(s.provisioner.ProviderType())
-	return err == nil && provider == tenant.ProviderTiDBCloudNative
+	if err != nil || provider != tenant.ProviderTiDBCloudNative {
+		return false
+	}
+	_, ok := s.provisioner.(tenant.ManagedClusterLister)
+	return ok
 }
 
 func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request) {
@@ -189,15 +193,10 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 	}
 	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
-	t, err := s.meta.GetTenant(r.Context(), res.TenantID)
-	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "tenant lookup failed")
-		return
-	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	_ = json.NewEncoder(w).Encode(adminTenantCreateResponse{
-		TenantID:      t.ID,
+		TenantID:      res.TenantID,
 		APIKey:        res.APIKey,
 		Status:        string(res.Status),
 		CloudProvider: res.CloudProvider,
@@ -216,8 +215,8 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 		writeAdminTiDBCloudError(w, r.Context(), err, "list tenants")
 		return
 	}
-	orgIDs := organizationIDsFromClusters(clusters)
-	if len(orgIDs) == 0 {
+	authorizedBindings := authorizedTiDBCloudOrgClusterBindings(clusters)
+	if len(authorizedBindings) == 0 {
 		pageSize, page, _, err := adminPagination(r)
 		if err != nil {
 			errJSON(w, http.StatusBadRequest, err.Error())
@@ -232,7 +231,7 @@ func (s *Server) handleAdminTenantList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	includeQuota := parseBoolQuery(r, "include_quota")
-	rows, err := s.meta.ListTenantsByTiDBCloudOrganizations(r.Context(), orgIDs, offset, pageSize+1)
+	rows, err := s.meta.ListTenantsByTiDBCloudOrgClusterBindings(r.Context(), authorizedBindings, offset, pageSize+1)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "tenant list failed")
 		return
@@ -264,7 +263,7 @@ func (s *Server) handleAdminTenantGet(w http.ResponseWriter, r *http.Request, te
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	t, binding, cloudCfg, ok := s.authorizedAdminTenant(w, r, tenantID, cred, true)
+	t, binding, cloudCfg, ok := s.authorizedAdminTenant(w, r, tenantID, cred, true, false)
 	if !ok {
 		return
 	}
@@ -299,7 +298,7 @@ func (s *Server) handleAdminTenantQuotaSet(w http.ResponseWriter, r *http.Reques
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	t, _, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false)
+	t, _, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false, false)
 	if !ok {
 		return
 	}
@@ -325,7 +324,7 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	t, _, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false)
+	t, _, _, ok := s.authorizedAdminTenant(w, r, tenantID, cred, false, true)
 	if !ok {
 		return
 	}
@@ -348,15 +347,6 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 			return
 		}
 	}
-	if updater, ok := s.provisioner.(tenant.QuotaUpdater); ok {
-		if _, err := updater.MarkQuotaUpdateStarted(r.Context(), clusterInfoFromTenant(t), cred); err != nil {
-			writeQuotaCredentialError(w, r.Context(), err, "delete")
-			return
-		}
-	} else {
-		errJSON(w, http.StatusNotFound, "tenant delete not enabled")
-		return
-	}
 	if t.Status == meta.TenantDeleting {
 		hasJob, err := s.meta.TenantDeleteJobExists(r.Context(), t.ID)
 		if err != nil {
@@ -368,6 +358,15 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 			writeJSON(w, http.StatusAccepted, adminTenantDeleteResponse{TenantID: t.ID, Status: string(meta.TenantDeleting)})
 			return
 		}
+	}
+	if updater, ok := s.provisioner.(tenant.QuotaUpdater); ok {
+		if _, err := updater.MarkQuotaUpdateStarted(r.Context(), clusterInfoFromTenant(t), cred); err != nil {
+			writeQuotaCredentialError(w, r.Context(), err, "delete")
+			return
+		}
+	} else {
+		errJSON(w, http.StatusNotFound, "tenant delete not enabled")
+		return
 	}
 	if t.Status != meta.TenantDeleting {
 		updated, err := s.meta.UpdateTenantStatusIf(r.Context(), t.ID, t.Status, meta.TenantDeleting)
@@ -404,7 +403,7 @@ func (s *Server) handleAdminTenantDelete(w http.ResponseWriter, r *http.Request,
 	writeJSON(w, http.StatusAccepted, adminTenantDeleteResponse{TenantID: t.ID, Status: string(status)})
 }
 
-func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, tenantID string, cred tenant.CredentialProvisionRequest, loadQuota bool) (*meta.Tenant, *meta.TenantTiDBCloudOrgBinding, *tenant.QuotaCloudConfig, bool) {
+func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, tenantID string, cred tenant.CredentialProvisionRequest, loadQuota bool, allowDeletingMissingCluster bool) (*meta.Tenant, *meta.TenantTiDBCloudOrgBinding, *tenant.QuotaCloudConfig, bool) {
 	t, err := s.meta.GetTenant(r.Context(), tenantID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
@@ -435,6 +434,18 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
 		return nil, nil, nil, false
+	}
+	if len(clusters) == 0 && allowDeletingMissingCluster && t.Status == meta.TenantDeleting {
+		clusters, err = s.listAllManagedClusters(r.Context(), cred, "")
+		if err != nil {
+			writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant")
+			return nil, nil, nil, false
+		}
+		for _, cluster := range clusters {
+			if cluster.OrganizationID == binding.OrganizationID {
+				return t, binding, nil, true
+			}
+		}
 	}
 	if len(clusters) == 0 {
 		errJSON(w, http.StatusForbidden, "no permission to access tenant with TiDB Cloud API key")
@@ -546,18 +557,23 @@ func (s *Server) writeAdminQuotaResponse(w http.ResponseWriter, r *http.Request,
 	})
 }
 
-func organizationIDsFromClusters(clusters []tenant.CloudClusterInfo) []string {
-	ids := make([]string, 0, len(clusters))
+func authorizedTiDBCloudOrgClusterBindings(clusters []tenant.CloudClusterInfo) []meta.TenantTiDBCloudOrgBinding {
+	out := make([]meta.TenantTiDBCloudOrgBinding, 0, len(clusters))
 	seen := make(map[string]bool, len(clusters))
 	for _, cluster := range clusters {
-		id := strings.TrimSpace(cluster.OrganizationID)
-		if id == "" || seen[id] {
+		orgID := strings.TrimSpace(cluster.OrganizationID)
+		clusterID := strings.TrimSpace(cluster.ClusterID)
+		if orgID == "" || clusterID == "" {
 			continue
 		}
-		seen[id] = true
-		ids = append(ids, id)
+		key := orgID + "\x00" + clusterID
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, meta.TenantTiDBCloudOrgBinding{OrganizationID: orgID, ClusterID: clusterID})
 	}
-	return ids
+	return out
 }
 
 func cloudClusterMap(clusters []tenant.CloudClusterInfo) map[string]tenant.CloudClusterInfo {
@@ -608,6 +624,10 @@ func adminPagination(r *http.Request) (pageSize, page, offset int, err error) {
 			return 0, 0, 0, fmt.Errorf("page must be a positive integer")
 		}
 		page = v
+	}
+	maxOffsetPage := 1 + int(^uint(0)>>1)/pageSize
+	if page > maxOffsetPage {
+		return 0, 0, 0, fmt.Errorf("page is too large")
 	}
 	offset = (page - 1) * pageSize
 	return pageSize, page, offset, nil

@@ -4167,7 +4167,14 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusBadGateway, msg, err)
 	}
 	cluster.Provider = provider
-	if provider == tenant.ProviderTiDBCloudNative && strings.TrimSpace(cluster.OrganizationID) != "" {
+	if provider == tenant.ProviderTiDBCloudNative {
+		if strings.TrimSpace(cluster.OrganizationID) == "" {
+			err := fmt.Errorf("tidbcloud organization label is missing")
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_tidbcloud_org_binding_missing", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			return nil, newProvisionTenantError(http.StatusBadGateway, "failed to read tidbcloud organization binding", err)
+		}
 		if err := s.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
 			TenantID:       tenantID,
 			OrganizationID: cluster.OrganizationID,

@@ -2,11 +2,99 @@ package cli
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func TestAdminTenantHelpIncludesCommandsFlagsAndExamples(t *testing.T) {
+	stdout, err := captureStdoutE(t, func() error {
+		return Admin([]string{"tenant", "--help"})
+	})
+	if err != nil {
+		t.Fatalf("Admin tenant help: %v", err)
+	}
+	for _, want := range []string{
+		"usage: drive9 admin tenant <command> [arguments]",
+		"commands:",
+		"create [flags]",
+		"list [flags]",
+		"get --tenant-id ID",
+		"delete --tenant-id ID",
+		"set-quota --tenant-id ID",
+		"--server URL",
+		"--region-code CODE",
+		"--tidbcloud-public-key KEY",
+		"--tidbcloud-private-key KEY",
+		"examples:",
+		"drive9 admin tenant create",
+		"drive9 admin tenant delete",
+		"drive9 admin tenant set-quota",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestAdminTenantCreatePrintsTable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+	spendingLimit := int64(10000)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/admin/tenants" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["public_key"] != "public-1" || body["private_key"] != "private-1" {
+			t.Fatalf("body credentials = %#v", body)
+		}
+		if body["max_storage_size"] != float64(102400) || body["tidbcloud_spending_limit"] != float64(spendingLimit) {
+			t.Fatalf("body quota = %#v", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tenant_id":      "tenant-1",
+			"api_key":        "drive9_owner_key",
+			"status":         "provisioning",
+			"cloud_provider": "aws",
+			"region":         "ap-southeast-1",
+		})
+	}))
+	defer ts.Close()
+
+	stdout, err := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"tenant", "create",
+			"--server", ts.URL,
+			"--tidbcloud-public-key", "public-1",
+			"--tidbcloud-private-key", "private-1",
+			"--max-storage-size", "102400",
+			"--tidbcloud-spending-limit", "10000",
+		})
+	})
+	if err != nil {
+		t.Fatalf("Admin tenant create: %v", err)
+	}
+	for _, want := range []string{
+		"TENANT_ID", "STATUS", "CLOUD_PROVIDER", "REGION", "API_KEY",
+		"tenant-1", "provisioning", "aws", "ap-southeast-1", "drive9_owner_key",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+	for _, banned := range []string{"tenant_id:", "api_key:"} {
+		if strings.Contains(stdout, banned) {
+			t.Fatalf("stdout should use table output, found %q:\n%s", banned, stdout)
+		}
+	}
+}
 
 func TestAdminTenantListPrintsTable(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
@@ -62,7 +150,7 @@ func TestAdminTenantListPrintsTable(t *testing.T) {
 	}
 }
 
-func TestAdminQuotaListPrintsQuotaTable(t *testing.T) {
+func TestAdminTenantListIncludeQuotaPrintsQuotaTable(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)
 	spendingLimit := int64(10000)
@@ -103,14 +191,15 @@ func TestAdminQuotaListPrintsQuotaTable(t *testing.T) {
 
 	stdout, err := captureStdoutE(t, func() error {
 		return Admin([]string{
-			"quota", "list",
+			"tenant", "list",
 			"--server", ts.URL,
+			"--include-quota",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
 		})
 	})
 	if err != nil {
-		t.Fatalf("Admin quota list: %v", err)
+		t.Fatalf("Admin tenant list --include-quota: %v", err)
 	}
 	for _, want := range []string{
 		"TENANT_ID", "MAX_STORAGE", "MAX_FILE_SIZE", "MAX_FILE_COUNT", "SPENDING_LIMIT", "STORAGE_USED", "RESERVED", "FILE_COUNT",
@@ -122,12 +211,12 @@ func TestAdminQuotaListPrintsQuotaTable(t *testing.T) {
 	}
 }
 
-func TestAdminQuotaGetIsNotACommand(t *testing.T) {
+func TestAdminQuotaNamespaceIsNotACommand(t *testing.T) {
 	err := Admin([]string{"quota", "get", "--tenant-id", "tenant-1"})
 	if err == nil {
-		t.Fatal("Admin quota get error = nil, want unknown command")
+		t.Fatal("Admin quota error = nil, want unknown command")
 	}
-	if !strings.Contains(err.Error(), `unknown admin quota command "get"`) {
+	if !strings.Contains(err.Error(), `unknown admin command "quota"`) {
 		t.Fatalf("error = %q", err)
 	}
 }
@@ -185,5 +274,49 @@ func TestAdminTenantGetPrintsQuota(t *testing.T) {
 		if strings.Contains(stdout, banned) {
 			t.Fatalf("stdout should use table output, found %q:\n%s", banned, stdout)
 		}
+	}
+}
+
+func TestAdminTenantDeletePrintsTable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete || r.URL.Path != "/v1/admin/tenants/tenant-1" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(raw), `"public_key":"public-1"`) || !strings.Contains(string(raw), `"private_key":"private-1"`) {
+			t.Fatalf("body = %s, want tidbcloud credentials", raw)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"tenant_id": "tenant-1",
+			"status":    "deleting",
+		})
+	}))
+	defer ts.Close()
+
+	stdout, err := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"tenant", "delete",
+			"--server", ts.URL,
+			"--tenant-id", "tenant-1",
+			"--tidbcloud-public-key", "public-1",
+			"--tidbcloud-private-key", "private-1",
+		})
+	})
+	if err != nil {
+		t.Fatalf("Admin tenant delete: %v", err)
+	}
+	for _, want := range []string{"TENANT_ID", "STATUS", "tenant-1", "deleting"} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "delete status:") {
+		t.Fatalf("stdout should use table output:\n%s", stdout)
 	}
 }
