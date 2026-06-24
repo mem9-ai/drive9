@@ -12,9 +12,10 @@ import (
 )
 
 const (
-	// quotaConfigCacheRefreshInterval is how often the background goroutine
-	// polls the tenant quota config version from the central DB.
-	quotaConfigCacheRefreshInterval = 30 * time.Second
+	// defaultQuotaConfigCacheRefreshInterval is the default interval for the
+	// background goroutine that polls the tenant quota config version from
+	// the central DB. Override with DRIVE9_QUOTA_CACHE_REFRESH_SECONDS.
+	defaultQuotaConfigCacheRefreshInterval = 30 * time.Second
 	// quotaUsageCacheTTL bounds how long soft small-write quota checks may
 	// reuse central usage counters. Strict upload reservations still read
 	// central usage directly.
@@ -25,6 +26,19 @@ const (
 	// other servers.
 	quotaPendingDeltasCacheTTL = 100 * time.Millisecond
 )
+
+// quotaConfigCacheRefreshInterval is the resolved refresh interval (package-level
+// var so it can be set from env at startup).
+var quotaConfigCacheRefreshInterval = defaultQuotaConfigCacheRefreshInterval
+
+// InitQuotaConfigCacheRefreshInterval overrides the default refresh interval.
+// seconds <= 0 keeps the default (30s). Must be called before any backend
+// is created (before quota caches are instantiated).
+func InitQuotaConfigCacheRefreshInterval(seconds int) {
+	if seconds > 0 {
+		quotaConfigCacheRefreshInterval = time.Duration(seconds) * time.Second
+	}
+}
 
 type quotaConfigSnapshot struct {
 	config  *QuotaConfigView

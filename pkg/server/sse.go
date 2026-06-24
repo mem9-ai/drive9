@@ -20,9 +20,6 @@ const (
 	sseHeartbeatInterval = 30 * time.Second
 	sseFlushBatchSize    = 10
 	sseFlushMaxDelay     = 1 * time.Millisecond
-	// ssePollInterval is how often the live stream polls the fs_events table
-	// for cross-pod events. Matches the fs_layer_events poll interval.
-	ssePollInterval = 1 * time.Second
 )
 
 // stopTimer drains a timer's channel after stopping it to prevent spurious
@@ -258,11 +255,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// Phase 2: Live stream with micro-batching.
 	// The notify channel catches same-pod events instantly. A 1s poll ticker
 	// catches cross-pod events (writes on other pods that inserted into the
-	// shared fs_events table). This matches the fs_layer_events poll interval.
+	// shared fs_events table). The EventBus's per-bus poll goroutine handles
+	// cross-pod discovery and signals via the notify channel — no per-connection
+	// poll ticker needed (P1-6 optimization).
 	heartbeat := time.NewTicker(sseHeartbeatInterval)
 	defer heartbeat.Stop()
-	poll := time.NewTicker(ssePollInterval)
-	defer poll.Stop()
 
 	// Use a nil timer that we allocate on first need. Starting with
 	// time.NewTimer(0) and immediately stopping can leave a stale tick
@@ -330,10 +327,6 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if flushTimer != nil {
 				stopTimer(flushTimer)
 				flushC = nil
-			}
-		case <-poll.C:
-			if !pollAndSend() {
-				return
 			}
 		case <-flushC:
 			if bw.count > 0 {
