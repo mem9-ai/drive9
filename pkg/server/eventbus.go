@@ -135,7 +135,14 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 		})
 	}
 	if len(events) > 0 {
-		// Got rows: head is the last row's seq (no extra SELECT MAX round-trip).
+		// Got rows: check for a gap between the client's cursor and the
+		// first retained event. If since+1 < first event seq, events were
+		// pruned in between → reset to avoid silently missing them.
+		firstSeq := events[0].Seq
+		if since+1 < firstSeq {
+			headSeq = events[len(events)-1].Seq
+			return nil, headSeq, false // gap detected → reset
+		}
 		headSeq = events[len(events)-1].Seq
 		return events, headSeq, true
 	}
