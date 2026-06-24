@@ -1136,6 +1136,20 @@ func TestMetaSchemaSpecIncludesExternalBindings(t *testing.T) {
 	}
 }
 
+func TestMetaSchemaSpecIncludesTiDBCloudOrgBindings(t *testing.T) {
+	table := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_tidbcloud_org_bindings")
+	for _, column := range []string{"tenant_id", "organization_id", "cluster_id", "created_at", "updated_at"} {
+		if _, ok := table.columns[column]; !ok {
+			t.Fatalf("tenant_tidbcloud_org_bindings schema missing %s", column)
+		}
+	}
+	for _, index := range []string{"primary", "uk_tidbcloud_org_cluster", "idx_tidbcloud_org_created"} {
+		if _, ok := table.indexes[index]; !ok {
+			t.Fatalf("tenant_tidbcloud_org_bindings schema missing index %s", index)
+		}
+	}
+}
+
 func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
 	spec := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_quota_config")
 	meta := metaTableMeta{

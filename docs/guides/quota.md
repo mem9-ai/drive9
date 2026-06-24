@@ -1,9 +1,9 @@
 # drive9 quota guide
 
-Last verified: 2026-06-23.
+Last verified: 2026-06-24.
 
-This guide shows how to query and update Drive9 tenant quota from the CLI and
-HTTP API.
+This guide shows how to read and update Drive9 tenant quota from the CLI and
+HTTP API in TiDB Cloud Native mode.
 
 ## What quota tracks
 
@@ -26,18 +26,19 @@ Quota responses include these storage usage counters:
 
 ## Permissions and supported modes
 
-Quota query and update both require TiDB Cloud API keys plus a Drive9 tenant id.
-A Drive9 tenant API key is not accepted for quota query or update.
+Tenant list/get and quota update require TiDB Cloud API keys. A Drive9 tenant
+API key is not accepted for these admin operations.
 Server-side default TiDB Cloud credentials configured for tenant provision or
-deprovision are not used as a fallback by quota query or update. Callers must
+deprovision are not used as a fallback by quota read or update. Callers must
 supply TiDB Cloud credentials on each quota request; those credentials may be
 the same keys as the server defaults when passed explicitly.
 
 Only `tidb_cloud_native` tenants support quota update through this API. Other
 tenant providers use their configured defaults.
 
-Quota query first gets the TiDB Cloud cluster with the supplied TiDB Cloud API
-keys. Drive9 reads local quota config and usage only after that read succeeds.
+Tenant list/get first lists TiDB Cloud managed clusters with the supplied TiDB
+Cloud API keys. Drive9 reads local tenant and quota config only after that read
+succeeds.
 
 Quota update first reads the TiDB Cloud cluster labels, then patches the Drive9
 quota update labels to confirm the API key has cluster write permission. If that
@@ -46,43 +47,38 @@ then writes any Drive9-stored quota fields.
 
 ## CLI
 
-Use TiDB Cloud credentials and `--tenant-id` to query a TiDBCloud mode tenant.
+Use TiDB Cloud credentials to list TiDB Cloud Native tenants with quota:
 
 ```bash
-drive9 quota get \
+drive9 admin tenant list \
+  --region-code aws-ap-southeast-1 \
+  --tidbcloud-public-key <tidbcloud-public-key> \
+  --tidbcloud-private-key <tidbcloud-private-key>
+```
+
+Use tenant get when you already have the Drive9 tenant id:
+
+```bash
+drive9 admin tenant get \
   --region-code aws-ap-southeast-1 \
   --tenant-id tnt_abc123 \
   --tidbcloud-public-key <tidbcloud-public-key> \
-  --tidbcloud-private-key <tidbcloud-private-key> \
-  --json
-```
-
-You may provide TiDB Cloud keys through environment variables:
-
-```bash
-export DRIVE9_PUBLIC_KEY=<tidbcloud-public-key>
-export DRIVE9_PRIVATE_KEY=<tidbcloud-private-key>
-
-drive9 quota get --region-code aws-ap-southeast-1 --tenant-id tnt_abc123
+  --tidbcloud-private-key <tidbcloud-private-key>
 ```
 
 Example output:
 
 ```text
-tenant: tnt_abc123
-provider: tidb_cloud_native
-status: active
-supports_update: true
-config: max_storage_size=102400Mi max_file_size=1024Mi max_file_count=100000 tidbcloud_spending_limit=10000
-usage: storage_bytes=1048576 reserved_bytes=0 file_count=12
+TENANT_ID   STATUS  KIND  MAX_STORAGE  MAX_FILE_SIZE  MAX_FILE_COUNT  SPENDING_LIMIT  STORAGE_USED  RESERVED  FILE_COUNT
+tnt_abc123  active  live  102400 Mi    1024 Mi        100000          10000           1.0 MiB       0 B       12
 ```
 
-Set quota with `drive9 quota set`. Only TiDBCloud mode supports quota set. Pass
-at least one of `--max-storage-size`, `--max-file-size`,
+Set quota with `drive9 admin quota set`. Only TiDB Cloud Native mode supports
+quota set. Pass at least one of `--max-storage-size`, `--max-file-size`,
 `--max-file-count`, or `--tidbcloud-spending-limit`.
 
 ```bash
-drive9 quota set \
+drive9 admin quota set \
   --region-code aws-ap-southeast-1 \
   --tenant-id tnt_abc123 \
   --tidbcloud-public-key <tidbcloud-public-key> \
@@ -107,52 +103,61 @@ Validation rules:
 
 ## HTTP API
 
-All quota endpoints return the same response shape:
+Tenant get returns tenant information with quota:
 
 ```json
 {
   "tenant_id": "tnt_abc123",
-  "provider": "tidb_cloud_native",
   "status": "active",
-  "supports_update": true,
-  "config": {
-    "max_storage_size": 102400,
-    "max_file_size": 1024,
-    "max_file_count": 100000,
-    "tidbcloud_spending_limit": 10000
-  },
-  "usage": {
-    "storage_bytes": 1048576,
-    "reserved_bytes": 0,
-    "file_count": 12
+  "kind": "live",
+  "quota": {
+    "config": {
+      "max_storage_size": 102400,
+      "max_file_size": 1024,
+      "max_file_count": 100000,
+      "tidbcloud_spending_limit": 10000
+    },
+    "usage": {
+      "storage_bytes": 1048576,
+      "reserved_bytes": 0,
+      "file_count": 12
+    }
   }
 }
 ```
 
-### GET /v1/quota
+### GET /v1/admin/tenants
 
-Query quota for a `tidb_cloud_native` tenant using TiDB Cloud credentials.
+List authorized TiDB Cloud Native tenants. Add `include_quota=true` when the
+response should include quota for each tenant.
 
 ```bash
 curl -sS \
   -H "X-TiDBCloud-Public-Key: <tidbcloud-public-key>" \
   -H "X-TiDBCloud-Private-Key: <tidbcloud-private-key>" \
-  "https://drive9.example.com/v1/quota?tenant_id=tnt_abc123"
+  "https://drive9.example.com/v1/admin/tenants?page=1&page_size=10&include_quota=true"
 ```
 
-The server gets the TiDB Cloud cluster before returning quota, so the response
-includes the live cluster Spending Limit.
+### GET /v1/admin/tenants/{tenant-id}
 
-### POST /v1/quota
+Get a single authorized TiDB Cloud Native tenant. The response includes quota.
 
-Set quota for a `tidb_cloud_native` tenant using TiDB Cloud credentials.
+```bash
+curl -sS \
+  -H "X-TiDBCloud-Public-Key: <tidbcloud-public-key>" \
+  -H "X-TiDBCloud-Private-Key: <tidbcloud-private-key>" \
+  "https://drive9.example.com/v1/admin/tenants/tnt_abc123"
+```
+
+### POST /v1/admin/tenants/{tenant-id}/quota
+
+Set quota for a TiDB Cloud Native tenant using TiDB Cloud credentials.
 
 ```bash
 curl -sS \
   -H "Content-Type: application/json" \
-  -X POST https://drive9.example.com/v1/quota \
+  -X POST https://drive9.example.com/v1/admin/tenants/tnt_abc123/quota \
   -d '{
-    "tenant_id": "tnt_abc123",
     "public_key": "<tidbcloud-public-key>",
     "private_key": "<tidbcloud-private-key>",
     "max_storage_size": 102400,
@@ -175,11 +180,11 @@ The quota API returns JSON errors through the standard server error shape.
 
 | Status | When it happens |
 | --- | --- |
-| `400 Bad Request` | Invalid JSON, missing `tenant_id`, missing or partial TiDB Cloud credentials, missing all settable quota fields in a set request, or an invalid quota value. |
-| `403 Forbidden` | TiDB Cloud returns unauthorized or forbidden for the supplied API key. The message is `no permission to query quota with TiDB Cloud API key` or `no permission to update quota with TiDB Cloud API key`. |
+| `400 Bad Request` | Invalid JSON, missing tenant id where required, missing or partial TiDB Cloud credentials, missing all settable quota fields in a set request, or an invalid quota value. |
+| `403 Forbidden` | TiDB Cloud returns unauthorized or forbidden for the supplied API key. |
 | `404 Not Found` | The Drive9 tenant does not exist, quota is not enabled on this server, or TiDB Cloud cannot find the backend cluster. For the backend-cluster case, check the TiDB Cloud starter/native cluster status. |
 | `409 Conflict` | The tenant provider is not `tidb_cloud_native`. |
-| `502 Bad Gateway` | TiDB Cloud returned another upstream error while querying quota, updating quota labels, or updating Spending Limit. |
+| `502 Bad Gateway` | TiDB Cloud returned another upstream error while listing managed clusters, updating quota labels, or updating Spending Limit. |
 
 ## Notes for operators
 

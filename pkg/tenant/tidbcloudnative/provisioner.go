@@ -38,9 +38,10 @@ const (
 	DefaultSpendLimit   = int32(1000)
 	stateActive         = "ACTIVE"
 
-	Drive9ManagedLabel       = "drive9.ai/managed"
-	Drive9TenantIDLabel      = "drive9.ai/tenant_id"
-	Drive9QuotaUpdateAtLabel = "drive9.ai/update_quota_at"
+	Drive9ManagedLabel         = "drive9.ai/managed"
+	Drive9TenantIDLabel        = "drive9.ai/tenant_id"
+	Drive9QuotaUpdateAtLabel   = "drive9.ai/update_quota_at"
+	TiDBCloudOrganizationLabel = "tidb.cloud/organization"
 
 	upstreamErrorBodyLimit   = 2048
 	upstreamClusterBodyLimit = 1 << 20
@@ -49,7 +50,7 @@ const (
 var (
 	immutableLabelKeys = []string{
 		"tidb.cloud/project",
-		"tidb.cloud/organization",
+		TiDBCloudOrganizationLabel,
 	}
 )
 
@@ -244,14 +245,15 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 		}
 	}
 	out := &tenant.ClusterInfo{
-		TenantID:  tenantID,
-		ClusterID: info.ClusterID,
-		Host:      info.Endpoints.Public.Host,
-		Port:      info.Endpoints.Public.Port,
-		Username:  info.Username,
-		Password:  password,
-		DBName:    dbName,
-		Provider:  tenant.ProviderTiDBCloudNative,
+		TenantID:       tenantID,
+		ClusterID:      info.ClusterID,
+		OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
+		Host:           info.Endpoints.Public.Host,
+		Port:           info.Endpoints.Public.Port,
+		Username:       info.Username,
+		Password:       password,
+		DBName:         dbName,
+		Provider:       tenant.ProviderTiDBCloudNative,
 	}
 	if out.Username == "" && info.UserPrefix != "" {
 		out.Username = info.UserPrefix + ".root"
@@ -560,6 +562,57 @@ func (p *Provisioner) GetQuota(ctx context.Context, cluster *tenant.ClusterInfo,
 	return cloudCfg, nil
 }
 
+func (p *Provisioner) ListManagedClusters(ctx context.Context, req tenant.CredentialProvisionRequest, opts tenant.ManagedClusterListOptions) (*tenant.ManagedClusterListResult, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, fmt.Errorf("public_key and private_key are required")
+	}
+	pageSize := opts.PageSize
+	if pageSize <= 0 {
+		pageSize = 100
+	}
+	values := url.Values{}
+	values.Set("pageSize", strconv.Itoa(pageSize))
+	if token := strings.TrimSpace(opts.PageToken); token != "" {
+		values.Set("pageToken", token)
+	}
+	filter := fmt.Sprintf(`labels.%q = "true"`, Drive9ManagedLabel)
+	if clusterID := strings.TrimSpace(opts.ClusterID); clusterID != "" {
+		filter = fmt.Sprintf(`clusterId = %q AND %s`, clusterID, filter)
+	}
+	values.Set("filter", filter)
+	endpoint := p.apiURL + "/v1beta1/clusters?" + values.Encode()
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("list managed clusters: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, fmt.Errorf("read cluster list error body: %w", readErr)
+		}
+		return nil, quotaStatusError("cluster list", resp.StatusCode, sanitizeUpstreamBody(raw))
+	}
+	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if readErr != nil {
+		return nil, fmt.Errorf("read cluster list body: %w", readErr)
+	}
+	list, err := parseClusterList(raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse cluster list: %w", err)
+	}
+	out := &tenant.ManagedClusterListResult{
+		Clusters:      make([]tenant.CloudClusterInfo, 0, len(list.Clusters)),
+		NextPageToken: strings.TrimSpace(list.NextPageToken),
+	}
+	for _, info := range list.Clusters {
+		out.Clusters = append(out.Clusters, cloudClusterInfoFromClusterInfo(info))
+	}
+	return out, nil
+}
+
 func (p *Provisioner) clusterQuotaInfo(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, *tenant.QuotaCloudConfig, error) {
 	endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s", p.apiURL, url.PathEscape(clusterID))
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
@@ -845,12 +898,41 @@ type branchInfo struct {
 	Username   string `json:"username"`
 }
 
+type clusterListResponse struct {
+	Clusters      []clusterInfo `json:"clusters"`
+	NextPageToken string        `json:"nextPageToken"`
+}
+
 func parseClusterInfo(raw []byte) (*clusterInfo, error) {
 	var out clusterInfo
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
+}
+
+func parseClusterList(raw []byte) (*clusterListResponse, error) {
+	var out clusterListResponse
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+func cloudClusterInfoFromClusterInfo(info clusterInfo) tenant.CloudClusterInfo {
+	labels := make(map[string]string, len(info.Labels))
+	for k, v := range info.Labels {
+		labels[k] = v
+	}
+	out := tenant.CloudClusterInfo{
+		ClusterID:      strings.TrimSpace(info.ClusterID),
+		OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
+		Labels:         labels,
+	}
+	if info.SpendingLimit != nil {
+		out.TiDBCloudSpendingLimitMonthly = ptrInt64(int64(info.SpendingLimit.Monthly))
+	}
+	return out
 }
 
 func parseBranchInfo(raw []byte) (*branchInfo, error) {

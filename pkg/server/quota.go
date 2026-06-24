@@ -150,48 +150,10 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusConflict, "quota setting is only supported for tidb_cloud_native tenants")
 		return
 	}
-	if strings.TrimSpace(t.ClusterID) == "" {
-		errJSON(w, http.StatusNotFound, quotaBackendNotFoundMessage)
-		return
-	}
-	updater, ok := s.provisioner.(tenant.QuotaUpdater)
-	if !ok {
-		errJSON(w, http.StatusNotFound, "quota setting not enabled")
-		return
-	}
-	cloudCfg, err := updater.MarkQuotaUpdateStarted(r.Context(), clusterInfoFromTenant(t), cred)
+	cloudCfg, err := s.applyQuotaSet(r.Context(), t, cred, req)
 	if err != nil {
-		writeQuotaCredentialError(w, r.Context(), err, "update")
+		writeQuotaSetError(w, r.Context(), err, "update")
 		return
-	}
-	if req.TiDBCloudSpendingLimit != nil {
-		updatedCloudCfg, err := updater.UpdateQuota(r.Context(), clusterInfoFromTenant(t), cred, tenant.QuotaUpdateOptions{
-			TiDBCloudSpendingLimitMonthly: req.TiDBCloudSpendingLimit,
-		})
-		if err != nil {
-			writeQuotaCredentialError(w, r.Context(), err, "update")
-			return
-		}
-		if cloudCfg == nil {
-			cloudCfg = updatedCloudCfg
-		} else if updatedCloudCfg != nil && updatedCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
-			cloudCfg.TiDBCloudSpendingLimitMonthly = updatedCloudCfg.TiDBCloudSpendingLimitMonthly
-		}
-	}
-	quotaPatch, err := quotaConfigPatchFromRequest(req)
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if quotaPatch.MaxStorageBytes != nil || quotaPatch.MaxFileSizeBytes != nil || quotaPatch.MaxFileCount != nil {
-		if err := s.meta.SetQuotaConfigPatch(r.Context(), t.ID, quotaPatch); err != nil {
-			errJSON(w, http.StatusInternalServerError, "quota config update failed")
-			return
-		}
-		if err := s.meta.EnsureQuotaUsageRow(r.Context(), t.ID); err != nil {
-			errJSON(w, http.StatusInternalServerError, "quota usage initialization failed")
-			return
-		}
 	}
 	setRequestMetricTenant(r.Context(), t.ID, "", t.Provider, classifyTenantRequest(r))
 	s.writeQuotaResponse(w, r, t, cloudCfg)
@@ -264,6 +226,54 @@ func (s *Server) validateQuotaSetRequest(req quotaRequest) error {
 }
 
 const maxInt32 = int64(1<<31 - 1)
+
+var (
+	errQuotaSettingNotEnabled = errors.New("quota setting not enabled")
+	errQuotaLocalUpdateFailed = errors.New("quota local update failed")
+)
+
+func (s *Server) applyQuotaSet(ctx context.Context, t *meta.Tenant, cred tenant.CredentialProvisionRequest, req quotaRequest) (*tenant.QuotaCloudConfig, error) {
+	if t == nil {
+		return nil, fmt.Errorf("tenant is required")
+	}
+	if strings.TrimSpace(t.ClusterID) == "" {
+		return nil, tenant.ErrQuotaBackendNotFound
+	}
+	updater, ok := s.provisioner.(tenant.QuotaUpdater)
+	if !ok {
+		return nil, errQuotaSettingNotEnabled
+	}
+	cloudCfg, err := updater.MarkQuotaUpdateStarted(ctx, clusterInfoFromTenant(t), cred)
+	if err != nil {
+		return nil, err
+	}
+	if req.TiDBCloudSpendingLimit != nil {
+		updatedCloudCfg, err := updater.UpdateQuota(ctx, clusterInfoFromTenant(t), cred, tenant.QuotaUpdateOptions{
+			TiDBCloudSpendingLimitMonthly: req.TiDBCloudSpendingLimit,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if cloudCfg == nil {
+			cloudCfg = updatedCloudCfg
+		} else if updatedCloudCfg != nil && updatedCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
+			cloudCfg.TiDBCloudSpendingLimitMonthly = updatedCloudCfg.TiDBCloudSpendingLimitMonthly
+		}
+	}
+	quotaPatch, err := quotaConfigPatchFromRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	if quotaPatch.MaxStorageBytes != nil || quotaPatch.MaxFileSizeBytes != nil || quotaPatch.MaxFileCount != nil {
+		if err := s.meta.SetQuotaConfigPatch(ctx, t.ID, quotaPatch); err != nil {
+			return nil, fmt.Errorf("%w: quota config update failed: %w", errQuotaLocalUpdateFailed, err)
+		}
+		if err := s.meta.EnsureQuotaUsageRow(ctx, t.ID); err != nil {
+			return nil, fmt.Errorf("%w: quota usage initialization failed: %w", errQuotaLocalUpdateFailed, err)
+		}
+	}
+	return cloudCfg, nil
+}
 
 func quotaConfigPatchFromRequest(req quotaRequest) (meta.QuotaConfigPatch, error) {
 	var patch meta.QuotaConfigPatch
@@ -380,5 +390,27 @@ func writeQuotaCredentialError(w http.ResponseWriter, ctx context.Context, err e
 	default:
 		logger.Warn(ctx, "tidbcloud_quota_failed", zap.String("action", action), zap.Error(err))
 		errJSON(w, http.StatusBadGateway, "tidbcloud quota "+action+" failed")
+	}
+}
+
+func writeQuotaSetError(w http.ResponseWriter, ctx context.Context, err error, action string) {
+	if status, msg, ok := quotaSetErrorStatusMessage(err, action); ok {
+		if errors.Is(err, errQuotaLocalUpdateFailed) {
+			logger.Warn(ctx, "drive9_quota_update_failed", zap.String("action", action), zap.Error(err))
+		}
+		errJSON(w, status, msg)
+		return
+	}
+	writeQuotaCredentialError(w, ctx, err, action)
+}
+
+func quotaSetErrorStatusMessage(err error, action string) (int, string, bool) {
+	switch {
+	case errors.Is(err, errQuotaSettingNotEnabled):
+		return http.StatusNotFound, "quota setting not enabled", true
+	case errors.Is(err, errQuotaLocalUpdateFailed):
+		return http.StatusInternalServerError, "quota " + action + " failed", true
+	default:
+		return 0, "", false
 	}
 }

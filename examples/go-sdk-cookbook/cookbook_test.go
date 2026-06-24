@@ -233,12 +233,13 @@ func ExampleClient_quota() {
 	tenantID := "tnt_abc123"
 	credentialClient := drive9.New(serverURL, "")
 
-	quota, err := credentialClient.GetQuota(ctx, drive9.QuotaRequest{
+	tenant, err := credentialClient.AdminGetTenant(ctx, drive9.QuotaRequest{
 		TenantID:   tenantID,
 		PublicKey:  tidbCloudPublicKey,
 		PrivateKey: tidbCloudPrivateKey,
 	})
-	if err == nil {
+	if err == nil && tenant.Quota != nil {
+		quota := tenant.Quota
 		_ = quota.Config.MaxStorageSize
 		_ = quota.Config.MaxFileSize
 		_ = quota.Config.MaxFileCount

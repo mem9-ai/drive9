@@ -9,130 +9,10 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 
 	"github.com/mem9-ai/drive9/pkg/client"
 )
-
-// Quota queries or updates tenant quota configuration.
-func Quota(args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("%s", quotaUsage())
-	}
-	switch args[0] {
-	case "-h", "-help", "--help", "help":
-		_, _ = fmt.Fprintln(os.Stdout, quotaUsage())
-		return nil
-	case "get":
-		return quotaGet(args[1:])
-	case "set":
-		return quotaSet(args[1:])
-	default:
-		return fmt.Errorf("unknown quota command %q\n%s", args[0], quotaUsage())
-	}
-}
-
-func quotaGet(args []string) error {
-	serverFlag := ""
-	serverGiven := false
-	regionCodeFlag := ""
-	regionCodeGiven := false
-	tenantID := ""
-	tenantIDGiven := false
-	publicKeyFlag := ""
-	publicKeyGiven := false
-	privateKeyFlag := ""
-	privateKeyGiven := false
-	asJSON := false
-
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "-h", "-help", "--help", "help":
-			_, _ = fmt.Fprintln(os.Stdout, quotaGetUsage())
-			return nil
-		case "--server":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--server requires an argument")
-			}
-			i++
-			serverFlag = args[i]
-			serverGiven = true
-		case "--region-code":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--region-code requires an argument")
-			}
-			i++
-			regionCodeFlag = args[i]
-			regionCodeGiven = true
-		case "--tenant-id":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--tenant-id requires an argument")
-			}
-			i++
-			tenantID = args[i]
-			tenantIDGiven = true
-		case "--tidbcloud-public-key":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--tidbcloud-public-key requires an argument")
-			}
-			i++
-			publicKeyFlag = args[i]
-			publicKeyGiven = true
-		case "--tidbcloud-private-key":
-			if i+1 >= len(args) {
-				return fmt.Errorf("--tidbcloud-private-key requires an argument")
-			}
-			i++
-			privateKeyFlag = args[i]
-			privateKeyGiven = true
-		case "--json":
-			asJSON = true
-		default:
-			return fmt.Errorf("unknown flag %q\n%s", args[i], quotaGetUsage())
-		}
-	}
-	if err := rejectEmptyFlag("server", strings.TrimSpace(serverFlag), serverGiven); err != nil {
-		return err
-	}
-	if err := rejectEmptyFlag("region-code", strings.TrimSpace(regionCodeFlag), regionCodeGiven); err != nil {
-		return err
-	}
-	if err := rejectEmptyFlag("tenant-id", strings.TrimSpace(tenantID), tenantIDGiven); err != nil {
-		return err
-	}
-	if err := rejectEmptyFlag("tidbcloud-public-key", strings.TrimSpace(publicKeyFlag), publicKeyGiven); err != nil {
-		return err
-	}
-	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
-		return err
-	}
-
-	r := ResolveCredentials()
-	envPublicKey := consumeEnv(EnvTiDBCloudPublicKey)
-	envPrivateKey := consumeEnv(EnvTiDBCloudPrivateKey)
-	publicKey := strings.TrimSpace(publicKeyFlag)
-	if publicKey == "" {
-		publicKey = envPublicKey
-	}
-	privateKey := strings.TrimSpace(privateKeyFlag)
-	if privateKey == "" {
-		privateKey = envPrivateKey
-	}
-	tenantID = strings.TrimSpace(tenantID)
-
-	server, err := quotaServer(serverFlag, regionCodeFlag, r.Server, true)
-	if err != nil {
-		return err
-	}
-	req, err := quotaRequest(tenantID, publicKey, privateKey)
-	if err != nil {
-		return err
-	}
-	out, err := client.New(server, "").GetQuota(context.Background(), req)
-	if err != nil {
-		return quotaAPIError("query quota", err)
-	}
-	return printQuotaCLIResponse(out, asJSON)
-}
 
 func quotaSet(args []string) error {
 	serverFlag := ""
@@ -373,25 +253,21 @@ func printQuotaCLIResponse(out *client.QuotaResponse, asJSON bool) error {
 		enc.SetIndent("", "  ")
 		return enc.Encode(out)
 	}
-	fmt.Printf("%-20s %s\n", "TenantID:", out.TenantID)
-	fmt.Printf("%-20s %d Mi\n", "MaxStorage:", out.Config.MaxStorageSize)
-	fmt.Printf("%-20s %d Mi\n", "MaxFileSize:", out.Config.MaxFileSize)
-	if out.Config.MaxFileCount == 0 {
-		fmt.Printf("%-20s %s\n", "MaxFileCount:", "unlimited")
-	} else {
-		fmt.Printf("%-20s %d\n", "MaxFileCount:", out.Config.MaxFileCount)
-	}
-	if out.Config.TiDBCloudSpendingLimit != nil {
-		fmt.Printf("%-20s %d\n", "SpendingLimit:", *out.Config.TiDBCloudSpendingLimit)
-	}
-	fmt.Printf("%-20s %s\n", "StorageUsed:", formatBytes(out.Usage.StorageBytes))
-	fmt.Printf("%-20s %s\n", "Reserved:", formatBytes(out.Usage.ReservedBytes))
-	if out.Usage.FileCount == 0 {
-		fmt.Printf("%-20s %s\n", "FileCount:", "0")
-	} else {
-		fmt.Printf("%-20s %d\n", "FileCount:", out.Usage.FileCount)
-	}
-	return nil
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(w, "TENANT_ID\tSTATUS\tMAX_STORAGE\tMAX_FILE_SIZE\tMAX_FILE_COUNT\tSPENDING_LIMIT\tSTORAGE_USED\tRESERVED\tFILE_COUNT")
+	quota := &client.AdminTenantQuota{Config: out.Config, Usage: out.Usage}
+	_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+		out.TenantID,
+		out.Status,
+		adminQuotaMaxStorage(quota),
+		adminQuotaMaxFileSize(quota),
+		adminQuotaMaxFileCount(quota),
+		adminQuotaSpendingLimit(quota),
+		adminQuotaStorageUsed(quota),
+		adminQuotaReserved(quota),
+		adminQuotaFileCount(quota),
+	)
+	return w.Flush()
 }
 
 func formatBytes(n int64) string {
@@ -411,33 +287,8 @@ func formatBytes(n int64) string {
 	return fmt.Sprintf("%.1f %s", float64(n)/float64(div), units[exp])
 }
 
-func quotaUsage() string {
-	return `usage: drive9 quota <get|set> [flags]
-
-query or set tenant quota.
-
-commands:
-  get    query TiDBCloud mode quota with TiDB Cloud credentials and tenant id
-  set    set TiDBCloud mode quota with TiDB Cloud credentials and tenant id`
-}
-
-func quotaGetUsage() string {
-	return `usage: drive9 quota get [flags]
-
-query TiDBCloud mode quota with TiDB Cloud credentials and a drive9 tenant id.
-Drive9 tenant API keys are not accepted for quota reads.
-
-flags:
-  --server URL                    server URL (default: active context server)
-  --region-code CODE              TiDBCloud mode region code; ignored when --server is set
-  --tenant-id ID                  drive9 tenant id for quota query
-  --tidbcloud-public-key KEY      TiDB Cloud public key
-  --tidbcloud-private-key KEY     TiDB Cloud private key
-  --json                          output result as JSON`
-}
-
 func quotaSetUsage() string {
-	return `usage: drive9 quota set [flags]
+	return `usage: drive9 admin quota set [flags]
 
 set quota for TiDBCloud mode tenants only. This requires TiDB Cloud credentials
 and a drive9 tenant id. Drive9 tenant API keys are not accepted as

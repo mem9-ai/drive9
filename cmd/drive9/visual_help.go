@@ -469,17 +469,18 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 			},
 		},
 		{
-			Name:    "quota",
-			Args:    "<get|set> [flags]",
-			Summary: "query or set tenant quota",
+			Name:    "admin",
+			Args:    "<tenant|quota> <command> [flags]",
+			Summary: "manage TiDBCloud Native tenants and quota",
 			Details: []string{
-				"get requires --tenant-id and TiDB Cloud keys; Drive9 API keys are not accepted",
-				"only TiDBCloud mode supports set; Drive9 API keys cannot authorize quota updates",
+				"requires TiDB Cloud keys; Drive9 API keys are not accepted",
+				"tenant list/get is read-authorized through TiDB Cloud managed cluster listing",
+				"tenant delete and quota set require TiDB Cloud cluster label patch permission",
 			},
 			Flags: []visualHelpFlag{
 				{Name: "--server URL", Desc: "server URL; defaults to active context server"},
 				{Name: "--region-code CODE", Desc: "TiDBCloud mode region code; ignored when --server is set"},
-				{Name: "--tenant-id ID", Desc: "drive9 tenant id for quota query or set"},
+				{Name: "--tenant-id ID", Desc: "drive9 tenant id for tenant get/delete or quota set"},
 				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key"},
 				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key"},
 				{Name: "--max-storage-size Mi", Desc: "quota set: max confirmed+reserved storage size in Mi"},
@@ -489,8 +490,9 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "--json", Desc: "output result as JSON"},
 			},
 			Examples: []visualHelpExample{
-				{Command: "drive9 quota get --region-code aws-ap-southeast-1 --tenant-id tnt_xxx --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "query TiDBCloud mode tenant quota"},
-				{Command: "drive9 quota set --region-code aws-ap-southeast-1 --tenant-id tnt_xxx --max-storage-size 102400 --tidbcloud-spending-limit 10000 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "set TiDBCloud mode tenant quota"},
+				{Command: "drive9 admin tenant list --region-code aws-ap-southeast-1 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key> --json", Desc: "list managed TiDBCloud Native tenants"},
+				{Command: "drive9 admin tenant get --region-code aws-ap-southeast-1 --tenant-id tnt_xxx --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "query TiDBCloud Native tenant info and quota"},
+				{Command: "drive9 admin quota set --region-code aws-ap-southeast-1 --tenant-id tnt_xxx --max-storage-size 102400 --tidbcloud-spending-limit 10000 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "set TiDBCloud Native tenant quota"},
 			},
 		},
 		{

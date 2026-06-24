@@ -8,7 +8,7 @@
 //
 //	create  provision a new database and owner context
 //	delete  delete the current tenant
-//	quota   query or set tenant quota
+//	admin   TiDB Cloud Native admin operations
 //	ctx     manage contexts (show, add, import, fork, ls, use, rm)
 //	fs      filesystem operations (cp, cat, ls, stat, mv, rm, mkdir, chmod,
 //	        symlink, hardlink, sh, grep, find, layer)
@@ -50,7 +50,7 @@ var exitFunc = os.Exit
 // is the real cli.Secret and nothing else reassigns it outside tests.
 var vaultHandler = cli.Secret
 var deleteHandler = cli.DeleteTenant
-var quotaHandler = cli.Quota
+var adminHandler = cli.Admin
 var tokenHandler = cli.Token
 var doctorHandler = cli.Doctor
 var journalHandler = cli.Journal
@@ -126,20 +126,20 @@ func dispatch(cmd string, args []string) {
 		if err := deleteHandler(args); err != nil {
 			fatal("delete", err)
 		}
-	case "quota":
+	case "admin":
 		if cliLogger != nil {
 			sub := ""
 			if len(args) > 0 {
 				sub = args[0]
 			}
-			logger.Info(context.Background(), "cli_command", zap.String("command", "quota"), zap.String("subcommand", sub))
+			logger.Info(context.Background(), "cli_command", zap.String("command", "admin"), zap.String("subcommand", sub))
 		}
-		if err := quotaHandler(args); err != nil {
+		if err := adminHandler(args); err != nil {
 			sub := ""
 			if len(args) > 0 {
 				sub = " " + args[0]
 			}
-			fatal("quota"+sub, err)
+			fatal("admin"+sub, err)
 		}
 	case "ctx":
 		if cliLogger != nil {
@@ -415,8 +415,8 @@ func usage(code int) {
 			"  delete [--server URL] [--api-key KEY] [--json]\n"+
 			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
 			"                         delete current tenant with owner API key\n"+
-			"  quota <get|set> [flags]\n"+
-			"                         query or set tenant quota\n"+
+			"  admin <tenant|quota> <command> [flags]\n"+
+			"                         TiDB Cloud Native admin operations\n"+
 			"  ctx show [--json] [--reveal]\n"+
 			"                         show current context\n"+
 			"  ctx add --api-key <key> [--name NAME] [--server URL]\n"+

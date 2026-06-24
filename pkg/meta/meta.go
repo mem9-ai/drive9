@@ -216,6 +216,19 @@ type ExternalBinding struct {
 	UpdatedAt    time.Time
 }
 
+type TenantTiDBCloudOrgBinding struct {
+	TenantID       string
+	OrganizationID string
+	ClusterID      string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+type TenantWithTiDBCloudOrgBinding struct {
+	Tenant  Tenant
+	Binding TenantTiDBCloudOrgBinding
+}
+
 type Store struct {
 	db *sql.DB
 }
@@ -512,6 +525,15 @@ func metaInitSchemaStatements() []string {
 			updated_at    DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			UNIQUE INDEX uk_external_binding_subject (provider, subject_key),
 			INDEX idx_external_binding_tenant (tenant_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS tenant_tidbcloud_org_bindings (
+			tenant_id       VARCHAR(64) PRIMARY KEY,
+			organization_id VARCHAR(64) NOT NULL,
+			cluster_id      VARCHAR(255) NOT NULL,
+			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			UNIQUE INDEX uk_tidbcloud_org_cluster (cluster_id),
+			INDEX idx_tidbcloud_org_created (organization_id, created_at, tenant_id)
 		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_api_key_fs_scopes (
 			tenant_id   VARCHAR(64) NOT NULL,
@@ -1224,6 +1246,116 @@ func (s *Store) DeleteExternalBinding(ctx context.Context, provider, subjectKey 
 	return nil
 }
 
+func (s *Store) UpsertTenantTiDBCloudOrgBinding(ctx context.Context, b *TenantTiDBCloudOrgBinding) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "upsert_tidbcloud_org_binding", start, &err)
+	if b == nil {
+		return fmt.Errorf("tidbcloud org binding is required")
+	}
+	tenantID := strings.TrimSpace(b.TenantID)
+	organizationID := strings.TrimSpace(b.OrganizationID)
+	clusterID := strings.TrimSpace(b.ClusterID)
+	if tenantID == "" {
+		return fmt.Errorf("tenant_id is required")
+	}
+	if organizationID == "" {
+		return fmt.Errorf("organization_id is required")
+	}
+	if clusterID == "" {
+		return fmt.Errorf("cluster_id is required")
+	}
+	now := time.Now().UTC()
+	createdAt := b.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	updatedAt := b.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = now
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_tidbcloud_org_bindings
+		(tenant_id, organization_id, cluster_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON DUPLICATE KEY UPDATE
+			organization_id = VALUES(organization_id),
+			cluster_id = VALUES(cluster_id),
+			updated_at = VALUES(updated_at)`,
+		tenantID, organizationID, clusterID, createdAt.UTC(), updatedAt.UTC())
+	return err
+}
+
+func (s *Store) GetTenantTiDBCloudOrgBinding(ctx context.Context, tenantID string) (out *TenantTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_tidbcloud_org_binding", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT tenant_id, organization_id, cluster_id, created_at, updated_at
+		FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID)
+	var rec TenantTiDBCloudOrgBinding
+	if err = row.Scan(&rec.TenantID, &rec.OrganizationID, &rec.ClusterID, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			err = ErrNotFound
+			return nil, err
+		}
+		return nil, err
+	}
+	return &rec, nil
+}
+
+func (s *Store) ListTenantsByTiDBCloudOrganizations(ctx context.Context, organizationIDs []string, offset, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_tenants_by_tidbcloud_orgs", start, &err)
+	organizationIDs = compactStrings(organizationIDs)
+	if len(organizationIDs) == 0 {
+		return []TenantWithTiDBCloudOrgBinding{}, nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	placeholders := make([]string, len(organizationIDs))
+	args := make([]any, 0, len(organizationIDs)+2)
+	for i, id := range organizationIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	args = append(args, limit, offset)
+	query := `SELECT
+			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
+			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
+			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
+			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
+			b.tenant_id, b.organization_id, b.cluster_id, b.created_at, b.updated_at
+		FROM tenant_tidbcloud_org_bindings b
+		JOIN tenants t ON t.id = b.tenant_id
+		WHERE b.organization_id IN (` + strings.Join(placeholders, ",") + `)
+			AND t.provider = 'tidb_cloud_native'
+			AND t.status <> 'deleted'
+		ORDER BY t.created_at DESC, t.id DESC
+		LIMIT ? OFFSET ?`
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanTenantBindingRows(rows)
+}
+
+func compactStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]bool, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKey string, fn func(context.Context) error) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "external_binding_lock", start, &err)
@@ -1609,6 +1741,50 @@ func scanTenantRows(rows *sql.Rows) ([]Tenant, error) {
 			t.ClaimExpiresAt = &ts
 		}
 		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func scanTenantBindingRows(rows *sql.Rows) ([]TenantWithTiDBCloudOrgBinding, error) {
+	out := make([]TenantWithTiDBCloudOrgBinding, 0)
+	for rows.Next() {
+		var rec TenantWithTiDBCloudOrgBinding
+		var dbTLS int
+		var clusterID sql.NullString
+		var parentTenantID sql.NullString
+		var storageNamespaceID sql.NullString
+		var claimURL sql.NullString
+		var claimExp sql.NullTime
+		var s3BucketKeyEnabled int
+		if err := rows.Scan(&rec.Tenant.ID, &rec.Tenant.Status, &rec.Tenant.Kind, &parentTenantID, &storageNamespaceID,
+			&rec.Tenant.DBHost, &rec.Tenant.DBPort, &rec.Tenant.DBUser, &rec.Tenant.DBPasswordCipher,
+			&rec.Tenant.DBName, &dbTLS, &rec.Tenant.Provider, &clusterID, &rec.Tenant.BranchID, &claimURL, &claimExp, &rec.Tenant.SchemaVersion,
+			&rec.Tenant.S3EncryptionMode, &rec.Tenant.S3KMSKeyID, &s3BucketKeyEnabled, &rec.Tenant.CreatedAt, &rec.Tenant.UpdatedAt,
+			&rec.Binding.TenantID, &rec.Binding.OrganizationID, &rec.Binding.ClusterID, &rec.Binding.CreatedAt, &rec.Binding.UpdatedAt); err != nil {
+			return nil, err
+		}
+		rec.Tenant.DBTLS = dbTLS == 1
+		rec.Tenant.S3BucketKeyEnabled = boolPtr(s3BucketKeyEnabled == 1)
+		if clusterID.Valid {
+			rec.Tenant.ClusterID = clusterID.String
+		}
+		if parentTenantID.Valid {
+			rec.Tenant.ParentTenantID = parentTenantID.String
+		}
+		if storageNamespaceID.Valid {
+			rec.Tenant.StorageNamespaceID = storageNamespaceID.String
+		}
+		if claimURL.Valid {
+			rec.Tenant.ClaimURL = claimURL.String
+		}
+		if claimExp.Valid {
+			ts := claimExp.Time.UTC()
+			rec.Tenant.ClaimExpiresAt = &ts
+		}
+		out = append(out, rec)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

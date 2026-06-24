@@ -45,9 +45,6 @@ func TestGetQuotaSendsHeadersAndDecodesResponse(t *testing.T) {
 	if gotTenantID != "tenant-1" || gotPublicKey != "public-1" || gotPrivateKey != "private-1" {
 		t.Fatalf("request credentials tenant=%q public=%q private=%q", gotTenantID, gotPublicKey, gotPrivateKey)
 	}
-	if resp.Provider != "tidb_cloud_native" {
-		t.Fatalf("provider = %q", resp.Provider)
-	}
 	if resp.Config.TiDBCloudSpendingLimit == nil || *resp.Config.TiDBCloudSpendingLimit != 10000 {
 		t.Fatalf("spending limit = %#v, want 10000", resp.Config.TiDBCloudSpendingLimit)
 	}
@@ -69,8 +66,8 @@ func TestSetQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("method = %s, want POST", r.Method)
 		}
-		if r.URL.Path != "/v1/quota" {
-			t.Fatalf("path = %q, want /v1/quota", r.URL.Path)
+		if r.URL.Path != "/v1/admin/tenants/tenant-1/quota" {
+			t.Fatalf("path = %q, want /v1/admin/tenants/tenant-1/quota", r.URL.Path)
 		}
 		gotAuth = r.Header.Get("Authorization")
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
@@ -95,8 +92,8 @@ func TestSetQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
 	if gotBody["max_storage_size"] != float64(1000) {
 		t.Fatalf("request body = %#v", gotBody)
 	}
-	if len(gotBody) != 4 {
-		t.Fatalf("request body = %#v, want only tenant_id, public_key, private_key, and max_storage_size", gotBody)
+	if len(gotBody) != 3 {
+		t.Fatalf("request body = %#v, want only public_key, private_key, and max_storage_size", gotBody)
 	}
 	if resp.Config.MaxStorageSize != 1000 {
 		t.Fatalf("max storage size = %d, want 1000", resp.Config.MaxStorageSize)
@@ -136,8 +133,8 @@ func TestSetQuotaPostsFileLimits(t *testing.T) {
 	if gotBody["max_file_size"] != float64(64) || gotBody["max_file_count"] != float64(42) {
 		t.Fatalf("request body = %#v", gotBody)
 	}
-	if len(gotBody) != 5 {
-		t.Fatalf("request body = %#v, want tenant_id, public_key, private_key, max_file_size, and max_file_count", gotBody)
+	if len(gotBody) != 4 {
+		t.Fatalf("request body = %#v, want public_key, private_key, max_file_size, and max_file_count", gotBody)
 	}
 }
 
@@ -151,8 +148,8 @@ func TestSetQuotaPostsSpendingLimit(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Fatalf("method = %s, want POST", r.Method)
 		}
-		if r.URL.Path != "/v1/quota" {
-			t.Fatalf("path = %q, want /v1/quota", r.URL.Path)
+		if r.URL.Path != "/v1/admin/tenants/tenant-1/quota" {
+			t.Fatalf("path = %q, want /v1/admin/tenants/tenant-1/quota", r.URL.Path)
 		}
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Fatalf("decode request: %v", err)
@@ -174,8 +171,8 @@ func TestSetQuotaPostsSpendingLimit(t *testing.T) {
 	if gotBody["tidbcloud_spending_limit"] != float64(20000) {
 		t.Fatalf("request body = %#v", gotBody)
 	}
-	if len(gotBody) != 5 {
-		t.Fatalf("request body = %#v, want tenant_id, public_key, private_key, max_storage_size, and tidbcloud_spending_limit", gotBody)
+	if len(gotBody) != 4 {
+		t.Fatalf("request body = %#v, want public_key, private_key, max_storage_size, and tidbcloud_spending_limit", gotBody)
 	}
 }
 
@@ -207,10 +204,8 @@ func TestGetQuotaReturnsStatusError(t *testing.T) {
 
 func quotaClientTestResponse(tenantID string) map[string]any {
 	return map[string]any{
-		"tenant_id":       tenantID,
-		"provider":        "tidb_cloud_native",
-		"status":          "active",
-		"supports_update": true,
+		"tenant_id": tenantID,
+		"status":    "active",
 		"config": map[string]any{
 			"max_storage_size":         1000,
 			"max_file_size":            64,

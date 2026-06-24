@@ -83,7 +83,7 @@ func TestDispatchLongHelpFlagShowsUsage(t *testing.T) {
 		"usage: drive9 <command> [arguments]",
 		"create [--name NAME] [--region-code CODE] [--server URL] [--json]",
 		"delete [--server URL] [--api-key KEY] [--json]",
-		"quota <get|set> [flags]",
+		"admin <tenant|quota> <command> [flags]",
 		"ctx show [--json] [--reveal]",
 		"ctx use <name>",
 		"token <issue|revoke>",
@@ -560,29 +560,29 @@ func TestDispatchDeleteVerbReachesHandler(t *testing.T) {
 	}
 }
 
-func TestDispatchQuotaVerbReachesHandler(t *testing.T) {
-	origHandler := quotaHandler
+func TestDispatchAdminVerbReachesHandler(t *testing.T) {
+	origHandler := adminHandler
 	origExit := exitFunc
 	t.Cleanup(func() {
-		quotaHandler = origHandler
+		adminHandler = origHandler
 		exitFunc = origExit
 	})
 	exitFunc = func(int) {}
 
 	var gotArgs []string
 	called := false
-	quotaHandler = func(args []string) error {
+	adminHandler = func(args []string) error {
 		called = true
 		gotArgs = args
 		return nil
 	}
 
-	dispatch("quota", []string{"get", "--json"})
+	dispatch("admin", []string{"quota", "get", "--json"})
 
 	if !called {
-		t.Fatal("quota handler was not invoked for `drive9 quota ...`")
+		t.Fatal("admin handler was not invoked for `drive9 admin ...`")
 	}
-	want := []string{"get", "--json"}
+	want := []string{"quota", "get", "--json"}
 	if len(gotArgs) != len(want) {
 		t.Fatalf("args = %v, want %v", gotArgs, want)
 	}
@@ -590,6 +590,61 @@ func TestDispatchQuotaVerbReachesHandler(t *testing.T) {
 		if gotArgs[i] != want[i] {
 			t.Fatalf("args[%d] = %q, want %q", i, gotArgs[i], want[i])
 		}
+	}
+}
+
+func TestDispatchQuotaVerbIsRejected(t *testing.T) {
+	origHandler := adminHandler
+	origExit := exitFunc
+	origStderr := os.Stderr
+	origStop := cpuProfileStop
+	t.Cleanup(func() {
+		adminHandler = origHandler
+		exitFunc = origExit
+		os.Stderr = origStderr
+		cpuProfileStop = origStop
+	})
+	cpuProfileStop = func() {}
+
+	handlerCalled := false
+	adminHandler = func(args []string) error {
+		handlerCalled = true
+		return nil
+	}
+	var exitCodes []int
+	exitFunc = func(code int) { exitCodes = append(exitCodes, code) }
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+
+	dispatch("quota", []string{"get"})
+
+	_ = w.Close()
+	stderr := <-done
+	if handlerCalled {
+		t.Fatal("admin handler was invoked for old top-level `drive9 quota ...` command")
+	}
+	if !strings.Contains(stderr, `drive9: unknown command "quota"`) {
+		t.Fatalf("stderr = %q, want it to contain `drive9: unknown command \"quota\"`", stderr)
+	}
+	found2 := false
+	for _, c := range exitCodes {
+		if c == 2 {
+			found2 = true
+			break
+		}
+	}
+	if !found2 {
+		t.Fatalf("exit codes = %v, want exit(2) from usage() after unknown command", exitCodes)
 	}
 }
 
