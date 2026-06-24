@@ -101,6 +101,7 @@ type Dat9Backend struct {
 	quotaSource        QuotaSource    // "tenant" (default) or "server"
 	quotaConfigCache   *quotaConfigCache
 	quotaUsageCache    *quotaUsageCache
+	quotaPendingCache  *quotaPendingDeltasCache
 
 	// mutationQueue decouples central quota mutations (syncCentralFileCreate,
 	// syncCentralFileOverwrite) from the fsync critical path. Mutations are
@@ -314,6 +315,7 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		return err
 	}
 	if quotaOutboxEnqueued {
+		b.addLocalQuotaPendingDeltas(0, 1, 0)
 		b.notifyQuotaOutbox(true)
 	} else {
 		b.syncCentralFileCreate(ctx, fileID, 0, "")
@@ -394,6 +396,11 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 		return err
 	}
 	if quotaOutboxEnqueued {
+		mediaDelta := int64(0)
+		if isQuotaMediaContentType(symlinkContentType) {
+			mediaDelta = 1
+		}
+		b.addLocalQuotaPendingDeltas(int64(len(data)), 1, mediaDelta)
 		b.notifyQuotaOutbox(true)
 	} else {
 		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), symlinkContentType)
@@ -953,6 +960,11 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		centralQuotaStart = time.Now()
 	}
 	if quotaOutboxEnqueued {
+		mediaDelta := int64(0)
+		if isQuotaMediaContentType(contentType) {
+			mediaDelta = 1
+		}
+		b.addLocalQuotaPendingDeltas(int64(len(data)), 1, mediaDelta)
 		b.notifyQuotaOutbox(true)
 	} else {
 		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
@@ -1223,6 +1235,11 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		centralQuotaStart = time.Now()
 	}
 	if quotaOutboxEnqueued {
+		b.addLocalQuotaPendingDeltas(
+			int64(len(finalData))-nf.File.SizeBytes,
+			0,
+			quotaMediaDelta(isQuotaMediaContentType(nf.File.ContentType), isQuotaMediaContentType(contentType)),
+		)
 		b.notifyQuotaOutbox(true)
 	} else {
 		b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)

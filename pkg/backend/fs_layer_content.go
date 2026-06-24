@@ -177,6 +177,11 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 			return 0, err
 		}
 		if quotaOutboxEnqueued {
+			mediaDelta := int64(0)
+			if isQuotaMediaContentType(contentType) {
+				mediaDelta = 1
+			}
+			b.addLocalQuotaPendingDeltas(entry.SizeBytes, 1, mediaDelta)
 			b.notifyQuotaOutbox(true)
 		} else {
 			b.syncCentralFileCreate(ctx, fileID, entry.SizeBytes, contentType)
@@ -251,6 +256,11 @@ func (b *Dat9Backend) WriteStoredObjectCtxIfRevision(ctx context.Context, path s
 		return 0, err
 	}
 	if quotaOutboxEnqueued {
+		b.addLocalQuotaPendingDeltas(
+			entry.SizeBytes-oldSize,
+			0,
+			quotaMediaDelta(isQuotaMediaContentType(oldContentType), isQuotaMediaContentType(contentType)),
+		)
 		b.notifyQuotaOutbox(true)
 	} else {
 		b.syncCentralFileOverwrite(ctx, nf.File.FileID, oldSize, oldContentType, entry.SizeBytes, contentType)

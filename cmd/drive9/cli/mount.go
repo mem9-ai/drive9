@@ -153,7 +153,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	fs.Var(&remoteOnlyPatterns, "remote-only", "remote-persistent override path pattern for overlay routing (repeatable)")
 	fs.Var(&unpackArchives, "unpack", "restore a drive9 pack archive into --local-root before mounting (repeatable)")
 	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
-	dirCacheMaxEntries := fs.Int("dir-cache-max-entries", 100000, "maximum entries per directory in namespace cache before complete marking is disabled")
+	dirCacheMaxEntries := fs.Int("dir-cache-max-entries", 200000, "maximum entries per directory in namespace cache before complete marking is disabled")
 	commitQueueMaxPending := fs.Int("commit-queue-max-pending", 100, "maximum pending entries in CommitQueue before backpressure")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")

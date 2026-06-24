@@ -164,6 +164,39 @@ func TestQuotaUsageCacheUsesTTL(t *testing.T) {
 	}
 }
 
+func TestQuotaPendingDeltasCacheUsesTTLAndLocalAdjustments(t *testing.T) {
+	var calls atomic.Int64
+	storage := int64(10)
+	file := int64(1)
+	media := int64(0)
+	c := newQuotaPendingDeltasCache(func(context.Context) (int64, int64, int64, error) {
+		calls.Add(1)
+		return storage, file, media, nil
+	}, time.Hour)
+
+	first, ok := c.get(context.Background())
+	if !ok {
+		t.Fatal("first get failed")
+	}
+	if first.storageDelta != 10 || first.fileDelta != 1 || first.mediaDelta != 0 {
+		t.Fatalf("first deltas = %+v, want 10/1/0", first)
+	}
+
+	storage = 99
+	file = 9
+	c.add(5, 2, 1)
+	second, ok := c.get(context.Background())
+	if !ok {
+		t.Fatal("second get failed")
+	}
+	if second.storageDelta != 15 || second.fileDelta != 3 || second.mediaDelta != 1 {
+		t.Fatalf("second deltas = %+v, want 15/3/1", second)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("loader calls = %d, want 1", got)
+	}
+}
+
 func TestQuotaConfigCacheStop(t *testing.T) {
 	store := newCacheTestStore()
 	c := newQuotaConfigCache("t1", store)

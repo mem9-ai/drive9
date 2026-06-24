@@ -19,6 +19,11 @@ const (
 	// reuse central usage counters. Strict upload reservations still read
 	// central usage directly.
 	quotaUsageCacheTTL = 100 * time.Millisecond
+	// quotaPendingDeltasCacheTTL bounds tenant-local pending outbox aggregate
+	// reuse for soft small-write checks. The cache is adjusted for mutations
+	// enqueued/acked by this backend instance and periodically reloads to see
+	// other servers.
+	quotaPendingDeltasCacheTTL = 100 * time.Millisecond
 )
 
 type quotaConfigSnapshot struct {
@@ -26,13 +31,9 @@ type quotaConfigSnapshot struct {
 	version string
 }
 
-// quotaConfigCache is a per-tenant cache for low-frequency quota config.
-//
-// It intentionally does not cache usage counters. In multi-server deployments,
-// storage_bytes/reserved_bytes/file_count/media_file_count are high-churn shared
-// state, so quota checks read those counters from the central DB directly. This
-// cache only removes repeated config reads and uses version polling so config
-// changes converge without a cross-server invalidation channel.
+// quotaConfigCache is a per-tenant cache for low-frequency quota config. It
+// only removes repeated config reads and uses version polling so config changes
+// converge without a cross-server invalidation channel.
 type quotaConfigCache struct {
 	tenantID string
 	store    MetaQuotaStore
@@ -208,4 +209,80 @@ func (c *quotaUsageCache) get(ctx context.Context) *QuotaUsageView {
 	copied := *usage
 	metrics.RecordOperation("server_quota", "usage_cache", "load_ok", time.Since(start))
 	return &copied
+}
+
+type quotaPendingDeltas struct {
+	storageDelta int64
+	fileDelta    int64
+	mediaDelta   int64
+}
+
+type quotaPendingDeltasSnapshot struct {
+	deltas    quotaPendingDeltas
+	expiresAt time.Time
+}
+
+type quotaPendingDeltasLoader func(context.Context) (storageDelta, fileDelta, mediaDelta int64, err error)
+
+// quotaPendingDeltasCache avoids SUM(quota_outbox) on every small write. It is
+// only used by soft admission checks; strict upload reservation still reads the
+// tenant DB directly.
+type quotaPendingDeltasCache struct {
+	load quotaPendingDeltasLoader
+	ttl  time.Duration
+
+	mu       sync.Mutex
+	snapshot *quotaPendingDeltasSnapshot
+}
+
+func newQuotaPendingDeltasCache(load quotaPendingDeltasLoader, ttl time.Duration) *quotaPendingDeltasCache {
+	if ttl <= 0 {
+		ttl = quotaPendingDeltasCacheTTL
+	}
+	return &quotaPendingDeltasCache{load: load, ttl: ttl}
+}
+
+func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, bool) {
+	if c == nil || c.load == nil {
+		return quotaPendingDeltas{}, false
+	}
+	now := time.Now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.snapshot != nil && now.Before(c.snapshot.expiresAt) {
+		return c.snapshot.deltas, true
+	}
+
+	start := time.Now()
+	storageDelta, fileDelta, mediaDelta, err := c.load(ctx)
+	if err != nil {
+		logger.Warn(ctx, "server_quota_pending_outbox_delta_fail_open", zap.Error(err))
+		metrics.RecordOperation("server_quota", "pending_delta_cache", "load_error", time.Since(start))
+		return quotaPendingDeltas{}, false
+	}
+	deltas := quotaPendingDeltas{
+		storageDelta: storageDelta,
+		fileDelta:    fileDelta,
+		mediaDelta:   mediaDelta,
+	}
+	c.snapshot = &quotaPendingDeltasSnapshot{
+		deltas:    deltas,
+		expiresAt: now.Add(c.ttl),
+	}
+	metrics.RecordOperation("server_quota", "pending_delta_cache", "load_ok", time.Since(start))
+	return deltas, true
+}
+
+func (c *quotaPendingDeltasCache) add(storageDelta, fileDelta, mediaDelta int64) {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.snapshot == nil || time.Now().After(c.snapshot.expiresAt) {
+		return
+	}
+	c.snapshot.deltas.storageDelta += storageDelta
+	c.snapshot.deltas.fileDelta += fileDelta
+	c.snapshot.deltas.mediaDelta += mediaDelta
 }

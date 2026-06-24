@@ -351,6 +351,12 @@ func (b *Dat9Backend) pendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx
 	if b.store == nil || tx == nil {
 		return 0, 0, 0, true
 	}
+	if b.quotaPendingCache != nil {
+		deltas, ok := b.quotaPendingCache.get(ctx)
+		if ok {
+			return deltas.storageDelta, deltas.fileDelta, deltas.mediaDelta, true
+		}
+	}
 	storageDelta, fileDelta, mediaDelta, err := b.store.PendingQuotaOutboxDeltasTx(tx)
 	if err != nil {
 		logger.Warn(ctx, "server_quota_pending_outbox_delta_fail_open",
@@ -358,6 +364,12 @@ func (b *Dat9Backend) pendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx
 		return 0, 0, 0, false
 	}
 	return storageDelta, fileDelta, mediaDelta, true
+}
+
+func (b *Dat9Backend) addLocalQuotaPendingDeltas(storageDelta, fileDelta, mediaDelta int64) {
+	if b.quotaPendingCache != nil {
+		b.quotaPendingCache.add(storageDelta, fileDelta, mediaDelta)
+	}
 }
 
 func (r storageQuotaCheckResult) exceeded() bool {
