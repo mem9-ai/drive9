@@ -265,6 +265,37 @@ func TestMissingTableAndIndexDiffsIncludesExternalIndexes(t *testing.T) {
 	}
 }
 
+func TestQuotaOutboxMissingFileOrderIndexIsRepairable(t *testing.T) {
+	spec, err := tidbSchemaSpecForMode(TiDBEmbeddingModeAuto)
+	if err != nil {
+		t.Fatalf("schema spec: %v", err)
+	}
+	table := mustTableSpecFromSchemaSpec(t, spec, "quota_outbox")
+	meta := tidbTableMeta{
+		tableName: table.name,
+		columns:   make(map[string]tidbColumnMeta, len(table.columns)),
+	}
+	for name, col := range table.columns {
+		meta.columns[name] = tidbColumnMeta{columnType: col.columnType}
+	}
+	observedIndexes := make(map[string]struct{}, len(table.indexes))
+	for name := range table.indexes {
+		if name == "idx_quota_outbox_file_order" {
+			continue
+		}
+		observedIndexes[strings.ToLower(name)] = struct{}{}
+	}
+
+	diffs := diffTiDBTableMetaWithObservedIndexes(table, meta, "", observedIndexes, true)
+	if !hasDiffKindAndDetail(diffs, tidbSchemaDiffMissingIndex, "idx_quota_outbox_file_order") {
+		t.Fatalf("expected missing file-order index diff, got %#v", diffs)
+	}
+	repairs := plannedTiDBSchemaRepairs(diffs)
+	if len(repairs) != 1 || repairs[0] != "CREATE INDEX idx_quota_outbox_file_order ON quota_outbox(file_id, status, id)" {
+		t.Fatalf("unexpected repairs for missing quota_outbox file-order index: %#v", repairs)
+	}
+}
+
 func TestPlannedTiDBSchemaRepairsIncludesSafeStatementsOnly(t *testing.T) {
 	diffs := []tidbSchemaDiff{
 		{kind: tidbSchemaDiffMissingTable, tableName: "semantic_tasks", repairSQL: "CREATE TABLE IF NOT EXISTS semantic_tasks (...)"},
