@@ -71,7 +71,7 @@ func TestQuotaGetUsesTenantIDAndTiDBCloudHeaders(t *testing.T) {
 	if !strings.Contains(stdout, "MaxFileCount:") || !strings.Contains(stdout, "42") {
 		t.Fatalf("stdout should include max file count: %s", stdout)
 	}
-	if !strings.Contains(stdout, "SpendingLimit:") || !strings.Contains(stdout, "$100.00") {
+	if !strings.Contains(stdout, "SpendingLimit:") || !strings.Contains(stdout, "100.00") {
 		t.Fatalf("stdout should include spending limit: %s", stdout)
 	}
 	if !strings.Contains(stdout, "StorageUsed:") || !strings.Contains(stdout, "1 B") {

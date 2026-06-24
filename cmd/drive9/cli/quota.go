@@ -382,7 +382,7 @@ func printQuotaCLIResponse(out *client.QuotaResponse, asJSON bool) error {
 		fmt.Printf("%-20s %d\n", "MaxFileCount:", out.Config.MaxFileCount)
 	}
 	if out.Config.TiDBCloudSpendingLimit != nil {
-		fmt.Printf("%-20s $%.2f\n", "SpendingLimit:", float64(*out.Config.TiDBCloudSpendingLimit)/100)
+		fmt.Printf("%-20s %.2f\n", "SpendingLimit:", float64(*out.Config.TiDBCloudSpendingLimit)/100)
 	}
 	fmt.Printf("%-20s %s\n", "StorageUsed:", formatBytes(out.Usage.StorageBytes))
 	fmt.Printf("%-20s %s\n", "Reserved:", formatBytes(out.Usage.ReservedBytes))
