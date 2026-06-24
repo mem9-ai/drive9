@@ -5716,15 +5716,28 @@ func (fs *Dat9FS) lockWritableRemoteCommitPath(p string) func() {
 	if fs == nil || p == "" {
 		return func() {}
 	}
+	var timeout time.Duration
+	if fs.opts != nil {
+		timeout = fs.opts.RemoteCommitWaitTimeout
+	}
+	deadline := time.Now().Add(timeout)
 	for {
+		if timeout > 0 && time.Now().After(deadline) {
+			fs.debugf("lockWritableRemoteCommitPath: timeout (%s) waiting for %s, proceeding anyway", timeout, p)
+			return fs.lockRemoteCommitPath(p)
+		}
 		if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
-			fs.commitQueue.WaitPath(p)
+			if !fs.commitQueue.WaitPathTimeout(p, 50*time.Millisecond) {
+				continue // timed out this poll, recheck deadline on next loop
+			}
 			continue
 		}
 		unlockRemoteCommit := fs.lockRemoteCommitPath(p)
 		if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
 			unlockRemoteCommit()
-			fs.commitQueue.WaitPath(p)
+			if !fs.commitQueue.WaitPathTimeout(p, 50*time.Millisecond) {
+				continue
+			}
 			continue
 		}
 		return unlockRemoteCommit

@@ -7973,6 +7973,39 @@ func TestWaitQueuedRemoteCommitBeforeWriteBlocksUntilQueuedCommitDone(t *testing
 	}
 }
 
+func TestLockWritableRemoteCommitPathTimeoutProceedsAfterDeadline(t *testing.T) {
+	// Verify that lockWritableRemoteCommitPath returns within a bounded
+	// timeout even when the commit queue never releases the path.
+	path := "/repo/stuck.bin"
+	entry := &CommitEntry{Path: path}
+	cq := &CommitQueue{
+		queue:        []*CommitEntry{entry},
+		queuedByPath: make(map[string]map[*CommitEntry]struct{}),
+		inFlight:     make(map[string]*CommitEntry),
+	}
+	cq.rebuildQueuedIndexLocked()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	// Use a short timeout for the test so we don't wait 30s.
+	opts.RemoteCommitWaitTimeout = 200 * time.Millisecond
+	fs := &Dat9FS{commitQueue: cq, opts: opts}
+	fs.remoteCommitLocks = make(map[string]*sync.Mutex)
+
+	start := time.Now()
+	unlock := fs.lockWritableRemoteCommitPath(path)
+	elapsed := time.Since(start)
+	unlock()
+
+	// Should have waited at least ~200ms (the timeout) but not more than ~2s.
+	if elapsed < 150*time.Millisecond {
+		t.Fatalf("lockWritableRemoteCommitPath returned in %s, expected >= 150ms (timeout)", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("lockWritableRemoteCommitPath returned in %s, expected < 2s (timeout bounded)", elapsed)
+	}
+}
+
 func TestCodingAgentLocalOverlayFlushSkipsSyncForGeneratedPath(t *testing.T) {
 	var syncCalls atomic.Int32
 	previousSync := syncOpenLocalFile

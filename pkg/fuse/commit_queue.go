@@ -546,6 +546,22 @@ func (cq *CommitQueue) WaitPath(path string) {
 	}
 }
 
+// WaitPathTimeout is like WaitPath but returns false if the path is still
+// busy after pollInterval. Returns true immediately if the path is idle.
+// Callers should use this in a loop with their own deadline to bound wait time.
+func (cq *CommitQueue) WaitPathTimeout(path string, pollInterval time.Duration) bool {
+	cq.mu.Lock()
+	cq.forceDelayedPathLocked(path)
+	_, inflight := cq.inFlight[path]
+	queued := cq.hasQueuedPathLocked(path)
+	cq.mu.Unlock()
+	if !inflight && !queued {
+		return true
+	}
+	time.Sleep(pollInterval)
+	return false
+}
+
 // HasPath reports whether a path is queued or currently in flight.
 func (cq *CommitQueue) HasPath(path string) bool {
 	if cq == nil {
