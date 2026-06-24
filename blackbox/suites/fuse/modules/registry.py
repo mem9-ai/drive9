@@ -10,6 +10,7 @@ from .community_pjdfstest import CommunityPjdfstest
 from .community_pyxattr import CommunityPyxattr
 from .community_vdbench import CommunityVdbench
 from .drive9_customer_kimi_perf import Drive9KimiPerf
+from .drive9_customer_manus_perf import Drive9ManusPerf
 from .drive9_workflow_auto_pack_profile import Drive9AutoPackProfile
 from .drive9_workflow_auto_pack_umount_path import Drive9AutoPackUmountPath
 from .drive9_workflow_git_blobless import Drive9GitBlobless
@@ -58,5 +59,6 @@ def module_registry() -> dict[str, BaseModule]:
         Drive9WorkflowPerf(),
         Drive9LocalOverlayBuild(),
         Drive9KimiPerf(),
+        Drive9ManusPerf(),
     ]
     return {module.id: module for module in modules}

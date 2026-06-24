@@ -35,6 +35,29 @@
     }
   },
   {
+    "id": "cruip-tailwind-dashboard",
+    "url": "https://github.com/cruip/tailwind-dashboard-template.git",
+    "ref": "main",
+    "build_dir": ".",
+    "install": [
+      "corepack enable",
+      "corepack pnpm install --frozen-lockfile"
+    ],
+    "build": [
+      "corepack pnpm run build"
+    ],
+    "source_extensions": [
+      ".ts",
+      ".tsx",
+      ".js",
+      ".jsx",
+      ".css",
+      ".html",
+      ".json"
+    ],
+    "timeout_seconds": 1800
+  },
+  {
     "id": "kimi-code",
     "url": "https://github.com/MoonshotAI/kimi-code.git",
     "ref": "main",

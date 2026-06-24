@@ -23,7 +23,8 @@
       "drive9.workflow.local_overlay_build"
     ],
     "customer": [
-      "drive9.customer.kimi_perf"
+      "drive9.customer.kimi_perf",
+      "drive9.customer.manus_perf"
     ]
   },
   "modules": {
@@ -183,6 +184,99 @@
           "bytes": 10737418240,
           "files": 100000,
           "mount_repeats": 3
+        }
+      }
+    },
+    "drive9.customer.manus_perf": {
+      "selected_scales": [
+        "S"
+      ],
+      "profile": "coding-agent",
+      "durability": "auto",
+      "infinite_ttl_read_cache_s": 0,
+      "runs": 1,
+      "agent_counts": [
+        2,
+        4
+      ],
+      "small_file_sizes": [
+        1024,
+        20480,
+        102400
+      ],
+      "small_file_concurrency": [
+        1,
+        4,
+        16
+      ],
+      "small_file_ops": 50,
+      "write_sync_sizes": [
+        1024,
+        20480,
+        102400,
+        524288,
+        2097152
+      ],
+      "write_sync_ops": 50,
+      "write_sync_concurrency": [
+        1,
+        4
+      ],
+      "namespace_stat_samples": 1000,
+      "namespace_op_samples": 200,
+      "visibility_timeout_s": 30,
+      "cache_invalidation_samples": 30,
+      "routing_sizes": [
+        1024,
+        102400,
+        524288,
+        2097151,
+        2097152,
+        4194304
+      ],
+      "large_file_sizes": [
+        4194304,
+        16777216
+      ],
+      "large_file_ops": 10,
+      "extra_repo_id": "cruip-tailwind-dashboard",
+      "extra_storages": [
+        "local",
+        "fuse-writeback",
+        "fuse-write-sync"
+      ],
+      "extra_profiles": [
+        "coding-agent",
+        "none"
+      ],
+      "extra_runs": 1,
+      "raw_results": true,
+      "sections": {
+        "multi_session_shared": true,
+        "cross_visibility": true,
+        "concurrent_distinct": true,
+        "concurrent_same_file": true,
+        "namespace_ops": true,
+        "write_sync_small": true,
+        "cache_invalidation": true,
+        "routing_2mb": true,
+        "large_file_s3": true,
+        "single_session": true,
+        "file_lock": true,
+        "extra_clone_build": true
+      },
+      "scales": {
+        "S": {
+          "bytes": 104857600,
+          "files": 1000
+        },
+        "M": {
+          "bytes": 1073741824,
+          "files": 10000
+        },
+        "L": {
+          "bytes": 10737418240,
+          "files": 100000
         }
       }
     }
