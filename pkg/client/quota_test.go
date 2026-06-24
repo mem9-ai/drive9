@@ -56,7 +56,7 @@ func TestGetQuotaSendsHeadersAndDecodesResponse(t *testing.T) {
 	}
 }
 
-func TestSetQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
+func TestAdminSetTenantQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
 	t.Parallel()
 
 	storageSize := int64(1000)
@@ -77,14 +77,14 @@ func TestSetQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	resp, err := New(srv.URL, "").SetQuota(context.Background(), QuotaSetRequest{
+	resp, err := New(srv.URL, "").AdminSetTenantQuota(context.Background(), QuotaSetRequest{
 		TenantID:       "tenant-1",
 		PublicKey:      "public-1",
 		PrivateKey:     "private-1",
 		MaxStorageSize: &storageSize,
 	})
 	if err != nil {
-		t.Fatalf("SetQuota: %v", err)
+		t.Fatalf("AdminSetTenantQuota: %v", err)
 	}
 	if gotAuth != "" {
 		t.Fatalf("Authorization = %q, want empty", gotAuth)
@@ -103,7 +103,7 @@ func TestSetQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
 	}
 }
 
-func TestSetQuotaPostsFileLimits(t *testing.T) {
+func TestAdminSetTenantQuotaPostsFileLimits(t *testing.T) {
 	t.Parallel()
 
 	fileSize := int64(64)
@@ -120,7 +120,7 @@ func TestSetQuotaPostsFileLimits(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := New(srv.URL, "").SetQuota(context.Background(), QuotaSetRequest{
+	_, err := New(srv.URL, "").AdminSetTenantQuota(context.Background(), QuotaSetRequest{
 		TenantID:     "tenant-1",
 		PublicKey:    "public-1",
 		PrivateKey:   "private-1",
@@ -128,7 +128,7 @@ func TestSetQuotaPostsFileLimits(t *testing.T) {
 		MaxFileCount: &fileCount,
 	})
 	if err != nil {
-		t.Fatalf("SetQuota: %v", err)
+		t.Fatalf("AdminSetTenantQuota: %v", err)
 	}
 	if gotBody["max_file_size"] != float64(64) || gotBody["max_file_count"] != float64(42) {
 		t.Fatalf("request body = %#v", gotBody)
@@ -138,7 +138,7 @@ func TestSetQuotaPostsFileLimits(t *testing.T) {
 	}
 }
 
-func TestSetQuotaPostsSpendingLimit(t *testing.T) {
+func TestAdminSetTenantQuotaPostsSpendingLimit(t *testing.T) {
 	t.Parallel()
 
 	storageSize := int64(1000)
@@ -158,7 +158,7 @@ func TestSetQuotaPostsSpendingLimit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := New(srv.URL, "").SetQuota(context.Background(), QuotaSetRequest{
+	_, err := New(srv.URL, "").AdminSetTenantQuota(context.Background(), QuotaSetRequest{
 		TenantID:               "tenant-1",
 		PublicKey:              "public-1",
 		PrivateKey:             "private-1",
@@ -166,7 +166,7 @@ func TestSetQuotaPostsSpendingLimit(t *testing.T) {
 		TiDBCloudSpendingLimit: &spendingLimit,
 	})
 	if err != nil {
-		t.Fatalf("SetQuota: %v", err)
+		t.Fatalf("AdminSetTenantQuota: %v", err)
 	}
 	if gotBody["tidbcloud_spending_limit"] != float64(20000) {
 		t.Fatalf("request body = %#v", gotBody)

@@ -251,7 +251,7 @@ func ExampleClient_quota() {
 	fileSize := int64(1024)          // Mi
 	fileCount := int64(100000)
 	spendingLimit := int64(10000)
-	_, _ = credentialClient.SetQuota(ctx, drive9.QuotaSetRequest{
+	_, _ = credentialClient.AdminSetTenantQuota(ctx, drive9.QuotaSetRequest{
 		TenantID:               tenantID,
 		PublicKey:              tidbCloudPublicKey,
 		PrivateKey:             tidbCloudPrivateKey,

@@ -155,7 +155,7 @@ func quotaSet(args []string) error {
 	if err != nil {
 		return err
 	}
-	out, err := client.New(server, "").SetQuota(context.Background(), client.QuotaSetRequest{
+	out, err := client.New(server, "").AdminSetTenantQuota(context.Background(), client.QuotaSetRequest{
 		TenantID:               cred.TenantID,
 		PublicKey:              cred.PublicKey,
 		PrivateKey:             cred.PrivateKey,
