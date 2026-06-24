@@ -992,6 +992,9 @@ func (p *Provisioner) WaitForBranchUserWithCredentials(ctx context.Context, clus
 		if err != nil {
 			return "", err
 		}
+		if info.Username != "" {
+			return info.Username, nil
+		}
 		if info.UserPrefix != "" {
 			return info.UserPrefix + ".root", nil
 		}

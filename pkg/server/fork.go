@@ -347,18 +347,27 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		return nil, err
 	}
 	if err := s.copyAutoEmbeddingProfileForFork(ctx, source.ID, forkID, source.Provider, now); err != nil {
-		s.markForkFailed(ctx, forkID)
+		s.deleteForkBranchOrPersist(ctx, forkID, credentialReq, nil)
+		if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantDeleted); err != nil {
+			logger.Error(ctx, "fork_pre_api_key_mark_deleted_failed", zap.String("tenant_id", forkID), zap.Error(err))
+		}
 		return nil, err
 	}
 
 	apiToken, err := token.IssueToken(s.tokenSecret, forkID, 1)
 	if err != nil {
-		s.markForkFailed(ctx, forkID)
+		s.deleteForkBranchOrPersist(ctx, forkID, credentialReq, nil)
+		if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantDeleted); err != nil {
+			logger.Error(ctx, "fork_pre_api_key_mark_deleted_failed", zap.String("tenant_id", forkID), zap.Error(err))
+		}
 		return nil, err
 	}
 	cipherToken, err := s.pool.Encrypt(ctx, []byte(apiToken))
 	if err != nil {
-		s.markForkFailed(ctx, forkID)
+		s.deleteForkBranchOrPersist(ctx, forkID, credentialReq, nil)
+		if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantDeleted); err != nil {
+			logger.Error(ctx, "fork_pre_api_key_mark_deleted_failed", zap.String("tenant_id", forkID), zap.Error(err))
+		}
 		return nil, err
 	}
 	if err := s.meta.InsertAPIKey(ctx, &meta.APIKey{
@@ -373,7 +382,10 @@ func (s *Server) createForkTenant(ctx context.Context, sourceTenantID, displayNa
 		CreatedAt:     time.Now().UTC(),
 		UpdatedAt:     time.Now().UTC(),
 	}); err != nil {
-		s.markForkFailed(ctx, forkID)
+		s.deleteForkBranchOrPersist(ctx, forkID, credentialReq, nil)
+		if err := s.meta.UpdateTenantStatus(ctx, forkID, meta.TenantDeleted); err != nil {
+			logger.Error(ctx, "fork_pre_api_key_mark_deleted_failed", zap.String("tenant_id", forkID), zap.Error(err))
+		}
 		return nil, err
 	}
 
