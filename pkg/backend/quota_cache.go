@@ -173,14 +173,18 @@ type quotaUsageSnapshot struct {
 }
 
 // quotaUsageCache is used only by soft small-write admission checks. It avoids
-// one central DB read per 1KB write while keeping the stale window short.
+// one central DB read per tiny write while keeping the stale window short.
+// In multi-server deployments, each backend can briefly admit writes against a
+// usage snapshot that is stale by at most ttl; strict upload reservations must
+// continue to call loadQuotaUsage directly.
 type quotaUsageCache struct {
 	tenantID string
 	store    MetaQuotaStore
 	ttl      time.Duration
 
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	snapshot *quotaUsageSnapshot
+	loadMu   sync.Mutex
 }
 
 func newQuotaUsageCache(tenantID string, store MetaQuotaStore, ttl time.Duration) *quotaUsageCache {
@@ -192,11 +196,15 @@ func newQuotaUsageCache(tenantID string, store MetaQuotaStore, ttl time.Duration
 
 func (c *quotaUsageCache) get(ctx context.Context) *QuotaUsageView {
 	now := time.Now()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.snapshot != nil && c.snapshot.usage != nil && now.Before(c.snapshot.expiresAt) {
-		usage := *c.snapshot.usage
-		return &usage
+	if usage := c.cached(now); usage != nil {
+		return usage
+	}
+
+	c.loadMu.Lock()
+	defer c.loadMu.Unlock()
+	now = time.Now()
+	if usage := c.cached(now); usage != nil {
+		return usage
 	}
 
 	start := time.Now()
@@ -211,12 +219,31 @@ func (c *quotaUsageCache) get(ctx context.Context) *QuotaUsageView {
 		metrics.RecordOperation("server_quota", "usage_cache", "load_empty", time.Since(start))
 		return nil
 	}
+	copied := *usage
+	c.mu.Lock()
 	c.snapshot = &quotaUsageSnapshot{
-		usage:     usage,
-		expiresAt: now.Add(c.ttl),
+		usage:     &copied,
+		expiresAt: time.Now().Add(c.ttl),
+	}
+	c.mu.Unlock()
+	metrics.RecordOperation("server_quota", "usage_cache", "load_ok", time.Since(start))
+	return cloneQuotaUsageView(usage)
+}
+
+func (c *quotaUsageCache) cached(now time.Time) *QuotaUsageView {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.snapshot != nil && c.snapshot.usage != nil && now.Before(c.snapshot.expiresAt) {
+		return cloneQuotaUsageView(c.snapshot.usage)
+	}
+	return nil
+}
+
+func cloneQuotaUsageView(usage *QuotaUsageView) *QuotaUsageView {
+	if usage == nil {
+		return nil
 	}
 	copied := *usage
-	metrics.RecordOperation("server_quota", "usage_cache", "load_ok", time.Since(start))
 	return &copied
 }
 
@@ -288,6 +315,9 @@ func (c *quotaPendingDeltasCache) add(storageDelta, fileDelta, mediaDelta int64)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// If the snapshot is missing or expired, leave it cold. The next soft
+	// admission check reloads from quota_outbox and sees this backend's queued
+	// row along with rows from other servers.
 	if c.snapshot == nil || time.Now().After(c.snapshot.expiresAt) {
 		return
 	}

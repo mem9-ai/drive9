@@ -22,6 +22,7 @@ const (
 	quotaOutboxBatchSize                = 100
 	quotaOutboxRecoverLimit             = 100
 	quotaOutboxUploadDrainLimit         = 1000
+	quotaOutboxUploadDrainMaxWait       = 5 * time.Second
 	quotaOutboxUploadDrainWait          = 25 * time.Millisecond
 	quotaOutboxUploadDrainWarnThreshold = 10
 	quotaOutboxRetryBaseDelay           = 200 * time.Millisecond
@@ -86,6 +87,8 @@ func (b *Dat9Backend) waitQuotaOutboxNotifyQuiet(ctx context.Context) bool {
 	if quotaOutboxNotifyDelay <= 0 {
 		return true
 	}
+	// Coalesce bursts until the channel is quiet for quotaOutboxNotifyDelay.
+	// quotaOutboxNotifyMaxDelay bounds the wait under a steady write stream.
 	timer := time.NewTimer(quotaOutboxNotifyDelay)
 	defer timer.Stop()
 	maxTimer := time.NewTimer(quotaOutboxNotifyMaxDelay)
@@ -160,8 +163,12 @@ func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string
 	if limit <= 0 {
 		limit = quotaOutboxUploadDrainLimit
 	}
+	start := time.Now()
 	processedCount := 0
 	for i := 0; i < limit; i++ {
+		if quotaOutboxUploadDrainMaxWait > 0 && time.Since(start) > quotaOutboxUploadDrainMaxWait {
+			return fmt.Errorf("quota outbox for file %s still pending after %s", fileID, quotaOutboxUploadDrainMaxWait)
+		}
 		pending, err := b.store.HasPendingQuotaOutboxFileMutation(ctx, fileID)
 		if err != nil {
 			return fmt.Errorf("check pending quota outbox for file: %w", err)

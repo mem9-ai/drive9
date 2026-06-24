@@ -216,6 +216,24 @@ func TestQuotaOutboxNotifyQuietHasMaxWait(t *testing.T) {
 	}
 }
 
+func TestQuotaOutboxNotifyQuietReturnsAfterQuietPeriod(t *testing.T) {
+	b := &Dat9Backend{quotaOutboxNotify: make(chan struct{}, quotaOutboxNotifySize)}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if !b.waitQuotaOutboxNotifyQuiet(ctx) {
+		t.Fatal("waitQuotaOutboxNotifyQuiet returned false")
+	}
+	dur := time.Since(start)
+	if dur < quotaOutboxNotifyDelay/2 {
+		t.Fatalf("waitQuotaOutboxNotifyQuiet duration = %s, want quiet-period wait", dur)
+	}
+	if dur > quotaOutboxNotifyMaxDelay+100*time.Millisecond {
+		t.Fatalf("waitQuotaOutboxNotifyQuiet duration = %s, want before max delay", dur)
+	}
+}
+
 func TestDrainQuotaOutboxForFileErrorsWhenPendingRowIsNotClaimable(t *testing.T) {
 	b, _ := newServerQuotaBackend(t, Options{})
 	b.stopQuotaOutboxWorker()

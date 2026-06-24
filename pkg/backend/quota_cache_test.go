@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -16,6 +17,7 @@ type cacheTestStore struct {
 	versionErr   error
 	configErr    error
 	configHook   func()
+	usageHook    func()
 }
 
 func newCacheTestStore() *cacheTestStore {
@@ -24,6 +26,9 @@ func newCacheTestStore() *cacheTestStore {
 
 func (m *cacheTestStore) GetQuotaUsage(ctx context.Context, tenantID string) (*QuotaUsageView, error) {
 	m.usageCalls.Add(1)
+	if m.usageHook != nil {
+		m.usageHook()
+	}
 	return m.fakeMetaQuotaStore.GetQuotaUsage(ctx, tenantID)
 }
 
@@ -211,6 +216,39 @@ func TestQuotaUsageCacheUsesTTL(t *testing.T) {
 	second := c.get(context.Background())
 	if second == nil || second.StorageBytes != 10 {
 		t.Fatalf("second usage = %+v, want cached storage 10", second)
+	}
+	if got := store.usageCalls.Load(); got != 1 {
+		t.Fatalf("usageCalls = %d, want 1", got)
+	}
+}
+
+func TestQuotaUsageCacheCoalescesConcurrentMisses(t *testing.T) {
+	store := newCacheTestStore()
+	store.usage["t1"] = &QuotaUsageView{TenantID: "t1", StorageBytes: 10}
+	c := newQuotaUsageCache("t1", store, time.Hour)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	store.usageHook = func() {
+		once.Do(func() { close(started) })
+		<-release
+	}
+
+	const workers = 5
+	results := make(chan *QuotaUsageView, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			results <- c.get(context.Background())
+		}()
+	}
+
+	<-started
+	close(release)
+	for i := 0; i < workers; i++ {
+		usage := <-results
+		if usage == nil || usage.StorageBytes != 10 {
+			t.Fatalf("usage = %+v, want storage 10", usage)
+		}
 	}
 	if got := store.usageCalls.Load(); got != 1 {
 		t.Fatalf("usageCalls = %d, want 1", got)

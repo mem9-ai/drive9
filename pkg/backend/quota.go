@@ -165,6 +165,10 @@ func (b *Dat9Backend) ensureStorageQuotaServer(ctx context.Context, tx *sql.Tx, 
 	return nil
 }
 
+// ensureFileCountQuotaServer is a soft optimistic file-count check for small
+// create-like writes. Like storage soft admission, concurrent servers may
+// briefly over-admit within the quota usage/pending-delta cache TTL; strict
+// upload reservations keep using live counters under the admission lock.
 func (b *Dat9Backend) ensureFileCountQuotaServer(ctx context.Context, tx *sql.Tx, currentFileDelta int64) error {
 	if !b.UseServerQuota() || currentFileDelta <= 0 {
 		return nil
