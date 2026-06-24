@@ -4976,6 +4976,27 @@ func (fs *Dat9FS) hasKnownLocalDirectoryChildren(dirPath string) bool {
 	return false
 }
 
+// collectLocallyUnlinkedPaths returns a set of direct child paths of dirPath
+// whose inodes are marked Unlinked. These are entries the client has already
+// deleted locally but the backend may not have propagated the deletion yet.
+func (fs *Dat9FS) collectLocallyUnlinkedPaths(dirPath string) map[string]struct{} {
+	unlinked := make(map[string]struct{})
+	for _, entry := range fs.inodes.Snapshot() {
+		if !entry.Unlinked {
+			continue
+		}
+		for p := range entry.Paths {
+			if isDirectChildPath(dirPath, p) {
+				unlinked[p] = struct{}{}
+			}
+		}
+		if isDirectChildPath(dirPath, entry.Path) {
+			unlinked[entry.Path] = struct{}{}
+		}
+	}
+	return unlinked
+}
+
 func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string) (bool, error) {
 	listStart := fs.perfStart()
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
@@ -4983,10 +5004,29 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 	if err != nil {
 		return false, err
 	}
-	if fs.dirCache != nil {
-		fs.dirCache.Put(dirPath, cachedFileInfos(items))
+	// Filter out entries that the local inode state knows are already
+	// unlinked. This handles eventual-consistency lag where a just-deleted
+	// file still appears in the remote listing, which would cause Rmdir to
+	// incorrectly return ENOTEMPTY for a directory the client knows is empty.
+	unlinkedPaths := fs.collectLocallyUnlinkedPaths(dirPath)
+	liveItems := make([]client.FileInfo, 0, len(items))
+	for _, item := range items {
+		if !validDirEntryName(item.Name) {
+			continue
+		}
+		childP := dirPath + "/" + item.Name
+		if dirPath == "/" {
+			childP = "/" + item.Name
+		}
+		if _, isUnlinked := unlinkedPaths[childP]; isUnlinked {
+			continue // locally known-deleted, skip
+		}
+		liveItems = append(liveItems, item)
 	}
-	return len(items) > 0, nil
+	if fs.dirCache != nil {
+		fs.dirCache.Put(dirPath, cachedFileInfos(liveItems))
+	}
+	return len(liveItems) > 0, nil
 }
 
 func (fs *Dat9FS) remoteHardlinkCommittedDetached(srcP, dstP string) bool {

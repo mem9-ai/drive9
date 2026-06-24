@@ -18999,6 +18999,64 @@ func TestRmdirRejectsRemoteChildBeforeDelete(t *testing.T) {
 	}
 }
 
+func TestRmdirSucceedsAfterUnlinkWithStaleRemoteList(t *testing.T) {
+	// Simulate eventual consistency: a file was unlinked locally (inode
+	// marked Unlinked=true) but the remote listing still shows it.
+	// Rmdir should proceed with the delete instead of returning ENOTEMPTY.
+	var deleteCalls atomic.Int32
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir" && r.URL.Query().Has("list"):
+			listCalls.Add(1)
+			// Remote still lists the deleted file (eventual consistency lag).
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{{
+					"name":  "stale.txt",
+					"isDir": false,
+					"size":  1,
+				}},
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/dir":
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/dir/stale.txt":
+			// The unlink delete succeeded on the backend.
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	// Set up the directory and the file inode.
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	_ = dirIno
+	fileIno := fs.inodes.Lookup("/dir/stale.txt", false, 1, time.Now())
+	_ = fileIno
+
+	// Simulate the file being unlinked: RemoveLinkPreserve marks the inode
+	// as Unlinked=true while keeping the inode alive for open handles.
+	// This is what Unlink() does after a successful remote delete.
+	fs.inodes.RemoveLinkPreserve("/dir/stale.txt")
+
+	// Rmdir: NodeId=1 (root) is the parent, "dir" is the child to remove.
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.OK {
+		t.Fatalf("Rmdir status = %v, want OK (stale remote entry should be ignored)", st)
+	}
+	if got := listCalls.Load(); got < 1 {
+		t.Fatalf("remote list calls = %d, want >= 1", got)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Fatalf("remote delete calls = %d, want 1", got)
+	}
+}
+
 func TestRmdirRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T) {
 	path := "/repo/emptydir"
 
