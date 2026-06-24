@@ -11575,7 +11575,7 @@ func TestStatFs_ReportsVirtualCapacity(t *testing.T) {
 	}
 }
 
-func TestXAttr_GetReturnsENOATTR(t *testing.T) {
+func TestXAttr_GetMissingReturnsENOATTR(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://localhost"), opts)
@@ -11586,40 +11586,127 @@ func TestXAttr_GetReturnsENOATTR(t *testing.T) {
 	}
 }
 
-func TestXAttr_ListReturnsEmpty(t *testing.T) {
+func TestXAttr_SetGetRoundTrip(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
 
-	n, st := fs.ListXAttr(nil, &gofuse.InHeader{NodeId: 1}, nil)
-	if st != gofuse.OK {
-		t.Fatalf("ListXAttr status = %v, want OK", st)
-	}
-	if n != 0 {
-		t.Fatalf("ListXAttr size = %d, want 0", n)
-	}
-}
-
-func TestXAttr_SetDiscardsSilently(t *testing.T) {
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://localhost"), opts)
-
-	st := fs.SetXAttr(nil, &gofuse.SetXAttrIn{}, "user.test", []byte("val"))
+	st := fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.test", []byte("hello"))
 	if st != gofuse.OK {
 		t.Fatalf("SetXAttr status = %v, want OK", st)
 	}
+
+	n, st := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", nil)
+	if st != gofuse.OK {
+		t.Fatalf("GetXAttr status = %v, want OK", st)
+	}
+	if n != 5 {
+		t.Fatalf("GetXAttr size = %d, want 5", n)
+	}
+
+	dest := make([]byte, 16)
+	n, st = fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", dest)
+	if st != gofuse.OK {
+		t.Fatalf("GetXAttr status = %v, want OK", st)
+	}
+	if string(dest[:n]) != "hello" {
+		t.Fatalf("GetXAttr value = %q, want %q", string(dest[:n]), "hello")
+	}
 }
 
-func TestXAttr_RemoveReturnsENOATTR(t *testing.T) {
+func TestXAttr_ListReturnsSetAttrs(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
 
-	st := fs.RemoveXAttr(nil, &gofuse.InHeader{NodeId: 1}, "user.test")
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.foo", []byte("1"))
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.bar", []byte("2"))
+
+	n, st := fs.ListXAttr(nil, &gofuse.InHeader{NodeId: ino}, nil)
+	if st != gofuse.OK {
+		t.Fatalf("ListXAttr status = %v, want OK", st)
+	}
+	// Two names, each null-terminated.
+	expectedSize := len("user.foo") + 1 + len("user.bar") + 1
+	if n != uint32(expectedSize) {
+		t.Fatalf("ListXAttr size = %d, want %d", n, expectedSize)
+	}
+
+	dest := make([]byte, expectedSize)
+	n, st = fs.ListXAttr(nil, &gofuse.InHeader{NodeId: ino}, dest)
+	if st != gofuse.OK {
+		t.Fatalf("ListXAttr status = %v, want OK", st)
+	}
+	// Verify both names appear in the null-separated output.
+	names := strings.Split(strings.TrimRight(string(dest[:n]), "\x00"), "\x00")
+	if !contains(names, "user.foo") || !contains(names, "user.bar") {
+		t.Fatalf("ListXAttr names = %v, want both user.foo and user.bar", names)
+	}
+}
+
+func TestXAttr_RemoveWorks(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
+
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.test", []byte("val"))
+
+	st := fs.RemoveXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test")
+	if st != gofuse.OK {
+		t.Fatalf("RemoveXAttr status = %v, want OK", st)
+	}
+
+	_, st = fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", nil)
+	if st != gofuse.ENOATTR {
+		t.Fatalf("GetXAttr after remove status = %v, want ENOATTR", st)
+	}
+}
+
+func TestXAttr_RemoveMissingReturnsENOATTR(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
+
+	st := fs.RemoveXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test")
 	if st != gofuse.ENOATTR {
 		t.Fatalf("RemoveXAttr status = %v, want ENOATTR", st)
 	}
+}
+
+func TestXAttr_GetReturnsERANGEWhenDestTooSmall(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
+
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.test", []byte("hello world"))
+
+	dest := make([]byte, 3)
+	n, st := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", dest)
+	if st != gofuse.Status(syscall.ERANGE) {
+		t.Fatalf("GetXAttr status = %v, want ERANGE", st)
+	}
+	if n != 11 {
+		t.Fatalf("GetXAttr size = %d, want 11", n)
+	}
+}
+
+func contains(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSetAttr_MtimeUpdate(t *testing.T) {
