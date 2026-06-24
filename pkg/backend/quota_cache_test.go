@@ -15,6 +15,7 @@ type cacheTestStore struct {
 	usageCalls   atomic.Int64
 	versionErr   error
 	configErr    error
+	configHook   func()
 }
 
 func newCacheTestStore() *cacheTestStore {
@@ -30,6 +31,9 @@ func (m *cacheTestStore) GetQuotaConfig(ctx context.Context, tenantID string) (*
 	m.configCalls.Add(1)
 	if m.configErr != nil {
 		return nil, m.configErr
+	}
+	if m.configHook != nil {
+		m.configHook()
 	}
 	return m.fakeMetaQuotaStore.GetQuotaConfig(ctx, tenantID)
 }
@@ -140,6 +144,34 @@ func TestQuotaConfigCacheRefreshOnlyLoadsConfigWhenVersionChanges(t *testing.T) 
 	}
 	if got := store.usageCalls.Load(); got != 0 {
 		t.Fatalf("usageCalls = %d, want 0", got)
+	}
+}
+
+func TestQuotaConfigCacheLazyLoadDoesNotOverwriteRefreshedSnapshot(t *testing.T) {
+	store := newCacheTestStore()
+	store.config["t1"] = &QuotaConfigView{MaxStorageBytes: 1000}
+	c := newQuotaConfigCache("t1", store)
+	defer c.stop()
+
+	store.configHook = func() {
+		c.mu.Lock()
+		c.snapshot = &quotaConfigSnapshot{
+			config:  &QuotaConfigView{MaxStorageBytes: 2000},
+			version: "new-version",
+		}
+		c.mu.Unlock()
+	}
+
+	cfg := c.load(context.Background())
+	if cfg == nil {
+		t.Fatal("config is nil")
+	}
+	if cfg.MaxStorageBytes != 2000 {
+		t.Fatalf("lazy load config = %d, want refreshed 2000", cfg.MaxStorageBytes)
+	}
+	cached := c.get()
+	if cached == nil || cached.MaxStorageBytes != 2000 {
+		t.Fatalf("cached config = %+v, want refreshed 2000", cached)
 	}
 }
 

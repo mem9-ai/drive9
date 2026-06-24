@@ -97,11 +97,13 @@ func (c *quotaConfigCache) load(ctx context.Context) *QuotaConfigView {
 		return nil
 	}
 	c.mu.Lock()
-	version := ""
-	if c.snapshot != nil {
-		version = c.snapshot.version
+	if c.snapshot != nil && c.snapshot.config != nil {
+		existing := *c.snapshot.config
+		c.mu.Unlock()
+		metrics.RecordOperation("quota_config_cache", "load", "raced_refresh", time.Since(start))
+		return &existing
 	}
-	c.snapshot = &quotaConfigSnapshot{config: cfg, version: version}
+	c.snapshot = &quotaConfigSnapshot{config: cfg, version: ""}
 	c.mu.Unlock()
 	metrics.RecordOperation("quota_config_cache", "load", "ok", time.Since(start))
 	return cfg
