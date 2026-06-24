@@ -100,6 +100,12 @@ func TestListDir(t *testing.T) {
 	if len(entries) != 2 {
 		t.Fatalf("expected 2, got %d", len(entries))
 	}
+	// Server now returns revision in list response; verify it is populated.
+	for _, e := range entries {
+		if e.Revision <= 0 {
+			t.Fatalf("list entry %q: revision = %d, want > 0", e.Name, e.Revision)
+		}
+	}
 }
 
 func TestBatchStatCtxPreservesPerPathErrors(t *testing.T) {

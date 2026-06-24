@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"strings"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -64,19 +65,28 @@ func (w *ExpirySweepWorker) run(ctx context.Context) {
 			logger.Info(ctx, "expiry_sweep_worker_stopped")
 			return
 		case <-ticker.C:
-			w.sweep(ctx)
+			if w.sweep(ctx) {
+				logger.Info(ctx, "expiry_sweep_worker_stopped_fatal")
+				return
+			}
 		}
 	}
 }
 
-func (w *ExpirySweepWorker) sweep(ctx context.Context) {
+// sweep runs one expiry sweep cycle. Returns true if a fatal error occurred
+// (e.g. database closed) and the loop should stop.
+func (w *ExpirySweepWorker) sweep(ctx context.Context) (fatal bool) {
 	start := time.Now()
 	released, err := w.store.ExpireActiveReservations(ctx)
 	elapsed := time.Since(start)
 	if err != nil {
+		if strings.Contains(err.Error(), "database is closed") || strings.Contains(err.Error(), "connection refused") {
+			logger.Info(ctx, "expiry_sweep_worker_db_closed")
+			return true
+		}
 		logger.Error(ctx, "expiry_sweep_error", zap.Error(err), zap.Duration("elapsed", elapsed))
 		metrics.RecordOperation("expiry_sweep", "sweep", "error", elapsed)
-		return
+		return false
 	}
 	if released > 0 {
 		logger.Info(ctx, "expiry_sweep_released",
@@ -84,4 +94,5 @@ func (w *ExpirySweepWorker) sweep(ctx context.Context) {
 			zap.Duration("elapsed", elapsed))
 	}
 	metrics.RecordOperation("expiry_sweep", "sweep", "ok", elapsed)
+	return false
 }

@@ -113,8 +113,10 @@ func SemanticWorkerWillRun(cfg Config) bool {
 
 // ValidateDurableAsyncExtractRequiresSemanticWorker returns an error when async
 // image or audio extraction runtimes are enabled on the backend template (so
-// durable TiDB-auto semantic tasks may be enqueued for matching tenants) but the
-// semantic worker would not start for cfg.
+// durable semantic_tasks may be enqueued for matching tenants) but the
+// semantic worker would not start for cfg. The worker can start without an
+// embedder as long as image/audio extract is configured, since extract tasks
+// do not depend on EMBED_TEXT.
 //
 // When localTiDBAutoOnly is true, validation applies only if
 // template.DatabaseAutoEmbedding is true (drive9-server-local after resolving
@@ -249,22 +251,28 @@ func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Sto
 	}
 	// Multi-tenant scheduling never includes the local fallback ref (listTenantRefs
 	// only enumerates meta tenants), so fallback auto task types must not make the
-	// manager viable by themselves.
+	// manager viable by themselves. In single-tenant mode, the fallback backend's
+	// image/audio extract capability (independent of database auto-embedding) also
+	// makes the manager viable.
 	viable := hasAnyTaskTypes(app) || hasAnyTaskTypes(poolAuto)
 	if !hasMultiTenant {
 		viable = viable || hasAnyTaskTypes(fbAuto)
+		if fallback != nil && !viable {
+			viable = fallback.SupportsAsyncImageExtract() || fallback.SupportsAsyncAudioExtract()
+		}
 	}
 	if !viable {
 		return nil
 	}
 	// Single-tenant mode: require a viable fallback — either auto image path is
-	// fully configured, or app-managed embed is available.
+	// fully configured, app-managed embed is available, or image/audio extract
+	// is configured (extract does not depend on EMBED_TEXT).
 	if fallback != nil && !hasMultiTenant {
 		if fallback.UsesDatabaseAutoEmbedding() {
 			if !hasAnyTaskTypes(fallback.AutoSemanticTaskTypes()) {
 				return nil
 			}
-		} else if !hasAnyTaskTypes(app) {
+		} else if !hasAnyTaskTypes(app) && !fallback.SupportsAsyncImageExtract() && !fallback.SupportsAsyncAudioExtract() {
 			return nil
 		}
 	}
@@ -728,6 +736,12 @@ func pageWalkOrder(n int) []int {
 	return order
 }
 
+// tryClaimTenantSlot attempts to acquire a per-tenant concurrency slot.
+// NOTE: This is a per-pod limit, not a global limit. In a K-pod deployment,
+// a tenant may run up to K × PerTenantConcurrency tasks in parallel. This is
+// a capacity limit, not a correctness issue — the DB lease (ClaimSemanticTask
+// with FOR UPDATE SKIP LOCKED) guarantees single-owner-per-task regardless.
+// To enforce a strict global limit, use a DB token row or distributed limiter.
 func (m *semanticWorkerManager) tryClaimTenantSlot(tenantID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1372,6 +1386,34 @@ func hasAnyTaskTypes(types []semantic.TaskType) bool {
 	return len(types) > 0
 }
 
+// unionTaskTypes merges two task-type slices, deduplicating by value. Order
+// follows a then b, with duplicates from b dropped.
+func unionTaskTypes(a, b []semantic.TaskType) []semantic.TaskType {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[semantic.TaskType]struct{}, len(a)+len(b))
+	out := make([]semantic.TaskType, 0, len(a)+len(b))
+	for _, t := range a {
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	for _, t := range b {
+		if _, ok := seen[t]; ok {
+			continue
+		}
+		seen[t] = struct{}{}
+		out = append(out, t)
+	}
+	return out
+}
+
 // appManagedTaskTypes returns task types driven by the worker embedder (app-managed path).
 func (m *semanticWorkerManager) appManagedTaskTypes() []semantic.TaskType {
 	if m == nil {
@@ -1380,8 +1422,36 @@ func (m *semanticWorkerManager) appManagedTaskTypes() []semantic.TaskType {
 	return appManagedSemanticTaskTypes(m.embedder)
 }
 
+// poolExtractTaskTypes returns the img/audio extract task types advertised by the
+// pool, independent of database auto-embedding. Image and audio extraction tasks
+// do not depend on EMBED_TEXT, so they are valid for app-embedding (or no-embedding)
+// tenants as long as the async runtime is wired in the backend template.
+func (m *semanticWorkerManager) poolExtractTaskTypes() []semantic.TaskType {
+	if m == nil || m.pool == nil {
+		return nil
+	}
+	return m.pool.AutoSemanticTaskTypes()
+}
+
+// fallbackExtractTaskTypes returns the img/audio extract task types available on
+// the local fallback backend, independent of database auto-embedding.
+func (m *semanticWorkerManager) fallbackExtractTaskTypes() []semantic.TaskType {
+	if m == nil || m.fallback == nil {
+		return nil
+	}
+	var out []semantic.TaskType
+	if m.fallback.SupportsAsyncImageExtract() {
+		out = append(out, semantic.TaskTypeImgExtractText)
+	}
+	if m.fallback.SupportsAsyncAudioExtract() {
+		out = append(out, semantic.TaskTypeAudioExtractText)
+	}
+	return out
+}
+
 // taskTypesForProvider is the routing filter for meta tenant list scanning: TiDB-auto
-// tenants use pool auto types; others require app-managed embed.
+// tenants use pool auto types; others require app-managed embed and/or pool-configured
+// image/audio extract (which does not depend on EMBED_TEXT).
 func (m *semanticWorkerManager) taskTypesForProvider(provider string) []semantic.TaskType {
 	if m == nil {
 		return nil
@@ -1390,19 +1460,28 @@ func (m *semanticWorkerManager) taskTypesForProvider(provider string) []semantic
 		if m.pool == nil {
 			return nil
 		}
-		if types := m.pool.AutoSemanticTaskTypes(); types != nil {
+		types := m.pool.AutoSemanticTaskTypes()
+		// When auto-embedding is explicitly disabled, route TiDB tenants through
+		// app-managed embed types alongside any pool-configured extract types.
+		// Without this, embed tasks would never be claimed when extract types
+		// are present but auto-embedding is off.
+		if m.pool.IsAutoEmbeddingDisabled() {
+			return unionTaskTypes(m.appManagedTaskTypes(), types)
+		}
+		if types != nil {
 			return types
 		}
-		// Pool returned nil. If auto-embedding is explicitly disabled, route
-		// TiDB tenants through app-managed task types so they can be processed
-		// by an external embedder. Otherwise (pool has no image/audio extract
-		// configured) fall through to nil — TiDB tenant is skipped entirely.
-		if m.pool.IsAutoEmbeddingDisabled() {
-			return m.appManagedTaskTypes()
-		}
+		// Pool returned nil and auto-embedding is not disabled: no extract or
+		// embed tasks configured — skip this TiDB tenant entirely.
 		return nil
 	}
-	return m.appManagedTaskTypes()
+	// Non-auto-embedding provider: image/audio extract tasks are independent of
+	// EMBED_TEXT, so include pool-configured extract types alongside app-managed
+	// embed types. Without this, img_extract_text tasks enqueued for app-mode
+	// tenants would never be scanned or claimed when no embedder is configured.
+	// taskTypesForTarget filters at the per-backend level, so only backends that
+	// actually support extract (imageExtractEnabled etc.) will claim these tasks.
+	return unionTaskTypes(m.appManagedTaskTypes(), m.poolExtractTaskTypes())
 }
 
 func (m *semanticWorkerManager) shouldIncludeFallback() bool {
@@ -1412,7 +1491,10 @@ func (m *semanticWorkerManager) shouldIncludeFallback() bool {
 	if m.fallback.UsesDatabaseAutoEmbedding() {
 		return hasAnyTaskTypes(m.fallback.AutoSemanticTaskTypes())
 	}
-	return hasAnyTaskTypes(m.appManagedTaskTypes())
+	// App-embedding (or no-embedding) fallback: include when app-managed embed
+	// is available, or when image/audio extract is configured on the fallback
+	// backend (extract does not depend on EMBED_TEXT).
+	return hasAnyTaskTypes(m.appManagedTaskTypes()) || hasAnyTaskTypes(m.fallbackExtractTaskTypes())
 }
 
 // taskTypesForTarget is the effective ClaimSemanticTask filter for a concrete backend.

@@ -9,7 +9,7 @@ import (
 
 const (
 	defaultDirCacheTTL              = 10 * time.Second
-	defaultNamespaceCacheMaxEntries = 2000
+	defaultNamespaceCacheMaxEntries = 200000
 
 	// escalateMissThreshold/escalateMissWindow detect negative-lookup storms:
 	// once this many remote ENOENT stats hit the same directory within the
@@ -156,7 +156,7 @@ func (dc *DirCache) Put(dirPath string, items []CachedFileInfo) {
 	}
 	if len(items) <= dc.maxEntries {
 		entry.complete = true
-		entry.completeExpires = now.Add(dc.negativeTTL)
+		entry.completeExpires = now.Add(dc.ttl)
 	}
 	dc.entries[dirPath] = entry
 }

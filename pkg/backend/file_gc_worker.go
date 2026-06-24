@@ -65,7 +65,21 @@ func (b *Dat9Backend) StartFileGCWorker(opts FileGCWorkerOptions) *FileGCWorker 
 	return w
 }
 
-func (b *Dat9Backend) stopFileGCWorker() {
+// FileGCWorkerRunning reports whether the per-tenant file GC worker is currently
+// active. Intended for leadership-lifecycle tests and diagnostics.
+func (b *Dat9Backend) FileGCWorkerRunning() bool {
+	if b == nil {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.fileGCWorker != nil
+}
+
+// StopFileGCWorker stops the per-tenant file GC worker if it is running. Safe
+// to call when no worker is active. Used by the tenant pool's StopAllFileGC
+// (leader-loss path) and the backend's own Close.
+func (b *Dat9Backend) StopFileGCWorker() {
 	b.mu.Lock()
 	w := b.fileGCWorker
 	b.fileGCWorker = nil
@@ -228,6 +242,15 @@ func (b *Dat9Backend) deleteCentralFileMetaForGCTask(ctx context.Context, task *
 }
 
 func (b *Dat9Backend) checkNoPendingCentralFileMutation(ctx context.Context, fileID string) error {
+	if b.UseServerQuota() {
+		pending, err := b.store.HasPendingQuotaOutboxFileMutation(ctx, fileID)
+		if err != nil {
+			return err
+		}
+		if pending {
+			return fmt.Errorf("tenant quota outbox pending for file %s", fileID)
+		}
+	}
 	pending, err := b.metaStore.HasPendingFileMutation(ctx, b.tenantID, fileID)
 	if err != nil {
 		return err
@@ -243,6 +266,9 @@ func (b *Dat9Backend) applyCentralFileDeleteCountersTx(tx *sql.Tx, sizeBytes int
 		if err := b.metaStore.IncrStorageBytesTx(tx, b.tenantID, -sizeBytes); err != nil {
 			return err
 		}
+	}
+	if err := b.metaStore.IncrFileCountTx(tx, b.tenantID, -1); err != nil {
+		return err
 	}
 	if isMedia {
 		if err := b.metaStore.IncrMediaFileCountTx(tx, b.tenantID, -1); err != nil {

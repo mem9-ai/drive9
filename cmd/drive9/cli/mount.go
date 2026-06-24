@@ -153,6 +153,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	fs.Var(&remoteOnlyPatterns, "remote-only", "remote-persistent override path pattern for overlay routing (repeatable)")
 	fs.Var(&unpackArchives, "unpack", "restore a drive9 pack archive into --local-root before mounting (repeatable)")
 	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
+	dirCacheMaxEntries := fs.Int("dir-cache-max-entries", 200000, "maximum entries per directory in namespace cache before complete marking is disabled")
+	commitQueueMaxPending := fs.Int("commit-queue-max-pending", 100, "maximum pending entries in CommitQueue before backpressure")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
 	debug := fs.Bool("debug", false, "enable FUSE debug logging")
@@ -234,6 +236,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	}
 	if *uploadConcurrency <= 0 {
 		return fmt.Errorf("drive9 mount: --upload-concurrency must be > 0")
+	}
+	if *dirCacheMaxEntries <= 0 {
+		return fmt.Errorf("drive9 mount: --dir-cache-max-entries must be > 0")
+	}
+	if *commitQueueMaxPending <= 0 {
+		return fmt.Errorf("drive9 mount: --commit-queue-max-pending must be > 0")
 	}
 	if err := validateReadDirPrefetchFlags(*prefetchMaxFiles, *prefetchMaxFileBytes, *prefetchMaxBytes, *prefetchTimeout); err != nil {
 		return err
@@ -515,6 +523,8 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		RemoteOnlyPatterns:      append([]string(nil), effectiveRemoteOnlyPatterns...),
 		PackPaths:               append([]string(nil), effectivePackPaths...),
 		UploadConcurrency:       *uploadConcurrency,
+		DirCacheMaxEntries:      *dirCacheMaxEntries,
+		CommitQueueMaxPending:   *commitQueueMaxPending,
 		ReadConcurrency:         *readConcurrency,
 		ParallelReadConcurrency: *parallelReadConcurrency,
 		ParallelReadBlockSize:   *parallelReadBlockSize << 20,

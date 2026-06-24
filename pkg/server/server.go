@@ -24,6 +24,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/embedding"
+	"github.com/mem9-ai/drive9/pkg/leader"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
@@ -67,12 +68,24 @@ type Config struct {
 	// DisableDatabaseAutoEmbedding suppresses runtime writes that would trigger
 	// TiDB EMBED_TEXT, but TiDB tenants still use the normal auto schema.
 	DisableDatabaseAutoEmbedding bool
+	// Leader, when set, gates background schedulers (semantic worker, object GC,
+	// tenant delete cleanup, pending tenant reconciler, one-time resume tasks,
+	// central-quota mutation replay, upload-reservation expiry sweep, and
+	// per-tenant FileGC) to run only on the leader pod. When nil or disabled, all
+	// workers start unconditionally (single-pod mode).
+	Leader *leader.Manager
 }
 
 type SlockOAuthClient interface {
 	LoginURL() string
 	ExchangeCode(ctx context.Context, code string) (slockoauth.Token, error)
 	Userinfo(ctx context.Context, accessToken string) (slockoauth.UserInfo, error)
+}
+
+func isBackendQuotaExceeded(err error) bool {
+	return errors.Is(err, backend.ErrStorageQuotaExceeded) ||
+		errors.Is(err, backend.ErrFileSizeQuotaExceeded) ||
+		errors.Is(err, backend.ErrFileCountQuotaExceeded)
 }
 
 type autoEmbeddingSchemaProvisioner interface {
@@ -121,6 +134,22 @@ type Server struct {
 	forkWorkerMu        sync.Mutex
 	forkWorkerClosed    bool
 	schemaInitErrors    sync.Map
+	leader              *leader.Manager
+	// leaderWorkerCtx gates leader-only background schedulers. When leadership
+	// changes, this context is cancelled and recreated. Workers that use it
+	// (pending tenant reconciler, tenant delete cleanup, one-time resume tasks)
+	// stop automatically on cancellation.
+	leaderWorkerCtx      context.Context
+	leaderWorkerCancel   context.CancelFunc
+	leaderWorkerWG       sync.WaitGroup
+	leaderWorkerMu       sync.Mutex
+	leaderWorkersStarted bool
+	// replayWorker and expirySweepWorker are leader-gated central quota
+	// workers owned by the server (single callback owner). Started in
+	// startLeaderWorkers and stopped in stopLeaderWorkers so they follow
+	// leadership transitions rather than being wired separately in main.go.
+	replayWorker      *backend.MutationReplayWorker
+	expirySweepWorker *backend.ExpirySweepWorker
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -148,6 +177,7 @@ const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 // protocol change.
 type TenantStatusResponse struct {
 	Status  string `json:"status"`
+	Kind    string `json:"kind,omitempty"`
 	Message string `json:"message,omitempty"`
 
 	MaxUploadBytes int64 `json:"max_upload_bytes"`
@@ -223,6 +253,7 @@ func NewWithConfig(cfg Config) *Server {
 		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
+		leader:              cfg.Leader,
 	}
 	mux := http.NewServeMux()
 
@@ -275,6 +306,7 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
+	mux.Handle("/v1/quota", s.quotaRootHandler(cfg))
 	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -317,13 +349,6 @@ func NewWithConfig(cfg Config) *Server {
 	}
 
 	s.mux = mux
-	if s.meta != nil && s.pool != nil && s.provisioner != nil {
-		s.resumePendingTenants()
-		s.startPendingTenantReconciler()
-		s.resumeProvisioningTenants()
-		s.resumeDeletingForkTenants()
-		s.startTenantDeleteCleanup(backgroundWithTrace(context.Background()))
-	}
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
 	if s.semanticWorker != nil {
 		// Wire upload/write-commit kicks so freshly enqueued semantic tasks are
@@ -338,6 +363,8 @@ func NewWithConfig(cfg Config) *Server {
 			})
 		}
 	}
+	s.objectGCWorker = newObjectGCWorker(cfg.Meta, cfg.Pool)
+
 	appManagedTaskTypes := semanticWorkerLogTaskTypesFromTypes(appManagedSemanticTaskTypes(cfg.SemanticEmbedder))
 	var fallbackTaskTypes, poolAutoTaskTypes []string
 	if cfg.Backend != nil {
@@ -346,39 +373,27 @@ func NewWithConfig(cfg Config) *Server {
 	if cfg.Pool != nil {
 		poolAutoTaskTypes = semanticWorkerLogTaskTypesFromTypes(cfg.Pool.AutoSemanticTaskTypes())
 	}
-	if s.semanticWorker != nil {
-		fields := []zap.Field{
-			zap.Int("workers", s.semanticWorker.opts.Workers),
-			zap.Duration("poll_interval", s.semanticWorker.opts.PollInterval),
-			zap.Duration("lease_duration", s.semanticWorker.opts.LeaseDuration),
-			zap.Duration("recover_interval", s.semanticWorker.opts.RecoverInterval),
-			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
-			zap.Strings("app_managed_task_types", appManagedTaskTypes),
-			zap.Strings("fallback_task_types", fallbackTaskTypes),
-			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
-			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
-			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()),
+
+	// Gate background schedulers behind the leader manager when configured. When
+	// the leader is nil or disabled (single-pod mode), workers start immediately.
+	if s.leader != nil {
+		s.leader.SetCallbacks(s.onLead, s.onLose)
+		s.leader.Start(backgroundWithTrace(context.Background()))
+		// In disabled mode, Start calls onLead synchronously, which starts workers.
+		// In active mode, if this pod is already leader, onLead fires from the
+		// heartbeat goroutine. If not yet leader, workers stay stopped until
+		// leadership is gained.
+		if !s.leader.IsLeader() {
+			logger.Info("server_leader_standby",
+				zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
+				zap.Strings("app_managed_task_types", appManagedTaskTypes),
+				zap.Strings("fallback_task_types", fallbackTaskTypes),
+				zap.Strings("pool_auto_task_types", poolAutoTaskTypes))
 		}
-		fields = append(fields, s.semanticWorker.tenantScanLogFields()...)
-		logger.Info("server_semantic_workers_enabled", fields...)
-		s.semanticWorker.Start(backgroundWithTrace(context.Background()))
 	} else {
-		logger.Info("server_semantic_workers_disabled",
-			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
-			zap.Strings("app_managed_task_types", appManagedTaskTypes),
-			zap.Strings("fallback_task_types", fallbackTaskTypes),
-			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
-			zap.Bool("fallback_present", cfg.Backend != nil),
-			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
-			zap.Bool("pool_present", cfg.Pool != nil),
-			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
-	}
-	s.objectGCWorker = newObjectGCWorker(cfg.Meta, cfg.Pool)
-	if s.objectGCWorker != nil {
-		logger.Info("server_object_gc_worker_enabled")
-		s.objectGCWorker.Start(backgroundWithTrace(context.Background()))
-	} else {
-		logger.Info("server_object_gc_worker_disabled")
+		// No leader manager: single-pod mode, start workers immediately.
+		s.startLeaderWorkers()
+		s.logSemanticWorkerStatus(cfg, appManagedTaskTypes, fallbackTaskTypes, poolAutoTaskTypes)
 	}
 	return s
 }
@@ -393,6 +408,206 @@ func (s *Server) Close() {
 	}
 	s.forkWorkerMu.Unlock()
 	s.forkWorkerWG.Wait()
+	// Stop the leader manager first so any in-flight onLead/onLose callbacks
+	// finish before we tear down local workers. leader.Stop() waits for the
+	// heartbeat goroutine to exit, so no further callback can fire after it
+	// returns. If this pod currently holds leadership, Stop() invokes onLose,
+	// which runs stopLeaderWorkers and stops the leader-gated workers; the
+	// stopLeaderWorkers call below is then a no-op. If this pod is a standby,
+	// onLose does not fire, and stopLeaderWorkers is a no-op (workers were
+	// never started). This ordering prevents the race where Close() stops
+	// workers while onLead is still starting them (the callbacks and the local
+	// teardown are serialized on leaderWorkerMu, and no callback can outlive
+	// leader.Stop()).
+	if s.leader != nil {
+		s.leader.Stop()
+	}
+	// In single-pod (no-leader) mode, leader-gated workers were started
+	// unconditionally in NewWithConfig; stop them now. In leader mode this is a
+	// no-op (already stopped via onLose above) guarded by leaderWorkersStarted.
+	// stopLeaderWorkers also stops the semantic and object GC workers in both
+	// modes (they are started by startLeaderWorkers), so no separate Stop calls
+	// are needed here.
+	s.stopLeaderWorkers()
+}
+
+// startLeaderWorkers launches the background schedulers that should run only
+// on the leader pod: the fork-worker group (pending tenant reconciler, tenant
+// delete cleanup, one-time resume tasks), the semantic and object GC workers,
+// and the central-quota mutation replay + expiry sweep workers. The whole start
+// (including the worker assignments and Start calls) is serialized under
+// leaderWorkerMu and guarded by leaderWorkersStarted, so onLead racing with
+// Close()/onLose cannot interleave a start with a stop and leave orphan workers
+// running. The mutex is held for the entire transition so that a concurrent
+// stopLeaderWorkers observes the fully-started worker set (not a partial one).
+func (s *Server) startLeaderWorkers() {
+	s.leaderWorkerMu.Lock()
+	defer s.leaderWorkerMu.Unlock()
+	if s.leaderWorkersStarted {
+		return
+	}
+	s.leaderWorkersStarted = true
+	// Create a fresh leaderWorkerCtx for the fork-worker group and one-time
+	// resume tasks. These use leaderWorkerCtx (not forkWorkerCtx, which is
+	// reserved for API-triggered fork operations that must run on any pod).
+	leaderCtx, cancel := context.WithCancel(context.Background())
+	s.leaderWorkerCtx = leaderCtx
+	s.leaderWorkerCancel = cancel
+
+	if s.meta != nil && s.pool != nil && s.provisioner != nil {
+		// One-time resume tasks (run in leader-gated goroutines).
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			s.resumePendingTenantsWithCtx(workerCtx)
+		})
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			s.resumeProvisioningTenantsWithCtx(workerCtx)
+		})
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			s.resumeDeletingForkTenantsWithCtx(workerCtx)
+		})
+		// Periodic tenant delete cleanup.
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(defaultTenantDeletePollInterval)
+			defer ticker.Stop()
+			s.processTenantDeleteJobs(workerCtx)
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.processTenantDeleteJobs(workerCtx)
+				}
+			}
+		})
+		// Periodic pending tenant reconciler.
+		if pendingTenantSweepEvery > 0 {
+			s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+				ticker := time.NewTicker(pendingTenantSweepEvery)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-workerCtx.Done():
+						return
+					case <-ticker.C:
+						s.resumePendingTenantsWithCtx(workerCtx)
+					}
+				}
+			})
+		}
+	}
+	// Central-quota workers: the server owns these as the single leader-callback
+	// owner so they start/stop with leadership transitions (previously they were
+	// wired in main.go via a second SetCallbacks call that was clobbered by the
+	// server's own SetCallbacks).
+	if s.meta != nil {
+		s.replayWorker = backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(s.meta))
+		s.expirySweepWorker = backend.StartExpirySweepWorker(s.meta)
+	}
+	// Per-tenant FileGC: start on every cached backend so FileGC reacts to a
+	// leadership gain for backends created while this pod was a standby.
+	if s.pool != nil {
+		s.pool.StartAllFileGC()
+	}
+	if s.semanticWorker != nil {
+		s.semanticWorker.Start(backgroundWithTrace(leaderCtx))
+	}
+	if s.objectGCWorker != nil {
+		s.objectGCWorker.Start(backgroundWithTrace(leaderCtx))
+	}
+	// Periodic fs_events cleanup (leader-only). Prunes old event rows so the
+	// table doesn't grow unbounded. In single-tenant mode, cleans the fallback
+	// store. Multi-tenant cleanup is deferred to a separate task (see comment
+	// in cleanupFSEvents) — the table grows but bounded by event write rate
+	// and the 1h retention applies once multi-tenant cleanup is implemented.
+	s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+		ticker := time.NewTicker(fsEventsCleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+				s.cleanupFSEvents(workerCtx)
+			}
+		}
+	})
+}
+
+// fsEventsCleanupInterval is how often the leader prunes old fs_events rows.
+const fsEventsCleanupInterval = 5 * time.Minute
+
+// fsEventsRetention is how long event rows are kept before pruning.
+const fsEventsRetention = 1 * time.Hour
+
+// cleanupFSEvents prunes old fs_events rows from accessible stores.
+// Single-tenant mode cleans the fallback store. Multi-tenant cleanup is
+// intentionally deferred: iterating all tenant stores on every tick is
+// expensive, and the stale-cursor reset logic in EventsSince handles pruned
+// rows correctly (reset when since < oldestSeq). The table grows bounded by
+// event write rate; a separate task should add per-tenant cleanup via pool
+// iteration or on Acquire. See issue #599 P1-2.
+func (s *Server) cleanupFSEvents(ctx context.Context) {
+	if ctx.Err() != nil {
+		// Context already cancelled (shutdown in progress): skip cleanup to
+		// avoid a partial DELETE that will roll back. Log so operators can see
+		// that a cleanup cycle was interrupted by shutdown.
+		logger.Warn(ctx, "fs_events_cleanup_skipped_shutdown", zap.Error(ctx.Err()))
+		return
+	}
+	if s.fallback != nil && s.meta == nil {
+		store := s.fallback.Store()
+		if store != nil {
+			if _, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-fsEventsRetention)); err != nil {
+				if ctx.Err() != nil {
+					logger.Warn(ctx, "fs_events_cleanup_interrupted_by_shutdown", zap.Error(err))
+				} else {
+					logger.Warn(ctx, "fs_events_cleanup_failed", zap.Error(err))
+				}
+			}
+		}
+	}
+	// Multi-tenant: deferred to a separate task. The fs_events table grows
+	// unbounded in multi-tenant mode until per-tenant cleanup is implemented.
+}
+
+// stopLeaderWorkers stops the background schedulers started by startLeaderWorkers.
+// Called when the pod loses leadership or the server shuts down. The whole stop
+// (including the worker Stop/wait calls and clearing the worker fields) is
+// serialized under leaderWorkerMu and guarded by leaderWorkersStarted, so
+// onLose (heartbeat goroutine), Close() (main goroutine), and a concurrent
+// startLeaderWorkers cannot interleave. Holding the mutex for the entire
+// transition guarantees a concurrent startLeaderWorkers observes the
+// fully-stopped state (leaderWorkersStarted == false) and does not leave
+// orphan workers that a stop already ran past.
+func (s *Server) stopLeaderWorkers() {
+	s.leaderWorkerMu.Lock()
+	defer s.leaderWorkerMu.Unlock()
+	if !s.leaderWorkersStarted {
+		return
+	}
+	s.leaderWorkersStarted = false
+	cancel := s.leaderWorkerCancel
+	s.leaderWorkerCancel = nil
+	replayWorker := s.replayWorker
+	s.replayWorker = nil
+	expirySweepWorker := s.expirySweepWorker
+	s.expirySweepWorker = nil
+
+	if cancel != nil {
+		cancel()
+	}
+	s.leaderWorkerWG.Wait()
+	if replayWorker != nil {
+		replayWorker.Stop()
+	}
+	if expirySweepWorker != nil {
+		expirySweepWorker.Stop()
+	}
+	// Per-tenant FileGC: stop on every cached backend so FileGC reacts to a
+	// leadership loss for backends created while this pod was the leader.
+	if s.pool != nil {
+		s.pool.StopAllFileGC()
+	}
 	if s.semanticWorker != nil {
 		s.semanticWorker.Stop()
 	}
@@ -401,8 +616,32 @@ func (s *Server) Close() {
 	}
 }
 
-func (s *Server) resumeProvisioningTenants() {
-	ctx := backgroundWithTrace(context.Background())
+// startLeaderGoroutine launches a goroutine that runs fn under the leader
+// worker context. The goroutine is tracked by leaderWorkerWG and stops when
+// leadership is lost (leaderWorkerCtx is cancelled).
+func (s *Server) startLeaderGoroutine(ctx context.Context, fn func(context.Context)) {
+	s.leaderWorkerWG.Add(1)
+	go func() {
+		defer s.leaderWorkerWG.Done()
+		fn(ctx)
+	}()
+}
+
+// resumePendingTenantsWithCtx lists pending tenants and reconciles stale ones.
+func (s *Server) resumePendingTenantsWithCtx(ctx context.Context) {
+	tenants, err := s.meta.ListTenantsByStatus(ctx, meta.TenantPending, 1000)
+	if err != nil {
+		logger.Error(ctx, "resume_pending_list_failed", zap.Error(err))
+		return
+	}
+	for i := range tenants {
+		s.reconcilePendingTenant(ctx, tenants[i])
+	}
+}
+
+// resumeProvisioningTenantsWithCtx resumes provisioning tenants that were
+// interrupted by a previous restart.
+func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 	tenants, err := s.meta.ListTenantsByStatus(ctx, meta.TenantProvisioning, 1000)
 	if err != nil {
 		logger.Error(ctx, "resume_provisioning_list_failed", zap.Error(err))
@@ -414,6 +653,15 @@ func (s *Server) resumeProvisioningTenants() {
 			logger.Info(ctx, "resume_provisioning_fork",
 				zap.String("tenant_id", t.ID),
 				zap.String("parent_tenant_id", t.ParentTenantID))
+			if t.Provider == tenant.ProviderTiDBCloudNative && t.DBUser == "" {
+				logger.Error(ctx, "resume_provisioning_fork_no_credentials",
+					zap.String("tenant_id", t.ID),
+					zap.String("provider", t.Provider),
+					zap.String("cluster_id", t.ClusterID),
+					zap.String("branch_id", t.BranchID))
+				s.markForkFailed(ctx, t.ID)
+				continue
+			}
 			s.startForkProvision(ctx, t.ID)
 			continue
 		}
@@ -421,15 +669,65 @@ func (s *Server) resumeProvisioningTenants() {
 	}
 }
 
-func (s *Server) resumePendingTenants() {
-	ctx := backgroundWithTrace(context.Background())
-	tenants, err := s.meta.ListTenantsByStatus(ctx, meta.TenantPending, 1000)
-	if err != nil {
-		logger.Error(ctx, "resume_pending_list_failed", zap.Error(err))
-		return
+// resumeDeletingForkTenantsWithCtx resumes cleanup for deleting/failed fork tenants.
+func (s *Server) resumeDeletingForkTenantsWithCtx(ctx context.Context) {
+	for _, status := range []meta.TenantStatus{meta.TenantDeleting, meta.TenantFailed} {
+		tenants, err := s.meta.ListTenantsByStatus(ctx, status, 1000)
+		if err != nil {
+			logger.Error(ctx, "resume_fork_cleanup_list_failed", zap.String("status", string(status)), zap.Error(err))
+			continue
+		}
+		s.resumeForkCleanup(ctx, tenants)
 	}
-	for i := range tenants {
-		s.reconcilePendingTenant(ctx, tenants[i])
+}
+
+// onLead is the leader manager callback invoked when this pod gains leadership.
+func (s *Server) onLead() {
+	s.startLeaderWorkers()
+}
+
+// onLose is the leader manager callback invoked when this pod loses leadership.
+func (s *Server) onLose() {
+	s.stopLeaderWorkers()
+}
+
+// logSemanticWorkerStatus logs whether the semantic worker is enabled or disabled.
+// Called in single-pod mode (no leader manager) for backward-compatible logging.
+// Log-only: the workers are started by startLeaderWorkers (called just before
+// this in the no-leader path), so this must NOT call Start again (that would be
+// a redundant double-start and previously silently over-started them).
+func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallbackTaskTypes, poolAutoTaskTypes []string) {
+	ctx := backgroundWithTrace(context.Background())
+	if s.semanticWorker != nil {
+		fields := []zap.Field{
+			zap.Int("workers", s.semanticWorker.opts.Workers),
+			zap.Duration("poll_interval", s.semanticWorker.opts.PollInterval),
+			zap.Duration("lease_duration", s.semanticWorker.opts.LeaseDuration),
+			zap.Duration("recover_interval", s.semanticWorker.opts.RecoverInterval),
+			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
+			zap.Strings("app_managed_task_types", appManagedTaskTypes),
+			zap.Strings("fallback_task_types", fallbackTaskTypes),
+			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
+			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
+			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()),
+		}
+		fields = append(fields, s.semanticWorker.tenantScanLogFields()...)
+		logger.Info(ctx, "server_semantic_workers_enabled", fields...)
+	} else {
+		logger.Info(ctx, "server_semantic_workers_disabled",
+			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
+			zap.Strings("app_managed_task_types", appManagedTaskTypes),
+			zap.Strings("fallback_task_types", fallbackTaskTypes),
+			zap.Strings("pool_auto_task_types", poolAutoTaskTypes),
+			zap.Bool("fallback_present", cfg.Backend != nil),
+			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
+			zap.Bool("pool_present", cfg.Pool != nil),
+			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()))
+	}
+	if s.objectGCWorker != nil {
+		logger.Info(ctx, "server_object_gc_worker_enabled")
+	} else {
+		logger.Info(ctx, "server_object_gc_worker_disabled")
 	}
 }
 
@@ -443,26 +741,6 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
 		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.schemaInitForTenant(t.ID, t.Provider, s.provisioner.InitSchema))
 	})
-}
-
-func (s *Server) startPendingTenantReconciler() {
-	if s.forkWorkerCtx == nil || pendingTenantSweepEvery <= 0 {
-		return
-	}
-	s.forkWorkerWG.Add(1)
-	go func() {
-		defer s.forkWorkerWG.Done()
-		ticker := time.NewTicker(pendingTenantSweepEvery)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.forkWorkerCtx.Done():
-				return
-			case <-ticker.C:
-				s.resumePendingTenants()
-			}
-		}
-	}()
 }
 
 func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
@@ -1019,6 +1297,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_ok", "tenant_id", resolved.Tenant.ID, "status", resolved.Tenant.Status)...)
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          string(resolved.Tenant.Status),
+		Kind:            string(resolved.Tenant.Kind),
 		Message:         s.tenantStatusMessage(&resolved.Tenant),
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
@@ -1085,6 +1364,7 @@ func (s *Server) handleLocalTenantStatus(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(TenantStatusResponse{
 		Status:          "active",
+		Kind:            "live",
 		MaxUploadBytes:  s.maxUploadBytes,
 		InlineThreshold: s.inlineThreshold,
 	})
@@ -1258,6 +1538,7 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 		Size       int64  `json:"size"`
 		IsDir      bool   `json:"isDir"`
 		Mtime      int64  `json:"mtime,omitempty"`
+		Revision   int64  `json:"revision,omitempty"`
 		Mode       uint32 `json:"mode,omitempty"`
 		HasMode    bool   `json:"hasMode"`
 		ResourceID string `json:"resource_id,omitempty"`
@@ -1276,11 +1557,18 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request, path string)
 				nlink = uint32(parsed)
 			}
 		}
+		var revision int64
+		if raw := e.Meta.Content["revision"]; raw != "" {
+			if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil {
+				revision = parsed
+			}
+		}
 		out = append(out, entry{
 			Name:       e.Name,
 			Size:       e.Size,
 			IsDir:      e.IsDir,
 			Mtime:      mtime,
+			Revision:   revision,
 			Mode:       e.Mode,
 			HasMode:    hasMode,
 			ResourceID: e.Meta.Content["resource_id"],
@@ -1403,6 +1691,14 @@ func (s *Server) handleStatMetadata(w http.ResponseWriter, r *http.Request, path
 }
 
 func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string) {
+	timingEnabled := logger.BenchTimingLogEnabled()
+	var timingStart time.Time
+	var bodyReadDuration time.Duration
+	var backendWriteDuration time.Duration
+	var responseDuration time.Duration
+	if timingEnabled {
+		timingStart = time.Now()
+	}
 	if !authorizeFS(w, r, FSOpWrite, path) {
 		return
 	}
@@ -1482,7 +1778,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 				errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 				return
 			}
-			if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+			if isBackendQuotaExceeded(err) {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_storage_quota_exceeded", "path", path, "error", err)...)
 				metricEvent(r.Context(), "fs_write", "result", "error")
 				errJSON(w, http.StatusInsufficientStorage, err.Error())
@@ -1523,8 +1819,18 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
+	bodyReadStart := time.Time{}
+	if timingEnabled {
+		bodyReadStart = time.Now()
+	}
 	data, err := io.ReadAll(body)
+	if timingEnabled {
+		bodyReadDuration = time.Since(bodyReadStart)
+	}
 	if err != nil {
+		if timingEnabled {
+			logServerWriteTiming(r.Context(), path, 0, expectedRevision, 0, "body_read_error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), err)
+		}
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_body_too_large", "path", path, "max", s.maxUploadBytes)...)
@@ -1539,18 +1845,31 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	}
 	description := r.Header.Get("X-Dat9-Description")
 	if utf8.RuneCountInString(description) > backend.MaxDescriptionLen {
+		if timingEnabled {
+			logServerWriteTiming(r.Context(), path, len(data), expectedRevision, 0, "validation_error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), nil)
+		}
 		errJSON(w, http.StatusBadRequest, fmt.Sprintf("description exceeds %d characters", backend.MaxDescriptionLen))
 		return
 	}
+	backendWriteStart := time.Time{}
+	if timingEnabled {
+		backendWriteStart = time.Now()
+	}
 	_, committedRevision, err := b.WriteCtxIfRevisionWithTagsResult(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags, description)
+	if timingEnabled {
+		backendWriteDuration = time.Since(backendWriteStart)
+	}
 	if err != nil {
+		if timingEnabled {
+			logServerWriteTiming(r.Context(), path, len(data), expectedRevision, 0, "error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), err)
+		}
 		if errors.Is(err, backend.ErrUploadTooLarge) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_too_large_backend", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_storage_quota_exceeded", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusInsufficientStorage, err.Error())
@@ -1574,8 +1893,38 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "write_ok", "path", path, "bytes", len(data))...)
 	metricEvent(r.Context(), "fs_write", "result", "ok")
 	recordTenantFileBytes(r.Context(), "fs", "write", "write", int64(len(data)))
+	responseStart := time.Time{}
+	if timingEnabled {
+		responseStart = time.Now()
+	}
 	s.publishEvent(r, path, "write")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": committedRevision})
+	if timingEnabled {
+		responseDuration = time.Since(responseStart)
+		logServerWriteTiming(r.Context(), path, len(data), expectedRevision, committedRevision, "ok", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), nil)
+	}
+}
+
+func logServerWriteTiming(ctx context.Context, path string, bytes int, expectedRevision, committedRevision int64, result string, bodyReadDuration, backendWriteDuration, responseDuration, totalDuration time.Duration, err error) {
+	fields := []zap.Field{
+		zap.String("path", path),
+		zap.String("result", result),
+		zap.Int("bytes", bytes),
+		zap.Int64("expected_revision", expectedRevision),
+		zap.Int64("committed_revision", committedRevision),
+		zap.Float64("body_read_ms", serverDurationMs(bodyReadDuration)),
+		zap.Float64("backend_write_ms", serverDurationMs(backendWriteDuration)),
+		zap.Float64("response_ms", serverDurationMs(responseDuration)),
+		zap.Float64("total_ms", serverDurationMs(totalDuration)),
+	}
+	if err != nil {
+		fields = append(fields, zap.Error(err))
+	}
+	logger.InfoBenchTiming(ctx, "server_write_timing", fields...)
+}
+
+func serverDurationMs(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000.0
 }
 
 func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string) {
@@ -1633,7 +1982,7 @@ func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "patch_storage_quota_exceeded", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_patch", "result", "error")
 			errJSON(w, http.StatusInsufficientStorage, err.Error())
@@ -1731,7 +2080,7 @@ func (s *Server) handleAppend(w http.ResponseWriter, r *http.Request, path strin
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "append_storage_quota_exceeded", "path", path, "error", err)...)
 			metricEvent(r.Context(), "fs_append", "result", "error")
 			errJSON(w, http.StatusInsufficientStorage, err.Error())
@@ -2459,7 +2808,7 @@ func (s *Server) handleSymlink(w http.ResponseWriter, r *http.Request, path stri
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "symlink_storage_quota_exceeded", "path", path, "error", err)...)
 			errJSON(w, http.StatusInsufficientStorage, err.Error())
 			return
@@ -2628,7 +2977,7 @@ func (s *Server) handleUploadInitiate(w http.ResponseWriter, r *http.Request, b 
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "upload_initiate_storage_quota_exceeded", "path", req.Path, "error", err)...)
 			metricEvent(r.Context(), "fs_write", "result", "error")
 			errJSON(w, http.StatusInsufficientStorage, err.Error())
@@ -3100,7 +3449,7 @@ func (s *Server) handleV2UploadInitiate(w http.ResponseWriter, r *http.Request) 
 			errJSON(w, http.StatusRequestEntityTooLarge, err.Error())
 			return
 		}
-		if errors.Is(err, backend.ErrStorageQuotaExceeded) {
+		if isBackendQuotaExceeded(err) {
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "v2_upload_initiate_storage_quota_exceeded", "path", req.Path, "error", err)...)
 			metricEvent(r.Context(), "v2_upload_initiate", "result", "error")
 			errJSON(w, http.StatusInsufficientStorage, err.Error())

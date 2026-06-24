@@ -5,6 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/mem9-ai/drive9/pkg/logger"
 )
 
 // MetaQuotaStore defines the interface for central quota operations on the
@@ -13,23 +17,27 @@ import (
 type MetaQuotaStore interface {
 	// Config
 	GetQuotaConfig(ctx context.Context, tenantID string) (*QuotaConfigView, error)
+	GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error)
 
 	// Counters
 	GetQuotaUsage(ctx context.Context, tenantID string) (*QuotaUsageView, error)
 	EnsureQuotaUsageRow(ctx context.Context, tenantID string) error
 	IncrStorageBytes(ctx context.Context, tenantID string, delta int64) error
 	IncrReservedBytes(ctx context.Context, tenantID string, delta int64) error
+	IncrFileCount(ctx context.Context, tenantID string, delta int64) error
 	IncrMediaFileCount(ctx context.Context, tenantID string, delta int64) error
 	TransferReservedToConfirmed(ctx context.Context, tenantID string, reservedDelta, storageDelta int64) error
 	AtomicReserveAndInsertUpload(ctx context.Context, r *UploadReservationView) error
 	IncrStorageBytesTx(tx *sql.Tx, tenantID string, delta int64) error
 	IncrReservedBytesTx(tx *sql.Tx, tenantID string, delta int64) error
+	IncrFileCountTx(tx *sql.Tx, tenantID string, delta int64) error
 	IncrMediaFileCountTx(tx *sql.Tx, tenantID string, delta int64) error
 	TransferReservedToConfirmedTx(tx *sql.Tx, tenantID string, reservedDelta, storageDelta int64) error
 
 	// File meta (server-authored shadow state)
 	UpsertFileMeta(ctx context.Context, fm *FileMetaView) error
 	GetFileMeta(ctx context.Context, tenantID, fileID string) (*FileMetaView, error)
+	GetFileMetaForUpdateTx(tx *sql.Tx, tenantID, fileID string) (*FileMetaView, error)
 	DeleteFileMeta(ctx context.Context, tenantID, fileID string) error
 	UpsertFileMetaTx(tx *sql.Tx, fm *FileMetaView) error
 	DeleteFileMetaTx(tx *sql.Tx, tenantID, fileID string) error
@@ -40,7 +48,7 @@ type MetaQuotaStore interface {
 	UpdateUploadReservationStatus(ctx context.Context, tenantID, uploadID, status string) error
 	GetUploadReservation(ctx context.Context, tenantID, uploadID string) (*UploadReservationView, error)
 	UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID, uploadID, status string) error
-	SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (settled bool, err error)
+	SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (settled bool, fileCountDelta int64, err error)
 
 	// LLM cost
 	InsertCentralLLMUsage(ctx context.Context, r *LLMUsageView) error
@@ -64,6 +72,8 @@ type MetaQuotaStore interface {
 type QuotaConfigView struct {
 	TenantID         string
 	MaxStorageBytes  int64
+	MaxFileSizeBytes int64
+	MaxFileCount     int64
 	MaxMediaLLMFiles int64
 	MaxMonthlyCostMC int64
 }
@@ -73,6 +83,7 @@ type QuotaUsageView struct {
 	TenantID       string
 	StorageBytes   int64
 	ReservedBytes  int64
+	FileCount      int64
 	MediaFileCount int64
 }
 
@@ -86,12 +97,13 @@ type FileMetaView struct {
 
 // UploadReservationView is the backend-side view of an upload reservation.
 type UploadReservationView struct {
-	TenantID      string
-	UploadID      string
-	ReservedBytes int64
-	TargetPath    string
-	Status        string
-	ExpiresAt     time.Time
+	TenantID       string
+	UploadID       string
+	ReservedBytes  int64
+	FileCountDelta int64
+	TargetPath     string
+	Status         string
+	ExpiresAt      time.Time
 }
 
 // LLMUsageView is the backend-side view of a billable LLM call record.
@@ -115,9 +127,25 @@ type MutationLogView struct {
 
 // SetMetaQuotaStore sets the central quota store on the backend.
 // Called by tenant.Pool after backend creation.
-func (b *Dat9Backend) SetMetaQuotaStore(tenantID string, mqs MetaQuotaStore) {
+func (b *Dat9Backend) SetMetaQuotaStore(ctx context.Context, tenantID string, mqs MetaQuotaStore) {
 	b.tenantID = tenantID
 	b.metaStore = mqs
+	if mqs != nil {
+		if err := mqs.EnsureQuotaUsageRow(ctx, tenantID); err != nil {
+			logger.Warn(ctx, "ensure_quota_usage_row_failed",
+				zap.String("tenant_id", tenantID),
+				zap.Error(err))
+		}
+	}
+	if mqs != nil && b.quotaSource == QuotaSourceServer {
+		b.quotaConfigCache = newQuotaConfigCache(tenantID, mqs)
+		b.quotaUsageCache = newQuotaUsageCache(tenantID, mqs, quotaUsageCacheTTL)
+		if b.store != nil {
+			b.quotaPendingCache = newQuotaPendingDeltasCache(b.store.PendingQuotaOutboxDeltas, quotaPendingDeltasCacheTTL)
+		}
+		b.startMutationWorker()
+		b.startQuotaOutboxWorker()
+	}
 }
 
 // TenantID returns the tenant identifier for this backend instance.

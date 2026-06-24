@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/mem9-ai/drive9/pkg/meta"
 )
 
 func newServerQuotaBackend(t *testing.T, opts Options) (*Dat9Backend, *fakeMetaQuotaStore) {
@@ -19,34 +20,111 @@ func newServerQuotaBackend(t *testing.T, opts Options) (*Dat9Backend, *fakeMetaQ
 	fake.config["tenant-a"] = &QuotaConfigView{
 		TenantID:         "tenant-a",
 		MaxStorageBytes:  1 << 30,
+		MaxFileSizeBytes: meta.DefaultMaxFileSizeBytes(),
+		MaxFileCount:     0,
 		MaxMediaLLMFiles: 1000,
 		MaxMonthlyCostMC: 1 << 30,
 	}
-	b.SetMetaQuotaStore("tenant-a", fake)
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
 	return b, fake
 }
 
-func TestServerQuotaFeatureFlagRejectsOverLimitWrite(t *testing.T) {
-	b, fake := newServerQuotaBackend(t, Options{})
-	ctx := context.Background()
-
-	fake.mu.Lock()
-	fake.config["tenant-a"].MaxStorageBytes = 10
-	fake.mu.Unlock()
-
-	if _, err := b.Write("/alpha.txt", []byte("12345678"), 0, filesystem.WriteFlagCreate); err != nil {
-		t.Fatalf("create within central quota: %v", err)
+func waitForFakeCentralLLMUsage(t *testing.T, fake *fakeMetaQuotaStore, tenantID string, wantMonthly int64, wantUsageLen int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		fake.mu.Lock()
+		gotMonthly := fake.monthly[tenantID]
+		gotUsageLen := len(fake.llmUsage)
+		fake.mu.Unlock()
+		if gotMonthly == wantMonthly && gotUsageLen == wantUsageLen {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("central llm usage monthly=%d len=%d, want monthly=%d len=%d",
+				gotMonthly, gotUsageLen, wantMonthly, wantUsageLen)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func TestServerQuotaFeatureFlagRejectsOverLimitWrite(t *testing.T) {
+	opts := Options{}
+	opts.QuotaSource = QuotaSourceServer
+	b := newTestBackendWithOptions(t, opts)
+	fake := newFakeMetaQuotaStore()
+	fake.config["tenant-a"] = &QuotaConfigView{
+		TenantID:         "tenant-a",
+		MaxStorageBytes:  10,
+		MaxMediaLLMFiles: 1000,
+		MaxMonthlyCostMC: 1 << 30,
+	}
+	// Pre-seed usage near the limit so the cache snapshot (loaded
+	// synchronously in SetMetaQuotaStore) already reflects near-full state.
+	// This avoids depending on async mutation timing from a prior write.
+	fake.usage["tenant-a"] = &QuotaUsageView{
+		TenantID:     "tenant-a",
+		StorageBytes: 8,
+	}
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
+
 	if _, err := b.Write("/beta.txt", []byte("xyz"), 0, filesystem.WriteFlagCreate); !errors.Is(err, ErrStorageQuotaExceeded) {
 		t.Fatalf("expected ErrStorageQuotaExceeded from server quota path, got %v", err)
 	}
 
-	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	// Verify usage unchanged after rejected write.
+	usage, err := fake.GetQuotaUsage(context.Background(), "tenant-a")
 	if err != nil {
 		t.Fatalf("get central usage: %v", err)
 	}
 	if usage.StorageBytes != 8 || usage.ReservedBytes != 0 {
 		t.Fatalf("usage after rejected write = %+v", usage)
+	}
+}
+
+func TestServerQuotaRejectsOverFileSizeLimit(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	ctx := context.Background()
+
+	fake.mu.Lock()
+	fake.config["tenant-a"].MaxFileSizeBytes = 4
+	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(ctx)
+
+	if _, err := b.WriteCtx(ctx, "/too-large.txt", []byte("12345"), 0, filesystem.WriteFlagCreate); !errors.Is(err, ErrFileSizeQuotaExceeded) {
+		t.Fatalf("write error = %v, want ErrFileSizeQuotaExceeded", err)
+	}
+	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.StorageBytes != 0 || usage.FileCount != 0 {
+		t.Fatalf("usage after rejected write = %+v, want zero", usage)
+	}
+}
+
+func TestServerQuotaPendingOutboxFileDeltaRejectsOverFileCount(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	fake.mu.Lock()
+	fake.config["tenant-a"].MaxFileCount = 1
+	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(ctx)
+
+	if _, err := b.WriteCtx(ctx, "/first.txt", []byte("a"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.FileCount != 0 {
+		t.Fatalf("central file count before outbox drain = %d, want 0", usage.FileCount)
+	}
+	if _, err := b.WriteCtx(ctx, "/second.txt", []byte("b"), 0, filesystem.WriteFlagCreate); !errors.Is(err, ErrFileCountQuotaExceeded) {
+		t.Fatalf("second write error = %v, want ErrFileCountQuotaExceeded", err)
 	}
 }
 
@@ -63,6 +141,7 @@ func TestServerModeBudgetGateWritesCentralOnly(t *testing.T) {
 	fake.mu.Lock()
 	fake.config["tenant-a"].MaxMonthlyCostMC = 100
 	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(context.Background())
 
 	b.recordImageExtractUsage("task-server-budget", ImageExtractUsage{
 		PromptTokens:     120,
@@ -77,16 +156,7 @@ func TestServerModeBudgetGateWritesCentralOnly(t *testing.T) {
 		t.Fatalf("tenant monthly llm cost = %d, want 0 in server mode", total)
 	}
 
-	fake.mu.Lock()
-	gotMonthly := fake.monthly["tenant-a"]
-	gotUsageLen := len(fake.llmUsage)
-	fake.mu.Unlock()
-	if gotMonthly != 200 {
-		t.Fatalf("central monthly llm cost = %d, want 200", gotMonthly)
-	}
-	if gotUsageLen != 1 {
-		t.Fatalf("central llm usage len = %d, want 1", gotUsageLen)
-	}
+	waitForFakeCentralLLMUsage(t, fake, "tenant-a", 200, 1)
 	if !b.monthlyLLMCostExceededCheck(context.Background()) {
 		t.Fatal("expected central monthly budget check to trip in server mode")
 	}
@@ -115,7 +185,7 @@ func TestServerQuotaUploadOverwriteDeltaIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get central usage: %v", err)
 	}
-	if usage.StorageBytes != totalSize || usage.ReservedBytes != 0 || usage.MediaFileCount != 1 {
+	if usage.StorageBytes != totalSize || usage.ReservedBytes != 0 || usage.FileCount != 1 || usage.MediaFileCount != 1 {
 		t.Fatalf("usage after overwrite upload = %+v", usage)
 	}
 
@@ -211,6 +281,7 @@ func TestMutationReplayWorkerAppliesPendingUploadComplete(t *testing.T) {
 		TenantID:       "tenant-a",
 		StorageBytes:   7,
 		ReservedBytes:  32,
+		FileCount:      1,
 		MediaFileCount: 1,
 	}
 	fake.fileMeta[metaKey("tenant-a", "file-1")] = &FileMetaView{

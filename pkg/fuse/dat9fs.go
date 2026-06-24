@@ -246,7 +246,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		committedRev:      make(map[string]int64),
 		remoteCommitLocks: make(map[string]*sync.Mutex),
 		readCache:         NewReadCacheWithMaxFileSize(opts.CacheSize, opts.ReadCacheTTL, opts.ReadCacheMaxFileBytes),
-		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, defaultNamespaceCacheMaxEntries),
+		dirCache:          NewNamespaceCache(opts.DirTTL, opts.NegativeEntryTTL, dirCacheMaxEntriesOrDefault(opts.DirCacheMaxEntries)),
 		readSlots:         make(chan struct{}, readConcurrencyOrDefault(opts.ReadConcurrency)),
 		dirtyInodes:       make(map[uint64]dirtyInodeState),
 		specialByPath:     make(map[string]uint64),
@@ -336,6 +336,13 @@ const (
 func readConcurrencyOrDefault(n int) int {
 	if n <= 0 {
 		return defaultRemoteReadConcurrency
+	}
+	return n
+}
+
+func dirCacheMaxEntriesOrDefault(n int) int {
+	if n <= 0 {
+		return defaultNamespaceCacheMaxEntries
 	}
 	return n
 }
@@ -2809,15 +2816,24 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 		return syscall.ENOTSUP
 	}
 	mode, hasMode := fs.modeForPendingHandle(fh)
-	return fs.writeBack.PutWithBaseRevAndMode(
+
+	bvStart := time.Now()
+	data := fh.Dirty.bytesView()
+	bvDur := time.Since(bvStart)
+
+	timings, err := fs.writeBack.PutWithBaseRevAndModeTimings(
 		fh.Path,
-		fh.Dirty.bytesView(),
+		data,
 		fh.Dirty.Size(),
 		fs.pendingKindForHandle(fh),
 		fh.BaseRev,
 		mode,
 		hasMode,
 	)
+	if fs.perf != nil {
+		fs.perf.recordSnapshotWBSubPhases(bvDur, timings)
+	}
+	return err
 }
 
 func (fs *Dat9FS) loadWritableHandleFromShadowLocked(fh *FileHandle, meta *WriteBackMeta) error {
@@ -2871,11 +2887,10 @@ func (fs *Dat9FS) loadWritableHandleFromWriteBackLocked(fh *FileHandle) bool {
 		return false
 	}
 
-	meta, ok := fs.writeBack.GetMeta(fh.Path)
-	if !ok {
-		return false
-	}
-	data, ok := fs.writeBack.getView(fh.Path)
+	// Atomically read meta + data under one pathLock to guarantee they are
+	// from the same generation. A concurrent Put could otherwise replace the
+	// .dat between GetMeta and getView, giving us old BaseRev with new data.
+	meta, data, ok := fs.writeBack.GetMetaAndView(fh.Path)
 	if !ok {
 		return false
 	}
@@ -4459,6 +4474,7 @@ func cachedFileInfos(items []client.FileInfo) []CachedFileInfo {
 			Size:       item.Size,
 			IsDir:      item.IsDir,
 			Mtime:      mtime,
+			Revision:   item.Revision,
 			Mode:       item.Mode,
 			HasMode:    item.HasMode,
 			ResourceID: item.ResourceID,
@@ -8172,25 +8188,50 @@ func (fs *Dat9FS) applyBatchStats(ctx context.Context, dirPath string, items []C
 	if len(items) == 0 {
 		return
 	}
-	for start := 0; start < len(items); start += client.MaxBatchStatPaths {
-		end := start + client.MaxBatchStatPaths
-		if end > len(items) {
-			end = len(items)
+
+	// Collect indices of items that need a BatchStat (revision unknown).
+	// When the server list response includes revision (revision > 0), the
+	// item already has full metadata and no per-file stat is needed.
+	// This is backward-compatible: old servers that omit revision leave it
+	// at 0, so those entries still go through BatchStat.
+	//
+	// Directories are always skipped: they have no file revision, and the
+	// list API already returns their full metadata (name, isDir, mtime,
+	// mode, resourceID, nlink). BatchStat added no new information for
+	// directories.
+	var needStat []int
+	for i := range items {
+		if items[i].IsDir {
+			continue
 		}
-		paths := make([]string, end-start)
-		for i := start; i < end; i++ {
-			paths[i-start] = fs.remotePath(dirEntryChildPath(dirPath, items[i].Name))
+		if items[i].Revision <= 0 {
+			needStat = append(needStat, i)
+		}
+	}
+	if len(needStat) == 0 {
+		return
+	}
+
+	for batchStart := 0; batchStart < len(needStat); batchStart += client.MaxBatchStatPaths {
+		batchEnd := batchStart + client.MaxBatchStatPaths
+		if batchEnd > len(needStat) {
+			batchEnd = len(needStat)
+		}
+		batch := needStat[batchStart:batchEnd]
+		paths := make([]string, len(batch))
+		for j, idx := range batch {
+			paths[j] = fs.remotePath(dirEntryChildPath(dirPath, items[idx].Name))
 		}
 		results, err := fs.client.BatchStatCtx(ctx, paths)
 		if err != nil {
-			log.Printf("batch stat failed for %s entries %d-%d: %v", dirPath, start, end, err)
+			log.Printf("batch stat failed for %s (needStat batch %d-%d of %d): %v", dirPath, batchStart, batchEnd, len(needStat), err)
 			return
 		}
-		for i, result := range results {
+		for j, result := range results {
 			if !result.OK() {
 				continue
 			}
-			item := &items[start+i]
+			item := &items[batch[j]]
 			item.Size = result.Size
 			item.IsDir = result.IsDir
 			if result.Mtime > 0 {
@@ -10220,23 +10261,30 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 					stageStart := time.Now()
 					fs.debugf("flush stage shadow start path=%s size=%d durable=true", fh.Path, size)
 					err := fs.stageShadowForQueuedCommitLocked(fh, true)
+					stageDur := time.Since(stageStart)
 					fs.debugDurationf(stageStart, 0, "flush stage shadow done path=%s size=%d err=%v", fh.Path, size, err)
+					fs.perf.recordFlushStageShadow(stageDur)
 					if err != nil {
 						log.Printf("shadow stage failed for %s: %v, falling through", fh.Path, err)
 					} else {
 						phase = "small-snapshot-writeback"
+						snapWBStart := time.Now()
 						if err := fs.snapshotWriteBackLocked(fh); err != nil && fs.writeBack != nil {
 							log.Printf("writeback snapshot failed for %s: %v", fh.Path, err)
 						}
+						fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart))
 						fh.WriteBackSeq = fh.DirtySeq
 						return gofuse.OK
 					}
 				}
 
 				phase = "small-snapshot-writeback"
+				snapWBStart2 := time.Now()
 				if err := fs.snapshotWriteBackLocked(fh); err != nil {
+					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
 					log.Printf("writeback cache put failed for %s: %v, falling back to sync upload", fh.Path, err)
 				} else {
+					fs.perf.recordFlushSnapshotWB(time.Since(snapWBStart2))
 					if fs.pendingIndex != nil {
 						_, _ = fs.pendingIndex.PutWithBaseRev(fh.Path, size, fs.pendingKindForHandle(fh), fh.BaseRev)
 					}
@@ -10275,7 +10323,9 @@ func (fs *Dat9FS) Flush(cancel <-chan struct{}, input *gofuse.FlushIn) (status g
 			stageStart := time.Now()
 			fs.debugf("flush shadowspill stage start path=%s size=%d durable=true", fh.Path, size)
 			err := fs.stageShadowForQueuedCommitLocked(fh, true)
+			largeStageDur := time.Since(stageStart)
 			fs.debugDurationf(stageStart, 0, "flush shadowspill stage done path=%s size=%d err=%v", fh.Path, size, err)
+			fs.perf.recordFlushStageShadow(largeStageDur)
 			if err != nil {
 				log.Printf("flush: shadow stage failed for ShadowSpill %s (size=%d): %v, falling through to sync upload", fh.Path, fh.Dirty.Size(), err)
 			} else {

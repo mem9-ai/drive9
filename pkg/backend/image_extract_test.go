@@ -54,14 +54,28 @@ func TestAsyncImageExtractUpdatesContentText(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
-			Workers:   1,
-			QueueSize: 8,
 			Extractor: &staticImageExtractor{text: "cat on sofa screenshot invoice"},
 		},
 	})
 
 	if _, err := b.Write("/img/a.png", []byte("fake-png"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
+	}
+	// Durable delivery: the write enqueues an img_extract_text task, but the
+	// semantic worker is not running in backend tests. Call the processing
+	// function directly as the worker would.
+	fileID, _, _, _ := mustFileForPath(t, b, "/img/a.png")
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/a.png",
+		ContentType: "image/png",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
 	}
 
 	got := waitForContentText(t, b, "/img/a.png", 2*time.Second)
@@ -112,8 +126,6 @@ func TestAsyncImageExtractSkipsStaleChecksum(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
-			Workers:   1,
-			QueueSize: 8,
 			Extractor: extractor,
 		},
 	})
@@ -121,17 +133,55 @@ func TestAsyncImageExtractSkipsStaleChecksum(t *testing.T) {
 	if _, err := b.Write("/img/b.png", []byte("first-image-bytes"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
+	fileID, _, _, _ := mustFileForPath(t, b, "/img/b.png")
 
+	// Start extraction for revision 1 (gated — blocks until released).
+	resultCh := make(chan ImageExtractResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+			FileID:      fileID,
+			Path:        "/img/b.png",
+			ContentType: "image/png",
+			Revision:    1,
+		})
+		resultCh <- result
+		errCh <- err
+	}()
 	select {
 	case <-extractor.started:
 	case <-time.After(2 * time.Second):
 		t.Fatal("first extraction did not start")
 	}
 
+	// Overwrite to revision 2 while revision 1 extraction is in-flight.
 	if _, err := b.Write("/img/b.png", []byte("second-image-bytes"), 0, filesystem.WriteFlagTruncate); err != nil {
 		t.Fatal(err)
 	}
 	close(extractor.release)
+
+	// The stale revision 1 extraction should complete without writing.
+	if gotErr := <-errCh; gotErr != nil {
+		t.Fatal(gotErr)
+	}
+	if got := <-resultCh; got != ImageExtractResultStale {
+		t.Fatalf("stale result=%q, want %q", got, ImageExtractResultStale)
+	}
+
+	// Now process revision 2 directly.
+	_, revision, _, _ := mustFileForPath(t, b, "/img/b.png")
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/b.png",
+		ContentType: "image/png",
+		Revision:    revision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
+	}
 
 	got := waitForContentText(t, b, "/img/b.png", 3*time.Second)
 	if got != "new caption" {
@@ -209,30 +259,23 @@ func TestAsyncImageExtractAutoEmbeddingStaleResultDoesNotQueueOrOverwriteCurrent
 }
 
 func TestAsyncImageExtractRequeuesSucceededEmbedTask(t *testing.T) {
-	extractor := &gatedImageExtractor{
-		started: make(chan struct{}, 1),
-		release: make(chan struct{}),
-	}
 	b := newTestBackendWithOptions(t, Options{
+		AppSemanticTasksEnabled: true,
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
-			Workers:   1,
-			QueueSize: 8,
-			Extractor: extractor,
+			Extractor: &staticImageExtractor{text: "old caption"},
 		},
 	})
 
 	if _, err := b.Write("/img/requeue.png", []byte("first-image-bytes"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-extractor.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("image extraction did not start")
-	}
-
 	fileID, _, _, _ := mustFileForPath(t, b, "/img/requeue.png")
-	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), time.Now().UTC(), time.Minute)
+
+	// Claim and ack the initial embed task (simulating the worker processing
+	// it first and finding empty content_text → ack obsolete).
+	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), time.Now().UTC(), time.Minute,
+		semantic.TaskTypeEmbed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,19 +285,38 @@ func TestAsyncImageExtractRequeuesSucceededEmbedTask(t *testing.T) {
 	if err := b.Store().AckSemanticTask(context.Background(), claimed.TaskID, claimed.Receipt); err != nil {
 		t.Fatal(err)
 	}
-	close(extractor.release)
+
+	// Now run image extraction directly. On success it writes content_text
+	// and bridges a fresh embed task via EnsureSemanticTaskQueuedTx.
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/requeue.png",
+		ContentType: "image/png",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
+	}
 
 	got := waitForContentText(t, b, "/img/requeue.png", 3*time.Second)
 	if got != "old caption" {
 		t.Fatalf("expected extracted text %q, got %q", "old caption", got)
 	}
 
+	// After successful extraction, the embed task should be requeued (bridged)
+	// via EnsureSemanticTaskQueuedTx.
 	tasks := loadSemanticTasksForFile(t, b, fileID)
-	if len(tasks) != 1 {
-		t.Fatalf("semantic task count=%d, want 1", len(tasks))
+	var embedQueued int
+	for _, task := range tasks {
+		if task.TaskType == string(semantic.TaskTypeEmbed) && task.Status == "queued" {
+			embedQueued++
+		}
 	}
-	if tasks[0].ResourceVersion != 1 || tasks[0].Status != "queued" {
-		t.Fatalf("expected image bridge to requeue embed task, got %+v", tasks[0])
+	if embedQueued != 1 {
+		t.Fatalf("expected 1 queued embed task (image bridge requeue), got %d (all tasks: %+v)", embedQueued, tasks)
 	}
 }
 
@@ -264,10 +326,9 @@ func TestAsyncImageExtractStaleResultDoesNotRequeueOldRevision(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	b := newTestBackendWithOptions(t, Options{
+		AppSemanticTasksEnabled: true,
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
-			Workers:   1,
-			QueueSize: 8,
 			Extractor: extractor,
 		},
 	})
@@ -275,14 +336,12 @@ func TestAsyncImageExtractStaleResultDoesNotRequeueOldRevision(t *testing.T) {
 	if _, err := b.Write("/img/stale.png", []byte("first-image-bytes"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case <-extractor.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first extraction did not start")
-	}
-
 	fileID, _, _, _ := mustFileForPath(t, b, "/img/stale.png")
-	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), time.Now().UTC(), time.Minute)
+
+	// Claim and ack the initial embed task (simulating the worker processing
+	// it first). Use a type filter to claim only embed tasks.
+	claimed, found, err := b.Store().ClaimSemanticTask(context.Background(), time.Now().UTC(), time.Minute,
+		semantic.TaskTypeEmbed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,30 +352,85 @@ func TestAsyncImageExtractStaleResultDoesNotRequeueOldRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Start image extraction for revision 1 (gated).
+	resultCh := make(chan ImageExtractResult, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+			FileID:      fileID,
+			Path:        "/img/stale.png",
+			ContentType: "image/png",
+			Revision:    1,
+		})
+		resultCh <- result
+		errCh <- err
+	}()
+	select {
+	case <-extractor.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first extraction did not start")
+	}
+
+	// Overwrite to revision 2 while revision 1 extraction is in-flight.
 	if _, err := b.Write("/img/stale.png", []byte("second-image-bytes"), 0, filesystem.WriteFlagTruncate); err != nil {
 		t.Fatal(err)
 	}
 	close(extractor.release)
+
+	// The stale revision 1 extraction should complete as stale (not write).
+	if gotErr := <-errCh; gotErr != nil {
+		t.Fatal(gotErr)
+	}
+	if got := <-resultCh; got != ImageExtractResultStale {
+		t.Fatalf("stale result=%q, want %q", got, ImageExtractResultStale)
+	}
+
+	// Process revision 2 directly.
+	_, revision, _, _ := mustFileForPath(t, b, "/img/stale.png")
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/stale.png",
+		ContentType: "image/png",
+		Revision:    revision,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
+	}
 
 	got := waitForContentText(t, b, "/img/stale.png", 3*time.Second)
 	if got != "new caption" {
 		t.Fatalf("expected final extracted text %q, got %q", "new caption", got)
 	}
 
+	// Verify the embed task for revision 1 stays terminal (succeeded) and
+	// revision 2's embed task remains queued. The img_extract_text tasks are
+	// separate rows and are not checked here.
 	tasks := loadSemanticTasksForFile(t, b, fileID)
-	if len(tasks) != 2 {
-		t.Fatalf("semantic task count=%d, want 2", len(tasks))
+	var embedSucceeded, embedQueued int
+	for _, task := range tasks {
+		if task.TaskType == string(semantic.TaskTypeEmbed) {
+			switch {
+			case task.ResourceVersion == 1 && task.Status == "succeeded":
+				embedSucceeded++
+			case task.ResourceVersion == 2 && task.Status == "queued":
+				embedQueued++
+			}
+		}
 	}
-	if tasks[0].ResourceVersion != 1 || tasks[0].Status != "succeeded" {
-		t.Fatalf("stale revision task should stay terminal, got %+v", tasks[0])
+	if embedSucceeded != 1 {
+		t.Fatalf("expected 1 succeeded embed task for revision 1, got %d (all tasks: %+v)", embedSucceeded, tasks)
 	}
-	if tasks[1].ResourceVersion != 2 || tasks[1].Status != "queued" {
-		t.Fatalf("current revision task should remain queued, got %+v", tasks[1])
+	if embedQueued != 1 {
+		t.Fatalf("expected 1 queued embed task for revision 2, got %d (all tasks: %+v)", embedQueued, tasks)
 	}
 }
 
 func TestProcessImageExtractTaskWritesContentTextAndQueuesEmbedTask(t *testing.T) {
 	b := newTestBackendWithOptions(t, Options{
+		AppSemanticTasksEnabled: true,
 		AsyncImageExtract: AsyncImageExtractOptions{
 			Enabled:   true,
 			Workers:   1,
@@ -352,6 +466,44 @@ func TestProcessImageExtractTaskWritesContentTextAndQueuesEmbedTask(t *testing.T
 	}
 	if tasks[0].TaskType != "embed" || tasks[0].ResourceVersion != 1 || tasks[0].Status != "queued" {
 		t.Fatalf("unexpected semantic task: %+v", tasks[0])
+	}
+}
+
+func TestProcessImageExtractTaskDisabledSemanticWritesTextButSkipsEmbedTask(t *testing.T) {
+	b := newTestBackendWithOptions(t, Options{
+		// AppSemanticTasksEnabled intentionally false — simulates deployment
+		// without DRIVE9_EMBED_* worker configured.
+		AsyncImageExtract: AsyncImageExtractOptions{
+			Enabled:   true,
+			Workers:   1,
+			QueueSize: 8,
+			Extractor: &staticImageExtractor{text: "cat on sofa screenshot invoice"},
+		},
+	})
+
+	fileID := insertImageFileForExtractTest(t, b, "/img/disabled-embed.png", "image/png", []byte("fake-png"))
+	result, err := b.ProcessImageExtractTask(context.Background(), ImageExtractTaskSpec{
+		FileID:      fileID,
+		Path:        "/img/disabled-embed.png",
+		ContentType: "image/png",
+		Revision:    1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result != ImageExtractResultWritten {
+		t.Fatalf("result=%q, want %q", result, ImageExtractResultWritten)
+	}
+
+	nf, err := b.Store().Stat(context.Background(), "/img/disabled-embed.png")
+	if err != nil || nf.File == nil {
+		t.Fatalf("stat /img/disabled-embed.png: %v", err)
+	}
+	if !strings.Contains(nf.File.ContentText, "cat on sofa") {
+		t.Fatalf("content_text should be written even with disabled semantic tasks, got %q", nf.File.ContentText)
+	}
+	if tasks := loadSemanticTasksForFile(t, b, fileID); len(tasks) != 0 {
+		t.Fatalf("semantic task count=%d, want 0 when AppSemanticTasksEnabled=false", len(tasks))
 	}
 }
 

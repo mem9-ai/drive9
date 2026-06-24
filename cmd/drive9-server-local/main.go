@@ -142,6 +142,7 @@ func main() {
 		}
 	}
 	backendOpts.MaxUploadBytes = maxUploadBytes
+	meta.SetDefaultMaxFileSizeBytes(maxUploadBytes)
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_backend_options")
 
 	stepStart = time.Now()
@@ -176,6 +177,7 @@ func main() {
 	if semanticEmbedder != nil && backendOpts.QueryEmbedding.Client == nil {
 		backendOpts.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
+	backendOpts.AppSemanticTasksEnabled = semanticEmbedder != nil
 
 	var (
 		s3c     s3client.S3Client
@@ -250,7 +252,7 @@ func main() {
 		defer func() { _ = metaStore.Close() }()
 
 		adapter := tenant.NewMetaQuotaAdapter(metaStore)
-		b.SetMetaQuotaStore("local-tenant", adapter)
+		b.SetMetaQuotaStore(context.Background(), "local-tenant", adapter)
 
 		if err := metaStore.EnsureQuotaUsageRow(context.Background(), "local-tenant"); err != nil {
 			logger.Warn(startupCtx, "ensure_quota_usage_row_failed",

@@ -23,6 +23,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/buildinfo"
 	"github.com/mem9-ai/drive9/pkg/embedding"
 	"github.com/mem9-ai/drive9/pkg/encrypt"
+	"github.com/mem9-ai/drive9/pkg/leader"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/s3client"
@@ -118,8 +119,13 @@ func main() {
 	if semanticEmbedder != nil && backendOptions.QueryEmbedding.Client == nil {
 		backendOptions.QueryEmbedding = backend.QueryEmbeddingOptions{Client: semanticEmbedder}
 	}
+	backendOptions.AppSemanticTasksEnabled = semanticEmbedder != nil
 
-	store, err := meta.Open(metaDSN)
+	// P1-3: Configurable quota cache refresh interval (default 30s).
+	// In multi-pod deployments, increasing this reduces per-tenant-per-pod DB reads.
+	backend.InitQuotaConfigCacheRefreshInterval(envInt("DRIVE9_QUOTA_CACHE_REFRESH_SECONDS", 0))
+
+	store, err := openControlPlaneStoreWithRetry(context.Background(), metaDSN, defaultStartupRetryOptions())
 	if err != nil {
 		die(fmt.Errorf("open control-plane store: %w", err))
 	}
@@ -163,6 +169,7 @@ func main() {
 		}
 	}
 	backendOptions.MaxUploadBytes = maxUploadBytes
+	meta.SetDefaultMaxFileSizeBytes(maxUploadBytes)
 	providerType, err = tenant.NormalizeProvider(providerType)
 	if err != nil {
 		die(err)
@@ -204,6 +211,7 @@ func main() {
 	}
 
 	var pool *tenant.Pool
+	var leaderManager *leader.Manager
 	var tokenSecret []byte
 	if tokenHex != "" {
 		tokenSecret, err = hex.DecodeString(tokenHex)
@@ -225,9 +233,32 @@ func main() {
 			die(fmt.Errorf("create encryptor: %w", err))
 		}
 
-		if err := store.DB().Ping(); err != nil {
+		if err := pingControlPlaneDBWithRetry(context.Background(), store, defaultStartupRetryOptions()); err != nil {
 			die(fmt.Errorf("control-plane db unavailable: %w", err))
 		}
+
+		// Create a leader election manager for gating background schedulers.
+		// When disabled (single-pod), IsLeader always returns true and workers
+		// start immediately. In multi-pod mode, workers start only on the leader.
+		if os.Getenv("DRIVE9_LEADER_DISABLED") == "1" || os.Getenv("DRIVE9_LEADER_DISABLED") == "true" {
+			leaderManager = leader.NewManager(store.DB(), leader.WithDisabled())
+		} else {
+			leaderOpts := []leader.Option{
+				leader.WithLockName(envOr("DRIVE9_LEADER_LOCK_NAME", "drive9:leader")),
+			}
+			if v := envOr("DRIVE9_LEADER_HEARTBEAT_INTERVAL", ""); v != "" {
+				if d, err := time.ParseDuration(v); err == nil {
+					leaderOpts = append(leaderOpts, leader.WithHeartbeatInterval(d))
+				} else {
+					logger.Warn(context.Background(), "leader_heartbeat_interval_invalid_falling_back_to_default",
+						zap.String("env", "DRIVE9_LEADER_HEARTBEAT_INTERVAL"),
+						zap.String("value", v),
+						zap.Error(err))
+				}
+			}
+			leaderManager = leader.NewManager(store.DB(), leaderOpts...)
+		}
+		defer leaderManager.Stop()
 
 		pool = tenant.NewPool(tenant.PoolConfig{
 			S3Dir:                        s3cfg.Dir,
@@ -243,25 +274,20 @@ func main() {
 			S3SessionToken:               s3cfg.SessionToken,
 			S3EncryptionPolicy:           s3cfg.EncryptionPolicy,
 			BackendOptions:               backendOptions,
+			MaxTenants:                   envInt("DRIVE9_POOL_MAX_TENANTS", 0),
 			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
+			LeaderChecker:                leaderManager,
 		}, enc)
 		defer pool.Close()
-	}
 
-	if pool != nil {
 		pool.SetMetaStore(store)
 
-		// Start the mutation log replay worker for central quota.
-		replayWorker := backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(store))
-		if replayWorker != nil {
-			defer replayWorker.Stop()
-		}
-
-		// Start the upload reservation expiry sweep worker.
-		expirySweepWorker := backend.StartExpirySweepWorker(store)
-		if expirySweepWorker != nil {
-			defer expirySweepWorker.Stop()
-		}
+		// The mutation replay and expiry sweep workers are owned by the server
+		// (started/stopped in its leader-gated startLeaderWorkers/stopLeaderWorkers),
+		// so they follow leadership transitions alongside the other leader-gated
+		// schedulers. main.go no longer registers a competing SetCallbacks pair
+		// (that earlier pair was clobbered by the server's own SetCallbacks and
+		// never fired).
 
 		// TODO: Run ValidateDurableAsyncExtractRequiresSemanticWorker only when this process
 		// can serve tenants that enqueue durable audio_extract_text / img_extract_text
@@ -318,6 +344,7 @@ func main() {
 		TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
 		TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
 		DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
+		Leader:                       leaderManager,
 	}).ListenAndServe(addr))
 }
 
@@ -440,8 +467,8 @@ environment:
   DRIVE9_TIDB_AUTO_EMBEDDING_API_BASE provider base endpoint for models that require it
                                      optional for openai models; set it for Azure OpenAI endpoints
   DRIVE9_TENANT_PROVIDER db9|tidb_zero|tidb_cloud_starter|tidb_cloud_native (default for provisioning)
-  DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default TiDB Cloud spendingLimit.monthly in USD cents; optional for Starter, native defaults to 1000 when unset
-  DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Serverless API base URL for tidb_cloud_native
+  DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT default TiDB Cloud Cluster spendingLimit.monthly; optional for Starter, native defaults to 1000 when unset
+  DRIVE9_TIDBCLOUD_NATIVE_API_URL TiDB Cloud Cluster API base URL for tidb_cloud_native
   DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER cloud provider for tidb_cloud_native cluster creation, e.g. aws
   DRIVE9_TIDBCLOUD_NATIVE_REGION region for tidb_cloud_native cluster creation, e.g. us-east-1
   DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name (default: tidbcloud_fs)

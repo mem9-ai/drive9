@@ -79,9 +79,13 @@ type Dat9Backend struct {
 	// database-managed embedding path instead of the app-managed one for write,
 	// upload, image extraction, and grep behavior.
 	databaseAutoEmbedding bool
-	maxUploadBytes        int64
-	maxTenantStorageBytes int64
-	maxMediaLLMFiles      int64
+	// appSemanticTasksEnabled gates whether the app-managed embed worker path
+	// may enqueue semantic_tasks. False when no DRIVE9_EMBED_* worker is
+	// configured, preventing orphaned task rows.
+	appSemanticTasksEnabled bool
+	maxUploadBytes          int64
+	maxTenantStorageBytes   int64
+	maxMediaLLMFiles        int64
 	// inlineThreshold controls the DB-inline vs S3 storage cutoff and (when
 	// surfaced to clients) the simple-PUT vs multipart upload boundary.
 	inlineThreshold int64
@@ -95,15 +99,34 @@ type Dat9Backend struct {
 	storageNamespaceID string
 	metaStore          MetaQuotaStore // nil when central quota is not wired (tests, fallback)
 	quotaSource        QuotaSource    // "tenant" (default) or "server"
+	quotaConfigCache   *quotaConfigCache
+	quotaUsageCache    *quotaUsageCache
+	quotaPendingCache  *quotaPendingDeltasCache
+
+	// mutationQueue decouples central quota mutations (syncCentralFileCreate,
+	// syncCentralFileOverwrite) from the fsync critical path. Mutations are
+	// enqueued here and drained by a background worker. The mutation log
+	// provides crash recovery via the existing MutationReplayWorker.
+	//
+	// mutationMu serializes logQuotaMutation + enqueueMutation so that
+	// durable log_id order and channel enqueue order cannot diverge under
+	// concurrent same-tenant writes.
+	mutationMu    sync.Mutex
+	mutationQueue chan func()
+	mutationWG    sync.WaitGroup
+	mutationStop  context.CancelFunc
+
+	quotaOutboxNotify chan struct{}
+	quotaOutboxWG     sync.WaitGroup
+	quotaOutboxStop   context.CancelFunc
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 
-	// Async image -> text extraction worker (in-memory queue for P0).
+	// Async image -> text extraction runtime (durable semantic_tasks delivery;
+	// no in-process queue). The semantic worker claims img_extract_text tasks
+	// and calls ProcessImageExtractTask via this backend's extractor/S3 client.
 	imageExtractEnabled bool
 	imageExtractor      ImageTextExtractor
-	imageExtractQueue   chan ImageExtractTaskSpec
-	imageExtractWG      sync.WaitGroup
-	imageExtractCancel  context.CancelFunc
 	imageExtractTimeout time.Duration
 	imageExtractMaxSize int64
 	maxExtractTextBytes int
@@ -254,7 +277,11 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}
 	}
 
+	var quotaOutboxEnqueued bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
+			return err
+		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
 			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
 			StorageEncryptionMode:  storageEncryptionMode,
@@ -268,10 +295,18 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {
 			return err
 		}
-		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
 			Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
-		})
+		}); err != nil {
+			return err
+		}
+		created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, 0, "")
+		if err != nil {
+			return err
+		}
+		quotaOutboxEnqueued = created
+		return nil
 	})
 	if err != nil {
 		if storageType == datastore.StorageS3 {
@@ -279,7 +314,12 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 		}
 		return err
 	}
-	b.syncCentralFileCreate(ctx, fileID, 0, "")
+	if quotaOutboxEnqueued {
+		b.addLocalQuotaPendingDeltas(0, 1, 0)
+		b.notifyQuotaOutbox(true)
+	} else {
+		b.syncCentralFileCreate(ctx, fileID, 0, "")
+	}
 	return nil
 }
 
@@ -304,12 +344,19 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
 		return err
 	}
+	if err := b.ensureFileSizeQuota(ctx, int64(len(data))); err != nil {
+		return err
+	}
 	fileID := b.genID()
 	now := time.Now()
 	checksum := sha256sum(data)
 
+	var quotaOutboxEnqueued bool
 	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		if err := b.ensureStorageQuota(ctx, tx, linkPath, int64(len(data))); err != nil {
+			return err
+		}
+		if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
 			return err
 		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
@@ -332,15 +379,32 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 		if err := b.store.EnsureParentDirsTx(tx, linkPath, b.genID); err != nil {
 			return err
 		}
-		return b.store.InsertNodeTx(tx, &datastore.FileNode{
+		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID: b.genID(), Path: linkPath, ParentPath: pathutil.ParentPath(linkPath),
 			Name: pathutil.BaseName(linkPath), FileID: fileID, CreatedAt: now,
-		})
+		}); err != nil {
+			return err
+		}
+		created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, int64(len(data)), symlinkContentType)
+		if err != nil {
+			return err
+		}
+		quotaOutboxEnqueued = created
+		return nil
 	})
 	if err != nil {
 		return err
 	}
-	b.syncCentralFileCreate(ctx, fileID, int64(len(data)), symlinkContentType)
+	if quotaOutboxEnqueued {
+		mediaDelta := int64(0)
+		if isQuotaMediaContentType(symlinkContentType) {
+			mediaDelta = 1
+		}
+		b.addLocalQuotaPendingDeltas(int64(len(data)), 1, mediaDelta)
+		b.notifyQuotaOutbox(true)
+	} else {
+		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), symlinkContentType)
+	}
 	return nil
 }
 
@@ -566,11 +630,54 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path strin
 // returns the committed revision of the file after a successful write.
 func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (n int64, committedRevision int64, err error) {
 	start := time.Now()
-	defer func() { observeBackend(ctx, "write", err, start) }()
+	timingEnabled := logger.BenchTimingLogEnabled()
+	rawPath := path
+	canonicalPath := path
+	operation := "unknown"
+	result := "ok"
+	var canonicalizeDuration time.Duration
+	var statDuration time.Duration
+	var implementationDuration time.Duration
+	defer func() {
+		observeBackend(ctx, "write", err, start)
+		if !timingEnabled {
+			return
+		}
+		if err != nil {
+			result = backendWriteResult(err)
+		}
+		fields := []zap.Field{
+			zap.String("path", rawPath),
+			zap.String("canonical_path", canonicalPath),
+			zap.String("operation", operation),
+			zap.String("result", result),
+			zap.Int("bytes", len(data)),
+			zap.Int64("offset", offset),
+			zap.Int64("expected_revision", expectedRevision),
+			zap.Int64("committed_revision", committedRevision),
+			zap.Int("flags", int(flags)),
+			zap.Float64("canonicalize_ms", backendDurationMs(canonicalizeDuration)),
+			zap.Float64("stat_ms", backendDurationMs(statDuration)),
+			zap.Float64("implementation_ms", backendDurationMs(implementationDuration)),
+			zap.Float64("total_ms", backendDurationMs(time.Since(start))),
+		}
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+		}
+		logger.InfoBenchTiming(ctx, "backend_write_timing", fields...)
+	}()
 
 	tags = cloneFileTags(tags)
 
+	canonicalizeStart := time.Time{}
+	if timingEnabled {
+		canonicalizeStart = time.Now()
+	}
 	path, err = pathutil.Canonicalize(path)
+	canonicalPath = path
+	if timingEnabled {
+		canonicalizeDuration = time.Since(canonicalizeStart)
+	}
 	if err != nil {
 		return 0, 0, err
 	}
@@ -578,8 +685,16 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		return 0, 0, err
 	}
 
+	statStart := time.Time{}
+	if timingEnabled {
+		statStart = time.Now()
+	}
 	existing, err := b.store.Stat(ctx, path)
+	if timingEnabled {
+		statDuration = time.Since(statStart)
+	}
 	if err == datastore.ErrNotFound {
+		operation = "create"
 		if expectedRevision > 0 {
 			return 0, 0, datastore.ErrRevisionConflict
 		}
@@ -589,7 +704,14 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 			}
 			return 0, 0, datastore.ErrNotFound
 		}
+		implementationStart := time.Time{}
+		if timingEnabled {
+			implementationStart = time.Now()
+		}
 		n, err := b.createAndWriteCtx(ctx, path, data, tags, description)
+		if timingEnabled {
+			implementationDuration = time.Since(implementationStart)
+		}
 		if expectedRevision == 0 && errors.Is(err, datastore.ErrPathConflict) {
 			return 0, 0, datastore.ErrRevisionConflict
 		}
@@ -613,8 +735,37 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 	if expectedRevision > 0 && (existing.File == nil || existing.File.Revision != expectedRevision) {
 		return 0, 0, datastore.ErrRevisionConflict
 	}
+	operation = "overwrite"
+	implementationStart := time.Time{}
+	if timingEnabled {
+		implementationStart = time.Now()
+	}
 	n, rev, err := b.overwriteFileCtxWithRev(ctx, existing, data, offset, flags, expectedRevision, tags, description)
+	if timingEnabled {
+		implementationDuration = time.Since(implementationStart)
+	}
 	return n, rev, err
+}
+
+func backendWriteResult(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, datastore.ErrNotFound):
+		return "not_found"
+	case errors.Is(err, datastore.ErrRevisionConflict), errors.Is(err, datastore.ErrPathConflict), errors.Is(err, datastore.ErrUploadConflict):
+		return "conflict"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	default:
+		return "error"
+	}
+}
+
+func backendDurationMs(d time.Duration) float64 {
+	return float64(d.Microseconds()) / 1000.0
 }
 
 func cloneFileTags(tags map[string]string) map[string]string {
@@ -628,18 +779,62 @@ func cloneFileTags(tags map[string]string) map[string]string {
 	return out
 }
 
-func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string) (int64, error) {
+func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string) (written int64, err error) {
+	timingEnabled := logger.BenchTimingLogEnabled()
+	start := time.Time{}
+	if timingEnabled {
+		start = time.Now()
+	}
+	storageType := datastore.StorageDB9
+	contentType := ""
+	var prepareDuration time.Duration
+	var s3PutDuration time.Duration
+	var tenantTxDuration time.Duration
+	var centralQuotaDuration time.Duration
+	var imageEnqueueDuration time.Duration
+	defer func() {
+		if !timingEnabled {
+			return
+		}
+		fields := []zap.Field{
+			zap.String("path", path),
+			zap.String("result", backendWriteResult(err)),
+			zap.Int("bytes", len(data)),
+			zap.Int64("written", written),
+			zap.String("storage_type", string(storageType)),
+			zap.String("content_type", contentType),
+			zap.Float64("prepare_ms", backendDurationMs(prepareDuration)),
+			zap.Float64("s3_put_ms", backendDurationMs(s3PutDuration)),
+			zap.Float64("tenant_tx_ms", backendDurationMs(tenantTxDuration)),
+			zap.Float64("central_quota_ms", backendDurationMs(centralQuotaDuration)),
+			zap.Float64("image_enqueue_ms", backendDurationMs(imageEnqueueDuration)),
+			zap.Float64("total_ms", backendDurationMs(time.Since(start))),
+		}
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+		}
+		logger.InfoBenchTiming(ctx, "backend_write_create_timing", fields...)
+	}()
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
+		return 0, err
+	}
+	if err := b.ensureFileSizeQuota(ctx, int64(len(data))); err != nil {
 		return 0, err
 	}
 	fileID := b.genID()
 	now := time.Now()
 
-	contentType := detectContentType(path, data)
+	prepareStart := time.Time{}
+	if timingEnabled {
+		prepareStart = time.Now()
+	}
+	contentType = detectContentType(path, data)
 	checksum := sha256sum(data)
 	contentText := extractText(data, contentType, b.textExtractMaxBytes)
+	if timingEnabled {
+		prepareDuration = time.Since(prepareStart)
+	}
 
-	storageType := datastore.StorageDB9
 	storageRef := "inline"
 	storageEncryptionMode := datastore.StorageEncryptionNone
 	storageEncryptionKeyID := ""
@@ -655,16 +850,35 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		encOpts, encMode, encKeyID := b.s3WriteEncryption(storageRef)
 		storageEncryptionMode = encMode
 		storageEncryptionKeyID = encKeyID
+		s3PutStart := time.Time{}
+		if timingEnabled {
+			s3PutStart = time.Now()
+		}
 		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(data), int64(len(data)), encOpts); err != nil {
+			if timingEnabled {
+				s3PutDuration = time.Since(s3PutStart)
+			}
 			logger.Error(ctx, "backend_create_and_write_put_object_failed", zap.String("path", path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(data)), zap.Error(err))
 			return 0, fmt.Errorf("put object: %w", err)
+		}
+		if timingEnabled {
+			s3PutDuration = time.Since(s3PutStart)
 		}
 	}
 
 	var semanticTaskEnqueued bool
+	var quotaOutboxEnqueued bool
+	txStart := time.Time{}
+	if timingEnabled {
+		txStart = time.Now()
+	}
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
+		quotaOutboxEnqueued = false
 		if err := b.ensureStorageQuota(ctx, tx, path, int64(len(data))); err != nil {
+			return err
+		}
+		if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
 			return err
 		}
 		fileRev := int64(1)
@@ -697,44 +911,137 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 				return err
 			}
 		}
+		currentMediaDelta := quotaMediaDelta(false, isQuotaMediaContentType(contentType))
 		if b.UsesDatabaseAutoEmbedding() {
-			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, fileID, 1, path, contentType)
+			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType, currentMediaDelta)
 			semanticTaskEnqueued = created
+			if err != nil {
+				return err
+			}
+		} else {
+			// App-embedding mode: image/audio extract tasks are durable and independent
+			// of EMBED_TEXT, so register them in the same transaction. The embed task
+			// (if any) is enqueued separately below.
+			extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType, currentMediaDelta)
+			if extractErr != nil {
+				return extractErr
+			}
+			if b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
+				created, err := b.enqueueEmbedTaskTx(tx, fileID, 1)
+				semanticTaskEnqueued = created || extractCreated
+				if err != nil {
+					return err
+				}
+			} else {
+				semanticTaskEnqueued = extractCreated
+			}
+		}
+		created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, int64(len(data)), contentType)
+		if err != nil {
 			return err
 		}
-		if b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
-			created, err := b.enqueueEmbedTaskTx(tx, fileID, 1)
-			semanticTaskEnqueued = created
-			return err
-		}
+		quotaOutboxEnqueued = created
 		return nil
 	}); err != nil {
+		if timingEnabled {
+			tenantTxDuration = time.Since(txStart)
+		}
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
 		}
 		return 0, err
 	}
-	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
-	// Temporary compatibility: app embedding still relies on the legacy
-	// backend-owned image queue until its image task flow also moves to
-	// semantic_tasks.
-	if b.UsesDatabaseAutoEmbedding() {
-		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
-		return int64(len(data)), nil
+	if timingEnabled {
+		tenantTxDuration = time.Since(txStart)
 	}
-	b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
-	b.enqueueImageExtract(fileID, path, contentType, 1)
+	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
+	centralQuotaStart := time.Time{}
+	if timingEnabled {
+		centralQuotaStart = time.Now()
+	}
+	if quotaOutboxEnqueued {
+		mediaDelta := int64(0)
+		if isQuotaMediaContentType(contentType) {
+			mediaDelta = 1
+		}
+		b.addLocalQuotaPendingDeltas(int64(len(data)), 1, mediaDelta)
+		b.notifyQuotaOutbox(true)
+	} else {
+		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
+	}
+	if timingEnabled {
+		centralQuotaDuration = time.Since(centralQuotaStart)
+	}
 	return int64(len(data)), nil
 }
 
-func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (int64, int64, error) {
+func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore.NodeWithFile, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (written int64, newRevision int64, err error) {
+	timingEnabled := logger.BenchTimingLogEnabled()
+	start := time.Time{}
+	if timingEnabled {
+		start = time.Now()
+	}
+	path := ""
+	fileID := ""
+	oldSize := int64(0)
+	storageType := datastore.StorageDB9
+	contentType := ""
+	finalSize := int64(0)
+	var readExistingDuration time.Duration
+	var prepareDuration time.Duration
+	var s3PutDuration time.Duration
+	var tenantTxDuration time.Duration
+	var centralQuotaDuration time.Duration
+	var oldBlobCleanupDuration time.Duration
+	var imageEnqueueDuration time.Duration
+	defer func() {
+		if !timingEnabled {
+			return
+		}
+		fields := []zap.Field{
+			zap.String("path", path),
+			zap.String("file_id", fileID),
+			zap.String("result", backendWriteResult(err)),
+			zap.Int("input_bytes", len(data)),
+			zap.Int64("final_size", finalSize),
+			zap.Int64("old_size", oldSize),
+			zap.Int64("written", written),
+			zap.Int64("expected_revision", expectedRevision),
+			zap.Int64("committed_revision", newRevision),
+			zap.Int("flags", int(flags)),
+			zap.String("storage_type", string(storageType)),
+			zap.String("content_type", contentType),
+			zap.Float64("read_existing_ms", backendDurationMs(readExistingDuration)),
+			zap.Float64("prepare_ms", backendDurationMs(prepareDuration)),
+			zap.Float64("s3_put_ms", backendDurationMs(s3PutDuration)),
+			zap.Float64("tenant_tx_ms", backendDurationMs(tenantTxDuration)),
+			zap.Float64("central_quota_ms", backendDurationMs(centralQuotaDuration)),
+			zap.Float64("old_blob_cleanup_ms", backendDurationMs(oldBlobCleanupDuration)),
+			zap.Float64("image_enqueue_ms", backendDurationMs(imageEnqueueDuration)),
+			zap.Float64("total_ms", backendDurationMs(time.Since(start))),
+		}
+		if err != nil {
+			fields = append(fields, zap.Error(err))
+		}
+		logger.InfoBenchTiming(ctx, "backend_write_overwrite_timing", fields...)
+	}()
 	if nf.File == nil {
 		return 0, 0, fmt.Errorf("no file entity")
 	}
+	path = nf.Node.Path
+	fileID = nf.File.FileID
+	oldSize = nf.File.SizeBytes
 
 	var finalData []byte
 	if flags&filesystem.WriteFlagAppend != 0 {
+		readExistingStart := time.Time{}
+		if timingEnabled {
+			readExistingStart = time.Now()
+		}
 		existing, err := b.readFileDataCtx(ctx, nf.File)
+		if timingEnabled {
+			readExistingDuration = time.Since(readExistingStart)
+		}
 		if err != nil {
 			return 0, 0, fmt.Errorf("read existing data for append: %w", err)
 		}
@@ -742,7 +1049,14 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	} else if flags&filesystem.WriteFlagTruncate != 0 || offset <= 0 {
 		finalData = data
 	} else {
+		readExistingStart := time.Time{}
+		if timingEnabled {
+			readExistingStart = time.Now()
+		}
 		existing, err := b.readFileDataCtx(ctx, nf.File)
+		if timingEnabled {
+			readExistingDuration = time.Since(readExistingStart)
+		}
 		if err != nil {
 			return 0, 0, fmt.Errorf("read existing data for offset write: %w", err)
 		}
@@ -759,10 +1073,20 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 	if err := b.ensureUploadSizeAllowed(int64(len(finalData))); err != nil {
 		return 0, 0, err
 	}
-	contentType := detectContentType(nf.Node.Path, finalData)
+	if err := b.ensureFileSizeQuota(ctx, int64(len(finalData))); err != nil {
+		return 0, 0, err
+	}
+	finalSize = int64(len(finalData))
+	prepareStart := time.Time{}
+	if timingEnabled {
+		prepareStart = time.Now()
+	}
+	contentType = detectContentType(nf.Node.Path, finalData)
 	checksum := sha256sum(finalData)
 	contentText := extractText(finalData, contentType, b.textExtractMaxBytes)
-	storageType := datastore.StorageDB9
+	if timingEnabled {
+		prepareDuration = time.Since(prepareStart)
+	}
 	storageRef := "inline"
 	storageEncryptionMode := datastore.StorageEncryptionNone
 	storageEncryptionKeyID := ""
@@ -778,40 +1102,72 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		encOpts, encMode, encKeyID := b.s3WriteEncryption(storageRef)
 		storageEncryptionMode = encMode
 		storageEncryptionKeyID = encKeyID
+		s3PutStart := time.Time{}
+		if timingEnabled {
+			s3PutStart = time.Now()
+		}
 		if err := b.s3.PutObject(ctx, storageRef, bytes.NewReader(finalData), int64(len(finalData)), encOpts); err != nil {
+			if timingEnabled {
+				s3PutDuration = time.Since(s3PutStart)
+			}
 			logger.Error(ctx, "backend_overwrite_put_object_failed", zap.String("path", nf.Node.Path), zap.String("storage_ref", storageRef), zap.Int("bytes", len(finalData)), zap.Error(err))
 			return 0, 0, fmt.Errorf("put object: %w", err)
 		}
+		if timingEnabled {
+			s3PutDuration = time.Since(s3PutStart)
+		}
 	}
 
-	var newRev int64
 	var semanticTaskEnqueued bool
-	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+	var quotaOutboxEnqueued bool
+	txStart := time.Time{}
+	if timingEnabled {
+		txStart = time.Now()
+	}
+	err = b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
-		if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
+		quotaOutboxEnqueued = false
+		var oldSizeBytes int64
+		var oldContentTypeForQuota string
+		currentMeta, err := b.store.GetFileStorageMetaForUpdateTx(tx, nf.File.FileID)
+		if err != nil {
+			return err
+		}
+		oldSizeBytes = currentMeta.SizeBytes
+		oldContentTypeForQuota = currentMeta.ContentType
+		if expectedRevision > 0 && currentMeta.Revision != expectedRevision {
+			return datastore.ErrRevisionConflict
+		}
+		if b.UseServerQuota() {
+			if deltaBytes := int64(len(finalData)) - currentMeta.SizeBytes; deltaBytes > 0 {
+				if err := b.ensureStorageQuotaServer(ctx, tx, deltaBytes); err != nil {
+					return err
+				}
+			}
+		} else if err := b.ensureStorageQuota(ctx, tx, nf.Node.Path, int64(len(finalData))); err != nil {
 			return err
 		}
 		var txErr error
 		if b.UsesDatabaseAutoEmbedding() {
 			if expectedRevision > 0 {
-				newRev, txErr = b.store.UpdateFileContentAutoEmbeddingIfRevisionTx(tx,
+				newRevision, txErr = b.store.UpdateFileContentAutoEmbeddingIfRevisionTx(tx,
 					nf.File.FileID, expectedRevision, storageType, storageRef,
 					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
 			} else {
-				newRev, txErr = b.store.UpdateFileContentAutoEmbeddingTx(tx,
+				newRevision, txErr = b.store.UpdateFileContentAutoEmbeddingTx(tx,
 					nf.File.FileID, storageType, storageRef,
 					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
 			}
 		} else {
 			if expectedRevision > 0 {
-				newRev, txErr = b.store.UpdateFileContentIfRevisionTx(tx,
+				newRevision, txErr = b.store.UpdateFileContentIfRevisionTx(tx,
 					nf.File.FileID, expectedRevision, storageType, storageRef,
 					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
 			} else {
-				newRev, txErr = b.store.UpdateFileContentTx(tx,
+				newRevision, txErr = b.store.UpdateFileContentTx(tx,
 					nf.File.FileID, storageType, storageRef,
 					contentType, checksum, contentText, contentBlob, int64(len(finalData)), description,
 				)
@@ -828,18 +1184,45 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 				return err
 			}
 		}
+		currentMediaDelta := quotaMediaDelta(isQuotaMediaContentType(oldContentTypeForQuota), isQuotaMediaContentType(contentType))
 		if b.UsesDatabaseAutoEmbedding() {
-			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, nf.File.FileID, newRev, nf.Node.Path, contentType)
+			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType, currentMediaDelta)
 			semanticTaskEnqueued = created
+			if err != nil {
+				return err
+			}
+		} else {
+			// App-embedding mode: image/audio extract tasks are durable and independent
+			// of EMBED_TEXT, so register them in the same transaction. The embed task
+			// (if any) is enqueued separately below.
+			extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, nf.File.FileID, newRevision, nf.Node.Path, contentType, currentMediaDelta)
+			if extractErr != nil {
+				return extractErr
+			}
+			if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText, description) {
+				created, err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRevision)
+				semanticTaskEnqueued = created || extractCreated
+				if err != nil {
+					return err
+				}
+			} else {
+				semanticTaskEnqueued = extractCreated
+			}
+		}
+		created, err := b.enqueueQuotaFileOverwriteOutboxTx(tx, nf.File.FileID, oldSizeBytes, oldContentTypeForQuota, int64(len(finalData)), contentType)
+		if err != nil {
 			return err
 		}
-		if b.shouldEnqueueEmbedForRevision(nf.Node.Path, contentType, contentText, description) {
-			created, err := b.enqueueEmbedTaskTx(tx, nf.File.FileID, newRev)
-			semanticTaskEnqueued = created
-			return err
-		}
+		quotaOutboxEnqueued = created
+		nf.File.StorageType = currentMeta.StorageType
+		nf.File.StorageRef = currentMeta.StorageRef
+		nf.File.SizeBytes = oldSizeBytes
+		nf.File.ContentType = oldContentTypeForQuota
 		return nil
 	})
+	if timingEnabled {
+		tenantTxDuration = time.Since(txStart)
+	}
 	if err != nil {
 		if storageType == datastore.StorageS3 {
 			b.deleteBlobCtx(ctx, storageRef)
@@ -847,18 +1230,34 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		return 0, 0, err
 	}
 	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
-	b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
+	centralQuotaStart := time.Time{}
+	if timingEnabled {
+		centralQuotaStart = time.Now()
+	}
+	if quotaOutboxEnqueued {
+		b.addLocalQuotaPendingDeltas(
+			int64(len(finalData))-nf.File.SizeBytes,
+			0,
+			quotaMediaDelta(isQuotaMediaContentType(nf.File.ContentType), isQuotaMediaContentType(contentType)),
+		)
+		b.notifyQuotaOutbox(true)
+	} else {
+		b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
+	}
+	if timingEnabled {
+		centralQuotaDuration = time.Since(centralQuotaStart)
+	}
 	// Overwrite cleanup is object-level: file_gc_tasks track deleted file
 	// identities, not old blob refs for a still-live file_id.
-	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
-	// Temporary compatibility: app embedding still relies on the legacy
-	// backend-owned image queue until its image task flow also moves to
-	// semantic_tasks.
-	if b.UsesDatabaseAutoEmbedding() {
-		return int64(len(data)), newRev, nil
+	oldBlobCleanupStart := time.Time{}
+	if timingEnabled {
+		oldBlobCleanupStart = time.Now()
 	}
-	b.enqueueImageExtract(nf.File.FileID, nf.Node.Path, contentType, newRev)
-	return int64(len(data)), newRev, nil
+	b.deleteBlobIfS3Ctx(ctx, nf.File.StorageType, nf.File.StorageRef, storageRef)
+	if timingEnabled {
+		oldBlobCleanupDuration = time.Since(oldBlobCleanupStart)
+	}
+	return int64(len(data)), newRevision, nil
 }
 
 func (b *Dat9Backend) ReadDir(path string) ([]filesystem.FileInfo, error) {
@@ -927,6 +1326,9 @@ func (b *Dat9Backend) ReadDirCtx(ctx context.Context, path string) (infos []file
 			info.Size = e.File.SizeBytes
 			info.ModTime = fileMtime(e.File)
 			meta["resource_id"] = e.File.FileID
+			if e.File.Revision > 0 {
+				meta["revision"] = strconv.FormatInt(e.File.Revision, 10)
+			}
 			count := refCounts[e.File.FileID]
 			if count <= 0 {
 				count = 1

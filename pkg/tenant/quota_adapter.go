@@ -33,9 +33,15 @@ func (a *metaQuotaAdapter) GetQuotaConfig(ctx context.Context, tenantID string) 
 	return &backend.QuotaConfigView{
 		TenantID:         cfg.TenantID,
 		MaxStorageBytes:  cfg.MaxStorageBytes,
+		MaxFileSizeBytes: cfg.MaxFileSizeBytes,
+		MaxFileCount:     cfg.MaxFileCount,
 		MaxMediaLLMFiles: cfg.MaxMediaLLMFiles,
 		MaxMonthlyCostMC: cfg.MaxMonthlyCostMC,
 	}, nil
+}
+
+func (a *metaQuotaAdapter) GetQuotaConfigVersion(ctx context.Context, tenantID string) (string, error) {
+	return a.s.GetQuotaConfigVersion(ctx, tenantID)
 }
 
 func (a *metaQuotaAdapter) GetQuotaUsage(ctx context.Context, tenantID string) (*backend.QuotaUsageView, error) {
@@ -47,7 +53,21 @@ func (a *metaQuotaAdapter) GetQuotaUsage(ctx context.Context, tenantID string) (
 		TenantID:       u.TenantID,
 		StorageBytes:   u.StorageBytes,
 		ReservedBytes:  u.ReservedBytes,
+		FileCount:      u.FileCount,
 		MediaFileCount: u.MediaFileCount,
+	}, nil
+}
+
+func (a *metaQuotaAdapter) GetFileMetaForUpdateTx(tx *sql.Tx, tenantID, fileID string) (*backend.FileMetaView, error) {
+	fm, err := a.s.GetFileMetaForUpdateTx(tx, tenantID, fileID)
+	if err != nil {
+		return nil, err
+	}
+	return &backend.FileMetaView{
+		TenantID:  fm.TenantID,
+		FileID:    fm.FileID,
+		SizeBytes: fm.SizeBytes,
+		IsMedia:   fm.IsMedia,
 	}, nil
 }
 
@@ -71,6 +91,14 @@ func (a *metaQuotaAdapter) IncrReservedBytesTx(tx *sql.Tx, tenantID string, delt
 	return a.s.IncrReservedBytesTx(tx, tenantID, delta)
 }
 
+func (a *metaQuotaAdapter) IncrFileCount(ctx context.Context, tenantID string, delta int64) error {
+	return a.s.IncrFileCount(ctx, tenantID, delta)
+}
+
+func (a *metaQuotaAdapter) IncrFileCountTx(tx *sql.Tx, tenantID string, delta int64) error {
+	return a.s.IncrFileCountTx(tx, tenantID, delta)
+}
+
 func (a *metaQuotaAdapter) IncrMediaFileCount(ctx context.Context, tenantID string, delta int64) error {
 	return a.s.IncrMediaFileCount(ctx, tenantID, delta)
 }
@@ -92,16 +120,19 @@ func (a *metaQuotaAdapter) TransferReservedToConfirmedTx(tx *sql.Tx, tenantID st
 // invariants. Translates meta sentinels to backend sentinels for the caller.
 func (a *metaQuotaAdapter) AtomicReserveAndInsertUpload(ctx context.Context, r *backend.UploadReservationView) error {
 	err := a.s.AtomicReserveAndInsertUpload(ctx, &meta.UploadReservation{
-		TenantID:      r.TenantID,
-		UploadID:      r.UploadID,
-		ReservedBytes: r.ReservedBytes,
-		TargetPath:    r.TargetPath,
-		Status:        r.Status,
-		ExpiresAt:     r.ExpiresAt,
+		TenantID:       r.TenantID,
+		UploadID:       r.UploadID,
+		ReservedBytes:  r.ReservedBytes,
+		FileCountDelta: r.FileCountDelta,
+		TargetPath:     r.TargetPath,
+		Status:         r.Status,
+		ExpiresAt:      r.ExpiresAt,
 	})
 	switch {
 	case errors.Is(err, meta.ErrStorageQuotaExceeded):
 		return backend.ErrStorageQuotaExceeded
+	case errors.Is(err, meta.ErrFileCountQuotaExceeded):
+		return backend.ErrFileCountQuotaExceeded
 	case errors.Is(err, meta.ErrReservationAlreadyExists):
 		return backend.ErrReservationAlreadyExists
 	}
@@ -153,12 +184,13 @@ func (a *metaQuotaAdapter) DeleteFileMetaIfExistsTx(tx *sql.Tx, tenantID, fileID
 
 func (a *metaQuotaAdapter) InsertUploadReservation(ctx context.Context, r *backend.UploadReservationView) error {
 	return a.s.InsertUploadReservation(ctx, &meta.UploadReservation{
-		TenantID:      r.TenantID,
-		UploadID:      r.UploadID,
-		ReservedBytes: r.ReservedBytes,
-		TargetPath:    r.TargetPath,
-		Status:        r.Status,
-		ExpiresAt:     r.ExpiresAt,
+		TenantID:       r.TenantID,
+		UploadID:       r.UploadID,
+		ReservedBytes:  r.ReservedBytes,
+		FileCountDelta: r.FileCountDelta,
+		TargetPath:     r.TargetPath,
+		Status:         r.Status,
+		ExpiresAt:      r.ExpiresAt,
 	})
 }
 
@@ -170,7 +202,7 @@ func (a *metaQuotaAdapter) UpdateUploadReservationStatusTx(tx *sql.Tx, tenantID,
 	return a.s.UpdateUploadReservationStatusTx(tx, tenantID, uploadID, status)
 }
 
-func (a *metaQuotaAdapter) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (bool, error) {
+func (a *metaQuotaAdapter) SettleActiveReservationTx(tx *sql.Tx, tenantID, uploadID, status string) (bool, int64, error) {
 	return a.s.SettleActiveReservationTx(tx, tenantID, uploadID, status)
 }
 
@@ -183,12 +215,13 @@ func (a *metaQuotaAdapter) GetUploadReservation(ctx context.Context, tenantID, u
 		return nil, err
 	}
 	return &backend.UploadReservationView{
-		TenantID:      r.TenantID,
-		UploadID:      r.UploadID,
-		ReservedBytes: r.ReservedBytes,
-		TargetPath:    r.TargetPath,
-		Status:        r.Status,
-		ExpiresAt:     r.ExpiresAt,
+		TenantID:       r.TenantID,
+		UploadID:       r.UploadID,
+		ReservedBytes:  r.ReservedBytes,
+		FileCountDelta: r.FileCountDelta,
+		TargetPath:     r.TargetPath,
+		Status:         r.Status,
+		ExpiresAt:      r.ExpiresAt,
 	}, nil
 }
 

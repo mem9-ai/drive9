@@ -43,6 +43,10 @@ func ExampleClient_constructionStatusAndRawRequests() {
 	if err == nil {
 		_ = resp.Body.Close()
 	}
+	resp, err = c.RawGet("/v1/status")
+	if err == nil {
+		_ = resp.Body.Close()
+	}
 }
 
 func ExampleClient_filesystemCRUDAndMetadata() {
@@ -218,6 +222,43 @@ func ExampleClient_tokensAndVault() {
 	_, _ = delegated.ReadVaultSecret(ctx, "prod-db")
 	_, _ = delegated.ReadVaultSecretField(ctx, "prod-db", "DB_URL")
 	_ = owner.DeleteVaultSecret(ctx, "prod-db")
+}
+
+func ExampleClient_quota() {
+	ctx := context.Background()
+	serverURL := "https://drive9.example.com"
+
+	tidbCloudPublicKey := "tidbcloud-public-key"
+	tidbCloudPrivateKey := "tidbcloud-private-key"
+	tenantID := "tnt_abc123"
+	credentialClient := drive9.New(serverURL, "")
+
+	quota, err := credentialClient.GetQuota(ctx, drive9.QuotaRequest{
+		TenantID:   tenantID,
+		PublicKey:  tidbCloudPublicKey,
+		PrivateKey: tidbCloudPrivateKey,
+	})
+	if err == nil {
+		_ = quota.Config.MaxStorageSize
+		_ = quota.Config.MaxFileSize
+		_ = quota.Config.MaxFileCount
+		_ = quota.Config.TiDBCloudSpendingLimit
+		_ = quota.Usage.FileCount
+	}
+
+	storageSize := int64(100 * 1024) // Mi
+	fileSize := int64(1024)          // Mi
+	fileCount := int64(100000)
+	spendingLimit := int64(10000)
+	_, _ = credentialClient.SetQuota(ctx, drive9.QuotaSetRequest{
+		TenantID:               tenantID,
+		PublicKey:              tidbCloudPublicKey,
+		PrivateKey:             tidbCloudPrivateKey,
+		MaxStorageSize:         &storageSize,
+		MaxFileSize:            &fileSize,
+		MaxFileCount:           &fileCount,
+		TiDBCloudSpendingLimit: &spendingLimit,
+	})
 }
 
 func ExampleClient_eventsLayersGitAndJournal() {
@@ -411,6 +452,7 @@ var coveredClientMethods = map[string]bool{
 	"GetGitState":                          true,
 	"GetGitWorkspace":                      true,
 	"GetGitWorkspaceByRoot":                true,
+	"GetQuota":                             true,
 	"Grep":                                 true,
 	"GrepWithLayer":                        true,
 	"Hardlink":                             true,
@@ -439,6 +481,7 @@ var coveredClientMethods = map[string]bool{
 	"PutGitOverlayEntry":                   true,
 	"QueryVaultAudit":                      true,
 	"RawDelete":                            true,
+	"RawGet":                               true,
 	"RawPost":                              true,
 	"Read":                                 true,
 	"ReadAt":                               true,
@@ -474,6 +517,7 @@ var coveredClientMethods = map[string]bool{
 	"SQL":                                  true,
 	"SearchJournal":                        true,
 	"SetActor":                             true,
+	"SetQuota":                             true,
 	"SetSmallFileThresholdForTests":        true,
 	"SmallFileThreshold":                   true,
 	"Stat":                                 true,

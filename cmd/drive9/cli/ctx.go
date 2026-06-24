@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -56,7 +57,8 @@ func ctxUsage() string {
   import --from-file <path>                           add delegated context from file (must be mode 0600)
   import --from-file -                                add delegated context from stdin explicitly
   import                                              add delegated context from stdin (default when stdin is a pipe)
-  fork [<new>] [--from <ctx>] [--json]                create a copy-on-write fork context
+  fork [<new>] [--from <ctx>] [--json] [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]
+                                                        create a copy-on-write fork context
   ls [-l|--json] [--type <kind>|--scoped]             list contexts (filter by type: owner|delegated|fs_scoped)
   use <name>                                          activate a context
   rm <name>                                           remove a local context name (does NOT revoke server-side credential)`
@@ -447,8 +449,26 @@ func ctxAdd(cfg *Config, name string, ctx *Context) (*Context, error) {
 }
 
 func ctxForkCmd(args []string) error {
+	if len(args) == 1 && IsHelpArg(args[0]) {
+		_, _ = fmt.Fprintln(os.Stdout, `usage: drive9 ctx fork [<new>] [--from <ctx>] [--json] [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]
+
+  create a copy-on-write fork context. The fork shares the parent's storage namespace and uses a lightweight
+  TiDB Cloud branch for its database.
+
+  --from <ctx>                    source context name (default: current context)
+  --json                          output fork result as JSON
+  --tidbcloud-public-key KEY      TiDB Cloud public key
+  --tidbcloud-private-key KEY     TiDB Cloud private key
+
+  The fork tenant provisions asynchronously. Use "drive9 fs ls /" to poll.`)
+		return nil
+	}
 	newName := ""
 	fromName := ""
+	publicKeyFlag := ""
+	publicKeyGiven := false
+	privateKeyFlag := ""
+	privateKeyGiven := false
 	jsonOut := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -458,18 +478,40 @@ func ctxForkCmd(args []string) error {
 			}
 			i++
 			fromName = args[i]
+		case "--tidbcloud-public-key":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--tidbcloud-public-key requires an argument")
+			}
+			i++
+			publicKeyFlag = args[i]
+			publicKeyGiven = true
+		case "--tidbcloud-private-key":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--tidbcloud-private-key requires an argument")
+			}
+			i++
+			privateKeyFlag = args[i]
+			privateKeyGiven = true
 		case "--json":
 			jsonOut = true
 		default:
 			if strings.HasPrefix(args[i], "-") {
-				return fmt.Errorf("unknown flag %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--json]", args[i])
+				return fmt.Errorf("unknown flag %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--json] [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]", args[i])
 			}
 			if newName != "" {
-				return fmt.Errorf("unexpected argument %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--json]", args[i])
+				return fmt.Errorf("unexpected argument %q\nusage: drive9 ctx fork [<new>] [--from <ctx>] [--json] [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]", args[i])
 			}
 			newName = args[i]
 		}
 	}
+	if err := rejectEmptyFlag("tidbcloud-public-key", strings.TrimSpace(publicKeyFlag), publicKeyGiven); err != nil {
+		return err
+	}
+	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
+		return err
+	}
+	publicKey := strings.TrimSpace(publicKeyFlag)
+	privateKey := strings.TrimSpace(privateKeyFlag)
 	cfg := loadConfig()
 	if cfg.Contexts == nil {
 		cfg.Contexts = map[string]*Context{}
@@ -493,6 +535,19 @@ func ctxForkCmd(args []string) error {
 	if source.Type != PrincipalOwner || source.APIKey == "" {
 		return fmt.Errorf("ctx fork requires an owner context; %q is %q", fromName, source.Type)
 	}
+	if (publicKey == "" || privateKey == "") && (publicKeyGiven || privateKeyGiven || ctxForkUsesTiDBCloudCredentials(source)) {
+		envPublicKey := consumeEnv(EnvTiDBCloudPublicKey)
+		envPrivateKey := consumeEnv(EnvTiDBCloudPrivateKey)
+		if publicKey == "" {
+			publicKey = strings.TrimSpace(envPublicKey)
+		}
+		if privateKey == "" {
+			privateKey = strings.TrimSpace(envPrivateKey)
+		}
+	}
+	if (publicKey == "") != (privateKey == "") {
+		return fmt.Errorf("TiDBCloud fork requires both --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
+	}
 	server := source.Server
 	if server == "" {
 		server = cfg.Server
@@ -501,9 +556,17 @@ func ctxForkCmd(args []string) error {
 		return fmt.Errorf("source context %q has no server URL", fromName)
 	}
 
-	body, _ := json.Marshal(map[string]string{"name": newName})
+	reqBody := map[string]string{"name": newName}
+	if publicKey != "" {
+		reqBody["public_key"] = publicKey
+		reqBody["private_key"] = privateKey
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return fmt.Errorf("encode fork request: %w", err)
+	}
 	c := client.New(server, source.APIKey)
-	resp, err := c.RawPost("/v1/fork", strings.NewReader(string(body)))
+	resp, err := c.RawPost("/v1/fork", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("ctx fork failed: %w", err)
 	}
@@ -523,9 +586,12 @@ func ctxForkCmd(args []string) error {
 		return fmt.Errorf("ctx fork response missing api_key")
 	}
 	if _, err := ctxAdd(cfg, newName, &Context{
-		Type:   PrincipalOwner,
-		Server: server,
-		APIKey: result.APIKey,
+		Type:          PrincipalOwner,
+		Server:        server,
+		APIKey:        result.APIKey,
+		Mode:          source.Mode,
+		CloudProvider: source.CloudProvider,
+		Region:        source.Region,
 	}); err != nil {
 		return err
 	}
@@ -547,7 +613,21 @@ func ctxForkCmd(args []string) error {
 	if result.Status == "provisioning" {
 		fmt.Println("The fork is still provisioning. Wait a moment, then retry a command like `drive9 fs ls /`; `fs` commands may fail until the tenant becomes active.")
 	}
+	if result.Status == "failed" {
+		fmt.Printf("Fork provisioning failed. The fork context %q has been saved with its API key.\n", newName)
+		fmt.Printf("To clean up the failed fork, switch to it with `drive9 ctx use %s` and run `drive9 delete`.\n", newName)
+		fmt.Printf("For TiDB Cloud Native forks, pass --tidbcloud-public-key/--tidbcloud-private-key or set %s/%s if the server has no default credential.\n", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
+	}
 	return nil
+}
+
+func ctxForkUsesTiDBCloudCredentials(ctx *Context) bool {
+	if ctx == nil {
+		return false
+	}
+	mode := strings.TrimSpace(ctx.Mode)
+	return strings.EqualFold(mode, ModeLabelTiDBCloud) ||
+		strings.EqualFold(mode, RegionModeTiDBCloudNative)
 }
 
 type forkCtxResult struct {

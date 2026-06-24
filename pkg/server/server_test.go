@@ -27,6 +27,10 @@ import (
 )
 
 func newTestServer(t *testing.T) *Server {
+	return newTestServerWithLogger(t, nil)
+}
+
+func newTestServerWithLogger(t *testing.T, log *zap.Logger) *Server {
 	t.Helper()
 
 	s3Dir, err := os.MkdirTemp("", "dat9-srv-s3-*")
@@ -51,7 +55,7 @@ func newTestServer(t *testing.T) *Server {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(b)
+	return NewWithConfig(Config{Backend: b, Logger: log})
 }
 
 func insertTestS3File(t *testing.T, s *Server, p string, size int64) {
@@ -215,6 +219,52 @@ func TestWriteReturnsCommittedRevision(t *testing.T) {
 	}
 }
 
+func TestWriteEmitsBenchPhaseTiming(t *testing.T) {
+	logger.ResetBenchTimingLogEnabledForTest()
+	t.Cleanup(logger.ResetBenchTimingLogEnabledForTest)
+	t.Setenv("DRIVE9_BENCH_TIMING_LOG_ENABLED", "true")
+
+	core, recorded := observer.New(zap.InfoLevel)
+	s := newTestServerWithLogger(t, zap.New(core))
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/timing.txt", strings.NewReader("timing body"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("write status = %d, body %s", resp.StatusCode, body)
+	}
+
+	assertObservedTimingFields(t, recorded, "server_write_timing",
+		"path", "result", "bytes", "body_read_ms", "backend_write_ms", "response_ms", "total_ms")
+	assertObservedTimingFields(t, recorded, "backend_write_timing",
+		"path", "canonical_path", "operation", "stat_ms", "implementation_ms", "total_ms")
+	assertObservedTimingFields(t, recorded, "backend_write_create_timing",
+		"path", "result", "prepare_ms", "tenant_tx_ms", "central_quota_ms", "total_ms")
+	// central_quota_mutation_sync_timing is only emitted when metaStore is
+	// non-nil (server quota mode). This test backend has no metaStore, so the
+	// async mutation path short-circuits in logQuotaMutation.
+}
+
+func assertObservedTimingFields(t *testing.T, recorded *observer.ObservedLogs, message string, fields ...string) {
+	t.Helper()
+	entries := recorded.FilterMessage(message).AllUntimed()
+	if len(entries) == 0 {
+		t.Fatalf("missing log message %q", message)
+	}
+	ctx := entries[0].ContextMap()
+	for _, field := range fields {
+		if _, ok := ctx[field]; !ok {
+			t.Fatalf("%s missing field %q; got fields %#v", message, field, ctx)
+		}
+	}
+}
+
 func TestReadInlineNoRedirect(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)
@@ -369,6 +419,7 @@ func TestListDir(t *testing.T) {
 		Entries []struct {
 			Name       string `json:"name"`
 			IsDir      bool   `json:"isDir"`
+			Revision   int64  `json:"revision"`
 			ResourceID string `json:"resource_id"`
 			Nlink      uint32 `json:"nlink"`
 		} `json:"entries"`
@@ -384,6 +435,9 @@ func TestListDir(t *testing.T) {
 	}
 	if result.Entries[0].Nlink != 1 {
 		t.Fatalf("list entry nlink = %d, want 1", result.Entries[0].Nlink)
+	}
+	if result.Entries[0].Revision <= 0 {
+		t.Fatalf("list entry revision = %d, want > 0", result.Entries[0].Revision)
 	}
 }
 

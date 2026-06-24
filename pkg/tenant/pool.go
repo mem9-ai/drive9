@@ -47,11 +47,71 @@ type PoolConfig struct {
 	// against plain MySQL but need a TiDB-class provider for vault.
 	SkipTiDBSchemaCheck bool
 
-	// DisableDatabaseAutoEmbedding forces DatabaseAutoEmbedding=false for all
-	// tenants, even when the provider normally enables it (tidb_zero,
-	// tidb_cloud_starter). Use when the TiDB Cloud cluster does not have a
-	// supported auto-embedding provider configured.
+	// DisableDatabaseAutoEmbedding forces runtime DatabaseAutoEmbedding=false
+	// for all tenants, even when the provider normally enables it (tidb_zero,
+	// tidb_cloud_starter). It suppresses writes that would trigger DB-side
+	// EMBED_TEXT, but TiDB tenants still use the normal auto schema repair.
 	DisableDatabaseAutoEmbedding bool
+
+	// LeaderChecker, when set, gates per-tenant FileGCWorker to run only on
+	// the leader pod. When nil, FileGCWorker starts unconditionally (single-pod).
+	//
+	// FileGC reacts to leadership transitions and races safely with concurrent
+	// backend creation: the server calls StartAllFileGC on leadership gain and
+	// StopAllFileGC on loss. These set a pool-owned fileGCEnabled flag under p.mu,
+	// and Get/Acquire start FileGC on a newly inserted backend according to that
+	// flag (read under p.mu), so a backend created concurrently with a transition
+	// resolves to the post-transition state instead of a moment-in-time
+	// IsLeader() snapshot.
+	LeaderChecker LeaderChecker
+}
+
+// LeaderChecker reports whether the current process is the leader. Used by
+// the tenant pool to gate per-tenant background workers (e.g. FileGCWorker).
+type LeaderChecker interface {
+	IsLeader() bool
+}
+
+// StartAllFileGC starts the per-tenant FileGCWorker on every cached backend
+// and marks FileGC as enabled so backends created afterwards also start FileGC.
+// Called by the server's onLead callback. All state changes happen under p.mu,
+// so a backend being created concurrently will observe a consistent
+// fileGCEnabled value when it is inserted (see Get/Acquire).
+func (p *Pool) StartAllFileGC() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.fileGCEnabled = true
+	backends := make([]*backend.Dat9Backend, 0, len(p.items))
+	for _, e := range p.items {
+		backends = append(backends, e.backend)
+	}
+	p.mu.Unlock()
+	for _, b := range backends {
+		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+	}
+}
+
+// StopAllFileGC stops the per-tenant FileGCWorker on every cached backend and
+// marks FileGC as disabled so backends created afterwards do not start FileGC.
+// Called by the server's onLose callback. All state changes happen under p.mu,
+// so a backend being created concurrently will observe a consistent
+// fileGCEnabled value when it is inserted (see Get/Acquire).
+func (p *Pool) StopAllFileGC() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.fileGCEnabled = false
+	backends := make([]*backend.Dat9Backend, 0, len(p.items))
+	for _, e := range p.items {
+		backends = append(backends, e.backend)
+	}
+	p.mu.Unlock()
+	for _, b := range backends {
+		b.StopFileGCWorker()
+	}
 }
 
 type Pool struct {
@@ -64,6 +124,14 @@ type Pool struct {
 	maxSize                   int
 	tidbSchemaValidationOpens atomic.Uint64
 	semanticTaskNotifier      atomic.Pointer[func(tenantID string)]
+	// fileGCEnabled tracks whether per-tenant FileGCWorker should be running on
+	// this pod. It is set under p.mu by StartAllFileGC (leader gain) /
+	// StopAllFileGC (leader loss), and read under p.mu when a newly created
+	// backend is inserted, so backend creation racing with a leadership
+	// transition resolves correctly instead of using a moment-in-time
+	// IsLeader() check taken outside the pool lock. When no LeaderChecker is
+	// configured (single-pod) it is always true.
+	fileGCEnabled bool
 }
 
 type tenantAutoEmbeddingProfile struct {
@@ -98,7 +166,15 @@ func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 	if max <= 0 {
 		max = 128
 	}
-	return &Pool{cfg: cfg, enc: enc, items: map[string]*entry{}, order: list.New(), maxSize: max}
+	return &Pool{
+		cfg:     cfg,
+		enc:     enc,
+		items:   map[string]*entry{},
+		order:   list.New(),
+		maxSize: max,
+		// No LeaderChecker means single-pod mode: FileGC runs unconditionally.
+		fileGCEnabled: cfg.LeaderChecker == nil,
+	}
 }
 
 // SetMetaStore sets the central server DB store for quota operations.
@@ -195,7 +271,14 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 			}
 		}
 	}
+	// Read the pool-owned FileGC leader state under p.mu so a backend created
+	// concurrently with a leadership transition resolves to the post-transition
+	// state rather than a moment-in-time IsLeader() check taken outside the lock.
+	startFileGC := p.fileGCEnabled
 	p.mu.Unlock()
+	if startFileGC {
+		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+	}
 	for _, retired := range toClose {
 		closeEntry(retired)
 	}
@@ -281,7 +364,14 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			}
 		}
 	}
+	// Read the pool-owned FileGC leader state under p.mu so a backend created
+	// concurrently with a leadership transition resolves to the post-transition
+	// state rather than a moment-in-time IsLeader() check taken outside the lock.
+	startFileGC := p.fileGCEnabled
 	p.mu.Unlock()
+	if startFileGC {
+		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
+	}
 	for _, retired := range toClose {
 		closeEntry(retired)
 	}
@@ -584,15 +674,17 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	openStoreDurationMs := float64(time.Since(openStoreStart).Microseconds()) / 1000.0
 	ensureSchemaDurationMs := 0.0
 	migrateDurationMs := 0.0
-	if opts.DatabaseAutoEmbedding && (t.Provider == ProviderTiDBZero || t.Provider == ProviderTiDBCloudStarter) {
+	if UsesTiDBAutoEmbedding(t.Provider) {
 		autoEmbeddingProfile, err := p.autoEmbeddingProfileForTenant(ctx, t)
 		if err != nil {
 			_ = store.Close()
 			return nil, nil, fmt.Errorf("resolve tenant auto-embedding profile: %w", err)
 		}
-		if err := applyTiDBAutoEmbeddingProviderConfig(ctx, store.DB(), autoEmbeddingProfile.provider); err != nil {
-			_ = store.Close()
-			return nil, nil, fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
+		if !p.cfg.DisableDatabaseAutoEmbedding {
+			if err := applyTiDBAutoEmbeddingProviderConfig(ctx, store.DB(), autoEmbeddingProfile.provider); err != nil {
+				_ = store.Close()
+				return nil, nil, fmt.Errorf("apply tenant auto-embedding provider config: %w", err)
+			}
 		}
 		if !p.cfg.SkipTiDBSchemaCheck {
 			targetSchemaVersion, err := schema.TiDBTenantSchemaVersionForAutoEmbeddingProfile(autoEmbeddingProfile.schemaProfile)
@@ -606,7 +698,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 					_ = store.Close()
 					return nil, nil, fmt.Errorf("ensure tidb auto-embedding schema: %w", err)
 				}
-				ensureSchemaDurationMs = float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
+				ensureSchemaDurationMs += float64(time.Since(ensureSchemaStart).Microseconds()) / 1000.0
 				if p.metaStore != nil {
 					// Record the tenant-profile-specific version only after the
 					// schema has been confirmed to match that tenant's profile.
@@ -624,7 +716,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 					_ = store.Close()
 					return nil, nil, fmt.Errorf("validate tidb auto-embedding schema: %w", err)
 				}
-				ensureSchemaDurationMs = float64(time.Since(validateSchemaStart).Microseconds()) / 1000.0
+				ensureSchemaDurationMs += float64(time.Since(validateSchemaStart).Microseconds()) / 1000.0
 			}
 		}
 	}
@@ -682,9 +774,8 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
-		p.wireQuotaStore(b, t.ID)
+		p.wireQuotaStore(ctx, b, t.ID)
 		p.wireSemanticTaskNotifier(b, t.ID)
-		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 		return b, store, nil
 	}
 	if p.cfg.S3Dir != "" {
@@ -723,9 +814,8 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_s3_client_ms", s3ClientDurationMs),
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
-		p.wireQuotaStore(b, t.ID)
+		p.wireQuotaStore(ctx, b, t.ID)
 		p.wireSemanticTaskNotifier(b, t.ID)
-		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 		return b, store, nil
 	}
 	backendCreateStart := time.Now()
@@ -746,9 +836,8 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("create_s3_client_ms", 0),
 		zap.Float64("create_backend_ms", backendCreateDurationMs),
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
-	p.wireQuotaStore(b, t.ID)
+	p.wireQuotaStore(ctx, b, t.ID)
 	p.wireSemanticTaskNotifier(b, t.ID)
-	b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 	return b, store, nil
 }
 
@@ -863,20 +952,12 @@ func (p *Pool) defaultStorageNamespacePrefix(tenantID, backendName string) strin
 
 // wireQuotaStore sets the central quota store on a newly created backend.
 // No-op when the pool's metaStore is nil (tests, non-multi-tenant mode).
-// Also ensures a tenant_quota_usage row exists so that counter UPDATEs
-// do not fail for newly provisioned tenants.
-func (p *Pool) wireQuotaStore(b *backend.Dat9Backend, tenantID string) {
+func (p *Pool) wireQuotaStore(ctx context.Context, b *backend.Dat9Backend, tenantID string) {
 	if p.metaStore == nil {
 		return
 	}
 	adapter := NewMetaQuotaAdapter(p.metaStore)
-	b.SetMetaQuotaStore(tenantID, adapter)
-	// Bootstrap quota usage row (INSERT IGNORE — idempotent, cheap).
-	if err := p.metaStore.EnsureQuotaUsageRow(context.Background(), tenantID); err != nil {
-		logger.Warn(context.Background(), "wire_quota_store_ensure_usage_row_failed",
-			zap.String("tenant_id", tenantID),
-			zap.Error(err))
-	}
+	b.SetMetaQuotaStore(ctx, tenantID, adapter)
 }
 
 func (p *Pool) removeLocked(elem *list.Element) *entry {

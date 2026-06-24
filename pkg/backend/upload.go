@@ -177,27 +177,34 @@ func (b *Dat9Backend) supersedeActiveUpload(ctx context.Context, op string, exis
 	return err
 }
 
-func (b *Dat9Backend) validateUploadTargetRevision(ctx context.Context, path string, expectedRevision int64) error {
+func (b *Dat9Backend) validateUploadTargetRevision(ctx context.Context, path string, expectedRevision int64) (*datastore.NodeWithFile, bool, error) {
 	nf, err := b.store.Stat(ctx, path)
 	if err != nil {
 		if errors.Is(err, datastore.ErrNotFound) {
 			if expectedRevision > 0 {
-				return datastore.ErrRevisionConflict
+				return nil, false, datastore.ErrRevisionConflict
 			}
-			return nil
+			return nil, false, nil
 		}
-		return err
+		return nil, false, err
 	}
 	if nf.Node.IsDirectory {
-		return fmt.Errorf("is a directory: %s", path)
+		return nil, false, fmt.Errorf("is a directory: %s", path)
 	}
 	if expectedRevision == 0 {
-		return datastore.ErrRevisionConflict
+		return nf, true, datastore.ErrRevisionConflict
 	}
 	if expectedRevision > 0 && (nf.File == nil || nf.File.Status != datastore.StatusConfirmed || nf.File.Revision != expectedRevision) {
-		return datastore.ErrRevisionConflict
+		return nf, true, datastore.ErrRevisionConflict
 	}
-	return nil
+	return nf, true, nil
+}
+
+func uploadFileCountDelta(targetExists bool) int64 {
+	if targetExists {
+		return 0
+	}
+	return 1
 }
 
 func (b *Dat9Backend) cleanupFailedFinalizeUpload(ctx context.Context, upload *datastore.Upload) {
@@ -246,6 +253,10 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
 	}
+	if err := b.ensureFileSizeQuota(ctx, totalSize); err != nil {
+		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
+		return nil, err
+	}
 
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
@@ -263,12 +274,17 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
 	}
-	if err := b.validateUploadTargetRevision(ctx, path, expectedRevision); err != nil {
+	target, targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
+	if err != nil {
 		if errors.Is(err, datastore.ErrRevisionConflict) {
 			metrics.RecordOperation("backend", "initiate_upload", "conflict", time.Since(start))
 		} else {
 			metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		}
+		return nil, err
+	}
+	if err := b.drainQuotaOutboxForUploadTarget(ctx, target, targetExists); err != nil {
+		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
 	}
 
@@ -314,7 +330,7 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 
 	// Server-reserve-first saga: claim reserved_bytes on server DB before
 	// touching the tenant DB. Fail-open on server DB errors.
-	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize)
+	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize, uploadFileCountDelta(targetExists))
 	if err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		metrics.RecordOperation("backend", "initiate_upload", "quota_exceeded", time.Since(start))
@@ -422,6 +438,10 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
 	}
+	if err := b.ensureFileSizeQuota(ctx, totalSize); err != nil {
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
+		return nil, err
+	}
 
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
@@ -439,12 +459,17 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
 	}
-	if err := b.validateUploadTargetRevision(ctx, path, expectedRevision); err != nil {
+	target, targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
+	if err != nil {
 		if errors.Is(err, datastore.ErrRevisionConflict) {
 			metrics.RecordOperation("backend", "initiate_upload_v2", "conflict", time.Since(start))
 		} else {
 			metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		}
+		return nil, err
+	}
+	if err := b.drainQuotaOutboxForUploadTarget(ctx, target, targetExists); err != nil {
+		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
 	}
 	validateDurationMs := uploadPhaseMs(validateStart)
@@ -482,7 +507,7 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 
 	// Server-reserve-first saga: claim reserved_bytes on server DB before
 	// touching the tenant DB. Fail-open on server DB errors.
-	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize)
+	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, totalSize, uploadFileCountDelta(targetExists))
 	if err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, s3Key, mpu.UploadID)
 		metrics.RecordOperation("backend", "initiate_upload_v2", "quota_exceeded", time.Since(start))
@@ -959,7 +984,7 @@ func (b *Dat9Backend) ConfirmUploadWithTags(ctx context.Context, uploadID string
 // Both ConfirmUpload (v1) and ConfirmUploadV2 call this with already-validated parts.
 //
 // For TiDB auto-embedding tenants, durable img_extract_text / audio_extract_text
-// tasks are registered in the same transaction via enqueueTiDBAutoSemanticTasksTx,
+// tasks are registered in the same transaction via enqueueExtractSemanticTasksTx,
 // matching create/overwrite semantics (MP3/WAV closed set, runtime gates, payloads).
 func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Upload, parts []s3client.Part, tags map[string]string) error {
 	start := time.Now()
@@ -1089,18 +1114,28 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			}
 			if b.UsesDatabaseAutoEmbedding() {
 				stepStart = time.Now()
-				created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+				created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+					quotaMediaDelta(oldIsMedia, newIsMedia))
 				semanticTaskEnqueued = created
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 				return err
+			}
+			// App-embedding mode: image/audio extract tasks are durable and
+			// independent of EMBED_TEXT, so register them in the same transaction.
+			stepStart = time.Now()
+			extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+				quotaMediaDelta(oldIsMedia, newIsMedia))
+			if extractErr != nil {
+				return extractErr
 			}
 			if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "", upload.Description) {
-				stepStart = time.Now()
 				created, err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
-				semanticTaskEnqueued = created
+				semanticTaskEnqueued = created || extractCreated
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 				return err
 			}
+			semanticTaskEnqueued = extractCreated
+			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return nil
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -1151,18 +1186,28 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		}
 		if b.UsesDatabaseAutoEmbedding() {
 			stepStart = time.Now()
-			created, err := b.enqueueTiDBAutoSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType)
+			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+				quotaMediaDelta(false, newIsMedia))
 			semanticTaskEnqueued = created
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return err
+		}
+		// App-embedding mode: image/audio extract tasks are durable and
+		// independent of EMBED_TEXT, so register them in the same transaction.
+		stepStart = time.Now()
+		extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, confirmedFileID, confirmedRevision, upload.TargetPath, contentType,
+			quotaMediaDelta(false, newIsMedia))
+		if extractErr != nil {
+			return extractErr
 		}
 		if b.shouldEnqueueEmbedForRevision(upload.TargetPath, contentType, "", upload.Description) {
-			stepStart = time.Now()
 			created, err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
-			semanticTaskEnqueued = created
+			semanticTaskEnqueued = created || extractCreated
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 			return err
 		}
+		semanticTaskEnqueued = extractCreated
+		semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
 		return nil
 	}); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
@@ -1199,12 +1244,6 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		zap.Float64("tx_ms", txDurationMs),
 		zap.Float64("total_ms", uploadPhaseMs(start)),
 	)
-	if b.UsesDatabaseAutoEmbedding() {
-		metrics.RecordOperation("backend", "finalize_upload", "ok", time.Since(start))
-		return nil
-	}
-	b.enqueueImageExtractForUpload(ctx, upload, isOverwrite)
-
 	metrics.RecordOperation("backend", "finalize_upload", "ok", time.Since(start))
 	return nil
 }

@@ -188,7 +188,8 @@ type FileInfo struct {
 	Name       string `json:"name"`
 	Size       int64  `json:"size"`
 	IsDir      bool   `json:"isDir"`
-	Mtime      int64  `json:"mtime,omitempty"` // Unix seconds, 0 means unknown
+	Mtime      int64  `json:"mtime,omitempty"`    // Unix seconds, 0 means unknown
+	Revision   int64  `json:"revision,omitempty"` // file revision from server; 0 means unknown (old server)
 	Mode       uint32 `json:"mode,omitempty"`
 	HasMode    bool   `json:"hasMode"`
 	ResourceID string `json:"resource_id,omitempty"`
@@ -276,6 +277,14 @@ func (c *Client) url(path string) string {
 		path = "/" + path
 	}
 	return c.baseURL + "/v1/fs" + path
+}
+
+func (c *Client) RawGet(endpoint string) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, c.baseURL+endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	return c.do(req)
 }
 
 func (c *Client) RawPost(endpoint string, body io.Reader) (*http.Response, error) {

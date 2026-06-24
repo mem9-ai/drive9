@@ -1,7 +1,7 @@
 import { Client } from "./client.js";
 import { bodyInit } from "./compat.js";
 import { Drive9Error, StatusError, checkError } from "./error.js";
-import type { CompletePart, PresignedPart, UploadMeta, UploadPlan, UploadPlanV2 } from "./models.js";
+import type { CompletePart, PresignedPart, UploadMeta, UploadPlan, UploadPlanV2, UploadSummary, WriteOptions } from "./models.js";
 import { Semaphore } from "./utils.js";
 
 const PART_SIZE = 8 * 1024 * 1024;
@@ -44,11 +44,6 @@ export function computeCrc32c(data: Uint8Array): string {
       crc & 0xff,
     ])
   );
-}
-
-async function sha256Base64(data: Uint8Array): Promise<string> {
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  return bytesToBase64(new Uint8Array(hash));
 }
 
 async function streamToUint8Array(stream: ReadableStream<Uint8Array>, size: number): Promise<Uint8Array> {
@@ -168,8 +163,20 @@ export async function writeStreamImpl(
   path: string,
   stream: ReadableStream<Uint8Array> | Uint8Array,
   size: number,
-  expectedRevision = -1
+  options?: number | WriteOptions
 ): Promise<void> {
+  await writeStreamWithSummaryImpl(client, path, stream, size, options);
+}
+
+export async function writeStreamWithSummaryImpl(
+  client: Client,
+  path: string,
+  stream: ReadableStream<Uint8Array> | Uint8Array,
+  size: number,
+  options?: number | WriteOptions
+): Promise<UploadSummary> {
+  const opts = normalizeWriteOptions(options);
+  const started = new Date();
   const threshold = client["smallFileThreshold"];
   let data: Uint8Array;
   if (stream instanceof Uint8Array) {
@@ -177,43 +184,81 @@ export async function writeStreamImpl(
   } else {
     data = await streamToUint8Array(stream, size);
   }
-  if (size < threshold) {
-    return client.write(path, data, expectedRevision);
+  if (size === 0 || size < threshold) {
+    await client.write(path, data, opts);
+    return uploadSummary(path, size, "direct_put", started);
   }
   try {
-    await writeStreamV2(client, path, data, expectedRevision);
+    const plan = await writeStreamV2(client, path, data, opts);
+    return uploadSummary(path, size, "multipart_v2", started, plan.part_size, plan.total_parts, plan.total_parts);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("v2 upload API not available")) {
-      await writeStreamV1(client, path, data, expectedRevision);
+      const plan = await writeStreamV1(client, path, data, opts);
+      return uploadSummary(path, size, "multipart_v1", started, plan.part_size, plan.parts.length, plan.parts.length);
     } else {
       throw err;
     }
   }
 }
 
+function normalizeWriteOptions(options?: number | WriteOptions): Required<Pick<WriteOptions, "expectedRevision">> & Omit<WriteOptions, "expectedRevision"> {
+  if (typeof options === "number") return { expectedRevision: options };
+  return { expectedRevision: options?.expectedRevision ?? -1, tags: options?.tags, description: options?.description };
+}
+
+function uploadSummary(
+  path: string,
+  size: number,
+  mode: UploadSummary["mode"],
+  started: Date,
+  partSize?: number,
+  totalParts?: number,
+  uploadedParts?: number
+): UploadSummary {
+  const finished = new Date();
+  return {
+    type: "upload",
+    mode,
+    started_at: started.toISOString(),
+    finished_at: finished.toISOString(),
+    elapsed_seconds: (finished.getTime() - started.getTime()) / 1000,
+    remote_path: path,
+    total_bytes: size,
+    part_size_bytes: partSize,
+    total_parts: totalParts,
+    uploaded_parts: uploadedParts,
+  };
+}
+
+function expectedRevisionPayload(expectedRevision: number): { expected_revision?: number } {
+  return expectedRevision >= 0 ? { expected_revision: expectedRevision } : {};
+}
+
 async function writeStreamV1(
   client: Client,
   path: string,
   data: Uint8Array,
-  expectedRevision: number
-): Promise<void> {
+  options: Required<Pick<WriteOptions, "expectedRevision">> & Omit<WriteOptions, "expectedRevision">
+): Promise<UploadPlan> {
   const checksums = computePartChecksums(data, PART_SIZE);
-  const plan = await initiateUpload(client, path, data.length, checksums, expectedRevision);
+  const plan = await initiateUpload(client, path, data.length, checksums, options.expectedRevision, options.description || "");
   await uploadPartsV1(client, plan, data);
-  await completeUpload(client, plan.upload_id);
+  await completeUpload(client, plan.upload_id, options.tags);
+  return plan;
 }
 
 async function writeStreamV2(
   client: Client,
   path: string,
   data: Uint8Array,
-  expectedRevision: number
-): Promise<void> {
-  const plan = await initiateUploadV2(client, path, data.length, expectedRevision);
+  options: Required<Pick<WriteOptions, "expectedRevision">> & Omit<WriteOptions, "expectedRevision">
+): Promise<UploadPlanV2> {
+  const plan = await initiateUploadV2(client, path, data.length, options.expectedRevision, options.description || "");
   try {
     const parts = await uploadPartsV2(client, plan, data);
-    await completeUploadV2(client, plan.upload_id, parts);
+    await completeUploadV2(client, plan.upload_id, parts, options.tags);
+    return plan;
   } catch (err) {
     await abortUploadV2(client, plan.upload_id);
     throw err;
@@ -236,18 +281,19 @@ async function initiateUpload(
   path: string,
   size: number,
   checksums: string[],
-  expectedRevision: number
+  expectedRevision: number,
+  description: string
 ): Promise<UploadPlan> {
   try {
-    return await initiateUploadByBody(client, path, size, checksums, expectedRevision);
+    return await initiateUploadByBody(client, path, size, checksums, expectedRevision, description);
   } catch (err) {
     const status = err instanceof StatusError ? err.statusCode : 0;
     const msg = err instanceof Error ? err.message : String(err);
     if (status === 404 || status === 405) {
-      return initiateUploadLegacy(client, path, size, checksums, expectedRevision);
+      return initiateUploadLegacy(client, path, size, checksums, expectedRevision, description);
     }
     if (status === 400 && msg.toLowerCase().includes("unknown upload action")) {
-      return initiateUploadLegacy(client, path, size, checksums, expectedRevision);
+      return initiateUploadLegacy(client, path, size, checksums, expectedRevision, description);
     }
     throw err;
   }
@@ -258,12 +304,13 @@ async function initiateUploadByBody(
   path: string,
   size: number,
   checksums: string[],
-  expectedRevision: number
+  expectedRevision: number,
+  description: string
 ): Promise<UploadPlan> {
   const resp = await fetch(`${client.baseUrl}/v1/uploads/initiate`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ path, size, part_checksums: checksums, expected_revision: expectedRevision }),
+    body: JSON.stringify({ path, total_size: size, part_checksums: checksums, ...expectedRevisionPayload(expectedRevision), description }),
   });
   if (resp.status === 202) {
     return (await resp.json()) as UploadPlan;
@@ -277,12 +324,14 @@ async function initiateUploadLegacy(
   path: string,
   size: number,
   checksums: string[],
-  expectedRevision: number
+  expectedRevision: number,
+  description: string
 ): Promise<UploadPlan> {
   const headers = client["authHeaders"]({ "Content-Type": "application/octet-stream" });
   headers["X-Dat9-Content-Length"] = String(size);
   if (checksums.length) headers["X-Dat9-Part-Checksums"] = checksums.join(",");
   if (expectedRevision >= 0) headers["X-Dat9-Expected-Revision"] = String(expectedRevision);
+  if (description) headers["X-Dat9-Description"] = description;
   const resp = await fetch(client.fsUrl(path), { method: "PUT", headers });
   await checkError(resp);
   return (await resp.json()) as UploadPlan;
@@ -299,7 +348,7 @@ async function uploadPartsV1(client: Client, plan: UploadPlan, data: Uint8Array)
       (async () => {
         await semaphore.acquire();
         try {
-          await uploadOnePart(client, part.url, chunk, part.checksum_crc32c);
+          await uploadOnePart(client, part.url, chunk, part.checksum_crc32c, part.headers);
         } finally {
           semaphore.release();
         }
@@ -313,21 +362,31 @@ async function uploadOnePart(
   client: Client,
   url: string,
   data: Uint8Array,
-  checksumCrc32c?: string
+  checksumCrc32c?: string,
+  signedHeaders?: Record<string, unknown>
 ): Promise<void> {
   const checksum = checksumCrc32c || computeCrc32c(data);
+  const headers: Record<string, string> = {};
+  if (signedHeaders) {
+    for (const [k, v] of Object.entries(signedHeaders)) {
+      if (typeof v === "string" && k.toLowerCase() !== "host") headers[k] = v;
+    }
+  }
+  headers["x-amz-checksum-crc32c"] = checksum;
   const resp = await fetch(url, {
     method: "PUT",
-    headers: { "x-amz-checksum-crc32c": checksum },
+    headers,
     body: bodyInit(data),
   });
   await checkError(resp);
 }
 
-async function completeUpload(client: Client, uploadId: string): Promise<void> {
+async function completeUpload(client: Client, uploadId: string, tags?: Record<string, string>): Promise<void> {
+  const body = tags != null ? JSON.stringify({ tags }) : undefined;
   const resp = await fetch(`${client.baseUrl}/v1/uploads/${uploadId}/complete`, {
     method: "POST",
-    headers: client["authHeaders"](),
+    headers: client["authHeaders"](tags != null ? { "Content-Type": "application/json" } : undefined),
+    body,
   });
   await checkError(resp);
 }
@@ -336,12 +395,13 @@ async function initiateUploadV2(
   client: Client,
   path: string,
   size: number,
-  expectedRevision: number
+  expectedRevision: number,
+  description: string
 ): Promise<UploadPlanV2> {
   const resp = await fetch(`${client.baseUrl}/v2/uploads/initiate`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ path, total_size: size, expected_revision: expectedRevision }),
+    body: JSON.stringify({ path, total_size: size, ...expectedRevisionPayload(expectedRevision), description }),
   });
   if (resp.status === 404) {
     throw new Drive9Error("v2 upload API not available");
@@ -397,26 +457,31 @@ async function uploadOnePartV2(
   part: PresignedPart,
   data: Uint8Array
 ): Promise<string> {
+  const headers = presignedHeaders(part);
+  let resp = await fetch(part.url, { method: "PUT", headers, body: bodyInit(data) });
+  if (resp.status === 403) {
+    const fresh = await presignOnePart(client, uploadId, part.number);
+    resp = await fetch(fresh.url, { method: "PUT", headers: presignedHeaders(fresh), body: bodyInit(data) });
+  }
+  await checkError(resp);
+  return resp.headers.get("etag") || "";
+}
+
+function presignedHeaders(part: PresignedPart): Record<string, string> {
   const headers: Record<string, string> = {};
   if (part.headers) {
     for (const [k, v] of Object.entries(part.headers)) {
       if (typeof v === "string") headers[k] = v;
     }
   }
-  let resp = await fetch(part.url, { method: "PUT", headers, body: bodyInit(data) });
-  if (resp.status === 403) {
-    const fresh = await presignOnePart(client, uploadId, part.number);
-    resp = await fetch(fresh.url, { method: "PUT", headers, body: bodyInit(data) });
-  }
-  await checkError(resp);
-  return resp.headers.get("etag") || "";
+  return headers;
 }
 
-async function completeUploadV2(client: Client, uploadId: string, parts: CompletePart[]): Promise<void> {
+async function completeUploadV2(client: Client, uploadId: string, parts: CompletePart[], tags?: Record<string, string>): Promise<void> {
   const resp = await fetch(`${client.baseUrl}/v2/uploads/${uploadId}/complete`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ parts }),
+    body: JSON.stringify({ parts, tags }),
   });
   await checkError(resp);
 }
@@ -440,7 +505,7 @@ export async function resumeUploadImpl(
     await completeUpload(client, meta.upload_id);
     return;
   }
-  await uploadMissingParts(client, plan, data, meta.parts_total);
+  await uploadMissingParts(client, plan, data);
   await completeUpload(client, meta.upload_id);
 }
 
@@ -476,7 +541,7 @@ async function requestResumeByBody(client: Client, uploadId: string, checksums: 
     body: JSON.stringify({ part_checksums: checksums }),
   });
   const status = resp.status;
-  if (status === 202) {
+  if (status === 200 || status === 202) {
     return (await resp.json()) as UploadPlan;
   }
   const text = await resp.text().catch(() => "");
@@ -497,19 +562,18 @@ async function requestResumeLegacy(client: Client, uploadId: string, checksums: 
   return (await resp.json()) as UploadPlan;
 }
 
-async function uploadMissingParts(client: Client, plan: UploadPlan, data: Uint8Array, partsTotal: number): Promise<void> {
-  const stdPartSize = Math.floor(data.length / partsTotal) || PART_SIZE;
-  const parallelism = uploadParallelism(stdPartSize);
+async function uploadMissingParts(client: Client, plan: UploadPlan, data: Uint8Array): Promise<void> {
+  const parallelism = uploadParallelism(plan.part_size);
   const semaphore = new Semaphore(parallelism);
   const tasks: Promise<void>[] = [];
   for (const part of plan.parts) {
-    const offset = (part.number - 1) * stdPartSize;
+    const offset = (part.number - 1) * plan.part_size;
     const chunk = data.subarray(offset, offset + part.size);
     tasks.push(
       (async () => {
         await semaphore.acquire();
         try {
-          await uploadOnePart(client, part.url, chunk, part.checksum_crc32c);
+          await uploadOnePart(client, part.url, chunk, part.checksum_crc32c, part.headers);
         } finally {
           semaphore.release();
         }
@@ -518,4 +582,3 @@ async function uploadMissingParts(client: Client, plan: UploadPlan, data: Uint8A
   }
   await Promise.all(tasks);
 }
-

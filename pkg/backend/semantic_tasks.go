@@ -37,17 +37,20 @@ func (b *Dat9Backend) enqueueAudioExtractTaskTx(tx *sql.Tx, fileID string, revis
 	return b.store.EnqueueSemanticTaskTx(tx, task)
 }
 
-// enqueueTiDBAutoSemanticTasksTx registers durable img_extract_text and/or
-// audio_extract_text tasks for one confirmed file revision in TiDB auto-embedding mode.
-// When the tenant's media LLM file quota is exceeded, no extraction tasks are
-// enqueued but the file write itself succeeds normally.
-func (b *Dat9Backend) enqueueTiDBAutoSemanticTasksTx(ctx context.Context, tx *sql.Tx, fileID string, revision int64, path, contentType string) (bool, error) {
+// enqueueExtractSemanticTasksTx registers durable img_extract_text and/or
+// audio_extract_text tasks for one confirmed file revision. It applies in both
+// database auto-embedding and app-embedding modes: image/audio extraction does
+// not depend on EMBED_TEXT. When the tenant's media LLM file quota is exceeded,
+// no extraction tasks are enqueued but the file write itself succeeds normally.
+// currentMediaDelta accounts for the current transaction when server quota
+// usage has not converged yet.
+func (b *Dat9Backend) enqueueExtractSemanticTasksTx(ctx context.Context, tx *sql.Tx, fileID string, revision int64, path, contentType string, currentMediaDelta int64) (bool, error) {
 	isImage := b.hasAsyncImageTextSource(path, contentType)
 	isAudio := b.shouldEnqueueAudioExtractTask(path, contentType)
 	if !isImage && !isAudio {
 		return false, nil
 	}
-	if b.mediaLLMQuotaExceededCheckTx(ctx, tx) {
+	if b.mediaLLMQuotaExceededCheckTx(ctx, tx, currentMediaDelta) {
 		metrics.RecordOperation("media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
 		return false, nil
 	}
@@ -142,6 +145,9 @@ func newAudioExtractTask(taskID, fileID string, revision int64, path, contentTyp
 }
 
 func (b *Dat9Backend) shouldEnqueueEmbedForRevision(path, contentType, contentText, description string) bool {
+	if !b.appSemanticTasksEnabled {
+		return false
+	}
 	if strings.TrimSpace(contentText) != "" {
 		return true
 	}

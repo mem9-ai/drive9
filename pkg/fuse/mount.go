@@ -55,6 +55,7 @@ type MountOptions struct {
 	LocalOnlyPatterns       []string      // additional local-only path patterns for overlay-profile mounts
 	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for overlay-profile mounts
 	PackPaths               []string      // local overlay paths auto-packed after unmount
+	CommitQueueMaxPending   int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
 	UploadConcurrency       int           // number of background upload workers (default 4)
 	ReadConcurrency         int           // maximum concurrent backend reads issued by FUSE (default 24)
 	ParallelReadConcurrency int           // maximum concurrent block reads for one large FUSE read (default 4)
@@ -68,6 +69,7 @@ type MountOptions struct {
 	PrefetchMaxFileBytes    int64         // maximum individual file size prefetched (default 50KB)
 	PrefetchMaxBytes        int64         // maximum aggregate bytes prefetched per directory read (default 1MB)
 	PrefetchTimeout         time.Duration // timeout for one readdir prefetch batch (default 1s)
+	DirCacheMaxEntries      int           // maximum entries per directory in DirCache (default 200000); directories exceeding this limit are not cached as complete
 	TrustLocalEvents        bool          // allow revision-bound GetAttr hits from DirCache using process-local SSE freshness; safe only for single-server/sticky or cluster-wide event streams
 	AllowOther              bool          // allow other users to access mount
 	ReadOnly                bool          // mount as read-only
@@ -395,7 +397,11 @@ func Mount(opts *MountOptions) error {
 
 			// Initialize CommitQueue for background remote commits.
 			if shadowStore != nil && pendingIdx != nil {
-				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, maxCommitQueuePending, opts.RemoteRoot)
+				cqMaxPending := maxCommitQueuePending
+				if opts.CommitQueueMaxPending > 0 {
+					cqMaxPending = opts.CommitQueueMaxPending
+				}
+				cq := NewCommitQueue(c, shadowStore, pendingIdx, journal, opts.UploadConcurrency, cqMaxPending, opts.RemoteRoot)
 				cq.SetLayerRef(opts.LayerRef)
 				cq.SetPerfCounters(dat9fs.perf)
 				cq.OnSuccess = dat9fs.onCommitQueueSuccess

@@ -1,7 +1,7 @@
 import { Client } from "./client.js";
 import { bodyInit } from "./compat.js";
 import { checkError, Drive9Error } from "./error.js";
-import type { CompletePart, PresignedPart, UploadPlanV2 } from "./models.js";
+import type { CompletePart, PresignedPart, UploadPlanV2, WriteOptions } from "./models.js";
 import { Semaphore } from "./utils.js";
 
 const UPLOAD_MAX_CONCURRENCY = 16;
@@ -21,6 +21,8 @@ export class StreamWriter {
   private path: string;
   private totalSize: number;
   private expectedRevision: number;
+  private description: string;
+  private tags?: Record<string, string>;
   private abortOnError: boolean;
   private state: StreamState;
   private sem: Semaphore;
@@ -31,13 +33,20 @@ export class StreamWriter {
     client: Client,
     path: string,
     totalSize: number,
-    expectedRevision = -1,
+    expectedRevision: number | WriteOptions = -1,
     abortOnError = true
   ) {
     this.client = client;
     this.path = path;
     this.totalSize = totalSize;
-    this.expectedRevision = expectedRevision;
+    if (typeof expectedRevision === "number") {
+      this.expectedRevision = expectedRevision;
+      this.description = "";
+    } else {
+      this.expectedRevision = expectedRevision.expectedRevision ?? -1;
+      this.description = expectedRevision.description || "";
+      this.tags = expectedRevision.tags;
+    }
     this.abortOnError = abortOnError;
     this.state = {
       started: false,
@@ -151,7 +160,7 @@ export class StreamWriter {
       parts.push(part);
     }
 
-    await completeUploadV2(this.client, plan.upload_id, parts);
+    await completeUploadV2(this.client, plan.upload_id, parts, this.tags);
     this.state.completed = true;
   }
 
@@ -170,14 +179,16 @@ export class StreamWriter {
   }
 
   private async initiate(): Promise<UploadPlanV2> {
+    const payload: { path: string; total_size: number; expected_revision?: number; description?: string } = {
+      path: this.path,
+      total_size: this.totalSize,
+    };
+    if (this.expectedRevision >= 0) payload.expected_revision = this.expectedRevision;
+    if (this.description) payload.description = this.description;
     const resp = await fetch(`${this.client.baseUrl}/v2/uploads/initiate`, {
       method: "POST",
       headers: this.client["authHeaders"]({ "Content-Type": "application/json" }),
-      body: JSON.stringify({
-        path: this.path,
-        total_size: this.totalSize,
-        expected_revision: this.expectedRevision,
-      }),
+      body: JSON.stringify(payload),
     });
     if (resp.status === 404) {
       throw new Drive9Error("v2 upload API not available");
@@ -203,26 +214,31 @@ async function uploadOnePartV2(
   part: PresignedPart,
   data: Uint8Array
 ): Promise<string> {
+  const headers = presignedHeaders(part);
+  let resp = await fetch(part.url, { method: "PUT", headers, body: bodyInit(data) });
+  if (resp.status === 403) {
+    const fresh = await presignOnePart(client, uploadId, part.number);
+    resp = await fetch(fresh.url, { method: "PUT", headers: presignedHeaders(fresh), body: bodyInit(data) });
+  }
+  await checkError(resp);
+  return resp.headers.get("etag") || "";
+}
+
+function presignedHeaders(part: PresignedPart): Record<string, string> {
   const headers: Record<string, string> = {};
   if (part.headers) {
     for (const [k, v] of Object.entries(part.headers)) {
       if (typeof v === "string") headers[k] = v;
     }
   }
-  let resp = await fetch(part.url, { method: "PUT", headers, body: bodyInit(data) });
-  if (resp.status === 403) {
-    const fresh = await presignOnePart(client, uploadId, part.number);
-    resp = await fetch(fresh.url, { method: "PUT", headers, body: bodyInit(data) });
-  }
-  await checkError(resp);
-  return resp.headers.get("etag") || "";
+  return headers;
 }
 
-async function completeUploadV2(client: Client, uploadId: string, parts: CompletePart[]): Promise<void> {
+async function completeUploadV2(client: Client, uploadId: string, parts: CompletePart[], tags?: Record<string, string>): Promise<void> {
   const resp = await fetch(`${client.baseUrl}/v2/uploads/${uploadId}/complete`, {
     method: "POST",
     headers: client["authHeaders"]({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ parts }),
+    body: JSON.stringify({ parts, tags }),
   });
   await checkError(resp);
 }

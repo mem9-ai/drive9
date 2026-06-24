@@ -151,6 +151,10 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
 		return nil, err
 	}
+	if err := b.ensureFileSizeQuota(ctx, newSize); err != nil {
+		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		return nil, err
+	}
 
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
@@ -307,7 +311,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	expiresAt := now.Add(24 * time.Hour)
 
 	// Server-reserve-first saga (same as upload initiate).
-	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, newSize)
+	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, newSize, 0)
 	if err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
 		metrics.RecordOperation("backend", "patch_upload", "quota_exceeded", time.Since(start))
@@ -339,8 +343,10 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	}
 
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
-		if err := b.ensureStorageQuota(ctx, tx, path, newSize); err != nil {
-			return err
+		if !b.UseServerQuota() {
+			if err := b.ensureTenantStorageQuotaTx(tx, path, newSize); err != nil {
+				return err
+			}
 		}
 		if err := b.store.InsertFileTx(tx, &datastore.File{
 			FileID:                 fileID,

@@ -38,7 +38,7 @@ func TestFileGCTaskEnqueuesOriginalStorageRefAfterPathRecreate(t *testing.T) {
 	rec := &deleteRecordingS3Client{S3Client: b.s3}
 	b.s3 = rec
 	fake := newFakeMetaQuotaStore()
-	b.SetMetaQuotaStore("tenant-a", fake)
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
 	b.storageNamespaceID = "ns-a"
 
 	ctx := context.Background()
@@ -132,7 +132,7 @@ func TestFileGCTaskEnqueuesObjectCandidateWhenNamespaceWired(t *testing.T) {
 	rec := &deleteRecordingS3Client{S3Client: b.s3}
 	b.s3 = rec
 	fake := newFakeMetaQuotaStore()
-	b.SetMetaQuotaStore("tenant-a", fake)
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
 	b.storageNamespaceID = "ns-a"
 
 	ctx := context.Background()
@@ -312,7 +312,7 @@ func TestFileGCTaskRetriesWhenObjectCandidateEnqueueFails(t *testing.T) {
 	fake := newFakeMetaQuotaStore()
 	enqueueErr := errors.New("meta unavailable")
 	fake.objectGCCandidateErr = enqueueErr
-	b.SetMetaQuotaStore("tenant-a", fake)
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
 	b.storageNamespaceID = "ns-a"
 
 	ctx := context.Background()
@@ -388,7 +388,7 @@ func TestFileGCTaskReleasesCentralQuotaBeforeBlobRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if usage.StorageBytes != int64(len(payload)) || usage.MediaFileCount != 1 {
+	if usage.StorageBytes != int64(len(payload)) || usage.FileCount != 1 || usage.MediaFileCount != 1 {
 		t.Fatalf("usage after create = %+v", usage)
 	}
 
@@ -406,7 +406,7 @@ func TestFileGCTaskReleasesCentralQuotaBeforeBlobRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if usage.StorageBytes != 0 || usage.MediaFileCount != 0 {
+	if usage.StorageBytes != 0 || usage.FileCount != 0 || usage.MediaFileCount != 0 {
 		t.Fatalf("usage after failed candidate enqueue = %+v", usage)
 	}
 	if _, err := fake.GetFileMeta(ctx, "tenant-a", nf.File.FileID); err == nil {
@@ -527,7 +527,7 @@ func TestFileGCTaskWaitsForPendingCentralCreateMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if usage.StorageBytes != 0 || usage.MediaFileCount != 0 {
+	if usage.StorageBytes != 0 || usage.FileCount != 0 || usage.MediaFileCount != 0 {
 		t.Fatalf("usage after gc = %+v", usage)
 	}
 }
@@ -573,6 +573,9 @@ func TestFileGCTaskWaitsForPendingCentralOverwriteMutation(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := fake.IncrStorageBytes(ctx, "tenant-a", 50); err != nil {
+		t.Fatal(err)
+	}
+	if err := fake.IncrFileCount(ctx, "tenant-a", 1); err != nil {
 		t.Fatal(err)
 	}
 	if err := fake.IncrMediaFileCount(ctx, "tenant-a", 1); err != nil {
@@ -649,7 +652,7 @@ func TestFileGCTaskWaitsForPendingCentralOverwriteMutation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if usage.StorageBytes != 0 || usage.MediaFileCount != 0 {
+	if usage.StorageBytes != 0 || usage.FileCount != 0 || usage.MediaFileCount != 0 {
 		t.Fatalf("usage after gc = %+v", usage)
 	}
 }

@@ -60,6 +60,8 @@ type mountFuseOptions struct {
 	RemoteOnlyPatterns      []string
 	PackPaths               []string
 	UploadConcurrency       int
+	DirCacheMaxEntries      int
+	CommitQueueMaxPending   int
 	ReadConcurrency         int
 	ParallelReadConcurrency int
 	ParallelReadBlockSize   int64

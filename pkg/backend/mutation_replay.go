@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -64,18 +65,28 @@ func (w *MutationReplayWorker) run(ctx context.Context) {
 			logger.Info(ctx, "mutation_replay_worker_stopped")
 			return
 		case <-ticker.C:
-			w.replayBatch(ctx)
+			if w.replayBatch(ctx) {
+				// Fatal error (e.g. database closed) — stop the loop.
+				logger.Info(ctx, "mutation_replay_worker_stopped_fatal")
+				return
+			}
 		}
 	}
 }
 
-func (w *MutationReplayWorker) replayBatch(ctx context.Context) {
+// replayBatch processes one batch of pending mutations. Returns true if a
+// fatal error occurred (e.g. database closed) and the loop should stop.
+func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 	start := time.Now()
 	entries, err := w.store.ListPendingMutations(ctx, replayMinAge, replayBatchLimit)
 	if err != nil {
+		if strings.Contains(err.Error(), "database is closed") || strings.Contains(err.Error(), "connection refused") {
+			logger.Info(ctx, "mutation_replay_worker_db_closed")
+			return true
+		}
 		logger.Warn(ctx, "mutation_replay_list_failed", zap.Error(err))
 		metrics.RecordOperation("mutation_replay", "list", "error", time.Since(start))
-		return
+		return false
 	}
 	if len(entries) == 0 {
 		return
@@ -125,6 +136,7 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) {
 		zap.Int("failed", failed),
 		zap.Int("skipped_after_barrier", skipped),
 		zap.Float64("duration_ms", float64(time.Since(start).Milliseconds())))
+	return false
 }
 
 func (w *MutationReplayWorker) replayOne(ctx context.Context, entry MutationLogView) error {
@@ -137,71 +149,31 @@ func (w *MutationReplayWorker) replayOne(ctx context.Context, entry MutationLogV
 }
 
 func (w *MutationReplayWorker) applyMutation(tx *sql.Tx, entry MutationLogView) error {
-	switch entry.MutationType {
+	return applyCentralQuotaMutationTx(w.store, tx, entry.TenantID, entry.MutationType, entry.MutationData, entry.ID)
+}
+
+func applyCentralQuotaMutationTx(store MetaQuotaStore, tx *sql.Tx, tenantID, mutationType string, mutationData json.RawMessage, logID int64) error {
+	switch mutationType {
 	case "file_create":
 		var data fileCreateMutationData
-		if err := json.Unmarshal(entry.MutationData, &data); err != nil {
+		if err := json.Unmarshal(mutationData, &data); err != nil {
 			return err
 		}
-		if err := w.store.UpsertFileMetaTx(tx, &FileMetaView{
-			TenantID:  entry.TenantID,
-			FileID:    data.FileID,
-			SizeBytes: data.SizeBytes,
-			IsMedia:   data.IsMedia,
-		}); err != nil {
-			return err
-		}
-		if data.SizeBytes != 0 {
-			if err := w.store.IncrStorageBytesTx(tx, entry.TenantID, data.SizeBytes); err != nil {
-				return err
-			}
-		}
-		if data.IsMedia {
-			if err := w.store.IncrMediaFileCountTx(tx, entry.TenantID, 1); err != nil {
-				return err
-			}
-		}
-		return nil
+		return applyCentralFileCreateTx(store, tx, tenantID, data)
 
 	case "file_overwrite":
 		var data fileOverwriteMutationData
-		if err := json.Unmarshal(entry.MutationData, &data); err != nil {
+		if err := json.Unmarshal(mutationData, &data); err != nil {
 			return err
 		}
-		if err := w.store.UpsertFileMetaTx(tx, &FileMetaView{
-			TenantID:  entry.TenantID,
-			FileID:    data.FileID,
-			SizeBytes: data.NewSizeBytes,
-			IsMedia:   data.NewIsMedia,
-		}); err != nil {
-			return err
-		}
-		storageDelta := data.NewSizeBytes - data.OldSizeBytes
-		if storageDelta != 0 {
-			if err := w.store.IncrStorageBytesTx(tx, entry.TenantID, storageDelta); err != nil {
-				return err
-			}
-		}
-		mediaDelta := int64(0)
-		switch {
-		case !data.OldIsMedia && data.NewIsMedia:
-			mediaDelta = 1
-		case data.OldIsMedia && !data.NewIsMedia:
-			mediaDelta = -1
-		}
-		if mediaDelta != 0 {
-			if err := w.store.IncrMediaFileCountTx(tx, entry.TenantID, mediaDelta); err != nil {
-				return err
-			}
-		}
-		return nil
+		return applyCentralFileOverwriteTx(store, tx, tenantID, data)
 
 	case "file_delete":
 		var data fileDeleteMutationData
-		if err := json.Unmarshal(entry.MutationData, &data); err != nil {
+		if err := json.Unmarshal(mutationData, &data); err != nil {
 			return err
 		}
-		deleted, err := w.store.DeleteFileMetaIfExistsTx(tx, entry.TenantID, data.FileID)
+		deleted, err := store.DeleteFileMetaIfExistsTx(tx, tenantID, data.FileID)
 		if err != nil {
 			return err
 		}
@@ -209,12 +181,15 @@ func (w *MutationReplayWorker) applyMutation(tx *sql.Tx, entry MutationLogView) 
 			return nil
 		}
 		if data.SizeBytes != 0 {
-			if err := w.store.IncrStorageBytesTx(tx, entry.TenantID, -data.SizeBytes); err != nil {
+			if err := store.IncrStorageBytesTx(tx, tenantID, -data.SizeBytes); err != nil {
 				return err
 			}
 		}
+		if err := store.IncrFileCountTx(tx, tenantID, -1); err != nil {
+			return err
+		}
 		if data.IsMedia {
-			if err := w.store.IncrMediaFileCountTx(tx, entry.TenantID, -1); err != nil {
+			if err := store.IncrMediaFileCountTx(tx, tenantID, -1); err != nil {
 				return err
 			}
 		}
@@ -222,7 +197,7 @@ func (w *MutationReplayWorker) applyMutation(tx *sql.Tx, entry MutationLogView) 
 
 	case "upload_complete":
 		var data uploadCompleteMutationData
-		if err := json.Unmarshal(entry.MutationData, &data); err != nil {
+		if err := json.Unmarshal(mutationData, &data); err != nil {
 			return err
 		}
 		// Real shared helper — same body as the inline fast path in
@@ -230,15 +205,15 @@ func (w *MutationReplayWorker) applyMutation(tx *sql.Tx, entry MutationLogView) 
 		// caller (replayOne wraps applyMutation + MarkMutationAppliedTx in
 		// the same InTx), so this delegation is safe w.r.t. the Fix 2
 		// status='pending' guard.
-		return applyUploadCompleteTx(w.store, tx, entry.TenantID, data)
+		return applyUploadCompleteTx(store, tx, tenantID, data)
 
 	case "llm_cost_record":
 		var data llmCostMutationData
-		if err := json.Unmarshal(entry.MutationData, &data); err != nil {
+		if err := json.Unmarshal(mutationData, &data); err != nil {
 			return err
 		}
-		if err := w.store.InsertCentralLLMUsageTx(tx, &LLMUsageView{
-			TenantID:       entry.TenantID,
+		if err := store.InsertCentralLLMUsageTx(tx, &LLMUsageView{
+			TenantID:       tenantID,
 			TaskType:       data.TaskType,
 			TaskID:         data.TaskID,
 			CostMillicents: data.CostMillicents,
@@ -247,12 +222,12 @@ func (w *MutationReplayWorker) applyMutation(tx *sql.Tx, entry MutationLogView) 
 		}); err != nil {
 			return err
 		}
-		return w.store.IncrMonthlyLLMCostTx(tx, entry.TenantID, data.CostMillicents)
+		return store.IncrMonthlyLLMCostTx(tx, tenantID, data.CostMillicents)
 
 	default:
 		logger.Warn(context.Background(), "mutation_replay_unknown_type",
-			zap.String("mutation_type", entry.MutationType),
-			zap.Int64("log_id", entry.ID))
+			zap.String("mutation_type", mutationType),
+			zap.Int64("log_id", logID))
 		return nil // skip unknown types gracefully
 	}
 }

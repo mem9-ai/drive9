@@ -155,7 +155,7 @@ func backfillTenant(ctx context.Context, metaStore *meta.Store, enc encrypt.Encr
 
 	// Set the aggregate counters.
 	if !dryRun {
-		if err := metaStore.SetQuotaCounters(ctx, t.ID, stats.storageBytes, stats.mediaFiles); err != nil {
+		if err := metaStore.SetQuotaCounters(ctx, t.ID, stats.storageBytes, stats.mediaFiles, int64(stats.files)); err != nil {
 			return nil, fmt.Errorf("set quota counters: %w", err)
 		}
 	}

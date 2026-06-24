@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/meta"
 	"github.com/mem9-ai/drive9/pkg/metrics"
 	"go.uber.org/zap"
 )
@@ -32,25 +34,78 @@ import (
 // Idempotency: a duplicate (tenant_id, upload_id) is treated as
 // (true, nil) — the original initiate already claimed the reservation;
 // retrying MUST NOT bump reserved_bytes a second time.
-func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targetPath string, totalSize int64) (bool, error) {
+func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targetPath string, totalSize, fileCountDelta int64) (bool, error) {
 	if b.metaStore == nil {
 		return false, nil
 	}
 	start := time.Now()
 
-	err := b.metaStore.AtomicReserveAndInsertUpload(ctx, &UploadReservationView{
-		TenantID:      b.tenantID,
-		UploadID:      uploadID,
-		ReservedBytes: totalSize,
-		TargetPath:    targetPath,
-		Status:        "active",
-		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	if _, err := b.metaStore.GetUploadReservation(ctx, b.tenantID, uploadID); err == nil {
+		logger.Info(ctx, "central_quota_reserve_upload_duplicate",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("upload_id", uploadID))
+		metrics.RecordOperation("central_quota", "reserve_upload", "duplicate", time.Since(start))
+		return true, nil
+	} else if err != nil && !errors.Is(err, ErrReservationNotFound) {
+		logger.Warn(ctx, "central_quota_reserve_upload_duplicate_lookup_failed",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("upload_id", uploadID),
+			zap.Error(err))
+	}
+
+	reservation := &UploadReservationView{
+		TenantID:       b.tenantID,
+		UploadID:       uploadID,
+		ReservedBytes:  totalSize,
+		FileCountDelta: fileCountDelta,
+		TargetPath:     targetPath,
+		Status:         "active",
+		ExpiresAt:      time.Now().Add(24 * time.Hour),
+	}
+	duplicate := false
+	centralReserved := false
+	err := b.store.InTx(ctx, func(tx *sql.Tx) error {
+		if err := b.lockQuotaAdmissionTx(ctx, tx); err != nil {
+			return err
+		}
+		if _, err := b.metaStore.GetUploadReservation(ctx, b.tenantID, uploadID); err == nil {
+			duplicate = true
+			return nil
+		} else if err != nil && !errors.Is(err, ErrReservationNotFound) {
+			return err
+		}
+		if err := b.ensureUploadReserveFitsPendingQuotaTx(ctx, tx, totalSize, fileCountDelta); err != nil {
+			return err
+		}
+		if err := b.metaStore.AtomicReserveAndInsertUpload(ctx, reservation); err != nil {
+			return err
+		}
+		centralReserved = true
+		return nil
 	})
+	if duplicate {
+		logger.Info(ctx, "central_quota_reserve_upload_duplicate",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("upload_id", uploadID))
+		metrics.RecordOperation("central_quota", "reserve_upload", "duplicate", time.Since(start))
+		return true, nil
+	}
+	if err != nil && centralReserved {
+		logger.Warn(ctx, "central_quota_reserve_upload_tenant_lock_commit_failed",
+			zap.String("tenant_id", b.tenantID),
+			zap.String("upload_id", uploadID),
+			zap.Error(err))
+		metrics.RecordOperation("central_quota", "reserve_upload", "ok_lock_commit_failed", time.Since(start))
+		return true, nil
+	}
 	switch {
 	case err == nil:
 		metrics.RecordOperation("central_quota", "reserve_upload", "ok", time.Since(start))
 		return true, nil
 	case errors.Is(err, ErrStorageQuotaExceeded):
+		metrics.RecordOperation("central_quota", "reserve_upload", "quota_exceeded", time.Since(start))
+		return false, err
+	case errors.Is(err, ErrFileCountQuotaExceeded):
 		metrics.RecordOperation("central_quota", "reserve_upload", "quota_exceeded", time.Since(start))
 		return false, err
 	case errors.Is(err, ErrReservationAlreadyExists):
@@ -71,6 +126,40 @@ func (b *Dat9Backend) reserveUploadOnServer(ctx context.Context, uploadID, targe
 		// Fail-open: allow the upload to proceed when the server DB is down.
 		return false, nil
 	}
+}
+
+func (b *Dat9Backend) ensureUploadReserveFitsPendingQuotaTx(ctx context.Context, tx *sql.Tx, totalSize, fileCountDelta int64) error {
+	if !b.UseServerQuota() || (totalSize <= 0 && fileCountDelta <= 0) {
+		return nil
+	}
+	cfg := b.cachedQuotaConfig(ctx)
+	if cfg == nil {
+		metrics.RecordOperation("server_quota", "upload_reserve_pending_check", "fail_open", 0)
+		return nil
+	}
+	if cfg.MaxStorageBytes <= 0 && (fileCountDelta <= 0 || cfg.MaxFileCount <= 0) {
+		return nil
+	}
+	usage := b.loadQuotaUsage(ctx)
+	if usage == nil {
+		metrics.RecordOperation("server_quota", "upload_reserve_pending_check", "fail_open", 0)
+		return nil
+	}
+	pendingStorageDelta, pendingFileDelta, _, pendingOK := b.livePendingQuotaOutboxDeltasTx(ctx, tx)
+	if !pendingOK {
+		metrics.RecordOperation("server_quota", "upload_reserve_pending_check", "fail_open", 0)
+	}
+	projected := usage.StorageBytes + usage.ReservedBytes + pendingStorageDelta + totalSize
+	if cfg.MaxStorageBytes > 0 && projected > cfg.MaxStorageBytes {
+		return fmt.Errorf("%w: server limit=%d used=%d reserved=%d pending=%d delta=%d",
+			ErrStorageQuotaExceeded, cfg.MaxStorageBytes, usage.StorageBytes, usage.ReservedBytes, pendingStorageDelta, totalSize)
+	}
+	projectedFiles := usage.FileCount + pendingFileDelta + fileCountDelta
+	if fileCountDelta > 0 && cfg.MaxFileCount > 0 && projectedFiles > cfg.MaxFileCount {
+		return fmt.Errorf("%w: server limit=%d used=%d pending=%d delta=%d",
+			ErrFileCountQuotaExceeded, cfg.MaxFileCount, usage.FileCount, pendingFileDelta, fileCountDelta)
+	}
+	return nil
 }
 
 // --- Upload abort: release reservation ---
@@ -111,6 +200,11 @@ func (b *Dat9Backend) abortUploadReservation(ctx context.Context, uploadID strin
 	if err := b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
 		if err := b.metaStore.IncrReservedBytesTx(tx, b.tenantID, -r.ReservedBytes); err != nil {
 			return err
+		}
+		if r.FileCountDelta > 0 {
+			if err := b.metaStore.IncrFileCountTx(tx, b.tenantID, -r.FileCountDelta); err != nil {
+				return err
+			}
 		}
 		return b.metaStore.UpdateUploadReservationStatusTx(tx, b.tenantID, uploadID, "aborted")
 	}); err != nil {
@@ -259,7 +353,15 @@ func applyUploadCompleteTx(store MetaQuotaStore, tx *sql.Tx, tenantID string, da
 	case data.OldIsMedia && !data.NewIsMedia:
 		mediaDelta = -1
 	}
-	settled, err := store.SettleActiveReservationTx(tx, tenantID, data.UploadID, "completed")
+	oldExists := false
+	if old, err := store.GetFileMetaForUpdateTx(tx, tenantID, data.FileID); err != nil {
+		if !errors.Is(err, meta.ErrNotFound) {
+			return err
+		}
+	} else if old != nil {
+		oldExists = true
+	}
+	settled, reservedFileCountDelta, err := store.SettleActiveReservationTx(tx, tenantID, data.UploadID, "completed")
 	if err != nil {
 		return err
 	}
@@ -288,6 +390,11 @@ func applyUploadCompleteTx(store MetaQuotaStore, tx *sql.Tx, tenantID string, da
 		IsMedia:   data.NewIsMedia,
 	}); err != nil {
 		return err
+	}
+	if !oldExists && (!settled || reservedFileCountDelta <= 0) {
+		if err := store.IncrFileCountTx(tx, tenantID, 1); err != nil {
+			return err
+		}
 	}
 	if mediaDelta != 0 {
 		if err := store.IncrMediaFileCountTx(tx, tenantID, mediaDelta); err != nil {

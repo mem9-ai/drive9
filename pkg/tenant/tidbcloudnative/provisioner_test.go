@@ -3,11 +3,14 @@ package tidbcloudnative
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/tenant"
 )
@@ -132,6 +135,7 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 		Region       struct {
 			Name string `json:"name"`
 		} `json:"region"`
+		Labels        map[string]string `json:"labels"`
 		SpendingLimit struct {
 			Monthly int32 `json:"monthly"`
 		} `json:"spendingLimit"`
@@ -207,6 +211,9 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	}
 	if gotBody.RootPassword == "" {
 		t.Fatal("rootPassword was empty")
+	}
+	if gotBody.Labels[Drive9ManagedLabel] != "true" || gotBody.Labels[Drive9TenantIDLabel] != "tenant-1" {
+		t.Fatalf("labels = %#v", gotBody.Labels)
 	}
 	if gotBody.SpendingLimit.Monthly != 5000 {
 		t.Fatalf("spendingLimit.monthly = %d, want 5000", gotBody.SpendingLimit.Monthly)
@@ -302,6 +309,232 @@ func TestProvisionWithCredentialsIncludesUpstreamBodyOnError(t *testing.T) {
 	}
 }
 
+func TestBranchWithCredentialsUsesRequestCredentials(t *testing.T) {
+	var gotAuth []string
+	var gotCreateBody struct {
+		DisplayName  string `json:"displayName"`
+		ParentID     string `json:"parentId"`
+		RootPassword string `json:"rootPassword"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta1/clusters/cluster-1/branches":
+			if err := json.NewDecoder(r.Body).Decode(&gotCreateBody); err != nil {
+				t.Fatalf("decode create branch body: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"branchId": "branch-1",
+				"state":    "CREATING",
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters/cluster-1/branches/branch-1":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"branchId":   "branch-1",
+				"state":      "ACTIVE",
+				"userPrefix": "u2",
+				"endpoints":  map[string]any{"public": map[string]any{"host": "branch.example", "port": 4000}},
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1beta1/clusters/cluster-1/branches/branch-1":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	req := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	out, err := p.ProvisionBranchWithCredentials(context.Background(), "fork-tenant", &tenant.ClusterInfo{
+		ClusterID: "cluster-1",
+		BranchID:  "source-branch",
+		Password:  "branch-pass",
+		DBName:    "tenant_db",
+	}, req)
+	if err != nil {
+		t.Fatalf("ProvisionBranchWithCredentials: %v", err)
+	}
+	if out.ClusterID != "cluster-1" || out.BranchID != "branch-1" || out.Host != "branch.example" || out.Port != 4000 || out.Username != "u2.root" {
+		t.Fatalf("branch info = %#v", out)
+	}
+	if gotCreateBody.ParentID != "source-branch" || gotCreateBody.RootPassword != "branch-pass" {
+		t.Fatalf("create branch body = %+v", gotCreateBody)
+	}
+	if err := p.DeleteBranchWithCredentials(context.Background(), "cluster-1", "branch-1", req); err != nil {
+		t.Fatalf("DeleteBranchWithCredentials: %v", err)
+	}
+	if len(gotAuth) != 3 {
+		t.Fatalf("authorized request count = %d, want 3", len(gotAuth))
+	}
+	for _, auth := range gotAuth {
+		if !strings.Contains(auth, `username="public-1"`) {
+			t.Fatalf("Authorization header did not use request public key: %q", auth)
+		}
+		if strings.Contains(auth, "private-1") {
+			t.Fatalf("Authorization header leaked private key: %q", auth)
+		}
+	}
+}
+
+func TestCreateBranchWithCredentialsRejectsMissingStateAndEndpoint(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"branchId": "branch-1"})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	_, err := p.CreateBranchWithCredentials(context.Background(), "fork-tenant", &tenant.ClusterInfo{
+		ClusterID: "cluster-1",
+		DBName:    "tenant_db",
+	}, tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
+	if err == nil || !strings.Contains(err.Error(), "missing state and endpoint") {
+		t.Fatalf("CreateBranchWithCredentials error = %v, want missing state and endpoint", err)
+	}
+}
+
+func TestCreateBranchWithCredentialsReturnsEndpointWhenPOSTIncludesIt(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/v1beta1/clusters/cluster-1/branches" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"branchId":   "branch-1",
+				"state":      "CREATING",
+				"userPrefix": "u2",
+				"endpoints":  map[string]any{"public": map[string]any{"host": "branch.example", "port": 4000}},
+			})
+			return
+		}
+		t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	out, err := p.CreateBranchWithCredentials(context.Background(), "fork-tenant", &tenant.ClusterInfo{
+		ClusterID: "cluster-1",
+		DBName:    "tenant_db",
+	}, tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
+	if err != nil {
+		t.Fatalf("CreateBranchWithCredentials: %v", err)
+	}
+	if out.Host != "branch.example" || out.Port != 4000 || out.Username != "u2.root" {
+		t.Fatalf("branch endpoint = %s:%d (user=%s), want branch.example:4000 (u2.root)", out.Host, out.Port, out.Username)
+	}
+	if out.BranchID != "branch-1" || out.ClusterID != "cluster-1" {
+		t.Fatalf("branch metadata = cluster=%s branch=%s, want cluster-1/branch-1", out.ClusterID, out.BranchID)
+	}
+}
+
+func TestCreateBranchWithCredentialsDefersToWaitWhenPOSTMissingEndpoint(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"branchId": "branch-1",
+			"state":    "CREATING",
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	out, err := p.CreateBranchWithCredentials(context.Background(), "fork-tenant", &tenant.ClusterInfo{
+		ClusterID: "cluster-1",
+		DBName:    "tenant_db",
+	}, tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
+	if err != nil {
+		t.Fatalf("CreateBranchWithCredentials: %v", err)
+	}
+	if out.Host != "" || out.Port != 0 || out.Username != "" {
+		t.Fatalf("branch endpoint = %s:%d (user=%s), want empty (deferred to poll)", out.Host, out.Port, out.Username)
+	}
+	if out.BranchID != "branch-1" || out.ClusterID != "cluster-1" {
+		t.Fatalf("branch metadata = cluster=%s branch=%s, want cluster-1/branch-1", out.ClusterID, out.BranchID)
+	}
+}
+
+func TestWaitForBranchActiveRequiresConnectionInfo(t *testing.T) {
+	origPollInterval := tidbCloudNativePollInterval
+	tidbCloudNativePollInterval = time.Millisecond
+	t.Cleanup(func() { tidbCloudNativePollInterval = origPollInterval })
+
+	var getCount int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodGet || r.URL.Path != "/v1beta1/clusters/cluster-1/branches/branch-1" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		getCount++
+		if getCount == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"branchId": "branch-1",
+				"state":    "ACTIVE",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"branchId":   "branch-1",
+			"state":      "ACTIVE",
+			"userPrefix": "u2",
+			"endpoints":  map[string]any{"public": map[string]any{"host": "branch.example", "port": 4000}},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	out, err := p.WaitForBranchActiveWithCredentials(context.Background(), &tenant.ClusterInfo{
+		ClusterID: "cluster-1",
+		BranchID:  "branch-1",
+	}, tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
+	if err != nil {
+		t.Fatalf("WaitForBranchActiveWithCredentials: %v", err)
+	}
+	if getCount != 2 {
+		t.Fatalf("get count = %d, want 2", getCount)
+	}
+	if out.Host != "branch.example" || out.Username != "u2.root" {
+		t.Fatalf("branch connection = %#v", out)
+	}
+}
+
 func TestDeprovisionWithCredentialsDeletesCluster(t *testing.T) {
 	var gotAuth string
 	var deleteCalled bool
@@ -338,6 +571,390 @@ func TestDeprovisionWithCredentialsDeletesCluster(t *testing.T) {
 	}
 	if strings.Contains(gotAuth, "private-1") {
 		t.Fatalf("Authorization header leaked private key: %q", gotAuth)
+	}
+}
+
+func TestMarkQuotaUpdateStartedMergesDrive9Labels(t *testing.T) {
+	var patchCalled bool
+	var gotAuth string
+	var order []string
+	var gotPatch struct {
+		Cluster struct {
+			Labels map[string]string `json:"labels"`
+		} `json:"cluster"`
+		UpdateMask string `json:"updateMask"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/v1beta1/clusters/cluster-1" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		switch r.Method {
+		case http.MethodGet:
+			order = append(order, "GET")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-1",
+				"labels": map[string]string{
+					"environment":             "prod",
+					Drive9ManagedLabel:        "old",
+					Drive9TenantIDLabel:       "old-tenant",
+					"drive9.ai/unrelated":     "keep",
+					"tidb.cloud/project":      "123",
+					"tidb.cloud/organization": "456",
+				},
+				"spendingLimit": map[string]int32{
+					"monthly": 15000,
+				},
+			})
+			return
+		case http.MethodPatch:
+			order = append(order, "PATCH")
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+		patchCalled = true
+		if err := json.NewDecoder(r.Body).Decode(&gotPatch); err != nil {
+			t.Fatalf("decode patch: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"clusterId": "cluster-1"})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	cfg, err := p.MarkQuotaUpdateStarted(context.Background(), &tenant.ClusterInfo{
+		TenantID:  "tenant-1",
+		ClusterID: "cluster-1",
+	}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err != nil {
+		t.Fatalf("MarkQuotaUpdateStarted: %v", err)
+	}
+	if !patchCalled {
+		t.Fatal("PATCH was not called")
+	}
+	if len(order) != 2 || order[0] != "GET" || order[1] != "PATCH" {
+		t.Fatalf("order = %#v, want GET then PATCH", order)
+	}
+	if !strings.Contains(gotAuth, `username="public-1"`) {
+		t.Fatalf("Authorization header did not use request public key: %q", gotAuth)
+	}
+	if gotPatch.UpdateMask != "labels" {
+		t.Fatalf("updateMask = %q, want labels", gotPatch.UpdateMask)
+	}
+	labels := gotPatch.Cluster.Labels
+	if labels["environment"] != "prod" || labels["drive9.ai/unrelated"] != "keep" {
+		t.Fatalf("existing labels were not preserved: %#v", labels)
+	}
+	if _, ok := labels["tidb.cloud/project"]; ok {
+		t.Fatalf("immutable label tidb.cloud/project was not stripped: %#v", labels)
+	}
+	if _, ok := labels["tidb.cloud/organization"]; ok {
+		t.Fatalf("immutable label tidb.cloud/organization was not stripped: %#v", labels)
+	}
+	if labels[Drive9ManagedLabel] != "true" || labels[Drive9TenantIDLabel] != "tenant-1" {
+		t.Fatalf("drive9 labels = %#v", labels)
+	}
+	if labels[Drive9QuotaUpdateAtLabel] == "" {
+		t.Fatalf("%s label was empty: %#v", Drive9QuotaUpdateAtLabel, labels)
+	}
+	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly == nil || *cfg.TiDBCloudSpendingLimitMonthly != 15000 {
+		t.Fatalf("cloud config = %#v, want spending limit 15000", cfg)
+	}
+	if cfg.Labels[Drive9ManagedLabel] != "true" || cfg.Labels[Drive9TenantIDLabel] != "tenant-1" {
+		t.Fatalf("cloud config labels = %#v", cfg.Labels)
+	}
+}
+
+func TestUpdateQuotaPatchesSpendingLimitWithoutLabels(t *testing.T) {
+	monthly := int64(0)
+	var patchCalls int
+	var gotSpendingPatch struct {
+		Cluster struct {
+			SpendingLimit struct {
+				Monthly int32 `json:"monthly"`
+			} `json:"spendingLimit"`
+		} `json:"cluster"`
+		UpdateMask string `json:"updateMask"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/v1beta1/clusters/cluster-1" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		switch r.Method {
+		case http.MethodPatch:
+			patchCalls++
+			raw, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read patch body: %v", err)
+			}
+			if err := json.Unmarshal(raw, &gotSpendingPatch); err != nil {
+				t.Fatalf("decode spending patch: %v", err)
+			}
+			if gotSpendingPatch.UpdateMask != "spendingLimit.monthly" {
+				t.Fatalf("unexpected update mask %q", gotSpendingPatch.UpdateMask)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"clusterId": "cluster-1"})
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	cfg, err := p.UpdateQuota(context.Background(), &tenant.ClusterInfo{
+		TenantID:  "tenant-1",
+		ClusterID: "cluster-1",
+	}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{
+		TiDBCloudSpendingLimitMonthly: &monthly,
+	})
+	if err != nil {
+		t.Fatalf("UpdateQuota: %v", err)
+	}
+	if patchCalls != 1 {
+		t.Errorf("patch calls = %d, want 1", patchCalls)
+	}
+	if gotSpendingPatch.UpdateMask != "spendingLimit.monthly" || gotSpendingPatch.Cluster.SpendingLimit.Monthly != int32(monthly) {
+		t.Errorf("spending patch = %#v", gotSpendingPatch)
+	}
+	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly == nil || *cfg.TiDBCloudSpendingLimitMonthly != monthly {
+		t.Errorf("cloud config = %#v, want spending limit %d", cfg, monthly)
+	}
+}
+
+func TestUpdateQuotaReturnsSpendingLimitPatchFailure(t *testing.T) {
+	monthly := int64(0)
+	var order []string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/v1beta1/clusters/cluster-1" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		switch r.Method {
+		case http.MethodPatch:
+			var probe struct {
+				UpdateMask string `json:"updateMask"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&probe); err != nil {
+				t.Fatalf("decode patch probe: %v", err)
+			}
+			order = append(order, "PATCH "+probe.UpdateMask)
+			if probe.UpdateMask == "labels" {
+				t.Fatalf("UpdateQuota should not patch labels")
+			}
+			http.Error(w, "invalid spending limit", http.StatusBadRequest)
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	_, err := p.UpdateQuota(context.Background(), &tenant.ClusterInfo{
+		TenantID:  "tenant-1",
+		ClusterID: "cluster-1",
+	}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{
+		TiDBCloudSpendingLimitMonthly: &monthly,
+	})
+	if err == nil {
+		t.Fatal("UpdateQuota error = nil, want spending limit patch error")
+	}
+	if len(order) != 1 || order[0] != "PATCH spendingLimit.monthly" {
+		t.Fatalf("order = %#v", order)
+	}
+}
+
+func TestUpdateQuotaRejectsInvalidSpendingLimitBeforeRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		monthly int64
+	}{
+		{name: "negative", monthly: -1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hit bool
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hit = true
+				http.Error(w, "unexpected request", http.StatusInternalServerError)
+			}))
+			defer ts.Close()
+
+			p := &Provisioner{
+				apiURL: ts.URL,
+				client: ts.Client(),
+			}
+			_, err := p.UpdateQuota(context.Background(), &tenant.ClusterInfo{
+				TenantID:  "tenant-1",
+				ClusterID: "cluster-1",
+			}, tenant.CredentialProvisionRequest{
+				PublicKey:  "public-1",
+				PrivateKey: "private-1",
+			}, tenant.QuotaUpdateOptions{
+				TiDBCloudSpendingLimitMonthly: &tc.monthly,
+			})
+			if err == nil {
+				t.Fatal("UpdateQuota error = nil, want spending limit validation error")
+			}
+			if !strings.Contains(err.Error(), "tidbcloud_spending_limit must be non-negative") {
+				t.Fatalf("error = %q", err)
+			}
+			if hit {
+				t.Fatal("UpdateQuota dispatched request after local validation failed")
+			}
+		})
+	}
+}
+
+func TestGetQuotaOnlyGetsCluster(t *testing.T) {
+	var patchCalled bool
+	var getCalled bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			getCalled = true
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-1",
+				"labels":    map[string]string{Drive9ManagedLabel: "true"},
+			})
+		case http.MethodPatch:
+			patchCalled = true
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	_, err := p.GetQuota(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err != nil {
+		t.Fatalf("GetQuota: %v", err)
+	}
+	if !getCalled {
+		t.Fatal("GET was not called")
+	}
+	if patchCalled {
+		t.Fatal("PATCH should not be called for read-only quota authorization")
+	}
+}
+
+func TestGetQuotaReadsSpendingLimit(t *testing.T) {
+	var patchCalled bool
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-1",
+				"labels":    map[string]string{Drive9ManagedLabel: "true"},
+				"spendingLimit": map[string]int32{
+					"monthly": 15000,
+				},
+			})
+		case http.MethodPatch:
+			patchCalled = true
+		default:
+			t.Fatalf("unexpected method %s", r.Method)
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL: ts.URL,
+		client: ts.Client(),
+	}
+	cfg, err := p.GetQuota(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	if err != nil {
+		t.Fatalf("GetQuota: %v", err)
+	}
+	if patchCalled {
+		t.Fatal("PATCH should not be called for quota query")
+	}
+	if cfg == nil || cfg.TiDBCloudSpendingLimitMonthly == nil || *cfg.TiDBCloudSpendingLimitMonthly != 15000 {
+		t.Fatalf("quota cloud config = %#v, want spending limit 15000", cfg)
+	}
+}
+
+func TestQuotaCredentialErrorsMapForbiddenAndNotFound(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		statusCode int
+		target     error
+	}{
+		{name: "unauthorized", statusCode: http.StatusUnauthorized, target: tenant.ErrQuotaPermissionDenied},
+		{name: "forbidden", statusCode: http.StatusForbidden, target: tenant.ErrQuotaPermissionDenied},
+		{name: "not_found", statusCode: http.StatusNotFound, target: tenant.ErrQuotaBackendNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") == "" {
+					w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+					w.WriteHeader(http.StatusUnauthorized)
+					return
+				}
+				http.Error(w, "upstream says no", tc.statusCode)
+			}))
+			defer ts.Close()
+
+			p := &Provisioner{
+				apiURL: ts.URL,
+				client: ts.Client(),
+			}
+			_, err := p.GetQuota(context.Background(), &tenant.ClusterInfo{ClusterID: "cluster-1"}, tenant.CredentialProvisionRequest{
+				PublicKey:  "public-1",
+				PrivateKey: "private-1",
+			})
+			if !errors.Is(err, tc.target) {
+				t.Fatalf("err = %v, want errors.Is(%v)", err, tc.target)
+			}
+		})
 	}
 }
 
@@ -417,5 +1034,79 @@ func TestSQLQuoting(t *testing.T) {
 	}
 	if got := quoteString(`u'ser\name`); got != `'u''ser\\name'` {
 		t.Fatalf("quoteString = %q", got)
+	}
+}
+
+func TestWaitForBranchUserWithCredentialsPollsUserPrefix(t *testing.T) {
+	polls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		polls++
+		if polls < 3 {
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"branchId": "branch-1",
+				"state":    "CREATING",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"branchId":   "branch-1",
+			"state":      "ACTIVE",
+			"userPrefix": "u3",
+			"endpoints":  map[string]any{"public": map[string]any{"host": "branch.example", "port": 4000}},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	username, err := p.WaitForBranchUserWithCredentials(context.Background(), "cluster-1", "branch-1", tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
+	if err != nil {
+		t.Fatalf("WaitForBranchUserWithCredentials: %v", err)
+	}
+	if username != "u3.root" {
+		t.Fatalf("username = %q, want u3.root", username)
+	}
+	if polls != 3 {
+		t.Fatalf("polls = %d, want 3", polls)
+	}
+}
+
+func TestWaitForBranchUserWithCredentialsPrefersUsername(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"branchId": "branch-1",
+			"state":    "ACTIVE",
+			"username": "direct-user",
+			"endpoints": map[string]any{
+				"public": map[string]any{"host": "branch.example", "port": 4000},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	username, err := p.WaitForBranchUserWithCredentials(context.Background(), "cluster-1", "branch-1", tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"})
+	if err != nil {
+		t.Fatalf("WaitForBranchUserWithCredentials: %v", err)
+	}
+	if username != "direct-user" {
+		t.Fatalf("username = %q, want direct-user", username)
 	}
 }

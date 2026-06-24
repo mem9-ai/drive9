@@ -963,7 +963,9 @@ func TestNamespaceCache_DeferEscalationCoolsDown(t *testing.T) {
 }
 
 func TestNamespaceCache_CanAnswerMisses(t *testing.T) {
-	dc := NewNamespaceCache(10*time.Second, 30*time.Millisecond, 2)
+	// Use a short ttl so the complete marker expires within the test.
+	// completeExpires is now tied to ttl (not negativeTTL).
+	dc := NewNamespaceCache(30*time.Millisecond, 10*time.Millisecond, 2)
 
 	if dc.CanAnswerMisses("/dir") {
 		t.Fatal("empty cache should not answer misses")
@@ -1001,17 +1003,45 @@ func TestNamespaceCache_NegativeExpires(t *testing.T) {
 	}
 }
 
-func TestNamespaceCache_CompleteMissExpiresBeforePositiveList(t *testing.T) {
-	dc := NewNamespaceCache(10*time.Second, time.Millisecond, 10)
+func TestNamespaceCache_CompleteMissExpiresWithTTL(t *testing.T) {
+	// completeExpires uses the main ttl (not negativeTTL), so a complete
+	// listing stays valid for the full cache TTL. After ttl expires both
+	// the positive list and the complete miss state expire together.
+	// Use wide timing gaps (100ms ttl, 10ms negativeTTL) to avoid flakiness
+	// on loaded CI hosts.
+	dc := NewNamespaceCache(100*time.Millisecond, 10*time.Millisecond, 10)
 	dc.Put("/repo", []CachedFileInfo{{Name: "known.txt"}})
-	time.Sleep(5 * time.Millisecond)
 
-	if got := dc.Lookup("/repo", "missing.txt"); got.kind != namespaceLookupPartialMiss {
-		t.Fatalf("lookup kind after negative TTL = %v, want partial miss", got.kind)
+	// Immediately after Put, complete miss is valid.
+	if got := dc.Lookup("/repo", "missing.txt"); got.kind != namespaceLookupCompleteMiss {
+		t.Fatalf("lookup kind immediately = %v, want complete miss", got.kind)
 	}
-	items, ok := dc.Get("/repo")
-	if !ok || len(items) != 1 || items[0].Name != "known.txt" {
-		t.Fatalf("Get after negative TTL = %+v ok %t, want complete positive list", items, ok)
+
+	// After negativeTTL (10ms) but before ttl (100ms), complete miss still valid.
+	time.Sleep(20 * time.Millisecond)
+	if got := dc.Lookup("/repo", "missing.txt"); got.kind != namespaceLookupCompleteMiss {
+		t.Fatalf("lookup kind after negative TTL = %v, want complete miss (should survive until ttl)", got.kind)
+	}
+
+	// After ttl expires, both positive and complete state expire.
+	time.Sleep(100 * time.Millisecond)
+	if got := dc.Lookup("/repo", "missing.txt"); got.kind != namespaceLookupNone {
+		t.Fatalf("lookup kind after ttl = %v, want none", got.kind)
+	}
+}
+
+func TestNamespaceCache_NegativeEntriesExpireAtNegativeTTL(t *testing.T) {
+	// Individual negative entries (MarkNegative) still use the shorter
+	// negativeTTL, independent of completeExpires.
+	dc := NewNamespaceCache(10*time.Second, time.Millisecond, 10)
+	dc.MarkNegative("/repo", "gone.txt")
+
+	if got := dc.Lookup("/repo", "gone.txt"); got.kind != namespaceLookupNegative {
+		t.Fatalf("lookup kind immediately = %v, want negative", got.kind)
+	}
+	time.Sleep(3 * time.Millisecond)
+	if got := dc.Lookup("/repo", "gone.txt"); got.kind == namespaceLookupNegative {
+		t.Fatalf("negative should have expired after negativeTTL")
 	}
 }
 
@@ -1050,6 +1080,48 @@ func TestNamespaceCache_InvalidatePrefix(t *testing.T) {
 	}
 	if _, ok := dc.Get("/repo2"); !ok {
 		t.Fatal("/repo2 should be preserved")
+	}
+}
+
+func TestNamespaceCache_LargeDirCachesCompleteWithHighMaxEntries(t *testing.T) {
+	// With a high maxEntries (like the default), a 10k-entry
+	// directory should be cached as complete and returned by Get().
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, defaultNamespaceCacheMaxEntries)
+	items := make([]CachedFileInfo, 10000)
+	for i := range items {
+		items[i] = CachedFileInfo{
+			Name:     fmt.Sprintf("file_%05d.txt", i),
+			Size:     1024,
+			Revision: int64(i + 1),
+		}
+	}
+	dc.Put("/bigdir", items)
+
+	got, ok := dc.Get("/bigdir")
+	if !ok {
+		t.Fatal("10k-entry dir should be cached as complete with high maxEntries")
+	}
+	if len(got) != 10000 {
+		t.Fatalf("got %d cached entries, want 10000", len(got))
+	}
+	// Verify revision is preserved
+	if got[0].Revision <= 0 {
+		t.Fatal("revision should be preserved in cached entries")
+	}
+}
+
+func TestNamespaceCache_OldDefault2000DoesNotCacheLargeDir(t *testing.T) {
+	// Demonstrates the old behavior: maxEntries=2000 prevents 10k dirs
+	// from being cached as complete.
+	dc := NewNamespaceCache(10*time.Second, 10*time.Second, 2000)
+	items := make([]CachedFileInfo, 10000)
+	for i := range items {
+		items[i] = CachedFileInfo{Name: fmt.Sprintf("file_%05d.txt", i)}
+	}
+	dc.Put("/bigdir", items)
+
+	if _, ok := dc.Get("/bigdir"); ok {
+		t.Fatal("10k-entry dir should NOT be cached as complete with maxEntries=2000")
 	}
 }
 
