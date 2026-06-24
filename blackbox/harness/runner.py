@@ -7,10 +7,14 @@ import platform
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .core import (
+    CLASS_PLATFORM_DARWIN,
+    CLASS_PLATFORM_LINUX,
+    CLASS_TIMEOUT,
     FAIL,
     PASS,
     RESULT_ROOT,
@@ -30,10 +34,12 @@ from .core import (
     env_value,
     file_ts,
     progress,
+    resolve_module_timeout,
     utc_ts,
     write_json,
 )
 from .suite import load_suite_provider
+from . import report as report_engine
 
 
 class BlackboxRunner:
@@ -44,15 +50,37 @@ class BlackboxRunner:
         if not self.suite_config_dir.is_dir():
             raise BlackboxError(f"blackbox suite {self.suite!r} not found at {self.suite_config_dir}")
         self.session = args.session or file_ts()
-        self.result_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else RESULT_ROOT / self.suite / self.session
+        # Work-dir isolation: all writable state (cache, tmp, results) lives
+        # under work_dir so a run never pollutes the repo tree.
+        work_dir_raw = args.work_dir or os.environ.get("BLACKBOX_WORK_DIR", "")
+        if work_dir_raw:
+            self.work_dir = Path(work_dir_raw).expanduser().resolve()
+        else:
+            self.work_dir = RESULT_ROOT.parent / "work" / self.suite / self.session
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir = self.work_dir / "cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if args.out_dir:
+            self.result_dir = Path(args.out_dir).expanduser().resolve()
+        else:
+            self.result_dir = self.work_dir / "results" / self.suite / self.session
+        self.result_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir = self.result_dir / "tmp"
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        # Set GOCACHE/GOMODCACHE under work_dir if not already set.
+        os.environ.setdefault("GOCACHE", str(self.work_dir / "gocache"))
+        os.environ.setdefault("GOMODCACHE", str(self.work_dir / "gomodcache"))
         self.recorder = Recorder(self.result_dir)
         self.provider = load_suite_provider(self.suite, self.suite_config_dir)
         self.registry = self.provider.module_registry()
         self.config = self.provider.load_config()
         self.capabilities = self.provider.detect_capabilities()
         self.target = self.provider.create_target(args, self.result_dir, self.recorder, session=self.session)
+        # Pass the work_dir-based cache_root to the dependency manager.
         self.deps = self.provider.create_deps(auto_fetch=not args.offline, recorder=self.recorder)
+        self.deps.cache_root = self.cache_dir
+        self.deps.tools_root = self.cache_dir / "tools"
+        self.deps.tools_root.mkdir(parents=True, exist_ok=True)
         self.summary_printed = False
         self.ctx = Context(
             args=args,
@@ -145,100 +173,74 @@ class BlackboxRunner:
             manifest["git_sha"] = "unknown"
         write_json(self.result_dir / "manifest.json", manifest)
 
-    def write_report(self) -> Path:
-        summary = self.recorder.summary()
-        lines = [
-            f"# Drive9 {self.suite.upper()} Blackbox Report",
-            "",
-            f"- Suite: `{self.suite}`",
-            f"- Session: `{self.session}`",
-            f"- Timestamp: `{utc_ts()}`",
-            f"- Selected modules: `{len(self.selected)}`",
-            f"- Platform: `{platform.platform()}`",
-            f"- Result dir: `{self.result_dir}`",
-            "",
-            "## Summary",
-            "",
-            "| Status | Count |",
-            "|---|---:|",
-        ]
-        for status in (PASS, FAIL, SKIP, XFAIL, WARN):
-            lines.append(f"| {status} | {summary.get(status, 0)} |")
-        lines.extend(["", "## Correctness", "", "| Module | Category | Status | Seconds | Classification | Detail |", "|---|---|---:|---:|---|---|"])
-        for record in self.recorder.records:
-            detail = self.md_cell(record.detail, limit=240)
-            lines.append(f"| `{record.module}` | `{record.category}` | {record.status} | {record.seconds:.3f} | {self.md_cell(record.classification)} | {detail} |")
-        self.append_metric_sections(lines)
+    def write_module_report(self, module: Any, record: ModuleRecord) -> None:
+        """Generate a per-module report (markdown + JSON) under artifacts/<id>/."""
+        artifact_dir = self.ctx.artifact_dir(module.id)
+        # Module custom report, else framework template by profile.
+        custom = None
+        if hasattr(module, "render_report"):
+            try:
+                custom = module.render_report(self.ctx, record)
+            except Exception as exc:
+                progress(f"module report render error: {module.id}: {exc}")
+        if custom is not None:
+            markdown = custom
+        else:
+            markdown = report_engine.render_module_report(self.ctx, module, record)
+        report_path = artifact_dir / "report.md"
+        report_path.write_text(markdown, encoding="utf-8")
+        json_path = artifact_dir / "report.json"
+        write_json(
+            json_path,
+            {
+                "schema": "drive9-blackbox-module-report/v1",
+                "module": module.id,
+                "status": record.status,
+                "seconds": record.seconds,
+                "classification": record.classification,
+                "detail": record.detail,
+                "session": self.session,
+                "timestamp": utc_ts(),
+            },
+        )
+
+    def write_suite_report(self) -> Path:
+        """Generate the suite-level report (markdown + JSON)."""
+        records = list(self.recorder.records)
+        goals = ""
+        if hasattr(self.provider, "suite_goals"):
+            try:
+                goals = self.provider.suite_goals()
+            except Exception:
+                goals = ""
+        custom = None
+        if hasattr(self.provider, "render_suite_report"):
+            try:
+                custom = self.provider.render_suite_report(self.ctx, records)
+            except Exception as exc:
+                progress(f"suite report render error: {exc}")
+        if custom is not None:
+            markdown = custom
+        else:
+            markdown = report_engine.render_suite_report(self.ctx, self.suite, records, goals)
         report_path = self.result_dir / "report.md"
-        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        report_path.write_text(markdown, encoding="utf-8")
+        summary = self.recorder.summary()
+        write_json(
+            self.result_dir / "suite-report.json",
+            {
+                "schema": "drive9-blackbox-suite-report/v1",
+                "suite": self.suite,
+                "session": self.session,
+                "timestamp": utc_ts(),
+                "summary": summary,
+                "records": [r.__dict__ for r in records],
+            },
+        )
         return report_path
 
-    def append_metric_sections(self, lines: list[str]) -> None:
-        metrics_path = self.result_dir / "metrics.json"
-        if not metrics_path.exists():
-            return
-        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-        summaries = metrics.get("summaries", {})
-        if summaries:
-            lines.extend(
-                [
-                    "",
-                    "## Benchmark Summary",
-                    "",
-                    "| Module | Metric | Unit | Mean | Median | Min | Max | Stddev | Runs |",
-                    "|---|---|---|---:|---:|---:|---:|---:|---:|",
-                ]
-            )
-            for name, item in sorted(summaries.items()):
-                summary_item = item.get("summary", {})
-                values = summary_item.get("values", [])
-                lines.append(
-                    "| "
-                    f"`{self.metric_module(name)}` | "
-                    f"`{self.md_cell(name)}` | "
-                    f"{self.md_cell(summary_item.get('unit', ''))} | "
-                    f"{self.format_number(summary_item.get('mean', 0))} | "
-                    f"{self.format_number(summary_item.get('median', 0))} | "
-                    f"{self.format_number(summary_item.get('min', 0))} | "
-                    f"{self.format_number(summary_item.get('max', 0))} | "
-                    f"{self.format_number(summary_item.get('stdev', 0))} | "
-                    f"{len(values)} |"
-                )
-        rows = metrics.get("rows", [])
-        if rows:
-            lines.extend(["", "## Measurements", "", "| Module | Metric | Value | Unit | Labels |", "|---|---|---:|---|---|"])
-            for row in rows:
-                name = str(row.get("name", ""))
-                labels = row.get("labels", {})
-                lines.append(
-                    "| "
-                    f"`{self.metric_module(name)}` | "
-                    f"`{self.md_cell(name)}` | "
-                    f"{self.format_number(row.get('value', 0))} | "
-                    f"{self.md_cell(row.get('unit', ''))} | "
-                    f"{self.md_cell(json.dumps(labels, sort_keys=True), limit=240)} |"
-                )
-
-    def metric_module(self, metric_name: str) -> str:
-        for module_id in sorted(self.registry.keys(), key=len, reverse=True):
-            if metric_name == module_id or metric_name.startswith(module_id + "."):
-                return module_id
-        return "unknown"
-
-    @staticmethod
-    def md_cell(value: Any, *, limit: int = 1000) -> str:
-        text = str(value).replace("|", "\\|").replace("\n", " ")
-        return text[:limit]
-
-    @staticmethod
-    def format_number(value: Any) -> str:
-        try:
-            return f"{float(value):.3f}"
-        except (TypeError, ValueError):
-            return ""
-
     def finish_report(self) -> None:
-        report_path = self.write_report()
+        report_path = self.write_suite_report()
         if self.summary_printed:
             return
         summary = self.recorder.summary()
@@ -246,6 +248,18 @@ class BlackboxRunner:
         print(f"blackbox summary: {counts}", flush=True)
         print(f"blackbox report: {report_path}", flush=True)
         self.summary_printed = True
+
+    def bootstrap(self) -> int:
+        """Prepare dependencies into the work-dir, then exit.
+
+        Equivalent to ``--deps-only`` but with explicit work-dir printing so
+        the caller can reuse it with ``--work-dir <path>`` for subsequent runs.
+        """
+        progress(f"work dir: {self.work_dir}")
+        result = self.deps_only()
+        print(f"blackbox work-dir: {self.work_dir}", flush=True)
+        print(f"blackbox cache: {self.cache_dir}", flush=True)
+        return result
 
     def deps_only(self) -> int:
         progress(f"result dir: {self.result_dir}")
@@ -255,6 +269,14 @@ class BlackboxRunner:
             module = self.registry[module_id]
             start = time.monotonic()
             progress(f"deps {idx}/{total} start: {module.id} ({module.category})")
+            # Platform compatibility check (modules.json compat field).
+            compat_record = self.check_platform_compat(module)
+            if compat_record is not None:
+                compat_record.report_profile = self._module_profile(module)
+                self.recorder.record(compat_record)
+                progress(f"deps {idx}/{total} {compat_record.status}: {module.id} ({compat_record.classification})")
+                self.write_module_report(module, compat_record)
+                continue
             try:
                 module.ensure_dependencies(self.ctx)
                 record = ModuleRecord(module=module.id, category=module.category, status=PASS, seconds=time.monotonic() - start, classification="dependency prepared")
@@ -264,27 +286,94 @@ class BlackboxRunner:
                 record = ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
             except Exception as exc:
                 record = ModuleRecord(module=module.id, category=module.category, status=FAIL, seconds=time.monotonic() - start, classification="dependency failure", detail=f"{type(exc).__name__}: {exc}")
+                record.report_profile = self._module_profile(module)
                 self.recorder.record(record)
                 progress(f"deps {idx}/{total} {record.status}: {module.id} in {record.seconds:.1f}s ({record.classification})")
+                self.write_module_report(module, record)
                 if self.args.fail_fast:
                     raise
                 continue
+            record.report_profile = self._module_profile(module)
             self.recorder.record(record)
             progress(f"deps {idx}/{total} {record.status}: {module.id} in {record.seconds:.1f}s ({record.classification})")
+            self.write_module_report(module, record)
         self.write_manifest()
         self.finish_report()
         return 1 if self.recorder.has_failures() else 0
 
-    def run_module(self, module_id: str, *, index: int, total: int) -> None:
-        module = self.registry[module_id]
+    def resolve_timeout(self, module: Any) -> int:
+        return resolve_module_timeout(
+            module.id,
+            getattr(module, "timeout", 600),
+            self.suite,
+            self.config.get("modules", {}).get(module.id),
+        )
+
+    def check_platform_compat(self, module: Any) -> ModuleRecord | None:
+        """Check platform compatibility from modules.json compat field.
+
+        Returns a SKIP ModuleRecord if the module should not run on this
+        platform, or None to proceed (including xfail, which runs normally).
+        """
+        import platform as _platform
+
+        module_cfg = self.config.get("modules", {}).get(module.id, {})
+        compat = module_cfg.get("compat", {})
+        if not compat:
+            return None
+        os_name = _platform.system()
+        expectation = compat.get(os_name.lower(), "run")
+        if expectation == "skip":
+            classification = CLASS_PLATFORM_DARWIN if os_name == "Darwin" else CLASS_PLATFORM_LINUX
+            return ModuleRecord(
+                module=module.id,
+                category=module.category,
+                status=SKIP,
+                seconds=0.0,
+                classification=classification,
+                detail=f"module is {os_name}-incompatible per compat matrix",
+            )
+        return None
+
+    def expects_xfail(self, module: Any) -> bool:
+        """Whether this module is expected to fail on the current platform."""
+        import platform as _platform
+
+        module_cfg = self.config.get("modules", {}).get(module.id, {})
+        compat = module_cfg.get("compat", {})
+        if not compat:
+            return False
+        os_name = _platform.system()
+        return compat.get(os_name.lower(), "run") == "xfail"
+
+    @staticmethod
+    def _module_profile(module: Any) -> str:
+        if hasattr(module, "resolve_report_profile"):
+            try:
+                return module.resolve_report_profile()
+            except Exception:
+                pass
+        return "functional"
+
+    def execute_module(self, module: Any) -> ModuleRecord:
+        """Run ensure_dependencies + run, returning a ModuleRecord.
+
+        Wrapped in a ThreadPoolExecutor with a wall-clock timeout so a hung
+        module cannot block the entire run. On timeout the record is FAIL with
+        classification ``timeout``; the background thread is left to wind down
+        on its own (module sub-commands have their own per-command timeouts).
+        """
         start = time.monotonic()
-        progress(f"module {index}/{total} start: {module.id} ({module.category})")
-        try:
-            progress(f"module {index}/{total} deps: {module.id}")
+        timeout = self.resolve_timeout(module)
+
+        def body() -> ModuleRecord:
+            self.ctx.recorder.event({"type": "module", "phase": "deps-start", "module": module.id})
             module.ensure_dependencies(self.ctx)
-            progress(f"module {index}/{total} run: {module.id}")
+            self.ctx.recorder.event({"type": "module", "phase": "deps-end", "module": module.id})
+            self.ctx.recorder.event({"type": "module", "phase": "run-start", "module": module.id})
             metrics = module.run(self.ctx) or {}
-            record = ModuleRecord(
+            self.ctx.recorder.event({"type": "module", "phase": "run-end", "module": module.id, "status": PASS})
+            return ModuleRecord(
                 module=module.id,
                 category=module.category,
                 status=PASS,
@@ -292,6 +381,46 @@ class BlackboxRunner:
                 classification="passed",
                 metrics=metrics,
             )
+
+        try:
+            pool = ThreadPoolExecutor(max_workers=1)
+            future = pool.submit(body)
+            record = future.result(timeout=timeout)
+        except FutureTimeoutError:
+            elapsed = time.monotonic() - start
+            record = ModuleRecord(
+                module=module.id,
+                category=module.category,
+                status=FAIL,
+                seconds=elapsed,
+                classification=CLASS_TIMEOUT,
+                detail=f"module exceeded wall-clock timeout of {timeout}s after {elapsed:.1f}s",
+            )
+            self.ctx.recorder.event({"type": "module", "phase": "timeout", "module": module.id, "timeout_s": timeout, "elapsed_s": elapsed})
+        finally:
+            # Do not wait for the background thread to finish. On timeout the
+            # thread is left running (it winds down via per-command timeouts);
+            # waiting would block the runner and defeat the purpose of the
+            # wall-clock guard.
+            pool.shutdown(wait=False)
+        return record
+
+    def run_module(self, module_id: str, *, index: int, total: int) -> None:
+        module = self.registry[module_id]
+        start = time.monotonic()
+        progress(f"module {index}/{total} start: {module.id} ({module.category})")
+        # Platform compatibility check (modules.json compat field).
+        compat_record = self.check_platform_compat(module)
+        if compat_record is not None:
+            compat_record.report_profile = self._module_profile(module)
+            self.recorder.record(compat_record)
+            progress(f"module {index}/{total} {compat_record.status}: {module.id} ({compat_record.classification})")
+            self.write_module_report(module, compat_record)
+            return
+        record: ModuleRecord | None = None
+        re_raise: BaseException | None = None
+        try:
+            record = self.execute_module(module)
         except DependencyUnavailable as exc:
             record = ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
         except ModuleSkip as exc:
@@ -300,11 +429,7 @@ class BlackboxRunner:
             record = ModuleRecord(module=module.id, category=module.category, status=XFAIL, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
         except BlackboxError as exc:
             record = ModuleRecord(module=module.id, category=module.category, status=FAIL, seconds=time.monotonic() - start, classification="product regression", detail=str(exc))
-            self.recorder.record(record)
-            progress(f"module {index}/{total} {record.status}: {module.id} in {record.seconds:.1f}s ({record.classification})")
-            if self.args.fail_fast:
-                raise
-            return
+            re_raise = exc
         except Exception as exc:
             record = ModuleRecord(
                 module=module.id,
@@ -314,18 +439,30 @@ class BlackboxRunner:
                 classification="infra failure",
                 detail=f"{type(exc).__name__}: {exc}",
             )
-            self.recorder.record(record)
-            progress(f"module {index}/{total} {record.status}: {module.id} in {record.seconds:.1f}s ({record.classification})")
-            if self.args.fail_fast:
-                raise
+            re_raise = exc
+        if record is None:
             return
+        # Apply compat-matrix xfail expectation: FAIL → XFAIL, PASS → WARN.
+        if self.expects_xfail(module):
+            if record.status == FAIL:
+                record.status = XFAIL
+                record.classification = "expected platform incompatibility"
+            elif record.status == PASS:
+                record.status = WARN
+                record.classification = "unexpected pass (xfail expected)"
+        record.report_profile = self._module_profile(module)
         self.recorder.record(record)
         progress(f"module {index}/{total} {record.status}: {module.id} in {record.seconds:.1f}s ({record.classification})")
+        self.write_module_report(module, record)
+        if re_raise is not None and self.args.fail_fast:
+            raise re_raise
 
     def run(self) -> int:
         self.result_dir.mkdir(parents=True, exist_ok=True)
         if self.args.list:
             return self.list_modules()
+        if self.args.bootstrap:
+            return self.bootstrap()
         if self.args.deps_only:
             return self.deps_only()
         progress(f"result dir: {self.result_dir}")
@@ -344,25 +481,29 @@ class BlackboxRunner:
             return 0
         try:
             setup_start = time.monotonic()
-            try:
-                progress("setup start")
-                self.provider.setup(self.ctx)
-            except BlackboxError as exc:
-                detail = str(exc)
-                self.recorder.record(
-                    ModuleRecord(
-                        module="suite.setup",
-                        category="setup",
-                        status=FAIL,
-                        seconds=time.monotonic() - setup_start,
-                        classification="infra failure",
-                        detail=" ".join(detail.split()),
+            needs_setup = any(getattr(self.registry[mid], "needs_setup", True) for mid in self.selected)
+            if not needs_setup:
+                progress("setup skipped: no selected module requires suite setup")
+            else:
+                try:
+                    progress("setup start")
+                    self.provider.setup(self.ctx)
+                except BlackboxError as exc:
+                    detail = str(exc)
+                    self.recorder.record(
+                        ModuleRecord(
+                            module="suite.setup",
+                            category="setup",
+                            status=FAIL,
+                            seconds=time.monotonic() - setup_start,
+                            classification="infra failure",
+                            detail=" ".join(detail.split()),
+                        )
                     )
-                )
-                self.write_manifest()
-                print(f"blackbox setup failed: {detail}", file=sys.stderr, flush=True)
-                self.finish_report()
-                return 1
+                    self.write_manifest()
+                    print(f"blackbox setup failed: {detail}", file=sys.stderr, flush=True)
+                    self.finish_report()
+                    return 1
             progress(f"setup complete in {time.monotonic() - setup_start:.1f}s")
             self.write_manifest()
             total = len(self.selected)
@@ -383,6 +524,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     suite_default = os.environ.get("BLACKBOX_SUITE", "")
     parser = argparse.ArgumentParser(description="Run Drive9 blackbox modules.")
     parser.add_argument("--suite", default=suite_default, help="Blackbox suite domain. Defaults to BLACKBOX_SUITE.")
+    parser.add_argument("--all-suites", action="store_true", help="Discover and run all suites under blackbox/suites/. Generates an overall report.")
     selector = parser.add_mutually_exclusive_group(required=False)
     selector.add_argument("--all", action="store_true", help="Run every module in the selected suite.")
     selector.add_argument("--category", help="Run modules whose id/category has this prefix.")
@@ -391,22 +533,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     selector.add_argument("--list", action="store_true", help="List available modules.")
     parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --list.")
     parser.add_argument("--deps-only", action="store_true", help="Prepare external dependencies for selected modules without running suite setup.")
+    parser.add_argument("--bootstrap", action="store_true", help="Prepare dependencies into a work-dir, then exit. Use --work-dir to reuse later.")
     parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS, BLACKBOX_<SUITE>_RUNS, or 1.")
     parser.add_argument("--server-mode", choices=["auto", "existing", "local"], default=env_value("SERVER_MODE", "auto", suite_default))
     parser.add_argument("--drive9-cli", default=env_value("DRIVE9_CLI", "", suite_default))
+    parser.add_argument("--work-dir", default=env_value("WORK_DIR", "", suite_default), help="Isolated working directory for cache/tmp/results. Defaults to BLACKBOX_WORK_DIR.")
     parser.add_argument("--out-dir", default=env_value("OUT_DIR", "", suite_default))
     parser.add_argument("--session", default=env_value("SESSION", "", suite_default))
     parser.add_argument("--strict-prereqs", action="store_true", default=env_flag("STRICT", False, suite_default))
     parser.add_argument("--offline", action="store_true", default=env_flag("OFFLINE", False, suite_default))
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--keep-artifacts", action="store_true", default=env_flag("KEEP_ARTIFACTS", False, suite_default))
+    parser.add_argument("--keep-all-artifacts", action="store_true", default=env_flag("KEEP_ALL_ARTIFACTS", False, suite_default), help="Never clean tmp_dir, even on success.")
     return parser.parse_args(argv)
 
 
 def normalize_suite_args(args: argparse.Namespace) -> str:
     suite = str(args.suite or "").strip()
-    if not suite:
-        raise BlackboxError("--suite or BLACKBOX_SUITE is required")
+    if not suite and not getattr(args, "all_suites", False):
+        raise BlackboxError("--suite or BLACKBOX_SUITE is required (or use --all-suites)")
     return suite
 
 
@@ -432,9 +577,59 @@ def emit_module_list(registry: dict[str, Any], output_format: str) -> int:
     return 0
 
 
+def run_all_suites(args: argparse.Namespace) -> int:
+    """Discover and run every suite, then generate an overall report."""
+    from .suite import discover_suites
+
+    suites = discover_suites()
+    if not suites:
+        print("blackbox: no suites found", file=sys.stderr, flush=True)
+        return 1
+    suite_summaries: list[dict[str, Any]] = []
+    has_failures = False
+    work_dir_raw = args.work_dir or os.environ.get("BLACKBOX_WORK_DIR", "")
+    if work_dir_raw:
+        work_dir = Path(work_dir_raw).expanduser().resolve()
+    else:
+        work_dir = RESULT_ROOT.parent / "work" / "all-suites" / file_ts()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    for suite_name in suites:
+        progress(f"all-suites: running suite {suite_name}")
+        suite_args = argparse.Namespace(**vars(args))
+        suite_args.suite = suite_name
+        suite_args.all_suites = False
+        suite_args.work_dir = str(work_dir)
+        try:
+            runner = BlackboxRunner(suite_args)
+            code = runner.run()
+        except BlackboxError as exc:
+            progress(f"all-suites: suite {suite_name} failed: {exc}")
+            code = 1
+        if code != 0:
+            has_failures = True
+        summary = runner.recorder.summary()
+        report_rel = f"results/{suite_name}/{runner.session}/report.md"
+        suite_summaries.append({"suite": suite_name, "summary": summary, "report": report_rel})
+    # Generate overall report.
+    overall_md = report_engine.render_overall_report(work_dir, suite_summaries)
+    overall_path = work_dir / "report.md"
+    overall_path.write_text(overall_md, encoding="utf-8")
+    overall_json = {
+        "schema": "drive9-blackbox-overall-report/v1",
+        "timestamp": utc_ts(),
+        "work_dir": str(work_dir),
+        "suites": suite_summaries,
+    }
+    write_json(work_dir / "overall-report.json", overall_json)
+    print(f"blackbox overall report: {overall_path}", flush=True)
+    return 1 if has_failures else 0
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
+        if getattr(args, "all_suites", False):
+            return run_all_suites(args)
         runner = BlackboxRunner(args)
         return runner.run()
     except KeyboardInterrupt:

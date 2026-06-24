@@ -27,6 +27,14 @@ SKIP = "SKIP"
 XFAIL = "XFAIL"
 WARN = "WARN"
 
+# Classification constants for structured SKIP/FAIL reasons.
+CLASS_PLATFORM_LINUX = "platform:linux"
+CLASS_PLATFORM_DARWIN = "platform:darwin"
+CLASS_DEPENDENCY = "dependency"
+CLASS_EXPLICIT_OPT_IN = "explicit opt-in"
+CLASS_CONFIGURATION_SKIP = "configuration skip"
+CLASS_TIMEOUT = "timeout"
+
 
 class BlackboxError(RuntimeError):
     pass
@@ -87,6 +95,33 @@ def env_flag(suffix: str, default: bool = False, suite: str | None = None) -> bo
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def resolve_module_timeout(module_id: str, default_timeout: int, suite: str, module_config: dict[str, Any] | None = None) -> int:
+    """Resolve the wall-clock timeout for a module.
+
+    Priority (highest wins):
+    1. BLACKBOX_<SUITE>_<MODULE_UPPER>_TIMEOUT_S environment variable
+    2. BLACKBOX_<MODULE_UPPER>_TIMEOUT_S environment variable
+    3. ``timeout`` field in the module's modules.json config
+    4. The module class's ``timeout`` attribute (``default_timeout``)
+    """
+    module_env_suffix = module_id.replace(".", "_").replace("-", "_").upper() + "_TIMEOUT_S"
+    suite_specific = f"BLACKBOX_{suite.upper()}_{module_env_suffix}"
+    if suite_specific in os.environ:
+        try:
+            return max(1, int(os.environ[suite_specific]))
+        except ValueError:
+            pass
+    generic = f"BLACKBOX_{module_env_suffix}"
+    if generic in os.environ:
+        try:
+            return max(1, int(os.environ[generic]))
+        except ValueError:
+            pass
+    if module_config and isinstance(module_config.get("timeout"), (int, float)):
+        return max(1, int(module_config["timeout"]))
+    return max(1, int(default_timeout))
+
+
 def progress(message: str) -> None:
     if env_flag("QUIET", False):
         return
@@ -126,6 +161,35 @@ def summarize(values: list[float], unit: str) -> dict[str, Any]:
     }
 
 
+def percentile(ordered: list[float], pct: int) -> float:
+    """Linear-interpolation percentile over a pre-sorted list."""
+    if not ordered:
+        return 0.0
+    if len(ordered) == 1:
+        return ordered[0]
+    idx = (len(ordered) - 1) * pct / 100
+    lower = int(idx)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = idx - lower
+    return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+
+def latency_summary(values: list[float]) -> dict[str, float]:
+    """Return p50/p95/p99/mean/stdev for a list of latency samples."""
+    if not values:
+        return {"count": 0, "p50": 0.0, "p95": 0.0, "p99": 0.0, "max": 0.0, "mean": 0.0, "stdev": 0.0}
+    ordered = sorted(values)
+    return {
+        "count": len(values),
+        "p50": percentile(ordered, 50),
+        "p95": percentile(ordered, 95),
+        "p99": percentile(ordered, 99),
+        "max": max(values),
+        "mean": statistics.mean(values),
+        "stdev": statistics.stdev(values) if len(values) > 1 else 0.0,
+    }
+
+
 @dataclass
 class CommandResult:
     code: int
@@ -145,6 +209,7 @@ class ModuleRecord:
     detail: str = ""
     metrics: dict[str, Any] = field(default_factory=dict)
     artifacts: dict[str, str] = field(default_factory=dict)
+    report_profile: str = ""
 
 
 class Module(Protocol):
@@ -153,11 +218,16 @@ class Module(Protocol):
     description: str
     labels: tuple[str, ...]
     timeout: int
+    report_profile: str
+    needs_setup: bool
 
     def ensure_dependencies(self, ctx: "Context") -> None:
         ...
 
     def run(self, ctx: "Context") -> dict[str, Any] | None:
+        ...
+
+    def render_report(self, ctx: "Context", record: "ModuleRecord") -> str | None:
         ...
 
 

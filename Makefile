@@ -43,13 +43,16 @@ TEST_PKGS ?= ./...
 BLACKBOX_SUITE ?= fuse
 BLACKBOX_RUNS ?= 1
 BLACKBOX_SELECTOR ?= all
+BLACKBOX_WORK_DIR ?=
+BLACKBOX_ARGS ?=
+BLACKBOX_EXTRA ?=
 
 BUILDINFO_LDFLAGS = -X github.com/mem9-ai/dat9/pkg/buildinfo.Version=$(if $(VERSION),$(VERSION),dev) \
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitHash=$(GIT_HASH) \
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.GitBranch=$(GIT_BRANCH) \
 	-X github.com/mem9-ai/dat9/pkg/buildinfo.BuildTime=$(BUILD_TIME)
 
-.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local e2e-local blackbox blackbox-list blackbox-deps docker-build
+.PHONY: mod test test-failpoint test-podman fmt lint install-lint build build-server build-server-local build-cli build-cli-release run-server-local e2e-local blackbox blackbox-list blackbox-deps blackbox-bootstrap docker-build
 
 mod:
 	$(GO) mod tidy
@@ -132,8 +135,9 @@ blackbox:
 		module:*) args=(--module "$${selector#module:}");; \
 		*) args=(--module "$$selector");; \
 	esac; \
+	work_arg=""; if [ -n "$(BLACKBOX_WORK_DIR)" ]; then work_arg="--work-dir $(BLACKBOX_WORK_DIR)"; fi; \
 	echo "blackbox: suite=$(BLACKBOX_SUITE) selector=$$selector runs=$(BLACKBOX_RUNS)"; \
-	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --runs "$(BLACKBOX_RUNS)"
+	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --runs "$(BLACKBOX_RUNS)" $$work_arg $(BLACKBOX_EXTRA)
 
 blackbox-list:
 	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --list
@@ -148,8 +152,23 @@ blackbox-deps:
 		module:*) args=(--module "$${selector#module:}");; \
 		*) args=(--module "$$selector");; \
 	esac; \
+	work_arg=""; if [ -n "$(BLACKBOX_WORK_DIR)" ]; then work_arg="--work-dir $(BLACKBOX_WORK_DIR)"; fi; \
 	echo "blackbox deps: suite=$(BLACKBOX_SUITE) selector=$$selector"; \
-	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --deps-only
+	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --deps-only $$work_arg
+
+blackbox-bootstrap:
+	@set -euo pipefail; \
+	selector="$(BLACKBOX_SELECTOR)"; \
+	case "$$selector" in \
+		""|all) args=(--all);; \
+		group:*) args=(--group "$${selector#group:}");; \
+		category:*) args=(--category "$${selector#category:}");; \
+		module:*) args=(--module "$${selector#module:}");; \
+		*) args=(--module "$$selector");; \
+	esac; \
+	work_arg=""; if [ -n "$(BLACKBOX_WORK_DIR)" ]; then work_arg="--work-dir $(BLACKBOX_WORK_DIR)"; fi; \
+	echo "blackbox bootstrap: suite=$(BLACKBOX_SUITE) selector=$$selector"; \
+	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --bootstrap $$work_arg
 
 build-cli:
 	mkdir -p $(BIN_DIR)

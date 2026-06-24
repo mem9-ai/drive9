@@ -585,7 +585,8 @@ class Drive9FuseTargetProvider:
         if self.db_container and self.db_runtime and os.environ.get("DRIVE9_LOCAL_E2E_KEEP_DB", "0") != "1":
             progress(f"cleanup: removing MySQL container {self.db_container}")
             subprocess.run([self.db_runtime, "rm", "-f", self.db_container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
-        if not self.args.keep_artifacts and not self.recorder.has_failures():
+        keep_all = getattr(self.args, "keep_all_artifacts", False)
+        if not keep_all and not self.args.keep_artifacts and not self.recorder.has_failures():
             progress(f"cleanup: removing tmp artifacts {self.tmp_dir}")
             shutil.rmtree(self.tmp_dir, ignore_errors=True)
         progress("cleanup complete")

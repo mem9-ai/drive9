@@ -15,6 +15,10 @@ class DependencyManager:
         self.tools_root = self.cache_root / "tools"
         self.auto_fetch = auto_fetch
         self.recorder = recorder
+        # tools_root is created lazily on first use so the runner can override
+        # cache_root/tools_root before any dependency is prepared.
+
+    def _ensure_tools_root(self) -> None:
         self.tools_root.mkdir(parents=True, exist_ok=True)
 
     def event(self, name: str, status: str, detail: str, metadata: dict[str, Any] | None = None) -> None:
@@ -50,6 +54,7 @@ class DependencyManager:
         progress(f"dependency command done: {name}")
 
     def ensure_git_clone(self, name: str, url: str, ref: str) -> Path:
+        self._ensure_tools_root()
         dest = self.tools_root / name / ref
         marker = dest / ".drive9-blackbox-ready"
         if marker.exists():

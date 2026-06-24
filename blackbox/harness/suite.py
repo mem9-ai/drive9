@@ -38,6 +38,12 @@ class SuiteProvider(Protocol):
     def manifest_fields(self, ctx: Context) -> dict[str, Any]:
         ...
 
+    def render_suite_report(self, ctx: Context, records: list[ModuleRecord]) -> str | None:
+        ...
+
+    def suite_goals(self) -> str:
+        ...
+
 
 def load_suite_provider(suite: str, config_dir: Path) -> SuiteProvider:
     module_name = f"suites.{suite}.provider"
@@ -54,3 +60,16 @@ def load_suite_provider(suite: str, config_dir: Path) -> SuiteProvider:
     if provider_class is None:
         raise BlackboxError(f"blackbox suite {suite!r} provider must expose create_provider() or SuiteProvider")
     return provider_class(suite=suite, config_dir=config_dir)
+
+
+def discover_suites() -> list[str]:
+    """Return sorted list of suite names found under ``SUITES_DIR``."""
+    from .core import SUITES_DIR
+
+    if not SUITES_DIR.is_dir():
+        return []
+    suites: list[str] = []
+    for entry in sorted(SUITES_DIR.iterdir()):
+        if entry.is_dir() and (entry / "provider.py").exists():
+            suites.append(entry.name)
+    return suites

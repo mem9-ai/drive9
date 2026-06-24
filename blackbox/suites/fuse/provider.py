@@ -65,6 +65,18 @@ class FuseSuiteProvider:
             fields["drive9_version_error"] = str(exc)
         return fields
 
+    def render_suite_report(self, ctx: Context, records: list[ModuleRecord]) -> str | None:
+        return None
+
+    def suite_goals(self) -> str:
+        return (
+            "The FUSE suite validates Drive9's FUSE filesystem across POSIX compliance, "
+            "performance, workflow correctness, and customer scenario fidelity. Modules "
+            "cover community test suites (pjdfstest, LTP, fio, mdtest), ported JuiceFS "
+            "stress tests, official Git functional/perf tests, Drive9 workflow scenarios, "
+            "and customer workspace benchmarks."
+        )
+
 
 def create_provider(*, suite: str, config_dir: Path) -> FuseSuiteProvider:
     return FuseSuiteProvider(suite=suite, config_dir=config_dir)

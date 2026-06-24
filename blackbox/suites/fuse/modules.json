@@ -30,6 +30,24 @@
     "community.pjdfstest": {
       "groups": "all"
     },
+    "community.ltp.fs": {
+      "compat": {
+        "linux": "run",
+        "darwin": "skip"
+      }
+    },
+    "community.ltp.syscalls": {
+      "compat": {
+        "linux": "run",
+        "darwin": "skip"
+      }
+    },
+    "community.pyxattr": {
+      "compat": {
+        "linux": "run",
+        "darwin": "xfail"
+      }
+    },
     "community.fio": {
       "size": "128m"
     },

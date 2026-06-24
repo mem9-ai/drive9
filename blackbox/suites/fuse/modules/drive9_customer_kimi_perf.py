@@ -28,6 +28,9 @@ class Drive9KimiPerf(BaseModule):
     description = "Kimi sandbox workspace benchmark: namespace scale, small files, fsync, visibility, remount persistence, and same-host mounts."
     labels = ("drive9", "customer", "kimi", "performance", "fuse")
     timeout = 3600
+    report_profile = "customer"
+    # Cached report markdown from the last run(), used by render_report().
+    _last_report_markdown: str = ""
 
     def ensure_dependencies(self, ctx: Context) -> None:
         if not env_flag("KIMI_PERF_ENABLE", False, ctx.suite):
@@ -1029,7 +1032,12 @@ class Drive9KimiPerf(BaseModule):
             for row in rows:
                 writer.writerow(row)
         write_json(summary_dir / "summary.json", {"rows": rows, "issues": issues})
-        (artifact / "report.md").write_text(self.render_customer_report(ctx, rows, issues), encoding="utf-8")
+        # Cache the rendered customer report so render_report() can return it.
+        # The framework writes artifacts/<id>/report.md from render_report().
+        self._last_report_markdown = self.render_customer_report(ctx, rows, issues)
+
+    def render_report(self, ctx: Context, record: Any) -> str | None:
+        return self._last_report_markdown or None
 
     def render_customer_report(self, ctx: Context, rows: list[dict[str, Any]], issues: list[dict[str, Any]]) -> str:
         status_counts: dict[str, int] = {}
