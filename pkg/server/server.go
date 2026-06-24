@@ -599,6 +599,15 @@ func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 			logger.Info(ctx, "resume_provisioning_fork",
 				zap.String("tenant_id", t.ID),
 				zap.String("parent_tenant_id", t.ParentTenantID))
+			if t.Provider == tenant.ProviderTiDBCloudNative && t.DBUser == "" {
+				logger.Error(ctx, "resume_provisioning_fork_no_credentials",
+					zap.String("tenant_id", t.ID),
+					zap.String("provider", t.Provider),
+					zap.String("cluster_id", t.ClusterID),
+					zap.String("branch_id", t.BranchID))
+				s.markForkFailed(ctx, t.ID)
+				continue
+			}
 			s.startForkProvision(ctx, t.ID)
 			continue
 		}
