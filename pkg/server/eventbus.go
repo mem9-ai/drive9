@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -22,12 +23,16 @@ type ChangeEvent struct {
 
 const (
 	eventBusListenerChanSize = 1 // signal-only channel
+	// eventBusPollInterval is how often the per-bus poll goroutine queries
+	// fs_events for cross-pod events. Override via ssePollInterval in sse.go.
+	eventBusPollInterval = 1 * time.Second
 )
 
 // EventBus is a per-tenant event hub backed by the durable fs_events table.
 // Events are stored in the shared tenant database so that they propagate across
 // all pods. The local notify channel provides instant push to same-pod SSE clients;
-// cross-pod events are discovered via periodic polling of the fs_events table.
+// cross-pod events are discovered via a single per-bus poll goroutine (not
+// per-connection) to minimize TiDB RCU consumption.
 // The store field is an atomic pointer so it can be safely refreshed by
 // eventBuses.get (when the pool recreates a backend) while SSE handlers read it.
 type EventBus struct {
@@ -35,6 +40,11 @@ type EventBus struct {
 	mu        sync.Mutex
 	listeners map[uint64]chan struct{}
 	nextID    uint64
+
+	// poll goroutine lifecycle: starts on first Subscribe, stops on last Unsubscribe.
+	pollCancel context.CancelFunc
+	pollWG     sync.WaitGroup
+	pollLast   uint64 // last seq seen by the poll goroutine
 }
 
 // NewEventBus creates a new EventBus backed by the given tenant store.
@@ -69,8 +79,10 @@ func (eb *EventBus) Publish() {
 }
 
 // Subscribe registers a new listener. Returns a unique ID and a signal channel.
-// The channel receives a signal whenever new events are published locally.
-// Call Unsubscribe with the returned ID to clean up.
+// The channel receives a signal whenever new events are published locally or
+// discovered by the per-bus cross-pod poll goroutine.
+// On the first Subscribe, the poll goroutine is started to discover cross-pod
+// events. On the last Unsubscribe, it is stopped to release DB polling load.
 func (eb *EventBus) Subscribe() (uint64, chan struct{}) {
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
@@ -79,18 +91,102 @@ func (eb *EventBus) Subscribe() (uint64, chan struct{}) {
 	eb.nextID++
 	ch := make(chan struct{}, eventBusListenerChanSize)
 	eb.listeners[id] = ch
+
+	// Start the cross-pod poll goroutine on first subscriber.
+	if eb.pollCancel == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		eb.pollCancel = cancel
+		eb.pollWG.Add(1)
+		go eb.pollLoop(ctx)
+	}
 	return id, ch
 }
 
 // Unsubscribe removes a listener and closes its channel.
+// On the last Unsubscribe, the poll goroutine is stopped.
 func (eb *EventBus) Unsubscribe(id uint64) {
 	eb.mu.Lock()
-	defer eb.mu.Unlock()
-
 	if ch, ok := eb.listeners[id]; ok {
 		delete(eb.listeners, id)
 		close(ch)
 	}
+	// Stop the poll goroutine when no subscribers remain.
+	if len(eb.listeners) == 0 && eb.pollCancel != nil {
+		eb.pollCancel()
+		eb.pollCancel = nil
+	}
+	eb.mu.Unlock()
+
+	// Wait for poll goroutine outside the lock to avoid deadlock.
+	eb.pollWG.Wait()
+}
+
+// pollLoop is the per-bus cross-pod poll goroutine. It periodically queries
+// fs_events for new rows (written by other pods) and signals all local
+// subscribers via Publish(). This replaces per-SSE-connection polling, reducing
+// idle RCU from N-mounts×QPS to 1-poll-per-bus.
+func (eb *EventBus) pollLoop(ctx context.Context) {
+	defer eb.pollWG.Done()
+
+	// Initialize pollLast to the current head so we don't replay old events
+	// on first poll.
+	eb.mu.Lock()
+	eb.pollLast = eb.unsafeSeq(ctx)
+	eb.mu.Unlock()
+
+	ticker := time.NewTicker(eventBusPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			eb.pollOnce(ctx)
+		}
+	}
+}
+
+// pollOnce queries fs_events for rows after pollLast and signals subscribers
+// if any new rows are found.
+func (eb *EventBus) pollOnce(ctx context.Context) {
+	store := eb.store.Load()
+	if store == nil {
+		return
+	}
+	eb.mu.Lock()
+	since := eb.pollLast
+	eb.mu.Unlock()
+
+	rows, err := store.ListFSEventsSince(ctx, int64(since), 1000)
+	if err != nil {
+		// Don't log on every tick — only on persistent failures.
+		return
+	}
+	if len(rows) == 0 {
+		return
+	}
+	// Update pollLast to the last row's seq and signal subscribers.
+	eb.mu.Lock()
+	eb.pollLast = rows[len(rows)-1].Seq
+	eb.mu.Unlock()
+	eb.Publish()
+}
+
+// unsafeSeq returns the current maximum fs_events seq. Caller must hold eb.mu.
+func (eb *EventBus) unsafeSeq(ctx context.Context) uint64 {
+	store := eb.store.Load()
+	if store == nil {
+		return 0
+	}
+	seq, err := store.LatestFSEventSeq(ctx)
+	if err != nil {
+		return 0
+	}
+	if seq < 0 {
+		return 0
+	}
+	return uint64(seq)
 }
 
 // Seq returns the current maximum fs_events seq, or 0 if no events exist.

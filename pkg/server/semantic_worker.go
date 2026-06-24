@@ -736,6 +736,12 @@ func pageWalkOrder(n int) []int {
 	return order
 }
 
+// tryClaimTenantSlot attempts to acquire a per-tenant concurrency slot.
+// NOTE: This is a per-pod limit, not a global limit. In a K-pod deployment,
+// a tenant may run up to K × PerTenantConcurrency tasks in parallel. This is
+// a capacity limit, not a correctness issue — the DB lease (ClaimSemanticTask
+// with FOR UPDATE SKIP LOCKED) guarantees single-owner-per-task regardless.
+// To enforce a strict global limit, use a DB token row or distributed limiter.
 func (m *semanticWorkerManager) tryClaimTenantSlot(tenantID string) bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()

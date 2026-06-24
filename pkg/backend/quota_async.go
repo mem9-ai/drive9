@@ -9,6 +9,14 @@ const (
 	// Sized to absorb short bursts without blocking the write path. A single
 	// worker drains the channel to preserve per-tenant FIFO ordering
 	// (UpsertFileMetaTx is not commutative across create/overwrite).
+	//
+	// DEPRECATED: The in-process mutation queue provides per-tenant FIFO ordering
+	// only within a single backend instance. In multi-pod deployments, cross-pod
+	// ordering is not guaranteed (see logAndEnqueueMutation comment). The newer
+	// quota_outbox_worker.go uses FOR UPDATE SKIP LOCKED + lease for multi-pod
+	// safe claim-based processing. The mutation replay worker (leader-gated since
+	// PR #601) provides a convergence backstop for the durable mutation log.
+	// This queue remains as the primary in-process apply path for same-pod writes.
 	mutationQueueSize = 256
 )
 

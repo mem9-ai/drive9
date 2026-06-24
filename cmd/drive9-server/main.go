@@ -121,6 +121,10 @@ func main() {
 	}
 	backendOptions.AppSemanticTasksEnabled = semanticEmbedder != nil
 
+	// P1-3: Configurable quota cache refresh interval (default 30s).
+	// In multi-pod deployments, increasing this reduces per-tenant-per-pod DB reads.
+	backend.InitQuotaConfigCacheRefreshInterval(envInt("DRIVE9_QUOTA_CACHE_REFRESH_SECONDS", 0))
+
 	store, err := openControlPlaneStoreWithRetry(context.Background(), metaDSN, defaultStartupRetryOptions())
 	if err != nil {
 		die(fmt.Errorf("open control-plane store: %w", err))
@@ -270,6 +274,7 @@ func main() {
 			S3SessionToken:               s3cfg.SessionToken,
 			S3EncryptionPolicy:           s3cfg.EncryptionPolicy,
 			BackendOptions:               backendOptions,
+			MaxTenants:                   envInt("DRIVE9_POOL_MAX_TENANTS", 0),
 			DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 			LeaderChecker:                leaderManager,
 		}, enc)
