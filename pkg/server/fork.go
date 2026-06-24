@@ -945,6 +945,11 @@ func (s *Server) cleanupNativeFork(w http.ResponseWriter, r *http.Request, t *me
 	}
 	if err := s.cleanupForkTenantOnce(r.Context(), t.ID, credentialReq); err != nil {
 		logger.Error(r.Context(), "native_fork_cleanup_failed", zap.String("tenant_id", t.ID), zap.Error(err))
+		if t.Status != meta.TenantDeleting {
+			if revertErr := s.meta.UpdateTenantStatus(r.Context(), t.ID, t.Status); revertErr != nil {
+				logger.Error(r.Context(), "native_fork_cleanup_revert_failed", zap.String("tenant_id", t.ID), zap.Error(revertErr))
+			}
+		}
 		errJSON(w, http.StatusBadGateway, "fork delete cleanup failed")
 		return
 	}
