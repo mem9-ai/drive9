@@ -131,7 +131,7 @@ func (s *Store) claimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseD
 		    SELECT 1 FROM quota_outbox older
 		     WHERE older.id < q.id
 		       AND older.status IN (?, ?)
-		       AND (older.file_id = q.file_id OR (older.file_id IS NULL AND q.file_id IS NULL))
+		       AND (older.file_id = q.file_id OR older.file_id IS NULL OR q.file_id IS NULL)
 		  )
 		ORDER BY id
 		LIMIT ?
@@ -234,16 +234,19 @@ func (s *Store) AckQuotaOutboxBatchTx(ctx context.Context, tx *sql.Tx, entries [
 		return nil
 	}
 	now := time.Now().UTC()
-	conds := make([]string, 0, len(entries))
-	args := []any{QuotaOutboxSucceeded, now, now, QuotaOutboxProcessing, now}
+	ids := make([]any, 0, len(entries))
+	receipt := entries[0].Receipt
 	for i := range entries {
-		conds = append(conds, `(id = ? AND receipt = ?)`)
-		args = append(args, entries[i].ID, entries[i].Receipt)
+		if entries[i].Receipt != receipt {
+			return ErrQuotaOutboxLeaseMismatch
+		}
+		ids = append(ids, entries[i].ID)
 	}
+	args := append([]any{QuotaOutboxSucceeded, now, now, QuotaOutboxProcessing, receipt, now}, ids...)
 	res, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE quota_outbox SET status = ?, receipt = NULL,
 		leased_at = NULL, lease_until = NULL, completed_at = ?, updated_at = ?
-		WHERE status = ? AND lease_until IS NOT NULL AND lease_until > ?
-		  AND (%s)`, strings.Join(conds, " OR ")), args...)
+		WHERE status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?
+		  AND id IN (%s)`, sqlPlaceholders(len(entries))), args...)
 	if err != nil {
 		return err
 	}

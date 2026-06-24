@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -102,6 +103,50 @@ func TestServerQuotaOutboxBatchProcessesDifferentFiles(t *testing.T) {
 	}
 	if usage.StorageBytes != int64(len("aaaa")+len("bb")) || usage.FileCount != 2 || usage.MediaFileCount != 1 {
 		t.Fatalf("central usage after batch = %+v", usage)
+	}
+}
+
+func TestQuotaOutboxWorkerRepollsAfterUnderfilledSameFileBatch(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+	fileID := "same-file-backlog"
+
+	if _, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
+		FileID:       fileID,
+		MutationType: quotaMutationTypeFileCreate,
+		MutationData: mustQuotaMutationJSON(t, fileCreateMutationData{
+			FileID:    fileID,
+			SizeBytes: 1,
+		}),
+		StorageDelta: 1,
+		FileDelta:    1,
+	}); err != nil {
+		t.Fatalf("enqueue create: %v", err)
+	}
+	if _, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
+		FileID:       fileID,
+		MutationType: quotaMutationTypeOverwrite,
+		MutationData: mustQuotaMutationJSON(t, fileOverwriteMutationData{
+			FileID:       fileID,
+			OldSizeBytes: 1,
+			NewSizeBytes: 3,
+		}),
+		StorageDelta: 2,
+	}); err != nil {
+		t.Fatalf("enqueue overwrite: %v", err)
+	}
+
+	b.processQuotaOutboxAvailable(ctx)
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, fileID, datastore.QuotaOutboxSucceeded); got != 2 {
+		t.Fatalf("succeeded same-file rows = %d, want 2", got)
+	}
+	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("get usage: %v", err)
+	}
+	if usage.StorageBytes != 3 || usage.FileCount != 1 {
+		t.Fatalf("usage after same-file backlog drain = %+v, want storage=3 files=1", usage)
 	}
 }
 
@@ -339,6 +384,56 @@ func TestDrainQuotaOutboxForUploadTargetProcessesClaimableBatch(t *testing.T) {
 	}
 	if usage.StorageBytes != int64(len("older")+len("target")) || usage.FileCount != 2 {
 		t.Fatalf("central usage after drain = %+v, want both files applied", usage)
+	}
+}
+
+func TestDrainQuotaOutboxForFileContinuesAfterUnrelatedBatchError(t *testing.T) {
+	b, _ := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	for i := 0; i < quotaOutboxBatchSize; i++ {
+		fileID := "older-file"
+		data := json.RawMessage(`{"file_id":"bad-json","size_bytes":"bad","is_media":false}`)
+		if i > 0 {
+			fileID = fmt.Sprintf("older-file-%03d", i)
+			data = mustQuotaMutationJSON(t, fileCreateMutationData{
+				FileID:    fileID,
+				SizeBytes: 1,
+			})
+		}
+		if _, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
+			FileID:       fileID,
+			MutationType: quotaMutationTypeFileCreate,
+			MutationData: data,
+			StorageDelta: 1,
+			FileDelta:    1,
+		}); err != nil {
+			t.Fatalf("enqueue older %d: %v", i, err)
+		}
+	}
+	targetFileID := "target-file-after-unrelated-error"
+	if _, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
+		FileID:       targetFileID,
+		MutationType: quotaMutationTypeFileCreate,
+		MutationData: mustQuotaMutationJSON(t, fileCreateMutationData{
+			FileID:    targetFileID,
+			SizeBytes: 1,
+		}),
+		StorageDelta: 1,
+		FileDelta:    1,
+	}); err != nil {
+		t.Fatalf("enqueue target: %v", err)
+	}
+
+	if err := b.drainQuotaOutboxForFile(ctx, targetFileID, quotaOutboxUploadDrainLimit); err != nil {
+		t.Fatalf("drain target: %v", err)
+	}
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, targetFileID, datastore.QuotaOutboxSucceeded); got != 1 {
+		t.Fatalf("target succeeded rows = %d, want 1", got)
+	}
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, "older-file", datastore.QuotaOutboxQueued); got != 1 {
+		t.Fatalf("bad unrelated queued retry rows = %d, want 1", got)
 	}
 }
 
@@ -599,4 +694,13 @@ func latestQuotaOutboxStorageDeltaByFile(t *testing.T, ctx context.Context, b *D
 		t.Fatal(err)
 	}
 	return delta
+}
+
+func mustQuotaMutationJSON(t *testing.T, payload any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal quota mutation: %v", err)
+	}
+	return raw
 }

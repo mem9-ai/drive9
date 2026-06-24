@@ -220,6 +220,51 @@ func TestQuotaOutboxBatchClaimPreservesPerFileOrder(t *testing.T) {
 	}
 }
 
+func TestQuotaOutboxBatchClaimTreatsNullFileIDAsGlobalBarrier(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	availableNow := now.Add(-time.Second)
+
+	globalID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		MutationType: "global_legacy",
+		MutationData: json.RawMessage(`{}`),
+		AvailableAt:  availableNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fileID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       "file-1",
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		AvailableAt:  availableNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := s.ClaimQuotaOutboxBatch(ctx, now, time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != globalID {
+		t.Fatalf("claimed behind older NULL file_id = %+v, want only global id %d", claimed, globalID)
+	}
+	if err := s.InTx(ctx, func(tx *sql.Tx) error {
+		return s.AckQuotaOutboxBatchTx(ctx, tx, claimed)
+	}); err != nil {
+		t.Fatalf("ack global row: %v", err)
+	}
+	claimed, err = s.ClaimQuotaOutboxBatch(ctx, now.Add(time.Second), time.Minute, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != fileID {
+		t.Fatalf("claimed after global ack = %+v, want file id %d", claimed, fileID)
+	}
+}
+
 func TestQuotaOutboxDeadLetteredOlderRowUnblocksLaterClaim(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
