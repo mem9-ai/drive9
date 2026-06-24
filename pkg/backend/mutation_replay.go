@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
@@ -64,18 +65,28 @@ func (w *MutationReplayWorker) run(ctx context.Context) {
 			logger.Info(ctx, "mutation_replay_worker_stopped")
 			return
 		case <-ticker.C:
-			w.replayBatch(ctx)
+			if w.replayBatch(ctx) {
+				// Fatal error (e.g. database closed) — stop the loop.
+				logger.Info(ctx, "mutation_replay_worker_stopped_fatal")
+				return
+			}
 		}
 	}
 }
 
-func (w *MutationReplayWorker) replayBatch(ctx context.Context) {
+// replayBatch processes one batch of pending mutations. Returns true if a
+// fatal error occurred (e.g. database closed) and the loop should stop.
+func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 	start := time.Now()
 	entries, err := w.store.ListPendingMutations(ctx, replayMinAge, replayBatchLimit)
 	if err != nil {
+		if strings.Contains(err.Error(), "database is closed") || strings.Contains(err.Error(), "connection refused") {
+			logger.Info(ctx, "mutation_replay_worker_db_closed")
+			return true
+		}
 		logger.Warn(ctx, "mutation_replay_list_failed", zap.Error(err))
 		metrics.RecordOperation("mutation_replay", "list", "error", time.Since(start))
-		return
+		return false
 	}
 	if len(entries) == 0 {
 		return
@@ -125,6 +136,7 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) {
 		zap.Int("failed", failed),
 		zap.Int("skipped_after_barrier", skipped),
 		zap.Float64("duration_ms", float64(time.Since(start).Milliseconds())))
+	return false
 }
 
 func (w *MutationReplayWorker) replayOne(ctx context.Context, entry MutationLogView) error {

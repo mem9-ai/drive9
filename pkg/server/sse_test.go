@@ -4,12 +4,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/mem9-ai/drive9/internal/testmysql"
+	"github.com/mem9-ai/drive9/pkg/datastore"
 )
 
 // sseEvent represents a parsed SSE event.
@@ -38,11 +40,54 @@ func readSSEEvent(scanner *bufio.Scanner) (sseEvent, bool) {
 	return ev, false
 }
 
-func TestSSEEndpointSince0SendsReset(t *testing.T) {
-	srv := &Server{events: newEventBuses()}
-	bus := srv.events.get("")
+func newTestStoreForSSE(t *testing.T) *datastore.Store {
+	t.Helper()
+	store, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	testmysql.ResetDB(t, store.DB())
+	if _, err := store.DB().Exec(`CREATE TABLE IF NOT EXISTS fs_events (
+		seq        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+		path       VARCHAR(512) NOT NULL,
+		op         VARCHAR(64) NOT NULL,
+		actor      VARCHAR(255),
+		ts         BIGINT NOT NULL,
+		created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.DB().Exec(`CREATE INDEX idx_fs_events_created ON fs_events(created_at)`); err != nil && !strings.Contains(err.Error(), "Duplicate key") {
+		t.Fatal(err)
+	}
+	// Reset AUTO_INCREMENT so seq starts at 1 for deterministic test assertions.
+	if _, err := store.DB().Exec(`ALTER TABLE fs_events AUTO_INCREMENT = 1`); err != nil {
+		t.Fatal(err)
+	}
+	return store
+}
 
-	bus.Publish("/existing.txt", "write", "")
+func newSSETestServer(t *testing.T) (*Server, *datastore.Store) {
+	t.Helper()
+	store := newTestStoreForSSE(t)
+	srv := &Server{events: newEventBuses()}
+	srv.events.get("", store)
+	return srv, store
+}
+
+func publishTestEvent(t *testing.T, store *datastore.Store, bus *EventBus, path, op, actor string) {
+	t.Helper()
+	if _, err := store.InsertFSEvent(context.Background(), path, op, actor, time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	bus.Publish()
+}
+
+func TestSSEEndpointSince0SendsReset(t *testing.T) {
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
+	publishTestEvent(t, store, bus, "/existing.txt", "write", "")
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Inject fallback scope context.
@@ -96,12 +141,12 @@ func TestSSEEndpointSince0SendsReset(t *testing.T) {
 }
 
 func TestSSEEndpointReplay(t *testing.T) {
-	srv := &Server{events: newEventBuses()}
-	bus := srv.events.get("")
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
 
-	bus.Publish("/a.txt", "write", "actor1")
-	bus.Publish("/b.txt", "write", "actor2")
-	bus.Publish("/c.txt", "write", "actor1")
+	publishTestEvent(t, store, bus, "/a.txt", "write", "actor1")
+	publishTestEvent(t, store, bus, "/b.txt", "write", "actor2")
+	publishTestEvent(t, store, bus, "/c.txt", "write", "actor1")
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
@@ -151,11 +196,10 @@ func TestSSEEndpointReplay(t *testing.T) {
 }
 
 func TestSSEEndpointLiveEvent(t *testing.T) {
-	srv := &Server{events: newEventBuses()}
-	bus := srv.events.get("")
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
 
-	// Pre-publish one event so since=1 is valid.
-	bus.Publish("/existing.txt", "write", "")
+	publishTestEvent(t, store, bus, "/existing.txt", "write", "")
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
@@ -184,7 +228,7 @@ func TestSSEEndpointLiveEvent(t *testing.T) {
 		t.Fatalf("initial event=%q, want heartbeat", current.Event)
 	}
 
-	bus.Publish("/new.txt", "write", "remote-actor")
+	publishTestEvent(t, store, bus, "/new.txt", "write", "remote-actor")
 
 	ev, ok := readSSEEvent(scanner)
 	if !ok {
@@ -203,14 +247,13 @@ func TestSSEEndpointLiveEvent(t *testing.T) {
 }
 
 func TestSSEStructuralOpEmitsReset(t *testing.T) {
-	srv := &Server{events: newEventBuses()}
-	bus := srv.events.get("")
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
 
-	// Publish a mix: write (file_changed) then rename (structural → reset).
-	bus.Publish("/a.txt", "write", "actor1")
-	bus.Publish("/old.txt", "rename", "actor1")
-	bus.Publish("/dir", "mkdir", "actor1")
-	bus.Publish("/gone.txt", "delete", "actor1")
+	publishTestEvent(t, store, bus, "/a.txt", "write", "actor1")
+	publishTestEvent(t, store, bus, "/old.txt", "rename", "actor1")
+	publishTestEvent(t, store, bus, "/dir", "mkdir", "actor1")
+	publishTestEvent(t, store, bus, "/gone.txt", "delete", "actor1")
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
@@ -309,10 +352,10 @@ func TestSSEStructuralOpEmitsReset(t *testing.T) {
 }
 
 func TestSSEStructuralOpLiveEmitsReset(t *testing.T) {
-	srv := &Server{events: newEventBuses()}
-	bus := srv.events.get("")
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
 
-	bus.Publish("/existing.txt", "write", "")
+	publishTestEvent(t, store, bus, "/existing.txt", "write", "")
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
@@ -340,7 +383,7 @@ func TestSSEStructuralOpLiveEmitsReset(t *testing.T) {
 		t.Fatalf("initial event=%q, want heartbeat", current.Event)
 	}
 
-	bus.Publish("/old", "rename", "remote-actor")
+	publishTestEvent(t, store, bus, "/old", "rename", "remote-actor")
 
 	ev, ok := readSSEEvent(scanner)
 	if !ok {
@@ -488,11 +531,10 @@ func TestSSEBufferedWriterExplicitFlush(t *testing.T) {
 // notify wakeup are flushed within sseFlushMaxDelay, not buffered until the
 // next heartbeat (30s).
 func TestSSEBurstFlush(t *testing.T) {
-	srv := &Server{events: newEventBuses()}
-	bus := srv.events.get("")
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
 
-	// Pre-publish one event so since=1 is valid.
-	bus.Publish("/existing.txt", "write", "")
+	publishTestEvent(t, store, bus, "/existing.txt", "write", "")
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
@@ -523,12 +565,12 @@ func TestSSEBurstFlush(t *testing.T) {
 		t.Fatalf("expected initial heartbeat, got %q", ev.Event)
 	}
 
-	// Publish a burst of 3 events concurrently.
+	// Publish a burst of 3 events.
 	go func() {
 		time.Sleep(50 * time.Millisecond)
-		bus.Publish("/a.txt", "write", "actor1")
-		bus.Publish("/b.txt", "write", "actor2")
-		bus.Publish("/c.txt", "write", "actor3")
+		publishTestEvent(t, store, bus, "/a.txt", "write", "actor1")
+		publishTestEvent(t, store, bus, "/b.txt", "write", "actor2")
+		publishTestEvent(t, store, bus, "/c.txt", "write", "actor3")
 	}()
 
 	// Read first event with a timeout well under heartbeat (30s).
@@ -562,14 +604,19 @@ func TestSSEBurstFlush(t *testing.T) {
 	}
 }
 
-// TestSSEResetFlushWhenSeqTooOld verifies that a reset caused by seq_too_old
-// is flushed immediately and not buffered until the next heartbeat.
+// TestSSEResetFlushWhenSeqTooOld verifies that a reset caused by a stale since
+// (events were pruned by cleanup) is flushed immediately.
 func TestSSEResetFlushWhenSeqTooOld(t *testing.T) {
-	srv := &Server{events: newEventBuses()}
-	bus := srv.events.get("")
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
 
-	// Publish one event so the ring has content.
-	bus.Publish("/a.txt", "write", "actor1")
+	// Insert one event.
+	publishTestEvent(t, store, bus, "/a.txt", "write", "actor1")
+
+	// Delete all events to simulate cleanup pruning.
+	if _, err := store.DeleteFSEventsBefore(context.Background(), time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
@@ -580,16 +627,8 @@ func TestSSEResetFlushWhenSeqTooOld(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// Publish enough events to wrap the ring buffer (eventBusRingSize = 10000).
-	// We publish 10005 events, then request since=5. The ring will have wrapped
-	// and seq=5 is too old, triggering seq_too_old.
-	for i := 2; i <= 10005; i++ {
-		bus.Publish(fmt.Sprintf("/file%d.txt", i), "write", "actor1")
-	}
-
-	// Connect with since=4 (older than the oldest retained event).
-	// After publishing 10005 events, oldestSeq = 6, so since+1 = 5 < 6 triggers seq_too_old.
-	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=4", nil)
+	// Connect with since=1 (the event was pruned → empty table → reset).
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -598,7 +637,6 @@ func TestSSEResetFlushWhenSeqTooOld(t *testing.T) {
 
 	scanner := bufio.NewScanner(resp.Body)
 
-	// First event must be the reset (not buffered).
 	ev, ok := readSSEEvent(scanner)
 	if !ok {
 		t.Fatal("expected reset event immediately")
@@ -606,12 +644,88 @@ func TestSSEResetFlushWhenSeqTooOld(t *testing.T) {
 	if ev.Event != "reset" {
 		t.Fatalf("expected reset, got %q", ev.Event)
 	}
+}
 
-	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(ev.Data), &data); err != nil {
-		t.Fatalf("unmarshal reset: %v", err)
+// TestSSEResetWhenPartialPruning verifies that a client whose cursor falls
+// in the pruned gap (events between cursor and oldest retained were deleted)
+// gets a reset, not a silent gap in the replay.
+func TestSSEResetWhenPartialPruning(t *testing.T) {
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
+
+	// Insert events seq=1,2,3.
+	publishTestEvent(t, store, bus, "/a.txt", "write", "actor1")
+	publishTestEvent(t, store, bus, "/b.txt", "write", "actor2")
+	publishTestEvent(t, store, bus, "/c.txt", "write", "actor3")
+
+	// Delete events 1 and 2 (simulate partial cleanup pruning).
+	if _, err := store.DB().Exec(`DELETE FROM fs_events WHERE seq <= 2`); err != nil {
+		t.Fatal(err)
 	}
-	if data["reason"] != "seq_too_old" {
-		t.Fatalf("expected reason seq_too_old, got %v", data["reason"])
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Client at since=1: events 2 was pruned (oldestSeq=3 > since+1=2) → reset.
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected event")
+	}
+	if ev.Event != "reset" {
+		t.Fatalf("expected reset for partially-pruned cursor, got %q", ev.Event)
+	}
+}
+
+// TestSSEResetWhenFutureCursor verifies that a client whose since is ahead of
+// the current head (server restarted / cursor stale) gets a reset.
+func TestSSEResetWhenFutureCursor(t *testing.T) {
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
+
+	// Insert one event (seq=1).
+	publishTestEvent(t, store, bus, "/a.txt", "write", "actor1")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Client at since=999: ahead of head (1) → reset (server_restart).
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=999", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected event")
+	}
+	// With no new events and since > head, the handler sends a heartbeat first
+	// (from the empty EventsSince result), then the poll ticker or the next
+	// EventsSince detects since > head and sends reset. But actually on the
+	// initial connection, EventsSince(999) returns ok=false → reset immediately.
+	if ev.Event != "reset" {
+		t.Fatalf("expected reset for future cursor, got %q", ev.Event)
 	}
 }

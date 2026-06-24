@@ -514,6 +514,60 @@ func (s *Server) startLeaderWorkers() {
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Start(backgroundWithTrace(leaderCtx))
 	}
+	// Periodic fs_events cleanup (leader-only). Prunes old event rows so the
+	// table doesn't grow unbounded. In single-tenant mode, cleans the fallback
+	// store. Multi-tenant cleanup is deferred to a separate task (see comment
+	// in cleanupFSEvents) — the table grows but bounded by event write rate
+	// and the 1h retention applies once multi-tenant cleanup is implemented.
+	s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+		ticker := time.NewTicker(fsEventsCleanupInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case <-ticker.C:
+				s.cleanupFSEvents(workerCtx)
+			}
+		}
+	})
+}
+
+// fsEventsCleanupInterval is how often the leader prunes old fs_events rows.
+const fsEventsCleanupInterval = 5 * time.Minute
+
+// fsEventsRetention is how long event rows are kept before pruning.
+const fsEventsRetention = 1 * time.Hour
+
+// cleanupFSEvents prunes old fs_events rows from accessible stores.
+// Single-tenant mode cleans the fallback store. Multi-tenant cleanup is
+// intentionally deferred: iterating all tenant stores on every tick is
+// expensive, and the stale-cursor reset logic in EventsSince handles pruned
+// rows correctly (reset when since < oldestSeq). The table grows bounded by
+// event write rate; a separate task should add per-tenant cleanup via pool
+// iteration or on Acquire. See issue #599 P1-2.
+func (s *Server) cleanupFSEvents(ctx context.Context) {
+	if ctx.Err() != nil {
+		// Context already cancelled (shutdown in progress): skip cleanup to
+		// avoid a partial DELETE that will roll back. Log so operators can see
+		// that a cleanup cycle was interrupted by shutdown.
+		logger.Warn(ctx, "fs_events_cleanup_skipped_shutdown", zap.Error(ctx.Err()))
+		return
+	}
+	if s.fallback != nil && s.meta == nil {
+		store := s.fallback.Store()
+		if store != nil {
+			if _, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-fsEventsRetention)); err != nil {
+				if ctx.Err() != nil {
+					logger.Warn(ctx, "fs_events_cleanup_interrupted_by_shutdown", zap.Error(err))
+				} else {
+					logger.Warn(ctx, "fs_events_cleanup_failed", zap.Error(err))
+				}
+			}
+		}
+	}
+	// Multi-tenant: deferred to a separate task. The fs_events table grows
+	// unbounded in multi-tenant mode until per-tenant cleanup is implemented.
 }
 
 // stopLeaderWorkers stops the background schedulers started by startLeaderWorkers.
