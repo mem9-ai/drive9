@@ -145,7 +145,7 @@ func (b *Dat9Backend) ensureUploadReserveFitsPendingQuotaTx(ctx context.Context,
 		metrics.RecordOperation("server_quota", "upload_reserve_pending_check", "fail_open", 0)
 		return nil
 	}
-	pendingStorageDelta, pendingFileDelta, _, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
+	pendingStorageDelta, pendingFileDelta, _, pendingOK := b.livePendingQuotaOutboxDeltasTx(ctx, tx)
 	if !pendingOK {
 		metrics.RecordOperation("server_quota", "upload_reserve_pending_check", "fail_open", 0)
 	}

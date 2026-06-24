@@ -353,6 +353,53 @@ func TestServerQuotaPendingOutboxDeltaRejectsUploadReserve(t *testing.T) {
 	}
 }
 
+func TestServerQuotaUploadReserveUsesLivePendingOutboxDeltas(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	fake.mu.Lock()
+	fake.config["tenant-a"].MaxStorageBytes = 10
+	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(ctx)
+
+	if b.quotaPendingCache == nil {
+		t.Fatal("quota pending cache is nil")
+	}
+	cached, ok := b.quotaPendingCache.get(ctx)
+	if !ok {
+		t.Fatal("warm quota pending cache failed")
+	}
+	if cached.storageDelta != 0 || cached.fileDelta != 0 || cached.mediaDelta != 0 {
+		t.Fatalf("initial cached pending deltas = %+v, want zero", cached)
+	}
+
+	if _, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
+		FileID:       "other-server-file",
+		MutationType: quotaMutationTypeFileCreate,
+		MutationData: json.RawMessage(`{}`),
+		StorageDelta: 8,
+		FileDelta:    1,
+	}); err != nil {
+		t.Fatalf("enqueue quota outbox: %v", err)
+	}
+
+	reserved, err := b.reserveUploadOnServer(ctx, "upload-live-pending", "/upload.bin", 3, 0)
+	if !errors.Is(err, ErrStorageQuotaExceeded) {
+		t.Fatalf("reserve error = %v, want ErrStorageQuotaExceeded", err)
+	}
+	if reserved {
+		t.Fatal("reserve should be false when live pending outbox pushes tenant over limit")
+	}
+	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("get usage after rejected reserve: %v", err)
+	}
+	if usage.ReservedBytes != 0 {
+		t.Fatalf("reserved bytes after rejected reserve = %d, want 0", usage.ReservedBytes)
+	}
+}
+
 func TestServerQuotaReserveUploadRetrySkipsPendingPrecheck(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
 	b.stopQuotaOutboxWorker()

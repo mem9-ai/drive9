@@ -183,7 +183,7 @@ func (b *Dat9Backend) ensureFileCountQuotaServer(ctx context.Context, tx *sql.Tx
 		return nil
 	}
 	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
-	_, pendingFileDelta, _, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
+	_, pendingFileDelta, _, pendingOK := b.cachedPendingQuotaOutboxDeltasTx(ctx, tx)
 	if !pendingOK {
 		metrics.RecordOperation("server_quota", "file_count_check_pending_delta", "fail_open", 0)
 	}
@@ -217,7 +217,7 @@ func (b *Dat9Backend) checkStorageQuotaServerTx(ctx context.Context, tx *sql.Tx,
 		return result, false // fail-open: usage unavailable
 	}
 	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
-	pendingStorageDelta, _, _, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
+	pendingStorageDelta, _, _, pendingOK := b.cachedPendingQuotaOutboxDeltasTx(ctx, tx)
 	if !pendingOK {
 		metrics.RecordOperation("server_quota", "storage_check_pending_delta", "fail_open", 0)
 	}
@@ -340,14 +340,18 @@ func (b *Dat9Backend) mediaLLMQuotaExceededServerTx(ctx context.Context, tx *sql
 		return false
 	}
 	recordTenantQuotaSnapshot(b.tenantID, usage, cfg)
-	_, _, pendingMediaDelta, pendingOK := b.pendingQuotaOutboxDeltasTx(ctx, tx)
+	_, _, pendingMediaDelta, pendingOK := b.cachedPendingQuotaOutboxDeltasTx(ctx, tx)
 	if !pendingOK {
 		metrics.RecordOperation("server_quota", "media_check_pending_delta", "fail_open", 0)
 	}
 	return usage.MediaFileCount+pendingMediaDelta+currentMediaDelta > cfg.MaxMediaLLMFiles
 }
 
-func (b *Dat9Backend) pendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx) (storageDelta, fileDelta, mediaDelta int64, ok bool) {
+// cachedPendingQuotaOutboxDeltasTx returns tenant-local pending quota deltas
+// for soft small-write checks. The short TTL cache avoids a SUM over
+// quota_outbox on every tiny write; strict upload reservations must call
+// livePendingQuotaOutboxDeltasTx under the admission lock instead.
+func (b *Dat9Backend) cachedPendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx) (storageDelta, fileDelta, mediaDelta int64, ok bool) {
 	if b.store == nil || tx == nil {
 		return 0, 0, 0, true
 	}
@@ -356,6 +360,13 @@ func (b *Dat9Backend) pendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx
 		if ok {
 			return deltas.storageDelta, deltas.fileDelta, deltas.mediaDelta, true
 		}
+	}
+	return b.livePendingQuotaOutboxDeltasTx(ctx, tx)
+}
+
+func (b *Dat9Backend) livePendingQuotaOutboxDeltasTx(ctx context.Context, tx *sql.Tx) (storageDelta, fileDelta, mediaDelta int64, ok bool) {
+	if b.store == nil || tx == nil {
+		return 0, 0, 0, true
 	}
 	storageDelta, fileDelta, mediaDelta, err := b.store.PendingQuotaOutboxDeltasTx(tx)
 	if err != nil {
