@@ -74,6 +74,18 @@ func (s *Store) LatestFSEventSeq(ctx context.Context) (int64, error) {
 	return seq.Int64, nil
 }
 
+// OldestFSEventSeq returns the current min seq in fs_events, or 0 if empty.
+func (s *Store) OldestFSEventSeq(ctx context.Context) (int64, error) {
+	var seq sql.NullInt64
+	if err := s.db.QueryRowContext(ctx, `SELECT MIN(seq) FROM fs_events`).Scan(&seq); err != nil {
+		return 0, fmt.Errorf("oldest fs_event seq: %w", err)
+	}
+	if !seq.Valid {
+		return 0, nil
+	}
+	return seq.Int64, nil
+}
+
 // DeleteFSEventsBefore deletes fs_events rows older than the given created_at threshold.
 func (s *Store) DeleteFSEventsBefore(ctx context.Context, before time.Time) (int64, error) {
 	res, err := s.db.ExecContext(ctx, `DELETE FROM fs_events WHERE created_at < ?`, before)

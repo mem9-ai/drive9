@@ -125,20 +125,21 @@ func newEventBuses() *eventBuses {
 }
 
 func (ebs *eventBuses) get(tenantID string, store *datastore.Store) *EventBus {
-	ebs.mu.RLock()
-	bus, ok := ebs.buses[tenantID]
-	ebs.mu.RUnlock()
-	if ok {
-		return bus
-	}
-
 	ebs.mu.Lock()
 	defer ebs.mu.Unlock()
-	// Double-check after acquiring write lock.
-	if bus, ok = ebs.buses[tenantID]; ok {
+	if bus, ok := ebs.buses[tenantID]; ok {
+		// Refresh the store reference if a non-nil store is provided: the pool
+		// may have invalidated and recreated the backend (closing the old store
+		// and opening a new one), so the cached bus's store could be stale/closed.
+		// Don't overwrite with nil — that would break a bus that already has a
+		// valid store (e.g. when tenantEventBus can't resolve a backend but the
+		// bus was previously initialized with one).
+		if store != nil {
+			bus.store = store
+		}
 		return bus
 	}
-	bus = NewEventBus(store)
+	bus := NewEventBus(store)
 	ebs.buses[tenantID] = bus
 	return bus
 }

@@ -627,7 +627,7 @@ func TestSSEResetFlushWhenSeqTooOld(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// Connect with since=1 (the event was pruned → seq_too_old or empty table → reset).
+	// Connect with since=1 (the event was pruned → empty table → reset).
 	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -643,5 +643,89 @@ func TestSSEResetFlushWhenSeqTooOld(t *testing.T) {
 	}
 	if ev.Event != "reset" {
 		t.Fatalf("expected reset, got %q", ev.Event)
+	}
+}
+
+// TestSSEResetWhenPartialPruning verifies that a client whose cursor falls
+// in the pruned gap (events between cursor and oldest retained were deleted)
+// gets a reset, not a silent gap in the replay.
+func TestSSEResetWhenPartialPruning(t *testing.T) {
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
+
+	// Insert events seq=1,2,3.
+	publishTestEvent(t, store, bus, "/a.txt", "write", "actor1")
+	publishTestEvent(t, store, bus, "/b.txt", "write", "actor2")
+	publishTestEvent(t, store, bus, "/c.txt", "write", "actor3")
+
+	// Delete events 1 and 2 (simulate partial cleanup pruning).
+	if _, err := store.DB().Exec(`DELETE FROM fs_events WHERE seq <= 2`); err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Client at since=1: events 2 was pruned (oldestSeq=3 > since+1=2) → reset.
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=1", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected event")
+	}
+	if ev.Event != "reset" {
+		t.Fatalf("expected reset for partially-pruned cursor, got %q", ev.Event)
+	}
+}
+
+// TestSSEResetWhenFutureCursor verifies that a client whose since is ahead of
+// the current head (server restarted / cursor stale) gets a reset.
+func TestSSEResetWhenFutureCursor(t *testing.T) {
+	srv, store := newSSETestServer(t)
+	bus := srv.events.get("", store)
+
+	// Insert one event (seq=1).
+	publishTestEvent(t, store, bus, "/a.txt", "write", "actor1")
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), tenantScopeKey, &TenantScope{TenantID: ""})
+		srv.handleEvents(w, r.WithContext(ctx))
+	}))
+	defer ts.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Client at since=999: ahead of head (1) → reset (server_restart).
+	req, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"?since=999", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	scanner := bufio.NewScanner(resp.Body)
+	ev, ok := readSSEEvent(scanner)
+	if !ok {
+		t.Fatal("expected event")
+	}
+	// With no new events and since > head, the handler sends a heartbeat first
+	// (from the empty EventsSince result), then the poll ticker or the next
+	// EventsSince detects since > head and sends reset. But actually on the
+	// initial connection, EventsSince(999) returns ok=false → reset immediately.
+	if ev.Event != "reset" {
+		t.Fatalf("expected reset for future cursor, got %q", ev.Event)
 	}
 }

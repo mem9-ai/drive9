@@ -166,7 +166,7 @@ func tidbAppEmbeddingBaseSchemaStatements() []string {
 		`CREATE INDEX idx_llm_usage_created ON llm_usage(created_at)`,
 		`CREATE TABLE IF NOT EXISTS fs_events (
 			seq        BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-			path       VARCHAR(512) NOT NULL,
+			path       TEXT NOT NULL,
 			op         VARCHAR(64) NOT NULL,
 			actor      VARCHAR(255),
 			ts         BIGINT NOT NULL,
