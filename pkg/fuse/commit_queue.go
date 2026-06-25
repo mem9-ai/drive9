@@ -1264,7 +1264,20 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, com
 		})
 		cancel()
 		if err != nil {
-			return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
+			// Chmod is a best-effort metadata operation. The file data has
+			// already been uploaded successfully. Under concurrent writes to
+			// the same file, the server may have already moved to a newer
+			// revision (or the file may have been replaced), causing the chmod
+			// to fail with "not found". Treating this as a terminal failure
+			// blocks the commit queue path indefinitely and stalls all
+			// subsequent FUSE operations on that path. Instead, log the warning
+			// and proceed — the mode will be applied by the next successful
+			// commit for this path.
+			if client.IsNotFound(err) {
+				log.Printf("commit queue: post-upload chmod not found for %s (concurrent write likely replaced it); proceeding without mode update", entry.Path)
+			} else {
+				return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
+			}
 		}
 	}
 
