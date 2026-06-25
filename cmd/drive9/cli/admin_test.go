@@ -96,6 +96,42 @@ func TestAdminTenantCreatePrintsTable(t *testing.T) {
 	}
 }
 
+func TestAdminTenantCreateHintsSpendingLimitOnFreeQuotaError(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/admin/tenants" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := body["tidbcloud_spending_limit"]; ok {
+			t.Fatalf("body unexpectedly included default spending limit: %#v", body)
+		}
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "TiDB Cloud free cluster limit reached",
+		})
+	}))
+	defer ts.Close()
+
+	err := Admin([]string{
+		"tenant", "create",
+		"--server", ts.URL,
+		"--tidbcloud-public-key", "public-1",
+		"--tidbcloud-private-key", "private-1",
+	})
+	if err == nil {
+		t.Fatal("Admin tenant create error = nil, want provision failure")
+	}
+	if !strings.Contains(err.Error(), "--tidbcloud-spending-limit") {
+		t.Fatalf("Admin tenant create error = %q, want spending limit hint", err)
+	}
+}
+
 func TestAdminTenantListPrintsTable(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	clearProvisionEnv(t)
