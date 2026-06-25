@@ -173,6 +173,18 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 			defer wg.Done()
 			defer func() { <-sem }()
 
+			// PingContext borrows a connection from the pool (reusing an idle one,
+			// else opening a new one when under MaxOpenConns) and returns it
+			// immediately, so each cycle adds a transient +1 connection per pinged
+			// pool — at most probeConcurrency in flight cluster-wide. Any opened
+			// conn is later reaped by ConnMaxIdleTime.
+			//
+			// Caveat: on a pool with an explicit MaxOpenConns that is fully checked
+			// out, PingContext blocks for a free slot and may hit `timeout`,
+			// recording the pool as unreachable when it is merely saturated. This is
+			// rarely hit because ApplyPoolDefaults leaves MaxOpenConns unlimited
+			// unless DRIVE9_DB_MAX_OPEN_CONNS is set; the pool-saturation alert
+			// covers that condition directly.
 			pingCtx, cancel := context.WithTimeout(ctx, timeout)
 			start := time.Now()
 			err := db.PingContext(pingCtx)
