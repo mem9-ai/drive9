@@ -1264,7 +1264,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusUnauthorized, "invalid API key")
 			return
 		}
-		metricEvent(r.Context(), "auth", "result", "meta_unavailable")
+		metricEvent(r.Context(), "auth", "result", "meta_backend_error")
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_meta_unavailable", "error", err)...)
 		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
 		return
@@ -1290,7 +1290,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(tok), plain) != 1 {
-		metricEvent(r.Context(), "auth", "result", "token_mismatch")
+		metricEvent(r.Context(), "auth", "result", "cipher_mismatch")
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_token_mismatch", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return

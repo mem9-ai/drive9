@@ -208,6 +208,7 @@ func (m *Manager) Stop() {
 		m.isLeader = false
 		cb := m.onLose
 		m.mu.Unlock()
+		recordLeaderState(false)
 		if cb != nil {
 			cb()
 		}
@@ -232,9 +233,10 @@ func (m *Manager) run(workerCtx context.Context) {
 		default:
 		}
 
+		acquireStart := time.Now()
 		acquired, conn, err := m.tryAcquire(workerCtx)
 		if err != nil {
-			metrics.RecordOperation(metricsComponent, "acquire", "error", 0)
+			metrics.RecordOperation(metricsComponent, "acquire", "error", time.Since(acquireStart))
 			recordLeaderState(false)
 			logger.Warn(workerCtx, "leader_acquire_failed",
 				zap.String("lock", m.lockName),
@@ -244,6 +246,7 @@ func (m *Manager) run(workerCtx context.Context) {
 		}
 
 		if acquired {
+			metrics.RecordOperation(metricsComponent, "acquire", "ok", time.Since(acquireStart))
 			m.gainLeadership()
 			m.holdLeadership(workerCtx, conn)
 			// When holdLeadership returns, we lost the lock or ctx was cancelled.
@@ -318,9 +321,10 @@ func (m *Manager) holdLeadership(ctx context.Context, conn *sql.Conn) {
 			return
 		case <-ticker.C:
 			// Keep the connection alive and verify lock ownership in one round-trip.
+			heartbeatStart := time.Now()
 			var ownerID sql.NullInt64
 			if err := conn.QueryRowContext(ctx, isUsedLockSQL, m.lockName).Scan(&ownerID); err != nil {
-				metrics.RecordOperation(metricsComponent, "heartbeat", "error", 0)
+				metrics.RecordOperation(metricsComponent, "heartbeat", "error", time.Since(heartbeatStart))
 				logger.Warn(ctx, "leader_heartbeat_failed",
 					zap.String("lock", m.lockName),
 					zap.Error(err))
@@ -341,8 +345,9 @@ func (m *Manager) holdLeadership(ctx context.Context, conn *sql.Conn) {
 				return
 			}
 			// Keep the connection alive to prevent wait_timeout from closing it.
+			keepaliveStart := time.Now()
 			if _, err := conn.ExecContext(ctx, keepAliveSQL); err != nil {
-				metrics.RecordOperation(metricsComponent, "keepalive", "error", 0)
+				metrics.RecordOperation(metricsComponent, "keepalive", "error", time.Since(keepaliveStart))
 				logger.Warn(ctx, "leader_keepalive_failed",
 					zap.String("lock", m.lockName),
 					zap.Error(err))
@@ -370,7 +375,6 @@ func (m *Manager) gainLeadership() {
 	cb := m.onLead
 	m.mu.Unlock()
 	recordLeaderState(true)
-	metrics.RecordOperation(metricsComponent, "acquire", "ok", 0)
 	if !wasLeader && cb != nil {
 		logger.Info(context.Background(), "leader_gained",
 			zap.String("lock", m.lockName))

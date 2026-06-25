@@ -370,8 +370,9 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	// concurrently with a leadership transition resolves to the post-transition
 	// state rather than a moment-in-time IsLeader() check taken outside the lock.
 	startFileGC := p.fileGCEnabled
-	metrics.RecordGauge("tenant_pool", "cached_backends", float64(len(p.items)))
+	cachedCount := len(p.items)
 	p.mu.Unlock()
+	metrics.RecordGauge("tenant_pool", "cached_backends", float64(cachedCount))
 	if startFileGC {
 		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 	}
@@ -971,7 +972,6 @@ func (p *Pool) removeLocked(elem *list.Element) *entry {
 	delete(p.items, e.tenantID)
 	e.retired = true
 	metrics.RecordOperation("tenant_pool", "evict", "ok", 0)
-	metrics.RecordGauge("tenant_pool", "cached_backends", float64(len(p.items)))
 	if e.refs == 0 {
 		return e
 	}

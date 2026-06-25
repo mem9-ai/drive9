@@ -151,29 +151,48 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 		firstErr    error
 	}
 	results := map[string]*roleAgg{}
-	for db, role := range dbByRole {
-		agg := results[role]
-		if agg == nil {
-			agg = &roleAgg{}
-			results[role] = agg
+	for _, role := range dbByRole {
+		if results[role] == nil {
+			results[role] = &roleAgg{}
 		}
-		agg.total++
-
-		pingCtx, cancel := context.WithTimeout(ctx, timeout)
-		start := time.Now()
-		err := db.PingContext(pingCtx)
-		cancel()
-
-		result := "ok"
-		if err != nil {
-			result = "error"
-			agg.unreachable++
-			if agg.firstErr == nil {
-				agg.firstErr = err
-			}
-		}
-		dbProbeDuration.Observe(time.Since(start).Seconds(), Attr("role", role), Attr("result", result))
+		results[role].total++
 	}
+
+	// Ping pools concurrently with a fixed bound so one slow/unreachable pool
+	// cannot serialize the whole cycle: with many unreachable tenant ("user")
+	// pools a serial loop would burn timeout*N and leave drive9_db_up stale.
+	const probeConcurrency = 8
+	sem := make(chan struct{}, probeConcurrency)
+	var wg sync.WaitGroup
+	var aggMu sync.Mutex
+	for db, role := range dbByRole {
+		db, role := db, role
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			pingCtx, cancel := context.WithTimeout(ctx, timeout)
+			start := time.Now()
+			err := db.PingContext(pingCtx)
+			cancel()
+
+			result := "ok"
+			if err != nil {
+				result = "error"
+				aggMu.Lock()
+				agg := results[role]
+				agg.unreachable++
+				if agg.firstErr == nil {
+					agg.firstErr = err
+				}
+				aggMu.Unlock()
+			}
+			dbProbeDuration.Observe(time.Since(start).Seconds(), Attr("role", cleanMetricValue(role, "unknown")), Attr("result", result))
+		}()
+	}
+	wg.Wait()
 
 	type transition struct {
 		role string
