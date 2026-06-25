@@ -598,7 +598,7 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenCreateQuotaFails(t *testing.T)
 		KeyName:               "default",
 		TokenVersion:          1,
 		CredentialProvisioner: &cred,
-		Quota:                 &quotaRequest{MaxStorageSize: &maxStorageSize},
+		Quota:                 &quotaRequest{quotaFields: quotaFields{MaxStorageSize: &maxStorageSize}},
 	})
 	if err == nil {
 		t.Fatal("provisionTenant error = nil, want quota error")

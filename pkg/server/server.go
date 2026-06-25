@@ -3848,12 +3848,9 @@ type credentialProvisionRequest struct {
 
 func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*credentialProvisionRequest, error) {
 	var req struct {
-		PublicKey              string `json:"public_key"`
-		PrivateKey             string `json:"private_key"`
-		MaxStorageSize         *int64 `json:"max_storage_size"`
-		MaxFileSize            *int64 `json:"max_file_size"`
-		MaxFileCount           *int64 `json:"max_file_count"`
-		TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
+		quotaFields
 	}
 	if r.Body != nil {
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCredentialProvisionBodyBytes))
@@ -3867,12 +3864,9 @@ func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*
 		}
 	}
 	out := &credentialProvisionRequest{}
-	if req.MaxStorageSize != nil || req.MaxFileSize != nil || req.MaxFileCount != nil || req.TiDBCloudSpendingLimit != nil {
+	if req.anySet() {
 		out.Quota = &quotaRequest{
-			MaxStorageSize:         req.MaxStorageSize,
-			MaxFileSize:            req.MaxFileSize,
-			MaxFileCount:           req.MaxFileCount,
-			TiDBCloudSpendingLimit: req.TiDBCloudSpendingLimit,
+			quotaFields: req.quotaFields,
 		}
 	}
 	cred := tenant.CredentialProvisionRequest{
@@ -3927,12 +3921,9 @@ func rejectCredentialProvisionBody(r *http.Request) error {
 		return fmt.Errorf("request body too large")
 	}
 	var raw struct {
-		PublicKey              string `json:"public_key"`
-		PrivateKey             string `json:"private_key"`
-		MaxStorageSize         *int64 `json:"max_storage_size"`
-		MaxFileSize            *int64 `json:"max_file_size"`
-		MaxFileCount           *int64 `json:"max_file_count"`
-		TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
+		quotaFields
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return fmt.Errorf("invalid JSON body: %w", err)
@@ -3943,7 +3934,7 @@ func rejectCredentialProvisionBody(r *http.Request) error {
 	if strings.TrimSpace(raw.PrivateKey) != "" {
 		return fmt.Errorf("tidbcloud private key is not supported for this provider (only tidb_cloud_native)")
 	}
-	if raw.MaxStorageSize != nil || raw.MaxFileSize != nil || raw.MaxFileCount != nil || raw.TiDBCloudSpendingLimit != nil {
+	if raw.anySet() {
 		return fmt.Errorf("quota settings are not supported for this provider (only tidb_cloud_native)")
 	}
 	return nil

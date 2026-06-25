@@ -23,21 +23,15 @@ const (
 )
 
 type adminTenantCreateRequest struct {
-	PublicKey              string `json:"public_key"`
-	PrivateKey             string `json:"private_key"`
-	MaxStorageSize         *int64 `json:"max_storage_size,omitempty"`
-	MaxFileSize            *int64 `json:"max_file_size,omitempty"`
-	MaxFileCount           *int64 `json:"max_file_count,omitempty"`
-	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
+	PublicKey  string `json:"public_key"`
+	PrivateKey string `json:"private_key"`
+	quotaFields
 }
 
 type adminTenantQuotaRequest struct {
-	PublicKey              string `json:"public_key"`
-	PrivateKey             string `json:"private_key"`
-	MaxStorageSize         *int64 `json:"max_storage_size,omitempty"`
-	MaxFileSize            *int64 `json:"max_file_size,omitempty"`
-	MaxFileCount           *int64 `json:"max_file_count,omitempty"`
-	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
+	PublicKey  string `json:"public_key"`
+	PrivateKey string `json:"private_key"`
+	quotaFields
 }
 
 type adminTenantResponse struct {
@@ -162,14 +156,11 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	quotaReq := quotaRequest{
-		TenantID:               "pending",
-		MaxStorageSize:         req.MaxStorageSize,
-		MaxFileSize:            req.MaxFileSize,
-		MaxFileCount:           req.MaxFileCount,
-		TiDBCloudSpendingLimit: req.TiDBCloudSpendingLimit,
+		TenantID:    "pending",
+		quotaFields: req.quotaFields,
 	}
 	var quotaOpt *quotaRequest
-	if quotaReq.MaxStorageSize != nil || quotaReq.MaxFileSize != nil || quotaReq.MaxFileCount != nil || quotaReq.TiDBCloudSpendingLimit != nil {
+	if quotaReq.anySet() {
 		if err := s.validateQuotaSetRequest(quotaReq); err != nil {
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
@@ -288,11 +279,8 @@ func (s *Server) handleAdminTenantQuotaSet(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	quotaReq := quotaRequest{
-		TenantID:               tenantID,
-		MaxStorageSize:         req.MaxStorageSize,
-		MaxFileSize:            req.MaxFileSize,
-		MaxFileCount:           req.MaxFileCount,
-		TiDBCloudSpendingLimit: req.TiDBCloudSpendingLimit,
+		TenantID:    tenantID,
+		quotaFields: req.quotaFields,
 	}
 	if err := s.validateQuotaSetRequest(quotaReq); err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())

@@ -17,13 +17,24 @@ import (
 )
 
 type quotaRequest struct {
-	TenantID               string `json:"tenant_id"`
-	PublicKey              string `json:"public_key"`
-	PrivateKey             string `json:"private_key"`
+	TenantID   string `json:"tenant_id"`
+	PublicKey  string `json:"public_key"`
+	PrivateKey string `json:"private_key"`
+	quotaFields
+}
+
+type quotaFields struct {
 	MaxStorageSize         *int64 `json:"max_storage_size,omitempty"`
 	MaxFileSize            *int64 `json:"max_file_size,omitempty"`
 	MaxFileCount           *int64 `json:"max_file_count,omitempty"`
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
+}
+
+func (f quotaFields) anySet() bool {
+	return f.MaxStorageSize != nil ||
+		f.MaxFileSize != nil ||
+		f.MaxFileCount != nil ||
+		f.TiDBCloudSpendingLimit != nil
 }
 
 type quotaResponse struct {
