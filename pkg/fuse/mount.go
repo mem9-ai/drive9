@@ -80,7 +80,7 @@ type MountOptions struct {
 	// RemoteCommitWaitTimeout bounds how long a FUSE write/flush handler waits
 	// for a background commit to finish before proceeding anyway. This prevents
 	// the FUSE daemon from hanging indefinitely when a backend upload is slow.
-	// Default 30s; 0 uses default; negative disables the timeout (legacy behavior).
+	// Default 5s; 0 uses default; negative disables the timeout (legacy behavior).
 	RemoteCommitWaitTimeout time.Duration
 }
 
@@ -179,7 +179,7 @@ func (o *MountOptions) setDefaults() {
 		o.Profiling.PerfMaxProfileFiles = defaultPerfMaxProfileFiles
 	}
 	if o.RemoteCommitWaitTimeout == 0 {
-		o.RemoteCommitWaitTimeout = 30 * time.Second
+		o.RemoteCommitWaitTimeout = 5 * time.Second
 	}
 }
 
