@@ -116,14 +116,10 @@ func TestNewProvisionerFromEnvRejectsInvalidDefaultSpendingLimit(t *testing.T) {
 }
 
 func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testing.T) {
-	var ensureDBCalled bool
 	var pollCount int
 	origEnsureDatabase := ensureDatabaseFunc
-	ensureDatabaseFunc = func(_ context.Context, user, password, host string, port int, dbName string) error {
-		ensureDBCalled = true
-		if user != "u1.root" || password == "" || host != "db.example" || port != 4000 || dbName != DefaultDatabaseName {
-			t.Fatalf("ensure database args = %s/%s %s:%d %s", user, password, host, port, dbName)
-		}
+	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
+		t.Fatal("ensure database should not run during provision")
 		return nil
 	}
 	t.Cleanup(func() { ensureDatabaseFunc = origEnsureDatabase })
@@ -152,7 +148,8 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 			pollCount++
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"clusterId":  "cluster-1",
-				"state":      "ACTIVE",
+				"state":      "CREATING",
+				"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1"},
 				"userPrefix": "u1",
 				"endpoints":  map[string]any{"public": map[string]any{"host": "db.example", "port": 4000}},
 			})
@@ -218,11 +215,8 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	if gotBody.SpendingLimit.Monthly != 5000 {
 		t.Fatalf("spendingLimit.monthly = %d, want 5000", gotBody.SpendingLimit.Monthly)
 	}
-	if out.ClusterID != "cluster-1" || out.Username != "u1.root" || out.DBName != DefaultDatabaseName || out.Provider != tenant.ProviderTiDBCloudNative {
+	if out.ClusterID != "cluster-1" || out.OrganizationID != "org-1" || out.Username != "u1.root" || out.DBName != DefaultDatabaseName || out.Provider != tenant.ProviderTiDBCloudNative {
 		t.Fatalf("unexpected cluster info: %#v", out)
-	}
-	if !ensureDBCalled {
-		t.Fatal("ensure database was not called")
 	}
 	if pollCount < 2 {
 		t.Fatalf("poll count = %d, want at least 2", pollCount)
@@ -234,10 +228,9 @@ func int32Ptr(v int32) *int32 {
 }
 
 func TestProvisionWithCredentialsDefaultsDatabaseName(t *testing.T) {
-	var ensuredDB string
 	origEnsureDatabase := ensureDatabaseFunc
-	ensureDatabaseFunc = func(_ context.Context, _ string, _ string, _ string, _ int, dbName string) error {
-		ensuredDB = dbName
+	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
+		t.Fatal("ensure database should not run during provision")
 		return nil
 	}
 	t.Cleanup(func() { ensureDatabaseFunc = origEnsureDatabase })
@@ -251,6 +244,7 @@ func TestProvisionWithCredentialsDefaultsDatabaseName(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"clusterId":  "cluster-1",
 			"state":      "ACTIVE",
+			"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1"},
 			"userPrefix": "u1",
 			"endpoints":  map[string]any{"public": map[string]any{"host": "db.example", "port": 4000}},
 		})
@@ -264,14 +258,38 @@ func TestProvisionWithCredentialsDefaultsDatabaseName(t *testing.T) {
 		defaultDatabaseName: DefaultDatabaseName,
 		client:              ts.Client(),
 	}
-	if _, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+	out, err := p.ProvisionWithCredentials(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("ProvisionWithCredentials: %v", err)
 	}
-	if ensuredDB != DefaultDatabaseName {
-		t.Fatalf("ensured database = %q, want %q", ensuredDB, DefaultDatabaseName)
+	if out.DBName != DefaultDatabaseName {
+		t.Fatalf("database name = %q, want %q", out.DBName, DefaultDatabaseName)
+	}
+}
+
+func TestEnsureDatabaseFromDSNUsesTenantConnection(t *testing.T) {
+	var gotUser, gotPassword, gotHost, gotDBName string
+	var gotPort int
+	origEnsureDatabase := ensureDatabaseFunc
+	ensureDatabaseFunc = func(_ context.Context, user, password, host string, port int, dbName string) error {
+		gotUser = user
+		gotPassword = password
+		gotHost = host
+		gotPort = port
+		gotDBName = dbName
+		return nil
+	}
+	t.Cleanup(func() { ensureDatabaseFunc = origEnsureDatabase })
+
+	err := ensureDatabaseFromDSN(context.Background(), "u1.root:db-pass@tcp(db.example:4000)/tidbcloud_fs?parseTime=true&tls=true")
+	if err != nil {
+		t.Fatalf("ensureDatabaseFromDSN: %v", err)
+	}
+	if gotUser != "u1.root" || gotPassword != "db-pass" || gotHost != "db.example" || gotPort != 4000 || gotDBName != DefaultDatabaseName {
+		t.Fatalf("ensure database args = %s/%s %s:%d %s", gotUser, gotPassword, gotHost, gotPort, gotDBName)
 	}
 }
 
