@@ -3755,8 +3755,9 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var credentialReq *tenant.CredentialProvisionRequest
+	var quotaReq *quotaRequest
 	if provider == tenant.ProviderTiDBCloudNative {
-		req, err := decodeCredentialProvisionRequest(w, r)
+		decoded, err := decodeCredentialProvisionRequest(w, r)
 		if err != nil {
 			if !errors.Is(err, tenant.ErrCredentialsRequired) {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
@@ -3764,21 +3765,26 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			req = resolveDefaultCredentials(s.provisioner)
-			if req == nil {
+			defaultReq := resolveDefaultCredentials(s.provisioner)
+			if defaultReq == nil {
 				errJSON(w, http.StatusBadRequest, tenant.ErrCredentialsRequired.Error())
 				return
 			}
+			if decoded == nil {
+				decoded = &credentialProvisionRequest{}
+			}
+			decoded.Credential = defaultReq
 		}
 		if validator, ok := s.provisioner.(credentialProvisionRequestValidator); ok {
-			if err := validator.ValidateCredentialProvisionRequest(*req); err != nil {
+			if err := validator.ValidateCredentialProvisionRequest(*decoded.Credential); err != nil {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
 				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 				errJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 		}
-		credentialReq = req
+		credentialReq = decoded.Credential
+		quotaReq = decoded.Quota
 	} else {
 		if err := rejectCredentialProvisionBody(r); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider, "error", err)...)
@@ -3791,6 +3797,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		KeyName:               "default",
 		TokenVersion:          1,
 		CredentialProvisioner: credentialReq,
+		Quota:                 quotaReq,
 	})
 	if err != nil {
 		var pe *provisionTenantError
@@ -3834,17 +3841,52 @@ func resolveDefaultCredentials(p tenant.Provisioner) *tenant.CredentialProvision
 	return nil
 }
 
-func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
+type credentialProvisionRequest struct {
+	Credential *tenant.CredentialProvisionRequest
+	Quota      *quotaRequest
+}
+
+func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*credentialProvisionRequest, error) {
 	var req struct {
-		PublicKey  string `json:"public_key"`
-		PrivateKey string `json:"private_key"`
+		PublicKey              string `json:"public_key"`
+		PrivateKey             string `json:"private_key"`
+		MaxStorageSize         *int64 `json:"max_storage_size"`
+		MaxFileSize            *int64 `json:"max_file_size"`
+		MaxFileCount           *int64 `json:"max_file_count"`
+		TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
 	}
-	return decodeCredentialRequest(w, r, &req, func() tenant.CredentialProvisionRequest {
-		return tenant.CredentialProvisionRequest{
-			PublicKey:  strings.TrimSpace(req.PublicKey),
-			PrivateKey: strings.TrimSpace(req.PrivateKey),
+	if r.Body != nil {
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCredentialProvisionBodyBytes))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("invalid JSON body: %w", err)
 		}
-	})
+		var extra struct{}
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("invalid JSON body: trailing data")
+		}
+	}
+	out := &credentialProvisionRequest{}
+	if req.MaxStorageSize != nil || req.MaxFileSize != nil || req.MaxFileCount != nil || req.TiDBCloudSpendingLimit != nil {
+		out.Quota = &quotaRequest{
+			MaxStorageSize:         req.MaxStorageSize,
+			MaxFileSize:            req.MaxFileSize,
+			MaxFileCount:           req.MaxFileCount,
+			TiDBCloudSpendingLimit: req.TiDBCloudSpendingLimit,
+		}
+	}
+	cred := tenant.CredentialProvisionRequest{
+		PublicKey:  strings.TrimSpace(req.PublicKey),
+		PrivateKey: strings.TrimSpace(req.PrivateKey),
+	}
+	if cred.PublicKey == "" && cred.PrivateKey == "" {
+		return out, tenant.ErrCredentialsRequired
+	}
+	if cred.PublicKey == "" || cred.PrivateKey == "" {
+		return nil, tenant.ErrPartialCredentials
+	}
+	out.Credential = &cred
+	return out, nil
 }
 
 func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, build func() tenant.CredentialProvisionRequest) (*tenant.CredentialProvisionRequest, error) {
@@ -3885,8 +3927,12 @@ func rejectCredentialProvisionBody(r *http.Request) error {
 		return fmt.Errorf("request body too large")
 	}
 	var raw struct {
-		PublicKey  string `json:"public_key"`
-		PrivateKey string `json:"private_key"`
+		PublicKey              string `json:"public_key"`
+		PrivateKey             string `json:"private_key"`
+		MaxStorageSize         *int64 `json:"max_storage_size"`
+		MaxFileSize            *int64 `json:"max_file_size"`
+		MaxFileCount           *int64 `json:"max_file_count"`
+		TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit"`
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return fmt.Errorf("invalid JSON body: %w", err)
@@ -3896,6 +3942,9 @@ func rejectCredentialProvisionBody(r *http.Request) error {
 	}
 	if strings.TrimSpace(raw.PrivateKey) != "" {
 		return fmt.Errorf("tidbcloud private key is not supported for this provider (only tidb_cloud_native)")
+	}
+	if raw.MaxStorageSize != nil || raw.MaxFileSize != nil || raw.MaxFileCount != nil || raw.TiDBCloudSpendingLimit != nil {
+		return fmt.Errorf("quota settings are not supported for this provider (only tidb_cloud_native)")
 	}
 	return nil
 }

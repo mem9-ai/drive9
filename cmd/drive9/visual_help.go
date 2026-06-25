@@ -439,11 +439,12 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "--server URL", Desc: "override server URL and bypass region manifest lookup"},
 				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key; required for TiDBCloud Mode"},
 				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key; required for TiDBCloud Mode"},
+				{Name: "--tidbcloud-spending-limit N", Desc: "TiDB Cloud Cluster Spending Limit; must be non-negative"},
 				{Name: "--json", Desc: "output result as JSON"},
 			},
 			Examples: []visualHelpExample{
 				{Command: "drive9 create", Desc: "provision an Anonymous tenant using the default region"},
-				{Command: "drive9 create --region-code aws-ap-southeast-1 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "provision a TiDBCloud tenant"},
+				{Command: "drive9 create --region-code aws-ap-southeast-1 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key> --tidbcloud-spending-limit 10000", Desc: "provision a TiDBCloud tenant with a spending limit"},
 				{Command: "drive9 create --server http://127.0.0.1:9009", Desc: "provision directly against a known server"},
 				{Command: "drive9 region list", Desc: "list available regions"},
 			},

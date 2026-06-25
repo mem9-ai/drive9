@@ -184,6 +184,59 @@ func TestCreateServerOverrideSendsNativeBodyAndSkipsManifest(t *testing.T) {
 	}
 }
 
+func TestCreateSendsTiDBCloudSpendingLimit(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+
+	bodyCh := make(chan map[string]any, 1)
+	provision := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/provision" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var gotBody map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		bodyCh <- gotBody
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"tenant_id":      "tenant-native",
+			"api_key":        "owner-native",
+			"status":         "provisioning",
+			"cloud_provider": "aws",
+			"region":         "us-east-1",
+		})
+	}))
+	defer provision.Close()
+
+	resetCredentialCacheForTest()
+
+	_, err := captureStdoutE(t, func() error {
+		return Create([]string{
+			"--name", "native-spending",
+			"--server", provision.URL,
+			"--tidbcloud-public-key", "public-1",
+			"--tidbcloud-private-key", "private-1",
+			"--tidbcloud-spending-limit", "10000",
+		})
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	var gotBody map[string]any
+	select {
+	case gotBody = <-bodyCh:
+	default:
+		t.Fatal("provision server was not called")
+	}
+	if gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
+		t.Fatalf("request credentials = %#v", gotBody)
+	}
+	if gotBody["tidbcloud_spending_limit"] != float64(10000) {
+		t.Fatalf("request spending limit = %#v", gotBody)
+	}
+}
+
 func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	withIsolatedHome(t)
 	clearProvisionEnv(t)
@@ -396,6 +449,22 @@ func TestCreateRejectsDatabaseNameFlag(t *testing.T) {
 		t.Fatal("Create error = nil, want unknown flag error")
 	}
 	if !strings.Contains(err.Error(), `unknown flag "--database-name"`) {
+		t.Fatalf("Create error = %q", err)
+	}
+}
+
+func TestCreateRejectsSpendingLimitWithoutTiDBCloudKeys(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+
+	err := Create([]string{
+		"--server", "https://drive9.example",
+		"--tidbcloud-spending-limit", "10000",
+	})
+	if err == nil {
+		t.Fatal("Create error = nil, want missing TiDBCloud keys error")
+	}
+	if !strings.Contains(err.Error(), "when --tidbcloud-spending-limit is set") {
 		t.Fatalf("Create error = %q", err)
 	}
 }

@@ -30,6 +30,7 @@ func Create(args []string) error {
 	publicKeyGiven := false
 	privateKeyFlag := ""
 	privateKeyGiven := false
+	var tidbCloudSpendingLimit *int64
 	asJSON := false
 
 	for i := 0; i < len(args); i++ {
@@ -71,6 +72,16 @@ func Create(args []string) error {
 			i++
 			privateKeyFlag = args[i]
 			privateKeyGiven = true
+		case "--tidbcloud-spending-limit":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--tidbcloud-spending-limit requires an argument")
+			}
+			i++
+			v, err := parseNonNegativeQuotaInt64Flag("--tidbcloud-spending-limit", args[i])
+			if err != nil {
+				return err
+			}
+			tidbCloudSpendingLimit = &v
 		case "--json":
 			asJSON = true
 		default:
@@ -118,6 +129,9 @@ func Create(args []string) error {
 	privateKey = strings.TrimSpace(privateKey)
 
 	mode := provisionModeForCredentials(publicKey, privateKey)
+	if tidbCloudSpendingLimit != nil && mode != RegionModeTiDBCloudNative {
+		return fmt.Errorf("TiDBCloud Mode requires --tidbcloud-public-key and --tidbcloud-private-key when --tidbcloud-spending-limit is set")
+	}
 	if mode == RegionModeTiDBCloudNative && (publicKey == "" || privateKey == "") {
 		return fmt.Errorf("TiDBCloud Mode requires --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
 	}
@@ -143,7 +157,7 @@ func Create(args []string) error {
 		return fmt.Errorf("context %q already exists; use a different name", name)
 	}
 
-	body, err := provisionRequestBody(publicKey, privateKey)
+	body, err := provisionRequestBody(publicKey, privateKey, tidbCloudSpendingLimit)
 	if err != nil {
 		return err
 	}
@@ -252,6 +266,7 @@ flags:
   --server URL                    override the server URL (bypasses region manifest lookup)
   --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud Mode)
   --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud Mode)
+  --tidbcloud-spending-limit N    TiDB Cloud Cluster Spending Limit; must be non-negative
   --json                          output result as JSON
 
 examples:
@@ -261,7 +276,8 @@ examples:
   # provision a TiDBCloud tenant in ap-southeast-1
   drive9 create --region-code aws-ap-southeast-1 \
     --tidbcloud-public-key <public-key> \
-    --tidbcloud-private-key <private-key>
+    --tidbcloud-private-key <private-key> \
+    --tidbcloud-spending-limit 10000
 
   # provision directly against a known server
   drive9 create --server http://127.0.0.1:9009
@@ -279,16 +295,19 @@ func provisionModeForCredentials(publicKey, privateKey string) string {
 	return RegionModeTiDBCloudStarter
 }
 
-func provisionRequestBody(publicKey, privateKey string) (io.Reader, error) {
-	if publicKey == "" && privateKey == "" {
+func provisionRequestBody(publicKey, privateKey string, tidbCloudSpendingLimit *int64) (io.Reader, error) {
+	if publicKey == "" && privateKey == "" && tidbCloudSpendingLimit == nil {
 		return nil, nil
 	}
 	if publicKey == "" || privateKey == "" {
 		return nil, fmt.Errorf("TiDBCloud Mode requires both public and private keys")
 	}
-	body := map[string]string{
+	body := map[string]any{
 		"public_key":  publicKey,
 		"private_key": privateKey,
+	}
+	if tidbCloudSpendingLimit != nil {
+		body["tidbcloud_spending_limit"] = *tidbCloudSpendingLimit
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {

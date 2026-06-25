@@ -449,9 +449,11 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
+	spendingLimit := int64(10000)
 	body, _ := json.Marshal(map[string]any{
-		"public_key":  "public-1",
-		"private_key": "private-1",
+		"public_key":               "public-1",
+		"private_key":              "private-1",
+		"tidbcloud_spending_limit": spendingLimit,
 	})
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -468,6 +470,15 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	}
 	if got := prov.credentialCalls.Load(); got != 1 {
 		t.Fatalf("credential provision calls = %d, want 1", got)
+	}
+	if got := prov.quotaMarkCalls.Load(); got != 1 {
+		t.Fatalf("quota mark calls = %d, want 1", got)
+	}
+	if got := prov.quotaUpdateCalls.Load(); got != 1 {
+		t.Fatalf("quota update calls = %d, want 1", got)
+	}
+	if prov.lastQuotaOptions.TiDBCloudSpendingLimitMonthly == nil || *prov.lastQuotaOptions.TiDBCloudSpendingLimitMonthly != spendingLimit {
+		t.Fatalf("quota spending limit = %#v, want %d", prov.lastQuotaOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
 	}
 	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
 		t.Fatalf("credential request = %+v", prov.lastCredentialReq)
