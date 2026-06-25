@@ -7975,7 +7975,9 @@ func TestWaitQueuedRemoteCommitBeforeWriteBlocksUntilQueuedCommitDone(t *testing
 
 func TestLockWritableRemoteCommitPathTimeoutProceedsAfterDeadline(t *testing.T) {
 	// Verify that lockWritableRemoteCommitPath returns within a bounded
-	// timeout even when the commit queue never releases the path.
+	// timeout even when the commit queue never releases the path. This covers
+	// BOTH the queued case and the in-flight case (worker holds the per-path
+	// remote commit lock, simulating a slow upload that never completes).
 	path := "/repo/stuck.bin"
 	entry := &CommitEntry{Path: path}
 	cq := &CommitQueue{
@@ -7987,10 +7989,16 @@ func TestLockWritableRemoteCommitPathTimeoutProceedsAfterDeadline(t *testing.T) 
 
 	opts := &MountOptions{}
 	opts.setDefaults()
-	// Use a short timeout for the test so we don't wait 30s.
+	// Use a short timeout for the test so we don't wait 5s.
 	opts.RemoteCommitWaitTimeout = 200 * time.Millisecond
 	fs := &Dat9FS{commitQueue: cq, opts: opts}
 	fs.remoteCommitLocks = make(map[string]*sync.Mutex)
+
+	// Pre-lock the per-path remote commit mutex to simulate an in-flight
+	// worker holding the lock during a slow upload. This reproduces the
+	// actual deadlock scenario: the FUSE handler busy-waits holding fh.mu
+	// while the worker holds remoteCommitLocks[path] across a long upload.
+	fs.lockRemoteCommitPath(path)
 
 	start := time.Now()
 	unlock := fs.lockWritableRemoteCommitPath(path)

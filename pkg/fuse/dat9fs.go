@@ -1885,6 +1885,30 @@ func (fs *Dat9FS) lockRemoteCommitPath(path string) func() {
 	return lock.Unlock
 }
 
+// tryLockRemoteCommitPath attempts to acquire the per-path remote commit
+// lock without blocking. Returns (unlock, true) on success, (nil, false) if
+// the lock is already held.
+func (fs *Dat9FS) tryLockRemoteCommitPath(path string) (func(), bool) {
+	if fs == nil || path == "" {
+		return func() {}, true
+	}
+	fs.remoteCommitMu.Lock()
+	if fs.remoteCommitLocks == nil {
+		fs.remoteCommitLocks = make(map[string]*sync.Mutex)
+	}
+	lock := fs.remoteCommitLocks[path]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		fs.remoteCommitLocks[path] = lock
+	}
+	fs.remoteCommitMu.Unlock()
+
+	if lock.TryLock() {
+		return lock.Unlock, true
+	}
+	return nil, false
+}
+
 func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 	if fs == nil || fh == nil {
 		return
@@ -5723,8 +5747,24 @@ func (fs *Dat9FS) lockWritableRemoteCommitPath(p string) func() {
 	deadline := time.Now().Add(timeout)
 	for {
 		if timeout > 0 && time.Now().After(deadline) {
+			// Proceeding after timeout trades per-path commit ordering for
+			// forward progress. The in-flight background commit may land on
+			// the backend after this newer write, causing a last-writer-wins
+			// inversion (stale overwrite). This is an accepted tradeoff: a
+			// hung FUSE daemon is strictly worse than a potential lost update,
+			// and the timeout is long enough (default 5s) that genuine commits
+			// should normally drain before it fires.
+			//
+			// Use TryLock instead of Lock: if the in-flight worker still holds
+			// the per-path mutex, we proceed without it (no-op unlock) rather
+			// than blocking — blocking here would re-introduce the deadlock.
 			fs.debugf("lockWritableRemoteCommitPath: timeout (%s) waiting for %s, proceeding anyway", timeout, p)
-			return fs.lockRemoteCommitPath(p)
+			unlock, ok := fs.tryLockRemoteCommitPath(p)
+			if ok {
+				return unlock
+			}
+			fs.debugf("lockWritableRemoteCommitPath: per-path lock still held for %s, proceeding without lock", p)
+			return func() {}
 		}
 		if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
 			if !fs.commitQueue.WaitPathTimeout(p, 50*time.Millisecond) {
