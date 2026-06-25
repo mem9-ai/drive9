@@ -5,7 +5,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 )
 
 // userHZ is the Linux clock-tick frequency assumed for converting /proc CPU
@@ -101,10 +100,5 @@ func openFileDescriptors() (int, bool) {
 	return n, true
 }
 
-func maxFileDescriptors() (uint64, bool) {
-	var rl syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
-		return 0, false
-	}
-	return uint64(rl.Cur), true
-}
+// maxFileDescriptors is implemented per-platform (process_unix.go / process_other.go)
+// because the RLIMIT_NOFILE syscall constants do not exist on Windows.

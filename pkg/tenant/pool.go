@@ -230,7 +230,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 			p.mu.Unlock()
 			return b, nil
 		}
-		if removed := p.removeLocked(e.elem); removed != nil {
+		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
 			toClose = append(toClose, removed)
 		}
 		p.mu.Unlock()
@@ -256,7 +256,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 			p.mu.Unlock()
 			return e.backend, nil
 		}
-		if removed := p.removeLocked(e.elem); removed != nil {
+		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
 			toClose = append(toClose, removed)
 		}
 	}
@@ -266,7 +266,7 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 	for p.order.Len() > p.maxSize {
 		oldest := p.order.Back()
 		if oldest != nil {
-			if removed := p.removeLocked(oldest); removed != nil {
+			if removed := p.removeLocked(oldest, "evict"); removed != nil {
 				toClose = append(toClose, removed)
 			}
 		}
@@ -316,7 +316,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 				zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 			return e.backend, p.makeRelease(e), nil
 		}
-		if removed := p.removeLocked(e.elem); removed != nil {
+		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
 			toClose = append(toClose, removed)
 		}
 		p.mu.Unlock()
@@ -351,7 +351,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 				zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 			return e.backend, p.makeRelease(e), nil
 		}
-		if removed := p.removeLocked(e.elem); removed != nil {
+		if removed := p.removeLocked(e.elem, "replace"); removed != nil {
 			toClose = append(toClose, removed)
 		}
 	}
@@ -361,7 +361,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	for p.order.Len() > p.maxSize {
 		oldest := p.order.Back()
 		if oldest != nil {
-			if removed := p.removeLocked(oldest); removed != nil {
+			if removed := p.removeLocked(oldest, "evict"); removed != nil {
 				toClose = append(toClose, removed)
 			}
 		}
@@ -392,7 +392,7 @@ func (p *Pool) Invalidate(tenantID string) {
 	var toClose *entry
 	p.mu.Lock()
 	if e, ok := p.items[tenantID]; ok {
-		toClose = p.removeLocked(e.elem)
+		toClose = p.removeLocked(e.elem, "invalidate")
 	}
 	p.mu.Unlock()
 	closeEntry(toClose)
@@ -435,7 +435,7 @@ func (p *Pool) InvalidateAndWait(ctx context.Context, tenantID string) error {
 	p.mu.Lock()
 	if e, ok := p.items[tenantID]; ok {
 		retired = e
-		toClose = p.removeLocked(e.elem)
+		toClose = p.removeLocked(e.elem, "invalidate")
 	}
 	p.mu.Unlock()
 	closeEntry(toClose)
@@ -548,7 +548,7 @@ func (p *Pool) Close() {
 	toClose := make([]*entry, 0, p.order.Len())
 	p.mu.Lock()
 	for p.order.Len() > 0 {
-		if removed := p.removeLocked(p.order.Back()); removed != nil {
+		if removed := p.removeLocked(p.order.Back(), "shutdown"); removed != nil {
 			toClose = append(toClose, removed)
 		}
 	}
@@ -965,13 +965,17 @@ func (p *Pool) wireQuotaStore(ctx context.Context, b *backend.Dat9Backend, tenan
 	b.SetMetaQuotaStore(ctx, tenantID, adapter)
 }
 
-func (p *Pool) removeLocked(elem *list.Element) *entry {
+// removeLocked drops elem from the pool. reason distinguishes capacity eviction
+// ("evict") from entry replacement ("replace"), explicit invalidation
+// ("invalidate"), and pool shutdown ("shutdown") so the tenant_pool/remove metric
+// doesn't conflate them — only result="evict" reflects real cache pressure.
+func (p *Pool) removeLocked(elem *list.Element, reason string) *entry {
 	e := elem.Value.(*entry)
 	p.order.Remove(elem)
 	e.elem = nil
 	delete(p.items, e.tenantID)
 	e.retired = true
-	metrics.RecordOperation("tenant_pool", "evict", "ok", 0)
+	metrics.RecordOperation("tenant_pool", "remove", reason, 0)
 	if e.refs == 0 {
 		return e
 	}
