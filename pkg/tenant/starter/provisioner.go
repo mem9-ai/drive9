@@ -62,12 +62,14 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 
 func (p *Provisioner) ProviderType() string { return tenant.ProviderTiDBCloudStarter }
 
+// InitSchema repairs known launch-schema drift (for example, missing uploads
+// columns from legacy tenants) and validates the TiDB auto-embedding contract.
 func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
-	return nil
+	return schema.EnsureTiDBSchemaForModeDSN(ctx, dsn, schema.TiDBEmbeddingModeAuto)
 }
 
 func (p *Provisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, dsn string, profile schema.TiDBAutoEmbeddingProfile) error {
-	return nil
+	return schema.EnsureTiDBSchemaForAutoEmbeddingProfileDSN(ctx, dsn, profile)
 }
 
 func (p *Provisioner) Provision(ctx context.Context, tenantID string) (*tenant.ClusterInfo, error) {

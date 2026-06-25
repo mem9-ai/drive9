@@ -125,6 +125,8 @@ func (p *Provisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, b
 func (p *Provisioner) ProvisioningRegion() string { return p.region }
 
 func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
+	// Direct callers still need database creation; the server auto-embedding
+	// path hoists the same ensure before provider pre-configuration.
 	if err := p.EnsureDatabase(ctx, dsn); err != nil {
 		return err
 	}

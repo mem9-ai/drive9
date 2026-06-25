@@ -92,6 +92,8 @@ func ExecSchemaStatementsParallelByTableContext(ctx context.Context, db *sql.DB,
 	wg.Wait()
 	close(errCh)
 	for err := range errCh {
+		// Return the first completed group failure; all groups see the cancelled
+		// context before starting the next statement.
 		return err
 	}
 	return nil

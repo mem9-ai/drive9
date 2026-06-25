@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -179,6 +180,7 @@ func (f *fakeProvisioner) ProvisionCallCount() int {
 
 type profileAwareFakeProvisioner struct {
 	fakeProvisioner
+	mu               sync.Mutex
 	profileInitCalls atomic.Int32
 	ensureDBCalls    atomic.Int32
 	lastProfile      tenantschema.TiDBAutoEmbeddingProfile
@@ -189,6 +191,8 @@ type profileAwareFakeProvisioner struct {
 
 func (f *profileAwareFakeProvisioner) EnsureDatabase(_ context.Context, dsn string) error {
 	f.ensureDBCalls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.lastEnsureDSN = dsn
 	f.callOrder = append(f.callOrder, "ensure")
 	return f.ensureDBErr
@@ -196,9 +200,17 @@ func (f *profileAwareFakeProvisioner) EnsureDatabase(_ context.Context, dsn stri
 
 func (f *profileAwareFakeProvisioner) InitSchemaForAutoEmbeddingProfile(_ context.Context, _ string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
 	f.profileInitCalls.Add(1)
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.lastProfile = profile
 	f.callOrder = append(f.callOrder, "profile-init")
 	return nil
+}
+
+func (f *profileAwareFakeProvisioner) callOrderString() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return strings.Join(f.callOrder, ",")
 }
 
 func TestSchemaInitForTenantEnsuresDatabaseBeforeAutoEmbeddingConfig(t *testing.T) {
@@ -262,7 +274,7 @@ func TestSchemaInitForTenantEnsuresDatabaseBeforeProfileInit(t *testing.T) {
 	if prov.profileInitCalls.Load() != 1 {
 		t.Fatalf("profile init calls = %d, want 1", prov.profileInitCalls.Load())
 	}
-	if got, want := strings.Join(prov.callOrder, ","), "ensure,profile-init"; got != want {
+	if got, want := prov.callOrderString(), "ensure,profile-init"; got != want {
 		t.Fatalf("call order = %s, want %s", got, want)
 	}
 }
