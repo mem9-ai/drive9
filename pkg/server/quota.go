@@ -256,8 +256,6 @@ func (s *Server) rejectQuotaSetForTenantStatus(t *meta.Tenant) error {
 		return fmt.Errorf("tenant is still provisioning")
 	case meta.TenantDeleting:
 		return fmt.Errorf("tenant is deleting")
-	case meta.TenantDeleted:
-		return fmt.Errorf("tenant not found")
 	default:
 		return nil
 	}

@@ -4217,6 +4217,12 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				})
 			} else {
 				err = fmt.Errorf("provisioner does not support create-time quota")
+				logger.Error(ctx, "server_event", eventFields(ctx, "provision_create_time_quota_not_supported", "tenant_id", tenantID, "provider", provider, "error", err)...)
+				metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+				if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+					logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+				}
+				return nil, newProvisionTenantError(http.StatusInternalServerError, "provisioner does not support create-time quota", err)
 			}
 		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
 			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
@@ -4314,8 +4320,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
 			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
-			return nil, newProvisionTenantError(http.StatusBadGateway, "failed to set tenant quota", err)
+			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to set tenant quota", err)
 		}
+		// The TiDB Cloud spending limit is applied in the create-cluster request and
+		// remains cloud-side; list/get quota reads it back from TiDB Cloud.
 		if provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
 			metricEvent(ctx, "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
 		}

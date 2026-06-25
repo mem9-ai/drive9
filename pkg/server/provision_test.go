@@ -203,6 +203,29 @@ func (f *fakeProvisioner) ProvisionCallCount() int {
 	return int(f.provisionCalls.Load())
 }
 
+type credentialOnlyProvisioner struct {
+	provider string
+	cluster  *tenant.ClusterInfo
+}
+
+func (f *credentialOnlyProvisioner) ProviderType() string { return f.provider }
+
+func (f *credentialOnlyProvisioner) InitSchema(_ context.Context, _ string) error { return nil }
+
+func (f *credentialOnlyProvisioner) Provision(_ context.Context, tenantID string) (*tenant.ClusterInfo, error) {
+	out := *f.cluster
+	out.TenantID = tenantID
+	out.Provider = f.provider
+	return &out, nil
+}
+
+func (f *credentialOnlyProvisioner) ProvisionWithCredentials(_ context.Context, tenantID string, _ tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	out := *f.cluster
+	out.TenantID = tenantID
+	out.Provider = f.provider
+	return &out, nil
+}
+
 type profileAwareFakeProvisioner struct {
 	fakeProvisioner
 	mu               sync.Mutex
@@ -755,6 +778,158 @@ func TestProvisionTiDBCloudNativeCreateQuotaSkipsQuotaPatch(t *testing.T) {
 	}
 	if cfg.MaxStorageBytes != maxStorageSize*quotaStorageSizeBytes {
 		t.Fatalf("quota max storage = %d, want %d", cfg.MaxStorageBytes, maxStorageSize*quotaStorageSizeBytes)
+	}
+}
+
+func TestProvisionTiDBCloudNativeCreateTimeQuotaRequiresQuotaProvisioner(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &credentialOnlyProvisioner{
+		provider: tenant.ProviderTiDBCloudNative,
+		cluster: &tenant.ClusterInfo{
+			ClusterID:      "native-cluster-no-quota-provisioner",
+			OrganizationID: "org-1",
+			Host:           "db.example",
+			Port:           4000,
+			Username:       "u1.root",
+			Password:       "db-pass",
+			DBName:         "customer_db",
+		},
+	}
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	spendingLimit := int64(10000)
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: &cred,
+		Quota: &quotaRequest{quotaFields: quotaFields{
+			TiDBCloudSpendingLimit: &spendingLimit,
+		}},
+	})
+	if err == nil {
+		t.Fatal("provisionTenant error = nil, want unsupported create-time quota error")
+	}
+	var provisionErr *provisionTenantError
+	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusInternalServerError {
+		t.Fatalf("provision error = %#v, want 500 provisionTenantError", err)
+	}
+	var status string
+	if err := metaStore.DB().QueryRow("SELECT status FROM tenants").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantFailed) {
+		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
+	}
+}
+
+func TestProvisionTiDBCloudNativeCreateTimeQuotaLocalPersistenceErrorIsInternal(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	if _, err := metaStore.DB().Exec("RENAME TABLE tenant_quota_config TO tenant_quota_config_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = metaStore.DB().Exec("RENAME TABLE tenant_quota_config_unavailable TO tenant_quota_config")
+	})
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		cluster: &tenant.ClusterInfo{
+			ClusterID:      "native-cluster-quota-local-error",
+			OrganizationID: "org-1",
+			Host:           "db.example",
+			Port:           4000,
+			Username:       "u1.root",
+			Password:       "db-pass",
+			DBName:         "customer_db",
+		},
+	}
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	maxStorageSize := int64(1000)
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: &cred,
+		Quota: &quotaRequest{quotaFields: quotaFields{
+			MaxStorageSize: &maxStorageSize,
+		}},
+	})
+	if err == nil {
+		t.Fatal("provisionTenant error = nil, want quota persistence error")
+	}
+	var provisionErr *provisionTenantError
+	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusInternalServerError {
+		t.Fatalf("provision error = %#v, want 500 provisionTenantError", err)
+	}
+	if got := prov.deprovisionCalls.Load(); got != 1 {
+		t.Fatalf("deprovision calls = %d, want 1", got)
+	}
+	var status string
+	if err := metaStore.DB().QueryRow("SELECT status FROM tenants").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantFailed) {
+		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
 }
 
