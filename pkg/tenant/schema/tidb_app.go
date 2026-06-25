@@ -214,7 +214,7 @@ func initTiDBAppEmbeddingSchema(ctx context.Context, dsn string, opts InitTiDBTe
 	if err := repairMySQLPathHashSchema(ctx, db); err != nil {
 		return err
 	}
-	if err := ExecSchemaStatementsContext(ctx, db, tidbAppEmbeddingBaseSchemaStatements()); err != nil {
+	if err := ExecSchemaStatementsParallelByTableContext(ctx, db, tidbAppEmbeddingBaseSchemaStatements()); err != nil {
 		return err
 	}
 	if opts.AllowUnsupportedOptionalIndexes {

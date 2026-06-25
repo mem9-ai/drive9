@@ -92,6 +92,10 @@ type autoEmbeddingSchemaProvisioner interface {
 	InitSchemaForAutoEmbeddingProfile(context.Context, string, tenantschema.TiDBAutoEmbeddingProfile) error
 }
 
+type tenantDatabaseEnsurer interface {
+	EnsureDatabase(context.Context, string) error
+}
+
 type credentialProvisionRequestValidator interface {
 	ValidateCredentialProvisionRequest(tenant.CredentialProvisionRequest) error
 }
@@ -4104,6 +4108,11 @@ func (s *Server) schemaInitForTenant(tenantID, provider string, fallback func(co
 		return fallback
 	}
 	return func(ctx context.Context, dsn string) error {
+		if ensurer, ok := s.provisioner.(tenantDatabaseEnsurer); ok {
+			if err := ensurer.EnsureDatabase(ctx, dsn); err != nil {
+				return fmt.Errorf("ensure tenant database: %w", err)
+			}
+		}
 		profile, err := s.autoEmbeddingProfileForTenant(ctx, tenantID)
 		if err != nil {
 			return fmt.Errorf("resolve tenant auto-embedding profile: %w", err)

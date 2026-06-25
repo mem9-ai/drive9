@@ -1209,7 +1209,7 @@ func initTiDBAutoEmbeddingSchemaWithProfile(ctx context.Context, dsn string, pro
 	if err := repairMySQLPathHashSchema(ctx, db); err != nil {
 		return err
 	}
-	if err := ExecSchemaStatementsContext(ctx, db, tidbAutoEmbeddingSchemaStatementsForConfig(render)); err != nil {
+	if err := ExecSchemaStatementsParallelByTableContext(ctx, db, tidbAutoEmbeddingSchemaStatementsForConfig(render)); err != nil {
 		return err
 	}
 	if err := EnsureTiDBSchemaForAutoEmbeddingProfile(ctx, db, profile); err != nil {
