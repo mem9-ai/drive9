@@ -30,6 +30,7 @@ func Create(args []string) error {
 	publicKeyGiven := false
 	privateKeyFlag := ""
 	privateKeyGiven := false
+	var tidbCloudSpendingLimit *int64
 	asJSON := false
 
 	for i := 0; i < len(args); i++ {
@@ -71,6 +72,16 @@ func Create(args []string) error {
 			i++
 			privateKeyFlag = args[i]
 			privateKeyGiven = true
+		case "--tidbcloud-spending-limit":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--tidbcloud-spending-limit requires an argument")
+			}
+			i++
+			v, err := parseNonNegativeQuotaInt64Flag("--tidbcloud-spending-limit", args[i])
+			if err != nil {
+				return err
+			}
+			tidbCloudSpendingLimit = &v
 		case "--json":
 			asJSON = true
 		default:
@@ -118,11 +129,18 @@ func Create(args []string) error {
 	privateKey = strings.TrimSpace(privateKey)
 
 	mode := provisionModeForCredentials(publicKey, privateKey)
+	if tidbCloudSpendingLimit != nil && mode != RegionModeTiDBCloudNative {
+		return fmt.Errorf("TiDBCloud Mode requires --tidbcloud-public-key and --tidbcloud-private-key when --tidbcloud-spending-limit is set")
+	}
 	if mode == RegionModeTiDBCloudNative && (publicKey == "" || privateKey == "") {
-		return fmt.Errorf("TiDBCloud mode requires --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
+		return fmt.Errorf("TiDBCloud Mode requires --tidbcloud-public-key and --tidbcloud-private-key, or %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
 	}
 	if mode == RegionModeTiDBCloudNative && strings.TrimSpace(serverFlag) == "" && strings.TrimSpace(regionCode) == "" {
-		return fmt.Errorf("TiDBCloud mode requires --region-code or --server; use drive9 region list to see available regions")
+		return fmt.Errorf("TiDBCloud Mode requires --region-code or --server; use drive9 region list to see available regions")
+	}
+	if mode == RegionModeTiDBCloudNative && tidbCloudSpendingLimit == nil {
+		defaultSpendingLimit := int64(0)
+		tidbCloudSpendingLimit = &defaultSpendingLimit
 	}
 	server, regionEntry, err := resolveProvisionServer(serverFlag, regionCode, mode, r.Server)
 	if err != nil {
@@ -143,7 +161,7 @@ func Create(args []string) error {
 		return fmt.Errorf("context %q already exists; use a different name", name)
 	}
 
-	body, err := provisionRequestBody(publicKey, privateKey)
+	body, err := provisionRequestBody(publicKey, privateKey, tidbCloudSpendingLimit)
 	if err != nil {
 		return err
 	}
@@ -159,7 +177,7 @@ func Create(args []string) error {
 			Error string `json:"error"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&errResp)
-		return fmt.Errorf("provision failed (HTTP %d): %s", resp.StatusCode, errResp.Error)
+		return fmt.Errorf("provision failed (HTTP %d): %s", resp.StatusCode, createProvisionErrorHint(errResp.Error))
 	}
 
 	var result createResult
@@ -250,8 +268,9 @@ flags:
   --name NAME                     context name (default: auto-generated 7-char name)
   --region-code CODE              provisioning region code; use "drive9 region list" to see available regions
   --server URL                    override the server URL (bypasses region manifest lookup)
-  --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud mode)
-  --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud mode)
+  --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud Mode)
+  --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud Mode)
+  --tidbcloud-spending-limit N    TiDB Cloud Cluster Spending Limit; must be non-negative (default: 0 in TiDBCloud Mode)
   --json                          output result as JSON
 
 examples:
@@ -261,7 +280,8 @@ examples:
   # provision a TiDBCloud tenant in ap-southeast-1
   drive9 create --region-code aws-ap-southeast-1 \
     --tidbcloud-public-key <public-key> \
-    --tidbcloud-private-key <private-key>
+    --tidbcloud-private-key <private-key> \
+    --tidbcloud-spending-limit 10000
 
   # provision directly against a known server
   drive9 create --server http://127.0.0.1:9009
@@ -279,22 +299,36 @@ func provisionModeForCredentials(publicKey, privateKey string) string {
 	return RegionModeTiDBCloudStarter
 }
 
-func provisionRequestBody(publicKey, privateKey string) (io.Reader, error) {
-	if publicKey == "" && privateKey == "" {
+func provisionRequestBody(publicKey, privateKey string, tidbCloudSpendingLimit *int64) (io.Reader, error) {
+	if publicKey == "" && privateKey == "" && tidbCloudSpendingLimit == nil {
 		return nil, nil
 	}
 	if publicKey == "" || privateKey == "" {
-		return nil, fmt.Errorf("TiDBCloud mode requires both public and private keys")
+		return nil, fmt.Errorf("TiDBCloud Mode requires both public and private keys")
 	}
-	body := map[string]string{
+	body := map[string]any{
 		"public_key":  publicKey,
 		"private_key": privateKey,
+	}
+	if tidbCloudSpendingLimit != nil {
+		body["tidbcloud_spending_limit"] = *tidbCloudSpendingLimit
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return nil, err
 	}
 	return bytes.NewReader(raw), nil
+}
+
+func createProvisionErrorHint(msg string) string {
+	trimmed := strings.TrimSpace(msg)
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "free quota") || strings.Contains(lower, "free cluster") || strings.Contains(lower, "usage quota") {
+		if !strings.Contains(lower, "--tidbcloud-spending-limit") {
+			return trimmed + "; retry with --tidbcloud-spending-limit N to set a TiDB Cloud Cluster Spending Limit"
+		}
+	}
+	return trimmed
 }
 
 func resolveProvisionServer(serverFlag, regionCode, mode, fallbackServer string) (string, *RegionManifestEntry, error) {
@@ -540,13 +574,13 @@ func deleteUsage() string {
 	return `usage: drive9 delete [flags]
 
 delete the current tenant. The tenant's TiDB Cloud cluster, database, and API
-keys are removed. For TiDBCloud mode, TiDB Cloud credentials must be provided.
+keys are removed. For TiDBCloud Mode, TiDB Cloud credentials must be provided.
 
 flags:
   --server URL                    server URL (default: active context server)
   --api-key KEY                   owner API key (default: active context API key)
-  --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud mode)
-  --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud mode)
+  --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud Mode)
+  --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud Mode)
   --json                          output result as JSON
   -y, --yes                       skip confirmation prompt
 
@@ -566,7 +600,7 @@ func deprovisionRequestBody(publicKey, privateKey string) (io.Reader, error) {
 		return nil, nil
 	}
 	if publicKey == "" || privateKey == "" {
-		return nil, fmt.Errorf("TiDBCloud mode requires both public and private keys for delete")
+		return nil, fmt.Errorf("TiDBCloud Mode requires both public and private keys for delete")
 	}
 	raw, err := json.Marshal(map[string]string{
 		"public_key":  publicKey,

@@ -34,12 +34,18 @@ type fakeProvisioner struct {
 	systemUsername    string
 	systemPassword    string
 	deprovisionErr    error
+	quotaMarkErr      error
+	quotaUpdateErr    error
 	provisionCalls    atomic.Int32
 	credentialCalls   atomic.Int32
 	systemUserCalls   atomic.Int32
 	deprovisionCalls  atomic.Int32
+	quotaMarkCalls    atomic.Int32
+	quotaUpdateCalls  atomic.Int32
 	lastCredentialReq tenant.CredentialProvisionRequest
 	lastDeprovision   *tenant.ClusterInfo
+	lastQuotaCluster  *tenant.ClusterInfo
+	lastQuotaOptions  tenant.QuotaUpdateOptions
 	defaultPublicKey  string
 	defaultPrivateKey string
 }
@@ -135,6 +141,36 @@ func (f *fakeProvisioner) DeprovisionWithCredentials(_ context.Context, cluster 
 		f.lastDeprovision = &out
 	}
 	return f.deprovisionErr
+}
+
+func (f *fakeProvisioner) MarkQuotaUpdateStarted(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.QuotaCloudConfig, error) {
+	f.quotaMarkCalls.Add(1)
+	f.lastCredentialReq = req
+	if cluster != nil {
+		out := *cluster
+		f.lastQuotaCluster = &out
+	}
+	if f.quotaMarkErr != nil {
+		return nil, f.quotaMarkErr
+	}
+	return nil, nil
+}
+
+func (f *fakeProvisioner) UpdateQuota(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
+	f.quotaUpdateCalls.Add(1)
+	f.lastCredentialReq = req
+	f.lastQuotaOptions = opts
+	if cluster != nil {
+		out := *cluster
+		f.lastQuotaCluster = &out
+	}
+	if f.quotaUpdateErr != nil {
+		return nil, f.quotaUpdateErr
+	}
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		return &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: opts.TiDBCloudSpendingLimitMonthly}, nil
+	}
+	return nil, nil
 }
 
 func (f *fakeProvisioner) ProvisionCallCount() int {
@@ -394,12 +430,13 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 		t.Fatal(err)
 	}
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cloudProvider: "aws", region: "us-east-1", cluster: &tenant.ClusterInfo{
-		ClusterID: "native-cluster-1",
-		Host:      "db.example",
-		Port:      4000,
-		Username:  "u1.root",
-		Password:  "db-pass",
-		DBName:    "customer_db",
+		ClusterID:      "native-cluster-1",
+		OrganizationID: "org-1",
+		Host:           "db.example",
+		Port:           4000,
+		Username:       "u1.root",
+		Password:       "db-pass",
+		DBName:         "customer_db",
 	}}
 
 	srv := NewWithConfig(Config{
@@ -412,9 +449,11 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
+	spendingLimit := int64(10000)
 	body, _ := json.Marshal(map[string]any{
-		"public_key":  "public-1",
-		"private_key": "private-1",
+		"public_key":               "public-1",
+		"private_key":              "private-1",
+		"tidbcloud_spending_limit": spendingLimit,
 	})
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -431,6 +470,15 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	}
 	if got := prov.credentialCalls.Load(); got != 1 {
 		t.Fatalf("credential provision calls = %d, want 1", got)
+	}
+	if got := prov.quotaMarkCalls.Load(); got != 1 {
+		t.Fatalf("quota mark calls = %d, want 1", got)
+	}
+	if got := prov.quotaUpdateCalls.Load(); got != 1 {
+		t.Fatalf("quota update calls = %d, want 1", got)
+	}
+	if prov.lastQuotaOptions.TiDBCloudSpendingLimitMonthly == nil || *prov.lastQuotaOptions.TiDBCloudSpendingLimitMonthly != spendingLimit {
+		t.Fatalf("quota spending limit = %#v, want %d", prov.lastQuotaOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
 	}
 	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
 		t.Fatalf("credential request = %+v", prov.lastCredentialReq)
@@ -468,6 +516,13 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	if got := prov.systemUserCalls.Load(); got == 0 {
 		t.Fatal("native system user setup was not called")
 	}
+	binding, err := metaStore.GetTenantTiDBCloudOrgBinding(context.Background(), out["tenant_id"])
+	if err != nil {
+		t.Fatalf("get tidbcloud org binding: %v", err)
+	}
+	if binding.OrganizationID != "org-1" || binding.ClusterID != "native-cluster-1" {
+		t.Fatalf("binding = %#v", binding)
+	}
 
 	var provider, dbName, dbUser string
 	var passCipher []byte
@@ -486,6 +541,182 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	}
 	if string(plain) != "system-pass" {
 		t.Fatalf("tenant db password = %q, want system password", plain)
+	}
+}
+
+func TestProvisionTiDBCloudNativeCleansClusterWhenCreateQuotaFails(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		quotaMarkErr:  tenant.ErrQuotaPermissionDenied,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		cluster: &tenant.ClusterInfo{
+			ClusterID:      "native-cluster-quota-fail",
+			OrganizationID: "org-1",
+			Host:           "db.example",
+			Port:           4000,
+			Username:       "u1.root",
+			Password:       "db-pass",
+			DBName:         "customer_db",
+		},
+	}
+
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	maxStorageSize := int64(1000)
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: &cred,
+		Quota:                 &quotaRequest{quotaFields: quotaFields{MaxStorageSize: &maxStorageSize}},
+	})
+	if err == nil {
+		t.Fatal("provisionTenant error = nil, want quota error")
+	}
+	var provisionErr *provisionTenantError
+	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusForbidden {
+		t.Fatalf("provision error = %#v, want 403 provisionTenantError", err)
+	}
+	if got := prov.quotaMarkCalls.Load(); got != 1 {
+		t.Errorf("quota mark calls = %d, want 1", got)
+	}
+	if got := prov.deprovisionCalls.Load(); got != 1 {
+		t.Errorf("deprovision calls = %d, want 1", got)
+	}
+	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "native-cluster-quota-fail" {
+		t.Errorf("deprovision cluster = %#v", prov.lastDeprovision)
+	}
+	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
+		t.Errorf("cleanup credentials = %+v", prov.lastCredentialReq)
+	}
+
+	var tenantID, status string
+	if err := metaStore.DB().QueryRow("SELECT id, status FROM tenants WHERE cluster_id = ?", "native-cluster-quota-fail").Scan(&tenantID, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantFailed) {
+		t.Errorf("tenant status = %s, want %s", status, meta.TenantFailed)
+	}
+	var apiKeyCount int
+	if err := metaStore.DB().QueryRow("SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ?", tenantID).Scan(&apiKeyCount); err != nil {
+		t.Fatal(err)
+	}
+	if apiKeyCount != 0 {
+		t.Errorf("api key count = %d, want 0", apiKeyCount)
+	}
+}
+
+func TestProvisionTiDBCloudNativeCleansClusterWhenOrgBindingMissing(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		cluster: &tenant.ClusterInfo{
+			ClusterID: "native-cluster-missing-org",
+			Host:      "db.example",
+			Port:      4000,
+			Username:  "u1.root",
+			Password:  "db-pass",
+			DBName:    "customer_db",
+		},
+	}
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: &cred,
+	})
+	if err == nil {
+		t.Fatal("provisionTenant error = nil, want org binding error")
+	}
+	var provisionErr *provisionTenantError
+	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusBadGateway {
+		t.Fatalf("provision error = %#v, want 502 provisionTenantError", err)
+	}
+	if got := prov.deprovisionCalls.Load(); got != 1 {
+		t.Fatalf("deprovision calls = %d, want 1", got)
+	}
+	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "native-cluster-missing-org" {
+		t.Fatalf("deprovision cluster = %#v", prov.lastDeprovision)
+	}
+	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
+		t.Fatalf("cleanup credentials = %+v", prov.lastCredentialReq)
+	}
+
+	var tenantID, status string
+	if err := metaStore.DB().QueryRow("SELECT id, status FROM tenants").Scan(&tenantID, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantFailed) {
+		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
+	}
+	var bindingCount int
+	if err := metaStore.DB().QueryRow("SELECT COUNT(*) FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?", tenantID).Scan(&bindingCount); err != nil {
+		t.Fatal(err)
+	}
+	if bindingCount != 0 {
+		t.Fatalf("binding count = %d, want 0", bindingCount)
 	}
 }
 
@@ -567,6 +798,77 @@ func TestDecodeCredentialProvisionRequestRejectsOversizedBody(t *testing.T) {
 	var maxErr *http.MaxBytesError
 	if !errors.As(err, &maxErr) {
 		t.Fatalf("error = %v, want MaxBytesError", err)
+	}
+}
+
+func TestProvisionTiDBCloudNativeRejectsQuotaWithoutCredentials(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider:          tenant.ProviderTiDBCloudNative,
+		cluster:           &tenant.ClusterInfo{},
+		defaultPublicKey:  "default-public",
+		defaultPrivateKey: "default-private",
+	}
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	spendingLimit := int64(10000)
+	body, _ := json.Marshal(map[string]any{
+		"tidbcloud_spending_limit": spendingLimit,
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if got := prov.credentialCalls.Load(); got != 0 {
+		t.Fatalf("credential provision calls = %d, want 0", got)
+	}
+	if got := prov.quotaUpdateCalls.Load(); got != 0 {
+		t.Fatalf("quota update calls = %d, want 0", got)
+	}
+	msg, _ := raw["error"].(string)
+	if !strings.Contains(strings.ToLower(msg), "requires public_key and private_key when quota settings are provided") {
+		t.Fatalf("error = %#v", raw)
 	}
 }
 
@@ -1366,10 +1668,10 @@ func TestProvisionTiDBCloudNativeRejectsPartialCredentials(t *testing.T) {
 	}
 	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative, cluster: &tenant.ClusterInfo{}}
 	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        pool,
-		Provisioner: prov,
-		TokenSecret: tokenSecret,
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -1415,15 +1717,15 @@ func TestProvisionTiDBCloudNativeUsesDefaultCredentialsWhenOmitted(t *testing.T)
 	}
 	prov := &fakeProvisioner{
 		provider:          tenant.ProviderTiDBCloudNative,
-		cluster:           &tenant.ClusterInfo{},
+		cluster:           &tenant.ClusterInfo{ClusterID: "native-cluster-default", OrganizationID: "org-default"},
 		defaultPublicKey:  "default-pk",
 		defaultPrivateKey: "default-sk",
 	}
 	srv := NewWithConfig(Config{
-		Meta:        metaStore,
-		Pool:        pool,
-		Provisioner: prov,
-		TokenSecret: tokenSecret,
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
 		DisableDatabaseAutoEmbedding: true,
 	})
 	defer srv.Close()
@@ -1444,5 +1746,16 @@ func TestProvisionTiDBCloudNativeUsesDefaultCredentialsWhenOmitted(t *testing.T)
 	}
 	if prov.lastCredentialReq.PublicKey != "default-pk" || prov.lastCredentialReq.PrivateKey != "default-sk" {
 		t.Fatalf("credentials = %s/%s, want default-pk/default-sk", prov.lastCredentialReq.PublicKey, prov.lastCredentialReq.PrivateKey)
+	}
+	var out map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	binding, err := metaStore.GetTenantTiDBCloudOrgBinding(context.Background(), out["tenant_id"])
+	if err != nil {
+		t.Fatalf("get tidbcloud org binding: %v", err)
+	}
+	if binding.OrganizationID != "org-default" || binding.ClusterID != "native-cluster-default" {
+		t.Fatalf("binding = %#v", binding)
 	}
 }

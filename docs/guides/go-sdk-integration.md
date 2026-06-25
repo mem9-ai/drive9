@@ -82,16 +82,15 @@ Use `client.NewWithToken` only when you intentionally hold a delegated
 capability token, such as a vault JWT. Filesystem commands normally use
 `client.New`.
 
-## Quota API
+## Admin Tenant And Quota API
 
-The SDK exposes typed quota helpers in `pkg/client`; with this guide's import
-alias they return `*drive9.QuotaResponse`. See
+The SDK exposes typed admin tenant and quota helpers in `pkg/client`. See
 [`docs/guides/quota.md`](quota.md) for the full CLI and HTTP reference.
 
-Query a `tidb_cloud_native` tenant:
+Get a `tidb_cloud_native` tenant with quota:
 
 ```go
-quota, err := drive9.New(serverURL, "").GetQuota(ctx, drive9.QuotaRequest{
+tenant, err := drive9.New(serverURL, "").AdminGetTenant(ctx, drive9.QuotaRequest{
 	TenantID:   "tnt_abc123",
 	PublicKey:  tidbCloudPublicKey,
 	PrivateKey: tidbCloudPrivateKey,
@@ -99,6 +98,7 @@ quota, err := drive9.New(serverURL, "").GetQuota(ctx, drive9.QuotaRequest{
 if err != nil {
 	return err
 }
+quota := tenant.Quota
 _ = quota.Config.MaxStorageSize
 _ = quota.Config.MaxFileSize
 _ = quota.Config.MaxFileCount
@@ -118,7 +118,7 @@ fileSize := int64(1024)
 fileCount := int64(100000)
 spendingLimit := int64(10000)
 
-quota, err := drive9.New(serverURL, "").SetQuota(ctx, drive9.QuotaSetRequest{
+quota, err := drive9.New(serverURL, "").AdminSetTenantQuota(ctx, drive9.QuotaSetRequest{
 	TenantID:               "tnt_abc123",
 	PublicKey:              tidbCloudPublicKey,
 	PrivateKey:             tidbCloudPrivateKey,

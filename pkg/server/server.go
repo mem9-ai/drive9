@@ -307,6 +307,8 @@ func NewWithConfig(cfg Config) *Server {
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
 	mux.Handle("/v1/quota", s.quotaRootHandler(cfg))
+	mux.Handle("/v1/admin/tenants", s.adminTenantsRootHandler())
+	mux.Handle("/v1/admin/tenants/", s.adminTenantsItemHandler())
 	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
@@ -3753,8 +3755,9 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var credentialReq *tenant.CredentialProvisionRequest
+	var quotaReq *quotaRequest
 	if provider == tenant.ProviderTiDBCloudNative {
-		req, err := decodeCredentialProvisionRequest(w, r)
+		decoded, err := decodeCredentialProvisionRequest(w, r)
 		if err != nil {
 			if !errors.Is(err, tenant.ErrCredentialsRequired) {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
@@ -3762,21 +3765,30 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			req = resolveDefaultCredentials(s.provisioner)
-			if req == nil {
+			if decoded != nil && decoded.Quota != nil {
+				errJSON(w, http.StatusBadRequest, "TiDBCloud Mode requires public_key and private_key when quota settings are provided")
+				return
+			}
+			defaultReq := resolveDefaultCredentials(s.provisioner)
+			if defaultReq == nil {
 				errJSON(w, http.StatusBadRequest, tenant.ErrCredentialsRequired.Error())
 				return
 			}
+			if decoded == nil {
+				decoded = &credentialProvisionRequest{}
+			}
+			decoded.Credential = defaultReq
 		}
 		if validator, ok := s.provisioner.(credentialProvisionRequestValidator); ok {
-			if err := validator.ValidateCredentialProvisionRequest(*req); err != nil {
+			if err := validator.ValidateCredentialProvisionRequest(*decoded.Credential); err != nil {
 				logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "provision_invalid_request", "provider", provider, "error", err)...)
 				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 				errJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
 		}
-		credentialReq = req
+		credentialReq = decoded.Credential
+		quotaReq = decoded.Quota
 	} else {
 		if err := rejectCredentialProvisionBody(r); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider, "error", err)...)
@@ -3789,6 +3801,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		KeyName:               "default",
 		TokenVersion:          1,
 		CredentialProvisioner: credentialReq,
+		Quota:                 quotaReq,
 	})
 	if err != nil {
 		var pe *provisionTenantError
@@ -3832,17 +3845,46 @@ func resolveDefaultCredentials(p tenant.Provisioner) *tenant.CredentialProvision
 	return nil
 }
 
-func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*tenant.CredentialProvisionRequest, error) {
+type credentialProvisionRequest struct {
+	Credential *tenant.CredentialProvisionRequest
+	Quota      *quotaRequest
+}
+
+func decodeCredentialProvisionRequest(w http.ResponseWriter, r *http.Request) (*credentialProvisionRequest, error) {
 	var req struct {
 		PublicKey  string `json:"public_key"`
 		PrivateKey string `json:"private_key"`
+		quotaFields
 	}
-	return decodeCredentialRequest(w, r, &req, func() tenant.CredentialProvisionRequest {
-		return tenant.CredentialProvisionRequest{
-			PublicKey:  strings.TrimSpace(req.PublicKey),
-			PrivateKey: strings.TrimSpace(req.PrivateKey),
+	if r.Body != nil {
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxCredentialProvisionBodyBytes))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("invalid JSON body: %w", err)
 		}
-	})
+		var extra struct{}
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("invalid JSON body: trailing data")
+		}
+	}
+	out := &credentialProvisionRequest{}
+	if req.anySet() {
+		out.Quota = &quotaRequest{
+			quotaFields: req.quotaFields,
+		}
+	}
+	cred := tenant.CredentialProvisionRequest{
+		PublicKey:  strings.TrimSpace(req.PublicKey),
+		PrivateKey: strings.TrimSpace(req.PrivateKey),
+	}
+	if cred.PublicKey == "" && cred.PrivateKey == "" {
+		return out, tenant.ErrCredentialsRequired
+	}
+	if cred.PublicKey == "" || cred.PrivateKey == "" {
+		return nil, tenant.ErrPartialCredentials
+	}
+	out.Credential = &cred
+	return out, nil
 }
 
 func decodeCredentialRequest(w http.ResponseWriter, r *http.Request, raw any, build func() tenant.CredentialProvisionRequest) (*tenant.CredentialProvisionRequest, error) {
@@ -3885,6 +3927,7 @@ func rejectCredentialProvisionBody(r *http.Request) error {
 	var raw struct {
 		PublicKey  string `json:"public_key"`
 		PrivateKey string `json:"private_key"`
+		quotaFields
 	}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return fmt.Errorf("invalid JSON body: %w", err)
@@ -3894,6 +3937,9 @@ func rejectCredentialProvisionBody(r *http.Request) error {
 	}
 	if strings.TrimSpace(raw.PrivateKey) != "" {
 		return fmt.Errorf("tidbcloud private key is not supported for this provider (only tidb_cloud_native)")
+	}
+	if raw.anySet() {
+		return fmt.Errorf("quota settings are not supported for this provider (only tidb_cloud_native)")
 	}
 	return nil
 }
@@ -3909,17 +3955,19 @@ type provisionTenantOptions struct {
 	TokenVersion          int
 	APIKeySource          apiKeyIssueSource
 	CredentialProvisioner *tenant.CredentialProvisionRequest
+	Quota                 *quotaRequest
 }
 
 type provisionTenantResult struct {
-	TenantID      string
-	APIKey        string
-	APIKeyID      string
-	Status        meta.TenantStatus
-	Provider      string
-	TenantDSN     string
-	CloudProvider string
-	Region        string
+	TenantID       string
+	APIKey         string
+	APIKeyID       string
+	Status         meta.TenantStatus
+	Provider       string
+	TenantDSN      string
+	CloudProvider  string
+	Region         string
+	OrganizationID string
 }
 
 type provisionTenantError struct {
@@ -4163,12 +4211,26 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusBadGateway, msg, err)
 	}
 	cluster.Provider = provider
-
-	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
-		ClusterID: cluster.ClusterID,
-		Provider:  provider,
-	}); err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_persist_cluster_id_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+	if provider == tenant.ProviderTiDBCloudNative {
+		if strings.TrimSpace(cluster.OrganizationID) == "" {
+			err := fmt.Errorf("tidbcloud organization label is missing")
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_tidbcloud_org_binding_missing", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "org_binding_missing")
+			return nil, newProvisionTenantError(http.StatusBadGateway, "failed to read tidbcloud organization binding", err)
+		}
+		if err := s.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+			TenantID:       tenantID,
+			OrganizationID: cluster.OrganizationID,
+			ClusterID:      cluster.ClusterID,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}); err != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_tidbcloud_org_binding_failed", "tenant_id", tenantID, "provider", provider, "organization_id", cluster.OrganizationID, "cluster_id", cluster.ClusterID, "error", err)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
+			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "org_binding_error")
+			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tidbcloud organization binding", err)
+		}
 	}
 
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
@@ -4208,6 +4270,38 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to update tenant status", err)
 	}
 
+	if opts.Quota != nil {
+		quotaReq := *opts.Quota
+		quotaReq.TenantID = tenantID
+		if err := s.validateQuotaSetRequest(quotaReq); err != nil {
+			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
+		}
+		if opts.CredentialProvisioner == nil {
+			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			return nil, newProvisionTenantError(http.StatusBadRequest, tenant.ErrCredentialsRequired.Error(), tenant.ErrCredentialsRequired)
+		}
+		if _, err := s.applyQuotaSet(ctx, &meta.Tenant{
+			ID:        tenantID,
+			Provider:  provider,
+			ClusterID: cluster.ClusterID,
+		}, *opts.CredentialProvisioner, quotaReq); err != nil {
+			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
+			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
+			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
+			if status, msg, ok := quotaSetErrorStatusMessage(err, "update"); ok {
+				return nil, newProvisionTenantError(status, msg, err)
+			}
+			if errors.Is(err, tenant.ErrQuotaPermissionDenied) {
+				return nil, newProvisionTenantError(http.StatusForbidden, "no permission to update quota with TiDB Cloud API key", err)
+			}
+			if errors.Is(err, tenant.ErrQuotaBackendNotFound) {
+				return nil, newProvisionTenantError(http.StatusNotFound, quotaBackendNotFoundMessage, err)
+			}
+			return nil, newProvisionTenantError(http.StatusBadGateway, "failed to set tenant quota", err)
+		}
+	}
+
 	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_api_key_failed", "tenant_id", tenantID, "api_key_id", apiKeyID, "error", err)...)
@@ -4225,15 +4319,46 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		cloudProvider, region = provisioningCloudRegion(s.provisioner)
 	}
 	return &provisionTenantResult{
-		TenantID:      tenantID,
-		APIKey:        apiToken,
-		APIKeyID:      apiKeyID,
-		Status:        meta.TenantProvisioning,
-		Provider:      provider,
-		TenantDSN:     tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
-		CloudProvider: cloudProvider,
-		Region:        region,
+		TenantID:       tenantID,
+		APIKey:         apiToken,
+		APIKeyID:       apiKeyID,
+		Status:         meta.TenantProvisioning,
+		Provider:       provider,
+		TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
+		CloudProvider:  cloudProvider,
+		Region:         region,
+		OrganizationID: strings.TrimSpace(cluster.OrganizationID),
 	}, nil
+}
+
+func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo, cred *tenant.CredentialProvisionRequest, reason string) {
+	if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return
+	}
+	cleanupCtx := backgroundWithTrace(ctx)
+	t := &meta.Tenant{
+		ID:        tenantID,
+		Provider:  provider,
+		ClusterID: cluster.ClusterID,
+		DBHost:    cluster.Host,
+		DBPort:    cluster.Port,
+		DBUser:    cluster.Username,
+		DBName:    cluster.DBName,
+	}
+	var req tenant.CredentialProvisionRequest
+	if provider == tenant.ProviderTiDBCloudNative {
+		if cred == nil {
+			logger.Warn(cleanupCtx, "server_event", eventFields(cleanupCtx, "provision_cluster_cleanup_skipped_missing_credentials", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID)...)
+			return
+		}
+		req = *cred
+	}
+	if err := s.deprovisionTenantCluster(cleanupCtx, t, req); err != nil {
+		logger.Error(cleanupCtx, "server_event", eventFields(cleanupCtx, "provision_cluster_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
+	}
 }
 
 func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {

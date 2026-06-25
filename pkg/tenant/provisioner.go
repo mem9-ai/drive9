@@ -15,6 +15,7 @@ var ErrQuotaBackendNotFound = errors.New("tidbcloud quota backend not found")
 type ClusterInfo struct {
 	TenantID       string
 	ClusterID      string
+	OrganizationID string
 	BranchID       string
 	Host           string
 	Port           int
@@ -47,6 +48,13 @@ type QuotaCloudConfig struct {
 	Labels                        map[string]string
 }
 
+type CloudClusterInfo struct {
+	ClusterID                     string
+	OrganizationID                string
+	Labels                        map[string]string
+	TiDBCloudSpendingLimitMonthly *int64
+}
+
 type CredentialProvisioner interface {
 	Provisioner
 	ProvisionWithCredentials(ctx context.Context, tenantID string, req CredentialProvisionRequest) (*ClusterInfo, error)
@@ -70,6 +78,22 @@ type QuotaGetter interface {
 
 type QuotaUpdateOptions struct {
 	TiDBCloudSpendingLimitMonthly *int64
+}
+
+type ManagedClusterListOptions struct {
+	PageSize  int
+	PageToken string
+	ClusterID string
+}
+
+type ManagedClusterListResult struct {
+	Clusters      []CloudClusterInfo
+	NextPageToken string
+}
+
+type ManagedClusterLister interface {
+	Provisioner
+	ListManagedClusters(ctx context.Context, req CredentialProvisionRequest, opts ManagedClusterListOptions) (*ManagedClusterListResult, error)
 }
 
 type BranchProvisioner interface {

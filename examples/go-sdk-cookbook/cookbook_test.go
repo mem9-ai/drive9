@@ -233,12 +233,13 @@ func ExampleClient_quota() {
 	tenantID := "tnt_abc123"
 	credentialClient := drive9.New(serverURL, "")
 
-	quota, err := credentialClient.GetQuota(ctx, drive9.QuotaRequest{
+	tenant, err := credentialClient.AdminGetTenant(ctx, drive9.QuotaRequest{
 		TenantID:   tenantID,
 		PublicKey:  tidbCloudPublicKey,
 		PrivateKey: tidbCloudPrivateKey,
 	})
-	if err == nil {
+	if err == nil && tenant.Quota != nil {
+		quota := tenant.Quota
 		_ = quota.Config.MaxStorageSize
 		_ = quota.Config.MaxFileSize
 		_ = quota.Config.MaxFileCount
@@ -250,7 +251,7 @@ func ExampleClient_quota() {
 	fileSize := int64(1024)          // Mi
 	fileCount := int64(100000)
 	spendingLimit := int64(10000)
-	_, _ = credentialClient.SetQuota(ctx, drive9.QuotaSetRequest{
+	_, _ = credentialClient.AdminSetTenantQuota(ctx, drive9.QuotaSetRequest{
 		TenantID:               tenantID,
 		PublicKey:              tidbCloudPublicKey,
 		PrivateKey:             tidbCloudPrivateKey,
@@ -414,6 +415,11 @@ func Example_localFileTransferShape() {
 }
 
 var coveredClientMethods = map[string]bool{
+	"AdminCreateTenant":                    true,
+	"AdminDeleteTenant":                    true,
+	"AdminGetTenant":                       true,
+	"AdminListTenants":                     true,
+	"AdminSetTenantQuota":                  true,
 	"AppendJournalEntries":                 true,
 	"AppendStream":                         true,
 	"APIKey":                               true,
