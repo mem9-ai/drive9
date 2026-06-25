@@ -4233,13 +4233,6 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 	}
 
-	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
-		ClusterID: cluster.ClusterID,
-		Provider:  provider,
-	}); err != nil {
-		logger.Error(ctx, "server_event", eventFields(ctx, "provision_persist_cluster_id_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
-	}
-
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
