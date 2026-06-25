@@ -4216,7 +4216,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			err := fmt.Errorf("tidbcloud organization label is missing")
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_tidbcloud_org_binding_missing", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "org_binding_missing")
 			return nil, newProvisionTenantError(http.StatusBadGateway, "failed to read tidbcloud organization binding", err)
 		}
 		if err := s.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
@@ -4228,7 +4228,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}); err != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_tidbcloud_org_binding_failed", "tenant_id", tenantID, "provider", provider, "organization_id", cluster.OrganizationID, "cluster_id", cluster.ClusterID, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
-			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "org_binding_error")
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tidbcloud organization binding", err)
 		}
 	}

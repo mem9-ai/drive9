@@ -636,6 +636,90 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenCreateQuotaFails(t *testing.T)
 	}
 }
 
+func TestProvisionTiDBCloudNativeCleansClusterWhenOrgBindingMissing(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		cluster: &tenant.ClusterInfo{
+			ClusterID: "native-cluster-missing-org",
+			Host:      "db.example",
+			Port:      4000,
+			Username:  "u1.root",
+			Password:  "db-pass",
+			DBName:    "customer_db",
+		},
+	}
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: &cred,
+	})
+	if err == nil {
+		t.Fatal("provisionTenant error = nil, want org binding error")
+	}
+	var provisionErr *provisionTenantError
+	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusBadGateway {
+		t.Fatalf("provision error = %#v, want 502 provisionTenantError", err)
+	}
+	if got := prov.deprovisionCalls.Load(); got != 1 {
+		t.Fatalf("deprovision calls = %d, want 1", got)
+	}
+	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "native-cluster-missing-org" {
+		t.Fatalf("deprovision cluster = %#v", prov.lastDeprovision)
+	}
+	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
+		t.Fatalf("cleanup credentials = %+v", prov.lastCredentialReq)
+	}
+
+	var tenantID, status string
+	if err := metaStore.DB().QueryRow("SELECT id, status FROM tenants").Scan(&tenantID, &status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantFailed) {
+		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
+	}
+	var bindingCount int
+	if err := metaStore.DB().QueryRow("SELECT COUNT(*) FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?", tenantID).Scan(&bindingCount); err != nil {
+		t.Fatal(err)
+	}
+	if bindingCount != 0 {
+		t.Fatalf("binding count = %d, want 0", bindingCount)
+	}
+}
+
 func TestProvisionTiDBCloudNativeRequiresRequestCredentials(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
