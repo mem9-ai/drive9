@@ -60,6 +60,11 @@ type CredentialProvisioner interface {
 	ProvisionWithCredentials(ctx context.Context, tenantID string, req CredentialProvisionRequest) (*ClusterInfo, error)
 }
 
+type CredentialQuotaProvisioner interface {
+	Provisioner
+	ProvisionWithCredentialsAndQuota(ctx context.Context, tenantID string, req CredentialProvisionRequest, opts QuotaUpdateOptions) (*ClusterInfo, *QuotaCloudConfig, error)
+}
+
 type CredentialDeprovisioner interface {
 	Provisioner
 	DeprovisionWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error

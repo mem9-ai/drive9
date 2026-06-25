@@ -25,30 +25,32 @@ import (
 )
 
 type fakeProvisioner struct {
-	provider          string
-	cloudProvider     string
-	region            string
-	cluster           *tenant.ClusterInfo
-	initErr           error
-	provisionErr      error
-	systemUserErr     error
-	systemUsername    string
-	systemPassword    string
-	deprovisionErr    error
-	quotaMarkErr      error
-	quotaUpdateErr    error
-	provisionCalls    atomic.Int32
-	credentialCalls   atomic.Int32
-	systemUserCalls   atomic.Int32
-	deprovisionCalls  atomic.Int32
-	quotaMarkCalls    atomic.Int32
-	quotaUpdateCalls  atomic.Int32
-	lastCredentialReq tenant.CredentialProvisionRequest
-	lastDeprovision   *tenant.ClusterInfo
-	lastQuotaCluster  *tenant.ClusterInfo
-	lastQuotaOptions  tenant.QuotaUpdateOptions
-	defaultPublicKey  string
-	defaultPrivateKey string
+	provider               string
+	cloudProvider          string
+	region                 string
+	cluster                *tenant.ClusterInfo
+	initErr                error
+	provisionErr           error
+	systemUserErr          error
+	systemUsername         string
+	systemPassword         string
+	deprovisionErr         error
+	quotaMarkErr           error
+	quotaUpdateErr         error
+	provisionCalls         atomic.Int32
+	credentialCalls        atomic.Int32
+	credentialQuotaCalls   atomic.Int32
+	systemUserCalls        atomic.Int32
+	deprovisionCalls       atomic.Int32
+	quotaMarkCalls         atomic.Int32
+	quotaUpdateCalls       atomic.Int32
+	lastCredentialReq      tenant.CredentialProvisionRequest
+	lastDeprovision        *tenant.ClusterInfo
+	lastQuotaCluster       *tenant.ClusterInfo
+	lastQuotaOptions       tenant.QuotaUpdateOptions
+	lastCreateQuotaOptions tenant.QuotaUpdateOptions
+	defaultPublicKey       string
+	defaultPrivateKey      string
 }
 
 func (f *fakeProvisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, bool) {
@@ -125,6 +127,29 @@ func (f *fakeProvisioner) ProvisionWithCredentials(_ context.Context, tenantID s
 	return &out, nil
 }
 
+func (f *fakeProvisioner) ProvisionWithCredentialsAndQuota(_ context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
+	f.credentialQuotaCalls.Add(1)
+	f.lastCredentialReq = req
+	f.lastCreateQuotaOptions = opts
+	if f.provisionErr != nil {
+		if f.cluster == nil {
+			return nil, nil, f.provisionErr
+		}
+		out := *f.cluster
+		out.TenantID = tenantID
+		out.Provider = f.provider
+		return &out, nil, f.provisionErr
+	}
+	out := *f.cluster
+	out.TenantID = tenantID
+	out.Provider = f.provider
+	var cloudCfg *tenant.QuotaCloudConfig
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		cloudCfg = &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: opts.TiDBCloudSpendingLimitMonthly}
+	}
+	return &out, cloudCfg, nil
+}
+
 func (f *fakeProvisioner) Deprovision(_ context.Context, cluster *tenant.ClusterInfo) error {
 	f.deprovisionCalls.Add(1)
 	if cluster != nil {
@@ -176,6 +201,29 @@ func (f *fakeProvisioner) UpdateQuota(_ context.Context, cluster *tenant.Cluster
 
 func (f *fakeProvisioner) ProvisionCallCount() int {
 	return int(f.provisionCalls.Load())
+}
+
+type credentialOnlyProvisioner struct {
+	provider string
+	cluster  *tenant.ClusterInfo
+}
+
+func (f *credentialOnlyProvisioner) ProviderType() string { return f.provider }
+
+func (f *credentialOnlyProvisioner) InitSchema(_ context.Context, _ string) error { return nil }
+
+func (f *credentialOnlyProvisioner) Provision(_ context.Context, tenantID string) (*tenant.ClusterInfo, error) {
+	out := *f.cluster
+	out.TenantID = tenantID
+	out.Provider = f.provider
+	return &out, nil
+}
+
+func (f *credentialOnlyProvisioner) ProvisionWithCredentials(_ context.Context, tenantID string, _ tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	out := *f.cluster
+	out.TenantID = tenantID
+	out.Provider = f.provider
+	return &out, nil
 }
 
 type profileAwareFakeProvisioner struct {
@@ -540,10 +588,12 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	defer ts.Close()
 
 	spendingLimit := int64(10000)
+	maxStorageSize := int64(1000)
 	body, _ := json.Marshal(map[string]any{
 		"public_key":               "public-1",
 		"private_key":              "private-1",
 		"tidbcloud_spending_limit": spendingLimit,
+		"max_storage_size":         maxStorageSize,
 	})
 	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -558,17 +608,20 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	if got := prov.ProvisionCallCount(); got != 0 {
 		t.Fatalf("plain provision calls = %d, want 0", got)
 	}
-	if got := prov.credentialCalls.Load(); got != 1 {
-		t.Fatalf("credential provision calls = %d, want 1", got)
+	if got := prov.credentialCalls.Load(); got != 0 {
+		t.Fatalf("credential provision calls = %d, want 0 when create-time quota is set", got)
 	}
-	if got := prov.quotaMarkCalls.Load(); got != 1 {
-		t.Fatalf("quota mark calls = %d, want 1", got)
+	if got := prov.credentialQuotaCalls.Load(); got != 1 {
+		t.Fatalf("credential quota provision calls = %d, want 1", got)
 	}
-	if got := prov.quotaUpdateCalls.Load(); got != 1 {
-		t.Fatalf("quota update calls = %d, want 1", got)
+	if got := prov.quotaMarkCalls.Load(); got != 0 {
+		t.Fatalf("quota mark calls = %d, want 0 for create-time quota", got)
 	}
-	if prov.lastQuotaOptions.TiDBCloudSpendingLimitMonthly == nil || *prov.lastQuotaOptions.TiDBCloudSpendingLimitMonthly != spendingLimit {
-		t.Fatalf("quota spending limit = %#v, want %d", prov.lastQuotaOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
+	if got := prov.quotaUpdateCalls.Load(); got != 0 {
+		t.Fatalf("quota update calls = %d, want 0 for create-time quota", got)
+	}
+	if prov.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly == nil || *prov.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly != spendingLimit {
+		t.Fatalf("create quota spending limit = %#v, want %d", prov.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
 	}
 	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
 		t.Fatalf("credential request = %+v", prov.lastCredentialReq)
@@ -613,6 +666,13 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	if binding.OrganizationID != "org-1" || binding.ClusterID != "native-cluster-1" {
 		t.Fatalf("binding = %#v", binding)
 	}
+	quotaCfg, err := metaStore.GetQuotaConfig(context.Background(), out["tenant_id"])
+	if err != nil {
+		t.Fatalf("get quota config: %v", err)
+	}
+	if quotaCfg.MaxStorageBytes != maxStorageSize*quotaStorageSizeBytes {
+		t.Fatalf("quota max storage = %d, want %d", quotaCfg.MaxStorageBytes, maxStorageSize*quotaStorageSizeBytes)
+	}
 
 	var provider, dbName, dbUser string
 	var passCipher []byte
@@ -634,7 +694,7 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	}
 }
 
-func TestProvisionTiDBCloudNativeCleansClusterWhenCreateQuotaFails(t *testing.T) {
+func TestProvisionTiDBCloudNativeCreateQuotaSkipsQuotaPatch(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
@@ -659,11 +719,10 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenCreateQuotaFails(t *testing.T)
 	}
 	prov := &fakeProvisioner{
 		provider:      tenant.ProviderTiDBCloudNative,
-		quotaMarkErr:  tenant.ErrQuotaPermissionDenied,
 		cloudProvider: "aws",
 		region:        "us-east-1",
 		cluster: &tenant.ClusterInfo{
-			ClusterID:      "native-cluster-quota-fail",
+			ClusterID:      "native-cluster-create-quota",
 			OrganizationID: "org-1",
 			Host:           "db.example",
 			Port:           4000,
@@ -683,46 +742,194 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenCreateQuotaFails(t *testing.T)
 	defer srv.Close()
 
 	maxStorageSize := int64(1000)
+	spendingLimit := int64(10000)
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	res, err := srv.provisionTenant(context.Background(), provisionTenantOptions{
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: &cred,
+		Quota: &quotaRequest{quotaFields: quotaFields{
+			MaxStorageSize:         &maxStorageSize,
+			TiDBCloudSpendingLimit: &spendingLimit,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("provisionTenant: %v", err)
+	}
+	if got := prov.credentialQuotaCalls.Load(); got != 1 {
+		t.Fatalf("credential quota provision calls = %d, want 1", got)
+	}
+	if got := prov.quotaMarkCalls.Load(); got != 0 {
+		t.Fatalf("quota mark calls = %d, want 0 for create-time quota", got)
+	}
+	if got := prov.quotaUpdateCalls.Load(); got != 0 {
+		t.Fatalf("quota update calls = %d, want 0 for create-time quota", got)
+	}
+	if got := prov.deprovisionCalls.Load(); got != 0 {
+		t.Fatalf("deprovision calls = %d, want 0", got)
+	}
+	if prov.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly == nil || *prov.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly != spendingLimit {
+		t.Fatalf("create quota spending limit = %#v, want %d", prov.lastCreateQuotaOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
+	}
+
+	cfg, err := metaStore.GetQuotaConfig(context.Background(), res.TenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxStorageBytes != maxStorageSize*quotaStorageSizeBytes {
+		t.Fatalf("quota max storage = %d, want %d", cfg.MaxStorageBytes, maxStorageSize*quotaStorageSizeBytes)
+	}
+}
+
+func TestProvisionTiDBCloudNativeCreateTimeQuotaRequiresQuotaProvisioner(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &credentialOnlyProvisioner{
+		provider: tenant.ProviderTiDBCloudNative,
+		cluster: &tenant.ClusterInfo{
+			ClusterID:      "native-cluster-no-quota-provisioner",
+			OrganizationID: "org-1",
+			Host:           "db.example",
+			Port:           4000,
+			Username:       "u1.root",
+			Password:       "db-pass",
+			DBName:         "customer_db",
+		},
+	}
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	spendingLimit := int64(10000)
 	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
 	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
 		KeyName:               "default",
 		TokenVersion:          1,
 		CredentialProvisioner: &cred,
-		Quota:                 &quotaRequest{quotaFields: quotaFields{MaxStorageSize: &maxStorageSize}},
+		Quota: &quotaRequest{quotaFields: quotaFields{
+			TiDBCloudSpendingLimit: &spendingLimit,
+		}},
 	})
 	if err == nil {
-		t.Fatal("provisionTenant error = nil, want quota error")
+		t.Fatal("provisionTenant error = nil, want unsupported create-time quota error")
 	}
 	var provisionErr *provisionTenantError
-	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusForbidden {
-		t.Fatalf("provision error = %#v, want 403 provisionTenantError", err)
+	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusInternalServerError {
+		t.Fatalf("provision error = %#v, want 500 provisionTenantError", err)
 	}
-	if got := prov.quotaMarkCalls.Load(); got != 1 {
-		t.Errorf("quota mark calls = %d, want 1", got)
-	}
-	if got := prov.deprovisionCalls.Load(); got != 1 {
-		t.Errorf("deprovision calls = %d, want 1", got)
-	}
-	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "native-cluster-quota-fail" {
-		t.Errorf("deprovision cluster = %#v", prov.lastDeprovision)
-	}
-	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
-		t.Errorf("cleanup credentials = %+v", prov.lastCredentialReq)
-	}
-
-	var tenantID, status string
-	if err := metaStore.DB().QueryRow("SELECT id, status FROM tenants WHERE cluster_id = ?", "native-cluster-quota-fail").Scan(&tenantID, &status); err != nil {
+	var status string
+	if err := metaStore.DB().QueryRow("SELECT status FROM tenants").Scan(&status); err != nil {
 		t.Fatal(err)
 	}
 	if status != string(meta.TenantFailed) {
-		t.Errorf("tenant status = %s, want %s", status, meta.TenantFailed)
+		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
-	var apiKeyCount int
-	if err := metaStore.DB().QueryRow("SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ?", tenantID).Scan(&apiKeyCount); err != nil {
+}
+
+func TestProvisionTiDBCloudNativeCreateTimeQuotaLocalPersistenceErrorIsInternal(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if apiKeyCount != 0 {
-		t.Errorf("api key count = %d, want 0", apiKeyCount)
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	if _, err := metaStore.DB().Exec("RENAME TABLE tenant_quota_config TO tenant_quota_config_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = metaStore.DB().Exec("RENAME TABLE tenant_quota_config_unavailable TO tenant_quota_config")
+	})
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider:      tenant.ProviderTiDBCloudNative,
+		cloudProvider: "aws",
+		region:        "us-east-1",
+		cluster: &tenant.ClusterInfo{
+			ClusterID:      "native-cluster-quota-local-error",
+			OrganizationID: "org-1",
+			Host:           "db.example",
+			Port:           4000,
+			Username:       "u1.root",
+			Password:       "db-pass",
+			DBName:         "customer_db",
+		},
+	}
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	maxStorageSize := int64(1000)
+	cred := tenant.CredentialProvisionRequest{PublicKey: "public-1", PrivateKey: "private-1"}
+	_, err = srv.provisionTenant(context.Background(), provisionTenantOptions{
+		KeyName:               "default",
+		TokenVersion:          1,
+		CredentialProvisioner: &cred,
+		Quota: &quotaRequest{quotaFields: quotaFields{
+			MaxStorageSize: &maxStorageSize,
+		}},
+	})
+	if err == nil {
+		t.Fatal("provisionTenant error = nil, want quota persistence error")
+	}
+	var provisionErr *provisionTenantError
+	if !errors.As(err, &provisionErr) || provisionErr.status != http.StatusInternalServerError {
+		t.Fatalf("provision error = %#v, want 500 provisionTenantError", err)
+	}
+	if got := prov.deprovisionCalls.Load(); got != 1 {
+		t.Fatalf("deprovision calls = %d, want 1", got)
+	}
+	var status string
+	if err := metaStore.DB().QueryRow("SELECT status FROM tenants").Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantFailed) {
+		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
 }
 

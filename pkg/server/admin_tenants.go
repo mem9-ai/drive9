@@ -290,6 +290,10 @@ func (s *Server) handleAdminTenantQuotaSet(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
+	if err := s.rejectQuotaSetForTenantStatus(t); err != nil {
+		errJSON(w, http.StatusConflict, err.Error())
+		return
+	}
 	cloudCfg, err := s.applyQuotaSet(r.Context(), t, cred, quotaReq)
 	if err != nil {
 		writeQuotaSetError(w, r.Context(), err, "update")

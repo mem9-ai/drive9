@@ -212,6 +212,9 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	if gotBody.Labels[Drive9ManagedLabel] != "true" || gotBody.Labels[Drive9TenantIDLabel] != "tenant-1" {
 		t.Fatalf("labels = %#v", gotBody.Labels)
 	}
+	if _, ok := gotBody.Labels[Drive9QuotaUpdateAtLabel]; ok {
+		t.Fatalf("create labels unexpectedly included %s: %#v", Drive9QuotaUpdateAtLabel, gotBody.Labels)
+	}
 	if gotBody.SpendingLimit.Monthly != 5000 {
 		t.Fatalf("spendingLimit.monthly = %d, want 5000", gotBody.SpendingLimit.Monthly)
 	}
@@ -220,6 +223,65 @@ func TestProvisionWithCredentialsUsesRequestCredentialsAndServerConfig(t *testin
 	}
 	if pollCount < 2 {
 		t.Fatalf("poll count = %d, want at least 2", pollCount)
+	}
+}
+
+func TestProvisionWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing.T) {
+	var gotBody struct {
+		Labels        map[string]string `json:"labels"`
+		SpendingLimit struct {
+			Monthly int32 `json:"monthly"`
+		} `json:"spendingLimit"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/v1beta1/clusters" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"clusterId":  "cluster-1",
+			"state":      "CREATING",
+			"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1"},
+			"userPrefix": "u1",
+			"endpoints":  map[string]any{"public": map[string]any{"host": "db.example", "port": 4000}},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		cloudProvider:       "aws",
+		region:              "us-east-1",
+		defaultDatabaseName: DefaultDatabaseName,
+		defaultSpendLimit:   int32Ptr(5000),
+		client:              ts.Client(),
+	}
+	monthly := int64(10000)
+	_, cloudCfg, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{TiDBCloudSpendingLimitMonthly: &monthly})
+	if err != nil {
+		t.Fatalf("ProvisionWithCredentialsAndQuota: %v", err)
+	}
+	if gotBody.SpendingLimit.Monthly != int32(monthly) {
+		t.Fatalf("spendingLimit.monthly = %d, want %d", gotBody.SpendingLimit.Monthly, monthly)
+	}
+	if gotBody.Labels[Drive9ManagedLabel] != "true" || gotBody.Labels[Drive9TenantIDLabel] != "tenant-1" {
+		t.Fatalf("labels = %#v", gotBody.Labels)
+	}
+	if _, ok := gotBody.Labels[Drive9QuotaUpdateAtLabel]; ok {
+		t.Fatalf("create labels unexpectedly included %s: %#v", Drive9QuotaUpdateAtLabel, gotBody.Labels)
+	}
+	if cloudCfg == nil || cloudCfg.TiDBCloudSpendingLimitMonthly == nil || *cloudCfg.TiDBCloudSpendingLimitMonthly != monthly {
+		t.Fatalf("cloud config = %#v, want spending limit %d", cloudCfg, monthly)
 	}
 }
 
