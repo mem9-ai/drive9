@@ -23,7 +23,7 @@ func (c fakeConnector) Connect(context.Context) (driver.Conn, error) {
 	if !c.healthy.Load() {
 		return nil, errors.New("fake db unreachable")
 	}
-	return fakeConn{healthy: c.healthy}, nil
+	return fakeConn(c), nil
 }
 
 func (c fakeConnector) Driver() driver.Driver { return fakeDriver{} }
