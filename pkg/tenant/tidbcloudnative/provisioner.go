@@ -190,18 +190,28 @@ func (p *Provisioner) ValidateCredentialProvisionRequest(req tenant.CredentialPr
 }
 
 func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID string, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	out, _, err := p.ProvisionWithCredentialsAndQuota(ctx, tenantID, req, tenant.QuotaUpdateOptions{})
+	return out, err
+}
+
+func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tenantID string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
 	publicKey := strings.TrimSpace(req.PublicKey)
 	privateKey := strings.TrimSpace(req.PrivateKey)
 	if publicKey == "" || privateKey == "" {
-		return nil, fmt.Errorf("public_key and private_key are required")
+		return nil, nil, fmt.Errorf("public_key and private_key are required")
 	}
 	dbName, err := p.resolveDatabaseName("")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		if err := validateTiDBCloudSpendingLimit(*opts.TiDBCloudSpendingLimitMonthly); err != nil {
+			return nil, nil, err
+		}
 	}
 	password, err := generateRandomPassword(24)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	reqBody := map[string]any{
 		"displayName":  clusterDisplayName(tenantID),
@@ -214,36 +224,42 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 			Drive9TenantIDLabel: tenantID,
 		},
 	}
-	if p.defaultSpendLimit != nil {
+	var spendingLimit *int64
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		spendingLimit = opts.TiDBCloudSpendingLimitMonthly
+		reqBody["spendingLimit"] = map[string]int32{"monthly": int32(*spendingLimit)}
+	} else if p.defaultSpendLimit != nil {
+		defaultLimit := int64(*p.defaultSpendLimit)
+		spendingLimit = &defaultLimit
 		reqBody["spendingLimit"] = map[string]int32{"monthly": *p.defaultSpendLimit}
 	}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	endpoint := p.apiURL + "/v1beta1/clusters"
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPost, endpoint, body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
-			return nil, readErr
+			return nil, nil, readErr
 		}
-		return nil, fmt.Errorf("%s", statusError("provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
+		return nil, nil, fmt.Errorf("%s", statusError("provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
-		return nil, readErr
+		return nil, nil, readErr
 	}
 	info, err := parseClusterInfo(raw)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if info.ClusterID == "" {
-		return nil, fmt.Errorf("tidbcloud native response missing cluster id")
+		return nil, nil, fmt.Errorf("tidbcloud native response missing cluster id")
 	}
 	if clusterProvisionMetadataIncomplete(info) {
 		info, err = p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, info.ClusterID)
@@ -254,7 +270,7 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 				Password:  password,
 				DBName:    dbName,
 				Provider:  tenant.ProviderTiDBCloudNative,
-			}, err
+			}, nil, err
 		}
 	}
 	out := &tenant.ClusterInfo{
@@ -272,12 +288,21 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 		out.Username = info.UserPrefix + ".root"
 	}
 	if out.Host == "" || out.Port == 0 {
-		return out, fmt.Errorf("tidbcloud native response missing endpoint")
+		return out, nil, fmt.Errorf("tidbcloud native response missing endpoint")
 	}
 	if out.Username == "" {
-		return out, fmt.Errorf("tidbcloud native response missing username")
+		return out, nil, fmt.Errorf("tidbcloud native response missing username")
 	}
-	return out, nil
+	cloudCfg := &tenant.QuotaCloudConfig{
+		Labels: map[string]string{
+			Drive9ManagedLabel:  "true",
+			Drive9TenantIDLabel: tenantID,
+		},
+	}
+	if spendingLimit != nil {
+		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(*spendingLimit)
+	}
+	return out, cloudCfg, nil
 }
 
 func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {

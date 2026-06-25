@@ -161,6 +161,10 @@ func (s *Server) handleQuotaSet(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusConflict, "quota setting is only supported for tidb_cloud_native tenants")
 		return
 	}
+	if err := s.rejectQuotaSetForTenantStatus(t); err != nil {
+		errJSON(w, http.StatusConflict, err.Error())
+		return
+	}
 	cloudCfg, err := s.applyQuotaSet(r.Context(), t, cred, req)
 	if err != nil {
 		writeQuotaSetError(w, r.Context(), err, "update")
@@ -243,6 +247,22 @@ var (
 	errQuotaLocalUpdateFailed = errors.New("quota local update failed")
 )
 
+func (s *Server) rejectQuotaSetForTenantStatus(t *meta.Tenant) error {
+	if t == nil {
+		return nil
+	}
+	switch t.Status {
+	case meta.TenantProvisioning:
+		return fmt.Errorf("tenant is still provisioning")
+	case meta.TenantDeleting:
+		return fmt.Errorf("tenant is deleting")
+	case meta.TenantDeleted:
+		return fmt.Errorf("tenant not found")
+	default:
+		return nil
+	}
+}
+
 func (s *Server) applyQuotaSet(ctx context.Context, t *meta.Tenant, cred tenant.CredentialProvisionRequest, req quotaRequest) (*tenant.QuotaCloudConfig, error) {
 	if t == nil {
 		return nil, fmt.Errorf("tenant is required")
@@ -284,6 +304,23 @@ func (s *Server) applyQuotaSet(ctx context.Context, t *meta.Tenant, cred tenant.
 		}
 	}
 	return cloudCfg, nil
+}
+
+func (s *Server) applyQuotaLocalConfig(ctx context.Context, tenantID string, req quotaRequest) error {
+	quotaPatch, err := quotaConfigPatchFromRequest(req)
+	if err != nil {
+		return err
+	}
+	if quotaPatch.MaxStorageBytes == nil && quotaPatch.MaxFileSizeBytes == nil && quotaPatch.MaxFileCount == nil {
+		return nil
+	}
+	if err := s.meta.SetQuotaConfigPatch(ctx, tenantID, quotaPatch); err != nil {
+		return fmt.Errorf("%w: quota config update failed: %w", errQuotaLocalUpdateFailed, err)
+	}
+	if err := s.meta.EnsureQuotaUsageRow(ctx, tenantID); err != nil {
+		return fmt.Errorf("%w: quota usage initialization failed: %w", errQuotaLocalUpdateFailed, err)
+	}
+	return nil
 }
 
 func quotaConfigPatchFromRequest(req quotaRequest) (meta.QuotaConfigPatch, error) {

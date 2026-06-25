@@ -4198,8 +4198,27 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 
 	var cluster *tenant.ClusterInfo
+	var provisionCloudCfg *tenant.QuotaCloudConfig
 	if provider == tenant.ProviderTiDBCloudNative {
-		if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
+		if opts.Quota != nil {
+			quotaReq := *opts.Quota
+			quotaReq.TenantID = tenantID
+			if err := s.validateQuotaSetRequest(quotaReq); err != nil {
+				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+				return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
+			}
+			if opts.CredentialProvisioner == nil {
+				_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+				return nil, newProvisionTenantError(http.StatusBadRequest, tenant.ErrCredentialsRequired.Error(), tenant.ErrCredentialsRequired)
+			}
+			if quotaProvisioner, ok := s.provisioner.(tenant.CredentialQuotaProvisioner); ok {
+				cluster, provisionCloudCfg, err = quotaProvisioner.ProvisionWithCredentialsAndQuota(ctx, tenantID, *opts.CredentialProvisioner, tenant.QuotaUpdateOptions{
+					TiDBCloudSpendingLimitMonthly: quotaReq.TiDBCloudSpendingLimit,
+				})
+			} else {
+				err = fmt.Errorf("provisioner does not support create-time quota")
+			}
+		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
 			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
 		} else {
 			err = fmt.Errorf("provisioner does not support request credentials")
@@ -4291,32 +4310,14 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	if opts.Quota != nil {
 		quotaReq := *opts.Quota
 		quotaReq.TenantID = tenantID
-		if err := s.validateQuotaSetRequest(quotaReq); err != nil {
-			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
-			return nil, newProvisionTenantError(http.StatusBadRequest, err.Error(), err)
-		}
-		if opts.CredentialProvisioner == nil {
-			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
-			return nil, newProvisionTenantError(http.StatusBadRequest, tenant.ErrCredentialsRequired.Error(), tenant.ErrCredentialsRequired)
-		}
-		if _, err := s.applyQuotaSet(ctx, &meta.Tenant{
-			ID:        tenantID,
-			Provider:  provider,
-			ClusterID: cluster.ClusterID,
-		}, *opts.CredentialProvisioner, quotaReq); err != nil {
+		if err := s.applyQuotaLocalConfig(ctx, tenantID, quotaReq); err != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
 			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
-			if status, msg, ok := quotaSetErrorStatusMessage(err, "update"); ok {
-				return nil, newProvisionTenantError(status, msg, err)
-			}
-			if errors.Is(err, tenant.ErrQuotaPermissionDenied) {
-				return nil, newProvisionTenantError(http.StatusForbidden, "no permission to update quota with TiDB Cloud API key", err)
-			}
-			if errors.Is(err, tenant.ErrQuotaBackendNotFound) {
-				return nil, newProvisionTenantError(http.StatusNotFound, quotaBackendNotFoundMessage, err)
-			}
 			return nil, newProvisionTenantError(http.StatusBadGateway, "failed to set tenant quota", err)
+		}
+		if provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
+			metricEvent(ctx, "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
 		}
 	}
 

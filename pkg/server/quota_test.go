@@ -467,6 +467,33 @@ func TestDeprecatedQuotaSetWorksWithoutTiDBCloudOrgBinding(t *testing.T) {
 	}
 }
 
+func TestQuotaSetRejectsProvisioningTenant(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	if err := rt.meta.UpdateTenantStatus(context.Background(), rt.tenantID, meta.TenantProvisioning); err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := postJSON(t, ts.URL+"/v1/quota", map[string]any{
+		"tenant_id":        rt.tenantID,
+		"public_key":       "public-1",
+		"private_key":      "private-1",
+		"max_storage_size": int64(1000),
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 409: %s", resp.StatusCode, body)
+	}
+	if got := rt.prov.markCalls.Load(); got != 0 {
+		t.Fatalf("mark calls = %d, want 0", got)
+	}
+	if got := rt.prov.updateCalls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0", got)
+	}
+}
+
 func TestQuotaSetChecksClusterWritePermissionBeforeFileLimitUpdate(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
@@ -1211,6 +1238,51 @@ func TestAdminTenantQuotaSetRequiresPatchLabelAuthorization(t *testing.T) {
 	}
 	if len(rt.prov.calls) < 2 || rt.prov.calls[0] != "list" || rt.prov.calls[1] != "mark" {
 		t.Fatalf("calls = %#v, want list then mark", rt.prov.calls)
+	}
+}
+
+func TestAdminTenantQuotaSetRejectsProvisioningTenant(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ctx := context.Background()
+	if err := rt.meta.UpdateTenantStatus(ctx, rt.tenantID, meta.TenantProvisioning); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+		TenantID:       rt.tenantID,
+		OrganizationID: "org-1",
+		ClusterID:      "cluster-quota-1",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
+		Clusters: []tenant.CloudClusterInfo{{
+			ClusterID:      "cluster-quota-1",
+			OrganizationID: "org-1",
+		}},
+	}}
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	resp := postJSON(t, ts.URL+"/v1/admin/tenants/"+rt.tenantID+"/quota", map[string]any{
+		"public_key":       "public-1",
+		"private_key":      "private-1",
+		"max_storage_size": int64(200),
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusConflict {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 409: %s", resp.StatusCode, body)
+	}
+	if got := rt.prov.listCalls.Load(); got != 1 {
+		t.Fatalf("list calls = %d, want 1", got)
+	}
+	if got := rt.prov.markCalls.Load(); got != 0 {
+		t.Fatalf("mark calls = %d, want 0", got)
+	}
+	if got := rt.prov.updateCalls.Load(); got != 0 {
+		t.Fatalf("update calls = %d, want 0", got)
 	}
 }
 
