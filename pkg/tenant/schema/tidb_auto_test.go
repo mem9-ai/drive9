@@ -9,8 +9,10 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
 )
@@ -240,6 +242,115 @@ func TestTiDBSchemaSpecFromStatementsAttachesExternalIndexesWithoutStalePointers
 	t1 := mustTableSpecFromSchemaSpec(t, spec, "t1")
 	if _, ok := t1.indexes["idx_t1_id"]; !ok {
 		t.Fatalf("expected idx_t1_id on t1, got indexes=%#v", t1.indexes)
+	}
+}
+
+func TestParallelSchemaStatementGroupsKeepsTableOrder(t *testing.T) {
+	groups, ok := parallelSchemaStatementGroups([]string{
+		`CREATE TABLE IF NOT EXISTS t1 (id VARCHAR(64) PRIMARY KEY)`,
+		`CREATE TABLE IF NOT EXISTS t2 (id VARCHAR(64) PRIMARY KEY)`,
+		`CREATE INDEX idx_t1_id ON t1(id)`,
+		`ALTER TABLE t2 ADD COLUMN name VARCHAR(64)`,
+	})
+	if !ok {
+		t.Fatal("parallelSchemaStatementGroups did not classify statements")
+	}
+	if len(groups) != 2 {
+		t.Fatalf("group count = %d, want 2", len(groups))
+	}
+	var t1, t2 []int
+	for _, group := range groups {
+		switch group.table {
+		case "t1":
+			for _, stmt := range group.statements {
+				t1 = append(t1, stmt.index)
+			}
+		case "t2":
+			for _, stmt := range group.statements {
+				t2 = append(t2, stmt.index)
+			}
+		default:
+			t.Fatalf("unexpected table group %q", group.table)
+		}
+	}
+	if fmt.Sprint(t1) != "[0 2]" {
+		t.Fatalf("t1 indexes = %v, want [0 2]", t1)
+	}
+	if fmt.Sprint(t2) != "[1 3]" {
+		t.Fatalf("t2 indexes = %v, want [1 3]", t2)
+	}
+}
+
+func TestParallelSchemaStatementGroupsRejectsUnclassifiedStatements(t *testing.T) {
+	if _, ok := parallelSchemaStatementGroups([]string{
+		`CREATE TABLE IF NOT EXISTS t1 (id VARCHAR(64) PRIMARY KEY)`,
+		`SET @@GLOBAL.foo = 'bar'`,
+	}); ok {
+		t.Fatal("parallelSchemaStatementGroups classified non-DDL statement")
+	}
+}
+
+func TestExecSchemaStatementsParallelByTableContextRunsIndependentTablesConcurrently(t *testing.T) {
+	firstStarted := make(chan string, 2)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	startOrder := make([]string, 0, 4)
+	db := newTestRepairDB(t, func(string) testRepairQueryResult {
+		return testRepairQueryResult{}
+	}, func(query string) error {
+		table, ok := schemaStatementTableName(query)
+		if !ok {
+			return fmt.Errorf("failed to classify query %q", query)
+		}
+		mu.Lock()
+		startOrder = append(startOrder, table)
+		mu.Unlock()
+		if strings.Contains(normalizeSQLFragment(query), "create table") {
+			select {
+			case firstStarted <- table:
+			default:
+			}
+			<-release
+		}
+		return nil
+	})
+	db.SetMaxOpenConns(4)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ExecSchemaStatementsParallelByTableContext(context.Background(), db, []string{
+			`CREATE TABLE IF NOT EXISTS t1 (id VARCHAR(64) PRIMARY KEY)`,
+			`CREATE INDEX idx_t1_id ON t1(id)`,
+			`CREATE TABLE IF NOT EXISTS t2 (id VARCHAR(64) PRIMARY KEY)`,
+			`CREATE INDEX idx_t2_id ON t2(id)`,
+		})
+	}()
+
+	got := map[string]bool{}
+	for len(got) < 2 {
+		select {
+		case table := <-firstStarted:
+			got[table] = true
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for concurrent table creates; got %v", got)
+		}
+	}
+	close(release)
+	if err := <-errCh; err != nil {
+		t.Fatalf("ExecSchemaStatementsParallelByTableContext: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(startOrder) != 4 {
+		t.Fatalf("executed statement count = %d, want 4 (%v)", len(startOrder), startOrder)
+	}
+	seenCreate := map[string]bool{}
+	for _, table := range startOrder {
+		seenCreate[table] = true
+	}
+	if !seenCreate["t1"] || !seenCreate["t2"] {
+		t.Fatalf("missing table create execution: %v", startOrder)
 	}
 }
 

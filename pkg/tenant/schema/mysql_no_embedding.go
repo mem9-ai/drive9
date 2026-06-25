@@ -218,7 +218,7 @@ func InitMySQLNoEmbeddingTenantSchemaContext(ctx context.Context, dsn string) er
 	if err := repairMySQLPathHashSchema(ctx, db); err != nil {
 		return err
 	}
-	if err := ExecSchemaStatementsContext(ctx, db, MySQLNoEmbeddingTenantSchemaStatements()); err != nil {
+	if err := ExecSchemaStatementsParallelByTableContext(ctx, db, MySQLNoEmbeddingTenantSchemaStatements()); err != nil {
 		return err
 	}
 	if err := ValidateMySQLNoEmbeddingTenantSchema(ctx, db); err != nil {
