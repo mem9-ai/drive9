@@ -125,17 +125,21 @@ func (p *Provisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, b
 func (p *Provisioner) ProvisioningRegion() string { return p.region }
 
 func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
-	if err := ensureDatabaseFromDSN(ctx, dsn); err != nil {
-		return fmt.Errorf("ensure tidbcloud native database: %w", err)
+	if err := p.EnsureDatabase(ctx, dsn); err != nil {
+		return err
 	}
 	return schema.InitTiDBTenantSchemaForModeWithOptionsContext(ctx, dsn, schema.TiDBEmbeddingModeAuto, schema.InitTiDBTenantSchemaOptions{})
 }
 
 func (p *Provisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, dsn string, profile schema.TiDBAutoEmbeddingProfile) error {
+	return schema.InitTiDBTenantSchemaForAutoEmbeddingProfileContext(ctx, dsn, profile)
+}
+
+func (p *Provisioner) EnsureDatabase(ctx context.Context, dsn string) error {
 	if err := ensureDatabaseFromDSN(ctx, dsn); err != nil {
 		return fmt.Errorf("ensure tidbcloud native database: %w", err)
 	}
-	return schema.InitTiDBTenantSchemaForAutoEmbeddingProfileContext(ctx, dsn, profile)
+	return nil
 }
 
 func (p *Provisioner) EnsureSystemUser(ctx context.Context, dsn, _ string) (string, string, error) {
@@ -887,6 +891,9 @@ func ensureDatabaseFromDSN(ctx context.Context, dsn string) error {
 	if cfg.Passwd == "" {
 		return fmt.Errorf("native tenant DSN password is empty")
 	}
+	if cfg.Net != "tcp" {
+		return fmt.Errorf("native tenant DSN network must be tcp, got %q", cfg.Net)
+	}
 	host, port, err := splitTCPAddr(cfg.Addr)
 	if err != nil {
 		return err
@@ -900,11 +907,17 @@ func splitTCPAddr(addr string) (string, int, error) {
 		return "", 0, fmt.Errorf("parse native tenant DSN address %q: %w", addr, err)
 	}
 	port, err := strconv.Atoi(portText)
-	if err != nil || port <= 0 {
+	if err != nil {
 		return "", 0, fmt.Errorf("parse native tenant DSN port %q: %w", portText, err)
+	}
+	if port <= 0 {
+		return "", 0, fmt.Errorf("native tenant DSN port must be positive, got %d", port)
 	}
 	if strings.TrimSpace(host) == "" {
 		return "", 0, fmt.Errorf("native tenant DSN host is empty")
+	}
+	if strings.Contains(host, ":") && !strings.HasPrefix(host, "[") {
+		host = "[" + host + "]"
 	}
 	return host, port, nil
 }
@@ -1050,7 +1063,7 @@ func (p *Provisioner) waitForClusterProvisionMetadata(ctx context.Context, publi
 			return info, nil
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("tidbcloud native cluster %s missing connection metadata before timeout: %s", clusterID, info.State)
+			return nil, fmt.Errorf("tidbcloud native cluster %s missing connection metadata or organization label before timeout: %s", clusterID, info.State)
 		}
 		select {
 		case <-ctx.Done():

@@ -180,13 +180,91 @@ func (f *fakeProvisioner) ProvisionCallCount() int {
 type profileAwareFakeProvisioner struct {
 	fakeProvisioner
 	profileInitCalls atomic.Int32
+	ensureDBCalls    atomic.Int32
 	lastProfile      tenantschema.TiDBAutoEmbeddingProfile
+	ensureDBErr      error
+	lastEnsureDSN    string
+	callOrder        []string
+}
+
+func (f *profileAwareFakeProvisioner) EnsureDatabase(_ context.Context, dsn string) error {
+	f.ensureDBCalls.Add(1)
+	f.lastEnsureDSN = dsn
+	f.callOrder = append(f.callOrder, "ensure")
+	return f.ensureDBErr
 }
 
 func (f *profileAwareFakeProvisioner) InitSchemaForAutoEmbeddingProfile(_ context.Context, _ string, profile tenantschema.TiDBAutoEmbeddingProfile) error {
 	f.profileInitCalls.Add(1)
 	f.lastProfile = profile
+	f.callOrder = append(f.callOrder, "profile-init")
 	return nil
+}
+
+func TestSchemaInitForTenantEnsuresDatabaseBeforeAutoEmbeddingConfig(t *testing.T) {
+	ensureErr := errors.New("database is not ready")
+	prov := &profileAwareFakeProvisioner{
+		fakeProvisioner: fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+		ensureDBErr:     ensureErr,
+	}
+	srv := NewWithConfig(Config{
+		Provisioner: prov,
+		TiDBAutoEmbeddingConfig: tenantschema.TiDBAutoEmbeddingConfig{
+			Model:      "openai/text-embedding-3-small",
+			Dimensions: 1536,
+		},
+	})
+	defer srv.Close()
+
+	init := srv.schemaInitForTenant("tenant-native", tenant.ProviderTiDBCloudNative, func(context.Context, string) error {
+		t.Fatal("fallback InitSchema was called")
+		return nil
+	})
+	err := init(context.Background(), "u1.root:db-pass@tcp(db.example:4000)/tidbcloud_fs?parseTime=true&tls=true")
+	if !errors.Is(err, ensureErr) {
+		t.Fatalf("schema init error = %v, want ensure error", err)
+	}
+	if prov.ensureDBCalls.Load() != 1 {
+		t.Fatalf("ensure DB calls = %d, want 1", prov.ensureDBCalls.Load())
+	}
+	if prov.profileInitCalls.Load() != 0 {
+		t.Fatalf("profile init calls = %d, want 0", prov.profileInitCalls.Load())
+	}
+	if prov.lastEnsureDSN == "" {
+		t.Fatal("ensure DB DSN was empty")
+	}
+}
+
+func TestSchemaInitForTenantEnsuresDatabaseBeforeProfileInit(t *testing.T) {
+	prov := &profileAwareFakeProvisioner{
+		fakeProvisioner: fakeProvisioner{provider: tenant.ProviderTiDBCloudNative},
+	}
+	srv := NewWithConfig(Config{
+		Provisioner: prov,
+		TiDBAutoEmbeddingConfig: tenantschema.TiDBAutoEmbeddingConfig{
+			Model:      "openai/text-embedding-3-small",
+			Dimensions: 1536,
+		},
+	})
+	defer srv.Close()
+
+	init := srv.schemaInitForTenant("tenant-native", tenant.ProviderTiDBCloudNative, func(context.Context, string) error {
+		t.Fatal("fallback InitSchema was called")
+		return nil
+	})
+	err := init(context.Background(), "u1.root:db-pass@tcp(db.example:4000)/tidbcloud_fs?parseTime=true&tls=true")
+	if err != nil {
+		t.Fatalf("schema init: %v", err)
+	}
+	if prov.ensureDBCalls.Load() != 1 {
+		t.Fatalf("ensure DB calls = %d, want 1", prov.ensureDBCalls.Load())
+	}
+	if prov.profileInitCalls.Load() != 1 {
+		t.Fatalf("profile init calls = %d, want 1", prov.profileInitCalls.Load())
+	}
+	if got, want := strings.Join(prov.callOrder, ","), "ensure,profile-init"; got != want {
+		t.Fatalf("call order = %s, want %s", got, want)
+	}
 }
 
 func TestProvisionMarksTenantFailedWhenInitKeepsFailing(t *testing.T) {

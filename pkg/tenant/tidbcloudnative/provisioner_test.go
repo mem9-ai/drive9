@@ -293,6 +293,49 @@ func TestEnsureDatabaseFromDSNUsesTenantConnection(t *testing.T) {
 	}
 }
 
+func TestEnsureDatabaseFromDSNRejectsNonTCPNetwork(t *testing.T) {
+	err := ensureDatabaseFromDSN(context.Background(), "u1.root:db-pass@unix(/tmp/mysql.sock)/tidbcloud_fs?parseTime=true")
+	if err == nil {
+		t.Fatal("expected non-tcp DSN error")
+	}
+	if !strings.Contains(err.Error(), `network must be tcp`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestEnsureDatabaseFromDSNHandlesIPv6Host(t *testing.T) {
+	var gotHost string
+	var gotPort int
+	origEnsureDatabase := ensureDatabaseFunc
+	ensureDatabaseFunc = func(_ context.Context, _ string, _ string, host string, port int, _ string) error {
+		gotHost = host
+		gotPort = port
+		return nil
+	}
+	t.Cleanup(func() { ensureDatabaseFunc = origEnsureDatabase })
+
+	err := ensureDatabaseFromDSN(context.Background(), "u1.root:db-pass@tcp([::1]:4000)/tidbcloud_fs?parseTime=true&tls=true")
+	if err != nil {
+		t.Fatalf("ensureDatabaseFromDSN: %v", err)
+	}
+	if gotHost != "[::1]" || gotPort != 4000 {
+		t.Fatalf("ensure database address = %s:%d, want [::1]:4000", gotHost, gotPort)
+	}
+}
+
+func TestEnsureDatabaseFromDSNRejectsNonPositivePort(t *testing.T) {
+	err := ensureDatabaseFromDSN(context.Background(), "u1.root:db-pass@tcp(db.example:0)/tidbcloud_fs?parseTime=true")
+	if err == nil {
+		t.Fatal("expected non-positive port error")
+	}
+	if !strings.Contains(err.Error(), "port must be positive") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(err.Error(), "%!w") {
+		t.Fatalf("error wrapped nil: %v", err)
+	}
+}
+
 func TestProvisionWithCredentialsIncludesUpstreamBodyOnError(t *testing.T) {
 	longBody := strings.Repeat("x", upstreamErrorBodyLimit+100)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
