@@ -1597,6 +1597,39 @@ func (fs *Dat9FS) refreshCommittedRevisionForOpenHandles(path string, revision i
 	}
 }
 
+// refreshCommittedRevisionForOpenHandlesWithSize is like
+// refreshCommittedRevisionForOpenHandles but uses an explicit committed
+// size instead of reading from the inode table. This is needed in the
+// Path 2 concurrent-write case where the inode size has already been
+// updated by the concurrent Write() but the committed revision
+// corresponds to the pre-write snapshot.
+func (fs *Dat9FS) refreshCommittedRevisionForOpenHandlesWithSize(path string, revision int64, skip *FileHandle, committedSize int64) {
+	if fs == nil || fs.openHandles == nil || path == "" || revision <= 0 {
+		return
+	}
+
+	for _, fh := range fs.openHandles.SnapshotPath(path) {
+		if fh == nil || fh == skip {
+			continue
+		}
+		if !fh.TryLock() {
+			continue
+		}
+		if fh.Dirty != nil {
+			cleanBuffer := fh.DirtySeq == 0 && !fh.Dirty.HasDirtyParts()
+			fh.IsNew = false
+			fh.BaseRev = revision
+			if fh.Streamer != nil {
+				fh.Streamer.RefreshExpectedRevision(expectedRevisionForHandle(fh))
+			}
+			if cleanBuffer {
+				fs.rebindCleanWriteBufferToRemoteLocked(fh, committedSize)
+			}
+		}
+		fh.Unlock()
+	}
+}
+
 func (fs *Dat9FS) refreshCleanCommittedRevisionForHandleLocked(fh *FileHandle) bool {
 	if fs == nil || fh == nil || fh.Dirty == nil || fh.DirtySeq != 0 || fh.Dirty.HasDirtyParts() {
 		return false
@@ -1914,6 +1947,42 @@ func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
 			log.Printf("shadow base revision adopt failed for %s: %v", fh.Path, err)
 		}
 	}
+}
+
+// markHandleRevisionOnlyLocked updates the handle's committed revision,
+// IsNew flag, OrigSize, and propagates the revision to other open handles,
+// but does NOT read from fh.Dirty for size information. snapshotSize is
+// the size of the data that was actually uploaded (captured before the
+// unlock window). This is used when a concurrent write mutated the dirty
+// buffer during the Path 2 unlock window, so the live dirty state reflects
+// uncommitted post-upload data.
+func (fs *Dat9FS) markHandleRevisionOnlyLocked(fh *FileHandle, revision int64, snapshotSize int64) {
+	if fs == nil || fh == nil || revision <= 0 {
+		return
+	}
+	if fh.IsNew {
+		fs.replaceCommittedRevision(fh.Path, revision)
+	} else {
+		fs.recordCommittedRevision(fh.Path, revision)
+	}
+	fh.IsNew = false
+	fh.BaseRev = revision
+	fh.OrigSize = snapshotSize
+	fs.inodes.UpdateRevision(fh.Ino, revision)
+	fs.refreshCommittedRevisionForOpenHandlesWithSize(fh.Path, revision, fh, snapshotSize)
+	if fs.writeBack != nil {
+		fs.writeBack.Remove(fh.Path)
+	}
+	if fs.shadowStore != nil {
+		fs.shadowStore.Remove(fh.Path)
+	}
+	if fs.pendingIndex != nil {
+		fs.pendingIndex.Remove(fh.Path)
+	}
+	fh.ShadowReady = false
+	fh.ShadowSpill = false
+	fh.ShadowCommitReady = false
+	fh.ShadowCommitSeq = 0
 }
 
 func (fs *Dat9FS) markHandleRemoteCommittedLocked(fh *FileHandle, revision int64) {
@@ -11260,12 +11329,33 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 			return
 		}
 
+		// B13: Acquire remoteCommitLock to serialize with any concurrent
+		// forced flush (Path 2). Lock ordering is handle.Lock() →
+		// remoteCommitLock — same as Write()'s fh.mu → remoteCommitLock,
+		// so no deadlock. Path 2 holds remoteCommitLock and releases fh.mu
+		// before uploading, so the callback blocks here until Path 2
+		// finishes and releases remoteCommitLock.
+		unlockRemoteCommit := fs.lockRemoteCommitPath(filePath)
+
+		// Re-check the expected revision after acquiring both locks.
+		// Path 2 records committed revision while holding remoteCommitLock,
+		// so by the time we acquire it, adoptCommittedRevisionLocked will
+		// see the updated revision. If expectedRevision changed, the
+		// forced flush already uploaded — skip to avoid double PUT.
+		currentExpectedRevision := fs.expectedRevisionForHandleLocked(handle)
+		if currentExpectedRevision != expectedRevision {
+			unlockRemoteCommit()
+			handle.Unlock()
+			return
+		}
+
 		dCtx, dCf := context.WithTimeout(context.Background(), fuseTimeout)
 		writeStart := fs.perfStart()
 		committedRev, err := fs.client.WriteCtxConditionalWithRevision(dCtx, fs.remotePath(filePath), data, expectedRevision)
 		dCf()
 		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
 		if err != nil {
+			unlockRemoteCommit()
 			handle.Unlock()
 			log.Printf("debounced flush failed for %s: %v", filePath, err)
 			return
@@ -11274,12 +11364,13 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		modeErr := fs.applyPendingModeForHandleLocked(modeCtx, handle)
 		modeCancel()
 		if modeErr != nil {
+			unlockRemoteCommit()
 			handle.Unlock()
 			log.Printf("debounced flush pending chmod failed for %s: %v", filePath, modeErr)
 			return
 		}
-		// The handle stays locked across upload + finalize so concurrent writes
-		// cannot advance live state for data outside this committed snapshot.
+		// Record committed revision while holding remoteCommitLock, consistent
+		// with Path 2's approach (lines 11754-11770).
 		if committedRev > 0 {
 			fs.recordCommittedRevision(filePath, committedRev)
 			handle.IsNew = false
@@ -11294,6 +11385,10 @@ func (fs *Dat9FS) flushHandleDebounced(ctx context.Context, fh *FileHandle, forc
 		} else {
 			fs.finalizeHandleFlushLocked(handle, expectedRevision)
 		}
+		// Release remoteCommitLock after recording revision, before
+		// releasing handle lock — same pattern as Path 2.
+		unlockRemoteCommit()
+
 		if handle.Dirty != nil && handle.DirtySeq == snapshotSeq {
 			handle.Dirty.ClearDirty()
 		}
@@ -11405,7 +11500,12 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	}
 
 	unlockRemoteCommit := fs.takeHandleRemoteCommitPathLocked(fh)
-	defer unlockRemoteCommit()
+	remoteCommitReleased := false
+	defer func() {
+		if !remoteCommitReleased {
+			unlockRemoteCommit()
+		}
+	}()
 
 	var err error
 	// Path 1a: Streaming mode — parts were submitted during Write() and are
@@ -11559,9 +11659,17 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 		return gofuse.OK
 	}
 
-	// Path 2: No streaming uploader or small file — materialize all data for upload.
-	data := fh.Dirty.bytesView()
+	// Path 2: No streaming uploader or small file — materialize data for upload.
+
 	expectedRevision := fs.expectedRevisionForHandleLocked(fh)
+	remotePath := fs.remotePath(fh.Path)
+	handlePath := fh.Path
+	handleIsNew := fh.IsNew
+	handleIno := fh.Ino
+	handleDirtySeq := fh.DirtySeq
+	handleOrigSize := fh.OrigSize
+	handleDirtyPartSize := fh.Dirty.PartSize()
+	handleFullRangeLoaded := writeBufferHasLoadedFullRange(fh.Dirty)
 	var committedRev int64
 
 	// Use the negotiated server threshold (not the heuristic-only inline
@@ -11573,32 +11681,23 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// rejects total_size=0.
 	threshold := fs.negotiatedInlineThreshold()
 	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
-	if useDirectPUT {
-		if size == 0 && fh.IsNew {
-			phase = "empty-create"
-			writeStart := time.Now()
-			fs.debugf("flushHandle empty create start path=%s expected_rev=%d", fh.Path, expectedRevision)
-			committedRev, err = fs.client.CreateFileCtx(ctx, fs.remotePath(fh.Path))
-			if isCreateActionUnsupportedErr(err) {
-				fs.debugf("flushHandle empty create unsupported path=%s fallback=small-write err=%v", fh.Path, err)
-				committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
-			}
-			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
-			fs.debugDurationf(writeStart, 0, "flushHandle empty create done path=%s committed_rev=%d err=%v", fh.Path, committedRev, err)
-		} else {
-			// Small file: direct PUT with revision return for freshness seeding.
-			phase = "small-write"
-			writeStart := time.Now()
-			fs.debugf("flushHandle small write start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
-			committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, fs.remotePath(fh.Path), data, expectedRevision)
-			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
-			fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", fh.Path, size, committedRev, err)
-		}
-	} else if threshold > 0 && fh.OrigSize >= threshold {
-		phase = "patch-file"
-		dirtyParts := fh.Dirty.DirtyPartNumbers()
+
+	// Determine whether we take the patch path (existing large file with
+	// dirty parts). Patch mode only needs per-part snapshots, NOT a full
+	// buffer copy — avoiding 2x memory for small edits to large files.
+	// B11: must also check size <= handleOrigSize — if the file grew beyond
+	// OrigSize, new parts have no server-side original data and the patch
+	// callback cannot construct correct content. Consistent with write-sync
+	// path's canPatchExisting guard (line ~9912).
+	usePatch := !useDirectPUT && threshold > 0 && handleOrigSize >= threshold && size <= handleOrigSize
+
+	// Prepare patch snapshots while we still hold the lock.
+	var dirtyParts []int
+	var partSnapshots map[int][]byte
+	if usePatch {
+		dirtyParts = fh.Dirty.DirtyPartNumbers()
 		if len(dirtyParts) > 0 {
-			partSnapshots := make(map[int][]byte, len(dirtyParts))
+			partSnapshots = make(map[int][]byte, len(dirtyParts))
 			for _, pn := range dirtyParts {
 				src := fh.Dirty.PartData(pn)
 				if src != nil {
@@ -11607,11 +11706,94 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 					partSnapshots[pn] = cp
 				}
 			}
+		}
+	}
+
+	// Snapshot the dirty buffer into an immutable copy before releasing fh.mu.
+	// bytesView() may return a mutable slice backed by the WriteBuffer's
+	// internal smallFileData; concurrent Write() calls while the lock is
+	// released would corrupt the upload payload.
+	//
+	// B9: Only build dataCopy for paths that actually need the full buffer
+	// (direct PUT, WriteStreamConditional, sidecar/read cache seeding).
+	// Patch mode uses per-part snapshots above and never reads dataCopy
+	// for the upload itself. Post-upload cache seeding for patch mode
+	// (committedRev == 0) does not seed the read cache with full data.
+	var dataCopy []byte
+	if !usePatch {
+		// B12: For the WriteStreamConditional path (grown large file), check
+		// that all parts are loaded before materializing. Lazy-loaded existing
+		// files may have unloaded remote-backed parts; bytesView() would fill
+		// them with zeroes, overwriting remote data. Consistent with write-sync
+		// path's CanMaterializeFull() guard (line ~9971).
+		if !useDirectPUT && !fh.Dirty.CanMaterializeFull() {
+			log.Printf("flushHandle cannot materialize full file for %s (path2 growth)", fh.Path)
+			return gofuse.EIO
+		}
+		dataCopy = make([]byte, fh.Dirty.Size())
+		copy(dataCopy, fh.Dirty.bytesView())
+	}
+
+	// Lock ordering fix (B3): Release fh.mu but keep remoteCommitLock
+	// held throughout the upload for same-path serialization.
+	//
+	// Write() acquires fh.mu → remoteCommitLock. To avoid deadlock,
+	// flush must NOT hold remoteCommitLock while waiting for fh.mu.
+	// We achieve this by:
+	//   1. Releasing fh.mu here (concurrent Read/Write can proceed)
+	//   2. Uploading while holding remoteCommitLock (serialization)
+	//   3. Releasing remoteCommitLock AFTER upload, BEFORE fh.Lock()
+	//
+	// Concurrent Write() acquires fh.mu, then blocks on remoteCommitLock
+	// until upload finishes — linear wait, no cycle.
+	// B13: Cancel any pending debounced upload for this path before releasing
+	// fh.mu. The debouncer callback acquires handle.Lock() and calls
+	// WriteCtxConditionalWithRevision directly, without participating in
+	// remoteCommitLock serialization. If a debounced upload fires while
+	// fh.mu is released (steps 1-3 below), both uploads race with the same
+	// expectedRevision — whichever conditional PUT loses gets a CAS error.
+	//
+	// Cancel stops pending timers. For already-fired callbacks that are
+	// blocked waiting for handle.Lock(), the callback itself re-checks
+	// expectedRevision after acquiring the lock and skips the upload if
+	// the revision advanced (see flushHandleDebounced callback).
+	if fs.debouncer != nil {
+		fs.debouncer.Cancel(handlePath)
+	}
+
+	uploadStart := time.Now()
+	fs.debugf("flushHandle path2 unlock before upload path=%s size=%d phase_hint=%s expected_rev=%d", handlePath, size, phase, expectedRevision)
+	fh.Unlock()
+
+	if useDirectPUT {
+		if size == 0 && handleIsNew {
+			phase = "empty-create"
+			writeStart := time.Now()
+			fs.debugf("flushHandle empty create start path=%s expected_rev=%d", handlePath, expectedRevision)
+			committedRev, err = fs.client.CreateFileCtx(ctx, remotePath)
+			if isCreateActionUnsupportedErr(err) {
+				fs.debugf("flushHandle empty create unsupported path=%s fallback=small-write err=%v", handlePath, err)
+				committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, remotePath, dataCopy, expectedRevision)
+			}
+			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, 0)
+			fs.debugDurationf(writeStart, 0, "flushHandle empty create done path=%s committed_rev=%d err=%v", handlePath, committedRev, err)
+		} else {
+			// Small file: direct PUT with revision return for freshness seeding.
+			phase = "small-write"
+			writeStart := time.Now()
+			fs.debugf("flushHandle small write start path=%s size=%d expected_rev=%d", handlePath, size, expectedRevision)
+			committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, remotePath, dataCopy, expectedRevision)
+			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(dataCopy)))
+			fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", handlePath, size, committedRev, err)
+		}
+	} else if usePatch {
+		phase = "patch-file"
+		if len(dirtyParts) > 0 {
 			patchStart := time.Now()
-			fs.debugf("flushHandle patch start path=%s size=%d dirty_parts=%d expected_rev=%d", fh.Path, size, len(dirtyParts), expectedRevision)
+			fs.debugf("flushHandle patch start path=%s size=%d dirty_parts=%d expected_rev=%d", handlePath, size, len(dirtyParts), expectedRevision)
 			err = fs.client.PatchFile(
 				ctx,
-				fs.remotePath(fh.Path),
+				remotePath,
 				size,
 				dirtyParts,
 				func(partNumber int, partSize int64, origData []byte) ([]byte, error) {
@@ -11621,7 +11803,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 					return origData, nil
 				},
 				nil,
-				client.WithPartSize(fh.Dirty.PartSize()),
+				client.WithPartSize(handleDirtyPartSize),
 				client.WithExpectedRevision(expectedRevision),
 			)
 			var patchBytes uint64
@@ -11629,55 +11811,186 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 				patchBytes = uint64(size)
 			}
 			fs.perfRecordRemote(perfRemoteWrite, patchStart, err, patchBytes)
-			fs.debugDurationf(patchStart, 0, "flushHandle patch done path=%s size=%d dirty_parts=%d err=%v", fh.Path, size, len(dirtyParts), err)
+			fs.debugDurationf(patchStart, 0, "flushHandle patch done path=%s size=%d dirty_parts=%d err=%v", handlePath, size, len(dirtyParts), err)
 		}
 		// If no dirty parts, nothing changed — skip upload.
 	} else {
 		// New large file or small-to-large growth: full upload via multipart.
 		phase = "write-stream"
 		writeStart := time.Now()
-		fs.debugf("flushHandle write stream start path=%s size=%d expected_rev=%d", fh.Path, size, expectedRevision)
+		fs.debugf("flushHandle write stream start path=%s size=%d expected_rev=%d", handlePath, size, expectedRevision)
 		err = fs.client.WriteStreamConditional(
 			ctx,
-			fs.remotePath(fh.Path),
-			bytes.NewReader(data),
+			remotePath,
+			bytes.NewReader(dataCopy),
 			size,
 			nil,
 			expectedRevision,
 		)
-		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(data)))
-		fs.debugDurationf(writeStart, 0, "flushHandle write stream done path=%s size=%d err=%v", fh.Path, size, err)
+		fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(dataCopy)))
+		fs.debugDurationf(writeStart, 0, "flushHandle write stream done path=%s size=%d err=%v", handlePath, size, err)
 	}
+
+	// Record the committed revision to global state WHILE still holding
+	// remoteCommitLock, so any subsequent flush that acquires the lock
+	// will see the updated revision via adoptCommittedRevisionLocked.
+	// This must happen before releasing remoteCommitLock to prevent a
+	// same-path flush from snapshotting a stale expectedRevision.
+	if err == nil && committedRev > 0 {
+		if handleIsNew {
+			fs.replaceCommittedRevision(handlePath, committedRev)
+		} else {
+			fs.recordCommittedRevision(handlePath, committedRev)
+		}
+	}
+	// B10: For successful uploads that don't return a server revision
+	// (PatchFile, WriteStreamConditional), derive a synthetic revision
+	// from expectedRevision and record it before releasing the commit
+	// lock. Without this, a same-path flush can acquire the lock in the
+	// gap between unlockRemoteCommit() and fh.Lock(), snapshot a stale
+	// expectedRevision, and issue a conditional upload that conflicts.
+	if err == nil && committedRev == 0 {
+		if syntheticRev, ok := committedRevisionFromExpectedRevision(expectedRevision); ok && syntheticRev > 0 {
+			fs.recordCommittedRevision(handlePath, syntheticRev)
+		}
+	}
+
+	// Release remoteCommitLock AFTER upload + revision recording but
+	// BEFORE re-acquiring fh.mu. This preserves same-path serialization
+	// (lock held during upload) while avoiding B3 deadlock (never hold
+	// remoteCommitLock while waiting for fh.mu).
+	unlockRemoteCommit()
+	remoteCommitReleased = true
+
+	// Re-acquire fh.mu after network call completes.
+	fh.Lock()
+	fs.debugDurationf(uploadStart, 0, "flushHandle path2 relock after upload path=%s size=%d err=%v", handlePath, size, err)
+
 	if err != nil {
-		log.Printf("flush upload failed for %s: %v", fh.Path, err)
+		log.Printf("flush upload failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)
 	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
-		log.Printf("flush pending chmod failed for %s: %v", fh.Path, err)
+		log.Printf("flush pending chmod failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)
 	}
 
 	sidecarRevision := sqliteCommittedRevision(committedRev, expectedRevision)
-	sidecarCached := fs.cacheCommittedSQLitePersistentJournalLocked(fh, sidecarRevision)
-	fh.Dirty.ClearDirty()
-	fs.clearDirtySize(fh.Ino, fh.DirtySeq)
-	fh.DirtySeq = 0
+	// Use snapshot path (handlePath), immutable data (dataCopy), and
+	// snapshot full-range flag for the SQLite sidecar cache. After the
+	// unlock window, live fh.Path may be retargeted and fh.Dirty may
+	// contain concurrent Write() data — using them would cache
+	// uncommitted bytes or cache under the wrong path.
+	var sidecarCached bool
+	if fs.readCache != nil && dataCopy != nil && sidecarRevision > 0 && isSQLitePersistentJournalPath(handlePath) &&
+		size <= fs.readCache.MaxFileSize() && handleFullRangeLoaded {
+		fs.readCache.Put(handlePath, dataCopy, sidecarRevision)
+		sidecarCached = true
+	}
+
+	// B4 guard: check retarget BEFORE dirty cleanup. If fh.Path was
+	// changed by retargetOpenHandlesForRename while the lock was released,
+	// the upload went to the old path (handlePath) but fh.Path now points
+	// to the new path. The dirty buffer now belongs to the new path and
+	// must NOT be cleared — the old-path upload success does not satisfy
+	// the new path's flush obligation.
+	pathRetargeted := fh.Path != handlePath
+
+	// Only clear dirty state if no concurrent writes happened while the
+	// lock was released AND the handle was not retargeted. If DirtySeq
+	// changed, a new write arrived and the buffer must stay dirty so the
+	// next flush picks it up. If retargeted, the dirty data belongs to
+	// the new path and must be preserved for a subsequent flush.
+	if !pathRetargeted && fh.DirtySeq == handleDirtySeq {
+		fh.Dirty.ClearDirty()
+		fs.clearDirtySize(handleIno, handleDirtySeq)
+		fh.DirtySeq = 0
+	}
+
 	if committedRev > 0 {
 		clearReadTargetForLockedHandle(fh)
-		fs.clearReadTargetsForPathExcept(fh.Path, fh)
-		fs.readCache.Put(fh.Path, data, committedRev)
-		fs.markHandleRemoteCommittedLocked(fh, committedRev)
+		if pathRetargeted {
+			// Upload went to handlePath; fh.Path is now different.
+			// Seed read cache and clear targets for the OLD path only.
+			// The handle's committed state should NOT be updated because
+			// the rename already changed the remote identity.
+			fs.clearReadTargetsForPathExcept(handlePath, nil)
+			fs.readCache.Put(handlePath, dataCopy, committedRev)
+			fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
+		} else {
+			fs.clearReadTargetsForPathExcept(handlePath, fh)
+			// Use dataCopy (immutable snapshot) for read cache seeding —
+			// the WriteBuffer may have been mutated by concurrent writes
+			// while the lock was released.
+			fs.readCache.Put(handlePath, dataCopy, committedRev)
+			if fh.DirtySeq == handleDirtySeq {
+				// No concurrent writes — safe to finalize from live handle.
+				fs.markHandleRemoteCommittedLocked(fh, committedRev)
+			} else {
+				// B7: concurrent writes mutated fh.Dirty during the unlock
+				// window. markHandleRemoteCommittedLocked reads fh.Dirty.Size()
+				// for OrigSize, which would associate the uploaded snapshot's
+				// revision with the post-write buffer size. Only update the
+				// committed revision and flags without consuming live dirty state.
+				fs.markHandleRevisionOnlyLocked(fh, committedRev, size)
+			}
+		}
 	} else if sidecarCached {
 		clearReadTargetForLockedHandle(fh)
-		fs.clearReadTargetsForPathExcept(fh.Path, fh)
-		fs.finalizeHandleFlushLocked(fh, expectedRevision)
+		fs.clearReadTargetsForPathExcept(handlePath, fh)
+		if !pathRetargeted {
+			if fh.DirtySeq == handleDirtySeq {
+				// No concurrent writes — safe to finalize from live handle.
+				fs.finalizeHandleFlushLocked(fh, expectedRevision)
+			} else {
+				// N1: concurrent writes mutated fh.Dirty during the unlock
+				// window. finalizeHandleFlushLocked would read fh.Dirty.Size()
+				// for OrigSize, associating the uploaded snapshot's synthetic
+				// revision with the post-write buffer size. Use the snapshot
+				// size instead.
+				if syntheticRev, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+					fs.markHandleRevisionOnlyLocked(fh, syntheticRev, size)
+				} else {
+					fs.finalizeHandleFlushLocked(fh, expectedRevision)
+				}
+			}
+		}
 	} else {
 		clearReadTargetForLockedHandle(fh)
-		fs.invalidateReadCacheAndTargetsExcept(fh.Path, fh)
-		fs.finalizeHandleFlushLocked(fh, expectedRevision)
+		fs.invalidateReadCacheAndTargetsExcept(handlePath, fh)
+		if !pathRetargeted {
+			if fh.DirtySeq == handleDirtySeq {
+				// No concurrent writes — safe to finalize from live handle.
+				fs.finalizeHandleFlushLocked(fh, expectedRevision)
+			} else {
+				// N1: concurrent writes mutated fh.Dirty during the unlock
+				// window. finalizeHandleFlushLocked would read fh.Dirty.Size()
+				// for OrigSize, associating the uploaded snapshot's synthetic
+				// revision with the post-write buffer size. Use the snapshot
+				// size instead.
+				if syntheticRev, ok := committedRevisionFromExpectedRevision(expectedRevision); ok {
+					fs.markHandleRevisionOnlyLocked(fh, syntheticRev, size)
+				} else {
+					fs.finalizeHandleFlushLocked(fh, expectedRevision)
+				}
+			}
+		}
 	}
-	fs.inodes.UpdateSize(fh.Ino, size)
-	fs.cacheFileForPath(fh.Path, size, time.Now(), committedRev)
+	// When concurrent writes happened (DirtySeq changed), the buffer may
+	// have a different size than the uploaded snapshot. Use the current
+	// dirty buffer size so inode attrs and dir cache reflect reality.
+	publishSize := size
+	if fh.DirtySeq != 0 && fh.Dirty != nil {
+		publishSize = fh.Dirty.Size()
+	}
+	fs.inodes.UpdateSize(handleIno, publishSize)
+	// B8: skip dir cache update for retargeted handles. finishLocalRename
+	// has already removed/negatively cached the old path (handlePath), and
+	// re-adding it here with the upload's size/revision would resurrect a
+	// stale entry. The new path (fh.Path) will be cached on its own flush.
+	if !pathRetargeted {
+		fs.cacheFileForPath(handlePath, publishSize, time.Now(), committedRev)
+	}
 	// Local flush — kernel receives the Flush reply with status.
 	// No notifyInode/notifyEntry needed; userspace caches are updated
 	// above and kernel will refresh attrs on next getattr/lookup.

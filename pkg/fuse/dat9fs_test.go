@@ -13834,6 +13834,1568 @@ func TestFlushHandle_SmallFile_SeedsReadCache(t *testing.T) {
 	}
 }
 
+// TestFlushHandle_Path2_SnapshotIsolation verifies that Path 2 of flushHandle
+// creates an immutable snapshot of dirty data before releasing fh.mu, so that
+// concurrent writes to the same handle during the HTTP upload do not pollute
+// the already-committed upload payload.
+//
+// Regression test for issue #579: without the snapshot+unlock fix, bytesView()
+// returned a mutable slice into WriteBuffer.smallFileData and the lock was
+// held for the entire HTTP round-trip, blocking FUSE Read() on the same handle.
+func TestFlushHandle_Path2_SnapshotIsolation(t *testing.T) {
+	original := []byte("ORIGINAL-PAYLOAD-BEFORE-FLUSH")
+
+	// uploadStarted signals the test goroutine that the HTTP handler has
+	// received the upload body — the lock has been released and a concurrent
+	// write can proceed.
+	uploadStarted := make(chan struct{})
+	// uploadResume lets the test control when the HTTP handler returns,
+	// keeping the upload in-flight while the concurrent write happens.
+	uploadResume := make(chan struct{})
+
+	var uploadedBody atomic.Value // stores []byte
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Errorf("read PUT body: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			uploadedBody.Store(body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 10})
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/snapshot-test.txt", false, int64(len(original)), time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+	fs.inodes.UpdateSize(ino, int64(len(original)))
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/snapshot-test.txt",
+		Dirty:   NewWriteBuffer("/snapshot-test.txt", maxPreloadSize, 0),
+		BaseRev: 1,
+	}
+	if _, err := fh.Dirty.Write(0, original); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+
+	// Start flush in a goroutine — it will release fh.mu during upload.
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	// Wait for the HTTP handler to receive the upload (lock released).
+	<-uploadStarted
+
+	// Mutate the WriteBuffer while upload is in-flight, simulating what
+	// a real fs.Write() would do: write data + advance DirtySeq. If the
+	// fix is correct, the upload uses the pre-unlock snapshot and this
+	// write does not affect the committed data. The generation guard must
+	// also preserve the dirty state so the new data is flushed next time.
+	mutated := []byte("MUTATED-WHILE-UPLOAD-INFLIGHT!")
+	fh.Lock()
+	if _, err := fh.Dirty.Write(0, mutated); err != nil {
+		t.Fatal(err)
+	}
+	// Advance DirtySeq like fs.Write() does via markDirtySize.
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fh.Unlock()
+
+	// Let the upload complete.
+	close(uploadResume)
+
+	st := <-flushDone
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+
+	// Verify the uploaded body matches the ORIGINAL snapshot, not the
+	// mutated data written while the upload was in-flight.
+	got, ok := uploadedBody.Load().([]byte)
+	if !ok {
+		t.Fatal("no upload body recorded")
+	}
+	if !bytes.Equal(got, original) {
+		t.Fatalf("uploaded body = %q, want %q (concurrent write leaked into upload)", got, original)
+	}
+
+	// Verify read cache was seeded with the snapshot, not the mutated buffer.
+	cached, ok := fs.readCache.Get("/snapshot-test.txt", 10)
+	if !ok {
+		t.Fatal("readCache miss after flush")
+	}
+	if !bytes.Equal(cached, original) {
+		t.Fatalf("readCache content = %q, want %q", cached, original)
+	}
+
+	// Verify the concurrent write kept the handle dirty (generation guard).
+	// If ClearDirty ran unconditionally, DirtySeq would be 0 and the new
+	// data would be silently lost on the next flush.
+	fh.Lock()
+	dirtySeqAfter := fh.DirtySeq
+	hasDirty := fh.Dirty.HasDirtyParts()
+	fh.Unlock()
+	if dirtySeqAfter == 0 {
+		t.Fatal("DirtySeq = 0 after flush with concurrent write — new write data would be lost")
+	}
+	if !hasDirty {
+		t.Fatal("Dirty.HasDirtyParts() = false after flush with concurrent write — new write not preserved")
+	}
+
+	// Verify inode size reflects the concurrent write, not the old snapshot.
+	// Without this guard, UpdateSize(ino, size) would roll back to the
+	// uploaded snapshot size, making getattr report a stale file length.
+	entry, ok := fs.inodes.GetEntry(ino)
+	if !ok {
+		t.Fatal("inode entry not found after flush")
+	}
+	if entry.Size != int64(len(mutated)) {
+		t.Fatalf("inode size = %d, want %d (concurrent write size); stale snapshot size would be %d",
+			entry.Size, len(mutated), len(original))
+	}
+}
+
+// TestFlushHandle_Path2_NoDeadlockWithConcurrentWrite verifies that the lock
+// ordering between fh.mu and remoteCommitLock does not deadlock. Before the
+// fix, flushHandle held remoteCommitLock while waiting to reacquire fh.mu,
+// while Write() held fh.mu waiting for remoteCommitLock → deadlock.
+//
+// After the fix, flush releases fh.mu before uploading (unblocking Read)
+// while keeping remoteCommitLock held for same-path serialization. After the
+// upload, remoteCommitLock is released BEFORE re-acquiring fh.mu — so flush
+// never holds remoteCommitLock while waiting for fh.mu. Concurrent Write()
+// acquires fh.mu then blocks on remoteCommitLock until upload finishes —
+// linear wait, no deadlock. This test exercises the actual B3 scenario:
+//
+// 1. Flush starts, upload blocks (remoteCommitLock held, fh.mu released)
+// 2. Write() starts DURING upload — acquires fh.mu, blocks on remoteCommitLock
+// 3. Upload resumes → remoteCommitLock released → Write() completes
+// 4. Both flush and Write succeed, dirty state preserved
+func TestFlushHandle_Path2_NoDeadlockWithConcurrentWrite(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 10})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/deadlock-test.txt", false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/deadlock-test.txt",
+		Dirty:   NewWriteBuffer("/deadlock-test.txt", maxPreloadSize, 0),
+		BaseRev: 1,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fhID := fs.fileHandles.Allocate(fh)
+
+	// Start flush in background.
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	// Wait for upload to start (fh.mu released by Path 2).
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start within timeout — fh.mu not released during Path 2 upload")
+	}
+
+	// Issue Write() DURING upload — this is the B3 deadlock scenario.
+	// Write() acquires fh.mu (released by flush), then blocks on
+	// remoteCommitLock (held by flush for upload serialization).
+	// Before the fix: flush held remoteCommitLock and waited for fh.mu
+	// to relock → circular wait → deadlock.
+	// After the fix: flush releases remoteCommitLock before fh.Lock(),
+	// so Write() completes after upload finishes → no deadlock.
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+			Size:     uint32(len("WORLD")),
+		}, []byte("WORLD"))
+		writeDone <- st
+	}()
+
+	// Give Write() a moment to acquire fh.mu and block on remoteCommitLock.
+	// If this were the old code, both goroutines would be stuck forever.
+	time.Sleep(50 * time.Millisecond)
+
+	// Resume upload — this releases remoteCommitLock, unblocking Write().
+	close(uploadResume)
+
+	// Both flush and Write must complete without deadlock.
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle did not complete — deadlock?")
+	}
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("concurrent Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write did not complete after upload released remoteCommitLock — deadlock?")
+	}
+
+	// The concurrent write must have kept the handle dirty for next flush.
+	fh.Lock()
+	if fh.DirtySeq == 0 {
+		fh.Unlock()
+		t.Fatal("DirtySeq = 0 after concurrent Write — data loss")
+	}
+	fh.Unlock()
+
+	_ = fhID // keep allocated for the duration of the test
+}
+
+// TestFlushHandle_Path2_RenameRetargetDuringUpload verifies that when
+// retargetOpenHandlesForRename changes fh.Path while a Path 2 upload is
+// in-flight, the committed revision is NOT misattributed to the new path.
+func TestFlushHandle_Path2_RenameRetargetDuringUpload(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 20})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	oldPath := "/rename-old.txt"
+	newPath := "/rename-new.txt"
+	ino := fs.inodes.Lookup(oldPath, false, 4, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    oldPath,
+		Dirty:   NewWriteBuffer(oldPath, maxPreloadSize, 0),
+		BaseRev: 5,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fs.openHandles.Add(fh)
+
+	// Start flush in background.
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	// Wait for upload to start.
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Simulate rename retarget while upload is in-flight.
+	fs.retargetOpenHandlesForRename(oldPath, newPath)
+
+	// Let the upload complete.
+	close(uploadResume)
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle did not complete")
+	}
+
+	// The committed revision (20) should NOT be recorded on the new path's
+	// handle state, because the upload went to the old path.
+	fh.Lock()
+	if fh.BaseRev == 20 {
+		fh.Unlock()
+		t.Fatal("markHandleRemoteCommittedLocked ran on retargeted handle — committed old-path upload data to new path")
+	}
+	// Verify the handle was actually retargeted to the new path.
+	if fh.Path != newPath {
+		fh.Unlock()
+		t.Fatalf("fh.Path = %q after retarget, want %q", fh.Path, newPath)
+	}
+	// B4 dirty-preservation: the upload went to old path, but the handle
+	// is now retargeted to new path. The dirty data in the buffer belongs
+	// to the new path and must NOT have been cleared by the old-path
+	// upload's success. DirtySeq must still be non-zero so the next flush
+	// picks up this data for the new path.
+	if fh.DirtySeq == 0 {
+		fh.Unlock()
+		t.Fatal("DirtySeq cleared after retargeted upload — new path data is no longer scheduled for flush")
+	}
+	if fh.Dirty.Size() == 0 {
+		fh.Unlock()
+		t.Fatal("Dirty buffer cleared after retargeted upload — new path data lost")
+	}
+	fh.Unlock()
+
+	// Verify the old path got cached with the upload data.
+	cached, ok := fs.readCache.Get(oldPath, 20)
+	if !ok {
+		t.Fatal("readCache miss for old path after flush")
+	}
+	if !bytes.Equal(cached, []byte("data")) {
+		t.Fatalf("readCache for old path = %q, want %q", cached, "data")
+	}
+
+	// The new path should NOT have cached data from the old-path upload.
+	if _, ok := fs.readCache.Get(newPath, 20); ok {
+		t.Fatal("readCache hit for new path — old-path upload data leaked to new path")
+	}
+}
+
+// TestFlushHandle_Path2_SidecarCacheUsesSnapshotOnRetarget verifies that the
+// SQLite persistent journal sidecar cache uses snapshot path+data (handlePath,
+// dataCopy) after the unlock window, not live fh.Path/fh.Dirty which may be
+// retargeted or mutated by concurrent writes.
+//
+// Uses a -wal path to trigger the isSQLitePersistentJournalPath branch.
+// During upload:
+//   - rename retarget changes fh.Path to a new -wal path
+//   - concurrent write mutates fh.Dirty with different data
+//
+// After flush: asserts sidecar cache contains old path + original snapshot
+// data, NOT the retargeted new path or the mutated dirty buffer.
+func TestFlushHandle_Path2_SidecarCacheUsesSnapshotOnRetarget(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			// Return revision 0 so committedRev == 0, forcing the
+			// sidecar cache branch (sidecarCached) instead of the
+			// committedRev > 0 branch.
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 0})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	oldPath := "/workload.db-wal"
+	newPath := "/renamed.db-wal"
+	ino := fs.inodes.Lookup(oldPath, false, 8, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    oldPath,
+		Dirty:   NewWriteBuffer(oldPath, maxPreloadSize, 0),
+		BaseRev: 3,
+	}
+	walData := []byte("wal-snapshot-data")
+	if _, err := fh.Dirty.Write(0, walData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fs.openHandles.Add(fh)
+
+	// Start flush in background.
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	// Wait for upload to start.
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Rename retarget during upload — fh.Path changes from old to new.
+	fs.retargetOpenHandlesForRename(oldPath, newPath)
+
+	// Mutate fh.Dirty during upload — simulates concurrent Write() while
+	// fh.mu is released. The sidecar cache must still use dataCopy
+	// (snapshot before upload), not live fh.Dirty.bytesView().
+	fh.Lock()
+	mutatedData := []byte("MUTATED-WAL-DATA!")
+	if _, err := fh.Dirty.Write(0, mutatedData); err != nil {
+		fh.Unlock()
+		t.Fatal(err)
+	}
+	fh.Unlock()
+
+	// Let the upload complete.
+	close(uploadResume)
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle did not complete")
+	}
+
+	// The sidecar cache MUST have been seeded under the old path
+	// (handlePath snapshot) with the snapshot data (dataCopy), NOT
+	// under the retargeted new path.
+	// expectedRevision for BaseRev=3 is 3 (expectedRevisionForHandle).
+	sidecarRev := int64(4) // sqliteCommittedRevision(0, 3) = 3+1 = 4
+	cached, ok := fs.readCache.Get(oldPath, sidecarRev)
+	if !ok {
+		t.Fatal("readCache miss for old -wal path — sidecar cache did not use snapshot handlePath")
+	}
+	if !bytes.Equal(cached, walData) {
+		t.Fatalf("readCache for old path = %q, want %q — sidecar cache did not use dataCopy", cached, walData)
+	}
+	// Explicitly verify the cached data is NOT the mutated dirty buffer.
+	if bytes.Equal(cached, mutatedData) {
+		t.Fatal("readCache contains mutated dirty bytes — sidecar cache used live fh.Dirty.bytesView() instead of dataCopy")
+	}
+
+	// The new path must NOT have sidecar cache from the old-path upload.
+	if _, ok := fs.readCache.Get(newPath, sidecarRev); ok {
+		t.Fatal("readCache hit for new -wal path — sidecar cache leaked to retargeted path")
+	}
+}
+
+// TestFlushHandle_Path2_ConcurrentWriteDoesNotCorruptOrigSize verifies that
+// when a concurrent Write() grows the file during the Path 2 unlock window,
+// OrigSize is set to the uploaded snapshot size, not the live dirty buffer
+// size. This ensures the next flush selects the correct upload path (direct
+// PUT vs patch) based on the actual committed base size. (B7 regression test)
+func TestFlushHandle_Path2_ConcurrentWriteDoesNotCorruptOrigSize(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 10})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/origsize-test.txt", false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	// Start with a small file (5 bytes).
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/origsize-test.txt",
+		Dirty:   NewWriteBuffer("/origsize-test.txt", maxPreloadSize, 0),
+		BaseRev: 1,
+	}
+	smallData := []byte("hello")
+	if _, err := fh.Dirty.Write(0, smallData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fhID := fs.fileHandles.Allocate(fh)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Concurrent Write during upload — grow file significantly.
+	largeData := make([]byte, 64*1024)
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+			Size:     uint32(len(largeData)),
+		}, largeData)
+		writeDone <- st
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(uploadResume)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write timed out")
+	}
+
+	// B7 assertion: OrigSize must NOT be the large post-write size.
+	// The uploaded snapshot was 5 bytes, so the committed revision's
+	// OrigSize should reflect the snapshot, not the concurrent write.
+	fh.Lock()
+	origSize := fh.OrigSize
+	dirtySize := fh.Dirty.Size()
+	dirtySeq := fh.DirtySeq
+	fh.Unlock()
+
+	// Dirty must still be pending (DirtySeq != 0) because concurrent write
+	// changed it during upload.
+	if dirtySeq == 0 {
+		t.Fatal("DirtySeq = 0 after concurrent Write — dirty data lost")
+	}
+	// OrigSize must equal the uploaded snapshot size (5 bytes), not the
+	// large dirty buffer size from the concurrent write.
+	snapshotSize := int64(len(smallData))
+	if origSize != snapshotSize {
+		t.Fatalf("OrigSize = %d, want %d (uploaded snapshot size); dirty buffer size = %d — B7: revision-only path must set OrigSize from snapshot",
+			origSize, snapshotSize, dirtySize)
+	}
+
+	_ = fhID
+}
+
+// TestFlushHandle_Path2_NoCommittedRevConcurrentWriteOrigSize verifies
+// that when a Path 2 flush succeeds without the server returning a
+// committed revision (e.g. PatchFile / WriteStreamConditional), and a
+// concurrent Write() grows the file during the unlock window, OrigSize
+// is set to the uploaded snapshot size (not the live dirty buffer size).
+// This is the N1 regression test: without the DirtySeq guard in the
+// non-committedRev finalization paths, finalizeHandleFlushLocked would
+// derive a synthetic revision from expectedRevision and read
+// fh.Dirty.Size() for OrigSize, associating the wrong size.
+func TestFlushHandle_Path2_NoCommittedRevConcurrentWriteOrigSize(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			// Server returns OK but WITHOUT a revision field —
+			// simulates PatchFile/WriteStreamConditional behavior.
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/n1-origsize-test.txt", false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	// Start with a small file (5 bytes).
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/n1-origsize-test.txt",
+		Dirty:   NewWriteBuffer("/n1-origsize-test.txt", maxPreloadSize, 0),
+		BaseRev: 1,
+	}
+	smallData := []byte("hello")
+	if _, err := fh.Dirty.Write(0, smallData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fhID := fs.fileHandles.Allocate(fh)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Concurrent Write during upload — grow file significantly.
+	largeData := make([]byte, 64*1024)
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+			Size:     uint32(len(largeData)),
+		}, largeData)
+		writeDone <- st
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(uploadResume)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write timed out")
+	}
+
+	// N1 assertion: OrigSize must NOT be the large post-write size.
+	// The uploaded snapshot was 5 bytes; the server did NOT return a
+	// revision, so the finalization uses a synthetic revision. OrigSize
+	// should reflect the snapshot, not the concurrent write.
+	fh.Lock()
+	origSize := fh.OrigSize
+	dirtySize := fh.Dirty.Size()
+	dirtySeq := fh.DirtySeq
+	fh.Unlock()
+
+	// Dirty must still be pending (DirtySeq != 0) because concurrent write
+	// changed it during upload.
+	if dirtySeq == 0 {
+		t.Fatal("DirtySeq = 0 after concurrent Write — dirty data lost")
+	}
+	// OrigSize must equal the uploaded snapshot size (5 bytes), not the
+	// large dirty buffer size from the concurrent write.
+	snapshotSize := int64(len(smallData))
+	if origSize != snapshotSize {
+		t.Fatalf("OrigSize = %d, want %d (uploaded snapshot size); dirty buffer size = %d — N1: non-committedRev path must set OrigSize from snapshot",
+			origSize, snapshotSize, dirtySize)
+	}
+
+	_ = fhID
+}
+
+// TestFlushHandle_Path2_LargeBaseSmallSnapshotOrigSize verifies the
+// old-large-base → small snapshot → concurrent write scenario. OrigSize
+// must be set to the uploaded snapshot size (small), not the stale large
+// base size. Otherwise the next flush would incorrectly select patch path
+// against a small remote object. (B7 regression test, adversary scenario)
+func TestFlushHandle_Path2_LargeBaseSmallSnapshotOrigSize(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 20})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/large-base-test.txt", false, 100*1024, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	// Start with a large OrigSize (simulating a previously-large file that
+	// was truncated and rewritten to a small size before this flush).
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     "/large-base-test.txt",
+		Dirty:    NewWriteBuffer("/large-base-test.txt", maxPreloadSize, 0),
+		BaseRev:  5,
+		OrigSize: 100 * 1024, // old large base
+	}
+	// Write small data (simulating truncate + small rewrite).
+	smallData := []byte("tiny")
+	if _, err := fh.Dirty.Write(0, smallData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fhID := fs.fileHandles.Allocate(fh)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Concurrent Write during upload — grow file to 64KB.
+	largeData := make([]byte, 64*1024)
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+			Size:     uint32(len(largeData)),
+		}, largeData)
+		writeDone <- st
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(uploadResume)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write timed out")
+	}
+
+	fh.Lock()
+	origSize := fh.OrigSize
+	dirtySize := fh.Dirty.Size()
+	fh.Unlock()
+
+	// OrigSize must equal the uploaded snapshot size (4 bytes = "tiny"),
+	// NOT the old large base (100KB) and NOT the post-write dirty size (64KB).
+	snapshotSize := int64(len(smallData))
+	if origSize != snapshotSize {
+		t.Fatalf("OrigSize = %d, want %d (uploaded snapshot size); old base = %d, dirty = %d — B7: stale large OrigSize not corrected",
+			origSize, snapshotSize, 100*1024, dirtySize)
+	}
+
+	_ = fhID
+}
+
+// TestFlushHandle_Path2_CleanSiblingOrigSizeFromSnapshot verifies that a
+// clean sibling handle refreshed by markHandleRevisionOnlyLocked gets
+// OrigSize from the uploaded snapshot size, not from the post-concurrent-write
+// inode size. Without this fix, committedHandleSizeLocked would read the
+// inode entry (already updated by the concurrent Write) and rebind the
+// sibling with the wrong OrigSize. (B7 sibling regression test)
+func TestFlushHandle_Path2_CleanSiblingOrigSizeFromSnapshot(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 30})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	ino := fs.inodes.Lookup("/sibling-test.txt", false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 1)
+
+	// Primary handle: small file (5 bytes), dirty.
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    "/sibling-test.txt",
+		Dirty:   NewWriteBuffer("/sibling-test.txt", maxPreloadSize, 0),
+		BaseRev: 1,
+	}
+	smallData := []byte("hello")
+	if _, err := fh.Dirty.Write(0, smallData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	fhID := fs.fileHandles.Allocate(fh)
+
+	// Clean sibling handle: same path, no dirty parts, DirtySeq == 0.
+	sibling := &FileHandle{
+		Ino:      ino,
+		Path:     "/sibling-test.txt",
+		Dirty:    NewWriteBuffer("/sibling-test.txt", maxPreloadSize, 0),
+		BaseRev:  1,
+		OrigSize: 5,
+	}
+	// Set totalSize/remoteSize to match a clean read buffer.
+	sibling.Dirty.totalSize = 5
+	sibling.Dirty.remoteSize = 5
+	siblingID := fs.fileHandles.Allocate(sibling)
+	// Register both handles so refreshCommittedRevisionForOpenHandlesWithSize finds the sibling.
+	if fs.openHandles == nil {
+		fs.openHandles = NewOpenHandleIndex()
+	}
+	fs.openHandles.Add(fh)
+	fs.openHandles.Add(sibling)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Concurrent Write on the primary handle during upload.
+	largeData := make([]byte, 64*1024)
+	for i := range largeData {
+		largeData[i] = byte(i % 256)
+	}
+	writeDone := make(chan gofuse.Status, 1)
+	go func() {
+		_, st := fs.Write(nil, &gofuse.WriteIn{
+			InHeader: gofuse.InHeader{NodeId: ino},
+			Fh:       fhID,
+			Offset:   0,
+			Size:     uint32(len(largeData)),
+		}, largeData)
+		writeDone <- st
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	close(uploadResume)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+	select {
+	case st := <-writeDone:
+		if st != gofuse.OK {
+			t.Fatalf("Write status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Write timed out")
+	}
+
+	snapshotSize := int64(len(smallData))
+
+	// Primary handle: OrigSize must equal snapshot size.
+	fh.Lock()
+	primaryOrigSize := fh.OrigSize
+	fh.Unlock()
+	if primaryOrigSize != snapshotSize {
+		t.Fatalf("primary OrigSize = %d, want %d", primaryOrigSize, snapshotSize)
+	}
+
+	// Sibling handle: OrigSize must also equal snapshot size, NOT the
+	// post-concurrent-write dirty size (64KB).
+	sibling.Lock()
+	siblingOrigSize := sibling.OrigSize
+	siblingBaseRev := sibling.BaseRev
+	sibling.Unlock()
+	if siblingBaseRev != 30 {
+		t.Fatalf("sibling BaseRev = %d, want 30", siblingBaseRev)
+	}
+	if siblingOrigSize != snapshotSize {
+		t.Fatalf("sibling OrigSize = %d, want %d (snapshot size) — clean sibling rebound from post-write inode size",
+			siblingOrigSize, snapshotSize)
+	}
+
+	_ = fhID
+	_ = siblingID
+}
+
+// TestFlushHandle_Path2_RetargetSkipsDirCacheForOldPath verifies that when
+// a handle is retargeted by rename during the Path 2 unlock window,
+// cacheFileForPath is NOT called for the old handlePath. Otherwise it
+// would re-add the pre-rename path to the directory cache after
+// finishLocalRename already removed it. (B8 regression test)
+func TestFlushHandle_Path2_RetargetSkipsDirCacheForOldPath(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 20})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	oldPath := "/rename-dircache-old.txt"
+	newPath := "/rename-dircache-new.txt"
+	ino := fs.inodes.Lookup(oldPath, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 3)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    oldPath,
+		Dirty:   NewWriteBuffer(oldPath, maxPreloadSize, 0),
+		BaseRev: 3,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("data1")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	// Retarget handle during upload (simulates rename).
+	fh.Lock()
+	fh.Path = newPath
+	fh.Unlock()
+
+	// Negative-cache the old path (simulates finishLocalRename).
+	fs.cacheNegativePath(oldPath)
+
+	close(uploadResume)
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+
+	// B8 assertion: the old path must NOT have been re-added to dir cache
+	// as a positive entry. After rename, finishLocalRename negatively cached
+	// oldPath. If cacheFileForPath ran for the retargeted handle, it would
+	// resurrect oldPath with a positive entry (size/revision from upload).
+	parentPath, name := cacheParentName(oldPath)
+	result := fs.dirCache.Lookup(parentPath, name)
+	if result.kind == namespaceLookupPositive {
+		t.Fatalf("dir cache has positive entry for old path %q after retarget — B8 bug: cacheFileForPath should be skipped for retargeted handles (size=%d)",
+			oldPath, result.item.Size)
+	}
+}
+
+// TestFlushHandle_Path2_PatchPathNoFullBufferCopy verifies that the patch
+// path (existing large file with dirty parts) does NOT build a full-buffer
+// dataCopy. Before the B9 fix, dataCopy was unconditionally allocated for
+// all Path 2 flushes, causing 2x memory use for small edits to large files.
+// This test verifies the patch path works correctly without dataCopy by
+// confirming it uses PATCH (not PUT) and completes successfully.
+func TestFlushHandle_Path2_PatchPathNoFullBufferCopy(t *testing.T) {
+	var patchReceived atomic.Bool
+	var putReceived atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			patchReceived.Store(true)
+			_, _ = io.ReadAll(r.Body)
+			// Return a patch plan with no parts to upload (all clean).
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"upload_id":    "test-upload-b9",
+				"upload_parts": []interface{}{},
+				"copied_parts": []interface{}{},
+			})
+			return
+		}
+		if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/complete") {
+			// Complete upload endpoint.
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		if r.Method == http.MethodPut {
+			putReceived.Store(true)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 10})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	// Set inline threshold low so the file is treated as "large".
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	path := "/b9-patch-no-full-copy.dat"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	// Create a handle with OrigSize above threshold (existing large file).
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev:  5,
+		OrigSize: 200, // above threshold → patch path
+	}
+
+	// Write some data to make it dirty.
+	data := make([]byte, 200)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+
+	// B9 assertion: The flush should have used PATCH (not PUT) for this
+	// existing large file, confirming the patch path was taken. The patch
+	// path uses partSnapshots (per-dirty-part copies) instead of a full
+	// dataCopy, avoiding 2x memory for large files with small edits.
+	if !patchReceived.Load() {
+		t.Fatal("expected PATCH request for existing large file above threshold — patch path not taken")
+	}
+	if putReceived.Load() {
+		t.Fatal("received PUT for existing large file — should use patch path, not direct PUT")
+	}
+}
+
+// TestFlushHandle_Path2_GrowthBypassesPatch verifies that when a large
+// existing file grows beyond OrigSize, Path 2 uses WriteStreamConditional
+// (full upload) instead of PatchFile. Without the B11 guard
+// (size <= handleOrigSize), PatchFile would be selected for a grown file,
+// but new parts beyond the original size have no server-side data, and the
+// patch callback cannot construct correct content for them.
+func TestFlushHandle_Path2_GrowthBypassesPatch(t *testing.T) {
+	var patchReceived atomic.Bool
+	var writeStreamReceived atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch {
+			patchReceived.Store(true)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"upload_id":    "test-upload-b11",
+				"upload_parts": []interface{}{},
+				"copied_parts": []interface{}{},
+			})
+			return
+		}
+		if r.Method == http.MethodPost {
+			// Multipart initiate or complete.
+			if strings.Contains(r.URL.Path, "/complete") {
+				w.WriteHeader(http.StatusOK)
+				_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+				return
+			}
+			// Initiate — WriteStreamConditional starts with POST.
+			writeStreamReceived.Store(true)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			writeStreamReceived.Store(true)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	path := "/b11-growth-no-patch.dat"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	// Existing large file (OrigSize=200), but write grows it to 400.
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev:  5,
+		OrigSize: 200, // above threshold
+	}
+
+	// Write 400 bytes — grows beyond OrigSize.
+	data := make([]byte, 400)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	if _, err := fh.Dirty.Write(0, data); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	fh.Lock()
+	_ = fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	// B11 assertion: growth must NOT use PatchFile. It should use
+	// WriteStreamConditional (full upload) because new parts beyond
+	// OrigSize have no server-side original data.
+	if patchReceived.Load() {
+		t.Fatal("received PATCH for grown file — B11: growth beyond OrigSize must bypass patch path and use full upload")
+	}
+}
+
+// TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock verifies that when
+// a Path 2 flush succeeds without the server returning a committed revision
+// (e.g. PatchFile / WriteStreamConditional), the synthetic revision
+// (expectedRevision + 1) is recorded to committedRev BEFORE releasing
+// the per-path remote commit lock. Without this (B10), a same-path flush
+// could acquire the lock, snapshot a stale expectedRevision, and issue a
+// conditional upload that conflicts with the just-completed one.
+func TestFlushHandle_Path2_SyntheticRevRecordedBeforeUnlock(t *testing.T) {
+	uploadStarted := make(chan struct{})
+	uploadResume := make(chan struct{})
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			_, _ = io.ReadAll(r.Body)
+			close(uploadStarted)
+			<-uploadResume
+			// Return OK WITHOUT a revision — simulates WriteStreamConditional.
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok"})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	path := "/b10-synthetic-rev.txt"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    path,
+		Dirty:   NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev: 5,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	flushDone := make(chan gofuse.Status, 1)
+	go func() {
+		fh.Lock()
+		st := fs.flushHandle(context.Background(), fh)
+		fh.Unlock()
+		flushDone <- st
+	}()
+
+	select {
+	case <-uploadStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("upload did not start")
+	}
+
+	close(uploadResume)
+
+	select {
+	case st := <-flushDone:
+		if st != gofuse.OK {
+			t.Fatalf("flushHandle status = %v, want OK", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("flushHandle timed out")
+	}
+
+	// B10 assertion: The synthetic revision (expectedRevision + 1 = 6)
+	// must be recorded in committedRev. Without the B10 fix, committedRev
+	// was only recorded for server-returned revisions (committedRev > 0),
+	// leaving a window where a same-path flush could snapshot stale state.
+	fs.committedMu.Lock()
+	recordedRev := fs.committedRev[path]
+	fs.committedMu.Unlock()
+
+	expectedSyntheticRev := int64(6) // BaseRev(5) + 1
+	if recordedRev != expectedSyntheticRev {
+		t.Fatalf("committedRev[%q] = %d, want %d — B10: synthetic revision must be recorded before releasing remote commit lock",
+			path, recordedRev, expectedSyntheticRev)
+	}
+}
+
+// TestFlushHandle_Path2_LazyLoadedGrowthReturnsEIO verifies that when a
+// lazy-loaded existing large file grows beyond OrigSize and enters the
+// WriteStreamConditional path, flushHandle returns EIO if the buffer
+// cannot materialize all parts. Without the B12 fix, bytesView() would
+// zero-fill unloaded remote-backed parts, overwriting remote data.
+func TestFlushHandle_Path2_LazyLoadedGrowthReturnsEIO(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("should not reach server — flush should return EIO before upload")
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var threshold int64 = 100
+	fs.smallFileMax.Store(threshold)
+
+	path := "/b12-lazy-growth.dat"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	// Create a part-mode WriteBuffer with remoteSize > 0 (simulating
+	// a lazy-loaded existing large file where some parts are NOT loaded).
+	wb := NewWriteBuffer(path, maxPreloadSize, 256)
+	wb.remoteSize = 512 // remote has 512 bytes that are NOT loaded locally
+	wb.totalSize = 512
+
+	fh := &FileHandle{
+		Ino:      ino,
+		Path:     path,
+		Dirty:    wb,
+		BaseRev:  5,
+		OrigSize: 200, // above threshold
+	}
+
+	// Write ONLY at offset 512 (append), growing file to 600.
+	// Parts 0 and 1 (covering bytes 0-511) are NOT loaded.
+	appendData := make([]byte, 88)
+	for i := range appendData {
+		appendData[i] = byte(i + 1)
+	}
+	if _, err := fh.Dirty.Write(512, appendData); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	// Verify CanMaterializeFull is false (parts 0,1 not loaded).
+	if fh.Dirty.CanMaterializeFull() {
+		t.Fatal("expected CanMaterializeFull() = false for lazy-loaded buffer")
+	}
+
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	// B12 assertion: must return EIO, not attempt upload with zero-filled data.
+	if st == gofuse.OK {
+		t.Fatal("expected EIO for lazy-loaded growth path — B12: must not materialize unloaded remote parts as zeroes")
+	}
+	if st != gofuse.EIO {
+		t.Fatalf("expected EIO, got %v", st)
+	}
+}
+
+// TestFlushHandle_Path2_DebounceCancelledBeforeUnlock verifies that the
+// debouncer is cancelled for the flush path before releasing fh.mu.
+// Without the B13 fix, a debounced upload could fire while fh.mu is
+// released, racing with the forced flush upload using the same
+// expectedRevision and causing a CAS conflict.
+func TestFlushHandle_Path2_DebounceCancelledBeforeUnlock(t *testing.T) {
+	var uploadCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			uploadCount.Add(1)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 10})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	opts.FlushDebounce = 50 * time.Millisecond
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	path := "/b13-debounce-cancel.txt"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    path,
+		Dirty:   NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev: 5,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	// Schedule a debounced flush first.
+	fh.Lock()
+	_ = fs.flushHandleDebounced(context.Background(), fh, false)
+	fh.Unlock()
+
+	// Now do a forced flush (flushHandle directly). This should cancel
+	// the pending debounce before releasing fh.mu.
+	fh.Lock()
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+
+	// Wait for debounce timer to expire. If the debounce was properly
+	// cancelled, only the forced flush upload should have occurred.
+	time.Sleep(200 * time.Millisecond)
+
+	count := uploadCount.Load()
+	if count != 1 {
+		t.Fatalf("upload count = %d, want 1 — B13: debounced upload should be cancelled before forced flush", count)
+	}
+}
+
+// TestFlushHandle_Path2_DebounceAlreadyFiredSkipsUpload verifies that when a
+// debounced callback has already fired and is blocked waiting on handle.Lock(),
+// it acquires remoteCommitLock and re-checks expectedRevision, skipping the
+// upload if a forced flush (Path 2) already uploaded successfully.
+//
+// Interleaving under test:
+//
+//	1. Hold fh.Lock() → schedule debounce (short delay) → keep lock held
+//	2. Timer fires → callback blocks on handle.Lock() (we hold it)
+//	3. Call flushHandle (Path 2) while holding lock — Path 2 internally
+//	   releases fh.mu, uploads, records committed revision, releases
+//	   remoteCommitLock, reacquires fh.mu, returns
+//	4. fh.Unlock() → callback acquires handle.Lock() → acquires
+//	   remoteCommitLock → re-checks expectedRevision → skip (no double PUT)
+func TestFlushHandle_Path2_DebounceAlreadyFiredSkipsUpload(t *testing.T) {
+	var uploadCount atomic.Int32
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			uploadCount.Add(1)
+			_, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "revision": 10})
+			return
+		}
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	// Very short debounce so the timer fires while we hold the lock.
+	opts.FlushDebounce = 5 * time.Millisecond
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	path := "/b13-already-fired.txt"
+	ino := fs.inodes.Lookup(path, false, 5, time.Now())
+	fs.inodes.UpdateRevision(ino, 5)
+
+	fh := &FileHandle{
+		Ino:     ino,
+		Path:    path,
+		Dirty:   NewWriteBuffer(path, maxPreloadSize, 0),
+		BaseRev: 5,
+	}
+	if _, err := fh.Dirty.Write(0, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	fh.DirtySeq = fs.markDirtySize(ino, fh.Dirty.Size())
+	_ = fs.fileHandles.Allocate(fh)
+
+	// Step 1: Hold lock, schedule debounce, keep lock held.
+	fh.Lock()
+	_ = fs.flushHandleDebounced(context.Background(), fh, false)
+	// Do NOT unlock — we keep fh.mu held so the callback blocks.
+
+	// Step 2: Wait for the debounce timer to fire. The callback removes
+	// itself from the pending map and then blocks on handle.Lock().
+	time.Sleep(50 * time.Millisecond)
+	// At this point: callback has fired, removed from pending map,
+	// blocked on handle.Lock(). Cancel() would be a no-op.
+
+	// Step 3: Force flush (Path 2) while holding fh.mu.
+	// flushHandle internally: acquires remoteCommitLock → releases fh.mu →
+	// uploads → records committed revision → releases remoteCommitLock →
+	// reacquires fh.mu → returns.
+	//
+	// During the fh.Unlock() window inside flushHandle, the debounced
+	// callback acquires handle.Lock() but then blocks on remoteCommitLock
+	// (which Path 2 still holds). After Path 2 finishes, callback acquires
+	// remoteCommitLock, re-checks expectedRevision, sees it changed, skips.
+	st := fs.flushHandle(context.Background(), fh)
+	fh.Unlock()
+
+	if st != gofuse.OK {
+		t.Fatalf("flushHandle status = %v, want OK", st)
+	}
+
+	// Step 4: Wait for debounced callback to finish (it should skip).
+	time.Sleep(100 * time.Millisecond)
+
+	count := uploadCount.Load()
+	if count != 1 {
+		t.Fatalf("upload count = %d, want 1 — B13: already-fired debounced callback should be serialized by remoteCommitLock and skip when expectedRevision advanced", count)
+	}
+}
+
 func TestFinalizeHandleFlushLocked_ResetsStreamerToCommittedRevision(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
