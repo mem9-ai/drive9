@@ -82,12 +82,12 @@ func (c *Client) AdminListTenants(ctx context.Context, query AdminTenantListRequ
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create admin tenant list request: %w", err)
 	}
 	setQuotaHeaders(req, query.PublicKey, query.PrivateKey)
 	resp, err := c.do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("admin tenant list request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
@@ -107,12 +107,12 @@ func (c *Client) AdminCreateTenant(ctx context.Context, req AdminTenantCreateReq
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/v1/admin/tenants", bytes.NewReader(raw))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create admin tenant create request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	resp, err := c.do(httpReq)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("admin tenant create request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
@@ -128,12 +128,12 @@ func (c *Client) AdminCreateTenant(ctx context.Context, req AdminTenantCreateReq
 func (c *Client) AdminGetTenant(ctx context.Context, query QuotaRequest) (*AdminTenant, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/admin/tenants/"+url.PathEscape(query.TenantID), nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create admin tenant get request: %w", err)
 	}
 	setQuotaHeaders(req, query.PublicKey, query.PrivateKey)
 	resp, err := c.do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("admin tenant get request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {
@@ -156,12 +156,12 @@ func (c *Client) AdminDeleteTenant(ctx context.Context, req AdminTenantDeleteReq
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/v1/admin/tenants/"+url.PathEscape(req.TenantID), bytes.NewReader(raw))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create admin tenant delete request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	resp, err := c.do(httpReq)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("admin tenant delete request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode >= 300 {

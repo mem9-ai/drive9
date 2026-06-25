@@ -315,6 +315,9 @@ func adminTenantGet(args []string) error {
 	if err != nil {
 		return quotaAPIError("get admin tenant", err)
 	}
+	if out == nil {
+		return fmt.Errorf("admin tenant get response is empty")
+	}
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")

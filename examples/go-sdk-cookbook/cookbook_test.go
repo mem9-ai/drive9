@@ -415,6 +415,11 @@ func Example_localFileTransferShape() {
 }
 
 var coveredClientMethods = map[string]bool{
+	"AdminCreateTenant":                    true,
+	"AdminDeleteTenant":                    true,
+	"AdminGetTenant":                       true,
+	"AdminListTenants":                     true,
+	"AdminSetTenantQuota":                  true,
 	"AppendJournalEntries":                 true,
 	"AppendStream":                         true,
 	"APIKey":                               true,
