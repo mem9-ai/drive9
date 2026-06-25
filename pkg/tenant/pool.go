@@ -309,6 +309,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			e.refs++
 			p.order.MoveToFront(e.elem)
 			p.mu.Unlock()
+			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
 			logger.InfoBenchTiming(ctx, "tenant_pool_acquire_timing",
 				zap.String("tenant_id", t.ID),
 				zap.Bool("cache_hit", true),
@@ -342,6 +343,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			p.mu.Unlock()
 			b.Close()
 			_ = st.Close()
+			metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
 			logger.InfoBenchTiming(ctx, "tenant_pool_acquire_timing",
 				zap.String("tenant_id", t.ID),
 				zap.Bool("cache_hit", true),
@@ -368,6 +370,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	// concurrently with a leadership transition resolves to the post-transition
 	// state rather than a moment-in-time IsLeader() check taken outside the lock.
 	startFileGC := p.fileGCEnabled
+	metrics.RecordGauge("tenant_pool", "cached_backends", float64(len(p.items)))
 	p.mu.Unlock()
 	if startFileGC {
 		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
@@ -375,6 +378,7 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 	for _, retired := range toClose {
 		closeEntry(retired)
 	}
+	metrics.RecordOperation("tenant_pool", "cache_lookup", "miss", 0)
 	logger.InfoBenchTiming(ctx, "tenant_pool_acquire_timing",
 		zap.String("tenant_id", t.ID),
 		zap.Bool("cache_hit", false),
@@ -966,6 +970,8 @@ func (p *Pool) removeLocked(elem *list.Element) *entry {
 	e.elem = nil
 	delete(p.items, e.tenantID)
 	e.retired = true
+	metrics.RecordOperation("tenant_pool", "evict", "ok", 0)
+	metrics.RecordGauge("tenant_pool", "cached_backends", float64(len(p.items)))
 	if e.refs == 0 {
 		return e
 	}

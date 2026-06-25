@@ -31,6 +31,14 @@ type Config struct {
 }
 
 func New(ctx context.Context, cfg Config) (Encryptor, error) {
+	enc, err := newEncryptor(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return newInstrumentedEncryptor(enc), nil
+}
+
+func newEncryptor(ctx context.Context, cfg Config) (Encryptor, error) {
 	switch strings.ToLower(string(cfg.Type)) {
 	case string(TypeLocalAES), "":
 		if cfg.Key == "" {

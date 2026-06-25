@@ -1250,6 +1250,7 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	tok := bearerToken(r)
 	if tok == "" {
+		metricEvent(r.Context(), "auth", "result", "missing_token")
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_missing_token")...)
 		errJSON(w, http.StatusUnauthorized, "missing or malformed Authorization header")
 		return
@@ -1258,43 +1259,51 @@ func (s *Server) handleTenantStatus(w http.ResponseWriter, r *http.Request) {
 	resolved, err := s.meta.ResolveByAPIKeyHash(r.Context(), token.HashToken(tok))
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
+			metricEvent(r.Context(), "auth", "result", "key_not_found")
 			logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_not_found")...)
 			errJSON(w, http.StatusUnauthorized, "invalid API key")
 			return
 		}
+		metricEvent(r.Context(), "auth", "result", "meta_unavailable")
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_meta_unavailable", "error", err)...)
 		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(token.HashToken(tok)), []byte(resolved.APIKey.JWTHash)) != 1 {
+		metricEvent(r.Context(), "auth", "result", "hash_mismatch")
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_hash_mismatch", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
 	setRequestMetricTenant(r.Context(), resolved.Tenant.ID, resolved.APIKey.ID, resolved.Tenant.Provider, classifyTenantRequest(r))
 	if resolved.APIKey.Status != meta.APIKeyActive {
+		metricEvent(r.Context(), "auth", "result", "key_inactive")
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_key_inactive", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "status", resolved.APIKey.Status)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
 	plain, err := poolDecryptToken(r.Context(), s.pool, resolved.APIKey.JWTCiphertext)
 	if err != nil {
+		metricEvent(r.Context(), "auth", "result", "decrypt_failed")
 		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_decrypt_failed", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 		errJSON(w, http.StatusInternalServerError, "auth backend unavailable")
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(tok), plain) != 1 {
+		metricEvent(r.Context(), "auth", "result", "token_mismatch")
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_token_mismatch", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
 	claims, err := token.ParseAndVerifyToken(s.tokenSecret, tok)
 	if err != nil {
+		metricEvent(r.Context(), "auth", "result", "token_invalid")
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_token_invalid", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "error", err)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return
 	}
 	if claims.TenantID != resolved.Tenant.ID || claims.TokenVersion != resolved.APIKey.TokenVersion {
+		metricEvent(r.Context(), "auth", "result", "claims_mismatch")
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "tenant_status_claims_mismatch", "tenant_id", resolved.Tenant.ID, "api_key_id", resolved.APIKey.ID, "claim_tenant", claims.TenantID, "claim_version", claims.TokenVersion)...)
 		errJSON(w, http.StatusUnauthorized, "invalid API key")
 		return

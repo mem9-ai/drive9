@@ -217,6 +217,8 @@ func WritePrometheus(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	globalRegistry.WritePrometheus(w)
 	writeDBPrometheus(w)
+	writeRuntimeMetrics(w)
+	writeProcessMetrics(w)
 }
 
 func cleanMetricValue(value, fallback string) string {

@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"net/http"
@@ -8,9 +9,20 @@ import (
 	"time"
 )
 
+// dbProbeState is the cached result of the most recent health probe for a role.
+type dbProbeState struct {
+	up               bool
+	unreachablePools int
+	totalPools       int
+	lastProbe        time.Time
+	known            bool
+}
+
 type dbMetrics struct {
-	mu  sync.RWMutex
-	dbs map[*sql.DB]string
+	mu      sync.RWMutex
+	dbs     map[*sql.DB]string
+	probe   map[string]dbProbeState
+	started bool
 }
 
 type dbPoolTotals struct {
@@ -27,14 +39,24 @@ type dbPoolTotals struct {
 }
 
 var dbOperationDurationBounds = []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}
+var dbProbeDurationBounds = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 
 var globalDB = &dbMetrics{
-	dbs: map[*sql.DB]string{},
+	dbs:   map[*sql.DB]string{},
+	probe: map[string]dbProbeState{},
 }
 
 var dbMeter = globalMeterProvider.Meter("db")
 var dbOperationsTotal = dbMeter.Int64Counter("drive9_db_operations_total", "Database operations by role/operation/result")
 var dbOperationDuration = dbMeter.Float64Histogram("drive9_db_operation_duration_seconds", "Database operation duration histogram", dbOperationDurationBounds)
+var dbProbeDuration = dbMeter.Float64Histogram("drive9_db_probe_duration_seconds", "Database health probe ping duration histogram by role/result", dbProbeDurationBounds)
+
+// DefaultDBHealthProbeInterval and DefaultDBHealthProbeTimeout are the fallbacks
+// used by StartDBHealthProbe when callers pass non-positive values.
+const (
+	DefaultDBHealthProbeInterval = 15 * time.Second
+	DefaultDBHealthProbeTimeout  = 3 * time.Second
+)
 
 func RecordDBOperation(role, operation, result string, d time.Duration) {
 	RegisterModule("db")
@@ -66,6 +88,128 @@ func UnregisterDB(db *sql.DB) {
 	globalDB.mu.Unlock()
 }
 
+// StartDBHealthProbe launches a background goroutine that periodically pings every
+// registered *sql.DB and publishes a per-role availability signal as the
+// drive9_db_up gauge. It is the active dependency-health probe for the metadata
+// store ("meta") and tenant data stores ("user"): pool/operation metrics only move
+// while there is live traffic, so an idle-but-unreachable database is otherwise
+// invisible.
+//
+// The probe never blocks the /metrics scrape path — scrapes read the cached probe
+// state. onChange (optional) is invoked outside the lock on a role's first observed
+// failure and on every subsequent up<->down transition, so callers can emit a log
+// without coupling this package to a logger. The goroutine stops when ctx is done;
+// repeat calls after the first are no-ops.
+//
+// Example alert (critical — control-plane DB unreachable):
+//
+//	max(drive9_db_up{role="meta"}) == 0
+func StartDBHealthProbe(ctx context.Context, interval, timeout time.Duration, onChange func(role string, up bool, err error)) {
+	if interval <= 0 {
+		interval = DefaultDBHealthProbeInterval
+	}
+	if timeout <= 0 {
+		timeout = DefaultDBHealthProbeTimeout
+	}
+
+	globalDB.mu.Lock()
+	if globalDB.started {
+		globalDB.mu.Unlock()
+		return
+	}
+	globalDB.started = true
+	globalDB.mu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		globalDB.probeOnce(ctx, timeout, onChange)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				globalDB.probeOnce(ctx, timeout, onChange)
+			}
+		}
+	}()
+}
+
+// probeOnce runs a single probe cycle across all registered pools and updates the
+// cached per-role state. Exported indirectly for tests via probeOnce.
+func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChange func(role string, up bool, err error)) {
+	m.mu.RLock()
+	dbByRole := make(map[*sql.DB]string, len(m.dbs))
+	for db, role := range m.dbs {
+		dbByRole[db] = role
+	}
+	m.mu.RUnlock()
+
+	type roleAgg struct {
+		total       int
+		unreachable int
+		firstErr    error
+	}
+	results := map[string]*roleAgg{}
+	for db, role := range dbByRole {
+		agg := results[role]
+		if agg == nil {
+			agg = &roleAgg{}
+			results[role] = agg
+		}
+		agg.total++
+
+		pingCtx, cancel := context.WithTimeout(ctx, timeout)
+		start := time.Now()
+		err := db.PingContext(pingCtx)
+		cancel()
+
+		result := "ok"
+		if err != nil {
+			result = "error"
+			agg.unreachable++
+			if agg.firstErr == nil {
+				agg.firstErr = err
+			}
+		}
+		dbProbeDuration.Observe(time.Since(start).Seconds(), Attr("role", role), Attr("result", result))
+	}
+
+	type transition struct {
+		role string
+		up   bool
+		err  error
+	}
+	var transitions []transition
+	now := time.Now()
+
+	m.mu.Lock()
+	if m.probe == nil {
+		m.probe = map[string]dbProbeState{}
+	}
+	for role, agg := range results {
+		up := agg.unreachable == 0
+		prev, existed := m.probe[role]
+		m.probe[role] = dbProbeState{
+			up:               up,
+			unreachablePools: agg.unreachable,
+			totalPools:       agg.total,
+			lastProbe:        now,
+			known:            true,
+		}
+		// Fire on the first observed failure, and on every up<->down change
+		// thereafter. A first observation that is healthy is not a transition.
+		if onChange != nil && ((!existed && !up) || (existed && prev.up != up)) {
+			transitions = append(transitions, transition{role: role, up: up, err: agg.firstErr})
+		}
+	}
+	m.mu.Unlock()
+
+	for _, t := range transitions {
+		onChange(t.role, t.up, t.err)
+	}
+}
+
 func writeDBPrometheus(w http.ResponseWriter) {
 	globalDB.mu.RLock()
 	dbByRole := make(map[*sql.DB]string, len(globalDB.dbs))
@@ -91,6 +235,37 @@ func writeDBPrometheus(w http.ResponseWriter) {
 		poolTotals[role] = totals
 	}
 	roles := SortedKeys(poolTotals)
+
+	globalDB.mu.RLock()
+	probeByRole := make(map[string]dbProbeState, len(globalDB.probe))
+	for role, state := range globalDB.probe {
+		probeByRole[role] = state
+	}
+	globalDB.mu.RUnlock()
+
+	// drive9_db_up is the active availability signal: 1 when every registered pool
+	// for the role answered its last health ping, 0 when any pool is unreachable.
+	// Roles not yet probed default to 1 (the startup ping already succeeded), so the
+	// `== 0` alert never fires on a cold series.
+	_, _ = fmt.Fprintln(w, "# HELP drive9_db_up Database availability by role (1 = all registered pools reachable on last probe)")
+	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_up gauge")
+	for _, role := range roles {
+		up := 1.0
+		if state, ok := probeByRole[role]; ok && state.known && !state.up {
+			up = 0.0
+		}
+		_, _ = fmt.Fprintf(w, "drive9_db_up{role=\"%s\"} %s\n", EscapePromLabel(role), formatFloat(up))
+	}
+
+	_, _ = fmt.Fprintln(w, "# HELP drive9_db_unreachable_pools Registered pools that failed their last health probe by role")
+	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_unreachable_pools gauge")
+	for _, role := range roles {
+		unreachable := 0
+		if state, ok := probeByRole[role]; ok && state.known {
+			unreachable = state.unreachablePools
+		}
+		_, _ = fmt.Fprintf(w, "drive9_db_unreachable_pools{role=\"%s\"} %d\n", EscapePromLabel(role), unreachable)
+	}
 
 	_, _ = fmt.Fprintln(w, "# HELP drive9_db_pool_registered Database pools currently registered for metrics by role")
 	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_pool_registered gauge")

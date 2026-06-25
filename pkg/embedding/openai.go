@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // OpenAIClientConfig configures an OpenAI-compatible embeddings endpoint.
@@ -63,8 +66,32 @@ func NewOpenAIClient(cfg OpenAIClientConfig) (*OpenAIClient, error) {
 	}, nil
 }
 
-// EmbedText implements Client.
+// EmbedText implements Client. It records drive9_service_operations_total and
+// drive9_service_operation_duration_seconds under component="embedding" so the
+// outbound LLM embedding provider's latency and error rate are observable (these
+// calls were previously silent — failures only surfaced indirectly as semantic
+// task retries / extract errors).
 func (c *OpenAIClient) EmbedText(ctx context.Context, text string) ([]float32, error) {
+	start := time.Now()
+	emb, err := c.embedText(ctx, text)
+	metrics.RecordOperation("embedding", "embed_text", embeddingResult(err), time.Since(start))
+	return emb, err
+}
+
+func embeddingResult(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		return "error"
+	}
+}
+
+func (c *OpenAIClient) embedText(ctx context.Context, text string) ([]float32, error) {
 	payload := map[string]any{
 		"model": c.model,
 		"input": text,
