@@ -717,6 +717,77 @@ func TestDecodeCredentialProvisionRequestRejectsOversizedBody(t *testing.T) {
 	}
 }
 
+func TestProvisionTiDBCloudNativeRejectsQuotaWithoutCredentials(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	tokenSecret := make([]byte, 32)
+	if _, err := rand.Read(tokenSecret); err != nil {
+		t.Fatal(err)
+	}
+	prov := &fakeProvisioner{
+		provider:          tenant.ProviderTiDBCloudNative,
+		cluster:           &tenant.ClusterInfo{},
+		defaultPublicKey:  "default-public",
+		defaultPrivateKey: "default-private",
+	}
+	srv := NewWithConfig(Config{
+		Meta:                         metaStore,
+		Pool:                         pool,
+		Provisioner:                  prov,
+		TokenSecret:                  tokenSecret,
+		DisableDatabaseAutoEmbedding: true,
+	})
+	defer srv.Close()
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	spendingLimit := int64(10000)
+	body, _ := json.Marshal(map[string]any{
+		"tidbcloud_spending_limit": spendingLimit,
+	})
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/v1/provision", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status=%d, want %d", resp.StatusCode, http.StatusBadRequest)
+	}
+	var raw map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		t.Fatal(err)
+	}
+	if got := prov.credentialCalls.Load(); got != 0 {
+		t.Fatalf("credential provision calls = %d, want 0", got)
+	}
+	if got := prov.quotaUpdateCalls.Load(); got != 0 {
+		t.Fatalf("quota update calls = %d, want 0", got)
+	}
+	msg, _ := raw["error"].(string)
+	if !strings.Contains(strings.ToLower(msg), "requires public_key and private_key when quota settings are provided") {
+		t.Fatalf("error = %#v", raw)
+	}
+}
+
 func TestProvisionTenantRejectsMissingNativeCredentialsBeforeInsert(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

@@ -3765,6 +3765,10 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 				errJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
+			if decoded != nil && decoded.Quota != nil {
+				errJSON(w, http.StatusBadRequest, "TiDBCloud Mode requires public_key and private_key when quota settings are provided")
+				return
+			}
 			defaultReq := resolveDefaultCredentials(s.provisioner)
 			if defaultReq == nil {
 				errJSON(w, http.StatusBadRequest, tenant.ErrCredentialsRequired.Error())
