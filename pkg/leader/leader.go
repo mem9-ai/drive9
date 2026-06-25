@@ -12,8 +12,23 @@ import (
 	"time"
 
 	"github.com/mem9-ai/drive9/pkg/logger"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"go.uber.org/zap"
 )
+
+// metricsComponent is the metrics component name for leader election. It exposes
+// drive9_service_gauge{component="leader",name="is_leader"} (1 on the pod that
+// currently holds the lock, 0 on followers), so the fleet can be alerted when no
+// pod is leader and all leader-gated background workers have stalled.
+const metricsComponent = "leader"
+
+func recordLeaderState(isLeader bool) {
+	if isLeader {
+		metrics.RecordGauge(metricsComponent, "is_leader", 1)
+		return
+	}
+	metrics.RecordGauge(metricsComponent, "is_leader", 0)
+}
 
 const (
 	// defaultLockName is the named lock used for leader election.
@@ -167,6 +182,9 @@ func (m *Manager) Start(ctx context.Context) {
 		m.isLeader = true
 		cb := m.onLead
 		m.mu.Unlock()
+		// Single-pod mode is always the leader; publish it so the no-leader
+		// alert never false-fires against a healthy single-pod deployment.
+		recordLeaderState(true)
 		if cb != nil {
 			cb()
 		}
@@ -190,6 +208,7 @@ func (m *Manager) Stop() {
 		m.isLeader = false
 		cb := m.onLose
 		m.mu.Unlock()
+		recordLeaderState(false)
 		if cb != nil {
 			cb()
 		}
@@ -214,8 +233,11 @@ func (m *Manager) run(workerCtx context.Context) {
 		default:
 		}
 
+		acquireStart := time.Now()
 		acquired, conn, err := m.tryAcquire(workerCtx)
 		if err != nil {
+			metrics.RecordOperation(metricsComponent, "acquire", "error", time.Since(acquireStart))
+			recordLeaderState(false)
 			logger.Warn(workerCtx, "leader_acquire_failed",
 				zap.String("lock", m.lockName),
 				zap.Error(err))
@@ -224,13 +246,15 @@ func (m *Manager) run(workerCtx context.Context) {
 		}
 
 		if acquired {
+			metrics.RecordOperation(metricsComponent, "acquire", "ok", time.Since(acquireStart))
 			m.gainLeadership()
 			m.holdLeadership(workerCtx, conn)
 			// When holdLeadership returns, we lost the lock or ctx was cancelled.
 			m.loseLeadership()
 			m.releaseConn(conn)
 		} else {
-			// Someone else holds the lock. Release the conn and retry.
+			// Someone else holds the lock. Publish follower state and retry.
+			recordLeaderState(false)
 			m.releaseConn(conn)
 			m.sleep(workerCtx, m.interval)
 		}
@@ -297,8 +321,10 @@ func (m *Manager) holdLeadership(ctx context.Context, conn *sql.Conn) {
 			return
 		case <-ticker.C:
 			// Keep the connection alive and verify lock ownership in one round-trip.
+			heartbeatStart := time.Now()
 			var ownerID sql.NullInt64
 			if err := conn.QueryRowContext(ctx, isUsedLockSQL, m.lockName).Scan(&ownerID); err != nil {
+				metrics.RecordOperation(metricsComponent, "heartbeat", "error", time.Since(heartbeatStart))
 				logger.Warn(ctx, "leader_heartbeat_failed",
 					zap.String("lock", m.lockName),
 					zap.Error(err))
@@ -319,7 +345,9 @@ func (m *Manager) holdLeadership(ctx context.Context, conn *sql.Conn) {
 				return
 			}
 			// Keep the connection alive to prevent wait_timeout from closing it.
+			keepaliveStart := time.Now()
 			if _, err := conn.ExecContext(ctx, keepAliveSQL); err != nil {
+				metrics.RecordOperation(metricsComponent, "keepalive", "error", time.Since(keepaliveStart))
 				logger.Warn(ctx, "leader_keepalive_failed",
 					zap.String("lock", m.lockName),
 					zap.Error(err))
@@ -346,6 +374,7 @@ func (m *Manager) gainLeadership() {
 	m.isLeader = true
 	cb := m.onLead
 	m.mu.Unlock()
+	recordLeaderState(true)
 	if !wasLeader && cb != nil {
 		logger.Info(context.Background(), "leader_gained",
 			zap.String("lock", m.lockName))
@@ -360,6 +389,7 @@ func (m *Manager) loseLeadership() {
 	m.ownConnID = 0
 	cb := m.onLose
 	m.mu.Unlock()
+	recordLeaderState(false)
 	if wasLeader && cb != nil {
 		logger.Info(context.Background(), "leader_lost",
 			zap.String("lock", m.lockName))

@@ -26,6 +26,7 @@ import (
 	"github.com/mem9-ai/drive9/pkg/leader"
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/s3client"
 	"github.com/mem9-ai/drive9/pkg/server"
 	"github.com/mem9-ai/drive9/pkg/slockoauth"
@@ -135,6 +136,21 @@ func main() {
 		}
 	}
 	defer func() { _ = store.Close() }()
+
+	// Continuously probe registered databases so that a metadata ("meta") or tenant
+	// ("user") store that becomes unreachable *after* startup is visible via the
+	// drive9_db_up gauge and the access log, not just indirectly through failing
+	// traffic. The probe covers the meta store immediately and tenant pools as they
+	// register. The startup ping above only proves reachability at boot.
+	probeInterval := time.Duration(envInt("DRIVE9_DB_HEALTH_PROBE_INTERVAL_SECONDS", 15)) * time.Second
+	probeTimeout := time.Duration(envInt("DRIVE9_DB_HEALTH_PROBE_TIMEOUT_SECONDS", 3)) * time.Second
+	metrics.StartDBHealthProbe(context.Background(), probeInterval, probeTimeout, func(role string, up bool, err error) {
+		if up {
+			logger.Info(context.Background(), "db_recovered", zap.String("role", role))
+			return
+		}
+		logger.Error(context.Background(), "db_unavailable", zap.String("role", role), zap.Error(err))
+	})
 
 	if s3cfg.Bucket == "" {
 		if err := os.MkdirAll(s3cfg.Dir, 0o755); err != nil {
