@@ -680,10 +680,19 @@ func TestFinalizeTenantDeleteUpdatesJobNamespaceAndTenant(t *testing.T) {
 		DBPasswordCipher:   []byte("cipher"),
 		DBName:             "tenant_delete_finalize",
 		DBTLS:              true,
-		Provider:           "tidb_cloud_starter",
+		Provider:           "tidb_cloud_native",
 		SchemaVersion:      1,
 		CreatedAt:          now,
 		UpdatedAt:          now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+		TenantID:       "delete-finalize-tenant",
+		OrganizationID: "org-delete-finalize",
+		ClusterID:      "cluster-delete-finalize",
+		CreatedAt:      now,
+		UpdatedAt:      now,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -738,6 +747,9 @@ func TestFinalizeTenantDeleteUpdatesJobNamespaceAndTenant(t *testing.T) {
 	}
 	if tenantStatus != string(TenantDeleted) {
 		t.Fatalf("tenant status = %s, want %s", tenantStatus, TenantDeleted)
+	}
+	if _, err := s.GetTenantTiDBCloudOrgBinding(ctx, "delete-finalize-tenant"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("org binding err = %v, want %v", err, ErrNotFound)
 	}
 }
 

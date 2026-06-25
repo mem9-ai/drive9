@@ -151,7 +151,7 @@ func (s *Server) handleTenantDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) enqueueTenantDeleteJob(ctx context.Context, t *meta.Tenant) (meta.TenantStatus, error) {
 	if t.StorageNamespaceID == "" {
-		if err := s.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantDeleted); err != nil {
+		if err := s.meta.MarkTenantDeleted(ctx, t.ID); err != nil {
 			return "", err
 		}
 		return meta.TenantDeleted, nil

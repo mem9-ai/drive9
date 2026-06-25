@@ -27,6 +27,7 @@ type quotaTestProvisioner struct {
 	updateErr         error
 	markErr           error
 	getErr            error
+	deprovisionErr    error
 	cloudCfg          *tenant.QuotaCloudConfig
 	defaultPublicKey  string
 	defaultPrivateKey string
@@ -35,10 +36,12 @@ type quotaTestProvisioner struct {
 	markCalls         atomic.Int32
 	getCalls          atomic.Int32
 	listCalls         atomic.Int32
+	deprovisionCalls  atomic.Int32
 	lastCluster       *tenant.ClusterInfo
 	lastCredentials   tenant.CredentialProvisionRequest
 	lastOptions       tenant.QuotaUpdateOptions
 	lastListOptions   tenant.ManagedClusterListOptions
+	lastDeprovision   *tenant.ClusterInfo
 	listErr           error
 	listPages         []*tenant.ManagedClusterListResult
 	calls             []string
@@ -111,6 +114,17 @@ func (p *quotaTestProvisioner) GetQuota(_ context.Context, cluster *tenant.Clust
 		return nil, p.getErr
 	}
 	return p.cloudCfg, nil
+}
+
+func (p *quotaTestProvisioner) DeprovisionWithCredentials(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
+	p.deprovisionCalls.Add(1)
+	p.calls = append(p.calls, "deprovision")
+	p.lastCredentials = req
+	if cluster != nil {
+		out := *cluster
+		p.lastDeprovision = &out
+	}
+	return p.deprovisionErr
 }
 
 func (p *quotaTestProvisioner) ListManagedClusters(_ context.Context, req tenant.CredentialProvisionRequest, opts tenant.ManagedClusterListOptions) (*tenant.ManagedClusterListResult, error) {
@@ -1253,6 +1267,62 @@ func TestAdminTenantDeleteRetryWithCleanupJobSkipsPatchAfterClusterGone(t *testi
 	}
 	if got := rt.prov.markCalls.Load(); got != 0 {
 		t.Fatalf("mark calls = %d, want 0 for already-enqueued delete retry", got)
+	}
+}
+
+func TestAdminTenantDeleteRemovesTiDBCloudOrgBinding(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ctx := context.Background()
+	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+		TenantID:       rt.tenantID,
+		OrganizationID: "org-1",
+		ClusterID:      "cluster-quota-1",
+		CreatedAt:      time.Now().UTC(),
+		UpdatedAt:      time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{
+		{Clusters: []tenant.CloudClusterInfo{{
+			ClusterID:      "cluster-quota-1",
+			OrganizationID: "org-1",
+		}}},
+	}
+	ts := httptest.NewServer(rt.server)
+	defer ts.Close()
+
+	req, err := http.NewRequest(http.MethodDelete, ts.URL+"/v1/admin/tenants/"+rt.tenantID, strings.NewReader(`{"public_key":"public-1","private_key":"private-1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 202: %s", resp.StatusCode, body)
+	}
+	if got := rt.prov.markCalls.Load(); got != 1 {
+		t.Fatalf("mark calls = %d, want 1", got)
+	}
+	if got := rt.prov.deprovisionCalls.Load(); got != 1 {
+		t.Fatalf("deprovision calls = %d, want 1", got)
+	}
+	if rt.prov.lastDeprovision == nil || rt.prov.lastDeprovision.ClusterID != "cluster-quota-1" {
+		t.Fatalf("deprovision cluster = %#v", rt.prov.lastDeprovision)
+	}
+	got, err := rt.meta.GetTenant(ctx, rt.tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != meta.TenantDeleted {
+		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleted)
+	}
+	if _, err := rt.meta.GetTenantTiDBCloudOrgBinding(ctx, rt.tenantID); !errors.Is(err, meta.ErrNotFound) {
+		t.Fatalf("binding err = %v, want %v", err, meta.ErrNotFound)
 	}
 }
 

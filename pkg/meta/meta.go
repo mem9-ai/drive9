@@ -2276,6 +2276,26 @@ func (s *Store) RetryTenantDeleteJob(ctx context.Context, tenantID string, notBe
 	return err
 }
 
+func (s *Store) MarkTenantDeleted(ctx context.Context, tenantID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "mark_tenant_deleted", start, &err)
+	now := time.Now().UTC()
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ?`,
+			TenantDeleted, now, tenantID)
+		if err != nil {
+			return err
+		}
+		if err := requireAffected(res); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func (s *Store) MarkTenantDeleteJobDeleted(ctx context.Context, tenantID string, deletedObjects, abortedMultipartUploads int64) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "mark_tenant_delete_job_deleted", start, &err)
@@ -2320,6 +2340,9 @@ func (s *Store) FinalizeTenantDelete(ctx context.Context, tenantID, namespaceID 
 			return err
 		}
 		if err := requireAffected(res); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID); err != nil {
 			return err
 		}
 		return nil
