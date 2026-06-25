@@ -103,6 +103,50 @@ func TestAdminSetTenantQuotaPostsPartialFieldsAndDecodesResponse(t *testing.T) {
 	}
 }
 
+func TestSetQuotaPostsDeprecatedCompatibilityEndpoint(t *testing.T) {
+	t.Parallel()
+
+	storageSize := int64(1000)
+	var gotAuth string
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("method = %s, want POST", r.Method)
+		}
+		if r.URL.Path != "/v1/quota" {
+			t.Fatalf("path = %q, want /v1/quota", r.URL.Path)
+		}
+		gotAuth = r.Header.Get("Authorization")
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(quotaClientTestResponse("tenant-1"))
+	}))
+	defer srv.Close()
+
+	resp, err := New(srv.URL, "").SetQuota(context.Background(), QuotaSetRequest{
+		TenantID:       "tenant-1",
+		PublicKey:      "public-1",
+		PrivateKey:     "private-1",
+		MaxStorageSize: &storageSize,
+	})
+	if err != nil {
+		t.Fatalf("SetQuota: %v", err)
+	}
+	if gotAuth != "" {
+		t.Fatalf("Authorization = %q, want empty", gotAuth)
+	}
+	if gotBody["tenant_id"] != "tenant-1" || gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
+		t.Fatalf("request body credentials = %#v", gotBody)
+	}
+	if gotBody["max_storage_size"] != float64(1000) {
+		t.Fatalf("request body = %#v", gotBody)
+	}
+	if resp.Config.MaxStorageSize != 1000 {
+		t.Fatalf("max storage size = %d, want 1000", resp.Config.MaxStorageSize)
+	}
+}
+
 func TestAdminSetTenantQuotaPostsFileLimits(t *testing.T) {
 	t.Parallel()
 

@@ -4251,7 +4251,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}, *opts.CredentialProvisioner, quotaReq); err != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_quota_update_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "quota_error")
-			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "quota_error")
 			if status, msg, ok := quotaSetErrorStatusMessage(err, "update"); ok {
 				return nil, newProvisionTenantError(status, msg, err)
 			}
@@ -4292,6 +4292,36 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		Region:         region,
 		OrganizationID: strings.TrimSpace(cluster.OrganizationID),
 	}, nil
+}
+
+func (s *Server) cleanupProvisionedClusterAfterProvisionFailure(ctx context.Context, tenantID, provider string, cluster *tenant.ClusterInfo, cred *tenant.CredentialProvisionRequest, reason string) {
+	if uerr := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); uerr != nil {
+		logger.Error(ctx, "server_event", eventFields(ctx, "provision_mark_failed_update_error", "tenant_id", tenantID, "provider", provider, "error", uerr)...)
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return
+	}
+	cleanupCtx := backgroundWithTrace(ctx)
+	t := &meta.Tenant{
+		ID:        tenantID,
+		Provider:  provider,
+		ClusterID: cluster.ClusterID,
+		DBHost:    cluster.Host,
+		DBPort:    cluster.Port,
+		DBUser:    cluster.Username,
+		DBName:    cluster.DBName,
+	}
+	var req tenant.CredentialProvisionRequest
+	if provider == tenant.ProviderTiDBCloudNative {
+		if cred == nil {
+			logger.Warn(cleanupCtx, "server_event", eventFields(cleanupCtx, "provision_cluster_cleanup_skipped_missing_credentials", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID)...)
+			return
+		}
+		req = *cred
+	}
+	if err := s.deprovisionTenantCluster(cleanupCtx, t, req); err != nil {
+		logger.Error(cleanupCtx, "server_event", eventFields(cleanupCtx, "provision_cluster_cleanup_failed", "tenant_id", tenantID, "provider", provider, "reason", reason, "cluster_id", cluster.ClusterID, "error", err)...)
+	}
 }
 
 func provisioningCloudRegion(provisioner tenant.Provisioner) (string, string) {

@@ -75,13 +75,13 @@ func (c *Client) GetQuota(ctx context.Context, query QuotaRequest) (*QuotaRespon
 	return decodeQuotaResponse(resp, "quota get")
 }
 
-// SetQuota updates quota for a tidb_cloud_native tenant through the admin tenant
-// quota endpoint. Drive9 tenant API keys cannot authorize quota updates for
-// their own tenant.
+// SetQuota updates quota through the deprecated compatibility /v1/quota
+// endpoint. Drive9 tenant API keys cannot authorize quota updates for their
+// own tenant.
 //
 // Deprecated: use AdminSetTenantQuota.
 func (c *Client) SetQuota(ctx context.Context, req QuotaSetRequest) (*QuotaResponse, error) {
-	return c.AdminSetTenantQuota(ctx, req)
+	return c.postQuota(ctx, "/v1/quota", req, "quota set")
 }
 
 func setQuotaHeaders(req *http.Request, publicKey, privateKey string) {
