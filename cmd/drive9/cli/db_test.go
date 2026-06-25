@@ -97,7 +97,7 @@ func TestCreateServerOverrideSendsNativeBodyAndSkipsManifest(t *testing.T) {
 	}))
 	defer manifest.Close()
 
-	bodyCh := make(chan map[string]string, 1)
+	bodyCh := make(chan map[string]any, 1)
 	provision := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/provision" {
 			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
@@ -105,7 +105,7 @@ func TestCreateServerOverrideSendsNativeBodyAndSkipsManifest(t *testing.T) {
 		if got := r.Header.Get("Content-Type"); got != "application/json" {
 			t.Fatalf("Content-Type = %q, want application/json", got)
 		}
-		var gotBody map[string]string
+		var gotBody map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Fatalf("decode request body: %v", err)
 		}
@@ -143,7 +143,7 @@ func TestCreateServerOverrideSendsNativeBodyAndSkipsManifest(t *testing.T) {
 	if atomic.LoadInt32(&manifestHits) != 0 {
 		t.Fatalf("manifest hits = %d, want 0 when --server is set", manifestHits)
 	}
-	var gotBody map[string]string
+	var gotBody map[string]any
 	select {
 	case gotBody = <-bodyCh:
 	default:
@@ -151,6 +151,9 @@ func TestCreateServerOverrideSendsNativeBodyAndSkipsManifest(t *testing.T) {
 	}
 	if gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
 		t.Fatalf("request body = %#v", gotBody)
+	}
+	if gotBody["tidbcloud_spending_limit"] != float64(0) {
+		t.Fatalf("request spending limit = %#v, want default 0", gotBody)
 	}
 	if _, ok := gotBody["database_name"]; ok {
 		t.Fatalf("request body unexpectedly included database_name: %#v", gotBody)
@@ -237,19 +240,48 @@ func TestCreateSendsTiDBCloudSpendingLimit(t *testing.T) {
 	}
 }
 
+func TestCreateHintsSpendingLimitOnFreeQuotaError(t *testing.T) {
+	withIsolatedHome(t)
+	clearProvisionEnv(t)
+
+	provision := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/provision" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"error": "TiDB Cloud free cluster limit reached",
+		})
+	}))
+	defer provision.Close()
+
+	err := Create([]string{
+		"--name", "native-free-quota",
+		"--server", provision.URL,
+		"--tidbcloud-public-key", "public-1",
+		"--tidbcloud-private-key", "private-1",
+	})
+	if err == nil {
+		t.Fatal("Create error = nil, want provision failure")
+	}
+	if !strings.Contains(err.Error(), "--tidbcloud-spending-limit") {
+		t.Fatalf("Create error = %q, want spending limit hint", err)
+	}
+}
+
 func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	withIsolatedHome(t)
 	clearProvisionEnv(t)
 
 	var nativeHits int32
 	var starterHits int32
-	bodyCh := make(chan map[string]string, 1)
+	bodyCh := make(chan map[string]any, 1)
 	native := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&nativeHits, 1)
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/provision" {
 			t.Fatalf("unexpected native request %s %s", r.Method, r.URL.Path)
 		}
-		var gotBody map[string]string
+		var gotBody map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
 			t.Fatalf("decode native body: %v", err)
 		}
@@ -304,7 +336,7 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	if atomic.LoadInt32(&starterHits) != 0 {
 		t.Fatalf("starter hits = %d, want 0", starterHits)
 	}
-	var gotBody map[string]string
+	var gotBody map[string]any
 	select {
 	case gotBody = <-bodyCh:
 	default:
@@ -312,6 +344,9 @@ func TestCreateRegionCodeSelectsNativeServer(t *testing.T) {
 	}
 	if gotBody["public_key"] != "public-1" || gotBody["private_key"] != "private-1" {
 		t.Fatalf("native body = %#v", gotBody)
+	}
+	if gotBody["tidbcloud_spending_limit"] != float64(0) {
+		t.Fatalf("native spending limit = %#v, want default 0", gotBody)
 	}
 	if _, ok := gotBody["database_name"]; ok {
 		t.Fatalf("native body unexpectedly included database_name: %#v", gotBody)

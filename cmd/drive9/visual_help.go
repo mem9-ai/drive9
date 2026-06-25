@@ -439,7 +439,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "--server URL", Desc: "override server URL and bypass region manifest lookup"},
 				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key; required for TiDBCloud Mode"},
 				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key; required for TiDBCloud Mode"},
-				{Name: "--tidbcloud-spending-limit N", Desc: "TiDB Cloud Cluster Spending Limit; must be non-negative"},
+				{Name: "--tidbcloud-spending-limit N", Desc: "TiDB Cloud Cluster Spending Limit; must be non-negative (default: 0 in TiDBCloud Mode)"},
 				{Name: "--json", Desc: "output result as JSON"},
 			},
 			Examples: []visualHelpExample{

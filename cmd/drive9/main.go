@@ -411,6 +411,7 @@ func usage(code int) {
 			"commands:\n"+
 			"  create [--name NAME] [--region-code CODE] [--server URL] [--json]\n"+
 			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+
+			"                         [--tidbcloud-spending-limit N]\n"+
 			"                         provision a new tenant and owner context\n"+
 			"  delete [--server URL] [--api-key KEY] [--json]\n"+
 			"                         [--tidbcloud-public-key KEY] [--tidbcloud-private-key KEY]\n"+

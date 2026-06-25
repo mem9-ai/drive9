@@ -138,6 +138,10 @@ func Create(args []string) error {
 	if mode == RegionModeTiDBCloudNative && strings.TrimSpace(serverFlag) == "" && strings.TrimSpace(regionCode) == "" {
 		return fmt.Errorf("TiDBCloud Mode requires --region-code or --server; use drive9 region list to see available regions")
 	}
+	if mode == RegionModeTiDBCloudNative && tidbCloudSpendingLimit == nil {
+		defaultSpendingLimit := int64(0)
+		tidbCloudSpendingLimit = &defaultSpendingLimit
+	}
 	server, regionEntry, err := resolveProvisionServer(serverFlag, regionCode, mode, r.Server)
 	if err != nil {
 		return err
@@ -173,7 +177,7 @@ func Create(args []string) error {
 			Error string `json:"error"`
 		}
 		_ = json.NewDecoder(resp.Body).Decode(&errResp)
-		return fmt.Errorf("provision failed (HTTP %d): %s", resp.StatusCode, errResp.Error)
+		return fmt.Errorf("provision failed (HTTP %d): %s", resp.StatusCode, createProvisionErrorHint(errResp.Error))
 	}
 
 	var result createResult
@@ -266,7 +270,7 @@ flags:
   --server URL                    override the server URL (bypasses region manifest lookup)
   --tidbcloud-public-key KEY      TiDB Cloud public key (required for TiDBCloud Mode)
   --tidbcloud-private-key KEY     TiDB Cloud private key (required for TiDBCloud Mode)
-  --tidbcloud-spending-limit N    TiDB Cloud Cluster Spending Limit; must be non-negative
+  --tidbcloud-spending-limit N    TiDB Cloud Cluster Spending Limit; must be non-negative (default: 0 in TiDBCloud Mode)
   --json                          output result as JSON
 
 examples:
@@ -314,6 +318,17 @@ func provisionRequestBody(publicKey, privateKey string, tidbCloudSpendingLimit *
 		return nil, err
 	}
 	return bytes.NewReader(raw), nil
+}
+
+func createProvisionErrorHint(msg string) string {
+	trimmed := strings.TrimSpace(msg)
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "free quota") || strings.Contains(lower, "free cluster") || strings.Contains(lower, "usage quota") {
+		if !strings.Contains(lower, "--tidbcloud-spending-limit") {
+			return trimmed + "; retry with --tidbcloud-spending-limit N to set a TiDB Cloud Cluster Spending Limit"
+		}
+	}
+	return trimmed
 }
 
 func resolveProvisionServer(serverFlag, regionCode, mode, fallbackServer string) (string, *RegionManifestEntry, error) {
