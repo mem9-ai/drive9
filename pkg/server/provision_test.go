@@ -597,16 +597,16 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenCreateQuotaFails(t *testing.T)
 		t.Fatalf("provision error = %#v, want 403 provisionTenantError", err)
 	}
 	if got := prov.quotaMarkCalls.Load(); got != 1 {
-		t.Fatalf("quota mark calls = %d, want 1", got)
+		t.Errorf("quota mark calls = %d, want 1", got)
 	}
 	if got := prov.deprovisionCalls.Load(); got != 1 {
-		t.Fatalf("deprovision calls = %d, want 1", got)
+		t.Errorf("deprovision calls = %d, want 1", got)
 	}
 	if prov.lastDeprovision == nil || prov.lastDeprovision.ClusterID != "native-cluster-quota-fail" {
-		t.Fatalf("deprovision cluster = %#v", prov.lastDeprovision)
+		t.Errorf("deprovision cluster = %#v", prov.lastDeprovision)
 	}
 	if prov.lastCredentialReq.PublicKey != "public-1" || prov.lastCredentialReq.PrivateKey != "private-1" {
-		t.Fatalf("cleanup credentials = %+v", prov.lastCredentialReq)
+		t.Errorf("cleanup credentials = %+v", prov.lastCredentialReq)
 	}
 
 	var tenantID, status string
@@ -614,14 +614,14 @@ func TestProvisionTiDBCloudNativeCleansClusterWhenCreateQuotaFails(t *testing.T)
 		t.Fatal(err)
 	}
 	if status != string(meta.TenantFailed) {
-		t.Fatalf("tenant status = %s, want %s", status, meta.TenantFailed)
+		t.Errorf("tenant status = %s, want %s", status, meta.TenantFailed)
 	}
 	var apiKeyCount int
 	if err := metaStore.DB().QueryRow("SELECT COUNT(*) FROM tenant_api_keys WHERE tenant_id = ?", tenantID).Scan(&apiKeyCount); err != nil {
 		t.Fatal(err)
 	}
 	if apiKeyCount != 0 {
-		t.Fatalf("api key count = %d, want 0", apiKeyCount)
+		t.Errorf("api key count = %d, want 0", apiKeyCount)
 	}
 }
 
