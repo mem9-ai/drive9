@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"math/big"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -125,16 +124,10 @@ func (p *Provisioner) DefaultCredentials() (tenant.CredentialProvisionRequest, b
 func (p *Provisioner) ProvisioningRegion() string { return p.region }
 
 func (p *Provisioner) InitSchema(ctx context.Context, dsn string) error {
-	if err := ensureDatabaseFromDSN(ctx, dsn); err != nil {
-		return fmt.Errorf("ensure tidbcloud native database: %w", err)
-	}
 	return schema.InitTiDBTenantSchemaForModeWithOptionsContext(ctx, dsn, schema.TiDBEmbeddingModeAuto, schema.InitTiDBTenantSchemaOptions{})
 }
 
 func (p *Provisioner) InitSchemaForAutoEmbeddingProfile(ctx context.Context, dsn string, profile schema.TiDBAutoEmbeddingProfile) error {
-	if err := ensureDatabaseFromDSN(ctx, dsn); err != nil {
-		return fmt.Errorf("ensure tidbcloud native database: %w", err)
-	}
 	return schema.InitTiDBTenantSchemaForAutoEmbeddingProfileContext(ctx, dsn, profile)
 }
 
@@ -239,8 +232,8 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	if info.ClusterID == "" {
 		return nil, fmt.Errorf("tidbcloud native response missing cluster id")
 	}
-	if clusterProvisionMetadataIncomplete(info) {
-		info, err = p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, info.ClusterID)
+	if info.State != stateActive || clusterConnectionIncomplete(info) {
+		info, err = p.waitForClusterActive(ctx, publicKey, privateKey, info.ClusterID)
 		if err != nil {
 			return &tenant.ClusterInfo{
 				TenantID:  tenantID,
@@ -270,6 +263,9 @@ func (p *Provisioner) ProvisionWithCredentials(ctx context.Context, tenantID str
 	}
 	if out.Username == "" {
 		return out, fmt.Errorf("tidbcloud native response missing username")
+	}
+	if err := ensureDatabaseFunc(ctx, out.Username, out.Password, out.Host, out.Port, dbName); err != nil {
+		return out, fmt.Errorf("ensure tidbcloud native database: %w", err)
 	}
 	return out, nil
 }
@@ -872,43 +868,6 @@ func ensureDatabase(ctx context.Context, user, password, host string, port int, 
 	return nil
 }
 
-func ensureDatabaseFromDSN(ctx context.Context, dsn string) error {
-	cfg, err := mysql.ParseDSN(dsn)
-	if err != nil {
-		return fmt.Errorf("parse native tenant DSN: %w", err)
-	}
-	dbName, err := normalizeDatabaseName(cfg.DBName)
-	if err != nil {
-		return err
-	}
-	if cfg.User == "" {
-		return fmt.Errorf("native tenant DSN user is empty")
-	}
-	if cfg.Passwd == "" {
-		return fmt.Errorf("native tenant DSN password is empty")
-	}
-	host, port, err := splitTCPAddr(cfg.Addr)
-	if err != nil {
-		return err
-	}
-	return ensureDatabaseFunc(ctx, cfg.User, cfg.Passwd, host, port, dbName)
-}
-
-func splitTCPAddr(addr string) (string, int, error) {
-	host, portText, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "", 0, fmt.Errorf("parse native tenant DSN address %q: %w", addr, err)
-	}
-	port, err := strconv.Atoi(portText)
-	if err != nil || port <= 0 {
-		return "", 0, fmt.Errorf("parse native tenant DSN port %q: %w", portText, err)
-	}
-	if strings.TrimSpace(host) == "" {
-		return "", 0, fmt.Errorf("native tenant DSN host is empty")
-	}
-	return host, port, nil
-}
-
 type clusterInfo struct {
 	ClusterID     string            `json:"clusterId"`
 	State         string            `json:"state"`
@@ -991,13 +950,6 @@ func clusterConnectionIncomplete(info *clusterInfo) bool {
 	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || (info.UserPrefix == "" && info.Username == "")
 }
 
-func clusterProvisionMetadataIncomplete(info *clusterInfo) bool {
-	if clusterConnectionIncomplete(info) {
-		return true
-	}
-	return strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]) == ""
-}
-
 func branchConnectionIncomplete(info *branchInfo) bool {
 	if info == nil {
 		return true
@@ -1022,7 +974,7 @@ func fillBranchEndpoint(out *tenant.ClusterInfo, branch *branchInfo) error {
 	return nil
 }
 
-func (p *Provisioner) waitForClusterProvisionMetadata(ctx context.Context, publicKey, privateKey, clusterID string) (*clusterInfo, error) {
+func (p *Provisioner) waitForClusterActive(ctx context.Context, publicKey, privateKey, clusterID string) (*clusterInfo, error) {
 	deadline := time.Now().Add(10 * time.Minute)
 	for {
 		endpoint := fmt.Sprintf("%s/v1beta1/clusters/%s?view=BASIC", p.apiURL, clusterID)
@@ -1046,11 +998,11 @@ func (p *Provisioner) waitForClusterProvisionMetadata(ctx context.Context, publi
 		if err != nil {
 			return nil, err
 		}
-		if !clusterProvisionMetadataIncomplete(info) {
+		if info.State == stateActive && !clusterConnectionIncomplete(info) {
 			return info, nil
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("tidbcloud native cluster %s missing connection metadata before timeout: %s", clusterID, info.State)
+			return nil, fmt.Errorf("tidbcloud native cluster %s not active before timeout: %s", clusterID, info.State)
 		}
 		select {
 		case <-ctx.Done():
