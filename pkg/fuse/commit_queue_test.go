@@ -2899,3 +2899,115 @@ func TestCommitQueueCancelPathStopsDelayedZeroTruncateAndCleansLocal(t *testing.
 		t.Fatal("CancelPath should clean local shadow/pending")
 	}
 }
+
+// TestCommitQueueCanceledInFlightDoesNotRemoveNewerStagedData verifies that
+// when an in-flight commit is canceled after its upload succeeds, its cleanup
+// path (onCommitSuccess) does NOT remove shadowStore/pendingIndex data that a
+// newer writer may have staged for the same path.
+//
+// This is the regression test for the data-loss bug identified in PR #617 review:
+// without the canceled check before onCommitSuccess, the old commit's
+// shadowStore.Remove(path) + pendingIndex.Remove(path) would delete the newer
+// writer's staged data.
+func TestCommitQueueCanceledInFlightDoesNotRemoveNewerStagedData(t *testing.T) {
+	path := "/repo/concurrent.bin"
+
+	// Track whether the upload context was canceled.
+	var uploadCanceled atomic.Bool
+	var uploadStarted atomic.Bool
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		uploadStarted.Store(true)
+		// Simulate a slow upload that will be canceled mid-flight.
+		// The server responds after a short delay so the upload can succeed
+		// before the cancel is processed, exercising the post-upload cancel path.
+		time.Sleep(50 * time.Millisecond)
+		// Check if the request context was canceled.
+		if r.Context().Err() != nil {
+			uploadCanceled.Store(true)
+			http.Error(w, "canceled", http.StatusRequestTimeout)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok","revision":1}`))
+	}))
+	defer ts.Close()
+
+	shadow, err := NewShadowStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer shadow.Close()
+	pending, err := NewPendingIndex(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stage old data for the path.
+	if err := shadow.WriteFull(path, []byte("old data"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode(path, 4, PendingNew, 0, 0o644, true); err != nil {
+		t.Fatal(err)
+	}
+
+	cq := NewCommitQueue(newTestClient(ts.URL), shadow, pending, nil, 1, 8)
+	// Enqueue the old commit entry.
+	oldEntry := &CommitEntry{
+		Path:    path,
+		Size:    4,
+		Kind:    PendingNew,
+		Mode:    0o644,
+		HasMode: true,
+	}
+	cq.Enqueue(oldEntry)
+
+	// Wait for the upload to start, then cancel the in-flight entry.
+	// This simulates the timeout path in lockWritableRemoteCommitPath calling CancelPath.
+	deadline := time.Now().Add(2 * time.Second)
+	for !uploadStarted.Load() && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !uploadStarted.Load() {
+		t.Fatal("upload did not start within 2s")
+	}
+
+	// Cancel the in-flight commit for this path.
+	cq.CancelPath(path)
+
+	// Now stage newer data (simulating the newer writer proceeding after timeout).
+	// The newer writer writes new content to the same shadow path.
+	newData := []byte("newer data from second writer")
+	if err := shadow.WriteFull(path, newData, 1); err != nil {
+		t.Fatalf("newer writer shadow stage failed: %v", err)
+	}
+	if _, err := pending.PutWithBaseRevAndMode(path, int64(len(newData)), PendingOverwrite, 1, 0o644, true); err != nil {
+		t.Fatalf("newer writer pending stage failed: %v", err)
+	}
+
+	// Wait for the old commit to finish (it may have succeeded or been canceled).
+	cq.DrainAll()
+
+	// Verify the newer staged data survived — the old commit's cleanup
+	// must NOT have removed it.
+	if !shadow.Has(path) {
+		t.Fatal("newer writer's shadow data was removed by old commit cleanup — data loss!")
+	}
+	data, err := shadow.ReadAll(path)
+	if err != nil {
+		t.Fatalf("read shadow after old commit: %v", err)
+	}
+	if string(data) != string(newData) {
+		t.Fatalf("shadow data = %q, want %q (newer writer's data)", string(data), string(newData))
+	}
+	if !pending.HasPending(path) {
+		t.Fatal("newer writer's pending entry was removed by old commit cleanup — data loss!")
+	}
+	meta, ok := pending.GetMeta(path)
+	if !ok {
+		t.Fatal("pending meta not found after old commit")
+	}
+	if meta.Size != int64(len(newData)) {
+		t.Fatalf("pending size = %d, want %d (newer writer's size)", meta.Size, len(newData))
+	}
+}

@@ -967,6 +967,18 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cancel()
 
 		if err == nil {
+			// Check if the entry was canceled while the upload was in flight.
+			// If canceled, skip onCommitSuccess entirely — its path-scoped
+			// cleanup (shadowStore.Remove + pendingIndex.Remove) would delete
+			// a newer writer's staged data. The upload already succeeded on the
+			// backend, so we just clean up the queue entry without touching
+			// local shadow/pending state.
+			if cq.isEntryCanceled(entry) {
+				unlockPath()
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: entry for %s was canceled after upload succeeded, skipping cleanup to preserve newer staged data", entry.Path)
+				return
+			}
 			if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err == nil {
 				unlockPath()
 				return

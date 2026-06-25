@@ -5755,10 +5755,16 @@ func (fs *Dat9FS) lockWritableRemoteCommitPath(p string) func() {
 			// and the timeout is long enough (default 5s) that genuine commits
 			// should normally drain before it fires.
 			//
-			// Use TryLock instead of Lock: if the in-flight worker still holds
-			// the per-path mutex, we proceed without it (no-op unlock) rather
-			// than blocking — blocking here would re-introduce the deadlock.
-			fs.debugf("lockWritableRemoteCommitPath: timeout (%s) waiting for %s, proceeding anyway", timeout, p)
+			// CRITICAL: before proceeding, cancel any in-flight commit for this
+			// path and clean up its shadow/pending state. Without this, the old
+			// commit's onCommitSuccess cleanup (shadowStore.Remove + pendingIndex.Remove)
+			// would delete the newer writer's staged data after it stages — a
+			// silent data-loss bug. Canceling the old entry first ensures its
+			// cleanup runs (or has already run) before the new writer stages.
+			fs.debugf("lockWritableRemoteCommitPath: timeout (%s) waiting for %s, canceling in-flight and proceeding", timeout, p)
+			if fs.commitQueue != nil {
+				fs.commitQueue.CancelPath(p)
+			}
 			unlock, ok := fs.tryLockRemoteCommitPath(p)
 			if ok {
 				return unlock
