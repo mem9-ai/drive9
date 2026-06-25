@@ -7581,14 +7581,91 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			}
 		}
 		if len(entries) > 0 {
+			// Remote/overlay listing shows children. If the local inode state
+			// is empty, the listing may be stale (eventual-consistency lag on
+			// just-completed Unlinks). Poll for up to 5 seconds, using
+			// remoteDirectoryHasChildren (which filters locally-unlinked entries)
+			// instead of listDir (which doesn't filter).
+			if !fs.hasKnownLocalDirectoryChildren(childP) {
+				fs.debugf("rmdir path=%s layer listing has %d entries but no local children, polling for up to 5s", childP, len(entries))
+				fs.dirCache.Invalidate(childP)
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					select {
+					case <-time.After(500 * time.Millisecond):
+					case <-ctx.Done():
+						status = gofuse.Status(syscall.EINTR)
+						return status
+					}
+					hasChildren, listErr := fs.remoteDirectoryHasChildren(ctx, childP)
+					if listErr != nil || !hasChildren {
+						entries = nil
+						break
+					}
+					fs.dirCache.Invalidate(childP)
+				}
+			}
+			if len(entries) > 0 {
+				status = gofuse.Status(syscall.ENOTEMPTY)
+				return status
+			}
+		}
+	} else {
+		// Check local state first. If the directory has known local children,
+		// we can return ENOTEMPTY without a remote round-trip.
+		if fs.hasKnownLocalDirectoryChildren(childP) {
 			status = gofuse.Status(syscall.ENOTEMPTY)
 			return status
 		}
-	} else if hasChildren, err := fs.remoteDirectoryHasChildren(ctx, childP); err == nil && hasChildren {
-		status = gofuse.Status(syscall.ENOTEMPTY)
-		return status
-	} else if err != nil {
-		fs.debugf("rmdir pre-delete list failed path=%s err=%v", childP, err)
+		// Local state says empty. The remote listing may be stale due to
+		// eventual-consistency lag on just-completed Unlinks, or pending
+		// writeback uploads. Flush any pending writes for children of this
+		// directory before checking the remote, so that the backend listing
+		// reflects the most recent state.
+		prefix := childP + "/"
+		if fs.commitQueue != nil {
+			// Wait for any queued/in-flight commits for children of this dir.
+			fs.commitQueue.WaitPrefix(prefix)
+		}
+		if fs.uploader != nil {
+			for _, meta := range fs.writeBack.ListByPrefix(prefix) {
+				fs.uploader.WaitPath(meta.Path)
+			}
+		}
+		// Now check the remote listing. If it still shows children, it's
+		// either a real child (not locally known) or eventual-consistency lag.
+		// Poll for up to 5 seconds (10 × 500ms) when the local state is empty,
+		// giving the backend time to propagate recent deletes.
+		hasChildren, err := fs.remoteDirectoryHasChildren(ctx, childP)
+		if err == nil && hasChildren {
+			// Invalidate the dirCache entry that was just written from the
+			// potentially-stale remote listing, so hasKnownLocalDirectoryChildren
+			// checks only the local inode state (which is authoritative).
+			fs.dirCache.Invalidate(childP)
+			if !fs.hasKnownLocalDirectoryChildren(childP) {
+				fs.debugf("rmdir path=%s remote has children but no local children, polling for up to 5s", childP)
+				deadline := time.Now().Add(5 * time.Second)
+				for time.Now().Before(deadline) {
+					select {
+					case <-time.After(500 * time.Millisecond):
+					case <-ctx.Done():
+						status = gofuse.Status(syscall.EINTR)
+						return status
+					}
+					hasChildren, err = fs.remoteDirectoryHasChildren(ctx, childP)
+					if err != nil || !hasChildren {
+						break
+					}
+					fs.dirCache.Invalidate(childP)
+				}
+			}
+		}
+		if err == nil && hasChildren {
+			status = gofuse.Status(syscall.ENOTEMPTY)
+			return status
+		} else if err != nil {
+			fs.debugf("rmdir pre-delete list failed path=%s err=%v", childP, err)
+		}
 	}
 
 	deleteStart := time.Now()
