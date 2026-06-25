@@ -3823,9 +3823,6 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		"status":    string(res.Status),
 	}
 	if res.Provider == tenant.ProviderTiDBCloudNative {
-		if res.OrganizationID != "" {
-			response["organization_id"] = res.OrganizationID
-		}
 		if res.CloudProvider != "" {
 			response["cloud_provider"] = res.CloudProvider
 		}

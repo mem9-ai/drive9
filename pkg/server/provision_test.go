@@ -494,9 +494,6 @@ func TestProvisionTiDBCloudNativeUsesRequestCredentials(t *testing.T) {
 	if out["cloud_provider"] != "aws" || out["region"] != "us-east-1" {
 		t.Fatalf("native cloud/region response = %+v", out)
 	}
-	if out["organization_id"] != "org-1" {
-		t.Fatalf("native organization response = %+v", out)
-	}
 	if _, ok := out["mode"]; ok {
 		t.Fatalf("native provision response unexpectedly included mode: %+v", out)
 	}
