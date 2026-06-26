@@ -433,6 +433,97 @@ func TestUploadOverwriteQueuesCompleteBehindPendingFileMutation(t *testing.T) {
 	if fileMeta.SizeBytes != totalSize {
 		t.Fatalf("central file meta size = %d, want %d", fileMeta.SizeBytes, totalSize)
 	}
+	if got := countPendingQuotaOutboxRowsByFile(t, ctx, b, target.File.FileID); got != 0 {
+		t.Fatalf("pending quota outbox rows after drain = %d, want 0", got)
+	}
+}
+
+func TestUploadCompleteOutboxRetryAfterCentralApplyDoesNotDoubleCharge(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	const (
+		uploadID = "upload-retry-after-central-apply"
+		fileID   = "file-retry-after-central-apply"
+		size     = int64(128)
+	)
+	if err := fake.AtomicReserveAndInsertUpload(ctx, &UploadReservationView{
+		TenantID:       "tenant-a",
+		UploadID:       uploadID,
+		ReservedBytes:  size,
+		FileCountDelta: 1,
+		TargetPath:     "/retry.bin",
+		Status:         "active",
+		ExpiresAt:      time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("reserve upload: %v", err)
+	}
+	raw := mustQuotaMutationJSON(t, uploadCompleteMutationData{
+		UploadID:      uploadID,
+		FileID:        fileID,
+		ReservedBytes: size,
+		NewSizeBytes:  size,
+	})
+	if _, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
+		FileID:       fileID,
+		MutationType: quotaMutationTypeUploadComplete,
+		MutationData: raw,
+	}); err != nil {
+		t.Fatalf("enqueue upload complete: %v", err)
+	}
+
+	claimAt := time.Now().UTC()
+	entry, found, err := b.store.ClaimQuotaOutbox(ctx, claimAt, time.Second)
+	if err != nil {
+		t.Fatalf("claim upload complete: %v", err)
+	}
+	if !found {
+		t.Fatal("claim upload complete: not found")
+	}
+	if err := b.applyQuotaOutboxEntry(ctx, entry); err != nil {
+		t.Fatalf("first central apply: %v", err)
+	}
+	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("get usage after first apply: %v", err)
+	}
+	if usage.StorageBytes != size || usage.ReservedBytes != 0 || usage.FileCount != 1 {
+		t.Fatalf("usage after first apply = %+v, want storage=%d reserved=0 files=1", usage, size)
+	}
+
+	recoverAt := claimAt.Add(2 * time.Second)
+	recovered, err := b.store.RecoverExpiredQuotaOutbox(ctx, recoverAt, 10)
+	if err != nil {
+		t.Fatalf("recover expired outbox: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered rows = %d, want 1", recovered)
+	}
+	retryEntry, found, err := b.store.ClaimQuotaOutbox(ctx, recoverAt, quotaOutboxLeaseDuration)
+	if err != nil {
+		t.Fatalf("reclaim upload complete: %v", err)
+	}
+	if !found {
+		t.Fatal("reclaim upload complete: not found")
+	}
+	applied, processed, err := b.processQuotaOutboxEntry(ctx, retryEntry)
+	if err != nil {
+		t.Fatalf("retry process upload complete: %v", err)
+	}
+	if !applied || !processed {
+		t.Fatalf("retry process applied=%t processed=%t, want true/true", applied, processed)
+	}
+	usage, err = fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("get usage after retry: %v", err)
+	}
+	if usage.StorageBytes != size || usage.ReservedBytes != 0 || usage.FileCount != 1 {
+		t.Fatalf("usage after retry = %+v, want storage=%d reserved=0 files=1", usage, size)
+	}
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, fileID, datastore.QuotaOutboxSucceeded); got != 1 {
+		t.Fatalf("succeeded upload-complete rows = %d, want 1", got)
+	}
 }
 
 func TestDrainQuotaOutboxForFileContinuesAfterUnrelatedBatchError(t *testing.T) {
@@ -738,6 +829,17 @@ func countQuotaOutboxRowsByFileAndMutation(t *testing.T, ctx context.Context, b 
 	var count int
 	if err := b.Store().DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox
 		WHERE file_id = ? AND mutation_type = ? AND status = ?`, fileID, mutationType, status).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func countPendingQuotaOutboxRowsByFile(t *testing.T, ctx context.Context, b *Dat9Backend, fileID string) int {
+	t.Helper()
+	var count int
+	if err := b.Store().DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox
+		WHERE file_id = ? AND status IN (?, ?)`,
+		fileID, datastore.QuotaOutboxQueued, datastore.QuotaOutboxProcessing).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	return count

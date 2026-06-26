@@ -242,6 +242,8 @@ func (s *Store) AckQuotaOutboxBatchTx(ctx context.Context, tx *sql.Tx, entries [
 		}
 		ids = append(ids, entries[i].ID)
 	}
+	// Receipt is the worker ownership token. Recovery clears receipt before
+	// requeueing, so stale owners cannot match after another worker reclaims.
 	args := append([]any{QuotaOutboxSucceeded, now, now, QuotaOutboxProcessing, receipt}, ids...)
 	res, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE quota_outbox SET status = ?, receipt = NULL,
 		leased_at = NULL, lease_until = NULL, completed_at = ?, updated_at = ?

@@ -1016,6 +1016,9 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	var semanticEnqueueDurationMs float64
 	var semanticTaskEnqueued bool
 	var quotaOutboxEnqueued bool
+	// upload.TotalSize is immutable from the upload row. The old* fields and
+	// confirmedFileID are refreshed inside each InTx attempt after locking the
+	// target node/file, then consumed by this same transaction's outbox enqueue.
 	enqueueUploadCompleteOutbox := func(tx *sql.Tx) error {
 		created, err := b.enqueueQuotaUploadCompleteOutboxTx(tx,
 			uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia)
@@ -1207,6 +1210,12 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	b.notifyQuotaOutbox(quotaOutboxEnqueued)
 
 	if !quotaOutboxEnqueued {
+		if b.UseServerQuota() {
+			logger.Error(ctx, "upload_complete_quota_accounting_skipped",
+				zap.String("tenant_id", b.tenantID),
+				zap.String("upload_id", uploadID),
+				zap.String("file_id", confirmedFileID))
+		}
 		// Preserve the non-outbox path when central quota is wired without
 		// server-quota mode; server quota uses the tenant-local outbox so
 		// upload completion is ordered with prior mutations for the same file.

@@ -903,18 +903,18 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		quotaOutboxEnqueued = false
 
 		done := backendTimingStep(timingEnabled, &quotaStorageCheckDuration)
-		if err := b.ensureStorageQuota(ctx, tx, path, int64(len(data))); err != nil {
-			done()
+		err := b.ensureStorageQuota(ctx, tx, path, int64(len(data)))
+		done()
+		if err != nil {
 			return err
 		}
-		done()
 
 		done = backendTimingStep(timingEnabled, &quotaFileCountCheckDuration)
-		if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
-			done()
+		err = b.ensureFileCountQuotaServer(ctx, tx, 1)
+		done()
+		if err != nil {
 			return err
 		}
-		done()
 
 		fileRev := int64(1)
 		insertFile := &datastore.File{
@@ -931,44 +931,45 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 
 		done = backendTimingStep(timingEnabled, &insertFileDuration)
-		if err := b.store.InsertFileTx(tx, insertFile); err != nil {
-			done()
+		err = b.store.InsertFileTx(tx, insertFile)
+		done()
+		if err != nil {
 			return err
 		}
-		done()
 
 		done = backendTimingStep(timingEnabled, &ensureParentDirsDuration)
-		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {
-			done()
+		err = b.store.EnsureParentDirsTx(tx, path, b.genID)
+		done()
+		if err != nil {
 			return err
 		}
-		done()
 
 		done = backendTimingStep(timingEnabled, &insertNodeDuration)
-		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
+		err = b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
 			Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
-		}); err != nil {
-			done()
+		})
+		done()
+		if err != nil {
 			return err
 		}
-		done()
 
 		if tags != nil {
 			done = backendTimingStep(timingEnabled, &tagUpdateDuration)
-			if err := b.store.ReplaceFileTagsTx(tx, fileID, tags); err != nil {
-				done()
+			err = b.store.ReplaceFileTagsTx(tx, fileID, tags)
+			done()
+			if err != nil {
 				return err
 			}
-			done()
 		}
 		currentMediaDelta := quotaMediaDelta(false, isQuotaMediaContentType(contentType))
 		done = backendTimingStep(timingEnabled, &semanticEnqueueDuration)
 		if b.UsesDatabaseAutoEmbedding() {
-			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType, currentMediaDelta)
+			var created bool
+			created, err = b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType, currentMediaDelta)
 			semanticTaskEnqueued = created
+			done()
 			if err != nil {
-				done()
 				return err
 			}
 		} else {
@@ -976,22 +977,19 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			// of EMBED_TEXT, so register them in the same transaction. The embed task
 			// (if any) is enqueued separately below.
 			extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType, currentMediaDelta)
-			if extractErr != nil {
-				done()
-				return extractErr
-			}
-			if b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
-				created, err := b.enqueueEmbedTaskTx(tx, fileID, 1)
-				semanticTaskEnqueued = created || extractCreated
-				if err != nil {
-					done()
-					return err
-				}
+			err = extractErr
+			if err == nil && b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
+				var embedCreated bool
+				embedCreated, err = b.enqueueEmbedTaskTx(tx, fileID, 1)
+				semanticTaskEnqueued = embedCreated || extractCreated
 			} else {
 				semanticTaskEnqueued = extractCreated
 			}
+			done()
+			if err != nil {
+				return err
+			}
 		}
-		done()
 		if timingEnabled {
 			// Keep the legacy field populated for existing dashboards; create
 			// uses the semantic enqueue phase as its image enqueue boundary.
@@ -1000,11 +998,10 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 
 		done = backendTimingStep(timingEnabled, &quotaOutboxEnqueueDuration)
 		created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, int64(len(data)), contentType)
+		done()
 		if err != nil {
-			done()
 			return err
 		}
-		done()
 		quotaOutboxEnqueued = created
 		return nil
 	}); err != nil {
