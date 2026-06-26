@@ -11846,6 +11846,49 @@ func TestXAttr_RameNoOpPreservesXattrs(t *testing.T) {
 	}
 }
 
+func TestXAttr_RenameOverExistingClearsDestinationXattrs(t *testing.T) {
+	// POSIX rename replaces the destination object. Stale xattrs from the
+	// old destination must not remain visible on the new object.
+	store := NewXAttrStore()
+	// Destination has xattrs; source does not.
+	store.Set("/dst", "user.old", []byte("stale"))
+	store.Set("/dst/child.txt", "user.child", []byte("stale_child"))
+
+	// Rename /src -> /dst (source has no xattrs).
+	store.Rename("/src", "/dst")
+
+	// /dst should have NO xattrs (source had none, destination's were cleared).
+	if _, ok := store.Get("/dst", "user.old"); ok {
+		t.Errorf("stale xattr on /dst survived rename-over-existing")
+	}
+	// /dst/child.txt should also be gone (destination subtree cleared).
+	if _, ok := store.Get("/dst/child.txt", "user.child"); ok {
+		t.Errorf("stale xattr on /dst/child.txt survived rename-over-existing")
+	}
+}
+
+func TestXAttr_RenameOverExistingReplacesDestinationXattrs(t *testing.T) {
+	// Both source and destination have xattrs — source wins.
+	store := NewXAttrStore()
+	store.Set("/dst", "user.old", []byte("stale"))
+	store.Set("/src", "user.new", []byte("fresh"))
+
+	store.Rename("/src", "/dst")
+
+	// Source's xattr should be on destination.
+	if v, ok := store.Get("/dst", "user.new"); !ok || string(v) != "fresh" {
+		t.Errorf("source xattr not migrated to destination: ok=%v val=%q", ok, v)
+	}
+	// Old destination xattr should be gone.
+	if _, ok := store.Get("/dst", "user.old"); ok {
+		t.Errorf("stale destination xattr survived rename-over-existing")
+	}
+	// Old source path should be empty.
+	if _, ok := store.Get("/src", "user.new"); ok {
+		t.Errorf("xattr still on old source path after rename")
+	}
+}
+
 func TestSetAttr_MtimeUpdate(t *testing.T) {
 	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(make([]byte, 42))

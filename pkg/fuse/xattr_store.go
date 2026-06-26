@@ -139,19 +139,37 @@ func (s *XAttrStore) Rename(oldPath, newPath string) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// Move the exact path.
+	// POSIX rename replaces the destination object: stale xattrs from the
+	// old destination must not remain visible on the new object. Clear the
+	// destination exact path and its subtree before moving source state.
+	delete(s.data, newPath)
+	newPrefix := newPath + "/"
+	// Collect keys to delete (avoid map mutation during range).
+	var toDelete []string
+	for p := range s.data {
+		if strings.HasPrefix(p, newPrefix) {
+			toDelete = append(toDelete, p)
+		}
+	}
+	for _, p := range toDelete {
+		delete(s.data, p)
+	}
+	// Move the exact path from source to destination.
 	if attrs, ok := s.data[oldPath]; ok {
 		s.data[newPath] = attrs
 		delete(s.data, oldPath)
 	}
 	// Move child paths (directory rename).
 	oldPrefix := oldPath + "/"
-	newPrefix := newPath + "/"
+	var keys []string
 	for p := range s.data {
 		if strings.HasPrefix(p, oldPrefix) {
-			child := newPrefix + strings.TrimPrefix(p, oldPrefix)
-			s.data[child] = s.data[p]
-			delete(s.data, p)
+			keys = append(keys, p)
 		}
+	}
+	for _, p := range keys {
+		child := newPrefix + strings.TrimPrefix(p, oldPrefix)
+		s.data[child] = s.data[p]
+		delete(s.data, p)
 	}
 }
