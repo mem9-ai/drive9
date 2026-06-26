@@ -656,7 +656,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 			return "", err
 		}
 		if forkTenant.DBHost != "" && forkTenant.DBPort != 0 && forkTenant.DBUser != "" {
-			return tenantDSN(forkTenant.DBUser, string(plain), forkTenant.DBHost, forkTenant.DBPort, forkTenant.DBName, forkTenant.DBTLS), nil
+			return tenantDSN(forkTenant.DBUser, string(plain), forkTenant.DBHost, forkTenant.DBPort, forkTenant.DBName, forkTenant.DBTLS, forkTenant.Provider), nil
 		}
 		if branchProv, ok := s.provisioner.(tenant.CredentialBranchProvisioner); ok && credentialReq != nil {
 			username, err := branchProv.WaitForBranchUserWithCredentials(ctx, forkTenant.ClusterID, forkTenant.BranchID, *credentialReq)
@@ -687,7 +687,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 			}); err != nil {
 				return "", err
 			}
-			return tenantDSN(username, string(plain), host, port, forkTenant.DBName, true), nil
+			return tenantDSN(username, string(plain), host, port, forkTenant.DBName, true, forkTenant.Provider), nil
 		}
 		cluster, err := s.waitForForkBranchActive(ctx, &tenant.ClusterInfo{
 			TenantID:  forkTenant.ID,
@@ -715,7 +715,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 		}); err != nil {
 			return "", err
 		}
-		return tenantDSN(cluster.Username, string(plain), cluster.Host, cluster.Port, cluster.DBName, true), nil
+		return tenantDSN(cluster.Username, string(plain), cluster.Host, cluster.Port, cluster.DBName, true, cluster.Provider), nil
 	}
 
 	branchPassword, err := s.pool.Decrypt(ctx, forkTenant.DBPasswordCipher)
@@ -754,7 +754,7 @@ func (s *Server) ensureForkBranchConnection(ctx context.Context, forkTenant, sou
 	if cluster.Host == "" || cluster.Port == 0 || cluster.Username == "" {
 		return "", forkErr(http.StatusServiceUnavailable, "database branch is not active yet")
 	}
-	return tenantDSN(cluster.Username, string(branchPassword), cluster.Host, cluster.Port, cluster.DBName, true), nil
+	return tenantDSN(cluster.Username, string(branchPassword), cluster.Host, cluster.Port, cluster.DBName, true, cluster.Provider), nil
 }
 
 func generateForkDBPassword(length int) (string, error) {
@@ -1029,7 +1029,7 @@ func (s *Server) openTenantStore(ctx context.Context, t *meta.Tenant) (*datastor
 	if err != nil {
 		return nil, err
 	}
-	return datastore.Open(tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS))
+	return datastore.Open(tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS, t.Provider))
 }
 
 func (s *Server) enqueueForkFileGCTaskRefs(ctx context.Context, t *meta.Tenant, store *datastore.Store) error {
