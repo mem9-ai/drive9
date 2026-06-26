@@ -45,8 +45,6 @@ from . import report as report_engine
 class BlackboxRunner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
-        self.suite = normalize_suite_args(args)
-        self.suite_config_dir = SUITES_DIR
         self.session = args.session or file_ts()
         # Work-dir isolation: all writable state (cache, tmp, results) lives
         # under work_dir so a run never pollutes the repo tree.
@@ -54,14 +52,14 @@ class BlackboxRunner:
         if work_dir_raw:
             self.work_dir = Path(work_dir_raw).expanduser().resolve()
         else:
-            self.work_dir = RESULT_ROOT.parent / "work" / self.suite / self.session
+            self.work_dir = RESULT_ROOT.parent / "work" / self.session
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir = self.work_dir / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         if args.out_dir:
             self.result_dir = Path(args.out_dir).expanduser().resolve()
         else:
-            self.result_dir = self.work_dir / "results" / self.suite / self.session
+            self.result_dir = self.work_dir / "results" / self.session
         self.result_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir = self.result_dir / "tmp"
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -69,7 +67,7 @@ class BlackboxRunner:
         os.environ.setdefault("GOCACHE", str(self.work_dir / "gocache"))
         os.environ.setdefault("GOMODCACHE", str(self.work_dir / "gomodcache"))
         self.recorder = Recorder(self.result_dir)
-        self.provider = load_suite_provider(self.suite, self.suite_config_dir)
+        self.provider = load_suite_provider("", SUITES_DIR)
         self.registry = discover_modules()
         self.config = {"modules": {}, "groups": load_groups()}
         self.capabilities = self.provider.detect_capabilities()
@@ -90,8 +88,8 @@ class BlackboxRunner:
             recorder=self.recorder,
             capabilities=self.capabilities,
             config=self.config,
-            runs=args.runs or int(env_value("RUNS", "1", self.suite)),
-            suite=self.suite,
+            runs=args.runs or int(env_value("RUNS", "1", "")),
+            suite="",
         )
         self.selected = self.select_modules()
 
@@ -112,7 +110,7 @@ class BlackboxRunner:
         elif self.args.group:
             group = self.config.get("groups", {}).get(self.args.group)
             if group is None:
-                raise BlackboxError(f"unknown group {self.args.group!r} for suite {self.suite!r}")
+                raise BlackboxError(f"unknown group {self.args.group!r} ")
             selected = self.expand_module_list(group)
         else:
             raise BlackboxError("one of --all, --category, --module, --group, or --list is required")
@@ -125,7 +123,7 @@ class BlackboxRunner:
             if module_id not in seen:
                 out.append(module_id)
                 seen.add(module_id)
-        if not self.args.module and not env_flag("INCLUDE_MANUAL", False, self.suite):
+        if not self.args.module and not env_flag("INCLUDE_MANUAL", False, ""):
             out = [module_id for module_id in out if not getattr(self.registry[module_id], "manual", False)]
         return out
 
@@ -146,7 +144,7 @@ class BlackboxRunner:
     def write_manifest(self) -> None:
         manifest: dict[str, Any] = {
             "schema": SCHEMA,
-            "suite": self.suite,
+            "suite": "",
             "session": self.session,
             "timestamp": utc_ts(),
             "result_dir": str(self.result_dir),
@@ -161,7 +159,7 @@ class BlackboxRunner:
             "runs": self.ctx.runs,
             "platform": platform.platform(),
             "capabilities": self.capabilities,
-            "suite_config_dir": str(self.suite_config_dir),
+            "suite_config_dir": str(SUITES_DIR),
         }
         manifest.update(self.provider.manifest_fields(self.ctx))
         try:
@@ -220,7 +218,7 @@ class BlackboxRunner:
         if custom is not None:
             markdown = custom
         else:
-            markdown = report_engine.render_suite_report(self.ctx, self.suite, records, goals)
+            markdown = report_engine.render_suite_report(self.ctx, "", records, goals)
         report_path = self.result_dir / "report.md"
         report_path.write_text(markdown, encoding="utf-8")
         summary = self.recorder.summary()
@@ -228,7 +226,7 @@ class BlackboxRunner:
             self.result_dir / "suite-report.json",
             {
                 "schema": "drive9-blackbox-suite-report/v1",
-                "suite": self.suite,
+                "suite": "",
                 "session": self.session,
                 "timestamp": utc_ts(),
                 "summary": summary,
@@ -303,7 +301,7 @@ class BlackboxRunner:
         return resolve_module_timeout(
             module.id,
             getattr(module, "timeout", 600),
-            self.suite,
+
             self.config.get("modules", {}).get(module.id),
         )
 
@@ -519,37 +517,28 @@ class BlackboxRunner:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    suite_default = os.environ.get("BLACKBOX_SUITE", "")
     parser = argparse.ArgumentParser(description="Run Drive9 blackbox modules.")
-    parser.add_argument("--suite", default=suite_default, help="Blackbox suite domain. Defaults to BLACKBOX_SUITE.")
-    parser.add_argument("--all-suites", action="store_true", help="Discover and run all suites under blackbox/suites/. Generates an overall report.")
     selector = parser.add_mutually_exclusive_group(required=False)
-    selector.add_argument("--all", action="store_true", help="Run every module in the selected suite.")
+    selector.add_argument("--all", action="store_true", help="Run every discovered module.")
     selector.add_argument("--category", help="Run modules whose id/category has this prefix.")
     selector.add_argument("--module", action="append", help="Run one module id or a comma-separated list. Can be repeated.")
-    selector.add_argument("--group", help="Run a named module group from the selected suite, e.g. functional, posix, or perf.")
+    selector.add_argument("--group", help="Run a named module group, e.g. functional, posix, or perf.")
     selector.add_argument("--list", action="store_true", help="List available modules.")
     parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --list.")
-    parser.add_argument("--deps-only", action="store_true", help="Prepare external dependencies for selected modules without running suite setup.")
+    parser.add_argument("--deps-only", action="store_true", help="Prepare external dependencies for selected modules without running setup.")
     parser.add_argument("--bootstrap", action="store_true", help="Prepare dependencies into a work-dir, then exit. Use --work-dir to reuse later.")
-    parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS, BLACKBOX_<SUITE>_RUNS, or 1.")
-    parser.add_argument("--server-mode", choices=["auto", "existing", "local"], default=env_value("SERVER_MODE", "auto", "default"))
-    parser.add_argument("--drive9-cli", default=env_value("DRIVE9_CLI", "", "default"))
-    parser.add_argument("--work-dir", default=env_value("WORK_DIR", "", "default"), help="Isolated working directory for cache/tmp/results. Defaults to BLACKBOX_WORK_DIR.")
-    parser.add_argument("--out-dir", default=env_value("OUT_DIR", "", "default"))
-    parser.add_argument("--session", default=env_value("SESSION", "", "default"))
-    parser.add_argument("--strict-prereqs", action="store_true", default=env_flag("STRICT", False, "default"))
-    parser.add_argument("--offline", action="store_true", default=env_flag("OFFLINE", False, "default"))
+    parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS or 1.")
+    parser.add_argument("--server-mode", choices=["auto", "existing", "local"], default=env_value("SERVER_MODE", "auto", ""))
+    parser.add_argument("--drive9-cli", default=env_value("DRIVE9_CLI", "", ""))
+    parser.add_argument("--work-dir", default=env_value("WORK_DIR", "", ""), help="Isolated working directory for cache/tmp/results. Defaults to BLACKBOX_WORK_DIR.")
+    parser.add_argument("--out-dir", default=env_value("OUT_DIR", "", ""))
+    parser.add_argument("--session", default=env_value("SESSION", "", ""))
+    parser.add_argument("--strict-prereqs", action="store_true", default=env_flag("STRICT", False, ""))
+    parser.add_argument("--offline", action="store_true", default=env_flag("OFFLINE", False, ""))
     parser.add_argument("--fail-fast", action="store_true")
-    parser.add_argument("--keep-artifacts", action="store_true", default=env_flag("KEEP_ARTIFACTS", False, "default"))
-    parser.add_argument("--keep-all-artifacts", action="store_true", default=env_flag("KEEP_ALL_ARTIFACTS", False, "default"), help="Never clean tmp_dir, even on success.")
+    parser.add_argument("--keep-artifacts", action="store_true", default=env_flag("KEEP_ARTIFACTS", False, ""))
+    parser.add_argument("--keep-all-artifacts", action="store_true", default=env_flag("KEEP_ALL_ARTIFACTS", False, ""), help="Never clean tmp_dir, even on success.")
     return parser.parse_args(argv)
-
-
-def normalize_suite_args(args: argparse.Namespace) -> str:
-    # The suite concept is simplified: there is one default suite.
-    # The name is used for result directory paths and env var prefixes.
-    return str(getattr(args, "suite", "") or "default").strip() or "default"
 
 
 def emit_module_list(registry: dict[str, Any], output_format: str) -> int:
@@ -574,59 +563,9 @@ def emit_module_list(registry: dict[str, Any], output_format: str) -> int:
     return 0
 
 
-def run_all_suites(args: argparse.Namespace) -> int:
-    """Discover and run every suite, then generate an overall report."""
-    from .suite import discover_suites
-
-    suites = discover_suites()
-    if not suites:
-        print("blackbox: no suites found", file=sys.stderr, flush=True)
-        return 1
-    suite_summaries: list[dict[str, Any]] = []
-    has_failures = False
-    work_dir_raw = args.work_dir or os.environ.get("BLACKBOX_WORK_DIR", "")
-    if work_dir_raw:
-        work_dir = Path(work_dir_raw).expanduser().resolve()
-    else:
-        work_dir = RESULT_ROOT.parent / "work" / "all-suites" / file_ts()
-    work_dir.mkdir(parents=True, exist_ok=True)
-    for suite_name in suites:
-        progress(f"all-suites: running suite {suite_name}")
-        suite_args = argparse.Namespace(**vars(args))
-        suite_args.suite = suite_name
-        suite_args.all_suites = False
-        suite_args.work_dir = str(work_dir)
-        try:
-            runner = BlackboxRunner(suite_args)
-            code = runner.run()
-        except BlackboxError as exc:
-            progress(f"all-suites: suite {suite_name} failed: {exc}")
-            code = 1
-        if code != 0:
-            has_failures = True
-        summary = runner.recorder.summary()
-        report_rel = f"results/{suite_name}/{runner.session}/report.md"
-        suite_summaries.append({"suite": suite_name, "summary": summary, "report": report_rel})
-    # Generate overall report.
-    overall_md = report_engine.render_overall_report(work_dir, suite_summaries)
-    overall_path = work_dir / "report.md"
-    overall_path.write_text(overall_md, encoding="utf-8")
-    overall_json = {
-        "schema": "drive9-blackbox-overall-report/v1",
-        "timestamp": utc_ts(),
-        "work_dir": str(work_dir),
-        "suites": suite_summaries,
-    }
-    write_json(work_dir / "overall-report.json", overall_json)
-    print(f"blackbox overall report: {overall_path}", flush=True)
-    return 1 if has_failures else 0
-
-
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     try:
-        if getattr(args, "all_suites", False):
-            return run_all_suites(args)
         runner = BlackboxRunner(args)
         return runner.run()
     except KeyboardInterrupt:
