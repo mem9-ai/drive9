@@ -286,7 +286,7 @@ func TestQuotaPendingDeltasCacheUsesTTLAndLocalAdjustments(t *testing.T) {
 	storage := int64(10)
 	file := int64(1)
 	media := int64(0)
-	c := newQuotaPendingDeltasCache(func(context.Context) (int64, int64, int64, error) {
+	c := newQuotaPendingDeltasCache("test-tenant", func(context.Context) (int64, int64, int64, error) {
 		calls.Add(1)
 		return storage, file, media, nil
 	}, time.Hour)
@@ -320,7 +320,7 @@ func TestQuotaPendingDeltasCacheDoesNotPublishSnapshotWhenLocalDeltaRacesLoad(t 
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
-	c := newQuotaPendingDeltasCache(func(context.Context) (int64, int64, int64, error) {
+	c := newQuotaPendingDeltasCache("test-tenant", func(context.Context) (int64, int64, int64, error) {
 		calls.Add(1)
 		once.Do(func() { close(started) })
 		<-release

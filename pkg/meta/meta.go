@@ -2544,14 +2544,18 @@ func observeMeta(ctx context.Context, op string, start time.Time, errp *error) {
 	result := "ok"
 	if errp != nil && *errp != nil {
 		switch {
-		case errors.Is(*errp, ErrNotFound):
+		case errors.Is(*errp, ErrNotFound), errors.Is(*errp, sql.ErrNoRows):
 			result = "not_found"
 		case errors.Is(*errp, ErrDuplicate):
 			result = "duplicate"
 		default:
 			result = "error"
 		}
-		logger.Error(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+		if result == "not_found" || result == "duplicate" {
+			logger.Warn(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+		} else {
+			logger.Error(ctx, "meta_op_failed", zap.String("operation", op), zap.String("result", result), zap.Error(*errp))
+		}
 	}
 	metrics.RecordOperation("meta", op, result, time.Since(start))
 }

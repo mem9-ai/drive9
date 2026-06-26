@@ -51,7 +51,7 @@ func (b *Dat9Backend) enqueueExtractSemanticTasksTx(ctx context.Context, tx *sql
 		return false, nil
 	}
 	if b.mediaLLMQuotaExceededCheckTx(ctx, tx, currentMediaDelta) {
-		metrics.RecordOperation("media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
+		metrics.RecordTenantOperation(b.tenantID, "media_llm_budget", "enqueue_skip", "quota_exceeded", 0)
 		return false, nil
 	}
 	enqueued := false

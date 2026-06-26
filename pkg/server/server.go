@@ -4516,7 +4516,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			s.schemaInitErrors.Delete(tenantID)
 			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_ok", "tenant_id", tenantID, "provider", provider, "attempt", attempt)...)
 			if s.metrics != nil {
-				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "ok")
+				s.metrics.recordEvent(tenantID, "tenant_schema_init", "provider", provider, "result", "ok")
 			}
 			updated, err := s.meta.UpdateTenantStatusIf(ctx, tenantID, meta.TenantProvisioning, meta.TenantActive)
 			if err != nil {
@@ -4532,7 +4532,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			s.schemaInitErrors.Store(tenantID, schemaInitStatusErrorMessage(err))
 			logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", err)...)
 			if s.metrics != nil {
-				s.metrics.recordEvent("tenant_schema_init", "provider", provider, "result", "error")
+				s.metrics.recordEvent(tenantID, "tenant_schema_init", "provider", provider, "result", "error")
 			}
 			remaining := time.Until(deadline)
 			if remaining <= 0 {

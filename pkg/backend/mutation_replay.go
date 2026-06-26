@@ -117,12 +117,15 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 				zap.Error(err))
 			if rErr := w.store.IncrMutationRetry(ctx, entry.ID, replayMaxRetries); rErr != nil {
 				logger.Error(ctx, "mutation_replay_incr_retry_failed",
+					zap.String("tenant_id", entry.TenantID),
 					zap.Int64("log_id", entry.ID),
 					zap.Error(rErr))
 			}
+			metrics.RecordTenantOperation(entry.TenantID, "mutation_replay", entry.MutationType, "error", 0)
 			blockedTenants[entry.TenantID] = struct{}{}
 			failed++
 		} else {
+			metrics.RecordTenantOperation(entry.TenantID, "mutation_replay", entry.MutationType, "ok", 0)
 			applied++
 		}
 	}
@@ -226,6 +229,7 @@ func applyCentralQuotaMutationTx(store MetaQuotaStore, tx *sql.Tx, tenantID, mut
 
 	default:
 		logger.Warn(context.Background(), "mutation_replay_unknown_type",
+			zap.String("tenant_id", tenantID),
 			zap.String("mutation_type", mutationType),
 			zap.Int64("log_id", logID))
 		return nil // skip unknown types gracefully

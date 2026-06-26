@@ -76,7 +76,7 @@ func (b *Dat9Backend) logQuotaMutation(ctx context.Context, mutationType string,
 			zap.String("tenant_id", b.tenantID),
 			zap.String("mutation_type", mutationType),
 			zap.Error(err))
-		metrics.RecordOperation("central_quota", mutationType, "fail_open", time.Duration(0))
+		metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "fail_open", time.Duration(0))
 		return 0, false
 	}
 	return logID, true
@@ -97,10 +97,10 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 			zap.String("mutation_type", mutationType),
 			zap.Int64("log_id", logID),
 			zap.Error(err))
-		metrics.RecordOperation("central_quota", mutationType, "pending", time.Duration(0))
+		metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "pending", time.Duration(0))
 		return
 	}
-	metrics.RecordOperation("central_quota", mutationType, "ok", time.Duration(0))
+	metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "ok", time.Duration(0))
 }
 
 // logAndEnqueueMutation atomically logs a mutation and enqueues its apply
