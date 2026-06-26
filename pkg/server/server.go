@@ -553,6 +553,9 @@ const fsEventsRetention = 1 * time.Hour
 // rows correctly (reset when since < oldestSeq). The table grows bounded by
 // event write rate; a separate task should add per-tenant cleanup via pool
 // iteration or on Acquire. See issue #599 P1-2.
+// In both modes the row count is sampled and reported as
+// drive9_fs_events_rows so operators can monitor table growth without direct
+// DB access.
 func (s *Server) cleanupFSEvents(ctx context.Context) {
 	if ctx.Err() != nil {
 		// Context already cancelled (shutdown in progress): skip cleanup to
@@ -564,12 +567,18 @@ func (s *Server) cleanupFSEvents(ctx context.Context) {
 	if s.fallback != nil && s.meta == nil {
 		store := s.fallback.Store()
 		if store != nil {
-			if _, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-fsEventsRetention)); err != nil {
+			// Sample row count before pruning so operators can track growth.
+			if count, err := store.CountFSEvents(ctx); err == nil {
+				metrics.RecordFSEventsRows("", count)
+			}
+			if n, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-fsEventsRetention)); err != nil {
 				if ctx.Err() != nil {
 					logger.Warn(ctx, "fs_events_cleanup_interrupted_by_shutdown", zap.Error(err))
 				} else {
 					logger.Warn(ctx, "fs_events_cleanup_failed", zap.Error(err))
 				}
+			} else {
+				metrics.RecordFSEventsPruned("", n)
 			}
 		}
 	}

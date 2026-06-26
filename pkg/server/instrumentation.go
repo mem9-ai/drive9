@@ -241,6 +241,14 @@ func (m *serverMetrics) recordBodyRead(method, route string, status int, bodyByt
 	metrics.RecordHTTPRequestBodyRead(method, route, status, bodyBytes, d)
 }
 
+// recordCount records only the request counter (no duration histogram).
+// Used for SSE/streaming routes whose handler blocks for the connection
+// lifetime — recording that lifetime into the HTTP duration histogram would
+// pollute all HTTP P95/P99 alerts. See observe for the route guard.
+func (m *serverMetrics) recordCount(method, route string, status int) {
+	metrics.RecordHTTPRequestCount(method, route, status)
+}
+
 func (m *serverMetrics) recordEvent(tenantID, event string, labels ...string) {
 	metrics.RecordTenantEvent(tenantID, event, labels...)
 }
@@ -619,6 +627,23 @@ func recordTenantHTTPRequest(r *http.Request, status int, d time.Duration, respo
 	}
 }
 
+// recordTenantHTTPRequestCount records only the tenant request counter (no
+// duration histogram) for SSE/streaming routes. Companion to recordCount.
+func recordTenantHTTPRequestCount(r *http.Request, status int) {
+	tenantID := requestTenantID(r)
+	if tenantID == "" {
+		return
+	}
+	class := classifyTenantRequest(r)
+	if scopedClass, ok := requestMetricClass(r.Context()); ok {
+		class = scopedClass
+	}
+	metrics.RecordTenantRequestCount(tenantID, class.surface, class.action, tenantRequestResult(status), status)
+	if r.ContentLength > 0 {
+		metrics.RecordTenantHTTPBytes(tenantID, class.surface, class.action, "request", r.ContentLength)
+	}
+}
+
 func recordTenantFileBytes(ctx context.Context, surface, action, direction string, bytes int64) {
 	tenantID, _, _ := requestMetricScope(ctx)
 	if tenantID == "" || bytes <= 0 {
@@ -666,17 +691,29 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	}
 
 	dur := time.Since(start)
-	s.metrics.record(r.Method, route, ow.status, dur)
-	if method, bodyRoute, bodyBytes, bodyReadDuration, ok := requestBodyReadMetric(r.Context()); ok {
-		if method == "" {
-			method = r.Method
+	// SSE routes (/v1/events) block in a select loop for the entire client
+	// connection lifetime — recording that lifetime into the HTTP request
+	// duration histogram would pollute all HTTP P95/P99 alerts (a 40s SSE
+	// connection would look like a 40s "request"). For SSE routes, record
+	// only the request counter (and tenant request counter + bytes); the
+	// connection lifetime goes into the dedicated SSE metrics recorded by
+	// handleEvents instead. duration_ms is still logged below for debugging.
+	if route == "/v1/events" {
+		s.metrics.recordCount(r.Method, route, ow.status)
+		recordTenantHTTPRequestCount(r, ow.status)
+	} else {
+		s.metrics.record(r.Method, route, ow.status, dur)
+		if method, bodyRoute, bodyBytes, bodyReadDuration, ok := requestBodyReadMetric(r.Context()); ok {
+			if method == "" {
+				method = r.Method
+			}
+			if bodyRoute == "" {
+				bodyRoute = route
+			}
+			s.metrics.recordBodyRead(method, bodyRoute, ow.status, bodyBytes, bodyReadDuration)
 		}
-		if bodyRoute == "" {
-			bodyRoute = route
-		}
-		s.metrics.recordBodyRead(method, bodyRoute, ow.status, bodyBytes, bodyReadDuration)
+		recordTenantHTTPRequest(r, ow.status, dur, ow.size)
 	}
-	recordTenantHTTPRequest(r, ow.status, dur, ow.size)
 
 	tenantID, apiKeyID, _ := requestMetricScope(r.Context())
 
