@@ -2960,7 +2960,9 @@ func TestCommitQueueCanceledInFlightDoesNotRemoveNewerStagedData(t *testing.T) {
 		Mode:    0o644,
 		HasMode: true,
 	}
-	cq.Enqueue(oldEntry)
+	if err := cq.Enqueue(oldEntry); err != nil {
+		t.Fatalf("Enqueue failed: %v", err)
+	}
 
 	// Wait for the upload to start, then cancel the in-flight entry.
 	// This simulates the timeout path in lockWritableRemoteCommitPath calling CancelPath.

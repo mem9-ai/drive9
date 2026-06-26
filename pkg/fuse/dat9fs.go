@@ -5764,6 +5764,13 @@ func (fs *Dat9FS) lockWritableRemoteCommitPath(p string) func() {
 			fs.debugf("lockWritableRemoteCommitPath: timeout (%s) waiting for %s, canceling in-flight and proceeding", timeout, p)
 			if fs.commitQueue != nil {
 				fs.commitQueue.CancelPath(p)
+				// Wait briefly for the worker to acknowledge cancellation and
+				// exit in-flight state. The worker checks isEntryCanceled before
+				// onCommitSuccess cleanup (skipping cleanup if canceled), so a
+				// short wait here ensures the old entry's cleanup (which could
+				// remove shadow/pending data) has either run or been skipped
+				// before we proceed to stage new data.
+				fs.commitQueue.WaitPathTimeout(p, 100*time.Millisecond)
 			}
 			unlock, ok := fs.tryLockRemoteCommitPath(p)
 			if ok {
