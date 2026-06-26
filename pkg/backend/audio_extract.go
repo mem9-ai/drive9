@@ -18,6 +18,7 @@ import (
 
 // AudioExtractRequest is the input to a pluggable audio->text extractor.
 type AudioExtractRequest struct {
+	TenantID    string
 	FileID      string
 	Path        string
 	ContentType string
@@ -336,6 +337,7 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 
 	taskCtx, cancel := context.WithTimeout(ctx, b.audioExtractTimeout)
 	text, audioUsage, err := b.audioExtractor.ExtractAudioText(taskCtx, AudioExtractRequest{
+		TenantID:    b.tenantID,
 		FileID:      task.FileID,
 		Path:        task.Path,
 		ContentType: extractorContentType,

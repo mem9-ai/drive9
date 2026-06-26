@@ -160,6 +160,8 @@ type semanticWorkerManager struct {
 	lastTenantScan            semanticTenantScanSnapshot
 	tenantScanMu              sync.Mutex
 
+	priorObservedTenants map[string]struct{}
+
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -1337,10 +1339,19 @@ func (m *semanticWorkerManager) observeOnce(ctx context.Context, now time.Time) 
 	metrics.RecordGauge("semantic_worker", "processing", float64(snapshot.processing))
 	metrics.RecordGauge("semantic_worker", "dead_lettered", float64(snapshot.deadLettered))
 	metrics.RecordGauge("semantic_worker", "queue_lag_seconds", snapshot.queueLagSeconds)
+	seen := make(map[string]struct{}, len(snapshot.perTenant))
 	for tenantID, tenantObs := range snapshot.perTenant {
 		metrics.RecordTenantGauge(tenantID, "semantic_worker", "dead_lettered", float64(tenantObs.deadLettered))
 		metrics.RecordTenantGauge(tenantID, "semantic_worker", "queue_lag_seconds", tenantObs.queueLagSeconds)
+		seen[tenantID] = struct{}{}
 	}
+	for tenantID := range m.priorObservedTenants {
+		if _, ok := seen[tenantID]; !ok {
+			metrics.RecordTenantGauge(tenantID, "semantic_worker", "dead_lettered", 0)
+			metrics.RecordTenantGauge(tenantID, "semantic_worker", "queue_lag_seconds", 0)
+		}
+	}
+	m.priorObservedTenants = seen
 }
 
 func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time.Time) semanticObservationSnapshot {

@@ -148,6 +148,7 @@ func (b *Dat9Backend) ensureUploadReserveFitsPendingQuotaTx(ctx context.Context,
 	pendingStorageDelta, pendingFileDelta, _, pendingOK := b.livePendingQuotaOutboxDeltasTx(ctx, tx)
 	if !pendingOK {
 		metrics.RecordTenantOperation(b.tenantID, "server_quota", "upload_reserve_pending_check", "fail_open", 0)
+		return nil
 	}
 	projected := usage.StorageBytes + usage.ReservedBytes + pendingStorageDelta + totalSize
 	if cfg.MaxStorageBytes > 0 && projected > cfg.MaxStorageBytes {

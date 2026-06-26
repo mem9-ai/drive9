@@ -726,6 +726,9 @@ func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	result := "ok"
 	auditTenantID := "unknown"
+	if scope := ScopeFromContext(r.Context()); scope != nil {
+		auditTenantID = scope.TenantID
+	}
 	defer func() { recordVaultOperation(auditTenantID, "audit_query", start, result) }()
 
 	if r.Method != http.MethodGet {
@@ -745,10 +748,6 @@ func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 		errJSON(w, http.StatusInternalServerError, sanitizeClientError(err))
 		return
 	}
-	scope := ScopeFromContext(r.Context())
-	if scope != nil {
-		auditTenantID = scope.TenantID
-	}
 
 	secretName := r.URL.Query().Get("secret")
 	limit := 100
@@ -758,7 +757,7 @@ func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	events, err := vs.QueryAuditLog(r.Context(), scope.TenantID, secretName, limit)
+	events, err := vs.QueryAuditLog(r.Context(), auditTenantID, secretName, limit)
 	if err != nil {
 		result = "error"
 		errJSON(w, http.StatusInternalServerError, "failed to query audit log")
