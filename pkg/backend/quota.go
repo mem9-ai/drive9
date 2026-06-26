@@ -93,7 +93,7 @@ func (b *Dat9Backend) monthlyLLMCostExceededServer(ctx context.Context) bool {
 	if err != nil {
 		logger.Warn(ctx, "server_llm_cost_check_fail_open",
 			zap.String("tenant_id", b.tenantID), zap.Error(err))
-		metrics.RecordOperation("server_quota", "llm_cost_check", "fail_open", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "server_quota", "llm_cost_check", "fail_open", time.Since(start))
 		return false // fail-open
 	}
 	// Use per-tenant config if available, otherwise fall back to global default.

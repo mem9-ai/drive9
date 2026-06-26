@@ -284,7 +284,7 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 	start := time.Now()
 	var result AudioExtractResult
 	defer func() {
-		metrics.RecordOperation("audio_extract", "process", legacyAudioExtractMetricResult(result), time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "audio_extract", "process", legacyAudioExtractMetricResult(result), time.Since(start))
 	}()
 
 	if !b.SupportsAsyncAudioExtract() {
@@ -292,7 +292,7 @@ func (b *Dat9Backend) ProcessAudioExtractTask(ctx context.Context, task AudioExt
 		return result, fmt.Errorf("async audio extract runtime not configured")
 	}
 	if b.monthlyLLMCostExceededCheck(ctx) {
-		metrics.RecordOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
+		metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "process_skip", "budget_exhausted", 0)
 		result = AudioExtractResultBudgetExhausted
 		return result, nil
 	}

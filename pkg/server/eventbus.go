@@ -36,7 +36,8 @@ const (
 // The store field is an atomic pointer so it can be safely refreshed by
 // eventBuses.get (when the pool recreates a backend) while SSE handlers read it.
 type EventBus struct {
-	store     atomic.Pointer[datastore.Store]
+	tenantID string
+	store    atomic.Pointer[datastore.Store]
 	mu        sync.Mutex
 	listeners map[uint64]chan struct{}
 	nextID    uint64
@@ -50,8 +51,9 @@ type EventBus struct {
 }
 
 // NewEventBus creates a new EventBus backed by the given tenant store.
-func NewEventBus(store *datastore.Store) *EventBus {
+func NewEventBus(tenantID string, store *datastore.Store) *EventBus {
 	eb := &EventBus{
+		tenantID:  tenantID,
 		listeners: make(map[uint64]chan struct{}),
 	}
 	eb.store.Store(store)
@@ -191,6 +193,7 @@ func (eb *EventBus) pollOnce(ctx context.Context) {
 		// Log so operators can detect persistent failures or pool-churn-induced
 		// stale-store hits. Don't send reset — just skip this tick.
 		logger.Warn(ctx, "event_bus_poll_failed",
+			zap.String("tenant_id", eb.tenantID),
 			zap.Uint64("since", since),
 			zap.Error(err))
 		return
@@ -247,9 +250,10 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 		// operators can detect and alert on persistent table-missing or DB
 		// connectivity issues.
 		logger.Warn(ctx, "event_bus_query_failed",
+			zap.String("tenant_id", eb.tenantID),
 			zap.Uint64("since", since),
 			zap.Error(err))
-		metrics.RecordOperation("event_bus", "query", "error", 0)
+		metrics.RecordTenantOperation(eb.tenantID, "event_bus", "query", "error", 0)
 		headSeq = since // keep the client's cursor unchanged
 		return nil, headSeq, true
 	}

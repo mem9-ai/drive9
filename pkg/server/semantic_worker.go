@@ -183,6 +183,12 @@ type semanticObservationSnapshot struct {
 	deadLettered    int
 	queueLagSeconds float64
 	inflight        int
+	perTenant       map[string]semanticTenantObservation
+}
+
+type semanticTenantObservation struct {
+	deadLettered    int
+	queueLagSeconds float64
 }
 
 type semanticTenantScanSnapshot struct {
@@ -302,10 +308,10 @@ func (m *semanticWorkerManager) Kick(tenantID string) {
 	m.mu.Unlock()
 	select {
 	case m.kicks <- tenantID:
-		metrics.RecordOperation("semantic_worker", "kick", "queued", 0)
+		metrics.RecordTenantOperation(tenantID, "semantic_worker", "kick", "queued", 0)
 	default:
 		m.clearKickPending(tenantID)
-		metrics.RecordOperation("semantic_worker", "kick", "dropped", 0)
+		metrics.RecordTenantOperation(tenantID, "semantic_worker", "kick", "dropped", 0)
 	}
 }
 
@@ -484,7 +490,7 @@ func (m *semanticWorkerManager) claimAndProcessOne(ctx context.Context, target *
 	claimStart := time.Now()
 	task, found, err := target.store.ClaimSemanticTask(ctx, time.Now().UTC(), m.opts.LeaseDuration, target.allowedTaskTypes...)
 	if err != nil {
-		metrics.RecordOperation("semantic_worker", "claim", "error", time.Since(claimStart))
+		metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "claim", "error", time.Since(claimStart))
 		logger.Warn(ctx, "semantic_worker_claim_failed",
 			append([]zap.Field{
 				zap.String("tenant_id", target.tenantID),
@@ -496,7 +502,7 @@ func (m *semanticWorkerManager) claimAndProcessOne(ctx context.Context, target *
 	if !found {
 		return false
 	}
-	metrics.RecordOperation("semantic_worker", "claim", "ok", time.Since(claimStart))
+	metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "claim", "ok", time.Since(claimStart))
 	logger.Info(ctx, "semantic_worker_claim_ok",
 		append([]zap.Field{
 			zap.String("tenant_id", target.tenantID),
@@ -514,8 +520,9 @@ func (m *semanticWorkerManager) processTask(ctx context.Context, target *semanti
 	}
 	start := time.Now()
 	result := "ok"
+	tenantID := target.tenantID
 	defer func() {
-		metrics.RecordOperation("semantic_worker", string(task.TaskType), result, time.Since(start))
+		metrics.RecordTenantOperation(tenantID, "semantic_worker", string(task.TaskType), result, time.Since(start))
 	}()
 	leaseExec := m.startTaskLeaseExecution(ctx, target, task)
 	var (
@@ -586,7 +593,7 @@ func (m *semanticWorkerManager) retryTask(ctx context.Context, tenantID string, 
 	retryAt := time.Now().UTC().Add(m.retryDelay(task.AttemptCount))
 	willDeadLetter := task.AttemptCount >= task.MaxAttempts
 	if err := store.RetrySemanticTask(ctx, task.TaskID, task.Receipt, retryAt, message); err != nil {
-		metrics.RecordOperation("semantic_worker", "retry", "error", time.Since(start))
+		metrics.RecordTenantOperation(tenantID, "semantic_worker", "retry", "error", time.Since(start))
 		logger.Warn(ctx, "semantic_worker_retry_failed",
 			append([]zap.Field{
 				zap.String("tenant_id", tenantID),
@@ -600,7 +607,7 @@ func (m *semanticWorkerManager) retryTask(ctx context.Context, tenantID string, 
 		result = "dead_lettered"
 		logMessage = "semantic_worker_dead_lettered"
 	}
-	metrics.RecordOperation("semantic_worker", "retry", result, time.Since(start))
+	metrics.RecordTenantOperation(tenantID, "semantic_worker", "retry", result, time.Since(start))
 	fields := append([]zap.Field{
 		zap.String("tenant_id", tenantID),
 		zap.String("result", result),
@@ -615,7 +622,7 @@ func (m *semanticWorkerManager) retryTask(ctx context.Context, tenantID string, 
 func (m *semanticWorkerManager) deadLetterTask(ctx context.Context, tenantID string, store *datastore.Store, task *semantic.Task, message string) {
 	start := time.Now()
 	if err := store.DeadLetterSemanticTask(ctx, task.TaskID, task.Receipt, message); err != nil {
-		metrics.RecordOperation("semantic_worker", "dead_letter", "error", time.Since(start))
+		metrics.RecordTenantOperation(tenantID, "semantic_worker", "dead_letter", "error", time.Since(start))
 		logger.Warn(ctx, "semantic_worker_dead_letter_failed",
 			append([]zap.Field{
 				zap.String("tenant_id", tenantID),
@@ -623,7 +630,7 @@ func (m *semanticWorkerManager) deadLetterTask(ctx context.Context, tenantID str
 			}, append(semanticTaskLogFields(task), zap.Error(err))...)...)
 		return
 	}
-	metrics.RecordOperation("semantic_worker", "dead_letter", "dead_lettered", time.Since(start))
+	metrics.RecordTenantOperation(tenantID, "semantic_worker", "dead_letter", "dead_lettered", time.Since(start))
 	logger.Warn(ctx, "semantic_worker_dead_lettered",
 		append([]zap.Field{
 			zap.String("tenant_id", tenantID),
@@ -668,7 +675,7 @@ func (m *semanticWorkerManager) recoverExpired(ctx context.Context) {
 			start := time.Now()
 			recovered, err := target.store.RecoverExpiredSemanticTasks(ctx, time.Now().UTC(), 64)
 			if err != nil {
-				metrics.RecordOperation("semantic_worker", "recover", "error", time.Since(start))
+				metrics.RecordTenantOperation(ref.id, "semantic_worker", "recover", "error", time.Since(start))
 				logger.Warn(ctx, "semantic_worker_recover_failed",
 					zap.String("tenant_id", ref.id),
 					zap.Error(err))
@@ -676,7 +683,7 @@ func (m *semanticWorkerManager) recoverExpired(ctx context.Context) {
 				return
 			}
 			if recovered > 0 {
-				metrics.RecordOperation("semantic_worker", "recover", "ok", time.Since(start))
+				metrics.RecordTenantOperation(ref.id, "semantic_worker", "recover", "ok", time.Since(start))
 				logger.Info(ctx, "semantic_worker_recover_ok",
 					zap.String("tenant_id", ref.id),
 					zap.String("result", "ok"),
@@ -1017,12 +1024,12 @@ func (e *semanticTaskLeaseExecution) run(m *semanticWorkerManager, target *seman
 			leaseUntil, err := target.store.RenewSemanticTask(e.ctx, task.TaskID, task.Receipt, m.opts.LeaseDuration)
 			if err != nil {
 				if errors.Is(err, semantic.ErrTaskLeaseMismatch) || errors.Is(err, semantic.ErrTaskNotFound) {
-					metrics.RecordOperation("semantic_worker", "renew", "error", time.Since(renewStart))
+					metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "renew", "error", time.Since(renewStart))
 					// A renew already in flight can still discover lease loss after
 					// processTask begins shutdown, so lease mismatch wins over stop.
 					e.markLeaseLost()
 					failpoint.InjectCall("semanticWorkerOnLeaseLost", target.tenantID, target.store, task, err)
-					metrics.RecordOperation("semantic_worker", "lease_lost", "ok", time.Since(renewStart))
+					metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "lease_lost", "ok", time.Since(renewStart))
 					logger.Warn(e.ctx, "semantic_worker_lease_lost",
 						append([]zap.Field{
 							zap.String("tenant_id", target.tenantID),
@@ -1037,7 +1044,7 @@ func (e *semanticTaskLeaseExecution) run(m *semanticWorkerManager, target *seman
 					e.logStopped(m, target, task)
 					return
 				}
-				metrics.RecordOperation("semantic_worker", "renew", "error", time.Since(renewStart))
+				metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "renew", "error", time.Since(renewStart))
 				logger.Warn(e.ctx, "semantic_worker_lease_renew_failed",
 					append([]zap.Field{
 						zap.String("tenant_id", target.tenantID),
@@ -1047,7 +1054,7 @@ func (e *semanticTaskLeaseExecution) run(m *semanticWorkerManager, target *seman
 			}
 			e.recordRenewedLease(leaseUntil)
 			failpoint.InjectCall("semanticWorkerAfterRenew", target.tenantID, target.store, task, leaseUntil)
-			metrics.RecordOperation("semantic_worker", "renew", "ok", time.Since(renewStart))
+			metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "renew", "ok", time.Since(renewStart))
 		}
 	}
 }
@@ -1224,7 +1231,7 @@ func (m *semanticWorkerManager) semanticTaskStillOwned(ctx context.Context, tena
 	}
 	// Treat ownership loss as a finalized runtime event: the worker must not ack
 	// or retry once another actor could have legitimately reclaimed the task.
-	metrics.RecordOperation("semantic_worker", "lease_lost", "ok", 0)
+	metrics.RecordTenantOperation(tenantID, "semantic_worker", "lease_lost", "ok", 0)
 	logger.Warn(ctx, "semantic_worker_finalize_skipped_lease_lost",
 		append([]zap.Field{
 			zap.String("tenant_id", tenantID),
@@ -1330,6 +1337,10 @@ func (m *semanticWorkerManager) observeOnce(ctx context.Context, now time.Time) 
 	metrics.RecordGauge("semantic_worker", "processing", float64(snapshot.processing))
 	metrics.RecordGauge("semantic_worker", "dead_lettered", float64(snapshot.deadLettered))
 	metrics.RecordGauge("semantic_worker", "queue_lag_seconds", snapshot.queueLagSeconds)
+	for tenantID, tenantObs := range snapshot.perTenant {
+		metrics.RecordTenantGauge(tenantID, "semantic_worker", "dead_lettered", float64(tenantObs.deadLettered))
+		metrics.RecordTenantGauge(tenantID, "semantic_worker", "queue_lag_seconds", tenantObs.queueLagSeconds)
+	}
 }
 
 func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time.Time) semanticObservationSnapshot {
@@ -1338,7 +1349,7 @@ func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time
 	} else {
 		now = now.UTC()
 	}
-	snapshot := semanticObservationSnapshot{inflight: m.snapshotProcessing()}
+	snapshot := semanticObservationSnapshot{inflight: m.snapshotProcessing(), perTenant: make(map[string]semanticTenantObservation)}
 	refs, err := m.listTenantRefs(ctx)
 	if err != nil {
 		logger.Warn(ctx, "semantic_worker_list_tenants_for_observation_failed", zap.Error(err))
@@ -1367,6 +1378,17 @@ func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time
 			snapshot.queued += obs.Queued
 			snapshot.processing += obs.Processing
 			snapshot.deadLettered += obs.DeadLettered
+			tenantLag := float64(0)
+			if obs.OldestClaimableAvailableAt != nil {
+				tenantLag = now.Sub(obs.OldestClaimableAvailableAt.UTC()).Seconds()
+			}
+			if tenantLag < 0 {
+				tenantLag = 0
+			}
+			snapshot.perTenant[ref.id] = semanticTenantObservation{
+				deadLettered:    obs.DeadLettered,
+				queueLagSeconds: tenantLag,
+			}
 			if obs.OldestClaimableAvailableAt != nil && (oldest == nil || obs.OldestClaimableAvailableAt.Before(*oldest)) {
 				t := obs.OldestClaimableAvailableAt.UTC()
 				oldest = &t

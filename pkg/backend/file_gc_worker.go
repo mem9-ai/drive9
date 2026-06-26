@@ -59,6 +59,7 @@ func (b *Dat9Backend) StartFileGCWorker(opts FileGCWorkerOptions) *FileGCWorker 
 	b.fileGCWorker = w
 	go w.run(ctx)
 	logger.Info(ctx, "file_gc_worker_started",
+		zap.String("tenant_id", b.tenantID),
 		zap.Duration("poll_interval", opts.PollInterval),
 		zap.Duration("lease_duration", opts.LeaseDuration),
 		zap.Int("batch_size", opts.BatchSize))
@@ -108,7 +109,7 @@ func (w *FileGCWorker) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			logger.Info(ctx, "file_gc_worker_stopped")
+			logger.Info(ctx, "file_gc_worker_stopped", zap.String("tenant_id", w.backend.tenantID))
 			return
 		case <-ticker.C:
 			w.processAvailable(ctx)
@@ -120,13 +121,14 @@ func (w *FileGCWorker) processAvailable(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
+	tenantID := w.backend.tenantID
 	now := time.Now().UTC()
 	if _, err := w.backend.store.RecoverExpiredFileGCTasks(ctx, now, w.opts.RecoverLimit); err != nil {
 		if isContextDone(err) {
 			return
 		}
-		logger.Warn(ctx, "file_gc_recover_expired_failed", zap.Error(err))
-		metrics.RecordOperation("file_gc", "recover_expired", "error", 0)
+		logger.Warn(ctx, "file_gc_recover_expired_failed", zap.String("tenant_id", tenantID), zap.Error(err))
+		metrics.RecordTenantOperation(tenantID, "file_gc", "recover_expired", "error", 0)
 	}
 	for i := 0; i < w.opts.BatchSize; i++ {
 		if ctx.Err() != nil {
@@ -137,7 +139,7 @@ func (w *FileGCWorker) processAvailable(ctx context.Context) {
 			if isContextDone(err) {
 				return
 			}
-			logger.Warn(ctx, "file_gc_task_process_failed", zap.Error(err))
+			logger.Warn(ctx, "file_gc_task_process_failed", zap.String("tenant_id", w.backend.tenantID), zap.Error(err))
 		}
 		if !processed {
 			return
@@ -159,32 +161,33 @@ func (b *Dat9Backend) ProcessOneFileGCTask(ctx context.Context) (bool, error) {
 
 func (b *Dat9Backend) processOneFileGCTask(ctx context.Context, opts FileGCWorkerOptions) (processed bool, err error) {
 	start := time.Now()
+	tenantID := b.tenantID
 	task, found, err := b.store.ClaimFileGCTask(ctx, time.Now().UTC(), opts.LeaseDuration)
 	if err != nil {
-		metrics.RecordOperation("file_gc", "claim", "error", time.Since(start))
+		metrics.RecordTenantOperation(tenantID, "file_gc", "claim", "error", time.Since(start))
 		return false, err
 	}
 	if !found {
-		metrics.RecordOperation("file_gc", "claim", "empty", time.Since(start))
+		metrics.RecordTenantOperation(tenantID, "file_gc", "claim", "empty", time.Since(start))
 		return false, nil
 	}
 
 	err = b.processFileGCTask(ctx, task)
 	if err == nil {
 		if ackErr := b.store.AckFileGCTask(ctx, task.TaskID, task.Receipt); ackErr != nil {
-			metrics.RecordOperation("file_gc", "ack", "error", time.Since(start))
+			metrics.RecordTenantOperation(tenantID, "file_gc", "ack", "error", time.Since(start))
 			return true, ackErr
 		}
-		metrics.RecordOperation("file_gc", "process", "ok", time.Since(start))
+		metrics.RecordTenantOperation(tenantID, "file_gc", "process", "ok", time.Since(start))
 		return true, nil
 	}
 
 	retryAt := time.Now().UTC().Add(fileGCRetryDelay(task.AttemptCount, opts.RetryBase, opts.RetryMax))
 	if retryErr := b.store.RetryFileGCTask(ctx, task.TaskID, task.Receipt, retryAt, err.Error()); retryErr != nil {
-		metrics.RecordOperation("file_gc", "retry", "error", time.Since(start))
+		metrics.RecordTenantOperation(tenantID, "file_gc", "retry", "error", time.Since(start))
 		return true, fmt.Errorf("process file gc task %s: %w; update retry: %v", task.TaskID, err, retryErr)
 	}
-	metrics.RecordOperation("file_gc", "process", "error", time.Since(start))
+	metrics.RecordTenantOperation(tenantID, "file_gc", "process", "error", time.Since(start))
 	return true, err
 }
 
@@ -202,6 +205,7 @@ func (b *Dat9Backend) processFileGCTask(ctx context.Context, task *datastore.Fil
 		}
 		if err != nil {
 			logger.Warn(ctx, "file_gc_object_gc_candidate_failed",
+				zap.String("tenant_id", b.tenantID),
 				zap.String("file_id", task.FileID),
 				zap.String("storage_ref", task.StorageRef),
 				zap.Error(err))
