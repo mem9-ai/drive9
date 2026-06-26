@@ -745,7 +745,7 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 			logger.Warn(workerCtx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
 			return
 		}
-		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
+		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS, t.Provider)
 		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.schemaInitForTenant(t.ID, t.Provider, s.provisioner.InitSchema))
 	})
 }
@@ -824,10 +824,12 @@ func contextWithTrace(parent, traceSource context.Context) context.Context {
 	return traceid.With(parent, traceID)
 }
 
-func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool) string {
+func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool, provider string) string {
 	query := "parseTime=true"
 	if tlsEnabled {
 		query += "&tls=true"
+	} else if provider == tenant.ProviderTiDBCloudNative {
+		query += "&tls=skip-verify"
 	}
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", user, password, host, port, dbName, query)
 }
@@ -4359,7 +4361,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		APIKeyID:       apiKeyID,
 		Status:         meta.TenantProvisioning,
 		Provider:       provider,
-		TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, dbtls),
+		TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, dbtls, provider),
 		CloudProvider:  cloudProvider,
 		Region:         region,
 		OrganizationID: strings.TrimSpace(cluster.OrganizationID),
