@@ -451,29 +451,23 @@ func Mount(opts *MountOptions) error {
 		return fmt.Errorf("fuse mount: %w", err)
 	}
 
-	// Start SSE watcher for remote change notifications.
-	sseWatcher := StartSSEWatcher(dat9fs, c, actorID)
+	// Start SSE watcher after WaitMount. The initial stream reset invalidates
+	// kernel/user-space caches; if it races go-fuse's WaitMount pollHack open
+	// on Linux, the kernel can reject .go-fuse-epoll-hack with EACCES/EPERM.
+	var sseWatcher *SSEWatcher
 	stopWatchers := func() {
-		sseWatcher.Stop()
+		if sseWatcher != nil {
+			sseWatcher.Stop()
+		}
 		layerEventWatcherStop()
 	}
 
-	// Start serving in a background goroutine so WaitMount can proceed.
-	// On macOS, Serve() must be running before WaitMount() returns because
-	// mount_macfuse waits for STATFS (handled in the serve loop) before
-	// signalling ready, and WaitMount then runs pollHack which triggers
-	// a LOOKUP+OPEN+POLL through the mount point.
-	go server.Serve()
-
-	// WaitMount blocks until mount_macfuse exits (INIT+STATFS done) and
-	// then runs pollHack, which opens .go-fuse-epoll-hack inside the mount
-	// to trigger _OP_POLL so go-fuse can reply ENOSYS. Without this, macOS
-	// may later send _OP_POLL and deadlock the Go runtime (the netpoller
-	// thread consumes the last GOMAXPROCS slot, leaving no thread to handle
-	// the POLL request from the kernel).
-	if err := server.WaitMount(); err != nil {
+	err = serveWaitMountThenStartWatchers(server.Serve, server.WaitMount, func() {
+		sseWatcher = StartSSEWatcher(dat9fs, c, actorID)
+	}, func(err error) error {
 		if ok, probeErr := shouldContinueAfterWaitMountPermissionError(err, opts.MountPoint, probeMountPointReady); ok {
 			fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission error ignored after readiness probe passed at %s: %v\n", opts.MountPoint, err)
+			return nil
 		} else {
 			if probeErr != nil {
 				fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission fallback probe failed at %s: %v\n", opts.MountPoint, probeErr)
@@ -481,6 +475,9 @@ func Mount(opts *MountOptions) error {
 			stopWatchers()
 			return fmt.Errorf("fuse wait mount: %w", err)
 		}
+	})
+	if err != nil {
+		return err
 	}
 	controlServer, err := startMountControlServer(opts.MountPoint, dat9fs)
 	if err != nil {
@@ -661,6 +658,37 @@ func Mount(opts *MountOptions) error {
 		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
 	server.Wait()
 	shutdown()
+	return nil
+}
+
+func serveWaitMountThenStartWatchers(
+	serve func(),
+	waitMount func() error,
+	startWatchers func(),
+	handleWaitMountError func(error) error,
+) error {
+	// Serve must be running before WaitMount can proceed. On macOS,
+	// mount_macfuse waits for STATFS before signalling ready, and that STATFS
+	// is handled by the serve loop.
+	//
+	// WaitMount then runs go-fuse's pollHack, which opens
+	// .go-fuse-epoll-hack inside the mountpoint to trigger _OP_POLL so
+	// go-fuse can reply ENOSYS. Without this, macOS may later send _OP_POLL
+	// and deadlock the Go runtime. Start watchers only after this readiness
+	// probe finishes so an initial remote reset cannot invalidate the mount
+	// while go-fuse is still proving readiness.
+	go serve()
+	if err := waitMount(); err != nil {
+		if handleWaitMountError == nil {
+			return err
+		}
+		if err := handleWaitMountError(err); err != nil {
+			return err
+		}
+	}
+	if startWatchers != nil {
+		startWatchers()
+	}
 	return nil
 }
 
