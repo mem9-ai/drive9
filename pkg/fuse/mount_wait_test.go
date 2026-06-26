@@ -2,9 +2,85 @@ package fuse
 
 import (
 	"errors"
+	"reflect"
 	"syscall"
 	"testing"
 )
+
+func TestServeWaitMountThenStartWatchersStartsWatchersAfterWaitMount(t *testing.T) {
+	var events []string
+	watchersStarted := false
+
+	err := serveWaitMountThenStartWatchers(func() {}, func() error {
+		if watchersStarted {
+			t.Fatal("watchers started before WaitMount returned")
+		}
+		events = append(events, "wait_mount")
+		return nil
+	}, func() {
+		events = append(events, "watchers")
+		watchersStarted = true
+	}, nil)
+
+	if err != nil {
+		t.Fatalf("serveWaitMountThenStartWatchers() error = %v, want nil", err)
+	}
+	if !watchersStarted {
+		t.Fatal("watchers were not started")
+	}
+	if want := []string{"wait_mount", "watchers"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+}
+
+func TestServeWaitMountThenStartWatchersStartsWatchersAfterAcceptedWaitMountError(t *testing.T) {
+	waitErr := errors.New("permission denied")
+	var events []string
+
+	err := serveWaitMountThenStartWatchers(func() {}, func() error {
+		events = append(events, "wait_mount")
+		return waitErr
+	}, func() {
+		events = append(events, "watchers")
+	}, func(err error) error {
+		if !errors.Is(err, waitErr) {
+			t.Fatalf("waitMount error = %v, want %v", err, waitErr)
+		}
+		events = append(events, "handler")
+		return nil
+	})
+
+	if err != nil {
+		t.Fatalf("serveWaitMountThenStartWatchers() error = %v, want nil", err)
+	}
+	if want := []string{"wait_mount", "handler", "watchers"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+}
+
+func TestServeWaitMountThenStartWatchersDoesNotStartWatchersAfterRejectedWaitMountError(t *testing.T) {
+	waitErr := errors.New("permission denied")
+	wantErr := errors.New("mount not ready")
+	watchersStarted := false
+
+	err := serveWaitMountThenStartWatchers(func() {}, func() error {
+		return waitErr
+	}, func() {
+		watchersStarted = true
+	}, func(err error) error {
+		if !errors.Is(err, waitErr) {
+			t.Fatalf("waitMount error = %v, want %v", err, waitErr)
+		}
+		return wantErr
+	})
+
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("serveWaitMountThenStartWatchers() error = %v, want %v", err, wantErr)
+	}
+	if watchersStarted {
+		t.Fatal("watchers started after rejected WaitMount error")
+	}
+}
 
 func TestShouldContinueAfterWaitMountPermissionErrorWhenProbePasses(t *testing.T) {
 	called := false
