@@ -38,7 +38,7 @@ from .core import (
     utc_ts,
     write_json,
 )
-from .suite import load_suite_provider, discover_modules, load_groups, discover_suites
+from .suite import load_suite_provider, discover_modules, discover_suites
 from . import report as report_engine
 
 
@@ -69,7 +69,7 @@ class BlackboxRunner:
         self.recorder = Recorder(self.result_dir)
         self.provider = load_suite_provider("", SUITES_DIR)
         self.registry = discover_modules()
-        self.config = {"modules": {}, "groups": load_groups()}
+        self.config = {"modules": {}}
         self.capabilities = self.provider.detect_capabilities()
         self.target = self.provider.create_target(args, self.result_dir, self.recorder, session=self.session)
         # Pass the work_dir-based cache_root to the dependency manager.
@@ -108,12 +108,18 @@ class BlackboxRunner:
         elif self.args.category:
             selected = [module.id for module in self.registry.values() if module.id.startswith(self.args.category) or module.category.startswith(self.args.category)]
         elif self.args.group:
-            group = self.config.get("groups", {}).get(self.args.group)
-            if group is None:
-                raise BlackboxError(f"unknown group {self.args.group!r} ")
-            selected = self.expand_module_list(group)
+            # --group <name> selects a directory group: every module whose id
+            # starts with "<group>.", mirroring the suites/<group>/ layout.
+            prefix = f"{self.args.group}."
+            selected = [module.id for module in self.registry.values() if module.id.startswith(prefix)]
+            if not selected:
+                raise BlackboxError(f"unknown group {self.args.group!r} (no modules under suites/{self.args.group}/)")
         else:
             raise BlackboxError("one of --all, --category, --module, --group, or --list is required")
+        # --label is an optional overlay filter (combinable with any selector).
+        labels = self._requested_labels()
+        if labels:
+            selected = [module_id for module_id in selected if labels & set(getattr(self.registry[module_id], "labels", ()))]
         missing = [module_id for module_id in selected if module_id not in self.registry]
         if missing:
             raise BlackboxError(f"unknown module(s): {', '.join(missing)}")
@@ -126,6 +132,14 @@ class BlackboxRunner:
         if not self.args.module and not env_flag("INCLUDE_MANUAL", False, ""):
             out = [module_id for module_id in out if not getattr(self.registry[module_id], "manual", False)]
         return out
+
+    def _requested_labels(self) -> set[str]:
+        if not self.args.label:
+            return set()
+        labels: set[str] = set()
+        for raw in self.args.label:
+            labels.update(part.strip() for part in raw.split(",") if part.strip())
+        return labels
 
     def expand_module_list(self, values: list[str] | str) -> list[str]:
         if values == "all":
@@ -522,9 +536,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     selector.add_argument("--all", action="store_true", help="Run every discovered module.")
     selector.add_argument("--category", help="Run modules whose id/category has this prefix.")
     selector.add_argument("--module", action="append", help="Run one module id or a comma-separated list. Can be repeated.")
-    selector.add_argument("--group", help="Run a named module group, e.g. functional, posix, or perf.")
+    selector.add_argument("--group", help="Run a directory group, e.g. community, juicefs, drive9, git, or customer.")
     selector.add_argument("--list", action="store_true", help="List available modules.")
     parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --list.")
+    parser.add_argument("--label", action="append", help="Filter selected modules by label. Comma-separated list; can be repeated. Combinable with --all/--category/--group.")
     parser.add_argument("--deps-only", action="store_true", help="Prepare external dependencies for selected modules without running setup.")
     parser.add_argument("--bootstrap", action="store_true", help="Prepare dependencies into a work-dir, then exit. Use --work-dir to reuse later.")
     parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS or 1.")

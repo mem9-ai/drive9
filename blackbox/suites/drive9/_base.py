@@ -9,7 +9,7 @@ from harness.module_base import BaseModule
 
 class Drive9WorkflowBase(BaseModule):
     category = "drive9.workflow"
-    labels = ("drive9", "workflow")
+    labels = ("drive9", "workflow", "functional")
     timeout = 1800
 
     def ensure_dependencies(self, ctx: Context) -> None:

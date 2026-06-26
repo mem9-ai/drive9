@@ -1261,7 +1261,7 @@ class Drive9ManusPerf(BaseModule):
                 "errors": 0,
                 "error_rate": 0.0,
                 "runs": 1,
-                "detail": f"extra repo id {cfg['extra_repo_id']} not found in repos.json",
+                "detail": f"extra repo id {cfg['extra_repo_id']} not found in config.json repos",
                 **self.latency_summary([]),
             })
             return rows
@@ -1288,7 +1288,7 @@ class Drive9ManusPerf(BaseModule):
         return rows
 
     def selected_extra_repo(self, ctx: Context, cfg: dict[str, Any]) -> dict[str, Any] | None:
-        repos = ctx.config.get("repos", [])
+        repos = module_config(ctx, self.id).get("repos", [])
         for repo in repos:
             if str(repo.get("id")) == str(cfg["extra_repo_id"]):
                 return repo

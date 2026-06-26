@@ -2,6 +2,31 @@
   "selected_scales": [
     "S"
   ],
+  "repos": [
+    {
+      "id": "cruip-tailwind-dashboard",
+      "url": "https://github.com/cruip/tailwind-dashboard-template.git",
+      "ref": "main",
+      "build_dir": ".",
+      "install": [
+        "corepack enable",
+        "corepack pnpm install --frozen-lockfile"
+      ],
+      "build": [
+        "corepack pnpm run build"
+      ],
+      "source_extensions": [
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".css",
+        ".html",
+        ".json"
+      ],
+      "timeout_seconds": 1800
+    }
+  ],
   "profile": "coding-agent",
   "durability": "auto",
   "infinite_ttl_read_cache_s": 0,

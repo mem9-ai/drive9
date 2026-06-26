@@ -7,11 +7,11 @@ from harness.core import BlackboxError, Context
 from harness.module_base import BaseModule, module_config
 
 
-class PortedJuiceFSRandomStress(BaseModule):
-    id = "ported.juicefs.random_stress"
-    category = "ported.juicefs.stress"
+class JuiceFSRandomStress(BaseModule):
+    id = "juicefs.random_stress"
+    category = "juicefs.stress"
     description = "JuiceFS-inspired concurrent create/read/rename/remove stress, rewritten for Drive9 FUSE."
-    labels = ("stress", "ported-juicefs")
+    labels = ("stress", "juicefs", "functional")
     timeout = 1200
 
     def run(self, ctx: Context) -> dict[str, Any]:
@@ -20,7 +20,7 @@ class PortedJuiceFSRandomStress(BaseModule):
         files = int(cfg.get("files_per_worker", 64))
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("ported_juicefs_random_stress", remote, durability="interactive")
+        handle = ctx.target.mount("juicefs_random_stress", remote, durability="interactive")
         errors: list[str] = []
         try:
             def worker(idx: int) -> None:

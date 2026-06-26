@@ -79,7 +79,7 @@ def discover_modules() -> dict[str, Any]:
     for group_dir in sorted(SUITES_DIR.iterdir()):
         if not group_dir.is_dir() or group_dir.name.startswith("_") or group_dir.name.startswith("."):
             continue
-        # Skip non-group files (e.g., groups.json)
+        # Skip top-level non-module files (e.g., __init__.py, README.md).
         if (group_dir / "module.py").exists():
             continue
         for module_dir in sorted(group_dir.iterdir()):
@@ -116,15 +116,6 @@ def load_module_config(module_dir: Path) -> dict[str, Any]:
     config_path = module_dir / "config.json"
     if config_path.exists():
         with open(config_path) as f:
-            return json.load(f)
-    return {}
-
-
-def load_groups() -> dict[str, list[str]]:
-    """Load groups.json from the suites directory."""
-    groups_path = SUITES_DIR / "groups.json"
-    if groups_path.exists():
-        with open(groups_path) as f:
             return json.load(f)
     return {}
 

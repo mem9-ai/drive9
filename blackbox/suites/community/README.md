@@ -1,476 +1,170 @@
-# Drive9 FUSE Blackbox Suite
+# Community Modules
 
-This directory documents the FUSE suite for the shared Drive9 blackbox harness.
-The generic harness lives under `blackbox/harness`; FUSE-specific suite
-configuration lives under `blackbox/suites/fuse`.
+This directory holds the `community.*` blackbox modules — open source filesystem
+test suites and tools run against a Drive9 FUSE mount. The generic harness lives
+under `blackbox/harness`; drive9-specific environment wiring (server/CLI/FUSE
+mount, dependency preparation) lives under `blackbox/env`.
 
-The current scope is FUSE only, including macFUSE/FUSE-T tolerant behavior on
-macOS. WebDAV is intentionally out of scope.
+## Modules
 
-## What It Tests
+Each subdirectory is one auto-discovered module (`module.py`), optionally with a
+`config.json`, `deps.py`, and data files (e.g. `allowlist.json`).
 
-The framework is organized around modules, not around one-off scripts.
+| Module | Profile | Description |
+|---|---|---|
+| `community.fio` | performance | fio sequential and random I/O workloads. |
+| `community.fsx` | functional | fsx randomized file operation stress. |
+| `community.lock` | compatibility | POSIX advisory lock checks. |
+| `community.ltp.fs` | compatibility | LTP filesystem scenario (`drive9-fs-smoke`). |
+| `community.ltp.syscalls` | compatibility | LTP filesystem-sensitive syscall subset (`drive9-syscalls-fs`). |
+| `community.mdtest` | performance | mdtest metadata create/stat/remove workload. |
+| `community.pjdfstest` | compatibility | pjdfstest POSIX pass rate. |
+| `community.pyxattr` | compatibility | pyxattr-backed extended attribute checks. |
+| `community.vdbench` | performance | vdbench file workload (manual dependency). |
 
-- `community.*`: open source community filesystem test suites or tools, such
-  as pjdfstest, LTP, fio, mdtest, vdbench, fsx, xattr, and lock checks.
-- `ported.juicefs.*`: Drive9-owned equivalent rewrites inspired by generic
-  filesystem tests used by JuiceFS. These are not vendored JuiceFS source.
-- `git.official.*`: upstream Git test suites, split into functional and
-  performance modules.
-- `drive9.workflow.*`: Drive9 CLI workflows that are tightly coupled with FUSE,
-  such as `drive9 git clone --fast`, blobless clone, worktrees, profile
-  auto-pack, `umount --pack-path`, portable profile, explicit pack/unpack, and
-  coding-agent local overlay build behavior.
-- `drive9.customer.*`: reproducible customer-scenario benchmarks. These are
-  opt-in modules because they can create large datasets and long-running load.
+The two LTP modules share one `module.py` (`community.ltp.fs` + `community.ltp.syscalls`).
 
-The category names describe where the test idea or suite comes from. They do
-not imply that the tested filesystem is JuiceFS or Git. The tested filesystem is
-always Drive9 FUSE unless a module explicitly documents otherwise.
+## Selection
 
-## Directory Layout
-
-Module code is intentionally split by file under `blackbox/suites/fuse/modules/`:
-
-```text
-blackbox/
-  run.py                           generic blackbox entrypoint
-  harness/
-    runner.py                       CLI, selection, lifecycle, reporting
-    suite.py                        suite provider protocol and loader
-    deps.py                         generic dependency cache helpers
-    capabilities.py                 generic host capability detection
-  suites/
-    fuse/
-      provider.py                   FUSE suite lifecycle and wiring
-      target.py                     Drive9 CLI/server/FUSE mount provider
-      deps.py                       pjdfstest/LTP/fio/Git/etc preparation
-      capabilities.py               macFUSE/FUSE-T/Linux FUSE detection
-      modules.json
-      repos.json
-      allowlists/
-      modules/
-        registry.py                 FUSE module registry only
-        base.py                     FUSE module helpers
-        community_pjdfstest.py      community.pjdfstest
-        community_ltp.py            community.ltp.fs / community.ltp.syscalls
-        community_fio.py            community.fio
-        community_mdtest.py         community.mdtest
-        community_vdbench.py        community.vdbench
-        community_pyxattr.py        community.pyxattr
-        community_fsx.py            community.fsx
-        community_lock.py           community.lock
-        ported_juicefs_*.py         ported.juicefs.* modules
-        git_official_*.py           git.official.* modules
-        drive9_workflow_*.py        drive9.workflow.* modules
-        drive9_customer_*.py        customer-scenario benchmark modules
-```
-
-New modules should get their own file unless they are a tiny variant of an
-existing module family, such as the two LTP modules in `community_ltp.py`.
-
-## Selection Model
-
-The suite exposes modules and selectors. It does not define run-profile policy.
-Callers decide when to run blackbox and which selector to use.
-
-The FUSE suite also defines named module groups:
-
-- `functional`: `ported.juicefs.*` plus Drive9 workflow modules.
-- `posix`: `community.pjdfstest`.
-- `perf`: performance modules such as fio, mdtest, Git perf, and Drive9
-  workflow perf. Modules with manual-only dependencies, such as vdbench, are
-  excluded unless selected explicitly or `BLACKBOX_INCLUDE_MANUAL=1` is set.
-- `customer`: opt-in customer-scenario modules. These are intentionally not
-  part of `perf` because callers must explicitly choose the dataset scale and
-  target environment.
-
-## Commands
-
-Common entry points:
+Modules are selected with `python3 blackbox/run.py`. The `community` directory
+group selects every module here:
 
 ```bash
-make blackbox
+python3 blackbox/run.py --group community
 ```
 
-Module-oriented entry points:
+Label filters narrow within a selection. Community-relevant labels include
+`posix` (`community.pjdfstest`), `performance` (`community.fio`,
+community.mdtest, community.vdbench`), and `compatibility`:
 
 ```bash
-make blackbox-list
-make blackbox BLACKBOX_SELECTOR=group:posix
-make blackbox BLACKBOX_SELECTOR=category:drive9.workflow
-make blackbox BLACKBOX_SELECTOR=module:community.pjdfstest
-make blackbox BLACKBOX_SELECTOR=group:customer
-make blackbox-deps BLACKBOX_SELECTOR=group:perf
+python3 blackbox/run.py --group community --label performance
+python3 blackbox/run.py --group community --label posix
+python3 blackbox/run.py --module community.pjdfstest
 ```
 
-Direct runner usage:
+`community.vdbench` is a manual-dependency module and is excluded from broad
+selectors unless `INCLUDE_MANUAL=1` is set or it is selected explicitly with
+`--module`.
 
-```bash
-python3 blackbox/run.py --suite fuse --all
-python3 blackbox/run.py --suite fuse --group posix
-python3 blackbox/run.py --suite fuse --category drive9.workflow
-python3 blackbox/run.py --suite fuse --module drive9.workflow.git_blobless
-python3 blackbox/run.py --suite fuse --list --format json
-```
+## Dependencies
 
-Modules marked `manual` are not selected by `make blackbox`,
-`BLACKBOX_SELECTOR=category:...`, or `BLACKBOX_SELECTOR=group:...` unless
-`BLACKBOX_INCLUDE_MANUAL=1` is set. They can always be run explicitly with
-`BLACKBOX_SELECTOR=module:<id>`.
+The harness prefers already-installed tools, then `*_BIN` / `*_DIR` environment
+overrides, then auto-fetch under the work-dir cache. On Linux hosts with
+`apt-get` and passwordless `sudo`, it can also bootstrap the system packages
+needed to build these suites (build-essential, autotools, Perl/prove, MPICH,
+Python headers). Disable that with `AUTO_INSTALL_SYSTEM_DEPS=0`.
 
-`--deps-only` prepares external test-suite dependencies without starting
-Drive9 or mounting FUSE:
-
-```bash
-python3 blackbox/run.py --suite fuse --all --deps-only
-python3 blackbox/run.py --suite fuse --group perf --deps-only
-```
-
-## Runtime Model
-
-The runner does the following:
-
-1. Detects host capabilities: OS, FUSE helper, root/non-root, xattr, locking,
-   and common tools.
-2. Resolves the selected modules from `--all`, `--category`, `--module`, or
-   suite-local `--group`.
-3. Prepares module dependencies from environment variables, PATH, or
-   `blackbox/cache`.
-4. Builds `drive9` and starts a local `drive9-server-local`, unless
-   `--drive9-cli` and/or `DRIVE9_BASE` point to existing components.
-5. Creates one or more isolated Drive9 remote roots and FUSE mountpoints per
-   module.
-6. Records structured results, metrics, raw logs, and artifacts.
-
-A module can return these statuses:
-
-- `PASS`: behavior matched expectations.
-- `FAIL`: likely Drive9 product regression or test failure.
-- `SKIP`: dependency, platform, or capability is unavailable.
-- `XFAIL`: known incompatibility that should be tracked but not fail the run.
-- `WARN`: non-fatal warning. This is reserved for future richer assertions.
-
-## Server Modes
-
-Default `--server-mode auto` uses `DRIVE9_BASE` when set. Otherwise it starts a
-local `drive9-server-local`.
-
-For local mode, the runner uses `DRIVE9_LOCAL_DSN` when set. If it is unset, it
-starts a disposable MySQL container with Docker or Podman.
-
-Useful environment variables:
-
-```bash
-DRIVE9_BASE=http://127.0.0.1:9009
-DRIVE9_API_KEY=drive9_xxx
-DRIVE9_LOCAL_DSN='root:pass@tcp(127.0.0.1:3306)/drive9_local?parseTime=true'
-BLACKBOX_SUITE=fuse
-BLACKBOX_SERVER_MODE=existing
-BLACKBOX_STRICT=1
-BLACKBOX_RUNS=1
-BLACKBOX_REPOS=drive9,kimi-code
-BLACKBOX_DRIVE9_CLI=/path/to/drive9
-BLACKBOX_OFFLINE=1
-BLACKBOX_KEEP_ARTIFACTS=1
-BLACKBOX_QUIET=1
-BLACKBOX_LOCAL_OVERLAY_PREWARM=0
-BLACKBOX_LOCAL_OVERLAY_VERIFY_REMOTE=0
-```
-
-## Kimi Performance Module
-
-`drive9.customer.kimi_perf` codifies the Kimi sandbox workload:
-
-- namespace scale at 100MB/1k files, 1GB/10k files, and 10GB/100k files;
-- single-directory and sharded-tree layouts;
-- mount, `ls`, `ls -l`, `find`, name-pattern `find`, and sampled `stat` latency;
-- small-file create, overwrite, append, partial edit, read, and stat-after-write
-  QPS plus p50/p95/p99/max;
-- close, `fsync`, and `fdatasync` write latency, including separate reader
-  mount/cache visibility checks;
-- one measurement round by default, controlled by `BLACKBOX_RUNS` or
-  `BLACKBOX_KIMI_PERF_RUNS`; set it to `3` when a three-round average is
-  required;
-- unmount/remount persistence checks for the "next sandbox sees previous data"
-  requirement;
-- same-host multi-mount validation for a configured set of mount counts.
-
-This module is never executed accidentally. It is registered in the `customer`
-group, but `ensure_dependencies` skips it unless explicitly enabled:
-
-```bash
-BLACKBOX_KIMI_PERF_ENABLE=1 \
-BLACKBOX_SERVER_MODE=existing \
-DRIVE9_BASE=http://drive9.pingkai.cn \
-make blackbox BLACKBOX_SELECTOR=module:drive9.customer.kimi_perf
-```
-
-The default configuration runs only the S scale. Full customer scale requires
-explicit selection. Namespace dataset preparation is timeout-bounded per
-scale/layout case; a large case timing out is recorded and the module continues
-with the next case.
-
-```bash
-BLACKBOX_KIMI_PERF_ENABLE=1 \
-BLACKBOX_RUNS=3 \
-BLACKBOX_KIMI_PERF_SCALES=S,M,L \
-BLACKBOX_KIMI_PERF_DATASET_TIMEOUTS=S=300,M=600,L=120 \
-BLACKBOX_KIMI_PERF_NAMESPACE_CMD_TIMEOUTS=S=180,M=30,L=30 \
-FUSE_POST_UMOUNT_WAIT_S=3 \
-BLACKBOX_SERVER_MODE=existing \
-DRIVE9_BASE=http://drive9.pingkai.cn \
-make blackbox BLACKBOX_SELECTOR=module:drive9.customer.kimi_perf
-```
-
-Useful tunables:
-
-```bash
-BLACKBOX_KIMI_PERF_LAYOUTS=single,tree
-BLACKBOX_KIMI_PERF_PROFILE=coding-agent
-BLACKBOX_KIMI_PERF_DURABILITY=auto
-BLACKBOX_KIMI_PERF_RUNS=3
-BLACKBOX_KIMI_PERF_STAT_SAMPLES=1000
-BLACKBOX_KIMI_PERF_DATASET_TIMEOUT_S=300
-BLACKBOX_KIMI_PERF_DATASET_TIMEOUTS=S=300,M=600,L=120
-BLACKBOX_KIMI_PERF_NAMESPACE_CMD_TIMEOUT_S=300
-BLACKBOX_KIMI_PERF_NAMESPACE_CMD_TIMEOUTS=S=180,M=30,L=30
-BLACKBOX_KIMI_PERF_SMALL_SIZES=1024,4096,20480,102400,1048576
-BLACKBOX_KIMI_PERF_SMALL_OPS=50
-BLACKBOX_KIMI_PERF_SMALL_CONCURRENCY=1,4,16,64
-BLACKBOX_KIMI_PERF_FLUSH_SIZES=1024,4096,20480,102400,1048576
-BLACKBOX_KIMI_PERF_FLUSH_OPS=30
-BLACKBOX_KIMI_PERF_FLUSH_CONCURRENCY=1,4,16,64
-BLACKBOX_KIMI_PERF_VISIBILITY_SAMPLES=100
-BLACKBOX_KIMI_PERF_MOUNT_COUNTS=1,2,5,10
-BLACKBOX_KIMI_PERF_REMOTE_ROOT=/some/reusable/remote/root
-BLACKBOX_KIMI_PERF_REUSE_DATASETS=1
-BLACKBOX_KIMI_PERF_RAW=1
-FUSE_POST_UMOUNT_WAIT_S=3
-```
-
-Per-section switches are also available:
-
-```bash
-BLACKBOX_KIMI_PERF_NAMESPACE=1
-BLACKBOX_KIMI_PERF_SMALL_FILE=1
-BLACKBOX_KIMI_PERF_FLUSH=1
-BLACKBOX_KIMI_PERF_PERSISTENCE=1
-BLACKBOX_KIMI_PERF_MULTI_MOUNT=1
-BLACKBOX_KIMI_PERF_SOAK=0
-```
-
-Outputs are written under the normal run directory:
-
-```text
-blackbox/results/fuse/<session>/artifacts/drive9.customer.kimi_perf/
-  environment.json
-  manifest.json
-  raw_results/*.jsonl
-  summary/summary.csv
-  summary/summary.json
-  report.md
-```
-
-`report.md` is the customer-facing summary table. `summary.csv` is meant for
-spreadsheets and trend dashboards. `raw_results/*.jsonl` contains per-operation
-latency records for deeper p95/p99/debug analysis.
-
-Important scope notes:
-
-- Same-host multi-mount results are reported as "validated on this host" only.
-  They are not a true multi-VM or multi-sandbox upper bound.
-- Cold namespace mount measurements use unique cache directories per mount.
-- Cross-mount visibility uses separate writer and reader cache directories.
-- True same-zone cloud measurement should run on a VM or compute instance in
-  the same zone as the target Drive9 deployment, using
-  `BLACKBOX_SERVER_MODE=existing`.
-
-## External Dependencies
-
-The framework prefers already-installed tools, then environment-provided paths,
-then cached auto-fetch under:
-
-```text
-blackbox/cache/
-```
-
-On Linux hosts with `apt-get` and passwordless `sudo`, blackbox can also
-bootstrap the system packages needed to build open source test suites, such as
-build-essential, autotools, Perl/prove, Git build libraries, MPICH, and Python
-headers. Disable that behavior with `BLACKBOX_AUTO_INSTALL_SYSTEM_DEPS=0`.
-
-Important dependency overrides:
+Direct environment overrides (read without prefix):
 
 ```bash
 PJDFSTEST_DIR=/path/to/pjdfstest
 PJDFSTEST_TESTS=/path/to/pjdfstest/tests
 PJDFSTEST_BIN=/path/to/pjdfstest
-PJDFSTEST_ALLOW_NONROOT=1
+PJDFSTEST_ALLOW_NONROOT=1          # pjdfstest normally requires root
 GIT_TEST_SOURCE_DIR=/path/to/git
-BLACKBOX_GIT_TEST_REF=v2.46.2
-LTP_ROOT=/path/to/ltp
-BLACKBOX_LTP_REF=20240129
-BLACKBOX_LTP_INSTALL_ROOT=/path/to/ltp-install
-BLACKBOX_LTP_FS_CASES="fs_inod01 openfile01 ftest01 ..."
-LTP_FS_SCENARIO=drive9-fs-smoke
-BLACKBOX_LTP_SYSCALL_DIRS="access chmod chown close ..."
-BLACKBOX_LTP_SYSCALL_CASES="access01 chmod01 open01 write01 ..."
-LTP_SYSCALLS_SCENARIO=drive9-syscalls-fs
+LTP_ROOT=/path/to/ltp              # installed tree with runltp, bin/ltp-pan, runtest/, testcases/bin/
+LTP_INSTALL_ROOT=/path/to/ltp-install
 FIO_BIN=/path/to/fio
-BLACKBOX_FIO_REF=fio-3.42
 MDTEST_BIN=/path/to/mdtest
-BLACKBOX_IOR_REF=4.0.0
 MPICC=/path/to/mpicc
-BLACKBOX_AUTO_INSTALL_SYSTEM_DEPS=1
-VDBENCH_BIN=/path/to/vdbench
+VDBENCH_BIN=/path/to/vdbench       # vdbench is never auto-fetched (Oracle download)
 FSX_BIN=/path/to/fsx
+```
+
+Tunables read via the harness `env_value` helper accept a `BLACKBOX_` prefix
+(`BLACKBOX_LTP_REF` is equivalent to the documented base name):
+
+```bash
+LTP_REF=20240129
+LTP_FS_CASES="openfile01 stream01 ftest01 lftest01 writetest01"
+LTP_SYSCALL_DIRS="access chmod chown close ..."
+LTP_SYSCALL_CASES="access01 chmod01 open01 write01 ..."
+LTP_MAKE_JOBS=2
+LTP_BUILD_TIMEOUT_S=1800
+FIO_REF=fio-3.42
+FIO_MAKE_JOBS=2
+FIO_BUILD_TIMEOUT_S=1800
+IOR_REF=4.0.0                       # IOR provides mdtest
+IOR_MAKE_JOBS=2
+IOR_BUILD_TIMEOUT_S=1800
+SECFS_TEST_REF=master               # fsx fallback source
+GIT_TEST_REF=v2.46.2
+GIT_TEST_BUILD_TIMEOUT_S=1800
 ```
 
 `LTP_ROOT` must point to an installed LTP tree containing `runltp`,
 `bin/ltp-pan`, `runtest/`, and `testcases/bin/`. When LTP is auto-fetched, the
-source checkout is kept under `blackbox/cache/tools/ltp/<ref>` and the runnable
-install tree is created under `blackbox/cache/tools/ltp-install/<ref>`.
+source checkout is kept under `<work-dir>/cache/tools/ltp/<ref>` and the runnable
+install tree under `<work-dir>/cache/tools/ltp-install/<ref>`.
 
-The auto-fetched LTP build intentionally does not build the full upstream LTP
-tree. It prepares the required runtime tools, a bounded filesystem smoke
-scenario, and a filesystem-oriented syscall subset. `community.ltp.fs` runs the
-generated `drive9-fs-smoke` scenario by default; set
-`BLACKBOX_LTP_FS_CASES` to choose a different bounded set, or set
-`LTP_FS_SCENARIO=fs` when the full upstream filesystem scenario is explicitly
-desired. `community.ltp.syscalls` runs the generated `drive9-syscalls-fs`
-scenario by default. The generated syscall scenario is an explicit bounded tag
-set, not every case in each built syscall directory; set
-`BLACKBOX_LTP_SYSCALL_CASES` or `BLACKBOX_LTP_SYSCALL_DIRS` to widen it. Set
-`LTP_SYSCALLS_SCENARIO=syscalls` only when `LTP_ROOT` points to a full LTP
-installation and full syscall coverage is desired.
+The auto-fetched LTP build intentionally does not build the full upstream tree.
+It prepares the required runtime tools, a bounded filesystem smoke scenario
+(`drive9-fs-smoke`), and a filesystem-oriented syscall subset
+(`drive9-syscalls-fs`). `community.ltp.fs` runs `drive9-fs-smoke` by default;
+set `LTP_FS_CASES` to choose a different bounded set, or
+`LTP_FS_SCENARIO=fs` for the full upstream filesystem scenario when `LTP_ROOT`
+points to a full installation. `community.ltp.syscalls` runs `drive9-syscalls-fs`
+by default; widen it with `LTP_SYSCALL_CASES` / `LTP_SYSCALL_DIRS`, or set
+`LTP_SYSCALLS_SCENARIO=syscalls` for full syscall coverage against a full LTP
+install.
 
-`community.fio` auto-fetches and builds fio when `fio` is not already
-available. `community.mdtest` auto-fetches and builds IOR/mdtest when `mdtest`
-is not already available. IOR requires an MPI compiler; on Linux systems with
-`apt-get` and passwordless `sudo`, blackbox attempts to install
-`mpich libmpich-dev` when `mpicc` is missing. Set
-`BLACKBOX_AUTO_INSTALL_SYSTEM_DEPS=0` to disable that system-package bootstrap.
-The IOR source checkout is patched in-cache for newer compiler compatibility
-before building mdtest.
-`community.fsx` uses the LTP-provided `fsx-linux` binary from the auto-fetched
-LTP install tree before falling back to `secfs.test`.
+`community.fio` auto-fetches and builds fio when `fio` is not already available.
+`community.mdtest` auto-fetches and builds IOR/mdtest when `mdtest` is not
+already available; IOR requires an MPI compiler, so on Linux with `apt-get` and
+passwordless `sudo` the harness installs `mpich libmpich-dev` when `mpicc` is
+missing. The IOR source is patched in-cache for newer compiler compatibility
+before building mdtest. `community.fsx` uses the LTP-provided `fsx-linux` binary
+from the auto-fetched LTP install tree before falling back to `secfs.test`.
 
-`community.vdbench` is a manual dependency module because vdbench is distributed
-through Oracle's download page rather than a normal open source repository.
-Set `VDBENCH_BIN` or put `vdbench` on `PATH`, then run it explicitly with
-`BLACKBOX_SELECTOR=module:community.vdbench` or opt manual modules into broader
-selectors with `BLACKBOX_INCLUDE_MANUAL=1`.
-
-Dependency metadata lives in `blackbox/suites/fuse/dependencies.json`.
-Generated dependency metadata is written next to cached dependencies when a
-module prepares them.
+Dependency metadata (name, source, license, default ref) for all groups is
+tracked in `blackbox/env/dependencies.json`. Generated dependency metadata is
+written next to cached dependencies when a module prepares them.
 
 ## Platform Notes
 
-Linux requirements:
+Linux requirements: `/dev/fuse` and `fusermount3` or `fusermount`.
 
-- `/dev/fuse`
-- `fusermount3` or `fusermount`
+Some POSIX cases are not expected to behave identically on macOS (permissions,
+ownership, flags, case-sensitivity-adjacent behavior). Modules classify these as
+`SKIP` or `XFAIL` through capability checks or allowlists rather than failing the
+whole run as a Drive9 regression.
 
-macOS requirements:
+## Adding A Community Module
 
-- macFUSE or FUSE-T mount helper: `mount_macfuse` or `mount_fusefs`
+1. Create `suites/community/<module_name>/` with `__init__.py` and `module.py`.
+2. Give the class a stable `id` (`community.<name>`), `category`, `description`,
+   `labels`, and `timeout`.
+3. Implement `ensure_dependencies(ctx)` when it needs external tools, either
+   inline or via a `deps.py` in the module directory.
+4. Implement `run(ctx)` returning a small metrics/details dict; mount through
+   `ctx.target.mount(...)` and always unmount in `finally`.
+5. Optionally add `config.json` for tunables and `*.json` data files.
+6. The module is auto-discovered — no registration step.
 
-Some POSIX cases are not expected to behave identically on macOS, especially
-permission, ownership, flags, and case-sensitivity-adjacent behavior. Modules
-should classify these as `SKIP` or `XFAIL` through capability checks or
-allowlists instead of failing the whole run as a Drive9 regression.
+Keep module IDs stable; CI reports and dashboards can depend on them.
 
-## Reports
+## Notices / Third-party
 
-Every run writes to:
+This blackbox framework is Drive9 test code. It integrates or can fetch several
+open source filesystem test suites and tools at runtime. Those dependencies
+retain their own licenses and notices.
 
-```text
-blackbox/results/fuse/<session>/
-  manifest.json
-  results.json
-  results.jsonl
-  metrics.json
-  events.jsonl
-  report.md
-  artifacts/
-  logs/
-  mount-logs/
-```
+- **pjdfstest**: https://github.com/pjd/pjdfstest — BSD-2-Clause
+- **Linux Test Project**: https://github.com/linux-test-project/ltp — GPL-2.0-or-later
+- **Git upstream tests** (used by `git.official.*`): https://github.com/git/git — GPL-2.0-only
+- **secfs.test / fsx**: https://github.com/billziss-gh/secfs.test — Apache-2.0
+- **fio**: https://github.com/axboe/fio — GPL-2.0-only
+- **IOR / mdtest**: https://github.com/hpc/ior — GPL-2.0-only
+- **vdbench**: Oracle distribution (manual download, not auto-fetched).
 
-`report.md` is the human-readable run summary. `results.json` is the stable
-machine-readable result file. `metrics.json` stores raw metric rows and
-aggregate summaries. Performance modules use one run by default; set
-`BLACKBOX_RUNS=3` when mean, median, min, max, and standard deviation across
-three samples are needed.
+`juicefs.*` modules (under `suites/juicefs/`) are Drive9-owned equivalent
+rewrites inspired by generic filesystem behaviors tested in the JuiceFS project,
+not vendored JuiceFS source code. JuiceFS source: https://github.com/juicedata/juicefs
+(Apache-2.0). If future work ever copies actual JuiceFS test files, that module
+must preserve the original copyright header and license notice and this section
+must be updated.
 
-## GitHub Actions
-
-`.github/workflows/blackbox.yml` is one possible caller. It runs the selector
-provided by workflow inputs, or `all` by default. Any recurring or release-gate
-schedule belongs to the workflow configuration, not to the blackbox harness.
-
-The workflow caches `blackbox/cache` and uploads
-`blackbox/results/fuse/**` as artifacts. It runs `make blackbox-deps` first so
-dependency setup is separated from the actual test run.
-
-## Adding A Module
-
-Add a module when the behavior is reusable, externally meaningful, or likely to
-grow. A module can wrap an upstream suite, an equivalent rewrite of a generic FS
-stress case, or a Drive9-specific workflow.
-
-1. Add a new file under `blackbox/suites/fuse/modules/`, named after the module
-   family or module ID, for example `drive9_workflow_new_case.py`.
-2. Give it a stable `id`, `category`, `description`, `labels`, and `timeout`.
-3. Implement `ensure_dependencies(ctx)` when it needs external tools.
-4. Implement `run(ctx)` and return a small metrics/details dictionary.
-5. Mount through `ctx.target.mount(...)` and always unmount in `finally`.
-6. Use `ModuleSkip`, `ModuleXFail`, `DependencyUnavailable`, or `BlackboxError`
-   for clear classification.
-7. Import and register the module in `blackbox/suites/fuse/modules/registry.py`.
-8. Add configuration in `blackbox/suites/fuse/modules.json` when the module needs tunables.
-9. Add it to a named group in `blackbox/suites/fuse/modules.json` only when a
-   stable group selector should include it.
-10. Update this README if the module introduces a new dependency or behavior
-    class.
-
-Keep module IDs stable because CI reports and dashboards can depend on them.
-
-## Drive9 Workflow Modules
-
-Drive9 CLI features that are meaningful only with FUSE belong under
-`drive9.workflow.*`, not under generic POSIX or community categories.
-
-Current workflow modules:
-
-- `drive9.workflow.git_fast_clone`
-- `drive9.workflow.git_blobless`
-- `drive9.workflow.git_worktree`
-- `drive9.workflow.auto_pack_profile`
-- `drive9.workflow.auto_pack_umount_path`
-- `drive9.workflow.portable_pack`
-- `drive9.workflow.pack_unpack_cli`
-- `drive9.workflow.pack_git_clone`
-- `drive9.workflow.perf`
-- `drive9.workflow.local_overlay_build`
-
-These cover Git workspace registration, fast clone modes, auto pack/unpack,
-explicit pack/unpack, build, grep/rg, edit, and commit paths that are central
-to Drive9 usability.
-
-`drive9.workflow.local_overlay_build` is narrower than the general workflow
-performance module. It compares native checkout/build samples with FUSE samples
-mounted as `--profile=coding-agent`, using the repo-specific `local_overlay`
-configuration from `repos.json`. The FUSE sample writes probe files under
-local-only paths, checks that they land under `<local-root>/overlay`, then
-remounts the same remote root with `profile=none` to verify that those probes
-are not persisted remotely. This is the coverage for coding-agent local overlay
-semantics and local-dependency/build-output performance.
-
-Run it directly when you want this heavier matrix:
-
-```bash
-make blackbox BLACKBOX_SELECTOR=module:drive9.workflow.local_overlay_build
-```
+fio, mdtest/IOR, vdbench, Python xattr bindings, and platform tools may be
+provided by the host environment or installed by CI. Their own distribution
+licenses apply.

@@ -45,7 +45,7 @@
     "license": "GPL-2.0-only",
     "default_ref": "v2.46.2"
   },
-  "ported.juicefs.*": {
+  "juicefs.*": {
     "name": "JuiceFS-inspired tests",
     "source": "https://github.com/juicedata/juicefs",
     "license": "Apache-2.0",

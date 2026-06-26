@@ -8,11 +8,11 @@ from harness.core import BlackboxError, Context, ensure_empty, sha256_file, stab
 from harness.module_base import BaseModule, module_config
 
 
-class PortedJuiceFSFsrand(BaseModule):
-    id = "ported.juicefs.fsrand"
-    category = "ported.juicefs.consistency"
+class JuiceFSFsrand(BaseModule):
+    id = "juicefs.fsrand"
+    category = "juicefs.consistency"
     description = "JuiceFS-inspired deterministic random filesystem model test, rewritten for Drive9 FUSE."
-    labels = ("compatibility", "stress", "ported-juicefs")
+    labels = ("compatibility", "stress", "juicefs", "functional")
     timeout = 1200
 
     def run(self, ctx: Context) -> dict[str, Any]:
@@ -20,7 +20,7 @@ class PortedJuiceFSFsrand(BaseModule):
         ops = int(cfg.get("ops", 1000))
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("ported_juicefs_fsrand", remote, durability="write-sync")
+        handle = ctx.target.mount("juicefs_fsrand", remote, durability="write-sync")
         oracle = ctx.tmp_dir / "oracle" / self.id
         ensure_empty(oracle)
         try:

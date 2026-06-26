@@ -1,4 +1,80 @@
 {
+  "repos": [
+    {
+      "id": "drive9",
+      "url": "https://github.com/mem9-ai/drive9.git",
+      "ref": "main",
+      "build_dir": ".",
+      "build": [
+        "make build"
+      ],
+      "source_extensions": [
+        ".go",
+        ".md",
+        ".sh",
+        ".yml",
+        ".yaml"
+      ],
+      "rg_pattern": "TODO|FIXME|func|type|interface|panic|error",
+      "timeout_seconds": 1800,
+      "local_overlay": {
+        "prewarm": [
+          "go mod download"
+        ],
+        "build": [
+          "make build"
+        ],
+        "local_only_patterns": [
+          "**/bin/**"
+        ],
+        "probe_paths": [
+          ".git/drive9-blackbox-local-overlay-probe",
+          ".cache/drive9-blackbox-local-overlay-probe",
+          "tmp/drive9-blackbox-local-overlay-probe",
+          "bin/drive9-blackbox-local-overlay-probe"
+        ]
+      }
+    },
+    {
+      "id": "kimi-code",
+      "url": "https://github.com/MoonshotAI/kimi-code.git",
+      "ref": "main",
+      "build_dir": ".",
+      "build": [
+        "corepack enable",
+        "corepack pnpm install --frozen-lockfile",
+        "corepack pnpm run build"
+      ],
+      "source_extensions": [
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".md",
+        ".css",
+        ".vue"
+      ],
+      "rg_pattern": "TODO|FIXME|class|interface|function|async|await|Error",
+      "timeout_seconds": 1800,
+      "local_overlay": {
+        "prewarm": [
+          "corepack pnpm install --frozen-lockfile --store-dir \"$PNPM_STORE_DIR\""
+        ],
+        "build": [
+          "corepack pnpm install --frozen-lockfile --store-dir \"$PNPM_STORE_DIR\"",
+          "corepack pnpm run build"
+        ],
+        "local_only_patterns": [
+          "**/packages/node-sdk/.tmp-api-extractor/**"
+        ],
+        "probe_paths": [
+          ".git/drive9-blackbox-local-overlay-probe",
+          "node_modules/drive9-blackbox-local-overlay-probe",
+          "packages/node-sdk/.tmp-api-extractor/drive9-blackbox-local-overlay-probe"
+        ]
+      }
+    }
+  ],
   "micro": {
     "sequential_sizes_mib": [
       1,

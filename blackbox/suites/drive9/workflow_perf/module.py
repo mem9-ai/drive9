@@ -14,12 +14,12 @@ from suites.drive9._base import Drive9WorkflowBase
 class Drive9WorkflowPerf(Drive9WorkflowBase):
     id = "drive9.workflow.perf"
     description = "Drive9 FUSE performance workloads: file I/O, SQLite, rg, git clone modes, build/edit."
-    labels = ("drive9", "workflow", "performance")
+    labels = ("drive9", "workflow", "performance", "functional")
     timeout = 7200
 
     def run(self, ctx: Context) -> dict[str, Any]:
         selected = [part.strip() for part in env_value("REPOS", "drive9,kimi-code", ctx.suite).split(",") if part.strip()]
-        repos_cfg = ctx.config.get("repos", [])
+        repos_cfg = module_config(ctx, self.id).get("repos", [])
         repos = [repo for repo in repos_cfg if repo.get("id") in selected]
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)

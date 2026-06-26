@@ -25,7 +25,6 @@ blackbox/
     capabilities.py     FUSE/macFUSE capability detection
     deps.py             Drive9DependencyManager: per-module tool builds
   suites/
-    groups.json         group definitions (group name → list of module IDs)
     community/          community test modules
       pjdfstest/
         module.py       test logic
@@ -37,7 +36,7 @@ blackbox/
       ...
     drive9/             drive9 workflow modules
     customer/           customer scenario modules
-    ported/             ported JuiceFS modules
+    juicefs/            JuiceFS-inspired rewrite modules
     git/                git official test modules
 ```
 
@@ -50,7 +49,10 @@ Module IDs are derived from the class's `id` attribute (not directory path).
 A single `module.py` can export multiple test classes (e.g., `ltp/module.py` has
 `CommunityLTPFS` + `CommunityLTPSyscalls`).
 
-Group definitions in `suites/groups.json` map group names to module ID patterns.
+`--group <name>` selects a directory group: every module whose id starts with
+`<group>.`, mirroring the `suites/<group>/` layout. `--label <label>` is an
+optional overlay filter (combinable with any selector) that narrows by module
+labels.
 
 ## Commands
 
@@ -68,8 +70,13 @@ python3 blackbox/run.py --all
 # Run a single module
 python3 blackbox/run.py --module community.pjdfstest
 
-# Run a group
-python3 blackbox/run.py --group perf
+# Run a directory group
+python3 blackbox/run.py --group community
+python3 blackbox/run.py --group juicefs
+
+# Narrow any selection by label
+python3 blackbox/run.py --group community --label performance
+python3 blackbox/run.py --all --label functional
 
 # Run by category prefix
 python3 blackbox/run.py --category drive9.workflow

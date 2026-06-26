@@ -59,7 +59,7 @@ class Drive9SuiteProvider:
         return (
             "The FUSE suite validates Drive9's FUSE filesystem across POSIX compliance, "
             "performance, workflow correctness, and customer scenario fidelity. Modules "
-            "cover community test suites (pjdfstest, LTP, fio, mdtest), ported JuiceFS "
+            "cover community test suites (pjdfstest, LTP, fio, mdtest), JuiceFS-inspired "
             "stress tests, official Git functional/perf tests, Drive9 workflow scenarios, "
             "and customer workspace benchmarks."
         )

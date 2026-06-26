@@ -15,7 +15,7 @@ from suites.drive9._base import Drive9WorkflowBase
 class Drive9LocalOverlayBuild(Drive9WorkflowBase):
     id = "drive9.workflow.local_overlay_build"
     description = "Compare native repo builds with Drive9 FUSE coding-agent local overlay builds."
-    labels = ("drive9", "workflow", "performance", "local-overlay")
+    labels = ("drive9", "workflow", "performance", "local-overlay", "functional")
     timeout = 10800
 
     def ensure_dependencies(self, ctx: Context) -> None:
@@ -102,8 +102,9 @@ class Drive9LocalOverlayBuild(Drive9WorkflowBase):
 
     def selected_repos(self, ctx: Context) -> list[dict[str, Any]]:
         selected = [part.strip() for part in env_value("REPOS", "drive9,kimi-code", ctx.suite).split(",") if part.strip()]
-        repos = [repo for repo in ctx.config.get("repos", []) if repo.get("id") in selected]
-        known = {str(repo.get("id")) for repo in ctx.config.get("repos", [])}
+        repos = module_config(ctx, self.id).get("repos", [])
+        repos = [repo for repo in repos if repo.get("id") in selected]
+        known = {str(repo.get("id")) for repo in module_config(ctx, self.id).get("repos", [])}
         unknown = sorted(set(selected) - known)
         if unknown:
             raise ModuleSkip(f"unknown BLACKBOX_REPOS value(s): {', '.join(unknown)}")

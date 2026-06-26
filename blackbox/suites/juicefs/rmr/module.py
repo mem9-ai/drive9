@@ -7,17 +7,17 @@ from harness.core import BlackboxError, Context
 from harness.module_base import BaseModule
 
 
-class PortedJuiceFSRmr(BaseModule):
-    id = "ported.juicefs.rmr"
-    category = "ported.juicefs.metadata"
+class JuiceFSRmr(BaseModule):
+    id = "juicefs.rmr"
+    category = "juicefs.metadata"
     description = "JuiceFS-inspired recursive remove workload, rewritten for Drive9 FUSE."
-    labels = ("metadata", "ported-juicefs")
+    labels = ("metadata", "juicefs", "functional")
     timeout = 900
 
     def run(self, ctx: Context) -> dict[str, Any]:
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("ported_juicefs_rmr", remote, durability="interactive")
+        handle = ctx.target.mount("juicefs_rmr", remote, durability="interactive")
         try:
             root = handle.mountpoint / "tree"
             for i in range(20):

@@ -7,18 +7,18 @@ from harness.core import BlackboxError, Context
 from harness.module_base import BaseModule
 
 
-class PortedJuiceFSCacheConsistency(BaseModule):
-    id = "ported.juicefs.cache_consistency"
-    category = "ported.juicefs.cache"
+class JuiceFSCacheConsistency(BaseModule):
+    id = "juicefs.cache_consistency"
+    category = "juicefs.cache"
     description = "JuiceFS-inspired two-mount cache visibility checks, rewritten for Drive9 FUSE."
-    labels = ("compatibility", "cache", "ported-juicefs")
+    labels = ("compatibility", "cache", "juicefs", "functional")
     timeout = 1200
 
     def run(self, ctx: Context) -> dict[str, Any]:
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        h1 = ctx.target.mount("ported_juicefs_cache_consistency", remote, cache_key="writer")
-        h2 = ctx.target.mount("ported_juicefs_cache_consistency", remote, cache_key="reader")
+        h1 = ctx.target.mount("juicefs_cache_consistency", remote, cache_key="writer")
+        h2 = ctx.target.mount("juicefs_cache_consistency", remote, cache_key="reader")
         try:
             (h1.mountpoint / "visible.txt").write_text("writer\n", encoding="utf-8")
             deadline = time.monotonic() + 10

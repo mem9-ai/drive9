@@ -8,11 +8,11 @@ from harness.core import BlackboxError, Context, stable_bytes
 from harness.module_base import BaseModule, module_config
 
 
-class PortedJuiceFSRandomRW(BaseModule):
-    id = "ported.juicefs.random_rw"
-    category = "ported.juicefs.io"
+class JuiceFSRandomRW(BaseModule):
+    id = "juicefs.random_rw"
+    category = "juicefs.io"
     description = "JuiceFS-inspired random write/read verification workload, rewritten for Drive9 FUSE."
-    labels = ("io", "ported-juicefs")
+    labels = ("io", "juicefs", "functional")
     timeout = 900
 
     def run(self, ctx: Context) -> dict[str, Any]:
@@ -21,7 +21,7 @@ class PortedJuiceFSRandomRW(BaseModule):
         ops = int(cfg.get("ops", 1024))
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
-        handle = ctx.target.mount("ported_juicefs_random_rw", remote, durability="write-sync")
+        handle = ctx.target.mount("juicefs_random_rw", remote, durability="write-sync")
         try:
             path = handle.mountpoint / "random-rw.bin"
             model = bytearray(stable_bytes(size, seed=19))
