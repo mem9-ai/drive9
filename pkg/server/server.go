@@ -828,12 +828,17 @@ func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled 
 	query := "parseTime=true"
 	if tlsEnabled {
 		tlsMode := "true"
-		if v := strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")); v != "" {
+		if isPrivateEndpointEnabled() {
 			tlsMode = "skip-verify"
 		}
 		query += "&tls=" + tlsMode
 	}
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", user, password, host, port, dbName, query)
+}
+
+func isPrivateEndpointEnabled() bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
+	return v == "1" || v == "true" || v == "yes"
 }
 
 func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handler {

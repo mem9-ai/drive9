@@ -667,8 +667,11 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	query := "parseTime=true"
 	if t.DBTLS {
 		tlsMode := "true"
-		if t.Provider == ProviderTiDBCloudNative && strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")) != "" {
-			tlsMode = "skip-verify"
+		if t.Provider == ProviderTiDBCloudNative {
+			v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
+			if v == "1" || v == "true" || v == "yes" {
+				tlsMode = "skip-verify"
+			}
 		}
 		query += "&tls=" + tlsMode
 	}
