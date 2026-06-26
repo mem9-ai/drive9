@@ -1,0 +1,11 @@
+{
+  "storages": [
+    "native",
+    "fuse"
+  ],
+  "prewarm": true,
+  "verify_remote_absence": true,
+  "profile": "coding-agent",
+  "durability": "interactive",
+  "allow_other": false
+}

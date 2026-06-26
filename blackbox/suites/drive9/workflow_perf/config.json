@@ -1,0 +1,10 @@
+{
+  "micro": {
+    "sequential_sizes_mib": [
+      1,
+      64,
+      512
+    ],
+    "sqlite_rows": 2000
+  }
+}

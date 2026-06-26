@@ -1,0 +1,6 @@
+{
+  "compat": {
+    "linux": "run",
+    "darwin": "xfail"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "tests": [
+    "p0001-rev-list.sh",
+    "p0002-read-cache.sh"
+  ]
+}

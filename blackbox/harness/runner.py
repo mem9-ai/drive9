@@ -38,7 +38,7 @@ from .core import (
     utc_ts,
     write_json,
 )
-from .suite import load_suite_provider
+from .suite import load_suite_provider, discover_modules, load_groups, discover_suites
 from . import report as report_engine
 
 
@@ -46,9 +46,7 @@ class BlackboxRunner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.suite = normalize_suite_args(args)
-        self.suite_config_dir = SUITES_DIR / self.suite
-        if not self.suite_config_dir.is_dir():
-            raise BlackboxError(f"blackbox suite {self.suite!r} not found at {self.suite_config_dir}")
+        self.suite_config_dir = SUITES_DIR
         self.session = args.session or file_ts()
         # Work-dir isolation: all writable state (cache, tmp, results) lives
         # under work_dir so a run never pollutes the repo tree.
@@ -72,8 +70,8 @@ class BlackboxRunner:
         os.environ.setdefault("GOMODCACHE", str(self.work_dir / "gomodcache"))
         self.recorder = Recorder(self.result_dir)
         self.provider = load_suite_provider(self.suite, self.suite_config_dir)
-        self.registry = self.provider.module_registry()
-        self.config = self.provider.load_config()
+        self.registry = discover_modules()
+        self.config = {"modules": {}, "groups": load_groups()}
         self.capabilities = self.provider.detect_capabilities()
         self.target = self.provider.create_target(args, self.result_dir, self.recorder, session=self.session)
         # Pass the work_dir-based cache_root to the dependency manager.
@@ -535,24 +533,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--deps-only", action="store_true", help="Prepare external dependencies for selected modules without running suite setup.")
     parser.add_argument("--bootstrap", action="store_true", help="Prepare dependencies into a work-dir, then exit. Use --work-dir to reuse later.")
     parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS, BLACKBOX_<SUITE>_RUNS, or 1.")
-    parser.add_argument("--server-mode", choices=["auto", "existing", "local"], default=env_value("SERVER_MODE", "auto", suite_default))
-    parser.add_argument("--drive9-cli", default=env_value("DRIVE9_CLI", "", suite_default))
-    parser.add_argument("--work-dir", default=env_value("WORK_DIR", "", suite_default), help="Isolated working directory for cache/tmp/results. Defaults to BLACKBOX_WORK_DIR.")
-    parser.add_argument("--out-dir", default=env_value("OUT_DIR", "", suite_default))
-    parser.add_argument("--session", default=env_value("SESSION", "", suite_default))
-    parser.add_argument("--strict-prereqs", action="store_true", default=env_flag("STRICT", False, suite_default))
-    parser.add_argument("--offline", action="store_true", default=env_flag("OFFLINE", False, suite_default))
+    parser.add_argument("--server-mode", choices=["auto", "existing", "local"], default=env_value("SERVER_MODE", "auto", "default"))
+    parser.add_argument("--drive9-cli", default=env_value("DRIVE9_CLI", "", "default"))
+    parser.add_argument("--work-dir", default=env_value("WORK_DIR", "", "default"), help="Isolated working directory for cache/tmp/results. Defaults to BLACKBOX_WORK_DIR.")
+    parser.add_argument("--out-dir", default=env_value("OUT_DIR", "", "default"))
+    parser.add_argument("--session", default=env_value("SESSION", "", "default"))
+    parser.add_argument("--strict-prereqs", action="store_true", default=env_flag("STRICT", False, "default"))
+    parser.add_argument("--offline", action="store_true", default=env_flag("OFFLINE", False, "default"))
     parser.add_argument("--fail-fast", action="store_true")
-    parser.add_argument("--keep-artifacts", action="store_true", default=env_flag("KEEP_ARTIFACTS", False, suite_default))
-    parser.add_argument("--keep-all-artifacts", action="store_true", default=env_flag("KEEP_ALL_ARTIFACTS", False, suite_default), help="Never clean tmp_dir, even on success.")
+    parser.add_argument("--keep-artifacts", action="store_true", default=env_flag("KEEP_ARTIFACTS", False, "default"))
+    parser.add_argument("--keep-all-artifacts", action="store_true", default=env_flag("KEEP_ALL_ARTIFACTS", False, "default"), help="Never clean tmp_dir, even on success.")
     return parser.parse_args(argv)
 
 
 def normalize_suite_args(args: argparse.Namespace) -> str:
-    suite = str(args.suite or "").strip()
-    if not suite and not getattr(args, "all_suites", False):
-        raise BlackboxError("--suite or BLACKBOX_SUITE is required (or use --all-suites)")
-    return suite
+    # The suite concept is simplified: there is one default suite.
+    # The name is used for result directory paths and env var prefixes.
+    return str(getattr(args, "suite", "") or "default").strip() or "default"
 
 
 def emit_module_list(registry: dict[str, Any], output_format: str) -> int:

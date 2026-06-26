@@ -41,7 +41,7 @@ TEST_TIMEOUT ?= 10m
 TEST_P ?=
 TEST_RUN ?=
 TEST_PKGS ?= ./...
-BLACKBOX_SUITE ?= fuse
+BLACKBOX_SUITE ?= default
 BLACKBOX_RUNS ?= 1
 BLACKBOX_SELECTOR ?= all
 BLACKBOX_WORK_DIR ?=
@@ -137,11 +137,11 @@ blackbox:
 		*) args=(--module "$$selector");; \
 	esac; \
 	work_arg=""; if [ -n "$(BLACKBOX_WORK_DIR)" ]; then work_arg="--work-dir $(BLACKBOX_WORK_DIR)"; fi; \
-	echo "blackbox: suite=$(BLACKBOX_SUITE) selector=$$selector runs=$(BLACKBOX_RUNS)"; \
-	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --runs "$(BLACKBOX_RUNS)" $$work_arg $(BLACKBOX_EXTRA)
+	echo "blackbox: selector=$$selector runs=$(BLACKBOX_RUNS)"; \
+	python3 blackbox/run.py  "$${args[@]}" --runs "$(BLACKBOX_RUNS)" $$work_arg $(BLACKBOX_EXTRA)
 
 blackbox-list:
-	python3 blackbox/run.py --suite $(BLACKBOX_SUITE) --list
+	python3 blackbox/run.py  --list
 
 blackbox-deps:
 	@set -euo pipefail; \
@@ -154,8 +154,8 @@ blackbox-deps:
 		*) args=(--module "$$selector");; \
 	esac; \
 	work_arg=""; if [ -n "$(BLACKBOX_WORK_DIR)" ]; then work_arg="--work-dir $(BLACKBOX_WORK_DIR)"; fi; \
-	echo "blackbox deps: suite=$(BLACKBOX_SUITE) selector=$$selector"; \
-	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --deps-only $$work_arg
+	echo "blackbox deps: selector=$$selector"; \
+	python3 blackbox/run.py  "$${args[@]}" --deps-only $$work_arg
 
 blackbox-bootstrap:
 	@set -euo pipefail; \
@@ -169,7 +169,7 @@ blackbox-bootstrap:
 	esac; \
 	work_arg=""; if [ -n "$(BLACKBOX_WORK_DIR)" ]; then work_arg="--work-dir $(BLACKBOX_WORK_DIR)"; fi; \
 	echo "blackbox bootstrap: suite=$(BLACKBOX_SUITE) selector=$$selector"; \
-	python3 blackbox/run.py --suite "$(BLACKBOX_SUITE)" "$${args[@]}" --bootstrap $$work_arg
+	python3 blackbox/run.py  "$${args[@]}" --bootstrap $$work_arg
 
 build-cli:
 	mkdir -p $(BIN_DIR)

@@ -1,0 +1,28 @@
+{
+  "functional": [
+    "ported.juicefs.*",
+    "drive9.workflow.git_fast_clone",
+    "drive9.workflow.git_blobless",
+    "drive9.workflow.git_worktree",
+    "drive9.workflow.auto_pack_profile",
+    "drive9.workflow.auto_pack_umount_path",
+    "drive9.workflow.portable_pack",
+    "drive9.workflow.pack_unpack_cli",
+    "drive9.workflow.pack_git_clone"
+  ],
+  "posix": [
+    "community.pjdfstest"
+  ],
+  "perf": [
+    "community.fio",
+    "community.mdtest",
+    "community.vdbench",
+    "git.official.perf",
+    "drive9.workflow.perf",
+    "drive9.workflow.local_overlay_build"
+  ],
+  "customer": [
+    "drive9.customer.kimi_perf",
+    "drive9.customer.manus_perf"
+  ]
+}
