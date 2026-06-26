@@ -1286,11 +1286,15 @@ func TestClusterConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	info.Endpoints.Private.Host = ""
 	info.Endpoints.Private.Port = 4000
 
-	if clusterConnectionIncomplete(info, false) {
+	if clusterConnectionIncomplete(info, false, "") {
 		t.Fatalf("public mode should report complete")
 	}
-	if !clusterConnectionIncomplete(info, true) {
+	if !clusterConnectionIncomplete(info, true, "") {
 		t.Fatalf("private mode should report incomplete when private host is empty")
+	}
+	// With tencent override host set, API private host empty is OK
+	if clusterConnectionIncomplete(info, true, "tencent.internal") {
+		t.Fatalf("private mode with override host should report complete even if API private host is empty")
 	}
 }
 
@@ -1359,10 +1363,10 @@ func TestBranchConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	branch.Endpoints.Private.Host = ""
 	branch.Endpoints.Private.Port = 4000
 
-	if branchConnectionIncomplete(branch, false) {
+	if branchConnectionIncomplete(branch, false, "") {
 		t.Fatalf("public mode should report complete")
 	}
-	if !branchConnectionIncomplete(branch, true) {
+	if !branchConnectionIncomplete(branch, true, "") {
 		t.Fatalf("private mode should report incomplete when private host is empty")
 	}
 }

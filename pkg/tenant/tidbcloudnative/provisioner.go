@@ -34,7 +34,8 @@ const (
 	EnvTiDBCloudDefaultSpendingLimit      = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
 	EnvTiDBCloudNativePublicKey           = "DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY"
 	EnvTiDBCloudNativePrivateKey          = "DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY"
-	EnvTiDBCloudNativeUsePrivateEndpoint  = "DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT"
+	EnvTiDBCloudNativeUsePrivateEndpoint          = "DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT"
+	EnvTiDBCloudTencentPrivateEndpointHost        = "DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST"
 
 	DefaultDatabaseName = "tidbcloud_fs"
 	DefaultSpendLimit   = int32(1000)
@@ -73,6 +74,7 @@ type Provisioner struct {
 	defaultPublicKey    string
 	defaultPrivateKey   string
 	usePrivateEndpoint  bool
+	tencentPrivateEndpointHost string
 	client              *http.Client
 }
 
@@ -107,6 +109,7 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 		defaultPublicKey:    strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePublicKey)),
 		defaultPrivateKey:   strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePrivateKey)),
 		usePrivateEndpoint:  parseBoolEnv(EnvTiDBCloudNativeUsePrivateEndpoint),
+		tencentPrivateEndpointHost: strings.TrimSpace(os.Getenv(EnvTiDBCloudTencentPrivateEndpointHost)),
 		client:              &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
@@ -264,7 +267,7 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 	if info.ClusterID == "" {
 		return nil, nil, fmt.Errorf("tidbcloud native response missing cluster id")
 	}
-	if clusterProvisionMetadataIncomplete(info, p.usePrivateEndpoint) {
+	if clusterProvisionMetadataIncomplete(info, p.usePrivateEndpoint, p.tencentPrivateEndpointHost) {
 		info, err = p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, info.ClusterID)
 		if err != nil {
 			return &tenant.ClusterInfo{
@@ -281,6 +284,9 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 	if p.usePrivateEndpoint {
 		host = info.Endpoints.Private.Host
 		port = info.Endpoints.Private.Port
+		if host == "" && p.tencentPrivateEndpointHost != "" {
+			host = p.tencentPrivateEndpointHost
+		}
 	} else {
 		host = info.Endpoints.Public.Host
 		port = info.Endpoints.Public.Port
@@ -401,7 +407,7 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 		DBName:    dbName,
 		Provider:  tenant.ProviderTiDBCloudNative,
 	}
-	if !branchConnectionIncomplete(branch, p.usePrivateEndpoint) {
+	if !branchConnectionIncomplete(branch, p.usePrivateEndpoint, p.tencentPrivateEndpointHost) {
 		if err := p.fillBranchEndpoint(out, branch); err != nil {
 			return out, err
 		}
@@ -1040,28 +1046,34 @@ func parseBranchInfo(raw []byte) (*branchInfo, error) {
 	return &out, nil
 }
 
-func clusterConnectionIncomplete(info *clusterInfo, usePrivate bool) bool {
+func clusterConnectionIncomplete(info *clusterInfo, usePrivate bool, overridePrivateHost string) bool {
 	if info == nil {
 		return true
 	}
 	if usePrivate {
+		if overridePrivateHost != "" {
+			return info.Endpoints.Private.Port == 0 || info.UserPrefix == ""
+		}
 		return info.Endpoints.Private.Host == "" || info.Endpoints.Private.Port == 0 || info.UserPrefix == ""
 	}
 	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
 }
 
-func clusterProvisionMetadataIncomplete(info *clusterInfo, usePrivate bool) bool {
-	if clusterConnectionIncomplete(info, usePrivate) {
+func clusterProvisionMetadataIncomplete(info *clusterInfo, usePrivate bool, overridePrivateHost string) bool {
+	if clusterConnectionIncomplete(info, usePrivate, overridePrivateHost) {
 		return true
 	}
 	return strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]) == ""
 }
 
-func branchConnectionIncomplete(info *branchInfo, usePrivate bool) bool {
+func branchConnectionIncomplete(info *branchInfo, usePrivate bool, overridePrivateHost string) bool {
 	if info == nil {
 		return true
 	}
 	if usePrivate {
+		if overridePrivateHost != "" {
+			return info.Endpoints.Private.Port == 0 || info.UserPrefix == ""
+		}
 		return info.Endpoints.Private.Host == "" || info.Endpoints.Private.Port == 0 || info.UserPrefix == ""
 	}
 	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
@@ -1073,6 +1085,9 @@ func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branch
 	if p.usePrivateEndpoint {
 		host = branch.Endpoints.Private.Host
 		port = branch.Endpoints.Private.Port
+		if host == "" && p.tencentPrivateEndpointHost != "" {
+			host = p.tencentPrivateEndpointHost
+		}
 	} else {
 		host = branch.Endpoints.Public.Host
 		port = branch.Endpoints.Public.Port
@@ -1109,7 +1124,7 @@ func (p *Provisioner) waitForClusterProvisionMetadata(ctx context.Context, publi
 		if err != nil {
 			return nil, err
 		}
-		if !clusterProvisionMetadataIncomplete(info, p.usePrivateEndpoint) {
+		if !clusterProvisionMetadataIncomplete(info, p.usePrivateEndpoint, p.tencentPrivateEndpointHost) {
 			return info, nil
 		}
 		if time.Now().After(deadline) {
@@ -1147,7 +1162,7 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privat
 		if err != nil {
 			return nil, err
 		}
-		if info.State == stateActive && !branchConnectionIncomplete(info, p.usePrivateEndpoint) {
+		if info.State == stateActive && !branchConnectionIncomplete(info, p.usePrivateEndpoint, p.tencentPrivateEndpointHost) {
 			return info, nil
 		}
 		if time.Now().After(deadline) {
