@@ -1361,7 +1361,7 @@ func TestAdminTenantPoolCreateCleansUpWhenOrganizationBackfillConflicts(t *testi
 	rt.prov.listPages = []*tenant.ManagedClusterListResult{{}}
 	ctx := context.Background()
 	now := time.Now().UTC()
-	if err := rt.meta.UpsertTenantPool(ctx, &meta.TenantPool{
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
 		PoolID:         "existing-pool",
 		OrganizationID: "org-1",
 		Size:           1,
@@ -1418,7 +1418,7 @@ func TestAdminTenantPoolReplenishSkipsDeletedOrShrunkPool(t *testing.T) {
 		CreatedAt:      now,
 		UpdatedAt:      now,
 	}
-	if err := rt.meta.UpsertTenantPool(ctx, stalePool); err != nil {
+	if err := rt.meta.CreateTenantPool(ctx, stalePool); err != nil {
 		t.Fatalf("upsert pool: %v", err)
 	}
 	if err := rt.meta.UpdateTenantPoolSize(ctx, stalePool.PoolID, 0); err != nil {
@@ -1436,6 +1436,83 @@ func TestAdminTenantPoolReplenishSkipsDeletedOrShrunkPool(t *testing.T) {
 	}
 }
 
+func TestAdminTenantPoolUpdateQuotaOnlyDoesNotResize(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
+		Clusters: []tenant.CloudClusterInfo{{
+			ClusterID:      "cluster-1",
+			OrganizationID: "org-1",
+		}},
+	}}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
+		PoolID:         "pool-1",
+		OrganizationID: "org-1",
+		Size:           2,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+
+	ts := httptest.NewServer(rt.server)
+	t.Cleanup(ts.Close)
+	resp := patchJSON(t, ts.URL+"/v1/admin/tenant-pool", map[string]any{
+		"public_key":               "public-1",
+		"private_key":              "private-1",
+		"tidbcloud_spending_limit": 9000,
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	if got := rt.prov.batchPoolCalls.Load(); got != 0 {
+		t.Fatalf("batch pool calls = %d, want 0", got)
+	}
+	pool, err := rt.meta.GetTenantPoolByID(ctx, "pool-1")
+	if err != nil {
+		t.Fatalf("get pool: %v", err)
+	}
+	if pool.Size != 2 || pool.SpendingLimit == nil || *pool.SpendingLimit != 9000 {
+		t.Fatalf("pool = %#v, want size 2 and spending limit 9000", pool)
+	}
+}
+
+func TestAdminTenantPoolReplenishUsesStoredSpendingLimit(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	limit := int64(7000)
+	pool := &meta.TenantPool{
+		PoolID:         "pool-1",
+		OrganizationID: "org-1",
+		Size:           1,
+		SpendingLimit:  &limit,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := rt.meta.CreateTenantPool(ctx, pool); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+
+	rt.server.replenishTenantPoolAsync(ctx, pool, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	rt.server.forkWorkerWG.Wait()
+
+	if got := rt.prov.batchPoolCalls.Load(); got != 1 {
+		t.Fatalf("batch pool calls = %d, want 1", got)
+	}
+	if rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly == nil || *rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly != limit {
+		t.Fatalf("replenish spending limit = %#v, want %d", rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly, limit)
+	}
+}
+
 func TestAdminTenantCreateDoesNotIssueAPIKeyWhenPoolPasswordDecryptFails(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
@@ -1446,7 +1523,7 @@ func TestAdminTenantCreateDoesNotIssueAPIKeyWhenPoolPasswordDecryptFails(t *test
 	}}
 	ctx := context.Background()
 	now := time.Now().UTC()
-	if err := rt.meta.UpsertTenantPool(ctx, &meta.TenantPool{
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
 		PoolID:         "pool-1",
 		OrganizationID: "org-1",
 		Size:           1,
@@ -1523,7 +1600,7 @@ func TestAdminTenantCreateClaimsFreePoolTenant(t *testing.T) {
 	}}
 	ctx := context.Background()
 	now := time.Now().UTC()
-	if err := rt.meta.UpsertTenantPool(ctx, &meta.TenantPool{
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
 		PoolID:         "pool-1",
 		OrganizationID: "org-1",
 		Size:           0,
@@ -1856,11 +1933,21 @@ func TestAdminPaginationRejectsOffsetOverflow(t *testing.T) {
 
 func postJSON(t *testing.T, url string, body map[string]any, apiKey string) *http.Response {
 	t.Helper()
+	return sendJSON(t, http.MethodPost, url, body, apiKey)
+}
+
+func patchJSON(t *testing.T, url string, body map[string]any, apiKey string) *http.Response {
+	t.Helper()
+	return sendJSON(t, http.MethodPatch, url, body, apiKey)
+}
+
+func sendJSON(t *testing.T, method, url string, body map[string]any, apiKey string) *http.Response {
+	t.Helper()
 	raw, err := json.Marshal(body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(raw))
+	req, err := http.NewRequest(method, url, bytes.NewReader(raw))
 	if err != nil {
 		t.Fatal(err)
 	}

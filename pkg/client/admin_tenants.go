@@ -57,7 +57,7 @@ type AdminTenantCreateResponse struct {
 type AdminTenantPoolRequest struct {
 	PublicKey              string `json:"public_key"`
 	PrivateKey             string `json:"private_key"`
-	PoolSize               int    `json:"pool_size,omitempty"`
+	PoolSize               *int   `json:"pool_size,omitempty"`
 	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
 }
 

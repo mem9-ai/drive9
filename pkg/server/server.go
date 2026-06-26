@@ -138,6 +138,7 @@ type Server struct {
 	forkWorkerWG        sync.WaitGroup
 	forkWorkerMu        sync.Mutex
 	forkWorkerClosed    bool
+	tenantPoolLocks     sync.Map
 	schemaInitErrors    sync.Map
 	leader              *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership

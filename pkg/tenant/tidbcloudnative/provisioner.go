@@ -418,10 +418,17 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 		info := created.Clusters[i]
 		tenantID := strings.TrimSpace(info.Labels[Drive9TenantIDLabel])
 		if tenantID == "" {
-			tenantID = strings.TrimSpace(tenantIDs[i])
+			errs[i] = fmt.Errorf("tidbcloud native batch response missing %s label for cluster %q", Drive9TenantIDLabel, info.ClusterID)
+			continue
 		}
-		if info.ClusterID == "" {
-			return nil, nil, fmt.Errorf("tidbcloud native batch response missing cluster id")
+		password, ok := passwords[tenantID]
+		if !ok {
+			errs[i] = fmt.Errorf("tidbcloud native batch response returned unknown tenant id %q", tenantID)
+			continue
+		}
+		if strings.TrimSpace(info.ClusterID) == "" {
+			errs[i] = fmt.Errorf("tidbcloud native batch response missing cluster id for tenant %q", tenantID)
+			continue
 		}
 		wg.Add(1)
 		go func() {
@@ -435,13 +442,13 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 				}
 				clusterInfo = waited
 			}
-			out[i] = p.clusterInfoFromResponse(tenantID, dbName, passwords[tenantID], clusterInfo)
+			out[i] = p.clusterInfoFromResponse(tenantID, dbName, password, clusterInfo)
 		}()
 	}
 	wg.Wait()
 	for _, err := range errs {
 		if err != nil {
-			return fallbackBatchClusterInfos(created.Clusters, tenantIDs, dbName), nil, err
+			return fallbackBatchClusterInfos(created.Clusters, dbName), nil, err
 		}
 	}
 	cloudCfg := &tenant.QuotaCloudConfig{Labels: map[string]string{
@@ -454,14 +461,11 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 	return out, cloudCfg, nil
 }
 
-func fallbackBatchClusterInfos(clusters []clusterInfo, tenantIDs []string, dbName string) []*tenant.ClusterInfo {
+func fallbackBatchClusterInfos(clusters []clusterInfo, dbName string) []*tenant.ClusterInfo {
 	out := make([]*tenant.ClusterInfo, 0, len(clusters))
 	for i := range clusters {
 		info := clusters[i]
 		tenantID := strings.TrimSpace(info.Labels[Drive9TenantIDLabel])
-		if tenantID == "" && i < len(tenantIDs) {
-			tenantID = strings.TrimSpace(tenantIDs[i])
-		}
 		out = append(out, &tenant.ClusterInfo{
 			TenantID:       tenantID,
 			ClusterID:      strings.TrimSpace(info.ClusterID),

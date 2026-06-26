@@ -476,7 +476,7 @@ func adminTenantPoolCreate(args []string) error {
 		}
 		return err
 	}
-	if req.PoolSize <= 0 {
+	if req.PoolSize == nil || *req.PoolSize <= 0 {
 		return fmt.Errorf("--pool-size must be positive")
 	}
 	out, err := client.New(server, "").AdminCreateTenantPool(context.Background(), req)
@@ -508,6 +508,9 @@ func adminTenantPoolUpdate(args []string) error {
 			return nil
 		}
 		return err
+	}
+	if req.PoolSize == nil || *req.PoolSize <= 0 {
+		return fmt.Errorf("--pool-size must be positive")
 	}
 	out, err := client.New(server, "").AdminUpdateTenantPool(context.Background(), req)
 	if err != nil {
@@ -586,7 +589,8 @@ func parseAdminTenantPoolCommand(args []string, usage string, allowPoolSize, all
 			if parseErr != nil {
 				return req, "", false, parseErr
 			}
-			req.PoolSize = int(v)
+			poolSize := int(v)
+			req.PoolSize = &poolSize
 			poolSizeGiven = true
 		case "--tidbcloud-spending-limit":
 			if !allowSpendingLimit {
@@ -982,7 +986,7 @@ decreasing deletes newest free tenants.
 flags:
   --server URL                     server URL (default: active context server)
   --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
-  --pool-size N                    target free tenant count; must be non-negative
+  --pool-size N                    target free tenant count; must be positive
   --tidbcloud-public-key KEY       TiDB Cloud public key
   --tidbcloud-private-key KEY      TiDB Cloud private key
   --tidbcloud-spending-limit N     TiDB Cloud Cluster Spending Limit for newly-created pool clusters

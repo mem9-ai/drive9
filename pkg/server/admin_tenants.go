@@ -172,6 +172,9 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		return
 	} else if claimed {
 		setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+		if res.Status == meta.TenantProvisioning {
+			s.startProvisionedTenantSchemaInit(r.Context(), res)
+		}
 		s.replenishTenantPoolAsync(r.Context(), pool, cred)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)

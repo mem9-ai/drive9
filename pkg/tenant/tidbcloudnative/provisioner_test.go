@@ -288,6 +288,7 @@ func TestProvisionWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing
 }
 
 func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
+	handlerErrs := make(chan error, 2)
 	var gotBody struct {
 		Requests []struct {
 			Cluster struct {
@@ -310,10 +311,14 @@ func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
 			return
 		}
 		if r.Method != http.MethodPost || r.URL.Path != "/v1beta1/clusters:batchCreate" {
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			handlerErrs <- fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
 		}
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
-			t.Fatalf("decode request body: %v", err)
+			handlerErrs <- fmt.Errorf("decode request body: %w", err)
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"clusters": []map[string]any{
@@ -351,6 +356,7 @@ func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BatchProvisionFreeClustersWithCredentialsAndQuota: %v", err)
 	}
+	assertNoHandlerError(t, handlerErrs)
 	if len(gotBody.Requests) != 2 {
 		t.Fatalf("requests = %d, want 2", len(gotBody.Requests))
 	}
@@ -385,6 +391,9 @@ func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFail
 	t.Cleanup(func() { tidbCloudNativePollInterval = origPoll })
 
 	var getCalls atomic.Int32
+	handlerErrs := make(chan error, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
 			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
@@ -412,6 +421,7 @@ func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFail
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters/cluster-2":
 			getCalls.Add(1)
+			cancel()
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"clusterId":  "cluster-2",
 				"state":      "CREATING",
@@ -419,7 +429,8 @@ func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFail
 				"userPrefix": "u2",
 			})
 		default:
-			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+			handlerErrs <- fmt.Errorf("unexpected request %s %s", r.Method, r.URL.String())
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
 		}
 	}))
 	defer ts.Close()
@@ -431,8 +442,6 @@ func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFail
 		defaultDatabaseName: DefaultDatabaseName,
 		client:              ts.Client(),
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
-	defer cancel()
 	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(ctx, []string{"tenant-1", "tenant-2"}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
@@ -440,6 +449,7 @@ func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFail
 	if err == nil {
 		t.Fatal("BatchProvisionFreeClustersWithCredentialsAndQuota error = nil, want metadata wait error")
 	}
+	assertNoHandlerError(t, handlerErrs)
 	if getCalls.Load() == 0 {
 		t.Fatal("cluster metadata GET was not called")
 	}
@@ -448,6 +458,62 @@ func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFail
 	}
 	if out[0].TenantID != "tenant-1" || out[0].ClusterID != "cluster-1" || out[1].TenantID != "tenant-2" || out[1].ClusterID != "cluster-2" {
 		t.Fatalf("fallback clusters = %#v", out)
+	}
+}
+
+func TestBatchProvisionFreeClustersRequiresTenantIDLabel(t *testing.T) {
+	handlerErrs := make(chan error, 2)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/v1beta1/clusters:batchCreate" {
+			handlerErrs <- fmt.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"clusters": []map[string]any{
+				{
+					"clusterId":  "cluster-1",
+					"state":      "ACTIVE",
+					"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1"},
+					"userPrefix": "u1",
+					"endpoints":  map[string]any{"public": map[string]any{"host": "db1.example", "port": 4000}},
+				},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		cloudProvider:       "aws",
+		region:              "us-east-1",
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1"}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{})
+	if err == nil || !strings.Contains(err.Error(), "missing "+Drive9TenantIDLabel) {
+		t.Fatalf("error = %v, want missing tenant id label", err)
+	}
+	assertNoHandlerError(t, handlerErrs)
+	if len(out) != 1 || out[0].TenantID != "" || out[0].ClusterID != "cluster-1" {
+		t.Fatalf("fallback clusters = %#v", out)
+	}
+}
+
+func assertNoHandlerError(t *testing.T, errs <-chan error) {
+	t.Helper()
+	select {
+	case err := <-errs:
+		t.Fatal(err)
+	default:
 	}
 }
 

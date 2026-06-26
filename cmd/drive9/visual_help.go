@@ -489,7 +489,7 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Name: "--max-storage-size Mi", Desc: "set-quota: max confirmed+reserved storage size in Mi"},
 				{Name: "--max-file-size Mi", Desc: "set-quota: max single file size in Mi"},
 				{Name: "--max-file-count N", Desc: "set-quota: max confirmed file count; 0 means unlimited"},
-				{Name: "--tidbcloud-spending-limit N", Desc: "set-quota: TiDB Cloud Cluster Spending Limit"},
+				{Name: "--tidbcloud-spending-limit N", Desc: "tenant set-quota or pool create/update TiDB Cloud Cluster Spending Limit"},
 				{Name: "--json", Desc: "output result as JSON"},
 			},
 			Examples: []visualHelpExample{

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"go.uber.org/zap"
@@ -19,7 +20,7 @@ import (
 type adminTenantPoolRequest struct {
 	PublicKey  string `json:"public_key"`
 	PrivateKey string `json:"private_key"`
-	PoolSize   int    `json:"pool_size"`
+	PoolSize   *int   `json:"pool_size,omitempty"`
 	quotaFields
 }
 
@@ -58,7 +59,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.PoolSize <= 0 {
+	if req.PoolSize == nil || *req.PoolSize <= 0 {
 		errJSON(w, http.StatusBadRequest, "pool_size must be positive")
 		return
 	}
@@ -92,10 +93,11 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 	}
 	poolID := token.NewID()
 	now := time.Now().UTC()
-	if err := s.meta.UpsertTenantPool(r.Context(), &meta.TenantPool{
+	if err := s.meta.CreateTenantPool(r.Context(), &meta.TenantPool{
 		PoolID:         poolID,
 		OrganizationID: orgID,
-		Size:           req.PoolSize,
+		Size:           *req.PoolSize,
+		SpendingLimit:  quotaReq.TiDBCloudSpendingLimit,
 		Status:         meta.TenantPoolActive,
 		CreatedAt:      now,
 		UpdatedAt:      now,
@@ -107,7 +109,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusInternalServerError, "failed to persist tenant pool")
 		return
 	}
-	results, err := s.createFreePoolTenants(r.Context(), poolID, req.PoolSize, cred, quotaOpt)
+	results, err := s.createFreePoolTenants(r.Context(), poolID, *req.PoolSize, cred, quotaOpt)
 	if err != nil {
 		s.deleteTenantPoolMetadata(r.Context(), poolID, "create_free_tenants_error")
 		errJSON(w, http.StatusBadGateway, fmt.Sprintf("create tenant pool failed: %v", err))
@@ -140,7 +142,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusAccepted, adminTenantPoolResponse{
 		PoolID:         poolID,
 		OrganizationID: orgID,
-		PoolSize:       req.PoolSize,
+		PoolSize:       *req.PoolSize,
 		FreeSize:       freeSize,
 		Status:         string(meta.TenantPoolActive),
 	})
@@ -171,8 +173,8 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if req.PoolSize < 0 {
-		errJSON(w, http.StatusBadRequest, "pool_size must be non-negative")
+	if req.PoolSize != nil && *req.PoolSize <= 0 {
+		errJSON(w, http.StatusBadRequest, "pool_size must be positive")
 		return
 	}
 	cred, err := adminCredentials(req.PublicKey, req.PrivateKey, r)
@@ -180,8 +182,24 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pool, freeSize, ok := s.authorizedTenantPool(w, r, cred)
+	pool, _, ok := s.authorizedTenantPool(w, r, cred)
 	if !ok {
+		return
+	}
+	lock := s.tenantPoolLock(pool.PoolID)
+	lock.Lock()
+	defer lock.Unlock()
+	if pool, err = s.meta.GetTenantPoolByID(r.Context(), pool.PoolID); err != nil {
+		errJSON(w, http.StatusInternalServerError, "tenant pool lookup failed")
+		return
+	}
+	if pool.Status != meta.TenantPoolActive {
+		errJSON(w, http.StatusConflict, "tenant pool is not active")
+		return
+	}
+	freeSize, err := s.meta.CountFreeTenantPoolBindings(r.Context(), pool.OrganizationID)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "tenant pool free size lookup failed")
 		return
 	}
 	quotaReq := quotaRequest{TenantID: "pool", quotaFields: req.quotaFields}
@@ -193,31 +211,35 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		}
 		quotaOpt = &quotaReq
 	}
-	if req.PoolSize > freeSize {
-		results, err := s.createFreePoolTenants(r.Context(), pool.PoolID, req.PoolSize-freeSize, cred, quotaOpt)
-		if err != nil {
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("grow tenant pool failed: %v", err))
-			return
+	targetSize := pool.Size
+	if req.PoolSize != nil {
+		targetSize = *req.PoolSize
+		if targetSize > freeSize {
+			results, err := s.createFreePoolTenants(r.Context(), pool.PoolID, targetSize-freeSize, cred, quotaOpt)
+			if err != nil {
+				errJSON(w, http.StatusBadGateway, fmt.Sprintf("grow tenant pool failed: %v", err))
+				return
+			}
+			for _, res := range results {
+				s.startProvisionedTenantSchemaInit(r.Context(), res)
+			}
+			freeSize += len(results)
+		} else if targetSize < freeSize {
+			if err := s.deleteNewestFreePoolTenants(r.Context(), pool.OrganizationID, freeSize-targetSize, cred, false); err != nil {
+				errJSON(w, http.StatusBadGateway, fmt.Sprintf("shrink tenant pool failed: %v", err))
+				return
+			}
+			freeSize = targetSize
 		}
-		for _, res := range results {
-			s.startProvisionedTenantSchemaInit(r.Context(), res)
-		}
-		freeSize += len(results)
-	} else if req.PoolSize < freeSize {
-		if err := s.deleteNewestFreePoolTenants(r.Context(), pool.OrganizationID, freeSize-req.PoolSize, cred); err != nil {
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("shrink tenant pool failed: %v", err))
-			return
-		}
-		freeSize = req.PoolSize
 	}
-	if err := s.meta.UpdateTenantPoolSize(r.Context(), pool.PoolID, req.PoolSize); err != nil {
+	if err := s.meta.UpdateTenantPoolSettings(r.Context(), pool.PoolID, req.PoolSize, quotaReq.TiDBCloudSpendingLimit); err != nil {
 		errJSON(w, http.StatusInternalServerError, "failed to update tenant pool")
 		return
 	}
 	writeJSON(w, http.StatusAccepted, adminTenantPoolResponse{
 		PoolID:         pool.PoolID,
 		OrganizationID: pool.OrganizationID,
-		PoolSize:       req.PoolSize,
+		PoolSize:       targetSize,
 		FreeSize:       freeSize,
 		Status:         string(pool.Status),
 	})
@@ -237,11 +259,18 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pool, freeSize, ok := s.authorizedTenantPool(w, r, cred)
+	pool, _, ok := s.authorizedTenantPool(w, r, cred)
 	if !ok {
 		return
 	}
-	if err := s.deleteNewestFreePoolTenants(r.Context(), pool.OrganizationID, freeSize, cred); err != nil {
+	lock := s.tenantPoolLock(pool.PoolID)
+	lock.Lock()
+	defer lock.Unlock()
+	if err := s.meta.UpdateTenantPoolStatus(r.Context(), pool.PoolID, meta.TenantPoolDeleting); err != nil {
+		errJSON(w, http.StatusInternalServerError, "failed to mark tenant pool deleting")
+		return
+	}
+	if err := s.deleteNewestFreePoolTenants(r.Context(), pool.OrganizationID, 0, cred, true); err != nil {
 		errJSON(w, http.StatusBadGateway, fmt.Sprintf("delete tenant pool failed: %v", err))
 		return
 	}
@@ -311,6 +340,7 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 	for i := 0; i < count; i++ {
 		tenantID := token.NewID()
 		if err := s.insertPendingPoolTenant(ctx, tenantID, provider, now); err != nil {
+			s.cleanupPoolProvisionedClusters(ctx, nil, cred, tenantIDs, "insert_pending_tenant_error")
 			return nil, err
 		}
 		tenantIDs = append(tenantIDs, tenantID)
@@ -376,7 +406,7 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 			TenantID:       cluster.TenantID,
 			Status:         meta.TenantProvisioning,
 			Provider:       provider,
-			TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
+			TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true, provider),
 			CloudProvider:  cloudProvider,
 			Region:         region,
 			OrganizationID: strings.TrimSpace(cluster.OrganizationID),
@@ -389,15 +419,13 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 func (s *Server) cleanupPoolProvisionedClusters(ctx context.Context, clusters []*tenant.ClusterInfo, cred tenant.CredentialProvisionRequest, tenantIDs []string, reason string) {
 	cleanupCtx := backgroundWithTrace(ctx)
 	seenTenants := make(map[string]struct{}, len(tenantIDs)+len(clusters))
+	deprovisionFailed := make(map[string]struct{}, len(clusters))
 	for _, tenantID := range tenantIDs {
 		tenantID = strings.TrimSpace(tenantID)
 		if tenantID == "" {
 			continue
 		}
 		seenTenants[tenantID] = struct{}{}
-		if err := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); err != nil {
-			logger.Warn(cleanupCtx, "admin_tenant_pool_cleanup_mark_failed", zap.String("tenant_id", tenantID), zap.String("reason", reason), zap.Error(err))
-		}
 	}
 	for _, cluster := range clusters {
 		if cluster == nil {
@@ -424,7 +452,23 @@ func (s *Server) cleanupPoolProvisionedClusters(ctx context.Context, clusters []
 			DBName:    cluster.DBName,
 		}
 		if err := s.deprovisionTenantCluster(cleanupCtx, t, cred); err != nil {
+			if tenantID != "" {
+				deprovisionFailed[tenantID] = struct{}{}
+			}
 			logger.Warn(cleanupCtx, "admin_tenant_pool_cleanup_cluster_failed", zap.String("tenant_id", tenantID), zap.String("cluster_id", cluster.ClusterID), zap.String("reason", reason), zap.Error(err))
+		}
+	}
+	for tenantID := range seenTenants {
+		if _, failed := deprovisionFailed[tenantID]; failed {
+			if err := s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed); err != nil {
+				logger.Warn(cleanupCtx, "admin_tenant_pool_cleanup_mark_failed", zap.String("tenant_id", tenantID), zap.String("reason", reason), zap.Error(err))
+			}
+			continue
+		}
+		_ = s.meta.RevokeTenantAPIKeys(cleanupCtx, tenantID)
+		if err := s.meta.MarkTenantDeleted(cleanupCtx, tenantID); err != nil {
+			logger.Warn(cleanupCtx, "admin_tenant_pool_cleanup_mark_deleted_failed", zap.String("tenant_id", tenantID), zap.String("reason", reason), zap.Error(err))
+			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 		}
 	}
 }
@@ -459,17 +503,30 @@ func (s *Server) insertPendingPoolTenant(ctx context.Context, tenantID, provider
 	return nil
 }
 
-func (s *Server) deleteNewestFreePoolTenants(ctx context.Context, organizationID string, count int, cred tenant.CredentialProvisionRequest) error {
-	if count <= 0 {
+func (s *Server) deleteNewestFreePoolTenants(ctx context.Context, organizationID string, count int, cred tenant.CredentialProvisionRequest, deleteAll bool) error {
+	if count <= 0 && !deleteAll {
 		return nil
 	}
 	remaining := count
-	for remaining > 0 {
-		rows, err := s.meta.ListFreeTenantPoolBindings(ctx, organizationID, true, remaining)
+	for deleteAll || remaining > 0 {
+		limit := remaining
+		if deleteAll {
+			limit = 100
+		}
+		var rows []meta.TenantWithTiDBCloudOrgBinding
+		var err error
+		if deleteAll {
+			rows, err = s.meta.ListFreeTenantPoolBindingsForDelete(ctx, organizationID, true, limit)
+		} else {
+			rows, err = s.meta.ListFreeTenantPoolBindings(ctx, organizationID, true, limit)
+		}
 		if err != nil {
 			return err
 		}
 		if len(rows) == 0 {
+			if deleteAll {
+				return nil
+			}
 			return fmt.Errorf("not enough free tenants to delete")
 		}
 		progressed := false
@@ -489,11 +546,13 @@ func (s *Server) deleteNewestFreePoolTenants(ctx context.Context, organizationID
 			}
 			_ = s.meta.RevokeTenantAPIKeys(ctx, t.ID)
 			if err := s.meta.MarkTenantDeleted(ctx, t.ID); err != nil {
-				_, _ = s.meta.UpdateTenantStatusIf(context.Background(), t.ID, meta.TenantDeleting, t.Status)
+				_ = s.meta.UpdateTenantStatus(context.Background(), t.ID, meta.TenantFailed)
 				return err
 			}
-			remaining--
-			if remaining == 0 {
+			if !deleteAll {
+				remaining--
+			}
+			if !deleteAll && remaining == 0 {
 				break
 			}
 		}
@@ -553,6 +612,9 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 	}
 	workerCtx := backgroundWithTrace(ctx)
 	s.startServerWorker(workerCtx, func(ctx context.Context) {
+		lock := s.tenantPoolLock(pool.PoolID)
+		lock.Lock()
+		defer lock.Unlock()
 		current, err := s.meta.GetTenantPoolByID(ctx, pool.PoolID)
 		if err != nil {
 			if !errors.Is(err, meta.ErrNotFound) {
@@ -572,7 +634,7 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 		if missing <= 0 {
 			return
 		}
-		results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
+		results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, tenantPoolQuotaRequest(current))
 		if err != nil {
 			logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
 			return
@@ -581,6 +643,26 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 			s.startProvisionedTenantSchemaInit(ctx, res)
 		}
 	})
+}
+
+func (s *Server) tenantPoolLock(poolID string) *sync.Mutex {
+	if strings.TrimSpace(poolID) == "" {
+		return &sync.Mutex{}
+	}
+	v, _ := s.tenantPoolLocks.LoadOrStore(poolID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+func tenantPoolQuotaRequest(pool *meta.TenantPool) *quotaRequest {
+	if pool == nil || pool.SpendingLimit == nil {
+		return nil
+	}
+	return &quotaRequest{
+		TenantID: "pool",
+		quotaFields: quotaFields{
+			TiDBCloudSpendingLimit: pool.SpendingLimit,
+		},
+	}
 }
 
 func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) (*provisionTenantResult, *meta.TenantPool, bool, error) {
@@ -648,7 +730,7 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		APIKeyID:       apiKeyID,
 		Status:         row.Tenant.Status,
 		Provider:       tenant.ProviderTiDBCloudNative,
-		TenantDSN:      tenantDSN(row.Tenant.DBUser, string(plainPass), row.Tenant.DBHost, row.Tenant.DBPort, row.Tenant.DBName, row.Tenant.DBTLS),
+		TenantDSN:      tenantDSN(row.Tenant.DBUser, string(plainPass), row.Tenant.DBHost, row.Tenant.DBPort, row.Tenant.DBName, row.Tenant.DBTLS, row.Tenant.Provider),
 		CloudProvider:  cloudProvider,
 		Region:         region,
 		OrganizationID: row.Binding.OrganizationID,
