@@ -77,6 +77,11 @@ type MountOptions struct {
 	PerfCounters            bool          // print low-overhead FUSE perf counter summary on shutdown
 	EnableGitWorkspaces     bool          // enable fast-clone git workspace overlay discovery
 	Profiling               ProfilingOptions
+	// RemoteCommitWaitTimeout bounds how long a FUSE write/flush handler waits
+	// for a background commit to finish before proceeding anyway. This prevents
+	// the FUSE daemon from hanging indefinitely when a backend upload is slow.
+	// Default 5s; 0 uses default; negative disables the timeout (legacy behavior).
+	RemoteCommitWaitTimeout time.Duration
 }
 
 const defaultUploadConcurrency = 16
@@ -172,6 +177,9 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.Profiling.ProfileDir != "" && o.Profiling.PerfMaxProfileFiles <= 0 {
 		o.Profiling.PerfMaxProfileFiles = defaultPerfMaxProfileFiles
+	}
+	if o.RemoteCommitWaitTimeout == 0 {
+		o.RemoteCommitWaitTimeout = 5 * time.Second
 	}
 }
 

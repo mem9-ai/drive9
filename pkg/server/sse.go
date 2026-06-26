@@ -137,7 +137,7 @@ func (ebs *eventBuses) get(tenantID string, store *datastore.Store) *EventBus {
 		}
 		return bus
 	}
-	bus := NewEventBus(store)
+	bus := NewEventBus(tenantID, store)
 	ebs.buses[tenantID] = bus
 	return bus
 }
@@ -172,10 +172,11 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 	if store != nil {
 		if _, err := store.InsertFSEvent(r.Context(), path, op, actor, time.Now().UnixMilli()); err != nil {
 			logger.Warn(r.Context(), "sse_publish_fs_event_insert_failed",
+				zap.String("tenant_id", bus.tenantID),
 				zap.String("path", path),
 				zap.String("op", op),
 				zap.Error(err))
-			metrics.RecordOperation("event_bus", "publish", "error", 0)
+			metrics.RecordTenantOperation(bus.tenantID, "event_bus", "publish", "error", 0)
 		}
 	}
 	bus.Publish()

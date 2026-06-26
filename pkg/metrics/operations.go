@@ -55,24 +55,37 @@ func SetModuleAvailability(module string, up bool) {
 }
 
 func RecordOperation(component, operation, result string, d time.Duration) {
+	RecordTenantOperation("", component, operation, result, d)
+}
+
+func RecordTenantOperation(tenantID, component, operation, result string, d time.Duration) {
 	component = cleanMetricValue(component, "unknown")
 	operation = cleanMetricValue(operation, "unknown")
 	result = cleanMetricValue(result, "unknown")
+	tenantID = cleanMetricValue(tenantID, "unknown")
 	RegisterModule(component)
 	attrs := []Attribute{
 		Attr("component", component),
 		Attr("operation", operation),
 		Attr("result", result),
 	}
+	if tenantID != "unknown" {
+		attrs = append(attrs, Attr("tenant_id", tenantID))
+	}
 	serviceOperationsTotal.Add(1, attrs...)
 	serviceOperationDuration.Observe(d.Seconds(), attrs...)
 }
 
 func RecordGauge(component, name string, value float64) {
+	RecordTenantGauge("", component, name, value)
+}
+
+func RecordTenantGauge(tenantID, component, name string, value float64) {
 	component = cleanMetricValue(component, "unknown")
 	name = cleanMetricValue(name, "unknown")
+	tenantID = strings.TrimSpace(tenantID)
 	RegisterModule(component)
-	serviceGauge.Set(value, Attr("component", component), Attr("name", name))
+	serviceGauge.Set(value, Attr("component", component), Attr("name", name), Attr("tenant_id", tenantID))
 }
 
 func RecordHTTPRequest(method, route string, status int, d time.Duration) {
@@ -99,9 +112,17 @@ func RecordHTTPInFlightRoute(route string, value float64) {
 }
 
 func RecordEvent(event string, labels ...string) {
+	RecordTenantEvent("", event, labels...)
+}
+
+func RecordTenantEvent(tenantID, event string, labels ...string) {
 	RegisterModule("server")
-	attrs := make([]Attribute, 0, len(labels)/2+1)
+	attrs := make([]Attribute, 0, len(labels)/2+2)
 	attrs = append(attrs, Attr("event", cleanMetricValue(event, "unknown")))
+	tenantID = cleanMetricValue(tenantID, "unknown")
+	if tenantID != "unknown" {
+		attrs = append(attrs, Attr("tenant_id", tenantID))
+	}
 	for i := 0; i+1 < len(labels); i += 2 {
 		attrs = append(attrs, Attr(labels[i], labels[i+1]))
 	}

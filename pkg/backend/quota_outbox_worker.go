@@ -126,7 +126,7 @@ func (b *Dat9Backend) processQuotaOutboxAvailable(ctx context.Context) {
 		logger.Warn(ctx, "quota_outbox_recover_expired_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.Error(err))
-		metrics.RecordOperation("quota_outbox", "recover_expired", "error", 0)
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "recover_expired", "error", 0)
 	}
 	processedTotal := 0
 	for processedTotal < quotaOutboxBatchSize {
@@ -236,11 +236,11 @@ func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (p
 	}
 	entries, err := b.store.ClaimQuotaOutboxBatch(ctx, time.Now().UTC(), quotaOutboxLeaseDuration, limit)
 	if err != nil {
-		metrics.RecordOperation("quota_outbox", "claim", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "claim", "error", time.Since(start))
 		return 0, err
 	}
 	if len(entries) == 0 {
-		metrics.RecordOperation("quota_outbox", "claim", "empty", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "claim", "empty", time.Since(start))
 		return 0, nil
 	}
 
@@ -267,7 +267,7 @@ func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (p
 		return nil
 	})
 	if err != nil {
-		metrics.RecordOperation("quota_outbox", "process", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "process", "error", time.Since(start))
 		return processed, err
 	}
 	if batchApplyErr == nil && processed > 0 {
@@ -291,7 +291,7 @@ func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (p
 			appliedEntries = append(appliedEntries, entries[i])
 		}
 		if entryErr != nil {
-			metrics.RecordOperation("quota_outbox", entries[i].MutationType, "error", time.Since(start))
+			metrics.RecordTenantOperation(b.tenantID, "quota_outbox", entries[i].MutationType, "error", time.Since(start))
 			if !entryProcessed {
 				b.recordAppliedQuotaOutboxEntries(start, appliedEntries)
 				return processed, entryErr
@@ -350,7 +350,7 @@ func (b *Dat9Backend) recordAppliedQuotaOutboxEntries(start time.Time, entries [
 	}
 	for _, entry := range entries {
 		b.addLocalQuotaPendingDeltas(-entry.StorageDelta, -entry.FileDelta, -entry.MediaDelta)
-		metrics.RecordOperation("quota_outbox", entry.MutationType, "ok", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", entry.MutationType, "ok", time.Since(start))
 	}
 }
 

@@ -99,7 +99,7 @@ func TestAsyncAudioExtractMetricsExposed(t *testing.T) {
 	if !strings.Contains(metricsText, "drive9_module_up{module=\"audio_extract\"} 1") {
 		t.Fatalf("metrics missing audio_extract module availability: %s", metricsText)
 	}
-	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\"} 4096") {
+	if !strings.Contains(metricsText, "drive9_service_gauge{component=\"audio_extract\",name=\"max_audio_bytes\",tenant_id=\"\"} 4096") {
 		t.Fatalf("metrics missing audio_extract runtime gauge: %s", metricsText)
 	}
 	if !strings.Contains(metricsText, "drive9_service_operations_total{component=\"audio_extract\",operation=\"process\",result=\"ok\"}") {

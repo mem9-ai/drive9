@@ -39,7 +39,7 @@ func newTestStoreForEventBus(t *testing.T) *datastore.Store {
 
 func TestEventBusSubscribeAndNotify(t *testing.T) {
 	store := newTestStoreForEventBus(t)
-	bus := NewEventBus(store)
+	bus := NewEventBus("test-tenant", store)
 
 	subID, notify := bus.Subscribe()
 	defer bus.Unsubscribe(subID)
@@ -70,7 +70,7 @@ func TestEventBusSubscribeAndNotify(t *testing.T) {
 
 func TestEventBusEventsSinceZeroReturnsReset(t *testing.T) {
 	store := newTestStoreForEventBus(t)
-	bus := NewEventBus(store)
+	bus := NewEventBus("test-tenant", store)
 
 	if _, err := store.InsertFSEvent(context.Background(), "/a.txt", "write", "", time.Now().UnixMilli()); err != nil {
 		t.Fatal(err)
@@ -87,7 +87,7 @@ func TestEventBusEventsSinceZeroReturnsReset(t *testing.T) {
 
 func TestEventBusEventsSinceReplays(t *testing.T) {
 	store := newTestStoreForEventBus(t)
-	bus := NewEventBus(store)
+	bus := NewEventBus("test-tenant", store)
 
 	// Insert two events.
 	seq1, err := store.InsertFSEvent(context.Background(), "/a.txt", "write", "actor1", time.Now().UnixMilli())
@@ -117,7 +117,7 @@ func TestEventBusEventsSinceReplays(t *testing.T) {
 
 func TestEventBusSeq(t *testing.T) {
 	store := newTestStoreForEventBus(t)
-	bus := NewEventBus(store)
+	bus := NewEventBus("test-tenant", store)
 
 	// Reset AUTO_INCREMENT so seq starts at 1.
 	if _, err := store.DB().Exec(`ALTER TABLE fs_events AUTO_INCREMENT = 1`); err != nil {
@@ -142,7 +142,7 @@ func TestEventBusSeq(t *testing.T) {
 
 func TestEventBusSubscribeUnsubscribe(t *testing.T) {
 	store := newTestStoreForEventBus(t)
-	bus := NewEventBus(store)
+	bus := NewEventBus("test-tenant", store)
 
 	subID, _ := bus.Subscribe()
 	bus.Unsubscribe(subID)
@@ -164,7 +164,7 @@ func TestEventBusSubscribeUnsubscribe(t *testing.T) {
 
 func TestEventBusMultipleSubscribers(t *testing.T) {
 	store := newTestStoreForEventBus(t)
-	bus := NewEventBus(store)
+	bus := NewEventBus("test-tenant", store)
 
 	var wg sync.WaitGroup
 	const n = 5
@@ -191,7 +191,7 @@ func TestEventBusMultipleSubscribers(t *testing.T) {
 // to catch data races on the store field. Run with -race to detect violations.
 func TestEventBusStoreRefreshNoRace(t *testing.T) {
 	store := newTestStoreForEventBus(t)
-	bus := NewEventBus(store)
+	bus := NewEventBus("test-tenant", store)
 
 	done := make(chan struct{})
 
@@ -218,7 +218,7 @@ func TestEventBusStoreRefreshNoRace(t *testing.T) {
 // failure branch flagged in D1.
 func TestEventBusEventsSinceQueryErrorReturnsCaughtUp(t *testing.T) {
 	store := newTestStoreForEventBus(t)
-	bus := NewEventBus(store)
+	bus := NewEventBus("test-tenant", store)
 
 	// Insert one event so since=1 is valid.
 	if _, err := store.InsertFSEvent(context.Background(), "/a.txt", "write", "", time.Now().UnixMilli()); err != nil {
@@ -248,7 +248,7 @@ func TestEventBusEventsSinceQueryErrorReturnsCaughtUp(t *testing.T) {
 // all other subscribers left.
 func TestEventBusUnsubscribeOneOfManyReturnsImmediately(t *testing.T) {
 	store := newTestStoreForEventBus(t)
-	bus := NewEventBus(store)
+	bus := NewEventBus("test-tenant", store)
 
 	// Two subscribers.
 	id1, _ := bus.Subscribe()
@@ -274,7 +274,7 @@ func TestEventBusUnsubscribeOneOfManyReturnsImmediately(t *testing.T) {
 // stops after the last Unsubscribe and can restart cleanly on a later Subscribe.
 func TestEventBusPollLoopStopsAfterLastUnsubscribe(t *testing.T) {
 	store := newTestStoreForEventBus(t)
-	bus := NewEventBus(store)
+	bus := NewEventBus("test-tenant", store)
 
 	// Subscribe then unsubscribe — poll should stop.
 	id, _ := bus.Subscribe()
@@ -315,7 +315,7 @@ func TestEventBusPollLoopStopsAfterLastUnsubscribe(t *testing.T) {
 // goroutine discovers new fs_events rows and signals subscribers via Publish.
 func TestEventBusPollLoopSignalsCrossPodEvents(t *testing.T) {
 	store := newTestStoreForEventBus(t)
-	bus := NewEventBus(store)
+	bus := NewEventBus("test-tenant", store)
 
 	// Insert an initial event so pollLast initializes to it.
 	if _, err := store.InsertFSEvent(context.Background(), "/init.txt", "write", "", time.Now().UnixMilli()); err != nil {

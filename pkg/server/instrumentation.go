@@ -178,7 +178,8 @@ func metricEvent(ctx context.Context, event string, labels ...string) {
 	if m == nil {
 		return
 	}
-	m.recordEvent(event, labels...)
+	tenantID, _, _ := requestMetricScope(ctx)
+	m.recordEvent(tenantID, event, labels...)
 }
 
 type serverMetrics struct {
@@ -203,8 +204,8 @@ func (m *serverMetrics) record(method, route string, status int, d time.Duration
 	metrics.RecordHTTPRequest(method, route, status, d)
 }
 
-func (m *serverMetrics) recordEvent(event string, labels ...string) {
-	metrics.RecordEvent(event, labels...)
+func (m *serverMetrics) recordEvent(tenantID, event string, labels ...string) {
+	metrics.RecordTenantEvent(tenantID, event, labels...)
 }
 
 func (m *serverMetrics) writePrometheus(w http.ResponseWriter) {

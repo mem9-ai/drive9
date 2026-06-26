@@ -23,7 +23,7 @@ func TestFallbackImageTextExtractorPropagatesPrimaryError(t *testing.T) {
 	fallback := &countingImageExtractor{text: "basic text"}
 	e := NewFallbackImageTextExtractor(primary, fallback)
 
-	_, _, err := e.ExtractImageText(context.Background(), ImageExtractRequest{FileID: "f1", Path: "/img/a.png"})
+	_, _, err := e.ExtractImageText(context.Background(), ImageExtractRequest{TenantID: "test-tenant", FileID: "f1", Path: "/img/a.png"})
 	if !errors.Is(err, primaryErr) {
 		t.Fatalf("expected primary error to propagate, got %v", err)
 	}
@@ -37,7 +37,7 @@ func TestFallbackImageTextExtractorUsesPrimaryText(t *testing.T) {
 	fallback := &countingImageExtractor{text: "basic text"}
 	e := NewFallbackImageTextExtractor(primary, fallback)
 
-	text, _, err := e.ExtractImageText(context.Background(), ImageExtractRequest{FileID: "f1", Path: "/img/a.png"})
+	text, _, err := e.ExtractImageText(context.Background(), ImageExtractRequest{TenantID: "test-tenant", FileID: "f1", Path: "/img/a.png"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestFallbackImageTextExtractorFallsBackOnEmptyPrimaryText(t *testing.T) {
 	fallback := &countingImageExtractor{text: "basic text"}
 	e := NewFallbackImageTextExtractor(primary, fallback)
 
-	text, _, err := e.ExtractImageText(context.Background(), ImageExtractRequest{FileID: "f1", Path: "/img/a.png"})
+	text, _, err := e.ExtractImageText(context.Background(), ImageExtractRequest{TenantID: "test-tenant", FileID: "f1", Path: "/img/a.png"})
 	if err != nil {
 		t.Fatal(err)
 	}

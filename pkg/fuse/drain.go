@@ -19,7 +19,6 @@ type drainError struct {
 	err  error
 }
 
-const fuseSyncFSProtocolMinor = 34
 const drainPendingWorkKind = "pending_work_remaining"
 
 func (e *drainError) Error() string {
@@ -176,12 +175,20 @@ func (fs *Dat9FS) populateNativeSyncFSSupport(resp *mountcontrol.DrainResponse) 
 		return
 	}
 	settings := fs.server.KernelSettings()
-	if settings == nil {
-		return
+	if settings != nil {
+		resp.FUSEProtocolMajor = settings.Major
+		resp.FUSEProtocolMinor = settings.Minor
 	}
-	resp.FUSEProtocolMajor = settings.Major
-	resp.FUSEProtocolMinor = settings.Minor
-	resp.NativeSyncFSSupported = settings.SupportsVersion(7, fuseSyncFSProtocolMinor)
+	// Linux kernels can advertise protocol support for FUSE_SYNCFS without
+	// dispatching syncfs(2) to userspace for this mount. Treat native syncfs as
+	// unsupported until the daemon observes a real SyncFs request; otherwise the
+	// control-plane drain response would falsely promise that `sync -f` flushes
+	// open Drive9 handles.
+	resp.NativeSyncFSSupported = fs.nativeSyncFSObserved()
+}
+
+func (fs *Dat9FS) nativeSyncFSObserved() bool {
+	return fs != nil && fs.nativeSyncFSSeen.Load()
 }
 
 func (fs *Dat9FS) mountPointForDrain() string {
@@ -350,6 +357,7 @@ func (fs *Dat9FS) SyncFs(cancel <-chan struct{}, header *gofuse.InHeader) gofuse
 	perfStart := fs.perfStart()
 	status := gofuse.OK
 	defer func() { fs.perfRecordFuse(perfFuseSyncFs, perfStart, status, 0) }()
+	fs.nativeSyncFSSeen.Store(true)
 
 	ctx, cf := fuseCtx(cancel)
 	defer cf()

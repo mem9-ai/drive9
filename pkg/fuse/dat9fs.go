@@ -105,6 +105,10 @@ type Dat9FS struct {
 	// drainMu serializes explicit mount drain and SyncFs requests so they
 	// cannot flush the same dirty handle concurrently.
 	drainMu sync.Mutex
+	// nativeSyncFSSeen is set after the daemon receives a real FUSE SYNCFS
+	// request. Protocol minor >= 7.34 alone is not enough: some Linux FUSE
+	// mounts negotiate that version but never dispatch syncfs(2) to userspace.
+	nativeSyncFSSeen atomic.Bool
 
 	// lookupStatRetry* counters track only the Lookup->Stat retry path so
 	// operators can distinguish absorbed interrupt noise from exhausted retries
@@ -1916,6 +1920,30 @@ func (fs *Dat9FS) lockRemoteCommitPath(path string) func() {
 
 	lock.Lock()
 	return lock.Unlock
+}
+
+// tryLockRemoteCommitPath attempts to acquire the per-path remote commit
+// lock without blocking. Returns (unlock, true) on success, (nil, false) if
+// the lock is already held.
+func (fs *Dat9FS) tryLockRemoteCommitPath(path string) (func(), bool) {
+	if fs == nil || path == "" {
+		return func() {}, true
+	}
+	fs.remoteCommitMu.Lock()
+	if fs.remoteCommitLocks == nil {
+		fs.remoteCommitLocks = make(map[string]*sync.Mutex)
+	}
+	lock := fs.remoteCommitLocks[path]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		fs.remoteCommitLocks[path] = lock
+	}
+	fs.remoteCommitMu.Unlock()
+
+	if lock.TryLock() {
+		return lock.Unlock, true
+	}
+	return nil, false
 }
 
 func (fs *Dat9FS) adoptCommittedRevisionLocked(fh *FileHandle) {
@@ -5785,15 +5813,57 @@ func (fs *Dat9FS) lockWritableRemoteCommitPath(p string) func() {
 	if fs == nil || p == "" {
 		return func() {}
 	}
+	var timeout time.Duration
+	if fs.opts != nil {
+		timeout = fs.opts.RemoteCommitWaitTimeout
+	}
+	deadline := time.Now().Add(timeout)
 	for {
+		if timeout > 0 && time.Now().After(deadline) {
+			// Proceeding after timeout trades per-path commit ordering for
+			// forward progress. The in-flight background commit may land on
+			// the backend after this newer write, causing a last-writer-wins
+			// inversion (stale overwrite). This is an accepted tradeoff: a
+			// hung FUSE daemon is strictly worse than a potential lost update,
+			// and the timeout is long enough (default 5s) that genuine commits
+			// should normally drain before it fires.
+			//
+			// CRITICAL: before proceeding, cancel any in-flight commit for this
+			// path and clean up its shadow/pending state. Without this, the old
+			// commit's onCommitSuccess cleanup (shadowStore.Remove + pendingIndex.Remove)
+			// would delete the newer writer's staged data after it stages — a
+			// silent data-loss bug. Canceling the old entry first ensures its
+			// cleanup runs (or has already run) before the new writer stages.
+			fs.debugf("lockWritableRemoteCommitPath: timeout (%s) waiting for %s, canceling in-flight and proceeding", timeout, p)
+			if fs.commitQueue != nil {
+				fs.commitQueue.CancelPath(p)
+				// Wait briefly for the worker to acknowledge cancellation and
+				// exit in-flight state. The worker checks isEntryCanceled before
+				// onCommitSuccess cleanup (skipping cleanup if canceled), so a
+				// short wait here ensures the old entry's cleanup (which could
+				// remove shadow/pending data) has either run or been skipped
+				// before we proceed to stage new data.
+				fs.commitQueue.WaitPathTimeout(p, 100*time.Millisecond)
+			}
+			unlock, ok := fs.tryLockRemoteCommitPath(p)
+			if ok {
+				return unlock
+			}
+			fs.debugf("lockWritableRemoteCommitPath: per-path lock still held for %s, proceeding without lock", p)
+			return func() {}
+		}
 		if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
-			fs.commitQueue.WaitPath(p)
+			if !fs.commitQueue.WaitPathTimeout(p, 50*time.Millisecond) {
+				continue // timed out this poll, recheck deadline on next loop
+			}
 			continue
 		}
 		unlockRemoteCommit := fs.lockRemoteCommitPath(p)
 		if fs.commitQueue != nil && fs.commitQueue.HasPath(p) {
 			unlockRemoteCommit()
-			fs.commitQueue.WaitPath(p)
+			if !fs.commitQueue.WaitPathTimeout(p, 50*time.Millisecond) {
+				continue
+			}
 			continue
 		}
 		return unlockRemoteCommit

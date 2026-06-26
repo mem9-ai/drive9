@@ -18,6 +18,7 @@ import (
 
 // ImageExtractRequest is the input to a pluggable image->text extractor.
 type ImageExtractRequest struct {
+	TenantID    string
 	FileID      string
 	Path        string
 	ContentType string
@@ -94,7 +95,7 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 		return ImageExtractResultRuntimeNotConfigured, fmt.Errorf("async image extract runtime not configured")
 	}
 	if b.monthlyLLMCostExceededCheck(ctx) {
-		metrics.RecordOperation("llm_cost_budget", "process_skip", "budget_exhausted", 0)
+		metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "process_skip", "budget_exhausted", 0)
 		return ImageExtractResultBudgetExhausted, nil
 	}
 
@@ -132,6 +133,7 @@ func (b *Dat9Backend) ProcessImageExtractTask(ctx context.Context, task ImageExt
 
 	taskCtx, cancel := context.WithTimeout(ctx, b.imageExtractTimeout)
 	text, imageUsage, err := b.imageExtractor.ExtractImageText(taskCtx, ImageExtractRequest{
+		TenantID:    b.tenantID,
 		FileID:      task.FileID,
 		Path:        task.Path,
 		ContentType: ct,

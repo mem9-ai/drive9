@@ -36,10 +36,11 @@ func (b *Dat9Backend) recordImageExtractUsage(taskID string, usage ImageExtractU
 	if !b.UseServerQuota() {
 		if err := b.store.InsertLLMUsage("img_extract_text", taskID, cost, totalTokens, "tokens"); err != nil {
 			logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
+				zap.String("tenant_id", b.tenantID),
 				zap.String("task_type", "img_extract_text"),
 				zap.String("task_id", taskID),
 				zap.Error(err))
-			metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
+			metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "usage_insert", "error", 0)
 		}
 	}
 	b.syncCentralLLMCostRecord(backgroundWithTrace(), "img_extract_text", taskID, cost, totalTokens, "tokens")
@@ -70,10 +71,11 @@ func (b *Dat9Backend) recordAudioExtractUsage(taskID string, usage AudioExtractU
 	if !b.UseServerQuota() {
 		if err := b.store.InsertLLMUsage("audio_extract_text", taskID, cost, rawUnits, rawUnitType); err != nil {
 			logger.Warn(backgroundWithTrace(), "llm_usage_insert_failed",
+				zap.String("tenant_id", b.tenantID),
 				zap.String("task_type", "audio_extract_text"),
 				zap.String("task_id", taskID),
 				zap.Error(err))
-			metrics.RecordOperation("llm_cost_budget", "usage_insert", "error", 0)
+			metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "usage_insert", "error", 0)
 		}
 	}
 	b.syncCentralLLMCostRecord(backgroundWithTrace(), "audio_extract_text", taskID, cost, rawUnits, rawUnitType)
@@ -113,8 +115,8 @@ func (b *Dat9Backend) monthlyLLMCostExceeded() bool {
 	}
 	total, err := b.store.MonthlyLLMCostMillicents()
 	if err != nil {
-		logger.Warn(backgroundWithTrace(), "llm_cost_budget_check_fail_open", zap.Error(err))
-		metrics.RecordOperation("llm_cost_budget", "quota_check", "fail_open", 0)
+		logger.Warn(backgroundWithTrace(), "llm_cost_budget_check_fail_open", zap.String("tenant_id", b.tenantID), zap.Error(err))
+		metrics.RecordTenantOperation(b.tenantID, "llm_cost_budget", "quota_check", "fail_open", 0)
 		return false
 	}
 	return total > b.maxMonthlyLLMCostMillicents

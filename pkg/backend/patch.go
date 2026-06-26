@@ -148,44 +148,44 @@ func appendDirtyPartNumbers(baseSize int64, newSize int64, partSize int64) []int
 func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path string, newSize int64, dirtyParts []int, clientPartSize int64, expectedRevision int64) (*PatchPlan, error) {
 	start := time.Now()
 	if err := b.ensureUploadSizeAllowed(newSize); err != nil {
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, err
 	}
 	if err := b.ensureFileSizeQuota(ctx, newSize); err != nil {
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, err
 	}
 
 	path, err := pathutil.Canonicalize(path)
 	if err != nil {
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, err
 	}
 	if err := rejectRootFileNodePath(path); err != nil {
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, err
 	}
 	if b.s3 == nil {
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, ErrS3NotConfigured
 	}
 
 	// Look up existing file to get its S3 key
 	nf, err := b.store.Stat(ctx, path)
 	if err != nil {
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("stat existing file: %w", err)
 	}
 	if nf.File == nil || nf.File.StorageType != datastore.StorageS3 {
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("%w: %s", ErrNotS3Stored, path)
 	}
 	if expectedRevision == 0 {
-		metrics.RecordOperation("backend", "patch_upload", "conflict", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "conflict", time.Since(start))
 		return nil, datastore.ErrRevisionConflict
 	}
 	if expectedRevision > 0 && nf.File.Revision != expectedRevision {
-		metrics.RecordOperation("backend", "patch_upload", "conflict", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "conflict", time.Since(start))
 		return nil, datastore.ErrRevisionConflict
 	}
 
@@ -200,12 +200,12 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 		partSize = s3client.PartSize
 	}
 	if partSize > s3client.MaxPartSize {
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("part_size %d exceeds S3 per-part limit of %d", partSize, s3client.MaxPartSize)
 	}
 	newParts := s3client.CalcParts(newSize, partSize)
 	if len(newParts) > MaxMultipartParts {
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("part_size %d produces %d parts for size %d, exceeds S3 limit of %d", partSize, len(newParts), newSize, MaxMultipartParts)
 	}
 
@@ -220,8 +220,8 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	// the presigned URL does not sign it — causing S3 403/400.  See #555.
 	mpu, err := b.s3.CreateMultipartUpload(ctx, newS3Key, s3client.ChecksumAlgoNone, encOpts)
 	if err != nil {
-		logger.Error(ctx, "backend_patch_upload_create_mpu_failed", zap.String("path", path), zap.Error(err))
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		logger.Error(ctx, "backend_patch_upload_create_mpu_failed", zap.String("tenant_id", b.tenantID), zap.String("path", path), zap.Error(err))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("create multipart upload: %w", err)
 	}
 
@@ -256,8 +256,8 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			_, err := b.s3.UploadPartCopy(ctx, newS3Key, mpu.UploadID, p.Number, sourceKey, partStart, partEnd)
 			if err != nil {
 				_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
-				logger.Error(ctx, "backend_patch_upload_copy_failed", zap.String("path", path), zap.Int("part", p.Number), zap.Error(err))
-				metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+				logger.Error(ctx, "backend_patch_upload_copy_failed", zap.String("tenant_id", b.tenantID), zap.String("path", path), zap.Int("part", p.Number), zap.Error(err))
+				metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 				return nil, fmt.Errorf("copy part %d: %w", p.Number, err)
 			}
 			plan.CopiedParts = append(plan.CopiedParts, p.Number)
@@ -266,8 +266,8 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			u, err := b.s3.PresignUploadPart(ctx, newS3Key, mpu.UploadID, p.Number, p.Size, s3client.ChecksumAlgoNone, "", s3client.UploadTTL)
 			if err != nil {
 				_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
-				logger.Error(ctx, "backend_patch_upload_presign_failed", zap.String("path", path), zap.Int("part", p.Number), zap.Error(err))
-				metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+				logger.Error(ctx, "backend_patch_upload_presign_failed", zap.String("tenant_id", b.tenantID), zap.String("path", path), zap.Int("part", p.Number), zap.Error(err))
+				metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 				return nil, fmt.Errorf("presign part %d: %w", p.Number, err)
 			}
 
@@ -289,7 +289,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 				}
 				readURL, err := b.s3.PresignGetObjectRange(ctx, sourceKey, partStart, partEnd, s3client.DownloadTTL)
 				if err != nil {
-					logger.Warn(ctx, "backend_patch_upload_presign_read_failed", zap.String("path", path), zap.Int("part", p.Number), zap.Error(err))
+					logger.Warn(ctx, "backend_patch_upload_presign_read_failed", zap.String("tenant_id", b.tenantID), zap.String("path", path), zap.Int("part", p.Number), zap.Error(err))
 					// Non-fatal: client can still upload the full part without merging
 				} else {
 					pup.ReadURL = readURL
@@ -314,7 +314,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 	reserved, err := b.reserveUploadOnServer(ctx, uploadID, path, newSize, 0)
 	if err != nil {
 		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
-		metrics.RecordOperation("backend", "patch_upload", "quota_exceeded", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "quota_exceeded", time.Since(start))
 		return nil, err
 	}
 
@@ -328,7 +328,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			b.abortUploadReservation(ctx, uploadID, newSize)
 		}
 		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, fmt.Errorf("lookup active upload for %s: %w", path, err)
 	}
 	if existing != nil {
@@ -337,7 +337,7 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 				b.abortUploadReservation(ctx, uploadID, newSize)
 			}
 			_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
-			metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+			metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 			return nil, fmt.Errorf("supersede active upload for %s: %w", path, err)
 		}
 	}
@@ -383,15 +383,15 @@ func (b *Dat9Backend) InitiatePatchUploadIfRevision(ctx context.Context, path st
 			b.abortUploadReservation(ctx, uploadID, newSize)
 		}
 		_ = b.s3.AbortMultipartUpload(ctx, newS3Key, mpu.UploadID)
-		logger.Error(ctx, "backend_patch_upload_insert_upload_failed", zap.String("path", path), zap.Error(err))
-		metrics.RecordOperation("backend", "patch_upload", "error", time.Since(start))
+		logger.Error(ctx, "backend_patch_upload_insert_upload_failed", zap.String("tenant_id", b.tenantID), zap.String("path", path), zap.Error(err))
+		metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "error", time.Since(start))
 		return nil, err
 	}
 
 	plan.UploadID = uploadID
-	metrics.RecordOperation("backend", "patch_upload", "ok", time.Since(start))
+	metrics.RecordTenantOperation(b.tenantID, "backend", "patch_upload", "ok", time.Since(start))
 
-	logger.Info(ctx, "backend_patch_upload_initiated",
+	logger.Info(ctx, "backend_patch_upload_initiated", zap.String("tenant_id", b.tenantID),
 		zap.String("path", path),
 		zap.Int64("new_size", newSize),
 		zap.Int("total_parts", len(newParts)),
