@@ -2062,13 +2062,13 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(text, `drive9_http_inflight_requests{route="/v1/fs/*"} 0.000000`) {
 		t.Fatalf("expected route-scoped inflight metric in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_service_operations_total{component="backend",operation="exec_sql",result="ok",tenant_id="local"}`) {
+	if !strings.Contains(text, `drive9_service_operations_total{component="backend",operation="exec_sql",result="ok"}`) {
 		t.Fatalf("expected backend service metric in response: %s", text)
 	}
 	if !strings.Contains(text, `drive9_http_request_duration_seconds_bucket{method="GET",route="/v1/fs/*",le="0.1"}`) {
 		t.Fatalf("expected http duration histogram bucket in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_service_operation_duration_seconds_bucket{component="backend",operation="exec_sql",result="ok",tenant_id="local",le="0.01"}`) {
+	if !strings.Contains(text, `drive9_service_operation_duration_seconds_bucket{component="backend",operation="exec_sql",result="ok",le="0.01"}`) {
 		t.Fatalf("expected service operation histogram bucket in response: %s", text)
 	}
 	if !strings.Contains(text, `drive9_db_operations_total{operation="`) || !strings.Contains(text, `role="user"`) {
@@ -2100,10 +2100,10 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(text, `drive9_tenant_file_bytes_total{action="read",direction="read",surface="fs",tenant_id="local"}`) {
 		t.Fatalf("expected tenant file read byte metric in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_business_events_total{event="fs_write",result="ok"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="fs_write",result="ok",tenant_id="local"}`) {
 		t.Fatalf("expected fs_write tenant event metric in response: %s", text)
 	}
-	if !strings.Contains(text, `drive9_business_events_total{event="fs_read",result="ok"}`) {
+	if !strings.Contains(text, `drive9_business_events_total{event="fs_read",result="ok",tenant_id="local"}`) {
 		t.Fatalf("expected fs_read tenant event metric in response: %s", text)
 	}
 	if !strings.Contains(text, `drive9_business_events_total{event="tenant_provision",result="error"}`) {
