@@ -546,6 +546,22 @@ func (cq *CommitQueue) WaitPath(path string) {
 	}
 }
 
+// WaitPathTimeout is like WaitPath but returns false if the path is still
+// busy after pollInterval. Returns true immediately if the path is idle.
+// Callers should use this in a loop with their own deadline to bound wait time.
+func (cq *CommitQueue) WaitPathTimeout(path string, pollInterval time.Duration) bool {
+	cq.mu.Lock()
+	cq.forceDelayedPathLocked(path)
+	_, inflight := cq.inFlight[path]
+	queued := cq.hasQueuedPathLocked(path)
+	cq.mu.Unlock()
+	if !inflight && !queued {
+		return true
+	}
+	time.Sleep(pollInterval)
+	return false
+}
+
 // HasPath reports whether a path is queued or currently in flight.
 func (cq *CommitQueue) HasPath(path string) bool {
 	if cq == nil {
@@ -951,6 +967,18 @@ func (cq *CommitQueue) commitOne(entry *CommitEntry) {
 		cancel()
 
 		if err == nil {
+			// Check if the entry was canceled while the upload was in flight.
+			// If canceled, skip onCommitSuccess entirely — its path-scoped
+			// cleanup (shadowStore.Remove + pendingIndex.Remove) would delete
+			// a newer writer's staged data. The upload already succeeded on the
+			// backend, so we just clean up the queue entry without touching
+			// local shadow/pending state.
+			if cq.isEntryCanceled(entry) {
+				unlockPath()
+				cq.removeFromQueue(entry)
+				log.Printf("commit queue: entry for %s was canceled after upload succeeded, skipping cleanup to preserve newer staged data", entry.Path)
+				return
+			}
 			if err := cq.onCommitSuccess(entry, entry.BaseRev, committedRev); err == nil {
 				unlockPath()
 				return
@@ -1248,7 +1276,20 @@ func (cq *CommitQueue) onCommitSuccess(entry *CommitEntry, expectedRevision, com
 		})
 		cancel()
 		if err != nil {
-			return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
+			// Chmod is a best-effort metadata operation. The file data has
+			// already been uploaded successfully. Under concurrent writes to
+			// the same file, the server may have already moved to a newer
+			// revision (or the file may have been replaced), causing the chmod
+			// to fail with "not found". Treating this as a terminal failure
+			// blocks the commit queue path indefinitely and stalls all
+			// subsequent FUSE operations on that path. Instead, log the warning
+			// and proceed — the mode will be applied by the next successful
+			// commit for this path.
+			if client.IsNotFound(err) {
+				log.Printf("commit queue: post-upload chmod not found for %s (concurrent write likely replaced it); proceeding without mode update", entry.Path)
+			} else {
+				return fmt.Errorf("%w: chmod %s to %o: %w", errCommitPostUpload, entry.Path, mode, err)
+			}
 		}
 	}
 
