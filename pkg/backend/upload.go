@@ -1142,56 +1142,56 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			if err := enqueueUploadSemanticTasks(tx, quotaMediaDelta(oldIsMedia, newIsMedia)); err != nil {
 				return err
 			}
-			return enqueueUploadCompleteOutbox(tx)
-		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if expectedRevision > 0 {
-			return datastore.ErrRevisionConflict
-		}
-
-		if b.UsesDatabaseAutoEmbedding() {
-			stepStart = time.Now()
-			if err := b.store.ConfirmPendingFileAutoEmbeddingTx(tx,
-				upload.FileID, datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize, upload.Description,
-			); err != nil {
-				return err
-			}
-			confirmPendingFileDurationMs = uploadPhaseMs(stepStart)
 		} else {
-			stepStart = time.Now()
-			if err := b.store.ConfirmPendingFileTx(tx,
-				upload.FileID, datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize, upload.Description,
-			); err != nil {
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
-			confirmPendingFileDurationMs = uploadPhaseMs(stepStart)
-		}
-		confirmedFileID = upload.FileID
-		confirmedRevision = 1
-		stepStart = time.Now()
-		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
-			NodeID:     b.genID(),
-			Path:       upload.TargetPath,
-			ParentPath: pathutil.ParentPath(upload.TargetPath),
-			Name:       pathutil.BaseName(upload.TargetPath),
-			FileID:     upload.FileID,
-			CreatedAt:  time.Now(),
-		}); err != nil {
-			if expectedRevision >= 0 && errors.Is(err, datastore.ErrPathConflict) {
+			if expectedRevision > 0 {
 				return datastore.ErrRevisionConflict
 			}
-			return err
-		}
-		insertNodeDurationMs = uploadPhaseMs(stepStart)
-		if tags != nil {
-			if err := b.store.ReplaceFileTagsTx(tx, upload.FileID, tags); err != nil {
+
+			if b.UsesDatabaseAutoEmbedding() {
+				stepStart = time.Now()
+				if err := b.store.ConfirmPendingFileAutoEmbeddingTx(tx,
+					upload.FileID, datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize, upload.Description,
+				); err != nil {
+					return err
+				}
+				confirmPendingFileDurationMs = uploadPhaseMs(stepStart)
+			} else {
+				stepStart = time.Now()
+				if err := b.store.ConfirmPendingFileTx(tx,
+					upload.FileID, datastore.StorageS3, upload.S3Key, contentType, upload.TotalSize, upload.Description,
+				); err != nil {
+					return err
+				}
+				confirmPendingFileDurationMs = uploadPhaseMs(stepStart)
+			}
+			confirmedFileID = upload.FileID
+			confirmedRevision = 1
+			stepStart = time.Now()
+			if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
+				NodeID:     b.genID(),
+				Path:       upload.TargetPath,
+				ParentPath: pathutil.ParentPath(upload.TargetPath),
+				Name:       pathutil.BaseName(upload.TargetPath),
+				FileID:     upload.FileID,
+				CreatedAt:  time.Now(),
+			}); err != nil {
+				if expectedRevision >= 0 && errors.Is(err, datastore.ErrPathConflict) {
+					return datastore.ErrRevisionConflict
+				}
 				return err
 			}
-		}
-		if err := enqueueUploadSemanticTasks(tx, quotaMediaDelta(false, newIsMedia)); err != nil {
-			return err
+			insertNodeDurationMs = uploadPhaseMs(stepStart)
+			if tags != nil {
+				if err := b.store.ReplaceFileTagsTx(tx, upload.FileID, tags); err != nil {
+					return err
+				}
+			}
+			if err := enqueueUploadSemanticTasks(tx, quotaMediaDelta(false, newIsMedia)); err != nil {
+				return err
+			}
 		}
 		return enqueueUploadCompleteOutbox(tx)
 	}); err != nil {
