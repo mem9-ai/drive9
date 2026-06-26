@@ -1436,7 +1436,7 @@ func TestAdminTenantPoolReplenishSkipsDeletedOrShrunkPool(t *testing.T) {
 	}
 }
 
-func TestAdminTenantPoolUpdateQuotaOnlyDoesNotResize(t *testing.T) {
+func TestAdminTenantPoolUpdateRequiresPoolSize(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
 		Clusters: []tenant.CloudClusterInfo{{
@@ -1460,14 +1460,13 @@ func TestAdminTenantPoolUpdateQuotaOnlyDoesNotResize(t *testing.T) {
 	ts := httptest.NewServer(rt.server)
 	t.Cleanup(ts.Close)
 	resp := patchJSON(t, ts.URL+"/v1/admin/tenant-pool", map[string]any{
-		"public_key":               "public-1",
-		"private_key":              "private-1",
-		"tidbcloud_spending_limit": 9000,
+		"public_key":  "public-1",
+		"private_key": "private-1",
 	}, "")
 	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusAccepted {
+	if resp.StatusCode != http.StatusBadRequest {
 		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+		t.Fatalf("status = %d, want 400 body=%s", resp.StatusCode, body)
 	}
 	if got := rt.prov.batchPoolCalls.Load(); got != 0 {
 		t.Fatalf("batch pool calls = %d, want 0", got)
@@ -1476,21 +1475,19 @@ func TestAdminTenantPoolUpdateQuotaOnlyDoesNotResize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get pool: %v", err)
 	}
-	if pool.Size != 2 || pool.SpendingLimit == nil || *pool.SpendingLimit != 9000 {
-		t.Fatalf("pool = %#v, want size 2 and spending limit 9000", pool)
+	if pool.Size != 2 {
+		t.Fatalf("pool size = %d, want 2", pool.Size)
 	}
 }
 
-func TestAdminTenantPoolReplenishUsesStoredSpendingLimit(t *testing.T) {
+func TestAdminTenantPoolReplenishUsesDefaultSpendingLimit(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	limit := int64(7000)
 	pool := &meta.TenantPool{
 		PoolID:         "pool-1",
 		OrganizationID: "org-1",
 		Size:           1,
-		SpendingLimit:  &limit,
 		Status:         meta.TenantPoolActive,
 		CreatedAt:      now,
 		UpdatedAt:      now,
@@ -1508,8 +1505,8 @@ func TestAdminTenantPoolReplenishUsesStoredSpendingLimit(t *testing.T) {
 	if got := rt.prov.batchPoolCalls.Load(); got != 1 {
 		t.Fatalf("batch pool calls = %d, want 1", got)
 	}
-	if rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly == nil || *rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly != limit {
-		t.Fatalf("replenish spending limit = %#v, want %d", rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly, limit)
+	if rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly != nil {
+		t.Fatalf("replenish spending limit = %#v, want nil", rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly)
 	}
 }
 

@@ -250,7 +250,6 @@ type TenantPool struct {
 	PoolID         string
 	OrganizationID string
 	Size           int
-	SpendingLimit  *int64
 	Status         TenantPoolStatus
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
@@ -570,7 +569,6 @@ func metaInitSchemaStatements() []string {
 			pool_id         VARCHAR(64) PRIMARY KEY,
 			organization_id VARCHAR(64) NULL,
 			size            INT NOT NULL,
-			spending_limit  BIGINT NULL,
 			status          VARCHAR(20) NOT NULL DEFAULT 'active',
 			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 			updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -1364,9 +1362,6 @@ func (s *Store) CreateTenantPool(ctx context.Context, p *TenantPool) (err error)
 	if p.Size < 0 {
 		return fmt.Errorf("pool size must be non-negative")
 	}
-	if p.SpendingLimit != nil && *p.SpendingLimit < 0 {
-		return fmt.Errorf("spending limit must be non-negative")
-	}
 	now := time.Now().UTC()
 	createdAt := p.CreatedAt
 	if createdAt.IsZero() {
@@ -1377,9 +1372,9 @@ func (s *Store) CreateTenantPool(ctx context.Context, p *TenantPool) (err error)
 		updatedAt = now
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_tidbcloud_pools
-		(pool_id, organization_id, size, spending_limit, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		poolID, nullStr(strings.TrimSpace(p.OrganizationID)), p.Size, nullableInt64(p.SpendingLimit), tenantPoolStatusForInsert(p.Status),
+		(pool_id, organization_id, size, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		poolID, nullStr(strings.TrimSpace(p.OrganizationID)), p.Size, tenantPoolStatusForInsert(p.Status),
 		createdAt.UTC(), updatedAt.UTC())
 	if isDuplicateEntry(err) {
 		return ErrDuplicate
@@ -1394,7 +1389,7 @@ func (s *Store) GetTenantPoolByOrganization(ctx context.Context, organizationID 
 	if organizationID == "" {
 		return nil, fmt.Errorf("organization_id is required")
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT pool_id, organization_id, size, spending_limit, status, created_at, updated_at
+	row := s.db.QueryRowContext(ctx, `SELECT pool_id, organization_id, size, status, created_at, updated_at
 		FROM tenant_tidbcloud_pools WHERE organization_id = ?`, organizationID)
 	return scanTenantPoolRow(row)
 }
@@ -1406,7 +1401,7 @@ func (s *Store) GetTenantPoolByID(ctx context.Context, poolID string) (out *Tena
 	if poolID == "" {
 		return nil, fmt.Errorf("pool_id is required")
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT pool_id, organization_id, size, spending_limit, status, created_at, updated_at
+	row := s.db.QueryRowContext(ctx, `SELECT pool_id, organization_id, size, status, created_at, updated_at
 		FROM tenant_tidbcloud_pools WHERE pool_id = ?`, poolID)
 	return scanTenantPoolRow(row)
 }
@@ -1570,32 +1565,6 @@ func (s *Store) UpdateTenantPoolSize(ctx context.Context, poolID string, size in
 		return fmt.Errorf("pool size must be non-negative")
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE tenant_tidbcloud_pools SET size = ?, updated_at = ? WHERE pool_id = ?`, size, time.Now().UTC(), poolID)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func (s *Store) UpdateTenantPoolSettings(ctx context.Context, poolID string, size *int, spendingLimit *int64) (err error) {
-	start := time.Now()
-	defer observeMeta(ctx, "update_tidbcloud_pool_settings", start, &err)
-	poolID = strings.TrimSpace(poolID)
-	if poolID == "" {
-		return fmt.Errorf("pool_id is required")
-	}
-	if size != nil && *size < 0 {
-		return fmt.Errorf("pool size must be non-negative")
-	}
-	if spendingLimit != nil && *spendingLimit < 0 {
-		return fmt.Errorf("spending limit must be non-negative")
-	}
-	res, err := s.db.ExecContext(ctx, `UPDATE tenant_tidbcloud_pools
-		SET size = COALESCE(?, size), spending_limit = COALESCE(?, spending_limit), updated_at = ?
-		WHERE pool_id = ?`, nullableInt(size), nullableInt64(spendingLimit), time.Now().UTC(), poolID)
 	if err != nil {
 		return err
 	}
@@ -3027,8 +2996,7 @@ func tenantPoolStatusForInsert(status TenantPoolStatus) TenantPoolStatus {
 func scanTenantPoolRow(row tenantBindingScanner) (*TenantPool, error) {
 	var rec TenantPool
 	var orgID sql.NullString
-	var spendingLimit sql.NullInt64
-	if err := row.Scan(&rec.PoolID, &orgID, &rec.Size, &spendingLimit, &rec.Status, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+	if err := row.Scan(&rec.PoolID, &orgID, &rec.Size, &rec.Status, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -3036,10 +3004,6 @@ func scanTenantPoolRow(row tenantBindingScanner) (*TenantPool, error) {
 	}
 	if orgID.Valid {
 		rec.OrganizationID = orgID.String
-	}
-	if spendingLimit.Valid {
-		v := spendingLimit.Int64
-		rec.SpendingLimit = &v
 	}
 	return &rec, nil
 }
@@ -3053,20 +3017,6 @@ func nullStr(v string) any {
 		return nil
 	}
 	return v
-}
-
-func nullableInt(v *int) any {
-	if v == nil {
-		return nil
-	}
-	return *v
-}
-
-func nullableInt64(v *int64) any {
-	if v == nil {
-		return nil
-	}
-	return *v
 }
 
 func nullableBytes(v []byte) any {

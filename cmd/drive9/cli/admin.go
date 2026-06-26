@@ -469,7 +469,7 @@ func adminTenantPool(args []string) error {
 }
 
 func adminTenantPoolCreate(args []string) error {
-	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolCreateUsage(), true, true)
+	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolCreateUsage(), true)
 	if err != nil {
 		if errors.Is(err, errHelpRequested{}) {
 			return nil
@@ -487,7 +487,7 @@ func adminTenantPoolCreate(args []string) error {
 }
 
 func adminTenantPoolGet(args []string) error {
-	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolGetUsage(), false, false)
+	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolGetUsage(), false)
 	if err != nil {
 		if errors.Is(err, errHelpRequested{}) {
 			return nil
@@ -502,7 +502,7 @@ func adminTenantPoolGet(args []string) error {
 }
 
 func adminTenantPoolUpdate(args []string) error {
-	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolUpdateUsage(), true, true)
+	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolUpdateUsage(), true)
 	if err != nil {
 		if errors.Is(err, errHelpRequested{}) {
 			return nil
@@ -520,7 +520,7 @@ func adminTenantPoolUpdate(args []string) error {
 }
 
 func adminTenantPoolDelete(args []string) error {
-	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolDeleteUsage(), false, false)
+	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolDeleteUsage(), false)
 	if err != nil {
 		if errors.Is(err, errHelpRequested{}) {
 			return nil
@@ -534,7 +534,7 @@ func adminTenantPoolDelete(args []string) error {
 	return printAdminTenantPoolResponse(out, asJSON)
 }
 
-func parseAdminTenantPoolCommand(args []string, usage string, allowPoolSize, allowSpendingLimit bool) (req client.AdminTenantPoolRequest, server string, asJSON bool, err error) {
+func parseAdminTenantPoolCommand(args []string, usage string, allowPoolSize bool) (req client.AdminTenantPoolRequest, server string, asJSON bool, err error) {
 	serverFlag := ""
 	serverGiven := false
 	regionCodeFlag := ""
@@ -592,19 +592,6 @@ func parseAdminTenantPoolCommand(args []string, usage string, allowPoolSize, all
 			poolSize := int(v)
 			req.PoolSize = &poolSize
 			poolSizeGiven = true
-		case "--tidbcloud-spending-limit":
-			if !allowSpendingLimit {
-				return req, "", false, fmt.Errorf("unknown flag %q\n%s", args[i], usage)
-			}
-			if i+1 >= len(args) {
-				return req, "", false, fmt.Errorf("--tidbcloud-spending-limit requires an argument")
-			}
-			i++
-			v, parseErr := parseNonNegativeQuotaInt64Flag("--tidbcloud-spending-limit", args[i])
-			if parseErr != nil {
-				return req, "", false, parseErr
-			}
-			req.TiDBCloudSpendingLimit = &v
 		case "--json":
 			asJSON = true
 		default:
@@ -928,7 +915,6 @@ flags:
   --pool-size N                    pool target free tenant count
   --tidbcloud-public-key KEY       TiDB Cloud public key
   --tidbcloud-private-key KEY      TiDB Cloud private key
-  --tidbcloud-spending-limit N     create/update TiDB Cloud Cluster Spending Limit for new pool clusters
   --json                           output result as JSON
 
 examples:
@@ -960,7 +946,6 @@ flags:
   --pool-size N                    number of free tenants to pre-create; must be positive
   --tidbcloud-public-key KEY       TiDB Cloud public key
   --tidbcloud-private-key KEY      TiDB Cloud private key
-  --tidbcloud-spending-limit N     TiDB Cloud Cluster Spending Limit for pool clusters
   --json                           output result as JSON`
 }
 
@@ -989,7 +974,6 @@ flags:
   --pool-size N                    target free tenant count; must be positive
   --tidbcloud-public-key KEY       TiDB Cloud public key
   --tidbcloud-private-key KEY      TiDB Cloud private key
-  --tidbcloud-spending-limit N     TiDB Cloud Cluster Spending Limit for newly-created pool clusters
   --json                           output result as JSON`
 }
 

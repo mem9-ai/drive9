@@ -138,8 +138,11 @@ func TestAdminTenantPoolCreatePrintsTable(t *testing.T) {
 		if body["public_key"] != "public-1" || body["private_key"] != "private-1" {
 			t.Fatalf("body credentials = %#v", body)
 		}
-		if body["pool_size"] != float64(3) || body["tidbcloud_spending_limit"] != float64(10000) {
+		if body["pool_size"] != float64(3) {
 			t.Fatalf("body pool fields = %#v", body)
+		}
+		if _, ok := body["tidbcloud_spending_limit"]; ok {
+			t.Fatalf("body should not contain tidbcloud_spending_limit: %#v", body)
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"pool_id":         "pool-1",
@@ -156,7 +159,6 @@ func TestAdminTenantPoolCreatePrintsTable(t *testing.T) {
 			"pool", "create",
 			"--server", ts.URL,
 			"--pool-size", "3",
-			"--tidbcloud-spending-limit", "10000",
 			"--tidbcloud-public-key", "public-1",
 			"--tidbcloud-private-key", "private-1",
 		})

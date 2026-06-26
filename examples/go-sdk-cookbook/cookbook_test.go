@@ -263,10 +263,9 @@ func ExampleClient_quota() {
 
 	poolSize := 10
 	_, _ = credentialClient.AdminCreateTenantPool(ctx, drive9.AdminTenantPoolRequest{
-		PublicKey:              tidbCloudPublicKey,
-		PrivateKey:             tidbCloudPrivateKey,
-		PoolSize:               &poolSize,
-		TiDBCloudSpendingLimit: &spendingLimit,
+		PublicKey:  tidbCloudPublicKey,
+		PrivateKey: tidbCloudPrivateKey,
+		PoolSize:   &poolSize,
 	})
 	pool, err := credentialClient.AdminGetTenantPool(ctx, drive9.AdminTenantPoolRequest{
 		PublicKey:  tidbCloudPublicKey,
@@ -278,10 +277,9 @@ func ExampleClient_quota() {
 	}
 	updatedPoolSize := 20
 	_, _ = credentialClient.AdminUpdateTenantPool(ctx, drive9.AdminTenantPoolRequest{
-		PublicKey:              tidbCloudPublicKey,
-		PrivateKey:             tidbCloudPrivateKey,
-		PoolSize:               &updatedPoolSize,
-		TiDBCloudSpendingLimit: &spendingLimit,
+		PublicKey:  tidbCloudPublicKey,
+		PrivateKey: tidbCloudPrivateKey,
+		PoolSize:   &updatedPoolSize,
 	})
 	_, _ = credentialClient.AdminDeleteTenantPool(ctx, drive9.AdminTenantPoolRequest{
 		PublicKey:  tidbCloudPublicKey,
