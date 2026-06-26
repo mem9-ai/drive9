@@ -19047,8 +19047,9 @@ func TestRmdirSucceedsAfterUnlinkWithStaleRemoteList(t *testing.T) {
 
 	// Simulate the file being unlinked: RemoveLinkPreserve marks the inode
 	// as Unlinked=true while keeping the inode alive for open handles.
-	// This is what Unlink() does after a successful remote delete.
+	// The real Unlink handler also records a delete tombstone.
 	fs.inodes.RemoveLinkPreserve("/dir/stale.txt")
+	fs.markPathDeleted("/dir/stale.txt")
 
 	// Rmdir: NodeId=1 (root) is the parent, "dir" is the child to remove.
 	// Should proceed to DELETE despite the stale remote listing.

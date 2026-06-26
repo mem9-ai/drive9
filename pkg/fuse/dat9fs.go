@@ -4987,27 +4987,6 @@ func (fs *Dat9FS) hasKnownLocalDirectoryChildren(dirPath string) bool {
 	return false
 }
 
-// collectLocallyUnlinkedPaths returns a set of direct child paths of dirPath
-// whose inodes are marked Unlinked. These are entries the client has already
-// deleted locally but the backend may not have propagated the deletion yet.
-func (fs *Dat9FS) collectLocallyUnlinkedPaths(dirPath string) map[string]struct{} {
-	unlinked := make(map[string]struct{})
-	for _, entry := range fs.inodes.Snapshot() {
-		if !entry.Unlinked {
-			continue
-		}
-		for p := range entry.Paths {
-			if isDirectChildPath(dirPath, p) {
-				unlinked[p] = struct{}{}
-			}
-		}
-		if isDirectChildPath(dirPath, entry.Path) {
-			unlinked[entry.Path] = struct{}{}
-		}
-	}
-	return unlinked
-}
-
 // markPathDeleted records a delete tombstone for the given path. This is
 // called by the Unlink handler after a successful remote delete, so that
 // remoteDirectoryHasChildren can filter out stale backend listings during
@@ -5023,7 +5002,16 @@ func (fs *Dat9FS) markPathDeleted(path string) {
 		fs.deletedPaths = make(map[string]time.Time)
 	}
 	fs.deletedPaths[path] = time.Now()
-	// Lazy GC: prune expired tombstones to bound memory.
+	// Threshold-triggered GC: prune expired tombstones every 100 writes
+	// to avoid O(n) per-call overhead during bulk deletes (rm -rf).
+	if len(fs.deletedPaths)%100 == 0 {
+		fs.pruneExpiredDeletedPathsLocked()
+	}
+}
+
+// pruneExpiredDeletedPathsLocked removes tombstones past their TTL.
+// Caller must hold deletedPathsMu.
+func (fs *Dat9FS) pruneExpiredDeletedPathsLocked() {
 	now := time.Now()
 	for p, ts := range fs.deletedPaths {
 		if now.Sub(ts) > deletedPathTTL {
@@ -5057,26 +5045,25 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 	if err != nil {
 		return false, err
 	}
-	// Filter out entries that the local inode state knows are already
-	// unlinked. This handles eventual-consistency lag where a just-deleted
-	// file still appears in the remote listing, which would cause Rmdir to
-	// incorrectly return ENOTEMPTY for a directory the client knows is empty.
-	unlinkedPaths := fs.collectLocallyUnlinkedPaths(dirPath)
+	// Filter out entries that have active delete tombstones. This handles
+	// eventual-consistency lag where a just-deleted file still appears in
+	// the remote listing, which would cause Rmdir to incorrectly return
+	// ENOTEMPTY for a directory the client knows is empty.
+	//
+	// Tombstones are recorded by Unlink/Rmdir after a successful remote
+	// delete and cover both the RemoveLink (no open handles, inode fully
+	// removed) and RemoveLinkPreserve (open handles, inode retained with
+	// Unlinked=true) cases. Using tombstones exclusively avoids O(n) full
+	// inode table scans per remoteDirectoryHasChildren call.
 	deletedTombstones := fs.snapshotDeletedPaths()
 	liveItems := make([]client.FileInfo, 0, len(items))
 	for _, item := range items {
 		if !validDirEntryName(item.Name) {
 			continue
 		}
-		// Build child path the same way childPath() does (string concat).
-		// pkg/pathutil doesn't have a Join helper; this pattern is used
-		// consistently throughout dat9fs.go for FUSE-internal paths.
 		childP := dirPath + "/" + item.Name
 		if dirPath == "/" {
 			childP = "/" + item.Name
-		}
-		if _, isUnlinked := unlinkedPaths[childP]; isUnlinked {
-			continue // locally known-deleted (RemoveLinkPreserve), skip
 		}
 		if _, isTombstoned := deletedTombstones[childP]; isTombstoned {
 			continue // recently deleted (tombstone), skip
@@ -7661,6 +7648,9 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 					case <-ctx.Done():
 						status = gofuse.Status(syscall.EINTR)
 						return status
+					case <-cancel:
+						status = gofuse.Status(syscall.EINTR)
+						return status
 					}
 					hasChildren, listErr := fs.remoteDirectoryHasChildren(ctx, childP)
 					if listErr != nil || !hasChildren {
@@ -7714,6 +7704,9 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 					select {
 					case <-time.After(500 * time.Millisecond):
 					case <-ctx.Done():
+						status = gofuse.Status(syscall.EINTR)
+						return status
+					case <-cancel:
 						status = gofuse.Status(syscall.EINTR)
 						return status
 					}
