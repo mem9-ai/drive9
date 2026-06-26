@@ -11616,7 +11616,7 @@ func TestStatFs_ReportsVirtualCapacity(t *testing.T) {
 	}
 }
 
-func TestXAttr_GetReturnsENOATTR(t *testing.T) {
+func TestXAttr_GetMissingReturnsENOATTR(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://localhost"), opts)
@@ -11627,39 +11627,306 @@ func TestXAttr_GetReturnsENOATTR(t *testing.T) {
 	}
 }
 
-func TestXAttr_ListReturnsEmpty(t *testing.T) {
+func TestXAttr_SetGetRoundTrip(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
 
-	n, st := fs.ListXAttr(nil, &gofuse.InHeader{NodeId: 1}, nil)
-	if st != gofuse.OK {
-		t.Fatalf("ListXAttr status = %v, want OK", st)
-	}
-	if n != 0 {
-		t.Fatalf("ListXAttr size = %d, want 0", n)
-	}
-}
-
-func TestXAttr_SetDiscardsSilently(t *testing.T) {
-	opts := &MountOptions{}
-	opts.setDefaults()
-	fs := NewDat9FS(newTestClient("http://localhost"), opts)
-
-	st := fs.SetXAttr(nil, &gofuse.SetXAttrIn{}, "user.test", []byte("val"))
+	st := fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.test", []byte("hello"))
 	if st != gofuse.OK {
 		t.Fatalf("SetXAttr status = %v, want OK", st)
 	}
+
+	n, st := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", nil)
+	if st != gofuse.OK {
+		t.Fatalf("GetXAttr status = %v, want OK", st)
+	}
+	if n != 5 {
+		t.Fatalf("GetXAttr size = %d, want 5", n)
+	}
+
+	dest := make([]byte, 16)
+	n, st = fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", dest)
+	if st != gofuse.OK {
+		t.Fatalf("GetXAttr status = %v, want OK", st)
+	}
+	if string(dest[:n]) != "hello" {
+		t.Fatalf("GetXAttr value = %q, want %q", string(dest[:n]), "hello")
+	}
 }
 
-func TestXAttr_RemoveReturnsENOATTR(t *testing.T) {
+func TestXAttr_ListReturnsSetAttrs(t *testing.T) {
 	opts := &MountOptions{}
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
 
-	st := fs.RemoveXAttr(nil, &gofuse.InHeader{NodeId: 1}, "user.test")
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.foo", []byte("1"))
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.bar", []byte("2"))
+
+	n, st := fs.ListXAttr(nil, &gofuse.InHeader{NodeId: ino}, nil)
+	if st != gofuse.OK {
+		t.Fatalf("ListXAttr status = %v, want OK", st)
+	}
+	// Two names, each null-terminated.
+	expectedSize := len("user.foo") + 1 + len("user.bar") + 1
+	if n != uint32(expectedSize) {
+		t.Fatalf("ListXAttr size = %d, want %d", n, expectedSize)
+	}
+
+	dest := make([]byte, expectedSize)
+	n, st = fs.ListXAttr(nil, &gofuse.InHeader{NodeId: ino}, dest)
+	if st != gofuse.OK {
+		t.Fatalf("ListXAttr status = %v, want OK", st)
+	}
+	// Verify both names appear in the null-separated output.
+	names := strings.Split(strings.TrimRight(string(dest[:n]), "\x00"), "\x00")
+	if !contains(names, "user.foo") || !contains(names, "user.bar") {
+		t.Fatalf("ListXAttr names = %v, want both user.foo and user.bar", names)
+	}
+}
+
+func TestXAttr_RemoveWorks(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
+
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.test", []byte("val"))
+
+	st := fs.RemoveXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test")
+	if st != gofuse.OK {
+		t.Fatalf("RemoveXAttr status = %v, want OK", st)
+	}
+
+	_, st = fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", nil)
+	if st != gofuse.ENOATTR {
+		t.Fatalf("GetXAttr after remove status = %v, want ENOATTR", st)
+	}
+}
+
+func TestXAttr_RemoveMissingReturnsENOATTR(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
+
+	st := fs.RemoveXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test")
 	if st != gofuse.ENOATTR {
 		t.Fatalf("RemoveXAttr status = %v, want ENOATTR", st)
+	}
+}
+
+func TestXAttr_GetReturnsERANGEWhenDestTooSmall(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
+
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.test", []byte("hello world"))
+
+	dest := make([]byte, 3)
+	n, st := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", dest)
+	if st != gofuse.Status(syscall.ERANGE) {
+		t.Fatalf("GetXAttr status = %v, want ERANGE", st)
+	}
+	if n != 11 {
+		t.Fatalf("GetXAttr size = %d, want 11", n)
+	}
+}
+
+func contains(slice []string, s string) bool {
+	for _, item := range slice {
+		if item == s {
+			return true
+		}
+	}
+	return false
+}
+
+func TestXAttr_RenameMigratesXattrs(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/old.txt", false, 0, time.Now())
+	oldIno, _ := fs.inodes.GetInode("/old.txt")
+
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: oldIno}}, "user.test", []byte("hello"))
+
+	// Rename the file — xattrs should migrate to the new path.
+	fs.xattrs.Rename("/old.txt", "/new.txt")
+
+	// Old path should have no xattrs.
+	_, st := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: oldIno}, "user.test", nil)
+	if st != gofuse.ENOATTR {
+		t.Errorf("GetXAttr on old path status = %v, want ENOATTR", st)
+	}
+
+	// New path should have the xattr.
+	fs.inodes.Lookup("/new.txt", false, 0, time.Now())
+	newIno, _ := fs.inodes.GetInode("/new.txt")
+	n, st := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: newIno}, "user.test", nil)
+	if st != gofuse.OK {
+		t.Errorf("GetXAttr on new path status = %v, want OK", st)
+	}
+	if n != 5 {
+		t.Errorf("GetXAttr on new path size = %d, want 5", n)
+	}
+}
+
+func TestXAttr_SetXAttrCreateFlagFailsIfExists(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
+
+	// Set initial value.
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.test", []byte("first"))
+
+	// XATTR_CREATE should fail (EEXIST) since attr already exists.
+	st := fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}, Flags: 1}, "user.test", []byte("second"))
+	if st != gofuse.Status(syscall.EEXIST) {
+		t.Errorf("SetXAttr with XATTR_CREATE on existing attr status = %v, want EEXIST", st)
+	}
+
+	// Value should be unchanged.
+	dest := make([]byte, 16)
+	n, _ := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", dest)
+	if string(dest[:n]) != "first" {
+		t.Errorf("value after failed CREATE = %q, want 'first'", string(dest[:n]))
+	}
+}
+
+func TestXAttr_SetXAttrReplaceFlagFailsIfMissing(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
+
+	// XATTR_REPLACE should fail (ENODATA) since attr doesn't exist.
+	st := fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}, Flags: 2}, "user.test", []byte("val"))
+	if st != gofuse.Status(syscall.ENODATA) {
+		t.Errorf("SetXAttr with XATTR_REPLACE on missing attr status = %v, want ENODATA", st)
+	}
+
+	// Set then replace — should succeed.
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.test", []byte("first"))
+	st = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}, Flags: 2}, "user.test", []byte("replaced"))
+	if st != gofuse.OK {
+		t.Errorf("SetXAttr with XATTR_REPLACE on existing attr status = %v, want OK", st)
+	}
+	dest := make([]byte, 16)
+	n, _ := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", dest)
+	if string(dest[:n]) != "replaced" {
+		t.Errorf("value after REPLACE = %q, want 'replaced'", string(dest[:n]))
+	}
+}
+
+func TestXAttr_RemoveAllCleansChildren(t *testing.T) {
+	store := NewXAttrStore()
+	store.Set("/dir", "user.dir", []byte("d"))
+	store.Set("/dir/file.txt", "user.file", []byte("f"))
+	store.Set("/dir/sub/inner.txt", "user.inner", []byte("i"))
+
+	// RemoveAll on "/dir" should clear itself and all children.
+	store.RemoveAll("/dir")
+
+	if _, ok := store.Get("/dir", "user.dir"); ok {
+		t.Errorf("xattr on /dir still exists after RemoveAll")
+	}
+	if _, ok := store.Get("/dir/file.txt", "user.file"); ok {
+		t.Errorf("xattr on /dir/file.txt still exists after RemoveAll")
+	}
+	if _, ok := store.Get("/dir/sub/inner.txt", "user.inner"); ok {
+		t.Errorf("xattr on /dir/sub/inner.txt still exists after RemoveAll")
+	}
+}
+
+func TestXAttr_RenameMigratesSubtree(t *testing.T) {
+	store := NewXAttrStore()
+	store.Set("/old", "user.top", []byte("t"))
+	store.Set("/old/child.txt", "user.child", []byte("c"))
+	store.Set("/old/sub/grand.txt", "user.grand", []byte("g"))
+
+	store.Rename("/old", "/new")
+
+	if _, ok := store.Get("/old", "user.top"); ok {
+		t.Errorf("xattr on /old still exists after Rename")
+	}
+	if _, ok := store.Get("/old/child.txt", "user.child"); ok {
+		t.Errorf("xattr on /old/child.txt still exists after Rename")
+	}
+	if v, ok := store.Get("/new", "user.top"); !ok || string(v) != "t" {
+		t.Errorf("xattr not migrated to /new")
+	}
+	if v, ok := store.Get("/new/child.txt", "user.child"); !ok || string(v) != "c" {
+		t.Errorf("xattr not migrated to /new/child.txt")
+	}
+	if v, ok := store.Get("/new/sub/grand.txt", "user.grand"); !ok || string(v) != "g" {
+		t.Errorf("xattr not migrated to /new/sub/grand.txt")
+	}
+}
+
+func TestXAttr_RameNoOpPreservesXattrs(t *testing.T) {
+	// Rename to the same path should be a no-op — xattrs must survive.
+	store := NewXAttrStore()
+	store.Set("/file.txt", "user.test", []byte("hello"))
+
+	store.Rename("/file.txt", "/file.txt")
+
+	if v, ok := store.Get("/file.txt", "user.test"); !ok || string(v) != "hello" {
+		t.Errorf("xattr lost after no-op Rename: ok=%v val=%q", ok, v)
+	}
+}
+
+func TestXAttr_RenameOverExistingClearsDestinationXattrs(t *testing.T) {
+	// POSIX rename replaces the destination object. Stale xattrs from the
+	// old destination must not remain visible on the new object.
+	store := NewXAttrStore()
+	// Destination has xattrs; source does not.
+	store.Set("/dst", "user.old", []byte("stale"))
+	store.Set("/dst/child.txt", "user.child", []byte("stale_child"))
+
+	// Rename /src -> /dst (source has no xattrs).
+	store.Rename("/src", "/dst")
+
+	// /dst should have NO xattrs (source had none, destination's were cleared).
+	if _, ok := store.Get("/dst", "user.old"); ok {
+		t.Errorf("stale xattr on /dst survived rename-over-existing")
+	}
+	// /dst/child.txt should also be gone (destination subtree cleared).
+	if _, ok := store.Get("/dst/child.txt", "user.child"); ok {
+		t.Errorf("stale xattr on /dst/child.txt survived rename-over-existing")
+	}
+}
+
+func TestXAttr_RenameOverExistingReplacesDestinationXattrs(t *testing.T) {
+	// Both source and destination have xattrs — source wins.
+	store := NewXAttrStore()
+	store.Set("/dst", "user.old", []byte("stale"))
+	store.Set("/src", "user.new", []byte("fresh"))
+
+	store.Rename("/src", "/dst")
+
+	// Source's xattr should be on destination.
+	if v, ok := store.Get("/dst", "user.new"); !ok || string(v) != "fresh" {
+		t.Errorf("source xattr not migrated to destination: ok=%v val=%q", ok, v)
+	}
+	// Old destination xattr should be gone.
+	if _, ok := store.Get("/dst", "user.old"); ok {
+		t.Errorf("stale destination xattr survived rename-over-existing")
+	}
+	// Old source path should be empty.
+	if _, ok := store.Get("/src", "user.new"); ok {
+		t.Errorf("xattr still on old source path after rename")
 	}
 }
 
