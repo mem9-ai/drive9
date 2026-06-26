@@ -7635,7 +7635,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		if len(entries) > 0 {
 			// Remote/overlay listing shows children. If the local inode state
 			// is empty, the listing may be stale (eventual-consistency lag on
-			// just-completed Unlinks). Poll for up to 5 seconds, using
+			// just-completed Unlinks). Poll for up to 2 seconds (4 × 500ms), using
 			// remoteDirectoryHasChildren (which filters locally-unlinked entries)
 			// instead of listDir (which doesn't filter).
 			if !fs.hasKnownLocalDirectoryChildren(childP) {
@@ -7679,7 +7679,7 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 		// This avoids widening the uninterruptible wait surface for rmdir.
 		// Now check the remote listing. If it still shows children, it's
 		// either a real child (not locally known) or eventual-consistency lag.
-		// Poll for up to 5 seconds (10 × 500ms) when the local state is empty,
+		// Poll for up to 2 seconds (4 × 500ms) when the local state is empty,
 		// giving the backend time to propagate recent deletes.
 		hasChildren, err := fs.remoteDirectoryHasChildren(ctx, childP)
 		if err == nil && hasChildren {
