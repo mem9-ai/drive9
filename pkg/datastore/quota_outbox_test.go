@@ -110,6 +110,124 @@ func TestQuotaOutboxRecoverExpired(t *testing.T) {
 	if !found || reclaimed.ID != claimed.ID {
 		t.Fatalf("reclaimed row = %+v found=%v, want id %d", reclaimed, found, claimed.ID)
 	}
+	if err := s.AckQuotaOutbox(ctx, claimed.ID, claimed.Receipt); err != ErrQuotaOutboxLeaseMismatch {
+		t.Fatalf("ack recovered row with old receipt error = %v, want lease mismatch", err)
+	}
+}
+
+func TestQuotaOutboxAckAllowsExpiredLeaseWhenReceiptStillOwned(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	id, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       "file-1",
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		AvailableAt:  now.Add(-time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := s.ClaimQuotaOutbox(ctx, now, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || claimed.ID != id {
+		t.Fatalf("claimed = %+v found=%v, want id %d", claimed, found, id)
+	}
+
+	if err := s.AckQuotaOutbox(ctx, claimed.ID, claimed.Receipt); err != nil {
+		t.Fatalf("ack expired-but-owned quota outbox: %v", err)
+	}
+	var status QuotaOutboxStatus
+	if err := s.DB().QueryRowContext(ctx, `SELECT status FROM quota_outbox WHERE id = ?`, id).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != QuotaOutboxSucceeded {
+		t.Fatalf("status = %q, want %q", status, QuotaOutboxSucceeded)
+	}
+}
+
+func TestQuotaOutboxBatchAckAllowsExpiredLeaseWhenReceiptStillOwned(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	availableNow := now.Add(-time.Second)
+
+	firstID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       "file-1",
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		AvailableAt:  availableNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       "file-2",
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"file-2"}`),
+		AvailableAt:  availableNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := s.ClaimQuotaOutboxBatch(ctx, now, time.Millisecond, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 2 || claimed[0].ID != firstID || claimed[1].ID != secondID {
+		t.Fatalf("claimed = %+v, want ids %d,%d", claimed, firstID, secondID)
+	}
+	if err := s.InTx(ctx, func(tx *sql.Tx) error {
+		return s.AckQuotaOutboxBatchTx(ctx, tx, claimed)
+	}); err != nil {
+		t.Fatalf("batch ack expired-but-owned quota outbox: %v", err)
+	}
+	var succeeded int
+	if err := s.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox WHERE status = ?`, QuotaOutboxSucceeded).Scan(&succeeded); err != nil {
+		t.Fatal(err)
+	}
+	if succeeded != 2 {
+		t.Fatalf("succeeded rows = %d, want 2", succeeded)
+	}
+}
+
+func TestQuotaOutboxRetryAllowsExpiredLeaseWhenReceiptStillOwned(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	id, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       "file-1",
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		AvailableAt:  now.Add(-time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := s.ClaimQuotaOutbox(ctx, now, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || claimed.ID != id {
+		t.Fatalf("claimed = %+v found=%v, want id %d", claimed, found, id)
+	}
+
+	retryAt := now.Add(time.Minute)
+	if err := s.RetryQuotaOutbox(ctx, claimed.ID, claimed.Receipt, retryAt, "temporary"); err != nil {
+		t.Fatalf("retry expired-but-owned quota outbox: %v", err)
+	}
+	var status QuotaOutboxStatus
+	if err := s.DB().QueryRowContext(ctx, `SELECT status FROM quota_outbox WHERE id = ?`, id).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != QuotaOutboxQueued {
+		t.Fatalf("status = %q, want %q", status, QuotaOutboxQueued)
+	}
 }
 
 func TestQuotaOutboxClaimWaitsForDelayedOlderRetry(t *testing.T) {
