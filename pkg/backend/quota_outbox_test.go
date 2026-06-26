@@ -500,7 +500,7 @@ func TestUploadCompleteOutboxRetryAfterCentralApplyDoesNotDoubleCharge(t *testin
 	if recovered != 1 {
 		t.Fatalf("recovered rows = %d, want 1", recovered)
 	}
-	retryEntry, found, err := b.store.ClaimQuotaOutbox(ctx, recoverAt, quotaOutboxLeaseDuration)
+	retryEntry, found, err := b.store.ClaimQuotaOutbox(ctx, recoverAt.Add(time.Second), quotaOutboxLeaseDuration)
 	if err != nil {
 		t.Fatalf("reclaim upload complete: %v", err)
 	}

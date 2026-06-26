@@ -1056,6 +1056,15 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
 		quotaOutboxEnqueued = false
+		oldStorageRef = ""
+		oldStorageType = ""
+		oldContentType = ""
+		isOverwrite = false
+		oldSizeBytes = 0
+		oldIsMedia = false
+		confirmedFileID = ""
+		confirmedRevision = 0
+		branch = "create"
 		stepStart := time.Now()
 		if err := b.store.CompleteUploadTx(tx, uploadID); err != nil {
 			return err
