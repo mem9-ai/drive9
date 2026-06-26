@@ -118,7 +118,7 @@ func TestQuotaOutboxRecoverExpired(t *testing.T) {
 func TestQuotaOutboxAckAllowsExpiredLeaseWhenReceiptStillOwned(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Microsecond)
+	now := time.Now().UTC().Add(-time.Second).Truncate(time.Microsecond)
 
 	id, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
 		FileID:       "file-1",
@@ -152,7 +152,7 @@ func TestQuotaOutboxAckAllowsExpiredLeaseWhenReceiptStillOwned(t *testing.T) {
 func TestQuotaOutboxBatchAckAllowsExpiredLeaseWhenReceiptStillOwned(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Microsecond)
+	now := time.Now().UTC().Add(-time.Second).Truncate(time.Microsecond)
 	availableNow := now.Add(-time.Second)
 
 	firstID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
@@ -198,7 +198,7 @@ func TestQuotaOutboxBatchAckAllowsExpiredLeaseWhenReceiptStillOwned(t *testing.T
 func TestQuotaOutboxRetryAllowsExpiredLeaseWhenReceiptStillOwned(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()
-	now := time.Now().UTC().Truncate(time.Microsecond)
+	now := time.Now().UTC().Add(-time.Second).Truncate(time.Microsecond)
 
 	id, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
 		FileID:       "file-1",
