@@ -85,11 +85,7 @@ func RecordTenantGauge(tenantID, component, name string, value float64) {
 	name = cleanMetricValue(name, "unknown")
 	tenantID = cleanMetricValue(tenantID, "unknown")
 	RegisterModule(component)
-	if tenantID != "unknown" {
-		serviceGauge.Set(value, Attr("component", component), Attr("name", name), Attr("tenant_id", tenantID))
-	} else {
-		serviceGauge.Set(value, Attr("component", component), Attr("name", name))
-	}
+	serviceGauge.Set(value, Attr("component", component), Attr("name", name), Attr("tenant_id", tenantID))
 }
 
 func RecordHTTPRequest(method, route string, status int, d time.Duration) {
