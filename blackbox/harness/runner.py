@@ -529,7 +529,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--bootstrap", action="store_true", help="Prepare dependencies into a work-dir, then exit. Use --work-dir to reuse later.")
     parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS or 1.")
     parser.add_argument("--server-mode", choices=["auto", "existing", "local"], default=env_value("SERVER_MODE", "auto", ""))
-    parser.add_argument("--drive9-cli", default=env_value("DRIVE9_CLI", "", ""))
+    parser.add_argument("--drive9-cli", required=True, help="Path to the drive9 CLI binary. Required.")
     parser.add_argument("--work-dir", default=env_value("WORK_DIR", "", ""), help="Isolated working directory for cache/tmp/results. Defaults to BLACKBOX_WORK_DIR.")
     parser.add_argument("--out-dir", default=env_value("OUT_DIR", "", ""))
     parser.add_argument("--session", default=env_value("SESSION", "", ""))

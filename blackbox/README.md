@@ -54,45 +54,46 @@ Group definitions in `suites/groups.json` map group names to module ID patterns.
 
 ## Commands
 
-All commands use `python3 blackbox/run.py` directly — no Makefile targets needed.
+All commands use `python3 blackbox/run.py` directly. `--drive9-cli` is required
+(it specifies the path to the drive9 CLI binary).
 
 ```bash
+# List available modules
+python3 blackbox/run.py --list --drive9-cli ./bin/drive9
+python3 blackbox/run.py --list --drive9-cli ./bin/drive9 --format json
+
 # Run all modules
-python3 blackbox/run.py --all
+python3 blackbox/run.py --all --drive9-cli ./bin/drive9
 
 # Run a single module
-python3 blackbox/run.py --module community.pjdfstest
+python3 blackbox/run.py --module community.pjdfstest --drive9-cli ./bin/drive9
 
 # Run a group
-python3 blackbox/run.py --group perf
+python3 blackbox/run.py --group perf --drive9-cli ./bin/drive9
 
 # Run by category prefix
-python3 blackbox/run.py --category drive9.workflow
-
-# List available modules
-python3 blackbox/run.py --list
-python3 blackbox/run.py --list --format json
+python3 blackbox/run.py --category drive9.workflow --drive9-cli ./bin/drive9
 
 # Bootstrap: prepare dependencies, then exit
-python3 blackbox/run.py --all --bootstrap --work-dir /tmp/bb
+python3 blackbox/run.py --all --bootstrap --drive9-cli ./bin/drive9 --work-dir /tmp/bb
 
 # Reuse the work-dir for a real run
-python3 blackbox/run.py --all --work-dir /tmp/bb
+python3 blackbox/run.py --all --drive9-cli ./bin/drive9 --work-dir /tmp/bb
 
 # Prepare dependencies only (no setup/run)
-python3 blackbox/run.py --all --deps-only --work-dir /tmp/bb
+python3 blackbox/run.py --all --deps-only --drive9-cli ./bin/drive9 --work-dir /tmp/bb
 
 # Performance runs
-python3 blackbox/run.py --module community.fio --runs 3
+python3 blackbox/run.py --module community.fio --drive9-cli ./bin/drive9 --runs 3
 
 # Strict prerequisites (fail if FUSE unavailable instead of skipping)
-python3 blackbox/run.py --all --strict-prereqs
+python3 blackbox/run.py --all --drive9-cli ./bin/drive9 --strict-prereqs
 
 # Offline mode (no auto-fetch of dependencies)
-python3 blackbox/run.py --all --offline
+python3 blackbox/run.py --all --drive9-cli ./bin/drive9 --offline
 
 # Custom server mode
-python3 blackbox/run.py --all --server-mode existing
+python3 blackbox/run.py --all --drive9-cli ./bin/drive9 --server-mode existing
 ```
 
 ## Module Structure
@@ -172,7 +173,6 @@ work-dir, keeping the repo tree clean. Use `--work-dir` to specify; defaults to
 | `BLACKBOX_WORK_DIR` | `blackbox/work/<session>` | Work directory for cache/tmp/results |
 | `BLACKBOX_RUNS` | `1` | Performance run count |
 | `SERVER_MODE` | `auto` | Server mode: `auto`, `existing`, `local` |
-| `DRIVE9_CLI` | (auto-detect) | Path to drive9 CLI binary |
 | `OFFLINE` | `false` | Disable auto-fetch of dependencies |
 | `STRICT` | `false` | Fail on missing prerequisites instead of skipping |
 | `KEEP_ARTIFACTS` | `false` | Keep module artifacts after run |
