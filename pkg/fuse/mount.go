@@ -470,14 +470,26 @@ func Mount(opts *MountOptions) error {
 	// thread consumes the last GOMAXPROCS slot, leaving no thread to handle
 	// the POLL request from the kernel).
 	if err := server.WaitMount(); err != nil {
-		stopWatchers()
+		cleanupMountStartFailure(mountStartCleanup{
+			reason:       "fuse wait mount failure",
+			mountPoint:   opts.MountPoint,
+			stopWatchers: stopWatchers,
+			flushAll:     dat9fs.FlushAll,
+			unmount:      server.Unmount,
+			forceUnmount: forceUnmount,
+		})
 		return fmt.Errorf("fuse wait mount: %w", err)
 	}
 	controlServer, err := startMountControlServer(opts.MountPoint, dat9fs)
 	if err != nil {
-		stopWatchers()
-		dat9fs.FlushAll()
-		_ = server.Unmount()
+		cleanupMountStartFailure(mountStartCleanup{
+			reason:       "mount control socket failure",
+			mountPoint:   opts.MountPoint,
+			stopWatchers: stopWatchers,
+			flushAll:     dat9fs.FlushAll,
+			unmount:      server.Unmount,
+			forceUnmount: forceUnmount,
+		})
 		return fmt.Errorf("start mount control socket: %w", err)
 	}
 	if controlServer != nil {
@@ -519,9 +531,17 @@ func Mount(opts *MountOptions) error {
 		ControlSocket:       controlServer.SocketPath(),
 	})
 	if err != nil {
-		stopWatchers()
-		dat9fs.FlushAll()
-		_ = server.Unmount()
+		if controlServer != nil {
+			controlServer.Close()
+		}
+		cleanupMountStartFailure(mountStartCleanup{
+			reason:       "mount process state failure",
+			mountPoint:   opts.MountPoint,
+			stopWatchers: stopWatchers,
+			flushAll:     dat9fs.FlushAll,
+			unmount:      server.Unmount,
+			forceUnmount: forceUnmount,
+		})
 		return fmt.Errorf("write mount pid file: %w", err)
 	}
 	defer func() {
@@ -653,6 +673,37 @@ func Mount(opts *MountOptions) error {
 	server.Wait()
 	shutdown()
 	return nil
+}
+
+type mountStartCleanup struct {
+	reason       string
+	mountPoint   string
+	stopWatchers func()
+	flushAll     func()
+	unmount      func() error
+	forceUnmount func(string)
+}
+
+func cleanupMountStartFailure(cleanup mountStartCleanup) {
+	if cleanup.stopWatchers != nil {
+		cleanup.stopWatchers()
+	}
+	if cleanup.flushAll != nil {
+		cleanup.flushAll()
+	}
+	if cleanup.unmount == nil {
+		return
+	}
+	if err := cleanup.unmount(); err != nil {
+		reason := strings.TrimSpace(cleanup.reason)
+		if reason == "" {
+			reason = "mount start failure"
+		}
+		fmt.Fprintf(os.Stderr, "drive9: cleanup after %s: unmount failed: %v\n", reason, err)
+		if cleanup.forceUnmount != nil && strings.TrimSpace(cleanup.mountPoint) != "" {
+			cleanup.forceUnmount(cleanup.mountPoint)
+		}
+	}
 }
 
 func validateMountOptionsProfile(opts *MountOptions) error {
