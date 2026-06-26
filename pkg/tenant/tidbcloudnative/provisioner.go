@@ -928,7 +928,7 @@ func ensureDatabase(ctx context.Context, user, password, host string, port int, 
 	cfg.ParseTime = true
 	cfg.TLSConfig = "true"
 	if usePrivate, _ := parseBoolEnv(EnvTiDBCloudNativeUsePrivateEndpoint); usePrivate {
-		cfg.TLSConfig = "false"
+		cfg.TLSConfig = "skip-verify"
 	}
 	db, err := sql.Open("mysql", cfg.FormatDSN())
 	if err != nil {
