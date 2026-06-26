@@ -18992,15 +18992,15 @@ func TestRmdirRejectsRemoteChildBeforeDelete(t *testing.T) {
 
 	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
 	if st != gofuse.Status(syscall.ENOTEMPTY) {
-		t.Fatalf("Rmdir status = %v, want ENOTEMPTY", st)
+		t.Errorf("Rmdir status = %v, want ENOTEMPTY", st)
 	}
 	// With the retry logic, if the local inode state knows about the child,
 	// Rmdir returns ENOTEMPTY immediately without a remote list call.
 	if got := listCalls.Load(); got != 0 {
-		t.Fatalf("remote list calls = %d, want 1", got)
+		t.Errorf("remote list calls = %d, want 0", got)
 	}
 	if got := deleteCalls.Load(); got != 0 {
-		t.Fatalf("remote delete calls = %d, want 0", got)
+		t.Errorf("remote delete calls = %d, want 0", got)
 	}
 }
 
@@ -19054,10 +19054,10 @@ func TestRmdirSucceedsAfterUnlinkWithStaleRemoteList(t *testing.T) {
 	// Should proceed to DELETE despite the stale remote listing.
 	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
 	if st != gofuse.OK {
-		t.Fatalf("Rmdir status = %v, want OK (stale remote entry should be ignored)", st)
+		t.Errorf("Rmdir status = %v, want OK (stale remote entry should be ignored)", st)
 	}
 	if got := deleteCalls.Load(); got != 1 {
-		t.Fatalf("remote delete calls = %d, want 1", got)
+		t.Errorf("remote delete calls = %d, want 1", got)
 	}
 }
 
@@ -19103,10 +19103,10 @@ func TestRmdirSucceedsAfterFullUnlinkWithStaleRemoteList(t *testing.T) {
 
 	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
 	if st != gofuse.OK {
-		t.Fatalf("Rmdir status = %v, want OK (should succeed after retry when remote clears)", st)
+		t.Errorf("Rmdir status = %v, want OK (should succeed after retry when remote clears)", st)
 	}
 	if got := deleteCalls.Load(); got != 1 {
-		t.Fatalf("remote delete calls = %d, want 1", got)
+		t.Errorf("remote delete calls = %d, want 1", got)
 	}
 }
 

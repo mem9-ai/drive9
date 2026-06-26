@@ -5014,6 +5014,9 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 		if !validDirEntryName(item.Name) {
 			continue
 		}
+		// Build child path the same way childPath() does (string concat).
+		// pkg/pathutil doesn't have a Join helper; this pattern is used
+		// consistently throughout dat9fs.go for FUSE-internal paths.
 		childP := dirPath + "/" + item.Name
 		if dirPath == "/" {
 			childP = "/" + item.Name
@@ -7587,9 +7590,9 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			// remoteDirectoryHasChildren (which filters locally-unlinked entries)
 			// instead of listDir (which doesn't filter).
 			if !fs.hasKnownLocalDirectoryChildren(childP) {
-				fs.debugf("rmdir path=%s layer listing has %d entries but no local children, polling for up to 5s", childP, len(entries))
+				fs.debugf("rmdir path=%s layer listing has %d entries but no local children, polling for up to 2s", childP, len(entries))
 				fs.dirCache.Invalidate(childP)
-				deadline := time.Now().Add(5 * time.Second)
+				deadline := time.Now().Add(2 * time.Second)
 				for time.Now().Before(deadline) {
 					select {
 					case <-time.After(500 * time.Millisecond):
@@ -7643,8 +7646,8 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			// checks only the local inode state (which is authoritative).
 			fs.dirCache.Invalidate(childP)
 			if !fs.hasKnownLocalDirectoryChildren(childP) {
-				fs.debugf("rmdir path=%s remote has children but no local children, polling for up to 5s", childP)
-				deadline := time.Now().Add(5 * time.Second)
+				fs.debugf("rmdir path=%s remote has children but no local children, polling for up to 2s", childP)
+				deadline := time.Now().Add(2 * time.Second)
 				for time.Now().Before(deadline) {
 					select {
 					case <-time.After(500 * time.Millisecond):
