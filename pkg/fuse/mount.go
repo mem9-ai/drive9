@@ -446,6 +446,19 @@ func Mount(opts *MountOptions) error {
 	server, err := gofuse.NewServer(dat9fs, opts.MountPoint, fuseOpts)
 	if err != nil {
 		layerEventWatcherStop()
+		cleanupMountStartFailure(mountStartCleanup{
+			reason:     "fuse server initialization failure",
+			mountPoint: opts.MountPoint,
+			cause:      err,
+		})
+		if shouldForceUnmountAfterNewServerError(err) {
+			mountPoint := strings.TrimSpace(opts.MountPoint)
+			if mountPoint == "" {
+				mountPoint = "<unknown>"
+			}
+			fmt.Fprintf(os.Stderr, "drive9: cleanup after fuse server initialization failure: forcing unmount of %s after partial init failure\n", mountPoint)
+			forceUnmount(opts.MountPoint)
+		}
 		return fmt.Errorf("fuse mount: %w", err)
 	}
 
@@ -473,6 +486,7 @@ func Mount(opts *MountOptions) error {
 		cleanupMountStartFailure(mountStartCleanup{
 			reason:       "fuse wait mount failure",
 			mountPoint:   opts.MountPoint,
+			cause:        err,
 			stopWatchers: stopWatchers,
 			flushAll:     dat9fs.FlushAll,
 			unmount:      server.Unmount,
@@ -485,6 +499,7 @@ func Mount(opts *MountOptions) error {
 		cleanupMountStartFailure(mountStartCleanup{
 			reason:       "mount control socket failure",
 			mountPoint:   opts.MountPoint,
+			cause:        err,
 			stopWatchers: stopWatchers,
 			flushAll:     dat9fs.FlushAll,
 			unmount:      server.Unmount,
@@ -537,6 +552,7 @@ func Mount(opts *MountOptions) error {
 		cleanupMountStartFailure(mountStartCleanup{
 			reason:       "mount process state failure",
 			mountPoint:   opts.MountPoint,
+			cause:        err,
 			stopWatchers: stopWatchers,
 			flushAll:     dat9fs.FlushAll,
 			unmount:      server.Unmount,
@@ -678,13 +694,35 @@ func Mount(opts *MountOptions) error {
 type mountStartCleanup struct {
 	reason       string
 	mountPoint   string
+	cause        error
 	stopWatchers func()
 	flushAll     func()
 	unmount      func() error
 	forceUnmount func(string)
+	logf         func(string, ...any)
 }
 
 func cleanupMountStartFailure(cleanup mountStartCleanup) {
+	reason := strings.TrimSpace(cleanup.reason)
+	if reason == "" {
+		reason = "mount start failure"
+	}
+	mountPoint := strings.TrimSpace(cleanup.mountPoint)
+	mountPointLabel := mountPoint
+	if mountPointLabel == "" {
+		mountPointLabel = "<unknown>"
+	}
+	logf := cleanup.logf
+	if logf == nil {
+		logf = func(format string, args ...any) {
+			fmt.Fprintf(os.Stderr, format, args...)
+		}
+	}
+	if cleanup.cause != nil {
+		logf("drive9: mount startup failed during %s at %s: %v\n", reason, mountPointLabel, cleanup.cause)
+	} else {
+		logf("drive9: mount startup failed during %s at %s\n", reason, mountPointLabel)
+	}
 	if cleanup.stopWatchers != nil {
 		cleanup.stopWatchers()
 	}
@@ -695,15 +733,21 @@ func cleanupMountStartFailure(cleanup mountStartCleanup) {
 		return
 	}
 	if err := cleanup.unmount(); err != nil {
-		reason := strings.TrimSpace(cleanup.reason)
-		if reason == "" {
-			reason = "mount start failure"
+		logf("drive9: cleanup after %s: unmount failed: %v\n", reason, err)
+		if cleanup.forceUnmount != nil && mountPoint != "" {
+			cleanup.forceUnmount(mountPoint)
 		}
-		fmt.Fprintf(os.Stderr, "drive9: cleanup after %s: unmount failed: %v\n", reason, err)
-		if cleanup.forceUnmount != nil && strings.TrimSpace(cleanup.mountPoint) != "" {
-			cleanup.forceUnmount(cleanup.mountPoint)
-		}
+		return
 	}
+	if mountPoint != "" {
+		logf("drive9: cleanup after %s: unmounted %s\n", reason, mountPoint)
+	} else {
+		logf("drive9: cleanup after %s: unmounted mountpoint\n", reason)
+	}
+}
+
+func shouldForceUnmountAfterNewServerError(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "init:")
 }
 
 func validateMountOptionsProfile(opts *MountOptions) error {
