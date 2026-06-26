@@ -213,6 +213,14 @@ func main() {
 		provisioner, provisionerErr = db9.NewProvisionerFromEnv()
 	}
 	if provisionerErr != nil {
+		isWanted := false
+		if providerType == tenant.ProviderTiDBCloudNative && os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_API_URL") != "" {
+			isWanted = true
+		}
+		if isWanted {
+			logger.Error(context.Background(), "provisioner_failed", zap.String("provider", providerType), zap.Error(provisionerErr))
+			os.Exit(1)
+		}
 		logger.Warn(context.Background(), "provisioner_not_configured", zap.String("provider", providerType), zap.Error(provisionerErr))
 	} else {
 		logger.Info(context.Background(), "provisioner_configured", zap.String("provider", providerType))
