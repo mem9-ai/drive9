@@ -828,8 +828,6 @@ func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled 
 	query := "parseTime=true"
 	if tlsEnabled {
 		query += "&tls=true"
-	} else {
-		query += "&tls=skip-verify"
 	}
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", user, password, host, port, dbName, query)
 }
