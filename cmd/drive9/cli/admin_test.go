@@ -11,19 +11,20 @@ import (
 
 func TestAdminTenantHelpIncludesCommandsFlagsAndExamples(t *testing.T) {
 	stdout, err := captureStdoutE(t, func() error {
-		return Admin([]string{"tenant", "--help"})
+		return Admin([]string{"--help"})
 	})
 	if err != nil {
-		t.Fatalf("Admin tenant help: %v", err)
+		t.Fatalf("Admin help: %v", err)
 	}
 	for _, want := range []string{
-		"usage: drive9 admin tenant <command> [arguments]",
+		"usage: drive9 admin <command> [arguments]",
 		"commands:",
-		"create [flags]",
-		"list [flags]",
-		"get --tenant-id ID",
-		"delete --tenant-id ID",
-		"set-quota --tenant-id ID",
+		"tenant create [flags]",
+		"tenant list [flags]",
+		"tenant get --tenant-id ID",
+		"tenant delete --tenant-id ID",
+		"tenant set-quota --tenant-id ID",
+		"pool <command>",
 		"--server URL",
 		"--region-code CODE",
 		"--tidbcloud-public-key KEY",
@@ -31,6 +32,7 @@ func TestAdminTenantHelpIncludesCommandsFlagsAndExamples(t *testing.T) {
 		"examples:",
 		"drive9 admin tenant create",
 		"drive9 admin tenant delete",
+		"drive9 admin pool create",
 		"drive9 admin tenant set-quota",
 	} {
 		if !strings.Contains(stdout, want) {
@@ -93,6 +95,124 @@ func TestAdminTenantCreatePrintsTable(t *testing.T) {
 		if strings.Contains(stdout, banned) {
 			t.Fatalf("stdout should use table output, found %q:\n%s", banned, stdout)
 		}
+	}
+}
+
+func TestAdminPoolHelpUsesTopLevelCommand(t *testing.T) {
+	stdout, err := captureStdoutE(t, func() error {
+		return Admin([]string{"pool", "--help"})
+	})
+	if err != nil {
+		t.Fatalf("Admin pool help: %v", err)
+	}
+	for _, want := range []string{
+		"usage: drive9 admin pool <command> [arguments]",
+		"create --pool-size N",
+		"get",
+		"update --pool-size N",
+		"delete",
+		"drive9 admin pool create",
+		"drive9 admin pool get",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+	if strings.Contains(stdout, "drive9 admin tenant pool") {
+		t.Fatalf("stdout should prefer top-level admin pool usage:\n%s", stdout)
+	}
+}
+
+func TestAdminTenantPoolCreatePrintsTable(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/admin/tenant-pool" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["public_key"] != "public-1" || body["private_key"] != "private-1" {
+			t.Fatalf("body credentials = %#v", body)
+		}
+		if body["pool_size"] != float64(3) || body["tidbcloud_spending_limit"] != float64(10000) {
+			t.Fatalf("body pool fields = %#v", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"pool_id":         "pool-1",
+			"organization_id": "org-1",
+			"pool_size":       3,
+			"free_size":       3,
+			"status":          "active",
+		})
+	}))
+	defer ts.Close()
+
+	stdout, err := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"pool", "create",
+			"--server", ts.URL,
+			"--pool-size", "3",
+			"--tidbcloud-spending-limit", "10000",
+			"--tidbcloud-public-key", "public-1",
+			"--tidbcloud-private-key", "private-1",
+		})
+	})
+	if err != nil {
+		t.Fatalf("Admin tenant pool create: %v", err)
+	}
+	for _, want := range []string{
+		"POOL_ID", "ORGANIZATION_ID", "POOL_SIZE", "FREE_SIZE", "STATUS",
+		"pool-1", "org-1", "3", "active",
+	} {
+		if !strings.Contains(stdout, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, stdout)
+		}
+	}
+}
+
+func TestAdminTenantPoolGetUsesCredentialHeadersAndJSON(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	clearProvisionEnv(t)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v1/admin/tenant-pool" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("X-TiDBCloud-Public-Key") != "public-1" || r.Header.Get("X-TiDBCloud-Private-Key") != "private-1" {
+			t.Fatalf("missing tidbcloud headers")
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"pool_id":         "pool-1",
+			"organization_id": "org-1",
+			"pool_size":       5,
+			"free_size":       4,
+			"status":          "active",
+		})
+	}))
+	defer ts.Close()
+
+	stdout, err := captureStdoutE(t, func() error {
+		return Admin([]string{
+			"pool", "get",
+			"--server", ts.URL,
+			"--tidbcloud-public-key", "public-1",
+			"--tidbcloud-private-key", "private-1",
+			"--json",
+		})
+	})
+	if err != nil {
+		t.Fatalf("Admin tenant pool get: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(stdout), &out); err != nil {
+		t.Fatalf("decode stdout json: %v\n%s", err, stdout)
+	}
+	if out["pool_id"] != "pool-1" || out["free_size"] != float64(4) {
+		t.Fatalf("stdout json = %#v", out)
 	}
 }
 

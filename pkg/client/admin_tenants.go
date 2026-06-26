@@ -54,6 +54,21 @@ type AdminTenantCreateResponse struct {
 	Region        string `json:"region,omitempty"`
 }
 
+type AdminTenantPoolRequest struct {
+	PublicKey              string `json:"public_key"`
+	PrivateKey             string `json:"private_key"`
+	PoolSize               int    `json:"pool_size,omitempty"`
+	TiDBCloudSpendingLimit *int64 `json:"tidbcloud_spending_limit,omitempty"`
+}
+
+type AdminTenantPoolResponse struct {
+	PoolID         string `json:"pool_id"`
+	OrganizationID string `json:"organization_id,omitempty"`
+	PoolSize       int    `json:"pool_size"`
+	FreeSize       int    `json:"free_size"`
+	Status         string `json:"status"`
+}
+
 type AdminTenantDeleteRequest struct {
 	TenantID   string `json:"tenant_id"`
 	PublicKey  string `json:"public_key"`
@@ -121,6 +136,71 @@ func (c *Client) AdminCreateTenant(ctx context.Context, req AdminTenantCreateReq
 	var out AdminTenantCreateResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode admin tenant create response: %w", err)
+	}
+	return &out, nil
+}
+
+func (c *Client) AdminCreateTenantPool(ctx context.Context, req AdminTenantPoolRequest) (*AdminTenantPoolResponse, error) {
+	return c.adminTenantPoolWithBody(ctx, http.MethodPost, req, "admin tenant pool create")
+}
+
+func (c *Client) AdminUpdateTenantPool(ctx context.Context, req AdminTenantPoolRequest) (*AdminTenantPoolResponse, error) {
+	return c.adminTenantPoolWithBody(ctx, http.MethodPatch, req, "admin tenant pool update")
+}
+
+func (c *Client) AdminDeleteTenantPool(ctx context.Context, req AdminTenantPoolRequest) (*AdminTenantPoolResponse, error) {
+	body := struct {
+		PublicKey  string `json:"public_key"`
+		PrivateKey string `json:"private_key"`
+	}{
+		PublicKey:  req.PublicKey,
+		PrivateKey: req.PrivateKey,
+	}
+	return c.adminTenantPoolWithBody(ctx, http.MethodDelete, body, "admin tenant pool delete")
+}
+
+func (c *Client) AdminGetTenantPool(ctx context.Context, req AdminTenantPoolRequest) (*AdminTenantPoolResponse, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/v1/admin/tenant-pool", nil)
+	if err != nil {
+		return nil, fmt.Errorf("create admin tenant pool get request: %w", err)
+	}
+	setQuotaHeaders(httpReq, req.PublicKey, req.PrivateKey)
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("admin tenant pool get request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out AdminTenantPoolResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode admin tenant pool get response: %w", err)
+	}
+	return &out, nil
+}
+
+func (c *Client) adminTenantPoolWithBody(ctx context.Context, method string, body any, operation string) (*AdminTenantPoolResponse, error) {
+	raw, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal %s request: %w", operation, err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, method, c.baseURL+"/v1/admin/tenant-pool", bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("create %s request: %w", operation, err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	resp, err := c.do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("%s request: %w", operation, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode >= 300 {
+		return nil, readError(resp)
+	}
+	var out AdminTenantPoolResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode %s response: %w", operation, err)
 	}
 	return &out, nil
 }

@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -282,6 +284,170 @@ func TestProvisionWithCredentialsAndQuotaSendsCreateTimeSpendingLimit(t *testing
 	}
 	if cloudCfg == nil || cloudCfg.TiDBCloudSpendingLimitMonthly == nil || *cloudCfg.TiDBCloudSpendingLimitMonthly != monthly {
 		t.Fatalf("cloud config = %#v, want spending limit %d", cloudCfg, monthly)
+	}
+}
+
+func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
+	var gotBody struct {
+		Requests []struct {
+			Cluster struct {
+				DisplayName  string            `json:"displayName"`
+				RootPassword string            `json:"rootPassword"`
+				Labels       map[string]string `json:"labels"`
+				Region       struct {
+					Name string `json:"name"`
+				} `json:"region"`
+				SpendingLimit struct {
+					Monthly int32 `json:"monthly"`
+				} `json:"spendingLimit"`
+			} `json:"cluster"`
+		} `json:"requests"`
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method != http.MethodPost || r.URL.Path != "/v1beta1/clusters:batchCreate" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"clusters": []map[string]any{
+				{
+					"clusterId":  "cluster-1",
+					"state":      "ACTIVE",
+					"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1", Drive9TenantIDLabel: "tenant-1"},
+					"userPrefix": "u1",
+					"endpoints":  map[string]any{"public": map[string]any{"host": "db1.example", "port": 4000}},
+				},
+				{
+					"clusterId":  "cluster-2",
+					"state":      "ACTIVE",
+					"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1", Drive9TenantIDLabel: "tenant-2"},
+					"userPrefix": "u2",
+					"endpoints":  map[string]any{"public": map[string]any{"host": "db2.example", "port": 4000}},
+				},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		cloudProvider:       "aws",
+		region:              "us-east-1",
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	monthly := int64(10000)
+	out, cloudCfg, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1", "tenant-2"}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{TiDBCloudSpendingLimitMonthly: &monthly})
+	if err != nil {
+		t.Fatalf("BatchProvisionFreeClustersWithCredentialsAndQuota: %v", err)
+	}
+	if len(gotBody.Requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(gotBody.Requests))
+	}
+	for i, req := range gotBody.Requests {
+		wantTenantID := fmt.Sprintf("tenant-%d", i+1)
+		if req.Cluster.Labels[Drive9ManagedLabel] != "true" ||
+			req.Cluster.Labels[Drive9TenantIDLabel] != wantTenantID ||
+			req.Cluster.Labels[Drive9PoolStatusLabel] != "free" {
+			t.Fatalf("request %d labels = %#v", i, req.Cluster.Labels)
+		}
+		if req.Cluster.RootPassword == "" {
+			t.Fatalf("request %d rootPassword empty", i)
+		}
+		if req.Cluster.Region.Name != "regions/aws-us-east-1" {
+			t.Fatalf("request %d region = %q", i, req.Cluster.Region.Name)
+		}
+		if req.Cluster.SpendingLimit.Monthly != int32(monthly) {
+			t.Fatalf("request %d spending = %d", i, req.Cluster.SpendingLimit.Monthly)
+		}
+	}
+	if len(out) != 2 || out[0].TenantID != "tenant-1" || out[0].ClusterID != "cluster-1" || out[1].TenantID != "tenant-2" || out[1].ClusterID != "cluster-2" {
+		t.Fatalf("clusters = %#v", out)
+	}
+	if cloudCfg == nil || cloudCfg.Labels[Drive9PoolStatusLabel] != "free" {
+		t.Fatalf("cloud config = %#v", cloudCfg)
+	}
+}
+
+func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFails(t *testing.T) {
+	origPoll := tidbCloudNativePollInterval
+	tidbCloudNativePollInterval = time.Millisecond
+	t.Cleanup(func() { tidbCloudNativePollInterval = origPoll })
+
+	var getCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1beta1/clusters:batchCreate":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusters": []map[string]any{
+					{
+						"clusterId":  "cluster-1",
+						"state":      "ACTIVE",
+						"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1", Drive9TenantIDLabel: "tenant-1"},
+						"userPrefix": "u1",
+						"endpoints":  map[string]any{"public": map[string]any{"host": "db1.example", "port": 4000}},
+					},
+					{
+						"clusterId":  "cluster-2",
+						"state":      "CREATING",
+						"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1", Drive9TenantIDLabel: "tenant-2"},
+						"userPrefix": "u2",
+					},
+				},
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters/cluster-2":
+			getCalls.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId":  "cluster-2",
+				"state":      "CREATING",
+				"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1", Drive9TenantIDLabel: "tenant-2"},
+				"userPrefix": "u2",
+			})
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		cloudProvider:       "aws",
+		region:              "us-east-1",
+		defaultDatabaseName: DefaultDatabaseName,
+		client:              ts.Client(),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(ctx, []string{"tenant-1", "tenant-2"}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{})
+	if err == nil {
+		t.Fatal("BatchProvisionFreeClustersWithCredentialsAndQuota error = nil, want metadata wait error")
+	}
+	if getCalls.Load() == 0 {
+		t.Fatal("cluster metadata GET was not called")
+	}
+	if len(out) != 2 {
+		t.Fatalf("clusters = %d, want 2 fallback clusters for cleanup: %#v", len(out), out)
+	}
+	if out[0].TenantID != "tenant-1" || out[0].ClusterID != "cluster-1" || out[1].TenantID != "tenant-2" || out[1].ClusterID != "cluster-2" {
+		t.Fatalf("fallback clusters = %#v", out)
 	}
 }
 

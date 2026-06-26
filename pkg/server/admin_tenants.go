@@ -167,6 +167,23 @@ func (s *Server) handleAdminTenantCreate(w http.ResponseWriter, r *http.Request)
 		}
 		quotaOpt = &quotaReq
 	}
+	if res, pool, claimed, err := s.claimAdminTenantFromPool(r.Context(), cred, quotaOpt); err != nil {
+		errJSON(w, http.StatusBadGateway, fmt.Sprintf("claim tenant pool tenant failed: %v", err))
+		return
+	} else if claimed {
+		setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+		s.replenishTenantPoolAsync(r.Context(), pool, cred)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(adminTenantCreateResponse{
+			TenantID:      res.TenantID,
+			APIKey:        res.APIKey,
+			Status:        string(res.Status),
+			CloudProvider: res.CloudProvider,
+			Region:        res.Region,
+		})
+		return
+	}
 	res, err := s.provisionTenant(r.Context(), provisionTenantOptions{
 		KeyName:               "default",
 		TokenVersion:          1,
@@ -420,6 +437,10 @@ func (s *Server) authorizedAdminTenant(w http.ResponseWriter, r *http.Request, t
 			return nil, nil, nil, false
 		}
 		errJSON(w, http.StatusInternalServerError, "tenant organization binding lookup failed")
+		return nil, nil, nil, false
+	}
+	if binding.PoolStatus == meta.TenantPoolBindingFree {
+		errJSON(w, http.StatusNotFound, "tenant not found")
 		return nil, nil, nil, false
 	}
 	clusters, err := s.listAllManagedClusters(r.Context(), cred, binding.ClusterID)

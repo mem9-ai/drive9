@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	mysql "github.com/go-sql-driver/mysql"
@@ -43,6 +44,8 @@ const (
 
 	Drive9ManagedLabel         = "drive9.ai/managed"
 	Drive9TenantIDLabel        = "drive9.ai/tenant_id"
+	Drive9PoolStatusLabel      = "drive9.ai/status"
+	Drive9PoolUsedAtLabel      = "drive9.ai/used_at"
 	Drive9QuotaUpdateAtLabel   = "drive9.ai/update_quota_at"
 	TiDBCloudOrganizationLabel = "tidb.cloud/organization"
 
@@ -324,6 +327,221 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(*spendingLimit)
 	}
 	return out, cloudCfg, nil
+}
+
+func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx context.Context, tenantIDs []string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) ([]*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, nil, fmt.Errorf("public_key and private_key are required")
+	}
+	if len(tenantIDs) == 0 {
+		return []*tenant.ClusterInfo{}, nil, nil
+	}
+	dbName, err := p.resolveDatabaseName("")
+	if err != nil {
+		return nil, nil, err
+	}
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		if err := validateTiDBCloudSpendingLimit(*opts.TiDBCloudSpendingLimitMonthly); err != nil {
+			return nil, nil, err
+		}
+	}
+	var spendingLimit *int64
+	requests := make([]map[string]any, 0, len(tenantIDs))
+	passwords := make(map[string]string, len(tenantIDs))
+	for _, tenantID := range tenantIDs {
+		tenantID = strings.TrimSpace(tenantID)
+		if tenantID == "" {
+			return nil, nil, fmt.Errorf("tenant id is required")
+		}
+		password, err := generateRandomPassword(24)
+		if err != nil {
+			return nil, nil, err
+		}
+		passwords[tenantID] = password
+		cluster := map[string]any{
+			"displayName":  clusterDisplayName(tenantID),
+			"rootPassword": password,
+			"region": map[string]string{
+				"name": p.regionName(),
+			},
+			"labels": map[string]string{
+				Drive9ManagedLabel:    "true",
+				Drive9TenantIDLabel:   tenantID,
+				Drive9PoolStatusLabel: "free",
+			},
+		}
+		if opts.TiDBCloudSpendingLimitMonthly != nil {
+			spendingLimit = opts.TiDBCloudSpendingLimitMonthly
+			cluster["spendingLimit"] = map[string]int32{"monthly": int32(*spendingLimit)}
+		} else if p.defaultSpendLimit != nil {
+			defaultLimit := int64(*p.defaultSpendLimit)
+			spendingLimit = &defaultLimit
+			cluster["spendingLimit"] = map[string]int32{"monthly": *p.defaultSpendLimit}
+		}
+		requests = append(requests, map[string]any{"cluster": cluster})
+	}
+	body, err := json.Marshal(map[string]any{"requests": requests})
+	if err != nil {
+		return nil, nil, err
+	}
+	endpoint := p.apiURL + "/v1beta1/clusters:batchCreate"
+	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodPost, endpoint, body)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
+		if readErr != nil {
+			return nil, nil, readErr
+		}
+		return nil, nil, fmt.Errorf("%s", statusError("batch provision", resp.StatusCode, sanitizeUpstreamBody(raw)))
+	}
+	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
+	if readErr != nil {
+		return nil, nil, readErr
+	}
+	var created clusterListResponse
+	if err := json.Unmarshal(raw, &created); err != nil {
+		return nil, nil, err
+	}
+	if len(created.Clusters) != len(tenantIDs) {
+		return nil, nil, fmt.Errorf("tidbcloud native batch provision returned %d clusters, want %d", len(created.Clusters), len(tenantIDs))
+	}
+	out := make([]*tenant.ClusterInfo, len(created.Clusters))
+	var wg sync.WaitGroup
+	errs := make([]error, len(created.Clusters))
+	for i := range created.Clusters {
+		i := i
+		info := created.Clusters[i]
+		tenantID := strings.TrimSpace(info.Labels[Drive9TenantIDLabel])
+		if tenantID == "" {
+			tenantID = strings.TrimSpace(tenantIDs[i])
+		}
+		if info.ClusterID == "" {
+			return nil, nil, fmt.Errorf("tidbcloud native batch response missing cluster id")
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			clusterInfo := &info
+			if clusterProvisionMetadataIncomplete(clusterInfo, p.usePrivateEndpoint, p.tencentPrivateEndpointHost) {
+				waited, waitErr := p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, info.ClusterID)
+				if waitErr != nil {
+					errs[i] = waitErr
+					return
+				}
+				clusterInfo = waited
+			}
+			out[i] = p.clusterInfoFromResponse(tenantID, dbName, passwords[tenantID], clusterInfo)
+		}()
+	}
+	wg.Wait()
+	for _, err := range errs {
+		if err != nil {
+			return fallbackBatchClusterInfos(created.Clusters, tenantIDs, dbName), nil, err
+		}
+	}
+	cloudCfg := &tenant.QuotaCloudConfig{Labels: map[string]string{
+		Drive9ManagedLabel:    "true",
+		Drive9PoolStatusLabel: "free",
+	}}
+	if spendingLimit != nil {
+		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(*spendingLimit)
+	}
+	return out, cloudCfg, nil
+}
+
+func fallbackBatchClusterInfos(clusters []clusterInfo, tenantIDs []string, dbName string) []*tenant.ClusterInfo {
+	out := make([]*tenant.ClusterInfo, 0, len(clusters))
+	for i := range clusters {
+		info := clusters[i]
+		tenantID := strings.TrimSpace(info.Labels[Drive9TenantIDLabel])
+		if tenantID == "" && i < len(tenantIDs) {
+			tenantID = strings.TrimSpace(tenantIDs[i])
+		}
+		out = append(out, &tenant.ClusterInfo{
+			TenantID:       tenantID,
+			ClusterID:      strings.TrimSpace(info.ClusterID),
+			OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
+			DBName:         dbName,
+			Provider:       tenant.ProviderTiDBCloudNative,
+		})
+	}
+	return out
+}
+
+func (p *Provisioner) MarkClusterPoolUsed(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, usedAt time.Time, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return nil, fmt.Errorf("cluster id is required")
+	}
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		if err := validateTiDBCloudSpendingLimit(*opts.TiDBCloudSpendingLimitMonthly); err != nil {
+			return nil, err
+		}
+	}
+	clusterID := strings.TrimSpace(cluster.ClusterID)
+	labels, cloudCfg, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
+	if err != nil {
+		return nil, fmt.Errorf("load cluster pool label info: %w", err)
+	}
+	labels[Drive9ManagedLabel] = "true"
+	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
+		labels[Drive9TenantIDLabel] = tenantID
+	}
+	labels[Drive9PoolStatusLabel] = "used"
+	labels[Drive9PoolUsedAtLabel] = usedAt.UTC().Format(time.RFC3339)
+	for _, k := range immutableLabelKeys {
+		delete(labels, k)
+	}
+	if err := p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels); err != nil {
+		return nil, fmt.Errorf("update cluster pool labels: %w", err)
+	}
+	if cloudCfg == nil {
+		cloudCfg = &tenant.QuotaCloudConfig{}
+	}
+	cloudCfg.Labels = labels
+	if opts.TiDBCloudSpendingLimitMonthly != nil {
+		monthly := *opts.TiDBCloudSpendingLimitMonthly
+		if err := p.updateSpendingLimitWithCredentials(ctx, publicKey, privateKey, clusterID, monthly); err != nil {
+			return nil, fmt.Errorf("update cluster spending limit: %w", err)
+		}
+		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(monthly)
+	}
+	return cloudCfg, nil
+}
+
+func (p *Provisioner) MarkClusterPoolFree(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return fmt.Errorf("cluster id is required")
+	}
+	clusterID := strings.TrimSpace(cluster.ClusterID)
+	labels, _, err := p.clusterQuotaInfo(ctx, publicKey, privateKey, clusterID)
+	if err != nil {
+		return fmt.Errorf("load cluster pool label info: %w", err)
+	}
+	labels[Drive9ManagedLabel] = "true"
+	if tenantID := strings.TrimSpace(cluster.TenantID); tenantID != "" {
+		labels[Drive9TenantIDLabel] = tenantID
+	}
+	labels[Drive9PoolStatusLabel] = "free"
+	delete(labels, Drive9PoolUsedAtLabel)
+	for _, k := range immutableLabelKeys {
+		delete(labels, k)
+	}
+	return p.updateQuotaLabelsWithCredentials(ctx, publicKey, privateKey, clusterID, labels)
 }
 
 func (p *Provisioner) ProvisionBranch(ctx context.Context, forkTenantID string, source *tenant.ClusterInfo) (*tenant.ClusterInfo, error) {
@@ -1053,6 +1271,43 @@ func cloudClusterInfoFromClusterInfo(info clusterInfo) tenant.CloudClusterInfo {
 	}
 	if info.SpendingLimit != nil {
 		out.TiDBCloudSpendingLimitMonthly = ptrInt64(int64(info.SpendingLimit.Monthly))
+	}
+	return out
+}
+
+func (p *Provisioner) clusterInfoFromResponse(tenantID, dbName, password string, info *clusterInfo) *tenant.ClusterInfo {
+	if info == nil {
+		return &tenant.ClusterInfo{
+			TenantID: tenantID,
+			Password: password,
+			DBName:   dbName,
+			Provider: tenant.ProviderTiDBCloudNative,
+		}
+	}
+	var host string
+	var port int
+	if p.usePrivateEndpoint {
+		host = info.Endpoints.Private.Host
+		port = info.Endpoints.Private.Port
+		if host == "" && p.tencentPrivateEndpointHost != "" {
+			host = p.tencentPrivateEndpointHost
+		}
+	} else {
+		host = info.Endpoints.Public.Host
+		port = info.Endpoints.Public.Port
+	}
+	out := &tenant.ClusterInfo{
+		TenantID:       tenantID,
+		ClusterID:      info.ClusterID,
+		OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
+		Host:           host,
+		Port:           port,
+		Password:       password,
+		DBName:         dbName,
+		Provider:       tenant.ProviderTiDBCloudNative,
+	}
+	if info.UserPrefix != "" {
+		out.Username = info.UserPrefix + ".root"
 	}
 	return out
 }

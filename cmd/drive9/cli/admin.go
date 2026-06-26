@@ -22,6 +22,8 @@ func Admin(args []string) error {
 		return nil
 	case "tenant", "tenants":
 		return adminTenant(args[1:])
+	case "pool":
+		return adminTenantPool(args[1:])
 	default:
 		return fmt.Errorf("unknown admin command %q\n%s", args[0], adminUsage())
 	}
@@ -45,6 +47,8 @@ func adminTenant(args []string) error {
 		return adminTenantDelete(args[1:])
 	case "set-quota":
 		return quotaSet(args[1:])
+	case "pool":
+		return adminTenantPool(args[1:])
 	default:
 		return fmt.Errorf("unknown admin tenant command %q\n%s", args[0], adminTenantUsage())
 	}
@@ -443,6 +447,193 @@ func adminTenantDelete(args []string) error {
 	return printAdminTenantDeleteResponse(out)
 }
 
+func adminTenantPool(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("%s", adminTenantPoolUsage())
+	}
+	switch args[0] {
+	case "-h", "-help", "--help", "help":
+		_, _ = fmt.Fprintln(os.Stdout, adminTenantPoolUsage())
+		return nil
+	case "create":
+		return adminTenantPoolCreate(args[1:])
+	case "get":
+		return adminTenantPoolGet(args[1:])
+	case "update":
+		return adminTenantPoolUpdate(args[1:])
+	case "delete":
+		return adminTenantPoolDelete(args[1:])
+	default:
+		return fmt.Errorf("unknown admin pool command %q\n%s", args[0], adminTenantPoolUsage())
+	}
+}
+
+func adminTenantPoolCreate(args []string) error {
+	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolCreateUsage(), true, true)
+	if err != nil {
+		if errors.Is(err, errHelpRequested{}) {
+			return nil
+		}
+		return err
+	}
+	if req.PoolSize <= 0 {
+		return fmt.Errorf("--pool-size must be positive")
+	}
+	out, err := client.New(server, "").AdminCreateTenantPool(context.Background(), req)
+	if err != nil {
+		return quotaAPIError("create admin tenant pool", err)
+	}
+	return printAdminTenantPoolResponse(out, asJSON)
+}
+
+func adminTenantPoolGet(args []string) error {
+	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolGetUsage(), false, false)
+	if err != nil {
+		if errors.Is(err, errHelpRequested{}) {
+			return nil
+		}
+		return err
+	}
+	out, err := client.New(server, "").AdminGetTenantPool(context.Background(), req)
+	if err != nil {
+		return quotaAPIError("get admin tenant pool", err)
+	}
+	return printAdminTenantPoolResponse(out, asJSON)
+}
+
+func adminTenantPoolUpdate(args []string) error {
+	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolUpdateUsage(), true, true)
+	if err != nil {
+		if errors.Is(err, errHelpRequested{}) {
+			return nil
+		}
+		return err
+	}
+	out, err := client.New(server, "").AdminUpdateTenantPool(context.Background(), req)
+	if err != nil {
+		return quotaAPIError("update admin tenant pool", err)
+	}
+	return printAdminTenantPoolResponse(out, asJSON)
+}
+
+func adminTenantPoolDelete(args []string) error {
+	req, server, asJSON, err := parseAdminTenantPoolCommand(args, adminTenantPoolDeleteUsage(), false, false)
+	if err != nil {
+		if errors.Is(err, errHelpRequested{}) {
+			return nil
+		}
+		return err
+	}
+	out, err := client.New(server, "").AdminDeleteTenantPool(context.Background(), req)
+	if err != nil {
+		return quotaAPIError("delete admin tenant pool", err)
+	}
+	return printAdminTenantPoolResponse(out, asJSON)
+}
+
+func parseAdminTenantPoolCommand(args []string, usage string, allowPoolSize, allowSpendingLimit bool) (req client.AdminTenantPoolRequest, server string, asJSON bool, err error) {
+	serverFlag := ""
+	serverGiven := false
+	regionCodeFlag := ""
+	regionCodeGiven := false
+	publicKeyFlag := ""
+	publicKeyGiven := false
+	privateKeyFlag := ""
+	privateKeyGiven := false
+	poolSizeGiven := false
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-h", "-help", "--help", "help":
+			_, _ = fmt.Fprintln(os.Stdout, usage)
+			return req, "", false, errHelpRequested{}
+		case "--server":
+			if i+1 >= len(args) {
+				return req, "", false, fmt.Errorf("--server requires an argument")
+			}
+			i++
+			serverFlag = args[i]
+			serverGiven = true
+		case "--region-code":
+			if i+1 >= len(args) {
+				return req, "", false, fmt.Errorf("--region-code requires an argument")
+			}
+			i++
+			regionCodeFlag = args[i]
+			regionCodeGiven = true
+		case "--tidbcloud-public-key":
+			if i+1 >= len(args) {
+				return req, "", false, fmt.Errorf("--tidbcloud-public-key requires an argument")
+			}
+			i++
+			publicKeyFlag = args[i]
+			publicKeyGiven = true
+		case "--tidbcloud-private-key":
+			if i+1 >= len(args) {
+				return req, "", false, fmt.Errorf("--tidbcloud-private-key requires an argument")
+			}
+			i++
+			privateKeyFlag = args[i]
+			privateKeyGiven = true
+		case "--pool-size":
+			if !allowPoolSize {
+				return req, "", false, fmt.Errorf("unknown flag %q\n%s", args[i], usage)
+			}
+			if i+1 >= len(args) {
+				return req, "", false, fmt.Errorf("--pool-size requires an argument")
+			}
+			i++
+			v, parseErr := parseNonNegativeQuotaInt64Flag("--pool-size", args[i])
+			if parseErr != nil {
+				return req, "", false, parseErr
+			}
+			req.PoolSize = int(v)
+			poolSizeGiven = true
+		case "--tidbcloud-spending-limit":
+			if !allowSpendingLimit {
+				return req, "", false, fmt.Errorf("unknown flag %q\n%s", args[i], usage)
+			}
+			if i+1 >= len(args) {
+				return req, "", false, fmt.Errorf("--tidbcloud-spending-limit requires an argument")
+			}
+			i++
+			v, parseErr := parseNonNegativeQuotaInt64Flag("--tidbcloud-spending-limit", args[i])
+			if parseErr != nil {
+				return req, "", false, parseErr
+			}
+			req.TiDBCloudSpendingLimit = &v
+		case "--json":
+			asJSON = true
+		default:
+			return req, "", false, fmt.Errorf("unknown flag %q\n%s", args[i], usage)
+		}
+	}
+	if allowPoolSize && !poolSizeGiven {
+		return req, "", false, fmt.Errorf("--pool-size is required")
+	}
+	if err := rejectEmptyFlag("server", strings.TrimSpace(serverFlag), serverGiven); err != nil {
+		return req, "", false, err
+	}
+	if err := rejectEmptyFlag("region-code", strings.TrimSpace(regionCodeFlag), regionCodeGiven); err != nil {
+		return req, "", false, err
+	}
+	if err := rejectEmptyFlag("tidbcloud-public-key", strings.TrimSpace(publicKeyFlag), publicKeyGiven); err != nil {
+		return req, "", false, err
+	}
+	if err := rejectEmptyFlag("tidbcloud-private-key", strings.TrimSpace(privateKeyFlag), privateKeyGiven); err != nil {
+		return req, "", false, err
+	}
+	r := ResolveCredentials()
+	server, err = quotaServer(serverFlag, regionCodeFlag, r.Server, true)
+	if err != nil {
+		return req, "", false, err
+	}
+	req.PublicKey, req.PrivateKey = adminTiDBCloudKeys(publicKeyFlag, privateKeyFlag)
+	if strings.TrimSpace(req.PublicKey) == "" || strings.TrimSpace(req.PrivateKey) == "" {
+		return req, "", false, fmt.Errorf("TiDB Cloud credentials are required; pass --tidbcloud-public-key and --tidbcloud-private-key or set %s/%s", EnvTiDBCloudPublicKey, EnvTiDBCloudPrivateKey)
+	}
+	return req, server, asJSON, nil
+}
+
 func parseAdminTenantIDCommand(args []string, usage string) (tenantID, server, publicKey, privateKey string, asJSON bool, err error) {
 	serverFlag := ""
 	serverGiven := false
@@ -546,14 +737,15 @@ type errHelpRequested struct{}
 func (errHelpRequested) Error() string { return "help requested" }
 
 func adminUsage() string {
-	return `usage: drive9 admin tenant <command> [arguments]
+	return `usage: drive9 admin <command> [arguments]
 
 commands:
-  tenant create [flags]            create a TiDBCloud Mode tenant
-  tenant list [flags]              list TiDBCloud Mode tenants
-  tenant get --tenant-id ID        show one tenant and quota
-  tenant delete --tenant-id ID     delete one tenant
-  tenant set-quota --tenant-id ID  set quota for one tenant
+  tenant create [flags]             create a TiDBCloud Mode tenant
+  tenant list [flags]               list TiDBCloud Mode tenants
+  tenant get --tenant-id ID         show one tenant and quota
+  tenant delete --tenant-id ID      delete one tenant
+  tenant set-quota --tenant-id ID   set quota for one tenant
+  pool <command> [flags]            manage the tenant pool
 
 global admin flags:
   --server URL                     server URL (default: active context server)
@@ -563,6 +755,10 @@ global admin flags:
   --json                           output result as JSON when supported
 
 examples:
+  drive9 admin tenant create --region-code aws-ap-southeast-1 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
   drive9 admin tenant list --region-code aws-ap-southeast-1 \
     --tidbcloud-public-key <public-key> \
     --tidbcloud-private-key <private-key>
@@ -572,6 +768,14 @@ examples:
     --tidbcloud-private-key <private-key>
 
   drive9 admin tenant set-quota --tenant-id tnt_xxx --max-storage-size 102400 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin tenant delete --tenant-id tnt_xxx \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin pool create --pool-size 10 \
     --tidbcloud-public-key <public-key> \
     --tidbcloud-private-key <private-key>`
 }
@@ -705,6 +909,99 @@ example:
     --tidbcloud-private-key <private-key>`
 }
 
+func adminTenantPoolUsage() string {
+	return `usage: drive9 admin pool <command> [arguments]
+
+commands:
+  create --pool-size N             create a tenant pool
+  get                              show the tenant pool
+  update --pool-size N             update tenant pool size
+  delete                           delete the tenant pool's free tenants
+
+flags:
+  --server URL                     server URL (default: active context server)
+  --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
+  --pool-size N                    pool target free tenant count
+  --tidbcloud-public-key KEY       TiDB Cloud public key
+  --tidbcloud-private-key KEY      TiDB Cloud private key
+  --tidbcloud-spending-limit N     create/update TiDB Cloud Cluster Spending Limit for new pool clusters
+  --json                           output result as JSON
+
+examples:
+  drive9 admin pool create --pool-size 10 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin pool get \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin pool update --pool-size 20 \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>
+
+  drive9 admin pool delete \
+    --tidbcloud-public-key <public-key> \
+    --tidbcloud-private-key <private-key>`
+}
+
+func adminTenantPoolCreateUsage() string {
+	return `usage: drive9 admin pool create --pool-size N [flags]
+
+create a TiDBCloud Mode tenant pool. New pool clusters are labeled free.
+
+flags:
+  --server URL                     server URL (default: active context server)
+  --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
+  --pool-size N                    number of free tenants to pre-create; must be positive
+  --tidbcloud-public-key KEY       TiDB Cloud public key
+  --tidbcloud-private-key KEY      TiDB Cloud private key
+  --tidbcloud-spending-limit N     TiDB Cloud Cluster Spending Limit for pool clusters
+  --json                           output result as JSON`
+}
+
+func adminTenantPoolGetUsage() string {
+	return `usage: drive9 admin pool get [flags]
+
+show the TiDBCloud Mode tenant pool.
+
+flags:
+  --server URL                     server URL (default: active context server)
+  --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
+  --tidbcloud-public-key KEY       TiDB Cloud public key
+  --tidbcloud-private-key KEY      TiDB Cloud private key
+  --json                           output result as JSON`
+}
+
+func adminTenantPoolUpdateUsage() string {
+	return `usage: drive9 admin pool update --pool-size N [flags]
+
+update TiDBCloud Mode tenant pool size. Increasing creates free tenants;
+decreasing deletes newest free tenants.
+
+flags:
+  --server URL                     server URL (default: active context server)
+  --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
+  --pool-size N                    target free tenant count; must be non-negative
+  --tidbcloud-public-key KEY       TiDB Cloud public key
+  --tidbcloud-private-key KEY      TiDB Cloud private key
+  --tidbcloud-spending-limit N     TiDB Cloud Cluster Spending Limit for newly-created pool clusters
+  --json                           output result as JSON`
+}
+
+func adminTenantPoolDeleteUsage() string {
+	return `usage: drive9 admin pool delete [flags]
+
+delete the TiDBCloud Mode tenant pool's free tenants and remove the pool.
+
+flags:
+  --server URL                     server URL (default: active context server)
+  --region-code CODE               TiDBCloud Mode region code; ignored when --server is set
+  --tidbcloud-public-key KEY       TiDB Cloud public key
+  --tidbcloud-private-key KEY      TiDB Cloud private key
+  --json                           output result as JSON`
+}
+
 func printAdminTenantCreateResponse(out *client.AdminTenantCreateResponse) error {
 	if out == nil {
 		return fmt.Errorf("admin tenant create response is empty")
@@ -717,6 +1014,27 @@ func printAdminTenantCreateResponse(out *client.AdminTenantCreateResponse) error
 		emptyAsDash(out.CloudProvider),
 		emptyAsDash(out.Region),
 		out.APIKey,
+	)
+	return w.Flush()
+}
+
+func printAdminTenantPoolResponse(out *client.AdminTenantPoolResponse, asJSON bool) error {
+	if out == nil {
+		return fmt.Errorf("admin tenant pool response is empty")
+	}
+	if asJSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(out)
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(w, "POOL_ID\tORGANIZATION_ID\tPOOL_SIZE\tFREE_SIZE\tSTATUS")
+	_, _ = fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\n",
+		out.PoolID,
+		emptyAsDash(out.OrganizationID),
+		out.PoolSize,
+		out.FreeSize,
+		out.Status,
 	)
 	return w.Flush()
 }
