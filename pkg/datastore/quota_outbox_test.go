@@ -69,6 +69,49 @@ func TestQuotaOutboxLifecycle(t *testing.T) {
 	}
 }
 
+func TestHasPendingQuotaOutboxFileMutationIncludesUploadComplete(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	payload := json.RawMessage(`{"upload_id":"upload-1","file_id":"file-1"}`)
+	if err := s.InTx(ctx, func(tx *sql.Tx) error {
+		_, err := s.EnqueueQuotaOutboxTx(tx, &QuotaOutboxEntry{
+			FileID:       "file-1",
+			MutationType: "upload_complete",
+			MutationData: payload,
+		})
+		return err
+	}); err != nil {
+		t.Fatalf("enqueue upload complete outbox: %v", err)
+	}
+
+	pending, err := s.HasPendingQuotaOutboxFileMutation(ctx, "file-1")
+	if err != nil {
+		t.Fatalf("has pending file mutation: %v", err)
+	}
+	if !pending {
+		t.Fatal("pending file mutation = false, want true")
+	}
+
+	claimed, found, err := s.ClaimQuotaOutbox(ctx, time.Now().UTC(), time.Minute)
+	if err != nil {
+		t.Fatalf("claim quota outbox: %v", err)
+	}
+	if !found {
+		t.Fatal("expected quota outbox row")
+	}
+	if err := s.AckQuotaOutbox(ctx, claimed.ID, claimed.Receipt); err != nil {
+		t.Fatalf("ack quota outbox: %v", err)
+	}
+	pending, err = s.HasPendingQuotaOutboxFileMutation(ctx, "file-1")
+	if err != nil {
+		t.Fatalf("has pending file mutation after ack: %v", err)
+	}
+	if pending {
+		t.Fatal("pending file mutation after ack = true, want false")
+	}
+}
+
 func TestQuotaOutboxRecoverExpired(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

@@ -451,7 +451,7 @@ func (s *Store) HasPendingQuotaOutboxFileMutation(ctx context.Context, fileID st
 	var count int
 	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox
 		WHERE file_id = ?
-		  AND mutation_type IN ('file_create', 'file_overwrite')
+		  AND mutation_type IN ('file_create', 'file_overwrite', 'upload_complete')
 		  AND status IN (?, ?)`,
 		fileID, QuotaOutboxQueued, QuotaOutboxProcessing).Scan(&count)
 	if err != nil {

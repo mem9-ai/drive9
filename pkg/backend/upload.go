@@ -274,17 +274,13 @@ func (b *Dat9Backend) InitiateUploadWithChecksumsIfRevision(ctx context.Context,
 		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
 	}
-	target, targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
+	_, targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
 	if err != nil {
 		if errors.Is(err, datastore.ErrRevisionConflict) {
 			metrics.RecordOperation("backend", "initiate_upload", "conflict", time.Since(start))
 		} else {
 			metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		}
-		return nil, err
-	}
-	if err := b.drainQuotaOutboxForUploadTarget(ctx, target, targetExists); err != nil {
-		metrics.RecordOperation("backend", "initiate_upload", "error", time.Since(start))
 		return nil, err
 	}
 
@@ -459,17 +455,13 @@ func (b *Dat9Backend) InitiateUploadV2IfRevision(ctx context.Context, path strin
 		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
 	}
-	target, targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
+	_, targetExists, err := b.validateUploadTargetRevision(ctx, path, expectedRevision)
 	if err != nil {
 		if errors.Is(err, datastore.ErrRevisionConflict) {
 			metrics.RecordOperation("backend", "initiate_upload_v2", "conflict", time.Since(start))
 		} else {
 			metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		}
-		return nil, err
-	}
-	if err := b.drainQuotaOutboxForUploadTarget(ctx, target, targetExists); err != nil {
-		metrics.RecordOperation("backend", "initiate_upload_v2", "error", time.Since(start))
 		return nil, err
 	}
 	validateDurationMs := uploadPhaseMs(validateStart)
@@ -1024,8 +1016,19 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	var insertNodeDurationMs float64
 	var semanticEnqueueDurationMs float64
 	var semanticTaskEnqueued bool
+	var quotaOutboxEnqueued bool
+	enqueueUploadCompleteOutbox := func(tx *sql.Tx) error {
+		created, err := b.enqueueQuotaUploadCompleteOutboxTx(tx,
+			uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia)
+		if err != nil {
+			return err
+		}
+		quotaOutboxEnqueued = created
+		return nil
+	}
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
+		quotaOutboxEnqueued = false
 		stepStart := time.Now()
 		if err := b.store.CompleteUploadTx(tx, uploadID); err != nil {
 			return err
@@ -1118,7 +1121,10 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 					quotaMediaDelta(oldIsMedia, newIsMedia))
 				semanticTaskEnqueued = created
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
-				return err
+				if err != nil {
+					return err
+				}
+				return enqueueUploadCompleteOutbox(tx)
 			}
 			// App-embedding mode: image/audio extract tasks are durable and
 			// independent of EMBED_TEXT, so register them in the same transaction.
@@ -1132,11 +1138,14 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 				created, err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
 				semanticTaskEnqueued = created || extractCreated
 				semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
-				return err
+				if err != nil {
+					return err
+				}
+				return enqueueUploadCompleteOutbox(tx)
 			}
 			semanticTaskEnqueued = extractCreated
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
-			return nil
+			return enqueueUploadCompleteOutbox(tx)
 		}
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -1190,7 +1199,10 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 				quotaMediaDelta(false, newIsMedia))
 			semanticTaskEnqueued = created
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
-			return err
+			if err != nil {
+				return err
+			}
+			return enqueueUploadCompleteOutbox(tx)
 		}
 		// App-embedding mode: image/audio extract tasks are durable and
 		// independent of EMBED_TEXT, so register them in the same transaction.
@@ -1204,11 +1216,14 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 			created, err := b.enqueueEmbedTaskTx(tx, confirmedFileID, confirmedRevision)
 			semanticTaskEnqueued = created || extractCreated
 			semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
-			return err
+			if err != nil {
+				return err
+			}
+			return enqueueUploadCompleteOutbox(tx)
 		}
 		semanticTaskEnqueued = extractCreated
 		semanticEnqueueDurationMs = uploadPhaseMs(stepStart)
-		return nil
+		return enqueueUploadCompleteOutbox(tx)
 	}); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_tx_failed", zap.String("upload_id", uploadID), zap.Error(err))
 		b.cleanupFailedFinalizeUpload(ctx, upload)
@@ -1219,10 +1234,14 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	}
 	txDurationMs := uploadPhaseMs(txStart)
 	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
+	b.notifyQuotaOutbox(quotaOutboxEnqueued)
 
-	// Transfer server-side reservation, update file shadow state, and mark the
-	// upload-complete mutation applied in one server-DB transaction.
-	b.completeUploadReservation(ctx, uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia)
+	if !quotaOutboxEnqueued {
+		// Preserve the non-outbox path when central quota is wired without
+		// server-quota mode; server quota uses the tenant-local outbox so
+		// upload completion is ordered with prior mutations for the same file.
+		b.completeUploadReservation(ctx, uploadID, upload.TotalSize, confirmedFileID, oldSizeBytes, oldIsMedia, upload.TotalSize, newIsMedia)
+	}
 
 	if isOverwrite {
 		b.deleteBlobIfS3Ctx(ctx, oldStorageType, oldStorageRef, upload.S3Key)
