@@ -18986,16 +18986,184 @@ func TestRmdirRejectsRemoteChildBeforeDelete(t *testing.T) {
 	opts.setDefaults()
 	fs := NewDat9FS(newTestClient(ts.URL), opts)
 	fs.inodes.Lookup("/dir", true, 0, time.Now())
+	// Register the child file in the inode table so hasKnownLocalDirectoryChildren
+	// returns true and Rmdir rejects immediately without retry.
+	fs.inodes.Lookup("/dir/file.txt", false, 1, time.Now())
 
 	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
 	if st != gofuse.Status(syscall.ENOTEMPTY) {
-		t.Fatalf("Rmdir status = %v, want ENOTEMPTY", st)
+		t.Errorf("Rmdir status = %v, want ENOTEMPTY", st)
 	}
-	if got := listCalls.Load(); got != 1 {
-		t.Fatalf("remote list calls = %d, want 1", got)
+	// With the retry logic, if the local inode state knows about the child,
+	// Rmdir returns ENOTEMPTY immediately without a remote list call.
+	if got := listCalls.Load(); got != 0 {
+		t.Errorf("remote list calls = %d, want 0", got)
 	}
 	if got := deleteCalls.Load(); got != 0 {
-		t.Fatalf("remote delete calls = %d, want 0", got)
+		t.Errorf("remote delete calls = %d, want 0", got)
+	}
+}
+
+func TestRmdirSucceedsAfterUnlinkWithStaleRemoteList(t *testing.T) {
+	// Simulate eventual consistency: a file was unlinked locally (inode
+	// marked Unlinked=true) but the remote listing still shows it.
+	// Rmdir should proceed with the delete instead of returning ENOTEMPTY,
+	// because the local state is authoritative for recently-deleted entries.
+	var deleteCalls atomic.Int32
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir" && r.URL.Query().Has("list"):
+			listCalls.Add(1)
+			// Remote still lists the deleted file (eventual consistency lag).
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{{
+					"name":  "stale.txt",
+					"isDir": false,
+					"size":  1,
+				}},
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/dir":
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/dir/stale.txt":
+			// The unlink delete succeeded on the backend.
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	// Set up the directory and the file inode.
+	dirIno := fs.inodes.Lookup("/dir", true, 0, time.Now())
+	_ = dirIno
+	fileIno := fs.inodes.Lookup("/dir/stale.txt", false, 1, time.Now())
+	_ = fileIno
+
+	// Simulate the file being unlinked: RemoveLinkPreserve marks the inode
+	// as Unlinked=true while keeping the inode alive for open handles.
+	// The real Unlink handler also records a delete tombstone.
+	fs.inodes.RemoveLinkPreserve("/dir/stale.txt")
+	fs.markPathDeleted("/dir/stale.txt")
+
+	// Rmdir: NodeId=1 (root) is the parent, "dir" is the child to remove.
+	// Should proceed to DELETE despite the stale remote listing.
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.OK {
+		t.Errorf("Rmdir status = %v, want OK (stale remote entry should be ignored)", st)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Errorf("remote delete calls = %d, want 1", got)
+	}
+}
+
+func TestRmdirSucceedsAfterFullUnlinkWithStaleRemoteList(t *testing.T) {
+	// Simulate eventual consistency: a file was unlinked and its inode fully
+	// removed from the table (RemoveLink, not RemoveLinkPreserve — no open
+	// handles). The remote listing shows the file on the first call, but
+	// returns empty on the second call (after the retry wait).
+	var listCalls atomic.Int32
+	var deleteCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir" && r.URL.Query().Has("list"):
+			n := listCalls.Add(1)
+			if n == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"entries": []map[string]any{{
+						"name": "stale.txt", "isDir": false, "size": 1,
+					}},
+				})
+			} else {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"entries": []map[string]any{},
+				})
+			}
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/dir":
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	fs.inodes.Lookup("/dir", true, 0, time.Now())
+	fs.inodes.Lookup("/dir/stale.txt", false, 1, time.Now())
+	fs.dirCache.Remove("/dir", "stale.txt")
+	fs.inodes.RemoveLink("/dir/stale.txt")
+
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	if st != gofuse.OK {
+		t.Errorf("Rmdir status = %v, want OK (should succeed after retry when remote clears)", st)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Errorf("remote delete calls = %d, want 1", got)
+	}
+}
+
+func TestRmdirSucceedsWithTombstoneFilteringStaleRemoteListing(t *testing.T) {
+	// Verify that delete tombstones filter stale remote listings even when
+	// the inode has been fully removed (RemoveLink with no open handles).
+	// The mock ALWAYS returns the stale entry (never clears), so the only way
+	// Rmdir can succeed is via the tombstone filter — not via polling.
+	var deleteCalls atomic.Int32
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir" && r.URL.Query().Has("list"):
+			listCalls.Add(1)
+			// Always returns stale entry — tombstone must filter this.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{{
+					"name": "stale.txt", "isDir": false, "size": 1,
+				}},
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/dir":
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	// Simulate: file was unlinked and inode fully removed (RemoveLink).
+	fs.inodes.Lookup("/dir", true, 0, time.Now())
+	fs.inodes.Lookup("/dir/stale.txt", false, 1, time.Now())
+	fs.dirCache.Remove("/dir", "stale.txt")
+	fs.inodes.RemoveLink("/dir/stale.txt")
+	// Record the tombstone — this is what the Unlink handler does after
+	// a successful remote delete.
+	fs.markPathDeleted("/dir/stale.txt")
+
+	// Rmdir should succeed immediately because the tombstone filters the stale
+	// entry — no polling delay needed.
+	start := time.Now()
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	elapsed := time.Since(start)
+
+	if st != gofuse.OK {
+		t.Errorf("Rmdir status = %v, want OK (tombstone should filter stale entry)", st)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Rmdir took %s, expected < 500ms (tombstone should filter without polling)", elapsed)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Errorf("remote delete calls = %d, want 1", got)
 	}
 }
 
