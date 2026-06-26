@@ -180,6 +180,7 @@ func TestServerQuotaUploadOverwriteDeltaIntegration(t *testing.T) {
 	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
 		t.Fatalf("confirm overwrite upload: %v", err)
 	}
+	b.processQuotaOutboxAvailable(ctx)
 
 	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
 	if err != nil {

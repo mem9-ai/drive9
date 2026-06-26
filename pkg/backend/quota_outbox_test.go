@@ -1,6 +1,7 @@
 package backend
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -11,6 +12,8 @@ import (
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
 	"github.com/mem9-ai/drive9/pkg/datastore"
+	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/s3client"
 )
 
 func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
@@ -349,41 +352,177 @@ func TestDrainQuotaOutboxForFileErrorsWhenPendingRowIsNotClaimable(t *testing.T)
 	}
 }
 
-func TestDrainQuotaOutboxForUploadTargetProcessesClaimableBatch(t *testing.T) {
+func TestUploadOverwriteQueuesCompleteBehindPendingFileMutation(t *testing.T) {
+	b := newTestBackendWithS3AndOptions(t, Options{QuotaSource: QuotaSourceServer})
+	fake := newFakeMetaQuotaStore()
+	fake.config["tenant-a"] = &QuotaConfigView{
+		TenantID:         "tenant-a",
+		MaxStorageBytes:  1 << 30,
+		MaxFileSizeBytes: meta.DefaultMaxFileSizeBytes(),
+		MaxMediaLLMFiles: 1000,
+		MaxMonthlyCostMC: 1 << 30,
+	}
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	if _, err := b.WriteCtx(ctx, "/target.bin", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	target, err := b.Store().Stat(ctx, "/target.bin")
+	if err != nil {
+		t.Fatalf("stat target: %v", err)
+	}
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, target.File.FileID, datastore.QuotaOutboxQueued); got != 1 {
+		t.Fatalf("queued rows before upload = %d, want 1", got)
+	}
+
+	totalSize := int64(2 << 20)
+	plan, err := b.InitiateUpload(ctx, "/target.bin", totalSize)
+	if err != nil {
+		t.Fatalf("initiate overwrite upload: %v", err)
+	}
+	if got := countQuotaOutboxRowsByFileAndMutation(t, ctx, b, target.File.FileID, quotaMutationTypeFileCreate, datastore.QuotaOutboxQueued); got != 1 {
+		t.Fatalf("queued create rows after initiate = %d, want 1", got)
+	}
+	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("get usage after initiate: %v", err)
+	}
+	if usage.StorageBytes != 0 || usage.ReservedBytes != totalSize || usage.FileCount != 0 {
+		t.Fatalf("usage after initiate = %+v, want storage=0 reserved=%d files=0", usage, totalSize)
+	}
+
+	upload, err := b.GetUpload(ctx, plan.UploadID)
+	if err != nil {
+		t.Fatalf("get upload: %v", err)
+	}
+	partData := bytes.Repeat([]byte{7}, int(totalSize))
+	for _, p := range plan.Parts {
+		start := int64(p.Number-1) * plan.PartSize
+		end := start + p.Size
+		if end > totalSize {
+			end = totalSize
+		}
+		if _, err := b.S3().(*s3client.LocalS3Client).UploadPart(ctx, upload.S3UploadID, p.Number, bytes.NewReader(partData[start:end])); err != nil {
+			t.Fatalf("upload part %d: %v", p.Number, err)
+		}
+	}
+	if err := b.ConfirmUpload(ctx, plan.UploadID); err != nil {
+		t.Fatalf("confirm upload: %v", err)
+	}
+	if got := countQuotaOutboxRowsByFileAndMutation(t, ctx, b, target.File.FileID, quotaMutationTypeFileCreate, datastore.QuotaOutboxQueued); got != 1 {
+		t.Fatalf("queued create rows after confirm = %d, want 1", got)
+	}
+	if got := countQuotaOutboxRowsByFileAndMutation(t, ctx, b, target.File.FileID, quotaMutationTypeUploadComplete, datastore.QuotaOutboxQueued); got != 1 {
+		t.Fatalf("queued upload-complete rows after confirm = %d, want 1", got)
+	}
+
+	b.processQuotaOutboxAvailable(ctx)
+	usage, err = fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("get usage after outbox: %v", err)
+	}
+	if usage.StorageBytes != totalSize || usage.ReservedBytes != 0 || usage.FileCount != 1 {
+		t.Fatalf("usage after outbox = %+v, want storage=%d reserved=0 files=1", usage, totalSize)
+	}
+	fileMeta, err := fake.GetFileMeta(ctx, "tenant-a", target.File.FileID)
+	if err != nil {
+		t.Fatalf("get central file meta: %v", err)
+	}
+	if fileMeta.SizeBytes != totalSize {
+		t.Fatalf("central file meta size = %d, want %d", fileMeta.SizeBytes, totalSize)
+	}
+	if got := countPendingQuotaOutboxRowsByFile(t, ctx, b, target.File.FileID); got != 0 {
+		t.Fatalf("pending quota outbox rows after drain = %d, want 0", got)
+	}
+}
+
+func TestUploadCompleteOutboxRetryAfterCentralApplyDoesNotDoubleCharge(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
 	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
-	if _, err := b.WriteCtx(ctx, "/older.txt", []byte("older"), 0, filesystem.WriteFlagCreate); err != nil {
-		t.Fatalf("write older: %v", err)
+	const (
+		uploadID = "upload-retry-after-central-apply"
+		fileID   = "file-retry-after-central-apply"
+		size     = int64(128)
+	)
+	if err := fake.AtomicReserveAndInsertUpload(ctx, &UploadReservationView{
+		TenantID:       "tenant-a",
+		UploadID:       uploadID,
+		ReservedBytes:  size,
+		FileCountDelta: 1,
+		TargetPath:     "/retry.bin",
+		Status:         "active",
+		ExpiresAt:      time.Now().Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("reserve upload: %v", err)
 	}
-	older, err := b.Store().Stat(ctx, "/older.txt")
-	if err != nil {
-		t.Fatalf("stat older: %v", err)
-	}
-	if _, err := b.WriteCtx(ctx, "/target.txt", []byte("target"), 0, filesystem.WriteFlagCreate); err != nil {
-		t.Fatalf("write target: %v", err)
-	}
-	target, err := b.Store().Stat(ctx, "/target.txt")
-	if err != nil {
-		t.Fatalf("stat target: %v", err)
+	raw := mustQuotaMutationJSON(t, uploadCompleteMutationData{
+		UploadID:      uploadID,
+		FileID:        fileID,
+		ReservedBytes: size,
+		NewSizeBytes:  size,
+	})
+	if _, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
+		FileID:       fileID,
+		MutationType: quotaMutationTypeUploadComplete,
+		MutationData: raw,
+	}); err != nil {
+		t.Fatalf("enqueue upload complete: %v", err)
 	}
 
-	if err := b.drainQuotaOutboxForUploadTarget(ctx, target, true); err != nil {
-		t.Fatalf("drain target: %v", err)
+	claimAt := time.Now().UTC()
+	entry, found, err := b.store.ClaimQuotaOutbox(ctx, claimAt, time.Second)
+	if err != nil {
+		t.Fatalf("claim upload complete: %v", err)
 	}
-	if got := countQuotaOutboxRowsByFile(t, ctx, b, older.File.FileID, datastore.QuotaOutboxSucceeded); got != 1 {
-		t.Fatalf("older succeeded rows = %d, want 1", got)
+	if !found {
+		t.Fatal("claim upload complete: not found")
 	}
-	if got := countQuotaOutboxRowsByFile(t, ctx, b, target.File.FileID, datastore.QuotaOutboxSucceeded); got != 1 {
-		t.Fatalf("target succeeded rows = %d, want 1", got)
+	if err := b.applyQuotaOutboxEntry(ctx, entry); err != nil {
+		t.Fatalf("first central apply: %v", err)
 	}
 	usage, err := fake.GetQuotaUsage(ctx, "tenant-a")
 	if err != nil {
-		t.Fatalf("get usage: %v", err)
+		t.Fatalf("get usage after first apply: %v", err)
 	}
-	if usage.StorageBytes != int64(len("older")+len("target")) || usage.FileCount != 2 {
-		t.Fatalf("central usage after drain = %+v, want both files applied", usage)
+	if usage.StorageBytes != size || usage.ReservedBytes != 0 || usage.FileCount != 1 {
+		t.Fatalf("usage after first apply = %+v, want storage=%d reserved=0 files=1", usage, size)
+	}
+
+	recoverAt := claimAt.Add(2 * time.Second)
+	recovered, err := b.store.RecoverExpiredQuotaOutbox(ctx, recoverAt, 10)
+	if err != nil {
+		t.Fatalf("recover expired outbox: %v", err)
+	}
+	if recovered != 1 {
+		t.Fatalf("recovered rows = %d, want 1", recovered)
+	}
+	retryEntry, found, err := b.store.ClaimQuotaOutbox(ctx, recoverAt.Add(time.Second), quotaOutboxLeaseDuration)
+	if err != nil {
+		t.Fatalf("reclaim upload complete: %v", err)
+	}
+	if !found {
+		t.Fatal("reclaim upload complete: not found")
+	}
+	applied, processed, err := b.processQuotaOutboxEntry(ctx, retryEntry)
+	if err != nil {
+		t.Fatalf("retry process upload complete: %v", err)
+	}
+	if !applied || !processed {
+		t.Fatalf("retry process applied=%t processed=%t, want true/true", applied, processed)
+	}
+	usage, err = fake.GetQuotaUsage(ctx, "tenant-a")
+	if err != nil {
+		t.Fatalf("get usage after retry: %v", err)
+	}
+	if usage.StorageBytes != size || usage.ReservedBytes != 0 || usage.FileCount != 1 {
+		t.Fatalf("usage after retry = %+v, want storage=%d reserved=0 files=1", usage, size)
+	}
+	if got := countQuotaOutboxRowsByFile(t, ctx, b, fileID, datastore.QuotaOutboxSucceeded); got != 1 {
+		t.Fatalf("succeeded upload-complete rows = %d, want 1", got)
 	}
 }
 
@@ -680,6 +819,27 @@ func countQuotaOutboxRowsByFile(t *testing.T, ctx context.Context, b *Dat9Backen
 	t.Helper()
 	var count int
 	if err := b.Store().DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox WHERE file_id = ? AND status = ?`, fileID, status).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func countQuotaOutboxRowsByFileAndMutation(t *testing.T, ctx context.Context, b *Dat9Backend, fileID string, mutationType string, status datastore.QuotaOutboxStatus) int {
+	t.Helper()
+	var count int
+	if err := b.Store().DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox
+		WHERE file_id = ? AND mutation_type = ? AND status = ?`, fileID, mutationType, status).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func countPendingQuotaOutboxRowsByFile(t *testing.T, ctx context.Context, b *Dat9Backend, fileID string) int {
+	t.Helper()
+	var count int
+	if err := b.Store().DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox
+		WHERE file_id = ? AND status IN (?, ?)`,
+		fileID, datastore.QuotaOutboxQueued, datastore.QuotaOutboxProcessing).Scan(&count); err != nil {
 		t.Fatal(err)
 	}
 	return count

@@ -160,7 +160,20 @@ type Dat9FS struct {
 	// the dat9 client). When 0, defaultSmallFileThreshold is used. Use the
 	// inlineThreshold() accessor; do not read directly.
 	smallFileMax atomic.Int64
+
+	// xattrs provides in-memory extended attribute storage for the mount session.
+	xattrs *XAttrStore
+
+	// deletedPaths tracks recently-unlinked paths as tombstones, so that
+	// remoteDirectoryHasChildren can filter out stale backend listings during
+	// the eventual-consistency window after a successful Unlink. Entries
+	// expire after deletedPathTTL (default 30s).
+	deletedPaths   map[string]time.Time
+	deletedPathsMu sync.Mutex
 }
+
+// deletedPathTTL is how long a delete tombstone remains active.
+const deletedPathTTL = 30 * time.Second
 
 // newWriteBuffer constructs a WriteBuffer with the small-file fast-path
 // cutoff aligned to the negotiated server inline_threshold.
@@ -263,6 +276,8 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		gitOverlayPending: make(map[string]map[string]pendingGitOverlayEntry),
 		readFlight:        NewSingleFlight(),
 		remoteReadTimeout: fuseTimeout,
+		xattrs:            NewXAttrStore(),
+		deletedPaths:     make(map[string]time.Time),
 	}
 }
 
@@ -4972,6 +4987,57 @@ func (fs *Dat9FS) hasKnownLocalDirectoryChildren(dirPath string) bool {
 	return false
 }
 
+// markPathDeleted records a delete tombstone for the given path. This is
+// called by the Unlink handler after a successful remote delete, so that
+// remoteDirectoryHasChildren can filter out stale backend listings during
+// the eventual-consistency window — even when the inode has been fully
+// removed (RemoveLink with no open handles).
+func (fs *Dat9FS) markPathDeleted(path string) {
+	if fs == nil || path == "" {
+		return
+	}
+	fs.deletedPathsMu.Lock()
+	defer fs.deletedPathsMu.Unlock()
+	if fs.deletedPaths == nil {
+		fs.deletedPaths = make(map[string]time.Time)
+	}
+	fs.deletedPaths[path] = time.Now()
+	// Threshold-triggered GC: prune expired tombstones every 100 writes
+	// to avoid O(n) per-call overhead during bulk deletes (rm -rf).
+	if len(fs.deletedPaths)%100 == 0 {
+		fs.pruneExpiredDeletedPathsLocked()
+	}
+}
+
+// pruneExpiredDeletedPathsLocked removes tombstones past their TTL.
+// Caller must hold deletedPathsMu.
+func (fs *Dat9FS) pruneExpiredDeletedPathsLocked() {
+	now := time.Now()
+	for p, ts := range fs.deletedPaths {
+		if now.Sub(ts) > deletedPathTTL {
+			delete(fs.deletedPaths, p)
+		}
+	}
+}
+
+// snapshotDeletedPaths returns a set of paths that have active delete
+// tombstones (recorded within deletedPathTTL). Safe for concurrent use.
+func (fs *Dat9FS) snapshotDeletedPaths() map[string]struct{} {
+	if fs == nil {
+		return nil
+	}
+	fs.deletedPathsMu.Lock()
+	defer fs.deletedPathsMu.Unlock()
+	now := time.Now()
+	out := make(map[string]struct{})
+	for p, ts := range fs.deletedPaths {
+		if now.Sub(ts) <= deletedPathTTL {
+			out[p] = struct{}{}
+		}
+	}
+	return out
+}
+
 func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string) (bool, error) {
 	listStart := fs.perfStart()
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
@@ -4979,10 +5045,35 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 	if err != nil {
 		return false, err
 	}
-	if fs.dirCache != nil {
-		fs.dirCache.Put(dirPath, cachedFileInfos(items))
+	// Filter out entries that have active delete tombstones. This handles
+	// eventual-consistency lag where a just-deleted file still appears in
+	// the remote listing, which would cause Rmdir to incorrectly return
+	// ENOTEMPTY for a directory the client knows is empty.
+	//
+	// Tombstones are recorded by Unlink/Rmdir after a successful remote
+	// delete and cover both the RemoveLink (no open handles, inode fully
+	// removed) and RemoveLinkPreserve (open handles, inode retained with
+	// Unlinked=true) cases. Using tombstones exclusively avoids O(n) full
+	// inode table scans per remoteDirectoryHasChildren call.
+	deletedTombstones := fs.snapshotDeletedPaths()
+	liveItems := make([]client.FileInfo, 0, len(items))
+	for _, item := range items {
+		if !validDirEntryName(item.Name) {
+			continue
+		}
+		childP := dirPath + "/" + item.Name
+		if dirPath == "/" {
+			childP = "/" + item.Name
+		}
+		if _, isTombstoned := deletedTombstones[childP]; isTombstoned {
+			continue // recently deleted (tombstone), skip
+		}
+		liveItems = append(liveItems, item)
 	}
-	return len(items) > 0, nil
+	if fs.dirCache != nil {
+		fs.dirCache.Put(dirPath, cachedFileInfos(liveItems))
+	}
+	return len(liveItems) > 0, nil
 }
 
 func (fs *Dat9FS) remoteHardlinkCommittedDetached(srcP, dstP string) bool {
@@ -7421,6 +7512,15 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	fs.dirCache.Remove(parentPath, name)
 	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.cacheNegativePath(childP)
+	// Clean up in-memory xattrs for the unlinked path.
+	if fs.xattrs != nil {
+		fs.xattrs.RemoveAll(childP)
+	}
+	// Record a delete tombstone so remoteDirectoryHasChildren can filter
+	// this path out of stale backend listings during the eventual-consistency
+	// window — even after the inode has been fully removed (RemoveLink with
+	// no open handles, where the inode is fully removed).
+	fs.markPathDeleted(childP)
 	// Kernel initiated the unlink and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
 	return gofuse.OK
@@ -7533,14 +7633,87 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			}
 		}
 		if len(entries) > 0 {
+			// Remote/overlay listing shows children. If the local inode state
+			// is empty, the listing may be stale (eventual-consistency lag on
+			// just-completed Unlinks). Poll for up to 2 seconds (4 × 500ms), using
+			// remoteDirectoryHasChildren (which filters locally-unlinked entries)
+			// instead of listDir (which doesn't filter).
+			if !fs.hasKnownLocalDirectoryChildren(childP) {
+				fs.debugf("rmdir path=%s layer listing has %d entries but no local children, polling for up to 2s", childP, len(entries))
+				fs.dirCache.Invalidate(childP)
+				deadline := time.Now().Add(2 * time.Second)
+				for time.Now().Before(deadline) {
+					select {
+					case <-time.After(500 * time.Millisecond):
+					case <-ctx.Done():
+						status = gofuse.Status(syscall.EINTR)
+						return status
+					case <-cancel:
+						status = gofuse.Status(syscall.EINTR)
+						return status
+					}
+					hasChildren, listErr := fs.remoteDirectoryHasChildren(ctx, childP)
+					if listErr != nil || !hasChildren {
+						entries = nil
+						break
+					}
+					fs.dirCache.Invalidate(childP)
+				}
+			}
+			if len(entries) > 0 {
+				status = gofuse.Status(syscall.ENOTEMPTY)
+				return status
+			}
+		}
+	} else {
+		// Check local state first. If the directory has known local children,
+		// we can return ENOTEMPTY without a remote round-trip.
+		if fs.hasKnownLocalDirectoryChildren(childP) {
 			status = gofuse.Status(syscall.ENOTEMPTY)
 			return status
 		}
-	} else if hasChildren, err := fs.remoteDirectoryHasChildren(ctx, childP); err == nil && hasChildren {
-		status = gofuse.Status(syscall.ENOTEMPTY)
-		return status
-	} else if err != nil {
-		fs.debugf("rmdir pre-delete list failed path=%s err=%v", childP, err)
+		// Local state says empty. The remote listing may be stale due to
+		// eventual-consistency lag on just-completed Unlinks. We skip the
+		// non-cancel-aware WaitPrefix/WaitPath calls and rely on tombstones
+		// + the cancel-aware polling loop below to handle eventual consistency.
+		// This avoids widening the uninterruptible wait surface for rmdir.
+		// Now check the remote listing. If it still shows children, it's
+		// either a real child (not locally known) or eventual-consistency lag.
+		// Poll for up to 2 seconds (4 × 500ms) when the local state is empty,
+		// giving the backend time to propagate recent deletes.
+		hasChildren, err := fs.remoteDirectoryHasChildren(ctx, childP)
+		if err == nil && hasChildren {
+			// Invalidate the dirCache entry that was just written from the
+			// potentially-stale remote listing, so hasKnownLocalDirectoryChildren
+			// checks only the local inode state (which is authoritative).
+			fs.dirCache.Invalidate(childP)
+			if !fs.hasKnownLocalDirectoryChildren(childP) {
+				fs.debugf("rmdir path=%s remote has children but no local children, polling for up to 2s", childP)
+				deadline := time.Now().Add(2 * time.Second)
+				for time.Now().Before(deadline) {
+					select {
+					case <-time.After(500 * time.Millisecond):
+					case <-ctx.Done():
+						status = gofuse.Status(syscall.EINTR)
+						return status
+					case <-cancel:
+						status = gofuse.Status(syscall.EINTR)
+						return status
+					}
+					hasChildren, err = fs.remoteDirectoryHasChildren(ctx, childP)
+					if err != nil || !hasChildren {
+						break
+					}
+					fs.dirCache.Invalidate(childP)
+				}
+			}
+		}
+		if err == nil && hasChildren {
+			status = gofuse.Status(syscall.ENOTEMPTY)
+			return status
+		} else if err != nil {
+			fs.debugf("rmdir pre-delete list failed path=%s err=%v", childP, err)
+		}
 	}
 
 	deleteStart := time.Now()
@@ -7596,6 +7769,13 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	fs.dirCache.Remove(parentPath, name)
 	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.cacheNegativePath(childP)
+	// Clean up in-memory xattrs for the removed directory and its children.
+	if fs.xattrs != nil {
+		fs.xattrs.RemoveAll(childP)
+	}
+	// Record a delete tombstone for the removed directory so that
+	// remoteDirectoryHasChildren on the parent can filter it out.
+	fs.markPathDeleted(childP)
 	// Kernel initiated the rmdir and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
 	return gofuse.OK
@@ -7782,6 +7962,10 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	}
 	fs.inodes.Rename(oldP, newP)
 	fs.renameSpecialNodeSubtree(oldP, newP)
+	// Migrate in-memory xattrs from old path to new path.
+	if fs.xattrs != nil {
+		fs.xattrs.Rename(oldP, newP)
+	}
 	fs.invalidateReadCacheAndTargets(oldP)
 	fs.invalidateReadCacheAndTargets(newP)
 	fs.readCache.InvalidatePrefix(oldP + "/")
@@ -12165,22 +12349,72 @@ func (fs *Dat9FS) StatFs(cancel <-chan struct{}, header *gofuse.InHeader, out *g
 	return gofuse.OK
 }
 
-// --- Xattr stubs (macOS Finder/Spotlight compatibility) ----------------------
+// --- Xattr handlers (in-memory, session-scoped) ----------------------------
 
 func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string, dest []byte) (uint32, gofuse.Status) {
-	return 0, gofuse.ENOATTR
+	path, ok := fs.inodes.GetPath(header.NodeId)
+	if !ok {
+		return 0, gofuse.ENOENT
+	}
+	val, found := fs.xattrs.Get(path, attr)
+	if !found {
+		return 0, gofuse.ENOATTR
+	}
+	if len(dest) == 0 {
+		return uint32(len(val)), gofuse.OK
+	}
+	if len(val) > len(dest) {
+		return uint32(len(val)), gofuse.Status(syscall.ERANGE)
+	}
+	copy(dest, val)
+	return uint32(len(val)), gofuse.OK
 }
 
 func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, dest []byte) (uint32, gofuse.Status) {
-	return 0, gofuse.OK
+	path, ok := fs.inodes.GetPath(header.NodeId)
+	if !ok {
+		return 0, gofuse.ENOENT
+	}
+	names := fs.xattrs.List(path)
+	var total int
+	for _, name := range names {
+		total += len(name) + 1
+	}
+	if len(dest) == 0 {
+		return uint32(total), gofuse.OK
+	}
+	if total > len(dest) {
+		return uint32(total), gofuse.Status(syscall.ERANGE)
+	}
+	off := 0
+	for _, name := range names {
+		off += copy(dest[off:], name)
+		dest[off] = 0
+		off++
+	}
+	return uint32(off), gofuse.OK
 }
 
 func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, attr string, data []byte) gofuse.Status {
+	path, ok := fs.inodes.GetPath(input.NodeId)
+	if !ok {
+		return gofuse.ENOENT
+	}
+	if err := fs.xattrs.SetWithFlags(path, attr, data, input.Flags); err != 0 {
+		return gofuse.Status(err)
+	}
 	return gofuse.OK
 }
 
 func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string) gofuse.Status {
-	return gofuse.ENOATTR
+	path, ok := fs.inodes.GetPath(header.NodeId)
+	if !ok {
+		return gofuse.ENOENT
+	}
+	if !fs.xattrs.Remove(path, attr) {
+		return gofuse.ENOATTR
+	}
+	return gofuse.OK
 }
 
 // onCommitQueueSuccess is called by the commit queue after a successful upload.

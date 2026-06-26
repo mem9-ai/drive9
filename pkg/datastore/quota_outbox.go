@@ -242,10 +242,12 @@ func (s *Store) AckQuotaOutboxBatchTx(ctx context.Context, tx *sql.Tx, entries [
 		}
 		ids = append(ids, entries[i].ID)
 	}
-	args := append([]any{QuotaOutboxSucceeded, now, now, QuotaOutboxProcessing, receipt, now}, ids...)
+	// Receipt is the worker ownership token. Recovery clears receipt before
+	// requeueing, so stale owners cannot match after another worker reclaims.
+	args := append([]any{QuotaOutboxSucceeded, now, now, QuotaOutboxProcessing, receipt}, ids...)
 	res, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE quota_outbox SET status = ?, receipt = NULL,
 		leased_at = NULL, lease_until = NULL, completed_at = ?, updated_at = ?
-		WHERE status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?
+		WHERE status = ? AND receipt = ?
 		  AND id IN (%s)`, sqlPlaceholders(len(entries))), args...)
 	if err != nil {
 		return err
@@ -264,8 +266,8 @@ func (s *Store) ackQuotaOutbox(ctx context.Context, db execer, id int64, receipt
 	now := time.Now().UTC()
 	res, err := db.ExecContext(ctx, `UPDATE quota_outbox SET status = ?, receipt = NULL,
 		leased_at = NULL, lease_until = NULL, completed_at = ?, updated_at = ?
-		WHERE id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
-		QuotaOutboxSucceeded, now, now, id, QuotaOutboxProcessing, receipt, now)
+		WHERE id = ? AND status = ? AND receipt = ?`,
+		QuotaOutboxSucceeded, now, now, id, QuotaOutboxProcessing, receipt)
 	if err != nil {
 		return err
 	}
@@ -331,7 +333,9 @@ func (s *Store) retryQuotaOutboxTx(ctx context.Context, tx *sql.Tx, id int64, re
 	if err != nil {
 		return err
 	}
-	if entry.Status != QuotaOutboxProcessing || entry.Receipt != receipt || entry.LeaseUntil == nil || !entry.LeaseUntil.After(now) {
+	// Receipt is the worker ownership token. Recovery clears the receipt before
+	// requeueing, so stale owners fail here even when their old lease expired.
+	if entry.Status != QuotaOutboxProcessing || entry.Receipt != receipt {
 		return ErrQuotaOutboxLeaseMismatch
 	}
 
@@ -449,7 +453,7 @@ func (s *Store) HasPendingQuotaOutboxFileMutation(ctx context.Context, fileID st
 	var count int
 	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox
 		WHERE file_id = ?
-		  AND mutation_type IN ('file_create', 'file_overwrite')
+		  AND mutation_type IN ('file_create', 'file_overwrite', 'upload_complete')
 		  AND status IN (?, ?)`,
 		fileID, QuotaOutboxQueued, QuotaOutboxProcessing).Scan(&count)
 	if err != nil {

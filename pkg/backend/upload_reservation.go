@@ -323,8 +323,7 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 //     claim on reserved_bytes is real, so we transfer reserved → storage.
 //
 //   - settled=false: no active reservation row found. This covers THREE
-//     sub-cases that are indistinguishable from the apply tx's POV and must
-//     all land on the same code path:
+//     sub-cases:
 //     (1) fail-open initiate — reserveUploadOnServer returned (false, nil)
 //     because the server DB was unreachable; no reserved_bytes were
 //     ever claimed and no reservation row was written.
@@ -335,9 +334,12 @@ func (b *Dat9Backend) completeUploadReservation(ctx context.Context, uploadID st
 //     but ExpireActiveReservations released it (and backed out the
 //     reserved_bytes) between initiate and this apply tx.
 //
-//     In all three sub-cases reserved_bytes is either untouched (case 1) or
-//     already balanced (cases 2, 3), so we skip the reserved→storage
-//     transfer and charge storage_bytes directly with newSizeBytes.
+//     If file_meta already equals the post-upload state, the row is a
+//     duplicate retry after a previous central apply committed but the
+//     tenant-local ack did not. In that case this helper is a no-op. Otherwise
+//     reserved_bytes is either untouched (case 1) or already balanced
+//     (cases 2, 3), so we skip the reserved→storage transfer and charge
+//     storage_bytes directly with newSizeBytes.
 //
 // This function is package-level (not a *Dat9Backend method) so that the
 // replay worker — which only holds a MetaQuotaStore, no backend — can call
@@ -355,16 +357,21 @@ func applyUploadCompleteTx(store MetaQuotaStore, tx *sql.Tx, tenantID string, da
 		mediaDelta = -1
 	}
 	oldExists := false
+	var oldMeta *FileMetaView
 	if old, err := store.GetFileMetaForUpdateTx(tx, tenantID, data.FileID); err != nil {
 		if !errors.Is(err, meta.ErrNotFound) {
 			return err
 		}
 	} else if old != nil {
 		oldExists = true
+		oldMeta = old
 	}
 	settled, reservedFileCountDelta, err := store.SettleActiveReservationTx(tx, tenantID, data.UploadID, "completed")
 	if err != nil {
 		return err
+	}
+	if !settled && oldMeta != nil && oldMeta.SizeBytes == data.NewSizeBytes && oldMeta.IsMedia == data.NewIsMedia {
+		return nil
 	}
 	if settled {
 		if err := store.TransferReservedToConfirmedTx(tx, tenantID, -data.ReservedBytes, data.ReservedBytes); err != nil {
