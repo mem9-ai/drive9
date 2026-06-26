@@ -1,0 +1,26 @@
+{
+  "description": "Known unsupported or platform-sensitive pjdfstests. These are reported as XFAIL_KNOWN instead of FAIL_REGRESSION.",
+  "known_xfail_groups": [
+    "chown",
+    "mkfifo",
+    "mknod",
+    "xattr"
+  ],
+  "known_xfail_paths": [
+    "chmod/00.t",
+    "chmod/01.t",
+    "chmod/03.t",
+    "chmod/07.t",
+    "chmod/11.t",
+    "link/00.t",
+    "link/01.t"
+  ],
+  "darwin_known_xfail_groups": [
+    "chmod",
+    "chown"
+  ],
+  "notes": [
+    "Tune this file as Drive9 FUSE POSIX coverage improves.",
+    "The raw pjdfstests pass rate is still emitted, even when effective pass rate excludes XFAIL_KNOWN rows."
+  ]
+}

@@ -1,0 +1,56 @@
+{
+  "defaults": {
+    "runs": 1,
+    "small_file_count": 512,
+    "small_file_bytes": 4096,
+    "metadata_count": 1000,
+    "random_reads": 4096,
+    "sequential_sizes_mib": [1, 64, 512],
+    "sqlite_rows": 2000,
+    "repo_timeout_seconds": 1800
+  },
+  "micro_workloads": [
+    "sequential_write_read",
+    "random_read_4k",
+    "small_file_churn",
+    "metadata_churn",
+    "sqlite_wal",
+    "grep_rg_find"
+  ],
+  "repo_workloads": [
+    "native_git_clone",
+    "fuse_git_clone",
+    "drive9_git_clone_fast",
+    "drive9_git_clone_fast_blobless",
+    "drive9_git_clone_fast_blobless_hydrate_off",
+    "build",
+    "rg",
+    "edit_commit",
+    "patch_commit",
+    "sandbox_restore"
+  ],
+  "repos": [
+    {
+      "id": "drive9",
+      "url": "https://github.com/mem9-ai/drive9.git",
+      "ref": "main",
+      "build_dir": ".",
+      "build": ["make build"],
+      "source_extensions": [".go", ".md", ".sh", ".yml", ".yaml"],
+      "rg_pattern": "TODO|FIXME|func|type|interface|panic|error"
+    },
+    {
+      "id": "kimi-code",
+      "url": "https://github.com/MoonshotAI/kimi-code.git",
+      "ref": "main",
+      "build_dir": ".",
+      "build": [
+        "corepack enable",
+        "corepack pnpm install --frozen-lockfile",
+        "corepack pnpm run build"
+      ],
+      "source_extensions": [".ts", ".tsx", ".js", ".jsx", ".md", ".css", ".vue"],
+      "rg_pattern": "TODO|FIXME|class|interface|function|async|await|Error"
+    }
+  ]
+}

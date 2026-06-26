@@ -1,0 +1,90 @@
+name: blackbox
+
+on:
+  workflow_dispatch:
+    inputs:
+      selector:
+        description: "Selection to run: all, group:<name>, category:<prefix>, module:<id[,id...]>, or a bare module id"
+        required: false
+        default: "all"
+        type: string
+      runs:
+        description: "Performance run count"
+        required: false
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: blackbox-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  BLACKBOX_SUITE: fuse
+  BLACKBOX_SELECTOR: ${{ inputs.selector || 'all' }}
+  BLACKBOX_RUNS: ${{ inputs.runs || '1' }}
+  BLACKBOX_STRICT: "1"
+  PJDFSTEST_ALLOW_NONROOT: "1"
+  DRIVE9_LOCAL_EMBEDDING_MODE: none
+  DRIVE9_LOCAL_INIT_SCHEMA: "true"
+
+jobs:
+  blackbox:
+    name: blackbox (${{ env.BLACKBOX_SUITE }} / ${{ env.BLACKBOX_SELECTOR }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake bison build-essential fio flex fuse3 gettext git libacl1-dev libcurl4-openssl-dev libmpich-dev libssl-dev libtool mpich perl pkg-config python3-dev python3-pip zlib1g-dev
+
+      - name: Cache blackbox dependencies
+        uses: actions/cache@v4
+        with:
+          path: blackbox/cache
+          key: blackbox-${{ env.BLACKBOX_SUITE }}-${{ runner.os }}-${{ hashFiles('blackbox/suites/**/dependencies.json') }}
+          restore-keys: |
+            blackbox-${{ env.BLACKBOX_SUITE }}-${{ runner.os }}-
+            blackbox-${{ runner.os }}-
+
+      - name: Prepare blackbox dependencies
+        run: make blackbox-deps BLACKBOX_SUITE="$BLACKBOX_SUITE" BLACKBOX_SELECTOR="$BLACKBOX_SELECTOR"
+
+      - name: Run blackbox
+        run: make blackbox BLACKBOX_SUITE="$BLACKBOX_SUITE" BLACKBOX_SELECTOR="$BLACKBOX_SELECTOR" BLACKBOX_RUNS="$BLACKBOX_RUNS"
+
+      - name: Publish job summary
+        if: always()
+        run: |
+          latest="$(find "blackbox/results/$BLACKBOX_SUITE" -name report.md -type f 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$latest" ]; then
+            cat "$latest" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No blackbox report produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload blackbox artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackbox-${{ env.BLACKBOX_SUITE }}
+          path: blackbox/results/${{ env.BLACKBOX_SUITE }}/**
+          if-no-files-found: warn

@@ -37,6 +37,8 @@ dist/
 build/
 tmp/
 .codex-gocache/
+.codex-golangci-cache/
+.codex-gomodcache/
 /dat9
 /drive9
 /drive9-server
@@ -49,3 +51,7 @@ second_opinion*
 # E2E generated reports
 e2e/reports/
 third_party/pjdfstest/
+blackbox/cache/
+blackbox/results/
+blackbox/work/
+blackbox-runs/
