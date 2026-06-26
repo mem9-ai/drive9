@@ -242,6 +242,7 @@ prepare_cli_binary() {
   case "$CLI_SOURCE" in
     build)
       make -C "$REPO_ROOT" build-cli CLI_BIN="$CLI_BIN"
+      chmod +x "$CLI_BIN"
       ;;
     official)
       download_official_cli

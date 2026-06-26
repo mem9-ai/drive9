@@ -235,6 +235,7 @@ json_body() { printf '%s' "$1" | sed '/__HTTP__/d'; }
 prepare_cli_binary() {
   CLI_BIN="$(mktemp)"
   make build-cli CLI_BIN="$CLI_BIN"
+  chmod +x "$CLI_BIN"
 }
 
 # write_crash_workload writes the pre-crash workload through the mount and

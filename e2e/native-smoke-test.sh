@@ -58,7 +58,10 @@ download_official_cli() {
 prepare_cli_binary() {
   CLI_BIN="$(mktemp)"
   case "$CLI_SOURCE" in
-    build) make build-cli CLI_BIN="$CLI_BIN" ;;
+    build)
+      make build-cli CLI_BIN="$CLI_BIN"
+      chmod +x "$CLI_BIN"
+      ;;
     official) download_official_cli ;;
     *) echo "invalid CLI_SOURCE: $CLI_SOURCE (expected build|official)" >&2; return 1 ;;
   esac
