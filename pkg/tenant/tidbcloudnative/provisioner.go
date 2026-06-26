@@ -100,7 +100,10 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 	if _, err := normalizeDatabaseName(defaultDB); err != nil {
 		return nil, fmt.Errorf("invalid %s: %w", EnvTiDBCloudNativeDefaultDatabaseName, err)
 	}
-	usePrivate := parseBoolEnv(EnvTiDBCloudNativeUsePrivateEndpoint)
+	usePrivate, err := parseBoolEnv(EnvTiDBCloudNativeUsePrivateEndpoint)
+	if err != nil {
+		return nil, err
+	}
 	privateHost := strings.TrimSpace(os.Getenv(EnvTiDBCloudTencentPrivateEndpointHost))
 	if usePrivate && strings.EqualFold(cloudProvider, "tencentcloud") && privateHost == "" {
 		return nil, fmt.Errorf("%s is required when %s=true and cloud provider is tencentcloud",
@@ -274,11 +277,12 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 		return nil, nil, fmt.Errorf("tidbcloud native response missing cluster id")
 	}
 	if clusterProvisionMetadataIncomplete(info, p.usePrivateEndpoint, p.tencentPrivateEndpointHost) {
-		info, err = p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, info.ClusterID)
+		clusterID := info.ClusterID
+		info, err = p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, clusterID)
 		if err != nil {
 			return &tenant.ClusterInfo{
 				TenantID:  tenantID,
-				ClusterID: info.ClusterID,
+				ClusterID: clusterID,
 				Password:  password,
 				DBName:    dbName,
 				Provider:  tenant.ProviderTiDBCloudNative,
@@ -831,9 +835,18 @@ func parseDefaultSpendLimit(raw string) (*int32, error) {
 	return &out, nil
 }
 
-func parseBoolEnv(name string) bool {
+func parseBoolEnv(name string) (bool, error) {
 	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
-	return v == "1" || v == "true" || v == "yes"
+	if v == "" {
+		return false, nil
+	}
+	switch v {
+	case "1", "true", "yes":
+		return true, nil
+	case "0", "false", "no":
+		return false, nil
+	}
+	return false, fmt.Errorf("%s must be 1/true/yes or 0/false/no, got %q", name, os.Getenv(name))
 }
 
 func normalizeDatabaseName(name string) (string, error) {
