@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -470,8 +472,15 @@ func Mount(opts *MountOptions) error {
 	// thread consumes the last GOMAXPROCS slot, leaving no thread to handle
 	// the POLL request from the kernel).
 	if err := server.WaitMount(); err != nil {
-		stopWatchers()
-		return fmt.Errorf("fuse wait mount: %w", err)
+		if ok, probeErr := shouldContinueAfterWaitMountPermissionError(err, opts.MountPoint, probeMountPointReady); ok {
+			fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission error ignored after readiness probe passed at %s: %v\n", opts.MountPoint, err)
+		} else {
+			if probeErr != nil {
+				fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission fallback probe failed at %s: %v\n", opts.MountPoint, probeErr)
+			}
+			stopWatchers()
+			return fmt.Errorf("fuse wait mount: %w", err)
+		}
 	}
 	controlServer, err := startMountControlServer(opts.MountPoint, dat9fs)
 	if err != nil {
@@ -652,6 +661,53 @@ func Mount(opts *MountOptions) error {
 		opts.MountPoint, opts.Server, actorID, opts.ReadOnly, opts.WritePolicy, cacheBase, shadowDir)
 	server.Wait()
 	shutdown()
+	return nil
+}
+
+func shouldContinueAfterWaitMountPermissionError(err error, mountPoint string, probe func(string) error) (bool, error) {
+	if err == nil || !isWaitMountPermissionError(err) {
+		return false, nil
+	}
+	if probe == nil {
+		return false, fmt.Errorf("no readiness probe configured")
+	}
+	if probeErr := probe(mountPoint); probeErr != nil {
+		return false, probeErr
+	}
+	return true, nil
+}
+
+func isWaitMountPermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+		return true
+	}
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "permission denied") || strings.Contains(errText, "operation not permitted")
+}
+
+func probeMountPointReady(mountPoint string) error {
+	mountPoint = strings.TrimSpace(mountPoint)
+	if mountPoint == "" {
+		return fmt.Errorf("empty mountpoint")
+	}
+	info, err := os.Stat(mountPoint)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("mountpoint is not a directory")
+	}
+	dir, err := os.Open(mountPoint)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	if _, err := dir.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
 	return nil
 }
 
