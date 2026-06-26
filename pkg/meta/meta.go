@@ -1524,10 +1524,10 @@ func (s *Store) ClaimOldestFreeTenantPoolBinding(ctx context.Context, organizati
 			FROM tenant_tidbcloud_org_bindings b
 			JOIN tenants t ON t.id = b.tenant_id
 			WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = 'tidb_cloud_native'
-				AND t.status IN (?, ?)
+				AND t.status = ?
 			ORDER BY b.created_at ASC, b.tenant_id ASC
 			LIMIT 1 FOR UPDATE`
-		row := tx.QueryRowContext(ctx, query, organizationID, TenantPoolBindingFree, TenantProvisioning, TenantActive)
+		row := tx.QueryRowContext(ctx, query, organizationID, TenantPoolBindingFree, TenantActive)
 		rec, scanErr := scanTenantBindingRow(row)
 		if scanErr != nil {
 			return scanErr

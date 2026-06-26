@@ -1188,6 +1188,100 @@ func TestUpsertTenantTiDBCloudOrgBindingAllowsSharedCluster(t *testing.T) {
 	}
 }
 
+func TestClaimOldestFreeTenantPoolBindingRequiresActiveTenant(t *testing.T) {
+	s := newControlStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := s.CreateTenantPool(ctx, &TenantPool{
+		PoolID:         "pool-claim-active",
+		OrganizationID: "org-claim-active",
+		Size:           2,
+		Status:         TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create tenant pool: %v", err)
+	}
+	provisioningCreated := now.Add(-2 * time.Minute)
+	if err := s.InsertTenant(ctx, &Tenant{
+		ID:               "pool-tenant-provisioning",
+		Status:           TenantProvisioning,
+		Kind:             TenantKindLive,
+		DBHost:           "db.example.com",
+		DBPort:           4000,
+		DBUser:           "u.root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tidbcloud_fs",
+		DBTLS:            true,
+		Provider:         "tidb_cloud_native",
+		ClusterID:        "cluster-provisioning",
+		SchemaVersion:    1,
+		CreatedAt:        provisioningCreated,
+		UpdatedAt:        provisioningCreated,
+	}); err != nil {
+		t.Fatalf("insert provisioning tenant: %v", err)
+	}
+	if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+		TenantID:       "pool-tenant-provisioning",
+		OrganizationID: "org-claim-active",
+		ClusterID:      "cluster-provisioning",
+		PoolID:         "pool-claim-active",
+		PoolStatus:     TenantPoolBindingFree,
+		CreatedAt:      provisioningCreated,
+		UpdatedAt:      provisioningCreated,
+	}); err != nil {
+		t.Fatalf("upsert provisioning binding: %v", err)
+	}
+	if _, err := s.ClaimOldestFreeTenantPoolBinding(ctx, "org-claim-active"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("claim provisioning tenant err = %v, want ErrNotFound", err)
+	}
+
+	activeCreated := now.Add(-time.Minute)
+	if err := s.InsertTenant(ctx, &Tenant{
+		ID:               "pool-tenant-active",
+		Status:           TenantActive,
+		Kind:             TenantKindLive,
+		DBHost:           "db.example.com",
+		DBPort:           4000,
+		DBUser:           "u.root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tidbcloud_fs",
+		DBTLS:            true,
+		Provider:         "tidb_cloud_native",
+		ClusterID:        "cluster-active",
+		SchemaVersion:    1,
+		CreatedAt:        activeCreated,
+		UpdatedAt:        activeCreated,
+	}); err != nil {
+		t.Fatalf("insert active tenant: %v", err)
+	}
+	if err := s.UpsertTenantTiDBCloudOrgBinding(ctx, &TenantTiDBCloudOrgBinding{
+		TenantID:       "pool-tenant-active",
+		OrganizationID: "org-claim-active",
+		ClusterID:      "cluster-active",
+		PoolID:         "pool-claim-active",
+		PoolStatus:     TenantPoolBindingFree,
+		CreatedAt:      activeCreated,
+		UpdatedAt:      activeCreated,
+	}); err != nil {
+		t.Fatalf("upsert active binding: %v", err)
+	}
+	row, err := s.ClaimOldestFreeTenantPoolBinding(ctx, "org-claim-active")
+	if err != nil {
+		t.Fatalf("claim active tenant: %v", err)
+	}
+	if row.Tenant.ID != "pool-tenant-active" {
+		t.Fatalf("claimed tenant = %q, want pool-tenant-active", row.Tenant.ID)
+	}
+	provisioningBinding, err := s.GetTenantTiDBCloudOrgBinding(ctx, "pool-tenant-provisioning")
+	if err != nil {
+		t.Fatalf("get provisioning binding: %v", err)
+	}
+	if provisioningBinding.PoolStatus != TenantPoolBindingFree {
+		t.Fatalf("provisioning pool status = %s, want %s", provisioningBinding.PoolStatus, TenantPoolBindingFree)
+	}
+}
+
 func TestDiffMetaTableMetaReportsMissingPrimaryKeyConstraint(t *testing.T) {
 	spec := mustMetaTableSpec(t, mustMetaSpec(t), "tenant_quota_config")
 	meta := metaTableMeta{

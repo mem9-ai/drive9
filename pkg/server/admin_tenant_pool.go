@@ -77,6 +77,9 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 		}
 		quotaOpt = &quotaReq
 	}
+	createLock := s.tenantPoolCreateLock(cred)
+	createLock.Lock()
+	defer createLock.Unlock()
 	orgID, err := s.firstManagedOrganization(r.Context(), cred)
 	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "create tenant pool")
@@ -650,6 +653,17 @@ func (s *Server) tenantPoolLock(poolID string) *sync.Mutex {
 		return &sync.Mutex{}
 	}
 	v, _ := s.tenantPoolLocks.LoadOrStore(poolID, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
+func (s *Server) tenantPoolCreateLock(cred tenant.CredentialProvisionRequest) *sync.Mutex {
+	key := strings.TrimSpace(cred.PublicKey)
+	if key == "" {
+		return &sync.Mutex{}
+	}
+	// A TiDB Cloud public key belongs to a single org, so this serializes the
+	// first-create path before the org id is discoverable from managed clusters.
+	v, _ := s.tenantPoolCreateLocks.LoadOrStore(key, &sync.Mutex{})
 	return v.(*sync.Mutex)
 }
 

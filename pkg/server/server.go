@@ -112,35 +112,36 @@ type nativeSystemUserProvisioner interface {
 }
 
 type Server struct {
-	fallback            *backend.Dat9Backend
-	meta                *meta.Store
-	pool                *tenant.Pool
-	provisioner         tenant.Provisioner
-	tokenSecret         []byte
-	localTenantAPIKey   string
-	vaultMK             *vault.MasterKey
-	vaultIssuerURL      string
-	publicURL           string
-	maxUploadBytes      int64
-	inlineThreshold     int64
-	metrics             *serverMetrics
-	logger              *zap.Logger
-	mux                 *http.ServeMux
-	events              *eventBuses
-	semanticWorker      *semanticWorkerManager
-	journalCursorSecret []byte
-	objectGCWorker      *objectGCWorker
-	slockOAuth          SlockOAuthClient
-	tidbAutoEmbedding   tenantAutoEmbeddingDefault
-	disableDBAutoEmbed  bool
-	forkWorkerCtx       context.Context
-	forkWorkerCancel    context.CancelFunc
-	forkWorkerWG        sync.WaitGroup
-	forkWorkerMu        sync.Mutex
-	forkWorkerClosed    bool
-	tenantPoolLocks     sync.Map
-	schemaInitErrors    sync.Map
-	leader              *leader.Manager
+	fallback              *backend.Dat9Backend
+	meta                  *meta.Store
+	pool                  *tenant.Pool
+	provisioner           tenant.Provisioner
+	tokenSecret           []byte
+	localTenantAPIKey     string
+	vaultMK               *vault.MasterKey
+	vaultIssuerURL        string
+	publicURL             string
+	maxUploadBytes        int64
+	inlineThreshold       int64
+	metrics               *serverMetrics
+	logger                *zap.Logger
+	mux                   *http.ServeMux
+	events                *eventBuses
+	semanticWorker        *semanticWorkerManager
+	journalCursorSecret   []byte
+	objectGCWorker        *objectGCWorker
+	slockOAuth            SlockOAuthClient
+	tidbAutoEmbedding     tenantAutoEmbeddingDefault
+	disableDBAutoEmbed    bool
+	forkWorkerCtx         context.Context
+	forkWorkerCancel      context.CancelFunc
+	forkWorkerWG          sync.WaitGroup
+	forkWorkerMu          sync.Mutex
+	forkWorkerClosed      bool
+	tenantPoolLocks       sync.Map
+	tenantPoolCreateLocks sync.Map
+	schemaInitErrors      sync.Map
+	leader                *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
 	// changes, this context is cancelled and recreated. Workers that use it
 	// (pending tenant reconciler, tenant delete cleanup, one-time resume tasks)
