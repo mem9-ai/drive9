@@ -978,6 +978,7 @@ type clusterInfo struct {
 	} `json:"endpoints"`
 	UserPrefix string `json:"userPrefix"`
 }
+
 type branchInfo struct {
 	BranchID  string `json:"branchId"`
 	State     string `json:"state"`
@@ -992,7 +993,6 @@ type branchInfo struct {
 		} `json:"private"`
 	} `json:"endpoints"`
 	UserPrefix string `json:"userPrefix"`
-	Username   string `json:"username"`
 }
 
 type clusterListResponse struct {
