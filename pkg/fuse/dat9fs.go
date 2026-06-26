@@ -11849,7 +11849,9 @@ func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, att
 	if !ok {
 		return gofuse.ENOENT
 	}
-	fs.xattrs.Set(path, attr, data)
+	if err := fs.xattrs.SetWithFlags(path, attr, data, input.Flags); err != 0 {
+		return gofuse.Status(err)
+	}
 	return gofuse.OK
 }
 

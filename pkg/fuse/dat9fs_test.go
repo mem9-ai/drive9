@@ -11739,6 +11739,101 @@ func TestXAttr_RenameMigratesXattrs(t *testing.T) {
 	}
 }
 
+func TestXAttr_SetXAttrCreateFlagFailsIfExists(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
+
+	// Set initial value.
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.test", []byte("first"))
+
+	// XATTR_CREATE should fail (EEXIST) since attr already exists.
+	st := fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}, Flags: 1}, "user.test", []byte("second"))
+	if st != gofuse.Status(syscall.EEXIST) {
+		t.Errorf("SetXAttr with XATTR_CREATE on existing attr status = %v, want EEXIST", st)
+	}
+
+	// Value should be unchanged.
+	dest := make([]byte, 16)
+	n, _ := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", dest)
+	if string(dest[:n]) != "first" {
+		t.Errorf("value after failed CREATE = %q, want 'first'", string(dest[:n]))
+	}
+}
+
+func TestXAttr_SetXAttrReplaceFlagFailsIfMissing(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/test.txt", false, 0, time.Now())
+	ino, _ := fs.inodes.GetInode("/test.txt")
+
+	// XATTR_REPLACE should fail (ENODATA) since attr doesn't exist.
+	st := fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}, Flags: 2}, "user.test", []byte("val"))
+	if st != gofuse.Status(syscall.ENODATA) {
+		t.Errorf("SetXAttr with XATTR_REPLACE on missing attr status = %v, want ENODATA", st)
+	}
+
+	// Set then replace — should succeed.
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}}, "user.test", []byte("first"))
+	st = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: ino}, Flags: 2}, "user.test", []byte("replaced"))
+	if st != gofuse.OK {
+		t.Errorf("SetXAttr with XATTR_REPLACE on existing attr status = %v, want OK", st)
+	}
+	dest := make([]byte, 16)
+	n, _ := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: ino}, "user.test", dest)
+	if string(dest[:n]) != "replaced" {
+		t.Errorf("value after REPLACE = %q, want 'replaced'", string(dest[:n]))
+	}
+}
+
+func TestXAttr_RemoveAllCleansChildren(t *testing.T) {
+	store := NewXAttrStore()
+	store.Set("/dir", "user.dir", []byte("d"))
+	store.Set("/dir/file.txt", "user.file", []byte("f"))
+	store.Set("/dir/sub/inner.txt", "user.inner", []byte("i"))
+
+	// RemoveAll on "/dir" should clear itself and all children.
+	store.RemoveAll("/dir")
+
+	if _, ok := store.Get("/dir", "user.dir"); ok {
+		t.Errorf("xattr on /dir still exists after RemoveAll")
+	}
+	if _, ok := store.Get("/dir/file.txt", "user.file"); ok {
+		t.Errorf("xattr on /dir/file.txt still exists after RemoveAll")
+	}
+	if _, ok := store.Get("/dir/sub/inner.txt", "user.inner"); ok {
+		t.Errorf("xattr on /dir/sub/inner.txt still exists after RemoveAll")
+	}
+}
+
+func TestXAttr_RenameMigratesSubtree(t *testing.T) {
+	store := NewXAttrStore()
+	store.Set("/old", "user.top", []byte("t"))
+	store.Set("/old/child.txt", "user.child", []byte("c"))
+	store.Set("/old/sub/grand.txt", "user.grand", []byte("g"))
+
+	store.Rename("/old", "/new")
+
+	if _, ok := store.Get("/old", "user.top"); ok {
+		t.Errorf("xattr on /old still exists after Rename")
+	}
+	if _, ok := store.Get("/old/child.txt", "user.child"); ok {
+		t.Errorf("xattr on /old/child.txt still exists after Rename")
+	}
+	if v, ok := store.Get("/new", "user.top"); !ok || string(v) != "t" {
+		t.Errorf("xattr not migrated to /new")
+	}
+	if v, ok := store.Get("/new/child.txt", "user.child"); !ok || string(v) != "c" {
+		t.Errorf("xattr not migrated to /new/child.txt")
+	}
+	if v, ok := store.Get("/new/sub/grand.txt", "user.grand"); !ok || string(v) != "g" {
+		t.Errorf("xattr not migrated to /new/sub/grand.txt")
+	}
+}
+
 func TestSetAttr_MtimeUpdate(t *testing.T) {
 	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(make([]byte, 42))

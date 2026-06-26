@@ -1,7 +1,15 @@
 package fuse
 
 import (
+	"strings"
 	"sync"
+	"syscall"
+)
+
+// XATTR_CREATE and XATTR_REPLACE flag values from Linux's setxattr(2).
+const (
+	xattrCreateFlag  = 1 // XATTR_CREATE
+	xattrReplaceFlag = 2 // XATTR_REPLACE
 )
 
 // XAttrStore provides in-memory extended attribute (xattr) storage for a
@@ -29,14 +37,31 @@ func NewXAttrStore() *XAttrStore {
 	}
 }
 
-// Set stores or replaces the value of attr for the given path.
-func (s *XAttrStore) Set(path, attr string, value []byte) {
+// SetWithFlags stores, creates, or replaces the value of attr for the given
+// path, honoring the XATTR_CREATE and XATTR_REPLACE flags from setxattr(2):
+//   - flags == 0 (neither): set unconditionally (create or replace).
+//   - XATTR_CREATE: fail with EEXIST if the attr already exists.
+//   - XATTR_REPLACE: fail with ENODATA if the attr does not exist.
+func (s *XAttrStore) SetWithFlags(path, attr string, value []byte, flags uint32) syscall.Errno {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.data[path] == nil {
 		s.data[path] = make(map[string][]byte)
 	}
+	_, exists := s.data[path][attr]
+	if flags&xattrCreateFlag != 0 && exists {
+		return syscall.EEXIST
+	}
+	if flags&xattrReplaceFlag != 0 && !exists {
+		return syscall.ENODATA
+	}
 	s.data[path][attr] = append([]byte(nil), value...)
+	return 0
+}
+
+// Set stores or replaces the value of attr for the given path (no flags).
+func (s *XAttrStore) Set(path, attr string, value []byte) {
+	_ = s.SetWithFlags(path, attr, value, 0)
 }
 
 // Get retrieves the value of attr for the given path.
@@ -89,21 +114,41 @@ func (s *XAttrStore) Remove(path, attr string) bool {
 	return true
 }
 
-// RemoveAll deletes all xattrs for the given path.
-// This should be called on Unlink/Rmdir to clean up xattr state.
+// RemoveAll deletes all xattrs for the given path and any paths underneath it
+// (i.e., for a directory path "/foo", also clears "/foo/bar", "/foo/baz/qux", etc.).
+// This should be called on Unlink (file) and Rmdir (directory) to clean up.
 func (s *XAttrStore) RemoveAll(path string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.data, path)
+	// Clean up any child paths (for rmdir of a directory with xattr'd children).
+	prefix := path + "/"
+	for p := range s.data {
+		if strings.HasPrefix(p, prefix) {
+			delete(s.data, p)
+		}
+	}
 }
 
-// Rename moves all xattrs from oldPath to newPath.
+// Rename moves all xattrs from oldPath to newPath, and migrates any child-path
+// xattrs for directory renames (e.g. "/old/" → "/new/" also moves "/old/sub").
 // This should be called on Rename to preserve xattrs across moves.
 func (s *XAttrStore) Rename(oldPath, newPath string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// Move the exact path.
 	if attrs, ok := s.data[oldPath]; ok {
 		s.data[newPath] = attrs
 		delete(s.data, oldPath)
+	}
+	// Move child paths (directory rename).
+	oldPrefix := oldPath + "/"
+	newPrefix := newPath + "/"
+	for p := range s.data {
+		if strings.HasPrefix(p, oldPrefix) {
+			child := newPrefix + strings.TrimPrefix(p, oldPrefix)
+			s.data[child] = s.data[p]
+			delete(s.data, p)
+		}
 	}
 }
