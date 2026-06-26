@@ -390,6 +390,8 @@ func (b *Dat9Backend) applyQuotaOutboxEntryTx(tx *sql.Tx, entry *datastore.Quota
 	if entry == nil {
 		return fmt.Errorf("quota outbox entry is required")
 	}
+	// Reuse the central mutation dispatcher; upload_complete is handled there
+	// by applyUploadCompleteTx, the same body used by mutation replay.
 	return applyCentralQuotaMutationTx(b.metaStore, tx, b.tenantID, entry.MutationType, entry.MutationData, entry.ID)
 }
 
