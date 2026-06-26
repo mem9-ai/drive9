@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -665,7 +666,11 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	}
 	query := "parseTime=true"
 	if t.DBTLS {
-		query += "&tls=true"
+		tlsMode := "true"
+		if t.Provider == ProviderTiDBCloudNative && strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")) != "" {
+			tlsMode = "skip-verify"
+		}
+		query += "&tls=" + tlsMode
 	}
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
 	openStoreStart := time.Now()
