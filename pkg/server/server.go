@@ -546,16 +546,19 @@ const fsEventsCleanupInterval = 5 * time.Minute
 // fsEventsRetention is how long event rows are kept before pruning.
 const fsEventsRetention = 1 * time.Hour
 
+// fsEventsCleanupTenantLimit bounds the number of active tenants scanned per
+// cleanup cycle. The 5m ticker covers many tenants over successive cycles;
+// the cap keeps each tick bounded and resumable (keyset-style pagination can
+// be added later if the active set grows beyond this).
+const fsEventsCleanupTenantLimit = 1000
+
 // cleanupFSEvents prunes old fs_events rows from accessible stores.
-// Single-tenant mode cleans the fallback store. Multi-tenant cleanup is
-// intentionally deferred: iterating all tenant stores on every tick is
-// expensive, and the stale-cursor reset logic in EventsSince handles pruned
-// rows correctly (reset when since < oldestSeq). The table grows bounded by
-// event write rate; a separate task should add per-tenant cleanup via pool
-// iteration or on Acquire. See issue #599 P1-2.
-// In both modes the row count is sampled and reported as
-// drive9_fs_events_rows so operators can monitor table growth without direct
-// DB access.
+// Single-tenant mode cleans the fallback store. Multi-tenant mode iterates
+// active tenants via the meta store + pool, pruning each tenant's fs_events
+// table and sampling the row count into drive9_fs_events_rows so operators
+// can monitor table growth without direct DB access. The stale-cursor reset
+// logic in EventsSince handles pruned rows correctly (reset when since <
+// oldestSeq). See issue #599 P1-2.
 func (s *Server) cleanupFSEvents(ctx context.Context) {
 	if ctx.Err() != nil {
 		// Context already cancelled (shutdown in progress): skip cleanup to
@@ -581,9 +584,60 @@ func (s *Server) cleanupFSEvents(ctx context.Context) {
 				metrics.RecordFSEventsPruned("", n)
 			}
 		}
+		return
 	}
-	// Multi-tenant: deferred to a separate task. The fs_events table grows
-	// unbounded in multi-tenant mode until per-tenant cleanup is implemented.
+	// Multi-tenant mode: iterate active tenants, prune each fs_events table
+	// and sample row counts. The scan is bounded by fsEventsCleanupTenantLimit
+	// and runs on the fsEventsCleanupInterval (5m) ticker, so the per-tick
+	// cost is proportional to active tenants (bounded) — not "expensive" as the
+	// old comment feared. pool.Acquire pins each backend so a concurrent
+	// retirement cannot close the store mid-DELETE.
+	if s.meta == nil || s.pool == nil {
+		return
+	}
+	tenants, err := s.meta.ListTenantsByStatus(ctx, meta.TenantActive, fsEventsCleanupTenantLimit)
+	if err != nil {
+		if ctx.Err() != nil {
+			logger.Warn(ctx, "fs_events_cleanup_list_interrupted_by_shutdown", zap.Error(err))
+		} else {
+			logger.Warn(ctx, "fs_events_cleanup_list_failed", zap.Error(err))
+		}
+		return
+	}
+	for i := range tenants {
+		if ctx.Err() != nil {
+			logger.Warn(ctx, "fs_events_cleanup_loop_interrupted_by_shutdown", zap.Error(ctx.Err()))
+			return
+		}
+		t := tenants[i]
+		b, release, err := s.pool.Acquire(ctx, &t)
+		if err != nil {
+			// Backend may not be cached/openable (e.g. credentials pending);
+			// skip this tenant rather than failing the whole cycle.
+			logger.Warn(ctx, "fs_events_cleanup_acquire_failed",
+				zap.String("tenant_id", t.ID), zap.Error(err))
+			continue
+		}
+		store := b.Store()
+		if store != nil {
+			if count, err := store.CountFSEvents(ctx); err == nil {
+				metrics.RecordFSEventsRows(t.ID, count)
+			}
+			if n, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-fsEventsRetention)); err != nil {
+				if ctx.Err() != nil {
+					logger.Warn(ctx, "fs_events_cleanup_interrupted_by_shutdown",
+						zap.String("tenant_id", t.ID), zap.Error(err))
+					release()
+					return
+				}
+				logger.Warn(ctx, "fs_events_cleanup_failed",
+					zap.String("tenant_id", t.ID), zap.Error(err))
+			} else {
+				metrics.RecordFSEventsPruned(t.ID, n)
+			}
+		}
+		release()
+	}
 }
 
 // stopLeaderWorkers stops the background schedulers started by startLeaderWorkers.
