@@ -7673,20 +7673,10 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 			return status
 		}
 		// Local state says empty. The remote listing may be stale due to
-		// eventual-consistency lag on just-completed Unlinks, or pending
-		// writeback uploads. Flush any pending writes for children of this
-		// directory before checking the remote, so that the backend listing
-		// reflects the most recent state.
-		prefix := childP + "/"
-		if fs.commitQueue != nil {
-			// Wait for any queued/in-flight commits for children of this dir.
-			fs.commitQueue.WaitPrefix(prefix)
-		}
-		if fs.uploader != nil {
-			for _, meta := range fs.writeBack.ListByPrefix(prefix) {
-				fs.uploader.WaitPath(meta.Path)
-			}
-		}
+		// eventual-consistency lag on just-completed Unlinks. We skip the
+		// non-cancel-aware WaitPrefix/WaitPath calls and rely on tombstones
+		// + the cancel-aware polling loop below to handle eventual consistency.
+		// This avoids widening the uninterruptible wait surface for rmdir.
 		// Now check the remote listing. If it still shows children, it's
 		// either a real child (not locally known) or eventual-consistency lag.
 		// Poll for up to 5 seconds (10 × 500ms) when the local state is empty,
