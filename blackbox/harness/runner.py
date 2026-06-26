@@ -301,7 +301,7 @@ class BlackboxRunner:
         return resolve_module_timeout(
             module.id,
             getattr(module, "timeout", 600),
-
+            self.ctx.suite,
             self.config.get("modules", {}).get(module.id),
         )
 
