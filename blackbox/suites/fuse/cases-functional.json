@@ -1,0 +1,54 @@
+{
+  "cases": [
+    {
+      "id": "mount_rw_basic",
+      "description": "Writable mount can create, fsync, read, unmount, and expose data remotely."
+    },
+    {
+      "id": "cross_channel_visibility",
+      "description": "CLI writes are visible through FUSE and FUSE writes are visible through CLI/API."
+    },
+    {
+      "id": "file_semantics",
+      "description": "Small, large, overwrite, truncate, sparse, EOF, and checksum semantics."
+    },
+    {
+      "id": "metadata_ops",
+      "description": "mkdir, readdir, stat, chmod, rename, unlink, and rmdir."
+    },
+    {
+      "id": "links",
+      "description": "symlink, hardlink, readlink, nlink, and target content checks."
+    },
+    {
+      "id": "readonly_mount",
+      "description": "Read-only mount allows reads and rejects mutations."
+    },
+    {
+      "id": "subtree_mount",
+      "description": "Mounting a remote subtree exposes the subtree as the mount root."
+    },
+    {
+      "id": "concurrency",
+      "description": "Multiple writers/readers plus rename/delete churn."
+    },
+    {
+      "id": "sqlite_wal",
+      "description": "SQLite WAL workload, checkpoint, close, remount, and row verification."
+    },
+    {
+      "id": "git_workspace",
+      "description": "Self-contained local fixture repo with drive9 git fast clone, blobless hydrate, status, edit, add, and commit."
+    },
+    {
+      "id": "crash_recovery",
+      "description": "Kill a foreground mount after writes, force detach if needed, remount with the same cache root, and verify recovery."
+    }
+  ],
+  "defaults": {
+    "large_file_mib": 16,
+    "concurrency_workers": 8,
+    "concurrency_files_per_worker": 8,
+    "sqlite_rows": 256
+  }
+}
