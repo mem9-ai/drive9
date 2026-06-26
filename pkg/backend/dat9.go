@@ -768,6 +768,16 @@ func backendDurationMs(d time.Duration) float64 {
 	return float64(d.Microseconds()) / 1000.0
 }
 
+func backendTimingStep(enabled bool, dst *time.Duration) func() {
+	if !enabled {
+		return func() {}
+	}
+	start := time.Now()
+	return func() {
+		*dst = time.Since(start)
+	}
+}
+
 func cloneFileTags(tags map[string]string) map[string]string {
 	if tags == nil {
 		return nil
@@ -891,29 +901,21 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	if err := b.store.InTx(ctx, func(tx *sql.Tx) error {
 		semanticTaskEnqueued = false
 		quotaOutboxEnqueued = false
-		stepStart := time.Time{}
-		if timingEnabled {
-			stepStart = time.Now()
-		}
+
+		done := backendTimingStep(timingEnabled, &quotaStorageCheckDuration)
 		if err := b.ensureStorageQuota(ctx, tx, path, int64(len(data))); err != nil {
-			if timingEnabled {
-				quotaStorageCheckDuration = time.Since(stepStart)
-			}
+			done()
 			return err
 		}
-		if timingEnabled {
-			quotaStorageCheckDuration = time.Since(stepStart)
-			stepStart = time.Now()
-		}
+		done()
+
+		done = backendTimingStep(timingEnabled, &quotaFileCountCheckDuration)
 		if err := b.ensureFileCountQuotaServer(ctx, tx, 1); err != nil {
-			if timingEnabled {
-				quotaFileCountCheckDuration = time.Since(stepStart)
-			}
+			done()
 			return err
 		}
-		if timingEnabled {
-			quotaFileCountCheckDuration = time.Since(stepStart)
-		}
+		done()
+
 		fileRev := int64(1)
 		insertFile := &datastore.File{
 			FileID: fileID, StorageType: storageType, StorageRef: storageRef,
@@ -927,67 +929,46 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		if b.UsesDatabaseAutoEmbedding() && description != "" {
 			insertFile.DescriptionEmbeddingRevision = &fileRev
 		}
-		if timingEnabled {
-			stepStart = time.Now()
-		}
+
+		done = backendTimingStep(timingEnabled, &insertFileDuration)
 		if err := b.store.InsertFileTx(tx, insertFile); err != nil {
-			if timingEnabled {
-				insertFileDuration = time.Since(stepStart)
-			}
+			done()
 			return err
 		}
-		if timingEnabled {
-			insertFileDuration = time.Since(stepStart)
-			stepStart = time.Now()
-		}
+		done()
+
+		done = backendTimingStep(timingEnabled, &ensureParentDirsDuration)
 		if err := b.store.EnsureParentDirsTx(tx, path, b.genID); err != nil {
-			if timingEnabled {
-				ensureParentDirsDuration = time.Since(stepStart)
-			}
+			done()
 			return err
 		}
-		if timingEnabled {
-			ensureParentDirsDuration = time.Since(stepStart)
-			stepStart = time.Now()
-		}
+		done()
+
+		done = backendTimingStep(timingEnabled, &insertNodeDuration)
 		if err := b.store.InsertNodeTx(tx, &datastore.FileNode{
 			NodeID: b.genID(), Path: path, ParentPath: pathutil.ParentPath(path),
 			Name: pathutil.BaseName(path), FileID: fileID, CreatedAt: now,
 		}); err != nil {
-			if timingEnabled {
-				insertNodeDuration = time.Since(stepStart)
-			}
+			done()
 			return err
 		}
-		if timingEnabled {
-			insertNodeDuration = time.Since(stepStart)
-		}
+		done()
+
 		if tags != nil {
-			if timingEnabled {
-				stepStart = time.Now()
-			}
+			done = backendTimingStep(timingEnabled, &tagUpdateDuration)
 			if err := b.store.ReplaceFileTagsTx(tx, fileID, tags); err != nil {
-				if timingEnabled {
-					tagUpdateDuration = time.Since(stepStart)
-				}
+				done()
 				return err
 			}
-			if timingEnabled {
-				tagUpdateDuration = time.Since(stepStart)
-			}
+			done()
 		}
 		currentMediaDelta := quotaMediaDelta(false, isQuotaMediaContentType(contentType))
-		if timingEnabled {
-			stepStart = time.Now()
-		}
+		done = backendTimingStep(timingEnabled, &semanticEnqueueDuration)
 		if b.UsesDatabaseAutoEmbedding() {
 			created, err := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType, currentMediaDelta)
 			semanticTaskEnqueued = created
 			if err != nil {
-				if timingEnabled {
-					semanticEnqueueDuration = time.Since(stepStart)
-					imageEnqueueDuration = semanticEnqueueDuration
-				}
+				done()
 				return err
 			}
 		} else {
@@ -996,43 +977,34 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			// (if any) is enqueued separately below.
 			extractCreated, extractErr := b.enqueueExtractSemanticTasksTx(ctx, tx, fileID, 1, path, contentType, currentMediaDelta)
 			if extractErr != nil {
-				if timingEnabled {
-					semanticEnqueueDuration = time.Since(stepStart)
-					imageEnqueueDuration = semanticEnqueueDuration
-				}
+				done()
 				return extractErr
 			}
 			if b.shouldEnqueueEmbedForRevision(path, contentType, contentText, description) {
 				created, err := b.enqueueEmbedTaskTx(tx, fileID, 1)
 				semanticTaskEnqueued = created || extractCreated
 				if err != nil {
-					if timingEnabled {
-						semanticEnqueueDuration = time.Since(stepStart)
-						imageEnqueueDuration = semanticEnqueueDuration
-					}
+					done()
 					return err
 				}
 			} else {
 				semanticTaskEnqueued = extractCreated
 			}
 		}
+		done()
 		if timingEnabled {
-			semanticEnqueueDuration = time.Since(stepStart)
 			// Keep the legacy field populated for existing dashboards; create
 			// uses the semantic enqueue phase as its image enqueue boundary.
 			imageEnqueueDuration = semanticEnqueueDuration
-			stepStart = time.Now()
 		}
+
+		done = backendTimingStep(timingEnabled, &quotaOutboxEnqueueDuration)
 		created, err := b.enqueueQuotaFileCreateOutboxTx(tx, fileID, int64(len(data)), contentType)
 		if err != nil {
-			if timingEnabled {
-				quotaOutboxEnqueueDuration = time.Since(stepStart)
-			}
+			done()
 			return err
 		}
-		if timingEnabled {
-			quotaOutboxEnqueueDuration = time.Since(stepStart)
-		}
+		done()
 		quotaOutboxEnqueued = created
 		return nil
 	}); err != nil {

@@ -331,6 +331,8 @@ func (s *Store) retryQuotaOutboxTx(ctx context.Context, tx *sql.Tx, id int64, re
 	if err != nil {
 		return err
 	}
+	// Receipt is the worker ownership token. Recovery clears the receipt before
+	// requeueing, so stale owners fail here even when their old lease expired.
 	if entry.Status != QuotaOutboxProcessing || entry.Receipt != receipt {
 		return ErrQuotaOutboxLeaseMismatch
 	}
