@@ -264,7 +264,7 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 	if info.ClusterID == "" {
 		return nil, nil, fmt.Errorf("tidbcloud native response missing cluster id")
 	}
-	if clusterProvisionMetadataIncomplete(info) {
+	if clusterProvisionMetadataIncomplete(info, p.usePrivateEndpoint) {
 		info, err = p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, info.ClusterID)
 		if err != nil {
 			return &tenant.ClusterInfo{
@@ -279,10 +279,8 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 	host := info.Endpoints.Public.Host
 	port := info.Endpoints.Public.Port
 	if p.usePrivateEndpoint {
-		if info.Endpoints.Private.Host != "" {
-			host = info.Endpoints.Private.Host
-			port = info.Endpoints.Private.Port
-		}
+		host = info.Endpoints.Private.Host
+		port = info.Endpoints.Private.Port
 	}
 	out := &tenant.ClusterInfo{
 		TenantID:       tenantID,
@@ -407,8 +405,8 @@ func (p *Provisioner) CreateBranchWithCredentials(ctx context.Context, forkTenan
 		DBName:    dbName,
 		Provider:  tenant.ProviderTiDBCloudNative,
 	}
-	if !branchConnectionIncomplete(branch) {
-		if err := fillBranchEndpoint(out, branch); err != nil {
+	if !branchConnectionIncomplete(branch, p.usePrivateEndpoint) {
+		if err := p.fillBranchEndpoint(out, branch); err != nil {
 			return out, err
 		}
 		return out, nil
@@ -444,7 +442,7 @@ func (p *Provisioner) WaitForBranchActiveWithCredentials(ctx context.Context, br
 	if err != nil {
 		return &out, fmt.Errorf("wait for branch active: %w", err)
 	}
-	if err := fillBranchEndpoint(&out, info); err != nil {
+	if err := p.fillBranchEndpoint(&out, info); err != nil {
 		return &out, err
 	}
 	return &out, nil
@@ -994,6 +992,10 @@ type branchInfo struct {
 			Host string `json:"host"`
 			Port int    `json:"port"`
 		} `json:"public"`
+		Private struct {
+			Host string `json:"host"`
+			Port int    `json:"port"`
+		} `json:"private"`
 	} `json:"endpoints"`
 	UserPrefix string `json:"userPrefix"`
 	Username   string `json:"username"`
@@ -1044,32 +1046,41 @@ func parseBranchInfo(raw []byte) (*branchInfo, error) {
 	return &out, nil
 }
 
-func clusterConnectionIncomplete(info *clusterInfo) bool {
+func clusterConnectionIncomplete(info *clusterInfo, usePrivate bool) bool {
 	if info == nil {
 		return true
 	}
-	if parseBoolEnv(EnvTiDBCloudNativeUsePrivateEndpoint) {
+	if usePrivate {
 		return info.Endpoints.Private.Host == "" || info.Endpoints.Private.Port == 0 || (info.UserPrefix == "" && info.Username == "")
 	}
 	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || (info.UserPrefix == "" && info.Username == "")
 }
 
-func clusterProvisionMetadataIncomplete(info *clusterInfo) bool {
-	if clusterConnectionIncomplete(info) {
+func clusterProvisionMetadataIncomplete(info *clusterInfo, usePrivate bool) bool {
+	if clusterConnectionIncomplete(info, usePrivate) {
 		return true
 	}
 	return strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]) == ""
 }
 
-func branchConnectionIncomplete(info *branchInfo) bool {
+func branchConnectionIncomplete(info *branchInfo, usePrivate bool) bool {
 	if info == nil {
 		return true
+	}
+	if usePrivate {
+		return info.Endpoints.Private.Host == "" || info.Endpoints.Private.Port == 0 || (info.UserPrefix == "" && info.Username == "")
 	}
 	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || (info.UserPrefix == "" && info.Username == "")
 }
 
-func fillBranchEndpoint(out *tenant.ClusterInfo, branch *branchInfo) error {
-	if branch.Endpoints.Public.Host == "" || branch.Endpoints.Public.Port == 0 {
+func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branchInfo) error {
+	host := branch.Endpoints.Public.Host
+	port := branch.Endpoints.Public.Port
+	if p.usePrivateEndpoint {
+		host = branch.Endpoints.Private.Host
+		port = branch.Endpoints.Private.Port
+	}
+	if host == "" || port == 0 {
 		return fmt.Errorf("tidbcloud native branch response missing endpoint")
 	}
 	if branch.Username != "" {
@@ -1080,8 +1091,8 @@ func fillBranchEndpoint(out *tenant.ClusterInfo, branch *branchInfo) error {
 	if out.Username == "" {
 		return fmt.Errorf("tidbcloud native branch response missing username")
 	}
-	out.Host = branch.Endpoints.Public.Host
-	out.Port = branch.Endpoints.Public.Port
+	out.Host = host
+	out.Port = port
 	return nil
 }
 
@@ -1109,7 +1120,7 @@ func (p *Provisioner) waitForClusterProvisionMetadata(ctx context.Context, publi
 		if err != nil {
 			return nil, err
 		}
-		if !clusterProvisionMetadataIncomplete(info) {
+		if !clusterProvisionMetadataIncomplete(info, p.usePrivateEndpoint) {
 			return info, nil
 		}
 		if time.Now().After(deadline) {
@@ -1147,7 +1158,7 @@ func (p *Provisioner) waitForBranchActive(ctx context.Context, publicKey, privat
 		if err != nil {
 			return nil, err
 		}
-		if info.State == stateActive && !branchConnectionIncomplete(info) {
+		if info.State == stateActive && !branchConnectionIncomplete(info, p.usePrivateEndpoint) {
 			return info, nil
 		}
 		if time.Now().After(deadline) {
