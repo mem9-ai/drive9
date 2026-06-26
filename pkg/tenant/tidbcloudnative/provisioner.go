@@ -300,7 +300,11 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 		out.Username = info.UserPrefix + ".root"
 	}
 	if out.Host == "" || out.Port == 0 {
-		return out, nil, fmt.Errorf("tidbcloud native response missing endpoint")
+		epKind := "public"
+		if p.usePrivateEndpoint {
+			epKind = "private"
+		}
+		return out, nil, fmt.Errorf("tidbcloud native response missing %s endpoint", epKind)
 	}
 	if out.Username == "" {
 		return out, nil, fmt.Errorf("tidbcloud native response missing username")
@@ -1087,7 +1091,11 @@ func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branch
 		port = branch.Endpoints.Public.Port
 	}
 	if host == "" || port == 0 {
-		return fmt.Errorf("tidbcloud native branch response missing endpoint")
+		epKind := "public"
+		if p.usePrivateEndpoint {
+			epKind = "private"
+		}
+		return fmt.Errorf("tidbcloud native branch response missing %s endpoint", epKind)
 	}
 	if branch.Username != "" {
 		out.Username = branch.Username
