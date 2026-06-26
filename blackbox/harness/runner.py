@@ -59,7 +59,7 @@ class BlackboxRunner:
         if args.out_dir:
             self.result_dir = Path(args.out_dir).expanduser().resolve()
         else:
-            self.result_dir = self.work_dir / "results" / self.session
+            self.result_dir = self.work_dir / "results"
         self.result_dir.mkdir(parents=True, exist_ok=True)
         self.tmp_dir = self.result_dir / "tmp"
         self.tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -529,7 +529,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--bootstrap", action="store_true", help="Prepare dependencies into a work-dir, then exit. Use --work-dir to reuse later.")
     parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS or 1.")
     parser.add_argument("--server-mode", choices=["auto", "existing", "local"], default=env_value("SERVER_MODE", "auto", ""))
-    parser.add_argument("--drive9-cli", required=True, help="Path to the drive9 CLI binary. Required.")
+    parser.add_argument("--drive9-cli", default="", help="Path to the drive9 CLI binary. Defaults to 'drive9' on PATH.")
     parser.add_argument("--work-dir", default=env_value("WORK_DIR", "", ""), help="Isolated working directory for cache/tmp/results. Defaults to BLACKBOX_WORK_DIR.")
     parser.add_argument("--out-dir", default=env_value("OUT_DIR", "", ""))
     parser.add_argument("--session", default=env_value("SESSION", "", ""))
@@ -565,6 +565,10 @@ def emit_module_list(registry: dict[str, Any], output_format: str) -> int:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    # Handle --list before creating any work-dir (no side effects).
+    if args.list:
+        registry = discover_modules()
+        return emit_module_list(registry, args.format)
     try:
         runner = BlackboxRunner(args)
         return runner.run()

@@ -54,46 +54,49 @@ Group definitions in `suites/groups.json` map group names to module ID patterns.
 
 ## Commands
 
-All commands use `python3 blackbox/run.py` directly. `--drive9-cli` is required
-(it specifies the path to the drive9 CLI binary).
+All commands use `python3 blackbox/run.py` directly. `--drive9-cli` is optional
+and defaults to `drive9` found on the system PATH.
 
 ```bash
-# List available modules
-python3 blackbox/run.py --list --drive9-cli ./bin/drive9
-python3 blackbox/run.py --list --drive9-cli ./bin/drive9 --format json
+# List available modules (no side effects, no work-dir created)
+python3 blackbox/run.py --list
+python3 blackbox/run.py --list --format json
 
 # Run all modules
-python3 blackbox/run.py --all --drive9-cli ./bin/drive9
+python3 blackbox/run.py --all
 
 # Run a single module
-python3 blackbox/run.py --module community.pjdfstest --drive9-cli ./bin/drive9
+python3 blackbox/run.py --module community.pjdfstest
 
 # Run a group
-python3 blackbox/run.py --group perf --drive9-cli ./bin/drive9
+python3 blackbox/run.py --group perf
 
 # Run by category prefix
-python3 blackbox/run.py --category drive9.workflow --drive9-cli ./bin/drive9
+python3 blackbox/run.py --category drive9.workflow
+
+# Specify a custom drive9 CLI path
+python3 blackbox/run.py --all --drive9-cli ./bin/drive9
 
 # Bootstrap: prepare dependencies, then exit
-python3 blackbox/run.py --all --bootstrap --drive9-cli ./bin/drive9 --work-dir /tmp/bb
+python3 blackbox/run.py --all --bootstrap --work-dir /tmp/bb
 
 # Reuse the work-dir for a real run
-python3 blackbox/run.py --all --drive9-cli ./bin/drive9 --work-dir /tmp/bb
+python3 blackbox/run.py --all --work-dir /tmp/bb
 
 # Prepare dependencies only (no setup/run)
-python3 blackbox/run.py --all --deps-only --drive9-cli ./bin/drive9 --work-dir /tmp/bb
+python3 blackbox/run.py --all --deps-only --work-dir /tmp/bb
 
 # Performance runs
-python3 blackbox/run.py --module community.fio --drive9-cli ./bin/drive9 --runs 3
+python3 blackbox/run.py --module community.fio --runs 3
 
 # Strict prerequisites (fail if FUSE unavailable instead of skipping)
-python3 blackbox/run.py --all --drive9-cli ./bin/drive9 --strict-prereqs
+python3 blackbox/run.py --all --strict-prereqs
 
 # Offline mode (no auto-fetch of dependencies)
-python3 blackbox/run.py --all --drive9-cli ./bin/drive9 --offline
+python3 blackbox/run.py --all --offline
 
 # Custom server mode
-python3 blackbox/run.py --all --drive9-cli ./bin/drive9 --server-mode existing
+python3 blackbox/run.py --all --server-mode existing
 ```
 
 ## Module Structure

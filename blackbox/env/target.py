@@ -113,7 +113,12 @@ class Drive9FuseTargetProvider:
         self.tmp_dir = result_dir / "tmp"
         self.bin_dir = result_dir / "bin"
         self.env_home = self.tmp_dir / "home"
-        self.cli = Path(args.drive9_cli).expanduser().resolve() if args.drive9_cli else self.bin_dir / "drive9"
+        if args.drive9_cli:
+            self.cli = Path(args.drive9_cli).expanduser().resolve()
+        else:
+            import shutil
+            found = shutil.which("drive9")
+            self.cli = Path(found).resolve() if found else self.bin_dir / "drive9"
         self.server_bin = self.bin_dir / "drive9-server-local"
         self.server_url = os.environ.get("DRIVE9_BASE", "")
         self.api_key = os.environ.get("DRIVE9_API_KEY", "")
