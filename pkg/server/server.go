@@ -4359,7 +4359,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		APIKeyID:       apiKeyID,
 		Status:         meta.TenantProvisioning,
 		Provider:       provider,
-		TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
+		TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, dbtls),
 		CloudProvider:  cloudProvider,
 		Region:         region,
 		OrganizationID: strings.TrimSpace(cluster.OrganizationID),
