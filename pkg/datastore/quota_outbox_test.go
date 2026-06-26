@@ -115,6 +115,76 @@ func TestQuotaOutboxRecoverExpired(t *testing.T) {
 	}
 }
 
+func TestQuotaOutboxBatchAckRejectsRecoveredOldReceipt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Add(-time.Second).Truncate(time.Microsecond)
+
+	id, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       "file-1",
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		AvailableAt:  now.Add(-time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := s.ClaimQuotaOutboxBatch(ctx, now, time.Millisecond, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != id {
+		t.Fatalf("claimed = %+v, want id %d", claimed, id)
+	}
+	if recovered, err := s.RecoverExpiredQuotaOutbox(ctx, time.Now().UTC(), 10); err != nil {
+		t.Fatal(err)
+	} else if recovered != 1 {
+		t.Fatalf("recovered rows = %d, want 1", recovered)
+	}
+	if _, err := s.ClaimQuotaOutboxBatch(ctx, time.Now().UTC(), time.Minute, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.InTx(ctx, func(tx *sql.Tx) error {
+		return s.AckQuotaOutboxBatchTx(ctx, tx, claimed)
+	}); err != ErrQuotaOutboxLeaseMismatch {
+		t.Fatalf("batch ack recovered row with old receipt error = %v, want lease mismatch", err)
+	}
+}
+
+func TestQuotaOutboxRetryRejectsRecoveredOldReceipt(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Add(-time.Second).Truncate(time.Microsecond)
+
+	id, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       "file-1",
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"file-1"}`),
+		AvailableAt:  now.Add(-time.Second),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := s.ClaimQuotaOutbox(ctx, now, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || claimed.ID != id {
+		t.Fatalf("claimed = %+v found=%v, want id %d", claimed, found, id)
+	}
+	if recovered, err := s.RecoverExpiredQuotaOutbox(ctx, time.Now().UTC(), 10); err != nil {
+		t.Fatal(err)
+	} else if recovered != 1 {
+		t.Fatalf("recovered rows = %d, want 1", recovered)
+	}
+	if _, _, err := s.ClaimQuotaOutbox(ctx, time.Now().UTC(), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RetryQuotaOutbox(ctx, claimed.ID, claimed.Receipt, time.Now().UTC(), "temporary"); err != ErrQuotaOutboxLeaseMismatch {
+		t.Fatalf("retry recovered row with old receipt error = %v, want lease mismatch", err)
+	}
+}
+
 func TestQuotaOutboxAckAllowsExpiredLeaseWhenReceiptStillOwned(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

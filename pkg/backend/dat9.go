@@ -1018,6 +1018,8 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		}
 		if timingEnabled {
 			semanticEnqueueDuration = time.Since(stepStart)
+			// Keep the legacy field populated for existing dashboards; create
+			// uses the semantic enqueue phase as its image enqueue boundary.
 			imageEnqueueDuration = semanticEnqueueDuration
 			stepStart = time.Now()
 		}
