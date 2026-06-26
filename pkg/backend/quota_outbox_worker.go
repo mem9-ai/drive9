@@ -29,6 +29,7 @@ const (
 	quotaOutboxRetryMaxDelay            = 30 * time.Second
 	quotaMutationTypeFileCreate         = "file_create"
 	quotaMutationTypeOverwrite          = "file_overwrite"
+	quotaMutationTypeUploadComplete     = "upload_complete"
 )
 
 func (b *Dat9Backend) startQuotaOutboxWorker() {
@@ -147,16 +148,6 @@ func (b *Dat9Backend) processQuotaOutboxAvailable(ctx context.Context) {
 		processedTotal += processed
 	}
 	b.notifyQuotaOutbox(true)
-}
-
-func (b *Dat9Backend) drainQuotaOutboxForUploadTarget(ctx context.Context, target *datastore.NodeWithFile, targetExists bool) error {
-	if !targetExists || !b.UseServerQuota() || b.store == nil {
-		return nil
-	}
-	if target == nil || target.File == nil || target.File.FileID == "" {
-		return nil
-	}
-	return b.drainQuotaOutboxForFile(ctx, target.File.FileID, quotaOutboxUploadDrainLimit)
 }
 
 func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string, limit int) error {
@@ -399,6 +390,8 @@ func (b *Dat9Backend) applyQuotaOutboxEntryTx(tx *sql.Tx, entry *datastore.Quota
 	if entry == nil {
 		return fmt.Errorf("quota outbox entry is required")
 	}
+	// Reuse the central mutation dispatcher; upload_complete is handled there
+	// by applyUploadCompleteTx, the same body used by mutation replay.
 	return applyCentralQuotaMutationTx(b.metaStore, tx, b.tenantID, entry.MutationType, entry.MutationData, entry.ID)
 }
 
@@ -450,6 +443,34 @@ func (b *Dat9Backend) enqueueQuotaFileCreateOutboxTx(tx *sql.Tx, fileID string, 
 		StorageDelta: sizeBytes,
 		FileDelta:    1,
 		MediaDelta:   mediaDelta,
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (b *Dat9Backend) enqueueQuotaUploadCompleteOutboxTx(tx *sql.Tx, uploadID string, reservedBytes int64, fileID string, oldSizeBytes int64, oldIsMedia bool, newSizeBytes int64, newIsMedia bool) (bool, error) {
+	if !b.UseServerQuota() {
+		return false, nil
+	}
+	data := uploadCompleteMutationData{
+		UploadID:      uploadID,
+		FileID:        fileID,
+		ReservedBytes: reservedBytes,
+		OldSizeBytes:  oldSizeBytes,
+		OldIsMedia:    oldIsMedia,
+		NewSizeBytes:  newSizeBytes,
+		NewIsMedia:    newIsMedia,
+	}
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return false, err
+	}
+	_, err = b.store.EnqueueQuotaOutboxTx(tx, &datastore.QuotaOutboxEntry{
+		FileID:       fileID,
+		MutationType: quotaMutationTypeUploadComplete,
+		MutationData: raw,
 	})
 	if err != nil {
 		return false, err
