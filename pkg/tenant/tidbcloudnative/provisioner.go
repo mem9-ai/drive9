@@ -100,6 +100,12 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 	if _, err := normalizeDatabaseName(defaultDB); err != nil {
 		return nil, fmt.Errorf("invalid %s: %w", EnvTiDBCloudNativeDefaultDatabaseName, err)
 	}
+	usePrivate := parseBoolEnv(EnvTiDBCloudNativeUsePrivateEndpoint)
+	privateHost := strings.TrimSpace(os.Getenv(EnvTiDBCloudTencentPrivateEndpointHost))
+	if usePrivate && strings.EqualFold(cloudProvider, "tencentcloud") && privateHost == "" {
+		return nil, fmt.Errorf("%s is required when %s=true and cloud provider is tencentcloud",
+			EnvTiDBCloudTencentPrivateEndpointHost, EnvTiDBCloudNativeUsePrivateEndpoint)
+	}
 	return &Provisioner{
 		apiURL:              strings.TrimRight(apiURL, "/"),
 		cloudProvider:       cloudProvider,
@@ -108,8 +114,8 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 		defaultSpendLimit:   defaultSpendLimit,
 		defaultPublicKey:    strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePublicKey)),
 		defaultPrivateKey:   strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePrivateKey)),
-		usePrivateEndpoint:  parseBoolEnv(EnvTiDBCloudNativeUsePrivateEndpoint),
-		tencentPrivateEndpointHost: strings.TrimSpace(os.Getenv(EnvTiDBCloudTencentPrivateEndpointHost)),
+		usePrivateEndpoint:         usePrivate,
+		tencentPrivateEndpointHost: privateHost,
 		client:              &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
