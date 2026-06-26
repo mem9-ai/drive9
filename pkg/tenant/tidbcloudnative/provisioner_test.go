@@ -1276,6 +1276,20 @@ func TestNewProvisionerFromEnvReadsPrivateEndpointFlag(t *testing.T) {
 	}
 }
 
+func TestNewProvisionerFromEnvRejectsMalformedPrivateEndpointFlag(t *testing.T) {
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
+	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
+	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+
+	for _, v := range []string{"on", "Y", "ture", "enabled", "2", "enable"} {
+		t.Setenv(EnvTiDBCloudNativeUsePrivateEndpoint, v)
+		_, err := NewProvisionerFromEnv()
+		if err == nil {
+			t.Fatalf("expected error for %q, got nil", v)
+		}
+	}
+}
+
 func TestClusterConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	info := &clusterInfo{
 		ClusterID:  "cluster-1",
