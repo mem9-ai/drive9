@@ -51,6 +51,12 @@ type requestMetricState struct {
 	surface        string
 	action         string
 	tenantInFlight bool
+
+	bodyReadObserved bool
+	bodyReadMethod   string
+	bodyReadRoute    string
+	bodyReadBytes    int64
+	bodyReadDuration time.Duration
 }
 
 func withMetrics(ctx context.Context, m *serverMetrics) context.Context {
@@ -152,6 +158,33 @@ func requestMetricClass(ctx context.Context) (tenantRequestClass, bool) {
 	return tenantRequestClass{surface: state.surface, action: state.action}, true
 }
 
+func setRequestBodyReadMetric(ctx context.Context, method, route string, bytes int64, d time.Duration) {
+	state := requestMetricStateFromContext(ctx)
+	if state == nil {
+		return
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	state.bodyReadObserved = true
+	state.bodyReadMethod = method
+	state.bodyReadRoute = route
+	state.bodyReadBytes = bytes
+	state.bodyReadDuration = d
+}
+
+func requestBodyReadMetric(ctx context.Context) (method, route string, bytes int64, d time.Duration, ok bool) {
+	state := requestMetricStateFromContext(ctx)
+	if state == nil {
+		return "", "", 0, 0, false
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if !state.bodyReadObserved {
+		return "", "", 0, 0, false
+	}
+	return state.bodyReadMethod, state.bodyReadRoute, state.bodyReadBytes, state.bodyReadDuration, true
+}
+
 func finishRequestMetricTenant(ctx context.Context) {
 	state := requestMetricStateFromContext(ctx)
 	if state == nil {
@@ -202,6 +235,10 @@ func newServerMetrics() *serverMetrics {
 
 func (m *serverMetrics) record(method, route string, status int, d time.Duration) {
 	metrics.RecordHTTPRequest(method, route, status, d)
+}
+
+func (m *serverMetrics) recordBodyRead(method, route string, status int, bodyBytes int64, d time.Duration) {
+	metrics.RecordHTTPRequestBodyRead(method, route, status, bodyBytes, d)
 }
 
 func (m *serverMetrics) recordEvent(tenantID, event string, labels ...string) {
@@ -630,6 +667,15 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 
 	dur := time.Since(start)
 	s.metrics.record(r.Method, route, ow.status, dur)
+	if method, bodyRoute, bodyBytes, bodyReadDuration, ok := requestBodyReadMetric(r.Context()); ok {
+		if method == "" {
+			method = r.Method
+		}
+		if bodyRoute == "" {
+			bodyRoute = route
+		}
+		s.metrics.recordBodyRead(method, bodyRoute, ow.status, bodyBytes, bodyReadDuration)
+	}
 	recordTenantHTTPRequest(r, ow.status, dur, ow.size)
 
 	tenantID, apiKeyID, _ := requestMetricScope(r.Context())

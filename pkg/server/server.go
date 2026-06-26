@@ -1834,14 +1834,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
-	bodyReadStart := time.Time{}
-	if timingEnabled {
-		bodyReadStart = time.Now()
-	}
+	bodyReadStart := time.Now()
 	data, err := io.ReadAll(body)
-	if timingEnabled {
-		bodyReadDuration = time.Since(bodyReadStart)
-	}
+	bodyReadDuration = time.Since(bodyReadStart)
+	bodyReadMetricBytes := requestBodyReadMetricBytes(cl, len(data))
+	setRequestBodyReadMetric(r.Context(), r.Method, requestRoute(r.URL.Path), bodyReadMetricBytes, bodyReadDuration)
+	logSlowWriteBodyRead(r.Context(), r, requestRoute(r.URL.Path), bodyReadMetricBytes, bodyReadDuration)
 	if err != nil {
 		if timingEnabled {
 			logServerWriteTiming(r.Context(), path, 0, expectedRevision, 0, "body_read_error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), err)
@@ -1940,6 +1938,54 @@ func logServerWriteTiming(ctx context.Context, path string, bytes int, expectedR
 
 func serverDurationMs(d time.Duration) float64 {
 	return float64(d.Microseconds()) / 1000.0
+}
+
+func requestBodyReadMetricBytes(declared int64, observed int) int64 {
+	if declared >= 0 {
+		return declared
+	}
+	return int64(observed)
+}
+
+const slowWriteBodyReadThreshold = 5 * time.Second
+
+func logSlowWriteBodyRead(ctx context.Context, r *http.Request, route string, bytes int64, d time.Duration) {
+	if d < slowWriteBodyReadThreshold {
+		return
+	}
+	fields := eventFields(ctx,
+		"write_body_read_slow",
+		"method", r.Method,
+		"route", route,
+		"bytes", bytes,
+		"duration_ms", serverDurationMs(d),
+		"rate_bucket", bodyReadRateBucket(bytes, d),
+	)
+	if r.RemoteAddr != "" {
+		fields = append(fields, zap.String("remote", r.RemoteAddr))
+	}
+	logger.Warn(ctx, "server_event", fields...)
+}
+
+func bodyReadRateBucket(bytes int64, d time.Duration) string {
+	if bytes <= 0 || d <= 0 {
+		return "unknown"
+	}
+	bytesPerSecond := float64(bytes) / d.Seconds()
+	switch {
+	case bytesPerSecond <= 1<<10:
+		return "le_1KiB_s"
+	case bytesPerSecond <= 10<<10:
+		return "le_10KiB_s"
+	case bytesPerSecond <= 100<<10:
+		return "le_100KiB_s"
+	case bytesPerSecond <= 1<<20:
+		return "le_1MiB_s"
+	case bytesPerSecond <= 10<<20:
+		return "le_10MiB_s"
+	default:
+		return "gt_10MiB_s"
+	}
 }
 
 func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string) {

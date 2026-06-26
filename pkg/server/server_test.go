@@ -2068,6 +2068,9 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(text, `drive9_http_request_duration_seconds_bucket{method="GET",route="/v1/fs/*",le="0.1"}`) {
 		t.Fatalf("expected http duration histogram bucket in response: %s", text)
 	}
+	if !strings.Contains(text, `drive9_http_request_body_read_duration_seconds_bucket{body_size_bucket="le_1KiB",method="PUT",route="/v1/fs/*",status_class="2xx",le="0.1"}`) {
+		t.Fatalf("expected request body read duration histogram bucket in response: %s", text)
+	}
 	if !strings.Contains(text, `drive9_service_operation_duration_seconds_bucket{component="backend",operation="exec_sql",result="ok",le="0.01"}`) {
 		t.Fatalf("expected service operation histogram bucket in response: %s", text)
 	}
@@ -2108,6 +2111,34 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(text, `drive9_business_events_total{event="tenant_provision",result="error"}`) {
 		t.Fatalf("expected tenant_provision error metric in response: %s", text)
+	}
+}
+
+func TestWriteBodyReadMetricRecordsFailureStatusClass(t *testing.T) {
+	base := newTestServer(t)
+	s := NewWithConfig(Config{Backend: base.fallback, MaxUploadBytes: 3})
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/too-large.txt", io.NopCloser(strings.NewReader("abcdef")))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("write status = %d, want %d", resp.StatusCode, http.StatusRequestEntityTooLarge)
+	}
+
+	resp, err = http.Get(ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, _ := io.ReadAll(resp.Body)
+	text := string(body)
+	if !strings.Contains(text, `drive9_http_request_body_read_duration_seconds_bucket{body_size_bucket="le_1KiB",method="PUT",route="/v1/fs/*",status_class="4xx",le="0.1"}`) {
+		t.Fatalf("expected failed body read histogram with 4xx status class, got: %s", text)
 	}
 }
 

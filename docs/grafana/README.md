@@ -26,6 +26,7 @@ Tenant usage metrics intentionally allow `tenant_id` as a Prometheus label, but 
 
 - `drive9-service-health-dashboard.json`: first-stop dashboard for service incidents, module availability, HTTP health, service error ratio, and coarse DB pressure.
 - `drive9-async-fuse-dashboard.json`: first-stop dashboard for delayed background work and mount-path incidents, especially semantic worker backlog, image/audio extraction runtime, audio extract failures, and FUSE remote behavior.
+- `drive9-alert-rules.yaml`: Prometheus alert rules for filesystem write-path incidents. The rules split backend write latency from inline PUT request-body read latency so client upload or network-path slowness does not page as backend processing latency.
 
 ## 3. Request-path drill-down dashboards
 
