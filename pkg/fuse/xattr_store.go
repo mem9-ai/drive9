@@ -8,9 +8,15 @@ import (
 // FUSE mount session. Xattrs are scoped to file paths and are not persisted
 // to the backend — they exist only for the lifetime of the mount.
 //
-// On Darwin (macOS), the store still works, but callers should filter out
-// system-generated xattr prefixes (com.apple.*, system.*) to avoid
-// polluting results with Finder/Spotlight metadata.
+// Note: xattrs are keyed by path, not by inode. This means hardlinks (multiple
+// paths to the same inode) get independent xattr sets. This is a deliberate
+// simplification — the primary use case is macOS Finder/Spotlight compatibility
+// and Linux POSIX xattr testing, where per-path semantics are sufficient.
+//
+// On Darwin (macOS), system-generated xattr prefixes (com.apple.*, system.*)
+// are NOT filtered by this store. The FUSE kernel layer handles those before
+// they reach the handler. If explicit filtering becomes needed, it should be
+// added in the GetXAttr/ListXAttr handlers, not in the store.
 type XAttrStore struct {
 	mu   sync.RWMutex
 	data map[string]map[string][]byte // path -> attrName -> value
@@ -89,4 +95,15 @@ func (s *XAttrStore) RemoveAll(path string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.data, path)
+}
+
+// Rename moves all xattrs from oldPath to newPath.
+// This should be called on Rename to preserve xattrs across moves.
+func (s *XAttrStore) Rename(oldPath, newPath string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if attrs, ok := s.data[oldPath]; ok {
+		s.data[newPath] = attrs
+		delete(s.data, oldPath)
+	}
 }

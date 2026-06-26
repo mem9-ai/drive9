@@ -7655,6 +7655,10 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	}
 	fs.inodes.Rename(oldP, newP)
 	fs.renameSpecialNodeSubtree(oldP, newP)
+	// Migrate in-memory xattrs from old path to new path.
+	if fs.xattrs != nil {
+		fs.xattrs.Rename(oldP, newP)
+	}
 	fs.invalidateReadCacheAndTargets(oldP)
 	fs.invalidateReadCacheAndTargets(newP)
 	fs.readCache.InvalidatePrefix(oldP + "/")

@@ -11709,6 +11709,36 @@ func contains(slice []string, s string) bool {
 	return false
 }
 
+func TestXAttr_RenameMigratesXattrs(t *testing.T) {
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient("http://localhost"), opts)
+	fs.inodes.Lookup("/old.txt", false, 0, time.Now())
+	oldIno, _ := fs.inodes.GetInode("/old.txt")
+
+	_ = fs.SetXAttr(nil, &gofuse.SetXAttrIn{InHeader: gofuse.InHeader{NodeId: oldIno}}, "user.test", []byte("hello"))
+
+	// Rename the file — xattrs should migrate to the new path.
+	fs.xattrs.Rename("/old.txt", "/new.txt")
+
+	// Old path should have no xattrs.
+	_, st := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: oldIno}, "user.test", nil)
+	if st != gofuse.ENOATTR {
+		t.Errorf("GetXAttr on old path status = %v, want ENOATTR", st)
+	}
+
+	// New path should have the xattr.
+	fs.inodes.Lookup("/new.txt", false, 0, time.Now())
+	newIno, _ := fs.inodes.GetInode("/new.txt")
+	n, st := fs.GetXAttr(nil, &gofuse.InHeader{NodeId: newIno}, "user.test", nil)
+	if st != gofuse.OK {
+		t.Errorf("GetXAttr on new path status = %v, want OK", st)
+	}
+	if n != 5 {
+		t.Errorf("GetXAttr on new path size = %d, want 5", n)
+	}
+}
+
 func TestSetAttr_MtimeUpdate(t *testing.T) {
 	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(make([]byte, 42))
