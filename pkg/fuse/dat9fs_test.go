@@ -19110,6 +19110,62 @@ func TestRmdirSucceedsAfterFullUnlinkWithStaleRemoteList(t *testing.T) {
 	}
 }
 
+func TestRmdirSucceedsWithTombstoneFilteringStaleRemoteListing(t *testing.T) {
+	// Verify that delete tombstones filter stale remote listings even when
+	// the inode has been fully removed (RemoveLink with no open handles).
+	// The mock ALWAYS returns the stale entry (never clears), so the only way
+	// Rmdir can succeed is via the tombstone filter — not via polling.
+	var deleteCalls atomic.Int32
+	var listCalls atomic.Int32
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/fs/dir" && r.URL.Query().Has("list"):
+			listCalls.Add(1)
+			// Always returns stale entry — tombstone must filter this.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"entries": []map[string]any{{
+					"name": "stale.txt", "isDir": false, "size": 1,
+				}},
+			})
+		case r.Method == http.MethodDelete && r.URL.Path == "/v1/fs/dir":
+			deleteCalls.Add(1)
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	// Simulate: file was unlinked and inode fully removed (RemoveLink).
+	fs.inodes.Lookup("/dir", true, 0, time.Now())
+	fs.inodes.Lookup("/dir/stale.txt", false, 1, time.Now())
+	fs.dirCache.Remove("/dir", "stale.txt")
+	fs.inodes.RemoveLink("/dir/stale.txt")
+	// Record the tombstone — this is what the Unlink handler does after
+	// a successful remote delete.
+	fs.markPathDeleted("/dir/stale.txt")
+
+	// Rmdir should succeed immediately because the tombstone filters the stale
+	// entry — no polling delay needed.
+	start := time.Now()
+	st := fs.Rmdir(nil, &gofuse.InHeader{NodeId: 1}, "dir")
+	elapsed := time.Since(start)
+
+	if st != gofuse.OK {
+		t.Errorf("Rmdir status = %v, want OK (tombstone should filter stale entry)", st)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("Rmdir took %s, expected < 500ms (tombstone should filter without polling)", elapsed)
+	}
+	if got := deleteCalls.Load(); got != 1 {
+		t.Errorf("remote delete calls = %d, want 1", got)
+	}
+}
+
 func TestRmdirRemoteDeleteDoesNotRetryRecreatedPathAfterInterrupt(t *testing.T) {
 	path := "/repo/emptydir"
 

@@ -163,7 +163,17 @@ type Dat9FS struct {
 
 	// xattrs provides in-memory extended attribute storage for the mount session.
 	xattrs *XAttrStore
+
+	// deletedPaths tracks recently-unlinked paths as tombstones, so that
+	// remoteDirectoryHasChildren can filter out stale backend listings during
+	// the eventual-consistency window after a successful Unlink. Entries
+	// expire after deletedPathTTL (default 30s).
+	deletedPaths   map[string]time.Time
+	deletedPathsMu sync.Mutex
 }
+
+// deletedPathTTL is how long a delete tombstone remains active.
+const deletedPathTTL = 30 * time.Second
 
 // newWriteBuffer constructs a WriteBuffer with the small-file fast-path
 // cutoff aligned to the negotiated server inline_threshold.
@@ -267,6 +277,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		readFlight:        NewSingleFlight(),
 		remoteReadTimeout: fuseTimeout,
 		xattrs:            NewXAttrStore(),
+		deletedPaths:     make(map[string]time.Time),
 	}
 }
 
@@ -4997,6 +5008,48 @@ func (fs *Dat9FS) collectLocallyUnlinkedPaths(dirPath string) map[string]struct{
 	return unlinked
 }
 
+// markPathDeleted records a delete tombstone for the given path. This is
+// called by the Unlink handler after a successful remote delete, so that
+// remoteDirectoryHasChildren can filter out stale backend listings during
+// the eventual-consistency window — even when the inode has been fully
+// removed (RemoveLink with no open handles).
+func (fs *Dat9FS) markPathDeleted(path string) {
+	if fs == nil || path == "" {
+		return
+	}
+	fs.deletedPathsMu.Lock()
+	defer fs.deletedPathsMu.Unlock()
+	if fs.deletedPaths == nil {
+		fs.deletedPaths = make(map[string]time.Time)
+	}
+	fs.deletedPaths[path] = time.Now()
+	// Lazy GC: prune expired tombstones to bound memory.
+	now := time.Now()
+	for p, ts := range fs.deletedPaths {
+		if now.Sub(ts) > deletedPathTTL {
+			delete(fs.deletedPaths, p)
+		}
+	}
+}
+
+// snapshotDeletedPaths returns a set of paths that have active delete
+// tombstones (recorded within deletedPathTTL). Safe for concurrent use.
+func (fs *Dat9FS) snapshotDeletedPaths() map[string]struct{} {
+	if fs == nil {
+		return nil
+	}
+	fs.deletedPathsMu.Lock()
+	defer fs.deletedPathsMu.Unlock()
+	now := time.Now()
+	out := make(map[string]struct{})
+	for p, ts := range fs.deletedPaths {
+		if now.Sub(ts) <= deletedPathTTL {
+			out[p] = struct{}{}
+		}
+	}
+	return out
+}
+
 func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string) (bool, error) {
 	listStart := fs.perfStart()
 	items, err := fs.client.ListCtx(ctx, fs.remotePath(dirPath))
@@ -5009,6 +5062,7 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 	// file still appears in the remote listing, which would cause Rmdir to
 	// incorrectly return ENOTEMPTY for a directory the client knows is empty.
 	unlinkedPaths := fs.collectLocallyUnlinkedPaths(dirPath)
+	deletedTombstones := fs.snapshotDeletedPaths()
 	liveItems := make([]client.FileInfo, 0, len(items))
 	for _, item := range items {
 		if !validDirEntryName(item.Name) {
@@ -5022,7 +5076,10 @@ func (fs *Dat9FS) remoteDirectoryHasChildren(ctx context.Context, dirPath string
 			childP = "/" + item.Name
 		}
 		if _, isUnlinked := unlinkedPaths[childP]; isUnlinked {
-			continue // locally known-deleted, skip
+			continue // locally known-deleted (RemoveLinkPreserve), skip
+		}
+		if _, isTombstoned := deletedTombstones[childP]; isTombstoned {
+			continue // recently deleted (tombstone), skip
 		}
 		liveItems = append(liveItems, item)
 	}
@@ -7472,6 +7529,11 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	if fs.xattrs != nil {
 		fs.xattrs.RemoveAll(childP)
 	}
+	// Record a delete tombstone so remoteDirectoryHasChildren can filter
+	// this path out of stale backend listings during the eventual-consistency
+	// window — even after the inode has been fully removed (RemoveLink with
+	// no open handles, where the inode is fully removed).
+	fs.markPathDeleted(childP)
 	// Kernel initiated the unlink and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
 	return gofuse.OK
@@ -7728,6 +7790,9 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	if fs.xattrs != nil {
 		fs.xattrs.RemoveAll(childP)
 	}
+	// Record a delete tombstone for the removed directory so that
+	// remoteDirectoryHasChildren on the parent can filter it out.
+	fs.markPathDeleted(childP)
 	// Kernel initiated the rmdir and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
 	return gofuse.OK
