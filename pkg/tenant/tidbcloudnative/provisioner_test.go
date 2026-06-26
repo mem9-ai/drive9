@@ -1323,7 +1323,7 @@ func TestProvisionWithCredentialsUsesPrivateEndpoint(t *testing.T) {
 			"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1"},
 			"endpoints": map[string]any{
 				"public":  map[string]any{"host": "public.example", "port": 4000},
-				"private": map[string]any{"host": "private.internal", "port": 4000},
+				"private": map[string]any{"host": "private.internal", "port": 4001},
 			},
 		})
 	}))
@@ -1344,8 +1344,8 @@ func TestProvisionWithCredentialsUsesPrivateEndpoint(t *testing.T) {
 	if res.Host != "private.internal" {
 		t.Fatalf("Host = %q, want private.internal", res.Host)
 	}
-	if res.Port != 4000 {
-		t.Fatalf("Port = %d, want 4000", res.Port)
+	if res.Port != 4001 {
+		t.Fatalf("Port = %d, want 4001", res.Port)
 	}
 }
 
@@ -1364,5 +1364,31 @@ func TestBranchConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
 	}
 	if !branchConnectionIncomplete(branch, true) {
 		t.Fatalf("private mode should report incomplete when private host is empty")
+	}
+}
+
+func TestFillBranchEndpointUsesPrivateEndpoint(t *testing.T) {
+	branch := &branchInfo{
+		BranchID:   "branch-1",
+		UserPrefix: "u1",
+	}
+	branch.Endpoints.Public.Host = "public.example"
+	branch.Endpoints.Public.Port = 4000
+	branch.Endpoints.Private.Host = "private.internal"
+	branch.Endpoints.Private.Port = 4001
+
+	p := &Provisioner{usePrivateEndpoint: true}
+	out := &tenant.ClusterInfo{}
+	if err := p.fillBranchEndpoint(out, branch); err != nil {
+		t.Fatalf("fillBranchEndpoint: %v", err)
+	}
+	if out.Host != "private.internal" {
+		t.Fatalf("Host = %q, want private.internal", out.Host)
+	}
+	if out.Port != 4001 {
+		t.Fatalf("Port = %d, want 4001", out.Port)
+	}
+	if out.Username != "u1.root" {
+		t.Fatalf("Username = %q, want u1.root", out.Username)
 	}
 }
