@@ -459,6 +459,7 @@ func Mount(opts *MountOptions) error {
 	// it does no initial blanket cache invalidation and its first poll only
 	// fires after a 1s tick on real remote events, so it cannot race pollHack.
 	var sseWatcher *SSEWatcher
+	dat9fs.markStatCacheUnverified()
 	stopWatchers := func() {
 		if sseWatcher != nil {
 			sseWatcher.Stop()
@@ -700,6 +701,9 @@ func shouldContinueAfterWaitMountPermissionError(err error, mountPoint string, p
 	if err == nil || !isWaitMountPermissionError(err) {
 		return false, nil
 	}
+	if runtime.GOOS != "linux" {
+		return false, nil
+	}
 	if probe == nil {
 		return false, fmt.Errorf("no readiness probe configured")
 	}
@@ -728,11 +732,12 @@ func isWaitMountPermissionError(err error) bool {
 // loop cannot hang startup forever on the fallback path.
 const probeMountPointReadyTimeout = 5 * time.Second
 
-// probeMountPointReady confirms the mountpoint is usable after a permission-like
-// WaitMount error. It is only meaningful because the FUSE mount syscall has
-// already succeeded by this point, so stat/open/readdir on mountPoint are served
-// through go-fuse rather than the underlying directory; a passing probe means the
-// kernel<->serve-loop path works despite WaitMount's pollHack hitting EACCES/EPERM.
+// probeMountPointReady confirms the mountpoint is an active, usable mount after
+// a Linux permission-like WaitMount error. The active-mount check prevents the
+// probe from accepting the plain directory that Mount creates before go-fuse
+// mounts over it; once the mount is active, stat/open/readdir are served through
+// go-fuse and a passing probe means the kernel<->serve-loop path works despite
+// WaitMount's pollHack hitting EACCES/EPERM.
 // The stat/open/readdir below can block on a wedged serve loop, so the work runs
 // under a timeout (see probeMountPointReadyTimeout).
 func probeMountPointReady(mountPoint string) error {
@@ -754,6 +759,10 @@ func probeMountPointReady(mountPoint string) error {
 }
 
 func probeMountPointReadyOnce(mountPoint string) error {
+	return probeMountPointReadyOnceWithMountCheck(mountPoint, activeMountPoint)
+}
+
+func probeMountPointReadyOnceWithMountCheck(mountPoint string, isActiveMountPoint func(string) (bool, error)) error {
 	info, err := os.Stat(mountPoint)
 	if err != nil {
 		return err
@@ -761,15 +770,25 @@ func probeMountPointReadyOnce(mountPoint string) error {
 	if !info.IsDir() {
 		return fmt.Errorf("mountpoint is not a directory")
 	}
+	mounted, err := isActiveMountPoint(mountPoint)
+	if err != nil {
+		return err
+	}
+	if !mounted {
+		return fmt.Errorf("mountpoint is not an active mount")
+	}
 	dir, err := os.Open(mountPoint)
 	if err != nil {
 		return err
 	}
-	defer dir.Close()
+	var readErr error
 	if _, err := dir.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+		readErr = err
+	}
+	if err := dir.Close(); err != nil {
 		return err
 	}
-	return nil
+	return readErr
 }
 
 func validateMountOptionsProfile(opts *MountOptions) error {

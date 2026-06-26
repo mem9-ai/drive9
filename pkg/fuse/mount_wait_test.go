@@ -10,8 +10,17 @@ import (
 
 func TestProbeMountPointReadySucceedsOnUsableDir(t *testing.T) {
 	dir := t.TempDir()
-	if err := probeMountPointReady(dir); err != nil {
-		t.Fatalf("probeMountPointReady(%q) = %v, want nil", dir, err)
+	if err := probeMountPointReadyOnceWithMountCheck(dir, func(string) (bool, error) {
+		return true, nil
+	}); err != nil {
+		t.Fatalf("probeMountPointReadyOnceWithMountCheck(%q) = %v, want nil", dir, err)
+	}
+}
+
+func TestProbeMountPointReadyRejectsPlainLocalDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := probeMountPointReadyOnce(dir); err == nil {
+		t.Fatal("probeMountPointReadyOnce(local dir) = nil, want error")
 	}
 }
 
