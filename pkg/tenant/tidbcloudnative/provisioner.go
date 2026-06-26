@@ -291,16 +291,12 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 		OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
 		Host:           host,
 		Port:           port,
-		Username:       info.Username,
 		Password:       password,
 		DBName:         dbName,
 		Provider:       tenant.ProviderTiDBCloudNative,
 	}
-	if out.Username == "" && info.UserPrefix != "" {
+	if info.UserPrefix != "" {
 		out.Username = info.UserPrefix + ".root"
-	}
-	if out.Username == "" {
-		return out, nil, fmt.Errorf("tidbcloud native response missing username")
 	}
 	cloudCfg := &tenant.QuotaCloudConfig{
 		Labels: map[string]string{
@@ -981,9 +977,7 @@ type clusterInfo struct {
 		} `json:"private"`
 	} `json:"endpoints"`
 	UserPrefix string `json:"userPrefix"`
-	Username   string `json:"username"`
 }
-
 type branchInfo struct {
 	BranchID  string `json:"branchId"`
 	State     string `json:"state"`
@@ -1051,9 +1045,9 @@ func clusterConnectionIncomplete(info *clusterInfo, usePrivate bool) bool {
 		return true
 	}
 	if usePrivate {
-		return info.Endpoints.Private.Host == "" || info.Endpoints.Private.Port == 0 || (info.UserPrefix == "" && info.Username == "")
+		return info.Endpoints.Private.Host == "" || info.Endpoints.Private.Port == 0 || info.UserPrefix == ""
 	}
-	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || (info.UserPrefix == "" && info.Username == "")
+	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
 }
 
 func clusterProvisionMetadataIncomplete(info *clusterInfo, usePrivate bool) bool {
@@ -1068,9 +1062,9 @@ func branchConnectionIncomplete(info *branchInfo, usePrivate bool) bool {
 		return true
 	}
 	if usePrivate {
-		return info.Endpoints.Private.Host == "" || info.Endpoints.Private.Port == 0 || (info.UserPrefix == "" && info.Username == "")
+		return info.Endpoints.Private.Host == "" || info.Endpoints.Private.Port == 0 || info.UserPrefix == ""
 	}
-	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || (info.UserPrefix == "" && info.Username == "")
+	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || info.UserPrefix == ""
 }
 
 func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branchInfo) error {
@@ -1083,13 +1077,8 @@ func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branch
 		host = branch.Endpoints.Public.Host
 		port = branch.Endpoints.Public.Port
 	}
-	if branch.Username != "" {
-		out.Username = branch.Username
-	} else if branch.UserPrefix != "" {
+	if branch.UserPrefix != "" {
 		out.Username = branch.UserPrefix + ".root"
-	}
-	if out.Username == "" {
-		return fmt.Errorf("tidbcloud native branch response missing username")
 	}
 	out.Host = host
 	out.Port = port
@@ -1200,9 +1189,6 @@ func (p *Provisioner) WaitForBranchUserWithCredentials(ctx context.Context, clus
 		info, err := parseBranchInfo(raw)
 		if err != nil {
 			return "", err
-		}
-		if info.Username != "" {
-			return info.Username, nil
 		}
 		if info.UserPrefix != "" {
 			return info.UserPrefix + ".root", nil

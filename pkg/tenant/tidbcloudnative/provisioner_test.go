@@ -1202,7 +1202,7 @@ func TestWaitForBranchUserWithCredentialsPollsUserPrefix(t *testing.T) {
 	}
 }
 
-func TestWaitForBranchUserWithCredentialsPrefersUsername(t *testing.T) {
+func TestWaitForBranchUserWithCredentialsUsesUserPrefix(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
 			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
@@ -1210,9 +1210,9 @@ func TestWaitForBranchUserWithCredentialsPrefersUsername(t *testing.T) {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"branchId": "branch-1",
-			"state":    "ACTIVE",
-			"username": "direct-user",
+			"branchId":   "branch-1",
+			"state":      "ACTIVE",
+			"userPrefix": "u2",
 			"endpoints": map[string]any{
 				"public": map[string]any{"host": "branch.example", "port": 4000},
 			},
@@ -1229,8 +1229,8 @@ func TestWaitForBranchUserWithCredentialsPrefersUsername(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WaitForBranchUserWithCredentials: %v", err)
 	}
-	if username != "direct-user" {
-		t.Fatalf("username = %q, want direct-user", username)
+	if username != "u2.root" {
+		t.Fatalf("username = %q, want u2.root", username)
 	}
 }
 
