@@ -725,10 +725,13 @@ func (s *Server) handleVaultGrantRevoke(w http.ResponseWriter, r *http.Request, 
 func (s *Server) handleVaultAudit(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	result := "ok"
-	auditTenantID := "unknown"
-	if scope := ScopeFromContext(r.Context()); scope != nil {
-		auditTenantID = scope.TenantID
+	scope := ScopeFromContext(r.Context())
+	if scope == nil {
+		result = "error"
+		errJSON(w, http.StatusForbidden, "missing tenant scope")
+		return
 	}
+	auditTenantID := scope.TenantID
 	defer func() { recordVaultOperation(auditTenantID, "audit_query", start, result) }()
 
 	if r.Method != http.MethodGet {
