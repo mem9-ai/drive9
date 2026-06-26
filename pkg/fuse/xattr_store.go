@@ -134,6 +134,9 @@ func (s *XAttrStore) RemoveAll(path string) {
 // xattrs for directory renames (e.g. "/old/" → "/new/" also moves "/old/sub").
 // This should be called on Rename to preserve xattrs across moves.
 func (s *XAttrStore) Rename(oldPath, newPath string) {
+	if oldPath == newPath {
+		return // no-op rename; avoid deleting the entry we just assigned
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// Move the exact path.

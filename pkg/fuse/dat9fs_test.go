@@ -11834,6 +11834,18 @@ func TestXAttr_RenameMigratesSubtree(t *testing.T) {
 	}
 }
 
+func TestXAttr_RameNoOpPreservesXattrs(t *testing.T) {
+	// Rename to the same path should be a no-op — xattrs must survive.
+	store := NewXAttrStore()
+	store.Set("/file.txt", "user.test", []byte("hello"))
+
+	store.Rename("/file.txt", "/file.txt")
+
+	if v, ok := store.Get("/file.txt", "user.test"); !ok || string(v) != "hello" {
+		t.Errorf("xattr lost after no-op Rename: ok=%v val=%q", ok, v)
+	}
+}
+
 func TestSetAttr_MtimeUpdate(t *testing.T) {
 	fs, ino, cleanup := newTestDat9FS(t, 42, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(make([]byte, 42))
