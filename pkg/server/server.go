@@ -827,18 +827,11 @@ func contextWithTrace(parent, traceSource context.Context) context.Context {
 func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool) string {
 	query := "parseTime=true"
 	if tlsEnabled {
-		tlsMode := "true"
-		if isPrivateEndpointEnabled() {
-			tlsMode = "skip-verify"
-		}
-		query += "&tls=" + tlsMode
+		query += "&tls=true"
+	} else {
+		query += "&tls=skip-verify"
 	}
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", user, password, host, port, dbName, query)
-}
-
-func isPrivateEndpointEnabled() bool {
-	v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
-	return v == "1" || v == "true" || v == "yes"
 }
 
 func injectFallbackBackend(b *backend.Dat9Backend, next http.Handler) http.Handler {
@@ -4295,13 +4288,20 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encrypt db password", err)
 	}
+	dbtls := true
+	if provider == tenant.ProviderTiDBCloudNative {
+		v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
+		if v == "1" || v == "true" || v == "yes" {
+			dbtls = false
+		}
+	}
 	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
 		DBUser:           cluster.Username,
 		DBPasswordCipher: cipherPass,
 		DBName:           cluster.DBName,
-		DBTLS:            true,
+		DBTLS:            dbtls,
 		Provider:         provider,
 		ClusterID:        cluster.ClusterID,
 		ClaimURL:         cluster.ClaimURL,
@@ -4361,7 +4361,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		APIKeyID:       apiKeyID,
 		Status:         meta.TenantProvisioning,
 		Provider:       provider,
-		TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
+		TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, dbtls),
 		CloudProvider:  cloudProvider,
 		Region:         region,
 		OrganizationID: strings.TrimSpace(cluster.OrganizationID),
