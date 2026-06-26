@@ -1,36 +1,32 @@
 # Drive9 Blackbox Harness
 
-`blackbox/` contains the shared Drive9 blackbox test harness. The harness is
-split into three layers:
+`blackbox/` contains the Drive9 blackbox test framework, organized into three layers:
 
-- **`harness/`** — generic test framework (runner, reporter, module protocol).
-  No drive9-specific dependencies.
-- **`env/`** — drive9 test environment (server startup, CLI build, FUSE mount,
-  dependency management, capability detection).
-- **`suites/`** — test modules organized by group and module name:
-  `suites/<group>/<module>/module.py`.
+- **`harness/`** — generic test framework (runner, reporter, module protocol). No drive9 dependencies.
+- **`env/`** — drive9 test environment (server startup, CLI build, FUSE mount, dependency management).
+- **`suites/`** — test modules organized by group and module name: `suites/<group>/<module>/module.py`.
 
 ## Layout
 
 ```text
 blackbox/
-  run.py                 generic entrypoint
+  run.py                 entrypoint
   harness/
-    core.py             shared constants, Context, Recorder, Module protocol
+    core.py             Context, Recorder, ModuleRecord, constants
     module_base.py      BaseModule class, module_config helper
-    runner.py           BlackboxRunner: module execution, timeout, reporting
-    report.py           three-tier report templates (module/suite/overall)
+    runner.py           BlackboxRunner: execution, timeout, reporting
+    report.py           report templates
     suite.py            auto-discovery: scan suites/*/*/module.py
     deps.py             DependencyManager: git clone, tool detection
-    capabilities.py    host capability detection (OS, tools, features)
+    capabilities.py     host capability detection
   env/
     provider.py         Drive9SuiteProvider: setup/cleanup lifecycle
-    target.py           Drive9 CLI/server/FUSE mount provider
-    capabilities.py    macFUSE/FUSE-T/Linux FUSE capability detection
+    target.py           server/CLI/FUSE mount provider
+    capabilities.py     FUSE/macFUSE capability detection
     deps.py             Drive9DependencyManager: per-module tool builds
   suites/
-    groups.json         group definitions (group name -> list of module IDs)
-    community/          community test modules (pjdfstest, fio, ltp, etc.)
+    groups.json         group definitions (group name → list of module IDs)
+    community/          community test modules
       pjdfstest/
         module.py       test logic
         config.json      timeout, compat, labels, module-specific settings
@@ -40,13 +36,9 @@ blackbox/
       ltp/
       ...
     drive9/             drive9 workflow modules
-      git_fast_clone/
-        module.py
-        config.json
-      ...
     customer/           customer scenario modules
     ported/             ported JuiceFS modules
-    git/               git official test modules
+    git/                git official test modules
 ```
 
 ## Auto-Discovery
@@ -54,11 +46,15 @@ blackbox/
 Modules are discovered automatically by scanning `suites/<group>/<module>/module.py`.
 Each module file must export a class with `id`, `category`, and `run()` attributes.
 
-Module IDs are derived from the directory path: `community/pjdfstest` → `community.pjdfstest`.
+Module IDs are derived from the class's `id` attribute (not directory path).
+A single `module.py` can export multiple test classes (e.g., `ltp/module.py` has
+`CommunityLTPFS` + `CommunityLTPSyscalls`).
 
-Group definitions in `groups.json` map group names to module ID patterns.
+Group definitions in `suites/groups.json` map group names to module ID patterns.
 
 ## Commands
+
+All commands use `python3 blackbox/run.py` directly — no Makefile targets needed.
 
 ```bash
 # Run all modules
@@ -74,6 +70,7 @@ python3 blackbox/run.py --group perf
 python3 blackbox/run.py --category drive9.workflow
 
 # List available modules
+python3 blackbox/run.py --list
 python3 blackbox/run.py --list --format json
 
 # Bootstrap: prepare dependencies, then exit
@@ -81,16 +78,21 @@ python3 blackbox/run.py --all --bootstrap --work-dir /tmp/bb
 
 # Reuse the work-dir for a real run
 python3 blackbox/run.py --all --work-dir /tmp/bb
-```
 
-Makefile targets:
+# Prepare dependencies only (no setup/run)
+python3 blackbox/run.py --all --deps-only --work-dir /tmp/bb
 
-```bash
-make blackbox
-make blackbox BLACKBOX_SELECTOR=group:perf
-make blackbox BLACKBOX_SELECTOR=module:community.pjdfstest
-make blackbox BLACKBOX_WORK_DIR=/tmp/bb
-make blackbox-bootstrap BLACKBOX_SELECTOR=module:community.lock BLACKBOX_WORK_DIR=/tmp/bb
+# Performance runs
+python3 blackbox/run.py --module community.fio --runs 3
+
+# Strict prerequisites (fail if FUSE unavailable instead of skipping)
+python3 blackbox/run.py --all --strict-prereqs
+
+# Offline mode (no auto-fetch of dependencies)
+python3 blackbox/run.py --all --offline
+
+# Custom server mode
+python3 blackbox/run.py --all --server-mode existing
 ```
 
 ## Module Structure
@@ -104,14 +106,6 @@ Each module directory contains:
 | `config.json` | No | Module config: `timeout`, `compat`, `labels`, `report_profile`, module-specific settings |
 | `deps.py` | No | `ensure_dependencies(ctx)` function for module-specific dependency preparation |
 | `*.json` | No | Module-specific data files (allowlists, fixtures, etc.) |
-
-## Reports
-
-Blackbox generates three levels of report:
-
-1. **Module report** (`results/<session>/<group>/<module>/report.md` + `report.json`)
-2. **Suite report** (`results/<session>/report.md` + `suite-report.json`)
-3. **Overall report** (cross-suite summary when running `--all-suites`)
 
 ## Adding a Module
 
@@ -138,6 +132,13 @@ class MyModule(BaseModule):
         return {"result": "ok"}
 ```
 
+## Reports
+
+Blackbox generates two levels of report:
+
+1. **Module report** (`results/<session>/<group>/<module>/report.md` + `report.json`)
+2. **Suite report** (`results/<session>/report.md` + `suite-report.json`)
+
 ## Platform Compatibility
 
 Each module's `config.json` can declare platform expectations:
@@ -154,6 +155,24 @@ Values: `"run"` (default), `"skip"`, or `"xfail"`.
 
 Each module has a wall-clock timeout. Priority:
 
-1. `BLACKBOX_<MODULE>_TIMEOUT_S` environment variable (module ID uppercased, dots → underscores)
+1. `BLACKBOX_<MODULE_ID>_TIMEOUT_S` env var (module ID uppercased, dots → underscores)
 2. `timeout` field in `config.json`
 3. Module class `timeout` attribute (default 600s)
+
+## Work-Dir Isolation
+
+All writable state (cache, tmp, results, GOCACHE/GOMODCACHE) lives under a
+work-dir, keeping the repo tree clean. Use `--work-dir` to specify; defaults to
+`blackbox/work/<session>/`.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BLACKBOX_WORK_DIR` | `blackbox/work/<session>` | Work directory for cache/tmp/results |
+| `BLACKBOX_RUNS` | `1` | Performance run count |
+| `SERVER_MODE` | `auto` | Server mode: `auto`, `existing`, `local` |
+| `DRIVE9_CLI` | (auto-detect) | Path to drive9 CLI binary |
+| `OFFLINE` | `false` | Disable auto-fetch of dependencies |
+| `STRICT` | `false` | Fail on missing prerequisites instead of skipping |
+| `KEEP_ARTIFACTS` | `false` | Keep module artifacts after run |
