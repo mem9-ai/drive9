@@ -160,6 +160,9 @@ type Dat9FS struct {
 	// the dat9 client). When 0, defaultSmallFileThreshold is used. Use the
 	// inlineThreshold() accessor; do not read directly.
 	smallFileMax atomic.Int64
+
+	// xattrs provides in-memory extended attribute storage for the mount session.
+	xattrs *XAttrStore
 }
 
 // newWriteBuffer constructs a WriteBuffer with the small-file fast-path
@@ -263,6 +266,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		gitOverlayPending: make(map[string]map[string]pendingGitOverlayEntry),
 		readFlight:        NewSingleFlight(),
 		remoteReadTimeout: fuseTimeout,
+		xattrs:            NewXAttrStore(),
 	}
 }
 
@@ -7421,6 +7425,10 @@ func (fs *Dat9FS) Unlink(cancel <-chan struct{}, header *gofuse.InHeader, name s
 	fs.dirCache.Remove(parentPath, name)
 	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.cacheNegativePath(childP)
+	// Clean up in-memory xattrs for the unlinked path.
+	if fs.xattrs != nil {
+		fs.xattrs.RemoveAll(childP)
+	}
 	// Kernel initiated the unlink and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
 	return gofuse.OK
@@ -7596,6 +7604,10 @@ func (fs *Dat9FS) Rmdir(cancel <-chan struct{}, header *gofuse.InHeader, name st
 	fs.dirCache.Remove(parentPath, name)
 	fs.touchDirectoryChangeTime(parentPath, time.Now())
 	fs.cacheNegativePath(childP)
+	// Clean up in-memory xattrs for the removed directory and its children.
+	if fs.xattrs != nil {
+		fs.xattrs.RemoveAll(childP)
+	}
 	// Kernel initiated the rmdir and receives OK — it already
 	// removes the dentry. No notifyEntry/notifyInode needed.
 	return gofuse.OK
@@ -7782,6 +7794,10 @@ func (fs *Dat9FS) finishLocalRename(input *gofuse.RenameIn, oldP, newP string) {
 	}
 	fs.inodes.Rename(oldP, newP)
 	fs.renameSpecialNodeSubtree(oldP, newP)
+	// Migrate in-memory xattrs from old path to new path.
+	if fs.xattrs != nil {
+		fs.xattrs.Rename(oldP, newP)
+	}
 	fs.invalidateReadCacheAndTargets(oldP)
 	fs.invalidateReadCacheAndTargets(newP)
 	fs.readCache.InvalidatePrefix(oldP + "/")
@@ -12165,22 +12181,72 @@ func (fs *Dat9FS) StatFs(cancel <-chan struct{}, header *gofuse.InHeader, out *g
 	return gofuse.OK
 }
 
-// --- Xattr stubs (macOS Finder/Spotlight compatibility) ----------------------
+// --- Xattr handlers (in-memory, session-scoped) ----------------------------
 
 func (fs *Dat9FS) GetXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string, dest []byte) (uint32, gofuse.Status) {
-	return 0, gofuse.ENOATTR
+	path, ok := fs.inodes.GetPath(header.NodeId)
+	if !ok {
+		return 0, gofuse.ENOENT
+	}
+	val, found := fs.xattrs.Get(path, attr)
+	if !found {
+		return 0, gofuse.ENOATTR
+	}
+	if len(dest) == 0 {
+		return uint32(len(val)), gofuse.OK
+	}
+	if len(val) > len(dest) {
+		return uint32(len(val)), gofuse.Status(syscall.ERANGE)
+	}
+	copy(dest, val)
+	return uint32(len(val)), gofuse.OK
 }
 
 func (fs *Dat9FS) ListXAttr(cancel <-chan struct{}, header *gofuse.InHeader, dest []byte) (uint32, gofuse.Status) {
-	return 0, gofuse.OK
+	path, ok := fs.inodes.GetPath(header.NodeId)
+	if !ok {
+		return 0, gofuse.ENOENT
+	}
+	names := fs.xattrs.List(path)
+	var total int
+	for _, name := range names {
+		total += len(name) + 1
+	}
+	if len(dest) == 0 {
+		return uint32(total), gofuse.OK
+	}
+	if total > len(dest) {
+		return uint32(total), gofuse.Status(syscall.ERANGE)
+	}
+	off := 0
+	for _, name := range names {
+		off += copy(dest[off:], name)
+		dest[off] = 0
+		off++
+	}
+	return uint32(off), gofuse.OK
 }
 
 func (fs *Dat9FS) SetXAttr(cancel <-chan struct{}, input *gofuse.SetXAttrIn, attr string, data []byte) gofuse.Status {
+	path, ok := fs.inodes.GetPath(input.NodeId)
+	if !ok {
+		return gofuse.ENOENT
+	}
+	if err := fs.xattrs.SetWithFlags(path, attr, data, input.Flags); err != 0 {
+		return gofuse.Status(err)
+	}
 	return gofuse.OK
 }
 
 func (fs *Dat9FS) RemoveXAttr(cancel <-chan struct{}, header *gofuse.InHeader, attr string) gofuse.Status {
-	return gofuse.ENOATTR
+	path, ok := fs.inodes.GetPath(header.NodeId)
+	if !ok {
+		return gofuse.ENOENT
+	}
+	if !fs.xattrs.Remove(path, attr) {
+		return gofuse.ENOATTR
+	}
+	return gofuse.OK
 }
 
 // onCommitQueueSuccess is called by the commit queue after a successful upload.
