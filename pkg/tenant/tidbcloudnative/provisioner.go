@@ -276,11 +276,14 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 			}, nil, err
 		}
 	}
-	host := info.Endpoints.Public.Host
-	port := info.Endpoints.Public.Port
+	var host string
+	var port int
 	if p.usePrivateEndpoint {
 		host = info.Endpoints.Private.Host
 		port = info.Endpoints.Private.Port
+	} else {
+		host = info.Endpoints.Public.Host
+		port = info.Endpoints.Public.Port
 	}
 	out := &tenant.ClusterInfo{
 		TenantID:       tenantID,
@@ -1074,11 +1077,14 @@ func branchConnectionIncomplete(info *branchInfo, usePrivate bool) bool {
 }
 
 func (p *Provisioner) fillBranchEndpoint(out *tenant.ClusterInfo, branch *branchInfo) error {
-	host := branch.Endpoints.Public.Host
-	port := branch.Endpoints.Public.Port
+	var host string
+	var port int
 	if p.usePrivateEndpoint {
 		host = branch.Endpoints.Private.Host
 		port = branch.Endpoints.Private.Port
+	} else {
+		host = branch.Endpoints.Public.Host
+		port = branch.Endpoints.Public.Port
 	}
 	if host == "" || port == 0 {
 		return fmt.Errorf("tidbcloud native branch response missing endpoint")

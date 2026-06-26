@@ -1233,3 +1233,136 @@ func TestWaitForBranchUserWithCredentialsPrefersUsername(t *testing.T) {
 		t.Fatalf("username = %q, want direct-user", username)
 	}
 }
+
+func TestNewProvisionerFromEnvReadsPrivateEndpointFlag(t *testing.T) {
+	t.Setenv(EnvTiDBCloudNativeAPIURL, "https://serverless.tidbapi.com")
+	t.Setenv(EnvTiDBCloudNativeCloudProvider, "aws")
+	t.Setenv(EnvTiDBCloudNativeRegion, "us-east-1")
+
+	defaultUse := false
+	p, err := NewProvisionerFromEnv()
+	if err != nil {
+		t.Fatalf("NewProvisionerFromEnv: %v", err)
+	}
+	if p.usePrivateEndpoint != defaultUse {
+		t.Fatalf("usePrivateEndpoint = %v, want %v (default)", p.usePrivateEndpoint, defaultUse)
+	}
+
+	t.Setenv(EnvTiDBCloudNativeUsePrivateEndpoint, "true")
+	p, err = NewProvisionerFromEnv()
+	if err != nil {
+		t.Fatalf("NewProvisionerFromEnv with true: %v", err)
+	}
+	if !p.usePrivateEndpoint {
+		t.Fatalf("usePrivateEndpoint = %v, want true", p.usePrivateEndpoint)
+	}
+
+	t.Setenv(EnvTiDBCloudNativeUsePrivateEndpoint, "1")
+	p, err = NewProvisionerFromEnv()
+	if err != nil {
+		t.Fatalf("NewProvisionerFromEnv with 1: %v", err)
+	}
+	if !p.usePrivateEndpoint {
+		t.Fatalf("usePrivateEndpoint = %v, want true", p.usePrivateEndpoint)
+	}
+
+	t.Setenv(EnvTiDBCloudNativeUsePrivateEndpoint, "no")
+	p, err = NewProvisionerFromEnv()
+	if err != nil {
+		t.Fatalf("NewProvisionerFromEnv with no: %v", err)
+	}
+	if p.usePrivateEndpoint {
+		t.Fatalf("usePrivateEndpoint = %v, want false", p.usePrivateEndpoint)
+	}
+}
+
+func TestClusterConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
+	info := &clusterInfo{
+		ClusterID:  "cluster-1",
+		UserPrefix: "u1",
+	}
+	info.Endpoints.Public.Host = "public.example"
+	info.Endpoints.Public.Port = 4000
+	info.Endpoints.Private.Host = ""
+	info.Endpoints.Private.Port = 4000
+
+	if clusterConnectionIncomplete(info, false) {
+		t.Fatalf("public mode should report complete")
+	}
+	if !clusterConnectionIncomplete(info, true) {
+		t.Fatalf("private mode should report incomplete when private host is empty")
+	}
+}
+
+func TestProvisionWithCredentialsUsesPrivateEndpoint(t *testing.T) {
+	var pollCount int
+	origEnsureDatabase := ensureDatabaseFunc
+	ensureDatabaseFunc = func(context.Context, string, string, string, int, string) error {
+		return nil
+	}
+	t.Cleanup(func() { ensureDatabaseFunc = origEnsureDatabase })
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		pollCount++
+		if r.URL.Path != "/v1beta1/clusters" && pollCount == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clusterId": "cluster-1",
+				"state":     "CREATING",
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"clusterId":  "cluster-1",
+			"state":      "ACTIVE",
+			"userPrefix": "u1",
+			"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1"},
+			"endpoints": map[string]any{
+				"public":  map[string]any{"host": "public.example", "port": 4000},
+				"private": map[string]any{"host": "private.internal", "port": 4000},
+			},
+		})
+	}))
+	defer ts.Close()
+
+	p := &Provisioner{
+		apiURL:              ts.URL,
+		defaultDatabaseName: DefaultDatabaseName,
+		usePrivateEndpoint:  true,
+		client:              ts.Client(),
+	}
+	res, _, err := p.ProvisionWithCredentialsAndQuota(context.Background(), "tenant-1", tenant.CredentialProvisionRequest{
+		PublicKey: "public-1", PrivateKey: "private-1",
+	}, tenant.QuotaUpdateOptions{})
+	if err != nil {
+		t.Fatalf("ProvisionWithCredentialsAndQuota: %v", err)
+	}
+	if res.Host != "private.internal" {
+		t.Fatalf("Host = %q, want private.internal", res.Host)
+	}
+	if res.Port != 4000 {
+		t.Fatalf("Port = %d, want 4000", res.Port)
+	}
+}
+
+func TestBranchConnectionIncompleteWhenPrivateEndpointMissing(t *testing.T) {
+	branch := &branchInfo{
+		BranchID:   "branch-1",
+		UserPrefix: "u1",
+	}
+	branch.Endpoints.Public.Host = "public.example"
+	branch.Endpoints.Public.Port = 4000
+	branch.Endpoints.Private.Host = ""
+	branch.Endpoints.Private.Port = 4000
+
+	if branchConnectionIncomplete(branch, false) {
+		t.Fatalf("public mode should report complete")
+	}
+	if !branchConnectionIncomplete(branch, true) {
+		t.Fatalf("private mode should report incomplete when private host is empty")
+	}
+}
