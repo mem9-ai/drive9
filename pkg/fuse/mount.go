@@ -454,6 +454,10 @@ func Mount(opts *MountOptions) error {
 	// Start SSE watcher after WaitMount. The initial stream reset invalidates
 	// kernel/user-space caches; if it races go-fuse's WaitMount pollHack open
 	// on Linux, the kernel can reject .go-fuse-epoll-hack with EACCES/EPERM.
+	//
+	// The layer event watcher (started earlier) is deliberately left running:
+	// it does no initial blanket cache invalidation and its first poll only
+	// fires after a 1s tick on real remote events, so it cannot race pollHack.
 	var sseWatcher *SSEWatcher
 	stopWatchers := func() {
 		if sseWatcher != nil {
@@ -465,16 +469,16 @@ func Mount(opts *MountOptions) error {
 	err = serveWaitMountThenStartWatchers(server.Serve, server.WaitMount, func() {
 		sseWatcher = StartSSEWatcher(dat9fs, c, actorID)
 	}, func(err error) error {
-		if ok, probeErr := shouldContinueAfterWaitMountPermissionError(err, opts.MountPoint, probeMountPointReady); ok {
+		ok, probeErr := shouldContinueAfterWaitMountPermissionError(err, opts.MountPoint, probeMountPointReady)
+		if ok {
 			fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission error ignored after readiness probe passed at %s: %v\n", opts.MountPoint, err)
 			return nil
-		} else {
-			if probeErr != nil {
-				fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission fallback probe failed at %s: %v\n", opts.MountPoint, probeErr)
-			}
-			stopWatchers()
-			return fmt.Errorf("fuse wait mount: %w", err)
 		}
+		if probeErr != nil {
+			fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission fallback probe failed at %s: %v\n", opts.MountPoint, probeErr)
+		}
+		stopWatchers()
+		return fmt.Errorf("fuse wait mount: %w", err)
 	})
 	if err != nil {
 		return err
@@ -712,15 +716,44 @@ func isWaitMountPermissionError(err error) bool {
 	if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
 		return true
 	}
+	// Some go-fuse WaitMount paths surface the kernel errno as a plain text
+	// error that does not unwrap to a syscall.Errno, so fall back to matching
+	// the canonical EACCES/EPERM strings. Keep this even though errors.Is above
+	// covers the wrapped case.
 	errText := strings.ToLower(err.Error())
 	return strings.Contains(errText, "permission denied") || strings.Contains(errText, "operation not permitted")
 }
 
+// probeMountPointReadyTimeout bounds the readiness probe so a half-broken serve
+// loop cannot hang startup forever on the fallback path.
+const probeMountPointReadyTimeout = 5 * time.Second
+
+// probeMountPointReady confirms the mountpoint is usable after a permission-like
+// WaitMount error. It is only meaningful because the FUSE mount syscall has
+// already succeeded by this point, so stat/open/readdir on mountPoint are served
+// through go-fuse rather than the underlying directory; a passing probe means the
+// kernel<->serve-loop path works despite WaitMount's pollHack hitting EACCES/EPERM.
+// The stat/open/readdir below can block on a wedged serve loop, so the work runs
+// under a timeout (see probeMountPointReadyTimeout).
 func probeMountPointReady(mountPoint string) error {
 	mountPoint = strings.TrimSpace(mountPoint)
 	if mountPoint == "" {
 		return fmt.Errorf("empty mountpoint")
 	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- probeMountPointReadyOnce(mountPoint)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(probeMountPointReadyTimeout):
+		return fmt.Errorf("mountpoint readiness probe timed out after %s", probeMountPointReadyTimeout)
+	}
+}
+
+func probeMountPointReadyOnce(mountPoint string) error {
 	info, err := os.Stat(mountPoint)
 	if err != nil {
 		return err

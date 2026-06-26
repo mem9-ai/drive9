@@ -2,10 +2,31 @@ package fuse
 
 import (
 	"errors"
+	"path/filepath"
 	"reflect"
 	"syscall"
 	"testing"
 )
+
+func TestProbeMountPointReadySucceedsOnUsableDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := probeMountPointReady(dir); err != nil {
+		t.Fatalf("probeMountPointReady(%q) = %v, want nil", dir, err)
+	}
+}
+
+func TestProbeMountPointReadyFailsOnMissingPath(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "does-not-exist")
+	if err := probeMountPointReady(missing); err == nil {
+		t.Fatal("probeMountPointReady(missing) = nil, want error")
+	}
+}
+
+func TestProbeMountPointReadyRejectsEmptyMountPoint(t *testing.T) {
+	if err := probeMountPointReady("   "); err == nil {
+		t.Fatal("probeMountPointReady(blank) = nil, want error")
+	}
+}
 
 func TestServeWaitMountThenStartWatchersStartsWatchersAfterWaitMount(t *testing.T) {
 	var events []string
