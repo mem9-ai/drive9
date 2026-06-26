@@ -83,7 +83,7 @@ func RecordGauge(component, name string, value float64) {
 func RecordTenantGauge(tenantID, component, name string, value float64) {
 	component = cleanMetricValue(component, "unknown")
 	name = cleanMetricValue(name, "unknown")
-	tenantID = cleanMetricValue(tenantID, "unknown")
+	tenantID = strings.TrimSpace(tenantID)
 	RegisterModule(component)
 	serviceGauge.Set(value, Attr("component", component), Attr("name", name), Attr("tenant_id", tenantID))
 }
