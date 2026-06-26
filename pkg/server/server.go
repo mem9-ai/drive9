@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	pathpkg "path"
 	"strconv"
 	"strings"
@@ -826,7 +827,11 @@ func contextWithTrace(parent, traceSource context.Context) context.Context {
 func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool) string {
 	query := "parseTime=true"
 	if tlsEnabled {
-		query += "&tls=true"
+		tlsMode := "true"
+		if v := strings.TrimSpace(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")); v != "" {
+			tlsMode = "skip-verify"
+		}
+		query += "&tls=" + tlsMode
 	}
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", user, password, host, port, dbName, query)
 }
