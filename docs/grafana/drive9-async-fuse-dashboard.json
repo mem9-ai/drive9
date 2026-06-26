@@ -132,7 +132,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "drive9_service_gauge{component=\"semantic_worker\",name=\"queue_lag_seconds\"}",
+          "expr": "sum(drive9_service_gauge{component=\"semantic_worker\",name=\"queue_lag_seconds\",tenant_id=\"\"})",
           "legendFormat": "queue_lag_seconds",
           "refId": "A"
         }
@@ -199,7 +199,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "drive9_service_gauge{component=\"semantic_worker\",name=\"dead_lettered\"}",
+          "expr": "sum(drive9_service_gauge{component=\"semantic_worker\",name=\"dead_lettered\",tenant_id=\"\"})",
           "legendFormat": "dead_lettered",
           "refId": "A"
         }
@@ -409,7 +409,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "drive9_service_gauge{component=\"semantic_worker\",name=~\"inflight|queued|processing|dead_lettered\"}",
+          "expr": "sum by (name) (drive9_service_gauge{component=\"semantic_worker\",name=~\"inflight|queued|processing|dead_lettered\",tenant_id=\"\"})",
           "legendFormat": "semantic_worker {{name}}",
           "refId": "A"
         }
@@ -456,7 +456,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "drive9_service_gauge{component=\"semantic_worker\",name=\"queue_lag_seconds\"}",
+          "expr": "sum(drive9_service_gauge{component=\"semantic_worker\",name=\"queue_lag_seconds\",tenant_id=\"\"})",
           "legendFormat": "semantic_worker queue_lag_seconds",
           "refId": "A"
         },
