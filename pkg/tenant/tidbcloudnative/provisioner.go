@@ -27,15 +27,15 @@ import (
 )
 
 const (
-	EnvTiDBCloudNativeAPIURL              = "DRIVE9_TIDBCLOUD_NATIVE_API_URL"
-	EnvTiDBCloudNativeCloudProvider       = "DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER"
-	EnvTiDBCloudNativeRegion              = "DRIVE9_TIDBCLOUD_NATIVE_REGION"
-	EnvTiDBCloudNativeDefaultDatabaseName = "DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME"
-	EnvTiDBCloudDefaultSpendingLimit      = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
-	EnvTiDBCloudNativePublicKey           = "DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY"
-	EnvTiDBCloudNativePrivateKey          = "DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY"
-	EnvTiDBCloudNativeUsePrivateEndpoint          = "DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT"
-	EnvTiDBCloudTencentPrivateEndpointHost        = "DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST"
+	EnvTiDBCloudNativeAPIURL               = "DRIVE9_TIDBCLOUD_NATIVE_API_URL"
+	EnvTiDBCloudNativeCloudProvider        = "DRIVE9_TIDBCLOUD_NATIVE_CLOUD_PROVIDER"
+	EnvTiDBCloudNativeRegion               = "DRIVE9_TIDBCLOUD_NATIVE_REGION"
+	EnvTiDBCloudNativeDefaultDatabaseName  = "DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME"
+	EnvTiDBCloudDefaultSpendingLimit       = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
+	EnvTiDBCloudNativePublicKey            = "DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY"
+	EnvTiDBCloudNativePrivateKey           = "DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY"
+	EnvTiDBCloudNativeUsePrivateEndpoint   = "DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT"
+	EnvTiDBCloudTencentPrivateEndpointHost = "DRIVE9_TIDBCLOUD_TENCENT_PRIVATE_ENDPOINT_HOST"
 
 	DefaultDatabaseName = "tidbcloud_fs"
 	DefaultSpendLimit   = int32(1000)
@@ -66,16 +66,16 @@ var (
 )
 
 type Provisioner struct {
-	apiURL              string
-	cloudProvider       string
-	region              string
-	defaultDatabaseName string
-	defaultSpendLimit   *int32
-	defaultPublicKey    string
-	defaultPrivateKey   string
-	usePrivateEndpoint  bool
+	apiURL                     string
+	cloudProvider              string
+	region                     string
+	defaultDatabaseName        string
+	defaultSpendLimit          *int32
+	defaultPublicKey           string
+	defaultPrivateKey          string
+	usePrivateEndpoint         bool
 	tencentPrivateEndpointHost string
-	client              *http.Client
+	client                     *http.Client
 }
 
 func NewProvisionerFromEnv() (*Provisioner, error) {
@@ -110,16 +110,16 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 			EnvTiDBCloudTencentPrivateEndpointHost, EnvTiDBCloudNativeUsePrivateEndpoint)
 	}
 	return &Provisioner{
-		apiURL:              strings.TrimRight(apiURL, "/"),
-		cloudProvider:       cloudProvider,
-		region:              region,
-		defaultDatabaseName: defaultDB,
-		defaultSpendLimit:   defaultSpendLimit,
-		defaultPublicKey:    strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePublicKey)),
-		defaultPrivateKey:   strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePrivateKey)),
+		apiURL:                     strings.TrimRight(apiURL, "/"),
+		cloudProvider:              cloudProvider,
+		region:                     region,
+		defaultDatabaseName:        defaultDB,
+		defaultSpendLimit:          defaultSpendLimit,
+		defaultPublicKey:           strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePublicKey)),
+		defaultPrivateKey:          strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePrivateKey)),
 		usePrivateEndpoint:         usePrivate,
 		tencentPrivateEndpointHost: privateHost,
-		client:              &http.Client{Timeout: 60 * time.Second},
+		client:                     &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
 
