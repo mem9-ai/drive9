@@ -34,6 +34,7 @@ const (
 	EnvTiDBCloudDefaultSpendingLimit      = "DRIVE9_TIDBCLOUD_DEFAULT_SPENDING_LIMIT"
 	EnvTiDBCloudNativePublicKey           = "DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY"
 	EnvTiDBCloudNativePrivateKey          = "DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY"
+	EnvTiDBCloudNativeUsePrivateEndpoint  = "DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT"
 
 	DefaultDatabaseName = "tidbcloud_fs"
 	DefaultSpendLimit   = int32(1000)
@@ -71,6 +72,7 @@ type Provisioner struct {
 	defaultSpendLimit   *int32
 	defaultPublicKey    string
 	defaultPrivateKey   string
+	usePrivateEndpoint  bool
 	client              *http.Client
 }
 
@@ -104,6 +106,7 @@ func NewProvisionerFromEnv() (*Provisioner, error) {
 		defaultSpendLimit:   defaultSpendLimit,
 		defaultPublicKey:    strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePublicKey)),
 		defaultPrivateKey:   strings.TrimSpace(os.Getenv(EnvTiDBCloudNativePrivateKey)),
+		usePrivateEndpoint:  parseBoolEnv(EnvTiDBCloudNativeUsePrivateEndpoint),
 		client:              &http.Client{Timeout: 60 * time.Second},
 	}, nil
 }
@@ -273,12 +276,20 @@ func (p *Provisioner) ProvisionWithCredentialsAndQuota(ctx context.Context, tena
 			}, nil, err
 		}
 	}
+	host := info.Endpoints.Public.Host
+	port := info.Endpoints.Public.Port
+	if p.usePrivateEndpoint {
+		if info.Endpoints.Private.Host != "" {
+			host = info.Endpoints.Private.Host
+			port = info.Endpoints.Private.Port
+		}
+	}
 	out := &tenant.ClusterInfo{
 		TenantID:       tenantID,
 		ClusterID:      info.ClusterID,
 		OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
-		Host:           info.Endpoints.Public.Host,
-		Port:           info.Endpoints.Public.Port,
+		Host:           host,
+		Port:           port,
 		Username:       info.Username,
 		Password:       password,
 		DBName:         dbName,
@@ -814,6 +825,11 @@ func parseDefaultSpendLimit(raw string) (*int32, error) {
 	return &out, nil
 }
 
+func parseBoolEnv(name string) bool {
+	v := strings.TrimSpace(strings.ToLower(os.Getenv(name)))
+	return v == "1" || v == "true" || v == "yes"
+}
+
 func normalizeDatabaseName(name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if !databaseNamePattern.MatchString(name) {
@@ -961,6 +977,10 @@ type clusterInfo struct {
 			Host string `json:"host"`
 			Port int    `json:"port"`
 		} `json:"public"`
+		Private struct {
+			Host string `json:"host"`
+			Port int    `json:"port"`
+		} `json:"private"`
 	} `json:"endpoints"`
 	UserPrefix string `json:"userPrefix"`
 	Username   string `json:"username"`
@@ -1027,6 +1047,9 @@ func parseBranchInfo(raw []byte) (*branchInfo, error) {
 func clusterConnectionIncomplete(info *clusterInfo) bool {
 	if info == nil {
 		return true
+	}
+	if parseBoolEnv(EnvTiDBCloudNativeUsePrivateEndpoint) {
+		return info.Endpoints.Private.Host == "" || info.Endpoints.Private.Port == 0 || (info.UserPrefix == "" && info.Username == "")
 	}
 	return info.Endpoints.Public.Host == "" || info.Endpoints.Public.Port == 0 || (info.UserPrefix == "" && info.Username == "")
 }
