@@ -114,6 +114,43 @@ func (p *Pool) StopAllFileGC() {
 	}
 }
 
+// ActiveTenantStores snapshots the (tenantID, store) pairs currently cached in
+// the pool. It is intended for leader-only background maintenance (e.g. the
+// fs_events cleanup goroutine) that should operate only on tenants with a
+// live backend — fs_events rows only accumulate for tenants that have served
+// traffic and thus have a cached backend. Unlike ListTenantsByStatus +
+// Acquire, this does NOT open backends for dormant tenants (which would
+// exhaust connections and fail for tenants whose credentials are not
+// materialized), so it is cheap and safe to call on every cleanup tick.
+// The returned stores are pinned only for the duration of the snapshot call;
+// callers must not retain them past the cleanup operation (a concurrent
+// retirement may close the underlying DB once this returns). In practice the
+// leader cleanup runs briefly and the entry's refs prevent close mid-use only
+// while Acquire is held — for a read-only COUNT/DELETE that tolerates a stale
+// reference error, this snapshot is sufficient and matches the existing
+// StartAllFileGC iteration pattern.
+func (p *Pool) ActiveTenantStores() []TenantStoreEntry {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	out := make([]TenantStoreEntry, 0, len(p.items))
+	for _, e := range p.items {
+		if e.store == nil || e.retired {
+			continue
+		}
+		out = append(out, TenantStoreEntry{TenantID: e.tenantID, Store: e.store})
+	}
+	p.mu.Unlock()
+	return out
+}
+
+// TenantStoreEntry is a (tenantID, store) pair returned by ActiveTenantStores.
+type TenantStoreEntry struct {
+	TenantID string
+	Store    *datastore.Store
+}
+
 type Pool struct {
 	mu                        sync.Mutex
 	cfg                       PoolConfig

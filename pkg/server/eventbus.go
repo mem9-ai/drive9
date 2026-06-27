@@ -97,6 +97,7 @@ func (eb *EventBus) Subscribe() (uint64, chan struct{}) {
 	eb.nextID++
 	ch := make(chan struct{}, eventBusListenerChanSize)
 	eb.listeners[id] = ch
+	metrics.RecordSSEInFlight(eb.tenantID, float64(len(eb.listeners)))
 
 	// Start the cross-pod poll goroutine on first subscriber.
 	if eb.pollCancel == nil {
@@ -136,6 +137,7 @@ func (eb *EventBus) Unsubscribe(id uint64) {
 		delete(eb.listeners, id)
 		close(ch)
 	}
+	metrics.RecordSSEInFlight(eb.tenantID, float64(len(eb.listeners)))
 	// Stop the poll goroutine when no subscribers remain.
 	var doneCh chan struct{}
 	if len(eb.listeners) == 0 && eb.pollCancel != nil {
@@ -188,14 +190,18 @@ func (eb *EventBus) pollOnce(ctx context.Context) {
 	since := eb.pollLast
 	eb.mu.Unlock()
 
+	queryStart := time.Now()
 	rows, err := store.ListFSEventsSince(ctx, int64(since), 1000)
+	metrics.RecordEventBusQuery(eb.tenantID, "poll", queryResult(err), time.Since(queryStart))
 	if err != nil {
 		// Log so operators can detect persistent failures or pool-churn-induced
 		// stale-store hits. Don't send reset — just skip this tick.
 		logger.Warn(ctx, "event_bus_poll_failed",
 			zap.String("tenant_id", eb.tenantID),
 			zap.Uint64("since", since),
+			zap.Float64("query_ms", float64(time.Since(queryStart).Microseconds())/1000),
 			zap.Error(err))
+		metrics.RecordEventBusPollFailure(eb.tenantID)
 		return
 	}
 	if len(rows) == 0 {
@@ -210,18 +216,7 @@ func (eb *EventBus) pollOnce(ctx context.Context) {
 
 // Seq returns the current maximum fs_events seq, or 0 if no events exist.
 func (eb *EventBus) Seq(ctx context.Context) uint64 {
-	store := eb.store.Load()
-	if store == nil {
-		return 0
-	}
-	seq, err := store.LatestFSEventSeq(ctx)
-	if err != nil {
-		return 0
-	}
-	if seq < 0 {
-		return 0
-	}
-	return uint64(seq)
+	return uint64(clampNonNegative(latestSeqSafeWithMetric(ctx, eb.store.Load(), eb.tenantID)))
 }
 
 // EventsSince returns all events with seq > since and the current head seq.
@@ -237,10 +232,12 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 	}
 	if since == 0 {
 		// Initial sync: send reset so client starts fresh.
-		headSeq = uint64(clampNonNegative(latestSeqSafe(ctx, store)))
+		headSeq = uint64(clampNonNegative(latestSeqSafeWithMetric(ctx, store, eb.tenantID)))
 		return nil, headSeq, false
 	}
+	queryStart := time.Now()
 	rows, err := store.ListFSEventsSince(ctx, int64(since), 1000)
+	metrics.RecordEventBusQuery(eb.tenantID, "events_since", queryResult(err), time.Since(queryStart))
 	if err != nil {
 		// Table missing or query failed: don't send reset on every poll —
 		// that would cause continuous full-cache invalidation. Instead, return
@@ -252,6 +249,7 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 		logger.Warn(ctx, "event_bus_query_failed",
 			zap.String("tenant_id", eb.tenantID),
 			zap.Uint64("since", since),
+			zap.Float64("query_ms", float64(time.Since(queryStart).Microseconds())/1000),
 			zap.Error(err))
 		metrics.RecordTenantOperation(eb.tenantID, "event_bus", "query", "error", 0)
 		headSeq = since // keep the client's cursor unchanged
@@ -281,8 +279,12 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 	}
 	// No rows after since. Check the actual table state to determine whether
 	// the client's cursor is stale (events pruned) or simply caught up.
-	latest := latestSeqSafe(ctx, store)
-	oldest := oldestSeqSafe(ctx, store)
+	latestStart := time.Now()
+	latest := latestSeqSafeWithMetric(ctx, store, eb.tenantID)
+	latestQueryMs := float64(time.Since(latestStart).Microseconds()) / 1000
+	oldestStart := time.Now()
+	oldest := oldestSeqSafeWithMetric(ctx, store, eb.tenantID)
+	oldestQueryMs := float64(time.Since(oldestStart).Microseconds()) / 1000
 	if latest == 0 {
 		// Table is empty (all events pruned): cursor is stale → reset.
 		return nil, 0, false
@@ -296,34 +298,56 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 		// Client cursor is behind the oldest retained event: events between
 		// since+1 and oldest-1 were pruned, so the client has a gap → reset
 		// to avoid silently missing those events.
+		// Log the gap with table bounds so operators can detect table growth
+		// without direct DB access (oldest-seq - since delta indicates how
+		// much was pruned).
+		logger.Info(ctx, "event_bus_cursor_gap",
+			zap.String("tenant_id", eb.tenantID),
+			zap.Uint64("since", since),
+			zap.Int64("oldest", oldest),
+			zap.Int64("latest", latest),
+			zap.Float64("latest_query_ms", latestQueryMs),
+			zap.Float64("oldest_query_ms", oldestQueryMs))
 		return nil, headSeq, false
 	}
 	// Client is caught up: no new events after since, cursor within range.
 	return nil, headSeq, true
 }
 
-// latestSeqSafe returns LatestFSEventSeq, or 0 on error.
-func latestSeqSafe(ctx context.Context, store *datastore.Store) int64 {
+// latestSeqSafeWithMetric is latestSeqSafe plus a per-query duration metric.
+func latestSeqSafeWithMetric(ctx context.Context, store *datastore.Store, tenantID string) int64 {
 	if store == nil {
 		return 0
 	}
+	start := time.Now()
 	seq, err := store.LatestFSEventSeq(ctx)
+	metrics.RecordEventBusQuery(tenantID, "latest", queryResult(err), time.Since(start))
 	if err != nil {
 		return 0
 	}
 	return seq
 }
 
-// oldestSeqSafe returns OldestFSEventSeq, or 0 on error.
-func oldestSeqSafe(ctx context.Context, store *datastore.Store) int64 {
+// oldestSeqSafeWithMetric is oldestSeqSafe plus a per-query duration metric.
+func oldestSeqSafeWithMetric(ctx context.Context, store *datastore.Store, tenantID string) int64 {
 	if store == nil {
 		return 0
 	}
+	start := time.Now()
 	seq, err := store.OldestFSEventSeq(ctx)
+	metrics.RecordEventBusQuery(tenantID, "oldest", queryResult(err), time.Since(start))
 	if err != nil {
 		return 0
 	}
 	return seq
+}
+
+// queryResult maps a query error to a metric result label.
+func queryResult(err error) string {
+	if err != nil {
+		return "error"
+	}
+	return "ok"
 }
 
 // clampNonNegative returns v if v >= 0, else 0.
