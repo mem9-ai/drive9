@@ -113,6 +113,12 @@ class Drive9WorkflowPerf(Drive9WorkflowBase):
             env["PATH"] = f"{node_bin_dir}:{env.get('PATH', '')}"
         except Exception:
             pass
+        # corepack prepare installs pnpm shims into COREPACK_HOME; add it to
+        # PATH so build scripts that invoke pnpm directly (not via corepack)
+        # can find them.
+        corepack_home = env.get("COREPACK_HOME", "")
+        if corepack_home:
+            env["PATH"] = f"{corepack_home}:{env.get('PATH', '')}"
         return env
 
     def repo_perf(self, ctx: Context, root: Path, repo: dict[str, Any]) -> None:
