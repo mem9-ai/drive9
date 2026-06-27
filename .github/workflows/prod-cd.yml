@@ -83,7 +83,7 @@ jobs:
             "${{ env.K8S_DEPLOYMENT }}=$IMAGE"
           kubectl --context prod -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
-            --timeout=180s
+            --timeout=300s
 
       - name: Rollback aws-ap-southeast-1 on failure
         if: failure() && steps.deploy-sg.outcome == 'failure'
@@ -99,7 +99,7 @@ jobs:
             set image deployment/drive9-server \
             drive9-server=$IMAGE
           kubectl --context prod -n drive9-tidbcloud \
-            rollout status deployment/drive9-server --timeout=180s
+            rollout status deployment/drive9-server --timeout=300s
 
       - name: Rollback drive9-tidbcloud on failure
         if: failure() && steps.deploy-sg-native.outcome == 'failure'
@@ -121,7 +121,7 @@ jobs:
             "${{ env.K8S_DEPLOYMENT }}=$IMAGE"
           kubectl --context us -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
-            --timeout=180s
+            --timeout=300s
 
       - name: Rollback aws-us-east-1 on failure
         if: failure() && steps.deploy-us.outcome == 'failure'
@@ -137,7 +137,7 @@ jobs:
             set image deployment/drive9-server \
             drive9-server=$IMAGE
           kubectl --context us -n drive9-tidbcloud \
-            rollout status deployment/drive9-server --timeout=180s
+            rollout status deployment/drive9-server --timeout=300s
 
       - name: Rollback drive9-tidbcloud aws-us-east-1 on failure
         if: failure() && steps.deploy-us-native.outcome == 'failure'
@@ -178,7 +178,7 @@ jobs:
             "${{ env.K8S_DEPLOYMENT }}=$ACR_IMAGE"
           kubectl --kubeconfig ~/.kube/alicloud-config -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout status "deployment/${{ env.K8S_DEPLOYMENT }}" \
-            --timeout=180s
+            --timeout=300s
 
       - name: Rollback alicloud-ap-southeast-1 on failure
         if: failure() && steps.deploy-alicloud.outcome == 'failure'
@@ -232,7 +232,7 @@ jobs:
             set image deployment/drive9-server \
             drive9-server=$TCR_IMAGE
           kubectl --kubeconfig ~/.kube/tencent-config -n drive9-tidbcloud \
-            rollout status deployment/drive9-server --timeout=180s
+            rollout status deployment/drive9-server --timeout=300s
 
       - name: Rollback tencentcloud-ap-beijing on failure
         if: failure() && steps.deploy-tencent.outcome == 'failure'
