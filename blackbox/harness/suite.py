@@ -104,6 +104,11 @@ def discover_modules() -> dict[str, Any]:
                 obj = getattr(mod, attr_name)
                 if isinstance(obj, type) and hasattr(obj, "id") and hasattr(obj, "run") and hasattr(obj, "category"):
                     instance = obj()
+                    # Record the actual directory so module_config() can locate
+                    # config.json even when the id has more dotted segments than
+                    # the directory nesting (e.g. drive9.workflow.local_overlay_build
+                    # lives under suites/drive9/local_overlay_build/).
+                    instance._module_dir = module_dir
                     modules[instance.id] = instance
                     found_any = True
             if not found_any:

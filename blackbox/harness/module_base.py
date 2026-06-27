@@ -60,9 +60,30 @@ class BaseModule:
 
 
 def module_config(ctx: Context, module_id: str) -> dict[str, Any]:
-    """Load config.json from the module's own directory."""
+    """Load config.json from the module's own directory.
+
+    The module directory is resolved in priority order:
+    1. The ``_module_dir`` attribute set by ``discover_modules`` on each
+       module instance (authoritative — handles ids with more dotted
+       segments than directory nesting, e.g. ``drive9.workflow.foo``
+       living under ``suites/drive9/foo/``).
+    2. The registry attached to ``ctx.config`` (populated by the runner).
+    3. A legacy split on the first dot (``group.rest`` → ``suites/group/rest``),
+       kept as a last-resort fallback.
+    """
     import json
     from pathlib import Path
+
+    registry = ctx.config.get("registry", {}) if ctx else {}
+    instance = registry.get(module_id)
+    module_dir = getattr(instance, "_module_dir", None)
+    if module_dir is not None:
+        config_path = module_dir / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
+                return json.load(f)
+        return {}
+
     parts = module_id.split(".", 1)
     if len(parts) == 2:
         config_path = Path(__file__).resolve().parent.parent / "suites" / parts[0] / parts[1] / "config.json"

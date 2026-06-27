@@ -69,7 +69,7 @@ class BlackboxRunner:
         self.recorder = Recorder(self.result_dir)
         self.provider = load_suite_provider("", SUITES_DIR)
         self.registry = discover_modules()
-        self.config = {"modules": {}}
+        self.config = {"modules": {}, "registry": self.registry}
         self.capabilities = self.provider.detect_capabilities()
         self.target = self.provider.create_target(args, self.result_dir, self.recorder, session=self.session)
         # Pass the work_dir-based cache_root to the dependency manager.

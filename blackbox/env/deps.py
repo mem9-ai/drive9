@@ -200,7 +200,7 @@ class Drive9DependencyManager(DependencyManager):
             if (path / "t").is_dir():
                 self.ensure_git_test_build(path)
                 return path
-        ref = env_value("GIT_TEST_REF", "v2.46.2")
+        ref = env_value("GIT_TEST_REF", "v2.49.0")
         root_dir = self.ensure_git_clone("git", "https://github.com/git/git.git", ref)
         self.ensure_git_test_build(root_dir)
         write_json(

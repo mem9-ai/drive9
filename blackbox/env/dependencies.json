@@ -43,7 +43,7 @@
     "name": "Git upstream test suite",
     "source": "https://github.com/git/git",
     "license": "GPL-2.0-only",
-    "default_ref": "v2.46.2"
+    "default_ref": "v2.49.0"
   },
   "juicefs.*": {
     "name": "JuiceFS-inspired tests",

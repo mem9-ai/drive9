@@ -89,7 +89,7 @@ IOR_REF=4.0.0                       # IOR provides mdtest
 IOR_MAKE_JOBS=2
 IOR_BUILD_TIMEOUT_S=1800
 SECFS_TEST_REF=master               # fsx fallback source
-GIT_TEST_REF=v2.46.2
+GIT_TEST_REF=v2.49.0
 GIT_TEST_BUILD_TIMEOUT_S=1800
 ```
 

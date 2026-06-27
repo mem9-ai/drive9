@@ -17,8 +17,12 @@ class CommunityPjdfstest(BaseModule):
     timeout = 1800
 
     def ensure_dependencies(self, ctx: Context) -> None:
-        if not ctx.capabilities.get("is_root") and os.environ.get("PJDFSTEST_ALLOW_NONROOT", "0") != "1":
-            raise ModuleSkip("pjdfstest normally requires root; set PJDFSTEST_ALLOW_NONROOT=1 to run anyway", "platform skip")
+        # pjdfstest historically ran as root, but it runs fine as a regular
+        # user for the non-privilege cases that are the focus here. Default to
+        # allowing non-root; set PJDFSTEST_ALLOW_NONROOT=0 to force the old
+        # root-only behavior.
+        if not ctx.capabilities.get("is_root") and os.environ.get("PJDFSTEST_ALLOW_NONROOT", "1") == "0":
+            raise ModuleSkip("pjdfstest requires root (PJDFSTEST_ALLOW_NONROOT=0)", "platform skip")
         ctx.deps.ensure_prove()
         ctx.deps.ensure_pjdfstest()
 
