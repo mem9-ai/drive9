@@ -17,6 +17,7 @@ import (
 // current capped exponential backoff this is roughly tens of minutes, while
 // still allowing normal transient central-store failures to recover.
 const defaultQuotaOutboxMaxAttempts = 100
+const quotaOutboxClaimMaxAttempts = 3
 const quotaAdmissionLockName = "default"
 
 type QuotaOutboxStatus string
@@ -55,6 +56,8 @@ type QuotaOutboxEntry struct {
 // ErrQuotaOutboxLeaseMismatch means a worker tried to ack/retry an outbox row
 // it no longer owns.
 var ErrQuotaOutboxLeaseMismatch = errors.New("quota outbox lease mismatch")
+
+var errQuotaOutboxClaimConflict = errors.New("quota outbox claim conflict")
 
 // EnqueueQuotaOutboxTx inserts a queued quota mutation inside an existing
 // tenant metadata transaction.
@@ -106,6 +109,17 @@ func (s *Store) ClaimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseD
 }
 
 func (s *Store) claimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) ([]QuotaOutboxEntry, error) {
+	for attempt := 0; attempt < quotaOutboxClaimMaxAttempts; attempt++ {
+		entries, err := s.claimQuotaOutboxBatchOnce(ctx, now, leaseDuration, limit)
+		if errors.Is(err, errQuotaOutboxClaimConflict) {
+			continue
+		}
+		return entries, err
+	}
+	return nil, nil
+}
+
+func (s *Store) claimQuotaOutboxBatchOnce(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) ([]QuotaOutboxEntry, error) {
 	if limit <= 0 {
 		limit = 1
 	}
@@ -183,7 +197,12 @@ func (s *Store) claimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseD
 		return nil, err
 	}
 	if rowsAffected != int64(len(entries)) {
-		return nil, ErrQuotaOutboxLeaseMismatch
+		// In multi-server deployments TiDB can report that fewer rows were
+		// claimed than the preceding SKIP LOCKED read selected. Treat that as a
+		// benign claim race: rollback this tx and let this worker retry or let
+		// another worker process the rows. Ack/retry paths still use
+		// ErrQuotaOutboxLeaseMismatch for real ownership failures.
+		return nil, errQuotaOutboxClaimConflict
 	}
 
 	for i := range entries {

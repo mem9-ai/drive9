@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 )
@@ -66,6 +68,63 @@ func TestQuotaOutboxLifecycle(t *testing.T) {
 	}
 	if storageDelta != 0 || fileDelta != 0 || mediaDelta != 0 {
 		t.Fatalf("pending deltas after ack = %d/%d/%d, want 0/0/0", storageDelta, fileDelta, mediaDelta)
+	}
+}
+
+func TestQuotaOutboxConcurrentBatchClaimNoDuplicates(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+
+	const totalRows = 20
+	for i := 0; i < totalRows; i++ {
+		if _, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+			FileID:       fmt.Sprintf("file-%02d", i),
+			MutationType: "file_create",
+			MutationData: json.RawMessage(`{"file_id":"file"}`),
+			AvailableAt:  now.Add(-time.Second),
+		}); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	var mu sync.Mutex
+	seen := make(map[int64]struct{})
+	errCh := make(chan error, 8)
+	var wg sync.WaitGroup
+	for i := 0; i < cap(errCh); i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				claimed, err := s.ClaimQuotaOutboxBatch(ctx, now, time.Minute, 5)
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if len(claimed) == 0 {
+					return
+				}
+				mu.Lock()
+				for _, entry := range claimed {
+					if _, ok := seen[entry.ID]; ok {
+						mu.Unlock()
+						errCh <- fmt.Errorf("duplicate claim for row %d", entry.ID)
+						return
+					}
+					seen[entry.ID] = struct{}{}
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatal(err)
+	}
+	if len(seen) != totalRows {
+		t.Fatalf("claimed rows = %d, want %d", len(seen), totalRows)
 	}
 }
 
