@@ -530,7 +530,11 @@ class BlackboxRunner:
             self.provider.cleanup(self.ctx)
 
 
+_parser: argparse.ArgumentParser | None = None
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
+    global _parser
     parser = argparse.ArgumentParser(description="Run Drive9 blackbox modules.")
     selector = parser.add_mutually_exclusive_group(required=False)
     selector.add_argument("--all", action="store_true", help="Run every discovered module.")
@@ -554,6 +558,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--fail-fast", action="store_true")
     parser.add_argument("--keep-artifacts", action="store_true", default=env_flag("KEEP_ARTIFACTS", False, ""))
     parser.add_argument("--keep-all-artifacts", action="store_true", default=env_flag("KEEP_ALL_ARTIFACTS", False, ""), help="Never clean tmp_dir, even on success.")
+    _parser = parser
     return parser.parse_args(argv)
 
 
@@ -585,6 +590,11 @@ def main(argv: list[str]) -> int:
     if args.list:
         registry = discover_modules()
         return emit_module_list(registry, args.format)
+    # No selector provided — print help instead of raising.
+    if not any([args.all, args.category, args.module, args.group]):
+        if _parser is not None:
+            _parser.print_help()
+        return 1
     try:
         runner = BlackboxRunner(args)
         return runner.run()
