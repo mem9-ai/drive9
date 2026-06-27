@@ -3,6 +3,8 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
+import shutil
+import subprocess
 from typing import Any
 
 from harness.core import BlackboxError, Context, ModuleSkip, write_json
@@ -16,12 +18,6 @@ class CommunityPjdfstest(BaseModule):
     timeout = 1800
 
     def ensure_dependencies(self, ctx: Context) -> None:
-        # pjdfstest historically ran as root, but it runs fine as a regular
-        # user for the non-privilege cases that are the focus here. Default to
-        # allowing non-root; set PJDFSTEST_ALLOW_NONROOT=0 to force the old
-        # root-only behavior.
-        if not ctx.capabilities.get("is_root") and os.environ.get("PJDFSTEST_ALLOW_NONROOT", "1") == "0":
-            raise ModuleSkip("pjdfstest requires root (PJDFSTEST_ALLOW_NONROOT=0)", "platform skip")
         ctx.deps.ensure_prove()
         ensure_pjdfstest(ctx)
 
@@ -43,9 +39,21 @@ class CommunityPjdfstest(BaseModule):
                     raise ModuleSkip("no configured pjdfstest groups found")
             env = ctx.target.base_env()
             env["PATH"] = f"{bin_path.parent}:{tests_dir.parent}:{env.get('PATH', '')}"
+            # pjdfstest exercises privileged operations (chown, chmod, utimens,
+            # etc.) that require root. When not root, elevate via sudo -E so
+            # the harness itself stays unprivileged. If sudo is unavailable or
+            # not passwordless, fail hard rather than running a degraded suite.
+            prove_cmd = ["prove", "--recurse", "--verbose", *test_args]
+            if not ctx.capabilities.get("is_root"):
+                if not shutil.which("sudo"):
+                    raise BlackboxError("pjdfstest requires root or passwordless sudo; sudo not found")
+                probe = subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                if probe.returncode != 0:
+                    raise BlackboxError("pjdfstest requires root or passwordless sudo; sudo not available")
+                prove_cmd = ["sudo", "-E", *prove_cmd]
             result = ctx.target.run_cmd(
                 "community-pjdfstest",
-                ["prove", "--recurse", "--verbose", *test_args],
+                prove_cmd,
                 cwd=work_dir,
                 timeout=int(os.environ.get("PJDFSTEST_TIMEOUT_S", str(self.timeout))),
                 env=env,

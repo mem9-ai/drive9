@@ -4,12 +4,10 @@ import os
 import shutil
 from pathlib import Path
 
-from harness.core import Context, DependencyUnavailable, ModuleSkip, env_value, progress, write_json
+from harness.core import Context, DependencyUnavailable, env_value, progress, write_json
 
 
 def ensure_dependencies(ctx: Context) -> None:
-    if not ctx.capabilities.get("is_root") and os.environ.get("PJDFSTEST_ALLOW_NONROOT", "1") == "0":
-        raise ModuleSkip("pjdfstest requires root (PJDFSTEST_ALLOW_NONROOT=0)", "platform skip")
     ctx.deps.ensure_prove()
     ensure_pjdfstest(ctx)
 
