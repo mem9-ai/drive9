@@ -85,6 +85,14 @@ func (s *Store) OldestFSEventSeq(ctx context.Context) (int64, error) {
 // CountFSEvents returns the total number of rows in fs_events. Used by the
 // leader cleanup goroutine to report drive9_fs_events_rows so operators can
 // monitor table growth without direct DB access.
+//
+// Note: COUNT(*) is a full table scan on TiDB/MySQL InnoDB (unlike PostgreSQL's
+// index-only count). This runs only every fsEventsCleanupInterval (5m) on the
+// leader per tenant with a cached backend, so the cost is bounded and
+// best-effort. If the table grows to millions of rows per tenant and this
+// becomes expensive, switch to a bounded condition (e.g.
+// `WHERE created_at > NOW() - INTERVAL 2 HOUR`) or an approximate count from
+// information_schema.TABLES.
 func (s *Store) CountFSEvents(ctx context.Context) (int64, error) {
 	var count int64
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM fs_events`).Scan(&count); err != nil {

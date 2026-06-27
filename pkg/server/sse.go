@@ -20,6 +20,12 @@ const (
 	sseHeartbeatInterval = 30 * time.Second
 	sseFlushBatchSize    = 10
 	sseFlushMaxDelay     = 1 * time.Millisecond
+
+	// sseEventsRoute is the SSE change-notification stream endpoint. It is the
+	// only SSE route today; observe uses this constant (plus the
+	// sseStreamEstablished context flag) to distinguish real SSE connection
+	// lifetimes from bounded error responses on the same route.
+	sseEventsRoute = "/v1/events"
 )
 
 // stopTimer drains a timer's channel after stopping it to prevent spurious
@@ -227,6 +233,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+	// Mark the stream as established so observe treats this as a real SSE
+	// connection lifetime (skip HTTP duration histogram, record SSE metrics
+	// instead of normal HTTP/tenant durations). Bounded error responses that
+	// return before this point are still recorded as normal HTTP requests.
+	markSSEStreamEstablished(r.Context())
 
 	ctx := r.Context()
 
@@ -253,7 +264,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	} else {
 		for _, ev := range events {
 			sendSSEEvent(bw, ev)
-			metrics.RecordSSEEventSent(tenantID, ev.Op)
+			if isStructuralOp(ev.Op) {
+				// Structural ops are emitted as reset events (see sendSSEEvent),
+				// so count them as resets, not file_changed deliveries.
+				metrics.RecordSSEResetSent(tenantID, "structural_change")
+			} else {
+				metrics.RecordSSEEventSent(tenantID, ev.Op)
+			}
 			lastSeen = ev.Seq
 		}
 	}
@@ -310,7 +327,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, ev := range liveEvents {
 			sendSSEEvent(bw, ev)
-			metrics.RecordSSEEventSent(tenantID, ev.Op)
+			if isStructuralOp(ev.Op) {
+				metrics.RecordSSEResetSent(tenantID, "structural_change")
+			} else {
+				metrics.RecordSSEEventSent(tenantID, ev.Op)
+			}
 			lastSeen = ev.Seq
 		}
 		if bw.count > 0 {

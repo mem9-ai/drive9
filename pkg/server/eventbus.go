@@ -281,8 +281,10 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 	// the client's cursor is stale (events pruned) or simply caught up.
 	latestStart := time.Now()
 	latest := latestSeqSafeWithMetric(ctx, store, eb.tenantID)
+	latestQueryMs := float64(time.Since(latestStart).Microseconds()) / 1000
 	oldestStart := time.Now()
 	oldest := oldestSeqSafeWithMetric(ctx, store, eb.tenantID)
+	oldestQueryMs := float64(time.Since(oldestStart).Microseconds()) / 1000
 	if latest == 0 {
 		// Table is empty (all events pruned): cursor is stale → reset.
 		return nil, 0, false
@@ -304,8 +306,8 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 			zap.Uint64("since", since),
 			zap.Int64("oldest", oldest),
 			zap.Int64("latest", latest),
-			zap.Float64("latest_query_ms", float64(time.Since(latestStart).Microseconds())/1000),
-			zap.Float64("oldest_query_ms", float64(time.Since(oldestStart).Microseconds())/1000))
+			zap.Float64("latest_query_ms", latestQueryMs),
+			zap.Float64("oldest_query_ms", oldestQueryMs))
 		return nil, headSeq, false
 	}
 	// Client is caught up: no new events after since, cursor within range.

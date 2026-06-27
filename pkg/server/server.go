@@ -591,6 +591,20 @@ func (s *Server) cleanupFSEvents(ctx context.Context) {
 	// a stale-reference COUNT/DELETE logs a warning and is retried next tick —
 	// this is acceptable for best-effort retention pruning and matches the
 	// StartAllFileGC iteration pattern.
+	//
+	// Limitation (deliberate, best-effort): a tenant that served traffic, was
+	// evicted from the pool cache, and went dormant before the next cleanup tick
+	// is not pruned here until it is re-acquired (its backend re-enters the
+	// cache, and the following tick cleans it). This is acceptable because:
+	//   1. EventsSince's stale-cursor reset logic (reset when since < oldestSeq)
+	//      already makes pruned-rows correctness independent of timely pruning.
+	//   2. Evicted-dormant tenants accumulate at most their pre-eviction write
+	//      rate × the window until next acquire, bounded by fsEventsRetention.
+	// Pruning on every Acquire was rejected to avoid coupling a DELETE (with
+	// its RTT and lock cost) into the request hot path. A bounded tenant scan
+	// (meta-driven, like the semantic worker's keyset pagination) is a future
+	// option if the active set grows large enough to matter; for now the cached
+	// snapshot covers the tenants that actually accumulate rows.
 	if s.pool == nil {
 		return
 	}
@@ -925,7 +939,7 @@ func (s *Server) handleBusiness(w http.ResponseWriter, r *http.Request) {
 		s.handleFork(w, r)
 	case r.URL.Path == "/v1/sql":
 		s.handleSQL(w, r)
-	case r.URL.Path == "/v1/events":
+	case r.URL.Path == sseEventsRoute:
 		s.handleEvents(w, r)
 	case r.URL.Path == "/v1/journals" || strings.HasPrefix(r.URL.Path, "/v1/journals/") || r.URL.Path == "/v1/journal-entries":
 		s.handleJournal(w, r)
