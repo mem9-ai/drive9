@@ -30,7 +30,7 @@ class Drive9SuiteProvider:
         if ctx.capabilities.get("fuse", {}).get("ok"):
             return []
         detail = str(ctx.capabilities.get("fuse", {}).get("detail", "FUSE unavailable"))
-        return [ModuleRecord(module="prereq.fuse", category="prereq", status=SKIP, seconds=0, classification="platform skip", detail=detail)]
+        return [ModuleRecord(module="prereq.fuse", status=SKIP, seconds=0, classification="platform skip", detail=detail)]
 
     def setup(self, ctx: Context) -> None:
         ctx.target.verify_cli()

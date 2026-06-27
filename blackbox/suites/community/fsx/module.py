@@ -9,8 +9,6 @@ from suites.community.fsx.deps import ensure_fsx
 
 
 class CommunityFSX(BaseModule):
-    id = "community.fsx"
-    category = "community.stress"
     description = "Run fsx randomized file operation stress on Drive9 FUSE."
     labels = ("stress", "community")
     timeout = 600

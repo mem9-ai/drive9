@@ -11,8 +11,6 @@ from suites.community.fio.deps import ensure_fio
 
 
 class CommunityFio(BaseModule):
-    id = "community.fio"
-    category = "community.performance"
     description = "Run fio sequential and random I/O workloads on Drive9 FUSE."
     labels = ("performance", "community")
     timeout = 600

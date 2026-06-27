@@ -9,8 +9,6 @@ from harness.module_base import BaseModule, module_config
 
 
 class JuiceFSFsrand(BaseModule):
-    id = "juicefs.fsrand"
-    category = "juicefs.consistency"
     description = "JuiceFS-inspired deterministic random filesystem model test, rewritten for Drive9 FUSE."
     labels = ("compatibility", "stress", "juicefs", "functional")
     timeout = 1200

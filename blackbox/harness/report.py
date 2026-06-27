@@ -115,7 +115,6 @@ def render_functional_module_report(ctx: Context, module: Any, record: ModuleRec
         f"# Module Report: `{module.id}`",
         "",
         f"- Description: {module.description}",
-        f"- Category: `{module.category}`",
         f"- Status: {status_emoji(record.status)} **{record.status}**",
         f"- Duration: `{record.seconds:.3f}s`",
         f"- Classification: `{record.classification or 'n/a'}`",
@@ -379,16 +378,7 @@ def _status_counts(records: list[ModuleRecord]) -> dict[str, int]:
 
 
 def _infer_profile_from_record(record: ModuleRecord) -> str:
-    if record.report_profile:
-        return record.report_profile
-    cat = record.category.lower()
-    if "performance" in cat or "perf" in cat:
-        return "performance"
-    if "compat" in cat or "posix" in cat:
-        return "compatibility"
-    if "customer" in cat:
-        return "customer"
-    return "functional"
+    return record.report_profile or "functional"
 
 
 def _append_profile_summary(lines: list[str], records: list[ModuleRecord]) -> None:

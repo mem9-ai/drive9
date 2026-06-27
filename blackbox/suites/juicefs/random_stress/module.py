@@ -8,8 +8,6 @@ from harness.module_base import BaseModule, module_config
 
 
 class JuiceFSRandomStress(BaseModule):
-    id = "juicefs.random_stress"
-    category = "juicefs.stress"
     description = "JuiceFS-inspired concurrent create/read/rename/remove stress, rewritten for Drive9 FUSE."
     labels = ("stress", "juicefs", "functional")
     timeout = 1200

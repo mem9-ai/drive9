@@ -8,8 +8,8 @@ from .core import Context, ModuleRecord
 
 
 class BaseModule:
-    id = ""
-    category = ""
+    _id: str = ""
+    _module_dir: Path | None = None
     description = ""
     labels: tuple[str, ...] = ()
     manual = False
@@ -22,21 +22,27 @@ class BaseModule:
     # or FUSE mount can set this to False.
     needs_setup = True
 
+    @property
+    def id(self) -> str:
+        return self._id
+
     def ensure_dependencies(self, ctx: Context) -> None:
         """Override in module to prepare module-specific dependencies.
         Default: try to import and call deps.py from the module directory."""
         import importlib
-        # Derive module directory from module_id
-        parts = self.id.split(".", 1)
-        if len(parts) == 2:
-            group, name = parts
-            try:
-                deps_mod = importlib.import_module(f"suites.{group}.{name}.deps")
-                if hasattr(deps_mod, "ensure_dependencies"):
-                    deps_mod.ensure_dependencies(ctx)
-                    return
-            except ModuleNotFoundError:
-                pass  # No deps.py — module has no special dependencies
+        if self._module_dir is not None:
+            # Import the deps module that lives alongside this module's module.py.
+            rel = self._module_dir.relative_to(Path(__file__).resolve().parent.parent / "suites")
+            parts = rel.parts
+            if len(parts) >= 2:
+                mod_name = ".".join(["suites", *parts, "deps"])
+                try:
+                    deps_mod = importlib.import_module(mod_name)
+                    if hasattr(deps_mod, "ensure_dependencies"):
+                        deps_mod.ensure_dependencies(ctx)
+                        return
+                except ModuleNotFoundError:
+                    pass  # No deps.py — module has no special dependencies
 
     def resolve_report_profile(self) -> str:
         if self.report_profile:

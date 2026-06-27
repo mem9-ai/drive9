@@ -7,7 +7,6 @@ from suites.drive9._base import Drive9WorkflowBase
 
 
 class Drive9GitBlobless(Drive9WorkflowBase):
-    id = "drive9.workflow.git_blobless"
     description = "drive9 git clone --fast --blobless into a FUSE mount with synchronous hydrate."
 
     def run(self, ctx: Context) -> dict[str, Any]:

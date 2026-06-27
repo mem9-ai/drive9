@@ -9,8 +9,6 @@ from suites.git._deps import ensure_git_source
 
 
 class GitOfficialFunctional(BaseModule):
-    id = "git.official.functional"
-    category = "git.official.functional"
     description = "Run selected upstream Git functional tests with trash roots on Drive9 FUSE."
     labels = ("compatibility", "git", "community")
     timeout = 7200

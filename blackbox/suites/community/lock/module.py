@@ -7,8 +7,6 @@ from harness.module_base import BaseModule
 
 
 class CommunityLock(BaseModule):
-    id = "community.lock"
-    category = "community.locking"
     description = "Run POSIX advisory lock checks on Drive9 FUSE."
     labels = ("compatibility", "locking")
     timeout = 120

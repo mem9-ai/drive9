@@ -8,8 +8,6 @@ from harness.module_base import BaseModule
 
 
 class JuiceFSRmr(BaseModule):
-    id = "juicefs.rmr"
-    category = "juicefs.metadata"
     description = "JuiceFS-inspired recursive remove workload, rewritten for Drive9 FUSE."
     labels = ("metadata", "juicefs", "functional")
     timeout = 900

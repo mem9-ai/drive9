@@ -8,8 +8,6 @@ from suites.community.pyxattr.deps import ensure_pyxattr
 
 
 class CommunityPyxattr(BaseModule):
-    id = "community.pyxattr"
-    category = "community.xattr"
     description = "Run pyxattr-backed extended attribute checks on Drive9 FUSE."
     labels = ("compatibility", "xattr", "community")
     timeout = 120

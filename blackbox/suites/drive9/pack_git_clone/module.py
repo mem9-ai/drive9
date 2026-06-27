@@ -7,7 +7,6 @@ from suites.drive9._base import Drive9WorkflowBase
 
 
 class Drive9PackGitClone(Drive9WorkflowBase):
-    id = "drive9.workflow.pack_git_clone"
     description = "Fast-cloned Git state can be packed and unpacked with Drive9 pack/unpack."
 
     def run(self, ctx: Context) -> dict[str, Any]:

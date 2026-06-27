@@ -7,7 +7,6 @@ from suites.drive9._base import Drive9WorkflowBase
 
 
 class Drive9GitWorktree(Drive9WorkflowBase):
-    id = "drive9.workflow.git_worktree"
     description = "drive9 git worktree add/remove --fast on top of a fast-cloned FUSE repository."
 
     def run(self, ctx: Context) -> dict[str, Any]:

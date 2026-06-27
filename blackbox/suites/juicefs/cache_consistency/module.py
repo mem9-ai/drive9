@@ -8,8 +8,6 @@ from harness.module_base import BaseModule
 
 
 class JuiceFSCacheConsistency(BaseModule):
-    id = "juicefs.cache_consistency"
-    category = "juicefs.cache"
     description = "JuiceFS-inspired two-mount cache visibility checks, rewritten for Drive9 FUSE."
     labels = ("compatibility", "cache", "juicefs", "functional")
     timeout = 1200

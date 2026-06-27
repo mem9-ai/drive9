@@ -10,8 +10,6 @@ from suites.community.vdbench.deps import ensure_vdbench
 
 
 class CommunityVdbench(BaseModule):
-    id = "community.vdbench"
-    category = "community.performance"
     description = "Run vdbench file workload on Drive9 FUSE when vdbench is installed."
     labels = ("performance", "community", "manual-dependency")
     manual = True

@@ -9,8 +9,6 @@ from suites.git._deps import ensure_git_source
 
 
 class GitOfficialPerf(BaseModule):
-    id = "git.official.perf"
-    category = "git.official.performance"
     description = "Run selected upstream Git t/perf tests with scratch data on Drive9 FUSE."
     labels = ("performance", "git", "community")
     timeout = 7200

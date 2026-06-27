@@ -202,7 +202,6 @@ class CommandResult:
 @dataclass
 class ModuleRecord:
     module: str
-    category: str
     status: str
     seconds: float
     classification: str = ""
@@ -214,7 +213,6 @@ class ModuleRecord:
 
 class Module(Protocol):
     id: str
-    category: str
     description: str
     labels: tuple[str, ...]
     timeout: int

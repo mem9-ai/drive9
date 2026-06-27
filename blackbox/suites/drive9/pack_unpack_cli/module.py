@@ -7,7 +7,6 @@ from suites.drive9._base import Drive9WorkflowBase
 
 
 class Drive9PackUnpackCLI(Drive9WorkflowBase):
-    id = "drive9.workflow.pack_unpack_cli"
     description = "Explicit drive9 pack/unpack round trip for overlay content under a FUSE mount."
 
     def run(self, ctx: Context) -> dict[str, Any]:

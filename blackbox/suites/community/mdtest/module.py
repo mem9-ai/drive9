@@ -9,8 +9,6 @@ from suites.community.mdtest.deps import ensure_mdtest
 
 
 class CommunityMdtest(BaseModule):
-    id = "community.mdtest"
-    category = "community.performance"
     description = "Run mdtest metadata create/stat/remove workload on Drive9 FUSE."
     labels = ("performance", "metadata", "community")
     timeout = 1200

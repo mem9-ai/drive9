@@ -93,20 +93,13 @@ class BlackboxRunner:
         )
         self.selected = self.select_modules()
 
-    def list_modules(self) -> int:
-        return emit_module_list(self.registry, self.args.format)
-
     def select_modules(self) -> list[str]:
-        if self.args.list:
-            return []
         selected: list[str] = []
         if self.args.module:
             for raw in self.args.module:
                 selected.extend(part.strip() for part in raw.split(",") if part.strip())
         elif self.args.all:
             selected = self.expand_module_list("all")
-        elif self.args.category:
-            selected = [module.id for module in self.registry.values() if module.id.startswith(self.args.category) or module.category.startswith(self.args.category)]
         elif self.args.group:
             # --group <name> selects a directory group: every module whose id
             # starts with "<group>.", mirroring the suites/<group>/ layout.
@@ -115,7 +108,7 @@ class BlackboxRunner:
             if not selected:
                 raise BlackboxError(f"unknown group {self.args.group!r} (no modules under suites/{self.args.group}/)")
         else:
-            raise BlackboxError("one of --all, --category, --module, --group, or --list is required")
+            raise BlackboxError("one of --all, --module, or --group is required")
         # --label is an optional overlay filter (combinable with any selector).
         labels = self._requested_labels()
         if labels:
@@ -151,8 +144,6 @@ class BlackboxRunner:
                 out.extend(module.id for module in self.registry.values() if module.id.startswith(prefix))
             elif value in self.registry:
                 out.append(value)
-            else:
-                out.extend(module.id for module in self.registry.values() if module.category == value or module.category.startswith(value + "."))
         return out
 
     def write_manifest(self) -> None:
@@ -164,11 +155,9 @@ class BlackboxRunner:
             "result_dir": str(self.result_dir),
             "selector": {
                 "all": bool(self.args.all),
-                "category": self.args.category,
                 "group": self.args.group,
                 "module": self.args.module,
             },
-            "category": self.args.category,
             "modules": self.selected,
             "runs": self.ctx.runs,
             "platform": platform.platform(),
@@ -278,7 +267,7 @@ class BlackboxRunner:
         for idx, module_id in enumerate(self.selected, start=1):
             module = self.registry[module_id]
             start = time.monotonic()
-            progress(f"deps {idx}/{total} start: {module.id} ({module.category})")
+            progress(f"deps {idx}/{total} start: {module.id}")
             # Platform compatibility check (modules.json compat field).
             compat_record = self.check_platform_compat(module)
             if compat_record is not None:
@@ -289,13 +278,13 @@ class BlackboxRunner:
                 continue
             try:
                 module.ensure_dependencies(self.ctx)
-                record = ModuleRecord(module=module.id, category=module.category, status=PASS, seconds=time.monotonic() - start, classification="dependency prepared")
+                record = ModuleRecord(module=module.id, status=PASS, seconds=time.monotonic() - start, classification="dependency prepared")
             except DependencyUnavailable as exc:
-                record = ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
+                record = ModuleRecord(module=module.id, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
             except ModuleSkip as exc:
-                record = ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
+                record = ModuleRecord(module=module.id, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
             except Exception as exc:
-                record = ModuleRecord(module=module.id, category=module.category, status=FAIL, seconds=time.monotonic() - start, classification="dependency failure", detail=f"{type(exc).__name__}: {exc}")
+                record = ModuleRecord(module=module.id, status=FAIL, seconds=time.monotonic() - start, classification="dependency failure", detail=f"{type(exc).__name__}: {exc}")
                 record.report_profile = self._module_profile(module)
                 self.recorder.record(record)
                 progress(f"deps {idx}/{total} {record.status}: {module.id} in {record.seconds:.1f}s ({record.classification})")
@@ -337,7 +326,6 @@ class BlackboxRunner:
             classification = CLASS_PLATFORM_DARWIN if os_name == "Darwin" else CLASS_PLATFORM_LINUX
             return ModuleRecord(
                 module=module.id,
-                category=module.category,
                 status=SKIP,
                 seconds=0.0,
                 classification=classification,
@@ -385,7 +373,6 @@ class BlackboxRunner:
             self.ctx.recorder.event({"type": "module", "phase": "run-end", "module": module.id, "status": PASS})
             return ModuleRecord(
                 module=module.id,
-                category=module.category,
                 status=PASS,
                 seconds=time.monotonic() - start,
                 classification="passed",
@@ -400,7 +387,6 @@ class BlackboxRunner:
             elapsed = time.monotonic() - start
             record = ModuleRecord(
                 module=module.id,
-                category=module.category,
                 status=FAIL,
                 seconds=elapsed,
                 classification=CLASS_TIMEOUT,
@@ -418,7 +404,7 @@ class BlackboxRunner:
     def run_module(self, module_id: str, *, index: int, total: int) -> None:
         module = self.registry[module_id]
         start = time.monotonic()
-        progress(f"module {index}/{total} start: {module.id} ({module.category})")
+        progress(f"module {index}/{total} start: {module.id}")
         # Platform compatibility check (modules.json compat field).
         compat_record = self.check_platform_compat(module)
         if compat_record is not None:
@@ -432,18 +418,17 @@ class BlackboxRunner:
         try:
             record = self.execute_module(module)
         except DependencyUnavailable as exc:
-            record = ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
+            record = ModuleRecord(module=module.id, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
         except ModuleSkip as exc:
-            record = ModuleRecord(module=module.id, category=module.category, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
+            record = ModuleRecord(module=module.id, status=SKIP, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
         except ModuleXFail as exc:
-            record = ModuleRecord(module=module.id, category=module.category, status=XFAIL, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
+            record = ModuleRecord(module=module.id, status=XFAIL, seconds=time.monotonic() - start, classification=exc.classification, detail=str(exc))
         except BlackboxError as exc:
-            record = ModuleRecord(module=module.id, category=module.category, status=FAIL, seconds=time.monotonic() - start, classification="product regression", detail=str(exc))
+            record = ModuleRecord(module=module.id, status=FAIL, seconds=time.monotonic() - start, classification="product regression", detail=str(exc))
             re_raise = exc
         except Exception as exc:
             record = ModuleRecord(
                 module=module.id,
-                category=module.category,
                 status=FAIL,
                 seconds=time.monotonic() - start,
                 classification="infra failure",
@@ -469,8 +454,6 @@ class BlackboxRunner:
 
     def run(self) -> int:
         self.result_dir.mkdir(parents=True, exist_ok=True)
-        if self.args.list:
-            return self.list_modules()
         if self.args.bootstrap:
             return self.bootstrap()
         if self.args.deps_only:
@@ -503,7 +486,6 @@ class BlackboxRunner:
                     self.recorder.record(
                         ModuleRecord(
                             module="suite.setup",
-                            category="setup",
                             status=FAIL,
                             seconds=time.monotonic() - setup_start,
                             classification="infra failure",
@@ -538,12 +520,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run Drive9 blackbox modules.")
     selector = parser.add_mutually_exclusive_group(required=False)
     selector.add_argument("--all", action="store_true", help="Run every discovered module.")
-    selector.add_argument("--category", help="Run modules whose id/category has this prefix.")
     selector.add_argument("--module", action="append", help="Run one module id or a comma-separated list. Can be repeated.")
     selector.add_argument("--group", help="Run a directory group, e.g. community, juicefs, drive9, git, or customer.")
-    selector.add_argument("--list", action="store_true", help="List available modules.")
-    parser.add_argument("--format", choices=["text", "json"], default="text", help="Output format for --list.")
-    parser.add_argument("--label", action="append", help="Filter selected modules by label. Comma-separated list; can be repeated. Combinable with --all/--category/--group.")
+    parser.add_argument("--label", action="append", help="Filter selected modules by label. Comma-separated list; can be repeated. Combinable with --all/--group.")
     parser.add_argument("--deps-only", action="store_true", help="Prepare external dependencies for selected modules without running setup.")
     parser.add_argument("--bootstrap", action="store_true", help="Prepare dependencies into a work-dir, then exit. Use --work-dir to reuse later.")
     parser.add_argument("--runs", type=int, default=0, help="Performance run count. Defaults to BLACKBOX_RUNS or 1.")
@@ -562,36 +541,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def emit_module_list(registry: dict[str, Any], output_format: str) -> int:
-    rows = []
-    for module in sorted(registry.values(), key=lambda item: item.id):
-        rows.append(
-            {
-                "id": module.id,
-                "category": module.category,
-                "labels": list(module.labels),
-                "manual": bool(getattr(module, "manual", False)),
-                "description": module.description,
-            }
-        )
-    if output_format == "json":
-        print(json.dumps(rows, indent=2, sort_keys=True))
-        return 0
-    for row in rows:
-        labels = ",".join(row["labels"])
-        manual = "manual" if row["manual"] else "auto"
-        print(f"{row['id']}\t{row['category']}\t{labels}\t{manual}\t{row['description']}")
-    return 0
-
-
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    # Handle --list before creating any work-dir (no side effects).
-    if args.list:
-        registry = discover_modules()
-        return emit_module_list(registry, args.format)
     # No selector provided — print help instead of raising.
-    if not any([args.all, args.category, args.module, args.group]):
+    if not any([args.all, args.module, args.group]):
         if _parser is not None:
             _parser.print_help()
         return 1

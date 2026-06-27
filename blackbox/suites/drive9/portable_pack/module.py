@@ -7,7 +7,6 @@ from suites.drive9._base import Drive9WorkflowBase
 
 
 class Drive9PortablePack(Drive9WorkflowBase):
-    id = "drive9.workflow.portable_pack"
     description = "Built-in portable profile auto-packs the entire local overlay across remounts."
 
     def run(self, ctx: Context) -> dict[str, Any]:

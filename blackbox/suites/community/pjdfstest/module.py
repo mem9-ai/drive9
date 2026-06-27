@@ -11,8 +11,6 @@ from suites.community.pjdfstest.deps import ensure_pjdfstest
 
 
 class CommunityPjdfstest(BaseModule):
-    id = "community.pjdfstest"
-    category = "community.posix"
     description = "Run pjdfstest on a Drive9 FUSE mount and report raw/effective POSIX pass rate."
     labels = ("compatibility", "posix", "community")
     timeout = 1800

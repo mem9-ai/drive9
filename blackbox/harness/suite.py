@@ -72,6 +72,7 @@ def discover_modules() -> dict[str, Any]:
     """Auto-discover all modules under suites/<group>/<module>/module.py.
 
     Returns a dict mapping module_id -> module instance.
+    The module id is derived from the directory path: ``<group>.<module>``.
     """
     if not SUITES_DIR.is_dir():
         return {}
@@ -88,31 +89,28 @@ def discover_modules() -> dict[str, Any]:
             module_py = module_dir / "module.py"
             if not module_py.exists():
                 continue
-            module_id_prefix = f"{group_dir.name}.{module_dir.name}"
+            module_id = f"{group_dir.name}.{module_dir.name}"
             mod_name = f"suites.{group_dir.name}.{module_dir.name}.module"
             try:
                 mod = importlib.import_module(mod_name)
             except Exception as exc:
                 # Store the error so the runner can report it
-                modules[module_id_prefix] = _ImportError(module_id_prefix, mod_name, exc)
+                modules[module_id] = _ImportError(module_id, mod_name, exc)
                 continue
-            # Find all module classes in the file — a single module.py can
-            # export multiple test classes (e.g., ltp/module.py has LTPFS + LTPSyscalls).
-            # Each class is registered by its own `id` attribute, not by directory path.
+            # Find the module class in the file — a class with ``run`` and
+            # ``description`` attributes. The id is derived from the directory,
+            # not declared on the class.
             found_any = False
             for attr_name in dir(mod):
                 obj = getattr(mod, attr_name)
-                if isinstance(obj, type) and hasattr(obj, "id") and hasattr(obj, "run") and hasattr(obj, "category"):
+                if isinstance(obj, type) and hasattr(obj, "run") and hasattr(obj, "description"):
                     instance = obj()
-                    # Record the actual directory so module_config() can locate
-                    # config.json even when the id has more dotted segments than
-                    # the directory nesting (e.g. drive9.workflow.local_overlay_build
-                    # lives under suites/drive9/local_overlay_build/).
                     instance._module_dir = module_dir
-                    modules[instance.id] = instance
+                    instance._id = module_id
+                    modules[module_id] = instance
                     found_any = True
             if not found_any:
-                modules[module_id_prefix] = _ImportError(module_id_prefix, mod_name, "no module class found")
+                modules[module_id] = _ImportError(module_id, mod_name, "no module class found")
     return modules
 
 
@@ -146,8 +144,8 @@ def discover_suites() -> list[str]:
 class _ImportError:
     """Placeholder for a module that failed to import."""
     def __init__(self, module_id: str, mod_name: str, exc: Any) -> None:
+        self._id = module_id
         self.id = module_id
-        self.category = "import_error"
         self.description = f"Failed to import {mod_name}: {exc}"
         self.labels: tuple[str, ...] = ()
         self.manual = False

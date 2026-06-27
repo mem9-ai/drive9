@@ -12,7 +12,6 @@ from suites.drive9._base import Drive9WorkflowBase
 
 
 class Drive9WorkflowPerf(Drive9WorkflowBase):
-    id = "drive9.workflow.perf"
     description = "Drive9 FUSE performance workloads: file I/O, SQLite, rg, git clone modes, build/edit."
     labels = ("drive9", "workflow", "performance", "functional")
     timeout = 7200

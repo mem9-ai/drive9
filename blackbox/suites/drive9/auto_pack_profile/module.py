@@ -7,7 +7,6 @@ from suites.drive9._base import Drive9WorkflowBase
 
 
 class Drive9AutoPackProfile(Drive9WorkflowBase):
-    id = "drive9.workflow.auto_pack_profile"
     description = "Custom profile pack paths auto-pack on umount and auto-unpack on the next mount."
 
     def run(self, ctx: Context) -> dict[str, Any]:

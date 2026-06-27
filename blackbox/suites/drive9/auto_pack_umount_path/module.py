@@ -8,7 +8,6 @@ from suites.drive9._base import Drive9WorkflowBase
 
 
 class Drive9AutoPackUmountPath(Drive9WorkflowBase):
-    id = "drive9.workflow.auto_pack_umount_path"
     description = "drive9 umount --pack-path persists selected coding-agent local-only paths."
 
     def run(self, ctx: Context) -> dict[str, Any]:

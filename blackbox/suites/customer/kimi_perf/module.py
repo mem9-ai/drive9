@@ -23,8 +23,6 @@ from harness.module_base import BaseModule, module_config
 
 
 class Drive9KimiPerf(BaseModule):
-    id = "drive9.customer.kimi_perf"
-    category = "drive9.customer.performance"
     description = "Kimi sandbox workspace benchmark: namespace scale, small files, fsync, visibility, remount persistence, and same-host mounts."
     labels = ("drive9", "customer", "kimi", "performance", "fuse")
     timeout = 3600

@@ -13,7 +13,6 @@ from suites.drive9._base import Drive9WorkflowBase
 
 
 class Drive9LocalOverlayBuild(Drive9WorkflowBase):
-    id = "drive9.workflow.local_overlay_build"
     description = "Compare native repo builds with Drive9 FUSE coding-agent local overlay builds."
     labels = ("drive9", "workflow", "performance", "local-overlay", "functional")
     timeout = 10800

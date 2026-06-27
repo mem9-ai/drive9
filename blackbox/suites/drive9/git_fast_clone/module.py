@@ -7,7 +7,6 @@ from suites.drive9._base import Drive9WorkflowBase
 
 
 class Drive9GitFastClone(Drive9WorkflowBase):
-    id = "drive9.workflow.git_fast_clone"
     description = "drive9 git clone --fast into a FUSE mount, followed by status/edit/commit."
 
     def run(self, ctx: Context) -> dict[str, Any]:

@@ -45,8 +45,6 @@ class Drive9ManusPerf(BaseModule):
       crossed with coding-agent and none profiles.
     """
 
-    id = "drive9.customer.manus_perf"
-    category = "drive9.customer.performance"
     description = (
         "Manus Persistent Sandbox / cloud-PC shared-storage benchmark: "
         "multi-session shared workspace, read/write consistency, cache "

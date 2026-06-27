@@ -9,8 +9,6 @@ from harness.module_base import BaseModule, module_config
 
 
 class JuiceFSRandomRW(BaseModule):
-    id = "juicefs.random_rw"
-    category = "juicefs.io"
     description = "JuiceFS-inspired random write/read verification workload, rewritten for Drive9 FUSE."
     labels = ("io", "juicefs", "functional")
     timeout = 900
