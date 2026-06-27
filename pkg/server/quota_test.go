@@ -1470,9 +1470,15 @@ func TestAdminTenantPoolUpdateRequiresPoolSize(t *testing.T) {
 		"private_key": "private-1",
 	}, "")
 	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
 	if resp.StatusCode != http.StatusBadRequest {
-		body, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 400 body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "pool_size is required") {
+		t.Fatalf("body = %s, want pool_size validation error", body)
 	}
 	if got := rt.prov.batchPoolCalls.Load(); got != 0 {
 		t.Fatalf("batch pool calls = %d, want 0", got)

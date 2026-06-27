@@ -399,6 +399,21 @@ func TestWithTenantPoolLockSerializesCallbacks(t *testing.T) {
 	}
 }
 
+func TestTenantPoolDatabaseLockNameStaysWithinMySQLLimit(t *testing.T) {
+	base := tenantPoolLockName("pool-lock-test")
+	got := tenantPoolDatabaseLockName(base, "drive9_test_with_a_long_database_name")
+	if len(got) != 64 {
+		t.Fatalf("lock name length = %d, want 64", len(got))
+	}
+	if !strings.HasPrefix(got, base+":") {
+		t.Fatalf("lock name = %q, want base prefix %q", got, base+":")
+	}
+	other := tenantPoolDatabaseLockName(base, "drive9_test_other")
+	if got == other {
+		t.Fatalf("database-scoped lock names should differ: %q", got)
+	}
+}
+
 func TestInsertAPIKeyAllowsRepeatedKeyName(t *testing.T) {
 	s := newControlStore(t)
 	now := time.Now().UTC()
@@ -1265,7 +1280,7 @@ func TestClaimOldestFreeTenantPoolBindingRequiresActiveTenant(t *testing.T) {
 		t.Fatalf("upsert provisioning binding: %v", err)
 	}
 	if _, err := s.ClaimOldestFreeTenantPoolBinding(ctx, "org-claim-active"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("claim provisioning tenant err = %v, want ErrNotFound", err)
+		t.Errorf("claim provisioning tenant err = %v, want ErrNotFound", err)
 	}
 
 	activeCreated := now.Add(-time.Minute)
@@ -1300,17 +1315,16 @@ func TestClaimOldestFreeTenantPoolBindingRequiresActiveTenant(t *testing.T) {
 	}
 	row, err := s.ClaimOldestFreeTenantPoolBinding(ctx, "org-claim-active")
 	if err != nil {
-		t.Fatalf("claim active tenant: %v", err)
-	}
-	if row.Tenant.ID != "pool-tenant-active" {
-		t.Fatalf("claimed tenant = %q, want pool-tenant-active", row.Tenant.ID)
+		t.Errorf("claim active tenant: %v", err)
+	} else if row.Tenant.ID != "pool-tenant-active" {
+		t.Errorf("claimed tenant = %q, want pool-tenant-active", row.Tenant.ID)
 	}
 	provisioningBinding, err := s.GetTenantTiDBCloudOrgBinding(ctx, "pool-tenant-provisioning")
 	if err != nil {
 		t.Fatalf("get provisioning binding: %v", err)
 	}
 	if provisioningBinding.PoolStatus != TenantPoolBindingFree {
-		t.Fatalf("provisioning pool status = %s, want %s", provisioningBinding.PoolStatus, TenantPoolBindingFree)
+		t.Errorf("provisioning pool status = %s, want %s", provisioningBinding.PoolStatus, TenantPoolBindingFree)
 	}
 }
 

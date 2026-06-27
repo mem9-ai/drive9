@@ -1853,8 +1853,14 @@ func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(c
 	}
 	defer func() { _ = conn.Close() }()
 
+	var databaseName sql.NullString
+	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
+		return err
+	}
+	lockName = tenantPoolDatabaseLockName(lockName, databaseName.String)
+
 	var got sql.NullInt64
-	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)", lockName, tenantPoolLockTimeoutSeconds).Scan(&got); err != nil {
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, tenantPoolLockTimeoutSeconds).Scan(&got); err != nil {
 		return err
 	}
 	if !got.Valid {
@@ -1867,7 +1873,7 @@ func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(c
 		releaseCtx, cancel := context.WithTimeout(context.Background(), tenantPoolReleaseLockTimeout)
 		defer cancel()
 		var released sql.NullInt64
-		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))", lockName).Scan(&released)
+		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
 		if releaseErr != nil {
 			err = errors.Join(err, releaseErr)
 			return
@@ -1896,6 +1902,11 @@ func tenantPoolLockName(poolID string) string {
 	}
 	sum := sha256.Sum256([]byte(poolID))
 	return "d9_tenant_pool:" + hex.EncodeToString(sum[:20])
+}
+
+func tenantPoolDatabaseLockName(baseLockName, databaseName string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(databaseName)))
+	return baseLockName + ":" + hex.EncodeToString(sum[:4])
 }
 
 func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *TenantWithAPIKey, err error) {
