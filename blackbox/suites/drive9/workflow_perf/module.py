@@ -113,11 +113,13 @@ class Drive9WorkflowPerf(Drive9WorkflowBase):
             env["PATH"] = f"{node_bin_dir}:{env.get('PATH', '')}"
         except Exception:
             pass
-        # corepack prepare installs pnpm shims into COREPACK_HOME; add it to
-        # PATH so build scripts that invoke pnpm directly (not via corepack)
-        # can find them.
+        # corepack prepare (Node 24's corepack 0.34+) stores pnpm under
+        # COREPACK_HOME/v1/ and does not create a top-level pnpm shim, so
+        # build scripts that call `pnpm` directly cannot find it. Create
+        # shim scripts in COREPACK_HOME that delegate to `corepack <tool>`.
         corepack_home = env.get("COREPACK_HOME", "")
         if corepack_home:
+            self.ensure_corepack_shims(Path(corepack_home))
             env["PATH"] = f"{corepack_home}:{env.get('PATH', '')}"
         return env
 
