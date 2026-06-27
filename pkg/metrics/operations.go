@@ -27,6 +27,7 @@ var serviceGauge = serviceMeter.Float64Gauge("drive9_service_gauge", "Service ga
 
 var httpRequestsTotal = httpMeter.Int64Counter("drive9_http_requests_total", "Total HTTP requests by method/route/status")
 var httpRequestDuration = httpMeter.Float64Histogram("drive9_http_request_duration_seconds", "HTTP request duration histogram by method/route", httpDurationBounds)
+var httpRequestBodyReadDuration = httpMeter.Float64Histogram("drive9_http_request_body_read_duration_seconds", "HTTP request body read duration histogram by method/route/status_class/body_size_bucket", httpDurationBounds)
 var httpInflight = httpMeter.Float64Gauge("drive9_http_inflight_requests", "Current in-flight HTTP requests")
 
 var businessEventsTotal = eventMeter.Int64Counter("drive9_business_events_total", "Business lifecycle events")
@@ -98,6 +99,16 @@ func RecordHTTPRequest(method, route string, status int, d time.Duration) {
 	httpRequestDuration.Observe(d.Seconds(),
 		Attr("method", cleanMetricValue(method, "UNKNOWN")),
 		Attr("route", cleanMetricValue(route, "other")),
+	)
+}
+
+func RecordHTTPRequestBodyRead(method, route string, status int, bodyBytes int64, d time.Duration) {
+	RegisterModule("server")
+	httpRequestBodyReadDuration.Observe(d.Seconds(),
+		Attr("method", cleanMetricValue(method, "UNKNOWN")),
+		Attr("route", cleanMetricValue(route, "other")),
+		Attr("status_class", statusClass(status)),
+		Attr("body_size_bucket", bodySizeBucket(bodyBytes)),
 	)
 }
 
@@ -248,4 +259,32 @@ func cleanMetricValue(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func statusClass(status int) string {
+	if status <= 0 {
+		return "unknown"
+	}
+	return strconv.Itoa(status/100) + "xx"
+}
+
+func bodySizeBucket(bytes int64) string {
+	switch {
+	case bytes < 0:
+		return "unknown"
+	case bytes == 0:
+		return "0"
+	case bytes <= 1<<10:
+		return "le_1KiB"
+	case bytes <= 10<<10:
+		return "le_10KiB"
+	case bytes <= 100<<10:
+		return "le_100KiB"
+	case bytes <= 1<<20:
+		return "le_1MiB"
+	case bytes <= 10<<20:
+		return "le_10MiB"
+	default:
+		return "gt_10MiB"
+	}
 }
