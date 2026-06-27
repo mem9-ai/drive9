@@ -62,7 +62,6 @@ PJDFSTEST_DIR=/path/to/pjdfstest
 PJDFSTEST_TESTS=/path/to/pjdfstest/tests
 PJDFSTEST_BIN=/path/to/pjdfstest
 PJDFSTEST_ALLOW_NONROOT=1          # pjdfstest normally requires root
-GIT_TEST_SOURCE_DIR=/path/to/git
 LTP_ROOT=/path/to/ltp              # installed tree with runltp, bin/ltp-pan, runtest/, testcases/bin/
 LTP_INSTALL_ROOT=/path/to/ltp-install
 FIO_BIN=/path/to/fio
@@ -89,8 +88,6 @@ IOR_REF=4.0.0                       # IOR provides mdtest
 IOR_MAKE_JOBS=2
 IOR_BUILD_TIMEOUT_S=1800
 SECFS_TEST_REF=master               # fsx fallback source
-GIT_TEST_REF=v2.49.0
-GIT_TEST_BUILD_TIMEOUT_S=1800
 ```
 
 `LTP_ROOT` must point to an installed LTP tree containing `runltp`,
@@ -152,7 +149,6 @@ retain their own licenses and notices.
 
 - **pjdfstest**: https://github.com/pjd/pjdfstest — BSD-2-Clause
 - **Linux Test Project**: https://github.com/linux-test-project/ltp — GPL-2.0-or-later
-- **Git upstream tests** (used by `git.official.*`): https://github.com/git/git — GPL-2.0-only
 - **secfs.test / fsx**: https://github.com/billziss-gh/secfs.test — Apache-2.0
 - **fio**: https://github.com/axboe/fio — GPL-2.0-only
 - **IOR / mdtest**: https://github.com/hpc/ior — GPL-2.0-only
