@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // defaultQuotaOutboxMaxAttempts bounds how long a poisoned quota mutation can
@@ -17,6 +19,7 @@ import (
 // current capped exponential backoff this is roughly tens of minutes, while
 // still allowing normal transient central-store failures to recover.
 const defaultQuotaOutboxMaxAttempts = 100
+const quotaOutboxClaimMaxAttempts = 3
 const quotaAdmissionLockName = "default"
 
 type QuotaOutboxStatus string
@@ -55,6 +58,8 @@ type QuotaOutboxEntry struct {
 // ErrQuotaOutboxLeaseMismatch means a worker tried to ack/retry an outbox row
 // it no longer owns.
 var ErrQuotaOutboxLeaseMismatch = errors.New("quota outbox lease mismatch")
+
+var errQuotaOutboxClaimConflict = errors.New("quota outbox claim conflict")
 
 // EnqueueQuotaOutboxTx inserts a queued quota mutation inside an existing
 // tenant metadata transaction.
@@ -106,6 +111,18 @@ func (s *Store) ClaimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseD
 }
 
 func (s *Store) claimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) ([]QuotaOutboxEntry, error) {
+	for attempt := 0; attempt < quotaOutboxClaimMaxAttempts; attempt++ {
+		entries, err := s.claimQuotaOutboxBatchOnce(ctx, now, leaseDuration, limit)
+		if errors.Is(err, errQuotaOutboxClaimConflict) {
+			continue
+		}
+		return entries, err
+	}
+	metrics.RecordOperation("datastore", "claim_quota_outbox_conflict_exhausted", "conflict", 0)
+	return nil, nil
+}
+
+func (s *Store) claimQuotaOutboxBatchOnce(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) ([]QuotaOutboxEntry, error) {
 	if limit <= 0 {
 		limit = 1
 	}
@@ -183,7 +200,12 @@ func (s *Store) claimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseD
 		return nil, err
 	}
 	if rowsAffected != int64(len(entries)) {
-		return nil, ErrQuotaOutboxLeaseMismatch
+		// Under concurrent SKIP LOCKED claims, TiDB can report that fewer rows
+		// were claimed than the preceding read selected. Treat that as a benign
+		// claim race: rollback this tx and let this worker retry or let another
+		// worker process the rows. Ack/retry paths still use
+		// ErrQuotaOutboxLeaseMismatch for real ownership failures.
+		return nil, errQuotaOutboxClaimConflict
 	}
 
 	for i := range entries {
