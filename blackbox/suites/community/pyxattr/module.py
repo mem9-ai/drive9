@@ -4,6 +4,7 @@ from typing import Any
 
 from harness.core import BlackboxError, Context, ModuleSkip, ModuleXFail
 from harness.module_base import BaseModule
+from suites.community.pyxattr.deps import ensure_pyxattr
 
 
 class CommunityPyxattr(BaseModule):
@@ -16,7 +17,7 @@ class CommunityPyxattr(BaseModule):
     def ensure_dependencies(self, ctx: Context) -> None:
         if not ctx.capabilities.get("features", {}).get("xattr"):
             raise ModuleSkip("host Python lacks os xattr helpers", "platform skip")
-        ctx.deps.ensure_pyxattr()
+        ensure_pyxattr(ctx)
 
     def run(self, ctx: Context) -> dict[str, Any]:
         remote = ctx.target.remote_root(self.id)

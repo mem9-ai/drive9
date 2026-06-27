@@ -5,6 +5,7 @@ from typing import Any
 
 from harness.core import BlackboxError, Context
 from harness.module_base import BaseModule, module_config
+from suites.community.mdtest.deps import ensure_mdtest
 
 
 class CommunityMdtest(BaseModule):
@@ -15,7 +16,7 @@ class CommunityMdtest(BaseModule):
     timeout = 1200
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        mdtest = ctx.deps.ensure_mdtest()
+        mdtest = ensure_mdtest(ctx)
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_mdtest", remote, profile="none")

@@ -47,14 +47,14 @@ class SuiteProvider(Protocol):
 
 
 def load_suite_provider(suite: str, config_dir: Path) -> SuiteProvider:
-    """Load the environment provider from env/provider.py."""
-    module_name = "env.provider"
+    """Load the environment provider from harness.provider."""
+    module_name = "harness.provider"
     try:
         module = importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
         if exc.name == module_name:
             raise BlackboxError(
-                f"blackbox env provider not found at {module_name}"
+                f"blackbox suite provider not found at {module_name}"
             ) from exc
         raise
     factory = getattr(module, "create_provider", None)

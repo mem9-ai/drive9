@@ -5,6 +5,7 @@ from typing import Any
 
 from harness.core import Context, DependencyUnavailable, summarize
 from harness.module_base import BaseModule, module_config, timeit
+from suites.git._deps import ensure_git_source
 
 
 class GitOfficialPerf(BaseModule):
@@ -16,7 +17,7 @@ class GitOfficialPerf(BaseModule):
 
     def run(self, ctx: Context) -> dict[str, Any]:
         ctx.deps.ensure_git_tool()
-        source = ctx.deps.ensure_git_source()
+        source = ensure_git_source(ctx)
         perf_run = source / "t" / "perf" / "run"
         if not perf_run.exists():
             raise DependencyUnavailable("Git t/perf runner not found")

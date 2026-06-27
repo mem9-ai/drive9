@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Any
 
 from harness.core import BlackboxError, Context, DependencyUnavailable, ModuleSkip
-from env.deps import DEFAULT_LTP_FS_SCENARIO, DEFAULT_LTP_SYSCALL_SCENARIO
 from harness.module_base import BaseModule
+from suites.community.ltp.deps import DEFAULT_LTP_FS_SCENARIO, DEFAULT_LTP_SYSCALL_SCENARIO, ensure_ltp
 
 
 class CommunityLTPFS(BaseModule):
@@ -19,10 +19,10 @@ class CommunityLTPFS(BaseModule):
     def ensure_dependencies(self, ctx: Context) -> None:
         if ctx.capabilities.get("os") != "Linux":
             raise ModuleSkip("LTP filesystem tests are Linux-only", "platform skip")
-        ctx.deps.ensure_ltp()
+        ensure_ltp(ctx)
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        ltp = ctx.deps.ensure_ltp()
+        ltp = ensure_ltp(ctx)
         runltp = str(ltp / "runltp")
         if not Path(runltp).exists():
             raise DependencyUnavailable("runltp not found")
@@ -57,7 +57,7 @@ class CommunityLTPSyscalls(CommunityLTPFS):
     labels = ("compatibility", "linux", "community")
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        ltp = ctx.deps.ensure_ltp()
+        ltp = ensure_ltp(ctx)
         runltp = str(ltp / "runltp")
         if not Path(runltp).exists():
             raise DependencyUnavailable("runltp not found")

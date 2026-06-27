@@ -5,6 +5,7 @@ from typing import Any
 
 from harness.core import BlackboxError, Context, ModuleSkip
 from harness.module_base import BaseModule, module_config
+from suites.git._deps import ensure_git_source
 
 
 class GitOfficialFunctional(BaseModule):
@@ -17,7 +18,7 @@ class GitOfficialFunctional(BaseModule):
     def run(self, ctx: Context) -> dict[str, Any]:
         ctx.deps.ensure_prove()
         ctx.deps.ensure_git_tool()
-        source = ctx.deps.ensure_git_source()
+        source = ensure_git_source(ctx)
         cfg = module_config(ctx, self.id)
         tests = cfg.get("tests", [])
         if not tests:

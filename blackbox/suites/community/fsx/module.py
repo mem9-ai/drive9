@@ -5,6 +5,7 @@ from typing import Any
 
 from harness.core import BlackboxError, Context
 from harness.module_base import BaseModule, module_config
+from suites.community.fsx.deps import ensure_fsx
 
 
 class CommunityFSX(BaseModule):
@@ -15,7 +16,7 @@ class CommunityFSX(BaseModule):
     timeout = 600
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        fsx = ctx.deps.ensure_fsx()
+        fsx = ensure_fsx(ctx)
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_fsx", remote)

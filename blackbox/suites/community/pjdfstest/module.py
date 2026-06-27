@@ -7,6 +7,7 @@ from typing import Any
 
 from harness.core import BlackboxError, Context, ModuleSkip, write_json
 from harness.module_base import BaseModule, module_config, read_text
+from suites.community.pjdfstest.deps import ensure_pjdfstest
 
 
 class CommunityPjdfstest(BaseModule):
@@ -24,10 +25,10 @@ class CommunityPjdfstest(BaseModule):
         if not ctx.capabilities.get("is_root") and os.environ.get("PJDFSTEST_ALLOW_NONROOT", "1") == "0":
             raise ModuleSkip("pjdfstest requires root (PJDFSTEST_ALLOW_NONROOT=0)", "platform skip")
         ctx.deps.ensure_prove()
-        ctx.deps.ensure_pjdfstest()
+        ensure_pjdfstest(ctx)
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        tests_dir, bin_path = ctx.deps.ensure_pjdfstest()
+        tests_dir, bin_path = ensure_pjdfstest(ctx)
         cfg = module_config(ctx, self.id)
         groups = cfg.get("groups", "all")
         remote = ctx.target.remote_root(self.id)

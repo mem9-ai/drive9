@@ -5,7 +5,7 @@ from typing import Any
 
 from harness.core import CACHE_ROOT, SKIP, Context, ModuleRecord, Recorder, load_json
 
-from .capabilities import detect_capabilities
+from .capabilities import detect_fuse_capabilities
 from .deps import Drive9DependencyManager
 
 from .target import Drive9FuseTargetProvider
@@ -18,7 +18,7 @@ class Drive9SuiteProvider:
 
 
     def detect_capabilities(self) -> dict[str, Any]:
-        return detect_capabilities()
+        return detect_fuse_capabilities()
 
     def create_deps(self, *, auto_fetch: bool, recorder: Recorder) -> Drive9DependencyManager:
         return Drive9DependencyManager(CACHE_ROOT, auto_fetch=auto_fetch, recorder=recorder)

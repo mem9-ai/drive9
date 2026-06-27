@@ -37,9 +37,6 @@ class BaseModule:
                     return
             except ModuleNotFoundError:
                 pass  # No deps.py — module has no special dependencies
-        # Fallback: call legacy ensure_all_for_module if deps manager supports it
-        if hasattr(ctx.deps, "ensure_all_for_module"):
-            ctx.deps.ensure_all_for_module(self.id)
 
     def resolve_report_profile(self) -> str:
         if self.report_profile:

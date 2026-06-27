@@ -6,6 +6,7 @@ from typing import Any
 
 from harness.core import BlackboxError, Context, DependencyUnavailable
 from harness.module_base import BaseModule
+from suites.community.vdbench.deps import ensure_vdbench
 
 
 class CommunityVdbench(BaseModule):
@@ -17,7 +18,7 @@ class CommunityVdbench(BaseModule):
     timeout = 1800
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        vdbench = ctx.deps.ensure_vdbench()
+        vdbench = ensure_vdbench(ctx)
         if not shutil.which("java"):
             raise DependencyUnavailable("vdbench requires java")
         remote = ctx.target.remote_root(self.id)
