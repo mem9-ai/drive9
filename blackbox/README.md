@@ -56,8 +56,9 @@ labels.
 
 ## Commands
 
-All commands use `python3 blackbox/run.py` directly. `--drive9-cli` is optional
-and defaults to `drive9` found on the system PATH.
+All commands use `python3 blackbox/run.py` directly. The default behavior uses
+the `drive9` binary found on PATH and reads server/auth from `~/.drive9/config`
+(via the CLI's own credential resolver). No CLI build, no server provisioning.
 
 ```bash
 # List available modules (no side effects, no work-dir created)
@@ -82,7 +83,11 @@ python3 blackbox/run.py --all --label functional
 python3 blackbox/run.py --category drive9.workflow
 
 # Specify a custom drive9 CLI path
-python3 blackbox/run.py --all --drive9-cli ./bin/drive9
+python3 blackbox/run.py --all --bin ./bin/drive9
+
+# Local server mode (user-built server binary, no auto-build)
+python3 blackbox/run.py --module community.pjdfstest \
+  --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local
 
 # Bootstrap: prepare dependencies, then exit
 python3 blackbox/run.py --all --bootstrap --work-dir /tmp/bb
@@ -101,10 +106,18 @@ python3 blackbox/run.py --all --strict-prereqs
 
 # Offline mode (no auto-fetch of dependencies)
 python3 blackbox/run.py --all --offline
-
-# Custom server mode
-python3 blackbox/run.py --all --server-mode existing
 ```
+
+## Server Modes
+
+- **`config` (default)**: Uses the `drive9` binary on PATH (or `--bin <path>`)
+  and lets the CLI resolve server URL and API key from `~/.drive9/config`. No
+  CLI build, no server provisioning, no local server. This is the normal mode
+  for running against an existing drive9 deployment.
+- **`local`**: Starts a `drive9-server-local` process with a MySQL container
+  (or `DRIVE9_LOCAL_DSN`). Requires `--local-server <path>` pointing to a
+  pre-built server binary and `--bin <path>` for the CLI. Neither binary is
+  built automatically.
 
 ## Module Structure
 

@@ -113,30 +113,37 @@ class Drive9FuseTargetProvider:
         self.tmp_dir = result_dir / "tmp"
         self.bin_dir = result_dir / "bin"
         self.env_home = self.tmp_dir / "home"
-        if args.drive9_cli:
-            self.cli = Path(args.drive9_cli).expanduser().resolve()
+        # CLI binary: --bin takes priority, then PATH lookup. Never built here.
+        if args.bin:
+            self.cli = Path(args.bin).expanduser().resolve()
         else:
-            import shutil
             found = shutil.which("drive9")
-            self.cli = Path(found).resolve() if found else self.bin_dir / "drive9"
-        self.server_bin = self.bin_dir / "drive9-server-local"
-        self.server_url = os.environ.get("DRIVE9_BASE", "")
-        self.api_key = os.environ.get("DRIVE9_API_KEY", "")
+            self.cli = Path(found).resolve() if found else None
+        # Server binary for --server-mode local: --local-server is required.
+        self.server_bin = Path(args.local_server).expanduser().resolve() if args.local_server else None
+        self.server_url = ""
+        self.api_key = ""
         self.local_api_key = os.environ.get("DRIVE9_LOCAL_API_KEY", "local-dev-key")
         self.server_proc: subprocess.Popen[bytes] | None = None
         self.db_container = ""
         self.db_runtime = ""
         self.mounts: list[MountHandle] = []
+        self.config_mode = args.server_mode == "config"
         for path in (self.logs_dir, self.mount_logs_dir, self.tmp_dir, self.bin_dir, self.env_home):
             path.mkdir(parents=True, exist_ok=True)
 
     def base_env(self) -> dict[str, str]:
         env = dict(os.environ)
-        env["HOME"] = str(self.env_home)
-        if self.server_url:
-            env["DRIVE9_SERVER"] = self.server_url
-        if self.api_key:
-            env["DRIVE9_API_KEY"] = self.api_key
+        if not self.config_mode:
+            # In local mode, isolate HOME and inject explicit credentials so
+            # the CLI does not pick up the user's ~/.drive9/config.
+            env["HOME"] = str(self.env_home)
+            if self.server_url:
+                env["DRIVE9_SERVER"] = self.server_url
+            if self.api_key:
+                env["DRIVE9_API_KEY"] = self.api_key
+        # In config mode, inherit the real HOME so the CLI reads
+        # ~/.drive9/config for server URL and API key on its own.
         env.setdefault("GIT_AUTHOR_NAME", "Drive9 Blackbox")
         env.setdefault("GIT_AUTHOR_EMAIL", "blackbox@drive9.local")
         env.setdefault("GIT_COMMITTER_NAME", "Drive9 Blackbox")
@@ -223,28 +230,12 @@ class Drive9FuseTargetProvider:
                 pass
             proc.wait(timeout=5)
 
-    def build_cli(self) -> None:
-        if self.args.drive9_cli:
-            if not self.cli.exists():
-                raise BlackboxError(f"drive9 CLI not found: {self.cli}")
-            progress(f"setup: using drive9 CLI {self.cli}")
-            return
-        progress("setup: building drive9 CLI")
-        env = dict(os.environ)
-        env["CGO_ENABLED"] = "0"
-        result = self.run_cmd("build-cli", ["go", "build", "-o", str(self.cli), "./cmd/drive9"], timeout=600, env=env)
-        if not result.ok:
-            raise BlackboxError(f"build drive9 CLI failed; see {result.stderr}")
-        progress(f"setup: drive9 CLI ready at {self.cli}")
-
-    def build_server_local(self) -> None:
-        progress("setup: building drive9-server-local")
-        env = dict(os.environ)
-        env["CGO_ENABLED"] = "0"
-        result = self.run_cmd("build-server-local", ["go", "build", "-o", str(self.server_bin), "./cmd/drive9-server-local"], timeout=600, env=env)
-        if not result.ok:
-            raise BlackboxError(f"build drive9-server-local failed; see {result.stderr}")
-        progress(f"setup: drive9-server-local ready at {self.server_bin}")
+    def verify_cli(self) -> None:
+        """Verify the drive9 CLI binary exists. Never builds it."""
+        if self.cli is None or not self.cli.exists():
+            hint = f" (from --bin {self.cli})" if self.cli else "; build it first or pass --bin <path>"
+            raise BlackboxError(f"drive9 CLI not found on PATH{hint}")
+        progress(f"setup: using drive9 CLI {self.cli}")
 
     def detect_runtime(self) -> str:
         runtime = os.environ.get("DRIVE9_LOCAL_E2E_DB_RUNTIME", "")
@@ -333,18 +324,14 @@ class Drive9FuseTargetProvider:
 
     def start_server(self) -> None:
         mode = self.args.server_mode
-        if mode == "auto":
-            mode = "existing" if self.server_url else "local"
-        if mode == "existing":
-            if not self.server_url:
-                raise BlackboxError("DRIVE9_BASE is required for --server-mode existing")
-            progress(f"setup: using existing drive9 server {self.server_url}")
-            if not self.api_key:
-                self.provision_existing_server()
+        if mode == "config":
+            progress("setup: using drive9 credentials from ~/.drive9/config")
             return
         if mode != "local":
             raise BlackboxError(f"unknown server mode: {mode}")
-        self.build_server_local()
+        if self.server_bin is None or not self.server_bin.exists():
+            raise BlackboxError("--local-server <path> is required for --server-mode local")
+        progress(f"setup: using drive9-server-local {self.server_bin}")
         dsn = self.start_mysql_if_needed()
         listen_addr = f"127.0.0.1:{pick_port()}"
         self.server_url = f"http://{listen_addr}"
@@ -394,29 +381,6 @@ class Drive9FuseTargetProvider:
         if tail:
             detail += f"\nlast log lines:\n{tail}"
         raise BlackboxError(detail)
-
-    def provision_existing_server(self) -> None:
-        progress(f"setup: provisioning tenant on existing server {self.server_url}")
-        code, parsed, raw = http_json("POST", f"{self.server_url}/v1/provision", timeout=60)
-        if code not in (200, 202) or not isinstance(parsed, dict):
-            raise BlackboxError(f"provision failed: code={code} body={raw}")
-        key = str(parsed.get("api_key") or "")
-        if not key:
-            raise BlackboxError(f"provision response missing api_key: {raw}")
-        self.api_key = key
-        deadline = time.monotonic() + int(os.environ.get("POLL_TIMEOUT_S", "120"))
-        progress("setup: waiting for provisioned tenant to become active")
-        next_wait_log = time.monotonic() + 10
-        while time.monotonic() < deadline:
-            status_code, status_body, _ = http_json("GET", f"{self.server_url}/v1/status", token=self.api_key, timeout=20)
-            if status_code == 200 and isinstance(status_body, dict) and status_body.get("status") == "active":
-                progress("setup: provisioned tenant is active")
-                return
-            if time.monotonic() >= next_wait_log:
-                progress("setup: still waiting for provisioned tenant")
-                next_wait_log = time.monotonic() + 10
-            time.sleep(float(os.environ.get("POLL_INTERVAL_S", "2")))
-        raise BlackboxError("provisioned tenant did not become active")
 
     def drive9(self, name: str, args: list[str], *, timeout: int = 120, ok_codes: tuple[int, ...] = (0,)) -> CommandResult:
         return self.run_cmd(name, [str(self.cli), *args], timeout=timeout, env=self.base_env(), ok_codes=ok_codes)

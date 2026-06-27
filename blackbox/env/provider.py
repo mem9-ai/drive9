@@ -33,7 +33,7 @@ class Drive9SuiteProvider:
         return [ModuleRecord(module="prereq.fuse", category="prereq", status=SKIP, seconds=0, classification="platform skip", detail=detail)]
 
     def setup(self, ctx: Context) -> None:
-        ctx.target.build_cli()
+        ctx.target.verify_cli()
         ctx.target.start_server()
 
     def cleanup(self, ctx: Context) -> None:
@@ -42,8 +42,8 @@ class Drive9SuiteProvider:
     def manifest_fields(self, ctx: Context) -> dict[str, Any]:
         fields: dict[str, Any] = {
             "server_mode": ctx.args.server_mode,
-            "server_url": ctx.target.server_url,
-            "drive9_cli": str(ctx.target.cli),
+            "server_url": ctx.target.server_url or "(from ~/.drive9/config)",
+            "drive9_cli": str(ctx.target.cli) if ctx.target.cli else "(not found)",
         }
         try:
             if ctx.target.cli.exists():
