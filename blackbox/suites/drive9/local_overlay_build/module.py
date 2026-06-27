@@ -126,6 +126,13 @@ class Drive9LocalOverlayBuild(Drive9WorkflowBase):
         for key, path in values.items():
             path.mkdir(parents=True, exist_ok=True)
             env[key] = str(path)
+        # Ensure a Node version that satisfies kimi-code's engine pin.
+        try:
+            node_bin = ctx.deps.ensure_node_version(">=24.15.0")
+            node_bin_dir = str(Path(node_bin).resolve().parent)
+            env["PATH"] = f"{node_bin_dir}:{env.get('PATH', '')}"
+        except Exception:
+            pass
         return env
 
     def sample_env(self, ctx: Context, repo_id: str, storage: str, run_index: int, base: dict[str, str]) -> dict[str, str]:

@@ -124,6 +124,61 @@ class Drive9DependencyManager(DependencyManager):
         attempted.update(missing)
         self._system_packages_attempted = attempted
 
+    def ensure_node_version(self, required: str = ">=24.15.0") -> str:
+        """Return a Node binary path that satisfies ``required``.
+
+        If the system Node already satisfies the constraint, return it. Otherwise
+        fetch the matching Node binary tarball into the tools cache and return
+        the cached ``node`` path. This lets repo-build modules (which clone
+        external repos like kimi-code that pin a newer Node engine) run without
+        requiring a host-level Node upgrade.
+        """
+        import re
+
+        sys_node = shutil.which("node")
+        if sys_node:
+            try:
+                out = subprocess.run([sys_node, "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20, check=False)
+                sys_version = out.stdout.strip().lstrip("v")
+            except Exception:
+                sys_version = ""
+            if sys_version and _node_satisfies(sys_version, required):
+                progress(f"dependency tool: node ({sys_version}) satisfies {required} -> {sys_node}")
+                return sys_node
+
+        # Determine the concrete version to fetch from the constraint.
+        target_version = _resolve_node_version(required)
+        node_dir = self.tools_root / "node" / target_version
+        node_bin = node_dir / "bin" / "node"
+        if node_bin.exists():
+            progress(f"dependency tool: node ({target_version}) from cache -> {node_bin}")
+            return str(node_bin)
+        if not self.auto_fetch:
+            raise DependencyUnavailable(f"node {required} is required and auto-fetch is disabled")
+        self._ensure_tools_root()
+        # Map major to a known stable release line; use the exact target.
+        arch = _node_arch()
+        tarball = f"node-v{target_version}-linux-{arch}.tar.xz"
+        url = f"https://nodejs.org/dist/v{target_version}/{tarball}"
+        download_dir = self.tools_root / "node" / "_downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        archive = download_dir / tarball
+        self.run(f"node-download-{target_version}", ["curl", "-fsSL", "-o", str(archive), url], timeout=600)
+        self.run(f"node-extract-{target_version}", ["tar", "-xJf", str(archive), "-C", str(node_dir.parent)], timeout=300)
+        extracted = node_dir.parent / f"node-v{target_version}-linux-{arch}"
+        extracted.rename(node_dir)
+        if not node_bin.exists():
+            raise DependencyUnavailable(f"node {target_version} download did not produce {node_bin}")
+        progress(f"dependency tool: node ({target_version}) fetched -> {node_bin}")
+        return str(node_bin)
+
+    def node_env(self, node_bin: str) -> dict[str, str]:
+        """Build an env with the given node's bin dir prepended to PATH."""
+        env = dict(os.environ)
+        node_bin_dir = str(Path(node_bin).resolve().parent)
+        env["PATH"] = f"{node_bin_dir}:{env.get('PATH', '')}"
+        return env
+
     def ensure_git_tool(self) -> str:
         found = shutil.which("git")
         if found:
@@ -569,3 +624,70 @@ class Drive9DependencyManager(DependencyManager):
             self.ensure_fsx()
         elif module_id == "community.pyxattr":
             self.ensure_pyxattr()
+
+
+def _node_version_tuple(version: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for piece in version.split("."):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            break
+    return tuple(parts)
+
+
+def _node_satisfies(actual: str, constraint: str) -> bool:
+    """Check whether ``actual`` (e.g. '24.15.1') satisfies ``constraint``.
+
+    Supports the simple constraints used by package.json ``engines.node``:
+    ``>=X.Y.Z`` and exact ``X.Y.Z``. Anything else is treated as satisfied
+    (defer to the system Node).
+    """
+    constraint = constraint.strip()
+    actual_t = _node_version_tuple(actual)
+    if constraint.startswith(">="):
+        return actual_t >= _node_version_tuple(constraint[2:].strip())
+    if constraint.startswith(">"):
+        return actual_t > _node_version_tuple(constraint[1:].strip())
+    if constraint.startswith("<="):
+        return actual_t <= _node_version_tuple(constraint[2:].strip())
+    if constraint.startswith("<"):
+        return actual_t < _node_version_tuple(constraint[1:].strip())
+    if constraint.startswith("="):
+        return actual_t == _node_version_tuple(constraint[1:].strip())
+    return True
+
+
+def _resolve_node_version(constraint: str) -> str:
+    """Resolve a constraint to a concrete Node version to download.
+
+    For ``>=24.15.0`` we pick the latest known 24.x release. This is updated
+    periodically; for other constraints, strip the operator and use the
+    version directly.
+    """
+    constraint = constraint.strip()
+    if constraint.startswith(">="):
+        base = constraint[2:].strip()
+        major = _node_version_tuple(base)[0]
+        # Known latest releases per major line (update as new versions ship).
+        latest = {
+            24: "24.15.0",
+            22: "22.22.1",
+            20: "20.19.0",
+        }
+        return latest.get(major, base)
+    for prefix in (">", "<", "<=", "="):
+        if constraint.startswith(prefix):
+            return constraint[len(prefix):].strip()
+    return constraint
+
+
+def _node_arch() -> str:
+    import platform
+
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        return "x64"
+    if machine in ("arm64", "aarch64"):
+        return "arm64"
+    return "x64"

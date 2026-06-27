@@ -1349,7 +1349,7 @@ class Drive9ManusPerf(BaseModule):
             checkout = checkout_parent / "repo"
             phases.append(self.run_phase(ctx, "clone", [["git", "clone", "--no-checkout", str(repo["url"]), str(checkout)]], checkout_parent, 1800, sample_env, shell=False, name=f"manus-extra-local-{repo['id']}-{profile}-run-{run_index}-clone"))
             phases.append(self.run_phase(ctx, "checkout", [["git", "-C", str(checkout), "checkout", "--detach", commit]], checkout_parent, 1800, sample_env, shell=False, name=f"manus-extra-local-{repo['id']}-{profile}-run-{run_index}-checkout"))
-            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack enable", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"manus-extra-local-{repo['id']}-{profile}-run-{run_index}-install"))
+            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack prepare pnpm@10.33.0 --activate", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"manus-extra-local-{repo['id']}-{profile}-run-{run_index}-install"))
             phases.append(self.run_phase(ctx, "build", [str(c) for c in repo.get("build", ["corepack pnpm run build"])], checkout, 1800, sample_env, shell=True, name=f"manus-extra-local-{repo['id']}-{profile}-run-{run_index}-build"))
             return self.assemble_sample(repo, commit, storage, profile, run_index, phases, failures)
         # FUSE storages.
@@ -1361,7 +1361,7 @@ class Drive9ManusPerf(BaseModule):
             checkout = handle.mountpoint / "repo"
             phases.append(self.run_phase(ctx, "clone", [["git", "clone", "--no-checkout", str(repo["url"]), str(checkout)]], handle.mountpoint, 1800, sample_env, shell=False, name=f"manus-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-clone"))
             phases.append(self.run_phase(ctx, "checkout", [["git", "-C", str(checkout), "checkout", "--detach", commit]], handle.mountpoint, 1800, sample_env, shell=False, name=f"manus-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-checkout"))
-            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack enable", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"manus-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-install"))
+            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack prepare pnpm@10.33.0 --activate", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"manus-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-install"))
             phases.append(self.run_phase(ctx, "build", [str(c) for c in repo.get("build", ["corepack pnpm run build"])], checkout, 1800, sample_env, shell=True, name=f"manus-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-build"))
             return self.assemble_sample(repo, commit, storage, profile, run_index, phases, failures)
         finally:
