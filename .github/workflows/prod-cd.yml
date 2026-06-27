@@ -129,6 +129,22 @@ jobs:
           kubectl --context us -n "${{ env.DEPLOY_NAMESPACE }}" \
             rollout undo "deployment/${{ env.K8S_DEPLOYMENT }}"
 
+      - name: Deploy drive9-tidbcloud to aws-us-east-1
+        id: deploy-us-native
+        if: inputs.region == 'all' || inputs.region == 'aws-us-east-1'
+        run: |
+          kubectl --context us -n drive9-tidbcloud \
+            set image deployment/drive9-server \
+            drive9-server=$IMAGE
+          kubectl --context us -n drive9-tidbcloud \
+            rollout status deployment/drive9-server --timeout=180s
+
+      - name: Rollback drive9-tidbcloud aws-us-east-1 on failure
+        if: failure() && steps.deploy-us-native.outcome == 'failure'
+        run: |
+          kubectl --context us -n drive9-tidbcloud \
+            rollout undo deployment/drive9-server
+
       - name: Configure Alibaba Cloud credentials
         if: inputs.region == 'all' || inputs.region == 'alicloud-ap-southeast-1'
         uses: aliyun/configure-aliyun-credentials-action@v1
