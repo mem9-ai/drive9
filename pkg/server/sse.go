@@ -20,6 +20,12 @@ const (
 	sseHeartbeatInterval = 30 * time.Second
 	sseFlushBatchSize    = 10
 	sseFlushMaxDelay     = 1 * time.Millisecond
+
+	// sseEventsRoute is the SSE change-notification stream endpoint. It is the
+	// only SSE route today; observe uses this constant (plus the
+	// sseStreamEstablished context flag) to distinguish real SSE connection
+	// lifetimes from bounded error responses on the same route.
+	sseEventsRoute = "/v1/events"
 )
 
 // stopTimer drains a timer's channel after stopping it to prevent spurious
@@ -177,6 +183,7 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 				zap.String("op", op),
 				zap.Error(err))
 			metrics.RecordTenantOperation(bus.tenantID, "event_bus", "publish", "error", 0)
+			metrics.RecordEventBusPublishError(bus.tenantID)
 		}
 	}
 	bus.Publish()
@@ -206,6 +213,17 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bus := s.tenantEventBus(r)
+	tenantID := bus.tenantID
+	connStart := time.Now()
+	// Track SSE inflight and connection lifetime. The inflight count is
+	// derived from the EventBus listener set (adjusted in Subscribe/
+	// Unsubscribe); here we record the connection lifecycle into the
+	// dedicated SSE metrics (NOT the HTTP duration histogram — see the
+	// route guard in observe).
+	defer func() {
+		metrics.RecordSSEConnection(tenantID, "closed", time.Since(connStart))
+	}()
+
 	subID, notify := bus.Subscribe()
 	defer bus.Unsubscribe(subID)
 
@@ -215,12 +233,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+	// Mark the stream as established so observe treats this as a real SSE
+	// connection lifetime (skip HTTP duration histogram, record SSE metrics
+	// instead of normal HTTP/tenant durations). Bounded error responses that
+	// return before this point are still recorded as normal HTTP requests.
+	markSSEStreamEstablished(r.Context())
 
 	ctx := r.Context()
 
 	// Phase 1: Replay or Reset.
 	// EventsSince reads from the durable fs_events table, so events written
 	// by other pods are visible here (cross-pod propagation).
+	phase1Start := time.Now()
 	events, headSeq, ok := bus.EventsSince(ctx, since)
 	lastSeen := since
 
@@ -235,10 +259,18 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		sendSSEReset(bw, headSeq, reason)
+		metrics.RecordSSEResetSent(tenantID, reason)
 		lastSeen = headSeq
 	} else {
 		for _, ev := range events {
 			sendSSEEvent(bw, ev)
+			if isStructuralOp(ev.Op) {
+				// Structural ops are emitted as reset events (see sendSSEEvent),
+				// so count them as resets, not file_changed deliveries.
+				metrics.RecordSSEResetSent(tenantID, "structural_change")
+			} else {
+				metrics.RecordSSEEventSent(tenantID, ev.Op)
+			}
 			lastSeen = ev.Seq
 		}
 	}
@@ -247,11 +279,13 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	// were marked unverified on disconnect become verified without waiting
 	// for the periodic heartbeat.
 	sendSSEHeartbeat(bw, lastSeen)
+	metrics.RecordSSEHeartbeatSent(tenantID)
 	// Flush initial replay/reset immediately so the client receives the
 	// cursor position without waiting for the periodic heartbeat.
 	if err := bw.Flush(); err != nil {
 		return
 	}
+	metrics.RecordSSEPhase1(tenantID, time.Since(phase1Start))
 
 	// Phase 2: Live stream with micro-batching.
 	// The notify channel catches same-pod events instantly. A 1s poll ticker
@@ -280,6 +314,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		liveEvents, liveHead, liveOK := bus.EventsSince(ctx, lastSeen)
 		if !liveOK {
 			sendSSEReset(bw, liveHead, "seq_too_old")
+			metrics.RecordSSEResetSent(tenantID, "seq_too_old")
 			lastSeen = liveHead
 			if err := bw.Flush(); err != nil {
 				return false
@@ -292,6 +327,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		for _, ev := range liveEvents {
 			sendSSEEvent(bw, ev)
+			if isStructuralOp(ev.Op) {
+				metrics.RecordSSEResetSent(tenantID, "structural_change")
+			} else {
+				metrics.RecordSSEEventSent(tenantID, ev.Op)
+			}
 			lastSeen = ev.Seq
 		}
 		if bw.count > 0 {
@@ -322,6 +362,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-heartbeat.C:
 			sendSSEHeartbeat(bw, lastSeen)
+			metrics.RecordSSEHeartbeatSent(tenantID)
 			if err := bw.Flush(); err != nil {
 				return
 			}

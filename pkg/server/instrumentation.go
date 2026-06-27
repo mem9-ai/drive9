@@ -57,6 +57,15 @@ type requestMetricState struct {
 	bodyReadRoute    string
 	bodyReadBytes    int64
 	bodyReadDuration time.Duration
+
+	// sseStreamEstablished is set by an SSE handler (handleEvents) once it has
+	// written the 200 streaming headers and entered its long-lived select
+	// loop. observe uses it to distinguish a real SSE connection lifetime
+	// (skip HTTP duration, record SSE metrics) from a bounded error response
+	// on the same route (bad auth, invalid since, non-GET) that must still be
+	// recorded into the HTTP/tenant duration histograms. See the route guard
+	// in observe.
+	sseStreamEstablished bool
 }
 
 func withMetrics(ctx context.Context, m *serverMetrics) context.Context {
@@ -75,6 +84,46 @@ func metricsFromContext(ctx context.Context) *serverMetrics {
 func requestMetricStateFromContext(ctx context.Context) *requestMetricState {
 	v, _ := ctx.Value(requestMetricsKey).(*requestMetricState)
 	return v
+}
+
+// markSSEStreamEstablished signals that the SSE handler has written the
+// streaming response headers and entered its long-lived loop, so observe
+// should treat this as a real SSE connection lifetime (skip the HTTP
+// duration histogram) rather than a bounded error response. Safe to call
+// from the SSE handler after WriteHeader(200).
+func markSSEStreamEstablished(ctx context.Context) {
+	if st := requestMetricStateFromContext(ctx); st != nil {
+		st.mu.Lock()
+		st.sseStreamEstablished = true
+		st.mu.Unlock()
+	}
+}
+
+// sseStreamEstablished reports whether the SSE handler marked the response
+// as an established streaming connection. observe uses this to decide whether
+// to skip the HTTP duration histogram.
+func sseStreamEstablished(ctx context.Context) bool {
+	if st := requestMetricStateFromContext(ctx); st != nil {
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		return st.sseStreamEstablished
+	}
+	return false
+}
+
+// recordTenantHTTPResponseBytes records the response body bytes for a request
+// without the duration histogram (used for established SSE streams where the
+// duration is excluded but byte accounting is still wanted).
+func recordTenantHTTPResponseBytes(r *http.Request, responseBytes int) {
+	tenantID := requestTenantID(r)
+	if tenantID == "" || responseBytes <= 0 {
+		return
+	}
+	class := classifyTenantRequest(r)
+	if scopedClass, ok := requestMetricClass(r.Context()); ok {
+		class = scopedClass
+	}
+	metrics.RecordTenantHTTPBytes(tenantID, class.surface, class.action, "response", int64(responseBytes))
 }
 
 func setRequestMetricScope(ctx context.Context, scope *TenantScope, class tenantRequestClass) {
@@ -241,6 +290,14 @@ func (m *serverMetrics) recordBodyRead(method, route string, status int, bodyByt
 	metrics.RecordHTTPRequestBodyRead(method, route, status, bodyBytes, d)
 }
 
+// recordCount records only the request counter (no duration histogram).
+// Used for SSE/streaming routes whose handler blocks for the connection
+// lifetime — recording that lifetime into the HTTP duration histogram would
+// pollute all HTTP P95/P99 alerts. See observe for the route guard.
+func (m *serverMetrics) recordCount(method, route string, status int) {
+	metrics.RecordHTTPRequestCount(method, route, status)
+}
+
 func (m *serverMetrics) recordEvent(tenantID, event string, labels ...string) {
 	metrics.RecordTenantEvent(tenantID, event, labels...)
 }
@@ -344,8 +401,8 @@ func requestRoute(path string) string {
 		return "/v1/tokens/*"
 	case path == "/v1/sql":
 		return "/v1/sql"
-	case path == "/v1/events":
-		return "/v1/events"
+	case path == sseEventsRoute:
+		return sseEventsRoute
 	case path == "/v1/fork":
 		return "/v1/fork"
 	case path == "/v1/fs:batch-stat":
@@ -407,7 +464,7 @@ func classifyTenantRequest(r *http.Request) tenantRequestClass {
 		return tenantRequestClass{surface: "upload", action: classifyV2UploadAction(r)}
 	case path == "/v1/sql":
 		return tenantRequestClass{surface: "sql", action: strings.ToLower(r.Method)}
-	case path == "/v1/events":
+	case path == sseEventsRoute:
 		return tenantRequestClass{surface: "events", action: strings.ToLower(r.Method)}
 	case path == "/v1/tokens" || strings.HasPrefix(path, "/v1/tokens/"):
 		return tenantRequestClass{surface: "tokens", action: classifyTokenAction(r)}
@@ -619,6 +676,23 @@ func recordTenantHTTPRequest(r *http.Request, status int, d time.Duration, respo
 	}
 }
 
+// recordTenantHTTPRequestCount records only the tenant request counter (no
+// duration histogram) for SSE/streaming routes. Companion to recordCount.
+func recordTenantHTTPRequestCount(r *http.Request, status int) {
+	tenantID := requestTenantID(r)
+	if tenantID == "" {
+		return
+	}
+	class := classifyTenantRequest(r)
+	if scopedClass, ok := requestMetricClass(r.Context()); ok {
+		class = scopedClass
+	}
+	metrics.RecordTenantRequestCount(tenantID, class.surface, class.action, tenantRequestResult(status), status)
+	if r.ContentLength > 0 {
+		metrics.RecordTenantHTTPBytes(tenantID, class.surface, class.action, "request", r.ContentLength)
+	}
+}
+
 func recordTenantFileBytes(ctx context.Context, surface, action, direction string, bytes int64) {
 	tenantID, _, _ := requestMetricScope(ctx)
 	if tenantID == "" || bytes <= 0 {
@@ -666,17 +740,36 @@ func (s *Server) observe(next http.Handler, w http.ResponseWriter, r *http.Reque
 	}
 
 	dur := time.Since(start)
-	s.metrics.record(r.Method, route, ow.status, dur)
-	if method, bodyRoute, bodyBytes, bodyReadDuration, ok := requestBodyReadMetric(r.Context()); ok {
-		if method == "" {
-			method = r.Method
+	// An established SSE stream (/v1/events) blocks in a select loop for the
+	// entire client connection lifetime — recording that lifetime into the
+	// HTTP request duration histogram would pollute all HTTP P95/P99 alerts
+	// (a 40s SSE connection would look like a 40s "request"). handleEvents sets
+	// the sseStreamEstablished flag only after it has written the 200 streaming
+	// headers, so bounded error responses on the same route (bad auth, invalid
+	// since, non-GET, backend setup failures) are still recorded as normal
+	// HTTP requests. For an established stream, record only the request counter
+	// (+ tenant request counter + response bytes); the connection lifetime goes
+	// into the dedicated SSE metrics recorded by handleEvents. duration_ms is
+	// still logged below for debugging.
+	if route == sseEventsRoute && sseStreamEstablished(r.Context()) {
+		s.metrics.recordCount(r.Method, route, ow.status)
+		recordTenantHTTPRequestCount(r, ow.status)
+		if ow.size > 0 {
+			recordTenantHTTPResponseBytes(r, ow.size)
 		}
-		if bodyRoute == "" {
-			bodyRoute = route
+	} else {
+		s.metrics.record(r.Method, route, ow.status, dur)
+		if method, bodyRoute, bodyBytes, bodyReadDuration, ok := requestBodyReadMetric(r.Context()); ok {
+			if method == "" {
+				method = r.Method
+			}
+			if bodyRoute == "" {
+				bodyRoute = route
+			}
+			s.metrics.recordBodyRead(method, bodyRoute, ow.status, bodyBytes, bodyReadDuration)
 		}
-		s.metrics.recordBodyRead(method, bodyRoute, ow.status, bodyBytes, bodyReadDuration)
+		recordTenantHTTPRequest(r, ow.status, dur, ow.size)
 	}
-	recordTenantHTTPRequest(r, ow.status, dur, ow.size)
 
 	tenantID, apiKeyID, _ := requestMetricScope(r.Context())
 
