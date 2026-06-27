@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // defaultQuotaOutboxMaxAttempts bounds how long a poisoned quota mutation can
@@ -116,6 +118,7 @@ func (s *Store) claimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseD
 		}
 		return entries, err
 	}
+	metrics.RecordOperation("datastore", "claim_quota_outbox_conflict_exhausted", "conflict", 0)
 	return nil, nil
 }
 
@@ -197,10 +200,10 @@ func (s *Store) claimQuotaOutboxBatchOnce(ctx context.Context, now time.Time, le
 		return nil, err
 	}
 	if rowsAffected != int64(len(entries)) {
-		// In multi-server deployments TiDB can report that fewer rows were
-		// claimed than the preceding SKIP LOCKED read selected. Treat that as a
-		// benign claim race: rollback this tx and let this worker retry or let
-		// another worker process the rows. Ack/retry paths still use
+		// Under concurrent SKIP LOCKED claims, TiDB can report that fewer rows
+		// were claimed than the preceding read selected. Treat that as a benign
+		// claim race: rollback this tx and let this worker retry or let another
+		// worker process the rows. Ack/retry paths still use
 		// ErrQuotaOutboxLeaseMismatch for real ownership failures.
 		return nil, errQuotaOutboxClaimConflict
 	}
