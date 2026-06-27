@@ -286,6 +286,8 @@ const metaSchemaMigrateLockNamePrefix = "dat9_meta_schema_migrate:"
 const metaSchemaMigrateLockTimeoutSeconds = 30
 const externalBindingLockTimeoutSeconds = 90
 const externalBindingReleaseLockTimeout = 5 * time.Second
+const tenantPoolLockTimeoutSeconds = 300
+const tenantPoolReleaseLockTimeout = 5 * time.Second
 
 func (s *Store) migrate() (err error) {
 	ctx := context.Background()
@@ -1835,9 +1837,65 @@ func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKe
 	return fn(ctx)
 }
 
+func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(context.Context) error) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "tenant_pool_lock", start, &err)
+	if fn == nil {
+		return fmt.Errorf("tenant pool lock callback is required")
+	}
+	lockName := tenantPoolLockName(poolID)
+	if lockName == "" {
+		return fmt.Errorf("pool_id is required")
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	var got sql.NullInt64
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(CONCAT(?, DATABASE()), ?)", lockName, tenantPoolLockTimeoutSeconds).Scan(&got); err != nil {
+		return err
+	}
+	if !got.Valid {
+		return fmt.Errorf("tenant pool named lock returned NULL")
+	}
+	if got.Int64 != 1 {
+		return fmt.Errorf("timed out waiting for tenant pool named lock")
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), tenantPoolReleaseLockTimeout)
+		defer cancel()
+		var released sql.NullInt64
+		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(CONCAT(?, DATABASE()))", lockName).Scan(&released)
+		if releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+			return
+		}
+		if !released.Valid {
+			err = errors.Join(err, fmt.Errorf("tenant pool named lock release returned NULL"))
+			return
+		}
+		if released.Int64 != 1 {
+			err = errors.Join(err, fmt.Errorf("tenant pool named lock was not held by current connection"))
+		}
+	}()
+
+	return fn(ctx)
+}
+
 func externalBindingLockName(provider, subjectKey string) string {
 	sum := sha256.Sum256([]byte(provider + "\x00" + subjectKey))
 	return "d9_extbind:" + hex.EncodeToString(sum[:20])
+}
+
+func tenantPoolLockName(poolID string) string {
+	poolID = strings.TrimSpace(poolID)
+	if poolID == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(poolID))
+	return "d9_tenant_pool:" + hex.EncodeToString(sum[:20])
 }
 
 func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *TenantWithAPIKey, err error) {

@@ -31,6 +31,28 @@ type adminTenantPoolResponse struct {
 	Status         string `json:"status"`
 }
 
+type adminTenantPoolHTTPError struct {
+	status  int
+	message string
+}
+
+func (e *adminTenantPoolHTTPError) Error() string {
+	return e.message
+}
+
+func adminTenantPoolError(status int, message string) error {
+	return &adminTenantPoolHTTPError{status: status, message: message}
+}
+
+func writeAdminTenantPoolError(w http.ResponseWriter, err error) {
+	var httpErr *adminTenantPoolHTTPError
+	if errors.As(err, &httpErr) {
+		errJSON(w, httpErr.status, httpErr.message)
+		return
+	}
+	errJSON(w, http.StatusInternalServerError, err.Error())
+}
+
 func (s *Server) adminTenantPoolHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !s.adminTenantAPIEnabled() {
@@ -185,48 +207,58 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 	lock := s.tenantPoolLock(pool.PoolID)
 	lock.Lock()
 	defer lock.Unlock()
-	if pool, err = s.meta.GetTenantPoolByID(r.Context(), pool.PoolID); err != nil {
-		errJSON(w, http.StatusInternalServerError, "tenant pool lookup failed")
-		return
-	}
-	if pool.Status != meta.TenantPoolActive {
-		errJSON(w, http.StatusConflict, "tenant pool is not active")
-		return
-	}
-	freeSize, err := s.meta.CountFreeTenantPoolBindings(r.Context(), pool.OrganizationID)
-	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "tenant pool free size lookup failed")
-		return
-	}
-	targetSize := *req.PoolSize
-	if targetSize > freeSize {
-		results, err := s.createFreePoolTenants(r.Context(), pool.PoolID, targetSize-freeSize, cred, nil)
+
+	var out adminTenantPoolResponse
+	if err := s.meta.WithTenantPoolLock(r.Context(), pool.PoolID, func(ctx context.Context) error {
+		if pool, err = s.meta.GetTenantPoolByID(ctx, pool.PoolID); err != nil {
+			return adminTenantPoolError(http.StatusInternalServerError, "tenant pool lookup failed")
+		}
+		if pool.Status != meta.TenantPoolActive {
+			return adminTenantPoolError(http.StatusConflict, "tenant pool is not active")
+		}
+		freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID)
 		if err != nil {
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("grow tenant pool failed: %v", err))
-			return
+			return adminTenantPoolError(http.StatusInternalServerError, "tenant pool free size lookup failed")
 		}
-		for _, res := range results {
-			s.startProvisionedTenantSchemaInit(r.Context(), res)
+		targetSize := *req.PoolSize
+		if targetSize > freeSize {
+			results, err := s.createFreePoolTenants(ctx, pool.PoolID, targetSize-freeSize, cred, nil)
+			if err != nil {
+				return adminTenantPoolError(http.StatusBadGateway, fmt.Sprintf("grow tenant pool failed: %v", err))
+			}
+			for _, res := range results {
+				s.startProvisionedTenantSchemaInit(ctx, res)
+			}
+			freeSize += len(results)
+		} else if targetSize < freeSize {
+			if err := s.deleteNewestFreePoolTenants(ctx, pool.OrganizationID, freeSize-targetSize, cred, false); err != nil {
+				if actualFreeSize, countErr := s.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID); countErr == nil {
+					if updateErr := s.meta.UpdateTenantPoolSize(ctx, pool.PoolID, actualFreeSize); updateErr != nil {
+						logger.Warn(ctx, "admin_tenant_pool_shrink_partial_size_update_failed", zap.String("pool_id", pool.PoolID), zap.Int("free_size", actualFreeSize), zap.Error(updateErr))
+					}
+				} else {
+					logger.Warn(ctx, "admin_tenant_pool_shrink_partial_count_failed", zap.String("pool_id", pool.PoolID), zap.Error(countErr))
+				}
+				return adminTenantPoolError(http.StatusBadGateway, fmt.Sprintf("shrink tenant pool failed: %v", err))
+			}
+			freeSize = targetSize
 		}
-		freeSize += len(results)
-	} else if targetSize < freeSize {
-		if err := s.deleteNewestFreePoolTenants(r.Context(), pool.OrganizationID, freeSize-targetSize, cred, false); err != nil {
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("shrink tenant pool failed: %v", err))
-			return
+		if err := s.meta.UpdateTenantPoolSize(ctx, pool.PoolID, targetSize); err != nil {
+			return adminTenantPoolError(http.StatusInternalServerError, "failed to update tenant pool")
 		}
-		freeSize = targetSize
-	}
-	if err := s.meta.UpdateTenantPoolSize(r.Context(), pool.PoolID, targetSize); err != nil {
-		errJSON(w, http.StatusInternalServerError, "failed to update tenant pool")
+		out = adminTenantPoolResponse{
+			PoolID:         pool.PoolID,
+			OrganizationID: pool.OrganizationID,
+			PoolSize:       targetSize,
+			FreeSize:       freeSize,
+			Status:         string(pool.Status),
+		}
+		return nil
+	}); err != nil {
+		writeAdminTenantPoolError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, adminTenantPoolResponse{
-		PoolID:         pool.PoolID,
-		OrganizationID: pool.OrganizationID,
-		PoolSize:       targetSize,
-		FreeSize:       freeSize,
-		Status:         string(pool.Status),
-	})
+	writeJSON(w, http.StatusAccepted, out)
 }
 
 func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Request) {
@@ -250,25 +282,31 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 	lock := s.tenantPoolLock(pool.PoolID)
 	lock.Lock()
 	defer lock.Unlock()
-	if err := s.meta.UpdateTenantPoolStatus(r.Context(), pool.PoolID, meta.TenantPoolDeleting); err != nil {
-		errJSON(w, http.StatusInternalServerError, "failed to mark tenant pool deleting")
+
+	var out adminTenantPoolResponse
+	if err := s.meta.WithTenantPoolLock(r.Context(), pool.PoolID, func(ctx context.Context) error {
+		if err := s.meta.UpdateTenantPoolStatus(ctx, pool.PoolID, meta.TenantPoolDeleting); err != nil {
+			return adminTenantPoolError(http.StatusInternalServerError, "failed to mark tenant pool deleting")
+		}
+		if err := s.deleteNewestFreePoolTenants(ctx, pool.OrganizationID, 0, cred, true); err != nil {
+			return adminTenantPoolError(http.StatusBadGateway, fmt.Sprintf("delete tenant pool failed: %v", err))
+		}
+		if err := s.meta.DeleteTenantPool(ctx, pool.PoolID); err != nil {
+			return adminTenantPoolError(http.StatusInternalServerError, "failed to delete tenant pool")
+		}
+		out = adminTenantPoolResponse{
+			PoolID:         pool.PoolID,
+			OrganizationID: pool.OrganizationID,
+			PoolSize:       pool.Size,
+			FreeSize:       0,
+			Status:         string(meta.TenantPoolDeleting),
+		}
+		return nil
+	}); err != nil {
+		writeAdminTenantPoolError(w, err)
 		return
 	}
-	if err := s.deleteNewestFreePoolTenants(r.Context(), pool.OrganizationID, 0, cred, true); err != nil {
-		errJSON(w, http.StatusBadGateway, fmt.Sprintf("delete tenant pool failed: %v", err))
-		return
-	}
-	if err := s.meta.DeleteTenantPool(r.Context(), pool.PoolID); err != nil {
-		errJSON(w, http.StatusInternalServerError, "failed to delete tenant pool")
-		return
-	}
-	writeJSON(w, http.StatusAccepted, adminTenantPoolResponse{
-		PoolID:         pool.PoolID,
-		OrganizationID: pool.OrganizationID,
-		PoolSize:       pool.Size,
-		FreeSize:       0,
-		Status:         string(meta.TenantPoolDeleting),
-	})
+	writeJSON(w, http.StatusAccepted, out)
 }
 
 func (s *Server) authorizedTenantPool(w http.ResponseWriter, r *http.Request, cred tenant.CredentialProvisionRequest) (*meta.TenantPool, int, bool) {
@@ -599,32 +637,37 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 		lock := s.tenantPoolLock(pool.PoolID)
 		lock.Lock()
 		defer lock.Unlock()
-		current, err := s.meta.GetTenantPoolByID(ctx, pool.PoolID)
-		if err != nil {
-			if !errors.Is(err, meta.ErrNotFound) {
-				logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
+		if err := s.meta.WithTenantPoolLock(ctx, pool.PoolID, func(ctx context.Context) error {
+			current, err := s.meta.GetTenantPoolByID(ctx, pool.PoolID)
+			if err != nil {
+				if !errors.Is(err, meta.ErrNotFound) {
+					logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
+				}
+				return nil
 			}
-			return
-		}
-		if current.Status != meta.TenantPoolActive || current.OrganizationID == "" || current.Size <= 0 {
-			return
-		}
-		freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
-		if err != nil {
-			logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
-			return
-		}
-		missing := current.Size - freeSize
-		if missing <= 0 {
-			return
-		}
-		results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
-		if err != nil {
-			logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
-			return
-		}
-		for _, res := range results {
-			s.startProvisionedTenantSchemaInit(ctx, res)
+			if current.Status != meta.TenantPoolActive || current.OrganizationID == "" || current.Size <= 0 {
+				return nil
+			}
+			freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, current.OrganizationID)
+			if err != nil {
+				logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+				return nil
+			}
+			missing := current.Size - freeSize
+			if missing <= 0 {
+				return nil
+			}
+			results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
+			if err != nil {
+				logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+				return nil
+			}
+			for _, res := range results {
+				s.startProvisionedTenantSchemaInit(ctx, res)
+			}
+			return nil
+		}); err != nil {
+			logger.Warn(ctx, "admin_tenant_pool_replenish_lock_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
 		}
 	})
 }

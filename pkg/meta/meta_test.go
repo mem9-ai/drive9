@@ -367,6 +367,38 @@ func TestWithExternalBindingLockSerializesCallbacks(t *testing.T) {
 	}
 }
 
+func TestWithTenantPoolLockSerializesCallbacks(t *testing.T) {
+	s := newControlStore(t)
+	var running int32
+	var maxRunning int32
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := s.WithTenantPoolLock(context.Background(), "pool-lock-test", func(context.Context) error {
+				n := atomic.AddInt32(&running, 1)
+				for {
+					max := atomic.LoadInt32(&maxRunning)
+					if n <= max || atomic.CompareAndSwapInt32(&maxRunning, max, n) {
+						break
+					}
+				}
+				time.Sleep(20 * time.Millisecond)
+				atomic.AddInt32(&running, -1)
+				return nil
+			})
+			if err != nil {
+				t.Errorf("WithTenantPoolLock: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if maxRunning != 1 {
+		t.Fatalf("max concurrent lock holders = %d, want 1", maxRunning)
+	}
+}
+
 func TestInsertAPIKeyAllowsRepeatedKeyName(t *testing.T) {
 	s := newControlStore(t)
 	now := time.Now().UTC()

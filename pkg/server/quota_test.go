@@ -32,6 +32,7 @@ type quotaTestProvisioner struct {
 	defaultPublicKey  string
 	defaultPrivateKey string
 	markHook          func() error
+	deprovisionHook   func(call int, cluster *tenant.ClusterInfo) error
 	updateCalls       atomic.Int32
 	markCalls         atomic.Int32
 	getCalls          atomic.Int32
@@ -124,12 +125,17 @@ func (p *quotaTestProvisioner) GetQuota(_ context.Context, cluster *tenant.Clust
 }
 
 func (p *quotaTestProvisioner) DeprovisionWithCredentials(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
-	p.deprovisionCalls.Add(1)
+	call := int(p.deprovisionCalls.Add(1))
 	p.calls = append(p.calls, "deprovision")
 	p.lastCredentials = req
 	if cluster != nil {
 		out := *cluster
 		p.lastDeprovision = &out
+	}
+	if p.deprovisionHook != nil {
+		if err := p.deprovisionHook(call, cluster); err != nil {
+			return err
+		}
 	}
 	return p.deprovisionErr
 }
@@ -1477,6 +1483,111 @@ func TestAdminTenantPoolUpdateRequiresPoolSize(t *testing.T) {
 	}
 	if pool.Size != 2 {
 		t.Fatalf("pool size = %d, want 2", pool.Size)
+	}
+}
+
+func TestAdminTenantPoolUpdateShrinkPartialFailureReconcilesSize(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
+		Clusters: []tenant.CloudClusterInfo{{
+			ClusterID:      "cluster-free-1",
+			OrganizationID: "org-1",
+		}},
+	}}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
+		PoolID:         "pool-1",
+		OrganizationID: "org-1",
+		Size:           3,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	for i := 1; i <= 3; i++ {
+		tenantID := fmt.Sprintf("pool-tenant-shrink-%d", i)
+		clusterID := fmt.Sprintf("cluster-free-%d", i)
+		createdAt := now.Add(time.Duration(i) * time.Minute)
+		if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+			ID:               tenantID,
+			Status:           meta.TenantActive,
+			DBHost:           "db.example.com",
+			DBPort:           4000,
+			DBUser:           "u.root",
+			DBPasswordCipher: []byte("cipher"),
+			DBName:           "tidbcloud_fs",
+			DBTLS:            true,
+			Provider:         tenant.ProviderTiDBCloudNative,
+			ClusterID:        clusterID,
+			SchemaVersion:    1,
+			CreatedAt:        createdAt,
+			UpdatedAt:        createdAt,
+		}); err != nil {
+			t.Fatalf("insert tenant %s: %v", tenantID, err)
+		}
+		if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+			TenantID:       tenantID,
+			OrganizationID: "org-1",
+			ClusterID:      clusterID,
+			PoolID:         "pool-1",
+			PoolStatus:     meta.TenantPoolBindingFree,
+			CreatedAt:      createdAt,
+			UpdatedAt:      createdAt,
+		}); err != nil {
+			t.Fatalf("upsert binding %s: %v", tenantID, err)
+		}
+	}
+	rt.prov.deprovisionHook = func(call int, _ *tenant.ClusterInfo) error {
+		if call == 2 {
+			return fmt.Errorf("tidbcloud deprovision failed")
+		}
+		return nil
+	}
+
+	ts := httptest.NewServer(rt.server)
+	t.Cleanup(ts.Close)
+	resp := patchJSON(t, ts.URL+"/v1/admin/tenant-pool", map[string]any{
+		"public_key":  "public-1",
+		"private_key": "private-1",
+		"pool_size":   1,
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadGateway {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 502 body=%s", resp.StatusCode, body)
+	}
+	if got := rt.prov.deprovisionCalls.Load(); got != 2 {
+		t.Fatalf("deprovision calls = %d, want 2", got)
+	}
+	pool, err := rt.meta.GetTenantPoolByID(ctx, "pool-1")
+	if err != nil {
+		t.Fatalf("get pool: %v", err)
+	}
+	if pool.Size != 2 {
+		t.Fatalf("pool size = %d, want reconciled actual free size 2", pool.Size)
+	}
+	free, err := rt.meta.CountFreeTenantPoolBindings(ctx, "org-1")
+	if err != nil {
+		t.Fatalf("count free: %v", err)
+	}
+	if free != 2 {
+		t.Fatalf("free size = %d, want 2", free)
+	}
+	deleted, err := rt.meta.GetTenant(ctx, "pool-tenant-shrink-3")
+	if err != nil {
+		t.Fatalf("get deleted tenant: %v", err)
+	}
+	if deleted.Status != meta.TenantDeleted {
+		t.Fatalf("newest tenant status = %s, want %s", deleted.Status, meta.TenantDeleted)
+	}
+	reverted, err := rt.meta.GetTenant(ctx, "pool-tenant-shrink-2")
+	if err != nil {
+		t.Fatalf("get reverted tenant: %v", err)
+	}
+	if reverted.Status != meta.TenantActive {
+		t.Fatalf("failed tenant status = %s, want %s", reverted.Status, meta.TenantActive)
 	}
 }
 
