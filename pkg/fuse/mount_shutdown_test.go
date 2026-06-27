@@ -110,6 +110,92 @@ func TestCleanupMountStartFailureForceUnmountsWhenServerUnmountFails(t *testing.
 	}
 }
 
+func TestCleanupNewServerFailureStopsFlushesAndForceUnmountsInitFailure(t *testing.T) {
+	var calls []string
+	var logs strings.Builder
+
+	cleanupNewServerFailure(
+		"/mnt/drive9",
+		errors.New("init: ENODEV"),
+		func() {
+			calls = append(calls, "stop")
+		},
+		func() {
+			calls = append(calls, "flush")
+		},
+		func(mountPoint string) {
+			calls = append(calls, "force:"+mountPoint)
+		},
+		func(format string, args ...any) {
+			logs.WriteString(fmt.Sprintf(format, args...))
+		},
+	)
+
+	want := []string{"stop", "flush", "force:/mnt/drive9"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls = %v, want %v", calls, want)
+		}
+	}
+	gotLogs := logs.String()
+	for _, wantLog := range []string{
+		"drive9: mount startup failed during fuse server initialization failure at /mnt/drive9: init: ENODEV",
+		"drive9: cleanup after fuse server initialization failure: forcing unmount of /mnt/drive9 after partial init failure",
+	} {
+		if !strings.Contains(gotLogs, wantLog) {
+			t.Fatalf("logs = %q, want substring %q", gotLogs, wantLog)
+		}
+	}
+}
+
+func TestCleanupNewServerFailureDoesNotForceUnmountNonInitFailure(t *testing.T) {
+	var calls []string
+
+	cleanupNewServerFailure(
+		"/mnt/drive9",
+		errors.New("fusermount: mountpoint is busy"),
+		func() {
+			calls = append(calls, "stop")
+		},
+		func() {
+			calls = append(calls, "flush")
+		},
+		func(mountPoint string) {
+			calls = append(calls, "force:"+mountPoint)
+		},
+		func(string, ...any) {},
+	)
+
+	want := []string{"stop", "flush"}
+	if len(calls) != len(want) {
+		t.Fatalf("calls = %v, want %v", calls, want)
+	}
+	for i := range want {
+		if calls[i] != want[i] {
+			t.Fatalf("calls = %v, want %v", calls, want)
+		}
+	}
+}
+
+func TestCleanupMountStartFailureSkipsForceUnmountForEmptyMountPoint(t *testing.T) {
+	forced := false
+
+	cleanupMountStartFailure(mountStartCleanup{
+		reason:                    "test",
+		cause:                     errors.New("init: ENODEV"),
+		forceUnmount:              func(string) { forced = true },
+		forceUnmountWithoutServer: true,
+		logf:                      func(string, ...any) {},
+	})
+
+	if forced {
+		t.Fatal("forceUnmount should not be called for an empty mountpoint")
+	}
+}
+
 func TestShouldForceUnmountAfterNewServerErrorOnlyForInitFailure(t *testing.T) {
 	if !shouldForceUnmountAfterNewServerError(errors.New("init: ENODEV")) {
 		t.Fatal("init failure should force cleanup")

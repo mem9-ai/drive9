@@ -445,20 +445,7 @@ func Mount(opts *MountOptions) error {
 	// Create FUSE server
 	server, err := gofuse.NewServer(dat9fs, opts.MountPoint, fuseOpts)
 	if err != nil {
-		layerEventWatcherStop()
-		cleanupMountStartFailure(mountStartCleanup{
-			reason:     "fuse server initialization failure",
-			mountPoint: opts.MountPoint,
-			cause:      err,
-		})
-		if shouldForceUnmountAfterNewServerError(err) {
-			mountPoint := strings.TrimSpace(opts.MountPoint)
-			if mountPoint == "" {
-				mountPoint = "<unknown>"
-			}
-			fmt.Fprintf(os.Stderr, "drive9: cleanup after fuse server initialization failure: forcing unmount of %s after partial init failure\n", mountPoint)
-			forceUnmount(opts.MountPoint)
-		}
+		cleanupNewServerFailure(opts.MountPoint, err, layerEventWatcherStop, dat9fs.FlushAll, forceUnmount, nil)
 		return fmt.Errorf("fuse mount: %w", err)
 	}
 
@@ -483,6 +470,8 @@ func Mount(opts *MountOptions) error {
 	// thread consumes the last GOMAXPROCS slot, leaving no thread to handle
 	// the POLL request from the kernel).
 	if err := server.WaitMount(); err != nil {
+		// NewServer succeeded and Serve is running, so cleanup can drain Drive9-side
+		// workers before asking go-fuse to detach any partially mounted kernel state.
 		cleanupMountStartFailure(mountStartCleanup{
 			reason:       "fuse wait mount failure",
 			mountPoint:   opts.MountPoint,
@@ -699,7 +688,10 @@ type mountStartCleanup struct {
 	flushAll     func()
 	unmount      func() error
 	forceUnmount func(string)
-	logf         func(string, ...any)
+	// forceUnmountWithoutServer is for the go-fuse NewServer post-mount/pre-server
+	// INIT failure path, where no Server exists to call Unmount on.
+	forceUnmountWithoutServer bool
+	logf                      func(string, ...any)
 }
 
 func cleanupMountStartFailure(cleanup mountStartCleanup) {
@@ -730,6 +722,10 @@ func cleanupMountStartFailure(cleanup mountStartCleanup) {
 		cleanup.flushAll()
 	}
 	if cleanup.unmount == nil {
+		if cleanup.forceUnmountWithoutServer && cleanup.forceUnmount != nil && mountPoint != "" {
+			logf("drive9: cleanup after %s: forcing unmount of %s after partial init failure\n", reason, mountPoint)
+			cleanup.forceUnmount(mountPoint)
+		}
 		return
 	}
 	if err := cleanup.unmount(); err != nil {
@@ -746,6 +742,32 @@ func cleanupMountStartFailure(cleanup mountStartCleanup) {
 	}
 }
 
+func cleanupNewServerFailure(
+	mountPoint string,
+	cause error,
+	stopWatchers func(),
+	flushAll func(),
+	forceUnmount func(string),
+	logf func(string, ...any),
+) {
+	cleanupMountStartFailure(mountStartCleanup{
+		reason:                    "fuse server initialization failure",
+		mountPoint:                mountPoint,
+		cause:                     cause,
+		stopWatchers:              stopWatchers,
+		flushAll:                  flushAll,
+		forceUnmount:              forceUnmount,
+		forceUnmountWithoutServer: shouldForceUnmountAfterNewServerError(cause),
+		logf:                      logf,
+	})
+}
+
+// shouldForceUnmountAfterNewServerError targets go-fuse's post-mount INIT
+// failure. In github.com/mornyx/go-fuse/v2, NewServer calls mount(), then
+// handleInit(), and returns fmt.Errorf("init: %s", code) if INIT fails after
+// closing the mount fd. That path has no Server handle for Unmount, so Drive9
+// must detach the mountpoint itself. Re-check this predicate when go-fuse is
+// upgraded or replaced.
 func shouldForceUnmountAfterNewServerError(err error) bool {
 	return err != nil && strings.HasPrefix(err.Error(), "init:")
 }
