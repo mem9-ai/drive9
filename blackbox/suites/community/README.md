@@ -158,13 +158,6 @@ retain their own licenses and notices.
 - **IOR / mdtest**: https://github.com/hpc/ior — GPL-2.0-only
 - **vdbench**: Oracle distribution (manual download, not auto-fetched).
 
-`juicefs.*` modules (under `suites/juicefs/`) are Drive9-owned equivalent
-rewrites inspired by generic filesystem behaviors tested in the JuiceFS project,
-not vendored JuiceFS source code. JuiceFS source: https://github.com/juicedata/juicefs
-(Apache-2.0). If future work ever copies actual JuiceFS test files, that module
-must preserve the original copyright header and license notice and this section
-must be updated.
-
 fio, mdtest/IOR, vdbench, Python xattr bindings, and platform tools may be
 provided by the host environment or installed by CI. Their own distribution
 licenses apply.
