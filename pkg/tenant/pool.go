@@ -666,6 +666,8 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	query := "parseTime=true"
 	if t.DBTLS {
 		query += "&tls=true"
+	} else if t.Provider == ProviderTiDBCloudNative {
+		query += "&tls=skip-verify"
 	}
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
 	openStoreStart := time.Now()

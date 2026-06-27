@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // defaultQuotaOutboxMaxAttempts bounds how long a poisoned quota mutation can
@@ -17,6 +19,7 @@ import (
 // current capped exponential backoff this is roughly tens of minutes, while
 // still allowing normal transient central-store failures to recover.
 const defaultQuotaOutboxMaxAttempts = 100
+const quotaOutboxClaimMaxAttempts = 3
 const quotaAdmissionLockName = "default"
 
 type QuotaOutboxStatus string
@@ -55,6 +58,8 @@ type QuotaOutboxEntry struct {
 // ErrQuotaOutboxLeaseMismatch means a worker tried to ack/retry an outbox row
 // it no longer owns.
 var ErrQuotaOutboxLeaseMismatch = errors.New("quota outbox lease mismatch")
+
+var errQuotaOutboxClaimConflict = errors.New("quota outbox claim conflict")
 
 // EnqueueQuotaOutboxTx inserts a queued quota mutation inside an existing
 // tenant metadata transaction.
@@ -106,6 +111,18 @@ func (s *Store) ClaimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseD
 }
 
 func (s *Store) claimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) ([]QuotaOutboxEntry, error) {
+	for attempt := 0; attempt < quotaOutboxClaimMaxAttempts; attempt++ {
+		entries, err := s.claimQuotaOutboxBatchOnce(ctx, now, leaseDuration, limit)
+		if errors.Is(err, errQuotaOutboxClaimConflict) {
+			continue
+		}
+		return entries, err
+	}
+	metrics.RecordOperation("datastore", "claim_quota_outbox_conflict_exhausted", "conflict", 0)
+	return nil, nil
+}
+
+func (s *Store) claimQuotaOutboxBatchOnce(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) ([]QuotaOutboxEntry, error) {
 	if limit <= 0 {
 		limit = 1
 	}
@@ -183,7 +200,12 @@ func (s *Store) claimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseD
 		return nil, err
 	}
 	if rowsAffected != int64(len(entries)) {
-		return nil, ErrQuotaOutboxLeaseMismatch
+		// Under concurrent SKIP LOCKED claims, TiDB can report that fewer rows
+		// were claimed than the preceding read selected. Treat that as a benign
+		// claim race: rollback this tx and let this worker retry or let another
+		// worker process the rows. Ack/retry paths still use
+		// ErrQuotaOutboxLeaseMismatch for real ownership failures.
+		return nil, errQuotaOutboxClaimConflict
 	}
 
 	for i := range entries {
@@ -242,10 +264,12 @@ func (s *Store) AckQuotaOutboxBatchTx(ctx context.Context, tx *sql.Tx, entries [
 		}
 		ids = append(ids, entries[i].ID)
 	}
-	args := append([]any{QuotaOutboxSucceeded, now, now, QuotaOutboxProcessing, receipt, now}, ids...)
+	// Receipt is the worker ownership token. Recovery clears receipt before
+	// requeueing, so stale owners cannot match after another worker reclaims.
+	args := append([]any{QuotaOutboxSucceeded, now, now, QuotaOutboxProcessing, receipt}, ids...)
 	res, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE quota_outbox SET status = ?, receipt = NULL,
 		leased_at = NULL, lease_until = NULL, completed_at = ?, updated_at = ?
-		WHERE status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?
+		WHERE status = ? AND receipt = ?
 		  AND id IN (%s)`, sqlPlaceholders(len(entries))), args...)
 	if err != nil {
 		return err
@@ -264,8 +288,8 @@ func (s *Store) ackQuotaOutbox(ctx context.Context, db execer, id int64, receipt
 	now := time.Now().UTC()
 	res, err := db.ExecContext(ctx, `UPDATE quota_outbox SET status = ?, receipt = NULL,
 		leased_at = NULL, lease_until = NULL, completed_at = ?, updated_at = ?
-		WHERE id = ? AND status = ? AND receipt = ? AND lease_until IS NOT NULL AND lease_until > ?`,
-		QuotaOutboxSucceeded, now, now, id, QuotaOutboxProcessing, receipt, now)
+		WHERE id = ? AND status = ? AND receipt = ?`,
+		QuotaOutboxSucceeded, now, now, id, QuotaOutboxProcessing, receipt)
 	if err != nil {
 		return err
 	}
@@ -331,7 +355,9 @@ func (s *Store) retryQuotaOutboxTx(ctx context.Context, tx *sql.Tx, id int64, re
 	if err != nil {
 		return err
 	}
-	if entry.Status != QuotaOutboxProcessing || entry.Receipt != receipt || entry.LeaseUntil == nil || !entry.LeaseUntil.After(now) {
+	// Receipt is the worker ownership token. Recovery clears the receipt before
+	// requeueing, so stale owners fail here even when their old lease expired.
+	if entry.Status != QuotaOutboxProcessing || entry.Receipt != receipt {
 		return ErrQuotaOutboxLeaseMismatch
 	}
 
@@ -449,7 +475,7 @@ func (s *Store) HasPendingQuotaOutboxFileMutation(ctx context.Context, fileID st
 	var count int
 	err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox
 		WHERE file_id = ?
-		  AND mutation_type IN ('file_create', 'file_overwrite')
+		  AND mutation_type IN ('file_create', 'file_overwrite', 'upload_complete')
 		  AND status IN (?, ?)`,
 		fileID, QuotaOutboxQueued, QuotaOutboxProcessing).Scan(&count)
 	if err != nil {

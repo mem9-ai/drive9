@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -449,27 +451,33 @@ func Mount(opts *MountOptions) error {
 		return fmt.Errorf("fuse mount: %w", err)
 	}
 
-	// Start SSE watcher for remote change notifications.
-	sseWatcher := StartSSEWatcher(dat9fs, c, actorID)
+	// Start SSE watcher after WaitMount. The initial stream reset invalidates
+	// kernel/user-space caches; if it races go-fuse's WaitMount pollHack open
+	// on Linux, the kernel can reject .go-fuse-epoll-hack with EACCES/EPERM.
+	//
+	// The layer event watcher (started earlier) is deliberately left running:
+	// it does no initial blanket cache invalidation and its first poll only
+	// fires after a 1s tick on real remote events, so it cannot race pollHack.
+	var sseWatcher *SSEWatcher
+	dat9fs.markStatCacheUnverified()
 	stopWatchers := func() {
-		sseWatcher.Stop()
+		if sseWatcher != nil {
+			sseWatcher.Stop()
+		}
 		layerEventWatcherStop()
 	}
 
-	// Start serving in a background goroutine so WaitMount can proceed.
-	// On macOS, Serve() must be running before WaitMount() returns because
-	// mount_macfuse waits for STATFS (handled in the serve loop) before
-	// signalling ready, and WaitMount then runs pollHack which triggers
-	// a LOOKUP+OPEN+POLL through the mount point.
-	go server.Serve()
-
-	// WaitMount blocks until mount_macfuse exits (INIT+STATFS done) and
-	// then runs pollHack, which opens .go-fuse-epoll-hack inside the mount
-	// to trigger _OP_POLL so go-fuse can reply ENOSYS. Without this, macOS
-	// may later send _OP_POLL and deadlock the Go runtime (the netpoller
-	// thread consumes the last GOMAXPROCS slot, leaving no thread to handle
-	// the POLL request from the kernel).
-	if err := server.WaitMount(); err != nil {
+	err = serveWaitMountThenStartWatchers(server.Serve, server.WaitMount, func() {
+		sseWatcher = StartSSEWatcher(dat9fs, c, actorID)
+	}, func(err error) error {
+		ok, probeErr := shouldContinueAfterWaitMountPermissionError(err, opts.MountPoint, probeMountPointReady)
+		if ok {
+			fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission error ignored after readiness probe passed at %s: %v\n", opts.MountPoint, err)
+			return nil
+		}
+		if probeErr != nil {
+			fmt.Fprintf(os.Stderr, "drive9: fuse wait mount permission fallback probe failed at %s: %v\n", opts.MountPoint, probeErr)
+		}
 		// NewServer succeeded and Serve is running, so cleanup can drain Drive9-side
 		// workers before asking go-fuse to detach any partially mounted kernel state.
 		cleanupMountStartFailure(mountStartCleanup{
@@ -482,6 +490,9 @@ func Mount(opts *MountOptions) error {
 			forceUnmount: forceUnmount,
 		})
 		return fmt.Errorf("fuse wait mount: %w", err)
+	})
+	if err != nil {
+		return err
 	}
 	controlServer, err := startMountControlServer(opts.MountPoint, dat9fs)
 	if err != nil {
@@ -770,6 +781,131 @@ func cleanupNewServerFailure(
 // upgraded or replaced.
 func shouldForceUnmountAfterNewServerError(err error) bool {
 	return err != nil && strings.HasPrefix(err.Error(), "init:")
+}
+
+func serveWaitMountThenStartWatchers(
+	serve func(),
+	waitMount func() error,
+	startWatchers func(),
+	handleWaitMountError func(error) error,
+) error {
+	// Serve must be running before WaitMount can proceed. On macOS,
+	// mount_macfuse waits for STATFS before signalling ready, and that STATFS
+	// is handled by the serve loop.
+	//
+	// WaitMount then runs go-fuse's pollHack, which opens
+	// .go-fuse-epoll-hack inside the mountpoint to trigger _OP_POLL so
+	// go-fuse can reply ENOSYS. Without this, macOS may later send _OP_POLL
+	// and deadlock the Go runtime. Start watchers only after this readiness
+	// probe finishes so an initial remote reset cannot invalidate the mount
+	// while go-fuse is still proving readiness.
+	go serve()
+	if err := waitMount(); err != nil {
+		if handleWaitMountError == nil {
+			return err
+		}
+		if err := handleWaitMountError(err); err != nil {
+			return err
+		}
+	}
+	if startWatchers != nil {
+		startWatchers()
+	}
+	return nil
+}
+
+func shouldContinueAfterWaitMountPermissionError(err error, mountPoint string, probe func(string) error) (bool, error) {
+	if err == nil || !isWaitMountPermissionError(err) {
+		return false, nil
+	}
+	if runtime.GOOS != "linux" {
+		return false, nil
+	}
+	if probe == nil {
+		return false, fmt.Errorf("no readiness probe configured")
+	}
+	if probeErr := probe(mountPoint); probeErr != nil {
+		return false, probeErr
+	}
+	return true, nil
+}
+
+func isWaitMountPermissionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.EACCES) {
+		return true
+	}
+	// Some go-fuse WaitMount paths surface the kernel errno as a plain text
+	// error that does not unwrap to a syscall.Errno, so fall back to matching
+	// the canonical EACCES/EPERM strings. Keep this even though errors.Is above
+	// covers the wrapped case.
+	errText := strings.ToLower(err.Error())
+	return strings.Contains(errText, "permission denied") || strings.Contains(errText, "operation not permitted")
+}
+
+// probeMountPointReadyTimeout bounds the readiness probe so a half-broken serve
+// loop cannot hang startup forever on the fallback path.
+const probeMountPointReadyTimeout = 5 * time.Second
+
+// probeMountPointReady confirms the mountpoint is an active, usable mount after
+// a Linux permission-like WaitMount error. The active-mount check prevents the
+// probe from accepting the plain directory that Mount creates before go-fuse
+// mounts over it; once the mount is active, stat/open/readdir are served through
+// go-fuse and a passing probe means the kernel<->serve-loop path works despite
+// WaitMount's pollHack hitting EACCES/EPERM.
+// The stat/open/readdir below can block on a wedged serve loop, so the work runs
+// under a timeout (see probeMountPointReadyTimeout).
+func probeMountPointReady(mountPoint string) error {
+	mountPoint = strings.TrimSpace(mountPoint)
+	if mountPoint == "" {
+		return fmt.Errorf("empty mountpoint")
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- probeMountPointReadyOnce(mountPoint)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(probeMountPointReadyTimeout):
+		return fmt.Errorf("mountpoint readiness probe timed out after %s", probeMountPointReadyTimeout)
+	}
+}
+
+func probeMountPointReadyOnce(mountPoint string) error {
+	return probeMountPointReadyOnceWithMountCheck(mountPoint, activeMountPoint)
+}
+
+func probeMountPointReadyOnceWithMountCheck(mountPoint string, isActiveMountPoint func(string) (bool, error)) error {
+	info, err := os.Stat(mountPoint)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("mountpoint is not a directory")
+	}
+	mounted, err := isActiveMountPoint(mountPoint)
+	if err != nil {
+		return err
+	}
+	if !mounted {
+		return fmt.Errorf("mountpoint is not an active mount")
+	}
+	dir, err := os.Open(mountPoint)
+	if err != nil {
+		return err
+	}
+	var readErr error
+	if _, err := dir.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+		readErr = err
+	}
+	if err := dir.Close(); err != nil {
+		return err
+	}
+	return readErr
 }
 
 func validateMountOptionsProfile(opts *MountOptions) error {

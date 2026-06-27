@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	pathpkg "path"
 	"strconv"
 	"strings"
@@ -744,7 +745,7 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 			logger.Warn(workerCtx, "resume_schema_init_skipped", zap.String("tenant_id", t.ID), zap.Error(err))
 			return
 		}
-		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS)
+		dsn := tenantDSN(t.DBUser, string(plain), t.DBHost, t.DBPort, t.DBName, t.DBTLS, t.Provider)
 		s.initTenantSchemaAsync(workerCtx, t.ID, dsn, t.Provider, s.schemaInitForTenant(t.ID, t.Provider, s.provisioner.InitSchema))
 	})
 }
@@ -823,10 +824,12 @@ func contextWithTrace(parent, traceSource context.Context) context.Context {
 	return traceid.With(parent, traceID)
 }
 
-func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool) string {
+func tenantDSN(user, password, host string, port int, dbName string, tlsEnabled bool, provider string) string {
 	query := "parseTime=true"
 	if tlsEnabled {
 		query += "&tls=true"
+	} else if provider == tenant.ProviderTiDBCloudNative {
+		query += "&tls=skip-verify"
 	}
 	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", user, password, host, port, dbName, query)
 }
@@ -1834,14 +1837,12 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		return
 	}
 	body := http.MaxBytesReader(w, r.Body, s.maxUploadBytes)
-	bodyReadStart := time.Time{}
-	if timingEnabled {
-		bodyReadStart = time.Now()
-	}
+	bodyReadStart := time.Now()
 	data, err := io.ReadAll(body)
-	if timingEnabled {
-		bodyReadDuration = time.Since(bodyReadStart)
-	}
+	bodyReadDuration = time.Since(bodyReadStart)
+	bodyReadMetricBytes := requestBodyReadMetricBytes(cl, len(data))
+	setRequestBodyReadMetric(r.Context(), r.Method, requestRoute(r.URL.Path), bodyReadMetricBytes, bodyReadDuration)
+	logSlowWriteBodyRead(r.Context(), r, requestRoute(r.URL.Path), bodyReadMetricBytes, bodyReadDuration)
 	if err != nil {
 		if timingEnabled {
 			logServerWriteTiming(r.Context(), path, 0, expectedRevision, 0, "body_read_error", bodyReadDuration, backendWriteDuration, responseDuration, time.Since(timingStart), err)
@@ -1940,6 +1941,54 @@ func logServerWriteTiming(ctx context.Context, path string, bytes int, expectedR
 
 func serverDurationMs(d time.Duration) float64 {
 	return float64(d.Microseconds()) / 1000.0
+}
+
+func requestBodyReadMetricBytes(declared int64, observed int) int64 {
+	if declared >= 0 {
+		return declared
+	}
+	return int64(observed)
+}
+
+const slowWriteBodyReadThreshold = 5 * time.Second
+
+func logSlowWriteBodyRead(ctx context.Context, r *http.Request, route string, bytes int64, d time.Duration) {
+	if d < slowWriteBodyReadThreshold {
+		return
+	}
+	fields := eventFields(ctx,
+		"write_body_read_slow",
+		"method", r.Method,
+		"route", route,
+		"bytes", bytes,
+		"duration_ms", serverDurationMs(d),
+		"rate_bucket", bodyReadRateBucket(bytes, d),
+	)
+	if r.RemoteAddr != "" {
+		fields = append(fields, zap.String("remote", r.RemoteAddr))
+	}
+	logger.Warn(ctx, "server_event", fields...)
+}
+
+func bodyReadRateBucket(bytes int64, d time.Duration) string {
+	if bytes <= 0 || d <= 0 {
+		return "unknown"
+	}
+	bytesPerSecond := float64(bytes) / d.Seconds()
+	switch {
+	case bytesPerSecond <= 1<<10:
+		return "le_1KiB_s"
+	case bytesPerSecond <= 10<<10:
+		return "le_10KiB_s"
+	case bytesPerSecond <= 100<<10:
+		return "le_100KiB_s"
+	case bytesPerSecond <= 1<<20:
+		return "le_1MiB_s"
+	case bytesPerSecond <= 10<<20:
+		return "le_10MiB_s"
+	default:
+		return "gt_10MiB_s"
+	}
 }
 
 func (s *Server) handlePatch(w http.ResponseWriter, r *http.Request, path string) {
@@ -4285,13 +4334,20 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encrypt db password", err)
 	}
+	dbtls := true
+	if provider == tenant.ProviderTiDBCloudNative {
+		v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
+		if v == "1" || v == "true" || v == "yes" {
+			dbtls = false
+		}
+	}
 	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
 		DBUser:           cluster.Username,
 		DBPasswordCipher: cipherPass,
 		DBName:           cluster.DBName,
-		DBTLS:            true,
+		DBTLS:            dbtls,
 		Provider:         provider,
 		ClusterID:        cluster.ClusterID,
 		ClaimURL:         cluster.ClaimURL,
@@ -4351,7 +4407,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		APIKeyID:       apiKeyID,
 		Status:         meta.TenantProvisioning,
 		Provider:       provider,
-		TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true),
+		TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, dbtls, provider),
 		CloudProvider:  cloudProvider,
 		Region:         region,
 		OrganizationID: strings.TrimSpace(cluster.OrganizationID),
