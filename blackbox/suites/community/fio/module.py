@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from harness.core import BlackboxError, Context, summarize
-from harness.module_base import BaseModule, module_config
+from harness.module_base import BaseModule
 from suites.community.fio.deps import ensure_fio
 
 
@@ -17,7 +17,7 @@ class CommunityFio(BaseModule):
 
     def run(self, ctx: Context) -> dict[str, Any]:
         fio = ensure_fio(ctx)
-        size = module_config(ctx, self.id).get("size", "128m")
+        size = os.environ.get("FIO_SIZE", "128m")
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_fio", remote)

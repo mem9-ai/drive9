@@ -4,7 +4,7 @@ import os
 from typing import Any
 
 from harness.core import BlackboxError, Context
-from harness.module_base import BaseModule, module_config
+from harness.module_base import BaseModule
 from suites.community.fsx.deps import ensure_fsx
 
 
@@ -19,7 +19,7 @@ class CommunityFSX(BaseModule):
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_fsx", remote)
         try:
-            ops = str(module_config(ctx, self.id).get("ops", 5000))
+            ops = str(os.environ.get("FSX_OPS", "5000"))
             args = [fsx, "-N", ops]
             if "fsx-linux" not in os.path.basename(fsx):
                 args.append(str(handle.mountpoint / "fsx.bin"))

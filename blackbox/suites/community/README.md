@@ -8,7 +8,7 @@ mount, dependency preparation) lives under `blackbox/env`.
 ## Modules
 
 Each subdirectory is one auto-discovered module (`module.py`), optionally with a
-`config.json`, `deps.py`, and data files (e.g. `allowlist.json`).
+`deps.py` and data files.
 
 | Module | Profile | Description |
 |---|---|---|
@@ -121,11 +121,6 @@ next to the cached dependency when a module prepares it.
 
 Linux requirements: `/dev/fuse` and `fusermount3` or `fusermount`.
 
-Some POSIX cases are not expected to behave identically on macOS (permissions,
-ownership, flags, case-sensitivity-adjacent behavior). Modules classify these as
-`SKIP` or `XFAIL` through capability checks or allowlists rather than failing the
-whole run as a Drive9 regression.
-
 ## Adding A Community Module
 
 1. Create `suites/community/<module_name>/` with `__init__.py` and `module.py`.
@@ -135,7 +130,8 @@ whole run as a Drive9 regression.
    inline or via a `deps.py` in the module directory.
 4. Implement `run(ctx)` returning a small metrics/details dict; mount through
    `ctx.target.mount(...)` and always unmount in `finally`.
-5. Optionally add `config.json` for tunables and `*.json` data files.
+5. Implement `run(ctx)` returning a small metrics/details dict; mount through
+   `ctx.target.mount(...)` and always unmount in `finally`.
 6. The module is auto-discovered — no registration step.
 
 Keep module IDs stable; CI reports and dashboards can depend on them.

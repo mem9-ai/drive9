@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from harness.core import BlackboxError, Context, DependencyUnavailable, ModuleSkip
+from harness.core import BlackboxError, Context, DependencyUnavailable
 from harness.module_base import BaseModule
 from suites.community.ltp_fs.deps import DEFAULT_LTP_SYSCALL_SCENARIO, ensure_ltp
 
@@ -15,8 +15,6 @@ class CommunityLTPSyscalls(BaseModule):
     timeout = 600
 
     def ensure_dependencies(self, ctx: Context) -> None:
-        if ctx.capabilities.get("os") != "Linux":
-            raise ModuleSkip("LTP syscall tests are Linux-only", "platform skip")
         ensure_ltp(ctx)
 
     def run(self, ctx: Context) -> dict[str, Any]:

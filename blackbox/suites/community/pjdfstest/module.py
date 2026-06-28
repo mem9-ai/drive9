@@ -1,19 +1,18 @@
 from __future__ import annotations
 
-import fnmatch
 import os
 import re
 import shutil
 import subprocess
 from typing import Any
 
-from harness.core import BlackboxError, Context, ModuleSkip, write_json
-from harness.module_base import BaseModule, module_config, read_text
+from harness.core import BlackboxError, Context, write_json
+from harness.module_base import BaseModule, read_text
 from suites.community.pjdfstest.deps import ensure_pjdfstest
 
 
 class CommunityPjdfstest(BaseModule):
-    description = "Run pjdfstest on a Drive9 FUSE mount and report raw/effective POSIX pass rate."
+    description = "Run pjdfstest on a Drive9 FUSE mount and report POSIX pass rate."
     labels = ("compatibility", "posix", "community")
     timeout = 1800
 
@@ -23,20 +22,13 @@ class CommunityPjdfstest(BaseModule):
 
     def run(self, ctx: Context) -> dict[str, Any]:
         tests_dir, bin_path = ensure_pjdfstest(ctx)
-        cfg = module_config(ctx, self.id)
-        groups = cfg.get("groups", "all")
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_pjdfstest", remote, profile="none", extra=["--allow-other"])
         try:
             work_dir = handle.mountpoint / "work"
             work_dir.mkdir(exist_ok=True)
-            if groups == "all":
-                test_args = [str(tests_dir)]
-            else:
-                test_args = [str(tests_dir / group) for group in groups if (tests_dir / group).exists()]
-                if not test_args:
-                    raise ModuleSkip("no configured pjdfstest groups found")
+            test_args = [str(tests_dir)]
             env = ctx.target.base_env()
             env["PATH"] = f"{bin_path.parent}:{tests_dir.parent}:{env.get('PATH', '')}"
             # pjdfstest exercises privileged operations (chown, chmod, utimens,
@@ -62,34 +54,25 @@ class CommunityPjdfstest(BaseModule):
             combined = read_text(result.stdout) + "\n" + read_text(result.stderr)
             log = ctx.artifact_dir(self.id) / "pjdfstest.log"
             log.write_text(combined, encoding="utf-8")
-            report = self.parse(ctx, combined, str(log), result.code)
+            report = self.parse(combined, str(log), result.code)
             write_json(ctx.result_dir / "pjdfstests.json", report)
             ctx.metric("community.pjdfstest.raw_pass_rate", float(report["raw_pass_rate"]), "ratio")
-            ctx.metric("community.pjdfstest.effective_pass_rate", float(report["effective_pass_rate"]), "ratio")
-            if report["fail_regression_cases"] > 0:
-                raise BlackboxError(f"pjdfstest regressions={report['fail_regression_cases']}; see {log}")
+            if report["failed_cases"] > 0:
+                raise BlackboxError(f"pjdfstest failures={report['failed_cases']}; see {log}")
             return report
         finally:
             ctx.target.unmount(handle)
 
-    def parse(self, ctx: Context, text: str, log_path: str, rc: int) -> dict[str, Any]:
-        allowlist = ctx.config.get("allowlists", {}).get("pjdfstest", {})
+    def parse(self, text: str, log_path: str, rc: int) -> dict[str, Any]:
         files_line = re.search(r"Files=(\d+),\s*Tests=(\d+),", text)
         total_files = int(files_line.group(1)) if files_line else 0
         total_cases = int(files_line.group(2)) if files_line else 0
         failed_file_re = re.compile(r"\S+/tests/(?P<rel>[^ ]+?\.t)\s+\(Wstat:\s*\d+\s+Tests:\s*(?P<tests>\d+)\s+Failed:\s*(?P<failed>\d+)\)")
         failed_files = []
-        xfail_cases = 0
-        fail_regression_cases = 0
         for match in failed_file_re.finditer(text):
             rel = match.group("rel")
             failed = int(match.group("failed"))
-            classification = "XFAIL_KNOWN" if self.known_xfail(ctx, allowlist, rel) else "FAIL_REGRESSION"
-            if classification == "XFAIL_KNOWN":
-                xfail_cases += failed
-            else:
-                fail_regression_cases += failed
-            failed_files.append({"path": rel, "tests": int(match.group("tests")), "failed": failed, "classification": classification})
+            failed_files.append({"path": rel, "tests": int(match.group("tests")), "failed": failed})
         failed_cases = sum(item["failed"] for item in failed_files)
         if total_cases == 0:
             failed_cases = len(re.findall(r"^not ok\s+\d+", text, flags=re.MULTILINE))
@@ -97,9 +80,7 @@ class CommunityPjdfstest(BaseModule):
         if rc != 0 and failed_cases == 0:
             failed_cases = 1
             total_cases = max(total_cases, 1)
-            fail_regression_cases = max(fail_regression_cases, 1)
         passed_cases = max(total_cases - failed_cases, 0)
-        denominator = max(total_cases - xfail_cases, 1)
         return {
             "schema": "drive9-fuse-pjdfstest/v2",
             "rc": rc,
@@ -108,18 +89,6 @@ class CommunityPjdfstest(BaseModule):
             "total_cases": total_cases,
             "passed_cases": passed_cases,
             "failed_cases": failed_cases,
-            "xfail_known_cases": xfail_cases,
-            "fail_regression_cases": fail_regression_cases,
             "raw_pass_rate": (passed_cases / total_cases) if total_cases else 0.0,
-            "effective_pass_rate": (passed_cases / denominator) if denominator else 0.0,
             "failed_files": failed_files,
         }
-
-    def known_xfail(self, ctx: Context, allowlist: dict[str, Any], rel: str) -> bool:
-        group = rel.split("/", 1)[0]
-        groups = set(allowlist.get("known_xfail_groups", []))
-        if ctx.capabilities.get("os") == "Darwin":
-            groups.update(allowlist.get("darwin_known_xfail_groups", []))
-        if group in groups:
-            return True
-        return any(fnmatch.fnmatch(rel, pattern) for pattern in allowlist.get("known_xfail_paths", []))

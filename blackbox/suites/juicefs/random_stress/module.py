@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 import threading
 from typing import Any
 
 from harness.core import BlackboxError, Context
-from harness.module_base import BaseModule, module_config
+from harness.module_base import BaseModule
 
 
 class JuiceFSRandomStress(BaseModule):
@@ -13,9 +14,8 @@ class JuiceFSRandomStress(BaseModule):
     timeout = 1200
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        cfg = module_config(ctx, self.id)
-        workers = int(cfg.get("workers", 4))
-        files = int(cfg.get("files_per_worker", 64))
+        workers = int(os.environ.get("RANDOM_STRESS_WORKERS", "4"))
+        files = int(os.environ.get("RANDOM_STRESS_FILES", "64"))
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("juicefs_random_stress", remote, durability="interactive")

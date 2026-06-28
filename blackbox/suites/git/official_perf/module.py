@@ -4,7 +4,7 @@ import os
 from typing import Any
 
 from harness.core import Context, DependencyUnavailable, summarize
-from harness.module_base import BaseModule, module_config, timeit
+from harness.module_base import BaseModule, timeit
 from suites.git._deps import ensure_git_source
 
 
@@ -13,13 +13,15 @@ class GitOfficialPerf(BaseModule):
     labels = ("performance", "git", "community")
     timeout = 7200
 
+    tests = ("p0001-rev-list.sh", "p0002-read-cache.sh")
+
     def run(self, ctx: Context) -> dict[str, Any]:
         ctx.deps.ensure_git_tool()
         source = ensure_git_source(ctx)
         perf_run = source / "t" / "perf" / "run"
         if not perf_run.exists():
             raise DependencyUnavailable("Git t/perf runner not found")
-        tests = module_config(ctx, self.id).get("tests", ["p0001-rev-list.sh"])
+        tests = list(self.tests)
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("git_official_perf", remote, durability="interactive")

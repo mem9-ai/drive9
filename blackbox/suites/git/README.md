@@ -7,32 +7,19 @@ compatible backend for real-world git workloads.
 
 ## Modules
 
-Each subdirectory is one auto-discovered module (`module.py`) with a `config.json`
-listing the test scripts to run and a `deps.py` that prepares the git source tree.
+Each subdirectory is one auto-discovered module (`module.py`) with a `deps.py`
+that prepares the git source tree. The test scripts to run are declared as class
+attributes on the module class (`tests` tuple).
 
 | Module | Category | Description |
 |---|---|---|
 | `git.official.functional` | functional | Runs selected `t/tNNNN-*.sh` functional tests via `prove`. Trash directories are placed on the FUSE mount. |
 | `git.official.perf` | performance | Runs selected `t/perf/pNNNN-*.sh` performance tests via `t/perf/run`. Scratch data is placed on the FUSE mount. |
 
-## Config
+## Test Scripts
 
-`config.json` contains a `tests` array listing the upstream test scripts to run.
-
-**`official_functional/config.json`** (functional):
-```
-t0000-basic.sh, t0001-init.sh, t1300-config.sh, t1400-update-ref.sh,
-t1450-fsck.sh, t1500-rev-parse.sh, t2020-checkout-detach.sh, t3700-add.sh,
-t3903-stash.sh, t4013-diff-various.sh, t5601-clone.sh,
-t7500-commit-template-squash-signoff.sh
-```
-
-**`official_perf/config.json`** (performance):
-```
-p0001-rev-list.sh, p0002-read-cache.sh
-```
-
-Edit the `tests` array to widen or narrow coverage.
+The `tests` class attribute on each module lists the upstream test scripts to run.
+Edit the tuple in `module.py` to widen or narrow coverage.
 
 ## Selection
 

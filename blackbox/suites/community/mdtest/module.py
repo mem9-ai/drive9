@@ -4,7 +4,7 @@ import os
 from typing import Any
 
 from harness.core import BlackboxError, Context
-from harness.module_base import BaseModule, module_config
+from harness.module_base import BaseModule
 from suites.community.mdtest.deps import ensure_mdtest
 
 
@@ -19,7 +19,7 @@ class CommunityMdtest(BaseModule):
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("community_mdtest", remote, profile="none")
         try:
-            files = str(module_config(ctx, self.id).get("files", 1000))
+            files = str(os.environ.get("MDTEST_FILES", "1000"))
             result = ctx.target.run_cmd("community-mdtest", [mdtest, "-d", str(handle.mountpoint / "mdtest"), "-n", files, "-u", "-L", "-F"], timeout=int(os.environ.get("MDTEST_TIMEOUT_S", str(self.timeout))))
             if not result.ok:
                 raise BlackboxError(f"mdtest failed; see {result.stderr}")

@@ -4,7 +4,7 @@ import os
 from typing import Any
 
 from harness.core import BlackboxError, Context, ModuleSkip
-from harness.module_base import BaseModule, module_config
+from harness.module_base import BaseModule
 from suites.git._deps import ensure_git_source
 
 
@@ -13,14 +13,26 @@ class GitOfficialFunctional(BaseModule):
     labels = ("compatibility", "git", "community")
     timeout = 7200
 
+    tests = (
+        "t0000-basic.sh",
+        "t0001-init.sh",
+        "t1300-config.sh",
+        "t1400-update-ref.sh",
+        "t1450-fsck.sh",
+        "t1500-rev-parse.sh",
+        "t2020-checkout-detach.sh",
+        "t3700-add.sh",
+        "t3903-stash.sh",
+        "t4013-diff-various.sh",
+        "t5601-clone.sh",
+        "t7500-commit-template-squash-signoff.sh",
+    )
+
     def run(self, ctx: Context) -> dict[str, Any]:
         ctx.deps.ensure_prove()
         ctx.deps.ensure_git_tool()
         source = ensure_git_source(ctx)
-        cfg = module_config(ctx, self.id)
-        tests = cfg.get("tests", [])
-        if not tests:
-            raise ModuleSkip("no Git functional tests configured")
+        tests = list(self.tests)
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("git_official_functional", remote, durability="write-sync")

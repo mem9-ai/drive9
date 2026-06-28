@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
 import random
 from pathlib import Path
 from typing import Any
 
 from harness.core import BlackboxError, Context, ensure_empty, sha256_file, stable_bytes
-from harness.module_base import BaseModule, module_config
+from harness.module_base import BaseModule
 
 
 class JuiceFSFsrand(BaseModule):
@@ -14,15 +15,15 @@ class JuiceFSFsrand(BaseModule):
     timeout = 1200
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        cfg = module_config(ctx, self.id)
-        ops = int(cfg.get("ops", 1000))
+        ops = int(os.environ.get("FSRAND_OPS", "1000"))
+        seed = int(os.environ.get("FSRAND_SEED", "9"))
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("juicefs_fsrand", remote, durability="write-sync")
         oracle = ctx.tmp_dir / "oracle" / self.id
         ensure_empty(oracle)
         try:
-            rng = random.Random(int(cfg.get("seed", 9)))
+            rng = random.Random(seed)
             for idx in range(ops):
                 self.random_op(rng, oracle, handle.mountpoint, idx)
                 if idx % 25 == 0:

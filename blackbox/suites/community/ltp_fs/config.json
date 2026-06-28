@@ -1,6 +1,0 @@
-{
-  "compat": {
-    "linux": "run",
-    "darwin": "skip"
-  }
-}

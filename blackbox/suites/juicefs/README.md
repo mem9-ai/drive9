@@ -9,8 +9,7 @@ stress, recursive remove).
 
 ## Modules
 
-Each subdirectory is one auto-discovered module (`module.py`), optionally with a
-`config.json` for tunables.
+Each subdirectory is one auto-discovered module (`module.py`).
 
 | Module | Category | Description |
 |---|---|---|
@@ -19,17 +18,6 @@ Each subdirectory is one auto-discovered module (`module.py`), optionally with a
 | `juicefs.random_rw` | io | Random write/read verification: writes N blocks of fixed size, then reads them back and verifies content integrity. |
 | `juicefs.random_stress` | stress | Concurrent create/read/rename/remove stress with configurable worker count and files-per-worker. |
 | `juicefs.rmr` | metadata | Recursive remove workload: creates a nested directory tree, then removes it recursively and verifies the root is gone. |
-
-## Config
-
-| Module | Config key | Default | Description |
-|---|---|---|---|
-| `juicefs.fsrand` | `seed` | `9` | RNG seed for deterministic op sequence. |
-| `juicefs.fsrand` | `ops` | `1000` | Number of random filesystem operations. |
-| `juicefs.random_rw` | `size_bytes` | `4194304` (4 MiB) | Block size for each write. |
-| `juicefs.random_rw` | `ops` | `1024` | Number of write/read cycles. |
-| `juicefs.random_stress` | `workers` | `4` | Concurrent worker threads. |
-| `juicefs.random_stress` | `files_per_worker` | `64` | Files each worker creates. |
 
 ## Selection
 

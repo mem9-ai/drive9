@@ -5,7 +5,7 @@ import random
 from typing import Any
 
 from harness.core import BlackboxError, Context, stable_bytes
-from harness.module_base import BaseModule, module_config
+from harness.module_base import BaseModule
 
 
 class JuiceFSRandomRW(BaseModule):
@@ -14,9 +14,8 @@ class JuiceFSRandomRW(BaseModule):
     timeout = 900
 
     def run(self, ctx: Context) -> dict[str, Any]:
-        cfg = module_config(ctx, self.id)
-        size = int(cfg.get("size_bytes", 4 * 1024 * 1024))
-        ops = int(cfg.get("ops", 1024))
+        size = int(os.environ.get("RANDOM_RW_SIZE_BYTES", str(4 * 1024 * 1024)))
+        ops = int(os.environ.get("RANDOM_RW_OPS", "1024"))
         remote = ctx.target.remote_root(self.id)
         ctx.target.mkdir_remote(remote)
         handle = ctx.target.mount("juicefs_random_rw", remote, durability="write-sync")

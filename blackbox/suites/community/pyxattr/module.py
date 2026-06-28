@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from harness.core import BlackboxError, Context, ModuleSkip, ModuleXFail
+from harness.core import BlackboxError, Context, ModuleSkip
 from harness.module_base import BaseModule
 from suites.community.pyxattr.deps import ensure_pyxattr
 
@@ -36,8 +36,6 @@ class CommunityPyxattr(BaseModule):
             )
             result = ctx.target.run_cmd("community-pyxattr", ["python3", "-c", script, str(p)], timeout=self.timeout)
             if not result.ok:
-                if ctx.capabilities.get("os") == "Darwin":
-                    raise ModuleXFail(f"xattr check failed on macFUSE; see {result.stderr}", "known platform incompatibility")
                 raise BlackboxError(f"xattr check failed; see {result.stderr}")
             return {"file": str(p)}
         finally:
