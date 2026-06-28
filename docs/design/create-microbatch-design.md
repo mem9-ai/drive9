@@ -169,6 +169,15 @@ The pending quota outbox deltas are loaded once at the start of the batch
 transaction. Successful jobs then update in-memory batch deltas. This avoids
 double-counting rows that were inserted earlier in the same transaction.
 
+With `DRIVE9_CREATE_BATCH_CONCURRENCY > 1`, concurrently flushing batches do not
+see each other's uncommitted in-transaction deltas. This is the same soft
+small-write admission model already used across multiple server pods: within
+the quota usage and pending-delta cache TTL, the system may briefly over-admit
+by roughly the in-flight batch concurrency window. Successful writes still
+durably enqueue quota outbox mutations and reconcile through accounting. Strict
+quota enforcement remains on the upload reservation path, which uses live
+counters under the tenant-wide admission lock.
+
 When a job commits and enqueues a quota outbox mutation, the existing local
 pending-delta cache is adjusted after the transaction commits, just like the
 non-batched path.

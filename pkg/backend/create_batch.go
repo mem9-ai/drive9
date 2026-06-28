@@ -149,7 +149,7 @@ func (c *createBatcher) create(ctx context.Context, path string, data []byte, ta
 	default:
 	}
 	if !queued {
-		c.dispatchFlush([]*createBatchJob{job})
+		c.dispatchFlushAsync([]*createBatchJob{job})
 	}
 	c.mu.Unlock()
 	res := <-job.result
@@ -223,6 +223,19 @@ func (c *createBatcher) dispatchFlush(batch []*createBatchJob) {
 	batch = append([]*createBatchJob(nil), batch...)
 	c.flushWG.Add(1)
 	c.flushSem <- struct{}{}
+	c.startFlush(batch)
+}
+
+func (c *createBatcher) dispatchFlushAsync(batch []*createBatchJob) {
+	batch = append([]*createBatchJob(nil), batch...)
+	c.flushWG.Add(1)
+	go func() {
+		c.flushSem <- struct{}{}
+		c.startFlush(batch)
+	}()
+}
+
+func (c *createBatcher) startFlush(batch []*createBatchJob) {
 	inFlight := c.inFlight.Add(1)
 	metrics.RecordTenantGauge(c.backend.tenantID, "create_batch", "in_flight", float64(inFlight))
 	go func() {
