@@ -4008,11 +4008,15 @@ func newProvisionTenantError(status int, message string, err error) *provisionTe
 	return &provisionTenantError{status: status, message: message, err: err}
 }
 
+func durationMillis(started time.Time) float64 {
+	return float64(time.Since(started).Microseconds()) / 1000
+}
+
 func logProvisionStage(ctx context.Context, event, tenantID, provider string, started time.Time, kv ...any) {
 	fields := []any{
 		"tenant_id", tenantID,
 		"provider", provider,
-		"duration_ms", float64(time.Since(started).Microseconds()) / 1000,
+		"duration_ms", durationMillis(started),
 	}
 	fields = append(fields, kv...)
 	logger.Info(ctx, "server_event", eventFields(ctx, event, fields...)...)
@@ -4396,7 +4400,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	}
 	logProvisionStage(ctx, "provision_api_key_issued", tenantID, provider, stageStarted, "api_key_id", apiKeyID)
 
-	logger.Info(ctx, "server_event", eventFields(ctx, "provision_accepted", "tenant_id", tenantID, "provider", provider, "duration_ms", float64(time.Since(provisionStarted).Microseconds())/1000)...)
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_accepted", "tenant_id", tenantID, "provider", provider, "duration_ms", durationMillis(provisionStarted))...)
 	metricEvent(ctx, "tenant_provision", "provider", provider, "result", "accepted")
 
 	cloudProvider, region := "", ""
