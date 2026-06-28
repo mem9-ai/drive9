@@ -119,6 +119,7 @@ type Dat9Backend struct {
 	quotaOutboxNotify chan struct{}
 	quotaOutboxWG     sync.WaitGroup
 	quotaOutboxStop   context.CancelFunc
+	claimQuotaOutbox  quotaOutboxBatchClaimer
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
 

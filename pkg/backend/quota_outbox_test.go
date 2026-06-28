@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,6 +107,49 @@ func TestServerQuotaOutboxBatchProcessesDifferentFiles(t *testing.T) {
 	}
 	if usage.StorageBytes != int64(len("aaaa")+len("bb")) || usage.FileCount != 2 || usage.MediaFileCount != 1 {
 		t.Fatalf("central usage after batch = %+v", usage)
+	}
+}
+
+func TestQuotaOutboxBatchConflictExhaustedRecordsTenantMetrics(t *testing.T) {
+	b, _ := newCentralQuotaBackend(t)
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	var called int
+	b.claimQuotaOutbox = func(claimCtx context.Context, now time.Time, lease time.Duration, limit int) (datastore.QuotaOutboxBatchClaimResult, error) {
+		called++
+		if claimCtx != ctx {
+			t.Fatal("claim context was not passed through")
+		}
+		if now.IsZero() {
+			t.Fatal("claim time is zero")
+		}
+		if lease != quotaOutboxLeaseDuration {
+			t.Fatalf("claim lease = %s, want %s", lease, quotaOutboxLeaseDuration)
+		}
+		if limit != 7 {
+			t.Fatalf("claim limit = %d, want 7", limit)
+		}
+		return datastore.QuotaOutboxBatchClaimResult{ConflictExhausted: true}, nil
+	}
+
+	processed, err := b.ProcessQuotaOutboxBatch(ctx, 7)
+	if err != nil {
+		t.Fatalf("process quota outbox batch: %v", err)
+	}
+	if processed != 0 {
+		t.Fatalf("processed = %d, want 0", processed)
+	}
+	if called != 1 {
+		t.Fatalf("claim calls = %d, want 1", called)
+	}
+
+	metricsText := readBackendMetrics()
+	if !strings.Contains(metricsText, `drive9_service_operations_total{component="quota_outbox",operation="claim",result="conflict",tenant_id="tenant-a"}`) {
+		t.Fatalf("metrics missing tenant-scoped claim conflict counter: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, `drive9_service_operations_total{component="quota_outbox",operation="claim_conflict_exhausted",result="conflict",tenant_id="tenant-a"}`) {
+		t.Fatalf("metrics missing tenant-scoped claim_conflict_exhausted counter: %s", metricsText)
 	}
 }
 

@@ -553,32 +553,37 @@ func TestTenantPoolErrorResultClassifiesExpectedDatabaseErrors(t *testing.T) {
 	tests := []struct {
 		name string
 		err  error
-		want string
+		want tenantPoolResult
 	}{
 		{
 			name: "tidb auth failed",
+			err:  fmt.Errorf("open db: %w", &mysql.MySQLError{Number: 1045, Message: "Access denied for user"}),
+			want: tenantPoolResultAuthFailed,
+		},
+		{
+			name: "tidb auth failed legacy message",
 			err:  fmt.Errorf("open db: Error 1045 (28000): Please check your user name and password and try again"),
-			want: "auth_failed",
+			want: tenantPoolResultAuthFailed,
 		},
 		{
 			name: "tidb usage quota exhausted",
-			err:  fmt.Errorf("open db: Error 1105 (HY000): Due to the usage quota being exhausted, access to the cluster has been restricted"),
-			want: "usage_quota_exhausted",
+			err:  fmt.Errorf("open db: %w", &mysql.MySQLError{Number: 1105, Message: "Due to the usage quota being exhausted, access to the cluster has been restricted"}),
+			want: tenantPoolResultUsageQuotaExhausted,
 		},
 		{
 			name: "tidb usage quota exhausted lowercase",
 			err:  fmt.Errorf("open db: error 1105 (hy000): due to the usage quota being exhausted"),
-			want: "usage_quota_exhausted",
+			want: tenantPoolResultUsageQuotaExhausted,
 		},
 		{
 			name: "not found",
 			err:  meta.ErrNotFound,
-			want: "not_found",
+			want: tenantPoolResultNotFound,
 		},
 		{
 			name: "unexpected",
 			err:  fmt.Errorf("open db: invalid connection"),
-			want: "error",
+			want: tenantPoolResultError,
 		},
 	}
 	for _, tt := range tests {

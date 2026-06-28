@@ -32,6 +32,8 @@ const (
 	quotaMutationTypeUploadComplete     = "upload_complete"
 )
 
+type quotaOutboxBatchClaimer func(context.Context, time.Time, time.Duration, int) (datastore.QuotaOutboxBatchClaimResult, error)
+
 func (b *Dat9Backend) startQuotaOutboxWorker() {
 	if b.quotaOutboxNotify != nil {
 		return
@@ -228,13 +230,20 @@ func (b *Dat9Backend) ProcessOneQuotaOutbox(ctx context.Context) (processed bool
 // converge in one tenant admission-lock window.
 func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (processed int, err error) {
 	start := time.Now()
-	if b.store == nil || b.metaStore == nil || b.tenantID == "" {
+	if b.metaStore == nil || b.tenantID == "" {
 		return 0, nil
 	}
 	if limit <= 0 {
 		limit = 1
 	}
-	claim, err := b.store.ClaimQuotaOutboxBatchResult(ctx, time.Now().UTC(), quotaOutboxLeaseDuration, limit)
+	claimQuotaOutbox := b.claimQuotaOutbox
+	if claimQuotaOutbox == nil {
+		if b.store == nil {
+			return 0, nil
+		}
+		claimQuotaOutbox = b.store.ClaimQuotaOutboxBatchResult
+	}
+	claim, err := claimQuotaOutbox(ctx, time.Now().UTC(), quotaOutboxLeaseDuration, limit)
 	if err != nil {
 		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "claim", "error", time.Since(start))
 		return 0, err
