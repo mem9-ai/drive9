@@ -124,6 +124,7 @@ func RecordTenantOperation(tenantID, component, operation, result string, d time
 // ResultForError returns a stable metric result label for common infrastructure
 // errors. Callers should use this when recording generic worker/DB failures so
 // transient bad connections do not get bucketed with semantic operation errors.
+// Keep mysqlutil.dbResult delegated here so DB and worker labels stay aligned.
 func ResultForError(err error) string {
 	switch {
 	case err == nil:

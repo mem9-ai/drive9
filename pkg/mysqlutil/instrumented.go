@@ -268,6 +268,8 @@ func observeDBOperation(ctx context.Context, role, operation string, start time.
 }
 
 func dbResult(err error) string {
+	// Delegate to metrics.ResultForError so DB operation labels match worker
+	// labels, especially for transient bad connections.
 	return metrics.ResultForError(err)
 }
 
