@@ -141,6 +141,7 @@ type Dat9Backend struct {
 
 	fileGCWorker     *FileGCWorker
 	runtimeMetricsID uint64
+	createBatcher    *createBatcher
 
 	// semanticTaskNotifier, when set, runs after a write or upload commit that
 	// enqueued at least one durable semantic task, so the semantic worker can
@@ -699,7 +700,10 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		if timingEnabled {
 			implementationStart = time.Now()
 		}
-		n, err := b.createAndWriteCtx(ctx, path, data, tags, description)
+		n, err, batched := b.tryCreateAndWriteBatchedCtx(ctx, path, data, tags, description)
+		if !batched {
+			n, err = b.createAndWriteCtx(ctx, path, data, tags, description)
+		}
 		if timingEnabled {
 			implementationDuration = time.Since(implementationStart)
 		}
@@ -735,7 +739,10 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		if timingEnabled {
 			implementationStart = time.Now()
 		}
-		n, err := b.createAndWriteCtx(ctx, path, data, tags, description)
+		n, err, batched := b.tryCreateAndWriteBatchedCtx(ctx, path, data, tags, description)
+		if !batched {
+			n, err = b.createAndWriteCtx(ctx, path, data, tags, description)
+		}
 		if timingEnabled {
 			implementationDuration = time.Since(implementationStart)
 		}

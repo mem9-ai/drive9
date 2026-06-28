@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	defaultImageExtractMaxSize   = int64(8 << 20) // 8 MiB
-	defaultImageExtractTimeout   = 20 * time.Second
+	defaultImageExtractMaxSize = int64(8 << 20) // 8 MiB
+	defaultImageExtractTimeout = 20 * time.Second
 	// DefaultImageExtractMaxTextBytes is the default stored semantic text cap
 	// for image extraction. The image writeback path also enforces an
 	// estimated-token cap before this byte cap is applied.
@@ -98,6 +98,17 @@ type Options struct {
 	// TextExtractMaxBytes overrides the synchronous text extraction cap. When
 	// 0, DefaultTextExtractMaxBytes is used. Independent of InlineThreshold.
 	TextExtractMaxBytes int64
+	// CreateBatch controls optional micro-batching for create-if-absent small
+	// file writes. The zero value disables batching and preserves the current
+	// one-create-one-transaction behavior.
+	CreateBatch CreateBatchOptions
+}
+
+// CreateBatchOptions controls micro-batching for DB-inline create-if-absent
+// writes. Batching is enabled only when MaxEntries > 1.
+type CreateBatchOptions struct {
+	MaxEntries int
+	Linger     time.Duration
 }
 
 // LLMCostBudgetOptions configures the monthly LLM cost budget.
@@ -222,6 +233,9 @@ func (b *Dat9Backend) configureOptions(opts Options) {
 	} else {
 		b.textExtractMaxBytes = DefaultTextExtractMaxBytes
 	}
+	if opts.CreateBatch.MaxEntries > 1 && b.quotaSource == QuotaSourceServer {
+		b.createBatcher = newCreateBatcher(b, opts.CreateBatch)
+	}
 
 	cb := opts.LLMCostBudget
 	switch {
@@ -308,6 +322,10 @@ func (b *Dat9Backend) Close() {
 	if b.audioExtractEnabled {
 		globalBackendRuntimeMetrics.deactivateAudio(b.runtimeMetricsID)
 		b.audioExtractEnabled = false
+	}
+	if b.createBatcher != nil {
+		b.createBatcher.stop()
+		b.createBatcher = nil
 	}
 	b.stopMutationWorker()
 	b.stopQuotaOutboxWorker()

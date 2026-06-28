@@ -372,6 +372,8 @@ environment:
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_USAGE_CACHE_TTL soft small-write central usage cache TTL, e.g. 250ms or 1s
   DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write tenant pending-outbox aggregate cache TTL, e.g. 250ms or 1s
+  DRIVE9_CREATE_BATCH_MAX max server-quota DB-inline create-if-absent writes per tenant transaction (default: 1/off)
+  DRIVE9_CREATE_BATCH_LINGER_MS max wait before flushing a non-full create batch in milliseconds (default: 1 when enabled)
 
   S3 storage:
   Set DRIVE9_S3_BUCKET to enable AWS S3 mode.
@@ -635,6 +637,13 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	opts.TextExtractMaxBytes = envInt64("DRIVE9_TEXT_EXTRACT_MAX_BYTES", backend.DefaultTextExtractMaxBytes)
 	if opts.TextExtractMaxBytes <= 0 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_TEXT_EXTRACT_MAX_BYTES must be a positive integer")
+	}
+	opts.CreateBatch = backend.CreateBatchOptions{
+		MaxEntries: envInt("DRIVE9_CREATE_BATCH_MAX", 1),
+		Linger:     time.Duration(envInt("DRIVE9_CREATE_BATCH_LINGER_MS", 0)) * time.Millisecond,
+	}
+	if opts.CreateBatch.MaxEntries < 1 {
+		return backend.Options{}, fmt.Errorf("DRIVE9_CREATE_BATCH_MAX must be a positive integer")
 	}
 
 	// Quota enforcement source: "tenant" (default) or "server" (central server DB).

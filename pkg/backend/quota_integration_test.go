@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -148,6 +149,168 @@ func TestCreateIfAbsentExistingPathReturnsConflictBeforeFileSizeQuota(t *testing
 
 	if _, _, err := b.WriteCtxIfRevisionWithTagsResult(ctx, "/size-exists.txt", []byte("12345"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, 0, nil, ""); !errors.Is(err, datastore.ErrRevisionConflict) {
 		t.Fatalf("duplicate create-if-absent error = %v, want ErrRevisionConflict", err)
+	}
+}
+
+func TestCreateBatchConcurrentCreatesCommit(t *testing.T) {
+	b, _ := newServerQuotaBackend(t, Options{
+		CreateBatch: CreateBatchOptions{
+			MaxEntries: 4,
+			Linger:     50 * time.Millisecond,
+		},
+	})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	const files = 12
+	start := make(chan struct{})
+	errs := make(chan error, files)
+	for i := 0; i < files; i++ {
+		i := i
+		go func() {
+			<-start
+			path := fmt.Sprintf("/batch/file-%02d.txt", i)
+			data := []byte(fmt.Sprintf("payload-%02d", i))
+			n, rev, err := b.WriteCtxIfRevisionWithTagsResult(ctx, path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, 0, nil, "")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if n != int64(len(data)) || rev != 1 {
+				errs <- fmt.Errorf("%s write n=%d rev=%d, want n=%d rev=1", path, n, rev, len(data))
+				return
+			}
+			errs <- nil
+		}()
+	}
+	close(start)
+	for i := 0; i < files; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("batched create %d failed: %v", i, err)
+		}
+	}
+	for i := 0; i < files; i++ {
+		path := fmt.Sprintf("/batch/file-%02d.txt", i)
+		info, err := b.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %s: %v", path, err)
+		}
+		if info.Size != int64(len(fmt.Sprintf("payload-%02d", i))) {
+			t.Fatalf("stat %s size = %d", path, info.Size)
+		}
+	}
+	var outboxRows int
+	if err := b.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox WHERE mutation_type = 'file_create'`).Scan(&outboxRows); err != nil {
+		t.Fatalf("count quota outbox: %v", err)
+	}
+	if outboxRows != files {
+		t.Fatalf("quota outbox rows = %d, want %d", outboxRows, files)
+	}
+}
+
+func TestCreateBatchDuplicatePathDoesNotAbortBatch(t *testing.T) {
+	b, _ := newServerQuotaBackend(t, Options{
+		CreateBatch: CreateBatchOptions{
+			MaxEntries: 3,
+			Linger:     50 * time.Millisecond,
+		},
+	})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	start := make(chan struct{})
+	type result struct {
+		path string
+		err  error
+	}
+	results := make(chan result, 3)
+	paths := []string{"/batch-dupe/same.txt", "/batch-dupe/same.txt", "/batch-dupe/other.txt"}
+	for _, path := range paths {
+		path := path
+		go func() {
+			<-start
+			_, _, err := b.WriteCtxIfRevisionWithTagsResult(ctx, path, []byte(path), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, 0, nil, "")
+			results <- result{path: path, err: err}
+		}()
+	}
+	close(start)
+
+	successSame := 0
+	conflictSame := 0
+	otherOK := false
+	for i := 0; i < len(paths); i++ {
+		res := <-results
+		switch res.path {
+		case "/batch-dupe/same.txt":
+			if res.err == nil {
+				successSame++
+			} else if errors.Is(res.err, datastore.ErrRevisionConflict) {
+				conflictSame++
+			} else {
+				t.Fatalf("same path error = %v, want nil or ErrRevisionConflict", res.err)
+			}
+		case "/batch-dupe/other.txt":
+			if res.err != nil {
+				t.Fatalf("other path error = %v, want nil", res.err)
+			}
+			otherOK = true
+		}
+	}
+	if successSame != 1 || conflictSame != 1 || !otherOK {
+		t.Fatalf("successSame=%d conflictSame=%d otherOK=%v, want 1/1/true", successSame, conflictSame, otherOK)
+	}
+	if _, err := b.Stat("/batch-dupe/other.txt"); err != nil {
+		t.Fatalf("other path should commit despite duplicate in same batch: %v", err)
+	}
+}
+
+func TestCreateBatchAppliesCumulativeStorageQuota(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{
+		CreateBatch: CreateBatchOptions{
+			MaxEntries: 3,
+			Linger:     50 * time.Millisecond,
+		},
+	})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+	fake.mu.Lock()
+	fake.config["tenant-a"].MaxStorageBytes = 8
+	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(ctx)
+
+	start := make(chan struct{})
+	errs := make(chan error, 3)
+	for i := 0; i < 3; i++ {
+		i := i
+		go func() {
+			<-start
+			_, _, err := b.WriteCtxIfRevisionWithTagsResult(ctx, fmt.Sprintf("/batch-quota/file-%d.txt", i), []byte("1234"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, 0, nil, "")
+			errs <- err
+		}()
+	}
+	close(start)
+
+	okCount := 0
+	exceededCount := 0
+	for i := 0; i < 3; i++ {
+		err := <-errs
+		if err == nil {
+			okCount++
+		} else if errors.Is(err, ErrStorageQuotaExceeded) {
+			exceededCount++
+		} else {
+			t.Fatalf("create error = %v, want nil or ErrStorageQuotaExceeded", err)
+		}
+	}
+	if okCount != 2 || exceededCount != 1 {
+		t.Fatalf("ok=%d exceeded=%d, want 2/1", okCount, exceededCount)
+	}
+	var outboxRows int
+	if err := b.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox WHERE mutation_type = 'file_create'`).Scan(&outboxRows); err != nil {
+		t.Fatalf("count quota outbox: %v", err)
+	}
+	if outboxRows != 2 {
+		t.Fatalf("quota outbox rows = %d, want 2", outboxRows)
 	}
 }
 
