@@ -688,6 +688,13 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 
 	if isCreateIfAbsentWrite(offset, flags, expectedRevision) {
 		operation = "create"
+		exists, err := b.store.NodeExists(ctx, path)
+		if err != nil {
+			return 0, 0, err
+		}
+		if exists {
+			return 0, 0, datastore.ErrRevisionConflict
+		}
 		implementationStart := time.Time{}
 		if timingEnabled {
 			implementationStart = time.Now()

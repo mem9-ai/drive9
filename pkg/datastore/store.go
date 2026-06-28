@@ -278,6 +278,25 @@ func (s *Store) GetNode(ctx context.Context, path string) (*FileNode, error) {
 	return n, err
 }
 
+// NodeExists reports whether any dentry occupies path without loading file
+// metadata. It is used by create-if-absent paths that only need conflict
+// precedence before doing heavier quota/storage work.
+func (s *Store) NodeExists(ctx context.Context, path string) (exists bool, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "node_exists", start, &err)
+
+	var one int
+	err = s.db.QueryRowContext(ctx, `SELECT 1 FROM file_nodes WHERE path_hash = ? AND path = ? LIMIT 1`,
+		fileNodePathHash(path), path).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 func (s *Store) ListNodes(ctx context.Context, parentPath string) (out []*FileNode, err error) {
 	start := time.Now()
 	defer observeStoreOp(ctx, "list_nodes", start, &err)
