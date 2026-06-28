@@ -1377,6 +1377,55 @@ func TestWriteWithExpectedRevisionConflict(t *testing.T) {
 	}
 }
 
+func TestWriteCreateIfAbsentSkipsPreStat(t *testing.T) {
+	logger.ResetBenchTimingLogEnabledForTest()
+	t.Cleanup(logger.ResetBenchTimingLogEnabledForTest)
+	t.Setenv("DRIVE9_BENCH_TIMING_LOG_ENABLED", "true")
+
+	core, recorded := observer.New(zap.InfoLevel)
+	s := newTestServerWithLogger(t, zap.New(core))
+	ts := httptest.NewServer(s)
+	defer ts.Close()
+
+	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/create-fast.txt", strings.NewReader("v1"))
+	req.Header.Set("X-Dat9-Expected-Revision", "0")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("create-if-absent status = %d, want 200", resp.StatusCode)
+	}
+
+	req, _ = http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/create-fast.txt", strings.NewReader("duplicate"))
+	req.Header.Set("X-Dat9-Expected-Revision", "0")
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("duplicate create-if-absent status = %d, want 409", resp.StatusCode)
+	}
+
+	entries := recorded.FilterMessage("backend_write_timing").AllUntimed()
+	for _, entry := range entries {
+		ctx := entry.ContextMap()
+		if ctx["path"] != "/create-fast.txt" || ctx["result"] != "ok" {
+			continue
+		}
+		if got := ctx["operation"]; got != "create" {
+			t.Fatalf("operation = %v, want create", got)
+		}
+		if got := ctx["stat_ms"]; got != float64(0) {
+			t.Fatalf("stat_ms = %v, want 0 for create-if-absent fast path", got)
+		}
+		return
+	}
+	t.Fatalf("missing successful backend_write_timing for create-if-absent; got %#v", entries)
+}
+
 func TestDelete(t *testing.T) {
 	s := newTestServer(t)
 	ts := httptest.NewServer(s)

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/c4pt0r/agfs/agfs-server/pkg/filesystem"
+	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/meta"
 )
 
@@ -82,6 +83,36 @@ func TestServerQuotaFeatureFlagRejectsOverLimitWrite(t *testing.T) {
 	}
 }
 
+func TestCreateIfAbsentExistingPathReturnsConflictBeforeStorageQuota(t *testing.T) {
+	opts := Options{}
+	opts.QuotaSource = QuotaSourceServer
+	b := newTestBackendWithOptions(t, opts)
+	fake := newFakeMetaQuotaStore()
+	fake.config["tenant-a"] = &QuotaConfigView{
+		TenantID:         "tenant-a",
+		MaxStorageBytes:  10,
+		MaxFileSizeBytes: meta.DefaultMaxFileSizeBytes(),
+		MaxMediaLLMFiles: 1000,
+		MaxMonthlyCostMC: 1 << 30,
+	}
+	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
+
+	if _, err := b.WriteCtxIfRevision(context.Background(), "/exists.txt", []byte("ok"), 0, filesystem.WriteFlagCreate, 0); err != nil {
+		t.Fatalf("seed create-if-absent: %v", err)
+	}
+	fake.mu.Lock()
+	fake.usage["tenant-a"] = &QuotaUsageView{
+		TenantID:     "tenant-a",
+		StorageBytes: 10,
+	}
+	fake.mu.Unlock()
+	b.quotaUsageCache.invalidate()
+
+	if _, _, err := b.WriteCtxIfRevisionWithTagsResult(context.Background(), "/exists.txt", []byte("too-large"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, 0, nil, ""); !errors.Is(err, datastore.ErrRevisionConflict) {
+		t.Fatalf("duplicate create-if-absent error = %v, want ErrRevisionConflict", err)
+	}
+}
+
 func TestServerQuotaRejectsOverFileSizeLimit(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
 	ctx := context.Background()
@@ -100,6 +131,23 @@ func TestServerQuotaRejectsOverFileSizeLimit(t *testing.T) {
 	}
 	if usage.StorageBytes != 0 || usage.FileCount != 0 {
 		t.Fatalf("usage after rejected write = %+v, want zero", usage)
+	}
+}
+
+func TestCreateIfAbsentExistingPathReturnsConflictBeforeFileSizeQuota(t *testing.T) {
+	b, fake := newServerQuotaBackend(t, Options{})
+	ctx := context.Background()
+
+	if _, err := b.WriteCtxIfRevision(ctx, "/size-exists.txt", []byte("ok"), 0, filesystem.WriteFlagCreate, 0); err != nil {
+		t.Fatalf("seed create-if-absent: %v", err)
+	}
+	fake.mu.Lock()
+	fake.config["tenant-a"].MaxFileSizeBytes = 4
+	fake.mu.Unlock()
+	b.quotaConfigCache.refresh(ctx)
+
+	if _, _, err := b.WriteCtxIfRevisionWithTagsResult(ctx, "/size-exists.txt", []byte("12345"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, 0, nil, ""); !errors.Is(err, datastore.ErrRevisionConflict) {
+		t.Fatalf("duplicate create-if-absent error = %v, want ErrRevisionConflict", err)
 	}
 }
 

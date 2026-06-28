@@ -127,6 +127,10 @@ func main() {
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "open_local_datastore")
 
 	stepStart = time.Now()
+	backend.InitQuotaAdmissionCacheTTLs(
+		envDuration("DRIVE9_QUOTA_USAGE_CACHE_TTL", 0),
+		envDuration("DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL", 0),
+	)
 	backendOpts, err := buildBackendOptionsFromEnv()
 	if err != nil {
 		die(err)
@@ -366,6 +370,8 @@ environment:
   DRIVE9_VAULT_MASTER_KEY 32-byte hex key for vault DEK wrapping (omit to disable vault)
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
+  DRIVE9_QUOTA_USAGE_CACHE_TTL soft small-write central usage cache TTL, e.g. 250ms or 1s
+  DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write tenant pending-outbox aggregate cache TTL, e.g. 250ms or 1s
 
   S3 storage:
   Set DRIVE9_S3_BUCKET to enable AWS S3 mode.
@@ -824,6 +830,23 @@ func envInt64(key string, fallback int64) int64 {
 	}
 	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := time.ParseDuration(raw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v; using %s\n", key, raw, err, fallback)
+		return fallback
+	}
+	if v < 0 {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q: duration must be non-negative; using %s\n", key, raw, fallback)
 		return fallback
 	}
 	return v
