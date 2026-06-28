@@ -111,12 +111,11 @@ install.
 already available; IOR requires an MPI compiler, so on Linux with `apt-get` and
 passwordless `sudo` the harness installs `mpich libmpich-dev` when `mpicc` is
 missing. The IOR source is patched in-cache for newer compiler compatibility
-before building mdtest. `community.fsx` uses the LTP-provided `fsx-linux` binary
-from the auto-fetched LTP install tree before falling back to `secfs.test`.
+before building mdtest. `community.fsx` fetches and builds `secfs.test` to obtain the `fsx` binary.
 
-Dependency metadata (name, source, license, default ref) for all groups is
-tracked in `blackbox/env/dependencies.json`. Generated dependency metadata is
-written next to cached dependencies when a module prepares them.
+Dependency metadata (name, source, license, ref) is embedded in each
+module's own `deps.py` and written as `.drive9-blackbox-dependency.json`
+next to the cached dependency when a module prepares it.
 
 ## Platform Notes
 
