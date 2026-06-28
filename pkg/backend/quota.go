@@ -63,6 +63,16 @@ func (b *Dat9Backend) ensureStorageQuota(ctx context.Context, tx *sql.Tx, path s
 	return b.ensureTenantStorageQuotaTx(tx, path, newSize)
 }
 
+// ensureCreateStorageQuota is the create-only variant of ensureStorageQuota.
+// The caller has not attached a dentry yet, so the current path size is known
+// to be zero; path conflicts later in the transaction roll back the write.
+func (b *Dat9Backend) ensureCreateStorageQuota(ctx context.Context, tx *sql.Tx, newSize int64) error {
+	if b.UseServerQuota() {
+		return b.ensureStorageQuotaServer(ctx, tx, newSize)
+	}
+	return b.ensureTenantCreateStorageQuotaTx(tx, newSize)
+}
+
 // mediaLLMQuotaExceededCheckTx dispatches the media LLM quota check
 // (transactional variant). currentMediaDelta is only applied to server quota,
 // where the current write may not be visible in central usage or pending outbox
@@ -444,6 +454,26 @@ func (b *Dat9Backend) ensureTenantStorageQuotaTx(tx *sql.Tx, path string, newSiz
 		return fmt.Errorf("%w: limit=%d used=%d reserved=%d current_path=%d requested=%d delta=%d",
 			ErrStorageQuotaExceeded, b.maxTenantStorageBytes, confirmedBytes, reservedBytes,
 			currentPathBytes, newSize, deltaBytes)
+	}
+	return nil
+}
+
+func (b *Dat9Backend) ensureTenantCreateStorageQuotaTx(tx *sql.Tx, newSize int64) error {
+	if newSize <= 0 || b.maxTenantStorageBytes <= 0 {
+		return nil
+	}
+	confirmedBytes, err := b.store.ConfirmedStorageBytesTx(tx)
+	if err != nil {
+		return fmt.Errorf("load confirmed storage usage: %w", err)
+	}
+	reservedBytes, err := b.store.ActiveUploadReservedBytesTx(tx)
+	if err != nil {
+		return fmt.Errorf("load upload reservations: %w", err)
+	}
+	totalBytes := confirmedBytes + reservedBytes + newSize
+	if totalBytes > b.maxTenantStorageBytes {
+		return fmt.Errorf("%w: limit=%d used=%d reserved=%d requested=%d delta=%d",
+			ErrStorageQuotaExceeded, b.maxTenantStorageBytes, confirmedBytes, reservedBytes, newSize, newSize)
 	}
 	return nil
 }

@@ -85,7 +85,7 @@ func (w *ExpirySweepWorker) sweep(ctx context.Context) (fatal bool) {
 			return true
 		}
 		logger.Error(ctx, "expiry_sweep_error", zap.Error(err), zap.Duration("elapsed", elapsed))
-		metrics.RecordOperation("expiry_sweep", "sweep", "error", elapsed)
+		metrics.RecordOperation("expiry_sweep", "sweep", metrics.ResultForError(err), elapsed)
 		return false
 	}
 	if released > 0 {

@@ -16,9 +16,9 @@ import (
 type ChangeEvent struct {
 	Seq   uint64 `json:"seq"`             // monotonic per-tenant seq (fs_events.seq AUTO_INCREMENT)
 	Path  string `json:"path"`            // affected path
-	Op    string `json:"op"`             // "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
+	Op    string `json:"op"`              // "write" | "delete" | "rename" | "mkdir" | "copy" | "upload_complete"
 	Actor string `json:"actor,omitempty"` // X-Dat9-Actor header value (per-mount ID)
-	Ts    int64  `json:"ts"`             // unix milliseconds
+	Ts    int64  `json:"ts"`              // unix milliseconds
 }
 
 const (
@@ -36,8 +36,8 @@ const (
 // The store field is an atomic pointer so it can be safely refreshed by
 // eventBuses.get (when the pool recreates a backend) while SSE handlers read it.
 type EventBus struct {
-	tenantID string
-	store    atomic.Pointer[datastore.Store]
+	tenantID  string
+	store     atomic.Pointer[datastore.Store]
 	mu        sync.Mutex
 	listeners map[uint64]chan struct{}
 	nextID    uint64
@@ -251,7 +251,7 @@ func (eb *EventBus) EventsSince(ctx context.Context, since uint64) (events []Cha
 			zap.Uint64("since", since),
 			zap.Float64("query_ms", float64(time.Since(queryStart).Microseconds())/1000),
 			zap.Error(err))
-		metrics.RecordTenantOperation(eb.tenantID, "event_bus", "query", "error", 0)
+		metrics.RecordTenantOperation(eb.tenantID, "event_bus", "query", metrics.ResultForError(err), 0)
 		headSeq = since // keep the client's cursor unchanged
 		return nil, headSeq, true
 	}
@@ -344,10 +344,7 @@ func oldestSeqSafeWithMetric(ctx context.Context, store *datastore.Store, tenant
 
 // queryResult maps a query error to a metric result label.
 func queryResult(err error) string {
-	if err != nil {
-		return "error"
-	}
-	return "ok"
+	return metrics.ResultForError(err)
 }
 
 // clampNonNegative returns v if v >= 0, else 0.

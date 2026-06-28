@@ -182,7 +182,7 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 				zap.String("path", path),
 				zap.String("op", op),
 				zap.Error(err))
-			metrics.RecordTenantOperation(bus.tenantID, "event_bus", "publish", "error", 0)
+			metrics.RecordTenantOperation(bus.tenantID, "event_bus", "publish", metrics.ResultForError(err), 0)
 			metrics.RecordEventBusPublishError(bus.tenantID)
 		}
 	}
