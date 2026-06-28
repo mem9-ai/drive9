@@ -26,7 +26,7 @@ def ensure_fsx(ctx: Context) -> str:
     root_dir = ctx.deps.ensure_git_clone("secfs.test", "https://github.com/billziss-gh/secfs.test.git", ref)
     candidate = root_dir / "tools" / "bin" / "fsx"
     if not candidate.exists():
-        ctx.deps.run("secfs-test-tools", ["make", "tools"], cwd=root_dir, timeout=1200)
+        ctx.deps.run("secfs-test-fsx", ["make", "tools/bin/fsx"], cwd=root_dir, timeout=1200)
     if candidate.exists():
         write_json(root_dir / ".drive9-blackbox-dependency.json", {"name": "secfs.test", "source": "https://github.com/billziss-gh/secfs.test", "ref": ref, "license": "Apache-2.0"})
         return str(candidate)
