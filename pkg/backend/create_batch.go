@@ -128,6 +128,13 @@ func (c *createBatcher) stop() {
 }
 
 func (c *createBatcher) create(ctx context.Context, path string, data []byte, tags map[string]string, description string) (int64, error) {
+	c.mu.Lock()
+	if c.stopping {
+		c.mu.Unlock()
+		return 0, errors.New("create batcher stopped")
+	}
+	c.mu.Unlock()
+
 	item, err := c.backend.prepareCreateWrite(ctx, path, data, tags, description)
 	if err != nil {
 		return 0, err
@@ -191,7 +198,7 @@ func (c *createBatcher) run() {
 			timer = time.NewTimer(c.linger)
 			timerC = timer.C
 		}
-		if len(batch) >= c.max || (c.maxBytes > 0 && batchBytes >= c.maxBytes) {
+		if len(batch) >= c.max || batchBytes >= c.maxBytes {
 			flush()
 		}
 	}
@@ -255,11 +262,13 @@ func (c *createBatcher) flush(batch []*createBatchJob) {
 	c.flushCount.Add(1)
 	active := make([]*createBatchJob, 0, len(batch))
 	for _, job := range batch {
-		metrics.RecordTenantOperation(b.tenantID, "create_batch", "wait", "ok", time.Since(job.item.now))
+		waitDuration := time.Since(job.item.now)
 		if err := job.ctx.Err(); err != nil {
+			metrics.RecordTenantOperation(b.tenantID, "create_batch", "wait", metrics.ResultForError(err), waitDuration)
 			job.result <- createBatchResult{err: err}
 			continue
 		}
+		metrics.RecordTenantOperation(b.tenantID, "create_batch", "wait", "ok", waitDuration)
 		active = append(active, job)
 	}
 	metrics.RecordTenantGauge(b.tenantID, "create_batch", "batch_size", float64(len(active)))

@@ -640,23 +640,39 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	if opts.TextExtractMaxBytes <= 0 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_TEXT_EXTRACT_MAX_BYTES must be a positive integer")
 	}
+	createBatchMax, err := envIntStrict("DRIVE9_CREATE_BATCH_MAX", 1)
+	if err != nil {
+		return backend.Options{}, err
+	}
+	createBatchMaxBytes, err := envInt64Strict("DRIVE9_CREATE_BATCH_MAX_BYTES", backend.DefaultCreateBatchMaxBytes)
+	if err != nil {
+		return backend.Options{}, err
+	}
+	createBatchConcurrency, err := envIntStrict("DRIVE9_CREATE_BATCH_CONCURRENCY", backend.DefaultCreateBatchConcurrency)
+	if err != nil {
+		return backend.Options{}, err
+	}
+	createBatchLingerMS, err := envIntStrict("DRIVE9_CREATE_BATCH_LINGER_MS", 1)
+	if err != nil {
+		return backend.Options{}, err
+	}
 	opts.CreateBatch = backend.CreateBatchOptions{
-		MaxEntries:           envInt("DRIVE9_CREATE_BATCH_MAX", 1),
-		MaxBytes:             envInt64("DRIVE9_CREATE_BATCH_MAX_BYTES", backend.DefaultCreateBatchMaxBytes),
-		MaxConcurrentFlushes: envInt("DRIVE9_CREATE_BATCH_CONCURRENCY", backend.DefaultCreateBatchConcurrency),
-		Linger:               time.Duration(envInt("DRIVE9_CREATE_BATCH_LINGER_MS", 1)) * time.Millisecond,
+		MaxEntries:           createBatchMax,
+		MaxBytes:             createBatchMaxBytes,
+		MaxConcurrentFlushes: createBatchConcurrency,
+		Linger:               time.Duration(createBatchLingerMS) * time.Millisecond,
 	}
 	if opts.CreateBatch.MaxEntries < 1 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_CREATE_BATCH_MAX must be a positive integer")
 	}
-	if opts.CreateBatch.MaxBytes < 0 {
-		return backend.Options{}, fmt.Errorf("DRIVE9_CREATE_BATCH_MAX_BYTES must be a non-negative integer")
+	if opts.CreateBatch.MaxBytes < 1 {
+		return backend.Options{}, fmt.Errorf("DRIVE9_CREATE_BATCH_MAX_BYTES must be a positive integer")
 	}
 	if opts.CreateBatch.MaxConcurrentFlushes < 1 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_CREATE_BATCH_CONCURRENCY must be a positive integer")
 	}
-	if opts.CreateBatch.Linger < 0 {
-		return backend.Options{}, fmt.Errorf("DRIVE9_CREATE_BATCH_LINGER_MS must be a non-negative integer")
+	if opts.CreateBatch.Linger <= 0 {
+		return backend.Options{}, fmt.Errorf("DRIVE9_CREATE_BATCH_LINGER_MS must be a positive integer")
 	}
 
 	// Quota enforcement source: "tenant" (default) or "server" (central server DB).
@@ -855,6 +871,30 @@ func envInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	return v
+}
+
+func envIntStrict(key string, fallback int) (int, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return fallback, nil
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer, got %q", key, raw)
+	}
+	return v, nil
+}
+
+func envInt64Strict(key string, fallback int64) (int64, error) {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be an integer, got %q", key, raw)
+	}
+	return v, nil
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {

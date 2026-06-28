@@ -110,6 +110,42 @@ func TestBuildBackendOptionsFromEnvAudioDisabled(t *testing.T) {
 	}
 }
 
+func TestBuildBackendOptionsFromEnvRejectsInvalidCreateBatchConfig(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_CREATE_BATCH_MAX",
+		"DRIVE9_CREATE_BATCH_MAX_BYTES",
+		"DRIVE9_CREATE_BATCH_CONCURRENCY",
+		"DRIVE9_CREATE_BATCH_LINGER_MS",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "malformed max", key: "DRIVE9_CREATE_BATCH_MAX", value: "abc"},
+		{name: "zero max bytes", key: "DRIVE9_CREATE_BATCH_MAX_BYTES", value: "0"},
+		{name: "malformed concurrency", key: "DRIVE9_CREATE_BATCH_CONCURRENCY", value: "many"},
+		{name: "zero linger", key: "DRIVE9_CREATE_BATCH_LINGER_MS", value: "0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			unsetEnv(t, keys)
+			setEnv(t, tt.key, tt.value)
+			if _, err := buildBackendOptionsFromEnv(); err == nil {
+				t.Fatalf("buildBackendOptionsFromEnv succeeded with %s=%q", tt.key, tt.value)
+			}
+		})
+	}
+}
+
 func TestBuildSemanticWorkerConfigFromEnvReadsWorkerOptionsWithoutEmbedder(t *testing.T) {
 	keys := []string{
 		"DRIVE9_EMBED_API_BASE",

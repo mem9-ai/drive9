@@ -568,6 +568,57 @@ func TestBuildBackendOptionsFromEnvAudioStub(t *testing.T) {
 	}
 }
 
+func TestBuildBackendOptionsFromEnvRejectsInvalidCreateBatchConfig(t *testing.T) {
+	keys := []string{
+		"DRIVE9_QUERY_EMBED_API_BASE",
+		"DRIVE9_QUERY_EMBED_API_KEY",
+		"DRIVE9_QUERY_EMBED_MODEL",
+		"DRIVE9_IMAGE_EXTRACT_ENABLED",
+		"DRIVE9_AUDIO_EXTRACT_ENABLED",
+		"DRIVE9_CREATE_BATCH_MAX",
+		"DRIVE9_CREATE_BATCH_MAX_BYTES",
+		"DRIVE9_CREATE_BATCH_CONCURRENCY",
+		"DRIVE9_CREATE_BATCH_LINGER_MS",
+	}
+	prev := make(map[string]string, len(keys))
+	for _, k := range keys {
+		prev[k] = os.Getenv(k)
+	}
+	t.Cleanup(func() {
+		for _, k := range keys {
+			if prev[k] == "" {
+				_ = os.Unsetenv(k)
+			} else {
+				_ = os.Setenv(k, prev[k])
+			}
+		}
+	})
+
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "malformed max", key: "DRIVE9_CREATE_BATCH_MAX", value: "abc"},
+		{name: "zero max bytes", key: "DRIVE9_CREATE_BATCH_MAX_BYTES", value: "0"},
+		{name: "malformed concurrency", key: "DRIVE9_CREATE_BATCH_CONCURRENCY", value: "many"},
+		{name: "zero linger", key: "DRIVE9_CREATE_BATCH_LINGER_MS", value: "0"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, k := range keys {
+				_ = os.Unsetenv(k)
+			}
+			if err := os.Setenv(tt.key, tt.value); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := buildBackendOptionsFromEnv(); err == nil {
+				t.Fatalf("buildBackendOptionsFromEnv succeeded with %s=%q", tt.key, tt.value)
+			}
+		})
+	}
+}
+
 func TestBuildBackendOptionsFromEnvAudioOpenAI(t *testing.T) {
 	keys := []string{
 		"DRIVE9_QUERY_EMBED_API_BASE",

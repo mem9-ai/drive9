@@ -233,6 +233,7 @@ Bad rollout signs:
 Roll out with the default off, then enable for a pressure-test environment:
 
 ```text
+DRIVE9_QUOTA_SOURCE=server
 DRIVE9_CREATE_BATCH_MAX=16
 DRIVE9_CREATE_BATCH_MAX_BYTES=1048576
 DRIVE9_CREATE_BATCH_CONCURRENCY=4
