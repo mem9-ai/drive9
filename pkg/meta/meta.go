@@ -1901,7 +1901,7 @@ func tenantPoolLockName(poolID string) string {
 		return ""
 	}
 	sum := sha256.Sum256([]byte(poolID))
-	return "d9_tenant_pool:" + hex.EncodeToString(sum[:20])
+	return "d9_tenant_pool:" + hex.EncodeToString(sum[:16])
 }
 
 func tenantPoolDatabaseLockName(baseLockName, databaseName string) string {

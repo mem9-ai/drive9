@@ -402,8 +402,8 @@ func TestWithTenantPoolLockSerializesCallbacks(t *testing.T) {
 func TestTenantPoolDatabaseLockNameStaysWithinMySQLLimit(t *testing.T) {
 	base := tenantPoolLockName("pool-lock-test")
 	got := tenantPoolDatabaseLockName(base, "drive9_test_with_a_long_database_name")
-	if len(got) != 64 {
-		t.Fatalf("lock name length = %d, want 64", len(got))
+	if len(got) >= 64 {
+		t.Fatalf("lock name length = %d, want below 64", len(got))
 	}
 	if !strings.HasPrefix(got, base+":") {
 		t.Fatalf("lock name = %q, want base prefix %q", got, base+":")

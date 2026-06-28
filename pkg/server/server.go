@@ -4228,7 +4228,6 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	var provisionCloudCfg *tenant.QuotaCloudConfig
 	stageStarted = time.Now()
 	provisionMode := "default"
-	logProvisionStart := false
 	if provider == tenant.ProviderTiDBCloudNative {
 		if opts.Quota != nil {
 			provisionMode = "tidb_cloud_native_credentials_quota"
@@ -4244,7 +4243,6 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			}
 			if quotaProvisioner, ok := s.provisioner.(tenant.CredentialQuotaProvisioner); ok {
 				logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
-				logProvisionStart = true
 				cluster, provisionCloudCfg, err = quotaProvisioner.ProvisionWithCredentialsAndQuota(ctx, tenantID, *opts.CredentialProvisioner, tenant.QuotaUpdateOptions{
 					TiDBCloudSpendingLimitMonthly: quotaReq.TiDBCloudSpendingLimit,
 				})
@@ -4260,7 +4258,6 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
 			provisionMode = "tidb_cloud_native_credentials"
 			logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
-			logProvisionStart = true
 			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
 		} else {
 			err = fmt.Errorf("provisioner does not support request credentials")
@@ -4268,11 +4265,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 	} else {
 		provisionMode = "provisioner_default"
 		logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
-		logProvisionStart = true
 		cluster, err = s.provisioner.Provision(ctx, tenantID)
-	}
-	if !logProvisionStart {
-		logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
 	}
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_cluster_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
