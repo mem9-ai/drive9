@@ -686,6 +686,25 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		return 0, 0, err
 	}
 
+	if isCreateIfAbsentWrite(offset, flags, expectedRevision) {
+		operation = "create"
+		implementationStart := time.Time{}
+		if timingEnabled {
+			implementationStart = time.Now()
+		}
+		n, err := b.createAndWriteCtx(ctx, path, data, tags, description)
+		if timingEnabled {
+			implementationDuration = time.Since(implementationStart)
+		}
+		if errors.Is(err, datastore.ErrPathConflict) {
+			return 0, 0, datastore.ErrRevisionConflict
+		}
+		if err != nil {
+			return 0, 0, err
+		}
+		return n, 1, nil
+	}
+
 	statStart := time.Time{}
 	if timingEnabled {
 		statStart = time.Now()
@@ -746,6 +765,13 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		implementationDuration = time.Since(implementationStart)
 	}
 	return n, rev, err
+}
+
+func isCreateIfAbsentWrite(offset int64, flags filesystem.WriteFlag, expectedRevision int64) bool {
+	return expectedRevision == 0 &&
+		offset == 0 &&
+		flags&filesystem.WriteFlagCreate != 0 &&
+		flags&filesystem.WriteFlagAppend == 0
 }
 
 func backendWriteResult(err error) string {
@@ -904,7 +930,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 		quotaOutboxEnqueued = false
 
 		done := backendTimingStep(timingEnabled, &quotaStorageCheckDuration)
-		err := b.ensureStorageQuota(ctx, tx, path, int64(len(data)))
+		err := b.ensureCreateStorageQuota(ctx, tx, int64(len(data)))
 		done()
 		if err != nil {
 			return err

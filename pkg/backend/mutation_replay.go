@@ -121,11 +121,11 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 					zap.Int64("log_id", entry.ID),
 					zap.Error(rErr))
 			}
-			metrics.RecordTenantOperation(entry.TenantID, "mutation_replay", entry.MutationType, metrics.ResultForError(err), 0)
+			metrics.RecordTenantOperationCount(entry.TenantID, "mutation_replay", entry.MutationType, metrics.ResultForError(err))
 			blockedTenants[entry.TenantID] = struct{}{}
 			failed++
 		} else {
-			metrics.RecordTenantOperation(entry.TenantID, "mutation_replay", entry.MutationType, "ok", 0)
+			metrics.RecordTenantOperationCount(entry.TenantID, "mutation_replay", entry.MutationType, "ok")
 			applied++
 		}
 	}

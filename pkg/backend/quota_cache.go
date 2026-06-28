@@ -48,10 +48,14 @@ func InitQuotaConfigCacheRefreshInterval(seconds int) {
 // caches are used only for small-write admission; strict upload reservations
 // continue to read current central and tenant-local quota state directly.
 func InitQuotaAdmissionCacheTTLs(usageTTL, pendingDeltasTTL time.Duration) {
-	if usageTTL > 0 {
+	if usageTTL < 0 {
+		logger.Warn(context.Background(), "quota_usage_cache_ttl_invalid", zap.Duration("ttl", usageTTL))
+	} else if usageTTL > 0 {
 		quotaUsageCacheTTL = usageTTL
 	}
-	if pendingDeltasTTL > 0 {
+	if pendingDeltasTTL < 0 {
+		logger.Warn(context.Background(), "quota_pending_deltas_cache_ttl_invalid", zap.Duration("ttl", pendingDeltasTTL))
+	} else if pendingDeltasTTL > 0 {
 		quotaPendingDeltasCacheTTL = pendingDeltasTTL
 	}
 }

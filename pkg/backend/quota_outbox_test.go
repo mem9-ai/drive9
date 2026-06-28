@@ -124,6 +124,56 @@ func TestServerQuotaOutboxBatchProcessesDifferentFiles(t *testing.T) {
 	}
 }
 
+func TestQuotaOutboxFallbackFailureRecordsProcessDurationOnly(t *testing.T) {
+	b, _ := newServerQuotaBackend(t, Options{})
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	if _, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
+		FileID:       "bad-json",
+		MutationType: quotaMutationTypeFileCreate,
+		MutationData: []byte(`{"file_id":123}`),
+		StorageDelta: 1,
+		FileDelta:    1,
+	}); err != nil {
+		t.Fatalf("enqueue bad create: %v", err)
+	}
+	if _, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
+		FileID:       "good-file",
+		MutationType: quotaMutationTypeFileCreate,
+		MutationData: mustQuotaMutationJSON(t, fileCreateMutationData{
+			FileID:    "good-file",
+			SizeBytes: 2,
+		}),
+		StorageDelta: 2,
+		FileDelta:    1,
+	}); err != nil {
+		t.Fatalf("enqueue good create: %v", err)
+	}
+
+	processed, err := b.ProcessQuotaOutboxBatch(ctx, 100)
+	if err == nil {
+		t.Fatal("process quota outbox batch error = nil, want fallback apply error")
+	}
+	if processed != 2 {
+		t.Fatalf("processed rows = %d, want 2", processed)
+	}
+
+	metricsText := readBackendMetrics()
+	if !strings.Contains(metricsText, `drive9_service_operations_total{component="quota_outbox",operation="process",result="error",tenant_id="tenant-a"}`) {
+		t.Fatalf("metrics missing quota_outbox process error counter: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, `drive9_service_operation_duration_seconds_count{component="quota_outbox",operation="process",result="error",tenant_id="tenant-a"}`) {
+		t.Fatalf("metrics missing quota_outbox process error duration: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, `drive9_service_operations_total{component="quota_outbox",operation="file_create",result="error",tenant_id="tenant-a"}`) {
+		t.Fatalf("metrics missing quota_outbox file_create error counter: %s", metricsText)
+	}
+	if strings.Contains(metricsText, `drive9_service_operation_duration_seconds_count{component="quota_outbox",operation="file_create",result="error",tenant_id="tenant-a"}`) {
+		t.Fatalf("quota_outbox file_create error should not record per-entry duration: %s", metricsText)
+	}
+}
+
 func TestQuotaOutboxBatchConflictExhaustedRecordsTenantMetrics(t *testing.T) {
 	b, _ := newCentralQuotaBackend(t)
 	b.stopQuotaOutboxWorker()

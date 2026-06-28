@@ -308,9 +308,10 @@ func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (p
 			appliedEntries = append(appliedEntries, entries[i])
 		}
 		if entryErr != nil {
-			metrics.RecordTenantOperation(b.tenantID, "quota_outbox", entries[i].MutationType, metrics.ResultForError(entryErr), time.Since(start))
+			metrics.RecordTenantOperationCount(b.tenantID, "quota_outbox", entries[i].MutationType, metrics.ResultForError(entryErr))
 			if !entryProcessed {
 				b.recordAppliedQuotaOutboxEntries(appliedEntries)
+				metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "process", metrics.ResultForError(entryErr), time.Since(start))
 				return processed, entryErr
 			}
 			if fallbackErr == nil {
@@ -320,6 +321,7 @@ func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (p
 	}
 	b.recordAppliedQuotaOutboxEntries(appliedEntries)
 	if fallbackErr != nil {
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "process", metrics.ResultForError(fallbackErr), time.Since(start))
 		return processed, fallbackErr
 	}
 	if processed > 0 {

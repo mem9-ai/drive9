@@ -842,6 +842,11 @@ func envDuration(key string, fallback time.Duration) time.Duration {
 	}
 	v, err := time.ParseDuration(raw)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q: %v; using %s\n", key, raw, err, fallback)
+		return fallback
+	}
+	if v < 0 {
+		fmt.Fprintf(os.Stderr, "invalid %s=%q: duration must be non-negative; using %s\n", key, raw, fallback)
 		return fallback
 	}
 	return v
