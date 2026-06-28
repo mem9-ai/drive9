@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/datastore"
 	"github.com/mem9-ai/drive9/pkg/encrypt"
@@ -1058,16 +1059,57 @@ func closeEntry(e *entry) {
 	}
 }
 
+type tenantPoolResult string
+
+const (
+	tenantPoolResultOK                   tenantPoolResult = "ok"
+	tenantPoolResultNotFound             tenantPoolResult = "not_found"
+	tenantPoolResultAuthFailed           tenantPoolResult = "auth_failed"
+	tenantPoolResultUsageQuotaExhausted  tenantPoolResult = "usage_quota_exhausted"
+	tenantPoolResultError                tenantPoolResult = "error"
+	mysqlErrAccessDenied                 uint16           = 1045
+	mysqlErrUsageQuotaExhaustedCandidate uint16           = 1105
+)
+
 func observePool(ctx context.Context, op, tenantID string, errp *error, start time.Time) {
-	result := "ok"
+	result := tenantPoolResultOK
 	if errp != nil && *errp != nil {
-		switch {
-		case errors.Is(*errp, meta.ErrNotFound):
-			result = "not_found"
-		default:
-			result = "error"
+		result = tenantPoolErrorResult(*errp)
+		fields := []zap.Field{zap.String("operation", op), zap.String("tenant_id", tenantID), zap.String("result", string(result)), zap.Error(*errp)}
+		if result == tenantPoolResultError {
+			logger.Error(ctx, "tenant_pool_op_failed", fields...)
+		} else {
+			logger.Warn(ctx, "tenant_pool_op_failed", fields...)
 		}
-		logger.Error(ctx, "tenant_pool_op_failed", zap.String("operation", op), zap.String("tenant_id", tenantID), zap.String("result", result), zap.Error(*errp))
 	}
-	metrics.RecordOperation("tenant_pool", op, result, time.Since(start))
+	metrics.RecordOperation("tenant_pool", op, string(result), time.Since(start))
+}
+
+func tenantPoolErrorResult(err error) tenantPoolResult {
+	switch {
+	case err == nil:
+		return tenantPoolResultOK
+	case errors.Is(err, meta.ErrNotFound):
+		return tenantPoolResultNotFound
+	}
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		switch mysqlErr.Number {
+		case mysqlErrAccessDenied:
+			return tenantPoolResultAuthFailed
+		case mysqlErrUsageQuotaExhaustedCandidate:
+			if strings.Contains(strings.ToLower(mysqlErr.Message), "usage quota") {
+				return tenantPoolResultUsageQuotaExhausted
+			}
+		}
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "please check your user name and password"):
+		return tenantPoolResultAuthFailed
+	case strings.Contains(msg, "due to the usage quota being exhausted"):
+		return tenantPoolResultUsageQuotaExhausted
+	default:
+		return tenantPoolResultError
+	}
 }

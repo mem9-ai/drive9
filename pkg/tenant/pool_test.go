@@ -549,6 +549,52 @@ func TestRecordTenantSchemaVersionUpdateFailureRecordsMetric(t *testing.T) {
 	}
 }
 
+func TestTenantPoolErrorResultClassifiesExpectedDatabaseErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want tenantPoolResult
+	}{
+		{
+			name: "tidb auth failed",
+			err:  fmt.Errorf("open db: %w", &mysql.MySQLError{Number: 1045, Message: "Access denied for user"}),
+			want: tenantPoolResultAuthFailed,
+		},
+		{
+			name: "tidb auth failed legacy message",
+			err:  fmt.Errorf("open db: Error 1045 (28000): Please check your user name and password and try again"),
+			want: tenantPoolResultAuthFailed,
+		},
+		{
+			name: "tidb usage quota exhausted",
+			err:  fmt.Errorf("open db: %w", &mysql.MySQLError{Number: 1105, Message: "Due to the usage quota being exhausted, access to the cluster has been restricted"}),
+			want: tenantPoolResultUsageQuotaExhausted,
+		},
+		{
+			name: "tidb usage quota exhausted lowercase",
+			err:  fmt.Errorf("open db: error 1105 (hy000): due to the usage quota being exhausted"),
+			want: tenantPoolResultUsageQuotaExhausted,
+		},
+		{
+			name: "not found",
+			err:  meta.ErrNotFound,
+			want: tenantPoolResultNotFound,
+		},
+		{
+			name: "unexpected",
+			err:  fmt.Errorf("open db: invalid connection"),
+			want: tenantPoolResultError,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tenantPoolErrorResult(tt.err); got != tt.want {
+				t.Fatalf("tenantPoolErrorResult() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func operationMetricValue(t *testing.T, output, labels string) uint64 {
 	t.Helper()
 	prefix := `drive9_service_operations_total{` + labels + `} `
