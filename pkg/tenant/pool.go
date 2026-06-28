@@ -1061,13 +1061,31 @@ func closeEntry(e *entry) {
 func observePool(ctx context.Context, op, tenantID string, errp *error, start time.Time) {
 	result := "ok"
 	if errp != nil && *errp != nil {
-		switch {
-		case errors.Is(*errp, meta.ErrNotFound):
-			result = "not_found"
-		default:
-			result = "error"
+		result = tenantPoolErrorResult(*errp)
+		fields := []zap.Field{zap.String("operation", op), zap.String("tenant_id", tenantID), zap.String("result", result), zap.Error(*errp)}
+		if result == "error" {
+			logger.Error(ctx, "tenant_pool_op_failed", fields...)
+		} else {
+			logger.Warn(ctx, "tenant_pool_op_failed", fields...)
 		}
-		logger.Error(ctx, "tenant_pool_op_failed", zap.String("operation", op), zap.String("tenant_id", tenantID), zap.String("result", result), zap.Error(*errp))
 	}
 	metrics.RecordOperation("tenant_pool", op, result, time.Since(start))
+}
+
+func tenantPoolErrorResult(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, meta.ErrNotFound):
+		return "not_found"
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "please check your user name and password"):
+		return "auth_failed"
+	case strings.Contains(msg, "due to the usage quota being exhausted"):
+		return "usage_quota_exhausted"
+	default:
+		return "error"
+	}
 }

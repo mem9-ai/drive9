@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-
-	"github.com/mem9-ai/drive9/pkg/metrics"
 )
 
 // defaultQuotaOutboxMaxAttempts bounds how long a poisoned quota mutation can
@@ -53,6 +51,15 @@ type QuotaOutboxEntry struct {
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 	CompletedAt  *time.Time
+}
+
+// QuotaOutboxBatchClaimResult reports the outcome of a batch claim. An
+// exhausted claim conflict means concurrent workers repeatedly won the same
+// claim race; callers can treat it like an empty poll while recording
+// tenant-scoped observability.
+type QuotaOutboxBatchClaimResult struct {
+	Entries           []QuotaOutboxEntry
+	ConflictExhausted bool
 }
 
 // ErrQuotaOutboxLeaseMismatch means a worker tried to ack/retry an outbox row
@@ -107,19 +114,39 @@ func (s *Store) ClaimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseD
 	start := time.Now()
 	defer observeStoreOp(ctx, "claim_quota_outbox_batch", start, &err)
 
-	return s.claimQuotaOutboxBatch(ctx, now, leaseDuration, limit)
+	result, err := s.claimQuotaOutboxBatchResult(ctx, now, leaseDuration, limit)
+	if err != nil {
+		return nil, err
+	}
+	return result.Entries, nil
+}
+
+// ClaimQuotaOutboxBatchResult claims queued quota mutations and returns whether
+// repeated benign claim conflicts exhausted the bounded retry loop.
+func (s *Store) ClaimQuotaOutboxBatchResult(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) (result QuotaOutboxBatchClaimResult, err error) {
+	start := time.Now()
+	defer observeStoreOp(ctx, "claim_quota_outbox_batch", start, &err)
+
+	return s.claimQuotaOutboxBatchResult(ctx, now, leaseDuration, limit)
 }
 
 func (s *Store) claimQuotaOutboxBatch(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) ([]QuotaOutboxEntry, error) {
+	result, err := s.claimQuotaOutboxBatchResult(ctx, now, leaseDuration, limit)
+	if err != nil {
+		return nil, err
+	}
+	return result.Entries, nil
+}
+
+func (s *Store) claimQuotaOutboxBatchResult(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) (QuotaOutboxBatchClaimResult, error) {
 	for attempt := 0; attempt < quotaOutboxClaimMaxAttempts; attempt++ {
 		entries, err := s.claimQuotaOutboxBatchOnce(ctx, now, leaseDuration, limit)
 		if errors.Is(err, errQuotaOutboxClaimConflict) {
 			continue
 		}
-		return entries, err
+		return QuotaOutboxBatchClaimResult{Entries: entries}, err
 	}
-	metrics.RecordOperation("datastore", "claim_quota_outbox_conflict_exhausted", "conflict", 0)
-	return nil, nil
+	return QuotaOutboxBatchClaimResult{ConflictExhausted: true}, nil
 }
 
 func (s *Store) claimQuotaOutboxBatchOnce(ctx context.Context, now time.Time, leaseDuration time.Duration, limit int) ([]QuotaOutboxEntry, error) {

@@ -234,15 +234,22 @@ func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (p
 	if limit <= 0 {
 		limit = 1
 	}
-	entries, err := b.store.ClaimQuotaOutboxBatch(ctx, time.Now().UTC(), quotaOutboxLeaseDuration, limit)
+	claim, err := b.store.ClaimQuotaOutboxBatchResult(ctx, time.Now().UTC(), quotaOutboxLeaseDuration, limit)
 	if err != nil {
 		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "claim", "error", time.Since(start))
 		return 0, err
 	}
+	if claim.ConflictExhausted {
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "claim", "conflict", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "claim_conflict_exhausted", "conflict", time.Since(start))
+		return 0, nil
+	}
+	entries := claim.Entries
 	if len(entries) == 0 {
 		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "claim", "empty", time.Since(start))
 		return 0, nil
 	}
+	metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "claim", "ok", time.Since(start))
 
 	appliedEntries := make([]datastore.QuotaOutboxEntry, 0, len(entries))
 	var batchApplyErr error
