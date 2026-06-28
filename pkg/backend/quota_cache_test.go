@@ -314,9 +314,8 @@ func TestQuotaPendingDeltasCacheUsesTTLAndLocalAdjustments(t *testing.T) {
 	}
 }
 
-func TestQuotaPendingDeltasCacheDoesNotPublishSnapshotWhenLocalDeltaRacesLoad(t *testing.T) {
+func TestQuotaPendingDeltasCachePublishesConservativeSnapshotWhenLocalDeltaRacesLoad(t *testing.T) {
 	var calls atomic.Int64
-	storage := int64(10)
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
@@ -324,7 +323,7 @@ func TestQuotaPendingDeltasCacheDoesNotPublishSnapshotWhenLocalDeltaRacesLoad(t 
 		calls.Add(1)
 		once.Do(func() { close(started) })
 		<-release
-		return storage, 1, 0, nil
+		return 10, 1, 0, nil
 	}, time.Hour)
 
 	type result struct {
@@ -339,22 +338,69 @@ func TestQuotaPendingDeltasCacheDoesNotPublishSnapshotWhenLocalDeltaRacesLoad(t 
 
 	<-started
 	c.add(5, 1, 0)
-	storage = 15
 	close(release)
 
 	got := <-done
-	if got.ok {
-		t.Fatalf("racing get ok=true deltas=%+v, want fallback", got.deltas)
+	if !got.ok {
+		t.Fatal("racing get failed")
+	}
+	if got.deltas.storageDelta != 15 || got.deltas.fileDelta != 2 || got.deltas.mediaDelta != 0 {
+		t.Fatalf("racing deltas = %+v, want 15/2/0", got.deltas)
 	}
 	next, ok := c.get(context.Background())
 	if !ok {
 		t.Fatal("second get failed")
 	}
-	if next.storageDelta != 15 || next.fileDelta != 1 || next.mediaDelta != 0 {
-		t.Fatalf("second deltas = %+v, want 15/1/0", next)
+	if next.storageDelta != 15 || next.fileDelta != 2 || next.mediaDelta != 0 {
+		t.Fatalf("second deltas = %+v, want 15/2/0", next)
 	}
-	if got := calls.Load(); got != 2 {
-		t.Fatalf("loader calls = %d, want 2", got)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("loader calls = %d, want 1", got)
+	}
+}
+
+func TestQuotaPendingDeltasCacheIgnoresNegativeRaceDeltasWhenPublishing(t *testing.T) {
+	var calls atomic.Int64
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	c := newQuotaPendingDeltasCache("test-tenant", func(context.Context) (int64, int64, int64, error) {
+		calls.Add(1)
+		once.Do(func() { close(started) })
+		<-release
+		return 10, 2, 1, nil
+	}, time.Hour)
+
+	type result struct {
+		deltas quotaPendingDeltas
+		ok     bool
+	}
+	done := make(chan result, 1)
+	go func() {
+		deltas, ok := c.get(context.Background())
+		done <- result{deltas: deltas, ok: ok}
+	}()
+
+	<-started
+	c.add(-5, -1, -1)
+	close(release)
+
+	got := <-done
+	if !got.ok {
+		t.Fatal("racing get failed")
+	}
+	if got.deltas.storageDelta != 10 || got.deltas.fileDelta != 2 || got.deltas.mediaDelta != 1 {
+		t.Fatalf("racing deltas = %+v, want 10/2/1", got.deltas)
+	}
+	next, ok := c.get(context.Background())
+	if !ok {
+		t.Fatal("second get failed")
+	}
+	if next.storageDelta != 10 || next.fileDelta != 2 || next.mediaDelta != 1 {
+		t.Fatalf("second deltas = %+v, want 10/2/1", next)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("loader calls = %d, want 1", got)
 	}
 }
 

@@ -291,10 +291,11 @@ type quotaPendingDeltasCache struct {
 	load     quotaPendingDeltasLoader
 	ttl      time.Duration
 
-	mu         sync.RWMutex
-	snapshot   *quotaPendingDeltasSnapshot
-	generation uint64
-	loadMu     sync.Mutex
+	mu                  sync.RWMutex
+	snapshot            *quotaPendingDeltasSnapshot
+	generation          uint64
+	localPositiveDeltas quotaPendingDeltas
+	loadMu              sync.Mutex
 }
 
 func newQuotaPendingDeltasCache(tenantID string, load quotaPendingDeltasLoader, ttl time.Duration) *quotaPendingDeltasCache {
@@ -322,6 +323,7 @@ func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, 
 
 	c.mu.RLock()
 	generation := c.generation
+	localPositiveDeltas := c.localPositiveDeltas
 	c.mu.RUnlock()
 
 	start := time.Now()
@@ -339,12 +341,19 @@ func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, 
 	expiresAt := time.Now().Add(c.ttl)
 	c.mu.Lock()
 	if c.generation != generation {
+		deltas.add(c.localPositiveDeltas.sub(localPositiveDeltas))
+		c.snapshot = &quotaPendingDeltasSnapshot{
+			deltas:    deltas,
+			expiresAt: expiresAt,
+		}
 		c.mu.Unlock()
-		// A local enqueue or ack raced this DB load. Do not merge blindly:
-		// the SELECT may or may not have observed that row. Let the caller
-		// fall back to a live tenant-DB read for this check.
+		// A local enqueue or ack raced this DB load. The SELECT may or may not
+		// have observed those rows. Merge only positive local deltas from the
+		// race window: that may double-count this process's newest writes for
+		// one short TTL, but it avoids undercounting quota and keeps small-write
+		// admission off the expensive in-transaction SUM(quota_outbox) path.
 		metrics.RecordTenantOperation(c.tenantID, "server_quota", "pending_delta_cache", "raced_local_delta", time.Since(start))
-		return quotaPendingDeltas{}, false
+		return deltas, true
 	}
 	c.snapshot = &quotaPendingDeltasSnapshot{
 		deltas:    deltas,
@@ -371,14 +380,41 @@ func (c *quotaPendingDeltasCache) add(storageDelta, fileDelta, mediaDelta int64)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.generation++
-	// If the snapshot is missing or expired, leave it cold. The generation bump
-	// prevents any concurrent loader from publishing a pre-delta snapshot; the
-	// next soft admission check reloads from quota_outbox and sees this
-	// backend's queued row along with rows from other servers.
+	c.localPositiveDeltas.add(quotaPendingDeltas{
+		storageDelta: maxInt64(storageDelta, 0),
+		fileDelta:    maxInt64(fileDelta, 0),
+		mediaDelta:   maxInt64(mediaDelta, 0),
+	})
+	// If the snapshot is missing or expired, leave it cold. A concurrent loader
+	// publishes a conservative snapshot by merging positive local deltas from
+	// the race window; otherwise the next soft admission check reloads from
+	// quota_outbox and sees this backend's queued row along with rows from
+	// other servers.
 	if c.snapshot == nil || time.Now().After(c.snapshot.expiresAt) {
 		return
 	}
 	c.snapshot.deltas.storageDelta += storageDelta
 	c.snapshot.deltas.fileDelta += fileDelta
 	c.snapshot.deltas.mediaDelta += mediaDelta
+}
+
+func (d *quotaPendingDeltas) add(other quotaPendingDeltas) {
+	d.storageDelta += other.storageDelta
+	d.fileDelta += other.fileDelta
+	d.mediaDelta += other.mediaDelta
+}
+
+func (d quotaPendingDeltas) sub(other quotaPendingDeltas) quotaPendingDeltas {
+	return quotaPendingDeltas{
+		storageDelta: d.storageDelta - other.storageDelta,
+		fileDelta:    d.fileDelta - other.fileDelta,
+		mediaDelta:   d.mediaDelta - other.mediaDelta,
+	}
+}
+
+func maxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
