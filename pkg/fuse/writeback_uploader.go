@@ -491,8 +491,13 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 	uploadStart := time.Now()
 	threshold := u.directPutThreshold()
 	useDirectPUT := meta.Size == 0 || (threshold > 0 && meta.Size < threshold)
+	foldModeIntoCreate := useDirectPUT && shouldFoldRemoteModeIntoCreate(meta.Kind, meta.HasMode, meta.Mode)
 	if useDirectPUT {
-		committedRev, err = u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, expectedRevision)
+		if foldModeIntoCreate {
+			committedRev, err = u.client.WriteCtxConditionalWithRevisionAndMode(ctx, u.remotePath(localPath), data, expectedRevision, meta.Mode&posixPermissionModeMask, true)
+		} else {
+			committedRev, err = u.client.WriteCtxConditionalWithRevision(ctx, u.remotePath(localPath), data, expectedRevision)
+		}
 	} else {
 		committedRev, err = uploadBufferedRemoteFileWithRevision(ctx, u.client, u.remotePath(localPath), data, expectedRevision)
 	}
@@ -506,17 +511,19 @@ func (u *WriteBackUploader) UploadSyncWithRevision(ctx context.Context, localPat
 		return 0, err
 	}
 	committedRev = committedRevisionForExpectedRevision(expectedRevision, committedRev)
-	chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
-	err = u.applyMode(chmodCtx, meta)
-	chmodCancel()
-	if err != nil {
-		if u.perf != nil {
-			u.perf.uploaderFailure.add(1)
+	if !foldModeIntoCreate {
+		chmodCtx, chmodCancel := context.WithTimeout(ctx, 30*time.Second)
+		err = u.applyMode(chmodCtx, meta)
+		chmodCancel()
+		if err != nil {
+			if u.perf != nil {
+				u.perf.uploaderFailure.add(1)
+			}
+			if _, markErr := u.cache.MarkChmodPending(localPath, gen); markErr != nil {
+				return 0, fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
+			}
+			return 0, err
 		}
-		if _, markErr := u.cache.MarkChmodPending(localPath, gen); markErr != nil {
-			return 0, fmt.Errorf("%w; mark chmod pending: %v", err, markErr)
-		}
-		return 0, err
 	}
 
 	// Atomically remove only if generation matches — a concurrent Put() may

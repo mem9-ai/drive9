@@ -8430,6 +8430,64 @@ func TestCreateDefaultModeDoesNotStageRemoteMode(t *testing.T) {
 	}
 }
 
+func TestFlushNewSmallFileFoldsCreateModeIntoPut(t *testing.T) {
+	var (
+		putCalls   atomic.Int32
+		chmodCalls atomic.Int32
+	)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			putCalls.Add(1)
+			if r.URL.Path != "/v1/fs/mode.txt" {
+				t.Errorf("PUT path = %s, want /v1/fs/mode.txt", r.URL.Path)
+			}
+			if got := r.Header.Get("X-Dat9-Mode"); got != "438" {
+				t.Errorf("X-Dat9-Mode = %q, want 438", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"revision": int64(1)})
+		case http.MethodPost:
+			if r.URL.Query().Has("chmod") {
+				chmodCalls.Add(1)
+				http.Error(w, "unexpected chmod", http.StatusInternalServerError)
+				return
+			}
+			http.Error(w, "unexpected POST", http.StatusInternalServerError)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer ts.Close()
+
+	opts := &MountOptions{FlushDebounce: 0}
+	opts.setDefaults()
+	fs := NewDat9FS(newTestClient(ts.URL), opts)
+
+	var out gofuse.CreateOut
+	st := fs.Create(nil, &gofuse.CreateIn{
+		InHeader: gofuse.InHeader{NodeId: 1},
+		Flags:    uint32(syscall.O_WRONLY | syscall.O_CREAT),
+		Mode:     0o666,
+	}, "mode.txt", &out)
+	if st != gofuse.OK {
+		t.Fatalf("Create status = %v, want OK", st)
+	}
+	if _, st = fs.Write(nil, &gofuse.WriteIn{Fh: out.Fh, Offset: 0}, []byte("x")); st != gofuse.OK {
+		t.Fatalf("Write status = %v, want OK", st)
+	}
+	if st = fs.Flush(nil, &gofuse.FlushIn{Fh: out.Fh}); st != gofuse.OK {
+		t.Fatalf("Flush status = %v, want OK", st)
+	}
+	fs.Release(nil, &gofuse.ReleaseIn{Fh: out.Fh})
+
+	if got := putCalls.Load(); got != 1 {
+		t.Fatalf("PUT calls = %d, want 1", got)
+	}
+	if got := chmodCalls.Load(); got != 0 {
+		t.Fatalf("chmod calls = %d, want 0", got)
+	}
+}
+
 func TestDeferredChmodRollbackRestoresUnknownMode(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost && r.URL.RawQuery == "chmod" {
@@ -15624,13 +15682,13 @@ func TestFlushHandle_Path2_DebounceCancelledBeforeUnlock(t *testing.T) {
 //
 // Interleaving under test:
 //
-//	1. Hold fh.Lock() → schedule debounce (short delay) → keep lock held
-//	2. Timer fires → callback blocks on handle.Lock() (we hold it)
-//	3. Call flushHandle (Path 2) while holding lock — Path 2 internally
-//	   releases fh.mu, uploads, records committed revision, releases
-//	   remoteCommitLock, reacquires fh.mu, returns
-//	4. fh.Unlock() → callback acquires handle.Lock() → acquires
-//	   remoteCommitLock → re-checks expectedRevision → skip (no double PUT)
+//  1. Hold fh.Lock() → schedule debounce (short delay) → keep lock held
+//  2. Timer fires → callback blocks on handle.Lock() (we hold it)
+//  3. Call flushHandle (Path 2) while holding lock — Path 2 internally
+//     releases fh.mu, uploads, records committed revision, releases
+//     remoteCommitLock, reacquires fh.mu, returns
+//  4. fh.Unlock() → callback acquires handle.Lock() → acquires
+//     remoteCommitLock → re-checks expectedRevision → skip (no double PUT)
 func TestFlushHandle_Path2_DebounceAlreadyFiredSkipsUpload(t *testing.T) {
 	var uploadCount atomic.Int32
 

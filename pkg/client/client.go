@@ -501,6 +501,13 @@ func (c *Client) WriteCtxConditionalWithRevision(ctx context.Context, path strin
 	return c.writeCtxConditionalFull(ctx, path, data, expectedRevision, nil, "")
 }
 
+// WriteCtxConditionalWithRevisionAndMode is like WriteCtxConditionalWithRevision
+// and also asks the server to persist the initial POSIX mode in the same write
+// transaction when hasMode is true.
+func (c *Client) WriteCtxConditionalWithRevisionAndMode(ctx context.Context, path string, data []byte, expectedRevision int64, mode uint32, hasMode bool) (int64, error) {
+	return c.writeCtxConditionalFullWithMode(ctx, path, data, expectedRevision, nil, "", mode, hasMode)
+}
+
 // CreateFile creates an empty file.
 func (c *Client) CreateFile(path string) (int64, error) {
 	return c.CreateFileCtx(context.Background(), path)
@@ -584,6 +591,10 @@ func (c *Client) HardlinkCtx(ctx context.Context, srcPath, dstPath string) error
 }
 
 func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string) (int64, error) {
+	return c.writeCtxConditionalFullWithMode(ctx, path, data, expectedRevision, tags, description, 0, false)
+}
+
+func (c *Client) writeCtxConditionalFullWithMode(ctx context.Context, path string, data []byte, expectedRevision int64, tags map[string]string, description string, mode uint32, hasMode bool) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.url(path), bytes.NewReader(data))
 	if err != nil {
 		return 0, err
@@ -597,6 +608,9 @@ func (c *Client) writeCtxConditionalFull(ctx context.Context, path string, data 
 	}
 	if description != "" {
 		req.Header.Set("X-Dat9-Description", description)
+	}
+	if hasMode {
+		req.Header.Set("X-Dat9-Mode", strconv.FormatUint(uint64(mode), 10))
 	}
 	resp, err := c.do(req)
 	if err != nil {

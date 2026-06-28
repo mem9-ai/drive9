@@ -631,6 +631,13 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTags(ctx context.Context, path strin
 // WriteCtxIfRevisionWithTagsResult is like WriteCtxIfRevisionWithTags but also
 // returns the committed revision of the file after a successful write.
 func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string) (n int64, committedRevision int64, err error) {
+	return b.WriteCtxIfRevisionWithTagsModeResult(ctx, path, data, offset, flags, expectedRevision, tags, description, 0, false)
+}
+
+// WriteCtxIfRevisionWithTagsModeResult is like WriteCtxIfRevisionWithTagsResult
+// and also persists the initial POSIX mode in the same transaction for creates
+// when hasMode is true.
+func (b *Dat9Backend) WriteCtxIfRevisionWithTagsModeResult(ctx context.Context, path string, data []byte, offset int64, flags filesystem.WriteFlag, expectedRevision int64, tags map[string]string, description string, mode uint32, hasMode bool) (n int64, committedRevision int64, err error) {
 	start := time.Now()
 	timingEnabled := logger.BenchTimingLogEnabled()
 	rawPath := path
@@ -700,9 +707,9 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		if timingEnabled {
 			implementationStart = time.Now()
 		}
-		n, err, batched := b.tryCreateAndWriteBatchedCtx(ctx, path, data, tags, description)
+		n, err, batched := b.tryCreateAndWriteBatchedWithModeCtx(ctx, path, data, tags, description, mode, hasMode)
 		if !batched {
-			n, err = b.createAndWriteCtx(ctx, path, data, tags, description)
+			n, err = b.createAndWriteWithModeCtx(ctx, path, data, tags, description, mode, hasMode)
 		}
 		if timingEnabled {
 			implementationDuration = time.Since(implementationStart)
@@ -739,9 +746,9 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		if timingEnabled {
 			implementationStart = time.Now()
 		}
-		n, err, batched := b.tryCreateAndWriteBatchedCtx(ctx, path, data, tags, description)
+		n, err, batched := b.tryCreateAndWriteBatchedWithModeCtx(ctx, path, data, tags, description, mode, hasMode)
 		if !batched {
-			n, err = b.createAndWriteCtx(ctx, path, data, tags, description)
+			n, err = b.createAndWriteWithModeCtx(ctx, path, data, tags, description, mode, hasMode)
 		}
 		if timingEnabled {
 			implementationDuration = time.Since(implementationStart)
@@ -830,7 +837,7 @@ func cloneFileTags(tags map[string]string) map[string]string {
 	return out
 }
 
-func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string) (written int64, err error) {
+func (b *Dat9Backend) createAndWriteWithModeCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string, mode uint32, hasMode bool) (written int64, err error) {
 	timingEnabled := logger.BenchTimingLogEnabled()
 	start := time.Time{}
 	if timingEnabled {
@@ -966,6 +973,9 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			ContentType:            contentType, SizeBytes: int64(len(data)),
 			ChecksumSHA256: checksum, Revision: fileRev, Status: datastore.StatusConfirmed,
 			ContentText: contentText, Description: description, CreatedAt: now, ConfirmedAt: &now,
+		}
+		if hasMode {
+			insertFile.Mode = mode & 0o7777
 		}
 		if b.UsesDatabaseAutoEmbedding() && description != "" {
 			insertFile.DescriptionEmbeddingRevision = &fileRev

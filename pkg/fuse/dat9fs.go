@@ -277,7 +277,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		readFlight:        NewSingleFlight(),
 		remoteReadTimeout: fuseTimeout,
 		xattrs:            NewXAttrStore(),
-		deletedPaths:     make(map[string]time.Time),
+		deletedPaths:      make(map[string]time.Time),
 	}
 }
 
@@ -11924,6 +11924,8 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	handleOrigSize := fh.OrigSize
 	handleDirtyPartSize := fh.Dirty.PartSize()
 	handleFullRangeLoaded := writeBufferHasLoadedFullRange(fh.Dirty)
+	pendingMode, hasPendingMode := fs.modeForPendingHandle(fh)
+	pendingModeGen := fh.PendingModeGen
 	var committedRev int64
 
 	// Use the negotiated server threshold (not the heuristic-only inline
@@ -11935,6 +11937,7 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	// rejects total_size=0.
 	threshold := fs.negotiatedInlineThreshold()
 	useDirectPUT := size == 0 || (threshold > 0 && size < threshold)
+	foldModeIntoCreate := useDirectPUT && handleIsNew && shouldFoldRemoteModeIntoCreate(fs.pendingKindForHandle(fh), hasPendingMode, pendingMode)
 
 	// Determine whether we take the patch path (existing large file with
 	// dirty parts). Patch mode only needs per-part snapshots, NOT a full
@@ -12024,8 +12027,12 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			phase = "empty-create"
 			writeStart := time.Now()
 			fs.debugf("flushHandle empty create start path=%s expected_rev=%d", handlePath, expectedRevision)
-			committedRev, err = fs.client.CreateFileCtx(ctx, remotePath)
-			if isCreateActionUnsupportedErr(err) {
+			if foldModeIntoCreate {
+				committedRev, err = fs.client.WriteCtxConditionalWithRevisionAndMode(ctx, remotePath, dataCopy, expectedRevision, pendingMode, true)
+			} else {
+				committedRev, err = fs.client.CreateFileCtx(ctx, remotePath)
+			}
+			if !foldModeIntoCreate && isCreateActionUnsupportedErr(err) {
 				fs.debugf("flushHandle empty create unsupported path=%s fallback=small-write err=%v", handlePath, err)
 				committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, remotePath, dataCopy, expectedRevision)
 			}
@@ -12036,7 +12043,11 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 			phase = "small-write"
 			writeStart := time.Now()
 			fs.debugf("flushHandle small write start path=%s size=%d expected_rev=%d", handlePath, size, expectedRevision)
-			committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, remotePath, dataCopy, expectedRevision)
+			if foldModeIntoCreate {
+				committedRev, err = fs.client.WriteCtxConditionalWithRevisionAndMode(ctx, remotePath, dataCopy, expectedRevision, pendingMode, true)
+			} else {
+				committedRev, err = fs.client.WriteCtxConditionalWithRevision(ctx, remotePath, dataCopy, expectedRevision)
+			}
 			fs.perfRecordRemote(perfRemoteWrite, writeStart, err, uint64(len(dataCopy)))
 			fs.debugDurationf(writeStart, 0, "flushHandle small write done path=%s size=%d committed_rev=%d err=%v", handlePath, size, committedRev, err)
 		}
@@ -12123,6 +12134,13 @@ func (fs *Dat9FS) flushHandle(ctx context.Context, fh *FileHandle) (status gofus
 	if err != nil {
 		log.Printf("flush upload failed for %s: %v", handlePath, err)
 		return httpToFuseStatus(err)
+	}
+	if foldModeIntoCreate && pendingModeMatchesLocked(fh, pendingMode, pendingModeGen) {
+		fs.inodes.UpdateMode(handleIno, pendingMode&posixPermissionModeMask)
+		clearPendingModeLocked(fh)
+		fh.Unlock()
+		fs.clearPendingModeForInodeGeneration(handleIno, fh, pendingMode, pendingModeGen)
+		fh.Lock()
 	}
 	if err := fs.applyPendingModeWithTimeoutLocked(fh); err != nil {
 		log.Printf("flush pending chmod failed for %s: %v", handlePath, err)

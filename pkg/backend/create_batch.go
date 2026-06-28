@@ -64,6 +64,8 @@ type preparedCreateWrite struct {
 	fileID               string
 	tags                 map[string]string
 	description          string
+	mode                 uint32
+	hasMode              bool
 	contentType          string
 	checksum             string
 	contentText          string
@@ -127,7 +129,7 @@ func (c *createBatcher) stop() {
 	<-c.done
 }
 
-func (c *createBatcher) create(ctx context.Context, path string, data []byte, tags map[string]string, description string) (int64, error) {
+func (c *createBatcher) createWithMode(ctx context.Context, path string, data []byte, tags map[string]string, description string, mode uint32, hasMode bool) (int64, error) {
 	c.mu.Lock()
 	if c.stopping {
 		c.mu.Unlock()
@@ -135,7 +137,7 @@ func (c *createBatcher) create(ctx context.Context, path string, data []byte, ta
 	}
 	c.mu.Unlock()
 
-	item, err := c.backend.prepareCreateWrite(ctx, path, data, tags, description)
+	item, err := c.backend.prepareCreateWriteWithMode(ctx, path, data, tags, description, mode, hasMode)
 	if err != nil {
 		return 0, err
 	}
@@ -371,18 +373,18 @@ func withCreateBatchSavepoint(ctx context.Context, tx *sql.Tx, fn func() error) 
 	return nil, nil
 }
 
-func (b *Dat9Backend) tryCreateAndWriteBatchedCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string) (int64, error, bool) {
+func (b *Dat9Backend) tryCreateAndWriteBatchedWithModeCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string, mode uint32, hasMode bool) (int64, error, bool) {
 	if b.createBatcher == nil || !b.UseServerQuota() || !b.shouldStoreInDB(int64(len(data))) {
 		return 0, nil, false
 	}
 	if isQuotaMediaContentType(detectContentType(path, data)) {
 		return 0, nil, false
 	}
-	written, err := b.createBatcher.create(ctx, path, data, tags, description)
+	written, err := b.createBatcher.createWithMode(ctx, path, data, tags, description, mode, hasMode)
 	return written, err, true
 }
 
-func (b *Dat9Backend) prepareCreateWrite(ctx context.Context, path string, data []byte, tags map[string]string, description string) (*preparedCreateWrite, error) {
+func (b *Dat9Backend) prepareCreateWriteWithMode(ctx context.Context, path string, data []byte, tags map[string]string, description string, mode uint32, hasMode bool) (*preparedCreateWrite, error) {
 	if err := b.ensureUploadSizeAllowed(int64(len(data))); err != nil {
 		return nil, err
 	}
@@ -400,6 +402,8 @@ func (b *Dat9Backend) prepareCreateWrite(ctx context.Context, path string, data 
 		fileID:      b.genID(),
 		tags:        cloneFileTags(tags),
 		description: description,
+		mode:        mode & 0o7777,
+		hasMode:     hasMode,
 		contentType: contentType,
 		checksum:    sha256sum(data),
 		contentText: extractText(data, contentType, b.textExtractMaxBytes),
@@ -494,6 +498,9 @@ func (b *Dat9Backend) insertPreparedCreateTx(ctx context.Context, tx *sql.Tx, it
 		Description:           item.description,
 		CreatedAt:             item.now,
 		ConfirmedAt:           &item.now,
+	}
+	if item.hasMode {
+		insertFile.Mode = item.mode
 	}
 	if b.UsesDatabaseAutoEmbedding() && item.description != "" {
 		insertFile.DescriptionEmbeddingRevision = &fileRev
