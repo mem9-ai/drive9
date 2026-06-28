@@ -125,6 +125,10 @@ func main() {
 	// P1-3: Configurable quota cache refresh interval (default 30s).
 	// In multi-pod deployments, increasing this reduces per-tenant-per-pod DB reads.
 	backend.InitQuotaConfigCacheRefreshInterval(envInt("DRIVE9_QUOTA_CACHE_REFRESH_SECONDS", 0))
+	backend.InitQuotaAdmissionCacheTTLs(
+		envDuration("DRIVE9_QUOTA_USAGE_CACHE_TTL", 0),
+		envDuration("DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL", 0),
+	)
 
 	store, err := openControlPlaneStoreWithRetry(context.Background(), metaDSN, defaultStartupRetryOptions())
 	if err != nil {
@@ -478,6 +482,8 @@ environment:
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_SOURCE tenant|server quota enforcement source (default: tenant)
+  DRIVE9_QUOTA_USAGE_CACHE_TTL soft small-write central usage cache TTL, e.g. 250ms or 1s
+  DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write tenant pending-outbox aggregate cache TTL, e.g. 250ms or 1s
   DRIVE9_DISABLE_AUTO_EMBEDDING true|false disable TiDB database-managed auto-embedding (default: false)
                                 set to true when the TiDB Cloud cluster has no supported embedding provider
   DRIVE9_TIDB_AUTO_EMBEDDING_MODEL TiDB EMBED_TEXT model for auto-embedding generated columns
@@ -865,6 +871,18 @@ func envInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	v, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return fallback
+	}
+	return v
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	v, err := time.ParseDuration(raw)
 	if err != nil {
 		return fallback
 	}

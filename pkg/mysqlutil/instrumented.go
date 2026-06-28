@@ -268,18 +268,7 @@ func observeDBOperation(ctx context.Context, role, operation string, start time.
 }
 
 func dbResult(err error) string {
-	switch {
-	case err == nil:
-		return "ok"
-	case errors.Is(err, context.Canceled):
-		return "canceled"
-	case errors.Is(err, context.DeadlineExceeded):
-		return "deadline_exceeded"
-	case errors.Is(err, driver.ErrBadConn):
-		return "bad_conn"
-	default:
-		return "error"
-	}
+	return metrics.ResultForError(err)
 }
 
 func toNamedValues(args []driver.Value) []driver.NamedValue {

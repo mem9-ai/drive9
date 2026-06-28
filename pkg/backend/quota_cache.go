@@ -19,17 +19,21 @@ const (
 	// quotaUsageCacheTTL bounds how long soft small-write quota checks may
 	// reuse central usage counters. Strict upload reservations still read
 	// central usage directly.
-	quotaUsageCacheTTL = 100 * time.Millisecond
+	defaultQuotaUsageCacheTTL = 250 * time.Millisecond
 	// quotaPendingDeltasCacheTTL bounds tenant-local pending outbox aggregate
 	// reuse for soft small-write checks. The cache is adjusted for mutations
 	// enqueued/acked by this backend instance and periodically reloads to see
 	// other servers.
-	quotaPendingDeltasCacheTTL = 100 * time.Millisecond
+	defaultQuotaPendingDeltasCacheTTL = 250 * time.Millisecond
 )
 
 // quotaConfigCacheRefreshInterval is the resolved refresh interval (package-level
 // var so it can be set from env at startup).
-var quotaConfigCacheRefreshInterval = defaultQuotaConfigCacheRefreshInterval
+var (
+	quotaConfigCacheRefreshInterval = defaultQuotaConfigCacheRefreshInterval
+	quotaUsageCacheTTL              = defaultQuotaUsageCacheTTL
+	quotaPendingDeltasCacheTTL      = defaultQuotaPendingDeltasCacheTTL
+)
 
 // InitQuotaConfigCacheRefreshInterval overrides the default refresh interval.
 // seconds <= 0 keeps the default (30s). Must be called before any backend
@@ -37,6 +41,18 @@ var quotaConfigCacheRefreshInterval = defaultQuotaConfigCacheRefreshInterval
 func InitQuotaConfigCacheRefreshInterval(seconds int) {
 	if seconds > 0 {
 		quotaConfigCacheRefreshInterval = time.Duration(seconds) * time.Second
+	}
+}
+
+// InitQuotaAdmissionCacheTTLs overrides soft quota admission cache TTLs. The
+// caches are used only for small-write admission; strict upload reservations
+// continue to read current central and tenant-local quota state directly.
+func InitQuotaAdmissionCacheTTLs(usageTTL, pendingDeltasTTL time.Duration) {
+	if usageTTL > 0 {
+		quotaUsageCacheTTL = usageTTL
+	}
+	if pendingDeltasTTL > 0 {
+		quotaPendingDeltasCacheTTL = pendingDeltasTTL
 	}
 }
 

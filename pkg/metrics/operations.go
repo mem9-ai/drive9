@@ -3,6 +3,9 @@
 package metrics
 
 import (
+	"context"
+	"database/sql/driver"
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -116,6 +119,46 @@ func RecordTenantOperation(tenantID, component, operation, result string, d time
 	}
 	serviceOperationsTotal.Add(1, attrs...)
 	serviceOperationDuration.Observe(d.Seconds(), attrs...)
+}
+
+// ResultForError returns a stable metric result label for common infrastructure
+// errors. Callers should use this when recording generic worker/DB failures so
+// transient bad connections do not get bucketed with semantic operation errors.
+func ResultForError(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline_exceeded"
+	case errors.Is(err, driver.ErrBadConn):
+		return "bad_conn"
+	case strings.Contains(strings.ToLower(err.Error()), "invalid connection"):
+		return "bad_conn"
+	default:
+		return "error"
+	}
+}
+
+// RecordTenantOperationCount records an operation outcome without adding a
+// duration sample. Use it for per-entry counters when one wall-clock duration
+// would be duplicated across many logical items in the same batch.
+func RecordTenantOperationCount(tenantID, component, operation, result string) {
+	component = cleanMetricValue(component, "unknown")
+	operation = cleanMetricValue(operation, "unknown")
+	result = cleanMetricValue(result, "unknown")
+	tenantID = cleanMetricValue(tenantID, "unknown")
+	RegisterModule(component)
+	attrs := []Attribute{
+		Attr("component", component),
+		Attr("operation", operation),
+		Attr("result", result),
+	}
+	if tenantID != "unknown" {
+		attrs = append(attrs, Attr("tenant_id", tenantID))
+	}
+	serviceOperationsTotal.Add(1, attrs...)
 }
 
 func RecordGauge(component, name string, value float64) {

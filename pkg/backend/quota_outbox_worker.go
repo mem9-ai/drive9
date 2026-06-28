@@ -128,7 +128,7 @@ func (b *Dat9Backend) processQuotaOutboxAvailable(ctx context.Context) {
 		logger.Warn(ctx, "quota_outbox_recover_expired_failed",
 			zap.String("tenant_id", b.tenantID),
 			zap.Error(err))
-		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "recover_expired", "error", 0)
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "recover_expired", metrics.ResultForError(err), 0)
 	}
 	processedTotal := 0
 	for processedTotal < quotaOutboxBatchSize {
@@ -245,7 +245,7 @@ func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (p
 	}
 	claim, err := claimQuotaOutbox(ctx, time.Now().UTC(), quotaOutboxLeaseDuration, limit)
 	if err != nil {
-		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "claim", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "claim", metrics.ResultForError(err), time.Since(start))
 		return 0, err
 	}
 	if claim.ConflictExhausted {
@@ -283,11 +283,12 @@ func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (p
 		return nil
 	})
 	if err != nil {
-		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "process", "error", time.Since(start))
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "process", metrics.ResultForError(err), time.Since(start))
 		return processed, err
 	}
 	if batchApplyErr == nil && processed > 0 {
-		b.recordAppliedQuotaOutboxEntries(start, appliedEntries)
+		b.recordAppliedQuotaOutboxEntries(appliedEntries)
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "process", "ok", time.Since(start))
 		return processed, nil
 	}
 	if len(entries) > 1 && batchApplyErr != nil {
@@ -307,9 +308,9 @@ func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (p
 			appliedEntries = append(appliedEntries, entries[i])
 		}
 		if entryErr != nil {
-			metrics.RecordTenantOperation(b.tenantID, "quota_outbox", entries[i].MutationType, "error", time.Since(start))
+			metrics.RecordTenantOperation(b.tenantID, "quota_outbox", entries[i].MutationType, metrics.ResultForError(entryErr), time.Since(start))
 			if !entryProcessed {
-				b.recordAppliedQuotaOutboxEntries(start, appliedEntries)
+				b.recordAppliedQuotaOutboxEntries(appliedEntries)
 				return processed, entryErr
 			}
 			if fallbackErr == nil {
@@ -317,9 +318,12 @@ func (b *Dat9Backend) ProcessQuotaOutboxBatch(ctx context.Context, limit int) (p
 			}
 		}
 	}
-	b.recordAppliedQuotaOutboxEntries(start, appliedEntries)
+	b.recordAppliedQuotaOutboxEntries(appliedEntries)
 	if fallbackErr != nil {
 		return processed, fallbackErr
+	}
+	if processed > 0 {
+		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", "process", "ok", time.Since(start))
 	}
 	return processed, nil
 }
@@ -357,7 +361,7 @@ func (b *Dat9Backend) processQuotaOutboxEntry(ctx context.Context, entry *datast
 	return true, true, nil
 }
 
-func (b *Dat9Backend) recordAppliedQuotaOutboxEntries(start time.Time, entries []datastore.QuotaOutboxEntry) {
+func (b *Dat9Backend) recordAppliedQuotaOutboxEntries(entries []datastore.QuotaOutboxEntry) {
 	if len(entries) == 0 {
 		return
 	}
@@ -366,7 +370,7 @@ func (b *Dat9Backend) recordAppliedQuotaOutboxEntries(start time.Time, entries [
 	}
 	for _, entry := range entries {
 		b.addLocalQuotaPendingDeltas(-entry.StorageDelta, -entry.FileDelta, -entry.MediaDelta)
-		metrics.RecordTenantOperation(b.tenantID, "quota_outbox", entry.MutationType, "ok", time.Since(start))
+		metrics.RecordTenantOperationCount(b.tenantID, "quota_outbox", entry.MutationType, "ok")
 	}
 }
 

@@ -128,7 +128,7 @@ func (w *FileGCWorker) processAvailable(ctx context.Context) {
 			return
 		}
 		logger.Warn(ctx, "file_gc_recover_expired_failed", zap.String("tenant_id", tenantID), zap.Error(err))
-		metrics.RecordTenantOperation(tenantID, "file_gc", "recover_expired", "error", 0)
+		metrics.RecordTenantOperation(tenantID, "file_gc", "recover_expired", metrics.ResultForError(err), 0)
 	}
 	for i := 0; i < w.opts.BatchSize; i++ {
 		if ctx.Err() != nil {
@@ -164,7 +164,7 @@ func (b *Dat9Backend) processOneFileGCTask(ctx context.Context, opts FileGCWorke
 	tenantID := b.tenantID
 	task, found, err := b.store.ClaimFileGCTask(ctx, time.Now().UTC(), opts.LeaseDuration)
 	if err != nil {
-		metrics.RecordTenantOperation(tenantID, "file_gc", "claim", "error", time.Since(start))
+		metrics.RecordTenantOperation(tenantID, "file_gc", "claim", metrics.ResultForError(err), time.Since(start))
 		return false, err
 	}
 	if !found {
@@ -175,7 +175,7 @@ func (b *Dat9Backend) processOneFileGCTask(ctx context.Context, opts FileGCWorke
 	err = b.processFileGCTask(ctx, task)
 	if err == nil {
 		if ackErr := b.store.AckFileGCTask(ctx, task.TaskID, task.Receipt); ackErr != nil {
-			metrics.RecordTenantOperation(tenantID, "file_gc", "ack", "error", time.Since(start))
+			metrics.RecordTenantOperation(tenantID, "file_gc", "ack", metrics.ResultForError(ackErr), time.Since(start))
 			return true, ackErr
 		}
 		metrics.RecordTenantOperation(tenantID, "file_gc", "process", "ok", time.Since(start))
@@ -184,10 +184,10 @@ func (b *Dat9Backend) processOneFileGCTask(ctx context.Context, opts FileGCWorke
 
 	retryAt := time.Now().UTC().Add(fileGCRetryDelay(task.AttemptCount, opts.RetryBase, opts.RetryMax))
 	if retryErr := b.store.RetryFileGCTask(ctx, task.TaskID, task.Receipt, retryAt, err.Error()); retryErr != nil {
-		metrics.RecordTenantOperation(tenantID, "file_gc", "retry", "error", time.Since(start))
+		metrics.RecordTenantOperation(tenantID, "file_gc", "retry", metrics.ResultForError(retryErr), time.Since(start))
 		return true, fmt.Errorf("process file gc task %s: %w; update retry: %v", task.TaskID, err, retryErr)
 	}
-	metrics.RecordTenantOperation(tenantID, "file_gc", "process", "error", time.Since(start))
+	metrics.RecordTenantOperation(tenantID, "file_gc", "process", metrics.ResultForError(err), time.Since(start))
 	return true, err
 }
 

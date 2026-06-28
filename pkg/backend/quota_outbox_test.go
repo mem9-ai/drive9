@@ -108,6 +108,20 @@ func TestServerQuotaOutboxBatchProcessesDifferentFiles(t *testing.T) {
 	if usage.StorageBytes != int64(len("aaaa")+len("bb")) || usage.FileCount != 2 || usage.MediaFileCount != 1 {
 		t.Fatalf("central usage after batch = %+v", usage)
 	}
+
+	metricsText := readBackendMetrics()
+	if !strings.Contains(metricsText, `drive9_service_operations_total{component="quota_outbox",operation="process",result="ok",tenant_id="tenant-a"}`) {
+		t.Fatalf("metrics missing quota_outbox process success counter: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, `drive9_service_operation_duration_seconds_count{component="quota_outbox",operation="process",result="ok",tenant_id="tenant-a"}`) {
+		t.Fatalf("metrics missing quota_outbox process success duration: %s", metricsText)
+	}
+	if !strings.Contains(metricsText, `drive9_service_operations_total{component="quota_outbox",operation="file_create",result="ok",tenant_id="tenant-a"}`) {
+		t.Fatalf("metrics missing quota_outbox file_create success counter: %s", metricsText)
+	}
+	if strings.Contains(metricsText, `drive9_service_operation_duration_seconds_count{component="quota_outbox",operation="file_create",result="ok",tenant_id="tenant-a"}`) {
+		t.Fatalf("quota_outbox file_create should not record per-entry duration: %s", metricsText)
+	}
 }
 
 func TestQuotaOutboxBatchConflictExhaustedRecordsTenantMetrics(t *testing.T) {
@@ -150,6 +164,29 @@ func TestQuotaOutboxBatchConflictExhaustedRecordsTenantMetrics(t *testing.T) {
 	}
 	if !strings.Contains(metricsText, `drive9_service_operations_total{component="quota_outbox",operation="claim_conflict_exhausted",result="conflict",tenant_id="tenant-a"}`) {
 		t.Fatalf("metrics missing tenant-scoped claim_conflict_exhausted counter: %s", metricsText)
+	}
+}
+
+func TestQuotaOutboxBatchClaimInvalidConnectionRecordsBadConn(t *testing.T) {
+	b, _ := newCentralQuotaBackend(t)
+	b.stopQuotaOutboxWorker()
+	ctx := context.Background()
+
+	b.claimQuotaOutbox = func(context.Context, time.Time, time.Duration, int) (datastore.QuotaOutboxBatchClaimResult, error) {
+		return datastore.QuotaOutboxBatchClaimResult{}, fmt.Errorf("claim quota outbox: invalid connection")
+	}
+
+	processed, err := b.ProcessQuotaOutboxBatch(ctx, 7)
+	if err == nil {
+		t.Fatal("process quota outbox batch error = nil, want invalid connection")
+	}
+	if processed != 0 {
+		t.Fatalf("processed = %d, want 0", processed)
+	}
+
+	metricsText := readBackendMetrics()
+	if !strings.Contains(metricsText, `drive9_service_operations_total{component="quota_outbox",operation="claim",result="bad_conn",tenant_id="tenant-a"}`) {
+		t.Fatalf("metrics missing tenant-scoped claim bad_conn counter: %s", metricsText)
 	}
 }
 
