@@ -107,8 +107,10 @@ type Options struct {
 // CreateBatchOptions controls micro-batching for DB-inline create-if-absent
 // writes. Batching is enabled only when MaxEntries > 1.
 type CreateBatchOptions struct {
-	MaxEntries int
-	Linger     time.Duration
+	MaxEntries           int
+	MaxBytes             int64
+	MaxConcurrentFlushes int
+	Linger               time.Duration
 }
 
 // LLMCostBudgetOptions configures the monthly LLM cost budget.

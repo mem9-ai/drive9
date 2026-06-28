@@ -161,8 +161,12 @@ func TestCreateBatchConcurrentCreatesCommit(t *testing.T) {
 	})
 	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
+	if b.createBatcher == nil {
+		t.Fatal("create batcher was not configured")
+	}
 
 	const files = 12
+	flushesBefore := b.createBatcher.flushCount.Load()
 	start := make(chan struct{})
 	errs := make(chan error, files)
 	for i := 0; i < files; i++ {
@@ -184,19 +188,28 @@ func TestCreateBatchConcurrentCreatesCommit(t *testing.T) {
 		}()
 	}
 	close(start)
+	failed := false
 	for i := 0; i < files; i++ {
 		if err := <-errs; err != nil {
-			t.Fatalf("batched create %d failed: %v", i, err)
+			t.Errorf("batched create %d failed: %v", i, err)
+			failed = true
 		}
+	}
+	if failed {
+		return
+	}
+	if got := b.createBatcher.flushCount.Load() - flushesBefore; got == 0 {
+		t.Errorf("create batch flushes = %d, want > 0", got)
 	}
 	for i := 0; i < files; i++ {
 		path := fmt.Sprintf("/batch/file-%02d.txt", i)
 		info, err := b.Stat(path)
 		if err != nil {
-			t.Fatalf("stat %s: %v", path, err)
+			t.Errorf("stat %s: %v", path, err)
+			continue
 		}
 		if info.Size != int64(len(fmt.Sprintf("payload-%02d", i))) {
-			t.Fatalf("stat %s size = %d", path, info.Size)
+			t.Errorf("stat %s size = %d", path, info.Size)
 		}
 	}
 	var outboxRows int
@@ -204,7 +217,7 @@ func TestCreateBatchConcurrentCreatesCommit(t *testing.T) {
 		t.Fatalf("count quota outbox: %v", err)
 	}
 	if outboxRows != files {
-		t.Fatalf("quota outbox rows = %d, want %d", outboxRows, files)
+		t.Errorf("quota outbox rows = %d, want %d", outboxRows, files)
 	}
 }
 
@@ -217,6 +230,10 @@ func TestCreateBatchDuplicatePathDoesNotAbortBatch(t *testing.T) {
 	})
 	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
+	if b.createBatcher == nil {
+		t.Fatal("create batcher was not configured")
+	}
+	flushesBefore := b.createBatcher.flushCount.Load()
 
 	start := make(chan struct{})
 	type result struct {
@@ -247,20 +264,23 @@ func TestCreateBatchDuplicatePathDoesNotAbortBatch(t *testing.T) {
 			} else if errors.Is(res.err, datastore.ErrRevisionConflict) {
 				conflictSame++
 			} else {
-				t.Fatalf("same path error = %v, want nil or ErrRevisionConflict", res.err)
+				t.Errorf("same path error = %v, want nil or ErrRevisionConflict", res.err)
 			}
 		case "/batch-dupe/other.txt":
 			if res.err != nil {
-				t.Fatalf("other path error = %v, want nil", res.err)
+				t.Errorf("other path error = %v, want nil", res.err)
 			}
 			otherOK = true
 		}
 	}
+	if got := b.createBatcher.flushCount.Load() - flushesBefore; got == 0 {
+		t.Errorf("create batch flushes = %d, want > 0", got)
+	}
 	if successSame != 1 || conflictSame != 1 || !otherOK {
-		t.Fatalf("successSame=%d conflictSame=%d otherOK=%v, want 1/1/true", successSame, conflictSame, otherOK)
+		t.Errorf("successSame=%d conflictSame=%d otherOK=%v, want 1/1/true", successSame, conflictSame, otherOK)
 	}
 	if _, err := b.Stat("/batch-dupe/other.txt"); err != nil {
-		t.Fatalf("other path should commit despite duplicate in same batch: %v", err)
+		t.Errorf("other path should commit despite duplicate in same batch: %v", err)
 	}
 }
 
@@ -273,6 +293,10 @@ func TestCreateBatchAppliesCumulativeStorageQuota(t *testing.T) {
 	})
 	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
+	if b.createBatcher == nil {
+		t.Fatal("create batcher was not configured")
+	}
+	flushesBefore := b.createBatcher.flushCount.Load()
 	fake.mu.Lock()
 	fake.config["tenant-a"].MaxStorageBytes = 8
 	fake.mu.Unlock()
@@ -299,18 +323,21 @@ func TestCreateBatchAppliesCumulativeStorageQuota(t *testing.T) {
 		} else if errors.Is(err, ErrStorageQuotaExceeded) {
 			exceededCount++
 		} else {
-			t.Fatalf("create error = %v, want nil or ErrStorageQuotaExceeded", err)
+			t.Errorf("create error = %v, want nil or ErrStorageQuotaExceeded", err)
 		}
 	}
+	if got := b.createBatcher.flushCount.Load() - flushesBefore; got == 0 {
+		t.Errorf("create batch flushes = %d, want > 0", got)
+	}
 	if okCount != 2 || exceededCount != 1 {
-		t.Fatalf("ok=%d exceeded=%d, want 2/1", okCount, exceededCount)
+		t.Errorf("ok=%d exceeded=%d, want 2/1", okCount, exceededCount)
 	}
 	var outboxRows int
 	if err := b.store.DB().QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_outbox WHERE mutation_type = 'file_create'`).Scan(&outboxRows); err != nil {
 		t.Fatalf("count quota outbox: %v", err)
 	}
 	if outboxRows != 2 {
-		t.Fatalf("quota outbox rows = %d, want 2", outboxRows)
+		t.Errorf("quota outbox rows = %d, want 2", outboxRows)
 	}
 }
 

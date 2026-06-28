@@ -746,7 +746,7 @@ func (b *Dat9Backend) WriteCtxIfRevisionWithTagsResult(ctx context.Context, path
 		if timingEnabled {
 			implementationDuration = time.Since(implementationStart)
 		}
-		if expectedRevision == 0 && errors.Is(err, datastore.ErrPathConflict) {
+		if errors.Is(err, datastore.ErrPathConflict) {
 			return 0, 0, datastore.ErrRevisionConflict
 		}
 		if err != nil {

@@ -77,12 +77,15 @@ For load testing, start with:
 ```text
 DRIVE9_QUOTA_SOURCE=server
 DRIVE9_CREATE_BATCH_MAX=16
+DRIVE9_CREATE_BATCH_MAX_BYTES=1048576
+DRIVE9_CREATE_BATCH_CONCURRENCY=4
 DRIVE9_CREATE_BATCH_LINGER_MS=1
 ```
 
-`DRIVE9_CREATE_BATCH_LINGER_MS` is the only linger setting. If unset or set to
-zero, the backend uses the built-in default linger of 1 ms when batching is
-enabled.
+`DRIVE9_CREATE_BATCH_LINGER_MS` is the only linger setting. If unset, it
+defaults to 1 ms. `DRIVE9_CREATE_BATCH_MAX_BYTES` caps the cumulative DB-inline
+payload bytes in one transaction. `DRIVE9_CREATE_BATCH_CONCURRENCY` bounds the
+number of in-flight flush transactions per tenant backend.
 
 ## Architecture
 
@@ -102,12 +105,16 @@ Request goroutines still perform per-request preparation:
 After preparation, the request enqueues a `createBatchJob` and waits on that
 job's result channel.
 
-The batcher goroutine flushes a batch when either:
+The collector goroutine seals a batch when any of these happens:
 
 - it collects `DRIVE9_CREATE_BATCH_MAX` jobs, or
+- cumulative DB-inline payload bytes reach `DRIVE9_CREATE_BATCH_MAX_BYTES`, or
 - the first job in the current batch waits longer than the configured linger.
 
-Flush opens one `Store.InTx` and processes active jobs in order.
+Sealed batches are handed to background flush goroutines behind a bounded
+semaphore. This lets the collector keep assembling later batches while earlier
+batches are in TiDB commit, but prevents unbounded same-tenant transaction
+fan-out. Each flush opens one `Store.InTx` and processes active jobs in order.
 
 ## Per-Job Isolation
 
@@ -115,14 +122,18 @@ A batch must not become "all or nothing" for expected per-file errors such as a
 duplicate path. Each job runs inside a SQL savepoint:
 
 ```sql
-SAVEPOINT drive9_create_batch_N;
+SAVEPOINT drive9_create_batch_job;
 -- one file create sequence
-ROLLBACK TO SAVEPOINT drive9_create_batch_N; -- only on that job's error
-RELEASE SAVEPOINT drive9_create_batch_N;
+ROLLBACK TO SAVEPOINT drive9_create_batch_job; -- only on that job's error
+RELEASE SAVEPOINT drive9_create_batch_job;
 ```
 
 If a job fails, only that job is marked failed. The batch continues with later
 jobs and commits successful jobs.
+
+Savepoint setup, rollback, or release failures are treated as fatal transaction
+errors. In that case the outer transaction is aborted and all active jobs receive
+the transaction error.
 
 If the outer transaction itself fails, all successful jobs in that transaction
 receive the transaction error, matching the fact that none of the writes
@@ -181,6 +192,8 @@ The implementation records:
 - `component="create_batch", operation="flush"` duration for batch transaction
   flush time
 - `component="create_batch", name="batch_size"` gauge with active jobs per flush
+- `component="create_batch", name="in_flight"` gauge with active flush
+  transactions
 
 During rollout, compare these with:
 
@@ -197,6 +210,7 @@ Good rollout signs:
 - create batch wait remains near the configured linger
 - QPS increases without a matching p99 increase
 - quota outbox backlog remains bounded
+- in-flight flush concurrency reaches the configured bound under high load
 
 Bad rollout signs:
 
@@ -211,12 +225,15 @@ Roll out with the default off, then enable for a pressure-test environment:
 
 ```text
 DRIVE9_CREATE_BATCH_MAX=16
+DRIVE9_CREATE_BATCH_MAX_BYTES=1048576
+DRIVE9_CREATE_BATCH_CONCURRENCY=4
 DRIVE9_CREATE_BATCH_LINGER_MS=1
 ```
 
 If the batcher improves throughput without p99 regression, test larger batches
-such as 32. Do not increase linger just to force larger batches; extra linger
-directly adds request latency.
+such as 32 or higher concurrency such as 6 to 8. Do not increase linger just to
+force larger batches; extra linger directly adds request latency. If queue wait
+grows while TiDB remains healthy, increase concurrency before increasing linger.
 
 Rollback is configuration-only:
 

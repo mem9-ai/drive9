@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -17,16 +19,33 @@ import (
 
 const (
 	defaultCreateBatchLinger = time.Millisecond
-	maxCreateBatchEntries    = 128
+	// DefaultCreateBatchMaxBytes bounds total DB-inline payload bytes per
+	// create batch transaction when batching is enabled.
+	DefaultCreateBatchMaxBytes = int64(1 << 20)
+	// DefaultCreateBatchConcurrency bounds concurrent create batch flush
+	// transactions per tenant backend when batching is enabled.
+	DefaultCreateBatchConcurrency = 4
+	maxCreateBatchEntries         = 128
+	maxCreateBatchConcurrency     = 16
 )
 
 type createBatcher struct {
-	backend *Dat9Backend
-	max     int
-	linger  time.Duration
-	jobs    chan *createBatchJob
-	cancel  context.CancelFunc
-	done    chan struct{}
+	backend     *Dat9Backend
+	max         int
+	maxBytes    int64
+	linger      time.Duration
+	concurrency int
+
+	jobs     chan *createBatchJob
+	stopCh   chan struct{}
+	done     chan struct{}
+	flushSem chan struct{}
+	flushWG  sync.WaitGroup
+	mu       sync.Mutex
+	stopping bool
+
+	flushCount atomic.Int64
+	inFlight   atomic.Int64
 }
 
 type createBatchJob struct {
@@ -62,29 +81,49 @@ func newCreateBatcher(b *Dat9Backend, opts CreateBatchOptions) *createBatcher {
 	if maxEntries > maxCreateBatchEntries {
 		maxEntries = maxCreateBatchEntries
 	}
+	maxBytes := opts.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = DefaultCreateBatchMaxBytes
+	}
+	concurrency := opts.MaxConcurrentFlushes
+	if concurrency <= 0 {
+		concurrency = DefaultCreateBatchConcurrency
+	}
+	if concurrency > maxCreateBatchConcurrency {
+		concurrency = maxCreateBatchConcurrency
+	}
 	linger := opts.Linger
 	if linger <= 0 {
 		linger = defaultCreateBatchLinger
 	}
-	ctx, cancel := context.WithCancel(backgroundWithTrace())
 	c := &createBatcher{
-		backend: b,
-		max:     maxEntries,
-		linger:  linger,
-		jobs:    make(chan *createBatchJob, maxEntries*16),
-		cancel:  cancel,
-		done:    make(chan struct{}),
+		backend:     b,
+		max:         maxEntries,
+		maxBytes:    maxBytes,
+		linger:      linger,
+		concurrency: concurrency,
+		jobs:        make(chan *createBatchJob, maxEntries*16),
+		stopCh:      make(chan struct{}),
+		done:        make(chan struct{}),
+		flushSem:    make(chan struct{}, concurrency),
 	}
-	go c.run(ctx)
+	go c.run()
 	logger.Info(backgroundWithTrace(), "backend_create_batcher_started",
 		zap.String("tenant_id", b.tenantID),
 		zap.Int("max_entries", maxEntries),
+		zap.Int64("max_bytes", maxBytes),
+		zap.Int("max_concurrent_flushes", concurrency),
 		zap.Duration("linger", linger))
 	return c
 }
 
 func (c *createBatcher) stop() {
-	c.cancel()
+	c.mu.Lock()
+	if !c.stopping {
+		c.stopping = true
+		close(c.stopCh)
+	}
+	c.mu.Unlock()
 	<-c.done
 }
 
@@ -98,22 +137,29 @@ func (c *createBatcher) create(ctx context.Context, path string, data []byte, ta
 		item:   item,
 		result: make(chan createBatchResult, 1),
 	}
+	c.mu.Lock()
+	if c.stopping {
+		c.mu.Unlock()
+		return 0, errors.New("create batcher stopped")
+	}
+	queued := false
 	select {
 	case c.jobs <- job:
-	case <-ctx.Done():
-		return 0, ctx.Err()
+		queued = true
+	default:
 	}
-	select {
-	case res := <-job.result:
-		return res.written, res.err
-	case <-ctx.Done():
-		return 0, ctx.Err()
+	if !queued {
+		c.dispatchFlush([]*createBatchJob{job})
 	}
+	c.mu.Unlock()
+	res := <-job.result
+	return res.written, res.err
 }
 
-func (c *createBatcher) run(ctx context.Context) {
+func (c *createBatcher) run() {
 	defer close(c.done)
 	var batch []*createBatchJob
+	var batchBytes int64
 	var timer *time.Timer
 	var timerC <-chan time.Time
 	stopTimer := func() {
@@ -134,23 +180,37 @@ func (c *createBatcher) run(ctx context.Context) {
 			return
 		}
 		stopTimer()
-		c.flush(batch)
+		c.dispatchFlush(batch)
 		batch = nil
+		batchBytes = 0
+	}
+	addJob := func(job *createBatchJob) {
+		batch = append(batch, job)
+		batchBytes += job.item.sizeBytes
+		if len(batch) == 1 {
+			timer = time.NewTimer(c.linger)
+			timerC = timer.C
+		}
+		if len(batch) >= c.max || (c.maxBytes > 0 && batchBytes >= c.maxBytes) {
+			flush()
+		}
 	}
 	for {
 		select {
-		case <-ctx.Done():
-			flush()
-			return
+		case <-c.stopCh:
+			stopTimer()
+			for {
+				select {
+				case job := <-c.jobs:
+					addJob(job)
+				default:
+					flush()
+					c.flushWG.Wait()
+					return
+				}
+			}
 		case job := <-c.jobs:
-			batch = append(batch, job)
-			if len(batch) == 1 {
-				timer = time.NewTimer(c.linger)
-				timerC = timer.C
-			}
-			if len(batch) >= c.max {
-				flush()
-			}
+			addJob(job)
 		case <-timerC:
 			timer = nil
 			timerC = nil
@@ -159,9 +219,27 @@ func (c *createBatcher) run(ctx context.Context) {
 	}
 }
 
+func (c *createBatcher) dispatchFlush(batch []*createBatchJob) {
+	batch = append([]*createBatchJob(nil), batch...)
+	c.flushWG.Add(1)
+	c.flushSem <- struct{}{}
+	inFlight := c.inFlight.Add(1)
+	metrics.RecordTenantGauge(c.backend.tenantID, "create_batch", "in_flight", float64(inFlight))
+	go func() {
+		defer c.flushWG.Done()
+		defer func() {
+			inFlight := c.inFlight.Add(-1)
+			metrics.RecordTenantGauge(c.backend.tenantID, "create_batch", "in_flight", float64(inFlight))
+			<-c.flushSem
+		}()
+		c.flush(batch)
+	}()
+}
+
 func (c *createBatcher) flush(batch []*createBatchJob) {
 	b := c.backend
 	start := time.Now()
+	c.flushCount.Add(1)
 	active := make([]*createBatchJob, 0, len(batch))
 	for _, job := range batch {
 		metrics.RecordTenantOperation(b.tenantID, "create_batch", "wait", "ok", time.Since(job.item.now))
@@ -182,7 +260,8 @@ func (c *createBatcher) flush(batch []*createBatchJob) {
 	}
 	outcomes := make([]jobOutcome, len(active))
 	txErr := b.store.InTx(backgroundWithTrace(), func(tx *sql.Tx) error {
-		pendingStorageDelta, pendingFileDelta, _, pendingOK := b.cachedPendingQuotaOutboxDeltasTx(backgroundWithTrace(), tx)
+		txCtx := backgroundWithTrace()
+		pendingStorageDelta, pendingFileDelta, _, pendingOK := b.cachedPendingQuotaOutboxDeltasTx(txCtx, tx)
 		if !pendingOK {
 			metrics.RecordTenantOperation(b.tenantID, "server_quota", "batch_pending_delta", "fail_open", 0)
 		}
@@ -199,8 +278,8 @@ func (c *createBatcher) flush(batch []*createBatchJob) {
 				outcomes[i].err = err
 				continue
 			}
-			err := withCreateBatchSavepoint(tx, i, func() error {
-				semanticTaskEnqueued, quotaOutboxEnqueued, err := b.insertPreparedCreateTx(backgroundWithTrace(), tx, item, batchMediaDelta+item.mediaDelta)
+			jobErr, fatalErr := withCreateBatchSavepoint(txCtx, tx, func() error {
+				semanticTaskEnqueued, quotaOutboxEnqueued, err := b.insertPreparedCreateTx(txCtx, tx, item, batchMediaDelta+item.mediaDelta)
 				if err != nil {
 					return err
 				}
@@ -208,8 +287,11 @@ func (c *createBatcher) flush(batch []*createBatchJob) {
 				item.quotaOutboxEnqueued = quotaOutboxEnqueued
 				return nil
 			})
-			if err != nil {
-				outcomes[i].err = err
+			if fatalErr != nil {
+				return fatalErr
+			}
+			if jobErr != nil {
+				outcomes[i].err = jobErr
 				continue
 			}
 			outcomes[i].ok = true
@@ -227,11 +309,11 @@ func (c *createBatcher) flush(batch []*createBatchJob) {
 	metrics.RecordTenantOperation(b.tenantID, "create_batch", "flush", result, time.Since(start))
 
 	for i, job := range active {
-		outcome := outcomes[i]
-		if txErr != nil && outcome.ok {
-			outcome.ok = false
-			outcome.err = txErr
+		if txErr != nil {
+			job.result <- createBatchResult{err: txErr}
+			continue
 		}
+		outcome := outcomes[i]
 		if !outcome.ok {
 			job.result <- createBatchResult{err: outcome.err}
 			continue
@@ -246,25 +328,25 @@ func (c *createBatcher) flush(batch []*createBatchJob) {
 	}
 }
 
-func withCreateBatchSavepoint(tx *sql.Tx, idx int, fn func() error) error {
-	name := fmt.Sprintf("drive9_create_batch_%d", idx)
-	if _, err := tx.Exec("SAVEPOINT " + name); err != nil {
-		return err
+func withCreateBatchSavepoint(ctx context.Context, tx *sql.Tx, fn func() error) (jobErr error, fatalErr error) {
+	if _, err := tx.ExecContext(ctx, "SAVEPOINT drive9_create_batch_job"); err != nil {
+		return nil, err
 	}
-	err := fn()
-	if err != nil {
-		_, rollbackErr := tx.Exec("ROLLBACK TO SAVEPOINT " + name)
-		_, releaseErr := tx.Exec("RELEASE SAVEPOINT " + name)
+	if err := fn(); err != nil {
+		_, rollbackErr := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT drive9_create_batch_job")
+		_, releaseErr := tx.ExecContext(ctx, "RELEASE SAVEPOINT drive9_create_batch_job")
 		if rollbackErr != nil {
-			return errors.Join(err, rollbackErr)
+			return nil, errors.Join(err, rollbackErr)
 		}
 		if releaseErr != nil {
-			return errors.Join(err, releaseErr)
+			return nil, errors.Join(err, releaseErr)
 		}
-		return err
+		return err, nil
 	}
-	_, err = tx.Exec("RELEASE SAVEPOINT " + name)
-	return err
+	if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT drive9_create_batch_job"); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 func (b *Dat9Backend) tryCreateAndWriteBatchedCtx(ctx context.Context, path string, data []byte, tags map[string]string, description string) (int64, error, bool) {

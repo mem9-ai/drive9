@@ -373,6 +373,8 @@ environment:
   DRIVE9_QUOTA_USAGE_CACHE_TTL soft small-write central usage cache TTL, e.g. 250ms or 1s
   DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write tenant pending-outbox aggregate cache TTL, e.g. 250ms or 1s
   DRIVE9_CREATE_BATCH_MAX max server-quota DB-inline create-if-absent writes per tenant transaction (default: 1/off)
+  DRIVE9_CREATE_BATCH_MAX_BYTES max DB-inline payload bytes per create batch transaction (default: 1048576)
+  DRIVE9_CREATE_BATCH_CONCURRENCY max concurrent create batch flush transactions per tenant (default: 4)
   DRIVE9_CREATE_BATCH_LINGER_MS max wait before flushing a non-full create batch in milliseconds (default: 1 when enabled)
 
   S3 storage:
@@ -639,11 +641,22 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 		return backend.Options{}, fmt.Errorf("DRIVE9_TEXT_EXTRACT_MAX_BYTES must be a positive integer")
 	}
 	opts.CreateBatch = backend.CreateBatchOptions{
-		MaxEntries: envInt("DRIVE9_CREATE_BATCH_MAX", 1),
-		Linger:     time.Duration(envInt("DRIVE9_CREATE_BATCH_LINGER_MS", 0)) * time.Millisecond,
+		MaxEntries:           envInt("DRIVE9_CREATE_BATCH_MAX", 1),
+		MaxBytes:             envInt64("DRIVE9_CREATE_BATCH_MAX_BYTES", backend.DefaultCreateBatchMaxBytes),
+		MaxConcurrentFlushes: envInt("DRIVE9_CREATE_BATCH_CONCURRENCY", backend.DefaultCreateBatchConcurrency),
+		Linger:               time.Duration(envInt("DRIVE9_CREATE_BATCH_LINGER_MS", 1)) * time.Millisecond,
 	}
 	if opts.CreateBatch.MaxEntries < 1 {
 		return backend.Options{}, fmt.Errorf("DRIVE9_CREATE_BATCH_MAX must be a positive integer")
+	}
+	if opts.CreateBatch.MaxBytes < 0 {
+		return backend.Options{}, fmt.Errorf("DRIVE9_CREATE_BATCH_MAX_BYTES must be a non-negative integer")
+	}
+	if opts.CreateBatch.MaxConcurrentFlushes < 1 {
+		return backend.Options{}, fmt.Errorf("DRIVE9_CREATE_BATCH_CONCURRENCY must be a positive integer")
+	}
+	if opts.CreateBatch.Linger < 0 {
+		return backend.Options{}, fmt.Errorf("DRIVE9_CREATE_BATCH_LINGER_MS must be a non-negative integer")
 	}
 
 	// Quota enforcement source: "tenant" (default) or "server" (central server DB).
