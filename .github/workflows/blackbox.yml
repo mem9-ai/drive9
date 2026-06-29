@@ -89,8 +89,6 @@ jobs:
       - name: Publish job summary
         if: always()
         run: |
-          # The suite-level report is at results/report.md (not a module-level
-          # one under results/artifacts/*/report.md). Find it explicitly.
           suite_report="$(find blackbox/work -path '*/results/report.md' -type f 2>/dev/null | sort | tail -n 1 || true)"
           if [ -n "$suite_report" ]; then
             cat "$suite_report" >> "$GITHUB_STEP_SUMMARY"
@@ -98,7 +96,18 @@ jobs:
             echo "No blackbox suite report produced." >> "$GITHUB_STEP_SUMMARY"
           fi
 
-          # Print per-module results from suite-report.json to the job log.
+      - name: Print report to log
+        if: always()
+        run: |
+          suite_report="$(find blackbox/work -path '*/results/report.md' -type f 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$suite_report" ]; then
+            echo "========== blackbox report =========="
+            cat "$suite_report"
+            echo "========== end report =========="
+          else
+            echo "No blackbox suite report produced."
+          fi
+
           suite_json="$(find blackbox/work -path '*/results/suite-report.json' -type f 2>/dev/null | sort | tail -n 1 || true)"
           if [ -n "$suite_json" ]; then
             echo ""

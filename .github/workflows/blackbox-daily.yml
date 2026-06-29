@@ -78,6 +78,18 @@ jobs:
             echo "No blackbox suite report produced." >> "$GITHUB_STEP_SUMMARY"
           fi
 
+      - name: Print report to log
+        if: always()
+        run: |
+          suite_report="$(find blackbox/work -path '*/results/report.md' -type f 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$suite_report" ]; then
+            echo "========== blackbox report =========="
+            cat "$suite_report"
+            echo "========== end report =========="
+          else
+            echo "No blackbox suite report produced."
+          fi
+
           suite_json="$(find blackbox/work -path '*/results/suite-report.json' -type f 2>/dev/null | sort | tail -n 1 || true)"
           if [ -n "$suite_json" ]; then
             echo ""
