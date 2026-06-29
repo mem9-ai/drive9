@@ -71,11 +71,26 @@ jobs:
       - name: Publish job summary
         if: always()
         run: |
-          latest="$(find blackbox/work -name report.md -type f 2>/dev/null | sort | tail -n 1 || true)"
-          if [ -n "$latest" ]; then
-            cat "$latest" >> "$GITHUB_STEP_SUMMARY"
+          suite_report="$(find blackbox/work -path '*/results/report.md' -type f 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$suite_report" ]; then
+            cat "$suite_report" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "No blackbox report produced." >> "$GITHUB_STEP_SUMMARY"
+            echo "No blackbox suite report produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          suite_json="$(find blackbox/work -path '*/results/suite-report.json' -type f 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$suite_json" ]; then
+            echo ""
+            echo "=== Per-module results ==="
+            python3 -c "
+          import json, sys
+          with open('$suite_json') as f:
+              data = json.load(f)
+          for r in data.get('records', []):
+              print(f\"  {r['status']:4s}  {r['module']:40s}  {r.get('seconds',0):.1f}s  {r.get('classification','')}\")
+          s = data.get('summary', {})
+          print(f\"\nSummary: PASS={s.get('PASS',0)} FAIL={s.get('FAIL',0)} SKIP={s.get('SKIP',0)} XFAIL={s.get('XFAIL',0)} WARN={s.get('WARN',0)}\")
+          "
           fi
 
       - name: Upload blackbox artifacts
@@ -83,7 +98,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: blackbox-weekly-community
-          path: |
-            blackbox/work/**/report.md
-            blackbox/work/**/suite-report.json
+          path: blackbox/work/**/results/**
           if-no-files-found: warn
