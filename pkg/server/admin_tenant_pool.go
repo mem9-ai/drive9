@@ -14,6 +14,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/logger"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/metrics"
 	"github.com/mem9-ai/drive9/pkg/tenant"
 	"github.com/mem9-ai/drive9/pkg/tenant/token"
 )
@@ -41,7 +42,10 @@ type tenantPoolResumeJob struct {
 	rerun atomic.Bool
 }
 
-const adminTenantPoolStatusCreating = "creating"
+const (
+	adminTenantPoolStatusCreating   = "creating"
+	adminTenantPoolMetricsComponent = "admin_tenant_pool"
+)
 
 func (e *adminTenantPoolHTTPError) Error() string {
 	return e.message
@@ -286,10 +290,24 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pool, _, _, ok := s.authorizedTenantPool(w, r, cred)
+	pool, initialFreeSize, initialSlotSize, ok := s.authorizedTenantPool(w, r, cred)
 	if !ok {
 		return
 	}
+	updateStarted := time.Now()
+	metricResult := "ok"
+	defer func() {
+		metrics.RecordOperation(adminTenantPoolMetricsComponent, "update", metricResult, time.Since(updateStarted))
+	}()
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_update_requested",
+		"provider", tenant.ProviderTiDBCloudNative,
+		"pool_id", pool.PoolID,
+		"organization_id", pool.OrganizationID,
+		"current_pool_size", pool.Size,
+		"target_pool_size", *req.PoolSize,
+		"free_size", initialFreeSize,
+		"slot_size", initialSlotSize,
+		"pool_status", pool.Status)...)
 	lock := s.tenantPoolLock(pool.PoolID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -312,18 +330,57 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		}
 		targetSize := *req.PoolSize
 		if targetSize > slotSize {
-			results, err := s.createFreePoolTenants(ctx, pool.PoolID, targetSize-slotSize, cred, nil)
+			stageStarted := time.Now()
+			growCount := targetSize - slotSize
+			logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_grow_started",
+				"provider", tenant.ProviderTiDBCloudNative,
+				"pool_id", pool.PoolID,
+				"organization_id", pool.OrganizationID,
+				"current_pool_size", pool.Size,
+				"target_pool_size", targetSize,
+				"free_size", freeSize,
+				"slot_size", slotSize,
+				"grow_count", growCount)...)
+			results, err := s.createFreePoolTenants(ctx, pool.PoolID, growCount, cred, nil)
 			if err != nil {
+				logger.Error(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_grow_failed",
+					"provider", tenant.ProviderTiDBCloudNative,
+					"pool_id", pool.PoolID,
+					"organization_id", pool.OrganizationID,
+					"target_pool_size", targetSize,
+					"grow_count", growCount,
+					"duration_ms", durationMillis(stageStarted),
+					"error", err)...)
 				return adminTenantPoolError(http.StatusBadGateway, fmt.Sprintf("grow tenant pool failed: %v", err))
 			}
 			for _, res := range results {
 				s.startProvisionedTenantSchemaInit(ctx, res)
 			}
+			logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_grow_done",
+				"provider", tenant.ProviderTiDBCloudNative,
+				"pool_id", pool.PoolID,
+				"organization_id", pool.OrganizationID,
+				"target_pool_size", targetSize,
+				"grow_count", growCount,
+				"created_count", len(results),
+				"duration_ms", durationMillis(stageStarted))...)
 			if freeSize, err = s.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID); err != nil {
 				return adminTenantPoolError(http.StatusInternalServerError, "tenant pool free size lookup failed")
 			}
 		} else if targetSize < slotSize {
-			if _, err := s.deleteNewestFreePoolTenants(ctx, pool.PoolID, pool.OrganizationID, slotSize-targetSize, cred, false); err != nil {
+			stageStarted := time.Now()
+			shrinkCount := slotSize - targetSize
+			logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_shrink_started",
+				"provider", tenant.ProviderTiDBCloudNative,
+				"pool_id", pool.PoolID,
+				"organization_id", pool.OrganizationID,
+				"current_pool_size", pool.Size,
+				"target_pool_size", targetSize,
+				"free_size", freeSize,
+				"slot_size", slotSize,
+				"shrink_count", shrinkCount)...)
+			deleted, err := s.deleteNewestFreePoolTenants(ctx, pool.PoolID, pool.OrganizationID, shrinkCount, cred, false)
+			if err != nil {
 				if actualSlotSize, countErr := s.meta.CountTenantPoolFreeSlots(ctx, pool.OrganizationID); countErr == nil {
 					if updateErr := s.meta.UpdateTenantPoolSize(ctx, pool.PoolID, actualSlotSize); updateErr != nil {
 						logger.Warn(ctx, "admin_tenant_pool_shrink_partial_size_update_failed", zap.String("pool_id", pool.PoolID), zap.Int("slot_size", actualSlotSize), zap.Error(updateErr))
@@ -331,15 +388,48 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 				} else {
 					logger.Warn(ctx, "admin_tenant_pool_shrink_partial_count_failed", zap.String("pool_id", pool.PoolID), zap.Error(countErr))
 				}
+				logger.Error(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_shrink_failed",
+					"provider", tenant.ProviderTiDBCloudNative,
+					"pool_id", pool.PoolID,
+					"organization_id", pool.OrganizationID,
+					"target_pool_size", targetSize,
+					"shrink_count", shrinkCount,
+					"deleted_count", deleted,
+					"duration_ms", durationMillis(stageStarted),
+					"error", err)...)
 				return adminTenantPoolError(http.StatusBadGateway, fmt.Sprintf("shrink tenant pool failed: %v", err))
 			}
+			logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_shrink_done",
+				"provider", tenant.ProviderTiDBCloudNative,
+				"pool_id", pool.PoolID,
+				"organization_id", pool.OrganizationID,
+				"target_pool_size", targetSize,
+				"shrink_count", shrinkCount,
+				"deleted_count", deleted,
+				"duration_ms", durationMillis(stageStarted))...)
 			if freeSize, err = s.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID); err != nil {
 				return adminTenantPoolError(http.StatusInternalServerError, "tenant pool free size lookup failed")
 			}
+		} else {
+			logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_noop",
+				"provider", tenant.ProviderTiDBCloudNative,
+				"pool_id", pool.PoolID,
+				"organization_id", pool.OrganizationID,
+				"current_pool_size", pool.Size,
+				"target_pool_size", targetSize,
+				"free_size", freeSize,
+				"slot_size", slotSize)...)
 		}
+		stageStarted := time.Now()
 		if err := s.meta.UpdateTenantPoolSize(ctx, pool.PoolID, targetSize); err != nil {
 			return adminTenantPoolError(http.StatusInternalServerError, "failed to update tenant pool")
 		}
+		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_size_persisted",
+			"provider", tenant.ProviderTiDBCloudNative,
+			"pool_id", pool.PoolID,
+			"organization_id", pool.OrganizationID,
+			"target_pool_size", targetSize,
+			"duration_ms", durationMillis(stageStarted))...)
 		if freeSize, err = s.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID); err != nil {
 			return adminTenantPoolError(http.StatusInternalServerError, "tenant pool free size lookup failed")
 		}
@@ -355,9 +445,26 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		}
 		return nil
 	}); err != nil {
+		metricResult = adminTenantPoolMetricResult(err)
+		logger.Error(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_update_failed",
+			"provider", tenant.ProviderTiDBCloudNative,
+			"pool_id", pool.PoolID,
+			"organization_id", pool.OrganizationID,
+			"current_pool_size", pool.Size,
+			"target_pool_size", *req.PoolSize,
+			"duration_ms", durationMillis(updateStarted),
+			"error", err)...)
 		writeAdminTenantPoolError(w, err)
 		return
 	}
+	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_update_done",
+		"provider", tenant.ProviderTiDBCloudNative,
+		"pool_id", out.PoolID,
+		"organization_id", out.OrganizationID,
+		"target_pool_size", out.PoolSize,
+		"free_size", out.FreeSize,
+		"status", out.Status,
+		"duration_ms", durationMillis(updateStarted))...)
 	writeJSON(w, http.StatusAccepted, out)
 }
 
@@ -377,6 +484,17 @@ func adminTenantPoolDisplayStatus(status meta.TenantPoolStatus, freeSize, slotSi
 		return adminTenantPoolStatusCreating
 	}
 	return string(status)
+}
+
+func adminTenantPoolMetricResult(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	var httpErr *adminTenantPoolHTTPError
+	if errors.As(err, &httpErr) && httpErr.status == http.StatusBadGateway {
+		return "cluster_error"
+	}
+	return metrics.ResultForError(err)
 }
 
 func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Request) {

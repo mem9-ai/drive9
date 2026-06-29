@@ -2249,6 +2249,10 @@ func TestAdminTenantPoolUpdateShrinkPartialFailureReconcilesSize(t *testing.T) {
 	if reverted.Status != meta.TenantActive {
 		t.Fatalf("failed tenant status = %s, want %s", reverted.Status, meta.TenantActive)
 	}
+	metricsText := readServerMetrics(t, rt.server)
+	if !strings.Contains(metricsText, `drive9_service_operations_total{component="admin_tenant_pool",operation="update",result="cluster_error"}`) {
+		t.Fatalf("metrics missing admin tenant pool update cluster_error: %s", metricsText)
+	}
 }
 
 func TestAdminTenantPoolReplenishUsesDefaultSpendingLimit(t *testing.T) {
