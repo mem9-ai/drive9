@@ -1384,6 +1384,59 @@ func TestAdminTenantPoolCreateBatchProvisionsFreeTenants(t *testing.T) {
 	}
 }
 
+func TestAdminTenantPoolCreateRejectsAboveMaxSize(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.server.tenantPoolMaxSize = 2
+	ts := httptest.NewServer(rt.server)
+	t.Cleanup(ts.Close)
+
+	resp := postJSON(t, ts.URL+"/v1/admin/tenant-pool", map[string]any{
+		"public_key":  "public-1",
+		"private_key": "private-1",
+		"pool_size":   3,
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "pool_size must be less than or equal to 2") {
+		t.Fatalf("body = %s", body)
+	}
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("list calls = %d, want 0", got)
+	}
+	if got := rt.prov.batchPoolCalls.Load(); got != 0 {
+		t.Fatalf("batch pool calls = %d, want 0", got)
+	}
+}
+
+func TestAdminTenantPoolUpdateRejectsAboveMaxSize(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.server.tenantPoolMaxSize = 2
+	ts := httptest.NewServer(rt.server)
+	t.Cleanup(ts.Close)
+
+	resp := patchJSON(t, ts.URL+"/v1/admin/tenant-pool", map[string]any{
+		"public_key":  "public-1",
+		"private_key": "private-1",
+		"pool_size":   3,
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "pool_size must be less than or equal to 2") {
+		t.Fatalf("body = %s", body)
+	}
+	if got := rt.prov.listCalls.Load(); got != 0 {
+		t.Fatalf("list calls = %d, want 0", got)
+	}
+}
+
 func TestAdminTenantPoolCreateCleansUpWhenOrganizationBackfillConflicts(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.listPages = []*tenant.ManagedClusterListResult{{}}

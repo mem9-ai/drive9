@@ -54,6 +54,9 @@ type Config struct {
 	LocalS3           *s3client.LocalS3Client
 	S3Dir             string
 	MaxUploadBytes    int64
+	// TenantPoolMaxSize caps admin tenant pool create/update target size.
+	// Values <= 0 leave the pool size uncapped.
+	TenantPoolMaxSize int
 	// InlineThreshold is the server-wide DB-inline vs S3 cutoff surfaced to
 	// clients via /v1/status. When 0, the value is inferred from
 	// cfg.Backend.InlineThreshold() (or omitted in responses if no backend).
@@ -122,6 +125,7 @@ type Server struct {
 	vaultIssuerURL        string
 	publicURL             string
 	maxUploadBytes        int64
+	tenantPoolMaxSize     int
 	inlineThreshold       int64
 	metrics               *serverMetrics
 	logger                *zap.Logger
@@ -246,6 +250,7 @@ func NewWithConfig(cfg Config) *Server {
 		publicURL:         strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
 		provisioner:       cfg.Provisioner,
 		maxUploadBytes:    maxUpload,
+		tenantPoolMaxSize: cfg.TenantPoolMaxSize,
 		inlineThreshold:   inlineThreshold,
 		metrics:           newServerMetrics(),
 		logger:            logger,

@@ -84,6 +84,10 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, "pool_size must be positive")
 		return
 	}
+	if err := s.validateTenantPoolSize(*req.PoolSize); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	cred, err := adminCredentials(req.PublicKey, req.PrivateKey, r)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
@@ -195,6 +199,10 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, "pool_size is required")
 		return
 	}
+	if err := s.validateTenantPoolSize(*req.PoolSize); err != nil {
+		errJSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	cred, err := adminCredentials(req.PublicKey, req.PrivateKey, r)
 	if err != nil {
 		errJSON(w, http.StatusBadRequest, err.Error())
@@ -259,6 +267,13 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	writeJSON(w, http.StatusAccepted, out)
+}
+
+func (s *Server) validateTenantPoolSize(size int) error {
+	if s.tenantPoolMaxSize > 0 && size > s.tenantPoolMaxSize {
+		return fmt.Errorf("pool_size must be less than or equal to %d", s.tenantPoolMaxSize)
+	}
+	return nil
 }
 
 func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Request) {

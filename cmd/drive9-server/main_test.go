@@ -81,6 +81,37 @@ func TestSlockOAuthFromEnvEnabled(t *testing.T) {
 	}
 }
 
+func TestTenantPoolMaxSizeFromEnv(t *testing.T) {
+	const key = "DRIVE9_TENANT_POOL_MAX_SIZE"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, []string{key})
+	got, err := tenantPoolMaxSizeFromEnv()
+	if err != nil {
+		t.Fatalf("tenantPoolMaxSizeFromEnv empty: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("empty max size = %d, want 0", got)
+	}
+
+	setEnv(t, key, "25")
+	got, err = tenantPoolMaxSizeFromEnv()
+	if err != nil {
+		t.Fatalf("tenantPoolMaxSizeFromEnv valid: %v", err)
+	}
+	if got != 25 {
+		t.Fatalf("max size = %d, want 25", got)
+	}
+
+	for _, raw := range []string{"0", "-1", "bad"} {
+		setEnv(t, key, raw)
+		if _, err := tenantPoolMaxSizeFromEnv(); err == nil {
+			t.Fatalf("tenantPoolMaxSizeFromEnv(%q) error = nil, want error", raw)
+		}
+	}
+}
+
 func TestBuildBackendOptionsFromEnvAudioDisabled(t *testing.T) {
 	keys := []string{
 		"DRIVE9_QUERY_EMBED_API_BASE",

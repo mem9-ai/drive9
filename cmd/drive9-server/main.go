@@ -178,6 +178,10 @@ func main() {
 	tokenHex := os.Getenv("DRIVE9_TOKEN_SIGNING_KEY")
 	vaultMKHex := os.Getenv("DRIVE9_VAULT_MASTER_KEY")
 	providerType := envOr("DRIVE9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
+	tenantPoolMaxSize, err := tenantPoolMaxSizeFromEnv()
+	if err != nil {
+		die(err)
+	}
 	maxUploadBytes := server.DefaultMaxUploadBytes
 	if raw := os.Getenv("DRIVE9_MAX_UPLOAD_BYTES"); raw != "" {
 		maxUploadBytes, err = strconv.ParseInt(raw, 10, 64)
@@ -363,6 +367,7 @@ func main() {
 		PublicURL:                    publicBaseURL(addr),
 		S3Dir:                        s3cfg.Dir,
 		MaxUploadBytes:               maxUploadBytes,
+		TenantPoolMaxSize:            tenantPoolMaxSize,
 		InlineThreshold:              backendOptions.InlineThreshold,
 		Logger:                       srvLogger,
 		SemanticEmbedder:             semanticEmbedder,
@@ -504,6 +509,7 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name (default: tidbcloud_fs)
   DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY optional default TiDB Cloud API public key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY optional default TiDB Cloud API private key for tidb_cloud_native create/delete when caller omits it
+  DRIVE9_TENANT_POOL_MAX_SIZE maximum admin tenant pool size; unset means no server-side cap
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
   DRIVE9_SLOCK_API_ORIGIN Slock API origin (required when DRIVE9_SLOCK_ORIGIN is set)
   DRIVE9_SLOCK_CLIENT_ID Slock connected-app client id (required when DRIVE9_SLOCK_ORIGIN is set)
@@ -875,6 +881,18 @@ func envInt64(key string, fallback int64) int64 {
 		return fallback
 	}
 	return v
+}
+
+func tenantPoolMaxSizeFromEnv() (int, error) {
+	raw := strings.TrimSpace(os.Getenv("DRIVE9_TENANT_POOL_MAX_SIZE"))
+	if raw == "" {
+		return 0, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0, fmt.Errorf("invalid DRIVE9_TENANT_POOL_MAX_SIZE: must be a positive integer")
+	}
+	return v, nil
 }
 
 func envDuration(key string, fallback time.Duration) time.Duration {
