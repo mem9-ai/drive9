@@ -99,33 +99,30 @@ func (r RunReport) FeishuCard() map[string]any {
 		title = fmt.Sprintf("drive9 e2e %s performance regression", triggerName(r.Context.Trigger))
 	}
 
-	var lines []string
+	var summary []string
 	if sig := r.FailureSignature(); sig != "" {
-		lines = append(lines, fmt.Sprintf("**signature:** `%s`", sig))
+		summary = append(summary, fmt.Sprintf("**signature:** `%s`", sig))
 	}
-	lines = append(lines, fmt.Sprintf("**trigger:** %s", triggerName(r.Context.Trigger)))
+	summary = append(summary, fmt.Sprintf("**trigger:** %s", triggerName(r.Context.Trigger)))
+	elements := []any{mdDiv(strings.Join(summary, "  ·  "))}
+
 	if len(r.Failed) > 0 {
-		lines = append(lines, fmt.Sprintf("**failed (%d):**", len(r.Failed)))
+		fl := []string{fmt.Sprintf("**failed (%d):**", len(r.Failed))}
 		for _, s := range r.Failed {
-			lines = append(lines, fmt.Sprintf("• **%s** — <font color='red'>%s</font> / %s (owner: %s)",
-				s.Suite, dash(string(s.FailureClass)), dash(s.ProductPromise), dash(s.OwnerHint)))
+			fl = append(fl, fmt.Sprintf("• **%s** — <font color='%s'>%s</font> / %s (owner: %s)",
+				s.Suite, failClassColor(s.FailureClass), dash(string(s.FailureClass)), dash(s.ProductPromise), dash(s.OwnerHint)))
 		}
+		elements = append(elements, mdDiv(strings.Join(fl, "\n")))
 	}
 	if len(r.PerfRegressed) > 0 {
-		lines = append(lines, "**performance regressions:**")
+		elements = append(elements, mdDiv("**performance regressions:**"))
 		for _, s := range r.PerfRegressed {
 			for _, m := range s.PerfRegressions() {
-				lines = append(lines, feishuPerfLine(s.Suite, m))
+				elements = append(elements, perfFieldsDiv(s.Suite, m))
 			}
 		}
 	}
 
-	elements := []any{
-		map[string]any{
-			"tag":  "div",
-			"text": map[string]any{"tag": "lark_md", "content": strings.Join(lines, "\n")},
-		},
-	}
 	var actions []any
 	if r.Context.RunURL != "" {
 		actions = append(actions, map[string]any{
@@ -187,31 +184,58 @@ func fmtPtr(p *float64) string {
 	return fmt.Sprintf("%.2f", *p)
 }
 
-// feishuPerfLine renders one regressed metric with rich lark_md emphasis on the
-// numbers an operator acts on: the measured value is bold red, and the deltas
-// against budget and baseline are bold and coloured (worse=red, better=green).
-func feishuPerfLine(suite string, m Metric) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "• ⏱ **%s** · %s = <font color='red'>**%.2f%s**</font>", suite, m.Name, m.Value, m.Unit)
-	if m.Budget != nil {
-		fmt.Fprintf(&b, " — budget %.2f%s%s", *m.Budget, m.Unit, pctDelta(m.Value, *m.Budget))
-	}
-	if m.Baseline != nil {
-		fmt.Fprintf(&b, " · baseline %.2f%s%s", *m.Baseline, m.Unit, pctDelta(m.Value, *m.Baseline))
-	}
-	return b.String()
+// mdDiv is a lark_md text block element.
+func mdDiv(content string) map[string]any {
+	return map[string]any{"tag": "div", "text": map[string]any{"tag": "lark_md", "content": content}}
 }
 
-// pctDelta renders a coloured, bold percentage difference of value vs ref
-// (worse=red with +, better=green). Empty when ref is zero.
-func pctDelta(value, ref float64) string {
+// shortField is a half-width lark_md field for the two-column metric layout.
+func shortField(content string) map[string]any {
+	return map[string]any{"is_short": true, "text": map[string]any{"tag": "lark_md", "content": content}}
+}
+
+// perfFieldsDiv lays one regressed metric out in aligned columns so the numbers
+// an operator acts on stand out: a full-width suite/metric header, then the
+// measured value (bold red) beside budget and baseline, each with a coloured
+// arrow + percentage delta (worse=red ▲, better=green ▼).
+func perfFieldsDiv(suite string, m Metric) map[string]any {
+	fields := []any{
+		map[string]any{"is_short": false, "text": map[string]any{"tag": "lark_md", "content": fmt.Sprintf("⏱ **%s** · %s", suite, m.Name)}},
+		shortField(fmt.Sprintf("**value**\n<font color='red'>**%.2f%s**</font>", m.Value, m.Unit)),
+	}
+	if m.Budget != nil {
+		fields = append(fields, shortField(fmt.Sprintf("**budget**\n%.2f%s %s", *m.Budget, m.Unit, arrowPct(m.Value, *m.Budget))))
+	}
+	if m.Baseline != nil {
+		fields = append(fields, shortField(fmt.Sprintf("**baseline**\n%.2f%s %s", *m.Baseline, m.Unit, arrowPct(m.Value, *m.Baseline))))
+	}
+	return map[string]any{"tag": "div", "fields": fields}
+}
+
+// arrowPct renders a coloured arrow + bold percentage difference of value vs ref:
+// an increase is ▲ red (worse for budgeted latency metrics), a decrease is ▼
+// green. Empty when ref is zero.
+func arrowPct(value, ref float64) string {
 	if ref == 0 {
 		return ""
 	}
 	pct := (value - ref) / ref * 100
-	color, sign := "red", "+"
-	if pct < 0 {
-		color, sign = "green", ""
+	if pct >= 0 {
+		return fmt.Sprintf("<font color='red'>▲ **+%.0f%%**</font>", pct)
 	}
-	return fmt.Sprintf(" (<font color='%s'>**%s%.0f%%**</font>)", color, sign, pct)
+	return fmt.Sprintf("<font color='green'>▼ **%.0f%%**</font>", pct)
+}
+
+// failClassColor maps a failure class to a lark_md font colour for quick triage.
+func failClassColor(c FailureClass) string {
+	switch c {
+	case FailureCorrectness:
+		return "red"
+	case FailureInfrastructure, FailureDependency, FailurePerformance:
+		return "orange"
+	case FailureFlaky:
+		return "grey"
+	default:
+		return "grey"
+	}
 }
