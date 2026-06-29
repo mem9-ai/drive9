@@ -19,12 +19,10 @@ from typing import Any, Callable
 
 from harness.core import BlackboxError, Context, ModuleSkip, env_flag, env_value, progress, stable_bytes, write_json
 
-from .base import BaseModule, module_config
+from harness.module_base import BaseModule, module_config
 
 
 class CustomCase1(BaseModule):
-    id = "custom.case1"
-    category = "custom.performance"
     description = "Case1 sandbox workspace benchmark: namespace scale, small files, fsync, visibility, remount persistence, and same-host mounts."
     labels = ("drive9", "custom", "case1", "performance", "fuse")
     timeout = 3600

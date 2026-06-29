@@ -3,10 +3,13 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
-from .core import CACHE_ROOT, DependencyUnavailable, REPO_ROOT, progress
+from .core import CACHE_ROOT, DependencyUnavailable, REPO_ROOT, env_value, progress, write_json
+
+APT_AUTO_INSTALL_TRUTHY = {"1", "true", "yes", "on"}
 
 
 class DependencyManager:
@@ -74,3 +77,165 @@ class DependencyManager:
         marker.write_text("ready\n", encoding="utf-8")
         progress(f"dependency ready: {name}@{ref} -> {dest}")
         return dest
+
+
+class Drive9DependencyManager(DependencyManager):
+    """Shared dependency helpers used across all suite modules.
+
+    Suite-specific fetchers (ensure_pjdfstest, ensure_ltp, etc.) live in each
+    module's own ``deps.py`` and call the shared methods here.
+    """
+
+    def ensure_system_packages(self, *packages: str) -> None:
+        requested = tuple(dict.fromkeys(package for package in packages if package))
+        if not requested:
+            return
+        if env_value("AUTO_INSTALL_SYSTEM_DEPS", "1").lower() not in APT_AUTO_INSTALL_TRUTHY:
+            return
+        if not sys.platform.startswith("linux"):
+            return
+        if not shutil.which("apt-get") or not shutil.which("sudo"):
+            return
+        probe = subprocess.run(["sudo", "-n", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if probe.returncode != 0:
+            return
+        attempted: set[str] = getattr(self, "_system_packages_attempted", set())
+        missing = [package for package in requested if package not in attempted]
+        if not missing:
+            return
+        if not getattr(self, "_apt_updated", False):
+            self.run("system-apt-update", ["sudo", "apt-get", "update"], timeout=1800)
+            self._apt_updated = True
+        command_name = "system-apt-install-" + "-".join(missing)
+        if len(command_name) > 120:
+            command_name = "system-apt-install-" + str(abs(hash(tuple(missing))))
+        self.run(command_name, ["sudo", "apt-get", "install", "-y", *missing], timeout=1800)
+        attempted.update(missing)
+        self._system_packages_attempted = attempted
+
+    def ensure_node_version(self, required: str = ">=24.15.0") -> str:
+        """Return a Node binary path that satisfies ``required``.
+
+        If the system Node already satisfies the constraint, return it. Otherwise
+        fetch the matching Node binary tarball into the tools cache and return
+        the cached ``node`` path.
+        """
+        sys_node = shutil.which("node")
+        if sys_node:
+            try:
+                out = subprocess.run([sys_node, "--version"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=20, check=False)
+                sys_version = out.stdout.strip().lstrip("v")
+            except Exception:
+                sys_version = ""
+            if sys_version and _node_satisfies(sys_version, required):
+                progress(f"dependency tool: node ({sys_version}) satisfies {required} -> {sys_node}")
+                return sys_node
+
+        target_version = _resolve_node_version(required)
+        node_dir = self.tools_root / "node" / target_version
+        node_bin = node_dir / "bin" / "node"
+        if node_bin.exists():
+            progress(f"dependency tool: node ({target_version}) from cache -> {node_bin}")
+            return str(node_bin)
+        if not self.auto_fetch:
+            raise DependencyUnavailable(f"node {required} is required and auto-fetch is disabled")
+        self._ensure_tools_root()
+        arch = _node_arch()
+        tarball = f"node-v{target_version}-linux-{arch}.tar.xz"
+        url = f"https://nodejs.org/dist/v{target_version}/{tarball}"
+        download_dir = self.tools_root / "node" / "_downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        archive = download_dir / tarball
+        self.run(f"node-download-{target_version}", ["curl", "-fsSL", "-o", str(archive), url], timeout=600)
+        self.run(f"node-extract-{target_version}", ["tar", "-xJf", str(archive), "-C", str(node_dir.parent)], timeout=300)
+        extracted = node_dir.parent / f"node-v{target_version}-linux-{arch}"
+        extracted.rename(node_dir)
+        if not node_bin.exists():
+            raise DependencyUnavailable(f"node {target_version} download did not produce {node_bin}")
+        progress(f"dependency tool: node ({target_version}) fetched -> {node_bin}")
+        return str(node_bin)
+
+    def node_env(self, node_bin: str) -> dict[str, str]:
+        """Build an env with the given node's bin dir prepended to PATH."""
+        env = dict(os.environ)
+        node_bin_dir = str(Path(node_bin).resolve().parent)
+        env["PATH"] = f"{node_bin_dir}:{env.get('PATH', '')}"
+        return env
+
+    def ensure_git_tool(self) -> str:
+        found = shutil.which("git")
+        if found:
+            progress(f"dependency tool: git -> {found}")
+            return found
+        self.ensure_system_packages("git")
+        found = shutil.which("git")
+        if found:
+            progress(f"dependency tool: git -> {found}")
+            return found
+        raise DependencyUnavailable("git is required")
+
+    def ensure_prove(self) -> str:
+        found = shutil.which("prove")
+        if found:
+            progress(f"dependency tool: prove -> {found}")
+            return found
+        self.ensure_system_packages("perl")
+        found = shutil.which("prove")
+        if found:
+            progress(f"dependency tool: prove -> {found}")
+            return found
+        raise DependencyUnavailable("prove is required")
+
+
+def _node_version_tuple(version: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for piece in version.split("."):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            break
+    return tuple(parts)
+
+
+def _node_satisfies(actual: str, constraint: str) -> bool:
+    constraint = constraint.strip()
+    actual_t = _node_version_tuple(actual)
+    if constraint.startswith(">="):
+        return actual_t >= _node_version_tuple(constraint[2:].strip())
+    if constraint.startswith(">"):
+        return actual_t > _node_version_tuple(constraint[1:].strip())
+    if constraint.startswith("<="):
+        return actual_t <= _node_version_tuple(constraint[2:].strip())
+    if constraint.startswith("<"):
+        return actual_t < _node_version_tuple(constraint[1:].strip())
+    if constraint.startswith("="):
+        return actual_t == _node_version_tuple(constraint[1:].strip())
+    return True
+
+
+def _resolve_node_version(constraint: str) -> str:
+    constraint = constraint.strip()
+    if constraint.startswith(">="):
+        base = constraint[2:].strip()
+        major = _node_version_tuple(base)[0]
+        latest = {
+            24: "24.15.0",
+            22: "22.22.1",
+            20: "20.19.0",
+        }
+        return latest.get(major, base)
+    for prefix in (">", "<", "<=", "="):
+        if constraint.startswith(prefix):
+            return constraint[len(prefix):].strip()
+    return constraint
+
+
+def _node_arch() -> str:
+    import platform
+
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        return "x64"
+    if machine in ("arm64", "aarch64"):
+        return "arm64"
+    return "x64"

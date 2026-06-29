@@ -1,0 +1,48 @@
+from __future__ import annotations
+
+import os
+import threading
+from typing import Any
+
+from harness.core import BlackboxError, Context
+from harness.module_base import BaseModule
+
+
+class JuiceFSRandomStress(BaseModule):
+    description = "JuiceFS-inspired concurrent create/read/rename/remove stress, rewritten for Drive9 FUSE."
+    labels = ("stress", "juicefs", "functional")
+    timeout = 1200
+
+    def run(self, ctx: Context) -> dict[str, Any]:
+        workers = int(os.environ.get("RANDOM_STRESS_WORKERS", "4"))
+        files = int(os.environ.get("RANDOM_STRESS_FILES", "64"))
+        remote = ctx.target.remote_root(self.id)
+        ctx.target.mkdir_remote(remote)
+        handle = ctx.target.mount("juicefs_random_stress", remote, durability="interactive")
+        errors: list[str] = []
+        try:
+            def worker(idx: int) -> None:
+                try:
+                    root = handle.mountpoint / f"worker-{idx}"
+                    root.mkdir()
+                    for n in range(files):
+                        p = root / f"f{n:04d}.txt"
+                        payload = f"worker={idx} file={n}\n"
+                        p.write_text(payload, encoding="utf-8")
+                        if p.read_text(encoding="utf-8") != payload:
+                            raise BlackboxError(f"readback mismatch {p}")
+                        p.rename(root / f"r{n:04d}.txt")
+                except Exception as exc:
+                    errors.append(str(exc))
+
+            threads = [threading.Thread(target=worker, args=(idx,)) for idx in range(workers)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            if errors:
+                raise BlackboxError("; ".join(errors[:5]))
+            count = sum(1 for _ in handle.mountpoint.rglob("*.txt"))
+            return {"workers": workers, "files": count}
+        finally:
+            ctx.target.unmount(handle)

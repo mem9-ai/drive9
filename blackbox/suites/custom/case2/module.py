@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from harness.core import BlackboxError, Context, ModuleSkip, env_flag, env_value, progress, stable_bytes, write_json
 
-from .base import BaseModule, module_config
+from harness.module_base import BaseModule, module_config
 
 
 # Durability label -> drive9 mount --durability value.
@@ -45,8 +45,6 @@ class Drive9Case2Perf(BaseModule):
       crossed with coding-agent and none profiles.
     """
 
-    id = "custom.case2_perf"
-    category = "custom.performance"
     description = (
         "Case2 Persistent Sandbox / cloud-PC shared-storage benchmark: "
         "multi-session shared workspace, read/write consistency, cache "
@@ -1261,7 +1259,7 @@ class Drive9Case2Perf(BaseModule):
                 "errors": 0,
                 "error_rate": 0.0,
                 "runs": 1,
-                "detail": f"extra repo id {cfg['extra_repo_id']} not found in repos.json",
+                "detail": f"extra repo id {cfg['extra_repo_id']} not found in config.json repos",
                 **self.latency_summary([]),
             })
             return rows
@@ -1288,7 +1286,7 @@ class Drive9Case2Perf(BaseModule):
         return rows
 
     def selected_extra_repo(self, ctx: Context, cfg: dict[str, Any]) -> dict[str, Any] | None:
-        repos = ctx.config.get("repos", [])
+        repos = module_config(ctx, self.id).get("repos", [])
         for repo in repos:
             if str(repo.get("id")) == str(cfg["extra_repo_id"]):
                 return repo
@@ -1349,7 +1347,7 @@ class Drive9Case2Perf(BaseModule):
             checkout = checkout_parent / "repo"
             phases.append(self.run_phase(ctx, "clone", [["git", "clone", "--no-checkout", str(repo["url"]), str(checkout)]], checkout_parent, 1800, sample_env, shell=False, name=f"case2-extra-local-{repo['id']}-{profile}-run-{run_index}-clone"))
             phases.append(self.run_phase(ctx, "checkout", [["git", "-C", str(checkout), "checkout", "--detach", commit]], checkout_parent, 1800, sample_env, shell=False, name=f"case2-extra-local-{repo['id']}-{profile}-run-{run_index}-checkout"))
-            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack enable", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"case2-extra-local-{repo['id']}-{profile}-run-{run_index}-install"))
+            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack prepare pnpm@10.33.0 --activate", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"case2-extra-local-{repo['id']}-{profile}-run-{run_index}-install"))
             phases.append(self.run_phase(ctx, "build", [str(c) for c in repo.get("build", ["corepack pnpm run build"])], checkout, 1800, sample_env, shell=True, name=f"case2-extra-local-{repo['id']}-{profile}-run-{run_index}-build"))
             return self.assemble_sample(repo, commit, storage, profile, run_index, phases, failures)
         # FUSE storages.
@@ -1361,7 +1359,7 @@ class Drive9Case2Perf(BaseModule):
             checkout = handle.mountpoint / "repo"
             phases.append(self.run_phase(ctx, "clone", [["git", "clone", "--no-checkout", str(repo["url"]), str(checkout)]], handle.mountpoint, 1800, sample_env, shell=False, name=f"case2-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-clone"))
             phases.append(self.run_phase(ctx, "checkout", [["git", "-C", str(checkout), "checkout", "--detach", commit]], handle.mountpoint, 1800, sample_env, shell=False, name=f"case2-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-checkout"))
-            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack enable", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"case2-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-install"))
+            phases.append(self.run_phase(ctx, "install", [str(c) for c in repo.get("install", ["corepack prepare pnpm@10.33.0 --activate", "corepack pnpm install --frozen-lockfile"])], checkout, 1800, sample_env, shell=True, name=f"case2-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-install"))
             phases.append(self.run_phase(ctx, "build", [str(c) for c in repo.get("build", ["corepack pnpm run build"])], checkout, 1800, sample_env, shell=True, name=f"case2-extra-{storage}-{repo['id']}-{profile}-run-{run_index}-build"))
             return self.assemble_sample(repo, commit, storage, profile, run_index, phases, failures)
         finally:
