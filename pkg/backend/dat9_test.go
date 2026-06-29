@@ -164,29 +164,6 @@ func TestWriteCtxIfRevisionWithTagsResult_ReturnsCommittedRevision(t *testing.T)
 	}
 }
 
-func TestWriteCtxIfRevisionWithTagsModeResult_CreatePersistsMode(t *testing.T) {
-	b := newTestBackend(t)
-	ctx := context.Background()
-
-	n, rev, err := b.WriteCtxIfRevisionWithTagsModeResult(ctx, "/mode.txt", []byte("x"), 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, 0, nil, "", 0o666, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != 1 {
-		t.Fatalf("written = %d, want 1", n)
-	}
-	if rev != 1 {
-		t.Fatalf("revision = %d, want 1", rev)
-	}
-	info, err := b.Stat("/mode.txt")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Mode != 0o666 {
-		t.Fatalf("mode = %o, want 0666", info.Mode)
-	}
-}
-
 func TestUsesDatabaseAutoEmbeddingDefaultsToFalse(t *testing.T) {
 	b := newTestBackend(t)
 	if b.UsesDatabaseAutoEmbedding() {

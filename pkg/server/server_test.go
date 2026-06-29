@@ -1377,37 +1377,6 @@ func TestWriteWithExpectedRevisionConflict(t *testing.T) {
 	}
 }
 
-func TestWriteWithModeHeaderPersistsMode(t *testing.T) {
-	s := newTestServer(t)
-	ts := httptest.NewServer(s)
-	defer ts.Close()
-
-	req, _ := http.NewRequest(http.MethodPut, ts.URL+"/v1/fs/mode.txt", strings.NewReader("data"))
-	req.Header.Set("X-Dat9-Expected-Revision", "0")
-	req.Header.Set("X-Dat9-Mode", "493") // 0o755
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("write with mode: %d", resp.StatusCode)
-	}
-
-	req, _ = http.NewRequest(http.MethodHead, ts.URL+"/v1/fs/mode.txt", nil)
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("stat mode file: %d", resp.StatusCode)
-	}
-	if got := resp.Header.Get("X-Dat9-Mode"); got != "493" {
-		t.Fatalf("X-Dat9-Mode = %q, want 493", got)
-	}
-}
-
 func TestWriteCreateIfAbsentSkipsPreStat(t *testing.T) {
 	logger.ResetBenchTimingLogEnabledForTest()
 	t.Cleanup(logger.ResetBenchTimingLogEnabledForTest)

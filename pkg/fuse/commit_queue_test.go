@@ -278,20 +278,20 @@ func TestCommitQueueCommitNowHoldsPathLockThroughSuccessCleanup(t *testing.T) {
 	}
 }
 
-func TestCommitQueueFoldsCreateModeIntoUpload(t *testing.T) {
+func TestCommitQueueAppliesModeAfterUpload(t *testing.T) {
 	var putCalls atomic.Int32
 	var chmodCalls atomic.Int32
-	var gotMode string
+	var chmodBody []byte
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPut:
 			putCalls.Add(1)
-			gotMode = r.Header.Get("X-Dat9-Mode")
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"status":"ok","revision":9}`))
 		case r.Method == http.MethodPost && r.URL.RawQuery == "chmod":
 			chmodCalls.Add(1)
-			http.Error(w, "unexpected chmod", http.StatusInternalServerError)
+			chmodBody, _ = io.ReadAll(r.Body)
+			w.WriteHeader(http.StatusOK)
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.String())
 			w.WriteHeader(http.StatusInternalServerError)
@@ -330,17 +330,11 @@ func TestCommitQueueFoldsCreateModeIntoUpload(t *testing.T) {
 	if got := putCalls.Load(); got != 1 {
 		t.Fatalf("PUT calls = %d, want 1", got)
 	}
-	if gotMode != "493" {
-		t.Fatalf("X-Dat9-Mode = %q, want 493", gotMode)
+	if got := chmodCalls.Load(); got != 1 {
+		t.Fatalf("chmod calls = %d, want 1", got)
 	}
-	if got := chmodCalls.Load(); got != 0 {
-		t.Fatalf("chmod calls = %d, want 0", got)
-	}
-	if pending.HasPending("/exec.sh") {
-		t.Fatal("pending entry should be removed after folded-mode commit")
-	}
-	if shadow.Has("/exec.sh") {
-		t.Fatal("shadow should be removed after folded-mode commit")
+	if !bytes.Contains(chmodBody, []byte("493")) {
+		t.Fatalf("chmod body = %s, want decimal mode 493", chmodBody)
 	}
 }
 
@@ -622,10 +616,10 @@ func TestCommitQueueRetriesPostUploadChmodNotFound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := shadow.WriteFull("/exec-retry.sh", []byte("data"), 8); err != nil {
+	if err := shadow.WriteFull("/exec-retry.sh", []byte("data"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.PutWithBaseRevAndMode("/exec-retry.sh", 4, PendingOverwrite, 8, 0o755, true); err != nil {
+	if _, err := pending.PutWithBaseRevAndMode("/exec-retry.sh", 4, PendingNew, 0, 0o755, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -633,8 +627,7 @@ func TestCommitQueueRetriesPostUploadChmodNotFound(t *testing.T) {
 	if err := cq.Enqueue(&CommitEntry{
 		Path:    "/exec-retry.sh",
 		Size:    4,
-		BaseRev: 8,
-		Kind:    PendingOverwrite,
+		Kind:    PendingNew,
 		Mode:    0o755,
 		HasMode: true,
 	}); err != nil {
@@ -680,10 +673,10 @@ func TestCommitQueueChmodFailureKeepsPendingState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := shadow.WriteFull("/exec-fail.sh", []byte("data"), 8); err != nil {
+	if err := shadow.WriteFull("/exec-fail.sh", []byte("data"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pending.PutWithBaseRevAndMode("/exec-fail.sh", 4, PendingOverwrite, 8, 0o755, true); err != nil {
+	if _, err := pending.PutWithBaseRevAndMode("/exec-fail.sh", 4, PendingNew, 0, 0o755, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -692,8 +685,7 @@ func TestCommitQueueChmodFailureKeepsPendingState(t *testing.T) {
 	err = cq.CommitNow(context.Background(), &CommitEntry{
 		Path:    "/exec-fail.sh",
 		Size:    4,
-		BaseRev: 8,
-		Kind:    PendingOverwrite,
+		Kind:    PendingNew,
 		Mode:    0o755,
 		HasMode: true,
 	})

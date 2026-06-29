@@ -82,28 +82,6 @@ func TestWriteAndRead(t *testing.T) {
 	}
 }
 
-func TestWriteCtxConditionalWithRevisionAndModeSendsModeHeader(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
-			t.Fatalf("method = %s, want PUT", r.Method)
-		}
-		if got := r.Header.Get("X-Dat9-Mode"); got != "438" {
-			t.Fatalf("X-Dat9-Mode = %q, want 438", got)
-		}
-		_ = json.NewEncoder(w).Encode(map[string]any{"revision": int64(1)})
-	}))
-	defer ts.Close()
-
-	c := New(ts.URL, "")
-	rev, err := c.WriteCtxConditionalWithRevisionAndMode(context.Background(), "/mode.txt", []byte("x"), 0, 0o666, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rev != 1 {
-		t.Fatalf("revision = %d, want 1", rev)
-	}
-}
-
 func TestListDir(t *testing.T) {
 	c, cleanup := newTestClient(t)
 	defer cleanup()

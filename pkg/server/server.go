@@ -1786,11 +1786,6 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 		errJSON(w, http.StatusBadRequest, "invalid X-Dat9-Expected-Revision header")
 		return
 	}
-	writeMode, hasWriteMode, err := parseWriteModeHeader(r.Header.Get("X-Dat9-Mode"))
-	if err != nil {
-		errJSON(w, http.StatusBadRequest, "invalid X-Dat9-Mode header")
-		return
-	}
 	writeTags, err := parseWriteTagsHeader(r.Header)
 	if err != nil {
 		logger.Warn(r.Context(), "server_event", eventFields(r.Context(), "write_invalid_tag_header", "path", path, "error", err)...)
@@ -1930,7 +1925,7 @@ func (s *Server) handleWrite(w http.ResponseWriter, r *http.Request, path string
 	if timingEnabled {
 		backendWriteStart = time.Now()
 	}
-	_, committedRevision, err := b.WriteCtxIfRevisionWithTagsModeResult(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags, description, writeMode, hasWriteMode)
+	_, committedRevision, err := b.WriteCtxIfRevisionWithTagsResult(r.Context(), path, data, 0, filesystem.WriteFlagCreate|filesystem.WriteFlagTruncate, expectedRevision, writeTags, description)
 	if timingEnabled {
 		backendWriteDuration = time.Since(backendWriteStart)
 	}
@@ -3447,18 +3442,6 @@ func parseExpectedRevisionHeader(raw string) (int64, error) {
 		return 0, fmt.Errorf("invalid expected revision")
 	}
 	return rev, nil
-}
-
-func parseWriteModeHeader(raw string) (uint32, bool, error) {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return 0, false, nil
-	}
-	mode, err := strconv.ParseUint(raw, 10, 32)
-	if err != nil || mode == 0 || mode > 0o7777 {
-		return 0, false, fmt.Errorf("invalid write mode")
-	}
-	return uint32(mode), true, nil
 }
 
 func (s *Server) handleUploadAbort(w http.ResponseWriter, r *http.Request, uploadID string) {

@@ -553,7 +553,7 @@ func TestWriteBackUploader_ChmodFailureRetainsCache(t *testing.T) {
 	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 1)
 
-	_ = cache.PutWithBaseRevAndMode("/mode-fail.txt", []byte("data"), 4, PendingOverwrite, 8, 0o755, true)
+	_ = cache.PutWithBaseRevAndMode("/mode-fail.txt", []byte("data"), 4, PendingNew, 0, 0o755, true)
 	uploader.Submit("/mode-fail.txt")
 	uploader.DrainAll()
 
@@ -597,7 +597,7 @@ func TestWriteBackUploader_ChmodFailureRetryDoesNotReuploadData(t *testing.T) {
 	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 1)
 
-	_ = cache.PutWithBaseRevAndMode("/mode-retry.txt", []byte("data"), 4, PendingOverwrite, 8, 0o755, true)
+	_ = cache.PutWithBaseRevAndMode("/mode-retry.txt", []byte("data"), 4, PendingNew, 0, 0o755, true)
 	uploader.Submit("/mode-retry.txt")
 	uploader.DrainAll()
 
@@ -785,7 +785,7 @@ func TestWriteBackUploader_UploadSyncChmodFailureReturnsErrorAndRetainsCache(t *
 	c := newTestClient(ts.URL)
 	uploader := NewWriteBackUploader(c, cache, 1)
 
-	_ = cache.PutWithBaseRevAndMode("/mode-sync-fail.txt", []byte("data"), 4, PendingOverwrite, 8, 0o755, true)
+	_ = cache.PutWithBaseRevAndMode("/mode-sync-fail.txt", []byte("data"), 4, PendingNew, 0, 0o755, true)
 	err := uploader.UploadSync(context.Background(), "/mode-sync-fail.txt")
 	if err == nil {
 		t.Fatal("UploadSync should fail when chmod fails")

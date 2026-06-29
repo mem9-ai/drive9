@@ -29,14 +29,6 @@ func shouldApplyRemoteMode(kind PendingKind, hasMode bool, mode uint32) bool {
 	return true
 }
 
-func shouldFoldRemoteModeIntoCreate(kind PendingKind, hasMode bool, mode uint32) bool {
-	if kind != PendingNew || !hasMode {
-		return false
-	}
-	mode &= posixPermissionModeMask
-	return mode != 0
-}
-
 func retryPostUploadMode(ctx context.Context, apply func() error) error {
 	var lastErr error
 	for attempt := 0; attempt < postUploadModeAttempts; attempt++ {

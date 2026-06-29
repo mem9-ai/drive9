@@ -1131,18 +1131,9 @@ func (cq *CommitQueue) uploadEntry(ctx context.Context, entry *CommitEntry) (int
 	useDirectPUT := entry.Size == 0 || (threshold > 0 && entry.Size < threshold)
 	if useDirectPUT {
 		start := time.Now()
-		foldModeIntoCreate := shouldFoldRemoteModeIntoCreate(entry.Kind, entry.HasMode, entry.Mode)
-		var committedRev int64
-		if foldModeIntoCreate {
-			committedRev, err = cq.client.WriteCtxConditionalWithRevisionAndMode(ctx, apiPath, data, expectedRevision, entry.Mode&posixPermissionModeMask, true)
-		} else {
-			committedRev, err = cq.client.WriteCtxConditionalWithRevision(ctx, apiPath, data, expectedRevision)
-		}
+		committedRev, err := cq.client.WriteCtxConditionalWithRevision(ctx, apiPath, data, expectedRevision)
 		if cq.perf != nil {
 			cq.perf.recordRemoteOp(perfRemoteWrite, err, time.Since(start), uint64(len(data)))
-		}
-		if err == nil && foldModeIntoCreate {
-			entry.HasMode = false
 		}
 		return committedRev, err
 	}
