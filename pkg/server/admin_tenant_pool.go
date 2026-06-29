@@ -105,6 +105,10 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	createStarted := time.Now()
+	metricResult := "ok"
+	defer func() {
+		metrics.RecordOperation(adminTenantPoolMetricsComponent, "create", metricResult, time.Since(createStarted))
+	}()
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_create_requested",
 		"provider", tenant.ProviderTiDBCloudNative,
 		"pool_size", *req.PoolSize)...)
@@ -119,6 +123,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 				"provider", tenant.ProviderTiDBCloudNative,
 				"duration_ms", durationMillis(stageStarted),
 				"error", err)...)
+			metricResult = "cluster_error"
 			writeAdminTiDBCloudError(w, ctx, err, "create tenant pool")
 			return nil
 		}
@@ -128,9 +133,11 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 			"duration_ms", durationMillis(stageStarted))...)
 		if orgID != "" {
 			if _, err := s.meta.GetTenantPoolByOrganization(ctx, orgID); err == nil {
+				metricResult = "conflict"
 				errJSON(w, http.StatusConflict, "tenant pool already exists for organization")
 				return nil
 			} else if !errors.Is(err, meta.ErrNotFound) {
+				metricResult = "error"
 				errJSON(w, http.StatusInternalServerError, "tenant pool lookup failed")
 				return nil
 			}
@@ -147,9 +154,11 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 			UpdatedAt:      now,
 		}); err != nil {
 			if errors.Is(err, meta.ErrDuplicate) {
+				metricResult = "conflict"
 				errJSON(w, http.StatusConflict, "tenant pool already exists for organization")
 				return nil
 			}
+			metricResult = "error"
 			errJSON(w, http.StatusInternalServerError, "failed to persist tenant pool")
 			return nil
 		}
@@ -176,6 +185,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 				"duration_ms", durationMillis(stageStarted),
 				"error", err)...)
 			s.deleteTenantPoolMetadata(ctx, poolID, "create_free_tenants_error")
+			metricResult = "cluster_error"
 			errJSON(w, http.StatusBadGateway, fmt.Sprintf("create tenant pool failed: %v", err))
 			return nil
 		}
@@ -194,9 +204,11 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 					s.cleanupCreatedPoolTenants(ctx, results, cred, "update_pool_org_error")
 					s.deleteTenantPoolMetadata(ctx, poolID, "update_pool_org_error")
 					if errors.Is(err, meta.ErrDuplicate) {
+						metricResult = "conflict"
 						errJSON(w, http.StatusConflict, "tenant pool already exists for organization")
 						return nil
 					}
+					metricResult = "error"
 					errJSON(w, http.StatusInternalServerError, "failed to update tenant pool organization")
 					return nil
 				}
@@ -243,6 +255,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 			"pool_size", *req.PoolSize,
 			"duration_ms", durationMillis(createStarted),
 			"error", err)...)
+		metricResult = adminTenantPoolMetricResult(err)
 		writeAdminTenantPoolError(w, err)
 		return
 	}
@@ -516,6 +529,10 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	deleteStarted := time.Now()
+	metricResult := "ok"
+	defer func() {
+		metrics.RecordOperation(adminTenantPoolMetricsComponent, "delete", metricResult, time.Since(deleteStarted))
+	}()
 	logger.Info(r.Context(), "server_event", eventFields(r.Context(), "admin_tenant_pool_delete_requested",
 		"provider", tenant.ProviderTiDBCloudNative,
 		"pool_id", pool.PoolID,
@@ -577,6 +594,7 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 			"organization_id", pool.OrganizationID,
 			"duration_ms", durationMillis(deleteStarted),
 			"error", err)...)
+		metricResult = adminTenantPoolMetricResult(err)
 		writeAdminTenantPoolError(w, err)
 		return
 	}
@@ -1284,6 +1302,11 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 	}
 	workerCtx := backgroundWithTrace(ctx)
 	s.startServerWorker(workerCtx, func(ctx context.Context) {
+		replenishStarted := time.Now()
+		metricResult := "ok"
+		defer func() {
+			metrics.RecordOperation(adminTenantPoolMetricsComponent, "replenish", metricResult, time.Since(replenishStarted))
+		}()
 		lock := s.tenantPoolLock(pool.PoolID)
 		lock.Lock()
 		defer lock.Unlock()
@@ -1292,24 +1315,31 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 			if err != nil {
 				if !errors.Is(err, meta.ErrNotFound) {
 					logger.Warn(ctx, "admin_tenant_pool_replenish_get_pool_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
+					metricResult = "error"
+				} else {
+					metricResult = "not_found"
 				}
 				return nil
 			}
 			if current.Status != meta.TenantPoolActive || current.OrganizationID == "" || current.Size <= 0 {
+				metricResult = "skipped"
 				return nil
 			}
 			slotSize, err := s.meta.CountTenantPoolFreeSlots(ctx, current.OrganizationID)
 			if err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_replenish_count_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+				metricResult = "error"
 				return nil
 			}
 			missing := current.Size - slotSize
 			if missing <= 0 {
+				metricResult = "noop"
 				return nil
 			}
 			results, err := s.createFreePoolTenants(ctx, current.PoolID, missing, cred, nil)
 			if err != nil {
 				logger.Warn(ctx, "admin_tenant_pool_replenish_failed", zap.String("pool_id", current.PoolID), zap.Error(err))
+				metricResult = "cluster_error"
 				return nil
 			}
 			for _, res := range results {
@@ -1318,6 +1348,7 @@ func (s *Server) replenishTenantPoolAsync(ctx context.Context, pool *meta.Tenant
 			return nil
 		}); err != nil {
 			logger.Warn(ctx, "admin_tenant_pool_replenish_lock_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
+			metricResult = adminTenantPoolMetricResult(err)
 		}
 	})
 }
