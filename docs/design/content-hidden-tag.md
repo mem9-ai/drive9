@@ -76,7 +76,7 @@ but qiffang ruled it out (msg `6e3c1255`): "感觉方案 B 太麻烦了, 因为
 
 | Key | Value | Owner | Semantics |
 |---|---|---|---|
-| `drive9.content_hidden` | `"true"` (or `"1"`) | user-written at upload (or via `tags` PUT) | When present and truthy, the file's read path returns EOF and stat reports `size=0`. Absent / falsy → real behavior. |
+| `drive9.content_hidden` | `"true"` | user-written at upload (or via `tags` PUT) | When the value is exactly `"true"`, the file's read path returns EOF and stat reports `size=0`. Missing or any other value → real behavior. |
 
 The value comparison is **strict**: only the literal string `"true"`
 enables content hiding. Any other value (empty, `"1"`, `"yes"`,
