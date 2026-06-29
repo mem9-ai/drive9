@@ -41,6 +41,8 @@ type tenantPoolResumeJob struct {
 	rerun atomic.Bool
 }
 
+const adminTenantPoolStatusCreating = "creating"
+
 func (e *adminTenantPoolHTTPError) Error() string {
 	return e.message
 }
@@ -205,9 +207,13 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 			s.startProvisionedTenantSchemaInit(ctx, res)
 		}
 		freeSize := 0
+		slotSize := 0
 		if orgID != "" {
 			if n, err := s.meta.CountFreeTenantPoolBindings(ctx, orgID); err == nil {
 				freeSize = n
+			}
+			if n, err := s.meta.CountTenantPoolFreeSlots(ctx, orgID); err == nil {
+				slotSize = n
 			}
 		}
 		writeJSON(w, http.StatusAccepted, adminTenantPoolResponse{
@@ -215,7 +221,7 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 			OrganizationID: orgID,
 			PoolSize:       *req.PoolSize,
 			FreeSize:       freeSize,
-			Status:         string(meta.TenantPoolActive),
+			Status:         adminTenantPoolDisplayStatus(meta.TenantPoolActive, freeSize, slotSize),
 		})
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_create_done",
 			"provider", tenant.ProviderTiDBCloudNative,
@@ -223,7 +229,8 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 			"organization_id", orgID,
 			"pool_size", *req.PoolSize,
 			"free_size", freeSize,
-			"status", meta.TenantPoolActive,
+			"slot_size", slotSize,
+			"status", adminTenantPoolDisplayStatus(meta.TenantPoolActive, freeSize, slotSize),
 			"duration_ms", durationMillis(createStarted))...)
 		return nil
 	}); err != nil {
@@ -243,7 +250,7 @@ func (s *Server) handleAdminTenantPoolGet(w http.ResponseWriter, r *http.Request
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pool, freeSize, ok := s.authorizedTenantPool(w, r, cred)
+	pool, freeSize, slotSize, ok := s.authorizedTenantPool(w, r, cred)
 	if !ok {
 		return
 	}
@@ -252,7 +259,7 @@ func (s *Server) handleAdminTenantPoolGet(w http.ResponseWriter, r *http.Request
 		OrganizationID: pool.OrganizationID,
 		PoolSize:       pool.Size,
 		FreeSize:       freeSize,
-		Status:         string(pool.Status),
+		Status:         adminTenantPoolDisplayStatus(pool.Status, freeSize, slotSize),
 	})
 }
 
@@ -279,7 +286,7 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pool, _, ok := s.authorizedTenantPool(w, r, cred)
+	pool, _, _, ok := s.authorizedTenantPool(w, r, cred)
 	if !ok {
 		return
 	}
@@ -333,12 +340,18 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		if err := s.meta.UpdateTenantPoolSize(ctx, pool.PoolID, targetSize); err != nil {
 			return adminTenantPoolError(http.StatusInternalServerError, "failed to update tenant pool")
 		}
+		if freeSize, err = s.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID); err != nil {
+			return adminTenantPoolError(http.StatusInternalServerError, "tenant pool free size lookup failed")
+		}
+		if slotSize, err = s.meta.CountTenantPoolFreeSlots(ctx, pool.OrganizationID); err != nil {
+			return adminTenantPoolError(http.StatusInternalServerError, "tenant pool slot size lookup failed")
+		}
 		out = adminTenantPoolResponse{
 			PoolID:         pool.PoolID,
 			OrganizationID: pool.OrganizationID,
 			PoolSize:       targetSize,
 			FreeSize:       freeSize,
-			Status:         string(pool.Status),
+			Status:         adminTenantPoolDisplayStatus(pool.Status, freeSize, slotSize),
 		}
 		return nil
 	}); err != nil {
@@ -359,6 +372,13 @@ func (s *Server) validateTenantPoolSize(size int) error {
 	return nil
 }
 
+func adminTenantPoolDisplayStatus(status meta.TenantPoolStatus, freeSize, slotSize int) string {
+	if status == meta.TenantPoolActive && freeSize == 0 && slotSize > 0 {
+		return adminTenantPoolStatusCreating
+	}
+	return string(status)
+}
+
 func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Request) {
 	var raw struct {
 		PublicKey  string `json:"public_key"`
@@ -373,7 +393,7 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pool, _, ok := s.authorizedTenantPool(w, r, cred)
+	pool, _, _, ok := s.authorizedTenantPool(w, r, cred)
 	if !ok {
 		return
 	}
@@ -453,31 +473,36 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusAccepted, out)
 }
 
-func (s *Server) authorizedTenantPool(w http.ResponseWriter, r *http.Request, cred tenant.CredentialProvisionRequest) (*meta.TenantPool, int, bool) {
+func (s *Server) authorizedTenantPool(w http.ResponseWriter, r *http.Request, cred tenant.CredentialProvisionRequest) (*meta.TenantPool, int, int, bool) {
 	orgID, err := s.firstManagedOrganization(r.Context(), cred)
 	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant pool")
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
 	if orgID == "" {
 		errJSON(w, http.StatusNotFound, "tenant pool not found")
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
 	pool, err := s.meta.GetTenantPoolByOrganization(r.Context(), orgID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "tenant pool not found")
-			return nil, 0, false
+			return nil, 0, 0, false
 		}
 		errJSON(w, http.StatusInternalServerError, "tenant pool lookup failed")
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
 	freeSize, err := s.meta.CountFreeTenantPoolBindings(r.Context(), orgID)
 	if err != nil {
 		errJSON(w, http.StatusInternalServerError, "tenant pool free size lookup failed")
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
-	return pool, freeSize, true
+	slotSize, err := s.meta.CountTenantPoolFreeSlots(r.Context(), orgID)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, "tenant pool slot size lookup failed")
+		return nil, 0, 0, false
+	}
+	return pool, freeSize, slotSize, true
 }
 
 func (s *Server) firstManagedOrganization(ctx context.Context, cred tenant.CredentialProvisionRequest) (string, error) {
