@@ -418,8 +418,11 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 		}
 		tenantID := strings.TrimSpace(cluster.TenantID)
 		if tenantID == "" {
-			cleanupOnError = true
-			return nil, fmt.Errorf("tidbcloud tenant id label is missing")
+			logger.Warn(ctx, "admin_tenant_pool_cluster_tenant_missing",
+				zap.String("pool_id", poolID),
+				zap.String("cluster_id", cluster.ClusterID))
+			s.cleanupPoolProvisionedClusters(ctx, []*tenant.ClusterInfo{cluster}, cred, nil, "cluster_tenant_missing")
+			continue
 		}
 		orgID := strings.TrimSpace(cluster.OrganizationID)
 		if orgID == "" {
@@ -458,10 +461,6 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 			cleanupOnError = true
 			return nil, err
 		}
-		if err := s.persistPoolTenantConnection(ctx, cluster, provider); err != nil {
-			cleanupOnError = true
-			return nil, err
-		}
 		if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); err != nil {
 			cleanupOnError = true
 			return nil, err
@@ -475,8 +474,16 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 			OrganizationID: orgID,
 		}
 		if poolClusterConnectionReady(cluster) {
+			if err := s.persistPoolTenantConnection(ctx, cluster, provider); err != nil {
+				cleanupOnError = true
+				return nil, err
+			}
 			res.TenantDSN = tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true, provider)
 		} else {
+			if err := s.persistPoolTenantProvisionSeed(ctx, cluster, provider); err != nil {
+				cleanupOnError = true
+				return nil, err
+			}
 			s.startPoolClusterMetadataResume(ctx, cluster, cred)
 		}
 		results = append(results, res)
@@ -498,9 +505,38 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 	return results, nil
 }
 
+func (s *Server) persistPoolTenantProvisionSeed(ctx context.Context, cluster *tenant.ClusterInfo, provider string) error {
+	if cluster == nil {
+		return fmt.Errorf("cluster info is required")
+	}
+	if strings.TrimSpace(cluster.TenantID) == "" {
+		return fmt.Errorf("cluster tenant id is required")
+	}
+	if strings.TrimSpace(cluster.ClusterID) == "" {
+		return fmt.Errorf("cluster id is required")
+	}
+	if strings.TrimSpace(cluster.Password) == "" {
+		return fmt.Errorf("cluster password is required")
+	}
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
+	if err != nil {
+		return err
+	}
+	return s.meta.UpdateTenantConnection(ctx, cluster.TenantID, &meta.Tenant{
+		DBPasswordCipher: cipherPass,
+		DBName:           cluster.DBName,
+		DBTLS:            true,
+		Provider:         provider,
+		ClusterID:        cluster.ClusterID,
+	})
+}
+
 func (s *Server) persistPoolTenantConnection(ctx context.Context, cluster *tenant.ClusterInfo, provider string) error {
 	if cluster == nil {
 		return fmt.Errorf("cluster info is required")
+	}
+	if !poolClusterConnectionReady(cluster) {
+		return fmt.Errorf("cluster connection metadata is incomplete")
 	}
 	if strings.TrimSpace(cluster.Password) == "" {
 		return fmt.Errorf("cluster password is required")
