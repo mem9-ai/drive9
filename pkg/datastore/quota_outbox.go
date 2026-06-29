@@ -19,6 +19,7 @@ import (
 const defaultQuotaOutboxMaxAttempts = 100
 const quotaOutboxClaimMaxAttempts = 3
 const quotaAdmissionLockName = "default"
+const quotaOutboxClaimScanMultiplier = 64
 
 type QuotaOutboxStatus string
 
@@ -168,19 +169,18 @@ func (s *Store) claimQuotaOutboxBatchOnce(ctx context.Context, now time.Time, le
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Keep the first step as a simple claim-index scan. The original single
+	// NOT EXISTS query had to encode both per-file ordering and NULL-file global
+	// barriers in SQL; TiDB can plan that as a large cartesian anti join on hot
+	// outbox tables. Lock a bounded candidate window first, then use indexed
+	// minimum-id checks below to preserve the same ordering semantics.
+	scanLimit := quotaOutboxClaimScanLimit(limit)
 	rows, err := tx.QueryContext(ctx, quotaOutboxSelectSQL+`
-		FROM quota_outbox q
+		FROM quota_outbox q FORCE INDEX (idx_quota_outbox_claim)
 		WHERE q.status = ? AND q.available_at <= ?
-		  AND NOT EXISTS (
-		    SELECT 1 FROM quota_outbox older
-		     WHERE older.id < q.id
-		       AND older.status IN (?, ?)
-		       AND (older.file_id = q.file_id OR older.file_id IS NULL OR q.file_id IS NULL)
-		  )
-		ORDER BY id
+		ORDER BY q.id
 		LIMIT ?
-		FOR UPDATE SKIP LOCKED`, QuotaOutboxQueued, now,
-		QuotaOutboxQueued, QuotaOutboxProcessing, limit)
+		FOR UPDATE SKIP LOCKED`, QuotaOutboxQueued, now, scanLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -195,6 +195,16 @@ func (s *Store) claimQuotaOutboxBatchOnce(ctx context.Context, now time.Time, le
 		entries = append(entries, *entry)
 	}
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	entries, err = s.claimableQuotaOutboxEntries(ctx, tx, entries, limit)
+	if err != nil {
 		return nil, err
 	}
 	if len(entries) == 0 {
@@ -248,6 +258,142 @@ func (s *Store) claimQuotaOutboxBatchOnce(ctx context.Context, now time.Time, le
 		return nil, err
 	}
 	return entries, nil
+}
+
+func quotaOutboxClaimScanLimit(limit int) int {
+	if limit <= 0 {
+		limit = 1
+	}
+	scanLimit := limit * quotaOutboxClaimScanMultiplier
+	if scanLimit < limit {
+		return limit
+	}
+	return scanLimit
+}
+
+func (s *Store) claimableQuotaOutboxEntries(ctx context.Context, tx *sql.Tx, candidates []QuotaOutboxEntry, limit int) ([]QuotaOutboxEntry, error) {
+	if len(candidates) == 0 || limit <= 0 {
+		return nil, nil
+	}
+
+	fileIDs := make([]string, 0, len(candidates))
+	fileIDSeen := make(map[string]struct{}, len(candidates))
+	for i := range candidates {
+		if candidates[i].FileID == "" {
+			continue
+		}
+		if _, ok := fileIDSeen[candidates[i].FileID]; ok {
+			continue
+		}
+		fileIDSeen[candidates[i].FileID] = struct{}{}
+		fileIDs = append(fileIDs, candidates[i].FileID)
+	}
+
+	minPendingByFile, err := s.minPendingQuotaOutboxIDByFile(ctx, tx, fileIDs)
+	if err != nil {
+		return nil, err
+	}
+	minNullPendingID, err := s.minNullFilePendingQuotaOutboxID(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
+	out := make([]QuotaOutboxEntry, 0, minInt(limit, len(candidates)))
+	for i := range candidates {
+		candidate := candidates[i]
+		if candidate.FileID == "" {
+			blocked, err := s.hasPendingQuotaOutboxBeforeID(ctx, tx, candidate.ID)
+			if err != nil {
+				return nil, err
+			}
+			if blocked {
+				continue
+			}
+		} else {
+			if minID, ok := minPendingByFile[candidate.FileID]; !ok || minID != candidate.ID {
+				continue
+			}
+			if minNullPendingID > 0 && minNullPendingID < candidate.ID {
+				continue
+			}
+		}
+		out = append(out, candidate)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) minPendingQuotaOutboxIDByFile(ctx context.Context, tx *sql.Tx, fileIDs []string) (map[string]int64, error) {
+	out := make(map[string]int64, len(fileIDs))
+	if len(fileIDs) == 0 {
+		return out, nil
+	}
+	args := make([]any, 0, len(fileIDs)+2)
+	for _, fileID := range fileIDs {
+		args = append(args, fileID)
+	}
+	args = append(args, QuotaOutboxQueued, QuotaOutboxProcessing)
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`SELECT file_id, MIN(id)
+		FROM quota_outbox FORCE INDEX (idx_quota_outbox_file_order)
+		WHERE file_id IN (%s) AND status IN (?, ?)
+		GROUP BY file_id`, sqlPlaceholders(len(fileIDs))), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var fileID string
+		var id int64
+		if err := rows.Scan(&fileID, &id); err != nil {
+			return nil, err
+		}
+		out[fileID] = id
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) minNullFilePendingQuotaOutboxID(ctx context.Context, tx *sql.Tx) (int64, error) {
+	var id sql.NullInt64
+	err := tx.QueryRowContext(ctx, `SELECT MIN(id)
+		FROM quota_outbox FORCE INDEX (idx_quota_outbox_file_order)
+		WHERE file_id IS NULL AND status IN (?, ?)`,
+		QuotaOutboxQueued, QuotaOutboxProcessing).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	if !id.Valid {
+		return 0, nil
+	}
+	return id.Int64, nil
+}
+
+func (s *Store) hasPendingQuotaOutboxBeforeID(ctx context.Context, tx *sql.Tx, id int64) (bool, error) {
+	var olderID int64
+	err := tx.QueryRowContext(ctx, `SELECT id
+		FROM quota_outbox FORCE INDEX (PRIMARY)
+		WHERE id < ? AND status IN (?, ?)
+		ORDER BY id
+		LIMIT 1`,
+		id, QuotaOutboxQueued, QuotaOutboxProcessing).Scan(&olderID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // AckQuotaOutbox marks a leased quota outbox row as successfully applied.
