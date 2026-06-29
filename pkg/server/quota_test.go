@@ -42,6 +42,7 @@ type quotaTestProvisioner struct {
 	batchPoolCalls              atomic.Int32
 	markPoolUsedCalls           atomic.Int32
 	markPoolFreeCalls           atomic.Int32
+	ensureSystemUserCalls       atomic.Int32
 	mu                          sync.Mutex
 	lastCluster                 *tenant.ClusterInfo
 	lastCredentials             tenant.CredentialProvisionRequest
@@ -158,6 +159,7 @@ func (p *quotaTestProvisioner) Provision(context.Context, string) (*tenant.Clust
 func (p *quotaTestProvisioner) InitSchema(context.Context, string) error { return nil }
 
 func (p *quotaTestProvisioner) EnsureSystemUser(context.Context, string, string) (string, string, error) {
+	p.ensureSystemUserCalls.Add(1)
 	return "u.tdc_fs_sys", "pool-pass", nil
 }
 
@@ -1594,6 +1596,70 @@ func TestAdminTenantPoolGetShowsCreatingForPendingSlots(t *testing.T) {
 	}
 	if got.PoolID != "pool-1" || got.FreeSize != 0 || got.Status != adminTenantPoolStatusCreating {
 		t.Fatalf("get pool response = %#v", got)
+	}
+}
+
+func TestTenantSchemaInitStopsWhenTenantLeavesProvisioning(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	tenantID := "schema-init-shrunk-tenant"
+	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantProvisioning,
+		DBHost:           "db.example.com",
+		DBPort:           4000,
+		DBUser:           "u.root",
+		DBPasswordCipher: []byte("cipher"),
+		DBName:           "tidbcloud_fs",
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        "cluster-schema-init",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatalf("insert tenant: %v", err)
+	}
+
+	done := make(chan struct{})
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(done)
+		rt.server.initTenantSchemaAsync(ctx, tenantID, "u.root:pass@tcp(db.example.com:4000)/tidbcloud_fs", tenant.ProviderTiDBCloudNative, func(ctx context.Context, _ string) error {
+			updated, err := rt.meta.UpdateTenantStatusIf(ctx, tenantID, meta.TenantProvisioning, meta.TenantDeleting)
+			if err != nil {
+				errCh <- err
+				return err
+			}
+			if !updated {
+				err := fmt.Errorf("tenant status was not provisioning")
+				errCh <- err
+				return err
+			}
+			return nil
+		})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("schema init did not stop after tenant left provisioning")
+	}
+	select {
+	case err := <-errCh:
+		t.Fatalf("schema init setup failed: %v", err)
+	default:
+	}
+	if calls := rt.prov.ensureSystemUserCalls.Load(); calls != 0 {
+		t.Fatalf("ensure system user calls = %d, want 0", calls)
+	}
+	got, err := rt.meta.GetTenant(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("get tenant: %v", err)
+	}
+	if got.Status != meta.TenantDeleting {
+		t.Fatalf("tenant status = %s, want %s", got.Status, meta.TenantDeleting)
 	}
 }
 

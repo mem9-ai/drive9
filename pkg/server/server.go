@@ -4783,8 +4783,14 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			return
 		default:
 		}
+		if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "before_attempt") {
+			return
+		}
 		err := schemaInit(ctx, tenantDSN)
 		if err == nil {
+			if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "before_finalize") {
+				return
+			}
 			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
 		}
 		if err == nil {
@@ -4804,6 +4810,9 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			}
 			return
 		} else {
+			if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "after_error") {
+				return
+			}
 			s.schemaInitErrors.Store(tenantID, schemaInitStatusErrorMessage(err))
 			logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", err)...)
 			if s.metrics != nil {
@@ -4855,6 +4864,41 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		backoff *= 2
 		attempt++
 	}
+}
+
+func (s *Server) tenantSchemaInitStillProvisioning(ctx context.Context, tenantID, provider, stage string) bool {
+	if s.meta == nil {
+		return true
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	t, err := s.meta.GetTenant(ctx, tenantID)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_stopped_status_changed",
+				"tenant_id", tenantID,
+				"provider", provider,
+				"stage", stage,
+				"status", "missing")...)
+			return false
+		}
+		logger.Warn(ctx, "schema_init_status_lookup_failed",
+			zap.String("tenant_id", tenantID),
+			zap.String("provider", provider),
+			zap.String("stage", stage),
+			zap.Error(err))
+		return true
+	}
+	if t.Status != meta.TenantProvisioning {
+		logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_stopped_status_changed",
+			"tenant_id", tenantID,
+			"provider", provider,
+			"stage", stage,
+			"status", t.Status)...)
+		return false
+	}
+	return true
 }
 
 func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) error {
