@@ -623,6 +623,59 @@ func TestQuotaOutboxBatchClaimBlocksNullFileIDBehindOlderPendingRow(t *testing.T
 	}
 }
 
+func TestQuotaOutboxBatchClaimScansPastBlockedWindow(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	availableNow := now.Add(-time.Second)
+
+	hotFileID := "hot-file"
+	blockingID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       hotFileID,
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"hot-file"}`),
+		AvailableAt:  availableNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocking, found, err := s.ClaimQuotaOutbox(ctx, now, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || blocking.ID != blockingID {
+		t.Fatalf("blocking claim = %+v found=%v, want id %d", blocking, found, blockingID)
+	}
+
+	for i := 0; i < quotaOutboxClaimScanLimit(1); i++ {
+		if _, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+			FileID:       hotFileID,
+			MutationType: "file_overwrite",
+			MutationData: json.RawMessage(`{"file_id":"hot-file"}`),
+			AvailableAt:  availableNow,
+		}); err != nil {
+			t.Fatalf("enqueue blocked hot row %d: %v", i, err)
+		}
+	}
+	coldID, err := s.EnqueueQuotaOutboxTx(s.DB(), &QuotaOutboxEntry{
+		FileID:       "cold-file",
+		MutationType: "file_create",
+		MutationData: json.RawMessage(`{"file_id":"cold-file"}`),
+		AvailableAt:  availableNow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := s.ClaimQuotaOutboxBatch(ctx, now.Add(time.Second), time.Minute, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != coldID {
+		t.Fatalf("claimed past blocked window = %+v, want cold id %d", claimed, coldID)
+	}
+}
+
 func TestQuotaOutboxDeadLetteredOlderRowUnblocksLaterClaim(t *testing.T) {
 	s := newTestStore(t)
 	ctx := context.Background()

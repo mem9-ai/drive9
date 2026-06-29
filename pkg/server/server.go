@@ -756,22 +756,27 @@ func (s *Server) resumeNativeProvisioningWithoutConnection(ctx context.Context, 
 		zap.String("provider", t.Provider),
 		zap.String("cluster_id", t.ClusterID),
 	}
+	markFailed := func(fields []zap.Field) {
+		if err := s.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantFailed); err != nil {
+			logger.Error(ctx, "resume_provisioning_native_mark_failed", append(fields, zap.Error(err))...)
+		}
+	}
 	if strings.TrimSpace(t.ClusterID) == "" {
 		logger.Warn(ctx, "resume_provisioning_native_no_cluster", logFields...)
-		_ = s.meta.UpdateTenantStatus(context.Background(), t.ID, meta.TenantFailed)
+		markFailed(logFields)
 		return
 	}
 	plain, err := s.pool.Decrypt(ctx, t.DBPasswordCipher)
 	if err != nil || strings.TrimSpace(string(plain)) == "" {
 		fields := append(logFields, zap.Error(err))
 		logger.Warn(ctx, "resume_provisioning_native_no_password", fields...)
-		_ = s.meta.UpdateTenantStatus(context.Background(), t.ID, meta.TenantFailed)
+		markFailed(fields)
 		return
 	}
 	defaultReq := resolveDefaultCredentials(s.provisioner)
 	if defaultReq == nil {
 		logger.Warn(ctx, "resume_provisioning_native_no_credentials", logFields...)
-		_ = s.meta.UpdateTenantStatus(context.Background(), t.ID, meta.TenantFailed)
+		markFailed(logFields)
 		return
 	}
 	cluster := &tenant.ClusterInfo{

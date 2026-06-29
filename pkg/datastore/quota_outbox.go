@@ -175,43 +175,57 @@ func (s *Store) claimQuotaOutboxBatchOnce(ctx context.Context, now time.Time, le
 	// outbox tables. Lock a bounded candidate window first, then use indexed
 	// minimum-id checks below to preserve the same ordering semantics.
 	scanLimit := quotaOutboxClaimScanLimit(limit)
-	rows, err := tx.QueryContext(ctx, quotaOutboxSelectSQL+`
-		FROM quota_outbox q FORCE INDEX (idx_quota_outbox_claim)
-		WHERE q.status = ? AND q.available_at <= ?
-		ORDER BY q.id
-		LIMIT ?
-		FOR UPDATE SKIP LOCKED`, QuotaOutboxQueued, now, scanLimit)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-
-	entries := make([]QuotaOutboxEntry, 0, limit)
-	for rows.Next() {
-		entry, err := scanQuotaOutbox(rows)
+	var entries []QuotaOutboxEntry
+	var lastCandidateID int64
+	for {
+		rows, err := tx.QueryContext(ctx, quotaOutboxSelectSQL+`
+			FROM quota_outbox q FORCE INDEX (idx_quota_outbox_claim)
+			WHERE q.status = ? AND q.available_at <= ? AND q.id > ?
+			ORDER BY q.id
+			LIMIT ?
+			FOR UPDATE SKIP LOCKED`, QuotaOutboxQueued, now, lastCandidateID, scanLimit)
 		if err != nil {
 			return nil, err
 		}
-		entries = append(entries, *entry)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	if len(entries) == 0 {
-		if err := tx.Commit(); err != nil {
+
+		candidates := make([]QuotaOutboxEntry, 0, scanLimit)
+		for rows.Next() {
+			entry, err := scanQuotaOutbox(rows)
+			if err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			candidates = append(candidates, *entry)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
 			return nil, err
 		}
-		return nil, nil
-	}
-	entries, err = s.claimableQuotaOutboxEntries(ctx, tx, entries, limit)
-	if err != nil {
-		return nil, err
-	}
-	if len(entries) == 0 {
-		if err := tx.Commit(); err != nil {
+		if err := rows.Close(); err != nil {
 			return nil, err
 		}
-		return nil, nil
+
+		if len(candidates) == 0 {
+			if err := tx.Commit(); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+		lastCandidateID = candidates[len(candidates)-1].ID
+
+		entries, err = s.claimableQuotaOutboxEntries(ctx, tx, candidates, limit)
+		if err != nil {
+			return nil, err
+		}
+		if len(entries) > 0 {
+			break
+		}
+		if len(candidates) < scanLimit {
+			if err := tx.Commit(); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
 	}
 
 	receipt := uuid.NewString()
@@ -306,9 +320,10 @@ func (s *Store) claimableQuotaOutboxEntries(ctx context.Context, tx *sql.Tx, can
 			if err != nil {
 				return nil, err
 			}
-			if blocked {
-				continue
+			if !blocked {
+				out = append(out, candidate)
 			}
+			break
 		} else {
 			if minID, ok := minPendingByFile[candidate.FileID]; !ok || minID != candidate.ID {
 				continue

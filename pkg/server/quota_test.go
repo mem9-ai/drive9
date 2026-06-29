@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	neturl "net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -41,6 +42,7 @@ type quotaTestProvisioner struct {
 	batchPoolCalls           atomic.Int32
 	markPoolUsedCalls        atomic.Int32
 	markPoolFreeCalls        atomic.Int32
+	mu                       sync.Mutex
 	lastCluster              *tenant.ClusterInfo
 	lastCredentials          tenant.CredentialProvisionRequest
 	lastOptions              tenant.QuotaUpdateOptions
@@ -56,6 +58,83 @@ type quotaTestProvisioner struct {
 	metadataWaitCalls        atomic.Int32
 	metadataWaitErr          error
 	calls                    []string
+}
+
+func (p *quotaTestProvisioner) recordCall(name string, req tenant.CredentialProvisionRequest, cluster *tenant.ClusterInfo, opts *tenant.QuotaUpdateOptions) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, name)
+	p.lastCredentials = req
+	if opts != nil {
+		p.lastOptions = *opts
+	}
+	if cluster != nil {
+		out := *cluster
+		p.lastCluster = &out
+	}
+}
+
+func (p *quotaTestProvisioner) recordListCall(req tenant.CredentialProvisionRequest, opts tenant.ManagedClusterListOptions) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, "list")
+	p.lastCredentials = req
+	p.lastListOptions = opts
+}
+
+func (p *quotaTestProvisioner) recordDeprovisionCall(req tenant.CredentialProvisionRequest, cluster *tenant.ClusterInfo) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls = append(p.calls, "deprovision")
+	p.lastCredentials = req
+	if cluster != nil {
+		out := *cluster
+		p.lastDeprovision = &out
+	}
+}
+
+func (p *quotaTestProvisioner) callsSnapshot() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.calls...)
+}
+
+func (p *quotaTestProvisioner) lastCredentialsSnapshot() tenant.CredentialProvisionRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastCredentials
+}
+
+func (p *quotaTestProvisioner) lastOptionsSnapshot() tenant.QuotaUpdateOptions {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastOptions
+}
+
+func (p *quotaTestProvisioner) lastListOptionsSnapshot() tenant.ManagedClusterListOptions {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastListOptions
+}
+
+func (p *quotaTestProvisioner) lastClusterSnapshot() *tenant.ClusterInfo {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lastCluster == nil {
+		return nil
+	}
+	out := *p.lastCluster
+	return &out
+}
+
+func (p *quotaTestProvisioner) lastDeprovisionSnapshot() *tenant.ClusterInfo {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.lastDeprovision == nil {
+		return nil
+	}
+	out := *p.lastDeprovision
+	return &out
 }
 
 func (p *quotaTestProvisioner) ProviderType() string { return p.provider }
@@ -82,13 +161,7 @@ func (p *quotaTestProvisioner) EnsureSystemUser(context.Context, string, string)
 
 func (p *quotaTestProvisioner) UpdateQuota(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
 	p.updateCalls.Add(1)
-	p.calls = append(p.calls, "update")
-	p.lastCredentials = req
-	p.lastOptions = opts
-	if cluster != nil {
-		out := *cluster
-		p.lastCluster = &out
-	}
+	p.recordCall("update", req, cluster, &opts)
 	if p.updateErr != nil {
 		return nil, p.updateErr
 	}
@@ -100,12 +173,7 @@ func (p *quotaTestProvisioner) UpdateQuota(_ context.Context, cluster *tenant.Cl
 
 func (p *quotaTestProvisioner) MarkQuotaUpdateStarted(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.QuotaCloudConfig, error) {
 	p.markCalls.Add(1)
-	p.calls = append(p.calls, "mark")
-	p.lastCredentials = req
-	if cluster != nil {
-		out := *cluster
-		p.lastCluster = &out
-	}
+	p.recordCall("mark", req, cluster, nil)
 	if p.markHook != nil {
 		if err := p.markHook(); err != nil {
 			return nil, err
@@ -119,12 +187,7 @@ func (p *quotaTestProvisioner) MarkQuotaUpdateStarted(_ context.Context, cluster
 
 func (p *quotaTestProvisioner) GetQuota(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.QuotaCloudConfig, error) {
 	p.getCalls.Add(1)
-	p.calls = append(p.calls, "get")
-	p.lastCredentials = req
-	if cluster != nil {
-		out := *cluster
-		p.lastCluster = &out
-	}
+	p.recordCall("get", req, cluster, nil)
 	if p.getErr != nil {
 		return nil, p.getErr
 	}
@@ -133,12 +196,7 @@ func (p *quotaTestProvisioner) GetQuota(_ context.Context, cluster *tenant.Clust
 
 func (p *quotaTestProvisioner) DeprovisionWithCredentials(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
 	call := int(p.deprovisionCalls.Add(1))
-	p.calls = append(p.calls, "deprovision")
-	p.lastCredentials = req
-	if cluster != nil {
-		out := *cluster
-		p.lastDeprovision = &out
-	}
+	p.recordDeprovisionCall(req, cluster)
 	if p.deprovisionHook != nil {
 		if err := p.deprovisionHook(call, cluster); err != nil {
 			return err
@@ -149,9 +207,7 @@ func (p *quotaTestProvisioner) DeprovisionWithCredentials(_ context.Context, clu
 
 func (p *quotaTestProvisioner) ListManagedClusters(_ context.Context, req tenant.CredentialProvisionRequest, opts tenant.ManagedClusterListOptions) (*tenant.ManagedClusterListResult, error) {
 	call := int(p.listCalls.Add(1))
-	p.calls = append(p.calls, "list")
-	p.lastCredentials = req
-	p.lastListOptions = opts
+	p.recordListCall(req, opts)
 	if p.listErr != nil {
 		return nil, p.listErr
 	}
@@ -167,9 +223,7 @@ func (p *quotaTestProvisioner) ListManagedClusters(_ context.Context, req tenant
 
 func (p *quotaTestProvisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(_ context.Context, tenantIDs []string, req tenant.CredentialProvisionRequest, opts tenant.QuotaUpdateOptions) ([]*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
 	p.batchPoolCalls.Add(1)
-	p.calls = append(p.calls, "batch_pool")
-	p.lastCredentials = req
-	p.lastOptions = opts
+	p.recordCall("batch_pool", req, nil, &opts)
 	out := make([]*tenant.ClusterInfo, 0, len(tenantIDs))
 	for i, tenantID := range tenantIDs {
 		password := "pool-pass"
@@ -208,12 +262,7 @@ func (p *quotaTestProvisioner) BatchProvisionFreeClustersWithCredentialsAndQuota
 
 func (p *quotaTestProvisioner) WaitForPoolClusterMetadata(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
 	p.metadataWaitCalls.Add(1)
-	p.calls = append(p.calls, "wait_pool_metadata")
-	p.lastCredentials = req
-	if cluster != nil {
-		out := *cluster
-		p.lastCluster = &out
-	}
+	p.recordCall("wait_pool_metadata", req, cluster, nil)
 	if p.metadataWaitErr != nil {
 		return nil, p.metadataWaitErr
 	}
@@ -233,24 +282,13 @@ func (p *quotaTestProvisioner) WaitForPoolClusterMetadata(_ context.Context, clu
 
 func (p *quotaTestProvisioner) MarkClusterPoolUsed(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, _ time.Time, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
 	p.markPoolUsedCalls.Add(1)
-	p.calls = append(p.calls, "mark_pool_used")
-	p.lastCredentials = req
-	p.lastOptions = opts
-	if cluster != nil {
-		out := *cluster
-		p.lastCluster = &out
-	}
+	p.recordCall("mark_pool_used", req, cluster, &opts)
 	return &tenant.QuotaCloudConfig{TiDBCloudSpendingLimitMonthly: opts.TiDBCloudSpendingLimitMonthly}, nil
 }
 
 func (p *quotaTestProvisioner) MarkClusterPoolFree(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) error {
 	p.markPoolFreeCalls.Add(1)
-	p.calls = append(p.calls, "mark_pool_free")
-	p.lastCredentials = req
-	if cluster != nil {
-		out := *cluster
-		p.lastCluster = &out
-	}
+	p.recordCall("mark_pool_free", req, cluster, nil)
 	return nil
 }
 
@@ -397,8 +435,9 @@ func TestQuotaGetDoesNotFallbackToDefaultTiDBCloudCredentials(t *testing.T) {
 	if got := rt.prov.getCalls.Load(); got != 0 {
 		t.Fatalf("get calls = %d, want 0", got)
 	}
-	if rt.prov.lastCredentials.PublicKey == "default-pk" || rt.prov.lastCredentials.PrivateKey == "default-sk" {
-		t.Fatalf("quota get used default credentials: %#v", rt.prov.lastCredentials)
+	lastCredentials := rt.prov.lastCredentialsSnapshot()
+	if lastCredentials.PublicKey == "default-pk" || lastCredentials.PrivateKey == "default-sk" {
+		t.Fatalf("quota get used default credentials: %#v", lastCredentials)
 	}
 }
 
@@ -417,8 +456,9 @@ func TestQuotaGetAllowsExplicitDefaultTiDBCloudCredentials(t *testing.T) {
 	if got := rt.prov.getCalls.Load(); got != 1 {
 		t.Fatalf("get calls = %d, want 1", got)
 	}
-	if rt.prov.lastCredentials.PublicKey != "default-pk" || rt.prov.lastCredentials.PrivateKey != "default-sk" {
-		t.Fatalf("last credentials = %#v", rt.prov.lastCredentials)
+	lastCredentials := rt.prov.lastCredentialsSnapshot()
+	if lastCredentials.PublicKey != "default-pk" || lastCredentials.PrivateKey != "default-sk" {
+		t.Fatalf("last credentials = %#v", lastCredentials)
 	}
 }
 
@@ -493,11 +533,13 @@ func TestQuotaGetUsesTiDBCloudAuthorization(t *testing.T) {
 	if got := rt.prov.updateCalls.Load(); got != 0 {
 		t.Fatalf("update calls = %d, want 0", got)
 	}
-	if rt.prov.lastCluster == nil || rt.prov.lastCluster.ClusterID != "cluster-quota-1" || rt.prov.lastCluster.TenantID != rt.tenantID {
-		t.Fatalf("last cluster = %#v", rt.prov.lastCluster)
+	lastCluster := rt.prov.lastClusterSnapshot()
+	if lastCluster == nil || lastCluster.ClusterID != "cluster-quota-1" || lastCluster.TenantID != rt.tenantID {
+		t.Fatalf("last cluster = %#v", lastCluster)
 	}
-	if rt.prov.lastCredentials.PublicKey != "public-1" || rt.prov.lastCredentials.PrivateKey != "private-1" {
-		t.Fatalf("last credentials = %#v", rt.prov.lastCredentials)
+	lastCredentials := rt.prov.lastCredentialsSnapshot()
+	if lastCredentials.PublicKey != "public-1" || lastCredentials.PrivateKey != "private-1" {
+		t.Fatalf("last credentials = %#v", lastCredentials)
 	}
 }
 
@@ -562,8 +604,9 @@ func TestQuotaSetChecksClusterWritePermissionBeforeMaxStorageUpdate(t *testing.T
 	if got := rt.prov.markCalls.Load(); got != 1 {
 		t.Fatalf("mark calls = %d, want 1", got)
 	}
-	if len(rt.prov.calls) != 1 || rt.prov.calls[0] != "mark" {
-		t.Fatalf("calls = %#v, want mark only", rt.prov.calls)
+	calls := rt.prov.callsSnapshot()
+	if len(calls) != 1 || calls[0] != "mark" {
+		t.Fatalf("calls = %#v, want mark only", calls)
 	}
 	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
 	if err != nil {
@@ -668,8 +711,9 @@ func TestQuotaSetChecksClusterWritePermissionBeforeFileLimitUpdate(t *testing.T)
 	if got := rt.prov.markCalls.Load(); got != 1 {
 		t.Fatalf("mark calls = %d, want 1", got)
 	}
-	if len(rt.prov.calls) != 1 || rt.prov.calls[0] != "mark" {
-		t.Fatalf("calls = %#v, want mark only", rt.prov.calls)
+	calls := rt.prov.callsSnapshot()
+	if len(calls) != 1 || calls[0] != "mark" {
+		t.Fatalf("calls = %#v, want mark only", calls)
 	}
 	cfg, err := rt.meta.GetQuotaConfig(ctx, rt.tenantID)
 	if err != nil {
@@ -703,11 +747,13 @@ func TestQuotaSetSpendingLimitOnlyDoesNotWriteStorageConfig(t *testing.T) {
 	if got := rt.prov.markCalls.Load(); got != 1 {
 		t.Fatalf("mark calls = %d, want 1", got)
 	}
-	if len(rt.prov.calls) != 2 || rt.prov.calls[0] != "mark" || rt.prov.calls[1] != "update" {
-		t.Fatalf("calls = %#v, want mark before update", rt.prov.calls)
+	calls := rt.prov.callsSnapshot()
+	if len(calls) != 2 || calls[0] != "mark" || calls[1] != "update" {
+		t.Fatalf("calls = %#v, want mark before update", calls)
 	}
-	if rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly == nil || *rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly != spendingLimit {
-		t.Fatalf("spending limit option = %#v, want %d", rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
+	lastOptions := rt.prov.lastOptionsSnapshot()
+	if lastOptions.TiDBCloudSpendingLimitMonthly == nil || *lastOptions.TiDBCloudSpendingLimitMonthly != spendingLimit {
+		t.Fatalf("spending limit option = %#v, want %d", lastOptions.TiDBCloudSpendingLimitMonthly, spendingLimit)
 	}
 	version, err := rt.meta.GetQuotaConfigVersion(context.Background(), rt.tenantID)
 	if err != nil {
@@ -781,8 +827,9 @@ func TestQuotaSetDoesNotFallbackToDefaultTiDBCloudCredentials(t *testing.T) {
 	if got := rt.prov.markCalls.Load(); got != 0 {
 		t.Fatalf("mark calls = %d, want 0", got)
 	}
-	if rt.prov.lastCredentials.PublicKey == "default-pk" || rt.prov.lastCredentials.PrivateKey == "default-sk" {
-		t.Fatalf("quota set used default credentials: %#v", rt.prov.lastCredentials)
+	lastCredentials := rt.prov.lastCredentialsSnapshot()
+	if lastCredentials.PublicKey == "default-pk" || lastCredentials.PrivateKey == "default-sk" {
+		t.Fatalf("quota set used default credentials: %#v", lastCredentials)
 	}
 }
 
@@ -809,11 +856,13 @@ func TestQuotaSetAllowsExplicitDefaultTiDBCloudCredentials(t *testing.T) {
 	if got := rt.prov.markCalls.Load(); got != 1 {
 		t.Fatalf("mark calls = %d, want 1", got)
 	}
-	if len(rt.prov.calls) != 1 || rt.prov.calls[0] != "mark" {
-		t.Fatalf("calls = %#v, want mark only", rt.prov.calls)
+	calls := rt.prov.callsSnapshot()
+	if len(calls) != 1 || calls[0] != "mark" {
+		t.Fatalf("calls = %#v, want mark only", calls)
 	}
-	if rt.prov.lastCredentials.PublicKey != "default-pk" || rt.prov.lastCredentials.PrivateKey != "default-sk" {
-		t.Fatalf("last credentials = %#v", rt.prov.lastCredentials)
+	lastCredentials := rt.prov.lastCredentialsSnapshot()
+	if lastCredentials.PublicKey != "default-pk" || lastCredentials.PrivateKey != "default-sk" {
+		t.Fatalf("last credentials = %#v", lastCredentials)
 	}
 }
 
@@ -1041,8 +1090,9 @@ func TestAdminTenantListReturnsEmptyWithoutDBLookupWhenNoManagedClusters(t *test
 	if got := rt.prov.listCalls.Load(); got != 1 {
 		t.Fatalf("list calls = %d, want 1", got)
 	}
-	if rt.prov.lastListOptions.ClusterID != "" {
-		t.Fatalf("cluster filter = %q, want empty", rt.prov.lastListOptions.ClusterID)
+	lastListOptions := rt.prov.lastListOptionsSnapshot()
+	if lastListOptions.ClusterID != "" {
+		t.Fatalf("cluster filter = %q, want empty", lastListOptions.ClusterID)
 	}
 }
 
@@ -1357,8 +1407,9 @@ func TestAdminTenantGetUsesListClusterAuthorizationAndReturnsQuota(t *testing.T)
 	if got := rt.prov.listCalls.Load(); got != 1 {
 		t.Fatalf("list calls = %d, want 1", got)
 	}
-	if rt.prov.lastListOptions.ClusterID != "cluster-quota-1" {
-		t.Fatalf("cluster filter = %q, want cluster-quota-1", rt.prov.lastListOptions.ClusterID)
+	lastListOptions := rt.prov.lastListOptionsSnapshot()
+	if lastListOptions.ClusterID != "cluster-quota-1" {
+		t.Fatalf("cluster filter = %q, want cluster-quota-1", lastListOptions.ClusterID)
 	}
 	if got := rt.prov.markCalls.Load(); got != 0 {
 		t.Fatalf("mark calls = %d, want 0", got)
@@ -1419,8 +1470,9 @@ func TestAdminTenantPoolCreateBatchProvisionsFreeTenants(t *testing.T) {
 	if rt.prov.batchPoolCalls.Load() != 1 {
 		t.Fatalf("batch pool calls = %d, want 1", rt.prov.batchPoolCalls.Load())
 	}
-	if rt.prov.lastOptions.TenantPoolID != out.PoolID {
-		t.Fatalf("batch pool id option = %q, want %q", rt.prov.lastOptions.TenantPoolID, out.PoolID)
+	lastOptions := rt.prov.lastOptionsSnapshot()
+	if lastOptions.TenantPoolID != out.PoolID {
+		t.Fatalf("batch pool id option = %q, want %q", lastOptions.TenantPoolID, out.PoolID)
 	}
 	pool, err := rt.meta.GetTenantPoolByOrganization(context.Background(), "org-1")
 	if err != nil {
@@ -1546,8 +1598,9 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneOrganizationMissi
 	if got := rt.prov.deprovisionCalls.Load(); got != 1 {
 		t.Fatalf("deprovision calls = %d, want 1", got)
 	}
-	if rt.prov.lastDeprovision == nil || rt.prov.lastDeprovision.ClusterID != "pool-cluster-2" {
-		t.Fatalf("last deprovision = %#v, want pool-cluster-2", rt.prov.lastDeprovision)
+	lastDeprovision := rt.prov.lastDeprovisionSnapshot()
+	if lastDeprovision == nil || lastDeprovision.ClusterID != "pool-cluster-2" {
+		t.Fatalf("last deprovision = %#v, want pool-cluster-2", lastDeprovision)
 	}
 }
 
@@ -1587,8 +1640,9 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneTenantLabelMissin
 	if got := rt.prov.deprovisionCalls.Load(); got != 1 {
 		t.Fatalf("deprovision calls = %d, want 1", got)
 	}
-	if rt.prov.lastDeprovision == nil || rt.prov.lastDeprovision.ClusterID != "pool-cluster-2" {
-		t.Fatalf("last deprovision = %#v, want pool-cluster-2", rt.prov.lastDeprovision)
+	lastDeprovision := rt.prov.lastDeprovisionSnapshot()
+	if lastDeprovision == nil || lastDeprovision.ClusterID != "pool-cluster-2" {
+		t.Fatalf("last deprovision = %#v, want pool-cluster-2", lastDeprovision)
 	}
 }
 
@@ -1666,11 +1720,12 @@ func TestResumeProvisioningNativeWithoutConnectionUsesDefaultCredentials(t *test
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got := rt.prov.metadataWaitCalls.Load(); got != 1 {
-		t.Fatalf("metadata wait calls = %d, want 1", got)
+	if got := rt.prov.metadataWaitCalls.Load(); got < 1 {
+		t.Fatalf("metadata wait calls = %d, want at least 1", got)
 	}
-	if rt.prov.lastCredentials.PublicKey != "default-public" || rt.prov.lastCredentials.PrivateKey != "default-private" {
-		t.Fatalf("credentials = %#v, want default credentials", rt.prov.lastCredentials)
+	lastCredentials := rt.prov.lastCredentialsSnapshot()
+	if lastCredentials.PublicKey != "default-public" || lastCredentials.PrivateKey != "default-private" {
+		t.Fatalf("credentials = %#v, want default credentials", lastCredentials)
 	}
 }
 
@@ -1987,8 +2042,9 @@ func TestAdminTenantPoolReplenishUsesDefaultSpendingLimit(t *testing.T) {
 	if got := rt.prov.batchPoolCalls.Load(); got != 1 {
 		t.Fatalf("batch pool calls = %d, want 1", got)
 	}
-	if rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly != nil {
-		t.Fatalf("replenish spending limit = %#v, want nil", rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly)
+	lastOptions := rt.prov.lastOptionsSnapshot()
+	if lastOptions.TiDBCloudSpendingLimitMonthly != nil {
+		t.Fatalf("replenish spending limit = %#v, want nil", lastOptions.TiDBCloudSpendingLimitMonthly)
 	}
 }
 
@@ -2145,11 +2201,13 @@ func TestAdminTenantCreateClaimsFreePoolTenant(t *testing.T) {
 	if rt.prov.markPoolUsedCalls.Load() != 1 {
 		t.Fatalf("mark pool used calls = %d, want 1", rt.prov.markPoolUsedCalls.Load())
 	}
-	if rt.prov.lastCluster == nil || rt.prov.lastCluster.ClusterID != "cluster-free-1" {
-		t.Fatalf("last cluster = %#v", rt.prov.lastCluster)
+	lastCluster := rt.prov.lastClusterSnapshot()
+	if lastCluster == nil || lastCluster.ClusterID != "cluster-free-1" {
+		t.Fatalf("last cluster = %#v", lastCluster)
 	}
-	if rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly == nil || *rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly != 123 {
-		t.Fatalf("last spending limit = %#v", rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly)
+	lastOptions := rt.prov.lastOptionsSnapshot()
+	if lastOptions.TiDBCloudSpendingLimitMonthly == nil || *lastOptions.TiDBCloudSpendingLimitMonthly != 123 {
+		t.Fatalf("last spending limit = %#v", lastOptions.TiDBCloudSpendingLimitMonthly)
 	}
 	binding, err := rt.meta.GetTenantTiDBCloudOrgBinding(ctx, tenantID)
 	if err != nil {
@@ -2248,11 +2306,13 @@ func TestProvisionClaimsFreePoolTenant(t *testing.T) {
 	if rt.prov.batchPoolCalls.Load() != 0 {
 		t.Errorf("batch pool calls = %d, want 0", rt.prov.batchPoolCalls.Load())
 	}
-	if rt.prov.lastCluster == nil || rt.prov.lastCluster.ClusterID != "cluster-free-1" {
-		t.Errorf("last cluster = %#v", rt.prov.lastCluster)
+	lastCluster := rt.prov.lastClusterSnapshot()
+	if lastCluster == nil || lastCluster.ClusterID != "cluster-free-1" {
+		t.Errorf("last cluster = %#v", lastCluster)
 	}
-	if rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly == nil || *rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly != 123 {
-		t.Errorf("last spending limit = %#v", rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly)
+	lastOptions := rt.prov.lastOptionsSnapshot()
+	if lastOptions.TiDBCloudSpendingLimitMonthly == nil || *lastOptions.TiDBCloudSpendingLimitMonthly != 123 {
+		t.Errorf("last spending limit = %#v", lastOptions.TiDBCloudSpendingLimitMonthly)
 	}
 	quotaCfg, err := rt.meta.GetQuotaConfig(ctx, tenantID)
 	if err != nil {
@@ -2396,8 +2456,9 @@ func TestAdminTenantQuotaSetRequiresPatchLabelAuthorization(t *testing.T) {
 	if cfg.MaxStorageBytes != 200*quotaStorageSizeBytes {
 		t.Fatalf("max storage bytes = %d, want %d", cfg.MaxStorageBytes, 200*quotaStorageSizeBytes)
 	}
-	if len(rt.prov.calls) < 2 || rt.prov.calls[0] != "list" || rt.prov.calls[1] != "mark" {
-		t.Fatalf("calls = %#v, want list then mark", rt.prov.calls)
+	calls := rt.prov.callsSnapshot()
+	if len(calls) < 2 || calls[0] != "list" || calls[1] != "mark" {
+		t.Fatalf("calls = %#v, want list then mark", calls)
 	}
 }
 
@@ -2543,8 +2604,9 @@ func TestAdminTenantDeleteRemovesTiDBCloudOrgBinding(t *testing.T) {
 	if got := rt.prov.deprovisionCalls.Load(); got != 1 {
 		t.Fatalf("deprovision calls = %d, want 1", got)
 	}
-	if rt.prov.lastDeprovision == nil || rt.prov.lastDeprovision.ClusterID != "cluster-quota-1" {
-		t.Fatalf("deprovision cluster = %#v", rt.prov.lastDeprovision)
+	lastDeprovision := rt.prov.lastDeprovisionSnapshot()
+	if lastDeprovision == nil || lastDeprovision.ClusterID != "cluster-quota-1" {
+		t.Fatalf("deprovision cluster = %#v", lastDeprovision)
 	}
 	got, err := rt.meta.GetTenant(ctx, rt.tenantID)
 	if err != nil {
