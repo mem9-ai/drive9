@@ -30,7 +30,7 @@ env:
 
 jobs:
   blackbox:
-    name: blackbox (${{ env.BLACKBOX_GROUP }})
+    name: blackbox (${{ inputs.group || 'all' }})
     runs-on: ubuntu-latest
     timeout-minutes: 240
 
