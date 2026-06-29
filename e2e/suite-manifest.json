@@ -98,6 +98,13 @@
       "product_promise": "drive9 passes the pjdfstest POSIX suite",
       "owner_hint": "fs",
       "failure_class": "correctness"
+    },
+    "e2e-feishu-proof": {
+      "title": "Feishu notification proof",
+      "product_area": "ci",
+      "product_promise": "Feishu notification delivery works",
+      "owner_hint": "ci",
+      "failure_class": "infrastructure"
     }
   }
 }

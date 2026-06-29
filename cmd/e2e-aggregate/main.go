@@ -32,16 +32,17 @@ func main() {
 		outPath       = flag.String("out", "", "write the aggregated RunReport JSON here")
 		issueBodyPath = flag.String("issue-body", "", "write the GitHub issue body here")
 		tierOverride  = flag.String("tier", "", "override automation tier (pr|post-merge|nightly|manual)")
+		proofSuite    = flag.String("proof-fail-suite", "", "inject a synthetic failed suite to prove the notification path end to end (manual CI proof)")
 	)
 	flag.Parse()
 
-	if err := run(*manifestPath, *outcomesPath, *summariesDir, *outPath, *issueBodyPath, *tierOverride); err != nil {
+	if err := run(*manifestPath, *outcomesPath, *summariesDir, *outPath, *issueBodyPath, *tierOverride, *proofSuite); err != nil {
 		fmt.Fprintln(os.Stderr, "e2e-aggregate:", err)
 		os.Exit(1)
 	}
 }
 
-func run(manifestPath, outcomesPath, summariesDir, outPath, issueBodyPath, tierOverride string) error {
+func run(manifestPath, outcomesPath, summariesDir, outPath, issueBodyPath, tierOverride, proofSuite string) error {
 	tier := e2ereport.TierFromEvent(os.Getenv("GITHUB_EVENT_NAME"))
 	if tierOverride != "" {
 		tier = e2ereport.Tier(tierOverride)
@@ -51,6 +52,13 @@ func run(manifestPath, outcomesPath, summariesDir, outPath, issueBodyPath, tierO
 	outcomes, err := loadOutcomes(outcomesPath)
 	if err != nil {
 		return err
+	}
+	if proofSuite != "" {
+		// Manual proof: a synthetic failed suite makes notify=true so the whole
+		// path (aggregate -> card -> Feishu) is exercised on a green CI run. It
+		// only affects this report; the real job gate reads actual step outcomes.
+		outcomes[proofSuite] = string(e2ereport.StatusFailure)
+		fmt.Fprintf(os.Stderr, "e2e-aggregate: proof mode — injected synthetic failed suite %q\n", proofSuite)
 	}
 	adopted := loadAdoptedSummaries(summariesDir)
 

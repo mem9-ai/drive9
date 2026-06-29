@@ -39,6 +39,10 @@ on:
         required: false
         default: "0"
         type: string
+      feishu_proof:
+        required: false
+        default: "0"
+        type: string
   workflow_dispatch:
     inputs:
       run_all_e2e:
@@ -129,6 +133,14 @@ on:
         options:
           - "0"
           - "1"
+      feishu_proof:
+        description: "Prove the Feishu notification path: inject a synthetic failed suite so a card is sent on this (green) run. Does not fail the job or file an issue."
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
 
 permissions:
   contents: read
@@ -164,6 +176,7 @@ env:
   # Deterministic perf gating lives in e2e/fuse-write-perf-budget-test.sh.
   FUSE_PERF_COMPARE_FAIL_ON_REGRESSION: "0"
   FUSE_CONCURRENCY_STRESS_REQUIRED: ${{ (github.event_name == 'schedule' || github.event_name == 'push' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' || inputs.run_fuse_concurrency_stress == '1'))) && '1' || '0' }}
+  FEISHU_PROOF: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.feishu_proof == '1' && '1' || '0' }}
   FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
   FUSE_CONCURRENCY_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-concurrency
   FEATURE_MATRIX_REPORT_DIR: ${{ github.workspace }}/e2e-artifacts/feature-matrix
@@ -504,12 +517,17 @@ jobs:
             "pjdfstest-suite": "${{ steps.pjdfstest-suite.outcome }}"
           }
           JSON
+          proof_arg=""
+          if [ "${FEISHU_PROOF}" = "1" ]; then
+            proof_arg="--proof-fail-suite e2e-feishu-proof"
+          fi
           go run ./cmd/e2e-aggregate \
             --manifest e2e/suite-manifest.json \
             --outcomes /tmp/e2e-outcomes.json \
             --summaries e2e/reports/summary \
             --out /tmp/e2e-report.json \
-            --issue-body /tmp/e2e-issue-body.md
+            --issue-body /tmp/e2e-issue-body.md \
+            $proof_arg
 
       # Push failures/regressions that warrant attention to Feishu/Lark. PR-tier
       # failures stay in GitHub by policy; the notifier no-ops when no Feishu
