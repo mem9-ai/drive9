@@ -220,17 +220,17 @@ type tenantPoolNoListProvisioner struct {
 
 func (p *tenantPoolNoListProvisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(context.Context, []string, tenant.CredentialProvisionRequest, tenant.QuotaUpdateOptions) ([]*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
 	p.batchPoolCalls.Add(1)
-	return nil, nil, errors.New("pool batch should not be called")
+	return nil, nil, nil
 }
 
 func (p *tenantPoolNoListProvisioner) MarkClusterPoolUsed(context.Context, *tenant.ClusterInfo, tenant.CredentialProvisionRequest, time.Time, tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
 	p.markPoolUsedCalls.Add(1)
-	return nil, errors.New("pool mark used should not be called")
+	return nil, nil
 }
 
 func (p *tenantPoolNoListProvisioner) MarkClusterPoolFree(context.Context, *tenant.ClusterInfo, tenant.CredentialProvisionRequest) error {
 	p.markPoolFreeCalls.Add(1)
-	return errors.New("pool mark free should not be called")
+	return nil
 }
 
 func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {

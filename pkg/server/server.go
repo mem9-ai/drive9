@@ -3910,6 +3910,7 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		quotaReq = decoded.Quota
 		if quotaReq != nil {
 			if err := s.validateQuotaSetRequest(*quotaReq); err != nil {
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
 				errJSON(w, http.StatusBadRequest, err.Error())
 				return
 			}
@@ -4690,7 +4691,7 @@ func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) {
 	ctx = ensureTrace(ctx)
-	schemaCtx := logger.WithContext(ctx, logger.FromContext(ctx).With(
+	ctx = logger.WithContext(ctx, logger.FromContext(ctx).With(
 		zap.String("tenant_id", tenantID),
 		zap.String("provider", provider),
 	))
@@ -4708,7 +4709,7 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			return
 		default:
 		}
-		err := schemaInit(schemaCtx, tenantDSN)
+		err := schemaInit(ctx, tenantDSN)
 		if err == nil {
 			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
 		}
