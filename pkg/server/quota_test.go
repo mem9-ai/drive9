@@ -57,6 +57,7 @@ type quotaTestProvisioner struct {
 	batchPoolMissingTenant      map[int]bool
 	metadataWaitCalls           atomic.Int32
 	metadataBatchWaitCalls      atomic.Int32
+	metadataBatchWaitHook       func(call int, clusters []*tenant.ClusterInfo)
 	metadataWaitErr             error
 	calls                       []string
 }
@@ -275,8 +276,11 @@ func (p *quotaTestProvisioner) WaitForPoolClusterMetadata(_ context.Context, clu
 }
 
 func (p *quotaTestProvisioner) WaitForPoolClustersMetadata(_ context.Context, clusters []*tenant.ClusterInfo, req tenant.CredentialProvisionRequest) ([]*tenant.ClusterInfo, error) {
-	p.metadataBatchWaitCalls.Add(1)
+	call := int(p.metadataBatchWaitCalls.Add(1))
 	p.recordCall("wait_pool_metadata_batch", req, nil, nil)
+	if p.metadataBatchWaitHook != nil {
+		p.metadataBatchWaitHook(call, clusters)
+	}
 	if p.metadataWaitErr != nil {
 		return nil, p.metadataWaitErr
 	}
@@ -1825,6 +1829,103 @@ func TestTenantPoolClaimMissTriggersPendingMetadataResume(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			t.Fatalf("tenant after pending resume = status %s host %q user %q, metadata batch waits=%d", tnt.Status, tnt.DBHost, tnt.DBUser, rt.prov.metadataBatchWaitCalls.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestTenantPoolMetadataResumeRerunsWhenTriggeredWhileActive(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
+		PoolID:         "pool-1",
+		OrganizationID: "org-1",
+		Size:           2,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var closeFirstStarted sync.Once
+	rt.prov.metadataBatchWaitHook = func(call int, _ []*tenant.ClusterInfo) {
+		if call != 1 {
+			return
+		}
+		closeFirstStarted.Do(func() { close(firstStarted) })
+		<-releaseFirst
+	}
+	makePending := func(tenantID, clusterID string) *tenant.ClusterInfo {
+		t.Helper()
+		passCipher, err := rt.server.pool.Encrypt(ctx, []byte("pool-pass"))
+		if err != nil {
+			t.Fatalf("encrypt password: %v", err)
+		}
+		if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+			ID:               tenantID,
+			Status:           meta.TenantPending,
+			DBPasswordCipher: passCipher,
+			DBName:           "tidbcloud_fs",
+			DBTLS:            true,
+			Provider:         tenant.ProviderTiDBCloudNative,
+			ClusterID:        clusterID,
+			SchemaVersion:    1,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		}); err != nil {
+			t.Fatalf("insert tenant %s: %v", tenantID, err)
+		}
+		if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+			TenantID:       tenantID,
+			OrganizationID: "org-1",
+			ClusterID:      clusterID,
+			PoolID:         "pool-1",
+			PoolStatus:     meta.TenantPoolBindingFree,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}); err != nil {
+			t.Fatalf("upsert binding %s: %v", tenantID, err)
+		}
+		return &tenant.ClusterInfo{
+			TenantID:       tenantID,
+			ClusterID:      clusterID,
+			OrganizationID: "org-1",
+			Password:       "pool-pass",
+			DBName:         "tidbcloud_fs",
+			Provider:       tenant.ProviderTiDBCloudNative,
+		}
+	}
+	first := makePending("pool-pending-rerun-1", "cluster-pending-rerun-1")
+	rt.server.startPoolClustersMetadataResume(ctx, "pool-1", []*tenant.ClusterInfo{first}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	select {
+	case <-firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first metadata resume did not start")
+	}
+	second := makePending("pool-pending-rerun-2", "cluster-pending-rerun-2")
+	rt.server.startPoolClustersMetadataResume(ctx, "pool-1", []*tenant.ClusterInfo{second}, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	})
+	close(releaseFirst)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		secondTenant, err := rt.meta.GetTenant(ctx, second.TenantID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rt.prov.metadataBatchWaitCalls.Load() >= 2 && secondTenant.DBHost == "db.example.com" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("second tenant after rerun = status %s host %q, metadata batch waits=%d", secondTenant.Status, secondTenant.DBHost, rt.prov.metadataBatchWaitCalls.Load())
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

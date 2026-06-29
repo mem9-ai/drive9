@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.uber.org/zap"
@@ -34,6 +35,10 @@ type adminTenantPoolResponse struct {
 type adminTenantPoolHTTPError struct {
 	status  int
 	message string
+}
+
+type tenantPoolResumeJob struct {
+	rerun atomic.Bool
 }
 
 func (e *adminTenantPoolHTTPError) Error() string {
@@ -403,7 +408,7 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 	if err != nil && len(clusters) == 0 {
 		s.cleanupPoolProvisionedClusters(ctx, clusters, cred, tenantIDs, "batch_provision_error")
 		for _, tenantID := range tenantIDs {
-			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+			s.markTenantPoolTenantFailed(ctx, tenantID, "batch_provision_error")
 		}
 		return nil, err
 	}
@@ -483,11 +488,11 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 			OrganizationID: orgID,
 		}
 		if poolClusterConnectionReady(cluster) {
-			if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); err != nil {
+			if err := s.persistPoolTenantConnection(ctx, cluster, provider); err != nil {
 				cleanupOnError = true
 				return nil, err
 			}
-			if err := s.persistPoolTenantConnection(ctx, cluster, provider); err != nil {
+			if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); err != nil {
 				cleanupOnError = true
 				return nil, err
 			}
@@ -512,7 +517,7 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 		if _, ok := discardedTenants[tenantID]; ok {
 			continue
 		}
-		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+		s.markTenantPoolTenantFailed(ctx, tenantID, "missing_cluster_response")
 	}
 	if len(clusters) > 0 && len(results) == 0 {
 		cleanupOnError = false
@@ -521,6 +526,19 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 	cleanupOnError = false
 	s.startPoolClustersMetadataResume(ctx, poolID, pendingResume, cred)
 	return results, nil
+}
+
+func (s *Server) markTenantPoolTenantFailed(ctx context.Context, tenantID, reason string) {
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return
+	}
+	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantFailed); err != nil {
+		logger.Warn(ctx, "admin_tenant_pool_mark_failed_failed",
+			zap.String("tenant_id", tenantID),
+			zap.String("reason", reason),
+			zap.Error(err))
+	}
 }
 
 func (s *Server) persistPoolTenantProvisionSeed(ctx context.Context, cluster *tenant.ClusterInfo, provider string) error {
@@ -592,11 +610,16 @@ func (s *Server) startPoolClustersMetadataResume(ctx context.Context, poolID str
 	if len(clusters) == 0 {
 		return
 	}
+	job := &tenantPoolResumeJob{}
 	if poolID != "" {
-		if _, loaded := s.tenantPoolResumeJobs.LoadOrStore(poolID, struct{}{}); loaded {
+		actual, loaded := s.tenantPoolResumeJobs.LoadOrStore(poolID, job)
+		if loaded {
+			if existing, ok := actual.(*tenantPoolResumeJob); ok {
+				existing.rerun.Store(true)
+			}
 			logger.Info(ctx, "admin_tenant_pool_metadata_resume_skipped",
 				zap.String("pool_id", poolID),
-				zap.String("reason", "metadata_resume_already_running"),
+				zap.String("reason", "metadata_resume_already_running_rerun_requested"),
 				zap.Int("cluster_count", len(clusters)))
 			return
 		}
@@ -613,16 +636,32 @@ func (s *Server) startPoolClustersMetadataResume(ctx context.Context, poolID str
 		workerCtx, cancel := context.WithTimeout(workerCtx, 10*time.Minute)
 		defer cancel()
 
-		started := time.Now()
-		updated, err := s.waitForPoolClustersMetadata(workerCtx, clusterCopies, cred)
-		if err != nil {
-			logger.Warn(workerCtx, "admin_tenant_pool_metadata_resume_batch_failed",
-				zap.String("pool_id", poolID),
-				zap.Int("cluster_count", len(clusterCopies)),
-				zap.Error(err))
-		}
-		for _, cluster := range updated {
-			s.completePoolClusterMetadataResume(workerCtx, started, cluster)
+		for {
+			started := time.Now()
+			updated, err := s.waitForPoolClustersMetadata(workerCtx, clusterCopies, cred)
+			if err != nil {
+				logger.Warn(workerCtx, "admin_tenant_pool_metadata_resume_batch_failed",
+					zap.String("pool_id", poolID),
+					zap.Int("cluster_count", len(clusterCopies)),
+					zap.Error(err))
+			}
+			for _, cluster := range updated {
+				s.completePoolClusterMetadataResume(workerCtx, started, cluster)
+			}
+			if poolID == "" || !job.rerun.Swap(false) {
+				return
+			}
+			next, err := s.pendingTenantPoolResumeClusters(workerCtx, poolID, len(clusterCopies))
+			if err != nil {
+				logger.Warn(workerCtx, "admin_tenant_pool_metadata_resume_rerun_list_failed",
+					zap.String("pool_id", poolID),
+					zap.Error(err))
+				return
+			}
+			clusterCopies = next
+			if len(clusterCopies) == 0 {
+				return
+			}
 		}
 	})
 }
@@ -943,27 +982,45 @@ func (s *Server) resumePendingTenantPoolAsync(ctx context.Context, pool *meta.Te
 	}
 	workerCtx := backgroundWithTrace(ctx)
 	s.startServerWorker(workerCtx, func(ctx context.Context) {
-		rows, err := s.meta.ListPendingTenantPoolBindingsForResume(ctx, pool.OrganizationID, pool.Size)
+		clusters, err := s.pendingTenantPoolResumeClusters(ctx, pool.PoolID, pool.Size)
 		if err != nil {
 			logger.Warn(ctx, "admin_tenant_pool_pending_resume_list_failed", zap.String("pool_id", pool.PoolID), zap.Error(err))
 			return
 		}
-		clusters := make([]*tenant.ClusterInfo, 0, len(rows))
-		for _, row := range rows {
-			plainPass, err := s.pool.Decrypt(ctx, row.Tenant.DBPasswordCipher)
-			if err != nil || strings.TrimSpace(string(plainPass)) == "" {
-				logger.Warn(ctx, "admin_tenant_pool_pending_resume_password_failed",
-					zap.String("tenant_id", row.Tenant.ID),
-					zap.String("pool_id", pool.PoolID),
-					zap.Error(err))
-				continue
-			}
-			cluster := clusterInfoFromTenant(&row.Tenant)
-			cluster.Password = string(plainPass)
-			clusters = append(clusters, cluster)
-		}
 		s.startPoolClustersMetadataResume(ctx, pool.PoolID, clusters, cred)
 	})
+}
+
+func (s *Server) pendingTenantPoolResumeClusters(ctx context.Context, poolID string, limit int) ([]*tenant.ClusterInfo, error) {
+	pool, err := s.meta.GetTenantPoolByID(ctx, poolID)
+	if err != nil {
+		return nil, err
+	}
+	if pool.OrganizationID == "" || pool.Status != meta.TenantPoolActive {
+		return []*tenant.ClusterInfo{}, nil
+	}
+	if limit <= 0 || limit < pool.Size {
+		limit = pool.Size
+	}
+	rows, err := s.meta.ListPendingTenantPoolBindingsForResume(ctx, pool.OrganizationID, limit)
+	if err != nil {
+		return nil, err
+	}
+	clusters := make([]*tenant.ClusterInfo, 0, len(rows))
+	for _, row := range rows {
+		plainPass, err := s.pool.Decrypt(ctx, row.Tenant.DBPasswordCipher)
+		if err != nil || strings.TrimSpace(string(plainPass)) == "" {
+			logger.Warn(ctx, "admin_tenant_pool_pending_resume_password_failed",
+				zap.String("tenant_id", row.Tenant.ID),
+				zap.String("pool_id", pool.PoolID),
+				zap.Error(err))
+			continue
+		}
+		cluster := clusterInfoFromTenant(&row.Tenant)
+		cluster.Password = string(plainPass)
+		clusters = append(clusters, cluster)
+	}
+	return clusters, nil
 }
 
 func (s *Server) tenantPoolLock(poolID string) *sync.Mutex {
