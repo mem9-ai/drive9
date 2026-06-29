@@ -1851,7 +1851,7 @@ func TestAdminTenantPoolCreateRejectsAboveMaxSize(t *testing.T) {
 		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, body)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "pool_size must be less than or equal to 2") {
+	if !strings.Contains(string(body), "pool_size 3 exceeds maximum 2") {
 		t.Fatalf("body = %s", body)
 	}
 	if got := rt.prov.listCalls.Load(); got != 0 {
@@ -1879,7 +1879,7 @@ func TestAdminTenantPoolUpdateRejectsAboveMaxSize(t *testing.T) {
 		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, body)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "pool_size must be less than or equal to 2") {
+	if !strings.Contains(string(body), "pool_size 3 exceeds maximum 2") {
 		t.Fatalf("body = %s", body)
 	}
 	if got := rt.prov.listCalls.Load(); got != 0 {

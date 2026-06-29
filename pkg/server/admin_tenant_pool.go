@@ -283,7 +283,7 @@ func (s *Server) validateTenantPoolSize(size int) error {
 		maxSize = DefaultTenantPoolMaxSize
 	}
 	if size > maxSize {
-		return fmt.Errorf("pool_size must be less than or equal to %d", maxSize)
+		return fmt.Errorf("pool_size %d exceeds maximum %d", size, maxSize)
 	}
 	return nil
 }
