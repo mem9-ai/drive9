@@ -492,6 +492,9 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 		}
 		results = append(results, res)
 	}
+	// A partial TiDB Cloud response can omit some requested tenant IDs. Those
+	// pending local tenants have no recoverable cluster metadata, so fail them
+	// while preserving tenants that were persisted above.
 	for _, tenantID := range tenantIDs {
 		if _, ok := persistedTenants[tenantID]; ok {
 			continue

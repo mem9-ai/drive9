@@ -890,7 +890,7 @@ func tenantPoolMaxSizeFromEnv() (int, error) {
 	}
 	v, err := strconv.Atoi(raw)
 	if err != nil || v <= 0 {
-		return 0, fmt.Errorf("invalid DRIVE9_TENANT_POOL_MAX_SIZE: must be a positive integer")
+		return 0, fmt.Errorf("invalid DRIVE9_TENANT_POOL_MAX_SIZE=%q: must be a positive integer", raw)
 	}
 	return v, nil
 }
