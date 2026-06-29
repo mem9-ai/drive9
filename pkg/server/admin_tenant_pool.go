@@ -401,7 +401,7 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 			zap.Int("cluster_count", len(clusters)),
 			zap.Error(err))
 	}
-	cleanupOnError := err == nil
+	cleanupOnError := true
 	defer func() {
 		if cleanupOnError {
 			s.cleanupPoolProvisionedClusters(ctx, clusters, cred, tenantIDs, "metadata_error")
@@ -415,9 +415,11 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 			continue
 		}
 		if strings.TrimSpace(cluster.TenantID) == "" {
+			cleanupOnError = true
 			return nil, fmt.Errorf("tidbcloud tenant id label is missing")
 		}
 		if strings.TrimSpace(cluster.OrganizationID) == "" {
+			cleanupOnError = true
 			return nil, fmt.Errorf("tidbcloud organization label is missing")
 		}
 		persistedTenants[strings.TrimSpace(cluster.TenantID)] = struct{}{}
@@ -430,12 +432,15 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 			CreatedAt:      now,
 			UpdatedAt:      now,
 		}); err != nil {
+			cleanupOnError = true
 			return nil, err
 		}
 		if err := s.persistPoolTenantConnection(ctx, cluster, provider); err != nil {
+			cleanupOnError = true
 			return nil, err
 		}
 		if err := s.meta.UpdateTenantStatus(ctx, cluster.TenantID, meta.TenantProvisioning); err != nil {
+			cleanupOnError = true
 			return nil, err
 		}
 		res := &provisionTenantResult{
@@ -466,6 +471,9 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 func (s *Server) persistPoolTenantConnection(ctx context.Context, cluster *tenant.ClusterInfo, provider string) error {
 	if cluster == nil {
 		return fmt.Errorf("cluster info is required")
+	}
+	if strings.TrimSpace(cluster.Password) == "" {
+		return fmt.Errorf("cluster password is required")
 	}
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {

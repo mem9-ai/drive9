@@ -1023,7 +1023,7 @@ func (p *Provisioner) listClusterInfosPageWithCredentials(ctx context.Context, p
 	filter := fmt.Sprintf(`labels.%q = "true"`, Drive9ManagedLabel)
 	clusterIDFilter := compactNonEmptyStrings(clusterIDs)
 	if len(clusterIDFilter) > 0 {
-		filter = fmt.Sprintf(`clusterId = %q AND %s`, strings.Join(clusterIDFilter, ","), filter)
+		filter = fmt.Sprintf(`clusterId = %s AND %s`, strings.Join(clusterIDFilter, ","), filter)
 	}
 	values.Set("filter", filter)
 	endpoint := p.apiURL + "/v1beta1/clusters?" + values.Encode()

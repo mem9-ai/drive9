@@ -55,7 +55,7 @@ type Config struct {
 	S3Dir             string
 	MaxUploadBytes    int64
 	// TenantPoolMaxSize caps admin tenant pool create/update target size.
-	// Values <= 0 leave the pool size uncapped.
+	// Values <= 0 use DefaultTenantPoolMaxSize.
 	TenantPoolMaxSize int
 	// InlineThreshold is the server-wide DB-inline vs S3 cutoff surfaced to
 	// clients via /v1/status. When 0, the value is inferred from
@@ -743,14 +743,47 @@ func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 			continue
 		}
 		if t.Provider == tenant.ProviderTiDBCloudNative && t.DBUser == "" {
-			logger.Warn(ctx, "resume_provisioning_native_no_connection",
-				zap.String("tenant_id", t.ID),
-				zap.String("provider", t.Provider),
-				zap.String("cluster_id", t.ClusterID))
+			s.resumeNativeProvisioningWithoutConnection(ctx, t)
 			continue
 		}
 		s.startTenantSchemaInitResume(ctx, t)
 	}
+}
+
+func (s *Server) resumeNativeProvisioningWithoutConnection(ctx context.Context, t meta.Tenant) {
+	logFields := []zap.Field{
+		zap.String("tenant_id", t.ID),
+		zap.String("provider", t.Provider),
+		zap.String("cluster_id", t.ClusterID),
+	}
+	if strings.TrimSpace(t.ClusterID) == "" {
+		logger.Warn(ctx, "resume_provisioning_native_no_cluster", logFields...)
+		_ = s.meta.UpdateTenantStatus(context.Background(), t.ID, meta.TenantFailed)
+		return
+	}
+	plain, err := s.pool.Decrypt(ctx, t.DBPasswordCipher)
+	if err != nil || strings.TrimSpace(string(plain)) == "" {
+		fields := append(logFields, zap.Error(err))
+		logger.Warn(ctx, "resume_provisioning_native_no_password", fields...)
+		_ = s.meta.UpdateTenantStatus(context.Background(), t.ID, meta.TenantFailed)
+		return
+	}
+	defaultReq := resolveDefaultCredentials(s.provisioner)
+	if defaultReq == nil {
+		logger.Warn(ctx, "resume_provisioning_native_no_credentials", logFields...)
+		_ = s.meta.UpdateTenantStatus(context.Background(), t.ID, meta.TenantFailed)
+		return
+	}
+	cluster := &tenant.ClusterInfo{
+		TenantID:  t.ID,
+		ClusterID: t.ClusterID,
+		Password:  string(plain),
+		DBName:    t.DBName,
+		Provider:  t.Provider,
+	}
+	logger.Info(ctx, "resume_provisioning_native_metadata",
+		append(logFields, zap.String("db_name", t.DBName))...)
+	s.startPoolClusterMetadataResume(ctx, cluster, *defaultReq)
 }
 
 // resumeDeletingForkTenantsWithCtx resumes cleanup for deleting/failed fork tenants.

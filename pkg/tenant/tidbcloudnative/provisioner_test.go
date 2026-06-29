@@ -387,9 +387,9 @@ func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
 }
 
 func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFails(t *testing.T) {
-	origPoll := tidbCloudNativePollInterval
-	tidbCloudNativePollInterval = time.Millisecond
-	t.Cleanup(func() { tidbCloudNativePollInterval = origPoll })
+	origPoll := tidbCloudNativeBatchMetadataPollInterval
+	tidbCloudNativeBatchMetadataPollInterval = time.Millisecond
+	t.Cleanup(func() { tidbCloudNativeBatchMetadataPollInterval = origPoll })
 
 	var listCalls atomic.Int32
 	handlerErrs := make(chan error, 2)
@@ -422,7 +422,7 @@ func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFail
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters":
 			listCalls.Add(1)
-			if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `clusterId = "cluster-2"`) || !strings.Contains(filter, Drive9ManagedLabel) {
+			if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `clusterId = cluster-2`) || !strings.Contains(filter, Drive9ManagedLabel) {
 				handlerErrs <- fmt.Errorf("unexpected list filter %q", filter)
 				http.Error(w, "unexpected filter", http.StatusBadRequest)
 				return
@@ -500,11 +500,20 @@ func TestBatchProvisionFreeClustersWaitsForMetadataByList(t *testing.T) {
 							Drive9PoolIDLabel:          "pool-1",
 						},
 					},
+					{
+						"clusterId": "cluster-2",
+						"state":     "CREATING",
+						"labels": map[string]string{
+							TiDBCloudOrganizationLabel: "org-1",
+							Drive9TenantIDLabel:        "tenant-2",
+							Drive9PoolIDLabel:          "pool-1",
+						},
+					},
 				},
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters":
 			listCalls.Add(1)
-			if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `clusterId = "cluster-1"`) || !strings.Contains(filter, Drive9ManagedLabel) {
+			if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `clusterId = cluster-1,cluster-2`) || !strings.Contains(filter, Drive9ManagedLabel) {
 				handlerErrs <- fmt.Errorf("unexpected list filter %q", filter)
 				http.Error(w, "unexpected filter", http.StatusBadRequest)
 				return
@@ -522,6 +531,17 @@ func TestBatchProvisionFreeClustersWaitsForMetadataByList(t *testing.T) {
 						"userPrefix": "u1",
 						"endpoints":  map[string]any{"public": map[string]any{"host": "db1.example", "port": 4000}},
 					},
+					{
+						"clusterId": "cluster-2",
+						"state":     "ACTIVE",
+						"labels": map[string]string{
+							TiDBCloudOrganizationLabel: "org-1",
+							Drive9TenantIDLabel:        "tenant-2",
+							Drive9PoolIDLabel:          "pool-1",
+						},
+						"userPrefix": "u2",
+						"endpoints":  map[string]any{"public": map[string]any{"host": "db2.example", "port": 4000}},
+					},
 				},
 			})
 		default:
@@ -538,7 +558,7 @@ func TestBatchProvisionFreeClustersWaitsForMetadataByList(t *testing.T) {
 		defaultDatabaseName: DefaultDatabaseName,
 		client:              ts.Client(),
 	}
-	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1"}, tenant.CredentialProvisionRequest{
+	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1", "tenant-2"}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	}, tenant.QuotaUpdateOptions{TenantPoolID: "pool-1"})
@@ -549,7 +569,9 @@ func TestBatchProvisionFreeClustersWaitsForMetadataByList(t *testing.T) {
 	if listCalls.Load() != 1 {
 		t.Fatalf("metadata list calls = %d, want 1", listCalls.Load())
 	}
-	if len(out) != 1 || out[0].Host != "db1.example" || out[0].Username != "u1.root" || out[0].OrganizationID != "org-1" {
+	if len(out) != 2 ||
+		out[0].Host != "db1.example" || out[0].Username != "u1.root" || out[0].OrganizationID != "org-1" ||
+		out[1].Host != "db2.example" || out[1].Username != "u2.root" || out[1].OrganizationID != "org-1" {
 		t.Fatalf("clusters = %#v", out)
 	}
 }
