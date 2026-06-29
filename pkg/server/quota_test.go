@@ -48,6 +48,8 @@ type quotaTestProvisioner struct {
 	lastDeprovision   *tenant.ClusterInfo
 	listErr           error
 	listPages         []*tenant.ManagedClusterListResult
+	batchPoolErr      error
+	batchPoolReady    bool
 	calls             []string
 }
 
@@ -169,15 +171,24 @@ func (p *quotaTestProvisioner) BatchProvisionFreeClustersWithCredentialsAndQuota
 			TenantID:       tenantID,
 			ClusterID:      fmt.Sprintf("pool-cluster-%d", i+1),
 			OrganizationID: "org-1",
-			Host:           "db.example.com",
-			Port:           4000,
-			Username:       "u.root",
 			Password:       "pool-pass",
 			DBName:         "tidbcloud_fs",
 			Provider:       tenant.ProviderTiDBCloudNative,
 		})
+		if p.batchPoolReady {
+			out[len(out)-1].Host = "db.example.com"
+			out[len(out)-1].Port = 4000
+			out[len(out)-1].Username = "u.root"
+		}
 	}
-	return out, nil, nil
+	if !p.batchPoolReady && p.batchPoolErr == nil {
+		for _, cluster := range out {
+			cluster.Host = "db.example.com"
+			cluster.Port = 4000
+			cluster.Username = "u.root"
+		}
+	}
+	return out, nil, p.batchPoolErr
 }
 
 func (p *quotaTestProvisioner) MarkClusterPoolUsed(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, _ time.Time, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
@@ -1368,6 +1379,9 @@ func TestAdminTenantPoolCreateBatchProvisionsFreeTenants(t *testing.T) {
 	if rt.prov.batchPoolCalls.Load() != 1 {
 		t.Fatalf("batch pool calls = %d, want 1", rt.prov.batchPoolCalls.Load())
 	}
+	if rt.prov.lastOptions.TenantPoolID != out.PoolID {
+		t.Fatalf("batch pool id option = %q, want %q", rt.prov.lastOptions.TenantPoolID, out.PoolID)
+	}
 	pool, err := rt.meta.GetTenantPoolByOrganization(context.Background(), "org-1")
 	if err != nil {
 		t.Fatalf("get pool: %v", err)
@@ -1381,6 +1395,63 @@ func TestAdminTenantPoolCreateBatchProvisionsFreeTenants(t *testing.T) {
 	}
 	if free != 2 {
 		t.Fatalf("free = %d, want 2", free)
+	}
+}
+
+func TestAdminTenantPoolCreatePersistsClustersWhenMetadataWaitFails(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{{}}
+	rt.prov.batchPoolErr = errors.New("tidbcloud native cluster get status 429")
+	ts := httptest.NewServer(rt.server)
+	t.Cleanup(ts.Close)
+
+	resp := postJSON(t, ts.URL+"/v1/admin/tenant-pool", map[string]any{
+		"public_key":  "public-1",
+		"private_key": "private-1",
+		"pool_size":   2,
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	var out adminTenantPoolResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 2 {
+		t.Fatalf("pool response = %#v", out)
+	}
+	pool, err := rt.meta.GetTenantPoolByOrganization(context.Background(), "org-1")
+	if err != nil {
+		t.Fatalf("get pool: %v", err)
+	}
+	if pool.PoolID != out.PoolID {
+		t.Fatalf("stored pool id = %q, want %q", pool.PoolID, out.PoolID)
+	}
+	rows, err := rt.meta.ListFreeTenantPoolBindings(context.Background(), "org-1", false, 10)
+	if err != nil {
+		t.Fatalf("list free bindings: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("free bindings = %d, want 2", len(rows))
+	}
+	for _, row := range rows {
+		if row.Tenant.Status != meta.TenantProvisioning {
+			t.Fatalf("tenant %s status = %s, want provisioning", row.Tenant.ID, row.Tenant.Status)
+		}
+		if row.Tenant.DBUser != "" || row.Tenant.DBHost != "" {
+			t.Fatalf("tenant %s connection = host %q user %q, want incomplete", row.Tenant.ID, row.Tenant.DBHost, row.Tenant.DBUser)
+		}
+		if row.Tenant.ClusterID == "" || len(row.Tenant.DBPasswordCipher) == 0 {
+			t.Fatalf("tenant %s cluster/password not persisted: %#v", row.Tenant.ID, row.Tenant)
+		}
+		if row.Binding.PoolStatus != meta.TenantPoolBindingFree {
+			t.Fatalf("tenant %s pool status = %s, want free", row.Tenant.ID, row.Binding.PoolStatus)
+		}
+	}
+	if got := rt.prov.deprovisionCalls.Load(); got != 0 {
+		t.Fatalf("deprovision calls = %d, want 0", got)
 	}
 }
 

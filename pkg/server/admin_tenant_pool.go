@@ -386,29 +386,41 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 	if quotaOpt != nil {
 		opts.TiDBCloudSpendingLimitMonthly = quotaOpt.TiDBCloudSpendingLimit
 	}
+	opts.TenantPoolID = poolID
 	clusters, _, err := manager.BatchProvisionFreeClustersWithCredentialsAndQuota(ctx, tenantIDs, cred, opts)
-	if err != nil {
+	if err != nil && len(clusters) == 0 {
 		s.cleanupPoolProvisionedClusters(ctx, clusters, cred, tenantIDs, "batch_provision_error")
 		for _, tenantID := range tenantIDs {
 			_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 		}
 		return nil, err
 	}
-	cleanupOnError := true
+	if err != nil {
+		logger.Warn(ctx, "admin_tenant_pool_batch_metadata_incomplete",
+			zap.String("pool_id", poolID),
+			zap.Int("cluster_count", len(clusters)),
+			zap.Error(err))
+	}
+	cleanupOnError := err == nil
 	defer func() {
 		if cleanupOnError {
 			s.cleanupPoolProvisionedClusters(ctx, clusters, cred, tenantIDs, "metadata_error")
 		}
 	}()
 	results := make([]*provisionTenantResult, 0, len(clusters))
+	persistedTenants := make(map[string]struct{}, len(clusters))
 	cloudProvider, region := provisioningCloudRegion(s.provisioner)
 	for _, cluster := range clusters {
 		if cluster == nil {
 			continue
 		}
+		if strings.TrimSpace(cluster.TenantID) == "" {
+			return nil, fmt.Errorf("tidbcloud tenant id label is missing")
+		}
 		if strings.TrimSpace(cluster.OrganizationID) == "" {
 			return nil, fmt.Errorf("tidbcloud organization label is missing")
 		}
+		persistedTenants[strings.TrimSpace(cluster.TenantID)] = struct{}{}
 		if err := s.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
 			TenantID:       cluster.TenantID,
 			OrganizationID: cluster.OrganizationID,
@@ -420,37 +432,114 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 		}); err != nil {
 			return nil, err
 		}
-		cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
-		if err != nil {
-			return nil, err
-		}
-		if err := s.meta.UpdateTenantConnection(ctx, cluster.TenantID, &meta.Tenant{
-			DBHost:           cluster.Host,
-			DBPort:           cluster.Port,
-			DBUser:           cluster.Username,
-			DBPasswordCipher: cipherPass,
-			DBName:           cluster.DBName,
-			DBTLS:            true,
-			Provider:         provider,
-			ClusterID:        cluster.ClusterID,
-		}); err != nil {
+		if err := s.persistPoolTenantConnection(ctx, cluster, provider); err != nil {
 			return nil, err
 		}
 		if err := s.meta.UpdateTenantStatus(ctx, cluster.TenantID, meta.TenantProvisioning); err != nil {
 			return nil, err
 		}
-		results = append(results, &provisionTenantResult{
+		res := &provisionTenantResult{
 			TenantID:       cluster.TenantID,
 			Status:         meta.TenantProvisioning,
 			Provider:       provider,
-			TenantDSN:      tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true, provider),
 			CloudProvider:  cloudProvider,
 			Region:         region,
 			OrganizationID: strings.TrimSpace(cluster.OrganizationID),
-		})
+		}
+		if poolClusterConnectionReady(cluster) {
+			res.TenantDSN = tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true, provider)
+		} else {
+			s.startPoolClusterMetadataResume(ctx, cluster, cred)
+		}
+		results = append(results, res)
+	}
+	for _, tenantID := range tenantIDs {
+		if _, ok := persistedTenants[tenantID]; ok {
+			continue
+		}
+		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 	}
 	cleanupOnError = false
 	return results, nil
+}
+
+func (s *Server) persistPoolTenantConnection(ctx context.Context, cluster *tenant.ClusterInfo, provider string) error {
+	if cluster == nil {
+		return fmt.Errorf("cluster info is required")
+	}
+	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
+	if err != nil {
+		return err
+	}
+	return s.meta.UpdateTenantConnection(ctx, cluster.TenantID, &meta.Tenant{
+		DBHost:           cluster.Host,
+		DBPort:           cluster.Port,
+		DBUser:           cluster.Username,
+		DBPasswordCipher: cipherPass,
+		DBName:           cluster.DBName,
+		DBTLS:            true,
+		Provider:         provider,
+		ClusterID:        cluster.ClusterID,
+	})
+}
+
+func poolClusterConnectionReady(cluster *tenant.ClusterInfo) bool {
+	return cluster != nil &&
+		strings.TrimSpace(cluster.TenantID) != "" &&
+		strings.TrimSpace(cluster.ClusterID) != "" &&
+		strings.TrimSpace(cluster.OrganizationID) != "" &&
+		strings.TrimSpace(cluster.Host) != "" &&
+		cluster.Port > 0 &&
+		strings.TrimSpace(cluster.Username) != "" &&
+		strings.TrimSpace(cluster.Password) != "" &&
+		strings.TrimSpace(cluster.DBName) != ""
+}
+
+func (s *Server) startPoolClusterMetadataResume(ctx context.Context, cluster *tenant.ClusterInfo, cred tenant.CredentialProvisionRequest) {
+	waiter, ok := s.provisioner.(tenant.TenantPoolClusterMetadataWaiter)
+	if !ok {
+		logger.Warn(ctx, "admin_tenant_pool_metadata_resume_skipped",
+			zap.String("tenant_id", cluster.TenantID),
+			zap.String("cluster_id", cluster.ClusterID),
+			zap.String("reason", "metadata_waiter_unavailable"))
+		return
+	}
+	clusterCopy := *cluster
+	s.startServerWorker(ctx, func(workerCtx context.Context) {
+		started := time.Now()
+		updated, err := waiter.WaitForPoolClusterMetadata(workerCtx, &clusterCopy, cred)
+		if err != nil {
+			logger.Warn(workerCtx, "admin_tenant_pool_metadata_resume_failed",
+				zap.String("tenant_id", clusterCopy.TenantID),
+				zap.String("cluster_id", clusterCopy.ClusterID),
+				zap.Error(err))
+			return
+		}
+		if !poolClusterConnectionReady(updated) {
+			logger.Warn(workerCtx, "admin_tenant_pool_metadata_resume_incomplete",
+				zap.String("tenant_id", clusterCopy.TenantID),
+				zap.String("cluster_id", clusterCopy.ClusterID))
+			return
+		}
+		if err := s.persistPoolTenantConnection(workerCtx, updated, tenant.ProviderTiDBCloudNative); err != nil {
+			logger.Warn(workerCtx, "admin_tenant_pool_metadata_resume_persist_failed",
+				zap.String("tenant_id", updated.TenantID),
+				zap.String("cluster_id", updated.ClusterID),
+				zap.Error(err))
+			return
+		}
+		cloudProvider, region := provisioningCloudRegion(s.provisioner)
+		logProvisionStage(workerCtx, "admin_tenant_pool_metadata_resume_done", updated.TenantID, tenant.ProviderTiDBCloudNative, started, "cluster_id", updated.ClusterID, "organization_id", updated.OrganizationID)
+		s.startProvisionedTenantSchemaInit(workerCtx, &provisionTenantResult{
+			TenantID:       updated.TenantID,
+			Status:         meta.TenantProvisioning,
+			Provider:       tenant.ProviderTiDBCloudNative,
+			TenantDSN:      tenantDSN(updated.Username, updated.Password, updated.Host, updated.Port, updated.DBName, true, tenant.ProviderTiDBCloudNative),
+			CloudProvider:  cloudProvider,
+			Region:         region,
+			OrganizationID: strings.TrimSpace(updated.OrganizationID),
+		})
+	})
 }
 
 func (s *Server) cleanupPoolProvisionedClusters(ctx context.Context, clusters []*tenant.ClusterInfo, cred tenant.CredentialProvisionRequest, tenantIDs []string, reason string) {

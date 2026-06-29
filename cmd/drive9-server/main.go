@@ -509,7 +509,7 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name (default: tidbcloud_fs)
   DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY optional default TiDB Cloud API public key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY optional default TiDB Cloud API private key for tidb_cloud_native create/delete when caller omits it
-  DRIVE9_TENANT_POOL_MAX_SIZE maximum admin tenant pool size; unset means no server-side cap
+  DRIVE9_TENANT_POOL_MAX_SIZE maximum admin tenant pool size (default: %d)
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
   DRIVE9_SLOCK_API_ORIGIN Slock API origin (required when DRIVE9_SLOCK_ORIGIN is set)
   DRIVE9_SLOCK_CLIENT_ID Slock connected-app client id (required when DRIVE9_SLOCK_ORIGIN is set)
@@ -583,7 +583,7 @@ environment:
 schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
   such as tidb_cloud_starter can stay in sync with drive9's schema source of truth.
-`, server.DefaultMaxUploadBytes, meta.DefaultMaxStorageBytes())
+`, server.DefaultMaxUploadBytes, meta.DefaultMaxStorageBytes(), server.DefaultTenantPoolMaxSize)
 	os.Exit(exitCode)
 }
 
@@ -886,7 +886,7 @@ func envInt64(key string, fallback int64) int64 {
 func tenantPoolMaxSizeFromEnv() (int, error) {
 	raw := strings.TrimSpace(os.Getenv("DRIVE9_TENANT_POOL_MAX_SIZE"))
 	if raw == "" {
-		return 0, nil
+		return server.DefaultTenantPoolMaxSize, nil
 	}
 	v, err := strconv.Atoi(raw)
 	if err != nil || v <= 0 {

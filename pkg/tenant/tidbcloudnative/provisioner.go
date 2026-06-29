@@ -9,6 +9,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -45,6 +46,7 @@ const (
 	Drive9ManagedLabel         = "drive9.ai/managed"
 	Drive9TenantIDLabel        = "drive9.ai/tenant_id"
 	Drive9PoolStatusLabel      = "drive9.ai/status"
+	Drive9PoolIDLabel          = "drive9.ai/pool_id"
 	Drive9PoolUsedAtLabel      = "drive9.ai/used_at"
 	Drive9QuotaUpdateAtLabel   = "drive9.ai/update_quota_at"
 	TiDBCloudOrganizationLabel = "tidb.cloud/organization"
@@ -64,8 +66,10 @@ var databaseNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
 var displayNameCharPattern = regexp.MustCompile(`[^A-Za-z0-9-]`)
 
 var (
-	ensureDatabaseFunc          = ensureDatabase
-	tidbCloudNativePollInterval = 5 * time.Second
+	ensureDatabaseFunc                       = ensureDatabase
+	tidbCloudNativePollInterval              = 5 * time.Second
+	tidbCloudNativeBatchMetadataGroupSize    = 10
+	tidbCloudNativeBatchMetadataPollInterval = 15 * time.Second
 )
 
 type Provisioner struct {
@@ -360,17 +364,21 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 			return nil, nil, err
 		}
 		passwords[tenantID] = password
+		labels := map[string]string{
+			Drive9ManagedLabel:    "true",
+			Drive9TenantIDLabel:   tenantID,
+			Drive9PoolStatusLabel: "free",
+		}
+		if poolID := strings.TrimSpace(opts.TenantPoolID); poolID != "" {
+			labels[Drive9PoolIDLabel] = poolID
+		}
 		cluster := map[string]any{
 			"displayName":  clusterDisplayName(tenantID),
 			"rootPassword": password,
 			"region": map[string]string{
 				"name": p.regionName(),
 			},
-			"labels": map[string]string{
-				Drive9ManagedLabel:    "true",
-				Drive9TenantIDLabel:   tenantID,
-				Drive9PoolStatusLabel: "free",
-			},
+			"labels": labels,
 		}
 		if opts.TiDBCloudSpendingLimitMonthly != nil {
 			spendingLimit = opts.TiDBCloudSpendingLimitMonthly
@@ -411,7 +419,7 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 		return nil, nil, fmt.Errorf("tidbcloud native batch provision returned %d clusters, want %d", len(created.Clusters), len(tenantIDs))
 	}
 	out := make([]*tenant.ClusterInfo, len(created.Clusters))
-	var wg sync.WaitGroup
+	pending := make([]batchClusterMetadataTarget, 0, len(created.Clusters))
 	errs := make([]error, len(created.Clusters))
 	for i := range created.Clusters {
 		i := i
@@ -430,38 +438,136 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 			errs[i] = fmt.Errorf("tidbcloud native batch response missing cluster id for tenant %q", tenantID)
 			continue
 		}
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			clusterInfo := &info
-			if clusterProvisionMetadataIncomplete(clusterInfo, p.usePrivateEndpoint, p.tencentPrivateEndpointHost) {
-				waited, waitErr := p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, info.ClusterID)
-				if waitErr != nil {
-					errs[i] = waitErr
-					return
-				}
-				clusterInfo = waited
-			}
-			out[i] = p.clusterInfoFromResponse(tenantID, dbName, password, clusterInfo)
-		}()
+		if clusterProvisionMetadataIncomplete(&info, p.usePrivateEndpoint, p.tencentPrivateEndpointHost) {
+			pending = append(pending, batchClusterMetadataTarget{index: i, tenantID: tenantID, password: password, initial: info})
+			continue
+		}
+		out[i] = p.clusterInfoFromResponse(tenantID, dbName, password, &info)
 	}
-	wg.Wait()
+	if len(pending) > 0 {
+		p.waitForBatchClusterProvisionMetadata(ctx, publicKey, privateKey, dbName, strings.TrimSpace(opts.TenantPoolID), pending, out, errs)
+	}
 	for _, err := range errs {
 		if err != nil {
-			return fallbackBatchClusterInfos(created.Clusters, dbName), nil, err
+			return fallbackBatchClusterInfos(created.Clusters, dbName, passwords), nil, err
 		}
 	}
 	cloudCfg := &tenant.QuotaCloudConfig{Labels: map[string]string{
 		Drive9ManagedLabel:    "true",
 		Drive9PoolStatusLabel: "free",
 	}}
+	if poolID := strings.TrimSpace(opts.TenantPoolID); poolID != "" {
+		cloudCfg.Labels[Drive9PoolIDLabel] = poolID
+	}
 	if spendingLimit != nil {
 		cloudCfg.TiDBCloudSpendingLimitMonthly = ptrInt64(*spendingLimit)
 	}
 	return out, cloudCfg, nil
 }
 
-func fallbackBatchClusterInfos(clusters []clusterInfo, dbName string) []*tenant.ClusterInfo {
+type batchClusterMetadataTarget struct {
+	index    int
+	tenantID string
+	password string
+	initial  clusterInfo
+}
+
+func (p *Provisioner) waitForBatchClusterProvisionMetadata(ctx context.Context, publicKey, privateKey, dbName, poolID string, pending []batchClusterMetadataTarget, out []*tenant.ClusterInfo, errs []error) {
+	groupSize := tidbCloudNativeBatchMetadataGroupSize
+	if groupSize <= 0 {
+		groupSize = 10
+	}
+	var wg sync.WaitGroup
+	for start := 0; start < len(pending); start += groupSize {
+		end := start + groupSize
+		if end > len(pending) {
+			end = len(pending)
+		}
+		group := pending[start:end]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.waitForBatchClusterProvisionMetadataGroup(ctx, publicKey, privateKey, dbName, poolID, group, out, errs)
+		}()
+	}
+	wg.Wait()
+}
+
+func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Context, publicKey, privateKey, dbName, poolID string, group []batchClusterMetadataTarget, out []*tenant.ClusterInfo, errs []error) {
+	deadline := time.Now().Add(10 * time.Minute)
+	pending := make(map[string]batchClusterMetadataTarget, len(group))
+	clusterIDs := make([]string, 0, len(group))
+	for _, target := range group {
+		clusterID := strings.TrimSpace(target.initial.ClusterID)
+		if clusterID == "" {
+			errs[target.index] = fmt.Errorf("tidbcloud native batch response missing cluster id for tenant %q", target.tenantID)
+			continue
+		}
+		pending[clusterID] = target
+		clusterIDs = append(clusterIDs, clusterID)
+	}
+	for len(pending) > 0 {
+		infos, err := p.listClusterInfosWithCredentials(ctx, publicKey, privateKey, clusterIDs, len(clusterIDs))
+		if err != nil {
+			if !isTiDBCloudStatus(err, http.StatusTooManyRequests) || time.Now().After(deadline) {
+				for _, target := range pending {
+					errs[target.index] = err
+				}
+				return
+			}
+		} else {
+			for i := range infos {
+				info := infos[i]
+				clusterID := strings.TrimSpace(info.ClusterID)
+				target, ok := pending[clusterID]
+				if !ok {
+					continue
+				}
+				if tenantID := strings.TrimSpace(info.Labels[Drive9TenantIDLabel]); tenantID != target.tenantID {
+					errs[target.index] = fmt.Errorf("tidbcloud native batch metadata tenant label mismatch for cluster %q: got %q, want %q", clusterID, tenantID, target.tenantID)
+					delete(pending, clusterID)
+					continue
+				}
+				if poolID != "" && strings.TrimSpace(info.Labels[Drive9PoolIDLabel]) != poolID {
+					errs[target.index] = fmt.Errorf("tidbcloud native batch metadata pool label mismatch for cluster %q", clusterID)
+					delete(pending, clusterID)
+					continue
+				}
+				if clusterProvisionMetadataIncomplete(&info, p.usePrivateEndpoint, p.tencentPrivateEndpointHost) {
+					continue
+				}
+				out[target.index] = p.clusterInfoFromResponse(target.tenantID, dbName, target.password, &info)
+				delete(pending, clusterID)
+			}
+		}
+		if len(pending) == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			for clusterID, target := range pending {
+				errs[target.index] = fmt.Errorf("tidbcloud native cluster %s missing connection metadata or organization label before timeout", clusterID)
+			}
+			return
+		}
+		select {
+		case <-ctx.Done():
+			for _, target := range pending {
+				errs[target.index] = ctx.Err()
+			}
+			return
+		case <-time.After(batchMetadataPollInterval()):
+		}
+	}
+}
+
+func batchMetadataPollInterval() time.Duration {
+	if tidbCloudNativeBatchMetadataPollInterval <= 0 {
+		return tidbCloudNativePollInterval
+	}
+	return tidbCloudNativeBatchMetadataPollInterval
+}
+
+func fallbackBatchClusterInfos(clusters []clusterInfo, dbName string, passwords map[string]string) []*tenant.ClusterInfo {
 	out := make([]*tenant.ClusterInfo, 0, len(clusters))
 	for i := range clusters {
 		info := clusters[i]
@@ -470,11 +576,36 @@ func fallbackBatchClusterInfos(clusters []clusterInfo, dbName string) []*tenant.
 			TenantID:       tenantID,
 			ClusterID:      strings.TrimSpace(info.ClusterID),
 			OrganizationID: strings.TrimSpace(info.Labels[TiDBCloudOrganizationLabel]),
+			Password:       passwords[tenantID],
 			DBName:         dbName,
 			Provider:       tenant.ProviderTiDBCloudNative,
 		})
 	}
 	return out
+}
+
+func (p *Provisioner) WaitForPoolClusterMetadata(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest) (*tenant.ClusterInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, fmt.Errorf("public_key and private_key are required")
+	}
+	if cluster == nil || strings.TrimSpace(cluster.ClusterID) == "" {
+		return nil, fmt.Errorf("cluster id is required")
+	}
+	dbName := strings.TrimSpace(cluster.DBName)
+	if dbName == "" {
+		var err error
+		dbName, err = p.resolveDatabaseName("")
+		if err != nil {
+			return nil, err
+		}
+	}
+	info, err := p.waitForClusterProvisionMetadata(ctx, publicKey, privateKey, strings.TrimSpace(cluster.ClusterID))
+	if err != nil {
+		return nil, err
+	}
+	return p.clusterInfoFromResponse(strings.TrimSpace(cluster.TenantID), dbName, cluster.Password, info), nil
 }
 
 func (p *Provisioner) MarkClusterPoolUsed(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, usedAt time.Time, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
@@ -850,45 +981,73 @@ func (p *Provisioner) ListManagedClusters(ctx context.Context, req tenant.Creden
 	if pageSize <= 0 {
 		pageSize = 100
 	}
+	infos, nextPageToken, err := p.listClusterInfosPageWithCredentials(ctx, publicKey, privateKey, []string{opts.ClusterID}, pageSize, opts.PageToken)
+	if err != nil {
+		return nil, fmt.Errorf("list managed clusters: %w", err)
+	}
+	out := &tenant.ManagedClusterListResult{
+		Clusters:      make([]tenant.CloudClusterInfo, 0, len(infos)),
+		NextPageToken: strings.TrimSpace(nextPageToken),
+	}
+	for _, info := range infos {
+		out.Clusters = append(out.Clusters, cloudClusterInfoFromClusterInfo(info))
+	}
+	return out, nil
+}
+
+func (p *Provisioner) listClusterInfosWithCredentials(ctx context.Context, publicKey, privateKey string, clusterIDs []string, pageSize int) ([]clusterInfo, error) {
+	var out []clusterInfo
+	pageToken := ""
+	for {
+		infos, nextPageToken, err := p.listClusterInfosPageWithCredentials(ctx, publicKey, privateKey, clusterIDs, pageSize, pageToken)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, infos...)
+		if nextPageToken == "" {
+			return out, nil
+		}
+		pageToken = nextPageToken
+	}
+}
+
+func (p *Provisioner) listClusterInfosPageWithCredentials(ctx context.Context, publicKey, privateKey string, clusterIDs []string, pageSize int, pageToken string) ([]clusterInfo, string, error) {
+	if pageSize <= 0 {
+		pageSize = 100
+	}
 	values := url.Values{}
 	values.Set("pageSize", strconv.Itoa(pageSize))
-	if token := strings.TrimSpace(opts.PageToken); token != "" {
+	if token := strings.TrimSpace(pageToken); token != "" {
 		values.Set("pageToken", token)
 	}
 	filter := fmt.Sprintf(`labels.%q = "true"`, Drive9ManagedLabel)
-	if clusterID := strings.TrimSpace(opts.ClusterID); clusterID != "" {
-		filter = fmt.Sprintf(`clusterId = %q AND %s`, clusterID, filter)
+	clusterIDFilter := compactNonEmptyStrings(clusterIDs)
+	if len(clusterIDFilter) > 0 {
+		filter = fmt.Sprintf(`clusterId = %q AND %s`, strings.Join(clusterIDFilter, ","), filter)
 	}
 	values.Set("filter", filter)
 	endpoint := p.apiURL + "/v1beta1/clusters?" + values.Encode()
 	resp, err := p.doDigestAuthRequest(ctx, publicKey, privateKey, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("list managed clusters: %w", err)
+		return nil, "", err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		raw, readErr := readUpstreamBody(resp.Body, upstreamErrorBodyLimit+1)
 		if readErr != nil {
-			return nil, fmt.Errorf("read cluster list error body: %w", readErr)
+			return nil, "", fmt.Errorf("read cluster list error body: %w", readErr)
 		}
-		return nil, quotaStatusError("cluster list", resp.StatusCode, sanitizeUpstreamBody(raw))
+		return nil, "", &tidbCloudStatusError{operation: "cluster list", code: resp.StatusCode, upstreamBody: sanitizeUpstreamBody(raw)}
 	}
 	raw, readErr := readUpstreamBody(resp.Body, upstreamClusterBodyLimit)
 	if readErr != nil {
-		return nil, fmt.Errorf("read cluster list body: %w", readErr)
+		return nil, "", fmt.Errorf("read cluster list body: %w", readErr)
 	}
 	list, err := parseClusterList(raw)
 	if err != nil {
-		return nil, fmt.Errorf("parse cluster list: %w", err)
+		return nil, "", fmt.Errorf("parse cluster list: %w", err)
 	}
-	out := &tenant.ManagedClusterListResult{
-		Clusters:      make([]tenant.CloudClusterInfo, 0, len(list.Clusters)),
-		NextPageToken: strings.TrimSpace(list.NextPageToken),
-	}
-	for _, info := range list.Clusters {
-		out.Clusters = append(out.Clusters, cloudClusterInfoFromClusterInfo(info))
-	}
-	return out, nil
+	return list.Clusters, strings.TrimSpace(list.NextPageToken), nil
 }
 
 func (p *Provisioner) clusterQuotaInfo(ctx context.Context, publicKey, privateKey, clusterID string) (map[string]string, *tenant.QuotaCloudConfig, error) {
@@ -1110,6 +1269,24 @@ func readUpstreamBody(r io.Reader, limit int64) ([]byte, error) {
 	return raw, nil
 }
 
+type tidbCloudStatusError struct {
+	operation    string
+	code         int
+	upstreamBody string
+}
+
+func (e *tidbCloudStatusError) Error() string {
+	if e == nil {
+		return ""
+	}
+	return statusError(e.operation, e.code, e.upstreamBody)
+}
+
+func isTiDBCloudStatus(err error, code int) bool {
+	var statusErr *tidbCloudStatusError
+	return errors.As(err, &statusErr) && statusErr.code == code
+}
+
 func statusError(operation string, code int, upstreamBody string) string {
 	msg := fmt.Sprintf("tidbcloud native %s status %d", operation, code)
 	if upstreamBody != "" {
@@ -1282,6 +1459,23 @@ func cloudClusterInfoFromClusterInfo(info clusterInfo) tenant.CloudClusterInfo {
 	return out
 }
 
+func compactNonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
+	}
+	return out
+}
+
 func (p *Provisioner) clusterInfoFromResponse(tenantID, dbName, password string, info *clusterInfo) *tenant.ClusterInfo {
 	if info == nil {
 		return &tenant.ClusterInfo{
@@ -1399,7 +1593,15 @@ func (p *Provisioner) waitForClusterProvisionMetadata(ctx context.Context, publi
 			return nil, readErr
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("%s", statusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw)))
+			if resp.StatusCode != http.StatusTooManyRequests || time.Now().After(deadline) {
+				return nil, fmt.Errorf("%s", statusError("cluster get", resp.StatusCode, sanitizeUpstreamBody(raw)))
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(tidbCloudNativePollInterval):
+				continue
+			}
 		}
 		info, err := parseClusterInfo(raw)
 		if err != nil {

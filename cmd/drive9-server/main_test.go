@@ -7,6 +7,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/server"
 )
 
 func TestVersionTextUsesDrive9ServerComponent(t *testing.T) {
@@ -91,8 +92,8 @@ func TestTenantPoolMaxSizeFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tenantPoolMaxSizeFromEnv empty: %v", err)
 	}
-	if got != 0 {
-		t.Fatalf("empty max size = %d, want 0", got)
+	if got != server.DefaultTenantPoolMaxSize {
+		t.Fatalf("empty max size = %d, want %d", got, server.DefaultTenantPoolMaxSize)
 	}
 
 	setEnv(t, key, "25")

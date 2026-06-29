@@ -181,6 +181,10 @@ var (
 // Keep callers on this exported constant so the default stays consistent.
 const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 
+// DefaultTenantPoolMaxSize caps admin tenant pools unless overridden by server
+// configuration.
+const DefaultTenantPoolMaxSize = 200
+
 // TenantStatusResponse is the JSON body of GET /v1/status. Fields are filled
 // per authenticated tenant so callers can discover their effective limits
 // before initiating uploads. MaxUploadBytes is currently process-wide but the
@@ -238,6 +242,10 @@ func NewWithConfig(cfg Config) *Server {
 	if inlineThreshold <= 0 {
 		inlineThreshold = backend.DefaultInlineThreshold
 	}
+	tenantPoolMaxSize := cfg.TenantPoolMaxSize
+	if tenantPoolMaxSize <= 0 {
+		tenantPoolMaxSize = DefaultTenantPoolMaxSize
+	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
 		fallback:          cfg.Backend,
@@ -250,7 +258,7 @@ func NewWithConfig(cfg Config) *Server {
 		publicURL:         strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
 		provisioner:       cfg.Provisioner,
 		maxUploadBytes:    maxUpload,
-		tenantPoolMaxSize: cfg.TenantPoolMaxSize,
+		tenantPoolMaxSize: tenantPoolMaxSize,
 		inlineThreshold:   inlineThreshold,
 		metrics:           newServerMetrics(),
 		logger:            logger,
@@ -732,6 +740,13 @@ func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 				continue
 			}
 			s.startForkProvision(ctx, t.ID)
+			continue
+		}
+		if t.Provider == tenant.ProviderTiDBCloudNative && t.DBUser == "" {
+			logger.Warn(ctx, "resume_provisioning_native_no_connection",
+				zap.String("tenant_id", t.ID),
+				zap.String("provider", t.Provider),
+				zap.String("cluster_id", t.ClusterID))
 			continue
 		}
 		s.startTenantSchemaInitResume(ctx, t)
