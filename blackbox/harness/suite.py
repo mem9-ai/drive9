@@ -107,6 +107,12 @@ def discover_modules() -> dict[str, Any]:
                     instance = obj()
                     instance._module_dir = module_dir
                     instance._id = module_id
+                    if module_id in modules:
+                        raise BlackboxError(
+                            f"duplicate module id {module_id!r}: already registered from "
+                            f"{getattr(modules[module_id], '_module_dir', '?')}, "
+                            f"conflict from {module_dir}"
+                        )
                     modules[module_id] = instance
                     found_any = True
             if not found_any:
@@ -153,3 +159,9 @@ class _ImportError:
         self.report_profile = ""
         self.needs_setup = False
         self._exc = exc
+
+    def ensure_dependencies(self, ctx: Any) -> None:
+        raise BlackboxError(f"module {self._id} failed to import: {self._exc}")
+
+    def run(self, ctx: Any) -> dict[str, Any]:
+        raise BlackboxError(f"module {self._id} failed to import: {self._exc}")
