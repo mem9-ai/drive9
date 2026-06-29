@@ -33,19 +33,24 @@ func main() {
 		issueBodyPath = flag.String("issue-body", "", "write the GitHub issue body here")
 		tierOverride  = flag.String("tier", "", "override automation tier (pr|post-merge|nightly|manual)")
 		proofSuite    = flag.String("proof-fail-suite", "", "inject a synthetic failed suite to prove the notification path end to end (manual CI proof)")
+		degraded      = flag.Bool("degraded", false, "the run is degraded (e.g. a required setup step hard-failed before suites ran): if no suite failure is otherwise detected, inject a synthetic pipeline failure so it is still reported and notified. Wire from GitHub failure().")
 	)
 	flag.Parse()
 
-	if err := run(*manifestPath, *outcomesPath, *summariesDir, *outPath, *issueBodyPath, *tierOverride, *proofSuite); err != nil {
+	if err := run(*manifestPath, *outcomesPath, *summariesDir, *outPath, *issueBodyPath, *tierOverride, *proofSuite, *degraded); err != nil {
 		fmt.Fprintln(os.Stderr, "e2e-aggregate:", err)
 		os.Exit(1)
 	}
 }
 
-func run(manifestPath, outcomesPath, summariesDir, outPath, issueBodyPath, tierOverride, proofSuite string) error {
+func run(manifestPath, outcomesPath, summariesDir, outPath, issueBodyPath, tierOverride, proofSuite string, degraded bool) error {
 	tier := e2ereport.TierFromEvent(os.Getenv("GITHUB_EVENT_NAME"))
 	if tierOverride != "" {
-		tier = e2ereport.Tier(tierOverride)
+		parsed, err := parseTierOverride(tierOverride)
+		if err != nil {
+			return err
+		}
+		tier = parsed
 	}
 
 	manifest := loadManifest(manifestPath)
@@ -64,6 +69,24 @@ func run(manifestPath, outcomesPath, summariesDir, outPath, issueBodyPath, tierO
 
 	summaries := e2ereport.SynthesizeSummaries(manifest, tier, outcomes, adopted)
 	report := e2ereport.Aggregate(runContextFromEnv(tier), summaries)
+
+	if degraded && report.OverallSuccess {
+		// A required step hard-failed before suite outcomes were collected, so the
+		// per-suite view looks clean while the job will fail. Fail closed: inject a
+		// pipeline failure so the run still gets a signature, issue, and notification.
+		summaries = append(summaries, e2ereport.SuiteSummary{
+			Suite:          "e2e-pipeline",
+			Status:         e2ereport.StatusFailure,
+			Tier:           tier,
+			ProductArea:    "ci",
+			ProductPromise: "the e2e pipeline runs to completion",
+			FailureClass:   e2ereport.FailureInfrastructure,
+			OwnerHint:      "ci",
+			Detail:         "a required step failed before per-suite results were collected",
+		})
+		report = e2ereport.Aggregate(runContextFromEnv(tier), summaries)
+		fmt.Fprintln(os.Stderr, "e2e-aggregate: degraded run — injected synthetic pipeline failure")
+	}
 
 	if err := appendStepSummary(report.Markdown()); err != nil {
 		return err
@@ -95,6 +118,15 @@ func run(manifestPath, outcomesPath, summariesDir, outPath, issueBodyPath, tierO
 	fmt.Printf("e2e-aggregate: %d suites, %d failed, %d perf-regressed, notify=%v (%s)\n",
 		len(report.Suites), len(report.Failed), len(report.PerfRegressed), decision.Notify, decision.Reason)
 	return nil
+}
+
+func parseTierOverride(value string) (e2ereport.Tier, error) {
+	switch tier := e2ereport.Tier(strings.TrimSpace(value)); tier {
+	case e2ereport.TierPR, e2ereport.TierPostMerge, e2ereport.TierNightly, e2ereport.TierManual:
+		return tier, nil
+	default:
+		return "", fmt.Errorf("invalid --tier %q (want pr|post-merge|nightly|manual)", value)
+	}
 }
 
 func loadManifest(path string) e2ereport.SuiteManifest {

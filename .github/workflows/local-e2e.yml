@@ -497,6 +497,10 @@ jobs:
       - name: Aggregate e2e product-quality report
         id: aggregate
         if: always()
+        env:
+          # True when a prior step hard-failed (e.g. TiDB/server setup) before the
+          # suites produced outcomes; the aggregator then fails closed.
+          AGG_DEGRADED: ${{ failure() }}
         run: |
           cat > /tmp/e2e-outcomes.json <<JSON
           {
@@ -521,13 +525,17 @@ jobs:
           if [ "${FEISHU_PROOF}" = "1" ]; then
             proof_arg="--proof-fail-suite e2e-feishu-proof"
           fi
+          degraded_arg=""
+          if [ "${AGG_DEGRADED}" = "true" ]; then
+            degraded_arg="--degraded"
+          fi
           go run ./cmd/e2e-aggregate \
             --manifest e2e/suite-manifest.json \
             --outcomes /tmp/e2e-outcomes.json \
             --summaries e2e/reports/summary \
             --out /tmp/e2e-report.json \
             --issue-body /tmp/e2e-issue-body.md \
-            $proof_arg
+            $proof_arg $degraded_arg
 
       # Push failures/regressions that warrant attention to Feishu/Lark. PR-tier
       # failures stay in GitHub by policy; the notifier no-ops when no Feishu

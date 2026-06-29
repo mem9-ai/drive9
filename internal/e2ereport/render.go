@@ -11,8 +11,11 @@ import (
 func (r RunReport) Markdown() string {
 	var b strings.Builder
 	overall := "✅ success"
-	if !r.OverallSuccess {
+	switch {
+	case !r.OverallSuccess:
 		overall = "❌ failure"
+	case len(r.PerfRegressed) > 0:
+		overall = "⚠️ performance regression"
 	}
 	fmt.Fprintf(&b, "## drive9 e2e product-quality report\n\n")
 	fmt.Fprintf(&b, "- overall: **%s**\n- trigger: `%s`\n", overall, triggerName(r.Context.Trigger))
@@ -50,7 +53,11 @@ func (r RunReport) Markdown() string {
 // signature so recurring patterns group into one thread.
 func (r RunReport) IssueBody() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "### drive9 e2e %s failure\n\n", triggerName(r.Context.Trigger))
+	kind := "failure"
+	if r.OverallSuccess && len(r.PerfRegressed) > 0 {
+		kind = "performance regression"
+	}
+	fmt.Fprintf(&b, "### drive9 e2e %s %s\n\n", triggerName(r.Context.Trigger), kind)
 	fmt.Fprintf(&b, "- signature: `%s`\n", r.FailureSignature())
 	if r.Context.SHA != "" {
 		fmt.Fprintf(&b, "- commit: `%s`\n", r.Context.SHA)
@@ -58,7 +65,9 @@ func (r RunReport) IssueBody() string {
 	if r.Context.RunURL != "" {
 		fmt.Fprintf(&b, "- run: %s\n", r.Context.RunURL)
 	}
-	b.WriteString("\n**Failed suites:**\n\n")
+	if len(r.Failed) > 0 {
+		b.WriteString("\n**Failed suites:**\n\n")
+	}
 	for _, s := range r.Failed {
 		fmt.Fprintf(&b, "- `%s` — class=%s, promise=%s, owner=%s", s.Suite, dash(string(s.FailureClass)), dash(s.ProductPromise), dash(s.OwnerHint))
 		if s.ArtifactURL != "" {

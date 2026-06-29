@@ -72,31 +72,26 @@ func SynthesizeSummaries(m SuiteManifest, defaultTier Tier, outcomes map[string]
 
 	for _, id := range ids {
 		seen[id] = true
-		if s, ok := byID[id]; ok {
+		meta := m.Suites[id]
+		status := NormalizeStatus(outcomes[id])
+		if adopted, ok := byID[id]; ok {
+			// Adopted summary wins for its dynamic fields, but manifest defaults
+			// fill any it left blank, and the GitHub step outcome is authoritative
+			// for failure: a script that exits non-zero (or leaves a stale success
+			// summary behind) must not be reported as passing.
+			s := fillFromManifest(adopted, meta, defaultTier)
+			if status == StatusFailure {
+				s = markFailed(s, meta, "step outcome reported failure")
+			}
 			out = append(out, s)
 			continue
 		}
-		meta := m.Suites[id]
-		status := NormalizeStatus(outcomes[id])
-		s := SuiteSummary{
-			Suite:          id,
-			Status:         status,
-			Tier:           pickTier(meta.Tier, defaultTier),
-			ProductArea:    meta.ProductArea,
-			ProductPromise: meta.ProductPromise,
-			OwnerHint:      meta.OwnerHint,
-		}
-		if status == StatusFailure {
-			s.FailureClass = pickFailureClass(meta.FailureClass)
-			if meta.Title != "" {
-				s.Detail = meta.Title + " did not succeed"
-			}
-		}
-		out = append(out, s)
+		out = append(out, synthesize(id, status, meta, defaultTier))
 	}
 
 	// Adopted summaries for suites not in the outcomes map (e.g. emitted by a
-	// suite the workflow table does not enumerate) are still included.
+	// suite the workflow table does not enumerate) are still included, with
+	// manifest defaults filled in.
 	extra := make([]string, 0)
 	for id := range byID {
 		if !seen[id] {
@@ -105,9 +100,66 @@ func SynthesizeSummaries(m SuiteManifest, defaultTier Tier, outcomes map[string]
 	}
 	sort.Strings(extra)
 	for _, id := range extra {
-		out = append(out, byID[id])
+		out = append(out, fillFromManifest(byID[id], m.Suites[id], defaultTier))
 	}
 	return out
+}
+
+func synthesize(id string, status Status, meta SuiteMeta, defaultTier Tier) SuiteSummary {
+	s := SuiteSummary{
+		Suite:          id,
+		Status:         status,
+		Tier:           pickTier(meta.Tier, defaultTier),
+		ProductArea:    meta.ProductArea,
+		ProductPromise: meta.ProductPromise,
+		OwnerHint:      meta.OwnerHint,
+	}
+	if status == StatusFailure {
+		s = markFailed(s, meta, "")
+	}
+	return s
+}
+
+// fillFromManifest fills zero-valued metadata fields of an adopted summary from
+// the manifest, so signatures and rendering stay complete even when a producer
+// emits only dynamic fields (status/metrics) and relies on manifest defaults.
+func fillFromManifest(s SuiteSummary, meta SuiteMeta, defaultTier Tier) SuiteSummary {
+	if s.Tier == "" {
+		s.Tier = pickTier(meta.Tier, defaultTier)
+	}
+	if s.ProductArea == "" {
+		s.ProductArea = meta.ProductArea
+	}
+	if s.ProductPromise == "" {
+		s.ProductPromise = meta.ProductPromise
+	}
+	if s.OwnerHint == "" {
+		s.OwnerHint = meta.OwnerHint
+	}
+	if s.Status == StatusFailure && s.FailureClass == FailureNone {
+		s.FailureClass = pickFailureClass(meta.FailureClass)
+	}
+	return s
+}
+
+// markFailed forces a suite to failed, classifying it from the manifest and
+// adding a default detail when the summary did not supply one.
+func markFailed(s SuiteSummary, meta SuiteMeta, reason string) SuiteSummary {
+	s.Status = StatusFailure
+	if s.FailureClass == FailureNone {
+		s.FailureClass = pickFailureClass(meta.FailureClass)
+	}
+	if s.Detail == "" {
+		title := meta.Title
+		if title == "" {
+			title = s.Suite
+		}
+		s.Detail = title + " did not succeed"
+		if reason != "" {
+			s.Detail += " (" + reason + ")"
+		}
+	}
+	return s
 }
 
 func pickTier(specific, fallback Tier) Tier {

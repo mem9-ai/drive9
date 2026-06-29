@@ -108,7 +108,7 @@ func Send(ctx context.Context, c Config, card map[string]any) (sent bool, err er
 }
 
 func (c Config) sendWebhook(ctx context.Context, card map[string]any) error {
-	return postJSON(ctx, c.Webhook, nil, webhookBody(card))
+	return postJSON(ctx, "Feishu webhook", c.Webhook, nil, webhookBody(card))
 }
 
 func (c Config) sendApp(ctx context.Context, card map[string]any) error {
@@ -121,7 +121,7 @@ func (c Config) sendApp(ctx context.Context, card map[string]any) error {
 		return err
 	}
 	url := c.baseURL() + "/open-apis/im/v1/messages?receive_id_type=chat_id"
-	return postJSON(ctx, url, map[string]string{"Authorization": "Bearer " + token}, body)
+	return postJSON(ctx, "Feishu message API", url, map[string]string{"Authorization": "Bearer " + token}, body)
 }
 
 func (c Config) tenantToken(ctx context.Context) (string, error) {
@@ -152,14 +152,17 @@ func (c Config) tenantToken(ctx context.Context) (string, error) {
 	return out.Token, nil
 }
 
-func postJSON(ctx context.Context, url string, headers map[string]string, body any) error {
+// postJSON posts body to url and validates the Feishu response. Errors carry the
+// endpoint label, never the URL: the custom-bot webhook URL embeds the bot token,
+// so logging it on a transient failure would leak the secret into CI logs.
+func postJSON(ctx context.Context, endpoint, url string, headers map[string]string, body any) error {
 	raw, err := json.Marshal(body)
 	if err != nil {
-		return fmt.Errorf("marshal request: %w", err)
+		return fmt.Errorf("marshal %s request: %w", endpoint, err)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
-		return err
+		return fmt.Errorf("build %s request: %w", endpoint, err)
 	}
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	for k, v := range headers {
@@ -167,22 +170,41 @@ func postJSON(ctx context.Context, url string, headers map[string]string, body a
 	}
 	resp, err := httpClient().Do(req)
 	if err != nil {
-		return fmt.Errorf("post %s: %w", url, err)
+		return fmt.Errorf("post %s: %w", endpoint, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("post %s: status %d: %s", url, resp.StatusCode, strings.TrimSpace(string(data)))
+		return fmt.Errorf("post %s: status %d: %s", endpoint, resp.StatusCode, snippet(data))
 	}
-	// Feishu returns 200 with a non-zero `code` on logical errors.
+	// Feishu reports logical failures in the body while returning HTTP 200. The
+	// app API uses {code,msg}; the custom-bot webhook uses {StatusCode,
+	// StatusMessage}. A 2xx body that is not valid JSON (proxy, wrong host, HTML
+	// error page) must fail closed rather than look delivered.
 	var out struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
+		Code          int    `json:"code"`
+		Msg           string `json:"msg"`
+		StatusCode    int    `json:"StatusCode"`
+		StatusMessage string `json:"StatusMessage"`
 	}
-	if err := json.Unmarshal(data, &out); err == nil && out.Code != 0 {
-		return fmt.Errorf("post %s: feishu code=%d msg=%s", url, out.Code, out.Msg)
+	if err := json.Unmarshal(data, &out); err != nil {
+		return fmt.Errorf("post %s: unexpected non-JSON 2xx response: %s", endpoint, snippet(data))
+	}
+	if out.Code != 0 {
+		return fmt.Errorf("post %s: feishu code=%d msg=%s", endpoint, out.Code, out.Msg)
+	}
+	if out.StatusCode != 0 {
+		return fmt.Errorf("post %s: feishu StatusCode=%d msg=%s", endpoint, out.StatusCode, out.StatusMessage)
 	}
 	return nil
+}
+
+func snippet(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) > 200 {
+		return s[:200] + "…"
+	}
+	return s
 }
 
 func httpClient() *http.Client { return &http.Client{Timeout: httpTimeout} }

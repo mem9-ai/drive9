@@ -131,4 +131,34 @@ func TestPostJSONSurfacesFeishuLogicalError(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "9499") {
 		t.Fatalf("expected logical error surfaced, got %v", err)
 	}
+	// The webhook URL is a secret and must never appear in errors/logs.
+	if strings.Contains(err.Error(), srv.URL) {
+		t.Fatalf("error leaked the webhook URL (secret): %v", err)
+	}
+}
+
+func TestWebhookStatusCodeLogicalError(t *testing.T) {
+	// Custom-bot webhooks report failures in StatusCode while returning HTTP 200.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"StatusCode":19001,"StatusMessage":"param invalid"}`))
+	}))
+	defer srv.Close()
+
+	_, err := Send(context.Background(), Config{Webhook: srv.URL}, map[string]any{})
+	if err == nil || !strings.Contains(err.Error(), "19001") {
+		t.Fatalf("expected StatusCode logical error, got %v", err)
+	}
+}
+
+func TestNonJSON2xxFailsClosed(t *testing.T) {
+	// A 200 that is not JSON (proxy/HTML/wrong host) must not look delivered.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`<html>gateway</html>`))
+	}))
+	defer srv.Close()
+
+	_, err := Send(context.Background(), Config{Webhook: srv.URL}, map[string]any{})
+	if err == nil || !strings.Contains(err.Error(), "non-JSON") {
+		t.Fatalf("expected non-JSON 2xx to fail closed, got %v", err)
+	}
 }

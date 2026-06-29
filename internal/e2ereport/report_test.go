@@ -23,6 +23,34 @@ func TestParseSuiteSummary(t *testing.T) {
 	if _, err := ParseSuiteSummary([]byte(`not json`)); err == nil {
 		t.Fatal("expected error for bad json")
 	}
+	// Enum fields must fail closed.
+	if _, err := ParseSuiteSummary([]byte(`{"suite":"x"}`)); err == nil {
+		t.Fatal("expected error for missing status")
+	}
+	if _, err := ParseSuiteSummary([]byte(`{"suite":"x","status":"passed"}`)); err == nil {
+		t.Fatal("expected error for invalid status")
+	}
+	if _, err := ParseSuiteSummary([]byte(`{"suite":"x","status":"failure","failure_class":"bogus"}`)); err == nil {
+		t.Fatal("expected error for invalid failure_class")
+	}
+	if _, err := ParseSuiteSummary([]byte(`{"suite":"x","status":"failure","tier":"weekly"}`)); err == nil {
+		t.Fatal("expected error for invalid tier")
+	}
+}
+
+func TestPerfOnlySignature(t *testing.T) {
+	// A regression-only run (everything passed, one budget breach) still gets a
+	// stable, non-empty signature so it can group/notify.
+	r := Aggregate(RunContext{Trigger: TierNightly}, []SuiteSummary{
+		{Suite: "fuse-write-perf-budget", Status: StatusSuccess,
+			Metrics: []Metric{{Name: "p99_write_ms", Value: 40, Budget: f64(30)}}},
+	})
+	if !r.OverallSuccess {
+		t.Fatal("perf-only run should still be OverallSuccess")
+	}
+	if r.FailureSignature() == "" {
+		t.Fatal("perf-only run should have a non-empty signature")
+	}
 }
 
 func sampleSuites() []SuiteSummary {
@@ -124,5 +152,24 @@ func TestRenderContainsKeyFacts(t *testing.T) {
 	}
 	if !strings.Contains(cs, "git-feature-matrix") {
 		t.Errorf("card missing failed suite: %s", cs)
+	}
+}
+
+func TestPerfOnlyRenderIsConsistent(t *testing.T) {
+	r := Aggregate(RunContext{Trigger: TierNightly, RunURL: "https://x/run/3"}, []SuiteSummary{
+		{Suite: "fuse-write-perf-budget", Status: StatusSuccess, ProductPromise: "performance",
+			Metrics: []Metric{{Name: "p99_write_ms", Value: 40, Unit: "ms", Budget: f64(30)}}},
+	})
+	md := strings.ToLower(r.Markdown())
+	if !strings.Contains(md, "performance regression") || strings.Contains(md, "❌ failure") {
+		t.Errorf("perf-only markdown should read as performance regression, not failure:\n%s", r.Markdown())
+	}
+	issue := r.IssueBody()
+	if !strings.Contains(issue, "performance regression") {
+		t.Errorf("perf-only issue body should say performance regression:\n%s", issue)
+	}
+	// No empty "Failed suites" section when nothing failed.
+	if strings.Contains(issue, "Failed suites") {
+		t.Errorf("perf-only issue body should not have a Failed suites section:\n%s", issue)
 	}
 }

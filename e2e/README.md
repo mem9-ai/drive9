@@ -79,7 +79,7 @@ A suite can opt into richer reporting (durations, metrics with budgets/baselines
 for soft performance regressions, artifact links) by writing a
 `SuiteSummary` JSON to `e2e/reports/summary/<suite>.json`; the aggregator uses it
 in place of the synthesized-from-outcome summary. When adding a suite to
-`.github/workflows/local-e2e.yml`, also add its entry to `suite-manifest.json`.
+`.github/workflows/local-e2e.yml`, also add its entry to `e2e/suite-manifest.json`.
 
 ## Run
 

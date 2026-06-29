@@ -76,7 +76,36 @@ type SuiteSummary struct {
 	Detail         string       `json:"detail,omitempty"`
 }
 
-// ParseSuiteSummary parses one suite-summary JSON document.
+func (s Status) valid() bool {
+	switch s {
+	case StatusSuccess, StatusFailure, StatusSkipped:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c FailureClass) valid() bool {
+	switch c {
+	case FailureNone, FailureCorrectness, FailureInfrastructure, FailureDependency, FailureFlaky, FailurePerformance, FailureUnknown:
+		return true
+	default:
+		return false
+	}
+}
+
+func (t Tier) valid() bool {
+	switch t {
+	case "", TierPR, TierPostMerge, TierNightly, TierManual:
+		return true
+	default:
+		return false
+	}
+}
+
+// ParseSuiteSummary parses and validates one suite-summary JSON document. Enum
+// fields are validated so a producer that omits or misspells status (or another
+// enum) fails closed instead of flowing through as a zero-value "not failure".
 func ParseSuiteSummary(data []byte) (SuiteSummary, error) {
 	var s SuiteSummary
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -84,6 +113,15 @@ func ParseSuiteSummary(data []byte) (SuiteSummary, error) {
 	}
 	if strings.TrimSpace(s.Suite) == "" {
 		return SuiteSummary{}, fmt.Errorf("suite summary missing required field: suite")
+	}
+	if !s.Status.valid() {
+		return SuiteSummary{}, fmt.Errorf("suite %q has invalid status %q (want success|failure|skipped)", s.Suite, s.Status)
+	}
+	if !s.FailureClass.valid() {
+		return SuiteSummary{}, fmt.Errorf("suite %q has invalid failure_class %q", s.Suite, s.FailureClass)
+	}
+	if !s.Tier.valid() {
+		return SuiteSummary{}, fmt.Errorf("suite %q has invalid tier %q", s.Suite, s.Tier)
 	}
 	return s, nil
 }
@@ -137,20 +175,28 @@ func Aggregate(ctx RunContext, summaries []SuiteSummary) RunReport {
 	return r
 }
 
-// FailureSignature is a stable short id for the set of failed suites and their
-// failure classes, so a recurring failure pattern groups into one issue thread
-// instead of spawning new ones. Empty when nothing failed.
+// FailureSignature is a stable short id for what went wrong — the set of failed
+// suites (with failure class) plus any performance-only regressions — so a
+// recurring pattern groups into one issue thread instead of spawning new ones.
+// Empty only when nothing failed and nothing regressed.
 func (r RunReport) FailureSignature() string {
-	if len(r.Failed) == 0 {
-		return ""
-	}
-	parts := make([]string, 0, len(r.Failed))
+	parts := make([]string, 0, len(r.Failed)+len(r.PerfRegressed))
 	for _, s := range r.Failed {
 		fc := s.FailureClass
 		if fc == FailureNone {
 			fc = FailureUnknown
 		}
 		parts = append(parts, s.Suite+":"+string(fc))
+	}
+	for _, s := range r.PerfRegressed {
+		// Failed suites are already represented above; add perf-only regressions
+		// so a regression-only run still gets a stable, groupable signature.
+		if s.Status != StatusFailure {
+			parts = append(parts, s.Suite+":"+string(FailurePerformance))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
 	}
 	sort.Strings(parts)
 	sum := sha256.Sum256([]byte(strings.Join(parts, "|")))

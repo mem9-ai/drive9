@@ -70,10 +70,31 @@ func TestSynthesizeSummaries(t *testing.T) {
 	if len(perf.Metrics) != 1 || perf.Status != StatusSuccess {
 		t.Fatalf("adopted summary not used: %+v", perf)
 	}
+	// ...but manifest defaults fill the fields the adopted summary left blank.
+	if perf.OwnerHint != "fs-team" || perf.ProductArea != "fuse" || perf.Tier != TierPostMerge {
+		t.Fatalf("manifest defaults not merged into adopted summary: %+v", perf)
+	}
 
 	// End-to-end: aggregate flags the synthesized failure and the adopted perf regression.
 	r := Aggregate(RunContext{Trigger: TierPostMerge}, got)
 	if r.OverallSuccess || len(r.Failed) != 1 || len(r.PerfRegressed) != 1 {
 		t.Fatalf("aggregate wrong: failed=%d perf=%d ok=%v", len(r.Failed), len(r.PerfRegressed), r.OverallSuccess)
+	}
+}
+
+func TestSynthesizeFailureOutcomeOverridesAdoptedSuccess(t *testing.T) {
+	m, _ := LoadManifest([]byte(sampleManifest))
+	// Suite self-reported success, but the GitHub step exited non-zero.
+	adopted := []SuiteSummary{{Suite: "git-feature-matrix", Status: StatusSuccess}}
+	got := SynthesizeSummaries(m, TierNightly, map[string]string{"git-feature-matrix": "failure"}, adopted)
+	if len(got) != 1 {
+		t.Fatalf("want 1, got %d", len(got))
+	}
+	s := got[0]
+	if s.Status != StatusFailure {
+		t.Fatalf("failing step outcome must override adopted success: %+v", s)
+	}
+	if s.FailureClass != FailureCorrectness { // from manifest default
+		t.Fatalf("failure class not classified from manifest: %+v", s)
 	}
 }
