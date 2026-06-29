@@ -213,8 +213,12 @@ func perfFieldsDiv(suite string, m Metric) map[string]any {
 }
 
 // arrowPct renders a coloured arrow + bold percentage difference of value vs ref:
-// an increase is ▲ red (worse for budgeted latency metrics), a decrease is ▼
-// green. Empty when ref is zero.
+// an increase is ▲ red, a decrease is ▼ green. Empty when ref is zero.
+//
+// This assumes lower-is-better, which holds for the latency budgets in the suite
+// manifest today (e.g. p99_write_ms). If a higher-is-better metric (e.g.
+// throughput) ever gets a budget, add a HigherIsBetter flag to Metric and invert
+// the colours here, or the arrow will read inverted for it.
 func arrowPct(value, ref float64) string {
 	if ref == 0 {
 		return ""

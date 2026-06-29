@@ -112,6 +112,8 @@ func (c Config) sendWebhook(ctx context.Context, card map[string]any) error {
 }
 
 func (c Config) sendApp(ctx context.Context, card map[string]any) error {
+	// Fetches a fresh tenant token per send. Fine for the one-send-per-CI-run use
+	// case; TODO: cache the token (2h TTL) if this is ever used for multi-send.
 	token, err := c.tenantToken(ctx)
 	if err != nil {
 		return err

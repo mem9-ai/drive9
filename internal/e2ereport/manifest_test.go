@@ -29,8 +29,8 @@ func TestLoadManifest(t *testing.T) {
 func TestNormalizeStatus(t *testing.T) {
 	cases := map[string]Status{
 		"success": StatusSuccess, "Success": StatusSuccess,
-		"failure": StatusFailure, "cancelled": StatusFailure, "weird": StatusFailure,
-		"": StatusSkipped, "skipped": StatusSkipped,
+		"failure": StatusFailure, "weird": StatusFailure,
+		"": StatusSkipped, "skipped": StatusSkipped, "cancelled": StatusSkipped,
 	}
 	for in, want := range cases {
 		if got := NormalizeStatus(in); got != want {

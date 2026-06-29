@@ -44,7 +44,10 @@ func NormalizeStatus(outcome string) Status {
 	switch strings.ToLower(strings.TrimSpace(outcome)) {
 	case "success":
 		return StatusSuccess
-	case "", "skipped":
+	case "", "skipped", "cancelled":
+		// A cancelled step (job/concurrency cancellation) is an operational
+		// non-event, not a product failure — treat it like skipped so it does not
+		// raise a false Feishu alarm. Truly unknown outcomes still fail closed.
 		return StatusSkipped
 	default:
 		return StatusFailure

@@ -655,6 +655,8 @@ jobs:
           # fuzzy, so narrow with it but confirm an exact "[sig: <signature>]"
           # marker client-side with jq; a new signature opens its own tracking
           # issue. With no signature we keep the legacy single-issue behaviour.
+          # The search+create is not atomic, but the workflow concurrency group
+          # serializes main runs, so a duplicate-issue race is not expected here.
           if [ -n "$SIGNATURE" ]; then
             existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
               --search "in:title $SIGNATURE" --json number,title \
