@@ -3908,6 +3908,13 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		}
 		credentialReq = decoded.Credential
 		quotaReq = decoded.Quota
+		if quotaReq != nil {
+			if err := s.validateQuotaSetRequest(*quotaReq); err != nil {
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 	} else {
 		if err := rejectCredentialProvisionBody(r); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider, "error", err)...)
@@ -3915,6 +3922,31 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
+	}
+	if provider == tenant.ProviderTiDBCloudNative && credentialReq != nil {
+		poolClaimStarted := time.Now()
+		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_started", "provider", provider, "quota_requested", quotaReq != nil)...)
+		if res, pool, claimed, err := s.claimAdminTenantFromPool(r.Context(), *credentialReq, quotaReq); err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_failed", "provider", provider, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", provisionTenantPoolClaimMetricResult(err))
+			errJSON(w, http.StatusBadGateway, "claim tenant pool tenant failed")
+			return
+		} else if claimed {
+			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
+			setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+			if res.Status == meta.TenantProvisioning {
+				s.startProvisionedTenantSchemaInit(r.Context(), res)
+			}
+			s.replenishTenantPoolAsync(r.Context(), pool, *credentialReq)
+			if quotaReq != nil && quotaReq.TiDBCloudSpendingLimit != nil {
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
+			}
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "accepted")
+			writeProvisionTenantAccepted(w, res)
+			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_create_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted))...)
+			return
+		}
+		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_missed", "provider", provider, "duration_ms", durationMillis(poolClaimStarted))...)
 	}
 	res, err := s.provisionTenant(r.Context(), provisionTenantOptions{
 		KeyName:               "default",
@@ -3933,7 +3965,17 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
+	writeProvisionTenantAccepted(w, res)
+}
 
+func provisionTenantPoolClaimMetricResult(err error) string {
+	if errors.Is(err, tenant.ErrQuotaPermissionDenied) || errors.Is(err, tenant.ErrQuotaBackendNotFound) {
+		return "cluster_error"
+	}
+	return "error"
+}
+
+func writeProvisionTenantAccepted(w http.ResponseWriter, res *provisionTenantResult) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	response := map[string]string{
@@ -4649,6 +4691,10 @@ func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) {
 	ctx = ensureTrace(ctx)
+	ctx = logger.WithContext(ctx, logger.FromContext(ctx).With(
+		zap.String("tenant_id", tenantID),
+		zap.String("provider", provider),
+	))
 	logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_started", "tenant_id", tenantID, "provider", provider)...)
 	deadline := time.Now().Add(schemaInitRetryWindow)
 	backoff := schemaInitInitialBackoff

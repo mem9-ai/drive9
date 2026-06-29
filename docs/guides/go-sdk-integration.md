@@ -136,6 +136,91 @@ _ = quota
 Quota query and update require TiDB Cloud API keys and a Drive9 tenant id. A
 Drive9 tenant API key cannot authorize quota operations for its own tenant.
 
+## Admin Tenant Pool API
+
+The SDK exposes tenant pool helpers for `tidb_cloud_native` organizations:
+
+- `AdminCreateTenantPool`
+- `AdminGetTenantPool`
+- `AdminUpdateTenantPool`
+- `AdminDeleteTenantPool`
+
+Tenant pool operations are authorized with TiDB Cloud API keys. Use
+`drive9.New(serverURL, "")`; a Drive9 tenant API key is not used for these
+admin pool calls.
+
+Create a pool with a target free size:
+
+```go
+poolSize := 20
+
+pool, err := drive9.New(serverURL, "").AdminCreateTenantPool(ctx, drive9.AdminTenantPoolRequest{
+	PublicKey:  tidbCloudPublicKey,
+	PrivateKey: tidbCloudPrivateKey,
+	PoolSize:   &poolSize,
+})
+if err != nil {
+	return err
+}
+_ = pool.PoolID
+_ = pool.OrganizationID
+_ = pool.PoolSize
+_ = pool.FreeSize
+_ = pool.Status
+```
+
+Get the current pool state:
+
+```go
+pool, err := drive9.New(serverURL, "").AdminGetTenantPool(ctx, drive9.AdminTenantPoolRequest{
+	PublicKey:  tidbCloudPublicKey,
+	PrivateKey: tidbCloudPrivateKey,
+})
+if err != nil {
+	return err
+}
+_ = pool.FreeSize
+```
+
+`AdminGetTenantPool` is read-only. It returns pool metadata and free capacity;
+it does not claim a tenant, mark a TiDB Cloud cluster as used, or replenish the
+pool.
+
+Update the target pool size:
+
+```go
+poolSize = 30
+
+pool, err = drive9.New(serverURL, "").AdminUpdateTenantPool(ctx, drive9.AdminTenantPoolRequest{
+	PublicKey:  tidbCloudPublicKey,
+	PrivateKey: tidbCloudPrivateKey,
+	PoolSize:   &poolSize,
+})
+if err != nil {
+	return err
+}
+_ = pool
+```
+
+Delete the pool and its remaining free tenants:
+
+```go
+pool, err = drive9.New(serverURL, "").AdminDeleteTenantPool(ctx, drive9.AdminTenantPoolRequest{
+	PublicKey:  tidbCloudPublicKey,
+	PrivateKey: tidbCloudPrivateKey,
+})
+if err != nil {
+	return err
+}
+_ = pool.Status
+```
+
+After a pool exists, tenant creation automatically tries to claim an active free
+tenant from the pool before falling back to normal TiDB Cloud cluster creation.
+This applies to `AdminCreateTenant` and to the public `/v1/provision` path used
+by `drive9 create`. Pool tenants are claimed only by create/provision flows,
+not by pool get/update/delete calls.
+
 ## Run the included smoke test
 
 This repository includes a minimal external-style example under
