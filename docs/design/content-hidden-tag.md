@@ -49,10 +49,17 @@ but qiffang ruled it out (msg `6e3c1255`): "感觉方案 B 太麻烦了, 因为
    (`imageExtractTagPrefix = "drive9.image."`), keeping policy-tag
    convention consistent. Other tags are user-controlled metadata as
    today.
-3. **Fail-safe semantics**: if anything goes wrong (cache stale, tag
-   write partial), the worst observable state is `size=0 / read empty`
-   for a short window. The real bytes on storage are never modified
-   by the tag toggle.
+3. **Officially wired paths fail closed; this is not a security
+   boundary**. The wired read/stat/search surfaces honor the tag
+   and return empty when set. If a future endpoint is added without
+   wiring the check (or a code path was missed), the failure mode is
+   a real-byte leak — there is no global interceptor. strategy-2 PR
+   review msg `2f0fd334` flagged that the earlier draft overclaimed
+   here. Mitigation: §6bis enumerates surfaces; §11 R6 calls out the
+   "forgot a surface" risk; long term, a real ACL layer (Workspace
+   Zones / scoped tokens) is the right primitive for hard isolation.
+   Real bytes on storage are never modified by tag toggle, so removal
+   restores the file exactly.
 4. **POSIX-coherent**: `stat.size` and the actual `read()` byte count
    stay consistent (both 0 when tag is set; both real when tag is
    absent). No "size=N but read returns 0" mismatch — that's the only
@@ -71,10 +78,14 @@ but qiffang ruled it out (msg `6e3c1255`): "感觉方案 B 太麻烦了, 因为
 |---|---|---|---|
 | `drive9.content_hidden` | `"true"` (or `"1"`) | user-written at upload (or via `tags` PUT) | When present and truthy, the file's read path returns EOF and stat reports `size=0`. Absent / falsy → real behavior. |
 
-The value comparison is **truthy-only**: `"true"`, `"1"`, `"yes"`,
-`"on"` (case-insensitive) all enable content hiding. Any other value
-(including empty string) is treated as absent. This matches how
-existing env-gated features check booleans in drive9.
+The value comparison is **strict**: only the literal string `"true"`
+enables content hiding. Any other value (empty, `"1"`, `"yes"`,
+case-different `"TRUE"`, anything else) is treated as absent.
+
+Strategy-2 PR review msg `2f0fd334` flagged that a broader truthy
+list expands the policy surface unnecessarily — for a reserved
+policy tag, strict matching makes user intent, test cases, and
+client implementations unambiguous.
 
 Constants land in a new helper:
 
@@ -82,18 +93,13 @@ Constants land in a new helper:
 // pkg/server/content_hidden.go
 package server
 
-const ContentHiddenTagKey = "drive9.content_hidden"
+const (
+    ContentHiddenTagKey   = "drive9.content_hidden"
+    ContentHiddenTagValue = "true"
+)
 
 func IsContentHidden(tags map[string]string) bool {
-    v, ok := tags[ContentHiddenTagKey]
-    if !ok {
-        return false
-    }
-    switch strings.ToLower(strings.TrimSpace(v)) {
-    case "true", "1", "yes", "on":
-        return true
-    }
-    return false
+    return tags[ContentHiddenTagKey] == ContentHiddenTagValue
 }
 ```
 
@@ -160,14 +166,28 @@ hidden-specific branches.
 
 The stat handler already calls `GetFileTags`. The read handler
 currently does not — adding the lookup is one DB query per read
-request. For high-throughput read paths, we cache the
-`content_hidden` bit on the inode in memory and invalidate on tag
-write (see §6). The DB lookup is the slow path; the fast path is a
-single boolean check on the cached struct.
+request.
 
-Concretely, the cache lives on the in-flight request context:
-`hiddenCacheKey{tenant, file_id} → struct{ hidden bool, revision int64 }`,
-with a short TTL (matching FUSE attr TTL).
+**P0 stance: no server-side hidden-bit cache.** strategy-2 PR
+review msg `2f0fd334` flagged that a TTL cache on a policy gate has
+exactly the wrong failure modes:
+
+- Stale `false` after the tag is set → returns real content (leak).
+- Stale `true` after the tag is removed → keeps returning empty
+  content (data unavailable).
+
+The revision-bump + SSE-invalidation chain (§5–§6) already exists
+to keep FUSE / HTTP cache consistent; adding a second TTL cache on
+the server side multiplies the consistency problem without buying
+much. P0 does direct lookup in `ReadPlanCtx` /
+`ReadInlinePlanCtx`, and `ReadDirCtx` uses a single batch
+`GetFileTagsByFileIDs(fileIDs...)` (one query per dir-listing) to
+avoid N+1.
+
+If profiling later shows hot-path stat/read overhead from the tag
+lookup, a P1 PR can add a cache *behind* a correctness-test gate.
+Without correctness tests proving the cache is invalidated on every
+flip, the cache stays out of tree.
 
 ## 5. Tag Write Path Changes
 
@@ -442,6 +462,11 @@ implementation has a single answer to point at.
 7. **Raw SQL tag bypass**: documented as unsupported in P0; possible
    `ExecSQL` parser intercept in a follow-up. Source: strategy-2
    `6e779f6d`.
+8. **Tag value matching**: strict literal `"true"` only — no
+   `1`/`yes`/`on`/`TRUE` aliases. Source: strategy-2 `2f0fd334`.
+9. **No P0 hidden-bit server cache**: direct lookup in read paths,
+   batch lookup in `ReadDirCtx`; cache is P1 only after correctness
+   tests prove flip invalidation. Source: strategy-2 `2f0fd334`.
 
 ## 11. Risks
 
