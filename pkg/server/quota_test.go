@@ -1802,6 +1802,107 @@ func TestAdminTenantCreateClaimsFreePoolTenant(t *testing.T) {
 	}
 }
 
+func TestProvisionClaimsFreePoolTenant(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
+		Clusters: []tenant.CloudClusterInfo{{
+			ClusterID:      "cluster-free-1",
+			OrganizationID: "org-1",
+		}},
+	}}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
+		PoolID:         "pool-1",
+		OrganizationID: "org-1",
+		Size:           0,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("upsert pool: %v", err)
+	}
+	passCipher, err := rt.server.pool.Encrypt(ctx, []byte("pool-pass"))
+	if err != nil {
+		t.Fatalf("encrypt password: %v", err)
+	}
+	tenantID := "pool-tenant-provision-1"
+	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantActive,
+		DBHost:           "db.example.com",
+		DBPort:           4000,
+		DBUser:           "u.root",
+		DBPasswordCipher: passCipher,
+		DBName:           "tidbcloud_fs",
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        "cluster-free-1",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatalf("insert tenant: %v", err)
+	}
+	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+		TenantID:       tenantID,
+		OrganizationID: "org-1",
+		ClusterID:      "cluster-free-1",
+		PoolID:         "pool-1",
+		PoolStatus:     meta.TenantPoolBindingFree,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("upsert binding: %v", err)
+	}
+
+	ts := httptest.NewServer(rt.server)
+	t.Cleanup(ts.Close)
+	resp := postJSON(t, ts.URL+"/v1/provision", map[string]any{
+		"public_key":               "public-1",
+		"private_key":              "private-1",
+		"tidbcloud_spending_limit": 123,
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	var out map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out["tenant_id"] != tenantID || out["api_key"] == "" || out["status"] != string(meta.TenantActive) {
+		t.Fatalf("provision response = %#v", out)
+	}
+	if got := rt.prov.markPoolUsedCalls.Load(); got != 1 {
+		t.Fatalf("mark pool used calls = %d, want 1", got)
+	}
+	if rt.prov.batchPoolCalls.Load() != 0 {
+		t.Fatalf("batch pool calls = %d, want 0", rt.prov.batchPoolCalls.Load())
+	}
+	if rt.prov.lastCluster == nil || rt.prov.lastCluster.ClusterID != "cluster-free-1" {
+		t.Fatalf("last cluster = %#v", rt.prov.lastCluster)
+	}
+	if rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly == nil || *rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly != 123 {
+		t.Fatalf("last spending limit = %#v", rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly)
+	}
+	binding, err := rt.meta.GetTenantTiDBCloudOrgBinding(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("get binding: %v", err)
+	}
+	if binding.PoolStatus != meta.TenantPoolBindingUsed || binding.UsedAt == nil {
+		t.Fatalf("binding = %#v, want used with used_at", binding)
+	}
+	resolved, err := rt.meta.ResolveByAPIKeyHash(ctx, token.HashToken(out["api_key"]))
+	if err != nil {
+		t.Fatalf("resolve issued api key: %v", err)
+	}
+	if resolved.Tenant.ID != tenantID {
+		t.Fatalf("resolved tenant = %q, want %q", resolved.Tenant.ID, tenantID)
+	}
+}
+
 func TestAdminTenantQuotaSetRequiresPatchLabelAuthorization(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	ctx := context.Background()
