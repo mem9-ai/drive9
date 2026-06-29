@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from harness.core import CACHE_ROOT, SKIP, Context, ModuleRecord, Recorder, load_json
+from harness.core import CACHE_ROOT, SKIP, Context, ModuleRecord, Recorder
 
 from .capabilities import detect_fuse_capabilities
 from .deps import Drive9DependencyManager
