@@ -24,41 +24,41 @@ import (
 )
 
 type quotaTestProvisioner struct {
-	provider                 string
-	updateErr                error
-	markErr                  error
-	getErr                   error
-	deprovisionErr           error
-	cloudCfg                 *tenant.QuotaCloudConfig
-	defaultPublicKey         string
-	defaultPrivateKey        string
-	markHook                 func() error
-	deprovisionHook          func(call int, cluster *tenant.ClusterInfo) error
-	updateCalls              atomic.Int32
-	markCalls                atomic.Int32
-	getCalls                 atomic.Int32
-	listCalls                atomic.Int32
-	deprovisionCalls         atomic.Int32
-	batchPoolCalls           atomic.Int32
-	markPoolUsedCalls        atomic.Int32
-	markPoolFreeCalls        atomic.Int32
-	mu                       sync.Mutex
-	lastCluster              *tenant.ClusterInfo
-	lastCredentials          tenant.CredentialProvisionRequest
-	lastOptions              tenant.QuotaUpdateOptions
-	lastListOptions          tenant.ManagedClusterListOptions
-	lastDeprovision          *tenant.ClusterInfo
-	listErr                  error
-	listPages                []*tenant.ManagedClusterListResult
-	batchPoolErr             error
-	batchPoolConnectionReady bool
-	batchPoolEmptyPassword   bool
-	batchPoolMissingOrg      map[int]bool
-	batchPoolMissingTenant   map[int]bool
-	metadataWaitCalls        atomic.Int32
-	metadataBatchWaitCalls   atomic.Int32
-	metadataWaitErr          error
-	calls                    []string
+	provider                    string
+	updateErr                   error
+	markErr                     error
+	getErr                      error
+	deprovisionErr              error
+	cloudCfg                    *tenant.QuotaCloudConfig
+	defaultPublicKey            string
+	defaultPrivateKey           string
+	markHook                    func() error
+	deprovisionHook             func(call int, cluster *tenant.ClusterInfo) error
+	updateCalls                 atomic.Int32
+	markCalls                   atomic.Int32
+	getCalls                    atomic.Int32
+	listCalls                   atomic.Int32
+	deprovisionCalls            atomic.Int32
+	batchPoolCalls              atomic.Int32
+	markPoolUsedCalls           atomic.Int32
+	markPoolFreeCalls           atomic.Int32
+	mu                          sync.Mutex
+	lastCluster                 *tenant.ClusterInfo
+	lastCredentials             tenant.CredentialProvisionRequest
+	lastOptions                 tenant.QuotaUpdateOptions
+	lastListOptions             tenant.ManagedClusterListOptions
+	lastDeprovision             *tenant.ClusterInfo
+	listErr                     error
+	listPages                   []*tenant.ManagedClusterListResult
+	batchPoolErr                error
+	batchPoolOmitConnectionInfo bool
+	batchPoolEmptyPassword      bool
+	batchPoolMissingOrg         map[int]bool
+	batchPoolMissingTenant      map[int]bool
+	metadataWaitCalls           atomic.Int32
+	metadataBatchWaitCalls      atomic.Int32
+	metadataWaitErr             error
+	calls                       []string
 }
 
 func (p *quotaTestProvisioner) recordCall(name string, req tenant.CredentialProvisionRequest, cluster *tenant.ClusterInfo, opts *tenant.QuotaUpdateOptions) {
@@ -245,17 +245,10 @@ func (p *quotaTestProvisioner) BatchProvisionFreeClustersWithCredentialsAndQuota
 		if p.batchPoolMissingOrg[i] {
 			out[len(out)-1].OrganizationID = ""
 		}
-		if p.batchPoolConnectionReady {
+		if !p.batchPoolOmitConnectionInfo {
 			out[len(out)-1].Host = "db.example.com"
 			out[len(out)-1].Port = 4000
 			out[len(out)-1].Username = "u.root"
-		}
-	}
-	if !p.batchPoolConnectionReady && p.batchPoolErr == nil {
-		for _, cluster := range out {
-			cluster.Host = "db.example.com"
-			cluster.Port = 4000
-			cluster.Username = "u.root"
 		}
 	}
 	return out, nil, p.batchPoolErr
@@ -1526,6 +1519,7 @@ func TestAdminTenantPoolCreatePersistsClustersWhenMetadataWaitFails(t *testing.T
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.listPages = []*tenant.ManagedClusterListResult{{}}
 	rt.prov.batchPoolErr = errors.New("tidbcloud native cluster get status 429")
+	rt.prov.batchPoolOmitConnectionInfo = true
 	rt.prov.metadataWaitErr = errors.New("metadata still unavailable")
 	ts := httptest.NewServer(rt.server)
 	t.Cleanup(ts.Close)
@@ -1594,6 +1588,7 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneOrganizationMissi
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.listPages = []*tenant.ManagedClusterListResult{{}}
 	rt.prov.batchPoolErr = errors.New("tidbcloud native cluster get status 429")
+	rt.prov.batchPoolOmitConnectionInfo = true
 	rt.prov.batchPoolMissingOrg = map[int]bool{1: true}
 	rt.prov.metadataWaitErr = errors.New("metadata still unavailable")
 	ts := httptest.NewServer(rt.server)
@@ -1643,6 +1638,7 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneTenantLabelMissin
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.listPages = []*tenant.ManagedClusterListResult{{}}
 	rt.prov.batchPoolErr = errors.New("tidbcloud native cluster get status 429")
+	rt.prov.batchPoolOmitConnectionInfo = true
 	rt.prov.batchPoolMissingTenant = map[int]bool{1: true}
 	rt.prov.metadataWaitErr = errors.New("metadata still unavailable")
 	ts := httptest.NewServer(rt.server)
