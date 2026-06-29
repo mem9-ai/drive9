@@ -1,38 +1,27 @@
-name: blackbox
+name: blackbox-daily
 
-# Manual trigger only — no push, no schedule, no PR.
 on:
+  schedule:
+    # 06:00 UTC every day
+    - cron: "0 6 * * *"
   workflow_dispatch:
-    inputs:
-      group:
-        description: "Module group to run (community, juicefs, drive9, git, customer, or all)"
-        required: false
-        default: "all"
-        type: string
-      runs:
-        description: "Performance run count"
-        required: false
-        default: "1"
-        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: blackbox-manual
+  group: blackbox-daily
   cancel-in-progress: false
 
 env:
-  BLACKBOX_GROUP: ${{ inputs.group || 'all' }}
-  BLACKBOX_RUNS: ${{ inputs.runs || '1' }}
   DRIVE9_LOCAL_INIT_SCHEMA: "true"
   DRIVE9_LOCAL_EMBEDDING_MODE: none
 
 jobs:
-  blackbox:
-    name: blackbox (${{ env.BLACKBOX_GROUP }})
+  blackbox-daily:
+    name: blackbox-daily (community)
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 120
 
     steps:
       - name: Checkout code
@@ -64,27 +53,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: blackbox/work/cache
-          key: blackbox-${{ env.BLACKBOX_GROUP }}-${{ runner.os }}-${{ hashFiles('blackbox/suites/**/deps.py', 'blackbox/suites/**/dependencies.json') }}
+          key: blackbox-community-${{ runner.os }}-${{ hashFiles('blackbox/suites/**/deps.py', 'blackbox/suites/**/dependencies.json') }}
           restore-keys: |
             blackbox-${{ runner.os }}-
 
       - name: Prepare blackbox dependencies
         run: |
-          args="--server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local --deps-only"
-          if [ "$BLACKBOX_GROUP" = "all" ]; then
-            python3 blackbox/run.py --all $args
-          else
-            python3 blackbox/run.py --group "$BLACKBOX_GROUP" $args
-          fi
+          python3 blackbox/run.py --group community \
+            --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local \
+            --deps-only
 
-      - name: Run blackbox
+      - name: Run blackbox (community)
         run: |
-          args="--server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local --runs $BLACKBOX_RUNS"
-          if [ "$BLACKBOX_GROUP" = "all" ]; then
-            python3 blackbox/run.py --all $args
-          else
-            python3 blackbox/run.py --group "$BLACKBOX_GROUP" $args
-          fi
+          python3 blackbox/run.py --group community \
+            --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local
 
       - name: Publish job summary
         if: always()
@@ -100,7 +82,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: blackbox-${{ env.BLACKBOX_GROUP }}
+          name: blackbox-daily-community
           path: |
             blackbox/work/**/report.md
             blackbox/work/**/suite-report.json
