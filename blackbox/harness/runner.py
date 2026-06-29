@@ -308,6 +308,20 @@ class BlackboxRunner:
             self.config.get("modules", {}).get(module.id),
         )
 
+    def _module_compat(self, module: Any) -> dict[str, str]:
+        """Resolve the module's platform compat matrix.
+
+        Reads the class-level ``compat`` attribute (the documented public
+        contract) first, falling back to any legacy config entry under
+        ``self.config["modules"][module.id]["compat"]`` for compatibility.
+        """
+        compat = getattr(module, "compat", None)
+        if isinstance(compat, dict) and compat:
+            return compat
+        module_cfg = self.config.get("modules", {}).get(module.id, {})
+        legacy = module_cfg.get("compat", {})
+        return legacy if isinstance(legacy, dict) else {}
+
     def check_platform_compat(self, module: Any) -> ModuleRecord | None:
         """Check platform compatibility from the module class compat attribute.
 
@@ -316,8 +330,7 @@ class BlackboxRunner:
         """
         import platform as _platform
 
-        module_cfg = self.config.get("modules", {}).get(module.id, {})
-        compat = module_cfg.get("compat", {})
+        compat = self._module_compat(module)
         if not compat:
             return None
         os_name = _platform.system()
@@ -337,8 +350,7 @@ class BlackboxRunner:
         """Whether this module is expected to fail on the current platform."""
         import platform as _platform
 
-        module_cfg = self.config.get("modules", {}).get(module.id, {})
-        compat = module_cfg.get("compat", {})
+        compat = self._module_compat(module)
         if not compat:
             return False
         os_name = _platform.system()

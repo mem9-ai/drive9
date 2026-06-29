@@ -63,12 +63,20 @@ jobs:
       - name: Cache blackbox dependencies
         uses: actions/cache@v4
         with:
+          # Cache the shared work-dir's cache/ so the deps-only step and the
+          # run step (both pinned to BLACKBOX_WORK_DIR below) reuse the same
+          # dependency builds across invocations and across runs.
           path: blackbox/work/cache
           key: blackbox-${{ env.BLACKBOX_GROUP }}-${{ runner.os }}-${{ hashFiles('blackbox/suites/**/deps.py', 'blackbox/suites/**/dependencies.json') }}
           restore-keys: |
             blackbox-${{ runner.os }}-
 
       - name: Prepare blackbox dependencies
+        env:
+          # Pin a stable work-dir so the deps-only and run steps share the
+          # same cache/ directory (each invocation otherwise gets a new
+          # second-based session under blackbox/work/<session>/).
+          BLACKBOX_WORK_DIR: blackbox/work/shared
         run: |
           args="--server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local --deps-only"
           if [ "$BLACKBOX_GROUP" = "all" ]; then
@@ -78,8 +86,10 @@ jobs:
           fi
 
       - name: Run blackbox
+        env:
+          BLACKBOX_WORK_DIR: blackbox/work/shared
         run: |
-          args="--server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local --runs $BLACKBOX_RUNS"
+          args="--server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local --runs $BLACKBOX_RUNS --strict-prereqs"
           if [ "$BLACKBOX_GROUP" = "all" ]; then
             python3 blackbox/run.py --all $args
           else

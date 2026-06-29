@@ -58,15 +58,20 @@ jobs:
             blackbox-${{ runner.os }}-
 
       - name: Prepare blackbox dependencies
+        env:
+          BLACKBOX_WORK_DIR: blackbox/work/shared
         run: |
           python3 blackbox/run.py --group community \
             --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local \
             --deps-only
 
       - name: Run blackbox (community)
+        env:
+          BLACKBOX_WORK_DIR: blackbox/work/shared
         run: |
           python3 blackbox/run.py --group community \
-            --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local
+            --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local \
+            --strict-prereqs
 
       - name: Publish job summary
         if: always()

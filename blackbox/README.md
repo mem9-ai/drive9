@@ -117,8 +117,11 @@ Each module directory contains:
 | `deps.py` | No | `ensure_dependencies(ctx)` function for module-specific dependency preparation |
 
 Module metadata (id, category, labels, timeout, compat) is declared as class
-attributes on the module class in `module.py` — there is no external `config.json`
-or `modules.json`.
+attributes on the module class in `module.py` — there is no external
+`modules.json` or per-module metadata config. Some modules ship a `config.json`
+alongside `module.py` as **runtime data** (repo lists, test cases, perf
+parameters) loaded by the module at run time; this is module data, not
+discovery metadata.
 
 ## Adding a Module
 
@@ -147,10 +150,12 @@ class MyModule(BaseModule):
 
 ## Reports
 
-Blackbox generates two levels of report:
+Blackbox generates two levels of report under the work directory
+(`blackbox/work/<session>/results/` by default, or `--out-dir` / `--work-dir`
+to override):
 
-1. **Module report** (`results/<session>/<group>/<module>/report.md` + `report.json`)
-2. **Suite report** (`results/<session>/report.md` + `suite-report.json`)
+1. **Module report** (`results/artifacts/<module>/report.md` + `report.json`)
+2. **Suite report** (`results/report.md` + `results/suite-report.json`)
 
 ## Platform Compatibility
 
