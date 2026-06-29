@@ -52,7 +52,8 @@ jobs:
       - name: Cache blackbox dependencies
         uses: actions/cache@v4
         with:
-          path: blackbox/work/cache
+          # Must match the runner's cache_dir under BLACKBOX_WORK_DIR=blackbox/work/shared.
+          path: blackbox/work/shared/cache
           key: blackbox-community-${{ runner.os }}-${{ hashFiles('blackbox/suites/**/deps.py', 'blackbox/suites/**/dependencies.json') }}
           restore-keys: |
             blackbox-${{ runner.os }}-
@@ -125,3 +126,4 @@ jobs:
             blackbox/work/**/results/logs/**
             blackbox/work/**/results/mount-logs/**
           if-no-files-found: warn
+          retention-days: 14

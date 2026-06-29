@@ -64,9 +64,10 @@ jobs:
         uses: actions/cache@v4
         with:
           # Cache the shared work-dir's cache/ so the deps-only step and the
-          # run step (both pinned to BLACKBOX_WORK_DIR below) reuse the same
-          # dependency builds across invocations and across runs.
-          path: blackbox/work/cache
+          # run step (both pinned to BLACKBOX_WORK_DIR=blackbox/work/shared
+          # below) reuse the same dependency builds across invocations and
+          # across runs. Path must match the runner's cache_dir exactly.
+          path: blackbox/work/shared/cache
           key: blackbox-${{ env.BLACKBOX_GROUP }}-${{ runner.os }}-${{ hashFiles('blackbox/suites/**/deps.py', 'blackbox/suites/**/dependencies.json') }}
           restore-keys: |
             blackbox-${{ runner.os }}-
@@ -148,3 +149,7 @@ jobs:
             blackbox/work/**/results/logs/**
             blackbox/work/**/results/mount-logs/**
           if-no-files-found: warn
+          # Keep artifacts for a bounded window; the runner filesystem itself
+          # is ephemeral (destroyed per-job), so this only bounds uploaded
+          # artifact storage. Reports are also printed to the job log above.
+          retention-days: 14
