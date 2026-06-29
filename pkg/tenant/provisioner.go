@@ -65,6 +65,13 @@ type CredentialQuotaProvisioner interface {
 	ProvisionWithCredentialsAndQuota(ctx context.Context, tenantID string, req CredentialProvisionRequest, opts QuotaUpdateOptions) (*ClusterInfo, *QuotaCloudConfig, error)
 }
 
+type TenantPoolClusterManager interface {
+	Provisioner
+	BatchProvisionFreeClustersWithCredentialsAndQuota(ctx context.Context, tenantIDs []string, req CredentialProvisionRequest, opts QuotaUpdateOptions) ([]*ClusterInfo, *QuotaCloudConfig, error)
+	MarkClusterPoolUsed(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest, usedAt time.Time, opts QuotaUpdateOptions) (*QuotaCloudConfig, error)
+	MarkClusterPoolFree(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
+}
+
 type CredentialDeprovisioner interface {
 	Provisioner
 	DeprovisionWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error

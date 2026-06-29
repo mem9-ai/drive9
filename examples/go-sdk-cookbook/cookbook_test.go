@@ -260,6 +260,31 @@ func ExampleClient_quota() {
 		MaxFileCount:           &fileCount,
 		TiDBCloudSpendingLimit: &spendingLimit,
 	})
+
+	poolSize := 10
+	_, _ = credentialClient.AdminCreateTenantPool(ctx, drive9.AdminTenantPoolRequest{
+		PublicKey:  tidbCloudPublicKey,
+		PrivateKey: tidbCloudPrivateKey,
+		PoolSize:   &poolSize,
+	})
+	pool, err := credentialClient.AdminGetTenantPool(ctx, drive9.AdminTenantPoolRequest{
+		PublicKey:  tidbCloudPublicKey,
+		PrivateKey: tidbCloudPrivateKey,
+	})
+	if err == nil {
+		_ = pool.PoolID
+		_ = pool.FreeSize
+	}
+	updatedPoolSize := 20
+	_, _ = credentialClient.AdminUpdateTenantPool(ctx, drive9.AdminTenantPoolRequest{
+		PublicKey:  tidbCloudPublicKey,
+		PrivateKey: tidbCloudPrivateKey,
+		PoolSize:   &updatedPoolSize,
+	})
+	_, _ = credentialClient.AdminDeleteTenantPool(ctx, drive9.AdminTenantPoolRequest{
+		PublicKey:  tidbCloudPublicKey,
+		PrivateKey: tidbCloudPrivateKey,
+	})
 }
 
 func ExampleClient_eventsLayersGitAndJournal() {
@@ -416,10 +441,14 @@ func Example_localFileTransferShape() {
 
 var coveredClientMethods = map[string]bool{
 	"AdminCreateTenant":                    true,
+	"AdminCreateTenantPool":                true,
 	"AdminDeleteTenant":                    true,
+	"AdminDeleteTenantPool":                true,
 	"AdminGetTenant":                       true,
+	"AdminGetTenantPool":                   true,
 	"AdminListTenants":                     true,
 	"AdminSetTenantQuota":                  true,
+	"AdminUpdateTenantPool":                true,
 	"AppendJournalEntries":                 true,
 	"AppendStream":                         true,
 	"APIKey":                               true,

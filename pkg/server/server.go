@@ -112,34 +112,36 @@ type nativeSystemUserProvisioner interface {
 }
 
 type Server struct {
-	fallback            *backend.Dat9Backend
-	meta                *meta.Store
-	pool                *tenant.Pool
-	provisioner         tenant.Provisioner
-	tokenSecret         []byte
-	localTenantAPIKey   string
-	vaultMK             *vault.MasterKey
-	vaultIssuerURL      string
-	publicURL           string
-	maxUploadBytes      int64
-	inlineThreshold     int64
-	metrics             *serverMetrics
-	logger              *zap.Logger
-	mux                 *http.ServeMux
-	events              *eventBuses
-	semanticWorker      *semanticWorkerManager
-	journalCursorSecret []byte
-	objectGCWorker      *objectGCWorker
-	slockOAuth          SlockOAuthClient
-	tidbAutoEmbedding   tenantAutoEmbeddingDefault
-	disableDBAutoEmbed  bool
-	forkWorkerCtx       context.Context
-	forkWorkerCancel    context.CancelFunc
-	forkWorkerWG        sync.WaitGroup
-	forkWorkerMu        sync.Mutex
-	forkWorkerClosed    bool
-	schemaInitErrors    sync.Map
-	leader              *leader.Manager
+	fallback              *backend.Dat9Backend
+	meta                  *meta.Store
+	pool                  *tenant.Pool
+	provisioner           tenant.Provisioner
+	tokenSecret           []byte
+	localTenantAPIKey     string
+	vaultMK               *vault.MasterKey
+	vaultIssuerURL        string
+	publicURL             string
+	maxUploadBytes        int64
+	inlineThreshold       int64
+	metrics               *serverMetrics
+	logger                *zap.Logger
+	mux                   *http.ServeMux
+	events                *eventBuses
+	semanticWorker        *semanticWorkerManager
+	journalCursorSecret   []byte
+	objectGCWorker        *objectGCWorker
+	slockOAuth            SlockOAuthClient
+	tidbAutoEmbedding     tenantAutoEmbeddingDefault
+	disableDBAutoEmbed    bool
+	forkWorkerCtx         context.Context
+	forkWorkerCancel      context.CancelFunc
+	forkWorkerWG          sync.WaitGroup
+	forkWorkerMu          sync.Mutex
+	forkWorkerClosed      bool
+	tenantPoolLocks       sync.Map
+	tenantPoolCreateLocks sync.Map
+	schemaInitErrors      sync.Map
+	leader                *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
 	// changes, this context is cancelled and recreated. Workers that use it
 	// (pending tenant reconciler, tenant delete cleanup, one-time resume tasks)
@@ -312,6 +314,7 @@ func NewWithConfig(cfg Config) *Server {
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
 	mux.Handle("/v1/quota", s.quotaRootHandler(cfg))
+	mux.Handle("/v1/admin/tenant-pool", s.adminTenantPoolHandler())
 	mux.Handle("/v1/admin/tenants", s.adminTenantsRootHandler())
 	mux.Handle("/v1/admin/tenants/", s.adminTenantsItemHandler())
 	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
@@ -4105,6 +4108,20 @@ func newProvisionTenantError(status int, message string, err error) *provisionTe
 	return &provisionTenantError{status: status, message: message, err: err}
 }
 
+func durationMillis(started time.Time) float64 {
+	return float64(time.Since(started).Microseconds()) / 1000
+}
+
+func logProvisionStage(ctx context.Context, event, tenantID, provider string, started time.Time, kv ...any) {
+	fields := []any{
+		"tenant_id", tenantID,
+		"provider", provider,
+		"duration_ms", durationMillis(started),
+	}
+	fields = append(fields, kv...)
+	logger.Info(ctx, "server_event", eventFields(ctx, event, fields...)...)
+}
+
 func defaultTiDBAutoEmbeddingConfig(cfg tenantschema.TiDBAutoEmbeddingConfig) tenantschema.TiDBAutoEmbeddingConfig {
 	if cfg.Model == "" && cfg.Dimensions == 0 {
 		return tenantschema.CurrentTiDBAutoEmbeddingConfig()
@@ -4254,6 +4271,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 	}
 	tenantID := token.NewID()
+	provisionStarted := time.Now()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
 	setRequestMetricTenant(ctx, tenantID, "", provider, tenantRequestClass{surface: "provision", action: "post"})
 
@@ -4262,12 +4280,15 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		keyName = "default"
 	}
 	now := time.Now().UTC()
+	stageStarted := time.Now()
 	autoProfile, err := s.defaultAutoEmbeddingProfileForTenant(ctx, tenantID, provider, now)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_auto_embedding_profile_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to build tenant auto-embedding profile", err)
 	}
+	logProvisionStage(ctx, "provision_auto_embedding_profile_built", tenantID, provider, stageStarted, "enabled", autoProfile != nil)
+	stageStarted = time.Now()
 	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantPending,
@@ -4288,8 +4309,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant", err)
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
+	logProvisionStage(ctx, "provision_tenant_inserted", tenantID, provider, stageStarted, "status", meta.TenantPending)
 
 	if autoProfile != nil {
+		stageStarted = time.Now()
 		if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, autoProfile); err != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_auto_embedding_profile_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
@@ -4298,12 +4321,16 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			}
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant auto-embedding profile", err)
 		}
+		logProvisionStage(ctx, "provision_auto_embedding_profile_inserted", tenantID, provider, stageStarted)
 	}
 
 	var cluster *tenant.ClusterInfo
 	var provisionCloudCfg *tenant.QuotaCloudConfig
+	stageStarted = time.Now()
+	provisionMode := "default"
 	if provider == tenant.ProviderTiDBCloudNative {
 		if opts.Quota != nil {
+			provisionMode = "tidb_cloud_native_credentials_quota"
 			quotaReq := *opts.Quota
 			quotaReq.TenantID = tenantID
 			if err := s.validateQuotaSetRequest(quotaReq); err != nil {
@@ -4315,6 +4342,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				return nil, newProvisionTenantError(http.StatusBadRequest, tenant.ErrCredentialsRequired.Error(), tenant.ErrCredentialsRequired)
 			}
 			if quotaProvisioner, ok := s.provisioner.(tenant.CredentialQuotaProvisioner); ok {
+				logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
 				cluster, provisionCloudCfg, err = quotaProvisioner.ProvisionWithCredentialsAndQuota(ctx, tenantID, *opts.CredentialProvisioner, tenant.QuotaUpdateOptions{
 					TiDBCloudSpendingLimitMonthly: quotaReq.TiDBCloudSpendingLimit,
 				})
@@ -4328,11 +4356,15 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				return nil, newProvisionTenantError(http.StatusInternalServerError, "provisioner does not support create-time quota", err)
 			}
 		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
+			provisionMode = "tidb_cloud_native_credentials"
+			logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
 			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
 		} else {
 			err = fmt.Errorf("provisioner does not support request credentials")
 		}
 	} else {
+		provisionMode = "provisioner_default"
+		logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
 		cluster, err = s.provisioner.Provision(ctx, tenantID)
 	}
 	if err != nil {
@@ -4356,8 +4388,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 		return nil, newProvisionTenantError(http.StatusBadGateway, msg, err)
 	}
+	logProvisionStage(ctx, "provision_cluster_provisioned", tenantID, provider, stageStarted, "mode", provisionMode, "cluster_id", cluster.ClusterID, "organization_id", cluster.OrganizationID)
 	cluster.Provider = provider
 	if provider == tenant.ProviderTiDBCloudNative {
+		stageStarted = time.Now()
 		if strings.TrimSpace(cluster.OrganizationID) == "" {
 			err := fmt.Errorf("tidbcloud organization label is missing")
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_tidbcloud_org_binding_missing", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
@@ -4377,8 +4411,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "org_binding_error")
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tidbcloud organization binding", err)
 		}
+		logProvisionStage(ctx, "provision_tidbcloud_org_binding_persisted", tenantID, provider, stageStarted, "cluster_id", cluster.ClusterID, "organization_id", cluster.OrganizationID)
 	}
 
+	stageStarted = time.Now()
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
@@ -4388,6 +4424,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encrypt db password", err)
 	}
+	logProvisionStage(ctx, "provision_db_password_encrypted", tenantID, provider, stageStarted)
 	dbtls := true
 	if provider == tenant.ProviderTiDBCloudNative {
 		v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
@@ -4395,6 +4432,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			dbtls = false
 		}
 	}
+	stageStarted = time.Now()
 	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
@@ -4414,6 +4452,8 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant connection", err)
 	}
+	logProvisionStage(ctx, "provision_tenant_connection_persisted", tenantID, provider, stageStarted, "cluster_id", cluster.ClusterID, "db_tls", dbtls)
+	stageStarted = time.Now()
 	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_tenant_status_failed", "tenant_id", tenantID, "provider", provider, "status", meta.TenantProvisioning, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
@@ -4422,8 +4462,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to update tenant status", err)
 	}
+	logProvisionStage(ctx, "provision_tenant_status_updated", tenantID, provider, stageStarted, "status", meta.TenantProvisioning)
 
 	if opts.Quota != nil {
+		stageStarted = time.Now()
 		quotaReq := *opts.Quota
 		quotaReq.TenantID = tenantID
 		if err := s.applyQuotaLocalConfig(ctx, tenantID, quotaReq); err != nil {
@@ -4437,8 +4479,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		if provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
 			metricEvent(ctx, "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
 		}
+		logProvisionStage(ctx, "provision_quota_local_config_applied", tenantID, provider, stageStarted, "create_time_spending_limit", provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil)
 	}
 
+	stageStarted = time.Now()
 	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_api_key_failed", "tenant_id", tenantID, "api_key_id", apiKeyID, "error", err)...)
@@ -4447,8 +4491,9 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist api key", err)
 	}
+	logProvisionStage(ctx, "provision_api_key_issued", tenantID, provider, stageStarted, "api_key_id", apiKeyID)
 
-	logger.Info(ctx, "server_event", eventFields(ctx, "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_accepted", "tenant_id", tenantID, "provider", provider, "duration_ms", durationMillis(provisionStarted))...)
 	metricEvent(ctx, "tenant_provision", "provider", provider, "result", "accepted")
 
 	cloudProvider, region := "", ""
