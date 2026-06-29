@@ -54,8 +54,9 @@ type Config struct {
 	LocalS3           *s3client.LocalS3Client
 	S3Dir             string
 	MaxUploadBytes    int64
-	// TenantPoolMaxSize caps admin tenant pool create/update target size.
-	// Values <= 0 use DefaultTenantPoolMaxSize.
+	// TenantPoolMaxSize caps admin tenant pool create/update target size. Values
+	// <= 0 are normalized to DefaultTenantPoolMaxSize; the pool is never
+	// intentionally uncapped.
 	TenantPoolMaxSize int
 	// InlineThreshold is the server-wide DB-inline vs S3 cutoff surfaced to
 	// clients via /v1/status. When 0, the value is inferred from
@@ -182,7 +183,7 @@ var (
 const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
 
 // DefaultTenantPoolMaxSize caps admin tenant pools unless overridden by server
-// configuration.
+// configuration with a positive value.
 const DefaultTenantPoolMaxSize = 200
 
 // TenantStatusResponse is the JSON body of GET /v1/status. Fields are filled
