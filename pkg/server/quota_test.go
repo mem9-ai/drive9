@@ -1468,7 +1468,10 @@ func TestAdminTenantQuotaGetIsNotExposed(t *testing.T) {
 
 func TestAdminTenantPoolCreateBatchProvisionsFreeTenants(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
-	rt.prov.listPages = []*tenant.ManagedClusterListResult{{}}
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{
+		{},
+		{Clusters: []tenant.CloudClusterInfo{{OrganizationID: "org-1"}}},
+	}
 	ts := httptest.NewServer(rt.server)
 	t.Cleanup(ts.Close)
 
@@ -1486,7 +1489,7 @@ func TestAdminTenantPoolCreateBatchProvisionsFreeTenants(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 {
+	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 || out.Status != adminTenantPoolStatusCreating {
 		t.Fatalf("pool response = %#v", out)
 	}
 	if rt.prov.batchPoolCalls.Load() != 1 {
@@ -1500,7 +1503,7 @@ func TestAdminTenantPoolCreateBatchProvisionsFreeTenants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get pool: %v", err)
 	}
-	if pool.PoolID != out.PoolID || pool.Size != 2 {
+	if pool.PoolID != out.PoolID || pool.Size != 2 || pool.Status != meta.TenantPoolActive {
 		t.Fatalf("stored pool = %#v", pool)
 	}
 	free, err := rt.meta.CountFreeTenantPoolBindings(context.Background(), "org-1")
@@ -1516,6 +1519,35 @@ func TestAdminTenantPoolCreateBatchProvisionsFreeTenants(t *testing.T) {
 	}
 	if slots != 2 {
 		t.Fatalf("free slots = %d, want 2", slots)
+	}
+
+	getResp := getAdminTenantPool(t, ts.URL, "public-1", "private-1")
+	defer func() { _ = getResp.Body.Close() }()
+	if getResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(getResp.Body)
+		t.Fatalf("get pool status = %d body=%s", getResp.StatusCode, body)
+	}
+	var got adminTenantPoolResponse
+	if err := json.NewDecoder(getResp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode get response: %v", err)
+	}
+	if got.PoolID != out.PoolID || got.FreeSize != 0 || got.Status != adminTenantPoolStatusCreating {
+		t.Fatalf("get pool response = %#v", got)
+	}
+}
+
+func TestAdminTenantPoolDisplayStatusCreating(t *testing.T) {
+	if got := adminTenantPoolDisplayStatus(meta.TenantPoolActive, 0, 2); got != adminTenantPoolStatusCreating {
+		t.Fatalf("pending slots status = %q, want %q", got, adminTenantPoolStatusCreating)
+	}
+	if got := adminTenantPoolDisplayStatus(meta.TenantPoolActive, 1, 2); got != string(meta.TenantPoolActive) {
+		t.Fatalf("free slots status = %q, want %q", got, meta.TenantPoolActive)
+	}
+	if got := adminTenantPoolDisplayStatus(meta.TenantPoolActive, 0, 0); got != string(meta.TenantPoolActive) {
+		t.Fatalf("empty slots status = %q, want %q", got, meta.TenantPoolActive)
+	}
+	if got := adminTenantPoolDisplayStatus(meta.TenantPoolDeleting, 0, 2); got != string(meta.TenantPoolDeleting) {
+		t.Fatalf("deleting status = %q, want %q", got, meta.TenantPoolDeleting)
 	}
 }
 
@@ -1542,7 +1574,7 @@ func TestAdminTenantPoolCreatePersistsClustersWhenMetadataWaitFails(t *testing.T
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 {
+	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 || out.Status != adminTenantPoolStatusCreating {
 		t.Fatalf("pool response = %#v", out)
 	}
 	pool, err := rt.meta.GetTenantPoolByOrganization(context.Background(), "org-1")
@@ -1612,7 +1644,7 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneOrganizationMissi
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 {
+	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 || out.Status != adminTenantPoolStatusCreating {
 		t.Fatalf("pool response = %#v", out)
 	}
 	pool, err := rt.meta.GetTenantPoolByOrganization(context.Background(), "org-1")
@@ -1662,7 +1694,7 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneTenantLabelMissin
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 {
+	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 || out.Status != adminTenantPoolStatusCreating {
 		t.Fatalf("pool response = %#v", out)
 	}
 	rows, err := rt.meta.ListPendingTenantPoolBindingsForResume(context.Background(), "org-1", 10)
@@ -2875,6 +2907,21 @@ func getQuota(t *testing.T, baseURL, tenantID, publicKey, privateKey, apiKey str
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)
 	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func getAdminTenantPool(t *testing.T, baseURL, publicKey, privateKey string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/v1/admin/tenant-pool", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set(quotaPublicKeyHeader, publicKey)
+	req.Header.Set(quotaPrivateKeyHeader, privateKey)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
