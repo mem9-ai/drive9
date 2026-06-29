@@ -211,6 +211,28 @@ type quotaRuntime struct {
 	server   *Server
 }
 
+type tenantPoolNoListProvisioner struct {
+	fakeProvisioner
+	batchPoolCalls    atomic.Int32
+	markPoolUsedCalls atomic.Int32
+	markPoolFreeCalls atomic.Int32
+}
+
+func (p *tenantPoolNoListProvisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(context.Context, []string, tenant.CredentialProvisionRequest, tenant.QuotaUpdateOptions) ([]*tenant.ClusterInfo, *tenant.QuotaCloudConfig, error) {
+	p.batchPoolCalls.Add(1)
+	return nil, nil, errors.New("pool batch should not be called")
+}
+
+func (p *tenantPoolNoListProvisioner) MarkClusterPoolUsed(context.Context, *tenant.ClusterInfo, tenant.CredentialProvisionRequest, time.Time, tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
+	p.markPoolUsedCalls.Add(1)
+	return nil, errors.New("pool mark used should not be called")
+}
+
+func (p *tenantPoolNoListProvisioner) MarkClusterPoolFree(context.Context, *tenant.ClusterInfo, tenant.CredentialProvisionRequest) error {
+	p.markPoolFreeCalls.Add(1)
+	return errors.New("pool mark free should not be called")
+}
+
 func newQuotaRuntime(t *testing.T, provider string) *quotaRuntime {
 	t.Helper()
 	db := newTenantDeleteDBInfo(t)
@@ -1909,6 +1931,55 @@ func TestProvisionClaimsFreePoolTenant(t *testing.T) {
 	}
 	if resolved.Tenant.ID != tenantID {
 		t.Fatalf("resolved tenant = %q, want %q", resolved.Tenant.ID, tenantID)
+	}
+}
+
+func TestProvisionFallsBackWhenTenantPoolClaimCannotListManagedClusters(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	prov := &tenantPoolNoListProvisioner{
+		fakeProvisioner: fakeProvisioner{
+			provider:      tenant.ProviderTiDBCloudNative,
+			cloudProvider: "aws",
+			region:        "us-east-1",
+			cluster: &tenant.ClusterInfo{
+				ClusterID:      "native-cluster-fallback",
+				OrganizationID: "org-1",
+				Host:           "db.example.com",
+				Port:           4000,
+				Username:       "u.root",
+				Password:       "db-pass",
+				DBName:         "tidbcloud_fs",
+			},
+		},
+	}
+	rt.server.provisioner = prov
+
+	ts := httptest.NewServer(rt.server)
+	t.Cleanup(ts.Close)
+	resp := postJSON(t, ts.URL+"/v1/provision", map[string]any{
+		"public_key":  "public-1",
+		"private_key": "private-1",
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	var out map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out["tenant_id"] == "" || out["api_key"] == "" || out["status"] != string(meta.TenantProvisioning) {
+		t.Errorf("provision response = %#v", out)
+	}
+	if got := prov.credentialCalls.Load(); got != 1 {
+		t.Errorf("credential provision calls = %d, want 1", got)
+	}
+	if got := prov.markPoolUsedCalls.Load(); got != 0 {
+		t.Errorf("mark pool used calls = %d, want 0", got)
+	}
+	if got := prov.batchPoolCalls.Load(); got != 0 {
+		t.Errorf("batch pool calls = %d, want 0", got)
 	}
 }
 

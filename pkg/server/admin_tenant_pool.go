@@ -698,6 +698,10 @@ func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.Crede
 		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_skipped", "provider", tenant.ProviderTiDBCloudNative, "reason", "pool_manager_unavailable", "duration_ms", durationMillis(claimStarted))...)
 		return nil, nil, false, nil
 	}
+	if _, ok := s.provisioner.(tenant.ManagedClusterLister); !ok {
+		logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_claim_skipped", "provider", tenant.ProviderTiDBCloudNative, "reason", "managed_cluster_lister_unavailable", "duration_ms", durationMillis(claimStarted))...)
+		return nil, nil, false, nil
+	}
 	stageStarted := time.Now()
 	orgID, err := s.firstManagedOrganization(ctx, cred)
 	if err != nil || orgID == "" {
