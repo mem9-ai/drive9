@@ -513,7 +513,7 @@ func TestBatchProvisionFreeClustersWaitsForMetadataByList(t *testing.T) {
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters":
 			listCalls.Add(1)
-			if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `clusterId = cluster-1,cluster-2`) || !strings.Contains(filter, Drive9ManagedLabel) {
+			if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `(clusterId = cluster-1 OR clusterId = cluster-2)`) || !strings.Contains(filter, Drive9ManagedLabel) {
 				handlerErrs <- fmt.Errorf("unexpected list filter %q", filter)
 				http.Error(w, "unexpected filter", http.StatusBadRequest)
 				return
