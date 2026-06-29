@@ -268,11 +268,27 @@ Surfaces that need explicit hidden-tag handling in this PR:
 
 | Surface | Where | Required behavior |
 |---|---|---|
-| Stat metadata `semantic_text` | stat handler at `pkg/server/server.go:1719` | blank `semantic_text` when hidden |
+| Stat metadata `semantic_text` | stat handler at `pkg/server/server.go:1753` | blank `semantic_text` when hidden |
+| Stat metadata `content_type` | stat handler `pkg/server/server.go:1752` | blank to `""` or `"application/octet-stream"` — leaking MIME reveals class (`application/pdf` → "this is a doc scan"). Default: blank to `""`. |
+| Stat metadata `checksum_sha256` | `pkg/server/fs_layer.go:66` and `git_workspace.go:84,95,109,123,138` | blank when hidden — content hash enables rainbow-table identification against known-public files (forms, ID-doc templates) |
+| Stat metadata `tags` (sibling system-derived) | stat handler `pkg/server/server.go:1754` | strip `drive9.image.*` and other `drive9.<derived>.*` system tags (they expose EXIF / extracted-content info); keep `drive9.content_hidden` itself and user-set business tags |
 | Inline batch read | `Dat9Backend.ReadInlinePlanCtx` (`pkg/backend/dat9.go:1642`) | empty `InlineData`, no `PresignURL` |
 | Grep / search / snippet | server search endpoints (find via `grep -r "snippet"` in `pkg/server`) | skip hidden files or return empty matches |
 | Semantic / embedding query | server endpoints serving `description_embedding` or returning matched text | skip hidden files in result set |
 | ETag / `Last-Modified` headers | GET handler | derive from `revision` so kernel/HTTP cache rotates on tag flip |
+
+The three middle rows (`content_type`, `checksum_sha256`, sibling
+system-derived tags) come from adversary-2 PR review msg `1c836768` —
+they're the same family as `semantic_text`: derived-from-content
+metadata leaked through stat. `checksum_sha256` is the highest-risk
+of the three (cryptographic identity → rainbow-table lookup against
+any public template).
+
+User-set business tags stay visible: hiding them would break
+client workflows that rely on tag-based file selection
+(e.g. "ls all files tagged `project=alpha`"). System-derived
+`drive9.<extracted>.*` tags are different — they're extracted from
+content and would re-leak it.
 
 The grep/search/embedding endpoints are the highest-risk side
 channel — they return content excerpts, so leaving them untouched
@@ -347,6 +363,17 @@ Explicit rejection is the right default.
 - Remove tag → ls shows real size → cat returns real bytes.
 - Set tag → verify SSE event emitted with type `file_attrs_changed`.
 - Remove tag → verify SSE event emitted.
+- Stat hidden file → `semantic_text == ""`, `content_type == ""`,
+  `checksum_sha256 == ""` in the response JSON; sibling
+  `drive9.image.*` tags absent.
+- Stat hidden file → `drive9.content_hidden` tag itself **is**
+  present in the response (so clients can introspect the policy).
+- Stat hidden file → user-set business tags (`project=alpha`,
+  arbitrary non-`drive9.` keys) **are** preserved.
+- `ReadPlanCtx` for hidden file → `PresignGetObject` mock asserts
+  zero invocations.
+- Search / grep / semantic endpoint → hidden file is not in result
+  rows; non-hidden files in the same dir are returned normally.
 
 ### 8.3 FUSE end-to-end
 
