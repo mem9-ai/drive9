@@ -1854,6 +1854,118 @@ func TestStartupKeepsFreshPendingTenant(t *testing.T) {
 	}
 }
 
+func TestReconcilePendingNativePoolTenantWithoutConnectionStaysPending(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	tenantID := token.NewID()
+	now := time.Now().UTC().Add(-2 * time.Minute)
+	origStaleAfter := pendingTenantStaleAfter
+	pendingTenantStaleAfter = time.Minute
+	defer func() { pendingTenantStaleAfter = origStaleAfter }()
+	pendingTenant := meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantPending,
+		DBPasswordCipher: []byte{},
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        "cluster-1",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := metaStore.InsertTenant(context.Background(), &pendingTenant); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := &Server{meta: metaStore}
+	srv.reconcilePendingTenant(context.Background(), pendingTenant)
+
+	row := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID)
+	var status string
+	if err := row.Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(meta.TenantPending) {
+		t.Fatalf("status after reconcile = %s, want %s", status, meta.TenantPending)
+	}
+}
+
+func TestReconcilePendingNativeTenantWithConnectionResumesSchemaInit(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	master := make([]byte, 32)
+	if _, err := rand.Read(master); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := encrypt.NewLocalAESEncryptor(master)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := tenant.NewPool(tenant.PoolConfig{S3Dir: mustTempDir(t), PublicURL: "http://localhost"}, enc)
+	defer pool.Close()
+
+	passCipher, err := pool.Encrypt(context.Background(), []byte("root-pass"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenantID := token.NewID()
+	now := time.Now().UTC().Add(-2 * time.Minute)
+	origStaleAfter := pendingTenantStaleAfter
+	pendingTenantStaleAfter = time.Minute
+	defer func() { pendingTenantStaleAfter = origStaleAfter }()
+	pendingTenant := meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantPending,
+		DBHost:           "db.example",
+		DBPort:           4000,
+		DBUser:           "u1.root",
+		DBPasswordCipher: passCipher,
+		DBName:           "tidbcloud_fs",
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        "cluster-1",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := metaStore.InsertTenant(context.Background(), &pendingTenant); err != nil {
+		t.Fatal(err)
+	}
+
+	prov := &fakeProvisioner{provider: tenant.ProviderTiDBCloudNative}
+	srv := &Server{meta: metaStore, pool: pool, provisioner: prov}
+	srv.reconcilePendingTenant(context.Background(), pendingTenant)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		row := metaStore.DB().QueryRow("SELECT status FROM tenants WHERE id = ?", tenantID)
+		var status string
+		if err := row.Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == string(meta.TenantActive) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("pending native tenant did not resume schema init, status=%s", status)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if prov.systemUserCalls.Load() != 1 {
+		t.Fatalf("system user calls = %d, want 1", prov.systemUserCalls.Load())
+	}
+}
+
 func TestReconcilePendingTenantDoesNotOverwriteChangedStatus(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {

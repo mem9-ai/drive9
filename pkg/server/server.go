@@ -745,11 +745,18 @@ func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 			continue
 		}
 		if t.Provider == tenant.ProviderTiDBCloudNative && t.DBUser == "" {
+			// TiDB Cloud native metadata resume is gated by request-scoped customer credentials.
 			logger.Warn(ctx, "resume_provisioning_native_no_connection",
 				zap.String("tenant_id", t.ID),
 				zap.String("provider", t.Provider),
 				zap.String("cluster_id", t.ClusterID),
 				zap.String("reason", "tidbcloud_credentials_unavailable"))
+			if s.metrics != nil {
+				s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
+					"provider", t.Provider,
+					"result", "skipped",
+					"reason", "tidbcloud_credentials_unavailable")
+			}
 			continue
 		}
 		s.startTenantSchemaInitResume(ctx, t)
@@ -831,15 +838,43 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 }
 
 func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
-	if t.Provider == tenant.ProviderTiDBCloudNative && strings.TrimSpace(t.ClusterID) != "" {
+	if t.Provider == tenant.ProviderTiDBCloudNative && strings.TrimSpace(t.ClusterID) != "" && strings.TrimSpace(t.DBUser) == "" {
 		logger.Info(ctx, "resume_pending_pool_tenant_skipped",
 			zap.String("tenant_id", t.ID),
 			zap.String("provider", t.Provider),
 			zap.String("cluster_id", t.ClusterID),
 			zap.String("reason", "tidbcloud_credentials_unavailable"))
+		if s.metrics != nil {
+			s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
+				"provider", t.Provider,
+				"result", "skipped",
+				"reason", "tidbcloud_credentials_unavailable")
+		}
 		return
 	}
 	if !isStalePendingTenant(time.Now().UTC(), t) {
+		return
+	}
+	if pendingTenantConnectionReady(t) {
+		updated, err := s.meta.UpdateTenantStatusIf(ctx, t.ID, meta.TenantPending, meta.TenantProvisioning)
+		if err != nil {
+			logger.Error(ctx, "resume_pending_schema_init_status_update_error",
+				zap.String("tenant_id", t.ID),
+				zap.Error(err))
+			return
+		}
+		if !updated {
+			logger.Info(ctx, "resume_pending_schema_init_skipped",
+				zap.String("tenant_id", t.ID),
+				zap.String("reason", "status_changed"))
+			return
+		}
+		t.Status = meta.TenantProvisioning
+		logger.Info(ctx, "resume_pending_schema_init_started",
+			zap.String("tenant_id", t.ID),
+			zap.String("provider", t.Provider),
+			zap.String("cluster_id", t.ClusterID))
+		s.startTenantSchemaInitResume(ctx, t)
 		return
 	}
 	logger.Warn(ctx, "resume_pending_mark_failed",
@@ -859,6 +894,14 @@ func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
 			zap.String("tenant_id", t.ID),
 			zap.String("reason", "status_changed"))
 	}
+}
+
+func pendingTenantConnectionReady(t meta.Tenant) bool {
+	return strings.TrimSpace(t.DBHost) != "" &&
+		t.DBPort > 0 &&
+		strings.TrimSpace(t.DBUser) != "" &&
+		len(t.DBPasswordCipher) > 0 &&
+		strings.TrimSpace(t.DBName) != ""
 }
 
 func isStalePendingTenant(now time.Time, t meta.Tenant) bool {

@@ -1070,6 +1070,7 @@ func (p *Provisioner) listClusterInfosPageWithCredentials(ctx context.Context, p
 	filter := fmt.Sprintf(`labels.%q = "true"`, Drive9ManagedLabel)
 	clusterIDFilter := compactNonEmptyStrings(clusterIDs)
 	if len(clusterIDFilter) > 0 {
+		// TiDB Cloud serverless cvtGlobalFilter splits comma-separated clusterId values server-side.
 		filter = fmt.Sprintf("clusterId = %q AND %s", strings.Join(clusterIDFilter, ","), filter)
 	}
 	values.Set("filter", filter)
