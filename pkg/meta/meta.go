@@ -40,6 +40,8 @@ const (
 	TenantDeleted      TenantStatus = "deleted"
 )
 
+const tidbCloudNativeProvider = "tidb_cloud_native"
+
 type TenantKind string
 
 const (
@@ -1432,18 +1434,34 @@ func (s *Store) UpdateTenantPoolOrganization(ctx context.Context, poolID, organi
 }
 
 func (s *Store) CountFreeTenantPoolBindings(ctx context.Context, organizationID string) (out int, err error) {
+	return s.countFreeTenantPoolBindingsByStatus(ctx, organizationID, []TenantStatus{TenantActive})
+}
+
+func (s *Store) CountTenantPoolFreeSlots(ctx context.Context, organizationID string) (out int, err error) {
+	return s.countFreeTenantPoolBindingsByStatus(ctx, organizationID, []TenantStatus{TenantPending, TenantProvisioning, TenantActive})
+}
+
+func (s *Store) countFreeTenantPoolBindingsByStatus(ctx context.Context, organizationID string, statuses []TenantStatus) (out int, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "count_free_tidbcloud_pool_bindings", start, &err)
 	organizationID = strings.TrimSpace(organizationID)
 	if organizationID == "" {
 		return 0, fmt.Errorf("organization_id is required")
 	}
+	if len(statuses) == 0 {
+		return 0, fmt.Errorf("tenant statuses are required")
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(statuses)), ",")
+	args := make([]any, 0, 3+len(statuses))
+	args = append(args, organizationID, TenantPoolBindingFree, tidbCloudNativeProvider)
+	for _, status := range statuses {
+		args = append(args, status)
+	}
 	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*)
 		FROM tenant_tidbcloud_org_bindings b
 		JOIN tenants t ON t.id = b.tenant_id
-		WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = 'tidb_cloud_native'
-			AND t.status IN (?, ?)`,
-		organizationID, TenantPoolBindingFree, TenantProvisioning, TenantActive)
+		WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
+			AND t.status IN (`+placeholders+`)`, args...)
 	if err = row.Scan(&out); err != nil {
 		return 0, err
 	}
@@ -1453,13 +1471,25 @@ func (s *Store) CountFreeTenantPoolBindings(ctx context.Context, organizationID 
 func (s *Store) ListFreeTenantPoolBindings(ctx context.Context, organizationID string, newestFirst bool, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_free_tidbcloud_pool_bindings", start, &err)
-	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantProvisioning, TenantActive})
+	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantActive})
 }
 
 func (s *Store) ListFreeTenantPoolBindingsForDelete(ctx context.Context, organizationID string, newestFirst bool, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_free_tidbcloud_pool_bindings_for_delete", start, &err)
-	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantProvisioning, TenantActive, TenantFailed})
+	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantPending, TenantProvisioning, TenantActive, TenantFailed})
+}
+
+func (s *Store) ListTenantPoolFreeSlotsForDelete(ctx context.Context, organizationID string, newestFirst bool, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_tidbcloud_pool_free_slots_for_delete", start, &err)
+	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantPending, TenantProvisioning, TenantActive})
+}
+
+func (s *Store) ListPendingTenantPoolBindingsForResume(ctx context.Context, organizationID string, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_pending_tidbcloud_pool_bindings_for_resume", start, &err)
+	return s.listFreeTenantPoolBindings(ctx, organizationID, false, limit, []TenantStatus{TenantPending})
 }
 
 func (s *Store) listFreeTenantPoolBindings(ctx context.Context, organizationID string, newestFirst bool, limit int, statuses []TenantStatus) (out []TenantWithTiDBCloudOrgBinding, err error) {
@@ -1486,12 +1516,12 @@ func (s *Store) listFreeTenantPoolBindings(ctx context.Context, organizationID s
 			b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
 		FROM tenant_tidbcloud_org_bindings b
 		JOIN tenants t ON t.id = b.tenant_id
-		WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = 'tidb_cloud_native'
-			AND t.status IN (` + placeholders + `)
-		ORDER BY b.created_at ` + order + `, b.tenant_id ` + order + `
-		LIMIT ?`
-	args := make([]any, 0, 3+len(statuses))
-	args = append(args, organizationID, TenantPoolBindingFree)
+			WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
+				AND t.status IN (` + placeholders + `)
+			ORDER BY b.created_at ` + order + `, b.tenant_id ` + order + `
+			LIMIT ?`
+	args := make([]any, 0, 4+len(statuses))
+	args = append(args, organizationID, TenantPoolBindingFree, tidbCloudNativeProvider)
 	for _, status := range statuses {
 		args = append(args, status)
 	}
@@ -1520,11 +1550,11 @@ func (s *Store) ClaimOldestFreeTenantPoolBinding(ctx context.Context, organizati
 				b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
 			FROM tenant_tidbcloud_org_bindings b
 			JOIN tenants t ON t.id = b.tenant_id
-			WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = 'tidb_cloud_native'
-				AND t.status = ?
-			ORDER BY b.created_at ASC, b.tenant_id ASC
-			LIMIT 1 FOR UPDATE`
-		row := tx.QueryRowContext(ctx, query, organizationID, TenantPoolBindingFree, TenantActive)
+				WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
+					AND t.status = ?
+				ORDER BY b.created_at ASC, b.tenant_id ASC
+				LIMIT 1 FOR UPDATE`
+		row := tx.QueryRowContext(ctx, query, organizationID, TenantPoolBindingFree, tidbCloudNativeProvider, TenantActive)
 		rec, scanErr := scanTenantBindingRow(row)
 		if scanErr != nil {
 			return scanErr
@@ -1683,26 +1713,26 @@ func (s *Store) ListTenantsByTiDBCloudOrganizations(ctx context.Context, organiz
 		limit = 10
 	}
 	placeholders := make([]string, len(organizationIDs))
-	args := make([]any, 0, len(organizationIDs)+2)
+	args := make([]any, 0, len(organizationIDs)+5)
 	for i, id := range organizationIDs {
 		placeholders[i] = "?"
 		args = append(args, id)
 	}
-	args = append(args, limit, offset)
+	args = append(args, tidbCloudNativeProvider, TenantPoolBindingFree, TenantDeleted, limit, offset)
 	query := `SELECT
 			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
 			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
 			b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
-		FROM tenant_tidbcloud_org_bindings b
-		JOIN tenants t ON t.id = b.tenant_id
-		WHERE b.organization_id IN (` + strings.Join(placeholders, ",") + `)
-			AND t.provider = 'tidb_cloud_native'
-			AND b.pool_status <> 'free'
-			AND t.status <> 'deleted'
-		ORDER BY t.created_at DESC, t.id DESC
-		LIMIT ? OFFSET ?`
+			FROM tenant_tidbcloud_org_bindings b
+			JOIN tenants t ON t.id = b.tenant_id
+			WHERE b.organization_id IN (` + strings.Join(placeholders, ",") + `)
+				AND t.provider = ?
+				AND b.pool_status <> ?
+				AND t.status <> ?
+			ORDER BY t.created_at DESC, t.id DESC
+			LIMIT ? OFFSET ?`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -1725,26 +1755,26 @@ func (s *Store) ListTenantsByTiDBCloudOrgClusterBindings(ctx context.Context, bi
 		limit = 10
 	}
 	placeholders := make([]string, 0, len(bindings))
-	args := make([]any, 0, len(bindings)*2+2)
+	args := make([]any, 0, len(bindings)*2+5)
 	for _, binding := range bindings {
 		placeholders = append(placeholders, "(?, ?)")
 		args = append(args, binding.OrganizationID, binding.ClusterID)
 	}
-	args = append(args, limit, offset)
+	args = append(args, tidbCloudNativeProvider, TenantPoolBindingFree, TenantDeleted, limit, offset)
 	query := `SELECT
 			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
 			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
 			b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
-		FROM tenant_tidbcloud_org_bindings b
-		JOIN tenants t ON t.id = b.tenant_id
-		WHERE (b.organization_id, b.cluster_id) IN (` + strings.Join(placeholders, ",") + `)
-			AND t.provider = 'tidb_cloud_native'
-			AND b.pool_status <> 'free'
-			AND t.status <> 'deleted'
-		ORDER BY t.created_at DESC, t.id DESC
-		LIMIT ? OFFSET ?`
+			FROM tenant_tidbcloud_org_bindings b
+			JOIN tenants t ON t.id = b.tenant_id
+			WHERE (b.organization_id, b.cluster_id) IN (` + strings.Join(placeholders, ",") + `)
+				AND t.provider = ?
+				AND b.pool_status <> ?
+				AND t.status <> ?
+			ORDER BY t.created_at DESC, t.id DESC
+			LIMIT ? OFFSET ?`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err

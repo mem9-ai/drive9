@@ -1387,6 +1387,13 @@ func TestNewWithConfigUsesDefaultMaxUploadBytes(t *testing.T) {
 	}
 }
 
+func TestNewWithConfigUsesDefaultTenantPoolMaxSize(t *testing.T) {
+	s := NewWithConfig(Config{})
+	if s.tenantPoolMaxSize != DefaultTenantPoolMaxSize {
+		t.Fatalf("default tenantPoolMaxSize = %d, want %d", s.tenantPoolMaxSize, DefaultTenantPoolMaxSize)
+	}
+}
+
 func TestDeclaredContentLengthOverMaxRejected(t *testing.T) {
 	base, _ := newTestServerWithS3(t)
 	s := NewWithConfig(Config{Backend: base.fallback, MaxUploadBytes: 10})

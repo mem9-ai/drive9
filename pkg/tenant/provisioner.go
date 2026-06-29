@@ -72,6 +72,16 @@ type TenantPoolClusterManager interface {
 	MarkClusterPoolFree(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
 }
 
+type TenantPoolClusterMetadataWaiter interface {
+	Provisioner
+	WaitForPoolClusterMetadata(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) (*ClusterInfo, error)
+}
+
+type TenantPoolClusterMetadataBatchWaiter interface {
+	Provisioner
+	WaitForPoolClustersMetadata(ctx context.Context, clusters []*ClusterInfo, req CredentialProvisionRequest) ([]*ClusterInfo, error)
+}
+
 type CredentialDeprovisioner interface {
 	Provisioner
 	DeprovisionWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
@@ -90,6 +100,7 @@ type QuotaGetter interface {
 
 type QuotaUpdateOptions struct {
 	TiDBCloudSpendingLimitMonthly *int64
+	TenantPoolID                  string
 }
 
 type ManagedClusterListOptions struct {

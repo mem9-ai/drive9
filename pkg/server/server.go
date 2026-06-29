@@ -54,6 +54,10 @@ type Config struct {
 	LocalS3           *s3client.LocalS3Client
 	S3Dir             string
 	MaxUploadBytes    int64
+	// TenantPoolMaxSize caps admin tenant pool create/update target size. Values
+	// <= 0 are normalized to DefaultTenantPoolMaxSize; the pool is never
+	// intentionally uncapped.
+	TenantPoolMaxSize int
 	// InlineThreshold is the server-wide DB-inline vs S3 cutoff surfaced to
 	// clients via /v1/status. When 0, the value is inferred from
 	// cfg.Backend.InlineThreshold() (or omitted in responses if no backend).
@@ -122,6 +126,7 @@ type Server struct {
 	vaultIssuerURL        string
 	publicURL             string
 	maxUploadBytes        int64
+	tenantPoolMaxSize     int
 	inlineThreshold       int64
 	metrics               *serverMetrics
 	logger                *zap.Logger
@@ -140,6 +145,7 @@ type Server struct {
 	forkWorkerClosed      bool
 	tenantPoolLocks       sync.Map
 	tenantPoolCreateLocks sync.Map
+	tenantPoolResumeJobs  sync.Map
 	schemaInitErrors      sync.Map
 	leader                *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
@@ -176,6 +182,10 @@ var (
 // DefaultMaxUploadBytes is the server-wide fallback upload size limit.
 // Keep callers on this exported constant so the default stays consistent.
 const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
+
+// DefaultTenantPoolMaxSize caps admin tenant pools unless overridden by server
+// configuration with a positive value.
+const DefaultTenantPoolMaxSize = 200
 
 // TenantStatusResponse is the JSON body of GET /v1/status. Fields are filled
 // per authenticated tenant so callers can discover their effective limits
@@ -234,6 +244,10 @@ func NewWithConfig(cfg Config) *Server {
 	if inlineThreshold <= 0 {
 		inlineThreshold = backend.DefaultInlineThreshold
 	}
+	tenantPoolMaxSize := cfg.TenantPoolMaxSize
+	if tenantPoolMaxSize <= 0 {
+		tenantPoolMaxSize = DefaultTenantPoolMaxSize
+	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
 		fallback:          cfg.Backend,
@@ -246,6 +260,7 @@ func NewWithConfig(cfg Config) *Server {
 		publicURL:         strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
 		provisioner:       cfg.Provisioner,
 		maxUploadBytes:    maxUpload,
+		tenantPoolMaxSize: tenantPoolMaxSize,
 		inlineThreshold:   inlineThreshold,
 		metrics:           newServerMetrics(),
 		logger:            logger,
@@ -729,6 +744,21 @@ func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 			s.startForkProvision(ctx, t.ID)
 			continue
 		}
+		if t.Provider == tenant.ProviderTiDBCloudNative && t.DBUser == "" {
+			// TiDB Cloud native metadata resume is gated by request-scoped customer credentials.
+			logger.Warn(ctx, "resume_provisioning_native_no_connection",
+				zap.String("tenant_id", t.ID),
+				zap.String("provider", t.Provider),
+				zap.String("cluster_id", t.ClusterID),
+				zap.String("reason", "tidbcloud_credentials_unavailable"))
+			if s.metrics != nil {
+				s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
+					"provider", t.Provider,
+					"result", "skipped",
+					"reason", "tidbcloud_credentials_unavailable")
+			}
+			continue
+		}
 		s.startTenantSchemaInitResume(ctx, t)
 	}
 }
@@ -808,7 +838,43 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 }
 
 func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
+	if t.Provider == tenant.ProviderTiDBCloudNative && strings.TrimSpace(t.ClusterID) != "" && strings.TrimSpace(t.DBUser) == "" {
+		logger.Info(ctx, "resume_pending_pool_tenant_skipped",
+			zap.String("tenant_id", t.ID),
+			zap.String("provider", t.Provider),
+			zap.String("cluster_id", t.ClusterID),
+			zap.String("reason", "tidbcloud_credentials_unavailable"))
+		if s.metrics != nil {
+			s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
+				"provider", t.Provider,
+				"result", "skipped",
+				"reason", "tidbcloud_credentials_unavailable")
+		}
+		return
+	}
 	if !isStalePendingTenant(time.Now().UTC(), t) {
+		return
+	}
+	if pendingTenantConnectionReady(t) {
+		updated, err := s.meta.UpdateTenantStatusIf(ctx, t.ID, meta.TenantPending, meta.TenantProvisioning)
+		if err != nil {
+			logger.Error(ctx, "resume_pending_schema_init_status_update_error",
+				zap.String("tenant_id", t.ID),
+				zap.Error(err))
+			return
+		}
+		if !updated {
+			logger.Info(ctx, "resume_pending_schema_init_skipped",
+				zap.String("tenant_id", t.ID),
+				zap.String("reason", "status_changed"))
+			return
+		}
+		t.Status = meta.TenantProvisioning
+		logger.Info(ctx, "resume_pending_schema_init_started",
+			zap.String("tenant_id", t.ID),
+			zap.String("provider", t.Provider),
+			zap.String("cluster_id", t.ClusterID))
+		s.startTenantSchemaInitResume(ctx, t)
 		return
 	}
 	logger.Warn(ctx, "resume_pending_mark_failed",
@@ -828,6 +894,14 @@ func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
 			zap.String("tenant_id", t.ID),
 			zap.String("reason", "status_changed"))
 	}
+}
+
+func pendingTenantConnectionReady(t meta.Tenant) bool {
+	return strings.TrimSpace(t.DBHost) != "" &&
+		t.DBPort > 0 &&
+		strings.TrimSpace(t.DBUser) != "" &&
+		len(t.DBPasswordCipher) > 0 &&
+		strings.TrimSpace(t.DBName) != ""
 }
 
 func isStalePendingTenant(now time.Time, t meta.Tenant) bool {
