@@ -107,14 +107,16 @@ func (r RunReport) FeishuCard() map[string]any {
 	if len(r.Failed) > 0 {
 		lines = append(lines, fmt.Sprintf("**failed (%d):**", len(r.Failed)))
 		for _, s := range r.Failed {
-			lines = append(lines, fmt.Sprintf("• %s — %s / %s (owner: %s)",
+			lines = append(lines, fmt.Sprintf("• **%s** — <font color='red'>%s</font> / %s (owner: %s)",
 				s.Suite, dash(string(s.FailureClass)), dash(s.ProductPromise), dash(s.OwnerHint)))
 		}
 	}
-	for _, s := range r.PerfRegressed {
-		for _, m := range s.PerfRegressions() {
-			lines = append(lines, fmt.Sprintf("• ⏱ %s %s=%.2f%s (budget %s, baseline %s)",
-				s.Suite, m.Name, m.Value, m.Unit, fmtPtr(m.Budget), fmtPtr(m.Baseline)))
+	if len(r.PerfRegressed) > 0 {
+		lines = append(lines, "**performance regressions:**")
+		for _, s := range r.PerfRegressed {
+			for _, m := range s.PerfRegressions() {
+				lines = append(lines, feishuPerfLine(s.Suite, m))
+			}
 		}
 	}
 
@@ -183,4 +185,33 @@ func fmtPtr(p *float64) string {
 		return "-"
 	}
 	return fmt.Sprintf("%.2f", *p)
+}
+
+// feishuPerfLine renders one regressed metric with rich lark_md emphasis on the
+// numbers an operator acts on: the measured value is bold red, and the deltas
+// against budget and baseline are bold and coloured (worse=red, better=green).
+func feishuPerfLine(suite string, m Metric) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "• ⏱ **%s** · %s = <font color='red'>**%.2f%s**</font>", suite, m.Name, m.Value, m.Unit)
+	if m.Budget != nil {
+		fmt.Fprintf(&b, " — budget %.2f%s%s", *m.Budget, m.Unit, pctDelta(m.Value, *m.Budget))
+	}
+	if m.Baseline != nil {
+		fmt.Fprintf(&b, " · baseline %.2f%s%s", *m.Baseline, m.Unit, pctDelta(m.Value, *m.Baseline))
+	}
+	return b.String()
+}
+
+// pctDelta renders a coloured, bold percentage difference of value vs ref
+// (worse=red with +, better=green). Empty when ref is zero.
+func pctDelta(value, ref float64) string {
+	if ref == 0 {
+		return ""
+	}
+	pct := (value - ref) / ref * 100
+	color, sign := "red", "+"
+	if pct < 0 {
+		color, sign = "green", ""
+	}
+	return fmt.Sprintf(" (<font color='%s'>**%s%.0f%%**</font>)", color, sign, pct)
 }
