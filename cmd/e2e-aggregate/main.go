@@ -70,10 +70,13 @@ func run(manifestPath, outcomesPath, summariesDir, outPath, issueBodyPath, tierO
 	summaries := e2ereport.SynthesizeSummaries(manifest, tier, outcomes, adopted)
 	report := e2ereport.Aggregate(runContextFromEnv(tier), summaries)
 
-	if degraded && report.OverallSuccess {
+	if degraded && report.OverallSuccess && len(report.PerfRegressed) == 0 {
 		// A required step hard-failed before suite outcomes were collected, so the
-		// per-suite view looks clean while the job will fail. Fail closed: inject a
-		// pipeline failure so the run still gets a signature, issue, and notification.
+		// per-suite view is completely empty while the job will fail. Fail closed:
+		// inject a pipeline failure so the run still gets a signature, issue, and
+		// notification. Only when there is no other signal — a perf-only regression
+		// already notifies and must keep its own signature/routing, not be masked
+		// as an infrastructure failure.
 		summaries = append(summaries, e2ereport.SuiteSummary{
 			Suite:          "e2e-pipeline",
 			Status:         e2ereport.StatusFailure,

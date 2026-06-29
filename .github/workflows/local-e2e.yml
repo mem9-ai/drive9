@@ -523,13 +523,12 @@ jobs:
             "pjdfstest-suite": "${{ steps.pjdfstest-suite.outcome }}"
           }
           JSON
-          proof_arg=""
+          args=()
           if [ "${FEISHU_PROOF}" = "1" ]; then
-            proof_arg="--proof-fail-suite e2e-feishu-proof"
+            args+=(--proof-fail-suite e2e-feishu-proof)
           fi
-          degraded_arg=""
           if [ -f /tmp/e2e-degraded ]; then
-            degraded_arg="--degraded"
+            args+=(--degraded)
           fi
           go run ./cmd/e2e-aggregate \
             --manifest e2e/suite-manifest.json \
@@ -537,7 +536,7 @@ jobs:
             --summaries e2e/reports/summary \
             --out /tmp/e2e-report.json \
             --issue-body /tmp/e2e-issue-body.md \
-            $proof_arg $degraded_arg
+            "${args[@]}"
 
       # Push failures/regressions that warrant attention to Feishu/Lark. PR-tier
       # failures stay in GitHub by policy; the notifier no-ops when no Feishu
@@ -641,21 +640,25 @@ jobs:
             --description "Automated: local-e2e scheduled/post-merge run failed" \
             --color D93F0B --force || true
 
-          # Prefer the structured, signature-led body from the aggregator; fall
-          # back to a one-liner if it is missing for any reason.
-          if [ -s /tmp/e2e-issue-body.md ]; then
-            body="$(cat /tmp/e2e-issue-body.md)"
-            body="$body"$'\n\n'"_run: $RUN_URL_"
+          # Prefer the structured, signature-led body from the aggregator; fall back
+          # to a one-liner if it is missing. Use a file (--body-file) so suite names
+          # or failure detail containing shell metacharacters/backticks cannot break
+          # or inject into the gh call.
+          body_file=/tmp/e2e-issue-body.md
+          if [ -s "$body_file" ]; then
+            printf '\n\n_run: %s_\n' "$RUN_URL" >> "$body_file"
           else
-            body="local-e2e \`$EVENT_NAME\` run failed on \`main\` at $SHA: $RUN_URL"
+            printf 'local-e2e `%s` run failed on `main` at %s: %s\n' "$EVENT_NAME" "$SHA" "$RUN_URL" > "$body_file"
           fi
 
-          # Group recurring failures by signature: an open issue carrying the same
-          # signature is reused; a new signature opens its own tracking issue. With
-          # no signature we keep the legacy single-issue behaviour.
+          # Group recurring failures by signature. GitHub's `in:title` search is
+          # fuzzy, so narrow with it but confirm an exact "[sig: <signature>]"
+          # marker client-side with jq; a new signature opens its own tracking
+          # issue. With no signature we keep the legacy single-issue behaviour.
           if [ -n "$SIGNATURE" ]; then
             existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
-              --search "in:title $SIGNATURE" --json number --jq '.[0].number // empty')"
+              --search "in:title $SIGNATURE" --json number,title \
+              --jq "[.[] | select(.title | contains(\"[sig: $SIGNATURE]\"))][0].number // empty")"
             title="local-e2e failure on main [sig: $SIGNATURE]"
           else
             existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
@@ -664,8 +667,8 @@ jobs:
           fi
 
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$REPO" --body "$body"
+            gh issue comment "$existing" --repo "$REPO" --body-file "$body_file"
           else
             gh issue create --repo "$REPO" --label ci-e2e-failure \
-              --title "$title" --body "$body"
+              --title "$title" --body-file "$body_file"
           fi
