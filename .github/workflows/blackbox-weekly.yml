@@ -98,5 +98,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: blackbox-weekly-community
-          path: blackbox/work/**/results/**
+          path: |
+            blackbox/work/**/results/report.md
+            blackbox/work/**/results/suite-report.json
+            blackbox/work/**/results/manifest.json
+            blackbox/work/**/results/events.jsonl
+            blackbox/work/**/results/artifacts/**/report.md
+            blackbox/work/**/results/artifacts/**/report.json
+            blackbox/work/**/results/logs/**
+            blackbox/work/**/results/mount-logs/**
           if-no-files-found: warn
