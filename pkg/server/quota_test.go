@@ -1494,6 +1494,13 @@ func TestAdminTenantPoolCreatePersistsClustersWhenMetadataWaitFails(t *testing.T
 	if got := rt.prov.deprovisionCalls.Load(); got != 0 {
 		t.Fatalf("deprovision calls = %d, want 0", got)
 	}
+	deadline := time.Now().Add(5 * time.Second)
+	for rt.prov.metadataWaitCalls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := rt.prov.metadataWaitCalls.Load(); got < 2 {
+		t.Fatalf("metadata wait calls = %d, want at least 2", got)
+	}
 }
 
 func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneOrganizationMissing(t *testing.T) {

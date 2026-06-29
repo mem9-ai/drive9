@@ -270,8 +270,12 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 }
 
 func (s *Server) validateTenantPoolSize(size int) error {
-	if s.tenantPoolMaxSize > 0 && size > s.tenantPoolMaxSize {
-		return fmt.Errorf("pool_size must be less than or equal to %d", s.tenantPoolMaxSize)
+	maxSize := s.tenantPoolMaxSize
+	if maxSize <= 0 {
+		maxSize = DefaultTenantPoolMaxSize
+	}
+	if size > maxSize {
+		return fmt.Errorf("pool_size must be less than or equal to %d", maxSize)
 	}
 	return nil
 }
@@ -580,6 +584,9 @@ func (s *Server) startPoolClusterMetadataResume(ctx context.Context, cluster *te
 	}
 	clusterCopy := *cluster
 	s.startServerWorker(ctx, func(workerCtx context.Context) {
+		workerCtx, cancel := context.WithTimeout(workerCtx, 10*time.Minute)
+		defer cancel()
+
 		started := time.Now()
 		updated, err := waiter.WaitForPoolClusterMetadata(workerCtx, &clusterCopy, cred)
 		if err != nil {
