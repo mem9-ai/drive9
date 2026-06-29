@@ -409,23 +409,46 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 	}()
 	results := make([]*provisionTenantResult, 0, len(clusters))
 	persistedTenants := make(map[string]struct{}, len(clusters))
+	discardedTenants := make(map[string]struct{}, len(clusters))
 	cloudProvider, region := provisioningCloudRegion(s.provisioner)
+	poolOrgID := ""
 	for _, cluster := range clusters {
 		if cluster == nil {
 			continue
 		}
-		if strings.TrimSpace(cluster.TenantID) == "" {
+		tenantID := strings.TrimSpace(cluster.TenantID)
+		if tenantID == "" {
 			cleanupOnError = true
 			return nil, fmt.Errorf("tidbcloud tenant id label is missing")
 		}
-		if strings.TrimSpace(cluster.OrganizationID) == "" {
-			cleanupOnError = true
-			return nil, fmt.Errorf("tidbcloud organization label is missing")
+		orgID := strings.TrimSpace(cluster.OrganizationID)
+		if orgID == "" {
+			if poolOrgID == "" {
+				pool, lookupErr := s.meta.GetTenantPoolByID(ctx, poolID)
+				if lookupErr != nil && !errors.Is(lookupErr, meta.ErrNotFound) {
+					cleanupOnError = true
+					return nil, lookupErr
+				}
+				if pool != nil {
+					poolOrgID = strings.TrimSpace(pool.OrganizationID)
+				}
+			}
+			orgID = poolOrgID
 		}
-		persistedTenants[strings.TrimSpace(cluster.TenantID)] = struct{}{}
+		if orgID == "" {
+			logger.Warn(ctx, "admin_tenant_pool_cluster_org_missing",
+				zap.String("pool_id", poolID),
+				zap.String("tenant_id", tenantID),
+				zap.String("cluster_id", cluster.ClusterID))
+			s.cleanupPoolProvisionedClusters(ctx, []*tenant.ClusterInfo{cluster}, cred, []string{tenantID}, "cluster_org_missing")
+			discardedTenants[tenantID] = struct{}{}
+			continue
+		}
+		cluster.OrganizationID = orgID
+		persistedTenants[tenantID] = struct{}{}
 		if err := s.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
-			TenantID:       cluster.TenantID,
-			OrganizationID: cluster.OrganizationID,
+			TenantID:       tenantID,
+			OrganizationID: orgID,
 			ClusterID:      cluster.ClusterID,
 			PoolID:         poolID,
 			PoolStatus:     meta.TenantPoolBindingFree,
@@ -439,17 +462,17 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 			cleanupOnError = true
 			return nil, err
 		}
-		if err := s.meta.UpdateTenantStatus(ctx, cluster.TenantID, meta.TenantProvisioning); err != nil {
+		if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); err != nil {
 			cleanupOnError = true
 			return nil, err
 		}
 		res := &provisionTenantResult{
-			TenantID:       cluster.TenantID,
+			TenantID:       tenantID,
 			Status:         meta.TenantProvisioning,
 			Provider:       provider,
 			CloudProvider:  cloudProvider,
 			Region:         region,
-			OrganizationID: strings.TrimSpace(cluster.OrganizationID),
+			OrganizationID: orgID,
 		}
 		if poolClusterConnectionReady(cluster) {
 			res.TenantDSN = tenantDSN(cluster.Username, cluster.Password, cluster.Host, cluster.Port, cluster.DBName, true, provider)
@@ -462,7 +485,14 @@ func (s *Server) createFreePoolTenants(ctx context.Context, poolID string, count
 		if _, ok := persistedTenants[tenantID]; ok {
 			continue
 		}
+		if _, ok := discardedTenants[tenantID]; ok {
+			continue
+		}
 		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
+	}
+	if len(clusters) > 0 && len(results) == 0 {
+		cleanupOnError = false
+		return nil, fmt.Errorf("no tenant pool clusters could be persisted")
 	}
 	cleanupOnError = false
 	return results, nil

@@ -51,6 +51,7 @@ type quotaTestProvisioner struct {
 	batchPoolErr           error
 	batchPoolReady         bool
 	batchPoolEmptyPassword bool
+	batchPoolMissingOrg    map[int]bool
 	metadataWaitCalls      atomic.Int32
 	metadataWaitErr        error
 	calls                  []string
@@ -182,6 +183,9 @@ func (p *quotaTestProvisioner) BatchProvisionFreeClustersWithCredentialsAndQuota
 			DBName:         "tidbcloud_fs",
 			Provider:       tenant.ProviderTiDBCloudNative,
 		})
+		if p.batchPoolMissingOrg[i] {
+			out[len(out)-1].OrganizationID = ""
+		}
 		if p.batchPoolReady {
 			out[len(out)-1].Host = "db.example.com"
 			out[len(out)-1].Port = 4000
@@ -1485,6 +1489,54 @@ func TestAdminTenantPoolCreatePersistsClustersWhenMetadataWaitFails(t *testing.T
 	}
 	if got := rt.prov.deprovisionCalls.Load(); got != 0 {
 		t.Fatalf("deprovision calls = %d, want 0", got)
+	}
+}
+
+func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneOrganizationMissing(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{{}}
+	rt.prov.batchPoolErr = errors.New("tidbcloud native cluster get status 429")
+	rt.prov.batchPoolMissingOrg = map[int]bool{1: true}
+	rt.prov.metadataWaitErr = errors.New("metadata still unavailable")
+	ts := httptest.NewServer(rt.server)
+	t.Cleanup(ts.Close)
+
+	resp := postJSON(t, ts.URL+"/v1/admin/tenant-pool", map[string]any{
+		"public_key":  "public-1",
+		"private_key": "private-1",
+		"pool_size":   2,
+	}, "")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusAccepted {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d body=%s", resp.StatusCode, body)
+	}
+	var out adminTenantPoolResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 1 {
+		t.Fatalf("pool response = %#v", out)
+	}
+	pool, err := rt.meta.GetTenantPoolByOrganization(context.Background(), "org-1")
+	if err != nil {
+		t.Fatalf("get pool: %v", err)
+	}
+	if pool.PoolID != out.PoolID {
+		t.Fatalf("stored pool id = %q, want %q", pool.PoolID, out.PoolID)
+	}
+	rows, err := rt.meta.ListFreeTenantPoolBindings(context.Background(), "org-1", false, 10)
+	if err != nil {
+		t.Fatalf("list free bindings: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("free bindings = %d, want 1", len(rows))
+	}
+	if got := rt.prov.deprovisionCalls.Load(); got != 1 {
+		t.Fatalf("deprovision calls = %d, want 1", got)
+	}
+	if rt.prov.lastDeprovision == nil || rt.prov.lastDeprovision.ClusterID != "pool-cluster-2" {
+		t.Fatalf("last deprovision = %#v, want pool-cluster-2", rt.prov.lastDeprovision)
 	}
 }
 
