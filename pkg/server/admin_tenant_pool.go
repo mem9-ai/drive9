@@ -101,74 +101,80 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 	createLock := s.tenantPoolCreateLock(cred)
 	createLock.Lock()
 	defer createLock.Unlock()
-	orgID, err := s.firstManagedOrganization(r.Context(), cred)
-	if err != nil {
-		writeAdminTiDBCloudError(w, r.Context(), err, "create tenant pool")
-		return
-	}
-	if orgID != "" {
-		if _, err := s.meta.GetTenantPoolByOrganization(r.Context(), orgID); err == nil {
-			errJSON(w, http.StatusConflict, "tenant pool already exists for organization")
-			return
-		} else if !errors.Is(err, meta.ErrNotFound) {
-			errJSON(w, http.StatusInternalServerError, "tenant pool lookup failed")
-			return
+	if err := s.meta.WithTenantPoolLock(r.Context(), tenantPoolCreateDatabaseLockKey(cred), func(ctx context.Context) error {
+		orgID, err := s.firstManagedOrganization(ctx, cred)
+		if err != nil {
+			writeAdminTiDBCloudError(w, ctx, err, "create tenant pool")
+			return nil
 		}
-	}
-	poolID := token.NewID()
-	now := time.Now().UTC()
-	if err := s.meta.CreateTenantPool(r.Context(), &meta.TenantPool{
-		PoolID:         poolID,
-		OrganizationID: orgID,
-		Size:           *req.PoolSize,
-		Status:         meta.TenantPoolActive,
-		CreatedAt:      now,
-		UpdatedAt:      now,
-	}); err != nil {
-		if errors.Is(err, meta.ErrDuplicate) {
-			errJSON(w, http.StatusConflict, "tenant pool already exists for organization")
-			return
-		}
-		errJSON(w, http.StatusInternalServerError, "failed to persist tenant pool")
-		return
-	}
-	results, err := s.createFreePoolTenants(r.Context(), poolID, *req.PoolSize, cred, nil)
-	if err != nil {
-		s.deleteTenantPoolMetadata(r.Context(), poolID, "create_free_tenants_error")
-		errJSON(w, http.StatusBadGateway, fmt.Sprintf("create tenant pool failed: %v", err))
-		return
-	}
-	if orgID == "" {
-		orgID = firstResultOrganizationID(results)
 		if orgID != "" {
-			if err := s.meta.UpdateTenantPoolOrganization(r.Context(), poolID, orgID); err != nil {
-				s.cleanupCreatedPoolTenants(r.Context(), results, cred, "update_pool_org_error")
-				s.deleteTenantPoolMetadata(r.Context(), poolID, "update_pool_org_error")
-				if errors.Is(err, meta.ErrDuplicate) {
-					errJSON(w, http.StatusConflict, "tenant pool already exists for organization")
-					return
-				}
-				errJSON(w, http.StatusInternalServerError, "failed to update tenant pool organization")
-				return
+			if _, err := s.meta.GetTenantPoolByOrganization(ctx, orgID); err == nil {
+				errJSON(w, http.StatusConflict, "tenant pool already exists for organization")
+				return nil
+			} else if !errors.Is(err, meta.ErrNotFound) {
+				errJSON(w, http.StatusInternalServerError, "tenant pool lookup failed")
+				return nil
 			}
 		}
-	}
-	for _, res := range results {
-		s.startProvisionedTenantSchemaInit(r.Context(), res)
-	}
-	freeSize := 0
-	if orgID != "" {
-		if n, err := s.meta.CountFreeTenantPoolBindings(r.Context(), orgID); err == nil {
-			freeSize = n
+		poolID := token.NewID()
+		now := time.Now().UTC()
+		if err := s.meta.CreateTenantPool(ctx, &meta.TenantPool{
+			PoolID:         poolID,
+			OrganizationID: orgID,
+			Size:           *req.PoolSize,
+			Status:         meta.TenantPoolActive,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}); err != nil {
+			if errors.Is(err, meta.ErrDuplicate) {
+				errJSON(w, http.StatusConflict, "tenant pool already exists for organization")
+				return nil
+			}
+			errJSON(w, http.StatusInternalServerError, "failed to persist tenant pool")
+			return nil
 		}
+		results, err := s.createFreePoolTenants(ctx, poolID, *req.PoolSize, cred, nil)
+		if err != nil {
+			s.deleteTenantPoolMetadata(ctx, poolID, "create_free_tenants_error")
+			errJSON(w, http.StatusBadGateway, fmt.Sprintf("create tenant pool failed: %v", err))
+			return nil
+		}
+		if orgID == "" {
+			orgID = firstResultOrganizationID(results)
+			if orgID != "" {
+				if err := s.meta.UpdateTenantPoolOrganization(ctx, poolID, orgID); err != nil {
+					s.cleanupCreatedPoolTenants(ctx, results, cred, "update_pool_org_error")
+					s.deleteTenantPoolMetadata(ctx, poolID, "update_pool_org_error")
+					if errors.Is(err, meta.ErrDuplicate) {
+						errJSON(w, http.StatusConflict, "tenant pool already exists for organization")
+						return nil
+					}
+					errJSON(w, http.StatusInternalServerError, "failed to update tenant pool organization")
+					return nil
+				}
+			}
+		}
+		for _, res := range results {
+			s.startProvisionedTenantSchemaInit(ctx, res)
+		}
+		freeSize := 0
+		if orgID != "" {
+			if n, err := s.meta.CountFreeTenantPoolBindings(ctx, orgID); err == nil {
+				freeSize = n
+			}
+		}
+		writeJSON(w, http.StatusAccepted, adminTenantPoolResponse{
+			PoolID:         poolID,
+			OrganizationID: orgID,
+			PoolSize:       *req.PoolSize,
+			FreeSize:       freeSize,
+			Status:         string(meta.TenantPoolActive),
+		})
+		return nil
+	}); err != nil {
+		writeAdminTenantPoolError(w, err)
+		return
 	}
-	writeJSON(w, http.StatusAccepted, adminTenantPoolResponse{
-		PoolID:         poolID,
-		OrganizationID: orgID,
-		PoolSize:       *req.PoolSize,
-		FreeSize:       freeSize,
-		Status:         string(meta.TenantPoolActive),
-	})
 }
 
 func (s *Server) handleAdminTenantPoolGet(w http.ResponseWriter, r *http.Request) {
@@ -1040,6 +1046,14 @@ func (s *Server) tenantPoolCreateLock(cred tenant.CredentialProvisionRequest) *s
 	// first-create path before the org id is discoverable from managed clusters.
 	v, _ := s.tenantPoolCreateLocks.LoadOrStore(key, &sync.Mutex{})
 	return v.(*sync.Mutex)
+}
+
+func tenantPoolCreateDatabaseLockKey(cred tenant.CredentialProvisionRequest) string {
+	key := strings.TrimSpace(cred.PublicKey)
+	if key == "" {
+		return ""
+	}
+	return "create:" + key
 }
 
 func (s *Server) claimAdminTenantFromPool(ctx context.Context, cred tenant.CredentialProvisionRequest, quotaOpt *quotaRequest) (*provisionTenantResult, *meta.TenantPool, bool, error) {
