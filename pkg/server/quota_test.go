@@ -1858,9 +1858,11 @@ func TestProvisionClaimsFreePoolTenant(t *testing.T) {
 
 	ts := httptest.NewServer(rt.server)
 	t.Cleanup(ts.Close)
+	maxStorageSize := int64(100)
 	resp := postJSON(t, ts.URL+"/v1/provision", map[string]any{
 		"public_key":               "public-1",
 		"private_key":              "private-1",
+		"max_storage_size":         maxStorageSize,
 		"tidbcloud_spending_limit": 123,
 	}, "")
 	defer func() { _ = resp.Body.Close() }()
@@ -1873,19 +1875,26 @@ func TestProvisionClaimsFreePoolTenant(t *testing.T) {
 		t.Fatalf("decode response: %v", err)
 	}
 	if out["tenant_id"] != tenantID || out["api_key"] == "" || out["status"] != string(meta.TenantActive) {
-		t.Fatalf("provision response = %#v", out)
+		t.Errorf("provision response = %#v", out)
 	}
 	if got := rt.prov.markPoolUsedCalls.Load(); got != 1 {
-		t.Fatalf("mark pool used calls = %d, want 1", got)
+		t.Errorf("mark pool used calls = %d, want 1", got)
 	}
 	if rt.prov.batchPoolCalls.Load() != 0 {
-		t.Fatalf("batch pool calls = %d, want 0", rt.prov.batchPoolCalls.Load())
+		t.Errorf("batch pool calls = %d, want 0", rt.prov.batchPoolCalls.Load())
 	}
 	if rt.prov.lastCluster == nil || rt.prov.lastCluster.ClusterID != "cluster-free-1" {
-		t.Fatalf("last cluster = %#v", rt.prov.lastCluster)
+		t.Errorf("last cluster = %#v", rt.prov.lastCluster)
 	}
 	if rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly == nil || *rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly != 123 {
-		t.Fatalf("last spending limit = %#v", rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly)
+		t.Errorf("last spending limit = %#v", rt.prov.lastOptions.TiDBCloudSpendingLimitMonthly)
+	}
+	quotaCfg, err := rt.meta.GetQuotaConfig(ctx, tenantID)
+	if err != nil {
+		t.Fatalf("get quota config: %v", err)
+	}
+	if quotaCfg.MaxStorageBytes != maxStorageSize*quotaStorageSizeBytes {
+		t.Errorf("quota max storage = %d, want %d", quotaCfg.MaxStorageBytes, maxStorageSize*quotaStorageSizeBytes)
 	}
 	binding, err := rt.meta.GetTenantTiDBCloudOrgBinding(ctx, tenantID)
 	if err != nil {

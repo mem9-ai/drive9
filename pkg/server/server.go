@@ -3909,7 +3909,6 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		credentialReq = decoded.Credential
 		quotaReq = decoded.Quota
 		if quotaReq != nil {
-			quotaReq.TenantID = "pending"
 			if err := s.validateQuotaSetRequest(*quotaReq); err != nil {
 				errJSON(w, http.StatusBadRequest, err.Error())
 				return
@@ -3928,7 +3927,8 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_started", "provider", provider, "quota_requested", quotaReq != nil)...)
 		if res, pool, claimed, err := s.claimAdminTenantFromPool(r.Context(), *credentialReq, quotaReq); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_failed", "provider", provider, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
-			errJSON(w, http.StatusBadGateway, fmt.Sprintf("claim tenant pool tenant failed: %v", err))
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", provisionTenantPoolClaimMetricResult(err))
+			errJSON(w, http.StatusBadGateway, "claim tenant pool tenant failed")
 			return
 		} else if claimed {
 			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
@@ -3937,6 +3937,10 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 				s.startProvisionedTenantSchemaInit(r.Context(), res)
 			}
 			s.replenishTenantPoolAsync(r.Context(), pool, *credentialReq)
+			if quotaReq != nil && quotaReq.TiDBCloudSpendingLimit != nil {
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
+			}
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "accepted")
 			writeProvisionTenantAccepted(w, res)
 			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_create_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted))...)
 			return
@@ -3961,6 +3965,13 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
 	writeProvisionTenantAccepted(w, res)
+}
+
+func provisionTenantPoolClaimMetricResult(err error) string {
+	if errors.Is(err, tenant.ErrQuotaPermissionDenied) || errors.Is(err, tenant.ErrQuotaBackendNotFound) {
+		return "cluster_error"
+	}
+	return "error"
 }
 
 func writeProvisionTenantAccepted(w http.ResponseWriter, res *provisionTenantResult) {
