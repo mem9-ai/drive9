@@ -26,11 +26,11 @@ type adminTenantPoolRequest struct {
 }
 
 type adminTenantPoolResponse struct {
-	PoolID         string `json:"pool_id"`
-	OrganizationID string `json:"organization_id,omitempty"`
-	PoolSize       int    `json:"pool_size"`
-	FreeSize       int    `json:"free_size"`
-	Status         string `json:"status"`
+	PoolID         string                `json:"pool_id"`
+	OrganizationID string                `json:"organization_id,omitempty"`
+	PoolSize       int                   `json:"pool_size"`
+	FreeSize       int                   `json:"free_size"`
+	Status         adminTenantPoolStatus `json:"status"`
 }
 
 type adminTenantPoolHTTPError struct {
@@ -42,10 +42,11 @@ type tenantPoolResumeJob struct {
 	rerun atomic.Bool
 }
 
-const (
-	adminTenantPoolStatusCreating   = "creating"
-	adminTenantPoolMetricsComponent = "admin_tenant_pool"
-)
+type adminTenantPoolStatus string
+
+const adminTenantPoolStatusCreating adminTenantPoolStatus = "creating"
+
+const adminTenantPoolMetricsComponent = "admin_tenant_pool"
 
 func (e *adminTenantPoolHTTPError) Error() string {
 	return e.message
@@ -223,13 +224,15 @@ func (s *Server) handleAdminTenantPoolCreate(w http.ResponseWriter, r *http.Requ
 			s.startProvisionedTenantSchemaInit(ctx, res)
 		}
 		freeSize := 0
-		slotSize := 0
+		slotSize := len(results)
 		if orgID != "" {
 			if n, err := s.meta.CountFreeTenantPoolBindings(ctx, orgID); err == nil {
 				freeSize = n
-			}
-			if n, err := s.meta.CountTenantPoolFreeSlots(ctx, orgID); err == nil {
-				slotSize = n
+			} else {
+				logger.Warn(ctx, "admin_tenant_pool_create_free_size_lookup_failed",
+					zap.String("pool_id", poolID),
+					zap.String("organization_id", orgID),
+					zap.Error(err))
 			}
 		}
 		writeJSON(w, http.StatusAccepted, adminTenantPoolResponse{
@@ -267,8 +270,13 @@ func (s *Server) handleAdminTenantPoolGet(w http.ResponseWriter, r *http.Request
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pool, freeSize, slotSize, ok := s.authorizedTenantPool(w, r, cred)
+	pool, ok := s.authorizedTenantPool(w, r, cred)
 	if !ok {
+		return
+	}
+	freeSize, slotSize, err := s.tenantPoolSizes(r.Context(), pool.OrganizationID)
+	if err != nil {
+		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, adminTenantPoolResponse{
@@ -303,7 +311,7 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pool, initialFreeSize, initialSlotSize, ok := s.authorizedTenantPool(w, r, cred)
+	pool, ok := s.authorizedTenantPool(w, r, cred)
 	if !ok {
 		return
 	}
@@ -318,8 +326,6 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 		"organization_id", pool.OrganizationID,
 		"current_pool_size", pool.Size,
 		"target_pool_size", *req.PoolSize,
-		"free_size", initialFreeSize,
-		"slot_size", initialSlotSize,
 		"pool_status", pool.Status)...)
 	lock := s.tenantPoolLock(pool.PoolID)
 	lock.Lock()
@@ -377,9 +383,6 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 				"grow_count", growCount,
 				"created_count", len(results),
 				"duration_ms", durationMillis(stageStarted))...)
-			if freeSize, err = s.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID); err != nil {
-				return adminTenantPoolError(http.StatusInternalServerError, "tenant pool free size lookup failed")
-			}
 		} else if targetSize < slotSize {
 			stageStarted := time.Now()
 			shrinkCount := slotSize - targetSize
@@ -420,9 +423,6 @@ func (s *Server) handleAdminTenantPoolUpdate(w http.ResponseWriter, r *http.Requ
 				"shrink_count", shrinkCount,
 				"deleted_count", deleted,
 				"duration_ms", durationMillis(stageStarted))...)
-			if freeSize, err = s.meta.CountFreeTenantPoolBindings(ctx, pool.OrganizationID); err != nil {
-				return adminTenantPoolError(http.StatusInternalServerError, "tenant pool free size lookup failed")
-			}
 		} else {
 			logger.Info(ctx, "server_event", eventFields(ctx, "admin_tenant_pool_update_noop",
 				"provider", tenant.ProviderTiDBCloudNative,
@@ -492,11 +492,11 @@ func (s *Server) validateTenantPoolSize(size int) error {
 	return nil
 }
 
-func adminTenantPoolDisplayStatus(status meta.TenantPoolStatus, freeSize, slotSize int) string {
+func adminTenantPoolDisplayStatus(status meta.TenantPoolStatus, freeSize, slotSize int) adminTenantPoolStatus {
 	if status == meta.TenantPoolActive && freeSize == 0 && slotSize > 0 {
 		return adminTenantPoolStatusCreating
 	}
-	return string(status)
+	return adminTenantPoolStatus(status)
 }
 
 func adminTenantPoolMetricResult(err error) string {
@@ -524,7 +524,7 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 		errJSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	pool, _, _, ok := s.authorizedTenantPool(w, r, cred)
+	pool, ok := s.authorizedTenantPool(w, r, cred)
 	if !ok {
 		return
 	}
@@ -584,7 +584,7 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 			OrganizationID: pool.OrganizationID,
 			PoolSize:       pool.Size,
 			FreeSize:       0,
-			Status:         string(meta.TenantPoolDeleting),
+			Status:         adminTenantPoolStatus(meta.TenantPoolDeleting),
 		}
 		return nil
 	}); err != nil {
@@ -609,36 +609,38 @@ func (s *Server) handleAdminTenantPoolDelete(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusAccepted, out)
 }
 
-func (s *Server) authorizedTenantPool(w http.ResponseWriter, r *http.Request, cred tenant.CredentialProvisionRequest) (*meta.TenantPool, int, int, bool) {
+func (s *Server) authorizedTenantPool(w http.ResponseWriter, r *http.Request, cred tenant.CredentialProvisionRequest) (*meta.TenantPool, bool) {
 	orgID, err := s.firstManagedOrganization(r.Context(), cred)
 	if err != nil {
 		writeAdminTiDBCloudError(w, r.Context(), err, "authorize tenant pool")
-		return nil, 0, 0, false
+		return nil, false
 	}
 	if orgID == "" {
 		errJSON(w, http.StatusNotFound, "tenant pool not found")
-		return nil, 0, 0, false
+		return nil, false
 	}
 	pool, err := s.meta.GetTenantPoolByOrganization(r.Context(), orgID)
 	if err != nil {
 		if errors.Is(err, meta.ErrNotFound) {
 			errJSON(w, http.StatusNotFound, "tenant pool not found")
-			return nil, 0, 0, false
+			return nil, false
 		}
 		errJSON(w, http.StatusInternalServerError, "tenant pool lookup failed")
-		return nil, 0, 0, false
+		return nil, false
 	}
-	freeSize, err := s.meta.CountFreeTenantPoolBindings(r.Context(), orgID)
+	return pool, true
+}
+
+func (s *Server) tenantPoolSizes(ctx context.Context, organizationID string) (int, int, error) {
+	freeSize, err := s.meta.CountFreeTenantPoolBindings(ctx, organizationID)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "tenant pool free size lookup failed")
-		return nil, 0, 0, false
+		return 0, 0, fmt.Errorf("tenant pool free size lookup failed")
 	}
-	slotSize, err := s.meta.CountTenantPoolFreeSlots(r.Context(), orgID)
+	slotSize, err := s.meta.CountTenantPoolFreeSlots(ctx, organizationID)
 	if err != nil {
-		errJSON(w, http.StatusInternalServerError, "tenant pool slot size lookup failed")
-		return nil, 0, 0, false
+		return 0, 0, fmt.Errorf("tenant pool slot size lookup failed")
 	}
-	return pool, freeSize, slotSize, true
+	return freeSize, slotSize, nil
 }
 
 func (s *Server) firstManagedOrganization(ctx context.Context, cred tenant.CredentialProvisionRequest) (string, error) {
