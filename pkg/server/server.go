@@ -145,6 +145,7 @@ type Server struct {
 	forkWorkerClosed      bool
 	tenantPoolLocks       sync.Map
 	tenantPoolCreateLocks sync.Map
+	tenantPoolResumeJobs  sync.Map
 	schemaInitErrors      sync.Map
 	leader                *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
@@ -744,52 +745,15 @@ func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 			continue
 		}
 		if t.Provider == tenant.ProviderTiDBCloudNative && t.DBUser == "" {
-			s.resumeNativeProvisioningWithoutConnection(ctx, t)
+			logger.Warn(ctx, "resume_provisioning_native_no_connection",
+				zap.String("tenant_id", t.ID),
+				zap.String("provider", t.Provider),
+				zap.String("cluster_id", t.ClusterID),
+				zap.String("reason", "tidbcloud_credentials_unavailable"))
 			continue
 		}
 		s.startTenantSchemaInitResume(ctx, t)
 	}
-}
-
-func (s *Server) resumeNativeProvisioningWithoutConnection(ctx context.Context, t meta.Tenant) {
-	logFields := []zap.Field{
-		zap.String("tenant_id", t.ID),
-		zap.String("provider", t.Provider),
-		zap.String("cluster_id", t.ClusterID),
-	}
-	markFailed := func(fields []zap.Field) {
-		if err := s.meta.UpdateTenantStatus(ctx, t.ID, meta.TenantFailed); err != nil {
-			logger.Error(ctx, "resume_provisioning_native_mark_failed", append(fields, zap.Error(err))...)
-		}
-	}
-	if strings.TrimSpace(t.ClusterID) == "" {
-		logger.Warn(ctx, "resume_provisioning_native_no_cluster", logFields...)
-		markFailed(logFields)
-		return
-	}
-	plain, err := s.pool.Decrypt(ctx, t.DBPasswordCipher)
-	if err != nil || strings.TrimSpace(string(plain)) == "" {
-		fields := append(logFields, zap.Error(err))
-		logger.Warn(ctx, "resume_provisioning_native_no_password", fields...)
-		markFailed(fields)
-		return
-	}
-	defaultReq := resolveDefaultCredentials(s.provisioner)
-	if defaultReq == nil {
-		logger.Warn(ctx, "resume_provisioning_native_no_credentials", logFields...)
-		markFailed(logFields)
-		return
-	}
-	cluster := &tenant.ClusterInfo{
-		TenantID:  t.ID,
-		ClusterID: t.ClusterID,
-		Password:  string(plain),
-		DBName:    t.DBName,
-		Provider:  t.Provider,
-	}
-	logger.Info(ctx, "resume_provisioning_native_metadata",
-		append(logFields, zap.String("db_name", t.DBName))...)
-	s.startPoolClusterMetadataResume(ctx, cluster, *defaultReq)
 }
 
 // resumeDeletingForkTenantsWithCtx resumes cleanup for deleting/failed fork tenants.
@@ -867,6 +831,14 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 }
 
 func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
+	if t.Provider == tenant.ProviderTiDBCloudNative && strings.TrimSpace(t.ClusterID) != "" {
+		logger.Info(ctx, "resume_pending_pool_tenant_skipped",
+			zap.String("tenant_id", t.ID),
+			zap.String("provider", t.Provider),
+			zap.String("cluster_id", t.ClusterID),
+			zap.String("reason", "tidbcloud_credentials_unavailable"))
+		return
+	}
 	if !isStalePendingTenant(time.Now().UTC(), t) {
 		return
 	}

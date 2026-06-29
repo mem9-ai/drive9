@@ -386,15 +386,9 @@ func TestBatchProvisionFreeClustersUsesBatchCreateAndFreeLabel(t *testing.T) {
 	}
 }
 
-func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFails(t *testing.T) {
-	origPoll := tidbCloudNativeBatchMetadataPollInterval
-	tidbCloudNativeBatchMetadataPollInterval = time.Millisecond
-	t.Cleanup(func() { tidbCloudNativeBatchMetadataPollInterval = origPoll })
-
+func TestBatchProvisionFreeClustersReturnsCreatedClustersWithoutMetadataWait(t *testing.T) {
 	var listCalls atomic.Int32
 	handlerErrs := make(chan error, 2)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") == "" {
 			w.Header().Set("WWW-Authenticate", `Digest realm="tidbcloud", nonce="nonce-1", qop="auth"`)
@@ -422,22 +416,8 @@ func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFail
 			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters":
 			listCalls.Add(1)
-			if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `clusterId = "cluster-2"`) || !strings.Contains(filter, Drive9ManagedLabel) {
-				handlerErrs <- fmt.Errorf("unexpected list filter %q", filter)
-				http.Error(w, "unexpected filter", http.StatusBadRequest)
-				return
-			}
-			cancel()
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"clusters": []map[string]any{
-					{
-						"clusterId":  "cluster-2",
-						"state":      "CREATING",
-						"labels":     map[string]string{TiDBCloudOrganizationLabel: "org-1", Drive9TenantIDLabel: "tenant-2"},
-						"userPrefix": "u2",
-					},
-				},
-			})
+			handlerErrs <- fmt.Errorf("unexpected metadata wait request %q", r.URL.String())
+			http.Error(w, "unexpected metadata wait", http.StatusInternalServerError)
 		default:
 			handlerErrs <- fmt.Errorf("unexpected request %s %s", r.Method, r.URL.String())
 			http.Error(w, "unexpected request", http.StatusInternalServerError)
@@ -452,29 +432,32 @@ func TestBatchProvisionFreeClustersReturnsAllCreatedClustersWhenMetadataWaitFail
 		defaultDatabaseName: DefaultDatabaseName,
 		client:              ts.Client(),
 	}
-	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(ctx, []string{"tenant-1", "tenant-2"}, tenant.CredentialProvisionRequest{
+	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1", "tenant-2"}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
 	}, tenant.QuotaUpdateOptions{})
-	if err == nil {
-		t.Fatal("BatchProvisionFreeClustersWithCredentialsAndQuota error = nil, want metadata wait error")
+	if err != nil {
+		t.Fatalf("BatchProvisionFreeClustersWithCredentialsAndQuota: %v", err)
 	}
 	assertNoHandlerError(t, handlerErrs)
-	if listCalls.Load() == 0 {
-		t.Fatal("cluster metadata list was not called")
+	if listCalls.Load() != 0 {
+		t.Fatalf("metadata list calls = %d, want 0", listCalls.Load())
 	}
 	if len(out) != 2 {
-		t.Fatalf("clusters = %d, want 2 fallback clusters for cleanup: %#v", len(out), out)
+		t.Fatalf("clusters = %d, want 2: %#v", len(out), out)
 	}
 	if out[0].TenantID != "tenant-1" || out[0].ClusterID != "cluster-1" || out[1].TenantID != "tenant-2" || out[1].ClusterID != "cluster-2" {
-		t.Fatalf("fallback clusters = %#v", out)
+		t.Fatalf("clusters = %#v", out)
 	}
 	if out[0].Password == "" || out[1].Password == "" {
-		t.Fatalf("fallback clusters did not preserve generated passwords: %#v", out)
+		t.Fatalf("clusters did not preserve generated passwords: %#v", out)
+	}
+	if out[1].Host != "" || out[1].Port != 0 {
+		t.Fatalf("incomplete cluster connection = %#v, want no endpoint", out[1])
 	}
 }
 
-func TestBatchProvisionFreeClustersWaitsForMetadataByList(t *testing.T) {
+func TestWaitForPoolClustersMetadataUsesList(t *testing.T) {
 	origPoll := tidbCloudNativeBatchMetadataPollInterval
 	tidbCloudNativeBatchMetadataPollInterval = time.Millisecond
 	t.Cleanup(func() { tidbCloudNativeBatchMetadataPollInterval = origPoll })
@@ -488,29 +471,6 @@ func TestBatchProvisionFreeClustersWaitsForMetadataByList(t *testing.T) {
 			return
 		}
 		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/v1beta1/clusters:batchCreate":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"clusters": []map[string]any{
-					{
-						"clusterId": "cluster-1",
-						"state":     "CREATING",
-						"labels": map[string]string{
-							TiDBCloudOrganizationLabel: "org-1",
-							Drive9TenantIDLabel:        "tenant-1",
-							Drive9PoolIDLabel:          "pool-1",
-						},
-					},
-					{
-						"clusterId": "cluster-2",
-						"state":     "CREATING",
-						"labels": map[string]string{
-							TiDBCloudOrganizationLabel: "org-1",
-							Drive9TenantIDLabel:        "tenant-2",
-							Drive9PoolIDLabel:          "pool-1",
-						},
-					},
-				},
-			})
 		case r.Method == http.MethodGet && r.URL.Path == "/v1beta1/clusters":
 			listCalls.Add(1)
 			if filter := r.URL.Query().Get("filter"); !strings.Contains(filter, `clusterId = "cluster-1,cluster-2"`) || !strings.Contains(filter, Drive9ManagedLabel) {
@@ -558,12 +518,15 @@ func TestBatchProvisionFreeClustersWaitsForMetadataByList(t *testing.T) {
 		defaultDatabaseName: DefaultDatabaseName,
 		client:              ts.Client(),
 	}
-	out, _, err := p.BatchProvisionFreeClustersWithCredentialsAndQuota(context.Background(), []string{"tenant-1", "tenant-2"}, tenant.CredentialProvisionRequest{
+	out, err := p.WaitForPoolClustersMetadata(context.Background(), []*tenant.ClusterInfo{
+		{TenantID: "tenant-1", ClusterID: "cluster-1", Password: "pass-1", DBName: DefaultDatabaseName},
+		{TenantID: "tenant-2", ClusterID: "cluster-2", Password: "pass-2", DBName: DefaultDatabaseName},
+	}, tenant.CredentialProvisionRequest{
 		PublicKey:  "public-1",
 		PrivateKey: "private-1",
-	}, tenant.QuotaUpdateOptions{TenantPoolID: "pool-1"})
+	})
 	if err != nil {
-		t.Fatalf("BatchProvisionFreeClustersWithCredentialsAndQuota: %v", err)
+		t.Fatalf("WaitForPoolClustersMetadata: %v", err)
 	}
 	assertNoHandlerError(t, handlerErrs)
 	if listCalls.Load() != 1 {

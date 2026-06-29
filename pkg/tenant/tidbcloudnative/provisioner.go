@@ -419,7 +419,6 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 		return nil, nil, fmt.Errorf("tidbcloud native batch provision returned %d clusters, want %d", len(created.Clusters), len(tenantIDs))
 	}
 	out := make([]*tenant.ClusterInfo, len(created.Clusters))
-	pending := make([]batchClusterMetadataTarget, 0, len(created.Clusters))
 	errs := make([]error, len(created.Clusters))
 	for i := range created.Clusters {
 		i := i
@@ -438,14 +437,7 @@ func (p *Provisioner) BatchProvisionFreeClustersWithCredentialsAndQuota(ctx cont
 			errs[i] = fmt.Errorf("tidbcloud native batch response missing cluster id for tenant %q", tenantID)
 			continue
 		}
-		if clusterProvisionMetadataIncomplete(&info, p.usePrivateEndpoint, p.tencentPrivateEndpointHost) {
-			pending = append(pending, batchClusterMetadataTarget{index: i, tenantID: tenantID, password: password, initial: info})
-			continue
-		}
 		out[i] = p.clusterInfoFromResponse(tenantID, dbName, password, &info)
-	}
-	if len(pending) > 0 {
-		p.waitForBatchClusterProvisionMetadata(ctx, publicKey, privateKey, dbName, strings.TrimSpace(opts.TenantPoolID), pending, out, errs)
 	}
 	for _, err := range errs {
 		if err != nil {
@@ -469,10 +461,11 @@ type batchClusterMetadataTarget struct {
 	index    int
 	tenantID string
 	password string
+	dbName   string
 	initial  clusterInfo
 }
 
-func (p *Provisioner) waitForBatchClusterProvisionMetadata(ctx context.Context, publicKey, privateKey, dbName, poolID string, pending []batchClusterMetadataTarget, out []*tenant.ClusterInfo, errs []error) {
+func (p *Provisioner) waitForBatchClusterProvisionMetadata(ctx context.Context, publicKey, privateKey, poolID string, pending []batchClusterMetadataTarget, out []*tenant.ClusterInfo, errs []error) {
 	groupSize := tidbCloudNativeBatchMetadataGroupSize
 	if groupSize <= 0 {
 		groupSize = 10
@@ -487,13 +480,13 @@ func (p *Provisioner) waitForBatchClusterProvisionMetadata(ctx context.Context, 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			p.waitForBatchClusterProvisionMetadataGroup(ctx, publicKey, privateKey, dbName, poolID, group, out, errs)
+			p.waitForBatchClusterProvisionMetadataGroup(ctx, publicKey, privateKey, poolID, group, out, errs)
 		}()
 	}
 	wg.Wait()
 }
 
-func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Context, publicKey, privateKey, dbName, poolID string, group []batchClusterMetadataTarget, out []*tenant.ClusterInfo, errs []error) {
+func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Context, publicKey, privateKey, poolID string, group []batchClusterMetadataTarget, out []*tenant.ClusterInfo, errs []error) {
 	deadline := time.Now().Add(10 * time.Minute)
 	pending := make(map[string]batchClusterMetadataTarget, len(group))
 	clusterIDs := make([]string, 0, len(group))
@@ -536,7 +529,7 @@ func (p *Provisioner) waitForBatchClusterProvisionMetadataGroup(ctx context.Cont
 				if clusterProvisionMetadataIncomplete(&info, p.usePrivateEndpoint, p.tencentPrivateEndpointHost) {
 					continue
 				}
-				out[target.index] = p.clusterInfoFromResponse(target.tenantID, dbName, target.password, &info)
+				out[target.index] = p.clusterInfoFromResponse(target.tenantID, target.dbName, target.password, &info)
 				delete(pending, clusterID)
 			}
 		}
@@ -606,6 +599,60 @@ func (p *Provisioner) WaitForPoolClusterMetadata(ctx context.Context, cluster *t
 		return nil, err
 	}
 	return p.clusterInfoFromResponse(strings.TrimSpace(cluster.TenantID), dbName, cluster.Password, info), nil
+}
+
+func (p *Provisioner) WaitForPoolClustersMetadata(ctx context.Context, clusters []*tenant.ClusterInfo, req tenant.CredentialProvisionRequest) ([]*tenant.ClusterInfo, error) {
+	publicKey := strings.TrimSpace(req.PublicKey)
+	privateKey := strings.TrimSpace(req.PrivateKey)
+	if publicKey == "" || privateKey == "" {
+		return nil, fmt.Errorf("public_key and private_key are required")
+	}
+	if len(clusters) == 0 {
+		return []*tenant.ClusterInfo{}, nil
+	}
+	out := make([]*tenant.ClusterInfo, len(clusters))
+	pending := make([]batchClusterMetadataTarget, 0, len(clusters))
+	errs := make([]error, len(clusters))
+	for i, cluster := range clusters {
+		if cluster == nil {
+			errs[i] = fmt.Errorf("cluster is required")
+			continue
+		}
+		tenantID := strings.TrimSpace(cluster.TenantID)
+		if tenantID == "" {
+			errs[i] = fmt.Errorf("cluster tenant id is required")
+			continue
+		}
+		if strings.TrimSpace(cluster.ClusterID) == "" {
+			errs[i] = fmt.Errorf("cluster id is required for tenant %q", tenantID)
+			continue
+		}
+		dbName := strings.TrimSpace(cluster.DBName)
+		if dbName == "" {
+			var err error
+			dbName, err = p.resolveDatabaseName("")
+			if err != nil {
+				errs[i] = err
+				continue
+			}
+		}
+		pending = append(pending, batchClusterMetadataTarget{
+			index:    i,
+			tenantID: tenantID,
+			password: cluster.Password,
+			dbName:   dbName,
+			initial: clusterInfo{
+				ClusterID: strings.TrimSpace(cluster.ClusterID),
+				Labels: map[string]string{
+					Drive9TenantIDLabel: tenantID,
+				},
+			},
+		})
+	}
+	if len(pending) > 0 {
+		p.waitForBatchClusterProvisionMetadata(ctx, publicKey, privateKey, "", pending, out, errs)
+	}
+	return out, errors.Join(errs...)
 }
 
 func (p *Provisioner) MarkClusterPoolUsed(ctx context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, usedAt time.Time, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {

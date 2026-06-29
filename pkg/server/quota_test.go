@@ -56,6 +56,7 @@ type quotaTestProvisioner struct {
 	batchPoolMissingOrg      map[int]bool
 	batchPoolMissingTenant   map[int]bool
 	metadataWaitCalls        atomic.Int32
+	metadataBatchWaitCalls   atomic.Int32
 	metadataWaitErr          error
 	calls                    []string
 }
@@ -278,6 +279,30 @@ func (p *quotaTestProvisioner) WaitForPoolClusterMetadata(_ context.Context, clu
 		out.DBName = "tidbcloud_fs"
 	}
 	return &out, nil
+}
+
+func (p *quotaTestProvisioner) WaitForPoolClustersMetadata(_ context.Context, clusters []*tenant.ClusterInfo, req tenant.CredentialProvisionRequest) ([]*tenant.ClusterInfo, error) {
+	p.metadataBatchWaitCalls.Add(1)
+	p.recordCall("wait_pool_metadata_batch", req, nil, nil)
+	if p.metadataWaitErr != nil {
+		return nil, p.metadataWaitErr
+	}
+	out := make([]*tenant.ClusterInfo, 0, len(clusters))
+	for _, cluster := range clusters {
+		if cluster == nil {
+			continue
+		}
+		next := *cluster
+		next.OrganizationID = "org-1"
+		next.Host = "db.example.com"
+		next.Port = 4000
+		next.Username = "u.root"
+		if next.DBName == "" {
+			next.DBName = "tidbcloud_fs"
+		}
+		out = append(out, &next)
+	}
+	return out, nil
 }
 
 func (p *quotaTestProvisioner) MarkClusterPoolUsed(_ context.Context, cluster *tenant.ClusterInfo, req tenant.CredentialProvisionRequest, _ time.Time, opts tenant.QuotaUpdateOptions) (*tenant.QuotaCloudConfig, error) {
@@ -1464,7 +1489,7 @@ func TestAdminTenantPoolCreateBatchProvisionsFreeTenants(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 2 {
+	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 {
 		t.Fatalf("pool response = %#v", out)
 	}
 	if rt.prov.batchPoolCalls.Load() != 1 {
@@ -1485,8 +1510,15 @@ func TestAdminTenantPoolCreateBatchProvisionsFreeTenants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("count free: %v", err)
 	}
-	if free != 2 {
-		t.Fatalf("free = %d, want 2", free)
+	if free != 0 {
+		t.Fatalf("active free = %d, want 0 before schema init", free)
+	}
+	slots, err := rt.meta.CountTenantPoolFreeSlots(context.Background(), "org-1")
+	if err != nil {
+		t.Fatalf("count free slots: %v", err)
+	}
+	if slots != 2 {
+		t.Fatalf("free slots = %d, want 2", slots)
 	}
 }
 
@@ -1512,7 +1544,7 @@ func TestAdminTenantPoolCreatePersistsClustersWhenMetadataWaitFails(t *testing.T
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 2 {
+	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 {
 		t.Fatalf("pool response = %#v", out)
 	}
 	pool, err := rt.meta.GetTenantPoolByOrganization(context.Background(), "org-1")
@@ -1522,16 +1554,16 @@ func TestAdminTenantPoolCreatePersistsClustersWhenMetadataWaitFails(t *testing.T
 	if pool.PoolID != out.PoolID {
 		t.Fatalf("stored pool id = %q, want %q", pool.PoolID, out.PoolID)
 	}
-	rows, err := rt.meta.ListFreeTenantPoolBindings(context.Background(), "org-1", false, 10)
+	rows, err := rt.meta.ListPendingTenantPoolBindingsForResume(context.Background(), "org-1", 10)
 	if err != nil {
-		t.Fatalf("list free bindings: %v", err)
+		t.Fatalf("list pending bindings: %v", err)
 	}
 	if len(rows) != 2 {
-		t.Fatalf("free bindings = %d, want 2", len(rows))
+		t.Fatalf("pending bindings = %d, want 2", len(rows))
 	}
 	for _, row := range rows {
-		if row.Tenant.Status != meta.TenantProvisioning {
-			t.Fatalf("tenant %s status = %s, want provisioning", row.Tenant.ID, row.Tenant.Status)
+		if row.Tenant.Status != meta.TenantPending {
+			t.Fatalf("tenant %s status = %s, want pending", row.Tenant.ID, row.Tenant.Status)
 		}
 		if row.Tenant.DBUser != "" || row.Tenant.DBHost != "" {
 			t.Fatalf("tenant %s connection = host %q user %q, want incomplete", row.Tenant.ID, row.Tenant.DBHost, row.Tenant.DBUser)
@@ -1547,11 +1579,14 @@ func TestAdminTenantPoolCreatePersistsClustersWhenMetadataWaitFails(t *testing.T
 		t.Fatalf("deprovision calls = %d, want 0", got)
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for rt.prov.metadataWaitCalls.Load() < 2 && time.Now().Before(deadline) {
+	for rt.prov.metadataBatchWaitCalls.Load() < 1 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
-	if got := rt.prov.metadataWaitCalls.Load(); got < 2 {
-		t.Fatalf("metadata wait calls = %d, want at least 2", got)
+	if got := rt.prov.metadataBatchWaitCalls.Load(); got < 1 {
+		t.Fatalf("metadata batch wait calls = %d, want at least 1", got)
+	}
+	if got := rt.prov.metadataWaitCalls.Load(); got != 0 {
+		t.Fatalf("single metadata wait calls = %d, want 0", got)
 	}
 }
 
@@ -1578,7 +1613,7 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneOrganizationMissi
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 1 {
+	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 {
 		t.Fatalf("pool response = %#v", out)
 	}
 	pool, err := rt.meta.GetTenantPoolByOrganization(context.Background(), "org-1")
@@ -1588,12 +1623,12 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneOrganizationMissi
 	if pool.PoolID != out.PoolID {
 		t.Fatalf("stored pool id = %q, want %q", pool.PoolID, out.PoolID)
 	}
-	rows, err := rt.meta.ListFreeTenantPoolBindings(context.Background(), "org-1", false, 10)
+	rows, err := rt.meta.ListPendingTenantPoolBindingsForResume(context.Background(), "org-1", 10)
 	if err != nil {
-		t.Fatalf("list free bindings: %v", err)
+		t.Fatalf("list pending bindings: %v", err)
 	}
 	if len(rows) != 1 {
-		t.Fatalf("free bindings = %d, want 1", len(rows))
+		t.Fatalf("pending bindings = %d, want 1", len(rows))
 	}
 	if got := rt.prov.deprovisionCalls.Load(); got != 1 {
 		t.Fatalf("deprovision calls = %d, want 1", got)
@@ -1627,15 +1662,15 @@ func TestAdminTenantPoolCreatePreservesPersistedClustersWhenOneTenantLabelMissin
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 1 {
+	if out.PoolID == "" || out.OrganizationID != "org-1" || out.PoolSize != 2 || out.FreeSize != 0 {
 		t.Fatalf("pool response = %#v", out)
 	}
-	rows, err := rt.meta.ListFreeTenantPoolBindings(context.Background(), "org-1", false, 10)
+	rows, err := rt.meta.ListPendingTenantPoolBindingsForResume(context.Background(), "org-1", 10)
 	if err != nil {
-		t.Fatalf("list free bindings: %v", err)
+		t.Fatalf("list pending bindings: %v", err)
 	}
 	if len(rows) != 1 {
-		t.Fatalf("free bindings = %d, want 1", len(rows))
+		t.Fatalf("pending bindings = %d, want 1", len(rows))
 	}
 	if got := rt.prov.deprovisionCalls.Load(); got != 1 {
 		t.Fatalf("deprovision calls = %d, want 1", got)
@@ -1672,7 +1707,7 @@ func TestAdminTenantPoolCreateCleansUpWhenPartialMetadataPersistenceFails(t *tes
 	}
 }
 
-func TestResumeProvisioningNativeWithoutConnectionUsesDefaultCredentials(t *testing.T) {
+func TestResumeProvisioningNativeWithoutConnectionSkipsMetadataResume(t *testing.T) {
 	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
 	rt.prov.defaultPublicKey = "default-public"
 	rt.prov.defaultPrivateKey = "default-private"
@@ -1703,29 +1738,99 @@ func TestResumeProvisioningNativeWithoutConnectionUsesDefaultCredentials(t *test
 	}
 
 	rt.server.resumeProvisioningTenantsWithCtx(ctx)
+	tnt, err := rt.meta.GetTenant(ctx, tenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tnt.Status != meta.TenantProvisioning || tnt.DBUser != "" || tnt.DBHost != "" {
+		t.Fatalf("tenant after resume = status %s host %q user %q, want unchanged provisioning without connection", tnt.Status, tnt.DBHost, tnt.DBUser)
+	}
+	if got := rt.prov.metadataWaitCalls.Load(); got != 0 {
+		t.Fatalf("metadata wait calls = %d, want 0", got)
+	}
+	if got := rt.prov.metadataBatchWaitCalls.Load(); got != 0 {
+		t.Fatalf("metadata batch wait calls = %d, want 0", got)
+	}
+}
+
+func TestTenantPoolClaimMissTriggersPendingMetadataResume(t *testing.T) {
+	rt := newQuotaRuntime(t, tenant.ProviderTiDBCloudNative)
+	rt.prov.listPages = []*tenant.ManagedClusterListResult{{
+		Clusters: []tenant.CloudClusterInfo{{
+			ClusterID:      "cluster-pending-1",
+			OrganizationID: "org-1",
+		}},
+	}}
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := rt.meta.CreateTenantPool(ctx, &meta.TenantPool{
+		PoolID:         "pool-1",
+		OrganizationID: "org-1",
+		Size:           1,
+		Status:         meta.TenantPoolActive,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("create pool: %v", err)
+	}
+	passCipher, err := rt.server.pool.Encrypt(ctx, []byte("pool-pass"))
+	if err != nil {
+		t.Fatalf("encrypt password: %v", err)
+	}
+	tenantID := "pool-pending-resume-1"
+	if err := rt.meta.InsertTenant(ctx, &meta.Tenant{
+		ID:               tenantID,
+		Status:           meta.TenantPending,
+		DBPasswordCipher: passCipher,
+		DBName:           "tidbcloud_fs",
+		DBTLS:            true,
+		Provider:         tenant.ProviderTiDBCloudNative,
+		ClusterID:        "cluster-pending-1",
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}); err != nil {
+		t.Fatalf("insert tenant: %v", err)
+	}
+	if err := rt.meta.UpsertTenantTiDBCloudOrgBinding(ctx, &meta.TenantTiDBCloudOrgBinding{
+		TenantID:       tenantID,
+		OrganizationID: "org-1",
+		ClusterID:      "cluster-pending-1",
+		PoolID:         "pool-1",
+		PoolStatus:     meta.TenantPoolBindingFree,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}); err != nil {
+		t.Fatalf("upsert binding: %v", err)
+	}
+
+	res, pool, claimed, err := rt.server.claimAdminTenantFromPool(ctx, tenant.CredentialProvisionRequest{
+		PublicKey:  "public-1",
+		PrivateKey: "private-1",
+	}, nil)
+	if err != nil {
+		t.Fatalf("claim from pool: %v", err)
+	}
+	if claimed || res != nil || pool == nil || pool.PoolID != "pool-1" {
+		t.Fatalf("claim result res=%#v pool=%#v claimed=%v, want miss with pool", res, pool, claimed)
+	}
+	if got := rt.prov.markPoolUsedCalls.Load(); got != 0 {
+		t.Fatalf("mark pool used calls = %d, want 0 for pending tenant", got)
+	}
+
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		tnt, err := rt.meta.GetTenant(ctx, tenantID)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if tnt.Status == meta.TenantActive {
-			if tnt.DBHost != "db.example.com" || tnt.DBUser != "u.tdc_fs_sys" {
-				t.Fatalf("tenant connection = host %q user %q", tnt.DBHost, tnt.DBUser)
-			}
+		if rt.prov.metadataBatchWaitCalls.Load() >= 1 && tnt.DBHost == "db.example.com" && tnt.DBUser == "u.tdc_fs_sys" && tnt.Status == meta.TenantActive {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("tenant status = %s, want active", tnt.Status)
+			t.Fatalf("tenant after pending resume = status %s host %q user %q, metadata batch waits=%d", tnt.Status, tnt.DBHost, tnt.DBUser, rt.prov.metadataBatchWaitCalls.Load())
 		}
 		time.Sleep(10 * time.Millisecond)
-	}
-	if got := rt.prov.metadataWaitCalls.Load(); got < 1 {
-		t.Fatalf("metadata wait calls = %d, want at least 1", got)
-	}
-	lastCredentials := rt.prov.lastCredentialsSnapshot()
-	if lastCredentials.PublicKey != "default-public" || lastCredentials.PrivateKey != "default-private" {
-		t.Fatalf("credentials = %#v, want default credentials", lastCredentials)
 	}
 }
 

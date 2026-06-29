@@ -1432,18 +1432,34 @@ func (s *Store) UpdateTenantPoolOrganization(ctx context.Context, poolID, organi
 }
 
 func (s *Store) CountFreeTenantPoolBindings(ctx context.Context, organizationID string) (out int, err error) {
+	return s.countFreeTenantPoolBindingsByStatus(ctx, organizationID, []TenantStatus{TenantActive})
+}
+
+func (s *Store) CountTenantPoolFreeSlots(ctx context.Context, organizationID string) (out int, err error) {
+	return s.countFreeTenantPoolBindingsByStatus(ctx, organizationID, []TenantStatus{TenantPending, TenantProvisioning, TenantActive})
+}
+
+func (s *Store) countFreeTenantPoolBindingsByStatus(ctx context.Context, organizationID string, statuses []TenantStatus) (out int, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "count_free_tidbcloud_pool_bindings", start, &err)
 	organizationID = strings.TrimSpace(organizationID)
 	if organizationID == "" {
 		return 0, fmt.Errorf("organization_id is required")
 	}
+	if len(statuses) == 0 {
+		return 0, fmt.Errorf("tenant statuses are required")
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(statuses)), ",")
+	args := make([]any, 0, 2+len(statuses))
+	args = append(args, organizationID, TenantPoolBindingFree)
+	for _, status := range statuses {
+		args = append(args, status)
+	}
 	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*)
 		FROM tenant_tidbcloud_org_bindings b
 		JOIN tenants t ON t.id = b.tenant_id
 		WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = 'tidb_cloud_native'
-			AND t.status IN (?, ?)`,
-		organizationID, TenantPoolBindingFree, TenantProvisioning, TenantActive)
+			AND t.status IN (`+placeholders+`)`, args...)
 	if err = row.Scan(&out); err != nil {
 		return 0, err
 	}
@@ -1453,13 +1469,25 @@ func (s *Store) CountFreeTenantPoolBindings(ctx context.Context, organizationID 
 func (s *Store) ListFreeTenantPoolBindings(ctx context.Context, organizationID string, newestFirst bool, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_free_tidbcloud_pool_bindings", start, &err)
-	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantProvisioning, TenantActive})
+	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantActive})
 }
 
 func (s *Store) ListFreeTenantPoolBindingsForDelete(ctx context.Context, organizationID string, newestFirst bool, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_free_tidbcloud_pool_bindings_for_delete", start, &err)
-	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantProvisioning, TenantActive, TenantFailed})
+	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantPending, TenantProvisioning, TenantActive, TenantFailed})
+}
+
+func (s *Store) ListTenantPoolFreeSlotsForDelete(ctx context.Context, organizationID string, newestFirst bool, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_tidbcloud_pool_free_slots_for_delete", start, &err)
+	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantPending, TenantProvisioning, TenantActive})
+}
+
+func (s *Store) ListPendingTenantPoolBindingsForResume(ctx context.Context, organizationID string, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_pending_tidbcloud_pool_bindings_for_resume", start, &err)
+	return s.listFreeTenantPoolBindings(ctx, organizationID, false, limit, []TenantStatus{TenantPending})
 }
 
 func (s *Store) listFreeTenantPoolBindings(ctx context.Context, organizationID string, newestFirst bool, limit int, statuses []TenantStatus) (out []TenantWithTiDBCloudOrgBinding, err error) {

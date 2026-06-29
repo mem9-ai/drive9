@@ -77,6 +77,11 @@ type TenantPoolClusterMetadataWaiter interface {
 	WaitForPoolClusterMetadata(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) (*ClusterInfo, error)
 }
 
+type TenantPoolClusterMetadataBatchWaiter interface {
+	Provisioner
+	WaitForPoolClustersMetadata(ctx context.Context, clusters []*ClusterInfo, req CredentialProvisionRequest) ([]*ClusterInfo, error)
+}
+
 type CredentialDeprovisioner interface {
 	Provisioner
 	DeprovisionWithCredentials(ctx context.Context, cluster *ClusterInfo, req CredentialProvisionRequest) error
