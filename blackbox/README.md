@@ -1,9 +1,8 @@
 # Drive9 Blackbox Harness
 
-`blackbox/` contains the Drive9 blackbox test framework, organized into three layers:
+`blackbox/` contains the Drive9 blackbox test framework, organized into two layers:
 
-- **`harness/`** — generic test framework (runner, reporter, module protocol). No drive9 dependencies.
-- **`env/`** — drive9 test environment (server startup, CLI build, FUSE mount, dependency management).
+- **`harness/`** — generic test framework + drive9 test environment (server startup, CLI build, FUSE mount, dependency management).
 - **`suites/`** — test modules organized by group and module name: `suites/<group>/<module>/module.py`.
 
 ## Layout
@@ -13,26 +12,22 @@ blackbox/
   run.py                 entrypoint
   harness/
     core.py             Context, Recorder, ModuleRecord, constants
-    module_base.py      BaseModule class, module_config helper
+    module_base.py      BaseModule class
     runner.py           BlackboxRunner: execution, timeout, reporting
     report.py           report templates
     suite.py            auto-discovery: scan suites/*/*/module.py
     deps.py             DependencyManager: git clone, tool detection
     capabilities.py     host capability detection
-  env/
     provider.py         Drive9SuiteProvider: setup/cleanup lifecycle
     target.py           server/CLI/FUSE mount provider
-    capabilities.py     FUSE/macFUSE capability detection
-    deps.py             Drive9DependencyManager: per-module tool builds
   suites/
     community/          community test modules
       pjdfstest/
         module.py       test logic
-        config.json      timeout, compat, labels, module-specific settings
         deps.py          dependency preparation (optional)
-        allowlist.json   test allowlist (optional)
       fio/
-      ltp/
+      ltp_fs/
+      ltp_syscalls/
       ...
     drive9/             drive9 workflow modules
     customer/           customer scenario modules
@@ -43,11 +38,10 @@ blackbox/
 ## Auto-Discovery
 
 Modules are discovered automatically by scanning `suites/<group>/<module>/module.py`.
-Each module file must export a class with `id`, `category`, and `run()` attributes.
-
-Module IDs are derived from the class's `id` attribute (not directory path).
-A single `module.py` can export multiple test classes (e.g., `ltp/module.py` has
-`CommunityLTPFS` + `CommunityLTPSyscalls`).
+Module IDs are derived from the directory path: `<group>.<module>`.
+A single `module.py` can export multiple test classes (e.g., `ltp/module.py` had
+`CommunityLTPFS` + `CommunityLTPSyscalls` — now split into separate `ltp_fs/`
+and `ltp_syscalls/` directories).
 
 `--group <name>` selects a directory group: every module whose id starts with
 `<group>.`, mirroring the `suites/<group>/` layout. `--label <label>` is an
@@ -61,10 +55,6 @@ the `drive9` binary found on PATH and reads server/auth from `~/.drive9/config`
 (via the CLI's own credential resolver). No CLI build, no server provisioning.
 
 ```bash
-# List available modules (no side effects, no work-dir created)
-python3 blackbox/run.py --list
-python3 blackbox/run.py --list --format json
-
 # Run all modules
 python3 blackbox/run.py --all
 
@@ -78,9 +68,6 @@ python3 blackbox/run.py --group juicefs
 # Narrow any selection by label
 python3 blackbox/run.py --group community --label performance
 python3 blackbox/run.py --all --label functional
-
-# Run by category prefix
-python3 blackbox/run.py --category drive9.workflow
 
 # Specify a custom drive9 CLI path
 python3 blackbox/run.py --all --bin ./bin/drive9
@@ -126,19 +113,21 @@ Each module directory contains:
 | File | Required | Description |
 |------|----------|-------------|
 | `__init__.py` | Yes | Python package marker |
-| `module.py` | Yes | Test logic: a class with `id`, `category`, `run(ctx) -> dict` |
-| `config.json` | No | Module config: `timeout`, `compat`, `labels`, `report_profile`, module-specific settings |
+| `module.py` | Yes | Test logic: a class with `run(ctx) -> dict` |
 | `deps.py` | No | `ensure_dependencies(ctx)` function for module-specific dependency preparation |
-| `*.json` | No | Module-specific data files (allowlists, fixtures, etc.) |
+
+Module metadata (id, category, labels, timeout, compat) is declared as class
+attributes on the module class in `module.py` — there is no external `config.json`
+or `modules.json`.
 
 ## Adding a Module
 
 1. Create `suites/<group>/<module_name>/` with `__init__.py` and `module.py`
-2. Optionally add `config.json` and `deps.py`
+2. Optionally add `deps.py`
 3. The module is automatically discovered — no registration needed
 
 ```python
-# suites/mygroup/mymodule/module.py
+# suits/mygroup/mymodule/module.py
 from harness.module_base import BaseModule
 
 class MyModule(BaseModule):
@@ -149,7 +138,7 @@ class MyModule(BaseModule):
     timeout = 300
 
     def run(self, ctx):
-        # ctx.target: server/CLI/mount helpers from env/
+        # ctx.target: server/CLI/mount helpers from harness/
         # ctx.deps: dependency manager
         # ctx.capabilities: platform capability dict
         ...
@@ -165,12 +154,11 @@ Blackbox generates two levels of report:
 
 ## Platform Compatibility
 
-Each module's `config.json` can declare platform expectations:
+Each module can declare platform expectations as a class attribute:
 
-```json
-{
-  "compat": { "linux": "run", "darwin": "skip" }
-}
+```python
+class MyModule(BaseModule):
+    compat = {"linux": "run", "darwin": "skip"}
 ```
 
 Values: `"run"` (default), `"skip"`, or `"xfail"`.
@@ -180,8 +168,7 @@ Values: `"run"` (default), `"skip"`, or `"xfail"`.
 Each module has a wall-clock timeout. Priority:
 
 1. `BLACKBOX_<MODULE_ID>_TIMEOUT_S` env var (module ID uppercased, dots → underscores)
-2. `timeout` field in `config.json`
-3. Module class `timeout` attribute (default 600s)
+2. Module class `timeout` attribute (default 600s)
 
 ## Work-Dir Isolation
 
@@ -195,7 +182,20 @@ work-dir, keeping the repo tree clean. Use `--work-dir` to specify; defaults to
 |----------|---------|-------------|
 | `BLACKBOX_WORK_DIR` | `blackbox/work/<session>` | Work directory for cache/tmp/results |
 | `BLACKBOX_RUNS` | `1` | Performance run count |
-| `SERVER_MODE` | `auto` | Server mode: `auto`, `existing`, `local` |
+| `SERVER_MODE` | `config` | Server mode: `config` or `local` |
 | `OFFLINE` | `false` | Disable auto-fetch of dependencies |
 | `STRICT` | `false` | Fail on missing prerequisites instead of skipping |
 | `KEEP_ARTIFACTS` | `false` | Keep module artifacts after run |
+
+## CI Workflows
+
+Three GitHub Actions workflows are provided:
+
+- **`blackbox.yml`** — manual trigger only (`workflow_dispatch`). User specifies
+  a group (community, juicefs, drive9, git, customer, or all). No push/PR
+  triggers.
+- **`blackbox-daily.yml`** — runs at 06:00 UTC daily, community group only.
+- **`blackbox-weekly.yml`** — runs at 06:00 UTC every Monday, community group only.
+
+All three use `--server-mode local` to start an isolated MySQL container and
+`drive9-server-local`, then run `python3 blackbox/run.py` directly.

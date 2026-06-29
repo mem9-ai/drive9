@@ -101,8 +101,7 @@ def resolve_module_timeout(module_id: str, default_timeout: int, suite: str, mod
     Priority (highest wins):
     1. BLACKBOX_<SUITE>_<MODULE_UPPER>_TIMEOUT_S environment variable
     2. BLACKBOX_<MODULE_UPPER>_TIMEOUT_S environment variable
-    3. ``timeout`` field in the module's modules.json config
-    4. The module class's ``timeout`` attribute (``default_timeout``)
+    3. The module class's ``timeout`` attribute (``default_timeout``)
     """
     module_env_suffix = module_id.replace(".", "_").replace("-", "_").upper() + "_TIMEOUT_S"
     suite_specific = f"BLACKBOX_{suite.upper()}_{module_env_suffix}"

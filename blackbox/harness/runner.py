@@ -268,7 +268,7 @@ class BlackboxRunner:
             module = self.registry[module_id]
             start = time.monotonic()
             progress(f"deps {idx}/{total} start: {module.id}")
-            # Platform compatibility check (modules.json compat field).
+            # Platform compatibility check (module class compat attribute).
             compat_record = self.check_platform_compat(module)
             if compat_record is not None:
                 compat_record.report_profile = self._module_profile(module)
@@ -309,7 +309,7 @@ class BlackboxRunner:
         )
 
     def check_platform_compat(self, module: Any) -> ModuleRecord | None:
-        """Check platform compatibility from modules.json compat field.
+        """Check platform compatibility from the module class compat attribute.
 
         Returns a SKIP ModuleRecord if the module should not run on this
         platform, or None to proceed (including xfail, which runs normally).
@@ -405,7 +405,7 @@ class BlackboxRunner:
         module = self.registry[module_id]
         start = time.monotonic()
         progress(f"module {index}/{total} start: {module.id}")
-        # Platform compatibility check (modules.json compat field).
+        # Platform compatibility check (module class compat attribute).
         compat_record = self.check_platform_compat(module)
         if compat_record is not None:
             compat_record.report_profile = self._module_profile(module)
