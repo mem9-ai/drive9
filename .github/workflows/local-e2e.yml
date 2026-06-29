@@ -478,6 +478,53 @@ jobs:
             echo "pjdfstest POSIX suite: \`RUN_POSIX_FEATURE_MATRIX=${RUN_POSIX_FEATURE_MATRIX}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Turn the raw per-suite outcomes into one product-quality report: a richer
+      # step summary grouped by product promise, an aggregated JSON for the
+      # notifier, a signature-led issue body, and outputs (notify/signature/...).
+      - name: Aggregate e2e product-quality report
+        id: aggregate
+        if: always()
+        run: |
+          cat > /tmp/e2e-outcomes.json <<JSON
+          {
+            "api-smoke": "${{ steps.api-smoke.outcome }}",
+            "existing-key-smoke": "${{ steps.existing-key-smoke.outcome }}",
+            "cli-smoke": "${{ steps.cli-smoke.outcome }}",
+            "layer-fs-smoke": "${{ steps.layer-fs-smoke.outcome }}",
+            "fuse-smoke": "${{ steps.fuse-smoke.outcome }}",
+            "git-ops-smoke": "${{ steps.git-ops-smoke.outcome }}",
+            "portable-pack-unpack-e2e": "${{ steps.portable-pack-unpack-e2e.outcome }}",
+            "fuse-crash-recovery": "${{ steps.fuse-crash-recovery.outcome }}",
+            "fuse-write-perf-budget": "${{ steps.fuse-write-perf-budget.outcome }}",
+            "fuse_performance_compare": "${{ steps.fuse_performance_compare.outcome }}",
+            "fuse-concurrency-stress": "${{ steps.fuse-concurrency-stress.outcome }}",
+            "fuse-posix-fsx": "${{ steps.fuse-posix-fsx.outcome }}",
+            "smoke-all": "${{ steps.smoke-all.outcome }}",
+            "git-feature-matrix": "${{ steps.git-feature-matrix.outcome }}",
+            "pjdfstest-suite": "${{ steps.pjdfstest-suite.outcome }}"
+          }
+          JSON
+          go run ./cmd/e2e-aggregate \
+            --manifest e2e/suite-manifest.json \
+            --outcomes /tmp/e2e-outcomes.json \
+            --summaries e2e/reports/summary \
+            --out /tmp/e2e-report.json \
+            --issue-body /tmp/e2e-issue-body.md
+
+      # Push failures/regressions that warrant attention to Feishu/Lark. PR-tier
+      # failures stay in GitHub by policy; the notifier no-ops when no Feishu
+      # secret is configured, so this never blocks a fork/PR without secrets.
+      - name: Notify Feishu on post-merge/nightly failure or perf regression
+        if: always() && steps.aggregate.outputs.notify == 'true'
+        continue-on-error: true
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        run: |
+          go run ./cmd/feishu-notify --report /tmp/e2e-report.json
+
       - name: Dump TiDB playground logs
         if: always()
         run: |
@@ -560,16 +607,37 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EVENT_NAME: ${{ github.event_name }}
           SHA: ${{ github.sha }}
+          SIGNATURE: ${{ steps.aggregate.outputs.signature }}
         run: |
           gh label create ci-e2e-failure --repo "$REPO" \
             --description "Automated: local-e2e scheduled/post-merge run failed" \
             --color D93F0B --force || true
-          body="local-e2e \`$EVENT_NAME\` run failed on \`main\` at $SHA: $RUN_URL"
-          existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
-            --json number --jq '.[0].number // empty')"
+
+          # Prefer the structured, signature-led body from the aggregator; fall
+          # back to a one-liner if it is missing for any reason.
+          if [ -s /tmp/e2e-issue-body.md ]; then
+            body="$(cat /tmp/e2e-issue-body.md)"
+            body="$body"$'\n\n'"_run: $RUN_URL_"
+          else
+            body="local-e2e \`$EVENT_NAME\` run failed on \`main\` at $SHA: $RUN_URL"
+          fi
+
+          # Group recurring failures by signature: an open issue carrying the same
+          # signature is reused; a new signature opens its own tracking issue. With
+          # no signature we keep the legacy single-issue behaviour.
+          if [ -n "$SIGNATURE" ]; then
+            existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
+              --search "in:title $SIGNATURE" --json number --jq '.[0].number // empty')"
+            title="local-e2e failure on main [sig: $SIGNATURE]"
+          else
+            existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
+              --json number --jq '.[0].number // empty')"
+            title="local-e2e $EVENT_NAME run failing on main"
+          fi
+
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$REPO" --body "$body"
           else
             gh issue create --repo "$REPO" --label ci-e2e-failure \
-              --title "local-e2e $EVENT_NAME run failing on main" --body "$body"
+              --title "$title" --body "$body"
           fi
