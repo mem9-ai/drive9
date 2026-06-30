@@ -74,9 +74,9 @@ type ShadowStore struct {
 	pendingBytes        atomic.Int64 // current shadow bytes on disk; updated internally by write/remove methods
 
 	// Throttled disk space check state (atomic for lock-free fast path).
-	lastDiskCheck  atomic.Int64 // unix nano of last check
-	diskOK         atomic.Bool  // cached result of last check
-	cachedFreeBytes atomic.Int64 // cached Statfs free bytes (Bavail*Bsize)
+	lastDiskCheck    atomic.Int64 // unix nano of last check
+	diskOK           atomic.Bool  // cached result of last check
+	cachedFreeBytes  atomic.Int64 // cached Statfs free bytes (Bavail*Bsize)
 	cachedTotalBytes atomic.Int64 // cached Statfs total bytes (Blocks*Bsize)
 }
 

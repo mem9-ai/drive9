@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestShadowStoreWriteExtentsReadAt(t *testing.T) {
@@ -1072,6 +1073,36 @@ func TestWriteStreamReplacementPeakBounded(t *testing.T) {
 	}
 	if !bytes.Equal(data, origData) {
 		t.Fatalf("shadow content corrupted after rejected replacement")
+	}
+}
+
+func TestFreeRatioThrottledReEvaluatesCachedCapacity(t *testing.T) {
+	dir := t.TempDir()
+	// free-ratio=0.50 (50% must remain free); no byte quota.
+	ss, err := NewShadowStoreWithQuota(dir, 0.50, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Directly prime the cached Statfs values to simulate a known disk geometry.
+	// Simulated: 1000 bytes total, 600 bytes free (60% free).
+	ss.cachedFreeBytes.Store(600)
+	ss.cachedTotalBytes.Store(1000)
+	// Set lastDiskCheck to now so throttled path uses cached values.
+	ss.lastDiskCheck.Store(time.Now().UnixNano())
+
+	// Small requiredBytes=100: freeAfter=500, ratio=0.50 → pass (barely).
+	if err := ss.checkFreeRatioThrottled(100); err != nil {
+		t.Fatalf("small requiredBytes should pass: %v", err)
+	}
+
+	// Large requiredBytes=200: freeAfter=400, ratio=0.40 < 0.50 → ENOSPC.
+	// This verifies that cached capacity is re-evaluated with the new
+	// requiredBytes, not just returning the cached bool from the first check.
+	err = ss.checkFreeRatioThrottled(200)
+	if err != syscall.ENOSPC {
+		t.Fatalf("large requiredBytes should ENOSPC with cached capacity, got %v", err)
 	}
 }
 
