@@ -78,10 +78,6 @@ type ShadowStore struct {
 	cachedFreeBytes  atomic.Int64 // cached Statfs free bytes (Bavail*Bsize)
 	cachedTotalBytes atomic.Int64 // cached Statfs total bytes (Blocks*Bsize)
 
-	// supersededFds holds old file descriptors replaced by WriteStream.
-	// They are kept open so concurrent readers that grabbed the fd before
-	// the swap don't hit EBADF. Drained on Close.
-	supersededFds []*os.File
 }
 
 // NewShadowStore creates a ShadowStore rooted at dir.
@@ -491,9 +487,10 @@ func (s *ShadowStore) checkFreeRatioThrottled(requiredBytes int64) error {
 // Statfs values). On quota breach the temp file is removed and the original
 // shadow is untouched.
 //
-// Concurrency note: WriteStream swaps sf.fd under s.mu. The old fd is kept
-// open in supersededFds (not closed) so concurrent readers that grabbed it
-// before the swap don't hit EBADF. Superseded fds are closed on Close().
+// Concurrency note: WriteStream swaps sf.fd under full Lock and closes the
+// old fd after releasing the lock. This is safe because ReadAt/ReadAll
+// perform the actual fd.ReadAt call under RLock, so no concurrent reader
+// can be using the old fd when WriteStream releases Lock.
 func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64) (int64, error) {
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
@@ -549,13 +546,11 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	sf.fd = newFd
 	sf.size = n
 	sf.baseRev = baseRev
-	// Keep oldFd open so concurrent readers that grabbed it before the swap
-	// don't hit EBADF. The fd is appended to supersededFds and closed when
-	// the ShadowStore is closed.
-	if oldFd != nil {
-		s.supersededFds = append(s.supersededFds, oldFd)
-	}
 	s.mu.Unlock()
+	// Safe to close: ReadAt/ReadAll hold RLock during the actual fd.ReadAt
+	// call, and WriteStream holds full Lock during the swap, so no concurrent
+	// reader can be using oldFd after we release Lock.
+	_ = oldFd.Close()
 	s.pendingBytes.Add(delta)
 	return n, nil
 }
@@ -715,61 +710,65 @@ func (s *ShadowStore) SizeGen(gen uint64) int64 {
 
 // ReadAt reads from a shadow file at the given offset. Uses pread for
 // efficient partial reads without seeking.
+// The read is performed under RLock to prevent WriteStream from closing the
+// fd mid-read (pread is safe under RLock as it doesn't modify fd state).
 func (s *ShadowStore) ReadAt(remotePath string, offset int64, buf []byte) (int, error) {
 	s.mu.RLock()
 	sf, ok := s.files[remotePath]
+	if ok {
+		n, err := sf.fd.ReadAt(buf, offset)
+		s.mu.RUnlock()
+		return n, err
+	}
 	s.mu.RUnlock()
 
-	if !ok {
-		// Not in memory — try opening from disk.
-		sp := s.shadowPath(remotePath)
-		fd, err := os.Open(sp)
-		if err != nil {
-			return 0, fmt.Errorf("shadow file not found: %s", remotePath)
-		}
-		s.mu.Lock()
-		// Re-check after acquiring write lock.
-		if existingSf, exists := s.files[remotePath]; exists {
-			_ = fd.Close()
-			sf = existingSf
-		} else {
-			fi, err := fd.Stat()
-			if err != nil {
-				_ = fd.Close()
-				s.mu.Unlock()
-				return 0, fmt.Errorf("shadow stat: %w", err)
-			}
-			sf = &ShadowFile{fd: fd, size: fi.Size()}
-			s.files[remotePath] = sf
-		}
-		s.mu.Unlock()
+	// Not in memory — try opening from disk.
+	sp := s.shadowPath(remotePath)
+	fd, err := os.Open(sp)
+	if err != nil {
+		return 0, fmt.Errorf("shadow file not found: %s", remotePath)
 	}
-
-	return sf.fd.ReadAt(buf, offset)
+	s.mu.Lock()
+	// Re-check after acquiring write lock.
+	if existingSf, exists := s.files[remotePath]; exists {
+		_ = fd.Close()
+		sf = existingSf
+	} else {
+		fi, err := fd.Stat()
+		if err != nil {
+			_ = fd.Close()
+			s.mu.Unlock()
+			return 0, fmt.Errorf("shadow stat: %w", err)
+		}
+		sf = &ShadowFile{fd: fd, size: fi.Size()}
+		s.files[remotePath] = sf
+	}
+	// Perform read under lock so fd stays valid.
+	n, readErr := sf.fd.ReadAt(buf, offset)
+	s.mu.Unlock()
+	return n, readErr
 }
 
 // ReadAll reads the entire shadow file for the given path.
+// The read is performed under RLock to prevent WriteStream from closing the
+// fd mid-read.
 func (s *ShadowStore) ReadAll(remotePath string) ([]byte, error) {
 	s.mu.RLock()
 	sf, ok := s.files[remotePath]
-	var size int64
 	if ok {
-		size = sf.size
+		data := make([]byte, sf.size)
+		_, err := sf.fd.ReadAt(data, 0)
+		s.mu.RUnlock()
+		if err != nil {
+			return nil, err
+		}
+		return data, nil
 	}
 	s.mu.RUnlock()
 
-	if !ok {
-		// Try reading from disk.
-		sp := s.shadowPath(remotePath)
-		return os.ReadFile(sp)
-	}
-
-	data := make([]byte, size)
-	_, err := sf.fd.ReadAt(data, 0)
-	if err != nil {
-		return nil, err
-	}
-	return data, nil
+	// Try reading from disk.
+	sp := s.shadowPath(remotePath)
+	return os.ReadFile(sp)
 }
 
 // Open opens the current shadow file for remotePath for streaming reads.
@@ -1057,8 +1056,7 @@ func (s *ShadowStore) Has(remotePath string) bool {
 	return err == nil
 }
 
-// Close closes all open shadow file descriptors, including superseded fds
-// kept alive for concurrent reader safety.
+// Close closes all open shadow file descriptors.
 func (s *ShadowStore) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1069,15 +1067,11 @@ func (s *ShadowStore) Close() {
 	for _, rt := range s.retired {
 		_ = rt.fd.Close()
 	}
-	for _, fd := range s.supersededFds {
-		_ = fd.Close()
-	}
 	s.files = make(map[string]*ShadowFile)
 	s.active = make(map[string]uint64)
 	s.genFile = make(map[uint64]*ShadowFile)
 	s.refs = make(map[uint64]int32)
 	s.retired = make(map[uint64]*retiredShadow)
-	s.supersededFds = nil
 }
 
 // RecoverFromDisk scans the shadow directory and loads shadow files into memory.
