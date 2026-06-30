@@ -186,33 +186,14 @@ func (s *ShadowStore) checkQuotaForDelta(delta int64) error {
 }
 
 // CheckWriteBackQuotaThrottled is a throttled version of CheckWriteBackQuota.
-// The Statfs result is cached for diskCheckInterval; the byte quota check
-// always runs fresh (it is cheap — just an atomic load).
+// The byte quota check always runs fresh (cheap atomic load). The free-ratio
+// check is throttled via checkFreeRatioThrottled (Statfs cached for
+// diskCheckInterval).
 func (s *ShadowStore) CheckWriteBackQuotaThrottled(requiredBytes int64) error {
-	// Byte quota check always runs (cheap, no syscall).
 	if err := s.checkByteQuota(requiredBytes); err != nil {
 		return err
 	}
-
-	// Free-ratio check is throttled via CAS.
-	now := time.Now().UnixNano()
-	last := s.lastDiskCheck.Load()
-	if now-last < int64(diskCheckInterval) {
-		if !s.diskOK.Load() {
-			return syscall.ENOSPC
-		}
-		return nil
-	}
-	if s.lastDiskCheck.CompareAndSwap(last, now) {
-		err := s.checkFreeRatio(requiredBytes)
-		s.diskOK.Store(err == nil)
-		return err
-	}
-	// CAS loser: use cached Statfs result.
-	if !s.diskOK.Load() {
-		return syscall.ENOSPC
-	}
-	return nil
+	return s.checkFreeRatioThrottled(requiredBytes)
 }
 
 // AddPendingBytes is a no-op. Pending byte accounting is now managed
@@ -410,23 +391,28 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 // quotaCopyBufSize is the chunk size for quota-aware streaming copies.
 const quotaCopyBufSize = 32 << 10 // 32KB
 
-// quotaCopy copies from r to dst, checking the byte quota after each chunk.
-// During streaming the old shadow file still exists on disk alongside the
-// growing temp file, so peak disk usage is oldSize + tempSize. To bound
-// peak usage, the check uses the full temp size (written+nr) as the
-// required bytes — not just the delta — because both files coexist until
-// the atomic rename.
+// quotaCopy copies from r to dst, checking both byte quota and free-ratio
+// incrementally. During streaming the old shadow file still exists on disk
+// alongside the growing temp file, so peak disk usage is oldSize + tempSize.
+// Both checks use the full temp size (written+nr) as required bytes.
+// The byte quota check runs on every chunk (cheap atomic load). The
+// free-ratio check is throttled via the same diskOK/lastDiskCheck mechanism
+// used by CheckWriteBackQuotaThrottled, so Statfs runs at most once per
+// diskCheckInterval.
 func (s *ShadowStore) quotaCopy(dst io.Writer, r io.Reader, oldSize int64) (int64, error) {
 	buf := make([]byte, quotaCopyBufSize)
 	var written int64
 	for {
 		nr, readErr := r.Read(buf)
 		if nr > 0 {
-			// Check byte quota using the full temp file size (not delta)
+			// Check both quotas using the full temp file size (not delta)
 			// because the old shadow still occupies disk until rename.
 			tmpSize := written + int64(nr)
 			if tmpSize > 0 {
 				if err := s.checkByteQuota(tmpSize); err != nil {
+					return written, err
+				}
+				if err := s.checkFreeRatioThrottled(tmpSize); err != nil {
 					return written, err
 				}
 			}
@@ -448,11 +434,36 @@ func (s *ShadowStore) quotaCopy(dst io.Writer, r io.Reader, oldSize int64) (int6
 	}
 }
 
+// checkFreeRatioThrottled checks the free-ratio guard using the same
+// throttle mechanism as CheckWriteBackQuotaThrottled. Returns ENOSPC if
+// the cached or fresh Statfs result indicates insufficient free space.
+func (s *ShadowStore) checkFreeRatioThrottled(requiredBytes int64) error {
+	if s.writeCacheFreeRatio <= 0 {
+		return nil
+	}
+	now := time.Now().UnixNano()
+	last := s.lastDiskCheck.Load()
+	if now-last < int64(diskCheckInterval) {
+		if !s.diskOK.Load() {
+			return syscall.ENOSPC
+		}
+		return nil
+	}
+	if s.lastDiskCheck.CompareAndSwap(last, now) {
+		err := s.checkFreeRatio(requiredBytes)
+		s.diskOK.Store(err == nil)
+		return err
+	}
+	if !s.diskOK.Load() {
+		return syscall.ENOSPC
+	}
+	return nil
+}
+
 // WriteStream replaces the shadow contents by streaming from r.
 // Returns ENOSPC if the streamed data would breach disk protection limits.
-// The byte quota is checked incrementally during streaming so that peak disk
-// usage of the temp file is bounded by the quota. The free-ratio check runs
-// once after streaming completes (Statfs per chunk would be too expensive).
+// Both byte quota and free-ratio are checked incrementally during streaming
+// via quotaCopy (byte quota every chunk, free-ratio throttled via diskOK).
 // On quota breach the temp file is removed and the original shadow is
 // untouched.
 func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64) (int64, error) {
@@ -472,8 +483,8 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 		return 0, fmt.Errorf("shadow stream tmp create: %w", err)
 	}
 
-	// Use a quota-aware copy: check byte quota every 32KB so the temp file
-	// never grows far beyond the quota limit.
+	// Use a quota-aware copy: check byte quota + free-ratio every chunk so
+	// the temp file never grows far beyond the protection limit.
 	n, err := s.quotaCopy(tmpFd, r, oldSize)
 	if err != nil {
 		_ = tmpFd.Close()
@@ -490,14 +501,6 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	}
 	_ = tmpFd.Close()
 
-	// Post-stream free-ratio check (Statfs is too expensive to run per chunk).
-	// Use the full temp size (not delta) because old shadow + temp coexist.
-	if n > 0 {
-		if err := s.checkFreeRatio(n); err != nil {
-			_ = os.Remove(tmpPath)
-			return 0, err
-		}
-	}
 	delta := n - oldSize
 
 	// Commit: swap temp file over the shadow file.
