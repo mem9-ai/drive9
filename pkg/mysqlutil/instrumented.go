@@ -272,8 +272,8 @@ func (tx instrumentedTx) Rollback() error {
 	return err
 }
 
-func observeDBOperation(ctx context.Context, role, tenantID, operation string, start time.Time, err error) {
-	metrics.RecordTenantDBOperation(role, tenantID, operation, dbResult(err), time.Since(start))
+func observeDBOperation(ctx context.Context, role, _ string, operation string, start time.Time, err error) {
+	metrics.RecordDBOperation(role, operation, dbResult(err), time.Since(start))
 }
 
 func dbResult(err error) string {

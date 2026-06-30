@@ -51,15 +51,18 @@ func TestRecordTenantOperationCountDoesNotRecordDuration(t *testing.T) {
 	}
 }
 
-func TestRecordTenantDBOperationIncludesTenantID(t *testing.T) {
+func TestRecordDBOperationOmitsTenantID(t *testing.T) {
 	const tenantID = "tenant-db-operation-test"
 
-	RecordTenantDBOperation("user", tenantID, "query", "ok", 0)
+	RecordDBOperation("user", "query", "ok", 0)
 
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	text := rec.Body.String()
-	if !strings.Contains(text, `drive9_db_operations_total{operation="query",result="ok",role="user",tenant_id="`+tenantID+`"} 1`) {
-		t.Fatalf("missing tenant db operation total:\n%s", text)
+	if !strings.Contains(text, `drive9_db_operations_total{operation="query",result="ok",role="user"} 1`) {
+		t.Fatalf("missing db operation total:\n%s", text)
+	}
+	if strings.Contains(text, `tenant_id="`+tenantID+`"`) {
+		t.Fatalf("db operation metrics must not carry tenant_id:\n%s", text)
 	}
 }

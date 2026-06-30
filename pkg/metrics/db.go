@@ -77,19 +77,11 @@ const (
 )
 
 func RecordDBOperation(role, operation, result string, d time.Duration) {
-	RecordTenantDBOperation(role, "", operation, result, d)
-}
-
-func RecordTenantDBOperation(role, tenantID, operation, result string, d time.Duration) {
 	RegisterModule("db")
 	attrs := []Attribute{
 		Attr("role", cleanMetricValue(role, "unknown")),
 		Attr("operation", cleanMetricValue(operation, "unknown")),
 		Attr("result", cleanMetricValue(result, "unknown")),
-	}
-	tenantID = cleanMetricValue(tenantID, "unknown")
-	if tenantID != "unknown" {
-		attrs = append(attrs, Attr("tenant_id", tenantID))
 	}
 	dbOperationsTotal.Add(1, attrs...)
 	dbOperationDuration.Observe(d.Seconds(), attrs...)
