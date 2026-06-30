@@ -303,6 +303,14 @@ func (s *ShadowStore) Ensure(remotePath string, size int64, baseRev int64) error
 		return err
 	}
 
+	s.mu.RLock()
+	oldSize := sf.size
+	s.mu.RUnlock()
+	delta := size - oldSize
+	if err := s.checkQuotaForDelta(delta); err != nil {
+		return err
+	}
+
 	s.mu.Lock()
 	if err := sf.fd.Truncate(size); err != nil {
 		s.mu.Unlock()
@@ -313,6 +321,7 @@ func (s *ShadowStore) Ensure(remotePath string, size int64, baseRev int64) error
 		sf.baseRev = baseRev
 	}
 	s.mu.Unlock()
+	s.pendingBytes.Add(delta)
 	return nil
 }
 

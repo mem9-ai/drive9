@@ -1007,6 +1007,43 @@ func TestWriteStreamQuotaEnforcement(t *testing.T) {
 	}
 }
 
+func TestEnsureQuotaEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Ensure within quota should succeed and track pendingBytes.
+	if err := ss.Ensure("/f.txt", 80, 1); err != nil {
+		t.Fatalf("Ensure within quota should succeed: %v", err)
+	}
+	if p := ss.PendingBytes(); p != 80 {
+		t.Fatalf("expected pending 80 after Ensure, got %d", p)
+	}
+
+	// Ensure exceeding quota should ENOSPC.
+	err = ss.Ensure("/f.txt", 200, 2)
+	if err != syscall.ENOSPC {
+		t.Fatalf("Ensure exceeding quota should ENOSPC, got %v", err)
+	}
+	// Pending should still be 80.
+	if p := ss.PendingBytes(); p != 80 {
+		t.Fatalf("expected pending 80 after rejected Ensure, got %d", p)
+	}
+
+	// WriteAt within the Ensured range should not bypass quota.
+	// (delta=0 since WriteAt doesn't grow beyond Ensured size)
+	_, err = ss.WriteAt("/f.txt", 0, make([]byte, 80), 1)
+	if err != nil {
+		t.Fatalf("WriteAt within Ensured size should succeed: %v", err)
+	}
+	if p := ss.PendingBytes(); p != 80 {
+		t.Fatalf("expected pending 80 after WriteAt, got %d", p)
+	}
+}
+
 func TestCheckWriteBackQuotaThrottled(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStoreWithQuota(dir, 0.10, 0)
