@@ -87,6 +87,9 @@ func run(manifestPath, outcomesPath, summariesDir, outPath, issueBodyPath, tierO
 			OwnerHint:      "ci",
 			Detail:         "a required step failed before per-suite results were collected",
 		})
+		// Re-aggregate intentionally: the first Aggregate decided there was no
+		// signal; rebuild the report so the injected suite flows into Failed,
+		// the signature, and the notify decision.
 		report = e2ereport.Aggregate(runContextFromEnv(tier), summaries)
 		fmt.Fprintln(os.Stderr, "e2e-aggregate: degraded run — injected synthetic pipeline failure")
 	}

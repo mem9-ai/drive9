@@ -541,8 +541,17 @@ jobs:
       # Push failures/regressions that warrant attention to Feishu/Lark. PR-tier
       # failures stay in GitHub by policy; the notifier no-ops when no Feishu
       # secret is configured, so this never blocks a fork/PR without secrets.
+      #
+      # SECURITY: only run on trusted events. A pull_request runs code from the PR
+      # checkout, and a PR-controlled aggregator can set notify=true (e.g. a perf
+      # regression notifies regardless of tier); exposing the Feishu secrets to
+      # `go run` on a PR would let a same-repo PR exfiltrate them. push/schedule
+      # are main-only; workflow_dispatch/workflow_call require a trusted actor.
       - name: Notify Feishu on post-merge/nightly failure or perf regression
-        if: always() && steps.aggregate.outputs.notify == 'true'
+        if: >-
+          always() && steps.aggregate.outputs.notify == 'true' &&
+          (github.event_name == 'push' || github.event_name == 'schedule' ||
+          github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call')
         continue-on-error: true
         env:
           FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
@@ -657,7 +666,9 @@ jobs:
           # issue. With no signature we keep the legacy single-issue behaviour.
           # The search+create is not atomic, but the workflow concurrency group
           # serializes main runs, so a duplicate-issue race is not expected here.
-          if [ -n "$SIGNATURE" ]; then
+          # The signature is a sha256 hex slice; require [0-9a-f] before splicing
+          # it into the jq filter (defense-in-depth against jq metacharacters).
+          if [[ "$SIGNATURE" =~ ^[0-9a-f]+$ ]]; then
             existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
               --search "in:title $SIGNATURE" --json number,title \
               --jq "[.[] | select(.title | contains(\"[sig: $SIGNATURE]\"))][0].number // empty")"
