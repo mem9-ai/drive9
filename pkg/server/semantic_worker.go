@@ -215,6 +215,7 @@ type semanticTenantScanSnapshot struct {
 	cursorID        string
 	rawTenants      int
 	includedTenants int
+	limited         bool
 	wrapped         bool
 }
 
@@ -548,8 +549,9 @@ func (m *semanticWorkerManager) processKicked(ctx context.Context, tenantID stri
 	m.Kick(tenantID)
 }
 
-// kickRef resolves a kicked tenant ID to a schedulable ref, applying the same
-// status and provider/task-type filters as cached polling.
+// kickRef resolves a kicked tenant ID to a schedulable ref. Unlike cached
+// polling, a kick can wake a dormant tenant, so it applies provider/task-type
+// filters before acquiring the backend.
 func (m *semanticWorkerManager) kickRef(ctx context.Context, tenantID string) (semanticTenantRef, bool) {
 	if tenantID == semanticLocalTenantID {
 		// Match scan behavior: the local fallback is only schedulable outside
@@ -952,7 +954,7 @@ func (m *semanticWorkerManager) recordCachedTenantScan(raw, included int, limite
 		limit:           m.opts.TenantScanLimit,
 		rawTenants:      raw,
 		includedTenants: included,
-		wrapped:         limited,
+		limited:         limited,
 	}
 }
 
@@ -1450,6 +1452,7 @@ func semanticTenantScanLogFields(s semanticTenantScanSnapshot) []zap.Field {
 		zap.String("tenant_scan_cursor_id", s.cursorID),
 		zap.Int("tenant_scan_raw_tenants", s.rawTenants),
 		zap.Int("tenant_scan_included_tenants", s.includedTenants),
+		zap.Bool("tenant_scan_limited", s.limited),
 		zap.Bool("tenant_scan_wrapped", s.wrapped),
 	}
 	if s.cursorSet {

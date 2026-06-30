@@ -1299,7 +1299,7 @@ func TestSemanticWorkerListTenantRefsIncludesOnlyWarmCachedTenants(t *testing.T)
 		t.Fatalf("refs = %v, want one cached tenant and no dormant tenant", got)
 	}
 	scan := m.tenantScanSnapshot()
-	if scan.rawTenants != 2 || scan.includedTenants != 1 || !scan.wrapped || scan.cursorSet {
+	if scan.rawTenants != 2 || scan.includedTenants != 1 || !scan.limited || scan.wrapped || scan.cursorSet {
 		t.Fatalf("tenant scan snapshot = %+v, want limited warm scan", scan)
 	}
 }
