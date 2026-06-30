@@ -186,6 +186,7 @@ var (
 	// full schema diff on every tenant open.
 	periodicTiDBSchemaValidationEvery uint64 = 32
 	defaultTenantPoolDrainTimeout            = 30 * time.Second
+	defaultTenantPoolMaxTenants              = 1024
 )
 
 type entry struct {
@@ -202,7 +203,7 @@ type entry struct {
 func NewPool(cfg PoolConfig, enc encrypt.Encryptor) *Pool {
 	max := cfg.MaxTenants
 	if max <= 0 {
-		max = 128
+		max = defaultTenantPoolMaxTenants
 	}
 	return &Pool{
 		cfg:     cfg,
@@ -709,7 +710,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 	}
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?%s", t.DBUser, string(pass), t.DBHost, t.DBPort, t.DBName, query)
 	openStoreStart := time.Now()
-	store, err := datastore.Open(dsn)
+	store, err := datastore.OpenForTenant(dsn, t.ID)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open datastore: %w", err)
 	}

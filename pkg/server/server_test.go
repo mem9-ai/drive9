@@ -2126,12 +2126,7 @@ func TestMetricsEndpoint(t *testing.T) {
 	if !strings.Contains(text, `drive9_db_operations_total{operation="`) || !strings.Contains(text, `role="user"`) {
 		t.Fatalf("expected user db operation metric in response: %s", text)
 	}
-	for _, line := range strings.Split(text, "\n") {
-		if strings.HasPrefix(line, "drive9_db_") && strings.Contains(line, `tenant_id="`) {
-			t.Fatalf("expected db operation metrics to avoid tenant_id labels: %s", line)
-		}
-	}
-	if !strings.Contains(text, `drive9_db_pool_registered{role="user"}`) {
+	if !strings.Contains(text, `drive9_db_pool_registered{role="user"`) {
 		t.Fatalf("expected user db pool metric in response: %s", text)
 	}
 	if !strings.Contains(text, `drive9_tenant_requests_total{action="write",result="ok",status="200",status_class="2xx",surface="fs",tenant_id="local"}`) {

@@ -50,3 +50,19 @@ func TestRecordTenantOperationCountDoesNotRecordDuration(t *testing.T) {
 		t.Fatalf("counter-only operation unexpectedly recorded a duration:\n%s", text)
 	}
 }
+
+func TestRecordDBOperationOmitsTenantID(t *testing.T) {
+	const tenantID = "tenant-db-operation-test"
+
+	RecordDBOperation("user", "query", "ok", 0)
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	text := rec.Body.String()
+	if !strings.Contains(text, `drive9_db_operations_total{operation="query",result="ok",role="user"} 1`) {
+		t.Fatalf("missing db operation total:\n%s", text)
+	}
+	if strings.Contains(text, `tenant_id="`+tenantID+`"`) {
+		t.Fatalf("db operation metrics must not carry tenant_id:\n%s", text)
+	}
+}

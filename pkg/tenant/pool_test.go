@@ -23,6 +23,13 @@ import (
 	"github.com/mem9-ai/drive9/pkg/tenant/schema"
 )
 
+func TestNewPoolUsesDefaultMaxTenants(t *testing.T) {
+	pool := NewPool(PoolConfig{}, nil)
+	if pool.maxSize != defaultTenantPoolMaxTenants {
+		t.Fatalf("max size = %d, want %d", pool.maxSize, defaultTenantPoolMaxTenants)
+	}
+}
+
 func TestPoolAcquireInvalidateDefersCloseUntilRelease(t *testing.T) {
 	pool, tenant := newTestPoolAndTenant(t, 2, "tenant-a")
 	ctx := context.Background()
