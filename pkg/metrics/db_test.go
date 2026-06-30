@@ -150,3 +150,25 @@ func TestDBMetricsIncludeTenantIDForTenantPools(t *testing.T) {
 		t.Fatalf("expected tenant pool wait series, got:\n%s", out)
 	}
 }
+
+func TestDBHealthProbeDropsUnregisteredTenantState(t *testing.T) {
+	const tenantID = "tenant-db-unregister-test"
+
+	healthy := &atomic.Bool{}
+	healthy.Store(false)
+	db := sql.OpenDB(fakeConnector{healthy: healthy})
+	db.SetMaxIdleConns(0)
+	t.Cleanup(func() { _ = db.Close() })
+
+	RegisterTenantDB("user", tenantID, db)
+	globalDB.probeOnce(context.Background(), time.Second, nil)
+	if _, ok := globalDB.probe[dbMetricKey{role: "user", tenantID: tenantID}]; !ok {
+		t.Fatalf("expected tenant probe state to be recorded")
+	}
+
+	UnregisterDB(db)
+	globalDB.probeOnce(context.Background(), time.Second, nil)
+	if _, ok := globalDB.probe[dbMetricKey{role: "user", tenantID: tenantID}]; ok {
+		t.Fatalf("expected tenant probe state to be removed after unregister")
+	}
+}

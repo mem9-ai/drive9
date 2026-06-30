@@ -214,12 +214,10 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 			// pool — at most probeConcurrency in flight cluster-wide. Any opened
 			// conn is later reaped by ConnMaxIdleTime.
 			//
-			// Caveat: on a pool with an explicit MaxOpenConns that is fully checked
-			// out, PingContext blocks for a free slot and may hit `timeout`,
-			// recording the pool as unreachable when it is merely saturated. This is
-			// rarely hit because ApplyPoolDefaults leaves MaxOpenConns unlimited
-			// unless the role-specific max-open env var is set; the pool-saturation
-			// alert covers that condition directly.
+			// Caveat: on a pool with MaxOpenConns fully checked out, PingContext
+			// blocks for a free slot and may hit `timeout`, recording the pool as
+			// unreachable when it is merely saturated. The pool-saturation alert
+			// covers that condition directly.
 			pingCtx, cancel := context.WithTimeout(ctx, timeout)
 			start := time.Now()
 			err := db.PingContext(pingCtx)
@@ -250,15 +248,14 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 	now := time.Now()
 
 	m.mu.Lock()
-	if m.probe == nil {
-		m.probe = map[dbMetricKey]dbProbeState{}
-	}
+	prevProbe := m.probe
+	nextProbe := make(map[dbMetricKey]dbProbeState, len(results))
 	for keyString, agg := range results {
 		pool := poolsByKeyString[keyString]
 		key := pool.metricKey()
 		up := agg.unreachable == 0
-		prev, existed := m.probe[key]
-		m.probe[key] = dbProbeState{
+		prev, existed := prevProbe[key]
+		nextProbe[key] = dbProbeState{
 			up:               up,
 			unreachablePools: agg.unreachable,
 			totalPools:       agg.total,
@@ -271,6 +268,7 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 			transitions = append(transitions, transition{info: pool.info(), up: up, err: agg.firstErr})
 		}
 	}
+	m.probe = nextProbe
 	m.mu.Unlock()
 
 	for _, t := range transitions {
