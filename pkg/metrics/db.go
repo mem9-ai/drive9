@@ -65,9 +65,9 @@ var dbProbeDuration = dbMeter.Float64Histogram("drive9_db_probe_duration_seconds
 // DefaultDBHealthProbeInterval and DefaultDBHealthProbeTimeout are the fallbacks
 // used by StartDBHealthProbe when callers pass non-positive values.
 const (
-	DefaultDBHealthProbeInterval = 15 * time.Second
-	DefaultDBHealthProbeTimeout  = 3 * time.Second
-	dbRoleMeta                   = "meta"
+	DefaultDBHealthProbeInterval        = 15 * time.Second
+	DefaultDBHealthProbeTimeout         = 3 * time.Second
+	dbRoleMeta                   string = "meta"
 )
 
 // DBHealthProbeOptions controls which registered DB pools are actively pinged.
@@ -199,6 +199,7 @@ func (m *dbMetrics) probeOnceWithOptions(ctx context.Context, timeout time.Durat
 	type roleAgg struct {
 		total       int
 		unreachable int
+		saturated   int
 		firstErr    error
 	}
 	results := map[string]*roleAgg{}
@@ -240,6 +241,9 @@ func (m *dbMetrics) probeOnceWithOptions(ctx context.Context, timeout time.Durat
 			// this state, even if the database is also unreachable underneath.
 			if isDBPoolSaturated(db) {
 				result = "pool_saturated"
+				aggMu.Lock()
+				results[role].saturated++
+				aggMu.Unlock()
 				observeDBProbeDuration(start, role, result)
 				return
 			}
@@ -276,9 +280,14 @@ func (m *dbMetrics) probeOnceWithOptions(ctx context.Context, timeout time.Durat
 	for role, agg := range results {
 		up := agg.unreachable == 0
 		prev, existed := prevProbe[role]
+		unreachablePools := agg.unreachable
+		if existed && agg.saturated > 0 && agg.unreachable == 0 {
+			up = prev.up
+			unreachablePools = prev.unreachablePools
+		}
 		nextProbe[role] = dbProbeState{
 			up:               up,
-			unreachablePools: agg.unreachable,
+			unreachablePools: unreachablePools,
 			totalPools:       agg.total,
 			lastProbe:        now,
 			known:            true,

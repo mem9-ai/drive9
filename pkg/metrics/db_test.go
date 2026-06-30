@@ -230,13 +230,19 @@ func TestDBHealthProbeDropsUnregisteredState(t *testing.T) {
 
 	RegisterDB(role, db)
 	globalDB.probeOnce(context.Background(), time.Second, nil)
-	if _, ok := globalDB.probe[role]; !ok {
+	globalDB.mu.RLock()
+	_, ok := globalDB.probe[role]
+	globalDB.mu.RUnlock()
+	if !ok {
 		t.Fatalf("expected probe state to be recorded")
 	}
 
 	UnregisterDB(db)
 	globalDB.probeOnce(context.Background(), time.Second, nil)
-	if _, ok := globalDB.probe[role]; ok {
+	globalDB.mu.RLock()
+	_, ok = globalDB.probe[role]
+	globalDB.mu.RUnlock()
+	if ok {
 		t.Fatalf("expected probe state to be removed after unregister")
 	}
 }
@@ -279,5 +285,40 @@ func TestDBHealthProbeDoesNotMarkSaturatedMetaPoolDown(t *testing.T) {
 	fullText := rec.Body.String()
 	if !strings.Contains(fullText, `drive9_db_probe_duration_seconds_bucket{result="pool_saturated",role="meta"`) {
 		t.Fatalf("expected saturated meta probe duration series, got:\n%s", fullText)
+	}
+}
+
+func TestDBHealthProbeKeepsPreviousDownStateWhenMetaPoolSaturated(t *testing.T) {
+	healthy := &atomic.Bool{}
+	healthy.Store(false)
+	db := sql.OpenDB(fakeConnector{healthy: healthy})
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(0)
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = db.Close()
+	})
+
+	RegisterDB("meta", db)
+	globalDB.probeOnce(context.Background(), time.Second, nil)
+	if out := renderDB(t); !strings.Contains(out, `drive9_db_up{role="meta"} 0`) {
+		t.Fatalf("expected failed probe to mark meta down, got:\n%s", out)
+	}
+
+	healthy.Store(true)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open held conn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	globalDB.probeOnce(context.Background(), 10*time.Millisecond, nil)
+	out := renderDB(t)
+	if !strings.Contains(out, `drive9_db_up{role="meta"} 0`) {
+		t.Fatalf("expected saturated meta pool to preserve previous down state, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_unreachable_pools{role="meta"} 1`) {
+		t.Fatalf("expected saturated meta pool to preserve previous unreachable count, got:\n%s", out)
 	}
 }
