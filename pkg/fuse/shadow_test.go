@@ -1190,3 +1190,69 @@ func TestRenamePendingBytesReplacesTarget(t *testing.T) {
 		t.Fatalf("after rename: pendingBytes=%d, want 5", pb)
 	}
 }
+
+// TestWriteStreamConcurrentReadAt verifies no data race between WriteStream
+// and ReadAt on the same path. Run with -race to detect.
+func TestWriteStreamConcurrentReadAt(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Seed initial shadow.
+	if err := ss.WriteFull("/f", []byte("initial"), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	// Concurrent reader.
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64)
+		for i := 0; i < 200; i++ {
+			_, _ = ss.ReadAt("/f", 0, buf)
+		}
+	}()
+	// Concurrent writer.
+	for i := 0; i < 50; i++ {
+		data := bytes.Repeat([]byte("x"), i+1)
+		_, _ = ss.WriteStream("/f", bytes.NewReader(data), int64(i+2))
+	}
+	<-done
+}
+
+// TestWriteStreamConcurrentReadAtGen verifies no data race between WriteStream
+// and ReadAtGen on a pinned active generation. Run with -race to detect.
+func TestWriteStreamConcurrentReadAtGen(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Seed initial shadow and pin it.
+	if err := ss.WriteFull("/f", []byte("initial"), 1); err != nil {
+		t.Fatal(err)
+	}
+	gen := ss.Pin("/f")
+	defer ss.Unpin(gen)
+
+	done := make(chan struct{})
+	// Concurrent reader via pinned generation.
+	go func() {
+		defer close(done)
+		buf := make([]byte, 64)
+		for i := 0; i < 200; i++ {
+			_, _ = ss.ReadAtGen(gen, 0, buf)
+		}
+	}()
+	// Concurrent writer.
+	for i := 0; i < 50; i++ {
+		data := bytes.Repeat([]byte("x"), i+1)
+		_, _ = ss.WriteStream("/f", bytes.NewReader(data), int64(i+2))
+	}
+	<-done
+}
