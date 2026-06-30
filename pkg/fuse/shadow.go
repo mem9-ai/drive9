@@ -677,18 +677,23 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 // Works for both active generations (shadow still in files map) and retired
 // generations (shadow moved to retired map by Remove). Returns (0, error)
 // if the generation is unknown.
+// The read is performed under RLock to prevent WriteStream from swapping
+// the fd mid-read on active generations.
 func (s *ShadowStore) ReadAtGen(gen uint64, offset int64, buf []byte) (int, error) {
 	s.mu.RLock()
 	if sf, ok := s.genFile[gen]; ok {
+		n, err := sf.fd.ReadAt(buf, offset)
 		s.mu.RUnlock()
-		return sf.fd.ReadAt(buf, offset)
+		return n, err
 	}
 	rt, ok := s.retired[gen]
-	s.mu.RUnlock()
-	if !ok {
-		return 0, fmt.Errorf("shadow gen %d not found", gen)
+	if ok {
+		n, err := rt.fd.ReadAt(buf, offset)
+		s.mu.RUnlock()
+		return n, err
 	}
-	return rt.fd.ReadAt(buf, offset)
+	s.mu.RUnlock()
+	return 0, fmt.Errorf("shadow gen %d not found", gen)
 }
 
 // SizeGen returns the size of a shadow file by generation token. Works for
