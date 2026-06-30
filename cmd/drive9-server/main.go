@@ -142,18 +142,14 @@ func main() {
 	}
 	defer func() { _ = store.Close() }()
 
-	// Continuously probe registered databases so that a metadata ("meta") or tenant
-	// ("user") store that becomes unreachable *after* startup is visible via the
-	// drive9_db_up gauge and the access log, not just indirectly through failing
-	// traffic. The probe covers the meta store immediately and tenant pools as they
-	// register. The startup ping above only proves reachability at boot.
+	// Continuously probe the long-lived metadata ("meta") store so a control-plane
+	// DB outage after startup is visible via drive9_db_up and logs. Tenant user
+	// and user_schema pools are workload pools; probing them would only keep
+	// short-lived connections warm and compete with business traffic.
 	probeInterval := time.Duration(envInt("DRIVE9_DB_HEALTH_PROBE_INTERVAL_SECONDS", 15)) * time.Second
 	probeTimeout := time.Duration(envInt("DRIVE9_DB_HEALTH_PROBE_TIMEOUT_SECONDS", 3)) * time.Second
-	metrics.StartDBHealthProbe(context.Background(), probeInterval, probeTimeout, func(info metrics.DBPoolInfo, up bool, err error) {
-		fields := []zap.Field{zap.String("role", info.Role)}
-		if info.TenantID != "" {
-			fields = append(fields, zap.String("tenant_id", info.TenantID))
-		}
+	metrics.StartDBHealthProbeWithOptions(context.Background(), probeInterval, probeTimeout, dbHealthProbeOptionsFromEnv(), func(role string, up bool, err error) {
+		fields := []zap.Field{zap.String("role", role)}
 		if up {
 			logger.Info(context.Background(), "db_recovered", fields...)
 			return
@@ -525,6 +521,9 @@ environment:
   DRIVE9_USER_DB_MAX_IDLE_CONNS max idle connections for each cached tenant user DB pool (default: 1)
   DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS max open connections for tenant schema-init DB pools (default: 8)
   DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS max idle connections for tenant schema-init DB pools (default: 0)
+  DRIVE9_DB_HEALTH_PROBE_INTERVAL_SECONDS DB health probe interval seconds (default: 15)
+  DRIVE9_DB_HEALTH_PROBE_TIMEOUT_SECONDS DB health probe timeout seconds (default: 3)
+  DRIVE9_DB_HEALTH_PROBE_META_ENABLED true|false to probe the control-plane DB (default: true)
   DRIVE9_ENCRYPT_TYPE local_aes|kms|aliyun_kms|tencent_kms
   DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
   DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms/aliyun_kms/tencent_kms)
@@ -923,6 +922,12 @@ func envBool(key string, fallback bool) bool {
 		return false
 	default:
 		return fallback
+	}
+}
+
+func dbHealthProbeOptionsFromEnv() metrics.DBHealthProbeOptions {
+	return metrics.DBHealthProbeOptions{
+		ProbeMeta: envBool("DRIVE9_DB_HEALTH_PROBE_META_ENABLED", true),
 	}
 }
 

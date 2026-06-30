@@ -113,6 +113,36 @@ func TestTenantPoolMaxSizeFromEnv(t *testing.T) {
 	}
 }
 
+func TestDBHealthProbeOptionsFromEnvDefaults(t *testing.T) {
+	keys := []string{
+		"DRIVE9_DB_HEALTH_PROBE_META_ENABLED",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	opts := dbHealthProbeOptionsFromEnv()
+	if !opts.ProbeMeta {
+		t.Fatal("ProbeMeta=false, want true")
+	}
+}
+
+func TestDBHealthProbeOptionsFromEnvOverrides(t *testing.T) {
+	keys := []string{
+		"DRIVE9_DB_HEALTH_PROBE_META_ENABLED",
+	}
+	restore := snapshotEnv(t, keys)
+	t.Cleanup(func() { restoreEnv(t, restore) })
+	unsetEnv(t, keys)
+
+	setEnv(t, "DRIVE9_DB_HEALTH_PROBE_META_ENABLED", "false")
+
+	opts := dbHealthProbeOptionsFromEnv()
+	if opts.ProbeMeta {
+		t.Fatal("ProbeMeta=true, want false")
+	}
+}
+
 func TestBuildBackendOptionsFromEnvAudioDisabled(t *testing.T) {
 	keys := []string{
 		"DRIVE9_QUERY_EMBED_API_BASE",

@@ -17,6 +17,7 @@ import (
 // toggled at runtime so the health probe can be exercised without a real MySQL.
 type fakeConnector struct {
 	healthy *atomic.Bool
+	ping    func(context.Context) error
 }
 
 func (c fakeConnector) Connect(context.Context) (driver.Conn, error) {
@@ -34,13 +35,17 @@ func (fakeDriver) Open(string) (driver.Conn, error) { return nil, errors.New("no
 
 type fakeConn struct {
 	healthy *atomic.Bool
+	ping    func(context.Context) error
 }
 
 func (fakeConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("not supported") }
 func (fakeConn) Close() error                        { return nil }
 func (fakeConn) Begin() (driver.Tx, error)           { return nil, errors.New("not supported") }
 
-func (c fakeConn) Ping(context.Context) error {
+func (c fakeConn) Ping(ctx context.Context) error {
+	if c.ping != nil {
+		return c.ping(ctx)
+	}
 	if !c.healthy.Load() {
 		return driver.ErrBadConn
 	}
@@ -55,7 +60,7 @@ func renderDB(t *testing.T) string {
 }
 
 func TestDBHealthProbeFlipsDriveDBUp(t *testing.T) {
-	const role = "probe_test_role"
+	const role = "meta"
 
 	healthy := &atomic.Bool{}
 	healthy.Store(true)
@@ -72,8 +77,8 @@ func TestDBHealthProbeFlipsDriveDBUp(t *testing.T) {
 		err error
 	}
 	var changes []change
-	onChange := func(info DBPoolInfo, up bool, err error) {
-		if info.Role != role {
+	onChange := func(gotRole string, up bool, err error) {
+		if gotRole != role {
 			return
 		}
 		mu.Lock()
@@ -124,7 +129,7 @@ func TestDBHealthProbeFlipsDriveDBUp(t *testing.T) {
 	}
 }
 
-func TestDBMetricsIncludeTenantIDForTenantPools(t *testing.T) {
+func TestDBHealthProbeSkipsTenantPools(t *testing.T) {
 	const (
 		role     = "user"
 		tenantID = "tenant-db-metrics-test"
@@ -144,8 +149,11 @@ func TestDBMetricsIncludeTenantIDForTenantPools(t *testing.T) {
 	globalDB.probeOnce(context.Background(), time.Second, nil)
 	out := renderDB(t)
 
-	if !strings.Contains(out, `drive9_db_up{role="user",tenant_id="`+tenantID+`"} 1`) {
-		t.Fatalf("expected tenant db_up series, got:\n%s", out)
+	if strings.Contains(out, `drive9_db_up{role="user"`) {
+		t.Fatalf("expected user pool to have no db_up series, got:\n%s", out)
+	}
+	if strings.Contains(out, `drive9_db_unreachable_pools{role="user"`) {
+		t.Fatalf("expected user pool to have no unreachable probe series, got:\n%s", out)
 	}
 	if !strings.Contains(out, `drive9_db_pool_registered{role="user",tenant_id="`+tenantID+`"} 1`) {
 		t.Fatalf("expected tenant pool_registered series, got:\n%s", out)
@@ -156,13 +164,64 @@ func TestDBMetricsIncludeTenantIDForTenantPools(t *testing.T) {
 	rec := httptest.NewRecorder()
 	WritePrometheus(rec)
 	fullText := rec.Body.String()
-	if !strings.Contains(fullText, `drive9_db_probe_duration_seconds_bucket{result="ok",role="user",tenant_id="`+tenantID+`"`) {
-		t.Fatalf("expected tenant probe duration series, got:\n%s", fullText)
+	if strings.Contains(fullText, `drive9_db_probe_duration_seconds_bucket{result="ok",role="user"`) {
+		t.Fatalf("expected user pool to have no probe duration series, got:\n%s", fullText)
 	}
 }
 
-func TestDBHealthProbeDropsUnregisteredTenantState(t *testing.T) {
-	const tenantID = "tenant-db-unregister-test"
+func TestDBHealthProbeSkipsUserSchemaPools(t *testing.T) {
+	healthy := &atomic.Bool{}
+	healthy.Store(true)
+	db := sql.OpenDB(fakeConnector{healthy: healthy})
+	db.SetMaxIdleConns(0)
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = db.Close()
+	})
+
+	RegisterDB("user_schema", db)
+	globalDB.probeOnce(context.Background(), time.Second, nil)
+
+	out := renderDB(t)
+	if strings.Contains(out, `drive9_db_up{role="user_schema"`) {
+		t.Fatalf("expected user_schema to have no db_up series, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_pool_registered{role="user_schema"} 1`) {
+		t.Fatalf("expected role-only user_schema pool stats to remain visible, got:\n%s", out)
+	}
+}
+
+func TestStartDBHealthProbeDisabledDoesNotStart(t *testing.T) {
+	globalDB.mu.Lock()
+	origStarted := globalDB.started
+	origProbe := globalDB.probe
+	globalDB.started = false
+	globalDB.probe = map[string]dbProbeState{
+		dbRoleMeta: {up: true, known: true},
+	}
+	globalDB.mu.Unlock()
+	t.Cleanup(func() {
+		globalDB.mu.Lock()
+		globalDB.started = origStarted
+		globalDB.probe = origProbe
+		globalDB.mu.Unlock()
+	})
+
+	StartDBHealthProbeWithOptions(context.Background(), time.Millisecond, time.Millisecond, DBHealthProbeOptions{}, nil)
+
+	globalDB.mu.RLock()
+	defer globalDB.mu.RUnlock()
+	if globalDB.started {
+		t.Fatal("disabled health probe started background goroutine")
+	}
+	if len(globalDB.probe) != 0 {
+		t.Fatalf("disabled health probe kept stale probe state: %+v", globalDB.probe)
+	}
+}
+
+func TestDBHealthProbeDropsUnregisteredState(t *testing.T) {
+	const role = "meta"
 
 	healthy := &atomic.Bool{}
 	healthy.Store(false)
@@ -174,22 +233,26 @@ func TestDBHealthProbeDropsUnregisteredTenantState(t *testing.T) {
 		_ = db.Close()
 	})
 
-	RegisterTenantDB("user", tenantID, db)
+	RegisterDB(role, db)
 	globalDB.probeOnce(context.Background(), time.Second, nil)
-	if _, ok := globalDB.probe[dbMetricKey{role: "user", tenantID: tenantID}]; !ok {
-		t.Fatalf("expected tenant probe state to be recorded")
+	globalDB.mu.RLock()
+	_, ok := globalDB.probe[role]
+	globalDB.mu.RUnlock()
+	if !ok {
+		t.Fatalf("expected probe state to be recorded")
 	}
 
 	UnregisterDB(db)
 	globalDB.probeOnce(context.Background(), time.Second, nil)
-	if _, ok := globalDB.probe[dbMetricKey{role: "user", tenantID: tenantID}]; ok {
-		t.Fatalf("expected tenant probe state to be removed after unregister")
+	globalDB.mu.RLock()
+	_, ok = globalDB.probe[role]
+	globalDB.mu.RUnlock()
+	if ok {
+		t.Fatalf("expected probe state to be removed after unregister")
 	}
 }
 
-func TestDBHealthProbeDoesNotMarkSaturatedTenantPoolDown(t *testing.T) {
-	const tenantID = "tenant-db-saturated-test"
-
+func TestDBHealthProbeKeepsPreviousUpStateWhenMetaPoolSaturated(t *testing.T) {
 	healthy := &atomic.Bool{}
 	healthy.Store(true)
 	db := sql.OpenDB(fakeConnector{healthy: healthy})
@@ -200,57 +263,21 @@ func TestDBHealthProbeDoesNotMarkSaturatedTenantPoolDown(t *testing.T) {
 		globalDB.probeOnce(context.Background(), time.Second, nil)
 		_ = db.Close()
 	})
-
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		t.Fatalf("open held conn: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
-
-	RegisterTenantDB("user", tenantID, db)
-	globalDB.probeOnce(context.Background(), 10*time.Millisecond, func(info DBPoolInfo, up bool, err error) {
-		if info.TenantID == tenantID {
-			t.Fatalf("expected no down transition for saturated tenant pool, got up=%v err=%v", up, err)
-		}
-	})
-
-	out := renderDB(t)
-	if !strings.Contains(out, `drive9_db_up{role="user",tenant_id="`+tenantID+`"} 1`) {
-		t.Fatalf("expected saturated tenant pool to remain up, got:\n%s", out)
-	}
-	if !strings.Contains(out, `drive9_db_unreachable_pools{role="user",tenant_id="`+tenantID+`"} 0`) {
-		t.Fatalf("expected saturated tenant pool not to count as unreachable, got:\n%s", out)
-	}
-
-	rec := httptest.NewRecorder()
-	WritePrometheus(rec)
-	fullText := rec.Body.String()
-	if !strings.Contains(fullText, `drive9_db_probe_duration_seconds_bucket{result="pool_saturated",role="user",tenant_id="`+tenantID+`"`) {
-		t.Fatalf("expected saturated probe duration series, got:\n%s", fullText)
-	}
-}
-
-func TestDBHealthProbeDoesNotMarkSaturatedMetaPoolDown(t *testing.T) {
-	healthy := &atomic.Bool{}
-	healthy.Store(true)
-	db := sql.OpenDB(fakeConnector{healthy: healthy})
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(0)
-	t.Cleanup(func() {
-		UnregisterDB(db)
-		globalDB.probeOnce(context.Background(), time.Second, nil)
-		_ = db.Close()
-	})
-
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		t.Fatalf("open held conn: %v", err)
-	}
-	t.Cleanup(func() { _ = conn.Close() })
 
 	RegisterDB("meta", db)
-	globalDB.probeOnce(context.Background(), 10*time.Millisecond, func(info DBPoolInfo, up bool, err error) {
-		if info.Role == "meta" {
+	globalDB.probeOnce(context.Background(), time.Second, nil)
+	if out := renderDB(t); !strings.Contains(out, `drive9_db_up{role="meta"} 1`) {
+		t.Fatalf("expected initial healthy meta probe, got:\n%s", out)
+	}
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open held conn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	globalDB.probeOnce(context.Background(), 10*time.Millisecond, func(role string, up bool, err error) {
+		if role == "meta" {
 			t.Fatalf("expected no down transition for saturated meta pool, got up=%v err=%v", up, err)
 		}
 	})
@@ -269,7 +296,179 @@ func TestDBHealthProbeDoesNotMarkSaturatedMetaPoolDown(t *testing.T) {
 	if !strings.Contains(fullText, `drive9_db_probe_duration_seconds_bucket{result="pool_saturated",role="meta"`) {
 		t.Fatalf("expected saturated meta probe duration series, got:\n%s", fullText)
 	}
-	if strings.Contains(fullText, `role="meta",tenant_id=`) {
-		t.Fatalf("expected meta probe duration series to omit tenant_id, got:\n%s", fullText)
+}
+
+func TestDBHealthProbeMarksFirstSaturatedMetaPoolDown(t *testing.T) {
+	healthy := &atomic.Bool{}
+	healthy.Store(true)
+	db := sql.OpenDB(fakeConnector{healthy: healthy})
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(0)
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = db.Close()
+	})
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open held conn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	var changes []struct {
+		up  bool
+		err error
+	}
+	RegisterDB("meta", db)
+	globalDB.probeOnce(context.Background(), 10*time.Millisecond, func(role string, up bool, err error) {
+		if role == "meta" {
+			changes = append(changes, struct {
+				up  bool
+				err error
+			}{up: up, err: err})
+		}
+	})
+
+	out := renderDB(t)
+	if !strings.Contains(out, `drive9_db_up{role="meta"} 0`) {
+		t.Fatalf("expected first saturated meta probe to mark role down, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_unreachable_pools{role="meta"} 1`) {
+		t.Fatalf("expected first saturated meta probe to count the unverified pool, got:\n%s", out)
+	}
+	if len(changes) != 1 || changes[0].up || changes[0].err == nil {
+		t.Fatalf("expected one down transition with saturation error, got %+v", changes)
+	}
+}
+
+func TestDBHealthProbeKeepsPreviousDownStateWhenMetaPoolSaturated(t *testing.T) {
+	healthy := &atomic.Bool{}
+	healthy.Store(false)
+	db := sql.OpenDB(fakeConnector{healthy: healthy})
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(0)
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = db.Close()
+	})
+
+	RegisterDB("meta", db)
+	globalDB.probeOnce(context.Background(), time.Second, nil)
+	if out := renderDB(t); !strings.Contains(out, `drive9_db_up{role="meta"} 0`) {
+		t.Fatalf("expected failed probe to mark meta down, got:\n%s", out)
+	}
+
+	healthy.Store(true)
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open held conn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	globalDB.probeOnce(context.Background(), 10*time.Millisecond, nil)
+	out := renderDB(t)
+	if !strings.Contains(out, `drive9_db_up{role="meta"} 0`) {
+		t.Fatalf("expected saturated meta pool to preserve previous down state, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_unreachable_pools{role="meta"} 1`) {
+		t.Fatalf("expected saturated meta pool to preserve previous unreachable count, got:\n%s", out)
+	}
+}
+
+func TestDBHealthProbeMarksRoleDownWhenOneMetaPoolSaturatedAndAnotherUnreachable(t *testing.T) {
+	saturatedHealthy := &atomic.Bool{}
+	saturatedHealthy.Store(true)
+	saturatedDB := sql.OpenDB(fakeConnector{healthy: saturatedHealthy})
+	saturatedDB.SetMaxOpenConns(1)
+	saturatedDB.SetMaxIdleConns(0)
+
+	unreachableHealthy := &atomic.Bool{}
+	unreachableHealthy.Store(false)
+	unreachableDB := sql.OpenDB(fakeConnector{healthy: unreachableHealthy})
+	unreachableDB.SetMaxIdleConns(0)
+
+	t.Cleanup(func() {
+		UnregisterDB(saturatedDB)
+		UnregisterDB(unreachableDB)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = saturatedDB.Close()
+		_ = unreachableDB.Close()
+	})
+
+	conn, err := saturatedDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open held conn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	RegisterDB("meta", saturatedDB)
+	RegisterDB("meta", unreachableDB)
+	globalDB.probeOnce(context.Background(), 10*time.Millisecond, nil)
+
+	out := renderDB(t)
+	if !strings.Contains(out, `drive9_db_up{role="meta"} 0`) {
+		t.Fatalf("expected mixed saturated/unreachable meta pools to mark role down, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_unreachable_pools{role="meta"} 1`) {
+		t.Fatalf("expected only the unreachable meta pool to count as unreachable, got:\n%s", out)
+	}
+}
+
+func TestDBHealthProbeDoesNotResurrectUnregisteredRoleAfterInFlightProbe(t *testing.T) {
+	const role = "meta"
+
+	healthy := &atomic.Bool{}
+	healthy.Store(true)
+	pingStarted := make(chan struct{})
+	releasePing := make(chan struct{})
+	var closeStarted sync.Once
+	db := sql.OpenDB(fakeConnector{
+		healthy: healthy,
+		ping: func(ctx context.Context) error {
+			closeStarted.Do(func() { close(pingStarted) })
+			select {
+			case <-releasePing:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	db.SetMaxIdleConns(0)
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = db.Close()
+	})
+
+	RegisterDB(role, db)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+	}()
+
+	select {
+	case <-pingStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for probe ping to start")
+	}
+
+	UnregisterDB(db)
+	close(releasePing)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for in-flight probe to finish")
+	}
+
+	globalDB.mu.RLock()
+	_, ok := globalDB.probe[role]
+	globalDB.mu.RUnlock()
+	if ok {
+		t.Fatalf("expected in-flight probe not to resurrect unregistered role")
 	}
 }
