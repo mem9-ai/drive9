@@ -9,34 +9,99 @@ import (
 )
 
 const (
-	defaultConnMaxLifetime = 5 * time.Minute
-	defaultConnMaxIdleTime = 45 * time.Second
+	defaultMetaConnMaxLifetime       = 5 * time.Minute
+	defaultMetaConnMaxIdleTime       = 45 * time.Second
+	defaultMetaMaxOpenConns          = 100
+	defaultMetaMaxIdleConns          = 20
+	defaultUserConnMaxLifetime       = 30 * time.Second
+	defaultUserConnMaxIdleTime       = 30 * time.Second
+	defaultUserMaxOpenConns          = 4
+	defaultUserMaxIdleConns          = 1
+	defaultUserSchemaConnMaxLifetime = 1 * time.Minute
+	defaultUserSchemaConnMaxIdleTime = 10 * time.Second
+	defaultUserSchemaMaxOpenConns    = 8
+	defaultUserSchemaMaxIdleConns    = 0
 )
 
 // ApplyPoolDefaults rotates and prunes idle connections before common LB/NAT
 // idle timeout windows. It also applies configurable open/idle connection
-// limits via DRIVE9_DB_MAX_OPEN_CONNS and DRIVE9_DB_MAX_IDLE_CONNS env vars
-// (default 0 = unlimited, backward compatible). In a multi-pod deployment,
-// set these to ensure N_pods × maxOpenConns ≤ TiDB max_connections.
-func ApplyPoolDefaults(db *sql.DB) {
-	db.SetConnMaxLifetime(defaultConnMaxLifetime)
-	db.SetConnMaxIdleTime(defaultConnMaxIdleTime)
-	if v := envInt("DRIVE9_DB_MAX_OPEN_CONNS", 0); v > 0 {
+// limits via role-specific env vars.
+//
+// Supported role-specific env vars:
+//   - DRIVE9_META_DB_MAX_OPEN_CONNS / DRIVE9_META_DB_MAX_IDLE_CONNS
+//   - DRIVE9_USER_DB_MAX_OPEN_CONNS / DRIVE9_USER_DB_MAX_IDLE_CONNS
+//   - DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS / DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS
+//
+// The limits apply to each *sql.DB pool, not to all pools in the process. In a
+// multi-pod deployment, set these so pod_count * pools_per_pod * maxOpenConns
+// stays within TiDB max_connections.
+func ApplyPoolDefaults(db *sql.DB, role string) {
+	lifetime, idleTime := defaultPoolLifetime(role)
+	db.SetConnMaxLifetime(lifetime)
+	db.SetConnMaxIdleTime(idleTime)
+	maxOpen, maxIdle := defaultPoolLimits(role)
+	if v := poolEnvInt(role, "MAX_OPEN_CONNS", maxOpen); v > 0 {
 		db.SetMaxOpenConns(v)
 	}
-	if v := envInt("DRIVE9_DB_MAX_IDLE_CONNS", 0); v > 0 {
+	if v := poolEnvInt(role, "MAX_IDLE_CONNS", maxIdle); v >= 0 {
 		db.SetMaxIdleConns(v)
 	}
 }
 
-func envInt(key string, def int) int {
+func defaultPoolLifetime(role string) (time.Duration, time.Duration) {
+	switch role {
+	case RoleUser:
+		return defaultUserConnMaxLifetime, defaultUserConnMaxIdleTime
+	case RoleUserSchema:
+		return defaultUserSchemaConnMaxLifetime, defaultUserSchemaConnMaxIdleTime
+	default:
+		return defaultMetaConnMaxLifetime, defaultMetaConnMaxIdleTime
+	}
+}
+
+func defaultPoolLimits(role string) (int, int) {
+	switch role {
+	case RoleMeta:
+		return defaultMetaMaxOpenConns, defaultMetaMaxIdleConns
+	case RoleUser:
+		return defaultUserMaxOpenConns, defaultUserMaxIdleConns
+	case RoleUserSchema:
+		return defaultUserSchemaMaxOpenConns, defaultUserSchemaMaxIdleConns
+	default:
+		return 0, 0
+	}
+}
+
+func poolEnvInt(role, suffix string, def int) int {
+	if key := rolePoolEnvKey(role, suffix); key != "" {
+		if v, ok := lookupEnvInt(key); ok {
+			return v
+		}
+	}
+	return def
+}
+
+func rolePoolEnvKey(role, suffix string) string {
+	switch role {
+	case RoleMeta:
+		return "DRIVE9_META_DB_" + suffix
+	case RoleUser:
+		return "DRIVE9_USER_DB_" + suffix
+	case RoleUserSchema:
+		return "DRIVE9_USER_SCHEMA_DB_" + suffix
+	default:
+		return ""
+	}
+}
+
+func lookupEnvInt(key string) (int, bool) {
 	s := os.Getenv(key)
 	if s == "" {
-		return def
+		return 0, false
 	}
 	v, err := strconv.Atoi(s)
 	if err != nil {
-		return def
+		return 0, false
 	}
-	return v
+	return v, true
 }

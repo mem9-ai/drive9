@@ -149,12 +149,17 @@ func main() {
 	// register. The startup ping above only proves reachability at boot.
 	probeInterval := time.Duration(envInt("DRIVE9_DB_HEALTH_PROBE_INTERVAL_SECONDS", 15)) * time.Second
 	probeTimeout := time.Duration(envInt("DRIVE9_DB_HEALTH_PROBE_TIMEOUT_SECONDS", 3)) * time.Second
-	metrics.StartDBHealthProbe(context.Background(), probeInterval, probeTimeout, func(role string, up bool, err error) {
+	metrics.StartDBHealthProbe(context.Background(), probeInterval, probeTimeout, func(info metrics.DBPoolInfo, up bool, err error) {
+		fields := []zap.Field{zap.String("role", info.Role)}
+		if info.TenantID != "" {
+			fields = append(fields, zap.String("tenant_id", info.TenantID))
+		}
 		if up {
-			logger.Info(context.Background(), "db_recovered", zap.String("role", role))
+			logger.Info(context.Background(), "db_recovered", fields...)
 			return
 		}
-		logger.Error(context.Background(), "db_unavailable", zap.String("role", role), zap.Error(err))
+		fields = append(fields, zap.Error(err))
+		logger.Error(context.Background(), "db_unavailable", fields...)
 	})
 
 	if s3cfg.Bucket == "" {
@@ -414,9 +419,9 @@ func main() {
 		Leader:                       leaderManager,
 		SSENotifyPollInterval:        sseNotifyPollInterval,
 		SSENotifyRetention:           sseNotifyRetention,
-		PodID:                         podID,
-		PodAddr:                       podAddr,
-		PodNotifySecret:               podNotifySecret,
+		PodID:                        podID,
+		PodAddr:                      podAddr,
+		PodNotifySecret:              podNotifySecret,
 	}).ListenAndServe(addr))
 }
 
@@ -513,6 +518,13 @@ environment:
   DRIVE9_LISTEN_ADDR serve listen address (default: :9009)
   DRIVE9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DRIVE9_META_DSN    control-plane MySQL DSN (required)
+  DRIVE9_POOL_MAX_TENANTS max cached tenant user DB pools per pod (default: 1024)
+  DRIVE9_META_DB_MAX_OPEN_CONNS max open connections for the per-pod meta DB pool
+  DRIVE9_META_DB_MAX_IDLE_CONNS max idle connections for the per-pod meta DB pool
+  DRIVE9_USER_DB_MAX_OPEN_CONNS max open connections for each cached tenant user DB pool (default: 4)
+  DRIVE9_USER_DB_MAX_IDLE_CONNS max idle connections for each cached tenant user DB pool (default: 1)
+  DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS max open connections for tenant schema-init DB pools
+  DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS max idle connections for tenant schema-init DB pools
   DRIVE9_ENCRYPT_TYPE local_aes|kms|aliyun_kms|tencent_kms
   DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
   DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms/aliyun_kms/tencent_kms)

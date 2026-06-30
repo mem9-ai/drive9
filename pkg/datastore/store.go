@@ -158,11 +158,15 @@ type Store struct {
 }
 
 func Open(dsn string) (*Store, error) {
+	return OpenForTenant(dsn, "")
+}
+
+func OpenForTenant(dsn, tenantID string) (*Store, error) {
 	lower := strings.ToLower(dsn)
 	if strings.Contains(lower, "multistatements=true") || strings.Contains(lower, "multistatements=1") {
 		return nil, fmt.Errorf("multiStatements is not allowed in production DSN")
 	}
-	db, err := mysqlutil.OpenInstrumented(context.Background(), dsn, mysqlutil.RoleUser)
+	db, err := mysqlutil.OpenInstrumentedForTenant(context.Background(), dsn, mysqlutil.RoleUser, tenantID)
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}

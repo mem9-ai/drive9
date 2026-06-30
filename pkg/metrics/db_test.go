@@ -72,8 +72,8 @@ func TestDBHealthProbeFlipsDriveDBUp(t *testing.T) {
 		err error
 	}
 	var changes []change
-	onChange := func(r string, up bool, err error) {
-		if r != role {
+	onChange := func(info DBPoolInfo, up bool, err error) {
+		if info.Role != role {
 			return
 		}
 		mu.Lock()
@@ -121,5 +121,32 @@ func TestDBHealthProbeFlipsDriveDBUp(t *testing.T) {
 	}
 	if !changes[1].up {
 		t.Fatalf("expected second transition to be up, got %+v", changes[1])
+	}
+}
+
+func TestDBMetricsIncludeTenantIDForTenantPools(t *testing.T) {
+	const (
+		role     = "user"
+		tenantID = "tenant-db-metrics-test"
+	)
+
+	healthy := &atomic.Bool{}
+	healthy.Store(true)
+	db := sql.OpenDB(fakeConnector{healthy: healthy})
+	db.SetMaxIdleConns(0)
+	t.Cleanup(func() { UnregisterDB(db); _ = db.Close() })
+
+	RegisterTenantDB(role, tenantID, db)
+	globalDB.probeOnce(context.Background(), time.Second, nil)
+	out := renderDB(t)
+
+	if !strings.Contains(out, `drive9_db_up{role="user",tenant_id="`+tenantID+`"} 1`) {
+		t.Fatalf("expected tenant db_up series, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_pool_registered{role="user",tenant_id="`+tenantID+`"} 1`) {
+		t.Fatalf("expected tenant pool_registered series, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_pool_wait_count_total{role="user",tenant_id="`+tenantID+`"} 0`) {
+		t.Fatalf("expected tenant pool wait series, got:\n%s", out)
 	}
 }
