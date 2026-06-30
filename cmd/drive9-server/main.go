@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -357,6 +358,39 @@ func main() {
 		logger.Info(context.Background(), "slock_oauth_disabled")
 	}
 
+	// SSE cross-pod notification configuration. These enable the new scheme
+	// that avoids polling every tenant's TiDB. The notify poller reads the
+	// central sse_notify_outbox (always-provisioned meta DB) at 200ms; the
+	// pod-to-pod HTTP push provides <10ms latency when PodID/PodAddr/secret
+	// are set. See pkg/server/notify_poller.go and pod_notifier.go.
+	sseNotifyPollInterval := envDuration("DRIVE9_SSE_NOTIFY_POLL_INTERVAL", 200*time.Millisecond)
+	sseNotifyRetention := envDuration("DRIVE9_SSE_NOTIFY_RETENTION", time.Hour)
+	podID := strings.TrimSpace(os.Getenv("DRIVE9_POD_ID"))
+	podAddr := strings.TrimSpace(os.Getenv("DRIVE9_POD_ADDR"))
+	// Default podAddr to the listen addr only if it's a real, non-wildcard
+	// address. The notifier requires a full base URL (http://host:port) for
+	// http.NewRequest. Wildcard binds like ":9009", "0.0.0.0:9009", or "[::]:9009"
+	// are not dialable by peers, so we leave podAddr empty in that case — the
+	// podRegistry still reports subscriptions and the leader sweeps stale pods,
+	// but cross-pod HTTP push is disabled until an explicit address is set.
+	if podAddr == "" && podID != "" {
+		if host, port, err := net.SplitHostPort(addr); err == nil && host != "" && host != "0.0.0.0" && host != "::" {
+			podAddr = "http://" + net.JoinHostPort(host, port)
+		}
+	}
+	var podNotifySecret []byte
+	if raw := strings.TrimSpace(os.Getenv("DRIVE9_POD_NOTIFY_SECRET")); raw != "" {
+		podNotifySecret = []byte(raw)
+	}
+	if podID != "" {
+		logger.Info(context.Background(), "sse_notify_config",
+			zap.String("pod_id", podID),
+			zap.String("pod_addr", podAddr),
+			zap.Duration("poll_interval", sseNotifyPollInterval),
+			zap.Duration("retention", sseNotifyRetention),
+			zap.Bool("push_enabled", podNotifySecret != nil))
+	}
+
 	die(server.NewWithConfig(server.Config{
 		Meta:                         store,
 		Pool:                         pool,
@@ -378,6 +412,11 @@ func main() {
 		TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
 		DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 		Leader:                       leaderManager,
+		SSENotifyPollInterval:        sseNotifyPollInterval,
+		SSENotifyRetention:           sseNotifyRetention,
+		PodID:                         podID,
+		PodAddr:                       podAddr,
+		PodNotifySecret:               podNotifySecret,
 	}).ListenAndServe(addr))
 }
 
@@ -514,6 +553,22 @@ environment:
   DRIVE9_SLOCK_API_ORIGIN Slock API origin (required when DRIVE9_SLOCK_ORIGIN is set)
   DRIVE9_SLOCK_CLIENT_ID Slock connected-app client id (required when DRIVE9_SLOCK_ORIGIN is set)
   DRIVE9_SLOCK_CLIENT_SECRET Slock connected-app client secret (required when DRIVE9_SLOCK_ORIGIN is set)
+
+  SSE cross-pod notification (set DRIVE9_POD_ID to enable; required for large multi-tenant deployments):
+  DRIVE9_POD_ID     unique pod identifier; when set, this pod registers in the central
+                    pod_registry and reports its SSE subscriber tenant set so peers can
+                    route push notifications. The outbox poller runs on all multi-tenant
+                    pods regardless; cross-pod HTTP push requires DRIVE9_POD_NOTIFY_SECRET.
+  DRIVE9_POD_ADDR   full base URL (e.g. http://10.0.0.5:9009) reachable by other pods for
+                    peer push notifications. Defaults to http://<listen-addr> when the
+                    listen address is a non-wildcard host; must be set explicitly in
+                    multi-host deployments.
+  DRIVE9_POD_NOTIFY_SECRET  shared bearer token for /v1/internal/sse-notify pod-to-pod
+                    push authentication. When set, enables the <10ms cross-pod HTTP push
+                    path; when unset, only the 200ms fallback poller is used.
+  DRIVE9_SSE_NOTIFY_POLL_INTERVAL  fallback outbox poll interval (default: 200ms)
+  DRIVE9_SSE_NOTIFY_RETENTION      how long outbox rows are kept before leader pruning
+                    (default: 1h)
 
   S3 storage (set DRIVE9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
