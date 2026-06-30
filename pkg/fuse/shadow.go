@@ -189,11 +189,15 @@ func (s *ShadowStore) CheckWriteBackQuotaThrottled(requiredBytes int64) error {
 	if !s.diskOK.Load() {
 		return syscall.ENOSPC
 	}
+	// CAS loser: still check byte quota (cheap, no syscall).
+	if s.writeCacheMaxBytes > 0 {
+		if s.pendingBytes.Load()+requiredBytes > s.writeCacheMaxBytes {
+			return syscall.ENOSPC
+		}
+	}
 	return nil
 }
 
-// AddPendingBytes adds n bytes to the pending write-back byte counter.
-// Called when shadow data is staged for upload.
 // AddPendingBytes is a no-op. Pending byte accounting is now managed
 // internally by ShadowStore write/remove methods.
 // Deprecated: do not call; kept for backward compatibility.

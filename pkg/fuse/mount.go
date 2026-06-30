@@ -58,7 +58,7 @@ type MountOptions struct {
 	RemoteOnlyPatterns      []string      // remote-persistent override path patterns for overlay-profile mounts
 	PackPaths               []string      // local overlay paths auto-packed after unmount
 	CommitQueueMaxPending   int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
-	WriteCacheFreeRatio     float64       // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); 0 disables
+	WriteCacheFreeRatio     float64       // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); negative disables
 	WriteCacheSizeMB        int64         // byte quota for write-back pending data in MB (default 0 = disabled); when set, writes exceeding this return ENOSPC
 	UploadConcurrency       int           // number of background upload workers (default 4)
 	ReadConcurrency         int           // maximum concurrent backend reads issued by FUSE (default 24)
@@ -138,6 +138,12 @@ func (o *MountOptions) setDefaults() {
 	}
 	if o.ParallelReadBlockSize <= 0 {
 		o.ParallelReadBlockSize = defaultParallelReadBlockSize
+	}
+	if o.WriteCacheFreeRatio < 0 {
+		// Negative values explicitly disable the write-back free-ratio guard.
+		o.WriteCacheFreeRatio = 0
+	} else if o.WriteCacheFreeRatio == 0 {
+		o.WriteCacheFreeRatio = defaultWriteCacheFreeRatio
 	}
 	if o.LookupRetryCount < 0 {
 		// Negative values are CLI-internal sentinels meaning retries were

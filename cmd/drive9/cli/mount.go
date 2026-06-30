@@ -331,6 +331,12 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	if *writeCacheSizeMB < 0 {
 		return fmt.Errorf("drive9 mount: --write-cache-size-mb must be >= 0")
 	}
+	// Map CLI 0 → -1 sentinel so MountOptions.setDefaults() knows the user
+	// explicitly disabled the guard rather than left it unset.
+	normalizedWriteCacheFreeRatio := *writeCacheFreeRatio
+	if normalizedWriteCacheFreeRatio == 0 {
+		normalizedWriteCacheFreeRatio = -1
+	}
 	normalizedLookupRetryCount := lookupRetryCountFlagValue(lookupRetryCountGiven, *lookupRetryCount)
 	normalizedLookupRetryTimeout := durationFlagValue(fs, "lookup-retry-timeout", *lookupRetryTimeout)
 	normalizedDirTTL := durationFlagValue(fs, "dir-ttl", *dirTTL)
@@ -533,7 +539,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 		UploadConcurrency:       *uploadConcurrency,
 		DirCacheMaxEntries:      *dirCacheMaxEntries,
 		CommitQueueMaxPending:   *commitQueueMaxPending,
-		WriteCacheFreeRatio:     *writeCacheFreeRatio,
+		WriteCacheFreeRatio:     normalizedWriteCacheFreeRatio,
 		WriteCacheSizeMB:        *writeCacheSizeMB,
 		ReadConcurrency:         *readConcurrency,
 		ParallelReadConcurrency: *parallelReadConcurrency,
