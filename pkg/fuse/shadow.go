@@ -74,8 +74,10 @@ type ShadowStore struct {
 	pendingBytes        atomic.Int64 // current shadow bytes on disk; updated internally by write/remove methods
 
 	// Throttled disk space check state (atomic for lock-free fast path).
-	lastDiskCheck atomic.Int64 // unix nano of last check
-	diskOK        atomic.Bool  // cached result of last check
+	lastDiskCheck  atomic.Int64 // unix nano of last check
+	diskOK         atomic.Bool  // cached result of last check
+	cachedFreeBytes atomic.Int64 // cached Statfs free bytes (Bavail*Bsize)
+	cachedTotalBytes atomic.Int64 // cached Statfs total bytes (Blocks*Bsize)
 }
 
 // NewShadowStore creates a ShadowStore rooted at dir.
@@ -149,23 +151,32 @@ func (s *ShadowStore) checkByteQuota(requiredBytes int64) error {
 }
 
 // checkFreeRatio checks the free-space ratio (requires Statfs syscall).
+// Also caches the Statfs values for use by checkFreeRatioThrottled.
 func (s *ShadowStore) checkFreeRatio(requiredBytes int64) error {
 	if s.writeCacheFreeRatio > 0 {
 		var stat syscall.Statfs_t
 		if err := syscall.Statfs(s.dir, &stat); err == nil {
 			totalBytes := int64(stat.Blocks) * int64(stat.Bsize)
 			freeBytes := int64(stat.Bavail) * int64(stat.Bsize)
-			freeAfterWrite := freeBytes - requiredBytes
-			if totalBytes > 0 {
-				ratioAfterWrite := float64(freeAfterWrite) / float64(totalBytes)
-				if ratioAfterWrite < s.writeCacheFreeRatio {
-					log.Printf("write-back quota rejected: cache_dir=%s free_bytes=%d required_bytes=%d free_ratio=%.4f threshold=%.4f reason=free_ratio_exceeded",
-						s.dir, freeBytes, requiredBytes, ratioAfterWrite, s.writeCacheFreeRatio)
-					return syscall.ENOSPC
-				}
-			}
+			s.cachedFreeBytes.Store(freeBytes)
+			s.cachedTotalBytes.Store(totalBytes)
+			return s.evalFreeRatio(freeBytes, totalBytes, requiredBytes)
 		}
 		// If Statfs fails, allow the write (cannot check).
+	}
+	return nil
+}
+
+// evalFreeRatio evaluates the free-ratio check against given capacity values.
+func (s *ShadowStore) evalFreeRatio(freeBytes, totalBytes, requiredBytes int64) error {
+	freeAfterWrite := freeBytes - requiredBytes
+	if totalBytes > 0 {
+		ratioAfterWrite := float64(freeAfterWrite) / float64(totalBytes)
+		if ratioAfterWrite < s.writeCacheFreeRatio {
+			log.Printf("write-back quota rejected: cache_dir=%s free_bytes=%d required_bytes=%d free_ratio=%.4f threshold=%.4f reason=free_ratio_exceeded",
+				s.dir, freeBytes, requiredBytes, ratioAfterWrite, s.writeCacheFreeRatio)
+			return syscall.ENOSPC
+		}
 	}
 	return nil
 }
@@ -434,9 +445,11 @@ func (s *ShadowStore) quotaCopy(dst io.Writer, r io.Reader, oldSize int64) (int6
 	}
 }
 
-// checkFreeRatioThrottled checks the free-ratio guard using the same
-// throttle mechanism as CheckWriteBackQuotaThrottled. Returns ENOSPC if
-// the cached or fresh Statfs result indicates insufficient free space.
+// checkFreeRatioThrottled checks the free-ratio guard using cached Statfs
+// values. Within the throttle window, re-evaluates the ratio using the
+// cached free/total bytes against the current requiredBytes so that
+// increasing write sizes are correctly bounded without a fresh Statfs.
+// Outside the window, performs a fresh Statfs and caches the result.
 func (s *ShadowStore) checkFreeRatioThrottled(requiredBytes int64) error {
 	if s.writeCacheFreeRatio <= 0 {
 		return nil
@@ -444,9 +457,13 @@ func (s *ShadowStore) checkFreeRatioThrottled(requiredBytes int64) error {
 	now := time.Now().UnixNano()
 	last := s.lastDiskCheck.Load()
 	if now-last < int64(diskCheckInterval) {
-		if !s.diskOK.Load() {
-			return syscall.ENOSPC
+		// Within throttle window: re-evaluate with cached capacity.
+		freeBytes := s.cachedFreeBytes.Load()
+		totalBytes := s.cachedTotalBytes.Load()
+		if totalBytes > 0 {
+			return s.evalFreeRatio(freeBytes, totalBytes, requiredBytes)
 		}
+		// No cached values yet — allow (first call will populate).
 		return nil
 	}
 	if s.lastDiskCheck.CompareAndSwap(last, now) {
@@ -454,8 +471,11 @@ func (s *ShadowStore) checkFreeRatioThrottled(requiredBytes int64) error {
 		s.diskOK.Store(err == nil)
 		return err
 	}
-	if !s.diskOK.Load() {
-		return syscall.ENOSPC
+	// CAS loser: use cached capacity values.
+	freeBytes := s.cachedFreeBytes.Load()
+	totalBytes := s.cachedTotalBytes.Load()
+	if totalBytes > 0 {
+		return s.evalFreeRatio(freeBytes, totalBytes, requiredBytes)
 	}
 	return nil
 }
