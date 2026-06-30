@@ -33,7 +33,6 @@ type sseOutboxTestCluster struct {
 	podBAddr  string
 	tenantID  string
 	token     string
-	pool      *tenant.Pool
 }
 
 // newSSEOutboxTestCluster creates two server instances with SSE cross-pod
