@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import importlib
+import json
 from pathlib import Path
 from typing import Any, Protocol
 
-from .core import BlackboxError, Context, ModuleRecord, Recorder
+from .core import BlackboxError, Context, ModuleRecord, Recorder, SUITES_DIR
 
 
 class SuiteProvider(Protocol):
@@ -46,30 +47,121 @@ class SuiteProvider(Protocol):
 
 
 def load_suite_provider(suite: str, config_dir: Path) -> SuiteProvider:
-    module_name = f"suites.{suite}.provider"
+    """Load the environment provider from harness.provider."""
+    module_name = "harness.provider"
     try:
         module = importlib.import_module(module_name)
     except ModuleNotFoundError as exc:
         if exc.name == module_name:
-            raise BlackboxError(f"blackbox suite {suite!r} does not provide provider module {module_name}") from exc
+            raise BlackboxError(
+                f"blackbox suite provider not found at {module_name}"
+            ) from exc
         raise
     factory = getattr(module, "create_provider", None)
     if callable(factory):
         return factory(suite=suite, config_dir=config_dir)
     provider_class = getattr(module, "SuiteProvider", None)
     if provider_class is None:
-        raise BlackboxError(f"blackbox suite {suite!r} provider must expose create_provider() or SuiteProvider")
+        raise BlackboxError(
+            "env.provider must expose create_provider() or SuiteProvider"
+        )
     return provider_class(suite=suite, config_dir=config_dir)
 
 
-def discover_suites() -> list[str]:
-    """Return sorted list of suite names found under ``SUITES_DIR``."""
-    from .core import SUITES_DIR
+def discover_modules() -> dict[str, Any]:
+    """Auto-discover all modules under suites/<group>/<module>/module.py.
 
+    Returns a dict mapping module_id -> module instance.
+    The module id is derived from the directory path: ``<group>.<module>``.
+    """
+    if not SUITES_DIR.is_dir():
+        return {}
+    modules: dict[str, Any] = {}
+    for group_dir in sorted(SUITES_DIR.iterdir()):
+        if not group_dir.is_dir() or group_dir.name.startswith("_") or group_dir.name.startswith("."):
+            continue
+        # Skip top-level non-module files (e.g., __init__.py, README.md).
+        if (group_dir / "module.py").exists():
+            continue
+        for module_dir in sorted(group_dir.iterdir()):
+            if not module_dir.is_dir() or module_dir.name.startswith("_") or module_dir.name.startswith("."):
+                continue
+            module_py = module_dir / "module.py"
+            if not module_py.exists():
+                continue
+            module_id = f"{group_dir.name}.{module_dir.name}"
+            mod_name = f"suites.{group_dir.name}.{module_dir.name}.module"
+            try:
+                mod = importlib.import_module(mod_name)
+            except Exception as exc:
+                # Store the error so the runner can report it
+                modules[module_id] = _ImportError(module_id, mod_name, exc)
+                continue
+            # Find the module class in the file — a class with ``run`` and
+            # ``description`` attributes. The id is derived from the directory,
+            # not declared on the class.
+            found_any = False
+            for attr_name in dir(mod):
+                obj = getattr(mod, attr_name)
+                if isinstance(obj, type) and hasattr(obj, "run") and hasattr(obj, "description"):
+                    instance = obj()
+                    instance._module_dir = module_dir
+                    instance._id = module_id
+                    if module_id in modules:
+                        raise BlackboxError(
+                            f"duplicate module id {module_id!r}: already registered from "
+                            f"{getattr(modules[module_id], '_module_dir', '?')}, "
+                            f"conflict from {module_dir}"
+                        )
+                    modules[module_id] = instance
+                    found_any = True
+            if not found_any:
+                modules[module_id] = _ImportError(module_id, mod_name, "no module class found")
+    return modules
+
+
+def load_module_config(module_dir: Path) -> dict[str, Any]:
+    """Load config.json from a module directory."""
+    config_path = module_dir / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            return json.load(f)
+    return {}
+
+
+def discover_suites() -> list[str]:
+    """Return sorted list of group names found under suites/."""
     if not SUITES_DIR.is_dir():
         return []
-    suites: list[str] = []
+    groups: list[str] = []
     for entry in sorted(SUITES_DIR.iterdir()):
-        if entry.is_dir() and (entry / "provider.py").exists():
-            suites.append(entry.name)
-    return suites
+        if entry.is_dir() and not entry.name.startswith("_") and not entry.name.startswith("."):
+            # Check if this directory contains module subdirectories
+            has_modules = any(
+                (entry / sub / "module.py").exists()
+                for sub in entry.iterdir()
+                if sub.is_dir()
+            )
+            if has_modules:
+                groups.append(entry.name)
+    return groups
+
+
+class _ImportError:
+    """Placeholder for a module that failed to import."""
+    def __init__(self, module_id: str, mod_name: str, exc: Any) -> None:
+        self._id = module_id
+        self.id = module_id
+        self.description = f"Failed to import {mod_name}: {exc}"
+        self.labels: tuple[str, ...] = ()
+        self.manual = False
+        self.timeout = 0
+        self.report_profile = ""
+        self.needs_setup = False
+        self._exc = exc
+
+    def ensure_dependencies(self, ctx: Any) -> None:
+        raise BlackboxError(f"module {self._id} failed to import: {self._exc}")
+
+    def run(self, ctx: Any) -> dict[str, Any]:
+        raise BlackboxError(f"module {self._id} failed to import: {self._exc}")

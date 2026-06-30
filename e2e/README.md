@@ -53,6 +53,34 @@ without adding it to `.github/workflows/local-e2e.yml`.
 Scheduled and post-merge failures auto-file/append to a `ci-e2e-failure`
 GitHub issue, since GitHub only notifies the workflow author otherwise.
 
+## Product-quality report & Feishu notifications
+
+After the suites run, `cmd/e2e-aggregate` turns the per-suite outcomes into one
+product-quality report (`internal/e2ereport`). It is driven by
+`e2e/suite-manifest.json`, which maps each `local-e2e.yml` step id to its product
+area, product promise, owner hint, and default failure class. The aggregator:
+
+- appends a richer summary (grouped by product promise, with failed suites and
+  any performance regressions) to the workflow step summary;
+- computes a stable **failure signature** so a recurring failure pattern groups
+  into one `ci-e2e-failure` issue instead of spawning new ones, and writes a
+  structured, signature-led issue body;
+- decides whether to notify Feishu/Lark: PR-tier failures stay in GitHub;
+  post-merge/nightly/manual failures and explicit performance regressions are
+  pushed.
+
+`cmd/feishu-notify` sends the notification card. It auto-detects the transport
+from repo secrets and **no-ops (never fails the run) when none is configured**:
+
+- custom-bot webhook — set `FEISHU_WEBHOOK`;
+- app (tenant) API — set `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, `FEISHU_CHAT_ID`.
+
+A suite can opt into richer reporting (durations, metrics with budgets/baselines
+for soft performance regressions, artifact links) by writing a
+`SuiteSummary` JSON to `e2e/reports/summary/<suite>.json`; the aggregator uses it
+in place of the synthesized-from-outcome summary. When adding a suite to
+`.github/workflows/local-e2e.yml`, also add its entry to `e2e/suite-manifest.json`.
+
 ## Run
 
 Use a hosted deployment by default. For local development on this machine, use

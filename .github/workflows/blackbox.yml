@@ -1,10 +1,11 @@
 name: blackbox
 
+# Manual trigger only — no push, no schedule, no PR.
 on:
   workflow_dispatch:
     inputs:
-      selector:
-        description: "Selection to run: all, group:<name>, category:<prefix>, module:<id[,id...]>, or a bare module id"
+      group:
+        description: "Module group to run (community, juicefs, drive9, git, customer, or all)"
         required: false
         default: "all"
         type: string
@@ -18,21 +19,18 @@ permissions:
   contents: read
 
 concurrency:
-  group: blackbox-${{ github.ref }}
+  group: blackbox-manual
   cancel-in-progress: false
 
 env:
-  BLACKBOX_SUITE: fuse
-  BLACKBOX_SELECTOR: ${{ inputs.selector || 'all' }}
+  BLACKBOX_GROUP: ${{ inputs.group || 'all' }}
   BLACKBOX_RUNS: ${{ inputs.runs || '1' }}
-  BLACKBOX_STRICT: "1"
-  PJDFSTEST_ALLOW_NONROOT: "1"
-  DRIVE9_LOCAL_EMBEDDING_MODE: none
   DRIVE9_LOCAL_INIT_SCHEMA: "true"
+  DRIVE9_LOCAL_EMBEDDING_MODE: none
 
 jobs:
   blackbox:
-    name: blackbox (${{ env.BLACKBOX_SUITE }} / ${{ env.BLACKBOX_SELECTOR }})
+    name: blackbox (${{ inputs.group || 'all' }})
     runs-on: ubuntu-latest
     timeout-minutes: 240
 
@@ -56,35 +54,107 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y autoconf automake bison build-essential fio flex fuse3 gettext git libacl1-dev libcurl4-openssl-dev libmpich-dev libssl-dev libtool mpich perl pkg-config python3-dev python3-pip zlib1g-dev
 
+      - name: Build drive9 CLI
+        run: CGO_ENABLED=0 go build -o bin/drive9 ./cmd/drive9
+
+      - name: Build drive9-server-local
+        run: CGO_ENABLED=0 go build -o bin/drive9-server-local ./cmd/drive9-server-local
+
       - name: Cache blackbox dependencies
         uses: actions/cache@v4
         with:
-          path: blackbox/cache
-          key: blackbox-${{ env.BLACKBOX_SUITE }}-${{ runner.os }}-${{ hashFiles('blackbox/suites/**/dependencies.json') }}
+          # Cache the shared work-dir's cache/ so the deps-only step and the
+          # run step (both pinned to BLACKBOX_WORK_DIR=blackbox/work/shared
+          # below) reuse the same dependency builds across invocations and
+          # across runs. Path must match the runner's cache_dir exactly.
+          path: blackbox/work/shared/cache
+          key: blackbox-${{ env.BLACKBOX_GROUP }}-${{ runner.os }}-${{ hashFiles('blackbox/suites/**/deps.py', 'blackbox/suites/**/dependencies.json') }}
           restore-keys: |
-            blackbox-${{ env.BLACKBOX_SUITE }}-${{ runner.os }}-
+            blackbox-${{ env.BLACKBOX_GROUP }}-${{ runner.os }}-
             blackbox-${{ runner.os }}-
 
       - name: Prepare blackbox dependencies
-        run: make blackbox-deps BLACKBOX_SUITE="$BLACKBOX_SUITE" BLACKBOX_SELECTOR="$BLACKBOX_SELECTOR"
+        env:
+          # Pin a stable work-dir so the deps-only and run steps share the
+          # same cache/ directory (each invocation otherwise gets a new
+          # second-based session under blackbox/work/<session>/).
+          BLACKBOX_WORK_DIR: blackbox/work/shared
+        run: |
+          if [ "$BLACKBOX_GROUP" = "all" ]; then
+            python3 blackbox/run.py --all \
+              --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local --deps-only
+          else
+            python3 blackbox/run.py --group "$BLACKBOX_GROUP" \
+              --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local --deps-only
+          fi
 
       - name: Run blackbox
-        run: make blackbox BLACKBOX_SUITE="$BLACKBOX_SUITE" BLACKBOX_SELECTOR="$BLACKBOX_SELECTOR" BLACKBOX_RUNS="$BLACKBOX_RUNS"
+        env:
+          BLACKBOX_WORK_DIR: blackbox/work/shared
+        run: |
+          if [ "$BLACKBOX_GROUP" = "all" ]; then
+            python3 blackbox/run.py --all \
+              --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local \
+              --runs "$BLACKBOX_RUNS" --strict-prereqs
+          else
+            python3 blackbox/run.py --group "$BLACKBOX_GROUP" \
+              --server-mode local --bin ./bin/drive9 --local-server ./bin/drive9-server-local \
+              --runs "$BLACKBOX_RUNS" --strict-prereqs
+          fi
 
       - name: Publish job summary
         if: always()
         run: |
-          latest="$(find "blackbox/results/$BLACKBOX_SUITE" -name report.md -type f 2>/dev/null | sort | tail -n 1 || true)"
-          if [ -n "$latest" ]; then
-            cat "$latest" >> "$GITHUB_STEP_SUMMARY"
+          suite_report="$(find blackbox/work -path '*/results/report.md' -type f 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$suite_report" ]; then
+            cat "$suite_report" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "No blackbox report produced." >> "$GITHUB_STEP_SUMMARY"
+            echo "No blackbox suite report produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Print report to log
+        if: always()
+        run: |
+          suite_report="$(find blackbox/work -path '*/results/report.md' -type f 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$suite_report" ]; then
+            echo "========== blackbox report =========="
+            cat "$suite_report"
+            echo "========== end report =========="
+          else
+            echo "No blackbox suite report produced."
+          fi
+
+          suite_json="$(find blackbox/work -path '*/results/suite-report.json' -type f 2>/dev/null | sort | tail -n 1 || true)"
+          if [ -n "$suite_json" ]; then
+            echo ""
+            echo "=== Per-module results ==="
+            python3 -c '
+          import json, sys
+          with open(sys.argv[1]) as f:
+              data = json.load(f)
+          for r in data.get("records", []):
+              print(f"  {r[\"status\"]:4s}  {r[\"module\"]:40s}  {r.get(\"seconds\",0):.1f}s  {r.get(\"classification\",\"\")}")
+          s = data.get("summary", {})
+          print(f"\nSummary: PASS={s.get(\"PASS\",0)} FAIL={s.get(\"FAIL\",0)} SKIP={s.get(\"SKIP\",0)} XFAIL={s.get(\"XFAIL\",0)} WARN={s.get(\"WARN\",0)}")
+          ' "$suite_json"
           fi
 
       - name: Upload blackbox artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: blackbox-${{ env.BLACKBOX_SUITE }}
-          path: blackbox/results/${{ env.BLACKBOX_SUITE }}/**
+          name: blackbox-${{ env.BLACKBOX_GROUP }}
+          path: |
+            blackbox/work/**/results/report.md
+            blackbox/work/**/results/suite-report.json
+            blackbox/work/**/results/manifest.json
+            blackbox/work/**/results/events.jsonl
+            blackbox/work/**/results/artifacts/**/report.md
+            blackbox/work/**/results/artifacts/**/report.json
+            blackbox/work/**/results/logs/**
+            blackbox/work/**/results/mount-logs/**
           if-no-files-found: warn
+          # Keep artifacts for a bounded window; the runner filesystem itself
+          # is ephemeral (destroyed per-job), so this only bounds uploaded
+          # artifact storage. Reports are also printed to the job log above.
+          retention-days: 14

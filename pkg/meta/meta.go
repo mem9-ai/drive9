@@ -40,6 +40,8 @@ const (
 	TenantDeleted      TenantStatus = "deleted"
 )
 
+const tidbCloudNativeProvider = "tidb_cloud_native"
+
 type TenantKind string
 
 const (
@@ -220,6 +222,9 @@ type TenantTiDBCloudOrgBinding struct {
 	TenantID       string
 	OrganizationID string
 	ClusterID      string
+	PoolID         string
+	PoolStatus     TenantPoolBindingStatus
+	UsedAt         *time.Time
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 }
@@ -227,6 +232,29 @@ type TenantTiDBCloudOrgBinding struct {
 type TenantWithTiDBCloudOrgBinding struct {
 	Tenant  Tenant
 	Binding TenantTiDBCloudOrgBinding
+}
+
+type TenantPoolBindingStatus string
+
+const (
+	TenantPoolBindingUsed TenantPoolBindingStatus = "used"
+	TenantPoolBindingFree TenantPoolBindingStatus = "free"
+)
+
+type TenantPoolStatus string
+
+const (
+	TenantPoolActive   TenantPoolStatus = "active"
+	TenantPoolDeleting TenantPoolStatus = "deleting"
+)
+
+type TenantPool struct {
+	PoolID         string
+	OrganizationID string
+	Size           int
+	Status         TenantPoolStatus
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type Store struct {
@@ -260,6 +288,8 @@ const metaSchemaMigrateLockNamePrefix = "dat9_meta_schema_migrate:"
 const metaSchemaMigrateLockTimeoutSeconds = 30
 const externalBindingLockTimeoutSeconds = 90
 const externalBindingReleaseLockTimeout = 5 * time.Second
+const tenantPoolLockTimeoutSeconds = 300
+const tenantPoolReleaseLockTimeout = 5 * time.Second
 
 func (s *Store) migrate() (err error) {
 	ctx := context.Background()
@@ -530,11 +560,25 @@ func metaInitSchemaStatements() []string {
 				tenant_id       VARCHAR(64) PRIMARY KEY,
 				organization_id VARCHAR(64) NOT NULL,
 				cluster_id      VARCHAR(255) NOT NULL,
+				pool_id         VARCHAR(64) NOT NULL DEFAULT '',
+				pool_status     VARCHAR(20) NOT NULL DEFAULT 'used',
+				used_at         DATETIME(3) NULL,
 				created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
 				updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 				INDEX idx_tidbcloud_org_cluster (organization_id, cluster_id, created_at, tenant_id),
-				INDEX idx_tidbcloud_org_created (organization_id, created_at, tenant_id)
+				INDEX idx_tidbcloud_org_created (organization_id, created_at, tenant_id),
+				INDEX idx_tidbcloud_pool_free (organization_id, pool_status, created_at, tenant_id)
 			)`,
+		`CREATE TABLE IF NOT EXISTS tenant_tidbcloud_pools (
+			pool_id         VARCHAR(64) PRIMARY KEY,
+			organization_id VARCHAR(64) NULL,
+			size            INT NOT NULL,
+			status          VARCHAR(20) NOT NULL DEFAULT 'active',
+			created_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at      DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			UNIQUE INDEX uk_tidbcloud_pool_org (organization_id),
+			INDEX idx_tidbcloud_pool_status (status, created_at)
+		)`,
 		`CREATE TABLE IF NOT EXISTS tenant_api_key_fs_scopes (
 			tenant_id   VARCHAR(64) NOT NULL,
 			api_key_id  VARCHAR(64) NOT NULL,
@@ -627,6 +671,45 @@ func metaInitSchemaStatements() []string {
 			applied_at     DATETIME(3) NULL,
 			INDEX idx_pending (status, created_at),
 			INDEX idx_tenant_order (tenant_id, id)
+		)`,
+		// sse_notify_outbox is a central notification pointer table for cross-pod
+		// SSE event fan-out. Each FS mutation writes a lightweight row here (tenant_id
+		// + seq) so that pods can discover which tenants have new events without
+		// polling every tenant's own TiDB. The event content stays in the per-tenant
+		// fs_events table; this table only signals "tenant T has new rows after seq".
+		// The central meta DB is always provisioned (not serverless), so polling it
+		// does not incur per-tenant RCU. Retention pruning is leader-gated.
+		`CREATE TABLE IF NOT EXISTS sse_notify_outbox (
+			id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+			tenant_id  VARCHAR(64) NOT NULL,
+			seq        BIGINT UNSIGNED NOT NULL,
+			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			INDEX idx_sse_notify_created (created_at)
+		)`,
+		// pod_registry tracks all drive9-server pods for cross-pod SSE push
+		// notification routing. Each pod upserts its row on startup and heartbeats
+		// every ~10s. The leader marks pods with stale heartbeats as inactive so
+		// writers don't push to dead pods. This table lives in the central meta DB
+		// (always provisioned).
+		`CREATE TABLE IF NOT EXISTS pod_registry (
+			pod_id         VARCHAR(64) PRIMARY KEY,
+			addr           VARCHAR(255) NOT NULL,
+			last_heartbeat DATETIME(3) NOT NULL,
+			status         VARCHAR(20) NOT NULL DEFAULT 'active',
+			created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			INDEX idx_pod_heartbeat (last_heartbeat)
+		)`,
+		// pod_subscriptions maps each pod to the tenant IDs for which it has active
+		// SSE subscribers. Writers consult this (via a locally cached reverse index)
+		// to push notifications only to pods that care about a given tenant, avoiding
+		// wasteful fan-out to pods with no subscribers for that tenant. Each pod
+		// periodically upserts its current subscriber set and prunes stale entries.
+		`CREATE TABLE IF NOT EXISTS pod_subscriptions (
+			pod_id     VARCHAR(64) NOT NULL,
+			tenant_id VARCHAR(64) NOT NULL,
+			updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (pod_id, tenant_id)
 		)`,
 	}
 }
@@ -1274,30 +1357,385 @@ func (s *Store) UpsertTenantTiDBCloudOrgBinding(ctx context.Context, b *TenantTi
 		updatedAt = now
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_tidbcloud_org_bindings
-		(tenant_id, organization_id, cluster_id, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)
+		(tenant_id, organization_id, cluster_id, pool_id, pool_status, used_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON DUPLICATE KEY UPDATE
 			organization_id = VALUES(organization_id),
 			cluster_id = VALUES(cluster_id),
+			pool_id = VALUES(pool_id),
+			pool_status = VALUES(pool_status),
+			used_at = VALUES(used_at),
 			updated_at = VALUES(updated_at)`,
-		tenantID, organizationID, clusterID, createdAt.UTC(), updatedAt.UTC())
+		tenantID, organizationID, clusterID, strings.TrimSpace(b.PoolID), tenantPoolBindingStatusForInsert(b.PoolStatus), b.UsedAt,
+		createdAt.UTC(), updatedAt.UTC())
 	return err
 }
 
 func (s *Store) GetTenantTiDBCloudOrgBinding(ctx context.Context, tenantID string) (out *TenantTiDBCloudOrgBinding, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "get_tidbcloud_org_binding", start, &err)
-	row := s.db.QueryRowContext(ctx, `SELECT tenant_id, organization_id, cluster_id, created_at, updated_at
+	row := s.db.QueryRowContext(ctx, `SELECT tenant_id, organization_id, cluster_id, pool_id, pool_status, used_at, created_at, updated_at
 		FROM tenant_tidbcloud_org_bindings WHERE tenant_id = ?`, tenantID)
 	var rec TenantTiDBCloudOrgBinding
-	if err = row.Scan(&rec.TenantID, &rec.OrganizationID, &rec.ClusterID, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+	var usedAt sql.NullTime
+	if err = row.Scan(&rec.TenantID, &rec.OrganizationID, &rec.ClusterID, &rec.PoolID, &rec.PoolStatus, &usedAt, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = ErrNotFound
 			return nil, err
 		}
 		return nil, err
 	}
+	if usedAt.Valid {
+		t := usedAt.Time.UTC()
+		rec.UsedAt = &t
+	}
 	return &rec, nil
+}
+
+func (s *Store) CreateTenantPool(ctx context.Context, p *TenantPool) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "create_tidbcloud_pool", start, &err)
+	if p == nil {
+		return fmt.Errorf("tenant pool is required")
+	}
+	poolID := strings.TrimSpace(p.PoolID)
+	if poolID == "" {
+		return fmt.Errorf("pool_id is required")
+	}
+	if p.Size < 0 {
+		return fmt.Errorf("pool size must be non-negative")
+	}
+	now := time.Now().UTC()
+	createdAt := p.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = now
+	}
+	updatedAt := p.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = now
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT INTO tenant_tidbcloud_pools
+		(pool_id, organization_id, size, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		poolID, nullStr(strings.TrimSpace(p.OrganizationID)), p.Size, tenantPoolStatusForInsert(p.Status),
+		createdAt.UTC(), updatedAt.UTC())
+	if isDuplicateEntry(err) {
+		return ErrDuplicate
+	}
+	return err
+}
+
+func (s *Store) GetTenantPoolByOrganization(ctx context.Context, organizationID string) (out *TenantPool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_tidbcloud_pool_by_org", start, &err)
+	organizationID = strings.TrimSpace(organizationID)
+	if organizationID == "" {
+		return nil, fmt.Errorf("organization_id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT pool_id, organization_id, size, status, created_at, updated_at
+		FROM tenant_tidbcloud_pools WHERE organization_id = ?`, organizationID)
+	return scanTenantPoolRow(row)
+}
+
+func (s *Store) GetTenantPoolByID(ctx context.Context, poolID string) (out *TenantPool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_tidbcloud_pool_by_id", start, &err)
+	poolID = strings.TrimSpace(poolID)
+	if poolID == "" {
+		return nil, fmt.Errorf("pool_id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT pool_id, organization_id, size, status, created_at, updated_at
+		FROM tenant_tidbcloud_pools WHERE pool_id = ?`, poolID)
+	return scanTenantPoolRow(row)
+}
+
+func (s *Store) UpdateTenantPoolOrganization(ctx context.Context, poolID, organizationID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tidbcloud_pool_org", start, &err)
+	poolID = strings.TrimSpace(poolID)
+	organizationID = strings.TrimSpace(organizationID)
+	if poolID == "" || organizationID == "" {
+		return fmt.Errorf("pool_id and organization_id are required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tenant_tidbcloud_pools
+		SET organization_id = ?, updated_at = ? WHERE pool_id = ?`, organizationID, time.Now().UTC(), poolID)
+	if err != nil {
+		if isDuplicateEntry(err) {
+			return ErrDuplicate
+		}
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) CountFreeTenantPoolBindings(ctx context.Context, organizationID string) (out int, err error) {
+	return s.countFreeTenantPoolBindingsByStatus(ctx, organizationID, []TenantStatus{TenantActive})
+}
+
+func (s *Store) CountTenantPoolFreeSlots(ctx context.Context, organizationID string) (out int, err error) {
+	return s.countFreeTenantPoolBindingsByStatus(ctx, organizationID, []TenantStatus{TenantPending, TenantProvisioning, TenantActive})
+}
+
+func (s *Store) countFreeTenantPoolBindingsByStatus(ctx context.Context, organizationID string, statuses []TenantStatus) (out int, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "count_free_tidbcloud_pool_bindings", start, &err)
+	organizationID = strings.TrimSpace(organizationID)
+	if organizationID == "" {
+		return 0, fmt.Errorf("organization_id is required")
+	}
+	if len(statuses) == 0 {
+		return 0, fmt.Errorf("tenant statuses are required")
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(statuses)), ",")
+	args := make([]any, 0, 3+len(statuses))
+	args = append(args, organizationID, TenantPoolBindingFree, tidbCloudNativeProvider)
+	for _, status := range statuses {
+		args = append(args, status)
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT COUNT(*)
+		FROM tenant_tidbcloud_org_bindings b
+		JOIN tenants t ON t.id = b.tenant_id
+		WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
+			AND t.status IN (`+placeholders+`)`, args...)
+	if err = row.Scan(&out); err != nil {
+		return 0, err
+	}
+	return out, nil
+}
+
+func (s *Store) ListFreeTenantPoolBindings(ctx context.Context, organizationID string, newestFirst bool, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_free_tidbcloud_pool_bindings", start, &err)
+	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantActive})
+}
+
+func (s *Store) ListFreeTenantPoolBindingsForDelete(ctx context.Context, organizationID string, newestFirst bool, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_free_tidbcloud_pool_bindings_for_delete", start, &err)
+	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantPending, TenantProvisioning, TenantActive, TenantFailed})
+}
+
+func (s *Store) ListTenantPoolFreeSlotsForDelete(ctx context.Context, organizationID string, newestFirst bool, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_tidbcloud_pool_free_slots_for_delete", start, &err)
+	return s.listFreeTenantPoolBindings(ctx, organizationID, newestFirst, limit, []TenantStatus{TenantPending, TenantProvisioning, TenantActive})
+}
+
+func (s *Store) ListPendingTenantPoolBindingsForResume(ctx context.Context, organizationID string, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_pending_tidbcloud_pool_bindings_for_resume", start, &err)
+	return s.listFreeTenantPoolBindings(ctx, organizationID, false, limit, []TenantStatus{TenantPending})
+}
+
+func (s *Store) listFreeTenantPoolBindings(ctx context.Context, organizationID string, newestFirst bool, limit int, statuses []TenantStatus) (out []TenantWithTiDBCloudOrgBinding, err error) {
+	organizationID = strings.TrimSpace(organizationID)
+	if organizationID == "" {
+		return nil, fmt.Errorf("organization_id is required")
+	}
+	if len(statuses) == 0 {
+		return nil, fmt.Errorf("tenant statuses are required")
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	order := "ASC"
+	if newestFirst {
+		order = "DESC"
+	}
+	placeholders := strings.TrimRight(strings.Repeat("?,", len(statuses)), ",")
+	query := `SELECT
+			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
+			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
+			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
+			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
+			b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
+		FROM tenant_tidbcloud_org_bindings b
+		JOIN tenants t ON t.id = b.tenant_id
+			WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
+				AND t.status IN (` + placeholders + `)
+			ORDER BY b.created_at ` + order + `, b.tenant_id ` + order + `
+			LIMIT ?`
+	args := make([]any, 0, 4+len(statuses))
+	args = append(args, organizationID, TenantPoolBindingFree, tidbCloudNativeProvider)
+	for _, status := range statuses {
+		args = append(args, status)
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanTenantBindingRows(rows)
+}
+
+func (s *Store) ClaimOldestFreeTenantPoolBinding(ctx context.Context, organizationID string) (out *TenantWithTiDBCloudOrgBinding, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "claim_free_tidbcloud_pool_binding", start, &err)
+	organizationID = strings.TrimSpace(organizationID)
+	if organizationID == "" {
+		return nil, fmt.Errorf("organization_id is required")
+	}
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		query := `SELECT
+				t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
+				t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
+				t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
+				t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
+				b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
+			FROM tenant_tidbcloud_org_bindings b
+			JOIN tenants t ON t.id = b.tenant_id
+				WHERE b.organization_id = ? AND b.pool_status = ? AND t.provider = ?
+					AND t.status = ?
+				ORDER BY b.created_at ASC, b.tenant_id ASC
+				LIMIT 1 FOR UPDATE`
+		row := tx.QueryRowContext(ctx, query, organizationID, TenantPoolBindingFree, tidbCloudNativeProvider, TenantActive)
+		rec, scanErr := scanTenantBindingRow(row)
+		if scanErr != nil {
+			return scanErr
+		}
+		now := time.Now().UTC()
+		res, execErr := tx.ExecContext(ctx, `UPDATE tenant_tidbcloud_org_bindings
+			SET pool_status = ?, used_at = ?, updated_at = ?
+			WHERE tenant_id = ? AND pool_status = ?`,
+			TenantPoolBindingUsed, now, now, rec.Binding.TenantID, TenantPoolBindingFree)
+		if execErr != nil {
+			return execErr
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			return ErrNotFound
+		}
+		rec.Binding.PoolStatus = TenantPoolBindingUsed
+		rec.Binding.UsedAt = &now
+		rec.Binding.UpdatedAt = now
+		out = rec
+		return nil
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (s *Store) UpdateTenantPoolSize(ctx context.Context, poolID string, size int) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tidbcloud_pool_size", start, &err)
+	poolID = strings.TrimSpace(poolID)
+	if poolID == "" {
+		return fmt.Errorf("pool_id is required")
+	}
+	if size < 0 {
+		return fmt.Errorf("pool size must be non-negative")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tenant_tidbcloud_pools SET size = ?, updated_at = ? WHERE pool_id = ?`, size, time.Now().UTC(), poolID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) UpdateTenantPoolStatus(ctx context.Context, poolID string, status TenantPoolStatus) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tidbcloud_pool_status", start, &err)
+	poolID = strings.TrimSpace(poolID)
+	if poolID == "" {
+		return fmt.Errorf("pool_id is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tenant_tidbcloud_pools SET status = ?, updated_at = ? WHERE pool_id = ?`,
+		tenantPoolStatusForInsert(status), time.Now().UTC(), poolID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) DeleteTenantPool(ctx context.Context, poolID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_tidbcloud_pool", start, &err)
+	poolID = strings.TrimSpace(poolID)
+	if poolID == "" {
+		return fmt.Errorf("pool_id is required")
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM tenant_tidbcloud_pools WHERE pool_id = ?`, poolID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) UpdateTenantPoolBindingStatus(ctx context.Context, tenantID string, status TenantPoolBindingStatus, usedAt *time.Time) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "update_tidbcloud_pool_binding_status", start, &err)
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return fmt.Errorf("tenant_id is required")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE tenant_tidbcloud_org_bindings
+		SET pool_status = ?, used_at = ?, updated_at = ? WHERE tenant_id = ?`,
+		tenantPoolBindingStatusForInsert(status), usedAt, time.Now().UTC(), tenantID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *Store) MarkFreeTenantPoolTenantDeleting(ctx context.Context, tenantID string, from TenantStatus) (updated bool, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "mark_free_tidbcloud_pool_tenant_deleting", start, &err)
+	tenantID = strings.TrimSpace(tenantID)
+	if tenantID == "" {
+		return false, fmt.Errorf("tenant_id is required")
+	}
+	err = s.InTx(ctx, func(tx *sql.Tx) error {
+		var id string
+		row := tx.QueryRowContext(ctx, `SELECT t.id
+			FROM tenants t
+			JOIN tenant_tidbcloud_org_bindings b ON b.tenant_id = t.id
+			WHERE t.id = ? AND t.status = ? AND b.pool_status = ?
+			LIMIT 1 FOR UPDATE`, tenantID, from, TenantPoolBindingFree)
+		if scanErr := row.Scan(&id); scanErr != nil {
+			return scanErr
+		}
+		res, execErr := tx.ExecContext(ctx, `UPDATE tenants SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
+			TenantDeleting, time.Now().UTC(), tenantID, from)
+		if execErr != nil {
+			return execErr
+		}
+		n, _ := res.RowsAffected()
+		updated = n > 0
+		return nil
+	})
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return updated, nil
 }
 
 func (s *Store) ListTenantsByTiDBCloudOrganizations(ctx context.Context, organizationIDs []string, offset, limit int) (out []TenantWithTiDBCloudOrgBinding, err error) {
@@ -1314,25 +1752,26 @@ func (s *Store) ListTenantsByTiDBCloudOrganizations(ctx context.Context, organiz
 		limit = 10
 	}
 	placeholders := make([]string, len(organizationIDs))
-	args := make([]any, 0, len(organizationIDs)+2)
+	args := make([]any, 0, len(organizationIDs)+5)
 	for i, id := range organizationIDs {
 		placeholders[i] = "?"
 		args = append(args, id)
 	}
-	args = append(args, limit, offset)
+	args = append(args, tidbCloudNativeProvider, TenantPoolBindingFree, TenantDeleted, limit, offset)
 	query := `SELECT
 			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
 			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
-			b.tenant_id, b.organization_id, b.cluster_id, b.created_at, b.updated_at
-		FROM tenant_tidbcloud_org_bindings b
-		JOIN tenants t ON t.id = b.tenant_id
-		WHERE b.organization_id IN (` + strings.Join(placeholders, ",") + `)
-			AND t.provider = 'tidb_cloud_native'
-			AND t.status <> 'deleted'
-		ORDER BY t.created_at DESC, t.id DESC
-		LIMIT ? OFFSET ?`
+			b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
+			FROM tenant_tidbcloud_org_bindings b
+			JOIN tenants t ON t.id = b.tenant_id
+			WHERE b.organization_id IN (` + strings.Join(placeholders, ",") + `)
+				AND t.provider = ?
+				AND b.pool_status <> ?
+				AND t.status <> ?
+			ORDER BY t.created_at DESC, t.id DESC
+			LIMIT ? OFFSET ?`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -1355,25 +1794,26 @@ func (s *Store) ListTenantsByTiDBCloudOrgClusterBindings(ctx context.Context, bi
 		limit = 10
 	}
 	placeholders := make([]string, 0, len(bindings))
-	args := make([]any, 0, len(bindings)*2+2)
+	args := make([]any, 0, len(bindings)*2+5)
 	for _, binding := range bindings {
 		placeholders = append(placeholders, "(?, ?)")
 		args = append(args, binding.OrganizationID, binding.ClusterID)
 	}
-	args = append(args, limit, offset)
+	args = append(args, tidbCloudNativeProvider, TenantPoolBindingFree, TenantDeleted, limit, offset)
 	query := `SELECT
 			t.id, t.status, t.kind, t.parent_tenant_id, t.storage_namespace_id,
 			t.db_host, t.db_port, t.db_user, t.db_password, t.db_name,
 			t.db_tls, t.provider, t.cluster_id, t.branch_id, t.claim_url, t.claim_expires_at, t.schema_version,
 			t.s3_encryption_mode, t.s3_kms_key_id, t.s3_bucket_key_enabled, t.created_at, t.updated_at,
-			b.tenant_id, b.organization_id, b.cluster_id, b.created_at, b.updated_at
-		FROM tenant_tidbcloud_org_bindings b
-		JOIN tenants t ON t.id = b.tenant_id
-		WHERE (b.organization_id, b.cluster_id) IN (` + strings.Join(placeholders, ",") + `)
-			AND t.provider = 'tidb_cloud_native'
-			AND t.status <> 'deleted'
-		ORDER BY t.created_at DESC, t.id DESC
-		LIMIT ? OFFSET ?`
+			b.tenant_id, b.organization_id, b.cluster_id, b.pool_id, b.pool_status, b.used_at, b.created_at, b.updated_at
+			FROM tenant_tidbcloud_org_bindings b
+			JOIN tenants t ON t.id = b.tenant_id
+			WHERE (b.organization_id, b.cluster_id) IN (` + strings.Join(placeholders, ",") + `)
+				AND t.provider = ?
+				AND b.pool_status <> ?
+				AND t.status <> ?
+			ORDER BY t.created_at DESC, t.id DESC
+			LIMIT ? OFFSET ?`
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -1466,9 +1906,76 @@ func (s *Store) WithExternalBindingLock(ctx context.Context, provider, subjectKe
 	return fn(ctx)
 }
 
+func (s *Store) WithTenantPoolLock(ctx context.Context, poolID string, fn func(context.Context) error) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "tenant_pool_lock", start, &err)
+	if fn == nil {
+		return fmt.Errorf("tenant pool lock callback is required")
+	}
+	lockName := tenantPoolLockName(poolID)
+	if lockName == "" {
+		return fmt.Errorf("pool_id is required")
+	}
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	var databaseName sql.NullString
+	if err := conn.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&databaseName); err != nil {
+		return err
+	}
+	lockName = tenantPoolDatabaseLockName(lockName, databaseName.String)
+
+	var got sql.NullInt64
+	if err := conn.QueryRowContext(ctx, "SELECT GET_LOCK(?, ?)", lockName, tenantPoolLockTimeoutSeconds).Scan(&got); err != nil {
+		return err
+	}
+	if !got.Valid {
+		return fmt.Errorf("tenant pool named lock returned NULL")
+	}
+	if got.Int64 != 1 {
+		return fmt.Errorf("timed out waiting for tenant pool named lock")
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), tenantPoolReleaseLockTimeout)
+		defer cancel()
+		var released sql.NullInt64
+		releaseErr := conn.QueryRowContext(releaseCtx, "SELECT RELEASE_LOCK(?)", lockName).Scan(&released)
+		if releaseErr != nil {
+			err = errors.Join(err, releaseErr)
+			return
+		}
+		if !released.Valid {
+			err = errors.Join(err, fmt.Errorf("tenant pool named lock release returned NULL"))
+			return
+		}
+		if released.Int64 != 1 {
+			err = errors.Join(err, fmt.Errorf("tenant pool named lock was not held by current connection"))
+		}
+	}()
+
+	return fn(ctx)
+}
+
 func externalBindingLockName(provider, subjectKey string) string {
 	sum := sha256.Sum256([]byte(provider + "\x00" + subjectKey))
 	return "d9_extbind:" + hex.EncodeToString(sum[:20])
+}
+
+func tenantPoolLockName(poolID string) string {
+	poolID = strings.TrimSpace(poolID)
+	if poolID == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(poolID))
+	return "d9_tenant_pool:" + hex.EncodeToString(sum[:16])
+}
+
+func tenantPoolDatabaseLockName(baseLockName, databaseName string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(databaseName)))
+	return baseLockName + ":" + hex.EncodeToString(sum[:4])
 }
 
 func (s *Store) ResolveByAPIKeyHash(ctx context.Context, hash string) (out *TenantWithAPIKey, err error) {
@@ -1817,45 +2324,67 @@ func scanTenantRows(rows *sql.Rows) ([]Tenant, error) {
 func scanTenantBindingRows(rows *sql.Rows) ([]TenantWithTiDBCloudOrgBinding, error) {
 	out := make([]TenantWithTiDBCloudOrgBinding, 0)
 	for rows.Next() {
-		var rec TenantWithTiDBCloudOrgBinding
-		var dbTLS int
-		var clusterID sql.NullString
-		var parentTenantID sql.NullString
-		var storageNamespaceID sql.NullString
-		var claimURL sql.NullString
-		var claimExp sql.NullTime
-		var s3BucketKeyEnabled int
-		if err := rows.Scan(&rec.Tenant.ID, &rec.Tenant.Status, &rec.Tenant.Kind, &parentTenantID, &storageNamespaceID,
-			&rec.Tenant.DBHost, &rec.Tenant.DBPort, &rec.Tenant.DBUser, &rec.Tenant.DBPasswordCipher,
-			&rec.Tenant.DBName, &dbTLS, &rec.Tenant.Provider, &clusterID, &rec.Tenant.BranchID, &claimURL, &claimExp, &rec.Tenant.SchemaVersion,
-			&rec.Tenant.S3EncryptionMode, &rec.Tenant.S3KMSKeyID, &s3BucketKeyEnabled, &rec.Tenant.CreatedAt, &rec.Tenant.UpdatedAt,
-			&rec.Binding.TenantID, &rec.Binding.OrganizationID, &rec.Binding.ClusterID, &rec.Binding.CreatedAt, &rec.Binding.UpdatedAt); err != nil {
+		rec, err := scanTenantBindingScanner(rows)
+		if err != nil {
 			return nil, err
 		}
-		rec.Tenant.DBTLS = dbTLS == 1
-		rec.Tenant.S3BucketKeyEnabled = boolPtr(s3BucketKeyEnabled == 1)
-		if clusterID.Valid {
-			rec.Tenant.ClusterID = clusterID.String
-		}
-		if parentTenantID.Valid {
-			rec.Tenant.ParentTenantID = parentTenantID.String
-		}
-		if storageNamespaceID.Valid {
-			rec.Tenant.StorageNamespaceID = storageNamespaceID.String
-		}
-		if claimURL.Valid {
-			rec.Tenant.ClaimURL = claimURL.String
-		}
-		if claimExp.Valid {
-			ts := claimExp.Time.UTC()
-			rec.Tenant.ClaimExpiresAt = &ts
-		}
-		out = append(out, rec)
+		out = append(out, *rec)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	return out, nil
+}
+
+type tenantBindingScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanTenantBindingRow(row tenantBindingScanner) (*TenantWithTiDBCloudOrgBinding, error) {
+	return scanTenantBindingScanner(row)
+}
+
+func scanTenantBindingScanner(row tenantBindingScanner) (*TenantWithTiDBCloudOrgBinding, error) {
+	var rec TenantWithTiDBCloudOrgBinding
+	var dbTLS int
+	var clusterID sql.NullString
+	var parentTenantID sql.NullString
+	var storageNamespaceID sql.NullString
+	var claimURL sql.NullString
+	var claimExp sql.NullTime
+	var s3BucketKeyEnabled int
+	var usedAt sql.NullTime
+	if err := row.Scan(&rec.Tenant.ID, &rec.Tenant.Status, &rec.Tenant.Kind, &parentTenantID, &storageNamespaceID,
+		&rec.Tenant.DBHost, &rec.Tenant.DBPort, &rec.Tenant.DBUser, &rec.Tenant.DBPasswordCipher,
+		&rec.Tenant.DBName, &dbTLS, &rec.Tenant.Provider, &clusterID, &rec.Tenant.BranchID, &claimURL, &claimExp, &rec.Tenant.SchemaVersion,
+		&rec.Tenant.S3EncryptionMode, &rec.Tenant.S3KMSKeyID, &s3BucketKeyEnabled, &rec.Tenant.CreatedAt, &rec.Tenant.UpdatedAt,
+		&rec.Binding.TenantID, &rec.Binding.OrganizationID, &rec.Binding.ClusterID, &rec.Binding.PoolID, &rec.Binding.PoolStatus, &usedAt,
+		&rec.Binding.CreatedAt, &rec.Binding.UpdatedAt); err != nil {
+		return nil, err
+	}
+	rec.Tenant.DBTLS = dbTLS == 1
+	rec.Tenant.S3BucketKeyEnabled = boolPtr(s3BucketKeyEnabled == 1)
+	if clusterID.Valid {
+		rec.Tenant.ClusterID = clusterID.String
+	}
+	if parentTenantID.Valid {
+		rec.Tenant.ParentTenantID = parentTenantID.String
+	}
+	if storageNamespaceID.Valid {
+		rec.Tenant.StorageNamespaceID = storageNamespaceID.String
+	}
+	if claimURL.Valid {
+		rec.Tenant.ClaimURL = claimURL.String
+	}
+	if claimExp.Valid {
+		ts := claimExp.Time.UTC()
+		rec.Tenant.ClaimExpiresAt = &ts
+	}
+	if usedAt.Valid {
+		ts := usedAt.Time.UTC()
+		rec.Binding.UsedAt = &ts
+	}
+	return &rec, nil
 }
 
 func (s *Store) UpdateTenantStatus(ctx context.Context, id string, status TenantStatus) (err error) {
@@ -2588,6 +3117,35 @@ func tenantS3BucketKeyEnabledForInsert(t *Tenant) bool {
 	return *t.S3BucketKeyEnabled
 }
 
+func tenantPoolBindingStatusForInsert(status TenantPoolBindingStatus) TenantPoolBindingStatus {
+	if status == "" {
+		return TenantPoolBindingUsed
+	}
+	return status
+}
+
+func tenantPoolStatusForInsert(status TenantPoolStatus) TenantPoolStatus {
+	if status == "" {
+		return TenantPoolActive
+	}
+	return status
+}
+
+func scanTenantPoolRow(row tenantBindingScanner) (*TenantPool, error) {
+	var rec TenantPool
+	var orgID sql.NullString
+	if err := row.Scan(&rec.PoolID, &orgID, &rec.Size, &rec.Status, &rec.CreatedAt, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	if orgID.Valid {
+		rec.OrganizationID = orgID.String
+	}
+	return &rec, nil
+}
+
 func boolPtr(v bool) *bool {
 	return &v
 }
@@ -2612,4 +3170,337 @@ func isDuplicateEntry(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "Duplicate entry") || strings.Contains(msg, "UNIQUE constraint failed")
+}
+
+// ---------------------------------------------------------------------------
+// SSE notify outbox
+// ---------------------------------------------------------------------------
+
+// SSENotifyRow mirrors a row in sse_notify_outbox. It is a lightweight pointer
+// (tenant_id + seq) to the actual event content stored in the per-tenant
+// fs_events table. The central meta DB holds this table so pods can discover
+// cross-pod events without polling every tenant's own TiDB.
+type SSENotifyRow struct {
+	ID        uint64
+	TenantID  string
+	Seq       uint64
+	CreatedAt time.Time
+}
+
+// PodRegistryStatus is the lifecycle state of a pod in pod_registry.
+type PodRegistryStatus string
+
+const (
+	PodRegistryActive PodRegistryStatus = "active"
+	PodRegistryStale  PodRegistryStatus = "stale"
+)
+
+// PodRow mirrors a row in pod_registry.
+type PodRow struct {
+	PodID  string
+	Addr   string
+	Status PodRegistryStatus
+}
+
+// InsertSSENotify writes a notification pointer to sse_notify_outbox. This is
+// best-effort: if the INSERT fails, the event is still durable in the
+// per-tenant fs_events table and will be discovered on SSE client reconnect
+// replay. The central meta DB is always provisioned so this write never wakes
+// a serverless tenant TiDB.
+func (s *Store) InsertSSENotify(ctx context.Context, tenantID string, seq uint64) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_sse_notify", start, &err)
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO sse_notify_outbox (tenant_id, seq) VALUES (?, ?)`,
+		tenantID, seq)
+	return err
+}
+
+// ListSSENotifySince returns outbox rows with id > afterID, ordered by id, up to
+// limit. The consumer advances its cursor to the last row's id so subsequent
+// calls do not re-read the same rows.
+func (s *Store) ListSSENotifySince(ctx context.Context, afterID uint64, limit int) (out []SSENotifyRow, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_sse_notify_since", start, &err)
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, tenant_id, seq, created_at FROM sse_notify_outbox WHERE id > ? ORDER BY id LIMIT ?`,
+		afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var rec SSENotifyRow
+		if err = rows.Scan(&rec.ID, &rec.TenantID, &rec.Seq, &rec.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// MaxSSENotifyID returns the current maximum id in sse_notify_outbox, or 0 if
+// the table is empty. Used by the notify poller to initialize its cursor on
+// startup (skipping historical rows — SSE client reconnect replay covers those).
+func (s *Store) MaxSSENotifyID(ctx context.Context) (out uint64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "max_sse_notify_id", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM sse_notify_outbox`)
+	if err = row.Scan(&out); err != nil {
+		return 0, err
+	}
+	return out, nil
+}
+
+// DeleteSSENotifyBefore prunes outbox rows older than the given threshold.
+// Leader-gated; retention is relative to DB insert time (created_at).
+func (s *Store) DeleteSSENotifyBefore(ctx context.Context, before time.Time) (n int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_sse_notify_before", start, &err)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM sse_notify_outbox WHERE created_at < ?`, before)
+	if err != nil {
+		return 0, err
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ---------------------------------------------------------------------------
+// Pod registry
+// ---------------------------------------------------------------------------
+
+// UpsertPod registers or refreshes this pod's heartbeat in pod_registry. On
+// first insert the row is created with status='active'; on subsequent calls
+// the addr, last_heartbeat, and status are updated (reviving a stale pod).
+func (s *Store) UpsertPod(ctx context.Context, podID, addr string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "upsert_pod", start, &err)
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO pod_registry (pod_id, addr, last_heartbeat, status)
+		 VALUES (?, ?, NOW(3), 'active')
+		 ON DUPLICATE KEY UPDATE addr = VALUES(addr), last_heartbeat = NOW(3), status = 'active'`,
+		podID, addr)
+	return err
+}
+
+// ListActivePods returns all active pods excluding selfID. Used by the pod
+// notifier to build its peer list for cross-pod HTTP push.
+func (s *Store) ListActivePods(ctx context.Context, selfID string) (out []PodRow, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_active_pods", start, &err)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT pod_id, addr, status FROM pod_registry WHERE status = 'active' AND pod_id != ?`,
+		selfID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var rec PodRow
+		if err = rows.Scan(&rec.PodID, &rec.Addr, &rec.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// MarkStalePods marks pods with heartbeats older than the threshold as stale.
+// Leader-gated: prevents writers from pushing notifications to dead pods.
+func (s *Store) MarkStalePods(ctx context.Context, before time.Time) (n int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "mark_stale_pods", start, &err)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE pod_registry SET status = 'stale' WHERE last_heartbeat < ? AND status = 'active'`,
+		before)
+	if err != nil {
+		return 0, err
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// DeletePod removes a pod and its subscriptions from the registry. Used when a
+// pod is decommissioned. Best-effort: stale pod cleanup handles the common case.
+// DeletePod removes a pod and its subscriptions from the registry. Both
+// deletions run in a single transaction so a partial failure doesn't leave
+// orphaned subscription rows. Used when a pod is decommissioned.
+func (s *Store) DeletePod(ctx context.Context, podID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_pod", start, &err)
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM pod_subscriptions WHERE pod_id = ?`, podID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM pod_registry WHERE pod_id = ?`, podID)
+		return err
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Pod subscriptions
+// ---------------------------------------------------------------------------
+
+// UpsertPodSubscriptions records the set of tenant IDs for which podID has
+// active SSE subscribers. Each (pod_id, tenant_id) pair is upserted with the
+// current timestamp. Callers should call PrunePodSubscriptions to remove
+// tenants that are no longer active.
+func (s *Store) UpsertPodSubscriptions(ctx context.Context, podID string, tenantIDs []string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "upsert_pod_subscriptions", start, &err)
+	if len(tenantIDs) == 0 {
+		return nil
+	}
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		for _, tenantID := range tenantIDs {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO pod_subscriptions (pod_id, tenant_id)
+				 VALUES (?, ?)
+				 ON DUPLICATE KEY UPDATE updated_at = NOW(3)`,
+				podID, tenantID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// PrunePodSubscriptions removes pod_subscriptions rows for podID whose
+// tenant_id is not in keepSet. This lets a pod prune tenants whose SSE
+// subscribers have all disconnected. keepSet may be empty (prunes all).
+func (s *Store) PrunePodSubscriptions(ctx context.Context, podID string, keepSet []string) (n int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "prune_pod_subscriptions", start, &err)
+	if len(keepSet) == 0 {
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM pod_subscriptions WHERE pod_id = ?`, podID)
+		if err != nil {
+			return 0, err
+		}
+		return res.RowsAffected()
+	}
+	// Build a NOT IN clause with placeholders. keepSet is bounded by the number
+	// of tenants with active SSE connections on this pod (typically small).
+	placeholders := make([]string, len(keepSet))
+	args := make([]any, 0, len(keepSet)+1)
+	args = append(args, podID)
+	for i, t := range keepSet {
+		placeholders[i] = "?"
+		args = append(args, t)
+	}
+	query := fmt.Sprintf(
+		`DELETE FROM pod_subscriptions WHERE pod_id = ? AND tenant_id NOT IN (%s)`,
+		strings.Join(placeholders, ","))
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ListPodSubscriptions returns the tenant IDs for which podID has active SSE
+// subscribers. Used by the route cache builder to compute which peers care
+// about each tenant.
+func (s *Store) ListPodSubscriptions(ctx context.Context, podID string) (out []string, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_pod_subscriptions", start, &err)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT tenant_id FROM pod_subscriptions WHERE pod_id = ?`, podID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var tenantID string
+		if err = rows.Scan(&tenantID); err != nil {
+			return nil, err
+		}
+		out = append(out, tenantID)
+	}
+	return out, rows.Err()
+}
+
+// ListAllPodSubscriptions returns all (pod_id, tenant_id) pairs from
+// pod_subscriptions. Used by the route cache builder to construct a
+// tenant→pods reverse index for push notification routing.
+func (s *Store) ListAllPodSubscriptions(ctx context.Context) (out []PodSubscriptionRow, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_all_pod_subscriptions", start, &err)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT pod_id, tenant_id FROM pod_subscriptions`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var rec PodSubscriptionRow
+		if err = rows.Scan(&rec.PodID, &rec.TenantID); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// PodSubscriptionRow mirrors a row in pod_subscriptions.
+type PodSubscriptionRow struct {
+	PodID    string
+	TenantID string
+}
+
+// DeletePodSubscriptions removes all subscription rows for podID. Called when
+// a pod is decommissioned or marked stale by the leader sweeper.
+func (s *Store) DeletePodSubscriptions(ctx context.Context, podID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_pod_subscriptions", start, &err)
+	_, err = s.db.ExecContext(ctx, `DELETE FROM pod_subscriptions WHERE pod_id = ?`, podID)
+	return err
+}
+
+// ListStalePods returns pod IDs with status='stale'. Used by the leader sweeper
+// to clean up subscriptions for dead pods.
+func (s *Store) ListStalePods(ctx context.Context) (out []string, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_stale_pods", start, &err)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT pod_id FROM pod_registry WHERE status = 'stale'`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var podID string
+		if err = rows.Scan(&podID); err != nil {
+			return nil, err
+		}
+		out = append(out, podID)
+	}
+	return out, rows.Err()
+}
+
+// DeleteSubscriptionsForStalePods deletes pod_subscriptions rows whose pod is
+// currently stale, using a subquery join so the stale check and the delete are
+// atomic. This avoids a TOCTOU race where a pod recovers to active between
+// ListStalePods and DeletePodSubscriptions, which would delete subscriptions for
+// a live pod. Returns the number of deleted rows.
+func (s *Store) DeleteSubscriptionsForStalePods(ctx context.Context) (n int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_subscriptions_for_stale_pods", start, &err)
+	res, err := s.db.ExecContext(ctx,
+		`DELETE ps FROM pod_subscriptions ps
+		 INNER JOIN pod_registry pr ON ps.pod_id = pr.pod_id
+		 WHERE pr.status = 'stale'`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from harness.core import CACHE_ROOT, SKIP, Context, ModuleRecord, Recorder
+
+from .capabilities import detect_fuse_capabilities
+from .deps import Drive9DependencyManager
+
+from .target import Drive9FuseTargetProvider
+
+
+class Drive9SuiteProvider:
+    def __init__(self, *, suite: str, config_dir: Path) -> None:
+        self.suite = suite
+        self.config_dir = config_dir
+
+
+    def detect_capabilities(self) -> dict[str, Any]:
+        return detect_fuse_capabilities()
+
+    def create_deps(self, *, auto_fetch: bool, recorder: Recorder) -> Drive9DependencyManager:
+        return Drive9DependencyManager(CACHE_ROOT, auto_fetch=auto_fetch, recorder=recorder)
+
+    def create_target(self, args: Any, result_dir: Path, recorder: Recorder, *, session: str) -> Drive9FuseTargetProvider:
+        return Drive9FuseTargetProvider(args, result_dir, recorder, suite=self.suite, session=session)
+
+    def check_prerequisites(self, ctx: Context) -> list[ModuleRecord]:
+        if ctx.capabilities.get("fuse", {}).get("ok"):
+            return []
+        detail = str(ctx.capabilities.get("fuse", {}).get("detail", "FUSE unavailable"))
+        return [ModuleRecord(module="prereq.fuse", status=SKIP, seconds=0, classification="platform skip", detail=detail)]
+
+    def setup(self, ctx: Context) -> None:
+        ctx.target.verify_cli()
+        ctx.target.start_server()
+
+    def cleanup(self, ctx: Context) -> None:
+        ctx.target.cleanup()
+
+    def manifest_fields(self, ctx: Context) -> dict[str, Any]:
+        fields: dict[str, Any] = {
+            "server_mode": ctx.args.server_mode,
+            "server_url": ctx.target.server_url or "(from ~/.drive9/config)",
+            "drive9_cli": str(ctx.target.cli) if ctx.target.cli else "(not found)",
+        }
+        try:
+            if ctx.target.cli.exists():
+                fields["drive9_version"] = ctx.target.capture([str(ctx.target.cli), "--version"], timeout=20).strip()
+        except Exception as exc:
+            fields["drive9_version_error"] = str(exc)
+        return fields
+
+    def render_suite_report(self, ctx: Context, records: list[ModuleRecord]) -> str | None:
+        return None
+
+    def suite_goals(self) -> str:
+        return (
+            "The FUSE suite validates Drive9's FUSE filesystem across POSIX compliance, "
+            "performance, workflow correctness, and customer scenario fidelity. Modules "
+            "cover community test suites (pjdfstest, LTP, fio, mdtest), JuiceFS-inspired "
+            "stress tests, official Git functional/perf tests, Drive9 workflow scenarios, "
+            "and customer workspace benchmarks."
+        )
+
+
+def create_provider(*, suite: str, config_dir: Path) -> Drive9SuiteProvider:
+    return Drive9SuiteProvider(suite=suite, config_dir=config_dir)

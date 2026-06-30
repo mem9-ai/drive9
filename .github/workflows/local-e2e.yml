@@ -39,6 +39,10 @@ on:
         required: false
         default: "0"
         type: string
+      feishu_proof:
+        required: false
+        default: "0"
+        type: string
   workflow_dispatch:
     inputs:
       run_all_e2e:
@@ -129,6 +133,14 @@ on:
         options:
           - "0"
           - "1"
+      feishu_proof:
+        description: "Prove the Feishu notification path: inject a synthetic failed suite so a card is sent on this (green) run. Does not fail the job or file an issue."
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
 
 permissions:
   contents: read
@@ -164,6 +176,7 @@ env:
   # Deterministic perf gating lives in e2e/fuse-write-perf-budget-test.sh.
   FUSE_PERF_COMPARE_FAIL_ON_REGRESSION: "0"
   FUSE_CONCURRENCY_STRESS_REQUIRED: ${{ (github.event_name == 'schedule' || github.event_name == 'push' || ((github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.run_all_e2e == '1' || inputs.run_fuse_concurrency_stress == '1'))) && '1' || '0' }}
+  FEISHU_PROOF: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && inputs.feishu_proof == '1' && '1' || '0' }}
   FUSE_PERF_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-performance
   FUSE_CONCURRENCY_ARTIFACT_DIR: ${{ github.workspace }}/e2e-artifacts/fuse-concurrency
   FEATURE_MATRIX_REPORT_DIR: ${{ github.workspace }}/e2e-artifacts/feature-matrix
@@ -478,6 +491,76 @@ jobs:
             echo "pjdfstest POSIX suite: \`RUN_POSIX_FEATURE_MATRIX=${RUN_POSIX_FEATURE_MATRIX}\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Turn the raw per-suite outcomes into one product-quality report: a richer
+      # step summary grouped by product promise, an aggregated JSON for the
+      # notifier, a signature-led issue body, and outputs (notify/signature/...).
+      # failure() is only valid in `if:`, so capture "a prior step hard-failed"
+      # (e.g. TiDB/server setup) as a marker file the aggregator can read.
+      - name: Detect degraded pipeline
+        if: failure()
+        run: touch /tmp/e2e-degraded
+
+      - name: Aggregate e2e product-quality report
+        id: aggregate
+        if: always()
+        run: |
+          cat > /tmp/e2e-outcomes.json <<JSON
+          {
+            "api-smoke": "${{ steps.api-smoke.outcome }}",
+            "existing-key-smoke": "${{ steps.existing-key-smoke.outcome }}",
+            "cli-smoke": "${{ steps.cli-smoke.outcome }}",
+            "layer-fs-smoke": "${{ steps.layer-fs-smoke.outcome }}",
+            "fuse-smoke": "${{ steps.fuse-smoke.outcome }}",
+            "git-ops-smoke": "${{ steps.git-ops-smoke.outcome }}",
+            "portable-pack-unpack-e2e": "${{ steps.portable-pack-unpack-e2e.outcome }}",
+            "fuse-crash-recovery": "${{ steps.fuse-crash-recovery.outcome }}",
+            "fuse-write-perf-budget": "${{ steps.fuse-write-perf-budget.outcome }}",
+            "fuse_performance_compare": "${{ steps.fuse_performance_compare.outcome }}",
+            "fuse-concurrency-stress": "${{ steps.fuse-concurrency-stress.outcome }}",
+            "fuse-posix-fsx": "${{ steps.fuse-posix-fsx.outcome }}",
+            "smoke-all": "${{ steps.smoke-all.outcome }}",
+            "git-feature-matrix": "${{ steps.git-feature-matrix.outcome }}",
+            "pjdfstest-suite": "${{ steps.pjdfstest-suite.outcome }}"
+          }
+          JSON
+          args=()
+          if [ "${FEISHU_PROOF}" = "1" ]; then
+            args+=(--proof-fail-suite e2e-feishu-proof)
+          fi
+          if [ -f /tmp/e2e-degraded ]; then
+            args+=(--degraded)
+          fi
+          go run ./cmd/e2e-aggregate \
+            --manifest e2e/suite-manifest.json \
+            --outcomes /tmp/e2e-outcomes.json \
+            --summaries e2e/reports/summary \
+            --out /tmp/e2e-report.json \
+            --issue-body /tmp/e2e-issue-body.md \
+            "${args[@]}"
+
+      # Push failures/regressions that warrant attention to Feishu/Lark. PR-tier
+      # failures stay in GitHub by policy; the notifier no-ops when no Feishu
+      # secret is configured, so this never blocks a fork/PR without secrets.
+      #
+      # SECURITY: only run on trusted events. A pull_request runs code from the PR
+      # checkout, and a PR-controlled aggregator can set notify=true (e.g. a perf
+      # regression notifies regardless of tier); exposing the Feishu secrets to
+      # `go run` on a PR would let a same-repo PR exfiltrate them. push/schedule
+      # are main-only; workflow_dispatch/workflow_call require a trusted actor.
+      - name: Notify Feishu on post-merge/nightly failure or perf regression
+        if: >-
+          always() && steps.aggregate.outputs.notify == 'true' &&
+          (github.event_name == 'push' || github.event_name == 'schedule' ||
+          github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call')
+        continue-on-error: true
+        env:
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_CHAT_ID: ${{ secrets.FEISHU_CHAT_ID }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+        run: |
+          go run ./cmd/feishu-notify --report /tmp/e2e-report.json
+
       - name: Dump TiDB playground logs
         if: always()
         run: |
@@ -560,16 +643,45 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           EVENT_NAME: ${{ github.event_name }}
           SHA: ${{ github.sha }}
+          SIGNATURE: ${{ steps.aggregate.outputs.signature }}
         run: |
           gh label create ci-e2e-failure --repo "$REPO" \
             --description "Automated: local-e2e scheduled/post-merge run failed" \
             --color D93F0B --force || true
-          body="local-e2e \`$EVENT_NAME\` run failed on \`main\` at $SHA: $RUN_URL"
-          existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
-            --json number --jq '.[0].number // empty')"
+
+          # Prefer the structured, signature-led body from the aggregator; fall back
+          # to a one-liner if it is missing. Use a file (--body-file) so suite names
+          # or failure detail containing shell metacharacters/backticks cannot break
+          # or inject into the gh call.
+          body_file=/tmp/e2e-issue-body.md
+          if [ -s "$body_file" ]; then
+            printf '\n\n_run: %s_\n' "$RUN_URL" >> "$body_file"
+          else
+            printf 'local-e2e `%s` run failed on `main` at %s: %s\n' "$EVENT_NAME" "$SHA" "$RUN_URL" > "$body_file"
+          fi
+
+          # Group recurring failures by signature. GitHub's `in:title` search is
+          # fuzzy, so narrow with it but confirm an exact "[sig: <signature>]"
+          # marker client-side with jq; a new signature opens its own tracking
+          # issue. With no signature we keep the legacy single-issue behaviour.
+          # The search+create is not atomic, but the workflow concurrency group
+          # serializes main runs, so a duplicate-issue race is not expected here.
+          # The signature is a sha256 hex slice; require [0-9a-f] before splicing
+          # it into the jq filter (defense-in-depth against jq metacharacters).
+          if [[ "$SIGNATURE" =~ ^[0-9a-f]+$ ]]; then
+            existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
+              --search "in:title $SIGNATURE" --json number,title \
+              --jq "[.[] | select(.title | contains(\"[sig: $SIGNATURE]\"))][0].number // empty")"
+            title="local-e2e failure on main [sig: $SIGNATURE]"
+          else
+            existing="$(gh issue list --repo "$REPO" --label ci-e2e-failure --state open \
+              --json number --jq '.[0].number // empty')"
+            title="local-e2e $EVENT_NAME run failing on main"
+          fi
+
           if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$REPO" --body "$body"
+            gh issue comment "$existing" --repo "$REPO" --body-file "$body_file"
           else
             gh issue create --repo "$REPO" --label ci-e2e-failure \
-              --title "local-e2e $EVENT_NAME run failing on main" --body "$body"
+              --title "$title" --body-file "$body_file"
           fi

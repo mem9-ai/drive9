@@ -1,0 +1,60 @@
+from __future__ import annotations
+
+import os
+from typing import Any
+
+from harness.core import BlackboxError, Context, ModuleSkip
+from harness.module_base import BaseModule
+from suites.git._deps import ensure_git_source
+
+
+class GitOfficialFunctional(BaseModule):
+    description = "Run selected upstream Git functional tests with trash roots on Drive9 FUSE."
+    labels = ("compatibility", "git", "community")
+    timeout = 7200
+
+    tests = (
+        "t0000-basic.sh",
+        "t0001-init.sh",
+        "t1300-config.sh",
+        "t1400-update-ref.sh",
+        "t1450-fsck.sh",
+        "t1500-rev-parse.sh",
+        "t2020-checkout-detach.sh",
+        "t3700-add.sh",
+        "t3903-stash.sh",
+        "t4013-diff-various.sh",
+        "t5601-clone.sh",
+        "t7500-commit-template-squash-signoff.sh",
+    )
+
+    def run(self, ctx: Context) -> dict[str, Any]:
+        ctx.deps.ensure_prove()
+        ctx.deps.ensure_git_tool()
+        source = ensure_git_source(ctx)
+        tests = list(self.tests)
+        remote = ctx.target.remote_root(self.id)
+        ctx.target.mkdir_remote(remote)
+        handle = ctx.target.mount("git_official_functional", remote, durability="write-sync")
+        try:
+            trash_root = handle.mountpoint / "git-test-trash"
+            trash_root.mkdir()
+            env = ctx.target.base_env()
+            env["GIT_TEST_INSTALLED"] = str(source / "bin-wrappers")
+            env["GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME"] = "main"
+            output_dir = ctx.artifact_dir(self.id) / "test-output"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            env["TEST_OUTPUT_DIRECTORY"] = str(output_dir)
+            test_paths = [str(source / "t" / test) for test in tests]
+            result = ctx.target.run_cmd(
+                "git-official-functional",
+                ["prove", "--timer", "--verbose", *test_paths, "::", f"--root={trash_root}"],
+                cwd=source / "t",
+                timeout=int(os.environ.get("GIT_TEST_TIMEOUT_S", str(self.timeout))),
+                env=env,
+            )
+            if not result.ok:
+                raise BlackboxError(f"Git official functional tests failed; see {result.stderr}")
+            return {"tests": tests, "source": str(source)}
+        finally:
+            ctx.target.unmount(handle)

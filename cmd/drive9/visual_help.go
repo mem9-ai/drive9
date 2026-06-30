@@ -471,23 +471,25 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 		},
 		{
 			Name:    "admin",
-			Args:    "tenant <command> [arguments]",
-			Summary: "manage TiDBCloud Mode tenants and quota",
+			Args:    "<tenant|pool> <command> [arguments]",
+			Summary: "manage TiDBCloud Mode tenants, pools, and quota",
 			Details: []string{
 				"requires TiDB Cloud keys; Drive9 API keys are not accepted",
 				"tenant list/get is read-authorized through TiDB Cloud managed cluster listing",
 				"tenant delete and tenant set-quota require TiDB Cloud cluster label patch permission",
+				"pool commands manage pre-created free tenants for faster admin tenant create",
 			},
 			Flags: []visualHelpFlag{
 				{Name: "--server URL", Desc: "server URL; defaults to active context server"},
 				{Name: "--region-code CODE", Desc: "TiDBCloud Mode region code; ignored when --server is set"},
 				{Name: "--tenant-id ID", Desc: "drive9 tenant id for tenant get/delete/set-quota"},
+				{Name: "--pool-size N", Desc: "pool create/update target free tenant count"},
 				{Name: "--tidbcloud-public-key KEY", Desc: "TiDB Cloud public key"},
 				{Name: "--tidbcloud-private-key KEY", Desc: "TiDB Cloud private key"},
 				{Name: "--max-storage-size Mi", Desc: "set-quota: max confirmed+reserved storage size in Mi"},
 				{Name: "--max-file-size Mi", Desc: "set-quota: max single file size in Mi"},
 				{Name: "--max-file-count N", Desc: "set-quota: max confirmed file count; 0 means unlimited"},
-				{Name: "--tidbcloud-spending-limit N", Desc: "set-quota: TiDB Cloud Cluster Spending Limit"},
+				{Name: "--tidbcloud-spending-limit N", Desc: "tenant create/set-quota TiDB Cloud Cluster Spending Limit"},
 				{Name: "--json", Desc: "output result as JSON"},
 			},
 			Examples: []visualHelpExample{
@@ -495,6 +497,8 @@ func drive9VisualHelpCommands() []visualHelpCommand {
 				{Command: "drive9 admin tenant list --region-code aws-ap-southeast-1 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key> --json", Desc: "list managed TiDBCloud Mode tenants"},
 				{Command: "drive9 admin tenant get --region-code aws-ap-southeast-1 --tenant-id tnt_xxx --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "query TiDBCloud Mode tenant info and quota"},
 				{Command: "drive9 admin tenant set-quota --region-code aws-ap-southeast-1 --tenant-id tnt_xxx --max-storage-size 102400 --tidbcloud-spending-limit 10000 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "set TiDBCloud Mode tenant quota"},
+				{Command: "drive9 admin pool create --region-code aws-ap-southeast-1 --pool-size 10 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "create a TiDBCloud Mode tenant pool"},
+				{Command: "drive9 admin pool get --region-code aws-ap-southeast-1 --tidbcloud-public-key <public-key> --tidbcloud-private-key <private-key>", Desc: "show tenant pool free size"},
 			},
 		},
 		{

@@ -7,6 +7,7 @@ import (
 
 	"github.com/mem9-ai/drive9/pkg/backend"
 	"github.com/mem9-ai/drive9/pkg/meta"
+	"github.com/mem9-ai/drive9/pkg/server"
 )
 
 func TestVersionTextUsesDrive9ServerComponent(t *testing.T) {
@@ -78,6 +79,37 @@ func TestSlockOAuthFromEnvEnabled(t *testing.T) {
 	}
 	if c == nil || !strings.Contains(c.LoginURL(), "client_id=drive9") {
 		t.Fatalf("unexpected Slock client: %#v", c)
+	}
+}
+
+func TestTenantPoolMaxSizeFromEnv(t *testing.T) {
+	const key = "DRIVE9_TENANT_POOL_MAX_SIZE"
+	restore := snapshotEnv(t, []string{key})
+	t.Cleanup(func() { restoreEnv(t, restore) })
+
+	unsetEnv(t, []string{key})
+	got, err := tenantPoolMaxSizeFromEnv()
+	if err != nil {
+		t.Fatalf("tenantPoolMaxSizeFromEnv empty: %v", err)
+	}
+	if got != server.DefaultTenantPoolMaxSize {
+		t.Fatalf("empty max size = %d, want %d", got, server.DefaultTenantPoolMaxSize)
+	}
+
+	setEnv(t, key, "25")
+	got, err = tenantPoolMaxSizeFromEnv()
+	if err != nil {
+		t.Fatalf("tenantPoolMaxSizeFromEnv valid: %v", err)
+	}
+	if got != 25 {
+		t.Fatalf("max size = %d, want 25", got)
+	}
+
+	for _, raw := range []string{"0", "-1", "bad"} {
+		setEnv(t, key, raw)
+		if _, err := tenantPoolMaxSizeFromEnv(); err == nil {
+			t.Fatalf("tenantPoolMaxSizeFromEnv(%q) error = nil, want error", raw)
+		}
 	}
 }
 

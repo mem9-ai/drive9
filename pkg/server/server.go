@@ -54,6 +54,10 @@ type Config struct {
 	LocalS3           *s3client.LocalS3Client
 	S3Dir             string
 	MaxUploadBytes    int64
+	// TenantPoolMaxSize caps admin tenant pool create/update target size. Values
+	// <= 0 are normalized to DefaultTenantPoolMaxSize; the pool is never
+	// intentionally uncapped.
+	TenantPoolMaxSize int
 	// InlineThreshold is the server-wide DB-inline vs S3 cutoff surfaced to
 	// clients via /v1/status. When 0, the value is inferred from
 	// cfg.Backend.InlineThreshold() (or omitted in responses if no backend).
@@ -75,6 +79,31 @@ type Config struct {
 	// per-tenant FileGC) to run only on the leader pod. When nil or disabled, all
 	// workers start unconditionally (single-pod mode).
 	Leader *leader.Manager
+
+	// SSE notification outbox + pod-to-pod push configuration. These enable the
+	// new cross-pod SSE scheme that avoids polling every tenant's TiDB. When
+	// Meta is nil (single-tenant mode), these are unused.
+	//
+	// SSENotifyPollInterval is the fallback poller tick (default 200ms). The
+	// poller reads the central sse_notify_outbox table (always-provisioned meta
+	// DB) — not per-tenant TiDBs — so idle tenant TiDBs can scale to zero.
+	//
+	// SSENotifyRetention is how long outbox rows are kept before leader-gated
+	// pruning (default 1h).
+	//
+	// PodID uniquely identifies this pod in the central pod_registry. PodAddr
+	// is the internally reachable address (host:port) for peer push notifications.
+	// When both are set, this pod registers itself and reports its SSE subscriber
+	// tenant set so peers can route push notifications.
+	//
+	// PodNotifySecret is the shared bearer token for /v1/internal/sse-notify
+	// authentication. When set, the pod-to-pod push path is enabled; when nil,
+	// only the 200ms poller fallback is used (no push).
+	SSENotifyPollInterval time.Duration
+	SSENotifyRetention     time.Duration
+	PodID                  string
+	PodAddr                string
+	PodNotifySecret        []byte
 }
 
 type SlockOAuthClient interface {
@@ -112,34 +141,38 @@ type nativeSystemUserProvisioner interface {
 }
 
 type Server struct {
-	fallback            *backend.Dat9Backend
-	meta                *meta.Store
-	pool                *tenant.Pool
-	provisioner         tenant.Provisioner
-	tokenSecret         []byte
-	localTenantAPIKey   string
-	vaultMK             *vault.MasterKey
-	vaultIssuerURL      string
-	publicURL           string
-	maxUploadBytes      int64
-	inlineThreshold     int64
-	metrics             *serverMetrics
-	logger              *zap.Logger
-	mux                 *http.ServeMux
-	events              *eventBuses
-	semanticWorker      *semanticWorkerManager
-	journalCursorSecret []byte
-	objectGCWorker      *objectGCWorker
-	slockOAuth          SlockOAuthClient
-	tidbAutoEmbedding   tenantAutoEmbeddingDefault
-	disableDBAutoEmbed  bool
-	forkWorkerCtx       context.Context
-	forkWorkerCancel    context.CancelFunc
-	forkWorkerWG        sync.WaitGroup
-	forkWorkerMu        sync.Mutex
-	forkWorkerClosed    bool
-	schemaInitErrors    sync.Map
-	leader              *leader.Manager
+	fallback              *backend.Dat9Backend
+	meta                  *meta.Store
+	pool                  *tenant.Pool
+	provisioner           tenant.Provisioner
+	tokenSecret           []byte
+	localTenantAPIKey     string
+	vaultMK               *vault.MasterKey
+	vaultIssuerURL        string
+	publicURL             string
+	maxUploadBytes        int64
+	tenantPoolMaxSize     int
+	inlineThreshold       int64
+	metrics               *serverMetrics
+	logger                *zap.Logger
+	mux                   *http.ServeMux
+	events                *eventBuses
+	semanticWorker        *semanticWorkerManager
+	journalCursorSecret   []byte
+	objectGCWorker        *objectGCWorker
+	slockOAuth            SlockOAuthClient
+	tidbAutoEmbedding     tenantAutoEmbeddingDefault
+	disableDBAutoEmbed    bool
+	forkWorkerCtx         context.Context
+	forkWorkerCancel      context.CancelFunc
+	forkWorkerWG          sync.WaitGroup
+	forkWorkerMu          sync.Mutex
+	forkWorkerClosed      bool
+	tenantPoolLocks       sync.Map
+	tenantPoolCreateLocks sync.Map
+	tenantPoolResumeJobs  sync.Map
+	schemaInitErrors      sync.Map
+	leader                *leader.Manager
 	// leaderWorkerCtx gates leader-only background schedulers. When leadership
 	// changes, this context is cancelled and recreated. Workers that use it
 	// (pending tenant reconciler, tenant delete cleanup, one-time resume tasks)
@@ -155,6 +188,22 @@ type Server struct {
 	// leadership transitions rather than being wired separately in main.go.
 	replayWorker      *backend.MutationReplayWorker
 	expirySweepWorker *backend.ExpirySweepWorker
+
+	// SSE cross-pod notification components. The notifyPoller reads the central
+	// sse_notify_outbox table (in the always-provisioned meta DB) on every pod
+	// to discover which tenants have new fs_events rows — replacing the old
+	// per-bus 1s poll that kept every serverless tenant TiDB awake. The
+	// podNotifier sends fire-and-forget HTTP pushes to peers for <10ms latency.
+	// The podRegistry maintains this pod's presence and subscriber set in the
+	// central DB. All three run on every pod (not leader-gated); the leader
+	// additionally sweeps stale pods and prunes the outbox.
+	podNotifier     *podNotifier
+	podRegistry     *podRegistry
+	podNotifySecret []byte
+	notifyCancel    context.CancelFunc
+	notifyWG        sync.WaitGroup
+	// sseNotifyRetention is how long outbox rows are kept before leader pruning.
+	sseNotifyRetention time.Duration
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -174,6 +223,10 @@ var (
 // DefaultMaxUploadBytes is the server-wide fallback upload size limit.
 // Keep callers on this exported constant so the default stays consistent.
 const DefaultMaxUploadBytes int64 = 10 * (1 << 30) // 10 GiB
+
+// DefaultTenantPoolMaxSize caps admin tenant pools unless overridden by server
+// configuration with a positive value.
+const DefaultTenantPoolMaxSize = 200
 
 // TenantStatusResponse is the JSON body of GET /v1/status. Fields are filled
 // per authenticated tenant so callers can discover their effective limits
@@ -232,6 +285,10 @@ func NewWithConfig(cfg Config) *Server {
 	if inlineThreshold <= 0 {
 		inlineThreshold = backend.DefaultInlineThreshold
 	}
+	tenantPoolMaxSize := cfg.TenantPoolMaxSize
+	if tenantPoolMaxSize <= 0 {
+		tenantPoolMaxSize = DefaultTenantPoolMaxSize
+	}
 	forkWorkerCtx, forkWorkerCancel := context.WithCancel(context.Background())
 	s := &Server{
 		fallback:          cfg.Backend,
@@ -244,6 +301,7 @@ func NewWithConfig(cfg Config) *Server {
 		publicURL:         strings.TrimRight(strings.TrimSpace(cfg.PublicURL), "/"),
 		provisioner:       cfg.Provisioner,
 		maxUploadBytes:    maxUpload,
+		tenantPoolMaxSize: tenantPoolMaxSize,
 		inlineThreshold:   inlineThreshold,
 		metrics:           newServerMetrics(),
 		logger:            logger,
@@ -259,6 +317,12 @@ func NewWithConfig(cfg Config) *Server {
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
 		leader:              cfg.Leader,
+		podNotifySecret:     cfg.PodNotifySecret,
+		sseNotifyRetention:  cfg.SSENotifyRetention,
+		}
+	// Default SSE notify retention.
+	if s.sseNotifyRetention <= 0 {
+		s.sseNotifyRetention = defaultSSENotifyRetention
 	}
 	mux := http.NewServeMux()
 
@@ -312,12 +376,19 @@ func NewWithConfig(cfg Config) *Server {
 	mux.HandleFunc("/v1/status", s.handleTenantStatus)
 	mux.HandleFunc("/v1/provision", s.handleProvision)
 	mux.Handle("/v1/quota", s.quotaRootHandler(cfg))
+	mux.Handle("/v1/admin/tenant-pool", s.adminTenantPoolHandler())
 	mux.Handle("/v1/admin/tenants", s.adminTenantsRootHandler())
 	mux.Handle("/v1/admin/tenants/", s.adminTenantsItemHandler())
 	mux.HandleFunc("/v1/auth/slock/login", s.handleSlockLogin)
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+	// Internal pod-to-pod SSE push endpoint. Authenticated via a shared
+	// internal bearer secret (not tenant auth). Only registered when a secret
+	// is configured; the handler rejects all requests if no secret is set.
+	if len(cfg.PodNotifySecret) > 0 {
+		mux.HandleFunc(sseNotifyInternalRoute, s.handleInternalSSENotify)
+	}
 
 	local := cfg.LocalS3
 	if local == nil && cfg.Backend != nil {
@@ -372,6 +443,13 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	s.objectGCWorker = newObjectGCWorker(cfg.Meta, cfg.Pool)
 
+	// Start SSE cross-pod notification infrastructure. These run on every pod
+	// (not leader-gated) because each pod needs to discover cross-pod events
+	// for its own SSE subscribers. Only enabled in multi-tenant mode (Meta != nil).
+	if s.meta != nil {
+		s.startNotifyInfrastructure(cfg)
+	}
+
 	appManagedTaskTypes := semanticWorkerLogTaskTypesFromTypes(appManagedSemanticTaskTypes(cfg.SemanticEmbedder))
 	var fallbackTaskTypes, poolAutoTaskTypes []string
 	if cfg.Backend != nil {
@@ -405,6 +483,75 @@ func NewWithConfig(cfg Config) *Server {
 	return s
 }
 
+// startNotifyInfrastructure launches the SSE cross-pod notification components
+// that run on every pod (not leader-gated):
+//   - notifyPoller: reads the central sse_notify_outbox table at 200ms intervals
+//     to discover which tenants have new fs_events rows written by other pods.
+//   - podRegistry: maintains this pod's presence in pod_registry and reports its
+//     SSE subscriber tenant set to pod_subscriptions for push routing.
+//   - podNotifier: sends fire-and-forget HTTP pushes to peers for <10ms latency.
+//
+// Only called in multi-tenant mode (Meta != nil). In single-tenant mode the
+// fallback EventBus handles delivery without any cross-pod mechanism.
+func (s *Server) startNotifyInfrastructure(cfg Config) {
+	// Create a single context for all notify components. We store only the
+	// cancel func (not the context itself) on Server, per coding guidelines:
+	// "Pass context through call chains; do not store context in structs."
+	notifyCtx, notifyCancel := context.WithCancel(backgroundWithTrace(context.Background()))
+	s.notifyCancel = notifyCancel
+
+	// Fallback poller: reads the central outbox on every pod.
+	poller := newNotifyPoller(s.meta, s.events, cfg.SSENotifyPollInterval)
+	s.notifyWG.Add(1)
+	go func() {
+		defer s.notifyWG.Done()
+		poller.run(notifyCtx)
+	}()
+
+	// Pod registry: heartbeat + subscription reporting. Created when PodID is
+	// set; PodAddr may be empty initially (e.g. when the listen address is not
+	// known yet) — the heartbeat is a no-op in that case, but subscription
+	// reporting and the leader's stale-pod sweep still function.
+	if cfg.PodID != "" {
+		reg := newPodRegistry(s.meta, cfg.PodID, cfg.PodAddr, s.events)
+		s.podRegistry = reg
+		// Synchronous initial registration so this pod is visible in
+		// ListActivePods immediately (not after the first heartbeat tick).
+		_ = reg.RegisterBeforeStart(context.Background())
+		// Start the registry's goroutines. They are tracked by the registry's
+		// own WaitGroup and stopped via reg.Stop() in stopNotifyInfrastructure.
+		reg.Start(notifyCtx)
+	}
+
+	// Pod-to-pod push notifier: only when a shared secret is configured.
+	if len(cfg.PodNotifySecret) > 0 && cfg.PodID != "" {
+		notifier := newPodNotifier(s.meta, cfg.PodID, cfg.PodNotifySecret)
+		s.podNotifier = notifier
+		notifier.Start(notifyCtx)
+	}
+}
+
+// stopNotifyInfrastructure stops the notify poller, pod registry, and pod
+// notifier. Called from Close AFTER stopLeaderWorkers so the leader-gated
+// stale-pod sweep (which dereferences s.podRegistry) can't race with clearing
+// podRegistry. The poller is stopped via notifyCancel; the registry and notifier
+// have their own Stop methods that wait for all goroutines to exit.
+func (s *Server) stopNotifyInfrastructure() {
+	if s.notifyCancel != nil {
+		s.notifyCancel()
+	}
+	s.notifyWG.Wait()
+	if s.podRegistry != nil {
+		s.podRegistry.Stop()
+	}
+	if s.podNotifier != nil {
+		s.podNotifier.Stop()
+	}
+	s.notifyCancel = nil
+	s.podNotifier = nil
+	s.podRegistry = nil
+}
+
 func (s *Server) Close() {
 	s.forkWorkerMu.Lock()
 	if !s.forkWorkerClosed {
@@ -436,6 +583,10 @@ func (s *Server) Close() {
 	// modes (they are started by startLeaderWorkers), so no separate Stop calls
 	// are needed here.
 	s.stopLeaderWorkers()
+	// Stop SSE cross-pod notification infrastructure AFTER leader-gated workers
+	// are stopped, so the stale-pod sweep (which dereferences s.podRegistry)
+	// cannot race with clearing podRegistry during shutdown.
+	s.stopNotifyInfrastructure()
 }
 
 // startLeaderWorkers launches the background schedulers that should run only
@@ -538,6 +689,40 @@ func (s *Server) startLeaderWorkers() {
 			}
 		}
 	})
+	// Periodic SSE notify outbox cleanup (leader-only). Prunes old
+	// sse_notify_outbox rows so the central table doesn't grow unbounded.
+	// Only runs in multi-tenant mode (Meta != nil).
+	if s.meta != nil {
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(sseNotifyCleanupInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.cleanupSSENotifyOutbox(workerCtx)
+				}
+			}
+		})
+	}
+	// Periodic stale pod sweep (leader-only). Marks pods with expired heartbeats
+	// as stale and cleans up their subscription rows so writers stop pushing to
+	// dead pods. Only runs when pod registry is configured.
+	if s.podRegistry != nil {
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(stalePodSweepInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.podRegistry.SweepStalePods(workerCtx)
+				}
+			}
+		})
+	}
 }
 
 // fsEventsCleanupInterval is how often the leader prunes old fs_events rows.
@@ -545,6 +730,14 @@ const fsEventsCleanupInterval = 5 * time.Minute
 
 // fsEventsRetention is how long event rows are kept before pruning.
 const fsEventsRetention = 1 * time.Hour
+
+// defaultSSENotifyRetention is how long sse_notify_outbox rows are kept before
+// the leader prunes them. Matches fs_events retention so the outbox doesn't
+// outlive the event content it points to.
+const defaultSSENotifyRetention = 1 * time.Hour
+
+// sseNotifyCleanupInterval is how often the leader prunes old outbox rows.
+const sseNotifyCleanupInterval = 5 * time.Minute
 
 // cleanupFSEvents prunes old fs_events rows from accessible stores.
 // Single-tenant mode cleans the fallback store. Multi-tenant mode iterates
@@ -628,6 +821,35 @@ func (s *Server) cleanupFSEvents(ctx context.Context) {
 		} else {
 			metrics.RecordFSEventsPruned(te.TenantID, n)
 		}
+	}
+}
+
+// cleanupSSENotifyOutbox prunes old sse_notify_outbox rows from the central meta
+// DB. Leader-gated; runs on the sseNotifyCleanupInterval ticker. The outbox is
+// a lightweight pointer table (tenant_id + seq), not event content — pruning
+// old rows doesn't lose events because SSE clients use fs_events seq cursors
+// for replay, and the outbox is only a cross-pod wake-up signal.
+func (s *Server) cleanupSSENotifyOutbox(ctx context.Context) {
+	if ctx.Err() != nil {
+		logger.Warn(ctx, "sse_notify_cleanup_skipped_shutdown", zap.Error(ctx.Err()))
+		return
+	}
+	if s.meta == nil {
+		return
+	}
+	n, err := s.meta.DeleteSSENotifyBefore(ctx, time.Now().Add(-s.sseNotifyRetention))
+	if err != nil {
+		if ctx.Err() != nil {
+			logger.Warn(ctx, "sse_notify_cleanup_interrupted_by_shutdown", zap.Error(err))
+		} else {
+			logger.Warn(ctx, "sse_notify_cleanup_failed", zap.Error(err))
+		}
+		return
+	}
+	if n > 0 {
+		logger.Info(ctx, "sse_notify_outbox_pruned",
+			zap.Int64("rows", n),
+			zap.Duration("retention", s.sseNotifyRetention))
 	}
 }
 
@@ -726,6 +948,21 @@ func (s *Server) resumeProvisioningTenantsWithCtx(ctx context.Context) {
 			s.startForkProvision(ctx, t.ID)
 			continue
 		}
+		if t.Provider == tenant.ProviderTiDBCloudNative && t.DBUser == "" {
+			// TiDB Cloud native metadata resume is gated by request-scoped customer credentials.
+			logger.Warn(ctx, "resume_provisioning_native_no_connection",
+				zap.String("tenant_id", t.ID),
+				zap.String("provider", t.Provider),
+				zap.String("cluster_id", t.ClusterID),
+				zap.String("reason", "tidbcloud_credentials_unavailable"))
+			if s.metrics != nil {
+				s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
+					"provider", t.Provider,
+					"result", "skipped",
+					"reason", "tidbcloud_credentials_unavailable")
+			}
+			continue
+		}
 		s.startTenantSchemaInitResume(ctx, t)
 	}
 }
@@ -805,7 +1042,43 @@ func (s *Server) startTenantSchemaInitResume(ctx context.Context, t meta.Tenant)
 }
 
 func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
+	if t.Provider == tenant.ProviderTiDBCloudNative && strings.TrimSpace(t.ClusterID) != "" && strings.TrimSpace(t.DBUser) == "" {
+		logger.Info(ctx, "resume_pending_pool_tenant_skipped",
+			zap.String("tenant_id", t.ID),
+			zap.String("provider", t.Provider),
+			zap.String("cluster_id", t.ClusterID),
+			zap.String("reason", "tidbcloud_credentials_unavailable"))
+		if s.metrics != nil {
+			s.metrics.recordEvent(t.ID, "tenant_pool_pending_resume",
+				"provider", t.Provider,
+				"result", "skipped",
+				"reason", "tidbcloud_credentials_unavailable")
+		}
+		return
+	}
 	if !isStalePendingTenant(time.Now().UTC(), t) {
+		return
+	}
+	if pendingTenantConnectionReady(t) {
+		updated, err := s.meta.UpdateTenantStatusIf(ctx, t.ID, meta.TenantPending, meta.TenantProvisioning)
+		if err != nil {
+			logger.Error(ctx, "resume_pending_schema_init_status_update_error",
+				zap.String("tenant_id", t.ID),
+				zap.Error(err))
+			return
+		}
+		if !updated {
+			logger.Info(ctx, "resume_pending_schema_init_skipped",
+				zap.String("tenant_id", t.ID),
+				zap.String("reason", "status_changed"))
+			return
+		}
+		t.Status = meta.TenantProvisioning
+		logger.Info(ctx, "resume_pending_schema_init_started",
+			zap.String("tenant_id", t.ID),
+			zap.String("provider", t.Provider),
+			zap.String("cluster_id", t.ClusterID))
+		s.startTenantSchemaInitResume(ctx, t)
 		return
 	}
 	logger.Warn(ctx, "resume_pending_mark_failed",
@@ -825,6 +1098,14 @@ func (s *Server) reconcilePendingTenant(ctx context.Context, t meta.Tenant) {
 			zap.String("tenant_id", t.ID),
 			zap.String("reason", "status_changed"))
 	}
+}
+
+func pendingTenantConnectionReady(t meta.Tenant) bool {
+	return strings.TrimSpace(t.DBHost) != "" &&
+		t.DBPort > 0 &&
+		strings.TrimSpace(t.DBUser) != "" &&
+		len(t.DBPasswordCipher) > 0 &&
+		strings.TrimSpace(t.DBName) != ""
 }
 
 func isStalePendingTenant(now time.Time, t meta.Tenant) bool {
@@ -3905,6 +4186,13 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 		}
 		credentialReq = decoded.Credential
 		quotaReq = decoded.Quota
+		if quotaReq != nil {
+			if err := s.validateQuotaSetRequest(*quotaReq); err != nil {
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "error")
+				errJSON(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		}
 	} else {
 		if err := rejectCredentialProvisionBody(r); err != nil {
 			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_credential_rejected", "provider", provider, "error", err)...)
@@ -3912,6 +4200,31 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, http.StatusBadRequest, err.Error())
 			return
 		}
+	}
+	if provider == tenant.ProviderTiDBCloudNative && credentialReq != nil {
+		poolClaimStarted := time.Now()
+		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_started", "provider", provider, "quota_requested", quotaReq != nil)...)
+		if res, pool, claimed, err := s.claimAdminTenantFromPool(r.Context(), *credentialReq, quotaReq); err != nil {
+			logger.Error(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_failed", "provider", provider, "duration_ms", durationMillis(poolClaimStarted), "error", err)...)
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", provisionTenantPoolClaimMetricResult(err))
+			errJSON(w, http.StatusBadGateway, "claim tenant pool tenant failed")
+			return
+		} else if claimed {
+			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted), "status", res.Status)...)
+			setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
+			if res.Status == meta.TenantProvisioning {
+				s.startProvisionedTenantSchemaInit(r.Context(), res)
+			}
+			s.replenishTenantPoolAsync(r.Context(), pool, *credentialReq)
+			if quotaReq != nil && quotaReq.TiDBCloudSpendingLimit != nil {
+				metricEvent(r.Context(), "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
+			}
+			metricEvent(r.Context(), "tenant_provision", "provider", provider, "result", "accepted")
+			writeProvisionTenantAccepted(w, res)
+			logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_create_accepted", "tenant_id", res.TenantID, "provider", res.Provider, "pool_id", pool.PoolID, "organization_id", res.OrganizationID, "duration_ms", durationMillis(poolClaimStarted))...)
+			return
+		}
+		logger.Info(r.Context(), "server_event", eventFields(r.Context(), "provision_tenant_pool_claim_missed", "provider", provider, "duration_ms", durationMillis(poolClaimStarted))...)
 	}
 	res, err := s.provisionTenant(r.Context(), provisionTenantOptions{
 		KeyName:               "default",
@@ -3930,7 +4243,17 @@ func (s *Server) handleProvision(w http.ResponseWriter, r *http.Request) {
 	}
 	setRequestMetricTenant(r.Context(), res.TenantID, res.APIKeyID, res.Provider, classifyTenantRequest(r))
 	s.startProvisionedTenantSchemaInit(r.Context(), res)
+	writeProvisionTenantAccepted(w, res)
+}
 
+func provisionTenantPoolClaimMetricResult(err error) string {
+	if errors.Is(err, tenant.ErrQuotaPermissionDenied) || errors.Is(err, tenant.ErrQuotaBackendNotFound) {
+		return "cluster_error"
+	}
+	return "error"
+}
+
+func writeProvisionTenantAccepted(w http.ResponseWriter, res *provisionTenantResult) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
 	response := map[string]string{
@@ -4105,6 +4428,20 @@ func newProvisionTenantError(status int, message string, err error) *provisionTe
 	return &provisionTenantError{status: status, message: message, err: err}
 }
 
+func durationMillis(started time.Time) float64 {
+	return float64(time.Since(started).Microseconds()) / 1000
+}
+
+func logProvisionStage(ctx context.Context, event, tenantID, provider string, started time.Time, kv ...any) {
+	fields := []any{
+		"tenant_id", tenantID,
+		"provider", provider,
+		"duration_ms", durationMillis(started),
+	}
+	fields = append(fields, kv...)
+	logger.Info(ctx, "server_event", eventFields(ctx, event, fields...)...)
+}
+
 func defaultTiDBAutoEmbeddingConfig(cfg tenantschema.TiDBAutoEmbeddingConfig) tenantschema.TiDBAutoEmbeddingConfig {
 	if cfg.Model == "" && cfg.Dimensions == 0 {
 		return tenantschema.CurrentTiDBAutoEmbeddingConfig()
@@ -4254,6 +4591,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 	}
 	tenantID := token.NewID()
+	provisionStarted := time.Now()
 	logger.Info(ctx, "server_event", eventFields(ctx, "provision_requested", "tenant_id", tenantID, "provider", provider)...)
 	setRequestMetricTenant(ctx, tenantID, "", provider, tenantRequestClass{surface: "provision", action: "post"})
 
@@ -4262,12 +4600,15 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		keyName = "default"
 	}
 	now := time.Now().UTC()
+	stageStarted := time.Now()
 	autoProfile, err := s.defaultAutoEmbeddingProfileForTenant(ctx, tenantID, provider, now)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_auto_embedding_profile_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to build tenant auto-embedding profile", err)
 	}
+	logProvisionStage(ctx, "provision_auto_embedding_profile_built", tenantID, provider, stageStarted, "enabled", autoProfile != nil)
+	stageStarted = time.Now()
 	if err := s.meta.InsertTenant(ctx, &meta.Tenant{
 		ID:               tenantID,
 		Status:           meta.TenantPending,
@@ -4288,8 +4629,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant", err)
 	}
 	metricEvent(ctx, "metadb_query", "api", "insert_tenant", "result", "ok")
+	logProvisionStage(ctx, "provision_tenant_inserted", tenantID, provider, stageStarted, "status", meta.TenantPending)
 
 	if autoProfile != nil {
+		stageStarted = time.Now()
 		if err := s.meta.UpsertTenantAutoEmbeddingProfile(ctx, autoProfile); err != nil {
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_auto_embedding_profile_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
 			metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
@@ -4298,12 +4641,16 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			}
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant auto-embedding profile", err)
 		}
+		logProvisionStage(ctx, "provision_auto_embedding_profile_inserted", tenantID, provider, stageStarted)
 	}
 
 	var cluster *tenant.ClusterInfo
 	var provisionCloudCfg *tenant.QuotaCloudConfig
+	stageStarted = time.Now()
+	provisionMode := "default"
 	if provider == tenant.ProviderTiDBCloudNative {
 		if opts.Quota != nil {
+			provisionMode = "tidb_cloud_native_credentials_quota"
 			quotaReq := *opts.Quota
 			quotaReq.TenantID = tenantID
 			if err := s.validateQuotaSetRequest(quotaReq); err != nil {
@@ -4315,6 +4662,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				return nil, newProvisionTenantError(http.StatusBadRequest, tenant.ErrCredentialsRequired.Error(), tenant.ErrCredentialsRequired)
 			}
 			if quotaProvisioner, ok := s.provisioner.(tenant.CredentialQuotaProvisioner); ok {
+				logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
 				cluster, provisionCloudCfg, err = quotaProvisioner.ProvisionWithCredentialsAndQuota(ctx, tenantID, *opts.CredentialProvisioner, tenant.QuotaUpdateOptions{
 					TiDBCloudSpendingLimitMonthly: quotaReq.TiDBCloudSpendingLimit,
 				})
@@ -4328,11 +4676,15 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 				return nil, newProvisionTenantError(http.StatusInternalServerError, "provisioner does not support create-time quota", err)
 			}
 		} else if credentialProvisioner, ok := s.provisioner.(tenant.CredentialProvisioner); ok {
+			provisionMode = "tidb_cloud_native_credentials"
+			logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
 			cluster, err = credentialProvisioner.ProvisionWithCredentials(ctx, tenantID, *opts.CredentialProvisioner)
 		} else {
 			err = fmt.Errorf("provisioner does not support request credentials")
 		}
 	} else {
+		provisionMode = "provisioner_default"
+		logProvisionStage(ctx, "provision_cluster_provision_started", tenantID, provider, stageStarted, "mode", provisionMode)
 		cluster, err = s.provisioner.Provision(ctx, tenantID)
 	}
 	if err != nil {
@@ -4356,8 +4708,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 		return nil, newProvisionTenantError(http.StatusBadGateway, msg, err)
 	}
+	logProvisionStage(ctx, "provision_cluster_provisioned", tenantID, provider, stageStarted, "mode", provisionMode, "cluster_id", cluster.ClusterID, "organization_id", cluster.OrganizationID)
 	cluster.Provider = provider
 	if provider == tenant.ProviderTiDBCloudNative {
+		stageStarted = time.Now()
 		if strings.TrimSpace(cluster.OrganizationID) == "" {
 			err := fmt.Errorf("tidbcloud organization label is missing")
 			logger.Error(ctx, "server_event", eventFields(ctx, "provision_tidbcloud_org_binding_missing", "tenant_id", tenantID, "provider", provider, "cluster_id", cluster.ClusterID, "error", err)...)
@@ -4377,8 +4731,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			s.cleanupProvisionedClusterAfterProvisionFailure(ctx, tenantID, provider, cluster, opts.CredentialProvisioner, "org_binding_error")
 			return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tidbcloud organization binding", err)
 		}
+		logProvisionStage(ctx, "provision_tidbcloud_org_binding_persisted", tenantID, provider, stageStarted, "cluster_id", cluster.ClusterID, "organization_id", cluster.OrganizationID)
 	}
 
+	stageStarted = time.Now()
 	cipherPass, err := s.pool.Encrypt(ctx, []byte(cluster.Password))
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_encrypt_db_password_failed", "tenant_id", tenantID, "provider", provider, "error", err)...)
@@ -4388,6 +4744,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to encrypt db password", err)
 	}
+	logProvisionStage(ctx, "provision_db_password_encrypted", tenantID, provider, stageStarted)
 	dbtls := true
 	if provider == tenant.ProviderTiDBCloudNative {
 		v := strings.TrimSpace(strings.ToLower(os.Getenv("DRIVE9_TIDBCLOUD_NATIVE_USE_PRIVATE_ENDPOINT")))
@@ -4395,6 +4752,7 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 			dbtls = false
 		}
 	}
+	stageStarted = time.Now()
 	if err := s.meta.UpdateTenantConnection(ctx, tenantID, &meta.Tenant{
 		DBHost:           cluster.Host,
 		DBPort:           cluster.Port,
@@ -4414,6 +4772,8 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist tenant connection", err)
 	}
+	logProvisionStage(ctx, "provision_tenant_connection_persisted", tenantID, provider, stageStarted, "cluster_id", cluster.ClusterID, "db_tls", dbtls)
+	stageStarted = time.Now()
 	if err := s.meta.UpdateTenantStatus(ctx, tenantID, meta.TenantProvisioning); err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_update_tenant_status_failed", "tenant_id", tenantID, "provider", provider, "status", meta.TenantProvisioning, "error", err)...)
 		metricEvent(ctx, "tenant_provision", "provider", provider, "result", "error")
@@ -4422,8 +4782,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		}
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to update tenant status", err)
 	}
+	logProvisionStage(ctx, "provision_tenant_status_updated", tenantID, provider, stageStarted, "status", meta.TenantProvisioning)
 
 	if opts.Quota != nil {
+		stageStarted = time.Now()
 		quotaReq := *opts.Quota
 		quotaReq.TenantID = tenantID
 		if err := s.applyQuotaLocalConfig(ctx, tenantID, quotaReq); err != nil {
@@ -4437,8 +4799,10 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		if provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil {
 			metricEvent(ctx, "tenant_provision", "provider", provider, "quota", "create_time_spending_limit")
 		}
+		logProvisionStage(ctx, "provision_quota_local_config_applied", tenantID, provider, stageStarted, "create_time_spending_limit", provisionCloudCfg != nil && provisionCloudCfg.TiDBCloudSpendingLimitMonthly != nil)
 	}
 
+	stageStarted = time.Now()
 	apiToken, apiKeyID, err := s.issueOwnerAPIKey(ctx, tenantID, keyName, opts.TokenVersion, opts.APIKeySource)
 	if err != nil {
 		logger.Error(ctx, "server_event", eventFields(ctx, "provision_insert_api_key_failed", "tenant_id", tenantID, "api_key_id", apiKeyID, "error", err)...)
@@ -4447,8 +4811,9 @@ func (s *Server) provisionTenant(ctx context.Context, opts provisionTenantOption
 		_ = s.meta.UpdateTenantStatus(context.Background(), tenantID, meta.TenantFailed)
 		return nil, newProvisionTenantError(http.StatusInternalServerError, "failed to persist api key", err)
 	}
+	logProvisionStage(ctx, "provision_api_key_issued", tenantID, provider, stageStarted, "api_key_id", apiKeyID)
 
-	logger.Info(ctx, "server_event", eventFields(ctx, "provision_accepted", "tenant_id", tenantID, "provider", provider)...)
+	logger.Info(ctx, "server_event", eventFields(ctx, "provision_accepted", "tenant_id", tenantID, "provider", provider, "duration_ms", durationMillis(provisionStarted))...)
 	metricEvent(ctx, "tenant_provision", "provider", provider, "result", "accepted")
 
 	cloudProvider, region := "", ""
@@ -4604,6 +4969,10 @@ func (s *Server) handleLocalTenantProvision(w http.ResponseWriter, r *http.Reque
 
 func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN, provider string, schemaInit func(context.Context, string) error) {
 	ctx = ensureTrace(ctx)
+	ctx = logger.WithContext(ctx, logger.FromContext(ctx).With(
+		zap.String("tenant_id", tenantID),
+		zap.String("provider", provider),
+	))
 	logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_started", "tenant_id", tenantID, "provider", provider)...)
 	deadline := time.Now().Add(schemaInitRetryWindow)
 	backoff := schemaInitInitialBackoff
@@ -4618,8 +4987,14 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			return
 		default:
 		}
+		if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "before_attempt") {
+			return
+		}
 		err := schemaInit(ctx, tenantDSN)
 		if err == nil {
+			if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "before_finalize") {
+				return
+			}
 			err = s.finalizeTenantSchemaInit(ctx, tenantID, tenantDSN, provider)
 		}
 		if err == nil {
@@ -4639,6 +5014,9 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 			}
 			return
 		} else {
+			if !s.tenantSchemaInitStillProvisioning(ctx, tenantID, provider, "after_error") {
+				return
+			}
 			s.schemaInitErrors.Store(tenantID, schemaInitStatusErrorMessage(err))
 			logger.Error(ctx, "server_event", eventFields(ctx, "schema_init_failed", "tenant_id", tenantID, "provider", provider, "attempt", attempt, "error", err)...)
 			if s.metrics != nil {
@@ -4690,6 +5068,41 @@ func (s *Server) initTenantSchemaAsync(ctx context.Context, tenantID, tenantDSN,
 		backoff *= 2
 		attempt++
 	}
+}
+
+func (s *Server) tenantSchemaInitStillProvisioning(ctx context.Context, tenantID, provider, stage string) bool {
+	if s.meta == nil {
+		return true
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	t, err := s.meta.GetTenant(ctx, tenantID)
+	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_stopped_status_changed",
+				"tenant_id", tenantID,
+				"provider", provider,
+				"stage", stage,
+				"status", "missing")...)
+			return false
+		}
+		logger.Warn(ctx, "schema_init_status_lookup_failed",
+			zap.String("tenant_id", tenantID),
+			zap.String("provider", provider),
+			zap.String("stage", stage),
+			zap.Error(err))
+		return true
+	}
+	if t.Status != meta.TenantProvisioning {
+		logger.Info(ctx, "server_event", eventFields(ctx, "schema_init_stopped_status_changed",
+			"tenant_id", tenantID,
+			"provider", provider,
+			"stage", stage,
+			"status", t.Status)...)
+		return false
+	}
+	return true
 }
 
 func (s *Server) finalizeTenantSchemaInit(ctx context.Context, tenantID, tenantDSN, provider string) error {

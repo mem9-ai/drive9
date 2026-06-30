@@ -1,0 +1,110 @@
+{
+  "_comment": "Product metadata for drive9 e2e suites, keyed by the local-e2e.yml step id. Consumed by cmd/e2e-aggregate to turn raw step outcomes into a product-quality report (owner routing, failure signatures, Feishu notifications). Suites that adopt the structured summary contract (e2e/reports/summary/<suite>.json) override these defaults. Keep in sync when adding suites to .github/workflows/local-e2e.yml.",
+  "suites": {
+    "api-smoke": {
+      "title": "API smoke",
+      "product_area": "api",
+      "product_promise": "HTTP API works end to end",
+      "owner_hint": "api"
+    },
+    "existing-key-smoke": {
+      "title": "Existing-key smoke",
+      "product_area": "api",
+      "product_promise": "existing API keys keep working",
+      "owner_hint": "api"
+    },
+    "cli-smoke": {
+      "title": "CLI smoke",
+      "product_area": "cli",
+      "product_promise": "drive9 CLI works end to end",
+      "owner_hint": "cli"
+    },
+    "layer-fs-smoke": {
+      "title": "Layer FS smoke",
+      "product_area": "filesystem",
+      "product_promise": "layered filesystem reads/writes are correct",
+      "owner_hint": "fs"
+    },
+    "fuse-smoke": {
+      "title": "FUSE release gate",
+      "product_area": "fuse",
+      "product_promise": "FUSE mount works for release",
+      "owner_hint": "fs"
+    },
+    "git-ops-smoke": {
+      "title": "Git operations smoke",
+      "product_area": "git",
+      "product_promise": "core git operations work on drive9",
+      "owner_hint": "git",
+      "failure_class": "correctness"
+    },
+    "portable-pack-unpack-e2e": {
+      "title": "Portable pack/unpack e2e",
+      "product_area": "portability",
+      "product_promise": "pack/unpack round-trips losslessly",
+      "owner_hint": "fs"
+    },
+    "fuse-crash-recovery": {
+      "title": "FUSE crash recovery e2e",
+      "product_area": "fuse",
+      "product_promise": "FUSE recovers cleanly after a crash",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
+    },
+    "fuse-write-perf-budget": {
+      "title": "FUSE write perf budget e2e",
+      "product_area": "fuse",
+      "product_promise": "FUSE write latency stays within budget",
+      "owner_hint": "fs",
+      "failure_class": "performance"
+    },
+    "fuse_performance_compare": {
+      "title": "FUSE performance compare",
+      "product_area": "fuse",
+      "product_promise": "FUSE performance does not regress vs baseline",
+      "owner_hint": "fs",
+      "failure_class": "performance"
+    },
+    "fuse-concurrency-stress": {
+      "title": "FUSE concurrency stress",
+      "product_area": "fuse",
+      "product_promise": "FUSE stays correct under concurrency",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
+    },
+    "fuse-posix-fsx": {
+      "title": "FUSE POSIX/fsx gate",
+      "product_area": "fuse",
+      "product_promise": "FUSE upholds POSIX semantics",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
+    },
+    "smoke-all": {
+      "title": "Full smoke-all suite",
+      "product_area": "platform",
+      "product_promise": "the full smoke suite passes",
+      "owner_hint": "platform"
+    },
+    "git-feature-matrix": {
+      "title": "Git feature matrix",
+      "product_area": "git",
+      "product_promise": "git feature matrix is compatible",
+      "owner_hint": "git",
+      "failure_class": "correctness"
+    },
+    "pjdfstest-suite": {
+      "title": "pjdfstest POSIX suite",
+      "product_area": "posix",
+      "product_promise": "drive9 passes the pjdfstest POSIX suite",
+      "owner_hint": "fs",
+      "failure_class": "correctness"
+    },
+    "e2e-feishu-proof": {
+      "title": "Feishu notification proof",
+      "product_area": "ci",
+      "product_promise": "Feishu notification delivery works",
+      "owner_hint": "ci",
+      "failure_class": "infrastructure"
+    }
+  }
+}

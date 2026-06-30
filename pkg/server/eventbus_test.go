@@ -244,8 +244,10 @@ func TestEventBusEventsSinceQueryErrorReturnsCaughtUp(t *testing.T) {
 
 // TestEventBusUnsubscribeOneOfManyReturnsImmediately verifies that unsubscribing
 // while other subscribers remain connected returns immediately (B1 regression test).
-// Before the fix, Unsubscribe unconditionally waited on pollWG, blocking until
-// all other subscribers left.
+// Before the original fix, Unsubscribe unconditionally waited on the poll goroutine,
+// blocking until all other subscribers left. (The per-bus poll goroutine has since
+// been removed entirely — cross-pod discovery is now centralized in the notifyPoller
+// — but the fast-return property is still asserted here.)
 func TestEventBusUnsubscribeOneOfManyReturnsImmediately(t *testing.T) {
 	store := newTestStoreForEventBus(t)
 	bus := NewEventBus("test-tenant", store)
@@ -267,79 +269,5 @@ func TestEventBusUnsubscribeOneOfManyReturnsImmediately(t *testing.T) {
 		// Success: returned immediately.
 	case <-time.After(time.Second):
 		t.Fatal("Unsubscribe blocked while another subscriber remained connected")
-	}
-}
-
-// TestEventBusPollLoopStopsAfterLastUnsubscribe verifies that the poll goroutine
-// stops after the last Unsubscribe and can restart cleanly on a later Subscribe.
-func TestEventBusPollLoopStopsAfterLastUnsubscribe(t *testing.T) {
-	store := newTestStoreForEventBus(t)
-	bus := NewEventBus("test-tenant", store)
-
-	// Subscribe then unsubscribe — poll should stop.
-	id, _ := bus.Subscribe()
-	bus.Unsubscribe(id)
-
-	// pollCancel should be nil after last unsubscribe.
-	bus.mu.Lock()
-	cancelNil := bus.pollCancel == nil
-	bus.mu.Unlock()
-	if !cancelNil {
-		t.Fatal("pollCancel should be nil after last Unsubscribe")
-	}
-
-	// Resubscribe — poll should restart.
-	id2, notify := bus.Subscribe()
-	defer bus.Unsubscribe(id2)
-
-	bus.mu.Lock()
-	cancelSet := bus.pollCancel != nil
-	bus.mu.Unlock()
-	if !cancelSet {
-		t.Fatal("pollCancel should be set after Subscribe restarts poll")
-	}
-
-	// Verify notify still works.
-	bus.Publish()
-	select {
-	case _, open := <-notify:
-		if !open {
-			t.Fatal("notify channel closed unexpectedly")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for notify signal after poll restart")
-	}
-}
-
-// TestEventBusPollLoopSignalsCrossPodEvents verifies that the per-bus poll
-// goroutine discovers new fs_events rows and signals subscribers via Publish.
-func TestEventBusPollLoopSignalsCrossPodEvents(t *testing.T) {
-	store := newTestStoreForEventBus(t)
-	bus := NewEventBus("test-tenant", store)
-
-	// Insert an initial event so pollLast initializes to it.
-	if _, err := store.InsertFSEvent(context.Background(), "/init.txt", "write", "", time.Now().UnixMilli()); err != nil {
-		t.Fatal(err)
-	}
-
-	id, notify := bus.Subscribe()
-	defer bus.Unsubscribe(id)
-
-	// Simulate a cross-pod write: insert a new row directly into fs_events
-	// (not via publishEvent), bypassing the local notify channel.
-	if _, err := store.InsertFSEvent(context.Background(), "/cross-pod.txt", "write", "remote", time.Now().UnixMilli()); err != nil {
-		t.Fatal(err)
-	}
-
-	// The per-bus poll goroutine should discover the new row within ~2s
-	// (1s poll interval + margin) and signal via Publish.
-	select {
-	case _, open := <-notify:
-		if !open {
-			t.Fatal("notify channel closed")
-		}
-		// Signal received — poll goroutine discovered the cross-pod event.
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for cross-pod event signal from poll goroutine")
 	}
 }

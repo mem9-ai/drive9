@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -178,6 +179,10 @@ func main() {
 	tokenHex := os.Getenv("DRIVE9_TOKEN_SIGNING_KEY")
 	vaultMKHex := os.Getenv("DRIVE9_VAULT_MASTER_KEY")
 	providerType := envOr("DRIVE9_TENANT_PROVIDER", tenant.ProviderTiDBZero)
+	tenantPoolMaxSize, err := tenantPoolMaxSizeFromEnv()
+	if err != nil {
+		die(err)
+	}
 	maxUploadBytes := server.DefaultMaxUploadBytes
 	if raw := os.Getenv("DRIVE9_MAX_UPLOAD_BYTES"); raw != "" {
 		maxUploadBytes, err = strconv.ParseInt(raw, 10, 64)
@@ -353,6 +358,39 @@ func main() {
 		logger.Info(context.Background(), "slock_oauth_disabled")
 	}
 
+	// SSE cross-pod notification configuration. These enable the new scheme
+	// that avoids polling every tenant's TiDB. The notify poller reads the
+	// central sse_notify_outbox (always-provisioned meta DB) at 200ms; the
+	// pod-to-pod HTTP push provides <10ms latency when PodID/PodAddr/secret
+	// are set. See pkg/server/notify_poller.go and pod_notifier.go.
+	sseNotifyPollInterval := envDuration("DRIVE9_SSE_NOTIFY_POLL_INTERVAL", 200*time.Millisecond)
+	sseNotifyRetention := envDuration("DRIVE9_SSE_NOTIFY_RETENTION", time.Hour)
+	podID := strings.TrimSpace(os.Getenv("DRIVE9_POD_ID"))
+	podAddr := strings.TrimSpace(os.Getenv("DRIVE9_POD_ADDR"))
+	// Default podAddr to the listen addr only if it's a real, non-wildcard
+	// address. The notifier requires a full base URL (http://host:port) for
+	// http.NewRequest. Wildcard binds like ":9009", "0.0.0.0:9009", or "[::]:9009"
+	// are not dialable by peers, so we leave podAddr empty in that case — the
+	// podRegistry still reports subscriptions and the leader sweeps stale pods,
+	// but cross-pod HTTP push is disabled until an explicit address is set.
+	if podAddr == "" && podID != "" {
+		if host, port, err := net.SplitHostPort(addr); err == nil && host != "" && host != "0.0.0.0" && host != "::" {
+			podAddr = "http://" + net.JoinHostPort(host, port)
+		}
+	}
+	var podNotifySecret []byte
+	if raw := strings.TrimSpace(os.Getenv("DRIVE9_POD_NOTIFY_SECRET")); raw != "" {
+		podNotifySecret = []byte(raw)
+	}
+	if podID != "" {
+		logger.Info(context.Background(), "sse_notify_config",
+			zap.String("pod_id", podID),
+			zap.String("pod_addr", podAddr),
+			zap.Duration("poll_interval", sseNotifyPollInterval),
+			zap.Duration("retention", sseNotifyRetention),
+			zap.Bool("push_enabled", podNotifySecret != nil))
+	}
+
 	die(server.NewWithConfig(server.Config{
 		Meta:                         store,
 		Pool:                         pool,
@@ -363,6 +401,7 @@ func main() {
 		PublicURL:                    publicBaseURL(addr),
 		S3Dir:                        s3cfg.Dir,
 		MaxUploadBytes:               maxUploadBytes,
+		TenantPoolMaxSize:            tenantPoolMaxSize,
 		InlineThreshold:              backendOptions.InlineThreshold,
 		Logger:                       srvLogger,
 		SemanticEmbedder:             semanticEmbedder,
@@ -373,6 +412,11 @@ func main() {
 		TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
 		DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 		Leader:                       leaderManager,
+		SSENotifyPollInterval:        sseNotifyPollInterval,
+		SSENotifyRetention:           sseNotifyRetention,
+		PodID:                        podID,
+		PodAddr:                      podAddr,
+		PodNotifySecret:              podNotifySecret,
 	}).ListenAndServe(addr))
 }
 
@@ -508,10 +552,27 @@ environment:
   DRIVE9_TIDBCLOUD_NATIVE_DEFAULT_DATABASE_NAME default tidb_cloud_native database name (default: tidbcloud_fs)
   DRIVE9_TIDBCLOUD_NATIVE_PUBLIC_KEY optional default TiDB Cloud API public key for tidb_cloud_native create/delete when caller omits it
   DRIVE9_TIDBCLOUD_NATIVE_PRIVATE_KEY optional default TiDB Cloud API private key for tidb_cloud_native create/delete when caller omits it
+  DRIVE9_TENANT_POOL_MAX_SIZE maximum admin tenant pool size (default: %d)
   DRIVE9_SLOCK_ORIGIN Slock browser origin; when set, enables /v1/auth/slock/*
   DRIVE9_SLOCK_API_ORIGIN Slock API origin (required when DRIVE9_SLOCK_ORIGIN is set)
   DRIVE9_SLOCK_CLIENT_ID Slock connected-app client id (required when DRIVE9_SLOCK_ORIGIN is set)
   DRIVE9_SLOCK_CLIENT_SECRET Slock connected-app client secret (required when DRIVE9_SLOCK_ORIGIN is set)
+
+  SSE cross-pod notification (set DRIVE9_POD_ID to enable; required for large multi-tenant deployments):
+  DRIVE9_POD_ID     unique pod identifier; when set, this pod registers in the central
+                    pod_registry and reports its SSE subscriber tenant set so peers can
+                    route push notifications. The outbox poller runs on all multi-tenant
+                    pods regardless; cross-pod HTTP push requires DRIVE9_POD_NOTIFY_SECRET.
+  DRIVE9_POD_ADDR   full base URL (e.g. http://10.0.0.5:9009) reachable by other pods for
+                    peer push notifications. Defaults to http://<listen-addr> when the
+                    listen address is a non-wildcard host; must be set explicitly in
+                    multi-host deployments.
+  DRIVE9_POD_NOTIFY_SECRET  shared bearer token for /v1/internal/sse-notify pod-to-pod
+                    push authentication. When set, enables the <10ms cross-pod HTTP push
+                    path; when unset, only the 200ms fallback poller is used.
+  DRIVE9_SSE_NOTIFY_POLL_INTERVAL  fallback outbox poll interval (default: 200ms)
+  DRIVE9_SSE_NOTIFY_RETENTION      how long outbox rows are kept before leader pruning
+                    (default: 1h)
 
   S3 storage (set DRIVE9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
@@ -581,7 +642,7 @@ environment:
 schema tooling:
   dump-init-sql writes the exact init schema SQL to stdout so external systems
   such as tidb_cloud_starter can stay in sync with drive9's schema source of truth.
-`, server.DefaultMaxUploadBytes, meta.DefaultMaxStorageBytes())
+`, server.DefaultMaxUploadBytes, meta.DefaultMaxStorageBytes(), server.DefaultTenantPoolMaxSize)
 	os.Exit(exitCode)
 }
 
@@ -935,6 +996,18 @@ func envInt64Strict(key string, fallback int64) (int64, error) {
 	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("%s must be an integer, got %q", key, raw)
+	}
+	return v, nil
+}
+
+func tenantPoolMaxSizeFromEnv() (int, error) {
+	raw := strings.TrimSpace(os.Getenv("DRIVE9_TENANT_POOL_MAX_SIZE"))
+	if raw == "" {
+		return server.DefaultTenantPoolMaxSize, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return 0, fmt.Errorf("invalid DRIVE9_TENANT_POOL_MAX_SIZE=%q: must be a positive integer", raw)
 	}
 	return v, nil
 }
