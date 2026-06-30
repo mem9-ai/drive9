@@ -269,9 +269,8 @@ func (s *ShadowStore) ensureShadowFile(remotePath string, baseRev int64) (*Shado
 	defer s.mu.Unlock()
 
 	if sf, ok := s.files[remotePath]; ok {
-		if baseRev != 0 {
-			sf.baseRev = baseRev
-		}
+		// Do not update baseRev here — callers update it in their
+		// success path after the write and quota check pass.
 		return sf, nil
 	}
 
