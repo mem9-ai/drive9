@@ -180,14 +180,13 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 		unreachable int
 		firstErr    error
 	}
-	results := map[string]*roleAgg{}
+	results := map[dbMetricKey]*roleAgg{}
 	for _, pool := range dbByPool {
 		key := pool.metricKey()
-		keyString := key.string()
-		if results[keyString] == nil {
-			results[keyString] = &roleAgg{}
+		if results[key] == nil {
+			results[key] = &roleAgg{}
 		}
-		results[keyString].total++
+		results[key].total++
 	}
 
 	// Ping pools concurrently with a fixed bound so one slow/unreachable pool
@@ -197,11 +196,11 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 	sem := make(chan struct{}, probeConcurrency)
 	var wg sync.WaitGroup
 	var aggMu sync.Mutex
-	poolsByKeyString := map[string]registeredDB{}
+	poolsByKey := map[dbMetricKey]registeredDB{}
 	for db, pool := range dbByPool {
 		db, pool := db, pool
-		keyString := pool.metricKey().string()
-		poolsByKeyString[keyString] = pool
+		key := pool.metricKey()
+		poolsByKey[key] = pool
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
@@ -214,27 +213,28 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 			// pool — at most probeConcurrency in flight cluster-wide. Any opened
 			// conn is later reaped by ConnMaxIdleTime.
 			//
-			// Caveat: on a pool with MaxOpenConns fully checked out, PingContext
-			// blocks for a free slot and may hit `timeout`, recording the pool as
-			// unreachable when it is merely saturated. The pool-saturation alert
-			// covers that condition directly.
-			pingCtx, cancel := context.WithTimeout(ctx, timeout)
 			start := time.Now()
+			result := "ok"
+			if isTenantPoolSaturated(db, key) {
+				result = "pool_saturated"
+				observeDBProbeDuration(start, key, result)
+				return
+			}
+
+			pingCtx, cancel := context.WithTimeout(ctx, timeout)
 			err := db.PingContext(pingCtx)
 			cancel()
-
-			result := "ok"
 			if err != nil {
 				result = "error"
 				aggMu.Lock()
-				agg := results[keyString]
+				agg := results[key]
 				agg.unreachable++
 				if agg.firstErr == nil {
 					agg.firstErr = err
 				}
 				aggMu.Unlock()
 			}
-			dbProbeDuration.Observe(time.Since(start).Seconds(), Attr("role", cleanMetricValue(pool.role, "unknown")), Attr("result", result))
+			observeDBProbeDuration(start, key, result)
 		}()
 	}
 	wg.Wait()
@@ -250,9 +250,8 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 	m.mu.Lock()
 	prevProbe := m.probe
 	nextProbe := make(map[dbMetricKey]dbProbeState, len(results))
-	for keyString, agg := range results {
-		pool := poolsByKeyString[keyString]
-		key := pool.metricKey()
+	for key, agg := range results {
+		pool := poolsByKey[key]
 		up := agg.unreachable == 0
 		prev, existed := prevProbe[key]
 		nextProbe[key] = dbProbeState{
@@ -387,8 +386,23 @@ func (p registeredDB) info() DBPoolInfo {
 	return info
 }
 
-func (k dbMetricKey) string() string {
-	return k.role + "\x00" + k.tenantID
+func isTenantPoolSaturated(db *sql.DB, key dbMetricKey) bool {
+	if key.tenantID == "" || key.tenantID == "unknown" {
+		return false
+	}
+	stats := db.Stats()
+	return stats.MaxOpenConnections > 0 && stats.Idle == 0 && stats.InUse >= stats.MaxOpenConnections
+}
+
+func observeDBProbeDuration(start time.Time, key dbMetricKey, result string) {
+	attrs := []Attribute{
+		Attr("role", key.role),
+		Attr("result", result),
+	}
+	if key.tenantID != "" && key.tenantID != "unknown" {
+		attrs = append(attrs, Attr("tenant_id", key.tenantID))
+	}
+	dbProbeDuration.Observe(time.Since(start).Seconds(), attrs...)
 }
 
 func dbLabels(key dbMetricKey) string {

@@ -519,12 +519,12 @@ environment:
   DRIVE9_PUBLIC_URL  externally reachable base URL for presigned URLs (required for remote clients)
   DRIVE9_META_DSN    control-plane MySQL DSN (required)
   DRIVE9_POOL_MAX_TENANTS max cached tenant user DB pools per pod (default: 1024)
-  DRIVE9_META_DB_MAX_OPEN_CONNS max open connections for the per-pod meta DB pool
-  DRIVE9_META_DB_MAX_IDLE_CONNS max idle connections for the per-pod meta DB pool
+  DRIVE9_META_DB_MAX_OPEN_CONNS max open connections for the per-pod meta DB pool (default: 100)
+  DRIVE9_META_DB_MAX_IDLE_CONNS max idle connections for the per-pod meta DB pool (default: 20)
   DRIVE9_USER_DB_MAX_OPEN_CONNS max open connections for each cached tenant user DB pool (default: 4)
   DRIVE9_USER_DB_MAX_IDLE_CONNS max idle connections for each cached tenant user DB pool (default: 1)
-  DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS max open connections for tenant schema-init DB pools
-  DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS max idle connections for tenant schema-init DB pools
+  DRIVE9_USER_SCHEMA_DB_MAX_OPEN_CONNS max open connections for tenant schema-init DB pools (default: 8)
+  DRIVE9_USER_SCHEMA_DB_MAX_IDLE_CONNS max idle connections for tenant schema-init DB pools (default: 0)
   DRIVE9_ENCRYPT_TYPE local_aes|kms|aliyun_kms|tencent_kms
   DRIVE9_MASTER_KEY  32-byte hex key for local_aes encryptor
   DRIVE9_ENCRYPT_KEY KMS key id or alias (required for kms/aliyun_kms/tencent_kms)
