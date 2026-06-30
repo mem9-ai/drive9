@@ -51,11 +51,17 @@ type podNotifier struct {
 	// Lifecycle: Start spawns the refresh goroutine; Stop cancels it and waits
 	// for all in-flight dispatch goroutines to exit so shutdown doesn't race
 	// with HTTP requests accessing pn.client/pn.secret.
-	refreshCtx    context.Context
-	refreshCancel context.CancelFunc
-	wg            sync.WaitGroup      // tracks refreshLoop + all dispatchPush goroutines
-	dispatchCtx   context.Context     // context for dispatch goroutines
+	refreshCtx     context.Context
+	refreshCancel  context.CancelFunc
+	wg             sync.WaitGroup      // tracks refreshLoop + all dispatchPush goroutines
+	dispatchCtx    context.Context     // context for dispatch goroutines
 	dispatchCancel context.CancelFunc // cancels all in-flight dispatches
+
+	// pushSem bounds the number of concurrent in-flight push goroutines,
+	// preventing goroutine explosion under burst writes with many peer
+	// subscribers. If the semaphore is exhausted, excess pushes are dropped
+	// (fire-and-forget) — the 200ms notifyPoller is the durable fallback.
+	pushSem chan struct{}
 
 	// routeRefreshInterval is how often the route table is refreshed from
 	// the central pod_subscriptions table. Stale routes are harmless: an
@@ -76,6 +82,10 @@ const (
 	// defaultPushTimeout bounds each fire-and-forget HTTP POST so a dead peer
 	// doesn't leak goroutines.
 	defaultPushTimeout = 2 * time.Second
+	// maxConcurrentPushes bounds the number of in-flight push goroutines.
+	// When exhausted, excess pushes are silently dropped (fire-and-forget);
+	// the notifyPoller fallback ensures no events are lost.
+	maxConcurrentPushes = 64
 )
 
 // newPodNotifier creates a podNotifier. selfID is this pod's identifier;
@@ -86,6 +96,7 @@ func newPodNotifier(metaStore *meta.Store, selfID string, secret []byte) *podNot
 		client:               &http.Client{}, // no client-level timeout; per-request context timeout used instead
 		selfID:               selfID,
 		secret:               secret,
+		pushSem:              make(chan struct{}, maxConcurrentPushes),
 		routeRefreshInterval: defaultRouteRefreshInterval,
 		pushTimeout:          defaultPushTimeout,
 	}
@@ -225,13 +236,22 @@ func (pn *podNotifier) Notify(tenantID string, seq uint64) {
 
 // dispatchPush sends a single fire-and-forget POST to a peer. It runs in its
 // own goroutine (tracked by wg) so the caller is never blocked by a slow/dead
-// peer. The request uses a per-request context with pushTimeout so a dead peer
-// doesn't leak the goroutine. Errors are logged at debug level (the notifyPoller
-// is the durable fallback).
+// peer. Concurrency is bounded by pushSem (maxConcurrentPushes); if the
+// semaphore is exhausted, the push is silently dropped — the notifyPoller is
+// the durable fallback. The request uses a per-request context with pushTimeout
+// so a dead peer doesn't leak the goroutine.
 func (pn *podNotifier) dispatchPush(addr string, payload []byte) {
+	// Non-blocking semaphore acquire: if at capacity, drop this push.
+	// The 200ms notifyPoller fallback ensures the event is still delivered.
+	select {
+	case pn.pushSem <- struct{}{}:
+	default:
+		return
+	}
 	pn.wg.Add(1)
 	go func() {
 		defer pn.wg.Done()
+		defer func() { <-pn.pushSem }()
 		ctx, cancel := context.WithTimeout(pn.dispatchCtx, pn.pushTimeout)
 		defer cancel()
 		url := addr + sseNotifyInternalRoute

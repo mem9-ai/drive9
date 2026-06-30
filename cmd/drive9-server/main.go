@@ -368,13 +368,14 @@ func main() {
 	podID := strings.TrimSpace(os.Getenv("DRIVE9_POD_ID"))
 	podAddr := strings.TrimSpace(os.Getenv("DRIVE9_POD_ADDR"))
 	// Default podAddr to the listen addr only if it's a real, non-wildcard
-	// address. Wildcard binds like ":9009", "0.0.0.0:9009", or "[::]:9009" are
-	// not dialable by peers, so we leave podAddr empty in that case — the
+	// address. The notifier requires a full base URL (http://host:port) for
+	// http.NewRequest. Wildcard binds like ":9009", "0.0.0.0:9009", or "[::]:9009"
+	// are not dialable by peers, so we leave podAddr empty in that case — the
 	// podRegistry still reports subscriptions and the leader sweeps stale pods,
 	// but cross-pod HTTP push is disabled until an explicit address is set.
 	if podAddr == "" && podID != "" {
 		if host, port, err := net.SplitHostPort(addr); err == nil && host != "" && host != "0.0.0.0" && host != "::" {
-			podAddr = net.JoinHostPort(host, port)
+			podAddr = "http://" + net.JoinHostPort(host, port)
 		}
 	}
 	var podNotifySecret []byte
@@ -556,11 +557,12 @@ environment:
   SSE cross-pod notification (set DRIVE9_POD_ID to enable; required for large multi-tenant deployments):
   DRIVE9_POD_ID     unique pod identifier; when set, this pod registers in the central
                     pod_registry and reports its SSE subscriber tenant set so peers can
-                    route push notifications. Enables the new SSE scheme that avoids
-                    polling every tenant's TiDB (idle tenant TiDBs can scale to zero).
-  DRIVE9_POD_ADDR   internally reachable address (host:port) for peer push notifications
-                    (default: DRIVE9_LISTEN_ADDR; in multi-host deployments set to the
-                    address reachable by other pods)
+                    route push notifications. The outbox poller runs on all multi-tenant
+                    pods regardless; cross-pod HTTP push requires DRIVE9_POD_NOTIFY_SECRET.
+  DRIVE9_POD_ADDR   full base URL (e.g. http://10.0.0.5:9009) reachable by other pods for
+                    peer push notifications. Defaults to http://<listen-addr> when the
+                    listen address is a non-wildcard host; must be set explicitly in
+                    multi-host deployments.
   DRIVE9_POD_NOTIFY_SECRET  shared bearer token for /v1/internal/sse-notify pod-to-pod
                     push authentication. When set, enables the <10ms cross-pod HTTP push
                     path; when unset, only the 200ms fallback poller is used.
