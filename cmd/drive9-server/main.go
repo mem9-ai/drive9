@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -366,11 +367,15 @@ func main() {
 	sseNotifyRetention := envDuration("DRIVE9_SSE_NOTIFY_RETENTION", time.Hour)
 	podID := strings.TrimSpace(os.Getenv("DRIVE9_POD_ID"))
 	podAddr := strings.TrimSpace(os.Getenv("DRIVE9_POD_ADDR"))
-	// Default podAddr to the listen addr if not explicitly set, so single-host
-	// deployments work without extra configuration. Multi-host deployments must
-	// set DRIVE9_POD_ADDR to the internally reachable address.
+	// Default podAddr to the listen addr only if it's a real, non-wildcard
+	// address. Wildcard binds like ":9009", "0.0.0.0:9009", or "[::]:9009" are
+	// not dialable by peers, so we leave podAddr empty in that case — the
+	// podRegistry still reports subscriptions and the leader sweeps stale pods,
+	// but cross-pod HTTP push is disabled until an explicit address is set.
 	if podAddr == "" && podID != "" {
-		podAddr = addr
+		if host, port, err := net.SplitHostPort(addr); err == nil && host != "" && host != "0.0.0.0" && host != "::" {
+			podAddr = net.JoinHostPort(host, port)
+		}
 	}
 	var podNotifySecret []byte
 	if raw := strings.TrimSpace(os.Getenv("DRIVE9_POD_NOTIFY_SECRET")); raw != "" {

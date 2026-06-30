@@ -19,10 +19,14 @@ func newTestMetaStoreForNotify(t *testing.T) *meta.Store {
 	}
 	t.Cleanup(func() { _ = metaStore.Close() })
 	testmysql.ResetMetaDB(t, metaStore.DB())
-	// Also clear SSE notify tables (ResetMetaDB may not know about new tables).
-	_, _ = metaStore.DB().Exec("DELETE FROM sse_notify_outbox")
-	_, _ = metaStore.DB().Exec("DELETE FROM pod_subscriptions")
-	_, _ = metaStore.DB().Exec("DELETE FROM pod_registry")
+	// Clean up SSE notify tables (ResetMetaDB may not know about new tables).
+	// Fail on error so stale rows don't leak between tests.
+	ctx := context.Background()
+	for _, table := range []string{"sse_notify_outbox", "pod_subscriptions", "pod_registry"} {
+		if _, err := metaStore.DB().ExecContext(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clean up %s: %v", table, err)
+		}
+	}
 	return metaStore
 }
 
@@ -39,6 +43,9 @@ func TestNotifyPollerDiscoversCrossPodEvents(t *testing.T) {
 	defer bus.Unsubscribe(id)
 
 	np := newNotifyPoller(metaStore, buses, 50*time.Millisecond)
+	// Initialize cursor to 0 so we don't skip the row we're about to insert
+	// (run() would set it to MaxSSENotifyID which races with the insert).
+	np.lastID = 0
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go np.run(ctx)
@@ -74,6 +81,7 @@ func TestNotifyPollerSkipsTenantsWithoutSubscribers(t *testing.T) {
 	defer bus1.Unsubscribe(id1)
 
 	np := newNotifyPoller(metaStore, buses, 50*time.Millisecond)
+	np.lastID = 0 // start from beginning to avoid cursor race with insert
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go np.run(ctx)
@@ -150,16 +158,15 @@ func TestNotifyPollerBatchDrain(t *testing.T) {
 		t.Fatalf("poller cursor %d did not drain to max %d", np.lastID, maxID)
 	}
 
-	// The subscriber should have been woken (at least once). Drain the notify
-	// channel to confirm it received a signal.
+	// The subscriber should have been woken at least once by the synchronous
+	// pollOnce call (which calls Publish for each row; the coalescing channel
+	// buffer size 1 means the first signal is retained).
 	select {
 	case _, open := <-notify:
 		if !open {
 			t.Fatal("notify channel closed")
 		}
 	case <-time.After(2 * time.Second):
-		// It's possible the notify signal was already consumed or dropped due
-		// to the coalescing buffer (size 1). That's acceptable — the key
-		// assertion is that all rows were drained (checked above).
+		t.Fatal("timed out waiting for notify signal after batch drain")
 	}
 }

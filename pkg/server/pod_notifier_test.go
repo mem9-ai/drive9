@@ -56,9 +56,9 @@ func TestPodNotifierPushWakesSubscriber(t *testing.T) {
 	notifier.Start(context.Background())
 	defer notifier.Stop()
 
-	// Wait for the route table to refresh (the notifier refreshes on Start).
-	// Give it a moment to read pod_registry + pod_subscriptions.
-	time.Sleep(6 * time.Second)
+	// Refresh the route table synchronously instead of waiting for the 5s
+	// ticker. This is deterministic and avoids the 6s sleep.
+	notifier.refresh(context.Background())
 
 	// Notify should push to the receiver, which wakes the subscriber.
 	notifier.Notify("push-tenant", 42)
@@ -94,8 +94,8 @@ func TestPodNotifierFireAndForget(t *testing.T) {
 	notifier.Start(context.Background())
 	defer notifier.Stop()
 
-	// Wait for route refresh.
-	time.Sleep(6 * time.Second)
+	// Refresh the route table synchronously.
+	notifier.refresh(context.Background())
 
 	// Notify must return immediately (fire-and-forget), even though the peer
 	// is unreachable. The goroutine handling the failed POST will time out in

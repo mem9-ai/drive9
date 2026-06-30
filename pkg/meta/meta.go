@@ -3331,11 +3331,19 @@ func (s *Store) MarkStalePods(ctx context.Context, before time.Time) (n int64, e
 
 // DeletePod removes a pod and its subscriptions from the registry. Used when a
 // pod is decommissioned. Best-effort: stale pod cleanup handles the common case.
+// DeletePod removes a pod and its subscriptions from the registry. Both
+// deletions run in a single transaction so a partial failure doesn't leave
+// orphaned subscription rows. Used when a pod is decommissioned.
 func (s *Store) DeletePod(ctx context.Context, podID string) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "delete_pod", start, &err)
-	_, err = s.db.ExecContext(ctx, `DELETE FROM pod_registry WHERE pod_id = ?`, podID)
-	return err
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM pod_subscriptions WHERE pod_id = ?`, podID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM pod_registry WHERE pod_id = ?`, podID)
+		return err
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -3477,4 +3485,22 @@ func (s *Store) ListStalePods(ctx context.Context) (out []string, err error) {
 		out = append(out, podID)
 	}
 	return out, rows.Err()
+}
+
+// DeleteSubscriptionsForStalePods deletes pod_subscriptions rows whose pod is
+// currently stale, using a subquery join so the stale check and the delete are
+// atomic. This avoids a TOCTOU race where a pod recovers to active between
+// ListStalePods and DeletePodSubscriptions, which would delete subscriptions for
+// a live pod. Returns the number of deleted rows.
+func (s *Store) DeleteSubscriptionsForStalePods(ctx context.Context) (n int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_subscriptions_for_stale_pods", start, &err)
+	res, err := s.db.ExecContext(ctx,
+		`DELETE ps FROM pod_subscriptions ps
+		 INNER JOIN pod_registry pr ON ps.pod_id = pr.pod_id
+		 WHERE pr.status = 'stale'`)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }

@@ -48,10 +48,14 @@ type podNotifier struct {
 	// routeCache is the current podRouteTable. Refreshed by refreshLoop.
 	routeCache atomic.Pointer[podRouteTable]
 
-	// Lifecycle: Start spawns the refresh goroutine; Stop cancels it.
+	// Lifecycle: Start spawns the refresh goroutine; Stop cancels it and waits
+	// for all in-flight dispatch goroutines to exit so shutdown doesn't race
+	// with HTTP requests accessing pn.client/pn.secret.
 	refreshCtx    context.Context
 	refreshCancel context.CancelFunc
-	wg            sync.WaitGroup
+	wg            sync.WaitGroup      // tracks refreshLoop + all dispatchPush goroutines
+	dispatchCtx   context.Context     // context for dispatch goroutines
+	dispatchCancel context.CancelFunc // cancels all in-flight dispatches
 
 	// routeRefreshInterval is how often the route table is refreshed from
 	// the central pod_subscriptions table. Stale routes are harmless: an
@@ -59,9 +63,7 @@ type podNotifier struct {
 	// returns nil); a missed push is caught by the 200ms notifyPoller.
 	routeRefreshInterval time.Duration
 
-	// pushTimeout is the per-HTTP-request timeout. Fire-and-forget: we don't
-	// retry on failure, but we don't want to block goroutines indefinitely on
-	// a dead peer.
+	// pushTimeout is the per-HTTP-request timeout, enforced via context.
 	pushTimeout time.Duration
 }
 
@@ -81,7 +83,7 @@ const (
 func newPodNotifier(metaStore *meta.Store, selfID string, secret []byte) *podNotifier {
 	return &podNotifier{
 		metaStore:            metaStore,
-		client:               &http.Client{Timeout: defaultPushTimeout},
+		client:               &http.Client{}, // no client-level timeout; per-request context timeout used instead
 		selfID:               selfID,
 		secret:               secret,
 		routeRefreshInterval: defaultRouteRefreshInterval,
@@ -89,9 +91,12 @@ func newPodNotifier(metaStore *meta.Store, selfID string, secret []byte) *podNot
 	}
 }
 
-// Start launches the route table refresh goroutine.
+// Start launches the route table refresh goroutine and initializes the
+// dispatch context. All goroutines (refresh + dispatch) are tracked by wg so
+// Stop can wait for them.
 func (pn *podNotifier) Start(ctx context.Context) {
 	pn.refreshCtx, pn.refreshCancel = context.WithCancel(ctx)
+	pn.dispatchCtx, pn.dispatchCancel = context.WithCancel(ctx)
 	pn.wg.Add(1)
 	go func() {
 		defer pn.wg.Done()
@@ -99,10 +104,15 @@ func (pn *podNotifier) Start(ctx context.Context) {
 	}()
 }
 
-// Stop cancels the refresh goroutine and waits for it to exit.
+// Stop cancels the refresh goroutine and all in-flight dispatch goroutines,
+// then waits for them to exit. This ensures no goroutine is accessing
+// pn.client/pn.secret after Stop returns.
 func (pn *podNotifier) Stop() {
 	if pn.refreshCancel != nil {
 		pn.refreshCancel()
+	}
+	if pn.dispatchCancel != nil {
+		pn.dispatchCancel()
 	}
 	pn.wg.Wait()
 }
@@ -214,12 +224,18 @@ func (pn *podNotifier) Notify(tenantID string, seq uint64) {
 }
 
 // dispatchPush sends a single fire-and-forget POST to a peer. It runs in its
-// own goroutine so the caller is never blocked by a slow/dead peer. Errors
-// are logged at debug level (the notifyPoller is the durable fallback).
+// own goroutine (tracked by wg) so the caller is never blocked by a slow/dead
+// peer. The request uses a per-request context with pushTimeout so a dead peer
+// doesn't leak the goroutine. Errors are logged at debug level (the notifyPoller
+// is the durable fallback).
 func (pn *podNotifier) dispatchPush(addr string, payload []byte) {
+	pn.wg.Add(1)
 	go func() {
+		defer pn.wg.Done()
+		ctx, cancel := context.WithTimeout(pn.dispatchCtx, pn.pushTimeout)
+		defer cancel()
 		url := addr + sseNotifyInternalRoute
-		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 		if err != nil {
 			return
 		}

@@ -49,11 +49,14 @@ func newSSEOutboxTestCluster(t *testing.T) *sseOutboxTestCluster {
 	}
 	t.Cleanup(func() { _ = metaStore.Close() })
 	testmysql.ResetMetaDB(t, metaStore.DB())
-	_, _ = metaStore.DB().Exec("DELETE FROM sse_notify_outbox")
-	_, _ = metaStore.DB().Exec("DELETE FROM pod_subscriptions")
-	_, _ = metaStore.DB().Exec("DELETE FROM pod_registry")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	// Clean up SSE notify tables (ResetMetaDB may not know about new tables).
+	// Fail on error so stale rows don't leak between tests.
+	ctx := context.Background()
+	for _, table := range []string{"sse_notify_outbox", "pod_subscriptions", "pod_registry", "tenant_api_keys", "tenants"} {
+		if _, err := metaStore.DB().ExecContext(ctx, "DELETE FROM "+table); err != nil {
+			t.Fatalf("clean up %s: %v", table, err)
+		}
+	}
 
 	parsed, err := mysql.ParseDSN(testDSN)
 	if err != nil {
@@ -305,9 +308,9 @@ func TestSSEOutboxCrossPodPushDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait for Pod A's podNotifier to refresh its route table (5s interval,
-	// plus an initial refresh on Start).
-	time.Sleep(6 * time.Second)
+	// Refresh Pod A's podNotifier route table synchronously instead of
+	// waiting for the 5s ticker. This is deterministic and avoids the 6s sleep.
+	tc.podA.podNotifier.refresh(context.Background())
 
 	// Pod A notifies its peers — should push to Pod B.
 	tc.podA.podNotifier.Notify(tc.tenantID, 1)

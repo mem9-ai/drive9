@@ -197,10 +197,9 @@ type Server struct {
 	// The podRegistry maintains this pod's presence and subscriber set in the
 	// central DB. All three run on every pod (not leader-gated); the leader
 	// additionally sweeps stale pods and prunes the outbox.
-	podNotifier    *podNotifier
-	podRegistry    *podRegistry
+	podNotifier     *podNotifier
+	podRegistry     *podRegistry
 	podNotifySecret []byte
-	notifyCtx       context.Context
 	notifyCancel    context.CancelFunc
 	notifyWG        sync.WaitGroup
 	// sseNotifyRetention is how long outbox rows are kept before leader pruning.
@@ -495,8 +494,10 @@ func NewWithConfig(cfg Config) *Server {
 // Only called in multi-tenant mode (Meta != nil). In single-tenant mode the
 // fallback EventBus handles delivery without any cross-pod mechanism.
 func (s *Server) startNotifyInfrastructure(cfg Config) {
+	// Create a single context for all notify components. We store only the
+	// cancel func (not the context itself) on Server, per coding guidelines:
+	// "Pass context through call chains; do not store context in structs."
 	notifyCtx, notifyCancel := context.WithCancel(backgroundWithTrace(context.Background()))
-	s.notifyCtx = notifyCtx
 	s.notifyCancel = notifyCancel
 
 	// Fallback poller: reads the central outbox on every pod.
@@ -516,8 +517,10 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 		s.podRegistry = reg
 		// Synchronous initial registration so this pod is visible in
 		// ListActivePods immediately (not after the first heartbeat tick).
-		reg.RegisterBeforeStart(context.Background())
-		go reg.Start(notifyCtx)
+		_ = reg.RegisterBeforeStart(context.Background())
+		// Start the registry's goroutines. They are tracked by the registry's
+		// own WaitGroup and stopped via reg.Stop() in stopNotifyInfrastructure.
+		reg.Start(notifyCtx)
 	}
 
 	// Pod-to-pod push notifier: only when a shared secret is configured.
@@ -528,13 +531,19 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 	}
 }
 
-// stopNotifyInfrastructure cancels the notify context and waits for all notify
-// goroutines (poller, registry, notifier) to exit. Called from Close.
+// stopNotifyInfrastructure stops the notify poller, pod registry, and pod
+// notifier. Called from Close AFTER stopLeaderWorkers so the leader-gated
+// stale-pod sweep (which dereferences s.podRegistry) can't race with clearing
+// podRegistry. The poller is stopped via notifyCancel; the registry and notifier
+// have their own Stop methods that wait for all goroutines to exit.
 func (s *Server) stopNotifyInfrastructure() {
 	if s.notifyCancel != nil {
 		s.notifyCancel()
 	}
 	s.notifyWG.Wait()
+	if s.podRegistry != nil {
+		s.podRegistry.Stop()
+	}
 	if s.podNotifier != nil {
 		s.podNotifier.Stop()
 	}
@@ -553,8 +562,6 @@ func (s *Server) Close() {
 	}
 	s.forkWorkerMu.Unlock()
 	s.forkWorkerWG.Wait()
-	// Stop SSE cross-pod notification infrastructure (runs on every pod).
-	s.stopNotifyInfrastructure()
 	// Stop the leader manager first so any in-flight onLead/onLose callbacks
 	// finish before we tear down local workers. leader.Stop() waits for the
 	// heartbeat goroutine to exit, so no further callback can fire after it
@@ -576,6 +583,10 @@ func (s *Server) Close() {
 	// modes (they are started by startLeaderWorkers), so no separate Stop calls
 	// are needed here.
 	s.stopLeaderWorkers()
+	// Stop SSE cross-pod notification infrastructure AFTER leader-gated workers
+	// are stopped, so the stale-pod sweep (which dereferences s.podRegistry)
+	// cannot race with clearing podRegistry during shutdown.
+	s.stopNotifyInfrastructure()
 }
 
 // startLeaderWorkers launches the background schedulers that should run only

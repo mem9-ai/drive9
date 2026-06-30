@@ -238,14 +238,19 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 	// without polling the tenant's own TiDB. Best-effort: if this fails, the
 	// pod-to-pod push (step 4) may still deliver, and SSE client reconnect replay
 	// is the ultimate fallback. Only write if we got a valid seq from step 1.
+	// Use a non-cancelable context so a client disconnect after the fs_events
+	// write doesn't abort the outbox pointer (which would leave the poller
+	// fallback missing the event for cross-pod subscribers).
 	if seq > 0 && s.meta != nil {
-		if err := s.meta.InsertSSENotify(ctx, bus.tenantID, uint64(seq)); err != nil {
+		outboxCtx, outboxCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		if err := s.meta.InsertSSENotify(outboxCtx, bus.tenantID, uint64(seq)); err != nil {
 			logger.Warn(ctx, "sse_publish_outbox_insert_failed",
 				zap.String("tenant_id", bus.tenantID),
 				zap.Int64("seq", seq),
 				zap.Error(err))
 			metrics.RecordTenantOperation(bus.tenantID, "event_bus", "outbox_publish", metrics.ResultForError(err), 0)
 		}
+		outboxCancel()
 	}
 
 	// Step 3: Wake same-pod SSE subscribers instantly (in-memory, sub-ms).
