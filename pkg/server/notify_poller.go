@@ -61,23 +61,32 @@ func newNotifyPoller(metaStore *meta.Store, buses *eventBuses, interval time.Dur
 	}
 }
 
-// run starts the poller goroutine. It blocks until ctx is cancelled.
-func (np *notifyPoller) run(ctx context.Context) {
-	// Initialize cursor to current max id so we skip historical outbox rows.
-	// Events written before this pod started are delivered to clients via
-	// Phase-1 EventsSince replay on SSE reconnect, not via the poller.
+// initCursor synchronously initializes the poller's lastID to the current max
+// outbox id. This MUST be called before run() starts and before the server
+// accepts live traffic, so that a write between poller construction and the
+// first poll tick is not skipped. If the init query fails, lastID stays 0
+// (reads some historical rows but Publish is a no-op for tenants without
+// subscribers — not harmful).
+func (np *notifyPoller) initCursor(ctx context.Context) {
 	maxID, err := np.metaStore.MaxSSENotifyID(ctx)
 	if err != nil {
 		logger.Warn(ctx, "notify_poller_init_cursor_failed",
 			zap.Error(err))
-		// Start from 0 — worst case we read some historical rows and find no
-		// matching buses (Publish is a no-op). Not harmful.
 		maxID = 0
 	}
 	np.lastID = maxID
+	logger.Info(ctx, "notify_poller_cursor_initialized",
+		zap.Uint64("cursor", np.lastID))
+}
+
+// run starts the poller goroutine. It blocks until ctx is cancelled.
+// The cursor (lastID) must already be initialized by initCursor before run
+// is called, so that no outbox rows are skipped between construction and
+// the first poll tick.
+func (np *notifyPoller) run(ctx context.Context) {
 	logger.Info(ctx, "notify_poller_started",
 		zap.Duration("interval", np.interval),
-		zap.Uint64("initial_cursor", np.lastID))
+		zap.Uint64("cursor", np.lastID))
 
 	ticker := time.NewTicker(np.interval)
 	defer ticker.Stop()

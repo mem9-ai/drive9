@@ -43,15 +43,16 @@ func TestNotifyPollerDiscoversCrossPodEvents(t *testing.T) {
 	defer bus.Unsubscribe(id)
 
 	np := newNotifyPoller(metaStore, buses, 50*time.Millisecond)
-	// Initialize cursor to 0 so we don't skip the row we're about to insert
-	// (run() would set it to MaxSSENotifyID which races with the insert).
-	np.lastID = 0
+	// Initialize cursor synchronously (as startNotifyInfrastructure does).
+	// At this point the outbox is empty, so lastID = 0.
+	np.initCursor(context.Background())
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go np.run(ctx)
 
-	// Simulate a cross-pod write: insert an outbox row (as a peer pod would).
-	// The poller should discover it within ~100ms and Publish to wake notify.
+	// Simulate a cross-pod write: insert an outbox row AFTER the poller is
+	// ready. The poller should discover it within ~100ms and Publish to wake
+	// notify. This proves no race between cursor init and the insert.
 	if err := metaStore.InsertSSENotify(context.Background(), "T", 1); err != nil {
 		t.Fatal(err)
 	}
@@ -81,12 +82,13 @@ func TestNotifyPollerSkipsTenantsWithoutSubscribers(t *testing.T) {
 	defer bus1.Unsubscribe(id1)
 
 	np := newNotifyPoller(metaStore, buses, 50*time.Millisecond)
-	np.lastID = 0 // start from beginning to avoid cursor race with insert
+	np.initCursor(context.Background())
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	go np.run(ctx)
 
-	// Insert outbox rows for T1 (has subscriber) and T2 (no subscriber).
+	// Insert outbox rows for T1 (has subscriber) and T2 (no subscriber)
+	// AFTER the poller cursor is initialized.
 	if err := metaStore.InsertSSENotify(context.Background(), "T1", 1); err != nil {
 		t.Fatal(err)
 	}
@@ -144,8 +146,12 @@ func TestNotifyPollerBatchDrain(t *testing.T) {
 	np := newNotifyPoller(metaStore, buses, 50*time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	// Initialize cursor synchronously — the outbox already has burstSize rows,
+	// so initCursor sets lastID to the max (skipping them all). Then we reset
+	// to 0 to drain from the beginning for the test.
+	np.initCursor(ctx)
+	np.lastID = 0 // override to drain all rows for the test
 	// Manually call pollOnce once to drain all batches synchronously.
-	np.lastID = 0 // start from the beginning
 	np.pollOnce(ctx)
 
 	// All rows should have been consumed. Verify by checking that the poller's
