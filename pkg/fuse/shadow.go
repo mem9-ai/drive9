@@ -1,6 +1,7 @@
 package fuse
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -95,7 +96,7 @@ func NewShadowStoreWithQuota(dir string, freeRatio float64, maxBytes int64) (*Sh
 	// nothing else ever deletes these files.
 	if entries, err := os.ReadDir(dir); err == nil {
 		for _, e := range entries {
-			if strings.Contains(e.Name(), ".shadow.retired.") {
+			if strings.Contains(e.Name(), ".shadow.retired.") || strings.HasSuffix(e.Name(), ".shadow.tmp") {
 				_ = os.Remove(filepath.Join(dir, e.Name()))
 			}
 		}
@@ -406,11 +407,50 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 	return nil
 }
 
+// quotaCopyBufSize is the chunk size for quota-aware streaming copies.
+const quotaCopyBufSize = 32 << 10 // 32KB
+
+// quotaCopy copies from r to dst, checking the byte quota after each chunk.
+// oldSize is the current shadow size used to compute the delta. Returns the
+// total bytes written and ENOSPC if the byte quota is breached mid-stream.
+func (s *ShadowStore) quotaCopy(dst io.Writer, r io.Reader, oldSize int64) (int64, error) {
+	buf := make([]byte, quotaCopyBufSize)
+	var written int64
+	for {
+		nr, readErr := r.Read(buf)
+		if nr > 0 {
+			// Check byte quota based on cumulative delta before writing.
+			delta := (written + int64(nr)) - oldSize
+			if delta > 0 {
+				if err := s.checkByteQuota(delta); err != nil {
+					return written, err
+				}
+			}
+			nw, writeErr := dst.Write(buf[:nr])
+			written += int64(nw)
+			if writeErr != nil {
+				return written, writeErr
+			}
+			if nw != nr {
+				return written, io.ErrShortWrite
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return written, nil
+			}
+			return written, readErr
+		}
+	}
+}
+
 // WriteStream replaces the shadow contents by streaming from r.
 // Returns ENOSPC if the streamed data would breach disk protection limits.
-// Because the final size is unknown before streaming, the data is streamed
-// to a temp file first; on quota breach the temp file is removed and the
-// original shadow is untouched.
+// The byte quota is checked incrementally during streaming so that peak disk
+// usage of the temp file is bounded by the quota. The free-ratio check runs
+// once after streaming completes (Statfs per chunk would be too expensive).
+// On quota breach the temp file is removed and the original shadow is
+// untouched.
 func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64) (int64, error) {
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
@@ -427,24 +467,30 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	if err != nil {
 		return 0, fmt.Errorf("shadow stream tmp create: %w", err)
 	}
-	n, err := io.Copy(tmpFd, r)
+
+	// Use a quota-aware copy: check byte quota every 32KB so the temp file
+	// never grows far beyond the quota limit.
+	n, err := s.quotaCopy(tmpFd, r, oldSize)
 	if err != nil {
-		tmpFd.Close()
-		os.Remove(tmpPath)
+		_ = tmpFd.Close()
+		_ = os.Remove(tmpPath)
+		if errors.Is(err, syscall.ENOSPC) {
+			return 0, err
+		}
 		return n, fmt.Errorf("shadow write stream: %w", err)
 	}
 	if err := tmpFd.Sync(); err != nil {
-		tmpFd.Close()
-		os.Remove(tmpPath)
+		_ = tmpFd.Close()
+		_ = os.Remove(tmpPath)
 		return n, fmt.Errorf("shadow stream sync: %w", err)
 	}
-	tmpFd.Close()
+	_ = tmpFd.Close()
 
-	// Post-stream quota check before committing.
+	// Post-stream free-ratio check (Statfs is too expensive to run per chunk).
 	delta := n - oldSize
 	if delta > 0 {
-		if err := s.checkQuotaForDelta(delta); err != nil {
-			os.Remove(tmpPath)
+		if err := s.checkFreeRatio(delta); err != nil {
+			_ = os.Remove(tmpPath)
 			return 0, err
 		}
 	}
@@ -452,7 +498,7 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	// Commit: swap temp file over the shadow file.
 	shadowFile := s.shadowPath(remotePath)
 	if err := os.Rename(tmpPath, shadowFile); err != nil {
-		os.Remove(tmpPath)
+		_ = os.Remove(tmpPath)
 		return 0, fmt.Errorf("shadow stream rename: %w", err)
 	}
 
@@ -468,7 +514,7 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	sf.size = n
 	sf.baseRev = baseRev
 	s.mu.Unlock()
-	oldFd.Close()
+	_ = oldFd.Close()
 	s.pendingBytes.Add(delta)
 	return n, nil
 }

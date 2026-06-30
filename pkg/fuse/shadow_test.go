@@ -1007,6 +1007,36 @@ func TestWriteStreamQuotaEnforcement(t *testing.T) {
 	}
 }
 
+func TestWriteStreamPeakDiskBounded(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Attempt to stream 200 bytes which exceeds the 100-byte quota.
+	// The incremental quota check should abort mid-stream so the temp
+	// file never reaches 200 bytes.
+	_, err = ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 200)), 1)
+	if err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC, got %v", err)
+	}
+
+	// Verify no temp file residue.
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if filepath.Ext(e.Name()) == ".tmp" {
+			t.Fatalf("temp file residue found: %s", e.Name())
+		}
+	}
+
+	// pendingBytes should be 0 (nothing was committed).
+	if p := ss.PendingBytes(); p != 0 {
+		t.Fatalf("expected pending 0, got %d", p)
+	}
+}
+
 func TestEnsureQuotaEnforcement(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
