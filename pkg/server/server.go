@@ -507,8 +507,11 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 		poller.run(notifyCtx)
 	}()
 
-	// Pod registry: heartbeat + subscription reporting.
-	if cfg.PodID != "" && cfg.PodAddr != "" {
+	// Pod registry: heartbeat + subscription reporting. Created when PodID is
+	// set; PodAddr may be empty initially (e.g. when the listen address is not
+	// known yet) — the heartbeat is a no-op in that case, but subscription
+	// reporting and the leader's stale-pod sweep still function.
+	if cfg.PodID != "" {
 		reg := newPodRegistry(s.meta, cfg.PodID, cfg.PodAddr, s.events)
 		s.podRegistry = reg
 		go reg.Start(notifyCtx)
