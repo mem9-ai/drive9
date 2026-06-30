@@ -322,3 +322,42 @@ func TestDBHealthProbeKeepsPreviousDownStateWhenMetaPoolSaturated(t *testing.T) 
 		t.Fatalf("expected saturated meta pool to preserve previous unreachable count, got:\n%s", out)
 	}
 }
+
+func TestDBHealthProbeMarksRoleDownWhenOneMetaPoolSaturatedAndAnotherUnreachable(t *testing.T) {
+	saturatedHealthy := &atomic.Bool{}
+	saturatedHealthy.Store(true)
+	saturatedDB := sql.OpenDB(fakeConnector{healthy: saturatedHealthy})
+	saturatedDB.SetMaxOpenConns(1)
+	saturatedDB.SetMaxIdleConns(0)
+
+	unreachableHealthy := &atomic.Bool{}
+	unreachableHealthy.Store(false)
+	unreachableDB := sql.OpenDB(fakeConnector{healthy: unreachableHealthy})
+	unreachableDB.SetMaxIdleConns(0)
+
+	t.Cleanup(func() {
+		UnregisterDB(saturatedDB)
+		UnregisterDB(unreachableDB)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = saturatedDB.Close()
+		_ = unreachableDB.Close()
+	})
+
+	conn, err := saturatedDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open held conn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	RegisterDB("meta", saturatedDB)
+	RegisterDB("meta", unreachableDB)
+	globalDB.probeOnce(context.Background(), 10*time.Millisecond, nil)
+
+	out := renderDB(t)
+	if !strings.Contains(out, `drive9_db_up{role="meta"} 0`) {
+		t.Fatalf("expected mixed saturated/unreachable meta pools to mark role down, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_unreachable_pools{role="meta"} 1`) {
+		t.Fatalf("expected only the unreachable meta pool to count as unreachable, got:\n%s", out)
+	}
+}
