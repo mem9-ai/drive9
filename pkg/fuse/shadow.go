@@ -77,6 +77,11 @@ type ShadowStore struct {
 	lastDiskCheck    atomic.Int64 // unix nano of last check
 	cachedFreeBytes  atomic.Int64 // cached Statfs free bytes (Bavail*Bsize)
 	cachedTotalBytes atomic.Int64 // cached Statfs total bytes (Blocks*Bsize)
+
+	// supersededFds holds old file descriptors replaced by WriteStream.
+	// They are kept open so concurrent readers that grabbed the fd before
+	// the swap don't hit EBADF. Drained on Close.
+	supersededFds []*os.File
 }
 
 // NewShadowStore creates a ShadowStore rooted at dir.
@@ -486,12 +491,9 @@ func (s *ShadowStore) checkFreeRatioThrottled(requiredBytes int64) error {
 // Statfs values). On quota breach the temp file is removed and the original
 // shadow is untouched.
 //
-// Concurrency note: WriteStream swaps sf.fd under s.mu and closes the old fd
-// after releasing the lock. Callers that read the same path concurrently
-// should use Pin/ReadAtGen (generation-pinned reads) rather than ReadAt to
-// avoid a use-after-close race on the fd. All current callers hold the file
-// handle lock during WriteStream, so concurrent unpinned ReadAt on the same
-// path does not occur in practice.
+// Concurrency note: WriteStream swaps sf.fd under s.mu. The old fd is kept
+// open in supersededFds (not closed) so concurrent readers that grabbed it
+// before the swap don't hit EBADF. Superseded fds are closed on Close().
 func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64) (int64, error) {
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
@@ -547,8 +549,13 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	sf.fd = newFd
 	sf.size = n
 	sf.baseRev = baseRev
+	// Keep oldFd open so concurrent readers that grabbed it before the swap
+	// don't hit EBADF. The fd is appended to supersededFds and closed when
+	// the ShadowStore is closed.
+	if oldFd != nil {
+		s.supersededFds = append(s.supersededFds, oldFd)
+	}
 	s.mu.Unlock()
-	_ = oldFd.Close()
 	s.pendingBytes.Add(delta)
 	return n, nil
 }
@@ -1050,7 +1057,8 @@ func (s *ShadowStore) Has(remotePath string) bool {
 	return err == nil
 }
 
-// Close closes all open shadow file descriptors.
+// Close closes all open shadow file descriptors, including superseded fds
+// kept alive for concurrent reader safety.
 func (s *ShadowStore) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1061,11 +1069,15 @@ func (s *ShadowStore) Close() {
 	for _, rt := range s.retired {
 		_ = rt.fd.Close()
 	}
+	for _, fd := range s.supersededFds {
+		_ = fd.Close()
+	}
 	s.files = make(map[string]*ShadowFile)
 	s.active = make(map[string]uint64)
 	s.genFile = make(map[uint64]*ShadowFile)
 	s.refs = make(map[uint64]int32)
 	s.retired = make(map[uint64]*retiredShadow)
+	s.supersededFds = nil
 }
 
 // RecoverFromDisk scans the shadow directory and loads shadow files into memory.
