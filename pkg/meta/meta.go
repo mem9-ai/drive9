@@ -672,6 +672,45 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_pending (status, created_at),
 			INDEX idx_tenant_order (tenant_id, id)
 		)`,
+		// sse_notify_outbox is a central notification pointer table for cross-pod
+		// SSE event fan-out. Each FS mutation writes a lightweight row here (tenant_id
+		// + seq) so that pods can discover which tenants have new events without
+		// polling every tenant's own TiDB. The event content stays in the per-tenant
+		// fs_events table; this table only signals "tenant T has new rows after seq".
+		// The central meta DB is always provisioned (not serverless), so polling it
+		// does not incur per-tenant RCU. Retention pruning is leader-gated.
+		`CREATE TABLE IF NOT EXISTS sse_notify_outbox (
+			id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+			tenant_id  VARCHAR(64) NOT NULL,
+			seq        BIGINT UNSIGNED NOT NULL,
+			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			INDEX idx_sse_notify_created (created_at)
+		)`,
+		// pod_registry tracks all drive9-server pods for cross-pod SSE push
+		// notification routing. Each pod upserts its row on startup and heartbeats
+		// every ~10s. The leader marks pods with stale heartbeats as inactive so
+		// writers don't push to dead pods. This table lives in the central meta DB
+		// (always provisioned).
+		`CREATE TABLE IF NOT EXISTS pod_registry (
+			pod_id         VARCHAR(64) PRIMARY KEY,
+			addr           VARCHAR(255) NOT NULL,
+			last_heartbeat DATETIME(3) NOT NULL,
+			status         VARCHAR(20) NOT NULL DEFAULT 'active',
+			created_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			updated_at     DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			INDEX idx_pod_heartbeat (last_heartbeat)
+		)`,
+		// pod_subscriptions maps each pod to the tenant IDs for which it has active
+		// SSE subscribers. Writers consult this (via a locally cached reverse index)
+		// to push notifications only to pods that care about a given tenant, avoiding
+		// wasteful fan-out to pods with no subscribers for that tenant. Each pod
+		// periodically upserts its current subscriber set and prunes stale entries.
+		`CREATE TABLE IF NOT EXISTS pod_subscriptions (
+			pod_id     VARCHAR(64) NOT NULL,
+			tenant_id VARCHAR(64) NOT NULL,
+			updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (pod_id, tenant_id)
+		)`,
 	}
 }
 
@@ -3131,4 +3170,311 @@ func isDuplicateEntry(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "Duplicate entry") || strings.Contains(msg, "UNIQUE constraint failed")
+}
+
+// ---------------------------------------------------------------------------
+// SSE notify outbox
+// ---------------------------------------------------------------------------
+
+// SSENotifyRow mirrors a row in sse_notify_outbox. It is a lightweight pointer
+// (tenant_id + seq) to the actual event content stored in the per-tenant
+// fs_events table. The central meta DB holds this table so pods can discover
+// cross-pod events without polling every tenant's own TiDB.
+type SSENotifyRow struct {
+	ID        uint64
+	TenantID  string
+	Seq       uint64
+	CreatedAt time.Time
+}
+
+// PodRegistryStatus is the lifecycle state of a pod in pod_registry.
+type PodRegistryStatus string
+
+const (
+	PodRegistryActive PodRegistryStatus = "active"
+	PodRegistryStale  PodRegistryStatus = "stale"
+)
+
+// PodRow mirrors a row in pod_registry.
+type PodRow struct {
+	PodID  string
+	Addr   string
+	Status PodRegistryStatus
+}
+
+// InsertSSENotify writes a notification pointer to sse_notify_outbox. This is
+// best-effort: if the INSERT fails, the event is still durable in the
+// per-tenant fs_events table and will be discovered on SSE client reconnect
+// replay. The central meta DB is always provisioned so this write never wakes
+// a serverless tenant TiDB.
+func (s *Store) InsertSSENotify(ctx context.Context, tenantID string, seq uint64) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_sse_notify", start, &err)
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO sse_notify_outbox (tenant_id, seq) VALUES (?, ?)`,
+		tenantID, seq)
+	return err
+}
+
+// ListSSENotifySince returns outbox rows with id > afterID, ordered by id, up to
+// limit. The consumer advances its cursor to the last row's id so subsequent
+// calls do not re-read the same rows.
+func (s *Store) ListSSENotifySince(ctx context.Context, afterID uint64, limit int) (out []SSENotifyRow, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_sse_notify_since", start, &err)
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, tenant_id, seq, created_at FROM sse_notify_outbox WHERE id > ? ORDER BY id LIMIT ?`,
+		afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var rec SSENotifyRow
+		if err = rows.Scan(&rec.ID, &rec.TenantID, &rec.Seq, &rec.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// MaxSSENotifyID returns the current maximum id in sse_notify_outbox, or 0 if
+// the table is empty. Used by the notify poller to initialize its cursor on
+// startup (skipping historical rows — SSE client reconnect replay covers those).
+func (s *Store) MaxSSENotifyID(ctx context.Context) (out uint64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "max_sse_notify_id", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM sse_notify_outbox`)
+	if err = row.Scan(&out); err != nil {
+		return 0, err
+	}
+	return out, nil
+}
+
+// DeleteSSENotifyBefore prunes outbox rows older than the given threshold.
+// Leader-gated; retention is relative to DB insert time (created_at).
+func (s *Store) DeleteSSENotifyBefore(ctx context.Context, before time.Time) (n int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_sse_notify_before", start, &err)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM sse_notify_outbox WHERE created_at < ?`, before)
+	if err != nil {
+		return 0, err
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ---------------------------------------------------------------------------
+// Pod registry
+// ---------------------------------------------------------------------------
+
+// UpsertPod registers or refreshes this pod's heartbeat in pod_registry. On
+// first insert the row is created with status='active'; on subsequent calls
+// the addr, last_heartbeat, and status are updated (reviving a stale pod).
+func (s *Store) UpsertPod(ctx context.Context, podID, addr string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "upsert_pod", start, &err)
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO pod_registry (pod_id, addr, last_heartbeat, status)
+		 VALUES (?, ?, NOW(3), 'active')
+		 ON DUPLICATE KEY UPDATE addr = VALUES(addr), last_heartbeat = NOW(3), status = 'active'`,
+		podID, addr)
+	return err
+}
+
+// ListActivePods returns all active pods excluding selfID. Used by the pod
+// notifier to build its peer list for cross-pod HTTP push.
+func (s *Store) ListActivePods(ctx context.Context, selfID string) (out []PodRow, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_active_pods", start, &err)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT pod_id, addr, status FROM pod_registry WHERE status = 'active' AND pod_id != ?`,
+		selfID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var rec PodRow
+		if err = rows.Scan(&rec.PodID, &rec.Addr, &rec.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// MarkStalePods marks pods with heartbeats older than the threshold as stale.
+// Leader-gated: prevents writers from pushing notifications to dead pods.
+func (s *Store) MarkStalePods(ctx context.Context, before time.Time) (n int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "mark_stale_pods", start, &err)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE pod_registry SET status = 'stale' WHERE last_heartbeat < ? AND status = 'active'`,
+		before)
+	if err != nil {
+		return 0, err
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// DeletePod removes a pod and its subscriptions from the registry. Used when a
+// pod is decommissioned. Best-effort: stale pod cleanup handles the common case.
+func (s *Store) DeletePod(ctx context.Context, podID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_pod", start, &err)
+	_, err = s.db.ExecContext(ctx, `DELETE FROM pod_registry WHERE pod_id = ?`, podID)
+	return err
+}
+
+// ---------------------------------------------------------------------------
+// Pod subscriptions
+// ---------------------------------------------------------------------------
+
+// UpsertPodSubscriptions records the set of tenant IDs for which podID has
+// active SSE subscribers. Each (pod_id, tenant_id) pair is upserted with the
+// current timestamp. Callers should call PrunePodSubscriptions to remove
+// tenants that are no longer active.
+func (s *Store) UpsertPodSubscriptions(ctx context.Context, podID string, tenantIDs []string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "upsert_pod_subscriptions", start, &err)
+	if len(tenantIDs) == 0 {
+		return nil
+	}
+	return s.InTx(ctx, func(tx *sql.Tx) error {
+		for _, tenantID := range tenantIDs {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO pod_subscriptions (pod_id, tenant_id)
+				 VALUES (?, ?)
+				 ON DUPLICATE KEY UPDATE updated_at = NOW(3)`,
+				podID, tenantID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// PrunePodSubscriptions removes pod_subscriptions rows for podID whose
+// tenant_id is not in keepSet. This lets a pod prune tenants whose SSE
+// subscribers have all disconnected. keepSet may be empty (prunes all).
+func (s *Store) PrunePodSubscriptions(ctx context.Context, podID string, keepSet []string) (n int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "prune_pod_subscriptions", start, &err)
+	if len(keepSet) == 0 {
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM pod_subscriptions WHERE pod_id = ?`, podID)
+		if err != nil {
+			return 0, err
+		}
+		return res.RowsAffected()
+	}
+	// Build a NOT IN clause with placeholders. keepSet is bounded by the number
+	// of tenants with active SSE connections on this pod (typically small).
+	placeholders := make([]string, len(keepSet))
+	args := make([]any, 0, len(keepSet)+1)
+	args = append(args, podID)
+	for i, t := range keepSet {
+		placeholders[i] = "?"
+		args = append(args, t)
+	}
+	query := fmt.Sprintf(
+		`DELETE FROM pod_subscriptions WHERE pod_id = ? AND tenant_id NOT IN (%s)`,
+		strings.Join(placeholders, ","))
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ListPodSubscriptions returns the tenant IDs for which podID has active SSE
+// subscribers. Used by the route cache builder to compute which peers care
+// about each tenant.
+func (s *Store) ListPodSubscriptions(ctx context.Context, podID string) (out []string, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_pod_subscriptions", start, &err)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT tenant_id FROM pod_subscriptions WHERE pod_id = ?`, podID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var tenantID string
+		if err = rows.Scan(&tenantID); err != nil {
+			return nil, err
+		}
+		out = append(out, tenantID)
+	}
+	return out, rows.Err()
+}
+
+// ListAllPodSubscriptions returns all (pod_id, tenant_id) pairs from
+// pod_subscriptions. Used by the route cache builder to construct a
+// tenant→pods reverse index for push notification routing.
+func (s *Store) ListAllPodSubscriptions(ctx context.Context) (out []PodSubscriptionRow, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_all_pod_subscriptions", start, &err)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT pod_id, tenant_id FROM pod_subscriptions`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var rec PodSubscriptionRow
+		if err = rows.Scan(&rec.PodID, &rec.TenantID); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// PodSubscriptionRow mirrors a row in pod_subscriptions.
+type PodSubscriptionRow struct {
+	PodID    string
+	TenantID string
+}
+
+// DeletePodSubscriptions removes all subscription rows for podID. Called when
+// a pod is decommissioned or marked stale by the leader sweeper.
+func (s *Store) DeletePodSubscriptions(ctx context.Context, podID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_pod_subscriptions", start, &err)
+	_, err = s.db.ExecContext(ctx, `DELETE FROM pod_subscriptions WHERE pod_id = ?`, podID)
+	return err
+}
+
+// ListStalePods returns pod IDs with status='stale'. Used by the leader sweeper
+// to clean up subscriptions for dead pods.
+func (s *Store) ListStalePods(ctx context.Context) (out []string, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_stale_pods", start, &err)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT pod_id FROM pod_registry WHERE status = 'stale'`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var podID string
+		if err = rows.Scan(&podID); err != nil {
+			return nil, err
+		}
+		out = append(out, podID)
+	}
+	return out, rows.Err()
 }

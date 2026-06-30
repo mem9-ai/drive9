@@ -79,6 +79,31 @@ type Config struct {
 	// per-tenant FileGC) to run only on the leader pod. When nil or disabled, all
 	// workers start unconditionally (single-pod mode).
 	Leader *leader.Manager
+
+	// SSE notification outbox + pod-to-pod push configuration. These enable the
+	// new cross-pod SSE scheme that avoids polling every tenant's TiDB. When
+	// Meta is nil (single-tenant mode), these are unused.
+	//
+	// SSENotifyPollInterval is the fallback poller tick (default 200ms). The
+	// poller reads the central sse_notify_outbox table (always-provisioned meta
+	// DB) — not per-tenant TiDBs — so idle tenant TiDBs can scale to zero.
+	//
+	// SSENotifyRetention is how long outbox rows are kept before leader-gated
+	// pruning (default 1h).
+	//
+	// PodID uniquely identifies this pod in the central pod_registry. PodAddr
+	// is the internally reachable address (host:port) for peer push notifications.
+	// When both are set, this pod registers itself and reports its SSE subscriber
+	// tenant set so peers can route push notifications.
+	//
+	// PodNotifySecret is the shared bearer token for /v1/internal/sse-notify
+	// authentication. When set, the pod-to-pod push path is enabled; when nil,
+	// only the 200ms poller fallback is used (no push).
+	SSENotifyPollInterval time.Duration
+	SSENotifyRetention     time.Duration
+	PodID                  string
+	PodAddr                string
+	PodNotifySecret        []byte
 }
 
 type SlockOAuthClient interface {
@@ -163,6 +188,23 @@ type Server struct {
 	// leadership transitions rather than being wired separately in main.go.
 	replayWorker      *backend.MutationReplayWorker
 	expirySweepWorker *backend.ExpirySweepWorker
+
+	// SSE cross-pod notification components. The notifyPoller reads the central
+	// sse_notify_outbox table (in the always-provisioned meta DB) on every pod
+	// to discover which tenants have new fs_events rows — replacing the old
+	// per-bus 1s poll that kept every serverless tenant TiDB awake. The
+	// podNotifier sends fire-and-forget HTTP pushes to peers for <10ms latency.
+	// The podRegistry maintains this pod's presence and subscriber set in the
+	// central DB. All three run on every pod (not leader-gated); the leader
+	// additionally sweeps stale pods and prunes the outbox.
+	podNotifier    *podNotifier
+	podRegistry    *podRegistry
+	podNotifySecret []byte
+	notifyCtx       context.Context
+	notifyCancel    context.CancelFunc
+	notifyWG        sync.WaitGroup
+	// sseNotifyRetention is how long outbox rows are kept before leader pruning.
+	sseNotifyRetention time.Duration
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -276,6 +318,12 @@ func NewWithConfig(cfg Config) *Server {
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
 		leader:              cfg.Leader,
+		podNotifySecret:     cfg.PodNotifySecret,
+		sseNotifyRetention:  cfg.SSENotifyRetention,
+		}
+	// Default SSE notify retention.
+	if s.sseNotifyRetention <= 0 {
+		s.sseNotifyRetention = defaultSSENotifyRetention
 	}
 	mux := http.NewServeMux()
 
@@ -336,6 +384,12 @@ func NewWithConfig(cfg Config) *Server {
 	mux.HandleFunc("/v1/auth/slock/callback", s.handleSlockCallback)
 	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
+	// Internal pod-to-pod SSE push endpoint. Authenticated via a shared
+	// internal bearer secret (not tenant auth). Only registered when a secret
+	// is configured; the handler rejects all requests if no secret is set.
+	if len(cfg.PodNotifySecret) > 0 {
+		mux.HandleFunc(sseNotifyInternalRoute, s.handleInternalSSENotify)
+	}
 
 	local := cfg.LocalS3
 	if local == nil && cfg.Backend != nil {
@@ -390,6 +444,13 @@ func NewWithConfig(cfg Config) *Server {
 	}
 	s.objectGCWorker = newObjectGCWorker(cfg.Meta, cfg.Pool)
 
+	// Start SSE cross-pod notification infrastructure. These run on every pod
+	// (not leader-gated) because each pod needs to discover cross-pod events
+	// for its own SSE subscribers. Only enabled in multi-tenant mode (Meta != nil).
+	if s.meta != nil {
+		s.startNotifyInfrastructure(cfg)
+	}
+
 	appManagedTaskTypes := semanticWorkerLogTaskTypesFromTypes(appManagedSemanticTaskTypes(cfg.SemanticEmbedder))
 	var fallbackTaskTypes, poolAutoTaskTypes []string
 	if cfg.Backend != nil {
@@ -423,6 +484,59 @@ func NewWithConfig(cfg Config) *Server {
 	return s
 }
 
+// startNotifyInfrastructure launches the SSE cross-pod notification components
+// that run on every pod (not leader-gated):
+//   - notifyPoller: reads the central sse_notify_outbox table at 200ms intervals
+//     to discover which tenants have new fs_events rows written by other pods.
+//   - podRegistry: maintains this pod's presence in pod_registry and reports its
+//     SSE subscriber tenant set to pod_subscriptions for push routing.
+//   - podNotifier: sends fire-and-forget HTTP pushes to peers for <10ms latency.
+//
+// Only called in multi-tenant mode (Meta != nil). In single-tenant mode the
+// fallback EventBus handles delivery without any cross-pod mechanism.
+func (s *Server) startNotifyInfrastructure(cfg Config) {
+	notifyCtx, notifyCancel := context.WithCancel(backgroundWithTrace(context.Background()))
+	s.notifyCtx = notifyCtx
+	s.notifyCancel = notifyCancel
+
+	// Fallback poller: reads the central outbox on every pod.
+	poller := newNotifyPoller(s.meta, s.events, cfg.SSENotifyPollInterval)
+	s.notifyWG.Add(1)
+	go func() {
+		defer s.notifyWG.Done()
+		poller.run(notifyCtx)
+	}()
+
+	// Pod registry: heartbeat + subscription reporting.
+	if cfg.PodID != "" && cfg.PodAddr != "" {
+		reg := newPodRegistry(s.meta, cfg.PodID, cfg.PodAddr, s.events)
+		s.podRegistry = reg
+		go reg.Start(notifyCtx)
+	}
+
+	// Pod-to-pod push notifier: only when a shared secret is configured.
+	if len(cfg.PodNotifySecret) > 0 && cfg.PodID != "" {
+		notifier := newPodNotifier(s.meta, cfg.PodID, cfg.PodNotifySecret)
+		s.podNotifier = notifier
+		notifier.Start(notifyCtx)
+	}
+}
+
+// stopNotifyInfrastructure cancels the notify context and waits for all notify
+// goroutines (poller, registry, notifier) to exit. Called from Close.
+func (s *Server) stopNotifyInfrastructure() {
+	if s.notifyCancel != nil {
+		s.notifyCancel()
+	}
+	s.notifyWG.Wait()
+	if s.podNotifier != nil {
+		s.podNotifier.Stop()
+	}
+	s.notifyCancel = nil
+	s.podNotifier = nil
+	s.podRegistry = nil
+}
+
 func (s *Server) Close() {
 	s.forkWorkerMu.Lock()
 	if !s.forkWorkerClosed {
@@ -433,6 +547,8 @@ func (s *Server) Close() {
 	}
 	s.forkWorkerMu.Unlock()
 	s.forkWorkerWG.Wait()
+	// Stop SSE cross-pod notification infrastructure (runs on every pod).
+	s.stopNotifyInfrastructure()
 	// Stop the leader manager first so any in-flight onLead/onLose callbacks
 	// finish before we tear down local workers. leader.Stop() waits for the
 	// heartbeat goroutine to exit, so no further callback can fire after it
@@ -556,6 +672,40 @@ func (s *Server) startLeaderWorkers() {
 			}
 		}
 	})
+	// Periodic SSE notify outbox cleanup (leader-only). Prunes old
+	// sse_notify_outbox rows so the central table doesn't grow unbounded.
+	// Only runs in multi-tenant mode (Meta != nil).
+	if s.meta != nil {
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(sseNotifyCleanupInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.cleanupSSENotifyOutbox(workerCtx)
+				}
+			}
+		})
+	}
+	// Periodic stale pod sweep (leader-only). Marks pods with expired heartbeats
+	// as stale and cleans up their subscription rows so writers stop pushing to
+	// dead pods. Only runs when pod registry is configured.
+	if s.podRegistry != nil {
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(stalePodSweepInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.podRegistry.SweepStalePods(workerCtx)
+				}
+			}
+		})
+	}
 }
 
 // fsEventsCleanupInterval is how often the leader prunes old fs_events rows.
@@ -563,6 +713,14 @@ const fsEventsCleanupInterval = 5 * time.Minute
 
 // fsEventsRetention is how long event rows are kept before pruning.
 const fsEventsRetention = 1 * time.Hour
+
+// defaultSSENotifyRetention is how long sse_notify_outbox rows are kept before
+// the leader prunes them. Matches fs_events retention so the outbox doesn't
+// outlive the event content it points to.
+const defaultSSENotifyRetention = 1 * time.Hour
+
+// sseNotifyCleanupInterval is how often the leader prunes old outbox rows.
+const sseNotifyCleanupInterval = 5 * time.Minute
 
 // cleanupFSEvents prunes old fs_events rows from accessible stores.
 // Single-tenant mode cleans the fallback store. Multi-tenant mode iterates
@@ -646,6 +804,35 @@ func (s *Server) cleanupFSEvents(ctx context.Context) {
 		} else {
 			metrics.RecordFSEventsPruned(te.TenantID, n)
 		}
+	}
+}
+
+// cleanupSSENotifyOutbox prunes old sse_notify_outbox rows from the central meta
+// DB. Leader-gated; runs on the sseNotifyCleanupInterval ticker. The outbox is
+// a lightweight pointer table (tenant_id + seq), not event content — pruning
+// old rows doesn't lose events because SSE clients use fs_events seq cursors
+// for replay, and the outbox is only a cross-pod wake-up signal.
+func (s *Server) cleanupSSENotifyOutbox(ctx context.Context) {
+	if ctx.Err() != nil {
+		logger.Warn(ctx, "sse_notify_cleanup_skipped_shutdown", zap.Error(ctx.Err()))
+		return
+	}
+	if s.meta == nil {
+		return
+	}
+	n, err := s.meta.DeleteSSENotifyBefore(ctx, time.Now().Add(-s.sseNotifyRetention))
+	if err != nil {
+		if ctx.Err() != nil {
+			logger.Warn(ctx, "sse_notify_cleanup_interrupted_by_shutdown", zap.Error(err))
+		} else {
+			logger.Warn(ctx, "sse_notify_cleanup_failed", zap.Error(err))
+		}
+		return
+	}
+	if n > 0 {
+		logger.Info(ctx, "sse_notify_outbox_pruned",
+			zap.Int64("rows", n),
+			zap.Duration("retention", s.sseNotifyRetention))
 	}
 }
 

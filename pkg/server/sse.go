@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -26,6 +27,14 @@ const (
 	// sseStreamEstablished context flag) to distinguish real SSE connection
 	// lifetimes from bounded error responses on the same route.
 	sseEventsRoute = "/v1/events"
+
+	// sseNotifyInternalRoute is the pod-to-pod SSE push endpoint. It receives
+	// a lightweight {tenant_id, seq} POST from a peer pod that just wrote an
+	// fs_events row, so this pod can wake its local SSE subscribers for that
+	// tenant without waiting for the 200ms notifyPoller fallback. Registered
+	// directly on the mux (not through the tenant auth middleware chain) and
+	// authenticated via a shared internal bearer secret.
+	sseNotifyInternalRoute = "/v1/internal/sse-notify"
 )
 
 // stopTimer drains a timer's channel after stopping it to prevent spurious
@@ -148,6 +157,36 @@ func (ebs *eventBuses) get(tenantID string, store *datastore.Store) *EventBus {
 	return bus
 }
 
+// getIfExists returns the EventBus for tenantID if one already exists, or nil
+// if no bus has been created for that tenant. Unlike get, it does NOT create a
+// new bus. Used by the notifyPoller and pod notifier to wake only tenants that
+// have local SSE subscribers — skipping idle tenants avoids touching their TiDB.
+func (ebs *eventBuses) getIfExists(tenantID string) *EventBus {
+	ebs.mu.RLock()
+	defer ebs.mu.RUnlock()
+	return ebs.buses[tenantID]
+}
+
+// activeTenantIDs returns the tenant IDs for which this pod has EventBus
+// instances (and thus potentially SSE subscribers). Used by the pod registry
+// to periodically report this pod's subscription set to the central DB so
+// writers can route push notifications to the right pods.
+func (ebs *eventBuses) activeTenantIDs() []string {
+	ebs.mu.RLock()
+	defer ebs.mu.RUnlock()
+	ids := make([]string, 0, len(ebs.buses))
+	for id, bus := range ebs.buses {
+		// Only report buses that currently have listeners. A bus without
+		// listeners means all SSE connections for that tenant disconnected;
+		// reporting it would cause peers to push notifications to a pod that
+		// has no one to deliver them to.
+		if bus.HasListeners() {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 func (s *Server) tenantEventBus(r *http.Request) *EventBus {
 	scope := ScopeFromContext(r.Context())
 	if scope != nil && scope.Backend != nil {
@@ -164,20 +203,26 @@ func (s *Server) tenantEventBus(r *http.Request) *EventBus {
 func (s *Server) publishEvent(r *http.Request, path, op string) {
 	actor := r.Header.Get("X-Dat9-Actor")
 	bus := s.tenantEventBus(r)
-	// Best-effort durable insert. If the INSERT fails (network blip, table
-	// missing pre-migration, conn pool exhaustion), the event is lost for
-	// cross-pod SSE clients — they won't see it via the 1s poll since there's
-	// no DB row. However, local SSE clients still get instant delivery via
-	// the notify channel below (their poll will find no new rows but the
-	// notify signal wakes them to re-check, which returns empty = caught up).
-	// FUSE correctness is maintained by HEAD revalidation regardless.
+	ctx := r.Context()
+	// Step 1: Insert the durable event row into the per-tenant fs_events table.
+	// This is the authoritative event content (path/op/actor/ts) and the source
+	// of the monotonic seq cursor. Best-effort: if the INSERT fails (network
+	// blip, table missing pre-migration, conn pool exhaustion), the event is
+	// lost for cross-pod SSE clients — they won't see it via the outbox or push
+	// since there's no DB row. However, local SSE clients still get instant
+	// delivery via the notify channel below (their EventsSince will find no new
+	// rows but the notify signal wakes them to re-check, returning empty =
+	// caught up). FUSE correctness is maintained by HEAD revalidation regardless.
 	// For existing tenants without the fs_events table (pre-migration), the
-	// INSERT will fail until EnsureTiDBSchemaForAutoEmbeddingProfile creates
-	// the table (triggered automatically by the CRC32 schema version bump).
+	// INSERT will fail until EnsureTiDBSchemaForAutoEmbeddingProfile creates the
+	// table (triggered automatically by the CRC32 schema version bump).
+	var seq int64
 	store := bus.store.Load()
 	if store != nil {
-		if _, err := store.InsertFSEvent(r.Context(), path, op, actor, time.Now().UnixMilli()); err != nil {
-			logger.Warn(r.Context(), "sse_publish_fs_event_insert_failed",
+		var err error
+		seq, err = store.InsertFSEvent(ctx, path, op, actor, time.Now().UnixMilli())
+		if err != nil {
+			logger.Warn(ctx, "sse_publish_fs_event_insert_failed",
 				zap.String("tenant_id", bus.tenantID),
 				zap.String("path", path),
 				zap.String("op", op),
@@ -186,7 +231,80 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 			metrics.RecordEventBusPublishError(bus.tenantID)
 		}
 	}
+
+	// Step 2: Write a lightweight pointer to the central sse_notify_outbox
+	// table (in the always-provisioned meta DB). This lets other pods discover
+	// that tenant T has new fs_events rows via the 200ms notifyPoller fallback,
+	// without polling the tenant's own TiDB. Best-effort: if this fails, the
+	// pod-to-pod push (step 4) may still deliver, and SSE client reconnect replay
+	// is the ultimate fallback. Only write if we got a valid seq from step 1.
+	if seq > 0 && s.meta != nil {
+		if err := s.meta.InsertSSENotify(ctx, bus.tenantID, uint64(seq)); err != nil {
+			logger.Warn(ctx, "sse_publish_outbox_insert_failed",
+				zap.String("tenant_id", bus.tenantID),
+				zap.Int64("seq", seq),
+				zap.Error(err))
+			metrics.RecordTenantOperation(bus.tenantID, "event_bus", "outbox_publish", metrics.ResultForError(err), 0)
+		}
+	}
+
+	// Step 3: Wake same-pod SSE subscribers instantly (in-memory, sub-ms).
 	bus.Publish()
+
+	// Step 4: Push to peer pods that have SSE subscribers for this tenant.
+	// This is the <10ms cross-pod fast path. Fire-and-forget: the outbox (step 2)
+	// + notifyPoller is the durable fallback. Only push if we got a valid seq.
+	if seq > 0 && s.podNotifier != nil {
+		s.podNotifier.Notify(bus.tenantID, uint64(seq))
+	}
+}
+
+// handleInternalSSENotify receives a pod-to-pod push notification from a
+// peer pod. The peer just wrote an fs_events row for tenant_id and is
+// notifying this pod (which has SSE subscribers for that tenant) to wake them
+// immediately rather than waiting for the 200ms notifyPoller fallback.
+//
+// Authenticated via a shared internal bearer secret (PodNotifySecret) compared
+// in constant time. Registered directly on the mux, NOT through the tenant auth
+// middleware — this endpoint has no tenant scope.
+//
+// Fire-and-forget semantics: the peer does not wait for a response. If this
+// pod's bus for the tenant no longer exists (all subscribers disconnected),
+// Publish is a no-op. EventsSince on the next wake reads the actual event
+// content from the tenant's fs_events table.
+func (s *Server) handleInternalSSENotify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// Validate the shared internal secret. If no secret is configured, the
+	// internal endpoint is disabled (404-equivalent: reject all requests).
+	if len(s.podNotifySecret) == 0 {
+		errJSON(w, http.StatusNotFound, "not found")
+		return
+	}
+	tok := bearerToken(r)
+	if tok == "" || subtle.ConstantTimeCompare([]byte(tok), s.podNotifySecret) != 1 {
+		errJSON(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var req notifyPushRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		errJSON(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.TenantID == "" {
+		errJSON(w, http.StatusBadRequest, "missing tenant_id")
+		return
+	}
+	// Wake local SSE subscribers for this tenant. If no bus exists (no local
+	// subscribers), this is a no-op — the peer's route table was slightly stale.
+	// The tenant's TiDB is NOT queried here; the SSE handler will call
+	// EventsSince only when it actually has a subscriber to deliver to.
+	if bus := s.events.getIfExists(req.TenantID); bus != nil {
+		bus.Publish()
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
