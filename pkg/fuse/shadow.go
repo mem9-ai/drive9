@@ -194,15 +194,15 @@ func (s *ShadowStore) CheckWriteBackQuotaThrottled(requiredBytes int64) error {
 
 // AddPendingBytes adds n bytes to the pending write-back byte counter.
 // Called when shadow data is staged for upload.
-func (s *ShadowStore) AddPendingBytes(n int64) {
-	s.pendingBytes.Add(n)
-}
+// AddPendingBytes is a no-op. Pending byte accounting is now managed
+// internally by ShadowStore write/remove methods.
+// Deprecated: do not call; kept for backward compatibility.
+func (s *ShadowStore) AddPendingBytes(n int64) {}
 
-// SubPendingBytes subtracts n bytes from the pending write-back byte counter.
-// Called when a commit succeeds and local pending data is cleaned up.
-func (s *ShadowStore) SubPendingBytes(n int64) {
-	s.pendingBytes.Add(-n)
-}
+// SubPendingBytes is a no-op. Pending byte accounting is now managed
+// internally by ShadowStore write/remove methods.
+// Deprecated: do not call; kept for backward compatibility.
+func (s *ShadowStore) SubPendingBytes(n int64) {}
 
 // PendingBytes returns the current pending write-back byte count.
 func (s *ShadowStore) PendingBytes() int64 {
@@ -311,13 +311,18 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 
 	end := offset + int64(n)
 	s.mu.Lock()
+	oldSize := sf.size
 	if end > sf.size {
 		sf.size = end
 	}
 	if baseRev != 0 {
 		sf.baseRev = baseRev
 	}
+	newSize := sf.size
 	s.mu.Unlock()
+	if delta := newSize - oldSize; delta > 0 {
+		s.pendingBytes.Add(delta)
+	}
 	return n, nil
 }
 
@@ -343,10 +348,13 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 		return fmt.Errorf("shadow final truncate: %w", err)
 	}
 
+	newSize := int64(len(data))
 	s.mu.Lock()
-	sf.size = int64(len(data))
+	oldSize := sf.size
+	sf.size = newSize
 	sf.baseRev = baseRev
 	s.mu.Unlock()
+	s.pendingBytes.Add(newSize - oldSize)
 	return nil
 }
 
@@ -371,9 +379,11 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	}
 
 	s.mu.Lock()
+	oldSize := sf.size
 	sf.size = n
 	sf.baseRev = baseRev
 	s.mu.Unlock()
+	s.pendingBytes.Add(n - oldSize)
 	return n, nil
 }
 
@@ -388,11 +398,13 @@ func (s *ShadowStore) Truncate(remotePath string, size int64, baseRev int64) err
 	}
 
 	s.mu.Lock()
+	oldSize := sf.size
 	sf.size = size
 	if baseRev != 0 {
 		sf.baseRev = baseRev
 	}
 	s.mu.Unlock()
+	s.pendingBytes.Add(size - oldSize)
 	return nil
 }
 
@@ -450,17 +462,19 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 	}
 
 	// Update shadow file metadata.
+	newSize := wb.Size()
 	s.mu.Lock()
-	sf.size = wb.Size()
+	oldSize := sf.size
+	sf.size = newSize
 	sf.extents = extents
 	if baseRev != 0 {
 		sf.baseRev = baseRev
 	}
-	targetSize := sf.size
 	s.mu.Unlock()
+	s.pendingBytes.Add(newSize - oldSize)
 
 	// Truncate to exact size if needed (handle shrinks).
-	if err := sf.fd.Truncate(targetSize); err != nil {
+	if err := sf.fd.Truncate(newSize); err != nil {
 		return fmt.Errorf("shadow truncate: %w", err)
 	}
 
@@ -733,7 +747,9 @@ func (s *ShadowStore) Remove(remotePath string) {
 			_ = os.Remove(diskPath)
 			retiredPath = diskPath // fd still valid, disk file gone
 		}
+		var removedSize int64
 		if sf != nil {
+			removedSize = sf.size
 			s.retired[gen] = &retiredShadow{
 				fd:       sf.fd,
 				diskPath: retiredPath,
@@ -741,6 +757,9 @@ func (s *ShadowStore) Remove(remotePath string) {
 			}
 		}
 		s.mu.Unlock()
+		if removedSize > 0 {
+			s.pendingBytes.Add(-removedSize)
+		}
 		return
 	}
 	// No active pins — remove immediately.
@@ -749,12 +768,17 @@ func (s *ShadowStore) Remove(remotePath string) {
 		delete(s.genFile, gen)
 		delete(s.refs, gen)
 	}
+	var removedSize int64
 	sf, ok := s.files[remotePath]
 	if ok {
+		removedSize = sf.size
 		_ = sf.fd.Close()
 		delete(s.files, remotePath)
 	}
 	s.mu.Unlock()
+	if removedSize > 0 {
+		s.pendingBytes.Add(-removedSize)
+	}
 
 	// Always attempt disk cleanup — the shadow may exist only on disk
 	// (e.g. after crash/restart recovery where it was never loaded into

@@ -2849,9 +2849,6 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 		fh.ShadowReady = true
 	}
 
-	// Track pending bytes for byte quota enforcement.
-	fs.shadowStore.AddPendingBytes(size)
-
 	if durable {
 		if err := fs.shadowStore.Sync(fh.Path); err != nil {
 			return err
@@ -12519,10 +12516,6 @@ func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int6
 func (fs *Dat9FS) onCommitQueueCleanup(entry *CommitEntry) {
 	if entry == nil || entry.Inode == 0 {
 		return
-	}
-	// Release pending byte quota after successful commit cleanup.
-	if fs.shadowStore != nil && entry.Size > 0 {
-		fs.shadowStore.SubPendingBytes(entry.Size)
 	}
 	fs.clearRemovedCommittedShadowForOpenHandles(entry.Path, fs.latestCommittedRevision(entry.Path), entry.Size)
 	fs.cleanupCommittedInode(entry.Inode, entry.Path)

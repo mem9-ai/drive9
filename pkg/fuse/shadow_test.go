@@ -724,8 +724,10 @@ func TestCheckWriteBackQuotaByteQuotaExceeded(t *testing.T) {
 	}
 	defer ss.Close()
 
-	// Simulate 800 bytes already pending.
-	ss.AddPendingBytes(800)
+	// Write an 800-byte shadow file to accumulate pending bytes internally.
+	if err := ss.WriteFull("/big.txt", make([]byte, 800), 1); err != nil {
+		t.Fatal(err)
+	}
 
 	// Writing 300 more bytes (total 1100 > 1024) should be rejected.
 	err = ss.CheckWriteBackQuota(300)
@@ -742,8 +744,10 @@ func TestCheckWriteBackQuotaByteQuotaDisabled(t *testing.T) {
 	}
 	defer ss.Close()
 
-	ss.AddPendingBytes(999999999)
-	// With quota disabled, any write should pass.
+	// Write a large shadow file; with quota disabled, any further write should pass.
+	if err := ss.WriteFull("/big.txt", make([]byte, 10000), 1); err != nil {
+		t.Fatal(err)
+	}
 	if err := ss.CheckWriteBackQuota(999999999); err != nil {
 		t.Fatalf("expected write to be allowed with quota disabled, got %v", err)
 	}
@@ -799,7 +803,7 @@ func TestCheckWriteBackQuotaFreeRatioDisabled(t *testing.T) {
 	}
 }
 
-func TestPendingBytesAddSubRecover(t *testing.T) {
+func TestPendingBytesWriteFullAndRemove(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
 	if err != nil {
@@ -812,44 +816,51 @@ func TestPendingBytesAddSubRecover(t *testing.T) {
 		t.Fatalf("expected initial pending 0, got %d", p)
 	}
 
-	// Add and sub.
-	ss.AddPendingBytes(1000)
+	// WriteFull should increase pending bytes.
+	if err := ss.WriteFull("/a.txt", make([]byte, 1000), 1); err != nil {
+		t.Fatal(err)
+	}
 	if p := ss.PendingBytes(); p != 1000 {
-		t.Fatalf("expected pending 1000 after add, got %d", p)
+		t.Fatalf("expected pending 1000 after write, got %d", p)
 	}
 
-	ss.SubPendingBytes(400)
+	// Overwriting with a smaller file should decrease pending.
+	if err := ss.WriteFull("/a.txt", make([]byte, 600), 2); err != nil {
+		t.Fatal(err)
+	}
 	if p := ss.PendingBytes(); p != 600 {
-		t.Fatalf("expected pending 600 after sub, got %d", p)
+		t.Fatalf("expected pending 600 after overwrite, got %d", p)
+	}
+
+	// Remove should bring it back to 0.
+	ss.Remove("/a.txt")
+	if p := ss.PendingBytes(); p != 0 {
+		t.Fatalf("expected pending 0 after remove, got %d", p)
 	}
 }
 
 func TestRecoverPendingBytesFromDisk(t *testing.T) {
 	dir := t.TempDir()
-	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	// Write some shadow files.
-	if err := ss.WriteFull("/a.txt", []byte("hello"), 1); err != nil {
+	// Manually create shadow files on disk to simulate a crash scenario
+	// where the in-memory ShadowStore state is lost.
+	if err := os.WriteFile(filepath.Join(dir, "aaa.shadow"), []byte("hello"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := ss.WriteFull("/b.txt", []byte("world!!"), 2); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "bbb.shadow"), []byte("world!!"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ss.Close()
 
 	// Create a new store and recover pending bytes.
-	ss2, err := NewShadowStoreWithQuota(dir, 0, 100)
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ss2.Close()
+	defer ss.Close()
 
-	ss2.RecoverPendingBytes()
+	ss.RecoverPendingBytes()
 	// Should recover 5 + 7 = 12 bytes.
-	if p := ss2.PendingBytes(); p != 12 {
+	if p := ss.PendingBytes(); p != 12 {
 		t.Fatalf("expected recovered pending 12, got %d", p)
 	}
 }
@@ -862,18 +873,61 @@ func TestByteQuotaRecoveryAfterCommitCleanup(t *testing.T) {
 	}
 	defer ss.Close()
 
-	// Simulate staging a 80-byte file.
-	ss.AddPendingBytes(80)
+	// Stage an 80-byte shadow file.
+	if err := ss.WriteFull("/file.txt", make([]byte, 80), 1); err != nil {
+		t.Fatal(err)
+	}
 	if err := ss.CheckWriteBackQuota(30); err != syscall.ENOSPC {
 		t.Fatalf("expected ENOSPC when 80+30>100, got %v", err)
 	}
 
-	// Simulate commit cleanup (sub bytes).
-	ss.SubPendingBytes(80)
+	// Simulate commit cleanup: Remove releases pending bytes.
+	ss.Remove("/file.txt")
 
 	// Now writing 30 should succeed again.
 	if err := ss.CheckWriteBackQuota(30); err != nil {
 		t.Fatalf("expected write to succeed after cleanup, got %v", err)
+	}
+}
+
+func TestPendingBytesNoDoubleCount(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write a 500-byte shadow file.
+	if err := ss.WriteFull("/f.txt", make([]byte, 500), 1); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 500 {
+		t.Fatalf("expected pending 500, got %d", p)
+	}
+
+	// Overwrite the same path with 500 bytes again — pending must stay 500, not 1000.
+	if err := ss.WriteFull("/f.txt", make([]byte, 500), 2); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 500 {
+		t.Fatalf("expected pending 500 after re-stage, got %d (double-count bug)", p)
+	}
+
+	// A third stage that grows the file to 700 should bring pending to 700.
+	if err := ss.WriteFull("/f.txt", make([]byte, 700), 3); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 700 {
+		t.Fatalf("expected pending 700 after grow, got %d", p)
+	}
+
+	// Shrink back to 200.
+	if err := ss.WriteFull("/f.txt", make([]byte, 200), 4); err != nil {
+		t.Fatal(err)
+	}
+	if p := ss.PendingBytes(); p != 200 {
+		t.Fatalf("expected pending 200 after shrink, got %d", p)
 	}
 }
 
