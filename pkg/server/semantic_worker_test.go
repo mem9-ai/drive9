@@ -483,8 +483,7 @@ func TestSemanticWorkerKeepsBorrowedTenantBackendAliveDuringInvalidate(t *testin
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPool(t)
 	parsed, err := mysql.ParseDSN(testDSN)
@@ -524,14 +523,7 @@ func TestSemanticWorkerKeepsBorrowedTenantBackendAliveDuringInvalidate(t *testin
 	if err := metaStore.InsertTenant(context.Background(), tenantMeta); err != nil {
 		t.Fatal(err)
 	}
-	b, err := pool.Get(context.Background(), tenantMeta)
-	if err != nil {
-		t.Fatal(err)
-	}
-	b.Store().DB().SetMaxIdleConns(1)
-	if err := b.Store().DB().PingContext(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	b := warmTestTenantBackend(t, pool, tenantMeta)
 	if _, err := b.Write("/docs/pinned-worker.txt", []byte("hello borrowed backend"), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}
@@ -743,8 +735,7 @@ func TestSemanticWorkerManagerStartsForMultiTenantImageOnlyMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPoolWithBackendOptions(t, backend.Options{
 		AsyncImageExtract: backend.AsyncImageExtractOptions{Enabled: true},
@@ -785,8 +776,7 @@ func TestSemanticWorkerManagerStartsForMultiTenantAudioOnlyMode(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPoolWithBackendOptions(t, backend.Options{
 		AsyncAudioExtract: backend.AsyncAudioExtractOptions{Enabled: true, Extractor: staticServerAudioExtractor{text: "x"}},
@@ -828,8 +818,7 @@ func TestSemanticWorkerManagerNilWhenMultiTenantOnlyFallbackHasAutoTasks(t *test
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPool(t)
 	fallback := newTestBackendForSemanticWorkerWithOptions(t, backend.Options{
@@ -929,6 +918,104 @@ func TestSemanticWorkerRecoversExpiredClaim(t *testing.T) {
 	waitForTaskStatus(t, b, nf.File.FileID, 1, string(semantic.TaskSucceeded), 3*time.Second)
 	if claimed.TaskID == "" {
 		t.Fatal("expected claimed task id")
+	}
+}
+
+func TestSemanticWorkerRecoversExpiredClaimForColdPoolTenant(t *testing.T) {
+	initServerTenantSchema(t, testDSN)
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	appStore, err := datastore.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testmysql.ResetDB(t, appStore.DB())
+	defer func() { _ = appStore.Close() }()
+
+	pool := newTestTenantPool(t)
+	parsed, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port := "127.0.0.1", 3306
+	if parsed.Addr != "" {
+		h, p, _ := strings.Cut(parsed.Addr, ":")
+		if h != "" {
+			host = h
+		}
+		if p != "" {
+			_, _ = fmt.Sscanf(p, "%d", &port)
+		}
+	}
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	tenantMeta := &meta.Tenant{
+		ID:               token.NewID(),
+		Status:           meta.TenantActive,
+		DBHost:           host,
+		DBPort:           port,
+		DBUser:           parsed.User,
+		DBPasswordCipher: passCipher,
+		DBName:           parsed.DBName,
+		DBTLS:            false,
+		Provider:         tenant.ProviderDB9,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := metaStore.InsertTenant(context.Background(), tenantMeta); err != nil {
+		t.Fatal(err)
+	}
+	if warm := pool.WarmTenantIDs(); len(warm) != 0 {
+		t.Fatalf("warm tenant ids before recovery = %v, want none", warm)
+	}
+
+	ctx := context.Background()
+	taskTime := time.Now().UTC().Add(-time.Minute)
+	if _, err := appStore.EnqueueSemanticTask(ctx, &semantic.Task{
+		TaskID:          "cold-expired-task",
+		TaskType:        semantic.TaskTypeEmbed,
+		ResourceID:      "file-cold-expired",
+		ResourceVersion: 1,
+		Status:          semantic.TaskQueued,
+		MaxAttempts:     3,
+		AvailableAt:     taskTime,
+		CreatedAt:       taskTime,
+		UpdatedAt:       taskTime,
+		PayloadJSON:     []byte(`{"path":"/docs/cold.txt"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := appStore.ClaimSemanticTask(ctx, taskTime.Add(time.Second), 10*time.Millisecond, semantic.TaskTypeEmbed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("expected claim to find cold tenant task")
+	}
+
+	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{
+		TenantScanLimit: 1,
+	})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	m.recoverExpired(context.Background())
+
+	var status string
+	if err := appStore.DB().QueryRow(`SELECT status FROM semantic_tasks WHERE task_id = ?`, claimed.TaskID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(semantic.TaskQueued) {
+		t.Fatalf("cold tenant task status=%q, want %q", status, semantic.TaskQueued)
 	}
 }
 
@@ -1041,8 +1128,7 @@ func TestSemanticWorkerListTenantRefsUsesWarmCachedBackendsOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPool(t)
 	parsed, err := mysql.ParseDSN(testDSN)
@@ -1206,13 +1292,15 @@ func TestSemanticWorkerListTenantRefsIncludesOnlyWarmCachedTenants(t *testing.T)
 		got = append(got, ref.id)
 	}
 	slices.Sort(got)
-	want := []string{"tenant-cached-1", "tenant-cached-2"}
-	if !slices.Equal(got, want) {
-		t.Fatalf("refs = %v, want %v", got, want)
+	if len(got) != 1 {
+		t.Fatalf("refs = %v, want one cached tenant due to scan limit", got)
+	}
+	if !slices.Contains([]string{"tenant-cached-1", "tenant-cached-2"}, got[0]) {
+		t.Fatalf("refs = %v, want one cached tenant and no dormant tenant", got)
 	}
 	scan := m.tenantScanSnapshot()
-	if scan.rawTenants != 2 || scan.includedTenants != 2 || scan.cursorSet {
-		t.Fatalf("tenant scan snapshot = %+v, want two cached tenants and no cursor", scan)
+	if scan.rawTenants != 2 || scan.includedTenants != 1 || !scan.wrapped || scan.cursorSet {
+		t.Fatalf("tenant scan snapshot = %+v, want limited warm scan", scan)
 	}
 }
 
@@ -1223,8 +1311,7 @@ func TestSemanticWorkerListTenantRefsDoesNotFilterWarmCachedProviders(t *testing
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPool(t)
 	parsed, err := mysql.ParseDSN(testDSN)
@@ -1312,14 +1399,100 @@ func TestSemanticWorkerListTenantRefsDoesNotFilterWarmCachedProviders(t *testing
 	}
 }
 
+func TestSemanticWorkerListTenantRefsSkipsInactiveWarmCachedTenant(t *testing.T) {
+	initServerTenantSchema(t, testDSN)
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = metaStore.Close() }()
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	pool := newTestTenantPool(t)
+	parsed, err := mysql.ParseDSN(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, port := "127.0.0.1", 3306
+	if parsed.Addr != "" {
+		h, p, _ := strings.Cut(parsed.Addr, ":")
+		if h != "" {
+			host = h
+		}
+		if p != "" {
+			_, _ = fmt.Sscanf(p, "%d", &port)
+		}
+	}
+	passCipher, err := pool.Encrypt(context.Background(), []byte(parsed.Passwd))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	activeTenant := &meta.Tenant{
+		ID:               "tenant-active-warm",
+		Status:           meta.TenantActive,
+		DBHost:           host,
+		DBPort:           port,
+		DBUser:           parsed.User,
+		DBPasswordCipher: passCipher,
+		DBName:           parsed.DBName,
+		DBTLS:            false,
+		Provider:         tenant.ProviderDB9,
+		SchemaVersion:    1,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	deletingTenant := &meta.Tenant{
+		ID:               "tenant-deleting-warm",
+		Status:           meta.TenantActive,
+		DBHost:           host,
+		DBPort:           port,
+		DBUser:           parsed.User,
+		DBPasswordCipher: passCipher,
+		DBName:           parsed.DBName,
+		DBTLS:            false,
+		Provider:         tenant.ProviderDB9,
+		SchemaVersion:    1,
+		CreatedAt:        now.Add(time.Millisecond),
+		UpdatedAt:        now.Add(time.Millisecond),
+	}
+	if err := metaStore.InsertTenant(context.Background(), activeTenant); err != nil {
+		t.Fatal(err)
+	}
+	if err := metaStore.InsertTenant(context.Background(), deletingTenant); err != nil {
+		t.Fatal(err)
+	}
+	warmTestTenantBackend(t, pool, activeTenant)
+	warmTestTenantBackend(t, pool, deletingTenant)
+	if err := metaStore.UpdateTenantStatus(context.Background(), deletingTenant.ID, meta.TenantDeleting); err != nil {
+		t.Fatal(err)
+	}
+
+	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	refs, err := m.listTenantRefs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		got = append(got, ref.id)
+	}
+	slices.Sort(got)
+	if !slices.Equal(got, []string{activeTenant.ID}) {
+		t.Fatalf("tenant refs=%v, want only active warm tenant %q", got, activeTenant.ID)
+	}
+}
+
 func TestSemanticWorkerLegacyProviderFilterStillAppliesToKicks(t *testing.T) {
 	metaStore, err := meta.Open(testDSN)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPool(t)
 	passCipher, err := pool.Encrypt(context.Background(), []byte("pw"))
@@ -1392,8 +1565,7 @@ func TestSemanticWorkerHTTPMultiTenantImageOnlySkipsAppTenantEmbedTasks(t *testi
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPoolWithBackendOptions(t, backend.Options{
 		AppSemanticTasksEnabled: true,
@@ -1550,8 +1722,7 @@ func TestSemanticWorkerListTenantRefsDoesNotUseFallbackImageCapabilityForPoolTen
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPool(t)
 	passCipher, err := pool.Encrypt(context.Background(), []byte("pw"))
@@ -2167,8 +2338,7 @@ func TestSemanticWorkerNextTargetUsesWarmCachedBackendOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPool(t)
 	parsed, err := mysql.ParseDSN(testDSN)
@@ -2275,14 +2445,13 @@ func TestSemanticWorkerKickDedupAndOverflow(t *testing.T) {
 	if len(m.kicks) != semanticKickQueueCapacity {
 		t.Fatalf("kicks=%d after overflow, want %d", len(m.kicks), semanticKickQueueCapacity)
 	}
-	// A dropped kick must not stay marked pending, or later kicks for that
-	// tenant would be deduped away forever.
-	droppedID := fmt.Sprintf("tenant-fill-%d", semanticKickQueueCapacity-1)
+	delayedID := fmt.Sprintf("tenant-fill-%d", semanticKickQueueCapacity-1)
 	m.mu.Lock()
-	_, pending := m.kickPending[droppedID]
+	_, pending := m.kickPending[delayedID]
+	_, queued := m.kickQueued[delayedID]
 	m.mu.Unlock()
-	if pending {
-		t.Fatalf("tenant %s still pending after dropped kick", droppedID)
+	if !pending || queued {
+		t.Fatalf("tenant %s pending=%v queued=%v, want pending delayed kick", delayedID, pending, queued)
 	}
 
 	got := <-m.kicks
@@ -2290,9 +2459,16 @@ func TestSemanticWorkerKickDedupAndOverflow(t *testing.T) {
 		t.Fatalf("first queued kick=%q, want tenant-a", got)
 	}
 	m.clearKickPending(got)
-	m.Kick("tenant-a")
+	m.queueNextPendingKick()
 	if len(m.kicks) != semanticKickQueueCapacity {
-		t.Fatalf("kicks=%d after re-kick, want %d", len(m.kicks), semanticKickQueueCapacity)
+		t.Fatalf("kicks=%d after delayed kick retry, want %d", len(m.kicks), semanticKickQueueCapacity)
+	}
+	m.mu.Lock()
+	_, pending = m.kickPending[delayedID]
+	_, queued = m.kickQueued[delayedID]
+	m.mu.Unlock()
+	if !pending || !queued {
+		t.Fatalf("tenant %s pending=%v queued=%v, want delayed kick requeued", delayedID, pending, queued)
 	}
 }
 
@@ -2322,8 +2498,7 @@ func TestSemanticWorkerKickClaimsPoolTenantTaskWithoutScan(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = metaStore.Close() }()
-	_, _ = metaStore.DB().Exec("DELETE FROM tenant_api_keys")
-	_, _ = metaStore.DB().Exec("DELETE FROM tenants")
+	testmysql.ResetMetaDB(t, metaStore.DB())
 
 	pool := newTestTenantPool(t)
 
