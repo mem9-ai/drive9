@@ -17,13 +17,14 @@ import (
 // toggled at runtime so the health probe can be exercised without a real MySQL.
 type fakeConnector struct {
 	healthy *atomic.Bool
+	ping    func(context.Context) error
 }
 
 func (c fakeConnector) Connect(context.Context) (driver.Conn, error) {
 	if !c.healthy.Load() {
 		return nil, errors.New("fake db unreachable")
 	}
-	return fakeConn(c), nil
+	return fakeConn{healthy: c.healthy, ping: c.ping}, nil
 }
 
 func (c fakeConnector) Driver() driver.Driver { return fakeDriver{} }
@@ -34,13 +35,17 @@ func (fakeDriver) Open(string) (driver.Conn, error) { return nil, errors.New("no
 
 type fakeConn struct {
 	healthy *atomic.Bool
+	ping    func(context.Context) error
 }
 
 func (fakeConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("not supported") }
 func (fakeConn) Close() error                        { return nil }
 func (fakeConn) Begin() (driver.Tx, error)           { return nil, errors.New("not supported") }
 
-func (c fakeConn) Ping(context.Context) error {
+func (c fakeConn) Ping(ctx context.Context) error {
+	if c.ping != nil {
+		return c.ping(ctx)
+	}
 	if !c.healthy.Load() {
 		return driver.ErrBadConn
 	}
@@ -247,7 +252,7 @@ func TestDBHealthProbeDropsUnregisteredState(t *testing.T) {
 	}
 }
 
-func TestDBHealthProbeDoesNotMarkSaturatedMetaPoolDown(t *testing.T) {
+func TestDBHealthProbeKeepsPreviousUpStateWhenMetaPoolSaturated(t *testing.T) {
 	healthy := &atomic.Bool{}
 	healthy.Store(true)
 	db := sql.OpenDB(fakeConnector{healthy: healthy})
@@ -259,13 +264,18 @@ func TestDBHealthProbeDoesNotMarkSaturatedMetaPoolDown(t *testing.T) {
 		_ = db.Close()
 	})
 
+	RegisterDB("meta", db)
+	globalDB.probeOnce(context.Background(), time.Second, nil)
+	if out := renderDB(t); !strings.Contains(out, `drive9_db_up{role="meta"} 1`) {
+		t.Fatalf("expected initial healthy meta probe, got:\n%s", out)
+	}
+
 	conn, err := db.Conn(context.Background())
 	if err != nil {
 		t.Fatalf("open held conn: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 
-	RegisterDB("meta", db)
 	globalDB.probeOnce(context.Background(), 10*time.Millisecond, func(role string, up bool, err error) {
 		if role == "meta" {
 			t.Fatalf("expected no down transition for saturated meta pool, got up=%v err=%v", up, err)
@@ -285,6 +295,50 @@ func TestDBHealthProbeDoesNotMarkSaturatedMetaPoolDown(t *testing.T) {
 	fullText := rec.Body.String()
 	if !strings.Contains(fullText, `drive9_db_probe_duration_seconds_bucket{result="pool_saturated",role="meta"`) {
 		t.Fatalf("expected saturated meta probe duration series, got:\n%s", fullText)
+	}
+}
+
+func TestDBHealthProbeMarksFirstSaturatedMetaPoolDown(t *testing.T) {
+	healthy := &atomic.Bool{}
+	healthy.Store(true)
+	db := sql.OpenDB(fakeConnector{healthy: healthy})
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(0)
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = db.Close()
+	})
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open held conn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	var changes []struct {
+		up  bool
+		err error
+	}
+	RegisterDB("meta", db)
+	globalDB.probeOnce(context.Background(), 10*time.Millisecond, func(role string, up bool, err error) {
+		if role == "meta" {
+			changes = append(changes, struct {
+				up  bool
+				err error
+			}{up: up, err: err})
+		}
+	})
+
+	out := renderDB(t)
+	if !strings.Contains(out, `drive9_db_up{role="meta"} 0`) {
+		t.Fatalf("expected first saturated meta probe to mark role down, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_unreachable_pools{role="meta"} 1`) {
+		t.Fatalf("expected first saturated meta probe to count the unverified pool, got:\n%s", out)
+	}
+	if len(changes) != 1 || changes[0].up || changes[0].err == nil {
+		t.Fatalf("expected one down transition with saturation error, got %+v", changes)
 	}
 }
 
@@ -359,5 +413,62 @@ func TestDBHealthProbeMarksRoleDownWhenOneMetaPoolSaturatedAndAnotherUnreachable
 	}
 	if !strings.Contains(out, `drive9_db_unreachable_pools{role="meta"} 1`) {
 		t.Fatalf("expected only the unreachable meta pool to count as unreachable, got:\n%s", out)
+	}
+}
+
+func TestDBHealthProbeDoesNotResurrectUnregisteredRoleAfterInFlightProbe(t *testing.T) {
+	const role = "meta"
+
+	healthy := &atomic.Bool{}
+	healthy.Store(true)
+	pingStarted := make(chan struct{})
+	releasePing := make(chan struct{})
+	var closeStarted sync.Once
+	db := sql.OpenDB(fakeConnector{
+		healthy: healthy,
+		ping: func(ctx context.Context) error {
+			closeStarted.Do(func() { close(pingStarted) })
+			select {
+			case <-releasePing:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	db.SetMaxIdleConns(0)
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = db.Close()
+	})
+
+	RegisterDB(role, db)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+	}()
+
+	select {
+	case <-pingStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for probe ping to start")
+	}
+
+	UnregisterDB(db)
+	close(releasePing)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for in-flight probe to finish")
+	}
+
+	globalDB.mu.RLock()
+	_, ok := globalDB.probe[role]
+	globalDB.mu.RUnlock()
+	if ok {
+		t.Fatalf("expected in-flight probe not to resurrect unregistered role")
 	}
 }

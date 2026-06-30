@@ -278,12 +278,20 @@ func (m *dbMetrics) probeOnceWithOptions(ctx context.Context, timeout time.Durat
 	prevProbe := m.probe
 	nextProbe := make(map[string]dbProbeState, len(results))
 	for role, agg := range results {
+		if !m.hasProbePoolLocked(role, opts) {
+			continue
+		}
 		up := agg.unreachable == 0
 		prev, existed := prevProbe[role]
 		unreachablePools := agg.unreachable
+		transitionErr := agg.firstErr
 		if existed && agg.saturated > 0 && agg.unreachable == 0 {
 			up = prev.up
 			unreachablePools = prev.unreachablePools
+		} else if !existed && agg.saturated > 0 && agg.unreachable == 0 {
+			up = false
+			unreachablePools = agg.total
+			transitionErr = fmt.Errorf("all %s DB probe pools are saturated", role)
 		}
 		nextProbe[role] = dbProbeState{
 			up:               up,
@@ -295,7 +303,7 @@ func (m *dbMetrics) probeOnceWithOptions(ctx context.Context, timeout time.Durat
 		// Fire on the first observed failure, and on every up<->down change
 		// thereafter. A first observation that is healthy is not a transition.
 		if onChange != nil && ((!existed && !up) || (existed && prev.up != up)) {
-			transitions = append(transitions, transition{role: role, up: up, err: agg.firstErr})
+			transitions = append(transitions, transition{role: role, up: up, err: transitionErr})
 		}
 	}
 	m.probe = nextProbe
@@ -419,6 +427,15 @@ func (p registeredDB) metricRole() string {
 func (m *dbMetrics) hasPoolLocked(role string) bool {
 	for _, pool := range m.dbs {
 		if pool.metricRole() == role {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *dbMetrics) hasProbePoolLocked(role string, opts DBHealthProbeOptions) bool {
+	for _, pool := range m.dbs {
+		if pool.metricRole() == role && m.shouldProbePool(pool, opts) {
 			return true
 		}
 	}
