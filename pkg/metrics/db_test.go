@@ -187,6 +187,34 @@ func TestDBHealthProbeSkipsUserSchemaPools(t *testing.T) {
 	}
 }
 
+func TestStartDBHealthProbeDisabledDoesNotStart(t *testing.T) {
+	globalDB.mu.Lock()
+	origStarted := globalDB.started
+	origProbe := globalDB.probe
+	globalDB.started = false
+	globalDB.probe = map[string]dbProbeState{
+		dbRoleMeta: {up: true, known: true},
+	}
+	globalDB.mu.Unlock()
+	t.Cleanup(func() {
+		globalDB.mu.Lock()
+		globalDB.started = origStarted
+		globalDB.probe = origProbe
+		globalDB.mu.Unlock()
+	})
+
+	StartDBHealthProbeWithOptions(context.Background(), time.Millisecond, time.Millisecond, DBHealthProbeOptions{}, nil)
+
+	globalDB.mu.RLock()
+	defer globalDB.mu.RUnlock()
+	if globalDB.started {
+		t.Fatal("disabled health probe started background goroutine")
+	}
+	if len(globalDB.probe) != 0 {
+		t.Fatalf("disabled health probe kept stale probe state: %+v", globalDB.probe)
+	}
+}
+
 func TestDBHealthProbeDropsUnregisteredState(t *testing.T) {
 	const role = "meta"
 

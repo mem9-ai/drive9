@@ -67,6 +67,7 @@ var dbProbeDuration = dbMeter.Float64Histogram("drive9_db_probe_duration_seconds
 const (
 	DefaultDBHealthProbeInterval = 15 * time.Second
 	DefaultDBHealthProbeTimeout  = 3 * time.Second
+	dbRoleMeta                   = "meta"
 )
 
 // DBHealthProbeOptions controls which registered DB pools are actively pinged.
@@ -145,6 +146,12 @@ func StartDBHealthProbeWithOptions(ctx context.Context, interval, timeout time.D
 	}
 	if timeout <= 0 {
 		timeout = DefaultDBHealthProbeTimeout
+	}
+	if !opts.hasEnabledProbes() {
+		globalDB.mu.Lock()
+		globalDB.probe = map[string]dbProbeState{}
+		globalDB.mu.Unlock()
+		return
 	}
 
 	globalDB.mu.Lock()
@@ -410,7 +417,11 @@ func (m *dbMetrics) hasPoolLocked(role string) bool {
 }
 
 func (m *dbMetrics) shouldProbePool(pool registeredDB, opts DBHealthProbeOptions) bool {
-	return pool.metricRole() == "meta" && opts.ProbeMeta
+	return pool.metricRole() == dbRoleMeta && opts.ProbeMeta
+}
+
+func (opts DBHealthProbeOptions) hasEnabledProbes() bool {
+	return opts.ProbeMeta
 }
 
 func isDBPoolSaturated(db *sql.DB) bool {
