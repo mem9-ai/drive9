@@ -400,8 +400,9 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 
 // WriteStream replaces the shadow contents by streaming from r.
 // Returns ENOSPC if the streamed data would breach disk protection limits.
-// Because the final size is unknown before streaming, the quota check runs
-// post-write; on breach the shadow is truncated back to its previous size.
+// Because the final size is unknown before streaming, the data is streamed
+// to a temp file first; on quota breach the temp file is removed and the
+// original shadow is untouched.
 func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64) (int64, error) {
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
@@ -412,37 +413,54 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	oldSize := sf.size
 	s.mu.RUnlock()
 
-	if err := sf.fd.Truncate(0); err != nil {
-		return 0, fmt.Errorf("shadow reset truncate: %w", err)
-	}
-	if _, err := sf.fd.Seek(0, 0); err != nil {
-		return 0, fmt.Errorf("shadow reset seek: %w", err)
-	}
-	n, err := io.Copy(sf.fd, r)
+	// Stream to a temp file so the original shadow is untouched on failure.
+	tmpPath := s.shadowPath(remotePath) + ".tmp"
+	tmpFd, err := os.Create(tmpPath)
 	if err != nil {
+		return 0, fmt.Errorf("shadow stream tmp create: %w", err)
+	}
+	n, err := io.Copy(tmpFd, r)
+	if err != nil {
+		tmpFd.Close()
+		os.Remove(tmpPath)
 		return n, fmt.Errorf("shadow write stream: %w", err)
 	}
-	if err := sf.fd.Truncate(n); err != nil {
-		return n, fmt.Errorf("shadow final truncate: %w", err)
+	if err := tmpFd.Sync(); err != nil {
+		tmpFd.Close()
+		os.Remove(tmpPath)
+		return n, fmt.Errorf("shadow stream sync: %w", err)
 	}
+	tmpFd.Close()
 
-	// Post-write quota check: rollback if breached.
+	// Post-stream quota check before committing.
 	delta := n - oldSize
 	if delta > 0 {
 		if err := s.checkQuotaForDelta(delta); err != nil {
-			// Rollback: restore previous size.
-			_ = sf.fd.Truncate(oldSize)
-			s.mu.Lock()
-			sf.size = oldSize
-			s.mu.Unlock()
+			os.Remove(tmpPath)
 			return 0, err
 		}
 	}
 
+	// Commit: swap temp file over the shadow file.
+	shadowFile := s.shadowPath(remotePath)
+	if err := os.Rename(tmpPath, shadowFile); err != nil {
+		os.Remove(tmpPath)
+		return 0, fmt.Errorf("shadow stream rename: %w", err)
+	}
+
+	// Reopen the fd for the shadow file.
+	newFd, err := os.OpenFile(shadowFile, os.O_RDWR, 0o644)
+	if err != nil {
+		return 0, fmt.Errorf("shadow stream reopen: %w", err)
+	}
+
 	s.mu.Lock()
+	oldFd := sf.fd
+	sf.fd = newFd
 	sf.size = n
 	sf.baseRev = baseRev
 	s.mu.Unlock()
+	oldFd.Close()
 	s.pendingBytes.Add(delta)
 	return n, nil
 }

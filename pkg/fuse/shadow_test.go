@@ -976,7 +976,8 @@ func TestWriteStreamQuotaEnforcement(t *testing.T) {
 	defer ss.Close()
 
 	// WriteStream within quota should succeed.
-	n, err := ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 50)), 1)
+	origData := bytes.Repeat([]byte("A"), 50)
+	n, err := ss.WriteStream("/f.txt", bytes.NewReader(origData), 1)
 	if err != nil {
 		t.Fatalf("WriteStream within quota should succeed: %v", err)
 	}
@@ -987,14 +988,22 @@ func TestWriteStreamQuotaEnforcement(t *testing.T) {
 		t.Fatalf("expected pending 50, got %d", p)
 	}
 
-	// WriteStream exceeding quota should ENOSPC and rollback.
+	// WriteStream exceeding quota should ENOSPC and preserve original shadow.
 	_, err = ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 200)), 2)
 	if err != syscall.ENOSPC {
 		t.Fatalf("WriteStream exceeding quota should ENOSPC, got %v", err)
 	}
-	// Pending should be rolled back to 50 (previous successful size).
+	// Pending should still be 50 (original shadow untouched).
 	if p := ss.PendingBytes(); p != 50 {
-		t.Fatalf("expected pending 50 after rollback, got %d", p)
+		t.Fatalf("expected pending 50 after failed stream, got %d", p)
+	}
+	// Original content must be preserved.
+	data, err := ss.ReadAll("/f.txt")
+	if err != nil {
+		t.Fatalf("ReadAll after failed stream: %v", err)
+	}
+	if !bytes.Equal(data, origData) {
+		t.Fatalf("shadow content corrupted: got %d bytes of %q, want 50 bytes of 'A'", len(data), data[:1])
 	}
 }
 
