@@ -217,3 +217,47 @@ func TestDBHealthProbeDoesNotMarkSaturatedTenantPoolDown(t *testing.T) {
 		t.Fatalf("expected saturated probe duration series, got:\n%s", fullText)
 	}
 }
+
+func TestDBHealthProbeDoesNotMarkSaturatedMetaPoolDown(t *testing.T) {
+	healthy := &atomic.Bool{}
+	healthy.Store(true)
+	db := sql.OpenDB(fakeConnector{healthy: healthy})
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(0)
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = db.Close()
+	})
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("open held conn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	RegisterDB("meta", db)
+	globalDB.probeOnce(context.Background(), 10*time.Millisecond, func(info DBPoolInfo, up bool, err error) {
+		if info.Role == "meta" {
+			t.Fatalf("expected no down transition for saturated meta pool, got up=%v err=%v", up, err)
+		}
+	})
+
+	out := renderDB(t)
+	if !strings.Contains(out, `drive9_db_up{role="meta"} 1`) {
+		t.Fatalf("expected saturated meta pool to remain up, got:\n%s", out)
+	}
+	if !strings.Contains(out, `drive9_db_unreachable_pools{role="meta"} 0`) {
+		t.Fatalf("expected saturated meta pool not to count as unreachable, got:\n%s", out)
+	}
+
+	rec := httptest.NewRecorder()
+	WritePrometheus(rec)
+	fullText := rec.Body.String()
+	if !strings.Contains(fullText, `drive9_db_probe_duration_seconds_bucket{result="pool_saturated",role="meta"`) {
+		t.Fatalf("expected saturated meta probe duration series, got:\n%s", fullText)
+	}
+	if strings.Contains(fullText, `role="meta",tenant_id=`) {
+		t.Fatalf("expected meta probe duration series to omit tenant_id, got:\n%s", fullText)
+	}
+}

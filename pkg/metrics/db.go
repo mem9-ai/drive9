@@ -215,7 +215,11 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 			//
 			start := time.Now()
 			result := "ok"
-			if isTenantPoolSaturated(db, key) {
+			// A saturated bounded pool cannot lend a connection to PingContext,
+			// so probing through it would report a false database outage. Keep
+			// drive9_db_up unchanged and let pool wait/saturation metrics cover
+			// this state, even if the database is also unreachable underneath.
+			if isDBPoolSaturated(db) {
 				result = "pool_saturated"
 				observeDBProbeDuration(start, key, result)
 				return
@@ -386,10 +390,7 @@ func (p registeredDB) info() DBPoolInfo {
 	return info
 }
 
-func isTenantPoolSaturated(db *sql.DB, key dbMetricKey) bool {
-	if key.tenantID == "" || key.tenantID == "unknown" {
-		return false
-	}
+func isDBPoolSaturated(db *sql.DB) bool {
 	stats := db.Stats()
 	return stats.MaxOpenConnections > 0 && stats.Idle == 0 && stats.InUse >= stats.MaxOpenConnections
 }
