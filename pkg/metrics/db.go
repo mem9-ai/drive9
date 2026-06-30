@@ -10,13 +10,6 @@ import (
 	"time"
 )
 
-// DBPoolInfo identifies a registered database pool for metrics and health
-// transition logging.
-type DBPoolInfo struct {
-	Role     string
-	TenantID string
-}
-
 // dbProbeState is the cached result of the most recent health probe for a role.
 type dbProbeState struct {
 	up               bool
@@ -39,7 +32,7 @@ type dbMetricKey struct {
 type dbMetrics struct {
 	mu      sync.RWMutex
 	dbs     map[*sql.DB]registeredDB
-	probe   map[dbMetricKey]dbProbeState
+	probe   map[string]dbProbeState
 	started bool
 }
 
@@ -61,7 +54,7 @@ var dbProbeDurationBounds = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25
 
 var globalDB = &dbMetrics{
 	dbs:   map[*sql.DB]registeredDB{},
-	probe: map[dbMetricKey]dbProbeState{},
+	probe: map[string]dbProbeState{},
 }
 
 var dbMeter = globalMeterProvider.Meter("db")
@@ -75,6 +68,13 @@ const (
 	DefaultDBHealthProbeInterval = 15 * time.Second
 	DefaultDBHealthProbeTimeout  = 3 * time.Second
 )
+
+// DBHealthProbeOptions controls which registered DB pools are actively pinged.
+// drive9-server only probes the long-lived control-plane DB; tenant user DB
+// pools are short-lived workload pools and are observed through normal traffic.
+type DBHealthProbeOptions struct {
+	ProbeMeta bool
+}
 
 func RecordDBOperation(role, operation, result string, d time.Duration) {
 	RegisterModule("db")
@@ -106,19 +106,25 @@ func UnregisterDB(db *sql.DB) {
 		return
 	}
 	globalDB.mu.Lock()
+	pool, ok := globalDB.dbs[db]
 	delete(globalDB.dbs, db)
+	if ok {
+		role := pool.metricRole()
+		if !globalDB.hasPoolLocked(role) {
+			delete(globalDB.probe, role)
+		}
+	}
 	globalDB.mu.Unlock()
 }
 
 // StartDBHealthProbe launches a background goroutine that periodically pings every
-// registered *sql.DB and publishes availability as the drive9_db_up gauge. It is
-// the active dependency-health probe for the metadata store ("meta") and tenant
-// data stores ("user"): pool/operation metrics only move while there is live
-// traffic, so an idle-but-unreachable database is otherwise invisible. User DB
-// pool series include tenant_id when the pool was registered with one.
+// registered long-lived dependency *sql.DB and publishes availability as the
+// drive9_db_up gauge. In drive9-server this means the metadata store ("meta").
+// Tenant user/user_schema pools are short-lived workload pools, so probing them
+// would only keep connections warm and compete with business traffic.
 //
 // The probe never blocks the /metrics scrape path — scrapes read the cached probe
-// state. onChange (optional) is invoked outside the lock on a pool key's first
+// state. onChange (optional) is invoked outside the lock on a role's first
 // observed failure and on every subsequent up<->down transition, so callers can
 // emit a log without coupling this package to a logger. The goroutine stops when
 // ctx is done; repeat calls after the first are no-ops.
@@ -126,7 +132,14 @@ func UnregisterDB(db *sql.DB) {
 // Example alert (critical — control-plane DB unreachable):
 //
 //	max(drive9_db_up{role="meta"}) == 0
-func StartDBHealthProbe(ctx context.Context, interval, timeout time.Duration, onChange func(info DBPoolInfo, up bool, err error)) {
+func StartDBHealthProbe(ctx context.Context, interval, timeout time.Duration, onChange func(role string, up bool, err error)) {
+	StartDBHealthProbeWithOptions(ctx, interval, timeout, DBHealthProbeOptions{
+		ProbeMeta: true,
+	}, onChange)
+}
+
+// StartDBHealthProbeWithOptions is StartDBHealthProbe with role filtering.
+func StartDBHealthProbeWithOptions(ctx context.Context, interval, timeout time.Duration, opts DBHealthProbeOptions, onChange func(role string, up bool, err error)) {
 	if interval <= 0 {
 		interval = DefaultDBHealthProbeInterval
 	}
@@ -145,13 +158,13 @@ func StartDBHealthProbe(ctx context.Context, interval, timeout time.Duration, on
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		globalDB.probeOnce(ctx, timeout, onChange)
+		globalDB.probeOnceWithOptions(ctx, timeout, opts, onChange)
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				globalDB.probeOnce(ctx, timeout, onChange)
+				globalDB.probeOnceWithOptions(ctx, timeout, opts, onChange)
 			}
 		}
 	}()
@@ -159,10 +172,19 @@ func StartDBHealthProbe(ctx context.Context, interval, timeout time.Duration, on
 
 // probeOnce runs a single probe cycle across all registered pools and updates the
 // cached per-role state. Exported indirectly for tests via probeOnce.
-func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChange func(info DBPoolInfo, up bool, err error)) {
+func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChange func(role string, up bool, err error)) {
+	m.probeOnceWithOptions(ctx, timeout, DBHealthProbeOptions{
+		ProbeMeta: true,
+	}, onChange)
+}
+
+func (m *dbMetrics) probeOnceWithOptions(ctx context.Context, timeout time.Duration, opts DBHealthProbeOptions, onChange func(role string, up bool, err error)) {
 	m.mu.RLock()
 	dbByPool := make(map[*sql.DB]registeredDB, len(m.dbs))
 	for db, pool := range m.dbs {
+		if !m.shouldProbePool(pool, opts) {
+			continue
+		}
 		dbByPool[db] = pool
 	}
 	m.mu.RUnlock()
@@ -172,27 +194,25 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 		unreachable int
 		firstErr    error
 	}
-	results := map[dbMetricKey]*roleAgg{}
+	results := map[string]*roleAgg{}
 	for _, pool := range dbByPool {
-		key := pool.metricKey()
-		if results[key] == nil {
-			results[key] = &roleAgg{}
+		role := pool.metricRole()
+		if results[role] == nil {
+			results[role] = &roleAgg{}
 		}
-		results[key].total++
+		results[role].total++
 	}
 
 	// Ping pools concurrently with a fixed bound so one slow/unreachable pool
-	// cannot serialize the whole cycle: with many unreachable tenant ("user")
-	// pools a serial loop would burn timeout*N and leave drive9_db_up stale.
+	// cannot serialize the whole cycle if multiple long-lived DB dependencies
+	// are registered in tests or future server modes.
 	const probeConcurrency = 8
 	sem := make(chan struct{}, probeConcurrency)
 	var wg sync.WaitGroup
 	var aggMu sync.Mutex
-	poolsByKey := map[dbMetricKey]registeredDB{}
 	for db, pool := range dbByPool {
 		db, pool := db, pool
-		key := pool.metricKey()
-		poolsByKey[key] = pool
+		role := pool.metricRole()
 		wg.Add(1)
 		sem <- struct{}{}
 		go func() {
@@ -213,7 +233,7 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 			// this state, even if the database is also unreachable underneath.
 			if isDBPoolSaturated(db) {
 				result = "pool_saturated"
-				observeDBProbeDuration(start, key, result)
+				observeDBProbeDuration(start, role, result)
 				return
 			}
 
@@ -223,20 +243,20 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 			if err != nil {
 				result = "error"
 				aggMu.Lock()
-				agg := results[key]
+				agg := results[role]
 				agg.unreachable++
 				if agg.firstErr == nil {
 					agg.firstErr = err
 				}
 				aggMu.Unlock()
 			}
-			observeDBProbeDuration(start, key, result)
+			observeDBProbeDuration(start, role, result)
 		}()
 	}
 	wg.Wait()
 
 	type transition struct {
-		info DBPoolInfo
+		role string
 		up   bool
 		err  error
 	}
@@ -245,12 +265,11 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 
 	m.mu.Lock()
 	prevProbe := m.probe
-	nextProbe := make(map[dbMetricKey]dbProbeState, len(results))
-	for key, agg := range results {
-		pool := poolsByKey[key]
+	nextProbe := make(map[string]dbProbeState, len(results))
+	for role, agg := range results {
 		up := agg.unreachable == 0
-		prev, existed := prevProbe[key]
-		nextProbe[key] = dbProbeState{
+		prev, existed := prevProbe[role]
+		nextProbe[role] = dbProbeState{
 			up:               up,
 			unreachablePools: agg.unreachable,
 			totalPools:       agg.total,
@@ -260,14 +279,14 @@ func (m *dbMetrics) probeOnce(ctx context.Context, timeout time.Duration, onChan
 		// Fire on the first observed failure, and on every up<->down change
 		// thereafter. A first observation that is healthy is not a transition.
 		if onChange != nil && ((!existed && !up) || (existed && prev.up != up)) {
-			transitions = append(transitions, transition{info: pool.info(), up: up, err: agg.firstErr})
+			transitions = append(transitions, transition{role: role, up: up, err: agg.firstErr})
 		}
 	}
 	m.probe = nextProbe
 	m.mu.Unlock()
 
 	for _, t := range transitions {
-		onChange(t.info, t.up, t.err)
+		onChange(t.role, t.up, t.err)
 	}
 }
 
@@ -299,34 +318,35 @@ func writeDBPrometheus(w http.ResponseWriter) {
 	keys := sortedDBMetricKeys(poolTotals)
 
 	globalDB.mu.RLock()
-	probeByKey := make(map[dbMetricKey]dbProbeState, len(globalDB.probe))
-	for key, state := range globalDB.probe {
-		probeByKey[key] = state
+	probeByRole := make(map[string]dbProbeState, len(globalDB.probe))
+	for role, state := range globalDB.probe {
+		probeByRole[role] = state
 	}
 	globalDB.mu.RUnlock()
 
-	// drive9_db_up is the active availability signal: 1 when every registered pool
+	probeRoles := SortedKeys(probeByRole)
+
+	// drive9_db_up is the active availability signal: 1 when every probed pool
 	// for the role answered its last health ping, 0 when any pool is unreachable.
-	// Roles not yet probed default to 1 (the startup ping already succeeded), so the
-	// `== 0` alert never fires on a cold series.
-	_, _ = fmt.Fprintln(w, "# HELP drive9_db_up Database availability by role (1 = all registered pools reachable on last probe)")
+	// Unprobed roles/pools do not emit a cold availability series.
+	_, _ = fmt.Fprintln(w, "# HELP drive9_db_up Database availability by role (1 = all probed pools reachable on last probe)")
 	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_up gauge")
-	for _, key := range keys {
+	for _, role := range probeRoles {
 		up := 1.0
-		if state, ok := probeByKey[key]; ok && state.known && !state.up {
+		if state, ok := probeByRole[role]; ok && state.known && !state.up {
 			up = 0.0
 		}
-		_, _ = fmt.Fprintf(w, "drive9_db_up{%s} %s\n", dbLabels(key), formatFloat(up))
+		_, _ = fmt.Fprintf(w, "drive9_db_up{role=\"%s\"} %s\n", EscapePromLabel(role), formatFloat(up))
 	}
 
 	_, _ = fmt.Fprintln(w, "# HELP drive9_db_unreachable_pools Registered pools that failed their last health probe by role")
 	_, _ = fmt.Fprintln(w, "# TYPE drive9_db_unreachable_pools gauge")
-	for _, key := range keys {
+	for _, role := range probeRoles {
 		unreachable := 0
-		if state, ok := probeByKey[key]; ok && state.known {
+		if state, ok := probeByRole[role]; ok && state.known {
 			unreachable = state.unreachablePools
 		}
-		_, _ = fmt.Fprintf(w, "drive9_db_unreachable_pools{%s} %d\n", dbLabels(key), unreachable)
+		_, _ = fmt.Fprintf(w, "drive9_db_unreachable_pools{role=\"%s\"} %d\n", EscapePromLabel(role), unreachable)
 	}
 
 	_, _ = fmt.Fprintln(w, "# HELP drive9_db_pool_registered Database pools currently registered for metrics by role")
@@ -370,16 +390,27 @@ func writeDBPrometheus(w http.ResponseWriter) {
 }
 
 func (p registeredDB) metricKey() dbMetricKey {
-	return dbMetricKey{role: cleanMetricValue(p.role, "unknown"), tenantID: cleanMetricValue(p.tenantID, "unknown")}
+	return dbMetricKey{
+		role:     cleanMetricValue(p.role, "unknown"),
+		tenantID: cleanMetricValue(p.tenantID, "unknown"),
+	}
 }
 
-func (p registeredDB) info() DBPoolInfo {
-	key := p.metricKey()
-	info := DBPoolInfo{Role: key.role}
-	if key.tenantID != "unknown" {
-		info.TenantID = key.tenantID
+func (p registeredDB) metricRole() string {
+	return cleanMetricValue(p.role, "unknown")
+}
+
+func (m *dbMetrics) hasPoolLocked(role string) bool {
+	for _, pool := range m.dbs {
+		if pool.metricRole() == role {
+			return true
+		}
 	}
-	return info
+	return false
+}
+
+func (m *dbMetrics) shouldProbePool(pool registeredDB, opts DBHealthProbeOptions) bool {
+	return pool.metricRole() == "meta" && opts.ProbeMeta
 }
 
 func isDBPoolSaturated(db *sql.DB) bool {
@@ -387,13 +418,10 @@ func isDBPoolSaturated(db *sql.DB) bool {
 	return stats.MaxOpenConnections > 0 && stats.Idle == 0 && stats.InUse >= stats.MaxOpenConnections
 }
 
-func observeDBProbeDuration(start time.Time, key dbMetricKey, result string) {
+func observeDBProbeDuration(start time.Time, role, result string) {
 	attrs := []Attribute{
-		Attr("role", key.role),
+		Attr("role", role),
 		Attr("result", result),
-	}
-	if key.tenantID != "" && key.tenantID != "unknown" {
-		attrs = append(attrs, Attr("tenant_id", key.tenantID))
 	}
 	dbProbeDuration.Observe(time.Since(start).Seconds(), attrs...)
 }
