@@ -502,6 +502,12 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 
 	// Fallback poller: reads the central outbox on every pod.
 	poller := newNotifyPoller(s.meta, s.events, cfg.SSENotifyPollInterval)
+	// Initialize the poller cursor synchronously BEFORE starting the goroutine
+	// and BEFORE the server accepts live traffic. This prevents a race where a
+	// write between poller construction and the first MaxSSENotifyID call inside
+	// run() would be skipped (the poller would set lastID to the already-written
+	// row's id and never deliver it). See PR #647 adversary-1 re-review B1.
+	poller.initCursor(context.Background())
 	s.notifyWG.Add(1)
 	go func() {
 		defer s.notifyWG.Done()
