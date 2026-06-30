@@ -1037,6 +1037,44 @@ func TestWriteStreamPeakDiskBounded(t *testing.T) {
 	}
 }
 
+func TestWriteStreamReplacementPeakBounded(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write an initial 50-byte shadow.
+	origData := bytes.Repeat([]byte("A"), 50)
+	if _, err := ss.WriteStream("/f.txt", bytes.NewReader(origData), 1); err != nil {
+		t.Fatalf("initial WriteStream: %v", err)
+	}
+	if p := ss.PendingBytes(); p != 50 {
+		t.Fatalf("expected pending 50, got %d", p)
+	}
+
+	// Replace with 100 bytes. Final pending would be 100 (within quota),
+	// but peak disk is old(50) + tmp(100) = 150 which exceeds quota=100.
+	// The quota check uses the full temp size, so this must ENOSPC.
+	_, err = ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 100)), 2)
+	if err != syscall.ENOSPC {
+		t.Fatalf("expected ENOSPC for replacement peak exceeding quota, got %v", err)
+	}
+
+	// Original shadow must be preserved.
+	if p := ss.PendingBytes(); p != 50 {
+		t.Fatalf("expected pending 50 after rejected replacement, got %d", p)
+	}
+	data, err := ss.ReadAll("/f.txt")
+	if err != nil {
+		t.Fatalf("ReadAll after rejected replacement: %v", err)
+	}
+	if !bytes.Equal(data, origData) {
+		t.Fatalf("shadow content corrupted after rejected replacement")
+	}
+}
+
 func TestEnsureQuotaEnforcement(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota

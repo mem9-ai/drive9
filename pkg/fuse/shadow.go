@@ -411,18 +411,22 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 const quotaCopyBufSize = 32 << 10 // 32KB
 
 // quotaCopy copies from r to dst, checking the byte quota after each chunk.
-// oldSize is the current shadow size used to compute the delta. Returns the
-// total bytes written and ENOSPC if the byte quota is breached mid-stream.
+// During streaming the old shadow file still exists on disk alongside the
+// growing temp file, so peak disk usage is oldSize + tempSize. To bound
+// peak usage, the check uses the full temp size (written+nr) as the
+// required bytes — not just the delta — because both files coexist until
+// the atomic rename.
 func (s *ShadowStore) quotaCopy(dst io.Writer, r io.Reader, oldSize int64) (int64, error) {
 	buf := make([]byte, quotaCopyBufSize)
 	var written int64
 	for {
 		nr, readErr := r.Read(buf)
 		if nr > 0 {
-			// Check byte quota based on cumulative delta before writing.
-			delta := (written + int64(nr)) - oldSize
-			if delta > 0 {
-				if err := s.checkByteQuota(delta); err != nil {
+			// Check byte quota using the full temp file size (not delta)
+			// because the old shadow still occupies disk until rename.
+			tmpSize := written + int64(nr)
+			if tmpSize > 0 {
+				if err := s.checkByteQuota(tmpSize); err != nil {
 					return written, err
 				}
 			}
@@ -487,13 +491,14 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 	_ = tmpFd.Close()
 
 	// Post-stream free-ratio check (Statfs is too expensive to run per chunk).
-	delta := n - oldSize
-	if delta > 0 {
-		if err := s.checkFreeRatio(delta); err != nil {
+	// Use the full temp size (not delta) because old shadow + temp coexist.
+	if n > 0 {
+		if err := s.checkFreeRatio(n); err != nil {
 			_ = os.Remove(tmpPath)
 			return 0, err
 		}
 	}
+	delta := n - oldSize
 
 	// Commit: swap temp file over the shadow file.
 	shadowFile := s.shadowPath(remotePath)
