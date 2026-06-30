@@ -399,11 +399,19 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 }
 
 // WriteStream replaces the shadow contents by streaming from r.
+// Returns ENOSPC if the streamed data would breach disk protection limits.
+// Because the final size is unknown before streaming, the quota check runs
+// post-write; on breach the shadow is truncated back to its previous size.
 func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64) (int64, error) {
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
 		return 0, err
 	}
+
+	s.mu.RLock()
+	oldSize := sf.size
+	s.mu.RUnlock()
+
 	if err := sf.fd.Truncate(0); err != nil {
 		return 0, fmt.Errorf("shadow reset truncate: %w", err)
 	}
@@ -418,12 +426,24 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 		return n, fmt.Errorf("shadow final truncate: %w", err)
 	}
 
+	// Post-write quota check: rollback if breached.
+	delta := n - oldSize
+	if delta > 0 {
+		if err := s.checkQuotaForDelta(delta); err != nil {
+			// Rollback: restore previous size.
+			_ = sf.fd.Truncate(oldSize)
+			s.mu.Lock()
+			sf.size = oldSize
+			s.mu.Unlock()
+			return 0, err
+		}
+	}
+
 	s.mu.Lock()
-	oldSize := sf.size
 	sf.size = n
 	sf.baseRev = baseRev
 	s.mu.Unlock()
-	s.pendingBytes.Add(n - oldSize)
+	s.pendingBytes.Add(delta)
 	return n, nil
 }
 

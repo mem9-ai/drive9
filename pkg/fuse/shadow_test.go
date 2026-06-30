@@ -967,6 +967,37 @@ func TestReStageNoFalseENOSPC(t *testing.T) {
 	}
 }
 
+func TestWriteStreamQuotaEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 100) // 100 byte quota
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// WriteStream within quota should succeed.
+	n, err := ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 50)), 1)
+	if err != nil {
+		t.Fatalf("WriteStream within quota should succeed: %v", err)
+	}
+	if n != 50 {
+		t.Fatalf("expected 50 bytes written, got %d", n)
+	}
+	if p := ss.PendingBytes(); p != 50 {
+		t.Fatalf("expected pending 50, got %d", p)
+	}
+
+	// WriteStream exceeding quota should ENOSPC and rollback.
+	_, err = ss.WriteStream("/f.txt", bytes.NewReader(make([]byte, 200)), 2)
+	if err != syscall.ENOSPC {
+		t.Fatalf("WriteStream exceeding quota should ENOSPC, got %v", err)
+	}
+	// Pending should be rolled back to 50 (previous successful size).
+	if p := ss.PendingBytes(); p != 50 {
+		t.Fatalf("expected pending 50 after rollback, got %d", p)
+	}
+}
+
 func TestCheckWriteBackQuotaThrottled(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStoreWithQuota(dir, 0.10, 0)
