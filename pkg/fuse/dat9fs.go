@@ -277,7 +277,7 @@ func NewDat9FS(c *client.Client, opts *MountOptions) *Dat9FS {
 		readFlight:        NewSingleFlight(),
 		remoteReadTimeout: fuseTimeout,
 		xattrs:            NewXAttrStore(),
-		deletedPaths:     make(map[string]time.Time),
+		deletedPaths:      make(map[string]time.Time),
 	}
 }
 
@@ -2925,7 +2925,12 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 		return syscall.ENOTSUP
 	}
 
-	// Write-back disk protection: check quota before writing snapshot.
+	// Write-back disk protection: best-effort quota pre-check before writing
+	// the snapshot to the writeBack cache directory. This uses shadowStore's
+	// quota config (same partition in typical deployments) as a proxy for the
+	// writeBack dir. All callers treat ENOSPC as degraded (fallback to sync
+	// upload), so the check is advisory — it prevents filling the disk when
+	// possible but does not guarantee hard enforcement.
 	if fs.shadowStore != nil {
 		if err := fs.shadowStore.CheckWriteBackQuota(fh.Dirty.Size()); err != nil {
 			return err
@@ -10116,13 +10121,19 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	}
 	written = n
 
-	// Non-ShadowSpill: write-through to shadow after Dirty (best-effort).
+	// Non-ShadowSpill: write-through to shadow after Dirty (best-effort for
+	// I/O errors, but ENOSPC from quota guard is propagated to the caller so
+	// write-back disk protection is enforced).
 	if !fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
 		shadowStart := time.Now()
 		unlockShadowWrite := fs.lockHandleRemoteCommitPathLocked(fh)
 		_, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev)
 		unlockShadowWrite()
 		if err != nil {
+			if errors.Is(err, syscall.ENOSPC) {
+				source = "shadow-through-nospace"
+				return 0, gofuse.Status(syscall.ENOSPC)
+			}
 			log.Printf("shadow write-through failed for %s: %v", fh.Path, err)
 			fs.shadowStore.Remove(fh.Path)
 			fh.ShadowReady = false

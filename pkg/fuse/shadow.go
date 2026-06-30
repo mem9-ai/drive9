@@ -75,7 +75,6 @@ type ShadowStore struct {
 
 	// Throttled disk space check state (atomic for lock-free fast path).
 	lastDiskCheck    atomic.Int64 // unix nano of last check
-	diskOK           atomic.Bool  // cached result of last check
 	cachedFreeBytes  atomic.Int64 // cached Statfs free bytes (Bavail*Bsize)
 	cachedTotalBytes atomic.Int64 // cached Statfs total bytes (Blocks*Bsize)
 }
@@ -113,7 +112,6 @@ func NewShadowStoreWithQuota(dir string, freeRatio float64, maxBytes int64) (*Sh
 		writeCacheFreeRatio: freeRatio,
 		writeCacheMaxBytes:  maxBytes,
 	}
-	ss.diskOK.Store(true)
 	return ss, nil
 }
 
@@ -138,6 +136,11 @@ func (s *ShadowStore) CheckWriteBackQuota(requiredBytes int64) error {
 }
 
 // checkByteQuota checks the byte quota only (cheap, no syscall).
+// Note: this is a best-effort soft limit. The check is not serialized with
+// pendingBytes.Add, so two concurrent writers on different paths may both
+// pass the check and then both Add, briefly exceeding the quota. This is
+// acceptable because the quota is a safety margin, not a hard guarantee,
+// and the overshoot is bounded by the size of a single write.
 func (s *ShadowStore) checkByteQuota(requiredBytes int64) error {
 	if s.writeCacheMaxBytes > 0 {
 		currentPending := s.pendingBytes.Load()
@@ -183,14 +186,13 @@ func (s *ShadowStore) evalFreeRatio(freeBytes, totalBytes, requiredBytes int64) 
 
 // checkQuotaForDelta checks both byte quota and free-ratio for a shadow write
 // that will change disk usage by delta bytes. Called internally before shadow
-// writes. If delta <= 0 (shrink or no change), only free-ratio is checked.
+// writes. If delta <= 0 (shrink or no change), the check is skipped entirely
+// because shrinks never consume additional disk space.
 func (s *ShadowStore) checkQuotaForDelta(delta int64) error {
 	if delta > 0 {
 		if err := s.checkByteQuota(delta); err != nil {
 			return err
 		}
-	}
-	if delta > 0 {
 		return s.checkFreeRatio(delta)
 	}
 	return nil
@@ -407,9 +409,8 @@ const quotaCopyBufSize = 32 << 10 // 32KB
 // alongside the growing temp file, so peak disk usage is oldSize + tempSize.
 // Both checks use the full temp size (written+nr) as required bytes.
 // The byte quota check runs on every chunk (cheap atomic load). The
-// free-ratio check is throttled via the same diskOK/lastDiskCheck mechanism
-// used by CheckWriteBackQuotaThrottled, so Statfs runs at most once per
-// diskCheckInterval.
+// free-ratio check is throttled via checkFreeRatioThrottled (Statfs cached
+// for diskCheckInterval, re-evaluated against current requiredBytes).
 func (s *ShadowStore) quotaCopy(dst io.Writer, r io.Reader, oldSize int64) (int64, error) {
 	buf := make([]byte, quotaCopyBufSize)
 	var written int64
@@ -467,9 +468,7 @@ func (s *ShadowStore) checkFreeRatioThrottled(requiredBytes int64) error {
 		return nil
 	}
 	if s.lastDiskCheck.CompareAndSwap(last, now) {
-		err := s.checkFreeRatio(requiredBytes)
-		s.diskOK.Store(err == nil)
-		return err
+		return s.checkFreeRatio(requiredBytes)
 	}
 	// CAS loser: use cached capacity values.
 	freeBytes := s.cachedFreeBytes.Load()
@@ -483,9 +482,16 @@ func (s *ShadowStore) checkFreeRatioThrottled(requiredBytes int64) error {
 // WriteStream replaces the shadow contents by streaming from r.
 // Returns ENOSPC if the streamed data would breach disk protection limits.
 // Both byte quota and free-ratio are checked incrementally during streaming
-// via quotaCopy (byte quota every chunk, free-ratio throttled via diskOK).
-// On quota breach the temp file is removed and the original shadow is
-// untouched.
+// via quotaCopy (byte quota every chunk, free-ratio throttled via cached
+// Statfs values). On quota breach the temp file is removed and the original
+// shadow is untouched.
+//
+// Concurrency note: WriteStream swaps sf.fd under s.mu and closes the old fd
+// after releasing the lock. Callers that read the same path concurrently
+// should use Pin/ReadAtGen (generation-pinned reads) rather than ReadAt to
+// avoid a use-after-close race on the fd. All current callers hold the file
+// handle lock during WriteStream, so concurrent unpinned ReadAt on the same
+// path does not occur in practice.
 func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64) (int64, error) {
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
@@ -968,24 +974,32 @@ func (s *ShadowStore) Remove(remotePath string) {
 	_ = os.Remove(sp)
 }
 
-// Rename moves a shadow file from oldPath to newPath.
+// Rename moves a shadow file from oldPath to newPath. If a shadow already
+// exists at newPath, it is replaced and its size is subtracted from
+// pendingBytes (the replacement shadow's disk file is overwritten by the
+// os.Rename).
 func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	sf, ok := s.files[oldPath]
 	if !ok {
+		s.mu.Unlock()
 		return false
 	}
 
 	oldSP := s.shadowPath(oldPath)
 	newSP := s.shadowPath(newPath)
 	if err := os.Rename(oldSP, newSP); err != nil {
+		s.mu.Unlock()
 		return false
 	}
 
 	replacedSF := s.files[newPath]
 	replacedGen := s.active[newPath]
+	var replacedSize int64
+	if replacedSF != nil {
+		replacedSize = replacedSF.size
+	}
 
 	delete(s.files, oldPath)
 	s.files[newPath] = sf
@@ -1012,6 +1026,12 @@ func (s *ShadowStore) Rename(oldPath, newPath string) bool {
 		}
 	} else if replacedSF != nil && replacedSF != sf {
 		_ = replacedSF.fd.Close()
+	}
+	s.mu.Unlock()
+
+	// Adjust pendingBytes: the replaced shadow's disk file is gone.
+	if replacedSize > 0 {
+		s.pendingBytes.Add(-replacedSize)
 	}
 	return true
 }

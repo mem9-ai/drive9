@@ -1160,3 +1160,33 @@ func TestCheckWriteBackQuotaThrottled(t *testing.T) {
 		t.Fatalf("throttled results differ: %v vs %v", err1, err2)
 	}
 }
+
+// TestRenamePendingBytesReplacesTarget verifies that Rename subtracts the
+// replaced target's size from pendingBytes.
+func TestRenamePendingBytesReplacesTarget(t *testing.T) {
+	dir := t.TempDir()
+	ss, err := NewShadowStoreWithQuota(dir, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write src=5B, dst=3B.
+	if err := ss.WriteFull("/src", []byte("hello"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := ss.WriteFull("/dst", []byte("bye"), 1); err != nil {
+		t.Fatal(err)
+	}
+	if pb := ss.PendingBytes(); pb != 8 {
+		t.Fatalf("before rename: pendingBytes=%d, want 8", pb)
+	}
+
+	// Rename /src → /dst replaces the 3B dst shadow.
+	if !ss.Rename("/src", "/dst") {
+		t.Fatal("Rename returned false")
+	}
+	if pb := ss.PendingBytes(); pb != 5 {
+		t.Fatalf("after rename: pendingBytes=%d, want 5", pb)
+	}
+}
