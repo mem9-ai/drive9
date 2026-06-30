@@ -183,6 +183,7 @@ func TestBuildSemanticWorkerConfigFromEnvReadsWorkerOptionsWithoutEmbedder(t *te
 	restore := snapshotEnv(t, keys)
 	t.Cleanup(func() { restoreEnv(t, restore) })
 	unsetEnv(t, keys)
+
 	setEnv(t, "DRIVE9_SEMANTIC_WORKERS", "8")
 	setEnv(t, "DRIVE9_SEMANTIC_TENANT_LIMIT", "512")
 

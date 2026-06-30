@@ -152,6 +152,28 @@ type TenantStoreEntry struct {
 	Store    *datastore.Store
 }
 
+// WarmTenantIDs snapshots tenant IDs whose backends are cached and whose DB
+// pool currently has at least one open connection. It is a best-effort signal
+// for background work that should avoid waking cold tenant databases.
+func (p *Pool) WarmTenantIDs() []string {
+	if p == nil {
+		return nil
+	}
+	p.mu.Lock()
+	out := make([]string, 0, len(p.items))
+	for _, e := range p.items {
+		if e.backend == nil || e.store == nil || e.retired {
+			continue
+		}
+		if e.store.DB().Stats().OpenConnections == 0 {
+			continue
+		}
+		out = append(out, e.tenantID)
+	}
+	p.mu.Unlock()
+	return out
+}
+
 type Pool struct {
 	mu                        sync.Mutex
 	cfg                       PoolConfig
@@ -425,6 +447,27 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 		zap.Float64("create_backend_ms", createBackendDurationMs),
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	return b, p.makeRelease(e), nil
+}
+
+// AcquireCached pins a cached backend without creating one on cache miss. It is
+// intended for background maintenance that may process already-active tenants
+// but must not wake dormant tenant databases.
+func (p *Pool) AcquireCached(tenantID string) (*backend.Dat9Backend, func(), bool) {
+	if p == nil || tenantID == "" {
+		return nil, nil, false
+	}
+	p.mu.Lock()
+	e, ok := p.items[tenantID]
+	if !ok || e.retired || e.backend == nil {
+		p.mu.Unlock()
+		return nil, nil, false
+	}
+	e.refs++
+	p.order.MoveToFront(e.elem)
+	b := e.backend
+	release := p.makeRelease(e)
+	p.mu.Unlock()
+	return b, release, true
 }
 
 func (p *Pool) Invalidate(tenantID string) {

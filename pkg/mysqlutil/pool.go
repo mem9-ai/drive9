@@ -13,9 +13,9 @@ const (
 	defaultMetaConnMaxIdleTime       = 45 * time.Second
 	defaultMetaMaxOpenConns          = 100
 	defaultMetaMaxIdleConns          = 20
-	defaultUserConnMaxLifetime       = 30 * time.Second
+	defaultUserConnMaxLifetime       = 45 * time.Second
 	defaultUserConnMaxIdleTime       = 30 * time.Second
-	defaultUserMaxOpenConns          = 4
+	defaultUserMaxOpenConns          = 6
 	defaultUserMaxIdleConns          = 1
 	defaultUserSchemaConnMaxLifetime = 1 * time.Minute
 	defaultUserSchemaConnMaxIdleTime = 10 * time.Second
@@ -46,6 +46,12 @@ func ApplyPoolDefaults(db *sql.DB, role string) {
 	if v := poolEnvInt(role, "MAX_IDLE_CONNS", maxIdle); v >= 0 {
 		db.SetMaxIdleConns(v)
 	}
+}
+
+// DefaultUserConnMaxLifetime returns the default maximum lifetime for tenant
+// user DB connections.
+func DefaultUserConnMaxLifetime() time.Duration {
+	return defaultUserConnMaxLifetime
 }
 
 func defaultPoolLifetime(role string) (time.Duration, time.Duration) {

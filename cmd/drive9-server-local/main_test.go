@@ -248,6 +248,7 @@ func TestBuildSemanticWorkerConfigFromEnvReadsWorkerOptionsWithoutEmbedder(t *te
 	for _, key := range keys {
 		_ = os.Unsetenv(key)
 	}
+
 	if err := os.Setenv("DRIVE9_SEMANTIC_WORKERS", "8"); err != nil {
 		t.Fatal(err)
 	}

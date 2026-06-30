@@ -100,10 +100,10 @@ type Config struct {
 	// authentication. When set, the pod-to-pod push path is enabled; when nil,
 	// only the 200ms poller fallback is used (no push).
 	SSENotifyPollInterval time.Duration
-	SSENotifyRetention     time.Duration
-	PodID                  string
-	PodAddr                string
-	PodNotifySecret        []byte
+	SSENotifyRetention    time.Duration
+	PodID                 string
+	PodAddr               string
+	PodNotifySecret       []byte
 }
 
 type SlockOAuthClient interface {
@@ -319,7 +319,7 @@ func NewWithConfig(cfg Config) *Server {
 		leader:              cfg.Leader,
 		podNotifySecret:     cfg.PodNotifySecret,
 		sseNotifyRetention:  cfg.SSENotifyRetention,
-		}
+	}
 	// Default SSE notify retention.
 	if s.sseNotifyRetention <= 0 {
 		s.sseNotifyRetention = defaultSSENotifyRetention
@@ -1006,8 +1006,11 @@ func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallba
 		fields := []zap.Field{
 			zap.Int("workers", s.semanticWorker.opts.Workers),
 			zap.Duration("poll_interval", s.semanticWorker.opts.PollInterval),
+			zap.Duration("warm_tenant_poll_interval", s.semanticWorker.opts.WarmTenantPollInterval),
+			zap.Duration("effective_poll_interval", s.semanticWorker.effectivePollInterval()),
 			zap.Duration("lease_duration", s.semanticWorker.opts.LeaseDuration),
 			zap.Duration("recover_interval", s.semanticWorker.opts.RecoverInterval),
+			zap.Duration("effective_recover_interval", s.semanticWorker.effectiveRecoverInterval()),
 			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
 			zap.Strings("app_managed_task_types", appManagedTaskTypes),
 			zap.Strings("fallback_task_types", fallbackTaskTypes),
