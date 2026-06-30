@@ -70,7 +70,7 @@ type ShadowStore struct {
 	// optional byte quota. See CheckWriteBackQuota.
 	writeCacheFreeRatio float64      // minimum free-space ratio (default 0.10); 0 disables
 	writeCacheMaxBytes  int64        // byte quota for write-back pending (0 = disabled)
-	pendingBytes        atomic.Int64 // current pending bytes tracked by Add/SubPendingBytes
+	pendingBytes        atomic.Int64 // current shadow bytes on disk; updated internally by write/remove methods
 
 	// Throttled disk space check state (atomic for lock-free fast path).
 	lastDiskCheck atomic.Int64 // unix nano of last check
