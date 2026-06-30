@@ -931,6 +931,42 @@ func TestPendingBytesNoDoubleCount(t *testing.T) {
 	}
 }
 
+func TestReStageNoFalseENOSPC(t *testing.T) {
+	dir := t.TempDir()
+	// Quota is 1000 bytes.
+	ss, err := NewShadowStoreWithQuota(dir, 0, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ss.Close()
+
+	// Write 800 bytes — within quota.
+	if err := ss.WriteFull("/f.txt", make([]byte, 800), 1); err != nil {
+		t.Fatalf("first write should succeed: %v", err)
+	}
+
+	// Re-stage same path with same 800 bytes — delta is 0, should NOT reject.
+	if err := ss.WriteFull("/f.txt", make([]byte, 800), 2); err != nil {
+		t.Fatalf("re-stage same size should succeed (delta=0): %v", err)
+	}
+
+	// Re-stage with 900 bytes — delta is 100, total 900 < 1000, should succeed.
+	if err := ss.WriteFull("/f.txt", make([]byte, 900), 3); err != nil {
+		t.Fatalf("re-stage with 100 byte growth should succeed: %v", err)
+	}
+
+	// Re-stage with 1100 bytes — delta is 200, total 1100 > 1000, should ENOSPC.
+	err = ss.WriteFull("/f.txt", make([]byte, 1100), 4)
+	if err != syscall.ENOSPC {
+		t.Fatalf("re-stage exceeding quota should ENOSPC, got %v", err)
+	}
+
+	// Pending should still be 900 (last successful write).
+	if p := ss.PendingBytes(); p != 900 {
+		t.Fatalf("expected pending 900 after rejected write, got %d", p)
+	}
+}
+
 func TestCheckWriteBackQuotaThrottled(t *testing.T) {
 	dir := t.TempDir()
 	ss, err := NewShadowStoreWithQuota(dir, 0.10, 0)

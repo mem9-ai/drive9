@@ -2833,11 +2833,6 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 
 	size := fh.Dirty.Size()
 
-	// Write-back disk protection: check quota before writing shadow.
-	if err := fs.shadowStore.CheckWriteBackQuota(size); err != nil {
-		return err
-	}
-
 	if fh.ShadowReady && fh.ShadowSpill {
 		if err := fs.shadowStore.Truncate(fh.Path, size, fh.BaseRev); err != nil {
 			return err
@@ -10095,15 +10090,15 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	// EIO without touching Dirty — OnPartFull may evict the part, so writing
 	// Dirty first could lose data if shadow then fails.
 	if fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
-		if err := fs.shadowStore.CheckWriteBackQuotaThrottled(int64(len(data))); err != nil {
-			source = "shadow-spill-nospace"
-			return 0, gofuse.Status(syscall.ENOSPC)
-		}
 		shadowStart := time.Now()
 		unlockShadowWrite := fs.lockHandleRemoteCommitPathLocked(fh)
 		_, err := fs.shadowStore.WriteAt(fh.Path, writeOffset, data, fh.BaseRev)
 		unlockShadowWrite()
 		if err != nil {
+			if errors.Is(err, syscall.ENOSPC) {
+				source = "shadow-spill-nospace"
+				return 0, gofuse.Status(syscall.ENOSPC)
+			}
 			log.Printf("shadow write failed for ShadowSpill %s: %v", fh.Path, err)
 			source = "shadow-spill-error"
 			return 0, gofuse.EIO

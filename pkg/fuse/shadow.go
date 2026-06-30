@@ -122,14 +122,20 @@ func (s *ShadowStore) shadowPath(remotePath string) string {
 // CheckWriteBackQuota checks whether a write of requiredBytes would violate
 // the write-back disk protection policy. Returns nil if the write is allowed,
 // or syscall.ENOSPC if it would breach either the free-space ratio or the
-// byte quota. The check is atomic: it predicts the post-write state and
-// rejects before any bytes are written.
+// byte quota.
 //
-// This is the single guard checkpoint for all write-back local disk writes
-// (shadow, pending, journal). Callers should invoke this before creating or
-// extending shadow files.
+// For external callers (non-shadow write paths like WriteBackCache snapshots),
+// requiredBytes is the full write size. For internal shadow writes, the
+// ShadowStore methods call checkQuotaForDelta with the actual delta.
 func (s *ShadowStore) CheckWriteBackQuota(requiredBytes int64) error {
-	// Check 1: byte quota (if enabled).
+	if err := s.checkByteQuota(requiredBytes); err != nil {
+		return err
+	}
+	return s.checkFreeRatio(requiredBytes)
+}
+
+// checkByteQuota checks the byte quota only (cheap, no syscall).
+func (s *ShadowStore) checkByteQuota(requiredBytes int64) error {
 	if s.writeCacheMaxBytes > 0 {
 		currentPending := s.pendingBytes.Load()
 		if currentPending+requiredBytes > s.writeCacheMaxBytes {
@@ -138,8 +144,11 @@ func (s *ShadowStore) CheckWriteBackQuota(requiredBytes int64) error {
 			return syscall.ENOSPC
 		}
 	}
+	return nil
+}
 
-	// Check 2: free-space ratio (if enabled).
+// checkFreeRatio checks the free-space ratio (requires Statfs syscall).
+func (s *ShadowStore) checkFreeRatio(requiredBytes int64) error {
 	if s.writeCacheFreeRatio > 0 {
 		var stat syscall.Statfs_t
 		if err := syscall.Statfs(s.dir, &stat); err == nil {
@@ -157,43 +166,50 @@ func (s *ShadowStore) CheckWriteBackQuota(requiredBytes int64) error {
 		}
 		// If Statfs fails, allow the write (cannot check).
 	}
-
 	return nil
 }
 
-// CheckWriteBackQuotaThrottled is a throttled version of CheckWriteBackQuota
-// that caches the result for diskCheckInterval. Safe for hot-path use.
-// requiredBytes is used for the actual Statfs check but the cached result
-// applies to all callers during the throttle window.
+// checkQuotaForDelta checks both byte quota and free-ratio for a shadow write
+// that will change disk usage by delta bytes. Called internally before shadow
+// writes. If delta <= 0 (shrink or no change), only free-ratio is checked.
+func (s *ShadowStore) checkQuotaForDelta(delta int64) error {
+	if delta > 0 {
+		if err := s.checkByteQuota(delta); err != nil {
+			return err
+		}
+	}
+	if delta > 0 {
+		return s.checkFreeRatio(delta)
+	}
+	return nil
+}
+
+// CheckWriteBackQuotaThrottled is a throttled version of CheckWriteBackQuota.
+// The Statfs result is cached for diskCheckInterval; the byte quota check
+// always runs fresh (it is cheap — just an atomic load).
 func (s *ShadowStore) CheckWriteBackQuotaThrottled(requiredBytes int64) error {
+	// Byte quota check always runs (cheap, no syscall).
+	if err := s.checkByteQuota(requiredBytes); err != nil {
+		return err
+	}
+
+	// Free-ratio check is throttled via CAS.
 	now := time.Now().UnixNano()
 	last := s.lastDiskCheck.Load()
 	if now-last < int64(diskCheckInterval) {
 		if !s.diskOK.Load() {
 			return syscall.ENOSPC
 		}
-		// Cached OK but still check byte quota (cheap, no syscall).
-		if s.writeCacheMaxBytes > 0 {
-			if s.pendingBytes.Load()+requiredBytes > s.writeCacheMaxBytes {
-				return syscall.ENOSPC
-			}
-		}
 		return nil
 	}
-	// CAS to avoid concurrent syscalls.
 	if s.lastDiskCheck.CompareAndSwap(last, now) {
-		err := s.CheckWriteBackQuota(requiredBytes)
+		err := s.checkFreeRatio(requiredBytes)
 		s.diskOK.Store(err == nil)
 		return err
 	}
+	// CAS loser: use cached Statfs result.
 	if !s.diskOK.Load() {
 		return syscall.ENOSPC
-	}
-	// CAS loser: still check byte quota (cheap, no syscall).
-	if s.writeCacheMaxBytes > 0 {
-		if s.pendingBytes.Load()+requiredBytes > s.writeCacheMaxBytes {
-			return syscall.ENOSPC
-		}
 	}
 	return nil
 }
@@ -308,34 +324,56 @@ func (s *ShadowStore) WriteAt(remotePath string, offset int64, data []byte, base
 		return 0, err
 	}
 
+	// Pre-check: estimate growth delta.
+	end := offset + int64(len(data))
+	s.mu.RLock()
+	oldSize := sf.size
+	s.mu.RUnlock()
+	if delta := end - oldSize; delta > 0 {
+		if err := s.checkQuotaForDelta(delta); err != nil {
+			return 0, err
+		}
+	}
+
 	n, err := sf.fd.WriteAt(data, offset)
 	if err != nil {
 		return n, fmt.Errorf("shadow write at %d: %w", offset, err)
 	}
 
-	end := offset + int64(n)
+	actualEnd := offset + int64(n)
 	s.mu.Lock()
-	oldSize := sf.size
-	if end > sf.size {
-		sf.size = end
+	prevSize := sf.size
+	if actualEnd > sf.size {
+		sf.size = actualEnd
 	}
 	if baseRev != 0 {
 		sf.baseRev = baseRev
 	}
 	newSize := sf.size
 	s.mu.Unlock()
-	if delta := newSize - oldSize; delta > 0 {
+	if delta := newSize - prevSize; delta > 0 {
 		s.pendingBytes.Add(delta)
 	}
 	return n, nil
 }
 
 // WriteFull replaces the shadow contents with a full snapshot.
+// Returns ENOSPC if the write would breach disk protection limits.
 func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) error {
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
 		return err
 	}
+
+	newSize := int64(len(data))
+	s.mu.RLock()
+	oldSize := sf.size
+	s.mu.RUnlock()
+	delta := newSize - oldSize
+	if err := s.checkQuotaForDelta(delta); err != nil {
+		return err
+	}
+
 	if err := sf.fd.Truncate(0); err != nil {
 		return fmt.Errorf("shadow reset truncate: %w", err)
 	}
@@ -348,17 +386,15 @@ func (s *ShadowStore) WriteFull(remotePath string, data []byte, baseRev int64) e
 			return fmt.Errorf("shadow write full: short write %d/%d", n, len(data))
 		}
 	}
-	if err := sf.fd.Truncate(int64(len(data))); err != nil {
+	if err := sf.fd.Truncate(newSize); err != nil {
 		return fmt.Errorf("shadow final truncate: %w", err)
 	}
 
-	newSize := int64(len(data))
 	s.mu.Lock()
-	oldSize := sf.size
 	sf.size = newSize
 	sf.baseRev = baseRev
 	s.mu.Unlock()
-	s.pendingBytes.Add(newSize - oldSize)
+	s.pendingBytes.Add(delta)
 	return nil
 }
 
@@ -392,23 +428,32 @@ func (s *ShadowStore) WriteStream(remotePath string, r io.Reader, baseRev int64)
 }
 
 // Truncate updates the shadow file length without syncing it.
+// Returns ENOSPC if the growth would breach disk protection limits.
 func (s *ShadowStore) Truncate(remotePath string, size int64, baseRev int64) error {
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
 		return err
 	}
+
+	s.mu.RLock()
+	oldSize := sf.size
+	s.mu.RUnlock()
+	delta := size - oldSize
+	if err := s.checkQuotaForDelta(delta); err != nil {
+		return err
+	}
+
 	if err := sf.fd.Truncate(size); err != nil {
 		return fmt.Errorf("shadow truncate: %w", err)
 	}
 
 	s.mu.Lock()
-	oldSize := sf.size
 	sf.size = size
 	if baseRev != 0 {
 		sf.baseRev = baseRev
 	}
 	s.mu.Unlock()
-	s.pendingBytes.Add(size - oldSize)
+	s.pendingBytes.Add(delta)
 	return nil
 }
 
@@ -431,6 +476,17 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 	sf, err := s.ensureShadowFile(remotePath, baseRev)
 	if err != nil {
 		return err
+	}
+
+	// Pre-check quota for the growth delta.
+	newSize := wb.Size()
+	s.mu.RLock()
+	oldSizeEst := sf.size
+	s.mu.RUnlock()
+	if delta := newSize - oldSizeEst; delta > 0 {
+		if err := s.checkQuotaForDelta(delta); err != nil {
+			return err
+		}
 	}
 
 	// Write each dirty part at its correct offset.
@@ -466,7 +522,6 @@ func (s *ShadowStore) WriteExtents(remotePath string, wb *WriteBuffer, baseRev i
 	}
 
 	// Update shadow file metadata.
-	newSize := wb.Size()
 	s.mu.Lock()
 	oldSize := sf.size
 	sf.size = newSize
