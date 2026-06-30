@@ -514,6 +514,9 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 	if cfg.PodID != "" {
 		reg := newPodRegistry(s.meta, cfg.PodID, cfg.PodAddr, s.events)
 		s.podRegistry = reg
+		// Synchronous initial registration so this pod is visible in
+		// ListActivePods immediately (not after the first heartbeat tick).
+		reg.RegisterBeforeStart(context.Background())
 		go reg.Start(notifyCtx)
 	}
 

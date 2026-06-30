@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -154,8 +155,22 @@ func newSSEOutboxTestCluster(t *testing.T) *sseOutboxTestCluster {
 		return pool
 	}
 
-	// Pod A: create server first, then wire the httptest server's handler to
-	// delegate to it. This avoids forward-reference issues.
+	// Pre-allocate httptest listeners so we know the addresses before creating
+	// the servers. This lets us pass the correct PodAddr to NewWithConfig.
+	lnA, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lnA.Close() })
+	lnB, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lnB.Close() })
+	podAAddr := "http://" + lnA.Addr().String()
+	podBAddr := "http://" + lnB.Addr().String()
+
+	// Pod A: create server with the pre-allocated address.
 	leaderMgrA := leader.NewManager(nil, leader.WithDisabled())
 	podA := NewWithConfig(Config{
 		Meta:            metaStore,
@@ -164,26 +179,23 @@ func newSSEOutboxTestCluster(t *testing.T) *sseOutboxTestCluster {
 		TokenSecret:     tokenSecret,
 		S3Dir:           s3Dir,
 		PodID:           "pod-a",
+		PodAddr:         podAAddr,
 		PodNotifySecret: podNotifySecret,
 		Leader:          leaderMgrA,
 		Logger:          zap.NewNop(),
 	})
 	t.Cleanup(func() { podA.Close() })
 
-	podASrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	podASrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == sseNotifyInternalRoute {
 			podA.handleInternalSSENotify(w, r)
 			return
 		}
 		http.NotFound(w, r)
 	}))
+	podASrv.Listener = lnA
+	podASrv.Start()
 	t.Cleanup(podASrv.Close)
-	// Update PodA's addr now that we know the test server's address.
-	// The podRegistry and podNotifier were started with PodAddr="" initially;
-	// we manually register the correct address.
-	if err := metaStore.UpsertPod(context.Background(), "pod-a", podASrv.URL); err != nil {
-		t.Fatal(err)
-	}
 
 	// Pod B.
 	leaderMgrB := leader.NewManager(nil, leader.WithDisabled())
@@ -194,23 +206,23 @@ func newSSEOutboxTestCluster(t *testing.T) *sseOutboxTestCluster {
 		TokenSecret:     tokenSecret,
 		S3Dir:           s3Dir,
 		PodID:           "pod-b",
+		PodAddr:         podBAddr,
 		PodNotifySecret: podNotifySecret,
 		Leader:          leaderMgrB,
 		Logger:          zap.NewNop(),
 	})
 	t.Cleanup(func() { podB.Close() })
 
-	podBSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	podBSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == sseNotifyInternalRoute {
 			podB.handleInternalSSENotify(w, r)
 			return
 		}
 		http.NotFound(w, r)
 	}))
+	podBSrv.Listener = lnB
+	podBSrv.Start()
 	t.Cleanup(podBSrv.Close)
-	if err := metaStore.UpsertPod(context.Background(), "pod-b", podBSrv.URL); err != nil {
-		t.Fatal(err)
-	}
 
 	return &sseOutboxTestCluster{
 		metaStore: metaStore,
@@ -317,8 +329,8 @@ func TestSSEOutboxCrossPodPushDelivery(t *testing.T) {
 func TestSSEOutboxPodRegistryHeartbeat(t *testing.T) {
 	tc := newSSEOutboxTestCluster(t)
 
-	// Both pods were manually registered with UpsertPod in newSSEOutboxTestCluster.
-	// Verify they appear in ListActivePods.
+	// Both pods auto-register via the heartbeat loop on Start (initial
+	// heartbeat is synchronous). Verify they appear in ListActivePods.
 	pods, err := tc.metaStore.ListActivePods(context.Background(), "pod-a")
 	if err != nil {
 		t.Fatal(err)

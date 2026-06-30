@@ -55,21 +55,40 @@ func newPodRegistry(metaStore *meta.Store, podID, addr string, buses *eventBuses
 	}
 }
 
-// Start launches the heartbeat and subscription-reporting goroutines. Both
-// run on every pod (not leader-gated). They block until ctx is cancelled.
+// Start launches the subscription-reporting goroutine (heartbeat is handled
+// by the caller via RegisterBeforeStart for synchronous initial registration).
+// Runs on every pod (not leader-gated). Blocks until ctx is cancelled.
 func (pr *podRegistry) Start(ctx context.Context) {
-	// Initial heartbeat so this pod appears in pod_registry immediately.
+	go pr.subscriptionLoop(ctx)
+	if pr.addr != "" {
+		go pr.heartbeatLoop(ctx)
+	}
+}
+
+// RegisterBeforeStart performs the initial synchronous heartbeat so this pod
+// appears in pod_registry immediately (before any background goroutine). This
+// lets callers (and tests) observe the pod in ListActivePods without waiting
+// for the first ticker. Skip if addr is empty.
+func (pr *podRegistry) RegisterBeforeStart(ctx context.Context) {
+	if pr.addr == "" {
+		return
+	}
 	if err := pr.metaStore.UpsertPod(ctx, pr.podID, pr.addr); err != nil {
 		logger.Warn(ctx, "pod_registry_initial_heartbeat_failed",
 			zap.String("pod_id", pr.podID),
 			zap.Error(err))
 	}
-	go pr.heartbeatLoop(ctx)
-	go pr.subscriptionLoop(ctx)
 }
 
 // heartbeatLoop upserts this pod's row in pod_registry at a fixed interval.
+// Skips if addr is empty (pod has no reachable address yet).
 func (pr *podRegistry) heartbeatLoop(ctx context.Context) {
+	if pr.addr == "" {
+		// No address to register — don't poll. The subscription loop still
+		// runs so this pod reports its subscriber set.
+		<-ctx.Done()
+		return
+	}
 	ticker := time.NewTicker(podHeartbeatInterval)
 	defer ticker.Stop()
 	for {
