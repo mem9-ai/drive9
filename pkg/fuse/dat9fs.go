@@ -2832,6 +2832,12 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 	fs.adoptCommittedRevisionLocked(fh)
 
 	size := fh.Dirty.Size()
+
+	// Write-back disk protection: check quota before writing shadow.
+	if err := fs.shadowStore.CheckWriteBackQuota(size); err != nil {
+		return err
+	}
+
 	if fh.ShadowReady && fh.ShadowSpill {
 		if err := fs.shadowStore.Truncate(fh.Path, size, fh.BaseRev); err != nil {
 			return err
@@ -2842,6 +2848,9 @@ func (fs *Dat9FS) stageShadowLocked(fh *FileHandle, durable bool) error {
 		}
 		fh.ShadowReady = true
 	}
+
+	// Track pending bytes for byte quota enforcement.
+	fs.shadowStore.AddPendingBytes(size)
 
 	if durable {
 		if err := fs.shadowStore.Sync(fh.Path); err != nil {
@@ -2923,6 +2932,14 @@ func (fs *Dat9FS) snapshotWriteBackLocked(fh *FileHandle) error {
 	if !fh.ShadowReady && !fh.IsNew && !fh.Dirty.CanMaterializeFull() {
 		return syscall.ENOTSUP
 	}
+
+	// Write-back disk protection: check quota before writing snapshot.
+	if fs.shadowStore != nil {
+		if err := fs.shadowStore.CheckWriteBackQuota(fh.Dirty.Size()); err != nil {
+			return err
+		}
+	}
+
 	mode, hasMode := fs.modeForPendingHandle(fh)
 
 	bvStart := time.Now()
@@ -10081,8 +10098,7 @@ func (fs *Dat9FS) Write(cancel <-chan struct{}, input *gofuse.WriteIn, data []by
 	// EIO without touching Dirty — OnPartFull may evict the part, so writing
 	// Dirty first could lose data if shadow then fails.
 	if fh.ShadowSpill && fh.ShadowReady && fs.shadowStore != nil {
-		if !fs.shadowStore.CheckDiskSpaceThrottled() {
-			log.Printf("shadow write rejected for %s: disk space below watermark", fh.Path)
+		if err := fs.shadowStore.CheckWriteBackQuotaThrottled(int64(len(data))); err != nil {
 			source = "shadow-spill-nospace"
 			return 0, gofuse.Status(syscall.ENOSPC)
 		}
@@ -12503,6 +12519,10 @@ func (fs *Dat9FS) onWriteBackUploadSuccess(meta WriteBackMeta, committedRev int6
 func (fs *Dat9FS) onCommitQueueCleanup(entry *CommitEntry) {
 	if entry == nil || entry.Inode == 0 {
 		return
+	}
+	// Release pending byte quota after successful commit cleanup.
+	if fs.shadowStore != nil && entry.Size > 0 {
+		fs.shadowStore.SubPendingBytes(entry.Size)
 	}
 	fs.clearRemovedCommittedShadowForOpenHandles(entry.Path, fs.latestCommittedRevision(entry.Path), entry.Size)
 	fs.cleanupCommittedInode(entry.Inode, entry.Path)

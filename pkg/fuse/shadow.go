@@ -3,6 +3,7 @@ package fuse
 import (
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,9 +16,10 @@ import (
 // smallFileShadowThreshold is the maximum file size for cached I/O mode.
 const smallFileShadowThreshold = 64 << 20 // 64MB
 
-// diskWatermarkBytes is the minimum free disk space before ShadowStore
-// refuses to stage new writes and logs a warning.
-const diskWatermarkBytes = 1 << 30 // 1GB
+// defaultWriteCacheFreeRatio is the default minimum free-space ratio for
+// the cache-dir partition. When the ratio would drop below this after a
+// write, ShadowStore refuses the write with ENOSPC.
+const defaultWriteCacheFreeRatio = 0.10
 
 // diskCheckInterval is the minimum time between disk space checks.
 const diskCheckInterval = 5 * time.Second
@@ -64,6 +66,12 @@ type ShadowStore struct {
 	refs    map[uint64]int32          // generation → active pin count
 	retired map[uint64]*retiredShadow // generation → retired shadow awaiting unpin
 
+	// Write-back disk protection: configurable free-space ratio guard and
+	// optional byte quota. See CheckWriteBackQuota.
+	writeCacheFreeRatio float64      // minimum free-space ratio (default 0.10); 0 disables
+	writeCacheMaxBytes  int64        // byte quota for write-back pending (0 = disabled)
+	pendingBytes        atomic.Int64 // current pending bytes tracked by Add/SubPendingBytes
+
 	// Throttled disk space check state (atomic for lock-free fast path).
 	lastDiskCheck atomic.Int64 // unix nano of last check
 	diskOK        atomic.Bool  // cached result of last check
@@ -71,6 +79,14 @@ type ShadowStore struct {
 
 // NewShadowStore creates a ShadowStore rooted at dir.
 func NewShadowStore(dir string) (*ShadowStore, error) {
+	return NewShadowStoreWithQuota(dir, defaultWriteCacheFreeRatio, 0)
+}
+
+// NewShadowStoreWithQuota creates a ShadowStore with configurable write-back
+// disk protection. freeRatio is the minimum free-space ratio on the cache-dir
+// partition (0 disables the check). maxBytes is an optional byte quota for
+// total pending write-back data (0 disables).
+func NewShadowStoreWithQuota(dir string, freeRatio float64, maxBytes int64) (*ShadowStore, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("shadow store dir: %w", err)
 	}
@@ -85,12 +101,14 @@ func NewShadowStore(dir string) (*ShadowStore, error) {
 		}
 	}
 	ss := &ShadowStore{
-		dir:     dir,
-		files:   make(map[string]*ShadowFile),
-		active:  make(map[string]uint64),
-		genFile: make(map[uint64]*ShadowFile),
-		refs:    make(map[uint64]int32),
-		retired: make(map[uint64]*retiredShadow),
+		dir:                 dir,
+		files:               make(map[string]*ShadowFile),
+		active:              make(map[string]uint64),
+		genFile:             make(map[uint64]*ShadowFile),
+		refs:                make(map[uint64]int32),
+		retired:             make(map[uint64]*retiredShadow),
+		writeCacheFreeRatio: freeRatio,
+		writeCacheMaxBytes:  maxBytes,
 	}
 	ss.diskOK.Store(true)
 	return ss, nil
@@ -101,31 +119,129 @@ func (s *ShadowStore) shadowPath(remotePath string) string {
 	return filepath.Join(s.dir, hashPath(remotePath)+".shadow")
 }
 
-// CheckDiskSpace returns true if there is sufficient disk space for writes.
-func (s *ShadowStore) CheckDiskSpace() bool {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(s.dir, &stat); err != nil {
-		return true // cannot check, assume OK
+// CheckWriteBackQuota checks whether a write of requiredBytes would violate
+// the write-back disk protection policy. Returns nil if the write is allowed,
+// or syscall.ENOSPC if it would breach either the free-space ratio or the
+// byte quota. The check is atomic: it predicts the post-write state and
+// rejects before any bytes are written.
+//
+// This is the single guard checkpoint for all write-back local disk writes
+// (shadow, pending, journal). Callers should invoke this before creating or
+// extending shadow files.
+func (s *ShadowStore) CheckWriteBackQuota(requiredBytes int64) error {
+	// Check 1: byte quota (if enabled).
+	if s.writeCacheMaxBytes > 0 {
+		currentPending := s.pendingBytes.Load()
+		if currentPending+requiredBytes > s.writeCacheMaxBytes {
+			log.Printf("write-back quota rejected: cache_dir=%s pending_bytes=%d required_bytes=%d quota_bytes=%d reason=byte_quota_exceeded",
+				s.dir, currentPending, requiredBytes, s.writeCacheMaxBytes)
+			return syscall.ENOSPC
+		}
 	}
-	avail := int64(stat.Bavail) * int64(stat.Bsize)
-	return avail >= diskWatermarkBytes
+
+	// Check 2: free-space ratio (if enabled).
+	if s.writeCacheFreeRatio > 0 {
+		var stat syscall.Statfs_t
+		if err := syscall.Statfs(s.dir, &stat); err == nil {
+			totalBytes := int64(stat.Blocks) * int64(stat.Bsize)
+			freeBytes := int64(stat.Bavail) * int64(stat.Bsize)
+			freeAfterWrite := freeBytes - requiredBytes
+			if totalBytes > 0 {
+				ratioAfterWrite := float64(freeAfterWrite) / float64(totalBytes)
+				if ratioAfterWrite < s.writeCacheFreeRatio {
+					log.Printf("write-back quota rejected: cache_dir=%s free_bytes=%d required_bytes=%d free_ratio=%.4f threshold=%.4f reason=free_ratio_exceeded",
+						s.dir, freeBytes, requiredBytes, ratioAfterWrite, s.writeCacheFreeRatio)
+					return syscall.ENOSPC
+				}
+			}
+		}
+		// If Statfs fails, allow the write (cannot check).
+	}
+
+	return nil
+}
+
+// CheckWriteBackQuotaThrottled is a throttled version of CheckWriteBackQuota
+// that caches the result for diskCheckInterval. Safe for hot-path use.
+// requiredBytes is used for the actual Statfs check but the cached result
+// applies to all callers during the throttle window.
+func (s *ShadowStore) CheckWriteBackQuotaThrottled(requiredBytes int64) error {
+	now := time.Now().UnixNano()
+	last := s.lastDiskCheck.Load()
+	if now-last < int64(diskCheckInterval) {
+		if !s.diskOK.Load() {
+			return syscall.ENOSPC
+		}
+		// Cached OK but still check byte quota (cheap, no syscall).
+		if s.writeCacheMaxBytes > 0 {
+			if s.pendingBytes.Load()+requiredBytes > s.writeCacheMaxBytes {
+				return syscall.ENOSPC
+			}
+		}
+		return nil
+	}
+	// CAS to avoid concurrent syscalls.
+	if s.lastDiskCheck.CompareAndSwap(last, now) {
+		err := s.CheckWriteBackQuota(requiredBytes)
+		s.diskOK.Store(err == nil)
+		return err
+	}
+	if !s.diskOK.Load() {
+		return syscall.ENOSPC
+	}
+	return nil
+}
+
+// AddPendingBytes adds n bytes to the pending write-back byte counter.
+// Called when shadow data is staged for upload.
+func (s *ShadowStore) AddPendingBytes(n int64) {
+	s.pendingBytes.Add(n)
+}
+
+// SubPendingBytes subtracts n bytes from the pending write-back byte counter.
+// Called when a commit succeeds and local pending data is cleaned up.
+func (s *ShadowStore) SubPendingBytes(n int64) {
+	s.pendingBytes.Add(-n)
+}
+
+// PendingBytes returns the current pending write-back byte count.
+func (s *ShadowStore) PendingBytes() int64 {
+	return s.pendingBytes.Load()
+}
+
+// RecoverPendingBytes scans the shadow directory and sets the pending byte
+// counter to the sum of all shadow file sizes. Called once at startup after
+// crash recovery to restore the accurate byte count.
+func (s *ShadowStore) RecoverPendingBytes() {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return
+	}
+	var total int64
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".shadow" {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			continue
+		}
+		total += fi.Size()
+	}
+	s.pendingBytes.Store(total)
+}
+
+// CheckDiskSpace returns true if there is sufficient disk space for writes.
+// Deprecated: use CheckWriteBackQuota for configurable protection.
+func (s *ShadowStore) CheckDiskSpace() bool {
+	return s.CheckWriteBackQuota(0) == nil
 }
 
 // CheckDiskSpaceThrottled returns the cached disk space result, refreshing at
 // most once per diskCheckInterval. Safe for hot-path use (lock-free fast path).
+// Deprecated: use CheckWriteBackQuotaThrottled for configurable protection.
 func (s *ShadowStore) CheckDiskSpaceThrottled() bool {
-	now := time.Now().UnixNano()
-	last := s.lastDiskCheck.Load()
-	if now-last < int64(diskCheckInterval) {
-		return s.diskOK.Load()
-	}
-	// CAS to avoid concurrent syscalls.
-	if s.lastDiskCheck.CompareAndSwap(last, now) {
-		ok := s.CheckDiskSpace()
-		s.diskOK.Store(ok)
-		return ok
-	}
-	return s.diskOK.Load()
+	return s.CheckWriteBackQuotaThrottled(0) == nil
 }
 
 func (s *ShadowStore) ensureShadowFile(remotePath string, baseRev int64) (*ShadowFile, error) {

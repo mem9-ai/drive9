@@ -62,6 +62,8 @@ type mountFuseOptions struct {
 	UploadConcurrency       int
 	DirCacheMaxEntries      int
 	CommitQueueMaxPending   int
+	WriteCacheFreeRatio     float64
+	WriteCacheSizeMB        int64
 	ReadConcurrency         int
 	ParallelReadConcurrency int
 	ParallelReadBlockSize   int64
