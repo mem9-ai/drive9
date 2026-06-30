@@ -59,7 +59,7 @@ type MountOptions struct {
 	PackPaths               []string      // local overlay paths auto-packed after unmount
 	CommitQueueMaxPending   int           // maximum pending entries in CommitQueue before backpressure (default 100); 0 uses default
 	WriteCacheFreeRatio     float64       // minimum free-space ratio on cache-dir partition before write-back refuses writes (default 0.10); negative disables
-	WriteCacheSizeMB        int64         // byte quota for write-back pending data in MB (default 0 = disabled); when set, writes exceeding this return ENOSPC
+	WriteCacheSizeMB        int64         // shadow cache byte quota in MB (default 0 = disabled); shadow writes exceeding this return ENOSPC
 	UploadConcurrency       int           // number of background upload workers (default 4)
 	ReadConcurrency         int           // maximum concurrent backend reads issued by FUSE (default 24)
 	ParallelReadConcurrency int           // maximum concurrent block reads for one large FUSE read (default 4)

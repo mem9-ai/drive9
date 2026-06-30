@@ -155,7 +155,7 @@ func fsMountCmdWithBackground(args []string, background bool) error {
 	uploadConcurrency := fs.Int("upload-concurrency", 16, "maximum concurrent background uploads issued by FUSE")
 	dirCacheMaxEntries := fs.Int("dir-cache-max-entries", 200000, "maximum entries per directory in namespace cache before complete marking is disabled")
 	writeCacheFreeRatio := fs.Float64("write-cache-free-ratio", 0.10, "minimum filesystem free-space ratio before write-back refuses writes with ENOSPC (0 disables)")
-	writeCacheSizeMB := fs.Int64("write-cache-size-mb", 0, "byte quota for write-back pending data in MB (0 = disabled); writes exceeding this return ENOSPC")
+	writeCacheSizeMB := fs.Int64("write-cache-size-mb", 0, "shadow cache byte quota in MB (0 = disabled); shadow writes exceeding this return ENOSPC")
 	commitQueueMaxPending := fs.Int("commit-queue-max-pending", 100, "maximum pending entries in CommitQueue before backpressure")
 	allowOther := fs.Bool("allow-other", false, "allow other users to access mount")
 	readOnly := fs.Bool("read-only", false, "mount as read-only")
