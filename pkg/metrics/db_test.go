@@ -134,7 +134,11 @@ func TestDBMetricsIncludeTenantIDForTenantPools(t *testing.T) {
 	healthy.Store(true)
 	db := sql.OpenDB(fakeConnector{healthy: healthy})
 	db.SetMaxIdleConns(0)
-	t.Cleanup(func() { UnregisterDB(db); _ = db.Close() })
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = db.Close()
+	})
 
 	RegisterTenantDB(role, tenantID, db)
 	globalDB.probeOnce(context.Background(), time.Second, nil)
@@ -164,7 +168,11 @@ func TestDBHealthProbeDropsUnregisteredTenantState(t *testing.T) {
 	healthy.Store(false)
 	db := sql.OpenDB(fakeConnector{healthy: healthy})
 	db.SetMaxIdleConns(0)
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = db.Close()
+	})
 
 	RegisterTenantDB("user", tenantID, db)
 	globalDB.probeOnce(context.Background(), time.Second, nil)
@@ -187,7 +195,11 @@ func TestDBHealthProbeDoesNotMarkSaturatedTenantPoolDown(t *testing.T) {
 	db := sql.OpenDB(fakeConnector{healthy: healthy})
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(0)
-	t.Cleanup(func() { UnregisterDB(db); _ = db.Close() })
+	t.Cleanup(func() {
+		UnregisterDB(db)
+		globalDB.probeOnce(context.Background(), time.Second, nil)
+		_ = db.Close()
+	})
 
 	conn, err := db.Conn(context.Background())
 	if err != nil {
