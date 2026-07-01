@@ -1563,10 +1563,16 @@ func TestSemanticWorkerLegacyProviderFilterStillAppliesToKicks(t *testing.T) {
 	if m == nil {
 		t.Fatal("expected semantic worker manager")
 	}
-	if ref, ok := m.kickRef(context.Background(), autoTenantID); ok {
+	if ref, ok, err := m.kickRef(context.Background(), autoTenantID); err != nil || ok {
+		if err != nil {
+			t.Fatal(err)
+		}
 		t.Fatalf("auto tenant kick ref = %+v, want skipped without pool extract types", ref)
 	}
-	ref, ok := m.kickRef(context.Background(), keepTenantID)
+	ref, ok, err := m.kickRef(context.Background(), keepTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !ok {
 		t.Fatal("expected non-auto tenant kick ref")
 	}
@@ -2544,6 +2550,41 @@ func TestSemanticWorkerKickedAcquireFailureKeepsKickPending(t *testing.T) {
 	m.mu.Unlock()
 	if !pending || !queued {
 		t.Fatalf("tenant %s pending=%v queued=%v, want acquire failure to keep kick retryable", tenantID, pending, queued)
+	}
+	if len(m.kicks) != 1 {
+		t.Fatalf("kicks=%d, want requeued failed kick", len(m.kicks))
+	}
+}
+
+func TestSemanticWorkerKickedLookupFailureKeepsKickPending(t *testing.T) {
+	metaStore, err := meta.Open(testDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testmysql.ResetMetaDB(t, metaStore.DB())
+
+	pool := newTestTenantPool(t)
+	m := newSemanticWorkerManager(nil, metaStore, pool, staticSemanticEmbedder{vec: []float32{0.1}}, SemanticWorkerOptions{})
+	if m == nil {
+		t.Fatal("expected semantic worker manager")
+	}
+	tenantID := token.NewID()
+	m.Kick(tenantID)
+	got := <-m.kicks
+	if got != tenantID {
+		t.Fatalf("queued kick=%q, want %q", got, tenantID)
+	}
+	if err := metaStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	m.processKicked(context.Background(), got)
+
+	m.mu.Lock()
+	_, pending := m.kickPending[tenantID]
+	_, queued := m.kickQueued[tenantID]
+	m.mu.Unlock()
+	if !pending || !queued {
+		t.Fatalf("tenant %s pending=%v queued=%v, want lookup failure to keep kick retryable", tenantID, pending, queued)
 	}
 	if len(m.kicks) != 1 {
 		t.Fatalf("kicks=%d, want requeued failed kick", len(m.kicks))

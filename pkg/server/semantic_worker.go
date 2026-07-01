@@ -519,7 +519,10 @@ func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
 func (m *semanticWorkerManager) processKicked(ctx context.Context, tenantID string) {
 	defer m.queueNextPendingKick()
 	m.markKickDequeued(tenantID)
-	ref, ok := m.kickRef(ctx, tenantID)
+	ref, ok, err := m.kickRef(ctx, tenantID)
+	if err != nil {
+		return
+	}
 	if !ok {
 		m.clearKickPending(tenantID)
 		return
@@ -566,34 +569,37 @@ func (m *semanticWorkerManager) processKicked(ctx context.Context, tenantID stri
 // kickRef resolves a kicked tenant ID to a schedulable ref. Unlike cached
 // polling, a kick can wake a dormant tenant, so it applies provider/task-type
 // filters before acquiring the backend.
-func (m *semanticWorkerManager) kickRef(ctx context.Context, tenantID string) (semanticTenantRef, bool) {
+func (m *semanticWorkerManager) kickRef(ctx context.Context, tenantID string) (semanticTenantRef, bool, error) {
 	if tenantID == semanticLocalTenantID {
 		// Match scan behavior: the local fallback is only schedulable outside
 		// multi-tenant mode (listTenantRefs never enumerates it otherwise).
 		if m.meta == nil || m.pool == nil {
 			if m.shouldIncludeFallback() {
-				return semanticTenantRef{id: semanticLocalTenantID}, true
+				return semanticTenantRef{id: semanticLocalTenantID}, true, nil
 			}
 		}
-		return semanticTenantRef{}, false
+		return semanticTenantRef{}, false, nil
 	}
 	if m.meta == nil || m.pool == nil {
-		return semanticTenantRef{}, false
+		return semanticTenantRef{}, false, nil
 	}
 	t, err := m.meta.GetTenant(ctx, tenantID)
 	if err != nil {
+		if errors.Is(err, meta.ErrNotFound) {
+			return semanticTenantRef{}, false, nil
+		}
 		logger.Warn(ctx, "semantic_worker_kick_tenant_lookup_failed",
 			zap.String("tenant_id", tenantID),
 			zap.Error(err))
-		return semanticTenantRef{}, false
+		return semanticTenantRef{}, false, err
 	}
 	if t.Status != meta.TenantActive {
-		return semanticTenantRef{}, false
+		return semanticTenantRef{}, false, nil
 	}
 	if !hasAnyTaskTypes(m.taskTypesForProvider(t.Provider)) {
-		return semanticTenantRef{}, false
+		return semanticTenantRef{}, false, nil
 	}
-	return semanticTenantRef{id: t.ID, tenant: t}, true
+	return semanticTenantRef{id: t.ID, tenant: t}, true, nil
 }
 
 func (m *semanticWorkerManager) claimAndProcessOne(ctx context.Context, target *semanticTarget) bool {
