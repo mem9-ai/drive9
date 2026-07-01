@@ -346,6 +346,8 @@ func (c *quotaPendingDeltasCache) get(ctx context.Context) (quotaPendingDeltas, 
 		return quotaPendingDeltas{}, false
 	}
 	if c.load == nil {
+		// Expiry mutates localDeltas/localEntries, so the hot no-loader path
+		// needs the write lock even though callers are logically reading.
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		c.expireLocalDeltasLocked(time.Now())
@@ -508,6 +510,8 @@ func (c *quotaPendingDeltasCache) expireLocalDeltasLocked(now time.Time) {
 }
 
 func (c *quotaPendingDeltasCache) removeLocalEntryLocked(deltas quotaPendingDeltas) bool {
+	// Match by aggregate delta rather than log ID: admission only reads the
+	// aggregate total, so same-delta pending entries are interchangeable.
 	for i, entry := range c.localEntries {
 		if entry.deltas == deltas {
 			copy(c.localEntries[i:], c.localEntries[i+1:])
