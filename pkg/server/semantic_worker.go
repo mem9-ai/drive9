@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -30,12 +29,11 @@ const (
 	defaultSemanticRecoverInterval      = 5 * time.Second
 	defaultSemanticRetryBaseDelay       = 200 * time.Millisecond
 	defaultSemanticRetryMaxDelay        = 30 * time.Second
-	defaultSemanticTenantScanLimit      = 128
 	defaultSemanticPerTenantConcurrency = 1
 	semanticLocalTenantID               = "local"
-	// semanticKickQueueCapacity bounds buffered upload-commit kicks; overflow
-	// kicks are dropped because the periodic tenant scan remains the durable
-	// fallback for claiming queued tasks.
+	// semanticKickQueueCapacity bounds buffered outbox kicks. Overflow kicks are
+	// dropped because the outbox poller will re-read the same row on the next tick
+	// if the worker has not yet claimed the task.
 	semanticKickQueueCapacity = 256
 	// semanticKickDrainLimit caps tasks drained per kick so one busy tenant
 	// cannot monopolize a worker; the tenant is re-kicked to continue after
@@ -68,8 +66,6 @@ type SemanticWorkerOptions struct {
 	RetryBaseDelay time.Duration
 	// RetryMaxDelay is the cap for exponential retry backoff.
 	RetryMaxDelay time.Duration
-	// TenantScanLimit bounds active tenants checked per scheduling pass.
-	TenantScanLimit int
 	// PerTenantConcurrency limits concurrent tasks per tenant.
 	PerTenantConcurrency int
 }
@@ -95,9 +91,6 @@ func (o *SemanticWorkerOptions) normalize() {
 	}
 	if o.RetryMaxDelay < o.RetryBaseDelay {
 		o.RetryMaxDelay = o.RetryBaseDelay
-	}
-	if o.TenantScanLimit <= 0 {
-		o.TenantScanLimit = defaultSemanticTenantScanLimit
 	}
 	if o.PerTenantConcurrency <= 0 {
 		o.PerTenantConcurrency = defaultSemanticPerTenantConcurrency
@@ -145,20 +138,19 @@ type semanticWorkerManager struct {
 	embedder embedding.Client
 	opts     SemanticWorkerOptions
 
+	// ownsTenant determines whether this pod is responsible for processing
+	// semantic tasks for the given tenant. In single-pod mode it is nil
+	// (always own). In multi-pod mode it is injected from the shard resolver
+	// so each pod only opens TiDBs for its shard of tenants, letting idle
+	// tenants on other shards scale to zero.
+	ownsTenant func(tenantID string) bool
+
 	mu          sync.Mutex
 	inflight    map[string]int
 	processing  int
 	kickPending map[string]struct{}
 
 	kicks chan string
-
-	tenantScanCursorSet       bool
-	tenantScanCursorCreatedAt time.Time
-	tenantScanCursorID        string
-	tenantScanRoundRawTenants int
-	tenantScanRoundIncluded   int
-	lastTenantScan            semanticTenantScanSnapshot
-	tenantScanMu              sync.Mutex
 
 	priorObservedTenants map[string]struct{}
 
@@ -191,16 +183,6 @@ type semanticObservationSnapshot struct {
 type semanticTenantObservation struct {
 	deadLettered    int
 	queueLagSeconds float64
-}
-
-type semanticTenantScanSnapshot struct {
-	limit           int
-	cursorSet       bool
-	cursorCreatedAt time.Time
-	cursorID        string
-	rawTenants      int
-	includedTenants int
-	wrapped         bool
 }
 
 type semanticTaskAction string
@@ -292,11 +274,21 @@ func newSemanticWorkerManager(fallback *backend.Dat9Backend, metaStore *meta.Sto
 	return m
 }
 
+// SetOwnsTenant sets the shard-ownership predicate. In multi-pod mode the
+// server injects this from the shard resolver so each pod only processes
+// tenants assigned to its shard. When nil, all tenants are owned (single-pod).
+func (m *semanticWorkerManager) SetOwnsTenant(fn func(tenantID string) bool) {
+	if m == nil {
+		return
+	}
+	m.ownsTenant = fn
+}
+
 // Kick prompts a worker to attempt claiming tasks for tenantID as soon as one
-// is idle, instead of waiting for the round-robin tenant scan to reach the
-// tenant. Kicks are best-effort: duplicates collapse while one is pending, and
-// the kick is dropped when the buffer is full — the periodic scan remains the
-// durable path that eventually claims every queued task.
+// is idle, instead of waiting for the next outbox poll tick. Kicks are
+// best-effort: duplicates collapse while one is pending, and the kick is
+// dropped when the buffer is full — the outbox poller remains the durable
+// path that re-reads the row on the next tick if the task is unclaimed.
 func (m *semanticWorkerManager) Kick(tenantID string) {
 	if m == nil || tenantID == "" {
 		return
@@ -348,7 +340,6 @@ func (m *semanticWorkerManager) Start(ctx context.Context) {
 		zap.Duration("lease_duration", m.opts.LeaseDuration),
 		zap.Duration("recover_interval", m.opts.RecoverInterval),
 	}
-	fields = append(fields, m.tenantScanLogFields()...)
 	logger.Info(workerCtx, "semantic_worker_manager_started", fields...)
 }
 
@@ -372,10 +363,6 @@ func (m *semanticWorkerManager) workerLoop(ctx context.Context, workerID int) {
 	ticker := time.NewTicker(m.opts.PollInterval)
 	defer ticker.Stop()
 	for {
-		processed := m.processNext(ctx)
-		if processed {
-			continue
-		}
 		select {
 		case <-ctx.Done():
 			logger.Info(ctx, "semantic_worker_stopped", zap.Int("worker_id", workerID))
@@ -383,6 +370,15 @@ func (m *semanticWorkerManager) workerLoop(ctx context.Context, workerID int) {
 		case tenantID := <-m.kicks:
 			m.processKicked(ctx, tenantID)
 		case <-ticker.C:
+			// In single-tenant mode (no meta/pool), the worker has no outbox
+			// poller to drive kicks, so it must periodically poll the fallback
+			// backend for queued tasks. In multi-tenant mode the outbox poller
+			// is the sole driver — the ticker is a harmless no-op wake.
+			if m.meta == nil || m.pool == nil {
+				if m.shouldIncludeFallback() {
+					m.processKicked(ctx, semanticLocalTenantID)
+				}
+			}
 		}
 	}
 }
@@ -396,29 +392,26 @@ func (m *semanticWorkerManager) recoverLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.recoverExpired(ctx)
 			m.observeOnce(ctx, time.Now().UTC())
 		}
 	}
 }
 
-func (m *semanticWorkerManager) processNext(ctx context.Context) bool {
-	target, err := m.nextTarget(ctx)
-	if err != nil {
-		logger.Warn(ctx, "semantic_worker_pick_tenant_failed", zap.Error(err))
-		return false
-	}
-	if target == nil {
-		return false
-	}
-	defer target.release()
-	return m.claimAndProcessOne(ctx, target)
-}
-
-// processKicked attempts to claim tasks for one kicked tenant immediately. It
-// is best-effort by design: every early return leaves the committed task to
-// the periodic tenant scan, which stays the durable claiming path.
+// processKicked attempts to claim tasks for one kicked tenant immediately.
+// The outbox poller is the durable path that drives all kicks; a dropped kick
+// is retried on the next poll tick. Recovery of expired leases is also bound
+// to this path: when ClaimSemanticTask finds no queued task, the worker
+// additionally recovers expired leases for the tenant so they are re-queued
+// — but only for tenants that have an outbox signal, never for idle tenants.
 func (m *semanticWorkerManager) processKicked(ctx context.Context, tenantID string) {
+	// Shard check: skip tenants this pod does not own. This guards against a
+	// kick that was enqueued before a shard rebalancing moved the tenant to
+	// another pod. The new owner's poller will read the same outbox row and
+	// claim the task.
+	if m.ownsTenant != nil && !m.ownsTenant(tenantID) {
+		m.clearKickPending(tenantID)
+		return
+	}
 	// Clear the pending mark before claiming: a task committed after this
 	// point triggers a fresh kick, and a task committed before it is already
 	// visible to the claim below, so no enqueue can slip through unnoticed.
@@ -445,19 +438,32 @@ func (m *semanticWorkerManager) processKicked(ctx context.Context, tenantID stri
 	if len(target.allowedTaskTypes) == 0 {
 		return
 	}
+	// Drain up to semanticKickDrainLimit tasks for this tenant.
+	claimed := false
 	for range semanticKickDrainLimit {
 		if ctx.Err() != nil {
 			return
 		}
 		if !m.claimAndProcessOne(ctx, target) {
-			return
+			break
 		}
+		claimed = true
+	}
+	// If no task was claimed, run expired-lease recovery for this tenant.
+	// This is the only recovery path — it avoids scanning idle tenant TiDBs
+	// while still re-queueing tasks whose lease expired (e.g. after a pod
+	// crash). If recovery finds and re-queues expired tasks, re-kick so the
+	// worker drains them promptly.
+	if !claimed {
+		m.recoverExpiredForTarget(ctx, target)
+		return
 	}
 	m.Kick(tenantID)
 }
 
-// kickRef resolves a kicked tenant ID to a schedulable ref, applying the same
-// status and provider/task-type filters as the scan path (listTenantRefs).
+// kickRef resolves a kicked tenant ID to a schedulable ref. A kick can wake a
+// dormant tenant (open its TiDB for the first time), so it applies provider/
+// task-type filters before acquiring the backend.
 func (m *semanticWorkerManager) kickRef(ctx context.Context, tenantID string) (semanticTenantRef, bool) {
 	if tenantID == semanticLocalTenantID {
 		// Match scan behavior: the local fallback is only schedulable outside
@@ -658,91 +664,34 @@ func (m *semanticWorkerManager) retryDelay(attemptCount int) time.Duration {
 	return delay
 }
 
-func (m *semanticWorkerManager) recoverExpired(ctx context.Context) {
-	refs, err := m.listTenantRefs(ctx)
-	if err != nil {
-		logger.Warn(ctx, "semantic_worker_list_tenants_for_recovery_failed", zap.Error(err))
+// recoverExpiredForTarget recovers expired leases for a single tenant whose
+// target is already acquired. This is the only recovery path: it runs when a
+// kick finds no queued task, ensuring expired leases are re-queued without
+// ever scanning idle tenant TiDBs. If recovery re-queues tasks, the caller
+// re-kicks so the worker drains them promptly.
+func (m *semanticWorkerManager) recoverExpiredForTarget(ctx context.Context, target *semanticTarget) {
+	if target == nil || target.store == nil {
 		return
 	}
-	for _, ref := range refs {
-		target, err := m.targetForRef(ctx, ref)
-		if err != nil {
-			logger.Warn(ctx, "semantic_worker_open_store_for_recovery_failed",
-				zap.String("tenant_id", ref.id),
-				zap.Error(err))
-			continue
-		}
-		func() {
-			defer target.release()
-			start := time.Now()
-			recovered, err := target.store.RecoverExpiredSemanticTasks(ctx, time.Now().UTC(), 64)
-			if err != nil {
-				metrics.RecordTenantOperation(ref.id, "semantic_worker", "recover", "error", time.Since(start))
-				logger.Warn(ctx, "semantic_worker_recover_failed",
-					zap.String("tenant_id", ref.id),
-					zap.Error(err))
-				m.invalidateTenantBackend(ref.id)
-				return
-			}
-			if recovered > 0 {
-				metrics.RecordTenantOperation(ref.id, "semantic_worker", "recover", "ok", time.Since(start))
-				logger.Info(ctx, "semantic_worker_recover_ok",
-					zap.String("tenant_id", ref.id),
-					zap.String("result", "ok"),
-					zap.Int("recovered", recovered))
-			}
-		}()
-	}
-}
-
-func (m *semanticWorkerManager) nextTarget(ctx context.Context) (*semanticTarget, error) {
-	refs, err := m.listTenantRefs(ctx)
+	start := time.Now()
+	recovered, err := target.store.RecoverExpiredSemanticTasks(ctx, time.Now().UTC(), 64)
 	if err != nil {
-		return nil, err
+		metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "recover", "error", time.Since(start))
+		logger.Warn(ctx, "semantic_worker_recover_failed",
+			zap.String("tenant_id", target.tenantID),
+			zap.Error(err))
+		m.invalidateTenantBackend(target.tenantID)
+		return
 	}
-	if len(refs) == 0 {
-		return nil, nil
+	if recovered > 0 {
+		metrics.RecordTenantOperation(target.tenantID, "semantic_worker", "recover", "ok", time.Since(start))
+		logger.Info(ctx, "semantic_worker_recover_ok",
+			zap.String("tenant_id", target.tenantID),
+			zap.String("result", "ok"),
+			zap.Int("recovered", recovered))
+		// Re-queue the kick so the worker drains the recovered tasks.
+		m.Kick(target.tenantID)
 	}
-
-	for _, idx := range pageWalkOrder(len(refs)) {
-		ref := refs[idx]
-		if !m.tryClaimTenantSlot(ref.id) {
-			continue
-		}
-		target, err := m.targetForRef(ctx, ref)
-		if err != nil {
-			logger.Warn(ctx, "semantic_worker_open_store_failed",
-				zap.String("tenant_id", ref.id),
-				zap.Error(err))
-			m.releaseTenantSlot(ref.id)
-			continue
-		}
-		target.release = chainReleases(target.release, func() { m.releaseTenantSlot(ref.id) })
-		if len(target.allowedTaskTypes) == 0 {
-			target.release()
-			continue
-		}
-		return target, nil
-	}
-	return nil, nil
-}
-
-// pageWalkOrder returns the visit order for one keyset page of tenants: a
-// single wrap-around walk of all indices from a uniformly random start. The
-// random start keeps scheduling fair across pages of different lengths — any
-// cursor persisted across calls and taken modulo the current page length gets
-// clamped by the shortest page and permanently starves tenants at higher
-// in-page indices. The deterministic walk after the start guarantees each
-// tenant in the page is attempted at most once per pass, so a tenant whose
-// backend consistently fails to open cannot consume retries that should move
-// on to healthy tenants.
-func pageWalkOrder(n int) []int {
-	order := make([]int, n)
-	start := rand.Intn(n)
-	for i := range order {
-		order[i] = (start + i) % n
-	}
-	return order
 }
 
 // tryClaimTenantSlot attempts to acquire a per-tenant concurrency slot.
@@ -769,111 +718,6 @@ func (m *semanticWorkerManager) releaseTenantSlot(tenantID string) {
 		return
 	}
 	m.inflight[tenantID]--
-}
-
-func (m *semanticWorkerManager) listTenantRefs(ctx context.Context) ([]semanticTenantRef, error) {
-	if m.meta != nil && m.pool != nil {
-		// Multi-tenant workers scan active tenants with a keyset cursor rather than
-		// repeatedly reading the oldest TenantScanLimit rows. The cursor advances to
-		// the last raw active tenant in each page, even when provider filtering drops
-		// every tenant from that page, so unsupported providers cannot pin the scan.
-		// When the page after the cursor is empty, the next scan wraps to the start
-		// of the active-tenant order and continues round-robin pagination.
-		m.tenantScanMu.Lock()
-		defer m.tenantScanMu.Unlock()
-		tenants, wrapped, err := m.nextTenantScanPage(ctx)
-		if err != nil {
-			return nil, err
-		}
-		refs := make([]semanticTenantRef, 0, len(tenants))
-		for i := range tenants {
-			t := tenants[i]
-			if !hasAnyTaskTypes(m.taskTypesForProvider(t.Provider)) {
-				continue
-			}
-			refs = append(refs, semanticTenantRef{id: t.ID, tenant: &t})
-		}
-		m.recordTenantScan(ctx, tenants, len(refs), wrapped)
-		return refs, nil
-	}
-	if m.shouldIncludeFallback() {
-		return []semanticTenantRef{{id: semanticLocalTenantID}}, nil
-	}
-	return nil, nil
-}
-
-// nextTenantScanPage returns the next raw page of active tenants for round-robin
-// scheduling. It reads the current scan cursor, fetches up to TenantScanLimit rows
-// after that cursor in (created_at, id) order, and wraps to the first page when the
-// cursor is already at the end of the active-tenant sequence.
-//
-// Outward behavior for callers (typically listTenantRefs under tenantScanMu):
-//   - Returns DB rows only; provider/task-type filtering happens after this call.
-//   - Does not advance the scan cursor; the caller must call recordTenantScan with
-//     the returned page and wrapped flag.
-//   - wrapped is true only when the first query after the cursor returned no rows
-//     and a second query restarted from the beginning of the active-tenant order.
-//   - On the first scan (no cursor yet), an empty page means there are no active
-//     tenants; wrapped stays false.
-func (m *semanticWorkerManager) nextTenantScanPage(ctx context.Context) ([]meta.Tenant, bool, error) {
-	createdAt, id, ok := m.tenantScanCursor()
-	tenants, err := m.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, createdAt, id, m.opts.TenantScanLimit)
-	if err != nil {
-		return nil, false, err
-	}
-	// Non-empty page, or the initial scan before any cursor exists: return as-is.
-	if len(tenants) > 0 || !ok {
-		return tenants, false, nil
-	}
-	// Cursor was set but nothing remains after it; wrap to the head of the order.
-	tenants, err = m.meta.ListTenantsByStatusAfter(ctx, meta.TenantActive, time.Time{}, "", m.opts.TenantScanLimit)
-	if err != nil {
-		return nil, true, err
-	}
-	return tenants, true, nil
-}
-
-func (m *semanticWorkerManager) tenantScanCursor() (time.Time, string, bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if !m.tenantScanCursorSet {
-		return time.Time{}, "", false
-	}
-	return m.tenantScanCursorCreatedAt, m.tenantScanCursorID, true
-}
-
-func (m *semanticWorkerManager) recordTenantScan(ctx context.Context, tenants []meta.Tenant, included int, wrapped bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if wrapped {
-		logger.Info(ctx, "semantic_worker_tenant_scan_wrapped",
-			zap.Int("tenant_scan_round_raw_tenants", m.tenantScanRoundRawTenants),
-			zap.Int("tenant_scan_round_included_tenants", m.tenantScanRoundIncluded),
-		)
-		m.tenantScanRoundRawTenants = 0
-		m.tenantScanRoundIncluded = 0
-	}
-	m.tenantScanRoundRawTenants += len(tenants)
-	m.tenantScanRoundIncluded += included
-	if len(tenants) > 0 {
-		last := tenants[len(tenants)-1]
-		m.tenantScanCursorSet = true
-		m.tenantScanCursorCreatedAt = last.CreatedAt.UTC()
-		m.tenantScanCursorID = last.ID
-	} else if wrapped || !m.tenantScanCursorSet {
-		m.tenantScanCursorSet = false
-		m.tenantScanCursorCreatedAt = time.Time{}
-		m.tenantScanCursorID = ""
-	}
-	m.lastTenantScan = semanticTenantScanSnapshot{
-		limit:           m.opts.TenantScanLimit,
-		cursorSet:       m.tenantScanCursorSet,
-		cursorCreatedAt: m.tenantScanCursorCreatedAt,
-		cursorID:        m.tenantScanCursorID,
-		rawTenants:      len(tenants),
-		includedTenants: included,
-		wrapped:         wrapped,
-	}
 }
 
 // TODO(JaySon-Huang): DB9/Postgres tenants are not yet supported in the semantic
@@ -1300,38 +1144,6 @@ func (m *semanticWorkerManager) snapshotProcessing() int {
 	return m.processing
 }
 
-func (m *semanticWorkerManager) tenantScanSnapshot() semanticTenantScanSnapshot {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	s := m.lastTenantScan
-	if s.limit == 0 {
-		s.limit = m.opts.TenantScanLimit
-		s.cursorSet = m.tenantScanCursorSet
-		s.cursorCreatedAt = m.tenantScanCursorCreatedAt
-		s.cursorID = m.tenantScanCursorID
-	}
-	return s
-}
-
-func (m *semanticWorkerManager) tenantScanLogFields() []zap.Field {
-	return semanticTenantScanLogFields(m.tenantScanSnapshot())
-}
-
-func semanticTenantScanLogFields(s semanticTenantScanSnapshot) []zap.Field {
-	fields := []zap.Field{
-		zap.Int("tenant_scan_limit", s.limit),
-		zap.Bool("tenant_scan_cursor_set", s.cursorSet),
-		zap.String("tenant_scan_cursor_id", s.cursorID),
-		zap.Int("tenant_scan_raw_tenants", s.rawTenants),
-		zap.Int("tenant_scan_included_tenants", s.includedTenants),
-		zap.Bool("tenant_scan_wrapped", s.wrapped),
-	}
-	if s.cursorSet {
-		fields = append(fields, zap.Time("tenant_scan_cursor_created_at", s.cursorCreatedAt.UTC()))
-	}
-	return fields
-}
-
 func (m *semanticWorkerManager) observeOnce(ctx context.Context, now time.Time) {
 	snapshot := m.collectObservation(ctx, now)
 	metrics.RecordGauge("semantic_worker", "inflight", float64(snapshot.inflight))
@@ -1361,50 +1173,72 @@ func (m *semanticWorkerManager) collectObservation(ctx context.Context, now time
 		now = now.UTC()
 	}
 	snapshot := semanticObservationSnapshot{inflight: m.snapshotProcessing(), perTenant: make(map[string]semanticTenantObservation)}
-	refs, err := m.listTenantRefs(ctx)
-	if err != nil {
-		logger.Warn(ctx, "semantic_worker_list_tenants_for_observation_failed", zap.Error(err))
+
+	// Observe only warm cached tenant stores — never open a cold tenant TiDB
+	// just for metrics. This is safe because the outbox poller + kick path is
+	// the sole driver of task processing; observation is best-effort telemetry.
+	var entries []tenant.TenantStoreEntry
+	if m.pool != nil {
+		entries = m.pool.ActiveTenantStores()
+	} else if m.fallback != nil {
+		// Single-tenant mode: observe the fallback store directly.
+		snapshot.perTenant[semanticLocalTenantID] = semanticTenantObservation{}
+		obs, err := m.fallback.Store().ObserveSemanticTasks(ctx, now)
+		if err != nil {
+			logger.Warn(ctx, "semantic_worker_observe_failed",
+				zap.String("tenant_id", semanticLocalTenantID),
+				zap.Error(err))
+			return snapshot
+		}
+		snapshot.queued += obs.Queued
+		snapshot.processing += obs.Processing
+		snapshot.deadLettered += obs.DeadLettered
+		tenantLag := float64(0)
+		if obs.OldestClaimableAvailableAt != nil {
+			tenantLag = now.Sub(obs.OldestClaimableAvailableAt.UTC()).Seconds()
+		}
+		if tenantLag < 0 {
+			tenantLag = 0
+		}
+		snapshot.perTenant[semanticLocalTenantID] = semanticTenantObservation{
+			deadLettered:    obs.DeadLettered,
+			queueLagSeconds: tenantLag,
+		}
+		if obs.OldestClaimableAvailableAt != nil {
+			t := obs.OldestClaimableAvailableAt.UTC()
+			snapshot.queueLagSeconds = now.Sub(t).Seconds()
+		}
 		return snapshot
 	}
 
 	var oldest *time.Time
-	for _, ref := range refs {
-		target, err := m.targetForRef(ctx, ref)
+	for _, e := range entries {
+		obs, err := e.Store.ObserveSemanticTasks(ctx, now)
 		if err != nil {
-			logger.Warn(ctx, "semantic_worker_open_store_for_observation_failed",
-				zap.String("tenant_id", ref.id),
+			logger.Warn(ctx, "semantic_worker_observe_failed",
+				zap.String("tenant_id", e.TenantID),
 				zap.Error(err))
+			m.invalidateTenantBackend(e.TenantID)
 			continue
 		}
-		func() {
-			defer target.release()
-			obs, err := target.store.ObserveSemanticTasks(ctx, now)
-			if err != nil {
-				logger.Warn(ctx, "semantic_worker_observe_failed",
-					zap.String("tenant_id", ref.id),
-					zap.Error(err))
-				m.invalidateTenantBackend(ref.id)
-				return
-			}
-			snapshot.queued += obs.Queued
-			snapshot.processing += obs.Processing
-			snapshot.deadLettered += obs.DeadLettered
-			tenantLag := float64(0)
-			if obs.OldestClaimableAvailableAt != nil {
-				tenantLag = now.Sub(obs.OldestClaimableAvailableAt.UTC()).Seconds()
-			}
-			if tenantLag < 0 {
-				tenantLag = 0
-			}
-			snapshot.perTenant[ref.id] = semanticTenantObservation{
-				deadLettered:    obs.DeadLettered,
-				queueLagSeconds: tenantLag,
-			}
-			if obs.OldestClaimableAvailableAt != nil && (oldest == nil || obs.OldestClaimableAvailableAt.Before(*oldest)) {
-				t := obs.OldestClaimableAvailableAt.UTC()
-				oldest = &t
-			}
-		}()
+		snapshot.queued += obs.Queued
+		snapshot.processing += obs.Processing
+		snapshot.deadLettered += obs.DeadLettered
+		tenantLag := float64(0)
+		if obs.OldestClaimableAvailableAt != nil {
+			tenantLag = now.Sub(obs.OldestClaimableAvailableAt.UTC()).Seconds()
+		}
+		if tenantLag < 0 {
+			tenantLag = 0
+		}
+		snapshot.perTenant[e.TenantID] = semanticTenantObservation{
+			deadLettered:    obs.DeadLettered,
+			queueLagSeconds: tenantLag,
+		}
+		if obs.OldestClaimableAvailableAt != nil && (oldest == nil || obs.OldestClaimableAvailableAt.Before(*oldest)) {
+			t := obs.OldestClaimableAvailableAt.UTC()
+			oldest = &t
+		}
 	}
 	if oldest != nil {
 		lag := now.Sub(*oldest).Seconds()

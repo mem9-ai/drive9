@@ -418,6 +418,9 @@ func main() {
 		PodID:                        podID,
 		PodAddr:                      podAddr,
 		PodNotifySecret:              podNotifySecret,
+		SemanticOutboxPollInterval:    time.Duration(envInt("DRIVE9_SEMANTIC_OUTBOX_POLL_INTERVAL_MS", 200)) * time.Millisecond,
+		SemanticOutboxCursorFlushInterval: time.Duration(envInt("DRIVE9_SEMANTIC_OUTBOX_CURSOR_FLUSH_MS", 5000)) * time.Millisecond,
+		SemanticShardRefreshInterval:  time.Duration(envInt("DRIVE9_SEMANTIC_SHARD_REFRESH_INTERVAL_MS", 5000)) * time.Millisecond,
 	}).ListenAndServe(addr))
 }
 
@@ -616,8 +619,10 @@ environment:
   DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
   DRIVE9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
   DRIVE9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
-  DRIVE9_SEMANTIC_TENANT_LIMIT active tenants scanned per round (default: 128)
   DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
+  DRIVE9_SEMANTIC_OUTBOX_POLL_INTERVAL_MS semantic outbox poller interval (default: 200)
+  DRIVE9_SEMANTIC_OUTBOX_CURSOR_FLUSH_MS semantic outbox cursor persistence interval (default: 5000)
+  DRIVE9_SEMANTIC_SHARD_REFRESH_INTERVAL_MS shard ring refresh interval (default: 5000)
 
   Image extraction (async image -> text for search):
   DRIVE9_IMAGE_EXTRACT_ENABLED true|false (default: false)
@@ -882,7 +887,6 @@ func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorker
 		RecoverInterval:      time.Duration(envInt("DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
 		RetryBaseDelay:       time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
 		RetryMaxDelay:        time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
-		TenantScanLimit:      envInt("DRIVE9_SEMANTIC_TENANT_LIMIT", 128),
 		PerTenantConcurrency: envInt("DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
 	}
 	baseURL := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_API_BASE"))

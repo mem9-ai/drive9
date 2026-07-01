@@ -711,6 +711,31 @@ func metaInitSchemaStatements() []string {
 			updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			PRIMARY KEY (pod_id, tenant_id)
 		)`,
+		// semantic_notify_outbox is a central notification pointer table for
+		// semantic task processing. Each write/upload that enqueues a durable
+		// semantic task inserts a lightweight row here (tenant_id) so pods can
+		// discover which tenants have pending work without polling every tenant's
+		// own TiDB. The central meta DB is always provisioned (not serverless), so
+		// polling it does not incur per-tenant RCU. Retention pruning is
+		// leader-gated. Unlike sse_notify_outbox, the semantic outbox poller
+		// persists its cursor in semantic_outbox_cursor so a pod restart does not
+		// skip unprocessed rows — semantic tasks have no replay fallback.
+		`CREATE TABLE IF NOT EXISTS semantic_notify_outbox (
+			id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+			tenant_id  VARCHAR(64) NOT NULL,
+			created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			INDEX idx_semantic_notify_created (created_at)
+		)`,
+		// semantic_outbox_cursor persists each pod's consumption cursor for
+		// semantic_notify_outbox. The per-pod last_id ensures a restart resumes
+		// from the last processed row rather than skipping to MAX(id), which
+		// would lose unprocessed signals (semantic tasks have no replay path).
+		`CREATE TABLE IF NOT EXISTS semantic_outbox_cursor (
+			pod_id     VARCHAR(64) NOT NULL,
+			last_id    BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (pod_id)
+		)`,
 	}
 }
 
@@ -3272,7 +3297,129 @@ func (s *Store) DeleteSSENotifyBefore(ctx context.Context, before time.Time) (n 
 }
 
 // ---------------------------------------------------------------------------
-// Pod registry
+// Semantic notify outbox
+// ---------------------------------------------------------------------------
+
+// SemanticNotifyRow mirrors a row in semantic_notify_outbox. It is a lightweight
+// pointer (tenant_id) signaling that the tenant has at least one queued semantic
+// task in its own TiDB. The central meta DB holds this table so pods can discover
+// pending work without polling every tenant's TiDB.
+type SemanticNotifyRow struct {
+	ID        uint64
+	TenantID  string
+	CreatedAt time.Time
+}
+
+// InsertSemanticNotify writes a notification pointer to semantic_notify_outbox.
+// This is best-effort: if the INSERT fails, the durable semantic_tasks row in
+// the tenant TiDB remains and the next write for that tenant produces a fresh
+// outbox row. The central meta DB is always provisioned so this write never
+// wakes a serverless tenant TiDB.
+func (s *Store) InsertSemanticNotify(ctx context.Context, tenantID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_semantic_notify", start, &err)
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO semantic_notify_outbox (tenant_id) VALUES (?)`,
+		tenantID)
+	return err
+}
+
+// ListSemanticNotifySince returns outbox rows with id > afterID, ordered by id,
+// up to limit. The consumer advances its cursor to the last row's id so
+// subsequent calls do not re-read the same rows.
+func (s *Store) ListSemanticNotifySince(ctx context.Context, afterID uint64, limit int) (out []SemanticNotifyRow, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_semantic_notify_since", start, &err)
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, tenant_id, created_at FROM semantic_notify_outbox WHERE id > ? ORDER BY id LIMIT ?`,
+		afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var rec SemanticNotifyRow
+		if err = rows.Scan(&rec.ID, &rec.TenantID, &rec.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// MaxSemanticNotifyID returns the current maximum id in semantic_notify_outbox,
+// or 0 if the table is empty. Used by the semantic outbox poller to initialize
+// its cursor on first launch (skipping historical rows — the pod has never
+// owned work before, so historical signals belong to other pods).
+func (s *Store) MaxSemanticNotifyID(ctx context.Context) (out uint64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "max_semantic_notify_id", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM semantic_notify_outbox`)
+	if err = row.Scan(&out); err != nil {
+		return 0, err
+	}
+	return out, nil
+}
+
+// DeleteSemanticNotifyBefore prunes outbox rows older than the given threshold.
+// Leader-gated; retention is relative to DB insert time (created_at).
+func (s *Store) DeleteSemanticNotifyBefore(ctx context.Context, before time.Time) (n int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_semantic_notify_before", start, &err)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM semantic_notify_outbox WHERE created_at < ?`, before)
+	if err != nil {
+		return 0, err
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// GetSemanticOutboxCursor returns the persisted last_id for the given pod, or 0
+// if no cursor exists (first launch). On error returns 0 and the error.
+func (s *Store) GetSemanticOutboxCursor(ctx context.Context, podID string) (lastID uint64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_semantic_outbox_cursor", start, &err)
+	row := s.db.QueryRowContext(ctx,
+		`SELECT last_id FROM semantic_outbox_cursor WHERE pod_id = ?`, podID)
+	if err = row.Scan(&lastID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return lastID, nil
+}
+
+// UpsertSemanticOutboxCursor persists the pod's consumption cursor. Called
+// periodically by the poller (not every tick) to reduce meta DB write QPS. On
+// crash, the poller resumes from the last persisted id and replays at most
+// cursorFlushInterval worth of rows — duplicate kicks are harmless.
+func (s *Store) UpsertSemanticOutboxCursor(ctx context.Context, podID string, lastID uint64) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "upsert_semantic_outbox_cursor", start, &err)
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO semantic_outbox_cursor (pod_id, last_id) VALUES (?, ?)
+		 ON DUPLICATE KEY UPDATE last_id = VALUES(last_id)`,
+		podID, lastID)
+	return err
+}
+
+// DeleteSemanticOutboxCursor removes the cursor row for a pod that no longer
+// exists in pod_registry. Leader-gated cleanup.
+func (s *Store) DeleteSemanticOutboxCursor(ctx context.Context, podID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_semantic_outbox_cursor", start, &err)
+	_, err = s.db.ExecContext(ctx,
+		`DELETE FROM semantic_outbox_cursor WHERE pod_id = ?`, podID)
+	return err
+}
+
 // ---------------------------------------------------------------------------
 
 // UpsertPod registers or refreshes this pod's heartbeat in pod_registry. On
@@ -3307,6 +3454,29 @@ func (s *Store) ListActivePods(ctx context.Context, selfID string) (out []PodRow
 			return nil, err
 		}
 		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// ListAllActivePodIDs returns the pod_id of every active pod in pod_registry,
+// including the caller's own pod_id. Used by the semantic shard resolver to
+// compute the full shard ring. The result is sorted by pod_id for deterministic
+// rank assignment.
+func (s *Store) ListAllActivePodIDs(ctx context.Context) (out []string, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_all_active_pod_ids", start, &err)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT pod_id FROM pod_registry WHERE status = 'active' ORDER BY pod_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var podID string
+		if err = rows.Scan(&podID); err != nil {
+			return nil, err
+		}
+		out = append(out, podID)
 	}
 	return out, rows.Err()
 }

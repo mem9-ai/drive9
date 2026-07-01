@@ -265,9 +265,6 @@ func TestBuildSemanticWorkerConfigFromEnvReadsWorkerOptionsWithoutEmbedder(t *te
 	if opts.Workers != 8 {
 		t.Fatalf("Workers=%d, want 8", opts.Workers)
 	}
-	if opts.TenantScanLimit != 512 {
-		t.Fatalf("TenantScanLimit=%d, want 512", opts.TenantScanLimit)
-	}
 }
 
 func TestLocalS3ConfigFromEnv(t *testing.T) {

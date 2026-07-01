@@ -104,6 +104,19 @@ type Config struct {
 	PodID                  string
 	PodAddr                string
 	PodNotifySecret        []byte
+
+	// SemanticOutboxPollInterval is the tick interval for the semantic
+	// notify outbox poller. Targets the always-provisioned meta DB, so the
+	// cost is negligible. Default 200ms.
+	SemanticOutboxPollInterval time.Duration
+	// SemanticOutboxCursorFlushInterval controls how often the semantic
+	// outbox poller persists its cursor to semantic_outbox_cursor. Default
+	// 5s — on crash, at most this much outbox is replayed (duplicate kicks
+	// are harmless).
+	SemanticOutboxCursorFlushInterval time.Duration
+	// SemanticShardRefreshInterval is how often the shard resolver queries
+	// pod_registry to refresh the active pod ring. Default 5s.
+	SemanticShardRefreshInterval time.Duration
 }
 
 type SlockOAuthClient interface {
@@ -430,10 +443,23 @@ func NewWithConfig(cfg Config) *Server {
 	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
 	if s.semanticWorker != nil {
 		// Wire upload/write-commit kicks so freshly enqueued semantic tasks are
-		// claimed immediately instead of waiting for the tenant scan to come
-		// around (which can take many minutes with hundreds of active tenants).
+		// claimed immediately. The notifier writes a best-effort row to the
+		// central semantic_notify_outbox in the meta DB so every pod's outbox
+		// poller can discover it, then fires an in-process kick for same-pod
+		// ~0ms latency. The durable semantic_tasks row in the tenant TiDB is the
+		// source of truth; the outbox is just a cross-pod signal.
 		if cfg.Pool != nil {
-			cfg.Pool.SetSemanticTaskNotifier(s.semanticWorker.Kick)
+			cfg.Pool.SetSemanticTaskNotifier(func(tenantID string) {
+				if s.meta != nil {
+					notifyCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+					// Best-effort outbox write — the durable semantic_tasks row in
+					// the tenant TiDB is the source of truth and the next write for
+					// this tenant will produce a fresh outbox row.
+					_ = s.meta.InsertSemanticNotify(notifyCtx, tenantID)
+					cancel()
+				}
+				s.semanticWorker.Kick(tenantID)
+			})
 		}
 		if cfg.Backend != nil {
 			cfg.Backend.SetSemanticTaskEnqueuedNotifier(func() {
@@ -484,12 +510,18 @@ func NewWithConfig(cfg Config) *Server {
 }
 
 // startNotifyInfrastructure launches the SSE cross-pod notification components
-// that run on every pod (not leader-gated):
+// and the semantic worker + outbox poller that run on every pod (not
+// leader-gated):
 //   - notifyPoller: reads the central sse_notify_outbox table at 200ms intervals
 //     to discover which tenants have new fs_events rows written by other pods.
 //   - podRegistry: maintains this pod's presence in pod_registry and reports its
 //     SSE subscriber tenant set to pod_subscriptions for push routing.
 //   - podNotifier: sends fire-and-forget HTTP pushes to peers for <10ms latency.
+//   - semanticShardResolver: periodically queries pod_registry to compute which
+//     tenants this pod owns via jump consistent hashing.
+//   - semanticOutboxPoller: reads the central semantic_notify_outbox table to
+//     discover tenants with pending semantic tasks and kicks the worker.
+//   - semanticWorker: processes semantic tasks for tenants this pod owns.
 //
 // Only called in multi-tenant mode (Meta != nil). In single-tenant mode the
 // fallback EventBus handles delivery without any cross-pod mechanism.
@@ -535,6 +567,33 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 		s.podNotifier = notifier
 		notifier.Start(notifyCtx)
 	}
+
+	// Semantic worker + outbox poller: run on every pod (not leader-gated) so
+	// each pod processes its shard of tenants. The shard resolver determines
+	// ownership via jump consistent hashing over the active pod ring.
+	if s.semanticWorker != nil {
+		shardResolver := newSemanticShardResolver(s.meta, cfg.PodID, cfg.SemanticShardRefreshInterval)
+		shardResolver.Start(notifyCtx)
+		s.semanticWorker.SetOwnsTenant(shardResolver.ownsTenantFn())
+
+		// Outbox poller: reads semantic_notify_outbox and kicks the worker for
+		// tenants this pod owns. Initialize cursor synchronously before live
+		// traffic so no outbox row is skipped.
+		outboxPoller := newSemanticOutboxPoller(
+			s.meta, s.semanticWorker, shardResolver.ownsTenantFn(), cfg.PodID,
+			cfg.SemanticOutboxPollInterval, cfg.SemanticOutboxCursorFlushInterval,
+		)
+		outboxPoller.initCursor(context.Background())
+		s.notifyWG.Add(1)
+		go func() {
+			defer s.notifyWG.Done()
+			outboxPoller.run(notifyCtx)
+		}()
+
+		// Start the semantic worker on the notify context so it stops with
+		// the notify infrastructure on shutdown.
+		s.semanticWorker.Start(notifyCtx)
+	}
 }
 
 // stopNotifyInfrastructure stops the notify poller, pod registry, and pod
@@ -552,6 +611,11 @@ func (s *Server) stopNotifyInfrastructure() {
 	}
 	if s.podNotifier != nil {
 		s.podNotifier.Stop()
+	}
+	// Semantic worker is started in startNotifyInfrastructure and must stop
+	// here so its goroutines exit before the notify context is cleared.
+	if s.semanticWorker != nil {
+		s.semanticWorker.Stop()
 	}
 	s.notifyCancel = nil
 	s.podNotifier = nil
@@ -672,7 +736,13 @@ func (s *Server) startLeaderWorkers() {
 	if s.pool != nil {
 		s.pool.StartAllFileGC()
 	}
-	if s.semanticWorker != nil {
+	// In multi-tenant mode the semantic worker is started in
+	// startNotifyInfrastructure (runs on every pod, not leader-gated) because
+	// each pod processes its own shard of tenants. In single-tenant mode
+	// (Meta == nil) startNotifyInfrastructure is never called, so start the
+	// worker here. Start is idempotent (guarded by m.cancel != nil), so calling
+	// it again in multi-tenant mode is a safe no-op.
+	if s.semanticWorker != nil && s.meta == nil {
 		s.semanticWorker.Start(backgroundWithTrace(leaderCtx))
 	}
 	if s.objectGCWorker != nil {
@@ -711,6 +781,21 @@ func (s *Server) startLeaderWorkers() {
 				}
 			}
 		})
+		// Periodic semantic notify outbox cleanup (leader-only). Prunes old
+		// semantic_notify_outbox rows and stale semantic_outbox_cursor rows so
+		// the central tables don't grow unbounded.
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(semanticNotifyCleanupInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.cleanupSemanticNotifyOutbox(workerCtx)
+				}
+			}
+		})
 	}
 	// Periodic stale pod sweep (leader-only). Marks pods with expired heartbeats
 	// as stale and cleans up their subscription rows so writers stop pushing to
@@ -744,6 +829,14 @@ const defaultSSENotifyRetention = 1 * time.Hour
 
 // sseNotifyCleanupInterval is how often the leader prunes old outbox rows.
 const sseNotifyCleanupInterval = 5 * time.Minute
+
+// semanticNotifyCleanupInterval is how often the leader prunes old
+// semantic_notify_outbox rows and stale semantic_outbox_cursor rows.
+const semanticNotifyCleanupInterval = 5 * time.Minute
+
+// defaultSemanticNotifyRetention is how long semantic_notify_outbox rows are
+// kept before the leader prunes them.
+const defaultSemanticNotifyRetention = 1 * time.Hour
 
 // cleanupFSEvents prunes old fs_events rows from accessible stores.
 // Single-tenant mode cleans the fallback store. Multi-tenant mode iterates
@@ -859,6 +952,37 @@ func (s *Server) cleanupSSENotifyOutbox(ctx context.Context) {
 	}
 }
 
+// cleanupSemanticNotifyOutbox prunes old semantic_notify_outbox rows from the
+// central meta DB. Leader-gated; runs on the semanticNotifyCleanupInterval
+// ticker. The outbox is a lightweight pointer table (tenant_id), not task
+// content — pruning old rows doesn't lose tasks because the durable
+// semantic_tasks row lives in the tenant TiDB, and the outbox is only a
+// cross-pod wake-up signal. Stale semantic_outbox_cursor rows for pods no
+// longer in pod_registry are also cleaned up.
+func (s *Server) cleanupSemanticNotifyOutbox(ctx context.Context) {
+	if ctx.Err() != nil {
+		logger.Warn(ctx, "semantic_notify_cleanup_skipped_shutdown", zap.Error(ctx.Err()))
+		return
+	}
+	if s.meta == nil {
+		return
+	}
+	n, err := s.meta.DeleteSemanticNotifyBefore(ctx, time.Now().Add(-defaultSemanticNotifyRetention))
+	if err != nil {
+		if ctx.Err() != nil {
+			logger.Warn(ctx, "semantic_notify_cleanup_interrupted_by_shutdown", zap.Error(err))
+		} else {
+			logger.Warn(ctx, "semantic_notify_cleanup_failed", zap.Error(err))
+		}
+		return
+	}
+	if n > 0 {
+		logger.Info(ctx, "semantic_notify_outbox_pruned",
+			zap.Int64("rows", n),
+			zap.Duration("retention", defaultSemanticNotifyRetention))
+	}
+}
+
 // stopLeaderWorkers stops the background schedulers started by startLeaderWorkers.
 // Called when the pod loses leadership or the server shuts down. The whole stop
 // (including the worker Stop/wait calls and clearing the worker fields) is
@@ -897,7 +1021,10 @@ func (s *Server) stopLeaderWorkers() {
 	if s.pool != nil {
 		s.pool.StopAllFileGC()
 	}
-	if s.semanticWorker != nil {
+	// In single-tenant mode the semantic worker was started here, so stop it
+	// here. In multi-tenant mode it is stopped in stopNotifyInfrastructure;
+	// Stop is idempotent (guarded by m.cancel != nil).
+	if s.semanticWorker != nil && s.meta == nil {
 		s.semanticWorker.Stop()
 	}
 	if s.objectGCWorker != nil {
@@ -1015,7 +1142,6 @@ func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallba
 			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
 			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()),
 		}
-		fields = append(fields, s.semanticWorker.tenantScanLogFields()...)
 		logger.Info(ctx, "server_semantic_workers_enabled", fields...)
 	} else {
 		logger.Info(ctx, "server_semantic_workers_disabled",
