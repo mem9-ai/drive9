@@ -1000,6 +1000,19 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 	completeMultipartStart := time.Now()
 	if err := b.s3.CompleteMultipartUpload(ctx, upload.S3Key, upload.S3UploadID, parts); err != nil {
 		logger.Error(ctx, "backend_finalize_upload_complete_multipart_failed", zap.String("upload_id", uploadID), zap.Error(err))
+		if b.UseServerQuota() {
+			cleanupCtx, cancelCleanup := postCommitQuotaMutationContext()
+			if resetErr := b.metaStore.UpdateUploadReservationStatus(cleanupCtx, b.tenantID, uploadID, "active"); resetErr != nil {
+				logger.Warn(cleanupCtx, "central_quota_upload_reset_active_failed",
+					zap.String("tenant_id", b.tenantID),
+					zap.String("upload_id", uploadID),
+					zap.Error(resetErr))
+				metrics.RecordTenantOperation(b.tenantID, "central_quota", "upload_reset_active", "error", time.Since(start))
+			} else {
+				metrics.RecordTenantOperation(b.tenantID, "central_quota", "upload_reset_active", "ok", time.Since(start))
+			}
+			cancelCleanup()
+		}
 		metrics.RecordTenantOperation(b.tenantID, "backend", "finalize_upload", "error", time.Since(start))
 		return fmt.Errorf("complete multipart: %w", err)
 	}

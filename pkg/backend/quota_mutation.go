@@ -113,12 +113,6 @@ func (b *Dat9Backend) logQuotaMutation(ctx context.Context, mutationType string,
 // applied. This is the async-safe half of the split mutation path — if it
 // fails or never runs, MutationReplayWorker picks up the pending log entry.
 func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType string, logID int64, pending quotaPendingDeltas, apply func(context.Context, *sql.Tx) error) {
-	defer func() {
-		if b.quotaUsageCache != nil {
-			b.quotaUsageCache.invalidate()
-		}
-		b.addPendingCentralMutationDeltas(-pending.storageDelta, -pending.fileDelta, -pending.mediaDelta)
-	}()
 	if err := b.metaStore.InTx(ctx, func(tx *sql.Tx) error {
 		if err := apply(ctx, tx); err != nil {
 			return err
@@ -133,6 +127,10 @@ func (b *Dat9Backend) applyQuotaMutation(ctx context.Context, mutationType strin
 		metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "pending", time.Duration(0))
 		return
 	}
+	if b.quotaUsageCache != nil {
+		b.quotaUsageCache.invalidate()
+	}
+	b.addPendingCentralMutationDeltas(-pending.storageDelta, -pending.fileDelta, -pending.mediaDelta)
 	metrics.RecordTenantOperation(b.tenantID, "central_quota", mutationType, "ok", time.Duration(0))
 }
 
@@ -164,7 +162,7 @@ func (b *Dat9Backend) logAndEnqueueMutation(ctx context.Context, mutationType st
 		return err
 	}
 	b.addPendingCentralMutationDeltas(pending.storageDelta, pending.fileDelta, pending.mediaDelta)
-	b.enqueueMutation(func(applyCtx context.Context) {
+	b.enqueueMutation(ctx, func(applyCtx context.Context) {
 		b.applyQuotaMutation(applyCtx, mutationType, logID, pending, apply)
 	})
 	b.mutationMu.Unlock()

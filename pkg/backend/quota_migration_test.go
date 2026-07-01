@@ -284,7 +284,12 @@ func (f *fakeMetaQuotaStore) UpdateUploadReservationStatus(ctx context.Context, 
 }
 
 func (f *fakeMetaQuotaStore) UpdateUploadReservationStatusTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID, status string) error {
-	return f.UpdateUploadReservationStatus(ctx, tenantID, uploadID, status)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r, ok := f.reservations[metaKey(tenantID, uploadID)]; ok && (r.Status == "active" || r.Status == "completing") {
+		r.Status = status
+	}
+	return nil
 }
 
 func (f *fakeMetaQuotaStore) AbortActiveReservationTx(ctx context.Context, tx *sql.Tx, tenantID, uploadID string) (bool, int64, int64, error) {
@@ -527,7 +532,7 @@ func newCentralQuotaBackend(t *testing.T) (*Dat9Backend, *fakeMetaQuotaStore) {
 func drainCentralQuotaMutations(t *testing.T, b *Dat9Backend) {
 	t.Helper()
 	done := make(chan struct{})
-	b.enqueueMutation(func(context.Context) {
+	b.enqueueMutation(context.Background(), func(context.Context) {
 		close(done)
 	})
 	select {
@@ -685,7 +690,7 @@ func TestCentralQuotaMutationLogInsertFailureSurfaces(t *testing.T) {
 	}
 }
 
-func TestCentralQuotaPendingDeltaClearsAfterInlineApplyFailure(t *testing.T) {
+func TestCentralQuotaPendingDeltaRetainedAfterInlineApplyFailure(t *testing.T) {
 	b, fake := newCentralQuotaBackend(t)
 	applyErr := errors.New("meta apply unavailable")
 
@@ -704,8 +709,8 @@ func TestCentralQuotaPendingDeltaClearsAfterInlineApplyFailure(t *testing.T) {
 	drainCentralQuotaMutations(t, b)
 
 	storageDelta, fileDelta, mediaDelta := b.pendingCentralMutationDeltas(context.Background())
-	if storageDelta != 0 || fileDelta != 0 || mediaDelta != 0 {
-		t.Fatalf("pending deltas = (%d,%d,%d), want zero after apply attempt", storageDelta, fileDelta, mediaDelta)
+	if storageDelta != 128 || fileDelta != 1 || mediaDelta != 0 {
+		t.Fatalf("pending deltas = (%d,%d,%d), want retained pending mutation", storageDelta, fileDelta, mediaDelta)
 	}
 	if got := fake.mutations[len(fake.mutations)-1].status; got != "pending" {
 		t.Fatalf("mutation status = %q, want pending for replay", got)

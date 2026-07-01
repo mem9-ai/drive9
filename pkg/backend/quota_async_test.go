@@ -17,7 +17,7 @@ func TestEnqueueMutation_Async(t *testing.T) {
 
 	var executed atomic.Int64
 	for i := 0; i < 10; i++ {
-		b.enqueueMutation(func(context.Context) {
+		b.enqueueMutation(context.Background(), func(context.Context) {
 			executed.Add(1)
 		})
 	}
@@ -31,7 +31,7 @@ func TestEnqueueMutation_InlineFallback(t *testing.T) {
 	// No mutation worker started — should run inline.
 	b := &Dat9Backend{}
 	var executed atomic.Int64
-	b.enqueueMutation(func(context.Context) {
+	b.enqueueMutation(context.Background(), func(context.Context) {
 		executed.Add(1)
 	})
 	require.Equal(t, int64(1), executed.Load())
@@ -48,7 +48,7 @@ func TestEnqueueMutation_FIFO_SingleWorker(t *testing.T) {
 	const n = 20
 	for i := 0; i < n; i++ {
 		i := i
-		b.enqueueMutation(func(context.Context) {
+		b.enqueueMutation(context.Background(), func(context.Context) {
 			order = append(order, i)
 			if len(order) == n {
 				close(done)
@@ -98,7 +98,7 @@ func TestMutationMu_ConcurrentOrdering(t *testing.T) {
 			// This models InsertMutationLog returning sequential IDs.
 			logID := nextID
 			nextID++
-			b.enqueueMutation(func(context.Context) {
+			b.enqueueMutation(context.Background(), func(context.Context) {
 				resultMu.Lock()
 				applied = append(applied, logID)
 				if len(applied) == n {
@@ -135,7 +135,7 @@ func TestStopMutationWorker_DrainsPending(t *testing.T) {
 
 	var executed atomic.Int64
 	for i := 0; i < 50; i++ {
-		b.enqueueMutation(func(context.Context) {
+		b.enqueueMutation(context.Background(), func(context.Context) {
 			executed.Add(1)
 		})
 	}

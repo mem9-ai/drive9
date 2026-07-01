@@ -30,7 +30,11 @@ func replayPollInterval() time.Duration {
 }
 
 func replayMinAge() time.Duration {
-	return envDurationMS("DRIVE9_QUOTA_REPLAY_MIN_AGE_MS", defaultReplayMinAge)
+	d := envDurationMS("DRIVE9_QUOTA_REPLAY_MIN_AGE_MS", defaultReplayMinAge)
+	if d <= 0 {
+		return defaultReplayMinAge
+	}
+	return d
 }
 
 func envDurationMS(name string, def time.Duration) time.Duration {
