@@ -22,6 +22,11 @@ const smallFileShadowThreshold = 64 << 20 // 64MB
 // write, ShadowStore refuses the write with ENOSPC.
 const defaultWriteCacheFreeRatio = 0.10
 
+// defaultWriteCacheSizeMB is the default byte quota for the write-back shadow
+// cache in megabytes. When pending shadow bytes exceed this limit, new writes
+// are refused with ENOSPC.
+const defaultWriteCacheSizeMB = 1024 // 1GB
+
 // diskCheckInterval is the minimum time between disk space checks.
 const diskCheckInterval = 5 * time.Second
 
