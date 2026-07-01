@@ -172,23 +172,23 @@ func TestBuildBackendOptionsFromEnvAudioDisabled(t *testing.T) {
 	}
 }
 
-func TestBuildSemanticWorkerConfigFromEnvReadsWorkerOptionsWithoutEmbedder(t *testing.T) {
+func TestBuildTenantWorkerConfigFromEnvReadsWorkerOptionsWithoutEmbedder(t *testing.T) {
 	keys := []string{
 		"DRIVE9_EMBED_API_BASE",
 		"DRIVE9_EMBED_API_KEY",
 		"DRIVE9_EMBED_MODEL",
 		"DRIVE9_SEMANTIC_WORKERS",
-		"DRIVE9_SEMANTIC_TENANT_LIMIT",
+		"DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY",
 	}
 	restore := snapshotEnv(t, keys)
 	t.Cleanup(func() { restoreEnv(t, restore) })
 	unsetEnv(t, keys)
 	setEnv(t, "DRIVE9_SEMANTIC_WORKERS", "8")
-	setEnv(t, "DRIVE9_SEMANTIC_TENANT_LIMIT", "512")
+	setEnv(t, "DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY", "4")
 
-	client, opts, err := buildSemanticWorkerConfigFromEnv()
+	client, opts, err := buildTenantWorkerConfigFromEnv()
 	if err != nil {
-		t.Fatalf("buildSemanticWorkerConfigFromEnv: %v", err)
+		t.Fatalf("buildTenantWorkerConfigFromEnv: %v", err)
 	}
 	if client != nil {
 		t.Fatal("client configured without DRIVE9_EMBED_*")
@@ -196,8 +196,8 @@ func TestBuildSemanticWorkerConfigFromEnvReadsWorkerOptionsWithoutEmbedder(t *te
 	if opts.Workers != 8 {
 		t.Fatalf("Workers=%d, want 8", opts.Workers)
 	}
-	if opts.TenantScanLimit != 512 {
-		t.Fatalf("TenantScanLimit=%d, want 512", opts.TenantScanLimit)
+	if opts.PerTenantConcurrency != 4 {
+		t.Fatalf("PerTenantConcurrency=%d, want 4", opts.PerTenantConcurrency)
 	}
 }
 

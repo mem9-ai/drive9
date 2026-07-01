@@ -64,7 +64,7 @@ type Config struct {
 	InlineThreshold  int64
 	Logger           *zap.Logger
 	SemanticEmbedder embedding.Client
-	SemanticWorkers  SemanticWorkerOptions
+	TenantWorkers    TenantWorkerOptions
 	SlockOAuth       SlockOAuthClient
 
 	TiDBAutoEmbeddingConfig  tenantschema.TiDBAutoEmbeddingConfig
@@ -80,30 +80,40 @@ type Config struct {
 	// workers start unconditionally (single-pod mode).
 	Leader *leader.Manager
 
-	// SSE notification outbox + pod-to-pod push configuration. These enable the
-	// new cross-pod SSE scheme that avoids polling every tenant's TiDB. When
-	// Meta is nil (single-tenant mode), these are unused.
+	// SSE notification + unified tenant outbox configuration. The unified
+	// outbox replaces per-tenant TiDB polling for SSE, semantic, file_gc, and
+	// quota work. Every pod polls tenant_notify_outbox (always-provisioned
+	// meta DB) and dispatches by work_mask. When Meta is nil (single-tenant
+	// mode), these are unused.
 	//
-	// SSENotifyPollInterval is the fallback poller tick (default 200ms). The
-	// poller reads the central sse_notify_outbox table (always-provisioned meta
-	// DB) — not per-tenant TiDBs — so idle tenant TiDBs can scale to zero.
-	//
+	// TenantOutboxPollInterval is the poller tick (default 200ms).
+	// TenantOutboxCursorFlushInterval is how often the cursor is persisted
+	// (default 5s).
+	// TenantShardRefreshInterval is how often the shard resolver refreshes the
+	// active pod ring (default 5s).
+	// TenantMaintenanceInterval throttles piggybacked fs_events cleanup +
+	// observation metrics per tenant (default 5min).
+	// SafetyNetScanInterval is how often the leader runs the safety-net scan
+	// (default 5min).
 	// SSENotifyRetention is how long outbox rows are kept before leader-gated
 	// pruning (default 1h).
 	//
 	// PodID uniquely identifies this pod in the central pod_registry. PodAddr
-	// is the internally reachable address (host:port) for peer push notifications.
-	// When both are set, this pod registers itself and reports its SSE subscriber
-	// tenant set so peers can route push notifications.
+	// is the internally reachable address (host:port). When both are set, this
+	// pod registers itself and reports its SSE subscriber set.
 	//
-	// PodNotifySecret is the shared bearer token for /v1/internal/sse-notify
-	// authentication. When set, the pod-to-pod push path is enabled; when nil,
-	// only the 200ms poller fallback is used (no push).
-	SSENotifyPollInterval time.Duration
-	SSENotifyRetention     time.Duration
-	PodID                  string
-	PodAddr                string
-	PodNotifySecret        []byte
+	// PodNotifySecret is retained for backward compatibility (the internal
+	// /v1/internal/sse-notify endpoint). Cross-pod push is superseded by the
+	// unified outbox poller; the secret still gates the legacy endpoint.
+	TenantOutboxPollInterval      time.Duration
+	TenantOutboxCursorFlushInterval time.Duration
+	TenantShardRefreshInterval    time.Duration
+	TenantMaintenanceInterval      time.Duration
+	SafetyNetScanInterval          time.Duration
+	SSENotifyRetention             time.Duration
+	PodID                          string
+	PodAddr                        string
+	PodNotifySecret                []byte
 }
 
 type SlockOAuthClient interface {
@@ -157,7 +167,8 @@ type Server struct {
 	logger                *zap.Logger
 	mux                   *http.ServeMux
 	events                *eventBuses
-	semanticWorker        *semanticWorkerManager
+	tenantWorker          *tenantWorkerManager
+	shardResolver         *semanticShardResolver
 	journalCursorSecret   []byte
 	objectGCWorker        *objectGCWorker
 	slockOAuth            SlockOAuthClient
@@ -189,21 +200,23 @@ type Server struct {
 	replayWorker      *backend.MutationReplayWorker
 	expirySweepWorker *backend.ExpirySweepWorker
 
-	// SSE cross-pod notification components. The notifyPoller reads the central
-	// sse_notify_outbox table (in the always-provisioned meta DB) on every pod
-	// to discover which tenants have new fs_events rows — replacing the old
-	// per-bus 1s poll that kept every serverless tenant TiDB awake. The
-	// podNotifier sends fire-and-forget HTTP pushes to peers for <10ms latency.
-	// The podRegistry maintains this pod's presence and subscriber set in the
-	// central DB. All three run on every pod (not leader-gated); the leader
-	// additionally sweeps stale pods and prunes the outbox.
-	podNotifier     *podNotifier
+	// Unified tenant outbox components. The tenantOutboxPoller reads the
+	// central tenant_notify_outbox table (in the always-provisioned meta DB)
+	// on every pod and dispatches by work_mask: SSE bits wake the local bus;
+	// semantic/file_gc/quota bits kick the tenantWorker on the shard owner.
+	// The shardResolver determines shard ownership via jump consistent hashing
+	// over the active pod ring. The podRegistry maintains this pod's presence
+	// and subscriber set in the central DB. All run on every pod (not
+	// leader-gated); the leader additionally sweeps stale pods and prunes the
+	// outbox.
 	podRegistry     *podRegistry
 	podNotifySecret []byte
 	notifyCancel    context.CancelFunc
 	notifyWG        sync.WaitGroup
 	// sseNotifyRetention is how long outbox rows are kept before leader pruning.
 	sseNotifyRetention time.Duration
+	// safetyNetScanInterval is how often the leader runs the safety-net scan.
+	safetyNetScanInterval time.Duration
 }
 
 type tenantAutoEmbeddingDefault struct {
@@ -316,13 +329,17 @@ func NewWithConfig(cfg Config) *Server {
 		journalCursorSecret: newJournalCursorSecret(cfg.TokenSecret),
 		forkWorkerCtx:       forkWorkerCtx,
 		forkWorkerCancel:    forkWorkerCancel,
-		leader:              cfg.Leader,
-		podNotifySecret:     cfg.PodNotifySecret,
-		sseNotifyRetention:  cfg.SSENotifyRetention,
-		}
+		leader:                 cfg.Leader,
+		podNotifySecret:        cfg.PodNotifySecret,
+		sseNotifyRetention:     cfg.SSENotifyRetention,
+		safetyNetScanInterval:  cfg.SafetyNetScanInterval,
+	}
 	// Default SSE notify retention.
 	if s.sseNotifyRetention <= 0 {
 		s.sseNotifyRetention = defaultSSENotifyRetention
+	}
+	if s.safetyNetScanInterval <= 0 {
+		s.safetyNetScanInterval = defaultSafetyNetScanInterval
 	}
 	mux := http.NewServeMux()
 
@@ -427,36 +444,43 @@ func NewWithConfig(cfg Config) *Server {
 	}
 
 	s.mux = mux
-	s.semanticWorker = newSemanticWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.SemanticWorkers)
-	if s.semanticWorker != nil {
-		// Wire upload/write-commit kicks so freshly enqueued semantic tasks are
-		// claimed immediately instead of waiting for the tenant scan to come
-		// around (which can take many minutes with hundreds of active tenants).
+	s.tenantWorker = newTenantWorkerManager(cfg.Backend, cfg.Meta, cfg.Pool, cfg.SemanticEmbedder, cfg.TenantWorkers, cfg.TenantMaintenanceInterval)
+	if s.tenantWorker != nil {
+		// Wire the write-path notifier so freshly enqueued semantic/file_gc/
+		// quota work triggers an immediate in-process kick (~0ms latency for
+		// same-pod writes) plus a best-effort outbox INSERT for cross-pod
+		// delivery. The pool wires each backend's notifier to call
+		// SetWorkEnqueuedNotifier which invokes the tenant worker's Kick.
 		if cfg.Pool != nil {
-			cfg.Pool.SetSemanticTaskNotifier(s.semanticWorker.Kick)
+			cfg.Pool.SetTenantWorkNotifier(func(tenantID string, workMask int) {
+				s.tenantWorker.Kick(tenantID, workMask)
+				s.insertTenantNotify(tenantID, workMask)
+			})
 		}
 		if cfg.Backend != nil {
-			cfg.Backend.SetSemanticTaskEnqueuedNotifier(func() {
-				s.semanticWorker.Kick(semanticLocalTenantID)
+			cfg.Backend.SetWorkEnqueuedNotifier(func(workMask int) {
+				s.tenantWorker.Kick(tenantLocalID, workMask)
+				s.insertTenantNotify(tenantLocalID, workMask)
 			})
 		}
 	}
 	s.objectGCWorker = newObjectGCWorker(cfg.Meta, cfg.Pool)
 
-	// Start SSE cross-pod notification infrastructure. These run on every pod
-	// (not leader-gated) because each pod needs to discover cross-pod events
-	// for its own SSE subscribers. Only enabled in multi-tenant mode (Meta != nil).
+	// Start unified tenant outbox notification infrastructure. This runs on
+	// every pod (not leader-gated) because each pod needs to discover cross-pod
+	// work for its own SSE subscribers and sharded tenants. Only enabled in
+	// multi-tenant mode (Meta != nil).
 	if s.meta != nil {
 		s.startNotifyInfrastructure(cfg)
 	}
 
-	appManagedTaskTypes := semanticWorkerLogTaskTypesFromTypes(appManagedSemanticTaskTypes(cfg.SemanticEmbedder))
+	appManagedTaskTypes := tenantWorkerLogTaskTypesFromTypes(appManagedTenantTaskTypes(cfg.SemanticEmbedder))
 	var fallbackTaskTypes, poolAutoTaskTypes []string
 	if cfg.Backend != nil {
-		fallbackTaskTypes = semanticWorkerLogTaskTypesFromTypes(cfg.Backend.AutoSemanticTaskTypes())
+		fallbackTaskTypes = tenantWorkerLogTaskTypesFromTypes(cfg.Backend.AutoSemanticTaskTypes())
 	}
 	if cfg.Pool != nil {
-		poolAutoTaskTypes = semanticWorkerLogTaskTypesFromTypes(cfg.Pool.AutoSemanticTaskTypes())
+		poolAutoTaskTypes = tenantWorkerLogTaskTypesFromTypes(cfg.Pool.AutoSemanticTaskTypes())
 	}
 
 	// Gate background schedulers behind the leader manager when configured. When
@@ -478,35 +502,62 @@ func NewWithConfig(cfg Config) *Server {
 	} else {
 		// No leader manager: single-pod mode, start workers immediately.
 		s.startLeaderWorkers()
-		s.logSemanticWorkerStatus(cfg, appManagedTaskTypes, fallbackTaskTypes, poolAutoTaskTypes)
+		s.logTenantWorkerStatus(cfg, appManagedTaskTypes, fallbackTaskTypes, poolAutoTaskTypes)
 	}
 	return s
 }
 
-// startNotifyInfrastructure launches the SSE cross-pod notification components
+// insertTenantNotify writes a best-effort unified outbox row so other pods
+// discover the work via the 200ms poller. Called from the write path after
+// the in-process kick. Failures are logged and are safe: the safety-net scan
+// recovers any missed work.
+func (s *Server) insertTenantNotify(tenantID string, workMask int) {
+	if s.meta == nil || tenantID == "" || workMask == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.meta.InsertTenantNotify(ctx, tenantID, workMask); err != nil {
+		logger.Warn(ctx, "tenant_notify_outbox_insert_failed",
+			zap.String("tenant_id", tenantID),
+			zap.Int("work_mask", workMask),
+			zap.Error(err))
+	}
+}
+
+// startNotifyInfrastructure launches the unified tenant outbox components
 // that run on every pod (not leader-gated):
-//   - notifyPoller: reads the central sse_notify_outbox table at 200ms intervals
-//     to discover which tenants have new fs_events rows written by other pods.
-//   - podRegistry: maintains this pod's presence in pod_registry and reports its
-//     SSE subscriber tenant set to pod_subscriptions for push routing.
-//   - podNotifier: sends fire-and-forget HTTP pushes to peers for <10ms latency.
+//   - shardResolver: refreshes the active pod ring for jump-consistent-hash
+//     shard ownership of semantic/file_gc/quota work.
+//   - tenantOutboxPoller: reads the central tenant_notify_outbox table at
+//     200ms intervals and dispatches by work_mask (SSE → wake local bus;
+//     semantic/file_gc/quota → kick tenantWorker on shard owner).
+//   - podRegistry: maintains this pod's presence in pod_registry and reports
+//     its SSE subscriber tenant set to pod_subscriptions.
 //
 // Only called in multi-tenant mode (Meta != nil). In single-tenant mode the
-// fallback EventBus handles delivery without any cross-pod mechanism.
+// fallback EventBus + tenantWorker workerLoop ticker handle delivery.
 func (s *Server) startNotifyInfrastructure(cfg Config) {
 	// Create a single context for all notify components. We store only the
-	// cancel func (not the context itself) on Server, per coding guidelines:
-	// "Pass context through call chains; do not store context in structs."
+	// cancel func (not the context itself) on Server, per coding guidelines.
 	notifyCtx, notifyCancel := context.WithCancel(backgroundWithTrace(context.Background()))
 	s.notifyCancel = notifyCancel
 
-	// Fallback poller: reads the central outbox on every pod.
-	poller := newNotifyPoller(s.meta, s.events, cfg.SSENotifyPollInterval)
+	// Shard resolver: refresh the active pod ring synchronously before the
+	// poller starts so ownsTenant has a valid ring on startup.
+	resolver := newSemanticShardResolver(s.meta, cfg.PodID, cfg.TenantShardRefreshInterval)
+	resolver.Start(context.Background())
+	s.shardResolver = resolver
+
+	// Unified outbox poller: reads the central outbox on every pod and
+	// dispatches by work_mask.
+	poller := newTenantOutboxPoller(
+		s.meta, s.events, s.tenantWorker, resolver.ownsTenantFn(),
+		cfg.PodID, cfg.TenantOutboxPollInterval, cfg.TenantOutboxCursorFlushInterval,
+	)
 	// Initialize the poller cursor synchronously BEFORE starting the goroutine
-	// and BEFORE the server accepts live traffic. This prevents a race where a
-	// write between poller construction and the first MaxSSENotifyID call inside
-	// run() would be skipped (the poller would set lastID to the already-written
-	// row's id and never deliver it). See PR #647 adversary-1 re-review B1.
+	// and BEFORE the server accepts live traffic. On restart the cursor is
+	// recovered from tenant_outbox_cursor; on first launch it skips to MAX(id).
 	poller.initCursor(context.Background())
 	s.notifyWG.Add(1)
 	go func() {
@@ -528,34 +579,27 @@ func (s *Server) startNotifyInfrastructure(cfg Config) {
 		// own WaitGroup and stopped via reg.Stop() in stopNotifyInfrastructure.
 		reg.Start(notifyCtx)
 	}
-
-	// Pod-to-pod push notifier: only when a shared secret is configured.
-	if len(cfg.PodNotifySecret) > 0 && cfg.PodID != "" {
-		notifier := newPodNotifier(s.meta, cfg.PodID, cfg.PodNotifySecret)
-		s.podNotifier = notifier
-		notifier.Start(notifyCtx)
-	}
 }
 
-// stopNotifyInfrastructure stops the notify poller, pod registry, and pod
-// notifier. Called from Close AFTER stopLeaderWorkers so the leader-gated
+// stopNotifyInfrastructure stops the shard resolver, notify poller, and pod
+// registry. Called from Close AFTER stopLeaderWorkers so the leader-gated
 // stale-pod sweep (which dereferences s.podRegistry) can't race with clearing
-// podRegistry. The poller is stopped via notifyCancel; the registry and notifier
-// have their own Stop methods that wait for all goroutines to exit.
+// podRegistry. The poller is stopped via notifyCancel; the resolver and
+// registry have their own Stop methods that wait for goroutines to exit.
 func (s *Server) stopNotifyInfrastructure() {
 	if s.notifyCancel != nil {
 		s.notifyCancel()
 	}
 	s.notifyWG.Wait()
+	if s.shardResolver != nil {
+		s.shardResolver.Stop()
+		s.shardResolver = nil
+	}
 	if s.podRegistry != nil {
 		s.podRegistry.Stop()
-	}
-	if s.podNotifier != nil {
-		s.podNotifier.Stop()
+		s.podRegistry = nil
 	}
 	s.notifyCancel = nil
-	s.podNotifier = nil
-	s.podRegistry = nil
 }
 
 func (s *Server) Close() {
@@ -667,54 +711,53 @@ func (s *Server) startLeaderWorkers() {
 		s.replayWorker = backend.StartMutationReplayWorker(tenant.NewMetaQuotaAdapter(s.meta))
 		s.expirySweepWorker = backend.StartExpirySweepWorker(s.meta)
 	}
-	// Per-tenant FileGC: start on every cached backend so FileGC reacts to a
-	// leadership gain for backends created while this pod was a standby.
-	if s.pool != nil {
-		s.pool.StartAllFileGC()
-	}
-	if s.semanticWorker != nil {
-		s.semanticWorker.Start(backgroundWithTrace(leaderCtx))
+	// Per-tenant FileGC and quota outbox workers are no longer per-backend
+	// goroutines — they are driven by kicks through the unified tenant worker.
+	// The tenantWorker starts here (leader-gated) so sharded work is processed
+	// only on the leader pod. In single-tenant mode it was started in
+	// startNotifyInfrastructure or runs via the workerLoop fallback ticker.
+	if s.tenantWorker != nil {
+		s.tenantWorker.Start(backgroundWithTrace(leaderCtx))
 	}
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Start(backgroundWithTrace(leaderCtx))
 	}
-	// Periodic fs_events cleanup (leader-only). Prunes old event rows so the
-	// table doesn't grow unbounded. In single-tenant mode, cleans the fallback
-	// store. In multi-tenant mode, iterates tenants with a cached backend via
-	// pool.ActiveTenantStores and prunes each fs_events table. See
-	// cleanupFSEvents for details.
-	s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-		ticker := time.NewTicker(fsEventsCleanupInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-workerCtx.Done():
-				return
-			case <-ticker.C:
-				s.cleanupFSEvents(workerCtx)
-			}
-		}
-	})
-	// Periodic SSE notify outbox cleanup (leader-only). Prunes old
-	// sse_notify_outbox rows so the central table doesn't grow unbounded.
-	// Only runs in multi-tenant mode (Meta != nil).
-	if s.meta != nil {
+	// Safety-net scan (leader-only). Recovers expired leases for warm tenants
+	// whose kick may have been lost. Runs on the SafetyNetScanInterval ticker.
+	if s.meta != nil && s.pool != nil {
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
-			ticker := time.NewTicker(sseNotifyCleanupInterval)
+			ticker := time.NewTicker(s.safetyNetScanInterval)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-workerCtx.Done():
 					return
 				case <-ticker.C:
-					s.cleanupSSENotifyOutbox(workerCtx)
+					s.safetyNetScan(workerCtx)
+				}
+			}
+		})
+	}
+	// Periodic tenant notify outbox cleanup (leader-only). Prunes old
+	// tenant_notify_outbox rows so the central table doesn't grow unbounded.
+	// Only runs in multi-tenant mode (Meta != nil).
+	if s.meta != nil {
+		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
+			ticker := time.NewTicker(tenantNotifyCleanupInterval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-workerCtx.Done():
+					return
+				case <-ticker.C:
+					s.cleanupTenantNotifyOutbox(workerCtx)
 				}
 			}
 		})
 	}
 	// Periodic stale pod sweep (leader-only). Marks pods with expired heartbeats
-	// as stale and cleans up their subscription rows so writers stop pushing to
-	// dead pods. Only runs when pod registry is configured.
+	// as stale and cleans up their subscription rows so the shard resolver stops
+	// routing work to dead pods. Only runs when pod registry is configured.
 	if s.podRegistry != nil {
 		s.startLeaderGoroutine(leaderCtx, func(workerCtx context.Context) {
 			ticker := time.NewTicker(stalePodSweepInterval)
@@ -731,129 +774,45 @@ func (s *Server) startLeaderWorkers() {
 	}
 }
 
-// fsEventsCleanupInterval is how often the leader prunes old fs_events rows.
-const fsEventsCleanupInterval = 5 * time.Minute
-
-// fsEventsRetention is how long event rows are kept before pruning.
+// fsEventsRetention is how long event rows are kept before pruning. Used by
+// the piggybacked maintenance in the tenant worker.
 const fsEventsRetention = 1 * time.Hour
 
-// defaultSSENotifyRetention is how long sse_notify_outbox rows are kept before
-// the leader prunes them. Matches fs_events retention so the outbox doesn't
-// outlive the event content it points to.
+// defaultSSENotifyRetention is how long tenant_notify_outbox rows are kept
+// before the leader prunes them. Matches fs_events retention so the outbox
+// doesn't outlive the work it points to.
 const defaultSSENotifyRetention = 1 * time.Hour
 
-// sseNotifyCleanupInterval is how often the leader prunes old outbox rows.
-const sseNotifyCleanupInterval = 5 * time.Minute
+// defaultSafetyNetScanInterval is how often the leader runs the safety-net scan.
+const defaultSafetyNetScanInterval = 5 * time.Minute
 
-// cleanupFSEvents prunes old fs_events rows from accessible stores.
-// Single-tenant mode cleans the fallback store. Multi-tenant mode iterates
-// active tenants via the meta store + pool, pruning each tenant's fs_events
-// table and sampling the row count into drive9_fs_events_rows so operators
-// can monitor table growth without direct DB access. The stale-cursor reset
-// logic in EventsSince handles pruned rows correctly (reset when since <
-// oldestSeq). See issue #599 P1-2.
-func (s *Server) cleanupFSEvents(ctx context.Context) {
-	if ctx.Err() != nil {
-		// Context already cancelled (shutdown in progress): skip cleanup to
-		// avoid a partial DELETE that will roll back. Log so operators can see
-		// that a cleanup cycle was interrupted by shutdown.
-		logger.Warn(ctx, "fs_events_cleanup_skipped_shutdown", zap.Error(ctx.Err()))
-		return
-	}
-	if s.fallback != nil && s.meta == nil {
-		store := s.fallback.Store()
-		if store != nil {
-			// Sample row count before pruning so operators can track growth.
-			if count, err := store.CountFSEvents(ctx); err == nil {
-				metrics.RecordFSEventsRows("", count)
-			}
-			if n, err := store.DeleteFSEventsBefore(ctx, time.Now().Add(-fsEventsRetention)); err != nil {
-				if ctx.Err() != nil {
-					logger.Warn(ctx, "fs_events_cleanup_interrupted_by_shutdown", zap.Error(err))
-				} else {
-					logger.Warn(ctx, "fs_events_cleanup_failed", zap.Error(err))
-				}
-			} else {
-				metrics.RecordFSEventsPruned("", n)
-			}
-		}
-		return
-	}
-	// Multi-tenant mode: iterate tenants with a cached backend, prune each
-	// fs_events table and sample row counts. fs_events rows only accumulate for
-	// tenants that have served traffic (and thus have a cached backend), so
-	// iterating ActiveTenantStores (a cheap cache snapshot) covers the tenants
-	// that need cleanup without forcing backend creation for dormant tenants
-	// (which would exhaust connections and fail for tenants whose credentials
-	// are not materialized). Runs on the fsEventsCleanupInterval (5m) ticker.
-	// A concurrent retirement may close the store after the snapshot returns;
-	// a stale-reference COUNT/DELETE logs a warning and is retried next tick —
-	// this is acceptable for best-effort retention pruning and matches the
-	// StartAllFileGC iteration pattern.
-	//
-	// Limitation (deliberate, best-effort): a tenant that served traffic, was
-	// evicted from the pool cache, and went dormant before the next cleanup tick
-	// is not pruned here until it is re-acquired (its backend re-enters the
-	// cache, and the following tick cleans it). This is acceptable because:
-	//   1. EventsSince's stale-cursor reset logic (reset when since < oldestSeq)
-	//      already makes pruned-rows correctness independent of timely pruning.
-	//   2. Evicted-dormant tenants accumulate at most their pre-eviction write
-	//      rate × the window until next acquire, bounded by fsEventsRetention.
-	// Pruning on every Acquire was rejected to avoid coupling a DELETE (with
-	// its RTT and lock cost) into the request hot path. A bounded tenant scan
-	// (meta-driven, like the semantic worker's keyset pagination) is a future
-	// option if the active set grows large enough to matter; for now the cached
-	// snapshot covers the tenants that actually accumulate rows.
-	if s.pool == nil {
-		return
-	}
-	for _, te := range s.pool.ActiveTenantStores() {
-		if ctx.Err() != nil {
-			logger.Warn(ctx, "fs_events_cleanup_loop_interrupted_by_shutdown", zap.Error(ctx.Err()))
-			return
-		}
-		// Sample row count before pruning so operators can track growth.
-		if count, err := te.Store.CountFSEvents(ctx); err == nil {
-			metrics.RecordFSEventsRows(te.TenantID, count)
-		}
-		if n, err := te.Store.DeleteFSEventsBefore(ctx, time.Now().Add(-fsEventsRetention)); err != nil {
-			if ctx.Err() != nil {
-				logger.Warn(ctx, "fs_events_cleanup_interrupted_by_shutdown",
-					zap.String("tenant_id", te.TenantID), zap.Error(err))
-				return
-			}
-			logger.Warn(ctx, "fs_events_cleanup_failed",
-				zap.String("tenant_id", te.TenantID), zap.Error(err))
-		} else {
-			metrics.RecordFSEventsPruned(te.TenantID, n)
-		}
-	}
-}
+// tenantNotifyCleanupInterval is how often the leader prunes old outbox rows.
+const tenantNotifyCleanupInterval = 5 * time.Minute
 
-// cleanupSSENotifyOutbox prunes old sse_notify_outbox rows from the central meta
-// DB. Leader-gated; runs on the sseNotifyCleanupInterval ticker. The outbox is
-// a lightweight pointer table (tenant_id + seq), not event content — pruning
-// old rows doesn't lose events because SSE clients use fs_events seq cursors
-// for replay, and the outbox is only a cross-pod wake-up signal.
-func (s *Server) cleanupSSENotifyOutbox(ctx context.Context) {
+// cleanupTenantNotifyOutbox prunes old tenant_notify_outbox rows from the
+// central meta DB. Leader-gated; runs on the tenantNotifyCleanupInterval
+// ticker. The outbox is a lightweight pointer table (tenant_id + work_mask),
+// not work content — pruning old rows doesn't lose work because the safety-net
+// scan recovers any expired leases.
+func (s *Server) cleanupTenantNotifyOutbox(ctx context.Context) {
 	if ctx.Err() != nil {
-		logger.Warn(ctx, "sse_notify_cleanup_skipped_shutdown", zap.Error(ctx.Err()))
+		logger.Warn(ctx, "tenant_notify_cleanup_skipped_shutdown", zap.Error(ctx.Err()))
 		return
 	}
 	if s.meta == nil {
 		return
 	}
-	n, err := s.meta.DeleteSSENotifyBefore(ctx, time.Now().Add(-s.sseNotifyRetention))
+	n, err := s.meta.DeleteTenantNotifyBefore(ctx, time.Now().Add(-s.sseNotifyRetention))
 	if err != nil {
 		if ctx.Err() != nil {
-			logger.Warn(ctx, "sse_notify_cleanup_interrupted_by_shutdown", zap.Error(err))
+			logger.Warn(ctx, "tenant_notify_cleanup_interrupted_by_shutdown", zap.Error(err))
 		} else {
-			logger.Warn(ctx, "sse_notify_cleanup_failed", zap.Error(err))
+			logger.Warn(ctx, "tenant_notify_cleanup_failed", zap.Error(err))
 		}
 		return
 	}
 	if n > 0 {
-		logger.Info(ctx, "sse_notify_outbox_pruned",
+		logger.Info(ctx, "tenant_notify_outbox_pruned",
 			zap.Int64("rows", n),
 			zap.Duration("retention", s.sseNotifyRetention))
 	}
@@ -892,13 +851,11 @@ func (s *Server) stopLeaderWorkers() {
 	if expirySweepWorker != nil {
 		expirySweepWorker.Stop()
 	}
-	// Per-tenant FileGC: stop on every cached backend so FileGC reacts to a
-	// leadership loss for backends created while this pod was the leader.
-	if s.pool != nil {
-		s.pool.StopAllFileGC()
-	}
-	if s.semanticWorker != nil {
-		s.semanticWorker.Stop()
+	// Per-tenant FileGC and quota outbox workers are no longer per-backend
+	// goroutines — they are driven by the unified tenant worker, which is
+	// stopped below. No separate StopAllFileGC call is needed.
+	if s.tenantWorker != nil {
+		s.tenantWorker.Stop()
 	}
 	if s.objectGCWorker != nil {
 		s.objectGCWorker.Stop()
@@ -995,19 +952,18 @@ func (s *Server) onLose() {
 	s.stopLeaderWorkers()
 }
 
-// logSemanticWorkerStatus logs whether the semantic worker is enabled or disabled.
+// logTenantWorkerStatus logs whether the tenant worker is enabled or disabled.
 // Called in single-pod mode (no leader manager) for backward-compatible logging.
 // Log-only: the workers are started by startLeaderWorkers (called just before
-// this in the no-leader path), so this must NOT call Start again (that would be
-// a redundant double-start and previously silently over-started them).
-func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallbackTaskTypes, poolAutoTaskTypes []string) {
+// this in the no-leader path), so this must NOT call Start again.
+func (s *Server) logTenantWorkerStatus(cfg Config, appManagedTaskTypes, fallbackTaskTypes, poolAutoTaskTypes []string) {
 	ctx := backgroundWithTrace(context.Background())
-	if s.semanticWorker != nil {
+	if s.tenantWorker != nil {
 		fields := []zap.Field{
-			zap.Int("workers", s.semanticWorker.opts.Workers),
-			zap.Duration("poll_interval", s.semanticWorker.opts.PollInterval),
-			zap.Duration("lease_duration", s.semanticWorker.opts.LeaseDuration),
-			zap.Duration("recover_interval", s.semanticWorker.opts.RecoverInterval),
+			zap.Int("workers", s.tenantWorker.opts.Workers),
+			zap.Duration("poll_interval", s.tenantWorker.opts.PollInterval),
+			zap.Duration("lease_duration", s.tenantWorker.opts.LeaseDuration),
+			zap.Duration("maintenance_interval", s.tenantWorker.opts.MaintenanceInterval),
 			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
 			zap.Strings("app_managed_task_types", appManagedTaskTypes),
 			zap.Strings("fallback_task_types", fallbackTaskTypes),
@@ -1015,10 +971,9 @@ func (s *Server) logSemanticWorkerStatus(cfg Config, appManagedTaskTypes, fallba
 			zap.Bool("fallback_image_extract_enabled", cfg.Backend != nil && cfg.Backend.SupportsAsyncImageExtract()),
 			zap.Bool("pool_image_extract_enabled", cfg.Pool != nil && cfg.Pool.SupportsAsyncImageExtract()),
 		}
-		fields = append(fields, s.semanticWorker.tenantScanLogFields()...)
-		logger.Info(ctx, "server_semantic_workers_enabled", fields...)
+		logger.Info(ctx, "server_tenant_worker_enabled", fields...)
 	} else {
-		logger.Info(ctx, "server_semantic_workers_disabled",
+		logger.Info(ctx, "server_tenant_worker_disabled",
 			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
 			zap.Strings("app_managed_task_types", appManagedTaskTypes),
 			zap.Strings("fallback_task_types", fallbackTaskTypes),

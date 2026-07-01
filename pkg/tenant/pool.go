@@ -73,48 +73,6 @@ type LeaderChecker interface {
 	IsLeader() bool
 }
 
-// StartAllFileGC starts the per-tenant FileGCWorker on every cached backend
-// and marks FileGC as enabled so backends created afterwards also start FileGC.
-// Called by the server's onLead callback. All state changes happen under p.mu,
-// so a backend being created concurrently will observe a consistent
-// fileGCEnabled value when it is inserted (see Get/Acquire).
-func (p *Pool) StartAllFileGC() {
-	if p == nil {
-		return
-	}
-	p.mu.Lock()
-	p.fileGCEnabled = true
-	backends := make([]*backend.Dat9Backend, 0, len(p.items))
-	for _, e := range p.items {
-		backends = append(backends, e.backend)
-	}
-	p.mu.Unlock()
-	for _, b := range backends {
-		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
-	}
-}
-
-// StopAllFileGC stops the per-tenant FileGCWorker on every cached backend and
-// marks FileGC as disabled so backends created afterwards do not start FileGC.
-// Called by the server's onLose callback. All state changes happen under p.mu,
-// so a backend being created concurrently will observe a consistent
-// fileGCEnabled value when it is inserted (see Get/Acquire).
-func (p *Pool) StopAllFileGC() {
-	if p == nil {
-		return
-	}
-	p.mu.Lock()
-	p.fileGCEnabled = false
-	backends := make([]*backend.Dat9Backend, 0, len(p.items))
-	for _, e := range p.items {
-		backends = append(backends, e.backend)
-	}
-	p.mu.Unlock()
-	for _, b := range backends {
-		b.StopFileGCWorker()
-	}
-}
-
 // ActiveTenantStores snapshots the (tenantID, store) pairs currently cached in
 // the pool. It is intended for leader-only background maintenance (e.g. the
 // fs_events cleanup goroutine) that should operate only on tenants with a
@@ -161,14 +119,10 @@ type Pool struct {
 	order                     *list.List
 	maxSize                   int
 	tidbSchemaValidationOpens atomic.Uint64
-	semanticTaskNotifier      atomic.Pointer[func(tenantID string)]
-	// fileGCEnabled tracks whether per-tenant FileGCWorker should be running on
-	// this pod. It is set under p.mu by StartAllFileGC (leader gain) /
-	// StopAllFileGC (leader loss), and read under p.mu when a newly created
-	// backend is inserted, so backend creation racing with a leadership
-	// transition resolves correctly instead of using a moment-in-time
-	// IsLeader() check taken outside the pool lock. When no LeaderChecker is
-	// configured (single-pod) it is always true.
+	tenantWorkNotifier       atomic.Pointer[func(tenantID string, workMask int)]
+	// fileGCEnabled is retained for backward compatibility but no longer used:
+	// FileGC is now kick-driven through the unified tenant worker, not a
+	// per-backend goroutine.
 	fileGCEnabled bool
 }
 
@@ -224,24 +178,24 @@ func (p *Pool) SetMetaStore(ms *meta.Store) {
 	p.metaStore = ms
 }
 
-// SetSemanticTaskNotifier registers a callback invoked with the tenant ID
-// whenever one of this pool's backends commits a durable semantic task, so the
-// semantic worker can claim the new work immediately instead of waiting for
-// the periodic tenant scan.
-func (p *Pool) SetSemanticTaskNotifier(fn func(tenantID string)) {
+// SetTenantWorkNotifier registers a callback invoked with the tenant ID and a
+// work mask whenever one of this pool's backends commits durable work (semantic
+// task, file_gc task, quota outbox row), so the tenant worker can claim the new
+// work immediately instead of waiting for a periodic scan.
+func (p *Pool) SetTenantWorkNotifier(fn func(tenantID string, workMask int)) {
 	if p == nil {
 		return
 	}
-	p.semanticTaskNotifier.Store(&fn)
+	p.tenantWorkNotifier.Store(&fn)
 }
 
-func (p *Pool) wireSemanticTaskNotifier(b *backend.Dat9Backend, tenantID string) {
+func (p *Pool) wireTenantWorkNotifier(b *backend.Dat9Backend, tenantID string) {
 	// Resolve the notifier at call time, not wire time, so backends created
-	// before SetSemanticTaskNotifier (e.g. during tenant resume on startup)
-	// still notify once the semantic worker registers.
-	b.SetSemanticTaskEnqueuedNotifier(func() {
-		if fn := p.semanticTaskNotifier.Load(); fn != nil && *fn != nil {
-			(*fn)(tenantID)
+	// before SetTenantWorkNotifier (e.g. during tenant resume on startup) still
+	// notify once the tenant worker registers.
+	b.SetWorkEnqueuedNotifier(func(workMask int) {
+		if fn := p.tenantWorkNotifier.Load(); fn != nil && *fn != nil {
+			(*fn)(tenantID, workMask)
 		}
 	})
 }
@@ -310,14 +264,9 @@ func (p *Pool) Get(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Backen
 			}
 		}
 	}
-	// Read the pool-owned FileGC leader state under p.mu so a backend created
-	// concurrently with a leadership transition resolves to the post-transition
-	// state rather than a moment-in-time IsLeader() check taken outside the lock.
-	startFileGC := p.fileGCEnabled
+	// FileGC is now kick-driven through the unified tenant worker; no
+	// per-backend goroutine is started here.
 	p.mu.Unlock()
-	if startFileGC {
-		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
-	}
 	for _, retired := range toClose {
 		closeEntry(retired)
 	}
@@ -405,16 +354,11 @@ func (p *Pool) Acquire(ctx context.Context, t *meta.Tenant) (out *backend.Dat9Ba
 			}
 		}
 	}
-	// Read the pool-owned FileGC leader state under p.mu so a backend created
-	// concurrently with a leadership transition resolves to the post-transition
-	// state rather than a moment-in-time IsLeader() check taken outside the lock.
-	startFileGC := p.fileGCEnabled
+	// FileGC is now kick-driven through the unified tenant worker; no
+	// per-backend goroutine is started here.
 	cachedCount := len(p.items)
 	p.mu.Unlock()
 	metrics.RecordGauge("tenant_pool", "cached_backends", float64(cachedCount))
-	if startFileGC {
-		b.StartFileGCWorker(backend.FileGCWorkerOptions{})
-	}
 	for _, retired := range toClose {
 		closeEntry(retired)
 	}
@@ -464,6 +408,34 @@ func (p *Pool) WaitTenantIdle(ctx context.Context, tenantID string) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// AcquireCached returns the cached backend for the tenant, pinning it for the
+// caller's active use, without creating a new backend if the tenant is not
+// already cached. This is used by the safety-net scan to recover expired
+// leases only for warm tenants (those with a live backend in the cache),
+// avoiding waking dormant serverless tenant TiDBs. Returns (nil, nil, false)
+// when the tenant is not cached (cold).
+func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release func(), ok bool) {
+	if p == nil || t == nil {
+		return nil, nil, false
+	}
+	s3EncryptionPolicy := t.S3EncryptionPolicy()
+	p.mu.Lock()
+	e, exists := p.items[t.ID]
+	if !exists {
+		p.mu.Unlock()
+		return nil, nil, false
+	}
+	if e.s3EncryptionPolicy != s3EncryptionPolicy || (t.StorageNamespaceID != "" && e.storageNamespaceID != t.StorageNamespaceID) {
+		p.mu.Unlock()
+		return nil, nil, false
+	}
+	e.refs++
+	p.order.MoveToFront(e.elem)
+	p.mu.Unlock()
+	metrics.RecordOperation("tenant_pool", "cache_lookup", "hit", 0)
+	return e.backend, p.makeRelease(e), true
 }
 
 func (p *Pool) InvalidateAndWait(ctx context.Context, tenantID string) error {
@@ -821,7 +793,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(ctx, b, t.ID)
-		p.wireSemanticTaskNotifier(b, t.ID)
+		p.wireTenantWorkNotifier(b, t.ID)
 		return b, store, nil
 	}
 	if p.cfg.S3Dir != "" {
@@ -861,7 +833,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 			zap.Float64("create_backend_ms", backendCreateDurationMs),
 			zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 		p.wireQuotaStore(ctx, b, t.ID)
-		p.wireSemanticTaskNotifier(b, t.ID)
+		p.wireTenantWorkNotifier(b, t.ID)
 		return b, store, nil
 	}
 	backendCreateStart := time.Now()
@@ -883,7 +855,7 @@ func (p *Pool) createBackend(ctx context.Context, t *meta.Tenant) (*backend.Dat9
 		zap.Float64("create_backend_ms", backendCreateDurationMs),
 		zap.Float64("total_ms", float64(time.Since(start).Microseconds())/1000.0))
 	p.wireQuotaStore(ctx, b, t.ID)
-	p.wireSemanticTaskNotifier(b, t.ID)
+	p.wireTenantWorkNotifier(b, t.ID)
 	return b, store, nil
 }
 

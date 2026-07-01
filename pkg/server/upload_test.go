@@ -27,10 +27,10 @@ import (
 
 func newTestServerWithS3(t *testing.T) (*Server, *s3client.LocalS3Client) {
 	t.Helper()
-	return newTestServerWithS3Config(t, backend.Options{}, SemanticWorkerOptions{})
+	return newTestServerWithS3Config(t, backend.Options{}, TenantWorkerOptions{})
 }
 
-func newTestServerWithS3Config(t *testing.T, backendOpts backend.Options, workerOpts SemanticWorkerOptions) (*Server, *s3client.LocalS3Client) {
+func newTestServerWithS3Config(t *testing.T, backendOpts backend.Options, workerOpts TenantWorkerOptions) (*Server, *s3client.LocalS3Client) {
 	t.Helper()
 	blobDir, err := os.MkdirTemp("", "dat9-srv-blobs-*")
 	if err != nil {
@@ -61,7 +61,7 @@ func newTestServerWithS3Config(t *testing.T, backendOpts backend.Options, worker
 	if err != nil {
 		t.Fatal(err)
 	}
-	return NewWithConfig(Config{Backend: b, SemanticWorkers: workerOpts}), s3c
+	return NewWithConfig(Config{Backend: b, TenantWorkers: workerOpts}), s3c
 }
 
 type failingCreateMultipartS3 struct {
@@ -610,10 +610,9 @@ func TestAutoImagePutWritesContentTextEndToEnd(t *testing.T) {
 			QueueSize: 8,
 			Extractor: staticServerImageExtractor{text: "caption from http put"},
 		},
-	}, SemanticWorkerOptions{
+	}, TenantWorkerOptions{
 		Workers:         1,
 		PollInterval:    10 * time.Millisecond,
-		RecoverInterval: 50 * time.Millisecond,
 		LeaseDuration:   200 * time.Millisecond,
 	})
 	ts := httptest.NewServer(s)
@@ -1107,10 +1106,9 @@ func TestAutoImageMultipartOverwriteWritesContentTextEndToEnd(t *testing.T) {
 			QueueSize: 8,
 			Extractor: staticServerImageExtractor{text: "caption from multipart overwrite"},
 		},
-	}, SemanticWorkerOptions{
+	}, TenantWorkerOptions{
 		Workers:         1,
 		PollInterval:    10 * time.Millisecond,
-		RecoverInterval: 50 * time.Millisecond,
 		LeaseDuration:   200 * time.Millisecond,
 	})
 	ts := httptest.NewServer(s)
@@ -1435,7 +1433,7 @@ func TestContentLengthHeaderMismatchRejected(t *testing.T) {
 }
 
 func TestWriteReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
-	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 10}, SemanticWorkerOptions{})
+	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 10}, TenantWorkerOptions{})
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 
@@ -1464,7 +1462,7 @@ func TestWriteReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
 }
 
 func TestUploadInitiateReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
-	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 70_000}, SemanticWorkerOptions{})
+	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 70_000}, TenantWorkerOptions{})
 	if _, err := s.fallback.Write("/filled.bin", bytes.Repeat([]byte("a"), 60_000), 0, filesystem.WriteFlagCreate); err != nil {
 		t.Fatal(err)
 	}

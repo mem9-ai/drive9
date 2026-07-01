@@ -19,7 +19,6 @@ import (
 
 func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	if _, err := b.WriteCtx(ctx, "/outbox.png", []byte("png-data"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -70,7 +69,6 @@ func TestServerQuotaSmallWriteUsesTenantOutbox(t *testing.T) {
 
 func TestServerQuotaOutboxBatchProcessesDifferentFiles(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	if _, err := b.WriteCtx(ctx, "/batch-a.txt", []byte("aaaa"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -126,7 +124,6 @@ func TestServerQuotaOutboxBatchProcessesDifferentFiles(t *testing.T) {
 
 func TestQuotaOutboxFallbackFailureRecordsProcessDurationOnly(t *testing.T) {
 	b, _ := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	if _, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
@@ -176,7 +173,6 @@ func TestQuotaOutboxFallbackFailureRecordsProcessDurationOnly(t *testing.T) {
 
 func TestQuotaOutboxBatchConflictExhaustedRecordsTenantMetrics(t *testing.T) {
 	b, _ := newCentralQuotaBackend(t)
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	var called int
@@ -219,7 +215,6 @@ func TestQuotaOutboxBatchConflictExhaustedRecordsTenantMetrics(t *testing.T) {
 
 func TestQuotaOutboxBatchClaimInvalidConnectionRecordsBadConn(t *testing.T) {
 	b, _ := newCentralQuotaBackend(t)
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	b.claimQuotaOutbox = func(context.Context, time.Time, time.Duration, int) (datastore.QuotaOutboxBatchClaimResult, error) {
@@ -242,7 +237,6 @@ func TestQuotaOutboxBatchClaimInvalidConnectionRecordsBadConn(t *testing.T) {
 
 func TestQuotaOutboxWorkerRepollsAfterUnderfilledSameFileBatch(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 	fileID := "same-file-backlog"
 
@@ -286,7 +280,6 @@ func TestQuotaOutboxWorkerRepollsAfterUnderfilledSameFileBatch(t *testing.T) {
 
 func TestServerQuotaSmallWriteDoesNotWaitForAdmissionLock(t *testing.T) {
 	b, _ := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	lockTx, err := b.store.DB().BeginTx(ctx, nil)
@@ -319,7 +312,6 @@ func TestServerQuotaSmallWriteDoesNotWaitForAdmissionLock(t *testing.T) {
 
 func TestQuotaOutboxWorkerHoldsAdmissionLockAcrossApplyAndAck(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	if _, err := b.WriteCtx(ctx, "/locked-outbox.txt", []byte("payload"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -366,7 +358,6 @@ func TestQuotaOutboxWorkerHoldsAdmissionLockAcrossApplyAndAck(t *testing.T) {
 
 func TestQuotaOutboxWorkerCommitsRetryAfterApplyError(t *testing.T) {
 	b, _ := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	id, err := b.store.EnqueueQuotaOutboxTx(b.store.DB(), &datastore.QuotaOutboxEntry{
@@ -405,59 +396,8 @@ func TestQuotaOutboxWorkerCommitsRetryAfterApplyError(t *testing.T) {
 	}
 }
 
-func TestQuotaOutboxNotifyQuietHasMaxWait(t *testing.T) {
-	b := &Dat9Backend{quotaOutboxNotify: make(chan struct{}, quotaOutboxNotifySize)}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-stop:
-				return
-			case <-ticker.C:
-				select {
-				case b.quotaOutboxNotify <- struct{}{}:
-				default:
-				}
-			}
-		}
-	}()
-
-	start := time.Now()
-	if !b.waitQuotaOutboxNotifyQuiet(ctx) {
-		t.Fatal("waitQuotaOutboxNotifyQuiet returned false")
-	}
-	if dur := time.Since(start); dur > 500*time.Millisecond {
-		t.Fatalf("waitQuotaOutboxNotifyQuiet duration = %s, want bounded by max delay", dur)
-	}
-}
-
-func TestQuotaOutboxNotifyQuietReturnsAfterQuietPeriod(t *testing.T) {
-	b := &Dat9Backend{quotaOutboxNotify: make(chan struct{}, quotaOutboxNotifySize)}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	start := time.Now()
-	if !b.waitQuotaOutboxNotifyQuiet(ctx) {
-		t.Fatal("waitQuotaOutboxNotifyQuiet returned false")
-	}
-	dur := time.Since(start)
-	if dur < quotaOutboxNotifyDelay/2 {
-		t.Fatalf("waitQuotaOutboxNotifyQuiet duration = %s, want quiet-period wait", dur)
-	}
-	if dur > quotaOutboxNotifyMaxDelay+100*time.Millisecond {
-		t.Fatalf("waitQuotaOutboxNotifyQuiet duration = %s, want before max delay", dur)
-	}
-}
-
 func TestDrainQuotaOutboxForFileErrorsWhenPendingRowIsNotClaimable(t *testing.T) {
 	b, _ := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	if _, err := b.WriteCtx(ctx, "/leased.txt", []byte("payload"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -494,7 +434,6 @@ func TestUploadOverwriteQueuesCompleteBehindPendingFileMutation(t *testing.T) {
 		MaxMonthlyCostMC: 1 << 30,
 	}
 	b.SetMetaQuotaStore(context.Background(), "tenant-a", fake)
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	if _, err := b.WriteCtx(ctx, "/target.bin", []byte("old"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -571,7 +510,6 @@ func TestUploadOverwriteQueuesCompleteBehindPendingFileMutation(t *testing.T) {
 
 func TestUploadCompleteOutboxRetryAfterCentralApplyDoesNotDoubleCharge(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	const (
@@ -659,7 +597,6 @@ func TestUploadCompleteOutboxRetryAfterCentralApplyDoesNotDoubleCharge(t *testin
 
 func TestDrainQuotaOutboxForFileContinuesAfterUnrelatedBatchError(t *testing.T) {
 	b, _ := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	for i := 0; i < quotaOutboxBatchSize; i++ {
@@ -709,7 +646,6 @@ func TestDrainQuotaOutboxForFileContinuesAfterUnrelatedBatchError(t *testing.T) 
 
 func TestServerQuotaPendingOutboxDeltaRejectsOverLimitWrite(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	fake.mu.Lock()
@@ -743,7 +679,6 @@ func TestServerQuotaPendingOutboxDeltaRejectsOverLimitWrite(t *testing.T) {
 
 func TestServerQuotaPendingOutboxDeltaRejectsUploadReserve(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	fake.mu.Lock()
@@ -780,7 +715,6 @@ func TestServerQuotaPendingOutboxDeltaRejectsUploadReserve(t *testing.T) {
 
 func TestServerQuotaUploadReserveUsesLivePendingOutboxDeltas(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	fake.mu.Lock()
@@ -827,7 +761,6 @@ func TestServerQuotaUploadReserveUsesLivePendingOutboxDeltas(t *testing.T) {
 
 func TestServerQuotaReserveUploadRetrySkipsPendingPrecheck(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	fake.mu.Lock()
@@ -860,7 +793,6 @@ func TestServerQuotaReserveUploadRetrySkipsPendingPrecheck(t *testing.T) {
 
 func TestServerQuotaOverwriteOutboxUsesLockedCurrentMeta(t *testing.T) {
 	b, _ := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	if _, err := b.WriteCtx(ctx, "/stale.txt", []byte("1234567890"), 0, filesystem.WriteFlagCreate); err != nil {
@@ -891,7 +823,6 @@ func TestServerQuotaMediaCheckIncludesCurrentWrite(t *testing.T) {
 			Extractor: &staticAudioExtractor{text: "transcript"},
 		},
 	})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	fake.mu.Lock()

@@ -69,6 +69,17 @@ const (
 	symlinkContentType        = "application/x-symlink"
 )
 
+// Work mask constants for the unified tenant notify outbox. These mirror the
+// constants in pkg/server/work_mask.go but are defined here in the backend
+// package so the write path can signal which work types were enqueued without
+// importing the server package (which would be a circular dependency).
+const (
+	BackendWorkSSE      = 1  // wake local SSE bus
+	BackendWorkSemantic  = 2  // kick semantic worker
+	BackendWorkFileGC    = 4  // kick file GC worker
+	BackendWorkQuota     = 8  // kick quota outbox worker
+)
+
 // Dat9Backend implements filesystem.FileSystem with the inode model.
 type Dat9Backend struct {
 	store         *datastore.Store
@@ -116,9 +127,6 @@ type Dat9Backend struct {
 	mutationWG    sync.WaitGroup
 	mutationStop  context.CancelFunc
 
-	quotaOutboxNotify chan struct{}
-	quotaOutboxWG     sync.WaitGroup
-	quotaOutboxStop   context.CancelFunc
 	claimQuotaOutbox  quotaOutboxBatchClaimer
 
 	s3EncryptionPolicy meta.ResolvedS3EncryptionPolicy
@@ -139,13 +147,13 @@ type Dat9Backend struct {
 	audioExtractMaxSize      int64
 	maxAudioExtractTextBytes int
 
-	fileGCWorker     *FileGCWorker
 	runtimeMetricsID uint64
 
-	// semanticTaskNotifier, when set, runs after a write or upload commit that
-	// enqueued at least one durable semantic task, so the semantic worker can
-	// claim it immediately instead of waiting for the tenant scan.
-	semanticTaskNotifier atomic.Pointer[func()]
+	// workEnqueuedNotifier, when set, runs after a write or upload commit that
+	// enqueued durable work (semantic task, file_gc task, quota outbox row),
+	// so the unified tenant worker can claim it immediately instead of waiting
+	// for a kick from the outbox poller.
+	workEnqueuedNotifier atomic.Pointer[func(workMask int)]
 
 	// Monthly LLM cost budget (P1).
 	maxMonthlyLLMCostMillicents     int64
@@ -168,24 +176,25 @@ func newBaseBackend(store *datastore.Store) *Dat9Backend {
 	}
 }
 
-// SetSemanticTaskEnqueuedNotifier registers fn to run after a write or upload
-// commit that enqueued at least one durable semantic task. fn must be cheap
-// and non-blocking: it is invoked inline on the write path. A dropped or
-// missing notification is safe — tasks are durable and the semantic worker's
-// periodic tenant scan claims them eventually.
-func (b *Dat9Backend) SetSemanticTaskEnqueuedNotifier(fn func()) {
+// SetWorkEnqueuedNotifier registers fn to run after a write or upload commit
+// that enqueues durable work (semantic task, file_gc task, or quota outbox row).
+// The workMask argument tells the caller which work types were enqueued. fn
+// must be cheap and non-blocking: it is invoked inline on the write path. A
+// dropped or missing notification is safe — work is durable and the unified
+// outbox poller + safety-net scan claim it eventually.
+func (b *Dat9Backend) SetWorkEnqueuedNotifier(fn func(workMask int)) {
 	if b == nil {
 		return
 	}
-	b.semanticTaskNotifier.Store(&fn)
+	b.workEnqueuedNotifier.Store(&fn)
 }
 
-func (b *Dat9Backend) notifySemanticTaskEnqueued(enqueued bool) {
-	if !enqueued {
+func (b *Dat9Backend) notifyWorkEnqueued(workMask int) {
+	if workMask == 0 {
 		return
 	}
-	if fn := b.semanticTaskNotifier.Load(); fn != nil && *fn != nil {
-		(*fn)()
+	if fn := b.workEnqueuedNotifier.Load(); fn != nil && *fn != nil {
+		(*fn)(workMask)
 	}
 }
 
@@ -317,7 +326,7 @@ func (b *Dat9Backend) CreateCtx(ctx context.Context, path string) (err error) {
 	}
 	if quotaOutboxEnqueued {
 		b.addLocalQuotaPendingDeltas(0, 1, 0)
-		b.notifyQuotaOutbox(true)
+		b.notifyWorkEnqueued(BackendWorkQuota)
 	} else {
 		b.syncCentralFileCreate(ctx, fileID, 0, "")
 	}
@@ -402,7 +411,7 @@ func (b *Dat9Backend) CreateSymlinkCtx(ctx context.Context, linkPath, target str
 			mediaDelta = 1
 		}
 		b.addLocalQuotaPendingDeltas(int64(len(data)), 1, mediaDelta)
-		b.notifyQuotaOutbox(true)
+		b.notifyWorkEnqueued(BackendWorkQuota)
 	} else {
 		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), symlinkContentType)
 	}
@@ -1050,7 +1059,9 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 	if timingEnabled {
 		tenantTxDuration = time.Since(txStart)
 	}
-	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
+	if semanticTaskEnqueued {
+		b.notifyWorkEnqueued(BackendWorkSemantic)
+	}
 	centralQuotaStart := time.Time{}
 	if timingEnabled {
 		centralQuotaStart = time.Now()
@@ -1061,7 +1072,7 @@ func (b *Dat9Backend) createAndWriteCtx(ctx context.Context, path string, data [
 			mediaDelta = 1
 		}
 		b.addLocalQuotaPendingDeltas(int64(len(data)), 1, mediaDelta)
-		b.notifyQuotaOutbox(true)
+		b.notifyWorkEnqueued(BackendWorkQuota)
 	} else {
 		b.syncCentralFileCreate(ctx, fileID, int64(len(data)), contentType)
 	}
@@ -1325,7 +1336,9 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 		}
 		return 0, 0, err
 	}
-	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
+	if semanticTaskEnqueued {
+		b.notifyWorkEnqueued(BackendWorkSemantic)
+	}
 	centralQuotaStart := time.Time{}
 	if timingEnabled {
 		centralQuotaStart = time.Now()
@@ -1336,7 +1349,7 @@ func (b *Dat9Backend) overwriteFileCtxWithRev(ctx context.Context, nf *datastore
 			0,
 			quotaMediaDelta(isQuotaMediaContentType(nf.File.ContentType), isQuotaMediaContentType(contentType)),
 		)
-		b.notifyQuotaOutbox(true)
+		b.notifyWorkEnqueued(BackendWorkQuota)
 	} else {
 		b.syncCentralFileOverwrite(ctx, nf.File.FileID, nf.File.SizeBytes, nf.File.ContentType, int64(len(finalData)), contentType)
 	}

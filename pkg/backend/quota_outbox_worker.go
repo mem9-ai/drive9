@@ -14,10 +14,6 @@ import (
 )
 
 const (
-	quotaOutboxNotifySize               = 1
-	quotaOutboxNotifyDelay              = 50 * time.Millisecond
-	quotaOutboxNotifyMaxDelay           = 200 * time.Millisecond
-	quotaOutboxPollInterval             = 1 * time.Second
 	quotaOutboxLeaseDuration            = 5 * time.Minute
 	quotaOutboxBatchSize                = 100
 	quotaOutboxRecoverLimit             = 100
@@ -33,88 +29,6 @@ const (
 )
 
 type quotaOutboxBatchClaimer func(context.Context, time.Time, time.Duration, int) (datastore.QuotaOutboxBatchClaimResult, error)
-
-func (b *Dat9Backend) startQuotaOutboxWorker() {
-	if b.quotaOutboxNotify != nil {
-		return
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	b.quotaOutboxStop = cancel
-	b.quotaOutboxNotify = make(chan struct{}, quotaOutboxNotifySize)
-	b.quotaOutboxWG.Add(1)
-	go b.runQuotaOutboxWorker(ctx)
-}
-
-func (b *Dat9Backend) stopQuotaOutboxWorker() {
-	if b.quotaOutboxStop != nil {
-		b.quotaOutboxStop()
-		b.quotaOutboxWG.Wait()
-		b.quotaOutboxStop = nil
-		b.quotaOutboxNotify = nil
-	}
-}
-
-func (b *Dat9Backend) notifyQuotaOutbox(enqueued bool) {
-	if !enqueued || b.quotaOutboxNotify == nil {
-		return
-	}
-	select {
-	case b.quotaOutboxNotify <- struct{}{}:
-	default:
-	}
-}
-
-func (b *Dat9Backend) runQuotaOutboxWorker(ctx context.Context) {
-	defer b.quotaOutboxWG.Done()
-
-	ticker := time.NewTicker(quotaOutboxPollInterval)
-	defer ticker.Stop()
-
-	b.processQuotaOutboxAvailable(ctx)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-b.quotaOutboxNotify:
-			if !b.waitQuotaOutboxNotifyQuiet(ctx) {
-				return
-			}
-			b.processQuotaOutboxAvailable(ctx)
-		case <-ticker.C:
-			b.processQuotaOutboxAvailable(ctx)
-		}
-	}
-}
-
-func (b *Dat9Backend) waitQuotaOutboxNotifyQuiet(ctx context.Context) bool {
-	if quotaOutboxNotifyDelay <= 0 {
-		return true
-	}
-	// Coalesce bursts until the channel is quiet for quotaOutboxNotifyDelay.
-	// quotaOutboxNotifyMaxDelay bounds the wait under a steady write stream.
-	timer := time.NewTimer(quotaOutboxNotifyDelay)
-	defer timer.Stop()
-	maxTimer := time.NewTimer(quotaOutboxNotifyMaxDelay)
-	defer maxTimer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return false
-		case <-timer.C:
-			return true
-		case <-maxTimer.C:
-			return true
-		case <-b.quotaOutboxNotify:
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(quotaOutboxNotifyDelay)
-		}
-	}
-}
 
 func (b *Dat9Backend) processQuotaOutboxAvailable(ctx context.Context) {
 	if ctx.Err() != nil || b.store == nil || b.metaStore == nil || b.tenantID == "" {
@@ -149,7 +63,6 @@ func (b *Dat9Backend) processQuotaOutboxAvailable(ctx context.Context) {
 		}
 		processedTotal += processed
 	}
-	b.notifyQuotaOutbox(true)
 }
 
 func (b *Dat9Backend) drainQuotaOutboxForFile(ctx context.Context, fileID string, limit int) error {

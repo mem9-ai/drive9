@@ -117,11 +117,10 @@ func newLeaderLifecycleServerWithLeader(t *testing.T, leaderMgr *leader.Manager)
 		Provisioner:      prov,
 		TokenSecret:      []byte("leader-lifecycle-test-secret"),
 		SemanticEmbedder: staticSemanticEmbedder{vec: []float32{0.1, 0.2, 0.3}},
-		SemanticWorkers: SemanticWorkerOptions{
-			Workers:         1,
-			PollInterval:    10 * time.Millisecond,
-			RecoverInterval: 50 * time.Millisecond,
-			LeaseDuration:   200 * time.Millisecond,
+		TenantWorkers: TenantWorkerOptions{
+			Workers:       1,
+			PollInterval:  10 * time.Millisecond,
+			LeaseDuration: 200 * time.Millisecond,
 		},
 		Leader: leaderMgr,
 		Logger: zap.NewNop(),
@@ -150,12 +149,12 @@ func newLeaderLifecycleServerWithLeader(t *testing.T, leaderMgr *leader.Manager)
 // It uses a disabled leader manager, whose Start invokes onLead synchronously,
 // so the assertions are deterministic.
 func TestLeaderGatedWorkersStartAndStop(t *testing.T) {
-	srv, pool, tenantID := newLeaderLifecycleServer(t)
+	srv, _, _ := newLeaderLifecycleServer(t)
 
 	// NewWithConfig already called leader.Start(), which (disabled) fired
 	// onLead synchronously, so all leader-gated workers should be running.
-	if srv.semanticWorker == nil || srv.semanticWorker.cancel == nil {
-		t.Fatal("semantic worker should be started on leadership gain")
+	if srv.tenantWorker == nil || srv.tenantWorker.cancel == nil {
+		t.Fatal("tenant worker should be started on leadership gain")
 	}
 	if srv.objectGCWorker == nil || !objectGCWorkerRunning(srv.objectGCWorker) {
 		t.Fatal("object GC worker should be started on leadership gain")
@@ -168,14 +167,6 @@ func TestLeaderGatedWorkersStartAndStop(t *testing.T) {
 	}
 	if !srv.leaderWorkersStarted {
 		t.Fatal("leaderWorkersStarted flag should be true after onLead")
-	}
-	// Per-tenant FileGC: the cached backend should have a running FileGC worker.
-	b := pool.S3Backend(tenantID)
-	if b == nil {
-		t.Fatal("cached backend should exist for the tenant")
-	}
-	if !b.FileGCWorkerRunning() {
-		t.Fatal("per-tenant FileGC worker should be started on leadership gain")
 	}
 
 	// Simulate leadership loss. onLose should stop ALL leader-gated workers.
@@ -190,11 +181,8 @@ func TestLeaderGatedWorkersStartAndStop(t *testing.T) {
 	if srv.expirySweepWorker != nil {
 		t.Fatal("expiry sweep worker should be nil after onLose")
 	}
-	if srv.semanticWorker != nil && srv.semanticWorker.cancel != nil {
-		t.Fatal("semantic worker should be stopped after onLose")
-	}
-	if b.FileGCWorkerRunning() {
-		t.Fatal("per-tenant FileGC worker should be stopped after onLose")
+	if srv.tenantWorker != nil && srv.tenantWorker.cancel != nil {
+		t.Fatal("tenant worker should be stopped after onLose")
 	}
 }
 
@@ -284,11 +272,8 @@ func TestLeaderGatedWorkersCloseRacesOnLead(t *testing.T) {
 		if objectGCWorkerRunning(srv.objectGCWorker) {
 			t.Fatalf("iter %d: object GC worker should be stopped after Close", i)
 		}
-		if srv.semanticWorker != nil && srv.semanticWorker.cancel != nil {
-			t.Fatalf("iter %d: semantic worker should be stopped after Close", i)
-		}
-		if b.FileGCWorkerRunning() {
-			t.Fatalf("iter %d: per-tenant FileGC worker should be stopped after Close", i)
+		if srv.tenantWorker != nil && srv.tenantWorker.cancel != nil {
+			t.Fatalf("iter %d: tenant worker should be stopped after Close", i)
 		}
 	}
 }
@@ -319,9 +304,6 @@ func TestLeaderGatedWorkersOnLoseRacesOnLead(t *testing.T) {
 		}
 		if srv.replayWorker != nil || srv.expirySweepWorker != nil {
 			t.Fatalf("iter %d: central-quota worker should be nil after final onLose", i)
-		}
-		if b.FileGCWorkerRunning() {
-			t.Fatalf("iter %d: per-tenant FileGC worker should be stopped after final onLose", i)
 		}
 		// Clean up the server (no-op stop path) and pool.
 		srv.Close()

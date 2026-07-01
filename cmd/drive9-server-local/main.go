@@ -171,11 +171,11 @@ func main() {
 		zap.String("embedding_mode", string(localEmbeddingMode)))
 
 	stepStart = time.Now()
-	semanticEmbedder, workerOpts, err := buildSemanticWorkerConfigFromEnv()
+	semanticEmbedder, workerOpts, err := buildTenantWorkerConfigFromEnv()
 	if err != nil {
 		die(err)
 	}
-	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_semantic_worker_config")
+	logLocalStartupStep(startupCtx, startupStart, stepStart, "build_tenant_worker_config")
 	// Keep the local entrypoint aligned with drive9-server: if only the background
 	// embedder is configured, grep reuses it for app-side query embedding.
 	if semanticEmbedder != nil && backendOpts.QueryEmbedding.Client == nil {
@@ -275,9 +275,8 @@ func main() {
 		logLocalStartupStep(startupCtx, startupStart, stepStart, "wire_central_quota",
 			zap.String("meta_dsn", redactDSN(metaDSN)))
 	}
-	b.StartFileGCWorker(backend.FileGCWorkerOptions{})
 
-	if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
+	if err := server.ValidateDurableAsyncExtractRequiresTenantWorker(server.Config{
 		Backend:          b,
 		LocalS3:          localS3,
 		VaultMasterKey:   vaultMasterKey,
@@ -285,7 +284,7 @@ func main() {
 		MaxUploadBytes:   maxUploadBytes,
 		Logger:           srvLogger,
 		SemanticEmbedder: semanticEmbedder,
-		SemanticWorkers:  workerOpts,
+		TenantWorkers:    workerOpts,
 	}, backendOpts, true); err != nil {
 		die(err)
 	}
@@ -302,7 +301,12 @@ func main() {
 		MaxUploadBytes:    maxUploadBytes,
 		Logger:            srvLogger,
 		SemanticEmbedder:  semanticEmbedder,
-		SemanticWorkers:   workerOpts,
+		TenantWorkers:     workerOpts,
+		TenantOutboxPollInterval:        envDuration("DRIVE9_TENANT_OUTBOX_POLL_INTERVAL_MS", 200*time.Millisecond),
+		TenantOutboxCursorFlushInterval: envDuration("DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS", 5000*time.Millisecond),
+		TenantShardRefreshInterval:      envDuration("DRIVE9_TENANT_SHARD_REFRESH_MS", 5000*time.Millisecond),
+		TenantMaintenanceInterval:       envDuration("DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS", 300000*time.Millisecond),
+		SafetyNetScanInterval:           envDuration("DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS", 300000*time.Millisecond),
 	})
 	defer srv.Close()
 	logLocalStartupStep(startupCtx, startupStart, stepStart, "create_server")
@@ -405,10 +409,14 @@ environment:
   DRIVE9_SEMANTIC_WORKERS number of background workers (default: 1)
   DRIVE9_SEMANTIC_POLL_INTERVAL_MS worker poll interval in milliseconds (default: 200)
   DRIVE9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30)
-  DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
   DRIVE9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
   DRIVE9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
   DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
+  DRIVE9_TENANT_OUTBOX_POLL_INTERVAL_MS  unified outbox poll interval (default: 200)
+  DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS   poller cursor flush interval (default: 5000)
+  DRIVE9_TENANT_SHARD_REFRESH_MS         shard resolver ring refresh (default: 5000)
+  DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS  piggyback maintenance throttle (default: 300000)
+  DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS     leader safety-net scan interval (default: 300000)
 
   Image extraction (async image -> text for search):
   DRIVE9_IMAGE_EXTRACT_ENABLED true|false (default: false)
@@ -727,15 +735,13 @@ func buildBackendOptionsFromEnv() (backend.Options, error) {
 	return opts, nil
 }
 
-func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorkerOptions, error) {
-	opts := server.SemanticWorkerOptions{
+func buildTenantWorkerConfigFromEnv() (embedding.Client, server.TenantWorkerOptions, error) {
+	opts := server.TenantWorkerOptions{
 		Workers:              envInt("DRIVE9_SEMANTIC_WORKERS", 1),
 		PollInterval:         time.Duration(envInt("DRIVE9_SEMANTIC_POLL_INTERVAL_MS", 200)) * time.Millisecond,
 		LeaseDuration:        time.Duration(envInt("DRIVE9_SEMANTIC_LEASE_SECONDS", 30)) * time.Second,
-		RecoverInterval:      time.Duration(envInt("DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
 		RetryBaseDelay:       time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
 		RetryMaxDelay:        time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
-		TenantScanLimit:      envInt("DRIVE9_SEMANTIC_TENANT_LIMIT", 128),
 		PerTenantConcurrency: envInt("DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
 	}
 	baseURL := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_API_BASE"))

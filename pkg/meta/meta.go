@@ -711,6 +711,29 @@ func metaInitSchemaStatements() []string {
 			updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
 			PRIMARY KEY (pod_id, tenant_id)
 		)`,
+		// tenant_notify_outbox is the unified outbox that replaces per-tenant TiDB
+		// polling for SSE, semantic, file_gc, and quota work. Each write path inserts
+		// a lightweight row (tenant_id + work_mask) into this always-provisioned meta
+		// DB table. Every pod polls it at 200ms and dispatches by work_mask: SSE bits
+		// wake the local bus (broadcast to all pods with subscribers); semantic/file_gc/
+		// quota bits kick the unified worker only on the shard owner. This eliminates
+		// all periodic per-tenant TiDB scans, enabling serverless scale-to-zero.
+		`CREATE TABLE IF NOT EXISTS tenant_notify_outbox (
+			id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+			tenant_id   VARCHAR(64) NOT NULL,
+			work_mask   TINYINT UNSIGNED NOT NULL DEFAULT 0,
+			created_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+			INDEX idx_tenant_notify_created (created_at)
+		)`,
+		// tenant_outbox_cursor stores each pod's last-processed outbox id so a pod
+		// can resume after restart without skipping work and without re-reading all
+		// history. Each pod owns its own row (keyed by pod_id).
+		`CREATE TABLE IF NOT EXISTS tenant_outbox_cursor (
+			pod_id      VARCHAR(64) NOT NULL,
+			last_id     BIGINT UNSIGNED NOT NULL DEFAULT 0,
+			updated_at  DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+			PRIMARY KEY (pod_id)
+		)`,
 	}
 }
 
@@ -3503,4 +3526,158 @@ func (s *Store) DeleteSubscriptionsForStalePods(ctx context.Context) (n int64, e
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// ---------------------------------------------------------------------------
+// Unified tenant notify outbox
+// ---------------------------------------------------------------------------
+
+// TenantNotifyRow mirrors a row in tenant_notify_outbox. Each row is a
+// lightweight work signal: tenant_id identifies the tenant and work_mask is a
+// bitmask of work types to dispatch (SSE, semantic, file_gc, quota).
+type TenantNotifyRow struct {
+	ID        uint64
+	TenantID  string
+	WorkMask  int
+	CreatedAt time.Time
+}
+
+// InsertTenantNotify writes a unified work signal to tenant_notify_outbox.
+// This is best-effort: if the INSERT fails, the work is still durable in the
+// per-tenant TiDB and will be recovered by the safety-net scan. The central
+// meta DB is always provisioned so this write never wakes a serverless tenant.
+func (s *Store) InsertTenantNotify(ctx context.Context, tenantID string, workMask int) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "insert_tenant_notify", start, &err)
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO tenant_notify_outbox (tenant_id, work_mask) VALUES (?, ?)`,
+		tenantID, workMask)
+	return err
+}
+
+// ListTenantNotifySince returns outbox rows with id > afterID, ordered by id,
+// up to limit. The consumer advances its cursor to the last row's id so
+// subsequent calls do not re-read the same rows.
+func (s *Store) ListTenantNotifySince(ctx context.Context, afterID uint64, limit int) (out []TenantNotifyRow, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_tenant_notify_since", start, &err)
+	if limit <= 0 {
+		limit = 1000
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, tenant_id, work_mask, created_at FROM tenant_notify_outbox WHERE id > ? ORDER BY id LIMIT ?`,
+		afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var rec TenantNotifyRow
+		if err = rows.Scan(&rec.ID, &rec.TenantID, &rec.WorkMask, &rec.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// MaxTenantNotifyID returns the current maximum id in tenant_notify_outbox, or
+// 0 if the table is empty. Used by a pod on first launch to skip historical rows
+// (the pod never owned work before its first start).
+func (s *Store) MaxTenantNotifyID(ctx context.Context) (out uint64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "max_tenant_notify_id", start, &err)
+	row := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM tenant_notify_outbox`)
+	if err = row.Scan(&out); err != nil {
+		return 0, err
+	}
+	return out, nil
+}
+
+// DeleteTenantNotifyBefore prunes outbox rows older than the given threshold.
+// Leader-gated; retention is relative to DB insert time (created_at).
+func (s *Store) DeleteTenantNotifyBefore(ctx context.Context, before time.Time) (n int64, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_tenant_notify_before", start, &err)
+	res, err := s.db.ExecContext(ctx, `DELETE FROM tenant_notify_outbox WHERE created_at < ?`, before)
+	if err != nil {
+		return 0, err
+	}
+	n, err = res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ---------------------------------------------------------------------------
+// Tenant outbox cursor
+// ---------------------------------------------------------------------------
+
+// TenantOutboxCursorRow mirrors a row in tenant_outbox_cursor.
+type TenantOutboxCursorRow struct {
+	PodID     string
+	LastID    uint64
+	UpdatedAt time.Time
+}
+
+// GetTenantOutboxCursor returns the persisted cursor (last_id) for podID, or
+// ErrNotFound if no row exists (first launch). The pod uses this on restart to
+// resume processing without skipping work.
+func (s *Store) GetTenantOutboxCursor(ctx context.Context, podID string) (out *TenantOutboxCursorRow, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "get_tenant_outbox_cursor", start, &err)
+	row := s.db.QueryRowContext(ctx,
+		`SELECT pod_id, last_id, updated_at FROM tenant_outbox_cursor WHERE pod_id = ?`, podID)
+	var rec TenantOutboxCursorRow
+	if err = row.Scan(&rec.PodID, &rec.LastID, &rec.UpdatedAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &rec, nil
+}
+
+// UpsertTenantOutboxCursor persists (or refreshes) the cursor for podID. The
+// poller flushes its in-memory last_id every few seconds so a restart resumes
+// from the last processed row.
+func (s *Store) UpsertTenantOutboxCursor(ctx context.Context, podID string, lastID uint64) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "upsert_tenant_outbox_cursor", start, &err)
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO tenant_outbox_cursor (pod_id, last_id) VALUES (?, ?)
+		 ON DUPLICATE KEY UPDATE last_id = VALUES(last_id), updated_at = CURRENT_TIMESTAMP(3)`,
+		podID, lastID)
+	return err
+}
+
+// DeleteTenantOutboxCursor removes the cursor row for podID. Used when a pod
+// is decommissioned so its cursor doesn't linger.
+func (s *Store) DeleteTenantOutboxCursor(ctx context.Context, podID string) (err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "delete_tenant_outbox_cursor", start, &err)
+	_, err = s.db.ExecContext(ctx, `DELETE FROM tenant_outbox_cursor WHERE pod_id = ?`, podID)
+	return err
+}
+
+// ListAllActivePodIDs returns the pod_id of every active pod in pod_registry,
+// ordered by pod_id. Used by the shard resolver to build the active pod ring.
+func (s *Store) ListAllActivePodIDs(ctx context.Context) (out []string, err error) {
+	start := time.Now()
+	defer observeMeta(ctx, "list_all_active_pod_ids", start, &err)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT pod_id FROM pod_registry WHERE status = 'active' ORDER BY pod_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var podID string
+		if err = rows.Scan(&podID); err != nil {
+			return nil, err
+		}
+		out = append(out, podID)
+	}
+	return out, rows.Err()
 }

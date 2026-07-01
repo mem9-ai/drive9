@@ -144,7 +144,7 @@ func (b *Dat9Backend) SetMetaQuotaStore(ctx context.Context, tenantID string, mq
 			b.quotaPendingCache = newQuotaPendingDeltasCache(b.tenantID, b.store.PendingQuotaOutboxDeltas, quotaPendingDeltasCacheTTL)
 		}
 		b.startMutationWorker()
-		b.startQuotaOutboxWorker()
+		_ = b.metaStore // quota outbox is kick-driven
 	}
 }
 

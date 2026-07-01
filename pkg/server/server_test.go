@@ -1254,7 +1254,7 @@ func TestSymlinkAllowsMaxTargetWithWorstCaseJSONEscaping(t *testing.T) {
 }
 
 func TestSymlinkReturns507WhenTenantStorageQuotaExceeded(t *testing.T) {
-	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 10}, SemanticWorkerOptions{})
+	s, _ := newTestServerWithS3Config(t, backend.Options{MaxTenantStorageBytes: 10}, TenantWorkerOptions{})
 	ts := httptest.NewServer(s)
 	defer ts.Close()
 

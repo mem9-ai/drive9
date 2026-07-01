@@ -246,7 +246,7 @@ func TestEventBusEventsSinceQueryErrorReturnsCaughtUp(t *testing.T) {
 // while other subscribers remain connected returns immediately (B1 regression test).
 // Before the original fix, Unsubscribe unconditionally waited on the poll goroutine,
 // blocking until all other subscribers left. (The per-bus poll goroutine has since
-// been removed entirely — cross-pod discovery is now centralized in the notifyPoller
+// been removed entirely — cross-pod discovery is now centralized in the tenantOutboxPoller
 // — but the fast-return property is still asserted here.)
 func TestEventBusUnsubscribeOneOfManyReturnsImmediately(t *testing.T) {
 	store := newTestStoreForEventBus(t)

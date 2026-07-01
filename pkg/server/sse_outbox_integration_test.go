@@ -251,12 +251,12 @@ func parseInt(s string) (int, error) {
 
 // TestSSEOutboxCrossPodPollerDelivery verifies the end-to-end flow:
 //  1. Pod B has an SSE subscriber for a tenant (bus with listener).
-//  2. Pod A writes an fs_events row + sse_notify_outbox row (simulating a
-//     cross-pod write via publishEvent).
-//  3. Pod B's notifyPoller discovers the outbox row and wakes its local
+//  2. Pod A writes a tenant_notify_outbox row with the SSE bit set
+//     (simulating a cross-pod write via publishEvent).
+//  3. Pod B's tenantOutboxPoller discovers the outbox row and wakes its local
 //     subscriber via Publish.
 //
-// This tests the 200ms fallback poller path.
+// This tests the 200ms unified outbox poller path.
 func TestSSEOutboxCrossPodPollerDelivery(t *testing.T) {
 	tc := newSSEOutboxTestCluster(t)
 
@@ -265,16 +265,12 @@ func TestSSEOutboxCrossPodPollerDelivery(t *testing.T) {
 	subID, notify := busB.Subscribe()
 	defer busB.Unsubscribe(subID)
 
-	// Pod A: write an outbox row (simulating publishEvent's outbox step).
-	// We don't need to actually write to fs_events for the poller test — the
-	// poller only reads the outbox pointer and wakes the bus. The SSE handler
-	// would then call EventsSince to read fs_events, but here we just verify
-	// the notify signal fires.
-	if err := tc.metaStore.InsertSSENotify(context.Background(), tc.tenantID, 1); err != nil {
+	// Pod A: write a unified outbox row (simulating publishEvent's outbox step).
+	if err := tc.metaStore.InsertTenantNotify(context.Background(), tc.tenantID, WorkSSE); err != nil {
 		t.Fatal(err)
 	}
 
-	// Pod B's notifyPoller should discover the outbox row within ~2s and
+	// Pod B's tenantOutboxPoller should discover the outbox row within ~3s and
 	// wake the subscriber.
 	select {
 	case _, open := <-notify:
@@ -284,45 +280,6 @@ func TestSSEOutboxCrossPodPollerDelivery(t *testing.T) {
 		// Success: cross-pod outbox delivery via the poller.
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for cross-pod outbox delivery via poller")
-	}
-}
-
-// TestSSEOutboxCrossPodPushDelivery verifies the HTTP push path:
-//  1. Pod B has an SSE subscriber for a tenant.
-//  2. Pod B reports its subscription (pod_subscriptions) so Pod A's
-//     podNotifier route table includes it.
-//  3. Pod A calls podNotifier.Notify, which pushes HTTP to Pod B.
-//  4. Pod B's handleInternalSSENotify wakes the subscriber.
-func TestSSEOutboxCrossPodPushDelivery(t *testing.T) {
-	tc := newSSEOutboxTestCluster(t)
-
-	// Pod B: create a bus and subscribe.
-	busB := tc.podB.events.get(tc.tenantID, nil)
-	subID, notify := busB.Subscribe()
-	defer busB.Unsubscribe(subID)
-
-	// Register Pod B's subscription in pod_subscriptions (simulating what
-	// podRegistry.subscriptionLoop does). Both pods are already registered
-	// in pod_registry by newSSEOutboxTestCluster.
-	if err := tc.metaStore.UpsertPodSubscriptions(context.Background(), "pod-b", []string{tc.tenantID}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Refresh Pod A's podNotifier route table synchronously instead of
-	// waiting for the 5s ticker. This is deterministic and avoids the 6s sleep.
-	tc.podA.podNotifier.refresh(context.Background())
-
-	// Pod A notifies its peers — should push to Pod B.
-	tc.podA.podNotifier.Notify(tc.tenantID, 1)
-
-	select {
-	case _, open := <-notify:
-		if !open {
-			t.Fatal("notify channel closed")
-		}
-		// Success: cross-pod push delivery.
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for cross-pod push delivery")
 	}
 }
 
@@ -486,36 +443,52 @@ func TestSSEOutboxStalePodSweep(t *testing.T) {
 	}
 }
 
-// TestSSEOutboxOutboxCleanup verifies that the leader's cleanupSSENotifyOutbox
+// TestSSEOutboxOutboxCleanup verifies that the leader's cleanupTenantNotifyOutbox
 // prunes old outbox rows.
 func TestSSEOutboxOutboxCleanup(t *testing.T) {
 	tc := newSSEOutboxTestCluster(t)
 
 	// Insert an outbox row with an old created_at.
 	_, err := tc.metaStore.DB().ExecContext(context.Background(),
-		`INSERT INTO sse_notify_outbox (tenant_id, seq, created_at) VALUES (?, ?, ?)`,
-		tc.tenantID, 1, time.Now().Add(-2*time.Hour))
+		`INSERT INTO tenant_notify_outbox (tenant_id, work_mask, created_at) VALUES (?, ?, ?)`,
+		tc.tenantID, WorkSSE, time.Now().Add(-2*time.Hour))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	// Insert a fresh row that should be retained.
-	if err := tc.metaStore.InsertSSENotify(context.Background(), tc.tenantID, 2); err != nil {
+	if err := tc.metaStore.InsertTenantNotify(context.Background(), tc.tenantID, WorkSSE); err != nil {
 		t.Fatal(err)
 	}
 
 	// Run cleanup with the default retention (1h). The old row should be pruned.
-	tc.podA.cleanupSSENotifyOutbox(context.Background())
+	tc.podA.cleanupTenantNotifyOutbox(context.Background())
 
-	// Verify only the fresh row remains.
-	rows, err := tc.metaStore.ListSSENotifySince(context.Background(), 0, 100)
+	// Verify only the fresh row remains for this tenant.
+	rows, err := tc.metaStore.ListTenantNotifySince(context.Background(), 0, 100)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 {
-		t.Fatalf("expected 1 outbox row after cleanup, got %d", len(rows))
+	var count int
+	for _, r := range rows {
+		if r.TenantID == tc.tenantID {
+			count++
+		}
 	}
-	if rows[0].Seq != 2 {
-		t.Fatalf("expected remaining row seq=2, got %d", rows[0].Seq)
+	if count != 1 {
+		t.Fatalf("expected 1 outbox row for tenant after cleanup, got %d", count)
+	}
+	var tenantRow *meta.TenantNotifyRow
+	for i := range rows {
+		if rows[i].TenantID == tc.tenantID {
+			tenantRow = &rows[i]
+			break
+		}
+	}
+	if tenantRow == nil {
+		t.Fatal("tenant row not found after cleanup")
+	}
+	if tenantRow.WorkMask != WorkSSE {
+		t.Fatalf("expected remaining row work_mask=%d, got %d", WorkSSE, tenantRow.WorkMask)
 	}
 }

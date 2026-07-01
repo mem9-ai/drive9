@@ -232,18 +232,17 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 		}
 	}
 
-	// Step 2: Write a lightweight pointer to the central sse_notify_outbox
-	// table (in the always-provisioned meta DB). This lets other pods discover
-	// that tenant T has new fs_events rows via the 200ms notifyPoller fallback,
-	// without polling the tenant's own TiDB. Best-effort: if this fails, the
-	// pod-to-pod push (step 4) may still deliver, and SSE client reconnect replay
-	// is the ultimate fallback. Only write if we got a valid seq from step 1.
-	// Use a non-cancelable context so a client disconnect after the fs_events
-	// write doesn't abort the outbox pointer (which would leave the poller
-	// fallback missing the event for cross-pod subscribers).
+	// Step 2: Write a lightweight pointer to the central tenant_notify_outbox
+	// table (in the always-provisioned meta DB) with the SSE work bit set. This
+	// lets other pods discover that tenant T has new fs_events rows via the
+	// 200ms unified outbox poller, without polling the tenant's own TiDB.
+	// Best-effort: if this fails, SSE client reconnect replay is the ultimate
+	// fallback. Only write if we got a valid seq from step 1. Use a
+	// non-cancelable context so a client disconnect after the fs_events write
+	// doesn't abort the outbox pointer.
 	if seq > 0 && s.meta != nil {
 		outboxCtx, outboxCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		if err := s.meta.InsertSSENotify(outboxCtx, bus.tenantID, uint64(seq)); err != nil {
+		if err := s.meta.InsertTenantNotify(outboxCtx, bus.tenantID, WorkSSE); err != nil {
 			logger.Warn(ctx, "sse_publish_outbox_insert_failed",
 				zap.String("tenant_id", bus.tenantID),
 				zap.Int64("seq", seq),
@@ -255,19 +254,20 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 
 	// Step 3: Wake same-pod SSE subscribers instantly (in-memory, sub-ms).
 	bus.Publish()
+}
 
-	// Step 4: Push to peer pods that have SSE subscribers for this tenant.
-	// This is the <10ms cross-pod fast path. Fire-and-forget: the outbox (step 2)
-	// + notifyPoller is the durable fallback. Only push if we got a valid seq.
-	if seq > 0 && s.podNotifier != nil {
-		s.podNotifier.Notify(bus.tenantID, uint64(seq))
-	}
+// notifyPushRequest is the JSON body for POST /v1/internal/sse-notify. This
+// legacy pod-to-pod push endpoint is retained for backward compatibility; the
+// unified outbox poller is the primary cross-pod delivery path.
+type notifyPushRequest struct {
+	TenantID string `json:"tenant_id"`
+	Seq      uint64 `json:"seq"`
 }
 
 // handleInternalSSENotify receives a pod-to-pod push notification from a
 // peer pod. The peer just wrote an fs_events row for tenant_id and is
 // notifying this pod (which has SSE subscribers for that tenant) to wake them
-// immediately rather than waiting for the 200ms notifyPoller fallback.
+// immediately rather than waiting for the 200ms unified outbox poller.
 //
 // Authenticated via a shared internal bearer secret (PodNotifySecret) compared
 // in constant time. Registered directly on the mux, NOT through the tenant auth

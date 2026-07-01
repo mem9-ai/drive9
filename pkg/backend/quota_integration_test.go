@@ -153,7 +153,6 @@ func TestCreateIfAbsentExistingPathReturnsConflictBeforeFileSizeQuota(t *testing
 
 func TestServerQuotaPendingOutboxFileDeltaRejectsOverFileCount(t *testing.T) {
 	b, fake := newServerQuotaBackend(t, Options{})
-	b.stopQuotaOutboxWorker()
 	ctx := context.Background()
 
 	fake.mu.Lock()

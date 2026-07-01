@@ -114,7 +114,7 @@ func main() {
 	}
 	autoEmbeddingAPIKey := strings.TrimSpace(os.Getenv(schema.EnvTiDBAutoEmbeddingAPIKey))
 	autoEmbeddingAPIBase := strings.TrimSpace(os.Getenv(schema.EnvTiDBAutoEmbeddingAPIBase))
-	semanticEmbedder, semanticWorkerOpts, err := buildSemanticWorkerConfigFromEnv()
+	semanticEmbedder, tenantWorkerOpts, err := buildTenantWorkerConfigFromEnv()
 	if err != nil {
 		die(err)
 	}
@@ -323,12 +323,12 @@ func main() {
 		// (that earlier pair was clobbered by the server's own SetCallbacks and
 		// never fired).
 
-		// TODO: Run ValidateDurableAsyncExtractRequiresSemanticWorker only when this process
+		// TODO: Run ValidateDurableAsyncExtractRequiresTenantWorker only when this process
 		// can serve tenants that enqueue durable audio_extract_text / img_extract_text
 		// (database auto-embedding: tidb_zero, tidb_cloud_starter). pool != nil is too broad
 		// for db9-only pools, which never hit that path but still get forced to configure
 		// DRIVE9_EMBED_* when async extract is wired on the template (PR #159 review).
-		if err := server.ValidateDurableAsyncExtractRequiresSemanticWorker(server.Config{
+		if err := server.ValidateDurableAsyncExtractRequiresTenantWorker(server.Config{
 			Meta:                         store,
 			Pool:                         pool,
 			Provisioner:                  provisioner,
@@ -339,7 +339,7 @@ func main() {
 			InlineThreshold:              backendOptions.InlineThreshold,
 			Logger:                       srvLogger,
 			SemanticEmbedder:             semanticEmbedder,
-			SemanticWorkers:              semanticWorkerOpts,
+			TenantWorkers:                tenantWorkerOpts,
 			TiDBAutoEmbeddingConfig:      autoEmbeddingConfig,
 			TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
 			TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
@@ -359,21 +359,17 @@ func main() {
 		logger.Info(context.Background(), "slock_oauth_disabled")
 	}
 
-	// SSE cross-pod notification configuration. These enable the new scheme
-	// that avoids polling every tenant's TiDB. The notify poller reads the
-	// central sse_notify_outbox (always-provisioned meta DB) at 200ms; the
-	// pod-to-pod HTTP push provides <10ms latency when PodID/PodAddr/secret
-	// are set. See pkg/server/notify_poller.go and pod_notifier.go.
-	sseNotifyPollInterval := envDuration("DRIVE9_SSE_NOTIFY_POLL_INTERVAL", 200*time.Millisecond)
+	// Unified tenant outbox notification configuration. The outbox poller reads
+	// the central tenant_notify_outbox (always-provisioned meta DB) at 200ms and
+	// dispatches by work_mask. See pkg/server/tenant_outbox_poller.go.
 	sseNotifyRetention := envDuration("DRIVE9_SSE_NOTIFY_RETENTION", time.Hour)
 	podID := strings.TrimSpace(os.Getenv("DRIVE9_POD_ID"))
 	podAddr := strings.TrimSpace(os.Getenv("DRIVE9_POD_ADDR"))
 	// Default podAddr to the listen addr only if it's a real, non-wildcard
-	// address. The notifier requires a full base URL (http://host:port) for
-	// http.NewRequest. Wildcard binds like ":9009", "0.0.0.0:9009", or "[::]:9009"
-	// are not dialable by peers, so we leave podAddr empty in that case — the
-	// podRegistry still reports subscriptions and the leader sweeps stale pods,
-	// but cross-pod HTTP push is disabled until an explicit address is set.
+	// address. The pod registry requires a full base URL for peer routing.
+	// Wildcard binds like ":9009", "0.0.0.0:9009", or "[::]:9009" are not
+	// dialable, so we leave podAddr empty in that case — the podRegistry still
+	// reports subscriptions and the leader sweeps stale pods.
 	if podAddr == "" && podID != "" {
 		if host, port, err := net.SplitHostPort(addr); err == nil && host != "" && host != "0.0.0.0" && host != "::" {
 			podAddr = "http://" + net.JoinHostPort(host, port)
@@ -384,10 +380,9 @@ func main() {
 		podNotifySecret = []byte(raw)
 	}
 	if podID != "" {
-		logger.Info(context.Background(), "sse_notify_config",
+		logger.Info(context.Background(), "tenant_outbox_config",
 			zap.String("pod_id", podID),
 			zap.String("pod_addr", podAddr),
-			zap.Duration("poll_interval", sseNotifyPollInterval),
 			zap.Duration("retention", sseNotifyRetention),
 			zap.Bool("push_enabled", podNotifySecret != nil))
 	}
@@ -406,18 +401,22 @@ func main() {
 		InlineThreshold:              backendOptions.InlineThreshold,
 		Logger:                       srvLogger,
 		SemanticEmbedder:             semanticEmbedder,
-		SemanticWorkers:              semanticWorkerOpts,
-		SlockOAuth:                   slockOAuth,
+		TenantWorkers:                tenantWorkerOpts,
+		SlockOAuth:                    slockOAuth,
 		TiDBAutoEmbeddingConfig:      autoEmbeddingConfig,
 		TiDBAutoEmbeddingAPIKey:      autoEmbeddingAPIKey,
 		TiDBAutoEmbeddingAPIBase:     autoEmbeddingAPIBase,
 		DisableDatabaseAutoEmbedding: disableDatabaseAutoEmbedding,
 		Leader:                       leaderManager,
-		SSENotifyPollInterval:        sseNotifyPollInterval,
-		SSENotifyRetention:           sseNotifyRetention,
-		PodID:                        podID,
-		PodAddr:                      podAddr,
-		PodNotifySecret:              podNotifySecret,
+		TenantOutboxPollInterval:        envDuration("DRIVE9_TENANT_OUTBOX_POLL_INTERVAL_MS", 200*time.Millisecond),
+		TenantOutboxCursorFlushInterval: envDuration("DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS", 5000*time.Millisecond),
+		TenantShardRefreshInterval:      envDuration("DRIVE9_TENANT_SHARD_REFRESH_MS", 5000*time.Millisecond),
+		TenantMaintenanceInterval:       envDuration("DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS", 300000*time.Millisecond),
+		SafetyNetScanInterval:           envDuration("DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS", 300000*time.Millisecond),
+		SSENotifyRetention:              sseNotifyRetention,
+		PodID:                            podID,
+		PodAddr:                          podAddr,
+		PodNotifySecret:                  podNotifySecret,
 	}).ListenAndServe(addr))
 }
 
@@ -574,12 +573,16 @@ environment:
                     peer push notifications. Defaults to http://<listen-addr> when the
                     listen address is a non-wildcard host; must be set explicitly in
                     multi-host deployments.
-  DRIVE9_POD_NOTIFY_SECRET  shared bearer token for /v1/internal/sse-notify pod-to-pod
-                    push authentication. When set, enables the <10ms cross-pod HTTP push
-                    path; when unset, only the 200ms fallback poller is used.
-  DRIVE9_SSE_NOTIFY_POLL_INTERVAL  fallback outbox poll interval (default: 200ms)
-  DRIVE9_SSE_NOTIFY_RETENTION      how long outbox rows are kept before leader pruning
-                    (default: 1h)
+  DRIVE9_POD_NOTIFY_SECRET  shared bearer token for the legacy /v1/internal/sse-notify
+                    pod-to-pod endpoint (retained for backward compat; the unified
+                    outbox poller is the primary cross-pod path).
+  DRIVE9_SSE_NOTIFY_RETENTION      how long tenant_notify_outbox rows are kept before
+                    leader pruning (default: 1h)
+  DRIVE9_TENANT_OUTBOX_POLL_INTERVAL_MS  unified outbox poll interval (default: 200)
+  DRIVE9_TENANT_OUTBOX_CURSOR_FLUSH_MS   how often the poller persists its cursor (default: 5000)
+  DRIVE9_TENANT_SHARD_REFRESH_MS         shard resolver pod ring refresh interval (default: 5000)
+  DRIVE9_TENANT_MAINTENANCE_INTERVAL_MS  piggyback maintenance throttle per tenant (default: 300000)
+  DRIVE9_SAFETY_NET_SCAN_INTERVAL_MS     leader safety-net scan interval (default: 300000)
 
   S3 storage (set DRIVE9_S3_BUCKET to enable AWS S3, otherwise local mock):
   DRIVE9_S3_BUCKET   S3 bucket name (enables AWS S3 mode)
@@ -613,10 +616,9 @@ environment:
   DRIVE9_SEMANTIC_WORKERS number of background workers (default: 1)
   DRIVE9_SEMANTIC_POLL_INTERVAL_MS worker poll interval in milliseconds (default: 200)
   DRIVE9_SEMANTIC_LEASE_SECONDS task lease duration in seconds (default: 30)
-  DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS recover sweep interval in milliseconds (default: 5000)
   DRIVE9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
   DRIVE9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
-  DRIVE9_SEMANTIC_TENANT_LIMIT active tenants scanned per round (default: 128)
+  DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
   DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
 
   Image extraction (async image -> text for search):
@@ -874,15 +876,13 @@ func buildAudioExtractOptionsFromEnv() (backend.AsyncAudioExtractOptions, error)
 	return async, nil
 }
 
-func buildSemanticWorkerConfigFromEnv() (embedding.Client, server.SemanticWorkerOptions, error) {
-	opts := server.SemanticWorkerOptions{
+func buildTenantWorkerConfigFromEnv() (embedding.Client, server.TenantWorkerOptions, error) {
+	opts := server.TenantWorkerOptions{
 		Workers:              envInt("DRIVE9_SEMANTIC_WORKERS", 1),
 		PollInterval:         time.Duration(envInt("DRIVE9_SEMANTIC_POLL_INTERVAL_MS", 200)) * time.Millisecond,
 		LeaseDuration:        time.Duration(envInt("DRIVE9_SEMANTIC_LEASE_SECONDS", 30)) * time.Second,
-		RecoverInterval:      time.Duration(envInt("DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS", 5000)) * time.Millisecond,
 		RetryBaseDelay:       time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_BASE_MS", 200)) * time.Millisecond,
 		RetryMaxDelay:        time.Duration(envInt("DRIVE9_SEMANTIC_RETRY_MAX_MS", 30000)) * time.Millisecond,
-		TenantScanLimit:      envInt("DRIVE9_SEMANTIC_TENANT_LIMIT", 128),
 		PerTenantConcurrency: envInt("DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY", 1),
 	}
 	baseURL := strings.TrimSpace(os.Getenv("DRIVE9_EMBED_API_BASE"))

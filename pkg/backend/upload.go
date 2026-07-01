@@ -1215,8 +1215,12 @@ func (b *Dat9Backend) finalizeUpload(ctx context.Context, upload *datastore.Uplo
 		return err
 	}
 	txDurationMs := uploadPhaseMs(txStart)
-	b.notifySemanticTaskEnqueued(semanticTaskEnqueued)
-	b.notifyQuotaOutbox(quotaOutboxEnqueued)
+	if semanticTaskEnqueued {
+		b.notifyWorkEnqueued(BackendWorkSemantic)
+	}
+	if quotaOutboxEnqueued {
+		b.notifyWorkEnqueued(BackendWorkQuota)
+	}
 
 	if !quotaOutboxEnqueued {
 		if b.UseServerQuota() {
