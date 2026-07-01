@@ -370,7 +370,7 @@ environment:
   DRIVE9_LOG_LEVEL debug|info|warn|error (default: info)
   DRIVE9_BENCH_TIMING_LOG_ENABLED true|false to emit benchmark timing logs on successful server hot paths (default: false)
   DRIVE9_QUOTA_USAGE_CACHE_TTL soft small-write central usage cache TTL, e.g. 250ms or 1s
-  DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write tenant pending-outbox aggregate cache TTL, e.g. 250ms or 1s
+  DRIVE9_QUOTA_PENDING_DELTAS_CACHE_TTL soft small-write in-process pending mutation cache TTL, e.g. 250ms or 1s
 
   S3 storage:
   Set DRIVE9_S3_BUCKET to enable AWS S3 mode.
