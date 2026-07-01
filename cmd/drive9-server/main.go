@@ -619,7 +619,6 @@ environment:
   DRIVE9_SEMANTIC_RETRY_BASE_MS base retry backoff in milliseconds (default: 200)
   DRIVE9_SEMANTIC_RETRY_MAX_MS max retry backoff in milliseconds (default: 30000)
   DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
-  DRIVE9_SEMANTIC_PER_TENANT_CONCURRENCY max concurrent tasks per tenant (default: 1)
 
   Image extraction (async image -> text for search):
   DRIVE9_IMAGE_EXTRACT_ENABLED true|false (default: false)
@@ -877,6 +876,12 @@ func buildAudioExtractOptionsFromEnv() (backend.AsyncAudioExtractOptions, error)
 }
 
 func buildTenantWorkerConfigFromEnv() (embedding.Client, server.TenantWorkerOptions, error) {
+	// Warn about deprecated env vars that are no longer parsed.
+	for _, deprecated := range []string{"DRIVE9_SEMANTIC_RECOVER_INTERVAL_MS", "DRIVE9_SEMANTIC_TENANT_LIMIT"} {
+		if os.Getenv(deprecated) != "" {
+			fmt.Fprintf(os.Stderr, "WARNING: %s is deprecated and no longer used; recovery is now kick-driven and tenant scan limit is removed\n", deprecated)
+		}
+	}
 	opts := server.TenantWorkerOptions{
 		Workers:              envInt("DRIVE9_SEMANTIC_WORKERS", 1),
 		PollInterval:         time.Duration(envInt("DRIVE9_SEMANTIC_POLL_INTERVAL_MS", 200)) * time.Millisecond,

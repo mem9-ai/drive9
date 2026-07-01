@@ -510,7 +510,8 @@ func NewWithConfig(cfg Config) *Server {
 // insertTenantNotify writes a best-effort unified outbox row so other pods
 // discover the work via the 200ms poller. Called from the write path after
 // the in-process kick. Failures are logged and are safe: the safety-net scan
-// recovers any missed work.
+// recovers any missed work. Uses a non-cancelable background context so a
+// client disconnect after the commit doesn't abort the outbox pointer.
 func (s *Server) insertTenantNotify(tenantID string, workMask int) {
 	if s.meta == nil || tenantID == "" || workMask == 0 {
 		return
@@ -964,6 +965,7 @@ func (s *Server) logTenantWorkerStatus(cfg Config, appManagedTaskTypes, fallback
 			zap.Duration("poll_interval", s.tenantWorker.opts.PollInterval),
 			zap.Duration("lease_duration", s.tenantWorker.opts.LeaseDuration),
 			zap.Duration("maintenance_interval", s.tenantWorker.opts.MaintenanceInterval),
+			zap.String("recovery_mode", "on_kick"),
 			zap.Bool("embedder_configured", cfg.SemanticEmbedder != nil),
 			zap.Strings("app_managed_task_types", appManagedTaskTypes),
 			zap.Strings("fallback_task_types", fallbackTaskTypes),
@@ -1080,6 +1082,12 @@ func isStalePendingTenant(now time.Time, t meta.Tenant) bool {
 	return !lastTouched.IsZero() && now.Sub(lastTouched) >= pendingTenantStaleAfter
 }
 
+// backgroundWithTrace creates a background context that inherits the trace ID
+// from ctx. Note: pkg/backend has a same-named function with a different
+// signature (no args, returns traceid.Background()). This server version
+// derives the trace from a caller-supplied context. Both are package-scoped
+// so there is no collision, but the naming overlap is intentional — each
+// package uses the variant appropriate to its trace ID source.
 func backgroundWithTrace(ctx context.Context) context.Context {
 	return contextWithTrace(context.Background(), ctx)
 }

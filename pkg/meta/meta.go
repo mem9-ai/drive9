@@ -672,13 +672,12 @@ func metaInitSchemaStatements() []string {
 			INDEX idx_pending (status, created_at),
 			INDEX idx_tenant_order (tenant_id, id)
 		)`,
-		// sse_notify_outbox is a central notification pointer table for cross-pod
-		// SSE event fan-out. Each FS mutation writes a lightweight row here (tenant_id
-		// + seq) so that pods can discover which tenants have new events without
-		// polling every tenant's own TiDB. The event content stays in the per-tenant
-		// fs_events table; this table only signals "tenant T has new rows after seq".
-		// The central meta DB is always provisioned (not serverless), so polling it
-		// does not incur per-tenant RCU. Retention pruning is leader-gated.
+		// sse_notify_outbox is the legacy central notification pointer table for
+		// cross-pod SSE event fan-out. Deprecated: replaced by
+		// tenant_notify_outbox (which carries the SSE work bit alongside
+		// semantic/file_gc/quota). The table is retained in the schema for
+		// migration safety (no DROP) but production code no longer writes to
+		// it. To be dropped in a future PR.
 		`CREATE TABLE IF NOT EXISTS sse_notify_outbox (
 			id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
 			tenant_id  VARCHAR(64) NOT NULL,
@@ -3196,13 +3195,15 @@ func isDuplicateEntry(err error) bool {
 }
 
 // ---------------------------------------------------------------------------
-// SSE notify outbox
+// SSE notify outbox (deprecated — replaced by tenant_notify_outbox)
 // ---------------------------------------------------------------------------
 
-// SSENotifyRow mirrors a row in sse_notify_outbox. It is a lightweight pointer
-// (tenant_id + seq) to the actual event content stored in the per-tenant
-// fs_events table. The central meta DB holds this table so pods can discover
-// cross-pod events without polling every tenant's own TiDB.
+// SSENotifyRow mirrors a row in sse_notify_outbox.
+//
+// Deprecated: replaced by tenant_notify_outbox + TenantNotifyRow. The
+// sse_notify_outbox table is no longer written to by production code; it is
+// retained in the schema for migration safety and will be dropped in a future
+// PR.
 type SSENotifyRow struct {
 	ID        uint64
 	TenantID  string
@@ -3225,11 +3226,11 @@ type PodRow struct {
 	Status PodRegistryStatus
 }
 
-// InsertSSENotify writes a notification pointer to sse_notify_outbox. This is
-// best-effort: if the INSERT fails, the event is still durable in the
-// per-tenant fs_events table and will be discovered on SSE client reconnect
-// replay. The central meta DB is always provisioned so this write never wakes
-// a serverless tenant TiDB.
+// InsertSSENotify writes a notification pointer to sse_notify_outbox.
+//
+// Deprecated: replaced by InsertTenantNotify. Retained for migration safety;
+// production code no longer calls this. The sse_notify_outbox table will be
+// dropped in a future PR.
 func (s *Store) InsertSSENotify(ctx context.Context, tenantID string, seq uint64) (err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "insert_sse_notify", start, &err)
@@ -3240,8 +3241,9 @@ func (s *Store) InsertSSENotify(ctx context.Context, tenantID string, seq uint64
 }
 
 // ListSSENotifySince returns outbox rows with id > afterID, ordered by id, up to
-// limit. The consumer advances its cursor to the last row's id so subsequent
-// calls do not re-read the same rows.
+// limit.
+//
+// Deprecated: replaced by ListTenantNotifySince.
 func (s *Store) ListSSENotifySince(ctx context.Context, afterID uint64, limit int) (out []SSENotifyRow, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "list_sse_notify_since", start, &err)
@@ -3266,8 +3268,9 @@ func (s *Store) ListSSENotifySince(ctx context.Context, afterID uint64, limit in
 }
 
 // MaxSSENotifyID returns the current maximum id in sse_notify_outbox, or 0 if
-// the table is empty. Used by the notify poller to initialize its cursor on
-// startup (skipping historical rows — SSE client reconnect replay covers those).
+// the table is empty.
+//
+// Deprecated: replaced by MaxTenantNotifyID.
 func (s *Store) MaxSSENotifyID(ctx context.Context) (out uint64, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "max_sse_notify_id", start, &err)
@@ -3279,7 +3282,8 @@ func (s *Store) MaxSSENotifyID(ctx context.Context) (out uint64, err error) {
 }
 
 // DeleteSSENotifyBefore prunes outbox rows older than the given threshold.
-// Leader-gated; retention is relative to DB insert time (created_at).
+//
+// Deprecated: replaced by DeleteTenantNotifyBefore.
 func (s *Store) DeleteSSENotifyBefore(ctx context.Context, before time.Time) (n int64, err error) {
 	start := time.Now()
 	defer observeMeta(ctx, "delete_sse_notify_before", start, &err)

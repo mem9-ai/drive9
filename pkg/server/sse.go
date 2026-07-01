@@ -237,19 +237,11 @@ func (s *Server) publishEvent(r *http.Request, path, op string) {
 	// lets other pods discover that tenant T has new fs_events rows via the
 	// 200ms unified outbox poller, without polling the tenant's own TiDB.
 	// Best-effort: if this fails, SSE client reconnect replay is the ultimate
-	// fallback. Only write if we got a valid seq from step 1. Use a
-	// non-cancelable context so a client disconnect after the fs_events write
-	// doesn't abort the outbox pointer.
-	if seq > 0 && s.meta != nil {
-		outboxCtx, outboxCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		if err := s.meta.InsertTenantNotify(outboxCtx, bus.tenantID, WorkSSE); err != nil {
-			logger.Warn(ctx, "sse_publish_outbox_insert_failed",
-				zap.String("tenant_id", bus.tenantID),
-				zap.Int64("seq", seq),
-				zap.Error(err))
-			metrics.RecordTenantOperation(bus.tenantID, "event_bus", "outbox_publish", metrics.ResultForError(err), 0)
-		}
-		outboxCancel()
+	// fallback. Only write if we got a valid seq from step 1. The helper uses
+	// a non-cancelable background context so a client disconnect after the
+	// fs_events write doesn't abort the outbox pointer.
+	if seq > 0 {
+		s.insertTenantNotify(bus.tenantID, WorkSSE)
 	}
 
 	// Step 3: Wake same-pod SSE subscribers instantly (in-memory, sub-ms).

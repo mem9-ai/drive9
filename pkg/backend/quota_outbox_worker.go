@@ -30,6 +30,10 @@ const (
 
 type quotaOutboxBatchClaimer func(context.Context, time.Time, time.Duration, int) (datastore.QuotaOutboxBatchClaimResult, error)
 
+// processQuotaOutboxAvailable drains pending quota outbox rows for this
+// backend's tenant. Called by the unified tenant worker on kick, and by tests.
+// Not called by any per-backend goroutine — the old ticker-based
+// runQuotaOutboxWorker was removed in favor of the kick-driven model.
 func (b *Dat9Backend) processQuotaOutboxAvailable(ctx context.Context) {
 	if ctx.Err() != nil || b.store == nil || b.metaStore == nil || b.tenantID == "" {
 		return

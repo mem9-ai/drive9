@@ -416,6 +416,16 @@ func (p *Pool) WaitTenantIdle(ctx context.Context, tenantID string) error {
 // leases only for warm tenants (those with a live backend in the cache),
 // avoiding waking dormant serverless tenant TiDBs. Returns (nil, nil, false)
 // when the tenant is not cached (cold).
+// AcquireCached pins a cached backend without creating one on cache miss. It
+// is intended for the safety-net scan and other background work that may
+// process already-active tenants but must not wake dormant tenant TiDBs.
+//
+// If the tenant's S3 encryption policy or storage namespace has changed since
+// the backend was cached, AcquireCached returns false (the stale backend is
+// not usable). In this rare case the safety-net scan skips the tenant — its
+// expired lease recovery is deferred until the next write kick triggers a
+// fresh Acquire with the updated policy. This is acceptable because policy
+// changes are rare and the tenant's tasks remain durable in its TiDB.
 func (p *Pool) AcquireCached(t *meta.Tenant) (b *backend.Dat9Backend, release func(), ok bool) {
 	if p == nil || t == nil {
 		return nil, nil, false
