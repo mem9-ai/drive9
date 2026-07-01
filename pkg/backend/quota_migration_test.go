@@ -38,6 +38,7 @@ type fakeMetaQuotaStore struct {
 	mutations            []fakeMutationRecord
 	nextID               int64
 	markAppliedCalls     int // Finding B invariant: count MarkMutationAppliedTx calls (pre-guard, on-entry)
+	observePendingCalls  int
 	monthlyCostErr       error
 	insertMutationErr    error
 	objectGCCandidateErr error
@@ -413,6 +414,7 @@ func (f *fakeMetaQuotaStore) ListPendingMutations(ctx context.Context, minAge ti
 func (f *fakeMetaQuotaStore) ObservePendingMutations(ctx context.Context) ([]MutationBacklogView, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.observePendingCalls++
 	now := time.Now().UTC()
 	byTenant := make(map[string]*MutationBacklogView)
 	oldest := make(map[string]time.Time)

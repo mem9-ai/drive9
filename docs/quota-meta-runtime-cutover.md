@@ -100,6 +100,10 @@ Watch the meta pipeline instead of tenant outbox health:
   for `quota_mutation_log` pending backlog by tenant.
 - `drive9_service_gauge{component="mutation_replay",name="oldest_pending_age_seconds"}`
   for oldest pending mutation age by tenant.
+- The replay backlog gauges reflect the last observation from a live
+  `mutation_replay` worker. A fatal worker exit intentionally leaves the last
+  non-zero values in place instead of clearing them, so pair these gauges with
+  `mutation_replay` worker error/bad-connection alerts.
 - `central_quota_mutation_log_insert_failed` log/metric.
 - `central_quota/upload_reset_active` errors or
   `central_quota_upload_reset_active_failed`, which indicate a retryable upload

@@ -38,6 +38,14 @@ func replayMinAge() time.Duration {
 	return d
 }
 
+func replayObserveEvery() time.Duration {
+	d := envDurationMS("DRIVE9_QUOTA_REPLAY_OBSERVE_MS", defaultReplayObserveEvery)
+	if d <= 0 {
+		return defaultReplayObserveEvery
+	}
+	return d
+}
+
 func envDurationMS(name string, def time.Duration) time.Duration {
 	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
@@ -87,8 +95,11 @@ func (w *MutationReplayWorker) Stop() {
 }
 
 func (w *MutationReplayWorker) run(ctx context.Context) {
+	gracefulStop := false
 	defer func() {
-		w.clearPendingBacklogGauges()
+		if gracefulStop {
+			w.clearPendingBacklogGauges()
+		}
 		close(w.done)
 	}()
 
@@ -99,6 +110,7 @@ func (w *MutationReplayWorker) run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			gracefulStop = true
 			logger.Info(ctx, "mutation_replay_worker_stopped")
 			return
 		case <-ticker.C:
@@ -182,7 +194,7 @@ func (w *MutationReplayWorker) replayBatch(ctx context.Context) (fatal bool) {
 }
 
 func (w *MutationReplayWorker) recordPendingBacklogIfDue(ctx context.Context) {
-	if !w.lastBacklogObservation.IsZero() && time.Since(w.lastBacklogObservation) < defaultReplayObserveEvery {
+	if !w.lastBacklogObservation.IsZero() && time.Since(w.lastBacklogObservation) < replayObserveEvery() {
 		return
 	}
 	w.recordPendingBacklog(ctx)
