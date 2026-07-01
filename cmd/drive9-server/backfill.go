@@ -16,9 +16,10 @@ import (
 	"github.com/mem9-ai/drive9/pkg/meta"
 )
 
-// runBackfillQuota bootstraps the central server DB quota counters and
-// tenant_file_meta rows from each tenant's local database. This is a one-time
-// migration tool to be run before switching quota_source to "server".
+// runBackfillQuota reconciles the central server DB quota counters and
+// tenant_file_meta rows from each tenant's local database. Run it during the
+// meta-quota cutover, after suspected post-commit quota mutation gaps, or
+// before deleting historical tenant quota_outbox rows.
 //
 // Environment:
 //
